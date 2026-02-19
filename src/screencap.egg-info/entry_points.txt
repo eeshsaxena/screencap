@@ -1,0 +1,2 @@
+[console_scripts]
+screencap = screencap.cli:cli

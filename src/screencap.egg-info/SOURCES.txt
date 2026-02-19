@@ -1,0 +1,17 @@
+pyproject.toml
+src/screencap/__init__.py
+src/screencap/catalog.py
+src/screencap/cli.py
+src/screencap/config.py
+src/screencap/recorder.py
+src/screencap/scrubber.py
+src/screencap/viewer.py
+src/screencap.egg-info/PKG-INFO
+src/screencap.egg-info/SOURCES.txt
+src/screencap.egg-info/dependency_links.txt
+src/screencap.egg-info/entry_points.txt
+src/screencap.egg-info/requires.txt
+src/screencap.egg-info/top_level.txt
+tests/test_catalog.py
+tests/test_cli.py
+tests/test_config.py

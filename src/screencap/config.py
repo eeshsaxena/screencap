@@ -1,0 +1,56 @@
+"""Configuration: ~/.screencap/config.toml + env vars."""
+
+from __future__ import annotations
+
+import os
+import sys
+from pathlib import Path
+
+if sys.version_info >= (3, 11):
+    import tomllib
+else:
+    import tomli as tomllib
+
+_DEFAULT_BASE = Path.home() / ".screencap"
+_DEFAULT_RECORDINGS = _DEFAULT_BASE / "recordings"
+_CONFIG_PATH = _DEFAULT_BASE / "config.toml"
+
+_config_cache: dict | None = None
+
+
+def _load_toml() -> dict:
+    global _config_cache
+    if _config_cache is not None:
+        return _config_cache
+    if _CONFIG_PATH.exists():
+        _config_cache = tomllib.loads(_CONFIG_PATH.read_text())
+    else:
+        _config_cache = {}
+    return _config_cache
+
+
+def get_recordings_dir() -> Path:
+    """Return recordings directory, creating it if needed."""
+    env = os.environ.get("SCREENCAP_RECORDINGS_DIR")
+    if env:
+        p = Path(env)
+    else:
+        cfg = _load_toml()
+        p = Path(cfg.get("recordings_dir", str(_DEFAULT_RECORDINGS)))
+    p.mkdir(parents=True, exist_ok=True)
+    return p
+
+
+def get_audio_default() -> bool:
+    """Return default audio setting (True = on)."""
+    env = os.environ.get("SCREENCAP_AUDIO_DEFAULT")
+    if env is not None:
+        return env.lower() in ("1", "true", "yes")
+    cfg = _load_toml()
+    return cfg.get("audio_default", True)
+
+
+def get_base_dir() -> Path:
+    """Return ~/.screencap/, creating it if needed."""
+    _DEFAULT_BASE.mkdir(parents=True, exist_ok=True)
+    return _DEFAULT_BASE
