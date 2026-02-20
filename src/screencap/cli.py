@@ -554,6 +554,64 @@ def _run_api_transcription(api_key, audio_path, transcript_path, transcript_json
 
 
 @cli.command()
+@click.argument("names", nargs=-1)
+@click.option("--all", "all_recordings", is_flag=True, help="Upload all recordings.")
+@click.option("--dry-run", is_flag=True, help="Show files and sizes without uploading.")
+def upload(names, all_recordings, dry_run):
+    """Upload recordings to cloud storage."""
+    from screencap.upload import resolve_recording_dirs, upload_recording, _fmt_size
+
+    try:
+        dirs = resolve_recording_dirs(names, all_recordings=all_recordings)
+    except (FileNotFoundError, ValueError) as e:
+        console.print(f"[red]Error:[/red] {e}")
+        sys.exit(1)
+
+    total_count = len(dirs)
+    all_uploaded = 0
+    all_skipped = 0
+    all_failed = 0
+    all_bytes = 0
+
+    for i, d in enumerate(dirs, 1):
+        if total_count > 1:
+            console.print(f"\n[bold][{i}/{total_count}][/bold] {d.name}")
+        try:
+            result = upload_recording(d, dry_run=dry_run)
+            all_uploaded += len(result.uploaded)
+            all_skipped += len(result.skipped)
+            all_failed += len(result.failed)
+            all_bytes += result.total_bytes
+
+            if not dry_run and not result.failed:
+                parts = []
+                if result.uploaded:
+                    parts.append(f"{len(result.uploaded)} new")
+                if result.skipped:
+                    parts.append(f"{len(result.skipped)} skipped")
+                summary = ", ".join(parts) if parts else "0 files"
+                if result.gcs_prefix:
+                    console.print(
+                        f"\n[green]Uploaded {d.name}[/green] -> {result.gcs_prefix} ({summary})"
+                    )
+                else:
+                    console.print(f"\n[green]Uploaded {d.name}[/green] ({summary})")
+        except FileNotFoundError as e:
+            console.print(f"[red]Error:[/red] {e}")
+            all_failed += 1
+        except RuntimeError as e:
+            console.print(f"[red]Error:[/red] {e}")
+            sys.exit(1)
+
+    if total_count > 1 and not dry_run:
+        console.print(
+            f"\n[bold]Done.[/bold] {all_uploaded} uploaded, "
+            f"{all_skipped} skipped, {all_failed} failed "
+            f"({_fmt_size(all_bytes)} total)"
+        )
+
+
+@cli.command()
 @click.argument("name")
 @click.option(
     "--model", "-m",
