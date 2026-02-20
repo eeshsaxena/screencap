@@ -25,31 +25,29 @@ class DarwinPlatform:
     def get_screen_dimensions() -> tuple[int, int]:
         """Get screen dimensions in physical pixels.
 
-        On Retina displays, this returns the actual pixel dimensions,
-        not the scaled logical dimensions.
+        Uses Quartz directly to avoid triggering the macOS Sequoia
+        screen-capture consent dialog (which ImageGrab.grab() causes).
 
         Returns:
             Tuple of (width, height) in physical pixels.
         """
         try:
-            from PIL import ImageGrab
-            screenshot = ImageGrab.grab()
-            return screenshot.size
-        except Exception:
-            # Fallback using Quartz
-            try:
-                import Quartz
+            import Quartz
 
-                main_display = Quartz.CGMainDisplayID()
-                width = Quartz.CGDisplayPixelsWide(main_display)
-                height = Quartz.CGDisplayPixelsHigh(main_display)
-                return (width, height)
-            except Exception:
-                return (1920, 1080)
+            main_display = Quartz.CGMainDisplayID()
+            width = Quartz.CGDisplayPixelsWide(main_display)
+            height = Quartz.CGDisplayPixelsHigh(main_display)
+            return (width, height)
+        except Exception:
+            return (1920, 1080)
 
     @staticmethod
     def get_display_pixel_ratio() -> float:
         """Get the display pixel ratio for Retina displays.
+
+        Uses Quartz directly to avoid triggering the macOS Sequoia
+        screen-capture consent dialog (which ImageGrab.grab() and
+        mss.mss() cause via CGWindowListCreateImage).
 
         Returns 2.0 for Retina displays, 1.0 for standard displays.
 
@@ -57,43 +55,18 @@ class DarwinPlatform:
             Pixel ratio (physical pixels / logical pixels).
         """
         try:
-            import mss
-            from PIL import ImageGrab
+            import Quartz
 
-            # Get physical dimensions from screenshot
-            screenshot = ImageGrab.grab()
-            physical_width = screenshot.size[0]
+            main_display = Quartz.CGMainDisplayID()
+            physical_width = Quartz.CGDisplayPixelsWide(main_display)
 
-            # Get logical dimensions from mss
-            with mss.mss() as sct:
-                # monitors[1] is typically the primary monitor
-                monitor = sct.monitors[1] if len(sct.monitors) > 1 else sct.monitors[0]
-                logical_width = monitor["width"]
-
-            if logical_width > 0:
-                return physical_width / logical_width
+            mode = Quartz.CGDisplayCopyDisplayMode(main_display)
+            if mode:
+                logical_width = Quartz.CGDisplayModeGetWidth(mode)
+                if logical_width > 0:
+                    return physical_width / logical_width
 
             return 1.0
-        except ImportError:
-            # Try using Quartz directly
-            try:
-                import Quartz
-
-                main_display = Quartz.CGMainDisplayID()
-
-                # Get physical dimensions
-                physical_width = Quartz.CGDisplayPixelsWide(main_display)
-
-                # Get logical dimensions using display mode
-                mode = Quartz.CGDisplayCopyDisplayMode(main_display)
-                if mode:
-                    logical_width = Quartz.CGDisplayModeGetWidth(mode)
-                    if logical_width > 0:
-                        return physical_width / logical_width
-
-                return 1.0
-            except Exception:
-                return 1.0
         except Exception:
             return 1.0
 
