@@ -17,7 +17,17 @@ import psutil
 from screencap import __version__
 
 METRICS_FILENAME = "system_metrics.json"
-SCHEMA_VERSION = 2
+SCHEMA_VERSION = 3
+
+_PHY_MODE_NAMES = {
+    0: "none",
+    1: "802.11a",
+    2: "802.11b",
+    3: "802.11g",
+    4: "802.11n",
+    5: "802.11ac",
+    6: "802.11ax",
+}
 
 
 def _parse_plist_array(text: str) -> list[str] | None:
@@ -156,7 +166,84 @@ def _collect_locale() -> dict:
     return locale_info
 
 
-def collect_static_metrics() -> dict:
+def _collect_wifi_static() -> dict | None:
+    """Gather WiFi interface state (connected, PHY mode).
+
+    macOS-only: uses CoreWLAN (pyobjc-framework-CoreWLAN). Returns None on
+    other platforms where the dependency is not installed.
+    """
+    try:
+        from CoreWLAN import CWWiFiClient
+    except ImportError:
+        return None
+
+    try:
+        client = CWWiFiClient.sharedWiFiClient()
+        iface = client.interface()
+        if iface is None:
+            return {"connected": None, "phy_mode": None}
+    except Exception:
+        return None
+
+    wifi: dict = {}
+
+    try:
+        # ssid() returns nil on macOS 14+ without Location Services authorization,
+        # even when connected. Fall back to RSSI as a connected indicator.
+        ssid = iface.ssid()
+        if ssid is not None:
+            wifi["connected"] = True
+        else:
+            rssi = int(iface.rssiValue())
+            wifi["connected"] = rssi != 0
+    except Exception:
+        wifi["connected"] = None
+
+    try:
+        mode_val = int(iface.activePHYMode())
+        wifi["phy_mode"] = _PHY_MODE_NAMES.get(mode_val, f"unknown({mode_val})")
+    except Exception:
+        wifi["phy_mode"] = None
+
+    return wifi
+
+
+def _collect_wifi_dynamic() -> dict | None:
+    """Gather WiFi signal strength and speed snapshot.
+
+    macOS-only: uses CoreWLAN (pyobjc-framework-CoreWLAN). Returns None on
+    other platforms where the dependency is not installed.
+    """
+    try:
+        from CoreWLAN import CWWiFiClient
+    except ImportError:
+        return None
+
+    try:
+        client = CWWiFiClient.sharedWiFiClient()
+        iface = client.interface()
+        if iface is None:
+            return {"rssi_dbm": None, "tx_rate_mbps": None}
+    except Exception:
+        return None
+
+    wifi: dict = {}
+
+    try:
+        rssi = int(iface.rssiValue())
+        wifi["rssi_dbm"] = rssi if rssi != 0 else None
+    except Exception:
+        wifi["rssi_dbm"] = None
+
+    try:
+        wifi["tx_rate_mbps"] = float(iface.transmitRate())
+    except Exception:
+        wifi["tx_rate_mbps"] = None
+
+    return wifi
+
+
+def collect_static_metrics(wifi_metrics: bool = True) -> dict:
     """Gather hardware, OS, and display info (unchanging during a recording)."""
     static: dict = {}
 
@@ -252,10 +339,17 @@ def collect_static_metrics() -> dict:
     except Exception:
         static["locale"] = None
 
+    # WiFi
+    if wifi_metrics:
+        try:
+            static["wifi"] = _collect_wifi_static()
+        except Exception:
+            static["wifi"] = None
+
     return static
 
 
-def collect_dynamic_metrics() -> dict:
+def collect_dynamic_metrics(wifi_metrics: bool = True) -> dict:
     """Gather CPU, memory, disk, and battery snapshot."""
     dynamic: dict = {}
 
@@ -298,23 +392,31 @@ def collect_dynamic_metrics() -> dict:
         dynamic["battery_percent"] = None
         dynamic["battery_charging"] = None
 
+    # WiFi
+    if wifi_metrics:
+        try:
+            dynamic["wifi"] = _collect_wifi_dynamic()
+        except Exception:
+            dynamic["wifi"] = None
+
     return dynamic
 
 
-def save_metrics(capture_dir: Path, phase: str) -> None:
+def save_metrics(capture_dir: Path, phase: str, wifi_metrics: bool = True) -> None:
     """Collect and write/update system_metrics.json in the recording directory.
 
     Args:
         capture_dir: Path to the recording directory.
         phase: "start" or "end".
+        wifi_metrics: Whether to collect WiFi metrics.
     """
     metrics_path = capture_dir / METRICS_FILENAME
 
     if phase == "start":
         data = {
             "schema_version": SCHEMA_VERSION,
-            "static": collect_static_metrics(),
-            "start": collect_dynamic_metrics(),
+            "static": collect_static_metrics(wifi_metrics=wifi_metrics),
+            "start": collect_dynamic_metrics(wifi_metrics=wifi_metrics),
             "end": None,
         }
         metrics_path.write_text(json.dumps(data, indent=2))
@@ -328,5 +430,5 @@ def save_metrics(capture_dir: Path, phase: str) -> None:
         else:
             data = {"schema_version": SCHEMA_VERSION, "static": {}, "start": None}
 
-        data["end"] = collect_dynamic_metrics()
+        data["end"] = collect_dynamic_metrics(wifi_metrics=wifi_metrics)
         metrics_path.write_text(json.dumps(data, indent=2))

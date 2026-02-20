@@ -11,7 +11,7 @@ from pathlib import Path
 
 from rich.console import Console
 
-from screencap.config import get_audio_default, get_recordings_dir
+from screencap.config import get_audio_default, get_recordings_dir, get_wifi_metrics
 
 console = Console()
 
@@ -40,10 +40,13 @@ def start_recording(
     description: str | None = None,
     audio: bool | None = None,
     output_dir: str | Path | None = None,
+    wifi_metrics: bool | None = None,
 ) -> Path:
     """Start a screen capture recording. Blocks until Ctrl+C."""
     if audio is None:
         audio = get_audio_default()
+    if wifi_metrics is None:
+        wifi_metrics = get_wifi_metrics()
 
     if output_dir:
         capture_dir = Path(output_dir)
@@ -95,7 +98,7 @@ def start_recording(
     try:
         from screencap.metrics import save_metrics
 
-        save_metrics(capture_dir, "start")
+        save_metrics(capture_dir, "start", wifi_metrics=wifi_metrics)
     except Exception as e:
         console.print(f"[yellow]Warning:[/yellow] Could not collect system metrics: {e}")
 
@@ -148,7 +151,7 @@ def start_recording(
     try:
         from screencap.metrics import save_metrics
 
-        save_metrics(capture_dir, "end")
+        save_metrics(capture_dir, "end", wifi_metrics=wifi_metrics)
     except Exception as e:
         console.print(f"[yellow]Warning:[/yellow] Could not collect end metrics: {e}")
 
