@@ -41,15 +41,6 @@ def start_recording(
     output_dir: str | Path | None = None,
 ) -> Path:
     """Start a screen capture recording. Blocks until Ctrl+C."""
-    from openadapt_capture import Recorder
-
-    if Recorder is None:
-        console.print(
-            "[red]Error:[/red] Recorder not available. "
-            "Check that all dependencies are installed (pynput, mss, etc.)"
-        )
-        raise SystemExit(1)
-
     if audio is None:
         audio = get_audio_default()
 
@@ -66,19 +57,31 @@ def start_recording(
 
     capture_dir.mkdir(parents=True, exist_ok=True)
 
+    desc = description or ""
+
+    console.print(f"[dim]Audio: {'on' if audio else 'off'}[/dim]")
+
+    t0 = time.time()
+    status = console.status("[bold]Initializing capture...[/bold]")
+    status.start()
+
+    # Heavy import — deferred here to keep `screencap --help` fast.
+    from openadapt_capture import Recorder
+
+    if Recorder is None:
+        status.stop()
+        console.print(
+            "[red]Error:[/red] Recorder not available. "
+            "Check that all dependencies are installed (pynput, mss, etc.)"
+        )
+        raise SystemExit(1)
+
     try:
         from screencap.metrics import save_metrics
 
         save_metrics(capture_dir, "start")
     except Exception as e:
         console.print(f"[yellow]Warning:[/yellow] Could not collect system metrics: {e}")
-
-    desc = description or ""
-
-    console.print(f'[bold red]Recording "[/bold red]{name}[bold red]"... Press Ctrl+C to stop.[/bold red]')
-    console.print(f"[dim]Audio: {'on' if audio else 'off'}[/dim]")
-
-    t0 = time.time()
 
     # Let KeyboardInterrupt propagate naturally into the Recorder.
     # record() internally catches KeyboardInterrupt at line 1707 and
@@ -92,6 +95,8 @@ def start_recording(
             capture_audio=audio,
         ) as recorder:
             recorder.wait_for_ready(timeout=30)
+            status.stop()
+            console.print(f'[bold red]Recording "[/bold red]{name}[bold red]"... Press Ctrl+C to stop.[/bold red]')
 
             # Install a handler only for second Ctrl+C (force-kill)
             _ctrl_c_count = 0
@@ -118,6 +123,7 @@ def start_recording(
     except KeyboardInterrupt:
         console.print("\n[dim]Stopping recording...[/dim]")
     finally:
+        status.stop()
         # Restore default handler
         signal.signal(signal.SIGINT, signal.default_int_handler)
         # Suppress noisy multiprocessing cleanup tracebacks
