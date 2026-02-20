@@ -37,10 +37,13 @@ def scrub_recording(
         console.print(f"[yellow]Removing existing scrubbed copy:[/yellow] {dst}")
         shutil.rmtree(dst)
 
-    console.print(f"Copying {name} → {name}-scrubbed ...")
-    shutil.copytree(src, dst)
+    with console.status(f"Copying {name} → {name}-scrubbed ..."):
+        shutil.copytree(src, dst)
+    console.print(f"Copied {name} → {name}-scrubbed")
 
-    scrubber = ScrubProvider.get_scrubber(provider)
+    with console.status("Loading NLP model..."):
+        scrubber = ScrubProvider.get_scrubber(provider)
+    console.print("NLP model loaded")
     entity_counts: dict[str, int] = {}
 
     # --- Scrub screenshots ---
@@ -126,18 +129,23 @@ def _scrub_capture_schema(cur, tables: set, scrubber) -> None:
     # Scrub event data JSON blobs
     if "events" in tables:
         cur.execute("SELECT id, data FROM events WHERE data IS NOT NULL")
-        for row_id, data_json in cur.fetchall():
-            if data_json:
-                try:
-                    data = json.loads(data_json) if isinstance(data_json, str) else data_json
-                    if isinstance(data, dict):
-                        scrubbed_data = _scrub_dict_recursive(data, scrubber)
-                        cur.execute(
-                            "UPDATE events SET data = ? WHERE id = ?",
-                            (json.dumps(scrubbed_data), row_id),
-                        )
-                except (json.JSONDecodeError, TypeError):
-                    pass
+        rows = cur.fetchall()
+        if rows:
+            with Progress(console=console) as progress:
+                task = progress.add_task("Scrubbing events...", total=len(rows))
+                for row_id, data_json in rows:
+                    if data_json:
+                        try:
+                            data = json.loads(data_json) if isinstance(data_json, str) else data_json
+                            if isinstance(data, dict):
+                                scrubbed_data = _scrub_dict_recursive(data, scrubber)
+                                cur.execute(
+                                    "UPDATE events SET data = ? WHERE id = ?",
+                                    (json.dumps(scrubbed_data), row_id),
+                                )
+                        except (json.JSONDecodeError, TypeError):
+                            pass
+                    progress.advance(task)
 
 
 def _scrub_recording_schema(cur, tables: set, scrubber) -> None:
@@ -169,18 +177,23 @@ def _scrub_recording_schema(cur, tables: set, scrubber) -> None:
         # Scrub element_state JSON
         try:
             cur.execute("SELECT id, element_state FROM action_event WHERE element_state IS NOT NULL")
-            for row_id, state_json in cur.fetchall():
-                if state_json:
-                    try:
-                        state = json.loads(state_json) if isinstance(state_json, str) else state_json
-                        if isinstance(state, dict):
-                            scrubbed_state = _scrub_dict_recursive(state, scrubber)
-                            cur.execute(
-                                "UPDATE action_event SET element_state = ? WHERE id = ?",
-                                (json.dumps(scrubbed_state), row_id),
-                            )
-                    except (json.JSONDecodeError, TypeError):
-                        pass
+            rows = cur.fetchall()
+            if rows:
+                with Progress(console=console) as progress:
+                    task = progress.add_task("Scrubbing action events...", total=len(rows))
+                    for row_id, state_json in rows:
+                        if state_json:
+                            try:
+                                state = json.loads(state_json) if isinstance(state_json, str) else state_json
+                                if isinstance(state, dict):
+                                    scrubbed_state = _scrub_dict_recursive(state, scrubber)
+                                    cur.execute(
+                                        "UPDATE action_event SET element_state = ? WHERE id = ?",
+                                        (json.dumps(scrubbed_state), row_id),
+                                    )
+                            except (json.JSONDecodeError, TypeError):
+                                pass
+                        progress.advance(task)
         except sqlite3.OperationalError:
             pass
 

@@ -122,31 +122,41 @@ def _check_scrub_deps() -> bool:
         import spacy  # noqa: F401
         import presidio_analyzer  # noqa: F401
         import presidio_anonymizer  # noqa: F401
-        return True
     except ImportError:
-        pass
+        console.print(
+            "[yellow]Scrubbing requires heavy dependencies (spaCy, Presidio, transformers) "
+            "which are not currently installed (~500 MB download).[/yellow]"
+        )
+        if not click.confirm("Install them now?", default=True):
+            console.print("[dim]Scrub cancelled.[/dim]")
+            return False
 
-    console.print(
-        "[yellow]Scrubbing requires heavy dependencies (spaCy, Presidio, transformers) "
-        "which are not currently installed (~500 MB download).[/yellow]"
-    )
-    if not click.confirm("Install them now?", default=True):
-        console.print("[dim]Scrub cancelled.[/dim]")
-        return False
+        import subprocess
 
-    import subprocess
+        console.print("[dim]Installing screencap[privacy] ...[/dim]")
+        result = subprocess.run(
+            [sys.executable, "-m", "pip", "install", "screencap[privacy]"],
+            capture_output=True,
+            text=True,
+        )
+        if result.returncode != 0:
+            console.print(f"[red]Installation failed:[/red]\n{result.stderr.strip()}")
+            return False
 
-    console.print("[dim]Installing openadapt-privacy[presidio] ...[/dim]")
-    result = subprocess.run(
-        [sys.executable, "-m", "pip", "install", "openadapt-privacy[presidio]"],
-        capture_output=True,
-        text=True,
-    )
-    if result.returncode != 0:
-        console.print(f"[red]Installation failed:[/red]\n{result.stderr.strip()}")
-        return False
+        console.print("[green]Dependencies installed.[/green]")
+        import spacy  # noqa: F811
 
-    console.print("[green]Dependencies installed successfully.[/green]")
+    # Ensure spaCy model is downloaded
+    import spacy
+
+    from openadapt_privacy.config import config as privacy_config
+
+    model_name = privacy_config.SPACY_MODEL_NAME
+    if not spacy.util.is_package(model_name):
+        with console.status(f"[bold]Downloading spaCy model ({model_name}) ...[/bold]"):
+            spacy.cli.download(model_name)
+        console.print(f"[green]Model {model_name} installed.[/green]")
+
     return True
 
 
