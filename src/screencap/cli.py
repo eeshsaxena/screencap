@@ -179,6 +179,15 @@ def info(name, as_json):
             if key == "displays":
                 for i, d in enumerate(val):
                     console.print(f"  [cyan]display {i}:[/cyan] {d.get('width')}x{d.get('height')}")
+            elif key == "locale" and isinstance(val, dict):
+                console.print(f"  [cyan]locale:[/cyan]")
+                for lk, lv in val.items():
+                    if isinstance(lv, list):
+                        console.print(f"    [cyan]{lk}:[/cyan] {', '.join(str(x) for x in lv)}")
+                    elif isinstance(lv, dict):
+                        console.print(f"    [cyan]{lk}:[/cyan] {lv}")
+                    else:
+                        console.print(f"    [cyan]{lk}:[/cyan] {lv}")
             else:
                 console.print(f"  [cyan]{key}:[/cyan] {val}")
 
