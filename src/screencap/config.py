@@ -50,6 +50,15 @@ def get_audio_default() -> bool:
     return cfg.get("audio_default", True)
 
 
+def get_wifi_metrics() -> bool:
+    """Return whether WiFi metrics collection is enabled (True = on)."""
+    env = os.environ.get("SCREENCAP_WIFI_METRICS")
+    if env is not None:
+        return env.lower() in ("1", "true", "yes")
+    cfg = _load_toml()
+    return cfg.get("wifi_metrics", True)
+
+
 def get_base_dir() -> Path:
     """Return ~/.screencap/, creating it if needed."""
     _DEFAULT_BASE.mkdir(parents=True, exist_ok=True)

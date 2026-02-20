@@ -36,6 +36,7 @@ dependencies = [
     "pyobjc-framework-Quartz>=9.0; sys_platform == 'darwin'",
     "pyobjc-framework-ApplicationServices>=9.0; sys_platform == 'darwin'",
     "pyobjc-framework-Cocoa>=9.0; sys_platform == 'darwin'",
+    "pyobjc-framework-CoreWLAN>=9.0; sys_platform == 'darwin'",
 ]
 
 [project.optional-dependencies]

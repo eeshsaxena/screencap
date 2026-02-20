@@ -25,7 +25,8 @@ def cli():
 @click.option("--description", "-d", default=None, help="Task description.")
 @click.option("--no-audio", is_flag=True, default=False, help="Disable audio capture.")
 @click.option("--output", "-o", type=click.Path(), default=None, help="Custom output directory.")
-def start(name, description, no_audio, output):
+@click.option("--no-wifi-metrics", is_flag=True, default=False, help="Disable WiFi metrics collection.")
+def start(name, description, no_audio, output, no_wifi_metrics):
     """Record a screen capture session. Ctrl+C to stop."""
     if not name:
         name = click.prompt("Recording name")
@@ -38,10 +39,11 @@ def start(name, description, no_audio, output):
         no_audio = audio_input.lower() == "n"
 
     audio = not no_audio
+    wifi_metrics = not no_wifi_metrics
 
     from screencap.recorder import start_recording
 
-    start_recording(name, description or None, audio, output)
+    start_recording(name, description or None, audio, output, wifi_metrics=wifi_metrics)
 
 
 @cli.command("list")
@@ -188,6 +190,10 @@ def info(name, as_json):
                         console.print(f"    [cyan]{lk}:[/cyan] {lv}")
                     else:
                         console.print(f"    [cyan]{lk}:[/cyan] {lv}")
+            elif key == "wifi" and isinstance(val, dict):
+                console.print(f"  [cyan]wifi:[/cyan]")
+                for wk, wv in val.items():
+                    console.print(f"    [cyan]{wk}:[/cyan] {wv}")
             else:
                 console.print(f"  [cyan]{key}:[/cyan] {val}")
 
@@ -196,7 +202,12 @@ def info(name, as_json):
         if snapshot:
             console.print(Panel(f"[bold]{phase.title()} Snapshot[/bold]"))
             for key, val in snapshot.items():
-                console.print(f"  [cyan]{key}:[/cyan] {val}")
+                if key == "wifi" and isinstance(val, dict):
+                    console.print(f"  [cyan]wifi:[/cyan]")
+                    for wk, wv in val.items():
+                        console.print(f"    [cyan]{wk}:[/cyan] {wv}")
+                else:
+                    console.print(f"  [cyan]{key}:[/cyan] {val}")
         elif phase == "end":
             console.print(f"\n  [dim]No end snapshot (recording may have been interrupted).[/dim]")
 

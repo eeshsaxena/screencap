@@ -49,6 +49,7 @@ def test_start_interactive():
         assert args[0][0] == "my-test"  # name
         assert args[0][1] == "some desc"  # description
         assert args[0][2] is True  # audio
+        assert args[1]["wifi_metrics"] is True
 
 
 def test_start_with_flags():
@@ -60,7 +61,23 @@ def test_start_with_flags():
             ["start", "--name", "test-rec", "--no-audio", "-d", "demo"],
         )
         assert result.exit_code == 0
-        mock_rec.assert_called_once_with("test-rec", "demo", False, None)
+        mock_rec.assert_called_once_with(
+            "test-rec", "demo", False, None, wifi_metrics=True,
+        )
+
+
+def test_start_no_wifi_metrics():
+    """Test --no-wifi-metrics flag is passed through."""
+    runner = CliRunner()
+    with mock.patch("screencap.recorder.start_recording") as mock_rec:
+        result = runner.invoke(
+            cli,
+            ["start", "--name", "test-rec", "--no-wifi-metrics"],
+        )
+        assert result.exit_code == 0
+        mock_rec.assert_called_once_with(
+            "test-rec", None, True, None, wifi_metrics=False,
+        )
 
 
 def test_view_not_found(tmp_path):
@@ -104,7 +121,7 @@ def _make_recording_dir(base, name, *, duration=60.0, with_metrics=False):
 
     if with_metrics:
         metrics = {
-            "schema_version": 2,
+            "schema_version": 3,
             "static": {
                 "hostname": "test-host.local",
                 "macos_version": "15.3",
@@ -129,9 +146,18 @@ def _make_recording_dir(base, name, *, duration=60.0, with_metrics=False):
                     "number_format": {"decimal_separator": ".", "grouping_separator": ","},
                     "currency_code": "USD",
                 },
+                "wifi": {"connected": True, "phy_mode": "802.11ax"},
             },
-            "start": {"collected_at": "2026-02-19T14:30:00+00:00", "cpu_percent": 12.5},
-            "end": {"collected_at": "2026-02-19T14:35:00+00:00", "cpu_percent": 18.0},
+            "start": {
+                "collected_at": "2026-02-19T14:30:00+00:00",
+                "cpu_percent": 12.5,
+                "wifi": {"rssi_dbm": -55, "tx_rate_mbps": 540.0},
+            },
+            "end": {
+                "collected_at": "2026-02-19T14:35:00+00:00",
+                "cpu_percent": 18.0,
+                "wifi": {"rssi_dbm": -52, "tx_rate_mbps": 780.0},
+            },
         }
         (rec_dir / "system_metrics.json").write_text(json.dumps(metrics))
 
@@ -152,6 +178,9 @@ def test_info_command_with_metrics(tmp_path):
     assert "en_US" in result.output
     assert "en-US" in result.output
     assert "America/New_York" in result.output
+    # WiFi rendering
+    assert "wifi:" in result.output
+    assert "802.11ax" in result.output
 
 
 def test_info_command_json_output(tmp_path):

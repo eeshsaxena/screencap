@@ -6,6 +6,8 @@ from unittest import mock
 from screencap.metrics import (
     METRICS_FILENAME,
     _collect_locale,
+    _collect_wifi_dynamic,
+    _collect_wifi_static,
     collect_dynamic_metrics,
     collect_static_metrics,
     save_metrics,
@@ -30,6 +32,10 @@ def test_collect_static_metrics_returns_expected_keys():
             return_value=mock.Mock(total=16 * 1024**3),
         ),
         mock.patch("screencap.metrics.mss.mss") as mock_mss,
+        mock.patch(
+            "screencap.metrics._collect_wifi_static",
+            return_value={"connected": True, "phy_mode": "802.11ax"},
+        ),
     ):
         mock_sct = mock.MagicMock()
         mock_sct.monitors = [
@@ -55,11 +61,13 @@ def test_collect_static_metrics_returns_expected_keys():
         "displays",
         "display_count",
         "locale",
+        "wifi",
     }
     assert expected_keys == set(result.keys())
     assert result["hostname"] == "test-host"
     assert result["display_count"] == 1
     assert result["displays"][0]["width"] == 2560
+    assert result["wifi"] == {"connected": True, "phy_mode": "802.11ax"}
 
 
 def test_collect_dynamic_metrics_returns_expected_keys():
@@ -77,6 +85,10 @@ def test_collect_dynamic_metrics_returns_expected_keys():
             "screencap.metrics.psutil.sensors_battery",
             return_value=mock.Mock(percent=87, power_plugged=True),
         ),
+        mock.patch(
+            "screencap.metrics._collect_wifi_dynamic",
+            return_value={"rssi_dbm": -55, "tx_rate_mbps": 540.0},
+        ),
     ):
         result = collect_dynamic_metrics()
 
@@ -89,11 +101,13 @@ def test_collect_dynamic_metrics_returns_expected_keys():
         "disk_available_gb",
         "battery_percent",
         "battery_charging",
+        "wifi",
     }
     assert expected_keys == set(result.keys())
     assert result["cpu_percent"] == 12.5
     assert result["battery_percent"] == 87
     assert result["battery_charging"] is True
+    assert result["wifi"] == {"rssi_dbm": -55, "tx_rate_mbps": 540.0}
 
 
 def test_save_metrics_start_creates_file(tmp_path):
@@ -107,7 +121,7 @@ def test_save_metrics_start_creates_file(tmp_path):
     assert metrics_file.exists()
 
     data = json.loads(metrics_file.read_text())
-    assert data["schema_version"] == 2
+    assert data["schema_version"] == 3
     assert data["static"] == {"hostname": "h"}
     assert data["start"] == {"cpu_percent": 10}
     assert data["end"] is None
@@ -147,7 +161,7 @@ def test_save_metrics_end_without_start(tmp_path):
     assert metrics_file.exists()
 
     data = json.loads(metrics_file.read_text())
-    assert data["schema_version"] == 2
+    assert data["schema_version"] == 3
     assert data["start"] is None
     assert data["end"] == {"cpu_percent": 5}
 
@@ -339,3 +353,208 @@ def test_collect_locale_partial_failure():
     assert result["preferred_languages"] == ["en-US", "pt-BR"]
     assert result["keyboard_layout"] == "com.apple.keylayout.US"
     assert result["timezone"] is not None
+
+
+# --- WiFi metrics tests ---
+
+
+def _make_mock_wifi_interface(*, ssid="MyNet", phy_mode=6, rssi=-55, tx_rate=540.0):
+    """Create a mock CWInterface with configurable values."""
+    iface = mock.Mock()
+    iface.ssid.return_value = ssid
+    iface.activePHYMode.return_value = phy_mode
+    iface.rssiValue.return_value = rssi
+    iface.transmitRate.return_value = tx_rate
+    return iface
+
+
+def _make_mock_wifi_client(iface=None):
+    """Create a mock CWWiFiClient.sharedWiFiClient()."""
+    client = mock.Mock()
+    client.interface.return_value = iface
+    return client
+
+
+def test_collect_wifi_static_happy_path():
+    """Connected WiFi returns connected=True and phy_mode string."""
+    iface = _make_mock_wifi_interface()
+    client = _make_mock_wifi_client(iface)
+
+    mock_module = mock.MagicMock()
+    mock_module.CWWiFiClient.sharedWiFiClient.return_value = client
+
+    with mock.patch.dict("sys.modules", {"CoreWLAN": mock_module}):
+        result = _collect_wifi_static()
+
+    assert result == {"connected": True, "phy_mode": "802.11ax"}
+
+
+def test_collect_wifi_static_ssid_nil_but_rssi_nonzero():
+    """macOS 14+ returns nil ssid without Location Services; RSSI fallback detects connected."""
+    iface = _make_mock_wifi_interface(ssid=None, phy_mode=6, rssi=-44)
+    client = _make_mock_wifi_client(iface)
+
+    mock_module = mock.MagicMock()
+    mock_module.CWWiFiClient.sharedWiFiClient.return_value = client
+
+    with mock.patch.dict("sys.modules", {"CoreWLAN": mock_module}):
+        result = _collect_wifi_static()
+
+    assert result["connected"] is True
+    assert result["phy_mode"] == "802.11ax"
+
+
+def test_collect_wifi_static_no_interface():
+    """No WiFi hardware returns None fields."""
+    client = _make_mock_wifi_client(iface=None)
+
+    mock_module = mock.MagicMock()
+    mock_module.CWWiFiClient.sharedWiFiClient.return_value = client
+
+    with mock.patch.dict("sys.modules", {"CoreWLAN": mock_module}):
+        result = _collect_wifi_static()
+
+    assert result == {"connected": None, "phy_mode": None}
+
+
+def test_collect_wifi_static_not_connected():
+    """WiFi interface exists but not connected (ssid=None and rssi=0)."""
+    iface = _make_mock_wifi_interface(ssid=None, rssi=0)
+    client = _make_mock_wifi_client(iface)
+
+    mock_module = mock.MagicMock()
+    mock_module.CWWiFiClient.sharedWiFiClient.return_value = client
+
+    with mock.patch.dict("sys.modules", {"CoreWLAN": mock_module}):
+        result = _collect_wifi_static()
+
+    assert result["connected"] is False
+
+
+def test_collect_wifi_static_import_error():
+    """CoreWLAN not installed returns None."""
+    with mock.patch.dict("sys.modules", {"CoreWLAN": None}):
+        result = _collect_wifi_static()
+
+    assert result is None
+
+
+def test_collect_wifi_dynamic_happy_path():
+    """Connected WiFi returns RSSI and TX rate."""
+    iface = _make_mock_wifi_interface(rssi=-55, tx_rate=540.0)
+    client = _make_mock_wifi_client(iface)
+
+    mock_module = mock.MagicMock()
+    mock_module.CWWiFiClient.sharedWiFiClient.return_value = client
+
+    with mock.patch.dict("sys.modules", {"CoreWLAN": mock_module}):
+        result = _collect_wifi_dynamic()
+
+    assert result == {"rssi_dbm": -55, "tx_rate_mbps": 540.0}
+
+
+def test_collect_wifi_dynamic_rssi_zero_sentinel():
+    """RSSI of 0 is treated as invalid and stored as None."""
+    iface = _make_mock_wifi_interface(rssi=0, tx_rate=867.0)
+    client = _make_mock_wifi_client(iface)
+
+    mock_module = mock.MagicMock()
+    mock_module.CWWiFiClient.sharedWiFiClient.return_value = client
+
+    with mock.patch.dict("sys.modules", {"CoreWLAN": mock_module}):
+        result = _collect_wifi_dynamic()
+
+    assert result["rssi_dbm"] is None
+    assert result["tx_rate_mbps"] == 867.0
+
+
+def test_collect_wifi_dynamic_no_interface():
+    """No WiFi hardware returns None fields for dynamic metrics."""
+    client = _make_mock_wifi_client(iface=None)
+
+    mock_module = mock.MagicMock()
+    mock_module.CWWiFiClient.sharedWiFiClient.return_value = client
+
+    with mock.patch.dict("sys.modules", {"CoreWLAN": mock_module}):
+        result = _collect_wifi_dynamic()
+
+    assert result == {"rssi_dbm": None, "tx_rate_mbps": None}
+
+
+def test_collect_wifi_dynamic_import_error():
+    """CoreWLAN not installed returns None for dynamic."""
+    with mock.patch.dict("sys.modules", {"CoreWLAN": None}):
+        result = _collect_wifi_dynamic()
+
+    assert result is None
+
+
+def test_wifi_metrics_disabled():
+    """When wifi_metrics=False, wifi key is omitted from both static and dynamic."""
+    with (
+        mock.patch("screencap.metrics.socket.gethostname", return_value="h"),
+        mock.patch("screencap.metrics.platform.mac_ver", return_value=("15.3", ("", "", ""), "")),
+        mock.patch(
+            "screencap.metrics.platform.uname",
+            return_value=mock.Mock(system="Darwin", release="24.6.0"),
+        ),
+        mock.patch(
+            "screencap.metrics.subprocess.run",
+            return_value=mock.Mock(stdout='{"SPDisplaysDataType": []}', returncode=0),
+        ),
+        mock.patch("screencap.metrics.psutil.cpu_count", return_value=8),
+        mock.patch(
+            "screencap.metrics.psutil.virtual_memory",
+            return_value=mock.Mock(total=16 * 1024**3, used=8 * 1024**3, percent=50.0),
+        ),
+        mock.patch(
+            "screencap.metrics.psutil.disk_usage",
+            return_value=mock.Mock(total=500 * 1024**3, free=200 * 1024**3),
+        ),
+        mock.patch(
+            "screencap.metrics.psutil.sensors_battery",
+            return_value=None,
+        ),
+        mock.patch("screencap.metrics.psutil.cpu_percent", return_value=5.0),
+        mock.patch("screencap.metrics.mss.mss") as mock_mss,
+    ):
+        mock_sct = mock.MagicMock()
+        mock_sct.monitors = [{"width": 3840, "height": 2160}]
+        mock_mss.return_value.__enter__ = mock.Mock(return_value=mock_sct)
+        mock_mss.return_value.__exit__ = mock.Mock(return_value=False)
+
+        static = collect_static_metrics(wifi_metrics=False)
+        dynamic = collect_dynamic_metrics(wifi_metrics=False)
+
+    assert "wifi" not in static
+    assert "wifi" not in dynamic
+
+
+def test_get_wifi_metrics_config_default():
+    """Default returns True."""
+    from screencap.config import get_wifi_metrics
+
+    with mock.patch("screencap.config._load_toml", return_value={}):
+        assert get_wifi_metrics() is True
+
+
+def test_get_wifi_metrics_config_env_var():
+    """Env var SCREENCAP_WIFI_METRICS overrides config."""
+    from screencap.config import get_wifi_metrics
+
+    with mock.patch.dict("os.environ", {"SCREENCAP_WIFI_METRICS": "false"}):
+        assert get_wifi_metrics() is False
+
+    with mock.patch.dict("os.environ", {"SCREENCAP_WIFI_METRICS": "true"}):
+        assert get_wifi_metrics() is True
+
+
+def test_get_wifi_metrics_config_toml():
+    """config.toml wifi_metrics=false disables WiFi collection."""
+    from screencap.config import get_wifi_metrics
+
+    with (
+        mock.patch.dict("os.environ", {}, clear=True),
+        mock.patch("screencap.config._load_toml", return_value={"wifi_metrics": False}),
+    ):
+        assert get_wifi_metrics() is False
