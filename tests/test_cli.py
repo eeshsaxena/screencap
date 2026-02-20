@@ -104,7 +104,7 @@ def _make_recording_dir(base, name, *, duration=60.0, with_metrics=False):
 
     if with_metrics:
         metrics = {
-            "schema_version": 1,
+            "schema_version": 2,
             "static": {
                 "hostname": "test-host.local",
                 "macos_version": "15.3",
@@ -118,6 +118,17 @@ def _make_recording_dir(base, name, *, duration=60.0, with_metrics=False):
                 "kernel_version": "Darwin 24.6.0",
                 "displays": [{"width": 2560, "height": 1600}],
                 "display_count": 1,
+                "locale": {
+                    "system_locale": "en_US",
+                    "preferred_languages": ["en-US", "pt-BR"],
+                    "keyboard_layout": "com.apple.keylayout.US",
+                    "input_sources": ["com.apple.keylayout.US"],
+                    "timezone": "America/New_York",
+                    "timezone_offset": "-05:00",
+                    "date_format": "M/d/yy",
+                    "number_format": {"decimal_separator": ".", "grouping_separator": ","},
+                    "currency_code": "USD",
+                },
             },
             "start": {"collected_at": "2026-02-19T14:30:00+00:00", "cpu_percent": 12.5},
             "end": {"collected_at": "2026-02-19T14:35:00+00:00", "cpu_percent": 18.0},
@@ -136,6 +147,11 @@ def test_info_command_with_metrics(tmp_path):
     assert "demo" in result.output
     assert "Apple M2" in result.output
     assert "15.3" in result.output
+    # Locale rendering
+    assert "locale:" in result.output
+    assert "en_US" in result.output
+    assert "en-US" in result.output
+    assert "America/New_York" in result.output
 
 
 def test_info_command_json_output(tmp_path):

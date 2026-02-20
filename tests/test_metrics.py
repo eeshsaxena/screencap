@@ -5,6 +5,7 @@ from unittest import mock
 
 from screencap.metrics import (
     METRICS_FILENAME,
+    _collect_locale,
     collect_dynamic_metrics,
     collect_static_metrics,
     save_metrics,
@@ -53,6 +54,7 @@ def test_collect_static_metrics_returns_expected_keys():
         "screencap_version",
         "displays",
         "display_count",
+        "locale",
     }
     assert expected_keys == set(result.keys())
     assert result["hostname"] == "test-host"
@@ -105,7 +107,7 @@ def test_save_metrics_start_creates_file(tmp_path):
     assert metrics_file.exists()
 
     data = json.loads(metrics_file.read_text())
-    assert data["schema_version"] == 1
+    assert data["schema_version"] == 2
     assert data["static"] == {"hostname": "h"}
     assert data["start"] == {"cpu_percent": 10}
     assert data["end"] is None
@@ -145,7 +147,7 @@ def test_save_metrics_end_without_start(tmp_path):
     assert metrics_file.exists()
 
     data = json.loads(metrics_file.read_text())
-    assert data["schema_version"] == 1
+    assert data["schema_version"] == 2
     assert data["start"] is None
     assert data["end"] == {"cpu_percent": 5}
 
@@ -235,7 +237,7 @@ def test_gpu_detection_timeout(tmp_path):
 
 
 def subprocess_side_effect(*args, **kwargs):
-    """Return CPU model for sysctl, timeout for system_profiler."""
+    """Return CPU model for sysctl, timeout for system_profiler, mock defaults."""
     import subprocess
 
     cmd = args[0] if args else kwargs.get("args", [])
@@ -243,4 +245,97 @@ def subprocess_side_effect(*args, **kwargs):
         return mock.Mock(stdout="Apple M2 Pro", returncode=0)
     if "system_profiler" in cmd:
         raise subprocess.TimeoutExpired(cmd, 5)
+    if "defaults" in cmd:
+        return _defaults_side_effect(cmd, **kwargs)
     return mock.Mock(stdout="", returncode=0)
+
+
+def _defaults_side_effect(cmd, **kwargs):
+    """Handle defaults read/export commands for locale tests."""
+    import plistlib
+
+    cmd_str = " ".join(cmd)
+    if "AppleLocale" in cmd:
+        return mock.Mock(stdout="en_US@currency=USD\n", returncode=0)
+    if "AppleLanguages" in cmd:
+        return mock.Mock(
+            stdout='(\n    "en-US",\n    "pt-BR"\n)\n',
+            returncode=0,
+        )
+    if "AppleCurrentKeyboardLayoutInputSourceID" in cmd:
+        return mock.Mock(stdout="com.apple.keylayout.US\n", returncode=0)
+    if "export" in cmd and "HIToolbox" in cmd_str:
+        plist_bytes = plistlib.dumps({
+            "AppleEnabledInputSources": [
+                {"KeyboardLayout Name": "U.S."},
+            ],
+        })
+        return mock.Mock(stdout=plist_bytes, returncode=0)
+    if "AppleICUDateFormatStrings" in cmd:
+        return mock.Mock(
+            stdout='{\n    1 = "M/d/yy";\n    2 = "MMM d, y";\n}\n',
+            returncode=0,
+        )
+    if "AppleICUNumberSymbols" in cmd:
+        return mock.Mock(
+            stdout='{\n    0 = ".";\n    1 = ",";\n}\n',
+            returncode=0,
+        )
+    return mock.Mock(stdout="", returncode=0)
+
+
+def test_collect_locale_happy_path():
+    """All 9 locale fields populate when subprocess calls succeed."""
+    with mock.patch(
+        "screencap.metrics.subprocess.run",
+        side_effect=_defaults_side_effect,
+    ):
+        result = _collect_locale()
+
+    assert set(result.keys()) == {
+        "system_locale",
+        "preferred_languages",
+        "keyboard_layout",
+        "input_sources",
+        "timezone",
+        "timezone_offset",
+        "date_format",
+        "number_format",
+        "currency_code",
+    }
+    assert result["system_locale"] == "en_US"
+    assert result["preferred_languages"] == ["en-US", "pt-BR"]
+    assert result["keyboard_layout"] == "com.apple.keylayout.US"
+    assert result["input_sources"] == ["U.S."]
+    assert result["timezone"] is not None  # depends on host
+    assert result["timezone_offset"] is not None
+    assert result["date_format"] == "M/d/yy"
+    assert result["number_format"] == {"decimal_separator": ".", "grouping_separator": ","}
+    assert result["currency_code"] == "USD"
+
+
+def test_collect_locale_partial_failure():
+    """If one defaults call fails, other fields still populate."""
+    call_count = 0
+
+    def flaky_side_effect(*args, **kwargs):
+        nonlocal call_count
+        call_count += 1
+        cmd = args[0] if args else kwargs.get("args", [])
+        # Fail the first subprocess call (AppleLocale for system_locale)
+        if call_count == 1:
+            raise OSError("simulated failure")
+        return _defaults_side_effect(cmd, **kwargs)
+
+    with mock.patch(
+        "screencap.metrics.subprocess.run",
+        side_effect=flaky_side_effect,
+    ):
+        result = _collect_locale()
+
+    # The first field (system_locale) should be None due to the failure
+    assert result["system_locale"] is None
+    # Other subprocess-based fields should still succeed
+    assert result["preferred_languages"] == ["en-US", "pt-BR"]
+    assert result["keyboard_layout"] == "com.apple.keylayout.US"
+    assert result["timezone"] is not None
