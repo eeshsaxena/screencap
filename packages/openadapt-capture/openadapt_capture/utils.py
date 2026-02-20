@@ -44,15 +44,24 @@ def get_process_local_sct() -> mss.mss:
 
 
 def get_monitor_dims() -> tuple[int, int]:
-    """Get the dimensions of the monitor.
+    """Get the logical dimensions of the primary monitor.
+
+    On macOS, uses Quartz to avoid triggering the slow ``mss`` / Core Graphics
+    screen-capture path.
 
     Returns:
         tuple[int, int]: The width and height of the monitor.
     """
+    if sys.platform == "darwin":
+        try:
+            import Quartz
+
+            main = Quartz.CGMainDisplayID()
+            return Quartz.CGDisplayPixelsWide(main), Quartz.CGDisplayPixelsHigh(main)
+        except (ImportError, Exception):
+            pass
     monitor = get_process_local_sct().monitors[0]
-    monitor_width = monitor["width"]
-    monitor_height = monitor["height"]
-    return monitor_width, monitor_height
+    return monitor["width"], monitor["height"]
 
 
 def set_start_time(value: float = None) -> float:
@@ -94,15 +103,55 @@ def get_timestamp() -> float:
 def take_screenshot() -> Image.Image:
     """Take a screenshot.
 
+    On macOS, uses the ``screencapture`` CLI because the Core Graphics API
+    (``CGWindowListCreateImage``, used by ``mss``) is throttled to ~30 s per
+    call on macOS Sequoia. ``screencapture`` is fast (~150 ms) and works
+    from any thread.
+
+    On other platforms, falls back to ``mss.grab()``.
+
     Returns:
-        PIL.Image: The screenshot image.
+        PIL.Image: The screenshot image, or None on failure.
     """
-    # monitor 0 is all in one
+    if sys.platform == "darwin":
+        return _take_screenshot_macos()
+    # Non-macOS: use mss
     sct = get_process_local_sct()
     monitor = sct.monitors[0]
     sct_img = sct.grab(monitor)
     image = Image.frombytes("RGB", sct_img.size, sct_img.bgra, "raw", "BGRX")
     return image
+
+
+def _take_screenshot_macos() -> Image.Image | None:
+    """Capture the screen on macOS using the ``screencapture`` CLI.
+
+    Returns:
+        PIL.Image or None on failure.
+    """
+    import os
+    import subprocess
+    import tempfile
+
+    fd, tmp = tempfile.mkstemp(suffix=".png")
+    os.close(fd)
+    try:
+        subprocess.run(
+            ["screencapture", "-x", "-C", tmp],
+            capture_output=True,
+            timeout=10,
+        )
+        image = Image.open(tmp)
+        image.load()  # force read before we delete the file
+        return image.convert("RGB")
+    except Exception as exc:
+        logger.warning(f"screencapture failed: {exc}")
+        return None
+    finally:
+        try:
+            os.unlink(tmp)
+        except OSError:
+            pass
 
 
 def get_double_click_interval_seconds() -> float:

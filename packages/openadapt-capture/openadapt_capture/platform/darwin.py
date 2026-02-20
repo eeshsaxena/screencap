@@ -98,6 +98,23 @@ class DarwinPlatform:
             return 1.0
 
     @staticmethod
+    def is_screen_recording_enabled() -> bool:
+        """Check if Screen Recording permission is granted.
+
+        macOS requires Screen Recording permission for capturing screen content.
+        Without it, mss.grab() returns all-black frames with no error.
+
+        Returns:
+            True if permission is granted, False otherwise.
+        """
+        try:
+            import Quartz
+
+            return Quartz.CGPreflightScreenCaptureAccess()
+        except (ImportError, AttributeError):
+            return True  # Assume enabled if we can't check
+
+    @staticmethod
     def is_accessibility_enabled() -> bool:
         """Check if accessibility permissions are enabled.
 

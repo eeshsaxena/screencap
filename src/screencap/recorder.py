@@ -4,6 +4,7 @@ from __future__ import annotations
 
 import os
 import signal
+import sys
 import time
 import warnings
 from pathlib import Path
@@ -56,6 +57,21 @@ def start_recording(
         raise SystemExit(1)
 
     capture_dir.mkdir(parents=True, exist_ok=True)
+
+    # Check macOS Screen Recording permission before starting
+    if sys.platform == "darwin":
+        try:
+            from openadapt_capture.platform.darwin import DarwinPlatform
+
+            if not DarwinPlatform.is_screen_recording_enabled():
+                console.print(
+                    "[red]Error:[/red] Screen Recording permission not granted.\n"
+                    "  Go to: System Settings > Privacy & Security > Screen Recording\n"
+                    "  Enable your terminal app, then restart it."
+                )
+                raise SystemExit(1)
+        except ImportError:
+            pass
 
     desc = description or ""
 
