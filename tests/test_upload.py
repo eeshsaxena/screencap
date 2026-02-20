@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import json
 import sqlite3
 from unittest import mock
 
@@ -9,9 +10,11 @@ from click.testing import CliRunner
 
 from screencap.cli import cli
 from screencap.upload import (
+    UPLOAD_STATUS_FILE,
     FileInfo,
     _content_type,
     _fmt_size,
+    is_uploaded,
     list_recording_files,
 )
 
@@ -582,3 +585,207 @@ def test_retry_url_none_means_success(tmp_path):
     ):
         # Should NOT raise — None URL means file already uploaded
         _upload_with_progress(f, "https://old-url", progress, "t", "rec1", max_retries=1)
+
+
+# ---------------------------------------------------------------------------
+# Upload status tracking
+# ---------------------------------------------------------------------------
+
+
+def test_is_uploaded_false(tmp_path):
+    """No status file → not uploaded."""
+    rec = tmp_path / "my-rec"
+    rec.mkdir()
+    assert is_uploaded(rec) is False
+
+
+def test_is_uploaded_true(tmp_path):
+    """Status file present → uploaded."""
+    rec = tmp_path / "my-rec"
+    rec.mkdir()
+    (rec / UPLOAD_STATUS_FILE).write_text('{"uploaded_at": "2026-01-01"}')
+    assert is_uploaded(rec) is True
+
+
+def test_upload_writes_status_file(tmp_path):
+    """Successful upload should create .upload_status.json."""
+    from screencap.upload import upload_recording
+
+    rec = tmp_path / "my-rec"
+    rec.mkdir()
+    (rec / "video.mp4").write_bytes(b"x" * 100)
+
+    mock_urls_resp = mock.MagicMock()
+    mock_urls_resp.status_code = 200
+    mock_urls_resp.json.return_value = {
+        "urls": {"video.mp4": "https://url/video"},
+        "gcs_prefix": "gs://bucket/recordings/my-rec/",
+    }
+
+    mock_put_resp = mock.MagicMock()
+    mock_put_resp.status_code = 200
+    mock_put_resp.raise_for_status = mock.MagicMock()
+
+    with (
+        mock.patch("screencap.upload.requests.post", return_value=mock_urls_resp),
+        mock.patch("screencap.upload.requests.put", return_value=mock_put_resp),
+    ):
+        result = upload_recording(rec)
+
+    assert result.uploaded == ["video.mp4"]
+
+    status_path = rec / UPLOAD_STATUS_FILE
+    assert status_path.exists()
+    status = json.loads(status_path.read_text())
+    assert status["gcs_prefix"] == "gs://bucket/recordings/my-rec/"
+    assert status["files_uploaded"] == 1
+    assert "uploaded_at" in status
+
+
+def test_upload_writes_status_when_all_skipped(tmp_path):
+    """When server says all files exist, status file should still be written."""
+    from screencap.upload import upload_recording
+
+    rec = tmp_path / "my-rec"
+    rec.mkdir()
+    (rec / "video.mp4").write_bytes(b"x" * 100)
+
+    mock_urls_resp = mock.MagicMock()
+    mock_urls_resp.status_code = 200
+    mock_urls_resp.json.return_value = {
+        "urls": {"video.mp4": None},
+        "gcs_prefix": "gs://bucket/recordings/my-rec/",
+    }
+
+    with mock.patch("screencap.upload.requests.post", return_value=mock_urls_resp):
+        upload_recording(rec)
+
+    assert (rec / UPLOAD_STATUS_FILE).exists()
+
+
+def test_upload_does_not_write_status_on_failure(tmp_path):
+    """Failed uploads should NOT write status file."""
+    from screencap.upload import upload_recording
+
+    rec = tmp_path / "my-rec"
+    rec.mkdir()
+    (rec / "video.mp4").write_bytes(b"x" * 100)
+
+    mock_urls_resp = mock.MagicMock()
+    mock_urls_resp.status_code = 200
+    mock_urls_resp.json.return_value = {
+        "urls": {"video.mp4": "https://url/video"},
+        "gcs_prefix": "gs://bucket/recordings/my-rec/",
+    }
+
+    mock_put_resp = mock.MagicMock()
+    mock_put_resp.status_code = 500
+    mock_put_resp.raise_for_status.side_effect = Exception("upload failed")
+
+    with (
+        mock.patch("screencap.upload.requests.post", return_value=mock_urls_resp),
+        mock.patch("screencap.upload.requests.put", return_value=mock_put_resp),
+    ):
+        result = upload_recording(rec)
+
+    assert result.failed == ["video.mp4"]
+    assert not (rec / UPLOAD_STATUS_FILE).exists()
+
+
+def test_upload_skips_if_already_uploaded(tmp_path):
+    """When status file exists, upload_recording should skip (no network calls)."""
+    from screencap.upload import upload_recording
+
+    rec = tmp_path / "my-rec"
+    rec.mkdir()
+    (rec / "video.mp4").write_bytes(b"x" * 100)
+    (rec / UPLOAD_STATUS_FILE).write_text('{"uploaded_at": "2026-01-01"}')
+
+    # No mocks for requests — if it tries to call the network, it'll fail
+    result = upload_recording(rec)
+    assert result.recording == "my-rec"
+    assert result.uploaded == []
+
+
+def test_upload_force_bypasses_status_check(tmp_path):
+    """--force should upload even when status file exists."""
+    from screencap.upload import upload_recording
+
+    rec = tmp_path / "my-rec"
+    rec.mkdir()
+    (rec / "video.mp4").write_bytes(b"x" * 100)
+    (rec / UPLOAD_STATUS_FILE).write_text('{"uploaded_at": "2026-01-01"}')
+
+    mock_urls_resp = mock.MagicMock()
+    mock_urls_resp.status_code = 200
+    mock_urls_resp.json.return_value = {
+        "urls": {"video.mp4": "https://url/video"},
+        "gcs_prefix": "gs://bucket/recordings/my-rec/",
+    }
+
+    mock_put_resp = mock.MagicMock()
+    mock_put_resp.status_code = 200
+    mock_put_resp.raise_for_status = mock.MagicMock()
+
+    with (
+        mock.patch("screencap.upload.requests.post", return_value=mock_urls_resp),
+        mock.patch("screencap.upload.requests.put", return_value=mock_put_resp),
+    ):
+        result = upload_recording(rec, force=True)
+
+    assert result.uploaded == ["video.mp4"]
+
+
+def test_dry_run_does_not_write_status(tmp_path):
+    """Dry run should NOT write status file."""
+    from screencap.upload import upload_recording
+
+    rec = tmp_path / "my-rec"
+    rec.mkdir()
+    (rec / "video.mp4").write_bytes(b"x" * 100)
+
+    result = upload_recording(rec, dry_run=True)
+    assert not (rec / UPLOAD_STATUS_FILE).exists()
+
+
+def test_upload_cli_force_flag(tmp_path):
+    """CLI --force flag should bypass local upload check."""
+    rec = tmp_path / "my-rec"
+    rec.mkdir()
+    (rec / "video.mp4").write_bytes(b"x" * 100)
+    (rec / UPLOAD_STATUS_FILE).write_text('{"uploaded_at": "2026-01-01"}')
+
+    mock_urls_resp = mock.MagicMock()
+    mock_urls_resp.status_code = 200
+    mock_urls_resp.json.return_value = {
+        "urls": {"video.mp4": "https://url/video"},
+        "gcs_prefix": "gs://bucket/recordings/my-rec/",
+    }
+
+    mock_put_resp = mock.MagicMock()
+    mock_put_resp.status_code = 200
+    mock_put_resp.raise_for_status = mock.MagicMock()
+
+    runner = CliRunner()
+    with (
+        mock.patch("screencap.upload.get_recordings_dir", return_value=tmp_path),
+        mock.patch("screencap.upload.requests.post", return_value=mock_urls_resp),
+        mock.patch("screencap.upload.requests.put", return_value=mock_put_resp),
+    ):
+        result = runner.invoke(cli, ["upload", "my-rec", "--force"])
+    assert result.exit_code == 0
+    assert "Uploaded" in result.output
+
+
+def test_upload_cli_skips_already_uploaded(tmp_path):
+    """CLI upload should print skip message when already uploaded."""
+    rec = tmp_path / "my-rec"
+    rec.mkdir()
+    (rec / "video.mp4").write_bytes(b"x" * 100)
+    (rec / UPLOAD_STATUS_FILE).write_text('{"uploaded_at": "2026-01-01"}')
+
+    runner = CliRunner()
+    with mock.patch("screencap.upload.get_recordings_dir", return_value=tmp_path):
+        result = runner.invoke(cli, ["upload", "my-rec"])
+    assert result.exit_code == 0
+    assert "Already uploaded" in result.output

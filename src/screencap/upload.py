@@ -2,9 +2,11 @@
 
 from __future__ import annotations
 
+import json
 import mimetypes
 import os
 from dataclasses import dataclass, field
+from datetime import datetime
 from pathlib import Path
 
 import requests
@@ -20,6 +22,8 @@ from rich.progress import (
 from screencap.config import get_recordings_dir
 
 console = Console()
+
+UPLOAD_STATUS_FILE = ".upload_status.json"
 
 DEFAULT_UPLOAD_URL = (
     "https://screencap-recording-signed-url-397234807794.southamerica-east1.run.app"
@@ -78,11 +82,30 @@ def _fmt_size(nbytes: int) -> str:
     return f"{nbytes / (1024 * 1024 * 1024):.1f} GB"
 
 
+def _write_upload_status(recording_dir: Path, result: UploadResult) -> None:
+    """Write upload status marker to recording directory."""
+    status = {
+        "uploaded_at": datetime.now().isoformat(),
+        "gcs_prefix": result.gcs_prefix,
+        "files_uploaded": len(result.uploaded),
+        "files_skipped": len(result.skipped),
+        "total_bytes": result.total_bytes,
+    }
+    (recording_dir / UPLOAD_STATUS_FILE).write_text(
+        json.dumps(status, indent=2)
+    )
+
+
+def is_uploaded(recording_dir: Path) -> bool:
+    """Check if a recording has been uploaded."""
+    return (recording_dir / UPLOAD_STATUS_FILE).is_file()
+
+
 def list_recording_files(recording_dir: Path) -> list[FileInfo]:
     """Return files in a recording dir, sorted largest-first."""
     files = []
     for p in sorted(recording_dir.iterdir()):
-        if p.is_symlink() or not p.is_file():
+        if p.is_symlink() or not p.is_file() or p.name.startswith("."):
             continue
         try:
             size = p.stat().st_size
@@ -96,7 +119,7 @@ def list_recording_files(recording_dir: Path) -> list[FileInfo]:
         ))
     # Also include files in subdirectories (e.g., screenshots/)
     for p in sorted(recording_dir.rglob("*")):
-        if p.is_symlink() or not p.is_file() or p.parent == recording_dir:
+        if p.is_symlink() or not p.is_file() or p.parent == recording_dir or p.name.startswith("."):
             continue
         try:
             size = p.stat().st_size
@@ -170,6 +193,7 @@ def upload_recording(
     recording_dir: Path,
     dry_run: bool = False,
     max_retries: int = 1,
+    force: bool = False,
 ) -> UploadResult:
     """Upload all files in a recording directory.
 
@@ -179,6 +203,13 @@ def upload_recording(
     4. Return summary
     """
     recording_name = recording_dir.name
+
+    if not dry_run and not force and is_uploaded(recording_dir):
+        console.print(
+            f"  [dim]Already uploaded (use --force to re-upload)[/dim]"
+        )
+        return UploadResult(recording=recording_name)
+
     files = list_recording_files(recording_dir)
 
     if not files:
@@ -227,6 +258,7 @@ def upload_recording(
 
     if not to_upload:
         console.print(f"  [dim]All files already uploaded.[/dim]")
+        _write_upload_status(recording_dir, result)
         return result
 
     # Upload with progress bars
@@ -250,6 +282,9 @@ def upload_recording(
                 progress.update(task_id, description=f"[red]{f.name} (failed)[/red]")
                 result.failed.append(f.name)
                 console.print(f"  [red]Error uploading {f.name}:[/red] {e}")
+
+    if not result.failed:
+        _write_upload_status(recording_dir, result)
 
     return result
 

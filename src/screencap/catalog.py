@@ -19,6 +19,7 @@ class RecordingInfo(NamedTuple):
     size_mb: str  # e.g. "48.3 MB"
     has_audio: bool
     has_scrubbed: bool
+    uploaded: bool
 
 
 def _fmt_duration(seconds: float | None) -> str:
@@ -123,6 +124,7 @@ def list_recordings(recordings_dir: Path | None = None) -> list[RecordingInfo]:
 
         has_audio = (d / "audio.flac").exists()
         has_scrubbed = (recordings_dir / f"{d.name}-scrubbed").is_dir()
+        uploaded = (d / ".upload_status.json").is_file()
 
         results.append(
             RecordingInfo(
@@ -132,6 +134,7 @@ def list_recordings(recordings_dir: Path | None = None) -> list[RecordingInfo]:
                 size_mb=_dir_size_mb(d),
                 has_audio=has_audio,
                 has_scrubbed=has_scrubbed,
+                uploaded=uploaded,
             )
         )
 
