@@ -37,6 +37,9 @@ screencap view my-session
 
 # scrub PII (first run installs ~500 MB of deps)
 screencap scrub my-session
+
+# transcribe audio (interactive — offers API or local Whisper)
+screencap transcribe my-session
 ```
 
 Press **Ctrl+C** once to stop recording gracefully. Double Ctrl+C to force quit.
@@ -82,6 +85,23 @@ Creates a privacy-scrubbed copy at `<name>-scrubbed/`. Never mutates originals.
 **What gets scrubbed:** screenshots (OCR + redaction), database text fields, transcript.json.
 **Not yet supported:** video.mp4 scrubbing.
 **Detected entities:** PERSON, EMAIL, PHONE, SSN, CREDIT_CARD, DATE_TIME, LOCATION.
+
+### `screencap transcribe <name>`
+
+Transcribe a recording's audio using Whisper. Interactively offers OpenAI API or local model.
+
+- If `OPENAI_API_KEY` is set, prompts to use the API (~$0.006/min)
+- Otherwise offers to enter a key or transcribe locally
+- Auto-installs `faster-whisper` if no local backend is found
+- Produces `transcript.txt` and `transcript.json` (with timestamps)
+
+| Model | Size | Notes |
+|-------|------|-------|
+| tiny | ~39 MB | Fast, lower accuracy |
+| base | ~140 MB | Good balance (recommended) |
+| small | ~466 MB | Better accuracy |
+| medium | ~1.5 GB | High accuracy |
+| large | ~2.9 GB | Best accuracy |
 
 ### `screencap --version`
 
