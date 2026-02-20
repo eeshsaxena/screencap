@@ -226,7 +226,10 @@ def process_events(
     prev_saved_window_timestamp = 0
     started = False
     while not terminate_processing.is_set() or not event_q.empty():
-        event = event_q.get()
+        try:
+            event = event_q.get(timeout=1.0)
+        except queue.Empty:
+            continue
         if not started:
             started_event.set()
             started = True
@@ -1727,12 +1730,23 @@ def record(
         collect_stats(performance_snapshots)
         log_memory_usage(_tracker, performance_snapshots)
 
-    def join_tasks(task_names: list[str]) -> None:
+    def join_tasks(task_names: list[str], timeout: float = 10.0) -> None:
         for task_name in task_names:
-            if task_name in task_by_name:
-                logger.info(f"joining {task_name=}...")
-                task = task_by_name[task_name]
-                task.join()
+            if task_name not in task_by_name:
+                continue
+            task = task_by_name[task_name]
+            logger.info(f"joining {task_name=}...")
+            task.join(timeout=timeout)
+            if task.is_alive():
+                logger.warning(f"{task_name} did not exit in {timeout}s, terminating")
+                if hasattr(task, "terminate"):
+                    task.terminate()
+                    task.join(timeout=5)
+                if hasattr(task, "is_alive") and task.is_alive():
+                    logger.warning(f"{task_name} still alive after terminate, killing")
+                    if hasattr(task, "kill"):
+                        task.kill()
+                        task.join(timeout=2)
 
     join_tasks(
         [

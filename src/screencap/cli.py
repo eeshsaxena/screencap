@@ -26,7 +26,8 @@ def cli():
 @click.option("--no-audio", is_flag=True, default=False, help="Disable audio capture.")
 @click.option("--output", "-o", type=click.Path(), default=None, help="Custom output directory.")
 @click.option("--no-wifi-metrics", is_flag=True, default=False, help="Disable WiFi metrics collection.")
-def start(name, description, no_audio, output, no_wifi_metrics):
+@click.option("--force", is_flag=True, default=False, help="Auto-clean orphaned processes before starting.")
+def start(name, description, no_audio, output, no_wifi_metrics, force):
     """Record a screen capture session. Ctrl+C to stop."""
     if not name:
         name = click.prompt("Recording name")
@@ -43,7 +44,10 @@ def start(name, description, no_audio, output, no_wifi_metrics):
 
     from screencap.recorder import start_recording
 
-    start_recording(name, description or None, audio, output, wifi_metrics=wifi_metrics)
+    start_recording(
+        name, description or None, audio, output,
+        wifi_metrics=wifi_metrics, force_clean=force,
+    )
 
 
 @cli.command("list")
@@ -267,6 +271,35 @@ def scrub(name, provider):
     from screencap.scrubber import scrub_recording
 
     scrub_recording(name, provider=provider)
+
+
+@cli.command()
+@click.option("--force", is_flag=True, help="Skip SIGTERM and go straight to SIGKILL.")
+def stop(force):
+    """Stop orphaned recording processes."""
+    from screencap.pidfile import (
+        delete_pidfile,
+        find_orphaned_processes,
+        terminate_processes,
+    )
+
+    orphans = find_orphaned_processes()
+    if not orphans:
+        console.print("[dim]No orphaned recording processes found.[/dim]")
+        return
+
+    console.print(f"Found {len(orphans)} orphaned recording process(es).")
+    terminated = terminate_processes(orphans, force=force)
+
+    for entry in terminated:
+        console.print(f"  Terminated {entry.get('name', 'unknown')} (PID {entry['pid']})... done")
+
+    if terminated:
+        console.print(f"Cleaned up {len(terminated)} process(es).")
+    else:
+        console.print("[yellow]Could not terminate any processes.[/yellow]")
+
+    delete_pidfile()
 
 
 if __name__ == "__main__":

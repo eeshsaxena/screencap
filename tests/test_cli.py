@@ -8,6 +8,7 @@ from unittest import mock
 from click.testing import CliRunner
 
 from screencap.cli import cli
+from screencap import pidfile
 
 
 def test_version():
@@ -62,7 +63,7 @@ def test_start_with_flags():
         )
         assert result.exit_code == 0
         mock_rec.assert_called_once_with(
-            "test-rec", "demo", False, None, wifi_metrics=True,
+            "test-rec", "demo", False, None, wifi_metrics=True, force_clean=False,
         )
 
 
@@ -76,7 +77,7 @@ def test_start_no_wifi_metrics():
         )
         assert result.exit_code == 0
         mock_rec.assert_called_once_with(
-            "test-rec", None, True, None, wifi_metrics=False,
+            "test-rec", None, True, None, wifi_metrics=False, force_clean=False,
         )
 
 
@@ -253,3 +254,77 @@ def test_scrub_redacts_hostname_in_metrics(tmp_path):
     scrubbed = json.loads((dst / "system_metrics.json").read_text())
     assert scrubbed["static"]["hostname"] == "<REDACTED>"
     assert scrubbed["static"]["cpu_model"] == "Apple M2"  # not redacted
+
+
+# --- stop command tests ---
+
+
+def test_stop_no_orphans():
+    runner = CliRunner()
+    with mock.patch("screencap.pidfile.find_orphaned_processes", return_value=[]):
+        result = runner.invoke(cli, ["stop"])
+    assert result.exit_code == 0
+    assert "No orphaned" in result.output
+
+
+def test_stop_with_orphans():
+    runner = CliRunner()
+    orphans = [{"pid": 111, "name": "screen_writer"}, {"pid": 222, "name": "video_writer"}]
+    with (
+        mock.patch("screencap.pidfile.find_orphaned_processes", return_value=orphans),
+        mock.patch("screencap.pidfile.terminate_processes", return_value=orphans),
+        mock.patch("screencap.pidfile.delete_pidfile"),
+    ):
+        result = runner.invoke(cli, ["stop"])
+    assert result.exit_code == 0
+    assert "2 orphaned" in result.output
+    assert "Cleaned up 2" in result.output
+
+
+def test_stop_with_force_flag():
+    runner = CliRunner()
+    orphans = [{"pid": 333, "name": "writer"}]
+    with (
+        mock.patch("screencap.pidfile.find_orphaned_processes", return_value=orphans),
+        mock.patch("screencap.pidfile.terminate_processes", return_value=orphans) as mock_term,
+        mock.patch("screencap.pidfile.delete_pidfile"),
+    ):
+        result = runner.invoke(cli, ["stop", "--force"])
+    assert result.exit_code == 0
+    mock_term.assert_called_once_with(orphans, force=True)
+
+
+# --- start --force tests ---
+
+
+def test_start_force_cleans_orphans():
+    """--force flag should auto-clean orphans before starting."""
+    runner = CliRunner()
+    orphans = [{"pid": 444, "name": "old_writer"}]
+    with (
+        mock.patch("screencap.pidfile.find_orphaned_processes", return_value=orphans),
+        mock.patch("screencap.pidfile.terminate_processes") as mock_term,
+        mock.patch("screencap.pidfile.delete_pidfile"),
+        mock.patch("screencap.pidfile.write_pidfile"),
+        mock.patch("screencap.recorder.start_recording") as mock_rec,
+    ):
+        result = runner.invoke(cli, ["start", "--name", "test", "--force"])
+    assert result.exit_code == 0
+    mock_rec.assert_called_once()
+    _, kwargs = mock_rec.call_args
+    assert kwargs["force_clean"] is True
+
+
+def test_start_warns_about_orphans():
+    """Without --force, start should warn and exit if orphans exist."""
+    runner = CliRunner()
+    orphans = [{"pid": 555, "name": "old_writer"}]
+    with (
+        mock.patch("screencap.pidfile.find_orphaned_processes", return_value=orphans),
+        mock.patch("screencap.pidfile.terminate_processes"),
+        mock.patch("screencap.pidfile.delete_pidfile"),
+    ):
+        # start_recording will raise SystemExit(1) when orphans found without --force
+        with mock.patch("screencap.recorder.start_recording", side_effect=SystemExit(1)):
+            result = runner.invoke(cli, ["start", "--name", "test"])
+    assert result.exit_code == 1
