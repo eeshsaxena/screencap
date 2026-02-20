@@ -32,6 +32,7 @@ dependencies = [
     "tqdm>=4.0.0",
     "numpy>=1.20.0",
     "magic-wormhole>=0.17.0",
+    "requests>=2.28.0",
     "oa-atomacos>=3.2.0; sys_platform == 'darwin'",
     "pyobjc-framework-Quartz>=9.0; sys_platform == 'darwin'",
     "pyobjc-framework-ApplicationServices>=9.0; sys_platform == 'darwin'",
