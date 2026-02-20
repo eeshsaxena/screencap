@@ -16,59 +16,31 @@ from zipfile import ZIP_DEFLATED, ZipFile
 
 
 def _find_wormhole() -> str | None:
-    """Find the wormhole executable path.
+    """Find the wormhole executable on PATH.
 
-    On Windows after pip install, the executable may be in Python's Scripts/
-    directory which isn't always on PATH.
+    Returns:
+        Path to wormhole executable, or None if not found.
     """
-    # Check PATH first
     path = shutil.which("wormhole")
     if path:
         return path
 
-    # Check in Python's Scripts directory (Windows) or bin directory (Unix)
-    python_dir = Path(sys.executable).parent
-    for candidate in [
-        python_dir / "Scripts" / "wormhole.exe",  # Windows venv/global
-        python_dir / "Scripts" / "wormhole",       # Windows without .exe
-        python_dir / "wormhole",                   # Unix bin/
-    ]:
-        if candidate.exists():
-            return str(candidate)
+    # In non-frozen mode, also check Python's bin/Scripts directory
+    if not getattr(sys, 'frozen', False):
+        python_dir = Path(sys.executable).parent
+        for candidate in [
+            python_dir / "Scripts" / "wormhole.exe",  # Windows venv/global
+            python_dir / "Scripts" / "wormhole",       # Windows without .exe
+            python_dir / "wormhole",                   # Unix bin/
+        ]:
+            if candidate.exists():
+                return str(candidate)
 
-    return None
-
-
-def _install_wormhole() -> str | None:
-    """Attempt to install magic-wormhole.
-
-    Returns:
-        Path to wormhole executable if successful, None otherwise.
-    """
-    print("Installing magic-wormhole...")
-    try:
-        subprocess.run(
-            [sys.executable, "-m", "pip", "install", "magic-wormhole"],
-            check=True,
-            capture_output=True,
-        )
-        print("magic-wormhole installed")
-    except subprocess.CalledProcessError as e:
-        print(f"Failed to install magic-wormhole: {e}")
-        return None
-
-    # Find the newly installed binary
-    path = _find_wormhole()
-    if path:
-        return path
-
-    print("magic-wormhole installed but 'wormhole' command not found on PATH.")
-    print(f"Try adding {Path(sys.executable).parent / 'Scripts'} to your PATH.")
     return None
 
 
 def _ensure_wormhole() -> str | None:
-    """Ensure magic-wormhole is available, install if needed.
+    """Ensure magic-wormhole is available.
 
     Returns:
         Path to wormhole executable, or None if unavailable.
@@ -76,7 +48,12 @@ def _ensure_wormhole() -> str | None:
     path = _find_wormhole()
     if path:
         return path
-    return _install_wormhole()
+
+    if getattr(sys, 'frozen', False):
+        print("magic-wormhole is not installed. Install it with: brew install magic-wormhole")
+    else:
+        print("magic-wormhole is not installed. Install it with: pip install magic-wormhole")
+    return None
 
 
 def send(recording_dir: str) -> str | None:
@@ -130,7 +107,7 @@ def send(recording_dir: str) -> str | None:
             return "sent"
         except FileNotFoundError:
             print(f"'wormhole' command not found at: {wormhole_path}")
-            print(f"Try: {sys.executable} -m pip install magic-wormhole")
+            print("Try: pip install magic-wormhole")
             return None
         except subprocess.CalledProcessError as e:
             print(f"Wormhole send failed: {e}")

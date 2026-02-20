@@ -30,6 +30,9 @@ def cli():
 def start(name, description, no_audio, output, no_wifi_metrics, force):
     """Record a screen capture session. Ctrl+C to stop."""
     if not name:
+        if not sys.stdin.isatty():
+            console.print("[red]Error: --name is required in non-interactive mode.[/red]")
+            raise SystemExit(1)
         name = click.prompt("Recording name")
         description = click.prompt("Description (optional)", default="", show_default=False)
         audio_input = click.prompt(
@@ -223,46 +226,33 @@ def info(name, as_json):
 
 
 def _check_scrub_deps() -> bool:
-    """Check if scrubbing dependencies are installed. Prompt to install if missing."""
+    """Verify scrub dependencies are available."""
     try:
-        import spacy  # noqa: F401
+        import spacy
         import presidio_analyzer  # noqa: F401
         import presidio_anonymizer  # noqa: F401
     except ImportError:
-        console.print(
-            "[yellow]Scrubbing requires heavy dependencies (spaCy, Presidio, transformers) "
-            "which are not currently installed (~500 MB download).[/yellow]"
-        )
-        if not click.confirm("Install them now?", default=True):
-            console.print("[dim]Scrub cancelled.[/dim]")
-            return False
+        if getattr(sys, 'frozen', False):
+            console.print("[red]Privacy dependencies missing from binary. Reinstall screencap.[/red]")
+        else:
+            console.print("[red]Privacy dependencies not installed.[/red]")
+            console.print("Run: pip install screencap[privacy]")
+        return False
 
-        import subprocess
-
-        console.print("[dim]Installing screencap[privacy] ...[/dim]")
-        result = subprocess.run(
-            [sys.executable, "-m", "pip", "install", "screencap[privacy]"],
-            capture_output=True,
-            text=True,
-        )
-        if result.returncode != 0:
-            console.print(f"[red]Installation failed:[/red]\n{result.stderr.strip()}")
-            return False
-
-        console.print("[green]Dependencies installed.[/green]")
-        import spacy  # noqa: F811
-
-    # Ensure spaCy model is downloaded
-    import spacy
-
+    # Verify spaCy model is loadable — do NOT use spacy.util.is_package()
+    # because it relies on importlib.metadata which is broken under PyInstaller.
     from openadapt_privacy.config import config as privacy_config
 
     model_name = privacy_config.SPACY_MODEL_NAME
-    if not spacy.util.is_package(model_name):
-        with console.status(f"[bold]Downloading spaCy model ({model_name}) ...[/bold]"):
-            spacy.cli.download(model_name)
-        console.print(f"[green]Model {model_name} installed.[/green]")
-
+    try:
+        spacy.load(model_name)
+    except OSError:
+        console.print(f"[red]spaCy model '{model_name}' not found.[/red]")
+        if getattr(sys, 'frozen', False):
+            console.print("Reinstall screencap to get scrubbing support.")
+        else:
+            console.print(f"Run: python -m spacy download {model_name}")
+        return False
     return True
 
 
@@ -399,9 +389,7 @@ def _detect_cached_models() -> list[str]:
 
 
 def _ensure_whisper_backend() -> None:
-    """Make sure at least one local whisper backend is installed. Offer to install if not."""
-    import subprocess
-
+    """Make sure at least one local whisper backend is installed."""
     try:
         import faster_whisper  # noqa: F401
         return
@@ -413,25 +401,12 @@ def _ensure_whisper_backend() -> None:
     except ImportError:
         pass
 
-    console.print(
-        "[yellow]Local transcription requires whisper dependencies "
-        "(~150 MB download).[/yellow]"
-    )
-    if not click.confirm("Install faster-whisper (recommended)?", default=True):
-        console.print("[dim]Transcription cancelled.[/dim]")
-        raise SystemExit(0)
-
-    console.print("[dim]Installing faster-whisper ...[/dim]")
-    cmd = [sys.executable, "-m", "pip", "install", "faster-whisper"]
-    result = subprocess.run(cmd, capture_output=True, text=True)
-    if result.returncode != 0 and "externally-managed-environment" in result.stderr:
-        result = subprocess.run(
-            cmd + ["--break-system-packages"], capture_output=True, text=True
-        )
-    if result.returncode != 0:
-        console.print(f"[red]Installation failed:[/red]\n{result.stderr.strip()}")
-        raise SystemExit(1)
-    console.print("[green]faster-whisper installed.[/green]")
+    if getattr(sys, 'frozen', False):
+        console.print("[red]Whisper dependencies missing from binary. Reinstall screencap.[/red]")
+    else:
+        console.print("[red]Local transcription requires whisper dependencies.[/red]")
+        console.print("Run: pip install faster-whisper")
+    raise SystemExit(1)
 
 
 def _select_local_model(model: str | None = None) -> tuple[str, str]:

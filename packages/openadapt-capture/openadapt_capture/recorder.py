@@ -66,8 +66,8 @@ def _send_profiling_via_wormhole(profile_path: str) -> None:
     import subprocess as _sp
 
     wormhole_bin = shutil.which("wormhole")
-    if not wormhole_bin:
-        # Check Python Scripts dir (Windows)
+    if not wormhole_bin and not getattr(sys, 'frozen', False):
+        # Check Python Scripts dir (Windows, non-frozen only)
         from pathlib import Path
 
         scripts_dir = Path(sys.executable).parent / "Scripts"

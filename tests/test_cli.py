@@ -2,6 +2,7 @@
 
 import json
 import sqlite3
+import sys
 import time
 from unittest import mock
 
@@ -38,7 +39,10 @@ def test_list_json_empty(tmp_path):
 def test_start_interactive():
     """Test that start command prompts when no --name given."""
     runner = CliRunner()
-    with mock.patch("screencap.recorder.start_recording") as mock_rec:
+    with mock.patch("screencap.recorder.start_recording") as mock_rec, \
+         mock.patch("screencap.cli.sys") as mock_sys:
+        mock_sys.stdin.isatty.return_value = True
+        mock_sys.exit = sys.exit
         result = runner.invoke(
             cli,
             ["start"],

@@ -411,12 +411,20 @@ def move_moov_atom(input_file: str, output_file: str = None) -> None:
     """Moves the moov atom to the beginning of the video file using ffmpeg.
 
     If no output file is specified, modifies the input file in place.
+    Gracefully skips if ffmpeg is not found (video still works, just without
+    faststart optimization).
 
     Args:
         input_file (str): The path to the input MP4 file.
         output_file (str, optional): The path to the output MP4 file where the moov
             atom is at the beginning. If None, modifies the input file in place.
     """
+    import shutil
+
+    if not shutil.which("ffmpeg"):
+        logger.warning("ffmpeg not found, skipping moov atom optimization")
+        return
+
     temp_file = None
     if output_file is None:
         # Create a temporary file
@@ -439,7 +447,13 @@ def move_moov_atom(input_file: str, output_file: str = None) -> None:
         output_file,
     ]
     logger.info(f"{command=}")
-    subprocess.run(command, check=True)
+    try:
+        subprocess.run(command, check=True)
+    except subprocess.CalledProcessError:
+        logger.warning("ffmpeg moov atom optimization failed, skipping")
+        if temp_file and os.path.exists(temp_file):
+            os.unlink(temp_file)
+        return
 
     if temp_file:
         # Replace the original file with the modified one
