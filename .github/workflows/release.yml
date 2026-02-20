@@ -1,0 +1,85 @@
+name: Build and Release
+
+on:
+  push:
+    tags:
+      - 'v*'
+
+permissions:
+  contents: read
+
+jobs:
+  build:
+    strategy:
+      matrix:
+        include:
+          - runner: macos-14    # arm64 (Apple Silicon)
+            arch: arm64
+          - runner: macos-13    # x86_64 (Intel)
+            arch: x86_64
+    runs-on: ${{ matrix.runner }}
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/setup-python@v5
+        with:
+          python-version: '3.12'
+
+      - uses: actions/cache@v4
+        with:
+          path: ~/.cache/pip
+          key: ${{ runner.os }}-${{ matrix.arch }}-pip-${{ hashFiles('pyproject.toml') }}
+
+      - name: Install dependencies
+        run: pip install -e ".[privacy]" && pip install pyinstaller
+
+      - name: Audit dependencies
+        run: pip install pip-audit && pip-audit
+
+      - name: Build frozen binary
+        run: pyinstaller pyinstaller/screencap.spec
+
+      - name: Smoke test
+        run: ./dist/screencap/screencap --help
+
+      - name: Package tarball and checksum
+        run: |
+          VERSION=${GITHUB_REF#refs/tags/v}
+          tar czf screencap-${VERSION}-${{ matrix.arch }}.tar.gz -C dist screencap/
+          shasum -a 256 screencap-${VERSION}-${{ matrix.arch }}.tar.gz >> checksums.sha256
+
+      - uses: actions/upload-artifact@v4
+        with:
+          name: screencap-${{ matrix.arch }}
+          path: |
+            screencap-*.tar.gz
+            checksums.sha256
+
+  release:
+    needs: build
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/download-artifact@v4
+
+      - name: Merge checksums
+        run: cat */checksums.sha256 > checksums.sha256
+
+      - id: auth
+        uses: google-github-actions/auth@v2
+        with:
+          credentials_json: ${{ secrets.GCP_SA_KEY }}
+
+      - uses: google-github-actions/setup-gcloud@v2
+
+      - name: Upload to GCS
+        run: |
+          VERSION=${GITHUB_REF#refs/tags/v}
+          # Upload versioned artifacts
+          gcloud storage cp */screencap-*.tar.gz gs://screencap-releases/releases/v${VERSION}/
+          gcloud storage cp checksums.sha256 gs://screencap-releases/releases/v${VERSION}/
+          # Upload/update install script
+          gcloud storage cp scripts/install.sh gs://screencap-releases/releases/install.sh
+          # Update latest version pointer
+          echo "$VERSION" | gcloud storage cp - gs://screencap-releases/releases/latest.txt
