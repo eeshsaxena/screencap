@@ -116,6 +116,82 @@ def view(name, scrubbed):
         sys.exit(1)
 
 
+@cli.command()
+@click.argument("name")
+@click.option("--json", "as_json", is_flag=True, help="Output as JSON.")
+def info(name, as_json):
+    """Show details and system metrics for a recording."""
+    from screencap.catalog import find_db, _read_recording_meta
+    from screencap.config import get_recordings_dir
+    from screencap.metrics import METRICS_FILENAME
+
+    recording_dir = get_recordings_dir() / name
+    if not recording_dir.exists():
+        console.print(f"[red]Error:[/red] Recording not found: {name}")
+        sys.exit(1)
+
+    # Read DB metadata
+    db_path = find_db(recording_dir)
+    rec_meta = {}
+    if db_path:
+        from datetime import datetime
+
+        started, duration = _read_recording_meta(db_path)
+        if started:
+            rec_meta["date"] = datetime.fromtimestamp(started).strftime("%Y-%m-%d %H:%M:%S")
+        if duration:
+            m, s = divmod(int(duration), 60)
+            h, m = divmod(m, 60)
+            rec_meta["duration"] = f"{h}h {m}m {s}s" if h else f"{m}m {s}s"
+
+    # Read metrics
+    metrics_path = recording_dir / METRICS_FILENAME
+    metrics = None
+    if metrics_path.exists():
+        try:
+            metrics = json.loads(metrics_path.read_text())
+        except (json.JSONDecodeError, OSError):
+            pass
+
+    if as_json:
+        click.echo(json.dumps({"recording": rec_meta, "metrics": metrics}, indent=2))
+        return
+
+    # Human-readable output
+    from rich.panel import Panel
+
+    console.print(Panel(f"[bold]{name}[/bold]", title="Recording"))
+
+    if rec_meta:
+        for key, val in rec_meta.items():
+            console.print(f"  [cyan]{key}:[/cyan] {val}")
+    else:
+        console.print("  [dim]No recording metadata available.[/dim]")
+
+    if metrics is None:
+        console.print("\n[dim]No system metrics available (recorded before metrics feature).[/dim]")
+        return
+
+    static = metrics.get("static", {})
+    if static:
+        console.print(Panel("[bold]System Info[/bold]"))
+        for key, val in static.items():
+            if key == "displays":
+                for i, d in enumerate(val):
+                    console.print(f"  [cyan]display {i}:[/cyan] {d.get('width')}x{d.get('height')}")
+            else:
+                console.print(f"  [cyan]{key}:[/cyan] {val}")
+
+    for phase in ("start", "end"):
+        snapshot = metrics.get(phase)
+        if snapshot:
+            console.print(Panel(f"[bold]{phase.title()} Snapshot[/bold]"))
+            for key, val in snapshot.items():
+                console.print(f"  [cyan]{key}:[/cyan] {val}")
+        elif phase == "end":
+            console.print(f"\n  [dim]No end snapshot (recording may have been interrupted).[/dim]")
+
+
 def _check_scrub_deps() -> bool:
     """Check if scrubbing dependencies are installed. Prompt to install if missing."""
     try:

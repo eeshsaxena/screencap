@@ -76,6 +76,11 @@ def scrub_recording(
     if transcript.exists():
         _scrub_transcript(transcript, scrubber)
 
+    # --- Scrub system metrics ---
+    metrics_file = dst / "system_metrics.json"
+    if metrics_file.exists():
+        _scrub_metrics(metrics_file)
+
     # --- Regenerate viewer.html ---
     try:
         from openadapt_capture import create_html
@@ -227,6 +232,19 @@ def _scrub_dict_recursive(d: dict, scrubber) -> dict:
         else:
             result[k] = v
     return result
+
+
+def _scrub_metrics(metrics_path: Path) -> None:
+    """Redact PII fields in system_metrics.json."""
+    try:
+        data = json.loads(metrics_path.read_text())
+        static = data.get("static", {})
+        if "hostname" in static:
+            static["hostname"] = "<REDACTED>"
+        metrics_path.write_text(json.dumps(data, indent=2))
+        console.print("[dim]Scrubbed system_metrics.json[/dim]")
+    except Exception as e:
+        console.print(f"[yellow]Warning:[/yellow] Failed to scrub system metrics: {e}")
 
 
 def _scrub_transcript(transcript_path: Path, scrubber) -> None:
