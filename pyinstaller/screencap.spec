@@ -67,6 +67,16 @@ try:
 except Exception:
     pass
 
+# rich._unicode_data uses hyphenated module names loaded via importlib
+# (e.g. "unicode17-0-0.py") which PyInstaller can't detect.
+try:
+    d, b, h = collect_all('rich._unicode_data')
+    all_datas += d
+    all_binaries += b
+    all_hiddenimports += h
+except Exception:
+    pass
+
 # ---------------------------------------------------------------------------
 # Hidden imports not auto-detected by PyInstaller
 # ---------------------------------------------------------------------------
@@ -96,16 +106,42 @@ all_hiddenimports += hidden_imports
 # ---------------------------------------------------------------------------
 # Analysis
 # ---------------------------------------------------------------------------
+import os
+_root = os.path.abspath(os.path.join(SPECPATH, '..'))
+
 a = Analysis(
     ['main.py'],
-    pathex=[],
+    pathex=[
+        os.path.join(_root, 'src'),
+        os.path.join(_root, 'packages', 'openadapt-capture'),
+        os.path.join(_root, 'packages', 'openadapt-privacy'),
+    ],
     binaries=all_binaries,
     datas=all_datas,
     hiddenimports=all_hiddenimports,
     hookspath=[],
     hooksconfig={},
     runtime_hooks=[],
-    excludes=[],
+    excludes=[
+        # Exclude heavy ML frameworks not needed by screencap at runtime.
+        # torch/torchvision are transitive deps of presidio but presidio
+        # works fine with just spaCy (CPU) for NER.
+        'torch', 'torchvision', 'torchaudio',
+        # transformers pulled in transitively but not used
+        'transformers', 'huggingface_hub', 'tokenizers', 'safetensors',
+        'hf_xet',
+        # OpenCV headless is only needed for presidio-image-redactor
+        # which is imported lazily — exclude to save ~90 MB
+        'cv2',
+        # Other heavy transitive deps not needed
+        'matplotlib', 'sympy', 'IPython', 'notebook', 'jupyter',
+        'scipy', 'sklearn', 'faiss',
+        'botocore', 'boto3', 'awscrt',
+        'google.cloud', 'google.auth', 'google.api_core',
+        'grpc', 'grpcio',
+        'timm',
+        '_gdcm', 'gdcm', 'pydicom',
+    ],
     noarchive=False,
 )
 
