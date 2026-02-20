@@ -112,8 +112,9 @@ NUM_MEMORY_STATS_TO_LOG = 3
 stop_sequence_detected = False
 ws_server_instance = None
 
-# TODO XXX replace with utils.get_monitor_dims() once fixed
-monitor_width, monitor_height = utils.take_screenshot().size
+# Screen dimensions are determined per-process in video_pre_callback()
+# (mss.grab() is slow from background threads on macOS, so we avoid
+# calling take_screenshot() at module level).
 
 
 def collect_stats(performance_snapshots: list[tracemalloc.Snapshot]) -> None:
@@ -517,8 +518,11 @@ def video_pre_callback(
         dict[str, Any]: The updated state.
     """
     video_file_path = video.get_video_file_path(recording.timestamp, video_dir)
+    # Get actual screen dimensions (this runs in a child process's main thread,
+    # where mss.grab() is fast on macOS).
+    screen_width, screen_height = utils.take_screenshot().size
     video_container, video_stream, video_start_timestamp = (
-        video.initialize_video_writer(video_file_path, monitor_width, monitor_height)
+        video.initialize_video_writer(video_file_path, screen_width, screen_height)
     )
     crud.update_video_start_time(db, recording, video_start_timestamp)
     return {
