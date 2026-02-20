@@ -422,7 +422,7 @@ body {{ font-family:'Outfit',-apple-system,BlinkMacSystemFont,sans-serif; backgr
 .player-nav button {{ background:transparent; border:1px solid var(--border); color:var(--text-2); width:30px; height:30px; border-radius:var(--radius-sm); cursor:pointer; font-size:0.75rem; display:flex; align-items:center; justify-content:center; transition:all 0.15s; }}
 .player-nav button:hover {{ background:var(--bg-3); color:var(--text-1); border-color:var(--border-hi); box-shadow:0 0 8px rgba(255,255,255,0.04); }}
 .player-nav button:disabled {{ opacity:0.25; cursor:not-allowed; pointer-events:none; }}
-.player-nav .play-btn {{ background:var(--accent); border:none; color:var(--bg-0); width:36px; height:36px; border-radius:50%; font-weight:700; font-size:0.85rem; }}
+.player-nav .play-btn {{ background:var(--accent); border:none; color:var(--bg-0); width:36px; height:36px; border-radius:var(--radius-sm); font-weight:700; font-size:0.85rem; }}
 .player-nav .play-btn:hover {{ background:var(--accent-hover); transform:scale(1.06); box-shadow:0 0 16px rgba(212,148,58,0.3); }}
 .step-display {{ font-family:'JetBrains Mono',monospace; font-size:0.75rem; color:var(--accent); font-weight:500; min-width:95px; text-align:center; line-height:36px; }}
 .timeline {{ flex:1; height:6px; background:var(--bg-3); border-radius:3px; cursor:pointer; position:relative; transition:height 0.12s; }}
