@@ -103,6 +103,41 @@ Transcribe a recording's audio using Whisper. Interactively offers OpenAI API or
 | medium | ~1.5 GB | High accuracy |
 | large | ~2.9 GB | Best accuracy |
 
+### `screencap upload [names...]`
+
+Upload recordings to cloud storage (GCS). Tracks upload status locally via `.upload_status.json` — re-running skips already-uploaded recordings without hitting the server.
+
+```bash
+# upload a single recording
+screencap upload my-session
+
+# upload multiple
+screencap upload session-1 session-2
+
+# upload all recordings
+screencap upload --all
+
+# re-upload even if already uploaded
+screencap upload my-session --force
+
+# preview what would be uploaded
+screencap upload my-session --dry-run
+```
+
+| Flag | Description |
+|------|-------------|
+| `--all` | Upload all recordings |
+| `--dry-run` | Show files and sizes without uploading |
+| `--force` | Re-upload even if already uploaded locally |
+
+### `screencap stop`
+
+Terminate orphaned recording processes left behind by a crash or forced quit.
+
+| Flag | Description |
+|------|-------------|
+| `--force` | Skip SIGTERM, go straight to SIGKILL |
+
 ### `screencap --version`
 
 Print current version.
@@ -130,12 +165,13 @@ Environment variables take precedence over `config.toml`.
 ```
 ~/.screencap/recordings/
 └── my-session/
-    ├── recording.db       # SQLite: events & metadata
-    ├── video.mp4          # Screen recording
-    ├── audio.flac         # Audio (if enabled)
-    ├── transcript.json    # Whisper transcription (optional)
-    ├── screenshots/       # PNG screenshots
-    └── viewer.html        # Interactive web viewer
+    ├── recording.db           # SQLite: events & metadata
+    ├── video.mp4              # Screen recording
+    ├── audio.flac             # Audio (if enabled)
+    ├── transcript.json        # Whisper transcription (optional)
+    ├── .upload_status.json    # Upload tracking (auto-created)
+    ├── screenshots/           # PNG screenshots
+    └── viewer.html            # Interactive web viewer
 ```
 
 ## Testing

@@ -86,21 +86,25 @@ def list_cmd(as_json, sort):
         return
 
     table = Table(show_header=True, header_style="bold cyan")
+    table.add_column("#", justify="right")
     table.add_column("Name")
     table.add_column("Date")
     table.add_column("Duration")
     table.add_column("Size")
     table.add_column("Audio")
     table.add_column("Scrubbed")
+    table.add_column("Uploaded")
 
-    for r in recordings:
+    for i, r in enumerate(recordings, 1):
         table.add_row(
+            str(i),
             r.name,
             r.date,
             r.duration,
             r.size_mb,
             "[green]\u2713[/green]" if r.has_audio else "[dim]\u2717[/dim]",
             "[green]\u2713[/green]" if r.has_scrubbed else "[dim]\u2717[/dim]",
+            "[green]\u2713[/green]" if r.uploaded else "[dim]\u2717[/dim]",
         )
 
     console.print(table)
@@ -557,7 +561,8 @@ def _run_api_transcription(api_key, audio_path, transcript_path, transcript_json
 @click.argument("names", nargs=-1)
 @click.option("--all", "all_recordings", is_flag=True, help="Upload all recordings.")
 @click.option("--dry-run", is_flag=True, help="Show files and sizes without uploading.")
-def upload(names, all_recordings, dry_run):
+@click.option("--force", is_flag=True, help="Re-upload even if already uploaded.")
+def upload(names, all_recordings, dry_run, force):
     """Upload recordings to cloud storage."""
     from screencap.upload import resolve_recording_dirs, upload_recording, _fmt_size
 
@@ -577,7 +582,7 @@ def upload(names, all_recordings, dry_run):
         if total_count > 1:
             console.print(f"\n[bold][{i}/{total_count}][/bold] {d.name}")
         try:
-            result = upload_recording(d, dry_run=dry_run)
+            result = upload_recording(d, dry_run=dry_run, force=force)
             all_uploaded += len(result.uploaded)
             all_skipped += len(result.skipped)
             all_failed += len(result.failed)
