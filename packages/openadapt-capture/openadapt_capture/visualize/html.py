@@ -328,11 +328,11 @@ def _generate_html(
 <link href="https://fonts.googleapis.com/css2?family=Outfit:wght@300;400;500;600;700&family=JetBrains+Mono:wght@400;500&display=swap" rel="stylesheet">
 <style>
 :root {{
-    --bg-0:#08090b; --bg-1:#111318; --bg-2:#191b22; --bg-3:#23252e;
+    --bg-0:#08090b; --bg-1:#111318; --bg-sidebar:#13151c; --bg-2:#191b22; --bg-3:#23252e;
     --border:rgba(255,255,255,0.06); --border-hi:rgba(255,255,255,0.12);
-    --text-1:#eeeef0; --text-2:#8a8c99; --text-3:#4e5060;
+    --text-1:#eeeef0; --text-2:#9ea0ad; --text-3:#686a7a;
     --accent:#d4943a; --accent-dim:rgba(212,148,58,0.12); --accent-hover:#e0a448;
-    --ev-click:#ef5350; --ev-drag:#4caf50; --ev-scroll:#ab47bc; --ev-type:#42a5f5; --ev-move:#616161;
+    --ev-click:#ef5350; --ev-drag:#4caf50; --ev-scroll:#ab47bc; --ev-type:#42a5f5; --ev-move:#717380;
     --radius:10px; --radius-sm:6px;
 }}
 *{{ box-sizing:border-box; margin:0; padding:0; }}
@@ -342,7 +342,7 @@ body {{ font-family:'Outfit',-apple-system,BlinkMacSystemFont,sans-serif; backgr
 .app {{ flex:1; display:flex; min-height:0; }}
 
 /* Left Panel */
-.panel-left {{ width:260px; background:var(--bg-1); border-right:1px solid var(--border); display:flex; flex-direction:column; flex-shrink:0; }}
+.panel-left {{ width:260px; background:var(--bg-sidebar); border-right:1px solid var(--border); display:flex; flex-direction:column; flex-shrink:0; }}
 .panel-header {{ padding:14px 16px; display:flex; justify-content:space-between; align-items:center; border-bottom:1px solid var(--border); }}
 .brand {{ font-weight:700; font-size:0.95rem; letter-spacing:-0.02em; color:var(--accent); }}
 .rec-id {{ font-family:'JetBrains Mono',monospace; font-size:0.65rem; color:var(--text-3); margin-top:2px; }}
@@ -351,10 +351,10 @@ body {{ font-family:'Outfit',-apple-system,BlinkMacSystemFont,sans-serif; backgr
 .events-list::-webkit-scrollbar {{ width:4px; }}
 .events-list::-webkit-scrollbar-track {{ background:transparent; }}
 .events-list::-webkit-scrollbar-thumb {{ background:var(--bg-3); border-radius:2px; }}
-.ev-item {{ display:flex; align-items:center; gap:10px; padding:8px 12px; border-radius:var(--radius-sm); cursor:pointer; transition:all 0.12s; border-left:3px solid transparent; margin-bottom:2px; }}
+.ev-item {{ display:flex; align-items:center; gap:10px; padding:8px 12px; border-radius:var(--radius-sm); cursor:pointer; transition:all 0.15s; border-left:3px solid transparent; margin-bottom:2px; }}
 .ev-item:hover {{ background:var(--bg-2); }}
-.ev-item.active {{ background:var(--accent-dim); border-left-color:var(--accent); }}
-.ev-dot {{ width:8px; height:8px; border-radius:50%; flex-shrink:0; }}
+.ev-item.active {{ background:var(--accent-dim); border-left-color:var(--accent); box-shadow:inset 0 0 0 1px rgba(212,148,58,0.08); }}
+.ev-icon {{ width:20px; height:20px; border-radius:var(--radius-sm); flex-shrink:0; display:flex; align-items:center; justify-content:center; font-size:0.7rem; background:rgba(255,255,255,0.04); }}
 .ev-body {{ flex:1; min-width:0; }}
 .ev-label {{ font-size:0.8rem; font-weight:500; display:block; white-space:nowrap; overflow:hidden; text-overflow:ellipsis; }}
 .ev-desc {{ font-family:'JetBrains Mono',monospace; font-size:0.65rem; color:var(--text-3); display:block; white-space:nowrap; overflow:hidden; text-overflow:ellipsis; }}
@@ -371,22 +371,22 @@ body {{ font-family:'Outfit',-apple-system,BlinkMacSystemFont,sans-serif; backgr
 .frame-badge {{ position:absolute; top:10px; right:10px; background:rgba(0,0,0,0.65); backdrop-filter:blur(8px); padding:4px 10px; border-radius:var(--radius-sm); font-family:'JetBrains Mono',monospace; font-size:0.72rem; color:var(--text-2); border:1px solid var(--border); }}
 
 /* Right Panel */
-.panel-right {{ width:300px; background:var(--bg-1); border-left:1px solid var(--border); display:flex; flex-direction:column; flex-shrink:0; overflow-y:auto; padding:10px; gap:8px; scrollbar-width:thin; scrollbar-color:var(--bg-3) transparent; }}
+.panel-right {{ width:300px; background:var(--bg-sidebar); border-left:1px solid var(--border); display:flex; flex-direction:column; flex-shrink:0; overflow-y:auto; padding:10px; gap:8px; scrollbar-width:thin; scrollbar-color:var(--bg-3) transparent; }}
 .panel-right::-webkit-scrollbar {{ width:4px; }}
 .panel-right::-webkit-scrollbar-track {{ background:transparent; }}
 .panel-right::-webkit-scrollbar-thumb {{ background:var(--bg-3); border-radius:2px; }}
-.ctx-header {{ display:flex; justify-content:space-between; align-items:center; padding:10px 14px; background:var(--bg-2); border:1px solid var(--border); border-radius:var(--radius); }}
-.ctx-type {{ font-weight:700; font-size:0.9rem; text-transform:uppercase; letter-spacing:0.02em; }}
+.ctx-header {{ display:flex; justify-content:space-between; align-items:center; padding:12px 14px; background:var(--bg-2); border:none; border-radius:var(--radius); }}
+.ctx-type {{ font-weight:800; font-size:1rem; text-transform:uppercase; letter-spacing:0.02em; }}
 .ctx-time {{ font-family:'JetBrains Mono',monospace; font-size:0.72rem; color:var(--text-2); }}
-.card {{ background:var(--bg-2); border:1px solid var(--border); border-radius:var(--radius); overflow:hidden; }}
-.card-label {{ font-size:0.65rem; font-weight:600; text-transform:uppercase; letter-spacing:0.06em; color:var(--text-3); padding:8px 14px 6px; }}
+.card {{ background:rgba(255,255,255,0.025); border:none; border-radius:var(--radius); overflow:hidden; }}
+.card-label {{ font-size:0.65rem; font-weight:600; text-transform:uppercase; letter-spacing:0.06em; color:var(--text-3); padding:10px 14px 6px; }}
 .card-head {{ display:flex; justify-content:space-between; align-items:center; padding:8px 14px 6px; }}
 .card-head .card-label {{ padding:0; }}
-.card-body {{ padding:4px 14px 10px; }}
-#app-card {{ border-left:3px solid rgba(120,160,255,0.35); }}
+.card-body {{ padding:6px 14px 12px; }}
+#app-card {{ border-left:3px solid rgba(120,160,255,0.35); background:rgba(120,160,255,0.03); }}
 .app-name {{ font-size:1rem; font-weight:600; color:var(--text-1); }}
 .app-window {{ font-size:0.75rem; color:var(--text-2); margin-top:1px; white-space:nowrap; overflow:hidden; text-overflow:ellipsis; }}
-#element-card {{ border-left:3px solid rgba(255,158,100,0.35); }}
+#element-card {{ border-left:3px solid rgba(255,158,100,0.35); background:rgba(255,158,100,0.03); }}
 .el-field {{ display:flex; align-items:baseline; padding:3px 0; }}
 .el-key {{ font-size:0.65rem; text-transform:uppercase; letter-spacing:0.04em; color:var(--text-3); min-width:50px; flex-shrink:0; }}
 .el-val {{ font-family:'JetBrains Mono',monospace; font-size:0.75rem; color:var(--text-1); word-break:break-word; }}
@@ -400,28 +400,34 @@ body {{ font-family:'Outfit',-apple-system,BlinkMacSystemFont,sans-serif; backgr
 .more-content.visible {{ display:block; }}
 .more-content .a11y-key {{ color:#7eb6ff; }}
 .more-content .a11y-val {{ color:#c3e88d; }}
-.detail-row {{ display:flex; padding:2px 0; }}
-.detail-key {{ font-size:0.65rem; text-transform:uppercase; letter-spacing:0.03em; color:var(--text-3); min-width:55px; flex-shrink:0; }}
+.detail-row {{ display:flex; padding:3px 0; line-height:1.6; }}
+.detail-key {{ font-size:0.65rem; text-transform:uppercase; letter-spacing:0.03em; color:var(--text-3); min-width:55px; flex-shrink:0; font-weight:500; }}
 .detail-val {{ font-family:'JetBrains Mono',monospace; font-size:0.75rem; color:var(--text-2); }}
+.detail-val.type-val {{ color:var(--text-1); font-weight:500; }}
+.detail-val.time-val {{ color:var(--text-3); }}
 .transcript-body {{ padding:8px 14px; font-size:0.75rem; line-height:1.8; color:var(--text-2); max-height:120px; overflow-y:auto; }}
 .transcript-segment {{ display:inline; cursor:pointer; padding:1px 4px; border-radius:3px; transition:all 0.12s; }}
 .transcript-segment:hover {{ background:var(--bg-3); color:var(--text-1); }}
 .transcript-segment.active {{ background:var(--accent-dim); color:var(--accent); }}
 .transcript-time {{ font-family:'JetBrains Mono',monospace; font-size:0.58rem; color:var(--text-3); margin-right:3px; }}
-.empty-msg {{ font-size:0.75rem; color:var(--text-3); font-style:italic; }}
+.empty-msg {{ font-size:0.75rem; color:var(--text-3); font-style:italic; padding:4px 0; }}
+.empty-state {{ display:flex; flex-direction:column; align-items:center; justify-content:center; padding:16px 0; gap:6px; }}
+.empty-state-icon {{ font-size:1.2rem; opacity:0.3; }}
+.empty-state-text {{ font-size:0.72rem; color:var(--text-3); }}
 
 /* Player Bar */
 .player-bar {{ background:var(--bg-1); border-top:1px solid var(--border); padding:10px 20px; flex-shrink:0; }}
 .player-main {{ display:flex; align-items:center; gap:12px; }}
 .player-nav {{ display:flex; align-items:center; gap:4px; }}
-.player-nav button {{ background:transparent; border:1px solid var(--border); color:var(--text-2); width:30px; height:30px; border-radius:var(--radius-sm); cursor:pointer; font-size:0.75rem; display:flex; align-items:center; justify-content:center; transition:all 0.12s; }}
-.player-nav button:hover {{ background:var(--bg-3); color:var(--text-1); border-color:var(--border-hi); }}
-.player-nav button:disabled {{ opacity:0.25; cursor:not-allowed; }}
+.player-nav button {{ background:transparent; border:1px solid var(--border); color:var(--text-2); width:30px; height:30px; border-radius:var(--radius-sm); cursor:pointer; font-size:0.75rem; display:flex; align-items:center; justify-content:center; transition:all 0.15s; }}
+.player-nav button:hover {{ background:var(--bg-3); color:var(--text-1); border-color:var(--border-hi); box-shadow:0 0 8px rgba(255,255,255,0.04); }}
+.player-nav button:disabled {{ opacity:0.25; cursor:not-allowed; pointer-events:none; }}
 .player-nav .play-btn {{ background:var(--accent); border:none; color:var(--bg-0); width:36px; height:36px; border-radius:50%; font-weight:700; font-size:0.85rem; }}
-.player-nav .play-btn:hover {{ background:var(--accent-hover); transform:scale(1.06); }}
-.step-display {{ font-family:'JetBrains Mono',monospace; font-size:0.75rem; color:var(--accent); font-weight:500; min-width:95px; text-align:center; }}
-.timeline {{ flex:1; height:6px; background:var(--bg-3); border-radius:3px; cursor:pointer; position:relative; }}
-.timeline-progress {{ height:100%; background:linear-gradient(90deg,var(--accent),var(--accent-hover)); border-radius:3px; width:0%; transition:width 0.08s; }}
+.player-nav .play-btn:hover {{ background:var(--accent-hover); transform:scale(1.06); box-shadow:0 0 16px rgba(212,148,58,0.3); }}
+.step-display {{ font-family:'JetBrains Mono',monospace; font-size:0.75rem; color:var(--accent); font-weight:500; min-width:95px; text-align:center; line-height:36px; }}
+.timeline {{ flex:1; height:6px; background:var(--bg-3); border-radius:3px; cursor:pointer; position:relative; transition:height 0.12s; }}
+.timeline:hover {{ height:8px; }}
+.timeline-progress {{ height:100%; background:linear-gradient(90deg,var(--accent),var(--accent-hover)); border-radius:3px; width:0%; transition:width 0.08s; box-shadow:0 0 6px rgba(212,148,58,0.2); }}
 .timeline-markers {{ position:absolute; top:0; left:0; right:0; bottom:0; }}
 .timeline-marker {{ position:absolute; width:2px; height:100%; background:rgba(255,255,255,0.12); transform:translateX(-50%); }}
 .time-display {{ font-family:'JetBrains Mono',monospace; font-size:0.72rem; color:var(--text-2); min-width:105px; text-align:right; }}
@@ -572,6 +578,18 @@ function getTypeColor(t){{
     return'var(--ev-move)';
 }}
 
+function getEventIcon(t){{
+    const lo=t.toLowerCase();
+    if(lo.includes('click'))return'\u25CE';
+    if(lo.includes('drag'))return'\u2197';
+    if(lo.includes('scroll'))return'\u21D5';
+    if(lo.includes('type'))return'\u2328';
+    if(lo.includes('move'))return'\u2192';
+    if(lo.includes('start'))return'\u25B6';
+    if(lo.includes('end'))return'\u25A0';
+    return'\u25CF';
+}}
+
 function getEventLabel(t){{
     const lo=t.toLowerCase();
     if(lo==='recording.start')return'Start';
@@ -609,12 +627,13 @@ function init(){{
         item.className='ev-item';
         item.dataset.index=i;
         const color=getTypeColor(ev.type);
+        const icon=getEventIcon(ev.type);
         const label=getEventLabel(ev.type);
         const desc=getEventDesc(ev);
         const ts=formatTime(ev.time);
         let dh='';
         if(desc)dh=`<span class="ev-desc">${{escapeHtml(desc)}}</span>`;
-        item.innerHTML=`<div class="ev-dot" style="background:${{color}}"></div><div class="ev-body"><span class="ev-label">${{escapeHtml(label)}}</span>${{dh}}</div><span class="ev-time">${{ts}}</span>`;
+        item.innerHTML=`<div class="ev-icon" style="color:${{color}}">${{icon}}</div><div class="ev-body"><span class="ev-label">${{escapeHtml(label)}}</span>${{dh}}</div><span class="ev-time">${{ts}}</span>`;
         item.addEventListener('click',()=>goToIndex(i));
         eventsList.appendChild(item);
     }});
@@ -680,7 +699,7 @@ function updateContext(ev){{
         else{{ appWindowEl.textContent=''; appWindowEl.style.display='none'; }}
     }}else{{ appNameEl.textContent='\u2014'; appWindowEl.style.display='none'; }}
     const el=ev.element;
-    if(!el||typeof el!=='object'||Object.keys(el).length===0){{ elementBody.innerHTML='<span class="empty-msg">No element data</span>'; return; }}
+    if(!el||typeof el!=='object'||Object.keys(el).length===0){{ elementBody.innerHTML='<div class="empty-state"><span class="empty-state-icon">\u2B1A</span><span class="empty-state-text">No element data</span></div>'; return; }}
     let h='';
     const role=el.AXRole||'',roleDesc=el.AXRoleDescription||'';
     if(role||roleDesc){{
@@ -732,7 +751,8 @@ function updateDetails(ev){{
     for(const[key,value]of Object.entries(ev)){{
         if(key==='index'||key==='element'||key==='window'||key==='windowTitle')continue;
         const dv=key==='time'?formatTime(value):value;
-        h+=`<div class="detail-row"><span class="detail-key">${{key}}</span><span class="detail-val">${{dv??'\u2014'}}</span></div>`;
+        const cls=key==='type'?' type-val':key==='time'?' time-val':'';
+        h+=`<div class="detail-row"><span class="detail-key">${{key}}</span><span class="detail-val${{cls}}">${{dv??'\u2014'}}</span></div>`;
     }}
     detailsContent.innerHTML=h;
 }}
