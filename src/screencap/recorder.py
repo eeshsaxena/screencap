@@ -2,7 +2,8 @@
 
 from __future__ import annotations
 
-import os
+import atexit
+import multiprocessing
 import signal
 import sys
 import time
@@ -41,12 +42,34 @@ def start_recording(
     audio: bool | None = None,
     output_dir: str | Path | None = None,
     wifi_metrics: bool | None = None,
+    force_clean: bool = False,
 ) -> Path:
     """Start a screen capture recording. Blocks until Ctrl+C."""
     if audio is None:
         audio = get_audio_default()
     if wifi_metrics is None:
         wifi_metrics = get_wifi_metrics()
+
+    # Check for orphaned processes from a previous recording
+    from screencap.pidfile import (
+        delete_pidfile,
+        find_orphaned_processes,
+        terminate_processes,
+        write_pidfile,
+    )
+
+    orphans = find_orphaned_processes()
+    if orphans:
+        if force_clean:
+            console.print(f"[yellow]Cleaning up {len(orphans)} orphaned process(es) from a previous recording...[/yellow]")
+            terminate_processes(orphans, force=True)
+            delete_pidfile()
+        else:
+            console.print(
+                f"[yellow]Warning:[/yellow] Found {len(orphans)} orphaned process(es) from a previous recording.\n"
+                "  Run 'screencap stop' to clean them up, or pass --force to auto-clean."
+            )
+            raise SystemExit(1)
 
     if output_dir:
         capture_dir = Path(output_dir)
@@ -102,6 +125,12 @@ def start_recording(
     except Exception as e:
         console.print(f"[yellow]Warning:[/yellow] Could not collect system metrics: {e}")
 
+    def _cleanup_children():
+        for child in multiprocessing.active_children():
+            child.terminate()
+
+    atexit.register(_cleanup_children)
+
     # Let KeyboardInterrupt propagate naturally into the Recorder.
     # record() internally catches KeyboardInterrupt at line 1707 and
     # sets terminate_processing, then joins all child processes.
@@ -115,6 +144,14 @@ def start_recording(
         ) as recorder:
             recorder.wait_for_ready(timeout=30)
             status.stop()
+
+            # Write PID file tracking all child processes
+            child_pids = [
+                {"pid": child.pid, "name": child.name}
+                for child in multiprocessing.active_children()
+            ]
+            write_pidfile(capture_dir, child_pids)
+
             console.print(f'[bold red]Recording "[/bold red]{name}[bold red]"... Press Ctrl+C to stop.[/bold red]')
 
             # Install a handler only for second Ctrl+C (force-kill)
@@ -127,8 +164,13 @@ def start_recording(
                     console.print("\n[dim]Stopping... (press Ctrl+C again to force quit)[/dim]")
                     recorder.stop()
                 else:
-                    console.print("\n[dim]Force quitting.[/dim]")
-                    os._exit(1)
+                    console.print("\n[dim]Force quitting — terminating child processes...[/dim]")
+                    for child in multiprocessing.active_children():
+                        child.terminate()
+                    time.sleep(1)
+                    for child in multiprocessing.active_children():
+                        child.kill()
+                    sys.exit(1)
 
             signal.signal(signal.SIGINT, _force_exit)
 
@@ -145,6 +187,8 @@ def start_recording(
         status.stop()
         # Restore default handler
         signal.signal(signal.SIGINT, signal.default_int_handler)
+        atexit.unregister(_cleanup_children)
+        delete_pidfile()
         # Suppress noisy multiprocessing cleanup tracebacks
         warnings.filterwarnings("ignore", category=ResourceWarning)
 
