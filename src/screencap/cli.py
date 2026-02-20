@@ -93,6 +93,7 @@ def list_cmd(as_json, sort):
     table.add_column("Size")
     table.add_column("Audio")
     table.add_column("Scrubbed")
+    table.add_column("Transcribed")
     table.add_column("Uploaded")
 
     for i, r in enumerate(recordings, 1):
@@ -104,6 +105,7 @@ def list_cmd(as_json, sort):
             r.size_mb,
             "[green]\u2713[/green]" if r.has_audio else "[dim]\u2717[/dim]",
             "[green]\u2713[/green]" if r.has_scrubbed else "[dim]\u2717[/dim]",
+            "[green]\u2713[/green]" if r.transcribed else "[dim]\u2717[/dim]",
             "[green]\u2713[/green]" if r.uploaded else "[dim]\u2717[/dim]",
         )
 
