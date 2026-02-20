@@ -65,6 +65,14 @@ def start_recording(
         raise SystemExit(1)
 
     capture_dir.mkdir(parents=True, exist_ok=True)
+
+    try:
+        from screencap.metrics import save_metrics
+
+        save_metrics(capture_dir, "start")
+    except Exception as e:
+        console.print(f"[yellow]Warning:[/yellow] Could not collect system metrics: {e}")
+
     desc = description or ""
 
     console.print(f'[bold red]Recording "[/bold red]{name}[bold red]"... Press Ctrl+C to stop.[/bold red]')
@@ -114,6 +122,13 @@ def start_recording(
         signal.signal(signal.SIGINT, signal.default_int_handler)
         # Suppress noisy multiprocessing cleanup tracebacks
         warnings.filterwarnings("ignore", category=ResourceWarning)
+
+    try:
+        from screencap.metrics import save_metrics
+
+        save_metrics(capture_dir, "end")
+    except Exception as e:
+        console.print(f"[yellow]Warning:[/yellow] Could not collect end metrics: {e}")
 
     elapsed = time.time() - t0
 
