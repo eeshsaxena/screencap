@@ -50,7 +50,18 @@ class Settings(BaseSettings):
     ] + SPECIAL_CHAR_STOP_SEQUENCES
 
     # Maximum screenshots per second (0 = unlimited / legacy behavior)
-    SCREEN_CAPTURE_FPS: float = 30.0
+    SCREEN_CAPTURE_FPS: float = 10.0
+
+    # Accessibility query tuning — controls how aggressively the recorder
+    # queries the target app's accessibility tree during recording.
+    # Minimum seconds between accessibility queries (0 = every event)
+    AX_QUERY_INTERVAL: float = 0.5
+    # Max depth for accessibility tree traversal (lower = less IPC to target app)
+    AX_MAX_DEPTH: int = 2
+    # Max wall-clock seconds for a single dump_state traversal
+    AX_DUMP_TIMEOUT: float = 0.5
+    # Per-element IPC timeout in seconds (caps hangs on unresponsive apps)
+    AX_ELEMENT_TIMEOUT: float = 1.0
 
     # Performance plotting
     PLOT_PERFORMANCE: bool = True
@@ -93,6 +104,10 @@ _FIELD_TO_CONFIG_ATTR = {
     "log_memory": "LOG_MEMORY",
     "plot_performance": "PLOT_PERFORMANCE",
     "screen_capture_fps": "SCREEN_CAPTURE_FPS",
+    "ax_query_interval": "AX_QUERY_INTERVAL",
+    "ax_max_depth": "AX_MAX_DEPTH",
+    "ax_dump_timeout": "AX_DUMP_TIMEOUT",
+    "ax_element_timeout": "AX_ELEMENT_TIMEOUT",
 }
 
 
@@ -112,6 +127,10 @@ class RecordingConfig:
     log_memory: bool | None = None
     plot_performance: bool | None = None
     screen_capture_fps: float | None = None
+    ax_query_interval: float | None = None
+    ax_max_depth: int | None = None
+    ax_dump_timeout: float | None = None
+    ax_element_timeout: float | None = None
 
 
 @contextmanager

@@ -23,6 +23,15 @@ except ImportError as e:
 
 from loguru import logger
 
+from openadapt_capture.config import config
+
+# Attributes worth capturing — keeps IPC to the target app minimal.
+_AX_ATTRS = {
+    "AXRole", "AXRoleDescription", "AXTitle", "AXValue",
+    "AXDescription", "AXChildren", "AXPosition", "AXSize",
+    "AXEnabled", "AXFocused", "AXIdentifier", "AXLabel",
+}
+
 
 def get_active_window_state(read_window_data: bool) -> dict | None:
     """Get the state of the active window.
@@ -107,7 +116,8 @@ def get_active_window(window_meta: dict) -> ApplicationServices.AXUIElementRef |
         app_ref, "AXFocusedWindow", None
     )
     if error_code:
-        logger.error("Error getting focused window")
+        # Expected during window transitions, Spotlight, menu bar focus, etc.
+        logger.debug(f"AXFocusedWindow unavailable (error {error_code})")
         return None
     return window
 
@@ -122,7 +132,14 @@ def get_window_data(window_meta: dict) -> dict:
         dict: A dictionary containing the data of the window.
     """
     window = get_active_window(window_meta)
-    state = dump_state(window)
+    if window is None:
+        return {}
+    state = dump_state(
+        window,
+        max_depth=config.AX_MAX_DEPTH,
+        timeout=config.AX_DUMP_TIMEOUT,
+        attr_allowlist=_AX_ATTRS,
+    )
     return state
 
 
@@ -133,6 +150,7 @@ def dump_state(
     current_depth: int = 0,
     timeout: float | None = None,
     start_time: float | None = None,
+    attr_allowlist: set[str] | None = None,
 ) -> Union[dict, list, None]:
     """Dump the state of the given element and its descendants.
 
@@ -143,6 +161,8 @@ def dump_state(
         current_depth (int): Current depth in the recursion.
         timeout (float): Maximum time in seconds for the dump_state operation.
         start_time (float): Start time of the dump_state operation.
+        attr_allowlist (set): If provided, only read these AX attribute names.
+            Reduces IPC calls to the target app. ``None`` means read all.
 
     Returns:
         dict or list or None: State of element and descendants as dict or list,
@@ -168,7 +188,8 @@ def dump_state(
         state = []
         for child in element:
             _state = dump_state(
-                child, elements, max_depth, current_depth + 1, timeout, start_time
+                child, elements, max_depth, current_depth + 1, timeout, start_time,
+                attr_allowlist,
             )
             if _state:
                 state.append(_state)
@@ -177,7 +198,8 @@ def dump_state(
         state = {}
         for k, v in element.items():
             _state = dump_state(
-                v, elements, max_depth, current_depth + 1, timeout, start_time
+                v, elements, max_depth, current_depth + 1, timeout, start_time,
+                attr_allowlist,
             )
             if _state:
                 state[k] = _state
@@ -190,6 +212,9 @@ def dump_state(
             state = {}
             for attr_name in attr_names:
                 if attr_name is None:
+                    continue
+                # Only read allowed attributes when an allowlist is active.
+                if attr_allowlist is not None and attr_name not in attr_allowlist:
                     continue
                 # don't traverse back up
                 # for WindowEvents:
@@ -221,6 +246,7 @@ def dump_state(
                     current_depth + 1,
                     timeout,
                     start_time,
+                    attr_allowlist,
                 )
                 if _state:
                     state[attr_name] = _state
@@ -312,8 +338,16 @@ def get_active_element_state(x: int, y: int) -> dict:
     window_meta = get_active_window_meta()
     pid = window_meta["kCGWindowOwnerPID"]
     app = oa_atomacos._a11y.AXUIElement.from_pid(pid)
+    app.set_timeout(config.AX_ELEMENT_TIMEOUT)
     el = app.get_element_at_position(x, y)
-    state = dump_state(el.ref)
+    if el is None:
+        return {}
+    state = dump_state(
+        el.ref,
+        max_depth=config.AX_MAX_DEPTH,
+        timeout=config.AX_DUMP_TIMEOUT,
+        attr_allowlist=_AX_ATTRS,
+    )
     state = deepconvert_objc(state)
     try:
         pickle.dumps(state, protocol=pickle.HIGHEST_PROTOCOL)
