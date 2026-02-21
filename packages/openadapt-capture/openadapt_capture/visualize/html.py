@@ -587,8 +587,8 @@ function getTypeColor(t){{
 
 function getEventIcon(t){{
     const lo=t.toLowerCase();
-    if(lo.includes('magnify'))return'\uD83D\uDD0D';
-    if(lo.includes('rotate'))return'\uD83D\uDD04';
+    if(lo.includes('magnify'))return'\u2316';
+    if(lo.includes('rotate'))return'\u21BB';
     if(lo.includes('click'))return'\u25CE';
     if(lo.includes('drag'))return'\u2197';
     if(lo.includes('scroll'))return'\u21D5';
