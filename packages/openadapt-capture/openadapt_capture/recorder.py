@@ -734,6 +734,14 @@ def on_scroll(
         )
 
 
+_MEDIA_VK_TO_NAME = {
+    21: "media_brightness_up",
+    22: "media_brightness_down",
+    23: "media_illumination_up",
+    24: "media_illumination_down",
+}
+
+
 def handle_key(
     event_q: queue.Queue,
     event_name: str,
@@ -759,11 +767,25 @@ def handle_key(
     attrs = {
         f"key_{attr_name}": getattr(key, attr_name, None) for attr_name in attr_names
     }
+
+    # Map unrecognized media keys by vk code
+    if attrs["key_name"] is None and attrs["key_vk"] is not None:
+        mapped_name = _MEDIA_VK_TO_NAME.get(attrs["key_vk"])
+        if mapped_name:
+            attrs["key_name"] = mapped_name
+
     logger.debug(f"{attrs=}")
     canonical_attrs = {
         f"canonical_key_{attr_name}": getattr(canonical_key, attr_name, None)
         for attr_name in attr_names
     }
+
+    # Apply same mapping to canonical attrs
+    if canonical_attrs["canonical_key_name"] is None and canonical_attrs["canonical_key_vk"] is not None:
+        mapped_name = _MEDIA_VK_TO_NAME.get(canonical_attrs["canonical_key_vk"])
+        if mapped_name:
+            canonical_attrs["canonical_key_name"] = mapped_name
+
     logger.debug(f"{canonical_attrs=}")
     trigger_action_event(event_q, {"name": event_name, **attrs, **canonical_attrs})
 
