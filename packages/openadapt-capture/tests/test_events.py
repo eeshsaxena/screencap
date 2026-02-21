@@ -169,6 +169,69 @@ class TestKeyboardEvents:
         assert len(event.children) == 4
 
 
+class TestMediaKeyEvents:
+    """Tests for media key event types."""
+
+    def test_key_down_media_play_pause(self):
+        """Test KeyDownEvent with media_play_pause round-trips through JSON."""
+        event = KeyDownEvent(
+            timestamp=1.0,
+            key_name="media_play_pause",
+        )
+        assert event.type == EventType.KEY_DOWN
+        assert event.key_name == "media_play_pause"
+
+        # Round-trip through JSON
+        data = event.model_dump()
+        restored = KeyDownEvent(**data)
+        assert restored.key_name == "media_play_pause"
+        assert restored.type == EventType.KEY_DOWN
+
+    def test_key_down_media_brightness_up(self):
+        """Test KeyDownEvent with media_brightness_up round-trips correctly."""
+        event = KeyDownEvent(
+            timestamp=1.0,
+            key_name="media_brightness_up",
+            key_vk="21",
+        )
+        data = event.model_dump()
+        restored = KeyDownEvent(**data)
+        assert restored.key_name == "media_brightness_up"
+        assert restored.key_vk == "21"
+
+    def test_key_down_media_volume_up(self):
+        """Test KeyDownEvent with media_volume_up round-trips correctly."""
+        event = KeyDownEvent(
+            timestamp=1.0,
+            key_name="media_volume_up",
+        )
+        json_str = event.model_dump_json()
+        assert "media_volume_up" in json_str
+
+    def test_key_up_media_play_pause(self):
+        """Test KeyUpEvent with media_play_pause round-trips correctly."""
+        event = KeyUpEvent(
+            timestamp=1.0,
+            key_name="media_play_pause",
+        )
+        assert event.type == EventType.KEY_UP
+        data = event.model_dump()
+        restored = KeyUpEvent(**data)
+        assert restored.key_name == "media_play_pause"
+
+    def test_key_up_media_brightness_down(self):
+        """Test KeyUpEvent with media_brightness_down round-trips correctly."""
+        event = KeyUpEvent(
+            timestamp=1.0,
+            key_name="media_brightness_down",
+            key_vk="22",
+        )
+        data = event.model_dump()
+        restored = KeyUpEvent(**data)
+        assert restored.key_name == "media_brightness_down"
+        assert restored.key_vk == "22"
+
+
 class TestScreenEvents:
     """Tests for screen event types."""
 

@@ -142,10 +142,22 @@ def remove_redundant_mouse_move_events(events: list[ActionEvent]) -> list[Action
     return result
 
 
+_MEDIA_KEY_PREFIXES = ("media_", "brightness_")
+
+
+def _is_media_key(event: KeyDownEvent | KeyUpEvent) -> bool:
+    """Check if a keyboard event represents a media/system key."""
+    if not hasattr(event, "key_name") or event.key_name is None:
+        return False
+    return any(event.key_name.startswith(p) for p in _MEDIA_KEY_PREFIXES)
+
+
 def merge_consecutive_keyboard_events(events: list[ActionEvent]) -> list[ActionEvent]:
     """Merge consecutive keyboard events into KeyTypeEvent.
 
     Groups key press/release sequences into typed text.
+    Media keys (play, volume, brightness, etc.) are emitted as raw
+    KeyDownEvent/KeyUpEvent instead of being merged.
 
     Args:
         events: List of events.
@@ -182,7 +194,11 @@ def merge_consecutive_keyboard_events(events: list[ActionEvent]) -> list[ActionE
         pressed_keys.clear()
 
     for event in events:
-        if isinstance(event, KeyDownEvent):
+        if isinstance(event, (KeyDownEvent, KeyUpEvent)) and _is_media_key(event):
+            # Media key: flush any buffered regular keys, then emit as-is
+            flush_buffer()
+            result.append(event)
+        elif isinstance(event, KeyDownEvent):
             key_id = event.key_name or event.key_char or event.key_vk or ""
             pressed_keys.add(key_id)
             keyboard_buffer.append(event)

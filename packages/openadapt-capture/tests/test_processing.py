@@ -112,6 +112,133 @@ class TestMergeConsecutiveKeyboardEvents:
         assert len(result) == 3  # KeyTypeEvent("a"), MouseMove, KeyTypeEvent("b")
 
 
+class TestMediaKeyProcessing:
+    """Tests for media key handling in the processing pipeline."""
+
+    def test_media_key_not_merged_into_key_type(self):
+        """Test that media key press/release pair is NOT merged into KeyTypeEvent."""
+        events = [
+            KeyDownEvent(timestamp=1.0, key_name="media_play_pause"),
+            KeyUpEvent(timestamp=1.1, key_name="media_play_pause"),
+        ]
+        result = merge_consecutive_keyboard_events(events)
+        assert len(result) == 2
+        assert isinstance(result[0], KeyDownEvent)
+        assert isinstance(result[1], KeyUpEvent)
+        assert result[0].key_name == "media_play_pause"
+
+    def test_regular_keys_still_merge_with_media_interspersed(self):
+        """Test: type 'abc' -> press Play -> type 'def' produces correct sequence."""
+        events = [
+            # Type "a"
+            KeyDownEvent(timestamp=1.0, key_char="a"),
+            KeyUpEvent(timestamp=1.1, key_char="a"),
+            # Type "b"
+            KeyDownEvent(timestamp=1.2, key_char="b"),
+            KeyUpEvent(timestamp=1.3, key_char="b"),
+            # Type "c"
+            KeyDownEvent(timestamp=1.4, key_char="c"),
+            KeyUpEvent(timestamp=1.5, key_char="c"),
+            # Media key
+            KeyDownEvent(timestamp=2.0, key_name="media_play_pause"),
+            KeyUpEvent(timestamp=2.1, key_name="media_play_pause"),
+            # Type "d"
+            KeyDownEvent(timestamp=3.0, key_char="d"),
+            KeyUpEvent(timestamp=3.1, key_char="d"),
+            # Type "e"
+            KeyDownEvent(timestamp=3.2, key_char="e"),
+            KeyUpEvent(timestamp=3.3, key_char="e"),
+            # Type "f"
+            KeyDownEvent(timestamp=3.4, key_char="f"),
+            KeyUpEvent(timestamp=3.5, key_char="f"),
+        ]
+        result = merge_consecutive_keyboard_events(events)
+
+        # Expect: KeyTypeEvent("a"), KeyTypeEvent("b"), KeyTypeEvent("c"),
+        #         KeyDown(media_play_pause), KeyUp(media_play_pause),
+        #         KeyTypeEvent("d"), KeyTypeEvent("e"), KeyTypeEvent("f")
+        assert len(result) == 8
+
+        # First three are KeyTypeEvents for a, b, c
+        assert isinstance(result[0], KeyTypeEvent)
+        assert result[0].text == "a"
+        assert isinstance(result[1], KeyTypeEvent)
+        assert result[1].text == "b"
+        assert isinstance(result[2], KeyTypeEvent)
+        assert result[2].text == "c"
+
+        # Media key events pass through as raw
+        assert isinstance(result[3], KeyDownEvent)
+        assert result[3].key_name == "media_play_pause"
+        assert isinstance(result[4], KeyUpEvent)
+        assert result[4].key_name == "media_play_pause"
+
+        # Last three are KeyTypeEvents for d, e, f
+        assert isinstance(result[5], KeyTypeEvent)
+        assert result[5].text == "d"
+        assert isinstance(result[6], KeyTypeEvent)
+        assert result[6].text == "e"
+        assert isinstance(result[7], KeyTypeEvent)
+        assert result[7].text == "f"
+
+    def test_brightness_key_not_merged(self):
+        """Test that brightness key events are not merged."""
+        events = [
+            KeyDownEvent(timestamp=1.0, key_name="media_brightness_up", key_vk="21"),
+            KeyUpEvent(timestamp=1.1, key_name="media_brightness_up", key_vk="21"),
+        ]
+        result = merge_consecutive_keyboard_events(events)
+        assert len(result) == 2
+        assert isinstance(result[0], KeyDownEvent)
+        assert isinstance(result[1], KeyUpEvent)
+
+    def test_volume_key_not_merged(self):
+        """Test that volume key events are not merged."""
+        events = [
+            KeyDownEvent(timestamp=1.0, key_name="media_volume_up"),
+            KeyUpEvent(timestamp=1.1, key_name="media_volume_up"),
+        ]
+        result = merge_consecutive_keyboard_events(events)
+        assert len(result) == 2
+        assert isinstance(result[0], KeyDownEvent)
+        assert isinstance(result[1], KeyUpEvent)
+
+    def test_remove_invalid_keeps_vk_only_events(self):
+        """Test that remove_invalid_keyboard_events passes events with only key_vk set."""
+        events = [
+            KeyDownEvent(timestamp=1.0, key_vk="21"),  # brightness key before mapping
+            KeyDownEvent(timestamp=2.0, key_char="a"),
+            KeyDownEvent(timestamp=3.0),  # truly empty — should be removed
+        ]
+        result = remove_invalid_keyboard_events(events)
+        assert len(result) == 2
+        assert result[0].key_vk == "21"
+        assert result[1].key_char == "a"
+
+    def test_media_key_in_full_pipeline(self):
+        """Test media keys through the full process_events pipeline."""
+        events = [
+            KeyDownEvent(timestamp=1.0, key_char="a"),
+            KeyUpEvent(timestamp=1.1, key_char="a"),
+            KeyDownEvent(timestamp=2.0, key_name="media_play_pause"),
+            KeyUpEvent(timestamp=2.1, key_name="media_play_pause"),
+            KeyDownEvent(timestamp=3.0, key_char="b"),
+            KeyUpEvent(timestamp=3.1, key_char="b"),
+        ]
+        result = process_events(events)
+
+        # Should have: KeyTypeEvent("a"), KeyDown(media), KeyUp(media), KeyTypeEvent("b")
+        assert len(result) == 4
+        assert isinstance(result[0], KeyTypeEvent)
+        assert result[0].text == "a"
+        assert isinstance(result[1], KeyDownEvent)
+        assert result[1].key_name == "media_play_pause"
+        assert isinstance(result[2], KeyUpEvent)
+        assert result[2].key_name == "media_play_pause"
+        assert isinstance(result[3], KeyTypeEvent)
+        assert result[3].text == "b"
+
+
 class TestMergeConsecutiveMouseMoveEvents:
     """Tests for merge_consecutive_mouse_move_events."""
 

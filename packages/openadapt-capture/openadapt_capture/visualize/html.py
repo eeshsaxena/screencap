@@ -149,6 +149,14 @@ def create_html(
             keys = action.keys
             if keys:
                 event_dict["keys"] = "+".join(keys)
+        # For raw key events (e.g. media keys), include key_name directly
+        if event_dict.get("text") is None and event_dict.get("keys") is None:
+            key_name = getattr(action.event, "key_name", None)
+            key_char = getattr(action.event, "key_char", None)
+            key_vk = getattr(action.event, "key_vk", None)
+            key_label = key_name or key_char or key_vk
+            if key_label:
+                event_dict["keys"] = str(key_label)
         if hasattr(action, "button"):
             event_dict["button"] = str(action.button)
         # dx/dy for drags and scrolls
@@ -580,7 +588,7 @@ function getTypeColor(t){{
     if(t.includes('click'))return'var(--ev-click)';
     if(t.includes('drag'))return'var(--ev-drag)';
     if(t.includes('scroll'))return'var(--ev-scroll)';
-    if(t.includes('type'))return'var(--ev-type)';
+    if(t.includes('type')||t==='key.down'||t==='key.up')return'var(--ev-type)';
     if(t.includes('start')||t.includes('end'))return'var(--accent)';
     return'var(--ev-move)';
 }}
@@ -592,7 +600,7 @@ function getEventIcon(t){{
     if(lo.includes('click'))return'\u25CE';
     if(lo.includes('drag'))return'\u2197';
     if(lo.includes('scroll'))return'\u21D5';
-    if(lo.includes('type'))return'\u2328';
+    if(lo.includes('type')||lo==='key.down'||lo==='key.up')return'\u2328';
     if(lo.includes('move'))return'\u2192';
     if(lo.includes('start'))return'\u25B6';
     if(lo.includes('end'))return'\u25A0';
@@ -611,6 +619,8 @@ function getEventLabel(t){{
     if(lo.includes('scroll'))return'Scroll';
     if(lo.includes('move'))return'Move';
     if(lo.includes('type'))return'Type';
+    if(lo==='key.down')return'Key \u25BC';
+    if(lo==='key.up')return'Key \u25B2';
     return t;
 }}
 
@@ -835,7 +845,7 @@ function drawOverlay(ev){{
         overlayCtx.beginPath();overlayCtx.moveTo(ax,ay);overlayCtx.lineTo(ax+10*Math.cos(endA+d*2.5),ay+10*Math.sin(endA+d*2.5));overlayCtx.lineTo(ax+10*Math.cos(endA-d*0.5),ay+10*Math.sin(endA-d*0.5));overlayCtx.closePath();overlayCtx.fillStyle='#ff9800';overlayCtx.fill();
         overlayCtx.beginPath();overlayCtx.arc(x,y,4,0,Math.PI*2);overlayCtx.fillStyle='#ff9800';overlayCtx.fill();
         overlayCtx.font='bold 13px sans-serif';overlayCtx.fillStyle='#ff9800';overlayCtx.fillText(Math.abs(Math.round(rot))+'\u00B0',x+r+10,y+5);
-    }}else if(type.includes('type')){{
+    }}else if(type.includes('type')||type==='key.down'||type==='key.up'){{
         const txt=ev.text||ev.keys||'';
         if(txt){{
             const bx=20,by=overlayCanvas.height-60,pad=10;
