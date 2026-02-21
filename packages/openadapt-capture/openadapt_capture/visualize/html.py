@@ -155,6 +155,11 @@ def create_html(
         if hasattr(action.event, "dx"):
             event_dict["dx"] = action.event.dx
             event_dict["dy"] = action.event.dy
+        # Gesture-specific fields
+        if hasattr(action.event, "magnification"):
+            event_dict["magnification"] = action.event.magnification
+        if hasattr(action.event, "rotation"):
+            event_dict["rotation"] = action.event.rotation
 
         # Accessibility data
         if getattr(action, "window_title", None):
@@ -332,7 +337,7 @@ def _generate_html(
     --border:rgba(255,255,255,0.06); --border-hi:rgba(255,255,255,0.12);
     --text-1:#eeeef0; --text-2:#9ea0ad; --text-3:#686a7a;
     --accent:#d4943a; --accent-dim:rgba(212,148,58,0.12); --accent-hover:#e0a448;
-    --ev-click:#ef5350; --ev-drag:#4caf50; --ev-scroll:#ab47bc; --ev-type:#42a5f5; --ev-move:#717380;
+    --ev-click:#ef5350; --ev-drag:#4caf50; --ev-scroll:#ab47bc; --ev-type:#42a5f5; --ev-move:#717380; --ev-magnify:#00bcd4; --ev-rotate:#ff9800;
     --radius:10px; --radius-sm:6px;
 }}
 *{{ box-sizing:border-box; margin:0; padding:0; }}
@@ -570,6 +575,8 @@ function formatTime(s){{ const m=Math.floor(s/60); const sc=(s%60).toFixed(2).pa
 
 function getTypeColor(t){{
     t=t.toLowerCase();
+    if(t.includes('magnify'))return'var(--ev-magnify)';
+    if(t.includes('rotate'))return'var(--ev-rotate)';
     if(t.includes('click'))return'var(--ev-click)';
     if(t.includes('drag'))return'var(--ev-drag)';
     if(t.includes('scroll'))return'var(--ev-scroll)';
@@ -580,6 +587,8 @@ function getTypeColor(t){{
 
 function getEventIcon(t){{
     const lo=t.toLowerCase();
+    if(lo.includes('magnify'))return'\uD83D\uDD0D';
+    if(lo.includes('rotate'))return'\uD83D\uDD04';
     if(lo.includes('click'))return'\u25CE';
     if(lo.includes('drag'))return'\u2197';
     if(lo.includes('scroll'))return'\u21D5';
@@ -594,6 +603,8 @@ function getEventLabel(t){{
     const lo=t.toLowerCase();
     if(lo==='recording.start')return'Start';
     if(lo==='recording.end')return'End';
+    if(lo.includes('magnify'))return'Zoom';
+    if(lo.includes('rotate'))return'Rotate';
     if(lo.includes('doubleclick'))return'Double Click';
     if(lo.includes('singleclick')||lo.includes('click'))return'Click';
     if(lo.includes('drag'))return'Drag';
@@ -606,6 +617,8 @@ function getEventLabel(t){{
 function getEventDesc(ev){{
     if(ev.text)return ev.text.substring(0,22);
     if(ev.keys)return ev.keys;
+    if(ev.magnification!=null)return(ev.magnification>0?'+':'')+Math.round(ev.magnification*100)+'% zoom';
+    if(ev.rotation!=null)return Math.abs(Math.round(ev.rotation))+'\u00B0 '+(ev.rotation>=0?'CCW':'CW');
     if(ev.x!=null&&ev.y!=null)return`(${{Math.round(ev.x)}},${{Math.round(ev.y)}})`;
     return'';
 }}
@@ -798,6 +811,30 @@ function drawOverlay(ev){{
             const aY=dy>0?-25:25;
             overlayCtx.beginPath();overlayCtx.moveTo(x,y+aY);overlayCtx.lineTo(x-8,y+aY+(dy>0?10:-10));overlayCtx.lineTo(x+8,y+aY+(dy>0?10:-10));overlayCtx.closePath();overlayCtx.fillStyle='#ab47bc';overlayCtx.fill();
         }}
+    }}else if(type.includes('magnify')){{
+        const x=oX+(ev.x*sX),y=oY+(ev.y*sY);
+        const mag=ev.magnification||0;
+        const r1=20,r2=35,r3=50;
+        const alpha=Math.min(Math.abs(mag)*3,0.6)+0.15;
+        overlayCtx.beginPath();overlayCtx.arc(x,y,r3,0,Math.PI*2);overlayCtx.strokeStyle=`rgba(0,188,212,${{alpha*0.5}})`;overlayCtx.lineWidth=2;overlayCtx.stroke();
+        overlayCtx.beginPath();overlayCtx.arc(x,y,r2,0,Math.PI*2);overlayCtx.strokeStyle=`rgba(0,188,212,${{alpha*0.7}})`;overlayCtx.lineWidth=2;overlayCtx.stroke();
+        overlayCtx.beginPath();overlayCtx.arc(x,y,r1,0,Math.PI*2);overlayCtx.strokeStyle='#00bcd4';overlayCtx.lineWidth=3;overlayCtx.stroke();
+        overlayCtx.beginPath();overlayCtx.arc(x,y,5,0,Math.PI*2);overlayCtx.fillStyle='#00bcd4';overlayCtx.fill();
+        const sign=mag>=0?'+':'';
+        overlayCtx.font='bold 13px sans-serif';overlayCtx.fillStyle='#00bcd4';overlayCtx.fillText(sign+Math.round(mag*100)+'%',x+r3+5,y+5);
+    }}else if(type.includes('rotate')){{
+        const x=oX+(ev.x*sX),y=oY+(ev.y*sY);
+        const rot=ev.rotation||0;
+        const r=30;
+        const startA=-Math.PI/2;
+        const sweep=(rot/180)*Math.PI;
+        overlayCtx.beginPath();overlayCtx.arc(x,y,r,startA,startA+sweep,rot<0);overlayCtx.strokeStyle='#ff9800';overlayCtx.lineWidth=3;overlayCtx.stroke();
+        const endA=startA+sweep;
+        const ax=x+r*Math.cos(endA),ay=y+r*Math.sin(endA);
+        const d=rot>=0?1:-1;
+        overlayCtx.beginPath();overlayCtx.moveTo(ax,ay);overlayCtx.lineTo(ax+10*Math.cos(endA+d*2.5),ay+10*Math.sin(endA+d*2.5));overlayCtx.lineTo(ax+10*Math.cos(endA-d*0.5),ay+10*Math.sin(endA-d*0.5));overlayCtx.closePath();overlayCtx.fillStyle='#ff9800';overlayCtx.fill();
+        overlayCtx.beginPath();overlayCtx.arc(x,y,4,0,Math.PI*2);overlayCtx.fillStyle='#ff9800';overlayCtx.fill();
+        overlayCtx.font='bold 13px sans-serif';overlayCtx.fillStyle='#ff9800';overlayCtx.fillText(Math.abs(Math.round(rot))+'\u00B0',x+r+10,y+5);
     }}else if(type.includes('type')){{
         const txt=ev.text||ev.keys||'';
         if(txt){{

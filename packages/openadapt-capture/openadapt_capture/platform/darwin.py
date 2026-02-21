@@ -88,6 +88,24 @@ class DarwinPlatform:
             return True  # Assume enabled if we can't check
 
     @staticmethod
+    def is_input_monitoring_enabled() -> bool:
+        """Check if Input Monitoring permission is granted.
+
+        Input Monitoring is required for listen-only CGEventTaps (used for
+        trackpad gesture capture). This is a lighter permission than
+        Accessibility.
+
+        Returns:
+            True if permission is granted, False otherwise.
+        """
+        try:
+            import Quartz
+
+            return Quartz.CGPreflightListenEventAccess()
+        except (ImportError, AttributeError):
+            return True  # Assume enabled if we can't check
+
+    @staticmethod
     def is_accessibility_enabled() -> bool:
         """Check if accessibility permissions are enabled.
 

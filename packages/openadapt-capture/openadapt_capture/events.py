@@ -21,6 +21,8 @@ class EventType(str, Enum):
     MOUSE_DOWN = "mouse.down"
     MOUSE_UP = "mouse.up"
     MOUSE_SCROLL = "mouse.scroll"
+    MOUSE_MAGNIFY = "mouse.magnify"
+    MOUSE_ROTATE = "mouse.rotate"
 
     # Keyboard events (raw)
     KEY_DOWN = "key.down"
@@ -116,6 +118,32 @@ class MouseScrollEvent(BaseEvent):
     y: float = Field(description="Mouse Y position in pixels")
     dx: float = Field(description="Horizontal scroll delta")
     dy: float = Field(description="Vertical scroll delta")
+
+
+class MouseMagnifyEvent(BaseEvent):
+    """Trackpad pinch-to-zoom gesture event.
+
+    Corresponds to macOS NSEventTypeMagnify (type 30).
+    magnification is a per-event delta (e.g., 0.05 = 5% zoom increase).
+    """
+
+    type: Literal[EventType.MOUSE_MAGNIFY] = EventType.MOUSE_MAGNIFY
+    x: float = Field(description="Cursor X position in pixels")
+    y: float = Field(description="Cursor Y position in pixels")
+    magnification: float = Field(description="Magnification delta per event")
+
+
+class MouseRotateEvent(BaseEvent):
+    """Trackpad two-finger rotation gesture event.
+
+    Corresponds to macOS NSEventTypeRotate (type 18).
+    rotation is in degrees, positive = counter-clockwise.
+    """
+
+    type: Literal[EventType.MOUSE_ROTATE] = EventType.MOUSE_ROTATE
+    x: float = Field(description="Cursor X position in pixels")
+    y: float = Field(description="Cursor Y position in pixels")
+    rotation: float = Field(description="Rotation in degrees, positive = CCW")
 
 
 # =============================================================================
@@ -263,7 +291,11 @@ class MouseDragEvent(BaseEvent):
     dx: float = Field(description="Horizontal displacement (end_x - start_x)")
     dy: float = Field(description="Vertical displacement (end_y - start_y)")
     button: MouseButton = Field(description="Mouse button name")
-    children: list[MouseDownEvent | MouseMoveEvent | MouseUpEvent] = Field(
+    children: list[
+        MouseDownEvent | MouseMoveEvent | MouseUpEvent
+        | MouseScrollEvent | KeyDownEvent | KeyUpEvent | KeyTypeEvent
+        | MouseMagnifyEvent | MouseRotateEvent
+    ] = Field(
         default_factory=list, description="Child events that were merged"
     )
 
@@ -291,6 +323,8 @@ ActionEvent = (
     | MouseDownEvent
     | MouseUpEvent
     | MouseScrollEvent
+    | MouseMagnifyEvent
+    | MouseRotateEvent
     | KeyDownEvent
     | KeyUpEvent
     | MouseClickEvent
