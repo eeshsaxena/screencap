@@ -338,8 +338,16 @@ def get_active_element_state(x: int, y: int) -> dict:
     window_meta = get_active_window_meta()
     pid = window_meta["kCGWindowOwnerPID"]
     app = oa_atomacos._a11y.AXUIElement.from_pid(pid)
+    app.set_timeout(config.AX_ELEMENT_TIMEOUT)
     el = app.get_element_at_position(x, y)
-    state = dump_state(el.ref)
+    if el is None:
+        return {}
+    state = dump_state(
+        el.ref,
+        max_depth=config.AX_MAX_DEPTH,
+        timeout=config.AX_DUMP_TIMEOUT,
+        attr_allowlist=_AX_ATTRS,
+    )
     state = deepconvert_objc(state)
     try:
         pickle.dumps(state, protocol=pickle.HIGHEST_PROTOCOL)
