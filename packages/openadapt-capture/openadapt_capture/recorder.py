@@ -219,6 +219,10 @@ def process_events(
 
     logger.info("Starting")
 
+    # Rate-limit accessibility queries to avoid starving target app main thread.
+    _AX_QUERY_INTERVAL = config.AX_QUERY_INTERVAL
+    _last_ax_query_time = 0.0
+
     prev_event = None
     prev_screen_event = None
     prev_window_event = None
@@ -285,6 +289,24 @@ def process_events(
                 # Window capture disabled — skip window timestamp requirement
             else:
                 event.data["window_event_timestamp"] = prev_window_event.timestamp
+
+            # Enrich with accessibility element state here (off the pynput
+            # callback thread) so input capture is never blocked.
+            # Rate-limited to avoid starving target app's main thread.
+            if config.RECORD_READ_ACTIVE_ELEMENT_STATE:
+                x = event.data.get("mouse_x")
+                y = event.data.get("mouse_y")
+                now = time.monotonic()
+                if x is not None and y is not None and (
+                    now - _last_ax_query_time >= _AX_QUERY_INTERVAL
+                ):
+                    _last_ax_query_time = now
+                    try:
+                        element_state = window.get_active_element_state(x, y)
+                    except Exception as exc:
+                        logger.warning(f"element state failed: {exc}")
+                        element_state = {}
+                    event.data["element_state"] = element_state
 
             process_event(
                 event,
@@ -626,6 +648,10 @@ def trigger_action_event(
 ) -> None:
     """Triggers an action event and adds it to the event queue.
 
+    Queues the event immediately without blocking on accessibility queries.
+    The element_state is populated later in process_events() to avoid
+    blocking the pynput callback thread.
+
     Args:
         event_q: The event queue to add the action event to.
         action_event_args: A dictionary containing the arguments for the action event.
@@ -633,14 +659,6 @@ def trigger_action_event(
     Returns:
         None
     """
-    x = action_event_args.get("mouse_x")
-    y = action_event_args.get("mouse_y")
-    if x is not None and y is not None:
-        if config.RECORD_READ_ACTIVE_ELEMENT_STATE:
-            element_state = window.get_active_element_state(x, y)
-        else:
-            element_state = {}
-        action_event_args["element_state"] = element_state
     event_q.put(Event(utils.get_timestamp(), "action", action_event_args))
 
 
@@ -834,13 +852,14 @@ def read_window_events(
     """
     utils.set_start_time(recording.timestamp)
 
-    logger.info("Starting")
+    poll_interval = max(config.AX_QUERY_INTERVAL, 0.1)
+    logger.info(f"Starting (poll_interval={poll_interval:.1f}s)")
     prev_window_data = {}
     started = False
     while not terminate_processing.is_set():
         window_data = window.get_active_window_data()
         if not window_data:
-            time.sleep(0.1)
+            time.sleep(poll_interval)
             continue
 
         if not started:
@@ -870,7 +889,7 @@ def read_window_events(
                 )
             )
         prev_window_data = window_data
-        time.sleep(0.1)  # poll ~10 times/sec instead of tight loop
+        time.sleep(poll_interval)
 
 
 @utils.trace(logger)
@@ -1906,6 +1925,10 @@ class Recorder:
         log_memory: bool | None = None,
         plot_performance: bool | None = None,
         screen_capture_fps: float | None = None,
+        ax_query_interval: float | None = None,
+        ax_max_depth: int | None = None,
+        ax_dump_timeout: float | None = None,
+        ax_element_timeout: float | None = None,
         send_profile: bool = False,
     ) -> None:
         from pathlib import Path
@@ -1930,6 +1953,10 @@ class Recorder:
             log_memory=log_memory,
             plot_performance=plot_performance,
             screen_capture_fps=screen_capture_fps,
+            ax_query_interval=ax_query_interval,
+            ax_max_depth=ax_max_depth,
+            ax_dump_timeout=ax_dump_timeout,
+            ax_element_timeout=ax_element_timeout,
         )
 
         # Shared state for cross-thread communication
