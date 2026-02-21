@@ -13,12 +13,12 @@ jobs:
     strategy:
       matrix:
         include:
-          - runner: macos-14    # arm64 (Apple Silicon)
+          - runner: macos-14
             arch: arm64
-          # x86_64 disabled: macos-13 runner no longer available on free tier.
-          # Re-enable when GitHub provides an Intel runner or use macos-13-xlarge (paid).
-          # - runner: macos-13
-          #   arch: x86_64
+            python-arch: arm64
+          - runner: macos-14    # x86_64 via Rosetta on Apple Silicon runner
+            arch: x86_64
+            python-arch: x64
     runs-on: ${{ matrix.runner }}
     steps:
       - uses: actions/checkout@v4
@@ -26,6 +26,7 @@ jobs:
       - uses: actions/setup-python@v5
         with:
           python-version: '3.12'
+          architecture: ${{ matrix.python-arch }}
 
       - uses: actions/cache@v4
         with:
