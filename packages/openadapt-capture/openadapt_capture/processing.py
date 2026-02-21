@@ -8,6 +8,8 @@ from __future__ import annotations
 
 from typing import Any, TypeVar
 
+import os
+
 from openadapt_capture.events import (
     ActionEvent,
     Event,
@@ -18,7 +20,9 @@ from openadapt_capture.events import (
     MouseDoubleClickEvent,
     MouseDownEvent,
     MouseDragEvent,
+    MouseMagnifyEvent,
     MouseMoveEvent,
+    MouseRotateEvent,
     MouseScrollEvent,
     MouseUpEvent,
 )
@@ -36,6 +40,11 @@ MOUSE_MOVE_MERGE_MIN_IDX_DELTA = 5  # minimum events between groups
 DOUBLE_CLICK_INTERVAL_SECONDS = 0.5  # default double-click interval
 DOUBLE_CLICK_DISTANCE_PIXELS = 5.0  # default double-click distance
 KEY_TYPE_MERGE_INTERVAL_SECONDS = 0.5  # merge adjacent KeyTypeEvents within this interval
+
+# Drag distance threshold (pixels). Down/up pairs within this distance are clicks, beyond are drags.
+# Default 3px matches macOS HIG and precision graphics apps (Inkscape=4px, Windows=4px).
+# Override via SCREENCAP_DRAG_THRESHOLD env var.
+DRAG_DISTANCE_THRESHOLD = float(os.environ.get("SCREENCAP_DRAG_THRESHOLD", "3.0"))
 
 
 # =============================================================================
@@ -56,8 +65,10 @@ def process_events(
     3. Merge consecutive keyboard events → KeyTypeEvent
     4. Merge consecutive mouse move events
     5. Merge consecutive mouse scroll events
-    6. Merge consecutive mouse click events → MouseClickEvent/MouseDoubleClickEvent
-    7. Detect drag events → MouseDragEvent
+    6. Merge consecutive mouse magnify events
+    7. Merge consecutive mouse rotate events
+    8. Merge consecutive mouse click events → MouseClickEvent/MouseDoubleClickEvent
+    9. Detect drag events → MouseDragEvent
 
     Args:
         events: Raw action events.
@@ -73,6 +84,8 @@ def process_events(
     events = merge_consecutive_keyboard_events(events)
     events = merge_consecutive_mouse_move_events(events)
     events = merge_consecutive_mouse_scroll_events(events)
+    events = merge_consecutive_mouse_magnify_events(events)
+    events = merge_consecutive_mouse_rotate_events(events)
     events = merge_consecutive_mouse_click_events(
         events,
         double_click_interval=double_click_interval,
@@ -287,11 +300,95 @@ def merge_consecutive_mouse_scroll_events(events: list[ActionEvent]) -> list[Act
     return result
 
 
+def merge_consecutive_mouse_magnify_events(events: list[ActionEvent]) -> list[ActionEvent]:
+    """Merge consecutive mouse magnify events.
+
+    Sums magnification deltas from consecutive pinch-to-zoom events.
+
+    Args:
+        events: List of events.
+
+    Returns:
+        Events with magnify gestures merged.
+    """
+    result = []
+    magnify_buffer: list[MouseMagnifyEvent] = []
+
+    def flush_buffer() -> None:
+        if not magnify_buffer:
+            return
+        if len(magnify_buffer) == 1:
+            result.append(magnify_buffer[0])
+        else:
+            first = magnify_buffer[0]
+            total_mag = sum(e.magnification for e in magnify_buffer)
+            merged = MouseMagnifyEvent(
+                timestamp=first.timestamp,
+                x=first.x,
+                y=first.y,
+                magnification=total_mag,
+            )
+            result.append(merged)
+        magnify_buffer.clear()
+
+    for event in events:
+        if isinstance(event, MouseMagnifyEvent):
+            magnify_buffer.append(event)
+        else:
+            flush_buffer()
+            result.append(event)
+
+    flush_buffer()
+    return result
+
+
+def merge_consecutive_mouse_rotate_events(events: list[ActionEvent]) -> list[ActionEvent]:
+    """Merge consecutive mouse rotate events.
+
+    Sums rotation deltas from consecutive two-finger rotation events.
+
+    Args:
+        events: List of events.
+
+    Returns:
+        Events with rotate gestures merged.
+    """
+    result = []
+    rotate_buffer: list[MouseRotateEvent] = []
+
+    def flush_buffer() -> None:
+        if not rotate_buffer:
+            return
+        if len(rotate_buffer) == 1:
+            result.append(rotate_buffer[0])
+        else:
+            first = rotate_buffer[0]
+            total_rot = sum(e.rotation for e in rotate_buffer)
+            merged = MouseRotateEvent(
+                timestamp=first.timestamp,
+                x=first.x,
+                y=first.y,
+                rotation=total_rot,
+            )
+            result.append(merged)
+        rotate_buffer.clear()
+
+    for event in events:
+        if isinstance(event, MouseRotateEvent):
+            rotate_buffer.append(event)
+        else:
+            flush_buffer()
+            result.append(event)
+
+    flush_buffer()
+    return result
+
+
 def merge_consecutive_mouse_click_events(
     events: list[ActionEvent],
     double_click_interval: float = DOUBLE_CLICK_INTERVAL_SECONDS,
     double_click_distance: float = DOUBLE_CLICK_DISTANCE_PIXELS,
-    drag_distance_threshold: float = 10.0,
+    drag_distance_threshold: float = DRAG_DISTANCE_THRESHOLD,
 ) -> list[ActionEvent]:
     """Merge mouse down/up events into click events.
 
@@ -406,14 +503,18 @@ def merge_consecutive_mouse_click_events(
 
 def detect_drag_events(
     events: list[ActionEvent],
-    min_distance: float = 10.0,
+    min_distance: float = DRAG_DISTANCE_THRESHOLD,
 ) -> list[ActionEvent]:
     """Detect drag events from mouse down → move → up sequences.
 
     A drag is detected when:
     1. Mouse down occurs
-    2. One or more mouse moves occur while button is held
-    3. Mouse up occurs at a different position than mouse down
+    2. Mouse up occurs for the same button at a distance >= min_distance
+
+    Keyboard, scroll, and gesture events that occur mid-drag are tolerated:
+    they are emitted inline AND included as children of the drag event.
+    Only truly unrelated events (WindowStateEvent, ScreenFrameEvent, merged
+    clicks) flush the drag state.
 
     Args:
         events: List of events (should already have clicks merged).
@@ -422,28 +523,57 @@ def detect_drag_events(
     Returns:
         Events with drags detected as MouseDragEvent.
     """
+    # Event types that are tolerated during a drag — emitted inline and
+    # also captured as children of the drag.
+    DRAG_SIBLING_TYPES = (
+        KeyTypeEvent, KeyDownEvent, KeyUpEvent,
+        MouseScrollEvent,
+        MouseMagnifyEvent, MouseRotateEvent,
+    )
+
     result = []
-    drag_state: dict[str, Any] | None = None  # {down: MouseDownEvent, moves: [...]}
+    # {down: MouseDownEvent, children: [...sibling events during drag]}
+    drag_state: dict[str, Any] | None = None
 
     def calculate_distance(x1: float, y1: float, x2: float, y2: float) -> float:
         return ((x2 - x1) ** 2 + (y2 - y1) ** 2) ** 0.5
 
+    def flush_drag_state() -> None:
+        """Emit buffered drag state as separate events (drag not completed)."""
+        nonlocal drag_state
+        if drag_state is None:
+            return
+        result.append(drag_state["down"])
+        result.extend(drag_state["children"])
+        drag_state = None
+
     for event in events:
         if isinstance(event, MouseDownEvent):
-            # Start potential drag
-            drag_state = {"down": event, "moves": []}
+            if drag_state is not None:
+                if event.button != drag_state["down"].button:
+                    # Second button during drag — emit inline, continue tracking original drag
+                    drag_state["children"].append(event)
+                    result.append(event)
+                    continue
+                else:
+                    # Same button pressed again — flush old state, start new
+                    flush_drag_state()
+            drag_state = {"down": event, "children": []}
+
         elif isinstance(event, MouseMoveEvent) and drag_state is not None:
-            # Track moves during potential drag
-            drag_state["moves"].append(event)
+            drag_state["children"].append(event)
+
         elif isinstance(event, MouseUpEvent) and drag_state is not None:
             down_event: MouseDownEvent = drag_state["down"]
-            moves: list[MouseMoveEvent] = drag_state["moves"]
 
             if down_event.button == event.button:
-                distance = calculate_distance(down_event.x, down_event.y, event.x, event.y)
+                # Matching button — check if this is a drag
+                distance = calculate_distance(
+                    down_event.x, down_event.y, event.x, event.y
+                )
 
-                if distance >= min_distance and moves:
-                    # Create drag event with dx/dy displacement
+                if distance >= min_distance:
+                    # Create drag event
                     drag = MouseDragEvent(
                         timestamp=down_event.timestamp,
                         x=down_event.x,
@@ -451,42 +581,38 @@ def detect_drag_events(
                         dx=event.x - down_event.x,
                         dy=event.y - down_event.y,
                         button=down_event.button,
-                        children=[down_event] + moves + [event],
+                        children=[down_event] + drag_state["children"] + [event],
                     )
                     result.append(drag)
                 else:
-                    # Not a drag, output as separate events
+                    # Not a drag — output as separate events
                     result.append(down_event)
-                    result.extend(moves)
+                    result.extend(drag_state["children"])
                     result.append(event)
+
+                drag_state = None
             else:
-                # Button mismatch
-                result.append(down_event)
-                result.extend(moves)
+                # MouseUp for a different button — emit inline, continue drag
+                drag_state["children"].append(event)
                 result.append(event)
 
-            drag_state = None
-        elif isinstance(event, (MouseClickEvent, MouseDoubleClickEvent)):
-            # Already merged click, just pass through
-            if drag_state is not None:
-                # Flush incomplete drag state
-                result.append(drag_state["down"])
-                result.extend(drag_state["moves"])
-                drag_state = None
-            result.append(event)
-        else:
-            # Other event types
-            if drag_state is not None:
-                # Interrupted drag sequence
-                result.append(drag_state["down"])
-                result.extend(drag_state["moves"])
-                drag_state = None
+        elif isinstance(event, DRAG_SIBLING_TYPES) and drag_state is not None:
+            # Tolerate keyboard/scroll/gesture events during drag
+            drag_state["children"].append(event)
             result.append(event)
 
-    # Handle any remaining drag state
-    if drag_state is not None:
-        result.append(drag_state["down"])
-        result.extend(drag_state["moves"])
+        elif isinstance(event, (MouseClickEvent, MouseDoubleClickEvent)):
+            # Already merged click — flush any incomplete drag
+            flush_drag_state()
+            result.append(event)
+
+        else:
+            # Truly unrelated events (WindowStateEvent, ScreenFrameEvent, etc.)
+            flush_drag_state()
+            result.append(event)
+
+    # Handle any remaining drag state at end of event list
+    flush_drag_state()
 
     return result
 
@@ -510,6 +636,8 @@ def get_action_events(events: list[Event]) -> list[ActionEvent]:
         MouseDownEvent,
         MouseUpEvent,
         MouseScrollEvent,
+        MouseMagnifyEvent,
+        MouseRotateEvent,
         KeyDownEvent,
         KeyUpEvent,
         MouseClickEvent,

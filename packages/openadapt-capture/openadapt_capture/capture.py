@@ -18,7 +18,9 @@ from openadapt_capture.events import (
     KeyUpEvent,
     MouseButton,
     MouseDownEvent,
+    MouseMagnifyEvent,
     MouseMoveEvent,
+    MouseRotateEvent,
     MouseScrollEvent,
     MouseUpEvent,
 )
@@ -95,6 +97,20 @@ def _convert_action_event(db_event) -> PydanticActionEvent | None:
             canonical_key_name=db_event.canonical_key_name,
             canonical_key_char=db_event.canonical_key_char,
             canonical_key_vk=db_event.canonical_key_vk,
+        )
+    elif db_event.name == "magnify":
+        return MouseMagnifyEvent(
+            timestamp=ts,
+            x=db_event.mouse_x or 0,
+            y=db_event.mouse_y or 0,
+            magnification=db_event.mouse_dx or 0.0,
+        )
+    elif db_event.name == "rotate":
+        return MouseRotateEvent(
+            timestamp=ts,
+            x=db_event.mouse_x or 0,
+            y=db_event.mouse_y or 0,
+            rotation=db_event.mouse_dx or 0.0,
         )
     return None
 

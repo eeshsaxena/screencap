@@ -1164,6 +1164,175 @@ def read_mouse_events(
     mouse_listener.stop()
 
 
+def read_gesture_events(
+    event_q: queue.Queue,
+    terminate_processing: multiprocessing.Event,
+    recording: Recording,
+    started_event: threading.Event,
+) -> None:
+    """Capture trackpad gesture events via a custom CGEventTap (macOS only).
+
+    Captures pinch-to-zoom (magnify), two-finger rotation, and three-finger
+    swipe events that pynput's mouse listener does not handle.
+
+    Uses kCGEventTapOptionListenOnly which requires Input Monitoring
+    permission (NOT Accessibility).
+
+    Args:
+        event_q: The event queue to add gesture events to.
+        terminate_processing: Event to signal termination.
+        recording: The recording object.
+        started_event: Event to set once started.
+    """
+    import Quartz
+    from AppKit import NSEvent
+    from CoreFoundation import (
+        CFMachPortCreateRunLoopSource,
+        CFRunLoopAddSource,
+        CFRunLoopAddTimer,
+        CFRunLoopGetCurrent,
+        CFRunLoopRun,
+        CFRunLoopStop,
+        CFRunLoopTimerCreate,
+        kCFAllocatorDefault,
+        kCFRunLoopDefaultMode,
+    )
+
+    utils.set_start_time(recording.timestamp)
+
+    # NSEvent type constants
+    NS_EVENT_TYPE_MAGNIFY = 30
+    NS_EVENT_TYPE_ROTATE = 18
+    NS_EVENT_TYPE_SWIPE = 31
+
+    # CGEventTap mask for type 29 (NSEventTypeGesture — all trackpad gestures)
+    gesture_mask = Quartz.CGEventMaskBit(29)
+
+    run_loop_ref = [None]  # mutable container for the CFRunLoop reference
+
+    def gesture_callback(_proxy, _type, cg_event, _refcon):
+        """CGEventTap callback — converts CGEvent to NSEvent and enqueues."""
+        try:
+            ns_event = NSEvent.eventWithCGEvent_(cg_event)
+            if ns_event is None:
+                return cg_event
+
+            sub_type = ns_event.type()
+
+            if sub_type == NS_EVENT_TYPE_MAGNIFY:
+                mag = ns_event.magnification()
+                if mag == 0.0:
+                    return cg_event
+                loc = Quartz.CGEventGetLocation(cg_event)
+                trigger_action_event(
+                    event_q,
+                    {
+                        "name": "magnify",
+                        "mouse_x": loc.x,
+                        "mouse_y": loc.y,
+                        "mouse_dx": mag,
+                        "mouse_dy": 0.0,
+                    },
+                )
+
+            elif sub_type == NS_EVENT_TYPE_ROTATE:
+                rot = ns_event.rotation()
+                if rot == 0.0:
+                    return cg_event
+                loc = Quartz.CGEventGetLocation(cg_event)
+                trigger_action_event(
+                    event_q,
+                    {
+                        "name": "rotate",
+                        "mouse_x": loc.x,
+                        "mouse_y": loc.y,
+                        "mouse_dx": rot,
+                        "mouse_dy": 0.0,
+                    },
+                )
+
+            elif sub_type == NS_EVENT_TYPE_SWIPE:
+                # Map three-finger swipe to scroll events
+                dx = ns_event.deltaX()
+                dy = ns_event.deltaY()
+                if dx == 0.0 and dy == 0.0:
+                    return cg_event
+                loc = Quartz.CGEventGetLocation(cg_event)
+                trigger_action_event(
+                    event_q,
+                    {
+                        "name": "scroll",
+                        "mouse_x": loc.x,
+                        "mouse_y": loc.y,
+                        "mouse_dx": dx,
+                        "mouse_dy": dy,
+                    },
+                )
+
+        except Exception:
+            # Never let exceptions escape a C callback
+            logger.exception("Error in gesture event callback")
+
+        return cg_event
+
+    # Create the event tap
+    tap = Quartz.CGEventTapCreate(
+        Quartz.kCGSessionEventTap,
+        Quartz.kCGHeadInsertEventTap,
+        Quartz.kCGEventTapOptionListenOnly,
+        gesture_mask,
+        gesture_callback,
+        None,
+    )
+
+    if tap is None:
+        logger.warning(
+            "Failed to create gesture CGEventTap. "
+            "Ensure Input Monitoring permission is granted in "
+            "System Settings > Privacy & Security > Input Monitoring. "
+            "Recording will continue without trackpad gesture capture."
+        )
+        started_event.set()
+        return
+
+    # Wire tap into a CFRunLoop
+    source = CFMachPortCreateRunLoopSource(kCFAllocatorDefault, tap, 0)
+    loop = CFRunLoopGetCurrent()
+    run_loop_ref[0] = loop
+    CFRunLoopAddSource(loop, source, kCFRunLoopDefaultMode)
+    Quartz.CGEventTapEnable(tap, True)
+
+    # Periodic timer to check for termination and re-enable the tap
+    # (macOS can silently disable taps when SecureInput is active).
+    CHECK_INTERVAL = 0.5  # seconds
+
+    def timer_callback(_timer, _info):
+        if terminate_processing.is_set():
+            Quartz.CGEventTapEnable(tap, False)
+            CFRunLoopStop(loop)
+        else:
+            # Re-enable tap in case macOS disabled it (SecureInput bug)
+            if not Quartz.CGEventTapIsEnabled(tap):
+                logger.debug("Re-enabling gesture event tap (was disabled)")
+                Quartz.CGEventTapEnable(tap, True)
+
+    timer = CFRunLoopTimerCreate(
+        kCFAllocatorDefault,
+        Quartz.CFAbsoluteTimeGetCurrent() + CHECK_INTERVAL,
+        CHECK_INTERVAL,
+        0, 0,
+        timer_callback,
+        None,
+    )
+    CFRunLoopAddTimer(loop, timer, kCFRunLoopDefaultMode)
+
+    started_event.set()
+
+    # Block this thread in the CFRunLoop until stopped
+    CFRunLoopRun()
+    logger.debug("Gesture event reader stopped")
+
+
 def record_audio(
     recording: Recording,
     db_path: str,
@@ -1426,6 +1595,20 @@ def record(
     recording, db_path = create_recording(task_description, capture_dir)
     recording_timestamp = recording.timestamp
 
+    # Pre-import pyobjc symbols on the main thread — pyobjc's lazy-loading
+    # bridge is not thread-safe for first-time resolution.
+    if sys.platform == "darwin":
+        try:
+            import Quartz as _q  # noqa: F401
+            from AppKit import NSEvent as _ns  # noqa: F401
+            _ = (_q.CGEventTapCreate, _q.CGEventMaskBit, _q.kCGSessionEventTap,
+                 _q.kCGHeadInsertEventTap, _q.kCGEventTapOptionListenOnly,
+                 _q.CGEventTapEnable, _q.CGEventTapIsEnabled,
+                 _q.CGEventGetLocation, _q.CFAbsoluteTimeGetCurrent)
+            _ = _ns.eventWithCGEvent_
+        except (ImportError, AttributeError):
+            pass  # pyobjc not available; gesture capture will be skipped
+
     event_q = queue.Queue()
     screen_write_q = sq.SynchronizedQueue()
     action_write_q = sq.SynchronizedQueue()
@@ -1506,6 +1689,24 @@ def record(
     )
     mouse_event_reader.start()
     task_by_name["mouse_event_reader"] = mouse_event_reader
+
+    # Start gesture event reader (macOS only — captures trackpad pinch/rotate/swipe)
+    if sys.platform == "darwin":
+        gesture_event_reader = threading.Thread(
+            target=read_gesture_events,
+            args=(
+                event_q,
+                terminate_processing,
+                recording,
+                task_started_events.setdefault(
+                    "gesture_event_reader", threading.Event()
+                ),
+            ),
+            daemon=True,
+            name="gesture_event_reader",
+        )
+        gesture_event_reader.start()
+        task_by_name["gesture_event_reader"] = gesture_event_reader
 
     if num_action_events is None:
         num_action_events = multiprocessing.Value("i", 0)

@@ -15,17 +15,23 @@ from openadapt_capture.events import (
     MouseDoubleClickEvent,
     MouseDownEvent,
     MouseDragEvent,
+    MouseMagnifyEvent,
     MouseMoveEvent,
+    MouseRotateEvent,
     MouseScrollEvent,
     MouseUpEvent,
+    WindowStateEvent,
 )
 from openadapt_capture.processing import (
     DOUBLE_CLICK_DISTANCE_PIXELS,
     DOUBLE_CLICK_INTERVAL_SECONDS,
+    DRAG_DISTANCE_THRESHOLD,
     detect_drag_events,
     merge_consecutive_keyboard_events,
     merge_consecutive_mouse_click_events,
+    merge_consecutive_mouse_magnify_events,
     merge_consecutive_mouse_move_events,
+    merge_consecutive_mouse_rotate_events,
     merge_consecutive_mouse_scroll_events,
     process_events,
     remove_redundant_mouse_move_events,
@@ -339,20 +345,23 @@ class TestDetectDragEventsComprehensive:
         # Children should include all moves
         assert len(result[0].children) == 6
 
-    def test_drag_interrupted_by_other_event(self, ts):
-        """Drag interrupted by non-mouse event should not create drag."""
+    def test_drag_with_keyboard_event_is_tolerated(self, ts):
+        """Keyboard events during drag should be tolerated (drag still detected)."""
         events = [
             MouseDownEvent(timestamp=ts.next(), x=100, y=100, button=MouseButton.LEFT),
             MouseMoveEvent(timestamp=ts.next(), x=150, y=150),
-            KeyDownEvent(timestamp=ts.next(), key_char="a"),  # Interruption
+            KeyDownEvent(timestamp=ts.next(), key_char="a"),  # Tolerated sibling
             MouseMoveEvent(timestamp=ts.next(), x=200, y=200),
             MouseUpEvent(timestamp=ts.next(), x=200, y=200, button=MouseButton.LEFT),
         ]
         result = detect_drag_events(events)
 
-        # Should not be a drag due to interruption
         drags = [e for e in result if isinstance(e, MouseDragEvent)]
-        assert len(drags) == 0
+        assert len(drags) == 1
+        # KeyDownEvent should be in children
+        drag = drags[0]
+        key_children = [c for c in drag.children if isinstance(c, KeyDownEvent)]
+        assert len(key_children) == 1
 
     def test_right_button_drag(self, ts):
         """Drag with right button should work."""
@@ -450,3 +459,285 @@ class TestFullPipelineComprehensive:
         events = [MouseMoveEvent(timestamp=ts.next(), x=100, y=100)]
         result = process_events(events)
         assert len(result) == 1
+
+
+# =============================================================================
+# Test: Robust Drag Detection (Phase 2)
+# =============================================================================
+
+class TestRobustDragDetection:
+    """Tests for Phase 2 drag detection improvements."""
+
+    def test_drag_with_modifier_keys(self, ts):
+        """Shift held during drag → drag detected with KeyTypeEvent children."""
+        events = [
+            MouseDownEvent(timestamp=ts.next(), x=100, y=100, button=MouseButton.LEFT),
+            MouseMoveEvent(timestamp=ts.next(), x=150, y=150),
+            KeyTypeEvent(timestamp=ts.next(), text="", children=[
+                KeyDownEvent(timestamp=ts.current - 0.05, key_name="shift"),
+                KeyUpEvent(timestamp=ts.current, key_name="shift"),
+            ]),
+            MouseMoveEvent(timestamp=ts.next(), x=200, y=200),
+            MouseUpEvent(timestamp=ts.next(), x=200, y=200, button=MouseButton.LEFT),
+        ]
+        result = detect_drag_events(events)
+
+        drags = [e for e in result if isinstance(e, MouseDragEvent)]
+        assert len(drags) == 1
+        key_children = [c for c in drags[0].children if isinstance(c, KeyTypeEvent)]
+        assert len(key_children) == 1
+
+    def test_drag_with_scroll_events(self, ts):
+        """Scroll during drag → drag detected with MouseScrollEvent children."""
+        events = [
+            MouseDownEvent(timestamp=ts.next(), x=100, y=100, button=MouseButton.LEFT),
+            MouseMoveEvent(timestamp=ts.next(), x=150, y=150),
+            MouseScrollEvent(timestamp=ts.next(), x=150, y=150, dx=0, dy=3),
+            MouseMoveEvent(timestamp=ts.next(), x=200, y=200),
+            MouseUpEvent(timestamp=ts.next(), x=200, y=200, button=MouseButton.LEFT),
+        ]
+        result = detect_drag_events(events)
+
+        drags = [e for e in result if isinstance(e, MouseDragEvent)]
+        assert len(drags) == 1
+        scroll_children = [c for c in drags[0].children if isinstance(c, MouseScrollEvent)]
+        assert len(scroll_children) == 1
+
+    def test_drag_fast_no_moves(self, ts):
+        """MouseDown + MouseUp, distance > threshold, no moves → drag detected."""
+        dist = DRAG_DISTANCE_THRESHOLD + 10  # well above threshold
+        events = [
+            MouseDownEvent(timestamp=ts.next(), x=100, y=100, button=MouseButton.LEFT),
+            MouseUpEvent(timestamp=ts.next(), x=100 + dist, y=100, button=MouseButton.LEFT),
+        ]
+        result = detect_drag_events(events)
+
+        drags = [e for e in result if isinstance(e, MouseDragEvent)]
+        assert len(drags) == 1
+        assert drags[0].dx == dist
+
+    def test_drag_second_button(self, ts):
+        """RMB pressed during LMB drag → original drag preserved."""
+        events = [
+            MouseDownEvent(timestamp=ts.next(), x=100, y=100, button=MouseButton.LEFT),
+            MouseMoveEvent(timestamp=ts.next(), x=150, y=150),
+            MouseDownEvent(timestamp=ts.next(), x=150, y=150, button=MouseButton.RIGHT),
+            MouseUpEvent(timestamp=ts.next(), x=150, y=150, button=MouseButton.RIGHT),
+            MouseMoveEvent(timestamp=ts.next(), x=200, y=200),
+            MouseUpEvent(timestamp=ts.next(), x=200, y=200, button=MouseButton.LEFT),
+        ]
+        result = detect_drag_events(events)
+
+        drags = [e for e in result if isinstance(e, MouseDragEvent)]
+        assert len(drags) == 1
+        assert drags[0].button == MouseButton.LEFT
+
+    def test_drag_with_gesture_events(self, ts):
+        """Magnify event during drag → drag detected."""
+        events = [
+            MouseDownEvent(timestamp=ts.next(), x=100, y=100, button=MouseButton.LEFT),
+            MouseMoveEvent(timestamp=ts.next(), x=150, y=150),
+            MouseMagnifyEvent(timestamp=ts.next(), x=150, y=150, magnification=0.1),
+            MouseMoveEvent(timestamp=ts.next(), x=200, y=200),
+            MouseUpEvent(timestamp=ts.next(), x=200, y=200, button=MouseButton.LEFT),
+        ]
+        result = detect_drag_events(events)
+
+        drags = [e for e in result if isinstance(e, MouseDragEvent)]
+        assert len(drags) == 1
+        mag_children = [c for c in drags[0].children if isinstance(c, MouseMagnifyEvent)]
+        assert len(mag_children) == 1
+
+    def test_drag_up_wrong_button(self, ts):
+        """MouseUp for different button than MouseDown → drag NOT ended."""
+        events = [
+            MouseDownEvent(timestamp=ts.next(), x=100, y=100, button=MouseButton.LEFT),
+            MouseMoveEvent(timestamp=ts.next(), x=150, y=150),
+            MouseUpEvent(timestamp=ts.next(), x=150, y=150, button=MouseButton.RIGHT),  # wrong button
+            MouseMoveEvent(timestamp=ts.next(), x=200, y=200),
+            MouseUpEvent(timestamp=ts.next(), x=200, y=200, button=MouseButton.LEFT),  # correct button
+        ]
+        result = detect_drag_events(events)
+
+        drags = [e for e in result if isinstance(e, MouseDragEvent)]
+        assert len(drags) == 1
+        # Drag should end at (200,200), not (150,150)
+        assert drags[0].dx == 100
+
+    def test_drag_state_flush_on_window_event(self, ts):
+        """WindowStateEvent mid-drag → drag properly flushed (preserved behavior)."""
+        events = [
+            MouseDownEvent(timestamp=ts.next(), x=100, y=100, button=MouseButton.LEFT),
+            MouseMoveEvent(timestamp=ts.next(), x=150, y=150),
+            WindowStateEvent(
+                timestamp=ts.next(), title="Test", left=0, top=0,
+                width=800, height=600, window_id=1,
+            ),
+            MouseMoveEvent(timestamp=ts.next(), x=200, y=200),
+            MouseUpEvent(timestamp=ts.next(), x=200, y=200, button=MouseButton.LEFT),
+        ]
+        result = detect_drag_events(events)
+
+        # WindowStateEvent should flush the drag state
+        drags = [e for e in result if isinstance(e, MouseDragEvent)]
+        assert len(drags) == 0
+
+
+# =============================================================================
+# Test: Gesture Event Types (Phase 1 & 4)
+# =============================================================================
+
+class TestGestureEventTypes:
+    """Tests for MouseMagnifyEvent and MouseRotateEvent."""
+
+    def test_magnify_event_creation(self):
+        """MouseMagnifyEvent can be instantiated with correct fields."""
+        ev = MouseMagnifyEvent(timestamp=1.0, x=500, y=300, magnification=0.05)
+        assert ev.type == "mouse.magnify"
+        assert ev.magnification == 0.05
+        assert ev.x == 500
+        assert ev.y == 300
+
+    def test_rotate_event_creation(self):
+        """MouseRotateEvent can be instantiated with correct fields."""
+        ev = MouseRotateEvent(timestamp=1.0, x=500, y=300, rotation=45.0)
+        assert ev.type == "mouse.rotate"
+        assert ev.rotation == 45.0
+
+    def test_magnify_event_merge(self, ts):
+        """Consecutive magnify events get merged with summed delta."""
+        events = [
+            MouseMagnifyEvent(timestamp=ts.next(), x=100, y=100, magnification=0.02),
+            MouseMagnifyEvent(timestamp=ts.next(), x=100, y=100, magnification=0.03),
+            MouseMagnifyEvent(timestamp=ts.next(), x=100, y=100, magnification=0.05),
+        ]
+        result = merge_consecutive_mouse_magnify_events(events)
+
+        assert len(result) == 1
+        assert isinstance(result[0], MouseMagnifyEvent)
+        assert abs(result[0].magnification - 0.10) < 1e-9
+
+    def test_rotate_event_merge(self, ts):
+        """Consecutive rotate events get merged with summed delta."""
+        events = [
+            MouseRotateEvent(timestamp=ts.next(), x=100, y=100, rotation=10.0),
+            MouseRotateEvent(timestamp=ts.next(), x=100, y=100, rotation=15.0),
+            MouseRotateEvent(timestamp=ts.next(), x=100, y=100, rotation=-5.0),
+        ]
+        result = merge_consecutive_mouse_rotate_events(events)
+
+        assert len(result) == 1
+        assert isinstance(result[0], MouseRotateEvent)
+        assert abs(result[0].rotation - 20.0) < 1e-9
+
+    def test_magnify_interrupted_creates_groups(self, ts):
+        """Magnify events interrupted by other event create separate groups."""
+        events = [
+            MouseMagnifyEvent(timestamp=ts.next(), x=100, y=100, magnification=0.02),
+            MouseMagnifyEvent(timestamp=ts.next(), x=100, y=100, magnification=0.03),
+            MouseMoveEvent(timestamp=ts.next(), x=200, y=200),
+            MouseMagnifyEvent(timestamp=ts.next(), x=200, y=200, magnification=0.01),
+        ]
+        result = merge_consecutive_mouse_magnify_events(events)
+
+        mag_events = [e for e in result if isinstance(e, MouseMagnifyEvent)]
+        assert len(mag_events) == 2
+        assert abs(mag_events[0].magnification - 0.05) < 1e-9
+        assert abs(mag_events[1].magnification - 0.01) < 1e-9
+
+    def test_gesture_events_pass_through_pipeline(self, ts):
+        """Magnify/rotate events survive all pipeline steps."""
+        events = [
+            MouseMoveEvent(timestamp=ts.next(), x=100, y=100),
+            MouseMagnifyEvent(timestamp=ts.next(), x=100, y=100, magnification=0.05),
+            MouseMagnifyEvent(timestamp=ts.next(), x=100, y=100, magnification=0.03),
+            MouseRotateEvent(timestamp=ts.next(), x=100, y=100, rotation=30.0),
+            MouseMoveEvent(timestamp=ts.next(), x=200, y=200),
+        ]
+        result = process_events(events)
+
+        mag_events = [e for e in result if isinstance(e, MouseMagnifyEvent)]
+        rot_events = [e for e in result if isinstance(e, MouseRotateEvent)]
+        assert len(mag_events) >= 1
+        assert len(rot_events) == 1
+
+    def test_get_action_events_includes_gestures(self, ts):
+        """Magnify/rotate included in get_action_events output."""
+        from openadapt_capture.processing import get_action_events
+
+        events = [
+            MouseMagnifyEvent(timestamp=ts.next(), x=100, y=100, magnification=0.05),
+            MouseRotateEvent(timestamp=ts.next(), x=100, y=100, rotation=30.0),
+        ]
+        result = get_action_events(events)
+
+        assert len(result) == 2
+        assert isinstance(result[0], MouseMagnifyEvent)
+        assert isinstance(result[1], MouseRotateEvent)
+
+
+# =============================================================================
+# Test: Integration (Blender-style workflow)
+# =============================================================================
+
+class TestBlenderWorkflowSimulation:
+    """Simulates a Blender-style workflow to verify all events are correctly classified."""
+
+    def test_blender_workflow(self, ts):
+        """Simulate: MMB-drag (orbit), Shift+MMB-drag (pan), pinch-to-zoom,
+        LMB-drag+Shift (constrained move), RMB cancel → all correctly classified."""
+        dist = DRAG_DISTANCE_THRESHOLD + 20
+
+        events = [
+            # 1. MMB orbit drag
+            MouseDownEvent(timestamp=ts.next(), x=400, y=400, button=MouseButton.MIDDLE),
+            MouseMoveEvent(timestamp=ts.next(), x=400 + dist, y=400 + dist),
+            MouseUpEvent(timestamp=ts.next(), x=400 + dist, y=400 + dist, button=MouseButton.MIDDLE),
+            # 2. Shift+MMB pan drag
+            MouseDownEvent(timestamp=ts.next(), x=400, y=400, button=MouseButton.MIDDLE),
+            KeyTypeEvent(timestamp=ts.next(), text="", children=[
+                KeyDownEvent(timestamp=ts.current - 0.05, key_name="shift"),
+                KeyUpEvent(timestamp=ts.current, key_name="shift"),
+            ]),
+            MouseMoveEvent(timestamp=ts.next(), x=400, y=400 + dist),
+            MouseUpEvent(timestamp=ts.next(), x=400, y=400 + dist, button=MouseButton.MIDDLE),
+            # 3. Pinch-to-zoom
+            MouseMagnifyEvent(timestamp=ts.next(), x=500, y=500, magnification=0.02),
+            MouseMagnifyEvent(timestamp=ts.next(), x=500, y=500, magnification=0.03),
+            MouseMagnifyEvent(timestamp=ts.next(), x=500, y=500, magnification=0.05),
+            # 4. LMB-drag + Shift (constrained transform)
+            MouseDownEvent(timestamp=ts.next(), x=300, y=300, button=MouseButton.LEFT),
+            MouseMoveEvent(timestamp=ts.next(), x=300 + dist, y=300),
+            KeyTypeEvent(timestamp=ts.next(), text="", children=[
+                KeyDownEvent(timestamp=ts.current - 0.05, key_name="shift"),
+                KeyUpEvent(timestamp=ts.current, key_name="shift"),
+            ]),
+            MouseMoveEvent(timestamp=ts.next(), x=300 + dist * 2, y=300),
+            MouseUpEvent(timestamp=ts.next(), x=300 + dist * 2, y=300, button=MouseButton.LEFT),
+            # 5. RMB cancel (click)
+            MouseDownEvent(timestamp=ts.next(), x=300, y=300, button=MouseButton.RIGHT),
+            MouseUpEvent(timestamp=ts.next(), x=300, y=300, button=MouseButton.RIGHT),
+        ]
+
+        result = process_events(events)
+
+        # Count event types
+        drags = [e for e in result if isinstance(e, MouseDragEvent)]
+        magnifies = [e for e in result if isinstance(e, MouseMagnifyEvent)]
+        clicks = [e for e in result if isinstance(e, (MouseClickEvent, MouseDoubleClickEvent))]
+
+        # Should have: orbit drag, pan drag, constrained drag = 3 drags
+        assert len(drags) == 3, f"Expected 3 drags, got {len(drags)}"
+
+        # Magnify events should be merged (3 raw → 1 merged)
+        assert len(magnifies) == 1, f"Expected 1 merged magnify, got {len(magnifies)}"
+        assert abs(magnifies[0].magnification - 0.10) < 1e-9
+
+        # RMB cancel should be a click
+        assert len(clicks) >= 1, f"Expected at least 1 click, got {len(clicks)}"
+
+        # Constrained drag should have KeyTypeEvent in children
+        constrained_drag = [d for d in drags if d.button == MouseButton.LEFT]
+        assert len(constrained_drag) == 1
+        key_children = [c for c in constrained_drag[0].children if isinstance(c, KeyTypeEvent)]
+        assert len(key_children) == 1
