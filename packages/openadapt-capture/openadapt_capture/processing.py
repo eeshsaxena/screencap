@@ -42,9 +42,9 @@ DOUBLE_CLICK_DISTANCE_PIXELS = 5.0  # default double-click distance
 KEY_TYPE_MERGE_INTERVAL_SECONDS = 0.5  # merge adjacent KeyTypeEvents within this interval
 
 # Drag distance threshold (pixels). Down/up pairs within this distance are clicks, beyond are drags.
-# Default 5px matches industry standard (Windows=4px, Blender=3px, Unity=5px).
+# Default 3px matches macOS HIG and precision graphics apps (Inkscape=4px, Windows=4px).
 # Override via SCREENCAP_DRAG_THRESHOLD env var.
-DRAG_DISTANCE_THRESHOLD = float(os.environ.get("SCREENCAP_DRAG_THRESHOLD", "5.0"))
+DRAG_DISTANCE_THRESHOLD = float(os.environ.get("SCREENCAP_DRAG_THRESHOLD", "3.0"))
 
 
 # =============================================================================
