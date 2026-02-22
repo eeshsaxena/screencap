@@ -22,6 +22,7 @@ from openadapt_capture.events import (
     MouseMoveEvent,
     MouseRotateEvent,
     MouseScrollEvent,
+    MouseSmartMagnifyEvent,
     MouseUpEvent,
 )
 from openadapt_capture.processing import process_events
@@ -114,6 +115,12 @@ def _convert_action_event(db_event) -> PydanticActionEvent | None:
             x=db_event.mouse_x or 0,
             y=db_event.mouse_y or 0,
             rotation=db_event.mouse_dx or 0.0,
+        )
+    elif db_event.name == "smart_magnify":
+        return MouseSmartMagnifyEvent(
+            timestamp=ts,
+            x=float(db_event.mouse_x or 0),
+            y=float(db_event.mouse_y or 0),
         )
     return None
 

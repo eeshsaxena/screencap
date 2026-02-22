@@ -1228,6 +1228,7 @@ def read_gesture_events(
     NS_EVENT_TYPE_MAGNIFY = 30
     NS_EVENT_TYPE_ROTATE = 18
     NS_EVENT_TYPE_SWIPE = 31
+    NS_EVENT_TYPE_SMART_MAGNIFY = 32
 
     # CGEventTap mask: type 29 (NSEventTypeGesture) for trackpad gestures,
     # plus mouse event types for pressure extraction (Force Touch / tablet).
@@ -1310,6 +1311,17 @@ def read_gesture_events(
                         "mouse_y": loc.y,
                         "mouse_dx": dx,
                         "mouse_dy": dy,
+                    },
+                )
+
+            elif ns_type == NS_EVENT_TYPE_SMART_MAGNIFY:
+                loc = Quartz.CGEventGetLocation(cg_event)
+                trigger_action_event(
+                    event_q,
+                    {
+                        "name": "smart_magnify",
+                        "mouse_x": loc.x,
+                        "mouse_y": loc.y,
                     },
                 )
 

@@ -24,6 +24,7 @@ from openadapt_capture.events import (
     MouseMoveEvent,
     MouseRotateEvent,
     MouseScrollEvent,
+    MouseSmartMagnifyEvent,
     MouseUpEvent,
 )
 
@@ -548,7 +549,7 @@ def detect_drag_events(
     DRAG_SIBLING_TYPES = (
         KeyTypeEvent, KeyDownEvent, KeyUpEvent,
         MouseScrollEvent,
-        MouseMagnifyEvent, MouseRotateEvent,
+        MouseMagnifyEvent, MouseRotateEvent, MouseSmartMagnifyEvent,
     )
 
     result = []
@@ -658,6 +659,7 @@ def get_action_events(events: list[Event]) -> list[ActionEvent]:
         MouseScrollEvent,
         MouseMagnifyEvent,
         MouseRotateEvent,
+        MouseSmartMagnifyEvent,
         KeyDownEvent,
         KeyUpEvent,
         MouseClickEvent,
