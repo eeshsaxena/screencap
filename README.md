@@ -11,8 +11,25 @@ macOS CLI for screen recording with built-in privacy scrubbing. Wraps [OpenAdapt
 
 ## Installation
 
+### Binary (recommended)
+
 ```bash
-# clone & install
+curl -sSf https://storage.googleapis.com/screencap-releases/releases/install.sh | sh
+```
+
+This installs a standalone binary to `~/.screencap/bin/`. No Python required.
+
+To **upgrade**, run the same command — it overwrites the existing binary with the latest version.
+
+To install a specific version:
+
+```bash
+SCREENCAP_VERSION=0.2.0 curl -sSf https://storage.googleapis.com/screencap-releases/releases/install.sh | sh
+```
+
+### From source
+
+```bash
 git clone https://github.com/Divide-By-0/screencap.git
 cd screencap
 pip install .
