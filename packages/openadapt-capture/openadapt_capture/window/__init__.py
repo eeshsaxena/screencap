@@ -52,6 +52,8 @@ def get_active_window_data(
         "width": width,
         "height": height,
         "window_id": window_id,
+        "app_bundle_id": state.get("app_bundle_id"),
+        "app_version": state.get("app_version"),
         "state": state,
     }
     return window_data

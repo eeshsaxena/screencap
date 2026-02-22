@@ -33,6 +33,36 @@ _AX_ATTRS = {
 }
 
 
+def _get_app_version_info(pid: int) -> tuple[str | None, str | None]:
+    """Look up bundle ID and version for a running application by PID.
+
+    Returns (bundle_id, version).  Both may be None on failure.
+    """
+    try:
+        running_app = AppKit.NSRunningApplication.runningApplicationWithProcessIdentifier_(pid)
+        if running_app is None:
+            return None, None
+
+        bundle_id = running_app.bundleIdentifier()
+        if bundle_id is not None:
+            bundle_id = str(bundle_id)
+
+        version = None
+        bundle_url = running_app.bundleURL()
+        if bundle_url is not None:
+            bundle = Foundation.NSBundle.bundleWithURL_(bundle_url)
+            if bundle is not None:
+                info = bundle.infoDictionary()
+                if info is not None:
+                    ver = info.get("CFBundleShortVersionString") or info.get("CFBundleVersion")
+                    if ver is not None:
+                        version = str(ver)
+
+        return bundle_id, version
+    except Exception:
+        return None, None
+
+
 def get_active_window_state(read_window_data: bool) -> dict | None:
     """Get the state of the active window.
 
@@ -59,6 +89,9 @@ def get_active_window_state(read_window_data: bool) -> dict | None:
     top = bounds["Y"]
     width = bounds["Width"]
     height = bounds["Height"]
+    # Look up app bundle ID and version from the owning process.
+    app_bundle_id, app_version = _get_app_version_info(meta["kCGWindowOwnerPID"])
+
     rval = {
         "title": title,
         "left": left,
@@ -66,6 +99,8 @@ def get_active_window_state(read_window_data: bool) -> dict | None:
         "width": width,
         "height": height,
         "window_id": window_id,
+        "app_bundle_id": app_bundle_id,
+        "app_version": app_version,
         "meta": meta,
         "data": data,
     }
