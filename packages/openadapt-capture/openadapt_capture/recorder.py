@@ -676,10 +676,10 @@ def on_move(event_q: queue.Queue, x: int, y: int, injected: bool = False) -> Non
     """
     logger.debug(f"{x=} {y=} {injected=}")
     if not injected:
-        trigger_action_event(
-            event_q,
-            {"name": "move", "mouse_x": x, "mouse_y": y},
-        )
+        data = {"name": "move", "mouse_x": x, "mouse_y": y}
+        if _current_pressure > 0.0:
+            data["mouse_pressure"] = _current_pressure
+        trigger_action_event(event_q, data)
 
 
 def on_click(
@@ -705,16 +705,16 @@ def on_click(
     """
     logger.debug(f"{x=} {y=} {button=} {pressed=} {injected=}")
     if not injected:
-        trigger_action_event(
-            event_q,
-            {
-                "name": "click",
-                "mouse_x": x,
-                "mouse_y": y,
-                "mouse_button_name": button.name,
-                "mouse_pressed": pressed,
-            },
-        )
+        data = {
+            "name": "click",
+            "mouse_x": x,
+            "mouse_y": y,
+            "mouse_button_name": button.name,
+            "mouse_pressed": pressed,
+        }
+        if _current_pressure > 0.0:
+            data["mouse_pressure"] = _current_pressure
+        trigger_action_event(event_q, data)
 
 
 def on_scroll(
@@ -1183,6 +1183,11 @@ def read_mouse_events(
     mouse_listener.stop()
 
 
+# Shared pressure state: written by gesture tap, read by pynput callbacks.
+# Python's GIL makes float reads/writes atomic; no lock needed.
+_current_pressure: float = 0.0
+
+
 def read_gesture_events(
     event_q: queue.Queue,
     terminate_processing: multiprocessing.Event,
@@ -1224,21 +1229,41 @@ def read_gesture_events(
     NS_EVENT_TYPE_ROTATE = 18
     NS_EVENT_TYPE_SWIPE = 31
 
-    # CGEventTap mask for type 29 (NSEventTypeGesture — all trackpad gestures)
-    gesture_mask = Quartz.CGEventMaskBit(29)
+    # CGEventTap mask: type 29 (NSEventTypeGesture) for trackpad gestures,
+    # plus mouse event types for pressure extraction (Force Touch / tablet).
+    gesture_mask = (
+        Quartz.CGEventMaskBit(29)  |    # NSEventTypeGesture
+        Quartz.CGEventMaskBit(1)   |    # kCGEventLeftMouseDown
+        Quartz.CGEventMaskBit(2)   |    # kCGEventLeftMouseUp
+        Quartz.CGEventMaskBit(5)   |    # kCGEventMouseMoved
+        Quartz.CGEventMaskBit(6)   |    # kCGEventLeftMouseDragged
+        Quartz.CGEventMaskBit(25)  |    # kCGEventOtherMouseDown
+        Quartz.CGEventMaskBit(26)  |    # kCGEventOtherMouseUp
+        Quartz.CGEventMaskBit(27)       # kCGEventOtherMouseMoved
+    )
 
     run_loop_ref = [None]  # mutable container for the CFRunLoop reference
 
-    def gesture_callback(_proxy, _type, cg_event, _refcon):
-        """CGEventTap callback — converts CGEvent to NSEvent and enqueues."""
+    # CGEvent types for mouse events used in pressure extraction
+    _MOUSE_EVENT_TYPES = {1, 2, 5, 6, 25, 26, 27}
+    # Mouse up types — reset pressure after release
+    _MOUSE_UP_TYPES = {2, 26}  # kCGEventLeftMouseUp, kCGEventOtherMouseUp
+
+    def gesture_callback(_proxy, event_type, cg_event, _refcon):
+        """CGEventTap callback — converts CGEvent to NSEvent and enqueues.
+
+        Handles both gesture events (magnify, rotate, swipe) and mouse events
+        (for pressure extraction from Force Touch trackpads and tablets).
+        """
+        global _current_pressure
         try:
             ns_event = NSEvent.eventWithCGEvent_(cg_event)
             if ns_event is None:
                 return cg_event
 
-            sub_type = ns_event.type()
+            ns_type = ns_event.type()
 
-            if sub_type == NS_EVENT_TYPE_MAGNIFY:
+            if ns_type == NS_EVENT_TYPE_MAGNIFY:
                 mag = ns_event.magnification()
                 if mag == 0.0:
                     return cg_event
@@ -1254,7 +1279,7 @@ def read_gesture_events(
                     },
                 )
 
-            elif sub_type == NS_EVENT_TYPE_ROTATE:
+            elif ns_type == NS_EVENT_TYPE_ROTATE:
                 rot = ns_event.rotation()
                 if rot == 0.0:
                     return cg_event
@@ -1270,7 +1295,7 @@ def read_gesture_events(
                     },
                 )
 
-            elif sub_type == NS_EVENT_TYPE_SWIPE:
+            elif ns_type == NS_EVENT_TYPE_SWIPE:
                 # Map three-finger swipe to scroll events
                 dx = ns_event.deltaX()
                 dy = ns_event.deltaY()
@@ -1287,6 +1312,26 @@ def read_gesture_events(
                         "mouse_dy": dy,
                     },
                 )
+
+            elif event_type in _MOUSE_EVENT_TYPES:
+                # Mouse event — extract pressure for shared state.
+                # pynput's callbacks read _current_pressure to include in event data.
+                pressure = 0.0
+
+                # Check tablet pressure first (CGEvent field 19 = kCGTabletEventPointPressure)
+                subtype = Quartz.CGEventGetIntegerValueField(cg_event, 7)  # kCGMouseEventSubtype
+                if subtype == 1:  # kCGEventMouseSubtypeTabletPoint
+                    pressure = Quartz.CGEventGetDoubleValueField(cg_event, 19)
+
+                # Fall back to NSEvent.pressure() (Force Touch trackpad)
+                if pressure == 0.0:
+                    pressure = ns_event.pressure()
+
+                _current_pressure = pressure
+
+                # Reset on mouse up to avoid stale pressure
+                if event_type in _MOUSE_UP_TYPES:
+                    _current_pressure = 0.0
 
         except Exception:
             # Never let exceptions escape a C callback
