@@ -21,38 +21,138 @@ def cli():
 
 
 @cli.command()
-@click.option("--name", "-n", default=None, help="Recording name.")
+@click.option("--name", "-n", default=None, help="Recording name (skips auto-naming).")
 @click.option("--description", "-d", default=None, help="Task description.")
 @click.option("--no-audio", is_flag=True, default=False, help="Disable audio capture.")
+@click.option("--no-video", is_flag=True, default=False, help="Disable video capture.")
+@click.option("--no-images", is_flag=True, default=False, help="Disable screenshot capture.")
+@click.option("--no-window-data", is_flag=True, default=False, help="Disable window/accessibility data.")
+@click.option("--no-browser-events", is_flag=True, default=False, help="Disable browser event capture.")
 @click.option("--output", "-o", type=click.Path(), default=None, help="Custom output directory.")
 @click.option("--no-wifi-metrics", is_flag=True, default=False, help="Disable WiFi metrics collection.")
 @click.option("--no-app-versions", is_flag=True, default=False, help="Disable running app version capture.")
+@click.option("--no-auto-name", is_flag=True, default=False, help="Skip LLM auto-naming after recording.")
+@click.option("--local-only", is_flag=True, default=False, help="Restrict LLM naming to local providers (Ollama).")
 @click.option("--force", is_flag=True, default=False, help="Auto-clean orphaned processes before starting.")
-def start(name, description, no_audio, output, no_wifi_metrics, no_app_versions, force):
+def start(
+    name, description, no_audio, no_video, no_images, no_window_data,
+    no_browser_events, output, no_wifi_metrics, no_app_versions,
+    no_auto_name, local_only, force,
+):
     """Record a screen capture session. Ctrl+C to stop."""
+    from datetime import datetime
+
+    from screencap.config import get_auto_name, get_auto_name_local_only
+
+    # Determine if auto-naming is enabled
+    user_provided_name = name is not None
+    auto_name_enabled = get_auto_name() and not no_auto_name and not user_provided_name
+    local_only = local_only or get_auto_name_local_only()
+
     if not name:
-        if not sys.stdin.isatty():
-            console.print("[red]Error: --name is required in non-interactive mode.[/red]")
-            raise SystemExit(1)
-        name = click.prompt("Recording name")
-        description = click.prompt("Description (optional)", default="", show_default=False)
-        audio_input = click.prompt(
-            "Record audio?",
-            type=click.Choice(["y", "n"], case_sensitive=False),
-            default="y",
-        )
-        no_audio = audio_input.lower() == "n"
+        if no_auto_name:
+            # Restore old interactive prompt behavior
+            if not sys.stdin.isatty():
+                console.print("[red]Error: --name is required with --no-auto-name in non-interactive mode.[/red]")
+                raise SystemExit(1)
+            name = click.prompt("Recording name")
+            description = description or click.prompt("Description (optional)", default="", show_default=False)
+        else:
+            # Generate timestamp-based temp name
+            name = f"rec-{datetime.now().strftime('%Y%m%dT%H%M%S')}"
 
     audio = not no_audio
     wifi_metrics = not no_wifi_metrics
     app_versions = not no_app_versions
 
+    # Capture flags: default to True for images and window data (opt-out)
+    capture_video = False if no_video else None  # None = use upstream default (True)
+    capture_images = False if no_images else True  # Default ON (overrides upstream False)
+    capture_window_data = False if no_window_data else None  # None = upstream default (True)
+    capture_browser_events = False if no_browser_events else None  # None = upstream default (False)
+
     from screencap.recorder import start_recording
 
-    start_recording(
+    capture_dir = start_recording(
         name, description or None, audio, output,
         wifi_metrics=wifi_metrics, app_versions=app_versions, force_clean=force,
+        capture_video=capture_video, capture_images=capture_images,
+        capture_window_data=capture_window_data, capture_browser_events=capture_browser_events,
     )
+
+    # --- Post-recording pipeline ---
+    if not auto_name_enabled:
+        return
+
+    # Auto-transcribe if audio was captured
+    audio_path = capture_dir / "audio.flac"
+    if audio and audio_path.exists() and audio_path.stat().st_size >= 1024:
+        try:
+            _auto_transcribe(capture_dir, audio_path)
+        except KeyboardInterrupt:
+            console.print("[yellow]Transcription cancelled.[/yellow]")
+
+    # LLM auto-naming
+    skip_rename = output is not None  # User chose a specific path
+    try:
+        from screencap.namer import auto_name as do_auto_name
+
+        with console.status("[bold]Generating name...[/bold]"):
+            final_dir = do_auto_name(
+                capture_dir,
+                local_only=local_only,
+                skip_rename=skip_rename,
+            )
+
+        if final_dir != capture_dir:
+            console.print(f"\n[bold green]Recording saved to {final_dir}/[/bold green]")
+    except KeyboardInterrupt:
+        console.print("[yellow]Naming cancelled — keeping timestamp name[/yellow]")
+
+
+def _auto_transcribe(capture_dir, audio_path):
+    """Auto-transcribe audio using the fastest available backend."""
+    transcript_path = capture_dir / "transcript.txt"
+    transcript_json_path = capture_dir / "transcript.json"
+
+    # Skip if already transcribed
+    if transcript_path.exists():
+        return
+
+    # Try faster-whisper first
+    try:
+        import faster_whisper  # noqa: F401
+        from openadapt_capture.cli import _transcribe_faster_whisper
+
+        with console.status("[bold]Transcribing audio...[/bold]"):
+            _transcribe_faster_whisper(audio_path, transcript_path, transcript_json_path, "base")
+        return
+    except ImportError:
+        pass
+
+    # Try openai-whisper
+    try:
+        from openadapt_capture.cli import _transcribe_local
+
+        with console.status("[bold]Transcribing audio...[/bold]"):
+            _transcribe_local(audio_path, transcript_path, transcript_json_path, "base")
+        return
+    except ImportError:
+        pass
+
+    # Try OpenAI API
+    import os
+
+    api_key = os.environ.get("OPENAI_API_KEY")
+    if api_key:
+        try:
+            with console.status("[bold]Transcribing audio via API...[/bold]"):
+                _transcribe_api_inline(api_key, audio_path, transcript_path, transcript_json_path)
+            return
+        except Exception:
+            pass
+
+    # No transcription backend available — not an error
 
 
 @cli.command("list")

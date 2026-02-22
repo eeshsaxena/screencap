@@ -44,6 +44,10 @@ def start_recording(
     wifi_metrics: bool | None = None,
     app_versions: bool | None = None,
     force_clean: bool = False,
+    capture_video: bool | None = None,
+    capture_images: bool | None = None,
+    capture_window_data: bool | None = None,
+    capture_browser_events: bool | None = None,
 ) -> Path:
     """Start a screen capture recording. Blocks until Ctrl+C."""
     if audio is None:
@@ -139,11 +143,25 @@ def start_recording(
     # sets terminate_processing, then joins all child processes.
     # We just need to handle the interrupt that bubbles up to us.
     try:
+        # Build Recorder kwargs, only passing non-None values
+        recorder_kwargs: dict = {
+            "task_description": desc,
+            "capture_audio": audio,
+        }
+        if capture_video is not None:
+            recorder_kwargs["capture_video"] = capture_video
+        else:
+            recorder_kwargs["capture_video"] = True
+        if capture_images is not None:
+            recorder_kwargs["capture_images"] = capture_images
+        if capture_window_data is not None:
+            recorder_kwargs["capture_window_data"] = capture_window_data
+        if capture_browser_events is not None:
+            recorder_kwargs["capture_browser_events"] = capture_browser_events
+
         with Recorder(
             str(capture_dir),
-            task_description=desc,
-            capture_video=True,
-            capture_audio=audio,
+            **recorder_kwargs,
         ) as recorder:
             recorder.wait_for_ready(timeout=30)
             status.stop()
