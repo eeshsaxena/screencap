@@ -128,7 +128,7 @@ def remove_redundant_mouse_move_events(events: list[ActionEvent]) -> list[Action
 
     def is_same_position(e1: MouseMoveEvent, e2: MouseMoveEvent) -> bool:
         # Holding a stylus still while varying pressure is NOT redundant
-        return e1.x == e2.x and e1.y == e2.y and e1.pressure == e2.pressure
+        return e1.x == e2.x and e1.y == e2.y and e1.pressure == e2.pressure and e1.modifier_flags == e2.modifier_flags
 
     result = []
     prev_move: MouseMoveEvent | None = None
@@ -253,6 +253,7 @@ def merge_consecutive_mouse_move_events(events: list[ActionEvent]) -> list[Actio
                 x=last.x,
                 y=last.y,
                 pressure=last.pressure,
+                modifier_flags=last.modifier_flags,
             )
             result.append(merged)
 
@@ -302,6 +303,10 @@ def merge_consecutive_mouse_scroll_events(events: list[ActionEvent]) -> list[Act
                 y=first.y,
                 dx=total_dx,
                 dy=total_dy,
+                modifier_flags=first.modifier_flags,
+                scroll_phase=first.scroll_phase,
+                momentum_phase=first.momentum_phase,
+                is_continuous=first.is_continuous,
             )
             result.append(merged)
 
@@ -490,6 +495,7 @@ def merge_consecutive_mouse_click_events(
                             y=down.y,
                             button=down.button,
                             pressure=down.pressure,
+                            modifier_flags=down.modifier_flags,
                             children=[down, up, next_down, next_up],
                         )
                         result.append(double_click)
@@ -505,6 +511,7 @@ def merge_consecutive_mouse_click_events(
                     y=down.y,
                     button=down.button,
                     pressure=down.pressure,
+                    modifier_flags=down.modifier_flags,
                     children=[down, up],
                 )
                 result.append(single_click)

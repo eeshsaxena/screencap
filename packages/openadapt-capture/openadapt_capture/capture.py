@@ -48,6 +48,7 @@ def _convert_action_event(db_event) -> PydanticActionEvent | None:
             x=db_event.mouse_x or 0,
             y=db_event.mouse_y or 0,
             pressure=getattr(db_event, "mouse_pressure", None),
+            modifier_flags=getattr(db_event, "modifier_flags", None),
         )
     elif db_event.name == "click":
         button = db_event.mouse_button_name or "left"
@@ -63,6 +64,7 @@ def _convert_action_event(db_event) -> PydanticActionEvent | None:
                 y=db_event.mouse_y or 0,
                 button=button,
                 pressure=getattr(db_event, "mouse_pressure", None),
+                modifier_flags=getattr(db_event, "modifier_flags", None),
             )
         elif db_event.mouse_pressed is False:
             return MouseUpEvent(
@@ -71,6 +73,7 @@ def _convert_action_event(db_event) -> PydanticActionEvent | None:
                 y=db_event.mouse_y or 0,
                 button=button,
                 pressure=getattr(db_event, "mouse_pressure", None),
+                modifier_flags=getattr(db_event, "modifier_flags", None),
             )
         else:
             return None
@@ -81,6 +84,10 @@ def _convert_action_event(db_event) -> PydanticActionEvent | None:
             y=db_event.mouse_y or 0,
             dx=db_event.mouse_dx or 0,
             dy=db_event.mouse_dy or 0,
+            modifier_flags=getattr(db_event, "modifier_flags", None),
+            scroll_phase=getattr(db_event, "scroll_phase", None),
+            momentum_phase=getattr(db_event, "momentum_phase", None),
+            is_continuous=getattr(db_event, "is_continuous", None),
         )
     elif db_event.name == "press":
         return KeyDownEvent(
