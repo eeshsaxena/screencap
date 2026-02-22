@@ -51,6 +51,9 @@ class DarwinPlatform:
 
         Returns 2.0 for Retina displays, 1.0 for standard displays.
 
+        Note: CGDisplayPixelsWide returns logical pixels on modern macOS,
+        so we use CGDisplayModeGetPixelWidth for true physical pixels.
+
         Returns:
             Pixel ratio (physical pixels / logical pixels).
         """
@@ -58,10 +61,9 @@ class DarwinPlatform:
             import Quartz
 
             main_display = Quartz.CGMainDisplayID()
-            physical_width = Quartz.CGDisplayPixelsWide(main_display)
-
             mode = Quartz.CGDisplayCopyDisplayMode(main_display)
             if mode:
+                physical_width = Quartz.CGDisplayModeGetPixelWidth(mode)
                 logical_width = Quartz.CGDisplayModeGetWidth(mode)
                 if logical_width > 0:
                     return physical_width / logical_width
