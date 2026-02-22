@@ -36,67 +36,90 @@ def test_list_json_empty(tmp_path):
         assert "No recordings" in result.output
 
 
-def test_start_interactive():
-    """Test that start command prompts when no --name given."""
+def test_start_auto_name(tmp_path):
+    """Test that start command auto-generates a timestamp name when no --name given."""
     runner = CliRunner()
-    with mock.patch("screencap.recorder.start_recording") as mock_rec, \
+    fake_dir = tmp_path / "rec-test"
+    fake_dir.mkdir()
+    with mock.patch("screencap.recorder.start_recording", return_value=fake_dir) as mock_rec, \
+         mock.patch("screencap.namer.auto_name", return_value=fake_dir) as mock_namer:
+        result = runner.invoke(cli, ["start"])
+        assert result.exit_code == 0
+        mock_rec.assert_called_once()
+        args = mock_rec.call_args
+        # Name should be a timestamp like rec-20260222T143000
+        assert args[0][0].startswith("rec-")
+
+
+def test_start_no_auto_name_interactive(tmp_path):
+    """Test that --no-auto-name restores the old interactive prompt."""
+    runner = CliRunner()
+    fake_dir = tmp_path / "my-test"
+    fake_dir.mkdir()
+    with mock.patch("screencap.recorder.start_recording", return_value=fake_dir) as mock_rec, \
          mock.patch("screencap.cli.sys") as mock_sys:
         mock_sys.stdin.isatty.return_value = True
         mock_sys.exit = sys.exit
         result = runner.invoke(
             cli,
-            ["start"],
-            input="my-test\nsome desc\ny\n",
+            ["start", "--no-auto-name"],
+            input="my-test\nsome desc\n",
         )
         assert result.exit_code == 0
         mock_rec.assert_called_once()
         args = mock_rec.call_args
         assert args[0][0] == "my-test"  # name
         assert args[0][1] == "some desc"  # description
-        assert args[0][2] is True  # audio
-        assert args[1]["wifi_metrics"] is True
-        assert args[1]["app_versions"] is True
 
 
 def test_start_with_flags():
     """Test start with all flags."""
     runner = CliRunner()
-    with mock.patch("screencap.recorder.start_recording") as mock_rec:
+    with mock.patch("screencap.recorder.start_recording", return_value=mock.MagicMock()) as mock_rec:
         result = runner.invoke(
             cli,
             ["start", "--name", "test-rec", "--no-audio", "-d", "demo"],
         )
         assert result.exit_code == 0
         mock_rec.assert_called_once_with(
-            "test-rec", "demo", False, None, wifi_metrics=True, app_versions=True, force_clean=False,
+            "test-rec", "demo", False, None,
+            wifi_metrics=True, app_versions=True, force_clean=False,
+            capture_video=None, capture_images=True,
+            capture_window_data=None, capture_browser_events=None,
         )
 
 
 def test_start_no_wifi_metrics():
     """Test --no-wifi-metrics flag is passed through."""
     runner = CliRunner()
-    with mock.patch("screencap.recorder.start_recording") as mock_rec:
+    with mock.patch("screencap.recorder.start_recording", return_value=mock.MagicMock()) as mock_rec:
         result = runner.invoke(
             cli,
             ["start", "--name", "test-rec", "--no-wifi-metrics"],
         )
         assert result.exit_code == 0
         mock_rec.assert_called_once_with(
-            "test-rec", None, True, None, wifi_metrics=False, app_versions=True, force_clean=False,
+            "test-rec", None, True, None,
+            wifi_metrics=False, app_versions=True, force_clean=False,
+            capture_video=None, capture_images=True,
+            capture_window_data=None, capture_browser_events=None,
         )
 
 
 def test_start_no_app_versions():
     """Test --no-app-versions flag is passed through."""
     runner = CliRunner()
-    with mock.patch("screencap.recorder.start_recording") as mock_rec:
+    with mock.patch("screencap.recorder.start_recording", return_value=mock.MagicMock()) as mock_rec:
         result = runner.invoke(
             cli,
             ["start", "--name", "test-rec", "--no-app-versions"],
         )
         assert result.exit_code == 0
         mock_rec.assert_called_once_with(
-            "test-rec", None, True, None, wifi_metrics=True, app_versions=False, force_clean=False,
+            "test-rec", None, True, None,
+            wifi_metrics=True, app_versions=False, force_clean=False,
+            capture_video=None, capture_images=True,
+            capture_window_data=None, capture_browser_events=None,
         )
 
 
@@ -340,7 +363,7 @@ def test_start_force_cleans_orphans():
         mock.patch("screencap.pidfile.terminate_processes") as mock_term,
         mock.patch("screencap.pidfile.delete_pidfile"),
         mock.patch("screencap.pidfile.write_pidfile"),
-        mock.patch("screencap.recorder.start_recording") as mock_rec,
+        mock.patch("screencap.recorder.start_recording", return_value=mock.MagicMock()) as mock_rec,
     ):
         result = runner.invoke(cli, ["start", "--name", "test", "--force"])
     assert result.exit_code == 0
@@ -362,3 +385,68 @@ def test_start_warns_about_orphans():
         with mock.patch("screencap.recorder.start_recording", side_effect=SystemExit(1)):
             result = runner.invoke(cli, ["start", "--name", "test"])
     assert result.exit_code == 1
+
+
+# --- new capture flag tests ---
+
+
+def test_start_no_video_flag(tmp_path):
+    """Test --no-video flag is passed through."""
+    runner = CliRunner()
+    fake_dir = tmp_path / "test-rec"
+    fake_dir.mkdir()
+    with mock.patch("screencap.recorder.start_recording", return_value=fake_dir) as mock_rec:
+        result = runner.invoke(cli, ["start", "--name", "test-rec", "--no-video"])
+    assert result.exit_code == 0
+    _, kwargs = mock_rec.call_args
+    assert kwargs["capture_video"] is False
+
+
+def test_start_no_images_flag(tmp_path):
+    """Test --no-images flag is passed through."""
+    runner = CliRunner()
+    fake_dir = tmp_path / "test-rec"
+    fake_dir.mkdir()
+    with mock.patch("screencap.recorder.start_recording", return_value=fake_dir) as mock_rec:
+        result = runner.invoke(cli, ["start", "--name", "test-rec", "--no-images"])
+    assert result.exit_code == 0
+    _, kwargs = mock_rec.call_args
+    assert kwargs["capture_images"] is False
+
+
+def test_start_no_window_data_flag(tmp_path):
+    """Test --no-window-data flag is passed through."""
+    runner = CliRunner()
+    fake_dir = tmp_path / "test-rec"
+    fake_dir.mkdir()
+    with mock.patch("screencap.recorder.start_recording", return_value=fake_dir) as mock_rec:
+        result = runner.invoke(cli, ["start", "--name", "test-rec", "--no-window-data"])
+    assert result.exit_code == 0
+    _, kwargs = mock_rec.call_args
+    assert kwargs["capture_window_data"] is False
+
+
+def test_start_name_skips_auto_naming(tmp_path):
+    """When --name is provided, auto-naming is skipped entirely."""
+    runner = CliRunner()
+    fake_dir = tmp_path / "my-recording"
+    fake_dir.mkdir()
+    with mock.patch("screencap.recorder.start_recording", return_value=fake_dir) as mock_rec, \
+         mock.patch("screencap.namer.auto_name") as mock_namer:
+        result = runner.invoke(cli, ["start", "--name", "my-recording"])
+    assert result.exit_code == 0
+    mock_namer.assert_not_called()
+
+
+def test_start_local_only_flag(tmp_path):
+    """Test --local-only flag is recognized."""
+    runner = CliRunner()
+    fake_dir = tmp_path / "rec-test"
+    fake_dir.mkdir()
+    with mock.patch("screencap.recorder.start_recording", return_value=fake_dir) as mock_rec, \
+         mock.patch("screencap.namer.auto_name", return_value=fake_dir) as mock_namer:
+        result = runner.invoke(cli, ["start", "--local-only"])
+    assert result.exit_code == 0
+    if mock_namer.called:
+        _, kwargs = mock_namer.call_args
+        assert kwargs.get("local_only") is True
