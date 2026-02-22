@@ -430,6 +430,120 @@ class TestCaptureEdgeCases:
             Capture.load(capture_path)
 
 
+class TestPixelRatio:
+    """Tests for pixel_ratio storage and backward compatibility."""
+
+    def test_new_recording_stores_pixel_ratio(self, temp_capture_dir):
+        """Test that a recording with pixel_ratio stores it correctly."""
+        capture_path = str(Path(temp_capture_dir) / "capture")
+        import os
+        import sys
+
+        os.makedirs(capture_path, exist_ok=True)
+        db_path = os.path.join(capture_path, "recording.db")
+        engine, Session = create_db(db_path)
+        session = Session()
+
+        import time
+        recording_data = {
+            "timestamp": time.time(),
+            "monitor_width": 1512,
+            "monitor_height": 982,
+            "pixel_ratio": 2.0,
+            "double_click_interval_seconds": 0.5,
+            "double_click_distance_pixels": 5,
+            "platform": sys.platform,
+            "task_description": "Retina test",
+        }
+        recording = crud.insert_recording(session, recording_data)
+        assert recording.pixel_ratio == 2.0
+
+        # Reload via Capture.load and check CaptureSession.pixel_ratio
+        capture = Capture.load(capture_path)
+        assert capture.pixel_ratio == 2.0
+        capture.close()
+
+    def test_backward_compat_old_db_without_column(self, temp_capture_dir):
+        """Test that old databases without pixel_ratio column are migrated."""
+        import os
+        import sqlite3
+
+        capture_path = str(Path(temp_capture_dir) / "capture")
+        os.makedirs(capture_path, exist_ok=True)
+        db_path = os.path.join(capture_path, "recording.db")
+
+        # Create a DB manually WITHOUT pixel_ratio column (simulating old schema)
+        conn = sqlite3.connect(db_path)
+        conn.execute("""
+            CREATE TABLE recording (
+                id INTEGER PRIMARY KEY,
+                timestamp REAL,
+                monitor_width INTEGER,
+                monitor_height INTEGER,
+                double_click_interval_seconds REAL,
+                double_click_distance_pixels REAL,
+                platform TEXT,
+                task_description TEXT,
+                video_start_time REAL,
+                config TEXT,
+                original_recording_id INTEGER
+            )
+        """)
+        import time
+        conn.execute(
+            "INSERT INTO recording (timestamp, monitor_width, monitor_height, platform, task_description)"
+            " VALUES (?, 1920, 1080, 'darwin', 'Old recording')",
+            (time.time(),),
+        )
+        conn.commit()
+        conn.close()
+
+        # Loading via Capture.load triggers _migrate_schema + SQLAlchemy query
+        capture = Capture.load(capture_path)
+        # Migrated default should be 1.0
+        assert capture.pixel_ratio == 1.0
+        capture.close()
+
+    def test_pixel_ratio_default_when_none(self, temp_capture_dir):
+        """Test CaptureSession.pixel_ratio returns 1.0 when value is None."""
+        capture_path = str(Path(temp_capture_dir) / "capture")
+        # _create_test_recording doesn't set pixel_ratio, so it defaults
+        recording, db_path, session = _create_test_recording(capture_path)
+
+        capture = Capture.load(capture_path)
+        # Model default is 1.0, so pixel_ratio should be 1.0
+        assert capture.pixel_ratio == 1.0
+        capture.close()
+
+    def test_viewer_html_embeds_pixel_ratio(self, temp_capture_dir):
+        """Test that generated HTML contains the correct pixelRatio value."""
+        capture_path = str(Path(temp_capture_dir) / "capture")
+        import os
+        import sys
+        import time
+
+        os.makedirs(capture_path, exist_ok=True)
+        db_path = os.path.join(capture_path, "recording.db")
+        engine, Session = create_db(db_path)
+        session = Session()
+
+        recording_data = {
+            "timestamp": time.time(),
+            "monitor_width": 1512,
+            "monitor_height": 982,
+            "pixel_ratio": 2.0,
+            "double_click_interval_seconds": 0.5,
+            "double_click_distance_pixels": 5,
+            "platform": sys.platform,
+            "task_description": "HTML test",
+        }
+        crud.insert_recording(session, recording_data)
+
+        from openadapt_capture.visualize.html import create_html
+        html = create_html(capture_path)
+        assert "const pixelRatio=2.0;" in html
+
+
 class TestRecordingConfig:
     """Tests for RecordingConfig and config_override."""
 
