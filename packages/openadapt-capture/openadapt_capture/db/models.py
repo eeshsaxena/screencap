@@ -39,6 +39,7 @@ class Recording(Base):
     timestamp = sa.Column(ForceFloat)
     monitor_width = sa.Column(sa.Integer)
     monitor_height = sa.Column(sa.Integer)
+    pixel_ratio = sa.Column(ForceFloat, default=1.0)
     double_click_interval_seconds = sa.Column(sa.Numeric(asdecimal=False))
     double_click_distance_pixels = sa.Column(sa.Numeric(asdecimal=False))
     platform = sa.Column(sa.String)

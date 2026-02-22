@@ -1016,15 +1016,19 @@ def create_recording(
     os.makedirs(capture_dir, exist_ok=True)
     db_path = os.path.join(capture_dir, "recording.db")
 
+    from openadapt_capture.platform import get_display_pixel_ratio
+
     timestamp = utils.set_start_time()
     monitor_width, monitor_height = utils.get_monitor_dims()
     double_click_distance_pixels = utils.get_double_click_distance_pixels()
     double_click_interval_seconds = utils.get_double_click_interval_seconds()
+    pixel_ratio = get_display_pixel_ratio()
     recording_data = {
         # TODO: rename
         "timestamp": timestamp,
         "monitor_width": monitor_width,
         "monitor_height": monitor_height,
+        "pixel_ratio": pixel_ratio,
         "double_click_distance_pixels": double_click_distance_pixels,
         "double_click_interval_seconds": double_click_interval_seconds,
         "platform": sys.platform,

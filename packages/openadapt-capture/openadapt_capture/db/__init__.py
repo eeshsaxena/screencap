@@ -96,6 +96,26 @@ def create_db(db_path: str, echo: bool = False) -> tuple:
     return engine, Session
 
 
+def _migrate_schema(db_path: str) -> None:
+    """Add missing columns to existing databases.
+
+    Called before opening a session so that SQLAlchemy queries don't fail
+    on old databases that lack newer columns.
+    """
+    import sqlite3
+
+    conn = sqlite3.connect(db_path)
+    cur = conn.cursor()
+    cur.execute("PRAGMA table_info(recording)")
+    columns = {row[1] for row in cur.fetchall()}
+    if "pixel_ratio" not in columns:
+        cur.execute(
+            "ALTER TABLE recording ADD COLUMN pixel_ratio REAL DEFAULT 1.0"
+        )
+        conn.commit()
+    conn.close()
+
+
 def get_session_for_path(db_path: str, echo: bool = False):
     """Create and return a new session for the given database path.
 
@@ -109,6 +129,7 @@ def get_session_for_path(db_path: str, echo: bool = False):
     Returns:
         A SQLAlchemy Session instance.
     """
+    _migrate_schema(db_path)
     db_url = f"sqlite:///{db_path}"
     engine = get_engine(db_url, echo=echo)
     Session = get_session_maker(engine)
