@@ -172,6 +172,8 @@ class WindowEvent(Base):
     width = sa.Column(sa.Integer)
     height = sa.Column(sa.Integer)
     window_id = sa.Column(sa.String)
+    app_bundle_id = sa.Column(sa.String)
+    app_version = sa.Column(sa.String)
 
     recording = sa.orm.relationship("Recording", back_populates="window_events")
     action_events = sa.orm.relationship("ActionEvent", back_populates="window_event")

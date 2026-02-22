@@ -55,6 +55,7 @@ def test_start_interactive():
         assert args[0][1] == "some desc"  # description
         assert args[0][2] is True  # audio
         assert args[1]["wifi_metrics"] is True
+        assert args[1]["app_versions"] is True
 
 
 def test_start_with_flags():
@@ -67,7 +68,7 @@ def test_start_with_flags():
         )
         assert result.exit_code == 0
         mock_rec.assert_called_once_with(
-            "test-rec", "demo", False, None, wifi_metrics=True, force_clean=False,
+            "test-rec", "demo", False, None, wifi_metrics=True, app_versions=True, force_clean=False,
         )
 
 
@@ -81,7 +82,21 @@ def test_start_no_wifi_metrics():
         )
         assert result.exit_code == 0
         mock_rec.assert_called_once_with(
-            "test-rec", None, True, None, wifi_metrics=False, force_clean=False,
+            "test-rec", None, True, None, wifi_metrics=False, app_versions=True, force_clean=False,
+        )
+
+
+def test_start_no_app_versions():
+    """Test --no-app-versions flag is passed through."""
+    runner = CliRunner()
+    with mock.patch("screencap.recorder.start_recording") as mock_rec:
+        result = runner.invoke(
+            cli,
+            ["start", "--name", "test-rec", "--no-app-versions"],
+        )
+        assert result.exit_code == 0
+        mock_rec.assert_called_once_with(
+            "test-rec", None, True, None, wifi_metrics=True, app_versions=False, force_clean=False,
         )
 
 
@@ -126,7 +141,7 @@ def _make_recording_dir(base, name, *, duration=60.0, with_metrics=False):
 
     if with_metrics:
         metrics = {
-            "schema_version": 3,
+            "schema_version": 4,
             "static": {
                 "hostname": "test-host.local",
                 "macos_version": "15.3",
@@ -152,6 +167,10 @@ def _make_recording_dir(base, name, *, duration=60.0, with_metrics=False):
                     "currency_code": "USD",
                 },
                 "wifi": {"connected": True, "phy_mode": "802.11ax"},
+                "running_applications": [
+                    {"name": "Finder", "bundle_id": "com.apple.finder", "version": "14.2"},
+                    {"name": "Google Chrome", "bundle_id": "com.google.Chrome", "version": "131.0.6778.86"},
+                ],
             },
             "start": {
                 "collected_at": "2026-02-19T14:30:00+00:00",
@@ -207,6 +226,17 @@ def test_info_command_no_metrics(tmp_path):
         result = runner.invoke(cli, ["info", "old-rec"])
     assert result.exit_code == 0
     assert "No system metrics" in result.output
+
+
+def test_info_command_with_running_applications(tmp_path):
+    _make_recording_dir(tmp_path, "demo", with_metrics=True)
+    runner = CliRunner()
+    with mock.patch("screencap.config.get_recordings_dir", return_value=tmp_path):
+        result = runner.invoke(cli, ["info", "demo"])
+    assert result.exit_code == 0
+    assert "running apps:" in result.output
+    assert "Finder (com.apple.finder) v14.2" in result.output
+    assert "Google Chrome (com.google.Chrome) v131.0.6778.86" in result.output
 
 
 def test_info_command_nonexistent_recording(tmp_path):

@@ -12,7 +12,7 @@ from pathlib import Path
 
 from rich.console import Console
 
-from screencap.config import get_audio_default, get_recordings_dir, get_wifi_metrics
+from screencap.config import get_app_versions, get_audio_default, get_recordings_dir, get_wifi_metrics
 
 console = Console()
 
@@ -42,6 +42,7 @@ def start_recording(
     audio: bool | None = None,
     output_dir: str | Path | None = None,
     wifi_metrics: bool | None = None,
+    app_versions: bool | None = None,
     force_clean: bool = False,
 ) -> Path:
     """Start a screen capture recording. Blocks until Ctrl+C."""
@@ -49,6 +50,8 @@ def start_recording(
         audio = get_audio_default()
     if wifi_metrics is None:
         wifi_metrics = get_wifi_metrics()
+    if app_versions is None:
+        app_versions = get_app_versions()
 
     # Check for orphaned processes from a previous recording
     from screencap.pidfile import (
@@ -121,7 +124,7 @@ def start_recording(
     try:
         from screencap.metrics import save_metrics
 
-        save_metrics(capture_dir, "start", wifi_metrics=wifi_metrics)
+        save_metrics(capture_dir, "start", wifi_metrics=wifi_metrics, app_versions=app_versions)
     except Exception as e:
         console.print(f"[yellow]Warning:[/yellow] Could not collect system metrics: {e}")
 
@@ -195,7 +198,7 @@ def start_recording(
     try:
         from screencap.metrics import save_metrics
 
-        save_metrics(capture_dir, "end", wifi_metrics=wifi_metrics)
+        save_metrics(capture_dir, "end", wifi_metrics=wifi_metrics, app_versions=app_versions)
     except Exception as e:
         console.print(f"[yellow]Warning:[/yellow] Could not collect end metrics: {e}")
 

@@ -26,8 +26,9 @@ def cli():
 @click.option("--no-audio", is_flag=True, default=False, help="Disable audio capture.")
 @click.option("--output", "-o", type=click.Path(), default=None, help="Custom output directory.")
 @click.option("--no-wifi-metrics", is_flag=True, default=False, help="Disable WiFi metrics collection.")
+@click.option("--no-app-versions", is_flag=True, default=False, help="Disable running app version capture.")
 @click.option("--force", is_flag=True, default=False, help="Auto-clean orphaned processes before starting.")
-def start(name, description, no_audio, output, no_wifi_metrics, force):
+def start(name, description, no_audio, output, no_wifi_metrics, no_app_versions, force):
     """Record a screen capture session. Ctrl+C to stop."""
     if not name:
         if not sys.stdin.isatty():
@@ -44,12 +45,13 @@ def start(name, description, no_audio, output, no_wifi_metrics, force):
 
     audio = not no_audio
     wifi_metrics = not no_wifi_metrics
+    app_versions = not no_app_versions
 
     from screencap.recorder import start_recording
 
     start_recording(
         name, description or None, audio, output,
-        wifi_metrics=wifi_metrics, force_clean=force,
+        wifi_metrics=wifi_metrics, app_versions=app_versions, force_clean=force,
     )
 
 
@@ -203,6 +205,11 @@ def info(name, as_json):
                         console.print(f"    [cyan]{lk}:[/cyan] {lv}")
                     else:
                         console.print(f"    [cyan]{lk}:[/cyan] {lv}")
+            elif key == "running_applications" and isinstance(val, list):
+                console.print(f"  [cyan]running apps:[/cyan]")
+                for app in val:
+                    v = f" v{app['version']}" if app.get("version") else ""
+                    console.print(f"    {app['name']} ({app['bundle_id']}){v}")
             elif key == "wifi" and isinstance(val, dict):
                 console.print(f"  [cyan]wifi:[/cyan]")
                 for wk, wv in val.items():
