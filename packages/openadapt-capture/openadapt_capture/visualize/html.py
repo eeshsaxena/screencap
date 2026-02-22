@@ -171,6 +171,17 @@ def create_html(
         # Pressure data
         if hasattr(action.event, "pressure") and action.event.pressure is not None:
             event_dict["pressure"] = action.event.pressure
+        # Modifier flags (human-readable in JS)
+        mf = getattr(action.event, "modifier_flags", None)
+        if mf is not None and mf != 0:
+            event_dict["modifiers"] = mf
+        # Scroll enrichment
+        if hasattr(action.event, "scroll_phase") and action.event.scroll_phase is not None:
+            event_dict["scroll_phase"] = action.event.scroll_phase
+        if hasattr(action.event, "momentum_phase") and action.event.momentum_phase is not None:
+            event_dict["momentum_phase"] = action.event.momentum_phase
+        if hasattr(action.event, "is_continuous") and action.event.is_continuous is not None:
+            event_dict["is_continuous"] = action.event.is_continuous
         # Drag path with per-point pressure for variable-thickness rendering
         if event_type == "mouse.drag" and hasattr(action.event, "children"):
             path = []
@@ -785,12 +796,29 @@ function updateContext(ev){{
     if(tog)tog.addEventListener('click',()=>{{ tog.classList.toggle('expanded'); document.getElementById('info-more').classList.toggle('visible'); }});
 }}
 
+function formatModifiers(flags){{
+    const parts=[];
+    if(flags&0x20000)parts.push('Shift');
+    if(flags&0x40000)parts.push('Ctrl');
+    if(flags&0x80000)parts.push('Opt');
+    if(flags&0x100000)parts.push('Cmd');
+    if(flags&0x10000)parts.push('Caps');
+    if(flags&0x800000)parts.push('Fn');
+    return parts.join('+')||String(flags);
+}}
+function formatScrollPhase(p){{
+    return {{1:'began',2:'changed',4:'stationary',8:'ended',128:'mayBegin'}}[p]||String(p);
+}}
+function formatMomentum(p){{
+    return {{0:'none',1:'begin',2:'continue',3:'end'}}[p]||String(p);
+}}
+
 function updateDetails(ev){{
     currentEvent=ev;
     let h='';
     for(const[key,value]of Object.entries(ev)){{
         if(key==='index'||key==='element'||key==='window'||key==='windowTitle'||key==='path')continue;
-        const dv=key==='time'?formatTime(value):value;
+        const dv=key==='time'?formatTime(value):key==='modifiers'?formatModifiers(value):key==='scroll_phase'?formatScrollPhase(value):key==='momentum_phase'?formatMomentum(value):key==='is_continuous'?(value?'trackpad':'wheel'):value;
         const cls=key==='type'?' type-val':key==='time'?' time-val':'';
         h+=`<div class="detail-row"><span class="detail-key">${{key}}</span><span class="detail-val${{cls}}">${{dv??'\u2014'}}</span></div>`;
     }}
