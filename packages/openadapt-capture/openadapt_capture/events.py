@@ -81,6 +81,7 @@ class MouseMoveEvent(BaseEvent):
     type: Literal[EventType.MOUSE_MOVE] = EventType.MOUSE_MOVE
     x: float = Field(description="Mouse X position in pixels")
     y: float = Field(description="Mouse Y position in pixels")
+    pressure: float | None = Field(default=None, description="Pressure 0.0-1.0, None if unsupported")
 
 
 class MouseDownEvent(BaseEvent):
@@ -93,6 +94,7 @@ class MouseDownEvent(BaseEvent):
     x: float = Field(description="Mouse X position in pixels")
     y: float = Field(description="Mouse Y position in pixels")
     button: MouseButton = Field(description="Mouse button name")
+    pressure: float | None = Field(default=None, description="Pressure 0.0-1.0, None if unsupported")
 
 
 class MouseUpEvent(BaseEvent):
@@ -105,6 +107,7 @@ class MouseUpEvent(BaseEvent):
     x: float = Field(description="Mouse X position in pixels")
     y: float = Field(description="Mouse Y position in pixels")
     button: MouseButton = Field(description="Mouse button name")
+    pressure: float | None = Field(default=None, description="Pressure 0.0-1.0, None if unsupported")
 
 
 class MouseScrollEvent(BaseEvent):
@@ -257,6 +260,7 @@ class MouseClickEvent(BaseEvent):
     x: float = Field(description="Mouse X position in pixels")
     y: float = Field(description="Mouse Y position in pixels")
     button: MouseButton = Field(description="Mouse button name")
+    pressure: float | None = Field(default=None, description="Pressure from down event, 0.0-1.0")
     children: list[MouseDownEvent | MouseUpEvent] = Field(
         default_factory=list, description="Child events that were merged"
     )
@@ -273,6 +277,7 @@ class MouseDoubleClickEvent(BaseEvent):
     x: float = Field(description="Mouse X position in pixels")
     y: float = Field(description="Mouse Y position in pixels")
     button: MouseButton = Field(description="Mouse button name")
+    pressure: float | None = Field(default=None, description="Pressure from first down event, 0.0-1.0")
     children: list[MouseDownEvent | MouseUpEvent] = Field(
         default_factory=list, description="Child events that were merged"
     )
@@ -283,6 +288,7 @@ class MouseDragEvent(BaseEvent):
 
     Uses x/y for start position and dx/dy for displacement (like MouseScrollEvent).
     End position can be computed as (x + dx, y + dy).
+    Pressure is always None at parent level; children preserve individual pressures.
     """
 
     type: Literal[EventType.MOUSE_DRAG] = EventType.MOUSE_DRAG
@@ -291,6 +297,7 @@ class MouseDragEvent(BaseEvent):
     dx: float = Field(description="Horizontal displacement (end_x - start_x)")
     dy: float = Field(description="Vertical displacement (end_y - start_y)")
     button: MouseButton = Field(description="Mouse button name")
+    pressure: float | None = Field(default=None, description="Always None; children have individual pressures")
     children: list[
         MouseDownEvent | MouseMoveEvent | MouseUpEvent
         | MouseScrollEvent | KeyDownEvent | KeyUpEvent | KeyTypeEvent

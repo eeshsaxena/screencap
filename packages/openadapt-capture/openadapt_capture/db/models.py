@@ -105,6 +105,7 @@ class ActionEvent(Base):
     mouse_y = sa.Column(sa.Numeric(asdecimal=False))
     mouse_dx = sa.Column(sa.Numeric(asdecimal=False))
     mouse_dy = sa.Column(sa.Numeric(asdecimal=False))
+    mouse_pressure = sa.Column(sa.Numeric(asdecimal=False), nullable=True)
     active_segment_description = sa.Column(sa.String)
     _available_segment_descriptions = sa.Column(
         "available_segment_descriptions",
