@@ -46,6 +46,7 @@ def _convert_action_event(db_event) -> PydanticActionEvent | None:
             timestamp=ts,
             x=db_event.mouse_x or 0,
             y=db_event.mouse_y or 0,
+            pressure=getattr(db_event, "mouse_pressure", None),
         )
     elif db_event.name == "click":
         button = db_event.mouse_button_name or "left"
@@ -60,6 +61,7 @@ def _convert_action_event(db_event) -> PydanticActionEvent | None:
                 x=db_event.mouse_x or 0,
                 y=db_event.mouse_y or 0,
                 button=button,
+                pressure=getattr(db_event, "mouse_pressure", None),
             )
         elif db_event.mouse_pressed is False:
             return MouseUpEvent(
@@ -67,6 +69,7 @@ def _convert_action_event(db_event) -> PydanticActionEvent | None:
                 x=db_event.mouse_x or 0,
                 y=db_event.mouse_y or 0,
                 button=button,
+                pressure=getattr(db_event, "mouse_pressure", None),
             )
         else:
             return None
