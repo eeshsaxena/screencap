@@ -168,6 +168,20 @@ def create_html(
             event_dict["magnification"] = action.event.magnification
         if hasattr(action.event, "rotation"):
             event_dict["rotation"] = action.event.rotation
+        # Pressure data
+        if hasattr(action.event, "pressure") and action.event.pressure is not None:
+            event_dict["pressure"] = action.event.pressure
+        # Drag path with per-point pressure for variable-thickness rendering
+        if event_type == "mouse.drag" and hasattr(action.event, "children"):
+            path = []
+            for child in action.event.children:
+                if hasattr(child, "x") and hasattr(child, "y"):
+                    point = {"x": child.x, "y": child.y}
+                    if hasattr(child, "pressure") and child.pressure is not None:
+                        point["p"] = child.pressure
+                    path.append(point)
+            if path:
+                event_dict["path"] = path
 
         # Accessibility data
         if getattr(action, "window_title", None):
@@ -772,7 +786,7 @@ function updateDetails(ev){{
     currentEvent=ev;
     let h='';
     for(const[key,value]of Object.entries(ev)){{
-        if(key==='index'||key==='element'||key==='window'||key==='windowTitle')continue;
+        if(key==='index'||key==='element'||key==='window'||key==='windowTitle'||key==='path')continue;
         const dv=key==='time'?formatTime(value):value;
         const cls=key==='type'?' type-val':key==='time'?' time-val':'';
         h+=`<div class="detail-row"><span class="detail-key">${{key}}</span><span class="detail-val${{cls}}">${{dv??'\u2014'}}</span></div>`;
@@ -809,7 +823,22 @@ function drawOverlay(ev){{
         overlayCtx.strokeStyle='#ef5350';overlayCtx.lineWidth=2;overlayCtx.stroke();
     }}else if(type.includes('drag')){{
         const sx=oX+(ev.x*sX),sy=oY+(ev.y*sY),ex=oX+((ev.x+ev.dx)*sX),ey=oY+((ev.y+ev.dy)*sY);
-        overlayCtx.beginPath();overlayCtx.moveTo(sx,sy);overlayCtx.lineTo(ex,ey);overlayCtx.strokeStyle='#4caf50';overlayCtx.lineWidth=3;overlayCtx.stroke();
+        overlayCtx.strokeStyle='#4caf50';
+        if(ev.path&&ev.path.length>1){{
+            /* Variable-thickness polyline when pressure data exists */
+            const minW=1,maxW=6;
+            for(let i=1;i<ev.path.length;i++){{
+                const p0=ev.path[i-1],p1=ev.path[i];
+                const pr=p1.p??0;
+                overlayCtx.lineWidth=minW+pr*(maxW-minW);
+                overlayCtx.beginPath();
+                overlayCtx.moveTo(oX+(p0.x*sX),oY+(p0.y*sY));
+                overlayCtx.lineTo(oX+(p1.x*sX),oY+(p1.y*sY));
+                overlayCtx.stroke();
+            }}
+        }}else{{
+            overlayCtx.beginPath();overlayCtx.moveTo(sx,sy);overlayCtx.lineTo(ex,ey);overlayCtx.lineWidth=3;overlayCtx.stroke();
+        }}
         overlayCtx.beginPath();overlayCtx.arc(sx,sy,8,0,Math.PI*2);overlayCtx.fillStyle='#4caf50';overlayCtx.fill();
         const a=Math.atan2(ey-sy,ex-sx);
         overlayCtx.beginPath();overlayCtx.moveTo(ex,ey);overlayCtx.lineTo(ex-15*Math.cos(a-0.4),ey-15*Math.sin(a-0.4));overlayCtx.lineTo(ex-15*Math.cos(a+0.4),ey-15*Math.sin(a+0.4));overlayCtx.closePath();overlayCtx.fillStyle='#4caf50';overlayCtx.fill();

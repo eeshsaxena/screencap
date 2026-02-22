@@ -99,6 +99,7 @@ def draw_drag(
     end_y: int,
     color: tuple = DRAG_COLOR,
     width: int = 3,
+    pressure: float | None = None,
 ) -> None:
     """Draw a drag indicator (line with arrow).
 
@@ -110,8 +111,12 @@ def draw_drag(
         end_y: End y coordinate.
         color: RGBA color tuple.
         width: Line width.
+        pressure: Optional average pressure (0.0-1.0) to modulate line width.
     """
     import math
+
+    if pressure is not None:
+        width = max(1, int(1 + pressure * 5))  # 1-6px
 
     # Draw the main line
     draw.line([(start_x, start_y), (end_x, end_y)], fill=color, width=width)
