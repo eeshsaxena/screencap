@@ -1422,6 +1422,10 @@ def record_audio(
 ) -> None:
     """Record audio narration during the recording and store data in database.
 
+    Uses a streaming FLAC writer to keep RAM bounded (~2 MB) regardless of
+    recording duration. A flush thread periodically drains the audio callback
+    buffer and appends PCM frames to a single open SoundFile writer.
+
     Args:
         recording: The recording object.
         db_path: Path to the per-capture database file.
@@ -1432,9 +1436,15 @@ def record_audio(
 
     signal.signal(signal.SIGINT, signal.SIG_IGN)
 
-    audio_frames = []  # to store audio frames
-
     import sounddevice
+
+    FLUSH_INTERVAL_SECS = 30
+    SAMPLERATE = 16000
+    CHANNELS = 1
+
+    # Locked buffer — audio_callback appends, flush thread drains
+    audio_buffer: list[np.ndarray] = []
+    buffer_lock = threading.Lock()
 
     def audio_callback(
         indata: np.ndarray, frames: int, time: Any, status: sounddevice.CallbackFlags
@@ -1444,83 +1454,106 @@ def record_audio(
         Note: time is of type cffi.FFI.CData, but since we don't use this argument
         and we also don't use the cffi library, the Any type annotation is used.
         """
-        # called whenever there is new audio frames
-        audio_frames.append(indata.copy())
+        with buffer_lock:
+            audio_buffer.append(indata.copy())
 
-    # open InputStream and start recording while ActionEvents are recorded
+    def _drain_buffer() -> np.ndarray | None:
+        """Swap out the buffer under lock, return concatenated frames or None."""
+        with buffer_lock:
+            if not audio_buffer:
+                return None
+            drained = audio_buffer[:]
+            audio_buffer.clear()
+        return np.concatenate(drained, axis=0)
+
+    def _flush_loop(
+        sf_writer: "soundfile.SoundFile",
+        stop_event: threading.Event,
+    ) -> None:
+        """Periodically drain audio_buffer and write frames to the FLAC file."""
+        while not stop_event.wait(timeout=FLUSH_INTERVAL_SECS):
+            frames = _drain_buffer()
+            if frames is not None:
+                try:
+                    sf_writer.write(frames)
+                    logger.debug(f"Flushed {len(frames)} audio frames to disk")
+                except Exception as e:
+                    logger.error(f"Audio flush failed: {e}")
+                    return
+
+    # Open streaming FLAC writer before starting the audio stream
+    from pathlib import Path as _Path
+
+    audio_flac_path = _Path(db_path).parent / "audio.flac"
+    sf_writer = soundfile.SoundFile(
+        str(audio_flac_path),
+        mode="w",
+        samplerate=SAMPLERATE,
+        channels=CHANNELS,
+        format="FLAC",
+    )
+
+    # Start the flush thread
+    flush_stop = threading.Event()
+    flush_thread = threading.Thread(
+        target=_flush_loop,
+        args=(sf_writer, flush_stop),
+        daemon=True,
+    )
+    flush_thread.start()
+
+    # Open InputStream and start recording
     audio_stream = sounddevice.InputStream(
-        callback=audio_callback, samplerate=16000, channels=1
+        callback=audio_callback, samplerate=SAMPLERATE, channels=CHANNELS
     )
     logger.info("Audio recording started.")
     start_timestamp = utils.get_timestamp()
     audio_stream.start()
 
     # NOTE: listener may not have actually started by now
-    # TODO: handle race condition, e.g. by sending synthetic events from main thread
     started_event.set()
 
     terminate_processing.wait()
     audio_stream.stop()
     audio_stream.close()
 
-    # Concatenate into one Numpy array
-    concatenated_audio = np.concatenate(audio_frames, axis=0)
-    # convert concatenated_audio to format expected by whisper
-    converted_audio = concatenated_audio.flatten().astype(np.float32)
+    # Signal flush thread to stop and wait for it
+    flush_stop.set()
+    flush_thread.join(timeout=10)
 
-    # compress and convert to bytes to save to database
-    logger.info(
-        "Size of uncompressed audio data: {} bytes".format(converted_audio.nbytes)
-    )
-    # Create an in-memory file-like object
-    file_obj = io.BytesIO()
-    # Write the audio data using lossless compression
-    soundfile.write(
-        file_obj, converted_audio, int(audio_stream.samplerate), format="FLAC"
-    )
-    # Get the compressed audio data as bytes
-    compressed_audio_bytes = file_obj.getvalue()
+    # Final drain — write any remaining buffered frames
+    final_frames = _drain_buffer()
+    if final_frames is not None:
+        try:
+            sf_writer.write(final_frames)
+            logger.debug(f"Final flush: {len(final_frames)} audio frames")
+        except Exception as e:
+            logger.error(f"Final audio flush failed: {e}")
 
-    logger.info(
-        "Size of compressed audio data: {} bytes".format(len(compressed_audio_bytes))
-    )
-
-    file_obj.close()
-
-    # Write audio.flac to disk (alongside recording.db)
-    from pathlib import Path as _Path
-    audio_flac_path = _Path(db_path).parent / "audio.flac"
-    audio_flac_path.write_bytes(compressed_audio_bytes)
+    # Close writer — finalizes FLAC headers
+    sf_writer.close()
     logger.info(f"Audio saved to {audio_flac_path}")
 
-    # Attempt transcription (optional — don't crash if whisper not installed)
-    result_text = ""
-    word_list = []
-    try:
-        import whisper
-        logger.info("Transcribing audio...")
-        model = whisper.load_model("base")
-        result_info = model.transcribe(converted_audio, word_timestamps=True, fp16=False)
-        result_text = result_info.get("text", "")
-        logger.info(f"The narrated text is: {result_text}")
-        if len(result_info.get("segments", [])) > 0:
-            if "words" in result_info["segments"][0]:
-                word_list = result_info["segments"][0]["words"]
-    except ImportError:
-        logger.info("Whisper not installed — skipping transcription. Audio saved OK.")
-    except Exception as e:
-        logger.warning(f"Transcription failed: {e}. Audio saved OK.")
+    # Read compressed FLAC from disk for DB insert
+    compressed_audio_bytes = audio_flac_path.read_bytes()
+    if not compressed_audio_bytes:
+        logger.warning("Zero-length audio recording — skipping DB insert")
+        return
+
+    logger.info(
+        f"Size of compressed audio data: {len(compressed_audio_bytes)} bytes"
+    )
 
     session = get_session_for_path(db_path)
-    # Create AudioInfo entry
+    # Create AudioInfo entry (transcription deferred to _auto_transcribe())
     crud.insert_audio_info(
         session,
         compressed_audio_bytes,
-        result_text,
+        "",  # transcribed_text — populated later by _auto_transcribe()
         recording,
         start_timestamp,
-        int(audio_stream.samplerate),
-        word_list,
+        SAMPLERATE,
+        [],  # word_list — populated later by _auto_transcribe()
     )
 
 
