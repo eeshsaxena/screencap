@@ -238,8 +238,9 @@ def _scrub_metrics(metrics_path: Path) -> None:
     """Redact PII fields in system_metrics.json.
 
     Note: locale data (system_locale, preferred_languages, timezone, etc.)
-    is not considered PII and is intentionally not redacted. Only hostname
-    is PII because it often contains the user's name.
+    and running_applications (app names, bundle IDs, versions) are not
+    considered PII and are intentionally not redacted. Only hostname is PII
+    because it often contains the user's name.
     """
     try:
         data = json.loads(metrics_path.read_text())

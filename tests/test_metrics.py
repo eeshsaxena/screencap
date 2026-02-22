@@ -6,6 +6,7 @@ from unittest import mock
 from screencap.metrics import (
     METRICS_FILENAME,
     _collect_locale,
+    _collect_running_applications,
     _collect_wifi_dynamic,
     _collect_wifi_static,
     collect_dynamic_metrics,
@@ -36,6 +37,10 @@ def test_collect_static_metrics_returns_expected_keys():
             "screencap.metrics._collect_wifi_static",
             return_value={"connected": True, "phy_mode": "802.11ax"},
         ),
+        mock.patch(
+            "screencap.metrics._collect_running_applications",
+            return_value=[{"name": "Finder", "bundle_id": "com.apple.finder", "version": "14.2"}],
+        ),
     ):
         mock_sct = mock.MagicMock()
         mock_sct.monitors = [
@@ -62,12 +67,14 @@ def test_collect_static_metrics_returns_expected_keys():
         "display_count",
         "locale",
         "wifi",
+        "running_applications",
     }
     assert expected_keys == set(result.keys())
     assert result["hostname"] == "test-host"
     assert result["display_count"] == 1
     assert result["displays"][0]["width"] == 2560
     assert result["wifi"] == {"connected": True, "phy_mode": "802.11ax"}
+    assert result["running_applications"] == [{"name": "Finder", "bundle_id": "com.apple.finder", "version": "14.2"}]
 
 
 def test_collect_dynamic_metrics_returns_expected_keys():
@@ -121,7 +128,7 @@ def test_save_metrics_start_creates_file(tmp_path):
     assert metrics_file.exists()
 
     data = json.loads(metrics_file.read_text())
-    assert data["schema_version"] == 3
+    assert data["schema_version"] == 4
     assert data["static"] == {"hostname": "h"}
     assert data["start"] == {"cpu_percent": 10}
     assert data["end"] is None
@@ -161,7 +168,7 @@ def test_save_metrics_end_without_start(tmp_path):
     assert metrics_file.exists()
 
     data = json.loads(metrics_file.read_text())
-    assert data["schema_version"] == 3
+    assert data["schema_version"] == 4
     assert data["start"] is None
     assert data["end"] == {"cpu_percent": 5}
 
@@ -558,3 +565,230 @@ def test_get_wifi_metrics_config_toml():
         mock.patch("screencap.config._load_toml", return_value={"wifi_metrics": False}),
     ):
         assert get_wifi_metrics() is False
+
+
+# --- Running applications tests ---
+
+
+def _make_mock_running_app(*, name="Finder", bundle_id="com.apple.finder",
+                           bundle_url="/Applications/Finder.app",
+                           activation_policy=0, info_dict=None):
+    """Create a mock NSRunningApplication."""
+    app = mock.Mock()
+    app.activationPolicy.return_value = activation_policy
+    app.bundleIdentifier.return_value = bundle_id
+    app.localizedName.return_value = name
+    url = mock.Mock() if bundle_url else None
+    app.bundleURL.return_value = url
+    return app, url, info_dict
+
+
+def test_collect_running_applications_happy_path():
+    """Mock NSWorkspace, verify list shape with sorted output."""
+    app1 = mock.Mock()
+    app1.activationPolicy.return_value = 0  # NSApplicationActivationPolicyRegular
+    app1.bundleIdentifier.return_value = "com.google.Chrome"
+    app1.localizedName.return_value = "Google Chrome"
+    app1.bundleURL.return_value = mock.Mock()
+
+    app2 = mock.Mock()
+    app2.activationPolicy.return_value = 0
+    app2.bundleIdentifier.return_value = "com.apple.finder"
+    app2.localizedName.return_value = "Finder"
+    app2.bundleURL.return_value = mock.Mock()
+
+    mock_workspace = mock.Mock()
+    mock_workspace.sharedWorkspace.return_value.runningApplications.return_value = [app1, app2]
+
+    bundle1 = mock.Mock()
+    bundle1.infoDictionary.return_value = {"CFBundleShortVersionString": "131.0.6778.86"}
+    bundle2 = mock.Mock()
+    bundle2.infoDictionary.return_value = {"CFBundleShortVersionString": "14.2"}
+
+    def bundle_with_url(url):
+        if url is app1.bundleURL.return_value:
+            return bundle1
+        return bundle2
+
+    mock_foundation = mock.Mock()
+    mock_foundation.NSBundle.bundleWithURL_.side_effect = bundle_with_url
+
+    mock_appkit = mock.MagicMock()
+    mock_appkit.NSWorkspace = mock_workspace
+    mock_appkit.NSApplicationActivationPolicyRegular = 0
+
+    with mock.patch.dict("sys.modules", {
+        "AppKit": mock_appkit,
+        "Foundation": mock_foundation,
+    }):
+        result = _collect_running_applications()
+
+    assert result is not None
+    assert len(result) == 2
+    # Sorted alphabetically by name
+    assert result[0]["name"] == "Finder"
+    assert result[0]["bundle_id"] == "com.apple.finder"
+    assert result[0]["version"] == "14.2"
+    assert result[1]["name"] == "Google Chrome"
+    assert result[1]["bundle_id"] == "com.google.Chrome"
+    assert result[1]["version"] == "131.0.6778.86"
+
+
+def test_collect_running_applications_import_error():
+    """pyobjc absent returns None."""
+    with mock.patch.dict("sys.modules", {"AppKit": None}):
+        result = _collect_running_applications()
+    assert result is None
+
+
+def test_collect_running_applications_partial_failure():
+    """One app raises, others succeed."""
+    good_app = mock.Mock()
+    good_app.activationPolicy.return_value = 0
+    good_app.bundleIdentifier.return_value = "com.apple.finder"
+    good_app.localizedName.return_value = "Finder"
+    good_app.bundleURL.return_value = mock.Mock()
+
+    bad_app = mock.Mock()
+    bad_app.activationPolicy.side_effect = RuntimeError("broken")
+
+    mock_workspace = mock.Mock()
+    mock_workspace.sharedWorkspace.return_value.runningApplications.return_value = [bad_app, good_app]
+
+    mock_bundle = mock.Mock()
+    mock_bundle.infoDictionary.return_value = {"CFBundleShortVersionString": "14.2"}
+
+    mock_foundation = mock.Mock()
+    mock_foundation.NSBundle.bundleWithURL_.return_value = mock_bundle
+
+    mock_appkit = mock.MagicMock()
+    mock_appkit.NSWorkspace = mock_workspace
+    mock_appkit.NSApplicationActivationPolicyRegular = 0
+
+    with mock.patch.dict("sys.modules", {
+        "AppKit": mock_appkit,
+        "Foundation": mock_foundation,
+    }):
+        result = _collect_running_applications()
+
+    assert result is not None
+    assert len(result) == 1
+    assert result[0]["name"] == "Finder"
+
+
+def test_collect_running_applications_no_bundle_id_skipped():
+    """Apps with nil bundleIdentifier are excluded."""
+    app = mock.Mock()
+    app.activationPolicy.return_value = 0
+    app.bundleIdentifier.return_value = None
+    app.localizedName.return_value = "Mystery"
+
+    mock_workspace = mock.Mock()
+    mock_workspace.sharedWorkspace.return_value.runningApplications.return_value = [app]
+
+    mock_appkit = mock.MagicMock()
+    mock_appkit.NSWorkspace = mock_workspace
+    mock_appkit.NSApplicationActivationPolicyRegular = 0
+
+    mock_foundation = mock.Mock()
+
+    with mock.patch.dict("sys.modules", {
+        "AppKit": mock_appkit,
+        "Foundation": mock_foundation,
+    }):
+        result = _collect_running_applications()
+
+    assert result is not None
+    assert len(result) == 0
+
+
+def test_collect_running_applications_version_fallback():
+    """CFBundleShortVersionString absent, falls back to CFBundleVersion."""
+    app = mock.Mock()
+    app.activationPolicy.return_value = 0
+    app.bundleIdentifier.return_value = "com.example.app"
+    app.localizedName.return_value = "Example"
+    app.bundleURL.return_value = mock.Mock()
+
+    mock_workspace = mock.Mock()
+    mock_workspace.sharedWorkspace.return_value.runningApplications.return_value = [app]
+
+    mock_bundle = mock.Mock()
+    mock_bundle.infoDictionary.return_value = {"CFBundleVersion": "42.1"}
+
+    mock_foundation = mock.Mock()
+    mock_foundation.NSBundle.bundleWithURL_.return_value = mock_bundle
+
+    mock_appkit = mock.MagicMock()
+    mock_appkit.NSWorkspace = mock_workspace
+    mock_appkit.NSApplicationActivationPolicyRegular = 0
+
+    with mock.patch.dict("sys.modules", {
+        "AppKit": mock_appkit,
+        "Foundation": mock_foundation,
+    }):
+        result = _collect_running_applications()
+
+    assert result is not None
+    assert len(result) == 1
+    assert result[0]["version"] == "42.1"
+
+
+def test_app_versions_disabled():
+    """When app_versions=False, running_applications key is absent from static."""
+    with (
+        mock.patch("screencap.metrics.socket.gethostname", return_value="h"),
+        mock.patch("screencap.metrics.platform.mac_ver", return_value=("15.3", ("", "", ""), "")),
+        mock.patch(
+            "screencap.metrics.platform.uname",
+            return_value=mock.Mock(system="Darwin", release="24.6.0"),
+        ),
+        mock.patch(
+            "screencap.metrics.subprocess.run",
+            return_value=mock.Mock(stdout='{"SPDisplaysDataType": []}', returncode=0),
+        ),
+        mock.patch("screencap.metrics.psutil.cpu_count", return_value=8),
+        mock.patch(
+            "screencap.metrics.psutil.virtual_memory",
+            return_value=mock.Mock(total=16 * 1024**3),
+        ),
+        mock.patch("screencap.metrics.mss.mss") as mock_mss,
+    ):
+        mock_sct = mock.MagicMock()
+        mock_sct.monitors = [{"width": 3840, "height": 2160}]
+        mock_mss.return_value.__enter__ = mock.Mock(return_value=mock_sct)
+        mock_mss.return_value.__exit__ = mock.Mock(return_value=False)
+
+        static = collect_static_metrics(app_versions=False)
+
+    assert "running_applications" not in static
+
+
+def test_get_app_versions_config_default():
+    """Default returns True."""
+    from screencap.config import get_app_versions
+
+    with mock.patch("screencap.config._load_toml", return_value={}):
+        assert get_app_versions() is True
+
+
+def test_get_app_versions_config_env_var():
+    """Env var SCREENCAP_APP_VERSIONS overrides config."""
+    from screencap.config import get_app_versions
+
+    with mock.patch.dict("os.environ", {"SCREENCAP_APP_VERSIONS": "false"}):
+        assert get_app_versions() is False
+
+    with mock.patch.dict("os.environ", {"SCREENCAP_APP_VERSIONS": "true"}):
+        assert get_app_versions() is True
+
+
+def test_get_app_versions_config_toml():
+    """config.toml app_versions=false disables app version collection."""
+    from screencap.config import get_app_versions
+
+    with (
+        mock.patch.dict("os.environ", {}, clear=True),
+        mock.patch("screencap.config._load_toml", return_value={"app_versions": False}),
+    ):
+        assert get_app_versions() is False

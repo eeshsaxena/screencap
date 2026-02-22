@@ -17,7 +17,7 @@ import psutil
 from screencap import __version__
 
 METRICS_FILENAME = "system_metrics.json"
-SCHEMA_VERSION = 3
+SCHEMA_VERSION = 4
 
 _PHY_MODE_NAMES = {
     0: "none",
@@ -243,7 +243,62 @@ def _collect_wifi_dynamic() -> dict | None:
     return wifi
 
 
-def collect_static_metrics(wifi_metrics: bool = True) -> dict:
+def _collect_running_applications() -> list[dict] | None:
+    """Enumerate running GUI apps with their versions via NSWorkspace/NSBundle.
+
+    macOS-only: uses AppKit.NSWorkspace and Foundation.NSBundle from
+    pyobjc-framework-Cocoa.  Returns None when pyobjc is not installed.
+    """
+    try:
+        from AppKit import NSWorkspace, NSApplicationActivationPolicyRegular
+        from Foundation import NSBundle
+    except ImportError:
+        return None
+
+    try:
+        apps = NSWorkspace.sharedWorkspace().runningApplications()
+    except Exception:
+        return None
+
+    result: list[dict] = []
+    for app in apps:
+        try:
+            if app.activationPolicy() != NSApplicationActivationPolicyRegular:
+                continue
+
+            bundle_id = app.bundleIdentifier()
+            if bundle_id is None:
+                continue
+
+            name = app.localizedName() or ""
+
+            version = None
+            bundle_url = app.bundleURL()
+            if bundle_url is not None:
+                try:
+                    bundle = NSBundle.bundleWithURL_(bundle_url)
+                    if bundle is not None:
+                        info = bundle.infoDictionary()
+                        if info is not None:
+                            version = info.get("CFBundleShortVersionString") or info.get("CFBundleVersion")
+                            if version is not None:
+                                version = str(version)
+                except Exception:
+                    pass
+
+            result.append({
+                "name": name,
+                "bundle_id": bundle_id,
+                "version": version,
+            })
+        except Exception:
+            continue
+
+    result.sort(key=lambda a: a["name"].lower())
+    return result
+
+
+def collect_static_metrics(wifi_metrics: bool = True, app_versions: bool = True) -> dict:
     """Gather hardware, OS, and display info (unchanging during a recording)."""
     static: dict = {}
 
@@ -346,6 +401,13 @@ def collect_static_metrics(wifi_metrics: bool = True) -> dict:
         except Exception:
             static["wifi"] = None
 
+    # Running applications
+    if app_versions:
+        try:
+            static["running_applications"] = _collect_running_applications()
+        except Exception:
+            static["running_applications"] = None
+
     return static
 
 
@@ -402,20 +464,26 @@ def collect_dynamic_metrics(wifi_metrics: bool = True) -> dict:
     return dynamic
 
 
-def save_metrics(capture_dir: Path, phase: str, wifi_metrics: bool = True) -> None:
+def save_metrics(
+    capture_dir: Path,
+    phase: str,
+    wifi_metrics: bool = True,
+    app_versions: bool = True,
+) -> None:
     """Collect and write/update system_metrics.json in the recording directory.
 
     Args:
         capture_dir: Path to the recording directory.
         phase: "start" or "end".
         wifi_metrics: Whether to collect WiFi metrics.
+        app_versions: Whether to collect running application versions.
     """
     metrics_path = capture_dir / METRICS_FILENAME
 
     if phase == "start":
         data = {
             "schema_version": SCHEMA_VERSION,
-            "static": collect_static_metrics(wifi_metrics=wifi_metrics),
+            "static": collect_static_metrics(wifi_metrics=wifi_metrics, app_versions=app_versions),
             "start": collect_dynamic_metrics(wifi_metrics=wifi_metrics),
             "end": None,
         }

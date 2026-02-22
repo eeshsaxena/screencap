@@ -59,6 +59,15 @@ def get_wifi_metrics() -> bool:
     return cfg.get("wifi_metrics", True)
 
 
+def get_app_versions() -> bool:
+    """Return whether running-application version capture is enabled (True = on)."""
+    env = os.environ.get("SCREENCAP_APP_VERSIONS")
+    if env is not None:
+        return env.lower() in ("1", "true", "yes")
+    cfg = _load_toml()
+    return cfg.get("app_versions", True)
+
+
 def get_base_dir() -> Path:
     """Return ~/.screencap/, creating it if needed."""
     _DEFAULT_BASE.mkdir(parents=True, exist_ok=True)
