@@ -126,7 +126,8 @@ def remove_redundant_mouse_move_events(events: list[ActionEvent]) -> list[Action
     """
 
     def is_same_position(e1: MouseMoveEvent, e2: MouseMoveEvent) -> bool:
-        return e1.x == e2.x and e1.y == e2.y
+        # Holding a stylus still while varying pressure is NOT redundant
+        return e1.x == e2.x and e1.y == e2.y and e1.pressure == e2.pressure
 
     result = []
     prev_move: MouseMoveEvent | None = None
@@ -243,13 +244,14 @@ def merge_consecutive_mouse_move_events(events: list[ActionEvent]) -> list[Actio
         if len(move_buffer) == 1:
             result.append(move_buffer[0])
         else:
-            # Create merged move event with final position
+            # Create merged move event with final position and last pressure
             first = move_buffer[0]
             last = move_buffer[-1]
             merged = MouseMoveEvent(
                 timestamp=first.timestamp,
                 x=last.x,
                 y=last.y,
+                pressure=last.pressure,
             )
             result.append(merged)
 
@@ -480,12 +482,13 @@ def merge_consecutive_mouse_click_events(
                     if next_down.timestamp in down_to_up:
                         next_up = down_to_up[next_down.timestamp]
 
-                        # Create double-click
+                        # Create double-click (pressure from first down event)
                         double_click = MouseDoubleClickEvent(
                             timestamp=down.timestamp,
                             x=down.x,
                             y=down.y,
                             button=down.button,
+                            pressure=down.pressure,
                             children=[down, up, next_down, next_up],
                         )
                         result.append(double_click)
@@ -494,12 +497,13 @@ def merge_consecutive_mouse_click_events(
                         skip_timestamps.add(next_up.timestamp)
                         continue
 
-                # Create single click
+                # Create single click (pressure from down event)
                 single_click = MouseClickEvent(
                     timestamp=down.timestamp,
                     x=down.x,
                     y=down.y,
                     button=down.button,
+                    pressure=down.pressure,
                     children=[down, up],
                 )
                 result.append(single_click)
