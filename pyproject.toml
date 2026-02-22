@@ -31,6 +31,7 @@ dependencies = [
     "pympler>=1.0.0",
     "tqdm>=4.0.0",
     "numpy>=1.20.0",
+    "faster-whisper>=1.1.0",
     "magic-wormhole>=0.17.0",
     "requests>=2.28.0",
     "oa-atomacos>=3.2.0; sys_platform == 'darwin'",
