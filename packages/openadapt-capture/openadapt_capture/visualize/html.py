@@ -359,7 +359,7 @@ def _generate_html(
     --border:rgba(255,255,255,0.06); --border-hi:rgba(255,255,255,0.12);
     --text-1:#eeeef0; --text-2:#9ea0ad; --text-3:#686a7a;
     --accent:#d4943a; --accent-dim:rgba(212,148,58,0.12); --accent-hover:#e0a448;
-    --ev-click:#ef5350; --ev-drag:#4caf50; --ev-scroll:#ab47bc; --ev-type:#42a5f5; --ev-move:#717380; --ev-magnify:#00bcd4; --ev-rotate:#ff9800;
+    --ev-click:#ef5350; --ev-drag:#4caf50; --ev-scroll:#ab47bc; --ev-type:#42a5f5; --ev-move:#717380; --ev-magnify:#00bcd4; --ev-rotate:#ff9800; --ev-smart-magnify:#26a69a;
     --radius:10px; --radius-sm:6px;
 }}
 *{{ box-sizing:border-box; margin:0; padding:0; }}
@@ -597,6 +597,7 @@ function formatTime(s){{ const m=Math.floor(s/60); const sc=(s%60).toFixed(2).pa
 
 function getTypeColor(t){{
     t=t.toLowerCase();
+    if(t.includes('smart_magnify'))return'var(--ev-smart-magnify)';
     if(t.includes('magnify'))return'var(--ev-magnify)';
     if(t.includes('rotate'))return'var(--ev-rotate)';
     if(t.includes('click'))return'var(--ev-click)';
@@ -609,6 +610,7 @@ function getTypeColor(t){{
 
 function getEventIcon(t){{
     const lo=t.toLowerCase();
+    if(lo.includes('smart_magnify'))return'\u29BF';
     if(lo.includes('magnify'))return'\u2316';
     if(lo.includes('rotate'))return'\u21BB';
     if(lo.includes('click'))return'\u25CE';
@@ -625,6 +627,7 @@ function getEventLabel(t){{
     const lo=t.toLowerCase();
     if(lo==='recording.start')return'Start';
     if(lo==='recording.end')return'End';
+    if(lo.includes('smart_magnify'))return'Smart Zoom';
     if(lo.includes('magnify'))return'Zoom';
     if(lo.includes('rotate'))return'Rotate';
     if(lo.includes('doubleclick'))return'Double Click';
@@ -850,6 +853,23 @@ function drawOverlay(ev){{
             const aY=dy>0?-25:25;
             overlayCtx.beginPath();overlayCtx.moveTo(x,y+aY);overlayCtx.lineTo(x-8,y+aY+(dy>0?10:-10));overlayCtx.lineTo(x+8,y+aY+(dy>0?10:-10));overlayCtx.closePath();overlayCtx.fillStyle='#ab47bc';overlayCtx.fill();
         }}
+    }}else if(type.includes('smart_magnify')){{
+        const x=oX+(ev.x*sX),y=oY+(ev.y*sY);
+        const r=25;
+        /* Pulsing circle */
+        overlayCtx.beginPath();overlayCtx.arc(x,y,r+15,0,Math.PI*2);overlayCtx.strokeStyle='rgba(38,166,154,0.3)';overlayCtx.lineWidth=2;overlayCtx.stroke();
+        overlayCtx.beginPath();overlayCtx.arc(x,y,r,0,Math.PI*2);overlayCtx.strokeStyle='#26a69a';overlayCtx.lineWidth=3;overlayCtx.stroke();
+        /* Crosshair */
+        overlayCtx.beginPath();
+        overlayCtx.moveTo(x-r-8,y);overlayCtx.lineTo(x-6,y);
+        overlayCtx.moveTo(x+6,y);overlayCtx.lineTo(x+r+8,y);
+        overlayCtx.moveTo(x,y-r-8);overlayCtx.lineTo(x,y-6);
+        overlayCtx.moveTo(x,y+6);overlayCtx.lineTo(x,y+r+8);
+        overlayCtx.strokeStyle='#26a69a';overlayCtx.lineWidth=2;overlayCtx.stroke();
+        /* Center dot */
+        overlayCtx.beginPath();overlayCtx.arc(x,y,4,0,Math.PI*2);overlayCtx.fillStyle='#26a69a';overlayCtx.fill();
+        /* Label */
+        overlayCtx.font='bold 13px sans-serif';overlayCtx.fillStyle='#26a69a';overlayCtx.fillText('Smart Zoom',x+r+12,y+5);
     }}else if(type.includes('magnify')){{
         const x=oX+(ev.x*sX),y=oY+(ev.y*sY);
         const mag=ev.magnification||0;

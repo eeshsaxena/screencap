@@ -19,6 +19,7 @@ from openadapt_capture.events import (
     MouseMoveEvent,
     MouseRotateEvent,
     MouseScrollEvent,
+    MouseSmartMagnifyEvent,
     MouseUpEvent,
     WindowStateEvent,
 )
@@ -674,6 +675,134 @@ class TestGestureEventTypes:
         assert len(result) == 2
         assert isinstance(result[0], MouseMagnifyEvent)
         assert isinstance(result[1], MouseRotateEvent)
+
+
+# =============================================================================
+# Test: SmartMagnify Event Types
+# =============================================================================
+
+class TestSmartMagnifyEventTypes:
+    """Tests for MouseSmartMagnifyEvent (two-finger double-tap zoom toggle)."""
+
+    def test_smart_magnify_event_creation(self):
+        """MouseSmartMagnifyEvent can be instantiated with correct fields."""
+        ev = MouseSmartMagnifyEvent(timestamp=1.0, x=500, y=300)
+        assert ev.type == "mouse.smart_magnify"
+        assert ev.x == 500
+        assert ev.y == 300
+
+    def test_smart_magnify_serialization_roundtrip(self):
+        """MouseSmartMagnifyEvent survives model_dump / model_validate."""
+        ev = MouseSmartMagnifyEvent(timestamp=1.0, x=500, y=300)
+        data = ev.model_dump()
+        restored = MouseSmartMagnifyEvent.model_validate(data)
+        assert restored.type == "mouse.smart_magnify"
+        assert restored.x == 500
+        assert restored.y == 300
+        assert restored.timestamp == 1.0
+
+    def test_smart_magnify_passes_through_pipeline(self, ts):
+        """SmartMagnify events survive all pipeline steps."""
+        events = [
+            MouseMoveEvent(timestamp=ts.next(), x=100, y=100),
+            MouseSmartMagnifyEvent(timestamp=ts.next(), x=200, y=200),
+            MouseMoveEvent(timestamp=ts.next(), x=300, y=300),
+        ]
+        result = process_events(events)
+
+        smart_events = [e for e in result if isinstance(e, MouseSmartMagnifyEvent)]
+        assert len(smart_events) == 1
+        assert smart_events[0].x == 200
+        assert smart_events[0].y == 200
+
+    def test_smart_magnify_not_merged(self, ts):
+        """Two consecutive SmartMagnify events remain two separate events."""
+        events = [
+            MouseSmartMagnifyEvent(timestamp=ts.next(), x=100, y=100),
+            MouseSmartMagnifyEvent(timestamp=ts.next(), x=100, y=100),
+        ]
+        result = process_events(events)
+
+        smart_events = [e for e in result if isinstance(e, MouseSmartMagnifyEvent)]
+        assert len(smart_events) == 2
+
+    def test_smart_magnify_in_drag_siblings(self, ts):
+        """SmartMagnify is tolerated during drag detection (included as sibling)."""
+        dist = DRAG_DISTANCE_THRESHOLD + 20
+        events = [
+            MouseDownEvent(timestamp=ts.next(), x=100, y=100, button=MouseButton.LEFT),
+            MouseMoveEvent(timestamp=ts.next(), x=100 + dist, y=100),
+            MouseSmartMagnifyEvent(timestamp=ts.next(), x=100 + dist, y=100),
+            MouseUpEvent(timestamp=ts.next(), x=100 + dist, y=100, button=MouseButton.LEFT),
+        ]
+        result = detect_drag_events(events)
+
+        drags = [e for e in result if isinstance(e, MouseDragEvent)]
+        assert len(drags) == 1
+        # SmartMagnify should be in the drag's children
+        smart_children = [c for c in drags[0].children if isinstance(c, MouseSmartMagnifyEvent)]
+        assert len(smart_children) == 1
+
+    def test_smart_magnify_in_get_action_events(self, ts):
+        """SmartMagnify included in get_action_events output."""
+        from openadapt_capture.processing import get_action_events
+
+        events = [
+            MouseSmartMagnifyEvent(timestamp=ts.next(), x=100, y=100),
+            MouseMagnifyEvent(timestamp=ts.next(), x=100, y=100, magnification=0.05),
+        ]
+        result = get_action_events(events)
+
+        assert len(result) == 2
+        assert isinstance(result[0], MouseSmartMagnifyEvent)
+        assert isinstance(result[1], MouseMagnifyEvent)
+
+    def test_smart_magnify_db_roundtrip(self, tmp_path):
+        """SmartMagnify events persist through CaptureStorage write/read."""
+        from openadapt_capture.storage import Capture, CaptureStorage
+
+        db_path = tmp_path / "test.db"
+        storage = CaptureStorage(db_path)
+        capture = Capture(
+            id="test", started_at=0.0, platform="darwin",
+            screen_width=1920, screen_height=1080,
+        )
+        storage.init_capture(capture)
+
+        ev = MouseSmartMagnifyEvent(timestamp=1.0, x=500, y=300)
+        storage.write_event(ev)
+
+        events = storage.get_events()
+        assert len(events) == 1
+        assert isinstance(events[0], MouseSmartMagnifyEvent)
+        assert events[0].x == 500
+        assert events[0].y == 300
+        storage.close()
+
+    def test_convert_action_event_smart_magnify(self):
+        """Legacy DB conversion handles smart_magnify events."""
+        from unittest.mock import MagicMock
+        from openadapt_capture.capture import _convert_action_event
+
+        db_event = MagicMock()
+        db_event.name = "smart_magnify"
+        db_event.timestamp = 1.0
+        db_event.mouse_x = 500
+        db_event.mouse_y = 300
+
+        result = _convert_action_event(db_event)
+        assert isinstance(result, MouseSmartMagnifyEvent)
+        assert result.x == 500.0
+        assert result.y == 300.0
+
+    def test_event_type_map_includes_all_gestures(self):
+        """EVENT_TYPE_MAP includes magnify, rotate, and smart_magnify."""
+        from openadapt_capture.events import EventType
+        from openadapt_capture.storage import EVENT_TYPE_MAP
+
+        assert EventType.MOUSE_MAGNIFY.value in EVENT_TYPE_MAP
+        assert EventType.MOUSE_ROTATE.value in EVENT_TYPE_MAP
+        assert EventType.MOUSE_SMART_MAGNIFY.value in EVENT_TYPE_MAP
 
 
 # =============================================================================

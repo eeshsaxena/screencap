@@ -27,6 +27,7 @@ from openadapt_capture.storage.sqlite import SQLiteStorage
 
 # Re-export from the original storage module for backward compatibility
 from openadapt_capture.storage_impl import (
+    EVENT_TYPE_MAP,
     Capture,
     CaptureStorage,
     Stream,
@@ -56,6 +57,8 @@ __all__ = [
     # Data models
     "Capture",
     "Stream",
+    # Mappings
+    "EVENT_TYPE_MAP",
     # Convenience functions
     "create_capture",
     "load_capture",

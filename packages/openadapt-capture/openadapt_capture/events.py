@@ -23,6 +23,7 @@ class EventType(str, Enum):
     MOUSE_SCROLL = "mouse.scroll"
     MOUSE_MAGNIFY = "mouse.magnify"
     MOUSE_ROTATE = "mouse.rotate"
+    MOUSE_SMART_MAGNIFY = "mouse.smart_magnify"
 
     # Keyboard events (raw)
     KEY_DOWN = "key.down"
@@ -147,6 +148,19 @@ class MouseRotateEvent(BaseEvent):
     x: float = Field(description="Cursor X position in pixels")
     y: float = Field(description="Cursor Y position in pixels")
     rotation: float = Field(description="Rotation in degrees, positive = CCW")
+
+
+class MouseSmartMagnifyEvent(BaseEvent):
+    """Two-finger double-tap zoom toggle (macOS SmartMagnify).
+
+    Corresponds to macOS NSEventTypeSmartMagnify (type 32).
+    This is a discrete toggle event — it zooms to fit a region
+    then zooms back out. No delta or direction is available.
+    """
+
+    type: Literal[EventType.MOUSE_SMART_MAGNIFY] = EventType.MOUSE_SMART_MAGNIFY
+    x: float = Field(description="Cursor X position in pixels")
+    y: float = Field(description="Cursor Y position in pixels")
 
 
 # =============================================================================
@@ -301,7 +315,7 @@ class MouseDragEvent(BaseEvent):
     children: list[
         MouseDownEvent | MouseMoveEvent | MouseUpEvent
         | MouseScrollEvent | KeyDownEvent | KeyUpEvent | KeyTypeEvent
-        | MouseMagnifyEvent | MouseRotateEvent
+        | MouseMagnifyEvent | MouseRotateEvent | MouseSmartMagnifyEvent
     ] = Field(
         default_factory=list, description="Child events that were merged"
     )
@@ -332,6 +346,7 @@ ActionEvent = (
     | MouseScrollEvent
     | MouseMagnifyEvent
     | MouseRotateEvent
+    | MouseSmartMagnifyEvent
     | KeyDownEvent
     | KeyUpEvent
     | MouseClickEvent
