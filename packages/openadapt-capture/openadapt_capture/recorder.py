@@ -679,6 +679,8 @@ def on_move(event_q: queue.Queue, x: int, y: int, injected: bool = False) -> Non
         data = {"name": "move", "mouse_x": x, "mouse_y": y}
         if _current_pressure > 0.0:
             data["mouse_pressure"] = _current_pressure
+        if _current_modifier_flags:
+            data["modifier_flags"] = _current_modifier_flags
         trigger_action_event(event_q, data)
 
 
@@ -714,6 +716,8 @@ def on_click(
         }
         if _current_pressure > 0.0:
             data["mouse_pressure"] = _current_pressure
+        if _current_modifier_flags:
+            data["modifier_flags"] = _current_modifier_flags
         trigger_action_event(event_q, data)
 
 
@@ -740,16 +744,22 @@ def on_scroll(
     """
     logger.debug(f"{x=} {y=} {dx=} {dy=} {injected=}")
     if not injected:
-        trigger_action_event(
-            event_q,
-            {
-                "name": "scroll",
-                "mouse_x": x,
-                "mouse_y": y,
-                "mouse_dx": dx,
-                "mouse_dy": dy,
-            },
-        )
+        data = {
+            "name": "scroll",
+            "mouse_x": x,
+            "mouse_y": y,
+            "mouse_dx": dx,
+            "mouse_dy": dy,
+        }
+        if _current_modifier_flags:
+            data["modifier_flags"] = _current_modifier_flags
+        if _current_scroll_phase:
+            data["scroll_phase"] = _current_scroll_phase
+        if _current_momentum_phase:
+            data["momentum_phase"] = _current_momentum_phase
+        if _current_is_continuous:
+            data["is_continuous"] = _current_is_continuous
+        trigger_action_event(event_q, data)
 
 
 def handle_key(
@@ -1190,6 +1200,10 @@ def read_mouse_events(
 # Shared pressure state: written by gesture tap, read by pynput callbacks.
 # Python's GIL makes float reads/writes atomic; no lock needed.
 _current_pressure: float = 0.0
+_current_modifier_flags: int = 0
+_current_scroll_phase: int = 0
+_current_momentum_phase: int = 0
+_current_is_continuous: bool = False
 
 
 def read_gesture_events(
@@ -1240,19 +1254,23 @@ def read_gesture_events(
         Quartz.CGEventMaskBit(29)  |    # NSEventTypeGesture
         Quartz.CGEventMaskBit(1)   |    # kCGEventLeftMouseDown
         Quartz.CGEventMaskBit(2)   |    # kCGEventLeftMouseUp
+        Quartz.CGEventMaskBit(3)   |    # kCGEventRightMouseDown
+        Quartz.CGEventMaskBit(4)   |    # kCGEventRightMouseUp
         Quartz.CGEventMaskBit(5)   |    # kCGEventMouseMoved
         Quartz.CGEventMaskBit(6)   |    # kCGEventLeftMouseDragged
+        Quartz.CGEventMaskBit(7)   |    # kCGEventRightMouseDragged
+        Quartz.CGEventMaskBit(8)   |    # kCGEventScrollWheel
         Quartz.CGEventMaskBit(25)  |    # kCGEventOtherMouseDown
         Quartz.CGEventMaskBit(26)  |    # kCGEventOtherMouseUp
-        Quartz.CGEventMaskBit(27)       # kCGEventOtherMouseMoved
+        Quartz.CGEventMaskBit(27)       # kCGEventOtherMouseDragged
     )
 
     run_loop_ref = [None]  # mutable container for the CFRunLoop reference
 
     # CGEvent types for mouse events used in pressure extraction
-    _MOUSE_EVENT_TYPES = {1, 2, 5, 6, 25, 26, 27}
+    _MOUSE_EVENT_TYPES = {1, 2, 3, 4, 5, 6, 7, 25, 26, 27}
     # Mouse up types — reset pressure after release
-    _MOUSE_UP_TYPES = {2, 26}  # kCGEventLeftMouseUp, kCGEventOtherMouseUp
+    _MOUSE_UP_TYPES = {2, 4, 26}  # kCGEventLeftMouseUp, kCGEventRightMouseUp, kCGEventOtherMouseUp
 
     def gesture_callback(_proxy, event_type, cg_event, _refcon):
         """CGEventTap callback — converts CGEvent to NSEvent and enqueues.
@@ -1260,7 +1278,7 @@ def read_gesture_events(
         Handles both gesture events (magnify, rotate, swipe) and mouse events
         (for pressure extraction from Force Touch trackpads and tablets).
         """
-        global _current_pressure
+        global _current_pressure, _current_modifier_flags, _current_scroll_phase, _current_momentum_phase, _current_is_continuous
         try:
             ns_event = NSEvent.eventWithCGEvent_(cg_event)
             if ns_event is None:
@@ -1329,9 +1347,16 @@ def read_gesture_events(
                     },
                 )
 
+            elif event_type == 8:  # kCGEventScrollWheel
+                _current_modifier_flags = Quartz.CGEventGetFlags(cg_event)
+                _current_scroll_phase = Quartz.CGEventGetIntegerValueField(cg_event, 99)
+                _current_momentum_phase = Quartz.CGEventGetIntegerValueField(cg_event, 123)
+                _current_is_continuous = bool(Quartz.CGEventGetIntegerValueField(cg_event, 88))
+
             elif event_type in _MOUSE_EVENT_TYPES:
-                # Mouse event — extract pressure for shared state.
-                # pynput's callbacks read _current_pressure to include in event data.
+                # Mouse event — extract pressure and modifier flags for shared state.
+                # pynput's callbacks read these globals to include in event data.
+                _current_modifier_flags = Quartz.CGEventGetFlags(cg_event)
                 if event_type in _MOUSE_UP_TYPES:
                     # Reset immediately on mouse-up so pynput's callback
                     # doesn't read stale pressure from the previous down/drag.
@@ -1718,7 +1743,8 @@ def record(
             _ = (_q.CGEventTapCreate, _q.CGEventMaskBit, _q.kCGSessionEventTap,
                  _q.kCGHeadInsertEventTap, _q.kCGEventTapOptionListenOnly,
                  _q.CGEventTapEnable, _q.CGEventTapIsEnabled,
-                 _q.CGEventGetLocation, _q.CFAbsoluteTimeGetCurrent)
+                 _q.CGEventGetLocation, _q.CFAbsoluteTimeGetCurrent,
+                 _q.CGEventGetFlags, _q.CGEventGetIntegerValueField)
             _ = _ns.eventWithCGEvent_
         except (ImportError, AttributeError):
             pass  # pyobjc not available; gesture capture will be skipped

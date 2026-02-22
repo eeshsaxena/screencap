@@ -83,6 +83,7 @@ class MouseMoveEvent(BaseEvent):
     x: float = Field(description="Mouse X position in pixels")
     y: float = Field(description="Mouse Y position in pixels")
     pressure: float | None = Field(default=None, description="Pressure 0.0-1.0, None if unsupported")
+    modifier_flags: int | None = Field(default=None, description="Active modifier bitmask from CGEventGetFlags")
 
 
 class MouseDownEvent(BaseEvent):
@@ -96,6 +97,7 @@ class MouseDownEvent(BaseEvent):
     y: float = Field(description="Mouse Y position in pixels")
     button: MouseButton = Field(description="Mouse button name")
     pressure: float | None = Field(default=None, description="Pressure 0.0-1.0, None if unsupported")
+    modifier_flags: int | None = Field(default=None, description="Active modifier bitmask from CGEventGetFlags")
 
 
 class MouseUpEvent(BaseEvent):
@@ -109,6 +111,7 @@ class MouseUpEvent(BaseEvent):
     y: float = Field(description="Mouse Y position in pixels")
     button: MouseButton = Field(description="Mouse button name")
     pressure: float | None = Field(default=None, description="Pressure 0.0-1.0, None if unsupported")
+    modifier_flags: int | None = Field(default=None, description="Active modifier bitmask from CGEventGetFlags")
 
 
 class MouseScrollEvent(BaseEvent):
@@ -122,6 +125,10 @@ class MouseScrollEvent(BaseEvent):
     y: float = Field(description="Mouse Y position in pixels")
     dx: float = Field(description="Horizontal scroll delta")
     dy: float = Field(description="Vertical scroll delta")
+    modifier_flags: int | None = Field(default=None, description="Active modifier bitmask from CGEventGetFlags")
+    scroll_phase: int | None = Field(default=None, description="Scroll phase (1=began, 2=changed, 128=ended)")
+    momentum_phase: int | None = Field(default=None, description="Momentum phase (0=none, 1=begin, 2=continue, 3=end)")
+    is_continuous: bool | None = Field(default=None, description="True=trackpad continuous, False=mouse wheel discrete")
 
 
 class MouseMagnifyEvent(BaseEvent):
@@ -275,6 +282,7 @@ class MouseClickEvent(BaseEvent):
     y: float = Field(description="Mouse Y position in pixels")
     button: MouseButton = Field(description="Mouse button name")
     pressure: float | None = Field(default=None, description="Pressure from down event, 0.0-1.0")
+    modifier_flags: int | None = Field(default=None, description="Modifier flags from down event")
     children: list[MouseDownEvent | MouseUpEvent] = Field(
         default_factory=list, description="Child events that were merged"
     )
@@ -292,6 +300,7 @@ class MouseDoubleClickEvent(BaseEvent):
     y: float = Field(description="Mouse Y position in pixels")
     button: MouseButton = Field(description="Mouse button name")
     pressure: float | None = Field(default=None, description="Pressure from first down event, 0.0-1.0")
+    modifier_flags: int | None = Field(default=None, description="Modifier flags from first down event")
     children: list[MouseDownEvent | MouseUpEvent] = Field(
         default_factory=list, description="Child events that were merged"
     )
