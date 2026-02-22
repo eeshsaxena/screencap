@@ -1316,22 +1316,23 @@ def read_gesture_events(
             elif event_type in _MOUSE_EVENT_TYPES:
                 # Mouse event — extract pressure for shared state.
                 # pynput's callbacks read _current_pressure to include in event data.
-                pressure = 0.0
-
-                # Check tablet pressure first (CGEvent field 19 = kCGTabletEventPointPressure)
-                subtype = Quartz.CGEventGetIntegerValueField(cg_event, 7)  # kCGMouseEventSubtype
-                if subtype == 1:  # kCGEventMouseSubtypeTabletPoint
-                    pressure = Quartz.CGEventGetDoubleValueField(cg_event, 19)
-
-                # Fall back to NSEvent.pressure() (Force Touch trackpad)
-                if pressure == 0.0:
-                    pressure = ns_event.pressure()
-
-                _current_pressure = pressure
-
-                # Reset on mouse up to avoid stale pressure
                 if event_type in _MOUSE_UP_TYPES:
+                    # Reset immediately on mouse-up so pynput's callback
+                    # doesn't read stale pressure from the previous down/drag.
                     _current_pressure = 0.0
+                else:
+                    pressure = 0.0
+
+                    # Check tablet pressure first (CGEvent field 19 = kCGTabletEventPointPressure)
+                    subtype = Quartz.CGEventGetIntegerValueField(cg_event, 7)  # kCGMouseEventSubtype
+                    if subtype == 1:  # kCGEventMouseSubtypeTabletPoint
+                        pressure = Quartz.CGEventGetDoubleValueField(cg_event, 19)
+
+                    # Fall back to NSEvent.pressure() (Force Touch trackpad)
+                    if pressure == 0.0:
+                        pressure = ns_event.pressure()
+
+                    _current_pressure = pressure
 
         except Exception:
             # Never let exceptions escape a C callback
