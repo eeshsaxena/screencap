@@ -450,3 +450,86 @@ def test_start_local_only_flag(tmp_path):
     if mock_namer.called:
         _, kwargs = mock_namer.call_args
         assert kwargs.get("local_only") is True
+
+
+# --- missing [record] extras tests ---
+
+
+def _import_error(name, *args, **kwargs):
+    """Simulate missing recording deps by raising ImportError for specific modules."""
+    raise ImportError(f"No module named '{name}'")
+
+
+def test_start_missing_record_deps():
+    """start should show helpful message when recording deps are missing."""
+    runner = CliRunner()
+    import builtins
+    original_import = builtins.__import__
+
+    def fake_import(name, *args, **kwargs):
+        if name == "screencap.recorder":
+            raise ImportError("No module named 'psutil'")
+        return original_import(name, *args, **kwargs)
+
+    with mock.patch("builtins.__import__", side_effect=fake_import):
+        result = runner.invoke(cli, ["start", "--name", "test"])
+    assert result.exit_code == 1
+    assert "recording dependencies" in result.output
+    assert "pip install screencap[record]" in result.output
+
+
+def test_stop_missing_record_deps():
+    """stop should show helpful message when recording deps are missing."""
+    runner = CliRunner()
+    import builtins
+    original_import = builtins.__import__
+
+    def fake_import(name, *args, **kwargs):
+        if name == "screencap.pidfile":
+            raise ImportError("No module named 'psutil'")
+        return original_import(name, *args, **kwargs)
+
+    with mock.patch("builtins.__import__", side_effect=fake_import):
+        result = runner.invoke(cli, ["stop"])
+    assert result.exit_code == 1
+    assert "recording dependencies" in result.output
+    assert "pip install screencap[record]" in result.output
+
+
+def test_info_missing_record_deps(tmp_path):
+    """info should show helpful message when recording deps are missing."""
+    runner = CliRunner()
+    import builtins
+    original_import = builtins.__import__
+
+    def fake_import(name, *args, **kwargs):
+        if name == "screencap.metrics":
+            raise ImportError("No module named 'mss'")
+        return original_import(name, *args, **kwargs)
+
+    with mock.patch("builtins.__import__", side_effect=fake_import):
+        result = runner.invoke(cli, ["info", "some-recording"])
+    assert result.exit_code == 1
+    assert "recording dependencies" in result.output
+    assert "pip install screencap[record]" in result.output
+
+
+def test_download_works_without_record_deps(tmp_path):
+    """download should work even without [record] extras installed."""
+    runner = CliRunner()
+    # download only needs requests + rich, both in base deps
+    with mock.patch(
+        "screencap.download.list_remote_recordings", return_value=[]
+    ):
+        result = runner.invoke(cli, ["download"])
+    assert result.exit_code == 0
+    assert "No recordings" in result.output
+
+
+def test_list_works_without_record_deps(tmp_path):
+    """list should work even without [record] extras installed."""
+    runner = CliRunner()
+    with mock.patch("screencap.catalog.get_recordings_dir", return_value=tmp_path):
+        result = runner.invoke(cli, ["list"])
+    assert result.exit_code == 0
+    assert "No recordings" in result.output
