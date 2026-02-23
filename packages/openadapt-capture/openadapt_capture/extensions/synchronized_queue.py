@@ -72,7 +72,11 @@ class SynchronizedQueue(Queue):
     """
 
     def __init__(self, maxsize: int = 0) -> None:
-        """Initialize the synchronized queue."""
+        """Initialize the synchronized queue.
+
+        Args:
+            maxsize: Upper bound on items in the queue (0 = unlimited).
+        """
         super().__init__(maxsize=maxsize, ctx=multiprocessing.get_context())
         self.size = SharedCounter(0)
 
