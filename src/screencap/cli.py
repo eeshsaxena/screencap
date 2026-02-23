@@ -241,7 +241,7 @@ def view(name, scrubbed):
 @click.option("--json", "as_json", is_flag=True, help="Output as JSON.")
 def info(name, as_json):
     """Show details and system metrics for a recording."""
-    from screencap.catalog import find_db, _read_recording_meta
+    from screencap.catalog import find_db, read_drops, _read_recording_meta
     from screencap.config import get_recordings_dir
     from screencap.metrics import METRICS_FILENAME
 
@@ -265,14 +265,7 @@ def info(name, as_json):
             rec_meta["duration"] = f"{h}h {m}m {s}s" if h else f"{m}m {s}s"
 
     # Read drop counts
-    profiling_path = recording_dir / "profiling.json"
-    drops = None
-    if profiling_path.exists():
-        try:
-            profiling = json.loads(profiling_path.read_text())
-            drops = profiling.get("drops")
-        except (json.JSONDecodeError, OSError):
-            pass
+    drops = read_drops(recording_dir)
 
     # Read metrics
     metrics_path = recording_dir / METRICS_FILENAME
@@ -298,7 +291,7 @@ def info(name, as_json):
     else:
         console.print("  [dim]No recording metadata available.[/dim]")
 
-    if drops and any(v > 0 for v in drops.values()):
+    if isinstance(drops, dict) and any(v > 0 for v in drops.values()):
         console.print(f"\n  [yellow]Events dropped during recording:[/yellow]")
         for event_type, count in drops.items():
             if count > 0:

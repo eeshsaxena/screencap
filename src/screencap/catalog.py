@@ -43,7 +43,7 @@ def _dir_size_mb(p: Path) -> str:
     return f"{total / (1024 * 1024):.1f} MB"
 
 
-def _read_drops(directory: Path) -> dict[str, int] | None:
+def read_drops(directory: Path) -> dict[str, int] | None:
     """Read event drop counts from profiling.json, if present."""
     profiling = directory / "profiling.json"
     if not profiling.exists():
@@ -51,7 +51,7 @@ def _read_drops(directory: Path) -> dict[str, int] | None:
     try:
         data = json.loads(profiling.read_text())
         drops = data.get("drops")
-        if drops and any(v > 0 for v in drops.values()):
+        if isinstance(drops, dict) and any(v > 0 for v in drops.values()):
             return drops
     except Exception:
         pass
@@ -145,7 +145,7 @@ def list_recordings(recordings_dir: Path | None = None) -> list[RecordingInfo]:
         transcribed = (d / "transcript.txt").exists()
         uploaded = (d / ".upload_status.json").is_file()
 
-        drops = _read_drops(d)
+        drops = read_drops(d)
 
         results.append(
             RecordingInfo(

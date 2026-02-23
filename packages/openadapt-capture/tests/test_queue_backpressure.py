@@ -232,3 +232,54 @@ class TestTriggerActionEvent:
         event = event_q.get_nowait()
         assert event.type == "action"
         assert event.data["name"] == "click"
+
+
+# ── Drop counting ────────────────────────────────────────────────────────────
+
+
+class TestDropCounting:
+    """Test that drop counters are incremented for all event types."""
+
+    def test_action_drop_counted(self):
+        """Non-move action drops should be counted in _drop_counts."""
+        import openadapt_capture.recorder as rec
+
+        rec._drop_counts = {}
+        event_q = queue.Queue(maxsize=1)
+        event_q.put("filler")
+
+        rec.trigger_action_event(event_q, {"name": "click", "mouse_x": 0, "mouse_y": 0})
+        assert rec._drop_counts.get("action", 0) == 1
+
+    def test_move_drop_not_counted(self):
+        """Mouse move drops are silent and should not be counted."""
+        import openadapt_capture.recorder as rec
+
+        rec._drop_counts = {}
+        event_q = queue.Queue(maxsize=1)
+        event_q.put("filler")
+
+        rec.trigger_action_event(event_q, {"name": "move", "mouse_x": 0, "mouse_y": 0})
+        assert rec._drop_counts.get("action", 0) == 0
+
+    def test_process_event_drop_not_in_drop_counts(self):
+        """process_event uses local _drops — module _drop_counts stays clean."""
+        import openadapt_capture.recorder as rec
+
+        rec._drop_counts = {}
+        write_q = SynchronizedQueue(maxsize=1)
+        perf_q = SynchronizedQueue()
+        write_q.put("filler")
+
+        event = Event(1.0, "action", {"name": "click"})
+        result = rec.process_event(
+            event, write_q, mock.MagicMock(), mock.MagicMock(), perf_q
+        )
+        assert result is False
+        # process_event itself does not touch _drop_counts
+        # (process_events is responsible for counting via its local _drops)
+        assert rec._drop_counts == {}
+        write_q.close()
+        write_q.join_thread()
+        perf_q.close()
+        perf_q.join_thread()

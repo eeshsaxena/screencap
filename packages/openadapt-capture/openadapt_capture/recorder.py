@@ -204,7 +204,6 @@ def process_events(
     num_window_events: multiprocessing.Value,
     num_browser_events: multiprocessing.Value,
     num_video_events: multiprocessing.Value,
-    drop_counts: Optional[dict] = None,
 ) -> None:
     """Process events from the event queue and write them to write queues.
 
@@ -224,8 +223,6 @@ def process_events(
         num_window_events: A counter for the number of window events.
         num_browser_events: A counter for the number of browser events.
         num_video_events: A counter for the number of video events.
-        drop_counts: Mutable dict populated with drop counts by event type.
-            Caller (record()) is responsible for persisting to profiling.json.
     """
     utils.set_start_time(recording.timestamp)
 
@@ -286,18 +283,23 @@ def process_events(
                     terminate_processing,
                 ):
                     num_video_events.value += 1
+                else:
+                    _drops["full_video"] += 1
         elif event.type == "window":
             prev_window_event = event
         elif event.type == "browser":
             if config.RECORD_BROWSER_EVENTS:
-                process_event(
+                if process_event(
                     event,
                     browser_write_q,
                     write_browser_event,
                     recording,
                     perf_q,
                     terminate_processing,
-                )
+                ):
+                    num_browser_events.value += 1
+                else:
+                    _drops["browser"] += 1
         elif event.type == "action":
             if prev_screen_event is None:
                 logger.warning("Discarding action that came before screen")
@@ -385,11 +387,11 @@ def process_events(
         del prev_event
         prev_event = event
 
-    # Export drop counts to caller via shared dict
+    # Export drop counts to module-level dict for record() to persist
     if any(_drops.values()):
         logger.warning(f"Events dropped during recording: {dict(_drops)}")
-        if drop_counts is not None:
-            drop_counts.update(_drops)
+        for k, v in _drops.items():
+            _drop_counts[k] = _drop_counts.get(k, 0) + v
 
     logger.info("Done")
 
@@ -714,6 +716,7 @@ def trigger_action_event(
         try:
             event_q.put(event, timeout=0.05)
         except queue.Full:
+            _drop_counts["action"] = _drop_counts.get("action", 0) + 1
             # Only log action_name (event type), never action_event_args
             # (contains keystrokes, coordinates, and other user input data)
             logger.warning(f"event_q full, dropping {action_name} action event")
@@ -895,6 +898,7 @@ def read_screen_events(
         try:
             event_q.put(Event(utils.get_timestamp(), "screen", screenshot), timeout=0.5)
         except queue.Full:
+            _drop_counts["screen"] = _drop_counts.get("screen", 0) + 1
             logger.debug("event_q full, dropping screen frame")
             continue
         # Throttle: sleep for the remainder of the frame interval
@@ -966,7 +970,8 @@ def read_window_events(
                 )
                 prev_window_data = window_data
             except queue.Full:
-                logger.debug("event_q full, dropping window event")
+                _drop_counts["window"] = _drop_counts.get("window", 0) + 1
+                logger.warning("event_q full, dropping window event")
                 # prev_window_data stays unchanged so we retry next iteration
         time.sleep(poll_interval)
 
@@ -1266,6 +1271,11 @@ def read_mouse_events(
     mouse_listener.stop()
 
 
+# Shared drop counters: written by reader threads, gesture tap, process_events.
+# Python's GIL makes dict operations safe enough for counters (minor undercount
+# possible on truly concurrent increments, acceptable for observability data).
+_drop_counts: dict = {}
+
 # Shared pressure state: written by gesture tap, read by pynput callbacks.
 # Python's GIL makes float reads/writes atomic; no lock needed.
 _current_pressure: float = 0.0
@@ -1341,6 +1351,16 @@ def read_gesture_events(
     # Mouse up types — reset pressure after release
     _MOUSE_UP_TYPES = {2, 4, 26}  # kCGEventLeftMouseUp, kCGEventRightMouseUp, kCGEventOtherMouseUp
 
+    def _enqueue_gesture(name, x, y, **extra):
+        """Enqueue a gesture event via put_nowait (CGEventTap cannot block)."""
+        data = {"name": name, "mouse_x": x, "mouse_y": y}
+        data.update(extra)
+        try:
+            event_q.put_nowait(Event(utils.get_timestamp(), "action", data))
+        except queue.Full:
+            _drop_counts["gesture"] = _drop_counts.get("gesture", 0) + 1
+            logger.warning(f"event_q full, dropping {name} gesture event")
+
     def gesture_callback(_proxy, event_type, cg_event, _refcon):
         """CGEventTap callback — converts CGEvent to NSEvent and enqueues.
 
@@ -1360,62 +1380,26 @@ def read_gesture_events(
                 if mag == 0.0:
                     return cg_event
                 loc = Quartz.CGEventGetLocation(cg_event)
-                # put_nowait: runs on CGEventTap, cannot block
-                try:
-                    event_q.put_nowait(Event(utils.get_timestamp(), "action", {
-                        "name": "magnify",
-                        "mouse_x": loc.x,
-                        "mouse_y": loc.y,
-                        "mouse_dx": mag,
-                        "mouse_dy": 0.0,
-                    }))
-                except queue.Full:
-                    logger.warning("event_q full, dropping magnify gesture event")
+                _enqueue_gesture("magnify", loc.x, loc.y, mouse_dx=mag, mouse_dy=0.0)
 
             elif ns_type == NS_EVENT_TYPE_ROTATE:
                 rot = ns_event.rotation()
                 if rot == 0.0:
                     return cg_event
                 loc = Quartz.CGEventGetLocation(cg_event)
-                try:
-                    event_q.put_nowait(Event(utils.get_timestamp(), "action", {
-                        "name": "rotate",
-                        "mouse_x": loc.x,
-                        "mouse_y": loc.y,
-                        "mouse_dx": rot,
-                        "mouse_dy": 0.0,
-                    }))
-                except queue.Full:
-                    logger.warning("event_q full, dropping rotate gesture event")
+                _enqueue_gesture("rotate", loc.x, loc.y, mouse_dx=rot, mouse_dy=0.0)
 
             elif ns_type == NS_EVENT_TYPE_SWIPE:
-                # Map three-finger swipe to scroll events
                 dx = ns_event.deltaX()
                 dy = ns_event.deltaY()
                 if dx == 0.0 and dy == 0.0:
                     return cg_event
                 loc = Quartz.CGEventGetLocation(cg_event)
-                try:
-                    event_q.put_nowait(Event(utils.get_timestamp(), "action", {
-                        "name": "scroll",
-                        "mouse_x": loc.x,
-                        "mouse_y": loc.y,
-                        "mouse_dx": dx,
-                        "mouse_dy": dy,
-                    }))
-                except queue.Full:
-                    logger.warning("event_q full, dropping swipe gesture event")
+                _enqueue_gesture("scroll", loc.x, loc.y, mouse_dx=dx, mouse_dy=dy)
 
             elif ns_type == NS_EVENT_TYPE_SMART_MAGNIFY:
                 loc = Quartz.CGEventGetLocation(cg_event)
-                try:
-                    event_q.put_nowait(Event(utils.get_timestamp(), "action", {
-                        "name": "smart_magnify",
-                        "mouse_x": loc.x,
-                        "mouse_y": loc.y,
-                    }))
-                except queue.Full:
-                    logger.warning("event_q full, dropping smart_magnify gesture event")
+                _enqueue_gesture("smart_magnify", loc.x, loc.y)
 
             elif event_type == 8:  # kCGEventScrollWheel
                 _current_modifier_flags = Quartz.CGEventGetFlags(cg_event)
@@ -1695,7 +1679,8 @@ def read_browser_events(
                 timeout=0.5,
             )
         except queue.Full:
-            logger.debug("event_q full, dropping browser event")
+            _drop_counts["browser_reader"] = _drop_counts.get("browser_reader", 0) + 1
+            logger.warning("event_q full, dropping browser event")
 
     set_browser_mode("idle", websocket)
 
@@ -1834,8 +1819,9 @@ def record(
     video_write_q = sq.SynchronizedQueue(maxsize=_IMAGE_QUEUE_SIZE)
     # perf_q: unbounded — tiny 3-tuples (~120 bytes each), bounded perf_q
     # risks cascade deadlock (all writers block → all write queues fill)
-    # Shared dict for event_processor thread to report drop counts back to record()
-    _event_drop_counts = {}
+    # Reset module-level drop counters for this recording session
+    global _drop_counts
+    _drop_counts = {}
     perf_q = sq.SynchronizedQueue()
     if terminate_processing is None:
         terminate_processing = multiprocessing.Event()
@@ -1957,7 +1943,6 @@ def record(
             num_window_events,
             num_browser_events,
             num_video_events,
-            _event_drop_counts,
         ),
     )
     event_processor.start()
@@ -2253,9 +2238,9 @@ def record(
             "total_max_ms": round(max(total_durs) * 1000, 1),
         }
 
-    # Merge drop counts from event_processor thread
-    if _event_drop_counts:
-        _profile_data["drops"] = dict(_event_drop_counts)
+    # Merge drop counts from all threads (readers, processor, gesture tap)
+    if _drop_counts:
+        _profile_data["drops"] = dict(_drop_counts)
 
     _profile_path = os.path.join(capture_dir, "profiling.json")
     try:
