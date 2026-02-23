@@ -13,6 +13,11 @@ from screencap import __version__
 
 console = Console()
 
+_RECORD_EXTRAS_MSG = (
+    "[red]Error: This command requires recording dependencies.[/red]\n"
+    "Install them with: [bold]pip install screencap\\[record][/bold]"
+)
+
 
 @click.group()
 @click.version_option(version=__version__, prog_name="screencap")
@@ -71,14 +76,22 @@ def start(
     capture_window_data = False if no_window_data else None  # None = upstream default (True)
     capture_browser_events = False if no_browser_events else None  # None = upstream default (False)
 
-    from screencap.recorder import start_recording
+    try:
+        from screencap.recorder import start_recording
+    except ImportError:
+        console.print(_RECORD_EXTRAS_MSG)
+        raise SystemExit(1)
 
-    capture_dir = start_recording(
-        name, description or None, audio, output,
-        wifi_metrics=wifi_metrics, app_versions=app_versions, force_clean=force,
-        capture_video=capture_video, capture_images=capture_images,
-        capture_window_data=capture_window_data, capture_browser_events=capture_browser_events,
-    )
+    try:
+        capture_dir = start_recording(
+            name, description or None, audio, output,
+            wifi_metrics=wifi_metrics, app_versions=app_versions, force_clean=force,
+            capture_video=capture_video, capture_images=capture_images,
+            capture_window_data=capture_window_data, capture_browser_events=capture_browser_events,
+        )
+    except ImportError:
+        console.print(_RECORD_EXTRAS_MSG)
+        raise SystemExit(1)
 
     # --- Post-recording pipeline ---
     if not auto_name_enabled:
@@ -231,6 +244,9 @@ def view(name, scrubbed):
         open_viewer(name, scrubbed=scrubbed)
         suffix = "-scrubbed" if scrubbed else ""
         console.print(f"[dim]Opening {name}{suffix}/viewer.html ...[/dim]")
+    except ImportError:
+        console.print(_RECORD_EXTRAS_MSG)
+        sys.exit(1)
     except FileNotFoundError as e:
         console.print(f"[red]Error:[/red] {e}")
         sys.exit(1)
@@ -243,7 +259,12 @@ def info(name, as_json):
     """Show details and system metrics for a recording."""
     from screencap.catalog import find_db, read_drops, _read_recording_meta
     from screencap.config import get_recordings_dir
-    from screencap.metrics import METRICS_FILENAME
+
+    try:
+        from screencap.metrics import METRICS_FILENAME
+    except ImportError:
+        console.print(_RECORD_EXTRAS_MSG)
+        raise SystemExit(1)
 
     recording_dir = get_recordings_dir() / name
     if not recording_dir.exists():
@@ -392,11 +413,15 @@ def scrub(name, provider):
 @click.option("--force", is_flag=True, help="Skip SIGTERM and go straight to SIGKILL.")
 def stop(force):
     """Stop orphaned recording processes."""
-    from screencap.pidfile import (
-        delete_pidfile,
-        find_orphaned_processes,
-        terminate_processes,
-    )
+    try:
+        from screencap.pidfile import (
+            delete_pidfile,
+            find_orphaned_processes,
+            terminate_processes,
+        )
+    except ImportError:
+        console.print(_RECORD_EXTRAS_MSG)
+        raise SystemExit(1)
 
     orphans = find_orphaned_processes()
     if not orphans:

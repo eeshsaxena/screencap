@@ -11,7 +11,12 @@ license = "MIT"
 dependencies = [
     "click>=8.0",
     "rich>=13.0",
+    "requests>=2.28.0",
     "tomli>=2.0; python_version < '3.11'",
+]
+
+[project.optional-dependencies]
+record = [
     # openadapt-capture dependencies
     "pydantic>=2.0.0",
     "pynput>=1.7.0",
@@ -33,16 +38,14 @@ dependencies = [
     "numpy>=1.20.0",
     "faster-whisper>=1.1.0",
     "magic-wormhole>=0.17.0",
-    "requests>=2.28.0",
     "oa-atomacos>=3.2.0; sys_platform == 'darwin'",
     "pyobjc-framework-Quartz>=9.0; sys_platform == 'darwin'",
     "pyobjc-framework-ApplicationServices>=9.0; sys_platform == 'darwin'",
     "pyobjc-framework-Cocoa>=9.0; sys_platform == 'darwin'",
     "pyobjc-framework-CoreWLAN>=9.0; sys_platform == 'darwin'",
 ]
-
-[project.optional-dependencies]
 privacy = [
+    "screencap[record]",
     "presidio-analyzer>=2.2.0",
     "presidio-anonymizer>=2.2.0",
     "presidio-image-redactor>=0.0.50",
@@ -50,6 +53,7 @@ privacy = [
     "spacy>=3.7.0",
 ]
 dev = [
+    "screencap[record]",
     "pytest>=7.0",
     "pytest-cov",
 ]
