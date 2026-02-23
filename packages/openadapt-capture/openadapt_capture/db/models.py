@@ -266,8 +266,6 @@ class AudioInfo(Base):
 
     id = sa.Column(sa.Integer, primary_key=True)
     timestamp = sa.Column(ForceFloat)
-    flac_data = sa.Column(sa.LargeBinary)
-    transcribed_text = sa.Column(sa.String)
     recording_timestamp = sa.Column(ForceFloat)
     recording_id = sa.Column(sa.ForeignKey("recording.id"))
     sample_rate = sa.Column(sa.Integer)
