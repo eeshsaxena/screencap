@@ -202,9 +202,12 @@ def list_cmd(as_json, sort):
     table.add_column("Uploaded")
 
     for i, r in enumerate(recordings, 1):
+        name_display = r.name
+        if r.drops:
+            name_display += " [yellow]\u26a0[/yellow]"
         table.add_row(
             str(i),
-            r.name,
+            name_display,
             r.date,
             r.duration,
             r.size_mb,
@@ -261,6 +264,16 @@ def info(name, as_json):
             h, m = divmod(m, 60)
             rec_meta["duration"] = f"{h}h {m}m {s}s" if h else f"{m}m {s}s"
 
+    # Read drop counts
+    profiling_path = recording_dir / "profiling.json"
+    drops = None
+    if profiling_path.exists():
+        try:
+            profiling = json.loads(profiling_path.read_text())
+            drops = profiling.get("drops")
+        except (json.JSONDecodeError, OSError):
+            pass
+
     # Read metrics
     metrics_path = recording_dir / METRICS_FILENAME
     metrics = None
@@ -271,7 +284,7 @@ def info(name, as_json):
             pass
 
     if as_json:
-        click.echo(json.dumps({"recording": rec_meta, "metrics": metrics}, indent=2))
+        click.echo(json.dumps({"recording": rec_meta, "metrics": metrics, "drops": drops}, indent=2))
         return
 
     # Human-readable output
@@ -284,6 +297,12 @@ def info(name, as_json):
             console.print(f"  [cyan]{key}:[/cyan] {val}")
     else:
         console.print("  [dim]No recording metadata available.[/dim]")
+
+    if drops and any(v > 0 for v in drops.values()):
+        console.print(f"\n  [yellow]Events dropped during recording:[/yellow]")
+        for event_type, count in drops.items():
+            if count > 0:
+                console.print(f"    [yellow]{event_type}:[/yellow] {count}")
 
     if metrics is None:
         console.print("\n[dim]No system metrics available (recorded before metrics feature).[/dim]")

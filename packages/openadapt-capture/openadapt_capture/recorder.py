@@ -19,9 +19,9 @@ import sys
 import threading
 import time
 import tracemalloc
-from collections import namedtuple
+from collections import defaultdict, namedtuple
 from functools import partial
-from typing import Any, Callable
+from typing import Any, Callable, Optional
 
 import av
 import fire
@@ -159,7 +159,8 @@ def process_event(
     write_fn: Callable,
     recording: Recording,
     perf_q: sq.SynchronizedQueue,
-) -> None:
+    terminate_processing: Optional[multiprocessing.Event] = None,
+) -> bool:
     """Process an event and take appropriate action based on its type.
 
     Args:
@@ -168,14 +169,22 @@ def process_event(
         write_fn: The function for writing the event.
         recording: The recording object.
         perf_q: The queue for collecting performance statistics.
+        terminate_processing: If set, use shorter timeout for prompt shutdown.
 
     Returns:
-        None
+        True if the event was successfully queued/written, False if dropped.
     """
     if PROC_WRITE_BY_EVENT_TYPE[event.type]:
-        write_q.put(event)
+        timeout = 0.5 if (terminate_processing and terminate_processing.is_set()) else 1.0
+        try:
+            write_q.put(event, timeout=timeout)
+            return True
+        except queue.Full:
+            logger.warning(f"write queue full, dropping {event.type} event")
+            return False
     else:
         write_fn(recording, event, perf_q)
+        return True
 
 
 @utils.trace(logger)
@@ -195,6 +204,7 @@ def process_events(
     num_window_events: multiprocessing.Value,
     num_browser_events: multiprocessing.Value,
     num_video_events: multiprocessing.Value,
+    capture_dir: Optional[str] = None,
 ) -> None:
     """Process events from the event queue and write them to write queues.
 
@@ -214,6 +224,7 @@ def process_events(
         num_window_events: A counter for the number of window events.
         num_browser_events: A counter for the number of browser events.
         num_video_events: A counter for the number of video events.
+        capture_dir: Path to the capture directory for persisting drop counts.
     """
     utils.set_start_time(recording.timestamp)
 
@@ -228,8 +239,17 @@ def process_events(
     prev_window_event = None
     prev_saved_screen_timestamp = 0
     prev_saved_window_timestamp = 0
+    _drops = defaultdict(int)  # drop counters by event type / group
     started = False
+    drain_start = None
     while not terminate_processing.is_set() or not event_q.empty():
+        # Enforce drain deadline once shutdown begins
+        if terminate_processing.is_set():
+            if drain_start is None:
+                drain_start = time.monotonic()
+            elif time.monotonic() - drain_start > 10.0:
+                logger.warning("Drain deadline exceeded, exiting event_processor")
+                break
         try:
             event = event_q.get(timeout=1.0)
         except queue.Empty:
@@ -256,14 +276,15 @@ def process_events(
             prev_screen_event = event
             if config.RECORD_FULL_VIDEO:
                 video_event = event._replace(type="screen/video")
-                process_event(
+                if process_event(
                     video_event,
                     video_write_q,
                     write_video_event,
                     recording,
                     perf_q,
-                )
-                num_video_events.value += 1
+                    terminate_processing,
+                ):
+                    num_video_events.value += 1
         elif event.type == "window":
             prev_window_event = event
         elif event.type == "browser":
@@ -274,6 +295,7 @@ def process_events(
                     write_browser_event,
                     recording,
                     perf_q,
+                    terminate_processing,
                 )
         elif event.type == "action":
             if prev_screen_event is None:
@@ -308,51 +330,72 @@ def process_events(
                         element_state = {}
                     event.data["element_state"] = element_state
 
-            process_event(
-                event,
-                action_write_q,
-                write_action_event,
-                recording,
-                perf_q,
-            )
-
-            num_action_events.value += 1
-
+            # Drop-coherent fan-out: collect all events for this action as a
+            # group. If any put fails, drop the entire group to prevent broken
+            # cross-references (e.g., action row pointing to nonexistent screenshot).
+            events_to_write = [(event, action_write_q, write_action_event)]
             if prev_saved_screen_timestamp < prev_screen_event.timestamp:
-                process_event(
-                    prev_screen_event,
-                    screen_write_q,
-                    write_screen_event,
-                    recording,
-                    perf_q,
+                events_to_write.append(
+                    (prev_screen_event, screen_write_q, write_screen_event)
                 )
-                num_screen_events.value += 1
-                prev_saved_screen_timestamp = prev_screen_event.timestamp
                 if config.RECORD_VIDEO and not config.RECORD_FULL_VIDEO:
-                    prev_video_event = prev_screen_event._replace(type="screen/video")
-                    process_event(
-                        prev_video_event,
-                        video_write_q,
-                        write_video_event,
-                        recording,
-                        perf_q,
+                    video_event = prev_screen_event._replace(type="screen/video")
+                    events_to_write.append(
+                        (video_event, video_write_q, write_video_event)
                     )
-                    num_video_events.value += 1
             if prev_window_event is not None:
                 if prev_saved_window_timestamp < prev_window_event.timestamp:
-                    process_event(
-                        prev_window_event,
-                        window_write_q,
-                        write_window_event,
-                        recording,
-                        perf_q,
+                    events_to_write.append(
+                        (prev_window_event, window_write_q, write_window_event)
                     )
+
+            # Try to write all; if any fails, drop the entire group
+            all_ok = True
+            for ev, wq, wfn in events_to_write:
+                if not process_event(
+                    ev, wq, wfn, recording, perf_q, terminate_processing
+                ):
+                    all_ok = False
+                    break
+
+            if all_ok:
+                num_action_events.value += 1
+                if any(ev.type == "screen" for ev, _, _ in events_to_write[1:]):
+                    num_screen_events.value += 1
+                    prev_saved_screen_timestamp = prev_screen_event.timestamp
+                if any(
+                    ev.type == "screen/video" for ev, _, _ in events_to_write[1:]
+                ):
+                    num_video_events.value += 1
+                if any(ev.type == "window" for ev, _, _ in events_to_write[1:]):
                     num_window_events.value += 1
                     prev_saved_window_timestamp = prev_window_event.timestamp
+            else:
+                _drops["action_group"] += 1
+                logger.warning(
+                    "Dropping action event group due to full write queue"
+                )
         else:
             raise Exception(f"unhandled {event.type=}")
         del prev_event
         prev_event = event
+
+    # Persist drop counts for observability
+    if any(_drops.values()):
+        logger.warning(f"Events dropped during recording: {dict(_drops)}")
+        if capture_dir:
+            try:
+                profiling_path = os.path.join(capture_dir, "profiling.json")
+                profiling_data = {}
+                if os.path.exists(profiling_path):
+                    with open(profiling_path) as f:
+                        profiling_data = json.load(f)
+                profiling_data["drops"] = dict(_drops)
+                with open(profiling_path, "w") as f:
+                    json.dump(profiling_data, f, indent=2)
+            except Exception as exc:
+                logger.warning(f"Failed to persist drop counts: {exc}")
+
     logger.info("Done")
 
 
@@ -652,6 +695,11 @@ def trigger_action_event(
     The element_state is populated later in process_events() to avoid
     blocking the pynput callback thread.
 
+    Backpressure strategy:
+    - Mouse moves: put_nowait() — fully redundant at 100+/sec, silent drop.
+    - Clicks/keys/scrolls: put(timeout=0.05) — pynput thread can tolerate
+      50ms block (not a CGEventTap), drop with warning on Full.
+
     Args:
         event_q: The event queue to add the action event to.
         action_event_args: A dictionary containing the arguments for the action event.
@@ -659,7 +707,21 @@ def trigger_action_event(
     Returns:
         None
     """
-    event_q.put(Event(utils.get_timestamp(), "action", action_event_args))
+    event = Event(utils.get_timestamp(), "action", action_event_args)
+    action_name = action_event_args.get("name", "")
+
+    if action_name == "move":
+        try:
+            event_q.put_nowait(event)
+        except queue.Full:
+            pass  # silent drop — next move arrives in ~10ms
+    else:
+        try:
+            event_q.put(event, timeout=0.05)
+        except queue.Full:
+            # Only log action_name (event type), never action_event_args
+            # (contains keystrokes, coordinates, and other user input data)
+            logger.warning(f"event_q full, dropping {action_name} action event")
 
 
 def on_move(event_q: queue.Queue, x: int, y: int, injected: bool = False) -> None:
@@ -832,7 +894,14 @@ def read_screen_events(
         if not started:
             started_event.set()
             started = True
-        event_q.put(Event(utils.get_timestamp(), "screen", screenshot))
+        # Yield to let action/window events through when queue is near-full
+        if event_q.qsize() > int(event_q.maxsize * 0.75):
+            time.sleep(0.1)
+        try:
+            event_q.put(Event(utils.get_timestamp(), "screen", screenshot), timeout=0.5)
+        except queue.Full:
+            logger.debug("event_q full, dropping screen frame")
+            continue
         # Throttle: sleep for the remainder of the frame interval
         if min_interval > 0:
             elapsed = time.perf_counter() - t_start
@@ -891,13 +960,18 @@ def read_window_events(
             logger.info(f"{_window_data=}")
         if window_data != prev_window_data:
             logger.debug("Queuing window event for writing")
-            event_q.put(
-                Event(
-                    utils.get_timestamp(),
-                    "window",
-                    window_data,
+            try:
+                event_q.put(
+                    Event(
+                        utils.get_timestamp(),
+                        "window",
+                        window_data,
+                    ),
+                    timeout=0.5,
                 )
-            )
+            except queue.Full:
+                logger.debug("event_q full, dropping window event")
+                # don't update prev_window_data so we retry on next change check
         prev_window_data = window_data
         time.sleep(poll_interval)
 
@@ -1291,32 +1365,33 @@ def read_gesture_events(
                 if mag == 0.0:
                     return cg_event
                 loc = Quartz.CGEventGetLocation(cg_event)
-                trigger_action_event(
-                    event_q,
-                    {
+                # put_nowait: runs on CGEventTap, cannot block
+                try:
+                    event_q.put_nowait(Event(utils.get_timestamp(), "action", {
                         "name": "magnify",
                         "mouse_x": loc.x,
                         "mouse_y": loc.y,
                         "mouse_dx": mag,
                         "mouse_dy": 0.0,
-                    },
-                )
+                    }))
+                except queue.Full:
+                    logger.warning("event_q full, dropping magnify gesture event")
 
             elif ns_type == NS_EVENT_TYPE_ROTATE:
                 rot = ns_event.rotation()
                 if rot == 0.0:
                     return cg_event
                 loc = Quartz.CGEventGetLocation(cg_event)
-                trigger_action_event(
-                    event_q,
-                    {
+                try:
+                    event_q.put_nowait(Event(utils.get_timestamp(), "action", {
                         "name": "rotate",
                         "mouse_x": loc.x,
                         "mouse_y": loc.y,
                         "mouse_dx": rot,
                         "mouse_dy": 0.0,
-                    },
-                )
+                    }))
+                except queue.Full:
+                    logger.warning("event_q full, dropping rotate gesture event")
 
             elif ns_type == NS_EVENT_TYPE_SWIPE:
                 # Map three-finger swipe to scroll events
@@ -1325,27 +1400,27 @@ def read_gesture_events(
                 if dx == 0.0 and dy == 0.0:
                     return cg_event
                 loc = Quartz.CGEventGetLocation(cg_event)
-                trigger_action_event(
-                    event_q,
-                    {
+                try:
+                    event_q.put_nowait(Event(utils.get_timestamp(), "action", {
                         "name": "scroll",
                         "mouse_x": loc.x,
                         "mouse_y": loc.y,
                         "mouse_dx": dx,
                         "mouse_dy": dy,
-                    },
-                )
+                    }))
+                except queue.Full:
+                    logger.warning("event_q full, dropping swipe gesture event")
 
             elif ns_type == NS_EVENT_TYPE_SMART_MAGNIFY:
                 loc = Quartz.CGEventGetLocation(cg_event)
-                trigger_action_event(
-                    event_q,
-                    {
+                try:
+                    event_q.put_nowait(Event(utils.get_timestamp(), "action", {
                         "name": "smart_magnify",
                         "mouse_x": loc.x,
                         "mouse_y": loc.y,
-                    },
-                )
+                    }))
+                except queue.Full:
+                    logger.warning("event_q full, dropping smart_magnify gesture event")
 
             elif event_type == 8:  # kCGEventScrollWheel
                 _current_modifier_flags = Quartz.CGEventGetFlags(cg_event)
@@ -1615,13 +1690,17 @@ def read_browser_events(
             continue
         timestamp = utils.get_timestamp()
         data = json.loads(message)
-        event_q.put(
-            Event(
-                timestamp,
-                "browser",
-                {"message": data},
+        try:
+            event_q.put(
+                Event(
+                    timestamp,
+                    "browser",
+                    {"message": data},
+                ),
+                timeout=0.5,
             )
-        )
+        except queue.Full:
+            logger.debug("event_q full, dropping browser event")
 
     set_browser_mode("idle", websocket)
 
@@ -1749,13 +1828,17 @@ def record(
         except (ImportError, AttributeError):
             pass  # pyobjc not available; gesture capture will be skipped
 
-    event_q = queue.Queue()
-    screen_write_q = sq.SynchronizedQueue()
-    action_write_q = sq.SynchronizedQueue()
-    window_write_q = sq.SynchronizedQueue()
-    browser_write_q = sq.SynchronizedQueue()
-    video_write_q = sq.SynchronizedQueue()
-    # TODO: save write times to DB; display performance plot in visualize.py
+    _IMAGE_QUEUE_SIZE = 20   # queues carrying PIL Images / video frames
+    _META_QUEUE_SIZE = 100   # queues carrying small dicts
+
+    event_q = queue.Queue(maxsize=_IMAGE_QUEUE_SIZE)
+    screen_write_q = sq.SynchronizedQueue(maxsize=_IMAGE_QUEUE_SIZE)
+    action_write_q = sq.SynchronizedQueue(maxsize=_META_QUEUE_SIZE)
+    window_write_q = sq.SynchronizedQueue(maxsize=_META_QUEUE_SIZE)
+    browser_write_q = sq.SynchronizedQueue(maxsize=_META_QUEUE_SIZE)
+    video_write_q = sq.SynchronizedQueue(maxsize=_IMAGE_QUEUE_SIZE)
+    # perf_q: unbounded — tiny 3-tuples (~120 bytes each), bounded perf_q
+    # risks cascade deadlock (all writers block → all write queues fill)
     perf_q = sq.SynchronizedQueue()
     if terminate_processing is None:
         terminate_processing = multiprocessing.Event()
@@ -1877,6 +1960,7 @@ def record(
             num_window_events,
             num_browser_events,
             num_video_events,
+            capture_dir,
         ),
     )
     event_processor.start()

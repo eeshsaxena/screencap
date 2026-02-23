@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import json
 import sqlite3
 from datetime import datetime
 from pathlib import Path
@@ -21,6 +22,7 @@ class RecordingInfo(NamedTuple):
     has_scrubbed: bool
     transcribed: bool
     uploaded: bool
+    drops: dict[str, int] | None = None  # event drop counts, if any
 
 
 def _fmt_duration(seconds: float | None) -> str:
@@ -39,6 +41,21 @@ def _dir_size_mb(p: Path) -> str:
     if total < 1024 * 1024:
         return f"{total / 1024:.1f} KB"
     return f"{total / (1024 * 1024):.1f} MB"
+
+
+def _read_drops(directory: Path) -> dict[str, int] | None:
+    """Read event drop counts from profiling.json, if present."""
+    profiling = directory / "profiling.json"
+    if not profiling.exists():
+        return None
+    try:
+        data = json.loads(profiling.read_text())
+        drops = data.get("drops")
+        if drops and any(v > 0 for v in drops.values()):
+            return drops
+    except Exception:
+        pass
+    return None
 
 
 def find_db(directory: Path) -> Path | None:
@@ -128,6 +145,8 @@ def list_recordings(recordings_dir: Path | None = None) -> list[RecordingInfo]:
         transcribed = (d / "transcript.txt").exists()
         uploaded = (d / ".upload_status.json").is_file()
 
+        drops = _read_drops(d)
+
         results.append(
             RecordingInfo(
                 name=d.name,
@@ -138,6 +157,7 @@ def list_recordings(recordings_dir: Path | None = None) -> list[RecordingInfo]:
                 has_scrubbed=has_scrubbed,
                 transcribed=transcribed,
                 uploaded=uploaded,
+                drops=drops,
             )
         )
 
