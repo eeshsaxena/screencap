@@ -294,8 +294,6 @@ def update_video_start_time(
 
 def insert_audio_info(
     session: SaSession,
-    audio_data: bytes,
-    transcribed_text: str,
     recording: Recording,
     timestamp: float,
     sample_rate: int,
@@ -305,16 +303,12 @@ def insert_audio_info(
 
     Args:
         session (sa.orm.Session): The database session.
-        audio_data (bytes): The audio data.
-        transcribed_text (str): The transcribed text.
         recording (Recording): The recording object.
         timestamp (float): The timestamp of the audio.
         sample_rate (int): The sample rate of the audio.
         word_list (list): A list of words with timestamps.
     """
     audio_info = AudioInfo(
-        flac_data=audio_data,
-        transcribed_text=transcribed_text,
         recording_timestamp=recording.timestamp,
         recording_id=recording.id,
         timestamp=timestamp,

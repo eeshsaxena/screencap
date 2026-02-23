@@ -267,14 +267,11 @@ class TestRecordAudioIntegration:
         assert info.frames > 0
         assert info.duration > 0
 
-        # Verify insert_audio_info was called with valid FLAC bytes
+        # Verify insert_audio_info was called
         mock_crud.insert_audio_info.assert_called_once()
         call_args = mock_crud.insert_audio_info.call_args
-        flac_bytes = call_args[0][1]
-        assert len(flac_bytes) > 0
-        # Verify empty transcription fields
-        assert call_args[0][2] == ""  # transcribed_text
-        assert call_args[0][6] == []  # word_list
+        # Args are now: (session, recording, start_timestamp, SAMPLERATE, [])
+        assert call_args[0][4] == []  # word_list
 
     @patch("openadapt_capture.recorder.crud")
     @patch("openadapt_capture.recorder.get_session_for_path")

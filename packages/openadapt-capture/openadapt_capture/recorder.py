@@ -1613,22 +1613,16 @@ def record_audio(
     sf_writer.close()
     logger.info(f"Audio saved to {audio_flac_path}")
 
-    # Read compressed FLAC from disk for DB insert
-    compressed_audio_bytes = audio_flac_path.read_bytes()
-    if not compressed_audio_bytes:
+    flac_size = audio_flac_path.stat().st_size
+    if not flac_size:
         logger.warning("Zero-length audio recording — skipping DB insert")
         return
 
-    logger.info(
-        f"Size of compressed audio data: {len(compressed_audio_bytes)} bytes"
-    )
+    logger.info(f"Size of compressed audio data: {flac_size} bytes")
 
     session = get_session_for_path(db_path)
-    # Create AudioInfo entry (transcription deferred to _auto_transcribe())
     crud.insert_audio_info(
         session,
-        compressed_audio_bytes,
-        "",  # transcribed_text — populated later by _auto_transcribe()
         recording,
         start_timestamp,
         SAMPLERATE,
