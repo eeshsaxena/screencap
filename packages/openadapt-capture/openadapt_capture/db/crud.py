@@ -25,7 +25,7 @@ from openadapt_capture.db.models import (
 # Type variable for generic model queries
 BaseModelType = TypeVar("BaseModelType")
 
-BATCH_SIZE = 1
+BATCH_SIZE = 1  # default; recorder overrides to 50 for throughput
 
 action_events = []
 screenshots = []
@@ -75,6 +75,29 @@ def _insert(
             buffer.clear()
         # Note: this does not contain the inserted row(s)
         return result
+
+
+def flush_buffers(session: SaSession) -> None:
+    """Commit any partially-filled insert buffers.
+
+    Must be called before a writer process exits so the last <BATCH_SIZE
+    events are not silently dropped.
+    """
+    _buffer_table_pairs = [
+        (action_events, ActionEvent),
+        (screenshots, Screenshot),
+        (window_events, WindowEvent),
+        (browser_events, BrowserEvent),
+        (performance_stats, PerformanceStat),
+        (memory_stats, MemoryStat),
+    ]
+    for buffer, table in _buffer_table_pairs:
+        if buffer:
+            session.execute(sa.insert(table), buffer)
+    session.commit()
+    # Clear only after commit succeeds — avoids silent data loss on I/O error.
+    for buffer, _ in _buffer_table_pairs:
+        buffer.clear()
 
 
 def insert_action_event(

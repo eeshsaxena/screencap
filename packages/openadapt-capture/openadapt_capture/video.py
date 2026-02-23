@@ -63,7 +63,7 @@ class VideoWriter:
         codec: str = "libx264",
         pix_fmt: str = "yuv444p",
         crf: int = 0,
-        preset: str = "veryslow",
+        preset: str = "ultrafast",
     ) -> None:
         """Initialize video writer.
 
@@ -75,7 +75,7 @@ class VideoWriter:
             codec: Video codec (default libx264).
             pix_fmt: Pixel format (default yuv444p for full color).
             crf: Constant Rate Factor, 0 for lossless (default 0).
-            preset: Encoding preset (default veryslow for max compression).
+            preset: Encoding preset (default ultrafast for real-time capture).
         """
 
         self.output_path = Path(output_path)
@@ -244,7 +244,7 @@ def initialize_video_writer(
     codec: str = config.VIDEO_ENCODING,
     pix_fmt: str = config.VIDEO_PIXEL_FORMAT,
     crf: int = 0,
-    preset: str = "veryslow",
+    preset: str = "ultrafast",
 ) -> tuple[av.container.OutputContainer, av.stream.Stream, float]:
     """Initializes video writer and returns the container, stream, and base timestamp.
 
@@ -259,7 +259,7 @@ def initialize_video_writer(
         crf (int, optional): Constant Rate Factor for encoding quality.
             Defaults to 0 for lossless.
         preset (str, optional): Encoding speed/quality trade-off.
-            Defaults to 'veryslow' for maximum compression.
+            Defaults to 'ultrafast' for real-time capture.
 
     Returns:
         tuple[av.container.OutputContainer, av.stream.Stream, float]: The initialized
@@ -601,7 +601,7 @@ class ChunkedVideoWriter:
         codec: str = "libx264",
         pix_fmt: str = "yuv444p",
         crf: int = 0,
-        preset: str = "veryslow",
+        preset: str = "ultrafast",
     ) -> None:
         """Initialize chunked video writer.
 

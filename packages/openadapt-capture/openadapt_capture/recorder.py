@@ -515,6 +515,8 @@ def write_events(
 
     logger.info(f"{event_type=} starting")
     signal.signal(signal.SIGINT, signal.SIG_IGN)
+    # Batch DB commits for throughput at high FPS (default is 1 = every event).
+    crud.BATCH_SIZE = 50
     session = get_session_for_path(db_path)
 
     if pre_callback:
@@ -560,6 +562,9 @@ def write_events(
                 progress.update()
         logger.debug(f"{event_type=} written")
 
+    # Flush any partial batch left in crud insert buffers.
+    crud.flush_buffers(session)
+
     if post_callback:
         post_callback(state)
 
@@ -585,7 +590,12 @@ def video_pre_callback(
     video_file_path = video.get_video_file_path(recording.timestamp, video_dir)
     # Get actual screen dimensions (this runs in a child process's main thread,
     # where mss.grab() is fast on macOS).
-    screen_width, screen_height = utils.take_screenshot().size
+    init_screenshot = utils.take_screenshot()
+    if init_screenshot is not None:
+        screen_width, screen_height = init_screenshot.size
+    else:
+        logger.warning("take_screenshot() returned None in video_pre_callback, using get_monitor_dims()")
+        screen_width, screen_height = utils.get_monitor_dims()
     video_container, video_stream, video_start_timestamp = (
         video.initialize_video_writer(video_file_path, screen_width, screen_height)
     )
