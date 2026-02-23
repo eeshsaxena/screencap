@@ -21,8 +21,14 @@ _RECORD_EXTRAS_MSG = (
 
 @click.group()
 @click.version_option(version=__version__, prog_name="screencap")
-def cli():
+@click.option("--no-update-check", is_flag=True, hidden=True,
+              help="Skip auto-update check.")
+@click.pass_context
+def cli(ctx, no_update_check):
     """ScreenCap — macOS screen capture with privacy scrubbing."""
+    if not no_update_check:
+        from screencap.updater import maybe_check_for_update
+        maybe_check_for_update()
 
 
 @cli.command()
@@ -440,6 +446,38 @@ def stop(force):
         console.print("[yellow]Could not terminate any processes.[/yellow]")
 
     delete_pidfile()
+
+
+@cli.command()
+def update():
+    """Check for and install updates."""
+    from screencap.updater import (
+        get_latest_version,
+        is_update_available,
+        perform_update,
+    )
+
+    if not getattr(sys, "frozen", False):
+        console.print("[yellow]Self-update is only available for standalone binary installs.[/yellow]")
+        console.print("Use [bold]pip install --upgrade screencap[/bold] instead.")
+        return
+
+    console.print(f"Current version: {__version__}")
+    latest = get_latest_version()
+
+    if latest is None:
+        console.print("[red]Could not reach update server.[/red]")
+        return
+
+    if not is_update_available(latest):
+        console.print("[green]Already up to date.[/green]")
+        return
+
+    console.print(f"New version available: {latest}")
+    if perform_update(latest):
+        console.print("Restart screencap to use the new version.")
+
+
 # ---------------------------------------------------------------------------
 # transcribe
 # ---------------------------------------------------------------------------

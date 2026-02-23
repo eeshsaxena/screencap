@@ -78,6 +78,15 @@ def get_auto_name() -> bool:
     return cfg.get("auto_name", True)
 
 
+def get_auto_update() -> bool:
+    """Return whether auto-update checking is enabled (True = on)."""
+    env = os.environ.get("SCREENCAP_AUTO_UPDATE")
+    if env is not None:
+        return env.lower() in ("1", "true", "yes")
+    cfg = _load_toml()
+    return cfg.get("auto_update", True)
+
+
 def get_auto_name_local_only() -> bool:
     """Return whether LLM auto-naming is restricted to local providers only."""
     env = os.environ.get("SCREENCAP_AUTO_NAME_LOCAL_ONLY")
