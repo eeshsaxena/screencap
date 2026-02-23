@@ -182,6 +182,30 @@ screencap upload my-session --dry-run
 | `--dry-run` | Show files and sizes without uploading |
 | `--force` | Re-upload even if already uploaded locally |
 
+### `screencap download`
+
+Download recordings from cloud storage (GCS). Tracks download status locally via `.download_status.json` — re-running skips already-downloaded recordings.
+
+```bash
+# download all new recordings
+screencap download
+
+# download to a custom directory
+screencap download --dest ~/ml-data
+
+# preview what would be downloaded
+screencap download --dry-run
+
+# re-download everything
+screencap download --force
+```
+
+| Flag | Description |
+|------|-------------|
+| `--dest DIR` | Override destination directory (default: `~/.screencap/downloads/`) |
+| `--dry-run` | Show recording names and file counts without downloading |
+| `--force` | Re-download all recordings, ignoring markers |
+
 ### `screencap stop`
 
 Terminate orphaned recording processes left behind by a crash or forced quit.
@@ -200,6 +224,7 @@ Config file: `~/.screencap/config.toml`
 
 ```toml
 recordings_dir = "/custom/path/to/recordings"
+downloads_dir = "/custom/path/to/downloads"
 audio_default = false
 auto_name = true              # LLM auto-naming after recording
 auto_name_local_only = false  # restrict to Ollama only
@@ -210,6 +235,7 @@ auto_name_local_only = false  # restrict to Ollama only
 | Variable | Default | Description |
 |----------|---------|-------------|
 | `SCREENCAP_RECORDINGS_DIR` | `~/.screencap/recordings` | Override recordings directory |
+| `SCREENCAP_DOWNLOADS_DIR` | `~/.screencap/downloads` | Override downloads directory |
 | `SCREENCAP_AUDIO_DEFAULT` | `true` | Default audio capture on/off |
 | `SCREENCAP_AUTO_NAME` | `true` | Enable/disable LLM auto-naming |
 | `SCREENCAP_AUTO_NAME_LOCAL_ONLY` | `false` | Restrict auto-naming to local providers (Ollama) |

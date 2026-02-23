@@ -701,6 +701,79 @@ def upload(names, all_recordings, dry_run, force):
 
 
 @cli.command()
+@click.option("--dest", default=None, help="Destination directory (default: ~/.screencap/downloads/).")
+@click.option("--dry-run", is_flag=True, help="Show what would be downloaded without downloading.")
+@click.option("--force", is_flag=True, help="Re-download all recordings, ignoring markers.")
+def download(dest, dry_run, force):
+    """Download recordings from cloud storage."""
+    from screencap.download import (
+        _fmt_size,
+        _resolve_dest_dir,
+        download_recording,
+        list_remote_recordings,
+    )
+
+    try:
+        dest_dir = _resolve_dest_dir(dest)
+    except RuntimeError as e:
+        console.print(f"[red]Error:[/red] {e}")
+        sys.exit(1)
+
+    try:
+        remote = list_remote_recordings()
+    except RuntimeError as e:
+        console.print(f"[red]Error:[/red] {e}")
+        sys.exit(1)
+
+    if not remote:
+        console.print("No recordings available for download.")
+        return
+
+    console.print(
+        f"Found [bold]{len(remote)}[/bold] recording(s) on server."
+    )
+
+    all_downloaded = 0
+    all_skipped = 0
+    all_failed = 0
+    all_bytes = 0
+
+    for i, rec in enumerate(remote, 1):
+        if len(remote) > 1:
+            console.print(
+                f"\n[bold][{i}/{len(remote)}][/bold] {rec.name} "
+                f"({_fmt_size(rec.total_size)}, {rec.file_count} files)"
+            )
+        try:
+            result = download_recording(
+                rec.name, dest_dir, dry_run=dry_run, force=force,
+            )
+            all_downloaded += len(result.downloaded)
+            all_skipped += len(result.skipped)
+            all_failed += len(result.failed)
+            all_bytes += result.total_bytes
+
+            if not dry_run and not result.failed and result.downloaded:
+                console.print(
+                    f"  [green]Downloaded {rec.name}[/green] "
+                    f"({len(result.downloaded)} files, {_fmt_size(result.total_bytes)})"
+                )
+        except FileNotFoundError as e:
+            console.print(f"  [red]Error:[/red] {e}")
+            all_failed += 1
+        except RuntimeError as e:
+            console.print(f"  [red]Error:[/red] {e}")
+            all_failed += 1
+
+    if not dry_run:
+        console.print(
+            f"\n[bold]Done.[/bold] {all_downloaded} downloaded, "
+            f"{all_skipped} skipped, {all_failed} failed "
+            f"({_fmt_size(all_bytes)} total)"
+        )
+
+
+@cli.command()
 @click.argument("name")
 @click.option(
     "--model", "-m",
