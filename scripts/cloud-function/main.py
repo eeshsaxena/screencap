@@ -1,4 +1,9 @@
-"""Cloud Function: generate signed GCS upload URLs for screencap recordings.
+"""Cloud Function: signed GCS URLs for screencap recording upload/download.
+
+Supports three actions (dispatched via ``action`` field in JSON body):
+- (default/no action) — generate signed upload URLs
+- ``list`` — list available recordings in the bucket
+- ``sign-download`` — generate signed download URLs for a recording
 
 Deploy:
     # 1. Grant signing permission to the Cloud Function's service account:
@@ -31,7 +36,8 @@ from flask import jsonify, request
 from google.cloud import storage
 
 BUCKET = "screencap-recordings"
-EXPIRY_MINUTES = 15
+UPLOAD_EXPIRY_MINUTES = 15
+DOWNLOAD_EXPIRY_HOURS = 4
 MAX_FILES = 500
 
 # Only allow safe characters in recording and file names.
@@ -65,16 +71,12 @@ def _cors(response, status=200):
 
 @functions_framework.http
 def get_upload_urls(request):
-    """Generate signed upload URLs for recording files.
+    """Dispatch to upload, list, or sign-download handlers.
 
-    Request:
-        POST {"recording": "my-rec",
-              "files": [{"name": "video.mp4", "content_type": "video/mp4"}, ...]}
-
-    Response:
-        {"urls": {"video.mp4": "https://..." or null}, "gcs_prefix": "gs://..."}
-
-    Files that already exist in the bucket get ``null`` (skip).
+    Actions:
+    - (default) upload: POST {"recording": "...", "files": [...]}
+    - list:             POST {"action": "list"}
+    - sign-download:    POST {"action": "sign-download", "recording": "..."}
     """
     if request.method == "OPTIONS":
         return ("", 204, CORS_HEADERS)
@@ -83,12 +85,82 @@ def get_upload_urls(request):
     if not data:
         return _cors((jsonify({"error": "JSON body required"}), 400))
 
+    action = data.get("action")
+
+    if action == "list":
+        return _handle_list()
+    if action == "sign-download":
+        return _handle_sign_download(data)
+    return _handle_upload(data)
+
+
+def _handle_list():
+    """List available recordings in the bucket."""
+    from collections import defaultdict
+
+    recordings = defaultdict(lambda: {"file_count": 0, "total_size": 0})
+
+    blobs = _storage_client.list_blobs(BUCKET, prefix="recordings/", timeout=60)
+    for blob in blobs:
+        # blob.name = "recordings/{recording_name}/{filename}"
+        parts = blob.name.split("/", 2)
+        if len(parts) < 3 or not parts[2]:
+            continue
+        rec_name = parts[1]
+        recordings[rec_name]["file_count"] += 1
+        recordings[rec_name]["total_size"] += blob.size or 0
+
+    result = [
+        {"name": name, **info}
+        for name, info in sorted(recordings.items())
+    ]
+    return _cors(jsonify({"recordings": result}))
+
+
+def _handle_sign_download(data):
+    """Generate signed GET URLs for all files in a recording."""
+    recording = data.get("recording")
+    if not recording:
+        return _cors((jsonify({"error": "'recording' field required"}), 400))
+
+    if not _RECORDING_RE.match(recording):
+        return _cors((jsonify({"error": "Invalid recording name"}), 400))
+
+    prefix = f"recordings/{recording}/"
+    blobs = list(_storage_client.list_blobs(BUCKET, prefix=prefix, timeout=60))
+
+    if not blobs:
+        return _cors((jsonify({"error": f"Recording not found: {recording}"}), 404))
+
+    _credentials.refresh(_auth_request)
+
+    urls = {}
+    for blob in blobs:
+        # Strip the prefix to get the relative filename
+        rel_name = blob.name[len(prefix):]
+        if not rel_name:
+            continue
+        urls[rel_name] = blob.generate_signed_url(
+            version="v4",
+            expiration=timedelta(hours=DOWNLOAD_EXPIRY_HOURS),
+            method="GET",
+            service_account_email=_credentials.service_account_email,
+            access_token=_credentials.token,
+        )
+
+    return _cors(jsonify({
+        "urls": urls,
+        "gcs_prefix": f"gs://{BUCKET}/{prefix}",
+    }))
+
+
+def _handle_upload(data):
+    """Generate signed upload URLs for recording files (original behavior)."""
     recording = data.get("recording")
     files = data.get("files")
     if not recording or not files:
         return _cors((jsonify({"error": "'recording' and 'files' fields required"}), 400))
 
-    # Validate recording name
     if not _RECORDING_RE.match(recording):
         return _cors((jsonify({"error": "Invalid recording name"}), 400))
 
@@ -100,18 +172,16 @@ def get_upload_urls(request):
         name = f.get("name")
         if not name:
             continue
-        # Validate filename (no path traversal)
         if not _FILENAME_RE.match(name) or ".." in name:
             continue
         blob = _bucket.blob(f"recordings/{recording}/{name}")
         if blob.exists():
             urls[name] = None
         else:
-            # Refresh credentials to get a valid access token for IAM signing
             _credentials.refresh(_auth_request)
             urls[name] = blob.generate_signed_url(
                 version="v4",
-                expiration=timedelta(minutes=EXPIRY_MINUTES),
+                expiration=timedelta(minutes=UPLOAD_EXPIRY_MINUTES),
                 method="PUT",
                 content_type=f.get("content_type", "application/octet-stream"),
                 service_account_email=_credentials.service_account_email,

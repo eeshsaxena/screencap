@@ -13,6 +13,7 @@ else:
 
 _DEFAULT_BASE = Path.home() / ".screencap"
 _DEFAULT_RECORDINGS = _DEFAULT_BASE / "recordings"
+_DEFAULT_DOWNLOADS = _DEFAULT_BASE / "downloads"
 _CONFIG_PATH = _DEFAULT_BASE / "config.toml"
 
 _config_cache: dict | None = None
@@ -84,6 +85,18 @@ def get_auto_name_local_only() -> bool:
         return env.lower() in ("1", "true", "yes")
     cfg = _load_toml()
     return cfg.get("auto_name_local_only", False)
+
+
+def get_downloads_dir() -> Path:
+    """Return downloads directory, creating it if needed."""
+    env = os.environ.get("SCREENCAP_DOWNLOADS_DIR")
+    if env:
+        p = Path(env)
+    else:
+        cfg = _load_toml()
+        p = Path(cfg.get("downloads_dir", str(_DEFAULT_DOWNLOADS)))
+    p.mkdir(parents=True, exist_ok=True)
+    return p
 
 
 def get_base_dir() -> Path:
