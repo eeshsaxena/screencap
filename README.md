@@ -24,7 +24,7 @@ To **upgrade**, run the same command — it overwrites the existing binary with 
 To install a specific version:
 
 ```bash
-SCREENCAP_VERSION=0.2.0 curl -sSf https://storage.googleapis.com/screencap-releases/releases/install.sh | sh
+curl -sSf https://storage.googleapis.com/screencap-releases/releases/install.sh | SCREENCAP_VERSION=0.2.0 sh
 ```
 
 ### From source
