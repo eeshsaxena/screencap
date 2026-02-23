@@ -11,7 +11,13 @@ import time
 import av
 import pytest
 
-from openadapt_capture.video import _FRAG_MP4_OPTIONS, extract_frames
+from openadapt_capture.video import (
+    _FRAG_MP4_OPTIONS,
+    _is_fragmented_mp4,
+    extract_frames,
+    get_video_info,
+    move_moov_atom,
+)
 
 
 class TestFmp4WriteReadRoundtrip:
@@ -153,3 +159,139 @@ class TestStandardMp4BackwardCompat:
         # Read back with extract_frames
         frames = extract_frames(str(output), [0.0, 0.5])
         assert len(frames) == 2
+
+
+# ---------------------------------------------------------------------------
+# Helpers
+# ---------------------------------------------------------------------------
+
+
+def _write_test_video(path, fmp4=False, num_frames=48, fps=24):
+    """Write a test video with known frame count and fps."""
+    opts = _FRAG_MP4_OPTIONS if fmp4 else {}
+    container = av.open(str(path), mode="w", container_options=opts)
+    stream = container.add_stream("libx264", rate=fps)
+    stream.width, stream.height = 100, 100
+    stream.pix_fmt = "yuv444p"
+    stream.options = {"crf": "0", "preset": "ultrafast", "g": "12"}
+    for _ in range(num_frames):
+        frame = av.VideoFrame(100, 100, "rgb24")
+        for packet in stream.encode(frame):
+            container.mux(packet)
+    for packet in stream.encode():
+        container.mux(packet)
+    container.close()
+
+
+# ---------------------------------------------------------------------------
+# Test 4: get_video_info duration normalization
+# ---------------------------------------------------------------------------
+
+
+class TestGetVideoInfoDuration:
+    """Test 4: get_video_info returns correct duration for both formats."""
+
+    def test_get_video_info_duration_standard_mp4(self, tmp_path):
+        """Duration in seconds for a standard MP4 file (stream.duration path)."""
+        path = tmp_path / "standard.mp4"
+        _write_test_video(path, fmp4=False, num_frames=48, fps=24)
+
+        info = get_video_info(str(path))
+        assert info["duration"] is not None
+        # 48 frames at 24fps = 2.0 seconds
+        assert abs(info["duration"] - 2.0) < 0.1
+
+    def test_get_video_info_duration_fmp4(self, tmp_path):
+        """Duration in seconds for a fragmented MP4 file."""
+        path = tmp_path / "fmp4.mp4"
+        _write_test_video(path, fmp4=True, num_frames=48, fps=24)
+
+        info = get_video_info(str(path))
+        assert info["duration"] is not None
+        assert abs(info["duration"] - 2.0) < 0.1
+
+    def test_get_video_info_duration_fallback_branch(self, tmp_path):
+        """Exercise get_video_info() fallback by forcing stream.duration=None."""
+        from types import SimpleNamespace
+        from unittest.mock import patch
+
+        path = tmp_path / "fmp4.mp4"
+        _write_test_video(path, fmp4=True, num_frames=48, fps=24)
+
+        # Open once to capture real metadata for the shim.
+        real_container = av.open(str(path))
+        real_stream = real_container.streams.video[0]
+        container_duration_us = real_container.duration
+        assert container_duration_us is not None, "fMP4 container.duration is None"
+
+        fake_stream = SimpleNamespace(
+            duration=None,  # Force fallback branch
+            time_base=real_stream.time_base,
+            width=real_stream.width,
+            height=real_stream.height,
+            average_rate=real_stream.average_rate,
+            codec_context=SimpleNamespace(
+                codec=SimpleNamespace(name=real_stream.codec_context.codec.name),
+            ),
+            frames=real_stream.frames,
+        )
+        fake_container = SimpleNamespace(
+            streams=SimpleNamespace(video=[fake_stream]),
+            duration=container_duration_us,
+            close=real_container.close,
+        )
+
+        with patch("openadapt_capture.video.av.open", return_value=fake_container):
+            info = get_video_info(str(path))
+
+        assert info["duration"] is not None
+        assert abs(info["duration"] - 2.0) < 0.1, (
+            f"Expected ~2.0s, got {info['duration']}s "
+            f"(raw container.duration={container_duration_us})"
+        )
+
+
+# ---------------------------------------------------------------------------
+# Tests for _is_fragmented_mp4 and move_moov_atom guard
+# ---------------------------------------------------------------------------
+
+
+class TestIsFragmentedMp4:
+    """Tests for the _is_fragmented_mp4 binary box scanner."""
+
+    def test_detects_fmp4(self, tmp_path):
+        """_is_fragmented_mp4 returns True for fMP4 files."""
+        path = tmp_path / "fmp4.mp4"
+        _write_test_video(path, fmp4=True, num_frames=24)
+        assert _is_fragmented_mp4(str(path)) is True
+
+    def test_detects_standard_mp4(self, tmp_path):
+        """_is_fragmented_mp4 returns False for standard MP4 files."""
+        path = tmp_path / "standard.mp4"
+        _write_test_video(path, fmp4=False, num_frames=24)
+        assert _is_fragmented_mp4(str(path)) is False
+
+    def test_returns_false_for_nonexistent_file(self):
+        """_is_fragmented_mp4 returns False for missing files."""
+        assert _is_fragmented_mp4("/nonexistent/path.mp4") is False
+
+    def test_returns_false_for_empty_file(self, tmp_path):
+        """_is_fragmented_mp4 returns False for empty files."""
+        path = tmp_path / "empty.mp4"
+        path.write_bytes(b"")
+        assert _is_fragmented_mp4(str(path)) is False
+
+
+class TestMoveMovAtomGuard:
+    """Tests that move_moov_atom skips fMP4 files."""
+
+    def test_skips_fmp4(self, tmp_path):
+        """move_moov_atom returns early for fMP4 files without running ffmpeg."""
+        from unittest.mock import patch
+
+        path = tmp_path / "fmp4.mp4"
+        _write_test_video(path, fmp4=True, num_frames=24)
+
+        with patch("subprocess.run") as mock_run:
+            move_moov_atom(str(path))
+            mock_run.assert_not_called()

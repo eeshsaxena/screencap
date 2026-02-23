@@ -8,6 +8,7 @@ and legacy functional API (initialize/write/finalize) copied from legacy OpenAda
 from __future__ import annotations
 
 import os
+import struct
 import subprocess
 import tempfile
 import threading
@@ -417,6 +418,48 @@ def finalize_video_writer(
     logger.info("done")
 
 
+def _is_fragmented_mp4(video_file_path: str) -> bool:
+    """Check if an MP4 file is fragmented by scanning for moof boxes.
+
+    Walks top-level MP4 box headers per ISO 14496-12 section 4.2:
+      - Standard box: 4-byte size (big-endian) + 4-byte type
+      - box_size == 1: 64-bit largesize in next 8 bytes
+      - box_size == 0: box extends to end of file (last box)
+    The presence of any 'moof' box is the definitive indicator of fMP4.
+    """
+    try:
+        with open(video_file_path, "rb") as f:
+            file_size = f.seek(0, 2)
+            f.seek(0)
+            while True:
+                box_start = f.tell()
+                header = f.read(8)
+                if len(header) < 8:
+                    break
+                box_size = struct.unpack(">I", header[:4])[0]
+                box_type = header[4:8]
+
+                if box_size == 1:
+                    ext = f.read(8)
+                    if len(ext) < 8:
+                        break
+                    box_size = struct.unpack(">Q", ext)[0]
+                elif box_size == 0:
+                    box_size = file_size - box_start
+
+                if box_type == b"moof":
+                    return True
+                if box_size < 8:
+                    break
+                next_box = box_start + box_size
+                if next_box <= box_start or next_box > file_size:
+                    break
+                f.seek(next_box)
+    except (OSError, struct.error):
+        pass
+    return False
+
+
 def move_moov_atom(input_file: str, output_file: str = None) -> None:
     """Moves the moov atom to the beginning of the video file using ffmpeg.
 
@@ -429,6 +472,10 @@ def move_moov_atom(input_file: str, output_file: str = None) -> None:
         output_file (str, optional): The path to the output MP4 file where the moov
             atom is at the beginning. If None, modifies the input file in place.
     """
+    if _is_fragmented_mp4(input_file):
+        logger.info("Skipping faststart: file is already fragmented MP4")
+        return
+
     import shutil
 
     if not shutil.which("ffmpeg"):
@@ -556,9 +603,15 @@ def get_video_info(video_path: str | Path) -> dict:
     video_stream = video_container.streams.video[0]
 
     info = {
-        "duration": float(video_stream.duration * video_stream.time_base)
-        if video_stream.duration
-        else None,
+        "duration": (
+            float(video_stream.duration * video_stream.time_base)
+            if video_stream.duration
+            else (
+                float(video_container.duration) / 1_000_000.0
+                if video_container.duration is not None
+                else None
+            )
+        ),
         "width": video_stream.width,
         "height": video_stream.height,
         "fps": float(video_stream.average_rate) if video_stream.average_rate else None,
