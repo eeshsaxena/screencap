@@ -26,7 +26,7 @@ console = Console()
 UPLOAD_STATUS_FILE = ".upload_status.json"
 
 DEFAULT_UPLOAD_URL = (
-    "https://screencap-recording-signed-url-397234807794.southamerica-east1.run.app"
+    "https://get-upload-urls-wyldgq6aqa-rj.a.run.app"
 )
 
 CONTENT_TYPES: dict[str, str] = {

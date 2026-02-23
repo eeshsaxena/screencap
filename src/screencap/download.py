@@ -25,7 +25,7 @@ console = Console()
 DOWNLOAD_STATUS_FILE = ".download_status.json"
 
 DEFAULT_DOWNLOAD_URL = (
-    "https://screencap-recording-signed-url-397234807794.southamerica-east1.run.app"
+    "https://get-upload-urls-wyldgq6aqa-rj.a.run.app"
 )
 
 
