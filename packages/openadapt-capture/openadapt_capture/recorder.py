@@ -204,7 +204,7 @@ def process_events(
     num_window_events: multiprocessing.Value,
     num_browser_events: multiprocessing.Value,
     num_video_events: multiprocessing.Value,
-    capture_dir: Optional[str] = None,
+    drop_counts: Optional[dict] = None,
 ) -> None:
     """Process events from the event queue and write them to write queues.
 
@@ -224,7 +224,8 @@ def process_events(
         num_window_events: A counter for the number of window events.
         num_browser_events: A counter for the number of browser events.
         num_video_events: A counter for the number of video events.
-        capture_dir: Path to the capture directory for persisting drop counts.
+        drop_counts: Mutable dict populated with drop counts by event type.
+            Caller (record()) is responsible for persisting to profiling.json.
     """
     utils.set_start_time(recording.timestamp)
 
@@ -333,7 +334,9 @@ def process_events(
             # Drop-coherent fan-out: collect all events for this action as a
             # group. If any put fails, drop the entire group to prevent broken
             # cross-references (e.g., action row pointing to nonexistent screenshot).
-            events_to_write = [(event, action_write_q, write_action_event)]
+            # Action is written LAST so that if a dependency (screen, video,
+            # window) fails, the action "anchor" record is never committed.
+            events_to_write = []
             if prev_saved_screen_timestamp < prev_screen_event.timestamp:
                 events_to_write.append(
                     (prev_screen_event, screen_write_q, write_screen_event)
@@ -348,6 +351,8 @@ def process_events(
                     events_to_write.append(
                         (prev_window_event, window_write_q, write_window_event)
                     )
+            # Action event last — the anchor record that references the others
+            events_to_write.append((event, action_write_q, write_action_event))
 
             # Try to write all; if any fails, drop the entire group
             all_ok = True
@@ -360,14 +365,14 @@ def process_events(
 
             if all_ok:
                 num_action_events.value += 1
-                if any(ev.type == "screen" for ev, _, _ in events_to_write[1:]):
+                if any(ev.type == "screen" for ev, _, _ in events_to_write):
                     num_screen_events.value += 1
                     prev_saved_screen_timestamp = prev_screen_event.timestamp
                 if any(
-                    ev.type == "screen/video" for ev, _, _ in events_to_write[1:]
+                    ev.type == "screen/video" for ev, _, _ in events_to_write
                 ):
                     num_video_events.value += 1
-                if any(ev.type == "window" for ev, _, _ in events_to_write[1:]):
+                if any(ev.type == "window" for ev, _, _ in events_to_write):
                     num_window_events.value += 1
                     prev_saved_window_timestamp = prev_window_event.timestamp
             else:
@@ -380,21 +385,11 @@ def process_events(
         del prev_event
         prev_event = event
 
-    # Persist drop counts for observability
+    # Export drop counts to caller via shared dict
     if any(_drops.values()):
         logger.warning(f"Events dropped during recording: {dict(_drops)}")
-        if capture_dir:
-            try:
-                profiling_path = os.path.join(capture_dir, "profiling.json")
-                profiling_data = {}
-                if os.path.exists(profiling_path):
-                    with open(profiling_path) as f:
-                        profiling_data = json.load(f)
-                profiling_data["drops"] = dict(_drops)
-                with open(profiling_path, "w") as f:
-                    json.dump(profiling_data, f, indent=2)
-            except Exception as exc:
-                logger.warning(f"Failed to persist drop counts: {exc}")
+        if drop_counts is not None:
+            drop_counts.update(_drops)
 
     logger.info("Done")
 
@@ -969,10 +964,10 @@ def read_window_events(
                     ),
                     timeout=0.5,
                 )
+                prev_window_data = window_data
             except queue.Full:
                 logger.debug("event_q full, dropping window event")
-                # don't update prev_window_data so we retry on next change check
-        prev_window_data = window_data
+                # prev_window_data stays unchanged so we retry next iteration
         time.sleep(poll_interval)
 
 
@@ -1839,6 +1834,8 @@ def record(
     video_write_q = sq.SynchronizedQueue(maxsize=_IMAGE_QUEUE_SIZE)
     # perf_q: unbounded — tiny 3-tuples (~120 bytes each), bounded perf_q
     # risks cascade deadlock (all writers block → all write queues fill)
+    # Shared dict for event_processor thread to report drop counts back to record()
+    _event_drop_counts = {}
     perf_q = sq.SynchronizedQueue()
     if terminate_processing is None:
         terminate_processing = multiprocessing.Event()
@@ -1960,7 +1957,7 @@ def record(
             num_window_events,
             num_browser_events,
             num_video_events,
-            capture_dir,
+            _event_drop_counts,
         ),
     )
     event_processor.start()
@@ -2255,6 +2252,10 @@ def record(
             "total_avg_ms": round(sum(total_durs) / len(total_durs) * 1000, 1),
             "total_max_ms": round(max(total_durs) * 1000, 1),
         }
+
+    # Merge drop counts from event_processor thread
+    if _event_drop_counts:
+        _profile_data["drops"] = dict(_event_drop_counts)
 
     _profile_path = os.path.join(capture_dir, "profiling.json")
     try:
