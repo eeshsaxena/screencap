@@ -24,6 +24,14 @@ from openadapt_capture.config import config
 if TYPE_CHECKING:
     from PIL import Image
 
+# fMP4: crash-safe — writes self-contained fragments to disk progressively,
+# so the file is playable even if the process is killed mid-recording.
+# See docs/plans/2026-02-22-fix-unrecoverable-mp4-on-crash-plan.md
+_FRAG_MP4_OPTIONS: dict[str, str] = {
+    "movflags": "frag_keyframe+empty_moov",
+    "flush_packets": "1",
+}
+
 
 # =============================================================================
 # Video Writer
@@ -89,12 +97,14 @@ class VideoWriter:
 
     def _init_stream(self) -> None:
         """Initialize the video stream."""
-        self._container = av.open(str(self.output_path), mode="w")
+        self._container = av.open(
+            str(self.output_path), mode="w", container_options=_FRAG_MP4_OPTIONS,
+        )
         self._stream = self._container.add_stream(self.codec, rate=self.fps)
         self._stream.width = self.width
         self._stream.height = self.height
         self._stream.pix_fmt = self.pix_fmt
-        self._stream.options = {"crf": str(self.crf), "preset": self.preset}
+        self._stream.options = {"crf": str(self.crf), "preset": self.preset, "g": str(config.VIDEO_GOP_SIZE)}
 
     @property
     def start_time(self) -> float | None:
@@ -256,12 +266,12 @@ def initialize_video_writer(
             container, stream, and base timestamp.
     """
     logger.info("initializing video stream...")
-    video_container = av.open(output_path, mode="w")
+    video_container = av.open(output_path, mode="w", container_options=_FRAG_MP4_OPTIONS)
     video_stream = video_container.add_stream(codec, rate=fps)
     video_stream.width = width
     video_stream.height = height
     video_stream.pix_fmt = pix_fmt
-    video_stream.options = {"crf": str(crf), "preset": preset}
+    video_stream.options = {"crf": str(crf), "preset": preset, "g": str(config.VIDEO_GOP_SIZE)}
 
     base_timestamp = utils.get_timestamp()
 

@@ -44,6 +44,7 @@ class Settings(BaseSettings):
     LOG_MEMORY: bool = False
     VIDEO_ENCODING: str = "libx264"
     VIDEO_PIXEL_FORMAT: str = "yuv444p"
+    VIDEO_GOP_SIZE: int = 48  # keyframe interval (frames); bounds max crash loss to 1 GOP
     # sequences that when typed, will stop the recording of ActionEvents
     STOP_SEQUENCES: list[list[str]] = [
         list(stop_str) for stop_str in STOP_STRS

@@ -224,7 +224,7 @@ def create_html(
                 import soundfile as sf
                 info = sf.info(str(audio_path))
                 audio_duration = info.duration
-            except ImportError:
+            except Exception:
                 pass
             # Load transcript if exists (prefer JSON with timestamps)
             transcript_json_path = capture_path / "transcript.json"
