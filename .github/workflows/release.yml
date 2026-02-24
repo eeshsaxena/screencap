@@ -16,9 +16,15 @@ jobs:
           - runner: macos-14
             arch: arm64
             python-arch: arm64
+            os: macos
           - runner: macos-14    # x86_64 via Rosetta on Apple Silicon runner
             arch: x86_64
             python-arch: x64
+            os: macos
+          - runner: windows-latest
+            arch: x86_64
+            python-arch: x64
+            os: windows
     runs-on: ${{ matrix.runner }}
     steps:
       - uses: actions/checkout@v4
@@ -27,35 +33,56 @@ jobs:
         with:
           python-version: '3.12'
           architecture: ${{ matrix.python-arch }}
-
-      - uses: actions/cache@v4
-        with:
-          path: ~/.cache/pip
-          key: ${{ runner.os }}-${{ matrix.arch }}-pip-${{ hashFiles('pyproject.toml') }}
+          cache: 'pip'
 
       - name: Install dependencies
         run: pip install -e ".[privacy]" && pip install pyinstaller
+        shell: bash
 
       - name: Audit dependencies
         run: pip install pip-audit && pip-audit
+        shell: bash
 
       - name: Build frozen binary
         run: pyinstaller pyinstaller/screencap.spec
+        shell: bash
 
       - name: Smoke test
         run: ./dist/screencap/screencap --help
+        if: matrix.os != 'windows'
+        shell: bash
 
-      - name: Package tarball and checksum
+      - name: Smoke test (Windows)
+        run: dist\screencap\screencap.exe --help
+        if: matrix.os == 'windows'
+        shell: cmd
+
+      - name: Package tarball and checksum (macOS)
+        if: matrix.os == 'macos'
+        shell: bash
         run: |
           VERSION=${GITHUB_REF#refs/tags/v}
-          tar czf screencap-${VERSION}-${{ matrix.arch }}.tar.gz -C dist screencap/
-          shasum -a 256 screencap-${VERSION}-${{ matrix.arch }}.tar.gz >> checksums.sha256
+          tar czf screencap-${VERSION}-macos-${{ matrix.arch }}.tar.gz -C dist screencap/
+          shasum -a 256 screencap-${VERSION}-macos-${{ matrix.arch }}.tar.gz >> checksums.sha256
+
+      - name: Package zip and checksum (Windows)
+        if: matrix.os == 'windows'
+        shell: pwsh
+        env:
+          REF_NAME: ${{ github.ref_name }}
+        run: |
+          $VERSION = $env:REF_NAME.TrimStart("v")
+          Compress-Archive -Path dist\screencap -DestinationPath "screencap-${VERSION}-windows-x86_64.zip"
+          $hash = (Get-FileHash "screencap-${VERSION}-windows-x86_64.zip" -Algorithm SHA256).Hash.ToLower()
+          "${hash}  screencap-${VERSION}-windows-x86_64.zip" | Set-Content -NoNewline -Encoding ascii checksums.sha256
+          Add-Content checksums.sha256 ""
 
       - uses: actions/upload-artifact@v4
         with:
-          name: screencap-${{ matrix.arch }}
+          name: screencap-${{ matrix.os }}-${{ matrix.arch }}
           path: |
             screencap-*.tar.gz
+            screencap-*.zip
             checksums.sha256
 
   release:
@@ -67,7 +94,7 @@ jobs:
       - uses: actions/download-artifact@v4
 
       - name: Merge checksums
-        run: cat */checksums.sha256 > checksums.sha256
+        run: cat */checksums.sha256 | tr -d '\r' > checksums.sha256
 
       - id: auth
         uses: google-github-actions/auth@v2
@@ -80,9 +107,13 @@ jobs:
         run: |
           VERSION=${GITHUB_REF#refs/tags/v}
           # Upload versioned artifacts
-          gcloud storage cp */screencap-*.tar.gz gs://screencap-releases/releases/v${VERSION}/
+          shopt -s nullglob
+          for f in */screencap-*.tar.gz */screencap-*.zip; do
+            gcloud storage cp "$f" "gs://screencap-releases/releases/v${VERSION}/"
+          done
           gcloud storage cp checksums.sha256 gs://screencap-releases/releases/v${VERSION}/
-          # Upload/update install script
+          # Upload/update install scripts
           gcloud storage cp scripts/install.sh gs://screencap-releases/releases/install.sh
+          gcloud storage cp scripts/install.ps1 gs://screencap-releases/releases/install.ps1
           # Update latest version pointer
           echo "$VERSION" | gcloud storage cp - gs://screencap-releases/releases/latest.txt

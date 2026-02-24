@@ -6,40 +6,44 @@ Builds a --onedir bundle. Key decisions:
 - All PyObjC hooks inlined here (no built-in hooks exist — pyinstaller/pyinstaller#833)
 - ApplicationServices requires CoreText (undocumented — pyobjc/pyobjc#581)
 - upx=False: UPX breaks macOS codesigning
+- Cross-platform: conditionally includes macOS PyObjC or Windows deps
 """
 
-from PyInstaller.utils.hooks import collect_all, copy_metadata
+import os
+import sys
 
-# ---------------------------------------------------------------------------
-# PyObjC framework collections
-# No built-in hooks exist for pyobjc-framework-* packages.
-# collect_all() gathers binaries, datas, and hidden imports for each.
-# ---------------------------------------------------------------------------
-pyobjc_packages = [
-    'objc',
-    'Quartz',
-    'CoreGraphics',
-    'QuartzCore',
-    'AppKit',
-    'Foundation',          # imported independently in vendored packages
-    'ApplicationServices',
-    'CoreText',            # undocumented dep of ApplicationServices
-    'CoreWLAN',
-]
+from PyInstaller.utils.hooks import collect_all, copy_metadata
 
 all_datas = []
 all_binaries = []
 all_hiddenimports = []
 
-for pkg in pyobjc_packages:
-    try:
-        d, b, h = collect_all(pkg)
-        all_datas += d
-        all_binaries += b
-        all_hiddenimports += h
-    except Exception:
-        # Package may not be installed (e.g. CoreWLAN on non-mac CI)
-        pass
+# ---------------------------------------------------------------------------
+# macOS: PyObjC framework collections
+# No built-in hooks exist for pyobjc-framework-* packages.
+# collect_all() gathers binaries, datas, and hidden imports for each.
+# ---------------------------------------------------------------------------
+if sys.platform == 'darwin':
+    pyobjc_packages = [
+        'objc',
+        'Quartz',
+        'CoreGraphics',
+        'QuartzCore',
+        'AppKit',
+        'Foundation',          # imported independently in vendored packages
+        'ApplicationServices',
+        'CoreText',            # undocumented dep of ApplicationServices
+        'CoreWLAN',
+    ]
+
+    for pkg in pyobjc_packages:
+        try:
+            d, b, h = collect_all(pkg)
+            all_datas += d
+            all_binaries += b
+            all_hiddenimports += h
+        except Exception:
+            pass
 
 # ---------------------------------------------------------------------------
 # spaCy + NLP dependency metadata
@@ -81,10 +85,6 @@ except Exception:
 # Hidden imports not auto-detected by PyInstaller
 # ---------------------------------------------------------------------------
 hidden_imports = [
-    # pynput macOS backend
-    'pynput.keyboard._darwin',
-    'pynput.mouse._darwin',
-    'pynput._util.darwin',
     # spaCy language data
     'spacy.lang.en',
     # Cython extensions used by spaCy/thinc
@@ -101,12 +101,25 @@ hidden_imports = [
     'presidio_anonymizer',
 ]
 
+# Platform-specific pynput backends
+if sys.platform == 'darwin':
+    hidden_imports += [
+        'pynput.keyboard._darwin',
+        'pynput.mouse._darwin',
+        'pynput._util.darwin',
+    ]
+elif sys.platform == 'win32':
+    hidden_imports += [
+        'pynput.keyboard._win32',
+        'pynput.mouse._win32',
+        'pynput._util.win32',
+    ]
+
 all_hiddenimports += hidden_imports
 
 # ---------------------------------------------------------------------------
 # Analysis
 # ---------------------------------------------------------------------------
-import os
 _root = os.path.abspath(os.path.join(SPECPATH, '..'))
 
 a = Analysis(

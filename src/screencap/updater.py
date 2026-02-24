@@ -51,29 +51,37 @@ def is_update_available(latest: str) -> bool:
         return False
 
 
-def _detect_arch() -> str:
-    """Return architecture string matching GCS tarball naming."""
+def _detect_platform_arch() -> tuple[str, str]:
+    """Return (os_name, arch) matching GCS archive naming."""
     machine = platform.machine()
     if machine in ("arm64", "aarch64"):
-        return "arm64"
-    return "x86_64"
+        arch = "arm64"
+    else:
+        arch = "x86_64"
+
+    if sys.platform == "win32":
+        return "windows", arch
+    return "macos", arch
 
 
 def _download_and_verify(version: str, dest_dir: Path) -> Path:
-    """Download tarball + checksum, verify, extract. Returns extracted dir."""
-    arch = _detect_arch()
-    tarball_name = f"screencap-{version}-{arch}.tar.gz"
+    """Download archive + checksum, verify, extract. Returns extracted dir."""
+    os_name, arch = _detect_platform_arch()
+    if os_name == "windows":
+        archive_name = f"screencap-{version}-{os_name}-{arch}.zip"
+    else:
+        archive_name = f"screencap-{version}-{os_name}-{arch}.tar.gz"
     base_url = f"{_DIST_BASE_URL}/v{version}"
 
     with tempfile.TemporaryDirectory() as tmpdir:
         tmp = Path(tmpdir)
-        tarball_path = tmp / tarball_name
+        tarball_path = tmp / archive_name
         checksum_path = tmp / "checksums.sha256"
 
         # Download tarball with progress bar
         with Progress() as progress:
             resp = requests.get(
-                f"{base_url}/{tarball_name}",
+                f"{base_url}/{archive_name}",
                 stream=True,
                 timeout=_DOWNLOAD_TIMEOUT,
             )
@@ -96,11 +104,11 @@ def _download_and_verify(version: str, dest_dir: Path) -> Path:
         # Verify checksum
         expected_hash = None
         for line in checksum_path.read_text().splitlines():
-            if tarball_name in line:
+            if archive_name in line:
                 expected_hash = line.split()[0]
                 break
         if not expected_hash:
-            raise RuntimeError(f"No checksum found for {tarball_name}")
+            raise RuntimeError(f"No checksum found for {archive_name}")
 
         actual_hash = hashlib.sha256(tarball_path.read_bytes()).hexdigest()
         if actual_hash != expected_hash:
@@ -129,10 +137,11 @@ def _atomic_swap(install_dir: Path, new_dir: Path) -> None:
     new_dir.rename(install_dir)
 
     # Remove macOS quarantine attributes
-    subprocess.run(
-        ["xattr", "-cr", str(install_dir)],
-        capture_output=True,
-    )
+    if sys.platform == "darwin":
+        subprocess.run(
+            ["xattr", "-cr", str(install_dir)],
+            capture_output=True,
+        )
 
 
 def perform_update(version: str) -> bool:
@@ -167,7 +176,8 @@ def perform_update(version: str) -> bool:
 def re_execute() -> None:
     """Replace current process with the (updated) binary."""
     install_dir = get_base_dir() / "bin" / "screencap"
-    binary = install_dir / "screencap"
+    binary_name = "screencap.exe" if sys.platform == "win32" else "screencap"
+    binary = install_dir / binary_name
     if binary.exists():
         os.execv(str(binary), sys.argv)
 

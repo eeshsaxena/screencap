@@ -1,31 +1,45 @@
 # ScreenCap
 
-macOS CLI for screen recording with built-in privacy scrubbing. Wraps [OpenAdapt](https://github.com/OpenAdaptAI) for capture and PII redaction.
+CLI for screen recording with built-in privacy scrubbing. Wraps [OpenAdapt](https://github.com/OpenAdaptAI) for capture and PII redaction.
+
+| Platform | Recording | Download & Export |
+|----------|-----------|-------------------|
+| macOS | Full support | Full support |
+| Windows | Not supported | Full support |
 
 ## Requirements
 
-- macOS
-- Python >= 3.10
+### macOS
+
+- Python >= 3.10 (from-source installs only)
 - Accessibility permissions (System Settings → Privacy & Security → Accessibility)
 - Screen Recording permissions (System Settings → Privacy & Security → Screen Recording)
+
+### Windows
+
+- Windows 10 or later
+- Python >= 3.10 (from-source installs only)
+- Recording is **not supported** on Windows. The `download`, `export`, and `list` commands work normally. The `view` and `start` commands are not available.
 
 ## Installation
 
 ### Binary (recommended)
 
+**macOS:**
+
 ```bash
 curl -sSf https://storage.googleapis.com/screencap-releases/releases/install.sh | sh
+```
+
+**Windows (PowerShell):**
+
+```powershell
+irm https://storage.googleapis.com/screencap-releases/releases/install.ps1 | iex
 ```
 
 This installs a standalone binary to `~/.screencap/bin/`. No Python required.
 
 To **upgrade**, run the same command — it overwrites the existing binary with the latest version.
-
-To install a specific version:
-
-```bash
-curl -sSf https://storage.googleapis.com/screencap-releases/releases/install.sh | SCREENCAP_VERSION=0.2.0 sh
-```
 
 ### From source
 
@@ -40,8 +54,10 @@ pip install -e ".[dev]"
 
 ## Quick Start
 
+> **Windows users:** The `start` and `view` commands are macOS-only. Use `download`, `export`, and `list` on Windows.
+
 ```bash
-# start recording immediately — no prompts needed
+# start recording immediately — no prompts needed (macOS only)
 screencap start
 
 # Ctrl+C to stop → auto-transcribes audio → LLM names the recording

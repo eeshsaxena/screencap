@@ -244,6 +244,10 @@ def list_cmd(as_json, sort):
 @click.option("--scrubbed", is_flag=True, help="Open the scrubbed version.")
 def view(name, scrubbed):
     """Open recording viewer in browser."""
+    if sys.platform == "win32":
+        console.print("[red]Error:[/red] The view command is not yet supported on Windows.")
+        sys.exit(1)
+
     from screencap.viewer import open_viewer
 
     try:

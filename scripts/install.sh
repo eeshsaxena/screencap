@@ -35,7 +35,7 @@ if [ -z "$VERSION" ]; then
 fi
 
 BASE_URL="${DIST_BASE_URL}/v${VERSION}"
-TARBALL="screencap-${VERSION}-${ARCH}.tar.gz"
+TARBALL="screencap-${VERSION}-macos-${ARCH}.tar.gz"
 
 echo "Installing screencap ${VERSION} for ${ARCH}..."
 
