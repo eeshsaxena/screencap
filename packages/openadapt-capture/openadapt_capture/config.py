@@ -58,11 +58,16 @@ class Settings(BaseSettings):
     # Minimum seconds between accessibility queries (0 = every event)
     AX_QUERY_INTERVAL: float = 0.5
     # Max depth for accessibility tree traversal (lower = less IPC to target app)
-    AX_MAX_DEPTH: int = 2
+    AX_MAX_DEPTH: int = 3
     # Max wall-clock seconds for a single dump_state traversal
     AX_DUMP_TIMEOUT: float = 0.5
     # Per-element IPC timeout in seconds (caps hangs on unresponsive apps)
     AX_ELEMENT_TIMEOUT: float = 1.0
+    # Event-aware AX query routing — different event types get different depths
+    AX_MOVE_QUERY_INTERVAL: float = 1.0   # Longer interval for moves
+    AX_CLICK_MAX_DEPTH: int = 4           # Deeper for clicks
+    AX_MOVE_MAX_DEPTH: int = 1            # Shallow for moves
+    AX_SCROLL_MAX_DEPTH: int = 2          # Medium for scrolls
 
     # Performance plotting
     PLOT_PERFORMANCE: bool = True
@@ -109,6 +114,10 @@ _FIELD_TO_CONFIG_ATTR = {
     "ax_max_depth": "AX_MAX_DEPTH",
     "ax_dump_timeout": "AX_DUMP_TIMEOUT",
     "ax_element_timeout": "AX_ELEMENT_TIMEOUT",
+    "ax_move_query_interval": "AX_MOVE_QUERY_INTERVAL",
+    "ax_click_max_depth": "AX_CLICK_MAX_DEPTH",
+    "ax_move_max_depth": "AX_MOVE_MAX_DEPTH",
+    "ax_scroll_max_depth": "AX_SCROLL_MAX_DEPTH",
 }
 
 
@@ -132,6 +141,10 @@ class RecordingConfig:
     ax_max_depth: int | None = None
     ax_dump_timeout: float | None = None
     ax_element_timeout: float | None = None
+    ax_move_query_interval: float | None = None
+    ax_click_max_depth: int | None = None
+    ax_move_max_depth: int | None = None
+    ax_scroll_max_depth: int | None = None
 
 
 @contextmanager
