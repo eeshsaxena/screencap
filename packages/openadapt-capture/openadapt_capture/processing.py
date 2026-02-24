@@ -14,6 +14,7 @@ from openadapt_capture.events import (
     ActionEvent,
     Event,
     KeyDownEvent,
+    KeyShortcutEvent,
     KeyTypeEvent,
     KeyUpEvent,
     MouseClickEvent,
@@ -64,6 +65,7 @@ def process_events(
     1. Remove invalid keyboard events
     2. Remove redundant mouse move events
     3. Merge consecutive keyboard events → KeyTypeEvent
+    3.5. Detect keyboard shortcuts → KeyShortcutEvent
     4. Merge consecutive mouse move events
     5. Merge consecutive mouse scroll events
     6. Merge consecutive mouse magnify events
@@ -83,6 +85,7 @@ def process_events(
     events = remove_invalid_keyboard_events(events)
     events = remove_redundant_mouse_move_events(events)
     events = merge_consecutive_keyboard_events(events)
+    events = detect_key_shortcuts(events)
     events = merge_consecutive_mouse_move_events(events)
     events = merge_consecutive_mouse_scroll_events(events)
     events = merge_consecutive_mouse_magnify_events(events)
@@ -221,6 +224,83 @@ def merge_consecutive_keyboard_events(events: list[ActionEvent]) -> list[ActionE
     flush_buffer()
 
     return result
+
+
+# =============================================================================
+# Keyboard Shortcut Detection
+# =============================================================================
+
+# Modifier key variants → canonical name
+MODIFIER_MAP = {
+    "ctrl": "ctrl", "ctrl_l": "ctrl", "ctrl_r": "ctrl",
+    "alt": "alt", "alt_l": "alt", "alt_r": "alt",
+    "shift": "shift", "shift_l": "shift", "shift_r": "shift",
+    "cmd": "cmd", "cmd_l": "cmd", "cmd_r": "cmd",
+}
+
+# Canonical modifier → sort position
+MODIFIER_ORDER = {"ctrl": 0, "alt": 1, "shift": 2, "cmd": 3}
+
+
+def detect_key_shortcuts(events: list[ActionEvent]) -> list[ActionEvent]:
+    """Convert KeyTypeEvent with modifiers into KeyShortcutEvent.
+
+    Args:
+        events: List of events (should already have keyboard events merged).
+
+    Returns:
+        Events with shortcuts converted from KeyTypeEvent to KeyShortcutEvent.
+    """
+    result = []
+    for event in events:
+        if isinstance(event, KeyTypeEvent):
+            shortcut = _try_convert_to_shortcut(event)
+            result.append(shortcut if shortcut else event)
+        else:
+            result.append(event)
+    return result
+
+
+def _try_convert_to_shortcut(event: KeyTypeEvent) -> KeyShortcutEvent | None:
+    """Check if a KeyTypeEvent is actually a keyboard shortcut.
+
+    Args:
+        event: A KeyTypeEvent to check.
+
+    Returns:
+        KeyShortcutEvent if it's a shortcut, None otherwise.
+    """
+    modifiers_found: set[str] = set()
+    regular_key: str | None = None
+
+    for child in event.children:
+        if not isinstance(child, KeyDownEvent):
+            continue
+        key_id = child.key_name or child.key_char or child.key_vk or ""
+        if key_id in MODIFIER_MAP:
+            modifiers_found.add(MODIFIER_MAP[key_id])
+        elif regular_key is None:
+            regular_key = key_id
+
+    if not modifiers_found or regular_key is None:
+        return None  # No modifiers, or modifier-only combo
+
+    # Shift+printable = typing, not shortcut
+    # (unless Ctrl/Alt/Cmd is also held)
+    if not (modifiers_found - {"shift"}):
+        # Only Shift — check if the regular key is printable
+        if len(regular_key) == 1 and regular_key.isprintable():
+            return None  # Shift+A = typing "A"
+
+    # Build canonical keys list
+    sorted_mods = sorted(modifiers_found, key=lambda m: MODIFIER_ORDER.get(m, 99))
+    keys = sorted_mods + [regular_key]
+
+    return KeyShortcutEvent(
+        timestamp=event.timestamp,
+        keys=keys,
+        children=list(event.children),
+    )
 
 
 def merge_consecutive_mouse_move_events(events: list[ActionEvent]) -> list[ActionEvent]:
@@ -554,7 +634,7 @@ def detect_drag_events(
     # Event types that are tolerated during a drag — emitted inline and
     # also captured as children of the drag.
     DRAG_SIBLING_TYPES = (
-        KeyTypeEvent, KeyDownEvent, KeyUpEvent,
+        KeyTypeEvent, KeyShortcutEvent, KeyDownEvent, KeyUpEvent,
         MouseScrollEvent,
         MouseMagnifyEvent, MouseRotateEvent, MouseSmartMagnifyEvent,
     )
@@ -673,6 +753,7 @@ def get_action_events(events: list[Event]) -> list[ActionEvent]:
         MouseDoubleClickEvent,
         MouseDragEvent,
         KeyTypeEvent,
+        KeyShortcutEvent,
     )
     return [e for e in events if isinstance(e, action_types)]
 

@@ -14,6 +14,7 @@ from openadapt_capture.events import (
 )
 from openadapt_capture.events import (
     KeyDownEvent,
+    KeyShortcutEvent,
     KeyTypeEvent,
     KeyUpEvent,
     MouseButton,
@@ -173,6 +174,8 @@ class Action:
     @property
     def text(self) -> str | None:
         """Typed text for keyboard actions."""
+        if isinstance(self.event, KeyShortcutEvent):
+            return self.event.text
         if isinstance(self.event, KeyTypeEvent):
             return self.event.text
         return None
@@ -182,7 +185,10 @@ class Action:
         """Key names for keyboard actions (useful when text is empty).
 
         Returns list of key names like ['ctrl', 'space'] or ['enter'].
+        For KeyShortcutEvent, returns the canonical keys list directly.
         """
+        if isinstance(self.event, KeyShortcutEvent):
+            return self.event.keys
         if isinstance(self.event, KeyTypeEvent):
             key_names = []
             seen = set()
