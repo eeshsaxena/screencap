@@ -96,43 +96,70 @@ def create_db(db_path: str, echo: bool = False) -> tuple:
     return engine, Session
 
 
+def _sa_type_to_sqlite(sa_col) -> str:
+    """Map a SQLAlchemy column type to a SQLite type string for ALTER TABLE."""
+    from sqlalchemy import Boolean, Integer, LargeBinary, Numeric, String, Text, JSON
+    from sqlalchemy import TypeDecorator
+
+    col_type = sa_col.type
+    # Unwrap TypeDecorator (e.g. ForceFloat → Numeric)
+    if isinstance(col_type, TypeDecorator):
+        col_type = col_type.impl
+
+    sa_type = type(col_type)
+    mapping = {
+        Integer: "INTEGER",
+        String: "TEXT",
+        Text: "TEXT",
+        Boolean: "BOOLEAN",
+        Numeric: "NUMERIC",
+        LargeBinary: "BLOB",
+        JSON: "TEXT",
+    }
+    sqlite_type = mapping.get(sa_type, "TEXT")
+
+    if sa_col.default is not None and sa_col.default.arg is not None:
+        arg = sa_col.default.arg
+        if isinstance(arg, bool):
+            sqlite_type += f" DEFAULT {int(arg)}"
+        elif isinstance(arg, (int, float)):
+            sqlite_type += f" DEFAULT {arg}"
+
+    return sqlite_type
+
+
 def _migrate_schema(db_path: str) -> None:
     """Add missing columns to existing databases.
 
-    Called before opening a session so that SQLAlchemy queries don't fail
-    on old databases that lack newer columns.
+    Compares every table that exists in the DB against the SQLAlchemy model
+    definitions and issues ALTER TABLE ADD COLUMN for anything missing.
+    Called before opening a session so that queries don't fail on old databases.
     """
     import sqlite3
+
+    from openadapt_capture.db import models  # noqa: F401 — registers models
 
     conn = sqlite3.connect(db_path)
     cur = conn.cursor()
 
-    # --- recording table ---
-    cur.execute("PRAGMA table_info(recording)")
-    rec_cols = {row[1] for row in cur.fetchall()}
-    if "pixel_ratio" not in rec_cols:
+    for table in Base.metadata.sorted_tables:
+        # Only migrate tables that already exist in the DB.
         cur.execute(
-            "ALTER TABLE recording ADD COLUMN pixel_ratio REAL DEFAULT 1.0"
+            "SELECT name FROM sqlite_master WHERE type='table' AND name=?",
+            (table.name,),
         )
+        if not cur.fetchone():
+            continue
 
-    # --- action_event table ---
-    cur.execute("PRAGMA table_info(action_event)")
-    ae_cols = {row[1] for row in cur.fetchall()}
+        cur.execute(f"PRAGMA table_info({table.name})")
+        existing_cols = {row[1] for row in cur.fetchall()}
 
-    # Columns added after the initial schema, with their SQLite types.
-    _new_action_cols = [
-        ("mouse_pressure", "NUMERIC"),
-        ("modifier_flags", "INTEGER"),
-        ("scroll_phase", "INTEGER"),
-        ("momentum_phase", "INTEGER"),
-        ("is_continuous", "BOOLEAN"),
-        ("disabled", "BOOLEAN DEFAULT 0"),
-    ]
-    for col_name, col_type in _new_action_cols:
-        if col_name not in ae_cols:
-            cur.execute(
-                f"ALTER TABLE action_event ADD COLUMN {col_name} {col_type}"
-            )
+        for col in table.columns:
+            if col.name not in existing_cols:
+                sqlite_type = _sa_type_to_sqlite(col)
+                cur.execute(
+                    f"ALTER TABLE {table.name} ADD COLUMN {col.name} {sqlite_type}"
+                )
 
     conn.commit()
     conn.close()
