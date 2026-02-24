@@ -433,7 +433,7 @@ class TestProcessEvents:
         assert "KeyTypeEvent" in types
 
         # Check that keyboard events were merged into KeyTypeEvents
+        # The sequential merge step combines "a" and "b" (200ms apart < 500ms threshold)
         key_types = [e for e in result if isinstance(e, KeyTypeEvent)]
-        assert len(key_types) == 2
-        assert key_types[0].text == "a"
-        assert key_types[1].text == "b"
+        assert len(key_types) == 1
+        assert key_types[0].text == "ab"

@@ -58,6 +58,7 @@ def process_events(
     events: list[ActionEvent],
     double_click_interval: float = DOUBLE_CLICK_INTERVAL_SECONDS,
     double_click_distance: float = DOUBLE_CLICK_DISTANCE_PIXELS,
+    key_type_merge_interval: float = KEY_TYPE_MERGE_INTERVAL_SECONDS,
 ) -> list[ActionEvent]:
     """Process raw events through the full pipeline.
 
@@ -66,6 +67,7 @@ def process_events(
     2. Remove redundant mouse move events
     3. Merge consecutive keyboard events → KeyTypeEvent
     3.5. Detect keyboard shortcuts → KeyShortcutEvent
+    3.75. Merge sequential key type events → word-level KeyTypeEvent
     4. Merge consecutive mouse move events
     5. Merge consecutive mouse scroll events
     6. Merge consecutive mouse magnify events
@@ -77,6 +79,7 @@ def process_events(
         events: Raw action events.
         double_click_interval: Time threshold for double-click detection (seconds).
         double_click_distance: Distance threshold for double-click detection (pixels).
+        key_type_merge_interval: Time threshold for merging sequential KeyTypeEvents (seconds).
 
     Returns:
         Processed events with merged actions.
@@ -86,6 +89,7 @@ def process_events(
     events = remove_redundant_mouse_move_events(events)
     events = merge_consecutive_keyboard_events(events)
     events = detect_key_shortcuts(events)
+    events = merge_sequential_key_type_events(events, interval=key_type_merge_interval)
     events = merge_consecutive_mouse_move_events(events)
     events = merge_consecutive_mouse_scroll_events(events)
     events = merge_consecutive_mouse_magnify_events(events)
@@ -301,6 +305,85 @@ def _try_convert_to_shortcut(event: KeyTypeEvent) -> KeyShortcutEvent | None:
         keys=keys,
         children=list(event.children),
     )
+
+
+def merge_sequential_key_type_events(
+    events: list[ActionEvent],
+    interval: float = KEY_TYPE_MERGE_INTERVAL_SECONDS,
+) -> list[ActionEvent]:
+    """Merge consecutive KeyTypeEvents into word-level events.
+
+    Groups sequential KeyTypeEvents whose inter-event gap is below
+    `interval` seconds. Flushes on word boundaries (space, Enter),
+    non-printable keys (Backspace, Tab, etc.), non-KeyTypeEvents,
+    and time gaps exceeding the threshold.
+
+    Args:
+        events: List of action events (post shortcut-detection).
+        interval: Maximum gap in seconds between KeyTypeEvents to merge.
+
+    Returns:
+        New list with consecutive KeyTypeEvents merged into word-level events.
+    """
+    result: list[ActionEvent] = []
+    buffer: list[KeyTypeEvent] = []
+
+    def flush_buffer() -> None:
+        if not buffer:
+            return
+        if len(buffer) == 1:
+            result.append(buffer[0])
+        else:
+            text = "".join(e.text for e in buffer)
+            children = []
+            for e in buffer:
+                children.extend(e.children)
+            result.append(KeyTypeEvent(
+                timestamp=buffer[0].timestamp,
+                text=text,
+                children=children,
+            ))
+        buffer.clear()
+
+    def _is_whitespace(event: KeyTypeEvent) -> bool:
+        """Whitespace text (space, newline, tab, etc.) — flush buffer, emit standalone."""
+        return bool(event.text) and event.text.strip() == ""
+
+    def _is_nonprintable(event: KeyTypeEvent) -> bool:
+        """Empty text with a non-modifier key_name (Backspace, Enter, Tab, Escape, etc.)."""
+        if event.text:
+            return False
+        for child in event.children:
+            if isinstance(child, KeyDownEvent) and child.key_name:
+                return True
+        return False
+
+    for event in events:
+        if not isinstance(event, KeyTypeEvent):
+            flush_buffer()
+            result.append(event)
+            continue
+
+        # Whitespace boundaries flush and are emitted standalone
+        if _is_whitespace(event):
+            flush_buffer()
+            result.append(event)
+            continue
+
+        # Non-printable keys flush and are emitted standalone
+        if _is_nonprintable(event):
+            flush_buffer()
+            result.append(event)
+            continue
+
+        # Time gap check
+        if buffer and (event.timestamp - buffer[-1].timestamp) >= interval:
+            flush_buffer()
+
+        buffer.append(event)
+
+    flush_buffer()
+    return result
 
 
 def merge_consecutive_mouse_move_events(events: list[ActionEvent]) -> list[ActionEvent]:
