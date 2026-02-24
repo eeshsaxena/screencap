@@ -533,3 +533,295 @@ def test_list_works_without_record_deps(tmp_path):
         result = runner.invoke(cli, ["list"])
     assert result.exit_code == 0
     assert "No recordings" in result.output
+
+
+# --- export command tests ---
+
+
+def _mock_action(event_json='{"type":"mouse.singleclick","timestamp":1.0,"x":100,"y":200}'):
+    """Create a mock Action whose event.model_dump_json() returns the given JSON."""
+    event = mock.MagicMock()
+    event.model_dump_json.return_value = event_json
+    action = mock.MagicMock()
+    action.event = event
+    return action
+
+
+def _mock_capture(actions=None):
+    """Create a mock Capture that yields given actions."""
+    capture = mock.MagicMock()
+    capture.__enter__ = mock.MagicMock(return_value=capture)
+    capture.__exit__ = mock.MagicMock(return_value=False)
+    if actions is None:
+        actions = [_mock_action()]
+    capture.actions.return_value = iter(actions)
+    return capture
+
+
+def _jsonl_lines(output):
+    """Extract valid JSON lines from mixed output (JSONL + stderr warnings)."""
+    lines = []
+    for line in output.strip().split("\n"):
+        line = line.strip()
+        if line.startswith("{"):
+            lines.append(line)
+    return lines
+
+
+def test_export_default_writes_to_recording_dir(tmp_path):
+    """Default export writes events.jsonl into the recording directory."""
+    rec_dir = tmp_path / "my-rec"
+    rec_dir.mkdir()
+
+    capture = _mock_capture()
+    runner = CliRunner()
+
+    with (
+        mock.patch("screencap.config.resolve_recording_dir", return_value=rec_dir),
+        mock.patch("openadapt_capture.capture.CaptureSession.load", return_value=capture),
+    ):
+        result = runner.invoke(cli, ["export", "my-rec"])
+
+    assert result.exit_code == 0
+    out_file = rec_dir / "events.jsonl"
+    assert out_file.exists()
+    lines = out_file.read_text().strip().split("\n")
+    assert len(lines) == 1
+    parsed = json.loads(lines[0])
+    assert parsed["type"] == "mouse.singleclick"
+
+
+def test_export_stdout(tmp_path):
+    """--stdout flag writes JSONL to stdout."""
+    rec_dir = tmp_path / "my-rec"
+    rec_dir.mkdir()
+
+    capture = _mock_capture()
+    runner = CliRunner()
+
+    with (
+        mock.patch("screencap.config.resolve_recording_dir", return_value=rec_dir),
+        mock.patch("openadapt_capture.capture.CaptureSession.load", return_value=capture),
+    ):
+        result = runner.invoke(cli, ["export", "my-rec", "--stdout"])
+
+    assert result.exit_code == 0
+    lines = _jsonl_lines(result.output)
+    assert len(lines) == 1
+    parsed = json.loads(lines[0])
+    assert parsed["type"] == "mouse.singleclick"
+    # No file written in recording dir
+    assert not (rec_dir / "events.jsonl").exists()
+
+
+def test_export_to_file(tmp_path):
+    """Export to custom file path with -o."""
+    rec_dir = tmp_path / "my-rec"
+    rec_dir.mkdir()
+    out_file = tmp_path / "custom.jsonl"
+
+    capture = _mock_capture()
+    runner = CliRunner()
+
+    with (
+        mock.patch("screencap.config.resolve_recording_dir", return_value=rec_dir),
+        mock.patch("openadapt_capture.capture.CaptureSession.load", return_value=capture),
+    ):
+        result = runner.invoke(cli, ["export", "my-rec", "-o", str(out_file)])
+
+    assert result.exit_code == 0
+    assert out_file.exists()
+    lines = out_file.read_text().strip().split("\n")
+    assert len(lines) == 1
+
+
+def test_export_missing_recording(tmp_path):
+    """Missing recording directory results in exit code 1."""
+    rec_dir = tmp_path / "nonexistent"  # Does not exist
+
+    runner = CliRunner()
+
+    with mock.patch("screencap.config.resolve_recording_dir", return_value=rec_dir):
+        result = runner.invoke(cli, ["export", "nonexistent"])
+
+    assert result.exit_code == 1
+
+
+def test_export_path_traversal(tmp_path):
+    """Path traversal attempt results in exit code 1."""
+    runner = CliRunner()
+
+    with mock.patch(
+        "screencap.config.resolve_recording_dir",
+        side_effect=ValueError("Invalid recording name"),
+    ):
+        result = runner.invoke(cli, ["export", "../../etc"])
+
+    assert result.exit_code == 1
+
+
+def test_export_exclude_moves(tmp_path):
+    """--exclude-moves passes include_moves=False to capture.actions()."""
+    rec_dir = tmp_path / "my-rec"
+    rec_dir.mkdir()
+
+    capture = _mock_capture(actions=[])
+    runner = CliRunner()
+
+    with (
+        mock.patch("screencap.config.resolve_recording_dir", return_value=rec_dir),
+        mock.patch("openadapt_capture.capture.CaptureSession.load", return_value=capture),
+    ):
+        result = runner.invoke(cli, ["export", "my-rec", "--exclude-moves"])
+
+    assert result.exit_code == 0
+    capture.actions.assert_called_once_with(include_moves=False)
+
+
+def test_export_includes_moves_by_default(tmp_path):
+    """Without --exclude-moves, include_moves=True is passed."""
+    rec_dir = tmp_path / "my-rec"
+    rec_dir.mkdir()
+
+    capture = _mock_capture(actions=[])
+    runner = CliRunner()
+
+    with (
+        mock.patch("screencap.config.resolve_recording_dir", return_value=rec_dir),
+        mock.patch("openadapt_capture.capture.CaptureSession.load", return_value=capture),
+    ):
+        result = runner.invoke(cli, ["export", "my-rec"])
+
+    assert result.exit_code == 0
+    capture.actions.assert_called_once_with(include_moves=True)
+
+
+def test_export_legacy_db_error(tmp_path):
+    """Legacy capture.db format results in exit code 1."""
+    rec_dir = tmp_path / "old-rec"
+    rec_dir.mkdir()
+
+    runner = CliRunner()
+
+    with (
+        mock.patch("screencap.config.resolve_recording_dir", return_value=rec_dir),
+        mock.patch(
+            "openadapt_capture.capture.CaptureSession.load",
+            side_effect=FileNotFoundError("Capture not found"),
+        ),
+    ):
+        result = runner.invoke(cli, ["export", "old-rec"])
+
+    assert result.exit_code == 1
+
+
+def test_export_empty_recording(tmp_path):
+    """Empty recording produces empty events.jsonl."""
+    rec_dir = tmp_path / "empty-rec"
+    rec_dir.mkdir()
+
+    capture = _mock_capture(actions=[])
+    runner = CliRunner()
+
+    with (
+        mock.patch("screencap.config.resolve_recording_dir", return_value=rec_dir),
+        mock.patch("openadapt_capture.capture.CaptureSession.load", return_value=capture),
+    ):
+        result = runner.invoke(cli, ["export", "empty-rec"])
+
+    assert result.exit_code == 0
+    out_file = rec_dir / "events.jsonl"
+    assert out_file.exists()
+    assert out_file.read_text().strip() == ""
+
+
+def test_export_multiple_events(tmp_path):
+    """Multiple events each get their own JSONL line."""
+    rec_dir = tmp_path / "multi-rec"
+    rec_dir.mkdir()
+
+    actions = [
+        _mock_action('{"type":"mouse.singleclick","timestamp":1.0}'),
+        _mock_action('{"type":"key.type","timestamp":2.0}'),
+        _mock_action('{"type":"mouse.scroll","timestamp":3.0}'),
+    ]
+    capture = _mock_capture(actions=actions)
+    runner = CliRunner()
+
+    with (
+        mock.patch("screencap.config.resolve_recording_dir", return_value=rec_dir),
+        mock.patch("openadapt_capture.capture.CaptureSession.load", return_value=capture),
+    ):
+        result = runner.invoke(cli, ["export", "multi-rec"])
+
+    assert result.exit_code == 0
+    out_file = rec_dir / "events.jsonl"
+    lines = out_file.read_text().strip().split("\n")
+    assert len(lines) == 3
+    for line in lines:
+        json.loads(line)
+
+
+def test_export_no_name_no_all():
+    """No name and no --all results in exit code 1."""
+    runner = CliRunner()
+    result = runner.invoke(cli, ["export"])
+    assert result.exit_code == 1
+
+
+def test_export_all_with_stdout():
+    """--all cannot be combined with --stdout."""
+    runner = CliRunner()
+    result = runner.invoke(cli, ["export", "--all", "--stdout"])
+    assert result.exit_code == 1
+
+
+def test_export_all_with_output():
+    """--all cannot be combined with -o."""
+    runner = CliRunner()
+    result = runner.invoke(cli, ["export", "--all", "-o", "out.jsonl"])
+    assert result.exit_code == 1
+
+
+def test_export_all(tmp_path):
+    """--all exports every recording to its own events.jsonl."""
+    # Create two recording dirs with recording.db
+    for name in ("rec-a", "rec-b"):
+        d = tmp_path / name
+        d.mkdir()
+        (d / "recording.db").touch()
+
+    # Also create a scrubbed dir and a non-recording dir — should be skipped
+    scrubbed = tmp_path / "rec-a-scrubbed"
+    scrubbed.mkdir()
+    (scrubbed / "recording.db").touch()
+    (tmp_path / "not-a-recording").mkdir()
+
+    capture = _mock_capture()
+    runner = CliRunner()
+
+    def fresh_capture(*args, **kwargs):
+        return _mock_capture()
+
+    with (
+        mock.patch("screencap.config.get_recordings_dir", return_value=tmp_path),
+        mock.patch("openadapt_capture.capture.CaptureSession.load", side_effect=fresh_capture),
+    ):
+        result = runner.invoke(cli, ["export", "--all"])
+
+    assert result.exit_code == 0
+    # Both recordings should have events.jsonl
+    assert (tmp_path / "rec-a" / "events.jsonl").exists()
+    assert (tmp_path / "rec-b" / "events.jsonl").exists()
+    # Scrubbed dir should NOT have been exported
+    assert not (scrubbed / "events.jsonl").exists()
+
+
+def test_export_all_no_recordings(tmp_path):
+    """--all with no recordings prints message and exits cleanly."""
+    runner = CliRunner()
+
+    with mock.patch("screencap.config.get_recordings_dir", return_value=tmp_path):
+        result = runner.invoke(cli, ["export", "--all"])
+
+    assert result.exit_code == 0
