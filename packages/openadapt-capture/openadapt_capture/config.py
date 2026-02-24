@@ -51,7 +51,7 @@ class Settings(BaseSettings):
     ] + SPECIAL_CHAR_STOP_SEQUENCES
 
     # Maximum screenshots per second (0 = unlimited / legacy behavior)
-    SCREEN_CAPTURE_FPS: float = 5.0
+    SCREEN_CAPTURE_FPS: float = 10.0
 
     # Accessibility query tuning — controls how aggressively the recorder
     # queries the target app's accessibility tree during recording.

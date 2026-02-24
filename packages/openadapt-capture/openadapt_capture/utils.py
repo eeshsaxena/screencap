@@ -133,11 +133,11 @@ def _take_screenshot_macos() -> Image.Image | None:
     import subprocess
     import tempfile
 
-    fd, tmp = tempfile.mkstemp(suffix=".png")
+    fd, tmp = tempfile.mkstemp(suffix=".jpg")
     os.close(fd)
     try:
         subprocess.run(
-            ["screencapture", "-x", "-C", tmp],
+            ["screencapture", "-x", "-C", "-t", "jpg", tmp],
             capture_output=True,
             timeout=10,
         )
