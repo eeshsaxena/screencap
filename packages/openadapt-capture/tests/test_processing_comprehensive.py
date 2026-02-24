@@ -8,6 +8,7 @@ import pytest
 
 from openadapt_capture.events import (
     KeyDownEvent,
+    KeyShortcutEvent,
     KeyTypeEvent,
     KeyUpEvent,
     MouseButton,
@@ -27,6 +28,7 @@ from openadapt_capture.processing import (
     DOUBLE_CLICK_DISTANCE_PIXELS,
     DOUBLE_CLICK_INTERVAL_SECONDS,
     DRAG_DISTANCE_THRESHOLD,
+    KEY_TYPE_MERGE_INTERVAL_SECONDS,
     detect_drag_events,
     merge_consecutive_keyboard_events,
     merge_consecutive_mouse_click_events,
@@ -34,6 +36,7 @@ from openadapt_capture.processing import (
     merge_consecutive_mouse_move_events,
     merge_consecutive_mouse_rotate_events,
     merge_consecutive_mouse_scroll_events,
+    merge_sequential_key_type_events,
     process_events,
     remove_redundant_mouse_move_events,
 )
@@ -870,3 +873,400 @@ class TestBlenderWorkflowSimulation:
         assert len(constrained_drag) == 1
         key_children = [c for c in constrained_drag[0].children if isinstance(c, KeyTypeEvent)]
         assert len(key_children) == 1
+
+
+# =============================================================================
+# Helpers for merge_sequential_key_type_events tests
+# =============================================================================
+
+
+def _make_key_type(char: str, timestamp: float) -> KeyTypeEvent:
+    """Create a single-character KeyTypeEvent with realistic children."""
+    return KeyTypeEvent(
+        timestamp=timestamp,
+        text=char,
+        children=[
+            KeyDownEvent(timestamp=timestamp, key_char=char),
+            KeyUpEvent(timestamp=timestamp + 0.05, key_char=char),
+        ],
+    )
+
+
+# =============================================================================
+# Test: merge_sequential_key_type_events
+# =============================================================================
+
+
+class TestMergeSequentialKeyTypeEvents:
+    """Tests for merge_sequential_key_type_events."""
+
+    def test_simple_merge(self, ts):
+        """Sequential single-char KeyTypeEvents within threshold merge."""
+        events = [
+            _make_key_type("h", ts.next()),
+            _make_key_type("e", ts.next()),
+            _make_key_type("l", ts.next()),
+            _make_key_type("l", ts.next()),
+            _make_key_type("o", ts.next()),
+        ]
+        result = merge_sequential_key_type_events(events)
+        assert len(result) == 1
+        assert result[0].text == "hello"
+        assert len(result[0].children) == 10  # 5 keys * (down + up)
+
+    def test_gap_exceeds_threshold(self, ts):
+        """Gap >= threshold flushes buffer."""
+        events = [
+            _make_key_type("h", 0.0),
+            _make_key_type("i", 0.6),  # 600ms gap, above 500ms threshold
+        ]
+        result = merge_sequential_key_type_events(events)
+        assert len(result) == 2
+        assert result[0].text == "h"
+        assert result[1].text == "i"
+
+    def test_gap_exactly_at_threshold(self, ts):
+        """Gap exactly at threshold flushes (strict less-than comparison)."""
+        events = [
+            _make_key_type("h", 0.0),
+            _make_key_type("i", KEY_TYPE_MERGE_INTERVAL_SECONDS),  # exactly 500ms
+        ]
+        result = merge_sequential_key_type_events(events)
+        assert len(result) == 2
+        assert result[0].text == "h"
+        assert result[1].text == "i"
+
+    def test_space_boundary(self, ts):
+        """Space flushes buffer and is emitted standalone."""
+        events = [
+            _make_key_type("h", ts.next()),
+            _make_key_type("i", ts.next()),
+            _make_key_type(" ", ts.next()),
+            _make_key_type("b", ts.next()),
+        ]
+        result = merge_sequential_key_type_events(events)
+        assert len(result) == 3
+        assert result[0].text == "hi"
+        assert result[1].text == " "
+        assert result[2].text == "b"
+
+    def test_shortcut_boundary(self, ts):
+        """KeyShortcutEvent flushes buffer."""
+        t0 = ts.next()
+        t1 = ts.next()
+        t2 = ts.next()
+        t3 = ts.next()
+        t4 = ts.next()
+        events = [
+            _make_key_type("h", t0),
+            _make_key_type("e", t1),
+            _make_key_type("l", t2),
+            KeyShortcutEvent(
+                timestamp=t3,
+                keys=["ctrl", "z"],
+                children=[
+                    KeyDownEvent(timestamp=t3, key_name="ctrl"),
+                    KeyDownEvent(timestamp=t3 + 0.01, key_char="z"),
+                    KeyUpEvent(timestamp=t3 + 0.05, key_char="z"),
+                    KeyUpEvent(timestamp=t3 + 0.06, key_name="ctrl"),
+                ],
+            ),
+            _make_key_type("l", t4),
+            _make_key_type("o", ts.next()),
+        ]
+        result = merge_sequential_key_type_events(events)
+        assert len(result) == 3
+        assert result[0].text == "hel"
+        assert isinstance(result[1], KeyShortcutEvent)
+        assert result[2].text == "lo"
+
+    def test_mouse_event_boundary(self, ts):
+        """Non-keyboard events flush buffer."""
+        events = [
+            _make_key_type("a", ts.next()),
+            _make_key_type("b", ts.next()),
+            MouseMoveEvent(timestamp=ts.next(), x=100.0, y=100.0),
+            _make_key_type("c", ts.next()),
+        ]
+        result = merge_sequential_key_type_events(events)
+        assert len(result) == 3
+        assert result[0].text == "ab"
+        assert isinstance(result[1], MouseMoveEvent)
+        assert result[2].text == "c"
+
+    def test_backspace_boundary(self, ts):
+        """Backspace (empty text, key_name=backspace) flushes buffer."""
+        t0 = ts.next()
+        t1 = ts.next()
+        t2 = ts.next()
+        backspace_ts = ts.next()
+        t3 = ts.next()
+        t4 = ts.next()
+        events = [
+            _make_key_type("h", t0),
+            _make_key_type("e", t1),
+            _make_key_type("l", t2),
+            KeyTypeEvent(
+                timestamp=backspace_ts,
+                text="",
+                children=[
+                    KeyDownEvent(timestamp=backspace_ts, key_name="backspace"),
+                    KeyUpEvent(timestamp=backspace_ts + 0.05, key_name="backspace"),
+                ],
+            ),
+            _make_key_type("l", t3),
+            _make_key_type("o", t4),
+        ]
+        result = merge_sequential_key_type_events(events)
+        assert len(result) == 3
+        assert result[0].text == "hel"
+        assert result[1].text == ""  # backspace event
+        assert result[2].text == "lo"
+
+    def test_enter_as_newline(self, ts):
+        """Enter delivered as text='\\n' is a whitespace boundary."""
+        t0 = ts.next()
+        t1 = ts.next()
+        enter_ts = ts.next()
+        t2 = ts.next()
+        events = [
+            _make_key_type("h", t0),
+            _make_key_type("e", t1),
+            KeyTypeEvent(
+                timestamp=enter_ts,
+                text="\n",
+                children=[
+                    KeyDownEvent(timestamp=enter_ts, key_name="enter"),
+                    KeyUpEvent(timestamp=enter_ts + 0.05, key_name="enter"),
+                ],
+            ),
+            _make_key_type("w", t2),
+        ]
+        result = merge_sequential_key_type_events(events)
+        assert len(result) == 3
+        assert result[0].text == "he"
+        assert result[1].text == "\n"
+        assert result[2].text == "w"
+
+    def test_enter_as_keyname(self, ts):
+        """Enter delivered as text='' with key_name='enter' is a nonprintable boundary."""
+        t0 = ts.next()
+        t1 = ts.next()
+        enter_ts = ts.next()
+        t2 = ts.next()
+        events = [
+            _make_key_type("h", t0),
+            _make_key_type("e", t1),
+            KeyTypeEvent(
+                timestamp=enter_ts,
+                text="",
+                children=[
+                    KeyDownEvent(timestamp=enter_ts, key_name="enter"),
+                    KeyUpEvent(timestamp=enter_ts + 0.05, key_name="enter"),
+                ],
+            ),
+            _make_key_type("w", t2),
+        ]
+        result = merge_sequential_key_type_events(events)
+        assert len(result) == 3
+        assert result[0].text == "he"
+        assert result[1].text == ""
+        assert result[2].text == "w"
+
+    def test_tab_as_char(self, ts):
+        """Tab delivered as text='\\t' is a whitespace boundary."""
+        t0 = ts.next()
+        tab_ts = ts.next()
+        t1 = ts.next()
+        events = [
+            _make_key_type("a", t0),
+            KeyTypeEvent(
+                timestamp=tab_ts,
+                text="\t",
+                children=[
+                    KeyDownEvent(timestamp=tab_ts, key_name="tab"),
+                    KeyUpEvent(timestamp=tab_ts + 0.05, key_name="tab"),
+                ],
+            ),
+            _make_key_type("b", t1),
+        ]
+        result = merge_sequential_key_type_events(events)
+        assert len(result) == 3
+        assert result[0].text == "a"
+        assert result[1].text == "\t"
+        assert result[2].text == "b"
+
+    def test_tab_as_keyname(self, ts):
+        """Tab delivered as text='' with key_name='tab' is a nonprintable boundary."""
+        t0 = ts.next()
+        tab_ts = ts.next()
+        t1 = ts.next()
+        events = [
+            _make_key_type("a", t0),
+            KeyTypeEvent(
+                timestamp=tab_ts,
+                text="",
+                children=[
+                    KeyDownEvent(timestamp=tab_ts, key_name="tab"),
+                    KeyUpEvent(timestamp=tab_ts + 0.05, key_name="tab"),
+                ],
+            ),
+            _make_key_type("b", t1),
+        ]
+        result = merge_sequential_key_type_events(events)
+        assert len(result) == 3
+        assert result[0].text == "a"
+        assert result[1].text == ""
+        assert result[2].text == "b"
+
+    def test_bare_modifier_boundary(self, ts):
+        """Bare Shift tap (text='', key_name='shift_l') flushes buffer."""
+        t0 = ts.next()
+        t1 = ts.next()
+        shift_ts = ts.next()
+        t2 = ts.next()
+        t3 = ts.next()
+        events = [
+            _make_key_type("h", t0),
+            _make_key_type("e", t1),
+            KeyTypeEvent(
+                timestamp=shift_ts,
+                text="",
+                children=[
+                    KeyDownEvent(timestamp=shift_ts, key_name="shift_l"),
+                    KeyUpEvent(timestamp=shift_ts + 0.05, key_name="shift_l"),
+                ],
+            ),
+            _make_key_type("l", t2),
+            _make_key_type("o", t3),
+        ]
+        result = merge_sequential_key_type_events(events)
+        assert len(result) == 3
+        assert result[0].text == "he"
+        assert result[1].text == ""  # bare modifier
+        assert result[2].text == "lo"
+
+    def test_punctuation_merges_with_word(self, ts):
+        """Punctuation is NOT a boundary — merges into the word."""
+        events = [
+            _make_key_type("h", ts.next()),
+            _make_key_type("e", ts.next()),
+            _make_key_type(",", ts.next()),
+        ]
+        result = merge_sequential_key_type_events(events)
+        assert len(result) == 1
+        assert result[0].text == "he,"
+
+    def test_end_of_stream_flush(self, ts):
+        """Buffer flushed at end of event list."""
+        events = [
+            _make_key_type("a", ts.next()),
+            _make_key_type("b", ts.next()),
+            _make_key_type("c", ts.next()),
+        ]
+        result = merge_sequential_key_type_events(events)
+        assert len(result) == 1
+        assert result[0].text == "abc"
+
+    def test_empty_input(self):
+        """Empty list returns empty list."""
+        assert merge_sequential_key_type_events([]) == []
+
+    def test_single_event(self, ts):
+        """Single event passes through unchanged."""
+        event = _make_key_type("x", ts.next())
+        result = merge_sequential_key_type_events([event])
+        assert len(result) == 1
+        assert result[0].text == "x"
+        assert result[0] is event  # same object, not a copy
+
+    def test_multi_char_input(self, ts):
+        """Multi-character KeyTypeEvent included in merge."""
+        t0 = ts.next()
+        t1 = ts.next()
+        events = [
+            KeyTypeEvent(
+                timestamp=t0,
+                text="th",
+                children=[
+                    KeyDownEvent(timestamp=t0, key_char="t"),
+                    KeyDownEvent(timestamp=t0 + 0.02, key_char="h"),
+                    KeyUpEvent(timestamp=t0 + 0.04, key_char="t"),
+                    KeyUpEvent(timestamp=t0 + 0.05, key_char="h"),
+                ],
+            ),
+            _make_key_type("e", t1),
+        ]
+        result = merge_sequential_key_type_events(events)
+        assert len(result) == 1
+        assert result[0].text == "the"
+        assert len(result[0].children) == 6  # 4 from "th" + 2 from "e"
+
+    def test_interval_zero(self, ts):
+        """interval=0 disables merging (every gap >= 0)."""
+        events = [
+            _make_key_type("a", ts.next()),
+            _make_key_type("b", ts.next()),
+            _make_key_type("c", ts.next()),
+        ]
+        result = merge_sequential_key_type_events(events, interval=0)
+        assert len(result) == 3
+        assert result[0].text == "a"
+        assert result[1].text == "b"
+        assert result[2].text == "c"
+
+    def test_merged_event_uses_first_timestamp(self, ts):
+        """Merged event uses the first event's timestamp."""
+        first_ts = ts.next()
+        events = [
+            _make_key_type("a", first_ts),
+            _make_key_type("b", ts.next()),
+            _make_key_type("c", ts.next()),
+        ]
+        result = merge_sequential_key_type_events(events)
+        assert len(result) == 1
+        assert result[0].timestamp == first_ts
+
+    def test_hello_world_scenario(self, ts):
+        """Typing 'hello world' produces 3 events: 'hello', ' ', 'world'."""
+        events = [
+            _make_key_type("h", ts.next()),
+            _make_key_type("e", ts.next()),
+            _make_key_type("l", ts.next()),
+            _make_key_type("l", ts.next()),
+            _make_key_type("o", ts.next()),
+            _make_key_type(" ", ts.next()),
+            _make_key_type("w", ts.next()),
+            _make_key_type("o", ts.next()),
+            _make_key_type("r", ts.next()),
+            _make_key_type("l", ts.next()),
+            _make_key_type("d", ts.next()),
+        ]
+        result = merge_sequential_key_type_events(events)
+        assert len(result) == 3
+        assert result[0].text == "hello"
+        assert result[1].text == " "
+        assert result[2].text == "world"
+
+    def test_pipeline_integration(self, ts):
+        """merge_sequential_key_type_events runs correctly in full pipeline."""
+        # Simulate raw key down/up events that go through full pipeline
+        events = [
+            KeyDownEvent(timestamp=ts.next(), key_char="h"),
+            KeyUpEvent(timestamp=ts.next(), key_char="h"),
+            KeyDownEvent(timestamp=ts.next(), key_char="i"),
+            KeyUpEvent(timestamp=ts.next(), key_char="i"),
+            KeyDownEvent(timestamp=ts.next(), key_char=" "),
+            KeyUpEvent(timestamp=ts.next(), key_char=" "),
+            KeyDownEvent(timestamp=ts.next(), key_char="y"),
+            KeyUpEvent(timestamp=ts.next(), key_char="y"),
+            KeyDownEvent(timestamp=ts.next(), key_char="o"),
+            KeyUpEvent(timestamp=ts.next(), key_char="o"),
+        ]
+        result = process_events(events)
+        key_types = [e for e in result if isinstance(e, KeyTypeEvent)]
+        # Should produce: "hi", " ", "yo"
+        assert len(key_types) == 3
+        assert key_types[0].text == "hi"
+        assert key_types[1].text == " "
+        assert key_types[2].text == "yo"
