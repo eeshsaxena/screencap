@@ -789,3 +789,190 @@ def test_upload_cli_skips_already_uploaded(tmp_path):
         result = runner.invoke(cli, ["upload", "my-rec"])
     assert result.exit_code == 0
     assert "Already uploaded" in result.output
+
+
+# ---------------------------------------------------------------------------
+# Parallel transfer tests
+# ---------------------------------------------------------------------------
+
+
+def test_upload_recording_jobs_1_sequential(tmp_path):
+    """--jobs 1 should produce correct results (matches sequential behavior)."""
+    from screencap.upload import upload_recording
+
+    rec = tmp_path / "my-rec"
+    rec.mkdir()
+    (rec / "video.mp4").write_bytes(b"x" * 100)
+    (rec / "audio.flac").write_bytes(b"x" * 50)
+
+    mock_urls_resp = mock.MagicMock()
+    mock_urls_resp.status_code = 200
+    mock_urls_resp.json.return_value = {
+        "urls": {"video.mp4": "https://url/video", "audio.flac": "https://url/audio"},
+        "gcs_prefix": "gs://bucket/recordings/my-rec/",
+    }
+
+    mock_put_resp = mock.MagicMock()
+    mock_put_resp.status_code = 200
+    mock_put_resp.raise_for_status = mock.MagicMock()
+
+    with (
+        mock.patch("screencap.upload.requests.post", return_value=mock_urls_resp),
+        mock.patch("screencap.upload.requests.put", return_value=mock_put_resp),
+    ):
+        result = upload_recording(rec, jobs=1)
+
+    assert set(result.uploaded) == {"video.mp4", "audio.flac"}
+    assert result.failed == []
+
+
+def test_upload_recording_jobs_more_than_files(tmp_path):
+    """--jobs 4 with 2 files should not hang."""
+    from screencap.upload import upload_recording
+
+    rec = tmp_path / "my-rec"
+    rec.mkdir()
+    (rec / "video.mp4").write_bytes(b"x" * 100)
+    (rec / "audio.flac").write_bytes(b"x" * 50)
+
+    mock_urls_resp = mock.MagicMock()
+    mock_urls_resp.status_code = 200
+    mock_urls_resp.json.return_value = {
+        "urls": {"video.mp4": "https://url/video", "audio.flac": "https://url/audio"},
+        "gcs_prefix": "gs://bucket/recordings/my-rec/",
+    }
+
+    mock_put_resp = mock.MagicMock()
+    mock_put_resp.status_code = 200
+    mock_put_resp.raise_for_status = mock.MagicMock()
+
+    with (
+        mock.patch("screencap.upload.requests.post", return_value=mock_urls_resp),
+        mock.patch("screencap.upload.requests.put", return_value=mock_put_resp),
+    ):
+        result = upload_recording(rec, jobs=4)
+
+    assert set(result.uploaded) == {"video.mp4", "audio.flac"}
+    assert result.failed == []
+
+
+def test_upload_recording_parallel_partial_failure(tmp_path):
+    """--jobs 4 with partial failure: result lists correct."""
+    from screencap.upload import upload_recording
+
+    rec = tmp_path / "my-rec"
+    rec.mkdir()
+    (rec / "a.txt").write_bytes(b"x" * 10)
+    (rec / "b.txt").write_bytes(b"x" * 10)
+    (rec / "c.txt").write_bytes(b"x" * 10)
+
+    mock_urls_resp = mock.MagicMock()
+    mock_urls_resp.status_code = 200
+    mock_urls_resp.json.return_value = {
+        "urls": {
+            "a.txt": "https://url/a",
+            "b.txt": "https://url/b",
+            "c.txt": "https://url/c",
+        },
+        "gcs_prefix": "gs://bucket/recordings/my-rec/",
+    }
+
+    call_count = 0
+
+    def put_side_effect(*args, **kwargs):
+        nonlocal call_count
+        call_count += 1
+        if call_count == 2:
+            resp = mock.MagicMock()
+            resp.status_code = 500
+            resp.raise_for_status.side_effect = Exception("upload failed")
+            return resp
+        resp = mock.MagicMock()
+        resp.status_code = 200
+        resp.raise_for_status = mock.MagicMock()
+        return resp
+
+    with (
+        mock.patch("screencap.upload.requests.post", return_value=mock_urls_resp),
+        mock.patch("screencap.upload.requests.put", side_effect=put_side_effect),
+    ):
+        result = upload_recording(rec, jobs=4, max_retries=0)
+
+    assert len(result.uploaded) == 2
+    assert len(result.failed) == 1
+    assert not (rec / UPLOAD_STATUS_FILE).exists()
+
+
+def test_upload_cli_jobs_flag_accepted(tmp_path):
+    """CLI --jobs 2 should be accepted."""
+    rec = tmp_path / "my-rec"
+    rec.mkdir()
+    (rec / "video.mp4").write_bytes(b"x" * 100)
+
+    mock_urls_resp = mock.MagicMock()
+    mock_urls_resp.status_code = 200
+    mock_urls_resp.json.return_value = {
+        "urls": {"video.mp4": "https://url/video"},
+        "gcs_prefix": "gs://bucket/recordings/my-rec/",
+    }
+
+    mock_put_resp = mock.MagicMock()
+    mock_put_resp.status_code = 200
+    mock_put_resp.raise_for_status = mock.MagicMock()
+
+    runner = CliRunner()
+    with (
+        mock.patch("screencap.upload.get_recordings_dir", return_value=tmp_path),
+        mock.patch("screencap.upload.requests.post", return_value=mock_urls_resp),
+        mock.patch("screencap.upload.requests.put", return_value=mock_put_resp),
+    ):
+        result = runner.invoke(cli, ["upload", "my-rec", "--jobs", "2"])
+    assert result.exit_code == 0
+
+
+def test_upload_cli_jobs_0_rejected():
+    """CLI --jobs 0 should be rejected by Click validation."""
+    runner = CliRunner()
+    result = runner.invoke(cli, ["upload", "my-rec", "--jobs", "0"])
+    assert result.exit_code != 0
+
+
+def test_upload_cli_jobs_negative_rejected():
+    """CLI --jobs -1 should be rejected."""
+    runner = CliRunner()
+    result = runner.invoke(cli, ["upload", "my-rec", "--jobs", "-1"])
+    assert result.exit_code != 0
+
+
+def test_upload_cli_jobs_abc_rejected():
+    """CLI --jobs abc should be rejected."""
+    runner = CliRunner()
+    result = runner.invoke(cli, ["upload", "my-rec", "--jobs", "abc"])
+    assert result.exit_code != 0
+
+
+def test_upload_cli_short_flag(tmp_path):
+    """CLI -j 1 short flag should work."""
+    rec = tmp_path / "my-rec"
+    rec.mkdir()
+    (rec / "video.mp4").write_bytes(b"x" * 100)
+
+    mock_urls_resp = mock.MagicMock()
+    mock_urls_resp.status_code = 200
+    mock_urls_resp.json.return_value = {
+        "urls": {"video.mp4": "https://url/video"},
+        "gcs_prefix": "gs://bucket/recordings/my-rec/",
+    }
+
+    mock_put_resp = mock.MagicMock()
+    mock_put_resp.status_code = 200
+    mock_put_resp.raise_for_status = mock.MagicMock()
+
+    runner = CliRunner()
+    with (
+        mock.patch("screencap.upload.get_recordings_dir", return_value=tmp_path),
+        mock.patch("screencap.upload.requests.post", return_value=mock_urls_resp),
+        mock.patch("screencap.upload.requests.put", return_value=mock_put_resp),
+    ):
+        result = runner.invoke(cli, ["upload", "my-rec", "-j", "1"])
+    assert result.exit_code == 0

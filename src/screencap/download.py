@@ -4,6 +4,7 @@ from __future__ import annotations
 
 import json
 import os
+from concurrent.futures import ThreadPoolExecutor, as_completed
 from dataclasses import dataclass, field
 from datetime import datetime, timezone
 from pathlib import Path
@@ -189,12 +190,13 @@ def download_recording(
     dest: Path,
     dry_run: bool = False,
     force: bool = False,
+    jobs: int = 4,
 ) -> DownloadResult:
     """Download all files for a single recording.
 
     1. Check marker (skip if already downloaded, unless force)
     2. Request signed URLs
-    3. Download files with progress
+    3. Download files with progress (parallel via ThreadPoolExecutor)
     4. Write marker on success
     """
     recording_dir = dest / name
@@ -226,6 +228,7 @@ def download_recording(
         return result
 
     recording_dir.mkdir(parents=True, exist_ok=True)
+    errors: list[tuple[str, str]] = []
 
     with Progress(
         TextColumn("  {task.description}"),
@@ -234,21 +237,45 @@ def download_recording(
         TransferSpeedColumn(),
         console=console,
     ) as progress:
-        for filename, signed_url in sorted(urls.items()):
-            task_id = progress.add_task(filename, total=0)
-            dest_path = recording_dir / filename
+        # 1. Create all progress tasks upfront
+        task_ids = {}
+        for filename in sorted(urls):
+            task_ids[filename] = progress.add_task(filename, total=0)
+
+        # 2. Submit all downloads
+        with ThreadPoolExecutor(max_workers=jobs) as executor:
+            futures = {}
+            for filename, signed_url in sorted(urls.items()):
+                dest_path = recording_dir / filename
+                future = executor.submit(
+                    _download_file_with_progress,
+                    signed_url, dest_path, progress, task_ids[filename],
+                )
+                futures[future] = filename
+
+            # 3. Collect results as they complete
             try:
-                nbytes = _download_file_with_progress(
-                    signed_url, dest_path, progress, task_id,
-                )
-                result.downloaded.append(filename)
-                result.total_bytes += nbytes
-            except Exception as e:
-                progress.update(
-                    task_id, description=f"[red]{filename} (failed)[/red]"
-                )
-                result.failed.append(filename)
-                console.print(f"  [red]Error downloading {filename}:[/red] {e}")
+                for future in as_completed(futures):
+                    filename = futures[future]
+                    try:
+                        nbytes = future.result()
+                        result.downloaded.append(filename)
+                        result.total_bytes += nbytes
+                    except Exception as e:
+                        progress.update(
+                            task_ids[filename],
+                            description=f"[red]{filename} (failed)[/red]",
+                        )
+                        result.failed.append(filename)
+                        errors.append((filename, str(e)))
+            except KeyboardInterrupt:
+                executor.shutdown(wait=False, cancel_futures=True)
+                console.print("\n[yellow]Download interrupted.[/yellow]")
+                raise
+
+    # 4. Print errors after progress block exits
+    for filename, err in errors:
+        console.print(f"  [red]Error downloading {filename}:[/red] {err}")
 
     if not result.failed:
         _write_download_status(recording_dir, result)

@@ -851,7 +851,9 @@ def _run_api_transcription(api_key, audio_path, transcript_path, transcript_json
 @click.option("--all", "all_recordings", is_flag=True, help="Upload all recordings.")
 @click.option("--dry-run", is_flag=True, help="Show files and sizes without uploading.")
 @click.option("--force", is_flag=True, help="Re-upload even if already uploaded.")
-def upload(names, all_recordings, dry_run, force):
+@click.option("--jobs", "-j", type=click.IntRange(min=1), default=4,
+              help="Parallel file transfers per recording (default: 4).")
+def upload(names, all_recordings, dry_run, force, jobs):
     """Upload recordings to cloud storage."""
     from screencap.upload import resolve_recording_dirs, upload_recording, _fmt_size
 
@@ -900,7 +902,7 @@ def upload(names, all_recordings, dry_run, force):
                         console.print(f"  [yellow]Warning:[/yellow] Export failed ({e}), uploading without events.jsonl")
 
         try:
-            result = upload_recording(d, dry_run=dry_run, force=force)
+            result = upload_recording(d, dry_run=dry_run, force=force, jobs=jobs)
             all_uploaded += len(result.uploaded)
             all_skipped += len(result.skipped)
             all_failed += len(result.failed)
@@ -938,7 +940,9 @@ def upload(names, all_recordings, dry_run, force):
 @click.option("--dest", default=None, help="Destination directory (default: ~/.screencap/downloads/).")
 @click.option("--dry-run", is_flag=True, help="Show what would be downloaded without downloading.")
 @click.option("--force", is_flag=True, help="Re-download all recordings, ignoring markers.")
-def download(dest, dry_run, force):
+@click.option("--jobs", "-j", type=click.IntRange(min=1), default=4,
+              help="Parallel file transfers per recording (default: 4).")
+def download(dest, dry_run, force, jobs):
     """Download recordings from cloud storage."""
     from screencap.download import (
         _fmt_size,
@@ -980,7 +984,7 @@ def download(dest, dry_run, force):
             )
         try:
             result = download_recording(
-                rec.name, dest_dir, dry_run=dry_run, force=force,
+                rec.name, dest_dir, dry_run=dry_run, force=force, jobs=jobs,
             )
             all_downloaded += len(result.downloaded)
             all_skipped += len(result.skipped)

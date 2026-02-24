@@ -5,6 +5,7 @@ from __future__ import annotations
 import json
 import mimetypes
 import os
+from concurrent.futures import ThreadPoolExecutor, as_completed
 from dataclasses import dataclass, field
 from datetime import datetime
 from pathlib import Path
@@ -195,12 +196,13 @@ def upload_recording(
     dry_run: bool = False,
     max_retries: int = 1,
     force: bool = False,
+    jobs: int = 4,
 ) -> UploadResult:
     """Upload all files in a recording directory.
 
     1. Enumerate files
     2. Request signed URLs (server tells us which are new vs existing)
-    3. Upload new files with progress bars
+    3. Upload new files with progress bars (parallel via ThreadPoolExecutor)
     4. Return summary
     """
     recording_name = recording_dir.name
@@ -262,6 +264,10 @@ def upload_recording(
         _write_upload_status(recording_dir, result)
         return result
 
+    # Build a lookup for file sizes (used when collecting results)
+    file_sizes = {f.name: f.size for f, _ in to_upload}
+    errors: list[tuple[str, str]] = []
+
     # Upload with progress bars
     with Progress(
         TextColumn("  {task.description}"),
@@ -270,19 +276,45 @@ def upload_recording(
         TransferSpeedColumn(),
         console=console,
     ) as progress:
-        for f, signed_url in to_upload:
-            task_id = progress.add_task(f.name, total=f.size)
-            try:
-                _upload_with_progress(
-                    f, signed_url, progress, task_id,
+        # 1. Create all progress tasks upfront
+        task_ids = {}
+        for f, _ in to_upload:
+            task_ids[f.name] = progress.add_task(f.name, total=f.size)
+
+        # 2. Submit all uploads
+        with ThreadPoolExecutor(max_workers=jobs) as executor:
+            futures = {}
+            for f, signed_url in to_upload:
+                future = executor.submit(
+                    _upload_with_progress,
+                    f, signed_url, progress, task_ids[f.name],
                     recording_name, max_retries,
                 )
-                result.uploaded.append(f.name)
-                result.total_bytes += f.size
-            except Exception as e:
-                progress.update(task_id, description=f"[red]{f.name} (failed)[/red]")
-                result.failed.append(f.name)
-                console.print(f"  [red]Error uploading {f.name}:[/red] {e}")
+                futures[future] = f.name
+
+            # 3. Collect results as they complete
+            try:
+                for future in as_completed(futures):
+                    fname = futures[future]
+                    try:
+                        future.result()
+                        result.uploaded.append(fname)
+                        result.total_bytes += file_sizes[fname]
+                    except Exception as e:
+                        progress.update(
+                            task_ids[fname],
+                            description=f"[red]{fname} (failed)[/red]",
+                        )
+                        result.failed.append(fname)
+                        errors.append((fname, str(e)))
+            except KeyboardInterrupt:
+                executor.shutdown(wait=False, cancel_futures=True)
+                console.print("\n[yellow]Upload interrupted.[/yellow]")
+                raise
+
+    # 4. Print errors after progress block exits
+    for filename, err in errors:
+        console.print(f"  [red]Error uploading {filename}:[/red] {err}")
 
     if not result.failed:
         _write_upload_status(recording_dir, result)
