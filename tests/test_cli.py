@@ -836,6 +836,121 @@ def test_export_all_no_recordings(tmp_path):
     assert result.exit_code == 0
 
 
+# --- export --downloads tests ---
+
+
+def test_export_downloads_only(tmp_path):
+    """--downloads (without --all) exports only downloaded recordings."""
+    dl_dir = tmp_path / "downloads"
+    rec_dir = tmp_path / "recordings"
+    dl_dir.mkdir()
+    rec_dir.mkdir()
+
+    # Create a downloaded recording
+    d = dl_dir / "dl-rec"
+    d.mkdir()
+    (d / "recording.db").touch()
+
+    # Create a local recording — should NOT be exported
+    r = rec_dir / "local-rec"
+    r.mkdir()
+    (r / "recording.db").touch()
+
+    capture = _mock_capture()
+    runner = CliRunner()
+
+    def fresh_capture(*args, **kwargs):
+        return _mock_capture()
+
+    with (
+        mock.patch("screencap.config.get_recordings_dir", return_value=rec_dir),
+        mock.patch("screencap.config.get_downloads_dir", return_value=dl_dir),
+        mock.patch("openadapt_capture.capture.CaptureSession.load", side_effect=fresh_capture),
+    ):
+        result = runner.invoke(cli, ["export", "--downloads"])
+
+    assert result.exit_code == 0
+    assert (dl_dir / "dl-rec" / "events.jsonl").exists()
+    assert not (rec_dir / "local-rec" / "events.jsonl").exists()
+
+
+def test_export_all_and_downloads(tmp_path):
+    """--all --downloads exports from both recordings and downloads dirs."""
+    dl_dir = tmp_path / "downloads"
+    rec_dir = tmp_path / "recordings"
+    dl_dir.mkdir()
+    rec_dir.mkdir()
+
+    # Downloaded recording
+    d = dl_dir / "dl-rec"
+    d.mkdir()
+    (d / "recording.db").touch()
+
+    # Local recording
+    r = rec_dir / "local-rec"
+    r.mkdir()
+    (r / "recording.db").touch()
+
+    def fresh_capture(*args, **kwargs):
+        return _mock_capture()
+
+    runner = CliRunner()
+
+    with (
+        mock.patch("screencap.config.get_recordings_dir", return_value=rec_dir),
+        mock.patch("screencap.config.get_downloads_dir", return_value=dl_dir),
+        mock.patch("openadapt_capture.capture.CaptureSession.load", side_effect=fresh_capture),
+    ):
+        result = runner.invoke(cli, ["export", "--all", "--downloads"])
+
+    assert result.exit_code == 0
+    assert (rec_dir / "local-rec" / "events.jsonl").exists()
+    assert (dl_dir / "dl-rec" / "events.jsonl").exists()
+
+
+def test_export_downloads_no_recordings(tmp_path):
+    """--downloads with empty downloads dir prints message and exits cleanly."""
+    runner = CliRunner()
+
+    with mock.patch("screencap.config.get_downloads_dir", return_value=tmp_path):
+        result = runner.invoke(cli, ["export", "--downloads"])
+
+    assert result.exit_code == 0
+
+
+def test_export_downloads_cannot_use_stdout():
+    """--downloads cannot be combined with --stdout."""
+    runner = CliRunner()
+    result = runner.invoke(cli, ["export", "--downloads", "--stdout"])
+    assert result.exit_code == 1
+
+
+def test_export_single_by_name_with_downloads_fallback(tmp_path):
+    """Single recording name with --downloads falls back to downloads dir."""
+    rec_dir = tmp_path / "recordings"
+    dl_dir = tmp_path / "downloads"
+    rec_dir.mkdir()
+    dl_dir.mkdir()
+
+    # Only in downloads dir
+    d = dl_dir / "my-dl"
+    d.mkdir()
+    (d / "recording.db").touch()
+
+    capture = _mock_capture()
+    runner = CliRunner()
+
+    with (
+        mock.patch("screencap.config.get_recordings_dir", return_value=rec_dir),
+        mock.patch("screencap.config.get_downloads_dir", return_value=dl_dir),
+        mock.patch("openadapt_capture.capture.CaptureSession.load", return_value=capture),
+    ):
+        result = runner.invoke(cli, ["export", "my-dl", "--downloads"])
+
+    assert result.exit_code == 0
+    assert (dl_dir / "my-dl" / "events.jsonl").exists()
+
+
 # --- upload auto-export tests ---
 
 
