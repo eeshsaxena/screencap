@@ -106,13 +106,35 @@ def _migrate_schema(db_path: str) -> None:
 
     conn = sqlite3.connect(db_path)
     cur = conn.cursor()
+
+    # --- recording table ---
     cur.execute("PRAGMA table_info(recording)")
-    columns = {row[1] for row in cur.fetchall()}
-    if "pixel_ratio" not in columns:
+    rec_cols = {row[1] for row in cur.fetchall()}
+    if "pixel_ratio" not in rec_cols:
         cur.execute(
             "ALTER TABLE recording ADD COLUMN pixel_ratio REAL DEFAULT 1.0"
         )
-        conn.commit()
+
+    # --- action_event table ---
+    cur.execute("PRAGMA table_info(action_event)")
+    ae_cols = {row[1] for row in cur.fetchall()}
+
+    # Columns added after the initial schema, with their SQLite types.
+    _new_action_cols = [
+        ("mouse_pressure", "NUMERIC"),
+        ("modifier_flags", "INTEGER"),
+        ("scroll_phase", "INTEGER"),
+        ("momentum_phase", "INTEGER"),
+        ("is_continuous", "BOOLEAN"),
+        ("disabled", "BOOLEAN DEFAULT 0"),
+    ]
+    for col_name, col_type in _new_action_cols:
+        if col_name not in ae_cols:
+            cur.execute(
+                f"ALTER TABLE action_event ADD COLUMN {col_name} {col_type}"
+            )
+
+    conn.commit()
     conn.close()
 
 
