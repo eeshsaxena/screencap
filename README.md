@@ -155,6 +155,37 @@ Transcribe a recording's audio using Whisper. Interactively offers OpenAI API or
 | medium | ~1.5 GB | High accuracy |
 | large | ~2.9 GB | Best accuracy |
 
+### `screencap export <name>`
+
+Export processed events as JSONL for ML training. Runs the full processing pipeline (click detection, drag detection, keyboard merge, shortcut detection) and writes one JSON object per line.
+
+```bash
+# export to the recording directory (default)
+screencap export my-session
+# → ~/.screencap/recordings/my-session/events.jsonl
+
+# export all recordings
+screencap export --all
+
+# stream to stdout (for piping to jq, etc.)
+screencap export my-session --stdout
+
+# custom output path
+screencap export my-session -o ~/training-data/events.jsonl
+
+# exclude mouse move events
+screencap export my-session --exclude-moves
+```
+
+| Flag | Description |
+|------|-------------|
+| `--all` | Export all recordings (each gets its own `events.jsonl`) |
+| `-o, --output PATH` | Custom output file path |
+| `--stdout` | Write to stdout instead of a file |
+| `--exclude-moves` | Omit mouse move events from output |
+
+**Warning:** Export includes all captured keystrokes (passwords, API keys, private messages). Run `screencap scrub` first for sensitive sessions.
+
 ### `screencap upload [names...]`
 
 Upload recordings to cloud storage (GCS). Tracks upload status locally via `.upload_status.json` — re-running skips already-uploaded recordings without hitting the server.
@@ -255,6 +286,7 @@ Environment variables take precedence over `config.toml`.
     ├── audio.flac              # Audio (if enabled)
     ├── transcript.txt          # Plain text transcript (auto or manual)
     ├── transcript.json         # Timestamped transcript (auto or manual)
+    ├── events.jsonl             # Exported events (created by `screencap export`)
     ├── system_metrics.json     # CPU, memory, display info
     ├── .upload_status.json     # Upload tracking (auto-created)
     └── viewer.html             # Interactive web viewer
