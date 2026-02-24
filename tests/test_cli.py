@@ -760,3 +760,68 @@ def test_export_multiple_events(tmp_path):
     assert len(lines) == 3
     for line in lines:
         json.loads(line)
+
+
+def test_export_no_name_no_all():
+    """No name and no --all results in exit code 1."""
+    runner = CliRunner()
+    result = runner.invoke(cli, ["export"])
+    assert result.exit_code == 1
+
+
+def test_export_all_with_stdout():
+    """--all cannot be combined with --stdout."""
+    runner = CliRunner()
+    result = runner.invoke(cli, ["export", "--all", "--stdout"])
+    assert result.exit_code == 1
+
+
+def test_export_all_with_output():
+    """--all cannot be combined with -o."""
+    runner = CliRunner()
+    result = runner.invoke(cli, ["export", "--all", "-o", "out.jsonl"])
+    assert result.exit_code == 1
+
+
+def test_export_all(tmp_path):
+    """--all exports every recording to its own events.jsonl."""
+    # Create two recording dirs with recording.db
+    for name in ("rec-a", "rec-b"):
+        d = tmp_path / name
+        d.mkdir()
+        (d / "recording.db").touch()
+
+    # Also create a scrubbed dir and a non-recording dir — should be skipped
+    scrubbed = tmp_path / "rec-a-scrubbed"
+    scrubbed.mkdir()
+    (scrubbed / "recording.db").touch()
+    (tmp_path / "not-a-recording").mkdir()
+
+    capture = _mock_capture()
+    runner = CliRunner()
+
+    def fresh_capture(*args, **kwargs):
+        return _mock_capture()
+
+    with (
+        mock.patch("screencap.config.get_recordings_dir", return_value=tmp_path),
+        mock.patch("openadapt_capture.capture.CaptureSession.load", side_effect=fresh_capture),
+    ):
+        result = runner.invoke(cli, ["export", "--all"])
+
+    assert result.exit_code == 0
+    # Both recordings should have events.jsonl
+    assert (tmp_path / "rec-a" / "events.jsonl").exists()
+    assert (tmp_path / "rec-b" / "events.jsonl").exists()
+    # Scrubbed dir should NOT have been exported
+    assert not (scrubbed / "events.jsonl").exists()
+
+
+def test_export_all_no_recordings(tmp_path):
+    """--all with no recordings prints message and exits cleanly."""
+    runner = CliRunner()
+
+    with mock.patch("screencap.config.get_recordings_dir", return_value=tmp_path):
+        result = runner.invoke(cli, ["export", "--all"])
+
+    assert result.exit_code == 0

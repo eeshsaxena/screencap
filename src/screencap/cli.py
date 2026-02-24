@@ -371,39 +371,59 @@ def info(name, as_json):
             console.print(f"\n  [dim]No end snapshot (recording may have been interrupted).[/dim]")
 
 
+def _export_one(recording_dir, output_path, exclude_moves, err_console):
+    """Export a single recording. Returns event count, or -1 on error."""
+    import contextlib
+
+    from openadapt_capture import Capture
+
+    try:
+        with Capture.load(str(recording_dir)) as capture:
+            out_ctx = open(output_path, "w") if output_path else contextlib.nullcontext(sys.stdout)
+            with out_ctx as out_file:
+                count = 0
+                for action in capture.actions(include_moves=not exclude_moves):
+                    click.echo(action.event.model_dump_json(), file=out_file)
+                    count += 1
+        return count
+    except FileNotFoundError:
+        err_console.print(
+            f"[red]Error:[/red] No recording.db found in {recording_dir.name}. "
+            "Legacy capture.db format is not supported for export."
+        )
+        return -1
+
+
 @cli.command()
-@click.argument("name")
+@click.argument("name", required=False, default=None)
+@click.option("--all", "all_recordings", is_flag=True, help="Export all recordings.")
 @click.option("--output", "-o", type=click.Path(), default=None,
               help="Output file path. Default: events.jsonl in the recording directory.")
 @click.option("--stdout", "use_stdout", is_flag=True, default=False,
               help="Write to stdout instead of a file.")
 @click.option("--exclude-moves", is_flag=True, default=False,
               help="Exclude mouse move events from output.")
-def export(name, output, use_stdout, exclude_moves):
+def export(name, all_recordings, output, use_stdout, exclude_moves):
     """Export recording events as JSONL for training.
 
     WARNING: Export includes all captured keystrokes (passwords, API keys,
     private messages). Run 'screencap scrub' on the recording first if it
     contains sensitive sessions.
     """
-    import contextlib
-
-    from screencap.config import resolve_recording_dir
+    from screencap.config import get_recordings_dir, resolve_recording_dir
 
     err_console = Console(stderr=True)
 
-    try:
-        recording_dir = resolve_recording_dir(name)
-    except ValueError:
-        err_console.print("[red]Error:[/red] Invalid recording name.")
+    if not name and not all_recordings:
+        err_console.print("[red]Error:[/red] Provide a recording name or use --all.")
         sys.exit(1)
 
-    if not recording_dir.exists():
-        err_console.print(f"[red]Error:[/red] Recording not found: {name}")
+    if all_recordings and (use_stdout or output):
+        err_console.print("[red]Error:[/red] --all cannot be used with --stdout or -o.")
         sys.exit(1)
 
     try:
-        from openadapt_capture import Capture
+        from openadapt_capture import Capture  # noqa: F401
     except ImportError:
         err_console.print(_RECORD_EXTRAS_MSG)
         raise SystemExit(1)
@@ -414,6 +434,47 @@ def export(name, output, use_stdout, exclude_moves):
         highlight=False,
     )
 
+    if all_recordings:
+        recordings_dir = get_recordings_dir()
+        dirs = sorted(
+            d for d in recordings_dir.iterdir()
+            if d.is_dir()
+            and not d.name.endswith("-scrubbed")
+            and (d / "recording.db").exists()
+        )
+        if not dirs:
+            err_console.print("[dim]No recordings found.[/dim]")
+            return
+
+        total = len(dirs)
+        exported = 0
+        failed = 0
+        for i, rec_dir in enumerate(dirs, 1):
+            err_console.print(f"\n[bold][{i}/{total}][/bold] {rec_dir.name}")
+            out = str(rec_dir / "events.jsonl")
+            count = _export_one(rec_dir, out, exclude_moves, err_console)
+            if count >= 0:
+                err_console.print(f"Exported {count} events to [bold]{out}[/bold]")
+                exported += 1
+            else:
+                failed += 1
+
+        err_console.print(f"\n[bold]Done.[/bold] {exported} exported, {failed} failed.")
+        if failed:
+            sys.exit(1)
+        return
+
+    # Single recording
+    try:
+        recording_dir = resolve_recording_dir(name)
+    except ValueError:
+        err_console.print("[red]Error:[/red] Invalid recording name.")
+        sys.exit(1)
+
+    if not recording_dir.exists():
+        err_console.print(f"[red]Error:[/red] Recording not found: {name}")
+        sys.exit(1)
+
     # Resolve output destination
     if use_stdout:
         output_path = None
@@ -422,25 +483,11 @@ def export(name, output, use_stdout, exclude_moves):
     else:
         output_path = str(recording_dir / "events.jsonl")
 
-    try:
-        with Capture.load(str(recording_dir)) as capture:
-            out_ctx = open(output_path, "w") if output_path else contextlib.nullcontext(sys.stdout)
-            with out_ctx as out_file:
-                count = 0
-                for action in capture.actions(include_moves=not exclude_moves):
-                    click.echo(action.event.model_dump_json(), file=out_file)
-                    count += 1
-
-        if output_path:
-            err_console.print(
-                f"Exported {count} events to [bold]{output_path}[/bold]"
-            )
-    except FileNotFoundError:
-        err_console.print(
-            f"[red]Error:[/red] No recording.db found in {name}. "
-            "Legacy capture.db format is not supported for export."
-        )
+    count = _export_one(recording_dir, output_path, exclude_moves, err_console)
+    if count < 0:
         sys.exit(1)
+    if output_path:
+        err_console.print(f"Exported {count} events to [bold]{output_path}[/bold]")
 
 
 def _check_scrub_deps() -> bool:
