@@ -323,17 +323,23 @@ def merge_consecutive_mouse_move_events(events: list[ActionEvent]) -> list[Actio
             return
 
         if len(move_buffer) == 1:
-            result.append(move_buffer[0])
+            ev = move_buffer[0]
+            # Always populate path, even for single moves
+            if not ev.path:
+                ev = ev.model_copy(update={"path": [(ev.x, ev.y)]})
+            result.append(ev)
         else:
             # Create merged move event with final position and last pressure
             first = move_buffer[0]
             last = move_buffer[-1]
+            path = [(m.x, m.y) for m in move_buffer]
             merged = MouseMoveEvent(
                 timestamp=first.timestamp,
                 x=last.x,
                 y=last.y,
                 pressure=last.pressure,
                 modifier_flags=last.modifier_flags,
+                path=path,
             )
             result.append(merged)
 
