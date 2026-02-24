@@ -581,3 +581,167 @@ def test_download_cli_summary_output(tmp_path):
     assert result.exit_code == 0
     assert "Done." in result.output
     assert "downloaded" in result.output
+
+
+# ---------------------------------------------------------------------------
+# Parallel transfer tests
+# ---------------------------------------------------------------------------
+
+
+def test_download_recording_jobs_1_sequential(tmp_path):
+    """--jobs 1 should produce correct results (matches sequential behavior)."""
+    from screencap.download import download_recording
+
+    mock_urls = {
+        "video.mp4": "https://signed/video",
+        "audio.flac": "https://signed/audio",
+    }
+
+    mock_resp = mock.MagicMock()
+    mock_resp.status_code = 200
+    mock_resp.headers = {"content-length": "100"}
+    mock_resp.raise_for_status = mock.MagicMock()
+    mock_resp.iter_content.return_value = [b"x" * 100]
+
+    with (
+        mock.patch("screencap.download.request_signed_urls", return_value=(mock_urls, "gs://...")),
+        mock.patch("screencap.download.requests.get", return_value=mock_resp),
+    ):
+        result = download_recording("my-rec", tmp_path, jobs=1)
+
+    assert set(result.downloaded) == {"video.mp4", "audio.flac"}
+    assert result.failed == []
+    assert (tmp_path / "my-rec" / DOWNLOAD_STATUS_FILE).exists()
+
+
+def test_download_recording_jobs_more_than_files(tmp_path):
+    """--jobs 4 with 2 files should not hang."""
+    from screencap.download import download_recording
+
+    mock_urls = {
+        "video.mp4": "https://signed/video",
+        "audio.flac": "https://signed/audio",
+    }
+
+    mock_resp = mock.MagicMock()
+    mock_resp.status_code = 200
+    mock_resp.headers = {"content-length": "50"}
+    mock_resp.raise_for_status = mock.MagicMock()
+    mock_resp.iter_content.return_value = [b"x" * 50]
+
+    with (
+        mock.patch("screencap.download.request_signed_urls", return_value=(mock_urls, "gs://...")),
+        mock.patch("screencap.download.requests.get", return_value=mock_resp),
+    ):
+        result = download_recording("my-rec", tmp_path, jobs=4)
+
+    assert set(result.downloaded) == {"video.mp4", "audio.flac"}
+    assert result.failed == []
+
+
+def test_download_recording_parallel_partial_failure(tmp_path):
+    """--jobs 4 with 1 file failing: result lists correct."""
+    from screencap.download import download_recording
+
+    mock_urls = {
+        "a.txt": "https://signed/a",
+        "b.txt": "https://signed/b",
+        "c.txt": "https://signed/c",
+        "d.txt": "https://signed/d",
+    }
+
+    mock_resp_ok = mock.MagicMock()
+    mock_resp_ok.status_code = 200
+    mock_resp_ok.headers = {"content-length": "10"}
+    mock_resp_ok.raise_for_status = mock.MagicMock()
+    mock_resp_ok.iter_content.return_value = [b"x" * 10]
+
+    call_count = 0
+
+    def side_effect(*args, **kwargs):
+        nonlocal call_count
+        call_count += 1
+        if call_count == 2:
+            raise ConnectionError("network drop")
+        return mock_resp_ok
+
+    with (
+        mock.patch("screencap.download.request_signed_urls", return_value=(mock_urls, "gs://...")),
+        mock.patch("screencap.download.requests.get", side_effect=side_effect),
+    ):
+        result = download_recording("my-rec", tmp_path, jobs=4)
+
+    assert len(result.downloaded) == 3
+    assert len(result.failed) == 1
+    assert not (tmp_path / "my-rec" / DOWNLOAD_STATUS_FILE).exists()
+
+
+def test_download_cli_jobs_flag_accepted(tmp_path):
+    """CLI --jobs 2 should be accepted."""
+    from screencap.download import RemoteRecording
+
+    remote = [RemoteRecording("rec-001", file_count=1, total_size=100)]
+    mock_urls = {"video.mp4": "https://signed/video"}
+
+    mock_resp = mock.MagicMock()
+    mock_resp.status_code = 200
+    mock_resp.headers = {"content-length": "50"}
+    mock_resp.raise_for_status = mock.MagicMock()
+    mock_resp.iter_content.return_value = [b"x" * 50]
+
+    runner = CliRunner()
+    with (
+        mock.patch("screencap.download.list_remote_recordings", return_value=remote),
+        mock.patch("screencap.download.request_signed_urls", return_value=(mock_urls, "gs://...")),
+        mock.patch("screencap.download.requests.get", return_value=mock_resp),
+        mock.patch("screencap.download.get_downloads_dir", return_value=tmp_path),
+    ):
+        result = runner.invoke(cli, ["download", "--jobs", "2"])
+
+    assert result.exit_code == 0
+
+
+def test_download_cli_jobs_0_rejected():
+    """CLI --jobs 0 should be rejected by Click validation."""
+    runner = CliRunner()
+    result = runner.invoke(cli, ["download", "--jobs", "0"])
+    assert result.exit_code != 0
+
+
+def test_download_cli_jobs_negative_rejected():
+    """CLI --jobs -1 should be rejected."""
+    runner = CliRunner()
+    result = runner.invoke(cli, ["download", "--jobs", "-1"])
+    assert result.exit_code != 0
+
+
+def test_download_cli_jobs_abc_rejected():
+    """CLI --jobs abc should be rejected."""
+    runner = CliRunner()
+    result = runner.invoke(cli, ["download", "--jobs", "abc"])
+    assert result.exit_code != 0
+
+
+def test_download_cli_short_flag(tmp_path):
+    """CLI -j 1 short flag should work."""
+    from screencap.download import RemoteRecording
+
+    remote = [RemoteRecording("rec-001", file_count=1, total_size=100)]
+    mock_urls = {"video.mp4": "https://signed/video"}
+
+    mock_resp = mock.MagicMock()
+    mock_resp.status_code = 200
+    mock_resp.headers = {"content-length": "50"}
+    mock_resp.raise_for_status = mock.MagicMock()
+    mock_resp.iter_content.return_value = [b"x" * 50]
+
+    runner = CliRunner()
+    with (
+        mock.patch("screencap.download.list_remote_recordings", return_value=remote),
+        mock.patch("screencap.download.request_signed_urls", return_value=(mock_urls, "gs://...")),
+        mock.patch("screencap.download.requests.get", return_value=mock_resp),
+        mock.patch("screencap.download.get_downloads_dir", return_value=tmp_path),
+    ):
+        result = runner.invoke(cli, ["download", "-j", "1"])
+
+    assert result.exit_code == 0
