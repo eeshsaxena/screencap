@@ -324,6 +324,155 @@ class TestMergeConsecutiveKeyboardEventsComprehensive:
 
 
 # =============================================================================
+# Test: keyboard buffer hold across non-keyboard events
+# =============================================================================
+
+class TestKeyboardBufferHoldAcrossNonKeyboardEvents:
+    """Tests that keyboard buffer is held when keys are physically pressed,
+    even when non-keyboard events interleave."""
+
+    def test_shortcut_with_interleaved_mouse_move(self, ts):
+        """Cmd-dn, MouseMove, C-dn, C-up, Cmd-up → one KeyTypeEvent with all 4 key events."""
+        events = [
+            KeyDownEvent(timestamp=ts.next(), key_name="cmd"),
+            MouseMoveEvent(timestamp=ts.next(), x=200, y=200),
+            KeyDownEvent(timestamp=ts.next(), key_char="c"),
+            KeyUpEvent(timestamp=ts.next(), key_char="c"),
+            KeyUpEvent(timestamp=ts.next(), key_name="cmd"),
+        ]
+        result = merge_consecutive_keyboard_events(events)
+
+        mouse_events = [e for e in result if isinstance(e, MouseMoveEvent)]
+        type_events = [e for e in result if isinstance(e, KeyTypeEvent)]
+
+        assert len(mouse_events) == 1, "MouseMove should be emitted inline"
+        assert len(type_events) == 1, "All key events should merge into one KeyTypeEvent"
+        # The KeyTypeEvent should contain all 4 key events as children
+        assert len(type_events[0].children) == 4
+        key_names = [c.key_name for c in type_events[0].children if hasattr(c, 'key_name') and c.key_name]
+        assert "cmd" in key_names
+
+    def test_shortcut_with_multiple_interleaved_events(self, ts):
+        """Cmd-dn, MouseMove, MouseScroll, C-dn, C-up, Cmd-up → mouse events emitted before KeyTypeEvent."""
+        events = [
+            KeyDownEvent(timestamp=ts.next(), key_name="cmd"),
+            MouseMoveEvent(timestamp=ts.next(), x=200, y=200),
+            MouseScrollEvent(timestamp=ts.next(), x=200, y=200, dx=0, dy=1),
+            KeyDownEvent(timestamp=ts.next(), key_char="c"),
+            KeyUpEvent(timestamp=ts.next(), key_char="c"),
+            KeyUpEvent(timestamp=ts.next(), key_name="cmd"),
+        ]
+        result = merge_consecutive_keyboard_events(events)
+
+        mouse_events = [e for e in result if isinstance(e, (MouseMoveEvent, MouseScrollEvent))]
+        type_events = [e for e in result if isinstance(e, KeyTypeEvent)]
+
+        assert len(mouse_events) == 2, "Both mouse events should be emitted"
+        assert len(type_events) == 1, "All key events should merge into one KeyTypeEvent"
+        assert len(type_events[0].children) == 4
+
+    def test_multi_modifier_shortcut_with_interleaved_mouse(self, ts):
+        """Cmd-dn, MouseMove, Shift-dn, MouseMove, Z-dn, Z-up, Shift-up, Cmd-up → one KeyTypeEvent."""
+        events = [
+            KeyDownEvent(timestamp=ts.next(), key_name="cmd"),
+            MouseMoveEvent(timestamp=ts.next(), x=100, y=100),
+            KeyDownEvent(timestamp=ts.next(), key_name="shift"),
+            MouseMoveEvent(timestamp=ts.next(), x=200, y=200),
+            KeyDownEvent(timestamp=ts.next(), key_char="z"),
+            KeyUpEvent(timestamp=ts.next(), key_char="z"),
+            KeyUpEvent(timestamp=ts.next(), key_name="shift"),
+            KeyUpEvent(timestamp=ts.next(), key_name="cmd"),
+        ]
+        result = merge_consecutive_keyboard_events(events)
+
+        mouse_events = [e for e in result if isinstance(e, MouseMoveEvent)]
+        type_events = [e for e in result if isinstance(e, KeyTypeEvent)]
+
+        assert len(mouse_events) == 2, "Both mouse moves should be emitted"
+        assert len(type_events) == 1, "All key events should merge into one KeyTypeEvent"
+        assert len(type_events[0].children) == 6  # cmd_dn, shift_dn, z_dn, z_up, shift_up, cmd_up
+
+    def test_modifier_only_no_letter(self, ts):
+        """Cmd-dn, MouseMove, Cmd-up → MouseMove then KeyTypeEvent(text='')."""
+        events = [
+            KeyDownEvent(timestamp=ts.next(), key_name="cmd"),
+            MouseMoveEvent(timestamp=ts.next(), x=200, y=200),
+            KeyUpEvent(timestamp=ts.next(), key_name="cmd"),
+        ]
+        result = merge_consecutive_keyboard_events(events)
+
+        mouse_events = [e for e in result if isinstance(e, MouseMoveEvent)]
+        type_events = [e for e in result if isinstance(e, KeyTypeEvent)]
+
+        assert len(mouse_events) == 1
+        assert len(type_events) == 1
+        assert type_events[0].text == ""
+        assert len(type_events[0].children) == 2  # cmd_dn, cmd_up
+
+    def test_no_keys_held_still_flushes(self, ts):
+        """a-dn, a-up (pressed_keys empties), MouseMove → KeyTypeEvent('a') then MouseMove."""
+        events = [
+            KeyDownEvent(timestamp=ts.next(), key_char="a"),
+            KeyUpEvent(timestamp=ts.next(), key_char="a"),
+            MouseMoveEvent(timestamp=ts.next(), x=200, y=200),
+        ]
+        result = merge_consecutive_keyboard_events(events)
+
+        # KeyTypeEvent should come first (flushed on key-up since pressed_keys is empty)
+        assert isinstance(result[0], KeyTypeEvent)
+        assert result[0].text == "a"
+        assert isinstance(result[1], MouseMoveEvent)
+
+    def test_empty_buffer_non_keyboard_event(self, ts):
+        """MouseMove with no prior keyboard activity → passes through unchanged."""
+        events = [
+            MouseMoveEvent(timestamp=ts.next(), x=200, y=200),
+        ]
+        result = merge_consecutive_keyboard_events(events)
+
+        assert len(result) == 1
+        assert isinstance(result[0], MouseMoveEvent)
+
+    def test_shortcut_with_mouse_click_interleaved(self, ts):
+        """Cmd-dn, MouseClick (down+up), C-dn, C-up, Cmd-up → click events inline, one KeyTypeEvent."""
+        events = [
+            KeyDownEvent(timestamp=ts.next(), key_name="cmd"),
+            MouseDownEvent(timestamp=ts.next(), x=100, y=100, button=MouseButton.LEFT),
+            MouseUpEvent(timestamp=ts.next(), x=100, y=100, button=MouseButton.LEFT),
+            KeyDownEvent(timestamp=ts.next(), key_char="c"),
+            KeyUpEvent(timestamp=ts.next(), key_char="c"),
+            KeyUpEvent(timestamp=ts.next(), key_name="cmd"),
+        ]
+        result = merge_consecutive_keyboard_events(events)
+
+        mouse_events = [e for e in result if isinstance(e, (MouseDownEvent, MouseUpEvent))]
+        type_events = [e for e in result if isinstance(e, KeyTypeEvent)]
+
+        assert len(mouse_events) == 2, "Mouse click events should be emitted inline"
+        assert len(type_events) == 1, "All key events should merge into one KeyTypeEvent"
+        assert len(type_events[0].children) == 4
+
+    def test_modifier_held_through_many_mouse_events(self, ts):
+        """Modifier held through 10+ mouse moves → buffer stays intact."""
+        events = [KeyDownEvent(timestamp=ts.next(), key_name="cmd")]
+        for _ in range(15):
+            events.append(MouseMoveEvent(timestamp=ts.next(), x=ts.current * 10, y=ts.current * 10))
+        events.extend([
+            KeyDownEvent(timestamp=ts.next(), key_char="c"),
+            KeyUpEvent(timestamp=ts.next(), key_char="c"),
+            KeyUpEvent(timestamp=ts.next(), key_name="cmd"),
+        ])
+        result = merge_consecutive_keyboard_events(events)
+
+        mouse_events = [e for e in result if isinstance(e, MouseMoveEvent)]
+        type_events = [e for e in result if isinstance(e, KeyTypeEvent)]
+
+        assert len(mouse_events) == 15, "All mouse moves should be emitted"
+        assert len(type_events) == 1, "All key events should merge into one KeyTypeEvent"
+        assert len(type_events[0].children) == 4  # cmd_dn, c_dn, c_up, cmd_up
+
+
+# =============================================================================
 # Test: detect_drag_events
 # =============================================================================
 

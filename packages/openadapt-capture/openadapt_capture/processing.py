@@ -168,6 +168,12 @@ def merge_consecutive_keyboard_events(events: list[ActionEvent]) -> list[ActionE
     Media keys (play, volume, brightness, etc.) are emitted as raw
     KeyDownEvent/KeyUpEvent instead of being merged.
 
+    Non-keyboard events (mouse moves, clicks, scrolls) are emitted inline.
+    However, the keyboard buffer is only flushed when no keys are physically
+    held (pressed_keys is empty). This preserves shortcuts like Cmd+C even
+    when mouse events interleave between the modifier key-down and the
+    letter key-down.
+
     Args:
         events: List of events.
 
@@ -220,8 +226,11 @@ def merge_consecutive_keyboard_events(events: list[ActionEvent]) -> list[ActionE
             if not pressed_keys:
                 flush_buffer()
         else:
-            # Non-keyboard event: flush buffer and add event
-            flush_buffer()
+            # Non-keyboard event: emit it, but only flush keyboard buffer
+            # if no keys are currently held (preserves shortcuts across
+            # interleaved mouse events)
+            if not pressed_keys:
+                flush_buffer()
             result.append(event)
 
     # Flush any remaining keyboard events
