@@ -381,6 +381,28 @@ class TestSpecialKeyProcessing:
         assert SpecialKeyEvent(timestamp=0, key_name="f12").text == "F12"
         assert SpecialKeyEvent(timestamp=0, key_name="insert").text == "INSERT"
 
+    def test_common_editing_keys_not_wrapped(self):
+        """Space, backspace, esc, enter, arrows etc. should NOT become SpecialKeyEvent.
+
+        On macOS these keys have key_name set and key_char=None, but they are
+        common editing/navigation keys that belong in the KeyTypeEvent flow.
+        """
+        editing_keys = [
+            "space", "backspace", "enter", "return", "tab", "escape",
+            "delete", "up", "down", "left", "right",
+            "home", "end", "page_up", "page_down", "caps_lock",
+        ]
+        for key_name in editing_keys:
+            events = [
+                KeyDownEvent(timestamp=1.0, key_name=key_name),
+                KeyUpEvent(timestamp=1.1, key_name=key_name),
+            ]
+            result = merge_consecutive_keyboard_events(events)
+            for ev in result:
+                assert not isinstance(ev, SpecialKeyEvent), (
+                    f"{key_name} should NOT be wrapped as SpecialKeyEvent"
+                )
+
 
 class TestMergeConsecutiveMouseMoveEvents:
     """Tests for merge_consecutive_mouse_move_events."""

@@ -6,6 +6,7 @@ the openadapt-capture Pydantic event models.
 
 from __future__ import annotations
 
+import re
 from typing import Any, TypeVar
 
 import os
@@ -159,13 +160,35 @@ _MODIFIER_NAMES = {
     "cmd", "cmd_l", "cmd_r",
 }
 
+_FUNCTION_KEY_RE = re.compile(r"^f\d+$")
+
+# Prefixes/patterns that identify truly special (non-editing) keys.
+_SPECIAL_KEY_PREFIXES = ("media_", "brightness_")
+_SPECIAL_KEY_NAMES = {
+    "eject", "fn", "insert", "print_screen", "scroll_lock", "pause",
+    "num_lock", "menu",
+}
+
 
 def _is_special_key(event: KeyDownEvent | KeyUpEvent) -> bool:
-    """Non-printable, non-modifier key (media, function, etc.)."""
+    """Media key, function key, or system key (NOT common editing keys).
+
+    Positively matches only:
+    - Media keys: key_name starts with "media_" or "brightness_"
+    - Function keys: key_name matches f1..f20
+    - System keys: eject, fn, insert, print_screen, etc.
+
+    Does NOT match common editing/navigation keys like space, backspace,
+    enter, tab, esc, arrows, delete, home, end, page_up, page_down.
+    """
     if not event.key_name or event.key_char is not None:
         return False
-    canonical = event.canonical_key_name or event.key_name
-    return canonical.lower() not in _MODIFIER_NAMES
+    canonical = (event.canonical_key_name or event.key_name).lower()
+    if any(canonical.startswith(p) for p in _SPECIAL_KEY_PREFIXES):
+        return True
+    if _FUNCTION_KEY_RE.match(canonical):
+        return True
+    return canonical in _SPECIAL_KEY_NAMES
 
 
 def merge_consecutive_keyboard_events(events: list[ActionEvent]) -> list[ActionEvent]:
