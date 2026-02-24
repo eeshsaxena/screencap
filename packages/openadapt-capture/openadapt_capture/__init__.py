@@ -52,6 +52,7 @@ from openadapt_capture.events import (
     MouseUpEvent,
     ScreenEvent,
     ScreenFrameEvent,
+    SpecialKeyEvent,
     WindowEvent,
     WindowStateEvent,
 )
@@ -148,6 +149,7 @@ __all__ = [
     "KeyUpEvent",
     "KeyTypeEvent",
     "KeyShortcutEvent",
+    "SpecialKeyEvent",
     # Screen/audio events
     "ScreenFrameEvent",
     "AudioChunkEvent",

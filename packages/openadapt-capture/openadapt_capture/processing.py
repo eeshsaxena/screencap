@@ -27,6 +27,7 @@ from openadapt_capture.events import (
     MouseScrollEvent,
     MouseSmartMagnifyEvent,
     MouseUpEvent,
+    SpecialKeyEvent,
 )
 
 # Type variable for event types
@@ -151,22 +152,28 @@ def remove_redundant_mouse_move_events(events: list[ActionEvent]) -> list[Action
     return result
 
 
-_MEDIA_KEY_PREFIXES = ("media_", "brightness_")
+_MODIFIER_NAMES = {
+    "shift", "shift_l", "shift_r",
+    "ctrl", "ctrl_l", "ctrl_r",
+    "alt", "alt_l", "alt_r", "alt_gr",
+    "cmd", "cmd_l", "cmd_r",
+}
 
 
-def _is_media_key(event: KeyDownEvent | KeyUpEvent) -> bool:
-    """Check if a keyboard event represents a media/system key."""
-    if not hasattr(event, "key_name") or event.key_name is None:
+def _is_special_key(event: KeyDownEvent | KeyUpEvent) -> bool:
+    """Non-printable, non-modifier key (media, function, etc.)."""
+    if not event.key_name or event.key_char is not None:
         return False
-    return any(event.key_name.startswith(p) for p in _MEDIA_KEY_PREFIXES)
+    canonical = event.canonical_key_name or event.key_name
+    return canonical.lower() not in _MODIFIER_NAMES
 
 
 def merge_consecutive_keyboard_events(events: list[ActionEvent]) -> list[ActionEvent]:
-    """Merge consecutive keyboard events into KeyTypeEvent.
+    """Merge consecutive keyboard events into KeyTypeEvent or SpecialKeyEvent.
 
     Groups key press/release sequences into typed text.
-    Media keys (play, volume, brightness, etc.) are emitted as raw
-    KeyDownEvent/KeyUpEvent instead of being merged.
+    Special keys (media, function, non-printable non-modifier) are wrapped
+    into SpecialKeyEvent when their down+up are immediately adjacent.
 
     Non-keyboard events (mouse moves, clicks, scrolls) are emitted inline.
     However, the keyboard buffer is only flushed when no keys are physically
@@ -178,7 +185,7 @@ def merge_consecutive_keyboard_events(events: list[ActionEvent]) -> list[ActionE
         events: List of events.
 
     Returns:
-        Events with keyboard sequences merged into KeyTypeEvent.
+        Events with keyboard sequences merged into KeyTypeEvent/SpecialKeyEvent.
     """
     result = []
     keyboard_buffer: list[KeyDownEvent | KeyUpEvent] = []
@@ -208,16 +215,67 @@ def merge_consecutive_keyboard_events(events: list[ActionEvent]) -> list[ActionE
         keyboard_buffer.clear()
         pressed_keys.clear()
 
+    # Pending special key down waiting for an adjacent up to pair with
+    pending_special_down: KeyDownEvent | None = None
+
+    def emit_pending_special_down() -> None:
+        """Emit pending special key down as a raw event (no paired up found)."""
+        nonlocal pending_special_down
+        if pending_special_down is not None:
+            result.append(pending_special_down)
+            pending_special_down = None
+
     for event in events:
-        if isinstance(event, (KeyDownEvent, KeyUpEvent)) and _is_media_key(event):
-            # Media key: flush any buffered regular keys, then emit as-is
-            flush_buffer()
-            result.append(event)
+        if isinstance(event, KeyDownEvent) and _is_special_key(event):
+            if pressed_keys:
+                # Modifiers are held — let the special key go into the buffer
+                # so it becomes part of a KeyTypeEvent → KeyShortcutEvent
+                keyboard_buffer.append(event)
+                key_id = event.key_name or event.key_char or event.key_vk or ""
+                pressed_keys.add(key_id)
+            else:
+                # No modifiers held — flush buffer, start pairing
+                flush_buffer()
+                emit_pending_special_down()
+                pending_special_down = event
+
+        elif isinstance(event, KeyUpEvent) and _is_special_key(event):
+            if pressed_keys:
+                # Modifiers held — let the up go into the buffer
+                key_id = event.key_name or event.key_char or event.key_vk or ""
+                pressed_keys.discard(key_id)
+                keyboard_buffer.append(event)
+                if not pressed_keys:
+                    flush_buffer()
+            elif pending_special_down is not None:
+                # Check if this up matches the pending down
+                down_id = pending_special_down.key_name or pending_special_down.key_char or pending_special_down.key_vk or ""
+                up_id = event.key_name or event.key_char or event.key_vk or ""
+                if down_id == up_id:
+                    # Adjacent pair — wrap into SpecialKeyEvent
+                    key_name = pending_special_down.canonical_key_name or pending_special_down.key_name or ""
+                    result.append(SpecialKeyEvent(
+                        timestamp=pending_special_down.timestamp,
+                        key_name=key_name,
+                        children=[pending_special_down, event],
+                    ))
+                    pending_special_down = None
+                else:
+                    # Mismatched — emit both as raw
+                    emit_pending_special_down()
+                    result.append(event)
+            else:
+                # Orphan up — emit as raw
+                result.append(event)
+
         elif isinstance(event, KeyDownEvent):
+            emit_pending_special_down()
             key_id = event.key_name or event.key_char or event.key_vk or ""
             pressed_keys.add(key_id)
             keyboard_buffer.append(event)
+
         elif isinstance(event, KeyUpEvent):
+            emit_pending_special_down()
             key_id = event.key_name or event.key_char or event.key_vk or ""
             pressed_keys.discard(key_id)
             keyboard_buffer.append(event)
@@ -226,14 +284,16 @@ def merge_consecutive_keyboard_events(events: list[ActionEvent]) -> list[ActionE
             if not pressed_keys:
                 flush_buffer()
         else:
-            # Non-keyboard event: emit it, but only flush keyboard buffer
-            # if no keys are currently held (preserves shortcuts across
-            # interleaved mouse events)
+            # Non-keyboard event breaks special key adjacency
+            emit_pending_special_down()
+            # Only flush keyboard buffer if no keys are currently held
+            # (preserves shortcuts across interleaved mouse events)
             if not pressed_keys:
                 flush_buffer()
             result.append(event)
 
-    # Flush any remaining keyboard events
+    # Flush any remaining state
+    emit_pending_special_down()
     flush_buffer()
 
     return result
@@ -732,7 +792,7 @@ def detect_drag_events(
     # Event types that are tolerated during a drag — emitted inline and
     # also captured as children of the drag.
     DRAG_SIBLING_TYPES = (
-        KeyTypeEvent, KeyShortcutEvent, KeyDownEvent, KeyUpEvent,
+        KeyTypeEvent, KeyShortcutEvent, SpecialKeyEvent, KeyDownEvent, KeyUpEvent,
         MouseScrollEvent,
         MouseMagnifyEvent, MouseRotateEvent, MouseSmartMagnifyEvent,
     )
@@ -852,6 +912,7 @@ def get_action_events(events: list[Event]) -> list[ActionEvent]:
         MouseDragEvent,
         KeyTypeEvent,
         KeyShortcutEvent,
+        SpecialKeyEvent,
     )
     return [e for e in events if isinstance(e, action_types)]
 

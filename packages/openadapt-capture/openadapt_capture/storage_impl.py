@@ -32,6 +32,7 @@ from openadapt_capture.events import (
     MouseSmartMagnifyEvent,
     MouseUpEvent,
     ScreenFrameEvent,
+    SpecialKeyEvent,
     WindowStateEvent,
 )
 
@@ -147,6 +148,7 @@ EVENT_TYPE_MAP: dict[str, type[Event]] = {
     EventType.MOUSE_DOUBLECLICK.value: MouseDoubleClickEvent,
     EventType.MOUSE_DRAG.value: MouseDragEvent,
     EventType.KEY_TYPE.value: KeyTypeEvent,
+    EventType.KEY_SPECIAL.value: SpecialKeyEvent,
     EventType.WINDOW_STATE.value: WindowStateEvent,
 }
 
