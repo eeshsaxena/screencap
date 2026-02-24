@@ -262,6 +262,65 @@ class TestMergeConsecutiveMouseMoveEvents:
         assert len(result) == 1
         assert result[0].x == 100.0
 
+    def test_single_move_has_path(self):
+        """Single (unmerged) move should have path=[(x, y)]."""
+        events = [MouseMoveEvent(timestamp=1.0, x=50.0, y=75.0)]
+        result = merge_consecutive_mouse_move_events(events)
+        assert len(result) == 1
+        assert result[0].path == [(50.0, 75.0)]
+
+    def test_merged_moves_preserve_all_waypoints(self):
+        """Merged moves should have path with all intermediate positions."""
+        events = [
+            MouseMoveEvent(timestamp=1.0, x=0.0, y=0.0),
+            MouseMoveEvent(timestamp=1.1, x=10.0, y=5.0),
+            MouseMoveEvent(timestamp=1.2, x=20.0, y=10.0),
+            MouseMoveEvent(timestamp=1.3, x=30.0, y=15.0),
+        ]
+        result = merge_consecutive_mouse_move_events(events)
+        assert len(result) == 1
+        assert result[0].x == 30.0
+        assert result[0].y == 15.0
+        assert result[0].path == [
+            (0.0, 0.0),
+            (10.0, 5.0),
+            (20.0, 10.0),
+            (30.0, 15.0),
+        ]
+
+    def test_interrupted_moves_each_have_path(self):
+        """Moves interrupted by other events each get their own path."""
+        events = [
+            MouseMoveEvent(timestamp=1.0, x=0.0, y=0.0),
+            MouseMoveEvent(timestamp=1.1, x=10.0, y=10.0),
+            MouseScrollEvent(timestamp=1.2, x=10.0, y=10.0, dx=0.0, dy=1.0),
+            MouseMoveEvent(timestamp=1.3, x=20.0, y=20.0),
+        ]
+        result = merge_consecutive_mouse_move_events(events)
+        moves = [e for e in result if isinstance(e, MouseMoveEvent)]
+        assert len(moves) == 2
+        assert moves[0].path == [(0.0, 0.0), (10.0, 10.0)]
+        assert moves[1].path == [(20.0, 20.0)]
+
+    def test_path_serializes_as_nested_arrays(self):
+        """path should serialize as [[x1,y1],[x2,y2],...] in JSON."""
+        event = MouseMoveEvent(
+            timestamp=1.0, x=20.0, y=10.0,
+            path=[(0.0, 0.0), (10.0, 5.0), (20.0, 10.0)],
+        )
+        data = event.model_dump()
+        assert data["path"] == [(0.0, 0.0), (10.0, 5.0), (20.0, 10.0)]
+        # JSON round-trip
+        import json
+        json_str = event.model_dump_json()
+        parsed = json.loads(json_str)
+        assert parsed["path"] == [[0.0, 0.0], [10.0, 5.0], [20.0, 10.0]]
+
+    def test_default_path_is_empty_list(self):
+        """MouseMoveEvent created without path should default to empty list."""
+        event = MouseMoveEvent(timestamp=1.0, x=5.0, y=5.0)
+        assert event.path == []
+
 
 class TestMergeConsecutiveMouseScrollEvents:
     """Tests for merge_consecutive_mouse_scroll_events."""

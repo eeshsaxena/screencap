@@ -84,6 +84,11 @@ class MouseMoveEvent(BaseEvent):
     y: float = Field(description="Mouse Y position in pixels")
     pressure: float | None = Field(default=None, description="Pressure 0.0-1.0, None if unsupported")
     modifier_flags: int | None = Field(default=None, description="Active modifier bitmask from CGEventGetFlags")
+    path: list[tuple[float, float]] = Field(
+        default_factory=list,
+        description="All (x, y) waypoints. Single-element for unmerged moves, "
+                    "multi-element when consecutive moves are merged.",
+    )
 
 
 class MouseDownEvent(BaseEvent):
