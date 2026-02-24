@@ -167,6 +167,15 @@ screencap export my-session
 # export all recordings
 screencap export --all
 
+# export all downloaded recordings
+screencap export --downloads
+
+# export both local and downloaded recordings
+screencap export --all --downloads
+
+# export a specific download by name
+screencap export my-download --downloads
+
 # stream to stdout (for piping to jq, etc.)
 screencap export my-session --stdout
 
@@ -179,7 +188,8 @@ screencap export my-session --exclude-moves
 
 | Flag | Description |
 |------|-------------|
-| `--all` | Export all recordings (each gets its own `events.jsonl`) |
+| `--all` | Export all local recordings (each gets its own `events.jsonl`) |
+| `--downloads` | Include downloaded recordings (`~/.screencap/downloads/`). Use alone for downloads only, or with `--all` for both. |
 | `-o, --output PATH` | Custom output file path |
 | `--stdout` | Write to stdout instead of a file |
 | `--exclude-moves` | Omit mouse move events from output |

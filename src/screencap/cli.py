@@ -385,16 +385,29 @@ def _export_one(recording_dir, output_path, exclude_moves, err_console):
     return count
 
 
+def _find_exportable_dirs(base_dir):
+    """Find recording directories eligible for export under *base_dir*."""
+    if not base_dir.is_dir():
+        return []
+    return sorted(
+        d for d in base_dir.iterdir()
+        if d.is_dir()
+        and not d.name.endswith("-scrubbed")
+        and (d / "recording.db").exists()
+    )
+
+
 @cli.command()
 @click.argument("name", required=False, default=None)
 @click.option("--all", "all_recordings", is_flag=True, help="Export all recordings.")
+@click.option("--downloads", is_flag=True, help="Include downloaded recordings (with --all) or search downloads dir.")
 @click.option("--output", "-o", type=click.Path(), default=None,
               help="Output file path. Default: events.jsonl in the recording directory.")
 @click.option("--stdout", "use_stdout", is_flag=True, default=False,
               help="Write to stdout instead of a file.")
 @click.option("--exclude-moves", is_flag=True, default=False,
               help="Exclude mouse move events from output.")
-def export(name, all_recordings, output, use_stdout, exclude_moves):
+def export(name, all_recordings, downloads, output, use_stdout, exclude_moves):
     """Export recording events as JSONL for training.
 
     WARNING: Export includes all captured keystrokes (passwords, API keys,
@@ -405,12 +418,14 @@ def export(name, all_recordings, output, use_stdout, exclude_moves):
 
     err_console = Console(stderr=True)
 
-    if not name and not all_recordings:
-        err_console.print("[red]Error:[/red] Provide a recording name or use --all.")
+    batch_mode = all_recordings or (downloads and not name)
+
+    if not name and not batch_mode:
+        err_console.print("[red]Error:[/red] Provide a recording name or use --all / --downloads.")
         sys.exit(1)
 
-    if all_recordings and (use_stdout or output):
-        err_console.print("[red]Error:[/red] --all cannot be used with --stdout or -o.")
+    if batch_mode and (use_stdout or output):
+        err_console.print("[red]Error:[/red] --all/--downloads cannot be used with --stdout or -o.")
         sys.exit(1)
 
     try:
@@ -425,14 +440,15 @@ def export(name, all_recordings, output, use_stdout, exclude_moves):
         highlight=False,
     )
 
-    if all_recordings:
-        recordings_dir = get_recordings_dir()
-        dirs = sorted(
-            d for d in recordings_dir.iterdir()
-            if d.is_dir()
-            and not d.name.endswith("-scrubbed")
-            and (d / "recording.db").exists()
-        )
+    if batch_mode:
+        from screencap.config import get_downloads_dir
+
+        dirs = []
+        if all_recordings:
+            dirs.extend(_find_exportable_dirs(get_recordings_dir()))
+        if downloads:
+            dirs.extend(_find_exportable_dirs(get_downloads_dir()))
+
         if not dirs:
             err_console.print("[dim]No recordings found.[/dim]")
             return
@@ -455,12 +471,16 @@ def export(name, all_recordings, output, use_stdout, exclude_moves):
             sys.exit(1)
         return
 
-    # Single recording
+    # Single recording — check recordings dir first, then downloads
     try:
         recording_dir = resolve_recording_dir(name)
     except ValueError:
         err_console.print("[red]Error:[/red] Invalid recording name.")
         sys.exit(1)
+
+    if not recording_dir.exists() and downloads:
+        from screencap.config import get_downloads_dir
+        recording_dir = get_downloads_dir() / name
 
     if not recording_dir.exists():
         err_console.print(f"[red]Error:[/red] Recording not found: {name}")
