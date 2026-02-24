@@ -39,6 +39,7 @@ CONTENT_TYPES: dict[str, str] = {
     ".png": "image/png",
     ".jpg": "image/jpeg",
     ".csv": "text/csv",
+    ".jsonl": "application/x-ndjson",
 }
 
 

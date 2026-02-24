@@ -586,8 +586,10 @@ def test_export_default_writes_to_recording_dir(tmp_path):
     out_file = rec_dir / "events.jsonl"
     assert out_file.exists()
     lines = out_file.read_text().strip().split("\n")
-    assert len(lines) == 1
-    parsed = json.loads(lines[0])
+    assert len(lines) == 2  # metadata header + 1 event
+    header = json.loads(lines[0])
+    assert header["_meta"] is True
+    parsed = json.loads(lines[1])
     assert parsed["type"] == "mouse.singleclick"
 
 
@@ -607,8 +609,10 @@ def test_export_stdout(tmp_path):
 
     assert result.exit_code == 0
     lines = _jsonl_lines(result.output)
-    assert len(lines) == 1
-    parsed = json.loads(lines[0])
+    assert len(lines) == 2  # metadata header + 1 event
+    header = json.loads(lines[0])
+    assert header["_meta"] is True
+    parsed = json.loads(lines[1])
     assert parsed["type"] == "mouse.singleclick"
     # No file written in recording dir
     assert not (rec_dir / "events.jsonl").exists()
@@ -632,7 +636,7 @@ def test_export_to_file(tmp_path):
     assert result.exit_code == 0
     assert out_file.exists()
     lines = out_file.read_text().strip().split("\n")
-    assert len(lines) == 1
+    assert len(lines) == 2  # metadata header + 1 event
 
 
 def test_export_missing_recording(tmp_path):
@@ -732,7 +736,10 @@ def test_export_empty_recording(tmp_path):
     assert result.exit_code == 0
     out_file = rec_dir / "events.jsonl"
     assert out_file.exists()
-    assert out_file.read_text().strip() == ""
+    # Now includes metadata header even when no events
+    content = out_file.read_text().strip()
+    header = json.loads(content)
+    assert header["_meta"] is True
 
 
 def test_export_multiple_events(tmp_path):
@@ -757,8 +764,10 @@ def test_export_multiple_events(tmp_path):
     assert result.exit_code == 0
     out_file = rec_dir / "events.jsonl"
     lines = out_file.read_text().strip().split("\n")
-    assert len(lines) == 3
-    for line in lines:
+    assert len(lines) == 4  # metadata header + 3 events
+    header = json.loads(lines[0])
+    assert header["_meta"] is True
+    for line in lines[1:]:
         json.loads(line)
 
 
@@ -825,3 +834,114 @@ def test_export_all_no_recordings(tmp_path):
         result = runner.invoke(cli, ["export", "--all"])
 
     assert result.exit_code == 0
+
+
+# --- upload auto-export tests ---
+
+
+def _make_upload_recording(base, name, *, with_jsonl=False):
+    """Create a minimal recording dir for upload tests."""
+    rec_dir = base / name
+    rec_dir.mkdir(parents=True, exist_ok=True)
+    (rec_dir / "recording.db").touch()
+    if with_jsonl:
+        (rec_dir / "events.jsonl").write_text('{"_meta":true}\n')
+    return rec_dir
+
+
+def test_upload_auto_exports_missing_jsonl(tmp_path):
+    """Upload auto-generates events.jsonl when it doesn't exist."""
+    rec_dir = _make_upload_recording(tmp_path, "rec-a")
+    runner = CliRunner()
+
+    with (
+        mock.patch("screencap.upload.resolve_recording_dirs", return_value=[rec_dir]),
+        mock.patch("screencap.upload.upload_recording") as mock_upload,
+        mock.patch("screencap.exporter.export_recording", return_value=5) as mock_export,
+    ):
+        mock_upload.return_value = mock.MagicMock(
+            uploaded=["recording.db"], skipped=[], failed=[], total_bytes=100, gcs_prefix="gs://bucket/rec-a",
+        )
+        result = runner.invoke(cli, ["upload", "rec-a"])
+
+    assert result.exit_code == 0
+    mock_export.assert_called_once()
+    assert "Exported 5 events" in result.output
+
+
+def test_upload_skips_export_when_exists(tmp_path):
+    """Upload does NOT export when events.jsonl already exists."""
+    rec_dir = _make_upload_recording(tmp_path, "rec-b", with_jsonl=True)
+    runner = CliRunner()
+
+    with (
+        mock.patch("screencap.upload.resolve_recording_dirs", return_value=[rec_dir]),
+        mock.patch("screencap.upload.upload_recording") as mock_upload,
+        mock.patch("screencap.exporter.export_recording") as mock_export,
+    ):
+        mock_upload.return_value = mock.MagicMock(
+            uploaded=[], skipped=["events.jsonl"], failed=[], total_bytes=0, gcs_prefix=None,
+        )
+        result = runner.invoke(cli, ["upload", "rec-b"])
+
+    assert result.exit_code == 0
+    mock_export.assert_not_called()
+
+
+def test_upload_force_reexports(tmp_path):
+    """--force triggers export even when events.jsonl exists."""
+    rec_dir = _make_upload_recording(tmp_path, "rec-c", with_jsonl=True)
+    runner = CliRunner()
+
+    with (
+        mock.patch("screencap.upload.resolve_recording_dirs", return_value=[rec_dir]),
+        mock.patch("screencap.upload.upload_recording") as mock_upload,
+        mock.patch("screencap.exporter.export_recording", return_value=3) as mock_export,
+    ):
+        mock_upload.return_value = mock.MagicMock(
+            uploaded=["events.jsonl"], skipped=[], failed=[], total_bytes=50, gcs_prefix="gs://bucket/rec-c",
+        )
+        result = runner.invoke(cli, ["upload", "rec-c", "--force"])
+
+    assert result.exit_code == 0
+    mock_export.assert_called_once()
+
+
+def test_upload_dry_run_skips_export(tmp_path):
+    """Dry run does NOT trigger export."""
+    rec_dir = _make_upload_recording(tmp_path, "rec-d")
+    runner = CliRunner()
+
+    with (
+        mock.patch("screencap.upload.resolve_recording_dirs", return_value=[rec_dir]),
+        mock.patch("screencap.upload.upload_recording") as mock_upload,
+        mock.patch("screencap.exporter.export_recording") as mock_export,
+    ):
+        mock_upload.return_value = mock.MagicMock(
+            uploaded=[], skipped=[], failed=[], total_bytes=0, gcs_prefix=None,
+        )
+        result = runner.invoke(cli, ["upload", "rec-d", "--dry-run"])
+
+    assert result.exit_code == 0
+    mock_export.assert_not_called()
+
+
+def test_upload_export_failure_continues(tmp_path):
+    """Export failure warns but upload still proceeds."""
+    rec_dir = _make_upload_recording(tmp_path, "rec-e")
+    runner = CliRunner()
+
+    with (
+        mock.patch("screencap.upload.resolve_recording_dirs", return_value=[rec_dir]),
+        mock.patch("screencap.upload.upload_recording") as mock_upload,
+        mock.patch("screencap.exporter.export_recording", side_effect=RuntimeError("boom")),
+    ):
+        mock_upload.return_value = mock.MagicMock(
+            uploaded=["recording.db"], skipped=[], failed=[], total_bytes=100, gcs_prefix="gs://bucket/rec-e",
+        )
+        result = runner.invoke(cli, ["upload", "rec-e"])
+
+    assert result.exit_code == 0
+    mock_upload.assert_called_once()
+    assert "Warning" in result.output
+    assert "boom" in result.output

@@ -373,25 +373,16 @@ def info(name, as_json):
 
 def _export_one(recording_dir, output_path, exclude_moves, err_console):
     """Export a single recording. Returns event count, or -1 on error."""
-    import contextlib
+    from screencap.exporter import build_export_metadata, export_recording
 
-    from openadapt_capture import Capture
-
-    try:
-        with Capture.load(str(recording_dir)) as capture:
-            out_ctx = open(output_path, "w") if output_path else contextlib.nullcontext(sys.stdout)
-            with out_ctx as out_file:
-                count = 0
-                for action in capture.actions(include_moves=not exclude_moves):
-                    click.echo(action.event.model_dump_json(), file=out_file)
-                    count += 1
-        return count
-    except FileNotFoundError:
+    meta = build_export_metadata(exclude_moves)
+    count = export_recording(recording_dir, output_path, exclude_moves, metadata=meta)
+    if count == -1:
         err_console.print(
             f"[red]Error:[/red] No recording.db found in {recording_dir.name}. "
             "Legacy capture.db format is not supported for export."
         )
-        return -1
+    return count
 
 
 @cli.command()
@@ -856,9 +847,38 @@ def upload(names, all_recordings, dry_run, force):
     all_failed = 0
     all_bytes = 0
 
+    # Single privacy warning if any recordings will need export
+    if not dry_run:
+        needs_export = any(
+            not (d / "events.jsonl").exists() or force for d in dirs
+        )
+        if needs_export:
+            console.print(
+                "[yellow]Warning:[/yellow] Auto-export includes all captured keystrokes. "
+                "Run 'screencap scrub' first for sensitive sessions.",
+                highlight=False,
+            )
+
     for i, d in enumerate(dirs, 1):
         if total_count > 1:
             console.print(f"\n[bold][{i}/{total_count}][/bold] {d.name}")
+
+        # Auto-export events.jsonl if missing (or --force)
+        if not dry_run:
+            jsonl_path = d / "events.jsonl"
+            if not jsonl_path.exists() or force:
+                with console.status("[dim]Exporting events...[/dim]"):
+                    try:
+                        from screencap.exporter import export_recording, build_export_metadata
+                        meta = build_export_metadata(exclude_moves=False)
+                        count = export_recording(d, str(jsonl_path), exclude_moves=False, metadata=meta)
+                        if count >= 0:
+                            console.print(f"  [dim]Exported {count} events to events.jsonl[/dim]")
+                        else:
+                            console.print(f"  [yellow]Warning:[/yellow] Export failed (legacy DB?), uploading without events.jsonl")
+                    except Exception as e:
+                        console.print(f"  [yellow]Warning:[/yellow] Export failed ({e}), uploading without events.jsonl")
+
         try:
             result = upload_recording(d, dry_run=dry_run, force=force)
             all_uploaded += len(result.uploaded)
