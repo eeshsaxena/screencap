@@ -374,10 +374,12 @@ def info(name, as_json):
 @cli.command()
 @click.argument("name")
 @click.option("--output", "-o", type=click.Path(), default=None,
-              help="Output file path. Default: stdout.")
+              help="Output file path. Default: events.jsonl in the recording directory.")
+@click.option("--stdout", "use_stdout", is_flag=True, default=False,
+              help="Write to stdout instead of a file.")
 @click.option("--exclude-moves", is_flag=True, default=False,
               help="Exclude mouse move events from output.")
-def export(name, output, exclude_moves):
+def export(name, output, use_stdout, exclude_moves):
     """Export recording events as JSONL for training.
 
     WARNING: Export includes all captured keystrokes (passwords, API keys,
@@ -412,18 +414,26 @@ def export(name, output, exclude_moves):
         highlight=False,
     )
 
+    # Resolve output destination
+    if use_stdout:
+        output_path = None
+    elif output:
+        output_path = output
+    else:
+        output_path = str(recording_dir / "events.jsonl")
+
     try:
         with Capture.load(str(recording_dir)) as capture:
-            out_ctx = open(output, "w") if output else contextlib.nullcontext(sys.stdout)
+            out_ctx = open(output_path, "w") if output_path else contextlib.nullcontext(sys.stdout)
             with out_ctx as out_file:
                 count = 0
                 for action in capture.actions(include_moves=not exclude_moves):
                     click.echo(action.event.model_dump_json(), file=out_file)
                     count += 1
 
-        if output:
+        if output_path:
             err_console.print(
-                f"Exported {count} events to [bold]{output}[/bold]"
+                f"Exported {count} events to [bold]{output_path}[/bold]"
             )
     except FileNotFoundError:
         err_console.print(

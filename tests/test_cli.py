@@ -568,8 +568,8 @@ def _jsonl_lines(output):
     return lines
 
 
-def test_export_stdout(tmp_path):
-    """Export to stdout outputs valid JSONL."""
+def test_export_default_writes_to_recording_dir(tmp_path):
+    """Default export writes events.jsonl into the recording directory."""
     rec_dir = tmp_path / "my-rec"
     rec_dir.mkdir()
 
@@ -583,19 +583,42 @@ def test_export_stdout(tmp_path):
         result = runner.invoke(cli, ["export", "my-rec"])
 
     assert result.exit_code == 0
+    out_file = rec_dir / "events.jsonl"
+    assert out_file.exists()
+    lines = out_file.read_text().strip().split("\n")
+    assert len(lines) == 1
+    parsed = json.loads(lines[0])
+    assert parsed["type"] == "mouse.singleclick"
+
+
+def test_export_stdout(tmp_path):
+    """--stdout flag writes JSONL to stdout."""
+    rec_dir = tmp_path / "my-rec"
+    rec_dir.mkdir()
+
+    capture = _mock_capture()
+    runner = CliRunner()
+
+    with (
+        mock.patch("screencap.config.resolve_recording_dir", return_value=rec_dir),
+        mock.patch("openadapt_capture.capture.CaptureSession.load", return_value=capture),
+    ):
+        result = runner.invoke(cli, ["export", "my-rec", "--stdout"])
+
+    assert result.exit_code == 0
     lines = _jsonl_lines(result.output)
     assert len(lines) == 1
     parsed = json.loads(lines[0])
     assert parsed["type"] == "mouse.singleclick"
-    # Privacy warning is present in output
-    assert "Warning" in result.output
+    # No file written in recording dir
+    assert not (rec_dir / "events.jsonl").exists()
 
 
 def test_export_to_file(tmp_path):
-    """Export to file writes JSONL."""
+    """Export to custom file path with -o."""
     rec_dir = tmp_path / "my-rec"
     rec_dir.mkdir()
-    out_file = tmp_path / "events.jsonl"
+    out_file = tmp_path / "custom.jsonl"
 
     capture = _mock_capture()
     runner = CliRunner()
@@ -693,7 +716,7 @@ def test_export_legacy_db_error(tmp_path):
 
 
 def test_export_empty_recording(tmp_path):
-    """Empty recording produces no output lines."""
+    """Empty recording produces empty events.jsonl."""
     rec_dir = tmp_path / "empty-rec"
     rec_dir.mkdir()
 
@@ -707,8 +730,9 @@ def test_export_empty_recording(tmp_path):
         result = runner.invoke(cli, ["export", "empty-rec"])
 
     assert result.exit_code == 0
-    # No JSONL lines in output
-    assert len(_jsonl_lines(result.output)) == 0
+    out_file = rec_dir / "events.jsonl"
+    assert out_file.exists()
+    assert out_file.read_text().strip() == ""
 
 
 def test_export_multiple_events(tmp_path):
@@ -731,8 +755,8 @@ def test_export_multiple_events(tmp_path):
         result = runner.invoke(cli, ["export", "multi-rec"])
 
     assert result.exit_code == 0
-    lines = _jsonl_lines(result.output)
+    out_file = rec_dir / "events.jsonl"
+    lines = out_file.read_text().strip().split("\n")
     assert len(lines) == 3
-    # Each line is valid JSON
     for line in lines:
         json.loads(line)
