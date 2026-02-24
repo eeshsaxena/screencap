@@ -77,12 +77,15 @@ def get_active_window_state(read_window_data: bool) -> dict | None:
         return None
 
 
-def get_active_element_state(x: int, y: int) -> dict | None:
+def get_active_element_state(
+    x: int, y: int, max_depth: int | None = None
+) -> dict | None:
     """Get the state of the active element at the specified coordinates.
 
     Args:
         x (int): The x-coordinate of the element.
         y (int): The y-coordinate of the element.
+        max_depth: Override for AX tree traversal depth. None uses config default.
 
     Returns:
         dict or None: A dictionary containing the state of the active element,
@@ -91,7 +94,7 @@ def get_active_element_state(x: int, y: int) -> dict | None:
     if impl is None:
         return None
     try:
-        return impl.get_active_element_state(x, y)
+        return impl.get_active_element_state(x, y, max_depth=max_depth)
     except Exception as exc:
         logger.warning(f"{exc=}")
         return None

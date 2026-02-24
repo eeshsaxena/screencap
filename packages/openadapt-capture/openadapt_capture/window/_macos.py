@@ -26,10 +26,13 @@ from loguru import logger
 from openadapt_capture.config import config
 
 # Attributes worth capturing — keeps IPC to the target app minimal.
+# Avoid AXDocument/AXURL (filesystem I/O) and AXHidden (app-level, not element).
 _AX_ATTRS = {
     "AXRole", "AXRoleDescription", "AXTitle", "AXValue",
     "AXDescription", "AXChildren", "AXPosition", "AXSize",
     "AXEnabled", "AXFocused", "AXIdentifier", "AXLabel",
+    "AXSubrole", "AXPlaceholderValue", "AXExpanded",
+    "AXElementBusy", "AXSelected", "AXHelp",
 }
 
 
@@ -147,6 +150,10 @@ def get_active_window(window_meta: dict) -> ApplicationServices.AXUIElementRef |
     """
     pid = window_meta["kCGWindowOwnerPID"]
     app_ref = ApplicationServices.AXUIElementCreateApplication(pid)
+    # Set messaging timeout to avoid 6s hangs on unresponsive apps (Electron, etc.)
+    ApplicationServices.AXUIElementSetMessagingTimeout(
+        app_ref, config.AX_ELEMENT_TIMEOUT
+    )
     error_code, window = ApplicationServices.AXUIElementCopyAttributeValue(
         app_ref, "AXFocusedWindow", None
     )
@@ -244,31 +251,51 @@ def dump_state(
             element, None
         )
         if attr_names:
-            state = {}
+            # Filter to target attributes before any IPC.
+            target_attrs = []
             for attr_name in attr_names:
                 if attr_name is None:
                     continue
-                # Only read allowed attributes when an allowlist is active.
                 if attr_allowlist is not None and attr_name not in attr_allowlist:
                     continue
-                # don't traverse back up
-                # for WindowEvents:
                 if "parent" in attr_name.lower():
                     continue
-                # For ActionEvents:
                 if attr_name in ("AXTopLevelUIElement", "AXWindow"):
                     continue
+                target_attrs.append(attr_name)
 
-                (
-                    error_code,
-                    attr_val,
-                ) = ApplicationServices.AXUIElementCopyAttributeValue(
-                    element,
-                    attr_name,
-                    None,
-                )
+            if not target_attrs:
+                return {}
 
-                # for ActionEvents
+            # Batch API: 1 IPC call instead of N per-attribute calls.
+            state = {}
+            err, values = ApplicationServices.AXUIElementCopyMultipleAttributeValues(
+                element, target_attrs, 0, None
+            )
+            if err != 0 or values is None:
+                # Fallback: per-attribute queries on batch failure.
+                for attr_name in target_attrs:
+                    ec, attr_val = ApplicationServices.AXUIElementCopyAttributeValue(
+                        element, attr_name, None,
+                    )
+                    if attr_val is not None and (
+                        attr_name == "AXRole" and "application" in attr_val.lower()
+                    ):
+                        continue
+                    _state = dump_state(
+                        attr_val, elements, max_depth, current_depth + 1,
+                        timeout, start_time, attr_allowlist,
+                    )
+                    if _state:
+                        state[attr_name] = _state
+                return state
+
+            for attr_name, attr_val in zip(target_attrs, values):
+                # NSNull / kCFNull sentinel for unsupported attributes.
+                if attr_val is None:
+                    continue
+                if type(attr_val).__name__ == "NSNull":
+                    continue
                 if attr_val is not None and (
                     attr_name == "AXRole" and "application" in attr_val.lower()
                 ):
@@ -360,16 +387,21 @@ def deepconvert_objc(object: Any) -> Any | list | dict | Literal[0]:
     return value
 
 
-def get_active_element_state(x: int, y: int) -> dict:
+def get_active_element_state(
+    x: int, y: int, max_depth: int | None = None
+) -> dict:
     """Get the state of the active element at the specified coordinates.
 
     Args:
         x (int): The x-coordinate of the element.
         y (int): The y-coordinate of the element.
+        max_depth: Override for AX tree traversal depth. None uses config default.
 
     Returns:
         dict: A dictionary containing the state of the active element.
     """
+    if max_depth is None:
+        max_depth = config.AX_MAX_DEPTH
     window_meta = get_active_window_meta()
     pid = window_meta["kCGWindowOwnerPID"]
     app = oa_atomacos._a11y.AXUIElement.from_pid(pid)
@@ -379,7 +411,7 @@ def get_active_element_state(x: int, y: int) -> dict:
         return {}
     state = dump_state(
         el.ref,
-        max_depth=config.AX_MAX_DEPTH,
+        max_depth=max_depth,
         timeout=config.AX_DUMP_TIMEOUT,
         attr_allowlist=_AX_ATTRS,
     )
