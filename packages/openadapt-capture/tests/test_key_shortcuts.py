@@ -9,6 +9,7 @@ from openadapt_capture.events import (
     MouseDownEvent,
     MouseDragEvent,
     MouseMoveEvent,
+    MouseScrollEvent,
     MouseUpEvent,
 )
 from openadapt_capture.processing import (
@@ -372,3 +373,95 @@ class TestKeyShortcutInPipeline:
             ],
         )
         assert any(isinstance(c, KeyShortcutEvent) for c in drag.children)
+
+
+class TestShortcutsWithInterleavedMouseEvents:
+    """Pipeline integration tests: shortcuts detected despite interleaved mouse events."""
+
+    def test_cmd_c_through_full_pipeline(self):
+        """Cmd+C with MouseMove between modifier and letter → KeyShortcutEvent."""
+        events = [
+            KeyDownEvent(timestamp=1.0, key_name="cmd"),
+            MouseMoveEvent(timestamp=1.02, x=200, y=200),
+            KeyDownEvent(timestamp=1.05, key_char="c"),
+            KeyUpEvent(timestamp=1.10, key_char="c"),
+            KeyUpEvent(timestamp=1.12, key_name="cmd"),
+        ]
+        result = process_events(events)
+
+        shortcuts = [e for e in result if isinstance(e, KeyShortcutEvent)]
+        mouse_events = [e for e in result if isinstance(e, MouseMoveEvent)]
+
+        assert len(shortcuts) == 1, f"Expected 1 KeyShortcutEvent, got {len(shortcuts)}"
+        assert shortcuts[0].keys == ["cmd", "c"]
+        assert len(mouse_events) == 1, "MouseMoveEvent should be preserved"
+
+    def test_cmd_shift_z_through_full_pipeline(self):
+        """Cmd+Shift+Z with mouse moves between each key → KeyShortcutEvent."""
+        events = [
+            KeyDownEvent(timestamp=1.0, key_name="cmd"),
+            MouseMoveEvent(timestamp=1.01, x=100, y=100),
+            KeyDownEvent(timestamp=1.03, key_name="shift"),
+            MouseMoveEvent(timestamp=1.04, x=150, y=150),
+            KeyDownEvent(timestamp=1.06, key_char="z"),
+            KeyUpEvent(timestamp=1.10, key_char="z"),
+            KeyUpEvent(timestamp=1.12, key_name="shift"),
+            KeyUpEvent(timestamp=1.14, key_name="cmd"),
+        ]
+        result = process_events(events)
+
+        shortcuts = [e for e in result if isinstance(e, KeyShortcutEvent)]
+        mouse_events = [e for e in result if isinstance(e, MouseMoveEvent)]
+
+        assert len(shortcuts) == 1, f"Expected 1 KeyShortcutEvent, got {len(shortcuts)}"
+        assert set(shortcuts[0].keys) == {"shift", "cmd", "z"}
+        assert len(mouse_events) >= 1, "MouseMoveEvents should be preserved"
+
+    def test_plain_typing_with_mouse_between_chars(self):
+        """a-dn, a-up, MouseMove, b-dn, b-up → two separate KeyTypeEvents (no keys held at mouse)."""
+        events = [
+            KeyDownEvent(timestamp=1.0, key_char="a"),
+            KeyUpEvent(timestamp=1.1, key_char="a"),
+            MouseMoveEvent(timestamp=1.2, x=200, y=200),
+            KeyDownEvent(timestamp=1.3, key_char="b"),
+            KeyUpEvent(timestamp=1.4, key_char="b"),
+        ]
+        result = process_events(events)
+
+        type_events = [e for e in result if isinstance(e, KeyTypeEvent)]
+        mouse_events = [e for e in result if isinstance(e, MouseMoveEvent)]
+
+        assert len(type_events) == 2, f"Expected 2 KeyTypeEvents, got {len(type_events)}"
+        assert type_events[0].text == "a"
+        assert type_events[1].text == "b"
+        assert len(mouse_events) == 1
+
+    def test_cmd_c_with_scroll_interleaved(self):
+        """Cmd+C with MouseScrollEvent between modifier and letter → KeyShortcutEvent."""
+        events = [
+            KeyDownEvent(timestamp=1.0, key_name="cmd"),
+            MouseScrollEvent(timestamp=1.02, x=200, y=200, dx=0, dy=1),
+            KeyDownEvent(timestamp=1.05, key_char="c"),
+            KeyUpEvent(timestamp=1.10, key_char="c"),
+            KeyUpEvent(timestamp=1.12, key_name="cmd"),
+        ]
+        result = process_events(events)
+
+        shortcuts = [e for e in result if isinstance(e, KeyShortcutEvent)]
+        assert len(shortcuts) == 1
+        assert shortcuts[0].keys == ["cmd", "c"]
+
+    def test_cmd_click_modifier_after_mouse(self):
+        """Cmd held, mouse click, Cmd released → MouseDown/Up emitted inline, KeyTypeEvent after."""
+        events = [
+            KeyDownEvent(timestamp=1.0, key_name="cmd"),
+            MouseDownEvent(timestamp=1.02, x=100, y=100, button=MouseButton.LEFT),
+            MouseUpEvent(timestamp=1.05, x=100, y=100, button=MouseButton.LEFT),
+            KeyUpEvent(timestamp=1.10, key_name="cmd"),
+        ]
+        result = process_events(events)
+
+        # The modifier KeyTypeEvent should appear (cmd held, no letter → not a shortcut)
+        type_events = [e for e in result if isinstance(e, KeyTypeEvent)]
+        assert len(type_events) == 1
+        assert type_events[0].text == ""  # modifier-only, no chars
