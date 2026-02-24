@@ -33,6 +33,7 @@ from pynput import keyboard, mouse
 from tqdm import tqdm
 
 from openadapt_capture import utils, video, window
+from openadapt_capture.ax_cache import AXQueryCache
 from openadapt_capture.config import config
 from openadapt_capture.db import create_db, crud, get_session_for_path
 from openadapt_capture.db.models import ActionEvent, Recording
@@ -230,7 +231,15 @@ def process_events(
 
     # Rate-limit accessibility queries to avoid starving target app main thread.
     _AX_QUERY_INTERVAL = config.AX_QUERY_INTERVAL
+    _AX_MOVE_QUERY_INTERVAL = config.AX_MOVE_QUERY_INTERVAL
     _last_ax_query_time = 0.0
+    _last_ax_move_query_time = 0.0
+
+    # Async AX cache — runs element state queries off the event-processing thread.
+    ax_cache: AXQueryCache | None = None
+    if config.RECORD_READ_ACTIVE_ELEMENT_STATE:
+        ax_cache = AXQueryCache(query_fn=window.get_active_element_state)
+        ax_cache.start()
 
     prev_event = None
     prev_screen_event = None
@@ -315,22 +324,57 @@ def process_events(
             else:
                 event.data["window_event_timestamp"] = prev_window_event.timestamp
 
-            # Enrich with accessibility element state here (off the pynput
-            # callback thread) so input capture is never blocked.
-            # Rate-limited to avoid starving target app's main thread.
-            if config.RECORD_READ_ACTIVE_ELEMENT_STATE:
+            # Enrich with accessibility element state via async cache.
+            # Event-aware routing: different event types get different AX
+            # query depths and rate limits. Queries run in background thread
+            # so the event pipeline is never blocked by slow AX IPC.
+            ax_request_id = None
+            if ax_cache is not None:
                 x = event.data.get("mouse_x")
                 y = event.data.get("mouse_y")
+                action_name = event.data.get("name", "")
                 now = time.monotonic()
-                if x is not None and y is not None and (
-                    now - _last_ax_query_time >= _AX_QUERY_INTERVAL
-                ):
-                    _last_ax_query_time = now
-                    try:
-                        element_state = window.get_active_element_state(x, y)
-                    except Exception as exc:
-                        logger.warning(f"element state failed: {exc}")
-                        element_state = {}
+
+                # Key events: skip AX query entirely (no coordinates)
+                if action_name in ("key.down", "key.up"):
+                    pass
+                elif x is not None and y is not None:
+                    ax_depth = None
+                    should_query = False
+
+                    if action_name in ("click", "singleclick", "doubleclick"):
+                        # Clicks: deep query, bypass rate limit
+                        ax_depth = config.AX_CLICK_MAX_DEPTH
+                        should_query = True
+                    elif action_name == "scroll":
+                        # Scrolls: medium depth, normal rate limit
+                        ax_depth = config.AX_SCROLL_MAX_DEPTH
+                        if now - _last_ax_query_time >= _AX_QUERY_INTERVAL:
+                            should_query = True
+                    elif action_name == "move":
+                        # Moves: shallow depth, longer interval
+                        ax_depth = config.AX_MOVE_MAX_DEPTH
+                        if now - _last_ax_move_query_time >= _AX_MOVE_QUERY_INTERVAL:
+                            should_query = True
+                            _last_ax_move_query_time = now
+                    else:
+                        # Unknown action with coordinates: default behavior
+                        ax_depth = config.AX_MAX_DEPTH
+                        if now - _last_ax_query_time >= _AX_QUERY_INTERVAL:
+                            should_query = True
+
+                    if should_query:
+                        _last_ax_query_time = now
+                        ax_request_id = ax_cache.submit(
+                            x, y, max_depth=ax_depth, event_name=action_name
+                        )
+
+            # Retrieve async AX result before DB write.
+            if ax_request_id is not None:
+                # Allow slightly more time for click events (they're high-value).
+                ax_timeout = 0.05 if "click" in event.data.get("name", "") else 0.01
+                element_state = ax_cache.get(ax_request_id, timeout=ax_timeout)
+                if element_state is not None:
                     event.data["element_state"] = element_state
 
             # Drop-coherent fan-out: collect all events for this action as a
@@ -386,6 +430,10 @@ def process_events(
             raise Exception(f"unhandled {event.type=}")
         del prev_event
         prev_event = event
+
+    # Shut down async AX cache.
+    if ax_cache is not None:
+        ax_cache.stop()
 
     # Export drop counts to module-level dict for record() to persist
     if any(_drops.values()):
