@@ -53,6 +53,15 @@ def get_base() -> sa.engine:
 Base = get_base()
 
 
+def _set_sqlite_pragmas(dbapi_conn, connection_record):
+    """Set SQLite PRAGMAs on every new connection for write performance."""
+    cursor = dbapi_conn.cursor()
+    cursor.execute("PRAGMA journal_mode=WAL")
+    cursor.execute("PRAGMA synchronous=NORMAL")
+    cursor.execute("PRAGMA cache_size=-64000")
+    cursor.close()
+
+
 def get_engine(db_url: str, echo: bool = False) -> sa.engine:
     """Create and return a database engine.
 
@@ -65,6 +74,7 @@ def get_engine(db_url: str, echo: bool = False) -> sa.engine:
         connect_args={"check_same_thread": False},
         echo=echo,
     )
+    sa.event.listen(engine, "connect", _set_sqlite_pragmas)
     return engine
 
 
