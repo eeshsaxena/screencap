@@ -10,7 +10,7 @@ from __future__ import annotations
 from enum import Enum
 from typing import Literal
 
-from pydantic import BaseModel, Field
+from pydantic import BaseModel, Field, computed_field
 
 
 class EventType(str, Enum):
@@ -324,6 +324,7 @@ class MouseDragEvent(BaseEvent):
     children: list[
         MouseDownEvent | MouseMoveEvent | MouseUpEvent
         | MouseScrollEvent | KeyDownEvent | KeyUpEvent | KeyTypeEvent
+        | KeyShortcutEvent
         | MouseMagnifyEvent | MouseRotateEvent | MouseSmartMagnifyEvent
     ] = Field(
         default_factory=list, description="Child events that were merged"
@@ -344,6 +345,32 @@ class KeyTypeEvent(BaseEvent):
     )
 
 
+class KeyShortcutEvent(BaseEvent):
+    """Keyboard shortcut (modifier + key combination).
+
+    Created by detect_key_shortcuts() when a KeyTypeEvent
+    contains modifier keys combined with a non-printable regular key,
+    or Ctrl/Alt/Cmd combined with any key.
+
+    Example: Ctrl+z → keys=["ctrl", "z"], text="Ctrl+z"
+    """
+
+    type: Literal[EventType.KEY_SHORTCUT] = EventType.KEY_SHORTCUT
+    keys: list[str] = Field(
+        description="Canonically ordered key names, e.g. ['ctrl', 'z']"
+    )
+    children: list[KeyDownEvent | KeyUpEvent] = Field(
+        default_factory=list,
+        description="Child events that were merged",
+    )
+
+    @computed_field
+    @property
+    def text(self) -> str:
+        """Human-readable combo, e.g. 'Ctrl+z'."""
+        return "+".join(k.title() for k in self.keys[:-1]) + "+" + self.keys[-1]
+
+
 # =============================================================================
 # Union type for all events
 # =============================================================================
@@ -362,6 +389,7 @@ ActionEvent = (
     | MouseDoubleClickEvent
     | MouseDragEvent
     | KeyTypeEvent
+    | KeyShortcutEvent
 )
 
 ScreenEvent = ScreenFrameEvent

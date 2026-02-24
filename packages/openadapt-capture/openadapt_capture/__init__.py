@@ -39,6 +39,7 @@ from openadapt_capture.events import (
     Event,
     EventType,
     KeyDownEvent,
+    KeyShortcutEvent,
     KeyTypeEvent,
     KeyUpEvent,
     MouseButton,
@@ -58,6 +59,7 @@ from openadapt_capture.events import (
 # Event processing
 from openadapt_capture.processing import (
     detect_drag_events,
+    detect_key_shortcuts,
     get_action_events,
     get_audio_events,
     get_screen_events,
@@ -144,6 +146,7 @@ __all__ = [
     "KeyDownEvent",
     "KeyUpEvent",
     "KeyTypeEvent",
+    "KeyShortcutEvent",
     # Screen/audio events
     "ScreenFrameEvent",
     "AudioChunkEvent",
@@ -160,6 +163,7 @@ __all__ = [
     "remove_invalid_keyboard_events",
     "remove_redundant_mouse_move_events",
     "merge_consecutive_keyboard_events",
+    "detect_key_shortcuts",
     "merge_consecutive_mouse_move_events",
     "merge_consecutive_mouse_scroll_events",
     "merge_consecutive_mouse_click_events",
