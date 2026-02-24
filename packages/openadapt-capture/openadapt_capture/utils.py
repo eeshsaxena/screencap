@@ -46,8 +46,8 @@ def get_process_local_sct() -> mss.mss:
 def get_monitor_dims() -> tuple[int, int]:
     """Get the logical dimensions of the primary monitor.
 
-    On macOS, prefers Quartz for a lightweight query that avoids instantiating
-    a full ``mss`` screen-capture context.
+    On macOS, uses Quartz to avoid triggering the slow ``mss`` / Core Graphics
+    screen-capture path.
 
     Returns:
         tuple[int, int]: The width and height of the monitor.
@@ -100,60 +100,31 @@ def get_timestamp() -> float:
     return _start_time + perf_duration
 
 
-# Threshold (seconds) for detecting a macOS Core Graphics throttle stall.
-# If a single mss.grab() exceeds this, we fall back to the screencapture CLI
-# for the remainder of the session. See python-mss#436.
-_MSS_STALL_THRESHOLD_S = 2.0
-_macos_mss_disabled = False
-
-
 def take_screenshot() -> Image.Image:
-    """Take a screenshot using ``mss``, with a CLI fallback on macOS.
+    """Take a screenshot.
 
-    On macOS the Core Graphics API (``CGWindowListCreateImage``) that ``mss``
-    uses can stall for ~30 s under certain conditions (python-mss#436). In
-    practice single-threaded sequential grabs are fine (~16 ms median), so we
-    use ``mss`` as the primary path. If a grab ever exceeds
-    ``_MSS_STALL_THRESHOLD_S`` we permanently fall back to the
-    ``screencapture`` CLI for the rest of the session.
+    On macOS, uses the ``screencapture`` CLI because the Core Graphics API
+    (``CGWindowListCreateImage``, used by ``mss``) is throttled to ~30 s per
+    call on macOS Sequoia. ``screencapture`` is fast (~150 ms) and works
+    from any thread.
+
+    On other platforms, falls back to ``mss.grab()``.
 
     Returns:
         PIL.Image: The screenshot image, or None on failure.
     """
-    global _macos_mss_disabled
-
-    if sys.platform == "darwin" and _macos_mss_disabled:
-        return _take_screenshot_macos_cli()
-
+    if sys.platform == "darwin":
+        return _take_screenshot_macos()
+    # Non-macOS: use mss
     sct = get_process_local_sct()
     monitor = sct.monitors[0]
-
-    try:
-        t0 = time.perf_counter()
-        sct_img = sct.grab(monitor)
-        dur = time.perf_counter() - t0
-    except Exception as exc:
-        if sys.platform == "darwin":
-            _macos_mss_disabled = True
-            logger.warning(f"mss.grab() raised {exc!r} — falling back to screencapture CLI")
-            return _take_screenshot_macos_cli()
-        logger.error(f"mss.grab() failed: {exc!r}")
-        return None
-
-    if sys.platform == "darwin" and dur >= _MSS_STALL_THRESHOLD_S:
-        _macos_mss_disabled = True
-        logger.warning(
-            f"mss.grab() took {dur:.1f}s — falling back to screencapture CLI"
-        )
-        return _take_screenshot_macos_cli()
-
-    return Image.frombytes("RGB", sct_img.size, sct_img.bgra, "raw", "BGRX")
+    sct_img = sct.grab(monitor)
+    image = Image.frombytes("RGB", sct_img.size, sct_img.bgra, "raw", "BGRX")
+    return image
 
 
-def _take_screenshot_macos_cli() -> Image.Image | None:
+def _take_screenshot_macos() -> Image.Image | None:
     """Capture the screen on macOS using the ``screencapture`` CLI.
-
-    Slow (~150 ms) but immune to Core Graphics throttling.
 
     Returns:
         PIL.Image or None on failure.

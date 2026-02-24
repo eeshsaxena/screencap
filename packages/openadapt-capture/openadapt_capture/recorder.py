@@ -588,8 +588,7 @@ def video_pre_callback(
         dict[str, Any]: The updated state.
     """
     video_file_path = video.get_video_file_path(recording.timestamp, video_dir)
-    # Get actual screen dimensions (this runs in a child process's main thread,
-    # where mss.grab() is fast on macOS).
+    # Get actual screen dimensions from an initial screenshot.
     init_screenshot = utils.take_screenshot()
     if init_screenshot is not None:
         screen_width, screen_height = init_screenshot.size
