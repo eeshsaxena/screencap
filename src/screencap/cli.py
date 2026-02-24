@@ -371,6 +371,68 @@ def info(name, as_json):
             console.print(f"\n  [dim]No end snapshot (recording may have been interrupted).[/dim]")
 
 
+@cli.command()
+@click.argument("name")
+@click.option("--output", "-o", type=click.Path(), default=None,
+              help="Output file path. Default: stdout.")
+@click.option("--exclude-moves", is_flag=True, default=False,
+              help="Exclude mouse move events from output.")
+def export(name, output, exclude_moves):
+    """Export recording events as JSONL for training.
+
+    WARNING: Export includes all captured keystrokes (passwords, API keys,
+    private messages). Run 'screencap scrub' on the recording first if it
+    contains sensitive sessions.
+    """
+    import contextlib
+
+    from screencap.config import resolve_recording_dir
+
+    err_console = Console(stderr=True)
+
+    try:
+        recording_dir = resolve_recording_dir(name)
+    except ValueError:
+        err_console.print("[red]Error:[/red] Invalid recording name.")
+        sys.exit(1)
+
+    if not recording_dir.exists():
+        err_console.print(f"[red]Error:[/red] Recording not found: {name}")
+        sys.exit(1)
+
+    try:
+        from openadapt_capture import Capture
+    except ImportError:
+        err_console.print(_RECORD_EXTRAS_MSG)
+        raise SystemExit(1)
+
+    err_console.print(
+        "[yellow]Warning:[/yellow] Export includes all captured keystrokes. "
+        "Run 'screencap scrub' first for sensitive sessions.",
+        highlight=False,
+    )
+
+    try:
+        with Capture.load(str(recording_dir)) as capture:
+            out_ctx = open(output, "w") if output else contextlib.nullcontext(sys.stdout)
+            with out_ctx as out_file:
+                count = 0
+                for action in capture.actions(include_moves=not exclude_moves):
+                    click.echo(action.event.model_dump_json(), file=out_file)
+                    count += 1
+
+        if output:
+            err_console.print(
+                f"Exported {count} events to [bold]{output}[/bold]"
+            )
+    except FileNotFoundError:
+        err_console.print(
+            f"[red]Error:[/red] No recording.db found in {name}. "
+            "Legacy capture.db format is not supported for export."
+        )
+        sys.exit(1)
+
+
 def _check_scrub_deps() -> bool:
     """Verify scrub dependencies are available."""
     try:

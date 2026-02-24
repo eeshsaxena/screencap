@@ -112,3 +112,15 @@ def get_base_dir() -> Path:
     """Return ~/.screencap/, creating it if needed."""
     _DEFAULT_BASE.mkdir(parents=True, exist_ok=True)
     return _DEFAULT_BASE
+
+
+def resolve_recording_dir(name: str) -> Path:
+    """Resolve a recording name to a directory path, with traversal protection.
+
+    Raises ValueError if the resolved path escapes the recordings directory.
+    """
+    recordings_dir = get_recordings_dir()
+    recording_dir = (recordings_dir / name).resolve()
+    if not recording_dir.is_relative_to(recordings_dir.resolve()):
+        raise ValueError(f"Invalid recording name: {name}")
+    return recording_dir
