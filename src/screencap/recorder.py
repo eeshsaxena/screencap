@@ -222,14 +222,15 @@ def start_recording(
 
     elapsed = time.time() - t0
 
-    # Auto-generate viewer.html
-    try:
-        from openadapt_capture import create_html
-
-        create_html(str(capture_dir), output=str(capture_dir / "viewer.html"))
-        console.print("[dim]Generated viewer.html[/dim]")
-    except Exception as e:
-        console.print(f"[yellow]Warning:[/yellow] Could not generate viewer.html: {e}")
+    # Auto-generate viewer.html — disabled (too slow, does N full video scans).
+    # Run `screencap view <name>` to generate on demand instead.
+    # try:
+    #     from openadapt_capture import create_html
+    #
+    #     create_html(str(capture_dir), output=str(capture_dir / "viewer.html"))
+    #     console.print("[dim]Generated viewer.html[/dim]")
+    # except Exception as e:
+    #     console.print(f"[yellow]Warning:[/yellow] Could not generate viewer.html: {e}")
 
     console.print(f"\n[bold green]Saved to {capture_dir}/[/bold green]")
     console.print(f"   Duration: {_fmt_duration(elapsed)} | Size: {_fmt_size(capture_dir)}")
