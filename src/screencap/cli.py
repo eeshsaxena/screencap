@@ -225,7 +225,7 @@ def list_cmd(as_json, sort):
         )
         return
 
-    table = Table(show_header=True, header_style="bold cyan")
+    table = Table(show_header=True, header_style="bold #60a5fa")
     table.add_column("#", justify="right")
     table.add_column("Name")
     table.add_column("Date")
@@ -330,7 +330,7 @@ def info(name, as_json):
 
     if rec_meta:
         for key, val in rec_meta.items():
-            console.print(f"  [cyan]{key}:[/cyan] {val}")
+            console.print(f"  [#60a5fa]{key}:[/#60a5fa] {val}")
     else:
         console.print("  [dim]No recording metadata available.[/dim]")
 
@@ -350,27 +350,27 @@ def info(name, as_json):
         for key, val in static.items():
             if key == "displays":
                 for i, d in enumerate(val):
-                    console.print(f"  [cyan]display {i}:[/cyan] {d.get('width')}x{d.get('height')}")
+                    console.print(f"  [#60a5fa]display {i}:[/#60a5fa] {d.get('width')}x{d.get('height')}")
             elif key == "locale" and isinstance(val, dict):
-                console.print(f"  [cyan]locale:[/cyan]")
+                console.print(f"  [#60a5fa]locale:[/#60a5fa]")
                 for lk, lv in val.items():
                     if isinstance(lv, list):
-                        console.print(f"    [cyan]{lk}:[/cyan] {', '.join(str(x) for x in lv)}")
+                        console.print(f"    [#60a5fa]{lk}:[/#60a5fa] {', '.join(str(x) for x in lv)}")
                     elif isinstance(lv, dict):
-                        console.print(f"    [cyan]{lk}:[/cyan] {lv}")
+                        console.print(f"    [#60a5fa]{lk}:[/#60a5fa] {lv}")
                     else:
-                        console.print(f"    [cyan]{lk}:[/cyan] {lv}")
+                        console.print(f"    [#60a5fa]{lk}:[/#60a5fa] {lv}")
             elif key == "running_applications" and isinstance(val, list):
-                console.print(f"  [cyan]running apps:[/cyan]")
+                console.print(f"  [#60a5fa]running apps:[/#60a5fa]")
                 for app in val:
                     v = f" v{app['version']}" if app.get("version") else ""
                     console.print(f"    {app['name']} ({app['bundle_id']}){v}")
             elif key == "wifi" and isinstance(val, dict):
-                console.print(f"  [cyan]wifi:[/cyan]")
+                console.print(f"  [#60a5fa]wifi:[/#60a5fa]")
                 for wk, wv in val.items():
-                    console.print(f"    [cyan]{wk}:[/cyan] {wv}")
+                    console.print(f"    [#60a5fa]{wk}:[/#60a5fa] {wv}")
             else:
-                console.print(f"  [cyan]{key}:[/cyan] {val}")
+                console.print(f"  [#60a5fa]{key}:[/#60a5fa] {val}")
 
     for phase in ("start", "end"):
         snapshot = metrics.get(phase)
@@ -378,11 +378,11 @@ def info(name, as_json):
             console.print(Panel(f"[bold]{phase.title()} Snapshot[/bold]"))
             for key, val in snapshot.items():
                 if key == "wifi" and isinstance(val, dict):
-                    console.print(f"  [cyan]wifi:[/cyan]")
+                    console.print(f"  [#60a5fa]wifi:[/#60a5fa]")
                     for wk, wv in val.items():
-                        console.print(f"    [cyan]{wk}:[/cyan] {wv}")
+                        console.print(f"    [#60a5fa]{wk}:[/#60a5fa] {wv}")
                 else:
-                    console.print(f"  [cyan]{key}:[/cyan] {val}")
+                    console.print(f"  [#60a5fa]{key}:[/#60a5fa] {val}")
         elif phase == "end":
             console.print(f"\n  [dim]No end snapshot (recording may have been interrupted).[/dim]")
 
