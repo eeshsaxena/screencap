@@ -520,34 +520,7 @@ body {{ font-family:'Outfit',-apple-system,BlinkMacSystemFont,sans-serif; backgr
             <canvas id="overlay-canvas"></canvas>
             <div class="frame-badge" id="frame-time">0:00.00</div>
         </div>
-    </main>
-    <aside class="panel-right">
-        <div class="ctx-header">
-            <span class="ctx-type" id="ctx-type">&mdash;</span>
-            <span class="ctx-time" id="ctx-time">0:00.00</span>
-        </div>
-        <div class="card" id="app-card">
-            <div class="card-label">Application</div>
-            <div class="card-body">
-                <div class="app-name" id="app-name">&mdash;</div>
-                <div class="app-window" id="app-window"></div>
-            </div>
-        </div>
-        <div class="card" id="element-card">
-            <div class="card-label">UI Element</div>
-            <div class="card-body" id="element-body"><span class="empty-msg">No element data</span></div>
-        </div>
-        <div class="card">
-            <div class="card-head">
-                <span class="card-label">Event Data</span>
-                <button class="copy-btn" id="copy-btn">Copy</button>
-            </div>
-            <div class="card-body" id="details-content"><span class="empty-msg">Select an event</span></div>
-        </div>
-        {transcript_html}
-    </aside>
-</div>
-<div class="player-bar">
+        <div class="player-bar">
     <div class="player-main">
         <div class="player-nav">
             <button id="btn-first" title="First (Home)">\u23EE</button>
@@ -576,8 +549,35 @@ body {{ font-family:'Outfit',-apple-system,BlinkMacSystemFont,sans-serif; backgr
         {audio_html}
         <div class="player-spacer"></div>
         <button class="copy-btn" id="copy-all-btn">Copy All</button>
-        <span class="kbd-hint">Space play &middot; \u2190 \u2192 step &middot; O overlay</span>
+        <span class="kbd-hint"><kbd>Space</kbd> play &middot; <kbd>\u2190</kbd> <kbd>\u2192</kbd> step &middot; <kbd>O</kbd> overlay</span>
     </div>
+</div>
+    </main>
+    <aside class="panel-right">
+        <div class="ctx-header">
+            <span class="ctx-type" id="ctx-type">&mdash;</span>
+            <span class="ctx-time" id="ctx-time">0:00.00</span>
+        </div>
+        <div class="card" id="app-card">
+            <div class="card-label">Application</div>
+            <div class="card-body">
+                <div class="app-name" id="app-name">&mdash;</div>
+                <div class="app-window" id="app-window"></div>
+            </div>
+        </div>
+        <div class="card" id="element-card">
+            <div class="card-label">UI Element</div>
+            <div class="card-body" id="element-body"><span class="empty-msg">No element data</span></div>
+        </div>
+        <div class="card">
+            <div class="card-head">
+                <span class="card-label">Event Data</span>
+                <button class="copy-btn" id="copy-btn">Copy</button>
+            </div>
+            <div class="card-body" id="details-content"><span class="empty-msg">Select an event</span></div>
+        </div>
+        {transcript_html}
+    </aside>
 </div>
 {"" if not audio_b64 else f'<audio id="audio" src="data:{audio_type};base64,{audio_b64}"></audio>'}
 <script>
@@ -684,6 +684,7 @@ function init(){{
         const mk=document.createElement('div');
         mk.className='timeline-marker';
         mk.style.left=(ev.time/duration*100)+'%';
+        mk.style.background=getTypeColor(ev.type);mk.style.opacity='0.5';
         timelineMarkers.appendChild(mk);
     }});
     events.forEach((ev,i)=>{{
@@ -856,18 +857,18 @@ function drawOverlay(ev){{
     const type=ev.type;
     if(type.includes('click')||type==='mouse.down'||type==='mouse.up'){{
         const x=oX+(ev.x*sX),y=oY+(ev.y*sY),r=20;
-        overlayCtx.beginPath();overlayCtx.arc(x,y,r+10,0,Math.PI*2);overlayCtx.fillStyle='rgba(255,100,100,0.3)';overlayCtx.fill();
-        overlayCtx.beginPath();overlayCtx.arc(x,y,r,0,Math.PI*2);overlayCtx.strokeStyle='#ef5350';overlayCtx.lineWidth=3;overlayCtx.stroke();
-        overlayCtx.beginPath();overlayCtx.arc(x,y,4,0,Math.PI*2);overlayCtx.fillStyle='#ef5350';overlayCtx.fill();
+        overlayCtx.beginPath();overlayCtx.arc(x,y,r+10,0,Math.PI*2);overlayCtx.fillStyle='rgba(244,114,182,0.3)';overlayCtx.fill();
+        overlayCtx.beginPath();overlayCtx.arc(x,y,r,0,Math.PI*2);overlayCtx.strokeStyle='#f472b6';overlayCtx.lineWidth=3;overlayCtx.stroke();
+        overlayCtx.beginPath();overlayCtx.arc(x,y,4,0,Math.PI*2);overlayCtx.fillStyle='#f472b6';overlayCtx.fill();
         overlayCtx.beginPath();
         overlayCtx.moveTo(x-r-5,y);overlayCtx.lineTo(x-r+10,y);
         overlayCtx.moveTo(x+r-10,y);overlayCtx.lineTo(x+r+5,y);
         overlayCtx.moveTo(x,y-r-5);overlayCtx.lineTo(x,y-r+10);
         overlayCtx.moveTo(x,y+r-10);overlayCtx.lineTo(x,y+r+5);
-        overlayCtx.strokeStyle='#ef5350';overlayCtx.lineWidth=2;overlayCtx.stroke();
+        overlayCtx.strokeStyle='#f472b6';overlayCtx.lineWidth=2;overlayCtx.stroke();
     }}else if(type.includes('drag')){{
         const sx=oX+(ev.x*sX),sy=oY+(ev.y*sY),ex=oX+((ev.x+ev.dx)*sX),ey=oY+((ev.y+ev.dy)*sY);
-        overlayCtx.strokeStyle='#4caf50';
+        overlayCtx.strokeStyle='#22d3ee';
         if(ev.path&&ev.path.length>1){{
             /* Variable-thickness polyline when pressure data exists */
             const minW=1,maxW=6;
@@ -883,65 +884,65 @@ function drawOverlay(ev){{
         }}else{{
             overlayCtx.beginPath();overlayCtx.moveTo(sx,sy);overlayCtx.lineTo(ex,ey);overlayCtx.lineWidth=3;overlayCtx.stroke();
         }}
-        overlayCtx.beginPath();overlayCtx.arc(sx,sy,8,0,Math.PI*2);overlayCtx.fillStyle='#4caf50';overlayCtx.fill();
+        overlayCtx.beginPath();overlayCtx.arc(sx,sy,8,0,Math.PI*2);overlayCtx.fillStyle='#22d3ee';overlayCtx.fill();
         const a=Math.atan2(ey-sy,ex-sx);
-        overlayCtx.beginPath();overlayCtx.moveTo(ex,ey);overlayCtx.lineTo(ex-15*Math.cos(a-0.4),ey-15*Math.sin(a-0.4));overlayCtx.lineTo(ex-15*Math.cos(a+0.4),ey-15*Math.sin(a+0.4));overlayCtx.closePath();overlayCtx.fillStyle='#4caf50';overlayCtx.fill();
+        overlayCtx.beginPath();overlayCtx.moveTo(ex,ey);overlayCtx.lineTo(ex-15*Math.cos(a-0.4),ey-15*Math.sin(a-0.4));overlayCtx.lineTo(ex-15*Math.cos(a+0.4),ey-15*Math.sin(a+0.4));overlayCtx.closePath();overlayCtx.fillStyle='#22d3ee';overlayCtx.fill();
     }}else if(type.includes('scroll')){{
         const x=oX+(ev.x*sX),y=oY+(ev.y*sY);
-        overlayCtx.beginPath();overlayCtx.arc(x,y,15,0,Math.PI*2);overlayCtx.strokeStyle='#ab47bc';overlayCtx.lineWidth=2;overlayCtx.stroke();
+        overlayCtx.beginPath();overlayCtx.arc(x,y,15,0,Math.PI*2);overlayCtx.strokeStyle='#a78bfa';overlayCtx.lineWidth=2;overlayCtx.stroke();
         const dy=ev.dy||0;
         if(dy!==0){{
             const aY=dy>0?-25:25;
-            overlayCtx.beginPath();overlayCtx.moveTo(x,y+aY);overlayCtx.lineTo(x-8,y+aY+(dy>0?10:-10));overlayCtx.lineTo(x+8,y+aY+(dy>0?10:-10));overlayCtx.closePath();overlayCtx.fillStyle='#ab47bc';overlayCtx.fill();
+            overlayCtx.beginPath();overlayCtx.moveTo(x,y+aY);overlayCtx.lineTo(x-8,y+aY+(dy>0?10:-10));overlayCtx.lineTo(x+8,y+aY+(dy>0?10:-10));overlayCtx.closePath();overlayCtx.fillStyle='#a78bfa';overlayCtx.fill();
         }}
     }}else if(type.includes('smart_magnify')){{
         const x=oX+(ev.x*sX),y=oY+(ev.y*sY);
         const r=25;
         /* Pulsing circle */
-        overlayCtx.beginPath();overlayCtx.arc(x,y,r+15,0,Math.PI*2);overlayCtx.strokeStyle='rgba(38,166,154,0.3)';overlayCtx.lineWidth=2;overlayCtx.stroke();
-        overlayCtx.beginPath();overlayCtx.arc(x,y,r,0,Math.PI*2);overlayCtx.strokeStyle='#26a69a';overlayCtx.lineWidth=3;overlayCtx.stroke();
+        overlayCtx.beginPath();overlayCtx.arc(x,y,r+15,0,Math.PI*2);overlayCtx.strokeStyle='rgba(34,211,238,0.3)';overlayCtx.lineWidth=2;overlayCtx.stroke();
+        overlayCtx.beginPath();overlayCtx.arc(x,y,r,0,Math.PI*2);overlayCtx.strokeStyle='#22d3ee';overlayCtx.lineWidth=3;overlayCtx.stroke();
         /* Crosshair */
         overlayCtx.beginPath();
         overlayCtx.moveTo(x-r-8,y);overlayCtx.lineTo(x-6,y);
         overlayCtx.moveTo(x+6,y);overlayCtx.lineTo(x+r+8,y);
         overlayCtx.moveTo(x,y-r-8);overlayCtx.lineTo(x,y-6);
         overlayCtx.moveTo(x,y+6);overlayCtx.lineTo(x,y+r+8);
-        overlayCtx.strokeStyle='#26a69a';overlayCtx.lineWidth=2;overlayCtx.stroke();
+        overlayCtx.strokeStyle='#22d3ee';overlayCtx.lineWidth=2;overlayCtx.stroke();
         /* Center dot */
-        overlayCtx.beginPath();overlayCtx.arc(x,y,4,0,Math.PI*2);overlayCtx.fillStyle='#26a69a';overlayCtx.fill();
+        overlayCtx.beginPath();overlayCtx.arc(x,y,4,0,Math.PI*2);overlayCtx.fillStyle='#22d3ee';overlayCtx.fill();
         /* Label */
-        overlayCtx.font='bold 13px sans-serif';overlayCtx.fillStyle='#26a69a';overlayCtx.fillText('Smart Zoom',x+r+12,y+5);
+        overlayCtx.font='bold 13px sans-serif';overlayCtx.fillStyle='#22d3ee';overlayCtx.fillText('Smart Zoom',x+r+12,y+5);
     }}else if(type.includes('magnify')){{
         const x=oX+(ev.x*sX),y=oY+(ev.y*sY);
         const mag=ev.magnification||0;
         const r1=20,r2=35,r3=50;
         const alpha=Math.min(Math.abs(mag)*3,0.6)+0.15;
-        overlayCtx.beginPath();overlayCtx.arc(x,y,r3,0,Math.PI*2);overlayCtx.strokeStyle=`rgba(0,188,212,${{alpha*0.5}})`;overlayCtx.lineWidth=2;overlayCtx.stroke();
-        overlayCtx.beginPath();overlayCtx.arc(x,y,r2,0,Math.PI*2);overlayCtx.strokeStyle=`rgba(0,188,212,${{alpha*0.7}})`;overlayCtx.lineWidth=2;overlayCtx.stroke();
-        overlayCtx.beginPath();overlayCtx.arc(x,y,r1,0,Math.PI*2);overlayCtx.strokeStyle='#00bcd4';overlayCtx.lineWidth=3;overlayCtx.stroke();
-        overlayCtx.beginPath();overlayCtx.arc(x,y,5,0,Math.PI*2);overlayCtx.fillStyle='#00bcd4';overlayCtx.fill();
+        overlayCtx.beginPath();overlayCtx.arc(x,y,r3,0,Math.PI*2);overlayCtx.strokeStyle=`rgba(34,211,238,${{alpha*0.5}})`;overlayCtx.lineWidth=2;overlayCtx.stroke();
+        overlayCtx.beginPath();overlayCtx.arc(x,y,r2,0,Math.PI*2);overlayCtx.strokeStyle=`rgba(34,211,238,${{alpha*0.7}})`;overlayCtx.lineWidth=2;overlayCtx.stroke();
+        overlayCtx.beginPath();overlayCtx.arc(x,y,r1,0,Math.PI*2);overlayCtx.strokeStyle='#22d3ee';overlayCtx.lineWidth=3;overlayCtx.stroke();
+        overlayCtx.beginPath();overlayCtx.arc(x,y,5,0,Math.PI*2);overlayCtx.fillStyle='#22d3ee';overlayCtx.fill();
         const sign=mag>=0?'+':'';
-        overlayCtx.font='bold 13px sans-serif';overlayCtx.fillStyle='#00bcd4';overlayCtx.fillText(sign+Math.round(mag*100)+'%',x+r3+5,y+5);
+        overlayCtx.font='bold 13px sans-serif';overlayCtx.fillStyle='#22d3ee';overlayCtx.fillText(sign+Math.round(mag*100)+'%',x+r3+5,y+5);
     }}else if(type.includes('rotate')){{
         const x=oX+(ev.x*sX),y=oY+(ev.y*sY);
         const rot=ev.rotation||0;
         const r=30;
         const startA=-Math.PI/2;
         const sweep=(rot/180)*Math.PI;
-        overlayCtx.beginPath();overlayCtx.arc(x,y,r,startA,startA+sweep,rot<0);overlayCtx.strokeStyle='#ff9800';overlayCtx.lineWidth=3;overlayCtx.stroke();
+        overlayCtx.beginPath();overlayCtx.arc(x,y,r,startA,startA+sweep,rot<0);overlayCtx.strokeStyle='#818cf8';overlayCtx.lineWidth=3;overlayCtx.stroke();
         const endA=startA+sweep;
         const ax=x+r*Math.cos(endA),ay=y+r*Math.sin(endA);
         const d=rot>=0?1:-1;
-        overlayCtx.beginPath();overlayCtx.moveTo(ax,ay);overlayCtx.lineTo(ax+10*Math.cos(endA+d*2.5),ay+10*Math.sin(endA+d*2.5));overlayCtx.lineTo(ax+10*Math.cos(endA-d*0.5),ay+10*Math.sin(endA-d*0.5));overlayCtx.closePath();overlayCtx.fillStyle='#ff9800';overlayCtx.fill();
-        overlayCtx.beginPath();overlayCtx.arc(x,y,4,0,Math.PI*2);overlayCtx.fillStyle='#ff9800';overlayCtx.fill();
-        overlayCtx.font='bold 13px sans-serif';overlayCtx.fillStyle='#ff9800';overlayCtx.fillText(Math.abs(Math.round(rot))+'\u00B0',x+r+10,y+5);
+        overlayCtx.beginPath();overlayCtx.moveTo(ax,ay);overlayCtx.lineTo(ax+10*Math.cos(endA+d*2.5),ay+10*Math.sin(endA+d*2.5));overlayCtx.lineTo(ax+10*Math.cos(endA-d*0.5),ay+10*Math.sin(endA-d*0.5));overlayCtx.closePath();overlayCtx.fillStyle='#818cf8';overlayCtx.fill();
+        overlayCtx.beginPath();overlayCtx.arc(x,y,4,0,Math.PI*2);overlayCtx.fillStyle='#818cf8';overlayCtx.fill();
+        overlayCtx.font='bold 13px sans-serif';overlayCtx.fillStyle='#818cf8';overlayCtx.fillText(Math.abs(Math.round(rot))+'\u00B0',x+r+10,y+5);
     }}else if(type.includes('type')||type==='key.special'||type==='key.down'||type==='key.up'){{
         const txt=ev.text||ev.keys||'';
         if(txt){{
             const bx=20,by=overlayCanvas.height-60,pad=10;
             overlayCtx.font='16px monospace';
             const tw=Math.min(overlayCtx.measureText(txt).width,300);
-            overlayCtx.fillStyle='rgba(66,165,245,0.9)';overlayCtx.beginPath();overlayCtx.roundRect(bx,by,tw+pad*2,36,8);overlayCtx.fill();
+            overlayCtx.fillStyle='rgba(96,165,250,0.9)';overlayCtx.beginPath();overlayCtx.roundRect(bx,by,tw+pad*2,36,8);overlayCtx.fill();
             overlayCtx.fillStyle='#fff';overlayCtx.fillText(txt.substring(0,30),bx+pad,by+24);
         }}
     }}
