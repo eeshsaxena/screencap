@@ -108,9 +108,23 @@ def _download_and_verify(version: str, dest_dir: Path) -> Path:
                 f"Checksum mismatch: expected {expected_hash}, got {actual_hash}"
             )
 
-        # Extract to destination
-        dest_dir.mkdir(parents=True, exist_ok=True)
-        shutil.unpack_archive(str(tarball_path), str(dest_dir))
+        # Extract to a temp subdirectory so we can flatten the nested dir
+        extract_dir = tmp / "extract"
+        shutil.unpack_archive(str(tarball_path), str(extract_dir))
+
+        # The tarball contains a top-level screencap/ directory.
+        # Move its contents to dest_dir to avoid an extra nesting level.
+        inner = extract_dir / "screencap"
+        if inner.is_dir():
+            shutil.move(str(inner), str(dest_dir))
+        else:
+            # Fallback: no inner dir, use extraction root directly
+            shutil.move(str(extract_dir), str(dest_dir))
+
+        # Ensure the binary is executable
+        binary = dest_dir / "screencap"
+        if binary.exists():
+            binary.chmod(binary.stat().st_mode | 0o111)
 
     return dest_dir
 
