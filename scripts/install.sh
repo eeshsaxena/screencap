@@ -52,8 +52,9 @@ if ! (cd "$TMPDIR" && shasum -a 256 -c checksums.sha256 --ignore-missing); then
     exit 1
 fi
 
-# Extract
+# Extract (remove previous install to avoid "Can't replace directory" errors)
 mkdir -p "$INSTALL_DIR"
+rm -rf "$INSTALL_DIR/screencap"
 tar xzf "$TMPDIR/${TARBALL}" -C "$INSTALL_DIR"
 
 # Add to PATH (detect shell, use marker for idempotency)
