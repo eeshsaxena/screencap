@@ -460,7 +460,8 @@ def write_action_event(
     """
     assert event.type == "action", event
     crud.insert_action_event(db, recording, event.timestamp, event.data)
-    perf_q.put((event.type, event.timestamp, utils.get_timestamp()))
+    # disabled to increase perf
+    # perf_q.put((event.type, event.timestamp, utils.get_timestamp()))
 
 
 def write_screen_event(
@@ -487,7 +488,8 @@ def write_screen_event(
     else:
         event_data = {}
     crud.insert_screenshot(db, recording, event.timestamp, event_data)
-    perf_q.put((event.type, event.timestamp, utils.get_timestamp()))
+    # disabled to increase perf
+    # perf_q.put((event.type, event.timestamp, utils.get_timestamp()))
 
 
 def write_window_event(
@@ -506,7 +508,8 @@ def write_window_event(
     """
     assert event.type == "window", event
     crud.insert_window_event(db, recording, event.timestamp, event.data)
-    perf_q.put((event.type, event.timestamp, utils.get_timestamp()))
+    # disabled to increase perf
+    # perf_q.put((event.type, event.timestamp, utils.get_timestamp()))
 
 
 def write_browser_event(
@@ -525,7 +528,8 @@ def write_browser_event(
     """
     assert event.type == "browser", event
     crud.insert_browser_event(db, recording, event.timestamp, event.data)
-    perf_q.put((event.type, event.timestamp, utils.get_timestamp()))
+    # disabled to increase perf
+    # perf_q.put((event.type, event.timestamp, utils.get_timestamp()))
 
 
 @utils.trace(logger)
@@ -726,7 +730,8 @@ def write_video_event(
             last_pts,
             force_key_frame,
         )
-    perf_q.put((event.type, event.timestamp, utils.get_timestamp()))
+    # disabled to increase perf
+    # perf_q.put((event.type, event.timestamp, utils.get_timestamp()))
     return {
         **kwargs,
         **{
