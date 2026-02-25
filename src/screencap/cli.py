@@ -45,10 +45,11 @@ def cli(ctx, no_update_check):
 @click.option("--no-auto-name", is_flag=True, default=False, help="Skip LLM auto-naming after recording.")
 @click.option("--local-only", is_flag=True, default=False, help="Restrict LLM naming to local providers (Ollama).")
 @click.option("--force", is_flag=True, default=False, help="Auto-clean orphaned processes before starting.")
+@click.option("--verbose", "-v", is_flag=True, default=False, help="Show all info/debug output during recording.")
 def start(
     name, description, no_audio, no_video, no_images, no_window_data,
     no_browser_events, output, no_wifi_metrics, no_app_versions,
-    no_auto_name, local_only, force,
+    no_auto_name, local_only, force, verbose,
 ):
     """Record a screen capture session. Ctrl+C to stop."""
     from datetime import datetime
@@ -83,54 +84,58 @@ def start(
     capture_browser_events = False if no_browser_events else None  # None = upstream default (False)
 
     try:
-        from screencap.recorder import start_recording
+        from screencap.recorder import print_summary, start_recording
     except ImportError:
         console.print(_RECORD_EXTRAS_MSG)
         raise SystemExit(1)
 
     try:
-        capture_dir = start_recording(
+        capture_dir, elapsed = start_recording(
             name, description or None, audio, output,
             wifi_metrics=wifi_metrics, app_versions=app_versions, force_clean=force,
             capture_video=capture_video, capture_images=capture_images,
             capture_window_data=capture_window_data, capture_browser_events=capture_browser_events,
+            verbose=verbose,
         )
     except ImportError:
         console.print(_RECORD_EXTRAS_MSG)
         raise SystemExit(1)
 
     # --- Post-recording pipeline ---
-    if not auto_name_enabled:
-        return
+    final_name = name
+    final_dir = capture_dir
 
-    # Auto-transcribe if audio was captured
-    audio_path = capture_dir / "audio.flac"
-    if audio and audio_path.exists() and audio_path.stat().st_size >= 1024:
+    if auto_name_enabled:
+        # Auto-transcribe if audio was captured
+        audio_path = capture_dir / "audio.flac"
+        if audio and audio_path.exists() and audio_path.stat().st_size >= 1024:
+            try:
+                _auto_transcribe(capture_dir, audio_path)
+            except KeyboardInterrupt:
+                console.print("[yellow]Transcription cancelled.[/yellow]")
+
+        # LLM auto-naming
+        skip_rename = output is not None  # User chose a specific path
         try:
-            _auto_transcribe(capture_dir, audio_path)
+            from screencap.namer import auto_name as do_auto_name
+
+            with console.status("[bold]Generating name...[/bold]"):
+                final_dir = do_auto_name(
+                    capture_dir,
+                    local_only=local_only,
+                    skip_rename=skip_rename,
+                )
+            final_name = final_dir.name
         except KeyboardInterrupt:
-            console.print("[yellow]Transcription cancelled.[/yellow]")
+            console.print("[yellow]Naming cancelled — keeping timestamp name[/yellow]")
 
-    # LLM auto-naming
-    skip_rename = output is not None  # User chose a specific path
-    try:
-        from screencap.namer import auto_name as do_auto_name
-
-        with console.status("[bold]Generating name...[/bold]"):
-            final_dir = do_auto_name(
-                capture_dir,
-                local_only=local_only,
-                skip_rename=skip_rename,
-            )
-
-        if final_dir != capture_dir:
-            console.print(f"\n[bold green]Recording saved to {final_dir}/[/bold green]")
-    except KeyboardInterrupt:
-        console.print("[yellow]Naming cancelled — keeping timestamp name[/yellow]")
+    print_summary(final_name, final_dir, elapsed)
 
 
 def _auto_transcribe(capture_dir, audio_path):
     """Auto-transcribe audio using the fastest available backend."""
+    import os
+
     transcript_path = capture_dir / "transcript.txt"
     transcript_json_path = capture_dir / "transcript.json"
 
@@ -144,7 +149,14 @@ def _auto_transcribe(capture_dir, audio_path):
         from openadapt_capture.cli import _transcribe_faster_whisper
 
         with console.status("[bold]Transcribing audio...[/bold]"):
-            _transcribe_faster_whisper(audio_path, transcript_path, transcript_json_path, "base")
+            # Suppress print() calls from vendored code
+            _orig = sys.stdout
+            sys.stdout = open(os.devnull, "w")
+            try:
+                _transcribe_faster_whisper(audio_path, transcript_path, transcript_json_path, "base")
+            finally:
+                sys.stdout.close()
+                sys.stdout = _orig
         return
     except ImportError:
         pass
@@ -154,14 +166,18 @@ def _auto_transcribe(capture_dir, audio_path):
         from openadapt_capture.cli import _transcribe_local
 
         with console.status("[bold]Transcribing audio...[/bold]"):
-            _transcribe_local(audio_path, transcript_path, transcript_json_path, "base")
+            _orig = sys.stdout
+            sys.stdout = open(os.devnull, "w")
+            try:
+                _transcribe_local(audio_path, transcript_path, transcript_json_path, "base")
+            finally:
+                sys.stdout.close()
+                sys.stdout = _orig
         return
     except ImportError:
         pass
 
     # Try OpenAI API
-    import os
-
     api_key = os.environ.get("OPENAI_API_KEY")
     if api_key:
         try:
@@ -209,7 +225,7 @@ def list_cmd(as_json, sort):
         )
         return
 
-    table = Table(show_header=True, header_style="bold cyan")
+    table = Table(show_header=True, header_style="bold #60a5fa")
     table.add_column("#", justify="right")
     table.add_column("Name")
     table.add_column("Date")
@@ -314,7 +330,7 @@ def info(name, as_json):
 
     if rec_meta:
         for key, val in rec_meta.items():
-            console.print(f"  [cyan]{key}:[/cyan] {val}")
+            console.print(f"  [#60a5fa]{key}:[/#60a5fa] {val}")
     else:
         console.print("  [dim]No recording metadata available.[/dim]")
 
@@ -334,27 +350,27 @@ def info(name, as_json):
         for key, val in static.items():
             if key == "displays":
                 for i, d in enumerate(val):
-                    console.print(f"  [cyan]display {i}:[/cyan] {d.get('width')}x{d.get('height')}")
+                    console.print(f"  [#60a5fa]display {i}:[/#60a5fa] {d.get('width')}x{d.get('height')}")
             elif key == "locale" and isinstance(val, dict):
-                console.print(f"  [cyan]locale:[/cyan]")
+                console.print(f"  [#60a5fa]locale:[/#60a5fa]")
                 for lk, lv in val.items():
                     if isinstance(lv, list):
-                        console.print(f"    [cyan]{lk}:[/cyan] {', '.join(str(x) for x in lv)}")
+                        console.print(f"    [#60a5fa]{lk}:[/#60a5fa] {', '.join(str(x) for x in lv)}")
                     elif isinstance(lv, dict):
-                        console.print(f"    [cyan]{lk}:[/cyan] {lv}")
+                        console.print(f"    [#60a5fa]{lk}:[/#60a5fa] {lv}")
                     else:
-                        console.print(f"    [cyan]{lk}:[/cyan] {lv}")
+                        console.print(f"    [#60a5fa]{lk}:[/#60a5fa] {lv}")
             elif key == "running_applications" and isinstance(val, list):
-                console.print(f"  [cyan]running apps:[/cyan]")
+                console.print(f"  [#60a5fa]running apps:[/#60a5fa]")
                 for app in val:
                     v = f" v{app['version']}" if app.get("version") else ""
                     console.print(f"    {app['name']} ({app['bundle_id']}){v}")
             elif key == "wifi" and isinstance(val, dict):
-                console.print(f"  [cyan]wifi:[/cyan]")
+                console.print(f"  [#60a5fa]wifi:[/#60a5fa]")
                 for wk, wv in val.items():
-                    console.print(f"    [cyan]{wk}:[/cyan] {wv}")
+                    console.print(f"    [#60a5fa]{wk}:[/#60a5fa] {wv}")
             else:
-                console.print(f"  [cyan]{key}:[/cyan] {val}")
+                console.print(f"  [#60a5fa]{key}:[/#60a5fa] {val}")
 
     for phase in ("start", "end"):
         snapshot = metrics.get(phase)
@@ -362,11 +378,11 @@ def info(name, as_json):
             console.print(Panel(f"[bold]{phase.title()} Snapshot[/bold]"))
             for key, val in snapshot.items():
                 if key == "wifi" and isinstance(val, dict):
-                    console.print(f"  [cyan]wifi:[/cyan]")
+                    console.print(f"  [#60a5fa]wifi:[/#60a5fa]")
                     for wk, wv in val.items():
-                        console.print(f"    [cyan]{wk}:[/cyan] {wv}")
+                        console.print(f"    [#60a5fa]{wk}:[/#60a5fa] {wv}")
                 else:
-                    console.print(f"  [cyan]{key}:[/cyan] {val}")
+                    console.print(f"  [#60a5fa]{key}:[/#60a5fa] {val}")
         elif phase == "end":
             console.print(f"\n  [dim]No end snapshot (recording may have been interrupted).[/dim]")
 

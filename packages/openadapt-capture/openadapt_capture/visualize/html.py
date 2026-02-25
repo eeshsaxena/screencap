@@ -366,33 +366,37 @@ def _generate_html(
 <link href="https://fonts.googleapis.com/css2?family=Outfit:wght@300;400;500;600;700&family=JetBrains+Mono:wght@400;500&display=swap" rel="stylesheet">
 <style>
 :root {{
-    --bg-0:#08090b; --bg-1:#111318; --bg-sidebar:#13151c; --bg-2:#191b22; --bg-3:#23252e;
+    --bg-0:#080c1c; --bg-1:#0b1121; --bg-sidebar:#090e1e; --bg-2:#111827; --bg-3:#1e293b;
     --border:rgba(255,255,255,0.06); --border-hi:rgba(255,255,255,0.12);
-    --text-1:#eeeef0; --text-2:#9ea0ad; --text-3:#686a7a;
-    --accent:#d4943a; --accent-dim:rgba(212,148,58,0.12); --accent-hover:#e0a448;
-    --ev-click:#ef5350; --ev-drag:#4caf50; --ev-scroll:#ab47bc; --ev-type:#42a5f5; --ev-move:#717380; --ev-magnify:#00bcd4; --ev-rotate:#ff9800; --ev-smart-magnify:#26a69a;
-    --radius:10px; --radius-sm:6px;
+    --text-1:#f0f4ff; --text-2:rgba(210,225,255,0.7); --text-3:rgba(170,195,235,0.55);
+    --accent:#60a5fa; --accent-dim:rgba(96,165,250,0.14); --accent-hover:#3b82f6;
+    --ev-click:#f472b6; --ev-drag:#22d3ee; --ev-scroll:#a78bfa; --ev-type:#60a5fa; --ev-move:rgba(170,195,235,0.4); --ev-magnify:#22d3ee; --ev-rotate:#818cf8; --ev-smart-magnify:#22d3ee;
+    --glass-bg:rgba(255,255,255,0.07); --glass-border:rgba(255,255,255,0.12); --glass-bg-hover:rgba(255,255,255,0.11);
+    --accent-cyan:#22d3ee; --accent-cyan-dim:rgba(34,211,238,0.12); --accent-indigo:#818cf8; --accent-indigo-dim:rgba(129,140,248,0.12); --accent-violet:#a78bfa; --accent-violet-dim:rgba(167,139,250,0.1); --accent-rose:#f472b6; --accent-rose-dim:rgba(244,114,182,0.1);
+    --radius:12px; --radius-sm:8px; --radius-lg:16px;
+    --shadow-1:0 2px 16px rgba(0,0,0,0.4); --shadow-2:0 4px 24px rgba(0,0,0,0.5),0 0 0 1px rgba(255,255,255,0.03);
+    --ease:cubic-bezier(0.22,1,0.36,1);
 }}
 *{{ box-sizing:border-box; margin:0; padding:0; }}
-body {{ font-family:'Outfit',-apple-system,BlinkMacSystemFont,sans-serif; background:var(--bg-0); color:var(--text-1); height:100vh; overflow:hidden; display:flex; flex-direction:column; line-height:1.5; }}
+body {{ font-family:'Outfit',-apple-system,BlinkMacSystemFont,sans-serif; background:var(--bg-0); color:var(--text-1); height:100vh; overflow:hidden; display:flex; flex-direction:column; line-height:1.4; }}
 
 /* Layout */
 .app {{ flex:1; display:flex; min-height:0; }}
 
 /* Left Panel */
-.panel-left {{ width:260px; background:var(--bg-sidebar); border-right:1px solid var(--border); display:flex; flex-direction:column; flex-shrink:0; }}
+.panel-left {{ width:260px; background:var(--bg-sidebar); border-radius:0 var(--radius-lg) var(--radius-lg) 0; display:flex; flex-direction:column; flex-shrink:0; box-shadow:var(--shadow-1); overflow:hidden; }}
 .panel-header {{ padding:14px 16px; display:flex; justify-content:space-between; align-items:center; border-bottom:1px solid var(--border); }}
-.brand {{ font-weight:700; font-size:0.95rem; letter-spacing:-0.02em; color:var(--accent); }}
+.brand {{ font-weight:600; font-size:0.85rem; letter-spacing:-0.01em; color:var(--text-2); }}
 .rec-id {{ font-family:'JetBrains Mono',monospace; font-size:0.65rem; color:var(--text-3); margin-top:2px; }}
-.ev-count {{ font-family:'JetBrains Mono',monospace; font-size:0.7rem; color:var(--text-3); background:var(--bg-3); padding:2px 8px; border-radius:4px; }}
-.events-list {{ flex:1; overflow-y:auto; padding:6px; scrollbar-width:thin; scrollbar-color:var(--bg-3) transparent; }}
-.events-list::-webkit-scrollbar {{ width:4px; }}
+.ev-count {{ font-family:'JetBrains Mono',monospace; font-size:0.7rem; color:var(--text-3); background:var(--bg-3); padding:2px 10px; border-radius:20px; font-variant-numeric:tabular-nums; }}
+.events-list {{ flex:1; overflow-y:auto; padding:6px; scrollbar-width:thin; scrollbar-color:rgba(255,255,255,0.1) transparent; -webkit-mask-image:linear-gradient(to bottom,transparent 0px,#000 12px,#000 calc(100% - 12px),transparent 100%); mask-image:linear-gradient(to bottom,transparent 0px,#000 12px,#000 calc(100% - 12px),transparent 100%); }}
+.events-list::-webkit-scrollbar {{ width:6px; }}
 .events-list::-webkit-scrollbar-track {{ background:transparent; }}
-.events-list::-webkit-scrollbar-thumb {{ background:var(--bg-3); border-radius:2px; }}
-.ev-item {{ display:flex; align-items:center; gap:10px; padding:8px 12px; border-radius:var(--radius-sm); cursor:pointer; transition:all 0.15s; border-left:3px solid transparent; margin-bottom:2px; }}
-.ev-item:hover {{ background:var(--bg-2); }}
-.ev-item.active {{ background:var(--accent-dim); border-left-color:var(--accent); box-shadow:inset 0 0 0 1px rgba(212,148,58,0.08); }}
-.ev-icon {{ width:20px; height:20px; border-radius:var(--radius-sm); flex-shrink:0; display:flex; align-items:center; justify-content:center; font-size:0.7rem; background:rgba(255,255,255,0.04); }}
+.events-list::-webkit-scrollbar-thumb {{ background:rgba(255,255,255,0.1); border-radius:3px; }}
+.ev-item {{ display:flex; align-items:center; gap:10px; padding:7px 10px; border-radius:var(--radius-sm); cursor:pointer; transition:all 0.2s var(--ease); margin-bottom:1px; }}
+.ev-item:hover {{ background:rgba(255,255,255,0.04); transform:translateX(2px); }}
+.ev-item.active {{ background:var(--accent-dim); box-shadow:0 0 0 1px rgba(96,165,250,0.2); }}
+.ev-icon {{ width:24px; height:24px; border-radius:var(--radius-sm); flex-shrink:0; display:flex; align-items:center; justify-content:center; font-size:0.72rem; background:rgba(255,255,255,0.03); }}
 .ev-body {{ flex:1; min-width:0; }}
 .ev-label {{ font-size:0.8rem; font-weight:500; display:block; white-space:nowrap; overflow:hidden; text-overflow:ellipsis; }}
 .ev-desc {{ font-family:'JetBrains Mono',monospace; font-size:0.65rem; color:var(--text-3); display:block; white-space:nowrap; overflow:hidden; text-overflow:ellipsis; }}
@@ -402,33 +406,33 @@ body {{ font-family:'Outfit',-apple-system,BlinkMacSystemFont,sans-serif; backgr
 .ev-item.active .ev-desc {{ color:var(--text-2); }}
 
 /* Center */
-.center {{ flex:1; display:flex; align-items:center; justify-content:center; background:var(--bg-0); min-width:0; padding:12px; }}
-.frame-container {{ position:relative; max-width:100%; max-height:100%; }}
-.frame-container img {{ max-width:100%; max-height:calc(100vh - 120px); object-fit:contain; border-radius:var(--radius); display:block; }}
+.center {{ flex:1; display:flex; flex-direction:column; align-items:center; justify-content:center; background:transparent; min-width:0; padding:12px; gap:10px; }}
+.frame-container {{ position:relative; flex:1; min-height:0; max-width:100%; display:flex; align-items:center; justify-content:center; }}
+.frame-container img {{ max-width:100%; max-height:100%; object-fit:contain; border-radius:var(--radius); display:block; }}
 .frame-container canvas {{ position:absolute; top:0; left:0; pointer-events:none; border-radius:var(--radius); }}
-.frame-badge {{ position:absolute; top:10px; right:10px; background:rgba(0,0,0,0.65); backdrop-filter:blur(8px); padding:4px 10px; border-radius:var(--radius-sm); font-family:'JetBrains Mono',monospace; font-size:0.72rem; color:var(--text-2); border:1px solid var(--border); }}
+.frame-badge {{ position:absolute; top:12px; right:12px; background:rgba(0,0,0,0.4); backdrop-filter:blur(20px); -webkit-backdrop-filter:blur(20px); padding:6px 14px; border-radius:var(--radius-sm); font-family:'JetBrains Mono',monospace; font-size:0.72rem; color:rgba(255,255,255,0.7); border:1px solid rgba(255,255,255,0.06); font-variant-numeric:tabular-nums; }}
 
 /* Right Panel */
-.panel-right {{ width:300px; background:var(--bg-sidebar); border-left:1px solid var(--border); display:flex; flex-direction:column; flex-shrink:0; overflow-y:auto; padding:10px; gap:8px; scrollbar-width:thin; scrollbar-color:var(--bg-3) transparent; }}
-.panel-right::-webkit-scrollbar {{ width:4px; }}
+.panel-right {{ width:300px; background:var(--bg-sidebar); border-radius:var(--radius-lg) 0 0 var(--radius-lg); display:flex; flex-direction:column; flex-shrink:0; overflow-y:auto; padding:10px; gap:8px; box-shadow:var(--shadow-1); scrollbar-width:thin; scrollbar-color:rgba(255,255,255,0.1) transparent; }}
+.panel-right::-webkit-scrollbar {{ width:6px; }}
 .panel-right::-webkit-scrollbar-track {{ background:transparent; }}
-.panel-right::-webkit-scrollbar-thumb {{ background:var(--bg-3); border-radius:2px; }}
+.panel-right::-webkit-scrollbar-thumb {{ background:rgba(255,255,255,0.1); border-radius:3px; }}
 .ctx-header {{ display:flex; justify-content:space-between; align-items:center; padding:12px 14px; background:var(--bg-2); border:none; border-radius:var(--radius); }}
 .ctx-type {{ font-weight:800; font-size:1rem; text-transform:uppercase; letter-spacing:0.02em; }}
 .ctx-time {{ font-family:'JetBrains Mono',monospace; font-size:0.72rem; color:var(--text-2); }}
-.card {{ background:rgba(255,255,255,0.025); border:none; border-radius:var(--radius); overflow:hidden; }}
+.card {{ background:var(--glass-bg); border:1px solid var(--glass-border); border-radius:var(--radius); overflow:hidden; }}
 .card-label {{ font-size:0.65rem; font-weight:600; text-transform:uppercase; letter-spacing:0.06em; color:var(--text-3); padding:10px 14px 6px; }}
 .card-head {{ display:flex; justify-content:space-between; align-items:center; padding:8px 14px 6px; }}
 .card-head .card-label {{ padding:0; }}
 .card-body {{ padding:6px 14px 12px; }}
-#app-card {{ border-left:3px solid rgba(120,160,255,0.35); background:rgba(120,160,255,0.03); }}
+#app-card {{ background:var(--accent-indigo-dim); }}
 .app-name {{ font-size:1rem; font-weight:600; color:var(--text-1); }}
 .app-window {{ font-size:0.75rem; color:var(--text-2); margin-top:1px; white-space:nowrap; overflow:hidden; text-overflow:ellipsis; }}
-#element-card {{ border-left:3px solid rgba(255,158,100,0.35); background:rgba(255,158,100,0.03); }}
+#element-card {{ background:var(--accent-rose-dim); }}
 .el-field {{ display:flex; align-items:baseline; padding:3px 0; }}
 .el-key {{ font-size:0.65rem; text-transform:uppercase; letter-spacing:0.04em; color:var(--text-3); min-width:50px; flex-shrink:0; }}
 .el-val {{ font-family:'JetBrains Mono',monospace; font-size:0.75rem; color:var(--text-1); word-break:break-word; }}
-.el-val.role {{ color:#ff9e64; font-weight:600; }}
+.el-val.role {{ color:var(--accent-cyan); font-weight:600; }}
 .el-val.muted {{ color:var(--text-2); font-weight:400; }}
 .more-toggle {{ display:flex; align-items:center; gap:6px; padding-top:6px; margin-top:4px; border-top:1px solid var(--border); cursor:pointer; font-size:0.65rem; color:var(--text-3); user-select:none; transition:color 0.12s; }}
 .more-toggle:hover {{ color:var(--accent); }}
@@ -436,8 +440,8 @@ body {{ font-family:'Outfit',-apple-system,BlinkMacSystemFont,sans-serif; backgr
 .more-toggle.expanded .chevron {{ transform:rotate(90deg); }}
 .more-content {{ display:none; margin-top:6px; font-family:'JetBrains Mono',monospace; font-size:0.65rem; color:var(--text-2); max-height:140px; overflow-y:auto; padding:6px; background:var(--bg-3); border-radius:var(--radius-sm); }}
 .more-content.visible {{ display:block; }}
-.more-content .a11y-key {{ color:#7eb6ff; }}
-.more-content .a11y-val {{ color:#c3e88d; }}
+.more-content .a11y-key {{ color:var(--accent); }}
+.more-content .a11y-val {{ color:var(--accent-cyan); }}
 .detail-row {{ display:flex; padding:3px 0; line-height:1.6; }}
 .detail-key {{ font-size:0.65rem; text-transform:uppercase; letter-spacing:0.03em; color:var(--text-3); min-width:55px; flex-shrink:0; font-weight:500; }}
 .detail-val {{ font-family:'JetBrains Mono',monospace; font-size:0.75rem; color:var(--text-2); }}
@@ -454,41 +458,48 @@ body {{ font-family:'Outfit',-apple-system,BlinkMacSystemFont,sans-serif; backgr
 .empty-state-text {{ font-size:0.72rem; color:var(--text-3); }}
 
 /* Player Bar */
-.player-bar {{ background:var(--bg-1); border-top:1px solid var(--border); padding:10px 20px; flex-shrink:0; }}
+.player-bar {{ background:var(--bg-1); border-radius:var(--radius); padding:10px 16px; flex-shrink:0; width:100%; border:1px solid rgba(255,255,255,0.04); }}
 .player-main {{ display:flex; align-items:center; gap:12px; }}
-.player-nav {{ display:flex; align-items:center; gap:4px; }}
-.player-nav button {{ background:transparent; border:1px solid var(--border); color:var(--text-2); width:30px; height:30px; border-radius:var(--radius-sm); cursor:pointer; font-size:0.75rem; display:flex; align-items:center; justify-content:center; transition:all 0.15s; }}
-.player-nav button:hover {{ background:var(--bg-3); color:var(--text-1); border-color:var(--border-hi); box-shadow:0 0 8px rgba(255,255,255,0.04); }}
+.player-nav {{ display:flex; align-items:center; gap:2px; background:rgba(255,255,255,0.03); border-radius:var(--radius); padding:3px; }}
+.player-nav button {{ background:transparent; border:none; color:var(--text-2); width:30px; height:30px; border-radius:var(--radius-sm); cursor:pointer; font-size:0.75rem; display:flex; align-items:center; justify-content:center; transition:all 0.2s var(--ease); }}
+.player-nav button:hover {{ background:rgba(255,255,255,0.06); color:var(--text-1); }}
+.player-nav button:active {{ transform:scale(0.92); }}
 .player-nav button:disabled {{ opacity:0.25; cursor:not-allowed; pointer-events:none; }}
-.player-nav .play-btn {{ background:var(--accent); border:none; color:var(--bg-0); width:36px; height:36px; border-radius:var(--radius-sm); font-weight:700; font-size:0.85rem; }}
-.player-nav .play-btn:hover {{ background:var(--accent-hover); transform:scale(1.06); box-shadow:0 0 16px rgba(212,148,58,0.3); }}
-.step-display {{ font-family:'JetBrains Mono',monospace; font-size:0.75rem; color:var(--accent); font-weight:500; min-width:95px; text-align:center; line-height:36px; }}
-.timeline {{ flex:1; height:6px; background:var(--bg-3); border-radius:3px; cursor:pointer; position:relative; transition:height 0.12s; }}
-.timeline:hover {{ height:8px; }}
-.timeline-progress {{ height:100%; background:linear-gradient(90deg,var(--accent),var(--accent-hover)); border-radius:3px; width:0%; transition:width 0.08s; box-shadow:0 0 6px rgba(212,148,58,0.2); }}
-.timeline-markers {{ position:absolute; top:0; left:0; right:0; bottom:0; }}
-.timeline-marker {{ position:absolute; width:2px; height:100%; background:rgba(255,255,255,0.12); transform:translateX(-50%); }}
-.time-display {{ font-family:'JetBrains Mono',monospace; font-size:0.72rem; color:var(--text-2); min-width:105px; text-align:right; }}
+.player-nav .play-btn {{ background:var(--accent); border:none; color:var(--bg-0); width:36px; height:36px; border-radius:50%; font-weight:700; font-size:0.85rem; }}
+.player-nav .play-btn:hover {{ background:var(--accent-hover); transform:scale(1.08); box-shadow:0 0 20px rgba(96,165,250,0.3); }}
+.player-nav .play-btn:active {{ transform:scale(0.94); }}
+.step-display {{ font-family:'JetBrains Mono',monospace; font-size:0.72rem; color:var(--text-2); font-weight:500; min-width:90px; text-align:center; line-height:36px; font-variant-numeric:tabular-nums; }}
+.timeline {{ flex:1; height:4px; background:rgba(255,255,255,0.06); border-radius:2px; cursor:pointer; position:relative; transition:height 0.15s var(--ease); }}
+.timeline:hover {{ height:6px; }}
+.timeline-progress {{ height:100%; background:linear-gradient(90deg,var(--accent),var(--accent-hover)); border-radius:2px; width:0%; transition:width 0.06s linear; }}
+.timeline-markers {{ position:absolute; top:50%; left:0; right:0; transform:translateY(-50%); height:6px; }}
+.timeline-marker {{ position:absolute; width:3px; height:3px; border-radius:50%; background:rgba(255,255,255,0.18); transform:translateX(-50%); top:50%; margin-top:-1.5px; }}
+.time-display {{ font-family:'JetBrains Mono',monospace; font-size:0.72rem; color:var(--text-2); min-width:105px; text-align:right; font-variant-numeric:tabular-nums; }}
 .time-sep {{ color:var(--text-3); margin:0 2px; }}
 .player-secondary {{ display:flex; align-items:center; gap:14px; margin-top:8px; padding-top:8px; border-top:1px solid var(--border); }}
 .toggle {{ display:flex; align-items:center; gap:7px; cursor:pointer; user-select:none; }}
 .toggle input {{ display:none; }}
-.toggle-track {{ width:30px; height:16px; background:var(--bg-3); border:1px solid var(--border); border-radius:8px; position:relative; transition:all 0.15s; }}
-.toggle-track::after {{ content:''; width:10px; height:10px; background:var(--text-3); border-radius:50%; position:absolute; top:2px; left:2px; transition:all 0.15s; }}
-.toggle input:checked+.toggle-track {{ background:var(--accent-dim); border-color:var(--accent); }}
-.toggle input:checked+.toggle-track::after {{ background:var(--accent); left:16px; }}
+.toggle-track {{ width:28px; height:16px; background:var(--bg-3); border:1px solid rgba(255,255,255,0.06); border-radius:8px; position:relative; transition:all 0.2s var(--ease); }}
+.toggle-track::after {{ content:''; width:10px; height:10px; background:var(--text-3); border-radius:50%; position:absolute; top:2px; left:2px; transition:all 0.2s var(--ease); }}
+.toggle input:checked+.toggle-track {{ background:rgba(52,199,89,0.2); border-color:rgba(52,199,89,0.4); }}
+.toggle input:checked+.toggle-track::after {{ background:#34c759; left:16px; }}
 .toggle-label {{ font-size:0.72rem; color:var(--text-2); }}
 .audio-ctrl {{ display:flex; align-items:center; gap:6px; }}
 .audio-ctrl label {{ font-size:0.72rem; color:var(--text-2); }}
 .audio-ctrl input[type="range"] {{ width:70px; accent-color:var(--accent); }}
 .player-spacer {{ flex:1; }}
-.copy-btn {{ background:var(--bg-3); border:1px solid var(--border); color:var(--text-2); padding:3px 10px; border-radius:var(--radius-sm); cursor:pointer; font-size:0.65rem; font-family:'Outfit',sans-serif; text-transform:uppercase; letter-spacing:0.04em; font-weight:500; transition:all 0.12s; }}
-.copy-btn:hover {{ background:var(--bg-2); color:var(--text-1); }}
-.copy-btn.copied {{ background:var(--accent-dim); color:var(--accent); border-color:var(--accent); }}
+.copy-btn {{ background:transparent; border:1px solid transparent; color:var(--text-3); padding:4px 10px; border-radius:var(--radius-sm); cursor:pointer; font-size:0.65rem; font-family:'Outfit',sans-serif; text-transform:uppercase; letter-spacing:0.05em; font-weight:500; transition:all 0.15s var(--ease); }}
+.copy-btn:hover {{ background:rgba(255,255,255,0.04); border-color:var(--border-hi); color:var(--text-1); }}
+.copy-btn.copied {{ background:rgba(52,199,89,0.1); color:#34c759; border-color:rgba(52,199,89,0.3); }}
 .kbd-hint {{ font-size:0.6rem; color:var(--text-3); font-family:'JetBrains Mono',monospace; }}
+.kbd-hint kbd {{ display:inline-block; background:rgba(255,255,255,0.06); border:1px solid rgba(255,255,255,0.08); border-bottom-width:2px; border-radius:4px; padding:1px 5px; font-size:0.58rem; color:var(--text-2); font-family:inherit; line-height:1.4; }}
+
+*:focus {{ outline:none; }}
+*:focus-visible {{ outline:2px solid rgba(96,165,250,0.5); outline-offset:2px; }}
 
 @media (max-width:1100px) {{ .panel-left {{ width:210px; }} .panel-right {{ width:260px; }} }}
-@media (max-width:800px) {{ .app {{ flex-direction:column; }} .panel-left,.panel-right {{ width:100%; max-height:200px; }} .center {{ min-height:280px; }} }}
+@media (max-width:800px) {{ .app {{ flex-direction:column; }} .panel-left,.panel-right {{ width:100%; max-height:200px; border-radius:0; }} .center {{ min-height:280px; }} }}
+@media (prefers-reduced-motion:reduce) {{ *,*::before,*::after {{ animation-duration:0.01ms !important; transition-duration:0.01ms !important; }} }}
 </style>
 </head>
 <body>
@@ -509,34 +520,7 @@ body {{ font-family:'Outfit',-apple-system,BlinkMacSystemFont,sans-serif; backgr
             <canvas id="overlay-canvas"></canvas>
             <div class="frame-badge" id="frame-time">0:00.00</div>
         </div>
-    </main>
-    <aside class="panel-right">
-        <div class="ctx-header">
-            <span class="ctx-type" id="ctx-type">&mdash;</span>
-            <span class="ctx-time" id="ctx-time">0:00.00</span>
-        </div>
-        <div class="card" id="app-card">
-            <div class="card-label">Application</div>
-            <div class="card-body">
-                <div class="app-name" id="app-name">&mdash;</div>
-                <div class="app-window" id="app-window"></div>
-            </div>
-        </div>
-        <div class="card" id="element-card">
-            <div class="card-label">UI Element</div>
-            <div class="card-body" id="element-body"><span class="empty-msg">No element data</span></div>
-        </div>
-        <div class="card">
-            <div class="card-head">
-                <span class="card-label">Event Data</span>
-                <button class="copy-btn" id="copy-btn">Copy</button>
-            </div>
-            <div class="card-body" id="details-content"><span class="empty-msg">Select an event</span></div>
-        </div>
-        {transcript_html}
-    </aside>
-</div>
-<div class="player-bar">
+        <div class="player-bar">
     <div class="player-main">
         <div class="player-nav">
             <button id="btn-first" title="First (Home)">\u23EE</button>
@@ -565,8 +549,35 @@ body {{ font-family:'Outfit',-apple-system,BlinkMacSystemFont,sans-serif; backgr
         {audio_html}
         <div class="player-spacer"></div>
         <button class="copy-btn" id="copy-all-btn">Copy All</button>
-        <span class="kbd-hint">Space play &middot; \u2190 \u2192 step &middot; O overlay</span>
+        <span class="kbd-hint"><kbd>Space</kbd> play &middot; <kbd>\u2190</kbd> <kbd>\u2192</kbd> step &middot; <kbd>O</kbd> overlay</span>
     </div>
+</div>
+    </main>
+    <aside class="panel-right">
+        <div class="ctx-header">
+            <span class="ctx-type" id="ctx-type">&mdash;</span>
+            <span class="ctx-time" id="ctx-time">0:00.00</span>
+        </div>
+        <div class="card" id="app-card">
+            <div class="card-label">Application</div>
+            <div class="card-body">
+                <div class="app-name" id="app-name">&mdash;</div>
+                <div class="app-window" id="app-window"></div>
+            </div>
+        </div>
+        <div class="card" id="element-card">
+            <div class="card-label">UI Element</div>
+            <div class="card-body" id="element-body"><span class="empty-msg">No element data</span></div>
+        </div>
+        <div class="card">
+            <div class="card-head">
+                <span class="card-label">Event Data</span>
+                <button class="copy-btn" id="copy-btn">Copy</button>
+            </div>
+            <div class="card-body" id="details-content"><span class="empty-msg">Select an event</span></div>
+        </div>
+        {transcript_html}
+    </aside>
 </div>
 {"" if not audio_b64 else f'<audio id="audio" src="data:{audio_type};base64,{audio_b64}"></audio>'}
 <script>
@@ -673,6 +684,7 @@ function init(){{
         const mk=document.createElement('div');
         mk.className='timeline-marker';
         mk.style.left=(ev.time/duration*100)+'%';
+        mk.style.background=getTypeColor(ev.type);mk.style.opacity='0.5';
         timelineMarkers.appendChild(mk);
     }});
     events.forEach((ev,i)=>{{
@@ -845,18 +857,18 @@ function drawOverlay(ev){{
     const type=ev.type;
     if(type.includes('click')||type==='mouse.down'||type==='mouse.up'){{
         const x=oX+(ev.x*sX),y=oY+(ev.y*sY),r=20;
-        overlayCtx.beginPath();overlayCtx.arc(x,y,r+10,0,Math.PI*2);overlayCtx.fillStyle='rgba(255,100,100,0.3)';overlayCtx.fill();
-        overlayCtx.beginPath();overlayCtx.arc(x,y,r,0,Math.PI*2);overlayCtx.strokeStyle='#ef5350';overlayCtx.lineWidth=3;overlayCtx.stroke();
-        overlayCtx.beginPath();overlayCtx.arc(x,y,4,0,Math.PI*2);overlayCtx.fillStyle='#ef5350';overlayCtx.fill();
+        overlayCtx.beginPath();overlayCtx.arc(x,y,r+10,0,Math.PI*2);overlayCtx.fillStyle='rgba(244,114,182,0.3)';overlayCtx.fill();
+        overlayCtx.beginPath();overlayCtx.arc(x,y,r,0,Math.PI*2);overlayCtx.strokeStyle='#f472b6';overlayCtx.lineWidth=3;overlayCtx.stroke();
+        overlayCtx.beginPath();overlayCtx.arc(x,y,4,0,Math.PI*2);overlayCtx.fillStyle='#f472b6';overlayCtx.fill();
         overlayCtx.beginPath();
         overlayCtx.moveTo(x-r-5,y);overlayCtx.lineTo(x-r+10,y);
         overlayCtx.moveTo(x+r-10,y);overlayCtx.lineTo(x+r+5,y);
         overlayCtx.moveTo(x,y-r-5);overlayCtx.lineTo(x,y-r+10);
         overlayCtx.moveTo(x,y+r-10);overlayCtx.lineTo(x,y+r+5);
-        overlayCtx.strokeStyle='#ef5350';overlayCtx.lineWidth=2;overlayCtx.stroke();
+        overlayCtx.strokeStyle='#f472b6';overlayCtx.lineWidth=2;overlayCtx.stroke();
     }}else if(type.includes('drag')){{
         const sx=oX+(ev.x*sX),sy=oY+(ev.y*sY),ex=oX+((ev.x+ev.dx)*sX),ey=oY+((ev.y+ev.dy)*sY);
-        overlayCtx.strokeStyle='#4caf50';
+        overlayCtx.strokeStyle='#22d3ee';
         if(ev.path&&ev.path.length>1){{
             /* Variable-thickness polyline when pressure data exists */
             const minW=1,maxW=6;
@@ -872,65 +884,65 @@ function drawOverlay(ev){{
         }}else{{
             overlayCtx.beginPath();overlayCtx.moveTo(sx,sy);overlayCtx.lineTo(ex,ey);overlayCtx.lineWidth=3;overlayCtx.stroke();
         }}
-        overlayCtx.beginPath();overlayCtx.arc(sx,sy,8,0,Math.PI*2);overlayCtx.fillStyle='#4caf50';overlayCtx.fill();
+        overlayCtx.beginPath();overlayCtx.arc(sx,sy,8,0,Math.PI*2);overlayCtx.fillStyle='#22d3ee';overlayCtx.fill();
         const a=Math.atan2(ey-sy,ex-sx);
-        overlayCtx.beginPath();overlayCtx.moveTo(ex,ey);overlayCtx.lineTo(ex-15*Math.cos(a-0.4),ey-15*Math.sin(a-0.4));overlayCtx.lineTo(ex-15*Math.cos(a+0.4),ey-15*Math.sin(a+0.4));overlayCtx.closePath();overlayCtx.fillStyle='#4caf50';overlayCtx.fill();
+        overlayCtx.beginPath();overlayCtx.moveTo(ex,ey);overlayCtx.lineTo(ex-15*Math.cos(a-0.4),ey-15*Math.sin(a-0.4));overlayCtx.lineTo(ex-15*Math.cos(a+0.4),ey-15*Math.sin(a+0.4));overlayCtx.closePath();overlayCtx.fillStyle='#22d3ee';overlayCtx.fill();
     }}else if(type.includes('scroll')){{
         const x=oX+(ev.x*sX),y=oY+(ev.y*sY);
-        overlayCtx.beginPath();overlayCtx.arc(x,y,15,0,Math.PI*2);overlayCtx.strokeStyle='#ab47bc';overlayCtx.lineWidth=2;overlayCtx.stroke();
+        overlayCtx.beginPath();overlayCtx.arc(x,y,15,0,Math.PI*2);overlayCtx.strokeStyle='#a78bfa';overlayCtx.lineWidth=2;overlayCtx.stroke();
         const dy=ev.dy||0;
         if(dy!==0){{
             const aY=dy>0?-25:25;
-            overlayCtx.beginPath();overlayCtx.moveTo(x,y+aY);overlayCtx.lineTo(x-8,y+aY+(dy>0?10:-10));overlayCtx.lineTo(x+8,y+aY+(dy>0?10:-10));overlayCtx.closePath();overlayCtx.fillStyle='#ab47bc';overlayCtx.fill();
+            overlayCtx.beginPath();overlayCtx.moveTo(x,y+aY);overlayCtx.lineTo(x-8,y+aY+(dy>0?10:-10));overlayCtx.lineTo(x+8,y+aY+(dy>0?10:-10));overlayCtx.closePath();overlayCtx.fillStyle='#a78bfa';overlayCtx.fill();
         }}
     }}else if(type.includes('smart_magnify')){{
         const x=oX+(ev.x*sX),y=oY+(ev.y*sY);
         const r=25;
         /* Pulsing circle */
-        overlayCtx.beginPath();overlayCtx.arc(x,y,r+15,0,Math.PI*2);overlayCtx.strokeStyle='rgba(38,166,154,0.3)';overlayCtx.lineWidth=2;overlayCtx.stroke();
-        overlayCtx.beginPath();overlayCtx.arc(x,y,r,0,Math.PI*2);overlayCtx.strokeStyle='#26a69a';overlayCtx.lineWidth=3;overlayCtx.stroke();
+        overlayCtx.beginPath();overlayCtx.arc(x,y,r+15,0,Math.PI*2);overlayCtx.strokeStyle='rgba(34,211,238,0.3)';overlayCtx.lineWidth=2;overlayCtx.stroke();
+        overlayCtx.beginPath();overlayCtx.arc(x,y,r,0,Math.PI*2);overlayCtx.strokeStyle='#22d3ee';overlayCtx.lineWidth=3;overlayCtx.stroke();
         /* Crosshair */
         overlayCtx.beginPath();
         overlayCtx.moveTo(x-r-8,y);overlayCtx.lineTo(x-6,y);
         overlayCtx.moveTo(x+6,y);overlayCtx.lineTo(x+r+8,y);
         overlayCtx.moveTo(x,y-r-8);overlayCtx.lineTo(x,y-6);
         overlayCtx.moveTo(x,y+6);overlayCtx.lineTo(x,y+r+8);
-        overlayCtx.strokeStyle='#26a69a';overlayCtx.lineWidth=2;overlayCtx.stroke();
+        overlayCtx.strokeStyle='#22d3ee';overlayCtx.lineWidth=2;overlayCtx.stroke();
         /* Center dot */
-        overlayCtx.beginPath();overlayCtx.arc(x,y,4,0,Math.PI*2);overlayCtx.fillStyle='#26a69a';overlayCtx.fill();
+        overlayCtx.beginPath();overlayCtx.arc(x,y,4,0,Math.PI*2);overlayCtx.fillStyle='#22d3ee';overlayCtx.fill();
         /* Label */
-        overlayCtx.font='bold 13px sans-serif';overlayCtx.fillStyle='#26a69a';overlayCtx.fillText('Smart Zoom',x+r+12,y+5);
+        overlayCtx.font='bold 13px sans-serif';overlayCtx.fillStyle='#22d3ee';overlayCtx.fillText('Smart Zoom',x+r+12,y+5);
     }}else if(type.includes('magnify')){{
         const x=oX+(ev.x*sX),y=oY+(ev.y*sY);
         const mag=ev.magnification||0;
         const r1=20,r2=35,r3=50;
         const alpha=Math.min(Math.abs(mag)*3,0.6)+0.15;
-        overlayCtx.beginPath();overlayCtx.arc(x,y,r3,0,Math.PI*2);overlayCtx.strokeStyle=`rgba(0,188,212,${{alpha*0.5}})`;overlayCtx.lineWidth=2;overlayCtx.stroke();
-        overlayCtx.beginPath();overlayCtx.arc(x,y,r2,0,Math.PI*2);overlayCtx.strokeStyle=`rgba(0,188,212,${{alpha*0.7}})`;overlayCtx.lineWidth=2;overlayCtx.stroke();
-        overlayCtx.beginPath();overlayCtx.arc(x,y,r1,0,Math.PI*2);overlayCtx.strokeStyle='#00bcd4';overlayCtx.lineWidth=3;overlayCtx.stroke();
-        overlayCtx.beginPath();overlayCtx.arc(x,y,5,0,Math.PI*2);overlayCtx.fillStyle='#00bcd4';overlayCtx.fill();
+        overlayCtx.beginPath();overlayCtx.arc(x,y,r3,0,Math.PI*2);overlayCtx.strokeStyle=`rgba(34,211,238,${{alpha*0.5}})`;overlayCtx.lineWidth=2;overlayCtx.stroke();
+        overlayCtx.beginPath();overlayCtx.arc(x,y,r2,0,Math.PI*2);overlayCtx.strokeStyle=`rgba(34,211,238,${{alpha*0.7}})`;overlayCtx.lineWidth=2;overlayCtx.stroke();
+        overlayCtx.beginPath();overlayCtx.arc(x,y,r1,0,Math.PI*2);overlayCtx.strokeStyle='#22d3ee';overlayCtx.lineWidth=3;overlayCtx.stroke();
+        overlayCtx.beginPath();overlayCtx.arc(x,y,5,0,Math.PI*2);overlayCtx.fillStyle='#22d3ee';overlayCtx.fill();
         const sign=mag>=0?'+':'';
-        overlayCtx.font='bold 13px sans-serif';overlayCtx.fillStyle='#00bcd4';overlayCtx.fillText(sign+Math.round(mag*100)+'%',x+r3+5,y+5);
+        overlayCtx.font='bold 13px sans-serif';overlayCtx.fillStyle='#22d3ee';overlayCtx.fillText(sign+Math.round(mag*100)+'%',x+r3+5,y+5);
     }}else if(type.includes('rotate')){{
         const x=oX+(ev.x*sX),y=oY+(ev.y*sY);
         const rot=ev.rotation||0;
         const r=30;
         const startA=-Math.PI/2;
         const sweep=(rot/180)*Math.PI;
-        overlayCtx.beginPath();overlayCtx.arc(x,y,r,startA,startA+sweep,rot<0);overlayCtx.strokeStyle='#ff9800';overlayCtx.lineWidth=3;overlayCtx.stroke();
+        overlayCtx.beginPath();overlayCtx.arc(x,y,r,startA,startA+sweep,rot<0);overlayCtx.strokeStyle='#818cf8';overlayCtx.lineWidth=3;overlayCtx.stroke();
         const endA=startA+sweep;
         const ax=x+r*Math.cos(endA),ay=y+r*Math.sin(endA);
         const d=rot>=0?1:-1;
-        overlayCtx.beginPath();overlayCtx.moveTo(ax,ay);overlayCtx.lineTo(ax+10*Math.cos(endA+d*2.5),ay+10*Math.sin(endA+d*2.5));overlayCtx.lineTo(ax+10*Math.cos(endA-d*0.5),ay+10*Math.sin(endA-d*0.5));overlayCtx.closePath();overlayCtx.fillStyle='#ff9800';overlayCtx.fill();
-        overlayCtx.beginPath();overlayCtx.arc(x,y,4,0,Math.PI*2);overlayCtx.fillStyle='#ff9800';overlayCtx.fill();
-        overlayCtx.font='bold 13px sans-serif';overlayCtx.fillStyle='#ff9800';overlayCtx.fillText(Math.abs(Math.round(rot))+'\u00B0',x+r+10,y+5);
+        overlayCtx.beginPath();overlayCtx.moveTo(ax,ay);overlayCtx.lineTo(ax+10*Math.cos(endA+d*2.5),ay+10*Math.sin(endA+d*2.5));overlayCtx.lineTo(ax+10*Math.cos(endA-d*0.5),ay+10*Math.sin(endA-d*0.5));overlayCtx.closePath();overlayCtx.fillStyle='#818cf8';overlayCtx.fill();
+        overlayCtx.beginPath();overlayCtx.arc(x,y,4,0,Math.PI*2);overlayCtx.fillStyle='#818cf8';overlayCtx.fill();
+        overlayCtx.font='bold 13px sans-serif';overlayCtx.fillStyle='#818cf8';overlayCtx.fillText(Math.abs(Math.round(rot))+'\u00B0',x+r+10,y+5);
     }}else if(type.includes('type')||type==='key.special'||type==='key.down'||type==='key.up'){{
         const txt=ev.text||ev.keys||'';
         if(txt){{
             const bx=20,by=overlayCanvas.height-60,pad=10;
             overlayCtx.font='16px monospace';
             const tw=Math.min(overlayCtx.measureText(txt).width,300);
-            overlayCtx.fillStyle='rgba(66,165,245,0.9)';overlayCtx.beginPath();overlayCtx.roundRect(bx,by,tw+pad*2,36,8);overlayCtx.fill();
+            overlayCtx.fillStyle='rgba(96,165,250,0.9)';overlayCtx.beginPath();overlayCtx.roundRect(bx,by,tw+pad*2,36,8);overlayCtx.fill();
             overlayCtx.fillStyle='#fff';overlayCtx.fillText(txt.substring(0,30),bx+pad,by+24);
         }}
     }}

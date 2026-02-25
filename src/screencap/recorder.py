@@ -4,18 +4,30 @@ from __future__ import annotations
 
 import atexit
 import multiprocessing
+import os
+import shutil
 import signal
 import sys
+import threading
 import time
 import warnings
 from pathlib import Path
 
-from rich.console import Console
+from rich import box
+from rich.console import Console, Group
+from rich.live import Live
+from rich.panel import Panel
+from rich.text import Text
 
+from screencap import __version__
 from screencap.config import get_app_versions, get_audio_default, get_recordings_dir, get_wifi_metrics
 
 console = Console()
 
+
+# ---------------------------------------------------------------------------
+# Helpers
+# ---------------------------------------------------------------------------
 
 def _fmt_duration(seconds: float) -> str:
     m, s = divmod(int(seconds), 60)
@@ -25,16 +37,199 @@ def _fmt_duration(seconds: float) -> str:
     return f"{m}m {s}s"
 
 
+def _fmt_duration_clock(seconds: float) -> str:
+    """Format as HH:MM:SS for the live display."""
+    m, s = divmod(int(seconds), 60)
+    h, m = divmod(m, 60)
+    return f"{h:02d}:{m:02d}:{s:02d}"
+
+
 def _fmt_size(path: Path) -> str:
     if not path.exists():
         return "—"
     size = sum(f.stat().st_size for f in path.rglob("*") if f.is_file())
+    return _fmt_bytes(size)
+
+
+def _fmt_bytes(size: int) -> str:
     if size < 1024:
         return f"{size} B"
     if size < 1024 * 1024:
         return f"{size / 1024:.1f} KB"
     return f"{size / (1024 * 1024):.1f} MB"
 
+
+# ---------------------------------------------------------------------------
+# Banner
+# ---------------------------------------------------------------------------
+
+def _print_banner() -> None:
+    """Print the ASCII art startup banner."""
+    term_width = shutil.get_terminal_size((80, 24)).columns
+
+    if term_width < 78:
+        # Narrow terminal fallback
+        console.print(f"\n[bold #60a5fa]◉ ScreenCap[/bold #60a5fa] [dim #a78bfa]v{__version__}[/dim #a78bfa]\n")
+        return
+
+    try:
+        import pyfiglet
+        banner_text = pyfiglet.figlet_format("SCREENCAP", font="ansi_shadow")
+    except Exception:
+        console.print(f"\n[bold #60a5fa]◉ ScreenCap[/bold #60a5fa] [dim #a78bfa]v{__version__}[/dim #a78bfa]\n")
+        return
+
+    banner = Text(banner_text.rstrip(), style="bold #60a5fa")
+    console.print()
+    console.print(banner)
+    version_line = f"v{__version__}"
+    console.print(f"[#818cf8]{version_line:^{term_width}}[/#818cf8]")
+    console.print()
+
+
+# ---------------------------------------------------------------------------
+# Live recording display
+# ---------------------------------------------------------------------------
+
+def _build_live_display(name: str, elapsed: float, pulse_on: bool) -> Group:
+    """Build the Rich renderable for the live recording indicator."""
+    dot_style = "bold #f472b6" if pulse_on else "dim #f472b6"
+    timer = _fmt_duration_clock(elapsed)
+
+    line1 = Text()
+    line1.append(" ")
+    line1.append("●", style=dot_style)
+    line1.append(" REC  ", style="bold #f472b6")
+    line1.append(name, style="bold #f0f4ff")
+    # Right-align the timer
+    padding = max(1, 46 - len(name) - 12)
+    line1.append(" " * padding)
+    line1.append(timer, style="bold #f0f4ff")
+
+    line2 = Text()
+    line2.append(" Ctrl+C", style="#818cf8")
+    line2.append(" stop", style="dim")
+    line2.append("  ·  ", style="dim")
+    line2.append("Ctrl+C ×2", style="#818cf8")
+    line2.append(" force quit", style="dim")
+
+    content = Text()
+    content.append_text(line1)
+    content.append("\n\n")
+    content.append_text(line2)
+
+    panel = Panel(
+        content,
+        box=box.ROUNDED,
+        border_style="#f472b6",
+        padding=(1, 2),
+    )
+    # Wrap with a blank line on top as a buffer.  Rich's Live cleanup
+    # after Ctrl+C consistently misses the topmost rendered line (the
+    # terminal echoes ^C\n which shifts the cursor by 1, causing an
+    # off-by-one in Rich's line-erase count).  By making the topmost
+    # line blank, the missed line is invisible — not a red border.
+    return Group(Text(""), panel)
+
+
+# ---------------------------------------------------------------------------
+# Summary / end screen
+# ---------------------------------------------------------------------------
+
+def print_summary(name: str, capture_dir: Path, elapsed: float) -> None:
+    """Print the Vercel-style post-recording summary."""
+    console.print()
+    console.print("  [bold #22d3ee]✅ Recording complete[/bold #22d3ee]")
+    console.print()
+
+    # Stats with thick left border
+    stats: list[tuple[str, str]] = [
+        ("Name", name),
+        ("Duration", _fmt_duration(elapsed)),
+        ("Size", _fmt_size(capture_dir)),
+    ]
+
+    video = capture_dir / "video.mp4"
+    audio_file = capture_dir / "audio.flac"
+    if video.exists():
+        stats.append(("Video", _fmt_bytes(video.stat().st_size)))
+    if audio_file.exists():
+        stats.append(("Audio", _fmt_bytes(audio_file.stat().st_size)))
+
+    # Use ~ shorthand for home directory
+    location = str(capture_dir)
+    home = str(Path.home())
+    if location.startswith(home):
+        location = "~" + location[len(home):]
+    stats.append(("Location", location))
+
+    for label, value in stats:
+        console.print(f"  [dim #818cf8]┃[/dim #818cf8]  [#60a5fa]{label:<10}[/#60a5fa] {value}")
+
+    console.print()
+    console.print(f"  [#818cf8]{'━' * 52}[/#818cf8]")
+    console.print()
+    console.print("  [bold #f0f4ff]Next steps:[/bold #f0f4ff]")
+    console.print()
+
+    commands = [
+        (f"screencap view {name}", "Open in browser"),
+        (f"screencap scrub {name}", "Remove PII"),
+        (f"screencap export {name}", "Export as JSONL"),
+        (f"screencap upload {name}", "Upload to cloud"),
+        ("screencap list", "All recordings"),
+    ]
+    for cmd, desc in commands:
+        console.print(f"    [bold #22d3ee]{cmd:<38}[/bold #22d3ee] [dim]{desc}[/dim]")
+
+    console.print()
+
+
+# ---------------------------------------------------------------------------
+# Log suppression
+# ---------------------------------------------------------------------------
+
+def _suppress_output() -> None:
+    """Suppress noisy output from the recording pipeline.
+
+    Sets OA_LOG_LEVEL=ERROR env var so spawned child processes (which
+    re-import the module) pick up the higher threshold.  Also overrides
+    loguru directly in the current process (in case the module was already
+    imported before this function was called).  Disables tqdm as well.
+
+    We use ERROR (not WARNING) because the vendored code emits benign
+    WARNING messages during shutdown (screenshot failures, audio timeout)
+    that are expected and shouldn't clutter the user's terminal.
+    """
+    os.environ["OA_LOG_LEVEL"] = "ERROR"
+    os.environ["TQDM_DISABLE"] = "1"
+    # Override loguru directly in the main process — the env var only
+    # takes effect on fresh imports (child processes).  If openadapt_capture
+    # was already imported, loguru is already configured at INFO.
+    try:
+        from loguru import logger as _oa_logger
+        _oa_logger.remove()
+        _oa_logger.add(sys.stderr, level="ERROR")
+    except ImportError:
+        pass
+
+
+def _restore_output() -> None:
+    """Restore loguru and tqdm to defaults."""
+    os.environ.pop("OA_LOG_LEVEL", None)
+    os.environ.pop("TQDM_DISABLE", None)
+    # Re-configure loguru in this process back to INFO
+    try:
+        from loguru import logger as _oa_logger
+        _oa_logger.remove()
+        _oa_logger.add(sys.stderr, level="INFO")
+    except ImportError:
+        pass
+
+
+# ---------------------------------------------------------------------------
+# Main recording function
+# ---------------------------------------------------------------------------
 
 def start_recording(
     name: str,
@@ -48,7 +243,8 @@ def start_recording(
     capture_images: bool | None = None,
     capture_window_data: bool | None = None,
     capture_browser_events: bool | None = None,
-) -> Path:
+    verbose: bool = False,
+) -> tuple[Path, float]:
     """Start a screen capture recording. Blocks until Ctrl+C."""
     if audio is None:
         audio = get_audio_default()
@@ -91,6 +287,13 @@ def start_recording(
 
     capture_dir.mkdir(parents=True, exist_ok=True)
 
+    # Suppress loguru/tqdm noise unless --verbose.
+    # Must happen BEFORE any openadapt_capture import (including the
+    # screen-recording permission check below) so the env var is set
+    # when the module-level loguru config runs for the first time.
+    if not verbose:
+        _suppress_output()
+
     # Check macOS Screen Recording permission before starting
     if sys.platform == "darwin":
         try:
@@ -108,7 +311,11 @@ def start_recording(
 
     desc = description or ""
 
-    console.print(f"[dim]Audio: {'on' if audio else 'off'}[/dim]")
+    # --- Banner ---
+    _print_banner()
+
+    if verbose:
+        console.print(f"[dim]Audio: {'on' if audio else 'off'}[/dim]")
 
     t0 = time.time()
     status = console.status("[bold]Initializing capture...[/bold]")
@@ -130,7 +337,8 @@ def start_recording(
 
         save_metrics(capture_dir, "start", wifi_metrics=wifi_metrics, app_versions=app_versions)
     except Exception as e:
-        console.print(f"[yellow]Warning:[/yellow] Could not collect system metrics: {e}")
+        if verbose:
+            console.print(f"[yellow]Warning:[/yellow] Could not collect system metrics: {e}")
 
     def _cleanup_children():
         for child in multiprocessing.active_children():
@@ -138,10 +346,12 @@ def start_recording(
 
     atexit.register(_cleanup_children)
 
-    # Let KeyboardInterrupt propagate naturally into the Recorder.
-    # record() internally catches KeyboardInterrupt at line 1707 and
-    # sets terminate_processing, then joins all child processes.
-    # We just need to handle the interrupt that bubbles up to us.
+    # Track how stop happened for messaging after Live exits
+    _stop_reason = ""  # "graceful", "force", or "interrupt"
+    _stop_event = threading.Event()
+    _saved_stdout = None  # Will hold real stdout when we redirect to devnull
+    _saved_stderr = None  # Will hold real stderr when we redirect to devnull
+
     try:
         # Build Recorder kwargs, only passing non-None values
         recorder_kwargs: dict = {
@@ -173,19 +383,19 @@ def start_recording(
             ]
             write_pidfile(capture_dir, child_pids)
 
-            console.print(f'[bold red]Recording "[/bold red]{name}[bold red]"... Press Ctrl+C to stop.[/bold red]')
-
-            # Install a handler only for second Ctrl+C (force-kill)
+            # --- SIGINT handler (flag-based, no console.print inside) ---
             _ctrl_c_count = 0
 
             def _force_exit(sig, frame):
-                nonlocal _ctrl_c_count
+                nonlocal _ctrl_c_count, _stop_reason
                 _ctrl_c_count += 1
                 if _ctrl_c_count == 1:
-                    console.print("\n[dim]Stopping... (press Ctrl+C again to force quit)[/dim]")
+                    _stop_reason = "graceful"
+                    _stop_event.set()
                     recorder.stop()
                 else:
-                    console.print("\n[dim]Force quitting — terminating child processes...[/dim]")
+                    _stop_reason = "force"
+                    _stop_event.set()
                     for child in multiprocessing.active_children():
                         child.terminate()
                     time.sleep(1)
@@ -195,16 +405,82 @@ def start_recording(
 
             signal.signal(signal.SIGINT, _force_exit)
 
-            try:
-                while recorder.is_recording:
-                    time.sleep(0.5)
-            except KeyboardInterrupt:
-                console.print("\n[dim]Stopping recording...[/dim]")
-                recorder.stop()
+            # --- Live recording display ---
+            # We use transient=False and handle cleanup ourselves:
+            # on stop we replace the panel with the stop message via
+            # live.update().  Rich's normal render cycle overwrites
+            # every panel line (including borders) with the new content.
+            # transient=True has an off-by-one bug with Panel borders
+            # on signal interrupt, leaving the top border as a remnant.
+            with Live(
+                _build_live_display(name, 0.0, True),
+                console=console,
+                refresh_per_second=2,
+            ) as live:
+                try:
+                    while recorder.is_recording and not _stop_event.is_set():
+                        elapsed = time.time() - t0
+                        pulse_on = int(elapsed) % 2 == 0
+                        live.update(_build_live_display(name, elapsed, pulse_on))
+                        _stop_event.wait(0.5)
+                finally:
+                    # Replace the panel with the stop message.  Rich
+                    # knows the panel height and will overwrite every
+                    # line, including borders.  The message stays on
+                    # screen because transient=False (default).
+                    if _stop_reason == "graceful":
+                        live.update(Text("  ■ Stopping recording...", style="#a78bfa"))
+                    elif _stop_reason == "force":
+                        live.update(Text("  ⚡ Force quitting — terminating processes...", style="#f472b6"))
+                    else:
+                        live.update(Text(""))
+
+            # Suppress ALL output before Recorder.__exit__ runs:
+            # 1. Redirect stdout/stderr for print() calls (Recording Profile)
+            # 2. Remove loguru handlers — loguru caches the original stderr
+            #    file object, so sys.stderr = devnull doesn't stop it.
+            if not verbose:
+                try:
+                    from loguru import logger as _oa_logger
+                    _oa_logger.remove()
+                except Exception:
+                    pass
+                _saved_stdout = sys.stdout
+                _saved_stderr = sys.stderr
+                _devnull = open(os.devnull, "w")
+                sys.stdout = _devnull
+                sys.stderr = _devnull
 
     except KeyboardInterrupt:
-        console.print("\n[dim]Stopping recording...[/dim]")
+        _stop_reason = "interrupt"
+        console.print("  [dim]■ Stopping recording...[/dim]")
+        # Suppress profile block on interrupt path
+        if not verbose:
+            try:
+                from loguru import logger as _oa_logger
+                _oa_logger.remove()
+            except Exception:
+                pass
+            _saved_stdout = sys.stdout
+            _saved_stderr = sys.stderr
+            _devnull = open(os.devnull, "w")
+            sys.stdout = _devnull
+            sys.stderr = _devnull
     finally:
+        # Restore stdout/stderr if we redirected them
+        if _saved_stdout is not None:
+            try:
+                sys.stdout.close()
+            except Exception:
+                pass
+            sys.stdout = _saved_stdout
+        if _saved_stderr is not None:
+            try:
+                sys.stderr.close()
+            except Exception:
+                pass
+            sys.stderr = _saved_stderr
+
         status.stop()
         # Restore default handler
         signal.signal(signal.SIGINT, signal.default_int_handler)
@@ -218,31 +494,16 @@ def start_recording(
 
         save_metrics(capture_dir, "end", wifi_metrics=wifi_metrics, app_versions=app_versions)
     except Exception as e:
-        console.print(f"[yellow]Warning:[/yellow] Could not collect end metrics: {e}")
+        if verbose:
+            console.print(f"[yellow]Warning:[/yellow] Could not collect end metrics: {e}")
 
     elapsed = time.time() - t0
 
     # Auto-generate viewer.html — disabled (too slow, does N full video scans).
     # Run `screencap view <name>` to generate on demand instead.
-    # try:
-    #     from openadapt_capture import create_html
-    #
-    #     create_html(str(capture_dir), output=str(capture_dir / "viewer.html"))
-    #     console.print("[dim]Generated viewer.html[/dim]")
-    # except Exception as e:
-    #     console.print(f"[yellow]Warning:[/yellow] Could not generate viewer.html: {e}")
 
-    console.print(f"\n[bold green]Saved to {capture_dir}/[/bold green]")
-    console.print(f"   Duration: {_fmt_duration(elapsed)} | Size: {_fmt_size(capture_dir)}")
+    # Restore output if we suppressed it
+    if not verbose:
+        _restore_output()
 
-    video = capture_dir / "video.mp4"
-    audio_file = capture_dir / "audio.flac"
-    parts = []
-    if video.exists():
-        parts.append(f"Video: {_fmt_size(video)}")
-    if audio_file.exists():
-        parts.append(f"Audio: {_fmt_size(audio_file)}")
-    if parts:
-        console.print(f"   {' | '.join(parts)}")
-
-    return capture_dir
+    return capture_dir, elapsed
