@@ -460,7 +460,8 @@ def write_action_event(
     """
     assert event.type == "action", event
     crud.insert_action_event(db, recording, event.timestamp, event.data)
-    perf_q.put((event.type, event.timestamp, utils.get_timestamp()))
+    # disabled to increase perf
+    # perf_q.put((event.type, event.timestamp, utils.get_timestamp()))
 
 
 def write_screen_event(
@@ -487,7 +488,8 @@ def write_screen_event(
     else:
         event_data = {}
     crud.insert_screenshot(db, recording, event.timestamp, event_data)
-    perf_q.put((event.type, event.timestamp, utils.get_timestamp()))
+    # disabled to increase perf
+    # perf_q.put((event.type, event.timestamp, utils.get_timestamp()))
 
 
 def write_window_event(
@@ -506,7 +508,8 @@ def write_window_event(
     """
     assert event.type == "window", event
     crud.insert_window_event(db, recording, event.timestamp, event.data)
-    perf_q.put((event.type, event.timestamp, utils.get_timestamp()))
+    # disabled to increase perf
+    # perf_q.put((event.type, event.timestamp, utils.get_timestamp()))
 
 
 def write_browser_event(
@@ -525,7 +528,8 @@ def write_browser_event(
     """
     assert event.type == "browser", event
     crud.insert_browser_event(db, recording, event.timestamp, event.data)
-    perf_q.put((event.type, event.timestamp, utils.get_timestamp()))
+    # disabled to increase perf
+    # perf_q.put((event.type, event.timestamp, utils.get_timestamp()))
 
 
 @utils.trace(logger)
@@ -726,7 +730,8 @@ def write_video_event(
             last_pts,
             force_key_frame,
         )
-    perf_q.put((event.type, event.timestamp, utils.get_timestamp()))
+    # disabled to increase perf
+    # perf_q.put((event.type, event.timestamp, utils.get_timestamp()))
     return {
         **kwargs,
         **{
@@ -2113,35 +2118,37 @@ def record(
         task_by_name["audio_recorder"] = audio_recorder
 
     terminate_perf_event = multiprocessing.Event()
-    perf_stats_writer = multiprocessing.Process(
-        target=utils.WrapStdout(performance_stats_writer),
-        args=(
-            perf_q,
-            recording,
-            db_path,
-            terminate_perf_event,
-            task_started_events.setdefault(
-                "perf_stats_writer", multiprocessing.Event()
-            ),
-        ),
-    )
-    perf_stats_writer.start()
-    task_by_name["perf_stats_writer"] = perf_stats_writer
+    # disabled to increase perf
+    # perf_stats_writer = multiprocessing.Process(
+    #     target=utils.WrapStdout(performance_stats_writer),
+    #     args=(
+    #         perf_q,
+    #         recording,
+    #         db_path,
+    #         terminate_perf_event,
+    #         task_started_events.setdefault(
+    #             "perf_stats_writer", multiprocessing.Event()
+    #         ),
+    #     ),
+    # )
+    # perf_stats_writer.start()
+    # task_by_name["perf_stats_writer"] = perf_stats_writer
 
-    if config.PLOT_PERFORMANCE:
-        record_pid = os.getpid()
-        mem_writer = multiprocessing.Process(
-            target=utils.WrapStdout(memory_writer),
-            args=(
-                recording,
-                db_path,
-                terminate_perf_event,
-                record_pid,
-                task_started_events.setdefault("mem_writer", multiprocessing.Event()),
-            ),
-        )
-        mem_writer.start()
-        task_by_name["mem_writer"] = mem_writer
+    # disabled to increase perf
+    # if config.PLOT_PERFORMANCE:
+    #     record_pid = os.getpid()
+    #     mem_writer = multiprocessing.Process(
+    #         target=utils.WrapStdout(memory_writer),
+    #         args=(
+    #             recording,
+    #             db_path,
+    #             terminate_perf_event,
+    #             record_pid,
+    #             task_started_events.setdefault("mem_writer", multiprocessing.Event()),
+    #         ),
+    #     )
+    #     mem_writer.start()
+    #     task_by_name["mem_writer"] = mem_writer
 
     if log_memory:
         performance_snapshots = []
@@ -2224,23 +2231,25 @@ def record(
     )
 
     terminate_perf_event.set()
-    join_tasks(
-        [
-            "perf_stats_writer",
-            "mem_writer",
-        ]
-    )
+    # disabled to increase perf
+    # join_tasks(
+    #     [
+    #         "perf_stats_writer",
+    #         "mem_writer",
+    #     ]
+    # )
 
-    if config.PLOT_PERFORMANCE:
-        try:
-            from openadapt_capture import plotting
-
-            session = get_session_for_path(db_path)
-            plotting.plot_performance(
-                session, recording, save_dir=capture_dir,
-            )
-        except ImportError:
-            logger.warning("matplotlib not installed, skipping performance plot")
+    # disabled to increase perf
+    # if config.PLOT_PERFORMANCE:
+    #     try:
+    #         from openadapt_capture import plotting
+    #
+    #         session = get_session_for_path(db_path)
+    #         plotting.plot_performance(
+    #             session, recording, save_dir=capture_dir,
+    #         )
+    #     except ImportError:
+    #         logger.warning("matplotlib not installed, skipping performance plot")
 
     logger.info(f"Saved {recording_timestamp=}")
 
