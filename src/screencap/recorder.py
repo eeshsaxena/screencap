@@ -69,21 +69,21 @@ def _print_banner() -> None:
 
     if term_width < 78:
         # Narrow terminal fallback
-        console.print(f"\n[bold cyan]◉ ScreenCap[/bold cyan] [dim]v{__version__}[/dim]\n")
+        console.print(f"\n[bold #60a5fa]◉ ScreenCap[/bold #60a5fa] [dim #a78bfa]v{__version__}[/dim #a78bfa]\n")
         return
 
     try:
         import pyfiglet
         banner_text = pyfiglet.figlet_format("SCREENCAP", font="ansi_shadow")
     except Exception:
-        console.print(f"\n[bold cyan]◉ ScreenCap[/bold cyan] [dim]v{__version__}[/dim]\n")
+        console.print(f"\n[bold #60a5fa]◉ ScreenCap[/bold #60a5fa] [dim #a78bfa]v{__version__}[/dim #a78bfa]\n")
         return
 
-    banner = Text(banner_text.rstrip(), style="bold cyan")
+    banner = Text(banner_text.rstrip(), style="bold #60a5fa")
     console.print()
     console.print(banner)
     version_line = f"v{__version__}"
-    console.print(f"[dim]{version_line:^{term_width}}[/dim]")
+    console.print(f"[#818cf8]{version_line:^{term_width}}[/#818cf8]")
     console.print()
 
 
@@ -93,24 +93,24 @@ def _print_banner() -> None:
 
 def _build_live_display(name: str, elapsed: float, pulse_on: bool) -> Group:
     """Build the Rich renderable for the live recording indicator."""
-    dot_style = "bold red" if pulse_on else "dim red"
+    dot_style = "bold #f472b6" if pulse_on else "dim #f472b6"
     timer = _fmt_duration_clock(elapsed)
 
     line1 = Text()
     line1.append(" ")
     line1.append("●", style=dot_style)
-    line1.append(" REC  ", style="bold red")
-    line1.append(name, style="bold white")
+    line1.append(" REC  ", style="bold #f472b6")
+    line1.append(name, style="bold #f0f4ff")
     # Right-align the timer
     padding = max(1, 46 - len(name) - 12)
     line1.append(" " * padding)
-    line1.append(timer, style="bold white")
+    line1.append(timer, style="bold #f0f4ff")
 
     line2 = Text()
-    line2.append(" Ctrl+C", style="dim")
+    line2.append(" Ctrl+C", style="#818cf8")
     line2.append(" stop", style="dim")
     line2.append("  ·  ", style="dim")
-    line2.append("Ctrl+C ×2", style="dim")
+    line2.append("Ctrl+C ×2", style="#818cf8")
     line2.append(" force quit", style="dim")
 
     content = Text()
@@ -121,7 +121,7 @@ def _build_live_display(name: str, elapsed: float, pulse_on: bool) -> Group:
     panel = Panel(
         content,
         box=box.ROUNDED,
-        border_style="red",
+        border_style="#f472b6",
         padding=(1, 2),
     )
     # Wrap with a blank line on top as a buffer.  Rich's Live cleanup
@@ -139,7 +139,7 @@ def _build_live_display(name: str, elapsed: float, pulse_on: bool) -> Group:
 def print_summary(name: str, capture_dir: Path, elapsed: float) -> None:
     """Print the Vercel-style post-recording summary."""
     console.print()
-    console.print("  [bold green]✅ Recording complete[/bold green]")
+    console.print("  [bold #22d3ee]✅ Recording complete[/bold #22d3ee]")
     console.print()
 
     # Stats with thick left border
@@ -164,12 +164,12 @@ def print_summary(name: str, capture_dir: Path, elapsed: float) -> None:
     stats.append(("Location", location))
 
     for label, value in stats:
-        console.print(f"  [dim]┃[/dim]  [cyan]{label:<10}[/cyan] {value}")
+        console.print(f"  [dim #818cf8]┃[/dim #818cf8]  [#60a5fa]{label:<10}[/#60a5fa] {value}")
 
     console.print()
-    console.print(f"  [dim]{'━' * 52}[/dim]")
+    console.print(f"  [#818cf8]{'━' * 52}[/#818cf8]")
     console.print()
-    console.print("  [bold]Next steps:[/bold]")
+    console.print("  [bold #f0f4ff]Next steps:[/bold #f0f4ff]")
     console.print()
 
     commands = [
@@ -180,7 +180,7 @@ def print_summary(name: str, capture_dir: Path, elapsed: float) -> None:
         ("screencap list", "All recordings"),
     ]
     for cmd, desc in commands:
-        console.print(f"    [bold]{cmd:<38}[/bold] [dim]{desc}[/dim]")
+        console.print(f"    [bold #22d3ee]{cmd:<38}[/bold #22d3ee] [dim]{desc}[/dim]")
 
     console.print()
 
@@ -429,9 +429,9 @@ def start_recording(
                     # line, including borders.  The message stays on
                     # screen because transient=False (default).
                     if _stop_reason == "graceful":
-                        live.update(Text("  ■ Stopping recording...", style="dim"))
+                        live.update(Text("  ■ Stopping recording...", style="#a78bfa"))
                     elif _stop_reason == "force":
-                        live.update(Text("  ⚡ Force quitting — terminating processes...", style="yellow"))
+                        live.update(Text("  ⚡ Force quitting — terminating processes...", style="#f472b6"))
                     else:
                         live.update(Text(""))
 
