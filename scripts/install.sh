@@ -1,6 +1,6 @@
 #!/bin/sh
 # Install screencap CLI binary.
-# Usage: curl -sSf https://storage.googleapis.com/screencap-releases/releases/install.sh | sh
+# Usage: curl -sSfL https://get.screencap.sh | sh
 set -eu
 
 INSTALL_DIR="${HOME}/.screencap/bin"

@@ -1,6 +1,16 @@
 # ScreenCap
 
-macOS CLI for screen recording with built-in privacy scrubbing. Wraps [OpenAdapt](https://github.com/OpenAdaptAI) for capture and PII redaction.
+ScreenCap is a local-first macOS recorder for building high-quality demonstration data for automation and agent training. It captures screen, input, and context in one run, then lets you scrub sensitive data and export ML-ready events.
+
+Built on [OpenAdapt](https://github.com/OpenAdaptAI), ScreenCap is designed for teams who need more than video clips: reproducible recordings, structured interaction data, and a privacy-safe pipeline from capture to training.
+
+## What We Offer
+
+- **One-command capture workflow**: Start recording immediately with `screencap start`, then auto-transcribe and auto-name on stop.
+- **Privacy built in**: `screencap scrub` creates a scrubbed copy (screenshots + text fields + transcript) without mutating originals.
+- **ML-ready outputs**: Export processed interaction events to JSONL with `screencap export` for downstream training pipelines.
+- **Local-first by default**: Run from a standalone binary, keep recordings on disk, and use optional cloud sync only when needed.
+- **OpenAdapt-compatible data**: Recording artifacts and schema align with the broader OpenAdapt ecosystem.
 
 ## Requirements
 
@@ -14,7 +24,7 @@ macOS CLI for screen recording with built-in privacy scrubbing. Wraps [OpenAdapt
 ### Binary (recommended)
 
 ```bash
-curl -sSf https://storage.googleapis.com/screencap-releases/releases/install.sh | sh
+curl -sSfL https://get.screencap.sh | sh
 ```
 
 This installs a standalone binary to `~/.screencap/bin/`. No Python required.
@@ -24,7 +34,7 @@ To **upgrade**, run the same command — it overwrites the existing binary with 
 To install a specific version:
 
 ```bash
-curl -sSf https://storage.googleapis.com/screencap-releases/releases/install.sh | SCREENCAP_VERSION=0.2.0 sh
+curl -sSfL https://get.screencap.sh | SCREENCAP_VERSION=0.2.0 sh
 ```
 
 ### From source
