@@ -45,6 +45,7 @@ class EventType(str, Enum):
     MOUSE_DRAG = "mouse.drag"
     KEY_TYPE = "key.type"
     KEY_SHORTCUT = "key.shortcut"
+    KEY_SPECIAL = "key.special"
 
 
 class MouseButton(str, Enum):
@@ -329,7 +330,7 @@ class MouseDragEvent(BaseEvent):
     children: list[
         MouseDownEvent | MouseMoveEvent | MouseUpEvent
         | MouseScrollEvent | KeyDownEvent | KeyUpEvent | KeyTypeEvent
-        | KeyShortcutEvent
+        | KeyShortcutEvent | SpecialKeyEvent
         | MouseMagnifyEvent | MouseRotateEvent | MouseSmartMagnifyEvent
     ] = Field(
         default_factory=list, description="Child events that were merged"
@@ -376,6 +377,31 @@ class KeyShortcutEvent(BaseEvent):
         return "+".join(k.title() for k in self.keys[:-1]) + "+" + self.keys[-1]
 
 
+class SpecialKeyEvent(BaseEvent):
+    """Non-printable, non-modifier key event (media, function, etc.).
+
+    Created by merge_consecutive_keyboard_events() when adjacent
+    key-down/key-up pairs are detected for special keys.
+
+    Example: Play/Pause → key_name="media_play_pause", text="Play/Pause"
+    Example: F5 → key_name="f5", text="F5"
+    """
+
+    type: Literal[EventType.KEY_SPECIAL] = EventType.KEY_SPECIAL
+    key_name: str = Field(description="Canonical key name, e.g. 'media_play_pause', 'f5'")
+    children: list[KeyDownEvent | KeyUpEvent] = Field(default_factory=list)
+
+    @computed_field
+    @property
+    def text(self) -> str:
+        """Human-readable display name."""
+        if self.key_name.startswith("media_"):
+            return self.key_name.removeprefix("media_").replace("_", "/").title()
+        if self.key_name.startswith("brightness_"):
+            return self.key_name.replace("_", " ").title()
+        return self.key_name.upper()
+
+
 # =============================================================================
 # Union type for all events
 # =============================================================================
@@ -395,6 +421,7 @@ ActionEvent = (
     | MouseDragEvent
     | KeyTypeEvent
     | KeyShortcutEvent
+    | SpecialKeyEvent
 )
 
 ScreenEvent = ScreenFrameEvent

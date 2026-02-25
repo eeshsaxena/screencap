@@ -25,6 +25,7 @@ from openadapt_capture.events import (
     MouseScrollEvent,
     MouseSmartMagnifyEvent,
     MouseUpEvent,
+    SpecialKeyEvent,
 )
 from openadapt_capture.processing import process_events
 
@@ -176,6 +177,8 @@ class Action:
         """Typed text for keyboard actions."""
         if isinstance(self.event, KeyShortcutEvent):
             return self.event.text
+        if isinstance(self.event, SpecialKeyEvent):
+            return self.event.text
         if isinstance(self.event, KeyTypeEvent):
             return self.event.text
         return None
@@ -186,9 +189,12 @@ class Action:
 
         Returns list of key names like ['ctrl', 'space'] or ['enter'].
         For KeyShortcutEvent, returns the canonical keys list directly.
+        For SpecialKeyEvent, returns [key_name].
         """
         if isinstance(self.event, KeyShortcutEvent):
             return self.event.keys
+        if isinstance(self.event, SpecialKeyEvent):
+            return [self.event.key_name]
         if isinstance(self.event, KeyTypeEvent):
             key_names = []
             seen = set()
