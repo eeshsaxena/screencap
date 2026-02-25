@@ -366,12 +366,16 @@ def _generate_html(
 <link href="https://fonts.googleapis.com/css2?family=Outfit:wght@300;400;500;600;700&family=JetBrains+Mono:wght@400;500&display=swap" rel="stylesheet">
 <style>
 :root {{
-    --bg-0:#08090b; --bg-1:#111318; --bg-sidebar:#13151c; --bg-2:#191b22; --bg-3:#23252e;
+    --bg-0:#080c1c; --bg-1:#0b1121; --bg-sidebar:#090e1e; --bg-2:#111827; --bg-3:#1e293b;
     --border:rgba(255,255,255,0.06); --border-hi:rgba(255,255,255,0.12);
-    --text-1:#eeeef0; --text-2:#9ea0ad; --text-3:#686a7a;
-    --accent:#d4943a; --accent-dim:rgba(212,148,58,0.12); --accent-hover:#e0a448;
-    --ev-click:#ef5350; --ev-drag:#4caf50; --ev-scroll:#ab47bc; --ev-type:#42a5f5; --ev-move:#717380; --ev-magnify:#00bcd4; --ev-rotate:#ff9800; --ev-smart-magnify:#26a69a;
-    --radius:10px; --radius-sm:6px;
+    --text-1:#f0f4ff; --text-2:rgba(210,225,255,0.7); --text-3:rgba(170,195,235,0.55);
+    --accent:#60a5fa; --accent-dim:rgba(96,165,250,0.14); --accent-hover:#3b82f6;
+    --ev-click:#f472b6; --ev-drag:#22d3ee; --ev-scroll:#a78bfa; --ev-type:#60a5fa; --ev-move:rgba(170,195,235,0.4); --ev-magnify:#22d3ee; --ev-rotate:#818cf8; --ev-smart-magnify:#22d3ee;
+    --glass-bg:rgba(255,255,255,0.07); --glass-border:rgba(255,255,255,0.12); --glass-bg-hover:rgba(255,255,255,0.11);
+    --accent-cyan:#22d3ee; --accent-cyan-dim:rgba(34,211,238,0.12); --accent-indigo:#818cf8; --accent-indigo-dim:rgba(129,140,248,0.12); --accent-violet:#a78bfa; --accent-violet-dim:rgba(167,139,250,0.1); --accent-rose:#f472b6; --accent-rose-dim:rgba(244,114,182,0.1);
+    --radius:12px; --radius-sm:8px; --radius-lg:16px;
+    --shadow-1:0 2px 16px rgba(0,0,0,0.4); --shadow-2:0 4px 24px rgba(0,0,0,0.5),0 0 0 1px rgba(255,255,255,0.03);
+    --ease:cubic-bezier(0.22,1,0.36,1);
 }}
 *{{ box-sizing:border-box; margin:0; padding:0; }}
 body {{ font-family:'Outfit',-apple-system,BlinkMacSystemFont,sans-serif; background:var(--bg-0); color:var(--text-1); height:100vh; overflow:hidden; display:flex; flex-direction:column; line-height:1.5; }}
