@@ -19,7 +19,7 @@ dependencies = [
 
 [project.optional-dependencies]
 record = [
-    # openadapt-capture dependencies
+    # screencap-engine dependencies
     "pydantic>=2.0.0",
     "pynput>=1.7.0",
     "av>=10.0.0",
@@ -56,7 +56,7 @@ dev = [
 screencap = "screencap.cli:cli"
 
 [tool.setuptools.packages.find]
-where = ["src", "packages/openadapt-capture"]
+where = ["src", "packages/screencap-engine"]
 
 [tool.pytest.ini_options]
 testpaths = ["tests"]

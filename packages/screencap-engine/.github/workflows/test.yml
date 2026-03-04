@@ -53,4 +53,4 @@ jobs:
         run: uv sync --extra dev
 
       - name: Run ruff
-        run: uv run ruff check openadapt_capture/
+        run: uv run ruff check sc_engine/

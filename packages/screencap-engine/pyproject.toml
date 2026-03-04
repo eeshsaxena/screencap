@@ -1,5 +1,5 @@
 [project]
-name = "openadapt-capture"
+name = "screencap-engine"
 version = "0.3.0"
 description = "GUI interaction capture - platform-agnostic event streams with time-aligned media"
 readme = "README.md"
@@ -29,11 +29,9 @@ dependencies = [
     "mss>=6.0.0",
     "sounddevice>=0.5.3",
     "soundfile>=0.13.1",
-    # Note: openai-whisper moved to optional [transcribe] extra due to Python version conflicts
     "pydantic-settings>=2.12.0",
     "openai>=2.11.0",
     "websockets>=12.0",
-    # Legacy recording dependencies (matching OpenAdapt record.py)
     "sqlalchemy>=2.0.0",
     "alembic>=1.0.0",
     "loguru>=0.7.0",
@@ -62,7 +60,7 @@ transcribe = [
 
 # Everything
 all = [
-    "openadapt-capture[transcribe-fast,transcribe]",
+    "screencap-engine[transcribe-fast,transcribe]",
 ]
 
 dev = [
@@ -76,18 +74,18 @@ dev = [
 ]
 
 [project.scripts]
-capture = "openadapt_capture.cli:main"
+capture = "sc_engine.cli:main"
 
 [project.urls]
-Homepage = "https://github.com/OpenAdaptAI/openadapt-capture"
-Repository = "https://github.com/OpenAdaptAI/openadapt-capture"
+Homepage = "https://github.com/Divide-By-0/screencap"
+Repository = "https://github.com/Divide-By-0/screencap"
 
 [build-system]
 requires = ["hatchling"]
 build-backend = "hatchling.build"
 
 [tool.hatch.build.targets.wheel]
-packages = ["openadapt_capture"]
+packages = ["sc_engine"]
 
 [tool.ruff]
 line-length = 100
@@ -118,13 +116,13 @@ minor_tags = ["feat"]
 patch_tags = ["fix", "perf"]
 
 [tool.uv.sources]
-openadapt-capture = { workspace = true }
+screencap-engine = { workspace = true }
 
 [dependency-groups]
 dev = [
     "matplotlib>=3.10.8",
     "numpy>=2.2.6",
-    "openadapt-capture",
+    "screencap-engine",
     "psutil>=7.2.2",
     "pytest>=9.0.2",
 ]
