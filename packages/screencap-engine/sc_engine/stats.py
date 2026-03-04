@@ -185,7 +185,7 @@ def plot_capture_performance(
     Returns:
         PIL Image if neither output_path nor show.
     """
-    from openadapt_capture.storage import load_capture
+    from sc_engine.storage import load_capture
 
     capture, storage = load_capture(capture_dir)
 

@@ -113,8 +113,8 @@ def test_codec(
     Returns:
         CodecResult with metrics.
     """
-    from openadapt_capture.comparison import compute_psnr
-    from openadapt_capture.video import VideoWriter, extract_frames
+    from sc_engine.comparison import compute_psnr
+    from sc_engine.video import VideoWriter, extract_frames
 
     video_path = output_dir / f"test_{codec}.mp4"
     width, height = frames[0].size

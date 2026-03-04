@@ -7,8 +7,8 @@ import av
 import pytest
 from PIL import Image
 
-from openadapt_capture import utils
-from openadapt_capture.video import (
+from sc_engine import utils
+from sc_engine.video import (
     initialize_video_writer,
     write_video_frame,
 )

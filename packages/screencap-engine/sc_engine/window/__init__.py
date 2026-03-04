@@ -8,7 +8,7 @@ from typing import Any
 
 from loguru import logger
 
-from openadapt_capture.config import config
+from sc_engine.config import config
 
 impl = None
 try:

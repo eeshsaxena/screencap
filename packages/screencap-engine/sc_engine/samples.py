@@ -4,7 +4,7 @@ This module provides access to bundled example recordings that can be used
 for testing, demos, and as reference implementations.
 
 Example usage:
-    >>> from openadapt_capture.samples import list_examples, load_example
+    >>> from sc_engine.samples import list_examples, load_example
     >>> print(list_examples())
     ['turn-off-nightshift']
     >>> capture = load_example('turn-off-nightshift')
@@ -19,7 +19,7 @@ from pathlib import Path
 from typing import TYPE_CHECKING, Optional
 
 if TYPE_CHECKING:
-    from openadapt_capture.capture import CaptureSession
+    from sc_engine.capture import CaptureSession
 
 logger = logging.getLogger(__name__)
 
@@ -141,7 +141,7 @@ def load_example(name: str = DEFAULT_EXAMPLE) -> "CaptureSession":
         >>> for action in capture.actions():
         ...     print(f"{action.type}: {action.x}, {action.y}")
     """
-    from openadapt_capture.capture import CaptureSession
+    from sc_engine.capture import CaptureSession
 
     example_path = get_example_path(name)
     return CaptureSession.load(example_path)

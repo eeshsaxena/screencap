@@ -5,7 +5,7 @@ adaptation for per-capture databases.
 
 Usage:
 
-    $ python -m openadapt_capture.recorder "<description of task>"
+    $ python -m sc_engine.recorder "<description of task>"
 
 """
 
@@ -32,12 +32,12 @@ from pympler import tracker
 from pynput import keyboard, mouse
 from tqdm import tqdm
 
-from openadapt_capture import utils, video, window
-from openadapt_capture.ax_cache import AXQueryCache
-from openadapt_capture.config import config
-from openadapt_capture.db import create_db, crud, get_session_for_path
-from openadapt_capture.db.models import ActionEvent, Recording
-from openadapt_capture.extensions import synchronized_queue as sq
+from sc_engine import utils, video, window
+from sc_engine.ax_cache import AXQueryCache
+from sc_engine.config import config
+from sc_engine.db import create_db, crud, get_session_for_path
+from sc_engine.db.models import ActionEvent, Recording
+from sc_engine.extensions import synchronized_queue as sq
 
 try:
     import soundfile
@@ -1162,7 +1162,7 @@ def create_recording(
     os.makedirs(capture_dir, exist_ok=True)
     db_path = os.path.join(capture_dir, "recording.db")
 
-    from openadapt_capture.platform import get_display_pixel_ratio
+    from sc_engine.platform import get_display_pixel_ratio
 
     timestamp = utils.set_start_time()
     monitor_width, monitor_height = utils.get_monitor_dims()
@@ -2242,7 +2242,7 @@ def record(
     # disabled to increase perf
     # if config.PLOT_PERFORMANCE:
     #     try:
-    #         from openadapt_capture import plotting
+    #         from sc_engine import plotting
     #
     #         session = get_session_for_path(db_path)
     #         plotting.plot_performance(
@@ -2385,7 +2385,7 @@ class Recorder:
     ) -> None:
         from pathlib import Path
 
-        from openadapt_capture.config import RecordingConfig
+        from sc_engine.config import RecordingConfig
 
         self.capture_dir = str(Path(capture_dir).resolve())
         self.task_description = task_description
@@ -2446,7 +2446,7 @@ class Recorder:
 
     def _run_record(self) -> None:
         """Thread target: apply config overrides, then call record()."""
-        from openadapt_capture.config import config_override
+        from sc_engine.config import config_override
 
         with config_override(self._recording_config):
             record(
@@ -2538,7 +2538,7 @@ class Recorder:
         """
         if self._capture is None and not self.is_recording:
             try:
-                from openadapt_capture.capture import CaptureSession
+                from sc_engine.capture import CaptureSession
 
                 self._capture = CaptureSession.load(self.capture_dir)
             except FileNotFoundError:

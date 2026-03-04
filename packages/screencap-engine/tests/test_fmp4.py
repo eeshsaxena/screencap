@@ -11,7 +11,7 @@ import time
 import av
 import pytest
 
-from openadapt_capture.video import (
+from sc_engine.video import (
     _FRAG_MP4_OPTIONS,
     _is_fragmented_mp4,
     extract_frames,
@@ -241,7 +241,7 @@ class TestGetVideoInfoDuration:
             close=real_container.close,
         )
 
-        with patch("openadapt_capture.video.av.open", return_value=fake_container):
+        with patch("sc_engine.video.av.open", return_value=fake_container):
             info = get_video_info(str(path))
 
         assert info["duration"] is not None

@@ -25,11 +25,11 @@ from pathlib import Path
 import psutil
 import pytest
 
-from openadapt_capture.capture import CaptureSession
+from sc_engine.capture import CaptureSession
 
 # Recorder requires pynput which needs a display server
 try:
-    from openadapt_capture.recorder import Recorder
+    from sc_engine.recorder import Recorder
 except ImportError:
     Recorder = None
 

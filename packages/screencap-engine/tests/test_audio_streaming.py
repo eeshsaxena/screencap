@@ -217,15 +217,15 @@ class TestRecordAudioIntegration:
 
         return mock_stream
 
-    @patch("openadapt_capture.recorder.crud")
-    @patch("openadapt_capture.recorder.get_session_for_path")
-    @patch("openadapt_capture.recorder.utils")
+    @patch("sc_engine.recorder.crud")
+    @patch("sc_engine.recorder.get_session_for_path")
+    @patch("sc_engine.recorder.utils")
     def test_record_audio_produces_valid_flac(
         self, mock_utils, mock_get_session, mock_crud, tmp_path,
     ):
         """Full record_audio() with mocked sounddevice produces valid FLAC."""
-        from openadapt_capture.recorder import record_audio
-        from openadapt_capture.db.models import Recording
+        from sc_engine.recorder import record_audio
+        from sc_engine.db.models import Recording
 
         mock_utils.set_start_time = MagicMock()
         mock_utils.get_timestamp.return_value = 1000.0
@@ -273,15 +273,15 @@ class TestRecordAudioIntegration:
         # Args are now: (session, recording, start_timestamp, SAMPLERATE, [])
         assert call_args[0][4] == []  # word_list
 
-    @patch("openadapt_capture.recorder.crud")
-    @patch("openadapt_capture.recorder.get_session_for_path")
-    @patch("openadapt_capture.recorder.utils")
+    @patch("sc_engine.recorder.crud")
+    @patch("sc_engine.recorder.get_session_for_path")
+    @patch("sc_engine.recorder.utils")
     def test_record_audio_short_recording(
         self, mock_utils, mock_get_session, mock_crud, tmp_path,
     ):
         """Short recording (< flush interval) — all frames in final flush."""
-        from openadapt_capture.recorder import record_audio
-        from openadapt_capture.db.models import Recording
+        from sc_engine.recorder import record_audio
+        from sc_engine.db.models import Recording
 
         mock_utils.set_start_time = MagicMock()
         mock_utils.get_timestamp.return_value = 1000.0
@@ -314,15 +314,15 @@ class TestRecordAudioIntegration:
         assert info.frames > 0
         assert info.duration < 30  # well under flush interval
 
-    @patch("openadapt_capture.recorder.crud")
-    @patch("openadapt_capture.recorder.get_session_for_path")
-    @patch("openadapt_capture.recorder.utils")
+    @patch("sc_engine.recorder.crud")
+    @patch("sc_engine.recorder.get_session_for_path")
+    @patch("sc_engine.recorder.utils")
     def test_record_audio_immediate_stop(
         self, mock_utils, mock_get_session, mock_crud, tmp_path,
     ):
         """Immediate stop — produces empty FLAC, skips DB insert."""
-        from openadapt_capture.recorder import record_audio
-        from openadapt_capture.db.models import Recording
+        from sc_engine.recorder import record_audio
+        from sc_engine.db.models import Recording
 
         mock_utils.set_start_time = MagicMock()
         mock_utils.get_timestamp.return_value = 1000.0
@@ -358,15 +358,15 @@ class TestRecordAudioIntegration:
         # insert_audio_info should NOT have been called
         mock_crud.insert_audio_info.assert_not_called()
 
-    @patch("openadapt_capture.recorder.crud")
-    @patch("openadapt_capture.recorder.get_session_for_path")
-    @patch("openadapt_capture.recorder.utils")
+    @patch("sc_engine.recorder.crud")
+    @patch("sc_engine.recorder.get_session_for_path")
+    @patch("sc_engine.recorder.utils")
     def test_duration_matches_expected(
         self, mock_utils, mock_get_session, mock_crud, tmp_path,
     ):
         """Recorded duration approximately matches mock stream duration."""
-        from openadapt_capture.recorder import record_audio
-        from openadapt_capture.db.models import Recording
+        from sc_engine.recorder import record_audio
+        from sc_engine.db.models import Recording
 
         mock_utils.set_start_time = MagicMock()
         mock_utils.get_timestamp.return_value = 1000.0

@@ -9,12 +9,12 @@ from pathlib import Path
 
 import pytest
 
-from openadapt_capture.capture import Capture
-from openadapt_capture.db import create_db, crud
+from sc_engine.capture import Capture
+from sc_engine.db import create_db, crud
 
 # Recorder requires pynput which needs a display server
 try:
-    from openadapt_capture.recorder import Recorder
+    from sc_engine.recorder import Recorder
 except ImportError:
     Recorder = None
 
@@ -403,7 +403,7 @@ class TestCaptureEdgeCases:
         })
 
         # Disable the second event directly in the DB
-        from openadapt_capture.db.models import ActionEvent
+        from sc_engine.db.models import ActionEvent
         disabled_event = session.query(ActionEvent).filter(
             ActionEvent.mouse_x == 70.0
         ).first()
@@ -539,7 +539,7 @@ class TestPixelRatio:
         }
         crud.insert_recording(session, recording_data)
 
-        from openadapt_capture.visualize.html import create_html
+        from sc_engine.visualize.html import create_html
         html = create_html(capture_path)
         assert "const pixelRatio=2.0;" in html
 
@@ -549,7 +549,7 @@ class TestRecordingConfig:
 
     def test_config_override_applies_and_restores(self):
         """Test that config_override patches and restores config."""
-        from openadapt_capture.config import (
+        from sc_engine.config import (
             RecordingConfig,
             config,
             config_override,
@@ -569,7 +569,7 @@ class TestRecordingConfig:
 
     def test_config_override_none_values_unchanged(self):
         """Test that None values in RecordingConfig don't change config."""
-        from openadapt_capture.config import (
+        from sc_engine.config import (
             RecordingConfig,
             config,
             config_override,
@@ -582,7 +582,7 @@ class TestRecordingConfig:
 
     def test_config_override_restores_on_exception(self):
         """Test that config is restored even if body raises."""
-        from openadapt_capture.config import (
+        from sc_engine.config import (
             RecordingConfig,
             config,
             config_override,

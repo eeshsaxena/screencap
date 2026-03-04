@@ -83,7 +83,7 @@ def generate_synthetic_input(duration, stop_event):
 
 
 def main():
-    from openadapt_capture.recorder import Recorder
+    from sc_engine.recorder import Recorder
 
     capture_dir = Path("/tmp/openadapt_perf_test")
     if capture_dir.exists():
@@ -189,7 +189,7 @@ def main():
     # Try loading the capture
     print("Loading capture...")
     try:
-        from openadapt_capture.capture import CaptureSession
+        from sc_engine.capture import CaptureSession
         capture = CaptureSession.load(str(capture_dir))
         actions = list(capture.actions())
         raw = capture.raw_events()

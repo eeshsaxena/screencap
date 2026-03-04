@@ -57,13 +57,13 @@ def get_platform_provider() -> "PlatformProvider":
     platform = get_platform()
 
     if platform == "darwin":
-        from openadapt_capture.platform.darwin import DarwinPlatform
+        from sc_engine.platform.darwin import DarwinPlatform
         return DarwinPlatform()
     elif platform == "win32":
-        from openadapt_capture.platform.windows import WindowsPlatform
+        from sc_engine.platform.windows import WindowsPlatform
         return WindowsPlatform()
     elif platform.startswith("linux"):
-        from openadapt_capture.platform.linux import LinuxPlatform
+        from sc_engine.platform.linux import LinuxPlatform
         return LinuxPlatform()
     else:
         raise NotImplementedError(f"Platform not supported: {platform}")

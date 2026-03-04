@@ -14,7 +14,7 @@ from pathlib import Path
 import pytest
 import sqlalchemy as sa
 
-from openadapt_capture.events import (
+from sc_engine.events import (
     MouseButton,
     MouseClickEvent,
     MouseDoubleClickEvent,
@@ -23,7 +23,7 @@ from openadapt_capture.events import (
     MouseMoveEvent,
     MouseUpEvent,
 )
-from openadapt_capture.processing import (
+from sc_engine.processing import (
     detect_drag_events,
     merge_consecutive_mouse_click_events,
     merge_consecutive_mouse_move_events,
@@ -132,8 +132,8 @@ class TestPressureDB:
     @pytest.fixture
     def db_session(self):
         """Create a temporary in-memory DB with the ActionEvent schema."""
-        from openadapt_capture.db import Base
-        from openadapt_capture.db.models import ActionEvent, Recording
+        from sc_engine.db import Base
+        from sc_engine.db.models import ActionEvent, Recording
 
         engine = sa.create_engine("sqlite:///:memory:")
         Base.metadata.create_all(engine)
@@ -144,14 +144,14 @@ class TestPressureDB:
 
     def test_mouse_pressure_column_exists(self, db_session):
         """New recordings have mouse_pressure column in action_event table."""
-        from openadapt_capture.db.models import ActionEvent
+        from sc_engine.db.models import ActionEvent
 
         columns = {c.name for c in ActionEvent.__table__.columns}
         assert "mouse_pressure" in columns
 
     def test_insert_with_pressure(self, db_session):
         """Insert event with mouse_pressure, read back, verify value."""
-        from openadapt_capture.db.models import ActionEvent, Recording
+        from sc_engine.db.models import ActionEvent, Recording
 
         rec = Recording(
             id=1, timestamp=1000.0, monitor_width=1920, monitor_height=1080
@@ -176,7 +176,7 @@ class TestPressureDB:
 
     def test_insert_without_pressure(self, db_session):
         """Insert event without mouse_pressure, read back, verify None."""
-        from openadapt_capture.db.models import ActionEvent, Recording
+        from sc_engine.db.models import ActionEvent, Recording
 
         rec = Recording(
             id=1, timestamp=1000.0, monitor_width=1920, monitor_height=1080
@@ -200,8 +200,8 @@ class TestPressureDB:
 
     def test_crud_insert_accepts_mouse_pressure(self, db_session):
         """crud._insert() accepts mouse_pressure key without assertion failure."""
-        from openadapt_capture.db.crud import _insert
-        from openadapt_capture.db.models import ActionEvent
+        from sc_engine.db.crud import _insert
+        from sc_engine.db.models import ActionEvent
 
         event_data = {
             "name": "move",

@@ -11,7 +11,7 @@ import sqlalchemy as sa
 from loguru import logger
 from sqlalchemy.orm import Session as SaSession
 
-from openadapt_capture.db.models import (
+from sc_engine.db.models import (
     ActionEvent,
     AudioInfo,
     BrowserEvent,

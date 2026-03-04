@@ -14,7 +14,7 @@ from typing import Any, Iterator
 
 from pydantic import BaseModel, Field
 
-from openadapt_capture.events import (
+from sc_engine.events import (
     AudioChunkEvent,
     Event,
     EventType,

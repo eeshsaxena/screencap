@@ -25,7 +25,7 @@ def run_capture(duration: float, capture_dir: Path) -> None:
         duration: Capture duration in seconds.
         capture_dir: Directory to save capture.
     """
-    from openadapt_capture import Recorder
+    from sc_engine import Recorder
 
     print(f"Starting {duration}s capture...")
     print("Move your mouse, click, and type to generate events!")
@@ -55,7 +55,7 @@ def generate_demo_gif(capture_dir: Path, output_path: Path) -> None:
         capture_dir: Path to capture directory.
         output_path: Output path for GIF.
     """
-    from openadapt_capture.visualize import create_demo
+    from sc_engine.visualize import create_demo
 
     print("Generating demo GIF...")
     create_demo(
@@ -78,7 +78,7 @@ def generate_html_viewer(capture_dir: Path, output_path: Path) -> None:
         capture_dir: Path to capture directory.
         output_path: Output path for HTML.
     """
-    from openadapt_capture.visualize import create_html
+    from sc_engine.visualize import create_html
 
     print("Generating HTML viewer...")
     create_html(

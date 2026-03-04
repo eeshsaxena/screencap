@@ -5,13 +5,13 @@ import json
 
 import pytest
 
-from openadapt_capture.browser_bridge import (
+from sc_engine.browser_bridge import (
     BrowserBridge,
     BrowserEventRecord,
     BrowserMode,
     MessageType,
 )
-from openadapt_capture.browser_events import (
+from sc_engine.browser_events import (
     BoundingBox,
     BrowserClickEvent,
     BrowserEventType,

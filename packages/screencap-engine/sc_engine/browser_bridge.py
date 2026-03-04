@@ -27,9 +27,9 @@ except ImportError:
     WebSocketServerProtocol = Any  # type: ignore
 
 if TYPE_CHECKING:
-    from openadapt_capture.storage import CaptureStorage
+    from sc_engine.storage import CaptureStorage
 
-from openadapt_capture.browser_events import (
+from sc_engine.browser_events import (
     BoundingBox,
     BrowserClickEvent,
     BrowserEventType,

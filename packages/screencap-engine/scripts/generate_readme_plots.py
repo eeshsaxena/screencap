@@ -18,8 +18,8 @@ import numpy as np
 matplotlib.use("Agg")
 import matplotlib.pyplot as plt
 
-from openadapt_capture.comparison import ComparisonReport, FrameComparison
-from openadapt_capture.stats import CaptureStats, PerfStat
+from sc_engine.comparison import ComparisonReport, FrameComparison
+from sc_engine.stats import CaptureStats, PerfStat
 
 
 def generate_performance_plot(output_dir: Path) -> None:

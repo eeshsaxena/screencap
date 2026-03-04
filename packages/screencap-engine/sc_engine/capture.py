@@ -9,10 +9,10 @@ from dataclasses import dataclass
 from pathlib import Path
 from typing import TYPE_CHECKING, Iterator
 
-from openadapt_capture.events import (
+from sc_engine.events import (
     ActionEvent as PydanticActionEvent,
 )
-from openadapt_capture.events import (
+from sc_engine.events import (
     KeyDownEvent,
     KeyShortcutEvent,
     KeyTypeEvent,
@@ -27,7 +27,7 @@ from openadapt_capture.events import (
     MouseUpEvent,
     SpecialKeyEvent,
 )
-from openadapt_capture.processing import process_events
+from sc_engine.processing import process_events
 
 if TYPE_CHECKING:
     from PIL import Image
@@ -287,8 +287,8 @@ class CaptureSession:
         if not db_path.exists():
             raise FileNotFoundError(f"Capture not found: {capture_dir}")
 
-        from openadapt_capture.db import get_session_for_path
-        from openadapt_capture.db.models import Recording
+        from sc_engine.db import get_session_for_path
+        from sc_engine.db.models import Recording
 
         session = get_session_for_path(str(db_path))
         try:
@@ -520,7 +520,7 @@ class CaptureSession:
             return None
 
         try:
-            from openadapt_capture.video import extract_frame
+            from sc_engine.video import extract_frame
 
             # Convert to video-relative timestamp
             video_start = self._recording.video_start_time or self._recording.timestamp

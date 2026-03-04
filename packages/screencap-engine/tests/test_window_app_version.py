@@ -25,15 +25,15 @@ def test_window_state_includes_app_version():
 
     with (
         mock.patch(
-            "openadapt_capture.window._macos.get_active_window_meta",
+            "sc_engine.window._macos.get_active_window_meta",
             return_value=meta,
         ),
         mock.patch(
-            "openadapt_capture.window._macos._get_app_version_info",
+            "sc_engine.window._macos._get_app_version_info",
             return_value=("com.apple.Safari", "18.2"),
         ),
     ):
-        from openadapt_capture.window._macos import get_active_window_state
+        from sc_engine.window._macos import get_active_window_state
         result = get_active_window_state(read_window_data=False)
 
     assert result is not None
@@ -48,15 +48,15 @@ def test_window_state_version_none_on_failure():
 
     with (
         mock.patch(
-            "openadapt_capture.window._macos.get_active_window_meta",
+            "sc_engine.window._macos.get_active_window_meta",
             return_value=meta,
         ),
         mock.patch(
-            "openadapt_capture.window._macos._get_app_version_info",
+            "sc_engine.window._macos._get_app_version_info",
             return_value=(None, None),
         ),
     ):
-        from openadapt_capture.window._macos import get_active_window_state
+        from sc_engine.window._macos import get_active_window_state
         result = get_active_window_state(read_window_data=False)
 
     assert result is not None
@@ -70,15 +70,15 @@ def test_window_state_bundle_id_without_version():
 
     with (
         mock.patch(
-            "openadapt_capture.window._macos.get_active_window_meta",
+            "sc_engine.window._macos.get_active_window_meta",
             return_value=meta,
         ),
         mock.patch(
-            "openadapt_capture.window._macos._get_app_version_info",
+            "sc_engine.window._macos._get_app_version_info",
             return_value=("com.example.headless", None),
         ),
     ):
-        from openadapt_capture.window._macos import get_active_window_state
+        from sc_engine.window._macos import get_active_window_state
         result = get_active_window_state(read_window_data=False)
 
     assert result["app_bundle_id"] == "com.example.headless"
@@ -98,10 +98,10 @@ def test_window_data_surfaces_app_fields():
     }
 
     with mock.patch(
-        "openadapt_capture.window.get_active_window_state",
+        "sc_engine.window.get_active_window_state",
         return_value=mock_state,
     ):
-        from openadapt_capture.window import get_active_window_data
+        from sc_engine.window import get_active_window_data
         result = get_active_window_data()
 
     assert result["app_bundle_id"] == "com.apple.Safari"

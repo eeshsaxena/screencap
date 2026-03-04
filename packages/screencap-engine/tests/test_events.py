@@ -1,7 +1,7 @@
 """Tests for event schemas."""
 
 
-from openadapt_capture.events import (
+from sc_engine.events import (
     AudioChunkEvent,
     EventType,
     KeyDownEvent,

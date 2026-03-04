@@ -15,7 +15,7 @@ from typing import TYPE_CHECKING
 if TYPE_CHECKING:
     from PIL import Image
 
-    from openadapt_capture.capture import CaptureSession
+    from sc_engine.capture import CaptureSession
 
 
 def create_html(
@@ -39,7 +39,7 @@ def create_html(
     Returns:
         HTML string if output is None, otherwise None after writing file.
     """
-    from openadapt_capture.capture import CaptureSession
+    from sc_engine.capture import CaptureSession
 
     # Load capture if path provided
     if isinstance(capture_or_path, (str, Path)):

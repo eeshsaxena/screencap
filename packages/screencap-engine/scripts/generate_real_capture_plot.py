@@ -17,7 +17,7 @@ from pathlib import Path
 from typing import TYPE_CHECKING
 
 if TYPE_CHECKING:
-    from openadapt_capture.stats import CaptureStats
+    from sc_engine.stats import CaptureStats
 
 # Set matplotlib backend before importing pyplot
 import matplotlib
@@ -35,7 +35,7 @@ def run_real_capture(duration: float = 5.0) -> "CaptureStats":
     Returns:
         CaptureStats from the recording.
     """
-    from openadapt_capture import Recorder
+    from sc_engine import Recorder
 
     # Use a temp directory for the capture
     capture_dir = Path(tempfile.mkdtemp(prefix="capture_perf_"))

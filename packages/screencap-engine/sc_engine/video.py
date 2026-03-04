@@ -19,8 +19,8 @@ from typing import TYPE_CHECKING
 import av
 from loguru import logger
 
-from openadapt_capture import utils
-from openadapt_capture.config import config
+from sc_engine import utils
+from sc_engine.config import config
 
 if TYPE_CHECKING:
     from PIL import Image

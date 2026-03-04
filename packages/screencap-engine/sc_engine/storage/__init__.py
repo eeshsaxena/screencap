@@ -4,7 +4,7 @@ This module provides storage backends for persisting captured GUI events.
 The primary implementation uses SQLite for reliable, portable storage.
 
 Usage:
-    from openadapt_capture.storage import SQLiteStorage
+    from sc_engine.storage import SQLiteStorage
 
     # Create storage
     storage = SQLiteStorage("./capture/capture.db")
@@ -23,10 +23,10 @@ from __future__ import annotations
 from pathlib import Path
 
 # Import SQLite-specific implementation
-from openadapt_capture.storage.sqlite import SQLiteStorage
+from sc_engine.storage.sqlite import SQLiteStorage
 
 # Re-export from the original storage module for backward compatibility
-from openadapt_capture.storage_impl import (
+from sc_engine.storage_impl import (
     EVENT_TYPE_MAP,
     Capture,
     CaptureStorage,

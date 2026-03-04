@@ -11,7 +11,7 @@ from typing import Any, TypeVar
 
 import os
 
-from openadapt_capture.events import (
+from sc_engine.events import (
     ActionEvent,
     Event,
     KeyDownEvent,
@@ -949,7 +949,7 @@ def get_screen_events(events: list[Event]) -> list[Event]:
     Returns:
         Only screen frame events.
     """
-    from openadapt_capture.events import ScreenFrameEvent
+    from sc_engine.events import ScreenFrameEvent
 
     return [e for e in events if isinstance(e, ScreenFrameEvent)]
 
@@ -963,6 +963,6 @@ def get_audio_events(events: list[Event]) -> list[Event]:
     Returns:
         Only audio chunk events.
     """
-    from openadapt_capture.events import AudioChunkEvent
+    from sc_engine.events import AudioChunkEvent
 
     return [e for e in events if isinstance(e, AudioChunkEvent)]

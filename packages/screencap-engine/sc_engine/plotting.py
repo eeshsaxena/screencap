@@ -16,7 +16,7 @@ matplotlib.use("Agg")  # non-interactive backend; works from any thread
 import matplotlib.pyplot as plt  # noqa: E402
 from loguru import logger
 
-from openadapt_capture.db import models
+from sc_engine.db import models
 
 
 def plot_performance(

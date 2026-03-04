@@ -6,32 +6,32 @@ Platform-agnostic event streams with time-aligned media.
 __version__ = "0.1.0"
 
 # High-level APIs (primary interface)
-from openadapt_capture.capture import Action, Capture, CaptureSession
+from sc_engine.capture import Action, Capture, CaptureSession
 
 # Frame comparison utilities
-from openadapt_capture.comparison import (
+from sc_engine.comparison import (
     ComparisonReport,
     FrameComparison,
     compare_frames,
     compare_video_to_images,
     plot_comparison,
 )
-from openadapt_capture.config import RecordingConfig
-from openadapt_capture.db.models import (
+from sc_engine.config import RecordingConfig
+from sc_engine.db.models import (
     ActionEvent as DBActionEvent,
 )
 
 # Database models (low-level)
-from openadapt_capture.db.models import (
+from sc_engine.db.models import (
     Recording,
     Screenshot,
 )
-from openadapt_capture.db.models import (
+from sc_engine.db.models import (
     WindowEvent as DBWindowEvent,
 )
 
 # Event types
-from openadapt_capture.events import (
+from sc_engine.events import (
     ActionEvent,
     AudioChunkEvent,
     AudioEvent,
@@ -58,7 +58,7 @@ from openadapt_capture.events import (
 )
 
 # Event processing
-from openadapt_capture.processing import (
+from sc_engine.processing import (
     detect_drag_events,
     detect_key_shortcuts,
     get_action_events,
@@ -77,29 +77,29 @@ from openadapt_capture.processing import (
 # Recorder requires pynput which needs a display server (X11/Wayland/macOS/Windows).
 # Make it optional so the package is importable in headless environments (CI, servers).
 try:
-    from openadapt_capture.recorder import Recorder
+    from sc_engine.recorder import Recorder
 except ImportError:
     Recorder = None  # type: ignore[assignment,misc]
 
 # Performance statistics
-from openadapt_capture.stats import (
+from sc_engine.stats import (
     CaptureStats,
     PerfStat,
     plot_capture_performance,
 )
 
 # Visualization
-from openadapt_capture.visualize import create_demo, create_html
+from sc_engine.visualize import create_demo, create_html
 
 # Browser events and bridge (optional - requires websockets)
 try:
-    from openadapt_capture.browser_bridge import (
+    from sc_engine.browser_bridge import (
         BrowserBridge,
         BrowserEventRecord,
         BrowserMode,
         run_browser_bridge,
     )
-    from openadapt_capture.browser_events import (
+    from sc_engine.browser_events import (
         BoundingBox,
         BrowserClickEvent,
         BrowserEvent,

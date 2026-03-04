@@ -5,7 +5,7 @@ from pathlib import Path
 
 import pytest
 
-from openadapt_capture.events import (
+from sc_engine.events import (
     EventType,
     KeyDownEvent,
     MouseButton,
@@ -13,7 +13,7 @@ from openadapt_capture.events import (
     MouseMoveEvent,
     MouseUpEvent,
 )
-from openadapt_capture.storage import (
+from sc_engine.storage import (
     Capture,
     CaptureStorage,
     create_capture,
