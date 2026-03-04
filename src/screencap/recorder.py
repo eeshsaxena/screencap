@@ -7,6 +7,7 @@ import multiprocessing
 import os
 import shutil
 import signal
+import subprocess
 import sys
 import threading
 import time
@@ -228,6 +229,119 @@ def _restore_output() -> None:
 
 
 # ---------------------------------------------------------------------------
+# macOS permission helpers
+# ---------------------------------------------------------------------------
+
+def _open_privacy_settings(pane: str) -> None:
+    """Open System Settings to a specific Privacy & Security pane.
+
+    pane: one of 'Privacy_ScreenCapture', 'Privacy_Accessibility', 'Privacy_ListenEvent'
+    """
+    subprocess.run(
+        ["open", f"x-apple.systempreferences:com.apple.preference.security?{pane}"],
+        check=False,
+    )
+
+
+# Python snippets to check each permission in a fresh subprocess.
+# macOS caches permission state within a process, so in-process checks
+# won't detect grants made after startup.  Spawning a subprocess gives
+# us the real, current OS state.
+_PERMISSION_CHECK_CODE: dict[str, str] = {
+    "Accessibility": (
+        "from ApplicationServices import AXIsProcessTrustedWithOptions, kAXTrustedCheckOptionPrompt; "
+        "print(bool(AXIsProcessTrustedWithOptions({kAXTrustedCheckOptionPrompt: False})))"
+    ),
+    "Input Monitoring": (
+        "import Quartz; print(bool(Quartz.CGPreflightListenEventAccess()))"
+    ),
+}
+
+
+def _check_permission_fresh(name: str) -> bool:
+    """Check a permission in a fresh subprocess to bypass OS-level caching."""
+    code = _PERMISSION_CHECK_CODE.get(name)
+    if not code:
+        return False
+    try:
+        result = subprocess.run(
+            [sys.executable, "-c", code],
+            capture_output=True, text=True, timeout=5,
+        )
+        return result.stdout.strip() == "True"
+    except Exception:
+        return False
+
+
+def _check_macos_permissions() -> None:
+    """Check macOS permissions and guide the user through granting them.
+
+    Walks through each missing permission one at a time:
+    1. Non-restart permissions first (Accessibility, Input Monitoring) —
+       triggers the native prompt, opens System Settings, polls until granted.
+    2. Screen Recording last — requires a terminal restart, so we exit.
+
+    Polling uses a fresh subprocess for each check because macOS caches
+    permission state within a process lifetime.
+    """
+    if sys.platform != "darwin":
+        return
+
+    try:
+        from openadapt_capture.platform.darwin import DarwinPlatform
+    except ImportError:
+        return
+
+    # (name, check_fn, request_fn, pane, needs_restart)
+    all_permissions = [
+        ("Accessibility", DarwinPlatform.is_accessibility_enabled,
+         DarwinPlatform.request_accessibility_access, "Privacy_Accessibility", False),
+        ("Input Monitoring", DarwinPlatform.is_input_monitoring_enabled,
+         DarwinPlatform.request_input_monitoring_access, "Privacy_ListenEvent", False),
+        ("Screen Recording", DarwinPlatform.is_screen_recording_enabled,
+         DarwinPlatform.request_screen_recording_access, "Privacy_ScreenCapture", True),
+    ]
+
+    missing = [(name, check, request, pane, restart)
+               for name, check, request, pane, restart in all_permissions
+               if not check()]
+
+    if not missing:
+        return
+
+    names = ", ".join(m[0] for m in missing)
+    total = len(missing)
+    console.print(f"\n  [bold]Missing permissions:[/bold] {names}\n")
+
+    for i, (name, check_fn, request_fn, pane, needs_restart) in enumerate(missing, 1):
+        console.print(f"  [{i}/{total}] [bold]{name}[/bold]")
+
+        request_fn()
+        _open_privacy_settings(pane)
+        console.print("        System Settings has been opened — enable your terminal app.")
+
+        if needs_restart:
+            console.print("\n  [yellow]Note:[/yellow] Screen Recording requires a terminal restart.")
+            console.print("  After enabling, quit and reopen your terminal, then re-run:")
+            console.print("    screencap start")
+            raise SystemExit(1)
+
+        # Non-restart permission — poll with subprocess checks until granted
+        with console.status(f"[bold]  Waiting for {name}...[/bold]"):
+            for _ in range(120):
+                time.sleep(1)
+                if _check_permission_fresh(name):
+                    break
+
+        if _check_permission_fresh(name):
+            console.print(f"  [green]✓[/green] {name} granted!\n")
+        else:
+            console.print(f"\n  [red]Error:[/red] {name} was not granted in time.")
+            console.print("  Grant the permission and re-run: screencap start")
+            raise SystemExit(1)
+
+
+# ---------------------------------------------------------------------------
 # Main recording function
 # ---------------------------------------------------------------------------
 
@@ -294,20 +408,8 @@ def start_recording(
     if not verbose:
         _suppress_output()
 
-    # Check macOS Screen Recording permission before starting
-    if sys.platform == "darwin":
-        try:
-            from openadapt_capture.platform.darwin import DarwinPlatform
-
-            if not DarwinPlatform.is_screen_recording_enabled():
-                console.print(
-                    "[red]Error:[/red] Screen Recording permission not granted.\n"
-                    "  Go to: System Settings > Privacy & Security > Screen Recording\n"
-                    "  Enable your terminal app, then restart it."
-                )
-                raise SystemExit(1)
-        except ImportError:
-            pass
+    # Check macOS permissions (Screen Recording, Accessibility, Input Monitoring)
+    _check_macos_permissions()
 
     desc = description or ""
 
