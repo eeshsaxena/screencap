@@ -146,7 +146,7 @@ def _auto_transcribe(capture_dir, audio_path):
     # Try faster-whisper first
     try:
         import faster_whisper  # noqa: F401
-        from openadapt_capture.cli import _transcribe_faster_whisper
+        from sc_engine.cli import _transcribe_faster_whisper
 
         with console.status("[bold]Transcribing audio...[/bold]"):
             # Suppress print() calls from vendored code
@@ -163,7 +163,7 @@ def _auto_transcribe(capture_dir, audio_path):
 
     # Try openai-whisper
     try:
-        from openadapt_capture.cli import _transcribe_local
+        from sc_engine.cli import _transcribe_local
 
         with console.status("[bold]Transcribing audio...[/bold]"):
             _orig = sys.stdout
@@ -439,7 +439,7 @@ def export(name, all_recordings, downloads, output, use_stdout, exclude_moves):
         sys.exit(1)
 
     try:
-        from openadapt_capture import Capture  # noqa: F401
+        from sc_engine import Capture  # noqa: F401
     except ImportError:
         err_console.print(_RECORD_EXTRAS_MSG)
         raise SystemExit(1)
@@ -600,7 +600,7 @@ def _resolve_backend_interactive() -> tuple[str, str | None]:
     api_key = os.environ.get("OPENAI_API_KEY")
     if not api_key:
         try:
-            from openadapt_capture.config import settings
+            from sc_engine.config import settings
             api_key = settings.openai_api_key
         except Exception:
             pass
@@ -728,7 +728,7 @@ def _select_local_model(model: str | None = None) -> tuple[str, str]:
 def _transcribe_api_inline(api_key, audio_path, transcript_path, transcript_json_path):
     """Transcribe using OpenAI Whisper API with an explicit api_key.
 
-    Avoids delegating to openadapt_capture (whose pydantic-settings singleton
+    Avoids delegating to sc_engine (whose pydantic-settings singleton
     ignores os.environ changes after import).
     """
     from openai import OpenAI
@@ -795,10 +795,10 @@ def _run_api_transcription(api_key, audio_path, transcript_path, transcript_json
                 try:
                     try:
                         import faster_whisper  # noqa: F401
-                        from openadapt_capture.cli import _transcribe_faster_whisper
+                        from sc_engine.cli import _transcribe_faster_whisper
                         local_fn = _transcribe_faster_whisper
                     except ImportError:
-                        from openadapt_capture.cli import _transcribe_local
+                        from sc_engine.cli import _transcribe_local
                         local_fn = _transcribe_local
 
                     console.print(f"[dim]Using Whisper ({model} model)...[/dim]")
@@ -1030,13 +1030,13 @@ def transcribe(name, model):
             # Fix #3: resolve import FIRST, then call
             try:
                 import faster_whisper  # noqa: F401
-                from openadapt_capture.cli import _transcribe_faster_whisper
+                from sc_engine.cli import _transcribe_faster_whisper
                 local_fn = _transcribe_faster_whisper
             except ImportError:
-                from openadapt_capture.cli import _transcribe_local
+                from sc_engine.cli import _transcribe_local
                 local_fn = _transcribe_local
 
-            # Fix #4: no console.status() — openadapt_capture prints its own progress
+            # Fix #4: no console.status() — sc_engine prints its own progress
             console.print(f"[dim]Using Whisper ({backend_param} model)...[/dim]")
             local_fn(audio_path, transcript_path, transcript_json_path, backend_param)
         except Exception as e:

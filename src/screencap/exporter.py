@@ -34,7 +34,7 @@ def export_recording(
     When *output_path* is a file path, uses atomic write (write to .tmp,
     rename on success).  When *output_path* is None, writes to stdout.
     """
-    from openadapt_capture import Capture
+    from sc_engine import Capture
 
     try:
         with Capture.load(str(recording_dir)) as capture:

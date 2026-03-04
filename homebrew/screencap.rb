@@ -14,7 +14,7 @@ class Screencap < Formula
     venv = virtualenv_create(libexec, "python3.12")
 
     # Install vendored packages first
-    venv.pip_install buildpath/"packages/openadapt-capture"
+    venv.pip_install buildpath/"packages/screencap-engine"
 
     # Install screencap itself
     venv.pip_install_and_link buildpath

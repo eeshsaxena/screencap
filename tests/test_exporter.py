@@ -51,7 +51,7 @@ def test_export_recording_writes_metadata_header(tmp_path):
     capture = _mock_capture()
     meta = build_export_metadata(exclude_moves=False)
 
-    with mock.patch("openadapt_capture.capture.CaptureSession.load", return_value=capture):
+    with mock.patch("sc_engine.capture.CaptureSession.load", return_value=capture):
         count = export_recording(rec_dir, out_file, exclude_moves=False, metadata=meta)
 
     assert count == 1
@@ -75,7 +75,7 @@ def test_export_recording_no_metadata(tmp_path):
 
     capture = _mock_capture()
 
-    with mock.patch("openadapt_capture.capture.CaptureSession.load", return_value=capture):
+    with mock.patch("sc_engine.capture.CaptureSession.load", return_value=capture):
         count = export_recording(rec_dir, out_file, exclude_moves=False, metadata=None)
 
     assert count == 1
@@ -97,7 +97,7 @@ def test_export_recording_atomic_write_cleanup_on_failure(tmp_path):
         capture.actions.side_effect = RuntimeError("boom")
         return capture
 
-    with mock.patch("openadapt_capture.capture.CaptureSession.load", side_effect=failing_capture):
+    with mock.patch("sc_engine.capture.CaptureSession.load", side_effect=failing_capture):
         try:
             export_recording(rec_dir, out_file, exclude_moves=False)
         except RuntimeError:
@@ -116,7 +116,7 @@ def test_export_recording_atomic_write_success(tmp_path):
 
     capture = _mock_capture()
 
-    with mock.patch("openadapt_capture.capture.CaptureSession.load", return_value=capture):
+    with mock.patch("sc_engine.capture.CaptureSession.load", return_value=capture):
         export_recording(rec_dir, out_file, exclude_moves=False)
 
     assert os.path.exists(out_file)
@@ -130,7 +130,7 @@ def test_export_recording_legacy_db_returns_negative(tmp_path):
     out_file = str(rec_dir / "events.jsonl")
 
     with mock.patch(
-        "openadapt_capture.capture.CaptureSession.load",
+        "sc_engine.capture.CaptureSession.load",
         side_effect=FileNotFoundError("Capture not found"),
     ):
         count = export_recording(rec_dir, out_file, exclude_moves=False)

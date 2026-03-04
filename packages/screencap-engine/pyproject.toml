@@ -1,0 +1,128 @@
+[project]
+name = "screencap-engine"
+version = "0.3.0"
+description = "GUI interaction capture - platform-agnostic event streams with time-aligned media"
+readme = "README.md"
+requires-python = ">=3.10"
+license = "MIT"
+authors = [
+    {name = "MLDSAI Inc.", email = "richard@openadapt.ai"}
+]
+keywords = ["gui", "automation", "capture", "events", "rpa"]
+classifiers = [
+    "Development Status :: 2 - Pre-Alpha",
+    "Intended Audience :: Developers",
+    "License :: OSI Approved :: MIT License",
+    "Programming Language :: Python :: 3",
+    "Programming Language :: Python :: 3.10",
+    "Programming Language :: Python :: 3.11",
+    "Programming Language :: Python :: 3.12",
+    "Topic :: Software Development :: Libraries :: Python Modules",
+]
+
+dependencies = [
+    "pydantic>=2.0.0",
+    "pynput>=1.7.0",
+    "av>=10.0.0",
+    "Pillow>=9.0.0",
+    "fire>=0.7.1",
+    "mss>=6.0.0",
+    "sounddevice>=0.5.3",
+    "soundfile>=0.13.1",
+    "pydantic-settings>=2.12.0",
+    "openai>=2.11.0",
+    "websockets>=12.0",
+    "sqlalchemy>=2.0.0",
+    "alembic>=1.0.0",
+    "loguru>=0.7.0",
+    "psutil>=5.0.0",
+    "pympler>=1.0.0",
+    "tqdm>=4.0.0",
+    "numpy>=1.20.0",
+    "magic-wormhole>=0.17.0",
+    # macOS window/accessibility capture (only installed on macOS)
+    "oa-atomacos>=3.2.0; sys_platform == 'darwin'",
+    "pyobjc-framework-Quartz>=9.0; sys_platform == 'darwin'",
+    "pyobjc-framework-ApplicationServices>=9.0; sys_platform == 'darwin'",
+    "pyobjc-framework-Cocoa>=9.0; sys_platform == 'darwin'",
+]
+
+[project.optional-dependencies]
+# Whisper transcription - faster-whisper (recommended, 4x faster)
+transcribe-fast = [
+    "faster-whisper>=1.1.0",
+]
+
+# Legacy openai-whisper support
+transcribe = [
+    "openai-whisper>=20230314",
+]
+
+# Everything
+all = [
+    "screencap-engine[transcribe-fast,transcribe]",
+]
+
+dev = [
+    "pytest>=7.0.0",
+    "pytest-asyncio>=0.23.0",
+    "pytest-cov>=4.0.0",
+    "pytest-timeout>=2.0.0",
+    "ruff>=0.1.0",
+    "matplotlib>=3.5.0",
+    "numpy>=1.21.0",
+]
+
+[project.scripts]
+capture = "sc_engine.cli:main"
+
+[project.urls]
+Homepage = "https://github.com/Divide-By-0/screencap"
+Repository = "https://github.com/Divide-By-0/screencap"
+
+[build-system]
+requires = ["hatchling"]
+build-backend = "hatchling.build"
+
+[tool.hatch.build.targets.wheel]
+packages = ["sc_engine"]
+
+[tool.ruff]
+line-length = 100
+target-version = "py310"
+
+[tool.ruff.lint]
+select = ["E", "F", "I", "W"]
+ignore = ["E501"]
+
+[tool.pytest.ini_options]
+testpaths = ["tests"]
+python_files = ["test_*.py"]
+asyncio_mode = "auto"
+markers = [
+    "slow: marks tests as slow / integration (deselect with '-m \"not slow\"')",
+]
+
+[tool.semantic_release]
+version_toml = ["pyproject.toml:project.version"]
+commit_message = "chore: release {version}"
+
+[tool.semantic_release.branches.main]
+match = "main"
+
+[tool.semantic_release.commit_parser_options]
+allowed_tags = ["build", "chore", "ci", "docs", "feat", "fix", "perf", "refactor", "style", "test"]
+minor_tags = ["feat"]
+patch_tags = ["fix", "perf"]
+
+[tool.uv.sources]
+screencap-engine = { workspace = true }
+
+[dependency-groups]
+dev = [
+    "matplotlib>=3.10.8",
+    "numpy>=2.2.6",
+    "screencap-engine",
+    "psutil>=7.2.2",
+    "pytest>=9.0.2",
+]

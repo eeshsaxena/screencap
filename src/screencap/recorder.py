@@ -1,4 +1,4 @@
-"""Wrap openadapt-capture Recorder for screencap."""
+"""Wrap screencap-engine Recorder for screencap."""
 
 from __future__ import annotations
 
@@ -204,7 +204,7 @@ def _suppress_output() -> None:
     os.environ["OA_LOG_LEVEL"] = "ERROR"
     os.environ["TQDM_DISABLE"] = "1"
     # Override loguru directly in the main process — the env var only
-    # takes effect on fresh imports (child processes).  If openadapt_capture
+    # takes effect on fresh imports (child processes).  If sc_engine
     # was already imported, loguru is already configured at INFO.
     try:
         from loguru import logger as _oa_logger
@@ -287,7 +287,7 @@ def _check_macos_permissions() -> None:
         return
 
     try:
-        from openadapt_capture.platform.darwin import DarwinPlatform
+        from sc_engine.platform.darwin import DarwinPlatform
     except ImportError:
         return
 
@@ -401,7 +401,7 @@ def start_recording(
     capture_dir.mkdir(parents=True, exist_ok=True)
 
     # Suppress loguru/tqdm noise unless --verbose.
-    # Must happen BEFORE any openadapt_capture import (including the
+    # Must happen BEFORE any sc_engine import (including the
     # screen-recording permission check below) so the env var is set
     # when the module-level loguru config runs for the first time.
     if not verbose:
@@ -423,7 +423,7 @@ def start_recording(
     status.start()
 
     # Heavy import — deferred here to keep `screencap --help` fast.
-    from openadapt_capture import Recorder
+    from sc_engine import Recorder
 
     if Recorder is None:
         status.stop()
