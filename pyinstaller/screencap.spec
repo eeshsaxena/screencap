@@ -86,7 +86,8 @@ a = Analysis(
     hooksconfig={},
     runtime_hooks=[],
     excludes=[
-        # Exclude heavy frameworks not needed at runtime
+        # Defensive excludes — these may be pulled in transitively by
+        # dependencies (e.g. numpy, Pillow) even though screencap doesn't use them
         'torch', 'torchvision', 'torchaudio',
         'transformers', 'huggingface_hub', 'tokenizers', 'safetensors',
         'hf_xet',

@@ -835,7 +835,7 @@ def upload(names, all_recordings, dry_run, force, jobs):
     all_failed = 0
     all_bytes = 0
 
-    # Single privacy warning if any recordings will need export
+    # Warn if any recordings will need export
     if not dry_run:
         needs_export = any(
             not (d / "events.jsonl").exists() or force for d in dirs
