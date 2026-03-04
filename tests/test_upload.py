@@ -329,29 +329,6 @@ def test_resolve_all(tmp_path):
     assert len(dirs) == 2
 
 
-def test_resolve_all_skips_scrubbed(tmp_path):
-    """--all should skip -scrubbed directories."""
-    from screencap.upload import resolve_recording_dirs
-
-    # Original
-    r1 = tmp_path / "my-rec"
-    r1.mkdir()
-    conn = sqlite3.connect(str(r1 / "recording.db"))
-    conn.execute("CREATE TABLE recording (id INTEGER)")
-    conn.close()
-
-    # Scrubbed copy (has a valid DB but should be skipped)
-    scrubbed = tmp_path / "my-rec-scrubbed"
-    scrubbed.mkdir()
-    conn = sqlite3.connect(str(scrubbed / "recording.db"))
-    conn.execute("CREATE TABLE recording (id INTEGER)")
-    conn.close()
-
-    with mock.patch("screencap.upload.get_recordings_dir", return_value=tmp_path):
-        dirs = resolve_recording_dirs((), all_recordings=True)
-    assert len(dirs) == 1
-    assert dirs[0].name == "my-rec"
-
 
 def test_resolve_all_empty(tmp_path):
     from screencap.upload import resolve_recording_dirs

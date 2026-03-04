@@ -175,7 +175,6 @@ def print_summary(name: str, capture_dir: Path, elapsed: float) -> None:
 
     commands = [
         (f"screencap view {name}", "Open in browser"),
-        (f"screencap scrub {name}", "Remove PII"),
         (f"screencap export {name}", "Export as JSONL"),
         (f"screencap upload {name}", "Upload to cloud"),
         ("screencap list", "All recordings"),

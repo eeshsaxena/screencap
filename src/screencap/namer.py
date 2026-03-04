@@ -689,13 +689,6 @@ def auto_name(
             counter += 1
         final_name = f"{final_name}-{counter}"
 
-    # Also check scrubbed variant collision
-    if (recordings_dir / f"{final_name}-scrubbed").exists():
-        counter = 2
-        while (recordings_dir / f"{final_name}-{counter}").exists():
-            counter += 1
-        final_name = f"{final_name}-{counter}"
-
     final_dir = recordings_dir / final_name
     capture_dir.rename(final_dir)
 

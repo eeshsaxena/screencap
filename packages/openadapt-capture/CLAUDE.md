@@ -8,7 +8,6 @@ Key responsibilities:
 - Record human demonstrations with mouse, keyboard, and screen capture
 - Time-align all events and media (video, audio)
 - Process raw events into structured actions (clicks, drags, typing)
-- Support privacy scrubbing of sensitive data
 
 **Always use PRs, never push directly to main**
 
@@ -110,5 +109,4 @@ uv run pytest tests/ -v --ignore=tests/test_browser_bridge.py
 ## Related Projects
 
 - [openadapt-ml](https://github.com/OpenAdaptAI/openadapt-ml) - Train models on captures
-- [openadapt-privacy](https://github.com/OpenAdaptAI/openadapt-privacy) - PII scrubbing
 - [openadapt-evals](https://github.com/OpenAdaptAI/openadapt-evals) - Benchmark evaluation

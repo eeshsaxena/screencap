@@ -1,4 +1,4 @@
-"""ScreenCap — macOS CLI for screen capture with privacy scrubbing."""
+"""ScreenCap — macOS CLI for screen capture."""
 
 from importlib.metadata import version
 

@@ -33,7 +33,7 @@ Capture platform-agnostic GUI interaction streams with time-aligned screenshots 
       interactions                - Evaluate on                   agent on new
     - Mouse, keyboard,              benchmarks (WAA)              tasks
       screen, audio               - Compare models              - Real-time
-    - Privacy scrubbing           - Cloud GPU training            automation
+                                  - Cloud GPU training            automation
 
 ```
 
@@ -41,7 +41,6 @@ Capture platform-agnostic GUI interaction streams with time-aligned screenshots 
 |-----------|---------|------------|
 | **openadapt-capture** | Record human demonstrations | [GitHub](https://github.com/OpenAdaptAI/openadapt-capture) |
 | **openadapt-ml** | Train and evaluate GUI automation models | [GitHub](https://github.com/OpenAdaptAI/openadapt-ml) |
-| **openadapt-privacy** | PII scrubbing for recordings | [GitHub](https://github.com/OpenAdaptAI/openadapt-privacy) |
 
 ---
 
@@ -209,7 +208,6 @@ The `share` command compresses the recording, sends it via Magic Wormhole, and e
 | Extra | Features |
 |-------|----------|
 | `audio` | Audio capture + Whisper transcription |
-| `privacy` | PII scrubbing ([openadapt-privacy](https://github.com/OpenAdaptAI/openadapt-privacy)) |
 | `share` | Recording sharing via Magic Wormhole |
 | `all` | Everything |
 
@@ -228,7 +226,6 @@ uv run pytest tests/ -v -m slow
 ## Related Projects
 
 - [openadapt-ml](https://github.com/OpenAdaptAI/openadapt-ml) - Train and evaluate GUI automation models
-- [openadapt-privacy](https://github.com/OpenAdaptAI/openadapt-privacy) - PII detection and scrubbing for recordings
 - [openadapt-evals](https://github.com/OpenAdaptAI/openadapt-evals) - Benchmark evaluation for GUI agents
 - [Windows Agent Arena](https://github.com/microsoft/WindowsAgentArena) - Benchmark for Windows GUI agents
 

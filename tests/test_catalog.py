@@ -82,19 +82,7 @@ def test_list_single(recordings_dir):
     assert len(result) == 1
     assert result[0].name == "test1"
     assert result[0].has_audio is True
-    assert result[0].has_scrubbed is False
     assert "2m" in result[0].duration
-
-
-def test_list_with_scrubbed(recordings_dir):
-    _make_recording(recordings_dir, "demo", duration=30)
-    scrubbed = recordings_dir / "demo-scrubbed"
-    scrubbed.mkdir()
-    # scrubbed dirs are skipped from listing but detected as flag
-    result = list_recordings(recordings_dir)
-    assert len(result) == 1
-    assert result[0].name == "demo"
-    assert result[0].has_scrubbed is True
 
 
 def test_list_multiple(recordings_dir):

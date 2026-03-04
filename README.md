@@ -1,13 +1,12 @@
 # ScreenCap
 
-ScreenCap is a local-first macOS recorder for building high-quality demonstration data for automation and agent training. It captures screen, input, and context in one run, then lets you scrub sensitive data and export ML-ready events.
+ScreenCap is a local-first macOS recorder for building high-quality demonstration data for automation and agent training. It captures screen, input, and context in one run, then lets you export ML-ready events.
 
-Built on [OpenAdapt](https://github.com/OpenAdaptAI), ScreenCap is designed for teams who need more than video clips: reproducible recordings, structured interaction data, and a privacy-safe pipeline from capture to training.
+Built on [OpenAdapt](https://github.com/OpenAdaptAI), ScreenCap is designed for teams who need more than video clips: reproducible recordings, structured interaction data, and a streamlined pipeline from capture to training.
 
 ## What We Offer
 
 - **One-command capture workflow**: Start recording immediately with `screencap start`, then auto-transcribe and auto-name on stop.
-- **Privacy built in**: `screencap scrub` creates a scrubbed copy (screenshots + text fields + transcript) without mutating originals.
 - **ML-ready outputs**: Export processed interaction events to JSONL with `screencap export` for downstream training pipelines.
 - **Local-first by default**: Run from a standalone binary, keep recordings on disk, and use optional cloud sync only when needed.
 - **OpenAdapt-compatible data**: Recording artifacts and schema align with the broader OpenAdapt ecosystem.
@@ -65,9 +64,6 @@ screencap list
 
 # view in browser
 screencap view stripe-webhook-debugging
-
-# scrub PII (first run installs ~500 MB of deps)
-screencap scrub my-session
 
 # transcribe audio (interactive — offers API or local Whisper)
 screencap transcribe my-session
@@ -132,22 +128,6 @@ To use Ollama for fully local naming: `ollama pull qwen3-vl:4b` then `screencap 
 
 Opens the recording's `viewer.html` in your default browser.
 
-| Flag | Description |
-|------|-------------|
-| `--scrubbed` | Open the scrubbed version instead |
-
-### `screencap scrub <name>`
-
-Creates a privacy-scrubbed copy at `<name>-scrubbed/`. Never mutates originals.
-
-| Flag | Description |
-|------|-------------|
-| `--provider {PRESIDIO}` | Scrubbing provider (default: `PRESIDIO`) |
-
-**What gets scrubbed:** screenshots (OCR + redaction), database text fields, transcript.json.
-**Not yet supported:** video.mp4 scrubbing.
-**Detected entities:** PERSON, EMAIL, PHONE, SSN, CREDIT_CARD, DATE_TIME, LOCATION.
-
 ### `screencap transcribe <name>`
 
 Transcribe a recording's audio using Whisper. Interactively offers OpenAI API or local model.
@@ -204,7 +184,7 @@ screencap export my-session --exclude-moves
 | `--stdout` | Write to stdout instead of a file |
 | `--exclude-moves` | Omit mouse move events from output |
 
-**Warning:** Export includes all captured keystrokes (passwords, API keys, private messages). Run `screencap scrub` first for sensitive sessions.
+**Warning:** Export includes all captured keystrokes (passwords, API keys, private messages). Review recordings for sensitive data before sharing.
 
 ### `screencap upload [names...]`
 
