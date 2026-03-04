@@ -25,7 +25,7 @@ _RECORD_EXTRAS_MSG = (
               help="Skip auto-update check.")
 @click.pass_context
 def cli(ctx, no_update_check):
-    """ScreenCap — macOS screen capture with privacy scrubbing."""
+    """ScreenCap — macOS screen capture."""
     if not no_update_check:
         from screencap.updater import maybe_check_for_update
         maybe_check_for_update()
@@ -232,7 +232,6 @@ def list_cmd(as_json, sort):
     table.add_column("Duration")
     table.add_column("Size")
     table.add_column("Audio")
-    table.add_column("Scrubbed")
     table.add_column("Transcribed")
     table.add_column("Uploaded")
 
@@ -247,7 +246,6 @@ def list_cmd(as_json, sort):
             r.duration,
             r.size_mb,
             "[green]\u2713[/green]" if r.has_audio else "[dim]\u2717[/dim]",
-            "[green]\u2713[/green]" if r.has_scrubbed else "[dim]\u2717[/dim]",
             "[green]\u2713[/green]" if r.transcribed else "[dim]\u2717[/dim]",
             "[green]\u2713[/green]" if r.uploaded else "[dim]\u2717[/dim]",
         )
@@ -257,15 +255,13 @@ def list_cmd(as_json, sort):
 
 @cli.command()
 @click.argument("name")
-@click.option("--scrubbed", is_flag=True, help="Open the scrubbed version.")
-def view(name, scrubbed):
+def view(name):
     """Open recording viewer in browser."""
     from screencap.viewer import open_viewer
 
     try:
-        open_viewer(name, scrubbed=scrubbed)
-        suffix = "-scrubbed" if scrubbed else ""
-        console.print(f"[dim]Opening {name}{suffix}/viewer.html ...[/dim]")
+        open_viewer(name)
+        console.print(f"[dim]Opening {name}/viewer.html ...[/dim]")
     except ImportError:
         console.print(_RECORD_EXTRAS_MSG)
         sys.exit(1)
@@ -427,8 +423,7 @@ def export(name, all_recordings, downloads, output, use_stdout, exclude_moves):
     """Export recording events as JSONL for training.
 
     WARNING: Export includes all captured keystrokes (passwords, API keys,
-    private messages). Run 'screencap scrub' on the recording first if it
-    contains sensitive sessions.
+    private messages). Review recordings for sensitive data before sharing.
     """
     from screencap.config import get_recordings_dir, resolve_recording_dir
 
@@ -452,7 +447,7 @@ def export(name, all_recordings, downloads, output, use_stdout, exclude_moves):
 
     err_console.print(
         "[yellow]Warning:[/yellow] Export includes all captured keystrokes. "
-        "Run 'screencap scrub' first for sensitive sessions.",
+        "Review recordings for sensitive data before sharing.",
         highlight=False,
     )
 
@@ -515,50 +510,6 @@ def export(name, all_recordings, downloads, output, use_stdout, exclude_moves):
         sys.exit(1)
     if output_path:
         err_console.print(f"Exported {count} events to [bold]{output_path}[/bold]")
-
-
-def _check_scrub_deps() -> bool:
-    """Verify scrub dependencies are available."""
-    try:
-        import spacy
-        import presidio_analyzer  # noqa: F401
-        import presidio_anonymizer  # noqa: F401
-    except ImportError:
-        if getattr(sys, 'frozen', False):
-            console.print("[red]Privacy dependencies missing from binary. Reinstall screencap.[/red]")
-        else:
-            console.print("[red]Privacy dependencies not installed.[/red]")
-            console.print("Run: pip install screencap[privacy]")
-        return False
-
-    # Verify spaCy model is loadable — do NOT use spacy.util.is_package()
-    # because it relies on importlib.metadata which is broken under PyInstaller.
-    from openadapt_privacy.config import config as privacy_config
-
-    model_name = privacy_config.SPACY_MODEL_NAME
-    try:
-        spacy.load(model_name)
-    except OSError:
-        console.print(f"[red]spaCy model '{model_name}' not found.[/red]")
-        if getattr(sys, 'frozen', False):
-            console.print("Reinstall screencap to get scrubbing support.")
-        else:
-            console.print(f"Run: python -m spacy download {model_name}")
-        return False
-    return True
-
-
-@cli.command()
-@click.argument("name")
-@click.option("--provider", default="PRESIDIO", help="Scrubbing provider.")
-def scrub(name, provider):
-    """Create a privacy-scrubbed copy of a recording."""
-    if not _check_scrub_deps():
-        return
-
-    from screencap.scrubber import scrub_recording
-
-    scrub_recording(name, provider=provider)
 
 
 @cli.command()

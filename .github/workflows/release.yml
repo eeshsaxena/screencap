@@ -34,7 +34,7 @@ jobs:
           key: ${{ runner.os }}-${{ matrix.arch }}-pip-${{ hashFiles('pyproject.toml') }}
 
       - name: Install dependencies
-        run: pip install -e ".[privacy]" && pip install pyinstaller
+        run: pip install -e ".[record]" && pip install pyinstaller
 
       - name: Audit dependencies
         run: pip install pip-audit && pip-audit

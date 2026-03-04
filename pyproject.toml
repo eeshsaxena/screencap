@@ -5,7 +5,7 @@ build-backend = "setuptools.build_meta"
 [project]
 name = "screencap"
 version = "0.8.0"
-description = "macOS CLI for screen capture with privacy scrubbing"
+description = "macOS CLI for screen capture"
 requires-python = ">=3.10"
 license = "MIT"
 dependencies = [
@@ -46,14 +46,6 @@ record = [
     "pyobjc-framework-Cocoa>=9.0; sys_platform == 'darwin'",
     "pyobjc-framework-CoreWLAN>=9.0; sys_platform == 'darwin'",
 ]
-privacy = [
-    "screencap[record]",
-    "presidio-analyzer>=2.2.0",
-    "presidio-anonymizer>=2.2.0",
-    "presidio-image-redactor>=0.0.50",
-    "opencv-python-headless>=4.0",  # headless avoids FFmpeg dylib conflict with av
-    "spacy>=3.7.0",
-]
 dev = [
     "screencap[record]",
     "pytest>=7.0",
@@ -64,7 +56,7 @@ dev = [
 screencap = "screencap.cli:cli"
 
 [tool.setuptools.packages.find]
-where = ["src", "packages/openadapt-capture", "packages/openadapt-privacy"]
+where = ["src", "packages/openadapt-capture"]
 
 [tool.pytest.ini_options]
 testpaths = ["tests"]

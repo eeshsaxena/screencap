@@ -41,32 +41,6 @@ for pkg in pyobjc_packages:
         # Package may not be installed (e.g. CoreWLAN on non-mac CI)
         pass
 
-# ---------------------------------------------------------------------------
-# spaCy + NLP dependency metadata
-# PyInstaller doesn't collect dist-info by default; spacy.util and catalogue
-# need it for entry-point discovery.
-# ---------------------------------------------------------------------------
-metadata_packages = [
-    'spacy', 'spacy_legacy', 'thinc',
-    'cymem', 'preshed', 'murmurhash', 'srsly',
-    'catalogue', 'langcodes',
-]
-
-for pkg in metadata_packages:
-    try:
-        all_datas += copy_metadata(pkg)
-    except Exception:
-        pass
-
-# Also collect spacy data files (language data, etc.)
-try:
-    d, b, h = collect_all('spacy')
-    all_datas += d
-    all_binaries += b
-    all_hiddenimports += h
-except Exception:
-    pass
-
 # rich._unicode_data uses hyphenated module names loaded via importlib
 # (e.g. "unicode17-0-0.py") which PyInstaller can't detect.
 try:
@@ -85,20 +59,10 @@ hidden_imports = [
     'pynput.keyboard._darwin',
     'pynput.mouse._darwin',
     'pynput._util.darwin',
-    # spaCy language data
-    'spacy.lang.en',
-    # Cython extensions used by spaCy/thinc
-    'cymem.cymem',
-    'preshed.maps',
-    'murmurhash.mrmr',
-    'srsly.msgpack.util',
     # SQLAlchemy dialect
     'sqlalchemy.dialects.sqlite',
     # tomli for Python 3.10 (stdlib tomllib in 3.11+)
     'tomli',
-    # Presidio (optional, but include if installed)
-    'presidio_analyzer',
-    'presidio_anonymizer',
 ]
 
 all_hiddenimports += hidden_imports
@@ -114,7 +78,6 @@ a = Analysis(
     pathex=[
         os.path.join(_root, 'src'),
         os.path.join(_root, 'packages', 'openadapt-capture'),
-        os.path.join(_root, 'packages', 'openadapt-privacy'),
     ],
     binaries=all_binaries,
     datas=all_datas,
@@ -123,17 +86,11 @@ a = Analysis(
     hooksconfig={},
     runtime_hooks=[],
     excludes=[
-        # Exclude heavy ML frameworks not needed by screencap at runtime.
-        # torch/torchvision are transitive deps of presidio but presidio
-        # works fine with just spaCy (CPU) for NER.
+        # Exclude heavy frameworks not needed at runtime
         'torch', 'torchvision', 'torchaudio',
-        # transformers pulled in transitively but not used
         'transformers', 'huggingface_hub', 'tokenizers', 'safetensors',
         'hf_xet',
-        # OpenCV headless is only needed for presidio-image-redactor
-        # which is imported lazily — exclude to save ~90 MB
         'cv2',
-        # Other heavy transitive deps not needed
         'matplotlib', 'sympy', 'IPython', 'notebook', 'jupyter',
         'scipy', 'sklearn', 'faiss',
         'botocore', 'boto3', 'awscrt',

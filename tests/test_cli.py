@@ -140,14 +140,6 @@ def test_view_not_found(tmp_path):
         assert "Error" in result.output
 
 
-def test_scrub_missing():
-    runner = CliRunner()
-    with mock.patch("screencap.config.get_recordings_dir", return_value=mock.MagicMock()):
-        with mock.patch("screencap.scrubber.scrub_recording", side_effect=SystemExit(1)):
-            result = runner.invoke(cli, ["scrub", "missing"])
-            assert result.exit_code == 1
-
-
 # --- info command tests ---
 
 
@@ -278,48 +270,6 @@ def test_info_command_nonexistent_recording(tmp_path):
         result = runner.invoke(cli, ["info", "doesnotexist"])
     assert result.exit_code == 1
     assert "Error" in result.output
-
-
-# --- scrubber metrics test ---
-
-
-def test_scrub_redacts_hostname_in_metrics(tmp_path):
-    """Scrubbing should redact hostname in system_metrics.json."""
-    rec_dir = tmp_path / "my-rec"
-    rec_dir.mkdir()
-
-    # Minimal DB
-    db_path = rec_dir / "recording.db"
-    conn = sqlite3.connect(str(db_path))
-    cur = conn.cursor()
-    cur.execute(
-        "CREATE TABLE recording (id INTEGER PRIMARY KEY, timestamp REAL, platform TEXT, task_description TEXT)"
-    )
-    cur.execute("INSERT INTO recording VALUES (1, ?, 'darwin', 'test')", (time.time(),))
-    conn.commit()
-    conn.close()
-
-    # Write metrics with hostname
-    metrics = {
-        "schema_version": 1,
-        "static": {"hostname": "my-secret-host.local", "cpu_model": "Apple M2"},
-        "start": {"cpu_percent": 10},
-        "end": None,
-    }
-    (rec_dir / "system_metrics.json").write_text(json.dumps(metrics))
-
-    from screencap.scrubber import _scrub_metrics
-
-    # Simulate what scrub_recording does: copy then scrub
-    import shutil
-
-    dst = tmp_path / "my-rec-scrubbed"
-    shutil.copytree(rec_dir, dst)
-    _scrub_metrics(dst / "system_metrics.json")
-
-    scrubbed = json.loads((dst / "system_metrics.json").read_text())
-    assert scrubbed["static"]["hostname"] == "<REDACTED>"
-    assert scrubbed["static"]["cpu_model"] == "Apple M2"  # not redacted
 
 
 # --- stop command tests ---

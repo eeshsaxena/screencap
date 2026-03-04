@@ -19,7 +19,6 @@ class RecordingInfo(NamedTuple):
     duration: str  # e.g. "2m 34s"
     size_mb: str  # e.g. "48.3 MB"
     has_audio: bool
-    has_scrubbed: bool
     transcribed: bool
     uploaded: bool
     drops: dict[str, int] | None = None  # event drop counts, if any
@@ -141,7 +140,6 @@ def list_recordings(recordings_dir: Path | None = None) -> list[RecordingInfo]:
             date_str = datetime.fromtimestamp(started).strftime("%Y-%m-%d")
 
         has_audio = (d / "audio.flac").exists()
-        has_scrubbed = (recordings_dir / f"{d.name}-scrubbed").is_dir()
         transcribed = (d / "transcript.txt").exists()
         uploaded = (d / ".upload_status.json").is_file()
 
@@ -154,7 +152,6 @@ def list_recordings(recordings_dir: Path | None = None) -> list[RecordingInfo]:
                 duration=_fmt_duration(duration),
                 size_mb=_dir_size_mb(d),
                 has_audio=has_audio,
-                has_scrubbed=has_scrubbed,
                 transcribed=transcribed,
                 uploaded=uploaded,
                 drops=drops,

@@ -1,7 +1,7 @@
 class Screencap < Formula
   include Language::Python::Virtualenv
 
-  desc "macOS CLI for screen capture with privacy scrubbing"
+  desc "macOS CLI for screen capture"
   homepage "https://github.com/OpenAdaptAI/screencap"
   url "https://github.com/OpenAdaptAI/screencap/archive/refs/tags/v0.1.0.tar.gz"
   sha256 "PLACEHOLDER_SHA256"
@@ -15,13 +15,9 @@ class Screencap < Formula
 
     # Install vendored packages first
     venv.pip_install buildpath/"packages/openadapt-capture"
-    venv.pip_install buildpath/"packages/openadapt-privacy[presidio]"
 
     # Install screencap itself
     venv.pip_install_and_link buildpath
-
-    # Download spaCy model for privacy scrubbing
-    system libexec/"bin/python", "-m", "spacy", "download", "en_core_web_trf"
   end
 
   def caveats

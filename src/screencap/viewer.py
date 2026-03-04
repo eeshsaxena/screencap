@@ -16,13 +16,12 @@ console = Console()
 def open_viewer(
     name: str,
     recordings_dir: Path | None = None,
-    scrubbed: bool = False,
 ) -> None:
     """Open viewer.html for a recording in the default browser."""
     if recordings_dir is None:
         recordings_dir = get_recordings_dir()
 
-    dir_name = f"{name}-scrubbed" if scrubbed else name
+    dir_name = name
     rec_dir = recordings_dir / dir_name
     viewer = rec_dir / "viewer.html"
 
