@@ -151,6 +151,48 @@ class DarwinPlatform:
             return True  # Assume enabled if we can't check
 
     @staticmethod
+    def request_screen_recording_access() -> bool:
+        """Trigger the native Screen Recording permission dialog.
+
+        Returns True if already granted.
+        """
+        try:
+            import Quartz
+
+            return Quartz.CGRequestScreenCaptureAccess()
+        except (ImportError, AttributeError):
+            return True
+
+    @staticmethod
+    def request_input_monitoring_access() -> bool:
+        """Trigger the native Input Monitoring permission dialog.
+
+        Returns True if already granted.
+        """
+        try:
+            import Quartz
+
+            return Quartz.CGRequestListenEventAccess()
+        except (ImportError, AttributeError):
+            return True
+
+    @staticmethod
+    def request_accessibility_access() -> bool:
+        """Trigger the native Accessibility permission dialog.
+
+        Returns True if already granted.
+        """
+        try:
+            from ApplicationServices import (
+                AXIsProcessTrustedWithOptions,
+                kAXTrustedCheckOptionPrompt,
+            )
+
+            return AXIsProcessTrustedWithOptions({kAXTrustedCheckOptionPrompt: True})
+        except (ImportError, AttributeError):
+            return True
+
+    @staticmethod
     def get_active_window_info() -> dict | None:
         """Get information about the currently active window.
 

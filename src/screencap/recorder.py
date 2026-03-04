@@ -7,6 +7,7 @@ import multiprocessing
 import os
 import shutil
 import signal
+import subprocess
 import sys
 import threading
 import time
@@ -228,6 +229,79 @@ def _restore_output() -> None:
 
 
 # ---------------------------------------------------------------------------
+# macOS permission helpers
+# ---------------------------------------------------------------------------
+
+def _open_privacy_settings(pane: str) -> None:
+    """Open System Settings to a specific Privacy & Security pane.
+
+    pane: one of 'Privacy_ScreenCapture', 'Privacy_Accessibility', 'Privacy_ListenEvent'
+    """
+    subprocess.run(
+        ["open", f"x-apple.systempreferences:com.apple.preference.security?{pane}"],
+        check=False,
+    )
+
+
+def _check_macos_permissions() -> None:
+    """Check macOS permissions and guide the user through granting them.
+
+    Checks Screen Recording, Accessibility, and Input Monitoring.
+    For any missing permission, triggers the native OS prompt dialog
+    and opens System Settings to the relevant pane.
+    """
+    if sys.platform != "darwin":
+        return
+
+    try:
+        from openadapt_capture.platform.darwin import DarwinPlatform
+    except ImportError:
+        return
+
+    missing: list[tuple[str, str, bool]] = []
+
+    if not DarwinPlatform.is_screen_recording_enabled():
+        DarwinPlatform.request_screen_recording_access()
+        missing.append(("Screen Recording", "Privacy_ScreenCapture", True))
+
+    if not DarwinPlatform.is_accessibility_enabled():
+        DarwinPlatform.request_accessibility_access()
+        missing.append(("Accessibility", "Privacy_Accessibility", False))
+
+    if not DarwinPlatform.is_input_monitoring_enabled():
+        DarwinPlatform.request_input_monitoring_access()
+        missing.append(("Input Monitoring", "Privacy_ListenEvent", False))
+
+    if not missing:
+        return
+
+    # Open System Settings to the first missing permission's pane
+    _open_privacy_settings(missing[0][1])
+
+    # Build the error message
+    names = ", ".join(m[0] for m in missing)
+    needs_restart = any(m[2] for m in missing)
+
+    console.print(f"\n[red]Error:[/red] Missing permissions: {names}.")
+    console.print("  System Settings has been opened for you.")
+    console.print(f"  Enable [bold]{missing[0][0]}[/bold] for your terminal app.")
+
+    if len(missing) > 1:
+        others = ", ".join(m[0] for m in missing[1:])
+        console.print(f"  Also enable: {others}")
+
+    if needs_restart:
+        console.print("\n  [yellow]Note:[/yellow] Screen Recording requires a terminal restart.")
+        console.print("  After enabling, quit and reopen your terminal, then re-run:")
+    else:
+        console.print("\n  After enabling, re-run:")
+
+    console.print("    screencap start")
+
+    raise SystemExit(1)
+
+
+# ---------------------------------------------------------------------------
 # Main recording function
 # ---------------------------------------------------------------------------
 
@@ -294,20 +368,8 @@ def start_recording(
     if not verbose:
         _suppress_output()
 
-    # Check macOS Screen Recording permission before starting
-    if sys.platform == "darwin":
-        try:
-            from openadapt_capture.platform.darwin import DarwinPlatform
-
-            if not DarwinPlatform.is_screen_recording_enabled():
-                console.print(
-                    "[red]Error:[/red] Screen Recording permission not granted.\n"
-                    "  Go to: System Settings > Privacy & Security > Screen Recording\n"
-                    "  Enable your terminal app, then restart it."
-                )
-                raise SystemExit(1)
-        except ImportError:
-            pass
+    # Check macOS permissions (Screen Recording, Accessibility, Input Monitoring)
+    _check_macos_permissions()
 
     desc = description or ""
 
