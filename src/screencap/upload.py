@@ -368,7 +368,7 @@ def resolve_recording_dirs(
     if all_recordings:
         dirs = []
         for d in sorted(recordings_dir.iterdir()):
-            if not d.is_dir() or d.name.endswith("-scrubbed"):
+            if not d.is_dir():
                 continue
             if any((d / db).exists() for db in ("recording.db", "capture.db")):
                 dirs.append(d)

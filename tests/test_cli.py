@@ -761,10 +761,7 @@ def test_export_all(tmp_path):
         d.mkdir()
         (d / "recording.db").touch()
 
-    # Also create a scrubbed dir and a non-recording dir — should be skipped
-    scrubbed = tmp_path / "rec-a-scrubbed"
-    scrubbed.mkdir()
-    (scrubbed / "recording.db").touch()
+    # A non-recording dir (no recording.db) — should be skipped
     (tmp_path / "not-a-recording").mkdir()
 
     capture = _mock_capture()
@@ -783,8 +780,6 @@ def test_export_all(tmp_path):
     # Both recordings should have events.jsonl
     assert (tmp_path / "rec-a" / "events.jsonl").exists()
     assert (tmp_path / "rec-b" / "events.jsonl").exists()
-    # Scrubbed dir should NOT have been exported
-    assert not (scrubbed / "events.jsonl").exists()
 
 
 def test_export_all_no_recordings(tmp_path):

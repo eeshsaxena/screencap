@@ -404,7 +404,6 @@ def _find_exportable_dirs(base_dir):
     return sorted(
         d for d in base_dir.iterdir()
         if d.is_dir()
-        and not d.name.endswith("-scrubbed")
         and (d / "recording.db").exists()
     )
 

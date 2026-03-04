@@ -130,9 +130,6 @@ def list_recordings(recordings_dir: Path | None = None) -> list[RecordingInfo]:
         db = find_db(d)
         if db is None:
             continue
-        # Skip scrubbed copies
-        if d.name.endswith("-scrubbed"):
-            continue
 
         started, duration = _read_recording_meta(db)
         date_str = "—"
