@@ -246,12 +246,10 @@ def _open_privacy_settings(pane: str) -> None:
 def _check_macos_permissions() -> None:
     """Check macOS permissions and guide the user through granting them.
 
-    Checks Screen Recording, Accessibility, and Input Monitoring.
-    For any missing permission, triggers the native OS prompt dialog.
-
-    Accessibility and Input Monitoring take effect immediately, so we
-    poll for up to 60 seconds waiting for the user to grant them.
-    Screen Recording requires a terminal restart, so we must exit.
+    Walks through each missing permission one at a time:
+    1. Non-restart permissions first (Accessibility, Input Monitoring) —
+       triggers the native prompt, opens System Settings, polls until granted.
+    2. Screen Recording last — requires a terminal restart, so we exit.
     """
     if sys.platform != "darwin":
         return
@@ -261,70 +259,53 @@ def _check_macos_permissions() -> None:
     except ImportError:
         return
 
-    # Phase 1: Check all permissions and trigger native prompts
-    screen_recording_missing = False
-    if not DarwinPlatform.is_screen_recording_enabled():
-        DarwinPlatform.request_screen_recording_access()
-        screen_recording_missing = True
+    # (name, check_fn, request_fn, pane, needs_restart)
+    all_permissions = [
+        ("Accessibility", DarwinPlatform.is_accessibility_enabled,
+         DarwinPlatform.request_accessibility_access, "Privacy_Accessibility", False),
+        ("Input Monitoring", DarwinPlatform.is_input_monitoring_enabled,
+         DarwinPlatform.request_input_monitoring_access, "Privacy_ListenEvent", False),
+        ("Screen Recording", DarwinPlatform.is_screen_recording_enabled,
+         DarwinPlatform.request_screen_recording_access, "Privacy_ScreenCapture", True),
+    ]
 
-    # Accessibility and Input Monitoring take effect immediately —
-    # we can wait for the user to grant them.
-    # Each entry: (display name, check function, Settings pane ID)
-    pending: list[tuple[str, callable, str]] = []
+    missing = [(name, check, request, pane, restart)
+               for name, check, request, pane, restart in all_permissions
+               if not check()]
 
-    if not DarwinPlatform.is_accessibility_enabled():
-        DarwinPlatform.request_accessibility_access()
-        pending.append(("Accessibility", DarwinPlatform.is_accessibility_enabled, "Privacy_Accessibility"))
-
-    if not DarwinPlatform.is_input_monitoring_enabled():
-        DarwinPlatform.request_input_monitoring_access()
-        pending.append(("Input Monitoring", DarwinPlatform.is_input_monitoring_enabled, "Privacy_ListenEvent"))
-
-    if not screen_recording_missing and not pending:
+    if not missing:
         return
 
-    # Phase 2: Wait for Accessibility / Input Monitoring (immediate-effect permissions)
-    if pending:
-        names = ", ".join(name for name, _, _ in pending)
-        console.print(f"\n  [bold]Waiting for permissions:[/bold] {names}")
-        console.print("  System Settings has been opened — enable your terminal app.")
+    names = ", ".join(m[0] for m in missing)
+    total = len(missing)
+    console.print(f"\n  [bold]Missing permissions:[/bold] {names}\n")
 
-        # Open Settings to the first pending permission's pane
-        _open_privacy_settings(pending[0][2])
+    for i, (name, check_fn, request_fn, pane, needs_restart) in enumerate(missing, 1):
+        console.print(f"  [{i}/{total}] [bold]{name}[/bold]")
 
-        with console.status("[bold]Waiting for permissions to be granted...[/bold]"):
-            for _ in range(60):
-                time.sleep(1)
-                still_pending = [(n, check, pane) for n, check, pane in pending if not check()]
-                # If a permission was just granted and another is still pending,
-                # open Settings to the next pane automatically
-                if len(still_pending) < len(pending) and still_pending:
-                    granted = set(n for n, _, _ in pending) - set(n for n, _, _ in still_pending)
-                    console.print(f"  [green]✓[/green] {', '.join(granted)} granted!")
-                    console.print(f"  Now enable [bold]{still_pending[0][0]}[/bold]...")
-                    _open_privacy_settings(still_pending[0][2])
-                pending = still_pending
-                if not pending:
-                    break
+        request_fn()
+        _open_privacy_settings(pane)
+        console.print("        System Settings has been opened — enable your terminal app.")
 
-        if not pending:
-            console.print("  [green]✓[/green] Permissions granted!")
-        else:
-            still_missing = ", ".join(name for name, _, _ in pending)
-            console.print(f"\n[red]Error:[/red] Still missing: {still_missing}.")
-            console.print("  Grant the permissions and re-run: screencap start")
+        if needs_restart:
+            console.print("\n  [yellow]Note:[/yellow] Screen Recording requires a terminal restart.")
+            console.print("  After enabling, quit and reopen your terminal, then re-run:")
+            console.print("    screencap start")
             raise SystemExit(1)
 
-    # Phase 3: Screen Recording requires a terminal restart — must exit
-    if screen_recording_missing:
-        _open_privacy_settings("Privacy_ScreenCapture")
-        console.print("\n[red]Error:[/red] Missing permission: Screen Recording.")
-        console.print("  System Settings has been opened for you.")
-        console.print("  Enable [bold]Screen Recording[/bold] for your terminal app.")
-        console.print("\n  [yellow]Note:[/yellow] Screen Recording requires a terminal restart.")
-        console.print("  After enabling, quit and reopen your terminal, then re-run:")
-        console.print("    screencap start")
-        raise SystemExit(1)
+        # Non-restart permission — poll until granted or timeout
+        with console.status(f"[bold]  Waiting for {name}...[/bold]"):
+            for _ in range(60):
+                time.sleep(1)
+                if check_fn():
+                    break
+
+        if check_fn():
+            console.print(f"  [green]✓[/green] {name} granted!\n")
+        else:
+            console.print(f"\n  [red]Error:[/red] {name} was not granted in time.")
+            console.print("  Grant the permission and re-run: screencap start")
+            raise SystemExit(1)
 
 
 # ---------------------------------------------------------------------------
