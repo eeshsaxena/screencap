@@ -107,6 +107,24 @@ class TestBearerTokens:
         assert any(d.entity_type == EntityType.API_KEY for d in dets)
 
 
+class TestSSN:
+    def test_ssn_with_prefix(self, detector: RegexDetector):
+        dets = detector.detect("SSN: 123-45-6789")
+        ssn = [d for d in dets if d.entity_type == EntityType.SSN]
+        assert len(ssn) == 1
+
+    def test_ssn_social_security(self, detector: RegexDetector):
+        dets = detector.detect("Social Security Number: 123-45-6789")
+        ssn = [d for d in dets if d.entity_type == EntityType.SSN]
+        assert len(ssn) == 1
+
+    def test_bare_ssn_not_detected(self, detector: RegexDetector):
+        # Without context, should not flag random dashed numbers
+        dets = detector.detect("Reference: 123-45-6789")
+        ssn = [d for d in dets if d.entity_type == EntityType.SSN]
+        assert len(ssn) == 0
+
+
 class TestFalsePositives:
     def test_uuid_not_detected(self, detector: RegexDetector):
         text = "id: 550e8400-e29b-41d4-a716-446655440000"

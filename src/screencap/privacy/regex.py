@@ -77,6 +77,14 @@ _PATTERNS: list[tuple[re.Pattern[str], str, float]] = [
         EntityType.API_KEY,
         0.9,
     ),
+    # SSN: 3 digits - 2 digits - 4 digits (with context to reduce false positives)
+    (
+        re.compile(
+            r"""(?i)(?:ssn|social.security|social\s+security)\s*(?:number)?[\s:=#]*(\d{3}-\d{2}-\d{4})""",
+        ),
+        EntityType.SSN,
+        0.9,
+    ),
 ]
 
 

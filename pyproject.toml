@@ -46,8 +46,12 @@ record = [
     "pyobjc-framework-Cocoa>=9.0; sys_platform == 'darwin'",
     "pyobjc-framework-CoreWLAN>=9.0; sys_platform == 'darwin'",
 ]
+privacy = [
+    "detect-secrets>=1.5.0,<2.0",
+    "presidio-analyzer>=2.2",
+]
 dev = [
-    "screencap[record]",
+    "screencap[record,privacy]",
     "pytest>=7.0",
     "pytest-cov",
 ]
@@ -60,3 +64,6 @@ where = ["src", "packages/screencap-engine"]
 
 [tool.pytest.ini_options]
 testpaths = ["tests"]
+markers = [
+    "privacy: tests requiring privacy deps (detect-secrets, PII engine)",
+]
