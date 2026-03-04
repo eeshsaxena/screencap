@@ -269,36 +269,48 @@ def _check_macos_permissions() -> None:
 
     # Accessibility and Input Monitoring take effect immediately —
     # we can wait for the user to grant them.
-    pending: list[tuple[str, callable]] = []
+    # Each entry: (display name, check function, Settings pane ID)
+    pending: list[tuple[str, callable, str]] = []
 
     if not DarwinPlatform.is_accessibility_enabled():
         DarwinPlatform.request_accessibility_access()
-        pending.append(("Accessibility", DarwinPlatform.is_accessibility_enabled))
+        pending.append(("Accessibility", DarwinPlatform.is_accessibility_enabled, "Privacy_Accessibility"))
 
     if not DarwinPlatform.is_input_monitoring_enabled():
         DarwinPlatform.request_input_monitoring_access()
-        pending.append(("Input Monitoring", DarwinPlatform.is_input_monitoring_enabled))
+        pending.append(("Input Monitoring", DarwinPlatform.is_input_monitoring_enabled, "Privacy_ListenEvent"))
 
     if not screen_recording_missing and not pending:
         return
 
     # Phase 2: Wait for Accessibility / Input Monitoring (immediate-effect permissions)
     if pending:
-        names = ", ".join(name for name, _ in pending)
+        names = ", ".join(name for name, _, _ in pending)
         console.print(f"\n  [bold]Waiting for permissions:[/bold] {names}")
-        console.print("  Grant access in the dialog(s) that appeared.\n")
+        console.print("  System Settings has been opened — enable your terminal app.")
+
+        # Open Settings to the first pending permission's pane
+        _open_privacy_settings(pending[0][2])
 
         with console.status("[bold]Waiting for permissions to be granted...[/bold]"):
             for _ in range(60):
                 time.sleep(1)
-                pending = [(n, check) for n, check in pending if not check()]
+                still_pending = [(n, check, pane) for n, check, pane in pending if not check()]
+                # If a permission was just granted and another is still pending,
+                # open Settings to the next pane automatically
+                if len(still_pending) < len(pending) and still_pending:
+                    granted = set(n for n, _, _ in pending) - set(n for n, _, _ in still_pending)
+                    console.print(f"  [green]✓[/green] {', '.join(granted)} granted!")
+                    console.print(f"  Now enable [bold]{still_pending[0][0]}[/bold]...")
+                    _open_privacy_settings(still_pending[0][2])
+                pending = still_pending
                 if not pending:
                     break
 
         if not pending:
             console.print("  [green]✓[/green] Permissions granted!")
         else:
-            still_missing = ", ".join(name for name, _ in pending)
+            still_missing = ", ".join(name for name, _, _ in pending)
             console.print(f"\n[red]Error:[/red] Still missing: {still_missing}.")
             console.print("  Grant the permissions and re-run: screencap start")
             raise SystemExit(1)
