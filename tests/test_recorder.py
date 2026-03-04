@@ -253,9 +253,7 @@ class TestPermissionPrompting:
             with pytest.raises(SystemExit):
                 _check_macos_permissions()
 
-        # Should have triggered the native prompt
         platform.request_screen_recording_access.assert_called_once()
-        # Should have opened System Settings
         mock_subprocess.run.assert_called_once()
         call_args = mock_subprocess.run.call_args[0][0]
         assert "Privacy_ScreenCapture" in call_args[1]
@@ -266,15 +264,43 @@ class TestPermissionPrompting:
         ]
         assert len(restart_calls) > 0
 
-    def test_accessibility_only_missing_no_restart_message(self):
-        """Accessibility missing (without Screen Recording) should NOT mention restart."""
+    def test_accessibility_missing_waits_then_continues(self):
+        """Accessibility missing should poll and continue once granted (no exit)."""
         from screencap.recorder import _check_macos_permissions
 
         platform = self._make_platform_mock(screen=True, accessibility=False, input_monitoring=True)
+        # First call: False (initial check), second call: True (poll sees it granted)
+        platform.is_accessibility_enabled.side_effect = [False, True]
 
         with (
             mock.patch("screencap.recorder.sys") as mock_sys,
-            mock.patch("screencap.recorder.subprocess") as mock_subprocess,
+            mock.patch("screencap.recorder.time") as mock_time,
+            mock.patch("screencap.recorder.console") as mock_console,
+            mock.patch(
+                "openadapt_capture.platform.darwin.DarwinPlatform",
+                platform,
+            ),
+        ):
+            mock_sys.platform = "darwin"
+            # Should NOT raise — permission gets granted during poll
+            _check_macos_permissions()
+
+        platform.request_accessibility_access.assert_called_once()
+        # Should show success message
+        all_output = " ".join(str(c) for c in mock_console.print.call_args_list)
+        assert "granted" in all_output.lower()
+
+    def test_accessibility_missing_timeout_exits(self):
+        """Accessibility missing that never gets granted should exit after timeout."""
+        from screencap.recorder import _check_macos_permissions
+
+        platform = self._make_platform_mock(screen=True, accessibility=False, input_monitoring=True)
+        # Always returns False — user never grants it
+        platform.is_accessibility_enabled.return_value = False
+
+        with (
+            mock.patch("screencap.recorder.sys") as mock_sys,
+            mock.patch("screencap.recorder.time") as mock_time,
             mock.patch("screencap.recorder.console") as mock_console,
             mock.patch(
                 "openadapt_capture.platform.darwin.DarwinPlatform",
@@ -286,25 +312,22 @@ class TestPermissionPrompting:
             with pytest.raises(SystemExit):
                 _check_macos_permissions()
 
-        platform.request_accessibility_access.assert_called_once()
-        mock_subprocess.run.assert_called_once()
-        call_args = mock_subprocess.run.call_args[0][0]
-        assert "Privacy_Accessibility" in call_args[1]
-        # Should NOT mention terminal restart
-        restart_calls = [
-            str(c) for c in mock_console.print.call_args_list
-            if "terminal restart" in str(c).lower()
-        ]
-        assert len(restart_calls) == 0
+        all_output = " ".join(str(c) for c in mock_console.print.call_args_list)
+        assert "Still missing" in all_output
+        assert "Accessibility" in all_output
 
-    def test_multiple_permissions_missing_lists_all(self):
-        """Multiple missing permissions should all be prompted and listed."""
+    def test_multiple_missing_waits_for_immediate_then_exits_for_screen(self):
+        """With all missing: waits for Accessibility/Input, then exits for Screen Recording."""
         from screencap.recorder import _check_macos_permissions
 
         platform = self._make_platform_mock(screen=False, accessibility=False, input_monitoring=False)
+        # Accessibility and Input Monitoring get granted on first poll
+        platform.is_accessibility_enabled.side_effect = [False, True]
+        platform.is_input_monitoring_enabled.side_effect = [False, True]
 
         with (
             mock.patch("screencap.recorder.sys") as mock_sys,
+            mock.patch("screencap.recorder.time") as mock_time,
             mock.patch("screencap.recorder.subprocess") as mock_subprocess,
             mock.patch("screencap.recorder.console") as mock_console,
             mock.patch(
@@ -317,18 +340,15 @@ class TestPermissionPrompting:
             with pytest.raises(SystemExit):
                 _check_macos_permissions()
 
-        # All three request methods should have been called
+        # All three prompts triggered
         platform.request_screen_recording_access.assert_called_once()
         platform.request_accessibility_access.assert_called_once()
         platform.request_input_monitoring_access.assert_called_once()
-        # Settings opened to the FIRST missing (Screen Recording)
+        # Settings opened for Screen Recording (the one that needs restart)
         call_args = mock_subprocess.run.call_args[0][0]
         assert "Privacy_ScreenCapture" in call_args[1]
-        # All three names should appear in the output
         all_output = " ".join(str(c) for c in mock_console.print.call_args_list)
-        assert "Screen Recording" in all_output
-        assert "Accessibility" in all_output
-        assert "Input Monitoring" in all_output
+        assert "terminal restart" in all_output.lower()
 
     def test_non_darwin_platform_skips_check(self):
         """On non-darwin platforms, _check_macos_permissions is a no-op."""
@@ -336,7 +356,6 @@ class TestPermissionPrompting:
 
         with mock.patch("screencap.recorder.sys") as mock_sys:
             mock_sys.platform = "linux"
-            # Should not raise
             _check_macos_permissions()
 
     def test_import_error_fails_open(self):
@@ -345,19 +364,7 @@ class TestPermissionPrompting:
 
         with (
             mock.patch("screencap.recorder.sys") as mock_sys,
-            mock.patch(
-                "builtins.__import__",
-                side_effect=ImportError("no darwin"),
-            ),
-        ):
-            mock_sys.platform = "darwin"
-            # The function catches ImportError internally; should not raise
-            # We need a more targeted approach — mock the specific import
-        # Use a cleaner approach: patch the import target
-        with (
-            mock.patch("screencap.recorder.sys") as mock_sys,
             mock.patch.dict("sys.modules", {"openadapt_capture.platform.darwin": None}),
         ):
             mock_sys.platform = "darwin"
-            # Should not raise — graceful fallback
             _check_macos_permissions()

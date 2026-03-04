@@ -247,8 +247,11 @@ def _check_macos_permissions() -> None:
     """Check macOS permissions and guide the user through granting them.
 
     Checks Screen Recording, Accessibility, and Input Monitoring.
-    For any missing permission, triggers the native OS prompt dialog
-    and opens System Settings to the relevant pane.
+    For any missing permission, triggers the native OS prompt dialog.
+
+    Accessibility and Input Monitoring take effect immediately, so we
+    poll for up to 60 seconds waiting for the user to grant them.
+    Screen Recording requires a terminal restart, so we must exit.
     """
     if sys.platform != "darwin":
         return
@@ -258,47 +261,58 @@ def _check_macos_permissions() -> None:
     except ImportError:
         return
 
-    missing: list[tuple[str, str, bool]] = []
-
+    # Phase 1: Check all permissions and trigger native prompts
+    screen_recording_missing = False
     if not DarwinPlatform.is_screen_recording_enabled():
         DarwinPlatform.request_screen_recording_access()
-        missing.append(("Screen Recording", "Privacy_ScreenCapture", True))
+        screen_recording_missing = True
+
+    # Accessibility and Input Monitoring take effect immediately —
+    # we can wait for the user to grant them.
+    pending: list[tuple[str, callable]] = []
 
     if not DarwinPlatform.is_accessibility_enabled():
         DarwinPlatform.request_accessibility_access()
-        missing.append(("Accessibility", "Privacy_Accessibility", False))
+        pending.append(("Accessibility", DarwinPlatform.is_accessibility_enabled))
 
     if not DarwinPlatform.is_input_monitoring_enabled():
         DarwinPlatform.request_input_monitoring_access()
-        missing.append(("Input Monitoring", "Privacy_ListenEvent", False))
+        pending.append(("Input Monitoring", DarwinPlatform.is_input_monitoring_enabled))
 
-    if not missing:
+    if not screen_recording_missing and not pending:
         return
 
-    # Open System Settings to the first missing permission's pane
-    _open_privacy_settings(missing[0][1])
+    # Phase 2: Wait for Accessibility / Input Monitoring (immediate-effect permissions)
+    if pending:
+        names = ", ".join(name for name, _ in pending)
+        console.print(f"\n  [bold]Waiting for permissions:[/bold] {names}")
+        console.print("  Grant access in the dialog(s) that appeared.\n")
 
-    # Build the error message
-    names = ", ".join(m[0] for m in missing)
-    needs_restart = any(m[2] for m in missing)
+        with console.status("[bold]Waiting for permissions to be granted...[/bold]"):
+            for _ in range(60):
+                time.sleep(1)
+                pending = [(n, check) for n, check in pending if not check()]
+                if not pending:
+                    break
 
-    console.print(f"\n[red]Error:[/red] Missing permissions: {names}.")
-    console.print("  System Settings has been opened for you.")
-    console.print(f"  Enable [bold]{missing[0][0]}[/bold] for your terminal app.")
+        if not pending:
+            console.print("  [green]✓[/green] Permissions granted!")
+        else:
+            still_missing = ", ".join(name for name, _ in pending)
+            console.print(f"\n[red]Error:[/red] Still missing: {still_missing}.")
+            console.print("  Grant the permissions and re-run: screencap start")
+            raise SystemExit(1)
 
-    if len(missing) > 1:
-        others = ", ".join(m[0] for m in missing[1:])
-        console.print(f"  Also enable: {others}")
-
-    if needs_restart:
+    # Phase 3: Screen Recording requires a terminal restart — must exit
+    if screen_recording_missing:
+        _open_privacy_settings("Privacy_ScreenCapture")
+        console.print("\n[red]Error:[/red] Missing permission: Screen Recording.")
+        console.print("  System Settings has been opened for you.")
+        console.print("  Enable [bold]Screen Recording[/bold] for your terminal app.")
         console.print("\n  [yellow]Note:[/yellow] Screen Recording requires a terminal restart.")
         console.print("  After enabling, quit and reopen your terminal, then re-run:")
-    else:
-        console.print("\n  After enabling, re-run:")
-
-    console.print("    screencap start")
-
-    raise SystemExit(1)
+        console.print("    screencap start")
+        raise SystemExit(1)
 
 
 # ---------------------------------------------------------------------------
