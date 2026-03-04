@@ -1,4 +1,4 @@
-# openadapt-capture Design
+# screencap-engine Design
 
 ## Problem Statement
 
@@ -12,7 +12,7 @@ We need a platform-agnostic representation of GUI interactions that:
 
 ## Design Goals
 
-`openadapt-capture` is designed for **production use** - it should run uninterrupted for days without hindering the user.
+`screencap-engine` is designed for **production use** - it should run uninterrupted for days without hindering the user.
 
 ### Key Features
 

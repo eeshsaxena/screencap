@@ -10,8 +10,8 @@
 Generate a GIF or MP4 that visually demonstrates a recording:
 
 ```python
-from openadapt_capture import Capture
-from openadapt_capture.visualize import create_demo
+from sc_engine import Capture
+from sc_engine.visualize import create_demo
 
 capture = Capture.load("./my_capture")
 create_demo(capture, output="demo.gif", fps=10, max_duration=10)
@@ -37,7 +37,7 @@ create_demo(capture, output="demo.gif", fps=10, max_duration=10)
 Generate a self-contained HTML file for detailed inspection:
 
 ```python
-from openadapt_capture.visualize import create_html
+from sc_engine.visualize import create_html
 
 create_html("./my_capture", output="recording.html")
 ```
@@ -116,7 +116,7 @@ README would show:
 ## File Structure
 
 ```
-openadapt_capture/
+sc_engine/
 ├── visualize/
 │   ├── __init__.py      # Exports create_demo, create_html
 │   ├── demo.py          # GIF/video generation
@@ -134,7 +134,7 @@ openadapt_capture/
 ## API Summary
 
 ```python
-from openadapt_capture.visualize import create_demo, create_html
+from sc_engine.visualize import create_demo, create_html
 
 # Generate animated demo
 create_demo(

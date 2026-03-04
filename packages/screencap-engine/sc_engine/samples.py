@@ -37,7 +37,7 @@ def get_examples_dir() -> Path:
 
 
 def get_external_examples_dir() -> Path:
-    """Return the path to external examples (e.g., in openadapt-capture repo root).
+    """Return the path to external examples (e.g., in screencap-engine repo root).
 
     This looks for examples in the repository root, which is useful during
     development when examples are not bundled in the package.
@@ -118,7 +118,7 @@ def get_example_path(name: str) -> Path:
     else:
         raise FileNotFoundError(
             f"Example '{name}' not found. No examples are currently available. "
-            "Install openadapt-capture with examples or point to a capture directory."
+            "Install screencap-engine with examples or point to a capture directory."
         )
 
 

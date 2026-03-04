@@ -1,11 +1,11 @@
-"""Performance test for openadapt-capture recorder.
+"""Performance test for screencap-engine recorder.
 
 Runs a short recording with synthetic input (pynput Controllers), then
 loads the capture and prints a summary. Generates performance plots if
 PLOT_PERFORMANCE is enabled.
 
 Usage:
-    cd /Users/abrichr/oa/src/openadapt-capture
+    cd /Users/abrichr/oa/src/screencap-engine
     uv run python scripts/perf_test.py
 """
 
@@ -91,7 +91,7 @@ def main():
         shutil.rmtree(capture_dir)
 
     duration = 10  # seconds
-    print("=== openadapt-capture Performance Test ===")
+    print("=== screencap-engine Performance Test ===")
     print(f"Duration: {duration}s")
     print(f"Output: {capture_dir}")
     print()

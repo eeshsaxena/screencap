@@ -77,7 +77,7 @@ a = Analysis(
     ['main.py'],
     pathex=[
         os.path.join(_root, 'src'),
-        os.path.join(_root, 'packages', 'openadapt-capture'),
+        os.path.join(_root, 'packages', 'screencap-engine'),
     ],
     binaries=all_binaries,
     datas=all_datas,

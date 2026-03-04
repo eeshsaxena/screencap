@@ -30,7 +30,7 @@ function connectWebSocket() {
     ws = new WebSocket(WS_URL);
 
     ws.onopen = () => {
-      console.log('[OpenAdapt] WebSocket connected to', WS_URL);
+      console.log('[ScreenCap] WebSocket connected to', WS_URL);
       wsConnected = true;
 
       // Clear reconnect interval if set
@@ -44,7 +44,7 @@ function connectWebSocket() {
     };
 
     ws.onclose = () => {
-      console.log('[OpenAdapt] WebSocket disconnected');
+      console.log('[ScreenCap] WebSocket disconnected');
       wsConnected = false;
       ws = null;
 
@@ -56,7 +56,7 @@ function connectWebSocket() {
     };
 
     ws.onerror = (error) => {
-      console.error('[OpenAdapt] WebSocket error:', error);
+      console.error('[ScreenCap] WebSocket error:', error);
     };
 
     ws.onmessage = (event) => {
@@ -64,7 +64,7 @@ function connectWebSocket() {
     };
 
   } catch (error) {
-    console.error('[OpenAdapt] Failed to create WebSocket:', error);
+    console.error('[ScreenCap] Failed to create WebSocket:', error);
     scheduleReconnect();
   }
 }
@@ -78,7 +78,7 @@ function scheduleReconnect() {
   }
 
   reconnectInterval = setInterval(() => {
-    console.log('[OpenAdapt] Attempting to reconnect...');
+    console.log('[ScreenCap] Attempting to reconnect...');
     connectWebSocket();
   }, RECONNECT_DELAY);
 }
@@ -88,7 +88,7 @@ function scheduleReconnect() {
  */
 function sendToServer(message) {
   if (!ws || ws.readyState !== WebSocket.OPEN) {
-    console.warn('[OpenAdapt] WebSocket not connected, message dropped');
+    console.warn('[ScreenCap] WebSocket not connected, message dropped');
     return false;
   }
 
@@ -96,7 +96,7 @@ function sendToServer(message) {
     ws.send(JSON.stringify(message));
     return true;
   } catch (error) {
-    console.error('[OpenAdapt] Failed to send message:', error);
+    console.error('[ScreenCap] Failed to send message:', error);
     return false;
   }
 }
@@ -109,7 +109,7 @@ function handleServerMessage(data) {
   try {
     message = JSON.parse(data);
   } catch (error) {
-    console.error('[OpenAdapt] Invalid JSON from server:', data);
+    console.error('[ScreenCap] Invalid JSON from server:', data);
     return;
   }
 
@@ -129,7 +129,7 @@ function handleServerMessage(data) {
       break;
 
     default:
-      console.warn('[OpenAdapt] Unknown message type:', messageType);
+      console.warn('[ScreenCap] Unknown message type:', messageType);
   }
 }
 
@@ -139,7 +139,7 @@ function handleServerMessage(data) {
 function handleSetMode(message) {
   const newMode = message.payload?.mode || 'idle';
   currentMode = newMode;
-  console.log('[OpenAdapt] Mode set to:', currentMode);
+  console.log('[ScreenCap] Mode set to:', currentMode);
 
   // Broadcast mode change to all tabs
   broadcastToTabs({
@@ -165,7 +165,7 @@ function handlePing(message) {
 function handleExecuteAction(message) {
   const action = message.payload?.action;
   if (!action) {
-    console.error('[OpenAdapt] EXECUTE_ACTION missing action payload');
+    console.error('[ScreenCap] EXECUTE_ACTION missing action payload');
     return;
   }
 
@@ -261,7 +261,7 @@ chrome.runtime.onMessage.addListener((message, sender, sendResponse) => {
       break;
 
     default:
-      console.warn('[OpenAdapt] Unknown message type from content script:', message.type);
+      console.warn('[ScreenCap] Unknown message type from content script:', message.type);
       sendResponse({ success: false, error: 'Unknown message type' });
   }
 
@@ -291,7 +291,7 @@ chrome.tabs.onUpdated.addListener((tabId, changeInfo, tab) => {
  * Handle extension installation
  */
 chrome.runtime.onInstalled.addListener(() => {
-  console.log('[OpenAdapt] Extension installed');
+  console.log('[ScreenCap] Extension installed');
   connectWebSocket();
 });
 
@@ -299,7 +299,7 @@ chrome.runtime.onInstalled.addListener(() => {
  * Handle extension startup
  */
 chrome.runtime.onStartup.addListener(() => {
-  console.log('[OpenAdapt] Extension started');
+  console.log('[ScreenCap] Extension started');
   connectWebSocket();
 });
 
@@ -325,4 +325,4 @@ chrome.alarms.onAlarm.addListener((alarm) => {
 // Connect to WebSocket server on script load
 connectWebSocket();
 
-console.log('[OpenAdapt] Background service worker loaded');
+console.log('[ScreenCap] Background service worker loaded');

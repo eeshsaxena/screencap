@@ -4,7 +4,7 @@ This file provides guidance to Claude Code (claude.ai/code) when working with co
 
 ## Project Overview
 
-ScreenCap is a macOS CLI for screen recording. It wraps the vendored OpenAdapt capture package. Python >= 3.10, macOS only.
+ScreenCap is a macOS CLI for screen recording. It wraps the vendored screencap-engine package (`sc_engine` module). Python >= 3.10, macOS only.
 
 ## Common Commands
 
@@ -33,12 +33,12 @@ No linting is configured for the root `screencap` package. The vendored sub-pack
 
 **Core modules (all in `src/screencap/`):**
 - `config.py` — reads `~/.screencap/config.toml` with env var overrides (`SCREENCAP_RECORDINGS_DIR`, `SCREENCAP_AUDIO_DEFAULT`). Priority: env vars > config.toml > defaults. Uses module-level `_config_cache` dict (reset to `None` in tests).
-- `recorder.py` — wraps `openadapt_capture.Recorder` context manager. Custom SIGINT handler: first Ctrl+C = graceful stop, second = force quit.
+- `recorder.py` — wraps `sc_engine.Recorder` context manager. Custom SIGINT handler: first Ctrl+C = graceful stop, second = force quit.
 - `catalog.py` — scans recordings dir, reads metadata from SQLite. Supports two DB schemas: `recording.db` (tables: `recording`, `action_event`) and `capture.db` (tables: `capture`, `events`). Returns `RecordingInfo` NamedTuples.
 - `viewer.py` — opens `viewer.html` via macOS `open` command.
 
 **Vendored packages (under `packages/`):**
-- `openadapt-capture` — multi-process recording (pynput, mss, av/ffmpeg, sounddevice). SQLAlchemy + Alembic for per-capture SQLite DBs. Has its own entry point (`capture`).
+- `screencap-engine` (`sc_engine`) — multi-process recording (pynput, mss, av/ffmpeg, sounddevice). SQLAlchemy + Alembic for per-capture SQLite DBs. Has its own entry point (`capture`).
 
 The vendored package is co-installed via the root `pyproject.toml` `packages.find.where` — it is NOT a separate pip install.
 

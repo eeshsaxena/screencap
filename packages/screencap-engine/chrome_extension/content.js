@@ -79,7 +79,7 @@ const IMPLICIT_ROLES = {
 
 function setMode(mode) {
   currentMode = mode;
-  console.log(`[OpenAdapt] Mode set to: ${currentMode}`);
+  console.log(`[ScreenCap] Mode set to: ${currentMode}`);
 
   if (currentMode === 'record') {
     if (!recordListenersAttached) attachRecordListeners();
@@ -660,4 +660,4 @@ chrome.runtime.onMessage.addListener((message, sender, sendResponse) => {
 
 // ============ Initialization ============
 
-console.log('[OpenAdapt] Content script loaded');
+console.log('[ScreenCap] Content script loaded');

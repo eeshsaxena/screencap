@@ -1,4 +1,4 @@
-"""Shared keyboard shortcuts for all OpenAdapt viewers.
+"""Shared keyboard shortcuts for all screencap viewers.
 
 This module provides a unified keyboard shortcut system that ensures
 consistent UX across benchmark, training, and capture viewers.
@@ -14,7 +14,7 @@ def get_keyboard_shortcuts_js() -> str:
         JavaScript code that implements standardized keyboard shortcuts.
     """
     return """
-// Unified OpenAdapt Keyboard Shortcuts
+// Unified ScreenCap Keyboard Shortcuts
 // Standard shortcuts for consistent UX across all viewers
 
 const KeyboardShortcuts = {

@@ -1,4 +1,4 @@
-# Whisper Integration Plan for openadapt-capture
+# Whisper Integration Plan for screencap-engine
 
 ## 1. Current State Analysis
 
@@ -13,7 +13,7 @@
 - No dedicated whisper-related repository was found
 - Main project is OpenAdapt for "Generative Process Automation"
 
-### 1.2 Current Whisper Usage in openadapt-capture
+### 1.2 Current Whisper Usage in screencap-engine
 
 The package already has whisper integration in two places:
 
@@ -25,13 +25,13 @@ transcribe = [
 ]
 ```
 
-**openadapt_capture/audio.py:**
+**sc_engine/audio.py:**
 - Lazy imports whisper via `_import_whisper()`
 - `AudioRecorder.transcribe()` method for batch transcription
 - `ContinuousAudioCapture` class with streaming transcription support
 - Uses `whisper.load_model()` and `model.transcribe()` APIs
 
-**openadapt_capture/cli.py:**
+**sc_engine/cli.py:**
 - `transcribe` command with two modes:
   - `--api`: Uses OpenAI Whisper API (`whisper-1` model)
   - Local: Uses openai-whisper library (tiny, base, small, medium, large models)
@@ -253,7 +253,7 @@ result = transcribe(
 **Pros:**
 - Unified API across all backends
 - Automatic backend selection based on platform
-- Single dependency for openadapt-capture
+- Single dependency for screencap-engine
 - Version constraints managed centrally
 
 **Cons:**
@@ -275,7 +275,7 @@ RUN pip install openai-whisper
 COPY whisper_service.py /app/
 CMD ["python", "/app/whisper_service.py"]
 
-# In openadapt-capture
+# In screencap-engine
 import subprocess
 result = subprocess.run(
     ["docker", "run", "oa-whisper", "transcribe", audio_path],
@@ -328,7 +328,7 @@ transcribe-macos = [
 
 **Phase 2: Unified Backend Selection (Medium-term)**
 ```python
-# openadapt_capture/transcription.py
+# sc_engine/transcription.py
 
 def get_transcription_backend():
     """Auto-detect best available backend."""
@@ -459,4 +459,4 @@ If transcription becomes a core feature used across multiple OpenAdapt packages,
 ---
 
 *Document created: 2026-01-16*
-*Author: Research analysis for openadapt-capture whisper integration*
+*Author: Research analysis for screencap-engine whisper integration*

@@ -71,7 +71,7 @@ class BrowserEventRecord:
     """Browser event record for storage.
 
     This is a simple dataclass that wraps browser events for storage,
-    following the pattern used in openadapt-capture's events.py.
+    following the pattern used in screencap-engine's events.py.
     """
 
     timestamp: float

@@ -1,4 +1,4 @@
-"""Utility functions for openadapt-capture.
+"""Utility functions for screencap-engine.
 
 Copied from legacy OpenAdapt utils.py — timestamp management, screenshot capture,
 and multiprocessing helpers. Only import paths are changed.

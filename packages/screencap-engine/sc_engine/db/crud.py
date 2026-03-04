@@ -1,4 +1,4 @@
-"""CRUD operations for openadapt-capture database.
+"""CRUD operations for screencap-engine database.
 
 Copied from legacy OpenAdapt db/crud.py, adapted for per-capture databases.
 Only import paths are changed; function signatures and logic are identical.

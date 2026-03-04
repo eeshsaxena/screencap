@@ -1,10 +1,10 @@
-"""Side-by-side benchmark: legacy OpenAdapt vs new openadapt-capture recording patterns.
+"""Side-by-side benchmark: legacy OpenAdapt vs new screencap-engine recording patterns.
 
 Extracts the core screenshot capture + video encoding loops from both codebases
 and runs them in identical conditions for a fair comparison.
 
 Usage:
-    cd /Users/abrichr/oa/src/openadapt-capture
+    cd /Users/abrichr/oa/src/screencap-engine
     uv run python scripts/legacy_vs_new_benchmark.py
 """
 
@@ -212,7 +212,7 @@ def run_legacy_benchmark(output_dir, duration, record_full_video=False):
 
 
 # ===================================================================
-# New Pattern (from openadapt-capture)
+# New Pattern (from screencap-engine)
 # ===================================================================
 
 def _new_video_writer_worker(q, video_path, width, height, fps):
@@ -286,7 +286,7 @@ def _new_video_writer_worker(q, video_path, width, height, fps):
 
 
 def run_new_benchmark(output_dir, duration, record_full_video=False):
-    """Run the new openadapt-capture recording pattern."""
+    """Run the new screencap-engine recording pattern."""
     output_dir = Path(output_dir)
     output_dir.mkdir(parents=True, exist_ok=True)
 

@@ -1,4 +1,4 @@
-"""OpenAdapt Capture - GUI interaction capture.
+"""ScreenCap Engine - GUI interaction capture.
 
 Platform-agnostic event streams with time-aligned media.
 """

@@ -1,1 +1,1 @@
-"""Tests for openadapt-capture."""
+"""Tests for screencap-engine."""

@@ -1,8 +1,8 @@
-# Claude Code Instructions for openadapt-capture
+# Claude Code Instructions for screencap-engine
 
 ## Overview
 
-**openadapt-capture** is the data collection component of the OpenAdapt GUI automation ecosystem. It captures platform-agnostic GUI interaction streams (mouse, keyboard, screen) with time-aligned media for training ML models or replaying workflows.
+**screencap-engine** (`sc_engine`) is the recording engine for the screencap CLI. It captures platform-agnostic GUI interaction streams (mouse, keyboard, screen) with time-aligned media.
 
 Key responsibilities:
 - Record human demonstrations with mouse, keyboard, and screen capture
@@ -14,28 +14,22 @@ Key responsibilities:
 ## Quick Commands
 
 ```bash
-# Install the package
-uv add openadapt-capture
-
-# Install with audio support (large download)
-uv add "openadapt-capture[audio]"
-
 # Run tests (exclude browser bridge tests which need websockets fixtures)
-uv run pytest tests/ -v --ignore=tests/test_browser_bridge.py
+pytest tests/ -v --ignore=tests/test_browser_bridge.py
 
 # Run slow integration tests (requires accessibility permissions)
-uv run pytest tests/ -v -m slow
+pytest tests/ -v -m slow
 
 # Record a GUI capture
-uv run python -c "
-from openadapt_capture import Recorder
+python -c "
+from sc_engine import Recorder
 with Recorder('./my_capture', task_description='Demo task') as recorder:
     input('Perform the task, then press Enter to stop recording...')
 "
 
 # Load and analyze a capture
-uv run python -c "
-from openadapt_capture import Capture
+python -c "
+from sc_engine import Capture
 capture = Capture.load('./my_capture')
 for action in capture.actions():
     print(f'{action.timestamp}: {action.type} at ({action.x}, {action.y})')
@@ -45,8 +39,8 @@ for action in capture.actions():
 ## Architecture
 
 ```
-openadapt_capture/
-  recorder.py      # Multi-process recorder (legacy OpenAdapt record.py architecture)
+sc_engine/
+  recorder.py      # Multi-process recorder
   capture.py       # CaptureSession class for loading and iterating events/actions
   events.py        # Pydantic event models (MouseMoveEvent, KeyDownEvent, etc.)
   processing.py    # Event merging pipeline (clicks, drags, typing)
@@ -69,11 +63,11 @@ openadapt_capture/
 ## Key Components
 
 ### Recorder
-Multi-process recording system (copied from legacy OpenAdapt):
+Multi-process recording system:
 - `Recorder(capture_dir, task_description)` - Context manager
 - Internally runs `record()` which spawns reader threads + writer processes
 - Action-gated video capture (only encode frames when user acts)
-- Stop via context manager exit or stop sequences (default: `llqq`)
+- Stop via context manager exit or stop sequences (default: `oa.stop` / `llqq`)
 
 ### CaptureSession / Capture
 Load and query recorded captures:
@@ -81,7 +75,6 @@ Load and query recorded captures:
 - `capture.raw_events()` - List of Pydantic events from SQLAlchemy DB
 - `capture.actions()` - Iterator over processed actions (clicks, drags, typing)
 - `action.screenshot` - PIL Image at time of action (extracted from video)
-- `action.x`, `action.y`, `action.dx`, `action.dy`, `action.button`, `action.text`
 
 ### Storage
 SQLAlchemy-based per-capture databases:
@@ -97,16 +90,11 @@ SQLAlchemy-based per-capture databases:
 
 ```bash
 # Fast tests (unit + integration, no recording)
-uv run pytest tests/ -v --ignore=tests/test_browser_bridge.py -m "not slow"
+pytest tests/ -v --ignore=tests/test_browser_bridge.py -m "not slow"
 
 # Slow tests (full recording pipeline with pynput synthetic input)
-uv run pytest tests/ -v -m slow
+pytest tests/ -v -m slow
 
 # All tests
-uv run pytest tests/ -v --ignore=tests/test_browser_bridge.py
+pytest tests/ -v --ignore=tests/test_browser_bridge.py
 ```
-
-## Related Projects
-
-- [openadapt-ml](https://github.com/OpenAdaptAI/openadapt-ml) - Train models on captures
-- [openadapt-evals](https://github.com/OpenAdaptAI/openadapt-evals) - Benchmark evaluation

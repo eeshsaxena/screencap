@@ -379,7 +379,7 @@ def deepconvert_objc(object: Any) -> Any | list | dict | Literal[0]:
             logger.warning(
                 f"Unknown type: {type(object)} - "
                 "Please report this on GitHub: "
-                "github.com/OpenAdaptAI/openadapt-capture/issues/new"
+                "github.com/Divide-By-0/screencap/issues/new"
             )
             logger.warning(f"{object=}")
     if value:

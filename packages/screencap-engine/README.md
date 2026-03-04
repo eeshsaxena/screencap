@@ -1,11 +1,11 @@
 # OpenAdapt Capture
 
-[![Build Status](https://github.com/OpenAdaptAI/openadapt-capture/actions/workflows/test.yml/badge.svg)](https://github.com/OpenAdaptAI/openadapt-capture/actions/workflows/test.yml)
+[![Build Status](https://github.com/OpenAdaptAI/screencap-engine/actions/workflows/test.yml/badge.svg)](https://github.com/OpenAdaptAI/screencap-engine/actions/workflows/test.yml)
 [![License: MIT](https://img.shields.io/badge/License-MIT-yellow.svg)](https://opensource.org/licenses/MIT)
 [![Python 3.10+](https://img.shields.io/badge/python-3.10%2B-blue)](https://www.python.org/downloads/)
 
-[![PyPI version](https://img.shields.io/pypi/v/openadapt-capture.svg)](https://pypi.org/project/openadapt-capture/)
-[![Downloads](https://img.shields.io/pypi/dm/openadapt-capture.svg)](https://pypi.org/project/openadapt-capture/)
+[![PyPI version](https://img.shields.io/pypi/v/screencap-engine.svg)](https://pypi.org/project/screencap-engine/)
+[![Downloads](https://img.shields.io/pypi/dm/screencap-engine.svg)](https://pypi.org/project/screencap-engine/)
 
 **OpenAdapt Capture** is the data collection component of the [OpenAdapt](https://github.com/OpenAdaptAI) GUI automation ecosystem.
 
@@ -39,7 +39,7 @@ Capture platform-agnostic GUI interaction streams with time-aligned screenshots 
 
 | Component | Purpose | Repository |
 |-----------|---------|------------|
-| **openadapt-capture** | Record human demonstrations | [GitHub](https://github.com/OpenAdaptAI/openadapt-capture) |
+| **screencap-engine** | Record human demonstrations | [GitHub](https://github.com/OpenAdaptAI/screencap-engine) |
 | **openadapt-ml** | Train and evaluate GUI automation models | [GitHub](https://github.com/OpenAdaptAI/openadapt-ml) |
 
 ---
@@ -47,7 +47,7 @@ Capture platform-agnostic GUI interaction streams with time-aligned screenshots 
 ## Installation
 
 ```bash
-uv add openadapt-capture
+uv add screencap-engine
 ```
 
 This includes everything needed to capture and replay GUI interactions (mouse, keyboard, screen recording).
@@ -55,7 +55,7 @@ This includes everything needed to capture and replay GUI interactions (mouse, k
 For audio capture with Whisper transcription (large download):
 
 ```bash
-uv add "openadapt-capture[audio]"
+uv add "screencap-engine[audio]"
 ```
 
 ## Quick Start
@@ -63,7 +63,7 @@ uv add "openadapt-capture[audio]"
 ### Capture
 
 ```python
-from openadapt_capture import Recorder
+from sc_engine import Recorder
 
 # Record GUI interactions
 with Recorder("./my_capture", task_description="Demo task") as recorder:
@@ -74,7 +74,7 @@ with Recorder("./my_capture", task_description="Demo task") as recorder:
 ### Replay / Analysis
 
 ```python
-from openadapt_capture import Capture
+from sc_engine import Capture
 
 # Load and iterate over time-aligned events
 capture = Capture.load("./my_capture")
@@ -88,9 +88,9 @@ for action in capture.actions():
 ### Low-Level API
 
 ```python
-from openadapt_capture.db import create_db, get_session_for_path
-from openadapt_capture.db import crud
-from openadapt_capture.db.models import Recording, ActionEvent
+from sc_engine.db import create_db, get_session_for_path
+from sc_engine.db import crud
+from sc_engine.db.models import Recording, ActionEvent
 
 # Create a database
 engine, Session = create_db("/path/to/recording.db")
@@ -115,7 +115,7 @@ crud.insert_action_event(session, recording, 1700000001.0, {
 })
 
 # Query events back
-from openadapt_capture.capture import CaptureSession
+from sc_engine.capture import CaptureSession
 capture = CaptureSession.load("/path/to/capture_dir")
 actions = list(capture.actions())
 ```
@@ -173,7 +173,7 @@ Generate animated demos and interactive viewers from recordings:
 ### Animated GIF Demo
 
 ```python
-from openadapt_capture import Capture, create_demo
+from sc_engine import Capture, create_demo
 
 capture = Capture.load("./my_capture")
 create_demo(capture, output="demo.gif", fps=10, max_duration=15)
@@ -182,7 +182,7 @@ create_demo(capture, output="demo.gif", fps=10, max_duration=15)
 ### Interactive HTML Viewer
 
 ```python
-from openadapt_capture import Capture, create_html
+from sc_engine import Capture, create_html
 
 capture = Capture.load("./my_capture")
 create_html(capture, output="viewer.html", include_audio=True)

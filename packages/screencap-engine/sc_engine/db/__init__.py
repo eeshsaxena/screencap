@@ -1,4 +1,4 @@
-"""Package for interacting with the openadapt-capture database.
+"""Package for interacting with the screencap-engine database.
 
 Copied from legacy OpenAdapt db/db.py, adapted for per-capture databases.
 """
