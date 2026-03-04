@@ -260,18 +260,17 @@ class TestPermissionPrompting:
         assert "[1/1]" in all_output
 
     def test_accessibility_missing_step_by_step_then_continues(self):
-        """Accessibility missing: shows step [1/1], opens Settings, polls, continues."""
+        """Accessibility missing: shows step [1/1], opens Settings, polls via subprocess, continues."""
         from screencap.recorder import _check_macos_permissions
 
         platform = self._make_platform_mock(screen=True, accessibility=False, input_monitoring=True)
-        # Initial check: False, poll check: True, final verify: True
-        platform.is_accessibility_enabled.side_effect = [False, True, True]
 
         with (
             mock.patch("screencap.recorder.sys") as mock_sys,
             mock.patch("screencap.recorder.time"),
             mock.patch("screencap.recorder.subprocess") as mock_subprocess,
             mock.patch("screencap.recorder.console") as mock_console,
+            mock.patch("screencap.recorder._check_permission_fresh", side_effect=[True, True]),
             mock.patch(
                 "openadapt_capture.platform.darwin.DarwinPlatform",
                 platform,
@@ -281,8 +280,8 @@ class TestPermissionPrompting:
             _check_macos_permissions()
 
         platform.request_accessibility_access.assert_called_once()
-        call_args = mock_subprocess.run.call_args[0][0]
-        assert "Privacy_Accessibility" in call_args[1]
+        # subprocess.run called for opening Settings
+        assert mock_subprocess.run.called
         all_output = " ".join(str(c) for c in mock_console.print.call_args_list)
         assert "[1/1]" in all_output
         assert "granted" in all_output.lower()
@@ -292,13 +291,13 @@ class TestPermissionPrompting:
         from screencap.recorder import _check_macos_permissions
 
         platform = self._make_platform_mock(screen=True, accessibility=False, input_monitoring=True)
-        platform.is_accessibility_enabled.return_value = False
 
         with (
             mock.patch("screencap.recorder.sys") as mock_sys,
             mock.patch("screencap.recorder.time"),
             mock.patch("screencap.recorder.subprocess"),
             mock.patch("screencap.recorder.console") as mock_console,
+            mock.patch("screencap.recorder._check_permission_fresh", return_value=False),
             mock.patch(
                 "openadapt_capture.platform.darwin.DarwinPlatform",
                 platform,
@@ -317,16 +316,15 @@ class TestPermissionPrompting:
         from screencap.recorder import _check_macos_permissions
 
         platform = self._make_platform_mock(screen=True, accessibility=False, input_monitoring=False)
-        # Accessibility: False (initial), True (poll), True (verify)
-        platform.is_accessibility_enabled.side_effect = [False, True, True]
-        # Input Monitoring: False (initial), True (poll), True (verify)
-        platform.is_input_monitoring_enabled.side_effect = [False, True, True]
+        # Each permission: True (poll granted), True (verify)
+        fresh_results = [True, True, True, True]
 
         with (
             mock.patch("screencap.recorder.sys") as mock_sys,
             mock.patch("screencap.recorder.time"),
             mock.patch("screencap.recorder.subprocess") as mock_subprocess,
             mock.patch("screencap.recorder.console") as mock_console,
+            mock.patch("screencap.recorder._check_permission_fresh", side_effect=fresh_results),
             mock.patch(
                 "openadapt_capture.platform.darwin.DarwinPlatform",
                 platform,
@@ -335,13 +333,14 @@ class TestPermissionPrompting:
             mock_sys.platform = "darwin"
             _check_macos_permissions()
 
-        # Settings opened twice: Accessibility then Input Monitoring
-        panes_opened = [
-            call[0][0][1] for call in mock_subprocess.run.call_args_list
+        # Settings opened twice (via subprocess.run for 'open' command)
+        open_calls = [
+            call for call in mock_subprocess.run.call_args_list
+            if call[0][0][0] == "open"
         ]
-        assert len(panes_opened) == 2
-        assert "Privacy_Accessibility" in panes_opened[0]
-        assert "Privacy_ListenEvent" in panes_opened[1]
+        assert len(open_calls) == 2
+        assert "Privacy_Accessibility" in open_calls[0][0][0][1]
+        assert "Privacy_ListenEvent" in open_calls[1][0][0][1]
         all_output = " ".join(str(c) for c in mock_console.print.call_args_list)
         assert "[1/2]" in all_output
         assert "[2/2]" in all_output
@@ -351,14 +350,14 @@ class TestPermissionPrompting:
         from screencap.recorder import _check_macos_permissions
 
         platform = self._make_platform_mock(screen=False, accessibility=False, input_monitoring=False)
-        platform.is_accessibility_enabled.side_effect = [False, True, True]
-        platform.is_input_monitoring_enabled.side_effect = [False, True, True]
+        fresh_results = [True, True, True, True]
 
         with (
             mock.patch("screencap.recorder.sys") as mock_sys,
             mock.patch("screencap.recorder.time"),
             mock.patch("screencap.recorder.subprocess") as mock_subprocess,
             mock.patch("screencap.recorder.console") as mock_console,
+            mock.patch("screencap.recorder._check_permission_fresh", side_effect=fresh_results),
             mock.patch(
                 "openadapt_capture.platform.darwin.DarwinPlatform",
                 platform,
@@ -372,14 +371,27 @@ class TestPermissionPrompting:
         platform.request_accessibility_access.assert_called_once()
         platform.request_input_monitoring_access.assert_called_once()
         platform.request_screen_recording_access.assert_called_once()
-        # Last Settings pane should be Screen Recording
-        last_call_args = mock_subprocess.run.call_args[0][0]
-        assert "Privacy_ScreenCapture" in last_call_args[1]
         all_output = " ".join(str(c) for c in mock_console.print.call_args_list)
         assert "[1/3]" in all_output
         assert "[2/3]" in all_output
         assert "[3/3]" in all_output
         assert "terminal restart" in all_output.lower()
+
+    def test_check_permission_fresh_runs_subprocess(self):
+        """_check_permission_fresh should run a Python subprocess and parse stdout."""
+        from screencap.recorder import _check_permission_fresh
+
+        mock_result = mock.MagicMock()
+        mock_result.stdout = "True\n"
+
+        with mock.patch("screencap.recorder.subprocess") as mock_subprocess:
+            mock_subprocess.run.return_value = mock_result
+            assert _check_permission_fresh("Accessibility") is True
+
+        mock_subprocess.run.assert_called_once()
+        call_args = mock_subprocess.run.call_args
+        assert call_args[0][0][0] == sys.executable
+        assert "AXIsProcessTrustedWithOptions" in call_args[0][0][2]
 
     def test_non_darwin_platform_skips_check(self):
         """On non-darwin platforms, _check_macos_permissions is a no-op."""

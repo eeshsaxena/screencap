@@ -243,6 +243,36 @@ def _open_privacy_settings(pane: str) -> None:
     )
 
 
+# Python snippets to check each permission in a fresh subprocess.
+# macOS caches permission state within a process, so in-process checks
+# won't detect grants made after startup.  Spawning a subprocess gives
+# us the real, current OS state.
+_PERMISSION_CHECK_CODE: dict[str, str] = {
+    "Accessibility": (
+        "from ApplicationServices import AXIsProcessTrustedWithOptions, kAXTrustedCheckOptionPrompt; "
+        "print(bool(AXIsProcessTrustedWithOptions({kAXTrustedCheckOptionPrompt: False})))"
+    ),
+    "Input Monitoring": (
+        "import Quartz; print(bool(Quartz.CGPreflightListenEventAccess()))"
+    ),
+}
+
+
+def _check_permission_fresh(name: str) -> bool:
+    """Check a permission in a fresh subprocess to bypass OS-level caching."""
+    code = _PERMISSION_CHECK_CODE.get(name)
+    if not code:
+        return False
+    try:
+        result = subprocess.run(
+            [sys.executable, "-c", code],
+            capture_output=True, text=True, timeout=5,
+        )
+        return result.stdout.strip() == "True"
+    except Exception:
+        return False
+
+
 def _check_macos_permissions() -> None:
     """Check macOS permissions and guide the user through granting them.
 
@@ -250,6 +280,9 @@ def _check_macos_permissions() -> None:
     1. Non-restart permissions first (Accessibility, Input Monitoring) —
        triggers the native prompt, opens System Settings, polls until granted.
     2. Screen Recording last — requires a terminal restart, so we exit.
+
+    Polling uses a fresh subprocess for each check because macOS caches
+    permission state within a process lifetime.
     """
     if sys.platform != "darwin":
         return
@@ -293,14 +326,14 @@ def _check_macos_permissions() -> None:
             console.print("    screencap start")
             raise SystemExit(1)
 
-        # Non-restart permission — poll until granted or timeout
+        # Non-restart permission — poll with subprocess checks until granted
         with console.status(f"[bold]  Waiting for {name}...[/bold]"):
-            for _ in range(60):
+            for _ in range(120):
                 time.sleep(1)
-                if check_fn():
+                if _check_permission_fresh(name):
                     break
 
-        if check_fn():
+        if _check_permission_fresh(name):
             console.print(f"  [green]✓[/green] {name} granted!\n")
         else:
             console.print(f"\n  [red]Error:[/red] {name} was not granted in time.")
