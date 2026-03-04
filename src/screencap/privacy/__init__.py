@@ -226,11 +226,18 @@ class Anonymizer:
 # ---------------------------------------------------------------------------
 
 
-def create_default_pipeline() -> DetectionPipeline:
+def create_default_pipeline(
+    pii_engine: str | None = None,
+) -> DetectionPipeline:
     """Create a pipeline with all available detectors.
 
-    Call ONCE per scrub session — detector constructors load NLP models.
-    Reuse the returned pipeline for all text chunks.
+    Args:
+        pii_engine: PII backend to use. One of "presidio", "datafog", or
+            None (auto-detect: tries Presidio first, falls back to DataFog).
+
+    Call ONCE per scrub session — detector constructors load NLP models
+    (~200-500ms for Presidio/spaCy). Reuse the returned pipeline for all
+    text chunks.
 
     Raises ImportError with an actionable message if privacy deps are missing.
     """
@@ -251,14 +258,39 @@ def create_default_pipeline() -> DetectionPipeline:
             "Install with: pip install 'screencap[privacy]'"
         )
 
-    try:
-        from screencap.privacy.pii import PiiDetector
+    # PII engine selection
+    pii_loaded = False
+    if pii_engine in (None, "presidio"):
+        try:
+            from screencap.privacy.pii import PiiDetector
 
-        detectors.append(PiiDetector())
-    except ImportError:
+            detectors.append(PiiDetector())
+            pii_loaded = True
+        except ImportError:
+            if pii_engine == "presidio":
+                raise ImportError(
+                    "Presidio not installed. "
+                    "Install with: pip install presidio-analyzer"
+                )
+            logger.info("Presidio not available, trying DataFog...")
+
+    if not pii_loaded and pii_engine in (None, "datafog"):
+        try:
+            from screencap.privacy.pii_datafog import DataFogPiiDetector
+
+            detectors.append(DataFogPiiDetector())
+            pii_loaded = True
+        except ImportError:
+            if pii_engine == "datafog":
+                raise ImportError(
+                    "DataFog not installed. "
+                    "Install with: pip install datafog"
+                )
+
+    if not pii_loaded:
         logger.warning(
-            "PII engine not installed — PII detection disabled. "
-            "Install with: pip install 'screencap[privacy]'"
+            "No PII engine installed — PII detection disabled. "
+            "Install with: pip install presidio-analyzer  (or: pip install datafog)"
         )
 
     if len(detectors) < 2:
