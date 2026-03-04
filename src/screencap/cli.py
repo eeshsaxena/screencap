@@ -844,7 +844,7 @@ def upload(names, all_recordings, dry_run, force, jobs):
         if needs_export:
             console.print(
                 "[yellow]Warning:[/yellow] Auto-export includes all captured keystrokes. "
-                "Run 'screencap scrub' first for sensitive sessions.",
+                "Review recordings for sensitive data before sharing.",
                 highlight=False,
             )
 
