@@ -65,3 +65,115 @@ def test_missing_config_file():
         cfg._config_cache = None
         result = cfg._load_toml()
         assert result == {}
+
+
+# --- disk threshold config tests ---
+
+
+class TestDiskWarnMb:
+    """Tests for get_disk_warn_mb()."""
+
+    def test_default_value(self):
+        from screencap.config import get_disk_warn_mb
+
+        env = {k: v for k, v in os.environ.items() if k != "SCREENCAP_DISK_WARN_MB"}
+        with mock.patch.dict(os.environ, env, clear=True):
+            assert get_disk_warn_mb() == 2000
+
+    def test_env_var_override(self):
+        from screencap.config import get_disk_warn_mb
+
+        with mock.patch.dict(os.environ, {"SCREENCAP_DISK_WARN_MB": "1000"}):
+            assert get_disk_warn_mb() == 1000
+
+    def test_env_var_zero_disables(self):
+        from screencap.config import get_disk_warn_mb
+
+        with mock.patch.dict(os.environ, {"SCREENCAP_DISK_WARN_MB": "0"}):
+            assert get_disk_warn_mb() == 0
+
+    def test_env_var_whitespace(self):
+        from screencap.config import get_disk_warn_mb
+
+        with mock.patch.dict(os.environ, {"SCREENCAP_DISK_WARN_MB": "  500  "}):
+            assert get_disk_warn_mb() == 500
+
+    def test_env_var_non_numeric(self):
+        from screencap.config import get_disk_warn_mb
+
+        with mock.patch.dict(os.environ, {"SCREENCAP_DISK_WARN_MB": "abc"}):
+            with pytest.raises(SystemExit):
+                get_disk_warn_mb()
+
+    def test_env_var_negative(self):
+        from screencap.config import get_disk_warn_mb
+
+        with mock.patch.dict(os.environ, {"SCREENCAP_DISK_WARN_MB": "-1"}):
+            with pytest.raises(SystemExit):
+                get_disk_warn_mb()
+
+    def test_toml_value(self):
+        import screencap.config as cfg
+        from screencap.config import get_disk_warn_mb
+
+        env = {k: v for k, v in os.environ.items() if k != "SCREENCAP_DISK_WARN_MB"}
+        with mock.patch.dict(os.environ, env, clear=True):
+            cfg._config_cache = {"disk_warn_mb": 3000}
+            assert get_disk_warn_mb() == 3000
+
+    def test_toml_rejects_float(self):
+        import screencap.config as cfg
+        from screencap.config import get_disk_warn_mb
+
+        env = {k: v for k, v in os.environ.items() if k != "SCREENCAP_DISK_WARN_MB"}
+        with mock.patch.dict(os.environ, env, clear=True):
+            cfg._config_cache = {"disk_warn_mb": 500.0}
+            with pytest.raises(SystemExit):
+                get_disk_warn_mb()
+
+    def test_toml_rejects_string(self):
+        import screencap.config as cfg
+        from screencap.config import get_disk_warn_mb
+
+        env = {k: v for k, v in os.environ.items() if k != "SCREENCAP_DISK_WARN_MB"}
+        with mock.patch.dict(os.environ, env, clear=True):
+            cfg._config_cache = {"disk_warn_mb": "500"}
+            with pytest.raises(SystemExit):
+                get_disk_warn_mb()
+
+
+class TestDiskStopMb:
+    """Tests for get_disk_stop_mb()."""
+
+    def test_default_value(self):
+        from screencap.config import get_disk_stop_mb
+
+        env = {k: v for k, v in os.environ.items() if k != "SCREENCAP_DISK_STOP_MB"}
+        with mock.patch.dict(os.environ, env, clear=True):
+            assert get_disk_stop_mb() == 500
+
+    def test_env_var_override(self):
+        from screencap.config import get_disk_stop_mb
+
+        with mock.patch.dict(os.environ, {"SCREENCAP_DISK_STOP_MB": "200"}):
+            assert get_disk_stop_mb() == 200
+
+    def test_env_var_zero_disables(self):
+        from screencap.config import get_disk_stop_mb
+
+        with mock.patch.dict(os.environ, {"SCREENCAP_DISK_STOP_MB": "0"}):
+            assert get_disk_stop_mb() == 0
+
+    def test_env_var_non_numeric(self):
+        from screencap.config import get_disk_stop_mb
+
+        with mock.patch.dict(os.environ, {"SCREENCAP_DISK_STOP_MB": "xyz"}):
+            with pytest.raises(SystemExit):
+                get_disk_stop_mb()
+
+    def test_env_var_negative(self):
+        from screencap.config import get_disk_stop_mb
+
+        with mock.patch.dict(os.environ, {"SCREENCAP_DISK_STOP_MB": "-100"}):
+            with pytest.raises(SystemExit):
+                get_disk_stop_mb()

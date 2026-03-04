@@ -114,6 +114,56 @@ def get_base_dir() -> Path:
     return _DEFAULT_BASE
 
 
+def get_disk_warn_mb() -> int:
+    """Minimum free MB to start recording / show warning. Default 2000."""
+    env = os.environ.get("SCREENCAP_DISK_WARN_MB")
+    if env is not None:
+        env = env.strip()
+        try:
+            val = int(env)
+        except ValueError:
+            raise SystemExit(
+                f"Error: SCREENCAP_DISK_WARN_MB must be an integer, got: {env!r}"
+            )
+        if val < 0:
+            raise SystemExit(
+                f"Error: SCREENCAP_DISK_WARN_MB cannot be negative, got: {val}"
+            )
+        return val
+    cfg = _load_toml()
+    val = cfg.get("disk_warn_mb", 2000)
+    if not isinstance(val, int):
+        raise SystemExit(
+            f"Error: disk_warn_mb in config.toml must be an integer, got: {val!r}"
+        )
+    return val
+
+
+def get_disk_stop_mb() -> int:
+    """Free MB threshold to auto-stop recording. Default 500."""
+    env = os.environ.get("SCREENCAP_DISK_STOP_MB")
+    if env is not None:
+        env = env.strip()
+        try:
+            val = int(env)
+        except ValueError:
+            raise SystemExit(
+                f"Error: SCREENCAP_DISK_STOP_MB must be an integer, got: {env!r}"
+            )
+        if val < 0:
+            raise SystemExit(
+                f"Error: SCREENCAP_DISK_STOP_MB cannot be negative, got: {val}"
+            )
+        return val
+    cfg = _load_toml()
+    val = cfg.get("disk_stop_mb", 500)
+    if not isinstance(val, int):
+        raise SystemExit(
+            f"Error: disk_stop_mb in config.toml must be an integer, got: {val!r}"
+        )
+    return val
+
+
 def resolve_recording_dir(name: str) -> Path:
     """Resolve a recording name to a directory path, with traversal protection.
 

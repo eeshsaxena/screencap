@@ -21,9 +21,26 @@ from rich.panel import Panel
 from rich.text import Text
 
 from screencap import __version__
-from screencap.config import get_app_versions, get_audio_default, get_recordings_dir, get_wifi_metrics
+from screencap.config import (
+    get_app_versions,
+    get_audio_default,
+    get_disk_stop_mb,
+    get_disk_warn_mb,
+    get_recordings_dir,
+    get_wifi_metrics,
+)
 
 console = Console()
+
+_DISK_CHECK_INTERVAL = 30  # seconds between disk space checks
+
+
+class DiskFullError(Exception):
+    """Raised when recording auto-stops due to low disk space."""
+
+    def __init__(self, capture_dir: Path, elapsed: float):
+        self.capture_dir = capture_dir
+        self.elapsed = elapsed
 
 
 # ---------------------------------------------------------------------------
@@ -92,7 +109,7 @@ def _print_banner() -> None:
 # Live recording display
 # ---------------------------------------------------------------------------
 
-def _build_live_display(name: str, elapsed: float, pulse_on: bool) -> Group:
+def _build_live_display(name: str, elapsed: float, pulse_on: bool, disk_warning: str = "") -> Group:
     """Build the Rich renderable for the live recording indicator."""
     dot_style = "bold #f472b6" if pulse_on else "dim #f472b6"
     timer = _fmt_duration_clock(elapsed)
@@ -116,6 +133,9 @@ def _build_live_display(name: str, elapsed: float, pulse_on: bool) -> Group:
 
     content = Text()
     content.append_text(line1)
+    if disk_warning:
+        content.append("\n\n")
+        content.append(f"   {disk_warning}")
     content.append("\n\n")
     content.append_text(line2)
 
@@ -398,6 +418,39 @@ def start_recording(
         )
         raise SystemExit(1)
 
+    # --- Disk space thresholds ---
+    warn_mb = get_disk_warn_mb()
+    stop_mb = get_disk_stop_mb()
+
+    if warn_mb > 0 and stop_mb > 0 and stop_mb >= warn_mb:
+        console.print(
+            f"[red]Error:[/red] disk_stop_mb ({stop_mb}) must be less than "
+            f"disk_warn_mb ({warn_mb}). Adjust your config or env vars."
+        )
+        raise SystemExit(1)
+
+    # --- Pre-recording disk space check (before mkdir) ---
+    check_path = capture_dir.parent if not capture_dir.exists() else capture_dir
+    try:
+        free = shutil.disk_usage(check_path).free
+        warn_bytes = warn_mb * 1_048_576
+        if warn_mb > 0 and free < warn_bytes:
+            console.print(
+                f"[red]Error:[/red] Only {free / 1e9:.1f} GB free on "
+                f"{check_path}. Need at least "
+                f"{warn_bytes / 1e9:.1f} GB to start recording.\n"
+                f"  Set SCREENCAP_DISK_WARN_MB to lower the threshold, or =0 to disable."
+            )
+            raise SystemExit(1)
+    except FileNotFoundError:
+        console.print(
+            f"[red]Error:[/red] Recording path not found: {check_path}"
+        )
+        raise SystemExit(1)
+    except OSError as e:
+        if verbose:
+            console.print(f"[yellow]Warning:[/yellow] Disk space check failed: {e}")
+
     capture_dir.mkdir(parents=True, exist_ok=True)
 
     # Suppress loguru/tqdm noise unless --verbose.
@@ -448,10 +501,16 @@ def start_recording(
     atexit.register(_cleanup_children)
 
     # Track how stop happened for messaging after Live exits
-    _stop_reason = ""  # "graceful", "force", or "interrupt"
+    _stop_reason = ""  # "graceful", "force", "disk_full", or "interrupt"
     _stop_event = threading.Event()
     _saved_stdout = None  # Will hold real stdout when we redirect to devnull
     _saved_stderr = None  # Will hold real stderr when we redirect to devnull
+
+    # Disk check state (local to this function)
+    last_disk_check = 0.0
+    disk_warning = ""
+    disk_check_interval = _DISK_CHECK_INTERVAL
+    _disk_free_at_stop = 0.0
 
     try:
         # Build Recorder kwargs, only passing non-None values
@@ -522,14 +581,44 @@ def start_recording(
                     while recorder.is_recording and not _stop_event.is_set():
                         elapsed = time.time() - t0
                         pulse_on = int(elapsed) % 2 == 0
-                        live.update(_build_live_display(name, elapsed, pulse_on))
+
+                        # Periodic disk space check
+                        if elapsed - last_disk_check >= disk_check_interval:
+                            last_disk_check = elapsed
+                            try:
+                                free = shutil.disk_usage(capture_dir).free
+                                free_mb = free / 1_048_576
+
+                                if stop_mb > 0 and free_mb < stop_mb:
+                                    if not _stop_event.is_set():
+                                        _stop_reason = "disk_full"
+                                        _disk_free_at_stop = free_mb
+                                        disk_warning = f"Disk critically low: {free_mb:.0f} MB free. Stopping."
+                                        _stop_event.set()
+                                        recorder.stop()
+                                elif warn_mb > 0 and free_mb < warn_mb:
+                                    disk_warning = f"Low disk: {free / 1e9:.1f} GB free"
+                                    disk_check_interval = 5
+                                else:
+                                    disk_warning = ""
+                                    disk_check_interval = _DISK_CHECK_INTERVAL
+                            except OSError:
+                                disk_warning = ""
+
+                        live.update(_build_live_display(name, elapsed, pulse_on, disk_warning))
                         _stop_event.wait(0.5)
                 finally:
                     # Replace the panel with the stop message.  Rich
                     # knows the panel height and will overwrite every
                     # line, including borders.  The message stays on
                     # screen because transient=False (default).
-                    if _stop_reason == "graceful":
+                    if _stop_reason == "disk_full":
+                        live.update(Text(
+                            f"  ■ Recording auto-stopped: disk space critically low "
+                            f"({_disk_free_at_stop:.0f} MB remaining)",
+                            style="#f59e0b",
+                        ))
+                    elif _stop_reason == "graceful":
                         live.update(Text("  ■ Stopping recording...", style="#a78bfa"))
                     elif _stop_reason == "force":
                         live.update(Text("  ⚡ Force quitting — terminating processes...", style="#f472b6"))
@@ -593,18 +682,23 @@ def start_recording(
     try:
         from screencap.metrics import save_metrics
 
-        save_metrics(capture_dir, "end", wifi_metrics=wifi_metrics, app_versions=app_versions)
+        stop_reason_val = _stop_reason if _stop_reason == "disk_full" else None
+        save_metrics(
+            capture_dir, "end",
+            wifi_metrics=wifi_metrics, app_versions=app_versions,
+            stop_reason=stop_reason_val,
+        )
     except Exception as e:
         if verbose:
             console.print(f"[yellow]Warning:[/yellow] Could not collect end metrics: {e}")
 
     elapsed = time.time() - t0
 
-    # Auto-generate viewer.html — disabled (too slow, does N full video scans).
-    # Run `screencap view <name>` to generate on demand instead.
-
     # Restore output if we suppressed it
     if not verbose:
         _restore_output()
+
+    if _stop_reason == "disk_full":
+        raise DiskFullError(capture_dir, elapsed)
 
     return capture_dir, elapsed

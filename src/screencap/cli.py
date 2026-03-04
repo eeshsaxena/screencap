@@ -84,11 +84,12 @@ def start(
     capture_browser_events = False if no_browser_events else None  # None = upstream default (False)
 
     try:
-        from screencap.recorder import print_summary, start_recording
+        from screencap.recorder import DiskFullError, print_summary, start_recording
     except ImportError:
         console.print(_RECORD_EXTRAS_MSG)
         raise SystemExit(1)
 
+    disk_full = False
     try:
         capture_dir, elapsed = start_recording(
             name, description or None, audio, output,
@@ -97,6 +98,10 @@ def start(
             capture_window_data=capture_window_data, capture_browser_events=capture_browser_events,
             verbose=verbose,
         )
+    except DiskFullError as e:
+        capture_dir, elapsed = e.capture_dir, e.elapsed
+        disk_full = True
+        console.print("[yellow]Skipping auto-naming/transcription: disk space is low.[/yellow]")
     except ImportError:
         console.print(_RECORD_EXTRAS_MSG)
         raise SystemExit(1)
@@ -105,7 +110,7 @@ def start(
     final_name = name
     final_dir = capture_dir
 
-    if auto_name_enabled:
+    if auto_name_enabled and not disk_full:
         # Auto-transcribe if audio was captured
         audio_path = capture_dir / "audio.flac"
         if audio and audio_path.exists() and audio_path.stat().st_size >= 1024:
