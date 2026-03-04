@@ -46,7 +46,7 @@ def open_viewer(
 
         console.print("[dim]viewer.html not found, generating...[/dim]")
         try:
-            from openadapt_capture import create_html
+            from sc_engine import create_html
 
             create_html(str(rec_dir), output=str(viewer))
         except Exception as e:
