@@ -53,7 +53,7 @@ class TestDeletePidfile:
 class TestIsScreencapProcess:
     def test_matching_process(self):
         mock_proc = mock.MagicMock()
-        mock_proc.cmdline.return_value = ["python", "-m", "openadapt_capture.recorder"]
+        mock_proc.cmdline.return_value = ["python", "-m", "sc_engine.recorder"]
         with mock.patch("psutil.Process", return_value=mock_proc):
             assert pidfile._is_screencap_process(123) is True
 

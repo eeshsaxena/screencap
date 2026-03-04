@@ -539,7 +539,7 @@ def test_export_default_writes_to_recording_dir(tmp_path):
 
     with (
         mock.patch("screencap.config.resolve_recording_dir", return_value=rec_dir),
-        mock.patch("openadapt_capture.capture.CaptureSession.load", return_value=capture),
+        mock.patch("sc_engine.capture.CaptureSession.load", return_value=capture),
     ):
         result = runner.invoke(cli, ["export", "my-rec"])
 
@@ -564,7 +564,7 @@ def test_export_stdout(tmp_path):
 
     with (
         mock.patch("screencap.config.resolve_recording_dir", return_value=rec_dir),
-        mock.patch("openadapt_capture.capture.CaptureSession.load", return_value=capture),
+        mock.patch("sc_engine.capture.CaptureSession.load", return_value=capture),
     ):
         result = runner.invoke(cli, ["export", "my-rec", "--stdout"])
 
@@ -590,7 +590,7 @@ def test_export_to_file(tmp_path):
 
     with (
         mock.patch("screencap.config.resolve_recording_dir", return_value=rec_dir),
-        mock.patch("openadapt_capture.capture.CaptureSession.load", return_value=capture),
+        mock.patch("sc_engine.capture.CaptureSession.load", return_value=capture),
     ):
         result = runner.invoke(cli, ["export", "my-rec", "-o", str(out_file)])
 
@@ -635,7 +635,7 @@ def test_export_exclude_moves(tmp_path):
 
     with (
         mock.patch("screencap.config.resolve_recording_dir", return_value=rec_dir),
-        mock.patch("openadapt_capture.capture.CaptureSession.load", return_value=capture),
+        mock.patch("sc_engine.capture.CaptureSession.load", return_value=capture),
     ):
         result = runner.invoke(cli, ["export", "my-rec", "--exclude-moves"])
 
@@ -653,7 +653,7 @@ def test_export_includes_moves_by_default(tmp_path):
 
     with (
         mock.patch("screencap.config.resolve_recording_dir", return_value=rec_dir),
-        mock.patch("openadapt_capture.capture.CaptureSession.load", return_value=capture),
+        mock.patch("sc_engine.capture.CaptureSession.load", return_value=capture),
     ):
         result = runner.invoke(cli, ["export", "my-rec"])
 
@@ -671,7 +671,7 @@ def test_export_legacy_db_error(tmp_path):
     with (
         mock.patch("screencap.config.resolve_recording_dir", return_value=rec_dir),
         mock.patch(
-            "openadapt_capture.capture.CaptureSession.load",
+            "sc_engine.capture.CaptureSession.load",
             side_effect=FileNotFoundError("Capture not found"),
         ),
     ):
@@ -690,7 +690,7 @@ def test_export_empty_recording(tmp_path):
 
     with (
         mock.patch("screencap.config.resolve_recording_dir", return_value=rec_dir),
-        mock.patch("openadapt_capture.capture.CaptureSession.load", return_value=capture),
+        mock.patch("sc_engine.capture.CaptureSession.load", return_value=capture),
     ):
         result = runner.invoke(cli, ["export", "empty-rec"])
 
@@ -718,7 +718,7 @@ def test_export_multiple_events(tmp_path):
 
     with (
         mock.patch("screencap.config.resolve_recording_dir", return_value=rec_dir),
-        mock.patch("openadapt_capture.capture.CaptureSession.load", return_value=capture),
+        mock.patch("sc_engine.capture.CaptureSession.load", return_value=capture),
     ):
         result = runner.invoke(cli, ["export", "multi-rec"])
 
@@ -772,7 +772,7 @@ def test_export_all(tmp_path):
 
     with (
         mock.patch("screencap.config.get_recordings_dir", return_value=tmp_path),
-        mock.patch("openadapt_capture.capture.CaptureSession.load", side_effect=fresh_capture),
+        mock.patch("sc_engine.capture.CaptureSession.load", side_effect=fresh_capture),
     ):
         result = runner.invoke(cli, ["export", "--all"])
 
@@ -821,7 +821,7 @@ def test_export_downloads_only(tmp_path):
     with (
         mock.patch("screencap.config.get_recordings_dir", return_value=rec_dir),
         mock.patch("screencap.config.get_downloads_dir", return_value=dl_dir),
-        mock.patch("openadapt_capture.capture.CaptureSession.load", side_effect=fresh_capture),
+        mock.patch("sc_engine.capture.CaptureSession.load", side_effect=fresh_capture),
     ):
         result = runner.invoke(cli, ["export", "--downloads"])
 
@@ -855,7 +855,7 @@ def test_export_all_and_downloads(tmp_path):
     with (
         mock.patch("screencap.config.get_recordings_dir", return_value=rec_dir),
         mock.patch("screencap.config.get_downloads_dir", return_value=dl_dir),
-        mock.patch("openadapt_capture.capture.CaptureSession.load", side_effect=fresh_capture),
+        mock.patch("sc_engine.capture.CaptureSession.load", side_effect=fresh_capture),
     ):
         result = runner.invoke(cli, ["export", "--all", "--downloads"])
 
@@ -899,7 +899,7 @@ def test_export_single_by_name_with_downloads_fallback(tmp_path):
     with (
         mock.patch("screencap.config.get_recordings_dir", return_value=rec_dir),
         mock.patch("screencap.config.get_downloads_dir", return_value=dl_dir),
-        mock.patch("openadapt_capture.capture.CaptureSession.load", return_value=capture),
+        mock.patch("sc_engine.capture.CaptureSession.load", return_value=capture),
     ):
         result = runner.invoke(cli, ["export", "my-dl", "--downloads"])
 

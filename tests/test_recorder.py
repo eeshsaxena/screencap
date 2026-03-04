@@ -72,7 +72,7 @@ class TestAtexitHandler:
             mock.patch("screencap.pidfile.find_orphaned_processes", return_value=[]),
             mock.patch("screencap.pidfile.write_pidfile"),
             mock.patch("screencap.pidfile.delete_pidfile"),
-            mock.patch("openadapt_capture.Recorder") as MockRecorder,
+            mock.patch("sc_engine.Recorder") as MockRecorder,
             mock.patch("atexit.register", side_effect=lambda fn: registered.append(fn)),
             mock.patch("atexit.unregister", side_effect=lambda fn: unregistered.append(fn)),
         ):
@@ -134,7 +134,7 @@ class TestOrphanDetection:
             mock.patch("screencap.pidfile.terminate_processes") as mock_term,
             mock.patch("screencap.pidfile.delete_pidfile"),
             mock.patch("screencap.pidfile.write_pidfile"),
-            mock.patch("openadapt_capture.Recorder") as MockRecorder,
+            mock.patch("sc_engine.Recorder") as MockRecorder,
         ):
             MockRecorder.return_value.__enter__ = mock.MagicMock(return_value=mock_recorder)
             MockRecorder.return_value.__exit__ = mock.MagicMock(return_value=False)
@@ -162,7 +162,7 @@ class TestPidFileLifecycle:
             mock.patch("screencap.pidfile.find_orphaned_processes", return_value=[]),
             mock.patch("screencap.pidfile.write_pidfile") as mock_write,
             mock.patch("screencap.pidfile.delete_pidfile"),
-            mock.patch("openadapt_capture.Recorder") as MockRecorder,
+            mock.patch("sc_engine.Recorder") as MockRecorder,
         ):
             MockRecorder.return_value.__enter__ = mock.MagicMock(return_value=mock_recorder)
             MockRecorder.return_value.__exit__ = mock.MagicMock(return_value=False)
@@ -189,7 +189,7 @@ class TestPidFileLifecycle:
             mock.patch("screencap.pidfile.find_orphaned_processes", return_value=[]),
             mock.patch("screencap.pidfile.write_pidfile"),
             mock.patch("screencap.pidfile.delete_pidfile") as mock_delete,
-            mock.patch("openadapt_capture.Recorder") as MockRecorder,
+            mock.patch("sc_engine.Recorder") as MockRecorder,
         ):
             MockRecorder.return_value.__enter__ = mock.MagicMock(return_value=mock_recorder)
             MockRecorder.return_value.__exit__ = mock.MagicMock(return_value=False)
@@ -225,7 +225,7 @@ class TestPermissionPrompting:
         ):
             mock_sys.platform = "darwin"
             with mock.patch(
-                "openadapt_capture.platform.darwin.DarwinPlatform",
+                "sc_engine.platform.darwin.DarwinPlatform",
                 platform,
             ):
                 _check_macos_permissions()
@@ -243,7 +243,7 @@ class TestPermissionPrompting:
             mock.patch("screencap.recorder.subprocess") as mock_subprocess,
             mock.patch("screencap.recorder.console") as mock_console,
             mock.patch(
-                "openadapt_capture.platform.darwin.DarwinPlatform",
+                "sc_engine.platform.darwin.DarwinPlatform",
                 platform,
             ),
         ):
@@ -272,7 +272,7 @@ class TestPermissionPrompting:
             mock.patch("screencap.recorder.console") as mock_console,
             mock.patch("screencap.recorder._check_permission_fresh", side_effect=[True, True]),
             mock.patch(
-                "openadapt_capture.platform.darwin.DarwinPlatform",
+                "sc_engine.platform.darwin.DarwinPlatform",
                 platform,
             ),
         ):
@@ -299,7 +299,7 @@ class TestPermissionPrompting:
             mock.patch("screencap.recorder.console") as mock_console,
             mock.patch("screencap.recorder._check_permission_fresh", return_value=False),
             mock.patch(
-                "openadapt_capture.platform.darwin.DarwinPlatform",
+                "sc_engine.platform.darwin.DarwinPlatform",
                 platform,
             ),
         ):
@@ -326,7 +326,7 @@ class TestPermissionPrompting:
             mock.patch("screencap.recorder.console") as mock_console,
             mock.patch("screencap.recorder._check_permission_fresh", side_effect=fresh_results),
             mock.patch(
-                "openadapt_capture.platform.darwin.DarwinPlatform",
+                "sc_engine.platform.darwin.DarwinPlatform",
                 platform,
             ),
         ):
@@ -359,7 +359,7 @@ class TestPermissionPrompting:
             mock.patch("screencap.recorder.console") as mock_console,
             mock.patch("screencap.recorder._check_permission_fresh", side_effect=fresh_results),
             mock.patch(
-                "openadapt_capture.platform.darwin.DarwinPlatform",
+                "sc_engine.platform.darwin.DarwinPlatform",
                 platform,
             ),
         ):
@@ -407,7 +407,7 @@ class TestPermissionPrompting:
 
         with (
             mock.patch("screencap.recorder.sys") as mock_sys,
-            mock.patch.dict("sys.modules", {"openadapt_capture.platform.darwin": None}),
+            mock.patch.dict("sys.modules", {"sc_engine.platform.darwin": None}),
         ):
             mock_sys.platform = "darwin"
             _check_macos_permissions()
