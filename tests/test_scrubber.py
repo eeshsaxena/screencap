@@ -14,9 +14,11 @@ from screencap.scrubber import (
     ScrubResult,
     _build_app_allowlist,
     _scrub_db,
+    _scrub_events_jsonl,
     _scrub_json_recursive,
     _scrub_metrics,
     _scrub_text,
+    _scrub_text_with_detections,
     _scrub_transcript_json,
     _scrub_transcript_txt,
     scrub_recording,
@@ -66,6 +68,8 @@ def recording_dir(tmp_path):
     db.execute(
         """CREATE TABLE action_event (
         id INTEGER PRIMARY KEY, recording_id INTEGER,
+        name TEXT,
+        timestamp REAL,
         key_char TEXT, canonical_key_char TEXT,
         key_name TEXT, canonical_key_name TEXT,
         element_state TEXT,
@@ -74,13 +78,44 @@ def recording_dir(tmp_path):
     )"""
     )
     db.execute(
-        "INSERT INTO action_event VALUES (1, 1, 'e', 'e', 'e', 'e', ?, ?, ?)",
+        "INSERT INTO action_event VALUES (1, 1, 'click', 100.0, 'e', 'e', 'e', 'e', ?, ?, ?)",
         (
             json.dumps({"role": "button", "content": "john.doe@example.com"}),
             "John Doe's workspace",
             "John Doe's workspace, Settings",
         ),
     )
+    # Keystroke rows matching events.jsonl children
+    secret_text = "password=ssfsfodsufdouhhfwnenwekskjdhjsfhd"
+    normal_text = "hello"
+    row_id = 10
+    ts = 200.01
+    for ch in secret_text:
+        db.execute(
+            "INSERT INTO action_event VALUES (?, 1, 'press', ?, ?, ?, NULL, NULL, NULL, NULL, NULL)",
+            (row_id, round(ts, 2), ch, ch.lower()),
+        )
+        row_id += 1
+        ts += 0.01
+        db.execute(
+            "INSERT INTO action_event VALUES (?, 1, 'release', ?, ?, ?, NULL, NULL, NULL, NULL, NULL)",
+            (row_id, round(ts, 2), ch, ch.lower()),
+        )
+        row_id += 1
+        ts += 0.01
+    for ch in normal_text:
+        db.execute(
+            "INSERT INTO action_event VALUES (?, 1, 'press', ?, ?, ?, NULL, NULL, NULL, NULL, NULL)",
+            (row_id, round(ts, 2), ch, ch.lower()),
+        )
+        row_id += 1
+        ts += 0.01
+        db.execute(
+            "INSERT INTO action_event VALUES (?, 1, 'release', ?, ?, ?, NULL, NULL, NULL, NULL, NULL)",
+            (row_id, round(ts, 2), ch, ch.lower()),
+        )
+        row_id += 1
+        ts += 0.01
 
     db.execute(
         """CREATE TABLE window_event (
@@ -144,7 +179,23 @@ def recording_dir(tmp_path):
     # --- Stub files to verify deletion ---
     (rec / "audio.flac").write_bytes(b"\x00")
     (rec / "oa_recording-12345.mp4").write_bytes(b"\x00")
-    (rec / "events.jsonl").write_text('{"text": "john.doe@example.com"}\n')
+    # events.jsonl with realistic key.type events (children include key.down + key.up)
+    # Use helper to build children arrays matching DB rows
+    def _build_children(text, start_ts):
+        children = []
+        ts = start_ts
+        for ch in text:
+            children.append({"timestamp": round(ts, 2), "type": "key.down", "key_char": ch, "canonical_key_char": ch.lower(), "key_name": None, "canonical_key_name": None, "key_vk": None, "canonical_key_vk": None})
+            ts += 0.01
+            children.append({"timestamp": round(ts, 2), "type": "key.up", "key_char": ch, "canonical_key_char": ch.lower(), "key_name": None, "canonical_key_name": None, "key_vk": None, "canonical_key_vk": None})
+            ts += 0.01
+        return children
+
+    secret_event = {"timestamp": 200.0, "type": "key.type", "text": secret_text, "children": _build_children(secret_text, 200.01)}
+    normal_event = {"timestamp": 300.0, "type": "key.type", "text": normal_text, "children": _build_children(normal_text, round(200.01 + len(secret_text) * 0.02, 2))}
+    meta_line = json.dumps({"_meta": True, "screencap_version": "0.1.0", "exported_at": "2026-03-05T00:00:00"})
+    events_content = meta_line + "\n" + json.dumps(secret_event) + "\n" + json.dumps(normal_event) + "\n"
+    (rec / "events.jsonl").write_text(events_content)
     (rec / ".upload_status.json").write_text("{}")
     (rec / "viewer.html").write_text("<html>john.doe@example.com</html>")
 
@@ -204,9 +255,11 @@ def test_scrub_recording_e2e(recording_dir, tmp_path):
     # Unscrubable files deleted
     assert not (dst / "audio.flac").exists()
     assert not list(dst.glob("*.mp4"))
-    assert not (dst / "events.jsonl").exists()
     assert not (dst / ".upload_status.json").exists()
     assert not (dst / "viewer.html").exists()
+
+    # events.jsonl is scrubbed, not deleted
+    assert (dst / "events.jsonl").exists()
 
     # Text files still exist and are scrubbed
     assert (dst / "transcript.json").exists()
@@ -525,7 +578,7 @@ def test_scrub_deletes_media(recording_dir, tmp_path):
 
 
 def test_scrub_deletes_derived_files(recording_dir, tmp_path):
-    """events.jsonl, .upload_status.json, and viewer.html deleted."""
+    """.upload_status.json and viewer.html deleted; events.jsonl scrubbed not deleted."""
     with mock.patch(
         "screencap.config.get_recordings_dir", return_value=tmp_path
     ), mock.patch(
@@ -534,9 +587,10 @@ def test_scrub_deletes_derived_files(recording_dir, tmp_path):
         result = scrub_recording("test-recording")
 
     dst = tmp_path / "test-recording-scrubbed"
-    assert not (dst / "events.jsonl").exists()
     assert not (dst / ".upload_status.json").exists()
     assert not (dst / "viewer.html").exists()
+    # events.jsonl is now scrubbed, not deleted
+    assert (dst / "events.jsonl").exists()
 
 
 def test_scrub_deletes_screenshot_table(recording_dir, tmp_path):
@@ -815,3 +869,299 @@ def test_cli_scrub_missing_deps(tmp_path):
 
     assert result.exit_code == 1
     assert "Privacy dependencies" in result.output
+
+
+# ---------------------------------------------------------------------------
+# Events JSONL Scrubbing (Combined Keystroke Detection)
+# ---------------------------------------------------------------------------
+
+
+def _make_key_type_event(text, start_ts=100.0):
+    """Build a key.type event dict with key.down/key.up children for each char."""
+    children = []
+    ts = start_ts
+    for ch in text:
+        children.append(
+            {
+                "timestamp": round(ts, 2),
+                "type": "key.down",
+                "key_char": ch,
+                "canonical_key_char": ch.lower(),
+                "key_name": None,
+                "canonical_key_name": None,
+                "key_vk": None,
+                "canonical_key_vk": None,
+            }
+        )
+        ts += 0.01
+        children.append(
+            {
+                "timestamp": round(ts, 2),
+                "type": "key.up",
+                "key_char": ch,
+                "canonical_key_char": ch.lower(),
+                "key_name": None,
+                "canonical_key_name": None,
+                "key_vk": None,
+                "canonical_key_vk": None,
+            }
+        )
+        ts += 0.01
+    return {"timestamp": start_ts, "type": "key.type", "text": text, "children": children}
+
+
+def _make_events_jsonl(*events, with_meta=True):
+    """Build events.jsonl content from event dicts."""
+    lines = []
+    if with_meta:
+        lines.append(json.dumps({"_meta": True, "screencap_version": "0.1.0"}))
+    for ev in events:
+        lines.append(json.dumps(ev))
+    return "\n".join(lines) + "\n"
+
+
+def _setup_keystroke_db(db_path, events):
+    """Create a recording.db with action_event rows matching events.jsonl children."""
+    conn = sqlite3.connect(str(db_path))
+    conn.execute("CREATE TABLE recording (id INTEGER PRIMARY KEY, task_description TEXT)")
+    conn.execute("INSERT INTO recording VALUES (1, 'test')")
+    conn.execute(
+        """CREATE TABLE action_event (
+        id INTEGER PRIMARY KEY, recording_id INTEGER,
+        name TEXT, timestamp REAL,
+        key_char TEXT, canonical_key_char TEXT,
+        key_name TEXT, canonical_key_name TEXT,
+        element_state TEXT,
+        active_segment_description TEXT,
+        available_segment_descriptions TEXT
+    )"""
+    )
+    row_id = 1
+    for ev in events:
+        if ev.get("type") != "key.type":
+            continue
+        for child in ev.get("children", []):
+            name = "press" if child["type"] == "key.down" else "release"
+            conn.execute(
+                "INSERT INTO action_event VALUES (?, 1, ?, ?, ?, ?, NULL, NULL, NULL, NULL, NULL)",
+                (row_id, name, child["timestamp"], child.get("key_char"), child.get("canonical_key_char")),
+            )
+            row_id += 1
+    conn.commit()
+    conn.close()
+
+
+def test_scrub_events_jsonl_redacts_typed_secret(tmp_path, pipeline_and_anonymizer):
+    """password=ssfsfodsufdouhhfwnenwekskjdhjsfhd in key.type event text → text field redacted."""
+    pipeline, anonymizer = pipeline_and_anonymizer
+    rec = tmp_path / "scrubbed"
+    rec.mkdir()
+
+    secret_ev = _make_key_type_event("password=ssfsfodsufdouhhfwnenwekskjdhjsfhd")
+    (rec / "events.jsonl").write_text(_make_events_jsonl(secret_ev))
+    _setup_keystroke_db(rec / "recording.db", [secret_ev])
+
+    result = ScrubResult()
+    _scrub_events_jsonl(rec, pipeline, anonymizer, result)
+
+    lines = [json.loads(l) for l in (rec / "events.jsonl").read_text().strip().splitlines()]
+    # Meta line preserved
+    assert lines[0].get("_meta") is True
+    # Secret text should be redacted (not contain original)
+    key_type_ev = lines[1]
+    assert "password=ssfsfodsufdouhhfwnenwekskjdhjsfhd" not in key_type_ev["text"]
+
+
+def test_scrub_events_jsonl_maps_to_db_rows(tmp_path, pipeline_and_anonymizer):
+    """Redacted key.type children → corresponding DB rows have key_char = NULL."""
+    pipeline, anonymizer = pipeline_and_anonymizer
+    rec = tmp_path / "scrubbed"
+    rec.mkdir()
+
+    secret_ev = _make_key_type_event("password=ssfsfodsufdouhhfwnenwekskjdhjsfhd")
+    (rec / "events.jsonl").write_text(_make_events_jsonl(secret_ev))
+    _setup_keystroke_db(rec / "recording.db", [secret_ev])
+
+    result = ScrubResult()
+    _scrub_events_jsonl(rec, pipeline, anonymizer, result)
+
+    conn = sqlite3.connect(str(rec / "recording.db"))
+    cur = conn.cursor()
+    cur.execute("SELECT key_char FROM action_event WHERE key_char IS NOT NULL")
+    remaining = [r[0] for r in cur.fetchall()]
+    conn.close()
+
+    # At least some rows should have been NULLed
+    # The original had 20 rows (10 chars * press+release). If any secret was detected,
+    # some should now be NULL
+    cur2 = sqlite3.connect(str(rec / "recording.db")).cursor()
+    cur2.execute("SELECT COUNT(*) FROM action_event WHERE key_char IS NULL")
+    null_count = cur2.fetchone()[0]
+    assert null_count > 0, "Expected some DB rows to have key_char = NULL after scrub"
+
+
+def test_scrub_events_jsonl_preserves_normal_typing(tmp_path, pipeline_and_anonymizer):
+    """Non-secret keystrokes remain intact in events.jsonl."""
+    pipeline, anonymizer = pipeline_and_anonymizer
+    rec = tmp_path / "scrubbed"
+    rec.mkdir()
+
+    normal_ev = _make_key_type_event("hello", start_ts=300.0)
+    (rec / "events.jsonl").write_text(_make_events_jsonl(normal_ev))
+    _setup_keystroke_db(rec / "recording.db", [normal_ev])
+
+    result = ScrubResult()
+    _scrub_events_jsonl(rec, pipeline, anonymizer, result)
+
+    lines = [json.loads(l) for l in (rec / "events.jsonl").read_text().strip().splitlines()]
+    key_type_ev = lines[1]
+    assert key_type_ev["text"] == "hello"
+    # Children should still have key_char
+    for child in key_type_ev["children"]:
+        assert child["key_char"] is not None
+
+
+def test_scrub_events_jsonl_missing_file(tmp_path, pipeline_and_anonymizer):
+    """No events.jsonl → step skipped, no error."""
+    pipeline, anonymizer = pipeline_and_anonymizer
+    rec = tmp_path / "scrubbed"
+    rec.mkdir()
+
+    result = ScrubResult()
+    _scrub_events_jsonl(rec, pipeline, anonymizer, result)
+    # Should not crash
+
+
+def test_scrub_events_jsonl_meta_line_preserved(tmp_path, pipeline_and_anonymizer):
+    """_meta header line passes through unchanged."""
+    pipeline, anonymizer = pipeline_and_anonymizer
+    rec = tmp_path / "scrubbed"
+    rec.mkdir()
+
+    meta = {"_meta": True, "screencap_version": "0.1.0", "exported_at": "2026-03-05T00:00:00"}
+    (rec / "events.jsonl").write_text(json.dumps(meta) + "\n")
+
+    result = ScrubResult()
+    _scrub_events_jsonl(rec, pipeline, anonymizer, result)
+
+    lines = [json.loads(l) for l in (rec / "events.jsonl").read_text().strip().splitlines()]
+    assert lines[0]["_meta"] is True
+    assert lines[0]["screencap_version"] == "0.1.0"
+
+
+def test_scrub_events_jsonl_key_up_redacted(tmp_path, pipeline_and_anonymizer):
+    """Both key.down AND key.up children are redacted — no secret from release events."""
+    pipeline, anonymizer = pipeline_and_anonymizer
+    rec = tmp_path / "scrubbed"
+    rec.mkdir()
+
+    secret_ev = _make_key_type_event("password=ssfsfodsufdouhhfwnenwekskjdhjsfhd")
+    (rec / "events.jsonl").write_text(_make_events_jsonl(secret_ev))
+    _setup_keystroke_db(rec / "recording.db", [secret_ev])
+
+    result = ScrubResult()
+    _scrub_events_jsonl(rec, pipeline, anonymizer, result)
+
+    lines = [json.loads(l) for l in (rec / "events.jsonl").read_text().strip().splitlines()]
+    key_type_ev = lines[1]
+
+    # Check that wherever a key.down child is nulled, the paired key.up is also nulled
+    for i, child in enumerate(key_type_ev["children"]):
+        if child["type"] == "key.down" and child["key_char"] is None:
+            # The next key.up should also be nulled
+            if i + 1 < len(key_type_ev["children"]):
+                next_child = key_type_ev["children"][i + 1]
+                if next_child["type"] == "key.up":
+                    assert next_child["key_char"] is None, (
+                        f"key.up at index {i+1} not redacted — "
+                        f"secret reconstructable from release events"
+                    )
+
+
+def test_scrub_events_jsonl_empty_text(tmp_path, pipeline_and_anonymizer):
+    """key.type event with text: '' → no crash, no detection."""
+    pipeline, anonymizer = pipeline_and_anonymizer
+    rec = tmp_path / "scrubbed"
+    rec.mkdir()
+
+    empty_ev = {"timestamp": 100.0, "type": "key.type", "text": "", "children": []}
+    (rec / "events.jsonl").write_text(_make_events_jsonl(empty_ev))
+
+    result = ScrubResult()
+    _scrub_events_jsonl(rec, pipeline, anonymizer, result)
+    # Should not crash
+
+
+def test_scrub_events_jsonl_malformed_line(tmp_path, pipeline_and_anonymizer):
+    """Malformed JSON line → file deleted for safety."""
+    pipeline, anonymizer = pipeline_and_anonymizer
+    rec = tmp_path / "scrubbed"
+    rec.mkdir()
+
+    content = '{"_meta": true}\n{invalid json\n'
+    (rec / "events.jsonl").write_text(content)
+
+    result = ScrubResult()
+    _scrub_events_jsonl(rec, pipeline, anonymizer, result)
+
+    # File should be deleted due to processing error
+    assert not (rec / "events.jsonl").exists()
+
+
+def test_scrub_events_jsonl_no_db(tmp_path, pipeline_and_anonymizer):
+    """events.jsonl exists but no recording.db → JSONL scrubbed, DB step skipped."""
+    pipeline, anonymizer = pipeline_and_anonymizer
+    rec = tmp_path / "scrubbed"
+    rec.mkdir()
+
+    secret_ev = _make_key_type_event("password=ssfsfodsufdouhhfwnenwekskjdhjsfhd")
+    (rec / "events.jsonl").write_text(_make_events_jsonl(secret_ev))
+
+    result = ScrubResult()
+    _scrub_events_jsonl(rec, pipeline, anonymizer, result)
+
+    # JSONL should still exist (scrubbed)
+    assert (rec / "events.jsonl").exists()
+    lines = [json.loads(l) for l in (rec / "events.jsonl").read_text().strip().splitlines()]
+    key_type_ev = lines[1]
+    assert "password=ssfsfodsufdouhhfwnenwekskjdhjsfhd" not in key_type_ev["text"]
+
+
+def test_scrub_events_jsonl_nested_in_mouse_drag(tmp_path, pipeline_and_anonymizer):
+    """key.type inside mouse.drag children is scrubbed."""
+    pipeline, anonymizer = pipeline_and_anonymizer
+    rec = tmp_path / "scrubbed"
+    rec.mkdir()
+
+    inner_key_type = _make_key_type_event("password=ssfsfodsufdouhhfwnenwekskjdhjsfhd", start_ts=400.0)
+    drag_event = {
+        "timestamp": 399.0,
+        "type": "mouse.drag",
+        "children": [inner_key_type],
+    }
+    (rec / "events.jsonl").write_text(_make_events_jsonl(drag_event))
+
+    result = ScrubResult()
+    _scrub_events_jsonl(rec, pipeline, anonymizer, result)
+
+    lines = [json.loads(l) for l in (rec / "events.jsonl").read_text().strip().splitlines()]
+    drag_ev = lines[1]
+    nested_key_type = drag_ev["children"][0]
+    assert "password=ssfsfodsufdouhhfwnenwekskjdhjsfhd" not in nested_key_type["text"]
+
+
+def test_scrub_events_jsonl_entity_counts(tmp_path, pipeline_and_anonymizer):
+    """Entity counts from JSONL keystroke detection are accumulated in ScrubResult."""
+    pipeline, anonymizer = pipeline_and_anonymizer
+    rec = tmp_path / "scrubbed"
+    rec.mkdir()
+
+    secret_ev = _make_key_type_event("password=ssfsfodsufdouhhfwnenwekskjdhjsfhd")
+    (rec / "events.jsonl").write_text(_make_events_jsonl(secret_ev))
+    _setup_keystroke_db(rec / "recording.db", [secret_ev])
+
+    result = ScrubResult()
+    _scrub_events_jsonl(rec, pipeline, anonymizer, result)
+
+    # Should have detected at least one entity
+    assert sum(result.entity_counts.values()) > 0

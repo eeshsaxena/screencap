@@ -40,7 +40,7 @@ def _build_app_allowlist(metrics_path: Path) -> frozenset[str]:
 
 
 # Files to skip during copytree and delete as safety fallback.
-_SKIP_FILES = {"audio.flac", "events.jsonl", ".upload_status.json", "viewer.html"}
+_SKIP_FILES = {"audio.flac", ".upload_status.json", "viewer.html"}
 _SKIP_EXTENSIONS = {".mp4"}
 
 
@@ -93,6 +93,39 @@ def _scrub_text(
         result.entity_counts[det.entity_type] += 1
 
     return scrubbed
+
+
+def _scrub_text_with_detections(
+    text: str,
+    pipeline,
+    anonymizer,
+    result: ScrubResult,
+):
+    """Like _scrub_text but also returns the DetectionResult for span mapping.
+
+    Returns (scrubbed_text, detection_result). detection_result is None when
+    text was empty, whitespace-only, or all detectors failed.
+    """
+    if not text or not text.strip():
+        return text, None
+
+    from screencap.privacy import AllDetectorsFailedError
+
+    try:
+        detection_result = pipeline.detect(text)
+    except AllDetectorsFailedError:
+        console.print("  [yellow]Warning: all detectors failed on a field[/]")
+        return "<SCRUB_FAILED>", None
+
+    scrubbed = anonymizer.anonymize(
+        detection_result.normalized_text,
+        detection_result.detections,
+    )
+
+    for det in detection_result.detections:
+        result.entity_counts[det.entity_type] += 1
+
+    return scrubbed, detection_result
 
 
 # ---------------------------------------------------------------------------
@@ -400,6 +433,213 @@ def _scrub_metrics(path: Path, result: ScrubResult) -> None:
 
 
 # ---------------------------------------------------------------------------
+# Events JSONL scrubbing (combined keystroke detection)
+# ---------------------------------------------------------------------------
+
+
+def _process_single_key_type(
+    event: dict,
+    pipeline,
+    anonymizer,
+    result: ScrubResult,
+    db_redactions: list[dict],
+) -> None:
+    """Detect secrets in a single key.type event and collect DB redaction info."""
+    text = event.get("text", "")
+    scrubbed, detection_result = _scrub_text_with_detections(
+        text, pipeline, anonymizer, result
+    )
+
+    if not detection_result or not detection_result.detections:
+        return
+
+    # Build char_pos → child_index map (key.down children with key_char only)
+    char_pos = 0
+    pos_to_child: dict[int, int] = {}
+    for i, child in enumerate(event.get("children", [])):
+        if child.get("type") == "key.down" and child.get("key_char"):
+            pos_to_child[char_pos] = i
+            char_pos += 1
+
+    # Find children within detection spans
+    redact_positions: set[int] = set()
+    for det in detection_result.detections:
+        for pos in range(det.start, det.end):
+            if pos in pos_to_child:
+                redact_positions.add(pos)
+
+    # Expand to include paired key.up for each redacted key.down
+    redact_child_indices: set[int] = set()
+    children = event.get("children", [])
+    for pos in redact_positions:
+        down_idx = pos_to_child[pos]
+        redact_child_indices.add(down_idx)
+        # Find the paired key.up (typically the next child)
+        for j in range(down_idx + 1, len(children)):
+            if children[j].get("type") == "key.up":
+                redact_child_indices.add(j)
+                break
+
+    # Collect DB info BEFORE nulling (need original key_char for matching)
+    for idx in redact_child_indices:
+        child = children[idx]
+        if child.get("key_char"):
+            db_redactions.append(
+                {
+                    "timestamp": child.get("timestamp"),
+                    "key_char": child["key_char"],
+                    "type": child.get("type"),
+                }
+            )
+
+    # Now null in JSONL
+    event["text"] = scrubbed
+    for idx in redact_child_indices:
+        child = children[idx]
+        child["key_char"] = None
+        child["canonical_key_char"] = None
+
+
+def _process_key_type_events(
+    event: dict,
+    pipeline,
+    anonymizer,
+    result: ScrubResult,
+    db_redactions: list[dict],
+) -> None:
+    """Detect secrets in key.type events (top-level and nested in mouse.drag)."""
+    if event.get("type") == "key.type":
+        _process_single_key_type(event, pipeline, anonymizer, result, db_redactions)
+    elif event.get("type") == "mouse.drag":
+        for child in event.get("children", []):
+            if child.get("type") == "key.type":
+                _process_single_key_type(
+                    child, pipeline, anonymizer, result, db_redactions
+                )
+
+
+def _redact_keystroke_db_rows(dst: Path, redactions: list[dict]) -> None:
+    """Batch-redact key_char/canonical_key_char in action_event rows.
+
+    Uses a single DB connection and single commit for all redactions.
+    Matches by (timestamp, key_char, event_name) composite key.
+    """
+    db_path = find_db(dst)
+    if db_path is None:
+        return
+
+    conn = sqlite3.connect(str(db_path))
+    try:
+        tables = {
+            r[0]
+            for r in conn.execute(
+                "SELECT name FROM sqlite_master WHERE type='table'"
+            ).fetchall()
+        }
+        if "action_event" not in tables:
+            return
+
+        ids_to_redact: list[int] = []
+        for r in redactions:
+            name = "press" if r["type"] == "key.down" else "release"
+            row = conn.execute(
+                "SELECT id FROM action_event "
+                "WHERE name = ? AND timestamp = ? AND key_char = ? LIMIT 1",
+                (name, r["timestamp"], r["key_char"]),
+            ).fetchone()
+            if row:
+                ids_to_redact.append(row[0])
+
+        if ids_to_redact:
+            for i in range(0, len(ids_to_redact), 500):
+                chunk = ids_to_redact[i : i + 500]
+                placeholders = ",".join("?" * len(chunk))
+                conn.execute(
+                    f"UPDATE action_event "
+                    f"SET key_char = NULL, canonical_key_char = NULL "
+                    f"WHERE id IN ({placeholders})",
+                    chunk,
+                )
+            conn.commit()
+    except Exception:
+        conn.rollback()
+        raise
+    finally:
+        conn.close()
+
+
+def _scrub_events_jsonl(
+    dst: Path,
+    pipeline,
+    anonymizer,
+    result: ScrubResult,
+) -> None:
+    """Scrub combined keystroke sequences in events.jsonl and map back to DB.
+
+    1. Detects secrets in key.type event text fields (combined keystrokes).
+    2. Redacts key_char in JSONL children (both key.down and key.up).
+    3. Runs _scrub_json_recursive on ALL JSONL events for comprehensive PII scrub.
+    4. Maps redactions back to action_event DB rows.
+    5. Writes atomically (.tmp + rename).
+    6. Deletes file on any processing error (fail-safe).
+    """
+    import os
+
+    events_jsonl = dst / "events.jsonl"
+    if not events_jsonl.exists():
+        return
+
+    had_errors = False
+    db_redactions: list[dict] = []
+    output_lines: list[str] = []
+
+    for raw_line in events_jsonl.read_text(encoding="utf-8").splitlines():
+        if not raw_line.strip():
+            output_lines.append(raw_line)
+            continue
+
+        try:
+            event = json.loads(raw_line)
+        except json.JSONDecodeError:
+            console.print(
+                "  [yellow]Warning: malformed JSON line in events.jsonl[/]"
+            )
+            had_errors = True
+            continue
+
+        if event.get("_meta"):
+            output_lines.append(json.dumps(event, ensure_ascii=False))
+            continue
+
+        # Targeted key.type detection for combined-text secrets
+        _process_key_type_events(
+            event, pipeline, anonymizer, result, db_redactions
+        )
+
+        # Comprehensive scrub: run recursive walker on ALL events
+        _scrub_json_recursive(event, pipeline, anonymizer, result)
+
+        output_lines.append(json.dumps(event, ensure_ascii=False))
+
+    # Batch DB redaction (single connection, single commit)
+    if db_redactions:
+        _redact_keystroke_db_rows(dst, db_redactions)
+
+    # Atomic write or delete on error
+    if had_errors:
+        events_jsonl.unlink(missing_ok=True)
+        console.print(
+            "  [yellow]Warning: events.jsonl deleted due to processing errors[/]"
+        )
+    else:
+        tmp_path = str(events_jsonl) + ".tmp"
+        with open(tmp_path, "w", encoding="utf-8") as f:
+            for line in output_lines:
+                f.write(line + "\n")
+        os.rename(tmp_path, str(events_jsonl))
+
+
+# ---------------------------------------------------------------------------
 # Summary output
 # ---------------------------------------------------------------------------
 
@@ -502,7 +742,7 @@ def scrub_recording(
 
     # 7. Safety fallback deletion — remove any files that survived the ignore callback
     deleted_files: list[str] = []
-    for pattern_or_name in ("audio.flac", "events.jsonl", ".upload_status.json", "viewer.html"):
+    for pattern_or_name in ("audio.flac", ".upload_status.json", "viewer.html"):
         p = dst / pattern_or_name
         if p.exists():
             p.unlink()
@@ -525,7 +765,18 @@ def scrub_recording(
     with console.status("Scrubbing database..."):
         _scrub_db(dst, pipeline, anonymizer, result)
 
-    # 9-10. Scrub transcripts
+    # 9. Scrub combined keystroke sequences in events.jsonl
+    with console.status("Scrubbing keystroke sequences..."):
+        try:
+            _scrub_events_jsonl(dst, pipeline, anonymizer, result)
+        except Exception as exc:
+            console.print(
+                f"  [yellow]Warning: events.jsonl scrubbing failed ({exc}) — "
+                f"deleting for safety[/]"
+            )
+            (dst / "events.jsonl").unlink(missing_ok=True)
+
+    # 10-11. Scrub transcripts
     with console.status("Scrubbing transcripts..."):
         _scrub_transcript_json(dst / "transcript.json", pipeline, anonymizer, result)
         _scrub_transcript_txt(dst / "transcript.txt", pipeline, anonymizer, result)
