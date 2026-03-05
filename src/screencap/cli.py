@@ -1101,5 +1101,38 @@ def transcribe(name, model):
         console.print(f"\n[bold]Preview:[/bold]\n{preview}")
 
 
+_PRIVACY_EXTRAS_MSG = (
+    "[red]Error: Privacy dependencies not installed.[/red]\n"
+    "Install with: [bold]pip install screencap\\[privacy][/bold]\n"
+    "Or lightweight: [bold]pip install screencap\\[privacy-lite][/bold]"
+)
+
+
+@cli.command()
+@click.argument("name")
+@click.option(
+    "--pii-engine",
+    type=click.Choice(["presidio", "datafog"]),
+    default=None,
+    help="PII detection engine (default: auto-detect).",
+)
+def scrub(name: str, pii_engine: str | None) -> None:
+    """Create a privacy-scrubbed copy of a recording."""
+    from screencap.scrubber import scrub_recording
+
+    try:
+        scrub_recording(name, pii_engine=pii_engine)
+    except FileNotFoundError as e:
+        console.print(f"[red]Error:[/red] {e}")
+        raise SystemExit(1)
+    except ImportError as e:
+        console.print(_PRIVACY_EXTRAS_MSG)
+        console.print(f"[dim]{e}[/dim]")
+        raise SystemExit(1)
+    except ValueError as e:
+        console.print(f"[red]Error:[/red] {e}")
+        raise SystemExit(1)
+
+
 if __name__ == "__main__":
     cli()
