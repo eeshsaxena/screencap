@@ -34,7 +34,7 @@ from tqdm import tqdm
 
 from sc_engine import utils, video, window
 from sc_engine.ax_cache import AXQueryCache
-from sc_engine.config import config
+from sc_engine.config import RecordingConfig, config
 from sc_engine.db import create_db, crud, get_session_for_path
 from sc_engine.db.models import ActionEvent, Recording
 from sc_engine.extensions import synchronized_queue as sq
@@ -545,6 +545,7 @@ def write_events(
     started_event: multiprocessing.Event,
     pre_callback: Callable[[float], dict] | None = None,
     post_callback: Callable[[dict], None] | None = None,
+    config_overrides: dict[str, object] | None = None,
 ) -> None:
     """Write events of a specific type to the db using the provided write function.
 
@@ -562,7 +563,12 @@ def write_events(
             timestamp as only argument, returns a state dict.
         post_callback: Optional function to call after main loop. Takes state dict as
             only argument, returns None.
+        config_overrides: Optional dict of config overrides to apply in child process.
+            Spawn mode on macOS re-imports modules, losing in-memory config changes.
     """
+    from sc_engine.config import apply_config_overrides
+    apply_config_overrides(config_overrides)
+
     utils.set_start_time(recording.timestamp)
 
     logger.info(f"{event_type=} starting")
@@ -1817,6 +1823,7 @@ def record(
     num_browser_events: multiprocessing.Value = None,
     num_video_events: multiprocessing.Value = None,
     send_profile: bool = False,
+    recording_config: RecordingConfig | None = None,
 ) -> None:
     """Record Screenshots/ActionEvents/WindowEvents/BrowserEvents.
 
@@ -1832,6 +1839,14 @@ def record(
         config.RECORD_VIDEO,
         config.RECORD_IMAGES,
     )
+
+    # Build config overrides dict to propagate to spawned child processes.
+    # On macOS, spawn mode re-imports modules, losing in-memory config changes.
+    if recording_config is not None:
+        from sc_engine.config import build_config_overrides
+        _config_overrides = build_config_overrides(recording_config)
+    else:
+        _config_overrides = None
 
     # logically it makes sense to communicate from here, but when running
     # from the tray it takes too long
@@ -2019,6 +2034,7 @@ def record(
                 "screen_event_writer", multiprocessing.Event()
             ),
         ),
+        kwargs={"config_overrides": _config_overrides},
     )
     screen_event_writer.start()
     task_by_name["screen_event_writer"] = screen_event_writer
@@ -2039,6 +2055,7 @@ def record(
                     "browser_event_writer", multiprocessing.Event()
                 ),
             ),
+            kwargs={"config_overrides": _config_overrides},
         )
         browser_event_writer.start()
         task_by_name["browser_event_writer"] = browser_event_writer
@@ -2058,6 +2075,7 @@ def record(
                 "action_event_writer", multiprocessing.Event()
             ),
         ),
+        kwargs={"config_overrides": _config_overrides},
     )
     action_event_writer.start()
     task_by_name["action_event_writer"] = action_event_writer
@@ -2078,6 +2096,7 @@ def record(
                     "window_event_writer", multiprocessing.Event()
                 ),
             ),
+            kwargs={"config_overrides": _config_overrides},
         )
         window_event_writer.start()
         task_by_name["window_event_writer"] = window_event_writer
@@ -2098,6 +2117,7 @@ def record(
                 partial(video_pre_callback, video_dir=capture_dir),
                 video_post_callback,
             ),
+            kwargs={"config_overrides": _config_overrides},
         )
         video_writer.start()
         task_by_name["video_writer"] = video_writer
@@ -2461,6 +2481,7 @@ class Recorder:
                 num_browser_events=self._num_browser_events,
                 num_video_events=self._num_video_events,
                 send_profile=self._send_profile,
+                recording_config=self._recording_config,
             )
 
     def __enter__(self) -> "Recorder":
