@@ -48,9 +48,10 @@ _SLUG_RE = re.compile(r"^[a-z0-9]+(-[a-z0-9]+)*$")
 # ---------------------------------------------------------------------------
 
 def _sample_screenshots_from_db(db_path: Path, max_count: int = 5) -> list[str]:
-    """Extract screenshot PNGs from DB, resize, and return as base64 JPEG strings.
+    """Extract screenshots from DB, resize, and return as base64 JPEG strings.
 
-    Samples first, last, and evenly-spaced screenshots.
+    Tries file-based screenshots (image_path column) first, falls back to
+    png_data blobs. Samples first, last, and evenly-spaced screenshots.
     """
     try:
         conn = sqlite3.connect(str(db_path))
@@ -64,58 +65,142 @@ def _sample_screenshots_from_db(db_path: Path, max_count: int = 5) -> list[str]:
             conn.close()
             return []
 
-        cur.execute("SELECT COUNT(*) FROM screenshot WHERE png_data IS NOT NULL")
-        total = cur.fetchone()[0]
-        if total == 0:
-            conn.close()
-            return []
+        # Check if image_path column exists
+        cur.execute("PRAGMA table_info(screenshot)")
+        columns = {row[1] for row in cur.fetchall()}
+        has_image_path = "image_path" in columns
 
-        # Pick indices: first, last, and evenly-spaced
-        if total <= max_count:
-            indices = list(range(total))
-        else:
-            indices = [0, total - 1]
-            step = (total - 1) / (max_count - 1)
-            for i in range(1, max_count - 1):
-                idx = int(round(step * i))
-                if idx not in indices:
-                    indices.append(idx)
-            indices = sorted(set(indices))[:max_count]
+        recording_dir = db_path.parent
 
-        # Fetch by ROWID offset
-        screenshots_b64 = []
-        for idx in indices:
-            cur.execute(
-                "SELECT png_data FROM screenshot WHERE png_data IS NOT NULL "
-                "ORDER BY timestamp LIMIT 1 OFFSET ?",
-                (idx,),
+        # Try file-based screenshots first
+        if has_image_path:
+            result = _sample_screenshots_from_files(
+                conn, cur, recording_dir, max_count
             )
-            row = cur.fetchone()
-            if not row or not row[0]:
-                continue
+            if result:
+                conn.close()
+                return result
 
-            try:
-                from PIL import Image
-
-                img = Image.open(io.BytesIO(row[0]))
-                # Resize to 1024px wide, maintaining aspect ratio
-                if img.width > 1024:
-                    ratio = 1024 / img.width
-                    img = img.resize(
-                        (1024, int(img.height * ratio)),
-                        Image.LANCZOS,
-                    )
-                # Convert to JPEG
-                buf = io.BytesIO()
-                img.convert("RGB").save(buf, format="JPEG", quality=80)
-                screenshots_b64.append(base64.b64encode(buf.getvalue()).decode())
-            except Exception:
-                continue
-
+        # Fall back to blob-based screenshots
+        result = _sample_screenshots_from_blobs(conn, cur, max_count)
         conn.close()
-        return screenshots_b64
+        return result
     except Exception:
         return []
+
+
+def _sample_screenshots_from_files(
+    conn: sqlite3.Connection,
+    cur: sqlite3.Cursor,
+    recording_dir: Path,
+    max_count: int,
+) -> list[str]:
+    """Sample screenshots from file paths stored in DB."""
+    cur.execute(
+        "SELECT COUNT(*) FROM screenshot WHERE image_path IS NOT NULL"
+    )
+    total = cur.fetchone()[0]
+    if total == 0:
+        return []
+
+    indices = _pick_sample_indices(total, max_count)
+
+    screenshots_b64 = []
+    for idx in indices:
+        cur.execute(
+            "SELECT image_path FROM screenshot WHERE image_path IS NOT NULL "
+            "ORDER BY timestamp LIMIT 1 OFFSET ?",
+            (idx,),
+        )
+        row = cur.fetchone()
+        if not row or not row[0]:
+            continue
+
+        file_path = recording_dir / row[0]
+        b64 = _image_file_to_b64(file_path)
+        if b64:
+            screenshots_b64.append(b64)
+
+    return screenshots_b64
+
+
+def _sample_screenshots_from_blobs(
+    conn: sqlite3.Connection,
+    cur: sqlite3.Cursor,
+    max_count: int,
+) -> list[str]:
+    """Sample screenshots from png_data blobs in DB."""
+    cur.execute("SELECT COUNT(*) FROM screenshot WHERE png_data IS NOT NULL")
+    total = cur.fetchone()[0]
+    if total == 0:
+        return []
+
+    indices = _pick_sample_indices(total, max_count)
+
+    screenshots_b64 = []
+    for idx in indices:
+        cur.execute(
+            "SELECT png_data FROM screenshot WHERE png_data IS NOT NULL "
+            "ORDER BY timestamp LIMIT 1 OFFSET ?",
+            (idx,),
+        )
+        row = cur.fetchone()
+        if not row or not row[0]:
+            continue
+
+        b64 = _image_bytes_to_b64(row[0])
+        if b64:
+            screenshots_b64.append(b64)
+
+    return screenshots_b64
+
+
+def _pick_sample_indices(total: int, max_count: int) -> list[int]:
+    """Pick evenly-spaced indices including first and last."""
+    if total <= max_count:
+        return list(range(total))
+    indices = [0, total - 1]
+    step = (total - 1) / (max_count - 1)
+    for i in range(1, max_count - 1):
+        idx = int(round(step * i))
+        if idx not in indices:
+            indices.append(idx)
+    return sorted(set(indices))[:max_count]
+
+
+def _image_file_to_b64(file_path: Path) -> str | None:
+    """Read an image file and return as base64 JPEG string."""
+    try:
+        from PIL import Image
+
+        img = Image.open(file_path)
+        return _resize_and_encode(img)
+    except Exception:
+        return None
+
+
+def _image_bytes_to_b64(data: bytes) -> str | None:
+    """Decode image bytes and return as base64 JPEG string."""
+    try:
+        from PIL import Image
+
+        img = Image.open(io.BytesIO(data))
+        return _resize_and_encode(img)
+    except Exception:
+        return None
+
+
+def _resize_and_encode(img) -> str:
+    """Resize image to 1024px wide and encode as base64 JPEG."""
+    if img.width > 1024:
+        ratio = 1024 / img.width
+        img = img.resize(
+            (1024, int(img.height * ratio)),
+            img.Resampling.LANCZOS,
+        )
+    buf = io.BytesIO()
+    img.convert("RGB").save(buf, format="JPEG", quality=80)
+    return base64.b64encode(buf.getvalue()).decode()
 
 
 def _summarize_action_events(db_path: Path, limit: int = 50) -> list[dict]:

@@ -469,7 +469,9 @@ def write_screen_event(
     recording: Recording,
     event: Event,
     perf_q: sq.SynchronizedQueue,
-) -> None:
+    screenshots_dir: str | None = None,
+    **kwargs,
+) -> dict[str, Any]:
     """Write a screen event to the database and update the performance queue.
 
     Args:
@@ -477,19 +479,39 @@ def write_screen_event(
         recording: The recording object.
         event: A screen event to be written.
         perf_q: A queue for collecting performance data.
+        screenshots_dir: Directory for screenshot JPEG files.
+
+    Returns:
+        dict containing state for the next iteration.
     """
     assert event.type == "screen", event
     image = event.data
+    event_data: dict[str, Any] = {}
     if config.RECORD_IMAGES:
-        with io.BytesIO() as output:
-            image.save(output, format="JPEG", quality=95)
-            png_data = output.getvalue()
-        event_data = {"png_data": png_data}
-    else:
-        event_data = {}
+        if screenshots_dir:
+            import math
+
+            ts = event.timestamp
+            if math.isfinite(ts) and ts > 0:
+                filename = f"{ts:.6f}.jpg"
+                file_path = os.path.join(screenshots_dir, filename)
+                try:
+                    image.save(file_path, format="JPEG", quality=95)
+                    os.chmod(file_path, 0o600)
+                    event_data["image_path"] = f"screenshots/{filename}"
+                except OSError:
+                    logger.warning(
+                        f"Failed to save screenshot to {file_path}, skipping"
+                    )
+        else:
+            with io.BytesIO() as output:
+                image.save(output, format="JPEG", quality=95)
+                png_data = output.getvalue()
+            event_data["png_data"] = png_data
     crud.insert_screenshot(db, recording, event.timestamp, event_data)
     # disabled to increase perf
     # perf_q.put((event.type, event.timestamp, utils.get_timestamp()))
+    return {**kwargs, "screenshots_dir": screenshots_dir}
 
 
 def write_window_event(
@@ -543,7 +565,7 @@ def write_events(
     db_path: str,
     terminate_processing: multiprocessing.Event,
     started_event: multiprocessing.Event,
-    pre_callback: Callable[[float], dict] | None = None,
+    pre_callback: Callable | None = None,
     post_callback: Callable[[dict], None] | None = None,
     config_overrides: dict[str, object] | None = None,
 ) -> None:
@@ -686,6 +708,26 @@ def video_post_callback(state: dict) -> None:
         state["last_pts"],
         state["video_file_path"],
     )
+
+
+def screen_pre_callback(
+    db: crud.SaSession,
+    recording: Recording,
+    screenshots_dir: str | None = None,
+) -> dict[str, Any]:
+    """Create screenshots directory before the screen writer loop starts.
+
+    Args:
+        db: The database session (unused, required by callback signature).
+        recording: The recording object (unused, required by callback signature).
+        screenshots_dir: Path to the screenshots directory.
+
+    Returns:
+        State dict with screenshots_dir for the write loop.
+    """
+    if screenshots_dir:
+        os.makedirs(screenshots_dir, mode=0o700, exist_ok=True)
+    return {"screenshots_dir": screenshots_dir}
 
 
 def write_video_event(
@@ -2019,6 +2061,7 @@ def record(
     event_processor.start()
     task_by_name["event_processor"] = event_processor
 
+    _screenshots_dir = os.path.join(capture_dir, "screenshots")
     screen_event_writer = multiprocessing.Process(
         target=utils.WrapStdout(write_events),
         args=(
@@ -2033,6 +2076,7 @@ def record(
             task_started_events.setdefault(
                 "screen_event_writer", multiprocessing.Event()
             ),
+            partial(screen_pre_callback, screenshots_dir=_screenshots_dir),
         ),
         kwargs={"config_overrides": _config_overrides},
     )

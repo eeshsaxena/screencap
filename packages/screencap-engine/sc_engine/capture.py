@@ -511,6 +511,8 @@ class CaptureSession:
     def get_frame_at(self, timestamp: float, tolerance: float = 0.5) -> "Image" | None:
         """Get the screen frame closest to a timestamp.
 
+        Tries video first, then falls back to screenshot files on disk.
+
         Args:
             timestamp: Unix timestamp.
             tolerance: Maximum time difference in seconds.
@@ -519,22 +521,82 @@ class CaptureSession:
             PIL Image or None if not available.
         """
         video_path = self.video_path
-        if video_path is None:
+        if video_path is not None:
+            try:
+                from sc_engine.video import extract_frame
+
+                # Convert to video-relative timestamp
+                video_start = self._recording.video_start_time or self._recording.timestamp
+                video_timestamp = timestamp - video_start
+
+                if video_timestamp < 0:
+                    video_timestamp = 0
+
+                frame = extract_frame(video_path, video_timestamp, tolerance=tolerance)
+                if frame is not None:
+                    return frame
+            except Exception:
+                pass
+
+        # Fall back to screenshot files
+        return self._get_screenshot_frame(timestamp, tolerance)
+
+    def _get_screenshot_frame(self, timestamp: float, tolerance: float) -> "Image" | None:
+        """Find nearest screenshot file by timestamp.
+
+        Lazy-loads and caches the sorted list of (timestamp, path) pairs.
+        """
+        if not hasattr(self, "_screenshot_index"):
+            self._screenshot_index = self._build_screenshot_index()
+
+        if not self._screenshot_index:
             return None
 
+        import bisect
+
+        timestamps = [t for t, _ in self._screenshot_index]
+        idx = bisect.bisect_left(timestamps, timestamp)
+
+        best_idx = None
+        best_diff = float("inf")
+        for candidate in (idx - 1, idx):
+            if 0 <= candidate < len(timestamps):
+                diff = abs(timestamps[candidate] - timestamp)
+                if diff < best_diff:
+                    best_diff = diff
+                    best_idx = candidate
+
+        if best_idx is None or best_diff > tolerance:
+            return None
+
+        _, path = self._screenshot_index[best_idx]
         try:
-            from sc_engine.video import extract_frame
+            from PIL import Image as PILImage
 
-            # Convert to video-relative timestamp
-            video_start = self._recording.video_start_time or self._recording.timestamp
-            video_timestamp = timestamp - video_start
-
-            if video_timestamp < 0:
-                video_timestamp = 0
-
-            return extract_frame(video_path, video_timestamp, tolerance=tolerance)
+            return PILImage.open(path)
         except Exception:
             return None
+
+    def _build_screenshot_index(self) -> list[tuple[float, Path]]:
+        """Build sorted list of (timestamp, file_path) from DB image_path values."""
+        from sc_engine.db.models import Screenshot
+
+        index = []
+        try:
+            screenshots = (
+                self._session.query(Screenshot.timestamp, Screenshot.image_path)
+                .filter(Screenshot.image_path.isnot(None))
+                .order_by(Screenshot.timestamp)
+                .all()
+            )
+            for ts, rel_path in screenshots:
+                if ts is not None and rel_path:
+                    full_path = self.capture_dir / rel_path
+                    if full_path.exists():
+                        index.append((ts, full_path))
+        except Exception:
+            pass
+        return index
 
     def close(self) -> None:
         """Close the capture and release resources."""

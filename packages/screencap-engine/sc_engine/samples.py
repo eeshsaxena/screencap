@@ -168,7 +168,9 @@ def get_example_info(name: str = DEFAULT_EXAMPLE) -> dict:
     screenshots_dir = example_path / "screenshots"
     screenshot_count = 0
     if screenshots_dir.exists():
-        screenshot_count = len(list(screenshots_dir.glob("*.png")))
+        screenshot_count = len(
+            list(screenshots_dir.glob("*.png")) + list(screenshots_dir.glob("*.jpg"))
+        )
 
     return {
         "name": name,
@@ -217,7 +219,9 @@ def get_example_screenshots(name: str = DEFAULT_EXAMPLE) -> list[Path]:
     if not screenshots_dir.exists():
         return []
 
-    return sorted(screenshots_dir.glob("*.png"))
+    pngs = list(screenshots_dir.glob("*.png"))
+    jpgs = list(screenshots_dir.glob("*.jpg"))
+    return sorted(pngs + jpgs)
 
 
 def load_example_for_retrieval(name: str = DEFAULT_EXAMPLE) -> dict:
