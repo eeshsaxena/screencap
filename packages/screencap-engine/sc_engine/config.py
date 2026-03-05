@@ -12,7 +12,7 @@ from dataclasses import dataclass, fields
 from pydantic_settings import BaseSettings
 
 STOP_STRS = [
-    "oa.stop",
+    "sc.stop",
 ]
 SPECIAL_CHAR_STOP_SEQUENCES = [["ctrl", "ctrl", "ctrl"]]
 
