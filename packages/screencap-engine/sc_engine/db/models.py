@@ -210,6 +210,7 @@ class Screenshot(Base):
     png_data = sa.Column(sa.LargeBinary)
     png_diff_data = sa.Column(sa.LargeBinary, nullable=True)
     png_diff_mask_data = sa.Column(sa.LargeBinary, nullable=True)
+    image_path = sa.Column(sa.String, nullable=True)
 
     recording = sa.orm.relationship("Recording", back_populates="screenshots")
     action_event = sa.orm.relationship("ActionEvent", back_populates="screenshot")
