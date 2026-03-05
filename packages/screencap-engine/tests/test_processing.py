@@ -86,7 +86,7 @@ class TestMergeConsecutiveKeyboardEvents:
         """Test merging key events into typed text.
 
         Note: Each press/release cycle creates a separate KeyTypeEvent.
-        This matches OpenAdapt's behavior of grouping by pressed state.
+        This matches legacy behavior of grouping by pressed state.
         """
         events = [
             KeyDownEvent(timestamp=1.0, key_char="h"),

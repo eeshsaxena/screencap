@@ -1,6 +1,6 @@
 """Utility functions for screencap-engine.
 
-Copied from legacy OpenAdapt utils.py — timestamp management, screenshot capture,
+Timestamp management, screenshot capture,
 and multiprocessing helpers. Only import paths are changed.
 """
 
@@ -205,7 +205,7 @@ class WrapStdout:
     """Wrapper for multiprocessing process targets.
 
     Ensures that stdout/stderr are properly redirected in child processes.
-    Copied from legacy OpenAdapt utils.py.
+    
     """
 
     def __init__(self, fn: Callable) -> None:

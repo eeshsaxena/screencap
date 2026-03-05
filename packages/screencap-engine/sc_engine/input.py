@@ -1,7 +1,7 @@
 """Input capture for mouse and keyboard events.
 
 This module provides cross-platform input capture using pynput,
-following OpenAdapt's proven implementation.
+
 """
 
 from __future__ import annotations
@@ -443,7 +443,7 @@ class ScreenCapturer:
     def _capture_loop(self) -> None:
         """Main capture loop running in background thread.
 
-        Uses mss for screenshots (same as legacy OpenAdapt record.py),
+        Uses mss for screenshots,
         which is 2-4x faster than PIL.ImageGrab on Windows.
         """
         import sys
@@ -454,7 +454,7 @@ class ScreenCapturer:
 
         if sys.platform == "win32":
             import mss.windows
-            # Fix cursor flicker on Windows (from legacy OpenAdapt)
+            # Fix cursor flicker on Windows
             # https://github.com/BoboTiG/python-mss/issues/179#issuecomment-673292002
             mss.windows.CAPTUREBLT = 0
 

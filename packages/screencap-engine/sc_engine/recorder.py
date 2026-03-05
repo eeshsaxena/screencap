@@ -1,6 +1,6 @@
 """Script for creating Recordings.
 
-Copied from legacy OpenAdapt record.py. Only import paths changed +
+Multi-process recording system.
 adaptation for per-capture databases.
 
 Usage:
@@ -1011,7 +1011,7 @@ def read_window_events(
         ] != prev_window_data.get("window_id"):
             # TODO: fix exception sometimes triggered by the next line on win32:
             #   File "\Python39\lib\threading.py" line 917, in run
-            #   File "...\openadapt\record.py", line 277, in read window events
+            #   File "sc_engine/recorder.py" in read window events
             #   File "...\env\lib\site-packages\loguru\logger.py" line 1977, in info
             #   File "...\env\lib\site-packages\loguru\_logger.py", line 1964, in _log
             #       for handler in core.handlers.values):

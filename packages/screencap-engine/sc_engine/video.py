@@ -1,8 +1,8 @@
 """Video capture and frame extraction using PyAV.
 
 This module provides video recording capabilities using libx264 encoding,
-following OpenAdapt's proven implementation. Includes both a VideoWriter class
-and legacy functional API (initialize/write/finalize) copied from legacy OpenAdapt.
+Includes both a VideoWriter class
+and legacy functional API (initialize/write/finalize).
 """
 
 from __future__ import annotations
@@ -215,7 +215,7 @@ class VideoWriter:
 
 
 # =============================================================================
-# Legacy Functional API (copied from legacy OpenAdapt video.py)
+# Legacy Functional API
 # =============================================================================
 
 

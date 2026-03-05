@@ -1,4 +1,4 @@
-"""Side-by-side benchmark: legacy OpenAdapt vs new screencap-engine recording patterns.
+"""Side-by-side benchmark: legacy vs new screencap-engine recording patterns.
 
 Extracts the core screenshot capture + video encoding loops from both codebases
 and runs them in identical conditions for a fair comparison.
@@ -28,7 +28,7 @@ if sys.platform == "win32":
     mss.windows.CAPTUREBLT = 0
 
 # ===================================================================
-# Legacy Pattern (from OpenAdapt/legacy/openadapt/record.py)
+# Legacy Pattern (original recording system)
 # ===================================================================
 
 Event = namedtuple("Event", ("timestamp", "type", "data"))
@@ -445,7 +445,7 @@ def run_benchmark(name, run_fn, output_dir, duration):
 def main():
     import matplotlib.pyplot as plt
 
-    base_dir = Path("/tmp/openadapt_benchmark")
+    base_dir = Path("/tmp/screencap_benchmark")
     if base_dir.exists():
         import shutil
         shutil.rmtree(base_dir)

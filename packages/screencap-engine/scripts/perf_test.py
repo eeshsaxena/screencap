@@ -85,7 +85,7 @@ def generate_synthetic_input(duration, stop_event):
 def main():
     from sc_engine.recorder import Recorder
 
-    capture_dir = Path("/tmp/openadapt_perf_test")
+    capture_dir = Path("/tmp/screencap_perf_test")
     if capture_dir.exists():
         import shutil
         shutil.rmtree(capture_dir)

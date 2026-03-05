@@ -1,6 +1,6 @@
 """Windows platform window capture using pywinauto.
 
-Copied from legacy OpenAdapt window/_windows.py. Only import paths changed.
+Windows platform window capture.
 """
 
 import pickle

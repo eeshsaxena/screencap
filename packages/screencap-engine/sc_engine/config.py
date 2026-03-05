@@ -1,7 +1,7 @@
 """Configuration management using pydantic-settings.
 
 Loads settings from environment variables and .env file.
-Includes all legacy OpenAdapt recording configuration values.
+
 """
 
 from __future__ import annotations
@@ -25,13 +25,13 @@ class Settings(BaseSettings):
     2. .env file
     3. Default values
 
-    Recording config values are copied from legacy OpenAdapt config.py.
+    
     """
 
     # API keys
     openai_api_key: str | None = None
 
-    # Record and replay (from legacy OpenAdapt config.defaults.json)
+    # Record and replay defaults
     RECORD_WINDOW_DATA: bool = True
     RECORD_READ_ACTIVE_ELEMENT_STATE: bool = True
     RECORD_VIDEO: bool = True

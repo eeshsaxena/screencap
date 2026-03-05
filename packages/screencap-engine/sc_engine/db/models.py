@@ -1,6 +1,6 @@
-"""SQLAlchemy models for screencap-engine.
+"""SQLAlchemy models for the recording database.
 
-Copied verbatim from legacy OpenAdapt models.py.
+
 Only import paths are changed; column definitions and relationships are identical.
 """
 

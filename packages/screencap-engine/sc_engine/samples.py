@@ -223,7 +223,7 @@ def get_example_screenshots(name: str = DEFAULT_EXAMPLE) -> list[Path]:
 def load_example_for_retrieval(name: str = DEFAULT_EXAMPLE) -> dict:
     """Load example in a format suitable for demo retrieval libraries.
 
-    This returns a dict with fields expected by openadapt-retrieval's
+    This returns a dict with fields expected by the retrieval API's
     MultimodalDemoRetriever.add_demo() method.
 
     Args:

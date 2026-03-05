@@ -1,7 +1,7 @@
 """SQLite storage for capture events.
 
 This module provides a simple SQLite-based storage system for capture events,
-following OpenAdapt's approach but using Pydantic for serialization.
+using Pydantic for serialization.
 """
 
 from __future__ import annotations
