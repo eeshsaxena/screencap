@@ -257,6 +257,34 @@ FALSE_POSITIVES = [
         expected=[],
         is_false_positive=True,
     ),
+    CorpusCase(
+        id="fp-09",
+        description="App name that looks like proper noun (Ghostty)",
+        text="Ghostty tmux a",
+        expected=[],
+        is_false_positive=True,
+    ),
+    CorpusCase(
+        id="fp-10",
+        description="App name (Bitwarden)",
+        text="Bitwarden Bitwarden",
+        expected=[],
+        is_false_positive=True,
+    ),
+    CorpusCase(
+        id="fp-11",
+        description="App name (Homebrew)",
+        text="Homebrew — Installing packages",
+        expected=[],
+        is_false_positive=True,
+    ),
+    CorpusCase(
+        id="fp-12",
+        description="App name (Terminal.app)",
+        text="Terminal.app — bash",
+        expected=[],
+        is_false_positive=True,
+    ),
 ]
 
 # ---------------------------------------------------------------------------

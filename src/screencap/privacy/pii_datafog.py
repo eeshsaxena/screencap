@@ -1,58 +1,55 @@
-"""PiiDetector backed by DataFog — lightweight regex-based PII engine."""
+"""PiiDetector backed by DataFog — NER-capable PII engine using spaCy."""
 
 from __future__ import annotations
 
-from datafog import DataFog
+from datafog.engine import scan as datafog_scan
 
 from screencap.privacy import Detection, EntityType
 
-# Map DataFog entity types to our EntityType constants
+# Map DataFog canonical entity types to our EntityType constants.
+# ORGANIZATION dropped — no EntityType constant and high false positive rate
+# on app names (Terminal.app, Homebrew, Bitwarden) in window titles.
+# LOCATION dropped — too coarse (cities/countries); ADDRESS covers street addresses.
 _TYPE_MAP: dict[str, str] = {
     "EMAIL": EntityType.EMAIL,
     "PHONE": EntityType.PHONE,
     "SSN": EntityType.SSN,
     "CREDIT_CARD": EntityType.CREDIT_CARD,
-    # DataFog types we skip (not in our EntityType set or too noisy)
-    # "IP_ADDRESS", "DOB", "ZIP" — not mapped
+    "PERSON": EntityType.PERSON,
+    "ADDRESS": EntityType.ADDRESS,
 }
 
 
 class DataFogPiiDetector:
-    """Wraps DataFog for PII detection.
+    """Wraps DataFog engine for PII detection using spaCy NER.
 
-    Lightweight alternative to Presidio — regex-based, no NLP model.
-    Detects emails, phones, SSNs, credit cards. Does NOT detect names
-    or addresses (no NER capability).
+    Constructor loads the spaCy NLP model eagerly (~1-2s). Create once,
+    reuse for all text chunks.
     """
 
     def __init__(self) -> None:
-        self._engine = DataFog()
+        # Eager warm-up: load the spaCy model now so it's covered by the
+        # "Loading privacy detection engine..." spinner in scrubber.py.
+        # Also validates that datafog[nlp] is properly installed.
+        datafog_scan(" ", engine="spacy")
 
     def detect(self, text: str) -> list[Detection]:
-        results = self._engine.scan_text(text)
+        result = datafog_scan(text, engine="spacy")
 
         detections: list[Detection] = []
-        for datafog_type, values in results.items():
-            entity_type = _TYPE_MAP.get(datafog_type)
+        for entity in result.entities:
+            entity_type = _TYPE_MAP.get(entity.type)
             if entity_type is None:
                 continue
 
-            for value in values:
-                # Locate all occurrences of the matched value in text
-                search_start = 0
-                while True:
-                    idx = text.find(value, search_start)
-                    if idx == -1:
-                        break
-                    detections.append(
-                        Detection(
-                            entity_type=entity_type,
-                            start=idx,
-                            end=idx + len(value),
-                            score=0.85,
-                            source="pii-datafog",
-                        )
-                    )
-                    search_start = idx + 1
+            detections.append(
+                Detection(
+                    entity_type=entity_type,
+                    start=entity.start,
+                    end=entity.end,
+                    score=entity.confidence,
+                    source="pii-datafog",
+                )
+            )
 
         return detections

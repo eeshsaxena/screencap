@@ -255,6 +255,33 @@ screencap download --force
 | `--dry-run` | Show recording names and file counts without downloading |
 | `--force` | Re-download all recordings, ignoring markers |
 
+### `screencap scrub <name>`
+
+Redact PII and secrets from a recording's database and transcript files. Creates a scrubbed copy at `<name>-scrubbed/`.
+
+```bash
+# scrub with auto-detected engine (prefers Presidio, falls back to DataFog)
+screencap scrub my-session
+
+# use a specific PII engine
+screencap scrub my-session --pii-engine presidio
+screencap scrub my-session --pii-engine datafog
+```
+
+| Flag | Description |
+|------|-------------|
+| `--pii-engine {presidio,datafog}` | PII detection engine (default: auto-detect) |
+
+#### PII Engine Comparison
+
+| Engine | Install Extra | NER Model | Detects Names? | Install Size |
+|--------|---------------|-----------|----------------|-------------|
+| Presidio | `screencap[privacy]` | spaCy `en_core_web_lg` | Yes | ~560 MB |
+| DataFog (spaCy) | `screencap[privacy-lite]` | spaCy `en_core_web_lg` | Yes | ~560 MB |
+| DataFog (GLiNER) | `datafog[nlp-advanced]` | `urchade/gliner_multi_pii-v1` | Yes | ~2 GB (torch) |
+
+Both `privacy` and `privacy-lite` install `detect-secrets` for API key and secrets detection. The PII engines differ in their NER model but use the same underlying spaCy `en_core_web_lg` model (~560 MB).
+
 ### `screencap stop`
 
 Terminate orphaned recording processes left behind by a crash or forced quit.

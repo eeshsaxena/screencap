@@ -330,14 +330,14 @@ def create_default_pipeline(
         except ImportError:
             if pii_engine == "datafog":
                 raise ImportError(
-                    "DataFog not installed. "
-                    "Install with: pip install datafog"
+                    "DataFog NLP not installed. "
+                    "Install with: pip install 'datafog[nlp]'"
                 )
 
     if not pii_loaded:
         logger.warning(
             "No PII engine installed — PII detection disabled. "
-            "Install with: pip install presidio-analyzer  (or: pip install datafog)"
+            "Install with: pip install presidio-analyzer  (or: pip install 'datafog[nlp]')"
         )
 
     if len(detectors) < 2:

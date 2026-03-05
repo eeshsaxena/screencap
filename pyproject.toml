@@ -52,7 +52,7 @@ privacy = [
 ]
 privacy-lite = [
     "detect-secrets>=1.5.0,<2.0",
-    "datafog>=4.0",
+    "datafog[nlp]>=4.3,<5.0",
 ]
 dev = [
     "screencap[record,privacy]",
