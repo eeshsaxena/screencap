@@ -77,6 +77,43 @@ class TestDataFogDetection:
             assert d.source == "pii-datafog"
 
 
+class TestDataFogPersonThreshold:
+    def test_below_threshold_person_dropped(self):
+        """PERSON detection below threshold is dropped."""
+        # DataFog scores PERSON at 0.7 — set threshold above to filter them
+        det = DataFogPiiDetector(person_threshold=0.75)
+        dets = det.detect("Ghostty tmux a")
+        persons = [d for d in dets if d.entity_type == EntityType.PERSON]
+        assert len(persons) == 0
+
+    def test_non_person_unaffected(self):
+        """Threshold only applies to PERSON."""
+        det = DataFogPiiDetector(person_threshold=1.0)
+        dets = det.detect("Contact jane@example.com")
+        assert any(d.entity_type == EntityType.EMAIL for d in dets)
+
+
+class TestDataFogPersonAllowlist:
+    def test_allowlisted_app_suppressed(self):
+        """App name in allowlist suppresses PERSON detection."""
+        det = DataFogPiiDetector(
+            person_threshold=1.0,
+            person_allowlist=frozenset({"ghostty"}),
+        )
+        dets = det.detect("Ghostty tmux a")
+        persons = [d for d in dets if d.entity_type == EntityType.PERSON]
+        assert len(persons) == 0
+
+    def test_real_name_not_suppressed(self):
+        """Real person name not in allowlist is still detected."""
+        det = DataFogPiiDetector(
+            person_allowlist=frozenset({"ghostty"}),
+        )
+        dets = det.detect("John Doe is here")
+        persons = [d for d in dets if d.entity_type == EntityType.PERSON]
+        assert len(persons) >= 1
+
+
 class TestFactorySwitching:
     def test_create_with_presidio(self):
         from screencap.privacy import create_default_pipeline

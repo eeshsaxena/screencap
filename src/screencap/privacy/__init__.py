@@ -269,12 +269,16 @@ _VALID_PII_ENGINES = frozenset({"presidio", "datafog", None})
 
 def create_default_pipeline(
     pii_engine: str | None = None,
+    person_threshold: float = 0.5,
+    person_allowlist: frozenset[str] = frozenset(),
 ) -> DetectionPipeline:
     """Create a pipeline with all available detectors.
 
     Args:
         pii_engine: PII backend to use. One of "presidio", "datafog", or
             None (auto-detect: tries Presidio first, falls back to DataFog).
+        person_threshold: Drop PERSON detections with score <= this value.
+        person_allowlist: Lowercased app names to suppress as PERSON hits.
 
     Call ONCE per scrub session — detector constructors load NLP models
     (~200-500ms for Presidio/spaCy). Reuse the returned pipeline for all
@@ -311,7 +315,10 @@ def create_default_pipeline(
         try:
             from screencap.privacy.pii import PiiDetector
 
-            detectors.append(PiiDetector())
+            detectors.append(PiiDetector(
+                person_threshold=person_threshold,
+                person_allowlist=person_allowlist,
+            ))
             pii_loaded = True
         except ImportError:
             if pii_engine == "presidio":
@@ -325,7 +332,10 @@ def create_default_pipeline(
         try:
             from screencap.privacy.pii_datafog import DataFogPiiDetector
 
-            detectors.append(DataFogPiiDetector())
+            detectors.append(DataFogPiiDetector(
+                person_threshold=person_threshold,
+                person_allowlist=person_allowlist,
+            ))
             pii_loaded = True
         except ImportError:
             if pii_engine == "datafog":

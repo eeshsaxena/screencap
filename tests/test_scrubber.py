@@ -12,6 +12,7 @@ import pytest
 
 from screencap.scrubber import (
     ScrubResult,
+    _build_app_allowlist,
     _scrub_db,
     _scrub_json_recursive,
     _scrub_metrics,
@@ -585,6 +586,127 @@ def test_scrub_copytree_skips_media(recording_dir, tmp_path):
     # These should have been skipped by the ignore callback
     assert not (dst / "audio.flac").exists()
     assert not list(dst.glob("*.mp4"))
+
+
+# ---------------------------------------------------------------------------
+# App Allowlist
+# ---------------------------------------------------------------------------
+
+
+def test_build_allowlist_from_metrics(tmp_path):
+    """Running applications → frozenset of lowercased names."""
+    path = tmp_path / "system_metrics.json"
+    data = {
+        "static": {
+            "running_applications": [
+                {"name": "Ghostty", "bundle_id": "com.mitchellh.ghostty"},
+                {"name": "Bitwarden", "bundle_id": "com.bitwarden.desktop"},
+                {"name": "Google Chrome", "bundle_id": "com.google.Chrome"},
+            ]
+        }
+    }
+    path.write_text(json.dumps(data))
+
+    result = _build_app_allowlist(path)
+    assert "ghostty" in result
+    assert "bitwarden" in result
+    assert "google chrome" in result
+
+
+def test_build_allowlist_missing_file(tmp_path):
+    """Missing system_metrics.json → empty frozenset, no crash."""
+    result = _build_app_allowlist(tmp_path / "nonexistent.json")
+    assert result == frozenset()
+
+
+def test_build_allowlist_corrupted_json(tmp_path):
+    """Corrupted JSON → empty frozenset + warning."""
+    path = tmp_path / "system_metrics.json"
+    path.write_text("{invalid json")
+    result = _build_app_allowlist(path)
+    assert result == frozenset()
+
+
+def test_build_allowlist_null_running_applications(tmp_path):
+    """running_applications: null → empty frozenset."""
+    path = tmp_path / "system_metrics.json"
+    data = {"static": {"running_applications": None}}
+    path.write_text(json.dumps(data))
+
+    result = _build_app_allowlist(path)
+    assert result == frozenset()
+
+
+def test_build_allowlist_no_static_key(tmp_path):
+    """No 'static' key → empty frozenset."""
+    path = tmp_path / "system_metrics.json"
+    data = {"schema_version": 4}
+    path.write_text(json.dumps(data))
+
+    result = _build_app_allowlist(path)
+    assert result == frozenset()
+
+
+def test_build_allowlist_app_without_name(tmp_path):
+    """App entry missing 'name' key → skipped."""
+    path = tmp_path / "system_metrics.json"
+    data = {
+        "static": {
+            "running_applications": [
+                {"bundle_id": "com.no.name"},
+                {"name": "ValidApp"},
+            ]
+        }
+    }
+    path.write_text(json.dumps(data))
+
+    result = _build_app_allowlist(path)
+    assert "validapp" in result
+    assert len(result) == 1
+
+
+def test_scrub_recording_uses_allowlist(tmp_path):
+    """scrub_recording passes app allowlist to pipeline — app names not scrubbed."""
+    rec = tmp_path / "allowlist-test"
+    rec.mkdir()
+
+    # DB with window title containing app name
+    db = sqlite3.connect(str(rec / "recording.db"))
+    db.execute("CREATE TABLE recording (id INTEGER PRIMARY KEY, task_description TEXT)")
+    db.execute("INSERT INTO recording VALUES (1, 'test')")
+    db.execute(
+        "CREATE TABLE window_event (id INTEGER PRIMARY KEY, recording_id INTEGER, title TEXT)"
+    )
+    db.execute("INSERT INTO window_event VALUES (1, 1, 'Ghostty tmux a')")
+    db.commit()
+    db.close()
+
+    # system_metrics.json with Ghostty in running_applications
+    metrics = {
+        "static": {
+            "running_applications": [
+                {"name": "Ghostty", "bundle_id": "com.mitchellh.ghostty"},
+            ]
+        }
+    }
+    (rec / "system_metrics.json").write_text(json.dumps(metrics))
+
+    with mock.patch(
+        "screencap.config.get_recordings_dir", return_value=tmp_path
+    ), mock.patch(
+        "screencap.scrubber.get_recordings_dir", return_value=tmp_path
+    ):
+        result = scrub_recording("allowlist-test")
+
+    dst = tmp_path / "allowlist-test-scrubbed"
+    conn = sqlite3.connect(str(dst / "recording.db"))
+    cur = conn.cursor()
+    cur.execute("SELECT title FROM window_event")
+    title = cur.fetchone()[0]
+    conn.close()
+
+    # Ghostty should NOT be scrubbed (it's an app name, not a person)
+    assert "Ghostty" in title or "ghostty" in title.lower()
 
 
 # ---------------------------------------------------------------------------

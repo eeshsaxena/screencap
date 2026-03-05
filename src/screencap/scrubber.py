@@ -17,6 +17,28 @@ from screencap.config import get_recordings_dir, resolve_recording_dir
 
 console = Console()
 
+
+def _build_app_allowlist(metrics_path: Path) -> frozenset[str]:
+    """Build a set of app names from system_metrics.json running_applications.
+
+    Returns NFKC-normalized, lowercased app names. Silent on missing file
+    (expected for old recordings); warns on corruption.
+    """
+    if not metrics_path.exists():
+        return frozenset()
+    try:
+        data = json.loads(metrics_path.read_text(encoding="utf-8"))
+        apps = data.get("static", {}).get("running_applications") or []
+        # Deferred import — only needed here.
+        from screencap.privacy import normalize_text
+
+        names = {normalize_text(app["name"]).lower() for app in apps if app.get("name")}
+        return frozenset(names)
+    except (json.JSONDecodeError, OSError, KeyError, TypeError) as e:
+        console.print(f"  [yellow]Warning: could not read app allowlist: {e}[/]")
+        return frozenset()
+
+
 # Files to skip during copytree and delete as safety fallback.
 _SKIP_FILES = {"audio.flac", "events.jsonl", ".upload_status.json", "viewer.html"}
 _SKIP_EXTENSIONS = {".mp4"}
@@ -448,11 +470,17 @@ def scrub_recording(
     if not src.exists():
         raise FileNotFoundError(f"Recording not found: {name}")
 
-    # 3. Validate deps — create pipeline BEFORE any filesystem mutation
-    with console.status("Loading privacy detection engine..."):
-        pipeline = create_default_pipeline(pii_engine=pii_engine)
+    # 3. Build app-name allowlist from source metrics (before any mutation)
+    app_allowlist = _build_app_allowlist(src / "system_metrics.json")
 
-    # 4. Create anonymizer
+    # 4. Validate deps — create pipeline BEFORE any filesystem mutation
+    with console.status("Loading privacy detection engine..."):
+        pipeline = create_default_pipeline(
+            pii_engine=pii_engine,
+            person_allowlist=app_allowlist,
+        )
+
+    # 5. Create anonymizer
     anonymizer = Anonymizer()
 
     result = ScrubResult()

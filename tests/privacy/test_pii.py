@@ -75,6 +75,61 @@ class TestSkippedTypes:
         assert not any(d.entity_type == "DATE_TIME" for d in dets)
 
 
+class TestPersonThreshold:
+    def test_below_threshold_person_dropped(self):
+        """PERSON detection below threshold is dropped."""
+        # Presidio scores PERSON at 0.85 — set threshold above to filter them
+        det = PiiDetector(person_threshold=0.90)
+        dets = det.detect("Ghostty tmux a")
+        persons = [d for d in dets if d.entity_type == EntityType.PERSON]
+        assert len(persons) == 0
+
+    def test_above_threshold_person_kept(self):
+        """PERSON detection at or above threshold passes through."""
+        det = PiiDetector(person_threshold=0.5)
+        dets = det.detect("John Doe is here")
+        persons = [d for d in dets if d.entity_type == EntityType.PERSON]
+        assert len(persons) >= 1
+
+    def test_non_person_unaffected(self):
+        """Threshold only applies to PERSON, not EMAIL/PHONE."""
+        det = PiiDetector(person_threshold=1.0)  # block all PERSON
+        dets = det.detect("Contact jane@example.com at 555-123-4567")
+        # Emails and phones should still be detected
+        assert any(d.entity_type == EntityType.EMAIL for d in dets)
+
+
+class TestPersonAllowlist:
+    def test_allowlisted_app_suppressed(self):
+        """App name in allowlist suppresses PERSON detection."""
+        det = PiiDetector(
+            person_threshold=1.0,  # disable threshold so only allowlist matters
+            person_allowlist=frozenset({"ghostty"}),
+        )
+        dets = det.detect("Ghostty tmux a")
+        persons = [d for d in dets if d.entity_type == EntityType.PERSON]
+        assert len(persons) == 0
+
+    def test_real_name_not_suppressed(self):
+        """Real person name not in allowlist is still detected."""
+        det = PiiDetector(
+            person_allowlist=frozenset({"ghostty", "bitwarden"}),
+        )
+        dets = det.detect("John Doe is here")
+        persons = [d for d in dets if d.entity_type == EntityType.PERSON]
+        assert len(persons) >= 1
+
+    def test_case_insensitive_match(self):
+        """Allowlist matching is case-insensitive."""
+        det = PiiDetector(
+            person_threshold=1.0,
+            person_allowlist=frozenset({"bitwarden"}),
+        )
+        dets = det.detect("Bitwarden Bitwarden")
+        persons = [d for d in dets if d.entity_type == EntityType.PERSON]
+        assert len(persons) == 0
+
+
 class TestOffsets:
     def test_offset_correctness(self, detector: PiiDetector):
         text = "Hello John Doe, your email is john@example.com"
