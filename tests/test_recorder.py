@@ -1,10 +1,17 @@
-"""Tests for screencap.recorder — force-quit cleanup, PID file lifecycle, and permission prompting."""
+"""Tests for screencap.recorder — force-quit cleanup, PID file lifecycle, permission prompting, disk checks."""
 
 import inspect
 import sys
+from collections import namedtuple
 from unittest import mock
 
 import pytest
+
+
+# Generous disk usage for tests that don't test disk checks
+_PLENTY_OF_DISK = namedtuple("DiskUsage", ["total", "used", "free"])(
+    total=500e9, used=100e9, free=400e9,
+)
 
 
 class TestForceExitCleanup:
@@ -69,6 +76,9 @@ class TestAtexitHandler:
             mock.patch("screencap.recorder._check_macos_permissions"),
             mock.patch("screencap.recorder.get_audio_default", return_value=False),
             mock.patch("screencap.recorder.get_wifi_metrics", return_value=False),
+            mock.patch("screencap.recorder.get_disk_warn_mb", return_value=2000),
+            mock.patch("screencap.recorder.get_disk_stop_mb", return_value=500),
+            mock.patch("shutil.disk_usage", return_value=_PLENTY_OF_DISK),
             mock.patch("screencap.pidfile.find_orphaned_processes", return_value=[]),
             mock.patch("screencap.pidfile.write_pidfile"),
             mock.patch("screencap.pidfile.delete_pidfile"),
@@ -130,6 +140,9 @@ class TestOrphanDetection:
             mock.patch("screencap.recorder._check_macos_permissions"),
             mock.patch("screencap.recorder.get_audio_default", return_value=False),
             mock.patch("screencap.recorder.get_wifi_metrics", return_value=False),
+            mock.patch("screencap.recorder.get_disk_warn_mb", return_value=2000),
+            mock.patch("screencap.recorder.get_disk_stop_mb", return_value=500),
+            mock.patch("shutil.disk_usage", return_value=_PLENTY_OF_DISK),
             mock.patch("screencap.pidfile.find_orphaned_processes", return_value=orphans),
             mock.patch("screencap.pidfile.terminate_processes") as mock_term,
             mock.patch("screencap.pidfile.delete_pidfile"),
@@ -159,6 +172,9 @@ class TestPidFileLifecycle:
             mock.patch("screencap.recorder._check_macos_permissions"),
             mock.patch("screencap.recorder.get_audio_default", return_value=False),
             mock.patch("screencap.recorder.get_wifi_metrics", return_value=False),
+            mock.patch("screencap.recorder.get_disk_warn_mb", return_value=2000),
+            mock.patch("screencap.recorder.get_disk_stop_mb", return_value=500),
+            mock.patch("shutil.disk_usage", return_value=_PLENTY_OF_DISK),
             mock.patch("screencap.pidfile.find_orphaned_processes", return_value=[]),
             mock.patch("screencap.pidfile.write_pidfile") as mock_write,
             mock.patch("screencap.pidfile.delete_pidfile"),
@@ -186,6 +202,9 @@ class TestPidFileLifecycle:
             mock.patch("screencap.recorder._check_macos_permissions"),
             mock.patch("screencap.recorder.get_audio_default", return_value=False),
             mock.patch("screencap.recorder.get_wifi_metrics", return_value=False),
+            mock.patch("screencap.recorder.get_disk_warn_mb", return_value=2000),
+            mock.patch("screencap.recorder.get_disk_stop_mb", return_value=500),
+            mock.patch("shutil.disk_usage", return_value=_PLENTY_OF_DISK),
             mock.patch("screencap.pidfile.find_orphaned_processes", return_value=[]),
             mock.patch("screencap.pidfile.write_pidfile"),
             mock.patch("screencap.pidfile.delete_pidfile") as mock_delete,
@@ -411,3 +430,202 @@ class TestPermissionPrompting:
         ):
             mock_sys.platform = "darwin"
             _check_macos_permissions()
+
+
+# ---------------------------------------------------------------------------
+# Disk space check tests
+# ---------------------------------------------------------------------------
+
+DiskUsage = namedtuple("DiskUsage", ["total", "used", "free"])
+
+
+class TestPreRecordingDiskCheck:
+    """Tests for the pre-recording disk space gate."""
+
+    def test_sufficient_space_passes(self, tmp_path):
+        """Recording starts normally when there is enough disk space."""
+        from screencap.recorder import start_recording
+
+        mock_recorder = mock.MagicMock()
+        mock_recorder.wait_for_ready.return_value = True
+        mock_recorder.is_recording = False
+
+        # 10 GB free — well above default 2000 MB warn threshold
+        fake_usage = DiskUsage(total=100e9, used=90e9, free=10e9)
+
+        with (
+            mock.patch("screencap.recorder._check_macos_permissions"),
+            mock.patch("screencap.recorder.get_audio_default", return_value=False),
+            mock.patch("screencap.recorder.get_wifi_metrics", return_value=False),
+            mock.patch("screencap.recorder.get_disk_warn_mb", return_value=2000),
+            mock.patch("screencap.recorder.get_disk_stop_mb", return_value=500),
+            mock.patch("shutil.disk_usage", return_value=fake_usage),
+            mock.patch("screencap.pidfile.find_orphaned_processes", return_value=[]),
+            mock.patch("screencap.pidfile.write_pidfile"),
+            mock.patch("screencap.pidfile.delete_pidfile"),
+            mock.patch("sc_engine.Recorder") as MockRecorder,
+        ):
+            MockRecorder.return_value.__enter__ = mock.MagicMock(return_value=mock_recorder)
+            MockRecorder.return_value.__exit__ = mock.MagicMock(return_value=False)
+
+            capture_dir, elapsed = start_recording("test", output_dir=tmp_path / "test-rec")
+            assert capture_dir.exists()
+
+    def test_insufficient_space_aborts(self, tmp_path):
+        """Recording refuses to start when free space is below warn threshold."""
+        from screencap.recorder import start_recording
+
+        # 500 MB free — below default 2000 MB warn threshold
+        fake_usage = DiskUsage(total=100e9, used=99.5e9, free=500e6)
+
+        with (
+            mock.patch("screencap.recorder._check_macos_permissions"),
+            mock.patch("screencap.recorder.get_audio_default", return_value=False),
+            mock.patch("screencap.recorder.get_wifi_metrics", return_value=False),
+            mock.patch("screencap.recorder.get_disk_warn_mb", return_value=2000),
+            mock.patch("screencap.recorder.get_disk_stop_mb", return_value=500),
+            mock.patch("shutil.disk_usage", return_value=fake_usage),
+            mock.patch("screencap.pidfile.find_orphaned_processes", return_value=[]),
+        ):
+            with pytest.raises(SystemExit):
+                start_recording("test", output_dir=tmp_path / "test-rec")
+
+    def test_file_not_found_hard_error(self, tmp_path):
+        """FileNotFoundError from disk_usage produces hard error."""
+        from screencap.recorder import start_recording
+
+        with (
+            mock.patch("screencap.recorder._check_macos_permissions"),
+            mock.patch("screencap.recorder.get_audio_default", return_value=False),
+            mock.patch("screencap.recorder.get_wifi_metrics", return_value=False),
+            mock.patch("screencap.recorder.get_disk_warn_mb", return_value=2000),
+            mock.patch("screencap.recorder.get_disk_stop_mb", return_value=500),
+            mock.patch("shutil.disk_usage", side_effect=FileNotFoundError("not found")),
+            mock.patch("screencap.pidfile.find_orphaned_processes", return_value=[]),
+        ):
+            with pytest.raises(SystemExit):
+                start_recording("test", output_dir=tmp_path / "test-rec")
+
+    def test_oserror_fails_open(self, tmp_path):
+        """Other OSError from disk_usage is logged and recording proceeds."""
+        from screencap.recorder import start_recording
+
+        mock_recorder = mock.MagicMock()
+        mock_recorder.wait_for_ready.return_value = True
+        mock_recorder.is_recording = False
+
+        with (
+            mock.patch("screencap.recorder._check_macos_permissions"),
+            mock.patch("screencap.recorder.get_audio_default", return_value=False),
+            mock.patch("screencap.recorder.get_wifi_metrics", return_value=False),
+            mock.patch("screencap.recorder.get_disk_warn_mb", return_value=2000),
+            mock.patch("screencap.recorder.get_disk_stop_mb", return_value=500),
+            mock.patch("shutil.disk_usage", side_effect=OSError("FUSE error")),
+            mock.patch("screencap.pidfile.find_orphaned_processes", return_value=[]),
+            mock.patch("screencap.pidfile.write_pidfile"),
+            mock.patch("screencap.pidfile.delete_pidfile"),
+            mock.patch("sc_engine.Recorder") as MockRecorder,
+        ):
+            MockRecorder.return_value.__enter__ = mock.MagicMock(return_value=mock_recorder)
+            MockRecorder.return_value.__exit__ = mock.MagicMock(return_value=False)
+
+            # Should not raise — fail-open behavior
+            capture_dir, elapsed = start_recording("test", output_dir=tmp_path / "test-rec", verbose=True)
+            assert capture_dir.exists()
+
+    def test_warn_mb_zero_disables_check(self, tmp_path):
+        """Setting warn_mb=0 disables the pre-recording disk check."""
+        from screencap.recorder import start_recording
+
+        mock_recorder = mock.MagicMock()
+        mock_recorder.wait_for_ready.return_value = True
+        mock_recorder.is_recording = False
+
+        # Very low disk but check disabled
+        fake_usage = DiskUsage(total=100e9, used=99.9e9, free=100e6)
+
+        with (
+            mock.patch("screencap.recorder._check_macos_permissions"),
+            mock.patch("screencap.recorder.get_audio_default", return_value=False),
+            mock.patch("screencap.recorder.get_wifi_metrics", return_value=False),
+            mock.patch("screencap.recorder.get_disk_warn_mb", return_value=0),
+            mock.patch("screencap.recorder.get_disk_stop_mb", return_value=0),
+            mock.patch("shutil.disk_usage", return_value=fake_usage),
+            mock.patch("screencap.pidfile.find_orphaned_processes", return_value=[]),
+            mock.patch("screencap.pidfile.write_pidfile"),
+            mock.patch("screencap.pidfile.delete_pidfile"),
+            mock.patch("sc_engine.Recorder") as MockRecorder,
+        ):
+            MockRecorder.return_value.__enter__ = mock.MagicMock(return_value=mock_recorder)
+            MockRecorder.return_value.__exit__ = mock.MagicMock(return_value=False)
+
+            capture_dir, _ = start_recording("test", output_dir=tmp_path / "test-rec")
+            assert capture_dir.exists()
+
+    def test_check_runs_before_mkdir(self, tmp_path):
+        """Disk check should run before capture_dir.mkdir() — no leftover dirs on failure."""
+        from screencap.recorder import start_recording
+
+        fake_usage = DiskUsage(total=100e9, used=99.5e9, free=500e6)
+        capture_dir = tmp_path / "should-not-exist"
+
+        with (
+            mock.patch("screencap.recorder._check_macos_permissions"),
+            mock.patch("screencap.recorder.get_audio_default", return_value=False),
+            mock.patch("screencap.recorder.get_wifi_metrics", return_value=False),
+            mock.patch("screencap.recorder.get_disk_warn_mb", return_value=2000),
+            mock.patch("screencap.recorder.get_disk_stop_mb", return_value=500),
+            mock.patch("shutil.disk_usage", return_value=fake_usage),
+            mock.patch("screencap.pidfile.find_orphaned_processes", return_value=[]),
+        ):
+            with pytest.raises(SystemExit):
+                start_recording("test", output_dir=capture_dir)
+
+        # Directory should NOT have been created
+        assert not capture_dir.exists()
+
+
+class TestThresholdValidation:
+    """Tests for warn/stop threshold ordering."""
+
+    def test_stop_gte_warn_rejected(self, tmp_path):
+        """stop_mb >= warn_mb (when both non-zero) should be rejected."""
+        from screencap.recorder import start_recording
+
+        with (
+            mock.patch("screencap.recorder._check_macos_permissions"),
+            mock.patch("screencap.recorder.get_audio_default", return_value=False),
+            mock.patch("screencap.recorder.get_wifi_metrics", return_value=False),
+            mock.patch("screencap.recorder.get_disk_warn_mb", return_value=500),
+            mock.patch("screencap.recorder.get_disk_stop_mb", return_value=500),
+            mock.patch("screencap.pidfile.find_orphaned_processes", return_value=[]),
+        ):
+            with pytest.raises(SystemExit):
+                start_recording("test", output_dir=tmp_path / "test-rec")
+
+    def test_stop_greater_than_warn_rejected(self, tmp_path):
+        """stop_mb > warn_mb should be rejected."""
+        from screencap.recorder import start_recording
+
+        with (
+            mock.patch("screencap.recorder._check_macos_permissions"),
+            mock.patch("screencap.recorder.get_audio_default", return_value=False),
+            mock.patch("screencap.recorder.get_wifi_metrics", return_value=False),
+            mock.patch("screencap.recorder.get_disk_warn_mb", return_value=500),
+            mock.patch("screencap.recorder.get_disk_stop_mb", return_value=1000),
+            mock.patch("screencap.pidfile.find_orphaned_processes", return_value=[]),
+        ):
+            with pytest.raises(SystemExit):
+                start_recording("test", output_dir=tmp_path / "test-rec")
+
+
+class TestDiskFullError:
+    """Tests for DiskFullError exception."""
+
+    def test_disk_full_error_attributes(self):
+        from screencap.recorder import DiskFullError
+        from pathlib import Path
+
+        err = DiskFullError(Path("/tmp/rec"), 42.5)
+        assert err.capture_dir == Path("/tmp/rec")
+        assert err.elapsed == 42.5

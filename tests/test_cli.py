@@ -1016,3 +1016,48 @@ def test_upload_export_failure_continues(tmp_path):
     mock_upload.assert_called_once()
     assert "Warning" in result.output
     assert "boom" in result.output
+
+
+# --- DiskFullError handling tests ---
+
+
+def test_start_disk_full_skips_pipeline(tmp_path):
+    """DiskFullError is caught and post-recording pipeline is skipped."""
+    from pathlib import Path
+    from screencap.recorder import DiskFullError
+
+    runner = CliRunner()
+    fake_dir = tmp_path / "rec-test"
+    fake_dir.mkdir()
+
+    with (
+        mock.patch(
+            "screencap.recorder.start_recording",
+            side_effect=DiskFullError(fake_dir, 42.0),
+        ),
+        mock.patch("screencap.namer.auto_name") as mock_namer,
+    ):
+        result = runner.invoke(cli, ["start", "--name", "rec-test"])
+
+    assert result.exit_code == 0
+    assert "Skipping auto-naming/transcription" in result.output
+    mock_namer.assert_not_called()
+
+
+def test_start_disk_full_still_prints_summary(tmp_path):
+    """print_summary() still runs after DiskFullError."""
+    from screencap.recorder import DiskFullError
+
+    runner = CliRunner()
+    fake_dir = tmp_path / "rec-test"
+    fake_dir.mkdir()
+
+    with mock.patch(
+        "screencap.recorder.start_recording",
+        side_effect=DiskFullError(fake_dir, 42.0),
+    ):
+        result = runner.invoke(cli, ["start", "--name", "rec-test"])
+
+    assert result.exit_code == 0
+    # print_summary outputs "Recording complete"
+    assert "Recording complete" in result.output

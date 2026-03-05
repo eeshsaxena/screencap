@@ -469,6 +469,7 @@ def save_metrics(
     phase: str,
     wifi_metrics: bool = True,
     app_versions: bool = True,
+    stop_reason: str | None = None,
 ) -> None:
     """Collect and write/update system_metrics.json in the recording directory.
 
@@ -477,6 +478,7 @@ def save_metrics(
         phase: "start" or "end".
         wifi_metrics: Whether to collect WiFi metrics.
         app_versions: Whether to collect running application versions.
+        stop_reason: Optional stop reason for the "end" phase (e.g. "disk_full").
     """
     metrics_path = capture_dir / METRICS_FILENAME
 
@@ -499,4 +501,6 @@ def save_metrics(
             data = {"schema_version": SCHEMA_VERSION, "static": {}, "start": None}
 
         data["end"] = collect_dynamic_metrics(wifi_metrics=wifi_metrics)
+        if stop_reason:
+            data["end"]["stop_reason"] = stop_reason
         metrics_path.write_text(json.dumps(data, indent=2))

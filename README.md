@@ -95,6 +95,24 @@ Record screen, mouse, keyboard, and optionally audio. Starts immediately with no
 
 Output files: `video.mp4`, `audio.flac`, `recording.db`, `viewer.html`
 
+#### Disk space protection
+
+ScreenCap checks available disk space before and during recording to prevent filling your drive:
+
+1. **Pre-recording gate** — Refuses to start if free space is below the warning threshold (default: 2 GB).
+2. **Periodic check** — Every 30 seconds during recording, checks free space. Shows a warning in the live display when space is low.
+3. **Auto-stop** — If free space drops below the stop threshold (default: 500 MB), the recording stops automatically and saves what was captured.
+
+Both thresholds are configurable via environment variables or `config.toml`. Set to `0` to disable.
+
+```bash
+# lower the warning threshold to 500 MB
+SCREENCAP_DISK_WARN_MB=500 screencap start
+
+# disable disk checks entirely
+SCREENCAP_DISK_WARN_MB=0 SCREENCAP_DISK_STOP_MB=0 screencap start
+```
+
 #### Auto-naming
 
 After Ctrl+C, the post-recording pipeline runs:
@@ -259,6 +277,8 @@ downloads_dir = "/custom/path/to/downloads"
 audio_default = false
 auto_name = true              # LLM auto-naming after recording
 auto_name_local_only = false  # restrict to Ollama only
+disk_warn_mb = 2000           # free MB to start / warn (0 = disable)
+disk_stop_mb = 500            # free MB to auto-stop (0 = disable)
 ```
 
 ### Environment Variables
@@ -270,6 +290,8 @@ auto_name_local_only = false  # restrict to Ollama only
 | `SCREENCAP_AUDIO_DEFAULT` | `true` | Default audio capture on/off |
 | `SCREENCAP_AUTO_NAME` | `true` | Enable/disable LLM auto-naming |
 | `SCREENCAP_AUTO_NAME_LOCAL_ONLY` | `false` | Restrict auto-naming to local providers (Ollama) |
+| `SCREENCAP_DISK_WARN_MB` | `2000` | Free MB required to start recording / trigger warning (0 = disable) |
+| `SCREENCAP_DISK_STOP_MB` | `500` | Free MB threshold to auto-stop recording (0 = disable) |
 | `ANTHROPIC_API_KEY` | — | Enables Anthropic API as a naming provider |
 | `OPENAI_API_KEY` | — | Enables OpenAI API as a naming provider (also used for API transcription) |
 | `OLLAMA_HOST` | `http://localhost:11434` | Ollama server address |
