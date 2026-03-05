@@ -1,6 +1,6 @@
 """Linux platform window capture using xcffib.
 
-Copied from legacy OpenAdapt window/_linux.py. Only import paths changed.
+Linux platform window capture.
 """
 
 import pickle

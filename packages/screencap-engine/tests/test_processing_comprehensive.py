@@ -1,6 +1,6 @@
 """Comprehensive tests for event processing pipeline.
 
-These tests are modeled after OpenAdapt's test_events.py to ensure
+These tests are modeled after the legacy test_events.py to ensure
 thorough coverage of edge cases in event merging.
 """
 
@@ -76,7 +76,7 @@ def ts():
 # =============================================================================
 
 class TestMergeConsecutiveMouseClickEventsComprehensive:
-    """Comprehensive tests for click merging based on OpenAdapt patterns."""
+    """Comprehensive tests for click merging based on legacy patterns."""
 
     def test_single_click_becomes_singleclick(self, ts):
         """A single click (down+up) should become a MouseClickEvent."""

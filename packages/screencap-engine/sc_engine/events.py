@@ -1,7 +1,7 @@
 """Event schemas for GUI interaction capture.
 
 This module defines Pydantic models for all event types captured during
-GUI interaction recording. Events are designed to closely follow OpenAdapt's
+GUI interaction recording. Events are designed to follow the legacy
 battle-tested implementation.
 """
 
@@ -59,7 +59,7 @@ class MouseButton(str, Enum):
 class BaseEvent(BaseModel):
     """Base class for all events.
 
-    All events have a timestamp and type. This mirrors OpenAdapt's
+    All events have a timestamp and type. This mirrors the legacy
     Event namedtuple: Event = namedtuple("Event", ("timestamp", "type", "data"))
     """
 
@@ -77,7 +77,7 @@ class BaseEvent(BaseModel):
 class MouseMoveEvent(BaseEvent):
     """Mouse cursor movement event.
 
-    Corresponds to OpenAdapt's ActionEvent with name="move".
+    Corresponds to legacy ActionEvent with name="move".
     """
 
     type: Literal[EventType.MOUSE_MOVE] = EventType.MOUSE_MOVE
@@ -95,7 +95,7 @@ class MouseMoveEvent(BaseEvent):
 class MouseDownEvent(BaseEvent):
     """Mouse button press event.
 
-    Corresponds to OpenAdapt's ActionEvent with name="click" and mouse_pressed=True.
+    Corresponds to legacy ActionEvent with name="click" and mouse_pressed=True.
     """
 
     type: Literal[EventType.MOUSE_DOWN] = EventType.MOUSE_DOWN
@@ -109,7 +109,7 @@ class MouseDownEvent(BaseEvent):
 class MouseUpEvent(BaseEvent):
     """Mouse button release event.
 
-    Corresponds to OpenAdapt's ActionEvent with name="click" and mouse_pressed=False.
+    Corresponds to legacy ActionEvent with name="click" and mouse_pressed=False.
     """
 
     type: Literal[EventType.MOUSE_UP] = EventType.MOUSE_UP
@@ -123,7 +123,7 @@ class MouseUpEvent(BaseEvent):
 class MouseScrollEvent(BaseEvent):
     """Mouse scroll wheel event.
 
-    Corresponds to OpenAdapt's ActionEvent with name="scroll".
+    Corresponds to legacy ActionEvent with name="scroll".
     """
 
     type: Literal[EventType.MOUSE_SCROLL] = EventType.MOUSE_SCROLL
@@ -184,7 +184,7 @@ class MouseSmartMagnifyEvent(BaseEvent):
 class KeyDownEvent(BaseEvent):
     """Keyboard key press event.
 
-    Corresponds to OpenAdapt's ActionEvent with name="press".
+    Corresponds to legacy ActionEvent with name="press".
     """
 
     type: Literal[EventType.KEY_DOWN] = EventType.KEY_DOWN
@@ -199,7 +199,7 @@ class KeyDownEvent(BaseEvent):
 class KeyUpEvent(BaseEvent):
     """Keyboard key release event.
 
-    Corresponds to OpenAdapt's ActionEvent with name="release".
+    Corresponds to legacy ActionEvent with name="release".
     """
 
     type: Literal[EventType.KEY_UP] = EventType.KEY_UP
@@ -279,7 +279,7 @@ class WindowStateEvent(BaseEvent):
 class MouseClickEvent(BaseEvent):
     """Combined mouse click event (down + up).
 
-    Corresponds to OpenAdapt's ActionEvent with name="singleclick".
+    Corresponds to legacy ActionEvent with name="singleclick".
     Created by merge_consecutive_mouse_click_events().
     """
 
@@ -297,7 +297,7 @@ class MouseClickEvent(BaseEvent):
 class MouseDoubleClickEvent(BaseEvent):
     """Double click event.
 
-    Corresponds to OpenAdapt's ActionEvent with name="doubleclick".
+    Corresponds to legacy ActionEvent with name="doubleclick".
     Created by merge_consecutive_mouse_click_events().
     """
 
@@ -340,7 +340,7 @@ class MouseDragEvent(BaseEvent):
 class KeyTypeEvent(BaseEvent):
     """Sequence of typed characters.
 
-    Corresponds to OpenAdapt's ActionEvent with name="type".
+    Corresponds to legacy ActionEvent with name="type".
     Created by merge_consecutive_keyboard_events().
     """
 

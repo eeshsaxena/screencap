@@ -192,7 +192,7 @@ def print_summary(name: str, capture_dir: Path, elapsed: float) -> None:
 def _suppress_output() -> None:
     """Suppress noisy output from the recording pipeline.
 
-    Sets OA_LOG_LEVEL=ERROR env var so spawned child processes (which
+    Sets SC_LOG_LEVEL=ERROR env var so spawned child processes (which
     re-import the module) pick up the higher threshold.  Also overrides
     loguru directly in the current process (in case the module was already
     imported before this function was called).  Disables tqdm as well.
@@ -201,28 +201,28 @@ def _suppress_output() -> None:
     WARNING messages during shutdown (screenshot failures, audio timeout)
     that are expected and shouldn't clutter the user's terminal.
     """
-    os.environ["OA_LOG_LEVEL"] = "ERROR"
+    os.environ["SC_LOG_LEVEL"] = "ERROR"
     os.environ["TQDM_DISABLE"] = "1"
     # Override loguru directly in the main process — the env var only
     # takes effect on fresh imports (child processes).  If sc_engine
     # was already imported, loguru is already configured at INFO.
     try:
-        from loguru import logger as _oa_logger
-        _oa_logger.remove()
-        _oa_logger.add(sys.stderr, level="ERROR")
+        from loguru import logger as _sc_logger
+        _sc_logger.remove()
+        _sc_logger.add(sys.stderr, level="ERROR")
     except ImportError:
         pass
 
 
 def _restore_output() -> None:
     """Restore loguru and tqdm to defaults."""
-    os.environ.pop("OA_LOG_LEVEL", None)
+    os.environ.pop("SC_LOG_LEVEL", None)
     os.environ.pop("TQDM_DISABLE", None)
     # Re-configure loguru in this process back to INFO
     try:
-        from loguru import logger as _oa_logger
-        _oa_logger.remove()
-        _oa_logger.add(sys.stderr, level="INFO")
+        from loguru import logger as _sc_logger
+        _sc_logger.remove()
+        _sc_logger.add(sys.stderr, level="INFO")
     except ImportError:
         pass
 
@@ -542,8 +542,8 @@ def start_recording(
             #    file object, so sys.stderr = devnull doesn't stop it.
             if not verbose:
                 try:
-                    from loguru import logger as _oa_logger
-                    _oa_logger.remove()
+                    from loguru import logger as _sc_logger
+                    _sc_logger.remove()
                 except Exception:
                     pass
                 _saved_stdout = sys.stdout
@@ -558,8 +558,8 @@ def start_recording(
         # Suppress profile block on interrupt path
         if not verbose:
             try:
-                from loguru import logger as _oa_logger
-                _oa_logger.remove()
+                from loguru import logger as _sc_logger
+                _sc_logger.remove()
             except Exception:
                 pass
             _saved_stdout = sys.stdout

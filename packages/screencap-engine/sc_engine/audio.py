@@ -1,7 +1,7 @@
 """Audio capture and transcription.
 
 This module provides audio recording with optional Whisper transcription,
-following OpenAdapt's proven implementation.
+
 """
 
 from __future__ import annotations

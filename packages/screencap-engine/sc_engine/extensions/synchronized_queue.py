@@ -1,6 +1,6 @@
 """Module for customizing multiprocessing.Queue to avoid NotImplementedError.
 
-Copied verbatim from legacy OpenAdapt extensions/synchronized_queue.py.
+Synchronized multiprocessing queue wrapper.
 """
 
 import multiprocessing

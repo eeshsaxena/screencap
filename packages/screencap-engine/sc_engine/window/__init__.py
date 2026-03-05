@@ -1,6 +1,6 @@
 """Package for interacting with active window and elements across platforms.
 
-Copied from legacy OpenAdapt window/__init__.py. Only import paths changed.
+Platform-agnostic window capture interface.
 """
 
 import sys

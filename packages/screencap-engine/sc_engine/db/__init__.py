@@ -1,6 +1,6 @@
-"""Package for interacting with the screencap-engine database.
+"""Package for interacting with the recording database.
 
-Copied from legacy OpenAdapt db/db.py, adapted for per-capture databases.
+Adapted for per-capture databases.
 """
 
 import sqlalchemy as sa

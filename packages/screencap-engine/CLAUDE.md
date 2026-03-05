@@ -67,7 +67,7 @@ Multi-process recording system:
 - `Recorder(capture_dir, task_description)` - Context manager
 - Internally runs `record()` which spawns reader threads + writer processes
 - Action-gated video capture (only encode frames when user acts)
-- Stop via context manager exit or stop sequences (default: `oa.stop` / `llqq`)
+- Stop via context manager exit or stop sequences (default: `sc.stop` / `llqq`)
 
 ### CaptureSession / Capture
 Load and query recorded captures:

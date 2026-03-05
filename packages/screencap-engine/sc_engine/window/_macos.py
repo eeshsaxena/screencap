@@ -1,7 +1,4 @@
-"""macOS platform window capture using Quartz/AppKit.
-
-Copied from legacy OpenAdapt window/_macos.py. Only import paths changed.
-"""
+"""macOS platform window capture using Quartz/AppKit."""
 
 import pickle
 import plistlib

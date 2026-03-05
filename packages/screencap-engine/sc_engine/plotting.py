@@ -1,6 +1,6 @@
 """Plotting utilities for performance visualization.
 
-Copied from legacy OpenAdapt plotting.py — only the plot_performance function
+Only the plot_performance function
 and its dependencies. Import paths adapted for screencap-engine.
 """
 

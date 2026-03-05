@@ -1,6 +1,6 @@
 """Event processing pipeline for merging raw events into higher-level actions.
 
-This module ports OpenAdapt's event processing functions to work with
+This module ports legacy event processing functions to work with
 the screencap-engine Pydantic event models.
 """
 
@@ -677,7 +677,7 @@ def merge_consecutive_mouse_click_events(
 ) -> list[ActionEvent]:
     """Merge mouse down/up events into click events.
 
-    Uses timestamp mapping approach (like OpenAdapt) to match down/up events
+    Uses timestamp mapping approach to match down/up events
     even when other events occur between them.
 
     Detects single clicks and double clicks based on timing and distance.
