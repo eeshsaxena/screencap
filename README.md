@@ -2,14 +2,14 @@
 
 ScreenCap is a local-first macOS recorder for building high-quality demonstration data for automation and agent training. It captures screen, input, and context in one run, then lets you export ML-ready events.
 
-Built on [OpenAdapt](https://github.com/OpenAdaptAI), ScreenCap is designed for teams who need more than video clips: reproducible recordings, structured interaction data, and a streamlined pipeline from capture to training.
+ScreenCap is designed for teams who need more than video clips: reproducible recordings, structured interaction data, and a streamlined pipeline from capture to training.
 
 ## What We Offer
 
 - **One-command capture workflow**: Start recording immediately with `screencap start`, then auto-transcribe and auto-name on stop.
 - **ML-ready outputs**: Export processed interaction events to JSONL with `screencap export` for downstream training pipelines.
 - **Local-first by default**: Run from a standalone binary, keep recordings on disk, and use optional cloud sync only when needed.
-- **OpenAdapt-compatible data**: Recording artifacts and schema align with the broader OpenAdapt ecosystem.
+- **Structured recording data**: Recording artifacts and schema are designed for ML training pipelines.
 
 ## Requirements
 

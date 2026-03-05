@@ -2,8 +2,8 @@ class Screencap < Formula
   include Language::Python::Virtualenv
 
   desc "macOS CLI for screen capture"
-  homepage "https://github.com/OpenAdaptAI/screencap"
-  url "https://github.com/OpenAdaptAI/screencap/archive/refs/tags/v0.1.0.tar.gz"
+  homepage "https://github.com/Divide-By-0/screencap"
+  url "https://github.com/Divide-By-0/screencap/archive/refs/tags/v0.1.0.tar.gz"
   sha256 "PLACEHOLDER_SHA256"
   license "MIT"
 
