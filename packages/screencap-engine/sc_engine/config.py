@@ -165,3 +165,31 @@ def config_override(recording_config: RecordingConfig):
     finally:
         for config_attr, original_value in originals.items():
             object.__setattr__(config, config_attr, original_value)
+
+
+def build_config_overrides(recording_config: RecordingConfig) -> dict[str, object]:
+    """Build a dict of config overrides to pass to child processes.
+
+    Returns a mapping of Settings attribute names to their overridden values,
+    derived from non-None fields in the RecordingConfig.
+    """
+    overrides: dict[str, object] = {}
+    for field in fields(recording_config):
+        value = getattr(recording_config, field.name)
+        if value is not None:
+            config_attr = _FIELD_TO_CONFIG_ATTR[field.name]
+            overrides[config_attr] = value
+    return overrides
+
+
+def apply_config_overrides(overrides: dict[str, object] | None) -> None:
+    """Apply config overrides in a child process.
+
+    Called at the start of spawned child processes to restore config
+    values that were set via config_override() in the parent process.
+    Spawn mode on macOS re-imports modules, losing in-memory changes.
+    """
+    if not overrides:
+        return
+    for attr, value in overrides.items():
+        object.__setattr__(config, attr, value)

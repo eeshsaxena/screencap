@@ -242,8 +242,8 @@ def initialize_video_writer(
     width: int,
     height: int,
     fps: int = 24,
-    codec: str = config.VIDEO_ENCODING,
-    pix_fmt: str = config.VIDEO_PIXEL_FORMAT,
+    codec: str | None = None,
+    pix_fmt: str | None = None,
     crf: int = 0,
     preset: str = "ultrafast",
 ) -> tuple[av.container.OutputContainer, av.stream.Stream, float]:
@@ -266,6 +266,11 @@ def initialize_video_writer(
         tuple[av.container.OutputContainer, av.stream.Stream, float]: The initialized
             container, stream, and base timestamp.
     """
+    if codec is None:
+        codec = config.VIDEO_ENCODING
+    if pix_fmt is None:
+        pix_fmt = config.VIDEO_PIXEL_FORMAT
+
     logger.info("initializing video stream...")
     video_container = av.open(output_path, mode="w", container_options=_FRAG_MP4_OPTIONS)
     video_stream = video_container.add_stream(codec, rate=fps)
