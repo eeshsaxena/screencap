@@ -1060,5 +1060,57 @@ def transcribe(name, model):
         console.print(f"\n[bold]Preview:[/bold]\n{preview}")
 
 
+@cli.command()
+@click.argument("name", required=False, default=None)
+@click.option("--all", "all_recordings", is_flag=True, help="Generate heatmaps for all recordings.")
+@click.option("--endpoint", default=None, help="OmniParser API endpoint URL.")
+@click.option("--radius", type=int, default=20, help="Circle radius in pixels (default: 20).")
+def heatmap(name, all_recordings, endpoint, radius):
+    """Generate click-target heatmaps for VLM training."""
+    from screencap.config import get_recordings_dir
+    from screencap.heatmap import OMNIPARSER_ENDPOINT, process_recording
+
+    if endpoint is None:
+        endpoint = OMNIPARSER_ENDPOINT
+
+    if not name and not all_recordings:
+        console.print("[red]Error:[/red] Provide a recording name or use --all.")
+        sys.exit(1)
+
+    if name and all_recordings:
+        console.print("[red]Error:[/red] Cannot use both a name and --all.")
+        sys.exit(1)
+
+    recordings_dir = get_recordings_dir()
+
+    if all_recordings:
+        dirs = sorted(
+            d for d in recordings_dir.iterdir()
+            if d.is_dir() and (d / "recording.db").exists()
+        )
+        if not dirs:
+            console.print("[dim]No recordings found.[/dim]")
+            return
+
+        total = len(dirs)
+        for i, rec_dir in enumerate(dirs, 1):
+            console.print(f"\n[bold][{i}/{total}][/bold] {rec_dir.name}")
+            try:
+                count = process_recording(rec_dir, endpoint=endpoint, radius=radius)
+                console.print(f"  Generated {count} heatmap(s).")
+            except Exception as e:
+                console.print(f"  [red]Error:[/red] {e}")
+    else:
+        rec_dir = recordings_dir / name
+        if not rec_dir.exists():
+            console.print(f"[red]Error:[/red] Recording not found: {name}")
+            sys.exit(1)
+
+        with console.status("[bold]Generating heatmaps...[/bold]"):
+            count = process_recording(rec_dir, endpoint=endpoint, radius=radius)
+
+        console.print(f"[green]Done.[/green] Generated {count} heatmap(s) in {rec_dir / 'heatmaps'}")
+
+
 if __name__ == "__main__":
     cli()
