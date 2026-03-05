@@ -52,6 +52,7 @@ sc_engine/
   extensions/      # SynchronizedQueue (multiprocessing.Queue wrapper)
   utils.py         # Timestamps, screenshots, monitor dims
   config.py        # Recording config (RECORD_VIDEO, RECORD_AUDIO, etc.)
+  dedup.py         # Perceptual hashing (dHash) for screenshot deduplication
   video.py         # Video encoding (av/ffmpeg)
   audio.py         # Audio recording + transcription
   visualize/       # Demo GIF and HTML viewer generation
