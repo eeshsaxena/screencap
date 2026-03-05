@@ -69,6 +69,11 @@ class Settings(BaseSettings):
     AX_MOVE_MAX_DEPTH: int = 1            # Shallow for moves
     AX_SCROLL_MAX_DEPTH: int = 2          # Medium for scrolls
 
+    # Screenshot deduplication
+    SCREENSHOT_DEDUP: bool = True
+    SCREENSHOT_MIN_INTERVAL: float = 1.0       # seconds between saves
+    SCREENSHOT_HASH_THRESHOLD: int = 8         # Hamming distance (0=identical, 64=opposite)
+
     # Performance plotting
     PLOT_PERFORMANCE: bool = True
 
@@ -118,6 +123,9 @@ _FIELD_TO_CONFIG_ATTR = {
     "ax_click_max_depth": "AX_CLICK_MAX_DEPTH",
     "ax_move_max_depth": "AX_MOVE_MAX_DEPTH",
     "ax_scroll_max_depth": "AX_SCROLL_MAX_DEPTH",
+    "screenshot_dedup": "SCREENSHOT_DEDUP",
+    "screenshot_min_interval": "SCREENSHOT_MIN_INTERVAL",
+    "screenshot_hash_threshold": "SCREENSHOT_HASH_THRESHOLD",
 }
 
 
@@ -145,6 +153,9 @@ class RecordingConfig:
     ax_click_max_depth: int | None = None
     ax_move_max_depth: int | None = None
     ax_scroll_max_depth: int | None = None
+    screenshot_dedup: bool | None = None
+    screenshot_min_interval: float | None = None
+    screenshot_hash_threshold: int | None = None
 
 
 @contextmanager

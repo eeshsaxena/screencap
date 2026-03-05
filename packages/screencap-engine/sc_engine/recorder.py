@@ -35,6 +35,7 @@ from tqdm import tqdm
 from sc_engine import utils, video, window
 from sc_engine.ax_cache import AXQueryCache
 from sc_engine.config import RecordingConfig, config
+from sc_engine.dedup import dhash, hamming_distance
 from sc_engine.db import create_db, crud, get_session_for_path
 from sc_engine.db.models import ActionEvent, Recording
 from sc_engine.extensions import synchronized_queue as sq
@@ -246,6 +247,8 @@ def process_events(
     prev_window_event = None
     prev_saved_screen_timestamp = 0
     prev_saved_window_timestamp = 0
+    prev_saved_screen_hash: int | None = None   # dHash of last saved screenshot
+    prev_saved_window_key: tuple[str | None, int | None] = (None, None)  # (title, window_id)
     _drops = defaultdict(int)  # drop counters by event type / group
     started = False
     drain_start = None
@@ -377,13 +380,42 @@ def process_events(
                 if element_state is not None:
                     event.data["element_state"] = element_state
 
+            # Screenshot dedup gate
+            should_save_screen = prev_saved_screen_timestamp < prev_screen_event.timestamp
+            current_hash: int | None = None
+
+            if should_save_screen and config.SCREENSHOT_DEDUP:
+                if prev_saved_screen_hash is None:
+                    pass  # first frame always saved
+                else:
+                    current_window_key = (
+                        (prev_window_event.data.get("title"), prev_window_event.data.get("window_id"))
+                        if prev_window_event else (None, None)
+                    )
+                    window_changed = current_window_key != prev_saved_window_key
+
+                    if not window_changed:
+                        elapsed = prev_screen_event.timestamp - prev_saved_screen_timestamp
+                        if elapsed < config.SCREENSHOT_MIN_INTERVAL:
+                            should_save_screen = False
+                            _drops["screen_time_floor"] += 1
+                        else:
+                            current_hash = dhash(prev_screen_event.data)
+                            dist = hamming_distance(current_hash, prev_saved_screen_hash)
+                            if dist <= config.SCREENSHOT_HASH_THRESHOLD:
+                                should_save_screen = False
+                                _drops["screen_dedup"] += 1
+
+            if not should_save_screen:
+                event.data["screenshot_timestamp"] = prev_saved_screen_timestamp
+
             # Drop-coherent fan-out: collect all events for this action as a
             # group. If any put fails, drop the entire group to prevent broken
             # cross-references (e.g., action row pointing to nonexistent screenshot).
             # Action is written LAST so that if a dependency (screen, video,
             # window) fails, the action "anchor" record is never committed.
             events_to_write = []
-            if prev_saved_screen_timestamp < prev_screen_event.timestamp:
+            if should_save_screen:
                 events_to_write.append(
                     (prev_screen_event, screen_write_q, write_screen_event)
                 )
@@ -414,6 +446,11 @@ def process_events(
                 if any(ev.type == "screen" for ev, _, _ in events_to_write):
                     num_screen_events.value += 1
                     prev_saved_screen_timestamp = prev_screen_event.timestamp
+                    prev_saved_screen_hash = current_hash if current_hash is not None else dhash(prev_screen_event.data)
+                    prev_saved_window_key = (
+                        (prev_window_event.data.get("title"), prev_window_event.data.get("window_id"))
+                        if prev_window_event else (None, None)
+                    )
                 if any(
                     ev.type == "screen/video" for ev, _, _ in events_to_write
                 ):
@@ -2362,6 +2399,20 @@ def record(
             "total_max_ms": round(max(total_durs) * 1000, 1),
         }
 
+    # Screenshot dedup summary
+    _dedup_drops = _drop_counts.get("screen_dedup", 0) + _drop_counts.get("screen_time_floor", 0)
+    if _dedup_drops > 0:
+        _saved = num_screen_events.value
+        _total_candidates = _saved + _dedup_drops
+        _pct = (_dedup_drops / _total_candidates * 100) if _total_candidates > 0 else 0
+        _profile_data["screenshot_dedup"] = {
+            "saved": _saved,
+            "total_candidates": _total_candidates,
+            "reduction_pct": round(_pct, 1),
+            "drops_hash": _drop_counts.get("screen_dedup", 0),
+            "drops_time_floor": _drop_counts.get("screen_time_floor", 0),
+        }
+
     # Merge drop counts from all threads (readers, processor, gesture tap)
     if _drop_counts:
         _profile_data["drops"] = dict(_drop_counts)
@@ -2386,6 +2437,10 @@ def record(
             print(f"  screenshot: avg={st['screenshot_avg_ms']}ms "
                   f"max={st['screenshot_max_ms']}ms "
                   f"min={st['screenshot_min_ms']}ms")
+        if "screenshot_dedup" in _profile_data:
+            sd = _profile_data["screenshot_dedup"]
+            print(f"Screenshot dedup: saved {sd['saved']} of {sd['total_candidates']} "
+                  f"candidates ({sd['reduction_pct']}% reduction)")
         print(f"Config: WINDOW_DATA={config.RECORD_WINDOW_DATA} "
               f"VIDEO={config.RECORD_VIDEO} "
               f"PLOT_PERF={config.PLOT_PERFORMANCE} "
