@@ -1061,3 +1061,93 @@ def test_start_disk_full_still_prints_summary(tmp_path):
     assert result.exit_code == 0
     # print_summary outputs "Recording complete"
     assert "Recording complete" in result.output
+
+
+# --- Auto-export tests ---
+
+
+def test_start_auto_export_called(tmp_path):
+    """Auto-export is called during start command with correct args."""
+    runner = CliRunner()
+    fake_dir = tmp_path / "rec-test"
+    fake_dir.mkdir()
+
+    mock_export = mock.MagicMock(return_value=5)
+    mock_meta = mock.MagicMock(return_value={"_meta": True})
+
+    with mock.patch("screencap.recorder.start_recording", return_value=(fake_dir, 42.0)), \
+         mock.patch("screencap.namer.auto_name", return_value=fake_dir), \
+         mock.patch.dict("sys.modules", {"screencap.exporter": mock.MagicMock(
+             export_recording=mock_export,
+             build_export_metadata=mock_meta,
+         )}):
+        result = runner.invoke(cli, ["start"])
+        assert result.exit_code == 0
+        mock_meta.assert_called_once_with(exclude_moves=False)
+        mock_export.assert_called_once_with(
+            fake_dir, str(fake_dir / "events.jsonl"), exclude_moves=False, metadata={"_meta": True},
+        )
+        assert "Exported 5 events" in result.output
+
+
+def test_start_auto_export_failure_does_not_crash(tmp_path):
+    """Auto-export failure logs a warning but does not affect exit code."""
+    runner = CliRunner()
+    fake_dir = tmp_path / "rec-test"
+    fake_dir.mkdir()
+
+    mock_export = mock.MagicMock(side_effect=RuntimeError("boom"))
+    mock_meta = mock.MagicMock(return_value={"_meta": True})
+
+    with mock.patch("screencap.recorder.start_recording", return_value=(fake_dir, 42.0)), \
+         mock.patch("screencap.namer.auto_name", return_value=fake_dir), \
+         mock.patch.dict("sys.modules", {"screencap.exporter": mock.MagicMock(
+             export_recording=mock_export,
+             build_export_metadata=mock_meta,
+         )}):
+        result = runner.invoke(cli, ["start"])
+        assert result.exit_code == 0
+        assert "Warning" in result.output
+        assert "boom" in result.output
+        assert "Recording complete" in result.output
+
+
+def test_start_auto_export_runs_with_no_auto_name(tmp_path):
+    """Auto-export runs even when --no-auto-name is used."""
+    runner = CliRunner()
+    fake_dir = tmp_path / "my-test"
+    fake_dir.mkdir()
+
+    mock_export = mock.MagicMock(return_value=3)
+    mock_meta = mock.MagicMock(return_value={"_meta": True})
+
+    with mock.patch("screencap.recorder.start_recording", return_value=(fake_dir, 42.0)), \
+         mock.patch("screencap.cli.sys") as mock_sys, \
+         mock.patch.dict("sys.modules", {"screencap.exporter": mock.MagicMock(
+             export_recording=mock_export,
+             build_export_metadata=mock_meta,
+         )}):
+        mock_sys.stdin.isatty.return_value = True
+        mock_sys.exit = sys.exit
+        result = runner.invoke(
+            cli,
+            ["start", "--no-auto-name"],
+            input="my-test\nsome desc\n",
+        )
+        assert result.exit_code == 0
+        mock_export.assert_called_once()
+        assert "Exported 3 events" in result.output
+
+
+def test_start_auto_export_keyboard_interrupt(tmp_path):
+    """KeyboardInterrupt during auto-export is caught and pipeline continues."""
+    runner = CliRunner()
+    fake_dir = tmp_path / "rec-test"
+    fake_dir.mkdir()
+    with mock.patch("screencap.recorder.start_recording", return_value=(fake_dir, 42.0)), \
+         mock.patch("screencap.namer.auto_name", return_value=fake_dir), \
+         mock.patch("screencap.cli._auto_export", side_effect=KeyboardInterrupt):
+        result = runner.invoke(cli, ["start"])
+        assert result.exit_code == 0
+        assert "Export cancelled." in result.output
+        assert "Recording complete" in result.output

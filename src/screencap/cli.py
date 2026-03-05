@@ -107,8 +107,19 @@ def start(
         raise SystemExit(1)
 
     # --- Post-recording pipeline ---
+    # Order matters: export must run before auto-name, which may rename the directory.
+    # 1. Auto-export events.jsonl (unconditional)
+    # 2. Auto-transcribe audio (if auto_name_enabled and audio exists)
+    # 3. Auto-name via LLM (if auto_name_enabled; may rename capture_dir -> final_dir)
+    # 4. Print summary
     final_name = name
     final_dir = capture_dir
+
+    # Auto-export events.jsonl for downstream scrubbing
+    try:
+        _auto_export(capture_dir)
+    except KeyboardInterrupt:
+        console.print("[yellow]Export cancelled.[/yellow]")
 
     if auto_name_enabled and not disk_full:
         # Auto-transcribe if audio was captured
@@ -135,6 +146,31 @@ def start(
             console.print("[yellow]Naming cancelled — keeping timestamp name[/yellow]")
 
     print_summary(final_name, final_dir, elapsed)
+
+
+def _auto_export(capture_dir: Path) -> None:
+    """Auto-export events.jsonl for downstream scrubbing."""
+    jsonl_path = capture_dir / "events.jsonl"
+    try:
+        from screencap.exporter import build_export_metadata, export_recording
+
+        with console.status("[dim]Exporting events...[/dim]"):
+            meta = build_export_metadata(exclude_moves=False)
+            count = export_recording(
+                capture_dir, str(jsonl_path), exclude_moves=False, metadata=meta,
+            )
+        if count >= 0:
+            console.print(f"  [dim]Exported {count} events to events.jsonl[/dim]")
+        else:
+            console.print(
+                f"[yellow]Warning:[/yellow] Could not auto-export events.jsonl (legacy DB?). "
+                f"Run 'screencap export {capture_dir.name}' manually."
+            )
+    except Exception as e:
+        console.print(
+            f"[yellow]Warning:[/yellow] Could not auto-export events.jsonl ({e}). "
+            f"Run 'screencap export {capture_dir.name}' manually."
+        )
 
 
 def _auto_transcribe(capture_dir, audio_path):
