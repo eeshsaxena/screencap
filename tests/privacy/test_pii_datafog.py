@@ -70,3 +70,9 @@ class TestFactorySwitching:
         detector_names = [type(d).__name__ for d in pipeline._detectors]
         # With both installed, Presidio should be preferred
         assert "PiiDetector" in detector_names
+
+    def test_create_invalid_engine_raises(self):
+        from screencap.privacy import create_default_pipeline
+
+        with pytest.raises(ValueError, match="Invalid pii_engine"):
+            create_default_pipeline(pii_engine="invalid")

@@ -7,6 +7,8 @@ import pytest
 from screencap.privacy import EntityType
 from screencap.privacy.regex import RegexDetector
 
+pytestmark = pytest.mark.privacy
+
 
 @pytest.fixture()
 def detector() -> RegexDetector:

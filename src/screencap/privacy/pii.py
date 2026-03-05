@@ -18,22 +18,6 @@ _TYPE_MAP: dict[str, str] = {
     "NRP": EntityType.PERSON,  # Nationality, religious, political group
 }
 
-# Presidio entity types to skip (too noisy or irrelevant for our use case)
-_SKIP_TYPES = frozenset({
-    "URL",  # URLs are not PII by themselves
-    "DATE_TIME",  # Dates are not PII
-    "IP_ADDRESS",  # Handled separately if needed
-    "MAC_ADDRESS",
-    "CRYPTO",  # Crypto addresses
-    "IBAN_CODE",
-    "US_BANK_NUMBER",
-    "US_DRIVER_LICENSE",
-    "US_PASSPORT",
-    "US_ITIN",
-    "UK_NHS",
-    "MEDICAL_LICENSE",
-})
-
 
 class PiiDetector:
     """Wraps Presidio Analyzer for PII detection.
@@ -50,14 +34,10 @@ class PiiDetector:
 
         detections: list[Detection] = []
         for result in results:
-            # Skip types we don't care about
-            if result.entity_type in _SKIP_TYPES:
-                continue
-
             entity_type = _TYPE_MAP.get(result.entity_type)
             if entity_type is None:
-                # Unmapped PII type — skip with implicit pass
-                # (PII types should not use SECRET catch-all per plan)
+                # Unmapped PII type — skip (PII types should not use
+                # SECRET catch-all per plan)
                 continue
 
             detections.append(
@@ -66,7 +46,7 @@ class PiiDetector:
                     start=result.start,
                     end=result.end,
                     score=result.score,
-                    source="pii",
+                    source="pii-presidio",
                 )
             )
 

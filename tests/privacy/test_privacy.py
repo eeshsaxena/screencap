@@ -9,10 +9,13 @@ from screencap.privacy import (
     Anonymizer,
     Detection,
     DetectionPipeline,
+    DetectionResult,
     EntityType,
     _merge_detections,
     normalize_text,
 )
+
+pytestmark = pytest.mark.privacy
 
 
 # ---------------------------------------------------------------------------
@@ -89,6 +92,12 @@ class TestNormalizeText:
         assert normalize_text("te\u200dst") == "test"
         assert normalize_text("te\ufeffst") == "test"
 
+    def test_word_joiner_stripped(self):
+        assert normalize_text("te\u2060st") == "test"
+
+    def test_soft_hyphen_stripped(self):
+        assert normalize_text("te\u00adst") == "test"
+
     def test_empty(self):
         assert normalize_text("") == ""
 
@@ -105,18 +114,18 @@ class TestMergeDetections:
     def test_no_overlaps(self):
         dets = [
             Detection("EMAIL", 0, 10, 0.9, "regex"),
-            Detection("PHONE", 20, 30, 0.8, "pii"),
+            Detection("PHONE", 20, 30, 0.8, "pii-presidio"),
         ]
         result = _merge_detections(dets)
         assert len(result) == 2
 
     def test_dedup_identical_spans(self):
         d1 = Detection("EMAIL", 5, 25, 0.8, "regex")
-        d2 = Detection("EMAIL", 5, 25, 0.95, "pii")
+        d2 = Detection("EMAIL", 5, 25, 0.95, "pii-presidio")
         result = _merge_detections([d1, d2])
         assert len(result) == 1
         assert result[0].score == 0.95
-        assert result[0].source == "pii"
+        assert result[0].source == "pii-presidio"
 
     def test_nested_broader_wins(self):
         outer = Detection("CONNECTION_STRING", 0, 50, 0.9, "regex")
@@ -127,7 +136,7 @@ class TestMergeDetections:
         assert result[0].end == 50
 
     def test_partial_overlap_union(self):
-        d1 = Detection("EMAIL", 5, 25, 0.9, "pii")
+        d1 = Detection("EMAIL", 5, 25, 0.9, "pii-presidio")
         d2 = Detection("API_KEY", 20, 45, 0.85, "secrets")
         result = _merge_detections([d1, d2])
         assert len(result) == 1
@@ -138,12 +147,12 @@ class TestMergeDetections:
 
     def test_adjacent_not_merged(self):
         d1 = Detection("EMAIL", 0, 10, 0.9, "regex")
-        d2 = Detection("PHONE", 10, 20, 0.8, "pii")
+        d2 = Detection("PHONE", 10, 20, 0.8, "pii-presidio")
         result = _merge_detections([d1, d2])
         assert len(result) == 2
 
     def test_unsorted_input(self):
-        d1 = Detection("PHONE", 20, 30, 0.8, "pii")
+        d1 = Detection("PHONE", 20, 30, 0.8, "pii-presidio")
         d2 = Detection("EMAIL", 0, 10, 0.9, "regex")
         result = _merge_detections([d2, d1])
         assert result[0].start == 0
@@ -169,50 +178,61 @@ class _FakeDetector:
 
 
 class TestDetectionPipeline:
+    def test_no_detectors_raises(self):
+        with pytest.raises(ValueError, match="requires at least one detector"):
+            DetectionPipeline([])
+
     def test_short_circuit(self):
         det = _FakeDetector([Detection("EMAIL", 0, 3, 0.9, "fake")])
         pipeline = DetectionPipeline([det])
-        # Text < 4 chars → empty
-        assert pipeline.detect("abc") == []
+        result = pipeline.detect("abc")
+        assert result.detections == []
 
     def test_empty_text(self):
         det = _FakeDetector([Detection("EMAIL", 0, 3, 0.9, "fake")])
         pipeline = DetectionPipeline([det])
-        assert pipeline.detect("") == []
+        result = pipeline.detect("")
+        assert result.detections == []
 
-    def test_normalization(self):
-        """Pipeline normalizes text before passing to detectors."""
-        captured_text = []
+    def test_returns_detection_result(self):
+        det = _FakeDetector([Detection("EMAIL", 0, 20, 0.9, "fake")])
+        pipeline = DetectionPipeline([det])
+        result = pipeline.detect("test@example.com text")
+        assert isinstance(result, DetectionResult)
+        assert isinstance(result.normalized_text, str)
+        assert isinstance(result.detections, list)
+
+    def test_normalized_text_returned(self):
+        """Pipeline returns the normalized text that offsets refer to."""
 
         class CapturingDetector:
             def detect(self, text: str) -> list[Detection]:
-                captured_text.append(text)
                 return []
 
         pipeline = DetectionPipeline([CapturingDetector()])
-        pipeline.detect("p\u200bassword test")
-        assert captured_text[0] == "password test"
+        result = pipeline.detect("p\u200bassword test")
+        assert result.normalized_text == "password test"
 
     def test_single_detector(self):
         det = _FakeDetector([Detection("EMAIL", 0, 20, 0.9, "fake")])
         pipeline = DetectionPipeline([det])
         result = pipeline.detect("test@example.com text")
-        assert len(result) == 1
-        assert result[0].entity_type == "EMAIL"
+        assert len(result.detections) == 1
+        assert result.detections[0].entity_type == "EMAIL"
 
     def test_multiple_detectors_merged(self):
         d1 = _FakeDetector([Detection("EMAIL", 0, 16, 0.9, "d1")])
         d2 = _FakeDetector([Detection("PERSON", 20, 28, 0.8, "d2")])
         pipeline = DetectionPipeline([d1, d2])
         result = pipeline.detect("test@example.com    John Doe rest of text")
-        assert len(result) == 2
+        assert len(result.detections) == 2
 
     def test_detector_failure_continues(self):
         failing = _FakeDetector(error=RuntimeError("boom"))
         working = _FakeDetector([Detection("EMAIL", 0, 16, 0.9, "ok")])
         pipeline = DetectionPipeline([failing, working])
         result = pipeline.detect("test@example.com text")
-        assert len(result) == 1
+        assert len(result.detections) == 1
         assert "_FakeDetector" in pipeline.last_errors
         assert "RuntimeError" in pipeline.last_errors["_FakeDetector"]
 
@@ -228,16 +248,16 @@ class TestDetectionPipeline:
         working = _FakeDetector([Detection("EMAIL", 0, 10, 0.9, "ok")])
         pipeline = DetectionPipeline([failing, working])
         pipeline.detect("first call text here")
-        assert pipeline.last_errors  # has error
+        assert pipeline.last_errors
         pipeline.detect("second call text here")
-        assert pipeline.last_errors  # still has error from this call
-        # But it was reset (same key, fresh dict)
+        assert pipeline.last_errors
         assert "_FakeDetector" in pipeline.last_errors
 
-    def test_no_detectors_short_text(self):
-        pipeline = DetectionPipeline([])
-        # Short text → short-circuit before all-fail check
-        assert pipeline.detect("ab") == []
+    def test_validate_pii_engine(self):
+        from screencap.privacy import create_default_pipeline
+
+        with pytest.raises(ValueError, match="Invalid pii_engine"):
+            create_default_pipeline(pii_engine="invalid")
 
 
 # ---------------------------------------------------------------------------
@@ -258,7 +278,7 @@ class TestAnonymizer:
     def test_multiple_replacements(self, anonymizer: Anonymizer):
         text = "John Doe test@example.com"
         dets = [
-            Detection("PERSON", 0, 8, 0.9, "pii"),
+            Detection("PERSON", 0, 8, 0.9, "pii-presidio"),
             Detection("EMAIL", 9, 25, 0.9, "regex"),
         ]
         result = anonymizer.anonymize(text, dets)
@@ -282,7 +302,7 @@ class TestAnonymizer:
     def test_overlapping_detections_merged(self, anonymizer: Anonymizer):
         text = "x" * 50
         dets = [
-            Detection("EMAIL", 5, 25, 0.9, "pii"),
+            Detection("EMAIL", 5, 25, 0.9, "pii-presidio"),
             Detection("API_KEY", 20, 45, 0.85, "secrets"),
         ]
         result = anonymizer.anonymize(text, dets)

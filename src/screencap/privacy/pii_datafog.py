@@ -50,7 +50,7 @@ class DataFogPiiDetector:
                             start=idx,
                             end=idx + len(value),
                             score=0.85,
-                            source="pii",
+                            source="pii-datafog",
                         )
                     )
                     search_start = idx + 1

@@ -10,12 +10,36 @@ import logging
 import re
 import unicodedata
 from dataclasses import dataclass
-from typing import Protocol
+from typing import NamedTuple, Protocol
 
 logger = logging.getLogger(__name__)
 
-# Zero-width characters to strip during normalization
-_ZERO_WIDTH = re.compile("[\u200b\u200c\u200d\ufeff]")
+# Zero-width / invisible characters to strip during normalization.
+# Covers Unicode "default ignorable" code points that can break regex matching.
+_ZERO_WIDTH = re.compile(
+    "["
+    "\u00ad"   # Soft hyphen
+    "\u034f"   # Combining grapheme joiner
+    "\u061c"   # Arabic letter mark
+    "\u115f"   # Hangul choseong filler
+    "\u1160"   # Hangul jungseong filler
+    "\u17b4"   # Khmer vowel inherent Aq
+    "\u17b5"   # Khmer vowel inherent Aa
+    "\u180b-\u180e"  # Mongolian free variation selectors + vowel separator
+    "\u200b-\u200f"  # Zero-width space, ZWNJ, ZWJ, LRM, RLM
+    "\u202a-\u202e"  # Bidi embedding controls
+    "\u2060-\u2064"  # Word joiner, invisible times/separator/plus
+    "\u2066-\u2069"  # Bidi isolate controls
+    "\u206a-\u206f"  # Deprecated formatting chars
+    "\ufe00-\ufe0f"  # Variation selectors
+    "\ufeff"          # BOM / zero-width no-break space
+    "\uffa0"          # Halfwidth Hangul filler
+    "\ufff0-\ufff8"  # Specials
+    "\U000e0001"     # Language tag
+    "\U000e0020-\U000e007f"  # Tag components
+    "\U000e0100-\U000e01ef"  # Variation selectors supplement
+    "]"
+)
 
 
 # ---------------------------------------------------------------------------
@@ -49,7 +73,18 @@ class Detection:
     start: int  # character offset (inclusive)
     end: int  # character offset (exclusive)
     score: float  # confidence 0.0-1.0
-    source: str  # detector name: "secrets", "pii", "regex"
+    source: str  # detector name: "secrets", "pii-presidio", "pii-datafog", "regex"
+
+
+class DetectionResult(NamedTuple):
+    """Result from DetectionPipeline.detect().
+
+    Contains the normalized text (which offsets refer to) alongside
+    detections. Always pass ``normalized_text`` to Anonymizer.anonymize().
+    """
+
+    normalized_text: str
+    detections: list[Detection]
 
 
 class TextDetector(Protocol):
@@ -68,7 +103,7 @@ class AllDetectorsFailedError(Exception):
 
 
 def normalize_text(text: str) -> str:
-    """NFKC normalize and strip zero-width characters."""
+    """NFKC normalize and strip zero-width / invisible characters."""
     text = unicodedata.normalize("NFKC", text)
     return _ZERO_WIDTH.sub("", text)
 
@@ -79,11 +114,6 @@ def _sanitize_error(error: Exception, input_text: str) -> str:
     msg = str(error)[:80]
     if input_text and len(input_text) >= 4:
         msg = msg.replace(input_text, "[TEXT]")
-        # Also replace substrings of input that might appear
-        for i in range(0, len(input_text) - 3, 4):
-            chunk = input_text[i : i + 8]
-            if chunk in msg:
-                msg = msg.replace(chunk, "[TEXT]")
     return f"{class_name}: {msg}"
 
 
@@ -133,19 +163,28 @@ class DetectionPipeline:
     last_errors: dict[str, str]
 
     def __init__(self, detectors: list[TextDetector]) -> None:
+        if not detectors:
+            raise ValueError(
+                "DetectionPipeline requires at least one detector. "
+                "Use create_default_pipeline() to build a configured pipeline."
+            )
         self._detectors = list(detectors)
         self.last_errors = {}
 
-    def detect(self, text: str) -> list[Detection]:
-        """Run all detectors and return merged, non-overlapping detections."""
+    def detect(self, text: str) -> DetectionResult:
+        """Run all detectors and return normalized text + merged detections.
+
+        Returns a DetectionResult(normalized_text, detections). Always use
+        the normalized_text when passing results to Anonymizer.anonymize().
+        """
         self.last_errors = {}
 
         # Short-circuit: no meaningful entity fits in < 4 chars
         if len(text) < 4:
-            return []
+            return DetectionResult(text, [])
 
-        # Normalize
-        text = normalize_text(text)
+        # Normalize — all offsets in detections refer to this text
+        normalized = normalize_text(text)
 
         all_detections: list[Detection] = []
         failures = 0
@@ -153,11 +192,11 @@ class DetectionPipeline:
         for detector in self._detectors:
             name = type(detector).__name__
             try:
-                results = detector.detect(text)
+                results = detector.detect(normalized)
                 all_detections.extend(results)
             except Exception as exc:
                 failures += 1
-                sanitized = _sanitize_error(exc, text)
+                sanitized = _sanitize_error(exc, normalized)
                 self.last_errors[name] = sanitized
                 logger.warning("Detector %s failed: %s", name, sanitized)
                 logger.debug(
@@ -171,7 +210,7 @@ class DetectionPipeline:
                 f"Errors: {self.last_errors}"
             )
 
-        return _merge_detections(all_detections)
+        return DetectionResult(normalized, _merge_detections(all_detections))
 
 
 # ---------------------------------------------------------------------------
@@ -225,6 +264,8 @@ class Anonymizer:
 # Factory
 # ---------------------------------------------------------------------------
 
+_VALID_PII_ENGINES = frozenset({"presidio", "datafog", None})
+
 
 def create_default_pipeline(
     pii_engine: str | None = None,
@@ -241,6 +282,12 @@ def create_default_pipeline(
 
     Raises ImportError with an actionable message if privacy deps are missing.
     """
+    if pii_engine not in _VALID_PII_ENGINES:
+        raise ValueError(
+            f"Invalid pii_engine={pii_engine!r}. "
+            f"Must be one of: 'presidio', 'datafog', or None (auto-detect)."
+        )
+
     detectors: list[TextDetector] = []
 
     # RegexDetector has no external deps — always available

@@ -76,6 +76,10 @@ class DetectSecretsDetector:
         ]
 
     def detect(self, text: str) -> list[Detection]:
+        # No meaningful secret fits in < 10 chars
+        if len(text) < 10:
+            return []
+
         detections: list[Detection] = []
 
         # Split into lines preserving line endings for correct offset tracking
