@@ -233,7 +233,7 @@ def get_video_file_path(recording_timestamp: float, video_dir: str = None) -> st
         video_dir = os.path.join(os.getcwd(), "video")
     os.makedirs(video_dir, exist_ok=True)
     return os.path.join(
-        video_dir, f"oa_recording-{recording_timestamp}.mp4"
+        video_dir, f"recording-{recording_timestamp}.mp4"
     )
 
 

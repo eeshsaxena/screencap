@@ -349,6 +349,9 @@ class CaptureSession:
     @property
     def video_path(self) -> Path | None:
         """Path to video file if exists."""
+        # Current format: recording-{timestamp}.mp4
+        for p in self.capture_dir.glob("recording-*.mp4"):
+            return p
         # Legacy format: oa_recording-{timestamp}.mp4
         for p in self.capture_dir.glob("oa_recording-*.mp4"):
             return p
