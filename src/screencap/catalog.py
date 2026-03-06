@@ -22,6 +22,9 @@ class RecordingInfo(NamedTuple):
     transcribed: bool
     uploaded: bool
     drops: dict[str, int] | None = None  # event drop counts, if any
+    is_stub: bool = False  # True if media files deleted after upload
+    chunks_total: int = 0  # number of video chunks (0 = legacy single-file)
+    chunks_uploaded: int = 0  # number of chunks with upload status files
 
 
 def _fmt_duration(seconds: float | None) -> str:
@@ -136,9 +139,38 @@ def list_recordings(recordings_dir: Path | None = None) -> list[RecordingInfo]:
         if started:
             date_str = datetime.fromtimestamp(started).strftime("%Y-%m-%d")
 
-        has_audio = (d / "audio.flac").exists()
-        transcribed = (d / "transcript.txt").exists()
-        uploaded = (d / ".upload_status.json").is_file()
+        has_audio = (d / "audio.flac").exists() or any(d.glob("audio_*.flac"))
+        transcribed = (d / "transcript.txt").exists() or any(d.glob("transcript_*.txt"))
+        uploaded_legacy = (d / ".upload_status.json").is_file()
+
+        # Chunk detection — count from local files, status files, and manifests
+        chunk_videos = sorted(d.glob("chunk_*.mp4"))
+        chunk_status_files = list(d.glob(".chunk_*_status.json"))
+        chunk_manifests = sorted(d.glob("chunk_*_manifest.json"))
+        chunks_uploaded = len(chunk_status_files)
+        # chunks_total: use max of local videos, manifests, and uploaded count
+        # (local files may be deleted after upload)
+        chunks_total = max(len(chunk_videos), len(chunk_manifests), chunks_uploaded)
+
+        uploaded = uploaded_legacy or chunks_uploaded > 0
+
+        # For stubbed recordings, check chunk status files for audio evidence
+        if not has_audio and chunks_uploaded > 0:
+            for sf in chunk_status_files:
+                try:
+                    data = json.loads(sf.read_text())
+                    if any("audio_" in f for f in data.get("files", [])):
+                        has_audio = True
+                        break
+                except Exception:
+                    pass
+
+        # Stub detection: DB exists but no media files on disk
+        has_media = (
+            any(d.glob("*.mp4")) or any(d.glob("*.flac"))
+            or (d / "video.mp4").exists()
+        )
+        is_stub = uploaded and not has_media and db is not None
 
         drops = read_drops(d)
 
@@ -152,6 +184,9 @@ def list_recordings(recordings_dir: Path | None = None) -> list[RecordingInfo]:
                 transcribed=transcribed,
                 uploaded=uploaded,
                 drops=drops,
+                is_stub=is_stub,
+                chunks_total=chunks_total,
+                chunks_uploaded=chunks_uploaded,
             )
         )
 

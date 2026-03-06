@@ -205,7 +205,9 @@ def upload_recording(
     3. Upload new files with progress bars (parallel via ThreadPoolExecutor)
     4. Return summary
     """
-    recording_name = recording_dir.name
+    # Read immutable recording_id if available, fallback to dir name
+    _id_file = recording_dir / ".recording_id"
+    recording_name = _id_file.read_text().strip() if _id_file.exists() else recording_dir.name
 
     if not dry_run and not force and is_uploaded(recording_dir):
         console.print(
