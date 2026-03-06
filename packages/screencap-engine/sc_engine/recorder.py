@@ -1230,6 +1230,44 @@ def memory_writer(
     logger.info("Memory writer done")
 
 
+def _get_display_layout() -> list[dict] | None:
+    """Snapshot all connected display bounds and pixel ratios.
+
+    Returns a list of dicts with keys: display_id, x, y, w, h, pixel_ratio.
+    All coordinates are in logical macOS points (global display coordinate space).
+    Returns None on non-macOS or on failure.
+    """
+    if sys.platform != "darwin":
+        return None
+    try:
+        import Quartz
+
+        err, display_ids, count = Quartz.CGGetActiveDisplayList(16, None, None)
+        if err != 0 or not display_ids:
+            return None
+        displays = []
+        for did in display_ids[:count]:
+            bounds = Quartz.CGDisplayBounds(did)
+            mode = Quartz.CGDisplayCopyDisplayMode(did)
+            if mode:
+                phys_w = Quartz.CGDisplayModeGetPixelWidth(mode)
+                log_w = Quartz.CGDisplayModeGetWidth(mode)
+                ratio = phys_w / log_w if log_w > 0 else 1.0
+            else:
+                ratio = 1.0
+            displays.append({
+                "display_id": int(did),
+                "x": bounds.origin.x,
+                "y": bounds.origin.y,
+                "w": bounds.size.width,
+                "h": bounds.size.height,
+                "pixel_ratio": ratio,
+            })
+        return displays if displays else None
+    except Exception:
+        return None
+
+
 @utils.trace(logger)
 def create_recording(
     task_description: str,
@@ -1254,6 +1292,23 @@ def create_recording(
     double_click_distance_pixels = utils.get_double_click_distance_pixels()
     double_click_interval_seconds = utils.get_double_click_interval_seconds()
     pixel_ratio = get_display_pixel_ratio()
+
+    config = {}
+    display_layout = _get_display_layout()
+    if display_layout:
+        config["displays"] = display_layout
+
+    screenshot = utils.take_screenshot()
+    if screenshot is not None:
+        config["screenshot_size"] = list(screenshot.size)
+
+    logger.info(
+        f"Display layout: displays={display_layout}, "
+        f"screenshot_size={screenshot.size if screenshot else None}, "
+        f"primary_pixel_ratio={pixel_ratio}, "
+        f"monitor_dims=({monitor_width}, {monitor_height})"
+    )
+
     recording_data = {
         # TODO: rename
         "timestamp": timestamp,
@@ -1264,6 +1319,7 @@ def create_recording(
         "double_click_interval_seconds": double_click_interval_seconds,
         "platform": sys.platform,
         "task_description": task_description,
+        "config": config if config else None,
     }
     engine, Session = create_db(db_path)
     session = Session()

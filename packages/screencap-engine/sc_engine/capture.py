@@ -382,6 +382,14 @@ class CaptureSession:
         return 1.0
 
     @property
+    def display_map(self) -> list[dict] | None:
+        """Per-display bounds and pixel ratios, or None if not stored."""
+        config = getattr(self._recording, "config", None)
+        if isinstance(config, dict):
+            return config.get("displays")
+        return None
+
+    @property
     def audio_start_time(self) -> float | None:
         """Start timestamp of the audio recording, or None if unavailable."""
         # Check the AudioInfo relationship for the timestamp
