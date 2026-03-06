@@ -1,0 +1,411 @@
+"""Policy engine for privacy v3.
+
+Owns:
+- PrivacyMode and ContextClass enums
+- user privacy config parsing
+- the (context_class, privacy_mode) -> action matrix
+- policy precedence and evaluation
+"""
+
+from __future__ import annotations
+
+import os
+import re
+from dataclasses import dataclass, field
+from enum import Enum
+from typing import Protocol
+
+from screencap.privacy.actions import ActionDecision, PrivacyAction, stricter
+from screencap.privacy.reasons import ReasonCode
+
+
+# ---------------------------------------------------------------------------
+# Enums
+# ---------------------------------------------------------------------------
+
+
+class PrivacyMode(Enum):
+    PUBLIC = "public"
+    SHARED = "shared"
+    INTERNAL = "internal"
+
+
+class ContextClass(Enum):
+    PASSWORD_MANAGER = "password_manager"
+    BANKING = "banking"
+    EMAIL = "email"
+    CHAT = "chat"
+    CALENDAR = "calendar"
+    VIDEO_CALL = "video_call"
+    BROWSER_UNVERIFIED = "browser_unverified"
+    CODE_EDITOR_TERMINAL = "code_editor_terminal"
+    ADMIN_CONSOLE = "admin_console"
+    UNKNOWN = "unknown"
+
+
+# ---------------------------------------------------------------------------
+# Action matrix
+# ---------------------------------------------------------------------------
+
+# Explicit mapping for every (ContextClass, PrivacyMode) pair.
+# Shared is architecture-supported but deferred from implementation;
+# we still define its matrix entries for completeness.
+
+_ACTION_MATRIX: dict[tuple[ContextClass, PrivacyMode], PrivacyAction] = {
+    # password_manager
+    (ContextClass.PASSWORD_MANAGER, PrivacyMode.PUBLIC): PrivacyAction.EXCLUDE,
+    (ContextClass.PASSWORD_MANAGER, PrivacyMode.SHARED): PrivacyAction.EXCLUDE,
+    (ContextClass.PASSWORD_MANAGER, PrivacyMode.INTERNAL): PrivacyAction.EXCLUDE,
+    # banking
+    (ContextClass.BANKING, PrivacyMode.PUBLIC): PrivacyAction.EXCLUDE,
+    (ContextClass.BANKING, PrivacyMode.SHARED): PrivacyAction.EXCLUDE,
+    (ContextClass.BANKING, PrivacyMode.INTERNAL): PrivacyAction.MASK_WINDOW,
+    # email
+    (ContextClass.EMAIL, PrivacyMode.PUBLIC): PrivacyAction.MASK_WINDOW,
+    (ContextClass.EMAIL, PrivacyMode.SHARED): PrivacyAction.MASK_REGION,
+    (ContextClass.EMAIL, PrivacyMode.INTERNAL): PrivacyAction.TEXT_REDACT,
+    # chat
+    (ContextClass.CHAT, PrivacyMode.PUBLIC): PrivacyAction.MASK_WINDOW,
+    (ContextClass.CHAT, PrivacyMode.SHARED): PrivacyAction.MASK_REGION,
+    (ContextClass.CHAT, PrivacyMode.INTERNAL): PrivacyAction.TEXT_REDACT,
+    # calendar
+    (ContextClass.CALENDAR, PrivacyMode.PUBLIC): PrivacyAction.MASK_WINDOW,
+    (ContextClass.CALENDAR, PrivacyMode.SHARED): PrivacyAction.MASK_REGION,
+    (ContextClass.CALENDAR, PrivacyMode.INTERNAL): PrivacyAction.TEXT_REDACT,
+    # video_call
+    (ContextClass.VIDEO_CALL, PrivacyMode.PUBLIC): PrivacyAction.MASK_WINDOW,
+    (ContextClass.VIDEO_CALL, PrivacyMode.SHARED): PrivacyAction.MASK_REGION,
+    (ContextClass.VIDEO_CALL, PrivacyMode.INTERNAL): PrivacyAction.TEXT_REDACT,
+    # browser_unverified
+    (ContextClass.BROWSER_UNVERIFIED, PrivacyMode.PUBLIC): PrivacyAction.MASK_WINDOW,
+    (ContextClass.BROWSER_UNVERIFIED, PrivacyMode.SHARED): PrivacyAction.OCR_FALLBACK,
+    (ContextClass.BROWSER_UNVERIFIED, PrivacyMode.INTERNAL): PrivacyAction.ALLOW,
+    # code_editor_terminal
+    (ContextClass.CODE_EDITOR_TERMINAL, PrivacyMode.PUBLIC): PrivacyAction.OCR_FALLBACK,
+    (ContextClass.CODE_EDITOR_TERMINAL, PrivacyMode.SHARED): PrivacyAction.TEXT_REDACT,
+    (ContextClass.CODE_EDITOR_TERMINAL, PrivacyMode.INTERNAL): PrivacyAction.ALLOW,
+    # admin_console
+    (ContextClass.ADMIN_CONSOLE, PrivacyMode.PUBLIC): PrivacyAction.OCR_FALLBACK,
+    (ContextClass.ADMIN_CONSOLE, PrivacyMode.SHARED): PrivacyAction.TEXT_REDACT,
+    (ContextClass.ADMIN_CONSOLE, PrivacyMode.INTERNAL): PrivacyAction.ALLOW,
+    # unknown — fail closed in public
+    (ContextClass.UNKNOWN, PrivacyMode.PUBLIC): PrivacyAction.MASK_WINDOW,
+    (ContextClass.UNKNOWN, PrivacyMode.SHARED): PrivacyAction.OCR_FALLBACK,
+    (ContextClass.UNKNOWN, PrivacyMode.INTERNAL): PrivacyAction.ALLOW,
+}
+
+
+def get_matrix_action(
+    context: ContextClass, mode: PrivacyMode
+) -> PrivacyAction:
+    """Look up the base action for a (context, mode) pair.
+
+    Raises KeyError if the pair is missing — this should never happen
+    because the matrix is validated at import time.
+    """
+    return _ACTION_MATRIX[(context, mode)]
+
+
+def _validate_matrix() -> None:
+    """Verify every (ContextClass, PrivacyMode) pair is covered."""
+    for ctx in ContextClass:
+        for mode in PrivacyMode:
+            if (ctx, mode) not in _ACTION_MATRIX:
+                raise RuntimeError(
+                    f"Action matrix missing entry: ({ctx.value}, {mode.value})"
+                )
+
+
+_validate_matrix()
+
+
+# ---------------------------------------------------------------------------
+# Privacy config
+# ---------------------------------------------------------------------------
+
+
+@dataclass(frozen=True)
+class PrivacyConfig:
+    """Parsed [privacy] section from config.toml."""
+
+    mode: PrivacyMode = PrivacyMode.INTERNAL
+    exclude_apps: frozenset[str] = field(default_factory=frozenset)
+    mask_domains: frozenset[str] = field(default_factory=frozenset)
+    mask_title_patterns: tuple[re.Pattern[str], ...] = ()
+
+    def is_excluded_app(self, bundle_id: str) -> bool:
+        return bundle_id in self.exclude_apps
+
+    def is_masked_domain(self, domain: str) -> bool:
+        domain = domain.lower()
+        return any(domain == d or domain.endswith("." + d) for d in self.mask_domains)
+
+    def matches_title_pattern(self, title: str) -> str | None:
+        """Return the matching pattern string, or None."""
+        for pat in self.mask_title_patterns:
+            if pat.search(title):
+                return pat.pattern
+        return None
+
+
+class InvalidPrivacyConfigError(Exception):
+    """Raised when the [privacy] config section is malformed."""
+
+
+def parse_privacy_config(toml_dict: dict) -> PrivacyConfig:
+    """Parse the [privacy] section of a TOML config dict.
+
+    Args:
+        toml_dict: The full parsed TOML dict (not just the privacy section).
+
+    Returns:
+        PrivacyConfig with validated settings.
+
+    Raises:
+        InvalidPrivacyConfigError: On malformed values.
+    """
+    section = toml_dict.get("privacy", {})
+    if not isinstance(section, dict):
+        raise InvalidPrivacyConfigError(
+            f"[privacy] must be a table, got {type(section).__name__}"
+        )
+
+    # mode
+    mode_str = os.environ.get("SCREENCAP_PRIVACY_MODE") or section.get("mode", "internal")
+    if not isinstance(mode_str, str):
+        raise InvalidPrivacyConfigError(
+            f"privacy.mode must be a string, got {type(mode_str).__name__}"
+        )
+    try:
+        mode = PrivacyMode(mode_str.lower())
+    except ValueError:
+        valid = ", ".join(m.value for m in PrivacyMode)
+        raise InvalidPrivacyConfigError(
+            f"Invalid privacy.mode={mode_str!r}. Must be one of: {valid}"
+        )
+
+    # exclude_apps
+    raw_apps = section.get("exclude_apps", [])
+    if not isinstance(raw_apps, list):
+        raise InvalidPrivacyConfigError(
+            f"privacy.exclude_apps must be a list, got {type(raw_apps).__name__}"
+        )
+    for i, app in enumerate(raw_apps):
+        if not isinstance(app, str):
+            raise InvalidPrivacyConfigError(
+                f"privacy.exclude_apps[{i}] must be a string, got {type(app).__name__}"
+            )
+    exclude_apps = frozenset(raw_apps)
+
+    # mask_domains
+    raw_domains = section.get("mask_domains", [])
+    if not isinstance(raw_domains, list):
+        raise InvalidPrivacyConfigError(
+            f"privacy.mask_domains must be a list, got {type(raw_domains).__name__}"
+        )
+    for i, domain in enumerate(raw_domains):
+        if not isinstance(domain, str):
+            raise InvalidPrivacyConfigError(
+                f"privacy.mask_domains[{i}] must be a string, got {type(domain).__name__}"
+            )
+    mask_domains = frozenset(d.lower() for d in raw_domains)
+
+    # mask_title_patterns
+    raw_patterns = section.get("mask_title_patterns", [])
+    if not isinstance(raw_patterns, list):
+        raise InvalidPrivacyConfigError(
+            f"privacy.mask_title_patterns must be a list, got {type(raw_patterns).__name__}"
+        )
+    compiled: list[re.Pattern[str]] = []
+    for i, pat in enumerate(raw_patterns):
+        if not isinstance(pat, str):
+            raise InvalidPrivacyConfigError(
+                f"privacy.mask_title_patterns[{i}] must be a string, got {type(pat).__name__}"
+            )
+        try:
+            compiled.append(re.compile(pat))
+        except re.error as exc:
+            raise InvalidPrivacyConfigError(
+                f"privacy.mask_title_patterns[{i}] is not a valid regex: {exc}"
+            )
+
+    return PrivacyConfig(
+        mode=mode,
+        exclude_apps=exclude_apps,
+        mask_domains=mask_domains,
+        mask_title_patterns=tuple(compiled),
+    )
+
+
+# ---------------------------------------------------------------------------
+# Protocol contracts
+# ---------------------------------------------------------------------------
+
+
+@dataclass(frozen=True)
+class FrameMetadata:
+    """Metadata about a frame or data surface for context classification."""
+
+    bundle_id: str = ""
+    window_title: str = ""
+    domain: str | None = None  # None = unknown/unavailable
+    timestamp: float = 0.0
+
+
+@dataclass(frozen=True)
+class ContextResult:
+    """Output of a ContextClassifier."""
+
+    context_class: ContextClass
+    confidence: str = ""  # e.g. "domain", "bundle_id", "title"
+    evidence: str = ""  # human-readable, e.g. the bundle ID that matched
+
+
+class ContextClassifier(Protocol):
+    def classify(self, metadata: FrameMetadata) -> ContextResult: ...
+
+
+class PolicyEvaluator(Protocol):
+    def evaluate(
+        self, context: ContextResult, mode: PrivacyMode
+    ) -> ActionDecision: ...
+
+
+# ---------------------------------------------------------------------------
+# Default evaluator
+# ---------------------------------------------------------------------------
+
+# Map ContextClass -> ReasonCode for matrix-driven decisions
+_CONTEXT_REASON: dict[ContextClass, str] = {
+    ContextClass.PASSWORD_MANAGER: ReasonCode.CONTEXT_PASSWORD_MANAGER,
+    ContextClass.BANKING: ReasonCode.CONTEXT_BANKING,
+    ContextClass.EMAIL: ReasonCode.CONTEXT_EMAIL,
+    ContextClass.CHAT: ReasonCode.CONTEXT_CHAT,
+    ContextClass.CALENDAR: ReasonCode.CONTEXT_CALENDAR,
+    ContextClass.VIDEO_CALL: ReasonCode.CONTEXT_VIDEO_CALL,
+    ContextClass.BROWSER_UNVERIFIED: ReasonCode.CONTEXT_BROWSER_UNVERIFIED,
+    ContextClass.CODE_EDITOR_TERMINAL: ReasonCode.CONTEXT_CODE_EDITOR_TERMINAL,
+    ContextClass.ADMIN_CONSOLE: ReasonCode.CONTEXT_ADMIN_CONSOLE,
+    ContextClass.UNKNOWN: ReasonCode.CONTEXT_UNKNOWN,
+}
+
+
+class DefaultPolicyEvaluator:
+    """Evaluates policy using config rules + action matrix.
+
+    Precedence (highest to lowest):
+    1. Explicit user denylist (exclude_apps)
+    2. Domain mask rules (mask_domains)
+    3. Title mask rules (mask_title_patterns)
+    4. Action matrix lookup (context_class, privacy_mode)
+
+    At each level, the result is compared with the matrix default and
+    the stricter action wins.
+    """
+
+    def __init__(self, config: PrivacyConfig) -> None:
+        self._config = config
+
+    @property
+    def config(self) -> PrivacyConfig:
+        return self._config
+
+    def evaluate(
+        self,
+        context: ContextResult,
+        mode: PrivacyMode | None = None,
+    ) -> ActionDecision:
+        mode = mode or self._config.mode
+
+        # 1. Explicit app exclusion
+        if context.evidence and self._config.is_excluded_app(context.evidence):
+            return ActionDecision(
+                action=PrivacyAction.EXCLUDE,
+                reason=ReasonCode.POLICY_EXCLUDED_APP,
+                evidence=context.evidence,
+            )
+
+        # 2. Domain mask
+        # (context.evidence may be a domain when context_class is browser-related)
+        # We also check FrameMetadata domain if caller embeds it in evidence.
+        # For now, check if evidence looks like a domain.
+        # More robust: callers pass domain explicitly. This is a reasonable v1.
+
+        # 3. Title mask — checked via evidence string
+        title_match = self._config.matches_title_pattern(context.evidence)
+        if title_match:
+            matrix_action = get_matrix_action(context.context_class, mode)
+            forced = stricter(PrivacyAction.MASK_WINDOW, matrix_action)
+            return ActionDecision(
+                action=forced,
+                reason=ReasonCode.POLICY_MASKED_TITLE,
+                evidence=f"pattern={title_match}",
+            )
+
+        # 4. Matrix default
+        action = get_matrix_action(context.context_class, mode)
+        reason = _CONTEXT_REASON.get(
+            context.context_class, ReasonCode.POLICY_MODE_DEFAULT
+        )
+        return ActionDecision(
+            action=action,
+            reason=reason,
+            evidence=context.evidence,
+        )
+
+    def evaluate_with_metadata(
+        self,
+        context: ContextResult,
+        metadata: FrameMetadata,
+        mode: PrivacyMode | None = None,
+    ) -> ActionDecision:
+        """Evaluate with full metadata for domain/title/app checks.
+
+        Precedence:
+        1. Explicit app exclusion (bundle_id)
+        2. Domain mask rules
+        3. Title mask rules
+        4. Action matrix lookup
+        """
+        mode = mode or self._config.mode
+
+        # 1. Explicit app exclusion
+        if metadata.bundle_id and self._config.is_excluded_app(metadata.bundle_id):
+            return ActionDecision(
+                action=PrivacyAction.EXCLUDE,
+                reason=ReasonCode.POLICY_EXCLUDED_APP,
+                evidence=metadata.bundle_id,
+            )
+
+        # 2. Domain mask
+        if metadata.domain and self._config.is_masked_domain(metadata.domain):
+            matrix_action = get_matrix_action(context.context_class, mode)
+            forced = stricter(PrivacyAction.MASK_WINDOW, matrix_action)
+            return ActionDecision(
+                action=forced,
+                reason=ReasonCode.POLICY_MASKED_DOMAIN,
+                evidence=metadata.domain,
+            )
+
+        # 3. Title mask
+        if metadata.window_title:
+            title_match = self._config.matches_title_pattern(metadata.window_title)
+            if title_match:
+                matrix_action = get_matrix_action(context.context_class, mode)
+                forced = stricter(PrivacyAction.MASK_WINDOW, matrix_action)
+                return ActionDecision(
+                    action=forced,
+                    reason=ReasonCode.POLICY_MASKED_TITLE,
+                    evidence=f"pattern={title_match}",
+                )
+
+        # 4. Matrix default
+        action = get_matrix_action(context.context_class, mode)
+        reason = _CONTEXT_REASON.get(
+            context.context_class, ReasonCode.POLICY_MODE_DEFAULT
+        )
+        return ActionDecision(
+            action=action,
+            reason=reason,
+            evidence=context.evidence,
+        )

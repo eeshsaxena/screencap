@@ -204,6 +204,16 @@ def get_rest_threshold() -> float:
     return float(cfg.get("rest_threshold", 120.0))
 
 
+def get_privacy_config():
+    """Return a PrivacyConfig parsed from [privacy] in config.toml.
+
+    Deferred import to avoid circular deps and keep CLI startup fast.
+    """
+    from screencap.privacy.policy import parse_privacy_config
+
+    return parse_privacy_config(_load_toml())
+
+
 def resolve_recording_dir(name: str) -> Path:
     """Resolve a recording name to a directory path, with traversal protection.
 
