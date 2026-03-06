@@ -267,7 +267,10 @@ class ContextClassifier(Protocol):
 
 class PolicyEvaluator(Protocol):
     def evaluate(
-        self, context: ContextResult, mode: PrivacyMode
+        self,
+        context: ContextResult,
+        metadata: FrameMetadata,
+        mode: PrivacyMode,
     ) -> ActionDecision: ...
 
 
@@ -294,7 +297,7 @@ class DefaultPolicyEvaluator:
     """Evaluates policy using config rules + action matrix.
 
     Precedence (highest to lowest):
-    1. Explicit user denylist (exclude_apps)
+    1. Explicit user denylist (exclude_apps via bundle_id)
     2. Domain mask rules (mask_domains)
     3. Title mask rules (mask_title_patterns)
     4. Action matrix lookup (context_class, privacy_mode)
@@ -313,60 +316,9 @@ class DefaultPolicyEvaluator:
     def evaluate(
         self,
         context: ContextResult,
-        mode: PrivacyMode | None = None,
-    ) -> ActionDecision:
-        mode = mode or self._config.mode
-
-        # 1. Explicit app exclusion
-        if context.evidence and self._config.is_excluded_app(context.evidence):
-            return ActionDecision(
-                action=PrivacyAction.EXCLUDE,
-                reason=ReasonCode.POLICY_EXCLUDED_APP,
-                evidence=context.evidence,
-            )
-
-        # 2. Domain mask
-        # (context.evidence may be a domain when context_class is browser-related)
-        # We also check FrameMetadata domain if caller embeds it in evidence.
-        # For now, check if evidence looks like a domain.
-        # More robust: callers pass domain explicitly. This is a reasonable v1.
-
-        # 3. Title mask — checked via evidence string
-        title_match = self._config.matches_title_pattern(context.evidence)
-        if title_match:
-            matrix_action = get_matrix_action(context.context_class, mode)
-            forced = stricter(PrivacyAction.MASK_WINDOW, matrix_action)
-            return ActionDecision(
-                action=forced,
-                reason=ReasonCode.POLICY_MASKED_TITLE,
-                evidence=f"pattern={title_match}",
-            )
-
-        # 4. Matrix default
-        action = get_matrix_action(context.context_class, mode)
-        reason = _CONTEXT_REASON.get(
-            context.context_class, ReasonCode.POLICY_MODE_DEFAULT
-        )
-        return ActionDecision(
-            action=action,
-            reason=reason,
-            evidence=context.evidence,
-        )
-
-    def evaluate_with_metadata(
-        self,
-        context: ContextResult,
         metadata: FrameMetadata,
         mode: PrivacyMode | None = None,
     ) -> ActionDecision:
-        """Evaluate with full metadata for domain/title/app checks.
-
-        Precedence:
-        1. Explicit app exclusion (bundle_id)
-        2. Domain mask rules
-        3. Title mask rules
-        4. Action matrix lookup
-        """
         mode = mode or self._config.mode
 
         # 1. Explicit app exclusion
