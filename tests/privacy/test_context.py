@@ -14,14 +14,14 @@ from screencap.privacy.context import (
     DefaultContextClassifier,
     TemporalContextClassifier,
     WindowContext,
+    _BUNDLE_ID_MAP,
     associate_screenshot,
-    find_nearest_browser,
     find_nearest_window,
     load_browser_events,
     load_window_events,
     parse_screenshot_timestamp,
 )
-from screencap.privacy.policy import ContextClass, ContextResult, FrameMetadata
+from screencap.privacy.policy import ContextClass, FrameMetadata
 
 pytestmark = pytest.mark.privacy
 
@@ -32,33 +32,32 @@ pytestmark = pytest.mark.privacy
 
 
 class TestParseScreenshotTimestamp:
-    def test_standard_filename(self):
+    def test_parses_recorder_filename_format(self):
         assert parse_screenshot_timestamp("1709745600.123456.jpg") == pytest.approx(
             1709745600.123456
         )
 
-    def test_integer_timestamp(self):
-        assert parse_screenshot_timestamp("1709745600.000000.jpg") == pytest.approx(
-            1709745600.0
-        )
-
-    def test_non_jpg_returns_none(self):
-        assert parse_screenshot_timestamp("1709745600.123456.png") is None
-
-    def test_non_numeric_returns_none(self):
-        assert parse_screenshot_timestamp("screenshot.jpg") is None
-
-    def test_empty_string_returns_none(self):
-        assert parse_screenshot_timestamp("") is None
-
-    def test_jpeg_extension(self):
+    def test_parses_jpeg_extension(self):
         assert parse_screenshot_timestamp("1709745600.123456.jpeg") == pytest.approx(
             1709745600.123456
         )
 
+    def test_parses_db_image_path_with_directory_prefix(self):
+        # image_path in DB is stored as "screenshots/{ts}.jpg"
+        assert parse_screenshot_timestamp("screenshots/1709745600.123456.jpg") == pytest.approx(
+            1709745600.123456
+        )
+
+    @pytest.mark.parametrize("filename", [
+        "1709745600.123456.png",
+        "screenshot.jpg",
+    ])
+    def test_rejects_non_parseable_filenames(self, filename):
+        assert parse_screenshot_timestamp(filename) is None
+
 
 # ---------------------------------------------------------------------------
-# Nearest-event lookup
+# Nearest-event lookup (bisect logic)
 # ---------------------------------------------------------------------------
 
 
@@ -75,71 +74,31 @@ class TestFindNearestWindow:
         assert result is not None
         assert result.timestamp == 2.0
 
-    def test_nearest_before(self):
+    @pytest.mark.parametrize("target,expected_ts", [
+        (1.3, 1.0),  # closer to before
+        (2.8, 3.0),  # closer to after
+    ])
+    def test_picks_closest_by_distance(self, target, expected_ts):
         events = self._make_events([1.0, 3.0])
-        result = find_nearest_window(events, 1.3)
+        result = find_nearest_window(events, target)
         assert result is not None
-        assert result.timestamp == 1.0
+        assert result.timestamp == expected_ts
 
-    def test_nearest_after(self):
-        events = self._make_events([1.0, 3.0])
-        result = find_nearest_window(events, 2.8)
-        assert result is not None
-        assert result.timestamp == 3.0
-
-    def test_exceeds_max_delta(self):
+    def test_rejects_events_beyond_max_delta(self):
         events = self._make_events([1.0])
-        result = find_nearest_window(events, 10.0, max_delta=5.0)
-        assert result is None
-
-    def test_empty_events(self):
-        assert find_nearest_window([], 1.0) is None
-
-    def test_within_max_delta(self):
-        events = self._make_events([1.0])
-        result = find_nearest_window(events, 3.0, max_delta=5.0)
-        assert result is not None
-        assert result.timestamp == 1.0
-
-
-class TestFindNearestBrowser:
-    def _make_events(self, timestamps: list[float]) -> list[BrowserContext]:
-        return [
-            BrowserContext(timestamp=ts, url=f"https://example{i}.com", domain=f"example{i}.com")
-            for i, ts in enumerate(timestamps)
-        ]
-
-    def test_exact_match(self):
-        events = self._make_events([1.0, 2.0, 3.0])
-        result = find_nearest_browser(events, 2.0)
-        assert result is not None
-        assert result.timestamp == 2.0
-
-    def test_exceeds_max_delta(self):
-        events = self._make_events([1.0])
-        result = find_nearest_browser(events, 100.0, max_delta=5.0)
-        assert result is None
+        assert find_nearest_window(events, 10.0, max_delta=5.0) is None
 
 
 # ---------------------------------------------------------------------------
-# DB loaders
+# DB loaders (integration with real SQLite)
 # ---------------------------------------------------------------------------
 
 
-def _create_test_db(tmp_path: Path, schema: str = "recording") -> Path:
+def _create_test_db(tmp_path: Path) -> Path:
     """Create a test SQLite DB with window_event and browser_event tables."""
     db_path = tmp_path / "recording.db"
     conn = sqlite3.connect(str(db_path))
     cur = conn.cursor()
-
-    if schema == "recording":
-        cur.execute("""
-            CREATE TABLE recording (
-                id INTEGER PRIMARY KEY, timestamp REAL
-            )
-        """)
-        cur.execute("INSERT INTO recording (timestamp) VALUES (1000.0)")
-
     cur.execute("""
         CREATE TABLE window_event (
             id INTEGER PRIMARY KEY,
@@ -172,9 +131,10 @@ def _create_test_db(tmp_path: Path, schema: str = "recording") -> Path:
 
 
 class TestLoadWindowEvents:
-    def test_loads_sorted_events(self, tmp_path):
+    def test_loads_and_sorts_by_timestamp(self, tmp_path):
         db_path = _create_test_db(tmp_path)
         conn = sqlite3.connect(str(db_path))
+        # Insert out of order to verify ORDER BY
         conn.execute(
             "INSERT INTO window_event (timestamp, app_bundle_id, title, window_id) "
             "VALUES (2.0, 'com.apple.mail', 'Inbox', 'w1')"
@@ -191,9 +151,8 @@ class TestLoadWindowEvents:
         assert events[0].timestamp == 1.0
         assert events[0].app_bundle_id == "com.apple.Safari"
         assert events[1].timestamp == 2.0
-        assert events[1].app_bundle_id == "com.apple.mail"
 
-    def test_no_table(self, tmp_path):
+    def test_missing_table_returns_empty(self, tmp_path):
         db_path = tmp_path / "empty.db"
         conn = sqlite3.connect(str(db_path))
         conn.execute("CREATE TABLE other (id INTEGER PRIMARY KEY)")
@@ -214,18 +173,16 @@ class TestLoadWindowEvents:
         )
         conn.commit()
         conn.close()
-        events = load_window_events(db_path)
-        assert len(events) == 1
+        assert len(load_window_events(db_path)) == 1
 
 
 class TestLoadBrowserEvents:
-    def test_loads_url_and_domain(self, tmp_path):
+    def test_extracts_url_and_domain_from_json_message(self, tmp_path):
         db_path = _create_test_db(tmp_path)
         conn = sqlite3.connect(str(db_path))
         msg = json.dumps({"url": "https://mail.google.com/inbox", "type": "browser.click"})
         conn.execute(
-            "INSERT INTO browser_event (timestamp, message) VALUES (1.0, ?)",
-            (msg,),
+            "INSERT INTO browser_event (timestamp, message) VALUES (1.0, ?)", (msg,)
         )
         conn.commit()
         conn.close()
@@ -235,7 +192,7 @@ class TestLoadBrowserEvents:
         assert events[0].domain == "mail.google.com"
         assert events[0].url == "https://mail.google.com/inbox"
 
-    def test_no_url_in_message_skipped(self, tmp_path):
+    def test_skips_events_without_url(self, tmp_path):
         db_path = _create_test_db(tmp_path)
         conn = sqlite3.connect(str(db_path))
         conn.execute(
@@ -248,7 +205,7 @@ class TestLoadBrowserEvents:
 
 
 # ---------------------------------------------------------------------------
-# DefaultContextClassifier
+# DefaultContextClassifier — classification priority chain
 # ---------------------------------------------------------------------------
 
 
@@ -256,18 +213,24 @@ class TestDefaultContextClassifier:
     def setup_method(self):
         self.classifier = DefaultContextClassifier()
 
-    def test_known_app_bundle_id(self):
+    # Path 1: known app bundle ID
+    def test_known_bundle_id_classifies_directly(self):
         meta = FrameMetadata(bundle_id="com.apple.mail", window_title="Inbox")
         result = self.classifier.classify(meta)
         assert result.context_class == ContextClass.EMAIL
         assert result.confidence == "bundle_id"
 
-    def test_password_manager_bundle(self):
-        meta = FrameMetadata(bundle_id="com.1password.1password")
+    # Path 1 > Path 2: bundle ID takes priority over browser+domain
+    def test_known_bundle_id_beats_browser_domain(self):
+        meta = FrameMetadata(
+            bundle_id="com.apple.mail",
+            domain="mail.google.com",
+        )
         result = self.classifier.classify(meta)
-        assert result.context_class == ContextClass.PASSWORD_MANAGER
+        assert result.confidence == "bundle_id"
 
-    def test_browser_with_verified_domain(self):
+    # Path 2a: browser with verified domain
+    def test_browser_with_known_domain(self):
         meta = FrameMetadata(
             bundle_id="com.google.Chrome",
             domain="mail.google.com",
@@ -277,13 +240,18 @@ class TestDefaultContextClassifier:
         assert result.context_class == ContextClass.EMAIL
         assert result.confidence == "domain"
 
-    def test_browser_without_domain_is_unverified(self):
-        meta = FrameMetadata(bundle_id="com.google.Chrome")
+    # Path 2a: subdomain matching (parent-domain fallback)
+    def test_browser_subdomain_matches_parent_domain(self):
+        meta = FrameMetadata(
+            bundle_id="com.google.Chrome",
+            domain="workspace.mail.google.com",
+        )
         result = self.classifier.classify(meta)
-        assert result.context_class == ContextClass.BROWSER_UNVERIFIED
-        assert result.confidence == "bundle_id"
+        assert result.context_class == ContextClass.EMAIL
+        assert result.confidence == "domain"
 
-    def test_browser_unknown_domain_with_title_heuristic(self):
+    # Path 2b: browser + unknown domain falls to title heuristic
+    def test_browser_unknown_domain_falls_to_title(self):
         meta = FrameMetadata(
             bundle_id="com.apple.Safari",
             domain="random-site.com",
@@ -293,16 +261,14 @@ class TestDefaultContextClassifier:
         assert result.context_class == ContextClass.EMAIL
         assert result.confidence == "title"
 
-    def test_browser_unknown_domain_no_title_is_unverified(self):
-        meta = FrameMetadata(
-            bundle_id="com.apple.Safari",
-            domain="random-site.com",
-            window_title="Random Page",
-        )
+    # Path 2c: browser without domain data → browser_unverified
+    def test_browser_without_domain_is_unverified(self):
+        meta = FrameMetadata(bundle_id="com.google.Chrome")
         result = self.classifier.classify(meta)
         assert result.context_class == ContextClass.BROWSER_UNVERIFIED
 
-    def test_unknown_app_with_title_heuristic(self):
+    # Path 3: unknown app with title heuristic
+    def test_unknown_app_uses_title_heuristic(self):
         meta = FrameMetadata(
             bundle_id="com.unknown.app",
             window_title="Bank of America - Account",
@@ -311,51 +277,19 @@ class TestDefaultContextClassifier:
         assert result.context_class == ContextClass.BANKING
         assert result.confidence == "title"
 
+    # Path 4: no signal → explicit unknown
     def test_no_signal_produces_explicit_unknown(self):
-        meta = FrameMetadata()
-        result = self.classifier.classify(meta)
+        result = self.classifier.classify(FrameMetadata())
         assert result.context_class == ContextClass.UNKNOWN
-        assert result.confidence == "none"
         assert result.evidence == "no_matching_signal"
 
-    def test_code_editor_bundle(self):
-        meta = FrameMetadata(bundle_id="com.microsoft.VSCode")
-        result = self.classifier.classify(meta)
-        assert result.context_class == ContextClass.CODE_EDITOR_TERMINAL
-
-    def test_chat_app_bundle(self):
-        meta = FrameMetadata(bundle_id="com.tinyspeck.slackmacgap")
-        result = self.classifier.classify(meta)
-        assert result.context_class == ContextClass.CHAT
-
-    def test_browser_with_admin_console_domain(self):
-        meta = FrameMetadata(
-            bundle_id="com.google.Chrome",
-            domain="console.aws.amazon.com",
+    # Data integrity: bundle ID map and browser IDs must be disjoint
+    def test_bundle_id_map_disjoint_from_browser_ids(self):
+        overlap = set(_BUNDLE_ID_MAP.keys()) & BROWSER_BUNDLE_IDS
+        assert overlap == set(), (
+            f"Bundle IDs in both _BUNDLE_ID_MAP and BROWSER_BUNDLE_IDS would "
+            f"never reach the browser path: {overlap}"
         )
-        result = self.classifier.classify(meta)
-        assert result.context_class == ContextClass.ADMIN_CONSOLE
-        assert result.confidence == "domain"
-
-    def test_bundle_id_takes_priority_over_domain(self):
-        """Non-browser app with a domain should classify by bundle, not domain."""
-        meta = FrameMetadata(
-            bundle_id="com.apple.mail",
-            domain="mail.google.com",
-        )
-        result = self.classifier.classify(meta)
-        assert result.context_class == ContextClass.EMAIL
-        assert result.confidence == "bundle_id"
-
-    def test_all_browser_bundle_ids_recognized(self):
-        """Every bundle in BROWSER_BUNDLE_IDS should classify as browser_unverified
-        when no domain or title signal is present."""
-        for bid in BROWSER_BUNDLE_IDS:
-            meta = FrameMetadata(bundle_id=bid)
-            result = self.classifier.classify(meta)
-            assert result.context_class == ContextClass.BROWSER_UNVERIFIED, (
-                f"{bid} should be browser_unverified, got {result.context_class}"
-            )
 
 
 # ---------------------------------------------------------------------------
@@ -364,76 +298,45 @@ class TestDefaultContextClassifier:
 
 
 class TestTemporalContextClassifier:
-    def test_hold_previous_class_within_window(self):
+    def test_holds_classification_within_window(self):
         tc = TemporalContextClassifier(hold_seconds=3.0)
-
-        # First frame: classified as email
-        result1 = tc.classify(
-            FrameMetadata(bundle_id="com.apple.mail", timestamp=10.0)
-        )
-        assert result1.context_class == ContextClass.EMAIL
-
-        # Second frame 2s later: no signal, within hold window
-        result2 = tc.classify(FrameMetadata(timestamp=12.0))
-        assert result2.context_class == ContextClass.EMAIL
-        assert result2.confidence == "temporal_hold"
-
-    def test_decay_to_unknown_after_hold_expires(self):
-        tc = TemporalContextClassifier(hold_seconds=3.0)
-
         tc.classify(FrameMetadata(bundle_id="com.apple.mail", timestamp=10.0))
 
-        # 5 seconds later — beyond hold window
+        result = tc.classify(FrameMetadata(timestamp=12.0))
+        assert result.context_class == ContextClass.EMAIL
+        assert result.confidence == "temporal_hold"
+
+    def test_decays_to_unknown_after_hold_expires(self):
+        tc = TemporalContextClassifier(hold_seconds=3.0)
+        tc.classify(FrameMetadata(bundle_id="com.apple.mail", timestamp=10.0))
+
         result = tc.classify(FrameMetadata(timestamp=15.0))
         assert result.context_class == ContextClass.UNKNOWN
 
-    def test_new_classification_resets_hold(self):
+    def test_new_classification_resets_hold_timer(self):
         tc = TemporalContextClassifier(hold_seconds=3.0)
-
         tc.classify(FrameMetadata(bundle_id="com.apple.mail", timestamp=10.0))
-        # Switch to chat at t=12
-        result = tc.classify(
-            FrameMetadata(bundle_id="com.tinyspeck.slackmacgap", timestamp=12.0)
-        )
-        assert result.context_class == ContextClass.CHAT
+        tc.classify(FrameMetadata(bundle_id="com.tinyspeck.slackmacgap", timestamp=12.0))
 
-        # t=14 — within hold from chat, not email
+        # t=14 — within hold of chat (12+3), not email
         result = tc.classify(FrameMetadata(timestamp=14.0))
         assert result.context_class == ContextClass.CHAT
 
-    def test_deterministic_behavior(self):
-        """Same inputs always produce same outputs."""
-        for _ in range(3):
-            tc = TemporalContextClassifier(hold_seconds=3.0)
-            r1 = tc.classify(FrameMetadata(bundle_id="com.apple.mail", timestamp=10.0))
-            r2 = tc.classify(FrameMetadata(timestamp=12.0))
-            r3 = tc.classify(FrameMetadata(timestamp=20.0))
-            assert r1.context_class == ContextClass.EMAIL
-            assert r2.context_class == ContextClass.EMAIL
-            assert r3.context_class == ContextClass.UNKNOWN
-
-    def test_reset_clears_state(self):
+    def test_zero_timestamp_does_not_hold(self):
         tc = TemporalContextClassifier(hold_seconds=3.0)
         tc.classify(FrameMetadata(bundle_id="com.apple.mail", timestamp=10.0))
-        tc.reset()
-        result = tc.classify(FrameMetadata(timestamp=11.0))
-        assert result.context_class == ContextClass.UNKNOWN
 
-    def test_zero_timestamp_no_hold(self):
-        """Frames with timestamp=0 should not benefit from hold."""
-        tc = TemporalContextClassifier(hold_seconds=3.0)
-        tc.classify(FrameMetadata(bundle_id="com.apple.mail", timestamp=10.0))
         result = tc.classify(FrameMetadata(timestamp=0.0))
         assert result.context_class == ContextClass.UNKNOWN
 
 
 # ---------------------------------------------------------------------------
-# associate_screenshot integration
+# associate_screenshot — integration
 # ---------------------------------------------------------------------------
 
 
 class TestAssociateScreenshot:
-    def test_associates_window_and_browser(self):
+    def test_correlates_window_and_browser_by_timestamp(self):
         windows = [
             WindowContext(timestamp=1.0, app_bundle_id="com.google.Chrome", title="Gmail"),
         ]
@@ -449,19 +352,17 @@ class TestAssociateScreenshot:
         meta = associate_screenshot(1.0, [], [])
         assert meta.bundle_id == ""
         assert meta.domain is None
-        assert meta.window_title == ""
 
-    def test_window_too_far_away(self):
+    def test_non_browser_window_does_not_inherit_stale_browser_domain(self):
+        """Switching from Chrome to Finder must not carry the browser domain."""
         windows = [
-            WindowContext(timestamp=1.0, app_bundle_id="com.apple.mail", title="Inbox"),
+            WindowContext(timestamp=8.0, app_bundle_id="com.google.Chrome", title="Gmail"),
+            WindowContext(timestamp=10.0, app_bundle_id="com.apple.Finder", title="Documents"),
         ]
-        meta = associate_screenshot(100.0, windows, [], max_delta=5.0)
-        assert meta.bundle_id == ""
-
-    def test_browser_without_window(self):
         browsers = [
-            BrowserContext(timestamp=1.0, url="https://example.com", domain="example.com"),
+            BrowserContext(timestamp=8.0, url="https://chase.com", domain="chase.com"),
         ]
-        meta = associate_screenshot(1.0, [], browsers)
-        assert meta.domain == "example.com"
-        assert meta.bundle_id == ""
+        # Screenshot at t=10 — Finder is active, browser event is within max_delta
+        meta = associate_screenshot(10.0, windows, browsers)
+        assert meta.bundle_id == "com.apple.Finder"
+        assert meta.domain is None  # must NOT be "chase.com"

@@ -30,17 +30,18 @@ from screencap.privacy.policy import ContextClass, ContextResult, FrameMetadata
 
 
 def parse_screenshot_timestamp(filename: str) -> float | None:
-    """Extract Unix timestamp from a screenshot filename.
+    """Extract Unix timestamp from a screenshot filename or path.
 
-    Filenames are ``{timestamp:.6f}.jpg`` (e.g. ``1709745600.123456.jpg``).
-    Returns None if the filename doesn't match the expected format.
+    Handles both bare filenames (``1709745600.123456.jpg``) and DB
+    image_path values with a directory prefix (``screenshots/1709745600.123456.jpg``).
+    Returns None if the name doesn't match the expected format.
     """
-    stem = filename.rsplit(".", 1)[0] if "." in filename else filename
-    # Strip .jpg/.jpeg extension — but the stem itself contains a dot
-    # (the decimal point), so we need to be careful.
-    # Format: "1709745600.123456.jpg" → stem after removing last ".jpg" = "1709745600.123456"
-    if filename.endswith(".jpg") or filename.endswith(".jpeg"):
-        stem = filename[: filename.rfind(".jpg")] if filename.endswith(".jpg") else filename[: filename.rfind(".jpeg")]
+    # Strip directory prefix — image_path in the DB is "screenshots/{ts}.jpg"
+    basename = filename.rsplit("/", 1)[-1] if "/" in filename else filename
+    if basename.endswith(".jpg"):
+        stem = basename[: basename.rfind(".jpg")]
+    elif basename.endswith(".jpeg"):
+        stem = basename[: basename.rfind(".jpeg")]
     else:
         return None
     try:
@@ -517,6 +518,11 @@ def associate_screenshot(
 ) -> FrameMetadata:
     """Build FrameMetadata for a screenshot by correlating to nearest events.
 
+    Browser domain is only attached when the contemporaneous window is a
+    known browser. This prevents stale browser domains from leaking into
+    non-browser frames (e.g. after switching from Chrome to Finder), which
+    would cause the policy evaluator's mask_domains check to misfire.
+
     Args:
         screenshot_ts: Unix timestamp of the screenshot.
         window_events: Pre-loaded, sorted window events.
@@ -527,11 +533,17 @@ def associate_screenshot(
         FrameMetadata populated with best-available context.
     """
     window = find_nearest_window(window_events, screenshot_ts, max_delta)
-    browser = find_nearest_browser(browser_events, screenshot_ts, max_delta)
+
+    # Only look up browser domain when the window is a known browser.
+    domain: str | None = None
+    bundle_id = window.app_bundle_id if window else ""
+    if bundle_id in BROWSER_BUNDLE_IDS:
+        browser = find_nearest_browser(browser_events, screenshot_ts, max_delta)
+        domain = browser.domain if browser else None
 
     return FrameMetadata(
-        bundle_id=window.app_bundle_id if window else "",
+        bundle_id=bundle_id,
         window_title=window.title if window else "",
-        domain=browser.domain if browser else None,
+        domain=domain,
         timestamp=screenshot_ts,
     )
