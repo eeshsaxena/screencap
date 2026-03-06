@@ -46,10 +46,14 @@ def cli(ctx, no_update_check):
 @click.option("--local-only", is_flag=True, default=False, help="Restrict LLM naming to local providers (Ollama).")
 @click.option("--force", is_flag=True, default=False, help="Auto-clean orphaned processes before starting.")
 @click.option("--verbose", "-v", is_flag=True, default=False, help="Show all info/debug output during recording.")
+@click.option("--chunk-duration", type=float, default=None,
+              help="Auto-cut recording at this interval (seconds). Default: 3600 (1 hour). Set 0 to disable chunking.")
+@click.option("--no-live-upload", is_flag=True, default=False,
+              help="Disable background upload of chunks during recording.")
 def start(
     name, description, no_audio, no_video, no_images, no_window_data,
     no_browser_events, output, no_wifi_metrics, no_app_versions,
-    no_auto_name, local_only, force, verbose,
+    no_auto_name, local_only, force, verbose, chunk_duration, no_live_upload,
 ):
     """Record a screen capture session. Ctrl+C to stop."""
     from datetime import datetime
@@ -97,6 +101,8 @@ def start(
             capture_video=capture_video, capture_images=capture_images,
             capture_window_data=capture_window_data, capture_browser_events=capture_browser_events,
             verbose=verbose,
+            chunk_duration=chunk_duration,
+            live_upload=not no_live_upload,
         )
     except DiskFullError as e:
         capture_dir, elapsed = e.capture_dir, e.elapsed
@@ -123,8 +129,10 @@ def start(
 
     if auto_name_enabled and not disk_full:
         # Auto-transcribe if audio was captured
+        # In chunked mode, per-chunk transcription is handled by ChunkProcessor
+        has_chunk_transcripts = any(capture_dir.glob("transcript_*.txt"))
         audio_path = capture_dir / "audio.flac"
-        if audio and audio_path.exists() and audio_path.stat().st_size >= 1024:
+        if audio and not has_chunk_transcripts and audio_path.exists() and audio_path.stat().st_size >= 1024:
             try:
                 _auto_transcribe(capture_dir, audio_path)
             except KeyboardInterrupt:
@@ -860,7 +868,9 @@ def _run_api_transcription(api_key, audio_path, transcript_path, transcript_json
 @click.option("--force", is_flag=True, help="Re-upload even if already uploaded.")
 @click.option("--jobs", "-j", type=click.IntRange(min=1), default=4,
               help="Parallel file transfers per recording (default: 4).")
-def upload(names, all_recordings, dry_run, force, jobs):
+@click.option("--no-delete", is_flag=True, default=False,
+              help="Keep local recording files after upload instead of auto-deleting.")
+def upload(names, all_recordings, dry_run, force, jobs, no_delete):
     """Upload recordings to cloud storage."""
     from screencap.upload import resolve_recording_dirs, upload_recording, _fmt_size
 
@@ -893,9 +903,11 @@ def upload(names, all_recordings, dry_run, force, jobs):
             console.print(f"\n[bold][{i}/{total_count}][/bold] {d.name}")
 
         # Auto-export events.jsonl if missing (or --force)
+        # Skip if per-chunk JSONL already exists (chunked mode)
         if not dry_run:
+            has_chunk_events = any(d.glob("events_*.jsonl"))
             jsonl_path = d / "events.jsonl"
-            if not jsonl_path.exists() or force:
+            if not has_chunk_events and (not jsonl_path.exists() or force):
                 with console.status("[dim]Exporting events...[/dim]"):
                     try:
                         from screencap.exporter import export_recording, build_export_metadata
@@ -1132,6 +1144,32 @@ def scrub(name: str, pii_engine: str | None) -> None:
     except ValueError as e:
         console.print(f"[red]Error:[/red] {e}")
         raise SystemExit(1)
+
+
+@cli.command()
+def settings():
+    """Show current ScreenCap configuration."""
+    from screencap.config import (
+        get_audio_default,
+        get_auto_delete_after_upload,
+        get_auto_name,
+        get_chunk_duration,
+        get_recordings_dir,
+        get_rest_threshold,
+    )
+
+    chunk = get_chunk_duration()
+    chunk_str = f"{chunk:.0f}s ({chunk / 3600:.1f} hour)" if chunk > 0 else "disabled (legacy single-file)"
+    rest = get_rest_threshold()
+
+    console.print("\n[bold]ScreenCap Configuration[/bold]\n")
+    console.print(f"  Chunk duration:           {chunk_str}")
+    console.print(f"  Auto-delete after upload: {'enabled' if get_auto_delete_after_upload() else 'disabled'}")
+    console.print(f"  Rest threshold:           {rest:.0f}s ({rest / 60:.0f} min)")
+    console.print(f"  Recordings dir:           {get_recordings_dir()}")
+    console.print(f"  Audio default:            {'enabled' if get_audio_default() else 'disabled'}")
+    console.print(f"  Auto-name:                {'enabled' if get_auto_name() else 'disabled'}")
+    console.print()
 
 
 if __name__ == "__main__":
