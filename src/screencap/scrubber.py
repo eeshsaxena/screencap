@@ -152,14 +152,16 @@ def _scrub_screenshots_with_policy(
 ) -> None:
     """Route screenshot files by policy/context.
 
-    EXCLUDE or MASK_WINDOW → delete file (fail-safe; structural masking
-    is deferred to a later phase).
+    EXCLUDE → delete file.
+    MASK_WINDOW → apply full-window structural mask (phase 4).
+    MASK_REGION → apply pane-level structural mask.
     OCR_FALLBACK / TEXT_REDACT / ALLOW → keep file.
     """
     from screencap.privacy.context import (
         associate_screenshot,
         parse_screenshot_timestamp,
     )
+    from screencap.privacy.masking import MaskStrategy, mask_screenshot
 
     screenshots_dir = dst / "screenshots"
     if not screenshots_dir.is_dir():
@@ -185,8 +187,44 @@ def _scrub_screenshots_with_policy(
             )
         )
 
-        if decision.action in (PrivacyAction.EXCLUDE, PrivacyAction.MASK_WINDOW):
+        if decision.action == PrivacyAction.EXCLUDE:
             img_path.unlink()
+        elif decision.action == PrivacyAction.MASK_WINDOW:
+            try:
+                mask_screenshot(
+                    img_path,
+                    ctx.context_class,
+                    strategy=MaskStrategy.FULL_WINDOW,
+                    app_hint=meta.bundle_id,
+                )
+            except Exception as exc:
+                console.print(
+                    f"  [yellow]Warning: masking failed for {img_path.name} "
+                    f"({exc}) — deleting for safety[/]"
+                )
+                img_path.unlink()
+        elif decision.action == PrivacyAction.MASK_REGION:
+            try:
+                mask_screenshot(
+                    img_path,
+                    ctx.context_class,
+                    strategy=MaskStrategy.PANE,
+                    app_hint=meta.bundle_id,
+                )
+            except Exception as exc:
+                console.print(
+                    f"  [yellow]Warning: region masking failed for {img_path.name} "
+                    f"({exc}) — applying full-window mask[/]"
+                )
+                try:
+                    mask_screenshot(
+                        img_path,
+                        ctx.context_class,
+                        strategy=MaskStrategy.FULL_WINDOW,
+                        app_hint=meta.bundle_id,
+                    )
+                except Exception:
+                    img_path.unlink()
 
 
 # ---------------------------------------------------------------------------
