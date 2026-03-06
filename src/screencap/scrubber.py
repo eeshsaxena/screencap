@@ -195,19 +195,23 @@ def _scrub_screenshots_with_policy(
 
 
 def _null_event_content(event: dict) -> None:
-    """Null out sensitive content fields in an event dict in-place."""
+    """Null out sensitive content fields in an event dict in-place (recursive).
+
+    Handles nested structures like key.type inside mouse.drag.children.
+    """
     if "text" in event:
         event["text"] = None
+    if event.get("key_char"):
+        event["key_char"] = None
+        event["canonical_key_char"] = None
     for child in event.get("children", []):
-        if child.get("key_char"):
-            child["key_char"] = None
-            child["canonical_key_char"] = None
+        _null_event_content(child)
 
 
 def _null_db_rows_for_intervals(
     dst: Path, intervals: list[_BlockedInterval], result: ScrubResult
 ) -> None:
-    """Null out action_event columns during blocked-app intervals."""
+    """Null out action_event and window_event columns during blocked-app intervals."""
     if not intervals:
         return
     db_path = find_db(dst)
@@ -222,20 +226,29 @@ def _null_db_rows_for_intervals(
                 "SELECT name FROM sqlite_master WHERE type='table'"
             ).fetchall()
         }
-        if "action_event" not in tables:
-            return
 
         for iv in intervals:
             end_clause = "" if iv.end == float("inf") else f" AND timestamp < {iv.end}"
-            conn.execute(
-                f"UPDATE action_event SET "
-                f"key_char = NULL, canonical_key_char = NULL, "
-                f"element_state = NULL, "
-                f"active_segment_description = NULL, "
-                f"available_segment_descriptions = NULL "
-                f"WHERE timestamp >= ?{end_clause}",
-                (iv.start,),
-            )
+
+            if "action_event" in tables:
+                conn.execute(
+                    f"UPDATE action_event SET "
+                    f"key_char = NULL, canonical_key_char = NULL, "
+                    f"element_state = NULL, "
+                    f"active_segment_description = NULL, "
+                    f"available_segment_descriptions = NULL "
+                    f"WHERE timestamp >= ?{end_clause}",
+                    (iv.start,),
+                )
+
+            if "window_event" in tables:
+                conn.execute(
+                    f"UPDATE window_event SET "
+                    f"title = NULL, state = NULL "
+                    f"WHERE timestamp >= ?{end_clause}",
+                    (iv.start,),
+                )
+
             result.audit_entries.append(
                 AuditEntry(
                     timestamp=iv.start,

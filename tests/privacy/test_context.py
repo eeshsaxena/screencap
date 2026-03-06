@@ -75,14 +75,19 @@ class TestFindNearestWindow:
         assert result.timestamp == 2.0
 
     @pytest.mark.parametrize("target,expected_ts", [
-        (1.3, 1.0),  # closer to before
-        (2.8, 3.0),  # closer to after
+        (1.3, 1.0),  # after first event, before second
+        (2.8, 1.0),  # still before second event — latest-at-or-before is first
+        (3.5, 3.0),  # after second event — latest-at-or-before is second
     ])
-    def test_picks_closest_by_distance(self, target, expected_ts):
+    def test_picks_latest_at_or_before(self, target, expected_ts):
         events = self._make_events([1.0, 3.0])
         result = find_nearest_window(events, target)
         assert result is not None
         assert result.timestamp == expected_ts
+
+    def test_rejects_target_before_all_events(self):
+        events = self._make_events([5.0, 10.0])
+        assert find_nearest_window(events, 1.0) is None
 
     def test_rejects_events_beyond_max_delta(self):
         events = self._make_events([1.0])
@@ -341,12 +346,12 @@ class TestAssociateScreenshot:
             WindowContext(timestamp=1.0, app_bundle_id="com.google.Chrome", title="Gmail"),
         ]
         browsers = [
-            BrowserContext(timestamp=1.1, url="https://mail.google.com", domain="mail.google.com"),
+            BrowserContext(timestamp=1.0, url="https://mail.google.com", domain="mail.google.com"),
         ]
-        meta = associate_screenshot(1.05, windows, browsers)
+        meta = associate_screenshot(1.5, windows, browsers)
         assert meta.bundle_id == "com.google.Chrome"
         assert meta.domain == "mail.google.com"
-        assert meta.timestamp == 1.05
+        assert meta.timestamp == 1.5
 
     def test_no_events_returns_empty_metadata(self):
         meta = associate_screenshot(1.0, [], [])

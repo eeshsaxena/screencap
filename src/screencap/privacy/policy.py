@@ -184,6 +184,13 @@ def parse_privacy_config(toml_dict: dict) -> PrivacyConfig:
             f"Invalid privacy.mode={mode_str!r}. Must be one of: {valid}"
         )
 
+    if mode == PrivacyMode.SHARED:
+        raise InvalidPrivacyConfigError(
+            "privacy.mode='shared' is not yet enforced (MASK_REGION is not "
+            "implemented). Use 'public' or 'internal' until region masking "
+            "is available."
+        )
+
     # exclude_apps
     raw_apps = section.get("exclude_apps", [])
     if not isinstance(raw_apps, list):

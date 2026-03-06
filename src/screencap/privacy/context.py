@@ -91,16 +91,36 @@ def _nearest_index(timestamps: list[float], target: float) -> int | None:
     return pos if (after - target) <= (target - before) else pos - 1
 
 
+def _active_at_index(timestamps: list[float], target: float) -> int | None:
+    """Return index of the latest timestamp at or before target.
+
+    Window/browser events represent state transitions, so the active
+    state at any time T is the most recent event with timestamp <= T.
+    Returns None if no event is at or before target.
+    """
+    if not timestamps:
+        return None
+    pos = bisect.bisect_right(timestamps, target)
+    if pos == 0:
+        return None
+    return pos - 1
+
+
 def find_nearest_window(
     window_events: list[WindowContext],
     target_ts: float,
     max_delta: float = 5.0,
 ) -> WindowContext | None:
-    """Find the window_event closest to target_ts within max_delta seconds."""
+    """Find the window_event active at target_ts within max_delta seconds.
+
+    Uses "latest at or before" semantics since window events represent
+    state transitions — the active window at time T is the most recent
+    event with timestamp <= T.
+    """
     if not window_events:
         return None
     timestamps = [w.timestamp for w in window_events]
-    idx = _nearest_index(timestamps, target_ts)
+    idx = _active_at_index(timestamps, target_ts)
     if idx is None:
         return None
     if abs(window_events[idx].timestamp - target_ts) > max_delta:
@@ -113,11 +133,15 @@ def find_nearest_browser(
     target_ts: float,
     max_delta: float = 5.0,
 ) -> BrowserContext | None:
-    """Find the browser_event closest to target_ts within max_delta seconds."""
+    """Find the browser_event active at target_ts within max_delta seconds.
+
+    Uses "latest at or before" semantics since browser events represent
+    state transitions.
+    """
     if not browser_events:
         return None
     timestamps = [b.timestamp for b in browser_events]
-    idx = _nearest_index(timestamps, target_ts)
+    idx = _active_at_index(timestamps, target_ts)
     if idx is None:
         return None
     if abs(browser_events[idx].timestamp - target_ts) > max_delta:
@@ -516,7 +540,11 @@ def associate_screenshot(
     browser_events: list[BrowserContext],
     max_delta: float = 5.0,
 ) -> FrameMetadata:
-    """Build FrameMetadata for a screenshot by correlating to nearest events.
+    """Build FrameMetadata for a screenshot by finding the active context.
+
+    Uses "latest at or before" semantics: window/browser events are state
+    transitions, so the active state at time T is the most recent event
+    with timestamp <= T.
 
     Browser domain is only attached when the contemporaneous window is a
     known browser. This prevents stale browser domains from leaking into

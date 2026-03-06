@@ -419,6 +419,132 @@ class TestAuditOutput:
 
 
 # ---------------------------------------------------------------------------
+# Shared mode rejection
+# ---------------------------------------------------------------------------
+
+
+class TestSharedModeRejected:
+    def test_shared_mode_raises_config_error(self):
+        """shared mode is not yet enforced — config must reject it."""
+        from screencap.privacy.policy import InvalidPrivacyConfigError
+
+        with pytest.raises(InvalidPrivacyConfigError, match="shared.*not yet enforced"):
+            parse_privacy_config({"privacy": {"mode": "shared"}})
+
+
+# ---------------------------------------------------------------------------
+# Window event title nulling during blocked intervals
+# ---------------------------------------------------------------------------
+
+
+class TestWindowEventTitleNulling:
+    def test_window_event_title_nulled_in_blocked_interval(self, tmp_path):
+        """window_event.title must be nulled during blocked-app intervals."""
+        rec = tmp_path / "scrubbed"
+        rec.mkdir()
+        db_path = rec / "recording.db"
+        conn = sqlite3.connect(str(db_path))
+        conn.execute(
+            "CREATE TABLE recording (id INTEGER PRIMARY KEY, task_description TEXT)"
+        )
+        conn.execute("INSERT INTO recording VALUES (1, 'test')")
+        conn.execute(
+            """CREATE TABLE window_event (
+            id INTEGER PRIMARY KEY, recording_id INTEGER,
+            timestamp REAL, title TEXT, state TEXT
+        )"""
+        )
+        conn.execute(
+            "INSERT INTO window_event VALUES (1, 1, 15.0, 'VSCode', NULL)"
+        )
+        conn.execute(
+            "INSERT INTO window_event VALUES (2, 1, 25.0, 'Inbox - john@example.com', '{\"focused\": true}')"
+        )
+        conn.execute(
+            "INSERT INTO window_event VALUES (3, 1, 35.0, 'Finder', NULL)"
+        )
+        conn.commit()
+        conn.close()
+
+        intervals = [
+            _BlockedInterval(
+                start=20.0,
+                end=30.0,
+                action=PrivacyAction.MASK_WINDOW,
+                reason="context_email_surface",
+            )
+        ]
+        result = ScrubResult()
+        _null_db_rows_for_intervals(rec, intervals, result)
+
+        conn = sqlite3.connect(str(db_path))
+        cur = conn.cursor()
+        # Inside interval → nulled
+        cur.execute("SELECT title, state FROM window_event WHERE id = 2")
+        row = cur.fetchone()
+        assert row[0] is None
+        assert row[1] is None
+        # Outside interval → preserved
+        cur.execute("SELECT title FROM window_event WHERE id = 1")
+        assert cur.fetchone()[0] == "VSCode"
+        conn.close()
+
+
+# ---------------------------------------------------------------------------
+# Nested event content nulling
+# ---------------------------------------------------------------------------
+
+
+class TestNestedEventNulling:
+    def test_key_type_inside_mouse_drag_is_nulled(
+        self, tmp_path, pipeline_and_anonymizer
+    ):
+        """key.type nested inside mouse.drag children must also be nulled."""
+        pipeline, anonymizer = pipeline_and_anonymizer
+        nested_key_type = {
+            "timestamp": 25.0,
+            "type": "key.type",
+            "text": "secret-password",
+            "children": [
+                {"type": "key.down", "key_char": "s", "canonical_key_char": "s"},
+                {"type": "key.up", "key_char": "s", "canonical_key_char": "s"},
+            ],
+        }
+        drag_event = {
+            "timestamp": 25.0,
+            "type": "mouse.drag",
+            "children": [nested_key_type],
+        }
+        rec = tmp_path / "scrubbed"
+        rec.mkdir()
+        lines = [
+            json.dumps({"_meta": True, "screencap_version": "0.1.0"}),
+            json.dumps(drag_event),
+        ]
+        (rec / "events.jsonl").write_text("\n".join(lines) + "\n")
+
+        intervals = [
+            _BlockedInterval(
+                start=20.0,
+                end=30.0,
+                action=PrivacyAction.EXCLUDE,
+                reason="policy_excluded_app",
+            )
+        ]
+        result = ScrubResult()
+        _scrub_events_jsonl(rec, pipeline, anonymizer, result, intervals)
+
+        output = [
+            json.loads(l)
+            for l in (rec / "events.jsonl").read_text().strip().splitlines()
+        ]
+        drag = output[1]
+        nested = drag["children"][0]
+        assert nested["text"] is None
+        assert nested["children"][0]["key_char"] is None
+
+
+# ---------------------------------------------------------------------------
 # Fixtures
 # ---------------------------------------------------------------------------
 
