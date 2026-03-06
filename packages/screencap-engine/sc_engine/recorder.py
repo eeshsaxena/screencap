@@ -206,6 +206,7 @@ def process_events(
     num_window_events: multiprocessing.Value,
     num_browser_events: multiprocessing.Value,
     num_video_events: multiprocessing.Value,
+    screen_filter: Any | None = None,
 ) -> None:
     """Process events from the event queue and write them to write queues.
 
@@ -285,20 +286,30 @@ def process_events(
         if event.type == "screen":
             prev_screen_event = event
             if config.RECORD_FULL_VIDEO:
-                video_event = event._replace(type="screen/video")
-                if process_event(
-                    video_event,
-                    video_write_q,
-                    write_video_event,
-                    recording,
-                    perf_q,
-                    terminate_processing,
-                ):
-                    num_video_events.value += 1
+                # Privacy filter: skip full-video frames for blocked apps
+                if screen_filter is not None and not screen_filter.is_screen_allowed(event.timestamp):
+                    _drops["privacy_full_video"] = _drops.get("privacy_full_video", 0) + 1
                 else:
-                    _drops["full_video"] += 1
+                    video_event = event._replace(type="screen/video")
+                    if process_event(
+                        video_event,
+                        video_write_q,
+                        write_video_event,
+                        recording,
+                        perf_q,
+                        terminate_processing,
+                    ):
+                        num_video_events.value += 1
+                    else:
+                        _drops["full_video"] += 1
         elif event.type == "window":
             prev_window_event = event
+            # Notify privacy filter of window change
+            if screen_filter is not None:
+                try:
+                    screen_filter.on_window_event(event.data)
+                except Exception:
+                    pass  # filter errors must not break recording
         elif event.type == "browser":
             if config.RECORD_BROWSER_EVENTS:
                 if process_event(
@@ -383,6 +394,12 @@ def process_events(
             # Screenshot dedup gate
             should_save_screen = prev_saved_screen_timestamp < prev_screen_event.timestamp
             current_hash: int | None = None
+
+            # Privacy filter: suppress screenshot for blocked apps
+            if should_save_screen and screen_filter is not None:
+                if not screen_filter.is_screen_allowed(prev_screen_event.timestamp):
+                    should_save_screen = False
+                    _drops["privacy_screen"] = _drops.get("privacy_screen", 0) + 1
 
             if should_save_screen and config.SCREENSHOT_DEDUP:
                 if prev_saved_screen_hash is None:
@@ -2114,6 +2131,7 @@ def record(
     flush_ack_counter=None,
     audio_rotate_q=None,
     audio_ack_q=None,
+    screen_filter: Any | None = None,
 ) -> None:
     """Record Screenshots/ActionEvents/WindowEvents/BrowserEvents.
 
@@ -2304,6 +2322,7 @@ def record(
             num_window_events,
             num_browser_events,
             num_video_events,
+            screen_filter,
         ),
     )
     event_processor.start()
@@ -2759,6 +2778,7 @@ class Recorder:
         ax_element_timeout: float | None = None,
         send_profile: bool = False,
         video_chunk_duration: float | None = None,
+        screen_filter: Any | None = None,
     ) -> None:
         from pathlib import Path
 
@@ -2767,6 +2787,7 @@ class Recorder:
         self.capture_dir = str(Path(capture_dir).resolve())
         self.task_description = task_description
         self._send_profile = send_profile
+        self._screen_filter = screen_filter
 
         # Build recording config from constructor params
         self._recording_config = RecordingConfig(
@@ -2854,6 +2875,7 @@ class Recorder:
                 flush_ack_counter=self._flush_ack_counter,
                 audio_rotate_q=self._audio_rotate_q,
                 audio_ack_q=self._audio_ack_q,
+                screen_filter=self._screen_filter,
             )
 
     def _chunk_fanout(self) -> None:

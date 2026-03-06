@@ -497,6 +497,22 @@ def start_recording(
         )
         raise SystemExit(1)
 
+    # --- Privacy: capture-time enforcement ---
+    screen_filter = None
+    try:
+        from screencap.config import get_privacy_config
+        from screencap.privacy.recorder_enforcement import RecorderPrivacyFilter
+
+        privacy_config = get_privacy_config()
+        screen_filter = RecorderPrivacyFilter(privacy_config)
+        if verbose:
+            console.print(f"[dim]Privacy mode: {privacy_config.mode.value}[/dim]")
+    except Exception as e:
+        if verbose:
+            console.print(
+                f"[yellow]Warning:[/yellow] Privacy enforcement disabled: {e}"
+            )
+
     try:
         from screencap.metrics import save_metrics
 
@@ -551,6 +567,7 @@ def start_recording(
         with Recorder(
             str(capture_dir),
             **recorder_kwargs,
+            screen_filter=screen_filter,
         ) as recorder:
             recorder.wait_for_ready(timeout=30)
             status.stop()
