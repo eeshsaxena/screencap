@@ -92,11 +92,11 @@ def _resolve_dest_dir(dest: str | None) -> Path:
     return p
 
 
-def list_remote_recordings() -> list[RemoteRecording]:
-    """Fetch list of available recordings from the Cloud Function."""
+def list_remote_recordings(source: str = "recordings") -> list[RemoteRecording]:
+    """Fetch list of available recordings (or sessions) from the Cloud Function."""
     url = _get_download_url()
     try:
-        resp = requests.post(url, json={"action": "list"}, timeout=60)
+        resp = requests.post(url, json={"action": "list", "source": source}, timeout=60)
     except requests.ConnectionError:
         raise RuntimeError(
             "Download service unavailable. Check your internet connection."
@@ -123,8 +123,10 @@ def list_remote_recordings() -> list[RemoteRecording]:
     ]
 
 
-def request_signed_urls(recording_name: str) -> tuple[dict[str, str], str]:
-    """Request signed download URLs for a recording.
+def request_signed_urls(
+    recording_name: str, source: str = "recordings",
+) -> tuple[dict[str, str], str]:
+    """Request signed download URLs for a recording (or session).
 
     Returns (urls_dict, gcs_prefix) where urls_dict maps filename -> signed URL.
     """
@@ -132,7 +134,11 @@ def request_signed_urls(recording_name: str) -> tuple[dict[str, str], str]:
     try:
         resp = requests.post(
             url,
-            json={"action": "sign-download", "recording": recording_name},
+            json={
+                "action": "sign-download",
+                "recording": recording_name,
+                "source": source,
+            },
             timeout=60,
         )
     except requests.ConnectionError:
@@ -191,8 +197,9 @@ def download_recording(
     dry_run: bool = False,
     force: bool = False,
     jobs: int = 4,
+    source: str = "recordings",
 ) -> DownloadResult:
-    """Download all files for a single recording.
+    """Download all files for a single recording (or session).
 
     1. Check marker (skip if already downloaded, unless force)
     2. Request signed URLs
@@ -209,7 +216,7 @@ def download_recording(
         return result
 
     # Get signed URLs (just before download to avoid expiry)
-    urls, gcs_prefix = request_signed_urls(name)
+    urls, gcs_prefix = request_signed_urls(name, source=source)
     result.gcs_prefix = gcs_prefix
 
     if not urls:

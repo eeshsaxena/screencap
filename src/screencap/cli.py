@@ -961,7 +961,8 @@ def upload(names, all_recordings, dry_run, force, jobs, no_delete):
 @click.option("--force", is_flag=True, help="Re-download all recordings, ignoring markers.")
 @click.option("--jobs", "-j", type=click.IntRange(min=1), default=4,
               help="Parallel file transfers per recording (default: 4).")
-def download(dest, dry_run, force, jobs):
+@click.option("--sessions", is_flag=True, help="Download processed sessions instead of raw recordings.")
+def download(dest, dry_run, force, jobs, sessions):
     """Download recordings from cloud storage."""
     from screencap.download import (
         _fmt_size,
@@ -970,24 +971,36 @@ def download(dest, dry_run, force, jobs):
         list_remote_recordings,
     )
 
-    try:
-        dest_dir = _resolve_dest_dir(dest)
-    except RuntimeError as e:
-        console.print(f"[red]Error:[/red] {e}")
-        sys.exit(1)
+    source = "sessions" if sessions else "recordings"
+
+    if sessions and not dest:
+        from screencap.config import get_sessions_dir
+        try:
+            dest_dir = get_sessions_dir()
+        except OSError as e:
+            console.print(f"[red]Error:[/red] Cannot create sessions directory: {e}")
+            sys.exit(1)
+    else:
+        try:
+            dest_dir = _resolve_dest_dir(dest)
+        except RuntimeError as e:
+            console.print(f"[red]Error:[/red] {e}")
+            sys.exit(1)
 
     try:
-        remote = list_remote_recordings()
+        remote = list_remote_recordings(source=source)
     except RuntimeError as e:
         console.print(f"[red]Error:[/red] {e}")
         sys.exit(1)
 
     if not remote:
-        console.print("No recordings available for download.")
+        label = "sessions" if sessions else "recordings"
+        console.print(f"No {label} available for download.")
         return
 
+    label = "session" if sessions else "recording"
     console.print(
-        f"Found [bold]{len(remote)}[/bold] recording(s) on server."
+        f"Found [bold]{len(remote)}[/bold] {label}(s) on server."
     )
 
     all_downloaded = 0
@@ -1004,6 +1017,7 @@ def download(dest, dry_run, force, jobs):
         try:
             result = download_recording(
                 rec.name, dest_dir, dry_run=dry_run, force=force, jobs=jobs,
+                source=source,
             )
             all_downloaded += len(result.downloaded)
             all_skipped += len(result.skipped)

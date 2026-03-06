@@ -88,21 +88,26 @@ def get_upload_urls(request):
     action = data.get("action")
 
     if action == "list":
-        return _handle_list()
+        return _handle_list(data)
     if action == "sign-download":
         return _handle_sign_download(data)
     return _handle_upload(data)
 
 
-def _handle_list():
-    """List available recordings in the bucket."""
+def _handle_list(data=None):
+    """List available recordings (or sessions) in the bucket."""
     from collections import defaultdict
+
+    data = data or {}
+    source = data.get("source", "recordings")
+    if source not in ("recordings", "sessions"):
+        return _cors((jsonify({"error": "Invalid source"}), 400))
 
     recordings = defaultdict(lambda: {"file_count": 0, "total_size": 0})
 
-    blobs = _storage_client.list_blobs(BUCKET, prefix="recordings/", timeout=60)
+    blobs = _storage_client.list_blobs(BUCKET, prefix=f"{source}/", timeout=60)
     for blob in blobs:
-        # blob.name = "recordings/{recording_name}/{filename}"
+        # blob.name = "{source}/{name}/{filename...}"
         parts = blob.name.split("/", 2)
         if len(parts) < 3 or not parts[2]:
             continue
@@ -118,7 +123,7 @@ def _handle_list():
 
 
 def _handle_sign_download(data):
-    """Generate signed GET URLs for all files in a recording."""
+    """Generate signed GET URLs for all files in a recording (or session)."""
     recording = data.get("recording")
     if not recording:
         return _cors((jsonify({"error": "'recording' field required"}), 400))
@@ -126,7 +131,11 @@ def _handle_sign_download(data):
     if not _RECORDING_RE.match(recording):
         return _cors((jsonify({"error": "Invalid recording name"}), 400))
 
-    prefix = f"recordings/{recording}/"
+    source = data.get("source", "recordings")
+    if source not in ("recordings", "sessions"):
+        return _cors((jsonify({"error": "Invalid source"}), 400))
+
+    prefix = f"{source}/{recording}/"
     blobs = list(_storage_client.list_blobs(BUCKET, prefix=prefix, timeout=60))
 
     if not blobs:

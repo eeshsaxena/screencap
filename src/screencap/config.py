@@ -14,6 +14,7 @@ else:
 _DEFAULT_BASE = Path.home() / ".screencap"
 _DEFAULT_RECORDINGS = _DEFAULT_BASE / "recordings"
 _DEFAULT_DOWNLOADS = _DEFAULT_BASE / "downloads"
+_DEFAULT_SESSIONS = _DEFAULT_BASE / "sessions"
 _CONFIG_PATH = _DEFAULT_BASE / "config.toml"
 
 _config_cache: dict | None = None
@@ -104,6 +105,18 @@ def get_downloads_dir() -> Path:
     else:
         cfg = _load_toml()
         p = Path(cfg.get("downloads_dir", str(_DEFAULT_DOWNLOADS)))
+    p.mkdir(parents=True, exist_ok=True)
+    return p
+
+
+def get_sessions_dir() -> Path:
+    """Return sessions directory, creating it if needed."""
+    env = os.environ.get("SCREENCAP_SESSIONS_DIR")
+    if env:
+        p = Path(env)
+    else:
+        cfg = _load_toml()
+        p = Path(cfg.get("sessions_dir", str(_DEFAULT_SESSIONS)))
     p.mkdir(parents=True, exist_ok=True)
     return p
 
