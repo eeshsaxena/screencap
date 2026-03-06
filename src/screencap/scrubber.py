@@ -14,6 +14,8 @@ from rich.table import Table
 
 from screencap.catalog import find_db
 from screencap.config import get_recordings_dir, resolve_recording_dir
+from screencap.privacy.actions import PrivacyAction
+from screencap.privacy.reasons import AuditEntry, ReasonCode
 
 console = Console()
 
@@ -51,6 +53,7 @@ class ScrubResult:
     output_dir: Path = field(default_factory=Path)
     entity_counts: Counter = field(default_factory=Counter)
     deleted_files: list[str] = field(default_factory=list)
+    audit_entries: list[AuditEntry] = field(default_factory=list)
 
 
 def _copytree_ignore(directory: str, entries: list[str]) -> set[str]:
@@ -60,6 +63,193 @@ def _copytree_ignore(directory: str, entries: list[str]) -> set[str]:
         if entry in _SKIP_FILES or Path(entry).suffix in _SKIP_EXTENSIONS:
             ignored.add(entry)
     return ignored
+
+
+# ---------------------------------------------------------------------------
+# Blocked-app interval building
+# ---------------------------------------------------------------------------
+
+
+@dataclass(frozen=True)
+class _BlockedInterval:
+    """Time interval where a blocked app was frontmost."""
+
+    start: float
+    end: float
+    action: PrivacyAction
+    reason: str
+
+
+def _build_blocked_intervals(
+    window_events,
+    evaluator,
+    classifier,
+    browser_events=None,
+) -> list[_BlockedInterval]:
+    """Build intervals where the frontmost app triggers EXCLUDE or MASK_WINDOW.
+
+    Each window event defines a period from its timestamp to the next
+    window event's timestamp (or infinity for the last event).
+    """
+    from screencap.privacy.context import (
+        BROWSER_BUNDLE_IDS,
+        associate_screenshot,
+    )
+
+    if not window_events:
+        return []
+
+    intervals: list[_BlockedInterval] = []
+    browser_events = browser_events or []
+
+    for i, we in enumerate(window_events):
+        end_ts = (
+            window_events[i + 1].timestamp
+            if i + 1 < len(window_events)
+            else float("inf")
+        )
+        meta = associate_screenshot(
+            we.timestamp, window_events, browser_events
+        )
+        ctx = classifier.classify(meta)
+        decision = evaluator.evaluate(ctx, meta)
+
+        if decision.action in (PrivacyAction.EXCLUDE, PrivacyAction.MASK_WINDOW):
+            intervals.append(
+                _BlockedInterval(
+                    start=we.timestamp,
+                    end=end_ts,
+                    action=decision.action,
+                    reason=decision.reason,
+                )
+            )
+
+    return intervals
+
+
+def _find_blocked_interval(
+    timestamp: float, intervals: list[_BlockedInterval]
+) -> _BlockedInterval | None:
+    """Return the blocked interval containing timestamp, or None."""
+    for iv in intervals:
+        if iv.start <= timestamp < iv.end:
+            return iv
+    return None
+
+
+# ---------------------------------------------------------------------------
+# Screenshot routing
+# ---------------------------------------------------------------------------
+
+
+def _scrub_screenshots_with_policy(
+    dst: Path,
+    evaluator,
+    classifier,
+    window_events,
+    browser_events,
+    result: ScrubResult,
+) -> None:
+    """Route screenshot files by policy/context.
+
+    EXCLUDE or MASK_WINDOW → delete file (fail-safe; structural masking
+    is deferred to a later phase).
+    OCR_FALLBACK / TEXT_REDACT / ALLOW → keep file.
+    """
+    from screencap.privacy.context import (
+        associate_screenshot,
+        parse_screenshot_timestamp,
+    )
+
+    screenshots_dir = dst / "screenshots"
+    if not screenshots_dir.is_dir():
+        return
+
+    for img_path in sorted(screenshots_dir.glob("*.jpg")):
+        ts = parse_screenshot_timestamp(img_path.name)
+        if ts is None:
+            continue
+
+        meta = associate_screenshot(ts, window_events, browser_events)
+        ctx = classifier.classify(meta)
+        decision = evaluator.evaluate(ctx, meta)
+
+        result.audit_entries.append(
+            AuditEntry(
+                timestamp=ts,
+                surface="screenshot",
+                action=decision.action.value,
+                reason=decision.reason,
+                context_class=ctx.context_class.value,
+                evidence_type=ctx.confidence,
+            )
+        )
+
+        if decision.action in (PrivacyAction.EXCLUDE, PrivacyAction.MASK_WINDOW):
+            img_path.unlink()
+
+
+# ---------------------------------------------------------------------------
+# Blocked-app event handling
+# ---------------------------------------------------------------------------
+
+
+def _null_event_content(event: dict) -> None:
+    """Null out sensitive content fields in an event dict in-place."""
+    if "text" in event:
+        event["text"] = None
+    for child in event.get("children", []):
+        if child.get("key_char"):
+            child["key_char"] = None
+            child["canonical_key_char"] = None
+
+
+def _null_db_rows_for_intervals(
+    dst: Path, intervals: list[_BlockedInterval], result: ScrubResult
+) -> None:
+    """Null out action_event columns during blocked-app intervals."""
+    if not intervals:
+        return
+    db_path = find_db(dst)
+    if db_path is None:
+        return
+
+    conn = sqlite3.connect(str(db_path))
+    try:
+        tables = {
+            r[0]
+            for r in conn.execute(
+                "SELECT name FROM sqlite_master WHERE type='table'"
+            ).fetchall()
+        }
+        if "action_event" not in tables:
+            return
+
+        for iv in intervals:
+            end_clause = "" if iv.end == float("inf") else f" AND timestamp < {iv.end}"
+            conn.execute(
+                f"UPDATE action_event SET "
+                f"key_char = NULL, canonical_key_char = NULL, "
+                f"element_state = NULL, "
+                f"active_segment_description = NULL, "
+                f"available_segment_descriptions = NULL "
+                f"WHERE timestamp >= ?{end_clause}",
+                (iv.start,),
+            )
+            result.audit_entries.append(
+                AuditEntry(
+                    timestamp=iv.start,
+                    surface="db_field",
+                    action=iv.action.value,
+                    reason=iv.reason,
+                )
+            )
+        conn.commit()
+    except Exception:
+        conn.rollback()
+        raise
+    finally:
+        conn.close()
 
 
 def _scrub_text(
@@ -573,15 +763,18 @@ def _scrub_events_jsonl(
     pipeline,
     anonymizer,
     result: ScrubResult,
+    blocked_intervals: list[_BlockedInterval] | None = None,
 ) -> None:
     """Scrub combined keystroke sequences in events.jsonl and map back to DB.
 
-    1. Detects secrets in key.type event text fields (combined keystrokes).
-    2. Redacts key_char in JSONL children (both key.down and key.up).
-    3. Runs _scrub_json_recursive on ALL JSONL events for comprehensive PII scrub.
-    4. Maps redactions back to action_event DB rows.
-    5. Writes atomically (.tmp + rename).
-    6. Deletes file on any processing error (fail-safe).
+    1. Checks each event against blocked-app intervals — nulls content
+       for events during EXCLUDE/MASK_WINDOW periods.
+    2. Detects secrets in key.type event text fields (combined keystrokes).
+    3. Redacts key_char in JSONL children (both key.down and key.up).
+    4. Runs _scrub_json_recursive on ALL JSONL events for comprehensive PII scrub.
+    5. Maps redactions back to action_event DB rows.
+    6. Writes atomically (.tmp + rename).
+    7. Deletes file on any processing error (fail-safe).
     """
     import os
 
@@ -589,6 +782,7 @@ def _scrub_events_jsonl(
     if not events_jsonl.exists():
         return
 
+    blocked_intervals = blocked_intervals or []
     had_errors = False
     db_redactions: list[dict] = []
     output_lines: list[str] = []
@@ -608,6 +802,22 @@ def _scrub_events_jsonl(
             continue
 
         if event.get("_meta"):
+            output_lines.append(json.dumps(event, ensure_ascii=False))
+            continue
+
+        # Check blocked-app intervals
+        event_ts = event.get("timestamp", 0.0)
+        blocked = _find_blocked_interval(event_ts, blocked_intervals)
+        if blocked is not None:
+            _null_event_content(event)
+            result.audit_entries.append(
+                AuditEntry(
+                    timestamp=event_ts,
+                    surface="event",
+                    action=blocked.action.value,
+                    reason=blocked.reason,
+                )
+            )
             output_lines.append(json.dumps(event, ensure_ascii=False))
             continue
 
@@ -642,6 +852,18 @@ def _scrub_events_jsonl(
 # ---------------------------------------------------------------------------
 # Summary output
 # ---------------------------------------------------------------------------
+
+
+def _write_audit_log(dst: Path, result: ScrubResult) -> None:
+    """Write export-safe audit log to the scrubbed recording directory."""
+    if not result.audit_entries:
+        return
+    import dataclasses
+
+    entries = [dataclasses.asdict(e) for e in result.audit_entries]
+    (dst / "privacy_audit.json").write_text(
+        json.dumps(entries, indent=2), encoding="utf-8"
+    )
 
 
 def _print_summary(result: ScrubResult, rule_based_redactions: list[str]) -> None:
@@ -761,14 +983,61 @@ def scrub_recording(
         all_skipped.add(name_del)
     result.deleted_files = sorted(all_skipped)
 
-    # 8. Scrub DB
+    # 8. Load policy/context for policy-aware scrubbing
+    blocked_intervals: list[_BlockedInterval] = []
+    with console.status("Loading privacy policy and context..."):
+        try:
+            from screencap.config import get_privacy_config
+            from screencap.privacy.context import (
+                DefaultContextClassifier,
+                load_browser_events,
+                load_window_events,
+            )
+            from screencap.privacy.policy import DefaultPolicyEvaluator
+
+            privacy_config = get_privacy_config()
+            evaluator = DefaultPolicyEvaluator(privacy_config)
+            classifier = DefaultContextClassifier()
+
+            db_path = find_db(dst)
+            window_events = load_window_events(db_path) if db_path else []
+            browser_events = load_browser_events(db_path) if db_path else []
+
+            blocked_intervals = _build_blocked_intervals(
+                window_events, evaluator, classifier, browser_events
+            )
+        except Exception as exc:
+            console.print(
+                f"  [yellow]Warning: policy/context loading failed ({exc}) — "
+                f"falling back to generic scrubbing[/]"
+            )
+            evaluator = None  # type: ignore[assignment]
+            classifier = None  # type: ignore[assignment]
+            window_events = []
+            browser_events = []
+
+    # 9. Policy-aware screenshot routing
+    if evaluator and classifier:
+        with console.status("Routing screenshots by policy..."):
+            _scrub_screenshots_with_policy(
+                dst, evaluator, classifier, window_events, browser_events, result
+            )
+
+    # 10. Null DB rows during blocked-app intervals
+    if blocked_intervals:
+        with console.status("Nulling blocked-app DB rows..."):
+            _null_db_rows_for_intervals(dst, blocked_intervals, result)
+
+    # 11. Scrub DB
     with console.status("Scrubbing database..."):
         _scrub_db(dst, pipeline, anonymizer, result)
 
-    # 9. Scrub combined keystroke sequences in events.jsonl
+    # 12. Scrub combined keystroke sequences in events.jsonl
     with console.status("Scrubbing keystroke sequences..."):
         try:
-            _scrub_events_jsonl(dst, pipeline, anonymizer, result)
+            _scrub_events_jsonl(
+                dst, pipeline, anonymizer, result, blocked_intervals
+            )
         except Exception as exc:
             console.print(
                 f"  [yellow]Warning: events.jsonl scrubbing failed ({exc}) — "
@@ -776,12 +1045,12 @@ def scrub_recording(
             )
             (dst / "events.jsonl").unlink(missing_ok=True)
 
-    # 10-11. Scrub transcripts
+    # 13. Scrub transcripts
     with console.status("Scrubbing transcripts..."):
         _scrub_transcript_json(dst / "transcript.json", pipeline, anonymizer, result)
         _scrub_transcript_txt(dst / "transcript.txt", pipeline, anonymizer, result)
 
-    # 11. Scrub metrics (rule-based)
+    # 14. Scrub metrics (rule-based)
     rule_based_redactions: list[str] = []
     metrics_path = dst / "system_metrics.json"
     if metrics_path.exists():
@@ -799,8 +1068,11 @@ def scrub_recording(
             pass
     _scrub_metrics(metrics_path, result)
 
-    # 12. Print summary
+    # 15. Write audit log
+    _write_audit_log(dst, result)
+
+    # 16. Print summary
     _print_summary(result, rule_based_redactions)
 
-    # 13. Return result
+    # 17. Return result
     return result

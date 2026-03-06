@@ -7,6 +7,8 @@ dependencies.
 
 from __future__ import annotations
 
+from dataclasses import dataclass
+
 
 class ReasonCode:
     # Policy-layer reasons
@@ -35,5 +37,25 @@ class ReasonCode:
     OCR_SECRET = "ocr_secret"
     OCR_PII = "ocr_pii"
 
+    # Blocked-app interval reasons
+    BLOCKED_APP_EXCLUDE = "blocked_app_exclude"
+    BLOCKED_APP_MASK = "blocked_app_mask"
+
     # Explicit allow
     ALLOWED = "allowed"
+
+
+@dataclass(frozen=True)
+class AuditEntry:
+    """Export-safe audit entry for a privacy decision.
+
+    Must NOT contain raw text, normalized text, OCR word lists,
+    full titles, domains, or query parameters.
+    """
+
+    timestamp: float
+    surface: str  # "screenshot", "event", "keystroke", "db_field"
+    action: str  # PrivacyAction value
+    reason: str  # ReasonCode constant
+    context_class: str = ""  # ContextClass value
+    evidence_type: str = ""  # "bundle_id", "domain", "title" — category, not content
