@@ -164,6 +164,33 @@ def get_disk_stop_mb() -> int:
     return val
 
 
+def get_chunk_duration() -> float:
+    """Return auto-cut chunk duration in seconds. Default 3600 (1 hour). 0 = legacy."""
+    env = os.environ.get("SCREENCAP_CHUNK_DURATION")
+    if env is not None:
+        return float(env)
+    cfg = _load_toml()
+    return float(cfg.get("chunk_duration", 3600.0))
+
+
+def get_auto_delete_after_upload() -> bool:
+    """Return whether to auto-delete chunks after confirmed upload. Default True."""
+    env = os.environ.get("SCREENCAP_AUTO_DELETE")
+    if env is not None:
+        return env.lower() in ("1", "true", "yes")
+    cfg = _load_toml()
+    return cfg.get("auto_delete_after_upload", True)
+
+
+def get_rest_threshold() -> float:
+    """Return rest threshold in seconds for task segmentation. Default 120."""
+    env = os.environ.get("SCREENCAP_REST_THRESHOLD")
+    if env is not None:
+        return float(env)
+    cfg = _load_toml()
+    return float(cfg.get("rest_threshold", 120.0))
+
+
 def resolve_recording_dir(name: str) -> Path:
     """Resolve a recording name to a directory path, with traversal protection.
 
