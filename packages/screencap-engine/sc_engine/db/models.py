@@ -82,7 +82,8 @@ class Recording(Base):
         cascade="all, delete-orphan",
     )
     audio_info = sa.orm.relationship(
-        "AudioInfo", back_populates="recording", cascade="all, delete-orphan"
+        "AudioInfo", back_populates="recording", cascade="all, delete-orphan",
+        order_by="AudioInfo.timestamp",
     )
 
 

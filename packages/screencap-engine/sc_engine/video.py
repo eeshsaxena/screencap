@@ -200,7 +200,9 @@ class VideoWriter:
 
             close_thread = threading.Thread(target=close_container)
             close_thread.start()
-            close_thread.join()
+            close_thread.join(timeout=15)
+            if close_thread.is_alive():
+                logger.warning("VideoWriter close thread did not finish in 15s, continuing")
 
             self._container = None
             self._stream = None
@@ -412,7 +414,9 @@ def finalize_video_writer(
     close_thread.start()
 
     # Wait for the thread to finish execution
-    close_thread.join()
+    close_thread.join(timeout=15)
+    if close_thread.is_alive():
+        logger.warning("finalize_video_writer close thread did not finish in 15s, continuing")
 
     # Move moov atom to beginning of file
     if fix_moov:
@@ -660,6 +664,7 @@ class ChunkedVideoWriter:
         pix_fmt: str = "yuv444p",
         crf: int = 0,
         preset: str = "ultrafast",
+        chunk_rotate_q=None,
     ) -> None:
         """Initialize chunked video writer.
 
@@ -673,6 +678,7 @@ class ChunkedVideoWriter:
             pix_fmt: Pixel format.
             crf: Constant Rate Factor.
             preset: Encoding preset.
+            chunk_rotate_q: Optional multiprocessing.Queue for rotation notifications.
         """
         self.output_dir = Path(output_dir)
         self.output_dir.mkdir(parents=True, exist_ok=True)
@@ -685,6 +691,7 @@ class ChunkedVideoWriter:
         self.pix_fmt = pix_fmt
         self.crf = crf
         self.preset = preset
+        self.chunk_rotate_q = chunk_rotate_q
 
         self._current_writer: VideoWriter | None = None
         self._chunk_index = 0
@@ -710,6 +717,17 @@ class ChunkedVideoWriter:
         """Start a new video chunk."""
         if self._current_writer is not None:
             self._current_writer.close()
+            # Notify about completed chunk
+            if self.chunk_rotate_q is not None:
+                try:
+                    self.chunk_rotate_q.put({
+                        "type": "chunk_rotated",
+                        "completed_index": self._chunk_index - 1,
+                        "chunk_start_time": self._chunk_start_time,
+                        "rotation_time": timestamp,
+                    }, timeout=5)
+                except Exception:
+                    logger.warning("Failed to push chunk rotation event, continuing")
 
         chunk_path = self._get_chunk_path(self._chunk_index)
         self._current_writer = VideoWriter(
@@ -759,8 +777,21 @@ class ChunkedVideoWriter:
 
     def close(self) -> None:
         """Close the current chunk and finalize."""
+        import time as _time
+
         with self._lock:
             if self._current_writer is not None:
+                # Notify about the final chunk before closing
+                if self.chunk_rotate_q is not None:
+                    try:
+                        self.chunk_rotate_q.put({
+                            "type": "final_chunk",
+                            "completed_index": self._chunk_index - 1,
+                            "chunk_start_time": self._chunk_start_time,
+                            "rotation_time": _time.time(),
+                        }, timeout=5)
+                    except Exception:
+                        logger.warning("Failed to push final_chunk event, continuing")
                 self._current_writer.close()
                 self._current_writer = None
 

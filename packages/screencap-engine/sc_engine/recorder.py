@@ -605,6 +605,8 @@ def write_events(
     pre_callback: Callable | None = None,
     post_callback: Callable[[dict], None] | None = None,
     config_overrides: dict[str, object] | None = None,
+    flush_requested=None,
+    flush_ack_counter=None,
 ) -> None:
     """Write events of a specific type to the db using the provided write function.
 
@@ -644,49 +646,55 @@ def write_events(
     num_processed = 0
     progress = None
     started = False
-    while not terminate_processing.is_set() or not write_q.empty():
-        if terminate_processing.is_set() and progress is None:
-            # if processing is over, create a progress bar
-            total_events = num_events.value
-            progress = tqdm(
-                total=total_events,
-                desc=f"Writing {event_type} events...",
-                unit="event",
-                colour="green",
-                dynamic_ncols=True,
-            )
-            # update the progress bar with the number of events that have already
-            # been processed
-            for _ in range(num_processed):
-                progress.update()
-        if not started:
-            started_event.set()
-            started = True
-        try:
-            event = write_q.get_nowait()
-        except queue.Empty:
-            time.sleep(0.01)
-            continue
-        assert event.type == event_type, (event_type, event)
-        state = write_fn(session, recording, event, perf_q, **(state or {}))
-        num_processed += 1
-        with num_events.get_lock():
-            if progress is not None:
-                if progress.total < num_events.value:
-                    # update the total number of events in the progress bar
-                    progress.total = num_events.value
-                    progress.refresh()
-                progress.update()
-        logger.debug(f"{event_type=} written")
+    try:
+        while not terminate_processing.is_set() or not write_q.empty():
+            if terminate_processing.is_set() and progress is None:
+                # if processing is over, create a progress bar
+                total_events = num_events.value
+                progress = tqdm(
+                    total=total_events,
+                    desc=f"Writing {event_type} events...",
+                    unit="event",
+                    colour="green",
+                    dynamic_ncols=True,
+                )
+                # update the progress bar with the number of events that have already
+                # been processed
+                for _ in range(num_processed):
+                    progress.update()
+            if not started:
+                started_event.set()
+                started = True
+            try:
+                event = write_q.get_nowait()
+            except queue.Empty:
+                # Check for mid-recording flush request (chunked mode)
+                if flush_requested is not None and flush_requested.is_set():
+                    crud.flush_buffers(session)
+                    with flush_ack_counter.get_lock():
+                        flush_ack_counter.value += 1
+                time.sleep(0.01)
+                continue
+            assert event.type == event_type, (event_type, event)
+            state = write_fn(session, recording, event, perf_q, **(state or {}))
+            num_processed += 1
+            with num_events.get_lock():
+                if progress is not None:
+                    if progress.total < num_events.value:
+                        # update the total number of events in the progress bar
+                        progress.total = num_events.value
+                        progress.refresh()
+                    progress.update()
+            logger.debug(f"{event_type=} written")
+    finally:
+        # Flush any partial batch left in crud insert buffers.
+        crud.flush_buffers(session)
 
-    # Flush any partial batch left in crud insert buffers.
-    crud.flush_buffers(session)
+        if post_callback:
+            post_callback(state)
 
-    if post_callback:
-        post_callback(state)
-
-    if progress is not None:
-        progress.close()
+        if progress is not None:
+            progress.close()
 
     logger.info(f"{event_type=} done")
 
@@ -745,6 +753,69 @@ def video_post_callback(state: dict) -> None:
         state["last_pts"],
         state["video_file_path"],
     )
+
+
+def chunked_video_pre_callback(
+    db: crud.SaSession, recording: Recording, video_dir: str = None,
+    chunk_duration: float = 3600.0, chunk_rotate_q=None,
+) -> dict[str, Any]:
+    """Pre-callback for chunked video mode using ChunkedVideoWriter."""
+    init_screenshot = utils.take_screenshot()
+    if init_screenshot is not None:
+        screen_width, screen_height = init_screenshot.size
+    else:
+        logger.warning("take_screenshot() returned None in chunked_video_pre_callback")
+        screen_width, screen_height = utils.get_monitor_dims()
+
+    writer = video.ChunkedVideoWriter(
+        output_dir=video_dir or os.getcwd(),
+        width=screen_width,
+        height=screen_height,
+        chunk_duration=chunk_duration,
+        chunk_rotate_q=chunk_rotate_q,
+    )
+
+    video_start_timestamp = utils.get_timestamp()
+    crud.update_video_start_time(db, recording, video_start_timestamp)
+    return {
+        "chunked_writer": writer,
+        "video_start_timestamp": video_start_timestamp,
+    }
+
+
+def chunked_write_video_event(
+    db: crud.SaSession,
+    recording_timestamp: float,
+    event: "Event",
+    perf_q: sq.SynchronizedQueue,
+    chunked_writer: "video.ChunkedVideoWriter" = None,
+    video_start_timestamp: float = 0,
+    **kwargs: dict,
+) -> dict[str, Any]:
+    """Write a screen event using ChunkedVideoWriter."""
+    assert event.type == "screen/video"
+    screenshot_image = event.data
+    screenshot_timestamp = event.timestamp
+    force_key_frame = not hasattr(chunked_writer, '_has_written')
+    if force_key_frame:
+        chunked_writer._has_written = True
+    chunked_writer.write_frame(screenshot_image, screenshot_timestamp, force_key_frame)
+    return {
+        **kwargs,
+        "chunked_writer": chunked_writer,
+        "video_start_timestamp": video_start_timestamp,
+        "last_frame": screenshot_image,
+        "last_frame_timestamp": screenshot_timestamp,
+    }
+
+
+def chunked_video_post_callback(state: dict) -> None:
+    """Post-callback for chunked video mode."""
+    if state is None:
+        return
+    writer = state.get("chunked_writer")
+    if writer is not None:
+        writer.close()
 
 
 def screen_pre_callback(
@@ -1701,6 +1772,8 @@ def record_audio(
     db_path: str,
     terminate_processing: multiprocessing.Event,
     started_event: multiprocessing.Event,
+    audio_rotate_q=None,
+    audio_ack_q=None,
 ) -> None:
     """Record audio narration during the recording and store data in database.
 
@@ -1748,16 +1821,57 @@ def record_audio(
             audio_buffer.clear()
         return np.concatenate(drained, axis=0)
 
+    # Track current chunk index for chunked audio
+    _current_chunk_idx = [0]  # mutable container
+
+    def _rotate_audio(sf_writer_ref, capture_dir, new_idx):
+        """Close current FLAC, open new one for the next chunk."""
+        # Drain and write remaining buffer
+        frames = _drain_buffer()
+        if frames is not None:
+            try:
+                sf_writer_ref[0].write(frames)
+            except Exception as e:
+                logger.error(f"Audio rotation drain failed: {e}")
+        sf_writer_ref[0].close()
+
+        # Send ack for completed chunk
+        if audio_ack_q is not None:
+            try:
+                audio_ack_q.put({"type": "audio_rotated", "completed_index": _current_chunk_idx[0]}, timeout=5)
+            except Exception:
+                logger.error("Failed to send audio rotation ack")
+
+        _current_chunk_idx[0] = new_idx
+        new_path = capture_dir / f"audio_{new_idx:04d}.flac"
+        sf_writer_ref[0] = soundfile.SoundFile(
+            str(new_path), mode="w", samplerate=SAMPLERATE,
+            channels=CHANNELS, format="FLAC",
+        )
+        logger.info(f"Audio rotated to {new_path}")
+
     def _flush_loop(
-        sf_writer: "soundfile.SoundFile",
+        sf_writer_ref: list,
         stop_event: threading.Event,
+        capture_dir,
     ) -> None:
         """Periodically drain audio_buffer and write frames to the FLAC file."""
         while not stop_event.wait(timeout=FLUSH_INTERVAL_SECS):
+            # Check for rotation requests before flushing
+            if audio_rotate_q is not None:
+                while True:
+                    try:
+                        msg = audio_rotate_q.get_nowait()
+                        if msg.get("type") in ("chunk_rotated", "final_chunk"):
+                            new_idx = msg.get("completed_index", 0) + 1
+                            _rotate_audio(sf_writer_ref, capture_dir, new_idx)
+                    except Exception:
+                        break
+
             frames = _drain_buffer()
             if frames is not None:
                 try:
-                    sf_writer.write(frames)
+                    sf_writer_ref[0].write(frames)
                     logger.debug(f"Flushed {len(frames)} audio frames to disk")
                 except Exception as e:
                     logger.error(f"Audio flush failed: {e}")
@@ -1766,7 +1880,13 @@ def record_audio(
     # Open streaming FLAC writer before starting the audio stream
     from pathlib import Path as _Path
 
-    audio_flac_path = _Path(db_path).parent / "audio.flac"
+    capture_dir = _Path(db_path).parent
+    _is_chunked = audio_rotate_q is not None
+    if _is_chunked:
+        audio_flac_path = capture_dir / "audio_0000.flac"
+    else:
+        audio_flac_path = capture_dir / "audio.flac"
+
     sf_writer = soundfile.SoundFile(
         str(audio_flac_path),
         mode="w",
@@ -1774,13 +1894,14 @@ def record_audio(
         channels=CHANNELS,
         format="FLAC",
     )
+    sf_writer_ref = [sf_writer]  # mutable container for rotation
 
     # Start the flush thread
     flush_stop = threading.Event()
     flush_thread = threading.Thread(
         target=_flush_loop,
-        args=(sf_writer, flush_stop),
-        daemon=True,
+        args=(sf_writer_ref, flush_stop, capture_dir),
+        daemon=False,
     )
     flush_thread.start()
 
@@ -1803,20 +1924,49 @@ def record_audio(
     flush_stop.set()
     flush_thread.join(timeout=10)
 
+    # Process any remaining rotation events
+    if audio_rotate_q is not None:
+        while True:
+            try:
+                msg = audio_rotate_q.get_nowait()
+                if msg.get("type") in ("chunk_rotated", "final_chunk"):
+                    new_idx = msg.get("completed_index", 0) + 1
+                    _rotate_audio(sf_writer_ref, capture_dir, new_idx)
+            except Exception:
+                break
+
     # Final drain — write any remaining buffered frames
     final_frames = _drain_buffer()
     if final_frames is not None:
         try:
-            sf_writer.write(final_frames)
+            sf_writer_ref[0].write(final_frames)
             logger.debug(f"Final flush: {len(final_frames)} audio frames")
         except Exception as e:
             logger.error(f"Final audio flush failed: {e}")
 
     # Close writer — finalizes FLAC headers
-    sf_writer.close()
-    logger.info(f"Audio saved to {audio_flac_path}")
+    sf_writer_ref[0].close()
 
-    flac_size = audio_flac_path.stat().st_size
+    # Derive current audio path from chunk index (audio_flac_path may be stale
+    # if chunks were rotated/deleted during recording)
+    if _is_chunked:
+        _final_audio_path = capture_dir / f"audio_{_current_chunk_idx[0]:04d}.flac"
+    else:
+        _final_audio_path = audio_flac_path
+    logger.info(f"Audio saved to {_final_audio_path}")
+
+    # Send final audio ack
+    if audio_ack_q is not None:
+        try:
+            audio_ack_q.put({"type": "audio_final", "completed_index": _current_chunk_idx[0]}, timeout=5)
+        except Exception:
+            logger.error("Failed to send audio_final ack")
+
+    if not _final_audio_path.exists():
+        logger.info("Final audio file not on disk (may have been uploaded and deleted)")
+        return
+
+    flac_size = _final_audio_path.stat().st_size
     if not flac_size:
         logger.warning("Zero-length audio recording — skipping DB insert")
         return
@@ -1959,6 +2109,11 @@ def record(
     num_video_events: multiprocessing.Value = None,
     send_profile: bool = False,
     recording_config: RecordingConfig | None = None,
+    chunk_rotate_q=None,
+    flush_requested=None,
+    flush_ack_counter=None,
+    audio_rotate_q=None,
+    audio_ack_q=None,
 ) -> None:
     """Record Screenshots/ActionEvents/WindowEvents/BrowserEvents.
 
@@ -2171,7 +2326,11 @@ def record(
             ),
             partial(screen_pre_callback, screenshots_dir=_screenshots_dir),
         ),
-        kwargs={"config_overrides": _config_overrides},
+        kwargs={
+            "config_overrides": _config_overrides,
+            "flush_requested": flush_requested,
+            "flush_ack_counter": flush_ack_counter,
+        },
     )
     screen_event_writer.start()
     task_by_name["screen_event_writer"] = screen_event_writer
@@ -2192,7 +2351,11 @@ def record(
                     "browser_event_writer", multiprocessing.Event()
                 ),
             ),
-            kwargs={"config_overrides": _config_overrides},
+            kwargs={
+                "config_overrides": _config_overrides,
+                "flush_requested": flush_requested,
+                "flush_ack_counter": flush_ack_counter,
+            },
         )
         browser_event_writer.start()
         task_by_name["browser_event_writer"] = browser_event_writer
@@ -2212,7 +2375,11 @@ def record(
                 "action_event_writer", multiprocessing.Event()
             ),
         ),
-        kwargs={"config_overrides": _config_overrides},
+        kwargs={
+            "config_overrides": _config_overrides,
+            "flush_requested": flush_requested,
+            "flush_ack_counter": flush_ack_counter,
+        },
     )
     action_event_writer.start()
     task_by_name["action_event_writer"] = action_event_writer
@@ -2233,17 +2400,36 @@ def record(
                     "window_event_writer", multiprocessing.Event()
                 ),
             ),
-            kwargs={"config_overrides": _config_overrides},
+            kwargs={
+                "config_overrides": _config_overrides,
+                "flush_requested": flush_requested,
+                "flush_ack_counter": flush_ack_counter,
+            },
         )
         window_event_writer.start()
         task_by_name["window_event_writer"] = window_event_writer
 
     if config.RECORD_VIDEO:
+        _use_chunked = config.VIDEO_CHUNK_DURATION > 0
+        if _use_chunked:
+            _v_pre = partial(
+                chunked_video_pre_callback,
+                video_dir=capture_dir,
+                chunk_duration=config.VIDEO_CHUNK_DURATION,
+                chunk_rotate_q=chunk_rotate_q,
+            )
+            _v_write = chunked_write_video_event
+            _v_post = chunked_video_post_callback
+        else:
+            _v_pre = partial(video_pre_callback, video_dir=capture_dir)
+            _v_write = write_video_event
+            _v_post = video_post_callback
+
         video_writer = multiprocessing.Process(
             target=utils.WrapStdout(write_events),
             args=(
                 "screen/video",
-                write_video_event,
+                _v_write,
                 video_write_q,
                 num_video_events,
                 perf_q,
@@ -2251,10 +2437,14 @@ def record(
                 db_path,
                 terminate_processing,
                 task_started_events.setdefault("video_writer", multiprocessing.Event()),
-                partial(video_pre_callback, video_dir=capture_dir),
-                video_post_callback,
+                _v_pre,
+                _v_post,
             ),
-            kwargs={"config_overrides": _config_overrides},
+            kwargs={
+                "config_overrides": _config_overrides,
+                "flush_requested": flush_requested,
+                "flush_ack_counter": flush_ack_counter,
+            },
         )
         video_writer.start()
         task_by_name["video_writer"] = video_writer
@@ -2270,6 +2460,10 @@ def record(
                     "audio_event_writer", multiprocessing.Event()
                 ),
             ),
+            kwargs={
+                "audio_rotate_q": audio_rotate_q,
+                "audio_ack_q": audio_ack_q,
+            },
         )
         audio_recorder.start()
         task_by_name["audio_recorder"] = audio_recorder
@@ -2370,6 +2564,7 @@ def record(
                         task.kill()
                         task.join(timeout=2)
 
+    # Reader threads and lightweight writers — 10s is enough
     join_tasks(
         [
             "window_event_reader",
@@ -2382,10 +2577,12 @@ def record(
             "browser_event_writer",
             "action_event_writer",
             "window_event_writer",
-            "video_writer",
-            "audio_recorder",
         ]
     )
+    # Video finalization can take >10s (ffmpeg fMP4 close) — give it 30s
+    join_tasks(["video_writer"], timeout=30.0)
+    # Audio FLAC close needs extra time too
+    join_tasks(["audio_recorder"], timeout=15.0)
 
     terminate_perf_event.set()
     # disabled to increase perf
@@ -2411,7 +2608,8 @@ def record(
     logger.info(f"Saved {recording_timestamp=}")
 
     session = get_session_for_path(db_path)
-    crud.post_process_events(session, recording)
+    if not getattr(config, 'SKIP_POST_PROCESS', False):
+        crud.post_process_events(session, recording)
 
     # --- Profiling summary ---
     _profile_duration = time.perf_counter() - _profile_start
@@ -2557,6 +2755,7 @@ class Recorder:
         ax_dump_timeout: float | None = None,
         ax_element_timeout: float | None = None,
         send_profile: bool = False,
+        video_chunk_duration: float | None = None,
     ) -> None:
         from pathlib import Path
 
@@ -2584,6 +2783,7 @@ class Recorder:
             ax_max_depth=ax_max_depth,
             ax_dump_timeout=ax_dump_timeout,
             ax_element_timeout=ax_element_timeout,
+            video_chunk_duration=video_chunk_duration,
         )
 
         # Shared state for cross-thread communication
@@ -2600,9 +2800,18 @@ class Recorder:
         self._ready_event = threading.Event()
         self._stopped_event = threading.Event()
 
+        # Chunked recording queues and sync primitives
+        self._chunk_rotate_q = None
+        self._audio_rotate_q = None
+        self._audio_ack_q = None
+        self._chunk_process_q = None
+        self._flush_requested = None
+        self._flush_ack_counter = None
+
         # Internal
         self._record_thread: threading.Thread | None = None
         self._status_thread: threading.Thread | None = None
+        self._fanout_thread: threading.Thread | None = None
         self._capture = None  # lazy CaptureSession
 
     def _drain_status_pipe(self) -> None:
@@ -2637,14 +2846,63 @@ class Recorder:
                 num_video_events=self._num_video_events,
                 send_profile=self._send_profile,
                 recording_config=self._recording_config,
+                chunk_rotate_q=self._chunk_rotate_q,
+                flush_requested=self._flush_requested,
+                flush_ack_counter=self._flush_ack_counter,
+                audio_rotate_q=self._audio_rotate_q,
+                audio_ack_q=self._audio_ack_q,
             )
 
+    def _chunk_fanout(self) -> None:
+        """Fan-out thread: dispatch chunk rotation events to audio + chunk processor."""
+        while not self._stopped_event.is_set():
+            try:
+                msg = self._chunk_rotate_q.get(timeout=1.0)
+            except Exception:
+                continue
+            try:
+                if self._audio_rotate_q is not None:
+                    self._audio_rotate_q.put(msg, timeout=5)
+            except Exception:
+                logger.error("Fan-out: audio_rotate_q full or dead")
+            try:
+                if self._chunk_process_q is not None:
+                    self._chunk_process_q.put(msg, timeout=5)
+            except Exception:
+                logger.error("Fan-out: chunk_process_q full or dead")
+
     def __enter__(self) -> "Recorder":
+        # Set up chunking primitives if chunking enabled
+        chunk_duration = getattr(self._recording_config, 'video_chunk_duration', None)
+        if chunk_duration is None:
+            chunk_duration = config.VIDEO_CHUNK_DURATION
+        if chunk_duration > 0:
+            self._chunk_rotate_q = multiprocessing.Queue(maxsize=100)
+            self._audio_rotate_q = multiprocessing.Queue(maxsize=100)
+            self._audio_ack_q = multiprocessing.Queue(maxsize=100)
+            self._chunk_process_q = multiprocessing.Queue(maxsize=100)
+            self._flush_requested = multiprocessing.Event()
+            self._flush_ack_counter = multiprocessing.Value('i', 0)
+
+            # Auto-set skip_post_process and screenshot_min_interval for chunked mode
+            if self._recording_config.skip_post_process is None:
+                self._recording_config.skip_post_process = True
+            if self._recording_config.screenshot_min_interval is None:
+                self._recording_config.screenshot_min_interval = 1.0
+
         # Start status drain thread
         self._status_thread = threading.Thread(
             target=self._drain_status_pipe, daemon=True,
         )
         self._status_thread.start()
+
+        # Start fan-out thread if chunking is enabled
+        if self._chunk_rotate_q is not None:
+            self._fanout_thread = threading.Thread(
+                target=self._chunk_fanout, daemon=True,
+                name="chunk_fanout",
+            )
+            self._fanout_thread.start()
 
         # Start recording thread
         self._record_thread = threading.Thread(target=self._run_record)
@@ -2654,7 +2912,9 @@ class Recorder:
     def __exit__(self, exc_type, exc_val, exc_tb) -> None:
         self._terminate_processing.set()
         if self._record_thread is not None:
-            self._record_thread.join()
+            self._record_thread.join(timeout=30)
+            if self._record_thread.is_alive():
+                logger.warning("Record thread did not exit in 30s, continuing cleanup")
         self._stopped_event.set()  # ensure status thread exits
         if self._status_thread is not None:
             self._status_thread.join(timeout=5)
