@@ -126,34 +126,32 @@ def pane_geometry(
 
 # Visual treatment constants
 _MASK_COLOR = (30, 30, 30)  # near-black
-_MASK_OPACITY = 230  # 0-255, high = more opaque
 _LABEL_COLOR = (180, 180, 180)  # light gray text
 
 
 def apply_mask(image_path: Path, regions: list[MaskRegion]) -> None:
     """Apply visual masks to a screenshot image file, in-place.
 
-    Renders a semi-opaque dark overlay for each region with a small
+    Renders a fully opaque solid fill for each region with a small
     text label so users know the omission was intentional.
+
+    The fill is fully opaque — no original pixel data bleeds through.
+    This is a privacy requirement: even 10% bleed-through on high-contrast
+    text (black on white) leaves content recoverable via contrast stretch.
 
     Requires Pillow (available in record deps).
     """
     from PIL import Image, ImageDraw
 
-    img = Image.open(image_path).convert("RGBA")
-
-    overlay = Image.new("RGBA", img.size, (0, 0, 0, 0))
-    draw = ImageDraw.Draw(overlay)
+    img = Image.open(image_path).convert("RGB")
+    draw = ImageDraw.Draw(img)
 
     for region in regions:
         x1, y1 = region.x, region.y
         x2 = min(region.x + region.width, img.width)
         y2 = min(region.y + region.height, img.height)
 
-        draw.rectangle(
-            [x1, y1, x2, y2],
-            fill=(*_MASK_COLOR, _MASK_OPACITY),
-        )
+        draw.rectangle([x1, y1, x2, y2], fill=_MASK_COLOR)
 
         # Draw label centered in the region
         if region.label:
@@ -163,16 +161,9 @@ def apply_mask(image_path: Path, regions: list[MaskRegion]) -> None:
             text_h = bbox[3] - bbox[1]
             text_x = x1 + (x2 - x1 - text_w) // 2
             text_y = y1 + (y2 - y1 - text_h) // 2
-            draw.text(
-                (text_x, text_y),
-                label,
-                fill=(*_LABEL_COLOR, 255),
-            )
+            draw.text((text_x, text_y), label, fill=_LABEL_COLOR)
 
-    result = Image.alpha_composite(img, overlay)
-    # Save as JPEG (screenshots are .jpg) — flatten alpha
-    result = result.convert("RGB")
-    result.save(image_path, "JPEG", quality=85)
+    img.save(image_path, "JPEG", quality=85)
 
 
 def mask_screenshot(

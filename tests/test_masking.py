@@ -134,7 +134,7 @@ class TestMaskWindowIntegration:
         assert _avg_brightness(img_path) < original_brightness * 0.3
 
     def test_fallback_deletes_on_corrupt_image(self, tmp_path):
-        """MASK_WINDOW on a corrupt file → deleted safely."""
+        """MASK_WINDOW on a corrupt file → deleted safely, audit says exclude."""
         dst, evaluator, classifier, window_events, result = self._setup(
             tmp_path,
             timestamps=[22.0],
@@ -149,6 +149,9 @@ class TestMaskWindowIntegration:
         )
 
         assert not corrupt_path.exists(), "Corrupt image should be deleted for safety"
+        # Audit must reflect what actually happened (exclude), not what was attempted
+        assert len(result.audit_entries) == 1
+        assert result.audit_entries[0].action == "exclude"
 
     def test_communication_surfaces_masked_not_deleted_in_public(self, tmp_path):
         """Email, chat, calendar, video_call: all masked (kept) in public mode."""

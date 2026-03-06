@@ -176,16 +176,9 @@ def _scrub_screenshots_with_policy(
         ctx = classifier.classify(meta)
         decision = evaluator.evaluate(ctx, meta)
 
-        result.audit_entries.append(
-            AuditEntry(
-                timestamp=ts,
-                surface="screenshot",
-                action=decision.action.value,
-                reason=decision.reason,
-                context_class=ctx.context_class.value,
-                evidence_type=ctx.confidence,
-            )
-        )
+        # Track the actual action taken — may differ from decision if
+        # masking fails and falls back to deletion.
+        actual_action = decision.action
 
         if decision.action == PrivacyAction.EXCLUDE:
             img_path.unlink()
@@ -203,6 +196,7 @@ def _scrub_screenshots_with_policy(
                     f"({exc}) — deleting for safety[/]"
                 )
                 img_path.unlink()
+                actual_action = PrivacyAction.EXCLUDE
         elif decision.action == PrivacyAction.MASK_REGION:
             try:
                 mask_screenshot(
@@ -223,8 +217,21 @@ def _scrub_screenshots_with_policy(
                         strategy=MaskStrategy.FULL_WINDOW,
                         app_hint=meta.bundle_id,
                     )
+                    actual_action = PrivacyAction.MASK_WINDOW
                 except Exception:
                     img_path.unlink()
+                    actual_action = PrivacyAction.EXCLUDE
+
+        result.audit_entries.append(
+            AuditEntry(
+                timestamp=ts,
+                surface="screenshot",
+                action=actual_action.value,
+                reason=decision.reason,
+                context_class=ctx.context_class.value,
+                evidence_type=ctx.confidence,
+            )
+        )
 
 
 # ---------------------------------------------------------------------------
