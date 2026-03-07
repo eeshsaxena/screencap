@@ -499,6 +499,7 @@ def start_recording(
 
     # --- Privacy: capture-time enforcement ---
     screen_filter = None
+    privacy_config = None
     try:
         from screencap.config import get_privacy_config
         from screencap.privacy.recorder_enforcement import RecorderPrivacyFilter
@@ -525,12 +526,10 @@ def start_recording(
             if verbose:
                 console.print(f"[dim]Privacy mode: {privacy_config.mode.value}[/dim]")
     except Exception as e:
-        # In public mode, privacy enforcement is a hard requirement —
-        # recording without it would expose sensitive data.
-        try:
-            _is_public = privacy_config.mode.value == "public"
-        except NameError:
-            _is_public = False
+        _is_public = (
+            privacy_config is not None
+            and privacy_config.mode.value == "public"
+        )
         if _is_public:
             console.print(
                 f"[red]Error:[/red] Capture-time privacy enforcement failed "

@@ -145,7 +145,7 @@ def _build_blocked_intervals(
 
 
 def _build_secure_field_intervals(
-    db_path: Path,
+    db_path: Path | None,
     hold_seconds: float = 1.0,
 ) -> list[_BlockedInterval]:
     """Build blocked intervals from action events with AXSecureTextField.
@@ -1017,51 +1017,54 @@ def _scrub_events_jsonl(
     blocked_starts = [iv.start for iv in blocked_intervals]
     had_errors = False
     db_redactions: list[dict] = []
-    output_lines: list[str] = []
+    tmp_path = str(events_jsonl) + ".tmp"
 
-    for raw_line in events_jsonl.read_text(encoding="utf-8").splitlines():
-        if not raw_line.strip():
-            output_lines.append(raw_line)
-            continue
+    with open(events_jsonl, "r", encoding="utf-8") as infile, \
+         open(tmp_path, "w", encoding="utf-8") as outfile:
+        for raw_line in infile:
+            raw_line = raw_line.rstrip("\n")
+            if not raw_line.strip():
+                outfile.write(raw_line + "\n")
+                continue
 
-        try:
-            event = json.loads(raw_line)
-        except json.JSONDecodeError:
-            console.print(
-                "  [yellow]Warning: malformed JSON line in events.jsonl[/]"
-            )
-            had_errors = True
-            continue
-
-        if event.get("_meta"):
-            output_lines.append(json.dumps(event, ensure_ascii=False))
-            continue
-
-        # Check blocked-app intervals
-        event_ts = event.get("timestamp", 0.0)
-        blocked = _find_blocked_interval(event_ts, blocked_intervals, blocked_starts)
-        if blocked is not None:
-            _null_event_content(event)
-            result.audit_entries.append(
-                AuditEntry(
-                    timestamp=event_ts,
-                    surface="event",
-                    action=blocked.action.value,
-                    reason=blocked.reason,
+            try:
+                event = json.loads(raw_line)
+            except json.JSONDecodeError:
+                console.print(
+                    "  [yellow]Warning: malformed JSON line in events.jsonl[/]"
                 )
+                had_errors = True
+                continue
+
+            if event.get("_meta"):
+                outfile.write(json.dumps(event, ensure_ascii=False) + "\n")
+                continue
+
+            # Check blocked-app intervals
+            event_ts = event.get("timestamp", 0.0)
+            blocked = _find_blocked_interval(event_ts, blocked_intervals, blocked_starts)
+            if blocked is not None:
+                _null_event_content(event)
+                result.audit_entries.append(
+                    AuditEntry(
+                        timestamp=event_ts,
+                        surface="event",
+                        action=blocked.action.value,
+                        reason=blocked.reason,
+                    )
+                )
+                outfile.write(json.dumps(event, ensure_ascii=False) + "\n")
+                continue
+
+            # Targeted key.type detection for combined-text secrets
+            _process_key_type_events(
+                event, pipeline, anonymizer, result, db_redactions
             )
-            output_lines.append(json.dumps(event, ensure_ascii=False))
-            continue
 
-        # Targeted key.type detection for combined-text secrets
-        _process_key_type_events(
-            event, pipeline, anonymizer, result, db_redactions
-        )
+            # Comprehensive scrub: run recursive walker on ALL events
+            _scrub_json_recursive(event, pipeline, anonymizer, result)
 
-        # Comprehensive scrub: run recursive walker on ALL events
-        _scrub_json_recursive(event, pipeline, anonymizer, result)
-
-        output_lines.append(json.dumps(event, ensure_ascii=False))
+            outfile.write(json.dumps(event, ensure_ascii=False) + "\n")
 
     # Batch DB redaction (single connection, single commit)
     if db_redactions:
@@ -1070,14 +1073,12 @@ def _scrub_events_jsonl(
     # Atomic write or delete on error
     if had_errors:
         events_jsonl.unlink(missing_ok=True)
+        if os.path.exists(tmp_path):
+            os.unlink(tmp_path)
         console.print(
             "  [yellow]Warning: events.jsonl deleted due to processing errors[/]"
         )
     else:
-        tmp_path = str(events_jsonl) + ".tmp"
-        with open(tmp_path, "w", encoding="utf-8") as f:
-            for line in output_lines:
-                f.write(line + "\n")
         os.rename(tmp_path, str(events_jsonl))
 
 
@@ -1190,7 +1191,7 @@ def scrub_recording(
 
     # 7. Copy (skipping media/derived files)
     with console.status(f"Copying {name} → {name}-scrubbed ..."):
-        shutil.copytree(src, dst, symlinks=True, ignore=_copytree_ignore)
+        shutil.copytree(src, dst, symlinks=False, ignore=_copytree_ignore)
 
     result.output_dir = dst
 
@@ -1218,21 +1219,25 @@ def scrub_recording(
     # 9. Load policy/context for policy-aware scrubbing
     blocked_intervals: list[_BlockedInterval] = []
     with console.status("Loading privacy policy and context..."):
+        # Phase 1: Load policy engine — hard fail if unavailable, since
+        # we cannot determine what to scrub without a policy.
+        from screencap.config import get_privacy_config
+        from screencap.privacy.context import (
+            DefaultContextClassifier,
+            load_browser_events,
+            load_window_events,
+        )
+        from screencap.privacy.policy import DefaultPolicyEvaluator
+
+        privacy_config = get_privacy_config()
+        evaluator = DefaultPolicyEvaluator(privacy_config)
+        classifier = DefaultContextClassifier(
+            app_classes=privacy_config.app_classes,
+        )
+
+        # Phase 2: Load recording-specific context — gracefully fall back
+        # if the DB lacks window/browser event tables (older recordings).
         try:
-            from screencap.config import get_privacy_config
-            from screencap.privacy.context import (
-                DefaultContextClassifier,
-                load_browser_events,
-                load_window_events,
-            )
-            from screencap.privacy.policy import DefaultPolicyEvaluator
-
-            privacy_config = get_privacy_config()
-            evaluator = DefaultPolicyEvaluator(privacy_config)
-            classifier = DefaultContextClassifier(
-                app_classes=privacy_config.app_classes,
-            )
-
             db_path = find_db(dst)
             window_events = load_window_events(db_path) if db_path else []
             browser_events = load_browser_events(db_path) if db_path else []
@@ -1249,11 +1254,9 @@ def scrub_recording(
                 )
         except Exception as exc:
             console.print(
-                f"  [yellow]Warning: policy/context loading failed ({exc}) — "
-                f"falling back to generic scrubbing[/]"
+                f"  [yellow]Warning: could not load recording context ({exc}) — "
+                f"policy-aware screenshot routing will be skipped[/]"
             )
-            evaluator = None  # type: ignore[assignment]
-            classifier = None  # type: ignore[assignment]
             window_events = []
             browser_events = []
 

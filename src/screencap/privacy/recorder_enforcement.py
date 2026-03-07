@@ -80,6 +80,9 @@ KEYSTROKE_CONTENT_FIELDS = (
     "canonical_key_name",
     "canonical_key_vk",
     "text",
+    "element_state",
+    "active_segment_description",
+    "available_segment_descriptions",
 )
 
 
@@ -198,6 +201,9 @@ class RecorderPrivacyFilter:
 
         now = time.monotonic()
         with self._lock:
+            # Clear fail-closed state on successful window event
+            self._blocked_reasons.pop("filter_error", None)
+
             was_blocked = "app_policy" in self._blocked_reasons
 
             if now_blocked:
@@ -260,6 +266,15 @@ class RecorderPrivacyFilter:
         if active:
             self._blocked_reasons["secure_input"] = now + self._hold_seconds
         # Don't clear — let hold timer expire naturally
+
+    def fail_closed(self) -> None:
+        """Block all capture until the next successful window event.
+
+        Called when on_window_event() or on_action_event() raises an
+        exception, to ensure the filter doesn't fail open with stale state.
+        """
+        with self._lock:
+            self._blocked_reasons["filter_error"] = float("inf")
 
     def is_screen_allowed(self, timestamp: float | None = None) -> bool:
         """Check whether screen capture is currently allowed.

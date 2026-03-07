@@ -358,6 +358,9 @@ class TestKeystrokeBlocking:
             "canonical_key_name": "p",
             "canonical_key_vk": 35,
             "text": "p",
+            "element_state": {"AXRole": "AXTextField"},
+            "active_segment_description": "seg",
+            "available_segment_descriptions": ["seg1"],
             "timestamp": 1234567890.0,
         }
 
@@ -395,6 +398,9 @@ class TestKeystrokeBlocking:
                 "canonical_key_name": "p",
                 "canonical_key_vk": 35,
                 "text": "p",
+                "element_state": {"AXRole": "AXTextField"},
+                "active_segment_description": "seg",
+                "available_segment_descriptions": ["seg1"],
             }
 
         # Blocked app → keystrokes nulled

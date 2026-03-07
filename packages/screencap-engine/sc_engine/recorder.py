@@ -310,6 +310,7 @@ def process_events(
                     screen_filter.on_window_event(event.data)
                 except Exception:
                     _drops["privacy_filter_error"] += 1
+                    screen_filter.fail_closed()
         elif event.type == "browser":
             if config.RECORD_BROWSER_EVENTS:
                 if process_event(
@@ -397,6 +398,7 @@ def process_events(
                     screen_filter.on_action_event(event.data)
                 except Exception:
                     _drops["privacy_filter_error"] += 1
+                    screen_filter.fail_closed()
 
             # Screenshot dedup gate
             should_save_screen = prev_saved_screen_timestamp < prev_screen_event.timestamp

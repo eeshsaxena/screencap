@@ -185,12 +185,15 @@ def _save_config_atomic(config_path: Path, doc: tomlkit.TOMLDocument) -> None:
         dir=str(config_path.parent),
         suffix=".toml.tmp",
     )
+    closed = False
     try:
         os.write(fd, tomlkit.dumps(doc).encode())
         os.close(fd)
+        closed = True
         os.rename(tmp_path, str(config_path))
     except Exception:
-        os.close(fd) if not os.get_inheritable(fd) else None
+        if not closed:
+            os.close(fd)
         if os.path.exists(tmp_path):
             os.unlink(tmp_path)
         raise
