@@ -9,7 +9,7 @@ Discovery strategy (ordered by speed):
 2. Spotlight enrichment: mdfind with 5s timeout (graceful fallback)
 
 Classification priority (first match wins):
-1. Bundle ID in known-apps DB (_BUNDLE_ID_MAP in context.py)
+1. Bundle ID in known-apps DB (BUNDLE_ID_MAP in context.py)
 2. Apple sensitive-app overrides (com.apple.mail, etc.)
 3. Apple bundle ID prefix (com.apple.* -> safe)
 4. Naming pattern heuristics (Agent/Helper/IM/etc.)
@@ -225,7 +225,7 @@ def auto_classify_detailed(metadata: AppMetadata) -> ClassificationResult:
     """Classify an app using multi-layer local heuristics.
 
     Priority (first match wins):
-    1. Known-apps DB (_BUNDLE_ID_MAP)
+    1. Known-apps DB (BUNDLE_ID_MAP)
     2. Browser bundle IDs (BROWSER_BUNDLE_IDS)
     3. Apple sensitive-app overrides
     4. Apple bundle ID prefix (com.apple.* -> safe)
@@ -234,13 +234,13 @@ def auto_classify_detailed(metadata: AppMetadata) -> ClassificationResult:
     7. LSApplicationCategoryType
     8. UNKNOWN
     """
-    from screencap.privacy.context import BROWSER_BUNDLE_IDS, _BUNDLE_ID_MAP
+    from screencap.privacy.context import BROWSER_BUNDLE_IDS, BUNDLE_ID_MAP
 
     bid = metadata.bundle_id
 
     # Layer 1: Known-apps DB
-    if bid in _BUNDLE_ID_MAP:
-        return ClassificationResult(_BUNDLE_ID_MAP[bid], "known_app")
+    if bid in BUNDLE_ID_MAP:
+        return ClassificationResult(BUNDLE_ID_MAP[bid], "known_app")
 
     # Layer 2: Browser bundle IDs
     if bid in BROWSER_BUNDLE_IDS:

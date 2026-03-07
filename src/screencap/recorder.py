@@ -508,10 +508,12 @@ def start_recording(
         from screencap.privacy.recorder_enforcement import RecorderPrivacyFilter
 
         privacy_config = get_privacy_config()
-        # --cloud flag: force PUBLIC mode, bypassing env var tightening
+        # --cloud flag: force mode, but never loosen past env var / config floor
         if force_mode is not None:
             from dataclasses import replace as _dc_replace
-            privacy_config = _dc_replace(privacy_config, mode=force_mode)
+            from screencap.privacy.policy import _MODE_STRICTNESS
+            if _MODE_STRICTNESS[force_mode] <= _MODE_STRICTNESS[privacy_config.mode]:
+                privacy_config = _dc_replace(privacy_config, mode=force_mode)
         # capture-time enforcement requires window events to detect which
         # app is frontmost.  If window data capture is disabled (via CLI
         # flag or RECORD_WINDOW_DATA env var), the filter would silently
@@ -533,14 +535,9 @@ def start_recording(
             if verbose:
                 console.print(f"[dim]Privacy mode: {privacy_config.mode.value}[/dim]")
     except Exception as e:
-        _is_public = (
-            privacy_config is not None
-            and privacy_config.mode.value == "public"
-        )
-        if _is_public:
+        if privacy_config is not None:
             console.print(
-                f"[red]Error:[/red] Capture-time privacy enforcement failed "
-                f"in public mode: {e}\n"
+                f"[red]Error:[/red] Capture-time privacy enforcement failed: {e}\n"
                 "Recording cannot proceed without privacy protection. "
                 "Check dependencies and configuration."
             )

@@ -798,15 +798,12 @@ class TestPrivacyFilterInitFailure:
             with pytest.raises(SystemExit):
                 start_recording("test", output_dir=tmp_path / "test-rec")
 
-    def test_internal_mode_warns_on_filter_failure(self, tmp_path):
-        """Internal mode logs a warning and continues recording."""
+    def test_internal_mode_exits_on_filter_failure(self, tmp_path):
+        """Internal mode hard-fails when privacy config exists but filter init fails."""
         from screencap.privacy.policy import PrivacyConfig, PrivacyMode
         from screencap.recorder import start_recording
 
         internal_config = PrivacyConfig(mode=PrivacyMode.INTERNAL)
-        mock_recorder = mock.MagicMock()
-        mock_recorder.wait_for_ready.return_value = True
-        mock_recorder.is_recording = False
 
         with (
             mock.patch("screencap.recorder._check_macos_permissions"),
@@ -823,9 +820,11 @@ class TestPrivacyFilterInitFailure:
                 side_effect=RuntimeError("missing dep"),
             ),
             mock.patch("sc_engine.Recorder") as MockRecorder,
+            pytest.raises(SystemExit) as exc_info,
         ):
-            MockRecorder.return_value.__enter__ = mock.MagicMock(return_value=mock_recorder)
+            MockRecorder.return_value.__enter__ = mock.MagicMock()
             MockRecorder.return_value.__exit__ = mock.MagicMock(return_value=False)
 
-            capture_dir, _ = start_recording("test", output_dir=tmp_path / "test-rec")
-            assert capture_dir.exists()
+            start_recording("test", output_dir=tmp_path / "test-rec")
+
+        assert exc_info.value.code == 1

@@ -16,6 +16,10 @@ from enum import Enum
 from types import MappingProxyType
 from typing import Protocol
 
+# Transition hold: suppress capture for this many seconds after switching
+# away from a blocked app.  Covers macOS Cmd+Tab animation (200-350ms).
+DEFAULT_TRANSITION_HOLD_SECONDS: float = 1.0
+
 from screencap.privacy.actions import ActionDecision, PrivacyAction, stricter
 from screencap.privacy.reasons import ReasonCode
 

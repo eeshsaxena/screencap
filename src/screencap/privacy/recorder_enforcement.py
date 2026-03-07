@@ -51,9 +51,10 @@ import threading
 import time
 from collections.abc import Callable
 
-from screencap.privacy.actions import PrivacyAction
+from screencap.privacy.actions import KEYSTROKE_CONTENT_FIELDS, PrivacyAction
 from screencap.privacy.context import DefaultContextClassifier
 from screencap.privacy.policy import (
+    DEFAULT_TRANSITION_HOLD_SECONDS,
     DefaultPolicyEvaluator,
     FrameMetadata,
     PrivacyConfig,
@@ -62,28 +63,9 @@ from screencap.privacy.reasons import ReasonCode
 
 logger = logging.getLogger(__name__)
 
-# Default transition hold: suppress capture for this many seconds after
-# switching away from a blocked app. Covers macOS app-switch animations
-# (Cmd+Tab ~200-350ms) with margin.
-DEFAULT_TRANSITION_HOLD_SECONDS: float = 1.0
-
 # Actions that mean "this app should not be captured"
 # Import from actions.py — single source of truth shared with scrubber.
 from screencap.privacy.actions import BLOCK_ACTIONS as _BLOCK_ACTIONS
-
-# Key event content fields to null when blocking keystrokes
-KEYSTROKE_CONTENT_FIELDS = (
-    "key_char",
-    "key_name",
-    "key_vk",
-    "canonical_key_char",
-    "canonical_key_name",
-    "canonical_key_vk",
-    "text",
-    "element_state",
-    "active_segment_description",
-    "available_segment_descriptions",
-)
 
 
 _UNSET = object()

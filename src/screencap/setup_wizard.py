@@ -27,7 +27,7 @@ from screencap.app_discovery import (
     discover_installed_apps,
     is_background_app,
 )
-from screencap.privacy.context import _BUNDLE_ID_MAP
+from screencap.privacy.context import BUNDLE_ID_MAP
 from screencap.privacy.policy import ContextClass, PrivacyMode
 
 console = Console()
@@ -92,7 +92,7 @@ def _classify_with_overrides(
 ) -> dict[str, tuple[AppMetadata, ContextClass, str]]:
     """Classify all apps, respecting existing config and hardcoded map.
 
-    Priority: existing config > auto_classify_detailed (which checks _BUNDLE_ID_MAP).
+    Priority: existing config > auto_classify_detailed (which checks BUNDLE_ID_MAP).
 
     Returns: dict of bundle_id -> (metadata, context_class, source)
     """
@@ -696,7 +696,7 @@ def run_setup_wizard(
                 if bid in final_allow:
                     final_allow.remove(bid)
             elif group_key in ("communication", "safe"):
-                if bid not in existing_ac and bid not in _BUNDLE_ID_MAP:
+                if bid not in existing_ac and bid not in BUNDLE_ID_MAP:
                     final_app_classes[bid] = cls.value
                 if bid in final_allow:
                     final_allow.remove(bid)

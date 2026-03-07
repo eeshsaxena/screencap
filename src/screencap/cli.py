@@ -37,7 +37,7 @@ def _report_unclassified_apps(capture_dir) -> None:
 
     from screencap.catalog import find_db
     from screencap.config import get_privacy_config
-    from screencap.privacy.context import _BUNDLE_ID_MAP
+    from screencap.privacy.context import BUNDLE_ID_MAP
 
     db_path = find_db(capture_dir)
     if not db_path:
@@ -70,7 +70,7 @@ def _report_unclassified_apps(capture_dir) -> None:
         return
 
     known_bids = (
-        set(_BUNDLE_ID_MAP.keys())
+        set(BUNDLE_ID_MAP.keys())
         | set(privacy_config.exclude_apps)
         | set(privacy_config.app_classes.keys())
     )

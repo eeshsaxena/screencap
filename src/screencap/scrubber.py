@@ -14,9 +14,9 @@ from rich.table import Table
 
 from screencap.catalog import find_db
 from screencap.config import get_recordings_dir, resolve_recording_dir
-from screencap.privacy.actions import BLOCK_ACTIONS, PrivacyAction
+from screencap.privacy.actions import BLOCK_ACTIONS, KEYSTROKE_CONTENT_FIELDS, PrivacyAction
+from screencap.privacy.policy import DEFAULT_TRANSITION_HOLD_SECONDS
 from screencap.privacy.reasons import AuditEntry, ReasonCode
-from screencap.privacy.recorder_enforcement import DEFAULT_TRANSITION_HOLD_SECONDS
 
 console = Console()
 
@@ -44,7 +44,7 @@ def _build_app_allowlist(metrics_path: Path) -> frozenset[str]:
 
 # Files to skip during copytree and delete as safety fallback.
 _SKIP_FILES = {"audio.flac", ".upload_status.json", "viewer.html"}
-_SKIP_EXTENSIONS = {".mp4"}
+_SKIP_EXTENSIONS = {".mp4", ".flac", ".wav", ".m4a", ".aac", ".ogg", ".opus"}
 
 
 @dataclass
@@ -393,27 +393,9 @@ def _null_event_content(event: dict) -> None:
 
     Handles nested structures like key.type inside mouse.drag.children.
     """
-    if "text" in event:
-        event["text"] = None
-    if "key_char" in event:
-        event["key_char"] = None
-    if "canonical_key_char" in event:
-        event["canonical_key_char"] = None
-    if "key_name" in event:
-        event["key_name"] = None
-    if "canonical_key_name" in event:
-        event["canonical_key_name"] = None
-    if "key_vk" in event:
-        event["key_vk"] = None
-    if "canonical_key_vk" in event:
-        event["canonical_key_vk"] = None
-    # AX attribute fields — match _null_db_rows_for_intervals coverage
-    if "element_state" in event:
-        event["element_state"] = None
-    if "active_segment_description" in event:
-        event["active_segment_description"] = None
-    if "available_segment_descriptions" in event:
-        event["available_segment_descriptions"] = None
+    for field in KEYSTROKE_CONTENT_FIELDS:
+        if field in event:
+            event[field] = None
     for child in event.get("children", []):
         _null_event_content(child)
 
@@ -437,27 +419,21 @@ def _null_db_rows_for_intervals(
             ).fetchall()
         }
 
-        # Check for key_vk columns (absent in older recordings)
-        _has_key_vk = False
+        # Build SET clause from canonical field list, skipping columns
+        # absent in older recordings.
+        ae_cols: set[str] = set()
         if "action_event" in tables:
             ae_cols = {
                 r[1]
                 for r in conn.execute("PRAGMA table_info(action_event)").fetchall()
             }
-            _has_key_vk = "key_vk" in ae_cols
-
-        _vk_clause = "key_vk = NULL, canonical_key_vk = NULL, " if _has_key_vk else ""
+        null_fields = sorted(f for f in KEYSTROKE_CONTENT_FIELDS if f in ae_cols)
+        ae_set_clause = ", ".join(f"{f} = NULL" for f in null_fields)
 
         for iv in intervals:
             if iv.end == float("inf"):
                 ae_sql = (
-                    "UPDATE action_event SET "
-                    "key_char = NULL, canonical_key_char = NULL, "
-                    "key_name = NULL, canonical_key_name = NULL, "
-                    f"{_vk_clause}"
-                    "element_state = NULL, "
-                    "active_segment_description = NULL, "
-                    "available_segment_descriptions = NULL "
+                    f"UPDATE action_event SET {ae_set_clause} "
                     "WHERE timestamp >= ?"
                 )
                 ae_params = (iv.start,)
@@ -469,13 +445,7 @@ def _null_db_rows_for_intervals(
                 we_params = (iv.start,)
             else:
                 ae_sql = (
-                    "UPDATE action_event SET "
-                    "key_char = NULL, canonical_key_char = NULL, "
-                    "key_name = NULL, canonical_key_name = NULL, "
-                    f"{_vk_clause}"
-                    "element_state = NULL, "
-                    "active_segment_description = NULL, "
-                    "available_segment_descriptions = NULL "
+                    f"UPDATE action_event SET {ae_set_clause} "
                     "WHERE timestamp >= ? AND timestamp < ?"
                 )
                 ae_params = (iv.start, iv.end)
@@ -486,7 +456,7 @@ def _null_db_rows_for_intervals(
                 )
                 we_params = (iv.start, iv.end)
 
-            if "action_event" in tables:
+            if "action_event" in tables and ae_set_clause:
                 conn.execute(ae_sql, ae_params)
 
             if "window_event" in tables:
@@ -1228,9 +1198,26 @@ def scrub_recording(
             load_browser_events,
             load_window_events,
         )
-        from screencap.privacy.policy import DefaultPolicyEvaluator
+        from screencap.privacy.policy import (
+            DefaultPolicyEvaluator,
+            PrivacyMode,
+            _MODE_STRICTNESS,
+        )
 
         privacy_config = get_privacy_config()
+
+        # Use the stricter of current config mode and capture-time intent
+        intent_path = dst / ".recording_intent"
+        if intent_path.exists():
+            try:
+                intent_data = json.loads(intent_path.read_text(encoding="utf-8"))
+                intent_mode = PrivacyMode(intent_data["privacy_mode"])
+                if _MODE_STRICTNESS[intent_mode] < _MODE_STRICTNESS[privacy_config.mode]:
+                    from dataclasses import replace as _dc_replace
+                    privacy_config = _dc_replace(privacy_config, mode=intent_mode)
+            except (json.JSONDecodeError, KeyError, ValueError, OSError):
+                pass  # Missing or malformed intent — use current config
+
         evaluator = DefaultPolicyEvaluator(privacy_config)
         classifier = DefaultContextClassifier(
             app_classes=privacy_config.app_classes,

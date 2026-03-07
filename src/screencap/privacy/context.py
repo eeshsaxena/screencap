@@ -230,7 +230,7 @@ def _domain_from_url(url: str) -> str:
 # ---------------------------------------------------------------------------
 
 # Verified macOS bundle IDs for well-known app categories.
-_BUNDLE_ID_MAP: dict[str, ContextClass] = {
+BUNDLE_ID_MAP: dict[str, ContextClass] = {
     # Password managers
     "com.1password.1password": ContextClass.PASSWORD_MANAGER,
     "com.agilebits.onepassword7": ContextClass.PASSWORD_MANAGER,
@@ -463,9 +463,9 @@ class DefaultContextClassifier:
             )
 
         # 2. Known app bundle ID
-        if bundle_id and bundle_id in _BUNDLE_ID_MAP:
+        if bundle_id and bundle_id in BUNDLE_ID_MAP:
             return ContextResult(
-                context_class=_BUNDLE_ID_MAP[bundle_id],
+                context_class=BUNDLE_ID_MAP[bundle_id],
                 confidence="bundle_id",
                 evidence=bundle_id,
             )

@@ -13,7 +13,7 @@ from screencap.privacy.context import (
     BrowserContext,
     DefaultContextClassifier,
     WindowContext,
-    _BUNDLE_ID_MAP,
+    BUNDLE_ID_MAP,
     associate_screenshot,
     find_nearest_window,
     load_browser_events,
@@ -305,9 +305,9 @@ class TestDefaultContextClassifier:
 
     # Data integrity: bundle ID map and browser IDs must be disjoint
     def test_bundle_id_map_disjoint_from_browser_ids(self):
-        overlap = set(_BUNDLE_ID_MAP.keys()) & BROWSER_BUNDLE_IDS
+        overlap = set(BUNDLE_ID_MAP.keys()) & BROWSER_BUNDLE_IDS
         assert overlap == set(), (
-            f"Bundle IDs in both _BUNDLE_ID_MAP and BROWSER_BUNDLE_IDS would "
+            f"Bundle IDs in both BUNDLE_ID_MAP and BROWSER_BUNDLE_IDS would "
             f"never reach the browser path: {overlap}"
         )
 

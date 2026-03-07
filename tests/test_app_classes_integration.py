@@ -58,7 +58,7 @@ class TestParsePrivacyConfigAppClasses:
 
 class TestClassifierUserConfigOverride:
     def test_user_config_overrides_hardcoded_map(self):
-        """User config should take priority over _BUNDLE_ID_MAP."""
+        """User config should take priority over BUNDLE_ID_MAP."""
         classifier = DefaultContextClassifier(
             app_classes={"com.tinyspeck.slackmacgap": ContextClass.CODE_EDITOR_TERMINAL}
         )
@@ -105,7 +105,7 @@ class TestPostRecordingReport:
 
             _report_unclassified_apps(tmp_path)
 
-            # VSCode is in _BUNDLE_ID_MAP so should not be reported.
+            # VSCode is in BUNDLE_ID_MAP so should not be reported.
             # Figma is unknown and must appear in the output.
             all_output = " ".join(
                 str(c) for c in mock_console.print.call_args_list
@@ -136,7 +136,7 @@ class TestPostRecordingReport:
              mock.patch("screencap.cli.console") as mock_console:
             from screencap.cli import _report_unclassified_apps
             _report_unclassified_apps(tmp_path)
-            # Should not print anything since VSCode is in _BUNDLE_ID_MAP
+            # Should not print anything since VSCode is in BUNDLE_ID_MAP
             mock_console.print.assert_not_called()
 
 

@@ -117,28 +117,28 @@ class TestAutoClassifyDetailed:
         assert result.source == "known_app"
 
     def test_apple_sensitive_mail(self):
-        """com.apple.mail is in _BUNDLE_ID_MAP, so it matches as known_app."""
+        """com.apple.mail is in BUNDLE_ID_MAP, so it matches as known_app."""
         meta = AppMetadata(path="/test", bundle_id="com.apple.mail", display_name="Mail")
         result = auto_classify_detailed(meta)
         assert result.context_class == ContextClass.EMAIL
         assert result.source == "known_app"
 
     def test_apple_sensitive_messages(self):
-        """com.apple.MobileSMS is in _BUNDLE_ID_MAP, so it matches as known_app."""
+        """com.apple.MobileSMS is in BUNDLE_ID_MAP, so it matches as known_app."""
         meta = AppMetadata(path="/test", bundle_id="com.apple.MobileSMS", display_name="Messages")
         result = auto_classify_detailed(meta)
         assert result.context_class == ContextClass.CHAT
         assert result.source == "known_app"
 
     def test_apple_passwords_in_known_db(self):
-        """com.apple.Passwords is in _BUNDLE_ID_MAP, matches as known_app."""
+        """com.apple.Passwords is in BUNDLE_ID_MAP, matches as known_app."""
         meta = AppMetadata(path="/test", bundle_id="com.apple.Passwords", display_name="Passwords")
         result = auto_classify_detailed(meta)
         assert result.context_class == ContextClass.PASSWORD_MANAGER
         assert result.source == "known_app"
 
     def test_apple_facetime_in_known_db(self):
-        """com.apple.FaceTime is in _BUNDLE_ID_MAP, matches as known_app."""
+        """com.apple.FaceTime is in BUNDLE_ID_MAP, matches as known_app."""
         meta = AppMetadata(path="/test", bundle_id="com.apple.FaceTime", display_name="FaceTime")
         result = auto_classify_detailed(meta)
         assert result.context_class == ContextClass.VIDEO_CALL
@@ -151,14 +151,14 @@ class TestAutoClassifyDetailed:
         assert result.source == "apple_prefix"
 
     def test_known_app_takes_priority_over_apple_prefix(self):
-        """Apps in _BUNDLE_ID_MAP must not fall through to the generic prefix rule."""
+        """Apps in BUNDLE_ID_MAP must not fall through to the generic prefix rule."""
         meta = AppMetadata(path="/test", bundle_id="com.apple.iCal", display_name="Calendar")
         result = auto_classify_detailed(meta)
         assert result.context_class == ContextClass.CALENDAR
         assert result.source == "known_app"
 
     def test_apple_sensitive_not_in_known_db(self):
-        """Apple sensitive apps not in _BUNDLE_ID_MAP use the apple_sensitive layer."""
+        """Apple sensitive apps not in BUNDLE_ID_MAP use the apple_sensitive layer."""
         meta = AppMetadata(path="/test", bundle_id="com.apple.Messages", display_name="Messages")
         result = auto_classify_detailed(meta)
         assert result.context_class == ContextClass.CHAT

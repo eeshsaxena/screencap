@@ -43,6 +43,23 @@ def stricter(a: PrivacyAction, b: PrivacyAction) -> PrivacyAction:
 BLOCK_ACTIONS = frozenset({PrivacyAction.EXCLUDE, PrivacyAction.MASK_WINDOW})
 
 
+# Keystroke content fields to null when blocking.
+# Single source of truth used by both recorder_enforcement (capture-time)
+# and scrubber (post-processing).
+KEYSTROKE_CONTENT_FIELDS = frozenset({
+    "key_char",
+    "key_name",
+    "key_vk",
+    "canonical_key_char",
+    "canonical_key_name",
+    "canonical_key_vk",
+    "text",
+    "element_state",
+    "active_segment_description",
+    "available_segment_descriptions",
+})
+
+
 @dataclass(frozen=True)
 class ActionDecision:
     """Result of a policy evaluation."""
