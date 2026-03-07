@@ -76,44 +76,43 @@ class TestGroupApps:
             "com.apple.Terminal": (_make_app("com.apple.Terminal", "Terminal"), ContextClass.CODE_EDITOR_TERMINAL, "known_app"),
             "com.example.unknown": (_make_app("com.example.unknown", "Unknown"), ContextClass.UNKNOWN, "unknown"),
         }
-        groups, bg_count = _group_apps(classified)
+        groups, auto_allowed = _group_apps(classified)
         assert len(groups["blocked"]) == 1
         assert len(groups["communication"]) == 1
         assert len(groups["code"]) == 1
         assert len(groups["needs_review"]) == 1
-        assert bg_count == 0
 
-    def test_safe_group_from_apple_prefix(self):
+    def test_apple_prefix_auto_allowed(self):
+        """Apple prefix apps are auto-allowed, not shown in groups."""
         classified = {
             "com.apple.Preview": (_make_app("com.apple.Preview", "Preview"), ContextClass.UNKNOWN, "apple_prefix"),
             "com.apple.Maps": (_make_app("com.apple.Maps", "Maps"), ContextClass.UNKNOWN, "apple_prefix"),
         }
-        groups, bg_count = _group_apps(classified)
-        assert len(groups["safe"]) == 2
+        groups, auto_allowed = _group_apps(classified)
+        assert len(auto_allowed) == 2
+        # Not in any visible group
+        assert all(len(g) == 0 for g in groups.values())
 
-    def test_safe_group_from_category_safe(self):
+    def test_category_safe_auto_allowed(self):
         classified = {
             "com.example.game": (_make_app("com.example.game", "Game"), ContextClass.UNKNOWN, "category_safe"),
         }
-        groups, bg_count = _group_apps(classified)
-        assert len(groups["safe"]) == 1
+        groups, auto_allowed = _group_apps(classified)
+        assert len(auto_allowed) == 1
+        assert all(len(g) == 0 for g in groups.values())
 
-    def test_background_apps_filtered(self):
+    def test_background_apps_auto_allowed(self):
         classified = {
             "com.example.agent": (
                 _make_app("com.example.agent", "SpotlightAgent", is_background=True),
                 ContextClass.UNKNOWN, "system_service",
             ),
-            "com.apple.Preview": (_make_app("com.apple.Preview", "Preview"), ContextClass.UNKNOWN, "apple_prefix"),
+            "com.example.unknown": (_make_app("com.example.unknown", "Unknown"), ContextClass.UNKNOWN, "unknown"),
         }
-        groups, bg_count = _group_apps(classified)
-        assert bg_count == 1
-        assert len(groups["safe"]) == 1
-        # Background app should not be in any group
-        all_apps = []
-        for g in groups.values():
-            all_apps.extend(g)
-        assert not any(m.bundle_id == "com.example.agent" for m, _, _ in all_apps)
+        groups, auto_allowed = _group_apps(classified)
+        assert len(auto_allowed) == 1
+        assert auto_allowed[0][0].bundle_id == "com.example.agent"
+        assert len(groups["needs_review"]) == 1
 
     def test_background_detected_by_name_pattern(self):
         """Apps with service-like names are detected as background even without plist flag."""
@@ -123,8 +122,8 @@ class TestGroupApps:
                 ContextClass.UNKNOWN, "system_service",
             ),
         }
-        groups, bg_count = _group_apps(classified)
-        assert bg_count == 1
+        groups, auto_allowed = _group_apps(classified)
+        assert len(auto_allowed) == 1
 
 
 class TestBuildSaveDoc:

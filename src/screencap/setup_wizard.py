@@ -61,19 +61,18 @@ _SAFE_SOURCES = frozenset({
     "category_safe",
 })
 
-# Human-friendly group labels
+# Human-friendly group labels (only groups shown to the user)
 _GROUP_LABELS = {
     "blocked": "Blocked",
     "communication": "Communication",
     "code": "Code & Terminals",
-    "safe": "Safe",
     "needs_review": "Needs review",
 }
 
 # Short target names for the edit command
 _MOVE_TARGETS = {
     "block": "blocked",
-    "safe": "safe",
+    "allow": "needs_review",  # move to needs_review = implicitly allowed on accept
     "comm": "communication",
     "code": "code",
 }
@@ -111,24 +110,31 @@ def _classify_with_overrides(
 
 def _group_apps(
     classified: dict[str, tuple[AppMetadata, ContextClass, str]],
-) -> dict[str, list[tuple[AppMetadata, ContextClass, str]]]:
+) -> tuple[
+    dict[str, list[tuple[AppMetadata, ContextClass, str]]],
+    list[tuple[AppMetadata, ContextClass, str]],
+]:
     """Group classified apps into display categories.
 
-    Background apps (is_background=True or system_service/input_method name)
-    are excluded from all display groups.
+    Background apps and safe auto-classified apps are collected separately
+    (silently auto-allowed, not shown in wizard).
+
+    Returns:
+        (groups, auto_allowed) where groups are the visible display groups
+        and auto_allowed are safe/background apps to silently allow.
     """
     groups: dict[str, list[tuple[AppMetadata, ContextClass, str]]] = {
         "blocked": [],
         "communication": [],
         "code": [],
-        "safe": [],
         "needs_review": [],
     }
-    background_count = 0
+    auto_allowed: list[tuple[AppMetadata, ContextClass, str]] = []
 
     for _bid, (meta, cls, source) in classified.items():
-        if is_background_app(meta):
-            background_count += 1
+        # Background apps and safe-classified apps are silently auto-allowed
+        if is_background_app(meta) or source in _SAFE_SOURCES:
+            auto_allowed.append((meta, cls, source))
             continue
 
         if cls in _BLOCKED_CLASSES:
@@ -137,28 +143,26 @@ def _group_apps(
             groups["communication"].append((meta, cls, source))
         elif cls in _CODE_CLASSES:
             groups["code"].append((meta, cls, source))
-        elif source in _SAFE_SOURCES:
-            groups["safe"].append((meta, cls, source))
         elif source == "unknown":
             groups["needs_review"].append((meta, cls, source))
         else:
-            # known_app, apple_sensitive, pattern_rule, category_map with UNKNOWN class
-            # These are auto-classified but not specifically sensitive
-            groups["safe"].append((meta, cls, source))
+            # known_app, apple_sensitive, pattern_rule, category_map
+            # that don't map to a specific sensitive class -> auto-allow
+            auto_allowed.append((meta, cls, source))
 
     for group in groups.values():
         group.sort(key=lambda x: x[0].display_name.lower())
 
-    return groups, background_count
+    return groups, auto_allowed
 
 
 def _print_grouped_summary(
     groups: dict[str, list[tuple[AppMetadata, ContextClass, str]]],
-    total: int,
-    background_count: int,
+    auto_allowed_count: int,
 ) -> None:
     """Print grouped classification summary."""
-    console.print(f"\nWe auto-classified {total} apps:\n")
+    visible = sum(len(g) for g in groups.values())
+    console.print(f"\n{visible} apps to review:\n")
 
     for key, label in _GROUP_LABELS.items():
         apps = groups.get(key, [])
@@ -170,23 +174,22 @@ def _print_grouped_summary(
             preview += f"... (+{len(names) - 5} more)"
         console.print(f"  [bold]{label} ({len(apps)} apps):[/bold] {preview}")
 
-    if background_count > 0:
+    if auto_allowed_count > 0:
         console.print(
-            f"\n  [dim]({background_count} system services auto-allowed, not shown)[/dim]"
+            f"\n  [dim]({auto_allowed_count} safe apps auto-allowed, not shown)[/dim]"
         )
 
 
 def _approve_or_edit(
     groups: dict[str, list[tuple[AppMetadata, ContextClass, str]]],
-    background_count: int,
+    auto_allowed_count: int,
 ) -> dict[str, list[tuple[AppMetadata, ContextClass, str]]]:
     """Approve-by-exception editing loop.
 
     Returns updated groups after user edits.
     """
     while True:
-        total = sum(len(g) for g in groups.values())
-        _print_grouped_summary(groups, total, background_count)
+        _print_grouped_summary(groups, auto_allowed_count)
 
         console.print()
         choice = click.prompt(
@@ -239,7 +242,7 @@ def _edit_group(
             "or 'q' to go back.[/dim]"
         )
         console.print(
-            "  [dim]Targets: block, safe, comm, code[/dim]"
+            "  [dim]Targets: block, allow, comm, code[/dim]"
         )
 
         raw = click.prompt("  >", default="q", prompt_suffix=" ")
@@ -282,7 +285,7 @@ def _edit_group(
             new_cls = ContextClass.CHAT
         elif target_key == "code":
             new_cls = ContextClass.CODE_EDITOR_TERMINAL
-        else:  # safe
+        else:  # needs_review (allowed on accept)
             new_cls = ContextClass.UNKNOWN
 
         groups[target_key].append((meta, new_cls, "user_edit"))
@@ -436,10 +439,10 @@ def run_setup_wizard(
         console.print(f"\nFound {len(new_classified)} new app(s).")
         classified = new_classified
 
-    groups, background_count = _group_apps(classified)
+    groups, auto_allowed = _group_apps(classified)
 
     # Approve-or-edit loop
-    groups = _approve_or_edit(groups, background_count)
+    groups = _approve_or_edit(groups, len(auto_allowed))
 
     # Build final config from groups
     final_exclude: list[str] = sorted(existing_exclude)
@@ -448,12 +451,13 @@ def run_setup_wizard(
         (bid, cls.value) for bid, cls in existing_ac.items()
     )
 
-    # Collect background apps -> allow_apps
-    for bid, (meta, cls, source) in classified.items():
-        if is_background_app(meta) and bid not in final_allow and bid not in final_exclude:
+    # Auto-allowed apps (background + safe) -> allow_apps
+    for meta, cls, source in auto_allowed:
+        bid = meta.bundle_id
+        if bid not in final_allow and bid not in final_exclude:
             final_allow.append(bid)
 
-    # Process groups
+    # Process visible groups
     for meta, cls, source in groups.get("blocked", []):
         bid = meta.bundle_id
         if bid not in final_exclude:
@@ -476,12 +480,6 @@ def run_setup_wizard(
         if bid in final_allow:
             final_allow.remove(bid)
 
-    for meta, cls, source in groups.get("safe", []):
-        bid = meta.bundle_id
-        if bid not in final_allow and bid not in final_exclude:
-            final_allow.append(bid)
-        final_app_classes.pop(bid, None)
-
     # needs_review apps are implicitly accepted as safe (user saw them and hit Y)
     for meta, cls, source in groups.get("needs_review", []):
         bid = meta.bundle_id
@@ -490,18 +488,6 @@ def run_setup_wizard(
 
     final_exclude.sort()
     final_allow.sort()
-
-    # Count stats
-    auto_count = sum(
-        1 for bid, (_, cls, source) in classified.items()
-        if source != "unknown"
-        and source != "user_config"
-    )
-    total_visible = sum(len(g) for g in groups.values())
-    console.print(
-        f"\n  {auto_count} apps classified automatically, "
-        f"{total_visible} visible in summary."
-    )
 
     # Save
     if not click.confirm("\n  Save to config?", default=True):

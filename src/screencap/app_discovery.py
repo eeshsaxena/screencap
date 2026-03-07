@@ -332,8 +332,20 @@ def _scan_filesystem() -> list[str]:
     return app_paths
 
 
+# Paths that contain system-internal apps (not user-visible).
+# Spotlight returns apps from these locations but they are framework
+# internals, not things users launch or care about.
+_SPOTLIGHT_EXCLUDE_PREFIXES = (
+    "/System/Library/",
+    "/Library/Apple/",
+)
+
+
 def _scan_spotlight(timeout: float = 5.0) -> list[str]:
     """Use mdfind to discover all .app bundles via Spotlight index.
+
+    Filters out system-internal apps from /System/Library/ and similar
+    paths that aren't user-visible applications.
 
     Returns empty list on timeout or error.
     """
@@ -349,6 +361,7 @@ def _scan_spotlight(timeout: float = 5.0) -> list[str]:
         return [
             line for line in result.stdout.strip().split("\n")
             if line and line.endswith(".app")
+            and not any(line.startswith(p) for p in _SPOTLIGHT_EXCLUDE_PREFIXES)
         ]
     except (subprocess.TimeoutExpired, FileNotFoundError, OSError):
         logger.debug("Spotlight scan failed or timed out")
