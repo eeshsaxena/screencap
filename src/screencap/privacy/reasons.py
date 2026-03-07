@@ -29,14 +29,6 @@ class ReasonCode:
     CONTEXT_BROWSER_UNVERIFIED = "context_browser_unverified"
     CONTEXT_UNKNOWN = "context_unknown"
 
-    # Text-redaction reasons
-    TEXT_SECRET = "text_secret"
-    TEXT_PII = "text_pii"
-
-    # OCR / image reasons
-    OCR_SECRET = "ocr_secret"
-    OCR_PII = "ocr_pii"
-
     # Secure input reasons (capture-time detection)
     SECURE_INPUT_ACTIVE = "secure_input_active"
     SECURE_FIELD_DETECTED = "secure_field_detected"
@@ -45,8 +37,6 @@ class ReasonCode:
     BLOCKED_APP_EXCLUDE = "blocked_app_exclude"
     BLOCKED_APP_MASK = "blocked_app_mask"
 
-    # Explicit allow
-    ALLOWED = "allowed"
 
 
 @dataclass(frozen=True)

@@ -161,18 +161,6 @@ def _apply_mask_to_image(img, regions: list[MaskRegion]) -> None:
             draw.text((text_x, text_y), label, fill=_LABEL_COLOR)
 
 
-def apply_mask(image_path: Path, regions: list[MaskRegion]) -> None:
-    """Apply visual masks to a screenshot image file, in-place.
-
-    Requires Pillow (available in record deps).
-    """
-    from PIL import Image
-
-    img = Image.open(image_path).convert("RGB")
-    _apply_mask_to_image(img, regions)
-    img.save(image_path, "JPEG", quality=85, exif=b"")
-
-
 def mask_screenshot(
     image_path: Path,
     context_class: ContextClass,
@@ -191,14 +179,22 @@ def mask_screenshot(
 
     from PIL import Image
 
-    img = Image.open(image_path).convert("RGB")
-    w, h = img.size
-
-    if strategy == MaskStrategy.PANE:
-        regions = pane_geometry(w, h, context_class, app_hint)
-    else:
+    if strategy == MaskStrategy.FULL_WINDOW:
+        # Read dimensions without decoding pixel data, then create blank image
+        with Image.open(image_path) as probe:
+            w, h = probe.size
+        img = Image.new("RGB", (w, h), _MASK_COLOR)
         regions = full_window_geometry(w, h, context_class)
+        # Draw labels on the blank image
+        _apply_mask_to_image(img, regions)
+        img.save(image_path, "JPEG", quality=85, exif=b"")
+        img.close()
+    else:
+        with Image.open(image_path) as img:
+            img = img.convert("RGB")
+            w, h = img.size
+            regions = pane_geometry(w, h, context_class, app_hint)
+            _apply_mask_to_image(img, regions)
+            img.save(image_path, "JPEG", quality=85, exif=b"")
 
-    _apply_mask_to_image(img, regions)
-    img.save(image_path, "JPEG", quality=85, exif=b"")
     return True

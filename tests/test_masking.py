@@ -20,7 +20,7 @@ from screencap.privacy.context import DefaultContextClassifier, WindowContext
 from screencap.privacy.masking import (
     MaskRegion,
     MaskStrategy,
-    apply_mask,
+    _apply_mask_to_image,
     full_window_geometry,
     mask_screenshot,
 )
@@ -71,25 +71,29 @@ def _avg_brightness(path: Path) -> float:
 
 
 # ---------------------------------------------------------------------------
-# apply_mask rendering
+# _apply_mask_to_image rendering
 # ---------------------------------------------------------------------------
 
 
-class TestApplyMask:
+class TestApplyMaskToImage:
     def test_produces_valid_darkened_jpeg(self, tmp_path):
-        """apply_mask writes a valid JPEG that is visually darker than the original."""
+        """_apply_mask_to_image renders masks that make the image visually darker."""
+        from PIL import Image
+
         img_path = _make_test_jpeg(tmp_path / "test.jpg")
         original_brightness = _avg_brightness(img_path)
 
         regions = [MaskRegion(x=0, y=0, width=100, height=80, label="email")]
-        apply_mask(img_path, regions)
+        img = Image.open(img_path).convert("RGB")
+        _apply_mask_to_image(img, regions)
+        img.save(img_path, "JPEG", quality=85, exif=b"")
+        img.close()
 
         # File is still a valid JPEG
-        from PIL import Image
-
         img = Image.open(img_path)
         assert img.format == "JPEG"
         assert img.size == (100, 80)
+        img.close()
 
         # Content is significantly darker
         masked_brightness = _avg_brightness(img_path)
