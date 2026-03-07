@@ -197,6 +197,7 @@ def _build_save_doc(
     exclude_apps: list[str],
     allow_apps: list[str],
     app_classes: dict[str, str],
+    upload_default: str = "ask",
 ) -> tomlkit.TOMLDocument:
     """Update the TOML document with privacy settings."""
     # Ensure [privacy] section exists
@@ -205,6 +206,7 @@ def _build_save_doc(
 
     privacy = doc["privacy"]
     privacy["mode"] = mode.value
+    privacy["upload_default"] = upload_default
 
     if exclude_apps:
         privacy["exclude_apps"] = exclude_apps
@@ -593,6 +595,27 @@ def run_setup_wizard(
         mode_choice = click.prompt("  Choice", type=click.IntRange(1, 2), default=2)
         mode = PrivacyMode.PUBLIC if mode_choice == 1 else PrivacyMode.INTERNAL
 
+    # Upload default selection (skip in scan-only mode)
+    existing_upload_default = (
+        existing_privacy.get("upload_default", "ask")
+        if isinstance(existing_privacy, dict) else "ask"
+    )
+    if scan_only:
+        upload_default = existing_upload_default
+    else:
+        console.print("\nDefault recording destination:")
+        console.print("  [#818cf8]1.[/#818cf8] Always local  -- recordings stay on this machine")
+        console.print("  [#818cf8]2.[/#818cf8] Always cloud  -- recordings use public mode and upload automatically")
+        console.print("  [#818cf8]3.[/#818cf8] Ask every time\n")
+        _default_choice = {"local": 1, "cloud": 2, "ask": 3}.get(existing_upload_default, 3)
+        dest_choice = click.prompt("  Choice", type=click.IntRange(1, 3), default=_default_choice)
+        upload_default = {1: "local", 2: "cloud", 3: "ask"}[dest_choice]
+        if upload_default == "cloud":
+            console.print(
+                "\n  [dim]Cloud recordings always use public privacy mode regardless "
+                "of the mode selected above. Sensitive apps will be blocked or masked.[/dim]"
+            )
+
     # Discover apps
     with console.status("Scanning installed apps..."):
         apps = discover_installed_apps(use_spotlight=True, spotlight_timeout=5.0)
@@ -685,7 +708,7 @@ def run_setup_wizard(
     final_allow.sort()
 
     # Save
-    doc = _build_save_doc(doc, mode, final_exclude, final_allow, final_app_classes)
+    doc = _build_save_doc(doc, mode, final_exclude, final_allow, final_app_classes, upload_default)
     _save_config_atomic(config_path, doc)
 
     # Invalidate cache
