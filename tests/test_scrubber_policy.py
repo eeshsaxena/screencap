@@ -32,6 +32,7 @@ from screencap.scrubber import (
     ScrubResult,
     _BlockedInterval,
     _build_blocked_intervals,
+    _build_secure_field_intervals,
     _null_db_rows_for_intervals,
     _scrub_events_jsonl,
     _scrub_screenshots_with_policy,
@@ -160,8 +161,9 @@ class TestScreenshotRouting:
 
         assert (dst / "screenshots" / "15.0.jpg").exists()
 
-    def test_ocr_fallback_screenshot_kept(self, tmp_path):
-        """Screenshot during code editor in public mode → OCR_FALLBACK → kept."""
+    def test_ocr_fallback_screenshot_masked(self, tmp_path):
+        """Screenshot during code editor in public mode → OCR_FALLBACK → masked
+        (fail closed to MASK_WINDOW because no OCR engine is available)."""
         dst = self._setup_screenshots(tmp_path, [15.0])
         evaluator = _make_evaluator(mode="public")
         classifier = DefaultContextClassifier()
@@ -174,7 +176,12 @@ class TestScreenshotRouting:
             dst, evaluator, classifier, window_events, [], result
         )
 
-        assert (dst / "screenshots" / "15.0.jpg").exists()
+        # File still exists (masked, not deleted) — unless masking fails,
+        # in which case it falls back to deletion.  Either way the original
+        # pixels are not exported verbatim.
+        assert len(result.audit_entries) == 1
+        entry = result.audit_entries[0]
+        assert entry.action in ("mask_window", "exclude")
 
     def test_emits_audit_entry_with_no_raw_text(self, tmp_path):
         """Every routed screenshot produces an audit entry without raw text."""
@@ -220,15 +227,23 @@ class TestEventsJsonlBlockedIntervals:
     def test_event_content_nulled_during_blocked_interval(
         self, tmp_path, pipeline_and_anonymizer
     ):
-        """Event at t=25 inside blocked interval [20,30) → text and key_char nulled."""
+        """Event at t=25 inside blocked interval [20,30) → all key fields nulled."""
         pipeline, anonymizer = pipeline_and_anonymizer
         event = {
             "timestamp": 25.0,
             "type": "key.type",
             "text": "hello",
             "children": [
-                {"type": "key.down", "key_char": "h", "canonical_key_char": "h"},
-                {"type": "key.up", "key_char": "h", "canonical_key_char": "h"},
+                {
+                    "type": "key.down",
+                    "key_char": "h", "canonical_key_char": "h",
+                    "key_name": "h", "canonical_key_name": "h",
+                },
+                {
+                    "type": "key.up",
+                    "key_char": "h", "canonical_key_char": "h",
+                    "key_name": "h", "canonical_key_name": "h",
+                },
             ],
         }
         rec = self._make_events_jsonl(tmp_path, [event])
@@ -250,8 +265,13 @@ class TestEventsJsonlBlockedIntervals:
         ]
         blocked_ev = lines[1]
         assert blocked_ev["text"] is None
-        assert blocked_ev["children"][0]["key_char"] is None
-        assert blocked_ev["children"][1]["key_char"] is None
+        child_down = blocked_ev["children"][0]
+        child_up = blocked_ev["children"][1]
+        assert child_down["key_char"] is None
+        assert child_down["key_name"] is None
+        assert child_down["canonical_key_name"] is None
+        assert child_up["key_char"] is None
+        assert child_up["key_name"] is None
 
     def test_event_outside_interval_gets_normal_scrubbing(
         self, tmp_path, pipeline_and_anonymizer
@@ -294,6 +314,7 @@ class TestDbRowNulling:
         """Create recording.db with action_event rows.
 
         rows: list of (id, timestamp, key_char, element_state) tuples.
+        key_name is set to the same value as key_char to mimic real data.
         """
         rec = tmp_path / "scrubbed"
         rec.mkdir(exist_ok=True)
@@ -309,6 +330,7 @@ class TestDbRowNulling:
             name TEXT, timestamp REAL,
             key_char TEXT, canonical_key_char TEXT,
             key_name TEXT, canonical_key_name TEXT,
+            key_vk TEXT, canonical_key_vk TEXT,
             element_state TEXT,
             active_segment_description TEXT,
             available_segment_descriptions TEXT
@@ -316,15 +338,15 @@ class TestDbRowNulling:
         )
         for row_id, ts, key_char, element_state in rows:
             conn.execute(
-                "INSERT INTO action_event VALUES (?, 1, 'press', ?, ?, ?, NULL, NULL, ?, NULL, NULL)",
-                (row_id, ts, key_char, key_char, element_state),
+                "INSERT INTO action_event VALUES (?, 1, 'press', ?, ?, ?, ?, ?, ?, ?, ?, NULL, NULL)",
+                (row_id, ts, key_char, key_char, key_char, key_char, key_char, key_char, element_state),
             )
         conn.commit()
         conn.close()
         return rec
 
     def test_rows_in_blocked_interval_are_nulled(self, tmp_path):
-        """action_event rows at t=25 inside [20,30) → key_char and element_state NULL."""
+        """action_event rows at t=25 inside [20,30) → all key fields and element_state NULL."""
         rec = self._setup_action_event_db(
             tmp_path,
             [
@@ -348,21 +370,74 @@ class TestDbRowNulling:
         conn = sqlite3.connect(str(rec / "recording.db"))
         cur = conn.cursor()
 
-        # Row inside interval → nulled
-        cur.execute("SELECT key_char, element_state FROM action_event WHERE id = 2")
+        # Row inside interval → all sensitive fields nulled
+        cur.execute(
+            "SELECT key_char, key_name, canonical_key_name, key_vk, canonical_key_vk, element_state "
+            "FROM action_event WHERE id = 2"
+        )
+        row = cur.fetchone()
+        assert row[0] is None  # key_char
+        assert row[1] is None  # key_name
+        assert row[2] is None  # canonical_key_name
+        assert row[3] is None  # key_vk
+        assert row[4] is None  # canonical_key_vk
+        assert row[5] is None  # element_state
+
+        # Rows outside interval → preserved
+        cur.execute(
+            "SELECT key_char, key_name, element_state "
+            "FROM action_event WHERE id = 1"
+        )
+        row = cur.fetchone()
+        assert row[0] == "a"
+        assert row[1] == "a"
+        assert row[2] == '{"role": "textField"}'
+
+        cur.execute("SELECT key_char, key_name FROM action_event WHERE id = 3")
+        row = cur.fetchone()
+        assert row[0] == "d"
+        assert row[1] == "d"
+        conn.close()
+
+    def test_last_interval_with_infinity_end_nulls_all_remaining(self, tmp_path):
+        """Last window event produces an interval with end=inf — all subsequent rows nulled."""
+        rec = self._setup_action_event_db(
+            tmp_path,
+            [
+                (1, 15.0, "a", None),  # before interval
+                (2, 25.0, "s", None),  # inside interval
+                (3, 99.0, "d", None),  # also inside (inf end)
+            ],
+        )
+        intervals = [
+            _BlockedInterval(
+                start=20.0,
+                end=float("inf"),
+                action=PrivacyAction.EXCLUDE,
+                reason="policy_excluded_app",
+            )
+        ]
+        result = ScrubResult()
+
+        _null_db_rows_for_intervals(rec, intervals, result)
+
+        conn = sqlite3.connect(str(rec / "recording.db"))
+        cur = conn.cursor()
+
+        # Before interval → preserved
+        cur.execute("SELECT key_char FROM action_event WHERE id = 1")
+        assert cur.fetchone()[0] == "a"
+
+        # Both rows inside → nulled
+        cur.execute("SELECT key_char, key_name FROM action_event WHERE id = 2")
         row = cur.fetchone()
         assert row[0] is None
         assert row[1] is None
 
-        # Rows outside interval → preserved
-        cur.execute("SELECT key_char, element_state FROM action_event WHERE id = 1")
+        cur.execute("SELECT key_char, key_name FROM action_event WHERE id = 3")
         row = cur.fetchone()
-        assert row[0] == "a"
-        assert row[1] == '{"role": "textField"}'
-
-        cur.execute("SELECT key_char, element_state FROM action_event WHERE id = 3")
-        row = cur.fetchone()
-        assert row[0] == "d"
+        assert row[0] is None
+        assert row[1] is None
         conn.close()
 
 
@@ -542,6 +617,97 @@ class TestNestedEventNulling:
         nested = drag["children"][0]
         assert nested["text"] is None
         assert nested["children"][0]["key_char"] is None
+
+
+# ---------------------------------------------------------------------------
+# AXSecureTextField detection in post-processing
+# ---------------------------------------------------------------------------
+
+
+class TestSecureFieldIntervals:
+    def _setup_db_with_element_state(self, tmp_path, rows):
+        """Create recording.db with action_event rows containing element_state.
+
+        rows: list of (id, timestamp, element_state_json_str) tuples.
+        """
+        db_path = tmp_path / "recording.db"
+        conn = sqlite3.connect(str(db_path))
+        conn.execute(
+            "CREATE TABLE recording (id INTEGER PRIMARY KEY, task_description TEXT)"
+        )
+        conn.execute("INSERT INTO recording VALUES (1, 'test')")
+        conn.execute(
+            """CREATE TABLE action_event (
+            id INTEGER PRIMARY KEY, recording_id INTEGER,
+            name TEXT, timestamp REAL,
+            key_char TEXT, canonical_key_char TEXT,
+            key_name TEXT, canonical_key_name TEXT,
+            key_vk TEXT, canonical_key_vk TEXT,
+            element_state TEXT,
+            active_segment_description TEXT,
+            available_segment_descriptions TEXT
+        )"""
+        )
+        for row_id, ts, es in rows:
+            conn.execute(
+                "INSERT INTO action_event VALUES (?, 1, 'click', ?, NULL, NULL, NULL, NULL, NULL, NULL, ?, NULL, NULL)",
+                (row_id, ts, es),
+            )
+        conn.commit()
+        conn.close()
+        return db_path
+
+    def test_secure_text_field_produces_interval(self, tmp_path):
+        """AXRole=AXSecureTextField in element_state → blocked interval."""
+        db_path = self._setup_db_with_element_state(tmp_path, [
+            (1, 10.0, '{"AXRole": "AXTextField"}'),
+            (2, 20.0, '{"AXRole": "AXSecureTextField"}'),
+            (3, 30.0, '{"AXRole": "AXTextField"}'),
+        ])
+
+        intervals = _build_secure_field_intervals(db_path, hold_seconds=1.0)
+
+        assert len(intervals) == 1
+        assert intervals[0].start == 20.0
+        assert intervals[0].end == 21.0
+        assert intervals[0].reason == "secure_field_detected"
+
+    def test_secure_subrole_produces_interval(self, tmp_path):
+        """AXSubrole=AXSecureTextField → blocked interval."""
+        db_path = self._setup_db_with_element_state(tmp_path, [
+            (1, 15.0, '{"AXSubrole": "AXSecureTextField"}'),
+        ])
+
+        intervals = _build_secure_field_intervals(db_path, hold_seconds=2.0)
+
+        assert len(intervals) == 1
+        assert intervals[0].start == 15.0
+        assert intervals[0].end == 17.0
+
+    def test_no_secure_fields_no_intervals(self, tmp_path):
+        """Normal text fields produce no intervals."""
+        db_path = self._setup_db_with_element_state(tmp_path, [
+            (1, 10.0, '{"AXRole": "AXTextField"}'),
+            (2, 20.0, '{"AXRole": "AXButton"}'),
+        ])
+
+        intervals = _build_secure_field_intervals(db_path, hold_seconds=1.0)
+
+        assert intervals == []
+
+    def test_adjacent_secure_fields_merged(self, tmp_path):
+        """Overlapping secure field intervals are merged."""
+        db_path = self._setup_db_with_element_state(tmp_path, [
+            (1, 10.0, '{"AXRole": "AXSecureTextField"}'),
+            (2, 10.5, '{"AXRole": "AXSecureTextField"}'),  # overlaps with first
+        ])
+
+        intervals = _build_secure_field_intervals(db_path, hold_seconds=1.0)
+
+        # Should merge into a single interval [10.0, 11.5)
+        assert len(intervals) == 1
+        assert intervals[0].start == 10.0
+        assert intervals[0].end == 11.5
 
 
 # ---------------------------------------------------------------------------

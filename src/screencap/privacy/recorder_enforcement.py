@@ -9,11 +9,12 @@ defense-in-depth for anything this layer cannot catch (e.g., browser
 tab-level content, OCR-based redaction).
 
 Design decisions:
-- Screenshots only: action events (keystrokes, mouse) and window events
-  are still captured during blocked periods. Post-processing handles
-  those. See docs/tickets/ for the follow-up to extend this.
-- Transition hold: 1.0s after switching FROM a blocked app, capture
-  remains suppressed. This covers macOS app-switch animations (200-350ms)
+- Screenshots AND keystrokes: when any blocking reason fires, both
+  screenshots are dropped and keystroke content is nulled before writing.
+- Multiple blocking sources: secure input, secure field, excluded app,
+  and policy block are tracked independently with per-source hold timers.
+- Transition hold: 1.0s after a blocking source deactivates before
+  resuming capture. Covers macOS app-switch animations (200-350ms)
   with margin. The cost is a few missed frames of the new (allowed) app,
   which is acceptable since post-processing preserves them regardless.
 - Thread-safe: called from the event_processor thread in sc_engine.
@@ -45,8 +46,10 @@ This is deferred because:
 
 from __future__ import annotations
 
+import logging
 import threading
 import time
+from collections.abc import Callable
 
 from screencap.privacy.actions import PrivacyAction
 from screencap.privacy.context import DefaultContextClassifier
@@ -55,6 +58,9 @@ from screencap.privacy.policy import (
     FrameMetadata,
     PrivacyConfig,
 )
+from screencap.privacy.reasons import ReasonCode
+
+logger = logging.getLogger(__name__)
 
 # Default transition hold: suppress capture for this many seconds after
 # switching away from a blocked app. Covers macOS app-switch animations
@@ -64,12 +70,54 @@ DEFAULT_TRANSITION_HOLD_SECONDS: float = 1.0
 # Actions that mean "this app should not be captured"
 _BLOCK_ACTIONS = frozenset({PrivacyAction.EXCLUDE, PrivacyAction.MASK_WINDOW})
 
+# Key event content fields to null when blocking keystrokes
+KEYSTROKE_CONTENT_FIELDS = (
+    "key_char",
+    "key_name",
+    "key_vk",
+    "canonical_key_char",
+    "canonical_key_name",
+    "canonical_key_vk",
+)
+
+
+def _load_secure_input_fn() -> Callable[[], bool] | None:
+    """Try to load CGSIsSecureEventInputSet via ctypes.
+
+    Returns a callable that checks macOS Secure Input mode, or None if
+    the symbol is unavailable (non-macOS, missing framework, etc.).
+    """
+    try:
+        import ctypes
+
+        cg = ctypes.CDLL(
+            "/System/Library/Frameworks/CoreGraphics.framework/CoreGraphics"
+        )
+        fn = cg.CGSIsSecureEventInputSet
+        fn.restype = ctypes.c_bool
+        fn.argtypes = []
+        # Smoke-test the call to catch segfaults early
+        fn()
+        return fn
+    except (OSError, AttributeError):
+        return None
+
 
 class RecorderPrivacyFilter:
     """Capture-time privacy filter for the recording pipeline.
 
     Observes window events in real-time and evaluates them against the
-    privacy policy to gate screen capture. Thread-safe.
+    privacy policy to gate screen capture and keystroke content.
+    Thread-safe.
+
+    Blocking sources are tracked independently:
+    - ``app_policy`` — from window event classification (excluded app,
+      password manager, etc.)
+    - ``secure_input`` — from macOS CGSIsSecureEventInputSet
+    - ``secure_field`` — from AXSecureTextField in element_state
+
+    ``is_screen_allowed()`` returns False if ANY source is active or
+    within its hold period.
 
     Usage from sc_engine integration::
 
@@ -78,15 +126,23 @@ class RecorderPrivacyFilter:
         # In process_events(), on window event:
         filter.on_window_event(event.data)
 
+        # On action event with element_state:
+        filter.on_action_event(event.data)
+
         # Before saving a screen event:
         if not filter.is_screen_allowed(timestamp):
             skip this screenshot
+
+        # Before writing a key event to disk:
+        if not filter.is_screen_allowed():
+            filter.null_keystroke_content(event.data)
     """
 
     def __init__(
         self,
         config: PrivacyConfig,
         transition_hold_seconds: float = DEFAULT_TRANSITION_HOLD_SECONDS,
+        secure_input_fn: Callable[[], bool] | None = ...,
     ) -> None:
         self._evaluator = DefaultPolicyEvaluator(config)
         self._classifier = DefaultContextClassifier()
@@ -94,11 +150,22 @@ class RecorderPrivacyFilter:
         self._hold_seconds = transition_hold_seconds
 
         # Mutable state (protected by _lock)
-        self._blocked = False
-        self._transition_hold_until: float = 0.0
+        # reason -> hold_until monotonic timestamp (0.0 = not active)
+        self._blocked_reasons: dict[str, float] = {}
         self._current_bundle_id: str = ""
         self._current_title: str = ""
-        self._block_reason: str = ""
+
+        # Secure Input detection (Layer 0)
+        if secure_input_fn is ...:
+            # Default: try to load from OS
+            self._secure_input_fn = _load_secure_input_fn()
+            if self._secure_input_fn is None:
+                logger.warning(
+                    "CGSIsSecureEventInputSet unavailable — "
+                    "Secure Input detection (Layer 0) disabled"
+                )
+        else:
+            self._secure_input_fn = secure_input_fn
 
     def on_window_event(self, window_data: dict) -> None:
         """Update blocked state from a window event.
@@ -116,47 +183,121 @@ class RecorderPrivacyFilter:
         meta = FrameMetadata(
             bundle_id=bundle_id,
             window_title=title,
-            timestamp=time.time(),
+            timestamp=time.monotonic(),
         )
         ctx = self._classifier.classify(meta)
         decision = self._evaluator.evaluate(ctx, meta)
         now_blocked = decision.action in _BLOCK_ACTIONS
 
+        now = time.monotonic()
         with self._lock:
-            was_blocked = self._blocked
+            was_blocked = "app_policy" in self._blocked_reasons
 
-            if was_blocked and not now_blocked:
-                # Transitioning from blocked → allowed: apply hold
-                self._transition_hold_until = time.time() + self._hold_seconds
+            if now_blocked:
+                # Set app_policy hold deadline far in the future (active block)
+                self._blocked_reasons["app_policy"] = float("inf")
+            elif was_blocked:
+                # Transitioning from blocked → allowed: start hold timer
+                self._blocked_reasons["app_policy"] = now + self._hold_seconds
+            # else: was not blocked, still not blocked — no change
 
-            self._blocked = now_blocked
             self._current_bundle_id = bundle_id
             self._current_title = title
-            self._block_reason = decision.reason if now_blocked else ""
+
+    def on_action_event(self, action_data: dict) -> None:
+        """Check action event for AXSecureTextField (Layer 1).
+
+        Called from the event_processor thread when an action event
+        has element_state. Checks AXRole and AXSubrole for secure
+        text field indicators.
+
+        Args:
+            action_data: The action event data dict, may contain
+                'element_state' with AX attributes.
+        """
+        element_state = action_data.get("element_state")
+        if not element_state or not isinstance(element_state, dict):
+            return
+
+        is_secure = (
+            element_state.get("AXRole") == "AXSecureTextField"
+            or element_state.get("AXSubrole") == "AXSecureTextField"
+        )
+
+        now = time.monotonic()
+        with self._lock:
+            if is_secure:
+                self._blocked_reasons["secure_field"] = now + self._hold_seconds
+            # Don't clear secure_field here — let the hold timer expire naturally
+
+    def _check_secure_input(self) -> None:
+        """Poll macOS Secure Input mode (Layer 0).
+
+        Called from is_screen_allowed(). Updates the secure_input
+        blocking reason based on the current system state.
+        """
+        if self._secure_input_fn is None:
+            return
+
+        try:
+            active = self._secure_input_fn()
+        except Exception:
+            return
+
+        now = time.monotonic()
+        # Lock is already held by the caller (is_screen_allowed)
+        if active:
+            self._blocked_reasons["secure_input"] = now + self._hold_seconds
+        # Don't clear — let hold timer expire naturally
 
     def is_screen_allowed(self, timestamp: float | None = None) -> bool:
         """Check whether screen capture is currently allowed.
 
+        Also checks macOS Secure Input mode (Layer 0) on each call.
+
         Args:
-            timestamp: Optional Unix timestamp. If not provided, uses
-                current time. Used for transition hold check.
+            timestamp: Ignored (kept for API compatibility). The hold
+                check always uses the monotonic clock internally.
 
         Returns:
             True if capture should proceed, False if blocked.
         """
-        now = timestamp if timestamp is not None else time.time()
+        now = time.monotonic()
         with self._lock:
-            if self._blocked:
-                return False
-            if now < self._transition_hold_until:
-                return False
-            return True
+            self._check_secure_input()
+
+            # Clean up expired hold timers and check if any are still active.
+            # Strict > so a deadline of exactly `now` blocks for this cycle.
+            expired = []
+            for reason, hold_until in self._blocked_reasons.items():
+                if hold_until != float("inf") and now > hold_until:
+                    expired.append(reason)
+
+            for reason in expired:
+                del self._blocked_reasons[reason]
+
+            return len(self._blocked_reasons) == 0
+
+    @staticmethod
+    def null_keystroke_content(action_data: dict) -> None:
+        """Null out keystroke content fields in an action event dict.
+
+        Preserves structural metadata (timestamp, action name, event type).
+        Mouse and window events pass through unchanged.
+        """
+        for field in KEYSTROKE_CONTENT_FIELDS:
+            if field in action_data:
+                action_data[field] = None
 
     @property
     def is_blocked(self) -> bool:
-        """Whether the current frontmost app is blocked (no hold logic)."""
+        """Whether any blocking reason is currently active (no hold logic)."""
+        now = time.monotonic()
         with self._lock:
-            return self._blocked
+            for hold_until in self._blocked_reasons.values():
+                if hold_until == float("inf") or now < hold_until:
+                    return True
+            return False
 
     @property
     def current_bundle_id(self) -> str:
@@ -165,5 +306,10 @@ class RecorderPrivacyFilter:
 
     @property
     def block_reason(self) -> str:
+        """Primary blocking reason (first active reason)."""
+        now = time.monotonic()
         with self._lock:
-            return self._block_reason
+            for reason, hold_until in self._blocked_reasons.items():
+                if hold_until == float("inf") or now < hold_until:
+                    return reason
+            return ""

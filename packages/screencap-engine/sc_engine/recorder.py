@@ -288,7 +288,7 @@ def process_events(
             if config.RECORD_FULL_VIDEO:
                 # Privacy filter: skip full-video frames for blocked apps
                 if screen_filter is not None and not screen_filter.is_screen_allowed(event.timestamp):
-                    _drops["privacy_full_video"] = _drops.get("privacy_full_video", 0) + 1
+                    _drops["privacy_full_video"] += 1
                 else:
                     video_event = event._replace(type="screen/video")
                     if process_event(
@@ -309,7 +309,7 @@ def process_events(
                 try:
                     screen_filter.on_window_event(event.data)
                 except Exception:
-                    pass  # filter errors must not break recording
+                    _drops["privacy_filter_error"] += 1
         elif event.type == "browser":
             if config.RECORD_BROWSER_EVENTS:
                 if process_event(
@@ -391,6 +391,13 @@ def process_events(
                 if element_state is not None:
                     event.data["element_state"] = element_state
 
+            # Notify privacy filter of AXSecureTextField (Layer 1)
+            if screen_filter is not None and event.data.get("element_state"):
+                try:
+                    screen_filter.on_action_event(event.data)
+                except Exception:
+                    _drops["privacy_filter_error"] += 1
+
             # Screenshot dedup gate
             should_save_screen = prev_saved_screen_timestamp < prev_screen_event.timestamp
             current_hash: int | None = None
@@ -399,7 +406,7 @@ def process_events(
             if should_save_screen and screen_filter is not None:
                 if not screen_filter.is_screen_allowed(prev_screen_event.timestamp):
                     should_save_screen = False
-                    _drops["privacy_screen"] = _drops.get("privacy_screen", 0) + 1
+                    _drops["privacy_screen"] += 1
 
             if should_save_screen and config.SCREENSHOT_DEDUP:
                 if prev_saved_screen_hash is None:
@@ -446,6 +453,14 @@ def process_events(
                     events_to_write.append(
                         (prev_window_event, window_write_q, write_window_event)
                     )
+            # Privacy filter: null keystroke content for blocked apps/inputs
+            if screen_filter is not None:
+                _action_name = event.data.get("name", "")
+                if _action_name in ("key.down", "key.up"):
+                    if not screen_filter.is_screen_allowed(event.timestamp):
+                        screen_filter.null_keystroke_content(event.data)
+                        _drops["privacy_keystroke"] += 1
+
             # Action event last — the anchor record that references the others
             events_to_write.append((event, action_write_q, write_action_event))
 

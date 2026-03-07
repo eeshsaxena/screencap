@@ -37,6 +37,10 @@ class ReasonCode:
     OCR_SECRET = "ocr_secret"
     OCR_PII = "ocr_pii"
 
+    # Secure input reasons (capture-time detection)
+    SECURE_INPUT_ACTIVE = "secure_input_active"
+    SECURE_FIELD_DETECTED = "secure_field_detected"
+
     # Blocked-app interval reasons
     BLOCKED_APP_EXCLUDE = "blocked_app_exclude"
     BLOCKED_APP_MASK = "blocked_app_mask"
