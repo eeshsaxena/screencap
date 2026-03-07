@@ -14,6 +14,7 @@ class ReasonCode:
     # Policy-layer reasons
     POLICY_EXCLUDED_APP = "policy_excluded_app"
     POLICY_MASKED_DOMAIN = "policy_masked_domain"
+    POLICY_ALLOWED_APP = "policy_allowed_app"
     POLICY_MASKED_TITLE = "policy_masked_title"
     POLICY_MODE_DEFAULT = "policy_mode_default"
 

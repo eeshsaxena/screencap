@@ -130,12 +130,16 @@ class PrivacyConfig:
 
     mode: PrivacyMode = PrivacyMode.INTERNAL
     exclude_apps: frozenset[str] = field(default_factory=frozenset)
+    allow_apps: frozenset[str] = field(default_factory=frozenset)
     mask_domains: frozenset[str] = field(default_factory=frozenset)
     mask_title_patterns: tuple[re.Pattern[str], ...] = ()
     app_classes: dict[str, ContextClass] = field(default_factory=dict)
 
     def is_excluded_app(self, bundle_id: str) -> bool:
         return bundle_id in self.exclude_apps
+
+    def is_allowed_app(self, bundle_id: str) -> bool:
+        return bundle_id in self.allow_apps
 
     def is_masked_domain(self, domain: str) -> bool:
         domain = domain.lower()
@@ -205,6 +209,19 @@ def parse_privacy_config(toml_dict: dict) -> PrivacyConfig:
             )
     exclude_apps = frozenset(raw_apps)
 
+    # allow_apps
+    raw_allow = section.get("allow_apps", [])
+    if not isinstance(raw_allow, list):
+        raise InvalidPrivacyConfigError(
+            f"privacy.allow_apps must be a list, got {type(raw_allow).__name__}"
+        )
+    for i, app in enumerate(raw_allow):
+        if not isinstance(app, str):
+            raise InvalidPrivacyConfigError(
+                f"privacy.allow_apps[{i}] must be a string, got {type(app).__name__}"
+            )
+    allow_apps = frozenset(raw_allow)
+
     # mask_domains
     raw_domains = section.get("mask_domains", [])
     if not isinstance(raw_domains, list):
@@ -261,6 +278,7 @@ def parse_privacy_config(toml_dict: dict) -> PrivacyConfig:
     return PrivacyConfig(
         mode=mode,
         exclude_apps=exclude_apps,
+        allow_apps=allow_apps,
         mask_domains=mask_domains,
         mask_title_patterns=tuple(compiled),
         app_classes=app_classes,
@@ -328,9 +346,10 @@ class DefaultPolicyEvaluator:
 
     Precedence (highest to lowest):
     1. Explicit user denylist (exclude_apps via bundle_id)
-    2. Domain mask rules (mask_domains)
-    3. Title mask rules (mask_title_patterns)
-    4. Action matrix lookup (context_class, privacy_mode)
+    2. Explicit user allowlist (allow_apps via bundle_id)
+    3. Domain mask rules (mask_domains)
+    4. Title mask rules (mask_title_patterns)
+    5. Action matrix lookup (context_class, privacy_mode)
 
     At each level, the result is compared with the matrix default and
     the stricter action wins.
@@ -359,7 +378,15 @@ class DefaultPolicyEvaluator:
                 evidence=metadata.bundle_id,
             )
 
-        # 2. Domain mask
+        # 2. Explicit app allow
+        if metadata.bundle_id and self._config.is_allowed_app(metadata.bundle_id):
+            return ActionDecision(
+                action=PrivacyAction.ALLOW,
+                reason=ReasonCode.POLICY_ALLOWED_APP,
+                evidence=metadata.bundle_id,
+            )
+
+        # 3. Domain mask
         if metadata.domain and self._config.is_masked_domain(metadata.domain):
             matrix_action = get_matrix_action(context.context_class, mode)
             forced = stricter(PrivacyAction.MASK_WINDOW, matrix_action)
@@ -369,7 +396,7 @@ class DefaultPolicyEvaluator:
                 evidence=metadata.domain,
             )
 
-        # 3. Title mask
+        # 4. Title mask
         if metadata.window_title:
             title_match = self._config.matches_title_pattern(metadata.window_title)
             if title_match:
@@ -381,7 +408,7 @@ class DefaultPolicyEvaluator:
                     evidence=f"pattern={title_match}",
                 )
 
-        # 4. Matrix default
+        # 5. Matrix default
         action = get_matrix_action(context.context_class, mode)
         reason = _CONTEXT_REASON.get(
             context.context_class, ReasonCode.POLICY_MODE_DEFAULT

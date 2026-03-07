@@ -96,6 +96,20 @@ class TestParsePrivacyConfig:
         with pytest.raises(InvalidPrivacyConfigError, match="not a valid regex"):
             parse_privacy_config({"privacy": {"mask_title_patterns": ["(unclosed"]}})
 
+    def test_allow_apps_parsing(self):
+        cfg = parse_privacy_config(
+            {"privacy": {"allow_apps": ["com.apple.Finder", "com.apple.Preview"]}}
+        )
+        assert cfg.allow_apps == frozenset({"com.apple.Finder", "com.apple.Preview"})
+
+    def test_allow_apps_defaults_to_empty(self):
+        cfg = parse_privacy_config({})
+        assert cfg.allow_apps == frozenset()
+
+    def test_allow_apps_invalid_type_rejected(self):
+        with pytest.raises(InvalidPrivacyConfigError, match="must be a list"):
+            parse_privacy_config({"privacy": {"allow_apps": "not-a-list"}})
+
     def test_env_var_overrides_mode(self, monkeypatch):
         monkeypatch.setenv("SCREENCAP_PRIVACY_MODE", "public")
         cfg = parse_privacy_config({"privacy": {"mode": "internal"}})
@@ -160,6 +174,52 @@ class TestDefaultPolicyEvaluator:
         d = ev.evaluate(ctx, FrameMetadata())
         assert d.action == PrivacyAction.ALLOW
         assert d.reason == ReasonCode.CONTEXT_CODE_EDITOR_TERMINAL
+
+    def test_allow_apps_returns_allow(self):
+        """allow_apps grants ALLOW regardless of mode."""
+        ev = self._make_evaluator(mode="public", allow_apps=["com.example.app"])
+        ctx = ContextResult(ContextClass.UNKNOWN)
+        meta = FrameMetadata(bundle_id="com.example.app")
+        d = ev.evaluate(ctx, meta)
+        assert d.action == PrivacyAction.ALLOW
+        assert d.reason == ReasonCode.POLICY_ALLOWED_APP
+
+    def test_exclude_apps_beats_allow_apps(self):
+        """exclude_apps takes precedence over allow_apps."""
+        ev = self._make_evaluator(
+            mode="public",
+            exclude_apps=["com.example.app"],
+            allow_apps=["com.example.app"],
+        )
+        ctx = ContextResult(ContextClass.UNKNOWN)
+        meta = FrameMetadata(bundle_id="com.example.app")
+        d = ev.evaluate(ctx, meta)
+        assert d.action == PrivacyAction.EXCLUDE
+
+    def test_allow_apps_beats_domain_mask(self):
+        """allow_apps takes precedence over domain mask rules."""
+        ev = self._make_evaluator(
+            mode="public",
+            allow_apps=["com.example.app"],
+            mask_domains=["example.com"],
+        )
+        ctx = ContextResult(ContextClass.UNKNOWN)
+        meta = FrameMetadata(bundle_id="com.example.app", domain="example.com")
+        d = ev.evaluate(ctx, meta)
+        assert d.action == PrivacyAction.ALLOW
+        assert d.reason == ReasonCode.POLICY_ALLOWED_APP
+
+    def test_allow_apps_beats_title_mask(self):
+        """allow_apps takes precedence over title mask rules."""
+        ev = self._make_evaluator(
+            mode="public",
+            allow_apps=["com.example.app"],
+            mask_title_patterns=["(?i)secret"],
+        )
+        ctx = ContextResult(ContextClass.UNKNOWN)
+        meta = FrameMetadata(bundle_id="com.example.app", window_title="Secret Window")
+        d = ev.evaluate(ctx, meta)
+        assert d.action == PrivacyAction.ALLOW
 
     def test_domain_mask_defers_to_stricter_matrix_action(self):
         """When matrix already says EXCLUDE, domain mask doesn't weaken it."""

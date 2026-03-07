@@ -287,6 +287,22 @@ class TestDefaultContextClassifier:
         assert result.context_class == ContextClass.UNKNOWN
         assert result.evidence == "no_matching_signal"
 
+    # Data integrity: expanded bundle ID map spot checks
+    @pytest.mark.parametrize("bundle_id, expected", [
+        ("org.keepassxc.keepassxc", ContextClass.PASSWORD_MANAGER),
+        ("org.whispersystems.signal-desktop", ContextClass.CHAT),
+        ("io.alacritty", ContextClass.CODE_EDITOR_TERMINAL),
+        ("com.mitchellh.ghostty", ContextClass.CODE_EDITOR_TERMINAL),
+        ("com.apple.Passwords", ContextClass.PASSWORD_MANAGER),
+        ("com.apple.FaceTime", ContextClass.VIDEO_CALL),
+        ("org.mozilla.thunderbird", ContextClass.EMAIL),
+        ("com.tableplus.TablePlus", ContextClass.ADMIN_CONSOLE),
+    ])
+    def test_expanded_bundle_id_map(self, bundle_id, expected):
+        meta = FrameMetadata(bundle_id=bundle_id)
+        result = self.classifier.classify(meta)
+        assert result.context_class == expected
+
     # Data integrity: bundle ID map and browser IDs must be disjoint
     def test_bundle_id_map_disjoint_from_browser_ids(self):
         overlap = set(_BUNDLE_ID_MAP.keys()) & BROWSER_BUNDLE_IDS

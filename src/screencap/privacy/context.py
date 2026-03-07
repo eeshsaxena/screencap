@@ -237,8 +237,17 @@ _BUNDLE_ID_MAP: dict[str, ContextClass] = {
     "com.lastpass.LastPass": ContextClass.PASSWORD_MANAGER,
     "com.bitwarden.desktop": ContextClass.PASSWORD_MANAGER,
     "com.dashlane.Dashlane": ContextClass.PASSWORD_MANAGER,
-    # Banking (major US/UK/EU banking apps with macOS presence)
-    "com.chase.sig.android": ContextClass.BANKING,
+    "org.keepassxc.keepassxc": ContextClass.PASSWORD_MANAGER,
+    "com.sinew.Enpass-Desktop": ContextClass.PASSWORD_MANAGER,
+    "com.nordpass.NordPass": ContextClass.PASSWORD_MANAGER,
+    "com.apple.Passwords": ContextClass.PASSWORD_MANAGER,
+    # Banking / finance
+    "com.robinhood.Robinhood": ContextClass.BANKING,
+    "com.coinbase.Coinbase": ContextClass.BANKING,
+    "com.wealthfront.wealthfront": ContextClass.BANKING,
+    "com.personalcapital.pcap": ContextClass.BANKING,
+    "com.intuit.quicken": ContextClass.BANKING,
+    "com.coppernic.coppernic": ContextClass.BANKING,
     # Email
     "com.apple.mail": ContextClass.EMAIL,
     "com.microsoft.Outlook": ContextClass.EMAIL,
@@ -246,6 +255,10 @@ _BUNDLE_ID_MAP: dict[str, ContextClass] = {
     "com.freron.MailMate": ContextClass.EMAIL,
     "com.superhuman.electron": ContextClass.EMAIL,
     "com.mimestream.Mimestream": ContextClass.EMAIL,
+    "it.bloop.airmail2": ContextClass.EMAIL,
+    "com.postbox-inc.postbox": ContextClass.EMAIL,
+    "com.canarymail.mac": ContextClass.EMAIL,
+    "org.mozilla.thunderbird": ContextClass.EMAIL,
     # Chat / messaging
     "com.tinyspeck.slackmacgap": ContextClass.CHAT,
     "com.hnc.Discord": ContextClass.CHAT,
@@ -256,12 +269,27 @@ _BUNDLE_ID_MAP: dict[str, ContextClass] = {
     "com.microsoft.teams2": ContextClass.CHAT,
     "us.zoom.xos": ContextClass.CHAT,
     "com.skype.skype": ContextClass.CHAT,
+    "org.whispersystems.signal-desktop": ContextClass.CHAT,
+    "jp.naver.line.mac": ContextClass.CHAT,
+    "com.viber.osx": ContextClass.CHAT,
+    "com.tencent.xinWeChat": ContextClass.CHAT,
+    "im.riot.app": ContextClass.CHAT,  # Element
+    "com.beeper.beeper": ContextClass.CHAT,
+    "com.cisco.webexmeetings": ContextClass.CHAT,  # Webex Teams/Messaging
+    "com.google.chat": ContextClass.CHAT,
+    "com.mattermost.desktop": ContextClass.CHAT,
+    "com.wire.WireForOSX": ContextClass.CHAT,
     # Calendar
     "com.apple.iCal": ContextClass.CALENDAR,
     "com.flexibits.fantastical2.mac": ContextClass.CALENDAR,
+    "com.busymac.busycal3": ContextClass.CALENDAR,
+    "com.flexibits.fantastical": ContextClass.CALENDAR,
     # Video call (standalone video apps)
     "us.zoom.xos.meeting": ContextClass.VIDEO_CALL,
     "com.google.meet": ContextClass.VIDEO_CALL,
+    "com.cisco.webex.meetingmanager": ContextClass.VIDEO_CALL,
+    "com.logmein.GoToMeeting": ContextClass.VIDEO_CALL,
+    "com.apple.FaceTime": ContextClass.VIDEO_CALL,
     # Code editors / terminals
     "com.microsoft.VSCode": ContextClass.CODE_EDITOR_TERMINAL,
     "com.apple.Terminal": ContextClass.CODE_EDITOR_TERMINAL,
@@ -271,12 +299,35 @@ _BUNDLE_ID_MAP: dict[str, ContextClass] = {
     "com.jetbrains.intellij": ContextClass.CODE_EDITOR_TERMINAL,
     "com.jetbrains.pycharm": ContextClass.CODE_EDITOR_TERMINAL,
     "com.jetbrains.WebStorm": ContextClass.CODE_EDITOR_TERMINAL,
+    "com.jetbrains.goland": ContextClass.CODE_EDITOR_TERMINAL,
+    "com.jetbrains.CLion": ContextClass.CODE_EDITOR_TERMINAL,
+    "com.jetbrains.rider": ContextClass.CODE_EDITOR_TERMINAL,
+    "com.jetbrains.rubymine": ContextClass.CODE_EDITOR_TERMINAL,
+    "com.jetbrains.datagrip": ContextClass.CODE_EDITOR_TERMINAL,
     "com.sublimetext.4": ContextClass.CODE_EDITOR_TERMINAL,
     "com.todesktop.230313mzl4w4u92": ContextClass.CODE_EDITOR_TERMINAL,  # Cursor
     "dev.zed.Zed": ContextClass.CODE_EDITOR_TERMINAL,
     "com.github.atom": ContextClass.CODE_EDITOR_TERMINAL,
     "com.panic.Nova": ContextClass.CODE_EDITOR_TERMINAL,
     "com.codeux.irc.textual5": ContextClass.CODE_EDITOR_TERMINAL,
+    "io.alacritty": ContextClass.CODE_EDITOR_TERMINAL,
+    "net.kovidgoyal.kitty": ContextClass.CODE_EDITOR_TERMINAL,
+    "com.mitchellh.ghostty": ContextClass.CODE_EDITOR_TERMINAL,
+    "com.github.nicegraphic.rio": ContextClass.CODE_EDITOR_TERMINAL,
+    "com.barebones.bbedit": ContextClass.CODE_EDITOR_TERMINAL,
+    "com.coteditor.CotEditor": ContextClass.CODE_EDITOR_TERMINAL,
+    "com.macromates.TextMate": ContextClass.CODE_EDITOR_TERMINAL,
+    "com.apple.dt.Xcode": ContextClass.CODE_EDITOR_TERMINAL,
+    "com.neovide.neovide": ContextClass.CODE_EDITOR_TERMINAL,
+    "org.gnu.Emacs": ContextClass.CODE_EDITOR_TERMINAL,
+    "com.microsoft.VSCodeInsiders": ContextClass.CODE_EDITOR_TERMINAL,
+    "com.sublimetext.3": ContextClass.CODE_EDITOR_TERMINAL,
+    "com.sublimehq.Sublime-Merge": ContextClass.CODE_EDITOR_TERMINAL,
+    # Admin consoles
+    "com.amazon.awsvpnclient": ContextClass.ADMIN_CONSOLE,
+    "com.pgadmin.pgadmin4": ContextClass.ADMIN_CONSOLE,
+    "com.sequel-pro.sequel-pro": ContextClass.ADMIN_CONSOLE,
+    "com.tableplus.TablePlus": ContextClass.ADMIN_CONSOLE,
 }
 
 # Known browser bundle IDs.
@@ -290,6 +341,9 @@ BROWSER_BUNDLE_IDS: frozenset[str] = frozenset({
     "com.vivaldi.Vivaldi",
     "company.thebrowser.Browser",  # Arc
     "org.chromium.Chromium",
+    "com.nickvision.nicegx.nicegx",  # Orion
+    "org.waterfoxproject.waterfox",
+    "org.torproject.torbrowser",
 })
 
 # Domain → ContextClass for browser classification with verified domain.
