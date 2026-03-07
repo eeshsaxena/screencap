@@ -1192,6 +1192,67 @@ def upload(names, all_recordings, dry_run, force, jobs, no_delete):
         console.print(f"[red]Error:[/red] {e}")
         sys.exit(1)
 
+    # --- Intent-based upload gating ---
+    from screencap.catalog import read_intent
+
+    filtered_dirs: list = []
+    for d in dirs:
+        intent = read_intent(d)
+        # Cloud-intent or legacy (no intent file) recordings pass through.
+        # Local-intent recordings need special handling.
+        is_local_intent = intent == "local"
+
+        if is_local_intent and all_recordings:
+            console.print(
+                f"  [yellow]Skipping {d.name}[/yellow] (local intent "
+                "-- use 'screencap upload {name}' interactively)."
+            )
+            continue
+
+        if is_local_intent and not dry_run:
+            if not sys.stdin.isatty():
+                console.print(
+                    "[red]Error:[/red] Cannot upload local-intent recordings "
+                    "without interactive confirmation. "
+                    "Use --cloud at recording time for headless upload."
+                )
+                sys.exit(1)
+
+            console.print(
+                "\n[yellow]Warning:[/yellow] This recording was captured without "
+                "public-level protections. Post-hoc scrubbing is best-effort "
+                "and provides weaker privacy guarantees than capture-time enforcement."
+            )
+
+            # Auto-scrub: create a scrubbed copy and upload that instead
+            try:
+                from screencap.scrubber import scrub_recording
+
+                with console.status("[bold]Scrubbing recording for upload...[/bold]"):
+                    scrub_result = scrub_recording(d.name)
+                entity_total = sum(scrub_result.entity_counts.values())
+                console.print(
+                    f"  Scrubbed copy created at {scrub_result.output_dir.name}/ "
+                    f"({entity_total} redaction(s) applied)."
+                )
+            except Exception as e:
+                console.print(
+                    f"[red]Error:[/red] Scrubbing failed: {e}\n"
+                    "Upload aborted — cannot upload local-intent recording without scrubbing."
+                )
+                sys.exit(1)
+
+            if not click.confirm("Proceed with upload of scrubbed copy?", default=False):
+                console.print("[dim]Upload cancelled.[/dim]")
+                continue
+
+            # Upload the scrubbed copy instead
+            d = scrub_result.output_dir
+
+        filtered_dirs.append(d)
+
+    dirs = filtered_dirs
+
     total_count = len(dirs)
     all_uploaded = 0
     all_skipped = 0
