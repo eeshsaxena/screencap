@@ -629,3 +629,70 @@ class TestDiskFullError:
         err = DiskFullError(Path("/tmp/rec"), 42.5)
         assert err.capture_dir == Path("/tmp/rec")
         assert err.elapsed == 42.5
+
+
+class TestPrivacyFilterInitFailure:
+    """Tests for privacy filter construction failure behavior.
+
+    Public mode must hard-error (SystemExit) if the privacy filter can't
+    be created — recording without it would expose sensitive data.
+    Internal mode should warn and continue.
+    """
+
+    def test_public_mode_hard_errors_on_filter_failure(self, tmp_path):
+        """Public mode raises SystemExit(1) when privacy filter fails."""
+        from screencap.privacy.policy import PrivacyConfig, PrivacyMode
+        from screencap.recorder import start_recording
+
+        public_config = PrivacyConfig(mode=PrivacyMode.PUBLIC)
+
+        with (
+            mock.patch("screencap.recorder._check_macos_permissions"),
+            mock.patch("screencap.recorder.get_audio_default", return_value=False),
+            mock.patch("screencap.recorder.get_wifi_metrics", return_value=False),
+            mock.patch("screencap.recorder.get_disk_warn_mb", return_value=0),
+            mock.patch("screencap.recorder.get_disk_stop_mb", return_value=0),
+            mock.patch("screencap.pidfile.find_orphaned_processes", return_value=[]),
+            mock.patch("screencap.pidfile.write_pidfile"),
+            mock.patch("screencap.pidfile.delete_pidfile"),
+            mock.patch("screencap.config.get_privacy_config", return_value=public_config),
+            mock.patch(
+                "screencap.privacy.recorder_enforcement.RecorderPrivacyFilter",
+                side_effect=RuntimeError("missing dep"),
+            ),
+            mock.patch("sc_engine.Recorder"),
+        ):
+            with pytest.raises(SystemExit):
+                start_recording("test", output_dir=tmp_path / "test-rec")
+
+    def test_internal_mode_warns_on_filter_failure(self, tmp_path):
+        """Internal mode logs a warning and continues recording."""
+        from screencap.privacy.policy import PrivacyConfig, PrivacyMode
+        from screencap.recorder import start_recording
+
+        internal_config = PrivacyConfig(mode=PrivacyMode.INTERNAL)
+        mock_recorder = mock.MagicMock()
+        mock_recorder.wait_for_ready.return_value = True
+        mock_recorder.is_recording = False
+
+        with (
+            mock.patch("screencap.recorder._check_macos_permissions"),
+            mock.patch("screencap.recorder.get_audio_default", return_value=False),
+            mock.patch("screencap.recorder.get_wifi_metrics", return_value=False),
+            mock.patch("screencap.recorder.get_disk_warn_mb", return_value=0),
+            mock.patch("screencap.recorder.get_disk_stop_mb", return_value=0),
+            mock.patch("screencap.pidfile.find_orphaned_processes", return_value=[]),
+            mock.patch("screencap.pidfile.write_pidfile"),
+            mock.patch("screencap.pidfile.delete_pidfile"),
+            mock.patch("screencap.config.get_privacy_config", return_value=internal_config),
+            mock.patch(
+                "screencap.privacy.recorder_enforcement.RecorderPrivacyFilter",
+                side_effect=RuntimeError("missing dep"),
+            ),
+            mock.patch("sc_engine.Recorder") as MockRecorder,
+        ):
+            MockRecorder.return_value.__enter__ = mock.MagicMock(return_value=mock_recorder)
+            MockRecorder.return_value.__exit__ = mock.MagicMock(return_value=False)
+
+            capture_dir, _ = start_recording("test", output_dir=tmp_path / "test-rec")
+            assert capture_dir.exists()

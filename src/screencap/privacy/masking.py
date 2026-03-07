@@ -129,8 +129,8 @@ _MASK_COLOR = (30, 30, 30)  # near-black
 _LABEL_COLOR = (180, 180, 180)  # light gray text
 
 
-def apply_mask(image_path: Path, regions: list[MaskRegion]) -> None:
-    """Apply visual masks to a screenshot image file, in-place.
+def _apply_mask_to_image(img, regions: list[MaskRegion]) -> None:
+    """Apply visual masks to an already-opened PIL Image, in-place.
 
     Renders a fully opaque solid fill for each region with a small
     text label so users know the omission was intentional.
@@ -138,12 +138,9 @@ def apply_mask(image_path: Path, regions: list[MaskRegion]) -> None:
     The fill is fully opaque — no original pixel data bleeds through.
     This is a privacy requirement: even 10% bleed-through on high-contrast
     text (black on white) leaves content recoverable via contrast stretch.
-
-    Requires Pillow (available in record deps).
     """
-    from PIL import Image, ImageDraw
+    from PIL import ImageDraw
 
-    img = Image.open(image_path).convert("RGB")
     draw = ImageDraw.Draw(img)
 
     for region in regions:
@@ -163,7 +160,17 @@ def apply_mask(image_path: Path, regions: list[MaskRegion]) -> None:
             text_y = y1 + (y2 - y1 - text_h) // 2
             draw.text((text_x, text_y), label, fill=_LABEL_COLOR)
 
-    img.save(image_path, "JPEG", quality=85)
+
+def apply_mask(image_path: Path, regions: list[MaskRegion]) -> None:
+    """Apply visual masks to a screenshot image file, in-place.
+
+    Requires Pillow (available in record deps).
+    """
+    from PIL import Image
+
+    img = Image.open(image_path).convert("RGB")
+    _apply_mask_to_image(img, regions)
+    img.save(image_path, "JPEG", quality=85, exif=b"")
 
 
 def mask_screenshot(
@@ -184,13 +191,14 @@ def mask_screenshot(
 
     from PIL import Image
 
-    with Image.open(image_path) as img:
-        w, h = img.size
+    img = Image.open(image_path).convert("RGB")
+    w, h = img.size
 
     if strategy == MaskStrategy.PANE:
         regions = pane_geometry(w, h, context_class, app_hint)
     else:
         regions = full_window_geometry(w, h, context_class)
 
-    apply_mask(image_path, regions)
+    _apply_mask_to_image(img, regions)
+    img.save(image_path, "JPEG", quality=85, exif=b"")
     return True

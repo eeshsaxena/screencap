@@ -504,14 +504,44 @@ def start_recording(
         from screencap.privacy.recorder_enforcement import RecorderPrivacyFilter
 
         privacy_config = get_privacy_config()
-        screen_filter = RecorderPrivacyFilter(privacy_config)
-        if verbose:
-            console.print(f"[dim]Privacy mode: {privacy_config.mode.value}[/dim]")
-    except Exception as e:
-        if verbose:
+        # capture-time enforcement requires window events to detect which
+        # app is frontmost.  If window data capture is disabled (via CLI
+        # flag or RECORD_WINDOW_DATA env var), the filter would silently
+        # never block anything — warn and skip instead.
+        from sc_engine.config import config as _engine_config
+
+        _effective_window_data = (
+            capture_window_data
+            if capture_window_data is not None
+            else _engine_config.RECORD_WINDOW_DATA
+        )
+        if not _effective_window_data:
             console.print(
-                f"[yellow]Warning:[/yellow] Privacy enforcement disabled: {e}"
+                "[yellow]Warning:[/yellow] Capture-time privacy enforcement "
+                "requires window data. Disabled because window data capture is off."
             )
+        else:
+            screen_filter = RecorderPrivacyFilter(privacy_config)
+            if verbose:
+                console.print(f"[dim]Privacy mode: {privacy_config.mode.value}[/dim]")
+    except Exception as e:
+        # In public mode, privacy enforcement is a hard requirement —
+        # recording without it would expose sensitive data.
+        try:
+            _is_public = privacy_config.mode.value == "public"
+        except NameError:
+            _is_public = False
+        if _is_public:
+            console.print(
+                f"[red]Error:[/red] Capture-time privacy enforcement failed "
+                f"in public mode: {e}\n"
+                "Recording cannot proceed without privacy protection. "
+                "Check dependencies and configuration."
+            )
+            raise SystemExit(1)
+        console.print(
+            f"[yellow]Warning:[/yellow] Capture-time privacy enforcement disabled: {e}"
+        )
 
     try:
         from screencap.metrics import save_metrics

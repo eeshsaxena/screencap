@@ -453,13 +453,13 @@ def process_events(
                     events_to_write.append(
                         (prev_window_event, window_write_q, write_window_event)
                     )
-            # Privacy filter: null keystroke content for blocked apps/inputs
+            # Privacy filter: null sensitive content for blocked apps/inputs.
+            # Applies to ALL action events (key, mouse, etc.) — if the screen
+            # is blocked, no content fields should survive to disk.
             if screen_filter is not None:
-                _action_name = event.data.get("name", "")
-                if _action_name in ("key.down", "key.up"):
-                    if not screen_filter.is_screen_allowed(event.timestamp):
-                        screen_filter.null_keystroke_content(event.data)
-                        _drops["privacy_keystroke"] += 1
+                if not screen_filter.is_screen_allowed(event.timestamp):
+                    screen_filter.null_keystroke_content(event.data)
+                    _drops["privacy_keystroke"] += 1
 
             # Action event last — the anchor record that references the others
             events_to_write.append((event, action_write_q, write_action_event))

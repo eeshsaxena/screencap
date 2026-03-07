@@ -38,6 +38,11 @@ def stricter(a: PrivacyAction, b: PrivacyAction) -> PrivacyAction:
     return a if _ACTION_SEVERITY[a] <= _ACTION_SEVERITY[b] else b
 
 
+# Actions that mean "this app/surface should not be captured".
+# Used by both recorder_enforcement (capture-time) and scrubber (post-processing).
+BLOCK_ACTIONS = frozenset({PrivacyAction.EXCLUDE, PrivacyAction.MASK_WINDOW})
+
+
 @dataclass(frozen=True)
 class ActionDecision:
     """Result of a policy evaluation."""

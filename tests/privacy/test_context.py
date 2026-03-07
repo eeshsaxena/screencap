@@ -12,7 +12,6 @@ from screencap.privacy.context import (
     BROWSER_BUNDLE_IDS,
     BrowserContext,
     DefaultContextClassifier,
-    TemporalContextClassifier,
     WindowContext,
     _BUNDLE_ID_MAP,
     associate_screenshot,
@@ -295,44 +294,6 @@ class TestDefaultContextClassifier:
             f"Bundle IDs in both _BUNDLE_ID_MAP and BROWSER_BUNDLE_IDS would "
             f"never reach the browser path: {overlap}"
         )
-
-
-# ---------------------------------------------------------------------------
-# TemporalContextClassifier (state machine)
-# ---------------------------------------------------------------------------
-
-
-class TestTemporalContextClassifier:
-    def test_holds_classification_within_window(self):
-        tc = TemporalContextClassifier(hold_seconds=3.0)
-        tc.classify(FrameMetadata(bundle_id="com.apple.mail", timestamp=10.0))
-
-        result = tc.classify(FrameMetadata(timestamp=12.0))
-        assert result.context_class == ContextClass.EMAIL
-        assert result.confidence == "temporal_hold"
-
-    def test_decays_to_unknown_after_hold_expires(self):
-        tc = TemporalContextClassifier(hold_seconds=3.0)
-        tc.classify(FrameMetadata(bundle_id="com.apple.mail", timestamp=10.0))
-
-        result = tc.classify(FrameMetadata(timestamp=15.0))
-        assert result.context_class == ContextClass.UNKNOWN
-
-    def test_new_classification_resets_hold_timer(self):
-        tc = TemporalContextClassifier(hold_seconds=3.0)
-        tc.classify(FrameMetadata(bundle_id="com.apple.mail", timestamp=10.0))
-        tc.classify(FrameMetadata(bundle_id="com.tinyspeck.slackmacgap", timestamp=12.0))
-
-        # t=14 — within hold of chat (12+3), not email
-        result = tc.classify(FrameMetadata(timestamp=14.0))
-        assert result.context_class == ContextClass.CHAT
-
-    def test_zero_timestamp_does_not_hold(self):
-        tc = TemporalContextClassifier(hold_seconds=3.0)
-        tc.classify(FrameMetadata(bundle_id="com.apple.mail", timestamp=10.0))
-
-        result = tc.classify(FrameMetadata(timestamp=0.0))
-        assert result.context_class == ContextClass.UNKNOWN
 
 
 # ---------------------------------------------------------------------------

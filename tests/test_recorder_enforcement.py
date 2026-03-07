@@ -357,6 +357,7 @@ class TestKeystrokeBlocking:
             "canonical_key_char": "p",
             "canonical_key_name": "p",
             "canonical_key_vk": 35,
+            "text": "p",
             "timestamp": 1234567890.0,
         }
 
@@ -393,6 +394,7 @@ class TestKeystrokeBlocking:
                 "canonical_key_char": "p",
                 "canonical_key_name": "p",
                 "canonical_key_vk": 35,
+                "text": "p",
             }
 
         # Blocked app → keystrokes nulled
@@ -419,3 +421,20 @@ class TestKeystrokeBlocking:
 
         assert allowed_data["key_char"] == "p"
         assert allowed_data["key_vk"] == 35
+
+    def test_null_keystroke_content_nulls_text_on_composite_event(self):
+        """key.type composite events carry a 'text' field but no key_char/
+        key_name. null_keystroke_content must null 'text' and be harmless
+        for absent key fields — this is what makes the broader capture-time
+        nulling (all action types, not just key.down/up) safe."""
+        data = {
+            "name": "key.type",
+            "text": "hunter2",
+            "timestamp": 1234567890.0,
+        }
+
+        RecorderPrivacyFilter.null_keystroke_content(data)
+
+        assert data["text"] is None
+        assert data["name"] == "key.type"
+        assert data["timestamp"] == 1234567890.0
