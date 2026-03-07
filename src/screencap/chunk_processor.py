@@ -69,9 +69,13 @@ class ChunkProcessor:
             self._status = s
 
     def all_chunks_uploaded(self) -> bool:
-        """True if every processed chunk was uploaded successfully."""
+        """True if every processed chunk was uploaded successfully.
+
+        Returns False if no chunks were processed at all — that means
+        the video writer likely failed and no rotation events arrived.
+        """
         if not self._chunk_results:
-            return True
+            return False
         return all(self._chunk_results.values())
 
     def start(self) -> None:
@@ -101,11 +105,16 @@ class ChunkProcessor:
                 logger.warning("ChunkProcessor thread still alive after stop signal")
 
     def _run(self) -> None:
+        import queue as _queue_mod
+
         consecutive_errors = 0
         while not self._stop_event.is_set():
             try:
                 msg = self._q.get(timeout=2.0)
                 consecutive_errors = 0  # reset on successful get
+            except _queue_mod.Empty:
+                # Normal timeout — queue has no messages yet, just keep waiting
+                continue
             except (OSError, EOFError, BrokenPipeError):
                 # Queue pipe is broken (child processes died) — exit loop
                 logger.debug("ChunkProcessor queue broken, exiting")
