@@ -177,3 +177,85 @@ class TestDiskStopMb:
         with mock.patch.dict(os.environ, {"SCREENCAP_DISK_STOP_MB": "-100"}):
             with pytest.raises(SystemExit):
                 get_disk_stop_mb()
+
+
+# --- upload default config tests ---
+
+
+class TestUploadDefault:
+    """Tests for get_upload_default()."""
+
+    def test_default_value(self):
+        from screencap.config import get_upload_default
+
+        env = {k: v for k, v in os.environ.items() if k != "SCREENCAP_UPLOAD_DEFAULT"}
+        with mock.patch.dict(os.environ, env, clear=True):
+            assert get_upload_default() == "ask"
+
+    def test_env_var_override(self):
+        from screencap.config import get_upload_default
+
+        with mock.patch.dict(os.environ, {"SCREENCAP_UPLOAD_DEFAULT": "cloud"}):
+            assert get_upload_default() == "cloud"
+
+    def test_env_var_local(self):
+        from screencap.config import get_upload_default
+
+        with mock.patch.dict(os.environ, {"SCREENCAP_UPLOAD_DEFAULT": "local"}):
+            assert get_upload_default() == "local"
+
+    def test_env_var_ask(self):
+        from screencap.config import get_upload_default
+
+        with mock.patch.dict(os.environ, {"SCREENCAP_UPLOAD_DEFAULT": "ask"}):
+            assert get_upload_default() == "ask"
+
+    def test_env_var_invalid(self):
+        from screencap.config import get_upload_default
+
+        with mock.patch.dict(os.environ, {"SCREENCAP_UPLOAD_DEFAULT": "bogus"}):
+            with pytest.raises(SystemExit):
+                get_upload_default()
+
+    def test_env_var_case_insensitive(self):
+        from screencap.config import get_upload_default
+
+        with mock.patch.dict(os.environ, {"SCREENCAP_UPLOAD_DEFAULT": "CLOUD"}):
+            assert get_upload_default() == "cloud"
+
+    def test_toml_value(self):
+        import screencap.config as cfg
+        from screencap.config import get_upload_default
+
+        env = {k: v for k, v in os.environ.items() if k != "SCREENCAP_UPLOAD_DEFAULT"}
+        with mock.patch.dict(os.environ, env, clear=True):
+            cfg._config_cache = {"privacy": {"upload_default": "local"}}
+            assert get_upload_default() == "local"
+
+    def test_toml_invalid_value(self):
+        import screencap.config as cfg
+        from screencap.config import get_upload_default
+
+        env = {k: v for k, v in os.environ.items() if k != "SCREENCAP_UPLOAD_DEFAULT"}
+        with mock.patch.dict(os.environ, env, clear=True):
+            cfg._config_cache = {"privacy": {"upload_default": "bogus"}}
+            with pytest.raises(SystemExit):
+                get_upload_default()
+
+    def test_toml_non_string(self):
+        import screencap.config as cfg
+        from screencap.config import get_upload_default
+
+        env = {k: v for k, v in os.environ.items() if k != "SCREENCAP_UPLOAD_DEFAULT"}
+        with mock.patch.dict(os.environ, env, clear=True):
+            cfg._config_cache = {"privacy": {"upload_default": 42}}
+            with pytest.raises(SystemExit):
+                get_upload_default()
+
+    def test_env_overrides_toml(self):
+        import screencap.config as cfg
+        from screencap.config import get_upload_default
+
+        cfg._config_cache = {"privacy": {"upload_default": "local"}}
+        with mock.patch.dict(os.environ, {"SCREENCAP_UPLOAD_DEFAULT": "cloud"}):
+            assert get_upload_default() == "cloud"

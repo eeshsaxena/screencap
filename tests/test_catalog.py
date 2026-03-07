@@ -1,12 +1,13 @@
 """Tests for screencap.catalog."""
 
+import json
 import sqlite3
 import time
 from pathlib import Path
 
 import pytest
 
-from screencap.catalog import find_db, list_recordings
+from screencap.catalog import find_db, list_recordings, read_intent
 
 
 @pytest.fixture
@@ -132,3 +133,79 @@ def test_find_db_prefers_recording_db(tmp_path):
 
 def test_find_db_returns_none(tmp_path):
     assert find_db(tmp_path) is None
+
+
+# --- read_intent tests ---
+
+
+def test_read_intent_cloud(tmp_path):
+    intent_path = tmp_path / ".recording_intent"
+    intent_path.write_text(
+        json.dumps(
+            {
+                "version": 1,
+                "destination": "cloud",
+                "privacy_mode": "public",
+                "created_at": "2026-03-07T14:30:00Z",
+                "source": "flag",
+            }
+        )
+    )
+    assert read_intent(tmp_path) == "cloud"
+
+
+def test_read_intent_local(tmp_path):
+    intent_path = tmp_path / ".recording_intent"
+    intent_path.write_text(
+        json.dumps(
+            {
+                "version": 1,
+                "destination": "local",
+                "privacy_mode": "internal",
+                "created_at": "2026-03-07T14:30:00Z",
+                "source": "flag",
+            }
+        )
+    )
+    assert read_intent(tmp_path) == "local"
+
+
+def test_read_intent_missing(tmp_path):
+    assert read_intent(tmp_path) is None
+
+
+def test_read_intent_corrupt(tmp_path):
+    intent_path = tmp_path / ".recording_intent"
+    intent_path.write_text("NOT VALID JSON {{{")
+    assert read_intent(tmp_path) is None
+
+
+# --- list_recordings intent integration tests ---
+
+
+def test_list_recordings_with_intent(recordings_dir):
+    d = _make_recording(recordings_dir, "cloud-rec", duration=30)
+    intent_path = d / ".recording_intent"
+    intent_path.write_text(
+        json.dumps(
+            {
+                "version": 1,
+                "destination": "cloud",
+                "privacy_mode": "public",
+                "created_at": "2026-03-07T14:30:00Z",
+                "source": "flag",
+            }
+        )
+    )
+    result = list_recordings(recordings_dir)
+    assert len(result) == 1
+    assert result[0].name == "cloud-rec"
+    assert result[0].intent == "cloud"
+
+
+def test_list_recordings_legacy_no_intent(recordings_dir):
+    _make_recording(recordings_dir, "legacy-rec", duration=45)
+    result = list_recordings(recordings_dir)
+    assert len(result) == 1
+    assert result[0].name == "legacy-rec"
+    assert result[0].intent is None
