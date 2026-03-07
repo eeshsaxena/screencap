@@ -31,6 +31,109 @@ def cli(ctx, no_update_check):
         maybe_check_for_update()
 
 
+def _report_unclassified_apps(capture_dir) -> None:
+    """Report apps seen during recording that are not in privacy config."""
+    import sqlite3
+
+    from screencap.catalog import find_db
+    from screencap.config import get_privacy_config
+    from screencap.privacy.context import _BUNDLE_ID_MAP
+
+    db_path = find_db(capture_dir)
+    if not db_path:
+        return
+
+    conn = sqlite3.connect(str(db_path))
+    try:
+        cur = conn.cursor()
+        tables = {r[0] for r in cur.execute(
+            "SELECT name FROM sqlite_master WHERE type='table'"
+        ).fetchall()}
+        if "window_event" not in tables:
+            return
+        rows = cur.execute(
+            "SELECT DISTINCT app_bundle_id FROM window_event "
+            "WHERE app_bundle_id IS NOT NULL AND app_bundle_id != ''"
+        ).fetchall()
+    finally:
+        conn.close()
+
+    if not rows:
+        return
+
+    seen_bids = {r[0] for r in rows}
+
+    # Get configured bundle IDs
+    try:
+        privacy_config = get_privacy_config()
+    except Exception:
+        return
+
+    known_bids = (
+        set(_BUNDLE_ID_MAP.keys())
+        | set(privacy_config.exclude_apps)
+        | set(privacy_config.app_classes.keys())
+    )
+
+    unclassified = sorted(seen_bids - known_bids)
+    if not unclassified:
+        return
+
+    console.print(
+        f"\n[yellow]Note:[/yellow] {len(unclassified)} app(s) seen during recording "
+        f"are not classified:"
+    )
+    for bid in unclassified[:10]:
+        console.print(f"  {bid}")
+    if len(unclassified) > 10:
+        console.print(f"  ... and {len(unclassified) - 10} more")
+    console.print("  Run [bold]screencap setup --scan[/bold] to classify them.")
+
+
+def _maybe_prompt_privacy_setup() -> None:
+    """Prompt for privacy setup on first run if [privacy] section is missing."""
+    import sys as _sys  # use real sys, not the module-level reference
+
+    if not _sys.stdin.isatty():
+        return  # non-interactive: skip silently, use defaults
+
+    from screencap.config import _CONFIG_PATH, _load_toml
+
+    if not _CONFIG_PATH.exists():
+        # No config file at all — still prompt
+        pass
+    else:
+        cfg = _load_toml()
+        privacy_section = cfg.get("privacy")
+        if privacy_section is not None:
+            # Has a [privacy] section (even if empty or has setup_skipped)
+            return
+
+    console.print(
+        "\n[bold]Privacy setup not configured.[/bold] "
+        "Run the setup wizard to classify apps for privacy protection."
+    )
+    if click.confirm("Run setup now?", default=True):
+        from screencap.setup_wizard import run_setup_wizard
+        run_setup_wizard()
+    else:
+        # Write setup_skipped flag to prevent re-prompting
+        import tomlkit
+        from screencap.config import invalidate_config_cache
+        from screencap.setup_wizard import _load_config_toml, _save_config_atomic
+
+        doc = _load_config_toml(_CONFIG_PATH)
+        if "privacy" not in doc:
+            doc.add("privacy", tomlkit.table())
+        doc["privacy"]["setup_skipped"] = True
+        _save_config_atomic(_CONFIG_PATH, doc)
+        invalidate_config_cache()
+        console.print(
+            "[dim]Skipped. Recording will use default settings (internal mode). "
+            "Run 'screencap setup' anytime.[/dim]"
+        )
+
+
 @cli.command()
 @click.option("--name", "-n", default=None, help="Recording name (skips auto-naming).")
 @click.option("--description", "-d", default=None, help="Task description.")
@@ -86,6 +189,9 @@ def start(
     capture_images = False if no_images else True  # Default ON (overrides upstream False)
     capture_window_data = False if no_window_data else None  # None = upstream default (True)
     capture_browser_events = False if no_browser_events else None  # None = upstream default (False)
+
+    # First-run privacy setup detection
+    _maybe_prompt_privacy_setup()
 
     try:
         from screencap.recorder import DiskFullError, print_summary, start_recording
@@ -154,6 +260,12 @@ def start(
             console.print("[yellow]Naming cancelled — keeping timestamp name[/yellow]")
 
     print_summary(final_name, final_dir, elapsed)
+
+    # Post-recording new-app report
+    try:
+        _report_unclassified_apps(final_dir)
+    except Exception:
+        pass  # non-blocking
 
 
 def _auto_export(capture_dir: Path) -> None:
@@ -1271,6 +1383,29 @@ def transcribe(name, model):
     if text:
         preview = text[:500] + ("..." if len(text) > 500 else "")
         console.print(f"\n[bold]Preview:[/bold]\n{preview}")
+
+
+@cli.command()
+@click.option("--scan", is_flag=True, help="Rescan and show only new (unconfigured) apps.")
+@click.option("--show", is_flag=True, help="Display current classifications (read-only).")
+@click.option("--reset", is_flag=True, help="Remove [privacy] section after confirmation.")
+def setup(scan, show, reset):
+    """Configure privacy settings with an interactive wizard."""
+    from screencap.setup_wizard import (
+        reset_privacy_config,
+        run_setup_wizard,
+        show_current_config,
+    )
+
+    if show:
+        show_current_config()
+        return
+
+    if reset:
+        reset_privacy_config()
+        return
+
+    run_setup_wizard(scan_only=scan)
 
 
 _PRIVACY_EXTRAS_MSG = (

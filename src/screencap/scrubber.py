@@ -228,7 +228,12 @@ def _build_secure_field_intervals(
 def _merge_intervals(
     *interval_lists: list[_BlockedInterval],
 ) -> list[_BlockedInterval]:
-    """Merge multiple sorted interval lists into a single sorted list."""
+    """Concatenate and sort interval lists by start time.
+
+    Overlapping intervals are tolerated — _find_blocked_interval only
+    needs to answer "is this timestamp blocked?" and bisect handles
+    overlaps correctly for that purpose.
+    """
     all_intervals: list[_BlockedInterval] = []
     for ivs in interval_lists:
         all_intervals.extend(ivs)
@@ -401,6 +406,13 @@ def _null_event_content(event: dict) -> None:
         event["key_vk"] = None
     if "canonical_key_vk" in event:
         event["canonical_key_vk"] = None
+    # AX attribute fields — match _null_db_rows_for_intervals coverage
+    if "element_state" in event:
+        event["element_state"] = None
+    if "active_segment_description" in event:
+        event["active_segment_description"] = None
+    if "available_segment_descriptions" in event:
+        event["available_segment_descriptions"] = None
     for child in event.get("children", []):
         _null_event_content(child)
 
@@ -1217,7 +1229,9 @@ def scrub_recording(
 
             privacy_config = get_privacy_config()
             evaluator = DefaultPolicyEvaluator(privacy_config)
-            classifier = DefaultContextClassifier()
+            classifier = DefaultContextClassifier(
+                app_classes=privacy_config.app_classes,
+            )
 
             db_path = find_db(dst)
             window_events = load_window_events(db_path) if db_path else []

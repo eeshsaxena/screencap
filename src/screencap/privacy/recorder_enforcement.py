@@ -68,7 +68,8 @@ logger = logging.getLogger(__name__)
 DEFAULT_TRANSITION_HOLD_SECONDS: float = 1.0
 
 # Actions that mean "this app should not be captured"
-_BLOCK_ACTIONS = frozenset({PrivacyAction.EXCLUDE, PrivacyAction.MASK_WINDOW})
+# Import from actions.py — single source of truth shared with scrubber.
+from screencap.privacy.actions import BLOCK_ACTIONS as _BLOCK_ACTIONS
 
 # Key event content fields to null when blocking keystrokes
 KEYSTROKE_CONTENT_FIELDS = (
@@ -78,7 +79,11 @@ KEYSTROKE_CONTENT_FIELDS = (
     "canonical_key_char",
     "canonical_key_name",
     "canonical_key_vk",
+    "text",
 )
+
+
+_UNSET = object()
 
 
 def _load_secure_input_fn() -> Callable[[], bool] | None:
@@ -142,10 +147,12 @@ class RecorderPrivacyFilter:
         self,
         config: PrivacyConfig,
         transition_hold_seconds: float = DEFAULT_TRANSITION_HOLD_SECONDS,
-        secure_input_fn: Callable[[], bool] | None = ...,
+        secure_input_fn: Callable[[], bool] | None = _UNSET,
     ) -> None:
         self._evaluator = DefaultPolicyEvaluator(config)
-        self._classifier = DefaultContextClassifier()
+        self._classifier = DefaultContextClassifier(
+            app_classes=config.app_classes,
+        )
         self._lock = threading.Lock()
         self._hold_seconds = transition_hold_seconds
 
@@ -156,7 +163,7 @@ class RecorderPrivacyFilter:
         self._current_title: str = ""
 
         # Secure Input detection (Layer 0)
-        if secure_input_fn is ...:
+        if secure_input_fn is _UNSET:
             # Default: try to load from OS
             self._secure_input_fn = _load_secure_input_fn()
             if self._secure_input_fn is None:
@@ -235,6 +242,10 @@ class RecorderPrivacyFilter:
 
         Called from is_screen_allowed(). Updates the secure_input
         blocking reason based on the current system state.
+
+        Note: the ctypes call executes while self._lock is held. This is
+        safe because (a) all callers run on the single event_processor
+        thread (zero contention), and (b) the call is <0.1ms.
         """
         if self._secure_input_fn is None:
             return
@@ -289,27 +300,3 @@ class RecorderPrivacyFilter:
             if field in action_data:
                 action_data[field] = None
 
-    @property
-    def is_blocked(self) -> bool:
-        """Whether any blocking reason is currently active (no hold logic)."""
-        now = time.monotonic()
-        with self._lock:
-            for hold_until in self._blocked_reasons.values():
-                if hold_until == float("inf") or now < hold_until:
-                    return True
-            return False
-
-    @property
-    def current_bundle_id(self) -> str:
-        with self._lock:
-            return self._current_bundle_id
-
-    @property
-    def block_reason(self) -> str:
-        """Primary blocking reason (first active reason)."""
-        now = time.monotonic()
-        with self._lock:
-            for reason, hold_until in self._blocked_reasons.items():
-                if hold_until == float("inf") or now < hold_until:
-                    return reason
-            return ""

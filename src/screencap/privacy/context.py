@@ -74,23 +74,6 @@ class BrowserContext:
     domain: str
 
 
-def _nearest_index(timestamps: list[float], target: float) -> int | None:
-    """Return index of the nearest timestamp via bisect.
-
-    Returns None if timestamps is empty.
-    """
-    if not timestamps:
-        return None
-    pos = bisect.bisect_left(timestamps, target)
-    if pos == 0:
-        return 0
-    if pos == len(timestamps):
-        return len(timestamps) - 1
-    before = timestamps[pos - 1]
-    after = timestamps[pos]
-    return pos if (after - target) <= (target - before) else pos - 1
-
-
 def _active_at_index(timestamps: list[float], target: float) -> int | None:
     """Return index of the latest timestamp at or before target.
 
@@ -110,17 +93,21 @@ def find_nearest_window(
     window_events: list[WindowContext],
     target_ts: float,
     max_delta: float = 5.0,
+    _timestamps: list[float] | None = None,
 ) -> WindowContext | None:
     """Find the window_event active at target_ts within max_delta seconds.
 
     Uses "latest at or before" semantics since window events represent
     state transitions — the active window at time T is the most recent
     event with timestamp <= T.
+
+    Pass _timestamps to avoid rebuilding the list on every call.
     """
     if not window_events:
         return None
-    timestamps = [w.timestamp for w in window_events]
-    idx = _active_at_index(timestamps, target_ts)
+    if _timestamps is None:
+        _timestamps = [w.timestamp for w in window_events]
+    idx = _active_at_index(_timestamps, target_ts)
     if idx is None:
         return None
     if abs(window_events[idx].timestamp - target_ts) > max_delta:
@@ -132,16 +119,20 @@ def find_nearest_browser(
     browser_events: list[BrowserContext],
     target_ts: float,
     max_delta: float = 5.0,
+    _timestamps: list[float] | None = None,
 ) -> BrowserContext | None:
     """Find the browser_event active at target_ts within max_delta seconds.
 
     Uses "latest at or before" semantics since browser events represent
     state transitions.
+
+    Pass _timestamps to avoid rebuilding the list on every call.
     """
     if not browser_events:
         return None
-    timestamps = [b.timestamp for b in browser_events]
-    idx = _active_at_index(timestamps, target_ts)
+    if _timestamps is None:
+        _timestamps = [b.timestamp for b in browser_events]
+    idx = _active_at_index(_timestamps, target_ts)
     if idx is None:
         return None
     if abs(browser_events[idx].timestamp - target_ts) > max_delta:
@@ -388,21 +379,36 @@ class DefaultContextClassifier:
     """Deterministic context classifier.
 
     Classification priority:
-    1. Bundle ID in known app map → direct class
-    2. Bundle ID is a known browser:
+    1. User config app_classes override → direct class
+    2. Bundle ID in known app map → direct class
+    3. Bundle ID is a known browser:
        a. With verified domain → domain-based class
        b. Without domain → browser_unverified
        c. With title heuristic (weaker signal) → heuristic class
-    3. Title heuristic for non-browser apps
-    4. unknown (explicit, never implicit fallthrough)
+    4. Title heuristic for non-browser apps
+    5. unknown (explicit, never implicit fallthrough)
     """
+
+    def __init__(
+        self,
+        app_classes: dict[str, "ContextClass"] | None = None,
+    ) -> None:
+        self._app_classes = app_classes or {}
 
     def classify(self, metadata: FrameMetadata) -> ContextResult:
         bundle_id = metadata.bundle_id
         domain = metadata.domain
         title = metadata.window_title
 
-        # 1. Known app bundle ID
+        # 1. User config override
+        if bundle_id and bundle_id in self._app_classes:
+            return ContextResult(
+                context_class=self._app_classes[bundle_id],
+                confidence="user_config",
+                evidence=bundle_id,
+            )
+
+        # 2. Known app bundle ID
         if bundle_id and bundle_id in _BUNDLE_ID_MAP:
             return ContextResult(
                 context_class=_BUNDLE_ID_MAP[bundle_id],
@@ -461,73 +467,6 @@ class DefaultContextClassifier:
         )
 
 
-# ---------------------------------------------------------------------------
-# State machine with temporal hold/decay
-# ---------------------------------------------------------------------------
-
-# Default hold duration: keep classification for this many seconds after
-# the last confirming event, before decaying to unknown.
-DEFAULT_HOLD_SECONDS: float = 3.0
-
-
-@dataclass
-class _ClassifierState:
-    """Internal state for the temporal state machine."""
-
-    last_class: ContextClass = ContextClass.UNKNOWN
-    last_confidence: str = "none"
-    last_evidence: str = ""
-    last_confirmed_ts: float = 0.0
-
-
-class TemporalContextClassifier:
-    """Wraps DefaultContextClassifier with temporal hold/decay.
-
-    If a new frame has no context signal but is within hold_seconds of
-    the last confirmed classification, the previous class is held.
-    After hold_seconds, decays to UNKNOWN.
-    """
-
-    def __init__(
-        self,
-        hold_seconds: float = DEFAULT_HOLD_SECONDS,
-    ) -> None:
-        self._inner = DefaultContextClassifier()
-        self._hold_seconds = hold_seconds
-        self._state = _ClassifierState()
-
-    def classify(self, metadata: FrameMetadata) -> ContextResult:
-        result = self._inner.classify(metadata)
-
-        if result.context_class != ContextClass.UNKNOWN:
-            # Fresh classification — update state
-            self._state.last_class = result.context_class
-            self._state.last_confidence = result.confidence
-            self._state.last_evidence = result.evidence
-            self._state.last_confirmed_ts = metadata.timestamp
-            return result
-
-        # No signal — check temporal hold
-        if (
-            self._state.last_class != ContextClass.UNKNOWN
-            and metadata.timestamp > 0
-            and self._state.last_confirmed_ts > 0
-            and (metadata.timestamp - self._state.last_confirmed_ts) <= self._hold_seconds
-        ):
-            return ContextResult(
-                context_class=self._state.last_class,
-                confidence="temporal_hold",
-                evidence=f"held from {self._state.last_evidence}",
-            )
-
-        # Decay to unknown
-        self._state = _ClassifierState()
-        return result
-
-    def reset(self) -> None:
-        """Reset state machine to initial state."""
-        self._state = _ClassifierState()
-
 
 # ---------------------------------------------------------------------------
 # High-level association: screenshot → FrameMetadata
@@ -539,6 +478,8 @@ def associate_screenshot(
     window_events: list[WindowContext],
     browser_events: list[BrowserContext],
     max_delta: float = 5.0,
+    _window_timestamps: list[float] | None = None,
+    _browser_timestamps: list[float] | None = None,
 ) -> FrameMetadata:
     """Build FrameMetadata for a screenshot by finding the active context.
 
@@ -556,17 +497,23 @@ def associate_screenshot(
         window_events: Pre-loaded, sorted window events.
         browser_events: Pre-loaded, sorted browser events.
         max_delta: Maximum time delta (seconds) for a valid association.
+        _window_timestamps: Pre-computed window timestamps (avoids rebuilding per call).
+        _browser_timestamps: Pre-computed browser timestamps (avoids rebuilding per call).
 
     Returns:
         FrameMetadata populated with best-available context.
     """
-    window = find_nearest_window(window_events, screenshot_ts, max_delta)
+    window = find_nearest_window(
+        window_events, screenshot_ts, max_delta, _timestamps=_window_timestamps
+    )
 
     # Only look up browser domain when the window is a known browser.
     domain: str | None = None
     bundle_id = window.app_bundle_id if window else ""
     if bundle_id in BROWSER_BUNDLE_IDS:
-        browser = find_nearest_browser(browser_events, screenshot_ts, max_delta)
+        browser = find_nearest_browser(
+            browser_events, screenshot_ts, max_delta, _timestamps=_browser_timestamps
+        )
         domain = browser.domain if browser else None
 
     return FrameMetadata(

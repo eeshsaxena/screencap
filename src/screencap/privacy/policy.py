@@ -132,6 +132,7 @@ class PrivacyConfig:
     exclude_apps: frozenset[str] = field(default_factory=frozenset)
     mask_domains: frozenset[str] = field(default_factory=frozenset)
     mask_title_patterns: tuple[re.Pattern[str], ...] = ()
+    app_classes: dict[str, ContextClass] = field(default_factory=dict)
 
     def is_excluded_app(self, bundle_id: str) -> bool:
         return bundle_id in self.exclude_apps
@@ -236,11 +237,33 @@ def parse_privacy_config(toml_dict: dict) -> PrivacyConfig:
                 f"privacy.mask_title_patterns[{i}] is not a valid regex: {exc}"
             )
 
+    # app_classes
+    raw_app_classes = section.get("app_classes", {})
+    if not isinstance(raw_app_classes, dict):
+        raise InvalidPrivacyConfigError(
+            f"privacy.app_classes must be a table, got {type(raw_app_classes).__name__}"
+        )
+    app_classes: dict[str, ContextClass] = {}
+    for bid, cls_str in raw_app_classes.items():
+        if not isinstance(cls_str, str):
+            raise InvalidPrivacyConfigError(
+                f"privacy.app_classes.{bid} must be a string, got {type(cls_str).__name__}"
+            )
+        try:
+            app_classes[bid] = ContextClass(cls_str.lower())
+        except ValueError:
+            valid = ", ".join(c.value for c in ContextClass)
+            raise InvalidPrivacyConfigError(
+                f"Invalid privacy.app_classes.{bid}={cls_str!r}. "
+                f"Must be one of: {valid}"
+            )
+
     return PrivacyConfig(
         mode=mode,
         exclude_apps=exclude_apps,
         mask_domains=mask_domains,
         mask_title_patterns=tuple(compiled),
+        app_classes=app_classes,
     )
 
 
@@ -277,7 +300,7 @@ class PolicyEvaluator(Protocol):
         self,
         context: ContextResult,
         metadata: FrameMetadata,
-        mode: PrivacyMode,
+        mode: PrivacyMode | None = None,
     ) -> ActionDecision: ...
 
 

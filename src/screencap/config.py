@@ -31,6 +31,12 @@ def _load_toml() -> dict:
     return _config_cache
 
 
+def invalidate_config_cache() -> None:
+    """Reset the config cache so the next read re-loads from disk."""
+    global _config_cache
+    _config_cache = None
+
+
 def get_recordings_dir() -> Path:
     """Return recordings directory, creating it if needed."""
     env = os.environ.get("SCREENCAP_RECORDINGS_DIR")
