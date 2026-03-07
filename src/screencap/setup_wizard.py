@@ -74,12 +74,12 @@ _CLASS_LABELS: dict[ContextClass, str] = {
     ContextClass.UNKNOWN: "unknown",
 }
 
-# Group definitions: key, label, symbol, color
+# Group definitions: key, label, symbol, color_key
 _GROUP_DEFS = [
-    ("blocked", "Always blocked (sensitive)", "\u00d7", "red"),
-    ("communication", "Communication (masked in public mode)", "~", "yellow"),
-    ("safe", "Safe (captured normally)", "\u2713", "green"),
-    ("unclassified", "Needs your input", "?", "blue"),
+    ("blocked", "Always blocked (sensitive)", "\u00d7", "pink"),
+    ("communication", "Communication (masked in public mode)", "~", "purple"),
+    ("safe", "Safe (captured normally)", "\u2713", "cyan"),
+    ("unclassified", "Needs your input", "?", "indigo"),
 ]
 
 
@@ -229,7 +229,12 @@ def _build_save_doc(
 # Curses TUI for interactive app review
 # ---------------------------------------------------------------------------
 
-_COLOR_PAIR = {"red": 1, "yellow": 2, "green": 3, "blue": 4}
+# Brand palette (ANSI-256 equivalents of the hex colors used in recorder.py):
+#   #60a5fa (brand blue)  -> 111    #818cf8 (indigo)      -> 105
+#   #a78bfa (purple)      -> 141    #f472b6 (pink)        -> 211
+#   #22d3ee (cyan)        ->  80    #f0f4ff (near-white)  -> 255
+_ANSI = {"blue": 111, "indigo": 105, "purple": 141, "pink": 211, "cyan": 80}
+_COLOR_PAIR = {"pink": 1, "purple": 2, "cyan": 3, "indigo": 4, "blue": 5}
 
 
 def _toggle_app_tui(
@@ -283,10 +288,19 @@ def _run_tui(
     def _main(stdscr):
         curses.curs_set(0)
         curses.use_default_colors()
-        curses.init_pair(1, curses.COLOR_RED, -1)
-        curses.init_pair(2, curses.COLOR_YELLOW, -1)
-        curses.init_pair(3, curses.COLOR_GREEN, -1)
-        curses.init_pair(4, curses.COLOR_BLUE, -1)
+        # Use 256-color palette matching the app's brand colors
+        if curses.COLORS >= 256:
+            curses.init_pair(1, _ANSI["pink"], -1)     # blocked
+            curses.init_pair(2, _ANSI["purple"], -1)   # communication
+            curses.init_pair(3, _ANSI["cyan"], -1)     # safe
+            curses.init_pair(4, _ANSI["indigo"], -1)   # unclassified
+            curses.init_pair(5, _ANSI["blue"], -1)     # brand/title
+        else:
+            curses.init_pair(1, curses.COLOR_RED, -1)
+            curses.init_pair(2, curses.COLOR_MAGENTA, -1)
+            curses.init_pair(3, curses.COLOR_CYAN, -1)
+            curses.init_pair(4, curses.COLOR_BLUE, -1)
+            curses.init_pair(5, curses.COLOR_BLUE, -1)
 
         expanded = {k: True for k in groups if groups[k]}
         cursor = 0
@@ -335,12 +349,19 @@ def _run_tui(
                 scroll = cursor - content_h + 1
 
             # --- Header ---
+            brand = curses.color_pair(_COLOR_PAIR["blue"])
+            indigo = curses.color_pair(_COLOR_PAIR["indigo"])
             visible = sum(len(g) for g in groups.values())
             try:
-                stdscr.addnstr(0, 1, "Privacy Setup", w - 2, curses.A_BOLD)
+                title = "\u25c9 ScreenCap"
+                stdscr.addnstr(0, 1, title, w - 2, brand | curses.A_BOLD)
+                sub = "Privacy Setup"
+                x = len(title) + 3
+                stdscr.addnstr(0, x, sub, max(0, w - x - 1), curses.A_BOLD)
                 info = f"({visible} apps)"
-                stdscr.addnstr(0, 16, info, max(0, w - 17), curses.A_DIM)
-                stdscr.addnstr(1, 0, "\u2500" * (w - 1), w - 1)
+                x2 = x + len(sub) + 1
+                stdscr.addnstr(0, x2, info, max(0, w - x2 - 1), curses.A_DIM)
+                stdscr.addnstr(1, 0, "\u2500" * (w - 1), w - 1, indigo)
             except curses.error:
                 pass
 
@@ -420,12 +441,23 @@ def _run_tui(
                     action = "Enter/Space Block"
 
             try:
-                stdscr.addnstr(fy + 1, 0, "\u2500" * (w - 1), w - 1)
-                hints = (
-                    f" \u2191\u2193 Navigate  {action}"
-                    "  s Save  q Quit"
-                )
-                stdscr.addnstr(fy + 2, 0, hints, w - 1, curses.A_DIM)
+                stdscr.addnstr(fy + 1, 0, "\u2500" * (w - 1), w - 1, indigo)
+                # Render hints with brand-colored keys and dim descriptions
+                hint_x = 1
+                key_parts = [
+                    ("\u2191\u2193", "Navigate"),
+                    (action.split(" ", 1)[0] if action else "", action.split(" ", 1)[1] if " " in action else ""),
+                    ("s", "Save"),
+                    ("q", "Quit"),
+                ]
+                for key_text, desc_text in key_parts:
+                    if not key_text:
+                        continue
+                    stdscr.addnstr(fy + 2, hint_x, key_text, max(0, w - 1 - hint_x), brand)
+                    hint_x += len(key_text)
+                    label = f" {desc_text}  "
+                    stdscr.addnstr(fy + 2, hint_x, label, max(0, w - 1 - hint_x), curses.A_DIM)
+                    hint_x += len(label)
             except curses.error:
                 pass
 
@@ -519,10 +551,10 @@ def run_setup_wizard(
         except ValueError:
             mode = PrivacyMode.INTERNAL
     else:
-        console.print("\nWelcome to ScreenCap! Let's configure your privacy settings.\n")
+        console.print(f"\n[bold #60a5fa]\u25c9 ScreenCap[/bold #60a5fa] [dim #a78bfa]Privacy Setup[/dim #a78bfa]\n")
         console.print("Privacy mode:")
-        console.print("  1. Public   -- strictest, for sharing publicly")
-        console.print("  2. Internal -- permissive, for personal use\n")
+        console.print("  [#818cf8]1.[/#818cf8] Public   -- strictest, for sharing publicly")
+        console.print("  [#818cf8]2.[/#818cf8] Internal -- permissive, for personal use\n")
         mode_choice = click.prompt("  Choice", type=click.IntRange(1, 2), default=2)
         mode = PrivacyMode.PUBLIC if mode_choice == 1 else PrivacyMode.INTERNAL
 
@@ -620,8 +652,8 @@ def run_setup_wizard(
     from screencap.config import invalidate_config_cache
     invalidate_config_cache()
 
-    console.print(f"\n  [green]Privacy settings saved to {config_path}[/green]")
-    console.print("  Run 'screencap start' to begin recording.")
+    console.print(f"\n  [bold #22d3ee]\u2705 Privacy settings saved to {config_path}[/bold #22d3ee]")
+    console.print("  Run [bold #22d3ee]screencap start[/bold #22d3ee] to begin recording.")
     return True
 
 
