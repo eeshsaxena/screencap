@@ -657,11 +657,12 @@ class TestSecureFieldIntervals:
         conn.close()
         return db_path
 
-    def test_secure_text_field_produces_interval(self, tmp_path):
-        """AXRole=AXSecureTextField in element_state → blocked interval."""
+    @pytest.mark.parametrize("ax_key", ["AXRole", "AXSubrole"])
+    def test_secure_text_field_produces_interval(self, tmp_path, ax_key):
+        """AXSecureTextField in AXRole or AXSubrole → blocked interval."""
         db_path = self._setup_db_with_element_state(tmp_path, [
             (1, 10.0, '{"AXRole": "AXTextField"}'),
-            (2, 20.0, '{"AXRole": "AXSecureTextField"}'),
+            (2, 20.0, json.dumps({ax_key: "AXSecureTextField"})),
             (3, 30.0, '{"AXRole": "AXTextField"}'),
         ])
 
@@ -671,18 +672,6 @@ class TestSecureFieldIntervals:
         assert intervals[0].start == 20.0
         assert intervals[0].end == 21.0
         assert intervals[0].reason == "secure_field_detected"
-
-    def test_secure_subrole_produces_interval(self, tmp_path):
-        """AXSubrole=AXSecureTextField → blocked interval."""
-        db_path = self._setup_db_with_element_state(tmp_path, [
-            (1, 15.0, '{"AXSubrole": "AXSecureTextField"}'),
-        ])
-
-        intervals = _build_secure_field_intervals(db_path, hold_seconds=2.0)
-
-        assert len(intervals) == 1
-        assert intervals[0].start == 15.0
-        assert intervals[0].end == 17.0
 
     def test_no_secure_fields_no_intervals(self, tmp_path):
         """Normal text fields produce no intervals."""

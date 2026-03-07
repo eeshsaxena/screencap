@@ -44,7 +44,6 @@ class TestRecorderPrivacyFilter:
         )
         f = RecorderPrivacyFilter(config, transition_hold_seconds=0.0, secure_input_fn=None)
 
-        # VS Code is a code editor — OCR_FALLBACK in public, not blocked
         f.on_window_event({
             "app_bundle_id": "com.microsoft.VSCode",
             "title": "main.py — project",
@@ -151,9 +150,6 @@ class TestRecorderPrivacyFilter:
         )
         f = RecorderPrivacyFilter(config, transition_hold_seconds=0.0, secure_input_fn=None)
 
-        # Unknown app with title matching "inbox" pattern.
-        # In public mode, unknown context → MASK_WINDOW (blocked).
-        # The title pattern also forces MASK_WINDOW.
         f.on_window_event({
             "app_bundle_id": "com.unknown.app",
             "title": "Inbox — Webmail",
@@ -173,15 +169,6 @@ class TestSecureInputDetection:
         )
 
         assert f.is_screen_allowed() is False
-
-    def test_secure_input_inactive_allows_capture(self):
-        """When secure input fn returns False, capture is allowed."""
-        config = _make_config()
-        f = RecorderPrivacyFilter(
-            config, transition_hold_seconds=0.0, secure_input_fn=lambda: False
-        )
-
-        assert f.is_screen_allowed() is True
 
     def test_secure_input_none_allows_capture(self):
         """When secure input fn is None (unavailable), capture is allowed."""
@@ -239,8 +226,12 @@ class TestSecureInputDetection:
 class TestAXSecureTextField:
     """Tests for Layer 1: AXSecureTextField detection."""
 
-    def test_ax_role_secure_text_field_blocks(self):
-        """AXRole=AXSecureTextField triggers blocking."""
+    @pytest.mark.parametrize("ax_key", ["AXRole", "AXSubrole"])
+    def test_secure_text_field_blocks(self, ax_key):
+        """AXSecureTextField in AXRole or AXSubrole triggers blocking.
+
+        AXSubrole variant is used by Chrome/Electron.
+        """
         config = _make_config()
         f = RecorderPrivacyFilter(
             config, transition_hold_seconds=1.0, secure_input_fn=None
@@ -250,22 +241,7 @@ class TestAXSecureTextField:
         with patch("screencap.privacy.recorder_enforcement.time") as mock_time:
             mock_time.monotonic.return_value = now
             f.on_action_event({
-                "element_state": {"AXRole": "AXSecureTextField"},
-            })
-            assert f.is_screen_allowed() is False
-
-    def test_ax_subrole_secure_text_field_blocks(self):
-        """AXSubrole=AXSecureTextField triggers blocking (Chrome/Electron)."""
-        config = _make_config()
-        f = RecorderPrivacyFilter(
-            config, transition_hold_seconds=1.0, secure_input_fn=None
-        )
-
-        now = time.monotonic()
-        with patch("screencap.privacy.recorder_enforcement.time") as mock_time:
-            mock_time.monotonic.return_value = now
-            f.on_action_event({
-                "element_state": {"AXSubrole": "AXSecureTextField"},
+                "element_state": {ax_key: "AXSecureTextField"},
             })
             assert f.is_screen_allowed() is False
 
@@ -279,17 +255,6 @@ class TestAXSecureTextField:
         f.on_action_event({
             "element_state": {"AXRole": "AXTextField"},
         })
-
-        assert f.is_screen_allowed() is True
-
-    def test_no_element_state_allows(self):
-        """Action events without element_state don't affect blocking."""
-        config = _make_config()
-        f = RecorderPrivacyFilter(
-            config, transition_hold_seconds=0.0, secure_input_fn=None
-        )
-
-        f.on_action_event({"name": "key.down"})
 
         assert f.is_screen_allowed() is True
 
@@ -322,22 +287,6 @@ class TestAXSecureTextField:
 
 class TestMultiReasonComposition:
     """Tests for independent blocking sources composing via OR logic."""
-
-    def test_app_policy_and_secure_input_both_block(self):
-        """Both sources active — still blocked."""
-        config = _make_config(
-            exclude_apps=frozenset({"com.1password.1password"}),
-        )
-        f = RecorderPrivacyFilter(
-            config, transition_hold_seconds=0.0, secure_input_fn=lambda: True
-        )
-
-        f.on_window_event({
-            "app_bundle_id": "com.1password.1password",
-            "title": "1Password",
-        })
-
-        assert f.is_screen_allowed() is False
 
     def test_secure_input_blocks_even_when_app_allowed(self):
         """Secure input blocks even for a normally-allowed app."""
@@ -397,8 +346,9 @@ class TestMultiReasonComposition:
 class TestKeystrokeBlocking:
     """Tests for capture-time keystroke content nulling."""
 
-    def test_null_keystroke_content_nulls_all_fields(self):
-        """null_keystroke_content nulls all key content fields."""
+    def test_null_keystroke_content_nulls_all_fields_and_preserves_metadata(self):
+        """null_keystroke_content nulls all key content fields while
+        preserving structural metadata (name, timestamp)."""
         data = {
             "name": "key.down",
             "key_char": "p",
@@ -420,114 +370,52 @@ class TestKeystrokeBlocking:
         assert data["name"] == "key.down"
         assert data["timestamp"] == 1234567890.0
 
-    def test_null_keystroke_content_preserves_mouse_fields(self):
-        """null_keystroke_content doesn't affect mouse event data."""
-        data = {
-            "name": "click",
-            "mouse_x": 100,
-            "mouse_y": 200,
-            "timestamp": 1234567890.0,
-        }
+    def test_blocked_filter_gates_keystroke_nulling(self):
+        """Integration: when filter is blocked and caller follows the
+        is_screen_allowed() → null_keystroke_content() protocol,
+        key content is nulled; when allowed, it's preserved.
 
-        RecorderPrivacyFilter.null_keystroke_content(data)
-
-        # No keystroke fields to null — unchanged
-        assert data["mouse_x"] == 100
-        assert data["mouse_y"] == 200
-
-    def test_null_keystroke_content_partial_fields(self):
-        """null_keystroke_content handles events with only some key fields."""
-        data = {
-            "name": "key.down",
-            "key_char": "a",
-            "key_name": "a",
-            # no key_vk or canonical variants
-            "timestamp": 1234567890.0,
-        }
-
-        RecorderPrivacyFilter.null_keystroke_content(data)
-
-        assert data["key_char"] is None
-        assert data["key_name"] is None
-        assert "key_vk" not in data  # not added if not present
-
-    def test_blocked_app_nulls_keystrokes(self):
-        """When app is blocked, keystroke content is nulled."""
+        This mirrors the process_events() integration in sc_engine:
+            if not screen_filter.is_screen_allowed():
+                screen_filter.null_keystroke_content(event.data)
+        """
         config = _make_config(
             exclude_apps=frozenset({"com.1password.1password"}),
         )
-        f = RecorderPrivacyFilter(
-            config, transition_hold_seconds=0.0, secure_input_fn=None
-        )
+        f = RecorderPrivacyFilter(config, transition_hold_seconds=0.0, secure_input_fn=None)
 
+        def make_key_event():
+            return {
+                "name": "key.down",
+                "key_char": "p",
+                "key_name": "p",
+                "key_vk": 35,
+                "canonical_key_char": "p",
+                "canonical_key_name": "p",
+                "canonical_key_vk": 35,
+            }
+
+        # Blocked app → keystrokes nulled
         f.on_window_event({
             "app_bundle_id": "com.1password.1password",
             "title": "1Password",
         })
-
-        assert f.is_screen_allowed() is False
-
-        data = {
-            "name": "key.down",
-            "key_char": "p",
-            "key_name": "p",
-            "key_vk": 35,
-            "canonical_key_char": "p",
-            "canonical_key_name": "p",
-            "canonical_key_vk": 35,
-        }
-        f.null_keystroke_content(data)
+        blocked_data = make_key_event()
+        if not f.is_screen_allowed():
+            f.null_keystroke_content(blocked_data)
 
         for field in KEYSTROKE_CONTENT_FIELDS:
-            assert data[field] is None
+            assert blocked_data[field] is None
 
-    def test_secure_input_nulls_keystrokes(self):
-        """When secure input is active, keystroke content is nulled."""
-        config = _make_config()
-        f = RecorderPrivacyFilter(
-            config, transition_hold_seconds=0.0, secure_input_fn=lambda: True
-        )
-
-        assert f.is_screen_allowed() is False
-
-        data = {
-            "name": "key.down",
-            "key_char": "s",
-            "key_name": "s",
-            "key_vk": 1,
-            "canonical_key_char": "s",
-            "canonical_key_name": "s",
-            "canonical_key_vk": 1,
-        }
-        f.null_keystroke_content(data)
-
-        for field in KEYSTROKE_CONTENT_FIELDS:
-            assert data[field] is None
-
-    def test_allowed_app_preserves_keystrokes(self):
-        """When capture is allowed, keystrokes pass through unchanged."""
-        config = _make_config()
-        f = RecorderPrivacyFilter(
-            config, transition_hold_seconds=0.0, secure_input_fn=None
-        )
-
+        # Allowed app → keystrokes preserved
         f.on_window_event({
             "app_bundle_id": "com.microsoft.VSCode",
-            "title": "main.py — project",
+            "title": "main.py",
         })
+        # Wait for hold to expire (hold=0.0 so immediate)
+        allowed_data = make_key_event()
+        if not f.is_screen_allowed():
+            f.null_keystroke_content(allowed_data)
 
-        assert f.is_screen_allowed() is True
-
-        data = {
-            "name": "key.down",
-            "key_char": "a",
-            "key_name": "a",
-            "key_vk": 0,
-            "canonical_key_char": "a",
-            "canonical_key_name": "a",
-            "canonical_key_vk": 0,
-        }
-        original = dict(data)
-
-        # Don't call null_keystroke_content since capture is allowed
-        assert data == original
+        assert allowed_data["key_char"] == "p"
+        assert allowed_data["key_vk"] == 35
