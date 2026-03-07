@@ -382,6 +382,9 @@ def start_recording(
     verbose: bool = False,
     chunk_duration: float | None = None,
     live_upload: bool = True,
+    force_mode: "PrivacyMode | None" = None,
+    cloud_intent: bool = False,
+    intent_source: str = "flag",
 ) -> tuple[Path, float]:
     """Start a screen capture recording. Blocks until Ctrl+C."""
     if audio is None:
@@ -505,6 +508,10 @@ def start_recording(
         from screencap.privacy.recorder_enforcement import RecorderPrivacyFilter
 
         privacy_config = get_privacy_config()
+        # --cloud flag: force PUBLIC mode, bypassing env var tightening
+        if force_mode is not None:
+            from dataclasses import replace as _dc_replace
+            privacy_config = _dc_replace(privacy_config, mode=force_mode)
         # capture-time enforcement requires window events to detect which
         # app is frontmost.  If window data capture is disabled (via CLI
         # flag or RECORD_WINDOW_DATA env var), the filter would silently
@@ -591,6 +598,33 @@ def start_recording(
         recording_id_path = capture_dir / ".recording_id"
         recording_id_path.write_text(name)
 
+        # Write immutable recording intent file
+        import json as _json
+        from datetime import datetime as _dt, timezone as _tz
+
+        _intent_data = {
+            "version": 1,
+            "destination": "cloud" if cloud_intent else "local",
+            "privacy_mode": privacy_config.mode.value if privacy_config else "internal",
+            "created_at": _dt.now(_tz.utc).isoformat(),
+            "source": intent_source,
+        }
+        _intent_path = capture_dir / ".recording_intent"
+        try:
+            _intent_path.write_text(_json.dumps(_intent_data, indent=2))
+        except OSError as _intent_err:
+            if cloud_intent:
+                console.print(
+                    f"[red]Error:[/red] Failed to write recording intent: {_intent_err}\n"
+                    "Cloud recordings require intent tracking. Cannot proceed."
+                )
+                raise SystemExit(1)
+            else:
+                if verbose:
+                    console.print(
+                        f"[yellow]Warning:[/yellow] Could not write recording intent: {_intent_err}"
+                    )
+
         chunk_processor = None
 
         with Recorder(
@@ -623,7 +657,7 @@ def start_recording(
                             _aaq,
                             recording_name=name,
                             upload_enabled=live_upload,
-                            auto_delete=get_auto_delete_after_upload(),
+                            auto_delete=cloud_intent and get_auto_delete_after_upload(),
                             rest_threshold=get_rest_threshold(),
                             flush_requested=_flush_req,
                             flush_ack_counter=_flush_ctr,

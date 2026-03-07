@@ -210,6 +210,37 @@ def get_rest_threshold() -> float:
     return float(cfg.get("rest_threshold", 120.0))
 
 
+def get_upload_default() -> str:
+    """Return default recording destination: 'local', 'cloud', or 'ask'.
+
+    Priority: SCREENCAP_UPLOAD_DEFAULT env var > privacy.upload_default config > 'ask'.
+    """
+    valid = ("local", "cloud", "ask")
+    env = os.environ.get("SCREENCAP_UPLOAD_DEFAULT")
+    if env is not None:
+        val = env.strip().lower()
+        if val not in valid:
+            raise SystemExit(
+                f"Error: SCREENCAP_UPLOAD_DEFAULT must be one of {valid}, got: {env!r}"
+            )
+        return val
+    cfg = _load_toml()
+    section = cfg.get("privacy", {})
+    if isinstance(section, dict):
+        val = section.get("upload_default", "ask")
+        if not isinstance(val, str):
+            raise SystemExit(
+                f"Error: privacy.upload_default must be a string, got: {type(val).__name__}"
+            )
+        val = val.lower()
+        if val not in valid:
+            raise SystemExit(
+                f"Error: privacy.upload_default must be one of {valid}, got: {val!r}"
+            )
+        return val
+    return "ask"
+
+
 def get_privacy_config():
     """Return a PrivacyConfig parsed from [privacy] in config.toml.
 

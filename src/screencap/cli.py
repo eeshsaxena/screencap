@@ -153,10 +153,15 @@ def _maybe_prompt_privacy_setup() -> None:
               help="Auto-cut recording at this interval (seconds). Default: 3600 (1 hour). Set 0 to disable chunking.")
 @click.option("--no-live-upload", is_flag=True, default=False,
               help="Disable background upload of chunks during recording.")
+@click.option("--cloud", "destination", flag_value="cloud", default=None,
+              help="Record for cloud upload (forces public privacy mode).")
+@click.option("--local", "destination", flag_value="local",
+              help="Record for local use only (uses configured privacy mode).")
 def start(
     name, description, no_audio, no_video, no_images, no_window_data,
     no_browser_events, output, no_wifi_metrics, no_app_versions,
     no_auto_name, local_only, force, verbose, chunk_duration, no_live_upload,
+    destination,
 ):
     """Record a screen capture session. Ctrl+C to stop."""
     from datetime import datetime
@@ -193,6 +198,46 @@ def start(
     # First-run privacy setup detection
     _maybe_prompt_privacy_setup()
 
+    # --- Resolve recording destination (cloud/local) ---
+    from screencap.config import get_upload_default
+
+    intent_source = "flag"
+    if destination is None:
+        upload_default = get_upload_default()
+        if not sys.stdin.isatty():
+            # Non-interactive: always default to local regardless of config
+            destination = "local"
+            intent_source = "non_interactive_default"
+        elif upload_default == "ask":
+            console.print(
+                "\n[bold]Recording destination:[/bold]"
+            )
+            console.print(
+                "  Cloud recordings use public privacy mode -- email, chat, calendar,"
+            )
+            console.print(
+                "  and banking apps are blocked or masked. Data may be used in public datasets."
+            )
+            console.print(
+                "\n  Local recordings use your configured privacy mode and stay on this machine.\n"
+            )
+            destination = click.prompt(
+                "Cloud or local?",
+                type=click.Choice(["cloud", "local"], case_sensitive=False),
+                default="local",
+            )
+            intent_source = "prompt"
+        else:
+            destination = upload_default
+            intent_source = "config_default"
+    # else: destination was set by --cloud or --local flag, intent_source stays "flag"
+
+    is_cloud = destination == "cloud"
+    force_mode = None
+    if is_cloud:
+        from screencap.privacy.policy import PrivacyMode
+        force_mode = PrivacyMode.PUBLIC
+
     try:
         from screencap.recorder import DiskFullError, print_summary, start_recording
     except ImportError:
@@ -209,6 +254,9 @@ def start(
             verbose=verbose,
             chunk_duration=chunk_duration,
             live_upload=not no_live_upload,
+            force_mode=force_mode,
+            cloud_intent=is_cloud,
+            intent_source=intent_source,
         )
     except DiskFullError as e:
         capture_dir, elapsed = e.capture_dir, e.elapsed
@@ -392,6 +440,7 @@ def list_cmd(as_json, sort):
     table.add_column("Date")
     table.add_column("Duration")
     table.add_column("Size")
+    table.add_column("Intent")
     table.add_column("Audio")
     table.add_column("Transcribed")
     table.add_column("Uploaded")
@@ -400,12 +449,14 @@ def list_cmd(as_json, sort):
         name_display = r.name
         if r.drops:
             name_display += " [yellow]\u26a0[/yellow]"
+        intent_display = r.intent or "-"
         table.add_row(
             str(i),
             name_display,
             r.date,
             r.duration,
             r.size_mb,
+            intent_display,
             "[green]\u2713[/green]" if r.has_audio else "[dim]\u2717[/dim]",
             "[green]\u2713[/green]" if r.transcribed else "[dim]\u2717[/dim]",
             "[green]\u2713[/green]" if r.uploaded else "[dim]\u2717[/dim]",
@@ -450,6 +501,16 @@ def info(name, as_json):
         console.print(f"[red]Error:[/red] Recording not found: {name}")
         sys.exit(1)
 
+    # Read recording intent
+    from screencap.catalog import read_intent
+    intent_data = None
+    intent_path = recording_dir / ".recording_intent"
+    if intent_path.exists():
+        try:
+            intent_data = json.loads(intent_path.read_text())
+        except (json.JSONDecodeError, OSError):
+            pass
+
     # Read DB metadata
     db_path = find_db(recording_dir)
     rec_meta = {}
@@ -477,13 +538,18 @@ def info(name, as_json):
             pass
 
     if as_json:
-        click.echo(json.dumps({"recording": rec_meta, "metrics": metrics, "drops": drops}, indent=2))
+        click.echo(json.dumps({"recording": rec_meta, "metrics": metrics, "drops": drops, "intent": intent_data}, indent=2))
         return
 
     # Human-readable output
     from rich.panel import Panel
 
     console.print(Panel(f"[bold]{name}[/bold]", title="Recording"))
+
+    if intent_data:
+        console.print(f"  [#60a5fa]destination:[/#60a5fa] {intent_data.get('destination', '?')}")
+        console.print(f"  [#60a5fa]privacy mode:[/#60a5fa] {intent_data.get('privacy_mode', '?')}")
+        console.print(f"  [#60a5fa]intent source:[/#60a5fa] {intent_data.get('source', '?')}")
 
     if rec_meta:
         for key, val in rec_meta.items():
@@ -1451,6 +1517,7 @@ def settings():
         get_chunk_duration,
         get_recordings_dir,
         get_rest_threshold,
+        get_upload_default,
     )
 
     chunk = get_chunk_duration()
@@ -1464,6 +1531,7 @@ def settings():
     console.print(f"  Recordings dir:           {get_recordings_dir()}")
     console.print(f"  Audio default:            {'enabled' if get_audio_default() else 'disabled'}")
     console.print(f"  Auto-name:                {'enabled' if get_auto_name() else 'disabled'}")
+    console.print(f"  Upload default:           {get_upload_default()}")
     console.print()
 
 

@@ -62,7 +62,7 @@ def test_start_no_auto_name_interactive(tmp_path):
         mock_sys.exit = sys.exit
         result = runner.invoke(
             cli,
-            ["start", "--no-auto-name"],
+            ["start", "--no-auto-name", "--local"],
             input="my-test\nsome desc\n",
         )
         assert result.exit_code == 0
@@ -90,6 +90,8 @@ def test_start_with_flags(tmp_path):
             capture_window_data=None, capture_browser_events=None,
             verbose=False,
             chunk_duration=None, live_upload=True,
+            force_mode=None, cloud_intent=False,
+            intent_source="non_interactive_default",
         )
 
 
@@ -111,6 +113,8 @@ def test_start_no_wifi_metrics(tmp_path):
             capture_window_data=None, capture_browser_events=None,
             verbose=False,
             chunk_duration=None, live_upload=True,
+            force_mode=None, cloud_intent=False,
+            intent_source="non_interactive_default",
         )
 
 
@@ -132,6 +136,8 @@ def test_start_no_app_versions(tmp_path):
             capture_window_data=None, capture_browser_events=None,
             verbose=False,
             chunk_duration=None, live_upload=True,
+            force_mode=None, cloud_intent=False,
+            intent_source="non_interactive_default",
         )
 
 
@@ -1134,7 +1140,7 @@ def test_start_auto_export_runs_with_no_auto_name(tmp_path):
         mock_sys.exit = sys.exit
         result = runner.invoke(
             cli,
-            ["start", "--no-auto-name"],
+            ["start", "--no-auto-name", "--local"],
             input="my-test\nsome desc\n",
         )
         assert result.exit_code == 0

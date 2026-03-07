@@ -11,6 +11,22 @@ from typing import NamedTuple
 from screencap.config import get_recordings_dir
 
 DB_NAMES = ("recording.db", "capture.db")
+INTENT_FILE = ".recording_intent"
+
+
+def read_intent(directory: Path) -> str | None:
+    """Read the recording intent from a .recording_intent file.
+
+    Returns 'cloud', 'local', or None if the file is missing/corrupt.
+    """
+    intent_path = directory / INTENT_FILE
+    if not intent_path.exists():
+        return None
+    try:
+        data = json.loads(intent_path.read_text())
+        return data.get("destination")
+    except Exception:
+        return None
 
 
 class RecordingInfo(NamedTuple):
@@ -25,6 +41,7 @@ class RecordingInfo(NamedTuple):
     is_stub: bool = False  # True if media files deleted after upload
     chunks_total: int = 0  # number of video chunks (0 = legacy single-file)
     chunks_uploaded: int = 0  # number of chunks with upload status files
+    intent: str | None = None  # "cloud", "local", or None (legacy)
 
 
 def _fmt_duration(seconds: float | None) -> str:
@@ -173,6 +190,7 @@ def list_recordings(recordings_dir: Path | None = None) -> list[RecordingInfo]:
         is_stub = uploaded and not has_media and db is not None
 
         drops = read_drops(d)
+        intent = read_intent(d)
 
         results.append(
             RecordingInfo(
@@ -187,6 +205,7 @@ def list_recordings(recordings_dir: Path | None = None) -> list[RecordingInfo]:
                 is_stub=is_stub,
                 chunks_total=chunks_total,
                 chunks_uploaded=chunks_uploaded,
+                intent=intent,
             )
         )
 
