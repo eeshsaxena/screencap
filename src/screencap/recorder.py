@@ -771,7 +771,8 @@ def start_recording(
                     console.print(f"[yellow]Warning:[/yellow] DB upload failed: {e}")
 
         # Stub recording if all chunks uploaded
-        if chunk_processor.all_chunks_uploaded() and live_upload:
+        _has_chunk_files = any(capture_dir.glob("chunk_*.mp4"))
+        if chunk_processor.all_chunks_uploaded() and live_upload and _has_chunk_files:
             try:
                 from screencap.chunk_processor import stub_recording
                 deleted = stub_recording(capture_dir)
@@ -780,8 +781,10 @@ def start_recording(
             except Exception as e:
                 if verbose:
                     console.print(f"[yellow]Warning:[/yellow] Stub failed: {e}")
-        elif not chunk_processor.all_chunks_uploaded():
+        elif not chunk_processor.all_chunks_uploaded() or not _has_chunk_files:
             console.print("[yellow]Some chunks failed to upload — run 'screencap upload' later.[/yellow]")
+            if not verbose:
+                console.print("[dim]Tip: re-run with --verbose for detailed diagnostics.[/dim]")
 
     elapsed = time.time() - t0
 
