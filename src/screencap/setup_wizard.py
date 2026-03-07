@@ -1,7 +1,7 @@
-"""Privacy setup wizard — interactive app classification and config persistence.
+"""Privacy setup wizard -- interactive app classification and config persistence.
 
 Called by `screencap setup`. Discovers installed apps, auto-classifies them,
-presents grouped summary for user review, and saves to ~/.screencap/config.toml.
+presents a curses TUI for interactive review, and saves to ~/.screencap/config.toml.
 
 Config writes are atomic (temp file + os.rename) and preserve existing
 non-privacy sections and comments via tomlkit.
@@ -76,9 +76,9 @@ _CLASS_LABELS: dict[ContextClass, str] = {
 
 # Group definitions: key, label, symbol, color
 _GROUP_DEFS = [
-    ("blocked", "Always blocked (sensitive)", "×", "red"),
+    ("blocked", "Always blocked (sensitive)", "\u00d7", "red"),
     ("communication", "Communication (masked in public mode)", "~", "yellow"),
-    ("safe", "Safe (captured normally)", "✓", "green"),
+    ("safe", "Safe (captured normally)", "\u2713", "green"),
     ("unclassified", "Needs your input", "?", "blue"),
 ]
 
@@ -161,182 +161,6 @@ def _group_apps(
     return groups, auto_allowed
 
 
-def _print_full_display(
-    groups: dict[str, list[tuple[AppMetadata, ContextClass, str]]],
-    auto_allowed_count: int,
-) -> None:
-    """Print all groups with all apps, symbols and class labels."""
-    visible = sum(len(g) for g in groups.values())
-    console.print(
-        f"\nFound [bold]{visible}[/bold] apps on your system. "
-        "Here's how they've been classified:\n"
-    )
-
-    max_name = 24
-    group_num = 0
-
-    for key, label, symbol, color in _GROUP_DEFS:
-        apps = groups.get(key, [])
-        if not apps:
-            continue
-        group_num += 1
-        count_suffix = f" ({len(apps)} apps)" if key == "unclassified" else ""
-        console.print(f"  [bold]{group_num}. {label}{count_suffix}:[/bold]")
-        for meta, cls, _source in apps:
-            cls_label = _CLASS_LABELS.get(cls, cls.value)
-            name = meta.display_name[:max_name].ljust(max_name)
-            console.print(f"    [{color}]{symbol}[/{color}] {name} [dim]({cls_label})[/dim]")
-        console.print()
-
-    if auto_allowed_count > 0:
-        console.print(
-            f"  [dim]({auto_allowed_count} system/utility apps auto-allowed, not shown)[/dim]\n"
-        )
-
-
-def _interactive_review(
-    groups: dict[str, list[tuple[AppMetadata, ContextClass, str]]],
-    auto_allowed_count: int,
-) -> dict[str, list[tuple[AppMetadata, ContextClass, str]]]:
-    """Interactive review loop: display, let user edit groups, repeat.
-
-    Returns updated groups.
-    """
-    while True:
-        _print_full_display(groups, auto_allowed_count)
-
-        # Build menu of non-empty groups
-        active_groups = [
-            (key, label, symbol, color)
-            for key, label, symbol, color in _GROUP_DEFS
-            if groups.get(key)
-        ]
-
-        if not active_groups:
-            return groups
-
-        menu_items = ", ".join(
-            f"{i}={label.split('(')[0].strip()}"
-            for i, (key, label, _, _) in enumerate(active_groups, 1)
-        )
-        console.print(f"  Edit a group? [{menu_items}]")
-        raw = click.prompt(
-            "  ",
-            default="",
-            prompt_suffix="Press Enter to accept all, or group number to edit: ",
-        )
-
-        if not raw.strip():
-            return groups
-
-        try:
-            choice = int(raw.strip())
-        except ValueError:
-            console.print("  [red]Enter a number or press Enter to accept.[/red]")
-            continue
-
-        if choice < 1 or choice > len(active_groups):
-            console.print(f"  [red]Enter 1-{len(active_groups)} or Enter to accept.[/red]")
-            continue
-
-        selected_key = active_groups[choice - 1][0]
-        _edit_group_interactive(groups, selected_key)
-
-
-def _edit_group_interactive(
-    groups: dict[str, list[tuple[AppMetadata, ContextClass, str]]],
-    group_key: str,
-) -> None:
-    """Let user toggle individual apps in a group."""
-    # Find display info for this group
-    group_info = next(
-        (label, symbol, color) for key, label, symbol, color in _GROUP_DEFS
-        if key == group_key
-    )
-    label, symbol, color = group_info
-
-    while True:
-        apps = groups[group_key]
-        if not apps:
-            console.print(f"\n  [dim]{label}: empty[/dim]")
-            return
-
-        max_name = 24
-        console.print(f"\n  [bold]{label}:[/bold]")
-        for i, (meta, cls, _source) in enumerate(apps, 1):
-            cls_label = _CLASS_LABELS.get(cls, cls.value)
-            name = meta.display_name[:max_name].ljust(max_name)
-            console.print(
-                f"    {i:>2}. [{color}]{symbol}[/{color}] {name} [dim]({cls_label})[/dim]"
-            )
-
-        if group_key == "unclassified":
-            console.print(
-                "\n  [dim]Type a number to toggle: allow ✓ / block ×[/dim]"
-            )
-        elif group_key == "blocked":
-            console.print(
-                "\n  [dim]Type a number to unblock → move to Safe ✓[/dim]"
-            )
-        else:
-            console.print(
-                "\n  [dim]Type a number to block → move to Blocked ×[/dim]"
-            )
-
-        raw = click.prompt("  ", default="q", prompt_suffix="Number to toggle, q to go back: ")
-        if raw.strip().lower() == "q":
-            return
-
-        try:
-            idx = int(raw.strip())
-        except ValueError:
-            console.print("  [red]Enter a number or 'q'.[/red]")
-            continue
-
-        if idx < 1 or idx > len(apps):
-            console.print(f"  [red]Enter 1-{len(apps)}.[/red]")
-            continue
-
-        meta, cls, source = apps[idx - 1]
-
-        if group_key == "blocked":
-            # Unblock: move to safe
-            apps.pop(idx - 1)
-            groups["safe"].append((meta, ContextClass.UNKNOWN, "user_edit"))
-            groups["safe"].sort(key=lambda x: x[0].display_name.lower())
-            console.print(f"  [green]✓ {meta.display_name} → Safe[/green]")
-        elif group_key == "unclassified":
-            # Toggle: first press = allow, if already toggled to allow = block
-            if source == "user_allow":
-                # Toggle to block
-                apps.pop(idx - 1)
-                groups["blocked"].append(
-                    (meta, ContextClass.PASSWORD_MANAGER, "user_block")
-                )
-                groups["blocked"].sort(key=lambda x: x[0].display_name.lower())
-                console.print(f"  [red]× {meta.display_name} → Blocked[/red]")
-            elif source == "user_block":
-                # Toggle back to allow
-                apps.pop(idx - 1)
-                groups["safe"].append((meta, ContextClass.UNKNOWN, "user_allow"))
-                groups["safe"].sort(key=lambda x: x[0].display_name.lower())
-                console.print(f"  [green]✓ {meta.display_name} → Safe[/green]")
-            else:
-                # First toggle: allow (move to safe)
-                apps.pop(idx - 1)
-                groups["safe"].append((meta, ContextClass.UNKNOWN, "user_allow"))
-                groups["safe"].sort(key=lambda x: x[0].display_name.lower())
-                console.print(f"  [green]✓ {meta.display_name} → Safe[/green]")
-        else:
-            # Communication or safe: block
-            apps.pop(idx - 1)
-            groups["blocked"].append(
-                (meta, ContextClass.PASSWORD_MANAGER, "user_block")
-            )
-            groups["blocked"].sort(key=lambda x: x[0].display_name.lower())
-            console.print(f"  [red]× {meta.display_name} → Blocked[/red]")
-
-
 def _load_config_toml(config_path: Path) -> tomlkit.TOMLDocument:
     """Load existing config.toml or return empty document."""
     if config_path.exists():
@@ -401,6 +225,252 @@ def _build_save_doc(
     return doc
 
 
+# ---------------------------------------------------------------------------
+# Curses TUI for interactive app review
+# ---------------------------------------------------------------------------
+
+_COLOR_PAIR = {"red": 1, "yellow": 2, "green": 3, "blue": 4}
+
+
+def _toggle_app_tui(
+    groups: dict[str, list[tuple[AppMetadata, ContextClass, str]]],
+    group_key: str,
+    meta: AppMetadata,
+) -> None:
+    """Toggle an app: blocked -> safe, anything else -> blocked."""
+    apps = groups[group_key]
+    for i, (m, _c, _s) in enumerate(apps):
+        if m.bundle_id == meta.bundle_id:
+            apps.pop(i)
+            break
+    else:
+        return
+
+    if group_key == "blocked":
+        groups["safe"].append((meta, ContextClass.UNKNOWN, "user_edit"))
+        groups["safe"].sort(key=lambda x: x[0].display_name.lower())
+    else:
+        groups["blocked"].append(
+            (meta, ContextClass.PASSWORD_MANAGER, "user_block")
+        )
+        groups["blocked"].sort(key=lambda x: x[0].display_name.lower())
+
+
+def _run_tui(
+    groups: dict[str, list[tuple[AppMetadata, ContextClass, str]]],
+    auto_allowed_count: int,
+) -> bool:
+    """Curses TUI for interactive app review.
+
+    Arrow keys navigate, Enter/Space toggle, s saves, q cancels.
+    Returns True to save, False to cancel.
+    """
+    import curses
+
+    def _build_items(grps, expanded):
+        """Build flat list of navigable items from groups."""
+        items = []
+        for key, label, symbol, color in _GROUP_DEFS:
+            apps = grps.get(key, [])
+            if not apps:
+                continue
+            items.append(("group", key, label, symbol, color, len(apps)))
+            if expanded.get(key):
+                for app_meta, cls, src in apps:
+                    items.append(("app", key, app_meta, cls, src, symbol, color))
+        return items
+
+    def _main(stdscr):
+        curses.curs_set(0)
+        curses.use_default_colors()
+        curses.init_pair(1, curses.COLOR_RED, -1)
+        curses.init_pair(2, curses.COLOR_YELLOW, -1)
+        curses.init_pair(3, curses.COLOR_GREEN, -1)
+        curses.init_pair(4, curses.COLOR_BLUE, -1)
+
+        expanded = {k: True for k in groups if groups[k]}
+        cursor = 0
+        scroll = 0
+
+        while True:
+            stdscr.erase()
+            h, w = stdscr.getmaxyx()
+
+            if h < 6 or w < 40:
+                try:
+                    stdscr.addstr(0, 0, "Terminal too small. Resize and retry.")
+                except curses.error:
+                    pass
+                stdscr.refresh()
+                ch = stdscr.getch()
+                if ch == ord("q") or ch == 27:
+                    return False
+                continue
+
+            items = _build_items(groups, expanded)
+
+            if not items:
+                try:
+                    stdscr.addstr(1, 1, "No apps to review.")
+                    stdscr.addstr(3, 1, "Press s to save, q to cancel.")
+                except curses.error:
+                    pass
+                stdscr.refresh()
+                ch = stdscr.getch()
+                if ch == ord("s"):
+                    return True
+                if ch == ord("q") or ch == 27:
+                    return False
+                continue
+
+            cursor = max(0, min(cursor, len(items) - 1))
+
+            header_h = 2
+            footer_h = 3
+            content_h = max(1, h - header_h - footer_h)
+
+            if cursor < scroll:
+                scroll = cursor
+            if cursor >= scroll + content_h:
+                scroll = cursor - content_h + 1
+
+            # --- Header ---
+            visible = sum(len(g) for g in groups.values())
+            try:
+                stdscr.addnstr(0, 1, "Privacy Setup", w - 2, curses.A_BOLD)
+                info = f"({visible} apps)"
+                stdscr.addnstr(0, 16, info, max(0, w - 17), curses.A_DIM)
+                stdscr.addnstr(1, 0, "\u2500" * (w - 1), w - 1)
+            except curses.error:
+                pass
+
+            # --- Content ---
+            for i in range(scroll, min(len(items), scroll + content_h)):
+                y = header_h + (i - scroll)
+                if y >= h - footer_h:
+                    break
+                item = items[i]
+                sel = i == cursor
+
+                if item[0] == "group":
+                    _, key, label, _sym, col, cnt = item
+                    arrow = "\u25bc" if expanded.get(key) else "\u25b6"
+                    text = f" {arrow} {label} ({cnt})"
+                    cp = curses.color_pair(_COLOR_PAIR.get(col, 0))
+                    attr = cp | curses.A_BOLD
+                    if sel:
+                        attr |= curses.A_REVERSE
+                    try:
+                        stdscr.addnstr(y, 0, text, w - 1, attr)
+                    except curses.error:
+                        pass
+                else:
+                    _, _grp, app_meta, cls, _src, sym, col = item
+                    cls_lbl = _CLASS_LABELS.get(cls, cls.value)
+                    name = app_meta.display_name
+                    if len(name) > 24:
+                        name = name[:23] + "\u2026"
+
+                    sym_part = f"    {sym} "
+                    name_part = f"{name:<24}"
+                    cls_part = f" ({cls_lbl})"
+
+                    if sel:
+                        full = sym_part + name_part + cls_part
+                        try:
+                            stdscr.addnstr(y, 0, full, w - 1, curses.A_REVERSE)
+                        except curses.error:
+                            pass
+                    else:
+                        cp = curses.color_pair(_COLOR_PAIR.get(col, 0))
+                        try:
+                            stdscr.addnstr(y, 0, sym_part, w - 1, cp)
+                            x = len(sym_part)
+                            stdscr.addnstr(
+                                y, x, name_part, max(0, w - 1 - x)
+                            )
+                            x += len(name_part)
+                            stdscr.addnstr(
+                                y, x, cls_part, max(0, w - 1 - x),
+                                curses.A_DIM,
+                            )
+                        except curses.error:
+                            pass
+
+            # --- Footer ---
+            fy = h - footer_h
+            if auto_allowed_count > 0:
+                aa_info = (
+                    f" ({auto_allowed_count} system/utility apps auto-allowed)"
+                )
+                try:
+                    stdscr.addnstr(fy, 0, aa_info, w - 1, curses.A_DIM)
+                except curses.error:
+                    pass
+
+            # Context-sensitive action hint
+            action = ""
+            if cursor < len(items):
+                cur = items[cursor]
+                if cur[0] == "group":
+                    action = "Enter/Space Expand/Collapse"
+                elif cur[1] == "blocked":
+                    action = "Enter/Space Unblock"
+                else:
+                    action = "Enter/Space Block"
+
+            try:
+                stdscr.addnstr(fy + 1, 0, "\u2500" * (w - 1), w - 1)
+                hints = (
+                    f" \u2191\u2193 Navigate  {action}"
+                    "  s Save  q Quit"
+                )
+                stdscr.addnstr(fy + 2, 0, hints, w - 1, curses.A_DIM)
+            except curses.error:
+                pass
+
+            stdscr.refresh()
+
+            # --- Input ---
+            ch = stdscr.getch()
+            if ch == ord("q") or ch == 27:
+                return False
+            elif ch == ord("s"):
+                return True
+            elif ch in (curses.KEY_UP, ord("k")):
+                cursor = max(0, cursor - 1)
+            elif ch in (curses.KEY_DOWN, ord("j")):
+                cursor = min(len(items) - 1, cursor + 1)
+            elif ch == curses.KEY_HOME:
+                cursor = 0
+            elif ch == curses.KEY_END:
+                cursor = max(0, len(items) - 1)
+            elif ch == curses.KEY_PPAGE:
+                cursor = max(0, cursor - content_h)
+            elif ch == curses.KEY_NPAGE:
+                cursor = min(len(items) - 1, cursor + content_h)
+            elif ch in (curses.KEY_ENTER, 10, 13):
+                if cursor < len(items):
+                    cur = items[cursor]
+                    if cur[0] == "group":
+                        key = cur[1]
+                        expanded[key] = not expanded.get(key, True)
+                    else:
+                        _toggle_app_tui(groups, cur[1], cur[2])
+            elif ch == ord(" "):
+                if cursor < len(items):
+                    cur = items[cursor]
+                    if cur[0] == "app":
+                        _toggle_app_tui(groups, cur[1], cur[2])
+                    elif cur[0] == "group":
+                        key = cur[1]
+                        expanded[key] = not expanded.get(key, True)
+            elif ch == curses.KEY_RESIZE:
+                pass  # re-render on next iteration
+
+    return curses.wrapper(_main)
+
+
 def run_setup_wizard(
     config_path: Path | None = None,
     scan_only: bool = False,
@@ -451,8 +521,8 @@ def run_setup_wizard(
     else:
         console.print("\nWelcome to ScreenCap! Let's configure your privacy settings.\n")
         console.print("Privacy mode:")
-        console.print("  1. Public   — strictest, for sharing publicly")
-        console.print("  2. Internal — permissive, for personal use\n")
+        console.print("  1. Public   -- strictest, for sharing publicly")
+        console.print("  2. Internal -- permissive, for personal use\n")
         mode_choice = click.prompt("  Choice", type=click.IntRange(1, 2), default=2)
         mode = PrivacyMode.PUBLIC if mode_choice == 1 else PrivacyMode.INTERNAL
 
@@ -483,8 +553,19 @@ def run_setup_wizard(
 
     groups, auto_allowed = _group_apps(classified)
 
-    # Interactive review loop
-    groups = _interactive_review(groups, len(auto_allowed))
+    # Interactive review via curses TUI
+    try:
+        save = _run_tui(groups, len(auto_allowed))
+    except Exception:
+        console.print(
+            "[red]Interactive mode unavailable.[/red] "
+            "Edit ~/.screencap/config.toml directly."
+        )
+        return False
+
+    if not save:
+        console.print("  [dim]Setup cancelled, no changes saved.[/dim]")
+        return False
 
     # Build final config from groups
     final_exclude: list[str] = sorted(existing_exclude)
@@ -532,10 +613,6 @@ def run_setup_wizard(
     final_allow.sort()
 
     # Save
-    if not click.confirm("\n  Save these preferences?", default=True):
-        console.print("  [dim]Setup cancelled, no changes saved.[/dim]")
-        return False
-
     doc = _build_save_doc(doc, mode, final_exclude, final_allow, final_app_classes)
     _save_config_atomic(config_path, doc)
 

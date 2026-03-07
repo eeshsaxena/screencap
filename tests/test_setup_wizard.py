@@ -14,6 +14,7 @@ from screencap.setup_wizard import (
     _classify_with_overrides,
     _group_apps,
     _save_config_atomic,
+    _toggle_app_tui,
     reset_privacy_config,
     run_setup_wizard,
 )
@@ -133,6 +134,69 @@ class TestGroupApps:
         assert groups["safe"][0][0].display_name == "VS Code"
 
 
+class TestToggleAppTui:
+    def test_blocked_to_safe(self):
+        meta = _make_app("com.example.test", "Test")
+        groups = {
+            "blocked": [(meta, ContextClass.PASSWORD_MANAGER, "known_app")],
+            "communication": [],
+            "safe": [],
+            "unclassified": [],
+        }
+        _toggle_app_tui(groups, "blocked", meta)
+        assert len(groups["blocked"]) == 0
+        assert len(groups["safe"]) == 1
+        assert groups["safe"][0][0].bundle_id == "com.example.test"
+
+    def test_safe_to_blocked(self):
+        meta = _make_app("com.example.test", "Test")
+        groups = {
+            "blocked": [],
+            "communication": [],
+            "safe": [(meta, ContextClass.CODE_EDITOR_TERMINAL, "known_app")],
+            "unclassified": [],
+        }
+        _toggle_app_tui(groups, "safe", meta)
+        assert len(groups["safe"]) == 0
+        assert len(groups["blocked"]) == 1
+
+    def test_communication_to_blocked(self):
+        meta = _make_app("com.example.test", "Test")
+        groups = {
+            "blocked": [],
+            "communication": [(meta, ContextClass.CHAT, "known_app")],
+            "safe": [],
+            "unclassified": [],
+        }
+        _toggle_app_tui(groups, "communication", meta)
+        assert len(groups["communication"]) == 0
+        assert len(groups["blocked"]) == 1
+
+    def test_unclassified_to_blocked(self):
+        meta = _make_app("com.example.test", "Test")
+        groups = {
+            "blocked": [],
+            "communication": [],
+            "safe": [],
+            "unclassified": [(meta, ContextClass.UNKNOWN, "unknown")],
+        }
+        _toggle_app_tui(groups, "unclassified", meta)
+        assert len(groups["unclassified"]) == 0
+        assert len(groups["blocked"]) == 1
+
+    def test_noop_if_not_found(self):
+        meta = _make_app("com.example.test", "Test")
+        other = _make_app("com.example.other", "Other")
+        groups = {
+            "blocked": [(other, ContextClass.PASSWORD_MANAGER, "known_app")],
+            "communication": [],
+            "safe": [],
+            "unclassified": [],
+        }
+        _toggle_app_tui(groups, "blocked", meta)
+        assert len(groups["blocked"]) == 1  # unchanged
+
+
 class TestBuildSaveDoc:
     def test_creates_privacy_section(self):
         doc = tomlkit.document()
@@ -206,11 +270,10 @@ class TestRunSetupWizard:
         with mock.patch("sys.stdin") as mock_stdin, \
              mock.patch("screencap.setup_wizard.discover_installed_apps", return_value=apps), \
              mock.patch("screencap.setup_wizard.click") as mock_click, \
+             mock.patch("screencap.setup_wizard._run_tui", return_value=True), \
              mock.patch("screencap.config.invalidate_config_cache"):
             mock_stdin.isatty.return_value = True
-            # Mode=1 (public), then "" (Enter to accept), then confirm save
-            mock_click.prompt.side_effect = [1, ""]
-            mock_click.confirm.return_value = True
+            mock_click.prompt.return_value = 1  # public mode
 
             result = run_setup_wizard(config_path=config_path)
             assert result is True
@@ -228,10 +291,10 @@ class TestRunSetupWizard:
         with mock.patch("sys.stdin") as mock_stdin, \
              mock.patch("screencap.setup_wizard.discover_installed_apps", return_value=apps), \
              mock.patch("screencap.setup_wizard.click") as mock_click, \
+             mock.patch("screencap.setup_wizard._run_tui", return_value=True), \
              mock.patch("screencap.config.invalidate_config_cache"):
             mock_stdin.isatty.return_value = True
-            mock_click.prompt.side_effect = [2, ""]  # mode=internal, accept all
-            mock_click.confirm.return_value = True
+            mock_click.prompt.return_value = 2  # internal mode
 
             result = run_setup_wizard(config_path=config_path)
             assert result is True
@@ -248,10 +311,10 @@ class TestRunSetupWizard:
         with mock.patch("sys.stdin") as mock_stdin, \
              mock.patch("screencap.setup_wizard.discover_installed_apps", return_value=apps), \
              mock.patch("screencap.setup_wizard.click") as mock_click, \
+             mock.patch("screencap.setup_wizard._run_tui", return_value=True), \
              mock.patch("screencap.config.invalidate_config_cache"):
             mock_stdin.isatty.return_value = True
-            mock_click.prompt.side_effect = [2, ""]  # mode, accept all
-            mock_click.confirm.return_value = True
+            mock_click.prompt.return_value = 2  # internal mode
 
             result = run_setup_wizard(config_path=config_path)
             assert result is True
@@ -268,16 +331,33 @@ class TestRunSetupWizard:
         with mock.patch("sys.stdin") as mock_stdin, \
              mock.patch("screencap.setup_wizard.discover_installed_apps", return_value=apps), \
              mock.patch("screencap.setup_wizard.click") as mock_click, \
+             mock.patch("screencap.setup_wizard._run_tui", return_value=True), \
              mock.patch("screencap.config.invalidate_config_cache"):
             mock_stdin.isatty.return_value = True
-            mock_click.prompt.side_effect = [2, ""]  # mode, accept all
-            mock_click.confirm.return_value = True
+            mock_click.prompt.return_value = 2  # internal mode
 
             result = run_setup_wizard(config_path=config_path)
             assert result is True
 
             doc = tomlkit.parse(config_path.read_text())
             assert "com.1password.1password" in doc["privacy"]["exclude_apps"]
+
+    def test_wizard_cancel(self, tmp_path):
+        """User cancels in TUI, no config saved."""
+        config_path = tmp_path / "config.toml"
+        apps = [
+            AppMetadata("/test/Slack.app", "com.tinyspeck.slackmacgap", "Slack"),
+        ]
+        with mock.patch("sys.stdin") as mock_stdin, \
+             mock.patch("screencap.setup_wizard.discover_installed_apps", return_value=apps), \
+             mock.patch("screencap.setup_wizard.click") as mock_click, \
+             mock.patch("screencap.setup_wizard._run_tui", return_value=False):
+            mock_stdin.isatty.return_value = True
+            mock_click.prompt.return_value = 2
+
+            result = run_setup_wizard(config_path=config_path)
+            assert result is False
+            assert not config_path.exists()
 
 
 class TestResetPrivacyConfig:
@@ -352,11 +432,10 @@ class TestScanOnlyMode:
         ]
         with mock.patch("sys.stdin") as mock_stdin, \
              mock.patch("screencap.setup_wizard.discover_installed_apps", return_value=apps), \
+             mock.patch("screencap.setup_wizard._run_tui", return_value=True), \
              mock.patch("screencap.setup_wizard.click") as mock_click, \
              mock.patch("screencap.config.invalidate_config_cache"):
             mock_stdin.isatty.return_value = True
-            mock_click.prompt.side_effect = [""]  # accept all
-            mock_click.confirm.return_value = True
 
             result = run_setup_wizard(config_path=config_path, scan_only=True)
             assert result is True
