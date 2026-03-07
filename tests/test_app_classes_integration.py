@@ -99,12 +99,19 @@ class TestPostRecordingReport:
         config = PrivacyConfig(mode=PrivacyMode.INTERNAL)
 
         with mock.patch("screencap.catalog.find_db", return_value=db_path), \
-             mock.patch("screencap.config.get_privacy_config", return_value=config):
+             mock.patch("screencap.config.get_privacy_config", return_value=config), \
+             mock.patch("screencap.cli.console") as mock_console:
             from screencap.cli import _report_unclassified_apps
 
-            # VSCode is in _BUNDLE_ID_MAP, Figma is not
             _report_unclassified_apps(tmp_path)
-            # Should not raise; Figma should be reported as unclassified
+
+            # VSCode is in _BUNDLE_ID_MAP so should not be reported.
+            # Figma is unknown and must appear in the output.
+            all_output = " ".join(
+                str(c) for c in mock_console.print.call_args_list
+            )
+            assert "com.figma.Desktop" in all_output
+            assert "com.microsoft.VSCode" not in all_output
 
     def test_no_report_when_all_classified(self, tmp_path):
         import sqlite3

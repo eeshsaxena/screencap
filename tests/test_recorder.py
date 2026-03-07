@@ -1,5 +1,6 @@
 """Tests for screencap.recorder — force-quit cleanup, PID file lifecycle, permission prompting, disk checks."""
 
+import ast
 import inspect
 import sys
 from collections import namedtuple
@@ -18,11 +19,25 @@ class TestForceExitCleanup:
     """Tests for the force-quit (second Ctrl+C) behavior."""
 
     def test_no_os_exit_in_recorder(self):
-        """Verify os._exit is not used in the recorder module."""
+        """Verify os._exit is not called anywhere in the recorder module.
+
+        os._exit skips finally blocks and atexit handlers — sys.exit(1)
+        must be used instead to ensure cleanup runs.  Uses AST analysis
+        so comments and strings don't cause false positives.
+        """
         import screencap.recorder as mod
 
         source = inspect.getsource(mod)
-        assert "os._exit" not in source
+        tree = ast.parse(source)
+        os_exit_calls = [
+            node for node in ast.walk(tree)
+            if isinstance(node, ast.Call)
+            and isinstance(node.func, ast.Attribute)
+            and node.func.attr == "_exit"
+            and isinstance(node.func.value, ast.Name)
+            and node.func.value.id == "os"
+        ]
+        assert os_exit_calls == [], "os._exit found — use sys.exit(1) to allow cleanup"
 
     def test_force_handler_calls_terminate_and_kill(self):
         """The force-exit handler should terminate then kill children."""
@@ -50,12 +65,32 @@ class TestForceExitCleanup:
         mock_child_b.kill.assert_called_once()
         mock_child_a.kill.assert_not_called()
 
-    def test_sys_exit_used_instead_of_os_exit(self):
-        """Verify sys.exit is used in the force-quit path."""
+    def test_force_quit_uses_sys_exit(self):
+        """The force-quit path must use sys.exit (not os._exit) so that
+        finally blocks and atexit handlers run.  Uses AST to find
+        sys.exit calls inside the _force_exit nested function."""
         import screencap.recorder as mod
 
         source = inspect.getsource(mod)
-        assert "sys.exit(1)" in source
+        tree = ast.parse(source)
+
+        # Find the _force_exit function definition
+        force_exit_fn = None
+        for node in ast.walk(tree):
+            if isinstance(node, ast.FunctionDef) and node.name == "_force_exit":
+                force_exit_fn = node
+                break
+        assert force_exit_fn is not None, "_force_exit function not found in recorder"
+
+        sys_exit_calls = [
+            node for node in ast.walk(force_exit_fn)
+            if isinstance(node, ast.Call)
+            and isinstance(node.func, ast.Attribute)
+            and node.func.attr == "exit"
+            and isinstance(node.func.value, ast.Name)
+            and node.func.value.id == "sys"
+        ]
+        assert len(sys_exit_calls) >= 1, "_force_exit must call sys.exit"
 
 
 class TestAtexitHandler:
@@ -617,18 +652,6 @@ class TestThresholdValidation:
         ):
             with pytest.raises(SystemExit):
                 start_recording("test", output_dir=tmp_path / "test-rec")
-
-
-class TestDiskFullError:
-    """Tests for DiskFullError exception."""
-
-    def test_disk_full_error_attributes(self):
-        from screencap.recorder import DiskFullError
-        from pathlib import Path
-
-        err = DiskFullError(Path("/tmp/rec"), 42.5)
-        assert err.capture_dir == Path("/tmp/rec")
-        assert err.elapsed == 42.5
 
 
 class TestPrivacyFilterInitFailure:

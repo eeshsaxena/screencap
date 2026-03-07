@@ -158,6 +158,51 @@ class TestRecorderPrivacyFilter:
         assert f.is_screen_allowed() is False
 
 
+class TestFailClosed:
+    """Tests for fail_closed() — blocks all capture until next successful window event."""
+
+    def test_fail_closed_blocks_capture(self):
+        """After fail_closed(), capture is blocked."""
+        config = _make_config()
+        f = RecorderPrivacyFilter(config, transition_hold_seconds=0.0, secure_input_fn=None)
+
+        # Initially allowed
+        assert f.is_screen_allowed() is True
+
+        f.fail_closed()
+        assert f.is_screen_allowed() is False
+
+    def test_fail_closed_clears_on_next_window_event(self):
+        """A successful on_window_event() after fail_closed() restores capture."""
+        config = _make_config()
+        f = RecorderPrivacyFilter(config, transition_hold_seconds=0.0, secure_input_fn=None)
+
+        f.fail_closed()
+        assert f.is_screen_allowed() is False
+
+        # A new window event clears the fail-closed state
+        f.on_window_event({
+            "app_bundle_id": "com.microsoft.VSCode",
+            "title": "main.py — project",
+        })
+        assert f.is_screen_allowed() is True
+
+    def test_fail_closed_persists_across_hold_expiry(self):
+        """fail_closed() sets hold to infinity — doesn't expire with time."""
+        config = _make_config()
+        f = RecorderPrivacyFilter(config, transition_hold_seconds=1.0, secure_input_fn=None)
+
+        now = time.monotonic()
+        with patch("screencap.privacy.recorder_enforcement.time") as mock_time:
+            mock_time.monotonic.return_value = now
+            f.fail_closed()
+            assert f.is_screen_allowed() is False
+
+            # Even far in the future, still blocked (infinity hold)
+            mock_time.monotonic.return_value = now + 9999
+            assert f.is_screen_allowed() is False
+
+
 class TestSecureInputDetection:
     """Tests for Layer 0: CGSIsSecureEventInputSet detection."""
 

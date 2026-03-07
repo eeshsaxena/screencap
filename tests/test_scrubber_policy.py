@@ -161,14 +161,22 @@ class TestScreenshotRouting:
 
         assert (dst / "screenshots" / "15.0.jpg").exists()
 
-    def test_ocr_fallback_screenshot_masked(self, tmp_path):
-        """Screenshot during code editor in public mode → OCR_FALLBACK → masked
-        (fail closed to MASK_WINDOW because no OCR engine is available)."""
+    def test_ocr_fallback_fails_closed_to_mask_window(self, tmp_path):
+        """OCR_FALLBACK with no OCR engine fails closed to MASK_WINDOW:
+        file is kept but pixels are replaced with a mask."""
+        from PIL import Image
+
         dst = self._setup_screenshots(tmp_path, [15.0])
+        # Write a real JPEG so masking succeeds
+        img_path = dst / "screenshots" / "15.0.jpg"
+        img = Image.new("RGB", (100, 80), (255, 255, 255))
+        img.save(img_path, "JPEG")
+        img.close()
+
         evaluator = _make_evaluator(mode="public")
         classifier = DefaultContextClassifier()
         window_events = _make_window_events([
-            (10.0, "com.microsoft.VSCode"),
+            (10.0, "com.microsoft.VSCode"),  # code_editor + public → OCR_FALLBACK
         ])
         result = ScrubResult()
 
@@ -176,12 +184,9 @@ class TestScreenshotRouting:
             dst, evaluator, classifier, window_events, [], result
         )
 
-        # File still exists (masked, not deleted) — unless masking fails,
-        # in which case it falls back to deletion.  Either way the original
-        # pixels are not exported verbatim.
+        assert img_path.exists(), "OCR_FALLBACK should mask, not delete"
         assert len(result.audit_entries) == 1
-        entry = result.audit_entries[0]
-        assert entry.action in ("mask_window", "exclude")
+        assert result.audit_entries[0].action == "mask_window"
 
     def test_emits_audit_entry_with_no_raw_text(self, tmp_path):
         """Every routed screenshot produces an audit entry without raw text."""

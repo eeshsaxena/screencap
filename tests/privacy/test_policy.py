@@ -68,6 +68,7 @@ class TestParsePrivacyConfig:
         cfg = parse_privacy_config({})
         assert cfg.mode == PrivacyMode.INTERNAL
         assert cfg.exclude_apps == frozenset()
+        assert cfg.allow_apps == frozenset()
         assert cfg.mask_domains == frozenset()
         assert cfg.mask_title_patterns == ()
 
@@ -101,10 +102,6 @@ class TestParsePrivacyConfig:
             {"privacy": {"allow_apps": ["com.apple.Finder", "com.apple.Preview"]}}
         )
         assert cfg.allow_apps == frozenset({"com.apple.Finder", "com.apple.Preview"})
-
-    def test_allow_apps_defaults_to_empty(self):
-        cfg = parse_privacy_config({})
-        assert cfg.allow_apps == frozenset()
 
     def test_allow_apps_invalid_type_rejected(self):
         with pytest.raises(InvalidPrivacyConfigError, match="must be a list"):
