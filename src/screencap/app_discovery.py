@@ -9,10 +9,13 @@ Discovery strategy (ordered by speed):
 2. Spotlight enrichment: mdfind with 5s timeout (graceful fallback)
 
 Classification priority (first match wins):
-1. Bundle ID patterns (regex)
-2. App name keyword matching
-3. LSApplicationCategoryType from Info.plist
-4. No match → UNKNOWN
+1. Bundle ID in known-apps DB (_BUNDLE_ID_MAP in context.py)
+2. Apple sensitive-app overrides (com.apple.mail, etc.)
+3. Apple bundle ID prefix (com.apple.* -> safe)
+4. Naming pattern heuristics (Agent/Helper/IM/etc.)
+5. Bundle ID / display name pattern rules (regex)
+6. LSApplicationCategoryType from Info.plist
+7. No match -> UNKNOWN
 """
 
 from __future__ import annotations
@@ -38,10 +41,54 @@ class AppMetadata:
     bundle_id: str
     display_name: str
     category: str = ""  # LSApplicationCategoryType
+    is_background: bool = False
+
+
+@dataclass(frozen=True)
+class ClassificationResult:
+    """Classification with provenance for wizard display."""
+
+    context_class: ContextClass
+    source: str  # "known_app", "apple_sensitive", "apple_prefix", "system_service",
+                 # "input_method", "lifecycle", "decoration", "pattern_rule",
+                 # "category_map", "category_safe", "unknown"
 
 
 # ---------------------------------------------------------------------------
-# Bundle ID / name pattern → ContextClass
+# Apple sensitive apps (overrides the generic com.apple.* -> safe rule)
+# ---------------------------------------------------------------------------
+
+_APPLE_SENSITIVE_APPS: dict[str, ContextClass] = {
+    "com.apple.mail": ContextClass.EMAIL,
+    "com.apple.MobileSMS": ContextClass.CHAT,
+    "com.apple.Messages": ContextClass.CHAT,
+    "com.apple.iCal": ContextClass.CALENDAR,
+    "com.apple.CalendarAgent": ContextClass.CALENDAR,
+    "com.apple.FaceTime": ContextClass.VIDEO_CALL,
+    "com.apple.Passwords": ContextClass.PASSWORD_MANAGER,
+}
+
+
+# ---------------------------------------------------------------------------
+# Naming pattern heuristics (Layer 4)
+# ---------------------------------------------------------------------------
+
+_SYSTEM_SERVICE_PATTERNS = re.compile(
+    r"(?i)(Agent|Helper|UIServer|Service|Daemon)$"
+)
+_INPUT_METHOD_PATTERNS = re.compile(
+    r"(?i)(IM$|InputMethod|Typing|Kana|Romaji|Transliteration)"
+)
+_LIFECYCLE_PATTERNS = re.compile(
+    r"(?i)(Onboarding|Setup|Installer|Updater|Migration|Rosetta)"
+)
+_DECORATION_PATTERNS = re.compile(
+    r"(?i)(ScreenSaver|Wallpaper|Widget|TouchBar|Dock$)"
+)
+
+
+# ---------------------------------------------------------------------------
+# Bundle ID / name pattern -> ContextClass (Layer 5)
 # ---------------------------------------------------------------------------
 
 _PATTERN_RULES: list[tuple[re.Pattern[str], ContextClass]] = [
@@ -60,12 +107,68 @@ _PATTERN_RULES: list[tuple[re.Pattern[str], ContextClass]] = [
     (re.compile(r"(?i)(xcode|vscode|jetbrains|sublime|cursor|zed|nova)"), ContextClass.CODE_EDITOR_TERMINAL),
 ]
 
-# LSApplicationCategoryType → ContextClass
+# LSApplicationCategoryType -> ContextClass (Layer 6)
 _CATEGORY_MAP: dict[str, ContextClass] = {
     "public.app-category.finance": ContextClass.BANKING,
     "public.app-category.social-networking": ContextClass.CHAT,
     "public.app-category.developer-tools": ContextClass.CODE_EDITOR_TERMINAL,
 }
+
+_SAFE_CATEGORIES: frozenset[str] = frozenset({
+    "public.app-category.productivity",
+    "public.app-category.entertainment",
+    "public.app-category.music",
+    "public.app-category.photography",
+    "public.app-category.utilities",
+    "public.app-category.education",
+    "public.app-category.games",
+    "public.app-category.graphics-design",
+    "public.app-category.video",
+    "public.app-category.news",
+    "public.app-category.reference",
+    "public.app-category.weather",
+    "public.app-category.travel",
+    "public.app-category.sports",
+    "public.app-category.business",
+    "public.app-category.lifestyle",
+    "public.app-category.books",
+    "public.app-category.food-and-drink",
+})
+
+
+# ---------------------------------------------------------------------------
+# Background app detection
+# ---------------------------------------------------------------------------
+
+
+def _is_background_from_plist(app_path: str | Path) -> bool:
+    """Check LSUIElement or LSBackgroundOnly in Info.plist."""
+    plist_path = Path(app_path) / "Contents" / "Info.plist"
+    if not plist_path.exists():
+        return False
+    try:
+        with open(plist_path, "rb") as f:
+            plist = plistlib.load(f)
+    except Exception:
+        return False
+    return bool(plist.get("LSUIElement")) or bool(plist.get("LSBackgroundOnly"))
+
+
+def is_background_app(metadata: AppMetadata) -> bool:
+    """Check if an app is a background/agent app.
+
+    Checks Info.plist keys (LSUIElement, LSBackgroundOnly) and
+    naming patterns for system services that don't set these keys.
+    """
+    if metadata.is_background:
+        return True
+    # Naming pattern fallback for services without plist keys
+    name = metadata.display_name
+    if _SYSTEM_SERVICE_PATTERNS.search(name):
+        return True
+    if _INPUT_METHOD_PATTERNS.search(name):
+        return True
+    return False
 
 
 # ---------------------------------------------------------------------------
@@ -101,11 +204,14 @@ def get_app_metadata(app_path: str | Path) -> AppMetadata | None:
     )
     category = plist.get("LSApplicationCategoryType", "")
 
+    bg = bool(plist.get("LSUIElement")) or bool(plist.get("LSBackgroundOnly"))
+
     return AppMetadata(
         path=str(app_path),
         bundle_id=bundle_id,
         display_name=display_name,
         category=category,
+        is_background=bg,
     )
 
 
@@ -114,8 +220,68 @@ def get_app_metadata(app_path: str | Path) -> AppMetadata | None:
 # ---------------------------------------------------------------------------
 
 
+def auto_classify_detailed(metadata: AppMetadata) -> ClassificationResult:
+    """Classify an app using multi-layer local heuristics.
+
+    Priority (first match wins):
+    1. Known-apps DB (_BUNDLE_ID_MAP) -- checked by caller in setup wizard
+    2. Apple sensitive-app overrides
+    3. Apple bundle ID prefix (com.apple.* -> safe)
+    4. Naming pattern heuristics
+    5. Bundle ID / display name pattern rules
+    6. LSApplicationCategoryType
+    7. UNKNOWN
+    """
+    from screencap.privacy.context import _BUNDLE_ID_MAP
+
+    bid = metadata.bundle_id
+
+    # Layer 1: Known-apps DB
+    if bid in _BUNDLE_ID_MAP:
+        return ClassificationResult(_BUNDLE_ID_MAP[bid], "known_app")
+
+    # Layer 2: Apple sensitive apps
+    if bid in _APPLE_SENSITIVE_APPS:
+        return ClassificationResult(_APPLE_SENSITIVE_APPS[bid], "apple_sensitive")
+
+    # Layer 3: Apple bundle ID prefix (generic safe)
+    if bid.startswith("com.apple."):
+        return ClassificationResult(ContextClass.UNKNOWN, "apple_prefix")
+
+    # Layer 4: Naming pattern heuristics
+    name = metadata.display_name
+    if _SYSTEM_SERVICE_PATTERNS.search(name):
+        return ClassificationResult(ContextClass.UNKNOWN, "system_service")
+    if _INPUT_METHOD_PATTERNS.search(name):
+        return ClassificationResult(ContextClass.UNKNOWN, "input_method")
+    if _LIFECYCLE_PATTERNS.search(name):
+        return ClassificationResult(ContextClass.UNKNOWN, "lifecycle")
+    if _DECORATION_PATTERNS.search(name):
+        return ClassificationResult(ContextClass.UNKNOWN, "decoration")
+
+    # Layer 5: Bundle ID patterns
+    for pattern, ctx_class in _PATTERN_RULES:
+        if pattern.search(bid):
+            return ClassificationResult(ctx_class, "pattern_rule")
+
+    # Layer 5b: Display name patterns
+    for pattern, ctx_class in _PATTERN_RULES:
+        if pattern.search(name):
+            return ClassificationResult(ctx_class, "pattern_rule")
+
+    # Layer 6: Info.plist category -> specific class
+    if metadata.category and metadata.category in _CATEGORY_MAP:
+        return ClassificationResult(_CATEGORY_MAP[metadata.category], "category_map")
+
+    # Layer 6b: Info.plist category -> safe
+    if metadata.category and metadata.category in _SAFE_CATEGORIES:
+        return ClassificationResult(ContextClass.UNKNOWN, "category_safe")
+
+    return ClassificationResult(ContextClass.UNKNOWN, "unknown")
+
+
 def auto_classify(metadata: AppMetadata) -> ContextClass:
-    """Classify an app using local signals only.
+    """Classify an app using local signals only (backwards-compatible wrapper).
 
     Priority:
     1. Bundle ID pattern match
@@ -123,17 +289,16 @@ def auto_classify(metadata: AppMetadata) -> ContextClass:
     3. LSApplicationCategoryType
     4. UNKNOWN
     """
-    # 1. Bundle ID patterns
+    # Preserve original behavior: only pattern rules + category map
+    # (no apple prefix, no naming heuristics)
     for pattern, ctx_class in _PATTERN_RULES:
         if pattern.search(metadata.bundle_id):
             return ctx_class
 
-    # 2. Display name patterns
     for pattern, ctx_class in _PATTERN_RULES:
         if pattern.search(metadata.display_name):
             return ctx_class
 
-    # 3. Info.plist category
     if metadata.category and metadata.category in _CATEGORY_MAP:
         return _CATEGORY_MAP[metadata.category]
 

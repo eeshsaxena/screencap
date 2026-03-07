@@ -10,9 +10,12 @@ import pytest
 
 from screencap.app_discovery import (
     AppMetadata,
+    ClassificationResult,
     auto_classify,
+    auto_classify_detailed,
     discover_installed_apps,
     get_app_metadata,
+    is_background_app,
     _scan_filesystem,
     _scan_spotlight,
 )
@@ -102,6 +105,184 @@ class TestAutoClassify:
             display_name="RandomApp",
         )
         assert auto_classify(meta) == ContextClass.UNKNOWN
+
+
+class TestAutoClassifyDetailed:
+    """Tests for auto_classify_detailed with source provenance."""
+
+    def test_known_app_db(self):
+        meta = AppMetadata(path="/test", bundle_id="com.tinyspeck.slackmacgap", display_name="Slack")
+        result = auto_classify_detailed(meta)
+        assert result.context_class == ContextClass.CHAT
+        assert result.source == "known_app"
+
+    def test_apple_sensitive_mail(self):
+        """com.apple.mail is in _BUNDLE_ID_MAP, so it matches as known_app."""
+        meta = AppMetadata(path="/test", bundle_id="com.apple.mail", display_name="Mail")
+        result = auto_classify_detailed(meta)
+        assert result.context_class == ContextClass.EMAIL
+        assert result.source == "known_app"
+
+    def test_apple_sensitive_messages(self):
+        """com.apple.MobileSMS is in _BUNDLE_ID_MAP, so it matches as known_app."""
+        meta = AppMetadata(path="/test", bundle_id="com.apple.MobileSMS", display_name="Messages")
+        result = auto_classify_detailed(meta)
+        assert result.context_class == ContextClass.CHAT
+        assert result.source == "known_app"
+
+    def test_apple_passwords_in_known_db(self):
+        """com.apple.Passwords is in _BUNDLE_ID_MAP, matches as known_app."""
+        meta = AppMetadata(path="/test", bundle_id="com.apple.Passwords", display_name="Passwords")
+        result = auto_classify_detailed(meta)
+        assert result.context_class == ContextClass.PASSWORD_MANAGER
+        assert result.source == "known_app"
+
+    def test_apple_facetime_in_known_db(self):
+        """com.apple.FaceTime is in _BUNDLE_ID_MAP, matches as known_app."""
+        meta = AppMetadata(path="/test", bundle_id="com.apple.FaceTime", display_name="FaceTime")
+        result = auto_classify_detailed(meta)
+        assert result.context_class == ContextClass.VIDEO_CALL
+        assert result.source == "known_app"
+
+    def test_apple_prefix_generic(self):
+        meta = AppMetadata(path="/test", bundle_id="com.apple.Preview", display_name="Preview")
+        result = auto_classify_detailed(meta)
+        assert result.context_class == ContextClass.UNKNOWN
+        assert result.source == "apple_prefix"
+
+    def test_known_app_takes_priority_over_apple_prefix(self):
+        """Apps in _BUNDLE_ID_MAP must not fall through to the generic prefix rule."""
+        meta = AppMetadata(path="/test", bundle_id="com.apple.iCal", display_name="Calendar")
+        result = auto_classify_detailed(meta)
+        assert result.context_class == ContextClass.CALENDAR
+        assert result.source == "known_app"
+
+    def test_apple_sensitive_not_in_known_db(self):
+        """Apple sensitive apps not in _BUNDLE_ID_MAP use the apple_sensitive layer."""
+        meta = AppMetadata(path="/test", bundle_id="com.apple.Messages", display_name="Messages")
+        result = auto_classify_detailed(meta)
+        assert result.context_class == ContextClass.CHAT
+        assert result.source == "apple_sensitive"
+
+    def test_system_service_pattern(self):
+        meta = AppMetadata(path="/test", bundle_id="com.example.foo", display_name="SpotlightHelper")
+        result = auto_classify_detailed(meta)
+        assert result.source == "system_service"
+
+    def test_input_method_pattern(self):
+        meta = AppMetadata(path="/test", bundle_id="com.example.foo", display_name="JapaneseIM")
+        result = auto_classify_detailed(meta)
+        assert result.source == "input_method"
+
+    def test_lifecycle_pattern(self):
+        meta = AppMetadata(path="/test", bundle_id="com.example.foo", display_name="AppInstaller")
+        result = auto_classify_detailed(meta)
+        assert result.source == "lifecycle"
+
+    def test_decoration_pattern(self):
+        meta = AppMetadata(path="/test", bundle_id="com.example.foo", display_name="ScreenSaverEngine")
+        result = auto_classify_detailed(meta)
+        assert result.source == "decoration"
+
+    def test_pattern_rule_bundle_id(self):
+        meta = AppMetadata(path="/test", bundle_id="com.example.discord", display_name="MyApp")
+        result = auto_classify_detailed(meta)
+        assert result.context_class == ContextClass.CHAT
+        assert result.source == "pattern_rule"
+
+    def test_pattern_rule_display_name(self):
+        meta = AppMetadata(path="/test", bundle_id="com.example.foo", display_name="Slack Chat")
+        result = auto_classify_detailed(meta)
+        assert result.context_class == ContextClass.CHAT
+        assert result.source == "pattern_rule"
+
+    def test_category_map(self):
+        meta = AppMetadata(
+            path="/test", bundle_id="com.example.thing", display_name="Thing",
+            category="public.app-category.finance",
+        )
+        result = auto_classify_detailed(meta)
+        assert result.context_class == ContextClass.BANKING
+        assert result.source == "category_map"
+
+    def test_category_safe(self):
+        meta = AppMetadata(
+            path="/test", bundle_id="com.example.thing", display_name="Thing",
+            category="public.app-category.games",
+        )
+        result = auto_classify_detailed(meta)
+        assert result.context_class == ContextClass.UNKNOWN
+        assert result.source == "category_safe"
+
+    def test_unknown_fallback(self):
+        meta = AppMetadata(path="/test", bundle_id="com.example.random", display_name="RandomApp")
+        result = auto_classify_detailed(meta)
+        assert result.context_class == ContextClass.UNKNOWN
+        assert result.source == "unknown"
+
+    def test_wrapper_compatibility(self):
+        """auto_classify wrapper returns same ContextClass for pattern-matched apps."""
+        meta = AppMetadata(path="/test", bundle_id="com.example.discord", display_name="MyApp")
+        assert auto_classify(meta) == auto_classify_detailed(meta).context_class
+
+
+class TestBackgroundAppDetection:
+    def test_plist_lsuielement(self, tmp_path):
+        app = tmp_path / "Agent.app" / "Contents"
+        app.mkdir(parents=True)
+        plist = {
+            "CFBundleIdentifier": "com.example.agent",
+            "CFBundleName": "Agent",
+            "LSUIElement": True,
+        }
+        with open(app / "Info.plist", "wb") as f:
+            plistlib.dump(plist, f)
+        result = get_app_metadata(tmp_path / "Agent.app")
+        assert result is not None
+        assert result.is_background is True
+
+    def test_plist_lsbackgroundonly(self, tmp_path):
+        app = tmp_path / "Daemon.app" / "Contents"
+        app.mkdir(parents=True)
+        plist = {
+            "CFBundleIdentifier": "com.example.daemon",
+            "CFBundleName": "Daemon",
+            "LSBackgroundOnly": True,
+        }
+        with open(app / "Info.plist", "wb") as f:
+            plistlib.dump(plist, f)
+        result = get_app_metadata(tmp_path / "Daemon.app")
+        assert result is not None
+        assert result.is_background is True
+
+    def test_not_background(self, tmp_path):
+        app = tmp_path / "Normal.app" / "Contents"
+        app.mkdir(parents=True)
+        plist = {
+            "CFBundleIdentifier": "com.example.normal",
+            "CFBundleName": "Normal",
+        }
+        with open(app / "Info.plist", "wb") as f:
+            plistlib.dump(plist, f)
+        result = get_app_metadata(tmp_path / "Normal.app")
+        assert result is not None
+        assert result.is_background is False
+
+    def test_is_background_app_from_name(self):
+        meta = AppMetadata(path="/test", bundle_id="com.example.foo", display_name="CoreLocationAgent")
+        assert is_background_app(meta) is True
+
+    def test_is_background_app_input_method(self):
+        meta = AppMetadata(path="/test", bundle_id="com.example.foo", display_name="JapaneseIM")
+        assert is_background_app(meta) is True
+
+    def test_is_background_app_normal(self):
+        meta = AppMetadata(path="/test", bundle_id="com.example.foo", display_name="Safari")
+        assert is_background_app(meta) is False
+
+    def test_is_background_from_plist_flag(self):
+        meta = AppMetadata(path="/test", bundle_id="com.example.foo", display_name="NormalName", is_background=True)
+        assert is_background_app(meta) is True
 
 
 class TestScanSpotlight:
