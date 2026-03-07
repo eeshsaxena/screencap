@@ -583,8 +583,8 @@ def start_recording(
                             flush_ack_counter=_flush_ctr,
                         )
                         chunk_processor.start()
-                except Exception:
-                    pass  # chunking not available (e.g., mock recorder)
+                except Exception as _chunk_init_err:
+                    console.print(f"[yellow]Warning:[/yellow] ChunkProcessor failed to start: {_chunk_init_err}")
 
             # Write PID file tracking all child processes
             child_pids = [
@@ -676,10 +676,8 @@ def start_recording(
                     else:
                         live.update(Text(""))
 
-            # Suppress ALL output before Recorder.__exit__ runs:
-            # 1. Redirect stdout/stderr for print() calls (Recording Profile)
-            # 2. Remove loguru handlers — loguru caches the original stderr
-            #    file object, so sys.stderr = devnull doesn't stop it.
+            # Suppress stdout before Recorder.__exit__ runs (profile block),
+            # but redirect stderr to a log file so subprocess errors are captured.
             if not verbose:
                 try:
                     from loguru import logger as _sc_logger
@@ -690,12 +688,16 @@ def start_recording(
                 _saved_stderr = sys.stderr
                 _devnull = open(os.devnull, "w")
                 sys.stdout = _devnull
-                sys.stderr = _devnull
+                try:
+                    _engine_log = open(capture_dir / "engine_exit.log", "w")
+                    sys.stderr = _engine_log
+                except Exception:
+                    sys.stderr = _devnull
 
     except KeyboardInterrupt:
         _stop_reason = "interrupt"
         console.print("  [dim]■ Stopping recording...[/dim]")
-        # Suppress profile block on interrupt path
+        # Suppress stdout, redirect stderr to log file on interrupt path
         if not verbose:
             try:
                 from loguru import logger as _sc_logger
@@ -706,7 +708,11 @@ def start_recording(
             _saved_stderr = sys.stderr
             _devnull = open(os.devnull, "w")
             sys.stdout = _devnull
-            sys.stderr = _devnull
+            try:
+                _engine_log = open(capture_dir / "engine_exit.log", "w")
+                sys.stderr = _engine_log
+            except Exception:
+                sys.stderr = _devnull
     finally:
         # Restore stdout/stderr if we redirected them
         if _saved_stdout is not None:
