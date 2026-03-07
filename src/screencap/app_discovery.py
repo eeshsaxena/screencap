@@ -349,6 +349,11 @@ def _scan_filesystem() -> list[str]:
 _SPOTLIGHT_EXCLUDE_PREFIXES = (
     "/System/Library/",
     "/Library/Apple/",
+    # Framework-embedded runtimes — not user-facing apps.
+    # Python.app is the interpreter itself; blocking it would break
+    # any Python-based tool (including ScreenCap).
+    "/Library/Frameworks/",
+    "/Library/Developer/",
 )
 
 
@@ -412,6 +417,11 @@ def discover_installed_apps(
         if meta is None:
             continue
         if meta.bundle_id in seen_bundle_ids:
+            continue
+        # Skip language runtimes — they're not user-facing apps.
+        # org.python.* is the Python interpreter; blocking it would
+        # break ScreenCap and any other Python tool.
+        if meta.bundle_id.startswith("org.python."):
             continue
         seen_bundle_ids.add(meta.bundle_id)
         apps.append(meta)
