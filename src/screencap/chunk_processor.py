@@ -10,13 +10,26 @@ from __future__ import annotations
 import json
 import logging
 import os
+import shutil
 import sqlite3
+import subprocess
 import sys
 import threading
 import time
 from pathlib import Path
 
 logger = logging.getLogger(__name__)
+
+# Cache whether macOS `trash` binary exists (checked once)
+_HAS_TRASH = shutil.which("trash") is not None
+
+
+def _safe_trash(path: Path) -> None:
+    """Move file to Trash (macOS) if available, else fall back to unlink."""
+    if _HAS_TRASH:
+        subprocess.run(["trash", str(path)], check=True, capture_output=True)
+    else:
+        path.unlink()
 
 
 class ChunkProcessor:
@@ -438,14 +451,20 @@ class ChunkProcessor:
 
         Transcript upload failure is non-fatal — the chunk is still
         considered uploaded if video/audio/events succeed.
+        Retries once after a 5-second backoff on failure.
         """
-        try:
-            return upload_chunk_files(
-                self._recording_name, files, self._capture_dir,
-            )
-        except Exception as e:
-            logger.error(f"Chunk {idx} upload failed: {e}")
-            return False
+        for attempt in range(2):
+            try:
+                return upload_chunk_files(
+                    self._recording_name, files, self._capture_dir,
+                )
+            except Exception as e:
+                if attempt == 0:
+                    logger.warning(f"Chunk {idx} upload attempt 1 failed: {e}, retrying in 5s...")
+                    time.sleep(5)
+                else:
+                    logger.error(f"Chunk {idx} upload failed after retry: {e}")
+        return False
 
     def _delete_old_chunks(self, current_idx: int, keep_recent: int = 2) -> int:
         """Delete media files for old uploaded chunks. Returns bytes freed."""
@@ -462,10 +481,10 @@ class ChunkProcessor:
                 if path.exists():
                     try:
                         freed += path.stat().st_size
-                        path.unlink()
-                        logger.info(f"Deleted {path.name}")
-                    except OSError as e:
-                        logger.warning(f"Failed to delete {path.name}: {e}")
+                        _safe_trash(path)
+                        logger.info(f"Trashed {path.name}")
+                    except (OSError, subprocess.CalledProcessError) as e:
+                        logger.warning(f"Failed to trash {path.name}: {e}")
         return freed
 
 
@@ -619,20 +638,20 @@ def stub_recording(recording_dir: Path) -> list[str]:
             continue
         if p.suffix in (".mp4", ".flac", ".jsonl", ".png", ".jpg"):
             try:
-                p.unlink()
+                _safe_trash(p)
                 deleted.append(p.name)
-            except OSError as e:
-                logger.warning(f"Failed to delete {p.name}: {e}")
+            except (OSError, subprocess.CalledProcessError) as e:
+                logger.warning(f"Failed to trash {p.name}: {e}")
 
-    # Delete screenshots subdirectory
+    # Trash screenshots subdirectory
     screenshots_dir = recording_dir / "screenshots"
     if screenshots_dir.is_dir():
         for p in screenshots_dir.iterdir():
             if p.is_file():
                 try:
-                    p.unlink()
+                    _safe_trash(p)
                     deleted.append(f"screenshots/{p.name}")
-                except OSError:
+                except (OSError, subprocess.CalledProcessError):
                     pass
         try:
             screenshots_dir.rmdir()

@@ -579,7 +579,10 @@ def _check_idempotency(sessions_prefix: str, db_md5: str) -> bool:
         return False
     try:
         status = json.loads(data)
-        return status.get("source_db_md5") == db_md5 and status.get("status") == "complete"
+        if status.get("source_db_md5") != db_md5:
+            return False
+        # "complete" blocks reprocessing; "complete_empty" does NOT (manifests may arrive later)
+        return status.get("status") == "complete"
     except json.JSONDecodeError:
         return False
 
@@ -640,30 +643,19 @@ def process_recording(cloud_event):
     # Load manifests
     manifest_blobs = _list_manifests(recording_name)
     if not manifest_blobs:
-        log.warning("No manifests found for %s", recording_name)
-        # Write empty timeline
-        _upload_json(f"{sessions_prefix}timeline.json", {
-            "recording_name": recording_name,
-            "processed_at": started_at,
-            "processor_version": PROCESSOR_VERSION,
-            "total_tasks": 0,
-            "total_chunks": 0,
-            "total_duration_s": 0,
-            "total_active_s": 0,
-            "rest_threshold_secs": DEFAULT_REST_THRESHOLD,
-            "tasks": [],
-        })
+        log.warning("No manifests found for %s — writing provisional status (will retry on next recording.db upload)", recording_name)
+        # Write "complete_empty" status — this does NOT block reprocessing.
+        # If manifests arrive later and recording.db is re-uploaded (e.g. via
+        # `screencap upload`), the idempotency check will allow reprocessing.
         _upload_json(f"{sessions_prefix}_processing_status.json", {
-            "status": "complete",
+            "status": "complete_empty",
             "started_at": started_at,
             "completed_at": datetime.now(timezone.utc).isoformat(),
             "processor_version": PROCESSOR_VERSION,
             "source_db_md5": db_md5,
             "chunks_found": 0,
             "manifests_found": 0,
-            "tasks_before_merge": 0,
-            "tasks_after_merge": 0,
-            "total_video_bytes": 0,
+            "note": "No manifests found. Will reprocess if recording.db is re-uploaded after manifests arrive.",
         })
         return
 
