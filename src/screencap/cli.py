@@ -1093,14 +1093,19 @@ def upload(names, all_recordings, dry_run, force, jobs, no_delete):
 
 
 @cli.command()
+@click.argument("names", nargs=-1)
 @click.option("--dest", default=None, help="Destination directory (default: ~/.screencap/downloads/).")
 @click.option("--dry-run", is_flag=True, help="Show what would be downloaded without downloading.")
 @click.option("--force", is_flag=True, help="Re-download all recordings, ignoring markers.")
 @click.option("--jobs", "-j", type=click.IntRange(min=1), default=4,
               help="Parallel file transfers per recording (default: 4).")
 @click.option("--sessions", is_flag=True, help="Download processed sessions instead of raw recordings.")
-def download(dest, dry_run, force, jobs, sessions):
-    """Download recordings from cloud storage."""
+def download(names, dest, dry_run, force, jobs, sessions):
+    """Download recordings from cloud storage.
+
+    Optionally pass one or more recording NAMES to download only those.
+    With no names, all remote recordings are listed and downloaded.
+    """
     from screencap.download import (
         _fmt_size,
         _resolve_dest_dir,
@@ -1124,20 +1129,24 @@ def download(dest, dry_run, force, jobs, sessions):
             console.print(f"[red]Error:[/red] {e}")
             sys.exit(1)
 
-    try:
-        remote = list_remote_recordings(source=source)
-    except RuntimeError as e:
-        console.print(f"[red]Error:[/red] {e}")
-        sys.exit(1)
+    if names:
+        from types import SimpleNamespace
+        remote = [SimpleNamespace(name=n, total_size=0, file_count=0) for n in names]
+    else:
+        try:
+            remote = list_remote_recordings(source=source)
+        except RuntimeError as e:
+            console.print(f"[red]Error:[/red] {e}")
+            sys.exit(1)
 
-    if not remote:
-        label = "sessions" if sessions else "recordings"
-        console.print(f"No {label} available for download.")
-        return
+        if not remote:
+            label = "sessions" if sessions else "recordings"
+            console.print(f"No {label} available for download.")
+            return
 
     label = "session" if sessions else "recording"
     console.print(
-        f"Found [bold]{len(remote)}[/bold] {label}(s) on server."
+        f"Found [bold]{len(remote)}[/bold] {label}(s) to download."
     )
 
     all_downloaded = 0
