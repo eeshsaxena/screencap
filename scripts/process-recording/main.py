@@ -1,0 +1,757 @@
+"""Cloud Run service: combine chunked recordings into task-segmented sessions.
+
+Triggered by Eventarc when recording.db lands on GCS. Reads per-chunk manifests,
+merges cross-chunk tasks, combines video/audio per task via ffmpeg, slices events
+& transcripts, and writes everything to sessions/{name}/.
+"""
+
+from __future__ import annotations
+
+import hashlib
+import json
+import logging
+import os
+import re
+import subprocess
+import tempfile
+from datetime import datetime, timezone
+from pathlib import Path
+
+import functions_framework
+from google.cloud import storage
+
+logging.basicConfig(level=logging.INFO, format="%(levelname)s %(message)s")
+log = logging.getLogger(__name__)
+
+BUCKET = "screencap-recordings"
+PROCESSOR_VERSION = "1.0.0"
+DEFAULT_REST_THRESHOLD = 120.0
+MAX_MERGE_GAP = 5.0  # max seconds between consecutive chunk boundaries
+SLUG_MAX = 60
+
+_storage_client: storage.Client | None = None
+
+
+def _client() -> storage.Client:
+    global _storage_client
+    if _storage_client is None:
+        _storage_client = storage.Client()
+    return _storage_client
+
+
+def _bucket() -> storage.Bucket:
+    return _client().bucket(BUCKET)
+
+
+# ---------------------------------------------------------------------------
+# Helpers
+# ---------------------------------------------------------------------------
+
+def _slugify(text: str, max_len: int = 40) -> str:
+    s = text.lower()
+    s = re.sub(r"[^\w\s-]", "", s)
+    s = re.sub(r"[\s_]+", "-", s).strip("-")
+    return (s or "untitled")[:max_len]
+
+
+def _duration_human(secs: float) -> str:
+    h, rem = divmod(int(secs), 3600)
+    m, s = divmod(rem, 60)
+    parts = []
+    if h:
+        parts.append(f"{h}h")
+    if m:
+        parts.append(f"{m}m")
+    parts.append(f"{s}s")
+    return " ".join(parts)
+
+
+def _md5_bytes(data: bytes) -> str:
+    return hashlib.md5(data).hexdigest()
+
+
+def _download_blob(blob_name: str, dest: Path) -> bool:
+    """Download a GCS object to a local path. Returns True on success."""
+    try:
+        blob = _bucket().blob(blob_name)
+        blob.download_to_filename(str(dest))
+        return True
+    except Exception:
+        log.warning("Failed to download %s", blob_name, exc_info=True)
+        return False
+
+
+def _upload_blob(blob_name: str, src: Path, content_type: str = "application/octet-stream") -> None:
+    blob = _bucket().blob(blob_name)
+    blob.upload_from_filename(str(src), content_type=content_type)
+
+
+def _upload_json(blob_name: str, obj: dict | list) -> None:
+    blob = _bucket().blob(blob_name)
+    blob.upload_from_string(
+        json.dumps(obj, indent=2, ensure_ascii=False),
+        content_type="application/json",
+    )
+
+
+def _upload_text(blob_name: str, text: str) -> None:
+    blob = _bucket().blob(blob_name)
+    blob.upload_from_string(text, content_type="text/plain; charset=utf-8")
+
+
+def _blob_exists(blob_name: str) -> bool:
+    return _bucket().blob(blob_name).exists()
+
+
+def _blob_bytes(blob_name: str) -> bytes | None:
+    try:
+        return _bucket().blob(blob_name).download_as_bytes()
+    except Exception:
+        return None
+
+
+# ---------------------------------------------------------------------------
+# Manifest loading
+# ---------------------------------------------------------------------------
+
+def _list_manifests(recording_name: str) -> list[str]:
+    """List chunk_NNNN_manifest.json blobs sorted by chunk index."""
+    prefix = f"recordings/{recording_name}/"
+    blobs = _client().list_blobs(BUCKET, prefix=prefix)
+    manifests = []
+    for b in blobs:
+        fname = b.name.split("/")[-1]
+        if re.match(r"^chunk_\d{4}_manifest\.json$", fname):
+            manifests.append(b.name)
+    manifests.sort()
+    return manifests
+
+
+def _load_manifest(blob_name: str) -> dict | None:
+    data = _blob_bytes(blob_name)
+    if data is None:
+        return None
+    try:
+        return json.loads(data)
+    except json.JSONDecodeError:
+        log.warning("Invalid JSON in manifest %s", blob_name)
+        return None
+
+
+# ---------------------------------------------------------------------------
+# Cross-chunk task merging
+# ---------------------------------------------------------------------------
+
+def _merge_tasks(manifests: list[dict], rest_threshold: float) -> list[dict]:
+    """Merge tasks across chunks. Returns list of MergedTask dicts."""
+    merged: list[dict] = []
+    current: dict | None = None
+
+    for manifest in manifests:
+        chunk_idx = manifest["chunk_index"]
+        chunk_start = manifest["chunk_start"]
+        chunk_end = manifest["chunk_end"]
+        tasks = manifest.get("tasks", [])
+
+        for i, task in enumerate(tasks):
+            is_last_in_chunk = i == len(tasks) - 1
+            entry = {
+                "start_ts": task["start_ts"],
+                "end_ts": task["end_ts"],
+                "event_count": task["event_count"],
+                "dominant_app": task["dominant_app"],
+                "dominant_app_name": task.get("dominant_app_name", ""),
+                "dominant_title": task.get("dominant_title", ""),
+                "dominant_pct": task.get("dominant_pct", 0.0),
+                "all_apps": dict(task.get("all_apps", {})),
+                "derived_name": task.get("derived_name", "untitled"),
+                "rest_after_s": task.get("rest_after_s", 0.0),
+                "source_chunks": [{
+                    "chunk_index": chunk_idx,
+                    "chunk_start": chunk_start,
+                    "chunk_end": chunk_end,
+                    "start_ts": task["start_ts"],
+                    "end_ts": task["end_ts"],
+                    "start_offset_s": task["start_ts"] - chunk_start,
+                    "end_offset_s": task["end_ts"] - chunk_start,
+                }],
+                "_is_last_in_chunk": is_last_in_chunk,
+                "_chunk_end": chunk_end,
+            }
+
+            if current is None:
+                current = entry
+                continue
+
+            # Check merge conditions
+            should_merge = (
+                current["_is_last_in_chunk"]
+                and current["rest_after_s"] == 0
+                and abs(current["_chunk_end"] - chunk_start) <= MAX_MERGE_GAP
+                and (entry["start_ts"] - current["end_ts"]) < rest_threshold
+            )
+
+            if should_merge:
+                # Extend current task
+                current["end_ts"] = entry["end_ts"]
+                current["event_count"] += entry["event_count"]
+                # Union all_apps
+                for app, dur in entry["all_apps"].items():
+                    current["all_apps"][app] = current["all_apps"].get(app, 0) + dur
+                current["source_chunks"].extend(entry["source_chunks"])
+                current["rest_after_s"] = entry["rest_after_s"]
+                current["_is_last_in_chunk"] = entry["_is_last_in_chunk"]
+                current["_chunk_end"] = entry["_chunk_end"]
+                # Recompute dominant app
+                if current["all_apps"]:
+                    dom = max(current["all_apps"], key=current["all_apps"].get)
+                    total = sum(current["all_apps"].values())
+                    current["dominant_app"] = dom
+                    parts = dom.split(".")
+                    current["dominant_app_name"] = parts[-1] if parts else dom
+                    current["dominant_pct"] = round(
+                        current["all_apps"][dom] / total * 100, 1
+                    ) if total else 0.0
+                # Recompute derived_name from new dominant
+                app_slug = _slugify(current["dominant_app_name"])
+                title_slug = _slugify(current.get("dominant_title", ""))
+                current["derived_name"] = (
+                    f"{app_slug}-{title_slug}" if title_slug and title_slug != "untitled"
+                    else app_slug
+                )
+            else:
+                # Finalize current, start new
+                merged.append(current)
+                current = entry
+
+    if current is not None:
+        merged.append(current)
+
+    # Clean internal fields
+    for t in merged:
+        t.pop("_is_last_in_chunk", None)
+        t.pop("_chunk_end", None)
+
+    return merged
+
+
+# ---------------------------------------------------------------------------
+# Folder naming
+# ---------------------------------------------------------------------------
+
+def _assign_folder_names(tasks: list[dict]) -> list[str]:
+    """Assign 000_slug folder names, deduplicating as needed."""
+    seen: dict[str, int] = {}
+    folders: list[str] = []
+    for i, task in enumerate(tasks):
+        slug = task["derived_name"][:SLUG_MAX]
+        if slug in seen:
+            seen[slug] += 1
+            slug = f"{slug}-{seen[slug]}"
+        else:
+            seen[slug] = 0
+        folders.append(f"{i:03d}_{slug}")
+    return folders
+
+
+# ---------------------------------------------------------------------------
+# Events slicing
+# ---------------------------------------------------------------------------
+
+def _slice_events(
+    task: dict,
+    recording_name: str,
+    tmpdir: Path,
+) -> tuple[str, int]:
+    """Read events JSONL from source chunks, filter to task time range.
+
+    Returns (jsonl_text, event_count).
+    """
+    lines: list[str] = []
+
+    chunk_indices = {sc["chunk_index"] for sc in task["source_chunks"]}
+    for idx in sorted(chunk_indices):
+        blob_name = f"recordings/{recording_name}/events_{idx:04d}.jsonl"
+        data = _blob_bytes(blob_name)
+        if data is None:
+            continue
+        for line in data.decode("utf-8", errors="replace").splitlines():
+            line = line.strip()
+            if not line:
+                continue
+            try:
+                evt = json.loads(line)
+            except json.JSONDecodeError:
+                continue
+            ts = evt.get("timestamp") or evt.get("ts") or evt.get("time")
+            if ts is None:
+                lines.append(line)  # keep events without timestamp
+                continue
+            if task["start_ts"] <= ts < task["end_ts"]:
+                lines.append(line)
+
+    # Sort by timestamp
+    def _sort_key(line: str) -> float:
+        try:
+            evt = json.loads(line)
+            return evt.get("timestamp") or evt.get("ts") or evt.get("time") or 0
+        except Exception:
+            return 0
+
+    lines.sort(key=_sort_key)
+    return "\n".join(lines) + ("\n" if lines else ""), len(lines)
+
+
+# ---------------------------------------------------------------------------
+# Transcript slicing
+# ---------------------------------------------------------------------------
+
+def _slice_transcript(
+    task: dict,
+    recording_name: str,
+) -> tuple[str, list[dict], bool]:
+    """Slice transcript segments for this task from source chunks.
+
+    Returns (plain_text, segments_list, has_transcript).
+    """
+    all_segments: list[dict] = []
+
+    for sc in task["source_chunks"]:
+        idx = sc["chunk_index"]
+        chunk_start = sc["chunk_start"]
+
+        # Try JSON transcript first
+        blob_name = f"recordings/{recording_name}/transcript_{idx:04d}.json"
+        data = _blob_bytes(blob_name)
+        if data is None:
+            continue
+
+        try:
+            transcript_data = json.loads(data)
+        except json.JSONDecodeError:
+            continue
+
+        segments = transcript_data.get("segments", [])
+        task_start_rel = task["start_ts"] - chunk_start
+        task_end_rel = task["end_ts"] - chunk_start
+
+        for seg in segments:
+            seg_start = seg.get("start", 0)
+            seg_end = seg.get("end", 0)
+            if seg_end > task_start_rel and seg_start < task_end_rel:
+                all_segments.append(seg)
+
+    if not all_segments:
+        return "", [], False
+
+    plain = " ".join(s.get("text", "").strip() for s in all_segments).strip()
+    return plain, all_segments, True
+
+
+# ---------------------------------------------------------------------------
+# Video / audio merging via ffmpeg
+# ---------------------------------------------------------------------------
+
+def _ffmpeg_extract(
+    input_path: Path,
+    output_path: Path,
+    start_s: float,
+    end_s: float,
+) -> bool:
+    """Extract a time range from a media file using stream copy."""
+    cmd = [
+        "ffmpeg", "-y",
+        "-ss", f"{start_s:.3f}",
+        "-to", f"{end_s:.3f}",
+        "-i", str(input_path),
+        "-c", "copy",
+        "-avoid_negative_ts", "make_zero",
+        str(output_path),
+    ]
+    try:
+        subprocess.run(cmd, check=True, capture_output=True, timeout=300)
+        return True
+    except (subprocess.CalledProcessError, subprocess.TimeoutExpired) as e:
+        log.warning("ffmpeg extract failed: %s", e)
+        return False
+
+
+def _ffmpeg_concat(segment_paths: list[Path], output_path: Path) -> bool:
+    """Concatenate media segments via ffmpeg concat demuxer."""
+    list_path = output_path.parent / f"{output_path.stem}_concat.txt"
+    with open(list_path, "w") as f:
+        for p in segment_paths:
+            f.write(f"file '{p}'\n")
+
+    cmd = [
+        "ffmpeg", "-y",
+        "-f", "concat",
+        "-safe", "0",
+        "-i", str(list_path),
+        "-c", "copy",
+        str(output_path),
+    ]
+    try:
+        subprocess.run(cmd, check=True, capture_output=True, timeout=600)
+        return True
+    except (subprocess.CalledProcessError, subprocess.TimeoutExpired) as e:
+        log.warning("ffmpeg concat failed: %s", e)
+        return False
+    finally:
+        list_path.unlink(missing_ok=True)
+
+
+def _merge_media_for_task(
+    task: dict,
+    recording_name: str,
+    tmpdir: Path,
+    chunk_cache: dict[int, Path],
+    media_type: str,  # "video" or "audio"
+) -> Path | None:
+    """Download chunk media, extract per-chunk segments, concat into one file.
+
+    Returns path to merged file or None on failure.
+    media_type: "video" → chunk_NNNN.mp4, "audio" → audio_NNNN.flac
+    """
+    if media_type == "video":
+        pattern = "chunk_{idx:04d}.mp4"
+        ext = ".mp4"
+    else:
+        pattern = "audio_{idx:04d}.flac"
+        ext = ".flac"
+
+    segments: list[Path] = []
+
+    for sc in task["source_chunks"]:
+        idx = sc["chunk_index"]
+        chunk_start = sc["chunk_start"]
+
+        # Download chunk if not cached
+        if idx not in chunk_cache:
+            fname = pattern.format(idx=idx)
+            blob_name = f"recordings/{recording_name}/{fname}"
+            if not _blob_exists(blob_name):
+                log.info("Missing %s for chunk %d", media_type, idx)
+                continue
+            local = tmpdir / f"dl_{fname}"
+            if not _download_blob(blob_name, local):
+                continue
+            chunk_cache[idx] = local
+
+        chunk_path = chunk_cache.get(idx)
+        if chunk_path is None:
+            continue
+
+        # Compute offsets within this chunk
+        start_offset = max(0.0, sc["start_ts"] - chunk_start)
+        end_offset = sc["end_ts"] - chunk_start
+
+        # Extract segment
+        seg_path = tmpdir / f"seg_{idx:04d}_{media_type}{ext}"
+        if _ffmpeg_extract(chunk_path, seg_path, start_offset, end_offset):
+            if seg_path.stat().st_size > 0:
+                segments.append(seg_path)
+            else:
+                seg_path.unlink(missing_ok=True)
+
+    if not segments:
+        return None
+
+    # Single segment → use directly
+    if len(segments) == 1:
+        return segments[0]
+
+    # Multiple → concat
+    merged = tmpdir / f"merged_{media_type}{ext}"
+    if _ffmpeg_concat(segments, merged):
+        # Clean up segments
+        for p in segments:
+            p.unlink(missing_ok=True)
+        return merged
+
+    # Concat failed, fall back to first segment
+    return segments[0] if segments else None
+
+
+# ---------------------------------------------------------------------------
+# Process a single task
+# ---------------------------------------------------------------------------
+
+def _process_task(
+    task: dict,
+    folder: str,
+    recording_name: str,
+    tmpdir: Path,
+    video_cache: dict[int, Path],
+    audio_cache: dict[int, Path],
+    sessions_prefix: str,
+) -> dict:
+    """Process one merged task: media merge, events, transcript. Upload to GCS.
+
+    Returns task.json dict.
+    """
+    task_prefix = f"{sessions_prefix}tasks/{folder}/"
+
+    # --- Video ---
+    has_video = False
+    video_size = 0
+    video_path = _merge_media_for_task(
+        task, recording_name, tmpdir, video_cache, "video",
+    )
+    if video_path and video_path.exists():
+        video_size = video_path.stat().st_size
+        _upload_blob(f"{task_prefix}task_video.mp4", video_path, "video/mp4")
+        has_video = True
+        video_path.unlink(missing_ok=True)
+
+    # --- Audio ---
+    has_audio = False
+    audio_path = _merge_media_for_task(
+        task, recording_name, tmpdir, audio_cache, "audio",
+    )
+    if audio_path and audio_path.exists():
+        _upload_blob(f"{task_prefix}task_audio.flac", audio_path, "audio/flac")
+        has_audio = True
+        audio_path.unlink(missing_ok=True)
+
+    # --- Events ---
+    events_text, event_count = _slice_events(task, recording_name, tmpdir)
+    has_events = event_count > 0
+    if events_text:
+        _upload_text(f"{task_prefix}events.jsonl", events_text)
+
+    # --- Transcript ---
+    plain, segments, has_transcript = _slice_transcript(task, recording_name)
+    _upload_text(f"{task_prefix}transcript.txt", plain)
+    if segments:
+        _upload_json(f"{task_prefix}transcript_segments.json", segments)
+
+    # --- task.json ---
+    duration = task["end_ts"] - task["start_ts"]
+
+    # Build source_chunks with offsets
+    source_chunks_detail = []
+    for sc in task["source_chunks"]:
+        source_chunks_detail.append({
+            "chunk_index": sc["chunk_index"],
+            "start_ts": sc["start_ts"],
+            "end_ts": sc["end_ts"],
+            "start_offset_s": sc["start_offset_s"],
+            "end_offset_s": sc["end_offset_s"],
+        })
+
+    task_meta = {
+        "folder": folder,
+        "start_ts": task["start_ts"],
+        "end_ts": task["end_ts"],
+        "duration_s": round(duration, 1),
+        "duration_human": _duration_human(duration),
+        "event_count": event_count,
+        "dominant_app": task["dominant_app"],
+        "dominant_app_name": task["dominant_app_name"],
+        "dominant_title": task.get("dominant_title", ""),
+        "dominant_pct": task["dominant_pct"],
+        "derived_name": task["derived_name"],
+        "source_chunks": source_chunks_detail,
+        "merged_across_chunks": len(task["source_chunks"]) > 1,
+        "has_transcript": has_transcript,
+        "has_video": has_video,
+        "has_audio": has_audio,
+        "has_events": has_events,
+        "video_size_mb": round(video_size / (1024 * 1024), 1) if video_size else 0,
+        "rest_after_s": task.get("rest_after_s", 0.0),
+        "all_apps": task["all_apps"],
+    }
+
+    _upload_json(f"{task_prefix}task.json", task_meta)
+    return task_meta
+
+
+# ---------------------------------------------------------------------------
+# Idempotency
+# ---------------------------------------------------------------------------
+
+def _check_idempotency(sessions_prefix: str, db_md5: str) -> bool:
+    """Return True if this recording was already processed with same DB."""
+    status_blob = f"{sessions_prefix}_processing_status.json"
+    data = _blob_bytes(status_blob)
+    if data is None:
+        return False
+    try:
+        status = json.loads(data)
+        if status.get("source_db_md5") != db_md5:
+            return False
+        # "complete" blocks reprocessing; "complete_empty" does NOT (manifests may arrive later)
+        return status.get("status") == "complete"
+    except json.JSONDecodeError:
+        return False
+
+
+# ---------------------------------------------------------------------------
+# Chunk cache management
+# ---------------------------------------------------------------------------
+
+def _cleanup_chunk_cache(
+    cache: dict[int, Path],
+    needed_indices: set[int],
+) -> None:
+    """Delete cached chunk files no longer needed by any remaining task."""
+    to_remove = []
+    for idx, path in cache.items():
+        if idx not in needed_indices:
+            path.unlink(missing_ok=True)
+            to_remove.append(idx)
+    for idx in to_remove:
+        del cache[idx]
+
+
+# ---------------------------------------------------------------------------
+# Entry point
+# ---------------------------------------------------------------------------
+
+@functions_framework.cloud_event
+def process_recording(cloud_event):
+    """Eventarc handler: triggered when an object is finalized in GCS."""
+    data = cloud_event.data
+    object_name = data["name"]
+
+    # Guard: only process recording.db
+    parts = object_name.split("/")
+    if len(parts) != 3 or parts[0] != "recordings" or parts[2] != "recording.db":
+        log.info("Ignoring non-recording.db object: %s", object_name)
+        return
+
+    recording_name = parts[1]
+    log.info("Processing recording: %s", recording_name)
+
+    sessions_prefix = f"sessions/{recording_name}/"
+
+    # Download recording.db for md5
+    db_data = _blob_bytes(object_name)
+    if db_data is None:
+        log.error("Cannot download %s", object_name)
+        return
+    db_md5 = _md5_bytes(db_data)
+
+    # Idempotency check
+    if _check_idempotency(sessions_prefix, db_md5):
+        log.info("Already processed %s (md5=%s), skipping", recording_name, db_md5)
+        return
+
+    started_at = datetime.now(timezone.utc).isoformat()
+
+    # Load manifests
+    manifest_blobs = _list_manifests(recording_name)
+    if not manifest_blobs:
+        log.warning("No manifests found for %s — writing provisional status (will retry on next recording.db upload)", recording_name)
+        # Write "complete_empty" status — this does NOT block reprocessing.
+        # If manifests arrive later and recording.db is re-uploaded (e.g. via
+        # `screencap upload`), the idempotency check will allow reprocessing.
+        _upload_json(f"{sessions_prefix}_processing_status.json", {
+            "status": "complete_empty",
+            "started_at": started_at,
+            "completed_at": datetime.now(timezone.utc).isoformat(),
+            "processor_version": PROCESSOR_VERSION,
+            "source_db_md5": db_md5,
+            "chunks_found": 0,
+            "manifests_found": 0,
+            "note": "No manifests found. Will reprocess if recording.db is re-uploaded after manifests arrive.",
+        })
+        return
+
+    manifests = []
+    for blob_name in manifest_blobs:
+        m = _load_manifest(blob_name)
+        if m is not None:
+            manifests.append(m)
+
+    if not manifests:
+        log.error("All manifests failed to load for %s", recording_name)
+        return
+
+    # Count tasks before merge
+    tasks_before = sum(len(m.get("tasks", [])) for m in manifests)
+
+    # Get rest threshold from first manifest (they should all match)
+    rest_threshold = manifests[0].get("rest_threshold_secs", DEFAULT_REST_THRESHOLD)
+
+    # Merge cross-chunk tasks
+    merged_tasks = _merge_tasks(manifests, rest_threshold)
+    log.info(
+        "%s: %d chunks, %d tasks before merge, %d after merge",
+        recording_name, len(manifests), tasks_before, len(merged_tasks),
+    )
+
+    # Assign folder names
+    folders = _assign_folder_names(merged_tasks)
+
+    # Process tasks with /tmp management
+    with tempfile.TemporaryDirectory(prefix="screencap_") as tmpdir_str:
+        tmpdir = Path(tmpdir_str)
+        video_cache: dict[int, Path] = {}  # chunk_index → local path
+        audio_cache: dict[int, Path] = {}
+
+        timeline_tasks: list[dict] = []
+        total_video_bytes = 0
+        total_active_s = 0.0
+
+        for task_idx, (task, folder) in enumerate(zip(merged_tasks, folders)):
+            log.info("Processing task %d/%d: %s", task_idx + 1, len(merged_tasks), folder)
+
+            task_meta = _process_task(
+                task, folder, recording_name, tmpdir,
+                video_cache, audio_cache, sessions_prefix,
+            )
+
+            # Add index to timeline entry (strip all_apps for timeline)
+            timeline_entry = {k: v for k, v in task_meta.items() if k != "all_apps"}
+            timeline_entry["index"] = task_idx
+            timeline_tasks.append(timeline_entry)
+            total_video_bytes += int(task_meta.get("video_size_mb", 0) * 1024 * 1024)
+            total_active_s += task_meta.get("duration_s", 0)
+
+            # Cleanup chunk cache — remove chunks not needed by remaining tasks
+            remaining_chunks: set[int] = set()
+            for future_task in merged_tasks[task_idx + 1:]:
+                for sc in future_task["source_chunks"]:
+                    remaining_chunks.add(sc["chunk_index"])
+            _cleanup_chunk_cache(video_cache, remaining_chunks)
+            _cleanup_chunk_cache(audio_cache, remaining_chunks)
+
+    # Compute total duration
+    total_duration = 0.0
+    if merged_tasks:
+        total_duration = merged_tasks[-1]["end_ts"] - merged_tasks[0]["start_ts"]
+
+    # Upload timeline.json
+    timeline = {
+        "recording_name": recording_name,
+        "processed_at": datetime.now(timezone.utc).isoformat(),
+        "processor_version": PROCESSOR_VERSION,
+        "total_tasks": len(merged_tasks),
+        "total_chunks": len(manifests),
+        "total_duration_s": round(total_duration, 1),
+        "total_active_s": round(total_active_s, 1),
+        "rest_threshold_secs": rest_threshold,
+        "tasks": timeline_tasks,
+    }
+    _upload_json(f"{sessions_prefix}timeline.json", timeline)
+
+    # Upload processing status
+    _upload_json(f"{sessions_prefix}_processing_status.json", {
+        "status": "complete",
+        "started_at": started_at,
+        "completed_at": datetime.now(timezone.utc).isoformat(),
+        "processor_version": PROCESSOR_VERSION,
+        "source_db_md5": db_md5,
+        "chunks_found": len(manifests),
+        "manifests_found": len(manifest_blobs),
+        "tasks_before_merge": tasks_before,
+        "tasks_after_merge": len(merged_tasks),
+        "total_video_bytes": total_video_bytes,
+    })
+
+    log.info(
+        "Done processing %s: %d tasks, %d chunks",
+        recording_name, len(merged_tasks), len(manifests),
+    )

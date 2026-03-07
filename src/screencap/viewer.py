@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import subprocess
+import tempfile
 from pathlib import Path
 
 from rich.console import Console
@@ -11,6 +12,63 @@ from screencap.catalog import find_db
 from screencap.config import get_recordings_dir
 
 console = Console()
+
+
+def _ensure_single_video(rec_dir: Path) -> None:
+    """If only chunked videos exist, concatenate them into a temp video.mp4.
+
+    Uses ffmpeg concat demuxer (stream copy, no re-encode). The merged
+    file is placed in a temp directory (not in recording dir) to avoid
+    polluting uploads.
+    """
+    chunks = sorted(rec_dir.glob("chunk_*.mp4"))
+    if not chunks:
+        return  # nothing to concat
+    if (rec_dir / "video.mp4").exists():
+        return  # already has single video
+
+    # Only concat if we have 2+ chunks
+    if len(chunks) == 1:
+        # Symlink single chunk for compatibility
+        try:
+            (rec_dir / "video.mp4").symlink_to(chunks[0])
+        except OSError:
+            pass
+        return
+
+    console.print(f"[dim]Concatenating {len(chunks)} video chunks for viewer...[/dim]")
+    try:
+        # Write concat file list
+        concat_list = tempfile.NamedTemporaryFile(
+            mode="w", suffix=".txt", delete=False, prefix="screencap_concat_",
+        )
+        for chunk in chunks:
+            concat_list.write(f"file '{chunk}'\n")
+        concat_list.close()
+
+        # Use ffmpeg concat demuxer (stream copy)
+        out_path = rec_dir / "video.mp4"
+        result = subprocess.run(
+            [
+                "ffmpeg", "-y", "-f", "concat", "-safe", "0",
+                "-i", concat_list.name,
+                "-c", "copy", str(out_path),
+            ],
+            capture_output=True, text=True, timeout=300,
+        )
+        if result.returncode != 0:
+            console.print(f"[yellow]Warning:[/yellow] ffmpeg concat failed: {result.stderr[:200]}")
+        else:
+            console.print(f"[dim]Created merged video ({len(chunks)} chunks)[/dim]")
+    except FileNotFoundError:
+        console.print("[yellow]Warning:[/yellow] ffmpeg not found — cannot merge video chunks for viewer")
+    except Exception as e:
+        console.print(f"[yellow]Warning:[/yellow] Video merge failed: {e}")
+    finally:
+        try:
+            Path(concat_list.name).unlink(missing_ok=True)
+        except Exception:
+            pass
 
 
 def open_viewer(
@@ -29,6 +87,9 @@ def open_viewer(
         raise FileNotFoundError(
             f"Recording '{dir_name}' not found in {recordings_dir}"
         )
+
+    # For chunked recordings, ensure a single video file exists for the viewer
+    _ensure_single_video(rec_dir)
 
     # Auto-generate viewer.html if missing but a recording DB exists
     if not viewer.exists():

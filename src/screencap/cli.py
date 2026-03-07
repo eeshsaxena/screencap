@@ -46,10 +46,14 @@ def cli(ctx, no_update_check):
 @click.option("--local-only", is_flag=True, default=False, help="Restrict LLM naming to local providers (Ollama).")
 @click.option("--force", is_flag=True, default=False, help="Auto-clean orphaned processes before starting.")
 @click.option("--verbose", "-v", is_flag=True, default=False, help="Show all info/debug output during recording.")
+@click.option("--chunk-duration", type=float, default=None,
+              help="Auto-cut recording at this interval (seconds). Default: 3600 (1 hour). Set 0 to disable chunking.")
+@click.option("--no-live-upload", is_flag=True, default=False,
+              help="Disable background upload of chunks during recording.")
 def start(
     name, description, no_audio, no_video, no_images, no_window_data,
     no_browser_events, output, no_wifi_metrics, no_app_versions,
-    no_auto_name, local_only, force, verbose,
+    no_auto_name, local_only, force, verbose, chunk_duration, no_live_upload,
 ):
     """Record a screen capture session. Ctrl+C to stop."""
     from datetime import datetime
@@ -97,6 +101,8 @@ def start(
             capture_video=capture_video, capture_images=capture_images,
             capture_window_data=capture_window_data, capture_browser_events=capture_browser_events,
             verbose=verbose,
+            chunk_duration=chunk_duration,
+            live_upload=not no_live_upload,
         )
     except DiskFullError as e:
         capture_dir, elapsed = e.capture_dir, e.elapsed
@@ -123,8 +129,10 @@ def start(
 
     if auto_name_enabled and not disk_full:
         # Auto-transcribe if audio was captured
+        # In chunked mode, per-chunk transcription is handled by ChunkProcessor
+        has_chunk_transcripts = any(capture_dir.glob("transcript_*.txt"))
         audio_path = capture_dir / "audio.flac"
-        if audio and audio_path.exists() and audio_path.stat().st_size >= 1024:
+        if audio and not has_chunk_transcripts and audio_path.exists() and audio_path.stat().st_size >= 1024:
             try:
                 _auto_transcribe(capture_dir, audio_path)
             except KeyboardInterrupt:
@@ -853,6 +861,140 @@ def _run_api_transcription(api_key, audio_path, transcript_path, transcript_json
                 sys.exit(0)
 
 
+def _recover_chunk_metadata(
+    recording_dir: Path, console: "Console", *, force: bool = False,
+) -> None:
+    """Generate per-chunk manifests + events JSONL when chunks exist but metadata doesn't.
+
+    This is a recovery path for when ChunkProcessor failed during recording
+    but chunk video files were created. Uses recording.db to derive chunk
+    time ranges and generate the metadata files the Cloud Run processor needs.
+    """
+    import sqlite3
+
+    chunk_videos = sorted(recording_dir.glob("chunk_*.mp4"))
+    if not chunk_videos:
+        return  # not a chunked recording
+
+    db_path = recording_dir / "recording.db"
+    if not db_path.exists():
+        return
+
+    # Check which chunks are missing manifests and/or events
+    missing_manifests = []
+    missing_events = []
+    for vf in chunk_videos:
+        # Extract index from filename: chunk_0000.mp4 → 0
+        idx_str = vf.stem.split("_")[1]
+        try:
+            idx = int(idx_str)
+        except ValueError:
+            continue
+        if not (recording_dir / f"chunk_{idx:04d}_manifest.json").exists() or force:
+            missing_manifests.append(idx)
+        if not (recording_dir / f"events_{idx:04d}.jsonl").exists() or force:
+            missing_events.append(idx)
+
+    if not missing_manifests and not missing_events:
+        return
+
+    # Derive chunk time ranges from recording.db
+    try:
+        conn = sqlite3.connect(str(db_path))
+        conn.execute("PRAGMA busy_timeout=5000")
+        conn.execute("PRAGMA query_only=ON")
+        conn.row_factory = sqlite3.Row
+
+        # Get recording start time (video_start_time is when first frame was captured)
+        rec = conn.execute("SELECT timestamp FROM recording LIMIT 1").fetchone()
+        if not rec:
+            conn.close()
+            return
+        rec_start = rec["timestamp"]
+
+        # Get the first and last action event timestamps
+        first_evt = conn.execute("SELECT MIN(timestamp) as ts FROM action_event").fetchone()
+        last_evt = conn.execute("SELECT MAX(timestamp) as ts FROM action_event").fetchone()
+        if not first_evt or first_evt["ts"] is None:
+            conn.close()
+            return
+
+        first_ts = first_evt["ts"]
+        last_ts = last_evt["ts"]
+        n_chunks = len(chunk_videos)
+
+        # Determine chunk duration from config
+        from screencap.config import get_chunk_duration
+        chunk_dur = get_chunk_duration()
+        if chunk_dur <= 0:
+            # Estimate from recording span and chunk count
+            chunk_dur = (last_ts - first_ts) / max(n_chunks, 1)
+
+        # Compute chunk boundaries: chunk N covers [start + N*dur, start + (N+1)*dur)
+        # Use recording start (or first event) as the base
+        base_ts = min(rec_start, first_ts)
+        chunk_ranges = []
+        for idx in range(n_chunks):
+            c_start = base_ts + idx * chunk_dur
+            c_end = base_ts + (idx + 1) * chunk_dur
+            if idx == n_chunks - 1:
+                c_end = max(c_end, last_ts + 1.0)  # last chunk extends to cover all events
+            chunk_ranges.append((idx, c_start, c_end))
+
+        conn.close()
+    except Exception as e:
+        console.print(f"  [yellow]Warning:[/yellow] Could not derive chunk ranges: {e}")
+        return
+
+    # Generate missing manifests
+    if missing_manifests:
+        with console.status("[dim]Generating chunk manifests...[/dim]"):
+            from screencap.task_manifest import generate_manifest
+
+            generated = 0
+            for idx, c_start, c_end in chunk_ranges:
+                if idx in missing_manifests:
+                    try:
+                        generate_manifest(recording_dir, idx, c_start, c_end)
+                        generated += 1
+                    except Exception as e:
+                        console.print(f"  [yellow]Warning:[/yellow] Manifest generation failed for chunk {idx}: {e}")
+            if generated:
+                console.print(f"  [dim]Generated {generated} chunk manifest(s)[/dim]")
+
+    # Generate missing per-chunk events
+    if missing_events:
+        with console.status("[dim]Exporting per-chunk events...[/dim]"):
+            import json as _json
+
+            exported = 0
+            try:
+                conn = sqlite3.connect(str(db_path))
+                conn.execute("PRAGMA busy_timeout=5000")
+                conn.execute("PRAGMA query_only=ON")
+                conn.row_factory = sqlite3.Row
+
+                for idx, c_start, c_end in chunk_ranges:
+                    if idx in missing_events:
+                        try:
+                            rows = conn.execute(
+                                "SELECT * FROM action_event WHERE timestamp >= ? AND timestamp < ? ORDER BY timestamp",
+                                (c_start, c_end),
+                            ).fetchall()
+                            jsonl_path = recording_dir / f"events_{idx:04d}.jsonl"
+                            with open(jsonl_path, "w") as f:
+                                for row in rows:
+                                    f.write(_json.dumps(dict(row)) + "\n")
+                            exported += 1
+                        except Exception as e:
+                            console.print(f"  [yellow]Warning:[/yellow] Event export failed for chunk {idx}: {e}")
+                conn.close()
+            except Exception as e:
+                console.print(f"  [yellow]Warning:[/yellow] Could not export chunk events: {e}")
+            if exported:
+                console.print(f"  [dim]Exported events for {exported} chunk(s)[/dim]")
+
+
 @cli.command()
 @click.argument("names", nargs=-1)
 @click.option("--all", "all_recordings", is_flag=True, help="Upload all recordings.")
@@ -860,7 +1002,9 @@ def _run_api_transcription(api_key, audio_path, transcript_path, transcript_json
 @click.option("--force", is_flag=True, help="Re-upload even if already uploaded.")
 @click.option("--jobs", "-j", type=click.IntRange(min=1), default=4,
               help="Parallel file transfers per recording (default: 4).")
-def upload(names, all_recordings, dry_run, force, jobs):
+@click.option("--no-delete", is_flag=True, default=False,
+              help="Keep local recording files after upload instead of auto-deleting.")
+def upload(names, all_recordings, dry_run, force, jobs, no_delete):
     """Upload recordings to cloud storage."""
     from screencap.upload import resolve_recording_dirs, upload_recording, _fmt_size
 
@@ -893,9 +1037,11 @@ def upload(names, all_recordings, dry_run, force, jobs):
             console.print(f"\n[bold][{i}/{total_count}][/bold] {d.name}")
 
         # Auto-export events.jsonl if missing (or --force)
+        # Skip if per-chunk JSONL already exists (chunked mode)
         if not dry_run:
+            has_chunk_events = any(d.glob("events_*.jsonl"))
             jsonl_path = d / "events.jsonl"
-            if not jsonl_path.exists() or force:
+            if not has_chunk_events and (not jsonl_path.exists() or force):
                 with console.status("[dim]Exporting events...[/dim]"):
                     try:
                         from screencap.exporter import export_recording, build_export_metadata
@@ -907,6 +1053,9 @@ def upload(names, all_recordings, dry_run, force, jobs):
                             console.print(f"  [yellow]Warning:[/yellow] Export failed (legacy DB?), uploading without events.jsonl")
                     except Exception as e:
                         console.print(f"  [yellow]Warning:[/yellow] Export failed ({e}), uploading without events.jsonl")
+
+            # Recovery: generate per-chunk manifests + events if chunks exist but metadata doesn't
+            _recover_chunk_metadata(d, console, force=force)
 
         try:
             result = upload_recording(d, dry_run=dry_run, force=force, jobs=jobs)
@@ -944,13 +1093,19 @@ def upload(names, all_recordings, dry_run, force, jobs):
 
 
 @cli.command()
+@click.argument("names", nargs=-1)
 @click.option("--dest", default=None, help="Destination directory (default: ~/.screencap/downloads/).")
 @click.option("--dry-run", is_flag=True, help="Show what would be downloaded without downloading.")
 @click.option("--force", is_flag=True, help="Re-download all recordings, ignoring markers.")
 @click.option("--jobs", "-j", type=click.IntRange(min=1), default=4,
               help="Parallel file transfers per recording (default: 4).")
-def download(dest, dry_run, force, jobs):
-    """Download recordings from cloud storage."""
+@click.option("--sessions", is_flag=True, help="Download processed sessions instead of raw recordings.")
+def download(names, dest, dry_run, force, jobs, sessions):
+    """Download recordings from cloud storage.
+
+    Optionally pass one or more recording NAMES to download only those.
+    With no names, all remote recordings are listed and downloaded.
+    """
     from screencap.download import (
         _fmt_size,
         _resolve_dest_dir,
@@ -958,24 +1113,40 @@ def download(dest, dry_run, force, jobs):
         list_remote_recordings,
     )
 
-    try:
-        dest_dir = _resolve_dest_dir(dest)
-    except RuntimeError as e:
-        console.print(f"[red]Error:[/red] {e}")
-        sys.exit(1)
+    source = "sessions" if sessions else "recordings"
 
-    try:
-        remote = list_remote_recordings()
-    except RuntimeError as e:
-        console.print(f"[red]Error:[/red] {e}")
-        sys.exit(1)
+    if sessions and not dest:
+        from screencap.config import get_sessions_dir
+        try:
+            dest_dir = get_sessions_dir()
+        except OSError as e:
+            console.print(f"[red]Error:[/red] Cannot create sessions directory: {e}")
+            sys.exit(1)
+    else:
+        try:
+            dest_dir = _resolve_dest_dir(dest)
+        except RuntimeError as e:
+            console.print(f"[red]Error:[/red] {e}")
+            sys.exit(1)
 
-    if not remote:
-        console.print("No recordings available for download.")
-        return
+    if names:
+        from types import SimpleNamespace
+        remote = [SimpleNamespace(name=n, total_size=0, file_count=0) for n in names]
+    else:
+        try:
+            remote = list_remote_recordings(source=source)
+        except RuntimeError as e:
+            console.print(f"[red]Error:[/red] {e}")
+            sys.exit(1)
 
+        if not remote:
+            label = "sessions" if sessions else "recordings"
+            console.print(f"No {label} available for download.")
+            return
+
+    label = "session" if sessions else "recording"
     console.print(
-        f"Found [bold]{len(remote)}[/bold] recording(s) on server."
+        f"Found [bold]{len(remote)}[/bold] {label}(s) to download."
     )
 
     all_downloaded = 0
@@ -992,6 +1163,7 @@ def download(dest, dry_run, force, jobs):
         try:
             result = download_recording(
                 rec.name, dest_dir, dry_run=dry_run, force=force, jobs=jobs,
+                source=source,
             )
             all_downloaded += len(result.downloaded)
             all_skipped += len(result.skipped)
@@ -1132,6 +1304,32 @@ def scrub(name: str, pii_engine: str | None) -> None:
     except ValueError as e:
         console.print(f"[red]Error:[/red] {e}")
         raise SystemExit(1)
+
+
+@cli.command()
+def settings():
+    """Show current ScreenCap configuration."""
+    from screencap.config import (
+        get_audio_default,
+        get_auto_delete_after_upload,
+        get_auto_name,
+        get_chunk_duration,
+        get_recordings_dir,
+        get_rest_threshold,
+    )
+
+    chunk = get_chunk_duration()
+    chunk_str = f"{chunk:.0f}s ({chunk / 3600:.1f} hour)" if chunk > 0 else "disabled (legacy single-file)"
+    rest = get_rest_threshold()
+
+    console.print("\n[bold]ScreenCap Configuration[/bold]\n")
+    console.print(f"  Chunk duration:           {chunk_str}")
+    console.print(f"  Auto-delete after upload: {'enabled' if get_auto_delete_after_upload() else 'disabled'}")
+    console.print(f"  Rest threshold:           {rest:.0f}s ({rest / 60:.0f} min)")
+    console.print(f"  Recordings dir:           {get_recordings_dir()}")
+    console.print(f"  Audio default:            {'enabled' if get_audio_default() else 'disabled'}")
+    console.print(f"  Auto-name:                {'enabled' if get_auto_name() else 'disabled'}")
+    console.print()
 
 
 if __name__ == "__main__":

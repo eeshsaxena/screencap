@@ -269,12 +269,29 @@ def _collect_window_titles(db_path: Path) -> list[str]:
 
 
 def _load_transcript(capture_dir: Path, max_words: int = 2000) -> str | None:
-    """Load transcript text, truncated to max_words."""
+    """Load transcript text, truncated to max_words.
+
+    Supports both single-file (transcript.json/txt) and chunked
+    (transcript_NNNN.txt) formats.
+    """
     json_path = capture_dir / "transcript.json"
     txt_path = capture_dir / "transcript.txt"
 
     text = None
-    if json_path.exists():
+
+    # Try chunked transcripts first (transcript_0000.txt, transcript_0001.txt, ...)
+    chunk_txts = sorted(capture_dir.glob("transcript_*.txt"))
+    if chunk_txts:
+        parts = []
+        for ct in chunk_txts:
+            try:
+                parts.append(ct.read_text().strip())
+            except Exception:
+                pass
+        text = " ".join(parts)
+
+    # Fallback to single-file formats
+    if not text and json_path.exists():
         try:
             data = json.loads(json_path.read_text())
             text = data.get("text", "")

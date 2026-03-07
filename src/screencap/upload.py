@@ -103,11 +103,38 @@ def is_uploaded(recording_dir: Path) -> bool:
     return (recording_dir / UPLOAD_STATUS_FILE).is_file()
 
 
+def _wal_checkpoint(recording_dir: Path) -> None:
+    """Checkpoint recording.db WAL to ensure a clean DB file for upload."""
+    import sqlite3
+
+    db_path = recording_dir / "recording.db"
+    if not db_path.exists():
+        return
+    try:
+        conn = sqlite3.connect(str(db_path))
+        conn.execute("PRAGMA wal_checkpoint(TRUNCATE)")
+        conn.close()
+    except Exception:
+        pass  # best-effort — upload proceeds even if checkpoint fails
+
+
+# Files that should never be uploaded (SQLite WAL artifacts, temp files)
+_UPLOAD_EXCLUDE = {".db-shm", ".db-wal"}
+
+
 def list_recording_files(recording_dir: Path) -> list[FileInfo]:
-    """Return files in a recording dir, sorted largest-first."""
+    """Return files in a recording dir, sorted largest-first.
+
+    Runs a WAL checkpoint on recording.db first to ensure a clean DB,
+    and excludes SQLite WAL artifacts (.db-shm, .db-wal).
+    """
+    _wal_checkpoint(recording_dir)
+
     files = []
     for p in sorted(recording_dir.iterdir()):
         if p.is_symlink() or not p.is_file() or p.name.startswith("."):
+            continue
+        if any(p.name.endswith(ext) for ext in _UPLOAD_EXCLUDE):
             continue
         try:
             size = p.stat().st_size
@@ -205,7 +232,9 @@ def upload_recording(
     3. Upload new files with progress bars (parallel via ThreadPoolExecutor)
     4. Return summary
     """
-    recording_name = recording_dir.name
+    # Read immutable recording_id if available, fallback to dir name
+    _id_file = recording_dir / ".recording_id"
+    recording_name = _id_file.read_text().strip() if _id_file.exists() else recording_dir.name
 
     if not dry_run and not force and is_uploaded(recording_dir):
         console.print(

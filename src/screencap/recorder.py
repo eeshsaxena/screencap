@@ -109,7 +109,7 @@ def _print_banner() -> None:
 # Live recording display
 # ---------------------------------------------------------------------------
 
-def _build_live_display(name: str, elapsed: float, pulse_on: bool, disk_warning: str = "") -> Group:
+def _build_live_display(name: str, elapsed: float, pulse_on: bool, disk_warning: str = "", chunk_status: str = "") -> Group:
     """Build the Rich renderable for the live recording indicator."""
     dot_style = "bold #f472b6" if pulse_on else "dim #f472b6"
     timer = _fmt_duration_clock(elapsed)
@@ -136,6 +136,9 @@ def _build_live_display(name: str, elapsed: float, pulse_on: bool, disk_warning:
     if disk_warning:
         content.append("\n\n")
         content.append(f"   {disk_warning}")
+    if chunk_status:
+        content.append("\n")
+        content.append(f"   {chunk_status}", style="dim")
     content.append("\n\n")
     content.append_text(line2)
 
@@ -377,6 +380,8 @@ def start_recording(
     capture_window_data: bool | None = None,
     capture_browser_events: bool | None = None,
     verbose: bool = False,
+    chunk_duration: float | None = None,
+    live_upload: bool = True,
 ) -> tuple[Path, float]:
     """Start a screen capture recording. Blocks until Ctrl+C."""
     if audio is None:
@@ -385,6 +390,12 @@ def start_recording(
         wifi_metrics = get_wifi_metrics()
     if app_versions is None:
         app_versions = get_app_versions()
+
+    # Resolve chunk duration from CLI flag or config
+    if chunk_duration is None:
+        from screencap.config import get_chunk_duration
+        chunk_duration = get_chunk_duration()
+    chunking_enabled = chunk_duration > 0
 
     # Check for orphaned processes from a previous recording
     from screencap.pidfile import (
@@ -528,6 +539,14 @@ def start_recording(
             recorder_kwargs["capture_window_data"] = capture_window_data
         if capture_browser_events is not None:
             recorder_kwargs["capture_browser_events"] = capture_browser_events
+        if chunking_enabled:
+            recorder_kwargs["video_chunk_duration"] = chunk_duration
+
+        # Write immutable recording identity file (Phase 1a)
+        recording_id_path = capture_dir / ".recording_id"
+        recording_id_path.write_text(name)
+
+        chunk_processor = None
 
         with Recorder(
             str(capture_dir),
@@ -535,6 +554,37 @@ def start_recording(
         ) as recorder:
             recorder.wait_for_ready(timeout=30)
             status.stop()
+
+            # Start ChunkProcessor if chunking is enabled
+            if chunking_enabled:
+                try:
+                    import multiprocessing as _mp
+                    _cpq = getattr(recorder, '_chunk_process_q', None)
+                    _aaq = getattr(recorder, '_audio_ack_q', None)
+                    # Verify queues are real multiprocessing.Queue objects
+                    if (_cpq is not None and _aaq is not None
+                            and isinstance(_cpq, _mp.queues.Queue)):
+                        from screencap.chunk_processor import ChunkProcessor
+                        from screencap.config import get_auto_delete_after_upload, get_rest_threshold
+
+                        # Get flush protocol primitives from engine Recorder
+                        _flush_req = getattr(recorder, '_flush_requested', None)
+                        _flush_ctr = getattr(recorder, '_flush_ack_counter', None)
+
+                        chunk_processor = ChunkProcessor(
+                            capture_dir,
+                            _cpq,
+                            _aaq,
+                            recording_name=name,
+                            upload_enabled=live_upload,
+                            auto_delete=get_auto_delete_after_upload(),
+                            rest_threshold=get_rest_threshold(),
+                            flush_requested=_flush_req,
+                            flush_ack_counter=_flush_ctr,
+                        )
+                        chunk_processor.start()
+                except Exception as _chunk_init_err:
+                    console.print(f"[yellow]Warning:[/yellow] ChunkProcessor failed to start: {_chunk_init_err}")
 
             # Write PID file tracking all child processes
             child_pids = [
@@ -605,7 +655,8 @@ def start_recording(
                             except OSError:
                                 disk_warning = ""
 
-                        live.update(_build_live_display(name, elapsed, pulse_on, disk_warning))
+                        _chunk_status = chunk_processor.status if chunk_processor else ""
+                        live.update(_build_live_display(name, elapsed, pulse_on, disk_warning, _chunk_status))
                         _stop_event.wait(0.5)
                 finally:
                     # Replace the panel with the stop message.  Rich
@@ -625,10 +676,8 @@ def start_recording(
                     else:
                         live.update(Text(""))
 
-            # Suppress ALL output before Recorder.__exit__ runs:
-            # 1. Redirect stdout/stderr for print() calls (Recording Profile)
-            # 2. Remove loguru handlers — loguru caches the original stderr
-            #    file object, so sys.stderr = devnull doesn't stop it.
+            # Suppress stdout before Recorder.__exit__ runs (profile block),
+            # but redirect stderr to a log file so subprocess errors are captured.
             if not verbose:
                 try:
                     from loguru import logger as _sc_logger
@@ -639,12 +688,16 @@ def start_recording(
                 _saved_stderr = sys.stderr
                 _devnull = open(os.devnull, "w")
                 sys.stdout = _devnull
-                sys.stderr = _devnull
+                try:
+                    _engine_log = open(capture_dir / "engine_exit.log", "w")
+                    sys.stderr = _engine_log
+                except Exception:
+                    sys.stderr = _devnull
 
     except KeyboardInterrupt:
         _stop_reason = "interrupt"
         console.print("  [dim]■ Stopping recording...[/dim]")
-        # Suppress profile block on interrupt path
+        # Suppress stdout, redirect stderr to log file on interrupt path
         if not verbose:
             try:
                 from loguru import logger as _sc_logger
@@ -655,7 +708,11 @@ def start_recording(
             _saved_stderr = sys.stderr
             _devnull = open(os.devnull, "w")
             sys.stdout = _devnull
-            sys.stderr = _devnull
+            try:
+                _engine_log = open(capture_dir / "engine_exit.log", "w")
+                sys.stderr = _engine_log
+            except Exception:
+                sys.stderr = _devnull
     finally:
         # Restore stdout/stderr if we redirected them
         if _saved_stdout is not None:
@@ -691,6 +748,43 @@ def start_recording(
     except Exception as e:
         if verbose:
             console.print(f"[yellow]Warning:[/yellow] Could not collect end metrics: {e}")
+
+    # --- ChunkProcessor shutdown + DB checkpoint ---
+    if chunk_processor is not None:
+        try:
+            with console.status("[dim]Processing final chunk...[/dim]"):
+                chunk_processor.stop(timeout=300)
+        except KeyboardInterrupt:
+            console.print("[yellow]Force quit — current chunk may complete, queued chunks lost.[/yellow]")
+            console.print("[dim]Run 'screencap upload' later to upload remaining files.[/dim]")
+
+        # WAL checkpoint + upload recording.db
+        if live_upload:
+            try:
+                from screencap.chunk_processor import checkpoint_and_upload_db
+
+                _recording_name = (capture_dir / ".recording_id").read_text().strip() if (capture_dir / ".recording_id").exists() else name
+                with console.status("[dim]Uploading recording database...[/dim]"):
+                    checkpoint_and_upload_db(capture_dir, _recording_name)
+            except Exception as e:
+                if verbose:
+                    console.print(f"[yellow]Warning:[/yellow] DB upload failed: {e}")
+
+        # Stub recording if all chunks uploaded
+        _has_chunk_files = any(capture_dir.glob("chunk_*.mp4"))
+        if chunk_processor.all_chunks_uploaded() and live_upload and _has_chunk_files:
+            try:
+                from screencap.chunk_processor import stub_recording
+                deleted = stub_recording(capture_dir)
+                if deleted and verbose:
+                    console.print(f"[dim]Cleaned up {len(deleted)} local media files[/dim]")
+            except Exception as e:
+                if verbose:
+                    console.print(f"[yellow]Warning:[/yellow] Stub failed: {e}")
+        elif not chunk_processor.all_chunks_uploaded() or not _has_chunk_files:
+            console.print("[yellow]Some chunks failed to upload — run 'screencap upload' later.[/yellow]")
+            if not verbose:
+                console.print("[dim]Tip: re-run with --verbose for detailed diagnostics.[/dim]")
 
     elapsed = time.time() - t0
 

@@ -89,6 +89,7 @@ def test_start_with_flags(tmp_path):
             capture_video=None, capture_images=True,
             capture_window_data=None, capture_browser_events=None,
             verbose=False,
+            chunk_duration=None, live_upload=True,
         )
 
 
@@ -109,6 +110,7 @@ def test_start_no_wifi_metrics(tmp_path):
             capture_video=None, capture_images=True,
             capture_window_data=None, capture_browser_events=None,
             verbose=False,
+            chunk_duration=None, live_upload=True,
         )
 
 
@@ -129,6 +131,7 @@ def test_start_no_app_versions(tmp_path):
             capture_video=None, capture_images=True,
             capture_window_data=None, capture_browser_events=None,
             verbose=False,
+            chunk_duration=None, live_upload=True,
         )
 
 

@@ -14,6 +14,7 @@ else:
 _DEFAULT_BASE = Path.home() / ".screencap"
 _DEFAULT_RECORDINGS = _DEFAULT_BASE / "recordings"
 _DEFAULT_DOWNLOADS = _DEFAULT_BASE / "downloads"
+_DEFAULT_SESSIONS = _DEFAULT_BASE / "sessions"
 _CONFIG_PATH = _DEFAULT_BASE / "config.toml"
 
 _config_cache: dict | None = None
@@ -108,6 +109,18 @@ def get_downloads_dir() -> Path:
     return p
 
 
+def get_sessions_dir() -> Path:
+    """Return sessions directory, creating it if needed."""
+    env = os.environ.get("SCREENCAP_SESSIONS_DIR")
+    if env:
+        p = Path(env)
+    else:
+        cfg = _load_toml()
+        p = Path(cfg.get("sessions_dir", str(_DEFAULT_SESSIONS)))
+    p.mkdir(parents=True, exist_ok=True)
+    return p
+
+
 def get_base_dir() -> Path:
     """Return ~/.screencap/, creating it if needed."""
     _DEFAULT_BASE.mkdir(parents=True, exist_ok=True)
@@ -162,6 +175,33 @@ def get_disk_stop_mb() -> int:
             f"Error: disk_stop_mb in config.toml must be an integer, got: {val!r}"
         )
     return val
+
+
+def get_chunk_duration() -> float:
+    """Return auto-cut chunk duration in seconds. Default 3600 (1 hour). 0 = legacy."""
+    env = os.environ.get("SCREENCAP_CHUNK_DURATION")
+    if env is not None:
+        return float(env)
+    cfg = _load_toml()
+    return float(cfg.get("chunk_duration", 3600.0))
+
+
+def get_auto_delete_after_upload() -> bool:
+    """Return whether to auto-delete chunks after confirmed upload. Default True."""
+    env = os.environ.get("SCREENCAP_AUTO_DELETE")
+    if env is not None:
+        return env.lower() in ("1", "true", "yes")
+    cfg = _load_toml()
+    return cfg.get("auto_delete_after_upload", True)
+
+
+def get_rest_threshold() -> float:
+    """Return rest threshold in seconds for task segmentation. Default 120."""
+    env = os.environ.get("SCREENCAP_REST_THRESHOLD")
+    if env is not None:
+        return float(env)
+    cfg = _load_toml()
+    return float(cfg.get("rest_threshold", 120.0))
 
 
 def resolve_recording_dir(name: str) -> Path:

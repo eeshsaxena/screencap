@@ -360,10 +360,28 @@ class CaptureSession:
         return video_path if video_path.exists() else None
 
     @property
+    def video_paths(self) -> list[Path]:
+        """All video file paths, sorted (supports chunked recordings)."""
+        chunks = sorted(self.capture_dir.glob("chunk_*.mp4"))
+        if chunks:
+            return chunks
+        single = self.video_path
+        return [single] if single else []
+
+    @property
     def audio_path(self) -> Path | None:
         """Path to audio file if exists."""
         audio_path = self.capture_dir / "audio.flac"
         return audio_path if audio_path.exists() else None
+
+    @property
+    def audio_paths(self) -> list[Path]:
+        """All audio file paths, sorted (supports chunked recordings)."""
+        chunks = sorted(self.capture_dir.glob("audio_*.flac"))
+        if chunks:
+            return chunks
+        single = self.audio_path
+        return [single] if single else []
 
     @property
     def pixel_ratio(self) -> float:
