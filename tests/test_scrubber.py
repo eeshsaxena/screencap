@@ -18,7 +18,6 @@ from screencap.scrubber import (
     _scrub_json_recursive,
     _scrub_metrics,
     _scrub_text,
-    _scrub_text_with_detections,
     _scrub_transcript_json,
     _scrub_transcript_txt,
     scrub_recording,

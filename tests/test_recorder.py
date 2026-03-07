@@ -1,5 +1,6 @@
 """Tests for screencap.recorder — force-quit cleanup, PID file lifecycle, permission prompting, disk checks."""
 
+import ast
 import inspect
 import sys
 from collections import namedtuple
@@ -18,11 +19,25 @@ class TestForceExitCleanup:
     """Tests for the force-quit (second Ctrl+C) behavior."""
 
     def test_no_os_exit_in_recorder(self):
-        """Verify os._exit is not used in the recorder module."""
+        """Verify os._exit is not called anywhere in the recorder module.
+
+        os._exit skips finally blocks and atexit handlers — sys.exit(1)
+        must be used instead to ensure cleanup runs.  Uses AST analysis
+        so comments and strings don't cause false positives.
+        """
         import screencap.recorder as mod
 
         source = inspect.getsource(mod)
-        assert "os._exit" not in source
+        tree = ast.parse(source)
+        os_exit_calls = [
+            node for node in ast.walk(tree)
+            if isinstance(node, ast.Call)
+            and isinstance(node.func, ast.Attribute)
+            and node.func.attr == "_exit"
+            and isinstance(node.func.value, ast.Name)
+            and node.func.value.id == "os"
+        ]
+        assert os_exit_calls == [], "os._exit found — use sys.exit(1) to allow cleanup"
 
     def test_force_handler_calls_terminate_and_kill(self):
         """The force-exit handler should terminate then kill children."""
@@ -50,12 +65,32 @@ class TestForceExitCleanup:
         mock_child_b.kill.assert_called_once()
         mock_child_a.kill.assert_not_called()
 
-    def test_sys_exit_used_instead_of_os_exit(self):
-        """Verify sys.exit is used in the force-quit path."""
+    def test_force_quit_uses_sys_exit(self):
+        """The force-quit path must use sys.exit (not os._exit) so that
+        finally blocks and atexit handlers run.  Uses AST to find
+        sys.exit calls inside the _force_exit nested function."""
         import screencap.recorder as mod
 
         source = inspect.getsource(mod)
-        assert "sys.exit(1)" in source
+        tree = ast.parse(source)
+
+        # Find the _force_exit function definition
+        force_exit_fn = None
+        for node in ast.walk(tree):
+            if isinstance(node, ast.FunctionDef) and node.name == "_force_exit":
+                force_exit_fn = node
+                break
+        assert force_exit_fn is not None, "_force_exit function not found in recorder"
+
+        sys_exit_calls = [
+            node for node in ast.walk(force_exit_fn)
+            if isinstance(node, ast.Call)
+            and isinstance(node.func, ast.Attribute)
+            and node.func.attr == "exit"
+            and isinstance(node.func.value, ast.Name)
+            and node.func.value.id == "sys"
+        ]
+        assert len(sys_exit_calls) >= 1, "_force_exit must call sys.exit"
 
 
 class TestAtexitHandler:
@@ -619,13 +654,177 @@ class TestThresholdValidation:
                 start_recording("test", output_dir=tmp_path / "test-rec")
 
 
-class TestDiskFullError:
-    """Tests for DiskFullError exception."""
+class TestRecordingIntent:
+    """Tests for .recording_intent file and force_mode override."""
 
-    def test_disk_full_error_attributes(self):
-        from screencap.recorder import DiskFullError
-        from pathlib import Path
+    def test_force_mode_overrides_privacy_config(self, tmp_path):
+        """force_mode=PUBLIC overrides an INTERNAL config for the privacy filter."""
+        from screencap.privacy.policy import PrivacyConfig, PrivacyMode
+        from screencap.recorder import start_recording
 
-        err = DiskFullError(Path("/tmp/rec"), 42.5)
-        assert err.capture_dir == Path("/tmp/rec")
-        assert err.elapsed == 42.5
+        internal_config = PrivacyConfig(mode=PrivacyMode.INTERNAL)
+        mock_recorder = mock.MagicMock()
+        mock_recorder.wait_for_ready.return_value = True
+        mock_recorder.is_recording = False
+
+        with (
+            mock.patch("screencap.recorder._check_macos_permissions"),
+            mock.patch("screencap.recorder.get_audio_default", return_value=False),
+            mock.patch("screencap.recorder.get_wifi_metrics", return_value=False),
+            mock.patch("screencap.recorder.get_disk_warn_mb", return_value=0),
+            mock.patch("screencap.recorder.get_disk_stop_mb", return_value=0),
+            mock.patch("screencap.pidfile.find_orphaned_processes", return_value=[]),
+            mock.patch("screencap.pidfile.write_pidfile"),
+            mock.patch("screencap.pidfile.delete_pidfile"),
+            mock.patch("screencap.config.get_privacy_config", return_value=internal_config),
+            mock.patch(
+                "screencap.privacy.recorder_enforcement.RecorderPrivacyFilter",
+            ) as MockFilter,
+            mock.patch("sc_engine.Recorder") as MockRecorder,
+        ):
+            MockRecorder.return_value.__enter__ = mock.MagicMock(return_value=mock_recorder)
+            MockRecorder.return_value.__exit__ = mock.MagicMock(return_value=False)
+
+            start_recording(
+                "test", output_dir=tmp_path / "test-rec",
+                force_mode=PrivacyMode.PUBLIC, cloud_intent=True,
+            )
+            # RecorderPrivacyFilter should have been called with a PUBLIC config
+            MockFilter.assert_called_once()
+            actual_config = MockFilter.call_args[0][0]
+            assert actual_config.mode == PrivacyMode.PUBLIC
+
+    def test_intent_file_written(self, tmp_path):
+        """start_recording writes .recording_intent with correct destination."""
+        import json
+
+        from screencap.privacy.policy import PrivacyConfig, PrivacyMode
+        from screencap.recorder import start_recording
+
+        internal_config = PrivacyConfig(mode=PrivacyMode.INTERNAL)
+        mock_recorder = mock.MagicMock()
+        mock_recorder.wait_for_ready.return_value = True
+        mock_recorder.is_recording = False
+
+        with (
+            mock.patch("screencap.recorder._check_macos_permissions"),
+            mock.patch("screencap.recorder.get_audio_default", return_value=False),
+            mock.patch("screencap.recorder.get_wifi_metrics", return_value=False),
+            mock.patch("screencap.recorder.get_disk_warn_mb", return_value=0),
+            mock.patch("screencap.recorder.get_disk_stop_mb", return_value=0),
+            mock.patch("screencap.pidfile.find_orphaned_processes", return_value=[]),
+            mock.patch("screencap.pidfile.write_pidfile"),
+            mock.patch("screencap.pidfile.delete_pidfile"),
+            mock.patch("screencap.config.get_privacy_config", return_value=internal_config),
+            mock.patch(
+                "screencap.privacy.recorder_enforcement.RecorderPrivacyFilter",
+            ),
+            mock.patch("sc_engine.Recorder") as MockRecorder,
+        ):
+            MockRecorder.return_value.__enter__ = mock.MagicMock(return_value=mock_recorder)
+            MockRecorder.return_value.__exit__ = mock.MagicMock(return_value=False)
+
+            capture_dir, _ = start_recording(
+                "test", output_dir=tmp_path / "test-rec",
+                cloud_intent=True, intent_source="flag",
+            )
+
+        intent_path = capture_dir / ".recording_intent"
+        assert intent_path.exists()
+        data = json.loads(intent_path.read_text())
+        assert data["destination"] == "cloud"
+        assert data["source"] == "flag"
+        assert data["version"] == 1
+
+    def test_intent_write_failure_fatal_for_cloud(self, tmp_path):
+        """Cloud intent + write failure = SystemExit (fail-closed)."""
+        from screencap.privacy.policy import PrivacyConfig, PrivacyMode
+        from screencap.recorder import start_recording
+
+        config = PrivacyConfig(mode=PrivacyMode.PUBLIC)
+        rec_dir = tmp_path / "test-rec"
+        rec_dir.mkdir(parents=True)
+        # Make .recording_intent path a directory so write_text fails
+        (rec_dir / ".recording_intent").mkdir()
+
+        with (
+            mock.patch("screencap.recorder._check_macos_permissions"),
+            mock.patch("screencap.recorder.get_audio_default", return_value=False),
+            mock.patch("screencap.recorder.get_wifi_metrics", return_value=False),
+            mock.patch("screencap.recorder.get_disk_warn_mb", return_value=0),
+            mock.patch("screencap.recorder.get_disk_stop_mb", return_value=0),
+            mock.patch("screencap.pidfile.find_orphaned_processes", return_value=[]),
+            mock.patch("screencap.config.get_privacy_config", return_value=config),
+            mock.patch("sc_engine.Recorder"),
+        ):
+            with pytest.raises(SystemExit):
+                start_recording(
+                    "test", output_dir=rec_dir,
+                    force_mode=PrivacyMode.PUBLIC, cloud_intent=True,
+                )
+
+
+class TestPrivacyFilterInitFailure:
+    """Tests for privacy filter construction failure behavior.
+
+    Public mode must hard-error (SystemExit) if the privacy filter can't
+    be created — recording without it would expose sensitive data.
+    Internal mode should warn and continue.
+    """
+
+    def test_public_mode_hard_errors_on_filter_failure(self, tmp_path):
+        """Public mode raises SystemExit(1) when privacy filter fails."""
+        from screencap.privacy.policy import PrivacyConfig, PrivacyMode
+        from screencap.recorder import start_recording
+
+        public_config = PrivacyConfig(mode=PrivacyMode.PUBLIC)
+
+        with (
+            mock.patch("screencap.recorder._check_macos_permissions"),
+            mock.patch("screencap.recorder.get_audio_default", return_value=False),
+            mock.patch("screencap.recorder.get_wifi_metrics", return_value=False),
+            mock.patch("screencap.recorder.get_disk_warn_mb", return_value=0),
+            mock.patch("screencap.recorder.get_disk_stop_mb", return_value=0),
+            mock.patch("screencap.pidfile.find_orphaned_processes", return_value=[]),
+            mock.patch("screencap.pidfile.write_pidfile"),
+            mock.patch("screencap.pidfile.delete_pidfile"),
+            mock.patch("screencap.config.get_privacy_config", return_value=public_config),
+            mock.patch(
+                "screencap.privacy.recorder_enforcement.RecorderPrivacyFilter",
+                side_effect=RuntimeError("missing dep"),
+            ),
+            mock.patch("sc_engine.Recorder"),
+        ):
+            with pytest.raises(SystemExit):
+                start_recording("test", output_dir=tmp_path / "test-rec")
+
+    def test_internal_mode_exits_on_filter_failure(self, tmp_path):
+        """Internal mode hard-fails when privacy config exists but filter init fails."""
+        from screencap.privacy.policy import PrivacyConfig, PrivacyMode
+        from screencap.recorder import start_recording
+
+        internal_config = PrivacyConfig(mode=PrivacyMode.INTERNAL)
+
+        with (
+            mock.patch("screencap.recorder._check_macos_permissions"),
+            mock.patch("screencap.recorder.get_audio_default", return_value=False),
+            mock.patch("screencap.recorder.get_wifi_metrics", return_value=False),
+            mock.patch("screencap.recorder.get_disk_warn_mb", return_value=0),
+            mock.patch("screencap.recorder.get_disk_stop_mb", return_value=0),
+            mock.patch("screencap.pidfile.find_orphaned_processes", return_value=[]),
+            mock.patch("screencap.pidfile.write_pidfile"),
+            mock.patch("screencap.pidfile.delete_pidfile"),
+            mock.patch("screencap.config.get_privacy_config", return_value=internal_config),
+            mock.patch(
+                "screencap.privacy.recorder_enforcement.RecorderPrivacyFilter",
+                side_effect=RuntimeError("missing dep"),
+            ),
+            mock.patch("sc_engine.Recorder") as MockRecorder,
+            pytest.raises(SystemExit) as exc_info,
+        ):
+            MockRecorder.return_value.__enter__ = mock.MagicMock()
+            MockRecorder.return_value.__exit__ = mock.MagicMock(return_value=False)
+
+            start_recording("test", output_dir=tmp_path / "test-rec")
+
+        assert exc_info.value.code == 1

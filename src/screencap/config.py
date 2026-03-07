@@ -31,6 +31,12 @@ def _load_toml() -> dict:
     return _config_cache
 
 
+def invalidate_config_cache() -> None:
+    """Reset the config cache so the next read re-loads from disk."""
+    global _config_cache
+    _config_cache = None
+
+
 def get_recordings_dir() -> Path:
     """Return recordings directory, creating it if needed."""
     env = os.environ.get("SCREENCAP_RECORDINGS_DIR")
@@ -202,6 +208,47 @@ def get_rest_threshold() -> float:
         return float(env)
     cfg = _load_toml()
     return float(cfg.get("rest_threshold", 120.0))
+
+
+def get_upload_default() -> str:
+    """Return default recording destination: 'local', 'cloud', or 'ask'.
+
+    Priority: SCREENCAP_UPLOAD_DEFAULT env var > privacy.upload_default config > 'ask'.
+    """
+    valid = ("local", "cloud", "ask")
+    env = os.environ.get("SCREENCAP_UPLOAD_DEFAULT")
+    if env is not None:
+        val = env.strip().lower()
+        if val not in valid:
+            raise SystemExit(
+                f"Error: SCREENCAP_UPLOAD_DEFAULT must be one of {valid}, got: {env!r}"
+            )
+        return val
+    cfg = _load_toml()
+    section = cfg.get("privacy", {})
+    if isinstance(section, dict):
+        val = section.get("upload_default", "ask")
+        if not isinstance(val, str):
+            raise SystemExit(
+                f"Error: privacy.upload_default must be a string, got: {type(val).__name__}"
+            )
+        val = val.lower()
+        if val not in valid:
+            raise SystemExit(
+                f"Error: privacy.upload_default must be one of {valid}, got: {val!r}"
+            )
+        return val
+    return "ask"
+
+
+def get_privacy_config():
+    """Return a PrivacyConfig parsed from [privacy] in config.toml.
+
+    Deferred import to avoid circular deps and keep CLI startup fast.
+    """
+    from screencap.privacy.policy import parse_privacy_config
+
+    return parse_privacy_config(_load_toml())
 
 
 def resolve_recording_dir(name: str) -> Path:

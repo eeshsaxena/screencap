@@ -62,7 +62,7 @@ def test_start_no_auto_name_interactive(tmp_path):
         mock_sys.exit = sys.exit
         result = runner.invoke(
             cli,
-            ["start", "--no-auto-name"],
+            ["start", "--no-auto-name", "--local"],
             input="my-test\nsome desc\n",
         )
         assert result.exit_code == 0
@@ -90,6 +90,8 @@ def test_start_with_flags(tmp_path):
             capture_window_data=None, capture_browser_events=None,
             verbose=False,
             chunk_duration=None, live_upload=True,
+            force_mode=None, cloud_intent=False,
+            intent_source="non_interactive_default",
         )
 
 
@@ -111,6 +113,8 @@ def test_start_no_wifi_metrics(tmp_path):
             capture_window_data=None, capture_browser_events=None,
             verbose=False,
             chunk_duration=None, live_upload=True,
+            force_mode=None, cloud_intent=False,
+            intent_source="non_interactive_default",
         )
 
 
@@ -132,6 +136,8 @@ def test_start_no_app_versions(tmp_path):
             capture_window_data=None, capture_browser_events=None,
             verbose=False,
             chunk_duration=None, live_upload=True,
+            force_mode=None, cloud_intent=False,
+            intent_source="non_interactive_default",
         )
 
 
@@ -1134,7 +1140,7 @@ def test_start_auto_export_runs_with_no_auto_name(tmp_path):
         mock_sys.exit = sys.exit
         result = runner.invoke(
             cli,
-            ["start", "--no-auto-name"],
+            ["start", "--no-auto-name", "--local"],
             input="my-test\nsome desc\n",
         )
         assert result.exit_code == 0
@@ -1154,3 +1160,122 @@ def test_start_auto_export_keyboard_interrupt(tmp_path):
         assert result.exit_code == 0
         assert "Export cancelled." in result.output
         assert "Recording complete" in result.output
+
+
+# --- Cloud/Local intent flag tests ---
+
+
+def test_start_cloud_flag(tmp_path):
+    """--cloud forces PUBLIC privacy mode and sets cloud_intent=True."""
+    from screencap.privacy.policy import PrivacyMode
+
+    runner = CliRunner()
+    fake_dir = tmp_path / "test-rec"
+    fake_dir.mkdir()
+    with mock.patch("screencap.recorder.start_recording", return_value=(fake_dir, 42.0)) as mock_rec:
+        result = runner.invoke(cli, ["start", "--name", "test", "--cloud"])
+    assert result.exit_code == 0
+    mock_rec.assert_called_once()
+    _, kwargs = mock_rec.call_args
+    assert kwargs["force_mode"] == PrivacyMode.PUBLIC
+    assert kwargs["cloud_intent"] is True
+    assert kwargs["intent_source"] == "flag"
+
+
+def test_start_local_flag(tmp_path):
+    """--local uses configured mode and sets cloud_intent=False."""
+    runner = CliRunner()
+    fake_dir = tmp_path / "test-rec"
+    fake_dir.mkdir()
+    with mock.patch("screencap.recorder.start_recording", return_value=(fake_dir, 42.0)) as mock_rec:
+        result = runner.invoke(cli, ["start", "--name", "test", "--local"])
+    assert result.exit_code == 0
+    mock_rec.assert_called_once()
+    _, kwargs = mock_rec.call_args
+    assert kwargs["force_mode"] is None
+    assert kwargs["cloud_intent"] is False
+    assert kwargs["intent_source"] == "flag"
+
+
+def test_start_no_flag_non_interactive(tmp_path):
+    """No flag in non-interactive mode defaults to local."""
+    runner = CliRunner()
+    fake_dir = tmp_path / "test-rec"
+    fake_dir.mkdir()
+    with mock.patch("screencap.recorder.start_recording", return_value=(fake_dir, 42.0)) as mock_rec:
+        result = runner.invoke(cli, ["start", "--name", "test"])
+    assert result.exit_code == 0
+    mock_rec.assert_called_once()
+    _, kwargs = mock_rec.call_args
+    assert kwargs["force_mode"] is None
+    assert kwargs["cloud_intent"] is False
+    assert kwargs["intent_source"] == "non_interactive_default"
+
+
+def test_start_cloud_and_local_last_wins(tmp_path):
+    """--cloud --local: last flag wins (Click flag_value semantics)."""
+    runner = CliRunner()
+    fake_dir = tmp_path / "test-rec"
+    fake_dir.mkdir()
+    with mock.patch("screencap.recorder.start_recording", return_value=(fake_dir, 42.0)) as mock_rec:
+        result = runner.invoke(cli, ["start", "--name", "test", "--cloud", "--local"])
+    assert result.exit_code == 0
+    _, kwargs = mock_rec.call_args
+    # Last flag (--local) wins
+    assert kwargs["force_mode"] is None
+    assert kwargs["cloud_intent"] is False
+
+
+def test_upload_skips_local_intent_in_all_mode(tmp_path):
+    """upload --all skips recordings with local intent."""
+    rec_dir = tmp_path / "local-rec"
+    rec_dir.mkdir(parents=True)
+    (rec_dir / "recording.db").touch()
+    # Write a local-intent file
+    intent = {"destination": "local", "source": "flag"}
+    (rec_dir / ".recording_intent").write_text(json.dumps(intent))
+
+    runner = CliRunner()
+    with (
+        mock.patch("screencap.upload.resolve_recording_dirs", return_value=[rec_dir]),
+        mock.patch("screencap.upload.upload_recording") as mock_upload,
+    ):
+        mock_upload.return_value = mock.MagicMock(
+            uploaded=[], skipped=[], failed=[], total_bytes=0, gcs_prefix=None,
+        )
+        result = runner.invoke(cli, ["upload", "--all"])
+
+    assert result.exit_code == 0
+    assert "Skipping" in result.output
+    assert "local intent" in result.output
+    # upload_recording should NOT have been called for the skipped recording
+    mock_upload.assert_not_called()
+
+
+def test_upload_cloud_intent_proceeds(tmp_path):
+    """upload with cloud intent proceeds without scrub prompt."""
+    rec_dir = tmp_path / "cloud-rec"
+    rec_dir.mkdir(parents=True)
+    (rec_dir / "recording.db").touch()
+    (rec_dir / "events.jsonl").write_text('{"_meta":true}\n')
+    # Write a cloud-intent file
+    intent = {"destination": "cloud", "source": "flag"}
+    (rec_dir / ".recording_intent").write_text(json.dumps(intent))
+
+    runner = CliRunner()
+    with (
+        mock.patch("screencap.upload.resolve_recording_dirs", return_value=[rec_dir]),
+        mock.patch("screencap.upload.upload_recording") as mock_upload,
+    ):
+        mock_upload.return_value = mock.MagicMock(
+            uploaded=["recording.db", "events.jsonl"],
+            skipped=[], failed=[], total_bytes=200,
+            gcs_prefix="gs://bucket/cloud-rec",
+        )
+        result = runner.invoke(cli, ["upload", "cloud-rec"])
+
+    assert result.exit_code == 0
+    # upload_recording was called (no scrub prompt for cloud intent)
+    mock_upload.assert_called_once()
+    # No scrub warning in output
+    assert "scrub" not in result.output.lower()

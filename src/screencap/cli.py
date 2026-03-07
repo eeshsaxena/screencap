@@ -31,6 +31,109 @@ def cli(ctx, no_update_check):
         maybe_check_for_update()
 
 
+def _report_unclassified_apps(capture_dir) -> None:
+    """Report apps seen during recording that are not in privacy config."""
+    import sqlite3
+
+    from screencap.catalog import find_db
+    from screencap.config import get_privacy_config
+    from screencap.privacy.context import BUNDLE_ID_MAP
+
+    db_path = find_db(capture_dir)
+    if not db_path:
+        return
+
+    conn = sqlite3.connect(str(db_path))
+    try:
+        cur = conn.cursor()
+        tables = {r[0] for r in cur.execute(
+            "SELECT name FROM sqlite_master WHERE type='table'"
+        ).fetchall()}
+        if "window_event" not in tables:
+            return
+        rows = cur.execute(
+            "SELECT DISTINCT app_bundle_id FROM window_event "
+            "WHERE app_bundle_id IS NOT NULL AND app_bundle_id != ''"
+        ).fetchall()
+    finally:
+        conn.close()
+
+    if not rows:
+        return
+
+    seen_bids = {r[0] for r in rows}
+
+    # Get configured bundle IDs
+    try:
+        privacy_config = get_privacy_config()
+    except Exception:
+        return
+
+    known_bids = (
+        set(BUNDLE_ID_MAP.keys())
+        | set(privacy_config.exclude_apps)
+        | set(privacy_config.app_classes.keys())
+    )
+
+    unclassified = sorted(seen_bids - known_bids)
+    if not unclassified:
+        return
+
+    console.print(
+        f"\n[yellow]Note:[/yellow] {len(unclassified)} app(s) seen during recording "
+        f"are not classified:"
+    )
+    for bid in unclassified[:10]:
+        console.print(f"  {bid}")
+    if len(unclassified) > 10:
+        console.print(f"  ... and {len(unclassified) - 10} more")
+    console.print("  Run [bold]screencap setup --scan[/bold] to classify them.")
+
+
+def _maybe_prompt_privacy_setup() -> None:
+    """Prompt for privacy setup on first run if [privacy] section is missing."""
+    import sys as _sys  # use real sys, not the module-level reference
+
+    if not _sys.stdin.isatty():
+        return  # non-interactive: skip silently, use defaults
+
+    from screencap.config import _CONFIG_PATH, _load_toml
+
+    if not _CONFIG_PATH.exists():
+        # No config file at all — still prompt
+        pass
+    else:
+        cfg = _load_toml()
+        privacy_section = cfg.get("privacy")
+        if privacy_section is not None:
+            # Has a [privacy] section (even if empty or has setup_skipped)
+            return
+
+    console.print(
+        "\n[bold]Privacy setup not configured.[/bold] "
+        "Run the setup wizard to classify apps for privacy protection."
+    )
+    if click.confirm("Run setup now?", default=True):
+        from screencap.setup_wizard import run_setup_wizard
+        run_setup_wizard()
+    else:
+        # Write setup_skipped flag to prevent re-prompting
+        import tomlkit
+        from screencap.config import invalidate_config_cache
+        from screencap.setup_wizard import _load_config_toml, _save_config_atomic
+
+        doc = _load_config_toml(_CONFIG_PATH)
+        if "privacy" not in doc:
+            doc.add("privacy", tomlkit.table())
+        doc["privacy"]["setup_skipped"] = True
+        _save_config_atomic(_CONFIG_PATH, doc)
+        invalidate_config_cache()
+        console.print(
+            "[dim]Skipped. Recording will use default settings (internal mode). "
+            "Run 'screencap setup' anytime.[/dim]"
+        )
+
+
 @cli.command()
 @click.option("--name", "-n", default=None, help="Recording name (skips auto-naming).")
 @click.option("--description", "-d", default=None, help="Task description.")
@@ -50,10 +153,15 @@ def cli(ctx, no_update_check):
               help="Auto-cut recording at this interval (seconds). Default: 3600 (1 hour). Set 0 to disable chunking.")
 @click.option("--no-live-upload", is_flag=True, default=False,
               help="Disable background upload of chunks during recording.")
+@click.option("--cloud", "destination", flag_value="cloud", default=None,
+              help="Record for cloud upload (forces public privacy mode).")
+@click.option("--local", "destination", flag_value="local",
+              help="Record for local use only (uses configured privacy mode).")
 def start(
     name, description, no_audio, no_video, no_images, no_window_data,
     no_browser_events, output, no_wifi_metrics, no_app_versions,
     no_auto_name, local_only, force, verbose, chunk_duration, no_live_upload,
+    destination,
 ):
     """Record a screen capture session. Ctrl+C to stop."""
     from datetime import datetime
@@ -87,6 +195,49 @@ def start(
     capture_window_data = False if no_window_data else None  # None = upstream default (True)
     capture_browser_events = False if no_browser_events else None  # None = upstream default (False)
 
+    # First-run privacy setup detection
+    _maybe_prompt_privacy_setup()
+
+    # --- Resolve recording destination (cloud/local) ---
+    from screencap.config import get_upload_default
+
+    intent_source = "flag"
+    if destination is None:
+        upload_default = get_upload_default()
+        if not sys.stdin.isatty():
+            # Non-interactive: always default to local regardless of config
+            destination = "local"
+            intent_source = "non_interactive_default"
+        elif upload_default == "ask":
+            console.print(
+                "\n[bold]Recording destination:[/bold]"
+            )
+            console.print(
+                "  Cloud recordings use public privacy mode -- email, chat, calendar,"
+            )
+            console.print(
+                "  and banking apps are blocked or masked. Data may be used in public datasets."
+            )
+            console.print(
+                "\n  Local recordings use your configured privacy mode and stay on this machine.\n"
+            )
+            destination = click.prompt(
+                "Cloud or local?",
+                type=click.Choice(["cloud", "local"], case_sensitive=False),
+                default="local",
+            )
+            intent_source = "prompt"
+        else:
+            destination = upload_default
+            intent_source = "config_default"
+    # else: destination was set by --cloud or --local flag, intent_source stays "flag"
+
+    is_cloud = destination == "cloud"
+    force_mode = None
+    if is_cloud:
+        from screencap.privacy.policy import PrivacyMode
+        force_mode = PrivacyMode.PUBLIC
+
     try:
         from screencap.recorder import DiskFullError, print_summary, start_recording
     except ImportError:
@@ -103,6 +254,9 @@ def start(
             verbose=verbose,
             chunk_duration=chunk_duration,
             live_upload=not no_live_upload,
+            force_mode=force_mode,
+            cloud_intent=is_cloud,
+            intent_source=intent_source,
         )
     except DiskFullError as e:
         capture_dir, elapsed = e.capture_dir, e.elapsed
@@ -154,6 +308,12 @@ def start(
             console.print("[yellow]Naming cancelled — keeping timestamp name[/yellow]")
 
     print_summary(final_name, final_dir, elapsed)
+
+    # Post-recording new-app report
+    try:
+        _report_unclassified_apps(final_dir)
+    except Exception:
+        pass  # non-blocking
 
 
 def _auto_export(capture_dir: Path) -> None:
@@ -280,6 +440,7 @@ def list_cmd(as_json, sort):
     table.add_column("Date")
     table.add_column("Duration")
     table.add_column("Size")
+    table.add_column("Intent")
     table.add_column("Audio")
     table.add_column("Transcribed")
     table.add_column("Uploaded")
@@ -288,12 +449,14 @@ def list_cmd(as_json, sort):
         name_display = r.name
         if r.drops:
             name_display += " [yellow]\u26a0[/yellow]"
+        intent_display = r.intent or "-"
         table.add_row(
             str(i),
             name_display,
             r.date,
             r.duration,
             r.size_mb,
+            intent_display,
             "[green]\u2713[/green]" if r.has_audio else "[dim]\u2717[/dim]",
             "[green]\u2713[/green]" if r.transcribed else "[dim]\u2717[/dim]",
             "[green]\u2713[/green]" if r.uploaded else "[dim]\u2717[/dim]",
@@ -338,6 +501,16 @@ def info(name, as_json):
         console.print(f"[red]Error:[/red] Recording not found: {name}")
         sys.exit(1)
 
+    # Read recording intent
+    from screencap.catalog import read_intent
+    intent_data = None
+    intent_path = recording_dir / ".recording_intent"
+    if intent_path.exists():
+        try:
+            intent_data = json.loads(intent_path.read_text())
+        except (json.JSONDecodeError, OSError):
+            pass
+
     # Read DB metadata
     db_path = find_db(recording_dir)
     rec_meta = {}
@@ -365,13 +538,18 @@ def info(name, as_json):
             pass
 
     if as_json:
-        click.echo(json.dumps({"recording": rec_meta, "metrics": metrics, "drops": drops}, indent=2))
+        click.echo(json.dumps({"recording": rec_meta, "metrics": metrics, "drops": drops, "intent": intent_data}, indent=2))
         return
 
     # Human-readable output
     from rich.panel import Panel
 
     console.print(Panel(f"[bold]{name}[/bold]", title="Recording"))
+
+    if intent_data:
+        console.print(f"  [#60a5fa]destination:[/#60a5fa] {intent_data.get('destination', '?')}")
+        console.print(f"  [#60a5fa]privacy mode:[/#60a5fa] {intent_data.get('privacy_mode', '?')}")
+        console.print(f"  [#60a5fa]intent source:[/#60a5fa] {intent_data.get('source', '?')}")
 
     if rec_meta:
         for key, val in rec_meta.items():
@@ -1014,6 +1192,67 @@ def upload(names, all_recordings, dry_run, force, jobs, no_delete):
         console.print(f"[red]Error:[/red] {e}")
         sys.exit(1)
 
+    # --- Intent-based upload gating ---
+    from screencap.catalog import read_intent
+
+    filtered_dirs: list = []
+    for d in dirs:
+        intent = read_intent(d)
+        # Cloud-intent or legacy (no intent file) recordings pass through.
+        # Local-intent recordings need special handling.
+        is_local_intent = intent == "local"
+
+        if is_local_intent and all_recordings:
+            console.print(
+                f"  [yellow]Skipping {d.name}[/yellow] (local intent "
+                "-- use 'screencap upload {name}' interactively)."
+            )
+            continue
+
+        if is_local_intent and not dry_run:
+            if not sys.stdin.isatty():
+                console.print(
+                    "[red]Error:[/red] Cannot upload local-intent recordings "
+                    "without interactive confirmation. "
+                    "Use --cloud at recording time for headless upload."
+                )
+                sys.exit(1)
+
+            console.print(
+                "\n[yellow]Warning:[/yellow] This recording was captured without "
+                "public-level protections. Post-hoc scrubbing is best-effort "
+                "and provides weaker privacy guarantees than capture-time enforcement."
+            )
+
+            # Auto-scrub: create a scrubbed copy and upload that instead
+            try:
+                from screencap.scrubber import scrub_recording
+
+                with console.status("[bold]Scrubbing recording for upload...[/bold]"):
+                    scrub_result = scrub_recording(d.name)
+                entity_total = sum(scrub_result.entity_counts.values())
+                console.print(
+                    f"  Scrubbed copy created at {scrub_result.output_dir.name}/ "
+                    f"({entity_total} redaction(s) applied)."
+                )
+            except Exception as e:
+                console.print(
+                    f"[red]Error:[/red] Scrubbing failed: {e}\n"
+                    "Upload aborted — cannot upload local-intent recording without scrubbing."
+                )
+                sys.exit(1)
+
+            if not click.confirm("Proceed with upload of scrubbed copy?", default=False):
+                console.print("[dim]Upload cancelled.[/dim]")
+                continue
+
+            # Upload the scrubbed copy instead
+            d = scrub_result.output_dir
+
+        filtered_dirs.append(d)
+
+    dirs = filtered_dirs
+
     total_count = len(dirs)
     all_uploaded = 0
     all_skipped = 0
@@ -1273,6 +1512,29 @@ def transcribe(name, model):
         console.print(f"\n[bold]Preview:[/bold]\n{preview}")
 
 
+@cli.command()
+@click.option("--scan", is_flag=True, help="Rescan and show only new (unconfigured) apps.")
+@click.option("--show", is_flag=True, help="Display current classifications (read-only).")
+@click.option("--reset", is_flag=True, help="Remove [privacy] section after confirmation.")
+def setup(scan, show, reset):
+    """Configure privacy settings with an interactive wizard."""
+    from screencap.setup_wizard import (
+        reset_privacy_config,
+        run_setup_wizard,
+        show_current_config,
+    )
+
+    if show:
+        show_current_config()
+        return
+
+    if reset:
+        reset_privacy_config()
+        return
+
+    run_setup_wizard(scan_only=scan)
+
+
 _PRIVACY_EXTRAS_MSG = (
     "[red]Error: Privacy dependencies not installed.[/red]\n"
     "Install with: [bold]pip install screencap\\[privacy][/bold]\n"
@@ -1316,6 +1578,7 @@ def settings():
         get_chunk_duration,
         get_recordings_dir,
         get_rest_threshold,
+        get_upload_default,
     )
 
     chunk = get_chunk_duration()
@@ -1329,6 +1592,7 @@ def settings():
     console.print(f"  Recordings dir:           {get_recordings_dir()}")
     console.print(f"  Audio default:            {'enabled' if get_audio_default() else 'disabled'}")
     console.print(f"  Auto-name:                {'enabled' if get_auto_name() else 'disabled'}")
+    console.print(f"  Upload default:           {get_upload_default()}")
     console.print()
 
 
