@@ -2581,6 +2581,9 @@ def record(
     )
     # Video finalization can take >10s (ffmpeg fMP4 close) — give it 30s
     join_tasks(["video_writer"], timeout=30.0)
+    _vw = task_by_name.get("video_writer")
+    if _vw is not None and hasattr(_vw, "exitcode") and _vw.exitcode:
+        logger.warning(f"video_writer exited with code {_vw.exitcode}")
     # Audio FLAC close needs extra time too
     join_tasks(["audio_recorder"], timeout=15.0)
 
