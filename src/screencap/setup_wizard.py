@@ -53,6 +53,8 @@ _CODE_CLASSES = frozenset({
 # Sources that indicate a "safe" auto-classification (no specific privacy class)
 _SAFE_SOURCES = frozenset({
     "apple_prefix",
+    "dev_runtime",
+    "browser_pwa",
     "system_service",
     "input_method",
     "lifecycle",

@@ -214,6 +214,38 @@ class TestAutoClassifyDetailed:
         assert result.context_class == ContextClass.UNKNOWN
         assert result.source == "category_safe"
 
+    def test_known_browser(self):
+        meta = AppMetadata(path="/test", bundle_id="com.google.Chrome", display_name="Google Chrome")
+        result = auto_classify_detailed(meta)
+        assert result.context_class == ContextClass.BROWSER_UNVERIFIED
+        assert result.source == "known_browser"
+
+    def test_dev_runtime(self):
+        meta = AppMetadata(path="/test", bundle_id="org.python.python", display_name="Python")
+        result = auto_classify_detailed(meta)
+        assert result.source == "dev_runtime"
+
+    def test_browser_pwa(self):
+        meta = AppMetadata(path="/test", bundle_id="com.google.Chrome.app.xyz123", display_name="YouTube")
+        result = auto_classify_detailed(meta)
+        assert result.source == "browser_pwa"
+
+    def test_lifecycle_update_suffix(self):
+        meta = AppMetadata(path="/test", bundle_id="com.microsoft.foo", display_name="Visual Studio Update")
+        result = auto_classify_detailed(meta)
+        assert result.source == "lifecycle"
+
+    def test_system_service_srv_suffix(self):
+        meta = AppMetadata(path="/test", bundle_id="com.example.foo", display_name="pteiddialogsQTsrv")
+        result = auto_classify_detailed(meta)
+        assert result.source == "system_service"
+
+    def test_wallet_category(self):
+        meta = AppMetadata(path="/test", bundle_id="com.ledger.live", display_name="Ledger", category="public.app-category.wallet")
+        result = auto_classify_detailed(meta)
+        assert result.context_class == ContextClass.BANKING
+        assert result.source == "category_map"
+
     def test_unknown_fallback(self):
         meta = AppMetadata(path="/test", bundle_id="com.example.random", display_name="RandomApp")
         result = auto_classify_detailed(meta)

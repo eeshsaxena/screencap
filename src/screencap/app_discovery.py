@@ -74,13 +74,13 @@ _APPLE_SENSITIVE_APPS: dict[str, ContextClass] = {
 # ---------------------------------------------------------------------------
 
 _SYSTEM_SERVICE_PATTERNS = re.compile(
-    r"(?i)(Agent|Helper|UIServer|Service|Daemon)$"
+    r"(?i)(Agent|Helper|UIServer|Service|Daemon|srv)$"
 )
 _INPUT_METHOD_PATTERNS = re.compile(
     r"(?i)(IM$|InputMethod|Typing|Kana|Romaji|Transliteration)"
 )
 _LIFECYCLE_PATTERNS = re.compile(
-    r"(?i)(Onboarding|Setup|Installer|Updater|Migration|Rosetta)"
+    r"(?i)(Onboarding|Setup|Installer|Updater|Update$|Migration|Rosetta)"
 )
 _DECORATION_PATTERNS = re.compile(
     r"(?i)(ScreenSaver|Wallpaper|Widget|TouchBar|Dock$)"
@@ -110,6 +110,7 @@ _PATTERN_RULES: list[tuple[re.Pattern[str], ContextClass]] = [
 # LSApplicationCategoryType -> ContextClass (Layer 6)
 _CATEGORY_MAP: dict[str, ContextClass] = {
     "public.app-category.finance": ContextClass.BANKING,
+    "public.app-category.wallet": ContextClass.BANKING,
     "public.app-category.social-networking": ContextClass.CHAT,
     "public.app-category.developer-tools": ContextClass.CODE_EDITOR_TERMINAL,
 }
@@ -224,15 +225,16 @@ def auto_classify_detailed(metadata: AppMetadata) -> ClassificationResult:
     """Classify an app using multi-layer local heuristics.
 
     Priority (first match wins):
-    1. Known-apps DB (_BUNDLE_ID_MAP) -- checked by caller in setup wizard
-    2. Apple sensitive-app overrides
-    3. Apple bundle ID prefix (com.apple.* -> safe)
-    4. Naming pattern heuristics
-    5. Bundle ID / display name pattern rules
-    6. LSApplicationCategoryType
-    7. UNKNOWN
+    1. Known-apps DB (_BUNDLE_ID_MAP)
+    2. Browser bundle IDs (BROWSER_BUNDLE_IDS)
+    3. Apple sensitive-app overrides
+    4. Apple bundle ID prefix (com.apple.* -> safe)
+    5. Naming pattern heuristics
+    6. Bundle ID / display name pattern rules
+    7. LSApplicationCategoryType
+    8. UNKNOWN
     """
-    from screencap.privacy.context import _BUNDLE_ID_MAP
+    from screencap.privacy.context import BROWSER_BUNDLE_IDS, _BUNDLE_ID_MAP
 
     bid = metadata.bundle_id
 
@@ -240,15 +242,24 @@ def auto_classify_detailed(metadata: AppMetadata) -> ClassificationResult:
     if bid in _BUNDLE_ID_MAP:
         return ClassificationResult(_BUNDLE_ID_MAP[bid], "known_app")
 
-    # Layer 2: Apple sensitive apps
+    # Layer 2: Browser bundle IDs
+    if bid in BROWSER_BUNDLE_IDS:
+        return ClassificationResult(ContextClass.BROWSER_UNVERIFIED, "known_browser")
+
+    # Layer 3: Apple sensitive apps
     if bid in _APPLE_SENSITIVE_APPS:
         return ClassificationResult(_APPLE_SENSITIVE_APPS[bid], "apple_sensitive")
 
-    # Layer 3: Apple bundle ID prefix (generic safe)
+    # Layer 4: Safe bundle ID prefixes
     if bid.startswith("com.apple."):
         return ClassificationResult(ContextClass.UNKNOWN, "apple_prefix")
+    if bid.startswith("org.python."):
+        return ClassificationResult(ContextClass.UNKNOWN, "dev_runtime")
+    # Chrome/Chromium PWAs are just web bookmarks, treat as safe
+    if bid.startswith("com.google.Chrome.app."):
+        return ClassificationResult(ContextClass.UNKNOWN, "browser_pwa")
 
-    # Layer 4: Naming pattern heuristics
+    # Layer 5: Naming pattern heuristics
     name = metadata.display_name
     if _SYSTEM_SERVICE_PATTERNS.search(name):
         return ClassificationResult(ContextClass.UNKNOWN, "system_service")
@@ -259,21 +270,21 @@ def auto_classify_detailed(metadata: AppMetadata) -> ClassificationResult:
     if _DECORATION_PATTERNS.search(name):
         return ClassificationResult(ContextClass.UNKNOWN, "decoration")
 
-    # Layer 5: Bundle ID patterns
+    # Layer 6: Bundle ID patterns
     for pattern, ctx_class in _PATTERN_RULES:
         if pattern.search(bid):
             return ClassificationResult(ctx_class, "pattern_rule")
 
-    # Layer 5b: Display name patterns
+    # Layer 6b: Display name patterns
     for pattern, ctx_class in _PATTERN_RULES:
         if pattern.search(name):
             return ClassificationResult(ctx_class, "pattern_rule")
 
-    # Layer 6: Info.plist category -> specific class
+    # Layer 7: Info.plist category -> specific class
     if metadata.category and metadata.category in _CATEGORY_MAP:
         return ClassificationResult(_CATEGORY_MAP[metadata.category], "category_map")
 
-    # Layer 6b: Info.plist category -> safe
+    # Layer 7b: Info.plist category -> safe
     if metadata.category and metadata.category in _SAFE_CATEGORIES:
         return ClassificationResult(ContextClass.UNKNOWN, "category_safe")
 
