@@ -14,7 +14,8 @@ from screencap.setup_wizard import (
     _classify_with_overrides,
     _group_apps,
     _save_config_atomic,
-    _toggle_app_tui,
+    _toggle_override,
+    _app_visual,
     reset_privacy_config,
     run_setup_wizard,
 )
@@ -134,67 +135,50 @@ class TestGroupApps:
         assert groups["safe"][0][0].display_name == "VS Code"
 
 
-class TestToggleAppTui:
-    def test_blocked_to_safe(self):
-        meta = _make_app("com.example.test", "Test")
-        groups = {
-            "blocked": [(meta, ContextClass.PASSWORD_MANAGER, "known_app")],
-            "communication": [],
-            "safe": [],
-            "unclassified": [],
-        }
-        _toggle_app_tui(groups, "blocked", meta)
-        assert len(groups["blocked"]) == 0
-        assert len(groups["safe"]) == 1
-        assert groups["safe"][0][0].bundle_id == "com.example.test"
+class TestToggleOverride:
+    def test_blocked_first_toggle_allows(self):
+        overrides: dict[str, str] = {}
+        _toggle_override(overrides, "blocked", "com.example.test")
+        assert overrides["com.example.test"] == "allow"
 
-    def test_safe_to_blocked(self):
-        meta = _make_app("com.example.test", "Test")
-        groups = {
-            "blocked": [],
-            "communication": [],
-            "safe": [(meta, ContextClass.CODE_EDITOR_TERMINAL, "known_app")],
-            "unclassified": [],
-        }
-        _toggle_app_tui(groups, "safe", meta)
-        assert len(groups["safe"]) == 0
-        assert len(groups["blocked"]) == 1
+    def test_unclassified_first_toggle_allows(self):
+        overrides: dict[str, str] = {}
+        _toggle_override(overrides, "unclassified", "com.example.test")
+        assert overrides["com.example.test"] == "allow"
 
-    def test_communication_to_blocked(self):
-        meta = _make_app("com.example.test", "Test")
-        groups = {
-            "blocked": [],
-            "communication": [(meta, ContextClass.CHAT, "known_app")],
-            "safe": [],
-            "unclassified": [],
-        }
-        _toggle_app_tui(groups, "communication", meta)
-        assert len(groups["communication"]) == 0
-        assert len(groups["blocked"]) == 1
+    def test_safe_first_toggle_blocks(self):
+        overrides: dict[str, str] = {}
+        _toggle_override(overrides, "safe", "com.example.test")
+        assert overrides["com.example.test"] == "block"
 
-    def test_unclassified_to_blocked(self):
-        meta = _make_app("com.example.test", "Test")
-        groups = {
-            "blocked": [],
-            "communication": [],
-            "safe": [],
-            "unclassified": [(meta, ContextClass.UNKNOWN, "unknown")],
-        }
-        _toggle_app_tui(groups, "unclassified", meta)
-        assert len(groups["unclassified"]) == 0
-        assert len(groups["blocked"]) == 1
+    def test_communication_first_toggle_blocks(self):
+        overrides: dict[str, str] = {}
+        _toggle_override(overrides, "communication", "com.example.test")
+        assert overrides["com.example.test"] == "block"
 
-    def test_noop_if_not_found(self):
-        meta = _make_app("com.example.test", "Test")
-        other = _make_app("com.example.other", "Other")
-        groups = {
-            "blocked": [(other, ContextClass.PASSWORD_MANAGER, "known_app")],
-            "communication": [],
-            "safe": [],
-            "unclassified": [],
-        }
-        _toggle_app_tui(groups, "blocked", meta)
-        assert len(groups["blocked"]) == 1  # unchanged
+    def test_toggle_flips(self):
+        overrides = {"com.example.test": "allow"}
+        _toggle_override(overrides, "blocked", "com.example.test")
+        assert overrides["com.example.test"] == "block"
+        _toggle_override(overrides, "blocked", "com.example.test")
+        assert overrides["com.example.test"] == "allow"
+
+
+class TestAppVisual:
+    def test_no_override_returns_default(self):
+        sym, col = _app_visual("safe", "com.ex", {}, "\u2713", "cyan")
+        assert sym == "\u2713"
+        assert col == "cyan"
+
+    def test_override_block(self):
+        sym, col = _app_visual("safe", "com.ex", {"com.ex": "block"}, "\u2713", "cyan")
+        assert sym == "\u00d7"
+        assert col == "pink"
+
+    def test_override_allow(self):
+        sym, col = _app_visual("blocked", "com.ex", {"com.ex": "allow"}, "\u00d7", "pink")
+        assert sym == "\u2713"
+        assert col == "cyan"
 
 
 class TestBuildSaveDoc:
@@ -270,7 +254,7 @@ class TestRunSetupWizard:
         with mock.patch("sys.stdin") as mock_stdin, \
              mock.patch("screencap.setup_wizard.discover_installed_apps", return_value=apps), \
              mock.patch("screencap.setup_wizard.click") as mock_click, \
-             mock.patch("screencap.setup_wizard._run_tui", return_value=True), \
+             mock.patch("screencap.setup_wizard._run_tui", return_value={}), \
              mock.patch("screencap.config.invalidate_config_cache"):
             mock_stdin.isatty.return_value = True
             mock_click.prompt.return_value = 1  # public mode
@@ -291,7 +275,7 @@ class TestRunSetupWizard:
         with mock.patch("sys.stdin") as mock_stdin, \
              mock.patch("screencap.setup_wizard.discover_installed_apps", return_value=apps), \
              mock.patch("screencap.setup_wizard.click") as mock_click, \
-             mock.patch("screencap.setup_wizard._run_tui", return_value=True), \
+             mock.patch("screencap.setup_wizard._run_tui", return_value={}), \
              mock.patch("screencap.config.invalidate_config_cache"):
             mock_stdin.isatty.return_value = True
             mock_click.prompt.return_value = 2  # internal mode
@@ -311,7 +295,7 @@ class TestRunSetupWizard:
         with mock.patch("sys.stdin") as mock_stdin, \
              mock.patch("screencap.setup_wizard.discover_installed_apps", return_value=apps), \
              mock.patch("screencap.setup_wizard.click") as mock_click, \
-             mock.patch("screencap.setup_wizard._run_tui", return_value=True), \
+             mock.patch("screencap.setup_wizard._run_tui", return_value={}), \
              mock.patch("screencap.config.invalidate_config_cache"):
             mock_stdin.isatty.return_value = True
             mock_click.prompt.return_value = 2  # internal mode
@@ -331,7 +315,7 @@ class TestRunSetupWizard:
         with mock.patch("sys.stdin") as mock_stdin, \
              mock.patch("screencap.setup_wizard.discover_installed_apps", return_value=apps), \
              mock.patch("screencap.setup_wizard.click") as mock_click, \
-             mock.patch("screencap.setup_wizard._run_tui", return_value=True), \
+             mock.patch("screencap.setup_wizard._run_tui", return_value={}), \
              mock.patch("screencap.config.invalidate_config_cache"):
             mock_stdin.isatty.return_value = True
             mock_click.prompt.return_value = 2  # internal mode
@@ -342,6 +326,50 @@ class TestRunSetupWizard:
             doc = tomlkit.parse(config_path.read_text())
             assert "com.1password.1password" in doc["privacy"]["exclude_apps"]
 
+    def test_override_unblocks_app(self, tmp_path):
+        """User overrides a blocked app to allow — goes to allow_apps, not exclude."""
+        config_path = tmp_path / "config.toml"
+        apps = [
+            AppMetadata("/test/1Password.app", "com.1password.1password", "1Password"),
+        ]
+        overrides = {"com.1password.1password": "allow"}
+        with mock.patch("sys.stdin") as mock_stdin, \
+             mock.patch("screencap.setup_wizard.discover_installed_apps", return_value=apps), \
+             mock.patch("screencap.setup_wizard.click") as mock_click, \
+             mock.patch("screencap.setup_wizard._run_tui", return_value=overrides), \
+             mock.patch("screencap.config.invalidate_config_cache"):
+            mock_stdin.isatty.return_value = True
+            mock_click.prompt.return_value = 2
+
+            result = run_setup_wizard(config_path=config_path)
+            assert result is True
+
+            doc = tomlkit.parse(config_path.read_text())
+            assert "com.1password.1password" in doc["privacy"]["allow_apps"]
+            assert "exclude_apps" not in doc["privacy"]
+
+    def test_override_blocks_unclassified(self, tmp_path):
+        """User overrides an unclassified app to block — goes to exclude_apps."""
+        config_path = tmp_path / "config.toml"
+        apps = [
+            AppMetadata("/test/Figma.app", "com.figma.desktop", "Figma"),
+        ]
+        overrides = {"com.figma.desktop": "block"}
+        with mock.patch("sys.stdin") as mock_stdin, \
+             mock.patch("screencap.setup_wizard.discover_installed_apps", return_value=apps), \
+             mock.patch("screencap.setup_wizard.click") as mock_click, \
+             mock.patch("screencap.setup_wizard._run_tui", return_value=overrides), \
+             mock.patch("screencap.config.invalidate_config_cache"):
+            mock_stdin.isatty.return_value = True
+            mock_click.prompt.return_value = 2
+
+            result = run_setup_wizard(config_path=config_path)
+            assert result is True
+
+            doc = tomlkit.parse(config_path.read_text())
+            assert "com.figma.desktop" in doc["privacy"]["exclude_apps"]
+            assert "com.figma.desktop" not in doc["privacy"].get("allow_apps", [])
+
     def test_wizard_cancel(self, tmp_path):
         """User cancels in TUI, no config saved."""
         config_path = tmp_path / "config.toml"
@@ -351,7 +379,7 @@ class TestRunSetupWizard:
         with mock.patch("sys.stdin") as mock_stdin, \
              mock.patch("screencap.setup_wizard.discover_installed_apps", return_value=apps), \
              mock.patch("screencap.setup_wizard.click") as mock_click, \
-             mock.patch("screencap.setup_wizard._run_tui", return_value=False):
+             mock.patch("screencap.setup_wizard._run_tui", return_value=None):
             mock_stdin.isatty.return_value = True
             mock_click.prompt.return_value = 2
 
@@ -432,7 +460,7 @@ class TestScanOnlyMode:
         ]
         with mock.patch("sys.stdin") as mock_stdin, \
              mock.patch("screencap.setup_wizard.discover_installed_apps", return_value=apps), \
-             mock.patch("screencap.setup_wizard._run_tui", return_value=True), \
+             mock.patch("screencap.setup_wizard._run_tui", return_value={}), \
              mock.patch("screencap.setup_wizard.click") as mock_click, \
              mock.patch("screencap.config.invalidate_config_cache"):
             mock_stdin.isatty.return_value = True

@@ -237,38 +237,50 @@ _ANSI = {"blue": 111, "indigo": 105, "purple": 141, "pink": 211, "cyan": 80}
 _COLOR_PAIR = {"pink": 1, "purple": 2, "cyan": 3, "indigo": 4, "blue": 5}
 
 
-def _toggle_app_tui(
-    groups: dict[str, list[tuple[AppMetadata, ContextClass, str]]],
+def _toggle_override(
+    overrides: dict[str, str],
     group_key: str,
-    meta: AppMetadata,
+    bundle_id: str,
 ) -> None:
-    """Toggle an app: blocked -> safe, anything else -> blocked."""
-    apps = groups[group_key]
-    for i, (m, _c, _s) in enumerate(apps):
-        if m.bundle_id == meta.bundle_id:
-            apps.pop(i)
-            break
-    else:
-        return
+    """Toggle an app's override in-place (no group mutation).
 
-    if group_key == "blocked":
-        groups["safe"].append((meta, ContextClass.UNKNOWN, "user_edit"))
-        groups["safe"].sort(key=lambda x: x[0].display_name.lower())
-    else:
-        groups["blocked"].append(
-            (meta, ContextClass.PASSWORD_MANAGER, "user_block")
+    First toggle: blocked/unclassified -> allow, others -> block.
+    Subsequent toggles flip between allow and block.
+    """
+    if bundle_id in overrides:
+        overrides[bundle_id] = (
+            "allow" if overrides[bundle_id] == "block" else "block"
         )
-        groups["blocked"].sort(key=lambda x: x[0].display_name.lower())
+    elif group_key in ("blocked", "unclassified"):
+        overrides[bundle_id] = "allow"
+    else:
+        overrides[bundle_id] = "block"
+
+
+def _app_visual(
+    group_key: str,
+    bundle_id: str,
+    overrides: dict[str, str],
+    default_sym: str,
+    default_col: str,
+) -> tuple[str, str]:
+    """Return (symbol, color_key) for an app, considering overrides."""
+    if bundle_id in overrides:
+        if overrides[bundle_id] == "block":
+            return "\u00d7", "pink"
+        return "\u2713", "cyan"
+    return default_sym, default_col
 
 
 def _run_tui(
     groups: dict[str, list[tuple[AppMetadata, ContextClass, str]]],
     auto_allowed_count: int,
-) -> bool:
+) -> dict[str, str] | None:
     """Curses TUI for interactive app review.
 
-    Arrow keys navigate, Enter/Space toggle, s saves, q cancels.
-    Returns True to save, False to cancel.
+    Arrow keys navigate, Enter/Space toggle icons in-place, s saves, q cancels.
+    Returns overrides dict on save (bundle_id -> "allow"|"block"), None on cancel.
+    Groups are never mutated; overrides are applied by the caller on save.
     """
     import curses
 
@@ -303,6 +315,7 @@ def _run_tui(
             curses.init_pair(5, curses.COLOR_BLUE, -1)
 
         expanded = {k: True for k in groups if groups[k]}
+        overrides: dict[str, str] = {}
         cursor = 0
         scroll = 0
 
@@ -325,7 +338,7 @@ def _run_tui(
                 stdscr.refresh()
                 ch = stdscr.getch()
                 if ch == ord("q") or ch == 27:
-                    return False
+                    return None
                 continue
 
             items = _build_items(groups, expanded)
@@ -339,9 +352,9 @@ def _run_tui(
                 stdscr.refresh()
                 ch = stdscr.getch()
                 if ch == ord("s"):
-                    return True
+                    return overrides
                 if ch == ord("q") or ch == 27:
-                    return False
+                    return None
                 continue
 
             cursor = max(0, min(cursor, len(items) - 1))
@@ -393,7 +406,10 @@ def _run_tui(
                     except curses.error:
                         pass
                 else:
-                    _, _grp, app_meta, cls, _src, sym, col = item
+                    _, grp_key, app_meta, cls, _src, sym, col = item
+                    sym, col = _app_visual(
+                        grp_key, app_meta.bundle_id, overrides, sym, col,
+                    )
                     cls_lbl = _CLASS_LABELS.get(cls, cls.value)
                     name = app_meta.display_name
                     if len(name) > 24:
@@ -442,10 +458,20 @@ def _run_tui(
                 cur = items[cursor]
                 if cur[0] == "group":
                     action = "Enter/Space Expand/Collapse"
-                elif cur[1] == "blocked":
-                    action = "Enter/Space Unblock"
                 else:
-                    action = "Enter/Space Block"
+                    bid = cur[2].bundle_id
+                    grp = cur[1]
+                    # Determine what next toggle will produce
+                    if bid in overrides:
+                        will_be = "allow" if overrides[bid] == "block" else "block"
+                    elif grp in ("blocked", "unclassified"):
+                        will_be = "allow"
+                    else:
+                        will_be = "block"
+                    if will_be == "allow":
+                        action = "Enter/Space Allow \u2713"
+                    else:
+                        action = "Enter/Space Block \u00d7"
 
             try:
                 stdscr.addnstr(fy + 1, 0, "\u2500" * (w - 1), w - 1, indigo)
@@ -473,9 +499,9 @@ def _run_tui(
             # --- Input ---
             ch = stdscr.getch()
             if ch == ord("q") or ch == 27:
-                return False
+                return None
             elif ch == ord("s"):
-                return True
+                return overrides
             elif ch in (curses.KEY_UP, ord("k")):
                 cursor = max(0, cursor - 1)
             elif ch in (curses.KEY_DOWN, ord("j")):
@@ -495,12 +521,12 @@ def _run_tui(
                         key = cur[1]
                         expanded[key] = not expanded.get(key, True)
                     else:
-                        _toggle_app_tui(groups, cur[1], cur[2])
+                        _toggle_override(overrides, cur[1], cur[2].bundle_id)
             elif ch == ord(" "):
                 if cursor < len(items):
                     cur = items[cursor]
                     if cur[0] == "app":
-                        _toggle_app_tui(groups, cur[1], cur[2])
+                        _toggle_override(overrides, cur[1], cur[2].bundle_id)
                     elif cur[0] == "group":
                         key = cur[1]
                         expanded[key] = not expanded.get(key, True)
@@ -594,7 +620,7 @@ def run_setup_wizard(
 
     # Interactive review via curses TUI
     try:
-        save = _run_tui(groups, len(auto_allowed))
+        overrides = _run_tui(groups, len(auto_allowed))
     except Exception:
         console.print(
             "[red]Interactive mode unavailable.[/red] "
@@ -602,11 +628,11 @@ def run_setup_wizard(
         )
         return False
 
-    if not save:
+    if overrides is None:
         console.print("  [dim]Setup cancelled, no changes saved.[/dim]")
         return False
 
-    # Build final config from groups
+    # Build final config from groups + overrides
     final_exclude: list[str] = sorted(existing_exclude)
     final_allow: list[str] = sorted(existing_allow)
     final_app_classes: dict[str, str] = dict(
@@ -619,34 +645,39 @@ def run_setup_wizard(
         if bid not in final_allow and bid not in final_exclude:
             final_allow.append(bid)
 
-    # Process visible groups
-    for meta, cls, source in groups.get("blocked", []):
-        bid = meta.bundle_id
-        if bid not in final_exclude:
-            final_exclude.append(bid)
-        final_app_classes.pop(bid, None)
-        if bid in final_allow:
-            final_allow.remove(bid)
+    # Process visible groups, applying user overrides
+    for group_key in ("blocked", "communication", "safe", "unclassified"):
+        for meta, cls, source in groups.get(group_key, []):
+            bid = meta.bundle_id
 
-    for meta, cls, source in groups.get("communication", []):
-        bid = meta.bundle_id
-        if bid not in existing_ac and bid not in _BUNDLE_ID_MAP:
-            final_app_classes[bid] = cls.value
-        if bid in final_allow:
-            final_allow.remove(bid)
+            # User override takes priority over group default
+            if bid in overrides:
+                if overrides[bid] == "block":
+                    if bid not in final_exclude:
+                        final_exclude.append(bid)
+                    final_app_classes.pop(bid, None)
+                    if bid in final_allow:
+                        final_allow.remove(bid)
+                else:  # "allow"
+                    if bid not in final_allow and bid not in final_exclude:
+                        final_allow.append(bid)
+                continue
 
-    for meta, cls, source in groups.get("safe", []):
-        bid = meta.bundle_id
-        if bid not in existing_ac and bid not in _BUNDLE_ID_MAP:
-            final_app_classes[bid] = cls.value
-        if bid in final_allow:
-            final_allow.remove(bid)
-
-    # Unclassified: anything left is allowed (user saw them, didn't block)
-    for meta, cls, source in groups.get("unclassified", []):
-        bid = meta.bundle_id
-        if bid not in final_allow and bid not in final_exclude:
-            final_allow.append(bid)
+            # No override — use group default
+            if group_key == "blocked":
+                if bid not in final_exclude:
+                    final_exclude.append(bid)
+                final_app_classes.pop(bid, None)
+                if bid in final_allow:
+                    final_allow.remove(bid)
+            elif group_key in ("communication", "safe"):
+                if bid not in existing_ac and bid not in _BUNDLE_ID_MAP:
+                    final_app_classes[bid] = cls.value
+                if bid in final_allow:
+                    final_allow.remove(bid)
+            elif group_key == "unclassified":
+                if bid not in final_allow and bid not in final_exclude:
+                    final_allow.append(bid)
 
     final_exclude.sort()
     final_allow.sort()
