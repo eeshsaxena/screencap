@@ -42,6 +42,27 @@ No linting is configured for the root `screencap` package. The vendored sub-pack
 
 The vendored package is co-installed via the root `pyproject.toml` `packages.find.where` — it is NOT a separate pip install.
 
+## Privacy System (`src/screencap/privacy/`)
+
+Two-layer privacy enforcement: capture-time filtering + post-recording scrubbing.
+
+**Core modules:**
+- `actions.py` — `PrivacyAction` enum (EXCLUDE → MASK_WINDOW → MASK_REGION → TEXT_REDACT → OCR_FALLBACK → ALLOW), `ActionDecision` dataclass, `stricter()` comparator.
+- `policy.py` — `PrivacyMode` enum (public/internal), `ContextClass` enum (10 app categories), `_ACTION_MATRIX` mapping every (context, mode) pair to an action, `PrivacyConfig` (parsed from `[privacy]` in config.toml), `DefaultPolicyEvaluator` with 5-level precedence (exclude_apps > allow_apps > mask_domains > mask_title_patterns > matrix).
+- `context.py` — `DefaultContextClassifier` that maps bundle IDs, browser domains, and window titles to `ContextClass`. Includes known bundle ID map (~80 apps), browser domain map, and title heuristics. `associate_screenshot()` correlates screenshot timestamps to window/browser events using bisect-based nearest-event lookup.
+- `recorder_enforcement.py` — `RecorderPrivacyFilter` for capture-time gating. Observes window events, evaluates policy, blocks screenshots and nulls keystrokes. Multiple independent blocking sources (app_policy, secure_input, secure_field) with per-source hold timers. Starts fail-closed.
+- `masking.py` — Pillow-based screenshot masking (full-window blur) for MASK_WINDOW actions.
+- `reasons.py` — `ReasonCode` constants and `AuditEntry` for traceability.
+
+**Key design decisions:**
+- Fail-closed by default: filter blocks capture until first window event; errors trigger fail-closed until next successful event.
+- `SCREENCAP_PRIVACY_MODE` env var can only tighten, never loosen the mode vs config.toml.
+- `allow_apps` cannot bypass matrix EXCLUDE (e.g., password managers are always excluded regardless of allow list).
+- `PrivacyConfig.app_classes` is frozen (`MappingProxyType`) after construction.
+- Transition hold (1.0s) after switching from a blocked app covers macOS Cmd+Tab animation (200-350ms).
+- `shared` mode is defined in the matrix but raises `InvalidPrivacyConfigError` until MASK_REGION is implemented.
+- The `setup` CLI command runs an interactive TUI (curses) to classify installed apps, writing results to `[privacy]` in config.toml. First `screencap start` prompts for setup if no `[privacy]` section exists.
+
 ## Key Patterns
 
 - All user-facing output uses `rich.console.Console` (no bare `print()`).

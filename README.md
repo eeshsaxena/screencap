@@ -255,6 +255,111 @@ screencap download --force
 | `--dry-run` | Show recording names and file counts without downloading |
 | `--force` | Re-download all recordings, ignoring markers |
 
+### `screencap setup`
+
+Configure privacy settings with an interactive wizard. On first run, `screencap start` automatically prompts you to run this.
+
+The wizard scans your installed applications, classifies them into privacy categories, and writes a `[privacy]` section to `~/.screencap/config.toml`. Apps that ScreenCap already knows (password managers, email clients, code editors, etc.) are pre-classified. Apps it doesn't recognize are shown for your review.
+
+```bash
+# run the full setup wizard
+screencap setup
+
+# re-scan for new apps without resetting existing config
+screencap setup --scan
+
+# show current privacy configuration
+screencap setup --show
+
+# remove privacy configuration
+screencap setup --reset
+```
+
+| Flag | Description |
+|------|-------------|
+| `--scan` | Re-scan installed apps and update classifications |
+| `--show` | Display current privacy configuration |
+| `--reset` | Remove the `[privacy]` section from config |
+
+### Privacy Policy
+
+ScreenCap has a built-in privacy policy that controls what gets captured based on which app is in the foreground. The system works at two levels:
+
+1. **Capture-time filtering** — During recording, ScreenCap monitors the active window and blocks capture in real-time for excluded apps. Blocked screenshots are never written to disk, and keystroke content is nulled.
+
+2. **Post-recording scrubbing** — After recording, `screencap scrub` applies additional redaction (PII detection, secret scanning, screenshot masking) as defense-in-depth.
+
+#### Privacy Modes
+
+The privacy mode controls how aggressively different app categories are handled:
+
+| Mode | Use case | Behavior |
+|------|----------|----------|
+| `public` | Recordings shared externally | Strictest — masks or excludes most app categories |
+| `internal` | Internal/personal use | Permissive — only excludes password managers |
+
+Set the mode in `config.toml` or via environment variable:
+
+```toml
+[privacy]
+mode = "public"
+```
+
+```bash
+SCREENCAP_PRIVACY_MODE=public screencap start
+```
+
+The environment variable can only **tighten** the mode (e.g., set `public` when config says `internal`), never loosen it. This prevents accidental exposure.
+
+#### App Classification
+
+Apps are classified into context categories that determine the privacy action:
+
+| Category | Public mode | Internal mode |
+|----------|-------------|---------------|
+| Password manager | Exclude (never captured) | Exclude (never captured) |
+| Banking | Exclude | Mask window |
+| Email, Chat, Calendar, Video call | Mask window | Text redact |
+| Browser (no verified domain) | Mask window | Allow |
+| Code editor, Terminal | OCR fallback | Allow |
+| Admin console (AWS, DB tools) | OCR fallback | Allow |
+| Unknown / unclassified | Mask window | Allow |
+
+Apps are classified by: user config overrides > known bundle ID > browser domain matching > window title heuristics.
+
+#### Privacy Actions (strictest to most permissive)
+
+| Action | What it does |
+|--------|--------------|
+| **Exclude** | Screenshot deleted, keystrokes nulled. Nothing stored. |
+| **Mask window** | Full window area blurred in screenshot. |
+| **Text redact** | PII/secrets redacted from text fields. |
+| **OCR fallback** | Text extracted via OCR and redacted. |
+| **Allow** | No modification. |
+
+#### Additional Protections
+
+- **Secure Input detection** — macOS Secure Input mode (e.g., password fields in Safari) automatically blocks capture.
+- **AXSecureTextField** — Password fields detected via accessibility attributes block capture with a hold timer.
+- **Transition hold** — After switching away from a blocked app, capture stays blocked for 1 second to cover macOS app-switch animations.
+- **Fail-closed** — The filter starts blocked until the first window event arrives. If an error occurs during filtering, capture blocks until the next successful event.
+
+#### Config Options
+
+```toml
+[privacy]
+mode = "public"                              # "public" or "internal"
+exclude_apps = ["com.example.secret-app"]     # always block these apps
+allow_apps = ["com.example.safe-app"]         # always allow these apps
+mask_domains = ["internal.company.com"]       # mask browser tabs on these domains
+mask_title_patterns = ["(?i)\\bconfidential\\b"]  # mask windows matching these patterns
+
+[privacy.app_classes]
+"com.example.app" = "banking"                 # override classification for an app
+```
+
+**Precedence:** exclude_apps > allow_apps > mask_domains > mask_title_patterns > action matrix. The stricter action always wins when rules conflict.
+
 ### `screencap scrub <name>`
 
 Redact PII and secrets from a recording's database and transcript files. Creates a scrubbed copy at `<name>-scrubbed/`.
@@ -319,6 +424,7 @@ disk_stop_mb = 500            # free MB to auto-stop (0 = disable)
 | `SCREENCAP_AUTO_NAME_LOCAL_ONLY` | `false` | Restrict auto-naming to local providers (Ollama) |
 | `SCREENCAP_DISK_WARN_MB` | `2000` | Free MB required to start recording / trigger warning (0 = disable) |
 | `SCREENCAP_DISK_STOP_MB` | `500` | Free MB threshold to auto-stop recording (0 = disable) |
+| `SCREENCAP_PRIVACY_MODE` | — | Override privacy mode (can only tighten, never loosen) |
 | `ANTHROPIC_API_KEY` | — | Enables Anthropic API as a naming provider |
 | `OPENAI_API_KEY` | — | Enables OpenAI API as a naming provider (also used for API transcription) |
 | `OLLAMA_HOST` | `http://localhost:11434` | Ollama server address |
