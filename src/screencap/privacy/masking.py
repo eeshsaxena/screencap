@@ -190,11 +190,14 @@ def mask_screenshot(
         img.save(image_path, "JPEG", quality=85, exif=b"")
         img.close()
     else:
-        with Image.open(image_path) as img:
-            img = img.convert("RGB")
-            w, h = img.size
+        with Image.open(image_path) as probe:
+            converted = probe.convert("RGB")
+        try:
+            w, h = converted.size
             regions = pane_geometry(w, h, context_class, app_hint)
-            _apply_mask_to_image(img, regions)
-            img.save(image_path, "JPEG", quality=85, exif=b"")
+            _apply_mask_to_image(converted, regions)
+            converted.save(image_path, "JPEG", quality=85, exif=b"")
+        finally:
+            converted.close()
 
     return True

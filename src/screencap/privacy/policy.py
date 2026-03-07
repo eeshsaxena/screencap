@@ -13,6 +13,7 @@ import os
 import re
 from dataclasses import dataclass, field
 from enum import Enum
+from types import MappingProxyType
 from typing import Protocol
 
 from screencap.privacy.actions import ActionDecision, PrivacyAction, stricter
@@ -28,6 +29,13 @@ class PrivacyMode(Enum):
     PUBLIC = "public"
     SHARED = "shared"
     INTERNAL = "internal"
+
+
+_MODE_STRICTNESS: dict[PrivacyMode, int] = {
+    PrivacyMode.PUBLIC: 0,
+    PrivacyMode.SHARED: 1,
+    PrivacyMode.INTERNAL: 2,
+}
 
 
 class ContextClass(Enum):
@@ -152,6 +160,10 @@ class PrivacyConfig:
                 return pat.pattern
         return None
 
+    def __post_init__(self) -> None:
+        if isinstance(self.app_classes, dict):
+            object.__setattr__(self, "app_classes", MappingProxyType(self.app_classes))
+
 
 class InvalidPrivacyConfigError(Exception):
     """Raised when the [privacy] config section is malformed."""
@@ -175,12 +187,14 @@ def parse_privacy_config(toml_dict: dict) -> PrivacyConfig:
             f"[privacy] must be a table, got {type(section).__name__}"
         )
 
-    # mode
-    mode_str = os.environ.get("SCREENCAP_PRIVACY_MODE") or section.get("mode", "internal")
-    if not isinstance(mode_str, str):
+    # mode — env var can tighten but never loosen
+    config_mode_str = section.get("mode", "internal")
+    if not isinstance(config_mode_str, str):
         raise InvalidPrivacyConfigError(
-            f"privacy.mode must be a string, got {type(mode_str).__name__}"
+            f"privacy.mode must be a string, got {type(config_mode_str).__name__}"
         )
+    env_mode_str = os.environ.get("SCREENCAP_PRIVACY_MODE")
+    mode_str = env_mode_str or config_mode_str
     try:
         mode = PrivacyMode(mode_str.lower())
     except ValueError:
@@ -188,6 +202,14 @@ def parse_privacy_config(toml_dict: dict) -> PrivacyConfig:
         raise InvalidPrivacyConfigError(
             f"Invalid privacy.mode={mode_str!r}. Must be one of: {valid}"
         )
+
+    if env_mode_str:
+        try:
+            config_mode = PrivacyMode(config_mode_str.lower())
+        except ValueError:
+            config_mode = PrivacyMode.INTERNAL
+        if _MODE_STRICTNESS[mode] > _MODE_STRICTNESS[config_mode]:
+            mode = config_mode
 
     if mode == PrivacyMode.SHARED:
         raise InvalidPrivacyConfigError(
@@ -378,8 +400,15 @@ class DefaultPolicyEvaluator:
                 evidence=metadata.bundle_id,
             )
 
-        # 2. Explicit app allow
+        # 2. Explicit app allow (unless matrix says EXCLUDE)
         if metadata.bundle_id and self._config.is_allowed_app(metadata.bundle_id):
+            matrix_action = get_matrix_action(context.context_class, mode)
+            if matrix_action == PrivacyAction.EXCLUDE:
+                return ActionDecision(
+                    action=PrivacyAction.EXCLUDE,
+                    reason=ReasonCode.POLICY_EXCLUDED_APP,
+                    evidence=f"matrix override: {context.context_class.value}",
+                )
             return ActionDecision(
                 action=PrivacyAction.ALLOW,
                 reason=ReasonCode.POLICY_ALLOWED_APP,

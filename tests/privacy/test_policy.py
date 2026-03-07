@@ -112,10 +112,23 @@ class TestParsePrivacyConfig:
         cfg = parse_privacy_config({"privacy": {"mode": "internal"}})
         assert cfg.mode == PrivacyMode.PUBLIC
 
+    def test_env_var_cannot_downgrade_mode(self, monkeypatch):
+        monkeypatch.setenv("SCREENCAP_PRIVACY_MODE", "internal")
+        cfg = parse_privacy_config({"privacy": {"mode": "public"}})
+        assert cfg.mode == PrivacyMode.PUBLIC
+
 
 # ---------------------------------------------------------------------------
 # Domain matching (subtle suffix logic — security-relevant)
 # ---------------------------------------------------------------------------
+
+
+def test_app_classes_immutable():
+    cfg = parse_privacy_config(
+        {"privacy": {"app_classes": {"com.example.app": "email"}}}
+    )
+    with pytest.raises(TypeError):
+        cfg.app_classes["com.new.app"] = ContextClass.CHAT
 
 
 def test_subdomain_matching():
@@ -180,6 +193,18 @@ class TestDefaultPolicyEvaluator:
         d = ev.evaluate(ctx, meta)
         assert d.action == PrivacyAction.ALLOW
         assert d.reason == ReasonCode.POLICY_ALLOWED_APP
+
+    def test_allow_apps_cannot_bypass_password_manager_exclude(self):
+        """allow_apps does not override the PASSWORD_MANAGER → EXCLUDE invariant."""
+        ev = self._make_evaluator(
+            mode="internal",
+            allow_apps=["com.1password.1password"],
+            app_classes={"com.1password.1password": "password_manager"},
+        )
+        ctx = ContextResult(ContextClass.PASSWORD_MANAGER)
+        meta = FrameMetadata(bundle_id="com.1password.1password")
+        d = ev.evaluate(ctx, meta)
+        assert d.action == PrivacyAction.EXCLUDE
 
     def test_exclude_apps_beats_allow_apps(self):
         """exclude_apps takes precedence over allow_apps."""

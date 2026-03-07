@@ -16,6 +16,7 @@ from screencap.catalog import find_db
 from screencap.config import get_recordings_dir, resolve_recording_dir
 from screencap.privacy.actions import BLOCK_ACTIONS, PrivacyAction
 from screencap.privacy.reasons import AuditEntry, ReasonCode
+from screencap.privacy.recorder_enforcement import DEFAULT_TRANSITION_HOLD_SECONDS
 
 console = Console()
 
@@ -146,7 +147,7 @@ def _build_blocked_intervals(
 
 def _build_secure_field_intervals(
     db_path: Path | None,
-    hold_seconds: float = 1.0,
+    hold_seconds: float = DEFAULT_TRANSITION_HOLD_SECONDS,
 ) -> list[_BlockedInterval]:
     """Build blocked intervals from action events with AXSecureTextField.
 

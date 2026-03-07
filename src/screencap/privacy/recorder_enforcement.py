@@ -161,7 +161,7 @@ class RecorderPrivacyFilter:
 
         # Mutable state (protected by _lock)
         # reason -> hold_until monotonic timestamp (0.0 = not active)
-        self._blocked_reasons: dict[str, float] = {}
+        self._blocked_reasons: dict[str, float] = {"initial": float("inf")}
         self._current_bundle_id: str = ""
         self._current_title: str = ""
 
@@ -201,8 +201,9 @@ class RecorderPrivacyFilter:
 
         now = time.monotonic()
         with self._lock:
-            # Clear fail-closed state on successful window event
+            # Clear fail-closed / initial state on successful window event
             self._blocked_reasons.pop("filter_error", None)
+            self._blocked_reasons.pop("initial", None)
 
             was_blocked = "app_policy" in self._blocked_reasons
 

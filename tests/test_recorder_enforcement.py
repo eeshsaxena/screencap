@@ -22,7 +22,16 @@ def _make_config(**kwargs) -> PrivacyConfig:
     return PrivacyConfig(**defaults)
 
 
+_ALLOWED_EVENT = {"app_bundle_id": "com.microsoft.VSCode", "title": "main.py"}
+
+
 class TestRecorderPrivacyFilter:
+    def test_starts_blocked_before_first_window_event(self):
+        """Filter starts fail-closed until first window event arrives."""
+        config = _make_config()
+        f = RecorderPrivacyFilter(config, transition_hold_seconds=0.0, secure_input_fn=None)
+        assert f.is_screen_allowed() is False
+
     def test_blocked_app_suppresses_capture(self):
         """An excluded app in the policy blocks screen capture."""
         config = _make_config(
@@ -166,7 +175,7 @@ class TestFailClosed:
         config = _make_config()
         f = RecorderPrivacyFilter(config, transition_hold_seconds=0.0, secure_input_fn=None)
 
-        # Initially allowed
+        f.on_window_event(_ALLOWED_EVENT)
         assert f.is_screen_allowed() is True
 
         f.fail_closed()
@@ -222,6 +231,7 @@ class TestSecureInputDetection:
             config, transition_hold_seconds=0.0, secure_input_fn=None
         )
 
+        f.on_window_event(_ALLOWED_EVENT)
         assert f.is_screen_allowed() is True
 
     def test_secure_input_hold_after_deactivation(self):
@@ -235,6 +245,8 @@ class TestSecureInputDetection:
             transition_hold_seconds=hold,
             secure_input_fn=lambda: secure_active[0],
         )
+
+        f.on_window_event(_ALLOWED_EVENT)
 
         now = time.monotonic()
         with patch("screencap.privacy.recorder_enforcement.time") as mock_time:
@@ -264,6 +276,7 @@ class TestSecureInputDetection:
             config, transition_hold_seconds=0.0, secure_input_fn=boom
         )
 
+        f.on_window_event(_ALLOWED_EVENT)
         # Should not raise, should allow capture
         assert f.is_screen_allowed() is True
 
@@ -297,6 +310,7 @@ class TestAXSecureTextField:
             config, transition_hold_seconds=0.0, secure_input_fn=None
         )
 
+        f.on_window_event(_ALLOWED_EVENT)
         f.on_action_event({
             "element_state": {"AXRole": "AXTextField"},
         })
@@ -310,6 +324,8 @@ class TestAXSecureTextField:
         f = RecorderPrivacyFilter(
             config, transition_hold_seconds=hold, secure_input_fn=None
         )
+
+        f.on_window_event(_ALLOWED_EVENT)
 
         now = time.monotonic()
         with patch("screencap.privacy.recorder_enforcement.time") as mock_time:
@@ -379,6 +395,8 @@ class TestMultiReasonComposition:
             transition_hold_seconds=0.0,
             secure_input_fn=lambda: secure_active[0],
         )
+
+        f.on_window_event(_ALLOWED_EVENT)
 
         # Secure input blocks
         assert f.is_screen_allowed() is False
