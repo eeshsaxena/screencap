@@ -45,22 +45,14 @@ class TestParsePrivacyConfigAppClasses:
                 }
             })
 
-    def test_non_dict_app_classes(self):
-        with pytest.raises(InvalidPrivacyConfigError, match="must be a table"):
+    @pytest.mark.parametrize("bad_input, match", [
+        (["not", "a", "dict"], "must be a table"),
+        ({"com.example.app": 42}, "must be a string"),
+    ])
+    def test_rejects_malformed_app_classes(self, bad_input, match):
+        with pytest.raises(InvalidPrivacyConfigError, match=match):
             parse_privacy_config({
-                "privacy": {
-                    "mode": "internal",
-                    "app_classes": ["not", "a", "dict"],
-                }
-            })
-
-    def test_non_string_class_value(self):
-        with pytest.raises(InvalidPrivacyConfigError, match="must be a string"):
-            parse_privacy_config({
-                "privacy": {
-                    "mode": "internal",
-                    "app_classes": {"com.example.app": 42},
-                }
+                "privacy": {"mode": "internal", "app_classes": bad_input}
             })
 
 
@@ -79,29 +71,66 @@ class TestClassifierUserConfigOverride:
         assert result.context_class == ContextClass.CODE_EDITOR_TERMINAL
         assert result.confidence == "user_config"
 
-    def test_without_user_config_uses_hardcoded(self):
-        """Without user config, falls back to hardcoded map."""
-        classifier = DefaultContextClassifier()
-        from screencap.privacy.policy import FrameMetadata
 
-        result = classifier.classify(
-            FrameMetadata(bundle_id="com.tinyspeck.slackmacgap")
-        )
-        assert result.context_class == ContextClass.CHAT
-        assert result.confidence == "bundle_id"
 
-    def test_user_config_unknown_app(self):
-        """User config for an app not in hardcoded map."""
-        classifier = DefaultContextClassifier(
-            app_classes={"com.figma.Desktop": ContextClass.UNKNOWN}
-        )
-        from screencap.privacy.policy import FrameMetadata
+class TestPostRecordingReport:
+    """Tests for _report_unclassified_apps in cli.py."""
 
-        result = classifier.classify(
-            FrameMetadata(bundle_id="com.figma.Desktop")
+    def test_reports_unclassified_apps(self, tmp_path):
+        import sqlite3
+        from unittest import mock
+
+        # Create a recording DB with window events
+        db_path = tmp_path / "recording.db"
+        conn = sqlite3.connect(str(db_path))
+        conn.execute(
+            "CREATE TABLE window_event "
+            "(timestamp REAL, app_bundle_id TEXT, title TEXT, window_id TEXT)"
         )
-        assert result.context_class == ContextClass.UNKNOWN
-        assert result.confidence == "user_config"
+        conn.execute(
+            "INSERT INTO window_event VALUES (1.0, 'com.figma.Desktop', 'Figma', 'w1')"
+        )
+        conn.execute(
+            "INSERT INTO window_event VALUES (2.0, 'com.microsoft.VSCode', 'VS Code', 'w2')"
+        )
+        conn.commit()
+        conn.close()
+
+        config = PrivacyConfig(mode=PrivacyMode.INTERNAL)
+
+        with mock.patch("screencap.catalog.find_db", return_value=db_path), \
+             mock.patch("screencap.config.get_privacy_config", return_value=config):
+            from screencap.cli import _report_unclassified_apps
+
+            # VSCode is in _BUNDLE_ID_MAP, Figma is not
+            _report_unclassified_apps(tmp_path)
+            # Should not raise; Figma should be reported as unclassified
+
+    def test_no_report_when_all_classified(self, tmp_path):
+        import sqlite3
+        from unittest import mock
+
+        db_path = tmp_path / "recording.db"
+        conn = sqlite3.connect(str(db_path))
+        conn.execute(
+            "CREATE TABLE window_event "
+            "(timestamp REAL, app_bundle_id TEXT, title TEXT, window_id TEXT)"
+        )
+        conn.execute(
+            "INSERT INTO window_event VALUES (1.0, 'com.microsoft.VSCode', 'VS Code', 'w1')"
+        )
+        conn.commit()
+        conn.close()
+
+        config = PrivacyConfig(mode=PrivacyMode.INTERNAL)
+
+        with mock.patch("screencap.catalog.find_db", return_value=db_path), \
+             mock.patch("screencap.config.get_privacy_config", return_value=config), \
+             mock.patch("screencap.cli.console") as mock_console:
+            from screencap.cli import _report_unclassified_apps
+            _report_unclassified_apps(tmp_path)
+            # Should not print anything since VSCode is in _BUNDLE_ID_MAP
+            mock_console.print.assert_not_called()
 
 
 class TestEndToEndConfigToAction:

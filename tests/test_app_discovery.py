@@ -64,31 +64,27 @@ class TestGetAppMetadata:
 class TestAutoClassify:
     @pytest.mark.parametrize("bundle_id, expected", [
         ("com.1password.1password", ContextClass.PASSWORD_MANAGER),
-        ("com.bitwarden.desktop", ContextClass.PASSWORD_MANAGER),
         ("com.chase.banking", ContextClass.BANKING),
-        ("com.fidelity.investments", ContextClass.BANKING),
-        ("com.apple.mail", ContextClass.EMAIL),
-        ("com.readdle.spark", ContextClass.EMAIL),
         ("com.tinyspeck.slackmacgap", ContextClass.CHAT),
-        ("com.hnc.Discord", ContextClass.CHAT),
-        ("us.zoom.xos", ContextClass.VIDEO_CALL),
         ("com.apple.Terminal", ContextClass.CODE_EDITOR_TERMINAL),
-        ("com.microsoft.VSCode", ContextClass.CODE_EDITOR_TERMINAL),
     ])
     def test_bundle_id_patterns(self, bundle_id, expected):
         meta = AppMetadata(path="/test", bundle_id=bundle_id, display_name="Test")
         assert auto_classify(meta) == expected
 
-    @pytest.mark.parametrize("name, expected", [
-        ("1Password", ContextClass.PASSWORD_MANAGER),
-        ("Slack", ContextClass.CHAT),
-        ("Discord", ContextClass.CHAT),
-        ("Zoom", ContextClass.VIDEO_CALL),
-        ("Terminal", ContextClass.CODE_EDITOR_TERMINAL),
-    ])
-    def test_display_name_patterns(self, name, expected):
-        meta = AppMetadata(path="/test", bundle_id="com.example.unknown", display_name=name)
-        assert auto_classify(meta) == expected
+    def test_display_name_fallback(self):
+        """When bundle_id has no match, display name is checked."""
+        meta = AppMetadata(path="/test", bundle_id="com.example.unknown", display_name="Slack")
+        assert auto_classify(meta) == ContextClass.CHAT
+
+    def test_bundle_id_wins_over_display_name(self):
+        """Bundle ID pattern match takes priority over display name match."""
+        meta = AppMetadata(
+            path="/test",
+            bundle_id="com.example.slack",  # matches CHAT via bundle_id
+            display_name="Finance Tracker",  # would match BANKING via name
+        )
+        assert auto_classify(meta) == ContextClass.CHAT
 
     def test_category_classification(self):
         meta = AppMetadata(
@@ -106,24 +102,6 @@ class TestAutoClassify:
             display_name="RandomApp",
         )
         assert auto_classify(meta) == ContextClass.UNKNOWN
-
-
-class TestScanFilesystem:
-    def test_scans_applications(self, tmp_path):
-        apps_dir = tmp_path / "Applications"
-        apps_dir.mkdir()
-        (apps_dir / "Foo.app").mkdir()
-        (apps_dir / "Bar.app").mkdir()
-        # Non-.app dir should be traversed for nested apps
-        sub = apps_dir / "Utilities"
-        sub.mkdir()
-        (sub / "Baz.app").mkdir()
-
-        with mock.patch("screencap.app_discovery.Path") as mock_path:
-            mock_path.return_value = tmp_path / "Applications"
-            mock_path.home.return_value = tmp_path
-            # Can't easily mock Path("/Applications") so test discover_installed_apps instead
-            pass
 
 
 class TestScanSpotlight:

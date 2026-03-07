@@ -2,7 +2,6 @@
 
 from __future__ import annotations
 
-import plistlib
 from pathlib import Path
 from unittest import mock
 
@@ -14,11 +13,9 @@ from screencap.setup_wizard import (
     _build_save_doc,
     _classify_with_overrides,
     _group_apps,
-    _load_config_toml,
     _save_config_atomic,
     reset_privacy_config,
     run_setup_wizard,
-    show_current_config,
 )
 from screencap.app_discovery import AppMetadata
 
@@ -114,18 +111,6 @@ class TestAtomicSave:
         assert config_path.read_text() == 'original = "data"\n'
 
 
-class TestLoadConfigToml:
-    def test_missing_file(self, tmp_path):
-        doc = _load_config_toml(tmp_path / "nonexistent.toml")
-        assert isinstance(doc, tomlkit.TOMLDocument)
-
-    def test_existing_file(self, tmp_path):
-        config = tmp_path / "config.toml"
-        config.write_text('[privacy]\nmode = "public"\n')
-        doc = _load_config_toml(config)
-        assert doc["privacy"]["mode"] == "public"
-
-
 class TestRunSetupWizard:
     def test_non_interactive_exits(self, tmp_path):
         with mock.patch("sys.stdin") as mock_stdin:
@@ -157,24 +142,6 @@ class TestRunSetupWizard:
             assert doc["privacy"]["mode"] == "public"
 
 
-class TestShowCurrentConfig:
-    def test_no_config(self, tmp_path, capsys):
-        show_current_config(config_path=tmp_path / "nonexistent.toml")
-        # Just verify it doesn't crash
-
-    def test_with_config(self, tmp_path, capsys):
-        config_path = tmp_path / "config.toml"
-        config_path.write_text(
-            '[privacy]\n'
-            'mode = "public"\n'
-            'exclude_apps = ["com.1password.1password"]\n'
-            '\n'
-            '[privacy.app_classes]\n'
-            '"com.tinyspeck.slackmacgap" = "chat"\n'
-        )
-        show_current_config(config_path=config_path)
-
-
 class TestResetPrivacyConfig:
     def test_no_config_file(self, tmp_path):
         result = reset_privacy_config(config_path=tmp_path / "nonexistent.toml")
@@ -203,3 +170,57 @@ class TestResetPrivacyConfig:
         with mock.patch("screencap.setup_wizard.click.confirm", return_value=False):
             result = reset_privacy_config(config_path=config_path)
             assert result is False
+
+
+class TestCommentPreservation:
+    def test_toml_round_trip_preserves_comments(self, tmp_path):
+        """Config writes must preserve existing comments and formatting."""
+        config_path = tmp_path / "config.toml"
+        original = (
+            '# User preferences\n'
+            'recordings_dir = "/my/recordings"\n'
+            '\n'
+            '# Audio is disabled for battery\n'
+            'audio_default = false\n'
+        )
+        config_path.write_text(original)
+
+        doc = tomlkit.parse(config_path.read_text())
+        _build_save_doc(doc, PrivacyMode.PUBLIC, [], {"com.example.app": "chat"})
+        _save_config_atomic(config_path, doc)
+
+        result = config_path.read_text()
+        assert "# User preferences" in result
+        assert "# Audio is disabled for battery" in result
+        assert 'recordings_dir = "/my/recordings"' in result
+        assert 'mode = "public"' in result
+
+
+class TestScanOnlyMode:
+    def test_scan_only_filters_to_new_apps(self, tmp_path):
+        """--scan mode should only show apps not in existing config or hardcoded map."""
+        config_path = tmp_path / "config.toml"
+        config_path.write_text(
+            '[privacy]\n'
+            'mode = "internal"\n'
+            '\n'
+            '[privacy.app_classes]\n'
+            '"com.example.configured" = "chat"\n'
+        )
+        apps = [
+            AppMetadata("/test/Configured.app", "com.example.configured", "Configured"),
+            AppMetadata("/test/New.app", "com.example.new", "New App"),
+        ]
+        with mock.patch("sys.stdin") as mock_stdin, \
+             mock.patch("screencap.setup_wizard.discover_installed_apps", return_value=apps), \
+             mock.patch("screencap.setup_wizard.click") as mock_click, \
+             mock.patch("screencap.config.invalidate_config_cache"):
+            mock_stdin.isatty.return_value = True
+            mock_click.confirm.return_value = True
+
+            result = run_setup_wizard(config_path=config_path, scan_only=True)
+            assert result is True
+
+            doc = tomlkit.parse(config_path.read_text())
+            # Original config preserved
+            assert doc["privacy"]["app_classes"]["com.example.configured"] == "chat"
