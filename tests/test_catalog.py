@@ -138,36 +138,21 @@ def test_find_db_returns_none(tmp_path):
 # --- read_intent tests ---
 
 
-def test_read_intent_cloud(tmp_path):
+@pytest.mark.parametrize("destination", ["cloud", "local"])
+def test_read_intent_returns_destination(tmp_path, destination):
     intent_path = tmp_path / ".recording_intent"
     intent_path.write_text(
         json.dumps(
             {
                 "version": 1,
-                "destination": "cloud",
+                "destination": destination,
                 "privacy_mode": "public",
                 "created_at": "2026-03-07T14:30:00Z",
                 "source": "flag",
             }
         )
     )
-    assert read_intent(tmp_path) == "cloud"
-
-
-def test_read_intent_local(tmp_path):
-    intent_path = tmp_path / ".recording_intent"
-    intent_path.write_text(
-        json.dumps(
-            {
-                "version": 1,
-                "destination": "local",
-                "privacy_mode": "internal",
-                "created_at": "2026-03-07T14:30:00Z",
-                "source": "flag",
-            }
-        )
-    )
-    assert read_intent(tmp_path) == "local"
+    assert read_intent(tmp_path) == destination
 
 
 def test_read_intent_missing(tmp_path):

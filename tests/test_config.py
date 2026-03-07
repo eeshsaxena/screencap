@@ -192,23 +192,12 @@ class TestUploadDefault:
         with mock.patch.dict(os.environ, env, clear=True):
             assert get_upload_default() == "ask"
 
-    def test_env_var_override(self):
+    @pytest.mark.parametrize("value,expected", [("cloud", "cloud"), ("local", "local"), ("ask", "ask")])
+    def test_env_var_valid_values(self, value, expected):
         from screencap.config import get_upload_default
 
-        with mock.patch.dict(os.environ, {"SCREENCAP_UPLOAD_DEFAULT": "cloud"}):
-            assert get_upload_default() == "cloud"
-
-    def test_env_var_local(self):
-        from screencap.config import get_upload_default
-
-        with mock.patch.dict(os.environ, {"SCREENCAP_UPLOAD_DEFAULT": "local"}):
-            assert get_upload_default() == "local"
-
-    def test_env_var_ask(self):
-        from screencap.config import get_upload_default
-
-        with mock.patch.dict(os.environ, {"SCREENCAP_UPLOAD_DEFAULT": "ask"}):
-            assert get_upload_default() == "ask"
+        with mock.patch.dict(os.environ, {"SCREENCAP_UPLOAD_DEFAULT": value}):
+            assert get_upload_default() == expected
 
     def test_env_var_invalid(self):
         from screencap.config import get_upload_default

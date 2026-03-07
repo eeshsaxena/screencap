@@ -1212,11 +1212,18 @@ def test_start_no_flag_non_interactive(tmp_path):
     assert kwargs["intent_source"] == "non_interactive_default"
 
 
-def test_start_cloud_and_local_exclusive():
-    """--cloud and --local are mutually exclusive (same Click destination)."""
+def test_start_cloud_and_local_last_wins(tmp_path):
+    """--cloud --local: last flag wins (Click flag_value semantics)."""
     runner = CliRunner()
-    result = runner.invoke(cli, ["start", "--name", "test", "--cloud", "--local"])
-    assert result.exit_code != 0
+    fake_dir = tmp_path / "test-rec"
+    fake_dir.mkdir()
+    with mock.patch("screencap.recorder.start_recording", return_value=(fake_dir, 42.0)) as mock_rec:
+        result = runner.invoke(cli, ["start", "--name", "test", "--cloud", "--local"])
+    assert result.exit_code == 0
+    _, kwargs = mock_rec.call_args
+    # Last flag (--local) wins
+    assert kwargs["force_mode"] is None
+    assert kwargs["cloud_intent"] is False
 
 
 def test_upload_skips_local_intent_in_all_mode(tmp_path):
