@@ -196,8 +196,8 @@ class TestRunSetupWizard:
             result = run_setup_wizard(config_path=tmp_path / "config.toml")
             assert result is False
 
-    def test_full_wizard_flow(self, tmp_path):
-        """Test wizard with auto-classified apps, user saves."""
+    def test_full_wizard_accept_all(self, tmp_path):
+        """Test wizard: user accepts all classifications and saves."""
         config_path = tmp_path / "config.toml"
         apps = [
             AppMetadata("/test/1Password.app", "com.1password.1password", "1Password"),
@@ -208,8 +208,8 @@ class TestRunSetupWizard:
              mock.patch("screencap.setup_wizard.click") as mock_click, \
              mock.patch("screencap.config.invalidate_config_cache"):
             mock_stdin.isatty.return_value = True
-            # Mode choice = 1 (public), then confirm save
-            mock_click.prompt.return_value = 1
+            # Mode=1 (public), then "" (Enter to accept), then confirm save
+            mock_click.prompt.side_effect = [1, ""]
             mock_click.confirm.return_value = True
 
             result = run_setup_wizard(config_path=config_path)
@@ -220,7 +220,7 @@ class TestRunSetupWizard:
             assert doc["privacy"]["mode"] == "public"
 
     def test_wizard_saves_allow_apps(self, tmp_path):
-        """Test that auto-allowed apps end up in allow_apps config."""
+        """Auto-allowed apps end up in allow_apps config."""
         config_path = tmp_path / "config.toml"
         apps = [
             AppMetadata("/test/Preview.app", "com.apple.Preview", "Preview"),
@@ -230,7 +230,7 @@ class TestRunSetupWizard:
              mock.patch("screencap.setup_wizard.click") as mock_click, \
              mock.patch("screencap.config.invalidate_config_cache"):
             mock_stdin.isatty.return_value = True
-            mock_click.prompt.return_value = 2  # mode=internal
+            mock_click.prompt.side_effect = [2, ""]  # mode=internal, accept all
             mock_click.confirm.return_value = True
 
             result = run_setup_wizard(config_path=config_path)
@@ -239,8 +239,8 @@ class TestRunSetupWizard:
             doc = tomlkit.parse(config_path.read_text())
             assert "com.apple.Preview" in doc["privacy"]["allow_apps"]
 
-    def test_wizard_unclassified_allow(self, tmp_path):
-        """Unclassified app that user allows goes to allow_apps."""
+    def test_wizard_unclassified_goes_to_allow(self, tmp_path):
+        """Unclassified apps the user doesn't touch go to allow_apps on accept."""
         config_path = tmp_path / "config.toml"
         apps = [
             AppMetadata("/test/Figma.app", "com.figma.desktop", "Figma"),
@@ -250,8 +250,7 @@ class TestRunSetupWizard:
              mock.patch("screencap.setup_wizard.click") as mock_click, \
              mock.patch("screencap.config.invalidate_config_cache"):
             mock_stdin.isatty.return_value = True
-            # Mode choice = 2, then "a" for allow on unclassified, then save
-            mock_click.prompt.side_effect = [2, "a"]
+            mock_click.prompt.side_effect = [2, ""]  # mode, accept all
             mock_click.confirm.return_value = True
 
             result = run_setup_wizard(config_path=config_path)
@@ -260,25 +259,25 @@ class TestRunSetupWizard:
             doc = tomlkit.parse(config_path.read_text())
             assert "com.figma.desktop" in doc["privacy"]["allow_apps"]
 
-    def test_wizard_unclassified_block(self, tmp_path):
-        """Unclassified app that user blocks goes to exclude_apps."""
+    def test_wizard_blocked_goes_to_exclude(self, tmp_path):
+        """Blocked apps end up in exclude_apps config."""
         config_path = tmp_path / "config.toml"
         apps = [
-            AppMetadata("/test/Figma.app", "com.figma.desktop", "Figma"),
+            AppMetadata("/test/1Password.app", "com.1password.1password", "1Password"),
         ]
         with mock.patch("sys.stdin") as mock_stdin, \
              mock.patch("screencap.setup_wizard.discover_installed_apps", return_value=apps), \
              mock.patch("screencap.setup_wizard.click") as mock_click, \
              mock.patch("screencap.config.invalidate_config_cache"):
             mock_stdin.isatty.return_value = True
-            mock_click.prompt.side_effect = [2, "b"]
+            mock_click.prompt.side_effect = [2, ""]  # mode, accept all
             mock_click.confirm.return_value = True
 
             result = run_setup_wizard(config_path=config_path)
             assert result is True
 
             doc = tomlkit.parse(config_path.read_text())
-            assert "com.figma.desktop" in doc["privacy"]["exclude_apps"]
+            assert "com.1password.1password" in doc["privacy"]["exclude_apps"]
 
 
 class TestResetPrivacyConfig:
@@ -356,16 +355,14 @@ class TestScanOnlyMode:
              mock.patch("screencap.setup_wizard.click") as mock_click, \
              mock.patch("screencap.config.invalidate_config_cache"):
             mock_stdin.isatty.return_value = True
-            mock_click.prompt.side_effect = ["a"]  # allow the new app
+            mock_click.prompt.side_effect = [""]  # accept all
             mock_click.confirm.return_value = True
 
             result = run_setup_wizard(config_path=config_path, scan_only=True)
             assert result is True
 
             doc = tomlkit.parse(config_path.read_text())
-            # Original config preserved
             assert doc["privacy"]["app_classes"]["com.example.configured"] == "chat"
-            # New unknown app added to allow_apps
             assert "com.example.new" in doc["privacy"]["allow_apps"]
 
     def test_scan_only_all_classified(self, tmp_path):
@@ -376,11 +373,11 @@ class TestScanOnlyMode:
             'mode = "internal"\n'
         )
         apps = [
-            AppMetadata("/test/Preview.app", "com.apple.Preview", "Preview"),  # auto-classified
+            AppMetadata("/test/Preview.app", "com.apple.Preview", "Preview"),
         ]
         with mock.patch("sys.stdin") as mock_stdin, \
              mock.patch("screencap.setup_wizard.discover_installed_apps", return_value=apps), \
              mock.patch("screencap.setup_wizard.click") as mock_click:
             mock_stdin.isatty.return_value = True
             result = run_setup_wizard(config_path=config_path, scan_only=True)
-            assert result is False  # nothing new to review
+            assert result is False
