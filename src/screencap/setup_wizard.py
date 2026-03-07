@@ -306,6 +306,13 @@ def _run_tui(
         cursor = 0
         scroll = 0
 
+        # Start cursor on "Needs your input" group if it exists
+        init_items = _build_items(groups, expanded)
+        for idx, item in enumerate(init_items):
+            if item[0] == "group" and item[1] == "unclassified":
+                cursor = idx
+                break
+
         while True:
             stdscr.erase()
             h, w = stdscr.getmaxyx()
