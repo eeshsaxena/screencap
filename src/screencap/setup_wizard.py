@@ -1,8 +1,7 @@
 """Privacy setup wizard — interactive app classification and config persistence.
 
 Called by `screencap setup`. Discovers installed apps, auto-classifies them,
-presents grouped summary for user review (approve-by-exception), and saves
-to ~/.screencap/config.toml.
+presents grouped summary for user review, and saves to ~/.screencap/config.toml.
 
 Config writes are atomic (temp file + os.rename) and preserve existing
 non-privacy sections and comments via tomlkit.
@@ -61,20 +60,18 @@ _SAFE_SOURCES = frozenset({
     "category_safe",
 })
 
-# Human-friendly group labels (only groups shown to the user)
-_GROUP_LABELS = {
-    "blocked": "Blocked",
-    "communication": "Communication",
-    "code": "Code & Terminals",
-    "needs_review": "Needs review",
-}
-
-# Short target names for the edit command
-_MOVE_TARGETS = {
-    "block": "blocked",
-    "allow": "needs_review",  # move to needs_review = implicitly allowed on accept
-    "comm": "communication",
-    "code": "code",
+# Human-friendly class label
+_CLASS_LABELS: dict[ContextClass, str] = {
+    ContextClass.PASSWORD_MANAGER: "password manager",
+    ContextClass.BANKING: "banking",
+    ContextClass.EMAIL: "email",
+    ContextClass.CHAT: "chat",
+    ContextClass.CALENDAR: "calendar",
+    ContextClass.VIDEO_CALL: "video call",
+    ContextClass.BROWSER_UNVERIFIED: "browser",
+    ContextClass.CODE_EDITOR_TERMINAL: "code editor",
+    ContextClass.ADMIN_CONSOLE: "admin console",
+    ContextClass.UNKNOWN: "unknown",
 }
 
 
@@ -126,8 +123,8 @@ def _group_apps(
     groups: dict[str, list[tuple[AppMetadata, ContextClass, str]]] = {
         "blocked": [],
         "communication": [],
-        "code": [],
-        "needs_review": [],
+        "safe": [],
+        "unclassified": [],
     }
     auto_allowed: list[tuple[AppMetadata, ContextClass, str]] = []
 
@@ -142,9 +139,9 @@ def _group_apps(
         elif cls in _COMM_CLASSES:
             groups["communication"].append((meta, cls, source))
         elif cls in _CODE_CLASSES:
-            groups["code"].append((meta, cls, source))
+            groups["safe"].append((meta, cls, source))
         elif source == "unknown":
-            groups["needs_review"].append((meta, cls, source))
+            groups["unclassified"].append((meta, cls, source))
         else:
             # known_app, apple_sensitive, pattern_rule, category_map
             # that don't map to a specific sensitive class -> auto-allow
@@ -156,143 +153,86 @@ def _group_apps(
     return groups, auto_allowed
 
 
-def _print_grouped_summary(
+def _display_and_review(
     groups: dict[str, list[tuple[AppMetadata, ContextClass, str]]],
     auto_allowed_count: int,
-) -> None:
-    """Print grouped classification summary."""
-    visible = sum(len(g) for g in groups.values())
-    console.print(f"\n{visible} apps to review:\n")
+) -> dict[str, ContextClass]:
+    """Display classified apps and interactively review unclassified ones.
 
-    for key, label in _GROUP_LABELS.items():
-        apps = groups.get(key, [])
-        if not apps:
-            continue
-        names = [a.display_name for a, _, _ in apps]
-        preview = ", ".join(names[:5])
-        if len(names) > 5:
-            preview += f"... (+{len(names) - 5} more)"
-        console.print(f"  [bold]{label} ({len(apps)} apps):[/bold] {preview}")
+    Returns: dict of bundle_id -> ContextClass for user decisions on
+    unclassified apps. UNKNOWN = allow, PASSWORD_MANAGER = block.
+    """
+    visible = sum(len(g) for g in groups.values())
+    console.print(
+        f"\nFound {visible} apps on your system. "
+        "Here's how they've been classified:\n"
+    )
+
+    # Column width for alignment
+    max_name = 24
+
+    # Blocked group
+    blocked = groups.get("blocked", [])
+    if blocked:
+        console.print("  [bold]Always blocked (sensitive):[/bold]")
+        for meta, cls, _source in blocked:
+            label = _CLASS_LABELS.get(cls, cls.value)
+            name = meta.display_name[:max_name].ljust(max_name)
+            console.print(f"    [red]×[/red] {name} [dim]({label})[/dim]")
+        console.print()
+
+    # Communication group
+    comm = groups.get("communication", [])
+    if comm:
+        console.print("  [bold]Communication (masked in public mode):[/bold]")
+        for meta, cls, _source in comm:
+            label = _CLASS_LABELS.get(cls, cls.value)
+            name = meta.display_name[:max_name].ljust(max_name)
+            console.print(f"    [yellow]~[/yellow] {name} [dim]({label})[/dim]")
+        console.print()
+
+    # Safe / code group
+    safe = groups.get("safe", [])
+    if safe:
+        console.print("  [bold]Safe (captured normally):[/bold]")
+        for meta, cls, _source in safe:
+            label = _CLASS_LABELS.get(cls, cls.value)
+            name = meta.display_name[:max_name].ljust(max_name)
+            console.print(f"    [green]✓[/green] {name} [dim]({label})[/dim]")
+        console.print()
 
     if auto_allowed_count > 0:
         console.print(
-            f"\n  [dim]({auto_allowed_count} safe apps auto-allowed, not shown)[/dim]"
+            f"  [dim]({auto_allowed_count} system/utility apps auto-allowed, not shown)[/dim]\n"
         )
 
+    # Unclassified — interactive
+    unclassified = groups.get("unclassified", [])
+    user_decisions: dict[str, ContextClass] = {}
 
-def _approve_or_edit(
-    groups: dict[str, list[tuple[AppMetadata, ContextClass, str]]],
-    auto_allowed_count: int,
-) -> dict[str, list[tuple[AppMetadata, ContextClass, str]]]:
-    """Approve-by-exception editing loop.
+    if unclassified:
+        console.print(f"  [bold]Unclassified ({len(unclassified)} apps):[/bold]")
 
-    Returns updated groups after user edits.
-    """
-    while True:
-        _print_grouped_summary(groups, auto_allowed_count)
+        for meta, cls, _source in unclassified:
+            name = meta.display_name[:max_name].ljust(max_name)
+            choice = click.prompt(
+                f"    [blue]?[/blue] {name}",
+                type=click.Choice(["a", "b", "s"], case_sensitive=False),
+                default="a",
+                prompt_suffix=" [a=allow / b=block / s=skip]: ",
+                show_choices=False,
+            )
+            if choice.lower() == "b":
+                user_decisions[meta.bundle_id] = ContextClass.PASSWORD_MANAGER
+                console.print(f"      [red]→ blocked[/red]")
+            elif choice.lower() == "a":
+                user_decisions[meta.bundle_id] = ContextClass.UNKNOWN
+                console.print(f"      [green]→ allowed[/green]")
+            # skip: not added to decisions
 
         console.print()
-        choice = click.prompt(
-            "Looks good?",
-            type=click.Choice(["Y", "e"], case_sensitive=False),
-            default="Y",
-            prompt_suffix=" [Y to accept, e to edit]: ",
-        )
 
-        if choice.lower() == "y":
-            return groups
-
-        # Edit mode: show group menu
-        group_keys = [k for k in _GROUP_LABELS if groups.get(k)]
-        if not group_keys:
-            console.print("  [dim]No groups to edit.[/dim]")
-            return groups
-
-        console.print("\nEdit groups:")
-        for i, key in enumerate(group_keys, 1):
-            label = _GROUP_LABELS[key]
-            count = len(groups[key])
-            console.print(f"  {i}. {label} ({count} apps)")
-
-        group_choice = click.prompt(
-            "\nSelect group",
-            type=click.IntRange(1, len(group_keys)),
-            default=None,
-            prompt_suffix=f" [1-{len(group_keys)}, q to go back]: ",
-        )
-
-        selected_key = group_keys[group_choice - 1]
-        _edit_group(groups, selected_key)
-
-
-def _edit_group(
-    groups: dict[str, list[tuple[AppMetadata, ContextClass, str]]],
-    group_key: str,
-) -> None:
-    """Let user move apps between groups within a selected group."""
-    while True:
-        apps = groups[group_key]
-        label = _GROUP_LABELS[group_key]
-        console.print(f"\n{label} ({len(apps)} apps):")
-        for i, (meta, cls, source) in enumerate(apps, 1):
-            console.print(f"  {i}. {meta.display_name}")
-
-        console.print(
-            "\n  [dim]Enter '<number> <target>' to move (e.g. '5 block'), "
-            "or 'q' to go back.[/dim]"
-        )
-        console.print(
-            "  [dim]Targets: block, allow, comm, code[/dim]"
-        )
-
-        raw = click.prompt("  >", default="q", prompt_suffix=" ")
-        if raw.strip().lower() == "q":
-            return
-
-        parts = raw.strip().split(None, 1)
-        if len(parts) != 2:
-            console.print("  [red]Invalid. Use '<number> <target>', e.g. '5 block'[/red]")
-            continue
-
-        try:
-            idx = int(parts[0])
-        except ValueError:
-            console.print("  [red]Invalid number.[/red]")
-            continue
-
-        if idx < 1 or idx > len(apps):
-            console.print(f"  [red]Number must be 1-{len(apps)}.[/red]")
-            continue
-
-        target = parts[1].lower()
-        if target not in _MOVE_TARGETS:
-            console.print(f"  [red]Invalid target. Use: {', '.join(_MOVE_TARGETS)}[/red]")
-            continue
-
-        target_key = _MOVE_TARGETS[target]
-        if target_key == group_key:
-            console.print("  [dim]Already in that group.[/dim]")
-            continue
-
-        # Move the app
-        moved = apps.pop(idx - 1)
-        meta, old_cls, source = moved
-
-        # Assign appropriate ContextClass for the target group
-        if target_key == "blocked":
-            new_cls = ContextClass.PASSWORD_MANAGER
-        elif target_key == "communication":
-            new_cls = ContextClass.CHAT
-        elif target_key == "code":
-            new_cls = ContextClass.CODE_EDITOR_TERMINAL
-        else:  # needs_review (allowed on accept)
-            new_cls = ContextClass.UNKNOWN
-
-        groups[target_key].append((meta, new_cls, "user_edit"))
-        groups[target_key].sort(key=lambda x: x[0].display_name.lower())
-        console.print(
-            f"  Moved '{meta.display_name}' to {_GROUP_LABELS[target_key]}"
-        )
+    return user_decisions
 
 
 def _load_config_toml(config_path: Path) -> tomlkit.TOMLDocument:
@@ -407,10 +347,10 @@ def run_setup_wizard(
         except ValueError:
             mode = PrivacyMode.INTERNAL
     else:
-        console.print("\nWelcome to ScreenCap privacy setup.\n")
-        console.print("Privacy mode determines how aggressively apps are protected:")
-        console.print("  1. Public   — strictest, blocks sensitive apps, masks communication")
-        console.print("  2. Internal — permissive, captures most apps normally\n")
+        console.print("\nWelcome to ScreenCap! Let's configure your privacy settings.\n")
+        console.print("Privacy mode:")
+        console.print("  1. Public   — strictest, for sharing publicly")
+        console.print("  2. Internal — permissive, for personal use\n")
         mode_choice = click.prompt("  Choice", type=click.IntRange(1, 2), default=2)
         mode = PrivacyMode.PUBLIC if mode_choice == 1 else PrivacyMode.INTERNAL
 
@@ -441,8 +381,8 @@ def run_setup_wizard(
 
     groups, auto_allowed = _group_apps(classified)
 
-    # Approve-or-edit loop
-    groups = _approve_or_edit(groups, len(auto_allowed))
+    # Display and review
+    user_decisions = _display_and_review(groups, len(auto_allowed))
 
     # Build final config from groups
     final_exclude: list[str] = sorted(existing_exclude)
@@ -473,24 +413,38 @@ def run_setup_wizard(
         if bid in final_allow:
             final_allow.remove(bid)
 
-    for meta, cls, source in groups.get("code", []):
+    for meta, cls, source in groups.get("safe", []):
         bid = meta.bundle_id
         if bid not in existing_ac and bid not in _BUNDLE_ID_MAP:
             final_app_classes[bid] = cls.value
         if bid in final_allow:
             final_allow.remove(bid)
 
-    # needs_review apps are implicitly accepted as safe (user saw them and hit Y)
-    for meta, cls, source in groups.get("needs_review", []):
+    # Unclassified: apply user decisions
+    for meta, cls, source in groups.get("unclassified", []):
         bid = meta.bundle_id
-        if bid not in final_allow and bid not in final_exclude:
-            final_allow.append(bid)
+        if bid in user_decisions:
+            decision = user_decisions[bid]
+            if decision in _BLOCKED_CLASSES:
+                if bid not in final_exclude:
+                    final_exclude.append(bid)
+                final_app_classes.pop(bid, None)
+                if bid in final_allow:
+                    final_allow.remove(bid)
+            else:
+                # allowed
+                if bid not in final_allow and bid not in final_exclude:
+                    final_allow.append(bid)
+        else:
+            # skipped — still add to allow_apps (user saw it, didn't block)
+            if bid not in final_allow and bid not in final_exclude:
+                final_allow.append(bid)
 
     final_exclude.sort()
     final_allow.sort()
 
     # Save
-    if not click.confirm("\n  Save to config?", default=True):
+    if not click.confirm("\n  Save these preferences?", default=True):
         console.print("  [dim]Setup cancelled, no changes saved.[/dim]")
         return False
 

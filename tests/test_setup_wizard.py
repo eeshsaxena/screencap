@@ -79,8 +79,8 @@ class TestGroupApps:
         groups, auto_allowed = _group_apps(classified)
         assert len(groups["blocked"]) == 1
         assert len(groups["communication"]) == 1
-        assert len(groups["code"]) == 1
-        assert len(groups["needs_review"]) == 1
+        assert len(groups["safe"]) == 1
+        assert len(groups["unclassified"]) == 1
 
     def test_apple_prefix_auto_allowed(self):
         """Apple prefix apps are auto-allowed, not shown in groups."""
@@ -90,7 +90,6 @@ class TestGroupApps:
         }
         groups, auto_allowed = _group_apps(classified)
         assert len(auto_allowed) == 2
-        # Not in any visible group
         assert all(len(g) == 0 for g in groups.values())
 
     def test_category_safe_auto_allowed(self):
@@ -112,7 +111,7 @@ class TestGroupApps:
         groups, auto_allowed = _group_apps(classified)
         assert len(auto_allowed) == 1
         assert auto_allowed[0][0].bundle_id == "com.example.agent"
-        assert len(groups["needs_review"]) == 1
+        assert len(groups["unclassified"]) == 1
 
     def test_background_detected_by_name_pattern(self):
         """Apps with service-like names are detected as background even without plist flag."""
@@ -124,6 +123,14 @@ class TestGroupApps:
         }
         groups, auto_allowed = _group_apps(classified)
         assert len(auto_allowed) == 1
+
+    def test_code_editors_go_to_safe_group(self):
+        classified = {
+            "com.microsoft.VSCode": (_make_app("com.microsoft.VSCode", "VS Code"), ContextClass.CODE_EDITOR_TERMINAL, "known_app"),
+        }
+        groups, auto_allowed = _group_apps(classified)
+        assert len(groups["safe"]) == 1
+        assert groups["safe"][0][0].display_name == "VS Code"
 
 
 class TestBuildSaveDoc:
@@ -190,7 +197,7 @@ class TestRunSetupWizard:
             assert result is False
 
     def test_full_wizard_flow(self, tmp_path):
-        """Test wizard with auto-classified apps, user accepts and saves."""
+        """Test wizard with auto-classified apps, user saves."""
         config_path = tmp_path / "config.toml"
         apps = [
             AppMetadata("/test/1Password.app", "com.1password.1password", "1Password"),
@@ -201,8 +208,8 @@ class TestRunSetupWizard:
              mock.patch("screencap.setup_wizard.click") as mock_click, \
              mock.patch("screencap.config.invalidate_config_cache"):
             mock_stdin.isatty.return_value = True
-            # Mode choice = 1 (public), then "Y" to accept, then confirm save
-            mock_click.prompt.side_effect = [1, "Y"]
+            # Mode choice = 1 (public), then confirm save
+            mock_click.prompt.return_value = 1
             mock_click.confirm.return_value = True
 
             result = run_setup_wizard(config_path=config_path)
@@ -213,7 +220,7 @@ class TestRunSetupWizard:
             assert doc["privacy"]["mode"] == "public"
 
     def test_wizard_saves_allow_apps(self, tmp_path):
-        """Test that safe apps end up in allow_apps config."""
+        """Test that auto-allowed apps end up in allow_apps config."""
         config_path = tmp_path / "config.toml"
         apps = [
             AppMetadata("/test/Preview.app", "com.apple.Preview", "Preview"),
@@ -223,7 +230,7 @@ class TestRunSetupWizard:
              mock.patch("screencap.setup_wizard.click") as mock_click, \
              mock.patch("screencap.config.invalidate_config_cache"):
             mock_stdin.isatty.return_value = True
-            mock_click.prompt.side_effect = [2, "Y"]  # mode=internal, accept
+            mock_click.prompt.return_value = 2  # mode=internal
             mock_click.confirm.return_value = True
 
             result = run_setup_wizard(config_path=config_path)
@@ -231,6 +238,47 @@ class TestRunSetupWizard:
 
             doc = tomlkit.parse(config_path.read_text())
             assert "com.apple.Preview" in doc["privacy"]["allow_apps"]
+
+    def test_wizard_unclassified_allow(self, tmp_path):
+        """Unclassified app that user allows goes to allow_apps."""
+        config_path = tmp_path / "config.toml"
+        apps = [
+            AppMetadata("/test/Figma.app", "com.figma.desktop", "Figma"),
+        ]
+        with mock.patch("sys.stdin") as mock_stdin, \
+             mock.patch("screencap.setup_wizard.discover_installed_apps", return_value=apps), \
+             mock.patch("screencap.setup_wizard.click") as mock_click, \
+             mock.patch("screencap.config.invalidate_config_cache"):
+            mock_stdin.isatty.return_value = True
+            # Mode choice = 2, then "a" for allow on unclassified, then save
+            mock_click.prompt.side_effect = [2, "a"]
+            mock_click.confirm.return_value = True
+
+            result = run_setup_wizard(config_path=config_path)
+            assert result is True
+
+            doc = tomlkit.parse(config_path.read_text())
+            assert "com.figma.desktop" in doc["privacy"]["allow_apps"]
+
+    def test_wizard_unclassified_block(self, tmp_path):
+        """Unclassified app that user blocks goes to exclude_apps."""
+        config_path = tmp_path / "config.toml"
+        apps = [
+            AppMetadata("/test/Figma.app", "com.figma.desktop", "Figma"),
+        ]
+        with mock.patch("sys.stdin") as mock_stdin, \
+             mock.patch("screencap.setup_wizard.discover_installed_apps", return_value=apps), \
+             mock.patch("screencap.setup_wizard.click") as mock_click, \
+             mock.patch("screencap.config.invalidate_config_cache"):
+            mock_stdin.isatty.return_value = True
+            mock_click.prompt.side_effect = [2, "b"]
+            mock_click.confirm.return_value = True
+
+            result = run_setup_wizard(config_path=config_path)
+            assert result is True
+
+            doc = tomlkit.parse(config_path.read_text())
+            assert "com.figma.desktop" in doc["privacy"]["exclude_apps"]
 
 
 class TestResetPrivacyConfig:
@@ -308,7 +356,7 @@ class TestScanOnlyMode:
              mock.patch("screencap.setup_wizard.click") as mock_click, \
              mock.patch("screencap.config.invalidate_config_cache"):
             mock_stdin.isatty.return_value = True
-            mock_click.prompt.side_effect = ["Y"]  # accept
+            mock_click.prompt.side_effect = ["a"]  # allow the new app
             mock_click.confirm.return_value = True
 
             result = run_setup_wizard(config_path=config_path, scan_only=True)
@@ -317,7 +365,7 @@ class TestScanOnlyMode:
             doc = tomlkit.parse(config_path.read_text())
             # Original config preserved
             assert doc["privacy"]["app_classes"]["com.example.configured"] == "chat"
-            # New unknown app added to allow_apps (accepted by user)
+            # New unknown app added to allow_apps
             assert "com.example.new" in doc["privacy"]["allow_apps"]
 
     def test_scan_only_all_classified(self, tmp_path):
