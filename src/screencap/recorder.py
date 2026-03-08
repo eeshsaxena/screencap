@@ -675,25 +675,55 @@ def start_recording(
             ]
             write_pidfile(capture_dir, child_pids)
 
+            # Store raw PIDs for signal-safe force-exit (avoids
+            # multiprocessing._children_lock which can deadlock in a handler).
+            _child_pids = [child.pid for child in multiprocessing.active_children()]
+
             # --- SIGINT handler (flag-based, no console.print inside) ---
             _ctrl_c_count = 0
 
             def _force_exit(sig, frame):
                 nonlocal _ctrl_c_count, _stop_reason
                 _ctrl_c_count += 1
+
                 if _ctrl_c_count == 1:
                     _stop_reason = "graceful"
                     _stop_event.set()
                     recorder.stop()
-                else:
-                    _stop_reason = "force"
-                    _stop_event.set()
-                    for child in multiprocessing.active_children():
-                        child.terminate()
-                    time.sleep(1)
-                    for child in multiprocessing.active_children():
-                        child.kill()
-                    sys.exit(1)
+                    return
+
+                # 3rd+ Ctrl+C: exit immediately, no waiting
+                if _ctrl_c_count > 2:
+                    os._exit(1)
+
+                # 2nd Ctrl+C: force-quit path
+                _stop_reason = "force"
+                _stop_event.set()
+
+                # Kill children using stored PIDs (signal-safe)
+                for pid in _child_pids:
+                    try:
+                        os.kill(pid, signal.SIGTERM)
+                    except (ProcessLookupError, PermissionError):
+                        pass
+                time.sleep(1)
+                for pid in _child_pids:
+                    try:
+                        os.kill(pid, signal.SIGKILL)
+                    except (ProcessLookupError, PermissionError):
+                        pass
+
+                # Essential cleanup that os._exit would skip
+                try:
+                    delete_pidfile()
+                except Exception:
+                    pass
+                if _saved_stdout is not None:
+                    sys.stdout = _saved_stdout
+                if _saved_stderr is not None:
+                    sys.stderr = _saved_stderr
+
+                os._exit(1)
 
             signal.signal(signal.SIGINT, _force_exit)
 
