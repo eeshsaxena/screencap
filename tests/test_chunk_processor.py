@@ -2,10 +2,11 @@
 
 from __future__ import annotations
 
+import json
 import multiprocessing
 import time
 from pathlib import Path
-from unittest.mock import patch
+from unittest.mock import MagicMock, patch
 
 import pytest
 
@@ -108,3 +109,297 @@ def test_all_chunks_uploaded_empty_returns_false(capture_dir):
         upload_enabled=False, auto_delete=False,
     )
     assert cp.all_chunks_uploaded() is False
+
+
+# ---------------------------------------------------------------------------
+# Cloud-intent scrubbing tests
+# ---------------------------------------------------------------------------
+
+
+@pytest.fixture
+def cloud_capture_dir(tmp_path):
+    """Capture dir with recording.db including window_event table."""
+    import sqlite3
+
+    db_path = tmp_path / "recording.db"
+    conn = sqlite3.connect(str(db_path))
+    conn.execute(
+        "CREATE TABLE action_event ("
+        "id INTEGER PRIMARY KEY, timestamp REAL, name TEXT, "
+        "key_char TEXT, key_name TEXT, key_vk TEXT, "
+        "canonical_key_char TEXT, canonical_key_name TEXT, canonical_key_vk TEXT, "
+        "text TEXT, element_state TEXT, "
+        "active_segment_description TEXT, available_segment_descriptions TEXT)"
+    )
+    conn.execute(
+        "CREATE TABLE window_event ("
+        "id INTEGER PRIMARY KEY, timestamp REAL, title TEXT, "
+        "app_bundle_id TEXT, window_id TEXT)"
+    )
+    conn.execute(
+        "CREATE TABLE recording (id INTEGER PRIMARY KEY, timestamp REAL)"
+    )
+    conn.execute("INSERT INTO recording VALUES (1, 1000.0)")
+    conn.commit()
+    conn.close()
+    return tmp_path
+
+
+def _make_mock_pipeline():
+    """Create a mock pipeline/anonymizer that detects 'John Smith' as PERSON."""
+    from screencap.privacy import Anonymizer, Detection, DetectionResult
+
+    pipeline = MagicMock()
+
+    def mock_detect(text):
+        detections = []
+        idx = text.find("John Smith")
+        while idx != -1:
+            detections.append(Detection(
+                entity_type="PERSON",
+                start=idx,
+                end=idx + 10,
+                score=0.95,
+                source="test",
+            ))
+            idx = text.find("John Smith", idx + 10)
+        return DetectionResult(text, detections)
+
+    pipeline.detect = mock_detect
+    anonymizer = Anonymizer()
+    return pipeline, anonymizer
+
+
+@pytest.fixture
+def cloud_processor(cloud_capture_dir):
+    """ChunkProcessor with mock pipeline for cloud-intent scrubbing tests."""
+    from screencap.chunk_processor import ChunkProcessor
+
+    q = multiprocessing.Queue()
+    ack_q = multiprocessing.Queue()
+
+    cp = ChunkProcessor(
+        cloud_capture_dir, q, ack_q, recording_name="test",
+        upload_enabled=False, auto_delete=False,
+        cloud_intent=True,
+    )
+
+    pipeline, anonymizer = _make_mock_pipeline()
+    cp._pipeline = pipeline
+    cp._anonymizer = anonymizer
+    return cp
+
+
+class TestCloudIntentGating:
+    """Test that cloud-intent recordings gate media uploads."""
+
+    def test_collect_chunk_files_gates_media_by_cloud_intent(self, cloud_capture_dir):
+        """Cloud-intent excludes .mp4/.flac; non-cloud includes all."""
+        from screencap.chunk_processor import ChunkProcessor
+
+        q = multiprocessing.Queue()
+        ack_q = multiprocessing.Queue()
+
+        (cloud_capture_dir / "chunk_0000.mp4").write_bytes(b"video data")
+        (cloud_capture_dir / "audio_0000.flac").write_bytes(b"audio data")
+        (cloud_capture_dir / "events_0000.jsonl").write_text('{"name":"click"}\n')
+        (cloud_capture_dir / "chunk_0000_manifest.json").write_text('{}')
+
+        # Cloud-intent: text only
+        cp_cloud = ChunkProcessor(
+            cloud_capture_dir, q, ack_q, recording_name="test",
+            upload_enabled=False, auto_delete=False, cloud_intent=True,
+        )
+        cloud_names = [f["name"] for f in cp_cloud._collect_chunk_files(0, None)]
+        assert "chunk_0000.mp4" not in cloud_names
+        assert "audio_0000.flac" not in cloud_names
+        assert "events_0000.jsonl" in cloud_names
+        assert "chunk_0000_manifest.json" in cloud_names
+
+        # Non-cloud: everything
+        cp_local = ChunkProcessor(
+            cloud_capture_dir, q, ack_q, recording_name="test",
+            upload_enabled=False, auto_delete=False, cloud_intent=False,
+        )
+        local_names = [f["name"] for f in cp_local._collect_chunk_files(0, None)]
+        assert "chunk_0000.mp4" in local_names
+        assert "audio_0000.flac" in local_names
+
+    def test_checkpoint_and_upload_db_skips_for_cloud_intent(self, cloud_capture_dir):
+        """checkpoint_and_upload_db must skip upload for cloud-intent."""
+        from screencap.chunk_processor import checkpoint_and_upload_db
+
+        result = checkpoint_and_upload_db(
+            cloud_capture_dir, "test", cloud_intent=True,
+        )
+        assert result is True  # returns True (success) without uploading
+
+    def test_pipeline_init_failure_disables_uploads(self, cloud_capture_dir):
+        """If privacy deps fail to import, uploads must be disabled (fail-closed)."""
+        from screencap.chunk_processor import ChunkProcessor
+
+        q = multiprocessing.Queue()
+        ack_q = multiprocessing.Queue()
+
+        with patch(
+            "screencap.privacy.create_default_pipeline",
+            side_effect=ImportError("test: no privacy deps"),
+        ):
+            cp = ChunkProcessor(
+                cloud_capture_dir, q, ack_q, recording_name="test",
+                upload_enabled=True, auto_delete=False,
+                cloud_intent=True,
+            )
+            assert cp._upload_enabled is False
+            assert cp._pipeline is None
+
+    def test_non_cloud_skips_pipeline_init(self, cloud_capture_dir):
+        """Non-cloud recordings must not initialize the scrubbing pipeline."""
+        from screencap.chunk_processor import ChunkProcessor
+
+        q = multiprocessing.Queue()
+        ack_q = multiprocessing.Queue()
+
+        cp = ChunkProcessor(
+            cloud_capture_dir, q, ack_q, recording_name="test",
+            upload_enabled=True, auto_delete=False,
+            cloud_intent=False,
+        )
+        assert cp._pipeline is None
+        assert cp._anonymizer is None
+
+
+class TestInlineScrubbing:
+    """Test inline scrubbing of text surfaces."""
+
+    def test_scrub_events_jsonl_nulls_pii_keystrokes(self, cloud_capture_dir, cloud_processor):
+        """Keystroke content fields must be nulled when PII is detected in combined text."""
+        events = []
+        for ch in "John Smith":
+            events.append({
+                "name": "key.down",
+                "timestamp": 1000.0 + len(events),
+                "key_char": ch,
+                "canonical_key_char": ch,
+            })
+
+        events_path = cloud_capture_dir / "events_0000.jsonl"
+        with open(events_path, "w") as f:
+            for evt in events:
+                f.write(json.dumps(evt) + "\n")
+
+        cloud_processor._scrub_events_jsonl(
+            events_path, cloud_processor._pipeline, cloud_processor._anonymizer,
+        )
+
+        scrubbed = [json.loads(line) for line in events_path.read_text().splitlines() if line.strip()]
+
+        for evt in scrubbed:
+            assert evt["key_char"] is None, f"key_char not nulled: {evt}"
+            assert evt["canonical_key_char"] is None
+
+    def test_scrub_events_jsonl_leaves_clean_keystrokes(self, cloud_capture_dir, cloud_processor):
+        """Keystrokes that don't contain PII should be left unchanged."""
+        events = []
+        for ch in "hello world":
+            events.append({
+                "name": "key.down",
+                "timestamp": 1000.0 + len(events),
+                "key_char": ch,
+            })
+
+        events_path = cloud_capture_dir / "events_0000.jsonl"
+        with open(events_path, "w") as f:
+            for evt in events:
+                f.write(json.dumps(evt) + "\n")
+
+        cloud_processor._scrub_events_jsonl(
+            events_path, cloud_processor._pipeline, cloud_processor._anonymizer,
+        )
+
+        scrubbed = [json.loads(line) for line in events_path.read_text().splitlines() if line.strip()]
+        chars = [e["key_char"] for e in scrubbed]
+        assert chars == list("hello world")
+
+    def test_scrub_transcripts_txt_and_json(self, cloud_capture_dir, cloud_processor):
+        """Both transcript formats must have PII replaced, including segment text."""
+        txt_path = cloud_capture_dir / "transcript_0000.txt"
+        txt_path.write_text("Meeting with John Smith about the project")
+
+        json_path = cloud_capture_dir / "transcript_0000.json"
+        json_path.write_text(json.dumps({
+            "text": "Call with John Smith",
+            "segments": [
+                {"start": 0, "end": 5, "text": "Call with John Smith"},
+            ],
+        }))
+
+        cp = cloud_processor
+        cp._scrub_transcript_txt(txt_path, cp._pipeline, cp._anonymizer)
+        cp._scrub_transcript_json(json_path, cp._pipeline, cp._anonymizer)
+
+        # .txt
+        txt_result = txt_path.read_text()
+        assert "John Smith" not in txt_result
+        assert "<PERSON>" in txt_result
+
+        # .json top-level and segment
+        json_data = json.loads(json_path.read_text())
+        assert "John Smith" not in json_data["text"]
+        assert "<PERSON>" in json_data["text"]
+        assert "John Smith" not in json_data["segments"][0]["text"]
+
+    def test_scrub_manifest_dominant_title(self, cloud_capture_dir, cloud_processor):
+        """Manifest dominant_title must be scrubbed and derived_name re-derived."""
+        manifest_path = cloud_capture_dir / "chunk_0000_manifest.json"
+        manifest_path.write_text(json.dumps({
+            "chunk_index": 0,
+            "tasks": [{
+                "start_ts": 1000.0,
+                "end_ts": 1060.0,
+                "dominant_app": "com.google.Chrome",
+                "dominant_title": "John Smith - Contract Review - Google Chrome",
+                "derived_name": "chrome_john-smith-contract-review",
+            }],
+            "summary": {"primary_task": "chrome_john-smith-contract-review"},
+        }))
+
+        cp = cloud_processor
+        cp._scrub_manifest(manifest_path, cp._pipeline, cp._anonymizer)
+
+        data = json.loads(manifest_path.read_text())
+        task = data["tasks"][0]
+        assert "John Smith" not in task["dominant_title"]
+        assert "<PERSON>" in task["dominant_title"]
+        assert "john-smith" not in task["derived_name"]
+
+    def test_scrub_text_field_returns_sentinel_on_all_detectors_failed(
+        self, cloud_capture_dir, cloud_processor,
+    ):
+        """_scrub_text_field must return '<SCRUB_FAILED>' when all detectors fail."""
+        from screencap.privacy import AllDetectorsFailedError
+
+        cloud_processor._pipeline.detect = MagicMock(
+            side_effect=AllDetectorsFailedError("all failed"),
+        )
+
+        result = cloud_processor._scrub_text_field("some sensitive text")
+        assert result == "<SCRUB_FAILED>"
+
+    def test_scrub_chunk_files_renames_on_per_file_failure(
+        self, cloud_capture_dir, cloud_processor,
+    ):
+        """_scrub_chunk_files must rename a file to .scrub_failed when its scrub raises."""
+        # Write a valid events file but make the scrub method raise
+        events_path = cloud_capture_dir / "events_0000.jsonl"
+        events_path.write_text('{"name":"click"}\n')
+
+        with patch.object(
+            cloud_processor, "_scrub_events_jsonl",
+            side_effect=RuntimeError("simulated scrub failure"),
+        ):
+            cloud_processor._scrub_chunk_files(0, None)
+
+        # Original file should be renamed, not uploaded
+        assert not events_path.exists()
+        assert (cloud_capture_dir / "events_0000.jsonl.scrub_failed").exists()
