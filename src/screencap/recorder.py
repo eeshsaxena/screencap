@@ -648,16 +648,21 @@ def start_recording(
                         _flush_req = getattr(recorder, '_flush_requested', None)
                         _flush_ctr = getattr(recorder, '_flush_ack_counter', None)
 
+                        # Local-intent recordings must not live-upload raw data
+                        _effective_upload = live_upload if cloud_intent else False
+
                         chunk_processor = ChunkProcessor(
                             capture_dir,
                             _cpq,
                             _aaq,
                             recording_name=name,
-                            upload_enabled=live_upload,
+                            upload_enabled=_effective_upload,
                             auto_delete=cloud_intent and get_auto_delete_after_upload(),
                             rest_threshold=get_rest_threshold(),
                             flush_requested=_flush_req,
                             flush_ack_counter=_flush_ctr,
+                            cloud_intent=cloud_intent,
+                            privacy_mode=privacy_config.mode.value if privacy_config else "internal",
                         )
                         chunk_processor.start()
                 except Exception as _chunk_init_err:
@@ -842,7 +847,7 @@ def start_recording(
 
                 _recording_name = (capture_dir / ".recording_id").read_text().strip() if (capture_dir / ".recording_id").exists() else name
                 with console.status("[dim]Uploading recording database...[/dim]"):
-                    checkpoint_and_upload_db(capture_dir, _recording_name)
+                    checkpoint_and_upload_db(capture_dir, _recording_name, cloud_intent=cloud_intent)
             except Exception as e:
                 if verbose:
                     console.print(f"[yellow]Warning:[/yellow] DB upload failed: {e}")

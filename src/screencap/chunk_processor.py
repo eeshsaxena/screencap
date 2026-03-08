@@ -52,6 +52,8 @@ class ChunkProcessor:
         rest_threshold: float = 120.0,
         flush_requested=None,      # multiprocessing.Event — triggers writer buffer flush
         flush_ack_counter=None,    # multiprocessing.Value('i') — counts writer acks
+        cloud_intent: bool = False,
+        privacy_mode: str = "internal",
     ) -> None:
         self._capture_dir = Path(capture_dir)
         self._db_path = self._capture_dir / "recording.db"
@@ -63,6 +65,23 @@ class ChunkProcessor:
         self._rest_threshold = rest_threshold
         self._flush_requested = flush_requested
         self._flush_ack_counter = flush_ack_counter
+        self._cloud_intent = cloud_intent
+        self._privacy_mode = privacy_mode
+
+        # Initialize scrubbing pipeline for cloud-intent recordings
+        self._pipeline = None
+        self._anonymizer = None
+        if cloud_intent and upload_enabled:
+            try:
+                from screencap.privacy import Anonymizer, create_default_pipeline
+                self._pipeline = create_default_pipeline()
+                self._anonymizer = Anonymizer()
+                logger.info("Scrubbing pipeline initialized for cloud-intent recording")
+            except ImportError as e:
+                logger.error(
+                    f"Privacy deps not installed — disabling uploads for safety: {e}"
+                )
+                self._upload_enabled = False
 
         self._chunk_results: dict[int, bool] = {}  # idx → all_uploaded
         self._status_lock = threading.Lock()
@@ -183,7 +202,14 @@ class ChunkProcessor:
         if self._stop_event.is_set():
             return
 
-        # 5. Upload
+        # 5. Scrub text surfaces for cloud-intent recordings
+        if self._cloud_intent and self._pipeline is not None:
+            self._set_status(f"Chunk {idx}: scrubbing...")
+            self._scrub_chunk_files(idx, transcript_path)
+            if self._stop_event.is_set():
+                return
+
+        # 6. Upload
         success = False
         if self._upload_enabled:
             self._set_status(f"Chunk {idx}: uploading...")
@@ -197,7 +223,7 @@ class ChunkProcessor:
 
         self._chunk_results[idx] = success
 
-        # 6. Delete old chunks (keep 2 most recent)
+        # 7. Delete old chunks (keep 2 most recent)
         if success and self._auto_delete:
             freed = self._delete_old_chunks(idx, keep_recent=2)
             self._total_freed += freed
@@ -421,19 +447,200 @@ class ChunkProcessor:
             rest_threshold=self._rest_threshold,
         )
 
+    def _scrub_chunk_files(self, idx: int, transcript_path: Path | None) -> None:
+        """Inline-scrub text surfaces before upload for cloud-intent recordings.
+
+        Scrubs events JSONL (combined keystroke aggregation), transcript .txt/.json,
+        and manifest dominant_title. Uses atomic writes (.tmp + rename).
+        Per-field failure → <SCRUB_FAILED> sentinel. Per-file failure → file
+        marked for skip (renamed to .scrub_failed).
+        """
+        from screencap.privacy import AllDetectorsFailedError
+        from screencap.privacy.actions import KEYSTROKE_CONTENT_FIELDS
+
+        pipeline = self._pipeline
+        anonymizer = self._anonymizer
+
+        # --- Events JSONL ---
+        events_path = self._capture_dir / f"events_{idx:04d}.jsonl"
+        if events_path.exists():
+            try:
+                self._scrub_events_jsonl(events_path, pipeline, anonymizer)
+            except Exception as e:
+                logger.error(f"Chunk {idx}: events JSONL scrub failed, skipping file: {e}")
+                _rename_scrub_failed(events_path)
+
+        # --- Transcript .txt ---
+        if transcript_path and transcript_path.exists():
+            try:
+                self._scrub_transcript_txt(transcript_path, pipeline, anonymizer)
+            except Exception as e:
+                logger.error(f"Chunk {idx}: transcript .txt scrub failed, skipping file: {e}")
+                _rename_scrub_failed(transcript_path)
+
+        # --- Transcript .json (defense-in-depth) ---
+        transcript_json = self._capture_dir / f"transcript_{idx:04d}.json"
+        if transcript_json.exists():
+            try:
+                self._scrub_transcript_json(transcript_json, pipeline, anonymizer)
+            except Exception as e:
+                logger.error(f"Chunk {idx}: transcript .json scrub failed, skipping file: {e}")
+                _rename_scrub_failed(transcript_json)
+
+        # --- Manifest (dominant_title + derived_name) ---
+        manifest_path = self._capture_dir / f"chunk_{idx:04d}_manifest.json"
+        if manifest_path.exists():
+            try:
+                self._scrub_manifest(manifest_path, pipeline, anonymizer)
+            except Exception as e:
+                logger.error(f"Chunk {idx}: manifest scrub failed, skipping file: {e}")
+                _rename_scrub_failed(manifest_path)
+
+    def _scrub_text_field(self, text: str) -> str:
+        """Run a single text field through the pipeline. Returns scrubbed text.
+
+        On AllDetectorsFailedError returns '<SCRUB_FAILED>'.
+        """
+        from screencap.privacy import AllDetectorsFailedError
+
+        if not text or not text.strip():
+            return text
+        try:
+            result = self._pipeline.detect(text)
+        except AllDetectorsFailedError:
+            return "<SCRUB_FAILED>"
+        return self._anonymizer.anonymize(result.normalized_text, result.detections)
+
+    def _scrub_events_jsonl(self, path: Path, pipeline, anonymizer) -> None:
+        """Scrub keystroke content in events JSONL using combined-text aggregation."""
+        from screencap.privacy.actions import KEYSTROKE_CONTENT_FIELDS
+
+        lines = path.read_text(encoding="utf-8").splitlines()
+        events = []
+        for line in lines:
+            if line.strip():
+                events.append(json.loads(line))
+
+        # Aggregate consecutive key.down events into combined text strings
+        # to defeat the 4-char short-circuit in DetectionPipeline
+        i = 0
+        while i < len(events):
+            evt = events[i]
+            if evt.get("name") != "key.down" or not evt.get("key_char"):
+                i += 1
+                continue
+
+            # Collect run of consecutive key.down events
+            run_start = i
+            combined_chars = []
+            while i < len(events) and events[i].get("name") == "key.down":
+                ch = events[i].get("key_char", "")
+                combined_chars.append(ch if ch else "")
+                i += 1
+
+            combined_text = "".join(combined_chars)
+            if len(combined_text) < 4:
+                # Too short for detection — leave as-is
+                continue
+
+            # Run detection on combined text
+            scrubbed = self._scrub_text_field(combined_text)
+            if scrubbed == combined_text:
+                # No PII detected
+                continue
+
+            # PII found — null keystroke content fields for this entire run
+            for j in range(run_start, run_start + len(combined_chars)):
+                for field in KEYSTROKE_CONTENT_FIELDS:
+                    if field in events[j]:
+                        events[j][field] = None
+
+        # Also scrub any text fields on non-keystroke events
+        for evt in events:
+            if evt.get("name") in ("key.down", "key.up"):
+                continue
+            if "text" in evt and isinstance(evt["text"], str) and evt["text"]:
+                evt["text"] = self._scrub_text_field(evt["text"])
+
+        # Atomic write
+        tmp_path = str(path) + ".tmp"
+        with open(tmp_path, "w", encoding="utf-8") as f:
+            for evt in events:
+                f.write(json.dumps(evt) + "\n")
+        os.rename(tmp_path, str(path))
+
+    def _scrub_transcript_txt(self, path: Path, pipeline, anonymizer) -> None:
+        """Scrub PII from transcript .txt file."""
+        text = path.read_text(encoding="utf-8")
+        scrubbed = self._scrub_text_field(text)
+        tmp_path = str(path) + ".tmp"
+        with open(tmp_path, "w", encoding="utf-8") as f:
+            f.write(scrubbed)
+        os.rename(tmp_path, str(path))
+
+    def _scrub_transcript_json(self, path: Path, pipeline, anonymizer) -> None:
+        """Scrub PII from transcript .json file (text + segments)."""
+        data = json.loads(path.read_text(encoding="utf-8"))
+        if isinstance(data, dict):
+            if "text" in data and isinstance(data["text"], str):
+                data["text"] = self._scrub_text_field(data["text"])
+            if "segments" in data and isinstance(data["segments"], list):
+                for seg in data["segments"]:
+                    if isinstance(seg, dict) and isinstance(seg.get("text"), str):
+                        seg["text"] = self._scrub_text_field(seg["text"])
+        tmp_path = str(path) + ".tmp"
+        with open(tmp_path, "w", encoding="utf-8") as f:
+            json.dump(data, f, indent=2)
+        os.rename(tmp_path, str(path))
+
+    def _scrub_manifest(self, path: Path, pipeline, anonymizer) -> None:
+        """Scrub dominant_title in manifest and re-derive task name from clean title."""
+        from screencap.task_manifest import _derive_task_name
+
+        data = json.loads(path.read_text(encoding="utf-8"))
+        for task in data.get("tasks", []):
+            title = task.get("dominant_title", "")
+            if title:
+                scrubbed_title = self._scrub_text_field(title)
+                task["dominant_title"] = scrubbed_title
+                # Re-derive task name from scrubbed title
+                task["derived_name"] = _derive_task_name({
+                    "bundle_id": task.get("dominant_app", ""),
+                    "title": scrubbed_title,
+                })
+        # Update primary_task in summary
+        if data.get("tasks"):
+            primary = max(
+                data["tasks"],
+                key=lambda t: t.get("end_ts", 0) - t.get("start_ts", 0),
+            )["derived_name"]
+            data.setdefault("summary", {})["primary_task"] = primary
+
+        tmp_path = str(path) + ".tmp"
+        with open(tmp_path, "w", encoding="utf-8") as f:
+            json.dump(data, f, indent=2)
+        os.rename(tmp_path, str(path))
+
     def _collect_chunk_files(self, idx: int, transcript_path: Path | None) -> list[dict]:
         """Collect files belonging to this chunk for upload.
 
-        Skips 0-byte files (e.g. empty transcripts from silent audio)
-        to avoid GCS upload errors.
+        For cloud-intent recordings, excludes audio/video (no redaction engine).
+        Skips 0-byte files and files renamed to .scrub_failed.
         """
         files = []
-        patterns = [
-            f"chunk_{idx:04d}.mp4",
-            f"audio_{idx:04d}.flac",
-            f"events_{idx:04d}.jsonl",
-            f"chunk_{idx:04d}_manifest.json",
-        ]
+        if self._cloud_intent:
+            # Text-only upload for cloud-intent — audio/video stay local
+            patterns = [
+                f"events_{idx:04d}.jsonl",
+                f"chunk_{idx:04d}_manifest.json",
+            ]
+        else:
+            patterns = [
+                f"chunk_{idx:04d}.mp4",
+                f"audio_{idx:04d}.flac",
+                f"events_{idx:04d}.jsonl",
+                f"chunk_{idx:04d}_manifest.json",
+            ]
         if transcript_path and transcript_path.exists():
             patterns.append(transcript_path.name)
 
@@ -486,6 +693,15 @@ class ChunkProcessor:
                     except (OSError, subprocess.CalledProcessError) as e:
                         logger.warning(f"Failed to trash {path.name}: {e}")
         return freed
+
+
+def _rename_scrub_failed(path: Path) -> None:
+    """Rename a file to .scrub_failed so it's excluded from upload."""
+    try:
+        failed_path = path.with_suffix(path.suffix + ".scrub_failed")
+        path.rename(failed_path)
+    except OSError as e:
+        logger.warning(f"Failed to rename {path.name} for scrub failure: {e}")
 
 
 def _save_transcript_quiet(
@@ -581,8 +797,17 @@ def _upload_single(fi, signed_url: str) -> None:
     resp.raise_for_status()
 
 
-def checkpoint_and_upload_db(capture_dir: Path, recording_name: str) -> bool:
-    """WAL checkpoint recording.db then upload it."""
+def checkpoint_and_upload_db(
+    capture_dir: Path, recording_name: str, *, cloud_intent: bool = False,
+) -> bool:
+    """WAL checkpoint recording.db then upload it.
+
+    For cloud_intent=True, skips upload — raw DB contains unscrubbed PII.
+    The DB stays local for post-hoc scrubbed upload via ``screencap upload``.
+    """
+    if cloud_intent:
+        logger.info("Skipping recording.db upload for cloud-intent recording (unscrubbed)")
+        return True
     db_path = capture_dir / "recording.db"
     if not db_path.exists():
         return False

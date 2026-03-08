@@ -43,7 +43,7 @@ def _build_app_allowlist(metrics_path: Path) -> frozenset[str]:
 
 
 # Files to skip during copytree and delete as safety fallback.
-_SKIP_FILES = {"audio.flac", ".upload_status.json", "viewer.html"}
+_SKIP_FILES = {".upload_status.json", "viewer.html"}
 _SKIP_EXTENSIONS = {".mp4", ".flac", ".wav", ".m4a", ".aac", ".ogg", ".opus"}
 
 
@@ -980,9 +980,27 @@ def _scrub_events_jsonl(
     """
     import os
 
-    events_jsonl = dst / "events.jsonl"
-    if not events_jsonl.exists():
+    # Handle both legacy (events.jsonl) and chunked (events_NNNN.jsonl) layouts
+    event_files = sorted(dst.glob("events*.jsonl"))
+    if not event_files:
         return
+
+    for events_jsonl in event_files:
+        _scrub_single_events_jsonl(
+            events_jsonl, dst, pipeline, anonymizer, result, blocked_intervals,
+        )
+
+
+def _scrub_single_events_jsonl(
+    events_jsonl: Path,
+    dst: Path,
+    pipeline,
+    anonymizer,
+    result: ScrubResult,
+    blocked_intervals: list[_BlockedInterval] | None = None,
+) -> None:
+    """Scrub a single events JSONL file."""
+    import os
 
     blocked_intervals = blocked_intervals or []
     blocked_starts = [iv.start for iv in blocked_intervals]
@@ -1273,15 +1291,18 @@ def scrub_recording(
             )
         except Exception as exc:
             console.print(
-                f"  [yellow]Warning: events.jsonl scrubbing failed ({exc}) — "
+                f"  [yellow]Warning: events JSONL scrubbing failed ({exc}) — "
                 f"deleting for safety[/]"
             )
-            (dst / "events.jsonl").unlink(missing_ok=True)
+            for f in dst.glob("events*.jsonl"):
+                f.unlink(missing_ok=True)
 
-    # 14. Scrub transcripts
+    # 14. Scrub transcripts (legacy + chunked layouts)
     with console.status("Scrubbing transcripts..."):
-        _scrub_transcript_json(dst / "transcript.json", pipeline, anonymizer, result)
-        _scrub_transcript_txt(dst / "transcript.txt", pipeline, anonymizer, result)
+        for tj in sorted(dst.glob("transcript*.json")):
+            _scrub_transcript_json(tj, pipeline, anonymizer, result)
+        for tt in sorted(dst.glob("transcript*.txt")):
+            _scrub_transcript_txt(tt, pipeline, anonymizer, result)
 
     # 15. Scrub metrics (rule-based)
     metrics_path = dst / "system_metrics.json"

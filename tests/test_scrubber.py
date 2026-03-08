@@ -1175,3 +1175,53 @@ def test_scrub_events_jsonl_entity_counts(tmp_path, pipeline_and_anonymizer):
 
     # Should have detected at least one entity
     assert sum(result.entity_counts.values()) > 0
+
+
+# ---------------------------------------------------------------------------
+# Chunked file pattern tests
+# ---------------------------------------------------------------------------
+
+
+def test_scrub_events_jsonl_handles_chunked_files(tmp_path, pipeline_and_anonymizer):
+    """_scrub_events_jsonl must process events_NNNN.jsonl files, not just events.jsonl."""
+    pipeline, anonymizer = pipeline_and_anonymizer
+    rec = tmp_path / "scrubbed"
+    rec.mkdir()
+
+    secret_ev = _make_key_type_event("password=ssfsfodsufdouhhfwnenwekskjdhjsfhd")
+    # Write as chunked file name
+    (rec / "events_0000.jsonl").write_text(_make_events_jsonl(secret_ev))
+    _setup_keystroke_db(rec / "recording.db", [secret_ev])
+
+    result = ScrubResult()
+    _scrub_events_jsonl(rec, pipeline, anonymizer, result)
+
+    # The chunked file should have been processed
+    assert (rec / "events_0000.jsonl").exists()
+    content = (rec / "events_0000.jsonl").read_text()
+    # Original secret should be scrubbed
+    assert "ssfsfodsufdouhhfwnenwekskjdhjsfhd" not in content
+
+
+def test_scrub_transcript_functions_work_on_chunked_filenames(tmp_path, pipeline_and_anonymizer):
+    """_scrub_transcript_json/txt must work on chunked filenames (transcript_NNNN)."""
+    pipeline, anonymizer = pipeline_and_anonymizer
+    rec = tmp_path / "scrubbed"
+    rec.mkdir()
+
+    # Write chunked transcript files with PII (person name)
+    txt_path = rec / "transcript_0001.txt"
+    json_path = rec / "transcript_0001.json"
+    txt_path.write_text("Meeting with John Smith about the project today")
+    json_path.write_text(json.dumps({
+        "text": "Meeting with John Smith about the project today",
+        "segments": [{"start": 0, "end": 5, "text": "Meeting with John Smith about the project today"}],
+    }))
+
+    result = ScrubResult()
+    _scrub_transcript_json(json_path, pipeline, anonymizer, result)
+    _scrub_transcript_txt(txt_path, pipeline, anonymizer, result)
+
+    # Both chunked files should be scrubbed
+    assert "John Smith" not in txt_path.read_text()
+    assert "John Smith" not in json.loads(json_path.read_text())["text"]
