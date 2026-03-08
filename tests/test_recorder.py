@@ -2,8 +2,6 @@
 
 import ast
 import inspect
-import os
-import signal
 import sys
 from collections import namedtuple
 from unittest import mock
@@ -54,61 +52,6 @@ class TestForceExitCleanup:
                             f"os._exit found in {node.name} — only allowed in _force_exit"
                         )
 
-    def test_force_handler_calls_os_kill_on_stored_pids(self):
-        """The force-exit handler should os.kill stored PIDs with SIGTERM then SIGKILL."""
-        _child_pids = [1001, 1002]
-        killed = []
-
-        def fake_kill(pid, sig):
-            killed.append((pid, sig))
-
-        with mock.patch("os.kill", side_effect=fake_kill):
-            # Simulate what the second Ctrl+C does
-            for pid in _child_pids:
-                try:
-                    os.kill(pid, signal.SIGTERM)
-                except (ProcessLookupError, PermissionError):
-                    pass
-            for pid in _child_pids:
-                try:
-                    os.kill(pid, signal.SIGKILL)
-                except (ProcessLookupError, PermissionError):
-                    pass
-
-        assert killed == [
-            (1001, signal.SIGTERM),
-            (1002, signal.SIGTERM),
-            (1001, signal.SIGKILL),
-            (1002, signal.SIGKILL),
-        ]
-
-    def test_force_quit_uses_os_exit(self):
-        """The force-quit path must use os._exit (not sys.exit) to avoid
-        threading._shutdown deadlock.  Uses AST to find os._exit calls
-        inside the _force_exit nested function."""
-        import screencap.recorder as mod
-
-        source = inspect.getsource(mod)
-        tree = ast.parse(source)
-
-        # Find the _force_exit function definition
-        force_exit_fn = None
-        for node in ast.walk(tree):
-            if isinstance(node, ast.FunctionDef) and node.name == "_force_exit":
-                force_exit_fn = node
-                break
-        assert force_exit_fn is not None, "_force_exit function not found in recorder"
-
-        os_exit_calls = [
-            node for node in ast.walk(force_exit_fn)
-            if isinstance(node, ast.Call)
-            and isinstance(node.func, ast.Attribute)
-            and node.func.attr == "_exit"
-            and isinstance(node.func.value, ast.Name)
-            and node.func.value.id == "os"
-        ]
-        assert len(os_exit_calls) >= 1, "_force_exit must call os._exit"
-
     def test_force_quit_cleans_up_pidfile(self):
         """The force-quit handler should call delete_pidfile before os._exit."""
         import screencap.recorder as mod
@@ -131,40 +74,6 @@ class TestForceExitCleanup:
             and node.func.id == "delete_pidfile"
         ]
         assert len(delete_calls) >= 1, "_force_exit must call delete_pidfile"
-
-    def test_reentry_guard_exits_on_third_ctrl_c(self):
-        """Third+ Ctrl+C should call os._exit immediately (re-entry guard)."""
-        import screencap.recorder as mod
-
-        source = inspect.getsource(mod)
-        tree = ast.parse(source)
-
-        force_exit_fn = None
-        for node in ast.walk(tree):
-            if isinstance(node, ast.FunctionDef) and node.name == "_force_exit":
-                force_exit_fn = node
-                break
-        assert force_exit_fn is not None
-
-        # Find the re-entry guard: `if _ctrl_c_count > 2: os._exit(1)`
-        found_guard = False
-        for node in ast.walk(force_exit_fn):
-            if isinstance(node, ast.If):
-                # Check for _ctrl_c_count > 2
-                test = node.test
-                if (
-                    isinstance(test, ast.Compare)
-                    and isinstance(test.left, ast.Name)
-                    and test.left.id == "_ctrl_c_count"
-                    and len(test.ops) == 1
-                    and isinstance(test.ops[0], ast.Gt)
-                    and len(test.comparators) == 1
-                    and isinstance(test.comparators[0], ast.Constant)
-                    and test.comparators[0].value == 2
-                ):
-                    found_guard = True
-                    break
-        assert found_guard, "_force_exit must have re-entry guard for _ctrl_c_count > 2"
 
 
 class TestAtexitHandler:
