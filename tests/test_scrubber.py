@@ -177,6 +177,8 @@ def recording_dir(tmp_path):
 
     # --- Stub files to verify deletion ---
     (rec / "audio.flac").write_bytes(b"\x00")
+    (rec / "audio_0000.flac").write_bytes(b"chunk0")
+    (rec / "audio_0001.flac").write_bytes(b"chunk1")
     (rec / "oa_recording-12345.mp4").write_bytes(b"\x00")
     # events.jsonl with realistic key.type events (children include key.down + key.up)
     # Use helper to build children arrays matching DB rows
@@ -563,7 +565,7 @@ def test_scrub_metrics_no_wifi(tmp_path):
 
 
 def test_scrub_deletes_media(recording_dir, tmp_path):
-    """audio.flac and *.mp4 deleted from scrubbed copy."""
+    """audio.flac, chunked audio, and *.mp4 deleted from scrubbed copy."""
     with mock.patch(
         "screencap.config.get_recordings_dir", return_value=tmp_path
     ), mock.patch(
@@ -573,7 +575,11 @@ def test_scrub_deletes_media(recording_dir, tmp_path):
 
     dst = tmp_path / "test-recording-scrubbed"
     assert not (dst / "audio.flac").exists()
+    assert not (dst / "audio_0000.flac").exists()
+    assert not (dst / "audio_0001.flac").exists()
     assert not list(dst.glob("*.mp4"))
+    assert "audio_0000.flac" in result.deleted_files
+    assert "audio_0001.flac" in result.deleted_files
 
 
 def test_scrub_deletes_derived_files(recording_dir, tmp_path):
@@ -626,19 +632,24 @@ def test_scrub_deletes_audio_info_table(recording_dir, tmp_path):
     conn.close()
 
 
-def test_scrub_copytree_skips_media(recording_dir, tmp_path):
-    """Media files never copied (ignore callback)."""
+def test_scrub_safety_fallback_deletes_surviving_media(recording_dir, tmp_path):
+    """Safety fallback catches media files that bypass _copytree_ignore."""
     with mock.patch(
         "screencap.config.get_recordings_dir", return_value=tmp_path
     ), mock.patch(
         "screencap.scrubber.get_recordings_dir", return_value=tmp_path
+    ), mock.patch(
+        "screencap.scrubber._copytree_ignore", side_effect=lambda d, e: set()
     ):
-        scrub_recording("test-recording")
+        result = scrub_recording("test-recording")
 
     dst = tmp_path / "test-recording-scrubbed"
-    # These should have been skipped by the ignore callback
     assert not (dst / "audio.flac").exists()
+    assert not (dst / "audio_0000.flac").exists()
+    assert not (dst / "audio_0001.flac").exists()
     assert not list(dst.glob("*.mp4"))
+    assert "audio_0000.flac" in result.deleted_files
+    assert "audio_0001.flac" in result.deleted_files
 
 
 # ---------------------------------------------------------------------------

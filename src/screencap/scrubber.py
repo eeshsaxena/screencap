@@ -1168,14 +1168,15 @@ def scrub_recording(
 
     # 8. Safety fallback deletion — remove any files that survived the ignore callback
     deleted_files: list[str] = []
-    for pattern_or_name in ("audio.flac", ".upload_status.json", "viewer.html"):
-        p = dst / pattern_or_name
+    for skip_name in _SKIP_FILES:
+        p = dst / skip_name
         if p.exists():
             p.unlink()
-            deleted_files.append(pattern_or_name)
-    for mp4 in dst.glob("*.mp4"):
-        mp4.unlink()
-        deleted_files.append(mp4.name)
+            deleted_files.append(skip_name)
+    for ext in _SKIP_EXTENSIONS:
+        for f in dst.glob(f"*{ext}"):
+            f.unlink()
+            deleted_files.append(f.name)
 
     # Track which files were skipped/deleted (union of ignore + fallback)
     all_skipped = set()
