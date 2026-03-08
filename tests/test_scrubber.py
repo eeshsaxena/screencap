@@ -632,21 +632,24 @@ def test_scrub_deletes_audio_info_table(recording_dir, tmp_path):
     conn.close()
 
 
-def test_scrub_copytree_skips_media(recording_dir, tmp_path):
-    """Media files never copied (ignore callback)."""
+def test_scrub_safety_fallback_deletes_surviving_media(recording_dir, tmp_path):
+    """Safety fallback catches media files that bypass _copytree_ignore."""
     with mock.patch(
         "screencap.config.get_recordings_dir", return_value=tmp_path
     ), mock.patch(
         "screencap.scrubber.get_recordings_dir", return_value=tmp_path
+    ), mock.patch(
+        "screencap.scrubber._copytree_ignore", side_effect=lambda d, e: set()
     ):
-        scrub_recording("test-recording")
+        result = scrub_recording("test-recording")
 
     dst = tmp_path / "test-recording-scrubbed"
-    # These should have been skipped by the ignore callback
     assert not (dst / "audio.flac").exists()
     assert not (dst / "audio_0000.flac").exists()
     assert not (dst / "audio_0001.flac").exists()
     assert not list(dst.glob("*.mp4"))
+    assert "audio_0000.flac" in result.deleted_files
+    assert "audio_0001.flac" in result.deleted_files
 
 
 # ---------------------------------------------------------------------------
