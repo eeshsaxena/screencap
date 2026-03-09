@@ -501,8 +501,10 @@ def start_recording(
         raise SystemExit(1)
 
     # --- Privacy: capture-time enforcement ---
-    # Cloud-intent recordings always use public privacy mode
-    if cloud_intent and force_mode is None:
+    # Cloud-intent recordings always use PUBLIC mode — this is intentionally
+    # "looser" than INTERNAL because PUBLIC triggers OCR_FALLBACK for code
+    # editors, which the cloud block set catches. INTERNAL would ALLOW them.
+    if cloud_intent:
         from screencap.privacy.policy import PrivacyMode as _PrivacyMode
         force_mode = _PrivacyMode.PUBLIC
 

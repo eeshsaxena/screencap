@@ -198,24 +198,15 @@ class ChunkProcessor:
         if self._stop_event.is_set():
             return
 
-        # 4. Generate task manifest
+        # 4. Generate task manifest (with blocked intervals if available)
         self._set_status(f"Chunk {idx}: generating manifest...")
-        self._generate_manifest(idx, start_ts, end_ts)
-        if self._stop_event.is_set():
-            return
-
-        # 4b. Add blocked intervals to manifest (cloud-intent only)
+        blocked_intervals = None
         if self._screen_filter is not None and hasattr(self._screen_filter, 'get_blocked_intervals'):
             try:
-                intervals = self._screen_filter.get_blocked_intervals(start_ts, end_ts)
-                if intervals:
-                    manifest_path = self._capture_dir / f"chunk_{idx:04d}_manifest.json"
-                    if manifest_path.exists():
-                        data = json.loads(manifest_path.read_text())
-                        data["blocked_intervals"] = intervals
-                        manifest_path.write_text(json.dumps(data, indent=2))
+                blocked_intervals = self._screen_filter.get_blocked_intervals(start_ts, end_ts) or None
             except Exception:
-                logger.warning(f"Failed to add blocked_intervals to chunk {idx} manifest")
+                logger.warning(f"Failed to get blocked_intervals for chunk {idx}", exc_info=True)
+        self._generate_manifest(idx, start_ts, end_ts, blocked_intervals=blocked_intervals)
 
         # 5. Scrub text surfaces for cloud-intent recordings
         if self._cloud_intent and self._pipeline is not None:
@@ -453,13 +444,17 @@ class ChunkProcessor:
 
         return jsonl_path
 
-    def _generate_manifest(self, idx: int, start_ts: float, end_ts: float) -> Path:
+    def _generate_manifest(
+        self, idx: int, start_ts: float, end_ts: float,
+        blocked_intervals: list[dict] | None = None,
+    ) -> Path:
         """Generate task manifest for this chunk."""
         from screencap.task_manifest import generate_manifest
 
         return generate_manifest(
             self._capture_dir, idx, start_ts, end_ts,
             rest_threshold=self._rest_threshold,
+            blocked_intervals=blocked_intervals,
         )
 
     def _scrub_chunk_files(self, idx: int, transcript_path: Path | None) -> None:

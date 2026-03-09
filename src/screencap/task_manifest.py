@@ -35,6 +35,7 @@ def generate_manifest(
     end_ts: float,
     *,
     rest_threshold: float = 120.0,
+    blocked_intervals: list[dict] | None = None,
 ) -> Path:
     """Generate a task manifest JSON for one chunk.
 
@@ -44,6 +45,7 @@ def generate_manifest(
         start_ts: Chunk start timestamp (Unix epoch).
         end_ts: Chunk end timestamp (Unix epoch).
         rest_threshold: Seconds of inactivity to split tasks.
+        blocked_intervals: Privacy-blocked video intervals for this chunk.
 
     Returns:
         Path to the manifest file.
@@ -138,6 +140,9 @@ def generate_manifest(
             "idle": len(task_list) == 0,
         },
     }
+
+    if blocked_intervals:
+        manifest["blocked_intervals"] = blocked_intervals
 
     manifest_path.write_text(json.dumps(manifest, indent=2))
     logger.info(f"Generated manifest: {manifest_path.name} ({len(task_list)} tasks)")

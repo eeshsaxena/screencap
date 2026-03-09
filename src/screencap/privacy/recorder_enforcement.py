@@ -145,7 +145,7 @@ class RecorderPrivacyFilter:
         # Cloud-intent: expand block set to include OCR_FALLBACK apps
         # (code editors, admin consoles) which would otherwise pass through
         # unredacted since no OCR redaction engine exists for video.
-        self.cloud_intent = cloud_intent
+        self._cloud_intent = cloud_intent
         self._block_actions = _BLOCK_ACTIONS | (
             frozenset({PrivacyAction.OCR_FALLBACK}) if cloud_intent else frozenset()
         )
@@ -171,6 +171,10 @@ class RecorderPrivacyFilter:
                 )
         else:
             self._secure_input_fn = secure_input_fn
+
+    @property
+    def cloud_intent(self) -> bool:
+        return self._cloud_intent
 
     def on_window_event(self, window_data: dict) -> None:
         """Update blocked state from a window event.

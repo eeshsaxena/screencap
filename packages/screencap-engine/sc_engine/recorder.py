@@ -286,9 +286,20 @@ def process_events(
     _screen_dims = None
     _in_blocked_interval = False
 
+    def _start_blocked_interval_if_needed(ts):
+        """Record the start of a blocked interval (decoupled from placeholder rate)."""
+        nonlocal _in_blocked_interval
+        if not _in_blocked_interval:
+            _in_blocked_interval = True
+            try:
+                screen_filter.record_block_start(ts)
+            except Exception:
+                _drops["privacy_filter_error"] += 1
+
     def _push_placeholder_if_due(ts, screen_data=None):
         """Push placeholder at 1 FPS during blocked cloud-intent intervals."""
-        nonlocal _placeholder_frame, _last_placeholder_ts, _screen_dims, _in_blocked_interval
+        nonlocal _placeholder_frame, _last_placeholder_ts, _screen_dims
+        _start_blocked_interval_if_needed(ts)
         now_m = time.monotonic()
         if now_m - _last_placeholder_ts < _PLACEHOLDER_INTERVAL:
             return
@@ -299,9 +310,6 @@ def process_events(
             )
         if _placeholder_frame is None:
             _placeholder_frame = _make_placeholder_frame(*_screen_dims)
-        if not _in_blocked_interval:
-            _in_blocked_interval = True
-            screen_filter.record_block_start(ts)
         ph = Event(timestamp=ts, type="screen/video", data=_placeholder_frame)
         if process_event(ph, video_write_q, write_video_event, recording, perf_q, terminate_processing):
             num_video_events.value += 1
@@ -311,7 +319,10 @@ def process_events(
         nonlocal _in_blocked_interval
         if _cloud_placeholder and _in_blocked_interval:
             _in_blocked_interval = False
-            screen_filter.record_block_end(ts)
+            try:
+                screen_filter.record_block_end(ts)
+            except Exception:
+                _drops["privacy_filter_error"] += 1
     while not terminate_processing.is_set() or not event_q.empty():
         # Enforce drain deadline once shutdown begins
         if terminate_processing.is_set():
@@ -324,8 +335,8 @@ def process_events(
             event = event_q.get(timeout=1.0)
         except queue.Empty:
             # Push placeholder frames during idle blocked intervals (cloud-intent)
-            if (_cloud_placeholder and screen_filter is not None
-                    and config.RECORD_VIDEO and not screen_filter.is_screen_allowed()):
+            if (_cloud_placeholder and config.RECORD_VIDEO
+                    and not screen_filter.is_screen_allowed()):
                 _push_placeholder_if_due(utils.get_timestamp())
             continue
         if not started:
@@ -369,7 +380,7 @@ def process_events(
                         num_video_events.value += 1
                     else:
                         _drops["full_video"] += 1
-            elif _cloud_placeholder and screen_filter is not None and config.RECORD_VIDEO:
+            elif _cloud_placeholder and config.RECORD_VIDEO:
                 # Action-gated mode: push placeholder on screen events during blocked intervals
                 if not screen_filter.is_screen_allowed(event.timestamp):
                     _push_placeholder_if_due(event.timestamp, event.data)
@@ -477,9 +488,12 @@ def process_events(
             should_save_screen = prev_saved_screen_timestamp < prev_screen_event.timestamp
             current_hash: int | None = None
 
+            # Cache privacy check for this action event (avoids redundant lock + FFI)
+            _screen_allowed = screen_filter.is_screen_allowed(prev_screen_event.timestamp) if screen_filter is not None else True
+
             # Privacy filter: suppress screenshot for blocked apps
             if should_save_screen and screen_filter is not None:
-                if not screen_filter.is_screen_allowed(prev_screen_event.timestamp):
+                if not _screen_allowed:
                     should_save_screen = False
                     _drops["privacy_screen"] += 1
                     # Cloud-intent: push placeholder at 1 FPS
@@ -536,10 +550,9 @@ def process_events(
             # Privacy filter: null sensitive content for blocked apps/inputs.
             # Applies to ALL action events (key, mouse, etc.) — if the screen
             # is blocked, no content fields should survive to disk.
-            if screen_filter is not None:
-                if not screen_filter.is_screen_allowed(event.timestamp):
-                    screen_filter.null_keystroke_content(event.data)
-                    _drops["privacy_keystroke"] += 1
+            if screen_filter is not None and not _screen_allowed:
+                screen_filter.null_keystroke_content(event.data)
+                _drops["privacy_keystroke"] += 1
 
             # Action event last — the anchor record that references the others
             events_to_write.append((event, action_write_q, write_action_event))
@@ -581,8 +594,7 @@ def process_events(
         prev_event = event
 
     # Close any open blocked interval at recording end
-    if _cloud_placeholder and _in_blocked_interval and screen_filter is not None:
-        _end_blocked_interval_if_active(utils.get_timestamp())
+    _end_blocked_interval_if_active(utils.get_timestamp())
 
     # Shut down async AX cache.
     if ax_cache is not None:
