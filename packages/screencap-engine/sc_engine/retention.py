@@ -25,19 +25,6 @@ _SCROLL_ACTIONS = frozenset({"scroll", "magnify", "rotate", "smart_magnify"})
 class ScreenRetentionFilter:
     """Per-action-type time-floor filter for variable-rate capture."""
 
-    __slots__ = (
-        "_drag_interval",
-        "_scroll_interval",
-        "_type_interval",
-        "_idle_interval",
-        "_settle_secs",
-        "_held_buttons",
-        "_drag_active",
-        "_last_save_mono",
-        "_settle_deadline",
-        "_settle_pending",
-    )
-
     def __init__(
         self,
         *,
