@@ -81,7 +81,7 @@ class Settings(BaseSettings):
     SCREENSHOT_HASH_THRESHOLD: int = 8         # Hamming distance (0=identical, 64=opposite)
 
     # Variable-rate capture (action-aware)
-    SCREENSHOT_ACTION_AWARE: bool = False
+    SCREENSHOT_ACTION_AWARE: bool = True
     SCREENSHOT_CLICK_INTERVAL: float = 0.0       # Always save (0 = no floor)
     SCREENSHOT_DRAG_INTERVAL: float = 0.1        # ~10 fps during drag
     SCREENSHOT_SCROLL_INTERVAL: float = 0.1      # ~10 fps during scroll/zoom
