@@ -1952,8 +1952,12 @@ def record_audio(
     # Track current chunk index for chunked audio
     _current_chunk_idx = [0]  # mutable container
 
-    def _rotate_audio(sf_writer_ref, capture_dir, new_idx):
-        """Close current FLAC, open new one for the next chunk."""
+    def _rotate_audio(sf_writer_ref, capture_dir, new_idx, *, is_final=False):
+        """Close current FLAC, open new one for the next chunk.
+
+        When is_final=True, closes and acks but does NOT open a new file
+        or advance the chunk index — there is no next chunk.
+        """
         # Drain and write remaining buffer
         frames = _drain_buffer()
         if frames is not None:
@@ -1969,6 +1973,10 @@ def record_audio(
                 audio_ack_q.put({"type": "audio_rotated", "completed_index": _current_chunk_idx[0]}, timeout=5)
             except Exception:
                 logger.error("Failed to send audio rotation ack")
+
+        if is_final:
+            sf_writer_ref[0] = None  # mark as finalized
+            return
 
         _current_chunk_idx[0] = new_idx
         new_path = capture_dir / f"audio_{new_idx:04d}.flac"
@@ -1992,9 +2000,13 @@ def record_audio(
                         msg = audio_rotate_q.get_nowait()
                         if msg.get("type") in ("chunk_rotated", "final_chunk"):
                             new_idx = msg.get("completed_index", 0) + 1
-                            _rotate_audio(sf_writer_ref, capture_dir, new_idx)
+                            _rotate_audio(sf_writer_ref, capture_dir, new_idx,
+                                          is_final=msg["type"] == "final_chunk")
                     except Exception:
                         break
+
+            if sf_writer_ref[0] is None:
+                return  # finalized by final_chunk rotation
 
             frames = _drain_buffer()
             if frames is not None:
@@ -2059,21 +2071,24 @@ def record_audio(
                 msg = audio_rotate_q.get_nowait()
                 if msg.get("type") in ("chunk_rotated", "final_chunk"):
                     new_idx = msg.get("completed_index", 0) + 1
-                    _rotate_audio(sf_writer_ref, capture_dir, new_idx)
+                    _rotate_audio(sf_writer_ref, capture_dir, new_idx,
+                                  is_final=msg["type"] == "final_chunk")
             except Exception:
                 break
 
-    # Final drain — write any remaining buffered frames
-    final_frames = _drain_buffer()
-    if final_frames is not None:
-        try:
-            sf_writer_ref[0].write(final_frames)
-            logger.debug(f"Final flush: {len(final_frames)} audio frames")
-        except Exception as e:
-            logger.error(f"Final audio flush failed: {e}")
+    # Final drain — write any remaining buffered frames (skip if already
+    # finalized by a final_chunk rotation above).
+    if sf_writer_ref[0] is not None:
+        final_frames = _drain_buffer()
+        if final_frames is not None:
+            try:
+                sf_writer_ref[0].write(final_frames)
+                logger.debug(f"Final flush: {len(final_frames)} audio frames")
+            except Exception as e:
+                logger.error(f"Final audio flush failed: {e}")
 
-    # Close writer — finalizes FLAC headers
-    sf_writer_ref[0].close()
+        # Close writer — finalizes FLAC headers
+        sf_writer_ref[0].close()
 
     # Derive current audio path from chunk index (audio_flac_path may be stale
     # if chunks were rotated/deleted during recording)
@@ -2989,6 +3004,19 @@ class Recorder:
                 screen_filter=self._screen_filter,
             )
 
+    def _forward_fanout_msg(self, msg) -> None:
+        """Forward a single chunk event to audio and chunk processor queues."""
+        try:
+            if self._audio_rotate_q is not None:
+                self._audio_rotate_q.put(msg, timeout=5)
+        except Exception:
+            logger.error("Fan-out: audio_rotate_q full or dead")
+        try:
+            if self._chunk_process_q is not None:
+                self._chunk_process_q.put(msg, timeout=5)
+        except Exception:
+            logger.error("Fan-out: chunk_process_q full or dead")
+
     def _chunk_fanout(self) -> None:
         """Fan-out thread: dispatch chunk rotation events to audio + chunk processor."""
         while not self._stopped_event.is_set():
@@ -2996,16 +3024,15 @@ class Recorder:
                 msg = self._chunk_rotate_q.get(timeout=1.0)
             except Exception:
                 continue
+            self._forward_fanout_msg(msg)
+        # Drain remaining messages after stop signal so the final_chunk
+        # is never lost due to the _stopped_event race.
+        while True:
             try:
-                if self._audio_rotate_q is not None:
-                    self._audio_rotate_q.put(msg, timeout=5)
+                msg = self._chunk_rotate_q.get_nowait()
             except Exception:
-                logger.error("Fan-out: audio_rotate_q full or dead")
-            try:
-                if self._chunk_process_q is not None:
-                    self._chunk_process_q.put(msg, timeout=5)
-            except Exception:
-                logger.error("Fan-out: chunk_process_q full or dead")
+                break
+            self._forward_fanout_msg(msg)
 
     def __enter__(self) -> "Recorder":
         # Set up chunking primitives if chunking enabled
@@ -3051,7 +3078,9 @@ class Recorder:
             self._record_thread.join(timeout=30)
             if self._record_thread.is_alive():
                 logger.warning("Record thread did not exit in 30s, continuing cleanup")
-        self._stopped_event.set()  # ensure status thread exits
+        self._stopped_event.set()  # ensure status/fanout threads exit
+        if self._fanout_thread is not None:
+            self._fanout_thread.join(timeout=10)
         if self._status_thread is not None:
             self._status_thread.join(timeout=5)
 
