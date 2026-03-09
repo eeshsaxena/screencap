@@ -18,79 +18,62 @@ _PLENTY_OF_DISK = namedtuple("DiskUsage", ["total", "used", "free"])(
 class TestForceExitCleanup:
     """Tests for the force-quit (second Ctrl+C) behavior."""
 
-    def test_no_os_exit_in_recorder(self):
-        """Verify os._exit is not called anywhere in the recorder module.
+    def test_os_exit_only_in_force_exit(self):
+        """Verify os._exit is used only inside _force_exit, nowhere else.
 
-        os._exit skips finally blocks and atexit handlers — sys.exit(1)
-        must be used instead to ensure cleanup runs.  Uses AST analysis
-        so comments and strings don't cause false positives.
+        os._exit is required in _force_exit to avoid threading._shutdown
+        deadlock, but must not appear elsewhere (it skips finally blocks).
         """
         import screencap.recorder as mod
 
         source = inspect.getsource(mod)
         tree = ast.parse(source)
-        os_exit_calls = [
-            node for node in ast.walk(tree)
-            if isinstance(node, ast.Call)
-            and isinstance(node.func, ast.Attribute)
-            and node.func.attr == "_exit"
-            and isinstance(node.func.value, ast.Name)
-            and node.func.value.id == "os"
-        ]
-        assert os_exit_calls == [], "os._exit found — use sys.exit(1) to allow cleanup"
 
-    def test_force_handler_calls_terminate_and_kill(self):
-        """The force-exit handler should terminate then kill children."""
-        mock_child_a = mock.MagicMock()
-        mock_child_b = mock.MagicMock()
+        def _walk_excluding(node, excluded_names):
+            """Walk AST but skip FunctionDef nodes whose name is in excluded_names."""
+            for child in ast.iter_child_nodes(node):
+                if isinstance(child, ast.FunctionDef) and child.name in excluded_names:
+                    continue
+                yield child
+                yield from _walk_excluding(child, excluded_names)
 
-        # Build a _force_exit-like handler to test in isolation
-        import multiprocessing
+        # Check every function EXCEPT _force_exit for os._exit calls
+        for node in ast.walk(tree):
+            if isinstance(node, ast.FunctionDef) and node.name != "_force_exit":
+                for child in _walk_excluding(node, {"_force_exit"}):
+                    if (
+                        isinstance(child, ast.Call)
+                        and isinstance(child.func, ast.Attribute)
+                        and child.func.attr == "_exit"
+                        and isinstance(child.func.value, ast.Name)
+                        and child.func.value.id == "os"
+                    ):
+                        raise AssertionError(
+                            f"os._exit found in {node.name} — only allowed in _force_exit"
+                        )
 
-        with mock.patch(
-            "multiprocessing.active_children",
-            side_effect=[
-                [mock_child_a, mock_child_b],  # first call: terminate
-                [mock_child_b],  # second call: only b survived for kill
-            ],
-        ):
-            # Simulate what the second Ctrl+C does
-            for child in multiprocessing.active_children():
-                child.terminate()
-            for child in multiprocessing.active_children():
-                child.kill()
-
-        mock_child_a.terminate.assert_called_once()
-        mock_child_b.terminate.assert_called_once()
-        mock_child_b.kill.assert_called_once()
-        mock_child_a.kill.assert_not_called()
-
-    def test_force_quit_uses_sys_exit(self):
-        """The force-quit path must use sys.exit (not os._exit) so that
-        finally blocks and atexit handlers run.  Uses AST to find
-        sys.exit calls inside the _force_exit nested function."""
+    def test_force_quit_cleans_up_pidfile(self):
+        """The force-quit handler should call delete_pidfile before os._exit."""
         import screencap.recorder as mod
 
         source = inspect.getsource(mod)
         tree = ast.parse(source)
 
-        # Find the _force_exit function definition
         force_exit_fn = None
         for node in ast.walk(tree):
             if isinstance(node, ast.FunctionDef) and node.name == "_force_exit":
                 force_exit_fn = node
                 break
-        assert force_exit_fn is not None, "_force_exit function not found in recorder"
+        assert force_exit_fn is not None
 
-        sys_exit_calls = [
+        # Verify delete_pidfile is called inside _force_exit
+        delete_calls = [
             node for node in ast.walk(force_exit_fn)
             if isinstance(node, ast.Call)
-            and isinstance(node.func, ast.Attribute)
-            and node.func.attr == "exit"
-            and isinstance(node.func.value, ast.Name)
-            and node.func.value.id == "sys"
+            and isinstance(node.func, ast.Name)
+            and node.func.id == "delete_pidfile"
         ]
-        assert len(sys_exit_calls) >= 1, "_force_exit must call sys.exit"
+        assert len(delete_calls) >= 1, "_force_exit must call delete_pidfile"
 
 
 class TestAtexitHandler:
