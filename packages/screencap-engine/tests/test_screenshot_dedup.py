@@ -382,6 +382,24 @@ def _press_event(ts: float) -> Event:
     return Event(timestamp=ts, type="action", data={"name": "press", "key": "a"})
 
 
+class _AdvancingClock:
+    """Fake monotonic clock that advances by a fixed step on each call.
+
+    Decoupled from the number of internal time.monotonic() calls in
+    process_events() — any refactoring that adds/removes calls just shifts
+    the absolute time, it doesn't break the relative intervals.
+    """
+
+    def __init__(self, start: float = 0.0, step: float = 0.05):
+        self._value = start
+        self._step = step
+
+    def __call__(self) -> float:
+        v = self._value
+        self._value += self._step
+        return v
+
+
 class TestActionAwareSavesDragFrames:
     """ACTION_AWARE=True saves drag frames that dedup would reject."""
 
@@ -391,18 +409,10 @@ class TestActionAwareSavesDragFrames:
         img = _img()
         t0 = 1000.0
 
-        # Fake monotonic clock that advances with each call to match event pace
-        mono_times = iter([
-            # settle check in queue.Empty (initial)
-            0.0,
-            # click action: _r_mono
-            10.0,
-            # move action: _r_mono (0.15s after click in event time)
-            10.15,
-            # move action: _r_mono (0.3s after click in event time)
-            10.30,
-            # settle check (has_pending_settle) in event loop + other calls
-        ] + [99.0] * 50)  # padding for drain/shutdown calls
+        # start=10.0 clears the initial _last_save_mono=0.0 on first event.
+        # step=0.05s → the retention filter's 0.1s drag interval elapses
+        # roughly every 2 monotonic() calls, regardless of internal call count.
+        clock = _AdvancingClock(start=10.0, step=0.05)
 
         events = [
             _screen_event(t0, img),
@@ -415,11 +425,11 @@ class TestActionAwareSavesDragFrames:
         ]
 
         with mock.patch("sc_engine.recorder.time") as mock_time:
-            mock_time.monotonic = mock.MagicMock(side_effect=mono_times)
+            mock_time.monotonic = clock
             mock_time.time = time.time
             screen_count, action_count, _, drops = _run_process_events(events)
 
-        # Click save + 2 drag cadence bypasses = 3 screen saves
+        # Click always saves; drag moves save when cadence elapses
         assert screen_count >= 2
         assert drops.get("screen_click_save", 0) >= 1
 
@@ -433,16 +443,10 @@ class TestActionAwareTypingUsesTimeFloor:
         img = _img()
         t0 = 1000.0
 
-        # Monotonic times: first key at 10.0, second at 10.3 (< 1.0s), third at 10.6 (< 1.0s)
-        mono_times = iter([
-            0.0,
-            # first press: _r_mono
-            10.0,
-            # second press: _r_mono (0.3s later → within 1.0s type interval)
-            10.3,
-            # third press: _r_mono (0.6s later → still within 1.0s)
-            10.6,
-        ] + [99.0] * 50)
+        # start=10.0 clears the initial _last_save_mono=0.0 on first event.
+        # step=0.05s → consecutive press events are ~0.05-0.15s apart in
+        # monotonic time, well within the 1.0s type interval.
+        clock = _AdvancingClock(start=10.0, step=0.05)
 
         events = [
             _screen_event(t0, img),
@@ -455,10 +459,42 @@ class TestActionAwareTypingUsesTimeFloor:
         ]
 
         with mock.patch("sc_engine.recorder.time") as mock_time:
-            mock_time.monotonic = mock.MagicMock(side_effect=mono_times)
+            mock_time.monotonic = clock
             mock_time.time = time.time
             screen_count, action_count, _, drops = _run_process_events(events)
 
-        # Only first frame saved (typing cadence = 1.0s, events < 1s apart)
+        # Only first frame saved (typing cadence = 1.0s, clock advances ~0.05s/call)
         assert screen_count == 1
         assert drops.get("screen_cadence_skip", 0) >= 1
+
+
+class TestActionAwareWithDedupFallthrough:
+    """ACTION_AWARE + DEDUP=True: BASELINE decision falls through to dHash."""
+
+    def test_unknown_action_falls_through_to_dedup(self):
+        object.__setattr__(config, "SCREENSHOT_ACTION_AWARE", True)
+        object.__setattr__(config, "SCREENSHOT_DEDUP", True)
+        object.__setattr__(config, "SCREENSHOT_MIN_INTERVAL", 1.0)
+        object.__setattr__(config, "SCREENSHOT_HASH_THRESHOLD", 8)
+        img = _img()
+        t0 = 1000.0
+
+        clock = _AdvancingClock(start=10.0, step=0.05)
+
+        # key.down is unknown to retention filter → BASELINE → dHash gate
+        events = [
+            _screen_event(t0, img),
+            _window_event(t0 + 0.001),
+            _action_event(t0 + 0.01),        # first frame → saves (no prior hash)
+            _screen_event(t0 + 0.5, img),    # same image, < 1s
+            _action_event(t0 + 0.51),        # BASELINE → dHash → time floor skip
+        ]
+
+        with mock.patch("sc_engine.recorder.time") as mock_time:
+            mock_time.monotonic = clock
+            mock_time.time = time.time
+            screen_count, _, _, drops = _run_process_events(events)
+
+        # dHash time floor should kick in — only first frame saved
+        assert screen_count == 1
+        assert drops.get("screen_time_floor", 0) == 1
