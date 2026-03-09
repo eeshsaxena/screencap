@@ -12,6 +12,8 @@ from typing import TYPE_CHECKING, Iterator
 from sc_engine.convert import dict_to_action_event
 from sc_engine.events import (
     ActionEvent as PydanticActionEvent,
+    BaseEvent,
+    WindowSwitchEvent,
 )
 from sc_engine.events import (
     KeyDownEvent,
@@ -21,7 +23,11 @@ from sc_engine.events import (
     MouseMoveEvent,
     SpecialKeyEvent,
 )
-from sc_engine.processing import process_events
+from sc_engine.processing import (
+    deduplicate_window_events,
+    interleave_window_events,
+    process_events,
+)
 
 if TYPE_CHECKING:
     from PIL import Image
@@ -366,6 +372,54 @@ class CaptureSession:
             if pydantic_event is not None:
                 events.append(pydantic_event)
         return events
+
+    def export_events(self, include_moves: bool = False) -> list[BaseEvent]:
+        """Produce a combined, time-ordered list of processed action events
+        and deduplicated window.switch events for JSONL export.
+
+        Unlike :meth:`actions`, this returns raw Pydantic event objects
+        (no Action wrapper, no screenshots) and includes WindowSwitchEvent
+        entries interleaved by timestamp.
+
+        Privacy filtering is NOT applied here — callers (exporter,
+        chunk processor) apply their own privacy policy.
+
+        Args:
+            include_moves: Whether to include mouse.move events.
+
+        Returns:
+            Combined list of action + window.switch events, sorted by timestamp.
+        """
+        # 1. Process action events through the merge pipeline
+        raw = self.raw_events()
+        processed = process_events(
+            raw,
+            double_click_interval=self._recording.double_click_interval_seconds or 0.5,
+            double_click_distance=self._recording.double_click_distance_pixels or 5,
+        )
+
+        # Filter moves if not requested
+        if not include_moves:
+            processed = [e for e in processed if not isinstance(e, MouseMoveEvent)]
+
+        # 2. Build deduplicated window.switch events from DB
+        window_rows = []
+        for we in getattr(self._recording, "window_events", []):
+            window_rows.append({
+                "timestamp": we.timestamp,
+                "app_bundle_id": getattr(we, "app_bundle_id", None),
+                "title": getattr(we, "title", None),
+                "window_id": str(getattr(we, "window_id", "") or ""),
+                "left": getattr(we, "left", 0),
+                "top": getattr(we, "top", 0),
+                "width": getattr(we, "width", 0),
+                "height": getattr(we, "height", 0),
+            })
+        window_rows.sort(key=lambda r: r["timestamp"])
+        window_switches = deduplicate_window_events(window_rows)
+
+        # 3. Interleave by timestamp
+        return interleave_window_events(processed, window_switches)
 
     def actions(self, include_moves: bool = False) -> Iterator[Action]:
         """Iterate over processed actions.
