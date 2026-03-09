@@ -412,7 +412,31 @@ class ChunkProcessor:
         transcript_json_path.write_text(json.dumps(resp.model_dump(), indent=2))
 
     def _export_events(self, idx: int, start_ts: float, end_ts: float) -> Path:
-        """Export events from recording.db as JSONL for this chunk's time range."""
+        """Export events from recording.db as JSONL for this chunk's time range.
+
+        Uses the shared processing pipeline (same as CLI ``screencap export``)
+        so both paths produce identical JSONL format.
+
+        Steps: query action_event + window_event by time range →
+        dict_to_action_event → process_events → deduplicate window →
+        interleave → serialize.  Includes initial window context (last
+        window event before chunk start) and format_version: 2 header.
+        Mouse.move events are excluded by default.
+
+        Chunk boundary note: the processing pipeline is stateful (click
+        merging, typing aggregation).  A mouse.down at chunk end may stay
+        unmerged — this is an accepted trade-off documented as a known
+        limitation (orphan events at boundaries).
+        """
+        from sc_engine.convert import dict_to_action_event
+        from sc_engine.events import MouseMoveEvent
+        from sc_engine.processing import (
+            deduplicate_window_events,
+            interleave_window_events,
+            process_events,
+        )
+        from screencap.exporter import build_export_metadata, build_privacy_filter
+
         jsonl_path = self._capture_dir / f"events_{idx:04d}.jsonl"
         if jsonl_path.exists():
             return jsonl_path
@@ -422,18 +446,110 @@ class ChunkProcessor:
         conn.execute("PRAGMA query_only=ON")
         conn.row_factory = sqlite3.Row
         try:
-            rows = conn.execute(
+            # 1. Query action events and convert to Pydantic
+            action_rows = conn.execute(
                 "SELECT * FROM action_event WHERE timestamp >= ? AND timestamp < ? ORDER BY timestamp",
                 (start_ts, end_ts),
             ).fetchall()
-            with open(jsonl_path, "w") as f:
-                for row in rows:
-                    f.write(json.dumps(dict(row)) + "\n")
-            logger.info(f"Exported {len(rows)} events to {jsonl_path.name}")
+
+            raw_events = []
+            for row in action_rows:
+                try:
+                    evt = dict_to_action_event(dict(row))
+                    if evt is not None:
+                        raw_events.append(evt)
+                except Exception:
+                    logger.debug(f"Skipping malformed action event at ts={row['timestamp']}")
+
+            # 2. Run through processing pipeline
+            processed = process_events(raw_events)
+
+            # 3. Exclude mouse.move by default
+            processed = [e for e in processed if not isinstance(e, MouseMoveEvent)]
+
+            # 4. Query window events for deduplication
+            window_rows = self._query_window_events(conn, start_ts, end_ts)
+
+            # 5. Add initial window context (last window before chunk start)
+            initial_ctx = self._query_initial_window_context(conn, start_ts)
+            if initial_ctx is not None:
+                window_rows = [initial_ctx] + window_rows
+
+            window_switches = deduplicate_window_events(window_rows)
+
+            # 6. Apply privacy filter for cloud-intent
+            if self._cloud_intent:
+                pf = build_privacy_filter(
+                    privacy_mode=self._privacy_mode,
+                    cloud_intent=True,
+                )
+                window_switches = [
+                    filtered for ws in window_switches
+                    if (filtered := pf(ws)) is not None
+                ]
+
+            # 7. Interleave
+            combined = interleave_window_events(processed, window_switches)
+
+            # 8. Build metadata header
+            meta = build_export_metadata(exclude_moves=True)
+
+            # 9. Atomic write
+            tmp_path = str(jsonl_path) + ".tmp"
+            with open(tmp_path, "w") as f:
+                f.write(json.dumps(meta) + "\n")
+                for evt in combined:
+                    f.write(evt.model_dump_json() + "\n")
+            os.rename(tmp_path, str(jsonl_path))
+
+            n_action = len(processed)
+            n_window = len(window_switches)
+            logger.info(
+                f"Exported {n_action} action + {n_window} window events to {jsonl_path.name}"
+            )
+        except Exception:
+            # Clean up partial .tmp on failure
+            tmp_path = str(jsonl_path) + ".tmp"
+            if os.path.exists(tmp_path):
+                os.unlink(tmp_path)
+            raise
         finally:
             conn.close()
 
         return jsonl_path
+
+    def _query_window_events(
+        self, conn: sqlite3.Connection, start_ts: float, end_ts: float,
+    ) -> list[dict]:
+        """Query window_event table for a time range. Returns list of dicts."""
+        try:
+            rows = conn.execute(
+                "SELECT * FROM window_event WHERE timestamp >= ? AND timestamp < ? ORDER BY timestamp",
+                (start_ts, end_ts),
+            ).fetchall()
+            return [dict(r) for r in rows]
+        except sqlite3.OperationalError:
+            # window_event table may not exist in older DBs
+            logger.debug("window_event table not found, skipping window events")
+            return []
+
+    def _query_initial_window_context(
+        self, conn: sqlite3.Connection, start_ts: float,
+    ) -> dict | None:
+        """Query the last window_event before chunk start for initial context."""
+        try:
+            row = conn.execute(
+                "SELECT * FROM window_event WHERE timestamp < ? ORDER BY timestamp DESC LIMIT 1",
+                (start_ts,),
+            ).fetchone()
+            if row is not None:
+                d = dict(row)
+                # Set timestamp to just before chunk start so it appears first
+                d["timestamp"] = start_ts - 0.001
+                return d
+            return None
+        except sqlite3.OperationalError:
+            return None
 
     def _generate_manifest(
         self, idx: int, start_ts: float, end_ts: float,
@@ -456,17 +572,11 @@ class ChunkProcessor:
         Per-field failure → <SCRUB_FAILED> sentinel. Per-file failure → file
         marked for skip (renamed to .scrub_failed).
         """
-        from screencap.privacy import AllDetectorsFailedError
-        from screencap.privacy.actions import KEYSTROKE_CONTENT_FIELDS
-
-        pipeline = self._pipeline
-        anonymizer = self._anonymizer
-
         # --- Events JSONL ---
         events_path = self._capture_dir / f"events_{idx:04d}.jsonl"
         if events_path.exists():
             try:
-                self._scrub_events_jsonl(events_path, pipeline, anonymizer)
+                self._scrub_events_jsonl(events_path)
             except Exception as e:
                 logger.error(f"Chunk {idx}: events JSONL scrub failed, skipping file: {e}")
                 _rename_scrub_failed(events_path)
@@ -474,7 +584,7 @@ class ChunkProcessor:
         # --- Transcript .txt ---
         if transcript_path and transcript_path.exists():
             try:
-                self._scrub_transcript_txt(transcript_path, pipeline, anonymizer)
+                self._scrub_transcript_txt(transcript_path)
             except Exception as e:
                 logger.error(f"Chunk {idx}: transcript .txt scrub failed, skipping file: {e}")
                 _rename_scrub_failed(transcript_path)
@@ -483,7 +593,7 @@ class ChunkProcessor:
         transcript_json = self._capture_dir / f"transcript_{idx:04d}.json"
         if transcript_json.exists():
             try:
-                self._scrub_transcript_json(transcript_json, pipeline, anonymizer)
+                self._scrub_transcript_json(transcript_json)
             except Exception as e:
                 logger.error(f"Chunk {idx}: transcript .json scrub failed, skipping file: {e}")
                 _rename_scrub_failed(transcript_json)
@@ -492,7 +602,7 @@ class ChunkProcessor:
         manifest_path = self._capture_dir / f"chunk_{idx:04d}_manifest.json"
         if manifest_path.exists():
             try:
-                self._scrub_manifest(manifest_path, pipeline, anonymizer)
+                self._scrub_manifest(manifest_path)
             except Exception as e:
                 logger.error(f"Chunk {idx}: manifest scrub failed, skipping file: {e}")
                 _rename_scrub_failed(manifest_path)
@@ -512,56 +622,42 @@ class ChunkProcessor:
             return "<SCRUB_FAILED>"
         return self._anonymizer.anonymize(result.normalized_text, result.detections)
 
-    def _scrub_events_jsonl(self, path: Path, pipeline, anonymizer) -> None:
-        """Scrub keystroke content in events JSONL using combined-text aggregation."""
-        from screencap.privacy.actions import KEYSTROKE_CONTENT_FIELDS
+    def _scrub_events_jsonl(self, path: Path) -> None:
+        """Scrub PII in events JSONL (v2 unified format).
 
+        - ``key.type`` events: detect PII in ``text`` field, null ``text``
+          and ``children[*].key_char`` if detected.
+        - ``key.shortcut`` events: same as key.type.
+        - ``window.switch`` events: scrub ``window_title`` field.
+        """
         lines = path.read_text(encoding="utf-8").splitlines()
         events = []
         for line in lines:
             if line.strip():
                 events.append(json.loads(line))
 
-        # Aggregate consecutive key.down events into combined text strings
-        # to defeat the 4-char short-circuit in DetectionPipeline
-        i = 0
-        while i < len(events):
-            evt = events[i]
-            if evt.get("name") != "key.down" or not evt.get("key_char"):
-                i += 1
-                continue
-
-            # Collect run of consecutive key.down events
-            run_start = i
-            combined_chars = []
-            while i < len(events) and events[i].get("name") == "key.down":
-                ch = events[i].get("key_char", "")
-                combined_chars.append(ch if ch else "")
-                i += 1
-
-            combined_text = "".join(combined_chars)
-            if len(combined_text) < 4:
-                # Too short for detection — leave as-is
-                continue
-
-            # Run detection on combined text
-            scrubbed = self._scrub_text_field(combined_text)
-            if scrubbed == combined_text:
-                # No PII detected
-                continue
-
-            # PII found — null keystroke content fields for this entire run
-            for j in range(run_start, run_start + len(combined_chars)):
-                for field in KEYSTROKE_CONTENT_FIELDS:
-                    if field in events[j]:
-                        events[j][field] = None
-
-        # Also scrub any text fields on non-keystroke events
         for evt in events:
-            if evt.get("name") in ("key.down", "key.up"):
+            if evt.get("_meta"):
                 continue
-            if "text" in evt and isinstance(evt["text"], str) and evt["text"]:
-                evt["text"] = self._scrub_text_field(evt["text"])
+
+            evt_type = evt.get("type", "")
+
+            # key.type / key.shortcut: detect PII in text, null text + children key_char
+            if evt_type in ("key.type", "key.shortcut"):
+                text = evt.get("text", "")
+                if text and len(text) >= 4:
+                    scrubbed = self._scrub_text_field(text)
+                    if scrubbed != text:
+                        evt["text"] = None
+                        for child in evt.get("children", []):
+                            if "key_char" in child:
+                                child["key_char"] = None
+
+            # window.switch: scrub window_title
+            elif evt_type == "window.switch":
+                title = evt.get("window_title", "")
+                if title:
+                    evt["window_title"] = self._scrub_text_field(title)
 
         # Atomic write
         tmp_path = str(path) + ".tmp"
@@ -570,7 +666,7 @@ class ChunkProcessor:
                 f.write(json.dumps(evt) + "\n")
         os.rename(tmp_path, str(path))
 
-    def _scrub_transcript_txt(self, path: Path, pipeline, anonymizer) -> None:
+    def _scrub_transcript_txt(self, path: Path) -> None:
         """Scrub PII from transcript .txt file."""
         text = path.read_text(encoding="utf-8")
         scrubbed = self._scrub_text_field(text)
@@ -579,7 +675,7 @@ class ChunkProcessor:
             f.write(scrubbed)
         os.rename(tmp_path, str(path))
 
-    def _scrub_transcript_json(self, path: Path, pipeline, anonymizer) -> None:
+    def _scrub_transcript_json(self, path: Path) -> None:
         """Scrub PII from transcript .json file (text + segments)."""
         data = json.loads(path.read_text(encoding="utf-8"))
         if isinstance(data, dict):
@@ -594,7 +690,7 @@ class ChunkProcessor:
             json.dump(data, f, indent=2)
         os.rename(tmp_path, str(path))
 
-    def _scrub_manifest(self, path: Path, pipeline, anonymizer) -> None:
+    def _scrub_manifest(self, path: Path) -> None:
         """Scrub dominant_title in manifest and re-derive task name from clean title."""
         from screencap.task_manifest import _derive_task_name
 

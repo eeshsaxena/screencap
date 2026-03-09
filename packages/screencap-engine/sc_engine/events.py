@@ -37,6 +37,7 @@ class EventType(str, Enum):
 
     # Window events
     WINDOW_STATE = "window.state"
+    WINDOW_SWITCH = "window.switch"
 
     # Derived events (from post-processing)
     MOUSE_CLICK = "mouse.click"
@@ -271,6 +272,24 @@ class WindowStateEvent(BaseEvent):
     meta: dict | None = Field(default=None, description="Window metadata")
 
 
+class WindowSwitchEvent(BaseEvent):
+    """Standalone event emitted when the active app or window changes.
+
+    Deduplicated by (app_bundle_id, window_id) — captures actual window
+    switches, ignores title-only changes. Used in events.jsonl export.
+    """
+
+    type: Literal[EventType.WINDOW_SWITCH] = EventType.WINDOW_SWITCH
+    app_name: str = Field(description="Human-readable app name")
+    app_bundle_id: str | None = Field(default=None, description="e.g. com.apple.finder")
+    window_title: str = Field(description="Full or redacted window title")
+    window_id: str = Field(description="macOS CGWindowNumber")
+    x: int = Field(description="Window left position")
+    y: int = Field(description="Window top position")
+    width: int = Field(description="Window width in pixels")
+    height: int = Field(description="Window height in pixels")
+
+
 # =============================================================================
 # Derived Events (from post-processing)
 # =============================================================================
@@ -428,6 +447,6 @@ ScreenEvent = ScreenFrameEvent
 
 AudioEvent = AudioChunkEvent
 
-WindowEvent = WindowStateEvent
+WindowEvent = WindowStateEvent | WindowSwitchEvent
 
 Event = ActionEvent | ScreenEvent | AudioEvent | WindowEvent

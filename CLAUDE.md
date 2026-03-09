@@ -63,6 +63,28 @@ Two-layer privacy enforcement: capture-time filtering + post-recording scrubbing
 - `shared` mode is defined in the matrix but raises `InvalidPrivacyConfigError` until MASK_REGION is implemented.
 - The `setup` CLI command runs an interactive TUI (curses) to classify installed apps, writing results to `[privacy]` in config.toml. First `screencap start` prompts for setup if no `[privacy]` section exists.
 
+## Export System
+
+**Unified processing pipeline:** Both CLI `screencap export` and the chunk processor share the same event processing path:
+1. Raw DB rows → `dict_to_action_event()` (`sc_engine/convert.py`) → Pydantic events
+2. `process_events()` (`sc_engine/processing.py`) — 11-stage merge/detect pipeline
+3. `deduplicate_window_events()` + `interleave_window_events()` (`sc_engine/processing.py`)
+4. Privacy filtering (screencap layer) → JSONL serialization via `model_dump_json()`
+
+**Two export paths:**
+- **CLI export** (`src/screencap/exporter.py`) — `CaptureSession.export_events()` → `_write_events()`. Full recording export with optional privacy filter.
+- **Chunk processor** (`src/screencap/chunk_processor.py:_export_events()`) — per-chunk time-range export using raw `sqlite3` queries → shared pipeline. Includes initial window context (last window event before chunk start).
+
+**`events.jsonl` format (v2):**
+- Line 1: `_meta` header with `format_version: 2`, `screencap_version`, `exported_at`
+- Remaining lines: Pydantic event JSON — processed action events (`mouse.singleclick`, `key.type`, etc.) interleaved with `window.switch` events
+- `window.switch` events are deduplicated by `(app_bundle_id, window_id)` — title-only changes are ignored
+- `mouse.move` events excluded by default in both paths
+
+**Privacy-aware `window.switch` events:** EXCLUDE apps → suppressed entirely, MASK_WINDOW → title replaced with app name, OCR_FALLBACK → suppressed for cloud-intent uploads. Privacy filtering happens in the screencap layer (`exporter.py` / `chunk_processor.py`), not in `sc_engine`.
+
+**Scrubbing pipeline:** `_scrub_events_jsonl()` scrubs `key.type` and `key.shortcut` text + children `key_char`, and `window.switch` titles.
+
 ## Key Patterns
 
 - All user-facing output uses `rich.console.Console` (no bare `print()`).

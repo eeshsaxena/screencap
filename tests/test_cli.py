@@ -508,23 +508,21 @@ def test_list_works_without_record_deps(tmp_path):
 # --- export command tests ---
 
 
-def _mock_action(event_json='{"type":"mouse.singleclick","timestamp":1.0,"x":100,"y":200}'):
-    """Create a mock Action whose event.model_dump_json() returns the given JSON."""
+def _mock_event(event_json='{"type":"mouse.singleclick","timestamp":1.0,"x":100,"y":200}'):
+    """Create a mock BaseEvent whose model_dump_json() returns the given JSON."""
     event = mock.MagicMock()
     event.model_dump_json.return_value = event_json
-    action = mock.MagicMock()
-    action.event = event
-    return action
+    return event
 
 
-def _mock_capture(actions=None):
-    """Create a mock Capture that yields given actions."""
+def _mock_capture(events=None):
+    """Create a mock Capture that yields given events from export_events()."""
     capture = mock.MagicMock()
     capture.__enter__ = mock.MagicMock(return_value=capture)
     capture.__exit__ = mock.MagicMock(return_value=False)
-    if actions is None:
-        actions = [_mock_action()]
-    capture.actions.return_value = iter(actions)
+    if events is None:
+        events = [_mock_event()]
+    capture.export_events.return_value = iter(events)
     return capture
 
 
@@ -635,11 +633,11 @@ def test_export_path_traversal(tmp_path):
 
 
 def test_export_exclude_moves(tmp_path):
-    """--exclude-moves passes include_moves=False to capture.actions()."""
+    """--exclude-moves passes include_moves=False to capture.export_events()."""
     rec_dir = tmp_path / "my-rec"
     rec_dir.mkdir()
 
-    capture = _mock_capture(actions=[])
+    capture = _mock_capture(events=[])
     runner = CliRunner()
 
     with (
@@ -649,7 +647,7 @@ def test_export_exclude_moves(tmp_path):
         result = runner.invoke(cli, ["export", "my-rec", "--exclude-moves"])
 
     assert result.exit_code == 0
-    capture.actions.assert_called_once_with(include_moves=False)
+    capture.export_events.assert_called_once_with(include_moves=False)
 
 
 def test_export_includes_moves_by_default(tmp_path):
@@ -657,7 +655,7 @@ def test_export_includes_moves_by_default(tmp_path):
     rec_dir = tmp_path / "my-rec"
     rec_dir.mkdir()
 
-    capture = _mock_capture(actions=[])
+    capture = _mock_capture(events=[])
     runner = CliRunner()
 
     with (
@@ -667,7 +665,7 @@ def test_export_includes_moves_by_default(tmp_path):
         result = runner.invoke(cli, ["export", "my-rec"])
 
     assert result.exit_code == 0
-    capture.actions.assert_called_once_with(include_moves=True)
+    capture.export_events.assert_called_once_with(include_moves=True)
 
 
 def test_export_legacy_db_error(tmp_path):
@@ -694,7 +692,7 @@ def test_export_empty_recording(tmp_path):
     rec_dir = tmp_path / "empty-rec"
     rec_dir.mkdir()
 
-    capture = _mock_capture(actions=[])
+    capture = _mock_capture(events=[])
     runner = CliRunner()
 
     with (
@@ -717,12 +715,12 @@ def test_export_multiple_events(tmp_path):
     rec_dir = tmp_path / "multi-rec"
     rec_dir.mkdir()
 
-    actions = [
-        _mock_action('{"type":"mouse.singleclick","timestamp":1.0}'),
-        _mock_action('{"type":"key.type","timestamp":2.0}'),
-        _mock_action('{"type":"mouse.scroll","timestamp":3.0}'),
+    events = [
+        _mock_event('{"type":"mouse.singleclick","timestamp":1.0}'),
+        _mock_event('{"type":"key.type","timestamp":2.0}'),
+        _mock_event('{"type":"mouse.scroll","timestamp":3.0}'),
     ]
-    capture = _mock_capture(actions=actions)
+    capture = _mock_capture(events=events)
     runner = CliRunner()
 
     with (

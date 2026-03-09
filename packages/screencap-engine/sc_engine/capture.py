@@ -9,25 +9,25 @@ from dataclasses import dataclass
 from pathlib import Path
 from typing import TYPE_CHECKING, Iterator
 
+from sc_engine.convert import dict_to_action_event
 from sc_engine.events import (
     ActionEvent as PydanticActionEvent,
+    BaseEvent,
+    WindowSwitchEvent,
 )
 from sc_engine.events import (
     KeyDownEvent,
     KeyShortcutEvent,
     KeyTypeEvent,
     KeyUpEvent,
-    MouseButton,
-    MouseDownEvent,
-    MouseMagnifyEvent,
     MouseMoveEvent,
-    MouseRotateEvent,
-    MouseScrollEvent,
-    MouseSmartMagnifyEvent,
-    MouseUpEvent,
     SpecialKeyEvent,
 )
-from sc_engine.processing import process_events
+from sc_engine.processing import (
+    deduplicate_window_events,
+    interleave_window_events,
+    process_events,
+)
 
 if TYPE_CHECKING:
     from PIL import Image
@@ -36,102 +36,39 @@ if TYPE_CHECKING:
 def _convert_action_event(db_event) -> PydanticActionEvent | None:
     """Convert a SQLAlchemy ActionEvent to a Pydantic event.
 
+    Thin wrapper around :func:`dict_to_action_event` that extracts
+    a dict from the ORM object.
+
     Args:
         db_event: SQLAlchemy ActionEvent instance.
 
     Returns:
         Pydantic event or None if unrecognized.
     """
-    ts = db_event.timestamp
-
-    if db_event.name == "move":
-        return MouseMoveEvent(
-            timestamp=ts,
-            x=db_event.mouse_x or 0,
-            y=db_event.mouse_y or 0,
-            pressure=getattr(db_event, "mouse_pressure", None),
-            modifier_flags=getattr(db_event, "modifier_flags", None),
-        )
-    elif db_event.name == "click":
-        button = db_event.mouse_button_name or "left"
-        try:
-            button = MouseButton(button)
-        except ValueError:
-            button = MouseButton.LEFT
-
-        if db_event.mouse_pressed is True:
-            return MouseDownEvent(
-                timestamp=ts,
-                x=db_event.mouse_x or 0,
-                y=db_event.mouse_y or 0,
-                button=button,
-                pressure=getattr(db_event, "mouse_pressure", None),
-                modifier_flags=getattr(db_event, "modifier_flags", None),
-            )
-        elif db_event.mouse_pressed is False:
-            return MouseUpEvent(
-                timestamp=ts,
-                x=db_event.mouse_x or 0,
-                y=db_event.mouse_y or 0,
-                button=button,
-                pressure=getattr(db_event, "mouse_pressure", None),
-                modifier_flags=getattr(db_event, "modifier_flags", None),
-            )
-        else:
-            return None
-    elif db_event.name == "scroll":
-        return MouseScrollEvent(
-            timestamp=ts,
-            x=db_event.mouse_x or 0,
-            y=db_event.mouse_y or 0,
-            dx=db_event.mouse_dx or 0,
-            dy=db_event.mouse_dy or 0,
-            modifier_flags=getattr(db_event, "modifier_flags", None),
-            scroll_phase=getattr(db_event, "scroll_phase", None),
-            momentum_phase=getattr(db_event, "momentum_phase", None),
-            is_continuous=getattr(db_event, "is_continuous", None),
-        )
-    elif db_event.name == "press":
-        return KeyDownEvent(
-            timestamp=ts,
-            key_name=db_event.key_name,
-            key_char=db_event.key_char,
-            key_vk=db_event.key_vk,
-            canonical_key_name=db_event.canonical_key_name,
-            canonical_key_char=db_event.canonical_key_char,
-            canonical_key_vk=db_event.canonical_key_vk,
-        )
-    elif db_event.name == "release":
-        return KeyUpEvent(
-            timestamp=ts,
-            key_name=db_event.key_name,
-            key_char=db_event.key_char,
-            key_vk=db_event.key_vk,
-            canonical_key_name=db_event.canonical_key_name,
-            canonical_key_char=db_event.canonical_key_char,
-            canonical_key_vk=db_event.canonical_key_vk,
-        )
-    elif db_event.name == "magnify":
-        return MouseMagnifyEvent(
-            timestamp=ts,
-            x=db_event.mouse_x or 0,
-            y=db_event.mouse_y or 0,
-            magnification=db_event.mouse_dx or 0.0,
-        )
-    elif db_event.name == "rotate":
-        return MouseRotateEvent(
-            timestamp=ts,
-            x=db_event.mouse_x or 0,
-            y=db_event.mouse_y or 0,
-            rotation=db_event.mouse_dx or 0.0,
-        )
-    elif db_event.name == "smart_magnify":
-        return MouseSmartMagnifyEvent(
-            timestamp=ts,
-            x=float(db_event.mouse_x or 0),
-            y=float(db_event.mouse_y or 0),
-        )
-    return None
+    # Build a dict from the ORM object's columns.  Use getattr with
+    # defaults so missing columns (older DB schemas) don't crash.
+    row = {
+        "timestamp": db_event.timestamp,
+        "name": db_event.name,
+        "mouse_x": getattr(db_event, "mouse_x", None),
+        "mouse_y": getattr(db_event, "mouse_y", None),
+        "mouse_dx": getattr(db_event, "mouse_dx", None),
+        "mouse_dy": getattr(db_event, "mouse_dy", None),
+        "mouse_button_name": getattr(db_event, "mouse_button_name", None),
+        "mouse_pressed": getattr(db_event, "mouse_pressed", None),
+        "mouse_pressure": getattr(db_event, "mouse_pressure", None),
+        "modifier_flags": getattr(db_event, "modifier_flags", None),
+        "scroll_phase": getattr(db_event, "scroll_phase", None),
+        "momentum_phase": getattr(db_event, "momentum_phase", None),
+        "is_continuous": getattr(db_event, "is_continuous", None),
+        "key_name": getattr(db_event, "key_name", None),
+        "key_char": getattr(db_event, "key_char", None),
+        "key_vk": getattr(db_event, "key_vk", None),
+        "canonical_key_name": getattr(db_event, "canonical_key_name", None),
+        "canonical_key_char": getattr(db_event, "canonical_key_char", None),
+        "canonical_key_vk": getattr(db_event, "canonical_key_vk", None),
+    }
+    return dict_to_action_event(row)
 
 
 @dataclass
@@ -435,6 +372,54 @@ class CaptureSession:
             if pydantic_event is not None:
                 events.append(pydantic_event)
         return events
+
+    def export_events(self, include_moves: bool = False) -> list[BaseEvent]:
+        """Produce a combined, time-ordered list of processed action events
+        and deduplicated window.switch events for JSONL export.
+
+        Unlike :meth:`actions`, this returns raw Pydantic event objects
+        (no Action wrapper, no screenshots) and includes WindowSwitchEvent
+        entries interleaved by timestamp.
+
+        Privacy filtering is NOT applied here — callers (exporter,
+        chunk processor) apply their own privacy policy.
+
+        Args:
+            include_moves: Whether to include mouse.move events.
+
+        Returns:
+            Combined list of action + window.switch events, sorted by timestamp.
+        """
+        # 1. Process action events through the merge pipeline
+        raw = self.raw_events()
+        processed = process_events(
+            raw,
+            double_click_interval=self._recording.double_click_interval_seconds or 0.5,
+            double_click_distance=self._recording.double_click_distance_pixels or 5,
+        )
+
+        # Filter moves if not requested
+        if not include_moves:
+            processed = [e for e in processed if not isinstance(e, MouseMoveEvent)]
+
+        # 2. Build deduplicated window.switch events from DB
+        window_rows = []
+        for we in getattr(self._recording, "window_events", []):
+            window_rows.append({
+                "timestamp": we.timestamp,
+                "app_bundle_id": getattr(we, "app_bundle_id", None),
+                "title": getattr(we, "title", None),
+                "window_id": str(getattr(we, "window_id", "") or ""),
+                "left": getattr(we, "left", 0),
+                "top": getattr(we, "top", 0),
+                "width": getattr(we, "width", 0),
+                "height": getattr(we, "height", 0),
+            })
+        # window_events ORM relationship is already ordered by timestamp
+        window_switches = deduplicate_window_events(window_rows)
+
+        # 3. Interleave by timestamp
+        return interleave_window_events(processed, window_switches)
 
     def actions(self, include_moves: bool = False) -> Iterator[Action]:
         """Iterate over processed actions.

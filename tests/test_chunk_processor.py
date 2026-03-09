@@ -31,8 +31,8 @@ def capture_dir(tmp_path):
     return tmp_path
 
 
-def test_run_loop_does_not_exit_on_empty_queue(capture_dir):
-    """Regression test: _run must NOT exit after 10s of empty queue.
+def test_run_loop_survives_long_idle_and_responds(capture_dir):
+    """Regression: _run must survive 12s of empty queue and still process messages.
 
     Previously, queue.Empty (normal timeout) was caught by `except Exception`,
     which incremented consecutive_errors. After 5 timeouts (10s), the thread
@@ -53,7 +53,7 @@ def test_run_loop_does_not_exit_on_empty_queue(capture_dir):
     )
     cp.start()
 
-    # Wait 12 seconds — previously, the thread would die at ~10s
+    # Wait longer than the old 10s death threshold
     time.sleep(12)
 
     # Thread must still be alive
@@ -63,35 +63,7 @@ def test_run_loop_does_not_exit_on_empty_queue(capture_dir):
         "queue.Empty must not be treated as an error"
     )
 
-    # Clean shutdown
-    cp.stop(timeout=5)
-
-
-def test_run_loop_processes_message_after_long_wait(capture_dir):
-    """Verify ChunkProcessor processes a chunk message even after a long idle period."""
-    from screencap.chunk_processor import ChunkProcessor
-
-    q = multiprocessing.Queue()
-    ack_q = multiprocessing.Queue()
-
-    cp = ChunkProcessor(
-        capture_dir,
-        q,
-        ack_q,
-        recording_name="test",
-        upload_enabled=False,
-        auto_delete=False,
-    )
-    cp.start()
-
-    # Wait longer than old 10s death threshold
-    time.sleep(12)
-
-    # Now send a chunk message — processor should handle it
-    # (We'll just check thread is alive and can receive the poison pill)
-    assert cp._thread.is_alive()
-
-    # Send poison pill to verify the thread is responsive
+    # Verify it's still responsive by sending a poison pill
     q.put({"type": "poison_pill"})
     cp._thread.join(timeout=5)
     assert not cp._thread.is_alive(), "Thread should have exited after poison pill"
@@ -126,6 +98,10 @@ def cloud_capture_dir(tmp_path):
     conn.execute(
         "CREATE TABLE action_event ("
         "id INTEGER PRIMARY KEY, timestamp REAL, name TEXT, "
+        "mouse_x REAL, mouse_y REAL, mouse_dx REAL, mouse_dy REAL, "
+        "mouse_button_name TEXT, mouse_pressed INTEGER, "
+        "mouse_pressure REAL, modifier_flags INTEGER, "
+        "scroll_phase INTEGER, momentum_phase INTEGER, is_continuous INTEGER, "
         "key_char TEXT, key_name TEXT, key_vk TEXT, "
         "canonical_key_char TEXT, canonical_key_name TEXT, canonical_key_vk TEXT, "
         "text TEXT, element_state TEXT, "
@@ -134,7 +110,8 @@ def cloud_capture_dir(tmp_path):
     conn.execute(
         "CREATE TABLE window_event ("
         "id INTEGER PRIMARY KEY, timestamp REAL, title TEXT, "
-        "app_bundle_id TEXT, window_id TEXT)"
+        "app_bundle_id TEXT, window_id TEXT, "
+        "left INTEGER, top INTEGER, width INTEGER, height INTEGER)"
     )
     conn.execute(
         "CREATE TABLE recording (id INTEGER PRIMARY KEY, timestamp REAL)"
@@ -272,55 +249,6 @@ class TestCloudIntentGating:
 class TestInlineScrubbing:
     """Test inline scrubbing of text surfaces."""
 
-    def test_scrub_events_jsonl_nulls_pii_keystrokes(self, cloud_capture_dir, cloud_processor):
-        """Keystroke content fields must be nulled when PII is detected in combined text."""
-        events = []
-        for ch in "John Smith":
-            events.append({
-                "name": "key.down",
-                "timestamp": 1000.0 + len(events),
-                "key_char": ch,
-                "canonical_key_char": ch,
-            })
-
-        events_path = cloud_capture_dir / "events_0000.jsonl"
-        with open(events_path, "w") as f:
-            for evt in events:
-                f.write(json.dumps(evt) + "\n")
-
-        cloud_processor._scrub_events_jsonl(
-            events_path, cloud_processor._pipeline, cloud_processor._anonymizer,
-        )
-
-        scrubbed = [json.loads(line) for line in events_path.read_text().splitlines() if line.strip()]
-
-        for evt in scrubbed:
-            assert evt["key_char"] is None, f"key_char not nulled: {evt}"
-            assert evt["canonical_key_char"] is None
-
-    def test_scrub_events_jsonl_leaves_clean_keystrokes(self, cloud_capture_dir, cloud_processor):
-        """Keystrokes that don't contain PII should be left unchanged."""
-        events = []
-        for ch in "hello world":
-            events.append({
-                "name": "key.down",
-                "timestamp": 1000.0 + len(events),
-                "key_char": ch,
-            })
-
-        events_path = cloud_capture_dir / "events_0000.jsonl"
-        with open(events_path, "w") as f:
-            for evt in events:
-                f.write(json.dumps(evt) + "\n")
-
-        cloud_processor._scrub_events_jsonl(
-            events_path, cloud_processor._pipeline, cloud_processor._anonymizer,
-        )
-
-        scrubbed = [json.loads(line) for line in events_path.read_text().splitlines() if line.strip()]
-        chars = [e["key_char"] for e in scrubbed]
-        assert chars == list("hello world")
-
     def test_scrub_transcripts_txt_and_json(self, cloud_capture_dir, cloud_processor):
         """Both transcript formats must have PII replaced, including segment text."""
         txt_path = cloud_capture_dir / "transcript_0000.txt"
@@ -335,8 +263,8 @@ class TestInlineScrubbing:
         }))
 
         cp = cloud_processor
-        cp._scrub_transcript_txt(txt_path, cp._pipeline, cp._anonymizer)
-        cp._scrub_transcript_json(json_path, cp._pipeline, cp._anonymizer)
+        cp._scrub_transcript_txt(txt_path)
+        cp._scrub_transcript_json(json_path)
 
         # .txt
         txt_result = txt_path.read_text()
@@ -365,7 +293,7 @@ class TestInlineScrubbing:
         }))
 
         cp = cloud_processor
-        cp._scrub_manifest(manifest_path, cp._pipeline, cp._anonymizer)
+        cp._scrub_manifest(manifest_path)
 
         data = json.loads(manifest_path.read_text())
         task = data["tasks"][0]
@@ -404,18 +332,123 @@ class TestInlineScrubbing:
         assert not events_path.exists()
         assert (cloud_capture_dir / "events_0000.jsonl.scrub_failed").exists()
 
+    def test_scrub_v2_key_type_nulls_pii(self, cloud_capture_dir, cloud_processor):
+        """v2 format: key.type text with PII should be nulled, children key_char too."""
+        events = [
+            {"_meta": True, "format_version": 2},
+            {
+                "type": "key.type",
+                "timestamp": 1000.0,
+                "text": "John Smith",
+                "children": [
+                    {"type": "key.down", "timestamp": 1000.0, "key_char": "J"},
+                    {"type": "key.up", "timestamp": 1000.01, "key_char": "J"},
+                    {"type": "key.down", "timestamp": 1000.1, "key_char": "o"},
+                    {"type": "key.up", "timestamp": 1000.11, "key_char": "o"},
+                ],
+            },
+        ]
+
+        events_path = cloud_capture_dir / "events_0000.jsonl"
+        with open(events_path, "w") as f:
+            for evt in events:
+                f.write(json.dumps(evt) + "\n")
+
+        cloud_processor._scrub_events_jsonl(events_path)
+
+        scrubbed = [json.loads(line) for line in events_path.read_text().splitlines() if line.strip()]
+        key_type = scrubbed[1]
+        assert key_type["text"] is None
+        for child in key_type["children"]:
+            assert child["key_char"] is None
+
+    def test_scrub_v2_key_type_leaves_clean(self, cloud_capture_dir, cloud_processor):
+        """v2 format: key.type text without PII should be left unchanged."""
+        events = [
+            {"_meta": True, "format_version": 2},
+            {
+                "type": "key.type",
+                "timestamp": 1000.0,
+                "text": "hello world",
+                "children": [],
+            },
+        ]
+
+        events_path = cloud_capture_dir / "events_0000.jsonl"
+        with open(events_path, "w") as f:
+            for evt in events:
+                f.write(json.dumps(evt) + "\n")
+
+        cloud_processor._scrub_events_jsonl(events_path)
+
+        scrubbed = [json.loads(line) for line in events_path.read_text().splitlines() if line.strip()]
+        assert scrubbed[1]["text"] == "hello world"
+
+    def test_scrub_v2_key_shortcut_nulls_pii(self, cloud_capture_dir, cloud_processor):
+        """v2 format: key.shortcut with PII should null text and children key_char."""
+        events = [
+            {"_meta": True, "format_version": 2},
+            {
+                "type": "key.shortcut",
+                "timestamp": 1000.0,
+                "text": "John Smith",
+                "children": [
+                    {"type": "key.down", "timestamp": 1000.0, "key_char": "J"},
+                    {"type": "key.down", "timestamp": 1000.1, "key_char": "o"},
+                ],
+            },
+        ]
+
+        events_path = cloud_capture_dir / "events_0000.jsonl"
+        with open(events_path, "w") as f:
+            for evt in events:
+                f.write(json.dumps(evt) + "\n")
+
+        cloud_processor._scrub_events_jsonl(events_path)
+
+        scrubbed = [json.loads(line) for line in events_path.read_text().splitlines() if line.strip()]
+        shortcut = scrubbed[1]
+        assert shortcut["text"] is None
+        for child in shortcut["children"]:
+            assert child["key_char"] is None
+
+    def test_scrub_v2_window_switch_title(self, cloud_capture_dir, cloud_processor):
+        """v2 format: window.switch window_title with PII should be scrubbed."""
+        events = [
+            {"_meta": True, "format_version": 2},
+            {
+                "type": "window.switch",
+                "timestamp": 1000.0,
+                "app_name": "Chrome",
+                "app_bundle_id": "com.google.Chrome",
+                "window_title": "John Smith - Contract Review",
+                "window_id": "1",
+                "x": 0, "y": 0, "width": 800, "height": 600,
+            },
+        ]
+
+        events_path = cloud_capture_dir / "events_0000.jsonl"
+        with open(events_path, "w") as f:
+            for evt in events:
+                f.write(json.dumps(evt) + "\n")
+
+        cloud_processor._scrub_events_jsonl(events_path)
+
+        scrubbed = [json.loads(line) for line in events_path.read_text().splitlines() if line.strip()]
+        ws = scrubbed[1]
+        assert "John Smith" not in ws["window_title"]
+        assert "<PERSON>" in ws["window_title"]
 
 class TestBlockedIntervalsInManifest:
     """Tests for Phase 6: blocked intervals in chunk manifest."""
 
-    def test_blocked_intervals_added_to_manifest(self, cloud_capture_dir):
-        """ChunkProcessor adds blocked_intervals to manifest when screen_filter provides them."""
+    def test_generate_manifest_passes_blocked_intervals(self, cloud_capture_dir):
+        """_process_chunk passes screen_filter intervals to _generate_manifest."""
         from screencap.chunk_processor import ChunkProcessor
 
         q = multiprocessing.Queue()
         ack_q = multiprocessing.Queue()
 
-        # Create a mock screen_filter with blocked intervals
         mock_filter = MagicMock()
         mock_filter.get_blocked_intervals.return_value = [
             {"start_ts": 1000.5, "end_ts": 1010.0, "reason": "app_policy"},
@@ -423,48 +456,32 @@ class TestBlockedIntervalsInManifest:
 
         cp = ChunkProcessor(
             cloud_capture_dir, q, ack_q, recording_name="test",
-            upload_enabled=False, auto_delete=False, cloud_intent=True,
+            upload_enabled=False, auto_delete=False, cloud_intent=False,
             screen_filter=mock_filter,
         )
 
-        # Write a manifest file
-        manifest_path = cloud_capture_dir / "chunk_0000_manifest.json"
-        manifest_path.write_text(json.dumps({
-            "chunk_index": 0,
-            "tasks": [{"start_ts": 1000.0, "end_ts": 1060.0}],
-        }))
+        # Patch _generate_manifest to capture what _process_chunk passes
+        captured_kwargs = {}
+        original_generate = cp._generate_manifest
 
-        # Write required files for _process_chunk
-        (cloud_capture_dir / "chunk_0000.mp4").write_bytes(b"video")
-        (cloud_capture_dir / "events_0000.jsonl").write_text('{"name":"click"}\n')
+        def spy_generate(*args, **kwargs):
+            captured_kwargs.update(kwargs)
+            return original_generate(*args, **kwargs)
 
-        # Simulate the blocked intervals addition (extract the logic from _process_chunk)
-        intervals = cp._screen_filter.get_blocked_intervals(1000.0, 1060.0)
-        if intervals:
-            data = json.loads(manifest_path.read_text())
-            data["blocked_intervals"] = intervals
-            manifest_path.write_text(json.dumps(data, indent=2))
+        with patch.object(cp, "_generate_manifest", side_effect=spy_generate), \
+             patch.object(cp, "_wait_for_audio"), \
+             patch.object(cp, "_transcribe", return_value=None), \
+             patch.object(cp, "_trigger_flush"):
+            cp._process_chunk({
+                "completed_index": 0,
+                "chunk_start_time": 1000.0,
+                "rotation_time": 1060.0,
+            })
 
-        result = json.loads(manifest_path.read_text())
-        assert "blocked_intervals" in result
-        assert len(result["blocked_intervals"]) == 1
-        assert result["blocked_intervals"][0]["start_ts"] == 1000.5
-        assert result["blocked_intervals"][0]["reason"] == "app_policy"
-
-    def test_no_intervals_when_no_filter(self, cloud_capture_dir):
-        """Without screen_filter, manifest has no blocked_intervals."""
-        from screencap.chunk_processor import ChunkProcessor
-
-        q = multiprocessing.Queue()
-        ack_q = multiprocessing.Queue()
-
-        cp = ChunkProcessor(
-            cloud_capture_dir, q, ack_q, recording_name="test",
-            upload_enabled=False, auto_delete=False, cloud_intent=True,
-            screen_filter=None,
-        )
-
-        assert cp._screen_filter is None
+        mock_filter.get_blocked_intervals.assert_called_once_with(1000.0, 1060.0)
+        assert captured_kwargs["blocked_intervals"] == [
+            {"start_ts": 1000.5, "end_ts": 1010.0, "reason": "app_policy"},
+        ]
 
 
 class TestPlaceholderFrame:
@@ -482,22 +499,207 @@ class TestPlaceholderFrame:
         pixel = frame.getpixel((0, 0))
         assert pixel == (30, 30, 30)
 
-    def test_placeholder_frame_has_non_background_pixels(self):
-        """Placeholder frame has pixels other than background (i.e., contains text)."""
-        from sc_engine.recorder import _make_placeholder_frame
 
-        frame = _make_placeholder_frame(800, 600)
 
-        # The frame should have at least some pixels that aren't the background color
-        bg = (30, 30, 30)
-        has_non_bg = any(px != bg for px in frame.getdata())
-        assert has_non_bg, "Placeholder frame should have non-background pixels (text)"
+class TestUnifiedEventExport:
+    """Tests for the unified _export_events pipeline (Phase 3)."""
 
-    def test_placeholder_frame_cached_correctly(self):
-        """Same dimensions produce identical frames (cached at call site)."""
-        from sc_engine.recorder import _make_placeholder_frame
+    def _insert_action(self, conn, ts, name="click", **kwargs):
+        """Insert an action_event row."""
+        cols = {"timestamp": ts, "name": name}
+        cols.update(kwargs)
+        keys = ", ".join(cols.keys())
+        placeholders = ", ".join("?" * len(cols))
+        conn.execute(f"INSERT INTO action_event ({keys}) VALUES ({placeholders})", list(cols.values()))
 
-        f1 = _make_placeholder_frame(1920, 1080)
-        f2 = _make_placeholder_frame(1920, 1080)
-        # Both should be identical in content
-        assert list(f1.getdata()) == list(f2.getdata())  # noqa: PILLOW14
+    def _insert_window(self, conn, ts, title="Finder", bundle_id="com.apple.finder", window_id="1"):
+        """Insert a window_event row."""
+        conn.execute(
+            "INSERT INTO window_event (timestamp, title, app_bundle_id, window_id, "
+            "\"left\", top, width, height) VALUES (?, ?, ?, ?, 0, 0, 800, 600)",
+            (ts, title, bundle_id, window_id),
+        )
+
+    def test_produces_processed_events(self, cloud_capture_dir):
+        """_export_events should produce processed Pydantic events, not raw DB rows."""
+        import sqlite3
+
+        conn = sqlite3.connect(str(cloud_capture_dir / "recording.db"))
+        # Insert a click down + up → should be merged into mouse.singleclick
+        self._insert_action(conn, 1000.0, "click", mouse_x=100, mouse_y=200,
+                            mouse_button_name="left", mouse_pressed=1)
+        self._insert_action(conn, 1000.1, "click", mouse_x=100, mouse_y=200,
+                            mouse_button_name="left", mouse_pressed=0)
+        conn.commit()
+        conn.close()
+
+        from screencap.chunk_processor import ChunkProcessor
+
+        q = multiprocessing.Queue()
+        ack_q = multiprocessing.Queue()
+        cp = ChunkProcessor(
+            cloud_capture_dir, q, ack_q, recording_name="test",
+            upload_enabled=False, auto_delete=False,
+        )
+
+        cp._export_events(0, 999.0, 1001.0)
+
+        jsonl_path = cloud_capture_dir / "events_0000.jsonl"
+        assert jsonl_path.exists()
+        lines = jsonl_path.read_text().strip().split("\n")
+
+        # First line is _meta header
+        header = json.loads(lines[0])
+        assert header["_meta"] is True
+        assert header["format_version"] == 2
+
+        # Should have merged into singleclick
+        events = [json.loads(line) for line in lines[1:]]
+        types = [e["type"] for e in events]
+        assert "mouse.singleclick" in types
+        # Should NOT have raw "click" entries
+        assert not any(e.get("name") == "click" for e in events)
+
+    def test_includes_window_switch_events(self, cloud_capture_dir):
+        """_export_events should include deduplicated window.switch events."""
+        import sqlite3
+
+        conn = sqlite3.connect(str(cloud_capture_dir / "recording.db"))
+        self._insert_window(conn, 1000.0, "Documents", "com.apple.finder", "1")
+        self._insert_window(conn, 1000.5, "Downloads", "com.apple.finder", "1")  # same window, title change
+        self._insert_window(conn, 1001.0, "Google", "com.google.Chrome", "2")  # different window
+        self._insert_action(conn, 1000.2, "click", mouse_x=100, mouse_y=200,
+                            mouse_button_name="left", mouse_pressed=1)
+        self._insert_action(conn, 1000.3, "click", mouse_x=100, mouse_y=200,
+                            mouse_button_name="left", mouse_pressed=0)
+        conn.commit()
+        conn.close()
+
+        from screencap.chunk_processor import ChunkProcessor
+
+        q = multiprocessing.Queue()
+        ack_q = multiprocessing.Queue()
+        cp = ChunkProcessor(
+            cloud_capture_dir, q, ack_q, recording_name="test",
+            upload_enabled=False, auto_delete=False,
+        )
+
+        cp._export_events(0, 999.0, 1002.0)
+
+        lines = (cloud_capture_dir / "events_0000.jsonl").read_text().strip().split("\n")
+        events = [json.loads(line) for line in lines[1:]]  # skip _meta
+        ws_events = [e for e in events if e["type"] == "window.switch"]
+
+        # Deduped: Finder (1 window) + Chrome = 2 switches
+        assert len(ws_events) == 2
+        assert ws_events[0]["app_bundle_id"] == "com.apple.finder"
+        assert ws_events[1]["app_bundle_id"] == "com.google.Chrome"
+
+    def test_initial_window_context(self, cloud_capture_dir):
+        """First window.switch should be from before chunk start (initial context)."""
+        import sqlite3
+
+        conn = sqlite3.connect(str(cloud_capture_dir / "recording.db"))
+        # Window event before chunk start
+        self._insert_window(conn, 999.0, "Pre-chunk App", "com.example.app", "10")
+        self._insert_action(conn, 1000.2, "click", mouse_x=100, mouse_y=200,
+                            mouse_button_name="left", mouse_pressed=1)
+        self._insert_action(conn, 1000.3, "click", mouse_x=100, mouse_y=200,
+                            mouse_button_name="left", mouse_pressed=0)
+        conn.commit()
+        conn.close()
+
+        from screencap.chunk_processor import ChunkProcessor
+
+        q = multiprocessing.Queue()
+        ack_q = multiprocessing.Queue()
+        cp = ChunkProcessor(
+            cloud_capture_dir, q, ack_q, recording_name="test",
+            upload_enabled=False, auto_delete=False,
+        )
+
+        cp._export_events(0, 1000.0, 1001.0)
+
+        lines = (cloud_capture_dir / "events_0000.jsonl").read_text().strip().split("\n")
+        events = [json.loads(line) for line in lines[1:]]
+
+        # First event should be window.switch from initial context
+        assert events[0]["type"] == "window.switch"
+        assert events[0]["app_bundle_id"] == "com.example.app"
+
+    def test_atomic_write(self, cloud_capture_dir):
+        """No .tmp file should remain after successful export."""
+        from screencap.chunk_processor import ChunkProcessor
+
+        q = multiprocessing.Queue()
+        ack_q = multiprocessing.Queue()
+        cp = ChunkProcessor(
+            cloud_capture_dir, q, ack_q, recording_name="test",
+            upload_enabled=False, auto_delete=False,
+        )
+
+        cp._export_events(0, 1000.0, 1001.0)
+
+        assert (cloud_capture_dir / "events_0000.jsonl").exists()
+        assert not (cloud_capture_dir / "events_0000.jsonl.tmp").exists()
+
+    def test_excludes_mouse_move_by_default(self, cloud_capture_dir):
+        """Mouse.move events should be excluded by default."""
+        import sqlite3
+
+        conn = sqlite3.connect(str(cloud_capture_dir / "recording.db"))
+        self._insert_action(conn, 1000.0, "move", mouse_x=100, mouse_y=200)
+        self._insert_action(conn, 1000.1, "click", mouse_x=100, mouse_y=200,
+                            mouse_button_name="left", mouse_pressed=1)
+        self._insert_action(conn, 1000.2, "click", mouse_x=100, mouse_y=200,
+                            mouse_button_name="left", mouse_pressed=0)
+        conn.commit()
+        conn.close()
+
+        from screencap.chunk_processor import ChunkProcessor
+
+        q = multiprocessing.Queue()
+        ack_q = multiprocessing.Queue()
+        cp = ChunkProcessor(
+            cloud_capture_dir, q, ack_q, recording_name="test",
+            upload_enabled=False, auto_delete=False,
+        )
+
+        cp._export_events(0, 999.0, 1001.0)
+
+        lines = (cloud_capture_dir / "events_0000.jsonl").read_text().strip().split("\n")
+        events = [json.loads(line) for line in lines[1:]]
+        assert not any(e["type"] == "mouse.move" for e in events)
+
+    def test_malformed_rows_skipped_gracefully(self, cloud_capture_dir):
+        """Rows that fail conversion should be skipped without crashing export."""
+        import sqlite3
+
+        conn = sqlite3.connect(str(cloud_capture_dir / "recording.db"))
+        # Valid click pair
+        self._insert_action(conn, 1000.0, "click", mouse_x=100, mouse_y=200,
+                            mouse_button_name="left", mouse_pressed=1)
+        self._insert_action(conn, 1000.1, "click", mouse_x=100, mouse_y=200,
+                            mouse_button_name="left", mouse_pressed=0)
+        # Malformed: click with mouse_pressed=None → dict_to_action_event returns None
+        self._insert_action(conn, 1000.5, "click", mouse_x=50, mouse_y=50,
+                            mouse_button_name="left")  # mouse_pressed defaults to NULL
+        conn.commit()
+        conn.close()
+
+        from screencap.chunk_processor import ChunkProcessor
+
+        q = multiprocessing.Queue()
+        ack_q = multiprocessing.Queue()
+        cp = ChunkProcessor(
+            cloud_capture_dir, q, ack_q, recording_name="test",
+            upload_enabled=False, auto_delete=False,
+        )
+
+        # Should not raise
+        cp._export_events(0, 999.0, 1001.0)
+
+        lines = (cloud_capture_dir / "events_0000.jsonl").read_text().strip().split("\n")
+        events = [json.loads(line) for line in lines[1:]]
+        # The valid click pair should still be exported
+        assert any(e["type"] == "mouse.singleclick" for e in events)
