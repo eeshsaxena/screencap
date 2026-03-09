@@ -279,6 +279,23 @@ def process_events(
     started = False
     drain_start = None
 
+    # Variable-rate retention filter (action-aware capture)
+    retention_filter = None
+    RetentionDecision = None
+    if config.SCREENSHOT_ACTION_AWARE:
+        from sc_engine.retention import (
+            RetentionDecision,
+            ScreenRetentionFilter,
+        )
+        retention_filter = ScreenRetentionFilter(
+            click_interval=config.SCREENSHOT_CLICK_INTERVAL,
+            drag_interval=config.SCREENSHOT_DRAG_INTERVAL,
+            scroll_interval=config.SCREENSHOT_SCROLL_INTERVAL,
+            type_interval=config.SCREENSHOT_TYPE_INTERVAL,
+            idle_interval=config.SCREENSHOT_IDLE_INTERVAL,
+            settle_secs=config.SCREENSHOT_SCROLL_SETTLE,
+        )
+
     # Placeholder frame state (cloud-intent only: fill blocked intervals)
     _cloud_placeholder = getattr(screen_filter, 'cloud_intent', False)
     _placeholder_frame = None
@@ -331,9 +348,35 @@ def process_events(
             elif time.monotonic() - drain_start > 10.0:
                 logger.warning("Drain deadline exceeded, exiting event_processor")
                 break
+        # Adaptive timeout: shorter when a settle deadline is pending
+        _eq_timeout = 1.0
+        if retention_filter is not None and retention_filter.has_pending_settle():
+            _eq_timeout = max(0.05, retention_filter.time_until_settle(time.monotonic()))
         try:
-            event = event_q.get(timeout=1.0)
+            event = event_q.get(timeout=_eq_timeout)
         except queue.Empty:
+            # Check settle deadline — force-save current screen as settle frame
+            if (retention_filter is not None
+                    and prev_screen_event is not None
+                    and retention_filter.check_settle(time.monotonic())):
+                _drops["screen_settle_save"] += 1
+                # Re-use existing fan-out: save screen + action-gated video
+                settle_events = [
+                    (prev_screen_event, screen_write_q, write_screen_event),
+                ]
+                if config.RECORD_VIDEO and not config.RECORD_FULL_VIDEO:
+                    settle_vid = prev_screen_event._replace(type="screen/video")
+                    settle_events.append(
+                        (settle_vid, video_write_q, write_video_event),
+                    )
+                for sev, swq, swfn in settle_events:
+                    if process_event(sev, swq, swfn, recording, perf_q, terminate_processing):
+                        if sev.type == "screen":
+                            num_screen_events.value += 1
+                            prev_saved_screen_timestamp = prev_screen_event.timestamp
+                            prev_saved_screen_hash = dhash(prev_screen_event.data)
+                        elif sev.type == "screen/video":
+                            num_video_events.value += 1
             # Push placeholder frames during idle blocked intervals (cloud-intent)
             if (_cloud_placeholder and config.RECORD_VIDEO
                     and not screen_filter.is_screen_allowed()):
@@ -502,7 +545,25 @@ def process_events(
                 elif _cloud_placeholder:
                     _end_blocked_interval_if_active(prev_screen_event.timestamp)
 
-            if should_save_screen and config.SCREENSHOT_DEDUP:
+            # Action-type gating (variable-rate capture)
+            _retention_skip_dedup = False
+            if should_save_screen and retention_filter is not None:
+                _r_mono = time.monotonic()
+                _r_decision = retention_filter.should_save(
+                    event.data.get("name", ""), event.data, _r_mono,
+                )
+                if _r_decision is RetentionDecision.SAVE:
+                    _drops["screen_click_save"] += 1
+                    _retention_skip_dedup = True
+                elif _r_decision is RetentionDecision.BYPASS_DEDUP:
+                    _drops["screen_cadence_bypass"] += 1
+                    _retention_skip_dedup = True
+                elif _r_decision is RetentionDecision.SKIP:
+                    should_save_screen = False
+                    _drops["screen_cadence_skip"] += 1
+                # BASELINE → fall through to dHash
+
+            if should_save_screen and config.SCREENSHOT_DEDUP and not _retention_skip_dedup:
                 if prev_saved_screen_hash is None:
                     pass  # first frame always saved
                 else:

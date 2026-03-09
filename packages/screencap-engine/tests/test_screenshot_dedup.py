@@ -49,6 +49,25 @@ def _action_event(ts: float) -> Event:
     return Event(timestamp=ts, type="action", data={"name": "key.down", "key": "a"})
 
 
+def _click_event(ts: float, pressed: bool = True) -> Event:
+    return Event(timestamp=ts, type="action", data={
+        "name": "click", "pressed": pressed, "button": "left",
+        "mouse_x": 100, "mouse_y": 100,
+    })
+
+
+def _move_event(ts: float) -> Event:
+    return Event(timestamp=ts, type="action", data={
+        "name": "move", "mouse_x": 100, "mouse_y": 100,
+    })
+
+
+def _scroll_event(ts: float) -> Event:
+    return Event(timestamp=ts, type="action", data={
+        "name": "scroll", "mouse_x": 100, "mouse_y": 100, "dx": 0, "dy": -3,
+    })
+
+
 @pytest.fixture(autouse=True)
 def _setup_time():
     utils.set_start_time(time.time())
@@ -65,6 +84,7 @@ def _dedup_config():
     orig_window = config.RECORD_WINDOW_DATA
     orig_full_video = config.RECORD_FULL_VIDEO
     orig_ax = config.RECORD_READ_ACTIVE_ELEMENT_STATE
+    orig_action_aware = config.SCREENSHOT_ACTION_AWARE
 
     object.__setattr__(config, "SCREENSHOT_DEDUP", True)
     object.__setattr__(config, "SCREENSHOT_MIN_INTERVAL", 1.0)
@@ -73,6 +93,7 @@ def _dedup_config():
     object.__setattr__(config, "RECORD_WINDOW_DATA", True)
     object.__setattr__(config, "RECORD_FULL_VIDEO", False)
     object.__setattr__(config, "RECORD_READ_ACTIVE_ELEMENT_STATE", False)
+    object.__setattr__(config, "SCREENSHOT_ACTION_AWARE", False)
     yield
     object.__setattr__(config, "SCREENSHOT_DEDUP", orig_dedup)
     object.__setattr__(config, "SCREENSHOT_MIN_INTERVAL", orig_interval)
@@ -81,6 +102,7 @@ def _dedup_config():
     object.__setattr__(config, "RECORD_WINDOW_DATA", orig_window)
     object.__setattr__(config, "RECORD_FULL_VIDEO", orig_full_video)
     object.__setattr__(config, "RECORD_READ_ACTIVE_ELEMENT_STATE", orig_ax)
+    object.__setattr__(config, "SCREENSHOT_ACTION_AWARE", orig_action_aware)
 
 
 def _recording():
@@ -353,3 +375,90 @@ class TestFirstFrameAlwaysSaved:
         screen_count, action_count, _, _ = _run_process_events(events)
         assert screen_count == 1
         assert action_count == 1
+
+
+def _press_event(ts: float) -> Event:
+    """Key press action event (name='press', matching retention filter)."""
+    return Event(timestamp=ts, type="action", data={"name": "press", "key": "a"})
+
+
+class TestActionAwareSavesDragFrames:
+    """ACTION_AWARE=True saves drag frames that dedup would reject."""
+
+    def test_action_aware_saves_drag_frames(self):
+        object.__setattr__(config, "SCREENSHOT_ACTION_AWARE", True)
+        object.__setattr__(config, "SCREENSHOT_DEDUP", False)
+        img = _img()
+        t0 = 1000.0
+
+        # Fake monotonic clock that advances with each call to match event pace
+        mono_times = iter([
+            # settle check in queue.Empty (initial)
+            0.0,
+            # click action: _r_mono
+            10.0,
+            # move action: _r_mono (0.15s after click in event time)
+            10.15,
+            # move action: _r_mono (0.3s after click in event time)
+            10.30,
+            # settle check (has_pending_settle) in event loop + other calls
+        ] + [99.0] * 50)  # padding for drain/shutdown calls
+
+        events = [
+            _screen_event(t0, img),
+            _window_event(t0 + 0.001),
+            _click_event(t0 + 0.01, pressed=True),
+            _screen_event(t0 + 0.15, img),
+            _move_event(t0 + 0.16),
+            _screen_event(t0 + 0.3, img),
+            _move_event(t0 + 0.31),
+        ]
+
+        with mock.patch("sc_engine.recorder.time") as mock_time:
+            mock_time.monotonic = mock.MagicMock(side_effect=mono_times)
+            mock_time.time = time.time
+            screen_count, action_count, _, drops = _run_process_events(events)
+
+        # Click save + 2 drag cadence bypasses = 3 screen saves
+        assert screen_count >= 2
+        assert drops.get("screen_click_save", 0) >= 1
+
+
+class TestActionAwareTypingUsesTimeFloor:
+    """ACTION_AWARE=True throttles typing to ~1fps."""
+
+    def test_typing_throttled(self):
+        object.__setattr__(config, "SCREENSHOT_ACTION_AWARE", True)
+        object.__setattr__(config, "SCREENSHOT_DEDUP", False)
+        img = _img()
+        t0 = 1000.0
+
+        # Monotonic times: first key at 10.0, second at 10.3 (< 1.0s), third at 10.6 (< 1.0s)
+        mono_times = iter([
+            0.0,
+            # first press: _r_mono
+            10.0,
+            # second press: _r_mono (0.3s later → within 1.0s type interval)
+            10.3,
+            # third press: _r_mono (0.6s later → still within 1.0s)
+            10.6,
+        ] + [99.0] * 50)
+
+        events = [
+            _screen_event(t0, img),
+            _window_event(t0 + 0.001),
+            _press_event(t0 + 0.01),
+            _screen_event(t0 + 0.3, img),
+            _press_event(t0 + 0.31),
+            _screen_event(t0 + 0.6, img),
+            _press_event(t0 + 0.61),
+        ]
+
+        with mock.patch("sc_engine.recorder.time") as mock_time:
+            mock_time.monotonic = mock.MagicMock(side_effect=mono_times)
+            mock_time.time = time.time
+            screen_count, action_count, _, drops = _run_process_events(events)
+
+        # Only first frame saved (typing cadence = 1.0s, events < 1s apart)
+        assert screen_count == 1
+        assert drops.get("screen_cadence_skip", 0) >= 1

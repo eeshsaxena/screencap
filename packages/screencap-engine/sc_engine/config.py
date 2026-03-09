@@ -56,9 +56,6 @@ class Settings(BaseSettings):
     # Auto-cut video into chunks at this interval (seconds). 0 = legacy single-file.
     VIDEO_CHUNK_DURATION: float = 3600.0
 
-    # Minimum seconds between saved screenshots in chunked mode (0 = save every action)
-    SCREENSHOT_MIN_INTERVAL: float = 0.0
-
     # Skip post_process_events in chunked mode (set automatically)
     SKIP_POST_PROCESS: bool = False
 
@@ -79,9 +76,18 @@ class Settings(BaseSettings):
     AX_SCROLL_MAX_DEPTH: int = 2          # Medium for scrolls
 
     # Screenshot deduplication
-    SCREENSHOT_DEDUP: bool = True
+    SCREENSHOT_DEDUP: bool = False
     SCREENSHOT_MIN_INTERVAL: float = 1.0       # seconds between saves
     SCREENSHOT_HASH_THRESHOLD: int = 8         # Hamming distance (0=identical, 64=opposite)
+
+    # Variable-rate capture (action-aware)
+    SCREENSHOT_ACTION_AWARE: bool = False
+    SCREENSHOT_CLICK_INTERVAL: float = 0.0       # Always save (0 = no floor)
+    SCREENSHOT_DRAG_INTERVAL: float = 0.1        # ~10 fps during drag
+    SCREENSHOT_SCROLL_INTERVAL: float = 0.1      # ~10 fps during scroll/zoom
+    SCREENSHOT_TYPE_INTERVAL: float = 1.0        # ~1 fps during typing
+    SCREENSHOT_IDLE_INTERVAL: float = 2.0        # ~0.5 fps idle mouse move
+    SCREENSHOT_SCROLL_SETTLE: float = 0.4        # Settle frame after scroll silence
 
     # Performance plotting
     PLOT_PERFORMANCE: bool = True
@@ -125,7 +131,6 @@ _FIELD_TO_CONFIG_ATTR = {
     "plot_performance": "PLOT_PERFORMANCE",
     "screen_capture_fps": "SCREEN_CAPTURE_FPS",
     "video_chunk_duration": "VIDEO_CHUNK_DURATION",
-    "screenshot_min_interval": "SCREENSHOT_MIN_INTERVAL",
     "skip_post_process": "SKIP_POST_PROCESS",
     "ax_query_interval": "AX_QUERY_INTERVAL",
     "ax_max_depth": "AX_MAX_DEPTH",
@@ -138,6 +143,13 @@ _FIELD_TO_CONFIG_ATTR = {
     "screenshot_dedup": "SCREENSHOT_DEDUP",
     "screenshot_min_interval": "SCREENSHOT_MIN_INTERVAL",
     "screenshot_hash_threshold": "SCREENSHOT_HASH_THRESHOLD",
+    "screenshot_action_aware": "SCREENSHOT_ACTION_AWARE",
+    "screenshot_click_interval": "SCREENSHOT_CLICK_INTERVAL",
+    "screenshot_drag_interval": "SCREENSHOT_DRAG_INTERVAL",
+    "screenshot_scroll_interval": "SCREENSHOT_SCROLL_INTERVAL",
+    "screenshot_type_interval": "SCREENSHOT_TYPE_INTERVAL",
+    "screenshot_idle_interval": "SCREENSHOT_IDLE_INTERVAL",
+    "screenshot_scroll_settle": "SCREENSHOT_SCROLL_SETTLE",
 }
 
 
@@ -158,7 +170,6 @@ class RecordingConfig:
     plot_performance: bool | None = None
     screen_capture_fps: float | None = None
     video_chunk_duration: float | None = None
-    screenshot_min_interval: float | None = None
     skip_post_process: bool | None = None
     ax_query_interval: float | None = None
     ax_max_depth: int | None = None
@@ -171,6 +182,13 @@ class RecordingConfig:
     screenshot_dedup: bool | None = None
     screenshot_min_interval: float | None = None
     screenshot_hash_threshold: int | None = None
+    screenshot_action_aware: bool | None = None
+    screenshot_click_interval: float | None = None
+    screenshot_drag_interval: float | None = None
+    screenshot_scroll_interval: float | None = None
+    screenshot_type_interval: float | None = None
+    screenshot_idle_interval: float | None = None
+    screenshot_scroll_settle: float | None = None
 
 
 @contextmanager
