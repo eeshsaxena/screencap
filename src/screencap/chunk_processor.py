@@ -679,10 +679,10 @@ class ChunkProcessor:
                 if path.exists():
                     try:
                         freed += path.stat().st_size
-                        _safe_trash(path)
-                        logger.info(f"Trashed {path.name}")
-                    except (OSError, subprocess.CalledProcessError) as e:
-                        logger.warning(f"Failed to trash {path.name}: {e}")
+                        _safe_delete(path)
+                        logger.info(f"Deleted {path.name}")
+                    except OSError as e:
+                        logger.warning(f"Failed to delete {path.name}: {e}")
         return freed
 
 
@@ -854,20 +854,20 @@ def stub_recording(recording_dir: Path) -> list[str]:
             continue
         if p.suffix in (".mp4", ".flac", ".jsonl", ".png", ".jpg"):
             try:
-                _safe_trash(p)
+                _safe_delete(p)
                 deleted.append(p.name)
-            except (OSError, subprocess.CalledProcessError) as e:
-                logger.warning(f"Failed to trash {p.name}: {e}")
+            except OSError as e:
+                logger.warning(f"Failed to delete {p.name}: {e}")
 
-    # Trash screenshots subdirectory
+    # Delete screenshots subdirectory
     screenshots_dir = recording_dir / "screenshots"
     if screenshots_dir.is_dir():
         for p in screenshots_dir.iterdir():
             if p.is_file():
                 try:
-                    _safe_trash(p)
+                    _safe_delete(p)
                     deleted.append(f"screenshots/{p.name}")
-                except (OSError, subprocess.CalledProcessError):
+                except OSError:
                     pass
         try:
             screenshots_dir.rmdir()
