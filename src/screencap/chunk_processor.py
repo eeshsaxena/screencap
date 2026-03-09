@@ -10,9 +10,7 @@ from __future__ import annotations
 import json
 import logging
 import os
-import shutil
 import sqlite3
-import subprocess
 import sys
 import threading
 import time
@@ -20,16 +18,9 @@ from pathlib import Path
 
 logger = logging.getLogger(__name__)
 
-# Cache whether macOS `trash` binary exists (checked once)
-_HAS_TRASH = shutil.which("trash") is not None
-
-
-def _safe_trash(path: Path) -> None:
-    """Move file to Trash (macOS) if available, else fall back to unlink."""
-    if _HAS_TRASH:
-        subprocess.run(["trash", str(path)], check=True, capture_output=True)
-    else:
-        path.unlink()
+def _safe_delete(path: Path) -> None:
+    """Permanently delete a file from the filesystem."""
+    path.unlink()
 
 
 class ChunkProcessor:
