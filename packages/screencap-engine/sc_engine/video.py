@@ -27,7 +27,6 @@ if TYPE_CHECKING:
 
 # fMP4: crash-safe — writes self-contained fragments to disk progressively,
 # so the file is playable even if the process is killed mid-recording.
-# See docs/plans/2026-02-22-fix-unrecoverable-mp4-on-crash-plan.md
 _FRAG_MP4_OPTIONS: dict[str, str] = {
     "movflags": "frag_keyframe+empty_moov",
     "flush_packets": "1",
