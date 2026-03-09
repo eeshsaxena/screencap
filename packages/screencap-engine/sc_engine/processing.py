@@ -13,7 +13,9 @@ import os
 
 from sc_engine.events import (
     ActionEvent,
+    BaseEvent,
     Event,
+    WindowSwitchEvent,
     KeyDownEvent,
     KeyShortcutEvent,
     KeyTypeEvent,
@@ -966,3 +968,79 @@ def get_audio_events(events: list[Event]) -> list[Event]:
     from sc_engine.events import AudioChunkEvent
 
     return [e for e in events if isinstance(e, AudioChunkEvent)]
+
+
+# =============================================================================
+# Window Switch Processing
+# =============================================================================
+
+
+def deduplicate_window_events(
+    window_rows: list[dict],
+) -> list[WindowSwitchEvent]:
+    """Emit WindowSwitchEvent only when (app_bundle_id, window_id) changes.
+
+    Takes sorted window event dicts from the DB, deduplicates by the
+    (app_bundle_id, window_id) pair, and returns WindowSwitchEvent list.
+    Title-only changes (common in browsers) are ignored.
+
+    Privacy filtering is NOT done here — that belongs in the screencap
+    layer (exporter.py / chunk_processor.py).
+
+    Args:
+        window_rows: List of dicts with window_event DB columns,
+            sorted by timestamp.
+
+    Returns:
+        Deduplicated list of WindowSwitchEvent instances.
+    """
+    from sc_engine.convert import dict_to_window_switch
+
+    result: list[WindowSwitchEvent] = []
+    last_key: tuple[str | None, str | None] = (None, None)
+
+    for row in window_rows:
+        key = (row.get("app_bundle_id"), str(row.get("window_id") or ""))
+        if key != last_key:
+            result.append(dict_to_window_switch(row))
+            last_key = key
+
+    return result
+
+
+def interleave_window_events(
+    action_events: list[ActionEvent],
+    window_events: list[WindowSwitchEvent],
+) -> list[BaseEvent]:
+    """Merge window.switch events into the action event timeline by timestamp.
+
+    Both lists must be sorted by timestamp. The result is a single
+    time-ordered list containing both action events and window.switch events.
+
+    Args:
+        action_events: Processed action events (from process_events()).
+        window_events: Deduplicated WindowSwitchEvent list.
+
+    Returns:
+        Combined, time-ordered list.
+    """
+    result: list[BaseEvent] = []
+    ai, wi = 0, 0
+
+    while ai < len(action_events) and wi < len(window_events):
+        if window_events[wi].timestamp <= action_events[ai].timestamp:
+            result.append(window_events[wi])
+            wi += 1
+        else:
+            result.append(action_events[ai])
+            ai += 1
+
+    # Drain remaining
+    while ai < len(action_events):
+        result.append(action_events[ai])
+        ai += 1
+    while wi < len(window_events):
+        result.append(window_events[wi])
+        wi += 1
+
+    return result

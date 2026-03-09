@@ -9,6 +9,7 @@ from dataclasses import dataclass
 from pathlib import Path
 from typing import TYPE_CHECKING, Iterator
 
+from sc_engine.convert import dict_to_action_event
 from sc_engine.events import (
     ActionEvent as PydanticActionEvent,
 )
@@ -17,14 +18,7 @@ from sc_engine.events import (
     KeyShortcutEvent,
     KeyTypeEvent,
     KeyUpEvent,
-    MouseButton,
-    MouseDownEvent,
-    MouseMagnifyEvent,
     MouseMoveEvent,
-    MouseRotateEvent,
-    MouseScrollEvent,
-    MouseSmartMagnifyEvent,
-    MouseUpEvent,
     SpecialKeyEvent,
 )
 from sc_engine.processing import process_events
@@ -36,102 +30,39 @@ if TYPE_CHECKING:
 def _convert_action_event(db_event) -> PydanticActionEvent | None:
     """Convert a SQLAlchemy ActionEvent to a Pydantic event.
 
+    Thin wrapper around :func:`dict_to_action_event` that extracts
+    a dict from the ORM object.
+
     Args:
         db_event: SQLAlchemy ActionEvent instance.
 
     Returns:
         Pydantic event or None if unrecognized.
     """
-    ts = db_event.timestamp
-
-    if db_event.name == "move":
-        return MouseMoveEvent(
-            timestamp=ts,
-            x=db_event.mouse_x or 0,
-            y=db_event.mouse_y or 0,
-            pressure=getattr(db_event, "mouse_pressure", None),
-            modifier_flags=getattr(db_event, "modifier_flags", None),
-        )
-    elif db_event.name == "click":
-        button = db_event.mouse_button_name or "left"
-        try:
-            button = MouseButton(button)
-        except ValueError:
-            button = MouseButton.LEFT
-
-        if db_event.mouse_pressed is True:
-            return MouseDownEvent(
-                timestamp=ts,
-                x=db_event.mouse_x or 0,
-                y=db_event.mouse_y or 0,
-                button=button,
-                pressure=getattr(db_event, "mouse_pressure", None),
-                modifier_flags=getattr(db_event, "modifier_flags", None),
-            )
-        elif db_event.mouse_pressed is False:
-            return MouseUpEvent(
-                timestamp=ts,
-                x=db_event.mouse_x or 0,
-                y=db_event.mouse_y or 0,
-                button=button,
-                pressure=getattr(db_event, "mouse_pressure", None),
-                modifier_flags=getattr(db_event, "modifier_flags", None),
-            )
-        else:
-            return None
-    elif db_event.name == "scroll":
-        return MouseScrollEvent(
-            timestamp=ts,
-            x=db_event.mouse_x or 0,
-            y=db_event.mouse_y or 0,
-            dx=db_event.mouse_dx or 0,
-            dy=db_event.mouse_dy or 0,
-            modifier_flags=getattr(db_event, "modifier_flags", None),
-            scroll_phase=getattr(db_event, "scroll_phase", None),
-            momentum_phase=getattr(db_event, "momentum_phase", None),
-            is_continuous=getattr(db_event, "is_continuous", None),
-        )
-    elif db_event.name == "press":
-        return KeyDownEvent(
-            timestamp=ts,
-            key_name=db_event.key_name,
-            key_char=db_event.key_char,
-            key_vk=db_event.key_vk,
-            canonical_key_name=db_event.canonical_key_name,
-            canonical_key_char=db_event.canonical_key_char,
-            canonical_key_vk=db_event.canonical_key_vk,
-        )
-    elif db_event.name == "release":
-        return KeyUpEvent(
-            timestamp=ts,
-            key_name=db_event.key_name,
-            key_char=db_event.key_char,
-            key_vk=db_event.key_vk,
-            canonical_key_name=db_event.canonical_key_name,
-            canonical_key_char=db_event.canonical_key_char,
-            canonical_key_vk=db_event.canonical_key_vk,
-        )
-    elif db_event.name == "magnify":
-        return MouseMagnifyEvent(
-            timestamp=ts,
-            x=db_event.mouse_x or 0,
-            y=db_event.mouse_y or 0,
-            magnification=db_event.mouse_dx or 0.0,
-        )
-    elif db_event.name == "rotate":
-        return MouseRotateEvent(
-            timestamp=ts,
-            x=db_event.mouse_x or 0,
-            y=db_event.mouse_y or 0,
-            rotation=db_event.mouse_dx or 0.0,
-        )
-    elif db_event.name == "smart_magnify":
-        return MouseSmartMagnifyEvent(
-            timestamp=ts,
-            x=float(db_event.mouse_x or 0),
-            y=float(db_event.mouse_y or 0),
-        )
-    return None
+    # Build a dict from the ORM object's columns.  Use getattr with
+    # defaults so missing columns (older DB schemas) don't crash.
+    row = {
+        "timestamp": db_event.timestamp,
+        "name": db_event.name,
+        "mouse_x": getattr(db_event, "mouse_x", None),
+        "mouse_y": getattr(db_event, "mouse_y", None),
+        "mouse_dx": getattr(db_event, "mouse_dx", None),
+        "mouse_dy": getattr(db_event, "mouse_dy", None),
+        "mouse_button_name": getattr(db_event, "mouse_button_name", None),
+        "mouse_pressed": getattr(db_event, "mouse_pressed", None),
+        "mouse_pressure": getattr(db_event, "mouse_pressure", None),
+        "modifier_flags": getattr(db_event, "modifier_flags", None),
+        "scroll_phase": getattr(db_event, "scroll_phase", None),
+        "momentum_phase": getattr(db_event, "momentum_phase", None),
+        "is_continuous": getattr(db_event, "is_continuous", None),
+        "key_name": getattr(db_event, "key_name", None),
+        "key_char": getattr(db_event, "key_char", None),
+        "key_vk": getattr(db_event, "key_vk", None),
+        "canonical_key_name": getattr(db_event, "canonical_key_name", None),
+        "canonical_key_char": getattr(db_event, "canonical_key_char", None),
+        "canonical_key_vk": getattr(db_event, "canonical_key_vk", None),
+    }
+    return dict_to_action_event(row)
 
 
 @dataclass
