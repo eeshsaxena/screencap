@@ -531,6 +531,101 @@ class _SwitchingScreenFilter:
         pass
 
 
+class TestSettleFrameSavesAfterScrollSilence:
+    """Settle frame saves the last screen after scroll silence."""
+
+    def test_settle_saves_screen(self):
+        object.__setattr__(config, "SCREENSHOT_ACTION_AWARE", True)
+        object.__setattr__(config, "SCREENSHOT_DEDUP", False)
+        object.__setattr__(config, "RECORD_VIDEO", False)
+        img = _img()
+        t0 = 1000.0
+
+        # Large step so settle deadline elapses during queue.Empty
+        clock = _AdvancingClock(start=10.0, step=0.5)
+
+        events = [
+            _screen_event(t0, img),
+            _window_event(t0 + 0.001),
+            _scroll_event(t0 + 0.01),
+        ]
+
+        with mock.patch("sc_engine.recorder.time") as mock_time:
+            mock_time.monotonic = clock
+            mock_time.time = time.time
+            screen_count, _, _, drops = _run_process_events(events)
+
+        assert drops.get("screen_settle_save", 0) >= 1
+
+    def test_settle_also_saves_video_frame(self):
+        object.__setattr__(config, "SCREENSHOT_ACTION_AWARE", True)
+        object.__setattr__(config, "SCREENSHOT_DEDUP", False)
+        object.__setattr__(config, "RECORD_VIDEO", True)
+        object.__setattr__(config, "RECORD_FULL_VIDEO", False)
+        img = _img()
+        t0 = 1000.0
+
+        clock = _AdvancingClock(start=10.0, step=0.5)
+
+        events = [
+            _screen_event(t0, img),
+            _window_event(t0 + 0.001),
+            _scroll_event(t0 + 0.01),
+        ]
+
+        written_types = []
+
+        def capture_process_event(event, wq, wfn, rec, pq, tp):
+            written_types.append(event.type)
+            return True
+
+        event_q = queue.Queue()
+        for ev in events:
+            event_q.put(ev)
+
+        recording = _recording()
+        terminate = multiprocessing.Event()
+        started = threading.Event()
+        nums = {k: multiprocessing.Value("i", 0) for k in
+                ["screen", "action", "window", "browser", "video"]}
+
+        def set_terminate():
+            time.sleep(0.1)
+            terminate.set()
+        t = threading.Thread(target=set_terminate)
+        t.start()
+
+        with mock.patch("sc_engine.recorder.time") as mock_time, \
+             mock.patch("sc_engine.recorder.process_event", side_effect=capture_process_event):
+            mock_time.monotonic = clock
+            mock_time.time = time.time
+            from sc_engine import recorder as rec_mod
+            old_drops = dict(rec_mod._drop_counts)
+            rec_mod._drop_counts = {}
+
+            process_events(
+                event_q,
+                mock.MagicMock(spec=SynchronizedQueue),
+                mock.MagicMock(spec=SynchronizedQueue),
+                mock.MagicMock(spec=SynchronizedQueue),
+                mock.MagicMock(spec=SynchronizedQueue),
+                mock.MagicMock(spec=SynchronizedQueue),
+                mock.MagicMock(spec=SynchronizedQueue),
+                recording, terminate, started,
+                nums["screen"], nums["action"], nums["window"],
+                nums["browser"], nums["video"],
+            )
+            drops = dict(rec_mod._drop_counts)
+            rec_mod._drop_counts = old_drops
+
+        t.join()
+
+        assert drops.get("screen_settle_save", 0) >= 1
+        # Settle should write both screen and screen/video
+        assert "screen" in written_types
+        assert "screen/video" in written_types
+
+
 class TestSettleFrameBlockedByPrivacy:
     """Settle frame must NOT save when privacy filter blocks at settle time."""
 
@@ -541,20 +636,16 @@ class TestSettleFrameBlockedByPrivacy:
         img = _img()
         t0 = 1000.0
 
-        # Clock with large step so settle deadline elapses during queue.Empty
         clock = _AdvancingClock(start=10.0, step=0.5)
 
         events = [
             _screen_event(t0, img),
             _window_event(t0 + 0.001),
-            _scroll_event(t0 + 0.01),      # retention filter sees this → settle set
-            _scroll_event(t0 + 0.02),       # resets settle deadline
+            _scroll_event(t0 + 0.01),
+            _scroll_event(t0 + 0.02),
         ]
 
-        # Allow screens during scroll action processing (so retention filter
-        # sets the settle deadline), then block when settle fires.
-        # is_screen_allowed() is called: once per action event (cached check)
-        # + once on settle. Allow the first several, block after.
+        # Allow screens during scroll processing, block at settle time
         sf = _SwitchingScreenFilter(allow_count=2)
 
         with mock.patch("sc_engine.recorder.time") as mock_time:
@@ -564,6 +655,5 @@ class TestSettleFrameBlockedByPrivacy:
                 events, screen_filter=sf,
             )
 
-        # Settle frame must be blocked by privacy
         assert drops.get("privacy_settle_blocked", 0) >= 1
         assert drops.get("screen_settle_save", 0) == 0

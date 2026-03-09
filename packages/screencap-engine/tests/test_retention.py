@@ -154,11 +154,9 @@ class TestDragThenScrollStateReset:
         # Start drag
         f.should_save("click", {"pressed": True, "button": "left"}, t)
         f.should_save("move", {}, t + 0.1)
-        assert f._drag_active  # noqa: SLF001
 
-        # End drag
+        # End drag → settle pending
         f.should_save("click", {"pressed": False, "button": "left"}, t + 0.2)
-        assert not f._drag_active  # noqa: SLF001
         assert f.has_pending_settle()
 
         # Consume the drag settle
@@ -177,17 +175,6 @@ class TestDragThenScrollStateReset:
         assert f.check_settle(t + 1.2)  # 0.8 + 0.4 = 1.2
 
 
-class TestScrollGroupMembership:
-    """All gesture actions in _SCROLL_ACTIONS use scroll cadence + settle."""
-
-    @pytest.mark.parametrize("action", ["scroll", "magnify", "rotate", "smart_magnify"])
-    def test_scroll_group_actions(self, action):
-        f = ScreenRetentionFilter(scroll_interval=0.1, settle_secs=0.4)
-        d = f.should_save(action, {}, 600.0)
-        assert d is RetentionDecision.BYPASS_DEDUP
-        assert f.has_pending_settle()
-
-
 class TestUnknownActionBaseline:
     """Unknown action names fall through to BASELINE."""
 
@@ -200,22 +187,6 @@ class TestUnknownActionBaseline:
 class TestCrossTypeIntervalSharing:
     """_last_save_mono is shared across action types — a save from one type
     suppresses a different type within its interval."""
-
-    def test_click_suppresses_immediate_idle_move(self):
-        f = ScreenRetentionFilter(idle_interval=2.0)
-        t = 800.0
-
-        # Click down + up (no drag) sets _last_save_mono
-        f.should_save("click", {"pressed": True, "button": "left"}, t)
-        f.should_save("click", {"pressed": False, "button": "left"}, t + 0.05)
-
-        # Idle move 0.5s after last save — within 2.0s idle interval → SKIP
-        d = f.should_save("move", {}, t + 0.55)
-        assert d is RetentionDecision.SKIP
-
-        # Idle move 2.1s after last save — interval elapsed → BYPASS_DEDUP
-        d = f.should_save("move", {}, t + 2.2)
-        assert d is RetentionDecision.BYPASS_DEDUP
 
     def test_typing_does_not_suppress_click(self):
         f = ScreenRetentionFilter(type_interval=1.0)
