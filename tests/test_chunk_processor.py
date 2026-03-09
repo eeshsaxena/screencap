@@ -254,7 +254,7 @@ class TestInlineScrubbing:
         events = []
         for ch in "John Smith":
             events.append({
-                "name": "key.down",
+                "name": "press",
                 "timestamp": 1000.0 + len(events),
                 "key_char": ch,
                 "canonical_key_char": ch,
@@ -265,9 +265,7 @@ class TestInlineScrubbing:
             for evt in events:
                 f.write(json.dumps(evt) + "\n")
 
-        cloud_processor._scrub_events_jsonl(
-            events_path, cloud_processor._pipeline, cloud_processor._anonymizer,
-        )
+        cloud_processor._scrub_events_jsonl(events_path)
 
         scrubbed = [json.loads(line) for line in events_path.read_text().splitlines() if line.strip()]
 
@@ -280,7 +278,7 @@ class TestInlineScrubbing:
         events = []
         for ch in "hello world":
             events.append({
-                "name": "key.down",
+                "name": "press",
                 "timestamp": 1000.0 + len(events),
                 "key_char": ch,
             })
@@ -290,9 +288,7 @@ class TestInlineScrubbing:
             for evt in events:
                 f.write(json.dumps(evt) + "\n")
 
-        cloud_processor._scrub_events_jsonl(
-            events_path, cloud_processor._pipeline, cloud_processor._anonymizer,
-        )
+        cloud_processor._scrub_events_jsonl(events_path)
 
         scrubbed = [json.loads(line) for line in events_path.read_text().splitlines() if line.strip()]
         chars = [e["key_char"] for e in scrubbed]
@@ -312,8 +308,8 @@ class TestInlineScrubbing:
         }))
 
         cp = cloud_processor
-        cp._scrub_transcript_txt(txt_path, cp._pipeline, cp._anonymizer)
-        cp._scrub_transcript_json(json_path, cp._pipeline, cp._anonymizer)
+        cp._scrub_transcript_txt(txt_path)
+        cp._scrub_transcript_json(json_path)
 
         # .txt
         txt_result = txt_path.read_text()
@@ -342,7 +338,7 @@ class TestInlineScrubbing:
         }))
 
         cp = cloud_processor
-        cp._scrub_manifest(manifest_path, cp._pipeline, cp._anonymizer)
+        cp._scrub_manifest(manifest_path)
 
         data = json.loads(manifest_path.read_text())
         task = data["tasks"][0]
@@ -403,9 +399,7 @@ class TestInlineScrubbing:
             for evt in events:
                 f.write(json.dumps(evt) + "\n")
 
-        cloud_processor._scrub_events_jsonl(
-            events_path, cloud_processor._pipeline, cloud_processor._anonymizer,
-        )
+        cloud_processor._scrub_events_jsonl(events_path)
 
         scrubbed = [json.loads(line) for line in events_path.read_text().splitlines() if line.strip()]
         key_type = scrubbed[1]
@@ -430,12 +424,38 @@ class TestInlineScrubbing:
             for evt in events:
                 f.write(json.dumps(evt) + "\n")
 
-        cloud_processor._scrub_events_jsonl(
-            events_path, cloud_processor._pipeline, cloud_processor._anonymizer,
-        )
+        cloud_processor._scrub_events_jsonl(events_path)
 
         scrubbed = [json.loads(line) for line in events_path.read_text().splitlines() if line.strip()]
         assert scrubbed[1]["text"] == "hello world"
+
+    def test_scrub_v2_key_shortcut_nulls_pii(self, cloud_capture_dir, cloud_processor):
+        """v2 format: key.shortcut with PII should null text and children key_char."""
+        events = [
+            {"_meta": True, "format_version": 2},
+            {
+                "type": "key.shortcut",
+                "timestamp": 1000.0,
+                "text": "John Smith",
+                "children": [
+                    {"type": "key.down", "timestamp": 1000.0, "key_char": "J"},
+                    {"type": "key.down", "timestamp": 1000.1, "key_char": "o"},
+                ],
+            },
+        ]
+
+        events_path = cloud_capture_dir / "events_0000.jsonl"
+        with open(events_path, "w") as f:
+            for evt in events:
+                f.write(json.dumps(evt) + "\n")
+
+        cloud_processor._scrub_events_jsonl(events_path)
+
+        scrubbed = [json.loads(line) for line in events_path.read_text().splitlines() if line.strip()]
+        shortcut = scrubbed[1]
+        assert shortcut["text"] is None
+        for child in shortcut["children"]:
+            assert child["key_char"] is None
 
     def test_scrub_v2_window_switch_title(self, cloud_capture_dir, cloud_processor):
         """v2 format: window.switch window_title with PII should be scrubbed."""
@@ -457,14 +477,39 @@ class TestInlineScrubbing:
             for evt in events:
                 f.write(json.dumps(evt) + "\n")
 
-        cloud_processor._scrub_events_jsonl(
-            events_path, cloud_processor._pipeline, cloud_processor._anonymizer,
-        )
+        cloud_processor._scrub_events_jsonl(events_path)
 
         scrubbed = [json.loads(line) for line in events_path.read_text().splitlines() if line.strip()]
         ws = scrubbed[1]
         assert "John Smith" not in ws["window_title"]
         assert "<PERSON>" in ws["window_title"]
+
+    def test_scrub_v1_uses_press_event_name(self, cloud_capture_dir, cloud_processor):
+        """v1 format: scrubber uses 'press' (raw DB name) not 'key.down'."""
+        events = [
+            {"name": "press", "timestamp": 1000.0, "key_char": "J", "key_name": "j"},
+            {"name": "press", "timestamp": 1000.1, "key_char": "o", "key_name": "o"},
+            {"name": "press", "timestamp": 1000.2, "key_char": "h", "key_name": "h"},
+            {"name": "press", "timestamp": 1000.3, "key_char": "n", "key_name": "n"},
+            {"name": "press", "timestamp": 1000.4, "key_char": " ", "key_name": "space"},
+            {"name": "press", "timestamp": 1000.5, "key_char": "S", "key_name": "s"},
+            {"name": "press", "timestamp": 1000.6, "key_char": "m", "key_name": "m"},
+            {"name": "press", "timestamp": 1000.7, "key_char": "i", "key_name": "i"},
+            {"name": "press", "timestamp": 1000.8, "key_char": "t", "key_name": "t"},
+            {"name": "press", "timestamp": 1000.9, "key_char": "h", "key_name": "h"},
+        ]
+
+        events_path = cloud_capture_dir / "events_0000.jsonl"
+        with open(events_path, "w") as f:
+            for evt in events:
+                f.write(json.dumps(evt) + "\n")
+
+        cloud_processor._scrub_events_jsonl(events_path)
+
+        scrubbed = [json.loads(line) for line in events_path.read_text().splitlines() if line.strip()]
+        # PII detected → key_char should be nulled
+        for evt in scrubbed:
+            assert evt["key_char"] is None
 
 class TestBlockedIntervalsInManifest:
     """Tests for Phase 6: blocked intervals in chunk manifest."""

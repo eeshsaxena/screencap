@@ -415,7 +415,7 @@ class CaptureSession:
                 "width": getattr(we, "width", 0),
                 "height": getattr(we, "height", 0),
             })
-        window_rows.sort(key=lambda r: r["timestamp"])
+        # window_events ORM relationship is already ordered by timestamp
         window_switches = deduplicate_window_events(window_rows)
 
         # 3. Interleave by timestamp

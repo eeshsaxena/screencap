@@ -129,7 +129,7 @@ def build_privacy_filter(
 
         cfg = get_config()
         privacy_cfg = parse_privacy_config(cfg)
-    except Exception:
+    except (FileNotFoundError, KeyError, ValueError):
         logger.debug("Could not load privacy config, using defaults")
         from screencap.privacy.policy import PrivacyConfig
 

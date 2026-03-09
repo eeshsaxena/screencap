@@ -429,7 +429,7 @@ class ChunkProcessor:
         limitation (orphan events at boundaries).
         """
         from sc_engine.convert import dict_to_action_event
-        from sc_engine.events import MouseMoveEvent, WindowSwitchEvent
+        from sc_engine.events import MouseMoveEvent
         from sc_engine.processing import (
             deduplicate_window_events,
             interleave_window_events,
@@ -572,17 +572,11 @@ class ChunkProcessor:
         Per-field failure → <SCRUB_FAILED> sentinel. Per-file failure → file
         marked for skip (renamed to .scrub_failed).
         """
-        from screencap.privacy import AllDetectorsFailedError
-        from screencap.privacy.actions import KEYSTROKE_CONTENT_FIELDS
-
-        pipeline = self._pipeline
-        anonymizer = self._anonymizer
-
         # --- Events JSONL ---
         events_path = self._capture_dir / f"events_{idx:04d}.jsonl"
         if events_path.exists():
             try:
-                self._scrub_events_jsonl(events_path, pipeline, anonymizer)
+                self._scrub_events_jsonl(events_path)
             except Exception as e:
                 logger.error(f"Chunk {idx}: events JSONL scrub failed, skipping file: {e}")
                 _rename_scrub_failed(events_path)
@@ -590,7 +584,7 @@ class ChunkProcessor:
         # --- Transcript .txt ---
         if transcript_path and transcript_path.exists():
             try:
-                self._scrub_transcript_txt(transcript_path, pipeline, anonymizer)
+                self._scrub_transcript_txt(transcript_path)
             except Exception as e:
                 logger.error(f"Chunk {idx}: transcript .txt scrub failed, skipping file: {e}")
                 _rename_scrub_failed(transcript_path)
@@ -599,7 +593,7 @@ class ChunkProcessor:
         transcript_json = self._capture_dir / f"transcript_{idx:04d}.json"
         if transcript_json.exists():
             try:
-                self._scrub_transcript_json(transcript_json, pipeline, anonymizer)
+                self._scrub_transcript_json(transcript_json)
             except Exception as e:
                 logger.error(f"Chunk {idx}: transcript .json scrub failed, skipping file: {e}")
                 _rename_scrub_failed(transcript_json)
@@ -608,7 +602,7 @@ class ChunkProcessor:
         manifest_path = self._capture_dir / f"chunk_{idx:04d}_manifest.json"
         if manifest_path.exists():
             try:
-                self._scrub_manifest(manifest_path, pipeline, anonymizer)
+                self._scrub_manifest(manifest_path)
             except Exception as e:
                 logger.error(f"Chunk {idx}: manifest scrub failed, skipping file: {e}")
                 _rename_scrub_failed(manifest_path)
@@ -628,7 +622,7 @@ class ChunkProcessor:
             return "<SCRUB_FAILED>"
         return self._anonymizer.anonymize(result.normalized_text, result.detections)
 
-    def _scrub_events_jsonl(self, path: Path, pipeline, anonymizer) -> None:
+    def _scrub_events_jsonl(self, path: Path) -> None:
         """Scrub PII in events JSONL.
 
         Handles both format versions:
@@ -645,8 +639,6 @@ class ChunkProcessor:
         - Aggregate consecutive ``key.down`` ``key_char`` into combined text,
           null KEYSTROKE_CONTENT_FIELDS if PII detected.
         """
-        from screencap.privacy.actions import KEYSTROKE_CONTENT_FIELDS
-
         lines = path.read_text(encoding="utf-8").splitlines()
         events = []
         for line in lines:
@@ -695,13 +687,16 @@ class ChunkProcessor:
                 if title:
                     evt["window_title"] = self._scrub_text_field(title)
 
-            # key.shortcut: scrub text field
+            # key.shortcut: scrub text field + children key_char
             elif evt_type == "key.shortcut":
                 text = evt.get("text", "")
                 if text and len(text) >= 4:
                     scrubbed = self._scrub_text_field(text)
                     if scrubbed != text:
-                        evt["text"] = scrubbed
+                        evt["text"] = None
+                        for child in evt.get("children", []):
+                            if "key_char" in child:
+                                child["key_char"] = None
 
     def _scrub_events_v1(self, events: list[dict]) -> None:
         """Scrub v1 format events (raw DB rows) in place. Backward compat."""
@@ -710,13 +705,13 @@ class ChunkProcessor:
         i = 0
         while i < len(events):
             evt = events[i]
-            if evt.get("name") != "key.down" or not evt.get("key_char"):
+            if evt.get("name") != "press" or not evt.get("key_char"):
                 i += 1
                 continue
 
             run_start = i
             combined_chars = []
-            while i < len(events) and events[i].get("name") == "key.down":
+            while i < len(events) and events[i].get("name") == "press":
                 ch = events[i].get("key_char", "")
                 combined_chars.append(ch if ch else "")
                 i += 1
@@ -735,12 +730,12 @@ class ChunkProcessor:
                         events[j][field_] = None
 
         for evt in events:
-            if evt.get("name") in ("key.down", "key.up"):
+            if evt.get("name") in ("press", "release"):
                 continue
             if "text" in evt and isinstance(evt["text"], str) and evt["text"]:
                 evt["text"] = self._scrub_text_field(evt["text"])
 
-    def _scrub_transcript_txt(self, path: Path, pipeline, anonymizer) -> None:
+    def _scrub_transcript_txt(self, path: Path) -> None:
         """Scrub PII from transcript .txt file."""
         text = path.read_text(encoding="utf-8")
         scrubbed = self._scrub_text_field(text)
@@ -749,7 +744,7 @@ class ChunkProcessor:
             f.write(scrubbed)
         os.rename(tmp_path, str(path))
 
-    def _scrub_transcript_json(self, path: Path, pipeline, anonymizer) -> None:
+    def _scrub_transcript_json(self, path: Path) -> None:
         """Scrub PII from transcript .json file (text + segments)."""
         data = json.loads(path.read_text(encoding="utf-8"))
         if isinstance(data, dict):
@@ -764,7 +759,7 @@ class ChunkProcessor:
             json.dump(data, f, indent=2)
         os.rename(tmp_path, str(path))
 
-    def _scrub_manifest(self, path: Path, pipeline, anonymizer) -> None:
+    def _scrub_manifest(self, path: Path) -> None:
         """Scrub dominant_title in manifest and re-derive task name from clean title."""
         from screencap.task_manifest import _derive_task_name
 
