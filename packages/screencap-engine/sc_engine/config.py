@@ -82,7 +82,6 @@ class Settings(BaseSettings):
 
     # Variable-rate capture (action-aware)
     SCREENSHOT_ACTION_AWARE: bool = True
-    SCREENSHOT_CLICK_INTERVAL: float = 0.0       # Always save (0 = no floor)
     SCREENSHOT_DRAG_INTERVAL: float = 0.1        # ~10 fps during drag
     SCREENSHOT_SCROLL_INTERVAL: float = 0.1      # ~10 fps during scroll/zoom
     SCREENSHOT_TYPE_INTERVAL: float = 1.0        # ~1 fps during typing
@@ -144,7 +143,6 @@ _FIELD_TO_CONFIG_ATTR = {
     "screenshot_min_interval": "SCREENSHOT_MIN_INTERVAL",
     "screenshot_hash_threshold": "SCREENSHOT_HASH_THRESHOLD",
     "screenshot_action_aware": "SCREENSHOT_ACTION_AWARE",
-    "screenshot_click_interval": "SCREENSHOT_CLICK_INTERVAL",
     "screenshot_drag_interval": "SCREENSHOT_DRAG_INTERVAL",
     "screenshot_scroll_interval": "SCREENSHOT_SCROLL_INTERVAL",
     "screenshot_type_interval": "SCREENSHOT_TYPE_INTERVAL",
@@ -183,7 +181,6 @@ class RecordingConfig:
     screenshot_min_interval: float | None = None
     screenshot_hash_threshold: int | None = None
     screenshot_action_aware: bool | None = None
-    screenshot_click_interval: float | None = None
     screenshot_drag_interval: float | None = None
     screenshot_scroll_interval: float | None = None
     screenshot_type_interval: float | None = None

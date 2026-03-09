@@ -36,6 +36,7 @@ from sc_engine import utils, video, window
 from sc_engine.ax_cache import AXQueryCache
 from sc_engine.config import RecordingConfig, config
 from sc_engine.dedup import dhash, hamming_distance
+from sc_engine.retention import RetentionDecision, ScreenRetentionFilter
 from sc_engine.db import create_db, crud, get_session_for_path
 from sc_engine.db.models import ActionEvent, Recording
 from sc_engine.extensions import synchronized_queue as sq
@@ -281,14 +282,8 @@ def process_events(
 
     # Variable-rate retention filter (action-aware capture)
     retention_filter = None
-    RetentionDecision = None
     if config.SCREENSHOT_ACTION_AWARE:
-        from sc_engine.retention import (
-            RetentionDecision,
-            ScreenRetentionFilter,
-        )
         retention_filter = ScreenRetentionFilter(
-            click_interval=config.SCREENSHOT_CLICK_INTERVAL,
             drag_interval=config.SCREENSHOT_DRAG_INTERVAL,
             scroll_interval=config.SCREENSHOT_SCROLL_INTERVAL,
             type_interval=config.SCREENSHOT_TYPE_INTERVAL,
@@ -359,24 +354,33 @@ def process_events(
             if (retention_filter is not None
                     and prev_screen_event is not None
                     and retention_filter.check_settle(time.monotonic())):
-                _drops["screen_settle_save"] += 1
-                # Re-use existing fan-out: save screen + action-gated video
-                settle_events = [
-                    (prev_screen_event, screen_write_q, write_screen_event),
-                ]
-                if config.RECORD_VIDEO and not config.RECORD_FULL_VIDEO:
-                    settle_vid = prev_screen_event._replace(type="screen/video")
-                    settle_events.append(
-                        (settle_vid, video_write_q, write_video_event),
-                    )
-                for sev, swq, swfn in settle_events:
-                    if process_event(sev, swq, swfn, recording, perf_q, terminate_processing):
-                        if sev.type == "screen":
-                            num_screen_events.value += 1
-                            prev_saved_screen_timestamp = prev_screen_event.timestamp
-                            prev_saved_screen_hash = dhash(prev_screen_event.data)
-                        elif sev.type == "screen/video":
-                            num_video_events.value += 1
+                # Privacy filter: suppress settle frame for blocked apps
+                _settle_allowed = (
+                    screen_filter.is_screen_allowed(prev_screen_event.timestamp)
+                    if screen_filter is not None else True
+                )
+                if not _settle_allowed:
+                    _drops["privacy_settle_blocked"] += 1
+                else:
+                    _drops["screen_settle_save"] += 1
+                    # Re-use existing fan-out: save screen + action-gated video
+                    settle_events = [
+                        (prev_screen_event, screen_write_q, write_screen_event),
+                    ]
+                    if config.RECORD_VIDEO and not config.RECORD_FULL_VIDEO:
+                        settle_vid = prev_screen_event._replace(type="screen/video")
+                        settle_events.append(
+                            (settle_vid, video_write_q, write_video_event),
+                        )
+                    for sev, swq, swfn in settle_events:
+                        if process_event(sev, swq, swfn, recording, perf_q, terminate_processing):
+                            if sev.type == "screen":
+                                num_screen_events.value += 1
+                                prev_saved_screen_timestamp = prev_screen_event.timestamp
+                                if config.SCREENSHOT_DEDUP:
+                                    prev_saved_screen_hash = dhash(prev_screen_event.data)
+                            elif sev.type == "screen/video":
+                                num_video_events.value += 1
             # Push placeholder frames during idle blocked intervals (cloud-intent)
             if (_cloud_placeholder and config.RECORD_VIDEO
                     and not screen_filter.is_screen_allowed()):

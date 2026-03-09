@@ -26,7 +26,6 @@ class ScreenRetentionFilter:
     """Per-action-type time-floor filter for variable-rate capture."""
 
     __slots__ = (
-        "_click_interval",
         "_drag_interval",
         "_scroll_interval",
         "_type_interval",
@@ -42,14 +41,12 @@ class ScreenRetentionFilter:
     def __init__(
         self,
         *,
-        click_interval: float = 0.0,
         drag_interval: float = 0.1,
         scroll_interval: float = 0.1,
         type_interval: float = 1.0,
         idle_interval: float = 2.0,
         settle_secs: float = 0.4,
     ) -> None:
-        self._click_interval = click_interval
         self._drag_interval = drag_interval
         self._scroll_interval = scroll_interval
         self._type_interval = type_interval
@@ -103,19 +100,11 @@ class ScreenRetentionFilter:
         """Whether a settle deadline is pending."""
         return self._settle_pending
 
-    def time_until_settle(self, mono: float | None = None) -> float:
-        """Seconds remaining until the settle deadline (may be negative).
-
-        Parameters
-        ----------
-        mono:
-            Current ``time.monotonic()`` value.  If *None*, uses an internal
-            conservative estimate based on the last save time.
-        """
+    def time_until_settle(self, mono: float) -> float:
+        """Seconds remaining until the settle deadline (may be negative)."""
         if not self._settle_pending:
             return float("inf")
-        ref = mono if mono is not None else self._last_save_mono
-        return self._settle_deadline - ref
+        return self._settle_deadline - mono
 
     # ------------------------------------------------------------------
     # Internal handlers
