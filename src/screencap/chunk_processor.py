@@ -412,7 +412,31 @@ class ChunkProcessor:
         transcript_json_path.write_text(json.dumps(resp.model_dump(), indent=2))
 
     def _export_events(self, idx: int, start_ts: float, end_ts: float) -> Path:
-        """Export events from recording.db as JSONL for this chunk's time range."""
+        """Export events from recording.db as JSONL for this chunk's time range.
+
+        Uses the shared processing pipeline (same as CLI ``screencap export``)
+        so both paths produce identical JSONL format.
+
+        Steps: query action_event + window_event by time range →
+        dict_to_action_event → process_events → deduplicate window →
+        interleave → serialize.  Includes initial window context (last
+        window event before chunk start) and format_version: 2 header.
+        Mouse.move events are excluded by default.
+
+        Chunk boundary note: the processing pipeline is stateful (click
+        merging, typing aggregation).  A mouse.down at chunk end may stay
+        unmerged — this is an accepted trade-off documented as a known
+        limitation (orphan events at boundaries).
+        """
+        from sc_engine.convert import dict_to_action_event
+        from sc_engine.events import MouseMoveEvent, WindowSwitchEvent
+        from sc_engine.processing import (
+            deduplicate_window_events,
+            interleave_window_events,
+            process_events,
+        )
+        from screencap.exporter import build_export_metadata, build_privacy_filter
+
         jsonl_path = self._capture_dir / f"events_{idx:04d}.jsonl"
         if jsonl_path.exists():
             return jsonl_path
@@ -422,18 +446,110 @@ class ChunkProcessor:
         conn.execute("PRAGMA query_only=ON")
         conn.row_factory = sqlite3.Row
         try:
-            rows = conn.execute(
+            # 1. Query action events and convert to Pydantic
+            action_rows = conn.execute(
                 "SELECT * FROM action_event WHERE timestamp >= ? AND timestamp < ? ORDER BY timestamp",
                 (start_ts, end_ts),
             ).fetchall()
-            with open(jsonl_path, "w") as f:
-                for row in rows:
-                    f.write(json.dumps(dict(row)) + "\n")
-            logger.info(f"Exported {len(rows)} events to {jsonl_path.name}")
+
+            raw_events = []
+            for row in action_rows:
+                try:
+                    evt = dict_to_action_event(dict(row))
+                    if evt is not None:
+                        raw_events.append(evt)
+                except Exception:
+                    logger.debug(f"Skipping malformed action event at ts={row['timestamp']}")
+
+            # 2. Run through processing pipeline
+            processed = process_events(raw_events)
+
+            # 3. Exclude mouse.move by default
+            processed = [e for e in processed if not isinstance(e, MouseMoveEvent)]
+
+            # 4. Query window events for deduplication
+            window_rows = self._query_window_events(conn, start_ts, end_ts)
+
+            # 5. Add initial window context (last window before chunk start)
+            initial_ctx = self._query_initial_window_context(conn, start_ts)
+            if initial_ctx is not None:
+                window_rows = [initial_ctx] + window_rows
+
+            window_switches = deduplicate_window_events(window_rows)
+
+            # 6. Apply privacy filter for cloud-intent
+            if self._cloud_intent:
+                pf = build_privacy_filter(
+                    privacy_mode=self._privacy_mode,
+                    cloud_intent=True,
+                )
+                window_switches = [
+                    filtered for ws in window_switches
+                    if (filtered := pf(ws)) is not None
+                ]
+
+            # 7. Interleave
+            combined = interleave_window_events(processed, window_switches)
+
+            # 8. Build metadata header
+            meta = build_export_metadata(exclude_moves=True)
+
+            # 9. Atomic write
+            tmp_path = str(jsonl_path) + ".tmp"
+            with open(tmp_path, "w") as f:
+                f.write(json.dumps(meta) + "\n")
+                for evt in combined:
+                    f.write(evt.model_dump_json() + "\n")
+            os.rename(tmp_path, str(jsonl_path))
+
+            n_action = len(processed)
+            n_window = len(window_switches)
+            logger.info(
+                f"Exported {n_action} action + {n_window} window events to {jsonl_path.name}"
+            )
+        except Exception:
+            # Clean up partial .tmp on failure
+            tmp_path = str(jsonl_path) + ".tmp"
+            if os.path.exists(tmp_path):
+                os.unlink(tmp_path)
+            raise
         finally:
             conn.close()
 
         return jsonl_path
+
+    def _query_window_events(
+        self, conn: sqlite3.Connection, start_ts: float, end_ts: float,
+    ) -> list[dict]:
+        """Query window_event table for a time range. Returns list of dicts."""
+        try:
+            rows = conn.execute(
+                "SELECT * FROM window_event WHERE timestamp >= ? AND timestamp < ? ORDER BY timestamp",
+                (start_ts, end_ts),
+            ).fetchall()
+            return [dict(r) for r in rows]
+        except sqlite3.OperationalError:
+            # window_event table may not exist in older DBs
+            logger.debug("window_event table not found, skipping window events")
+            return []
+
+    def _query_initial_window_context(
+        self, conn: sqlite3.Connection, start_ts: float,
+    ) -> dict | None:
+        """Query the last window_event before chunk start for initial context."""
+        try:
+            row = conn.execute(
+                "SELECT * FROM window_event WHERE timestamp < ? ORDER BY timestamp DESC LIMIT 1",
+                (start_ts,),
+            ).fetchone()
+            if row is not None:
+                d = dict(row)
+                # Set timestamp to just before chunk start so it appears first
+                d["timestamp"] = start_ts - 0.001
+                return d
+            return None
+        except sqlite3.OperationalError:
+            return None
 
     def _generate_manifest(
         self, idx: int, start_ts: float, end_ts: float,

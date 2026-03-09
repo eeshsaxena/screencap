@@ -126,6 +126,10 @@ def cloud_capture_dir(tmp_path):
     conn.execute(
         "CREATE TABLE action_event ("
         "id INTEGER PRIMARY KEY, timestamp REAL, name TEXT, "
+        "mouse_x REAL, mouse_y REAL, mouse_dx REAL, mouse_dy REAL, "
+        "mouse_button_name TEXT, mouse_pressed INTEGER, "
+        "mouse_pressure REAL, modifier_flags INTEGER, "
+        "scroll_phase INTEGER, momentum_phase INTEGER, is_continuous INTEGER, "
         "key_char TEXT, key_name TEXT, key_vk TEXT, "
         "canonical_key_char TEXT, canonical_key_name TEXT, canonical_key_vk TEXT, "
         "text TEXT, element_state TEXT, "
@@ -134,7 +138,8 @@ def cloud_capture_dir(tmp_path):
     conn.execute(
         "CREATE TABLE window_event ("
         "id INTEGER PRIMARY KEY, timestamp REAL, title TEXT, "
-        "app_bundle_id TEXT, window_id TEXT)"
+        "app_bundle_id TEXT, window_id TEXT, "
+        "left INTEGER, top INTEGER, width INTEGER, height INTEGER)"
     )
     conn.execute(
         "CREATE TABLE recording (id INTEGER PRIMARY KEY, timestamp REAL)"
@@ -501,3 +506,174 @@ class TestPlaceholderFrame:
         f2 = _make_placeholder_frame(1920, 1080)
         # Both should be identical in content
         assert list(f1.getdata()) == list(f2.getdata())  # noqa: PILLOW14
+
+
+class TestUnifiedEventExport:
+    """Tests for the unified _export_events pipeline (Phase 3)."""
+
+    def _insert_action(self, conn, ts, name="click", **kwargs):
+        """Insert an action_event row."""
+        cols = {"timestamp": ts, "name": name}
+        cols.update(kwargs)
+        keys = ", ".join(cols.keys())
+        placeholders = ", ".join("?" * len(cols))
+        conn.execute(f"INSERT INTO action_event ({keys}) VALUES ({placeholders})", list(cols.values()))
+
+    def _insert_window(self, conn, ts, title="Finder", bundle_id="com.apple.finder", window_id="1"):
+        """Insert a window_event row."""
+        conn.execute(
+            "INSERT INTO window_event (timestamp, title, app_bundle_id, window_id, "
+            "\"left\", top, width, height) VALUES (?, ?, ?, ?, 0, 0, 800, 600)",
+            (ts, title, bundle_id, window_id),
+        )
+
+    def test_produces_processed_events(self, cloud_capture_dir):
+        """_export_events should produce processed Pydantic events, not raw DB rows."""
+        import sqlite3
+
+        conn = sqlite3.connect(str(cloud_capture_dir / "recording.db"))
+        # Insert a click down + up → should be merged into mouse.singleclick
+        self._insert_action(conn, 1000.0, "click", mouse_x=100, mouse_y=200,
+                            mouse_button_name="left", mouse_pressed=1)
+        self._insert_action(conn, 1000.1, "click", mouse_x=100, mouse_y=200,
+                            mouse_button_name="left", mouse_pressed=0)
+        conn.commit()
+        conn.close()
+
+        from screencap.chunk_processor import ChunkProcessor
+
+        q = multiprocessing.Queue()
+        ack_q = multiprocessing.Queue()
+        cp = ChunkProcessor(
+            cloud_capture_dir, q, ack_q, recording_name="test",
+            upload_enabled=False, auto_delete=False,
+        )
+
+        cp._export_events(0, 999.0, 1001.0)
+
+        jsonl_path = cloud_capture_dir / "events_0000.jsonl"
+        assert jsonl_path.exists()
+        lines = jsonl_path.read_text().strip().split("\n")
+
+        # First line is _meta header
+        header = json.loads(lines[0])
+        assert header["_meta"] is True
+        assert header["format_version"] == 2
+
+        # Should have merged into singleclick
+        events = [json.loads(line) for line in lines[1:]]
+        types = [e["type"] for e in events]
+        assert "mouse.singleclick" in types
+        # Should NOT have raw "click" entries
+        assert not any(e.get("name") == "click" for e in events)
+
+    def test_includes_window_switch_events(self, cloud_capture_dir):
+        """_export_events should include deduplicated window.switch events."""
+        import sqlite3
+
+        conn = sqlite3.connect(str(cloud_capture_dir / "recording.db"))
+        self._insert_window(conn, 1000.0, "Documents", "com.apple.finder", "1")
+        self._insert_window(conn, 1000.5, "Downloads", "com.apple.finder", "1")  # same window, title change
+        self._insert_window(conn, 1001.0, "Google", "com.google.Chrome", "2")  # different window
+        self._insert_action(conn, 1000.2, "click", mouse_x=100, mouse_y=200,
+                            mouse_button_name="left", mouse_pressed=1)
+        self._insert_action(conn, 1000.3, "click", mouse_x=100, mouse_y=200,
+                            mouse_button_name="left", mouse_pressed=0)
+        conn.commit()
+        conn.close()
+
+        from screencap.chunk_processor import ChunkProcessor
+
+        q = multiprocessing.Queue()
+        ack_q = multiprocessing.Queue()
+        cp = ChunkProcessor(
+            cloud_capture_dir, q, ack_q, recording_name="test",
+            upload_enabled=False, auto_delete=False,
+        )
+
+        cp._export_events(0, 999.0, 1002.0)
+
+        lines = (cloud_capture_dir / "events_0000.jsonl").read_text().strip().split("\n")
+        events = [json.loads(line) for line in lines[1:]]  # skip _meta
+        ws_events = [e for e in events if e["type"] == "window.switch"]
+
+        # Deduped: Finder (1 window) + Chrome = 2 switches
+        assert len(ws_events) == 2
+        assert ws_events[0]["app_bundle_id"] == "com.apple.finder"
+        assert ws_events[1]["app_bundle_id"] == "com.google.Chrome"
+
+    def test_initial_window_context(self, cloud_capture_dir):
+        """First window.switch should be from before chunk start (initial context)."""
+        import sqlite3
+
+        conn = sqlite3.connect(str(cloud_capture_dir / "recording.db"))
+        # Window event before chunk start
+        self._insert_window(conn, 999.0, "Pre-chunk App", "com.example.app", "10")
+        self._insert_action(conn, 1000.2, "click", mouse_x=100, mouse_y=200,
+                            mouse_button_name="left", mouse_pressed=1)
+        self._insert_action(conn, 1000.3, "click", mouse_x=100, mouse_y=200,
+                            mouse_button_name="left", mouse_pressed=0)
+        conn.commit()
+        conn.close()
+
+        from screencap.chunk_processor import ChunkProcessor
+
+        q = multiprocessing.Queue()
+        ack_q = multiprocessing.Queue()
+        cp = ChunkProcessor(
+            cloud_capture_dir, q, ack_q, recording_name="test",
+            upload_enabled=False, auto_delete=False,
+        )
+
+        cp._export_events(0, 1000.0, 1001.0)
+
+        lines = (cloud_capture_dir / "events_0000.jsonl").read_text().strip().split("\n")
+        events = [json.loads(line) for line in lines[1:]]
+
+        # First event should be window.switch from initial context
+        assert events[0]["type"] == "window.switch"
+        assert events[0]["app_bundle_id"] == "com.example.app"
+
+    def test_atomic_write(self, cloud_capture_dir):
+        """No .tmp file should remain after successful export."""
+        from screencap.chunk_processor import ChunkProcessor
+
+        q = multiprocessing.Queue()
+        ack_q = multiprocessing.Queue()
+        cp = ChunkProcessor(
+            cloud_capture_dir, q, ack_q, recording_name="test",
+            upload_enabled=False, auto_delete=False,
+        )
+
+        cp._export_events(0, 1000.0, 1001.0)
+
+        assert (cloud_capture_dir / "events_0000.jsonl").exists()
+        assert not (cloud_capture_dir / "events_0000.jsonl.tmp").exists()
+
+    def test_excludes_mouse_move_by_default(self, cloud_capture_dir):
+        """Mouse.move events should be excluded by default."""
+        import sqlite3
+
+        conn = sqlite3.connect(str(cloud_capture_dir / "recording.db"))
+        self._insert_action(conn, 1000.0, "move", mouse_x=100, mouse_y=200)
+        self._insert_action(conn, 1000.1, "click", mouse_x=100, mouse_y=200,
+                            mouse_button_name="left", mouse_pressed=1)
+        self._insert_action(conn, 1000.2, "click", mouse_x=100, mouse_y=200,
+                            mouse_button_name="left", mouse_pressed=0)
+        conn.commit()
+        conn.close()
+
+        from screencap.chunk_processor import ChunkProcessor
+
+        q = multiprocessing.Queue()
+        ack_q = multiprocessing.Queue()
+        cp = ChunkProcessor(
+            cloud_capture_dir, q, ack_q, recording_name="test",
+            upload_enabled=False, auto_delete=False,
+        )
+
+        cp._export_events(0, 999.0, 1001.0)
+
+        lines = (cloud_capture_dir / "events_0000.jsonl").read_text().strip().split("\n")
+        events = [json.loads(line) for line in lines[1:]]
+        assert not any(e["type"] == "mouse.move" for e in events)
