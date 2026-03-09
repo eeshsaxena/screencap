@@ -6,6 +6,8 @@ import json
 import os
 from unittest import mock
 
+import pytest
+
 from sc_engine.events import (
     EventType,
     MouseClickEvent,
@@ -46,18 +48,14 @@ def _mock_capture(export_events=None):
     return capture
 
 
-def test_build_export_metadata():
-    meta = build_export_metadata(exclude_moves=True)
+@pytest.mark.parametrize("exclude_moves", [True, False])
+def test_build_export_metadata(exclude_moves):
+    meta = build_export_metadata(exclude_moves=exclude_moves)
     assert meta["_meta"] is True
     assert meta["format_version"] == 2
     assert "screencap_version" in meta
     assert "exported_at" in meta
-    assert meta["exclude_moves"] is True
-
-
-def test_build_export_metadata_include_moves():
-    meta = build_export_metadata(exclude_moves=False)
-    assert meta["exclude_moves"] is False
+    assert meta["exclude_moves"] is exclude_moves
 
 
 def test_export_recording_writes_metadata_header(tmp_path):
