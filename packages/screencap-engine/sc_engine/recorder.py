@@ -2989,6 +2989,19 @@ class Recorder:
                 screen_filter=self._screen_filter,
             )
 
+    def _forward_fanout_msg(self, msg) -> None:
+        """Forward a single chunk event to audio and chunk processor queues."""
+        try:
+            if self._audio_rotate_q is not None:
+                self._audio_rotate_q.put(msg, timeout=5)
+        except Exception:
+            logger.error("Fan-out: audio_rotate_q full or dead")
+        try:
+            if self._chunk_process_q is not None:
+                self._chunk_process_q.put(msg, timeout=5)
+        except Exception:
+            logger.error("Fan-out: chunk_process_q full or dead")
+
     def _chunk_fanout(self) -> None:
         """Fan-out thread: dispatch chunk rotation events to audio + chunk processor."""
         while not self._stopped_event.is_set():
@@ -2996,16 +3009,15 @@ class Recorder:
                 msg = self._chunk_rotate_q.get(timeout=1.0)
             except Exception:
                 continue
+            self._forward_fanout_msg(msg)
+        # Drain remaining messages after stop signal so the final_chunk
+        # is never lost due to the _stopped_event race.
+        while True:
             try:
-                if self._audio_rotate_q is not None:
-                    self._audio_rotate_q.put(msg, timeout=5)
+                msg = self._chunk_rotate_q.get_nowait()
             except Exception:
-                logger.error("Fan-out: audio_rotate_q full or dead")
-            try:
-                if self._chunk_process_q is not None:
-                    self._chunk_process_q.put(msg, timeout=5)
-            except Exception:
-                logger.error("Fan-out: chunk_process_q full or dead")
+                break
+            self._forward_fanout_msg(msg)
 
     def __enter__(self) -> "Recorder":
         # Set up chunking primitives if chunking enabled
@@ -3051,7 +3063,9 @@ class Recorder:
             self._record_thread.join(timeout=30)
             if self._record_thread.is_alive():
                 logger.warning("Record thread did not exit in 30s, continuing cleanup")
-        self._stopped_event.set()  # ensure status thread exits
+        self._stopped_event.set()  # ensure status/fanout threads exit
+        if self._fanout_thread is not None:
+            self._fanout_thread.join(timeout=10)
         if self._status_thread is not None:
             self._status_thread.join(timeout=5)
 
