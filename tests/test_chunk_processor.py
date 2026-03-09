@@ -249,51 +249,6 @@ class TestCloudIntentGating:
 class TestInlineScrubbing:
     """Test inline scrubbing of text surfaces."""
 
-    def test_scrub_events_jsonl_nulls_pii_keystrokes(self, cloud_capture_dir, cloud_processor):
-        """Keystroke content fields must be nulled when PII is detected in combined text."""
-        events = []
-        for ch in "John Smith":
-            events.append({
-                "name": "press",
-                "timestamp": 1000.0 + len(events),
-                "key_char": ch,
-                "canonical_key_char": ch,
-            })
-
-        events_path = cloud_capture_dir / "events_0000.jsonl"
-        with open(events_path, "w") as f:
-            for evt in events:
-                f.write(json.dumps(evt) + "\n")
-
-        cloud_processor._scrub_events_jsonl(events_path)
-
-        scrubbed = [json.loads(line) for line in events_path.read_text().splitlines() if line.strip()]
-
-        for evt in scrubbed:
-            assert evt["key_char"] is None, f"key_char not nulled: {evt}"
-            assert evt["canonical_key_char"] is None
-
-    def test_scrub_events_jsonl_leaves_clean_keystrokes(self, cloud_capture_dir, cloud_processor):
-        """Keystrokes that don't contain PII should be left unchanged."""
-        events = []
-        for ch in "hello world":
-            events.append({
-                "name": "press",
-                "timestamp": 1000.0 + len(events),
-                "key_char": ch,
-            })
-
-        events_path = cloud_capture_dir / "events_0000.jsonl"
-        with open(events_path, "w") as f:
-            for evt in events:
-                f.write(json.dumps(evt) + "\n")
-
-        cloud_processor._scrub_events_jsonl(events_path)
-
-        scrubbed = [json.loads(line) for line in events_path.read_text().splitlines() if line.strip()]
-        chars = [e["key_char"] for e in scrubbed]
-        assert chars == list("hello world")
-
     def test_scrub_transcripts_txt_and_json(self, cloud_capture_dir, cloud_processor):
         """Both transcript formats must have PII replaced, including segment text."""
         txt_path = cloud_capture_dir / "transcript_0000.txt"
@@ -483,33 +438,6 @@ class TestInlineScrubbing:
         ws = scrubbed[1]
         assert "John Smith" not in ws["window_title"]
         assert "<PERSON>" in ws["window_title"]
-
-    def test_scrub_v1_uses_press_event_name(self, cloud_capture_dir, cloud_processor):
-        """v1 format: scrubber uses 'press' (raw DB name) not 'key.down'."""
-        events = [
-            {"name": "press", "timestamp": 1000.0, "key_char": "J", "key_name": "j"},
-            {"name": "press", "timestamp": 1000.1, "key_char": "o", "key_name": "o"},
-            {"name": "press", "timestamp": 1000.2, "key_char": "h", "key_name": "h"},
-            {"name": "press", "timestamp": 1000.3, "key_char": "n", "key_name": "n"},
-            {"name": "press", "timestamp": 1000.4, "key_char": " ", "key_name": "space"},
-            {"name": "press", "timestamp": 1000.5, "key_char": "S", "key_name": "s"},
-            {"name": "press", "timestamp": 1000.6, "key_char": "m", "key_name": "m"},
-            {"name": "press", "timestamp": 1000.7, "key_char": "i", "key_name": "i"},
-            {"name": "press", "timestamp": 1000.8, "key_char": "t", "key_name": "t"},
-            {"name": "press", "timestamp": 1000.9, "key_char": "h", "key_name": "h"},
-        ]
-
-        events_path = cloud_capture_dir / "events_0000.jsonl"
-        with open(events_path, "w") as f:
-            for evt in events:
-                f.write(json.dumps(evt) + "\n")
-
-        cloud_processor._scrub_events_jsonl(events_path)
-
-        scrubbed = [json.loads(line) for line in events_path.read_text().splitlines() if line.strip()]
-        # PII detected → key_char should be nulled
-        for evt in scrubbed:
-            assert evt["key_char"] is None
 
 class TestBlockedIntervalsInManifest:
     """Tests for Phase 6: blocked intervals in chunk manifest."""

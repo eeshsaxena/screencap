@@ -83,7 +83,7 @@ Two-layer privacy enforcement: capture-time filtering + post-recording scrubbing
 
 **Privacy-aware `window.switch` events:** EXCLUDE apps → suppressed entirely, MASK_WINDOW → title replaced with app name, OCR_FALLBACK → suppressed for cloud-intent uploads. Privacy filtering happens in the screencap layer (`exporter.py` / `chunk_processor.py`), not in `sc_engine`.
 
-**Scrubbing pipeline:** `_scrub_events_jsonl()` handles both v1 (raw `name` field) and v2 (processed `type` field) formats. v2 scrubs `key.type` text + children, and `window.switch` titles.
+**Scrubbing pipeline:** `_scrub_events_jsonl()` scrubs `key.type` and `key.shortcut` text + children `key_char`, and `window.switch` titles.
 
 ## Key Patterns
 
