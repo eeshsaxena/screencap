@@ -58,6 +58,7 @@ from screencap.privacy.policy import (
     DefaultPolicyEvaluator,
     FrameMetadata,
     PrivacyConfig,
+    get_matrix_action,
 )
 from screencap.privacy.reasons import ReasonCode
 
@@ -149,6 +150,13 @@ class RecorderPrivacyFilter:
         self._block_actions = _BLOCK_ACTIONS | (
             frozenset({PrivacyAction.OCR_FALLBACK}) if cloud_intent else frozenset()
         )
+        # Actions that trigger cloud-specific blocking even for allow_apps.
+        # allow_apps overrides the matrix to ALLOW, which is correct for local
+        # recordings (OCR scrubbing happens post-capture). But cloud video
+        # has no text redaction — so OCR_FALLBACK apps must still be blocked.
+        self._cloud_override_actions = (
+            frozenset({PrivacyAction.OCR_FALLBACK}) if cloud_intent else frozenset()
+        )
 
         # Mutable state (protected by _lock)
         # reason -> hold_until monotonic timestamp (0.0 = not active)
@@ -197,6 +205,18 @@ class RecorderPrivacyFilter:
         ctx = self._classifier.classify(meta)
         decision = self._evaluator.evaluate(ctx, meta)
         now_blocked = decision.action in self._block_actions
+
+        # Cloud-intent: allow_apps overrides the matrix to ALLOW, which is
+        # correct for local recordings (OCR scrubbing handles redaction).
+        # But cloud video has no text redaction engine, so apps whose matrix
+        # action is OCR_FALLBACK must still be blocked even if allow_apps
+        # granted ALLOW.
+        if not now_blocked and self._cloud_override_actions:
+            matrix_action = get_matrix_action(
+                ctx.context_class, self._evaluator.config.mode,
+            )
+            if matrix_action in self._cloud_override_actions:
+                now_blocked = True
 
         now = time.monotonic()
         with self._lock:

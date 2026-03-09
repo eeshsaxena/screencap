@@ -695,11 +695,16 @@ def run_setup_wizard(
                 final_app_classes.pop(bid, None)
                 if bid in final_allow:
                     final_allow.remove(bid)
-            elif group_key in ("communication", "safe"):
+            elif group_key == "communication":
                 if bid not in existing_ac and bid not in BUNDLE_ID_MAP:
                     final_app_classes[bid] = cls.value
                 if bid in final_allow:
                     final_allow.remove(bid)
+            elif group_key == "safe":
+                if bid not in existing_ac and bid not in BUNDLE_ID_MAP:
+                    final_app_classes[bid] = cls.value
+                if bid not in final_allow and bid not in final_exclude:
+                    final_allow.append(bid)
             elif group_key == "unclassified":
                 if bid not in final_allow and bid not in final_exclude:
                     final_allow.append(bid)
