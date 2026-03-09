@@ -629,7 +629,22 @@ class ChunkProcessor:
         return self._anonymizer.anonymize(result.normalized_text, result.detections)
 
     def _scrub_events_jsonl(self, path: Path, pipeline, anonymizer) -> None:
-        """Scrub keystroke content in events JSONL using combined-text aggregation."""
+        """Scrub PII in events JSONL.
+
+        Handles both format versions:
+        - v2 (unified): ``type`` field with processed events (``key.type``,
+          ``window.switch``, etc.)
+        - v1 (legacy): ``name`` field with raw DB events (``key.down``, etc.)
+
+        v2 scrubbing:
+        - ``key.type`` events: detect PII in ``text`` field, null ``text``
+          and ``children[*].key_char`` if detected.
+        - ``window.switch`` events: scrub ``window_title`` field.
+
+        v1 scrubbing (backward compat):
+        - Aggregate consecutive ``key.down`` ``key_char`` into combined text,
+          null KEYSTROKE_CONTENT_FIELDS if PII detected.
+        """
         from screencap.privacy.actions import KEYSTROKE_CONTENT_FIELDS
 
         lines = path.read_text(encoding="utf-8").splitlines()
@@ -638,8 +653,60 @@ class ChunkProcessor:
             if line.strip():
                 events.append(json.loads(line))
 
-        # Aggregate consecutive key.down events into combined text strings
-        # to defeat the 4-char short-circuit in DetectionPipeline
+        # Detect format version from _meta header
+        is_v2 = False
+        if events and events[0].get("_meta"):
+            is_v2 = events[0].get("format_version", 1) >= 2
+
+        if is_v2:
+            self._scrub_events_v2(events)
+        else:
+            self._scrub_events_v1(events)
+
+        # Atomic write
+        tmp_path = str(path) + ".tmp"
+        with open(tmp_path, "w", encoding="utf-8") as f:
+            for evt in events:
+                f.write(json.dumps(evt) + "\n")
+        os.rename(tmp_path, str(path))
+
+    def _scrub_events_v2(self, events: list[dict]) -> None:
+        """Scrub v2 format events (processed Pydantic events) in place."""
+        for evt in events:
+            if evt.get("_meta"):
+                continue
+
+            evt_type = evt.get("type", "")
+
+            # key.type: detect PII in text, null text + children key_char
+            if evt_type == "key.type":
+                text = evt.get("text", "")
+                if text and len(text) >= 4:
+                    scrubbed = self._scrub_text_field(text)
+                    if scrubbed != text:
+                        evt["text"] = None
+                        for child in evt.get("children", []):
+                            if "key_char" in child:
+                                child["key_char"] = None
+
+            # window.switch: scrub window_title
+            elif evt_type == "window.switch":
+                title = evt.get("window_title", "")
+                if title:
+                    evt["window_title"] = self._scrub_text_field(title)
+
+            # key.shortcut: scrub text field
+            elif evt_type == "key.shortcut":
+                text = evt.get("text", "")
+                if text and len(text) >= 4:
+                    scrubbed = self._scrub_text_field(text)
+                    if scrubbed != text:
+                        evt["text"] = scrubbed
+
+    def _scrub_events_v1(self, events: list[dict]) -> None:
+        """Scrub v1 format events (raw DB rows) in place. Backward compat."""
+        from screencap.privacy.actions import KEYSTROKE_CONTENT_FIELDS
+
         i = 0
         while i < len(events):
             evt = events[i]
@@ -647,7 +714,6 @@ class ChunkProcessor:
                 i += 1
                 continue
 
-            # Collect run of consecutive key.down events
             run_start = i
             combined_chars = []
             while i < len(events) and events[i].get("name") == "key.down":
@@ -657,34 +723,22 @@ class ChunkProcessor:
 
             combined_text = "".join(combined_chars)
             if len(combined_text) < 4:
-                # Too short for detection — leave as-is
                 continue
 
-            # Run detection on combined text
             scrubbed = self._scrub_text_field(combined_text)
             if scrubbed == combined_text:
-                # No PII detected
                 continue
 
-            # PII found — null keystroke content fields for this entire run
             for j in range(run_start, run_start + len(combined_chars)):
-                for field in KEYSTROKE_CONTENT_FIELDS:
-                    if field in events[j]:
-                        events[j][field] = None
+                for field_ in KEYSTROKE_CONTENT_FIELDS:
+                    if field_ in events[j]:
+                        events[j][field_] = None
 
-        # Also scrub any text fields on non-keystroke events
         for evt in events:
             if evt.get("name") in ("key.down", "key.up"):
                 continue
             if "text" in evt and isinstance(evt["text"], str) and evt["text"]:
                 evt["text"] = self._scrub_text_field(evt["text"])
-
-        # Atomic write
-        tmp_path = str(path) + ".tmp"
-        with open(tmp_path, "w", encoding="utf-8") as f:
-            for evt in events:
-                f.write(json.dumps(evt) + "\n")
-        os.rename(tmp_path, str(path))
 
     def _scrub_transcript_txt(self, path: Path, pipeline, anonymizer) -> None:
         """Scrub PII from transcript .txt file."""

@@ -409,6 +409,115 @@ class TestInlineScrubbing:
         assert not events_path.exists()
         assert (cloud_capture_dir / "events_0000.jsonl.scrub_failed").exists()
 
+    def test_scrub_v2_key_type_nulls_pii(self, cloud_capture_dir, cloud_processor):
+        """v2 format: key.type text with PII should be nulled, children key_char too."""
+        events = [
+            {"_meta": True, "format_version": 2},
+            {
+                "type": "key.type",
+                "timestamp": 1000.0,
+                "text": "John Smith",
+                "children": [
+                    {"type": "key.down", "timestamp": 1000.0, "key_char": "J"},
+                    {"type": "key.up", "timestamp": 1000.01, "key_char": "J"},
+                    {"type": "key.down", "timestamp": 1000.1, "key_char": "o"},
+                    {"type": "key.up", "timestamp": 1000.11, "key_char": "o"},
+                ],
+            },
+        ]
+
+        events_path = cloud_capture_dir / "events_0000.jsonl"
+        with open(events_path, "w") as f:
+            for evt in events:
+                f.write(json.dumps(evt) + "\n")
+
+        cloud_processor._scrub_events_jsonl(
+            events_path, cloud_processor._pipeline, cloud_processor._anonymizer,
+        )
+
+        scrubbed = [json.loads(line) for line in events_path.read_text().splitlines() if line.strip()]
+        key_type = scrubbed[1]
+        assert key_type["text"] is None
+        for child in key_type["children"]:
+            assert child["key_char"] is None
+
+    def test_scrub_v2_key_type_leaves_clean(self, cloud_capture_dir, cloud_processor):
+        """v2 format: key.type text without PII should be left unchanged."""
+        events = [
+            {"_meta": True, "format_version": 2},
+            {
+                "type": "key.type",
+                "timestamp": 1000.0,
+                "text": "hello world",
+                "children": [],
+            },
+        ]
+
+        events_path = cloud_capture_dir / "events_0000.jsonl"
+        with open(events_path, "w") as f:
+            for evt in events:
+                f.write(json.dumps(evt) + "\n")
+
+        cloud_processor._scrub_events_jsonl(
+            events_path, cloud_processor._pipeline, cloud_processor._anonymizer,
+        )
+
+        scrubbed = [json.loads(line) for line in events_path.read_text().splitlines() if line.strip()]
+        assert scrubbed[1]["text"] == "hello world"
+
+    def test_scrub_v2_window_switch_title(self, cloud_capture_dir, cloud_processor):
+        """v2 format: window.switch window_title with PII should be scrubbed."""
+        events = [
+            {"_meta": True, "format_version": 2},
+            {
+                "type": "window.switch",
+                "timestamp": 1000.0,
+                "app_name": "Chrome",
+                "app_bundle_id": "com.google.Chrome",
+                "window_title": "John Smith - Contract Review",
+                "window_id": "1",
+                "x": 0, "y": 0, "width": 800, "height": 600,
+            },
+        ]
+
+        events_path = cloud_capture_dir / "events_0000.jsonl"
+        with open(events_path, "w") as f:
+            for evt in events:
+                f.write(json.dumps(evt) + "\n")
+
+        cloud_processor._scrub_events_jsonl(
+            events_path, cloud_processor._pipeline, cloud_processor._anonymizer,
+        )
+
+        scrubbed = [json.loads(line) for line in events_path.read_text().splitlines() if line.strip()]
+        ws = scrubbed[1]
+        assert "John Smith" not in ws["window_title"]
+        assert "<PERSON>" in ws["window_title"]
+
+    def test_scrub_v1_backward_compat(self, cloud_capture_dir, cloud_processor):
+        """v1 format (no _meta header) should still be scrubbed correctly."""
+        events = []
+        for ch in "John Smith":
+            events.append({
+                "name": "key.down",
+                "timestamp": 1000.0 + len(events),
+                "key_char": ch,
+                "canonical_key_char": ch,
+            })
+
+        events_path = cloud_capture_dir / "events_0000.jsonl"
+        with open(events_path, "w") as f:
+            for evt in events:
+                f.write(json.dumps(evt) + "\n")
+
+        cloud_processor._scrub_events_jsonl(
+            events_path, cloud_processor._pipeline, cloud_processor._anonymizer,
+        )
+
+        scrubbed = [json.loads(line) for line in events_path.read_text().splitlines() if line.strip()]
+        for evt in scrubbed:
+            assert evt["key_char"] is None
+
 
 class TestBlockedIntervalsInManifest:
     """Tests for Phase 6: blocked intervals in chunk manifest."""
