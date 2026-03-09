@@ -1952,8 +1952,12 @@ def record_audio(
     # Track current chunk index for chunked audio
     _current_chunk_idx = [0]  # mutable container
 
-    def _rotate_audio(sf_writer_ref, capture_dir, new_idx):
-        """Close current FLAC, open new one for the next chunk."""
+    def _rotate_audio(sf_writer_ref, capture_dir, new_idx, *, is_final=False):
+        """Close current FLAC, open new one for the next chunk.
+
+        When is_final=True, closes and acks but does NOT open a new file
+        or advance the chunk index — there is no next chunk.
+        """
         # Drain and write remaining buffer
         frames = _drain_buffer()
         if frames is not None:
@@ -1969,6 +1973,10 @@ def record_audio(
                 audio_ack_q.put({"type": "audio_rotated", "completed_index": _current_chunk_idx[0]}, timeout=5)
             except Exception:
                 logger.error("Failed to send audio rotation ack")
+
+        if is_final:
+            sf_writer_ref[0] = None  # mark as finalized
+            return
 
         _current_chunk_idx[0] = new_idx
         new_path = capture_dir / f"audio_{new_idx:04d}.flac"
@@ -1992,9 +2000,13 @@ def record_audio(
                         msg = audio_rotate_q.get_nowait()
                         if msg.get("type") in ("chunk_rotated", "final_chunk"):
                             new_idx = msg.get("completed_index", 0) + 1
-                            _rotate_audio(sf_writer_ref, capture_dir, new_idx)
+                            _rotate_audio(sf_writer_ref, capture_dir, new_idx,
+                                          is_final=msg["type"] == "final_chunk")
                     except Exception:
                         break
+
+            if sf_writer_ref[0] is None:
+                return  # finalized by final_chunk rotation
 
             frames = _drain_buffer()
             if frames is not None:
@@ -2059,21 +2071,24 @@ def record_audio(
                 msg = audio_rotate_q.get_nowait()
                 if msg.get("type") in ("chunk_rotated", "final_chunk"):
                     new_idx = msg.get("completed_index", 0) + 1
-                    _rotate_audio(sf_writer_ref, capture_dir, new_idx)
+                    _rotate_audio(sf_writer_ref, capture_dir, new_idx,
+                                  is_final=msg["type"] == "final_chunk")
             except Exception:
                 break
 
-    # Final drain — write any remaining buffered frames
-    final_frames = _drain_buffer()
-    if final_frames is not None:
-        try:
-            sf_writer_ref[0].write(final_frames)
-            logger.debug(f"Final flush: {len(final_frames)} audio frames")
-        except Exception as e:
-            logger.error(f"Final audio flush failed: {e}")
+    # Final drain — write any remaining buffered frames (skip if already
+    # finalized by a final_chunk rotation above).
+    if sf_writer_ref[0] is not None:
+        final_frames = _drain_buffer()
+        if final_frames is not None:
+            try:
+                sf_writer_ref[0].write(final_frames)
+                logger.debug(f"Final flush: {len(final_frames)} audio frames")
+            except Exception as e:
+                logger.error(f"Final audio flush failed: {e}")
 
-    # Close writer — finalizes FLAC headers
-    sf_writer_ref[0].close()
+        # Close writer — finalizes FLAC headers
+        sf_writer_ref[0].close()
 
     # Derive current audio path from chunk index (audio_flac_path may be stale
     # if chunks were rotated/deleted during recording)
