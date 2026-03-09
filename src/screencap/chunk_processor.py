@@ -54,6 +54,7 @@ class ChunkProcessor:
         flush_ack_counter=None,    # multiprocessing.Value('i') — counts writer acks
         cloud_intent: bool = False,
         privacy_mode: str = "internal",
+        screen_filter=None,
     ) -> None:
         self._capture_dir = Path(capture_dir)
         self._db_path = self._capture_dir / "recording.db"
@@ -67,6 +68,7 @@ class ChunkProcessor:
         self._flush_ack_counter = flush_ack_counter
         self._cloud_intent = cloud_intent
         self._privacy_mode = privacy_mode
+        self._screen_filter = screen_filter
 
         # Initialize scrubbing pipeline for cloud-intent recordings
         self._pipeline = None
@@ -201,6 +203,19 @@ class ChunkProcessor:
         self._generate_manifest(idx, start_ts, end_ts)
         if self._stop_event.is_set():
             return
+
+        # 4b. Add blocked intervals to manifest (cloud-intent only)
+        if self._screen_filter is not None and hasattr(self._screen_filter, 'get_blocked_intervals'):
+            try:
+                intervals = self._screen_filter.get_blocked_intervals(start_ts, end_ts)
+                if intervals:
+                    manifest_path = self._capture_dir / f"chunk_{idx:04d}_manifest.json"
+                    if manifest_path.exists():
+                        data = json.loads(manifest_path.read_text())
+                        data["blocked_intervals"] = intervals
+                        manifest_path.write_text(json.dumps(data, indent=2))
+            except Exception:
+                logger.warning(f"Failed to add blocked_intervals to chunk {idx} manifest")
 
         # 5. Scrub text surfaces for cloud-intent recordings
         if self._cloud_intent and self._pipeline is not None:
@@ -624,23 +639,17 @@ class ChunkProcessor:
     def _collect_chunk_files(self, idx: int, transcript_path: Path | None) -> list[dict]:
         """Collect files belonging to this chunk for upload.
 
-        For cloud-intent recordings, excludes audio/video (no redaction engine).
+        Cloud-intent recordings include video (with placeholder frames for
+        blocked intervals) and audio alongside text files.
         Skips 0-byte files and files renamed to .scrub_failed.
         """
         files = []
-        if self._cloud_intent:
-            # Text-only upload for cloud-intent — audio/video stay local
-            patterns = [
-                f"events_{idx:04d}.jsonl",
-                f"chunk_{idx:04d}_manifest.json",
-            ]
-        else:
-            patterns = [
-                f"chunk_{idx:04d}.mp4",
-                f"audio_{idx:04d}.flac",
-                f"events_{idx:04d}.jsonl",
-                f"chunk_{idx:04d}_manifest.json",
-            ]
+        patterns = [
+            f"chunk_{idx:04d}.mp4",
+            f"audio_{idx:04d}.flac",
+            f"events_{idx:04d}.jsonl",
+            f"chunk_{idx:04d}_manifest.json",
+        ]
         if transcript_path and transcript_path.exists():
             patterns.append(transcript_path.name)
 

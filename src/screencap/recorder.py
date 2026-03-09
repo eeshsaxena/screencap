@@ -501,6 +501,11 @@ def start_recording(
         raise SystemExit(1)
 
     # --- Privacy: capture-time enforcement ---
+    # Cloud-intent recordings always use public privacy mode
+    if cloud_intent and force_mode is None:
+        from screencap.privacy.policy import PrivacyMode as _PrivacyMode
+        force_mode = _PrivacyMode.PUBLIC
+
     screen_filter = None
     privacy_config = None
     try:
@@ -531,7 +536,7 @@ def start_recording(
                 "requires window data. Disabled because window data capture is off."
             )
         else:
-            screen_filter = RecorderPrivacyFilter(privacy_config)
+            screen_filter = RecorderPrivacyFilter(privacy_config, cloud_intent=cloud_intent)
             if verbose:
                 console.print(f"[dim]Privacy mode: {privacy_config.mode.value}[/dim]")
     except Exception as e:
@@ -545,6 +550,17 @@ def start_recording(
         console.print(
             f"[yellow]Warning:[/yellow] Capture-time privacy enforcement disabled: {e}"
         )
+
+    # --- Cloud recording privacy warning ---
+    if cloud_intent and screen_filter is not None:
+        console.print()
+        console.print("[bold yellow]⚠ Cloud Recording Privacy Notice[/bold yellow]")
+        console.print("This recording will be uploaded. Privacy protections active:")
+        console.print("  • Sensitive apps (email, chat, banking, passwords) are automatically blocked")
+        console.print("  • Code editors and admin consoles are blocked (no text redaction available)")
+        console.print("  • Audio continues recording during all intervals, including blocked apps")
+        console.print("  [dim]Avoid displaying passwords, API keys, or personal information on screen.[/dim]")
+        console.print()
 
     try:
         from screencap.metrics import save_metrics
@@ -663,6 +679,7 @@ def start_recording(
                             flush_ack_counter=_flush_ctr,
                             cloud_intent=cloud_intent,
                             privacy_mode=privacy_config.mode.value if privacy_config else "internal",
+                            screen_filter=screen_filter,
                         )
                         chunk_processor.start()
                 except Exception as _chunk_init_err:
