@@ -890,20 +890,21 @@ def start_recording(
             console.print("[dim]Run 'screencap upload' later to upload remaining files.[/dim]")
 
         # WAL checkpoint + upload recording.db
+        _db_uploaded = False
         if live_upload:
             try:
                 from screencap.chunk_processor import checkpoint_and_upload_db
 
                 _recording_name = (capture_dir / ".recording_id").read_text().strip() if (capture_dir / ".recording_id").exists() else name
                 with console.status("[dim]Uploading recording database...[/dim]"):
-                    checkpoint_and_upload_db(capture_dir, _recording_name, cloud_intent=cloud_intent)
+                    _db_uploaded = checkpoint_and_upload_db(capture_dir, _recording_name, cloud_intent=cloud_intent)
             except Exception as e:
                 if verbose:
                     console.print(f"[yellow]Warning:[/yellow] DB upload failed: {e}")
 
-        # Stub recording if all chunks uploaded
+        # Stub recording if all chunks AND db uploaded
         _has_chunk_files = any(capture_dir.glob("chunk_*.mp4"))
-        if chunk_processor.all_chunks_uploaded() and live_upload and _has_chunk_files:
+        if chunk_processor.all_chunks_uploaded() and _db_uploaded and live_upload and _has_chunk_files:
             try:
                 from screencap.chunk_processor import stub_recording
                 deleted = stub_recording(capture_dir)

@@ -748,14 +748,20 @@ def upload_chunk_files(
 
     core_ok = True
     for fi in file_infos:
-        url = urls.get(fi.name)
+        is_core = not fi.name.startswith("transcript")
+        if fi.name not in urls:
+            # Server didn't return a URL at all — file was rejected/unknown
+            if is_core:
+                logger.error(f"Server returned no URL for core file {fi.name}")
+                core_ok = False
+            continue
+        url = urls[fi.name]
         if url is None:
-            continue  # already uploaded or skipped
+            continue  # server confirms already uploaded
         try:
             _upload_single(fi, url)
         except Exception as e:
-            # Transcript failure is non-fatal
-            if fi.name.startswith("transcript"):
+            if not is_core:
                 logger.warning(f"Non-fatal: failed to upload {fi.name}: {e}")
             else:
                 logger.error(f"Failed to upload {fi.name}: {e}")
@@ -828,7 +834,10 @@ def checkpoint_and_upload_db(
     )
     try:
         urls, _ = request_signed_urls(recording_name, [fi])
-        url = urls.get("recording.db")
+        if "recording.db" not in urls:
+            logger.error("Server returned no URL for recording.db")
+            return False
+        url = urls["recording.db"]
         if url:
             _upload_single(fi, url)
         return True
