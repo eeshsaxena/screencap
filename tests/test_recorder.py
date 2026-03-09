@@ -811,3 +811,85 @@ class TestPrivacyFilterInitFailure:
             start_recording("test", output_dir=tmp_path / "test-rec")
 
         assert exc_info.value.code == 1
+
+
+class TestCloudIntentRecording:
+    """Tests for cloud-intent recording behavior (Phases 3, 4)."""
+
+    def test_cloud_intent_forces_public_mode(self, tmp_path):
+        """Cloud-intent recording forces public privacy mode."""
+        from screencap.recorder import start_recording
+        from screencap.privacy.policy import PrivacyConfig, PrivacyMode
+
+        internal_config = PrivacyConfig(mode=PrivacyMode.INTERNAL)
+
+        captured_args = {}
+
+        class FakeFilter:
+            cloud_intent = True
+            def __init__(self, config, **kwargs):
+                captured_args["config"] = config
+                captured_args["kwargs"] = kwargs
+
+        with (
+            mock.patch("screencap.recorder._check_macos_permissions"),
+            mock.patch("screencap.recorder.get_recordings_dir", return_value=tmp_path),
+            mock.patch("shutil.disk_usage", return_value=_PLENTY_OF_DISK),
+            mock.patch("screencap.config.get_privacy_config", return_value=internal_config),
+            mock.patch(
+                "screencap.privacy.recorder_enforcement.RecorderPrivacyFilter",
+                side_effect=lambda config, **kw: FakeFilter(config, **kw),
+            ),
+            mock.patch("sc_engine.Recorder") as MockRecorder,
+            mock.patch("sc_engine.config.config") as mock_engine_config,
+        ):
+            mock_engine_config.RECORD_WINDOW_DATA = True
+            MockRecorder.return_value.__enter__ = mock.MagicMock()
+            MockRecorder.return_value.__exit__ = mock.MagicMock(return_value=False)
+            mock_recorder = MockRecorder.return_value.__enter__.return_value
+            mock_recorder.is_recording = False
+            mock_recorder.wait_for_ready = mock.MagicMock()
+
+            try:
+                start_recording("cloud-test", output_dir=tmp_path / "cloud-rec", cloud_intent=True)
+            except (SystemExit, Exception):
+                pass
+
+        # The privacy config passed to the filter should have public mode
+        assert captured_args["config"].mode == PrivacyMode.PUBLIC
+        assert captured_args["kwargs"].get("cloud_intent") is True
+
+    def test_cloud_intent_warning_printed(self, tmp_path, capsys):
+        """Cloud-intent recording prints privacy warning."""
+        from screencap.recorder import start_recording
+        from screencap.privacy.policy import PrivacyConfig, PrivacyMode
+
+        config = PrivacyConfig(mode=PrivacyMode.PUBLIC)
+
+        with (
+            mock.patch("screencap.recorder._check_macos_permissions"),
+            mock.patch("screencap.recorder.get_recordings_dir", return_value=tmp_path),
+            mock.patch("shutil.disk_usage", return_value=_PLENTY_OF_DISK),
+            mock.patch("screencap.config.get_privacy_config", return_value=config),
+            mock.patch("screencap.privacy.recorder_enforcement.RecorderPrivacyFilter") as MockFilter,
+            mock.patch("sc_engine.Recorder") as MockRecorder,
+            mock.patch("sc_engine.config.config") as mock_engine_config,
+            mock.patch("screencap.recorder.console") as mock_console,
+        ):
+            mock_engine_config.RECORD_WINDOW_DATA = True
+            mock_filter_instance = MockFilter.return_value
+            MockRecorder.return_value.__enter__ = mock.MagicMock()
+            MockRecorder.return_value.__exit__ = mock.MagicMock(return_value=False)
+            mock_recorder = MockRecorder.return_value.__enter__.return_value
+            mock_recorder.is_recording = False
+            mock_recorder.wait_for_ready = mock.MagicMock()
+
+            try:
+                start_recording("cloud-test", output_dir=tmp_path / "cloud-rec", cloud_intent=True)
+            except (SystemExit, Exception):
+                pass
+
+        # Check that the warning was printed
+        print_calls = [str(c) for c in mock_console.print.call_args_list]
+        warning_printed = any("Cloud Recording Privacy Notice" in str(c) for c in print_calls)
+        assert warning_printed, f"Privacy warning not found in console output: {print_calls}"

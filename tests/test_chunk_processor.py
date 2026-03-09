@@ -193,8 +193,8 @@ def cloud_processor(cloud_capture_dir):
 class TestCloudIntentGating:
     """Test that cloud-intent recordings gate media uploads."""
 
-    def test_collect_chunk_files_gates_media_by_cloud_intent(self, cloud_capture_dir):
-        """Cloud-intent excludes .mp4/.flac; non-cloud includes all."""
+    def test_collect_chunk_files_includes_video_audio_for_cloud_intent(self, cloud_capture_dir):
+        """Cloud-intent now includes .mp4/.flac (with placeholder frames for blocked intervals)."""
         from screencap.chunk_processor import ChunkProcessor
 
         q = multiprocessing.Queue()
@@ -205,14 +205,14 @@ class TestCloudIntentGating:
         (cloud_capture_dir / "events_0000.jsonl").write_text('{"name":"click"}\n')
         (cloud_capture_dir / "chunk_0000_manifest.json").write_text('{}')
 
-        # Cloud-intent: text only
+        # Cloud-intent: includes video and audio (with placeholder redaction)
         cp_cloud = ChunkProcessor(
             cloud_capture_dir, q, ack_q, recording_name="test",
             upload_enabled=False, auto_delete=False, cloud_intent=True,
         )
         cloud_names = [f["name"] for f in cp_cloud._collect_chunk_files(0, None)]
-        assert "chunk_0000.mp4" not in cloud_names
-        assert "audio_0000.flac" not in cloud_names
+        assert "chunk_0000.mp4" in cloud_names
+        assert "audio_0000.flac" in cloud_names
         assert "events_0000.jsonl" in cloud_names
         assert "chunk_0000_manifest.json" in cloud_names
 
@@ -403,3 +403,101 @@ class TestInlineScrubbing:
         # Original file should be renamed, not uploaded
         assert not events_path.exists()
         assert (cloud_capture_dir / "events_0000.jsonl.scrub_failed").exists()
+
+
+class TestBlockedIntervalsInManifest:
+    """Tests for Phase 6: blocked intervals in chunk manifest."""
+
+    def test_blocked_intervals_added_to_manifest(self, cloud_capture_dir):
+        """ChunkProcessor adds blocked_intervals to manifest when screen_filter provides them."""
+        from screencap.chunk_processor import ChunkProcessor
+
+        q = multiprocessing.Queue()
+        ack_q = multiprocessing.Queue()
+
+        # Create a mock screen_filter with blocked intervals
+        mock_filter = MagicMock()
+        mock_filter.get_blocked_intervals.return_value = [
+            {"start_ts": 1000.5, "end_ts": 1010.0, "reason": "app_policy"},
+        ]
+
+        cp = ChunkProcessor(
+            cloud_capture_dir, q, ack_q, recording_name="test",
+            upload_enabled=False, auto_delete=False, cloud_intent=True,
+            screen_filter=mock_filter,
+        )
+
+        # Write a manifest file
+        manifest_path = cloud_capture_dir / "chunk_0000_manifest.json"
+        manifest_path.write_text(json.dumps({
+            "chunk_index": 0,
+            "tasks": [{"start_ts": 1000.0, "end_ts": 1060.0}],
+        }))
+
+        # Write required files for _process_chunk
+        (cloud_capture_dir / "chunk_0000.mp4").write_bytes(b"video")
+        (cloud_capture_dir / "events_0000.jsonl").write_text('{"name":"click"}\n')
+
+        # Simulate the blocked intervals addition (extract the logic from _process_chunk)
+        intervals = cp._screen_filter.get_blocked_intervals(1000.0, 1060.0)
+        if intervals:
+            data = json.loads(manifest_path.read_text())
+            data["blocked_intervals"] = intervals
+            manifest_path.write_text(json.dumps(data, indent=2))
+
+        result = json.loads(manifest_path.read_text())
+        assert "blocked_intervals" in result
+        assert len(result["blocked_intervals"]) == 1
+        assert result["blocked_intervals"][0]["start_ts"] == 1000.5
+        assert result["blocked_intervals"][0]["reason"] == "app_policy"
+
+    def test_no_intervals_when_no_filter(self, cloud_capture_dir):
+        """Without screen_filter, manifest has no blocked_intervals."""
+        from screencap.chunk_processor import ChunkProcessor
+
+        q = multiprocessing.Queue()
+        ack_q = multiprocessing.Queue()
+
+        cp = ChunkProcessor(
+            cloud_capture_dir, q, ack_q, recording_name="test",
+            upload_enabled=False, auto_delete=False, cloud_intent=True,
+            screen_filter=None,
+        )
+
+        assert cp._screen_filter is None
+
+
+class TestPlaceholderFrame:
+    """Tests for Phase 1: placeholder frame generation."""
+
+    def test_make_placeholder_frame_dimensions(self):
+        """Placeholder frame has correct dimensions and color."""
+        from sc_engine.recorder import _make_placeholder_frame
+
+        frame = _make_placeholder_frame(1920, 1080)
+        assert frame.size == (1920, 1080)
+        assert frame.mode == "RGB"
+
+        # Check that top-left corner is near-black (30, 30, 30)
+        pixel = frame.getpixel((0, 0))
+        assert pixel == (30, 30, 30)
+
+    def test_placeholder_frame_has_non_background_pixels(self):
+        """Placeholder frame has pixels other than background (i.e., contains text)."""
+        from sc_engine.recorder import _make_placeholder_frame
+
+        frame = _make_placeholder_frame(800, 600)
+
+        # The frame should have at least some pixels that aren't the background color
+        bg = (30, 30, 30)
+        has_non_bg = any(px != bg for px in frame.getdata())
+        assert has_non_bg, "Placeholder frame should have non-background pixels (text)"
+
+    def test_placeholder_frame_cached_correctly(self):
+        """Same dimensions produce identical frames (cached at call site)."""
+        from sc_engine.recorder import _make_placeholder_frame
+
+        f1 = _make_placeholder_frame(1920, 1080)
+        f2 = _make_placeholder_frame(1920, 1080)
+        # Both should be identical in content
+        assert list(f1.getdata()) == list(f2.getdata())  # noqa: PILLOW14

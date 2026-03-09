@@ -58,6 +58,7 @@ from screencap.privacy.policy import (
     DefaultPolicyEvaluator,
     FrameMetadata,
     PrivacyConfig,
+    get_matrix_action,
 )
 from screencap.privacy.reasons import ReasonCode
 
@@ -133,6 +134,7 @@ class RecorderPrivacyFilter:
         config: PrivacyConfig,
         transition_hold_seconds: float = DEFAULT_TRANSITION_HOLD_SECONDS,
         secure_input_fn: Callable[[], bool] | None = _UNSET,
+        cloud_intent: bool = False,
     ) -> None:
         self._evaluator = DefaultPolicyEvaluator(config)
         self._classifier = DefaultContextClassifier(
@@ -141,11 +143,30 @@ class RecorderPrivacyFilter:
         self._lock = threading.Lock()
         self._hold_seconds = transition_hold_seconds
 
+        # Cloud-intent: expand block set to include OCR_FALLBACK apps
+        # (code editors, admin consoles) which would otherwise pass through
+        # unredacted since no OCR redaction engine exists for video.
+        self._cloud_intent = cloud_intent
+        self._block_actions = _BLOCK_ACTIONS | (
+            frozenset({PrivacyAction.OCR_FALLBACK}) if cloud_intent else frozenset()
+        )
+        # Actions that trigger cloud-specific blocking even for allow_apps.
+        # allow_apps overrides the matrix to ALLOW, which is correct for local
+        # recordings (OCR scrubbing happens post-capture). But cloud video
+        # has no text redaction — so OCR_FALLBACK apps must still be blocked.
+        self._cloud_override_actions = (
+            frozenset({PrivacyAction.OCR_FALLBACK}) if cloud_intent else frozenset()
+        )
+
         # Mutable state (protected by _lock)
         # reason -> hold_until monotonic timestamp (0.0 = not active)
         self._blocked_reasons: dict[str, float] = {"initial": float("inf")}
         self._current_bundle_id: str = ""
         self._current_title: str = ""
+
+        # Blocked interval tracking (for cloud-intent manifest metadata)
+        self._blocked_intervals: list[dict] = []
+        self._current_block_start: float | None = None
 
         # Secure Input detection (Layer 0)
         if secure_input_fn is _UNSET:
@@ -158,6 +179,10 @@ class RecorderPrivacyFilter:
                 )
         else:
             self._secure_input_fn = secure_input_fn
+
+    @property
+    def cloud_intent(self) -> bool:
+        return self._cloud_intent
 
     def on_window_event(self, window_data: dict) -> None:
         """Update blocked state from a window event.
@@ -179,7 +204,19 @@ class RecorderPrivacyFilter:
         )
         ctx = self._classifier.classify(meta)
         decision = self._evaluator.evaluate(ctx, meta)
-        now_blocked = decision.action in _BLOCK_ACTIONS
+        now_blocked = decision.action in self._block_actions
+
+        # Cloud-intent: allow_apps overrides the matrix to ALLOW, which is
+        # correct for local recordings (OCR scrubbing handles redaction).
+        # But cloud video has no text redaction engine, so apps whose matrix
+        # action is OCR_FALLBACK must still be blocked even if allow_apps
+        # granted ALLOW.
+        if not now_blocked and self._cloud_override_actions:
+            matrix_action = get_matrix_action(
+                ctx.context_class, self._evaluator.config.mode,
+            )
+            if matrix_action in self._cloud_override_actions:
+                now_blocked = True
 
         now = time.monotonic()
         with self._lock:
@@ -286,6 +323,54 @@ class RecorderPrivacyFilter:
                 del self._blocked_reasons[reason]
 
             return len(self._blocked_reasons) == 0
+
+    def record_block_start(self, ts: float) -> None:
+        """Record the start of a blocked interval.
+
+        Called from process_events when the filter transitions to blocked.
+        Uses event timestamps (Unix epoch) for consistency with chunk manifests.
+        """
+        with self._lock:
+            if self._current_block_start is None:
+                self._current_block_start = ts
+
+    def record_block_end(self, ts: float, reason: str = "app_policy") -> None:
+        """Record the end of a blocked interval.
+
+        Called from process_events when the filter transitions to allowed.
+        """
+        with self._lock:
+            if self._current_block_start is not None:
+                self._blocked_intervals.append({
+                    "start_ts": self._current_block_start,
+                    "end_ts": ts,
+                    "reason": reason,
+                })
+                self._current_block_start = None
+
+    def get_blocked_intervals(self, start_ts: float, end_ts: float) -> list[dict]:
+        """Get blocked intervals overlapping [start_ts, end_ts).
+
+        Returns clipped intervals for the given chunk time range.
+        Includes the current ongoing block if any.
+        """
+        with self._lock:
+            result = []
+            for interval in self._blocked_intervals:
+                if interval["end_ts"] > start_ts and interval["start_ts"] < end_ts:
+                    result.append({
+                        "start_ts": max(interval["start_ts"], start_ts),
+                        "end_ts": min(interval["end_ts"], end_ts),
+                        "reason": interval["reason"],
+                    })
+            # Include current ongoing block
+            if self._current_block_start is not None and self._current_block_start < end_ts:
+                result.append({
+                    "start_ts": max(self._current_block_start, start_ts),
+                    "end_ts": end_ts,
+                    "reason": "app_policy",
+                })
+            return result
 
     @staticmethod
     def null_keystroke_content(action_data: dict) -> None:

@@ -507,3 +507,147 @@ class TestKeystrokeBlocking:
         assert data["text"] is None
         assert data["name"] == "key.type"
         assert data["timestamp"] == 1234567890.0
+
+
+class TestCloudIntentBlocking:
+    """Tests for Phase 2: OCR_FALLBACK apps blocked for cloud-intent."""
+
+    def test_cloud_intent_blocks_ocr_fallback_apps(self):
+        """OCR_FALLBACK apps (code editors) are blocked for cloud-intent."""
+        config = _make_config()
+        f = RecorderPrivacyFilter(
+            config, transition_hold_seconds=0.0, secure_input_fn=None,
+            cloud_intent=True,
+        )
+
+        # VSCode gets OCR_FALLBACK in public mode (code editor)
+        f.on_window_event({
+            "app_bundle_id": "com.microsoft.VSCode",
+            "title": "main.py — project",
+        })
+
+        assert f.is_screen_allowed() is False
+
+    def test_non_cloud_allows_ocr_fallback_apps(self):
+        """OCR_FALLBACK apps pass through for non-cloud recordings."""
+        config = _make_config()
+        f = RecorderPrivacyFilter(
+            config, transition_hold_seconds=0.0, secure_input_fn=None,
+            cloud_intent=False,
+        )
+
+        f.on_window_event({
+            "app_bundle_id": "com.microsoft.VSCode",
+            "title": "main.py — project",
+        })
+
+        assert f.is_screen_allowed() is True
+
+    def test_cloud_intent_attribute_exposed(self):
+        """cloud_intent attribute is accessible (used by process_events)."""
+        config = _make_config()
+        f_cloud = RecorderPrivacyFilter(
+            config, transition_hold_seconds=0.0, secure_input_fn=None,
+            cloud_intent=True,
+        )
+        f_local = RecorderPrivacyFilter(
+            config, transition_hold_seconds=0.0, secure_input_fn=None,
+            cloud_intent=False,
+        )
+        assert f_cloud.cloud_intent is True
+        assert f_local.cloud_intent is False
+
+    def test_cloud_intent_still_blocks_excluded_apps(self):
+        """EXCLUDE apps are still blocked in cloud-intent (superset of normal)."""
+        config = _make_config(
+            exclude_apps=frozenset({"com.1password.1password"}),
+        )
+        f = RecorderPrivacyFilter(
+            config, transition_hold_seconds=0.0, secure_input_fn=None,
+            cloud_intent=True,
+        )
+
+        f.on_window_event({
+            "app_bundle_id": "com.1password.1password",
+            "title": "1Password",
+        })
+
+        assert f.is_screen_allowed() is False
+
+
+class TestBlockedIntervalTracking:
+    """Tests for Phase 6: blocked interval recording."""
+
+    def test_record_and_retrieve_interval(self):
+        """Blocked intervals are recorded and retrievable."""
+        config = _make_config()
+        f = RecorderPrivacyFilter(
+            config, transition_hold_seconds=0.0, secure_input_fn=None,
+        )
+
+        f.record_block_start(100.0)
+        f.record_block_end(110.0, reason="app_policy")
+
+        intervals = f.get_blocked_intervals(90.0, 120.0)
+        assert len(intervals) == 1
+        assert intervals[0]["start_ts"] == 100.0
+        assert intervals[0]["end_ts"] == 110.0
+        assert intervals[0]["reason"] == "app_policy"
+
+    def test_intervals_clipped_to_range(self):
+        """Intervals are clipped to the requested time range."""
+        config = _make_config()
+        f = RecorderPrivacyFilter(
+            config, transition_hold_seconds=0.0, secure_input_fn=None,
+        )
+
+        f.record_block_start(95.0)
+        f.record_block_end(115.0, reason="app_policy")
+
+        intervals = f.get_blocked_intervals(100.0, 110.0)
+        assert len(intervals) == 1
+        assert intervals[0]["start_ts"] == 100.0
+        assert intervals[0]["end_ts"] == 110.0
+
+    def test_ongoing_block_included(self):
+        """An ongoing (unclosed) blocked interval is included in results."""
+        config = _make_config()
+        f = RecorderPrivacyFilter(
+            config, transition_hold_seconds=0.0, secure_input_fn=None,
+        )
+
+        f.record_block_start(105.0)
+        # No record_block_end — still blocked
+
+        intervals = f.get_blocked_intervals(100.0, 120.0)
+        assert len(intervals) == 1
+        assert intervals[0]["start_ts"] == 105.0
+        assert intervals[0]["end_ts"] == 120.0
+
+    def test_non_overlapping_interval_excluded(self):
+        """Intervals outside the requested range are not returned."""
+        config = _make_config()
+        f = RecorderPrivacyFilter(
+            config, transition_hold_seconds=0.0, secure_input_fn=None,
+        )
+
+        f.record_block_start(50.0)
+        f.record_block_end(60.0)
+
+        intervals = f.get_blocked_intervals(100.0, 200.0)
+        assert len(intervals) == 0
+
+    def test_duplicate_start_ignored(self):
+        """Calling record_block_start twice without end doesn't create duplicates."""
+        config = _make_config()
+        f = RecorderPrivacyFilter(
+            config, transition_hold_seconds=0.0, secure_input_fn=None,
+        )
+
+        f.record_block_start(100.0)
+        f.record_block_start(105.0)  # Should be ignored
+        f.record_block_end(110.0)
+
+        intervals = f.get_blocked_intervals(90.0, 120.0)
+        assert len(intervals) == 1
+        assert intervals[0]["start_ts"] == 100.0
