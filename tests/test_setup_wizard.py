@@ -244,31 +244,13 @@ class TestRunSetupWizard:
             result = run_setup_wizard(config_path=tmp_path / "config.toml")
             assert result is False
 
-    def test_choice_cloud(self, tmp_path):
-        """Choice 1 (Cloud) → mode=public, upload_default=cloud."""
-        config_path = tmp_path / "config.toml"
-        apps = [
-            AppMetadata("/test/1Password.app", "com.1password.1password", "1Password"),
-            AppMetadata("/test/Slack.app", "com.tinyspeck.slackmacgap", "Slack"),
-        ]
-        with mock.patch("sys.stdin") as mock_stdin, \
-             mock.patch("screencap.setup_wizard.discover_installed_apps", return_value=apps), \
-             mock.patch("screencap.setup_wizard.click") as mock_click, \
-             mock.patch("screencap.setup_wizard._run_tui", return_value={}), \
-             mock.patch("screencap.config.invalidate_config_cache"):
-            mock_stdin.isatty.return_value = True
-            mock_click.prompt.return_value = 1  # Cloud
-
-            result = run_setup_wizard(config_path=config_path)
-            assert result is True
-            assert config_path.exists()
-
-            doc = tomlkit.parse(config_path.read_text())
-            assert doc["privacy"]["mode"] == "public"
-            assert doc["privacy"]["upload_default"] == "cloud"
-
-    def test_choice_local(self, tmp_path):
-        """Choice 2 (Local) → mode=internal, upload_default=local."""
+    @pytest.mark.parametrize("choice, expected_mode, expected_upload", [
+        (1, "public", "cloud"),    # Cloud
+        (2, "internal", "local"),  # Local
+        (3, "internal", "ask"),    # Ask every time
+    ])
+    def test_destination_choice_sets_mode_and_upload(self, tmp_path, choice, expected_mode, expected_upload):
+        """Each destination choice writes the correct mode + upload_default pair."""
         config_path = tmp_path / "config.toml"
         apps = [
             AppMetadata("/test/Slack.app", "com.tinyspeck.slackmacgap", "Slack"),
@@ -279,38 +261,17 @@ class TestRunSetupWizard:
              mock.patch("screencap.setup_wizard._run_tui", return_value={}), \
              mock.patch("screencap.config.invalidate_config_cache"):
             mock_stdin.isatty.return_value = True
-            mock_click.prompt.return_value = 2  # Local
+            mock_click.prompt.return_value = choice
 
             result = run_setup_wizard(config_path=config_path)
             assert result is True
 
             doc = tomlkit.parse(config_path.read_text())
-            assert doc["privacy"]["mode"] == "internal"
-            assert doc["privacy"]["upload_default"] == "local"
-
-    def test_choice_ask(self, tmp_path):
-        """Choice 3 (Ask every time) → mode=internal, upload_default=ask."""
-        config_path = tmp_path / "config.toml"
-        apps = [
-            AppMetadata("/test/Slack.app", "com.tinyspeck.slackmacgap", "Slack"),
-        ]
-        with mock.patch("sys.stdin") as mock_stdin, \
-             mock.patch("screencap.setup_wizard.discover_installed_apps", return_value=apps), \
-             mock.patch("screencap.setup_wizard.click") as mock_click, \
-             mock.patch("screencap.setup_wizard._run_tui", return_value={}), \
-             mock.patch("screencap.config.invalidate_config_cache"):
-            mock_stdin.isatty.return_value = True
-            mock_click.prompt.return_value = 3  # Ask every time
-
-            result = run_setup_wizard(config_path=config_path)
-            assert result is True
-
-            doc = tomlkit.parse(config_path.read_text())
-            assert doc["privacy"]["mode"] == "internal"
-            assert doc["privacy"]["upload_default"] == "ask"
+            assert doc["privacy"]["mode"] == expected_mode
+            assert doc["privacy"]["upload_default"] == expected_upload
 
     def test_rerun_preselects_existing_destination(self, tmp_path):
-        """Re-running setup pre-selects the current upload_default as default."""
+        """Re-running setup with existing cloud config passes default=1 to prompt."""
         config_path = tmp_path / "config.toml"
         config_path.write_text(
             '[privacy]\n'
@@ -320,20 +281,23 @@ class TestRunSetupWizard:
         apps = [
             AppMetadata("/test/Slack.app", "com.tinyspeck.slackmacgap", "Slack"),
         ]
+        captured_defaults = []
+
+        def fake_prompt(text, **kwargs):
+            captured_defaults.append(kwargs.get("default"))
+            return 1  # keep Cloud
+
         with mock.patch("sys.stdin") as mock_stdin, \
              mock.patch("screencap.setup_wizard.discover_installed_apps", return_value=apps), \
              mock.patch("screencap.setup_wizard.click") as mock_click, \
              mock.patch("screencap.setup_wizard._run_tui", return_value={}), \
              mock.patch("screencap.config.invalidate_config_cache"):
             mock_stdin.isatty.return_value = True
-            mock_click.prompt.return_value = 1  # keep Cloud
+            mock_click.prompt.side_effect = fake_prompt
 
             run_setup_wizard(config_path=config_path)
 
-            # Verify prompt was called with default=1 (Cloud)
-            mock_click.prompt.assert_called_with(
-                "  Choice", type=mock.ANY, default=1
-            )
+            assert captured_defaults == [1]  # Cloud = choice 1
 
     def test_wizard_saves_allow_apps(self, tmp_path):
         """Auto-allowed apps end up in allow_apps config."""
