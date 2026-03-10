@@ -505,6 +505,31 @@ class TestScanOnlyMode:
             assert doc["privacy"]["app_classes"]["com.example.configured"] == "chat"
             assert "com.example.new" in doc["privacy"]["allow_apps"]
 
+    @pytest.mark.parametrize("upload_default", ["cloud", "local"])
+    def test_scan_only_preserves_upload_default(self, tmp_path, upload_default):
+        """--scan preserves the existing upload_default through to saved config."""
+        config_path = tmp_path / "config.toml"
+        config_path.write_text(
+            '[privacy]\n'
+            f'mode = "internal"\n'
+            f'upload_default = "{upload_default}"\n'
+        )
+        apps = [
+            AppMetadata("/test/New.app", "com.example.new", "New App"),
+        ]
+        with mock.patch("sys.stdin") as mock_stdin, \
+             mock.patch("screencap.setup_wizard.discover_installed_apps", return_value=apps), \
+             mock.patch("screencap.setup_wizard._run_tui", return_value={}), \
+             mock.patch("screencap.setup_wizard.click") as mock_click, \
+             mock.patch("screencap.config.invalidate_config_cache"):
+            mock_stdin.isatty.return_value = True
+
+            result = run_setup_wizard(config_path=config_path, scan_only=True)
+            assert result is True
+
+            doc = tomlkit.parse(config_path.read_text())
+            assert doc["privacy"]["upload_default"] == upload_default
+
     def test_scan_only_all_classified(self, tmp_path):
         """--scan with no new unknown apps reports all classified."""
         config_path = tmp_path / "config.toml"
