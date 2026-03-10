@@ -1347,19 +1347,18 @@ def read_window_events(
             _wid = str(window_data.get("window_id") or "")
             _title = window_data.get("title") or ""
             if _pid is not None:
-                # Invalidate cache on window change so we re-query the URL
-                if (
-                    _title != prev_window_data.get("title")
-                    or _wid != str(prev_window_data.get("window_id") or "")
-                ):
+                # Invalidate cache on window change so we re-query the URL.
+                # Only invalidate on window_id change — title-only changes
+                # (e.g. Gmail unread count) don't change the URL.
+                if _wid != str(prev_window_data.get("window_id") or ""):
                     invalidate_url_cache(_pid, _wid)
                 window_data["browser_url"] = extract_browser_url(
                     _pid, _bundle, _wid, _title,
                 )
-                logger.debug(
-                    f"browser_url domain="
-                    f"{window_data.get('browser_url', '')!r}"
-                )
+                if window_data.get("browser_url"):
+                    from urllib.parse import urlparse
+                    _domain = urlparse(window_data["browser_url"]).hostname
+                    logger.debug(f"browser_url domain={_domain!r}")
 
         if window_data["title"] != prev_window_data.get("title") or window_data[
             "window_id"
@@ -1373,6 +1372,7 @@ def read_window_events(
             #   RuntimeError: dictionary changed size during iteration
             _window_data = window_data
             _window_data.pop("state")
+            _window_data.pop("browser_url", None)
             logger.info(f"{_window_data=}")
         if window_data != prev_window_data:
             logger.debug("Queuing window event for writing")

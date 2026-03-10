@@ -45,6 +45,10 @@ _FIREFOX_BUNDLES: frozenset[str] = frozenset({
     "org.waterfoxproject.waterfox",
 })
 
+_ALWAYS_PRIVATE_BUNDLES: frozenset[str] = frozenset({
+    "org.torproject.torbrowser",
+})
+
 _OTHER_BROWSER_BUNDLES: frozenset[str] = frozenset({
     "com.nickvision.nicegx.nicegx",  # Orion
     "org.torproject.torbrowser",
@@ -110,7 +114,11 @@ def _ax_get_str(element: Any, attr_name: str) -> str:
 
 
 def is_incognito(bundle_id: str, window_title: str) -> bool:
-    """Detect incognito/private-browsing windows from the window title."""
+    """Detect incognito/private-browsing windows from the window title.
+
+    Limitation: relies on English-language title substrings. Non-English
+    locales may not be detected (e.g. Chrome shows "(Inkognito)" in German).
+    """
     if bundle_id in _CHROMIUM_BUNDLES:
         return "(Incognito)" in window_title or "(Private)" in window_title
     if bundle_id in _SAFARI_BUNDLES:
@@ -258,6 +266,10 @@ def extract_browser_url(
     window_title:
         Window title — used for incognito detection.
     """
+    # Always-private browsers (Tor) → never extract
+    if bundle_id in _ALWAYS_PRIVATE_BUNDLES:
+        return None
+
     # Incognito → always None
     if is_incognito(bundle_id, window_title):
         return None
@@ -284,8 +296,10 @@ def extract_browser_url(
 
 def _extract_url(pid: int, bundle_id: str) -> str | None:
     """Core extraction: get the focused window and apply browser strategy."""
+    from sc_engine.config import config
+
     app_ref = _ApplicationServices.AXUIElementCreateApplication(pid)
-    _ApplicationServices.AXUIElementSetMessagingTimeout(app_ref, 2.0)
+    _ApplicationServices.AXUIElementSetMessagingTimeout(app_ref, config.AX_ELEMENT_TIMEOUT)
 
     err, window = _ApplicationServices.AXUIElementCopyAttributeValue(
         app_ref, "AXFocusedWindow", None,

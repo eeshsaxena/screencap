@@ -158,6 +158,7 @@ def build_privacy_filter(
         if action == PrivacyAction.MASK_WINDOW:
             return event.model_copy(update={
                 "window_title": event.app_name,
+                "domain": None,
             })
 
         return event
