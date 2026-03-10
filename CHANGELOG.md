@@ -5,6 +5,24 @@ All notable changes to this project will be documented in this file.
 The format is based on [Keep a Changelog](https://keepachangelog.com/),
 and this project adheres to [Semantic Versioning](https://semver.org/).
 
+## [0.9.1] - 2026-03-10
+
+### Added
+- **release:** Add changelog generation to /release command
+- **ci:** Add GitHub Release creation with changelog notes to release workflow
+- **recorder:** Add child process health monitoring during recording
+- **setup:** Merge privacy mode and destination into single setup question
+
+### Fixed
+- **ci:** Add semver validation, deny-all permissions default, idempotent release creation; curate v0.9.0 changelog
+- Replace numpy with pure-Python helper, use shared constants, harden viewer
+- **viewer:** Cap events, reduce frame size, prevent multi-GB HTML files
+- **recorder:** Add missing drop counters and tighten types for health monitoring
+- Remove browser_events arg from test_masking and test_scrubber_policy
+
+### Changed
+- Remove dead Chrome WebSocket browser extension integration
+
 ## [0.9.0] - 2026-03-10
 
 ### Added
