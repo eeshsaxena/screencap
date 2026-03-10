@@ -653,8 +653,7 @@ def _scrub_recording_schema(
     if "window_event" in tables:
         _try_scrub_text_column(conn, "window_event", "title", pipeline, anonymizer, result)
         _try_scrub_json_column(conn, "window_event", "state", pipeline, anonymizer, result)
-        # TODO: run PII pipeline on browser_url (same as title) to redact
-        # tokens/emails in query params while preserving the URL structure.
+        _try_scrub_text_column(conn, "window_event", "browser_url", pipeline, anonymizer, result)
 
 
 def _scrub_capture_schema(
