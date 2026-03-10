@@ -190,3 +190,70 @@ class TestDictToWindowSwitch:
         assert event.window_title == ""
         assert event.window_id == ""
         assert event.x == 0
+        assert event.domain is None
+
+    def test_domain_extracted_from_browser_url(self):
+        """browser_url column → domain hostname on WindowSwitchEvent."""
+        row = {
+            "timestamp": 1.0,
+            "app_bundle_id": "com.google.Chrome",
+            "title": "GitHub",
+            "window_id": "1",
+            "left": 0, "top": 0, "width": 800, "height": 600,
+            "browser_url": "https://github.com/Divide-By-0/screencap",
+        }
+        event = dict_to_window_switch(row)
+        assert event.domain == "github.com"
+
+    def test_domain_none_when_no_browser_url(self):
+        """Old recordings without browser_url column → domain=None."""
+        row = {
+            "timestamp": 1.0,
+            "app_bundle_id": "com.apple.Safari",
+            "title": "Apple",
+            "window_id": "2",
+            "left": 0, "top": 0, "width": 800, "height": 600,
+        }
+        event = dict_to_window_switch(row)
+        assert event.domain is None
+
+    def test_domain_none_when_browser_url_empty(self):
+        """Empty browser_url (Start Page, new tab) → domain=None."""
+        row = {
+            "timestamp": 1.0,
+            "app_bundle_id": "com.apple.Safari",
+            "title": "Start Page",
+            "window_id": "3",
+            "left": 0, "top": 0, "width": 800, "height": 600,
+            "browser_url": "",
+        }
+        event = dict_to_window_switch(row)
+        assert event.domain is None
+
+    def test_domain_none_when_browser_url_null(self):
+        """NULL browser_url from DB → domain=None."""
+        row = {
+            "timestamp": 1.0,
+            "app_bundle_id": "com.apple.Safari",
+            "title": "Safari",
+            "window_id": "4",
+            "left": 0, "top": 0, "width": 800, "height": 600,
+            "browser_url": None,
+        }
+        event = dict_to_window_switch(row)
+        assert event.domain is None
+
+    def test_domain_serialized_in_json(self):
+        """domain field appears in JSON serialization."""
+        row = {
+            "timestamp": 1.0,
+            "app_bundle_id": "com.google.Chrome",
+            "title": "Docs",
+            "window_id": "5",
+            "left": 0, "top": 0, "width": 800, "height": 600,
+            "browser_url": "https://docs.python.org/3/library/",
+        }
+        event = dict_to_window_switch(row)
+        import json
+        data = json.loads(event.model_dump_json())
+        assert data["domain"] == "docs.python.org"

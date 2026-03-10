@@ -7,6 +7,8 @@ event models.  Used by both CaptureSession (ORM) and the chunk processor
 
 from __future__ import annotations
 
+from urllib.parse import urlparse
+
 from sc_engine.events import (
     ActionEvent,
     KeyDownEvent,
@@ -145,6 +147,15 @@ def dict_to_window_switch(row: dict) -> WindowSwitchEvent:
     else:
         app_name = row.get("title") or "Unknown"
 
+    # Extract domain from browser_url (null-safe for old recordings)
+    domain: str | None = None
+    browser_url = row.get("browser_url")
+    if browser_url:
+        try:
+            domain = urlparse(browser_url).hostname or None
+        except Exception:
+            domain = None
+
     return WindowSwitchEvent(
         timestamp=row.get("timestamp", 0.0),
         app_name=app_name,
@@ -155,4 +166,5 @@ def dict_to_window_switch(row: dict) -> WindowSwitchEvent:
         y=row.get("top") or 0,
         width=row.get("width") or 0,
         height=row.get("height") or 0,
+        domain=domain,
     )

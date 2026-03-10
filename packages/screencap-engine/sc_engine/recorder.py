@@ -33,6 +33,11 @@ from pynput import keyboard, mouse
 from tqdm import tqdm
 
 from sc_engine import utils, video, window
+from sc_engine.window.ax_browser_url import (
+    ALL_KNOWN_BROWSER_BUNDLES as _BROWSER_BUNDLES,
+    extract_browser_url,
+    invalidate_url_cache,
+)
 from sc_engine.ax_cache import AXQueryCache
 from sc_engine.config import RecordingConfig, config
 from sc_engine.dedup import dhash, hamming_distance
@@ -1330,6 +1335,31 @@ def read_window_events(
         if not started:
             started_event.set()
             started = True
+
+        # Enrich browser windows with URL from address bar
+        _bundle = window_data.get("app_bundle_id") or ""
+        if _bundle in _BROWSER_BUNDLES:
+            _pid = (
+                (window_data.get("state") or {})
+                .get("meta", {})
+                .get("kCGWindowOwnerPID")
+            )
+            _wid = str(window_data.get("window_id") or "")
+            _title = window_data.get("title") or ""
+            if _pid is not None:
+                # Invalidate cache on window change so we re-query the URL
+                if (
+                    _title != prev_window_data.get("title")
+                    or _wid != str(prev_window_data.get("window_id") or "")
+                ):
+                    invalidate_url_cache(_pid, _wid)
+                window_data["browser_url"] = extract_browser_url(
+                    _pid, _bundle, _wid, _title,
+                )
+                logger.debug(
+                    f"browser_url domain="
+                    f"{window_data.get('browser_url', '')!r}"
+                )
 
         if window_data["title"] != prev_window_data.get("title") or window_data[
             "window_id"
