@@ -129,7 +129,7 @@ def _maybe_prompt_privacy_setup() -> None:
         _save_config_atomic(_CONFIG_PATH, doc)
         invalidate_config_cache()
         console.print(
-            "[dim]Skipped. Recording will use default settings (internal mode). "
+            "[dim]Skipped. Recordings will stay local with default privacy settings. "
             "Run 'screencap setup' anytime.[/dim]"
         )
 

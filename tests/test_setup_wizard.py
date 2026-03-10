@@ -244,11 +244,15 @@ class TestRunSetupWizard:
             result = run_setup_wizard(config_path=tmp_path / "config.toml")
             assert result is False
 
-    def test_full_wizard_accept_all(self, tmp_path):
-        """Test wizard: user accepts all classifications and saves."""
+    @pytest.mark.parametrize("choice, expected_mode, expected_upload", [
+        (1, "public", "cloud"),    # Cloud
+        (2, "internal", "local"),  # Local
+        (3, "internal", "ask"),    # Ask every time
+    ])
+    def test_destination_choice_sets_mode_and_upload(self, tmp_path, choice, expected_mode, expected_upload):
+        """Each destination choice writes the correct mode + upload_default pair."""
         config_path = tmp_path / "config.toml"
         apps = [
-            AppMetadata("/test/1Password.app", "com.1password.1password", "1Password"),
             AppMetadata("/test/Slack.app", "com.tinyspeck.slackmacgap", "Slack"),
         ]
         with mock.patch("sys.stdin") as mock_stdin, \
@@ -257,14 +261,43 @@ class TestRunSetupWizard:
              mock.patch("screencap.setup_wizard._run_tui", return_value={}), \
              mock.patch("screencap.config.invalidate_config_cache"):
             mock_stdin.isatty.return_value = True
-            mock_click.prompt.return_value = 1  # public mode
+            mock_click.prompt.return_value = choice
 
             result = run_setup_wizard(config_path=config_path)
             assert result is True
-            assert config_path.exists()
 
             doc = tomlkit.parse(config_path.read_text())
-            assert doc["privacy"]["mode"] == "public"
+            assert doc["privacy"]["mode"] == expected_mode
+            assert doc["privacy"]["upload_default"] == expected_upload
+
+    def test_rerun_preselects_existing_destination(self, tmp_path):
+        """Re-running setup with existing cloud config passes default=1 to prompt."""
+        config_path = tmp_path / "config.toml"
+        config_path.write_text(
+            '[privacy]\n'
+            'mode = "public"\n'
+            'upload_default = "cloud"\n'
+        )
+        apps = [
+            AppMetadata("/test/Slack.app", "com.tinyspeck.slackmacgap", "Slack"),
+        ]
+        captured_defaults = []
+
+        def fake_prompt(text, **kwargs):
+            captured_defaults.append(kwargs.get("default"))
+            return 1  # keep Cloud
+
+        with mock.patch("sys.stdin") as mock_stdin, \
+             mock.patch("screencap.setup_wizard.discover_installed_apps", return_value=apps), \
+             mock.patch("screencap.setup_wizard.click") as mock_click, \
+             mock.patch("screencap.setup_wizard._run_tui", return_value={}), \
+             mock.patch("screencap.config.invalidate_config_cache"):
+            mock_stdin.isatty.return_value = True
+            mock_click.prompt.side_effect = fake_prompt
+
+            run_setup_wizard(config_path=config_path)
+
+            assert captured_defaults == [1]  # Cloud = choice 1
 
     def test_wizard_saves_allow_apps(self, tmp_path):
         """Auto-allowed apps end up in allow_apps config."""
@@ -278,7 +311,7 @@ class TestRunSetupWizard:
              mock.patch("screencap.setup_wizard._run_tui", return_value={}), \
              mock.patch("screencap.config.invalidate_config_cache"):
             mock_stdin.isatty.return_value = True
-            mock_click.prompt.return_value = 2  # internal mode
+            mock_click.prompt.return_value = 2  # Local
 
             result = run_setup_wizard(config_path=config_path)
             assert result is True
@@ -298,7 +331,7 @@ class TestRunSetupWizard:
              mock.patch("screencap.setup_wizard._run_tui", return_value={}), \
              mock.patch("screencap.config.invalidate_config_cache"):
             mock_stdin.isatty.return_value = True
-            mock_click.prompt.return_value = 2  # internal mode
+            mock_click.prompt.return_value = 2  # Local
 
             result = run_setup_wizard(config_path=config_path)
             assert result is True
@@ -318,7 +351,7 @@ class TestRunSetupWizard:
              mock.patch("screencap.setup_wizard._run_tui", return_value={}), \
              mock.patch("screencap.config.invalidate_config_cache"):
             mock_stdin.isatty.return_value = True
-            mock_click.prompt.return_value = 2  # internal mode
+            mock_click.prompt.return_value = 2  # Local
 
             result = run_setup_wizard(config_path=config_path)
             assert result is True
@@ -339,7 +372,7 @@ class TestRunSetupWizard:
              mock.patch("screencap.setup_wizard._run_tui", return_value=overrides), \
              mock.patch("screencap.config.invalidate_config_cache"):
             mock_stdin.isatty.return_value = True
-            mock_click.prompt.return_value = 2
+            mock_click.prompt.return_value = 2  # Local
 
             result = run_setup_wizard(config_path=config_path)
             assert result is True
@@ -361,7 +394,7 @@ class TestRunSetupWizard:
              mock.patch("screencap.setup_wizard._run_tui", return_value=overrides), \
              mock.patch("screencap.config.invalidate_config_cache"):
             mock_stdin.isatty.return_value = True
-            mock_click.prompt.return_value = 2
+            mock_click.prompt.return_value = 2  # Local
 
             result = run_setup_wizard(config_path=config_path)
             assert result is True
@@ -381,7 +414,7 @@ class TestRunSetupWizard:
              mock.patch("screencap.setup_wizard.click") as mock_click, \
              mock.patch("screencap.setup_wizard._run_tui", return_value=None):
             mock_stdin.isatty.return_value = True
-            mock_click.prompt.return_value = 2
+            mock_click.prompt.return_value = 2  # Local
 
             result = run_setup_wizard(config_path=config_path)
             assert result is False
@@ -471,6 +504,31 @@ class TestScanOnlyMode:
             doc = tomlkit.parse(config_path.read_text())
             assert doc["privacy"]["app_classes"]["com.example.configured"] == "chat"
             assert "com.example.new" in doc["privacy"]["allow_apps"]
+
+    @pytest.mark.parametrize("upload_default", ["cloud", "local"])
+    def test_scan_only_preserves_upload_default(self, tmp_path, upload_default):
+        """--scan preserves the existing upload_default through to saved config."""
+        config_path = tmp_path / "config.toml"
+        config_path.write_text(
+            '[privacy]\n'
+            f'mode = "internal"\n'
+            f'upload_default = "{upload_default}"\n'
+        )
+        apps = [
+            AppMetadata("/test/New.app", "com.example.new", "New App"),
+        ]
+        with mock.patch("sys.stdin") as mock_stdin, \
+             mock.patch("screencap.setup_wizard.discover_installed_apps", return_value=apps), \
+             mock.patch("screencap.setup_wizard._run_tui", return_value={}), \
+             mock.patch("screencap.setup_wizard.click") as mock_click, \
+             mock.patch("screencap.config.invalidate_config_cache"):
+            mock_stdin.isatty.return_value = True
+
+            result = run_setup_wizard(config_path=config_path, scan_only=True)
+            assert result is True
+
+            doc = tomlkit.parse(config_path.read_text())
+            assert doc["privacy"]["upload_default"] == upload_default
 
     def test_scan_only_all_classified(self, tmp_path):
         """--scan with no new unknown apps reports all classified."""
