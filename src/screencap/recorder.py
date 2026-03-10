@@ -109,7 +109,7 @@ def _print_banner() -> None:
 # Live recording display
 # ---------------------------------------------------------------------------
 
-def _build_live_display(name: str, elapsed: float, pulse_on: bool, disk_warning: str = "", chunk_status: str = "") -> Group:
+def _build_live_display(name: str, elapsed: float, pulse_on: bool, disk_warning: str = "", chunk_status: str = "", health_warning: str = "") -> Group:
     """Build the Rich renderable for the live recording indicator."""
     dot_style = "bold #f472b6" if pulse_on else "dim #f472b6"
     timer = _fmt_duration_clock(elapsed)
@@ -139,6 +139,9 @@ def _build_live_display(name: str, elapsed: float, pulse_on: bool, disk_warning:
     if chunk_status:
         content.append("\n")
         content.append(f"   {chunk_status}", style="dim")
+    if health_warning:
+        content.append("\n")
+        content.append(f"   {health_warning}", style="bold #f59e0b")
     content.append("\n\n")
     content.append_text(line2)
 
@@ -719,14 +722,17 @@ def start_recording(
                 _stop_reason = "force"
                 _stop_event.set()
 
-                # Kill children using stored PIDs (signal-safe)
-                for pid in _child_pids:
+                # Kill children using stored PIDs (signal-safe).
+                # Snapshot to avoid mutation during iteration (health
+                # check removes dead PIDs from the main thread).
+                _pids_snapshot = list(_child_pids)
+                for pid in _pids_snapshot:
                     try:
                         os.kill(pid, signal.SIGTERM)
                     except (ProcessLookupError, PermissionError):
                         pass
                 time.sleep(1)
-                for pid in _child_pids:
+                for pid in _pids_snapshot:
                     try:
                         os.kill(pid, signal.SIGKILL)
                     except (ProcessLookupError, PermissionError):
@@ -787,14 +793,29 @@ def start_recording(
                                 disk_warning = ""
 
                         _chunk_status = chunk_processor.status if chunk_processor else ""
-                        live.update(_build_live_display(name, elapsed, pulse_on, disk_warning, _chunk_status))
+                        _health_warning = recorder.health_warning
+                        # Prune dead PIDs to prevent PID recycling bug in force-quit
+                        for crash in recorder.child_crashes:
+                            dead_pid = crash.get("pid")
+                            if dead_pid and dead_pid in _child_pids:
+                                _child_pids.remove(dead_pid)
+                        live.update(_build_live_display(name, elapsed, pulse_on, disk_warning, _chunk_status, _health_warning))
                         _stop_event.wait(0.5)
                 finally:
+                    # Detect if recording stopped due to a critical child crash
+                    if not _stop_reason and recorder.health_warning:
+                        _stop_reason = "child_crash"
+
                     # Replace the panel with the stop message.  Rich
                     # knows the panel height and will overwrite every
                     # line, including borders.  The message stays on
                     # screen because transient=False (default).
-                    if _stop_reason == "disk_full":
+                    if _stop_reason == "child_crash":
+                        live.update(Text(
+                            f"  \u26a0 Recording stopped: {recorder.health_warning}",
+                            style="#f59e0b",
+                        ))
+                    elif _stop_reason == "disk_full":
                         live.update(Text(
                             f"  ■ Recording auto-stopped: disk space critically low "
                             f"({_disk_free_at_stop:.0f} MB remaining)",
