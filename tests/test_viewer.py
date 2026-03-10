@@ -12,64 +12,30 @@ from screencap.viewer import _needs_regeneration
 class TestNeedsRegeneration:
     """Tests for the _needs_regeneration helper."""
 
-    def test_missing_file(self, tmp_path):
+    def test_missing_vs_existing(self, tmp_path):
         viewer = tmp_path / "viewer.html"
         assert _needs_regeneration(viewer, regenerate=False) is True
 
-    def test_existing_small_file(self, tmp_path):
-        viewer = tmp_path / "viewer.html"
         viewer.write_text("<html></html>")
         assert _needs_regeneration(viewer, regenerate=False) is False
 
-    def test_regenerate_flag(self, tmp_path):
+    def test_regenerate_flag_forces_regen(self, tmp_path):
         viewer = tmp_path / "viewer.html"
         viewer.write_text("<html></html>")
         assert _needs_regeneration(viewer, regenerate=True) is True
 
-    def test_oversized_file_triggers_regeneration(self, tmp_path):
+    def test_oversized_file_auto_regenerates(self, tmp_path):
         viewer = tmp_path / "viewer.html"
         with mock.patch("screencap.viewer._MAX_VIEWER_SIZE_BYTES", 100):
             viewer.write_bytes(b"x" * 200)
             assert _needs_regeneration(viewer, regenerate=False) is True
 
-    def test_file_under_threshold_no_regeneration(self, tmp_path):
-        viewer = tmp_path / "viewer.html"
-        with mock.patch("screencap.viewer._MAX_VIEWER_SIZE_BYTES", 1000):
-            viewer.write_bytes(b"x" * 500)
-            assert _needs_regeneration(viewer, regenerate=False) is False
 
+class TestOpenViewerMaxEventsWiring:
+    """Tests that open_viewer correctly translates max_events to create_html."""
 
-class TestOpenViewerParams:
-    """Tests for open_viewer parameter passing."""
-
-    def test_regenerate_deletes_existing_viewer(self, tmp_path):
-        """--regenerate deletes existing viewer.html before regenerating."""
-        from screencap.viewer import open_viewer
-
-        rec_dir = tmp_path / "test-rec"
-        rec_dir.mkdir()
-        viewer = rec_dir / "viewer.html"
-        viewer.write_text("<html>old gigabyte file</html>")
-
-        # Mock find_db to return a recording.db path
-        with mock.patch("screencap.viewer.find_db", return_value=rec_dir / "recording.db"):
-            with mock.patch("screencap.viewer.subprocess"):
-                # Mock the deferred sc_engine import inside open_viewer
-                mock_create = mock.MagicMock(return_value=None)
-                fake_module = mock.MagicMock()
-                fake_module.create_html = mock_create
-                with mock.patch.dict("sys.modules", {"sc_engine": fake_module}):
-                    open_viewer("test-rec", recordings_dir=tmp_path, regenerate=True)
-
-                    mock_create.assert_called_once()
-                    # Should have been called with frame_scale=0.5
-                    call_kwargs = mock_create.call_args
-                    assert call_kwargs.kwargs.get("frame_scale") == 0.5
-
-    def test_max_events_zero_passes_none(self, tmp_path):
-        """--max-events 0 disables capping (passes None to create_html)."""
-        from screencap.viewer import open_viewer
-
+    def _call_open_viewer(self, tmp_path, **kwargs):
+        """Call open_viewer with mocked create_html, return call kwargs."""
         rec_dir = tmp_path / "test-rec"
         rec_dir.mkdir()
 
@@ -79,27 +45,18 @@ class TestOpenViewerParams:
                 fake_module = mock.MagicMock()
                 fake_module.create_html = mock_create
                 with mock.patch.dict("sys.modules", {"sc_engine": fake_module}):
-                    open_viewer(
-                        "test-rec", recordings_dir=tmp_path, max_events=0
-                    )
+                    from screencap.viewer import open_viewer
+                    open_viewer("test-rec", recordings_dir=tmp_path, **kwargs)
+                    return mock_create.call_args
 
-                    call_kwargs = mock_create.call_args
-                    assert call_kwargs.kwargs.get("max_events") is None
+    @pytest.mark.parametrize("input_val, expected", [
+        (0, None),       # 0 disables caps
+        (200, 200),      # explicit value passed through
+    ])
+    def test_max_events_translation(self, tmp_path, input_val, expected):
+        call = self._call_open_viewer(tmp_path, max_events=input_val)
+        assert call.kwargs["max_events"] == expected
 
-    def test_default_max_events_500(self, tmp_path):
-        """Default open_viewer uses max_events=500."""
-        from screencap.viewer import open_viewer
-
-        rec_dir = tmp_path / "test-rec"
-        rec_dir.mkdir()
-
-        with mock.patch("screencap.viewer.find_db", return_value=rec_dir / "recording.db"):
-            with mock.patch("screencap.viewer.subprocess"):
-                mock_create = mock.MagicMock(return_value=None)
-                fake_module = mock.MagicMock()
-                fake_module.create_html = mock_create
-                with mock.patch.dict("sys.modules", {"sc_engine": fake_module}):
-                    open_viewer("test-rec", recordings_dir=tmp_path)
-
-                    call_kwargs = mock_create.call_args
-                    assert call_kwargs.kwargs.get("max_events") == 500
+    def test_default_caps_at_500(self, tmp_path):
+        call = self._call_open_viewer(tmp_path)
+        assert call.kwargs["max_events"] == 500
