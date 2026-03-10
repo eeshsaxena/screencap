@@ -468,23 +468,18 @@ def list_cmd(as_json, sort):
 @cli.command()
 @click.argument("name")
 @click.option("--regenerate", is_flag=True, help="Delete cached viewer.html and regenerate.")
-@click.option("--max-events", type=int, default=None, help="Max events in viewer (default 500, 0 for all).")
+@click.option("--max-events", type=int, default=500, help="Max events in viewer (0 for all).")
 def view(name, regenerate, max_events):
     """Open recording viewer in browser."""
     from screencap.viewer import open_viewer
 
     try:
-        kwargs = {}
-        if regenerate:
-            kwargs["regenerate"] = True
-        if max_events is not None:
-            kwargs["max_events"] = max_events
-        open_viewer(name, **kwargs)
+        open_viewer(name, regenerate=regenerate, max_events=max_events)
         console.print(f"[dim]Opening {name}/viewer.html ...[/dim]")
     except ImportError:
         console.print(_RECORD_EXTRAS_MSG)
         sys.exit(1)
-    except FileNotFoundError as e:
+    except (FileNotFoundError, RuntimeError, ValueError) as e:
         console.print(f"[red]Error:[/red] {e}")
         sys.exit(1)
 

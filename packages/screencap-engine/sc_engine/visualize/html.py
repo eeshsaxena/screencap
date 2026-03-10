@@ -18,6 +18,21 @@ if TYPE_CHECKING:
     from sc_engine.capture import CaptureSession
 
 
+def _even_indices(n: int, k: int) -> list[int]:
+    """Return k evenly-spaced indices in [0, n-1]."""
+    if k <= 0:
+        return []
+    if k == 1:
+        return [0]
+    return [round(i * (n - 1) / (k - 1)) for i in range(k)]
+
+
+# Default caps for CLI-generated viewers (both screencap and capture CLIs).
+DEFAULT_VIEWER_MAX_EVENTS = 500
+DEFAULT_VIEWER_FRAME_SCALE = 0.5
+DEFAULT_VIEWER_FRAME_QUALITY = 75
+
+
 def create_html(
     capture_or_path: "CaptureSession | str | Path",
     output: str | Path | None = None,
@@ -25,7 +40,7 @@ def create_html(
     include_audio: bool = True,
     frame_scale: float = 1.0,
     frame_quality: int = 85,
-) -> str:
+) -> str | None:
     """Generate an interactive HTML viewer for a capture recording.
 
     Args:
@@ -40,6 +55,10 @@ def create_html(
         HTML string if output is None, otherwise None after writing file.
     """
     from sc_engine.capture import CaptureSession
+
+    # Treat 0 or negative as "no limit"
+    if max_events is not None and max_events <= 0:
+        max_events = None
 
     # Load capture if path provided
     if isinstance(capture_or_path, (str, Path)):
@@ -76,8 +95,6 @@ def create_html(
     downsampled = False
     if max_events is not None and len(actions) > max_events:
         # Type-aware downsampling: keep ALL non-move events, sample moves
-        import numpy as np
-
         non_moves = []
         moves = []
         for idx, a in enumerate(actions):
@@ -89,14 +106,12 @@ def create_html(
 
         if len(non_moves) >= max_events:
             # More non-move events than budget — uniform sample non-moves
-            sample_indices = np.linspace(0, len(non_moves) - 1, max_events, dtype=int)
-            sampled = [non_moves[i] for i in sample_indices]
+            sampled = [non_moves[i] for i in _even_indices(len(non_moves), max_events)]
         else:
             # Keep all non-moves, fill remaining budget with sampled moves
             remaining = max_events - len(non_moves)
             if remaining > 0 and moves:
-                move_indices = np.linspace(0, len(moves) - 1, remaining, dtype=int)
-                sampled_moves = [moves[i] for i in move_indices]
+                sampled_moves = [moves[i] for i in _even_indices(len(moves), remaining)]
             else:
                 sampled_moves = []
             sampled = non_moves + sampled_moves

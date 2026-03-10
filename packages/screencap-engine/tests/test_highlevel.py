@@ -587,7 +587,7 @@ class TestViewerDownsampling:
     @staticmethod
     def _make_capture(actions):
         """Create a mock CaptureSession with controlled actions."""
-        from unittest.mock import MagicMock, PropertyMock
+        from unittest.mock import MagicMock
 
         capture = MagicMock()
         capture.id = "test-capture"

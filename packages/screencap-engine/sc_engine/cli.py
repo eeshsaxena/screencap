@@ -86,6 +86,11 @@ def visualize(
     import sys
 
     from sc_engine.visualize import create_demo, create_html
+    from sc_engine.visualize.html import (
+        DEFAULT_VIEWER_FRAME_QUALITY,
+        DEFAULT_VIEWER_FRAME_SCALE,
+        DEFAULT_VIEWER_MAX_EVENTS,
+    )
 
     capture_dir = Path(capture_dir)
 
@@ -101,9 +106,9 @@ def visualize(
         create_html(
             capture_dir,
             output=output_path,
-            max_events=500,
-            frame_scale=0.5,
-            frame_quality=75,
+            max_events=DEFAULT_VIEWER_MAX_EVENTS,
+            frame_scale=DEFAULT_VIEWER_FRAME_SCALE,
+            frame_quality=DEFAULT_VIEWER_FRAME_QUALITY,
         )
         print(f"Saved: {output_path}")
 

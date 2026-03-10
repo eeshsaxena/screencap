@@ -9,7 +9,7 @@ from pathlib import Path
 from rich.console import Console
 
 from screencap.catalog import find_db
-from screencap.config import get_recordings_dir
+from screencap.config import get_recordings_dir, resolve_recording_dir
 
 console = Console()
 
@@ -89,21 +89,16 @@ def _needs_regeneration(viewer: Path, regenerate: bool) -> bool:
 
 def open_viewer(
     name: str,
-    recordings_dir: Path | None = None,
     regenerate: bool = False,
     max_events: int | None = 500,
 ) -> None:
     """Open viewer.html for a recording in the default browser."""
-    if recordings_dir is None:
-        recordings_dir = get_recordings_dir()
-
-    dir_name = name
-    rec_dir = recordings_dir / dir_name
+    rec_dir = resolve_recording_dir(name)
     viewer = rec_dir / "viewer.html"
 
     if not rec_dir.exists():
         raise FileNotFoundError(
-            f"Recording '{dir_name}' not found in {recordings_dir}"
+            f"Recording '{name}' not found"
         )
 
     # For chunked recordings, ensure a single video file exists for the viewer
@@ -131,18 +126,20 @@ def open_viewer(
             console.print("[dim]viewer.html not found, generating...[/dim]")
         try:
             from sc_engine import create_html
+            from sc_engine.visualize.html import (
+                DEFAULT_VIEWER_FRAME_QUALITY,
+                DEFAULT_VIEWER_FRAME_SCALE,
+            )
 
-            # Use max_events=None to disable caps (full data) when explicitly 0
-            effective_max = None if max_events == 0 else max_events
             create_html(
                 str(rec_dir),
                 output=str(viewer),
-                max_events=effective_max,
-                frame_scale=0.5,
-                frame_quality=75,
+                max_events=max_events,
+                frame_scale=DEFAULT_VIEWER_FRAME_SCALE,
+                frame_quality=DEFAULT_VIEWER_FRAME_QUALITY,
             )
         except Exception as e:
-            raise FileNotFoundError(
+            raise RuntimeError(
                 f"Could not generate viewer.html: {e}"
             ) from e
 

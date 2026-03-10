@@ -32,28 +32,37 @@ class TestNeedsRegeneration:
 
 
 class TestOpenViewerMaxEventsWiring:
-    """Tests that open_viewer correctly translates max_events to create_html."""
+    """Tests that open_viewer correctly passes max_events to create_html."""
 
     def _call_open_viewer(self, tmp_path, **kwargs):
         """Call open_viewer with mocked create_html, return call kwargs."""
         rec_dir = tmp_path / "test-rec"
         rec_dir.mkdir()
 
-        with mock.patch("screencap.viewer.find_db", return_value=rec_dir / "recording.db"):
-            with mock.patch("screencap.viewer.subprocess"):
-                mock_create = mock.MagicMock(return_value=None)
-                fake_module = mock.MagicMock()
-                fake_module.create_html = mock_create
-                with mock.patch.dict("sys.modules", {"sc_engine": fake_module}):
-                    from screencap.viewer import open_viewer
-                    open_viewer("test-rec", recordings_dir=tmp_path, **kwargs)
-                    return mock_create.call_args
+        mock_create = mock.MagicMock(return_value=None)
+        fake_engine = mock.MagicMock()
+        fake_engine.create_html = mock_create
+        fake_html_module = mock.MagicMock()
+        fake_html_module.DEFAULT_VIEWER_FRAME_SCALE = 0.5
+        fake_html_module.DEFAULT_VIEWER_FRAME_QUALITY = 75
+
+        with mock.patch("screencap.viewer.resolve_recording_dir", return_value=rec_dir):
+            with mock.patch("screencap.viewer.find_db", return_value=rec_dir / "recording.db"):
+                with mock.patch("screencap.viewer.subprocess"):
+                    with mock.patch.dict("sys.modules", {
+                        "sc_engine": fake_engine,
+                        "sc_engine.visualize": mock.MagicMock(),
+                        "sc_engine.visualize.html": fake_html_module,
+                    }):
+                        from screencap.viewer import open_viewer
+                        open_viewer("test-rec", **kwargs)
+                        return mock_create.call_args
 
     @pytest.mark.parametrize("input_val, expected", [
-        (0, None),       # 0 disables caps
-        (200, 200),      # explicit value passed through
+        (0, 0),         # 0 passed through (create_html API handles conversion)
+        (200, 200),     # explicit value passed through
     ])
-    def test_max_events_translation(self, tmp_path, input_val, expected):
+    def test_max_events_passthrough(self, tmp_path, input_val, expected):
         call = self._call_open_viewer(tmp_path, max_events=input_val)
         assert call.kwargs["max_events"] == expected
 
