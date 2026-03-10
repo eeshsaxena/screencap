@@ -2657,6 +2657,15 @@ def record(
     # Audio FLAC close needs extra time too
     join_tasks(["audio_recorder"], timeout=15.0)
 
+    # Clean up SynchronizedQueues to prevent feeder-thread hangs at atexit.
+    for q in (screen_write_q, action_write_q, window_write_q,
+              browser_write_q, video_write_q, perf_q):
+        try:
+            q.cancel_join_thread()
+            q.close()
+        except Exception:
+            pass
+
     terminate_perf_event.set()
     # disabled to increase perf
     # join_tasks(
