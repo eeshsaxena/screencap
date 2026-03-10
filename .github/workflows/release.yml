@@ -5,11 +5,12 @@ on:
     tags:
       - 'v*'
 
-permissions:
-  contents: read
+permissions: {}
 
 jobs:
   build:
+    permissions:
+      contents: read
     strategy:
       matrix:
         include:
@@ -60,6 +61,8 @@ jobs:
 
   release:
     needs: build
+    permissions:
+      contents: write
     runs-on: ubuntu-latest
     steps:
       - uses: actions/checkout@v4
@@ -86,3 +89,26 @@ jobs:
           gcloud storage cp scripts/install.sh gs://screencap-releases/releases/install.sh
           # Update latest version pointer
           echo "$VERSION" | gcloud storage cp - gs://screencap-releases/releases/latest.txt
+
+      - name: Create GitHub Release
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          VERSION=${GITHUB_REF#refs/tags/v}
+          if ! echo "$VERSION" | grep -qE '^[0-9]+\.[0-9]+\.[0-9]+(-[a-zA-Z0-9.]+)?$'; then
+            echo "ERROR: Invalid version format: $VERSION" >&2
+            exit 1
+          fi
+          # Extract this version's section from CHANGELOG.md
+          awk "/^## \[${VERSION}\]/{found=1; next} /^## \[/{if(found) exit} found" CHANGELOG.md > release_notes.txt
+          # Fallback if extraction fails
+          if [ ! -s release_notes.txt ]; then
+            echo "See [CHANGELOG.md](CHANGELOG.md) for details." > release_notes.txt
+          fi
+          gh release create "v${VERSION}" \
+            --title "v${VERSION}" \
+            --notes-file release_notes.txt \
+            */screencap-*.tar.gz \
+            checksums.sha256 \
+          || gh release edit "v${VERSION}" \
+            --notes-file release_notes.txt
