@@ -147,7 +147,7 @@ def load_window_events(db_path: Path) -> list[WindowContext]:
         for row in cur:
             domain = None
             if has_browser_url and row[4]:
-                domain = _domain_from_url(row[4]) or None
+                domain = domain_from_url(row[4])
             results.append(WindowContext(
                 timestamp=float(row[0]),
                 app_bundle_id=row[1] or "",
@@ -160,13 +160,20 @@ def load_window_events(db_path: Path) -> list[WindowContext]:
         conn.close()
 
 
-def _domain_from_url(url: str) -> str:
-    """Extract the domain (hostname) from a URL."""
+def domain_from_url(url: str) -> str | None:
+    """Extract the domain (hostname) from a URL.
+
+    Returns None if the URL cannot be parsed or has no hostname.
+    """
     try:
         parsed = urlparse(url)
-        return parsed.hostname or ""
+        return parsed.hostname or None
     except Exception:
-        return ""
+        return None
+
+
+# Backward-compatible alias
+_domain_from_url = domain_from_url
 
 
 # ---------------------------------------------------------------------------

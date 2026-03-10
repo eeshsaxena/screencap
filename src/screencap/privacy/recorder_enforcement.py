@@ -52,7 +52,7 @@ import time
 from collections.abc import Callable
 
 from screencap.privacy.actions import KEYSTROKE_CONTENT_FIELDS, PrivacyAction
-from screencap.privacy.context import DefaultContextClassifier
+from screencap.privacy.context import DefaultContextClassifier, domain_from_url
 from screencap.privacy.policy import (
     DEFAULT_TRANSITION_HOLD_SECONDS,
     DefaultPolicyEvaluator,
@@ -201,9 +201,7 @@ class RecorderPrivacyFilter:
         domain = None
         browser_url = window_data.get("browser_url")
         if browser_url:
-            from screencap.privacy.context import _domain_from_url
-
-            domain = _domain_from_url(browser_url) or None
+            domain = domain_from_url(browser_url)
             logger.debug("Domain from browser_url: %s", domain)
 
         meta = FrameMetadata(

@@ -479,48 +479,39 @@ class TestNullDbBrowserUrl:
         _null_db_rows_for_intervals(tmp_path, intervals, result)
 
 
-class TestScrubBrowserUrl:
-    """_try_scrub_browser_url replaces full URLs with domain-only."""
+class TestNullEventContentWindowSwitch:
+    """_null_event_content nulls window_title and domain on window.switch events."""
 
-    def test_full_url_replaced_with_domain(self, tmp_path):
-        from screencap.scrubber import _try_scrub_browser_url, ScrubResult
+    def test_window_switch_fields_nulled(self):
+        from screencap.scrubber import _null_event_content
 
-        db_path = tmp_path / "recording.db"
-        _create_recording_db(db_path, with_browser_url=True)
+        event = {
+            "type": "window.switch",
+            "timestamp": 1.0,
+            "app_bundle_id": "com.google.Chrome",
+            "window_title": "Chase Online",
+            "domain": "chase.com",
+        }
+        _null_event_content(event)
+        assert event["window_title"] is None
+        assert event["domain"] is None
+        # Non-content fields preserved
+        assert event["app_bundle_id"] == "com.google.Chrome"
+        assert event["timestamp"] == 1.0
 
-        conn = sqlite3.connect(str(db_path))
-        conn.execute(
-            "INSERT INTO window_event (timestamp, app_bundle_id, title, window_id, browser_url) "
-            "VALUES (1.0, 'com.google.Chrome', 'GitHub', '1', 'https://github.com/user/repo?token=abc123')"
-        )
-        conn.execute(
-            "INSERT INTO window_event (timestamp, app_bundle_id, title, window_id, browser_url) "
-            "VALUES (2.0, 'com.google.Chrome', 'Page', '2', NULL)"
-        )
-        conn.commit()
+    def test_non_window_event_unchanged(self):
+        from screencap.scrubber import _null_event_content
 
-        result = ScrubResult(output_dir=tmp_path)
-        _try_scrub_browser_url(conn, None, None, result)
-        conn.commit()
+        event = {
+            "type": "key.type",
+            "timestamp": 1.0,
+            "text": "hello",
+        }
+        _null_event_content(event)
+        # text is in KEYSTROKE_CONTENT_FIELDS → nulled
+        assert event["text"] is None
+        # No window_title/domain keys added
+        assert "window_title" not in event
+        assert "domain" not in event
 
-        rows = conn.execute(
-            "SELECT browser_url FROM window_event ORDER BY timestamp"
-        ).fetchall()
-        conn.close()
 
-        # Full URL replaced with domain-only
-        assert rows[0][0] == "github.com"
-        # NULL stays NULL
-        assert rows[1][0] is None
-
-    def test_old_db_without_column_no_crash(self, tmp_path):
-        from screencap.scrubber import _try_scrub_browser_url, ScrubResult
-
-        db_path = tmp_path / "recording.db"
-        _create_recording_db(db_path, with_browser_url=False)
-
-        conn = sqlite3.connect(str(db_path))
-        result = ScrubResult(output_dir=tmp_path)
-        # Should not raise
-        _try_scrub_browser_url(conn, None, None, result)
-        conn.close()

@@ -1004,6 +1004,15 @@ def deduplicate_window_events(
         if key != last_key:
             result.append(dict_to_window_switch(row))
             last_key = key
+        elif result and row.get("browser_url") and not result[-1].domain:
+            # AX URL extraction often arrives one event after the initial
+            # window switch.  When the duplicate carries a browser_url that
+            # the already-emitted event lacks, patch it in.
+            converted = dict_to_window_switch(row)
+            if converted.domain:
+                result[-1] = result[-1].model_copy(
+                    update={"domain": converted.domain},
+                )
 
     return result
 

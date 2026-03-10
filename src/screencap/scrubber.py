@@ -108,7 +108,7 @@ def _build_blocked_intervals(
         meta = FrameMetadata(
             bundle_id=we.app_bundle_id,
             window_title=we.title,
-            domain=getattr(we, "domain", None),
+            domain=we.domain,
             timestamp=we.timestamp,
         )
         ctx = classifier.classify(meta)
@@ -370,11 +370,15 @@ def _scrub_screenshots_with_policy(
 def _null_event_content(event: dict) -> None:
     """Null out sensitive content fields in an event dict in-place (recursive).
 
-    Handles nested structures like key.type inside mouse.drag.children.
+    Handles nested structures like key.type inside mouse.drag.children,
+    and window.switch title/domain fields.
     """
     for field in KEYSTROKE_CONTENT_FIELDS:
         if field in event:
             event[field] = None
+    if event.get("type") == "window.switch":
+        event["window_title"] = None
+        event["domain"] = None
     for child in event.get("children", []):
         _null_event_content(child)
 
@@ -649,39 +653,8 @@ def _scrub_recording_schema(
     if "window_event" in tables:
         _try_scrub_text_column(conn, "window_event", "title", pipeline, anonymizer, result)
         _try_scrub_json_column(conn, "window_event", "state", pipeline, anonymizer, result)
-        # browser_url contains full URLs (PII) — scrub to domain-only or NULL
-        _try_scrub_browser_url(conn, pipeline, anonymizer, result)
-
-def _try_scrub_browser_url(
-    conn: sqlite3.Connection,
-    pipeline,
-    anonymizer,
-    result: ScrubResult,
-) -> None:
-    """Replace browser_url with domain-only hostname, or NULL if empty.
-
-    Full URLs contain PII (session tokens, account IDs, query params).
-    For uploaded scrubbed DBs, only the domain hostname is retained.
-    """
-    from screencap.privacy.context import _domain_from_url
-
-    try:
-        read_cur = conn.cursor()
-        write_cur = conn.cursor()
-        read_cur.execute(
-            "SELECT id, browser_url FROM window_event WHERE browser_url IS NOT NULL"
-        )
-        for row_id, url in read_cur:
-            if not url or not isinstance(url, str):
-                continue
-            domain = _domain_from_url(url)
-            # Replace full URL with domain-only (or NULL if no domain)
-            write_cur.execute(
-                "UPDATE window_event SET browser_url = ? WHERE id = ?",
-                (domain or None, row_id),
-            )
-    except sqlite3.OperationalError:
-        pass  # browser_url column doesn't exist in older DBs
+        # TODO: run PII pipeline on browser_url (same as title) to redact
+        # tokens/emails in query params while preserving the URL structure.
 
 
 def _scrub_capture_schema(
