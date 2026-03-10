@@ -6,6 +6,9 @@ import json
 import sys
 
 import click
+from dotenv import load_dotenv
+
+load_dotenv()  # auto-load .env if present
 from rich.console import Console
 from rich.table import Table
 
@@ -311,6 +314,22 @@ def start(
         _report_unclassified_apps(final_dir)
     except Exception:
         pass  # non-blocking
+
+    # Hard-exit to avoid multiprocessing feeder-thread atexit hangs.
+    # All recording data is flushed to disk by this point.
+    # Kill the resource tracker first so it can't warn about leaked semaphores.
+    import os as _os
+    try:
+        from multiprocessing.resource_tracker import _resource_tracker
+        if _resource_tracker._pid is not None:
+            _os.kill(_resource_tracker._pid, 9)
+            try:
+                _os.waitpid(_resource_tracker._pid, _os.WNOHANG)
+            except ChildProcessError:
+                pass
+    except Exception:
+        pass
+    _os._exit(0)
 
 
 def _auto_export(capture_dir: Path) -> None:
@@ -740,16 +759,46 @@ def export(name, all_recordings, downloads, output, use_stdout, exclude_moves):
 @cli.command()
 @click.option("--force", is_flag=True, help="Skip SIGTERM and go straight to SIGKILL.")
 def stop(force):
-    """Stop orphaned recording processes."""
+    """Stop recording processes."""
+    import os as _os
+    import signal as _signal
+    import time as _time
+
     try:
         from screencap.pidfile import (
+            _is_screencap_process,
+            _pid_exists,
             delete_pidfile,
             find_orphaned_processes,
+            read_pidfile,
             terminate_processes,
         )
     except ImportError:
         console.print(_RECORD_EXTRAS_MSG)
         raise SystemExit(1)
+
+    # Try graceful shutdown via SIGTERM to parent process first
+    if not force:
+        data = read_pidfile()
+        if data and data.get("parent_pid"):
+            parent_pid = data["parent_pid"]
+            if _pid_exists(parent_pid) and _is_screencap_process(parent_pid):
+                console.print(f"Sending stop signal to recording (PID {parent_pid})...")
+                try:
+                    _os.kill(parent_pid, _signal.SIGTERM)
+                except (ProcessLookupError, PermissionError):
+                    pass
+                else:
+                    # Wait for graceful shutdown (up to 30s)
+                    for _ in range(60):
+                        if not _pid_exists(parent_pid):
+                            break
+                        _time.sleep(0.5)
+                    if not _pid_exists(parent_pid):
+                        console.print("Recording stopped gracefully.")
+                        delete_pidfile()
+                        return
+                    console.print("[yellow]Graceful stop timed out — falling back to force kill.[/yellow]")
 
     orphans = find_orphaned_processes()
     if not orphans:
@@ -1294,6 +1343,24 @@ def upload(names, all_recordings, dry_run, force, jobs, no_delete):
 
             # Recovery: generate per-chunk manifests + events if chunks exist but metadata doesn't
             _recover_chunk_metadata(d, console, force=force)
+
+            # Recovery: generate sentinel file if missing (crash/force-quit recovery)
+            _sentinel_path = d / "recording_complete.json"
+            if not _sentinel_path.exists() and any(d.glob("chunk_*_manifest.json")):
+                try:
+                    from screencap.chunk_processor import _build_sentinel_data
+                    _rec_id_path = d / ".recording_id"
+                    _rec_name = _rec_id_path.read_text().strip() if _rec_id_path.exists() else d.name
+                    _chunk_count = len(list(d.glob("chunk_*_manifest.json")))
+                    _sentinel_data = _build_sentinel_data(
+                        recording_name=_rec_name,
+                        stop_reason="manual_upload",
+                        chunks_expected=_chunk_count,
+                    )
+                    import json as _json
+                    _sentinel_path.write_text(_json.dumps(_sentinel_data, indent=2))
+                except Exception:
+                    pass
 
         try:
             result = upload_recording(d, dry_run=dry_run, force=force, jobs=jobs)

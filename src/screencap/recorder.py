@@ -581,8 +581,10 @@ def start_recording(
     atexit.register(_cleanup_children)
 
     # Track how stop happened for messaging after Live exits
-    _stop_reason = ""  # "graceful", "force", "disk_full", or "interrupt"
+    _stop_reason = ""  # "graceful", "force", "disk_full", "sigterm", or "interrupt"
     _stop_event = threading.Event()
+    _sentinel_uploaded = False
+    _recording_name = name  # default; may be overridden by .recording_id later
     _saved_stdout = None  # Will hold real stdout when we redirect to devnull
     _saved_stderr = None  # Will hold real stderr when we redirect to devnull
 
@@ -745,9 +747,35 @@ def start_recording(
                 if _saved_stderr is not None:
                     sys.stderr = _saved_stderr
 
+                # Write sentinel locally for recovery via `screencap upload`
+                # (no upload — os._exit is imminent)
+                try:
+                    _sentinel = {
+                        "version": 1,
+                        "recording_name": _recording_name,
+                        "completed_at": _dt.now(_tz.utc).isoformat(),
+                        "stop_reason": "force",
+                        "chunks_expected": len(list(capture_dir.glob("chunk_*_manifest.json"))),
+                        "sentinel_id": str(__import__('uuid').uuid4()),
+                    }
+                    (capture_dir / "recording_complete.json").write_text(
+                        _json.dumps(_sentinel, indent=2)
+                    )
+                except Exception:
+                    pass
+
                 os._exit(1)
 
             signal.signal(signal.SIGINT, _force_exit)
+
+            # --- SIGTERM handler (for `screencap stop`) ---
+            def _sigterm_handler(sig, frame):
+                nonlocal _stop_reason
+                _stop_reason = "sigterm"
+                _stop_event.set()
+                recorder.stop()
+
+            signal.signal(signal.SIGTERM, _sigterm_handler)
 
             # --- Live recording display ---
             # We use transient=False and handle cleanup ourselves:
@@ -878,10 +906,29 @@ def start_recording(
             sys.stderr = _saved_stderr
 
         status.stop()
-        # Restore default handler
+        # Restore default handlers
         signal.signal(signal.SIGINT, signal.default_int_handler)
+        signal.signal(signal.SIGTERM, signal.SIG_DFL)
         atexit.unregister(_cleanup_children)
         delete_pidfile()
+
+        # Best-effort LOCAL sentinel write for unhandled exceptions (Step 3d)
+        # Do NOT upload here — chunk_processor hasn't stopped yet, so chunks
+        # may still be uploading.  Uploading sentinel now would trigger the
+        # stitcher before manifests land in GCS (race condition).
+        # The local file enables recovery via ``screencap upload``.
+        if cloud_intent and chunk_processor is not None and not _sentinel_uploaded:
+            try:
+                from screencap.chunk_processor import _build_sentinel_data
+                _n_chunks = len(list(capture_dir.glob("chunk_*_manifest.json")))
+                _sentinel_data = _build_sentinel_data(
+                    _recording_name, stop_reason="exception", chunks_expected=_n_chunks,
+                )
+                _sentinel_path = capture_dir / "recording_complete.json"
+                _sentinel_path.write_text(_json.dumps(_sentinel_data, indent=2))
+            except Exception:
+                pass
+
         # Suppress noisy multiprocessing cleanup tracebacks
         warnings.filterwarnings("ignore", category=ResourceWarning)
 
@@ -934,9 +981,25 @@ def start_recording(
                 if verbose:
                     console.print(f"[yellow]Warning:[/yellow] DB upload failed: {e}")
 
-        # Stub recording if all chunks AND db uploaded
+        # Sentinel upload for cloud-intent recordings (triggers stitching)
+        if cloud_intent and live_upload:
+            try:
+                from screencap.chunk_processor import upload_sentinel
+                _n_chunks = len(list(capture_dir.glob("chunk_*_manifest.json")))
+                _sentinel_uploaded = upload_sentinel(
+                    capture_dir, _recording_name,
+                    stop_reason=_stop_reason or "graceful",
+                    chunks_expected=_n_chunks,
+                )
+                if not _sentinel_uploaded:
+                    console.print("[yellow]Sentinel upload failed — run 'screencap upload' to trigger stitching.[/yellow]")
+            except Exception as e:
+                if verbose:
+                    console.print(f"[yellow]Warning:[/yellow] Sentinel upload failed: {e}")
+
+        # Stub recording if all chunks AND (db or sentinel) uploaded
         _has_chunk_files = any(capture_dir.glob("chunk_*.mp4"))
-        if chunk_processor.all_chunks_uploaded() and _db_uploaded and live_upload and _has_chunk_files:
+        if chunk_processor.all_chunks_uploaded() and (_db_uploaded or _sentinel_uploaded) and live_upload and _has_chunk_files:
             try:
                 from screencap.chunk_processor import stub_recording
                 deleted = stub_recording(capture_dir)

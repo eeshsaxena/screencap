@@ -23,7 +23,7 @@ from google.cloud import storage
 logging.basicConfig(level=logging.INFO, format="%(levelname)s %(message)s")
 log = logging.getLogger(__name__)
 
-BUCKET = "screencap-recordings"
+BUCKET = os.environ.get("SCREENCAP_BUCKET", "screencap-recordings")
 PROCESSOR_VERSION = "1.0.0"
 DEFAULT_REST_THRESHOLD = 120.0
 MAX_MERGE_GAP = 5.0  # max seconds between consecutive chunk boundaries
@@ -571,15 +571,20 @@ def _process_task(
 # Idempotency
 # ---------------------------------------------------------------------------
 
-def _check_idempotency(sessions_prefix: str, db_md5: str) -> bool:
-    """Return True if this recording was already processed with same DB."""
+def _check_idempotency(sessions_prefix: str, trigger_id: str) -> bool:
+    """Return True if this recording was already processed with same trigger.
+
+    ``trigger_id`` is either the MD5 of recording.db or the sentinel_id from
+    recording_complete.json.
+    """
     status_blob = f"{sessions_prefix}_processing_status.json"
     data = _blob_bytes(status_blob)
     if data is None:
         return False
     try:
         status = json.loads(data)
-        if status.get("source_db_md5") != db_md5:
+        existing_id = status.get("trigger_id") or status.get("source_db_md5")
+        if existing_id != trigger_id:
             return False
         # "complete" blocks reprocessing; "complete_empty" does NOT (manifests may arrive later)
         return status.get("status") == "complete"
@@ -615,49 +620,122 @@ def process_recording(cloud_event):
     data = cloud_event.data
     object_name = data["name"]
 
-    # Guard: only process recording.db
+    # Guard: only process trigger files
+    TRIGGER_FILES = {"recording.db", "recording_complete.json"}
     parts = object_name.split("/")
-    if len(parts) != 3 or parts[0] != "recordings" or parts[2] != "recording.db":
-        log.info("Ignoring non-recording.db object: %s", object_name)
+    if len(parts) != 3 or parts[0] != "recordings" or parts[2] not in TRIGGER_FILES:
+        log.info("Ignoring non-trigger object: %s", object_name)
         return
 
+    trigger_file = parts[2]
     recording_name = parts[1]
-    log.info("Processing recording: %s", recording_name)
+    log.info("Processing recording: %s (trigger: %s)", recording_name, trigger_file)
 
     sessions_prefix = f"sessions/{recording_name}/"
 
-    # Download recording.db for md5
-    db_data = _blob_bytes(object_name)
-    if db_data is None:
-        log.error("Cannot download %s", object_name)
-        return
-    db_md5 = _md5_bytes(db_data)
+    # Determine trigger ID for idempotency
+    if trigger_file == "recording_complete.json":
+        raw = _blob_bytes(object_name)
+        if raw is None:
+            log.error("Cannot download sentinel %s", object_name)
+            return
+        try:
+            sentinel = json.loads(raw)
+        except json.JSONDecodeError:
+            log.error("Invalid sentinel JSON: %s", object_name)
+            return
+        trigger_id = sentinel.get("sentinel_id", "")
+        chunks_expected = sentinel.get("chunks_expected", 0)
+    else:
+        # Legacy recording.db trigger
+        db_data = _blob_bytes(object_name)
+        if db_data is None:
+            log.error("Cannot download %s", object_name)
+            return
+        trigger_id = _md5_bytes(db_data)
+        chunks_expected = 0
 
     # Idempotency check
-    if _check_idempotency(sessions_prefix, db_md5):
-        log.info("Already processed %s (md5=%s), skipping", recording_name, db_md5)
+    if _check_idempotency(sessions_prefix, trigger_id):
+        log.info("Already processed %s (trigger_id=%s), skipping", recording_name, trigger_id)
         return
 
     started_at = datetime.now(timezone.utc).isoformat()
 
-    # Load manifests
+    # Load manifests — for sentinel triggers, retry briefly if none found yet
+    # (chunks may still be landing in GCS due to minor propagation delay)
     manifest_blobs = _list_manifests(recording_name)
+    if not manifest_blobs and trigger_file == "recording_complete.json" and chunks_expected > 0:
+        import time as _time
+        for _retry in range(1, 4):  # up to 3 retries, 15s apart = 45s max
+            log.info(
+                "%s: 0/%d manifests found, waiting 15s (retry %d/3)...",
+                recording_name, chunks_expected, _retry,
+            )
+            _time.sleep(15)
+            manifest_blobs = _list_manifests(recording_name)
+            if manifest_blobs:
+                log.info(
+                    "%s: found %d manifests after retry %d",
+                    recording_name, len(manifest_blobs), _retry,
+                )
+                break
+
     if not manifest_blobs:
-        log.warning("No manifests found for %s — writing provisional status (will retry on next recording.db upload)", recording_name)
+        log.warning("No manifests found for %s — writing provisional status (will retry on next trigger upload)", recording_name)
         # Write "complete_empty" status — this does NOT block reprocessing.
-        # If manifests arrive later and recording.db is re-uploaded (e.g. via
+        # If manifests arrive later and a trigger file is re-uploaded (e.g. via
         # `screencap upload`), the idempotency check will allow reprocessing.
         _upload_json(f"{sessions_prefix}_processing_status.json", {
             "status": "complete_empty",
             "started_at": started_at,
             "completed_at": datetime.now(timezone.utc).isoformat(),
             "processor_version": PROCESSOR_VERSION,
-            "source_db_md5": db_md5,
+            "trigger_id": trigger_id,
+            "trigger_file": trigger_file,
+            "source_db_md5": trigger_id if trigger_file == "recording.db" else None,
             "chunks_found": 0,
             "manifests_found": 0,
-            "note": "No manifests found. Will reprocess if recording.db is re-uploaded after manifests arrive.",
+            "note": "No manifests found. Will reprocess on next trigger upload.",
         })
         return
+
+    # Sentinel-triggered: verify all expected manifests are present
+    if trigger_file == "recording_complete.json" and chunks_expected > 0:
+        # Retry if some manifests are still missing
+        if len(manifest_blobs) < chunks_expected:
+            import time as _time
+            for _retry in range(1, 4):
+                log.info(
+                    "%s: %d/%d manifests found, waiting 15s (retry %d/3)...",
+                    recording_name, len(manifest_blobs), chunks_expected, _retry,
+                )
+                _time.sleep(15)
+                manifest_blobs = _list_manifests(recording_name)
+                if len(manifest_blobs) >= chunks_expected:
+                    log.info("%s: all %d manifests found after retry %d",
+                             recording_name, len(manifest_blobs), _retry)
+                    break
+
+        if len(manifest_blobs) < chunks_expected:
+            log.warning(
+                "%s: expected %d manifests but found %d — provisional status for retry",
+                recording_name, chunks_expected, len(manifest_blobs),
+            )
+            _upload_json(f"{sessions_prefix}_processing_status.json", {
+                "status": "complete_empty",
+                "started_at": started_at,
+                "completed_at": datetime.now(timezone.utc).isoformat(),
+                "processor_version": PROCESSOR_VERSION,
+                "trigger_id": trigger_id,
+                "trigger_file": trigger_file,
+                "chunks_found": len(manifest_blobs),
+                "chunks_expected": chunks_expected,
+                "manifests_found": len(manifest_blobs),
+                "note": f"Expected {chunks_expected} manifests, found {len(manifest_blobs)}. "
+                        "Will reprocess on recording.db upload via screencap upload.",
+            })
+            return
 
     manifests = []
     for blob_name in manifest_blobs:
@@ -743,7 +821,9 @@ def process_recording(cloud_event):
         "started_at": started_at,
         "completed_at": datetime.now(timezone.utc).isoformat(),
         "processor_version": PROCESSOR_VERSION,
-        "source_db_md5": db_md5,
+        "trigger_id": trigger_id,
+        "trigger_file": trigger_file,
+        "source_db_md5": trigger_id if trigger_file == "recording.db" else None,
         "chunks_found": len(manifests),
         "manifests_found": len(manifest_blobs),
         "tasks_before_merge": tasks_before,
