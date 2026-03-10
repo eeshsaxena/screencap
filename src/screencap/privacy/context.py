@@ -1,13 +1,13 @@
 """Context association and classification for privacy v3.
 
-Bridges screenshots to app/window/browser context via timestamp
+Bridges screenshots to app/window context via timestamp
 correlation, then classifies the context for policy decisions.
 
 Owns:
 - screenshot timestamp parsing
 - nearest-event lookup (bisect-based)
 - bundle-ID → ContextClass mapping
-- browser domain evidence
+- domain evidence (via domain field on FrameMetadata)
 - title heuristic enrichment
 - deterministic state machine with temporal hold/decay
 """
@@ -65,19 +65,10 @@ class WindowContext:
     window_id: str = ""
 
 
-@dataclass(frozen=True)
-class BrowserContext:
-    """A browser_event row relevant for context association."""
-
-    timestamp: float
-    url: str
-    domain: str
-
-
 def _active_at_index(timestamps: list[float], target: float) -> int | None:
     """Return index of the latest timestamp at or before target.
 
-    Window/browser events represent state transitions, so the active
+    Window events represent state transitions, so the active
     state at any time T is the most recent event with timestamp <= T.
     Returns None if no event is at or before target.
     """
@@ -115,31 +106,6 @@ def find_nearest_window(
     return window_events[idx]
 
 
-def find_nearest_browser(
-    browser_events: list[BrowserContext],
-    target_ts: float,
-    max_delta: float = 5.0,
-    _timestamps: list[float] | None = None,
-) -> BrowserContext | None:
-    """Find the browser_event active at target_ts within max_delta seconds.
-
-    Uses "latest at or before" semantics since browser events represent
-    state transitions.
-
-    Pass _timestamps to avoid rebuilding the list on every call.
-    """
-    if not browser_events:
-        return None
-    if _timestamps is None:
-        _timestamps = [b.timestamp for b in browser_events]
-    idx = _active_at_index(_timestamps, target_ts)
-    if idx is None:
-        return None
-    if abs(browser_events[idx].timestamp - target_ts) > max_delta:
-        return None
-    return browser_events[idx]
-
-
 # ---------------------------------------------------------------------------
 # DB loaders (raw sqlite3, consistent with screencap layer)
 # ---------------------------------------------------------------------------
@@ -172,48 +138,6 @@ def load_window_events(db_path: Path) -> list[WindowContext]:
         return results
     finally:
         conn.close()
-
-
-def load_browser_events(db_path: Path) -> list[BrowserContext]:
-    """Load browser_event rows sorted by timestamp, extracting URL/domain."""
-    conn = sqlite3.connect(str(db_path))
-    try:
-        cur = conn.cursor()
-        tables = {r[0] for r in cur.execute(
-            "SELECT name FROM sqlite_master WHERE type='table'"
-        ).fetchall()}
-        if "browser_event" not in tables:
-            return []
-        cur.execute(
-            "SELECT timestamp, message FROM browser_event "
-            "WHERE timestamp IS NOT NULL "
-            "ORDER BY timestamp"
-        )
-        results = []
-        for row in cur:
-            ts = float(row[0])
-            message = row[1]
-            url = _extract_url_from_message(message)
-            if url:
-                domain = _domain_from_url(url)
-                results.append(BrowserContext(timestamp=ts, url=url, domain=domain))
-        return results
-    finally:
-        conn.close()
-
-
-def _extract_url_from_message(message) -> str:
-    """Extract URL from a browser_event message (JSON column)."""
-    import json
-
-    if isinstance(message, str):
-        try:
-            message = json.loads(message)
-        except (json.JSONDecodeError, TypeError):
-            return ""
-    if isinstance(message, dict):
-        return message.get("url", "")
-    return ""
 
 
 def _domain_from_url(url: str) -> str:
@@ -530,29 +454,20 @@ class DefaultContextClassifier:
 def associate_screenshot(
     screenshot_ts: float,
     window_events: list[WindowContext],
-    browser_events: list[BrowserContext],
     max_delta: float = 5.0,
     _window_timestamps: list[float] | None = None,
-    _browser_timestamps: list[float] | None = None,
 ) -> FrameMetadata:
     """Build FrameMetadata for a screenshot by finding the active context.
 
-    Uses "latest at or before" semantics: window/browser events are state
+    Uses "latest at or before" semantics: window events are state
     transitions, so the active state at time T is the most recent event
     with timestamp <= T.
-
-    Browser domain is only attached when the contemporaneous window is a
-    known browser. This prevents stale browser domains from leaking into
-    non-browser frames (e.g. after switching from Chrome to Finder), which
-    would cause the policy evaluator's mask_domains check to misfire.
 
     Args:
         screenshot_ts: Unix timestamp of the screenshot.
         window_events: Pre-loaded, sorted window events.
-        browser_events: Pre-loaded, sorted browser events.
         max_delta: Maximum time delta (seconds) for a valid association.
         _window_timestamps: Pre-computed window timestamps (avoids rebuilding per call).
-        _browser_timestamps: Pre-computed browser timestamps (avoids rebuilding per call).
 
     Returns:
         FrameMetadata populated with best-available context.
@@ -561,18 +476,11 @@ def associate_screenshot(
         window_events, screenshot_ts, max_delta, _timestamps=_window_timestamps
     )
 
-    # Only look up browser domain when the window is a known browser.
-    domain: str | None = None
     bundle_id = window.app_bundle_id if window else ""
-    if bundle_id in BROWSER_BUNDLE_IDS:
-        browser = find_nearest_browser(
-            browser_events, screenshot_ts, max_delta, _timestamps=_browser_timestamps
-        )
-        domain = browser.domain if browser else None
 
     return FrameMetadata(
         bundle_id=bundle_id,
         window_title=window.title if window else "",
-        domain=domain,
+        domain=None,
         timestamp=screenshot_ts,
     )

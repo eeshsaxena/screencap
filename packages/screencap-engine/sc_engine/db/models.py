@@ -75,12 +75,6 @@ class Recording(Base):
         order_by="WindowEvent.timestamp",
         cascade="all, delete-orphan",
     )
-    browser_events = sa.orm.relationship(
-        "BrowserEvent",
-        back_populates="recording",
-        order_by="BrowserEvent.timestamp",
-        cascade="all, delete-orphan",
-    )
     audio_info = sa.orm.relationship(
         "AudioInfo", back_populates="recording", cascade="all, delete-orphan",
         order_by="AudioInfo.timestamp",
@@ -101,8 +95,6 @@ class ActionEvent(Base):
     screenshot_id = sa.Column(sa.ForeignKey("screenshot.id"))
     window_event_timestamp = sa.Column(ForceFloat)
     window_event_id = sa.Column(sa.ForeignKey("window_event.id"))
-    browser_event_timestamp = sa.Column(ForceFloat)
-    browser_event_id = sa.Column(sa.ForeignKey("browser_event.id"))
     mouse_x = sa.Column(sa.Numeric(asdecimal=False))
     mouse_y = sa.Column(sa.Numeric(asdecimal=False))
     mouse_dx = sa.Column(sa.Numeric(asdecimal=False))
@@ -134,7 +126,6 @@ class ActionEvent(Base):
     recording = sa.orm.relationship("Recording", back_populates="action_events")
     screenshot = sa.orm.relationship("Screenshot", back_populates="action_event")
     window_event = sa.orm.relationship("WindowEvent", back_populates="action_events")
-    browser_event = sa.orm.relationship("BrowserEvent", back_populates="action_events")
 
     def __str__(self) -> str:
         """Return a string representation of the action event."""
@@ -182,21 +173,6 @@ class WindowEvent(Base):
 
     recording = sa.orm.relationship("Recording", back_populates="window_events")
     action_events = sa.orm.relationship("ActionEvent", back_populates="window_event")
-
-
-class BrowserEvent(Base):
-    """Class representing a browser event in the database."""
-
-    __tablename__ = "browser_event"
-
-    id = sa.Column(sa.Integer, primary_key=True)
-    recording_timestamp = sa.Column(ForceFloat)
-    recording_id = sa.Column(sa.ForeignKey("recording.id"))
-    message = sa.Column(sa.JSON)
-    timestamp = sa.Column(ForceFloat)
-
-    recording = sa.orm.relationship("Recording", back_populates="browser_events")
-    action_events = sa.orm.relationship("ActionEvent", back_populates="browser_event")
 
 
 class Screenshot(Base):

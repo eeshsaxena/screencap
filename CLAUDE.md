@@ -38,7 +38,7 @@ No linting is configured for the root `screencap` package. The vendored sub-pack
 - `viewer.py` — opens `viewer.html` via macOS `open` command.
 
 **Vendored packages (under `packages/`):**
-- `screencap-engine` (`sc_engine`) — multi-process recording (pynput, mss, av/ffmpeg, sounddevice). SQLAlchemy + Alembic for per-capture SQLite DBs. Has its own entry point (`capture`).
+- `screencap-engine` (`sc_engine`) — multi-process recording (pynput, mss, av/ffmpeg, sounddevice). SQLAlchemy for per-capture SQLite DBs. Has its own entry point (`capture`).
 
 The vendored package is co-installed via the root `pyproject.toml` `packages.find.where` — it is NOT a separate pip install.
 
@@ -49,7 +49,7 @@ Two-layer privacy enforcement: capture-time filtering + post-recording scrubbing
 **Core modules:**
 - `actions.py` — `PrivacyAction` enum (EXCLUDE → MASK_WINDOW → MASK_REGION → TEXT_REDACT → OCR_FALLBACK → ALLOW), `ActionDecision` dataclass, `stricter()` comparator.
 - `policy.py` — `PrivacyMode` enum (public/internal), `ContextClass` enum (10 app categories), `_ACTION_MATRIX` mapping every (context, mode) pair to an action, `PrivacyConfig` (parsed from `[privacy]` in config.toml), `DefaultPolicyEvaluator` with 5-level precedence (exclude_apps > allow_apps > mask_domains > mask_title_patterns > matrix).
-- `context.py` — `DefaultContextClassifier` that maps bundle IDs, browser domains, and window titles to `ContextClass`. Includes known bundle ID map (~80 apps), browser domain map, and title heuristics. `associate_screenshot()` correlates screenshot timestamps to window/browser events using bisect-based nearest-event lookup.
+- `context.py` — `DefaultContextClassifier` that maps bundle IDs, browser domains, and window titles to `ContextClass`. Includes known bundle ID map (~80 apps), browser domain map, and title heuristics. `associate_screenshot()` correlates screenshot timestamps to window events using bisect-based nearest-event lookup.
 - `recorder_enforcement.py` — `RecorderPrivacyFilter` for capture-time gating. Observes window events, evaluates policy, blocks screenshots and nulls keystrokes. Multiple independent blocking sources (app_policy, secure_input, secure_field) with per-source hold timers. Starts fail-closed.
 - `masking.py` — Pillow-based screenshot masking (full-window blur) for MASK_WINDOW actions.
 - `reasons.py` — `ReasonCode` constants and `AuditEntry` for traceability.

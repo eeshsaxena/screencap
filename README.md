@@ -85,7 +85,6 @@ Record screen, mouse, keyboard, and optionally audio. Starts immediately with no
 | `--no-video` | Disable video capture |
 | `--no-images` | Disable screenshot capture |
 | `--no-window-data` | Disable window/accessibility data capture |
-| `--no-browser-events` | Disable browser event capture |
 | `--no-auto-name` | Skip LLM naming (prompts for name interactively) |
 | `--local-only` | Restrict LLM naming to local providers (Ollama) |
 | `-o, --output PATH` | Custom output directory (skips directory rename) |

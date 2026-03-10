@@ -2,7 +2,6 @@
 
 from __future__ import annotations
 
-import json
 import sqlite3
 from pathlib import Path
 
@@ -10,13 +9,11 @@ import pytest
 
 from screencap.privacy.context import (
     BROWSER_BUNDLE_IDS,
-    BrowserContext,
     DefaultContextClassifier,
     WindowContext,
     BUNDLE_ID_MAP,
     associate_screenshot,
     find_nearest_window,
-    load_browser_events,
     load_window_events,
     parse_screenshot_timestamp,
 )
@@ -99,7 +96,7 @@ class TestFindNearestWindow:
 
 
 def _create_test_db(tmp_path: Path) -> Path:
-    """Create a test SQLite DB with window_event and browser_event tables."""
+    """Create a test SQLite DB with window_event table."""
     db_path = tmp_path / "recording.db"
     conn = sqlite3.connect(str(db_path))
     cur = conn.cursor()
@@ -118,15 +115,6 @@ def _create_test_db(tmp_path: Path) -> Path:
             window_id TEXT,
             app_bundle_id TEXT,
             app_version TEXT
-        )
-    """)
-    cur.execute("""
-        CREATE TABLE browser_event (
-            id INTEGER PRIMARY KEY,
-            recording_id INTEGER,
-            recording_timestamp REAL,
-            message TEXT,
-            timestamp REAL
         )
     """)
     conn.commit()
@@ -178,34 +166,6 @@ class TestLoadWindowEvents:
         conn.commit()
         conn.close()
         assert len(load_window_events(db_path)) == 1
-
-
-class TestLoadBrowserEvents:
-    def test_extracts_url_and_domain_from_json_message(self, tmp_path):
-        db_path = _create_test_db(tmp_path)
-        conn = sqlite3.connect(str(db_path))
-        msg = json.dumps({"url": "https://mail.google.com/inbox", "type": "browser.click"})
-        conn.execute(
-            "INSERT INTO browser_event (timestamp, message) VALUES (1.0, ?)", (msg,)
-        )
-        conn.commit()
-        conn.close()
-
-        events = load_browser_events(db_path)
-        assert len(events) == 1
-        assert events[0].domain == "mail.google.com"
-        assert events[0].url == "https://mail.google.com/inbox"
-
-    def test_skips_events_without_url(self, tmp_path):
-        db_path = _create_test_db(tmp_path)
-        conn = sqlite3.connect(str(db_path))
-        conn.execute(
-            "INSERT INTO browser_event (timestamp, message) VALUES (1.0, ?)",
-            (json.dumps({"type": "scroll"}),),
-        )
-        conn.commit()
-        conn.close()
-        assert load_browser_events(db_path) == []
 
 
 # ---------------------------------------------------------------------------
@@ -318,33 +278,26 @@ class TestDefaultContextClassifier:
 
 
 class TestAssociateScreenshot:
-    def test_correlates_window_and_browser_by_timestamp(self):
+    def test_correlates_window_by_timestamp(self):
         windows = [
             WindowContext(timestamp=1.0, app_bundle_id="com.google.Chrome", title="Gmail"),
         ]
-        browsers = [
-            BrowserContext(timestamp=1.0, url="https://mail.google.com", domain="mail.google.com"),
-        ]
-        meta = associate_screenshot(1.5, windows, browsers)
+        meta = associate_screenshot(1.5, windows)
         assert meta.bundle_id == "com.google.Chrome"
-        assert meta.domain == "mail.google.com"
+        assert meta.domain is None
         assert meta.timestamp == 1.5
 
     def test_no_events_returns_empty_metadata(self):
-        meta = associate_screenshot(1.0, [], [])
+        meta = associate_screenshot(1.0, [])
         assert meta.bundle_id == ""
         assert meta.domain is None
 
-    def test_non_browser_window_does_not_inherit_stale_browser_domain(self):
-        """Switching from Chrome to Finder must not carry the browser domain."""
+    def test_non_browser_window(self):
+        """Switching from Chrome to Finder picks up the correct window."""
         windows = [
             WindowContext(timestamp=8.0, app_bundle_id="com.google.Chrome", title="Gmail"),
             WindowContext(timestamp=10.0, app_bundle_id="com.apple.Finder", title="Documents"),
         ]
-        browsers = [
-            BrowserContext(timestamp=8.0, url="https://chase.com", domain="chase.com"),
-        ]
-        # Screenshot at t=10 — Finder is active, browser event is within max_delta
-        meta = associate_screenshot(10.0, windows, browsers)
+        meta = associate_screenshot(10.0, windows)
         assert meta.bundle_id == "com.apple.Finder"
-        assert meta.domain is None  # must NOT be "chase.com"
+        assert meta.domain is None

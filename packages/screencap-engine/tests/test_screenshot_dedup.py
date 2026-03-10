@@ -126,7 +126,6 @@ def _run_process_events(events: list[Event], screen_filter=None):
     screen_wq = mock.MagicMock(spec=SynchronizedQueue)
     action_wq = mock.MagicMock(spec=SynchronizedQueue)
     window_wq = mock.MagicMock(spec=SynchronizedQueue)
-    browser_wq = mock.MagicMock(spec=SynchronizedQueue)
     video_wq = mock.MagicMock(spec=SynchronizedQueue)
     perf_q = mock.MagicMock(spec=SynchronizedQueue)
 
@@ -136,7 +135,6 @@ def _run_process_events(events: list[Event], screen_filter=None):
     num_screen = multiprocessing.Value("i", 0)
     num_action = multiprocessing.Value("i", 0)
     num_window = multiprocessing.Value("i", 0)
-    num_browser = multiprocessing.Value("i", 0)
     num_video = multiprocessing.Value("i", 0)
 
     # Mock process_event to always succeed and capture what's written
@@ -166,9 +164,9 @@ def _run_process_events(events: list[Event], screen_filter=None):
         rec_mod._drop_counts = {}
 
         process_events(
-            event_q, screen_wq, action_wq, window_wq, browser_wq, video_wq,
+            event_q, screen_wq, action_wq, window_wq, video_wq,
             perf_q, recording, terminate, started,
-            num_screen, num_action, num_window, num_browser, num_video,
+            num_screen, num_action, num_window, num_video,
             screen_filter=screen_filter,
         )
         drops = dict(rec_mod._drop_counts)
@@ -587,7 +585,7 @@ class TestSettleFrameSavesAfterScrollSilence:
         terminate = multiprocessing.Event()
         started = threading.Event()
         nums = {k: multiprocessing.Value("i", 0) for k in
-                ["screen", "action", "window", "browser", "video"]}
+                ["screen", "action", "window", "video"]}
 
         def set_terminate():
             time.sleep(0.1)
@@ -610,10 +608,9 @@ class TestSettleFrameSavesAfterScrollSilence:
                 mock.MagicMock(spec=SynchronizedQueue),
                 mock.MagicMock(spec=SynchronizedQueue),
                 mock.MagicMock(spec=SynchronizedQueue),
-                mock.MagicMock(spec=SynchronizedQueue),
                 recording, terminate, started,
                 nums["screen"], nums["action"], nums["window"],
-                nums["browser"], nums["video"],
+                nums["video"],
             )
             drops = dict(rec_mod._drop_counts)
             rec_mod._drop_counts = old_drops

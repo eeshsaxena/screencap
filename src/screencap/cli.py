@@ -141,7 +141,6 @@ def _maybe_prompt_privacy_setup() -> None:
 @click.option("--no-video", is_flag=True, default=False, help="Disable video capture.")
 @click.option("--no-images", is_flag=True, default=False, help="Disable screenshot capture.")
 @click.option("--no-window-data", is_flag=True, default=False, help="Disable window/accessibility data.")
-@click.option("--no-browser-events", is_flag=True, default=False, help="Disable browser event capture.")
 @click.option("--output", "-o", type=click.Path(), default=None, help="Custom output directory.")
 @click.option("--no-wifi-metrics", is_flag=True, default=False, help="Disable WiFi metrics collection.")
 @click.option("--no-app-versions", is_flag=True, default=False, help="Disable running app version capture.")
@@ -159,7 +158,7 @@ def _maybe_prompt_privacy_setup() -> None:
               help="Record for local use only (uses configured privacy mode).")
 def start(
     name, description, no_audio, no_video, no_images, no_window_data,
-    no_browser_events, output, no_wifi_metrics, no_app_versions,
+    output, no_wifi_metrics, no_app_versions,
     no_auto_name, local_only, force, verbose, chunk_duration, no_live_upload,
     destination,
 ):
@@ -193,8 +192,6 @@ def start(
     capture_video = False if no_video else None  # None = use upstream default (True)
     capture_images = False if no_images else True  # Default ON (overrides upstream False)
     capture_window_data = False if no_window_data else None  # None = upstream default (True)
-    capture_browser_events = False if no_browser_events else None  # None = upstream default (False)
-
     # First-run privacy setup detection
     _maybe_prompt_privacy_setup()
 
@@ -250,7 +247,7 @@ def start(
             name, description or None, audio, output,
             wifi_metrics=wifi_metrics, app_versions=app_versions, force_clean=force,
             capture_video=capture_video, capture_images=capture_images,
-            capture_window_data=capture_window_data, capture_browser_events=capture_browser_events,
+            capture_window_data=capture_window_data,
             verbose=verbose,
             chunk_duration=chunk_duration,
             live_upload=not no_live_upload,
