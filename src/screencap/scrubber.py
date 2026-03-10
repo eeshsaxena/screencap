@@ -85,27 +85,18 @@ def _build_blocked_intervals(
     window_events,
     evaluator,
     classifier,
-    browser_events=None,
 ) -> list[_BlockedInterval]:
     """Build intervals where the frontmost app triggers EXCLUDE or MASK_WINDOW.
 
     Each window event defines a period from its timestamp to the next
     window event's timestamp (or infinity for the last event).
     """
-    from screencap.privacy.context import (
-        BROWSER_BUNDLE_IDS,
-        find_nearest_browser,
-    )
     from screencap.privacy.policy import FrameMetadata
 
     if not window_events:
         return []
 
     intervals: list[_BlockedInterval] = []
-    browser_events = browser_events or []
-
-    # Pre-compute browser timestamps once for all lookups
-    browser_timestamps = [b.timestamp for b in browser_events]
 
     for i, we in enumerate(window_events):
         end_ts = (
@@ -114,19 +105,10 @@ def _build_blocked_intervals(
             else float("inf")
         )
 
-        # Build FrameMetadata directly — we already have the window event
-        domain: str | None = None
-        if we.app_bundle_id in BROWSER_BUNDLE_IDS and browser_events:
-            browser = find_nearest_browser(
-                browser_events, we.timestamp,
-                _timestamps=browser_timestamps,
-            )
-            domain = browser.domain if browser else None
-
         meta = FrameMetadata(
             bundle_id=we.app_bundle_id,
             window_title=we.title,
-            domain=domain,
+            domain=None,
             timestamp=we.timestamp,
         )
         ctx = classifier.classify(meta)
@@ -274,7 +256,6 @@ def _scrub_screenshots_with_policy(
     evaluator,
     classifier,
     window_events,
-    browser_events,
     result: ScrubResult,
 ) -> None:
     """Route screenshot files by policy/context.
@@ -297,7 +278,6 @@ def _scrub_screenshots_with_policy(
 
     # Pre-compute timestamp lists once for all screenshot lookups
     window_timestamps = [w.timestamp for w in window_events] if window_events else []
-    browser_timestamps = [b.timestamp for b in browser_events] if browser_events else []
 
     for img_path in sorted(screenshots_dir.glob("*.jpg")):
         ts = parse_screenshot_timestamp(img_path.name)
@@ -305,9 +285,8 @@ def _scrub_screenshots_with_policy(
             continue
 
         meta = associate_screenshot(
-            ts, window_events, browser_events,
+            ts, window_events,
             _window_timestamps=window_timestamps,
-            _browser_timestamps=browser_timestamps,
         )
         ctx = classifier.classify(meta)
         decision = evaluator.evaluate(ctx, meta)
@@ -661,10 +640,6 @@ def _scrub_recording_schema(
     if "window_event" in tables:
         _try_scrub_text_column(conn, "window_event", "title", pipeline, anonymizer, result)
         _try_scrub_json_column(conn, "window_event", "state", pipeline, anonymizer, result)
-
-    if "browser_event" in tables:
-        _try_scrub_json_column(conn, "browser_event", "message", pipeline, anonymizer, result)
-
 
 def _scrub_capture_schema(
     conn: sqlite3.Connection,
@@ -1214,7 +1189,6 @@ def scrub_recording(
         from screencap.config import get_privacy_config
         from screencap.privacy.context import (
             DefaultContextClassifier,
-            load_browser_events,
             load_window_events,
         )
         from screencap.privacy.policy import (
@@ -1247,10 +1221,9 @@ def scrub_recording(
         try:
             db_path = find_db(dst)
             window_events = load_window_events(db_path) if db_path else []
-            browser_events = load_browser_events(db_path) if db_path else []
 
             blocked_intervals = _build_blocked_intervals(
-                window_events, evaluator, classifier, browser_events
+                window_events, evaluator, classifier
             )
 
             # Build secure-field intervals from AXSecureTextField in element_state
@@ -1265,13 +1238,12 @@ def scrub_recording(
                 f"policy-aware screenshot routing will be skipped[/]"
             )
             window_events = []
-            browser_events = []
 
     # 10. Policy-aware screenshot routing
     if evaluator and classifier:
         with console.status("Routing screenshots by policy..."):
             _scrub_screenshots_with_policy(
-                dst, evaluator, classifier, window_events, browser_events, result
+                dst, evaluator, classifier, window_events, result
             )
 
     # 11. Null DB rows during blocked-app intervals

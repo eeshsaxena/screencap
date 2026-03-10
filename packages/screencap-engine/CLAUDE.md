@@ -14,8 +14,8 @@ Key responsibilities:
 ## Quick Commands
 
 ```bash
-# Run tests (exclude browser bridge tests which need websockets fixtures)
-pytest tests/ -v --ignore=tests/test_browser_bridge.py
+# Run tests
+pytest tests/ -v
 
 # Run slow integration tests (requires accessibility permissions)
 pytest tests/ -v -m slow
@@ -57,7 +57,6 @@ sc_engine/
   audio.py         # Audio recording + transcription
   visualize/       # Demo GIF and HTML viewer generation
   share.py         # Magic Wormhole sharing
-  browser_bridge.py # Browser extension integration
   cli.py           # CLI commands (capture record, capture info, capture share)
 ```
 
@@ -91,11 +90,11 @@ SQLAlchemy-based per-capture databases:
 
 ```bash
 # Fast tests (unit + integration, no recording)
-pytest tests/ -v --ignore=tests/test_browser_bridge.py -m "not slow"
+pytest tests/ -v -m "not slow"
 
 # Slow tests (full recording pipeline with pynput synthetic input)
 pytest tests/ -v -m slow
 
 # All tests
-pytest tests/ -v --ignore=tests/test_browser_bridge.py
+pytest tests/ -v
 ```

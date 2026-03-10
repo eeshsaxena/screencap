@@ -381,7 +381,6 @@ def start_recording(
     capture_video: bool | None = None,
     capture_images: bool | None = None,
     capture_window_data: bool | None = None,
-    capture_browser_events: bool | None = None,
     verbose: bool = False,
     chunk_duration: float | None = None,
     live_upload: bool = True,
@@ -607,8 +606,6 @@ def start_recording(
             recorder_kwargs["capture_images"] = capture_images
         if capture_window_data is not None:
             recorder_kwargs["capture_window_data"] = capture_window_data
-        if capture_browser_events is not None:
-            recorder_kwargs["capture_browser_events"] = capture_browser_events
         if chunking_enabled:
             recorder_kwargs["video_chunk_duration"] = chunk_duration
 

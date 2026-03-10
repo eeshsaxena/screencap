@@ -36,7 +36,6 @@ class Settings(BaseSettings):
     RECORD_READ_ACTIVE_ELEMENT_STATE: bool = True
     RECORD_VIDEO: bool = True
     RECORD_AUDIO: bool = False
-    RECORD_BROWSER_EVENTS: bool = False
     # if false, only write video events corresponding to screenshots
     RECORD_FULL_VIDEO: bool = False
     RECORD_IMAGES: bool = False
@@ -91,11 +90,6 @@ class Settings(BaseSettings):
     # Performance plotting
     PLOT_PERFORMANCE: bool = True
 
-    # Browser Events Record (extension) configurations
-    BROWSER_WEBSOCKET_SERVER_IP: str = "localhost"
-    BROWSER_WEBSOCKET_PORT: int = 8765
-    BROWSER_WEBSOCKET_MAX_SIZE: int = 2**22  # 4MB
-
     # Database
     DB_ECHO: bool = False
 
@@ -121,7 +115,6 @@ _FIELD_TO_CONFIG_ATTR = {
     "capture_audio": "RECORD_AUDIO",
     "capture_images": "RECORD_IMAGES",
     "capture_window_data": "RECORD_WINDOW_DATA",
-    "capture_browser_events": "RECORD_BROWSER_EVENTS",
     "capture_full_video": "RECORD_FULL_VIDEO",
     "video_encoding": "VIDEO_ENCODING",
     "video_pixel_format": "VIDEO_PIXEL_FORMAT",
@@ -159,7 +152,6 @@ class RecordingConfig:
     capture_audio: bool | None = None
     capture_images: bool | None = None
     capture_window_data: bool | None = None
-    capture_browser_events: bool | None = None
     capture_full_video: bool | None = None
     video_encoding: str | None = None
     video_pixel_format: str | None = None

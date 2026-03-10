@@ -14,7 +14,6 @@ from sqlalchemy.orm import Session as SaSession
 from sc_engine.db.models import (
     ActionEvent,
     AudioInfo,
-    BrowserEvent,
     MemoryStat,
     PerformanceStat,
     Recording,
@@ -30,7 +29,6 @@ BATCH_SIZE = 1  # default; recorder overrides to 50 for throughput
 action_events = []
 screenshots = []
 window_events = []
-browser_events = []
 performance_stats = []
 memory_stats = []
 
@@ -87,7 +85,6 @@ def flush_buffers(session: SaSession) -> None:
         (action_events, ActionEvent),
         (screenshots, Screenshot),
         (window_events, WindowEvent),
-        (browser_events, BrowserEvent),
         (performance_stats, PerformanceStat),
         (memory_stats, MemoryStat),
     ]
@@ -167,29 +164,6 @@ def insert_window_event(
         "recording_timestamp": recording.timestamp,
     }
     _insert(session, event_data, WindowEvent, window_events)
-
-
-def insert_browser_event(
-    session: SaSession,
-    recording: Recording,
-    event_timestamp: int,
-    event_data: dict[str, Any],
-) -> None:
-    """Insert a browser event into the database.
-
-    Args:
-        session (sa.orm.Session): The database session.
-        recording (Recording): The recording object.
-        event_timestamp (int): The timestamp of the event.
-        event_data (dict): The data of the event.
-    """
-    event_data = {
-        **event_data,
-        "timestamp": event_timestamp,
-        "recording_id": recording.id,
-        "recording_timestamp": recording.timestamp,
-    }
-    _insert(session, event_data, BrowserEvent, browser_events)
 
 
 def insert_perf_stat(
@@ -355,17 +329,12 @@ def post_process_events(session: SaSession, recording: Recording) -> None:
     screenshots_list = _get(session, Screenshot, recording.id)
     action_events_list = _get(session, ActionEvent, recording.id)
     window_events_list = _get(session, WindowEvent, recording.id)
-    browser_events_list = _get(session, BrowserEvent, recording.id)
 
     screenshot_timestamp_to_id_map = {
         screenshot.timestamp: screenshot.id for screenshot in screenshots_list
     }
     window_event_timestamp_to_id_map = {
         window_event.timestamp: window_event.id for window_event in window_events_list
-    }
-    browser_event_timestamp_to_id_map = {
-        browser_event.timestamp: browser_event.id
-        for browser_event in browser_events_list
     }
 
     for action_event in action_events_list:
@@ -374,8 +343,5 @@ def post_process_events(session: SaSession, recording: Recording) -> None:
         )
         action_event.window_event_id = window_event_timestamp_to_id_map.get(
             action_event.window_event_timestamp
-        )
-        action_event.browser_event_id = browser_event_timestamp_to_id_map.get(
-            action_event.browser_event_timestamp
         )
     session.commit()
