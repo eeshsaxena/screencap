@@ -18,6 +18,21 @@ if TYPE_CHECKING:
     from sc_engine.capture import CaptureSession
 
 
+def _even_indices(n: int, k: int) -> list[int]:
+    """Return k evenly-spaced indices in [0, n-1]."""
+    if k <= 0:
+        return []
+    if k == 1:
+        return [0]
+    return [round(i * (n - 1) / (k - 1)) for i in range(k)]
+
+
+# Default caps for CLI-generated viewers (both screencap and capture CLIs).
+DEFAULT_VIEWER_MAX_EVENTS = 500
+DEFAULT_VIEWER_FRAME_SCALE = 0.5
+DEFAULT_VIEWER_FRAME_QUALITY = 75
+
+
 def create_html(
     capture_or_path: "CaptureSession | str | Path",
     output: str | Path | None = None,
@@ -25,7 +40,7 @@ def create_html(
     include_audio: bool = True,
     frame_scale: float = 1.0,
     frame_quality: int = 85,
-) -> str:
+) -> str | None:
     """Generate an interactive HTML viewer for a capture recording.
 
     Args:
@@ -40,6 +55,10 @@ def create_html(
         HTML string if output is None, otherwise None after writing file.
     """
     from sc_engine.capture import CaptureSession
+
+    # Treat 0 or negative as "no limit"
+    if max_events is not None and max_events <= 0:
+        max_events = None
 
     # Load capture if path provided
     if isinstance(capture_or_path, (str, Path)):
@@ -72,11 +91,35 @@ def create_html(
         else:
             actions.append(a)
 
+    total_actions = len(actions)
+    downsampled = False
     if max_events is not None and len(actions) > max_events:
-        # Sample evenly
-        step = len(actions) / max_events
-        indices = [int(i * step) for i in range(max_events)]
-        actions = [actions[i] for i in indices]
+        # Type-aware downsampling: keep ALL non-move events, sample moves
+        non_moves = []
+        moves = []
+        for idx, a in enumerate(actions):
+            evt_type = a.type if isinstance(a.type, str) else a.type.value
+            if "move" in evt_type.lower():
+                moves.append((idx, a))
+            else:
+                non_moves.append((idx, a))
+
+        if len(non_moves) >= max_events:
+            # More non-move events than budget — uniform sample non-moves
+            sampled = [non_moves[i] for i in _even_indices(len(non_moves), max_events)]
+        else:
+            # Keep all non-moves, fill remaining budget with sampled moves
+            remaining = max_events - len(non_moves)
+            if remaining > 0 and moves:
+                sampled_moves = [moves[i] for i in _even_indices(len(moves), remaining)]
+            else:
+                sampled_moves = []
+            sampled = non_moves + sampled_moves
+
+        # Re-sort by original index to maintain chronological order
+        sampled.sort(key=lambda x: x[0])
+        actions = [a for _, a in sampled]
+        downsampled = True
 
     # Prepare frame data
     frames_data = []
@@ -208,6 +251,13 @@ def create_html(
 
         events_data.append(event_dict)
 
+    # Disable audio when downsampled — misaligned full audio is worse than none
+    if downsampled and include_audio:
+        include_audio = False
+        audio_omitted = True
+    else:
+        audio_omitted = False
+
     # Prepare audio data and get audio duration
     audio_b64 = ""
     audio_type = ""
@@ -280,6 +330,9 @@ def create_html(
         screen_height=screen_height,
         pixel_ratio=pixel_ratio,
         transcript=transcript,
+        downsampled=downsampled,
+        total_events=total_actions,
+        audio_omitted=audio_omitted,
     )
 
     if output is not None:
@@ -326,6 +379,9 @@ def _generate_html(
     screen_height: int,
     pixel_ratio: float,
     transcript: str = "",
+    downsampled: bool = False,
+    total_events: int = 0,
+    audio_omitted: bool = False,
 ) -> str:
     """Generate the complete HTML viewer content."""
     minutes = int(duration // 60)
@@ -355,6 +411,20 @@ def _generate_html(
             '</div>'
         )
 
+    banner_html = ""
+    if downsampled:
+        shown = len(events_data)
+        parts = [f"Showing {shown} of {total_events} events (downsampled)"]
+        if audio_omitted:
+            parts.append("audio omitted")
+        banner_text = " &mdash; ".join(parts)
+        banner_html = (
+            '<div class="downsample-banner">'
+            f'{banner_text}. '
+            'Regenerate with <code>screencap view --regenerate --max-events 0</code> for full data.'
+            '</div>'
+        )
+
     html = f'''<!DOCTYPE html>
 <html lang="en">
 <head>
@@ -379,6 +449,10 @@ def _generate_html(
 }}
 *{{ box-sizing:border-box; margin:0; padding:0; }}
 body {{ font-family:'Outfit',-apple-system,BlinkMacSystemFont,sans-serif; background:var(--bg-0); color:var(--text-1); height:100vh; overflow:hidden; display:flex; flex-direction:column; line-height:1.4; }}
+
+/* Downsample banner */
+.downsample-banner {{ background:rgba(250,204,21,0.12); border:1px solid rgba(250,204,21,0.25); color:rgba(250,204,21,0.9); font-size:0.78rem; padding:8px 16px; text-align:center; flex-shrink:0; }}
+.downsample-banner code {{ background:rgba(255,255,255,0.08); padding:2px 6px; border-radius:4px; font-family:'JetBrains Mono',monospace; font-size:0.72rem; }}
 
 /* Layout */
 .app {{ flex:1; display:flex; min-height:0; }}
@@ -503,7 +577,7 @@ body {{ font-family:'Outfit',-apple-system,BlinkMacSystemFont,sans-serif; backgr
 </style>
 </head>
 <body>
-<div class="app">
+{banner_html}<div class="app">
     <aside class="panel-left">
         <div class="panel-header">
             <div>

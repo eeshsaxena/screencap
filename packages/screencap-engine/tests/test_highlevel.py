@@ -544,6 +544,125 @@ class TestPixelRatio:
         assert "const pixelRatio=2.0;" in html
 
 
+class TestViewerDownsampling:
+    """Tests for type-aware downsampling in create_html.
+
+    Uses a mock CaptureSession to control the action mix precisely,
+    since the processing pipeline merges raw moves too aggressively
+    for integration-level control.
+    """
+
+    @staticmethod
+    def _make_fake_action(event_type, timestamp, x=100.0, y=100.0):
+        """Create a minimal action-like object for create_html."""
+        from unittest.mock import MagicMock
+        action = MagicMock()
+        action.type = event_type
+        action.timestamp = timestamp
+        action.x = x
+        action.y = y
+        action.screenshot = None
+        action.window_title = None
+        action.window_data = None
+        action.element_state = None
+        action.text = None if "click" in event_type or "move" in event_type else "a"
+        action.keys = None
+        action.button = "left" if "click" in event_type else None
+        action.event = MagicMock()
+        action.event.dx = 0
+        action.event.dy = 0
+        action.event.key_name = None
+        action.event.key_char = None
+        action.event.key_vk = None
+        action.event.modifier_flags = 0
+        action.event.children = []
+        action.event.scroll_phase = None
+        action.event.momentum_phase = None
+        action.event.is_continuous = None
+        action.event.pressure = None
+        action.event.magnification = None
+        action.event.rotation = None
+        return action
+
+    @staticmethod
+    def _make_capture(actions):
+        """Create a mock CaptureSession with controlled actions."""
+        from unittest.mock import MagicMock
+
+        capture = MagicMock()
+        capture.id = "test-capture"
+        capture.duration = 100.0
+        capture.screen_size = (1920, 1080)
+        capture.pixel_ratio = 1.0
+        capture.audio_start_time = None
+        capture.video_path = None
+        capture.capture_dir = Path("/tmp/fake-capture")
+        capture._recording.timestamp = actions[0].timestamp if actions else time.time()
+        capture._recording.video_start_time = None
+        capture.actions.return_value = actions
+        return capture
+
+    def test_type_aware_keeps_all_clicks_samples_moves(self):
+        """With 30 clicks + 100 moves and budget 50, all 30 clicks kept, 20 moves sampled."""
+        from sc_engine.visualize.html import create_html
+
+        ts = time.time()
+        clicks = [self._make_fake_action("mouse.singleclick", ts + i) for i in range(30)]
+        moves = [self._make_fake_action("mouse.move", ts + 30 + 0.5 * i) for i in range(100)]
+        all_actions = clicks + moves
+
+        capture = self._make_capture(all_actions)
+        html = create_html(capture, max_events=50)
+
+        import json
+        import re
+
+        match = re.search(r"const events=(\[.*?\]);", html, re.DOTALL)
+        assert match, "Could not find events data in HTML"
+        events = json.loads(match.group(1))
+
+        click_events = [e for e in events if "click" in e.get("type", "")]
+        move_events = [e for e in events if "move" in e.get("type", "")]
+
+        # All 30 clicks preserved (type-aware guarantee)
+        assert len(click_events) == 30
+        # Remaining 20 slots filled with sampled moves
+        assert len(move_events) == 20
+        # Banner and audio omission present
+        assert "(downsampled)" in html
+        assert "audio omitted" in html
+
+    def test_no_downsampling_when_under_budget(self):
+        """Events under max_events are not downsampled and show no banner."""
+        from sc_engine.visualize.html import create_html
+
+        ts = time.time()
+        actions = [self._make_fake_action("mouse.singleclick", ts + i) for i in range(10)]
+        capture = self._make_capture(actions)
+
+        html = create_html(capture, max_events=50)
+
+        assert "(downsampled)" not in html
+
+    def test_all_non_moves_exceed_budget_samples_uniformly(self):
+        """When clicks alone exceed budget, they are uniformly sampled."""
+        from sc_engine.visualize.html import create_html
+
+        ts = time.time()
+        actions = [self._make_fake_action("mouse.singleclick", ts + i) for i in range(100)]
+        capture = self._make_capture(actions)
+
+        html = create_html(capture, max_events=40)
+
+        import json
+        import re
+
+        match = re.search(r"const events=(\[.*?\]);", html, re.DOTALL)
+        events = json.loads(match.group(1))
+        click_events = [e for e in events if "click" in e.get("type", "")]
+        assert len(click_events) == 40
+
+
 class TestRecordingConfig:
     """Tests for RecordingConfig and config_override."""
 
