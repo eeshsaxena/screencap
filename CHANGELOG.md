@@ -5,6 +5,32 @@ All notable changes to this project will be documented in this file.
 The format is based on [Keep a Changelog](https://keepachangelog.com/),
 and this project adheres to [Semantic Versioning](https://semver.org/).
 
+## [0.9.2] - 2026-03-10
+
+### Added
+- **privacy:** Run PII pipeline on browser_url during DB scrub
+- **privacy:** Propagate browser domain through capture, export, and scrub pipelines
+- **sc_engine:** AX browser URL extraction + domain on WindowSwitchEvent
+- Graceful stop via SIGTERM, hard exit, and sentinel recovery in CLI
+- Upload sentinel after graceful recording stop to trigger stitching
+- Write local sentinel on force-exit and exception paths
+- Add SIGTERM handler for graceful stop via `screencap stop`
+- Add manifest retry logic for sentinel-triggered processing
+- Support recording_complete.json as stitching trigger
+- Add sentinel data builder and upload function
+- Make GCS bucket name configurable via SCREENCAP_BUCKET env var
+- Add python-dotenv dependency and auto-load .env at CLI entry
+
+### Fixed
+- Patch late-arriving browser_url onto deduplicated window events
+- Preserve recording_complete.json in stub_recording
+- Address code review findings from todo audit
+- Downgrade normal shutdown log messages from warning to debug
+- Drain and close chunk queues in screencap recorder on shutdown
+- Clean up Recorder class queues on context manager exit
+- Clean up multiprocessing queues after record() finishes
+- Resolve import errors and constructor mismatch in exporter
+
 ## [0.9.1] - 2026-03-10
 
 ### Added
