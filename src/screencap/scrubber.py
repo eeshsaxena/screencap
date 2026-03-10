@@ -108,7 +108,7 @@ def _build_blocked_intervals(
         meta = FrameMetadata(
             bundle_id=we.app_bundle_id,
             window_title=we.title,
-            domain=None,
+            domain=we.domain,
             timestamp=we.timestamp,
         )
         ctx = classifier.classify(meta)
@@ -370,11 +370,15 @@ def _scrub_screenshots_with_policy(
 def _null_event_content(event: dict) -> None:
     """Null out sensitive content fields in an event dict in-place (recursive).
 
-    Handles nested structures like key.type inside mouse.drag.children.
+    Handles nested structures like key.type inside mouse.drag.children,
+    and window.switch title/domain fields.
     """
     for field in KEYSTROKE_CONTENT_FIELDS:
         if field in event:
             event[field] = None
+    if event.get("type") == "window.switch":
+        event["window_title"] = None
+        event["domain"] = None
     for child in event.get("children", []):
         _null_event_content(child)
 
@@ -409,6 +413,17 @@ def _null_db_rows_for_intervals(
         null_fields = sorted(f for f in KEYSTROKE_CONTENT_FIELDS if f in ae_cols)
         ae_set_clause = ", ".join(f"{f} = NULL" for f in null_fields)
 
+        # Build window_event SET clause — include browser_url if column exists
+        we_null_cols = ["title", "state"]
+        if "window_event" in tables:
+            we_cols = {
+                r[1]
+                for r in conn.execute("PRAGMA table_info(window_event)").fetchall()
+            }
+            if "browser_url" in we_cols:
+                we_null_cols.append("browser_url")
+        we_set_clause = ", ".join(f"{c} = NULL" for c in we_null_cols)
+
         for iv in intervals:
             if iv.end == float("inf"):
                 ae_sql = (
@@ -417,8 +432,7 @@ def _null_db_rows_for_intervals(
                 )
                 ae_params = (iv.start,)
                 we_sql = (
-                    "UPDATE window_event SET "
-                    "title = NULL, state = NULL "
+                    f"UPDATE window_event SET {we_set_clause} "
                     "WHERE timestamp >= ?"
                 )
                 we_params = (iv.start,)
@@ -429,8 +443,7 @@ def _null_db_rows_for_intervals(
                 )
                 ae_params = (iv.start, iv.end)
                 we_sql = (
-                    "UPDATE window_event SET "
-                    "title = NULL, state = NULL "
+                    f"UPDATE window_event SET {we_set_clause} "
                     "WHERE timestamp >= ? AND timestamp < ?"
                 )
                 we_params = (iv.start, iv.end)
@@ -640,6 +653,8 @@ def _scrub_recording_schema(
     if "window_event" in tables:
         _try_scrub_text_column(conn, "window_event", "title", pipeline, anonymizer, result)
         _try_scrub_json_column(conn, "window_event", "state", pipeline, anonymizer, result)
+        _try_scrub_text_column(conn, "window_event", "browser_url", pipeline, anonymizer, result)
+
 
 def _scrub_capture_schema(
     conn: sqlite3.Connection,

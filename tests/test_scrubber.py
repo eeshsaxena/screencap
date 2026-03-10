@@ -118,11 +118,12 @@ def recording_dir(tmp_path):
 
     db.execute(
         """CREATE TABLE window_event (
-        id INTEGER PRIMARY KEY, recording_id INTEGER, title TEXT
+        id INTEGER PRIMARY KEY, recording_id INTEGER, title TEXT, browser_url TEXT
     )"""
     )
     db.execute(
-        "INSERT INTO window_event VALUES (1, 1, 'Chrome - john.doe@example.com')"
+        "INSERT INTO window_event VALUES (1, 1, 'Chrome - john.doe@example.com', "
+        "'https://example.com/profile?email=john.doe@example.com')"
     )
 
     # Screenshot BLOBs (should be deleted, not scrubbed)
@@ -310,6 +311,11 @@ def test_scrub_recording_schema(recording_dir, tmp_path, pipeline_and_anonymizer
     cur.execute("SELECT title FROM window_event")
     title = cur.fetchone()[0]
     assert "john.doe@example.com" not in title
+
+    # window_event.browser_url scrubbed (PII in query params redacted)
+    cur.execute("SELECT browser_url FROM window_event")
+    url = cur.fetchone()[0]
+    assert "john.doe@example.com" not in url
 
     # screenshot table emptied
     cur.execute("SELECT COUNT(*) FROM screenshot")
