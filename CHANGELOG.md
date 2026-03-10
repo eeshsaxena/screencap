@@ -9,119 +9,35 @@ and this project adheres to [Semantic Versioning](https://semver.org/).
 
 ### Added
 
-- **docs:** Add Export System section to CLAUDE.md and fix CLI export tests
-- **scrub:** Update scrubbing pipeline for unified event format
-- **chunk:** Upgrade chunk processor to use unified event pipeline
-- **export:** Integrate window.switch events into CLI export pipeline
-- **events:** Add shared pipeline foundation for unified event export
-- Enable action-aware retention by default
-- Variable-rate capture with per-action-type gating
-- Video redaction for cloud upload
-- **privacy:** Add upload_default step to setup wizard
-- **privacy:** Gate uploads on recording intent
-- **privacy:** Add per-recording cloud/local intent with mode forcing
-- **privacy:** Replace setup wizard with curses TUI
-- **privacy:** Add interactive group editing to setup wizard
-- **privacy:** Rewrite setup wizard with approve-by-exception UX
-- **privacy:** Expand known-apps DB and add allow_apps policy
-- **privacy:** Add multi-layer auto-classification heuristics
-- **privacy:** Add setup wizard with app discovery and config persistence
-- **privacy:** Add secure input detection + capture-time keystroke blocking
-- **privacy:** Add capture-time recorder enforcement for privacy v3 phase 5
-- **privacy:** Add structural masking for privacy v3 phase 4
-- **privacy:** Add post-processing enforcement for privacy v3 phase 3
-- **privacy:** Add context association and classification for privacy v3
-- **privacy:** Add policy core for privacy v3
-- Add optional NAME argument to screencap download command
-- Add Cloud Run service for task-segmented session processing
-- Add sessions download support to cloud function and CLI
-- Update catalog, viewer, namer, upload for chunked recordings
-- Integrate chunking into CLI and recorder
-- Add background chunk processor with upload and auto-delete
-- Add task manifest generation from resting periods
-- Wire chunked video/audio recording into engine
-- Add chunking config to engine and screencap layers
-- **recorder:** Store per-display layout and screenshot size at recording start
-- **privacy:** Scrub combined keystroke sequences from events.jsonl
-- **dedup:** Add screenshot deduplication via perceptual hashing
-- **privacy:** Upgrade DataFog PII detector to NER via spaCy engine
-- **privacy:** Add text orchestration layer and CLI scrub command
-- **privacy:** Add DataFog as alternative PII engine with switchable factory
-- **privacy:** Add PiiDetector (Presidio), test corpus, recall benchmark
-- **privacy:** Add core detection engine with pipeline, regex, and secrets detectors
-- Add Claude Code skills for capture testing and redaction guidance
+- **privacy:** Full privacy v3 system — policy engine, context classification, capture-time enforcement, structural masking, and post-processing filtering
+- **privacy:** Interactive curses TUI setup wizard with app discovery, auto-classification heuristics, and approve-by-exception UX
+- **privacy:** Per-recording cloud/local upload intent with mode forcing and upload gating
+- **privacy:** PII detection engine with Presidio, DataFog/spaCy NER, regex, and secrets detectors
+- **privacy:** Keystroke scrubbing pipeline for events.jsonl and chunk uploads
+- **export:** Unified event export pipeline — shared foundation for CLI export and chunk processor with window.switch interleaving
+- **chunking:** Background chunk processor with upload, auto-delete, and task manifest generation
+- **capture:** Variable-rate capture with action-aware retention and per-action-type gating
+- **capture:** Video redaction for cloud upload
+- **dedup:** Screenshot deduplication via perceptual hashing
 - Auto-export events.jsonl after recording stops
 - Write screenshots to disk as JPEG files instead of SQLite blobs
-- Add disk space check before and during recording
-- Step-by-step guided permission flow, one at a time
-- Open System Settings and auto-navigate between permission panes
-- Poll for Accessibility/Input Monitoring instead of exiting immediately
-- Auto-prompt macOS permissions on screencap start
+- Disk space check before and during recording
+- Guided macOS permission flow with auto-prompting and polling
+- Add optional NAME argument to `screencap download`
+- Cloud Run service for task-segmented session processing
 
 ### Fixed
 
-- **scrub:** Fix PII leaks in key.shortcut and v1 event scrubbing
-- Address review findings for action-aware retention
-- Skip opening new audio file on final_chunk rotation
-- Drain fan-out queue on shutdown to prevent final chunk loss
-- Gate stubbing on DB upload success and reject missing signed URLs
-- **privacy:** Enforce cloud OCR_FALLBACK blocking despite allow_apps
-- **chunk_processor:** Update all call sites to use _safe_delete
+- **privacy:** Fix PII leaks in key.shortcut events, harden fail-closed init, and enforce OCR_FALLBACK blocking
+- **privacy:** Improve app discovery — exclude Python runtime, classify browsers/PWAs/updaters, reduce title false positives
+- **chunking:** Harden upload pipeline with retry/recovery, drain fan-out queue on shutdown, fix final chunk loss
 - **recorder:** Use os._exit in force-quit to prevent threading._shutdown deadlock
-- **privacy:** Inline-scrub chunk uploads to prevent PII leaking to GCS
-- **privacy:** Use constants in scrubber safety fallback, add chunked audio tests
-- **privacy:** Consolidate shared constants and harden enforcement
-- **privacy:** Harden policy invariants and fail-closed init
-- **privacy:** Exclude Python runtime from app discovery entirely
-- **privacy:** Classify Python, browsers, PWAs, and updaters out of unclassified
-- **privacy:** Start TUI cursor on 'Needs your input' group
-- **privacy:** Filter system-internal apps and hide safe group from wizard
-- **privacy:** Harden fail-open paths in recorder, scrubber, and setup wizard
-- **privacy:** Refine context lookup, masking, and recorder integration
-- **privacy:** Address review findings — fully opaque mask + audit accuracy
-- **privacy:** Address review findings — 4 privacy-critical fixes
-- **privacy:** Handle image_path prefix and gate browser domain on browser window
-- Harden chunk upload pipeline with retry, recovery, and safety improvements
-- Require chunk files before stubbing and add verbose tip
-- Redirect stderr to engine_exit.log and surface ChunkProcessor init errors
-- Handle queue.Empty in ChunkProcessor and return False for empty chunks
-- Log video_writer non-zero exit code after join
-- **privacy:** Reduce false positives on app names in window titles
-- **privacy:** Address review findings from docs/todos
 - Propagate config overrides to multiprocessing child processes
-- Update stale comments in cli.py and pyinstaller spec
-- Remove privacy references from vendored openadapt-capture
-- Remove remaining scrub references missed in initial cleanup
-- Use subprocess to poll permissions (bypass macOS in-process caching)
 
 ### Changed
 
-- **scrub:** Remove v1 backward-compat scrubbing (never released)
-- Remove __slots__ from ScreenRetentionFilter
-- Clean up video redaction plumbing
-- **chunk_processor:** Replace _safe_trash with permanent _safe_delete
-- **privacy:** Toggle icons in-place instead of moving apps between groups
-- **privacy:** Align setup wizard colors with app brand palette
-- **privacy:** Redesign wizard UX with inline display and per-app review
-- **privacy:** Remove dead code and close PIL images properly
-- **privacy:** Simplify evaluator API and trim tests to 14 meaningful cases
-- Update root README, homebrew, engine config, and scripts to remove OpenAdapt references
-- Remove OpenAdapt references from engine docstrings and comments
-- Rename oa_recording to recording filename pattern with backward compat
-- Rename OA_LOG_LEVEL to SC_LOG_LEVEL, oa.stop to sc.stop, _oa_logger to _sc_logger
-- Remove chrome extension, docs, changelog, and readme from engine package
-- Update docs, comments, and remove stale openadapt references
-- Update test mock patches to use sc_engine module path
-- Update config and build files for screencap-engine rename
-- Update root screencap imports to use sc_engine
-- Update internal imports from openadapt_capture to sc_engine
-- Rename openadapt-capture dirs to screencap-engine/sc_engine
-- Remove dead -scrubbed directory filters
-- Remove openadapt-privacy package and scrub command
-
-### Other
-
-- Audit branch tests: delete low-value tests, merge duplicates, add coverage
+- Rename openadapt-capture to screencap-engine/sc_engine across all imports, configs, and docs
+- Remove legacy openadapt-privacy package and scrub command
 
 ## [0.8.0] - 2026-02-25
 

@@ -5,6 +5,8 @@ on:
     tags:
       - 'v*'
 
+permissions: {}
+
 jobs:
   build:
     permissions:
@@ -93,6 +95,10 @@ jobs:
           GH_TOKEN: ${{ github.token }}
         run: |
           VERSION=${GITHUB_REF#refs/tags/v}
+          if ! echo "$VERSION" | grep -qE '^[0-9]+\.[0-9]+\.[0-9]+(-[a-zA-Z0-9.]+)?$'; then
+            echo "ERROR: Invalid version format: $VERSION" >&2
+            exit 1
+          fi
           # Extract this version's section from CHANGELOG.md
           awk "/^## \[${VERSION}\]/{found=1; next} /^## \[/{if(found) exit} found" CHANGELOG.md > release_notes.txt
           # Fallback if extraction fails
@@ -103,4 +109,6 @@ jobs:
             --title "v${VERSION}" \
             --notes-file release_notes.txt \
             */screencap-*.tar.gz \
-            checksums.sha256
+            checksums.sha256 \
+          || gh release edit "v${VERSION}" \
+            --notes-file release_notes.txt
