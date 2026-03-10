@@ -571,15 +571,20 @@ def _process_task(
 # Idempotency
 # ---------------------------------------------------------------------------
 
-def _check_idempotency(sessions_prefix: str, db_md5: str) -> bool:
-    """Return True if this recording was already processed with same DB."""
+def _check_idempotency(sessions_prefix: str, trigger_id: str) -> bool:
+    """Return True if this recording was already processed with same trigger.
+
+    ``trigger_id`` is either the MD5 of recording.db or the sentinel_id from
+    recording_complete.json.
+    """
     status_blob = f"{sessions_prefix}_processing_status.json"
     data = _blob_bytes(status_blob)
     if data is None:
         return False
     try:
         status = json.loads(data)
-        if status.get("source_db_md5") != db_md5:
+        existing_id = status.get("trigger_id") or status.get("source_db_md5")
+        if existing_id != trigger_id:
             return False
         # "complete" blocks reprocessing; "complete_empty" does NOT (manifests may arrive later)
         return status.get("status") == "complete"
@@ -615,27 +620,44 @@ def process_recording(cloud_event):
     data = cloud_event.data
     object_name = data["name"]
 
-    # Guard: only process recording.db
+    # Guard: only process trigger files
+    TRIGGER_FILES = {"recording.db", "recording_complete.json"}
     parts = object_name.split("/")
-    if len(parts) != 3 or parts[0] != "recordings" or parts[2] != "recording.db":
-        log.info("Ignoring non-recording.db object: %s", object_name)
+    if len(parts) != 3 or parts[0] != "recordings" or parts[2] not in TRIGGER_FILES:
+        log.info("Ignoring non-trigger object: %s", object_name)
         return
 
+    trigger_file = parts[2]
     recording_name = parts[1]
-    log.info("Processing recording: %s", recording_name)
+    log.info("Processing recording: %s (trigger: %s)", recording_name, trigger_file)
 
     sessions_prefix = f"sessions/{recording_name}/"
 
-    # Download recording.db for md5
-    db_data = _blob_bytes(object_name)
-    if db_data is None:
-        log.error("Cannot download %s", object_name)
-        return
-    db_md5 = _md5_bytes(db_data)
+    # Determine trigger ID for idempotency
+    if trigger_file == "recording_complete.json":
+        raw = _blob_bytes(object_name)
+        if raw is None:
+            log.error("Cannot download sentinel %s", object_name)
+            return
+        try:
+            sentinel = json.loads(raw)
+        except json.JSONDecodeError:
+            log.error("Invalid sentinel JSON: %s", object_name)
+            return
+        trigger_id = sentinel.get("sentinel_id", "")
+        chunks_expected = sentinel.get("chunks_expected", 0)
+    else:
+        # Legacy recording.db trigger
+        db_data = _blob_bytes(object_name)
+        if db_data is None:
+            log.error("Cannot download %s", object_name)
+            return
+        trigger_id = _md5_bytes(db_data)
+        chunks_expected = 0
 
     # Idempotency check
-    if _check_idempotency(sessions_prefix, db_md5):
-        log.info("Already processed %s (md5=%s), skipping", recording_name, db_md5)
+    if _check_idempotency(sessions_prefix, trigger_id):
+        log.info("Already processed %s (trigger_id=%s), skipping", recording_name, trigger_id)
         return
 
     started_at = datetime.now(timezone.utc).isoformat()
