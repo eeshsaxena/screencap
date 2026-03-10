@@ -581,40 +581,32 @@ def run_setup_wizard(
                 except ValueError:
                     pass
 
-    # Mode selection (skip in scan-only mode)
-    if scan_only:
-        try:
-            mode = PrivacyMode(existing_mode_str)
-        except ValueError:
-            mode = PrivacyMode.INTERNAL
-    else:
-        console.print(f"\n[bold #60a5fa]\u25c9 ScreenCap[/bold #60a5fa] [dim #a78bfa]Privacy Setup[/dim #a78bfa]\n")
-        console.print("Privacy mode:")
-        console.print("  [#818cf8]1.[/#818cf8] Public   -- strictest, for sharing publicly")
-        console.print("  [#818cf8]2.[/#818cf8] Internal -- permissive, for personal use\n")
-        mode_choice = click.prompt("  Choice", type=click.IntRange(1, 2), default=2)
-        mode = PrivacyMode.PUBLIC if mode_choice == 1 else PrivacyMode.INTERNAL
-
-    # Upload default selection (skip in scan-only mode)
+    # Destination + privacy mode (skip in scan-only mode)
     existing_upload_default = (
         existing_privacy.get("upload_default", "ask")
         if isinstance(existing_privacy, dict) else "ask"
     )
     if scan_only:
+        try:
+            mode = PrivacyMode(existing_mode_str)
+        except ValueError:
+            mode = PrivacyMode.INTERNAL
         upload_default = existing_upload_default
     else:
-        console.print("\nDefault recording destination:")
-        console.print("  [#818cf8]1.[/#818cf8] Always local  -- recordings stay on this machine")
-        console.print("  [#818cf8]2.[/#818cf8] Always cloud  -- recordings use public mode and upload automatically")
+        console.print(f"\n[bold #60a5fa]\u25c9 ScreenCap[/bold #60a5fa] [dim #a78bfa]Privacy Setup[/dim #a78bfa]\n")
+        console.print("[bold]Where will your recordings go?[/bold]\n")
+        console.print("  [#818cf8]1.[/#818cf8] Cloud          \u2192 uploads to Claude (public privacy mode)")
+        console.print("  [#818cf8]2.[/#818cf8] Local          \u2192 stays on this machine (internal privacy mode)")
         console.print("  [#818cf8]3.[/#818cf8] Ask every time\n")
-        _default_choice = {"local": 1, "cloud": 2, "ask": 3}.get(existing_upload_default, 3)
+
+        _default_choice = {"cloud": 1, "local": 2, "ask": 3}.get(existing_upload_default, 2)
         dest_choice = click.prompt("  Choice", type=click.IntRange(1, 3), default=_default_choice)
-        upload_default = {1: "local", 2: "cloud", 3: "ask"}[dest_choice]
-        if upload_default == "cloud":
-            console.print(
-                "\n  [dim]Cloud recordings always use public privacy mode regardless "
-                "of the mode selected above. Sensitive apps will be blocked or masked.[/dim]"
-            )
+
+        mode, upload_default = {
+            1: (PrivacyMode.PUBLIC, "cloud"),
+            2: (PrivacyMode.INTERNAL, "local"),
+            3: (PrivacyMode.INTERNAL, "ask"),
+        }[dest_choice]
 
     # Discover apps
     with console.status("Scanning installed apps..."):
