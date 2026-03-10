@@ -98,7 +98,13 @@ def visualize(
     if html:
         output_path = Path(output) if output and not gif else capture_dir / "viewer.html"
         print(f"Generating HTML viewer: {output_path}")
-        create_html(capture_dir, output=output_path)
+        create_html(
+            capture_dir,
+            output=output_path,
+            max_events=500,
+            frame_scale=0.5,
+            frame_quality=75,
+        )
         print(f"Saved: {output_path}")
 
         if open_viewer:

@@ -72,11 +72,39 @@ def create_html(
         else:
             actions.append(a)
 
+    total_actions = len(actions)
+    downsampled = False
     if max_events is not None and len(actions) > max_events:
-        # Sample evenly
-        step = len(actions) / max_events
-        indices = [int(i * step) for i in range(max_events)]
-        actions = [actions[i] for i in indices]
+        # Type-aware downsampling: keep ALL non-move events, sample moves
+        import numpy as np
+
+        non_moves = []
+        moves = []
+        for idx, a in enumerate(actions):
+            evt_type = a.type if isinstance(a.type, str) else a.type.value
+            if "move" in evt_type.lower():
+                moves.append((idx, a))
+            else:
+                non_moves.append((idx, a))
+
+        if len(non_moves) >= max_events:
+            # More non-move events than budget — uniform sample non-moves
+            sample_indices = np.linspace(0, len(non_moves) - 1, max_events, dtype=int)
+            sampled = [non_moves[i] for i in sample_indices]
+        else:
+            # Keep all non-moves, fill remaining budget with sampled moves
+            remaining = max_events - len(non_moves)
+            if remaining > 0 and moves:
+                move_indices = np.linspace(0, len(moves) - 1, remaining, dtype=int)
+                sampled_moves = [moves[i] for i in move_indices]
+            else:
+                sampled_moves = []
+            sampled = non_moves + sampled_moves
+
+        # Re-sort by original index to maintain chronological order
+        sampled.sort(key=lambda x: x[0])
+        actions = [a for _, a in sampled]
+        downsampled = True
 
     # Prepare frame data
     frames_data = []
@@ -208,6 +236,13 @@ def create_html(
 
         events_data.append(event_dict)
 
+    # Disable audio when downsampled — misaligned full audio is worse than none
+    if downsampled and include_audio:
+        include_audio = False
+        audio_omitted = True
+    else:
+        audio_omitted = False
+
     # Prepare audio data and get audio duration
     audio_b64 = ""
     audio_type = ""
@@ -280,6 +315,9 @@ def create_html(
         screen_height=screen_height,
         pixel_ratio=pixel_ratio,
         transcript=transcript,
+        downsampled=downsampled,
+        total_events=total_actions,
+        audio_omitted=audio_omitted,
     )
 
     if output is not None:
@@ -326,6 +364,9 @@ def _generate_html(
     screen_height: int,
     pixel_ratio: float,
     transcript: str = "",
+    downsampled: bool = False,
+    total_events: int = 0,
+    audio_omitted: bool = False,
 ) -> str:
     """Generate the complete HTML viewer content."""
     minutes = int(duration // 60)
@@ -355,6 +396,20 @@ def _generate_html(
             '</div>'
         )
 
+    banner_html = ""
+    if downsampled:
+        shown = len(events_data)
+        parts = [f"Showing {shown} of {total_events} events (downsampled)"]
+        if audio_omitted:
+            parts.append("audio omitted")
+        banner_text = " &mdash; ".join(parts)
+        banner_html = (
+            '<div class="downsample-banner">'
+            f'{banner_text}. '
+            'Regenerate with <code>screencap view --regenerate --max-events 0</code> for full data.'
+            '</div>'
+        )
+
     html = f'''<!DOCTYPE html>
 <html lang="en">
 <head>
@@ -379,6 +434,10 @@ def _generate_html(
 }}
 *{{ box-sizing:border-box; margin:0; padding:0; }}
 body {{ font-family:'Outfit',-apple-system,BlinkMacSystemFont,sans-serif; background:var(--bg-0); color:var(--text-1); height:100vh; overflow:hidden; display:flex; flex-direction:column; line-height:1.4; }}
+
+/* Downsample banner */
+.downsample-banner {{ background:rgba(250,204,21,0.12); border:1px solid rgba(250,204,21,0.25); color:rgba(250,204,21,0.9); font-size:0.78rem; padding:8px 16px; text-align:center; flex-shrink:0; }}
+.downsample-banner code {{ background:rgba(255,255,255,0.08); padding:2px 6px; border-radius:4px; font-family:'JetBrains Mono',monospace; font-size:0.72rem; }}
 
 /* Layout */
 .app {{ flex:1; display:flex; min-height:0; }}
@@ -503,7 +562,7 @@ body {{ font-family:'Outfit',-apple-system,BlinkMacSystemFont,sans-serif; backgr
 </style>
 </head>
 <body>
-<div class="app">
+{banner_html}<div class="app">
     <aside class="panel-left">
         <div class="panel-header">
             <div>

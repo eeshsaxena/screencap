@@ -13,6 +13,10 @@ from screencap.config import get_recordings_dir
 
 console = Console()
 
+# Viewer files above this size are assumed to be pre-fix cached files
+# that should be auto-regenerated with caps.
+_MAX_VIEWER_SIZE_BYTES = 200_000_000  # 200 MB
+
 
 def _ensure_single_video(rec_dir: Path) -> None:
     """If only chunked videos exist, concatenate them into a temp video.mp4.
@@ -71,9 +75,23 @@ def _ensure_single_video(rec_dir: Path) -> None:
             pass
 
 
+def _needs_regeneration(viewer: Path, regenerate: bool) -> bool:
+    """Check if viewer.html needs to be (re)generated."""
+    if not viewer.exists():
+        return True
+    if regenerate:
+        return True
+    # Auto-regenerate oversized cached files from before the fix
+    if viewer.stat().st_size > _MAX_VIEWER_SIZE_BYTES:
+        return True
+    return False
+
+
 def open_viewer(
     name: str,
     recordings_dir: Path | None = None,
+    regenerate: bool = False,
+    max_events: int | None = 500,
 ) -> None:
     """Open viewer.html for a recording in the default browser."""
     if recordings_dir is None:
@@ -91,8 +109,8 @@ def open_viewer(
     # For chunked recordings, ensure a single video file exists for the viewer
     _ensure_single_video(rec_dir)
 
-    # Auto-generate viewer.html if missing but a recording DB exists
-    if not viewer.exists():
+    # Generate viewer.html if missing, explicitly requested, or oversized
+    if _needs_regeneration(viewer, regenerate):
         db = find_db(rec_dir)
         if db is None:
             raise FileNotFoundError(f"No recording database found in {rec_dir}")
@@ -105,11 +123,24 @@ def open_viewer(
                 f"Try: capture visualize {rec_dir} --html"
             )
 
-        console.print("[dim]viewer.html not found, generating...[/dim]")
+        if viewer.exists():
+            size_mb = viewer.stat().st_size / 1_000_000
+            console.print(f"[dim]Regenerating viewer.html ({size_mb:.0f} MB)...[/dim]")
+            viewer.unlink()
+        else:
+            console.print("[dim]viewer.html not found, generating...[/dim]")
         try:
             from sc_engine import create_html
 
-            create_html(str(rec_dir), output=str(viewer))
+            # Use max_events=None to disable caps (full data) when explicitly 0
+            effective_max = None if max_events == 0 else max_events
+            create_html(
+                str(rec_dir),
+                output=str(viewer),
+                max_events=effective_max,
+                frame_scale=0.5,
+                frame_quality=75,
+            )
         except Exception as e:
             raise FileNotFoundError(
                 f"Could not generate viewer.html: {e}"

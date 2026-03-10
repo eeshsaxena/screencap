@@ -544,6 +544,124 @@ class TestPixelRatio:
         assert "const pixelRatio=2.0;" in html
 
 
+class TestViewerDownsampling:
+    """Tests for type-aware downsampling in create_html."""
+
+    def _create_recording_with_events(self, capture_path, n_clicks, n_moves):
+        """Create a recording with a mix of click and move events."""
+        import os
+        import sys
+
+        os.makedirs(capture_path, exist_ok=True)
+        db_path = os.path.join(capture_path, "recording.db")
+        engine, Session = create_db(db_path)
+        session = Session()
+
+        ts = time.time()
+        recording_data = {
+            "timestamp": ts,
+            "monitor_width": 1920,
+            "monitor_height": 1080,
+            "double_click_interval_seconds": 0.5,
+            "double_click_distance_pixels": 5,
+            "platform": sys.platform,
+            "task_description": "Downsampling test",
+        }
+        recording = crud.insert_recording(session, recording_data)
+
+        # Insert move events (spaced >0.33s apart to survive the 3/sec filter)
+        for i in range(n_moves):
+            crud.insert_action_event(session, recording, ts + 0.5 * i, {
+                "name": "move",
+                "mouse_x": float(i * 10),
+                "mouse_y": float(i * 10),
+            })
+
+        # Insert click pairs (press + release) after the moves
+        move_end = ts + 0.5 * n_moves
+        for i in range(n_clicks):
+            click_ts = move_end + 1.0 * i
+            crud.insert_action_event(session, recording, click_ts, {
+                "name": "click",
+                "mouse_x": float(i * 20),
+                "mouse_y": float(i * 20),
+                "mouse_button_name": "left",
+                "mouse_pressed": True,
+            })
+            crud.insert_action_event(session, recording, click_ts + 0.05, {
+                "name": "click",
+                "mouse_x": float(i * 20),
+                "mouse_y": float(i * 20),
+                "mouse_button_name": "left",
+                "mouse_pressed": False,
+            })
+
+        return capture_path
+
+    def test_type_aware_downsampling_preserves_clicks(self, temp_capture_dir):
+        """When max_events triggers, all click events are preserved."""
+        capture_path = str(Path(temp_capture_dir) / "capture")
+        # 100 clicks → 100 singleclicks after processing
+        self._create_recording_with_events(capture_path, n_clicks=100, n_moves=0)
+
+        from sc_engine.visualize.html import create_html
+        # Budget of 50: should keep 50 of 100 clicks (all non-move, sampled)
+        html = create_html(capture_path, max_events=50)
+
+        import json
+        import re
+
+        match = re.search(r"const events=(\[.*?\]);", html, re.DOTALL)
+        assert match, "Could not find events data in HTML"
+        events = json.loads(match.group(1))
+
+        click_events = [e for e in events if "click" in e.get("type", "")]
+        # With 100 clicks and budget 50, we get 50 sampled clicks
+        assert len(click_events) == 50
+
+    def test_downsampling_shows_banner(self, temp_capture_dir):
+        """Downsampled HTML includes a warning banner."""
+        capture_path = str(Path(temp_capture_dir) / "capture")
+        # 100 clicks → 100 singleclicks, exceeds max_events=50
+        self._create_recording_with_events(capture_path, n_clicks=100, n_moves=0)
+
+        from sc_engine.visualize.html import create_html
+        html = create_html(capture_path, max_events=50)
+
+        assert "(downsampled)" in html
+
+    def test_no_downsampling_no_banner(self, temp_capture_dir):
+        """HTML without downsampling has no warning banner div."""
+        capture_path = str(Path(temp_capture_dir) / "capture")
+        self._create_recording_with_events(capture_path, n_clicks=5, n_moves=0)
+
+        from sc_engine.visualize.html import create_html
+        html = create_html(capture_path)  # no max_events
+
+        # CSS class exists in <style>, but the actual banner div should not
+        assert "(downsampled)" not in html
+
+    def test_downsampling_disables_audio(self, temp_capture_dir):
+        """When downsampled, audio is omitted and banner notes it."""
+        capture_path = str(Path(temp_capture_dir) / "capture")
+        self._create_recording_with_events(capture_path, n_clicks=100, n_moves=0)
+
+        from sc_engine.visualize.html import create_html
+        html = create_html(capture_path, max_events=50, include_audio=True)
+
+        assert "audio omitted" in html
+
+    def test_max_events_none_includes_all(self, temp_capture_dir):
+        """max_events=None includes all events without downsampling."""
+        capture_path = str(Path(temp_capture_dir) / "capture")
+        self._create_recording_with_events(capture_path, n_clicks=5, n_moves=0)
+
+        from sc_engine.visualize.html import create_html
+        html = create_html(capture_path, max_events=None)
+
+        assert "(downsampled)" not in html
+
+
 class TestRecordingConfig:
     """Tests for RecordingConfig and config_override."""
 
