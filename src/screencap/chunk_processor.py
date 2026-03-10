@@ -942,6 +942,79 @@ def checkpoint_and_upload_db(
         return False
 
 
+def _build_sentinel_data(
+    recording_name: str,
+    stop_reason: str,
+    chunks_expected: int,
+) -> dict:
+    """Build sentinel dict for recording_complete.json."""
+    import uuid
+    from datetime import datetime, timezone
+
+    from screencap import __version__
+
+    return {
+        "version": 1,
+        "recording_name": recording_name,
+        "completed_at": datetime.now(timezone.utc).isoformat(),
+        "stop_reason": stop_reason,
+        "screencap_version": __version__,
+        "chunks_expected": chunks_expected,
+        "sentinel_id": str(uuid.uuid4()),
+    }
+
+
+def upload_sentinel(
+    capture_dir: Path,
+    recording_name: str,
+    *,
+    stop_reason: str = "graceful",
+    chunks_expected: int = 0,
+) -> bool:
+    """Create and upload recording_complete.json sentinel to trigger stitching.
+
+    Always creates the local file even if upload fails (for recovery via
+    ``screencap upload``).  Returns True if upload succeeded.
+    """
+    from screencap.upload import FileInfo, _content_type, request_signed_urls
+
+    sentinel_data = _build_sentinel_data(recording_name, stop_reason, chunks_expected)
+    sentinel_path = capture_dir / "recording_complete.json"
+
+    # Write locally (atomic: tmp + rename)
+    tmp_path = sentinel_path.with_suffix(".json.tmp")
+    try:
+        tmp_path.write_text(json.dumps(sentinel_data, indent=2))
+        tmp_path.rename(sentinel_path)
+    except Exception as e:
+        logger.warning(f"Failed to write local sentinel: {e}")
+        # Try non-atomic fallback
+        try:
+            sentinel_path.write_text(json.dumps(sentinel_data, indent=2))
+        except Exception:
+            return False
+
+    # Upload
+    fi = FileInfo(
+        name="recording_complete.json",
+        path=sentinel_path,
+        content_type="application/json",
+        size=sentinel_path.stat().st_size,
+    )
+    try:
+        urls, _ = request_signed_urls(recording_name, [fi])
+        if "recording_complete.json" not in urls:
+            logger.error("Server returned no URL for recording_complete.json")
+            return False
+        url = urls["recording_complete.json"]
+        if url:
+            _upload_single(fi, url)
+        return True
+    except Exception as e:
+        logger.error(f"Failed to upload sentinel: {e}")
+        return False
+
+
 def stub_recording(recording_dir: Path) -> list[str]:
     """Delete media files from a fully-uploaded recording, keeping metadata."""
     keep_patterns = {
