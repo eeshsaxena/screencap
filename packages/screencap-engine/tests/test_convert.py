@@ -190,3 +190,43 @@ class TestDictToWindowSwitch:
         assert event.window_title == ""
         assert event.window_id == ""
         assert event.x == 0
+        assert event.domain is None
+
+    def test_domain_extracted_from_browser_url(self):
+        """browser_url column → domain hostname on WindowSwitchEvent."""
+        row = {
+            "timestamp": 1.0,
+            "app_bundle_id": "com.google.Chrome",
+            "title": "GitHub",
+            "window_id": "1",
+            "left": 0, "top": 0, "width": 800, "height": 600,
+            "browser_url": "https://github.com/Divide-By-0/screencap",
+        }
+        event = dict_to_window_switch(row)
+        assert event.domain == "github.com"
+
+    def test_domain_none_when_no_browser_url(self):
+        """Old recordings without browser_url column → domain=None."""
+        row = {
+            "timestamp": 1.0,
+            "app_bundle_id": "com.apple.Safari",
+            "title": "Apple",
+            "window_id": "2",
+            "left": 0, "top": 0, "width": 800, "height": 600,
+        }
+        event = dict_to_window_switch(row)
+        assert event.domain is None
+
+    def test_domain_none_when_browser_url_empty_or_null(self):
+        """Empty or NULL browser_url → domain=None."""
+        for browser_url in ("", None):
+            row = {
+                "timestamp": 1.0,
+                "app_bundle_id": "com.apple.Safari",
+                "title": "Safari",
+                "window_id": "3",
+                "left": 0, "top": 0, "width": 800, "height": 600,
+                "browser_url": browser_url,
+            }
+            event = dict_to_window_switch(row)
+            assert event.domain is None, f"Expected None for browser_url={browser_url!r}"

@@ -414,6 +414,7 @@ class CaptureSession:
                 "top": getattr(we, "top", 0),
                 "width": getattr(we, "width", 0),
                 "height": getattr(we, "height", 0),
+                "browser_url": getattr(we, "browser_url", None),
             })
         # window_events ORM relationship is already ordered by timestamp
         window_switches = deduplicate_window_events(window_rows)

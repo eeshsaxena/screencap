@@ -288,6 +288,7 @@ class WindowSwitchEvent(BaseEvent):
     y: int = Field(description="Window top position")
     width: int = Field(description="Window width in pixels")
     height: int = Field(description="Window height in pixels")
+    domain: str | None = Field(default=None, description="Hostname from browser URL")
 
 
 # =============================================================================
