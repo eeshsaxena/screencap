@@ -6,6 +6,9 @@ import json
 import sys
 
 import click
+from dotenv import load_dotenv
+
+load_dotenv()  # auto-load .env if present
 from rich.console import Console
 from rich.table import Table
 
