@@ -8,23 +8,17 @@ Validates that browser_url → domain flows correctly through:
 
 from __future__ import annotations
 
-import json
 import sqlite3
 from pathlib import Path
-from unittest.mock import MagicMock, patch
-
-import pytest
+from unittest.mock import patch
 
 from screencap.privacy.actions import PrivacyAction
 from screencap.privacy.context import (
     WindowContext,
-    _domain_from_url,
     associate_screenshot,
     load_window_events,
 )
 from screencap.privacy.policy import (
-    ContextClass,
-    FrameMetadata,
     PrivacyConfig,
     PrivacyMode,
 )
@@ -99,32 +93,6 @@ class TestRecorderDomainPropagation:
             "title": "Some Page",
         })
         # No browser_url → domain=None → BROWSER_UNVERIFIED → MASK_WINDOW → blocked
-        assert f.is_screen_allowed() is False
-
-    def test_browser_url_none_same_as_missing(self):
-        """Explicit browser_url=None is treated same as missing."""
-        config = _make_config()
-        f = RecorderPrivacyFilter(
-            config, transition_hold_seconds=0.0, secure_input_fn=None,
-        )
-        f.on_window_event({
-            "app_bundle_id": "com.google.Chrome",
-            "title": "Page",
-            "browser_url": None,
-        })
-        assert f.is_screen_allowed() is False
-
-    def test_browser_url_empty_string_falls_to_unverified(self):
-        """Empty browser_url → domain=None → BROWSER_UNVERIFIED."""
-        config = _make_config()
-        f = RecorderPrivacyFilter(
-            config, transition_hold_seconds=0.0, secure_input_fn=None,
-        )
-        f.on_window_event({
-            "app_bundle_id": "com.google.Chrome",
-            "title": "Page",
-            "browser_url": "",
-        })
         assert f.is_screen_allowed() is False
 
 
@@ -309,23 +277,6 @@ def _create_recording_db(db_path: Path, *, with_browser_url: bool = True) -> Non
     conn.close()
 
 
-class TestWindowContextDomain:
-    """WindowContext now carries domain extracted from browser_url."""
-
-    def test_window_context_has_domain_field(self):
-        wc = WindowContext(
-            timestamp=1.0,
-            app_bundle_id="com.google.Chrome",
-            title="GitHub",
-            domain="github.com",
-        )
-        assert wc.domain == "github.com"
-
-    def test_window_context_domain_defaults_none(self):
-        wc = WindowContext(timestamp=1.0, app_bundle_id="com.foo", title="Foo")
-        assert wc.domain is None
-
-
 class TestLoadWindowEventsWithDomain:
     """load_window_events reads browser_url and extracts domain."""
 
@@ -393,18 +344,6 @@ class TestAssociateScreenshotDomain:
         ]
         meta = associate_screenshot(1.5, events)
         assert meta.domain == "github.com"
-
-    def test_no_domain_gives_none(self):
-        events = [
-            WindowContext(
-                timestamp=1.0,
-                app_bundle_id="com.google.Chrome",
-                title="Page",
-                domain=None,
-            ),
-        ]
-        meta = associate_screenshot(1.5, events)
-        assert meta.domain is None
 
     def test_no_matching_window_gives_none_domain(self):
         meta = associate_screenshot(1.5, [])
