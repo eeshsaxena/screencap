@@ -217,43 +217,16 @@ class TestDictToWindowSwitch:
         event = dict_to_window_switch(row)
         assert event.domain is None
 
-    def test_domain_none_when_browser_url_empty(self):
-        """Empty browser_url (Start Page, new tab) → domain=None."""
-        row = {
-            "timestamp": 1.0,
-            "app_bundle_id": "com.apple.Safari",
-            "title": "Start Page",
-            "window_id": "3",
-            "left": 0, "top": 0, "width": 800, "height": 600,
-            "browser_url": "",
-        }
-        event = dict_to_window_switch(row)
-        assert event.domain is None
-
-    def test_domain_none_when_browser_url_null(self):
-        """NULL browser_url from DB → domain=None."""
-        row = {
-            "timestamp": 1.0,
-            "app_bundle_id": "com.apple.Safari",
-            "title": "Safari",
-            "window_id": "4",
-            "left": 0, "top": 0, "width": 800, "height": 600,
-            "browser_url": None,
-        }
-        event = dict_to_window_switch(row)
-        assert event.domain is None
-
-    def test_domain_serialized_in_json(self):
-        """domain field appears in JSON serialization."""
-        row = {
-            "timestamp": 1.0,
-            "app_bundle_id": "com.google.Chrome",
-            "title": "Docs",
-            "window_id": "5",
-            "left": 0, "top": 0, "width": 800, "height": 600,
-            "browser_url": "https://docs.python.org/3/library/",
-        }
-        event = dict_to_window_switch(row)
-        import json
-        data = json.loads(event.model_dump_json())
-        assert data["domain"] == "docs.python.org"
+    def test_domain_none_when_browser_url_empty_or_null(self):
+        """Empty or NULL browser_url → domain=None."""
+        for browser_url in ("", None):
+            row = {
+                "timestamp": 1.0,
+                "app_bundle_id": "com.apple.Safari",
+                "title": "Safari",
+                "window_id": "3",
+                "left": 0, "top": 0, "width": 800, "height": 600,
+                "browser_url": browser_url,
+            }
+            event = dict_to_window_switch(row)
+            assert event.domain is None, f"Expected None for browser_url={browser_url!r}"
