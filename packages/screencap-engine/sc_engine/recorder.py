@@ -233,6 +233,7 @@ def process_events(
     num_browser_events: multiprocessing.Value,
     num_video_events: multiprocessing.Value,
     screen_filter: Any | None = None,
+    dead_queues: set | None = None,
 ) -> None:
     """Process events from the event queue and write them to write queues.
 
@@ -280,6 +281,24 @@ def process_events(
     started = False
     drain_start = None
 
+    # Dead-queue bypass: map write queues to their writer process names.
+    # When a writer dies, record()'s health check adds its name to
+    # dead_queues (shared set).  We skip put() for dead writers to avoid
+    # 1.0s timeout cascades that stall the entire event pipeline.
+    if dead_queues is None:
+        dead_queues = set()
+    _q_to_writer = {
+        id(screen_write_q): "screen_event_writer",
+        id(action_write_q): "action_event_writer",
+        id(window_write_q): "window_event_writer",
+        id(browser_write_q): "browser_event_writer",
+        id(video_write_q): "video_writer",
+    }
+
+    def _is_queue_dead(wq: sq.SynchronizedQueue) -> bool:
+        writer = _q_to_writer.get(id(wq))
+        return writer is not None and writer in dead_queues
+
     # Variable-rate retention filter (action-aware capture)
     retention_filter = None
     if config.SCREENSHOT_ACTION_AWARE:
@@ -323,7 +342,7 @@ def process_events(
         if _placeholder_frame is None:
             _placeholder_frame = _make_placeholder_frame(*_screen_dims)
         ph = Event(timestamp=ts, type="screen/video", data=_placeholder_frame)
-        if process_event(ph, video_write_q, write_video_event, recording, perf_q, terminate_processing):
+        if not _is_queue_dead(video_write_q) and process_event(ph, video_write_q, write_video_event, recording, perf_q, terminate_processing):
             num_video_events.value += 1
         _last_placeholder_ts = now_m
 
@@ -373,6 +392,8 @@ def process_events(
                             (settle_vid, video_write_q, write_video_event),
                         )
                     for sev, swq, swfn in settle_events:
+                        if _is_queue_dead(swq):
+                            continue
                         if process_event(sev, swq, swfn, recording, perf_q, terminate_processing):
                             if sev.type == "screen":
                                 num_screen_events.value += 1
@@ -416,7 +437,9 @@ def process_events(
                 else:
                     _end_blocked_interval_if_active(event.timestamp)
                     video_event = event._replace(type="screen/video")
-                    if process_event(
+                    if _is_queue_dead(video_write_q):
+                        _drops["dead_queue_video"] += 1
+                    elif process_event(
                         video_event,
                         video_write_q,
                         write_video_event,
@@ -444,7 +467,9 @@ def process_events(
                     screen_filter.fail_closed()
         elif event.type == "browser":
             if config.RECORD_BROWSER_EVENTS:
-                if process_event(
+                if _is_queue_dead(browser_write_q):
+                    _drops["dead_queue_browser"] += 1
+                elif process_event(
                     event,
                     browser_write_q,
                     write_browser_event,
@@ -622,9 +647,12 @@ def process_events(
             # Action event last — the anchor record that references the others
             events_to_write.append((event, action_write_q, write_action_event))
 
-            # Try to write all; if any fails, drop the entire group
+            # Try to write all; if any fails (or dead queue), drop the entire group
             all_ok = True
             for ev, wq, wfn in events_to_write:
+                if _is_queue_dead(wq):
+                    all_ok = False
+                    break
                 if not process_event(
                     ev, wq, wfn, recording, perf_q, terminate_processing
                 ):
@@ -2495,6 +2523,9 @@ def record(
     if num_video_events is None:
         num_video_events = multiprocessing.Value("i", 0)
 
+    # Shared between main loop and event_processor thread (same process, GIL-safe)
+    dead_queues: set[str] = set()
+
     event_processor = threading.Thread(
         target=process_events,
         args=(
@@ -2514,6 +2545,7 @@ def record(
             num_browser_events,
             num_video_events,
             screen_filter,
+            dead_queues,
         ),
     )
     event_processor.start()
@@ -2742,8 +2774,40 @@ def record(
 
     global stop_sequence_detected
     stop_sequence_detected = False
+
+    _CRITICAL_TASKS = frozenset({
+        "action_event_writer", "video_writer",
+        "screen_event_writer", "event_processor",
+    })
+
     try:
         while not (stop_sequence_detected or terminate_processing.is_set()):
+            # Health check: detect crashed child processes/threads
+            for name, task in task_by_name.items():
+                if name in dead_queues:
+                    continue
+                if not task.is_alive():
+                    exitcode = getattr(task, "exitcode", None)
+                    pid = getattr(task, "pid", None)
+                    logger.error(
+                        f"Task '{name}' (pid={pid}) died unexpectedly "
+                        f"(exitcode={exitcode})"
+                    )
+                    dead_queues.add(name)
+                    if status_pipe:
+                        status_pipe.send({
+                            "type": "record.child_died",
+                            "task_name": name,
+                            "exitcode": exitcode,
+                            "pid": pid,
+                            "is_critical": name in _CRITICAL_TASKS,
+                        })
+                    if name in _CRITICAL_TASKS:
+                        logger.error(
+                            f"Critical task '{name}' died — stopping recording"
+                        )
+                        terminate_processing.set()
+                        break
             time.sleep(1)
         terminate_processing.set()
     except KeyboardInterrupt:
@@ -3023,6 +3087,10 @@ class Recorder:
         self._flush_requested = None
         self._flush_ack_counter = None
 
+        # Health monitoring
+        self._child_crashes: list[dict] = []
+        self._health_warning: str = ""
+
         # Internal
         self._record_thread: threading.Thread | None = None
         self._status_thread: threading.Thread | None = None
@@ -3040,6 +3108,25 @@ class Recorder:
                             self._ready_event.set()
                         elif msg.get("type") == "record.stopped":
                             self._stopped_event.set()
+                        elif msg.get("type") == "record.child_died":
+                            self._child_crashes.append(msg)
+                            name = msg["task_name"]
+                            code = msg.get("exitcode")
+                            if msg.get("is_critical"):
+                                self._health_warning = (
+                                    f"\u26a0 {name} crashed (exit {code}) "
+                                    f"\u2014 stopping"
+                                )
+                            else:
+                                degraded = [
+                                    c["task_name"]
+                                    for c in self._child_crashes
+                                    if not c.get("is_critical")
+                                ]
+                                self._health_warning = (
+                                    f"\u26a0 {', '.join(degraded)} crashed "
+                                    f"\u2014 recording degraded"
+                                )
         except (EOFError, OSError):
             pass
 
@@ -3168,6 +3255,16 @@ class Recorder:
             and self._record_thread.is_alive()
             and not self._terminate_processing.is_set()
         )
+
+    @property
+    def health_warning(self) -> str:
+        """Human-readable warning if a child process/thread crashed."""
+        return self._health_warning
+
+    @property
+    def child_crashes(self) -> list[dict]:
+        """List of crash events from child processes/threads."""
+        return list(self._child_crashes)
 
     @property
     def event_count(self) -> int:
