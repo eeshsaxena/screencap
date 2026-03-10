@@ -233,7 +233,7 @@ def process_events(
     num_browser_events: multiprocessing.Value,
     num_video_events: multiprocessing.Value,
     screen_filter: Any | None = None,
-    dead_queues: set | None = None,
+    dead_queues: set[str] | None = None,
 ) -> None:
     """Process events from the event queue and write them to write queues.
 
@@ -342,7 +342,9 @@ def process_events(
         if _placeholder_frame is None:
             _placeholder_frame = _make_placeholder_frame(*_screen_dims)
         ph = Event(timestamp=ts, type="screen/video", data=_placeholder_frame)
-        if not _is_queue_dead(video_write_q) and process_event(ph, video_write_q, write_video_event, recording, perf_q, terminate_processing):
+        if _is_queue_dead(video_write_q):
+            _drops["dead_queue_placeholder"] += 1
+        elif process_event(ph, video_write_q, write_video_event, recording, perf_q, terminate_processing):
             num_video_events.value += 1
         _last_placeholder_ts = now_m
 
@@ -393,6 +395,7 @@ def process_events(
                         )
                     for sev, swq, swfn in settle_events:
                         if _is_queue_dead(swq):
+                            _drops["dead_queue_settle"] += 1
                             continue
                         if process_event(sev, swq, swfn, recording, perf_q, terminate_processing):
                             if sev.type == "screen":
@@ -649,9 +652,11 @@ def process_events(
 
             # Try to write all; if any fails (or dead queue), drop the entire group
             all_ok = True
+            _dead_queue_drop = False
             for ev, wq, wfn in events_to_write:
                 if _is_queue_dead(wq):
                     all_ok = False
+                    _dead_queue_drop = True
                     break
                 if not process_event(
                     ev, wq, wfn, recording, perf_q, terminate_processing
@@ -676,6 +681,8 @@ def process_events(
                 if any(ev.type == "window" for ev, _, _ in events_to_write):
                     num_window_events.value += 1
                     prev_saved_window_timestamp = prev_window_event.timestamp
+            elif _dead_queue_drop:
+                _drops["dead_queue_action_group"] += 1
             else:
                 _drops["action_group"] += 1
                 logger.warning(
@@ -3087,7 +3094,9 @@ class Recorder:
         self._flush_requested = None
         self._flush_ack_counter = None
 
-        # Health monitoring
+        # Health monitoring — written by _drain_status_pipe thread, read by
+        # CLI thread via child_crashes/health_warning properties.  GIL-safe:
+        # list.append() and list() copy are atomic bytecode ops in CPython.
         self._child_crashes: list[dict] = []
         self._health_warning: str = ""
 
