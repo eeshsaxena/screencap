@@ -115,7 +115,6 @@ def build_privacy_filter(
     from screencap.privacy.policy import (
         DefaultPolicyEvaluator,
         PrivacyMode,
-        parse_privacy_config,
     )
 
     try:
@@ -125,17 +124,16 @@ def build_privacy_filter(
 
     # Load privacy config from config.toml
     try:
-        from screencap.config import get_config
+        from screencap.config import get_privacy_config
 
-        cfg = get_config()
-        privacy_cfg = parse_privacy_config(cfg)
-    except (FileNotFoundError, KeyError, ValueError):
+        privacy_cfg = get_privacy_config()
+    except (ImportError, FileNotFoundError, KeyError, ValueError):
         logger.debug("Could not load privacy config, using defaults")
         from screencap.privacy.policy import PrivacyConfig
 
         privacy_cfg = PrivacyConfig(mode=mode)
 
-    classifier = DefaultContextClassifier(privacy_cfg)
+    classifier = DefaultContextClassifier(app_classes=privacy_cfg.app_classes)
     evaluator = DefaultPolicyEvaluator(privacy_cfg)
 
     def _filter(event):

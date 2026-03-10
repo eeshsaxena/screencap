@@ -907,6 +907,20 @@ def start_recording(
             console.print("[yellow]Force quit — current chunk may complete, queued chunks lost.[/yellow]")
             console.print("[dim]Run 'screencap upload' later to upload remaining files.[/dim]")
 
+        # Drain and close chunk/ack queues to prevent feeder-thread hangs.
+        for _q in (_cpq, _aaq):
+            if _q is not None:
+                try:
+                    while True:
+                        _q.get_nowait()
+                except Exception:
+                    pass
+                try:
+                    _q.cancel_join_thread()
+                    _q.close()
+                except Exception:
+                    pass
+
         # WAL checkpoint + upload recording.db
         _db_uploaded = False
         if live_upload:
