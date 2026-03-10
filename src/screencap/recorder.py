@@ -581,8 +581,10 @@ def start_recording(
     atexit.register(_cleanup_children)
 
     # Track how stop happened for messaging after Live exits
-    _stop_reason = ""  # "graceful", "force", "disk_full", or "interrupt"
+    _stop_reason = ""  # "graceful", "force", "disk_full", "sigterm", or "interrupt"
     _stop_event = threading.Event()
+    _sentinel_uploaded = False
+    _recording_name = name  # default; may be overridden by .recording_id later
     _saved_stdout = None  # Will hold real stdout when we redirect to devnull
     _saved_stderr = None  # Will hold real stderr when we redirect to devnull
 
@@ -749,6 +751,15 @@ def start_recording(
 
             signal.signal(signal.SIGINT, _force_exit)
 
+            # --- SIGTERM handler (for `screencap stop`) ---
+            def _sigterm_handler(sig, frame):
+                nonlocal _stop_reason
+                _stop_reason = "sigterm"
+                _stop_event.set()
+                recorder.stop()
+
+            signal.signal(signal.SIGTERM, _sigterm_handler)
+
             # --- Live recording display ---
             # We use transient=False and handle cleanup ourselves:
             # on stop we replace the panel with the stop message via
@@ -878,8 +889,9 @@ def start_recording(
             sys.stderr = _saved_stderr
 
         status.stop()
-        # Restore default handler
+        # Restore default handlers
         signal.signal(signal.SIGINT, signal.default_int_handler)
+        signal.signal(signal.SIGTERM, signal.SIG_DFL)
         atexit.unregister(_cleanup_children)
         delete_pidfile()
         # Suppress noisy multiprocessing cleanup tracebacks
