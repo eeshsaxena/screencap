@@ -747,6 +747,23 @@ def start_recording(
                 if _saved_stderr is not None:
                     sys.stderr = _saved_stderr
 
+                # Write sentinel locally for recovery via `screencap upload`
+                # (no upload — os._exit is imminent)
+                try:
+                    _sentinel = {
+                        "version": 1,
+                        "recording_name": _recording_name,
+                        "completed_at": _dt.now(_tz.utc).isoformat(),
+                        "stop_reason": "force",
+                        "chunks_expected": len(list(capture_dir.glob("chunk_*_manifest.json"))),
+                        "sentinel_id": str(__import__('uuid').uuid4()),
+                    }
+                    (capture_dir / "recording_complete.json").write_text(
+                        _json.dumps(_sentinel, indent=2)
+                    )
+                except Exception:
+                    pass
+
                 os._exit(1)
 
             signal.signal(signal.SIGINT, _force_exit)
@@ -894,6 +911,24 @@ def start_recording(
         signal.signal(signal.SIGTERM, signal.SIG_DFL)
         atexit.unregister(_cleanup_children)
         delete_pidfile()
+
+        # Best-effort LOCAL sentinel write for unhandled exceptions (Step 3d)
+        # Do NOT upload here — chunk_processor hasn't stopped yet, so chunks
+        # may still be uploading.  Uploading sentinel now would trigger the
+        # stitcher before manifests land in GCS (race condition).
+        # The local file enables recovery via ``screencap upload``.
+        if cloud_intent and chunk_processor is not None and not _sentinel_uploaded:
+            try:
+                from screencap.chunk_processor import _build_sentinel_data
+                _n_chunks = len(list(capture_dir.glob("chunk_*_manifest.json")))
+                _sentinel_data = _build_sentinel_data(
+                    _recording_name, stop_reason="exception", chunks_expected=_n_chunks,
+                )
+                _sentinel_path = capture_dir / "recording_complete.json"
+                _sentinel_path.write_text(_json.dumps(_sentinel_data, indent=2))
+            except Exception:
+                pass
+
         # Suppress noisy multiprocessing cleanup tracebacks
         warnings.filterwarnings("ignore", category=ResourceWarning)
 
