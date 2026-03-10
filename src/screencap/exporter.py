@@ -143,6 +143,7 @@ def build_privacy_filter(
         metadata = FrameMetadata(
             bundle_id=bundle_id,
             window_title=event.window_title,
+            domain=getattr(event, "domain", None),
             timestamp=event.timestamp,
         )
         ctx = classifier.classify(metadata)

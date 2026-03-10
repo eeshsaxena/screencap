@@ -63,6 +63,7 @@ class WindowContext:
     app_bundle_id: str
     title: str
     window_id: str = ""
+    domain: str | None = None
 
 
 def _active_at_index(timestamps: list[float], target: float) -> int | None:
@@ -121,19 +122,38 @@ def load_window_events(db_path: Path) -> list[WindowContext]:
         ).fetchall()}
         if "window_event" not in tables:
             return []
-        cur.execute(
-            "SELECT timestamp, app_bundle_id, title, window_id "
-            "FROM window_event "
-            "WHERE timestamp IS NOT NULL "
-            "ORDER BY timestamp"
-        )
+
+        # Check if browser_url column exists (backward compat with old DBs)
+        we_cols = {
+            r[1] for r in cur.execute("PRAGMA table_info(window_event)").fetchall()
+        }
+        has_browser_url = "browser_url" in we_cols
+
+        if has_browser_url:
+            cur.execute(
+                "SELECT timestamp, app_bundle_id, title, window_id, browser_url "
+                "FROM window_event "
+                "WHERE timestamp IS NOT NULL "
+                "ORDER BY timestamp"
+            )
+        else:
+            cur.execute(
+                "SELECT timestamp, app_bundle_id, title, window_id "
+                "FROM window_event "
+                "WHERE timestamp IS NOT NULL "
+                "ORDER BY timestamp"
+            )
         results = []
         for row in cur:
+            domain = None
+            if has_browser_url and row[4]:
+                domain = _domain_from_url(row[4]) or None
             results.append(WindowContext(
                 timestamp=float(row[0]),
                 app_bundle_id=row[1] or "",
                 title=row[2] or "",
                 window_id=row[3] or "",
+                domain=domain,
             ))
         return results
     finally:
@@ -481,6 +501,6 @@ def associate_screenshot(
     return FrameMetadata(
         bundle_id=bundle_id,
         window_title=window.title if window else "",
-        domain=None,
+        domain=window.domain if window else None,
         timestamp=screenshot_ts,
     )

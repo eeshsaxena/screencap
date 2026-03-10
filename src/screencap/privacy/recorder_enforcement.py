@@ -197,9 +197,19 @@ class RecorderPrivacyFilter:
         bundle_id = window_data.get("app_bundle_id") or ""
         title = window_data.get("title") or ""
 
+        # Extract domain from browser_url for domain-aware classification
+        domain = None
+        browser_url = window_data.get("browser_url")
+        if browser_url:
+            from screencap.privacy.context import _domain_from_url
+
+            domain = _domain_from_url(browser_url) or None
+            logger.debug("Domain from browser_url: %s", domain)
+
         meta = FrameMetadata(
             bundle_id=bundle_id,
             window_title=title,
+            domain=domain,
             timestamp=time.monotonic(),
         )
         ctx = self._classifier.classify(meta)

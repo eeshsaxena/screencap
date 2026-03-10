@@ -108,7 +108,7 @@ def _build_blocked_intervals(
         meta = FrameMetadata(
             bundle_id=we.app_bundle_id,
             window_title=we.title,
-            domain=None,
+            domain=getattr(we, "domain", None),
             timestamp=we.timestamp,
         )
         ctx = classifier.classify(meta)
@@ -409,6 +409,17 @@ def _null_db_rows_for_intervals(
         null_fields = sorted(f for f in KEYSTROKE_CONTENT_FIELDS if f in ae_cols)
         ae_set_clause = ", ".join(f"{f} = NULL" for f in null_fields)
 
+        # Build window_event SET clause — include browser_url if column exists
+        we_null_cols = ["title", "state"]
+        if "window_event" in tables:
+            we_cols = {
+                r[1]
+                for r in conn.execute("PRAGMA table_info(window_event)").fetchall()
+            }
+            if "browser_url" in we_cols:
+                we_null_cols.append("browser_url")
+        we_set_clause = ", ".join(f"{c} = NULL" for c in we_null_cols)
+
         for iv in intervals:
             if iv.end == float("inf"):
                 ae_sql = (
@@ -417,8 +428,7 @@ def _null_db_rows_for_intervals(
                 )
                 ae_params = (iv.start,)
                 we_sql = (
-                    "UPDATE window_event SET "
-                    "title = NULL, state = NULL "
+                    f"UPDATE window_event SET {we_set_clause} "
                     "WHERE timestamp >= ?"
                 )
                 we_params = (iv.start,)
@@ -429,8 +439,7 @@ def _null_db_rows_for_intervals(
                 )
                 ae_params = (iv.start, iv.end)
                 we_sql = (
-                    "UPDATE window_event SET "
-                    "title = NULL, state = NULL "
+                    f"UPDATE window_event SET {we_set_clause} "
                     "WHERE timestamp >= ? AND timestamp < ?"
                 )
                 we_params = (iv.start, iv.end)
@@ -640,6 +649,40 @@ def _scrub_recording_schema(
     if "window_event" in tables:
         _try_scrub_text_column(conn, "window_event", "title", pipeline, anonymizer, result)
         _try_scrub_json_column(conn, "window_event", "state", pipeline, anonymizer, result)
+        # browser_url contains full URLs (PII) — scrub to domain-only or NULL
+        _try_scrub_browser_url(conn, pipeline, anonymizer, result)
+
+def _try_scrub_browser_url(
+    conn: sqlite3.Connection,
+    pipeline,
+    anonymizer,
+    result: ScrubResult,
+) -> None:
+    """Replace browser_url with domain-only hostname, or NULL if empty.
+
+    Full URLs contain PII (session tokens, account IDs, query params).
+    For uploaded scrubbed DBs, only the domain hostname is retained.
+    """
+    from screencap.privacy.context import _domain_from_url
+
+    try:
+        read_cur = conn.cursor()
+        write_cur = conn.cursor()
+        read_cur.execute(
+            "SELECT id, browser_url FROM window_event WHERE browser_url IS NOT NULL"
+        )
+        for row_id, url in read_cur:
+            if not url or not isinstance(url, str):
+                continue
+            domain = _domain_from_url(url)
+            # Replace full URL with domain-only (or NULL if no domain)
+            write_cur.execute(
+                "UPDATE window_event SET browser_url = ? WHERE id = ?",
+                (domain or None, row_id),
+            )
+    except sqlite3.OperationalError:
+        pass  # browser_url column doesn't exist in older DBs
+
 
 def _scrub_capture_schema(
     conn: sqlite3.Connection,
