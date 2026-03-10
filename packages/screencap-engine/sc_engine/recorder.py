@@ -3037,6 +3037,16 @@ class Recorder:
         if self._status_thread is not None:
             self._status_thread.join(timeout=5)
 
+        # Clean up multiprocessing queues to prevent feeder-thread hangs at exit.
+        for q in (self._chunk_rotate_q, self._audio_rotate_q,
+                  self._audio_ack_q, self._chunk_process_q):
+            if q is not None:
+                try:
+                    q.cancel_join_thread()
+                    q.close()
+                except Exception:
+                    pass
+
     def stop(self) -> None:
         """Stop recording programmatically."""
         self._terminate_processing.set()
