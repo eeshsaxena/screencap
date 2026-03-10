@@ -662,24 +662,80 @@ def process_recording(cloud_event):
 
     started_at = datetime.now(timezone.utc).isoformat()
 
-    # Load manifests
+    # Load manifests — for sentinel triggers, retry briefly if none found yet
+    # (chunks may still be landing in GCS due to minor propagation delay)
     manifest_blobs = _list_manifests(recording_name)
+    if not manifest_blobs and trigger_file == "recording_complete.json" and chunks_expected > 0:
+        import time as _time
+        for _retry in range(1, 4):  # up to 3 retries, 15s apart = 45s max
+            log.info(
+                "%s: 0/%d manifests found, waiting 15s (retry %d/3)...",
+                recording_name, chunks_expected, _retry,
+            )
+            _time.sleep(15)
+            manifest_blobs = _list_manifests(recording_name)
+            if manifest_blobs:
+                log.info(
+                    "%s: found %d manifests after retry %d",
+                    recording_name, len(manifest_blobs), _retry,
+                )
+                break
+
     if not manifest_blobs:
-        log.warning("No manifests found for %s — writing provisional status (will retry on next recording.db upload)", recording_name)
+        log.warning("No manifests found for %s — writing provisional status (will retry on next trigger upload)", recording_name)
         # Write "complete_empty" status — this does NOT block reprocessing.
-        # If manifests arrive later and recording.db is re-uploaded (e.g. via
+        # If manifests arrive later and a trigger file is re-uploaded (e.g. via
         # `screencap upload`), the idempotency check will allow reprocessing.
         _upload_json(f"{sessions_prefix}_processing_status.json", {
             "status": "complete_empty",
             "started_at": started_at,
             "completed_at": datetime.now(timezone.utc).isoformat(),
             "processor_version": PROCESSOR_VERSION,
-            "source_db_md5": db_md5,
+            "trigger_id": trigger_id,
+            "trigger_file": trigger_file,
+            "source_db_md5": trigger_id if trigger_file == "recording.db" else None,
             "chunks_found": 0,
             "manifests_found": 0,
-            "note": "No manifests found. Will reprocess if recording.db is re-uploaded after manifests arrive.",
+            "note": "No manifests found. Will reprocess on next trigger upload.",
         })
         return
+
+    # Sentinel-triggered: verify all expected manifests are present
+    if trigger_file == "recording_complete.json" and chunks_expected > 0:
+        # Retry if some manifests are still missing
+        if len(manifest_blobs) < chunks_expected:
+            import time as _time
+            for _retry in range(1, 4):
+                log.info(
+                    "%s: %d/%d manifests found, waiting 15s (retry %d/3)...",
+                    recording_name, len(manifest_blobs), chunks_expected, _retry,
+                )
+                _time.sleep(15)
+                manifest_blobs = _list_manifests(recording_name)
+                if len(manifest_blobs) >= chunks_expected:
+                    log.info("%s: all %d manifests found after retry %d",
+                             recording_name, len(manifest_blobs), _retry)
+                    break
+
+        if len(manifest_blobs) < chunks_expected:
+            log.warning(
+                "%s: expected %d manifests but found %d — provisional status for retry",
+                recording_name, chunks_expected, len(manifest_blobs),
+            )
+            _upload_json(f"{sessions_prefix}_processing_status.json", {
+                "status": "complete_empty",
+                "started_at": started_at,
+                "completed_at": datetime.now(timezone.utc).isoformat(),
+                "processor_version": PROCESSOR_VERSION,
+                "trigger_id": trigger_id,
+                "trigger_file": trigger_file,
+                "chunks_found": len(manifest_blobs),
+                "chunks_expected": chunks_expected,
+                "manifests_found": len(manifest_blobs),
+                "note": f"Expected {chunks_expected} manifests, found {len(manifest_blobs)}. "
+                        "Will reprocess on recording.db upload via screencap upload.",
+            })
+            return
 
     manifests = []
     for blob_name in manifest_blobs:
@@ -765,7 +821,9 @@ def process_recording(cloud_event):
         "started_at": started_at,
         "completed_at": datetime.now(timezone.utc).isoformat(),
         "processor_version": PROCESSOR_VERSION,
-        "source_db_md5": db_md5,
+        "trigger_id": trigger_id,
+        "trigger_file": trigger_file,
+        "source_db_md5": trigger_id if trigger_file == "recording.db" else None,
         "chunks_found": len(manifests),
         "manifests_found": len(manifest_blobs),
         "tasks_before_merge": tasks_before,
