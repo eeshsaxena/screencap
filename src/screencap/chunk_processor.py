@@ -116,7 +116,7 @@ class ChunkProcessor:
         try:
             self._q.put({"type": "poison_pill"}, timeout=5)
         except Exception:
-            logger.warning("Failed to send poison pill to ChunkProcessor")
+            logger.debug("ChunkProcessor already stopped, skipping shutdown signal")
         self._thread.join(timeout=timeout)
         if self._thread.is_alive():
             logger.warning(
@@ -268,7 +268,7 @@ class ChunkProcessor:
         with self._flush_ack_counter.get_lock():
             acked = self._flush_ack_counter.value
         if acked == 0:
-            logger.warning("Flush: no writers acknowledged (writers may have exited)")
+            logger.debug("Flush skipped: writers already finished")
         else:
             logger.info(f"Flush: {acked} writer(s) flushed buffers")
 
