@@ -981,9 +981,25 @@ def start_recording(
                 if verbose:
                     console.print(f"[yellow]Warning:[/yellow] DB upload failed: {e}")
 
-        # Stub recording if all chunks AND db uploaded
+        # Sentinel upload for cloud-intent recordings (triggers stitching)
+        if cloud_intent and live_upload:
+            try:
+                from screencap.chunk_processor import upload_sentinel
+                _n_chunks = len(list(capture_dir.glob("chunk_*_manifest.json")))
+                _sentinel_uploaded = upload_sentinel(
+                    capture_dir, _recording_name,
+                    stop_reason=_stop_reason or "graceful",
+                    chunks_expected=_n_chunks,
+                )
+                if not _sentinel_uploaded:
+                    console.print("[yellow]Sentinel upload failed — run 'screencap upload' to trigger stitching.[/yellow]")
+            except Exception as e:
+                if verbose:
+                    console.print(f"[yellow]Warning:[/yellow] Sentinel upload failed: {e}")
+
+        # Stub recording if all chunks AND (db or sentinel) uploaded
         _has_chunk_files = any(capture_dir.glob("chunk_*.mp4"))
-        if chunk_processor.all_chunks_uploaded() and _db_uploaded and live_upload and _has_chunk_files:
+        if chunk_processor.all_chunks_uploaded() and (_db_uploaded or _sentinel_uploaded) and live_upload and _has_chunk_files:
             try:
                 from screencap.chunk_processor import stub_recording
                 deleted = stub_recording(capture_dir)
