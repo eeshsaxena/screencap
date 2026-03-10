@@ -1020,6 +1020,7 @@ def stub_recording(recording_dir: Path) -> list[str]:
     keep_patterns = {
         "recording.db", "capture.db", ".upload_status.json",
         "session_summary.json", "profiling.json",
+        "recording_complete.json",
     }
     keep_prefixes = (".chunk_", "chunk_")
     keep_suffixes = ("_manifest.json", ".json", ".txt")
