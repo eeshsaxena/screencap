@@ -131,7 +131,7 @@ class TestMaskWindowIntegration:
         original_brightness = _avg_brightness(img_path)
 
         _scrub_screenshots_with_policy(
-            dst, evaluator, classifier, window_events, [], result
+            dst, evaluator, classifier, window_events, result
         )
 
         assert img_path.exists(), "MASK_WINDOW should keep the file, not delete it"
@@ -149,7 +149,7 @@ class TestMaskWindowIntegration:
         corrupt_path.write_bytes(b"not a jpeg")
 
         _scrub_screenshots_with_policy(
-            dst, evaluator, classifier, window_events, [], result
+            dst, evaluator, classifier, window_events, result
         )
 
         assert not corrupt_path.exists(), "Corrupt image should be deleted for safety"
@@ -177,7 +177,7 @@ class TestMaskWindowIntegration:
         result = ScrubResult()
 
         _scrub_screenshots_with_policy(
-            tmp_path, evaluator, classifier, window_events, [], result
+            tmp_path, evaluator, classifier, window_events, result
         )
 
         for ts, bundle_id in surfaces:
@@ -201,7 +201,7 @@ class TestMaskWindowIntegration:
         )
 
         _scrub_screenshots_with_policy(
-            dst, evaluator, classifier, window_events, [], result
+            dst, evaluator, classifier, window_events, result
         )
 
         assert not (dst / "screenshots" / "22.0.jpg").exists()

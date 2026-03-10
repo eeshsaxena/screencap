@@ -140,7 +140,7 @@ class TestScreenshotRouting:
         result = ScrubResult()
 
         _scrub_screenshots_with_policy(
-            dst, evaluator, classifier, window_events, [], result
+            dst, evaluator, classifier, window_events, result
         )
 
         assert not (dst / "screenshots" / "22.0.jpg").exists()
@@ -156,7 +156,7 @@ class TestScreenshotRouting:
         result = ScrubResult()
 
         _scrub_screenshots_with_policy(
-            dst, evaluator, classifier, window_events, [], result
+            dst, evaluator, classifier, window_events, result
         )
 
         assert (dst / "screenshots" / "15.0.jpg").exists()
@@ -181,7 +181,7 @@ class TestScreenshotRouting:
         result = ScrubResult()
 
         _scrub_screenshots_with_policy(
-            dst, evaluator, classifier, window_events, [], result
+            dst, evaluator, classifier, window_events, result
         )
 
         assert img_path.exists(), "OCR_FALLBACK should mask, not delete"
@@ -202,7 +202,7 @@ class TestScreenshotRouting:
         result = ScrubResult()
 
         _scrub_screenshots_with_policy(
-            dst, evaluator, classifier, window_events, [], result
+            dst, evaluator, classifier, window_events, result
         )
 
         assert len(result.audit_entries) == 1
