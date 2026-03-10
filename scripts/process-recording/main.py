@@ -23,7 +23,7 @@ from google.cloud import storage
 logging.basicConfig(level=logging.INFO, format="%(levelname)s %(message)s")
 log = logging.getLogger(__name__)
 
-BUCKET = "screencap-recordings"
+BUCKET = os.environ.get("SCREENCAP_BUCKET", "screencap-recordings")
 PROCESSOR_VERSION = "1.0.0"
 DEFAULT_REST_THRESHOLD = 120.0
 MAX_MERGE_GAP = 5.0  # max seconds between consecutive chunk boundaries

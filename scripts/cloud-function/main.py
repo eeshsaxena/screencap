@@ -26,6 +26,7 @@ Deploy:
 
 from __future__ import annotations
 
+import os
 import re
 from datetime import timedelta
 
@@ -35,7 +36,7 @@ import google.auth.transport.requests
 from flask import jsonify, request
 from google.cloud import storage
 
-BUCKET = "screencap-recordings"
+BUCKET = os.environ.get("SCREENCAP_BUCKET", "screencap-recordings")
 UPLOAD_EXPIRY_MINUTES = 15
 DOWNLOAD_EXPIRY_HOURS = 4
 MAX_FILES = 500
