@@ -1217,7 +1217,7 @@ def scrub_recording(
         )
 
         # Phase 2: Load recording-specific context — gracefully fall back
-        # if the DB lacks window/browser event tables (older recordings).
+        # if the DB lacks window event tables (older recordings).
         try:
             db_path = find_db(dst)
             window_events = load_window_events(db_path) if db_path else []

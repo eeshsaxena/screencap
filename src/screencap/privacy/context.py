@@ -1,13 +1,13 @@
 """Context association and classification for privacy v3.
 
-Bridges screenshots to app/window/browser context via timestamp
+Bridges screenshots to app/window context via timestamp
 correlation, then classifies the context for policy decisions.
 
 Owns:
 - screenshot timestamp parsing
 - nearest-event lookup (bisect-based)
 - bundle-ID → ContextClass mapping
-- browser domain evidence
+- domain evidence (via domain field on FrameMetadata)
 - title heuristic enrichment
 - deterministic state machine with temporal hold/decay
 """
@@ -68,7 +68,7 @@ class WindowContext:
 def _active_at_index(timestamps: list[float], target: float) -> int | None:
     """Return index of the latest timestamp at or before target.
 
-    Window/browser events represent state transitions, so the active
+    Window events represent state transitions, so the active
     state at any time T is the most recent event with timestamp <= T.
     Returns None if no event is at or before target.
     """

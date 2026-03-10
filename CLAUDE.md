@@ -38,7 +38,7 @@ No linting is configured for the root `screencap` package. The vendored sub-pack
 - `viewer.py` — opens `viewer.html` via macOS `open` command.
 
 **Vendored packages (under `packages/`):**
-- `screencap-engine` (`sc_engine`) — multi-process recording (pynput, mss, av/ffmpeg, sounddevice). SQLAlchemy + Alembic for per-capture SQLite DBs. Has its own entry point (`capture`).
+- `screencap-engine` (`sc_engine`) — multi-process recording (pynput, mss, av/ffmpeg, sounddevice). SQLAlchemy for per-capture SQLite DBs. Has its own entry point (`capture`).
 
 The vendored package is co-installed via the root `pyproject.toml` `packages.find.where` — it is NOT a separate pip install.
 
