@@ -46,6 +46,7 @@ class ChunkProcessor:
         cloud_intent: bool = False,
         privacy_mode: str = "internal",
         screen_filter=None,
+        segmentation_mode: str = "llm",
     ) -> None:
         self._capture_dir = Path(capture_dir)
         self._db_path = self._capture_dir / "recording.db"
@@ -60,6 +61,7 @@ class ChunkProcessor:
         self._cloud_intent = cloud_intent
         self._privacy_mode = privacy_mode
         self._screen_filter = screen_filter
+        self._segmentation_mode = segmentation_mode
 
         # Initialize scrubbing pipeline for cloud-intent recordings
         self._pipeline = None
@@ -562,6 +564,7 @@ class ChunkProcessor:
             self._capture_dir, idx, start_ts, end_ts,
             rest_threshold=self._rest_threshold,
             blocked_intervals=blocked_intervals,
+            segmentation_mode=self._segmentation_mode,
         )
 
     def _scrub_chunk_files(self, idx: int, transcript_path: Path | None) -> None:
@@ -691,21 +694,29 @@ class ChunkProcessor:
         os.rename(tmp_path, str(path))
 
     def _scrub_manifest(self, path: Path) -> None:
-        """Scrub dominant_title in manifest and re-derive task name from clean title."""
+        """Scrub PII from manifest.
+
+        v2 manifests (format_version: 2) have no tasks/titles — nothing to scrub.
+        Legacy manifests: scrub dominant_title and re-derive task name.
+        """
+        data = json.loads(path.read_text(encoding="utf-8"))
+
+        # v2 manifests have no text fields to scrub
+        if data.get("format_version", 0) >= 2:
+            return
+
+        # Legacy manifest: scrub task titles
         from screencap.task_manifest import _derive_task_name
 
-        data = json.loads(path.read_text(encoding="utf-8"))
         for task in data.get("tasks", []):
             title = task.get("dominant_title", "")
             if title:
                 scrubbed_title = self._scrub_text_field(title)
                 task["dominant_title"] = scrubbed_title
-                # Re-derive task name from scrubbed title
                 task["derived_name"] = _derive_task_name({
                     "bundle_id": task.get("dominant_app", ""),
                     "title": scrubbed_title,
                 })
-        # Update primary_task in summary
         if data.get("tasks"):
             primary = max(
                 data["tasks"],
