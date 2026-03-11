@@ -301,6 +301,25 @@ class TestInlineScrubbing:
         assert "<PERSON>" in task["dominant_title"]
         assert "john-smith" not in task["derived_name"]
 
+    def test_scrub_v2_manifest_skips(self, cloud_capture_dir, cloud_processor):
+        """v2 manifests have no text fields — scrub should be a no-op."""
+        manifest_path = cloud_capture_dir / "chunk_0000_manifest.json"
+        original = {
+            "format_version": 2,
+            "chunk_index": 0,
+            "chunk_start": 1000.0,
+            "chunk_end": 2000.0,
+            "stats": {"total_events": 42, "total_window_switches": 3},
+            "blocked_intervals": [],
+        }
+        manifest_path.write_text(json.dumps(original))
+
+        cloud_processor._scrub_manifest(manifest_path)
+
+        # File should be unchanged
+        data = json.loads(manifest_path.read_text())
+        assert data == original
+
     def test_scrub_text_field_returns_sentinel_on_all_detectors_failed(
         self, cloud_capture_dir, cloud_processor,
     ):
