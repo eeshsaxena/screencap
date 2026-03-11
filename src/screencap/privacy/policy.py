@@ -424,6 +424,10 @@ class DefaultPolicyEvaluator:
             )
 
         # 2. Explicit app allow (unless matrix says EXCLUDE)
+        # For browsers: allow_apps means "capture by default" but the URL
+        # classifier's per-site decisions still apply. When the classifier
+        # refined the context beyond BROWSER_UNVERIFIED, fall through to
+        # the matrix so sensitive sites are still gated.
         if metadata.bundle_id and self._config.is_allowed_app(metadata.bundle_id):
             matrix_action = get_matrix_action(context.context_class, mode)
             if matrix_action == PrivacyAction.EXCLUDE:
@@ -432,11 +436,19 @@ class DefaultPolicyEvaluator:
                     reason=ReasonCode.POLICY_EXCLUDED_APP,
                     evidence=f"matrix override: {context.context_class.value}",
                 )
-            return ActionDecision(
-                action=PrivacyAction.ALLOW,
-                reason=ReasonCode.POLICY_ALLOWED_APP,
-                evidence=metadata.bundle_id,
+            # Browser with refined context → let the matrix decide
+            is_browser = (
+                self._config.app_classes.get(metadata.bundle_id)
+                == ContextClass.BROWSER_UNVERIFIED
             )
+            if is_browser and context.context_class != ContextClass.BROWSER_UNVERIFIED:
+                pass  # fall through to matrix (step 5)
+            else:
+                return ActionDecision(
+                    action=PrivacyAction.ALLOW,
+                    reason=ReasonCode.POLICY_ALLOWED_APP,
+                    evidence=metadata.bundle_id,
+                )
 
         # 3. Domain mask
         if metadata.domain and self._config.is_masked_domain(metadata.domain):

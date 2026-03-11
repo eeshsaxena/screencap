@@ -322,6 +322,11 @@ _TITLE_HEURISTICS: list[tuple[re.Pattern[str], ContextClass]] = [
     (re.compile(r"(?i)\b1password\b"), ContextClass.PASSWORD_MANAGER),
     (re.compile(r"(?i)\bbitwarden\b"), ContextClass.PASSWORD_MANAGER),
     (re.compile(r"(?i)\bbank\b"), ContextClass.BANKING),
+    (re.compile(r"(?i)\blogin\b"), ContextClass.AUTH_FLOW),
+    (re.compile(r"(?i)\bsign.in\b"), ContextClass.AUTH_FLOW),
+    (re.compile(r"(?i)\bpasskey\b"), ContextClass.AUTH_FLOW),
+    (re.compile(r"(?i)\bpassword\b"), ContextClass.AUTH_FLOW),
+    (re.compile(r"(?i)\b(?:two.factor|2fa|mfa)\b"), ContextClass.AUTH_FLOW),
 ]
 
 
@@ -452,13 +457,17 @@ class DefaultContextClassifier:
         domain = metadata.domain
         title = metadata.window_title
 
-        # 1. User config override
+        # 1. User config override (non-browser apps only — browsers need
+        #    domain/keyword/title refinement in step 3)
         if bundle_id and bundle_id in self._app_classes:
-            return ContextResult(
-                context_class=self._app_classes[bundle_id],
-                confidence="user_config",
-                evidence=bundle_id,
-            )
+            cfg_class = self._app_classes[bundle_id]
+            if cfg_class != ContextClass.BROWSER_UNVERIFIED:
+                return ContextResult(
+                    context_class=cfg_class,
+                    confidence="user_config",
+                    evidence=bundle_id,
+                )
+            # BROWSER_UNVERIFIED → fall through to step 3 for refinement
 
         # 2. Known app bundle ID
         if bundle_id and bundle_id in BUNDLE_ID_MAP:
@@ -468,8 +477,12 @@ class DefaultContextClassifier:
                 evidence=bundle_id,
             )
 
-        # 3. Known browser
-        if bundle_id and bundle_id in BROWSER_BUNDLE_IDS:
+        # 3. Known browser (hardcoded set OR user-config tagged as browser_unverified)
+        is_browser = bundle_id and (
+            bundle_id in BROWSER_BUNDLE_IDS
+            or self._app_classes.get(bundle_id) == ContextClass.BROWSER_UNVERIFIED
+        )
+        if is_browser:
             if domain:
                 # Extract URL path from browser_url if available
                 url_path = ""
