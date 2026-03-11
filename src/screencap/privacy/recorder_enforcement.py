@@ -209,6 +209,7 @@ class RecorderPrivacyFilter:
             window_title=title,
             domain=domain,
             timestamp=time.monotonic(),
+            browser_url=browser_url,
         )
         ctx = self._classifier.classify(meta)
         decision = self._evaluator.evaluate(ctx, meta)

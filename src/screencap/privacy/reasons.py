@@ -28,6 +28,9 @@ class ReasonCode:
     CONTEXT_ADMIN_CONSOLE = "context_admin_console"
     CONTEXT_CODE_EDITOR_TERMINAL = "context_code_editor_terminal"
     CONTEXT_BROWSER_UNVERIFIED = "context_browser_unverified"
+    CONTEXT_AUTH_FLOW = "context_auth_flow"
+    CONTEXT_PAYMENT_FLOW = "context_payment_flow"
+    CONTEXT_CLOUD_STORAGE = "context_cloud_storage"
     CONTEXT_UNKNOWN = "context_unknown"
 
     # Secure input reasons (capture-time detection)

@@ -63,6 +63,9 @@ dev = [
 [project.scripts]
 screencap = "screencap.cli:cli"
 
+[tool.setuptools.package-data]
+"screencap.privacy" = ["data/**/*.txt", "data/**/VERSION", "data/**/LICENSE"]
+
 [tool.setuptools.packages.find]
 where = ["src", "packages/screencap-engine"]
 

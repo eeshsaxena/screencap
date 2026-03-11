@@ -19,9 +19,18 @@ import re
 import sqlite3
 from dataclasses import dataclass
 from pathlib import Path
-from urllib.parse import urlparse
+from urllib.parse import unquote, urlparse
 
-from screencap.privacy.policy import ContextClass, ContextResult, FrameMetadata
+from screencap.privacy.actions import stricter
+from screencap.privacy.policy import (
+    ContextClass,
+    ContextResult,
+    FrameMetadata,
+    PrivacyMode,
+    get_matrix_action,
+)
+
+
 
 
 # ---------------------------------------------------------------------------
@@ -64,6 +73,7 @@ class WindowContext:
     title: str
     window_id: str = ""
     domain: str | None = None
+    browser_url: str | None = None
 
 
 def _active_at_index(timestamps: list[float], target: float) -> int | None:
@@ -146,14 +156,16 @@ def load_window_events(db_path: Path) -> list[WindowContext]:
         results = []
         for row in cur:
             domain = None
-            if has_browser_url and row[4]:
-                domain = domain_from_url(row[4])
+            raw_url = row[4] if has_browser_url else None
+            if raw_url:
+                domain = domain_from_url(raw_url)
             results.append(WindowContext(
                 timestamp=float(row[0]),
                 app_bundle_id=row[1] or "",
                 title=row[2] or "",
                 window_id=row[3] or "",
                 domain=domain,
+                browser_url=raw_url or None,
             ))
         return results
     finally:
@@ -297,46 +309,6 @@ BROWSER_BUNDLE_IDS: frozenset[str] = frozenset({
     "org.torproject.torbrowser",
 })
 
-# Domain → ContextClass for browser classification with verified domain.
-_DOMAIN_CLASS_MAP: dict[str, ContextClass] = {
-    # Email
-    "mail.google.com": ContextClass.EMAIL,
-    "outlook.live.com": ContextClass.EMAIL,
-    "outlook.office.com": ContextClass.EMAIL,
-    "outlook.office365.com": ContextClass.EMAIL,
-    "mail.yahoo.com": ContextClass.EMAIL,
-    "mail.proton.me": ContextClass.EMAIL,
-    "app.fastmail.com": ContextClass.EMAIL,
-    # Chat
-    "app.slack.com": ContextClass.CHAT,
-    "discord.com": ContextClass.CHAT,
-    "web.whatsapp.com": ContextClass.CHAT,
-    "web.telegram.org": ContextClass.CHAT,
-    "teams.microsoft.com": ContextClass.CHAT,
-    # Calendar
-    "calendar.google.com": ContextClass.CALENDAR,
-    # Video call
-    "meet.google.com": ContextClass.VIDEO_CALL,
-    "zoom.us": ContextClass.VIDEO_CALL,
-    # Banking (US majors)
-    "chase.com": ContextClass.BANKING,
-    "secure.bankofamerica.com": ContextClass.BANKING,
-    "online.citi.com": ContextClass.BANKING,
-    "wellsfargo.com": ContextClass.BANKING,
-    # Password managers
-    "vault.bitwarden.com": ContextClass.PASSWORD_MANAGER,
-    "my.1password.com": ContextClass.PASSWORD_MANAGER,
-    # Admin consoles
-    "console.aws.amazon.com": ContextClass.ADMIN_CONSOLE,
-    "console.cloud.google.com": ContextClass.ADMIN_CONSOLE,
-    "portal.azure.com": ContextClass.ADMIN_CONSOLE,
-    "vercel.com": ContextClass.ADMIN_CONSOLE,
-    "dashboard.heroku.com": ContextClass.ADMIN_CONSOLE,
-    # Code
-    "github.com": ContextClass.CODE_EDITOR_TERMINAL,
-    "gitlab.com": ContextClass.CODE_EDITOR_TERMINAL,
-}
-
 # Title patterns for heuristic enrichment.
 # These do NOT replace verified domain evidence — they provide a hint
 # when no better signal is available.
@@ -355,16 +327,22 @@ _TITLE_HEURISTICS: list[tuple[re.Pattern[str], ContextClass]] = [
 ]
 
 
-def _classify_domain(domain: str) -> ContextClass | None:
-    """Classify by exact domain match or parent-domain match."""
-    domain = domain.lower()
-    if domain in _DOMAIN_CLASS_MAP:
-        return _DOMAIN_CLASS_MAP[domain]
-    # Check parent domains (e.g., "app.slack.com" matches "slack.com")
-    for known_domain, ctx_class in _DOMAIN_CLASS_MAP.items():
-        if domain.endswith("." + known_domain):
-            return ctx_class
-    return None
+# ---------------------------------------------------------------------------
+# Keyword sets for auth/payment flow detection (Phase 4)
+# ---------------------------------------------------------------------------
+
+_AUTH_KEYWORDS: frozenset[str] = frozenset({
+    "login", "signin", "sign-in", "auth", "authenticate",
+    "oauth", "sso", "mfa", "2fa", "verify", "recovery",
+    "forgot-password", "reset-password",
+})
+
+_PAYMENT_KEYWORDS: frozenset[str] = frozenset({
+    "checkout", "billing", "payment", "pay", "subscribe",
+})
+
+# Delimiters for tokenizing URL path segments and subdomain labels.
+_SEGMENT_SPLIT_RE = re.compile(r"[-_.]")
 
 
 def _classify_title(title: str) -> tuple[ContextClass, str] | None:
@@ -381,24 +359,91 @@ def _classify_title(title: str) -> tuple[ContextClass, str] | None:
 
 
 class DefaultContextClassifier:
-    """Deterministic context classifier.
+    """Deterministic context classifier with hybrid domain + keyword layers.
 
     Classification priority:
     1. User config app_classes override → direct class
     2. Bundle ID in known app map → direct class
     3. Bundle ID is a known browser:
-       a. With verified domain → domain-based class
-       b. Without domain → browser_unverified
-       c. With title heuristic (weaker signal) → heuristic class
+       a. Domain lookup in merged index (UT1 + supplement)
+       b. Keyword detection on URL path/subdomain (auth/payment flows)
+       c. When both match → stricter action wins
+       d. Title heuristic (weaker signal)
+       e. No domain evidence → browser_unverified
     4. Title heuristic for non-browser apps
     5. unknown (explicit, never implicit fallthrough)
     """
 
     def __init__(
         self,
-        app_classes: dict[str, "ContextClass"] | None = None,
+        app_classes: dict[str, ContextClass] | None = None,
+        domain_index: dict[str, ContextClass] | None = None,
     ) -> None:
         self._app_classes = app_classes or {}
+        if domain_index is not None:
+            self._domain_index = domain_index
+        else:
+            from screencap.privacy.domain_loader import build_domain_index
+            self._domain_index = build_domain_index()
+
+    def _classify_domain(self, domain: str) -> ContextClass | None:
+        """O(1) domain lookup in the merged index."""
+        domain = domain.lower().rstrip(".")
+        if domain in self._domain_index:
+            return self._domain_index[domain]
+        # Walk up parent domains for cases not covered by pre-expansion
+        labels = domain.split(".")
+        for i in range(1, len(labels) - 1):
+            parent = ".".join(labels[i:])
+            if parent in self._domain_index:
+                return self._domain_index[parent]
+        return None
+
+    def _detect_keyword_flow(
+        self, url_path: str, hostname: str
+    ) -> ContextClass | None:
+        """Check first URL path segment and subdomain labels for auth/payment keywords."""
+        # Check first path segment
+        if url_path and url_path != "/":
+            # Split path, take first segment after leading /
+            segments = url_path.lstrip("/").split("/", 1)
+            if segments:
+                first_seg = unquote(segments[0]).lower()
+                tokens = set(_SEGMENT_SPLIT_RE.split(first_seg))
+                if tokens & _AUTH_KEYWORDS:
+                    return ContextClass.AUTH_FLOW
+                if tokens & _PAYMENT_KEYWORDS:
+                    return ContextClass.PAYMENT_FLOW
+
+        # Check subdomain labels
+        if hostname:
+            labels = hostname.lower().split(".")
+            # Strip the last 2 labels (registered domain + TLD) as a heuristic.
+            # For two-part TLDs like co.uk, strip 3.
+            suffix_len = 2
+            if len(labels) >= 3:
+                last_two = labels[-2]
+                if last_two in ("co", "com", "org", "net", "ac", "gov", "edu"):
+                    suffix_len = 3
+            subdomain_labels = labels[: max(0, len(labels) - suffix_len)]
+            for label in subdomain_labels:
+                if label in _AUTH_KEYWORDS:
+                    return ContextClass.AUTH_FLOW
+                if label in _PAYMENT_KEYWORDS:
+                    return ContextClass.PAYMENT_FLOW
+
+        return None
+
+    def _pick_stricter(
+        self,
+        class_a: ContextClass,
+        class_b: ContextClass,
+        mode: PrivacyMode = PrivacyMode.PUBLIC,
+    ) -> ContextClass:
+        """Return whichever ContextClass produces the stricter action."""
+        action_a = get_matrix_action(class_a, mode)
+        action_b = get_matrix_action(class_b, mode)
+        return class_a if stricter(action_a, action_b) == action_a else class_b
 
     def classify(self, metadata: FrameMetadata) -> ContextResult:
         bundle_id = metadata.bundle_id
@@ -421,21 +466,44 @@ class DefaultContextClassifier:
                 evidence=bundle_id,
             )
 
-        # 2. Known browser
+        # 3. Known browser
         if bundle_id and bundle_id in BROWSER_BUNDLE_IDS:
-            # 2a. Verified domain
             if domain:
-                domain_class = _classify_domain(domain)
+                # Extract URL path from browser_url if available
+                url_path = ""
+                hostname = domain
+                if metadata.browser_url:
+                    try:
+                        parsed = urlparse(metadata.browser_url)
+                        url_path = parsed.path or ""
+                        hostname = parsed.hostname or domain
+                    except Exception:
+                        pass
+
+                domain_class = self._classify_domain(domain)
+                keyword_class = self._detect_keyword_flow(url_path, hostname)
+
+                if domain_class is not None and keyword_class is not None:
+                    winner = self._pick_stricter(domain_class, keyword_class)
+                    return ContextResult(
+                        context_class=winner,
+                        confidence="domain+keyword",
+                        evidence=f"{domain} (stricter of {domain_class.value}, {keyword_class.value})",
+                    )
                 if domain_class is not None:
                     return ContextResult(
                         context_class=domain_class,
                         confidence="domain",
                         evidence=domain,
                     )
-                # Domain known but not in our map — still a verified browser
-                # but we don't know the class, fall through to title or unverified
+                if keyword_class is not None:
+                    return ContextResult(
+                        context_class=keyword_class,
+                        confidence="keyword",
+                        evidence=f"keyword:{domain}",
+                    )
 
-            # 2b. Title heuristic (weaker than domain)
+            # 3d. Title heuristic (weaker than domain)
             if title:
                 title_result = _classify_title(title)
                 if title_result is not None:
@@ -446,14 +514,14 @@ class DefaultContextClassifier:
                         evidence=f"browser_title: {pattern}",
                     )
 
-            # 2c. No domain evidence → browser_unverified
+            # 3e. No domain evidence → browser_unverified
             return ContextResult(
                 context_class=ContextClass.BROWSER_UNVERIFIED,
                 confidence="bundle_id",
                 evidence=f"browser_no_domain: {bundle_id}",
             )
 
-        # 3. Unknown app — title heuristic
+        # 4. Unknown app — title heuristic
         if title:
             title_result = _classify_title(title)
             if title_result is not None:
@@ -464,7 +532,7 @@ class DefaultContextClassifier:
                     evidence=f"title: {pattern}",
                 )
 
-        # 4. Explicit unknown
+        # 5. Explicit unknown
         return ContextResult(
             context_class=ContextClass.UNKNOWN,
             confidence="none",
@@ -510,4 +578,5 @@ def associate_screenshot(
         window_title=window.title if window else "",
         domain=window.domain if window else None,
         timestamp=screenshot_ts,
+        browser_url=window.browser_url if window else None,
     )

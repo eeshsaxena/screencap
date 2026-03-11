@@ -52,6 +52,9 @@ class ContextClass(Enum):
     BROWSER_UNVERIFIED = "browser_unverified"
     CODE_EDITOR_TERMINAL = "code_editor_terminal"
     ADMIN_CONSOLE = "admin_console"
+    AUTH_FLOW = "auth_flow"
+    PAYMENT_FLOW = "payment_flow"
+    CLOUD_STORAGE = "cloud_storage"
     UNKNOWN = "unknown"
 
 
@@ -100,6 +103,18 @@ _ACTION_MATRIX: dict[tuple[ContextClass, PrivacyMode], PrivacyAction] = {
     (ContextClass.ADMIN_CONSOLE, PrivacyMode.PUBLIC): PrivacyAction.OCR_FALLBACK,
     (ContextClass.ADMIN_CONSOLE, PrivacyMode.SHARED): PrivacyAction.TEXT_REDACT,
     (ContextClass.ADMIN_CONSOLE, PrivacyMode.INTERNAL): PrivacyAction.ALLOW,
+    # auth_flow — login/SSO pages get maximum protection
+    (ContextClass.AUTH_FLOW, PrivacyMode.PUBLIC): PrivacyAction.EXCLUDE,
+    (ContextClass.AUTH_FLOW, PrivacyMode.SHARED): PrivacyAction.EXCLUDE,
+    (ContextClass.AUTH_FLOW, PrivacyMode.INTERNAL): PrivacyAction.MASK_WINDOW,
+    # payment_flow — checkout/billing pages
+    (ContextClass.PAYMENT_FLOW, PrivacyMode.PUBLIC): PrivacyAction.EXCLUDE,
+    (ContextClass.PAYMENT_FLOW, PrivacyMode.SHARED): PrivacyAction.EXCLUDE,
+    (ContextClass.PAYMENT_FLOW, PrivacyMode.INTERNAL): PrivacyAction.MASK_WINDOW,
+    # cloud_storage
+    (ContextClass.CLOUD_STORAGE, PrivacyMode.PUBLIC): PrivacyAction.MASK_WINDOW,
+    (ContextClass.CLOUD_STORAGE, PrivacyMode.SHARED): PrivacyAction.MASK_REGION,
+    (ContextClass.CLOUD_STORAGE, PrivacyMode.INTERNAL): PrivacyAction.ALLOW,
     # unknown — fail closed in public
     (ContextClass.UNKNOWN, PrivacyMode.PUBLIC): PrivacyAction.MASK_WINDOW,
     (ContextClass.UNKNOWN, PrivacyMode.SHARED): PrivacyAction.OCR_FALLBACK,
@@ -324,6 +339,7 @@ class FrameMetadata:
     window_title: str = ""
     domain: str | None = None  # None = unknown/unavailable
     timestamp: float = 0.0
+    browser_url: str | None = None  # Full URL for keyword detection
 
 
 @dataclass(frozen=True)
@@ -363,6 +379,9 @@ _CONTEXT_REASON: dict[ContextClass, str] = {
     ContextClass.BROWSER_UNVERIFIED: ReasonCode.CONTEXT_BROWSER_UNVERIFIED,
     ContextClass.CODE_EDITOR_TERMINAL: ReasonCode.CONTEXT_CODE_EDITOR_TERMINAL,
     ContextClass.ADMIN_CONSOLE: ReasonCode.CONTEXT_ADMIN_CONSOLE,
+    ContextClass.AUTH_FLOW: ReasonCode.CONTEXT_AUTH_FLOW,
+    ContextClass.PAYMENT_FLOW: ReasonCode.CONTEXT_PAYMENT_FLOW,
+    ContextClass.CLOUD_STORAGE: ReasonCode.CONTEXT_CLOUD_STORAGE,
     ContextClass.UNKNOWN: ReasonCode.CONTEXT_UNKNOWN,
 }
 

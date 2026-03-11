@@ -1,0 +1,15 @@
+UT1 Blocklist Data
+==================
+
+Source: Université Toulouse Capitole
+Mirror: https://github.com/olbat/ut1-blacklists
+License: Creative Commons Attribution-ShareAlike 4.0 International (CC BY-SA 4.0)
+         https://creativecommons.org/licenses/by-sa/4.0/
+
+This directory contains domain lists extracted from the UT1 blocklist project,
+used for privacy-aware browser domain classification in screencap.
+
+Only the following categories are included:
+  bank, financial, webmail, social_networks, chat, vpn
+
+IP addresses and non-domain entries have been stripped.
