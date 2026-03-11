@@ -618,6 +618,116 @@ def _cleanup_chunk_cache(
 
 
 # ---------------------------------------------------------------------------
+# App category classification (inline — Cloud Run doesn't have screencap pkg)
+# ---------------------------------------------------------------------------
+
+_BUNDLE_CATEGORY: dict[str, str] = {
+    # CODE
+    "com.microsoft.VSCode": "CODE",
+    "com.apple.Terminal": "CODE",
+    "com.googlecode.iterm2": "CODE",
+    "com.jetbrains.intellij": "CODE",
+    "com.jetbrains.pycharm": "CODE",
+    "com.jetbrains.WebStorm": "CODE",
+    "com.sublimetext.4": "CODE",
+    "com.sublimetext.3": "CODE",
+    "abnerworks.Typora": "CODE",
+    "com.todesktop.230313mzl4w4u92": "CODE",  # Cursor
+    "dev.warp.Warp-Stable": "CODE",
+    "com.github.Electron": "CODE",
+    # BROWSER
+    "com.apple.Safari": "BROWSER",
+    "com.google.Chrome": "BROWSER",
+    "org.mozilla.firefox": "BROWSER",
+    "com.brave.Browser": "BROWSER",
+    "com.operasoftware.Opera": "BROWSER",
+    "company.thebrowser.Browser": "BROWSER",  # Arc
+    "org.chromium.Chromium": "BROWSER",
+    "com.microsoft.edgemac": "BROWSER",
+    # CHAT
+    "com.tinyspeck.slackmacgap": "CHAT",
+    "com.apple.MobileSMS": "CHAT",
+    "ru.keepcoder.Telegram": "CHAT",
+    "com.hnc.Discord": "CHAT",
+    "us.zoom.xos": "CHAT",
+    "com.microsoft.teams2": "CHAT",
+    # EMAIL
+    "com.apple.mail": "EMAIL",
+    "com.readdle.smartemail-macos": "EMAIL",
+    "com.microsoft.Outlook": "EMAIL",
+    # DOCS
+    "com.apple.iWork.Pages": "DOCS",
+    "com.apple.iWork.Numbers": "DOCS",
+    "com.apple.iWork.Keynote": "DOCS",
+    "com.microsoft.Word": "DOCS",
+    "com.microsoft.Excel": "DOCS",
+    "com.microsoft.Powerpoint": "DOCS",
+    "md.obsidian": "DOCS",
+    "com.craft.craft": "DOCS",
+    "com.electron.logseq": "DOCS",
+    # DESIGN
+    "com.figma.Desktop": "DESIGN",
+    "com.bohemiancoding.sketch3": "DESIGN",
+    # MEDIA
+    "com.apple.Music": "MEDIA",
+    "com.spotify.client": "MEDIA",
+    "com.apple.QuickTimePlayerX": "MEDIA",
+    # SYSTEM
+    "com.apple.finder": "SYSTEM",
+    "com.apple.systempreferences": "SYSTEM",
+    "com.apple.ActivityMonitor": "SYSTEM",
+}
+
+_DOMAIN_CATEGORY: dict[str, str] = {
+    "github.com": "CODE",
+    "gitlab.com": "CODE",
+    "stackoverflow.com": "CODE",
+    "bitbucket.org": "CODE",
+    "mail.google.com": "EMAIL",
+    "outlook.live.com": "EMAIL",
+    "outlook.office.com": "EMAIL",
+    "slack.com": "CHAT",
+    "discord.com": "CHAT",
+    "teams.microsoft.com": "CHAT",
+    "docs.google.com": "DOCS",
+    "notion.so": "DOCS",
+    "www.notion.so": "DOCS",
+    "coda.io": "DOCS",
+    "figma.com": "DESIGN",
+    "www.figma.com": "DESIGN",
+    "youtube.com": "MEDIA",
+    "www.youtube.com": "MEDIA",
+    "twitter.com": "SOCIAL",
+    "x.com": "SOCIAL",
+    "linkedin.com": "SOCIAL",
+    "www.linkedin.com": "SOCIAL",
+    "reddit.com": "SOCIAL",
+    "www.reddit.com": "SOCIAL",
+}
+
+
+def _classify_app(bundle_id: str, title: str = "", domain: str = "") -> str:
+    """Classify an app into a category from bundle ID, title, or domain."""
+    if bundle_id in _BUNDLE_CATEGORY:
+        return _BUNDLE_CATEGORY[bundle_id]
+    if domain:
+        if domain in _DOMAIN_CATEGORY:
+            return _DOMAIN_CATEGORY[domain]
+        bare = domain.removeprefix("www.")
+        if bare in _DOMAIN_CATEGORY:
+            return _DOMAIN_CATEGORY[bare]
+    return "OTHER"
+
+
+def _app_name_short(bundle_id: str) -> str:
+    """Extract short app name from bundle ID."""
+    if not bundle_id:
+        return "Unknown"
+    parts = bundle_id.split(".")
+    return parts[-1] if len(parts) >= 3 else bundle_id
+
+
+# ---------------------------------------------------------------------------
 # Entry point
 # ---------------------------------------------------------------------------
 
