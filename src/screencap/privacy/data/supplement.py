@@ -22,7 +22,8 @@ SUPPLEMENT: dict[str, str] = {
     "lastpass.com": "PASSWORD_MANAGER",
     "app.nordpass.com": "PASSWORD_MANAGER",
     "app.keepersecurity.com": "PASSWORD_MANAGER",
-    "app.proton.me/pass": "PASSWORD_MANAGER",  # Proton Pass web
+    # app.proton.me omitted: shared host for Pass/Mail/Drive — can't
+    # distinguish via domain alone; falls to BROWSER_UNVERIFIED (safe).
     # ── Admin consoles ──────────────────────────────────────────────
     "console.aws.amazon.com": "ADMIN_CONSOLE",
     "console.cloud.google.com": "ADMIN_CONSOLE",
@@ -75,6 +76,7 @@ SUPPLEMENT: dict[str, str] = {
     "mail.aol.com": "EMAIL",
     "mail.icloud.com": "EMAIL",
     # ── Chat (UT1 gaps) ────────────────────────────────────────────
+    "slack.com": "CHAT",  # covers tenant hosts like acme.slack.com
     "app.slack.com": "CHAT",
     "web.whatsapp.com": "CHAT",
     "web.telegram.org": "CHAT",

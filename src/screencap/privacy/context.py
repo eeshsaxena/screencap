@@ -22,6 +22,7 @@ from pathlib import Path
 from urllib.parse import unquote, urlparse
 
 from screencap.privacy.actions import stricter
+from screencap.privacy.domain_loader import _is_tld_like
 from screencap.privacy.policy import (
     ContextClass,
     ContextResult,
@@ -180,12 +181,9 @@ def domain_from_url(url: str) -> str | None:
     try:
         parsed = urlparse(url)
         return parsed.hostname or None
-    except Exception:
+    except ValueError:
         return None
 
-
-# Backward-compatible alias
-_domain_from_url = domain_from_url
 
 
 # ---------------------------------------------------------------------------
@@ -395,6 +393,8 @@ class DefaultContextClassifier:
         labels = domain.split(".")
         for i in range(1, len(labels) - 1):
             parent = ".".join(labels[i:])
+            if _is_tld_like(parent):
+                continue
             if parent in self._domain_index:
                 return self._domain_index[parent]
         return None
@@ -474,16 +474,25 @@ class DefaultContextClassifier:
                 # Extract URL path from browser_url if available
                 url_path = ""
                 hostname = domain
+                fragment_path = ""
                 if metadata.browser_url:
                     try:
                         parsed = urlparse(metadata.browser_url)
                         url_path = parsed.path or ""
                         hostname = parsed.hostname or domain
-                    except Exception:
+                        # SPA hash-routing: /#/login or /app#/login
+                        if parsed.fragment.startswith("/"):
+                            fragment_path = parsed.fragment
+                    except ValueError:
                         pass
 
                 domain_class = self._classify_domain(domain)
                 keyword_class = self._detect_keyword_flow(url_path, hostname)
+                # Fall back to hash-route fragment if path had no keyword
+                if keyword_class is None and fragment_path:
+                    keyword_class = self._detect_keyword_flow(
+                        fragment_path, hostname
+                    )
 
                 if domain_class is not None and keyword_class is not None:
                     winner = self._pick_stricter(domain_class, keyword_class)

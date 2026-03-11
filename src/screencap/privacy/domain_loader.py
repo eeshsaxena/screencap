@@ -50,6 +50,9 @@ def _normalize_domain(raw: str) -> str | None:
     # Must contain at least one dot
     if "." not in d:
         return None
+    # Reject entries with URL path components (e.g. "app.proton.me/pass")
+    if "/" in d:
+        return None
     return d
 
 
@@ -100,6 +103,8 @@ def load_supplement() -> dict[str, ContextClass]:
 _SLD_SUFFIXES: frozenset[str] = frozenset({
     "co", "com", "org", "net", "ac", "gov", "edu", "mil",
     "sch", "nhs", "police", "mod",
+    # Country-code SLDs found leaking from UT1 parent expansion
+    "or", "go", "gr", "ne", "ad", "lg", "asn", "web", "my", "id",
 })
 
 
@@ -115,27 +120,6 @@ def _is_tld_like(parent: str) -> bool:
     return labels[0] in _SLD_SUFFIXES
 
 
-def _expand_parents(index: dict[str, ContextClass]) -> dict[str, ContextClass]:
-    """Pre-expand parent domains for O(1) suffix matching.
-
-    For each domain like ``secure.bankofamerica.com``, insert
-    ``bankofamerica.com`` (and ``com`` is skipped — too broad) if not
-    already present.  Only inserts parents with 2+ labels.
-    Skips TLD-like parents (e.g. ``co.uk``, ``com.au``).
-    """
-    expansions: dict[str, ContextClass] = {}
-    for domain, ctx_class in index.items():
-        labels = domain.split(".")
-        # Generate parent domains by stripping leading labels
-        # e.g. a.b.c.com → b.c.com, c.com  (skip single-label "com")
-        for i in range(1, len(labels) - 1):
-            parent = ".".join(labels[i:])
-            if _is_tld_like(parent):
-                continue
-            if parent not in index and parent not in expansions:
-                expansions[parent] = ctx_class
-    return expansions
-
 
 def build_domain_index(
     ut1: dict[str, ContextClass] | None = None,
@@ -144,7 +128,10 @@ def build_domain_index(
     """Merge UT1 + supplement into a single domain index.
 
     Supplement overwrites UT1 on conflicts (curated > automated).
-    Parent domains are pre-expanded for O(1) lookup.
+    Parent matching is handled at query time by the walk-up in
+    ``DefaultContextClassifier._classify_domain()`` — no pre-expansion
+    is done here, to avoid false positives on shared hosts like
+    ``google.com`` (which would be wrongly created from ``mail.google.com``).
     """
     if ut1 is None:
         ut1 = load_ut1_domains()
@@ -154,10 +141,5 @@ def build_domain_index(
     # Start with UT1, then overlay supplement (supplement wins on conflict)
     merged = dict(ut1)
     merged.update(supplement)
-
-    # Pre-expand parents
-    parents = _expand_parents(merged)
-    for parent, ctx_class in parents.items():
-        merged.setdefault(parent, ctx_class)
 
     return merged
