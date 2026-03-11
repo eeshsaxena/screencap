@@ -728,6 +728,230 @@ def _app_name_short(bundle_id: str) -> str:
 
 
 # ---------------------------------------------------------------------------
+# Shared event iteration
+# ---------------------------------------------------------------------------
+
+def _iterate_events(
+    recording_name: str,
+    manifests: list[dict],
+) -> "Generator[dict, None, None]":
+    """Yield parsed events from all chunks' JSONL files, in chunk order."""
+    for manifest in sorted(manifests, key=lambda m: m["chunk_index"]):
+        chunk_idx = manifest["chunk_index"]
+        blob_name = f"recordings/{recording_name}/events_{chunk_idx:04d}.jsonl"
+        data = _blob_bytes(blob_name)
+        if data is None:
+            continue
+        for line in data.decode("utf-8", errors="replace").splitlines():
+            line = line.strip()
+            if not line:
+                continue
+            try:
+                evt = json.loads(line)
+            except json.JSONDecodeError:
+                continue
+            if not evt.get("_meta"):
+                yield evt
+
+
+# ---------------------------------------------------------------------------
+# Activity summary derivation (Step 3)
+# ---------------------------------------------------------------------------
+
+def _format_relative_time(seconds: float) -> str:
+    """Format seconds as H:MM:SS relative timestamp."""
+    h, rem = divmod(int(max(0, seconds)), 3600)
+    m, s = divmod(rem, 60)
+    return f"{h}:{m:02d}:{s:02d}"
+
+
+def _parse_relative_time(rel: str) -> float:
+    """Parse H:MM:SS relative timestamp back to seconds.
+
+    Returns 0.0 on malformed input instead of crashing.
+    """
+    try:
+        parts = rel.split(":")
+        if len(parts) == 3:
+            return int(parts[0]) * 3600 + int(parts[1]) * 60 + int(parts[2])
+        if len(parts) == 2:
+            return int(parts[0]) * 60 + int(parts[1])
+        return float(parts[0])
+    except (ValueError, TypeError):
+        log.warning("Malformed relative timestamp: %r", rel)
+        return 0.0
+
+
+def _derive_activity_summary(
+    recording_name: str,
+    manifests: list[dict],
+) -> dict | None:
+    """Build compact activity summary from events JSONL + transcripts.
+
+    Stream-parses events files line by line for memory efficiency.
+    Returns dict with keys: summary, entries, time_map, session_start, session_end.
+    Returns None if no events data exists.
+    """
+    session_start = min(m["chunk_start"] for m in manifests)
+    session_end = max(m["chunk_end"] for m in manifests)
+
+    entries: list[dict] = []
+    current_entry: dict | None = None
+    # Also collect raw data for fallback segmentation (avoids re-reading GCS)
+    raw_timestamps: list[float] = []
+    raw_window_events: list[dict] = []
+
+    for evt in _iterate_events(recording_name, manifests):
+        evt_type = evt.get("type", "")
+        ts = evt.get("timestamp", 0)
+
+        # Collect raw data for fallback
+        if ts > 0 and evt_type != "mouse.move":
+            raw_timestamps.append(ts)
+        if evt_type == "window.switch":
+            raw_window_events.append({
+                "timestamp": ts,
+                "bundle_id": evt.get("app_bundle_id", ""),
+                "title": evt.get("window_title", ""),
+            })
+
+        if evt_type == "window.switch":
+            if current_entry is not None:
+                current_entry["end_ts"] = ts
+                entries.append(current_entry)
+
+            bundle_id = evt.get("app_bundle_id", "")
+            title = evt.get("window_title", "")
+            domain = evt.get("domain", "") or ""
+
+            current_entry = {
+                "start_ts": ts, "end_ts": ts,
+                "app": _app_name_short(bundle_id),
+                "bundle_id": bundle_id,
+                "title": title[:80], "domain": domain,
+                "cat": _classify_app(bundle_id, title, domain),
+                "typed": [], "shortcuts": [],
+                "clicks": 0, "scrolls": 0,
+            }
+
+        elif evt_type == "key.type" and current_entry is not None:
+            text = evt.get("text", "")
+            if text and len(current_entry["typed"]) < 5:
+                current_entry["typed"].append(text[:50])
+
+        elif evt_type == "key.shortcut" and current_entry is not None:
+            combo = evt.get("text", "") or evt.get("combo", "")
+            if combo and len(current_entry["shortcuts"]) < 10:
+                current_entry["shortcuts"].append(combo)
+
+        elif evt_type in ("mouse.singleclick", "mouse.doubleclick") and current_entry is not None:
+            current_entry["clicks"] += 1
+
+        elif evt_type == "mouse.scroll" and current_entry is not None:
+            current_entry["scrolls"] += 1
+
+    # Close final entry
+    if current_entry is not None:
+        current_entry["end_ts"] = session_end
+        entries.append(current_entry)
+
+    if not entries:
+        return None
+
+    # Merge consecutive entries with same app+title
+    merged: list[dict] = [entries[0]]
+    for e in entries[1:]:
+        prev = merged[-1]
+        if prev["bundle_id"] == e["bundle_id"] and prev["title"] == e["title"]:
+            prev["end_ts"] = e["end_ts"]
+            prev["typed"].extend(e["typed"])
+            prev["shortcuts"].extend(e["shortcuts"])
+            prev["clicks"] += e["clicks"]
+            prev["scrolls"] += e["scrolls"]
+            prev["typed"] = prev["typed"][:5]
+            prev["shortcuts"] = prev["shortcuts"][:10]
+        else:
+            merged.append(e)
+
+    # Build time_map: relative timestamp string → unix timestamp
+    time_map: dict[str, float] = {}
+
+    # Build compact timeline for LLM consumption (capped for context limits)
+    capped = merged[:MAX_ACTIVITY_ENTRIES]
+    if len(merged) > MAX_ACTIVITY_ENTRIES:
+        log.info("Activity entries capped: %d → %d", len(merged), MAX_ACTIVITY_ENTRIES)
+    timeline: list[dict] = []
+    for e in capped:
+        rel_start = e["start_ts"] - session_start
+        rel_end = e["end_ts"] - session_start
+        dur = rel_end - rel_start
+
+        rel_str = _format_relative_time(rel_start)
+        time_map[rel_str] = e["start_ts"]
+
+        entry: dict = {
+            "t": rel_str, "dur": _duration_human(dur),
+            "app": e["app"], "title": e["title"],
+        }
+        if e["domain"]:
+            entry["domain"] = e["domain"]
+        entry["cat"] = e["cat"]
+        if e["typed"]:
+            entry["typed"] = e["typed"]
+        if e["shortcuts"]:
+            entry["shortcuts"] = e["shortcuts"]
+        if e["clicks"]:
+            entry["clicks"] = e["clicks"]
+        timeline.append(entry)
+
+    # Gather transcript snippets
+    sorted_manifests = sorted(manifests, key=lambda m: m["chunk_index"])
+    transcript_snippets: list[dict] = []
+    for manifest in sorted_manifests:
+        chunk_idx = manifest["chunk_index"]
+        chunk_start = manifest["chunk_start"]
+        blob_name = f"recordings/{recording_name}/transcript_{chunk_idx:04d}.json"
+        data = _blob_bytes(blob_name)
+        if data is None:
+            continue
+        try:
+            transcript = json.loads(data)
+        except json.JSONDecodeError:
+            continue
+        for seg in transcript.get("segments", [])[:20]:
+            abs_ts = chunk_start + seg.get("start", 0)
+            rel = abs_ts - session_start
+            text = seg.get("text", "").strip()
+            if text:
+                snippet_rel = _format_relative_time(rel)
+                time_map[snippet_rel] = abs_ts
+                transcript_snippets.append({"t": snippet_rel, "text": text[:100]})
+
+    # Register session end
+    end_rel = _format_relative_time(session_end - session_start)
+    time_map[end_rel] = session_end
+
+    summary = {
+        "recording": recording_name,
+        "duration": _duration_human(session_end - session_start),
+        "timeline": timeline,
+    }
+    if transcript_snippets:
+        summary["transcript"] = transcript_snippets
+
+    return {
+        "summary": summary,
+        "entries": merged,
+        "time_map": time_map,
+        "session_start": session_start,
+        "session_end": session_end,
+        # Raw data for fallback segmentation (avoids re-reading GCS)
+        "raw_timestamps": raw_timestamps,
+        "raw_window_events": raw_window_events,
+    }
+
+
+# ---------------------------------------------------------------------------
 # Entry point
 # ---------------------------------------------------------------------------
 
