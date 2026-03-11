@@ -85,6 +85,23 @@ Two-layer privacy enforcement: capture-time filtering + post-recording scrubbing
 
 **Scrubbing pipeline:** `_scrub_events_jsonl()` scrubs `key.type` and `key.shortcut` text + children `key_char`, and `window.switch` titles.
 
+## Task Segmentation
+
+**Two segmentation modes** controlled by `segmentation_mode` config (`config.toml` or `--segmentation-mode` CLI flag, default `"llm"`):
+- **`llm` (default):** Client generates simplified v2 manifests (`format_version: 2`) with chunk metadata only (stats, timestamps). Cloud Run derives activity summary from events JSONL + transcripts, calls Gemini Flash for intelligent task boundaries with names, descriptions, categories. Falls back to idle-gap segmentation if LLM fails.
+- **`idle` (legacy):** Client generates v1 manifests with tasks array from idle-gap detection (120s threshold). Cloud Run merges cross-chunk tasks via `_merge_tasks()`.
+
+**Cloud Run LLM pipeline** (`scripts/process-recording/main.py`):
+1. `_derive_activity_summary()` — stream-parse events JSONL into compact activity timeline
+2. `_llm_segment_session()` → `_call_llm()` → `_call_gemini()` — Gemini Flash with structured output
+3. `_validate_llm_tasks()` — validate, convert relative→Unix timestamps, check overlaps
+4. `_map_tasks_to_chunks()` — map task boundaries to source chunk indices for media stitching
+5. Fallback: `_simple_segment_from_events()` + `_stats_summary()` — idle-gap with stats-based summary
+
+**Config:** `get_segmentation_mode()` in `config.py` reads from `config.toml`. CLI flag `--segmentation-mode` on `screencap start` takes priority. The manifest format itself controls Cloud Run behavior: v2 manifests always attempt LLM, v1 manifests use legacy merge.
+
+**Enriched output:** `timeline.json` includes `segmentation_method`, per-task `name`/`description`/`category`/`apps_used`/`confidence`, and session-level `summary` with `overview`/`primary_focus`/`time_breakdown`/`key_accomplishments`.
+
 ## Key Patterns
 
 - All user-facing output uses `rich.console.Console` (no bare `print()`).

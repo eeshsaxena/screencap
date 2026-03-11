@@ -159,16 +159,21 @@ def _maybe_prompt_privacy_setup() -> None:
               help="Record for cloud upload (forces public privacy mode).")
 @click.option("--local", "destination", flag_value="local",
               help="Record for local use only (uses configured privacy mode).")
+@click.option("--segmentation-mode", type=click.Choice(["llm", "idle"], case_sensitive=False),
+              default=None, help="Task segmentation: 'llm' (server-side) or 'idle' (gap detection).")
 def start(
     name, description, no_audio, no_video, no_images, no_window_data,
     output, no_wifi_metrics, no_app_versions,
     no_auto_name, local_only, force, verbose, chunk_duration, no_live_upload,
-    destination,
+    destination, segmentation_mode,
 ):
     """Record a screen capture session. Ctrl+C to stop."""
     from datetime import datetime
 
-    from screencap.config import get_auto_name, get_auto_name_local_only
+    from screencap.config import get_auto_name, get_auto_name_local_only, get_segmentation_mode
+
+    # Resolve segmentation mode: CLI flag > config.toml > default
+    seg_mode = segmentation_mode or get_segmentation_mode()
 
     # Determine if auto-naming is enabled
     user_provided_name = name is not None
@@ -257,6 +262,7 @@ def start(
             force_mode=force_mode,
             cloud_intent=is_cloud,
             intent_source=intent_source,
+            segmentation_mode=seg_mode,
         )
     except DiskFullError as e:
         capture_dir, elapsed = e.capture_dir, e.elapsed
@@ -1175,13 +1181,15 @@ def _recover_chunk_metadata(
     # Generate missing manifests
     if missing_manifests:
         with console.status("[dim]Generating chunk manifests...[/dim]"):
+            from screencap.config import get_segmentation_mode
             from screencap.task_manifest import generate_manifest
 
             generated = 0
+            seg_mode = get_segmentation_mode()
             for idx, c_start, c_end in chunk_ranges:
                 if idx in missing_manifests:
                     try:
-                        generate_manifest(recording_dir, idx, c_start, c_end)
+                        generate_manifest(recording_dir, idx, c_start, c_end, segmentation_mode=seg_mode)
                         generated += 1
                     except Exception as e:
                         console.print(f"  [yellow]Warning:[/yellow] Manifest generation failed for chunk {idx}: {e}")

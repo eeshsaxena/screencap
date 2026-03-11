@@ -1,3 +1,4 @@
 functions-framework==3.*
 google-cloud-storage>=2.14.0
 cloudevents>=1.9.0
+google-cloud-aiplatform>=1.53

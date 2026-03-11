@@ -387,6 +387,7 @@ def start_recording(
     force_mode: "PrivacyMode | None" = None,
     cloud_intent: bool = False,
     intent_source: str = "flag",
+    segmentation_mode: str = "llm",
 ) -> tuple[Path, float]:
     """Start a screen capture recording. Blocks until Ctrl+C."""
     if audio is None:
@@ -684,6 +685,7 @@ def start_recording(
                             cloud_intent=cloud_intent,
                             privacy_mode=privacy_config.mode.value if privacy_config else "internal",
                             screen_filter=screen_filter,
+                            segmentation_mode=segmentation_mode,
                         )
                         chunk_processor.start()
                 except Exception as _chunk_init_err:

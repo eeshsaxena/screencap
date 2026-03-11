@@ -1,7 +1,9 @@
 """Generate per-chunk task manifests from recording data.
 
-Detects resting periods (gaps > threshold between actions) and groups
-activity into tasks with dominant app identification.
+Two manifest formats:
+- v2 (default, mode='llm'): Simplified chunk metadata only. Task segmentation
+  happens server-side in Cloud Run via LLM.
+- v1 (mode='idle'): Legacy format with client-side idle-gap task segmentation.
 """
 
 from __future__ import annotations
@@ -14,8 +16,105 @@ from pathlib import Path
 
 logger = logging.getLogger(__name__)
 
+
+def generate_manifest(
+    capture_dir: Path,
+    chunk_idx: int,
+    start_ts: float,
+    end_ts: float,
+    *,
+    rest_threshold: float = 120.0,
+    blocked_intervals: list[dict] | None = None,
+    segmentation_mode: str = "llm",
+) -> Path:
+    """Generate a manifest JSON for one chunk.
+
+    Args:
+        capture_dir: Recording directory containing recording.db.
+        chunk_idx: Zero-based chunk index.
+        start_ts: Chunk start timestamp (Unix epoch).
+        end_ts: Chunk end timestamp (Unix epoch).
+        rest_threshold: Seconds of inactivity to split tasks (idle mode only).
+        blocked_intervals: Privacy-blocked video intervals for this chunk.
+        segmentation_mode: 'llm' for simplified metadata, 'idle' for legacy tasks.
+
+    Returns:
+        Path to the manifest file.
+    """
+    if segmentation_mode == "idle":
+        return _generate_manifest_legacy(
+            capture_dir, chunk_idx, start_ts, end_ts,
+            rest_threshold=rest_threshold,
+            blocked_intervals=blocked_intervals,
+        )
+    return _generate_manifest_v2(
+        capture_dir, chunk_idx, start_ts, end_ts,
+        blocked_intervals=blocked_intervals,
+    )
+
+
+# ---------------------------------------------------------------------------
+# v2 manifest — simplified chunk metadata (segmentation happens in Cloud Run)
+# ---------------------------------------------------------------------------
+
+def _generate_manifest_v2(
+    capture_dir: Path,
+    chunk_idx: int,
+    start_ts: float,
+    end_ts: float,
+    *,
+    blocked_intervals: list[dict] | None = None,
+) -> Path:
+    """Generate a simplified chunk metadata manifest (format_version 2)."""
+    manifest_path = capture_dir / f"chunk_{chunk_idx:04d}_manifest.json"
+
+    db_path = capture_dir / "recording.db"
+    conn = sqlite3.connect(str(db_path))
+    conn.execute("PRAGMA busy_timeout=5000")
+    conn.execute("PRAGMA query_only=ON")
+
+    try:
+        total_events = conn.execute(
+            """SELECT COUNT(*) FROM action_event
+               WHERE timestamp >= ? AND timestamp < ?
+                 AND name != 'move'""",
+            (start_ts, end_ts),
+        ).fetchone()[0]
+
+        total_switches = conn.execute(
+            """SELECT COUNT(*) FROM window_event
+               WHERE timestamp >= ? AND timestamp < ?""",
+            (start_ts, end_ts),
+        ).fetchone()[0]
+    finally:
+        conn.close()
+
+    manifest = {
+        "format_version": 2,
+        "chunk_index": chunk_idx,
+        "chunk_start": start_ts,
+        "chunk_end": end_ts,
+        "stats": {
+            "total_events": total_events,
+            "total_window_switches": total_switches,
+        },
+        "blocked_intervals": blocked_intervals or [],
+    }
+
+    manifest_path.write_text(json.dumps(manifest, indent=2))
+    logger.info(
+        "Generated manifest v2: %s (%d events, %d switches)",
+        manifest_path.name, total_events, total_switches,
+    )
+    return manifest_path
+
+
+# ---------------------------------------------------------------------------
+# v1 manifest — legacy idle-gap task segmentation (kept for mode='idle')
+# ---------------------------------------------------------------------------
+
 # Window title parsers — extract meaningful name from window title
-TITLE_PARSERS: dict[str, str] = {
+_TITLE_PARSERS: dict[str, str] = {
     "Visual Studio Code": r"(.+?) — (.+?) —",
     "Code": r"(.+?) — (.+?) —",
     "Google Chrome": r"(.+?) - Google Chrome",
@@ -28,7 +127,7 @@ TITLE_PARSERS: dict[str, str] = {
 }
 
 
-def generate_manifest(
+def _generate_manifest_legacy(
     capture_dir: Path,
     chunk_idx: int,
     start_ts: float,
@@ -37,19 +136,7 @@ def generate_manifest(
     rest_threshold: float = 120.0,
     blocked_intervals: list[dict] | None = None,
 ) -> Path:
-    """Generate a task manifest JSON for one chunk.
-
-    Args:
-        capture_dir: Recording directory containing recording.db.
-        chunk_idx: Zero-based chunk index.
-        start_ts: Chunk start timestamp (Unix epoch).
-        end_ts: Chunk end timestamp (Unix epoch).
-        rest_threshold: Seconds of inactivity to split tasks.
-        blocked_intervals: Privacy-blocked video intervals for this chunk.
-
-    Returns:
-        Path to the manifest file.
-    """
+    """Generate a legacy task manifest with idle-gap segmentation."""
     manifest_path = capture_dir / f"chunk_{chunk_idx:04d}_manifest.json"
     if manifest_path.exists():
         return manifest_path
@@ -61,7 +148,6 @@ def generate_manifest(
     conn.row_factory = sqlite3.Row
 
     try:
-        # Get explicit events (clicks, keys, scrolls — not moves)
         events = conn.execute(
             """SELECT timestamp, name FROM action_event
                WHERE timestamp >= ? AND timestamp < ?
@@ -70,7 +156,6 @@ def generate_manifest(
             (start_ts, end_ts),
         ).fetchall()
 
-        # Get window events for dominant app detection
         window_events = conn.execute(
             """SELECT timestamp, title, app_bundle_id, window_id
                FROM window_event
@@ -79,7 +164,6 @@ def generate_manifest(
             (start_ts, end_ts),
         ).fetchall()
 
-        # Also get the last window event before this chunk (for context)
         prev_window = conn.execute(
             """SELECT timestamp, title, app_bundle_id, window_id
                FROM window_event
@@ -90,10 +174,8 @@ def generate_manifest(
     finally:
         conn.close()
 
-    # Build tasks from events
     tasks = _segment_tasks(events, rest_threshold)
 
-    # Compute dominant app for each task
     all_windows = list(window_events)
     if prev_window:
         all_windows.insert(0, prev_window)
@@ -115,7 +197,6 @@ def generate_manifest(
             "derived_name": _derive_task_name(dom),
         })
 
-    # Compute rest_after for each task
     for i in range(len(task_list) - 1):
         task_list[i]["rest_after_s"] = round(
             task_list[i + 1]["start_ts"] - task_list[i]["end_ts"], 1,
@@ -152,10 +233,7 @@ def generate_manifest(
 def _segment_tasks(
     events: list, rest_threshold: float,
 ) -> list[tuple[float, float, int]]:
-    """Split events into tasks based on inactivity gaps.
-
-    Returns list of (start_ts, end_ts, event_count) tuples.
-    """
+    """Split events into tasks based on inactivity gaps."""
     if not events:
         return []
 
@@ -185,13 +263,11 @@ def _compute_dominant_app(
     if not window_events:
         return {"bundle_id": "", "title": "", "pct": 0, "all_apps": {}}
 
-    # Filter windows relevant to this task
     relevant = []
     for i, w in enumerate(window_events):
         if w["timestamp"] > task_end:
             break
         next_ts = window_events[i + 1]["timestamp"] if i + 1 < len(window_events) else task_end
-        # Clip to task boundaries
         win_start = max(w["timestamp"], task_start)
         win_end = min(next_ts, task_end)
         if win_end > win_start:
@@ -202,7 +278,6 @@ def _compute_dominant_app(
             })
 
     if not relevant:
-        # Use last window event before task
         for w in reversed(window_events):
             if w["timestamp"] <= task_start:
                 return {
@@ -213,9 +288,8 @@ def _compute_dominant_app(
                 }
         return {"bundle_id": "", "title": "", "pct": 0, "all_apps": {}}
 
-    # Sum time per app
     app_time: dict[str, float] = {}
-    app_title: dict[str, str] = {}  # keep last title per app
+    app_title: dict[str, str] = {}
     for r in relevant:
         bid = r["bundle_id"]
         app_time[bid] = app_time.get(bid, 0) + r["duration"]
@@ -236,8 +310,6 @@ def _app_name_from_bundle(bundle_id: str) -> str:
     """Extract human-friendly app name from bundle ID."""
     if not bundle_id:
         return ""
-    # com.apple.Safari → Safari
-    # com.google.Chrome → Chrome
     parts = bundle_id.split(".")
     if len(parts) >= 3:
         return parts[-1]
@@ -252,8 +324,7 @@ def _derive_task_name(dom: dict) -> str:
     if not app_name and not title:
         return "unknown"
 
-    # Try title parsers
-    for parser_app, pattern in TITLE_PARSERS.items():
+    for parser_app, pattern in _TITLE_PARSERS.items():
         if parser_app.lower() in app_name.lower():
             m = re.search(pattern, title)
             if m:
@@ -261,7 +332,6 @@ def _derive_task_name(dom: dict) -> str:
                 slug = _slugify(extracted)
                 return f"{_slugify(app_name)}_{slug}"
 
-    # Fallback: app + first 30 chars of title
     if title:
         slug = _slugify(title[:30])
         return f"{_slugify(app_name)}_{slug}" if app_name else slug
@@ -277,6 +347,10 @@ def _slugify(s: str) -> str:
     s = s.strip("-")
     return s[:40] or "untitled"
 
+
+# ---------------------------------------------------------------------------
+# Shared utilities
+# ---------------------------------------------------------------------------
 
 def _fmt_duration(secs: float) -> str:
     """Format seconds as human-readable duration."""

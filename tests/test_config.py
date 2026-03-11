@@ -248,3 +248,30 @@ class TestUploadDefault:
         cfg._config_cache = {"privacy": {"upload_default": "local"}}
         with mock.patch.dict(os.environ, {"SCREENCAP_UPLOAD_DEFAULT": "cloud"}):
             assert get_upload_default() == "cloud"
+
+
+# --- segmentation mode config tests ---
+
+
+class TestSegmentationMode:
+    """Tests for get_segmentation_mode()."""
+
+    def test_default_value(self):
+        from screencap.config import get_segmentation_mode
+
+        assert get_segmentation_mode() == "llm"
+
+    def test_toml_value(self):
+        import screencap.config as cfg
+        from screencap.config import get_segmentation_mode
+
+        cfg._config_cache = {"segmentation_mode": "idle"}
+        assert get_segmentation_mode() == "idle"
+
+    def test_toml_invalid(self):
+        import screencap.config as cfg
+        from screencap.config import get_segmentation_mode
+
+        cfg._config_cache = {"segmentation_mode": "bogus"}
+        with pytest.raises(SystemExit):
+            get_segmentation_mode()

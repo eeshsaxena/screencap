@@ -28,10 +28,8 @@ htmlcov/
 # Project
 docs/
 
-.claude/worktrees/
-.claude/settings.local.json
-.claude/memory/
-.claude/testing.md
-.claude/2026-*
+.claude/*
+!.claude/commands/
+!.claude/skills/
 
 .DS_Store
