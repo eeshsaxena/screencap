@@ -95,12 +95,33 @@ def load_supplement() -> dict[str, ContextClass]:
     return result
 
 
+# Known second-level domain suffixes — these are TLD-like and should not
+# be created as parent domain entries (e.g. "co.uk", "com.au").
+_SLD_SUFFIXES: frozenset[str] = frozenset({
+    "co", "com", "org", "net", "ac", "gov", "edu", "mil",
+    "sch", "nhs", "police", "mod",
+})
+
+
+def _is_tld_like(parent: str) -> bool:
+    """Return True if parent looks like a TLD rather than a real domain.
+
+    Examples that should be rejected: co.uk, com.au, org.br
+    Examples that should be kept: bankofamerica.com, google.com
+    """
+    labels = parent.split(".")
+    if len(labels) != 2:
+        return False
+    return labels[0] in _SLD_SUFFIXES
+
+
 def _expand_parents(index: dict[str, ContextClass]) -> dict[str, ContextClass]:
     """Pre-expand parent domains for O(1) suffix matching.
 
     For each domain like ``secure.bankofamerica.com``, insert
     ``bankofamerica.com`` (and ``com`` is skipped — too broad) if not
     already present.  Only inserts parents with 2+ labels.
+    Skips TLD-like parents (e.g. ``co.uk``, ``com.au``).
     """
     expansions: dict[str, ContextClass] = {}
     for domain, ctx_class in index.items():
@@ -109,6 +130,8 @@ def _expand_parents(index: dict[str, ContextClass]) -> dict[str, ContextClass]:
         # e.g. a.b.c.com → b.c.com, c.com  (skip single-label "com")
         for i in range(1, len(labels) - 1):
             parent = ".".join(labels[i:])
+            if _is_tld_like(parent):
+                continue
             if parent not in index and parent not in expansions:
                 expansions[parent] = ctx_class
     return expansions

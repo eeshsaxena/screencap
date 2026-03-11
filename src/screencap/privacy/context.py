@@ -409,10 +409,12 @@ class DefaultContextClassifier:
             segments = url_path.lstrip("/").split("/", 1)
             if segments:
                 first_seg = unquote(segments[0]).lower()
-                tokens = set(_SEGMENT_SPLIT_RE.split(first_seg))
-                if tokens & _AUTH_KEYWORDS:
+                # Check full segment first (e.g. "forgot-password" as a whole)
+                # then check tokenized parts (e.g. "login-callback" → "login")
+                candidates = {first_seg} | set(_SEGMENT_SPLIT_RE.split(first_seg))
+                if candidates & _AUTH_KEYWORDS:
                     return ContextClass.AUTH_FLOW
-                if tokens & _PAYMENT_KEYWORDS:
+                if candidates & _PAYMENT_KEYWORDS:
                     return ContextClass.PAYMENT_FLOW
 
         # Check subdomain labels
