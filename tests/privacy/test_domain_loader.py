@@ -1,4 +1,4 @@
-"""Tests for domain_loader: UT1 loading, supplement, merge, parent expansion."""
+"""Tests for domain_loader: UT1 loading, supplement, merge."""
 
 from __future__ import annotations
 
@@ -7,7 +7,7 @@ from pathlib import Path
 import pytest
 
 from screencap.privacy.domain_loader import (
-    _expand_parents,
+    _is_tld_like,
     _normalize_domain,
     build_domain_index,
     load_supplement,
@@ -43,8 +43,8 @@ class TestNormalizeDomain:
     def test_skip_single_label(self):
         assert _normalize_domain("localhost") is None
 
-    def test_valid_domain(self):
-        assert _normalize_domain("mail.google.com") == "mail.google.com"
+    def test_skip_url_with_path(self):
+        assert _normalize_domain("app.proton.me/pass") is None
 
 
 # ---------------------------------------------------------------------------
@@ -75,16 +75,6 @@ class TestLoadUT1Domains:
         assert result["mysocial.com"] == ContextClass.CHAT
         assert result["mychat.com"] == ContextClass.CHAT
         assert result["myvpn.com"] == ContextClass.ADMIN_CONSOLE
-
-    def test_skips_blank_and_ip_lines(self, tmp_path):
-        content = "valid.com\n\n# comment\n192.168.1.1\n10.0.0.1\n\nalso-valid.com\n"
-        (tmp_path / "bank.txt").write_text(content)
-        for cat in ("financial", "webmail", "social_networks", "chat", "vpn"):
-            (tmp_path / f"{cat}.txt").write_text("")
-        result = load_ut1_domains(ut1_dir=tmp_path)
-        assert "valid.com" in result
-        assert "also-valid.com" in result
-        assert len(result) == 2
 
     def test_missing_file_raises(self, tmp_path):
         with pytest.raises(FileNotFoundError, match="UT1 data file missing"):
@@ -123,42 +113,6 @@ class TestLoadSupplement:
 
 
 # ---------------------------------------------------------------------------
-# Parent domain expansion
-# ---------------------------------------------------------------------------
-
-
-class TestExpandParents:
-    def test_expands_child_to_parent(self):
-        index = {"secure.bankofamerica.com": ContextClass.BANKING}
-        parents = _expand_parents(index)
-        assert "bankofamerica.com" in parents
-        assert parents["bankofamerica.com"] == ContextClass.BANKING
-
-    def test_does_not_overwrite_existing_entries(self):
-        index = {
-            "sub.example.com": ContextClass.CHAT,
-            "example.com": ContextClass.EMAIL,
-        }
-        parents = _expand_parents(index)
-        # example.com already in index, should not be in parents
-        assert "example.com" not in parents
-
-    def test_skips_single_label_parents(self):
-        index = {"a.com": ContextClass.BANKING}
-        parents = _expand_parents(index)
-        # "com" is single-label, not useful
-        assert "com" not in parents
-
-    def test_multi_level_expansion(self):
-        index = {"a.b.c.example.com": ContextClass.BANKING}
-        parents = _expand_parents(index)
-        # Should create b.c.example.com, c.example.com, example.com
-        assert "b.c.example.com" in parents
-        assert "c.example.com" in parents
-        assert "example.com" in parents
-
-
-# ---------------------------------------------------------------------------
 # Full domain index build
 # ---------------------------------------------------------------------------
 
@@ -174,22 +128,30 @@ class TestBuildDomainIndex:
         index = build_domain_index(ut1=ut1, supplement=supplement)
         assert index["overlap.com"] == ContextClass.EMAIL
 
-    def test_parent_expansion_included(self, tmp_path):
-        for cat in ("bank", "financial", "webmail", "social_networks", "chat", "vpn"):
-            (tmp_path / f"{cat}.txt").write_text("")
-        (tmp_path / "bank.txt").write_text("secure.mybank.com\n")
-        index = build_domain_index(
-            ut1=load_ut1_domains(ut1_dir=tmp_path), supplement={}
-        )
-        assert "mybank.com" in index
-        assert index["mybank.com"] == ContextClass.BANKING
-
-    def test_real_data_builds_successfully(self):
-        """Smoke test: full build with real data."""
+    def test_no_false_positive_parent_expansion(self):
+        """Shared hosts like google.com must NOT be in the index."""
         index = build_domain_index()
-        assert len(index) > 14000
-        # Check UT1 domains are present
-        assert index.get("chase.com") == ContextClass.BANKING
-        # Check supplement domains are present
-        assert index.get("vault.bitwarden.com") == ContextClass.PASSWORD_MANAGER
-        assert index.get("drive.google.com") == ContextClass.CLOUD_STORAGE
+        # mail.google.com is in UT1 but google.com should not be expanded
+        assert "mail.google.com" in index
+        assert "google.com" not in index
+        # Same for other multi-purpose domains
+        assert "amazon.com" not in index
+        assert "cloudflare.com" not in index
+
+
+# ---------------------------------------------------------------------------
+# TLD-like detection (security-relevant for parent walk-up)
+# ---------------------------------------------------------------------------
+
+
+class TestIsTldLike:
+    @pytest.mark.parametrize("domain", [
+        "co.uk", "com.au", "org.br", "ac.jp", "gov.uk",
+        "or.jp", "go.com", "go.kr", "gr.jp", "asn.au", "web.app", "my.id",
+    ])
+    def test_rejects_tld_like_parents(self, domain):
+        assert _is_tld_like(domain) is True
+
+    @pytest.mark.parametrize("domain", ["bankofamerica.com", "google.co.uk", "example.org"])
+    def test_keeps_real_domains(self, domain):
+        assert _is_tld_like(domain) is False

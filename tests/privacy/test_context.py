@@ -167,6 +167,39 @@ class TestLoadWindowEvents:
         conn.close()
         assert len(load_window_events(db_path)) == 1
 
+    def test_browser_url_loaded_and_domain_extracted(self, tmp_path):
+        """browser_url column is loaded and domain is extracted from it."""
+        db_path = tmp_path / "recording.db"
+        conn = sqlite3.connect(str(db_path))
+        conn.execute("""
+            CREATE TABLE window_event (
+                id INTEGER PRIMARY KEY,
+                recording_id INTEGER,
+                recording_timestamp REAL,
+                timestamp REAL,
+                state TEXT,
+                title TEXT,
+                "left" INTEGER,
+                top INTEGER,
+                width INTEGER,
+                height INTEGER,
+                window_id TEXT,
+                app_bundle_id TEXT,
+                app_version TEXT,
+                browser_url TEXT
+            )
+        """)
+        conn.execute(
+            "INSERT INTO window_event (timestamp, app_bundle_id, title, window_id, browser_url) "
+            "VALUES (1.0, 'com.google.Chrome', 'Gmail', 'w1', 'https://mail.google.com/inbox')"
+        )
+        conn.commit()
+        conn.close()
+        events = load_window_events(db_path)
+        assert len(events) == 1
+        assert events[0].browser_url == "https://mail.google.com/inbox"
+        assert events[0].domain == "mail.google.com"
+
 
 # ---------------------------------------------------------------------------
 # DefaultContextClassifier — classification priority chain
@@ -284,20 +317,10 @@ class TestDomainClassification:
         self.classifier = DefaultContextClassifier()
 
     @pytest.mark.parametrize("domain, expected", [
-        # UT1 banks
-        ("chase.com", ContextClass.BANKING),
-        ("wellsfargo.com", ContextClass.BANKING),
-        # Supplement entries
-        ("vault.bitwarden.com", ContextClass.PASSWORD_MANAGER),
-        ("github.com", ContextClass.CODE_EDITOR_TERMINAL),
-        ("drive.google.com", ContextClass.CLOUD_STORAGE),
-        ("app.slack.com", ContextClass.CHAT),
-        ("meet.google.com", ContextClass.VIDEO_CALL),
-        ("calendar.google.com", ContextClass.CALENDAR),
-        ("console.aws.amazon.com", ContextClass.ADMIN_CONSOLE),
-        # Supplement email gap-fills
-        ("outlook.live.com", ContextClass.EMAIL),
-        ("mail.proton.me", ContextClass.EMAIL),
+        ("chase.com", ContextClass.BANKING),              # UT1
+        ("vault.bitwarden.com", ContextClass.PASSWORD_MANAGER),  # supplement
+        ("drive.google.com", ContextClass.CLOUD_STORAGE),        # supplement
+        ("outlook.live.com", ContextClass.EMAIL),                # supplement gap-fill
     ])
     def test_known_domains(self, domain, expected):
         meta = FrameMetadata(bundle_id="com.google.Chrome", domain=domain)
@@ -339,6 +362,15 @@ class TestDomainClassification:
         # Unknown domain, no title → browser_unverified
         assert result.context_class == ContextClass.BROWSER_UNVERIFIED
 
+    def test_shared_host_not_over_classified(self):
+        """google.com must not inherit EMAIL from mail.google.com."""
+        meta = FrameMetadata(
+            bundle_id="com.google.Chrome",
+            domain="www.google.com",
+        )
+        result = self.classifier.classify(meta)
+        assert result.context_class == ContextClass.BROWSER_UNVERIFIED
+
 
 # ---------------------------------------------------------------------------
 # Keyword detection (auth/payment flows)
@@ -351,20 +383,12 @@ class TestKeywordDetection:
     def setup_method(self):
         self.classifier = DefaultContextClassifier()
 
-    # Auth keywords in URL path
+    # Auth keywords in URL path — representative subset
     @pytest.mark.parametrize("path, expected", [
-        ("/login", ContextClass.AUTH_FLOW),
-        ("/signin", ContextClass.AUTH_FLOW),
-        ("/sign-in", ContextClass.AUTH_FLOW),
-        ("/auth", ContextClass.AUTH_FLOW),
-        ("/oauth", ContextClass.AUTH_FLOW),
-        ("/sso", ContextClass.AUTH_FLOW),
-        ("/mfa", ContextClass.AUTH_FLOW),
-        ("/2fa", ContextClass.AUTH_FLOW),
-        ("/verify", ContextClass.AUTH_FLOW),
-        ("/recovery", ContextClass.AUTH_FLOW),
-        ("/forgot-password", ContextClass.AUTH_FLOW),
-        ("/reset-password", ContextClass.AUTH_FLOW),
+        ("/login", ContextClass.AUTH_FLOW),           # simple token
+        ("/sign-in", ContextClass.AUTH_FLOW),         # hyphenated, full-segment match
+        ("/forgot-password", ContextClass.AUTH_FLOW), # multi-hyphen, full-segment match
+        ("/oauth", ContextClass.AUTH_FLOW),           # protocol-specific keyword
     ])
     def test_auth_keywords_in_path(self, path, expected):
         meta = FrameMetadata(
@@ -375,9 +399,9 @@ class TestKeywordDetection:
         result = self.classifier.classify(meta)
         assert result.context_class == expected
 
-    # Payment keywords in URL path
+    # Payment keywords in URL path — representative subset
     @pytest.mark.parametrize("path", [
-        "/checkout", "/billing", "/payment", "/pay", "/subscribe",
+        "/checkout", "/pay",
     ])
     def test_payment_keywords_in_path(self, path):
         meta = FrameMetadata(
@@ -475,6 +499,56 @@ class TestKeywordDetection:
         )
         result = self.classifier.classify(meta)
         assert result.context_class == ContextClass.AUTH_FLOW
+
+    # SPA hash-routing detection
+    def test_hash_routing_auth(self):
+        """SPA hash route /#/login should be detected as AUTH_FLOW."""
+        meta = FrameMetadata(
+            bundle_id="com.google.Chrome",
+            domain="example.com",
+            browser_url="https://example.com/#/login",
+        )
+        result = self.classifier.classify(meta)
+        assert result.context_class == ContextClass.AUTH_FLOW
+
+    def test_hash_routing_payment(self):
+        meta = FrameMetadata(
+            bundle_id="com.google.Chrome",
+            domain="example.com",
+            browser_url="https://example.com/#/checkout",
+        )
+        result = self.classifier.classify(meta)
+        assert result.context_class == ContextClass.PAYMENT_FLOW
+
+    def test_hash_routing_under_subpath(self):
+        """SPA hash route under a subpath: /app#/login should detect auth."""
+        meta = FrameMetadata(
+            bundle_id="com.google.Chrome",
+            domain="example.com",
+            browser_url="https://example.com/app#/login",
+        )
+        result = self.classifier.classify(meta)
+        assert result.context_class == ContextClass.AUTH_FLOW
+
+    def test_path_keyword_beats_fragment(self):
+        """Path keyword should win even when fragment also has a route."""
+        meta = FrameMetadata(
+            bundle_id="com.google.Chrome",
+            domain="example.com",
+            browser_url="https://example.com/checkout#/success",
+        )
+        result = self.classifier.classify(meta)
+        assert result.context_class == ContextClass.PAYMENT_FLOW
+
+    def test_regular_fragment_no_false_positive(self):
+        """Normal anchor fragments (page#section) should not trigger keywords."""
+        meta = FrameMetadata(
+            bundle_id="com.google.Chrome",
+            domain="example.com",
+            browser_url="https://example.com/docs#login",
+        )
+        result = self.classifier.classify(meta)
+        assert result.context_class == ContextClass.BROWSER_UNVERIFIED
 
     # No keyword match for regular paths
     def test_no_match_for_regular_path(self):

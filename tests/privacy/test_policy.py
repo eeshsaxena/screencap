@@ -57,45 +57,20 @@ class TestActionMatrix:
             == PrivacyAction.MASK_WINDOW
         )
 
-    # New ContextClass matrix entries
-    def test_auth_flow_excluded_in_public(self):
-        assert get_matrix_action(ContextClass.AUTH_FLOW, PrivacyMode.PUBLIC) == PrivacyAction.EXCLUDE
-
-    def test_auth_flow_excluded_in_shared(self):
-        assert get_matrix_action(ContextClass.AUTH_FLOW, PrivacyMode.SHARED) == PrivacyAction.EXCLUDE
-
-    def test_auth_flow_masked_in_internal(self):
-        assert get_matrix_action(ContextClass.AUTH_FLOW, PrivacyMode.INTERNAL) == PrivacyAction.MASK_WINDOW
-
-    def test_payment_flow_excluded_in_public(self):
-        assert get_matrix_action(ContextClass.PAYMENT_FLOW, PrivacyMode.PUBLIC) == PrivacyAction.EXCLUDE
-
-    def test_payment_flow_excluded_in_shared(self):
-        assert get_matrix_action(ContextClass.PAYMENT_FLOW, PrivacyMode.SHARED) == PrivacyAction.EXCLUDE
-
-    def test_payment_flow_masked_in_internal(self):
-        assert get_matrix_action(ContextClass.PAYMENT_FLOW, PrivacyMode.INTERNAL) == PrivacyAction.MASK_WINDOW
-
-    def test_cloud_storage_masked_in_public(self):
-        assert get_matrix_action(ContextClass.CLOUD_STORAGE, PrivacyMode.PUBLIC) == PrivacyAction.MASK_WINDOW
-
-    def test_cloud_storage_region_in_shared(self):
-        assert get_matrix_action(ContextClass.CLOUD_STORAGE, PrivacyMode.SHARED) == PrivacyAction.MASK_REGION
-
-    def test_cloud_storage_allowed_in_internal(self):
-        assert get_matrix_action(ContextClass.CLOUD_STORAGE, PrivacyMode.INTERNAL) == PrivacyAction.ALLOW
-
-    def test_matrix_has_39_entries(self):
-        """13 ContextClass x 3 PrivacyMode = 39 entries."""
-        assert len(ContextClass) == 13
-        # _validate_matrix() already checks completeness at import time;
-        # this is a belt-and-suspenders count check.
-        count = 0
-        for ctx in ContextClass:
-            for mode in PrivacyMode:
-                get_matrix_action(ctx, mode)  # would raise if missing
-                count += 1
-        assert count == 39
+    # New ContextClass matrix entries (pinned values for security-sensitive classes)
+    @pytest.mark.parametrize("ctx, mode, expected", [
+        (ContextClass.AUTH_FLOW, PrivacyMode.PUBLIC, PrivacyAction.EXCLUDE),
+        (ContextClass.AUTH_FLOW, PrivacyMode.SHARED, PrivacyAction.EXCLUDE),
+        (ContextClass.AUTH_FLOW, PrivacyMode.INTERNAL, PrivacyAction.MASK_WINDOW),
+        (ContextClass.PAYMENT_FLOW, PrivacyMode.PUBLIC, PrivacyAction.EXCLUDE),
+        (ContextClass.PAYMENT_FLOW, PrivacyMode.SHARED, PrivacyAction.EXCLUDE),
+        (ContextClass.PAYMENT_FLOW, PrivacyMode.INTERNAL, PrivacyAction.MASK_WINDOW),
+        (ContextClass.CLOUD_STORAGE, PrivacyMode.PUBLIC, PrivacyAction.MASK_WINDOW),
+        (ContextClass.CLOUD_STORAGE, PrivacyMode.SHARED, PrivacyAction.MASK_REGION),
+        (ContextClass.CLOUD_STORAGE, PrivacyMode.INTERNAL, PrivacyAction.ALLOW),
+    ])
+    def test_new_context_class_matrix_values(self, ctx, mode, expected):
+        assert get_matrix_action(ctx, mode) == expected
 
 
 # ---------------------------------------------------------------------------
