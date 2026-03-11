@@ -5,6 +5,26 @@ All notable changes to this project will be documented in this file.
 The format is based on [Keep a Changelog](https://keepachangelog.com/),
 and this project adheres to [Semantic Versioning](https://semver.org/).
 
+## [0.10.0] - 2026-03-11
+
+### Added
+- **privacy:** Add hybrid URL classifier with UT1 blocklist + keyword detection
+- **cloud-run:** V2 manifest orchestrator and entry point routing
+- **cloud-run:** Add LLM validation, fallback segmentation, and chunk mapping
+- **cloud-run:** Add LLM prompt, schema, and Gemini Flash call chain
+- **cloud-run:** Add event iterator and activity summary derivation
+- **cloud-run:** Add app category classification maps
+- **cloud-run:** Bump processor to v2, add LLM constants and defensive field access
+- **cli:** Add --segmentation-mode flag to screencap start
+- **recorder:** Accept segmentation_mode param in start_recording()
+- **chunk_processor:** Thread segmentation_mode, skip v2 manifest scrub
+- **manifest:** Split into v2 (LLM) and v1 (idle) manifest formats
+- **config:** Add get_segmentation_mode() for task segmentation
+
+### Fixed
+- **privacy:** Prevent app_classes and allow_apps from bypassing URL classifier for browsers
+- **privacy:** Remove parent expansion, fix shared-host and hash-routing classification
+
 ## [0.9.2] - 2026-03-10
 
 ### Added
