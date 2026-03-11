@@ -1096,6 +1096,287 @@ def _call_gemini(prompt: str) -> dict | None:
 
 
 # ---------------------------------------------------------------------------
+# LLM output validation (Step 6)
+# ---------------------------------------------------------------------------
+
+_VALID_CATEGORIES = frozenset(
+    {"development", "communication", "research", "admin", "creative", "other"}
+)
+
+
+def _validate_llm_tasks(
+    llm_result: dict,
+    session_start: float,
+    session_end: float,
+    time_map: dict[str, float],
+) -> dict | None:
+    """Validate LLM output and convert relative timestamps to Unix.
+
+    Returns dict with "tasks" and "summary", or None if invalid.
+    """
+    tasks = llm_result.get("tasks", [])
+    summary = llm_result.get("summary", {})
+
+    if not tasks:
+        log.warning("LLM returned empty tasks list")
+        return None
+
+    converted: list[dict] = []
+
+    for i, task in enumerate(tasks):
+        for field in ("start_time", "end_time", "name", "description", "category"):
+            if field not in task:
+                log.warning("Task %d missing field: %s", i, field)
+                return None
+
+        start_rel = task["start_time"]
+        end_rel = task["end_time"]
+
+        start_unix = time_map.get(start_rel, session_start + _parse_relative_time(start_rel))
+        end_unix = time_map.get(end_rel, session_start + _parse_relative_time(end_rel))
+
+        # Clamp to session bounds
+        start_unix = max(session_start, min(start_unix, session_end))
+        end_unix = max(session_start, min(end_unix, session_end))
+
+        if end_unix <= start_unix:
+            log.warning("Task %d has zero or negative duration", i)
+            return None
+
+        cat = task.get("category", "other")
+        if cat not in _VALID_CATEGORIES:
+            cat = "other"
+
+        name = (task.get("name") or f"Task {i + 1}").strip()[:50]
+
+        converted.append({
+            "start_ts": start_unix,
+            "end_ts": end_unix,
+            "name": name,
+            "derived_name": _slugify(name),
+            "description": (task.get("description") or "")[:200],
+            "category": cat,
+            "apps_used": task.get("apps_used", []),
+            "confidence": task.get("confidence", "medium"),
+            # Compatibility defaults for _process_task
+            "dominant_app": "",
+            "dominant_app_name": "",
+            "dominant_title": "",
+            "dominant_pct": 0.0,
+            "all_apps": {},
+            "rest_after_s": 0.0,
+            "event_count": 0,
+        })
+
+    converted.sort(key=lambda t: t["start_ts"])
+
+    # Check for overlaps (1s tolerance)
+    for i in range(len(converted) - 1):
+        if converted[i]["end_ts"] > converted[i + 1]["start_ts"] + 1.0:
+            log.warning("Tasks %d and %d overlap", i, i + 1)
+            return None
+
+    # Compute rest_after_s
+    for i in range(len(converted) - 1):
+        gap = converted[i + 1]["start_ts"] - converted[i]["end_ts"]
+        converted[i]["rest_after_s"] = round(max(0, gap), 1)
+    if converted:
+        converted[-1]["rest_after_s"] = 0.0
+
+    # Ensure summary has all required fields
+    if not summary.get("overview"):
+        summary["overview"] = f"Recording with {len(converted)} tasks."
+    if not summary.get("primary_focus"):
+        cats = [t["category"] for t in converted]
+        summary["primary_focus"] = max(set(cats), key=cats.count) if cats else "other"
+    if not summary.get("time_breakdown"):
+        summary["time_breakdown"] = {}
+    if not summary.get("key_accomplishments"):
+        summary["key_accomplishments"] = []
+
+    return {"tasks": converted, "summary": summary}
+
+
+# ---------------------------------------------------------------------------
+# Fallback segmentation + stats summary (Step 7)
+# ---------------------------------------------------------------------------
+
+def _simple_segment_from_events(
+    recording_name: str,
+    manifests: list[dict],
+    rest_threshold: float = DEFAULT_REST_THRESHOLD,
+    *,
+    cached_timestamps: list[float] | None = None,
+    cached_window_events: list[dict] | None = None,
+) -> list[dict]:
+    """Fallback: segment by idle gaps from events JSONL.
+
+    If cached_timestamps/cached_window_events are provided (from a prior
+    _derive_activity_summary call), skips re-reading events from GCS.
+    """
+    session_start = min(m["chunk_start"] for m in manifests)
+    session_end = max(m["chunk_end"] for m in manifests)
+
+    if cached_timestamps is not None and cached_window_events is not None:
+        timestamps = list(cached_timestamps)
+        window_events = list(cached_window_events)
+    else:
+        timestamps = []
+        window_events = []
+        for evt in _iterate_events(recording_name, manifests):
+            ts = evt.get("timestamp", 0)
+            evt_type = evt.get("type", "")
+
+            if evt_type == "window.switch":
+                window_events.append({
+                    "timestamp": ts,
+                    "bundle_id": evt.get("app_bundle_id", ""),
+                    "title": evt.get("window_title", ""),
+                })
+            if ts > 0 and evt_type != "mouse.move":
+                timestamps.append(ts)
+
+    if not timestamps:
+        return [{
+            "start_ts": session_start,
+            "end_ts": session_end,
+            "derived_name": "recording",
+            "dominant_app": "", "dominant_app_name": "",
+            "dominant_title": "", "dominant_pct": 0.0,
+            "all_apps": {}, "rest_after_s": 0.0, "event_count": 0,
+            "source_chunks": [
+                {
+                    "chunk_index": m["chunk_index"],
+                    "chunk_start": m["chunk_start"],
+                    "chunk_end": m["chunk_end"],
+                    "start_ts": m["chunk_start"],
+                    "end_ts": m["chunk_end"],
+                    "start_offset_s": 0.0,
+                    "end_offset_s": m["chunk_end"] - m["chunk_start"],
+                }
+                for m in sorted(manifests, key=lambda m: m["chunk_index"])
+            ],
+        }]
+
+    timestamps.sort()
+    window_events.sort(key=lambda w: w["timestamp"])
+
+    # Split by idle gaps
+    tasks_raw: list[tuple[float, float, int]] = []
+    task_start = timestamps[0]
+    task_end = task_start
+    count = 1
+    for ts in timestamps[1:]:
+        if ts - task_end > rest_threshold:
+            tasks_raw.append((task_start, task_end, count))
+            task_start = ts
+            count = 0
+        task_end = ts
+        count += 1
+    tasks_raw.append((task_start, task_end, count))
+
+    result: list[dict] = []
+    for start, end, evt_count in tasks_raw:
+        dom_bundle = ""
+        dom_title = ""
+        for w in reversed(window_events):
+            if w["timestamp"] <= end:
+                dom_bundle = w["bundle_id"]
+                dom_title = w["title"]
+                break
+
+        app_name = _app_name_short(dom_bundle) if dom_bundle else "unknown"
+        title_slug = _slugify(dom_title[:30]) if dom_title else ""
+        derived = (
+            f"{_slugify(app_name)}-{title_slug}"
+            if title_slug and title_slug != "untitled"
+            else _slugify(app_name)
+        )
+
+        task = {
+            "start_ts": start, "end_ts": end,
+            "derived_name": derived,
+            "dominant_app": dom_bundle,
+            "dominant_app_name": app_name,
+            "dominant_title": dom_title[:80] if dom_title else "",
+            "dominant_pct": 0.0, "all_apps": {},
+            "rest_after_s": 0.0, "event_count": evt_count,
+            "source_chunks": [],
+        }
+        task["source_chunks"] = _compute_source_chunks(task, manifests)
+        result.append(task)
+
+    for i in range(len(result) - 1):
+        result[i]["rest_after_s"] = round(
+            result[i + 1]["start_ts"] - result[i]["end_ts"], 1,
+        )
+
+    return result
+
+
+def _stats_summary(activity_entries: list[dict], tasks: list[dict]) -> dict:
+    """Generate a stats-based summary when LLM is unavailable."""
+    cat_time: dict[str, float] = {}
+    unique_apps: set[str] = set()
+
+    for e in activity_entries:
+        dur = e.get("end_ts", 0) - e.get("start_ts", 0)
+        cat = e.get("cat", "OTHER")
+        cat_time[cat] = cat_time.get(cat, 0) + dur
+        if e.get("app"):
+            unique_apps.add(e["app"])
+
+    total_time = sum(cat_time.values()) or 1.0
+    time_breakdown = {
+        cat: round(dur / total_time * 100)
+        for cat, dur in sorted(cat_time.items(), key=lambda x: -x[1])
+        if dur / total_time >= 0.05
+    }
+
+    dominant_cat = max(cat_time, key=cat_time.get) if cat_time else "other"
+
+    return {
+        "overview": f"Recording with {len(tasks)} tasks across {len(unique_apps)} apps.",
+        "primary_focus": dominant_cat.lower(),
+        "time_breakdown": time_breakdown,
+        "key_accomplishments": [],
+    }
+
+
+# ---------------------------------------------------------------------------
+# Task → chunk mapping (Step 8)
+# ---------------------------------------------------------------------------
+
+def _compute_source_chunks(task: dict, manifests: list[dict]) -> list[dict]:
+    """Map a task's time range to source chunk indices and offsets."""
+    source_chunks = []
+    for m in sorted(manifests, key=lambda m: m["chunk_index"]):
+        chunk_start = m["chunk_start"]
+        chunk_end = m["chunk_end"]
+        overlap_start = max(task["start_ts"], chunk_start)
+        overlap_end = min(task["end_ts"], chunk_end)
+        if overlap_end > overlap_start:
+            source_chunks.append({
+                "chunk_index": m["chunk_index"],
+                "chunk_start": chunk_start,
+                "chunk_end": chunk_end,
+                "start_ts": overlap_start,
+                "end_ts": overlap_end,
+                "start_offset_s": overlap_start - chunk_start,
+                "end_offset_s": overlap_end - chunk_start,
+            })
+    return source_chunks
+
+
+def _map_tasks_to_chunks(tasks: list[dict], manifests: list[dict]) -> list[dict]:
+    """Map LLM task boundaries to source chunk indices."""
+    for task in tasks:
+        if not task.get("source_chunks"):
+            task["source_chunks"] = _compute_source_chunks(task, manifests)
+    return tasks
+
+
+# ---------------------------------------------------------------------------
 # Entry point
 # ---------------------------------------------------------------------------
 
