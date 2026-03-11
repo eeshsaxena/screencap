@@ -24,8 +24,10 @@ logging.basicConfig(level=logging.INFO, format="%(levelname)s %(message)s")
 log = logging.getLogger(__name__)
 
 BUCKET = os.environ.get("SCREENCAP_BUCKET", "screencap-recordings")
-PROCESSOR_VERSION = "1.0.0"
+PROCESSOR_VERSION = "2.0.0"
+MAX_ACTIVITY_ENTRIES = 200  # cap activity timeline entries for LLM context
 DEFAULT_REST_THRESHOLD = 120.0
+_LLM_ENRICHED_FIELDS = ("name", "description", "category", "apps_used", "confidence")
 MAX_MERGE_GAP = 5.0  # max seconds between consecutive chunk boundaries
 SLUG_MAX = 60
 
@@ -547,11 +549,11 @@ def _process_task(
         "duration_s": round(duration, 1),
         "duration_human": _duration_human(duration),
         "event_count": event_count,
-        "dominant_app": task["dominant_app"],
-        "dominant_app_name": task["dominant_app_name"],
+        "dominant_app": task.get("dominant_app", ""),
+        "dominant_app_name": task.get("dominant_app_name", ""),
         "dominant_title": task.get("dominant_title", ""),
-        "dominant_pct": task["dominant_pct"],
-        "derived_name": task["derived_name"],
+        "dominant_pct": task.get("dominant_pct", 0.0),
+        "derived_name": task.get("derived_name", "untitled"),
         "source_chunks": source_chunks_detail,
         "merged_across_chunks": len(task["source_chunks"]) > 1,
         "has_transcript": has_transcript,
@@ -560,8 +562,13 @@ def _process_task(
         "has_events": has_events,
         "video_size_mb": round(video_size / (1024 * 1024), 1) if video_size else 0,
         "rest_after_s": task.get("rest_after_s", 0.0),
-        "all_apps": task["all_apps"],
+        "all_apps": task.get("all_apps", {}),
     }
+
+    # LLM-enriched fields (present when segmentation_method == "llm")
+    for llm_field in _LLM_ENRICHED_FIELDS:
+        if task.get(llm_field):
+            task_meta[llm_field] = task[llm_field]
 
     _upload_json(f"{task_prefix}task.json", task_meta)
     return task_meta
