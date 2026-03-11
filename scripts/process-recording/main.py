@@ -1377,6 +1377,76 @@ def _map_tasks_to_chunks(tasks: list[dict], manifests: list[dict]) -> list[dict]
 
 
 # ---------------------------------------------------------------------------
+# v2 manifest processing orchestrator (Step 9)
+# ---------------------------------------------------------------------------
+
+def _process_v2_manifests(
+    recording_name: str,
+    manifests: list[dict],
+) -> tuple[list[dict], str, dict | None]:
+    """Process v2 manifests: try LLM segmentation, fallback to idle-gap.
+
+    Returns (tasks, segmentation_method, summary_or_None).
+    """
+    tasks = None
+    summary = None
+    segmentation_method = "idle"
+    activity_data = None
+
+    # v2 manifests always attempt LLM segmentation. The manifest format
+    # itself is the control: v2 = try LLM, v1 = legacy _merge_tasks().
+    log.info("%s: attempting LLM segmentation", recording_name)
+    activity_data = _derive_activity_summary(recording_name, manifests)
+
+    if activity_data:
+        log.info(
+            "%s: activity summary — %d entries, %d timeline items",
+            recording_name,
+            len(activity_data["entries"]),
+            len(activity_data["summary"]["timeline"]),
+        )
+        llm_result = _llm_segment_session(activity_data["summary"])
+
+        if llm_result:
+            try:
+                validated = _validate_llm_tasks(
+                    llm_result,
+                    activity_data["session_start"],
+                    activity_data["session_end"],
+                    activity_data["time_map"],
+                )
+            except Exception:
+                log.warning("%s: LLM validation crashed", recording_name, exc_info=True)
+                validated = None
+            if validated:
+                tasks = _map_tasks_to_chunks(validated["tasks"], manifests)
+                summary = validated["summary"]
+                segmentation_method = "llm"
+                log.info("%s: LLM segmentation → %d tasks", recording_name, len(tasks))
+            else:
+                log.warning("%s: LLM output failed validation", recording_name)
+        else:
+            log.warning("%s: LLM call returned None", recording_name)
+    else:
+        log.warning("%s: no activity data for LLM", recording_name)
+
+    # Fallback
+    if tasks is None:
+        log.info("%s: using simple idle-gap segmentation", recording_name)
+        tasks = _simple_segment_from_events(
+            recording_name, manifests,
+            cached_timestamps=activity_data.get("raw_timestamps") if activity_data else None,
+            cached_window_events=activity_data.get("raw_window_events") if activity_data else None,
+        )
+        activity_entries = activity_data["entries"] if activity_data else []
+        summary = _stats_summary(activity_entries, tasks)
+        segmentation_method = "idle"
+        log.info("%s: simple segmentation → %d tasks", recording_name, len(tasks))
+
+    return tasks, segmentation_method, summary
+
+
+# ---------------------------------------------------------------------------
 # Entry point
 # ---------------------------------------------------------------------------
 
@@ -1513,18 +1583,29 @@ def process_recording(cloud_event):
         log.error("All manifests failed to load for %s", recording_name)
         return
 
-    # Count tasks before merge
-    tasks_before = sum(len(m.get("tasks", [])) for m in manifests)
+    # --- Route by manifest format version ---
+    format_version = manifests[0].get("format_version", 0)
+    segmentation_method = "idle"
+    session_summary = None
 
-    # Get rest threshold from first manifest (they should all match)
-    rest_threshold = manifests[0].get("rest_threshold_secs", DEFAULT_REST_THRESHOLD)
-
-    # Merge cross-chunk tasks
-    merged_tasks = _merge_tasks(manifests, rest_threshold)
-    log.info(
-        "%s: %d chunks, %d tasks before merge, %d after merge",
-        recording_name, len(manifests), tasks_before, len(merged_tasks),
-    )
+    if format_version >= 2:
+        # v2 manifests — LLM segmentation path (with idle-gap fallback)
+        merged_tasks, segmentation_method, session_summary = _process_v2_manifests(
+            recording_name, manifests,
+        )
+        log.info(
+            "%s: v2 path — %d chunks, %d tasks (%s)",
+            recording_name, len(manifests), len(merged_tasks), segmentation_method,
+        )
+    else:
+        # Legacy v1 manifests — existing cross-chunk merge
+        tasks_before = sum(len(m.get("tasks", [])) for m in manifests)
+        rest_threshold = manifests[0].get("rest_threshold_secs", DEFAULT_REST_THRESHOLD)
+        merged_tasks = _merge_tasks(manifests, rest_threshold)
+        log.info(
+            "%s: v1 path — %d chunks, %d tasks before merge, %d after",
+            recording_name, len(manifests), tasks_before, len(merged_tasks),
+        )
 
     # Assign folder names
     folders = _assign_folder_names(merged_tasks)
@@ -1532,7 +1613,7 @@ def process_recording(cloud_event):
     # Process tasks with /tmp management
     with tempfile.TemporaryDirectory(prefix="screencap_") as tmpdir_str:
         tmpdir = Path(tmpdir_str)
-        video_cache: dict[int, Path] = {}  # chunk_index → local path
+        video_cache: dict[int, Path] = {}
         audio_cache: dict[int, Path] = {}
 
         timeline_tasks: list[dict] = []
@@ -1547,14 +1628,20 @@ def process_recording(cloud_event):
                 video_cache, audio_cache, sessions_prefix,
             )
 
-            # Add index to timeline entry (strip all_apps for timeline)
+            # Build timeline entry
             timeline_entry = {k: v for k, v in task_meta.items() if k != "all_apps"}
             timeline_entry["index"] = task_idx
+
+            # Add LLM-enriched fields if present on the source task
+            for llm_field in _LLM_ENRICHED_FIELDS:
+                if task.get(llm_field):
+                    timeline_entry[llm_field] = task[llm_field]
+
             timeline_tasks.append(timeline_entry)
             total_video_bytes += int(task_meta.get("video_size_mb", 0) * 1024 * 1024)
             total_active_s += task_meta.get("duration_s", 0)
 
-            # Cleanup chunk cache — remove chunks not needed by remaining tasks
+            # Cleanup chunk cache
             remaining_chunks: set[int] = set()
             for future_task in merged_tasks[task_idx + 1:]:
                 for sc in future_task["source_chunks"]:
@@ -1567,18 +1654,29 @@ def process_recording(cloud_event):
     if merged_tasks:
         total_duration = merged_tasks[-1]["end_ts"] - merged_tasks[0]["start_ts"]
 
-    # Upload timeline.json
+    # Build timeline.json
     timeline = {
         "recording_name": recording_name,
+        "segmentation_method": segmentation_method,
         "processed_at": datetime.now(timezone.utc).isoformat(),
         "processor_version": PROCESSOR_VERSION,
         "total_tasks": len(merged_tasks),
         "total_chunks": len(manifests),
         "total_duration_s": round(total_duration, 1),
         "total_active_s": round(total_active_s, 1),
-        "rest_threshold_secs": rest_threshold,
         "tasks": timeline_tasks,
     }
+
+    # Add session summary (from LLM or stats-based fallback)
+    if session_summary:
+        timeline["summary"] = session_summary
+
+    # Legacy field for v1 compat
+    if format_version < 2:
+        timeline["rest_threshold_secs"] = manifests[0].get(
+            "rest_threshold_secs", DEFAULT_REST_THRESHOLD,
+        )
+
     _upload_json(f"{sessions_prefix}timeline.json", timeline)
 
     # Upload processing status
@@ -1592,12 +1690,12 @@ def process_recording(cloud_event):
         "source_db_md5": trigger_id if trigger_file == "recording.db" else None,
         "chunks_found": len(manifests),
         "manifests_found": len(manifest_blobs),
-        "tasks_before_merge": tasks_before,
-        "tasks_after_merge": len(merged_tasks),
+        "tasks_processed": len(merged_tasks),
+        "segmentation_method": segmentation_method,
         "total_video_bytes": total_video_bytes,
     })
 
     log.info(
-        "Done processing %s: %d tasks, %d chunks",
-        recording_name, len(merged_tasks), len(manifests),
+        "Done processing %s: %d tasks, %d chunks, method=%s",
+        recording_name, len(merged_tasks), len(manifests), segmentation_method,
     )
