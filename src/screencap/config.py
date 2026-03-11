@@ -210,6 +210,26 @@ def get_rest_threshold() -> float:
     return float(cfg.get("rest_threshold", 120.0))
 
 
+def get_segmentation_mode() -> str:
+    """Return segmentation mode: 'idle' or 'llm'. Default 'llm'.
+
+    Reads from config.toml key ``segmentation_mode``.
+    CLI flag ``--segmentation-mode`` takes priority (passed directly, not via this function).
+
+    Controls manifest format:
+    - 'idle': old manifest with tasks (format_version absent)
+    - 'llm': simplified manifest with chunk metadata only (format_version: 2)
+    """
+    valid = ("idle", "llm")
+    cfg = _load_toml()
+    val = cfg.get("segmentation_mode", "llm")
+    if not isinstance(val, str) or val not in valid:
+        raise SystemExit(
+            f"Error: segmentation_mode must be one of {valid}, got: {val!r}"
+        )
+    return val
+
+
 def get_upload_default() -> str:
     """Return default recording destination: 'local', 'cloud', or 'ask'.
 
