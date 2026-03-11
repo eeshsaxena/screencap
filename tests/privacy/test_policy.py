@@ -57,6 +57,21 @@ class TestActionMatrix:
             == PrivacyAction.MASK_WINDOW
         )
 
+    # New ContextClass matrix entries (pinned values for security-sensitive classes)
+    @pytest.mark.parametrize("ctx, mode, expected", [
+        (ContextClass.AUTH_FLOW, PrivacyMode.PUBLIC, PrivacyAction.EXCLUDE),
+        (ContextClass.AUTH_FLOW, PrivacyMode.SHARED, PrivacyAction.EXCLUDE),
+        (ContextClass.AUTH_FLOW, PrivacyMode.INTERNAL, PrivacyAction.MASK_WINDOW),
+        (ContextClass.PAYMENT_FLOW, PrivacyMode.PUBLIC, PrivacyAction.EXCLUDE),
+        (ContextClass.PAYMENT_FLOW, PrivacyMode.SHARED, PrivacyAction.EXCLUDE),
+        (ContextClass.PAYMENT_FLOW, PrivacyMode.INTERNAL, PrivacyAction.MASK_WINDOW),
+        (ContextClass.CLOUD_STORAGE, PrivacyMode.PUBLIC, PrivacyAction.MASK_WINDOW),
+        (ContextClass.CLOUD_STORAGE, PrivacyMode.SHARED, PrivacyAction.MASK_REGION),
+        (ContextClass.CLOUD_STORAGE, PrivacyMode.INTERNAL, PrivacyAction.ALLOW),
+    ])
+    def test_new_context_class_matrix_values(self, ctx, mode, expected):
+        assert get_matrix_action(ctx, mode) == expected
+
 
 # ---------------------------------------------------------------------------
 # Config parsing

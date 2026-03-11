@@ -110,6 +110,7 @@ def _build_blocked_intervals(
             window_title=we.title,
             domain=we.domain,
             timestamp=we.timestamp,
+            browser_url=we.browser_url,
         )
         ctx = classifier.classify(meta)
         decision = evaluator.evaluate(ctx, meta)
