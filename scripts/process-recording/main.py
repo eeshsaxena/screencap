@@ -952,6 +952,150 @@ def _derive_activity_summary(
 
 
 # ---------------------------------------------------------------------------
+# LLM segmentation (Steps 4–5)
+# ---------------------------------------------------------------------------
+
+_LLM_PROMPT = """\
+You are a productivity analyst examining a computer activity timeline from a screen recording.
+
+ACTIVITY LOG:
+{activity_json}
+
+INSTRUCTIONS:
+1. Identify the distinct TASKS the user performed. A task is a coherent unit of work —
+   not just "used an app" but "what were they trying to accomplish?"
+2. Brief app switches (< 30s) mid-task are NOT separate tasks — absorb them.
+3. Related activities across different apps are ONE task
+   (e.g., "code in VSCode → test in Terminal → check docs in Chrome" = one dev task).
+4. Use transcript speech to understand INTENT — "let me check my email" signals a task switch.
+
+For each task return:
+- start_time: relative timestamp (matching timeline format, e.g. "0:02:00")
+- end_time: relative timestamp
+- name: 3-8 word descriptive name (e.g., "Debugging auth service login flow")
+- description: 1-2 sentence summary of what the user did
+- category: one of [development, communication, research, admin, creative, other]
+- apps_used: list of apps involved
+- confidence: high | medium | low
+
+Also provide a SESSION SUMMARY:
+- overview: 2-3 sentence description of what the user accomplished
+- primary_focus: the main category of work
+- time_breakdown: approximate percentage per category
+- key_accomplishments: 2-4 bullet points of specific things completed
+
+RULES:
+- Every second of the recording must be covered by exactly one task (no gaps, no overlaps)
+- Name tasks by INTENT not by app name
+- A task should be at least 1 minute long
+- start_time of first task must be "0:00:00"
+
+Return ONLY valid JSON: {{"tasks": [...], "summary": {{...}}}}"""
+
+_RESPONSE_SCHEMA = {
+    "type": "object",
+    "properties": {
+        "tasks": {
+            "type": "array",
+            "items": {
+                "type": "object",
+                "properties": {
+                    "start_time": {"type": "string"},
+                    "end_time": {"type": "string"},
+                    "name": {"type": "string"},
+                    "description": {"type": "string"},
+                    "category": {
+                        "type": "string",
+                        "enum": ["development", "communication", "research",
+                                 "admin", "creative", "other"],
+                    },
+                    "apps_used": {"type": "array", "items": {"type": "string"}},
+                    "confidence": {
+                        "type": "string",
+                        "enum": ["high", "medium", "low"],
+                    },
+                },
+                "required": ["start_time", "end_time", "name", "description",
+                             "category", "apps_used", "confidence"],
+            },
+        },
+        "summary": {
+            "type": "object",
+            "properties": {
+                "overview": {"type": "string"},
+                "primary_focus": {"type": "string"},
+                "time_breakdown": {"type": "object"},
+                "key_accomplishments": {
+                    "type": "array", "items": {"type": "string"},
+                },
+            },
+            "required": ["overview", "primary_focus", "time_breakdown",
+                         "key_accomplishments"],
+        },
+    },
+    "required": ["tasks", "summary"],
+}
+
+
+def _llm_segment_session(activity_summary: dict) -> dict | None:
+    """Call LLM to segment the session into tasks.
+
+    Returns dict with "tasks" and "summary", or None on failure.
+    """
+    prompt = _LLM_PROMPT.format(
+        activity_json=json.dumps(activity_summary, indent=2),
+    )
+    return _call_llm(prompt)
+
+
+def _call_llm(prompt: str) -> dict | None:
+    """Call LLM: Vertex AI Gemini Flash. Returns parsed JSON or None."""
+    result = _call_gemini(prompt)
+    if result is not None:
+        return result
+
+    log.warning("Gemini failed — falling back to simple segmentation")
+    return None
+
+
+def _call_gemini(prompt: str) -> dict | None:
+    """Call Gemini Flash via Vertex AI. Returns parsed JSON or None."""
+    try:
+        from google.cloud import aiplatform  # noqa: F811
+        from vertexai.generative_models import GenerativeModel, GenerationConfig
+
+        project = os.environ.get("GOOGLE_CLOUD_PROJECT") or os.environ.get("GCP_PROJECT")
+        location = os.environ.get("GOOGLE_CLOUD_LOCATION", "us-central1")
+
+        if not project:
+            log.info("No GCP project configured for Gemini, skipping")
+            return None
+
+        aiplatform.init(project=project, location=location)
+
+        model = GenerativeModel("gemini-2.0-flash-001")
+        response = model.generate_content(
+            prompt,
+            generation_config=GenerationConfig(
+                response_mime_type="application/json",
+                response_schema=_RESPONSE_SCHEMA,
+                temperature=0.1,
+            ),
+        )
+
+        result = json.loads(response.text)
+        log.info("Gemini Flash returned %d tasks", len(result.get("tasks", [])))
+        return result
+
+    except ImportError:
+        log.info("vertexai not installed, skipping Gemini")
+        return None
+    except Exception:
+        log.warning("Gemini call failed", exc_info=True)
+        return None
+
+
+# ---------------------------------------------------------------------------
 # Entry point
 # ---------------------------------------------------------------------------
 
