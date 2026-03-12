@@ -73,7 +73,7 @@ class Detection:
     start: int  # character offset (inclusive)
     end: int  # character offset (exclusive)
     score: float  # confidence 0.0-1.0
-    source: str  # detector name: "secrets", "pii-presidio", "pii-datafog", "regex"
+    source: str  # detector name: "secrets", "pii-presidio", "pii-gliner", "regex"
 
 
 class DetectionResult(NamedTuple):
@@ -264,7 +264,7 @@ class Anonymizer:
 # Factory
 # ---------------------------------------------------------------------------
 
-_VALID_PII_ENGINES = frozenset({"presidio", "datafog", None})
+_VALID_PII_ENGINES = frozenset({"presidio", "presidio-gliner", None})
 
 
 def create_default_pipeline(
@@ -275,21 +275,22 @@ def create_default_pipeline(
     """Create a pipeline with all available detectors.
 
     Args:
-        pii_engine: PII backend to use. One of "presidio", "datafog", or
-            None (auto-detect: tries Presidio first, falls back to DataFog).
+        pii_engine: PII backend to use. One of "presidio" (spaCy NER),
+            "presidio-gliner" (GLiNER NER), or None (auto: GLiNER first,
+            falls back to spaCy).
         person_threshold: Drop PERSON detections with score <= this value.
         person_allowlist: Lowercased app names to suppress as PERSON hits.
 
     Call ONCE per scrub session — detector constructors load NLP models
-    (~200-500ms for Presidio/spaCy). Reuse the returned pipeline for all
-    text chunks.
+    (~200-500ms for spaCy, ~1-2s for GLiNER). Reuse the returned pipeline
+    for all text chunks.
 
     Raises ImportError with an actionable message if privacy deps are missing.
     """
     if pii_engine not in _VALID_PII_ENGINES:
         raise ValueError(
             f"Invalid pii_engine={pii_engine!r}. "
-            f"Must be one of: 'presidio', 'datafog', or None (auto-detect)."
+            f"Must be one of: 'presidio', 'presidio-gliner', or None (auto-detect)."
         )
 
     detectors: list[TextDetector] = []
@@ -309,45 +310,49 @@ def create_default_pipeline(
             "Install with: pip install 'screencap[privacy]'"
         )
 
-    # PII engine selection
+    # PII engine selection: GLiNER (default) or spaCy (legacy)
     pii_loaded = False
-    if pii_engine in (None, "presidio"):
-        try:
-            from screencap.privacy.pii import PiiDetector
+    ner_backend = "spacy" if pii_engine == "presidio" else "gliner"
 
-            detectors.append(PiiDetector(
-                person_threshold=person_threshold,
-                person_allowlist=person_allowlist,
-            ))
-            pii_loaded = True
-        except ImportError:
-            if pii_engine == "presidio":
-                raise ImportError(
-                    "Presidio not installed. "
-                    "Install with: pip install presidio-analyzer"
-                )
-            logger.info("Presidio not available, trying DataFog...")
+    try:
+        from screencap.privacy.pii import PiiDetector
 
-    if not pii_loaded and pii_engine in (None, "datafog"):
-        try:
-            from screencap.privacy.pii_datafog import DataFogPiiDetector
+        detectors.append(PiiDetector(
+            person_threshold=person_threshold,
+            person_allowlist=person_allowlist,
+            ner_backend=ner_backend,
+        ))
+        pii_loaded = True
+    except ImportError:
+        if pii_engine == "presidio-gliner":
+            raise ImportError(
+                "GLiNER not installed. "
+                "Install with: pip install 'presidio-analyzer[gliner]'"
+            )
+        if pii_engine == "presidio":
+            raise ImportError(
+                "Presidio not installed. "
+                "Install with: pip install presidio-analyzer"
+            )
+        # Auto-detect: GLiNER failed, try spaCy fallback
+        if ner_backend == "gliner":
+            logger.info("GLiNER not available, falling back to spaCy...")
+            try:
+                from screencap.privacy.pii import PiiDetector
 
-            detectors.append(DataFogPiiDetector(
-                person_threshold=person_threshold,
-                person_allowlist=person_allowlist,
-            ))
-            pii_loaded = True
-        except ImportError:
-            if pii_engine == "datafog":
-                raise ImportError(
-                    "DataFog NLP not installed. "
-                    "Install with: pip install 'datafog[nlp]'"
-                )
+                detectors.append(PiiDetector(
+                    person_threshold=person_threshold,
+                    person_allowlist=person_allowlist,
+                    ner_backend="spacy",
+                ))
+                pii_loaded = True
+            except ImportError:
+                pass
 
     if not pii_loaded:
         logger.warning(
             "No PII engine installed — PII detection disabled. "
-            "Install with: pip install presidio-analyzer  (or: pip install 'datafog[nlp]')"
+            "Install with: pip install 'presidio-analyzer[gliner]'"
         )
 
     if len(detectors) < 2:

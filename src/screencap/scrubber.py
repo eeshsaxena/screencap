@@ -1124,7 +1124,7 @@ def scrub_recording(
 
     Args:
         name: Recording name (directory name under recordings/).
-        pii_engine: "presidio", "datafog", or None (auto-detect).
+        pii_engine: "presidio", "presidio-gliner", or None (auto-detect).
 
     Returns:
         ScrubResult with entity counts and deleted files.

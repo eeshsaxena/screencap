@@ -13,7 +13,7 @@ from pathlib import Path
 
 import pytest
 
-from screencap.privacy import Anonymizer, Detection, DetectionPipeline, normalize_text
+from screencap.privacy import Anonymizer, Detection, DetectionPipeline
 from screencap.privacy.pii import PiiDetector
 from screencap.privacy.regex import RegexDetector
 from screencap.privacy.secrets import DetectSecretsDetector
@@ -162,34 +162,45 @@ def _find_detection(
 
     Returns (exact_match, partial_match, coverage_ratio).
     Coverage ratio = fraction of the expected span covered by the best detection.
+    Checks all occurrences of the substring, not just the first.
     """
-    idx = normalized.find(expected.substring)
-    if idx == -1:
+    exp_len = len(expected.substring)
+    if not exp_len:
         return False, False, 0.0
 
-    exp_start = idx
-    exp_end = idx + len(expected.substring)
-    exp_len = exp_end - exp_start
-
-    exact = False
+    best_exact = False
     best_coverage = 0.0
+    offset = 0
 
-    for det in detections:
-        if expected.source and det.source != expected.source:
-            continue
+    while True:
+        idx = normalized.find(expected.substring, offset)
+        if idx == -1:
+            break
 
-        # Partial overlap
-        if det.start < exp_end and det.end > exp_start:
-            overlap_start = max(det.start, exp_start)
-            overlap_end = min(det.end, exp_end)
-            coverage = (overlap_end - overlap_start) / exp_len
-            best_coverage = max(best_coverage, coverage)
+        exp_start = idx
+        exp_end = idx + exp_len
 
-            if det.start == exp_start and det.end == exp_end:
-                exact = True
+        for det in detections:
+            if expected.source and det.source != expected.source:
+                continue
+
+            if det.start < exp_end and det.end > exp_start:
+                overlap_start = max(det.start, exp_start)
+                overlap_end = min(det.end, exp_end)
+                coverage = (overlap_end - overlap_start) / exp_len
+                best_coverage = max(best_coverage, coverage)
+
+                if det.start == exp_start and det.end == exp_end:
+                    best_exact = True
+
+        # If we found an exact match, no need to check further occurrences
+        if best_exact:
+            break
+
+        offset = idx + 1
 
     partial = best_coverage > 0
-    return exact, partial, best_coverage
+    return best_exact, partial, best_coverage
 
 
 def _detection_matches_expected(
@@ -197,15 +208,21 @@ def _detection_matches_expected(
     det: Detection,
     expected_list: list[ExpectedEntity],
 ) -> bool:
-    """Check if a detection matches any expected entity in the case."""
+    """Check if a detection matches any expected entity in the case.
+
+    Checks all occurrences of each expected substring, not just the first.
+    """
     for exp in expected_list:
-        idx = normalized.find(exp.substring)
-        if idx == -1:
-            continue
-        exp_start = idx
-        exp_end = idx + len(exp.substring)
-        if det.start < exp_end and det.end > exp_start:
-            return True
+        offset = 0
+        while True:
+            idx = normalized.find(exp.substring, offset)
+            if idx == -1:
+                break
+            exp_start = idx
+            exp_end = idx + len(exp.substring)
+            if det.start < exp_end and det.end > exp_start:
+                return True
+            offset = idx + 1
     return False
 
 
@@ -359,6 +376,12 @@ def pipeline() -> DetectionPipeline:
     return _build_pipeline()
 
 
+@pytest.fixture(scope="module")
+def benchmark_results(pipeline: DetectionPipeline) -> AggregateResult:
+    """Cached benchmark results — run_benchmark() called once per session."""
+    return run_benchmark(pipeline)
+
+
 # ---------------------------------------------------------------------------
 # Test classes
 # ---------------------------------------------------------------------------
@@ -367,62 +390,56 @@ def pipeline() -> DetectionPipeline:
 class TestPipelineBenchmark:
     """Comprehensive benchmark against the full corpus."""
 
-    def test_benchmark_report(self, pipeline: DetectionPipeline) -> None:
+    def test_benchmark_report(self, benchmark_results: AggregateResult) -> None:
         """Generate full benchmark report. Always passes — metrics are informational."""
-        results = run_benchmark(pipeline)
-        print_benchmark_table(results)
+        print_benchmark_table(benchmark_results)
 
-    def test_recall_minimum(self, pipeline: DetectionPipeline) -> None:
+    def test_recall_minimum(self, benchmark_results: AggregateResult) -> None:
         """Hard gate: partial-overlap recall >= 95%."""
-        results = run_benchmark(pipeline)
-        recall = results.recall_partial
+        recall = benchmark_results.recall_partial
         assert recall >= 0.95, (
             f"Partial-overlap recall {recall:.1%} < 95%. "
-            f"FN={results.total_fn}, TP={results.total_tp}"
+            f"FN={benchmark_results.total_fn}, TP={benchmark_results.total_tp}"
         )
 
-    def test_precision_minimum(self, pipeline: DetectionPipeline) -> None:
+    def test_precision_minimum(self, benchmark_results: AggregateResult) -> None:
         """Hard gate: precision >= 80%."""
-        results = run_benchmark(pipeline)
-        precision = results.precision
+        precision = benchmark_results.precision
         assert precision >= 0.80, (
             f"Precision {precision:.1%} < 80%. "
-            f"FP={results.total_fp}, TP={results.total_tp}"
+            f"FP={benchmark_results.total_fp}, TP={benchmark_results.total_tp}"
         )
 
-    def test_document_leak_rate(self, pipeline: DetectionPipeline) -> None:
+    def test_document_leak_rate(self, benchmark_results: AggregateResult) -> None:
         """Hard gate: document-level leak rate < 5%."""
-        results = run_benchmark(pipeline)
-        leak_rate = results.document_leak_rate
+        leak_rate = benchmark_results.document_leak_rate
         assert leak_rate < 0.05, (
             f"Document leak rate {leak_rate:.1%} >= 5%. "
-            f"Leaks={results.document_leaks}/{results.document_total}"
+            f"Leaks={benchmark_results.document_leaks}/{benchmark_results.document_total}"
         )
 
-    def test_redaction_survival(self, pipeline: DetectionPipeline) -> None:
+    def test_redaction_survival(self, benchmark_results: AggregateResult) -> None:
         """Hard gate: redaction survival rate < 5%.
 
         If PII substrings survive in the anonymized output, the whole
         pipeline is failing at its job regardless of detection metrics.
         """
-        results = run_benchmark(pipeline)
-        rate = results.redaction_survival_rate
+        rate = benchmark_results.redaction_survival_rate
         assert rate < 0.05, (
             f"Redaction survival rate {rate:.1%} >= 5%. "
-            f"{results.redaction_survivals}/{results.redaction_total} PII strings survived anonymization."
+            f"{benchmark_results.redaction_survivals}/{benchmark_results.redaction_total} PII strings survived anonymization."
         )
 
-    def test_save_results_json(self, pipeline: DetectionPipeline, tmp_path: Path) -> None:
+    def test_save_results_json(self, benchmark_results: AggregateResult, tmp_path: Path) -> None:
         """Verify JSON output can be saved and re-read."""
-        results = run_benchmark(pipeline)
         out = tmp_path / "benchmark.json"
-        save_benchmark_json(results, out)
+        save_benchmark_json(benchmark_results, out)
 
         loaded = json.loads(out.read_text())
         assert "per_type" in loaded
         assert "totals" in loaded
         assert "fp_by_source" in loaded
-        assert loaded["totals"]["true_positives"] == results.total_tp
+        assert loaded["totals"]["true_positives"] == benchmark_results.total_tp
         assert "avg_coverage" in loaded["totals"]
         assert "redaction_survival_rate" in loaded["totals"]
         assert "weighted_fp_impact" in loaded["totals"]

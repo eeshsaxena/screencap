@@ -1611,8 +1611,7 @@ def setup(scan, show, reset):
 
 _PRIVACY_EXTRAS_MSG = (
     "[red]Error: Privacy dependencies not installed.[/red]\n"
-    "Install with: [bold]pip install screencap\\[privacy][/bold]\n"
-    "Or lightweight: [bold]pip install screencap\\[privacy-lite][/bold]"
+    "Install with: [bold]pip install screencap\\[privacy][/bold]"
 )
 
 
@@ -1620,9 +1619,9 @@ _PRIVACY_EXTRAS_MSG = (
 @click.argument("name")
 @click.option(
     "--pii-engine",
-    type=click.Choice(["presidio", "datafog"]),
+    type=click.Choice(["presidio", "presidio-gliner"]),
     default=None,
-    help="PII detection engine (default: auto-detect).",
+    help="PII detection engine (default: auto-detect, prefers GLiNER).",
 )
 def scrub(name: str, pii_engine: str | None) -> None:
     """Create a privacy-scrubbed copy of a recording."""

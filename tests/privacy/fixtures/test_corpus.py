@@ -57,8 +57,8 @@ WINDOW_TITLES = [
     CorpusCase(
         id="wt-02",
         description="Outlook with email in title",
-        text="jane.smith@corp.com - Outlook",
-        expected=[ExpectedEntity("EMAIL", "jane.smith@corp.com")],
+        text="jane.smith@example.org - Outlook",
+        expected=[ExpectedEntity("EMAIL", "jane.smith@example.org")],
     ),
     CorpusCase(
         id="wt-03",
@@ -177,10 +177,10 @@ MIXED_PII_SECRETS = [
     CorpusCase(
         id="mix-04",
         description="Name + email in message",
-        text="From: Jane Smith <jane.smith@company.org>",
+        text="From: Jane Smith <jane.smith@example.org>",
         expected=[
             ExpectedEntity("PERSON", "Jane Smith"),
-            ExpectedEntity("EMAIL", "jane.smith@company.org"),
+            ExpectedEntity("EMAIL", "jane.smith@example.org"),
         ],
     ),
 ]
@@ -315,10 +315,10 @@ NON_ENGLISH_NAMES = [
     CorpusCase(
         id="intl-02",
         description="German name with umlaut",
-        text="From: Hans Müller <hans@example.de>",
+        text="From: Hans Müller <hans@example.net>",
         expected=[
             ExpectedEntity("PERSON", "Hans Müller"),
-            ExpectedEntity("EMAIL", "hans@example.de"),
+            ExpectedEntity("EMAIL", "hans@example.net"),
         ],
     ),
     CorpusCase(
@@ -420,10 +420,10 @@ ADDITIONAL_PII = [
     CorpusCase(
         id="pii-06",
         description="Multiple emails",
-        text="CC: alice@example.com, bob@company.org",
+        text="CC: alice@example.com, bob@example.org",
         expected=[
             ExpectedEntity("EMAIL", "alice@example.com"),
-            ExpectedEntity("EMAIL", "bob@company.org"),
+            ExpectedEntity("EMAIL", "bob@example.org"),
         ],
     ),
 ]
@@ -608,8 +608,8 @@ TERMINAL_ACCESSIBILITY = [
     CorpusCase(
         id="term-tp-01",
         description="git config with real email",
-        text="git config user.email jose.garcia@company.com",
-        expected=[ExpectedEntity("EMAIL", "jose.garcia@company.com")],
+        text="git config user.email jose.garcia@example.com",
+        expected=[ExpectedEntity("EMAIL", "jose.garcia@example.com")],
     ),
     CorpusCase(
         id="term-tp-02",
@@ -658,10 +658,10 @@ TERMINAL_ACCESSIBILITY = [
     CorpusCase(
         id="term-hard-03",
         description="Git diff with email added",
-        text='+    "email": "alice.jones@startup.io",\n-    "email": "placeholder@test.com",',
+        text='+    "email": "alice.jones@example.org",\n-    "email": "placeholder@example.net",',
         expected=[
-            ExpectedEntity("EMAIL", "alice.jones@startup.io"),
-            ExpectedEntity("EMAIL", "placeholder@test.com"),
+            ExpectedEntity("EMAIL", "alice.jones@example.org"),
+            ExpectedEntity("EMAIL", "placeholder@example.net"),
         ],
     ),
 ]
@@ -760,4 +760,3 @@ ALL_TEST_CASES: list[CorpusCase] = (
 # Count for verification
 TRUE_POSITIVE_CASES = [tc for tc in ALL_TEST_CASES if not tc.is_false_positive and tc.expected]
 FALSE_POSITIVE_CASES = [tc for tc in ALL_TEST_CASES if tc.is_false_positive]
-TOTAL_EXPECTED_ENTITIES = sum(len(tc.expected) for tc in TRUE_POSITIVE_CASES)
