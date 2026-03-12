@@ -34,6 +34,12 @@ from tests.privacy.test_benchmark import (
 
 def _build_pipeline(engine: str) -> DetectionPipeline:
     """Build a pipeline for the given engine."""
+    if engine == "full":
+        # Full pipeline with resolver + heuristic filter (Step 3)
+        from screencap.privacy import create_default_pipeline
+
+        return create_default_pipeline()
+
     detectors = [RegexDetector(), DetectSecretsDetector()]
 
     if engine in ("presidio", "presidio-gliner"):
@@ -108,9 +114,9 @@ def main() -> None:
     parser = argparse.ArgumentParser(description="PII detection benchmark runner")
     parser.add_argument(
         "--engine",
-        choices=["presidio", "presidio-gliner"],
-        default="presidio",
-        help="PII engine to benchmark (default: presidio)",
+        choices=["presidio", "presidio-gliner", "full"],
+        default="full",
+        help="PII engine to benchmark. 'full' includes GLiNER + resolver + heuristic filter (default: full)",
     )
     parser.add_argument(
         "--compare",

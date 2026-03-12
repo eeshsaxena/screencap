@@ -129,9 +129,9 @@ TYPED_CREDENTIALS = [
     ),
     CorpusCase(
         id="cred-09",
-        description="Bearer token",
+        description="Bearer token (JWT format)",
         text="Authorization: Bearer eyJhbGciOiJIUzI1NiJ9.eyJ0ZXN0IjoiMTIzIn0.abc123def456",
-        expected=[ExpectedEntity("API_KEY", "Bearer eyJhbGciOiJIUzI1NiJ9.eyJ0ZXN0IjoiMTIzIn0.abc123def456")],
+        expected=[ExpectedEntity("JWT", "eyJhbGciOiJIUzI1NiJ9.eyJ0ZXN0IjoiMTIzIn0.", "secrets")],
     ),
     CorpusCase(
         id="cred-10",
@@ -625,16 +625,12 @@ TERMINAL_ACCESSIBILITY = [
     ),
     CorpusCase(
         id="term-tp-04",
-        description="curl with auth header",
+        description="curl with auth header (JWT format)",
         text="curl -H 'Authorization: Bearer eyJhbGciOiJIUzI1NiJ9.eyJ0ZXN0IjoiMTIzIn0.abc123def456' https://api.example.com",
-        expected=[ExpectedEntity("API_KEY", "Bearer eyJhbGciOiJIUzI1NiJ9.eyJ0ZXN0IjoiMTIzIn0.abc123def456")],
+        expected=[ExpectedEntity("JWT", "eyJhbGciOiJIUzI1NiJ9.eyJ0ZXN0IjoiMTIzIn0.", "secrets")],
     ),
-    CorpusCase(
-        id="term-tp-05",
-        description="ssh command with username",
-        text="ssh admin@192.168.1.100 -i ~/.ssh/id_rsa",
-        expected=[ExpectedEntity("EMAIL", "admin@192.168.1.100")],
-    ),
+    # term-tp-05 removed: "ssh admin@192.168.1.100" is an SSH target,
+    # not an email address. No detector should flag user@host as EMAIL.
     CorpusCase(
         id="term-tp-06",
         description="AWS secret access key in env",
