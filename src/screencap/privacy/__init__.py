@@ -10,7 +10,10 @@ import logging
 import re
 import unicodedata
 from dataclasses import dataclass
-from typing import NamedTuple, Protocol
+from typing import TYPE_CHECKING, NamedTuple, Protocol
+
+if TYPE_CHECKING:
+    from screencap.privacy.resolver import DetectionResolver
 
 logger = logging.getLogger(__name__)
 
@@ -73,7 +76,7 @@ class Detection:
     start: int  # character offset (inclusive)
     end: int  # character offset (exclusive)
     score: float  # confidence 0.0-1.0
-    source: str  # detector name: "secrets", "pii-presidio", "pii-datafog", "regex"
+    source: str  # detector name: "secrets", "pii-presidio", "pii-gliner", "regex"
 
 
 class DetectionResult(NamedTuple):
@@ -91,6 +94,14 @@ class TextDetector(Protocol):
     """Protocol for pluggable text detection backends."""
 
     def detect(self, text: str) -> list[Detection]: ...
+
+
+class DetectionFilter(Protocol):
+    """Protocol for post-detection false positive filters."""
+
+    def filter(self, text: str, detections: list[Detection]) -> list[Detection]:
+        """Return detections that pass the filter (remove false positives)."""
+        ...
 
 
 class AllDetectorsFailedError(Exception):
@@ -111,10 +122,7 @@ def normalize_text(text: str) -> str:
 def _sanitize_error(error: Exception, input_text: str) -> str:
     """Sanitize error message — never log input text."""
     class_name = type(error).__name__
-    msg = str(error)[:80]
-    if input_text and len(input_text) >= 4:
-        msg = msg.replace(input_text, "[TEXT]")
-    return f"{class_name}: {msg}"
+    return f"{class_name} (message suppressed — may contain input text)"
 
 
 def _merge_detections(detections: list[Detection]) -> list[Detection]:
@@ -158,17 +166,24 @@ def _merge_detections(detections: list[Detection]) -> list[Detection]:
 
 
 class DetectionPipeline:
-    """Composes multiple TextDetector instances with merge/dedup."""
+    """Composes multiple TextDetector instances with resolve/filter/dedup."""
 
     last_errors: dict[str, str]
 
-    def __init__(self, detectors: list[TextDetector]) -> None:
+    def __init__(
+        self,
+        detectors: list[TextDetector],
+        filters: list[DetectionFilter] | None = None,
+        resolver: DetectionResolver | None = None,
+    ) -> None:
         if not detectors:
             raise ValueError(
                 "DetectionPipeline requires at least one detector. "
                 "Use create_default_pipeline() to build a configured pipeline."
             )
         self._detectors = list(detectors)
+        self._filters = list(filters) if filters else []
+        self._resolver = resolver
         self.last_errors = {}
 
     def detect(self, text: str) -> DetectionResult:
@@ -210,7 +225,23 @@ class DetectionPipeline:
                 f"Errors: {self.last_errors}"
             )
 
-        return DetectionResult(normalized, _merge_detections(all_detections))
+        # Resolve overlaps: use resolver if provided, else legacy merge
+        if self._resolver is not None:
+            resolved = self._resolver.resolve(all_detections)
+        else:
+            resolved = _merge_detections(all_detections)
+
+        # Run filters sequentially
+        filtered = resolved
+        for f in self._filters:
+            try:
+                filtered = f.filter(normalized, filtered)
+            except Exception as exc:
+                filter_name = type(f).__name__
+                sanitized = _sanitize_error(exc, normalized)
+                logger.warning("Filter %s failed, skipping: %s", filter_name, sanitized)
+
+        return DetectionResult(normalized, filtered)
 
 
 # ---------------------------------------------------------------------------
@@ -264,7 +295,7 @@ class Anonymizer:
 # Factory
 # ---------------------------------------------------------------------------
 
-_VALID_PII_ENGINES = frozenset({"presidio", "datafog", None})
+_VALID_PII_ENGINES = frozenset({"presidio", "presidio-gliner", None})
 
 
 def create_default_pipeline(
@@ -275,21 +306,22 @@ def create_default_pipeline(
     """Create a pipeline with all available detectors.
 
     Args:
-        pii_engine: PII backend to use. One of "presidio", "datafog", or
-            None (auto-detect: tries Presidio first, falls back to DataFog).
+        pii_engine: PII backend to use. One of "presidio" (spaCy NER),
+            "presidio-gliner" (GLiNER NER), or None (auto: GLiNER first,
+            falls back to spaCy).
         person_threshold: Drop PERSON detections with score <= this value.
         person_allowlist: Lowercased app names to suppress as PERSON hits.
 
     Call ONCE per scrub session — detector constructors load NLP models
-    (~200-500ms for Presidio/spaCy). Reuse the returned pipeline for all
-    text chunks.
+    (~200-500ms for spaCy, ~1-2s for GLiNER). Reuse the returned pipeline
+    for all text chunks.
 
     Raises ImportError with an actionable message if privacy deps are missing.
     """
     if pii_engine not in _VALID_PII_ENGINES:
         raise ValueError(
             f"Invalid pii_engine={pii_engine!r}. "
-            f"Must be one of: 'presidio', 'datafog', or None (auto-detect)."
+            f"Must be one of: 'presidio', 'presidio-gliner', or None (auto-detect)."
         )
 
     detectors: list[TextDetector] = []
@@ -309,45 +341,47 @@ def create_default_pipeline(
             "Install with: pip install 'screencap[privacy]'"
         )
 
-    # PII engine selection
+    # PII engine selection: GLiNER (default) or spaCy (legacy)
     pii_loaded = False
-    if pii_engine in (None, "presidio"):
-        try:
-            from screencap.privacy.pii import PiiDetector
+    ner_backend = "spacy" if pii_engine == "presidio" else "gliner"
 
-            detectors.append(PiiDetector(
-                person_threshold=person_threshold,
-                person_allowlist=person_allowlist,
-            ))
-            pii_loaded = True
-        except ImportError:
-            if pii_engine == "presidio":
-                raise ImportError(
-                    "Presidio not installed. "
-                    "Install with: pip install presidio-analyzer"
-                )
-            logger.info("Presidio not available, trying DataFog...")
+    try:
+        from screencap.privacy.pii import PiiDetector
 
-    if not pii_loaded and pii_engine in (None, "datafog"):
-        try:
-            from screencap.privacy.pii_datafog import DataFogPiiDetector
-
-            detectors.append(DataFogPiiDetector(
-                person_threshold=person_threshold,
-                person_allowlist=person_allowlist,
-            ))
-            pii_loaded = True
-        except ImportError:
-            if pii_engine == "datafog":
-                raise ImportError(
-                    "DataFog NLP not installed. "
-                    "Install with: pip install 'datafog[nlp]'"
-                )
+        detectors.append(PiiDetector(
+            person_threshold=person_threshold,
+            person_allowlist=person_allowlist,
+            ner_backend=ner_backend,
+        ))
+        pii_loaded = True
+    except ImportError as exc:
+        if pii_engine == "presidio-gliner":
+            raise ImportError(
+                "GLiNER not installed. "
+                "Install with: pip install 'presidio-analyzer[gliner]'"
+            ) from exc
+        if pii_engine == "presidio":
+            raise ImportError(
+                "Presidio not installed. "
+                "Install with: pip install presidio-analyzer"
+            ) from exc
+        # Auto-detect: GLiNER failed, try spaCy fallback
+        if ner_backend == "gliner":
+            logger.info("GLiNER not available, falling back to spaCy...")
+            try:
+                detectors.append(PiiDetector(
+                    person_threshold=person_threshold,
+                    person_allowlist=person_allowlist,
+                    ner_backend="spacy",
+                ))
+                pii_loaded = True
+            except ImportError:
+                pass
 
     if not pii_loaded:
         logger.warning(
             "No PII engine installed — PII detection disabled. "
-            "Install with: pip install presidio-analyzer  (or: pip install 'datafog[nlp]')"
+            "Install with: pip install 'presidio-analyzer[gliner]'"
         )
 
     if len(detectors) < 2:
@@ -356,4 +390,10 @@ def create_default_pipeline(
             "Install with: pip install 'screencap[privacy]'"
         )
 
-    return DetectionPipeline(detectors)
+    from screencap.privacy.filters import HeuristicFilter
+    from screencap.privacy.resolver import DetectionResolver as _Resolver
+
+    resolver = _Resolver()
+    filters: list[DetectionFilter] = [HeuristicFilter()]
+
+    return DetectionPipeline(detectors, filters=filters, resolver=resolver)

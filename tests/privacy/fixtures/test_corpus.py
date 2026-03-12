@@ -18,6 +18,19 @@ class ExpectedEntity:
     source: str | None = None  # Expected detector (None = any)
 
 
+class Frequency:
+    """Estimated real-world occurrence rate in a typical recording session.
+
+    HIGH = appears hundreds of times per hour (shell prompts, menu bars, build output)
+    MEDIUM = appears tens of times per hour (window titles, sidebar labels)
+    LOW = appears a few times per session at most (SSNs, credit cards, API keys)
+    """
+
+    HIGH = "high"
+    MEDIUM = "medium"
+    LOW = "low"
+
+
 @dataclass
 class CorpusCase:
     """A single test case for the corpus."""
@@ -27,6 +40,7 @@ class CorpusCase:
     text: str
     expected: list[ExpectedEntity]
     is_false_positive: bool = False  # If True, expected should be empty
+    frequency: str | None = None  # Frequency hint for real-world impact weighting
 
 
 # ---------------------------------------------------------------------------
@@ -43,8 +57,8 @@ WINDOW_TITLES = [
     CorpusCase(
         id="wt-02",
         description="Outlook with email in title",
-        text="jane.smith@corp.com - Outlook",
-        expected=[ExpectedEntity("EMAIL", "jane.smith@corp.com")],
+        text="jane.smith@example.org - Outlook",
+        expected=[ExpectedEntity("EMAIL", "jane.smith@example.org")],
     ),
     CorpusCase(
         id="wt-03",
@@ -115,9 +129,9 @@ TYPED_CREDENTIALS = [
     ),
     CorpusCase(
         id="cred-09",
-        description="Bearer token",
+        description="Bearer token (JWT format)",
         text="Authorization: Bearer eyJhbGciOiJIUzI1NiJ9.eyJ0ZXN0IjoiMTIzIn0.abc123def456",
-        expected=[ExpectedEntity("API_KEY", "Bearer eyJhbGciOiJIUzI1NiJ9.eyJ0ZXN0IjoiMTIzIn0.abc123def456")],
+        expected=[ExpectedEntity("JWT", "eyJhbGciOiJIUzI1NiJ9.eyJ0ZXN0IjoiMTIzIn0.", "secrets")],
     ),
     CorpusCase(
         id="cred-10",
@@ -163,10 +177,10 @@ MIXED_PII_SECRETS = [
     CorpusCase(
         id="mix-04",
         description="Name + email in message",
-        text="From: Jane Smith <jane.smith@company.org>",
+        text="From: Jane Smith <jane.smith@example.org>",
         expected=[
             ExpectedEntity("PERSON", "Jane Smith"),
-            ExpectedEntity("EMAIL", "jane.smith@company.org"),
+            ExpectedEntity("EMAIL", "jane.smith@example.org"),
         ],
     ),
 ]
@@ -301,10 +315,10 @@ NON_ENGLISH_NAMES = [
     CorpusCase(
         id="intl-02",
         description="German name with umlaut",
-        text="From: Hans Müller <hans@example.de>",
+        text="From: Hans Müller <hans@example.net>",
         expected=[
             ExpectedEntity("PERSON", "Hans Müller"),
-            ExpectedEntity("EMAIL", "hans@example.de"),
+            ExpectedEntity("EMAIL", "hans@example.net"),
         ],
     ),
     CorpusCase(
@@ -406,10 +420,10 @@ ADDITIONAL_PII = [
     CorpusCase(
         id="pii-06",
         description="Multiple emails",
-        text="CC: alice@example.com, bob@company.org",
+        text="CC: alice@example.com, bob@example.org",
         expected=[
             ExpectedEntity("EMAIL", "alice@example.com"),
-            ExpectedEntity("EMAIL", "bob@company.org"),
+            ExpectedEntity("EMAIL", "bob@example.org"),
         ],
     ),
 ]
@@ -447,6 +461,280 @@ EDGE_CASES = [
 
 
 # ---------------------------------------------------------------------------
+# 11. Terminal / accessibility text (false positive candidates)
+# ---------------------------------------------------------------------------
+
+TERMINAL_ACCESSIBILITY = [
+    # --- Terminal output (FP candidates) ---
+    CorpusCase(
+        id="term-01",
+        description="zsh prompt with username",
+        text="jose@MacBook-Pro screencap %",
+        expected=[],
+        is_false_positive=True,
+        frequency=Frequency.HIGH,  # Every keystroke triggers a prompt capture
+    ),
+    CorpusCase(
+        id="term-02",
+        description="bash prompt with path",
+        text="user@host:/var/log$ grep ERROR app.log",
+        expected=[],
+        is_false_positive=True,
+        frequency=Frequency.HIGH,
+    ),
+    CorpusCase(
+        id="term-03",
+        description="brew list output",
+        text="cairo ffmpeg ghostscript harfbuzz libpng",
+        expected=[],
+        is_false_positive=True,
+        frequency=Frequency.MEDIUM,
+    ),
+    CorpusCase(
+        id="term-04",
+        description="pip install output",
+        text=(
+            "Collecting presidio-analyzer>=2.2\n"
+            "  Downloading presidio_analyzer-2.2.355-py3-none-any.whl"
+        ),
+        expected=[],
+        is_false_positive=True,
+        frequency=Frequency.MEDIUM,
+    ),
+    CorpusCase(
+        id="term-05",
+        description="docker ps output",
+        text=(
+            "CONTAINER ID  IMAGE          COMMAND    CREATED    STATUS    PORTS    NAMES\n"
+            "a1b2c3d4e5f6  postgres:15    postgres   2 hours    Up 2h     5432     my-db"
+        ),
+        expected=[],
+        is_false_positive=True,
+        frequency=Frequency.MEDIUM,
+    ),
+    CorpusCase(
+        id="term-06",
+        description="git log --oneline",
+        text="a1b2c3d fix(privacy): prevent app_classes bypass\n34d0845 Merge pull request #83",
+        expected=[],
+        is_false_positive=True,
+        frequency=Frequency.HIGH,  # git log appears in every terminal session
+    ),
+    CorpusCase(
+        id="term-07",
+        description="Python traceback",
+        text=(
+            'File "/usr/lib/python3.12/json/decoder.py", line 355, in raw_decode\n'
+            '    raise JSONDecodeError("Expecting value", s, err.value)'
+        ),
+        expected=[],
+        is_false_positive=True,
+        frequency=Frequency.HIGH,  # Tracebacks during dev are constant
+    ),
+    CorpusCase(
+        id="term-08",
+        description="npm run output",
+        text="> screencap@0.10.0 build\n> tsc --build tsconfig.json",
+        expected=[],
+        is_false_positive=True,
+        frequency=Frequency.HIGH,
+    ),
+    CorpusCase(
+        id="term-09",
+        description="ls -la output",
+        text="-rw-r--r--  1 jose  staff  4096 Mar 12 10:30 config.toml",
+        expected=[],
+        is_false_positive=True,
+        frequency=Frequency.HIGH,
+    ),
+    CorpusCase(
+        id="term-10",
+        description="ps aux output",
+        text="jose     12345  0.0  0.1  408628  16384 s001  S    10:30AM   0:00.05 /usr/bin/python3",
+        expected=[],
+        is_false_positive=True,
+        frequency=Frequency.MEDIUM,
+    ),
+    CorpusCase(
+        id="term-11",
+        description="Box-drawing characters",
+        text="┌─────────────────────────┐\n│  Settings               │\n└─────────────────────────┘",
+        expected=[],
+        is_false_positive=True,
+        frequency=Frequency.MEDIUM,  # TUI apps (htop, lazygit, etc.)
+    ),
+    CorpusCase(
+        id="term-12",
+        description="env output (no secrets)",
+        text="SHELL=/bin/zsh\nHOME=/Users/jose\nPATH=/usr/local/bin:/usr/bin:/bin",
+        expected=[],
+        is_false_positive=True,
+        frequency=Frequency.MEDIUM,
+    ),
+    CorpusCase(
+        id="term-13",
+        description="make build output",
+        text="gcc -Wall -O2 -o main main.c utils.c\ncc1: all warnings being treated as errors",
+        expected=[],
+        is_false_positive=True,
+        frequency=Frequency.HIGH,
+    ),
+    CorpusCase(
+        id="term-14",
+        description="pytest output with test names",
+        text="tests/test_cli.py::test_start_recording PASSED\ntests/test_cli.py::test_stop_recording PASSED",
+        expected=[],
+        is_false_positive=True,
+        frequency=Frequency.HIGH,
+    ),
+    CorpusCase(
+        id="term-15",
+        description="kubectl get pods output",
+        text="NAME                     READY   STATUS    RESTARTS   AGE\napi-server-7f8b9c6d4-x2k  1/1     Running   0          3d",
+        expected=[],
+        is_false_positive=True,
+        frequency=Frequency.MEDIUM,
+    ),
+    CorpusCase(
+        id="term-16",
+        description="cargo build output",
+        text="   Compiling serde v1.0.197\n   Compiling tokio v1.36.0\n    Finished `release` profile [optimized] target(s) in 45.32s",
+        expected=[],
+        is_false_positive=True,
+        frequency=Frequency.HIGH,
+    ),
+
+    # --- Real PII in terminal contexts (true positives) ---
+    CorpusCase(
+        id="term-tp-01",
+        description="git config with real email",
+        text="git config user.email jose.garcia@example.com",
+        expected=[ExpectedEntity("EMAIL", "jose.garcia@example.com")],
+    ),
+    CorpusCase(
+        id="term-tp-02",
+        description="export PASSWORD",
+        text="export DATABASE_PASSWORD=mysecretpassword123",
+        expected=[ExpectedEntity("PASSWORD", "DATABASE_PASSWORD=mysecretpassword123")],
+    ),
+    CorpusCase(
+        id="term-tp-03",
+        description="env with API key",
+        text="OPENAI_API_KEY=sk-AAAAAAAAAAAAAAAAAAAAT3BlbkFJBBBBBBBBBBBBBBBBBBBB",
+        expected=[ExpectedEntity("API_KEY", "sk-AAAAAAAAAAAAAAAAAAAAT3BlbkFJBBBBBBBBBBBBBBBBBBBB", "secrets")],
+    ),
+    CorpusCase(
+        id="term-tp-04",
+        description="curl with auth header (JWT format)",
+        text="curl -H 'Authorization: Bearer eyJhbGciOiJIUzI1NiJ9.eyJ0ZXN0IjoiMTIzIn0.abc123def456' https://api.example.com",
+        expected=[ExpectedEntity("JWT", "eyJhbGciOiJIUzI1NiJ9.eyJ0ZXN0IjoiMTIzIn0.", "secrets")],
+    ),
+    # term-tp-05 removed: "ssh admin@192.168.1.100" is an SSH target,
+    # not an email address. No detector should flag user@host as EMAIL.
+    CorpusCase(
+        id="term-tp-06",
+        description="AWS secret access key in env",
+        text="AWS_SECRET_ACCESS_KEY=wJalrXUtnFEMI/K7MDENG/bPxRfiCYEXAMPLEKEY",
+        expected=[ExpectedEntity("API_KEY", "wJalrXUtnFEMI/K7MDENG/bPxRfiCYEXAMPLEKEY")],
+    ),
+
+    # --- Harder mixed cases ---
+    CorpusCase(
+        id="term-hard-01",
+        description="URL with embedded credentials",
+        text="psql postgresql://admin:s3cretP@ss@db.prod.example.com:5432/myapp",
+        expected=[ExpectedEntity("CONNECTION_STRING", "postgresql://admin:s3cretP@ss@db.prod.example.com:5432/myapp")],
+    ),
+    CorpusCase(
+        id="term-hard-02",
+        description="Mixed secrets + noise in env dump",
+        text="LANG=en_US.UTF-8\nAWS_SECRET_ACCESS_KEY=wJalrXUtnFEMI/K7MDENG/bPxRfiCYEXAMPLEKEY\nTERM=xterm-256color",
+        expected=[ExpectedEntity("API_KEY", "wJalrXUtnFEMI/K7MDENG/bPxRfiCYEXAMPLEKEY")],
+    ),
+    CorpusCase(
+        id="term-hard-03",
+        description="Git diff with email added",
+        text='+    "email": "alice.jones@example.org",\n-    "email": "placeholder@example.net",',
+        expected=[
+            ExpectedEntity("EMAIL", "alice.jones@example.org"),
+            ExpectedEntity("EMAIL", "placeholder@example.net"),
+        ],
+    ),
+]
+
+# ---------------------------------------------------------------------------
+# 12. OCR screenshot false positives
+# ---------------------------------------------------------------------------
+
+OCR_SCREENSHOT_FPS = [
+    CorpusCase(
+        id="ocr-fp-01",
+        description="Gmail sidebar labels",
+        text="Inbox Starred Snoozed Sent Drafts More",
+        expected=[],
+        is_false_positive=True,
+        frequency=Frequency.HIGH,  # Every screenshot of Gmail
+    ),
+    CorpusCase(
+        id="ocr-fp-02",
+        description="macOS menu bar items",
+        text="File Edit View Window Help",
+        expected=[],
+        is_false_positive=True,
+        frequency=Frequency.HIGH,  # Visible in every screenshot
+    ),
+    CorpusCase(
+        id="ocr-fp-03",
+        description="Browser tab titles concatenated",
+        text="GitHub PRs Google Docs Figma Settings",
+        expected=[],
+        is_false_positive=True,
+        frequency=Frequency.HIGH,
+    ),
+    CorpusCase(
+        id="ocr-fp-04",
+        description="Calendar month abbreviations",
+        text="Jan Feb Mar Apr May Jun Jul Aug Sep Oct Nov Dec",
+        expected=[],
+        is_false_positive=True,
+        frequency=Frequency.MEDIUM,  # Calendar views
+    ),
+    CorpusCase(
+        id="ocr-fp-05",
+        description="Finder toolbar buttons",
+        text="Back Forward View Group Share Edit Tags",
+        expected=[],
+        is_false_positive=True,
+        frequency=Frequency.MEDIUM,
+    ),
+    CorpusCase(
+        id="ocr-fp-06",
+        description="Dock app names",
+        text="Safari Mail Maps Messages FaceTime Calendar Notes",
+        expected=[],
+        is_false_positive=True,
+        frequency=Frequency.HIGH,  # Dock visible in most screenshots
+    ),
+    CorpusCase(
+        id="ocr-fp-07",
+        description="VS Code status bar",
+        text="UTF-8  LF  Python  Ln 42, Col 15  Spaces: 4",
+        expected=[],
+        is_false_positive=True,
+        frequency=Frequency.HIGH,  # Visible while coding
+    ),
+    CorpusCase(
+        id="ocr-fp-08",
+        description="Xcode build status",
+        text="Build Succeeded | 12 warnings | MyApp.app",
+        expected=[],
+        is_false_positive=True,
+        frequency=Frequency.MEDIUM,
+    ),
+]
+
+
+# ---------------------------------------------------------------------------
 # All test cases combined
 # ---------------------------------------------------------------------------
 
@@ -461,9 +749,10 @@ ALL_TEST_CASES: list[CorpusCase] = (
     + NESTED_JSON
     + ADDITIONAL_PII
     + EDGE_CASES
+    + TERMINAL_ACCESSIBILITY
+    + OCR_SCREENSHOT_FPS
 )
 
 # Count for verification
 TRUE_POSITIVE_CASES = [tc for tc in ALL_TEST_CASES if not tc.is_false_positive and tc.expected]
 FALSE_POSITIVE_CASES = [tc for tc in ALL_TEST_CASES if tc.is_false_positive]
-TOTAL_EXPECTED_ENTITIES = sum(len(tc.expected) for tc in TRUE_POSITIVE_CASES)

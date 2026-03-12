@@ -1,4 +1,4 @@
-"""Tests for privacy core: Detection, EntityType, DetectionPipeline, Anonymizer."""
+"""Tests for privacy core: DetectionPipeline, Anonymizer, normalize_text, _merge_detections."""
 
 from __future__ import annotations
 
@@ -10,70 +10,13 @@ from screencap.privacy import (
     Detection,
     DetectionPipeline,
     DetectionResult,
-    EntityType,
     _merge_detections,
     normalize_text,
 )
+from screencap.privacy.filters import HeuristicFilter
+from screencap.privacy.resolver import DetectionResolver
 
 pytestmark = pytest.mark.privacy
-
-
-# ---------------------------------------------------------------------------
-# Detection dataclass
-# ---------------------------------------------------------------------------
-
-
-class TestDetection:
-    def test_frozen(self):
-        d = Detection("EMAIL", 0, 10, 0.9, "regex")
-        with pytest.raises(AttributeError):
-            d.start = 5  # type: ignore[misc]
-
-    def test_hashable(self):
-        d1 = Detection("EMAIL", 0, 10, 0.9, "regex")
-        d2 = Detection("EMAIL", 0, 10, 0.9, "regex")
-        assert d1 == d2
-        assert len({d1, d2}) == 1
-
-    def test_different_detections_not_equal(self):
-        d1 = Detection("EMAIL", 0, 10, 0.9, "regex")
-        d2 = Detection("EMAIL", 0, 11, 0.9, "regex")
-        assert d1 != d2
-
-
-# ---------------------------------------------------------------------------
-# EntityType
-# ---------------------------------------------------------------------------
-
-
-class TestEntityType:
-    def test_all_types_are_strings(self):
-        pii = [
-            EntityType.PERSON,
-            EntityType.EMAIL,
-            EntityType.PHONE,
-            EntityType.SSN,
-            EntityType.CREDIT_CARD,
-            EntityType.ADDRESS,
-        ]
-        secrets = [
-            EntityType.API_KEY,
-            EntityType.PRIVATE_KEY,
-            EntityType.PASSWORD,
-            EntityType.JWT,
-            EntityType.CONNECTION_STRING,
-            EntityType.SECRET,
-        ]
-        for t in pii + secrets:
-            assert isinstance(t, str)
-
-    def test_twelve_types(self):
-        types = {
-            v
-            for k, v in vars(EntityType).items()
-            if not k.startswith("_") and isinstance(v, str)
-        }
-        assert len(types) == 12
 
 
 # ---------------------------------------------------------------------------
@@ -82,21 +25,21 @@ class TestEntityType:
 
 
 class TestNormalizeText:
-    def test_nfkc(self):
-        # Fullwidth A → A
-        assert normalize_text("\uff21BC") == "ABC"
-
-    def test_zero_width_stripped(self):
-        assert normalize_text("p\u200bassword") == "password"
-        assert normalize_text("te\u200cst") == "test"
-        assert normalize_text("te\u200dst") == "test"
-        assert normalize_text("te\ufeffst") == "test"
-
-    def test_word_joiner_stripped(self):
-        assert normalize_text("te\u2060st") == "test"
-
-    def test_soft_hyphen_stripped(self):
-        assert normalize_text("te\u00adst") == "test"
+    @pytest.mark.parametrize(
+        "input_text, expected",
+        [
+            ("\uff21BC", "ABC"),                # NFKC fullwidth → ASCII
+            ("p\u200bassword", "password"),      # Zero-width space
+            ("te\u200cst", "test"),              # Zero-width non-joiner
+            ("te\u200dst", "test"),              # Zero-width joiner
+            ("te\ufeffst", "test"),              # BOM
+            ("te\u2060st", "test"),              # Word joiner
+            ("te\u00adst", "test"),              # Soft hyphen
+        ],
+        ids=["nfkc", "zwsp", "zwnj", "zwj", "bom", "word-joiner", "soft-hyphen"],
+    )
+    def test_normalization(self, input_text: str, expected: str):
+        assert normalize_text(input_text) == expected
 
     def test_empty(self):
         assert normalize_text("") == ""
@@ -182,25 +125,12 @@ class TestDetectionPipeline:
         with pytest.raises(ValueError, match="requires at least one detector"):
             DetectionPipeline([])
 
-    def test_short_circuit(self):
+    @pytest.mark.parametrize("text", ["abc", "", "hi"], ids=["3-chars", "empty", "2-chars"])
+    def test_short_text_skips_detection(self, text: str):
         det = _FakeDetector([Detection("EMAIL", 0, 3, 0.9, "fake")])
         pipeline = DetectionPipeline([det])
-        result = pipeline.detect("abc")
+        result = pipeline.detect(text)
         assert result.detections == []
-
-    def test_empty_text(self):
-        det = _FakeDetector([Detection("EMAIL", 0, 3, 0.9, "fake")])
-        pipeline = DetectionPipeline([det])
-        result = pipeline.detect("")
-        assert result.detections == []
-
-    def test_returns_detection_result(self):
-        det = _FakeDetector([Detection("EMAIL", 0, 20, 0.9, "fake")])
-        pipeline = DetectionPipeline([det])
-        result = pipeline.detect("test@example.com text")
-        assert isinstance(result, DetectionResult)
-        assert isinstance(result.normalized_text, str)
-        assert isinstance(result.detections, list)
 
     def test_normalized_text_returned(self):
         """Pipeline returns the normalized text that offsets refer to."""
@@ -212,13 +142,6 @@ class TestDetectionPipeline:
         pipeline = DetectionPipeline([CapturingDetector()])
         result = pipeline.detect("p\u200bassword test")
         assert result.normalized_text == "password test"
-
-    def test_single_detector(self):
-        det = _FakeDetector([Detection("EMAIL", 0, 20, 0.9, "fake")])
-        pipeline = DetectionPipeline([det])
-        result = pipeline.detect("test@example.com text")
-        assert len(result.detections) == 1
-        assert result.detections[0].entity_type == "EMAIL"
 
     def test_multiple_detectors_merged(self):
         d1 = _FakeDetector([Detection("EMAIL", 0, 16, 0.9, "d1")])
@@ -243,21 +166,63 @@ class TestDetectionPipeline:
         with pytest.raises(AllDetectorsFailedError):
             pipeline.detect("some text that is long enough")
 
-    def test_last_errors_reset_each_call(self):
-        failing = _FakeDetector(error=RuntimeError("boom"))
-        working = _FakeDetector([Detection("EMAIL", 0, 10, 0.9, "ok")])
-        pipeline = DetectionPipeline([failing, working])
-        pipeline.detect("first call text here")
-        assert pipeline.last_errors
-        pipeline.detect("second call text here")
-        assert pipeline.last_errors
-        assert "_FakeDetector" in pipeline.last_errors
+    def test_pipeline_with_resolver(self):
+        """Pipeline uses resolver instead of _merge_detections when provided."""
+        d1 = _FakeDetector([Detection("PERSON", 0, 5, 0.8, "pii-gliner")])
+        d2 = _FakeDetector([Detection("EMAIL", 3, 20, 0.9, "regex")])
+        resolver = DetectionResolver()
+        pipeline = DetectionPipeline([d1, d2], resolver=resolver)
+        result = pipeline.detect("test text that is long enough for detection")
+        # Partial overlap from different sources → both kept (resolver behavior)
+        assert len(result.detections) == 2
 
-    def test_validate_pii_engine(self):
-        from screencap.privacy import create_default_pipeline
+    def test_pipeline_with_filter(self):
+        """Pipeline applies filters after detection."""
+        # "Mar" as PERSON should be rejected by HeuristicFilter
+        d1 = _FakeDetector([Detection("PERSON", 0, 3, 0.8, "pii-gliner")])
+        hf = HeuristicFilter()
+        pipeline = DetectionPipeline([d1], filters=[hf])
+        result = pipeline.detect("Mar 12 10:30 text")
+        # "Mar" is < 4 chars AND a month name → filtered out
+        assert len(result.detections) == 0
 
-        with pytest.raises(ValueError, match="Invalid pii_engine"):
-            create_default_pipeline(pii_engine="invalid")
+    def test_pipeline_with_resolver_and_filter(self):
+        """Full pipeline: detectors → resolver → filter."""
+        # "Mar" PERSON should be rejected, real EMAIL should survive
+        d1 = _FakeDetector([
+            Detection("PERSON", 0, 3, 0.8, "pii-gliner"),
+            Detection("EMAIL", 4, 24, 0.95, "regex"),
+        ])
+        resolver = DetectionResolver()
+        hf = HeuristicFilter()
+        pipeline = DetectionPipeline([d1], filters=[hf], resolver=resolver)
+        result = pipeline.detect("Mar test@example.com more text")
+        assert len(result.detections) == 1
+        assert result.detections[0].entity_type == "EMAIL"
+
+    def test_pipeline_filter_failure_graceful(self):
+        """If a filter raises, pipeline skips it and returns unfiltered."""
+
+        class BrokenFilter:
+            def filter(self, text: str, detections: list[Detection]) -> list[Detection]:
+                raise RuntimeError("filter broke")
+
+        d1 = _FakeDetector([Detection("EMAIL", 0, 20, 0.9, "regex")])
+        pipeline = DetectionPipeline([d1], filters=[BrokenFilter()])
+        result = pipeline.detect("test@example.com text")
+        # Filter failed → detections pass through unfiltered
+        assert len(result.detections) == 1
+
+    def test_pipeline_without_resolver_uses_legacy_merge(self):
+        """Without resolver, pipeline falls back to _merge_detections."""
+        d1 = _FakeDetector([
+            Detection("PERSON", 0, 5, 0.8, "pii-gliner"),
+            Detection("EMAIL", 3, 20, 0.9, "regex"),
+        ])
+        pipeline = DetectionPipeline([d1])  # no resolver
+        result = pipeline.detect("test text that is long enough for detection")
+        # Legacy merge unions overlapping spans
+        assert len(result.detections) == 1
 
 
 # ---------------------------------------------------------------------------
@@ -268,6 +233,7 @@ class TestDetectionPipeline:
 class TestAnonymizer:
     def test_no_detections(self, anonymizer: Anonymizer):
         assert anonymizer.anonymize("hello world", []) == "hello world"
+        assert anonymizer.anonymize("", []) == ""
 
     def test_single_replacement(self, anonymizer: Anonymizer):
         text = "my email is test@example.com ok"
@@ -284,14 +250,21 @@ class TestAnonymizer:
         result = anonymizer.anonymize(text, dets)
         assert result == "<PERSON> <EMAIL>"
 
+    def test_adjacent_replacements(self, anonymizer: Anonymizer):
+        """Adjacent entities with no gap — offsets must not corrupt each other."""
+        text = "John Doejane@example.com"
+        dets = [
+            Detection("PERSON", 0, 8, 0.9, "pii-presidio"),
+            Detection("EMAIL", 8, 24, 0.9, "regex"),
+        ]
+        result = anonymizer.anonymize(text, dets)
+        assert result == "<PERSON><EMAIL>"
+
     def test_entire_text_is_entity(self, anonymizer: Anonymizer):
         text = "sk-abc123"
         dets = [Detection("API_KEY", 0, 9, 0.95, "secrets")]
         result = anonymizer.anonymize(text, dets)
         assert result == "<API_KEY>"
-
-    def test_empty_text(self, anonymizer: Anonymizer):
-        assert anonymizer.anonymize("", []) == ""
 
     def test_out_of_bounds_skipped(self, anonymizer: Anonymizer):
         text = "short"

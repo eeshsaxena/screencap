@@ -2,7 +2,11 @@
 
 from __future__ import annotations
 
+import bisect
+import dataclasses
 import json
+import os
+import re
 import shutil
 import sqlite3
 from collections import Counter
@@ -235,8 +239,6 @@ def _find_blocked_interval(
     Pass _starts (pre-computed [iv.start for iv in intervals]) to avoid
     rebuilding the list on every call.
     """
-    import bisect
-
     if not intervals:
         return None
     if _starts is None:
@@ -495,6 +497,12 @@ def _scrub_text(
     except AllDetectorsFailedError:
         console.print("  [yellow]Warning: all detectors failed on a field[/]")
         return "<SCRUB_FAILED>", None
+    except Exception as exc:
+        console.print(
+            f"  [yellow]Warning: detection pipeline error ({type(exc).__name__}) "
+            f"— failing closed[/]"
+        )
+        return "<SCRUB_FAILED>", None
 
     scrubbed = anonymizer.anonymize(
         detection_result.normalized_text,
@@ -518,10 +526,15 @@ def _scrub_json_recursive(
     anonymizer,
     result: ScrubResult,
     _depth: int = 0,
+    collect_detections: list[dict] | None = None,
 ) -> dict | list:
     """Walk a JSON-parsed structure and scrub all string leaves.
 
     Mutates obj in-place. Depth-limited to 50.
+
+    When *collect_detections* is not None and a key named ``AXValue`` is
+    scrubbed, its detection results are appended for cross-referencing
+    against keystrokes.
     """
     if _depth > 50:
         return obj
@@ -529,9 +542,24 @@ def _scrub_json_recursive(
     items = obj.items() if isinstance(obj, dict) else enumerate(obj)
     for key, value in items:
         if isinstance(value, str) and value.strip():
-            obj[key], _ = _scrub_text(value, pipeline, anonymizer, result)
+            obj[key], det_result = _scrub_text(value, pipeline, anonymizer, result)
+            if (
+                collect_detections is not None
+                and key == "AXValue"
+                and det_result is not None
+                and det_result.detections
+            ):
+                for det in det_result.detections:
+                    original_text = det_result.normalized_text[det.start : det.end]
+                    collect_detections.append({
+                        "original_text": original_text,
+                        "entity_type": det.entity_type,
+                        "score": det.score,
+                    })
         elif isinstance(value, (dict, list)):
-            _scrub_json_recursive(value, pipeline, anonymizer, result, _depth + 1)
+            _scrub_json_recursive(
+                value, pipeline, anonymizer, result, _depth + 1, collect_detections
+            )
 
     return obj
 
@@ -548,12 +576,35 @@ def _scrub_json_column(
     pipeline,
     anonymizer,
     result: ScrubResult,
+    row_detection_collector: dict[int, dict] | None = None,
 ) -> None:
-    """Scrub a JSON blob column using separate read/write cursors."""
+    """Scrub a JSON blob column using separate read/write cursors.
+
+    When *row_detection_collector* is not None, AXValue detections from
+    each row are stored as ``{row_id: {"timestamp": float, "detections": [...]}}``
+    for downstream cross-referencing against keystrokes.
+    """
     read_cur = conn.cursor()
     write_cur = conn.cursor()
-    read_cur.execute(f"SELECT id, {col} FROM {table} WHERE {col} IS NOT NULL")
-    for row_id, json_str in read_cur:
+    # Include timestamp when collecting detections (needed for xref matching).
+    # Fall back to no-timestamp query if the column doesn't exist.
+    has_timestamp = False
+    if row_detection_collector is not None:
+        try:
+            read_cur.execute(
+                f"SELECT id, {col}, timestamp FROM {table} WHERE {col} IS NOT NULL"
+            )
+            has_timestamp = True
+        except sqlite3.OperationalError:
+            read_cur.execute(f"SELECT id, {col} FROM {table} WHERE {col} IS NOT NULL")
+    else:
+        read_cur.execute(f"SELECT id, {col} FROM {table} WHERE {col} IS NOT NULL")
+    for row in read_cur:
+        if has_timestamp:
+            row_id, json_str, timestamp = row
+        else:
+            row_id, json_str = row
+            timestamp = None
         if not json_str or not isinstance(json_str, str):
             continue
         try:
@@ -566,7 +617,16 @@ def _scrub_json_column(
             continue
 
         if isinstance(data, (dict, list)):
-            _scrub_json_recursive(data, pipeline, anonymizer, result)
+            per_row: list[dict] | None = [] if row_detection_collector is not None else None
+            _scrub_json_recursive(
+                data, pipeline, anonymizer, result,
+                collect_detections=per_row,
+            )
+            if row_detection_collector is not None and per_row:
+                row_detection_collector[row_id] = {
+                    "timestamp": timestamp,
+                    "detections": per_row,
+                }
             scrubbed_json = json.dumps(data)
             if scrubbed_json != json_str:
                 write_cur.execute(
@@ -620,10 +680,14 @@ def _try_scrub_json_column(
     pipeline,
     anonymizer,
     result: ScrubResult,
+    row_detection_collector: dict[int, dict] | None = None,
 ) -> None:
     """Scrub a JSON column, silently skipping if the column doesn't exist."""
     try:
-        _scrub_json_column(conn, table, col, pipeline, anonymizer, result)
+        _scrub_json_column(
+            conn, table, col, pipeline, anonymizer, result,
+            row_detection_collector=row_detection_collector,
+        )
     except sqlite3.OperationalError:
         pass
 
@@ -634,8 +698,14 @@ def _scrub_recording_schema(
     pipeline,
     anonymizer,
     result: ScrubResult,
-) -> None:
-    """Scrub a recording.db schema."""
+) -> dict[int, dict]:
+    """Scrub a recording.db schema.
+
+    Returns a dict mapping row_id → {timestamp, detections} for
+    element_state AXValue detections (used for keystroke cross-referencing).
+    """
+    element_state_detections: dict[int, dict] = {}
+
     if "recording" in tables:
         _try_scrub_text_column(conn, "recording", "task_description", pipeline, anonymizer, result)
 
@@ -649,12 +719,17 @@ def _scrub_recording_schema(
             "available_segment_descriptions",
         ):
             _try_scrub_text_column(conn, "action_event", col, pipeline, anonymizer, result)
-        _try_scrub_json_column(conn, "action_event", "element_state", pipeline, anonymizer, result)
+        _try_scrub_json_column(
+            conn, "action_event", "element_state", pipeline, anonymizer, result,
+            row_detection_collector=element_state_detections,
+        )
 
     if "window_event" in tables:
         _try_scrub_text_column(conn, "window_event", "title", pipeline, anonymizer, result)
         _try_scrub_json_column(conn, "window_event", "state", pipeline, anonymizer, result)
         _try_scrub_text_column(conn, "window_event", "browser_url", pipeline, anonymizer, result)
+
+    return element_state_detections
 
 
 def _scrub_capture_schema(
@@ -677,13 +752,17 @@ def _scrub_db(
     pipeline,
     anonymizer,
     result: ScrubResult,
-) -> None:
-    """Scrub all text surfaces in the recording database."""
+) -> dict[int, dict]:
+    """Scrub all text surfaces in the recording database.
+
+    Returns element_state AXValue detections for keystroke cross-referencing.
+    """
     db_path = find_db(dst)
     if db_path is None:
         console.print("  [yellow]Warning: no database found — skipping DB scrubbing[/]")
-        return
+        return {}
 
+    element_state_detections: dict[int, dict] = {}
     conn = sqlite3.connect(str(db_path))
     try:
         cur = conn.cursor()
@@ -701,7 +780,9 @@ def _scrub_db(
         if "capture" in tables:
             _scrub_capture_schema(conn, tables, pipeline, anonymizer, result)
         elif "recording" in tables:
-            _scrub_recording_schema(conn, tables, pipeline, anonymizer, result)
+            element_state_detections = _scrub_recording_schema(
+                conn, tables, pipeline, anonymizer, result
+            )
         else:
             console.print(
                 "  [yellow]Warning: unrecognized database schema — "
@@ -714,6 +795,63 @@ def _scrub_db(
         raise
     finally:
         conn.close()
+
+    return element_state_detections
+
+
+# ---------------------------------------------------------------------------
+# Element-state cross-reference lookup
+# ---------------------------------------------------------------------------
+
+
+@dataclass(frozen=True)
+class _ElementStateDetection:
+    """A PII detection from an element_state AXValue field.
+
+    Used to cross-reference against keystrokes whose timestamps
+    fall within the same action_event rows.
+    """
+
+    original_text: str
+    entity_type: str
+    timestamps: frozenset[float]
+
+
+def _build_xref_lookup(
+    raw_detections: dict[int, dict],
+) -> list[_ElementStateDetection]:
+    """Deduplicate element_state detections and build a cross-reference list.
+
+    Groups by ``(entity_type, original_text.lower())``, collects all
+    timestamps where each unique detection appeared, and filters out
+    very short detections (< 3 chars).
+    """
+    grouped: dict[tuple[str, str], dict] = {}
+    for row_data in raw_detections.values():
+        ts = row_data.get("timestamp")
+        if ts is None:
+            continue
+        for det in row_data.get("detections", []):
+            original = det["original_text"]
+            if len(original.strip()) < 3:
+                continue
+            key = (det["entity_type"], original.lower())
+            if key not in grouped:
+                grouped[key] = {
+                    "original_text": original,
+                    "entity_type": det["entity_type"],
+                    "timestamps": set(),
+                }
+            grouped[key]["timestamps"].add(ts)
+
+    return [
+        _ElementStateDetection(
+            original_text=v["original_text"],
+            entity_type=v["entity_type"],
+            timestamps=frozenset(v["timestamps"]),
+        )
+        for v in grouped.values()
+    ]
 
 
 # ---------------------------------------------------------------------------
@@ -951,12 +1089,145 @@ def _redact_keystroke_db_rows(dst: Path, redactions: list[dict]) -> None:
         conn.close()
 
 
+def _cross_reference_key_type(
+    event: dict,
+    xref_detections: list[_ElementStateDetection],
+    result: ScrubResult,
+    db_redactions: list[dict],
+) -> None:
+    """Cross-reference element_state detections against a key.type event.
+
+    Matches detections whose timestamps overlap with the event's children
+    time range, then uses word-boundary matching to find and null leaked
+    keystrokes that the primary detection pass missed.
+    """
+    children = event.get("children", [])
+    if not children or not xref_detections:
+        return
+
+    # Get time range from children
+    child_timestamps = [
+        c.get("timestamp")
+        for c in children
+        if c.get("timestamp") is not None
+    ]
+    if not child_timestamps:
+        return
+    min_ts = min(child_timestamps)
+    max_ts = max(child_timestamps)
+
+    # Find matching detections: any whose timestamps overlap this event's range
+    matching_dets = [
+        d for d in xref_detections
+        if any(min_ts <= ts <= max_ts for ts in d.timestamps)
+    ]
+    if not matching_dets:
+        return
+
+    # Build current text from non-null key_char children (skip already-nulled)
+    # Also build pos_to_child map: character position → child index
+    char_pos = 0
+    pos_to_child: dict[int, int] = {}
+    text_chars: list[str] = []
+    for i, child in enumerate(children):
+        if child.get("type") == "key.down" and child.get("key_char"):
+            pos_to_child[char_pos] = i
+            text_chars.append(child["key_char"])
+            char_pos += 1
+
+    current_text = "".join(text_chars)
+    if not current_text.strip():
+        return
+
+    # Track positions to redact (set of char positions in current_text)
+    redact_positions: set[int] = set()
+    matched_entity_types: list[tuple[int, int, str]] = []  # (start, end, entity_type)
+
+    for det in matching_dets:
+        # Split detection text into tokens for matching
+        tokens = det.original_text.split()
+
+        # First try matching the full string
+        pattern = r"(?<![a-zA-Z0-9])" + re.escape(det.original_text) + r"(?![a-zA-Z0-9])"
+        m = re.search(pattern, current_text, re.IGNORECASE)
+        if m:
+            for pos in range(m.start(), m.end()):
+                if pos in pos_to_child:
+                    redact_positions.add(pos)
+            matched_entity_types.append((m.start(), m.end(), det.entity_type))
+            continue
+
+        # If no full match, try individual tokens
+        for token in tokens:
+            if len(token.strip()) < 3:
+                continue
+            token_pattern = (
+                r"(?<![a-zA-Z0-9])" + re.escape(token) + r"(?![a-zA-Z0-9])"
+            )
+            for m in re.finditer(token_pattern, current_text, re.IGNORECASE):
+                for pos in range(m.start(), m.end()):
+                    if pos in pos_to_child:
+                        redact_positions.add(pos)
+                matched_entity_types.append((m.start(), m.end(), det.entity_type))
+
+    if not redact_positions:
+        return
+
+    # Expand to include paired key.up for each redacted key.down
+    redact_child_indices: set[int] = set()
+    for pos in redact_positions:
+        down_idx = pos_to_child[pos]
+        redact_child_indices.add(down_idx)
+        for j in range(down_idx + 1, len(children)):
+            if children[j].get("type") == "key.up":
+                redact_child_indices.add(j)
+                break
+
+    # Collect DB redaction info BEFORE nulling
+    for idx in redact_child_indices:
+        child = children[idx]
+        if child.get("key_char"):
+            db_redactions.append({
+                "timestamp": child.get("timestamp"),
+                "key_char": child["key_char"],
+                "type": child.get("type"),
+            })
+
+    # Null in JSONL
+    for idx in redact_child_indices:
+        child = children[idx]
+        child["key_char"] = None
+        child["canonical_key_char"] = None
+
+    # Update text field: replace matched spans with <ENTITY_TYPE> tags.
+    # Use current_text (rebuilt from non-null children) because offsets in
+    # matched_entity_types were computed against it, not event["text"]
+    # which may have been modified by the primary detection pass.
+    text = current_text
+    for start, end, entity_type in sorted(matched_entity_types, reverse=True):
+        text = text[:start] + f"<{entity_type}>" + text[end:]
+    event["text"] = text
+
+    # Audit entries
+    for det in matching_dets:
+        result.audit_entries.append(
+            AuditEntry(
+                timestamp=event.get("timestamp", 0.0),
+                surface="keystroke_xref",
+                action="TEXT_REDACT",
+                reason=ReasonCode.ELEMENT_STATE_XREF,
+                evidence_type=f"{det.entity_type}:len={len(det.original_text)}",
+            )
+        )
+
+
 def _scrub_events_jsonl(
     dst: Path,
     pipeline,
     anonymizer,
     result: ScrubResult,
     blocked_intervals: list[_BlockedInterval] | None = None,
+    xref_detections: list[_ElementStateDetection] | None = None,
 ) -> None:
     """Scrub combined keystroke sequences in events.jsonl and map back to DB.
 
@@ -969,8 +1240,6 @@ def _scrub_events_jsonl(
     6. Writes atomically (.tmp + rename).
     7. Deletes file on any processing error (fail-safe).
     """
-    import os
-
     # Handle both legacy (events.jsonl) and chunked (events_NNNN.jsonl) layouts
     event_files = sorted(dst.glob("events*.jsonl"))
     if not event_files:
@@ -979,6 +1248,7 @@ def _scrub_events_jsonl(
     for events_jsonl in event_files:
         _scrub_single_events_jsonl(
             events_jsonl, dst, pipeline, anonymizer, result, blocked_intervals,
+            xref_detections=xref_detections,
         )
 
 
@@ -989,10 +1259,9 @@ def _scrub_single_events_jsonl(
     anonymizer,
     result: ScrubResult,
     blocked_intervals: list[_BlockedInterval] | None = None,
+    xref_detections: list[_ElementStateDetection] | None = None,
 ) -> None:
     """Scrub a single events JSONL file."""
-    import os
-
     blocked_intervals = blocked_intervals or []
     blocked_starts = [iv.start for iv in blocked_intervals]
     had_errors = False
@@ -1041,6 +1310,19 @@ def _scrub_single_events_jsonl(
                 event, pipeline, anonymizer, result, db_redactions
             )
 
+            # Cross-reference element_state detections against keystrokes
+            if xref_detections:
+                if event.get("type") == "key.type":
+                    _cross_reference_key_type(
+                        event, xref_detections, result, db_redactions
+                    )
+                elif event.get("type") == "mouse.drag":
+                    for child in event.get("children", []):
+                        if child.get("type") == "key.type":
+                            _cross_reference_key_type(
+                                child, xref_detections, result, db_redactions
+                            )
+
             # Comprehensive scrub: run recursive walker on ALL events
             _scrub_json_recursive(event, pipeline, anonymizer, result)
 
@@ -1071,8 +1353,6 @@ def _write_audit_log(dst: Path, result: ScrubResult) -> None:
     """Write export-safe audit log to the scrubbed recording directory."""
     if not result.audit_entries:
         return
-    import dataclasses
-
     entries = [dataclasses.asdict(e) for e in result.audit_entries]
     (dst / "privacy_audit.json").write_text(
         json.dumps(entries, indent=2), encoding="utf-8"
@@ -1124,7 +1404,7 @@ def scrub_recording(
 
     Args:
         name: Recording name (directory name under recordings/).
-        pii_engine: "presidio", "datafog", or None (auto-detect).
+        pii_engine: "presidio", "presidio-gliner", or None (auto-detect).
 
     Returns:
         ScrubResult with entity counts and deleted files.
@@ -1267,15 +1547,19 @@ def scrub_recording(
         with console.status("Nulling blocked-app DB rows..."):
             _null_db_rows_for_intervals(dst, blocked_intervals, result)
 
-    # 12. Scrub DB
+    # 12. Scrub DB — collect element_state detections for cross-referencing
     with console.status("Scrubbing database..."):
-        _scrub_db(dst, pipeline, anonymizer, result)
+        raw_detections = _scrub_db(dst, pipeline, anonymizer, result)
+
+    # 12b. Build cross-reference lookup from element_state detections
+    xref_detections = _build_xref_lookup(raw_detections)
 
     # 13. Scrub combined keystroke sequences in events.jsonl
     with console.status("Scrubbing keystroke sequences..."):
         try:
             _scrub_events_jsonl(
-                dst, pipeline, anonymizer, result, blocked_intervals
+                dst, pipeline, anonymizer, result, blocked_intervals,
+                xref_detections=xref_detections,
             )
         except Exception as exc:
             console.print(

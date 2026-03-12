@@ -41,6 +41,9 @@ class ReasonCode:
     BLOCKED_APP_EXCLUDE = "blocked_app_exclude"
     BLOCKED_APP_MASK = "blocked_app_mask"
 
+    # Cross-reference reasons
+    ELEMENT_STATE_XREF = "element_state_cross_reference"
+
 
 
 @dataclass(frozen=True)

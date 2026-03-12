@@ -364,27 +364,30 @@ mask_title_patterns = ["(?i)\\bconfidential\\b"]  # mask windows matching these 
 Redact PII and secrets from a recording's database and transcript files. Creates a scrubbed copy at `<name>-scrubbed/`.
 
 ```bash
-# scrub with auto-detected engine (prefers Presidio, falls back to DataFog)
+# scrub with auto-detected engine (prefers GLiNER, falls back to spaCy)
 screencap scrub my-session
 
 # use a specific PII engine
+screencap scrub my-session --pii-engine presidio-gliner
 screencap scrub my-session --pii-engine presidio
-screencap scrub my-session --pii-engine datafog
 ```
 
 | Flag | Description |
 |------|-------------|
-| `--pii-engine {presidio,datafog}` | PII detection engine (default: auto-detect) |
+| `--pii-engine {presidio,presidio-gliner}` | PII detection engine (default: auto-detect, prefers GLiNER) |
 
-#### PII Engine Comparison
+#### PII Engine
 
-| Engine | Install Extra | NER Model | Detects Names? | Install Size |
-|--------|---------------|-----------|----------------|-------------|
-| Presidio | `screencap[privacy]` | spaCy `en_core_web_lg` | Yes | ~560 MB |
-| DataFog (spaCy) | `screencap[privacy-lite]` | spaCy `en_core_web_lg` | Yes | ~560 MB |
-| DataFog (GLiNER) | `datafog[nlp-advanced]` | `urchade/gliner_multi_pii-v1` | Yes | ~2 GB (torch) |
+Install with `pip install 'screencap[privacy]'`. This installs Presidio with GLiNER NER backend (`presidio-analyzer[gliner]`) plus `detect-secrets` for API key and secrets detection.
 
-Both `privacy` and `privacy-lite` install `detect-secrets` for API key and secrets detection. The PII engines differ in their NER model but use the same underlying spaCy `en_core_web_lg` model (~560 MB).
+| Component | What it detects |
+|-----------|----------------|
+| GLiNER NER (default) | Names, emails, phone numbers, SSNs, credit cards, addresses |
+| spaCy NER (fallback) | Same entities, lower accuracy on short text |
+| detect-secrets | API keys, private keys, JWTs, connection strings, passwords |
+| Regex patterns | Emails, URLs, credit cards, SSNs, phone numbers |
+
+The detection pipeline applies a priority-based resolver to handle overlapping detections from different engines, followed by heuristic filters to reject common false positives.
 
 ### `screencap stop`
 
