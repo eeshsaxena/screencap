@@ -18,6 +18,19 @@ class ExpectedEntity:
     source: str | None = None  # Expected detector (None = any)
 
 
+class Frequency:
+    """Estimated real-world occurrence rate in a typical recording session.
+
+    HIGH = appears hundreds of times per hour (shell prompts, menu bars, build output)
+    MEDIUM = appears tens of times per hour (window titles, sidebar labels)
+    LOW = appears a few times per session at most (SSNs, credit cards, API keys)
+    """
+
+    HIGH = "high"
+    MEDIUM = "medium"
+    LOW = "low"
+
+
 @dataclass
 class CorpusCase:
     """A single test case for the corpus."""
@@ -27,6 +40,7 @@ class CorpusCase:
     text: str
     expected: list[ExpectedEntity]
     is_false_positive: bool = False  # If True, expected should be empty
+    frequency: str | None = None  # Frequency hint for real-world impact weighting
 
 
 # ---------------------------------------------------------------------------
@@ -458,6 +472,7 @@ TERMINAL_ACCESSIBILITY = [
         text="jose@MacBook-Pro screencap %",
         expected=[],
         is_false_positive=True,
+        frequency=Frequency.HIGH,  # Every keystroke triggers a prompt capture
     ),
     CorpusCase(
         id="term-02",
@@ -465,6 +480,7 @@ TERMINAL_ACCESSIBILITY = [
         text="user@host:/var/log$ grep ERROR app.log",
         expected=[],
         is_false_positive=True,
+        frequency=Frequency.HIGH,
     ),
     CorpusCase(
         id="term-03",
@@ -472,6 +488,7 @@ TERMINAL_ACCESSIBILITY = [
         text="cairo ffmpeg ghostscript harfbuzz libpng",
         expected=[],
         is_false_positive=True,
+        frequency=Frequency.MEDIUM,
     ),
     CorpusCase(
         id="term-04",
@@ -482,6 +499,7 @@ TERMINAL_ACCESSIBILITY = [
         ),
         expected=[],
         is_false_positive=True,
+        frequency=Frequency.MEDIUM,
     ),
     CorpusCase(
         id="term-05",
@@ -492,6 +510,7 @@ TERMINAL_ACCESSIBILITY = [
         ),
         expected=[],
         is_false_positive=True,
+        frequency=Frequency.MEDIUM,
     ),
     CorpusCase(
         id="term-06",
@@ -499,6 +518,7 @@ TERMINAL_ACCESSIBILITY = [
         text="a1b2c3d fix(privacy): prevent app_classes bypass\n34d0845 Merge pull request #83",
         expected=[],
         is_false_positive=True,
+        frequency=Frequency.HIGH,  # git log appears in every terminal session
     ),
     CorpusCase(
         id="term-07",
@@ -509,6 +529,7 @@ TERMINAL_ACCESSIBILITY = [
         ),
         expected=[],
         is_false_positive=True,
+        frequency=Frequency.HIGH,  # Tracebacks during dev are constant
     ),
     CorpusCase(
         id="term-08",
@@ -516,6 +537,7 @@ TERMINAL_ACCESSIBILITY = [
         text="> screencap@0.10.0 build\n> tsc --build tsconfig.json",
         expected=[],
         is_false_positive=True,
+        frequency=Frequency.HIGH,
     ),
     CorpusCase(
         id="term-09",
@@ -523,6 +545,7 @@ TERMINAL_ACCESSIBILITY = [
         text="-rw-r--r--  1 jose  staff  4096 Mar 12 10:30 config.toml",
         expected=[],
         is_false_positive=True,
+        frequency=Frequency.HIGH,
     ),
     CorpusCase(
         id="term-10",
@@ -530,6 +553,7 @@ TERMINAL_ACCESSIBILITY = [
         text="jose     12345  0.0  0.1  408628  16384 s001  S    10:30AM   0:00.05 /usr/bin/python3",
         expected=[],
         is_false_positive=True,
+        frequency=Frequency.MEDIUM,
     ),
     CorpusCase(
         id="term-11",
@@ -537,6 +561,7 @@ TERMINAL_ACCESSIBILITY = [
         text="┌─────────────────────────┐\n│  Settings               │\n└─────────────────────────┘",
         expected=[],
         is_false_positive=True,
+        frequency=Frequency.MEDIUM,  # TUI apps (htop, lazygit, etc.)
     ),
     CorpusCase(
         id="term-12",
@@ -544,6 +569,7 @@ TERMINAL_ACCESSIBILITY = [
         text="SHELL=/bin/zsh\nHOME=/Users/jose\nPATH=/usr/local/bin:/usr/bin:/bin",
         expected=[],
         is_false_positive=True,
+        frequency=Frequency.MEDIUM,
     ),
     CorpusCase(
         id="term-13",
@@ -551,6 +577,7 @@ TERMINAL_ACCESSIBILITY = [
         text="gcc -Wall -O2 -o main main.c utils.c\ncc1: all warnings being treated as errors",
         expected=[],
         is_false_positive=True,
+        frequency=Frequency.HIGH,
     ),
     CorpusCase(
         id="term-14",
@@ -558,6 +585,7 @@ TERMINAL_ACCESSIBILITY = [
         text="tests/test_cli.py::test_start_recording PASSED\ntests/test_cli.py::test_stop_recording PASSED",
         expected=[],
         is_false_positive=True,
+        frequency=Frequency.HIGH,
     ),
     CorpusCase(
         id="term-15",
@@ -565,6 +593,7 @@ TERMINAL_ACCESSIBILITY = [
         text="NAME                     READY   STATUS    RESTARTS   AGE\napi-server-7f8b9c6d4-x2k  1/1     Running   0          3d",
         expected=[],
         is_false_positive=True,
+        frequency=Frequency.MEDIUM,
     ),
     CorpusCase(
         id="term-16",
@@ -572,6 +601,7 @@ TERMINAL_ACCESSIBILITY = [
         text="   Compiling serde v1.0.197\n   Compiling tokio v1.36.0\n    Finished `release` profile [optimized] target(s) in 45.32s",
         expected=[],
         is_false_positive=True,
+        frequency=Frequency.HIGH,
     ),
 
     # --- Real PII in terminal contexts (true positives) ---
@@ -647,6 +677,7 @@ OCR_SCREENSHOT_FPS = [
         text="Inbox Starred Snoozed Sent Drafts More",
         expected=[],
         is_false_positive=True,
+        frequency=Frequency.HIGH,  # Every screenshot of Gmail
     ),
     CorpusCase(
         id="ocr-fp-02",
@@ -654,6 +685,7 @@ OCR_SCREENSHOT_FPS = [
         text="File Edit View Window Help",
         expected=[],
         is_false_positive=True,
+        frequency=Frequency.HIGH,  # Visible in every screenshot
     ),
     CorpusCase(
         id="ocr-fp-03",
@@ -661,6 +693,7 @@ OCR_SCREENSHOT_FPS = [
         text="GitHub PRs Google Docs Figma Settings",
         expected=[],
         is_false_positive=True,
+        frequency=Frequency.HIGH,
     ),
     CorpusCase(
         id="ocr-fp-04",
@@ -668,6 +701,7 @@ OCR_SCREENSHOT_FPS = [
         text="Jan Feb Mar Apr May Jun Jul Aug Sep Oct Nov Dec",
         expected=[],
         is_false_positive=True,
+        frequency=Frequency.MEDIUM,  # Calendar views
     ),
     CorpusCase(
         id="ocr-fp-05",
@@ -675,6 +709,7 @@ OCR_SCREENSHOT_FPS = [
         text="Back Forward View Group Share Edit Tags",
         expected=[],
         is_false_positive=True,
+        frequency=Frequency.MEDIUM,
     ),
     CorpusCase(
         id="ocr-fp-06",
@@ -682,6 +717,7 @@ OCR_SCREENSHOT_FPS = [
         text="Safari Mail Maps Messages FaceTime Calendar Notes",
         expected=[],
         is_false_positive=True,
+        frequency=Frequency.HIGH,  # Dock visible in most screenshots
     ),
     CorpusCase(
         id="ocr-fp-07",
@@ -689,6 +725,7 @@ OCR_SCREENSHOT_FPS = [
         text="UTF-8  LF  Python  Ln 42, Col 15  Spaces: 4",
         expected=[],
         is_false_positive=True,
+        frequency=Frequency.HIGH,  # Visible while coding
     ),
     CorpusCase(
         id="ocr-fp-08",
@@ -696,6 +733,7 @@ OCR_SCREENSHOT_FPS = [
         text="Build Succeeded | 12 warnings | MyApp.app",
         expected=[],
         is_false_positive=True,
+        frequency=Frequency.MEDIUM,
     ),
 ]
 

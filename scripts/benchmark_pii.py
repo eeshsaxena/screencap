@@ -64,11 +64,31 @@ def _compare(file_a: Path, file_b: Path) -> None:
         delta = vb - va
         sign = "+" if delta > 0 else ""
         print(f"| {key} | {va} | {vb} | {sign}{delta} |")
-    for key in ["precision", "recall_partial", "recall_exact", "f1", "document_leak_rate"]:
-        va, vb = ta[key], tb[key]
+    for key in ["precision", "recall_partial", "recall_exact", "avg_coverage", "f1",
+                 "document_leak_rate", "redaction_survival_rate"]:
+        va, vb = ta.get(key, 0), tb.get(key, 0)
         delta = vb - va
         sign = "+" if delta > 0 else ""
         print(f"| {key} | {va:.1%} | {vb:.1%} | {sign}{delta:.1%} |")
+    for key in ["weighted_fp_impact"]:
+        va, vb = ta.get(key, 0), tb.get(key, 0)
+        delta = vb - va
+        sign = "+" if delta > 0 else ""
+        print(f"| {key} | {va:.0f} | {vb:.0f} | {sign}{delta:.0f} |")
+
+    # FP by source comparison
+    src_a = a.get("fp_by_source", {})
+    src_b = b.get("fp_by_source", {})
+    all_sources = sorted(set(src_a.keys()) | set(src_b.keys()))
+    if all_sources:
+        print("\n### FP by Detector Source\n")
+        print("| Source | A | B | Delta |")
+        print("|---|---|---|---|")
+        for src in all_sources:
+            va, vb = src_a.get(src, 0), src_b.get(src, 0)
+            delta = vb - va
+            sign = "+" if delta > 0 else ""
+            print(f"| {src} | {va} | {vb} | {sign}{delta} |")
 
     # Per-type comparison
     all_types = sorted(set(a.get("per_type", {}).keys()) | set(b.get("per_type", {}).keys()))
