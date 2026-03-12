@@ -122,7 +122,7 @@ class DetectionResolver:
         # Phase 3: Resolve cross-source overlaps.
         result: list[Detection] = []
         for det in same_source_merged:
-            merged_flag = False
+            consumed = False
             for i in range(len(result) - 1, -1, -1):
                 prev = result[i]
 
@@ -139,9 +139,9 @@ class DetectionResolver:
                     # Incompatible nesting — keep higher priority
                     prev_pri = self._get_priority(prev)
                     det_pri = self._get_priority(det)
-                    if det_pri > prev_pri:
+                    if det_pri > prev_pri:  # strict >: inner replaces only if strictly higher priority
                         result[i] = det
-                    merged_flag = True
+                    consumed = True
                     break
 
                 # Check if prev is nested inside det (det is wider)
@@ -151,16 +151,16 @@ class DetectionResolver:
                         break  # Keep both
                     prev_pri = self._get_priority(prev)
                     det_pri = self._get_priority(det)
-                    if det_pri >= prev_pri:
+                    if det_pri >= prev_pri:  # >=: wider span wins ties (prefer more context)
                         result[i] = det
-                    merged_flag = True
+                    consumed = True
                     break
 
                 # Partial overlap, different sources (same-source already resolved)
                 # Keep BOTH — no union across sources
                 break
 
-            if not merged_flag:
+            if not consumed:
                 result.append(det)
 
         return sorted(result, key=lambda d: (d.start, d.end))

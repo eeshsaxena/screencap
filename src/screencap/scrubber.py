@@ -2,7 +2,11 @@
 
 from __future__ import annotations
 
+import bisect
+import dataclasses
 import json
+import os
+import re
 import shutil
 import sqlite3
 from collections import Counter
@@ -235,8 +239,6 @@ def _find_blocked_interval(
     Pass _starts (pre-computed [iv.start for iv in intervals]) to avoid
     rebuilding the list on every call.
     """
-    import bisect
-
     if not intervals:
         return None
     if _starts is None:
@@ -494,6 +496,12 @@ def _scrub_text(
         detection_result = pipeline.detect(text)
     except AllDetectorsFailedError:
         console.print("  [yellow]Warning: all detectors failed on a field[/]")
+        return "<SCRUB_FAILED>", None
+    except Exception as exc:
+        console.print(
+            f"  [yellow]Warning: detection pipeline error ({type(exc).__name__}) "
+            f"— failing closed[/]"
+        )
         return "<SCRUB_FAILED>", None
 
     scrubbed = anonymizer.anonymize(
@@ -1093,8 +1101,6 @@ def _cross_reference_key_type(
     time range, then uses word-boundary matching to find and null leaked
     keystrokes that the primary detection pass missed.
     """
-    import re
-
     children = event.get("children", [])
     if not children or not xref_detections:
         return
@@ -1193,12 +1199,13 @@ def _cross_reference_key_type(
         child["key_char"] = None
         child["canonical_key_char"] = None
 
-    # Update text field: replace matched spans with <ENTITY_TYPE> tags
-    # Process matches in reverse order to preserve positions
-    text = event.get("text", current_text)
+    # Update text field: replace matched spans with <ENTITY_TYPE> tags.
+    # Use current_text (rebuilt from non-null children) because offsets in
+    # matched_entity_types were computed against it, not event["text"]
+    # which may have been modified by the primary detection pass.
+    text = current_text
     for start, end, entity_type in sorted(matched_entity_types, reverse=True):
-        if start < len(text) and end <= len(text):
-            text = text[:start] + f"<{entity_type}>" + text[end:]
+        text = text[:start] + f"<{entity_type}>" + text[end:]
     event["text"] = text
 
     # Audit entries
@@ -1209,7 +1216,7 @@ def _cross_reference_key_type(
                 surface="keystroke_xref",
                 action="TEXT_REDACT",
                 reason=ReasonCode.ELEMENT_STATE_XREF,
-                evidence_type=f"{det.entity_type}:{det.original_text[:20]}",
+                evidence_type=f"{det.entity_type}:len={len(det.original_text)}",
             )
         )
 
@@ -1233,8 +1240,6 @@ def _scrub_events_jsonl(
     6. Writes atomically (.tmp + rename).
     7. Deletes file on any processing error (fail-safe).
     """
-    import os
-
     # Handle both legacy (events.jsonl) and chunked (events_NNNN.jsonl) layouts
     event_files = sorted(dst.glob("events*.jsonl"))
     if not event_files:
@@ -1257,8 +1262,6 @@ def _scrub_single_events_jsonl(
     xref_detections: list[_ElementStateDetection] | None = None,
 ) -> None:
     """Scrub a single events JSONL file."""
-    import os
-
     blocked_intervals = blocked_intervals or []
     blocked_starts = [iv.start for iv in blocked_intervals]
     had_errors = False
@@ -1350,8 +1353,6 @@ def _write_audit_log(dst: Path, result: ScrubResult) -> None:
     """Write export-safe audit log to the scrubbed recording directory."""
     if not result.audit_entries:
         return
-    import dataclasses
-
     entries = [dataclasses.asdict(e) for e in result.audit_entries]
     (dst / "privacy_audit.json").write_text(
         json.dumps(entries, indent=2), encoding="utf-8"
