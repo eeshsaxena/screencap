@@ -14,9 +14,6 @@ from pathlib import Path
 import pytest
 
 from screencap.privacy import Anonymizer, Detection, DetectionPipeline
-from screencap.privacy.pii import PiiDetector
-from screencap.privacy.regex import RegexDetector
-from screencap.privacy.secrets import DetectSecretsDetector
 from tests.privacy.fixtures.test_corpus import (
     FALSE_POSITIVE_CASES,
     TRUE_POSITIVE_CASES,
@@ -358,11 +355,9 @@ def save_benchmark_json(agg: AggregateResult, path: Path) -> None:
 
 
 def _build_pipeline() -> DetectionPipeline:
-    return DetectionPipeline([
-        RegexDetector(),
-        DetectSecretsDetector(),
-        PiiDetector(),
-    ])
+    from screencap.privacy import create_default_pipeline
+
+    return create_default_pipeline()
 
 
 # ---------------------------------------------------------------------------

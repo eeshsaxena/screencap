@@ -8,12 +8,15 @@ from screencap.privacy import (
     AllDetectorsFailedError,
     Anonymizer,
     Detection,
+    DetectionFilter,
     DetectionPipeline,
     DetectionResult,
     EntityType,
     _merge_detections,
     normalize_text,
 )
+from screencap.privacy.filters import HeuristicFilter
+from screencap.privacy.resolver import DetectionResolver
 
 pytestmark = pytest.mark.privacy
 
@@ -258,6 +261,64 @@ class TestDetectionPipeline:
 
         with pytest.raises(ValueError, match="Invalid pii_engine"):
             create_default_pipeline(pii_engine="invalid")
+
+    def test_pipeline_with_resolver(self):
+        """Pipeline uses resolver instead of _merge_detections when provided."""
+        d1 = _FakeDetector([Detection("PERSON", 0, 5, 0.8, "pii-gliner")])
+        d2 = _FakeDetector([Detection("EMAIL", 3, 20, 0.9, "regex")])
+        resolver = DetectionResolver()
+        pipeline = DetectionPipeline([d1, d2], resolver=resolver)
+        result = pipeline.detect("test text that is long enough for detection")
+        # Partial overlap from different sources → both kept (resolver behavior)
+        assert len(result.detections) == 2
+
+    def test_pipeline_with_filter(self):
+        """Pipeline applies filters after detection."""
+        # "Mar" as PERSON should be rejected by HeuristicFilter
+        d1 = _FakeDetector([Detection("PERSON", 0, 3, 0.8, "pii-gliner")])
+        hf = HeuristicFilter()
+        pipeline = DetectionPipeline([d1], filters=[hf])
+        result = pipeline.detect("Mar 12 10:30 text")
+        # "Mar" is < 4 chars AND a month name → filtered out
+        assert len(result.detections) == 0
+
+    def test_pipeline_with_resolver_and_filter(self):
+        """Full pipeline: detectors → resolver → filter."""
+        # "Mar" PERSON should be rejected, real EMAIL should survive
+        d1 = _FakeDetector([
+            Detection("PERSON", 0, 3, 0.8, "pii-gliner"),
+            Detection("EMAIL", 4, 24, 0.95, "regex"),
+        ])
+        resolver = DetectionResolver()
+        hf = HeuristicFilter()
+        pipeline = DetectionPipeline([d1], filters=[hf], resolver=resolver)
+        result = pipeline.detect("Mar test@example.com more text")
+        assert len(result.detections) == 1
+        assert result.detections[0].entity_type == "EMAIL"
+
+    def test_pipeline_filter_failure_graceful(self):
+        """If a filter raises, pipeline skips it and returns unfiltered."""
+
+        class BrokenFilter:
+            def filter(self, text: str, detections: list[Detection]) -> list[Detection]:
+                raise RuntimeError("filter broke")
+
+        d1 = _FakeDetector([Detection("EMAIL", 0, 20, 0.9, "regex")])
+        pipeline = DetectionPipeline([d1], filters=[BrokenFilter()])
+        result = pipeline.detect("test@example.com text")
+        # Filter failed → detections pass through unfiltered
+        assert len(result.detections) == 1
+
+    def test_pipeline_without_resolver_uses_legacy_merge(self):
+        """Without resolver, pipeline falls back to _merge_detections."""
+        d1 = _FakeDetector([
+            Detection("PERSON", 0, 5, 0.8, "pii-gliner"),
+            Detection("EMAIL", 3, 20, 0.9, "regex"),
+        ])
+        pipeline = DetectionPipeline([d1])  # no resolver
+        result = pipeline.detect("test text that is long enough for detection")
+        # Legacy merge unions overlapping spans
+        assert len(result.detections) == 1
 
 
 # ---------------------------------------------------------------------------

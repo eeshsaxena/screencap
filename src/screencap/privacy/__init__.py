@@ -10,7 +10,10 @@ import logging
 import re
 import unicodedata
 from dataclasses import dataclass
-from typing import NamedTuple, Protocol
+from typing import TYPE_CHECKING, NamedTuple, Protocol
+
+if TYPE_CHECKING:
+    from screencap.privacy.resolver import DetectionResolver
 
 logger = logging.getLogger(__name__)
 
@@ -93,6 +96,14 @@ class TextDetector(Protocol):
     def detect(self, text: str) -> list[Detection]: ...
 
 
+class DetectionFilter(Protocol):
+    """Protocol for post-detection false positive filters."""
+
+    def filter(self, text: str, detections: list[Detection]) -> list[Detection]:
+        """Return detections that pass the filter (remove false positives)."""
+        ...
+
+
 class AllDetectorsFailedError(Exception):
     """Raised when every detector in the pipeline fails."""
 
@@ -158,17 +169,24 @@ def _merge_detections(detections: list[Detection]) -> list[Detection]:
 
 
 class DetectionPipeline:
-    """Composes multiple TextDetector instances with merge/dedup."""
+    """Composes multiple TextDetector instances with resolve/filter/dedup."""
 
     last_errors: dict[str, str]
 
-    def __init__(self, detectors: list[TextDetector]) -> None:
+    def __init__(
+        self,
+        detectors: list[TextDetector],
+        filters: list[DetectionFilter] | None = None,
+        resolver: DetectionResolver | None = None,
+    ) -> None:
         if not detectors:
             raise ValueError(
                 "DetectionPipeline requires at least one detector. "
                 "Use create_default_pipeline() to build a configured pipeline."
             )
         self._detectors = list(detectors)
+        self._filters = list(filters) if filters else []
+        self._resolver = resolver
         self.last_errors = {}
 
     def detect(self, text: str) -> DetectionResult:
@@ -210,7 +228,23 @@ class DetectionPipeline:
                 f"Errors: {self.last_errors}"
             )
 
-        return DetectionResult(normalized, _merge_detections(all_detections))
+        # Resolve overlaps: use resolver if provided, else legacy merge
+        if self._resolver is not None:
+            resolved = self._resolver.resolve(all_detections)
+        else:
+            resolved = _merge_detections(all_detections)
+
+        # Run filters sequentially
+        filtered = resolved
+        for f in self._filters:
+            try:
+                filtered = f.filter(normalized, filtered)
+            except Exception as exc:
+                filter_name = type(f).__name__
+                sanitized = _sanitize_error(exc, normalized)
+                logger.warning("Filter %s failed, skipping: %s", filter_name, sanitized)
+
+        return DetectionResult(normalized, filtered)
 
 
 # ---------------------------------------------------------------------------
@@ -359,4 +393,10 @@ def create_default_pipeline(
             "Install with: pip install 'screencap[privacy]'"
         )
 
-    return DetectionPipeline(detectors)
+    from screencap.privacy.filters import HeuristicFilter
+    from screencap.privacy.resolver import DetectionResolver as _Resolver
+
+    resolver = _Resolver()
+    filters: list[DetectionFilter] = [HeuristicFilter()]
+
+    return DetectionPipeline(detectors, filters=filters, resolver=resolver)
