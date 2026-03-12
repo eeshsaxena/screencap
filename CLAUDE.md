@@ -85,6 +85,17 @@ Two-layer privacy enforcement: capture-time filtering + post-recording scrubbing
 
 **Scrubbing pipeline:** `_scrub_events_jsonl()` scrubs `key.type` and `key.shortcut` text + children `key_char`, and `window.switch` titles.
 
+**Detection pipeline (`src/screencap/privacy/`):**
+- `__init__.py` — `DetectionPipeline` composes detectors → resolver → filters. `Detection` dataclass, `EntityType` constants, `TextDetector`/`DetectionFilter` protocols, `Anonymizer`, `create_default_pipeline()` factory.
+- `pii.py` — `PiiDetector` wraps Presidio with GLiNER NER backend (default) or spaCy fallback. Person threshold + allowlist filtering.
+- `regex.py` — `RegexDetector` for emails, URLs, credit cards, SSNs, phone numbers.
+- `secrets.py` — `DetectSecretsDetector` wraps `detect-secrets` for API keys, private keys, JWTs, connection strings.
+- `resolver.py` — `DetectionResolver` resolves overlapping spans: same-source overlaps union, cross-source overlaps kept separate, compatible nesting preserved (EMAIL/PASSWORD/API_KEY inside CONNECTION_STRING). Source priority: secrets=40, regex=30, pii-gliner=20, pii-presidio=10.
+- `filters.py` — `HeuristicFilter` rejects common FPs: short PERSON, month/UI-keyword as PERSON, box-drawing as ADDRESS, malformed SSN, separator-less PHONE.
+- `entity_mapping.py` — Centralized label mapping for Presidio + GLiNER NER backends.
+
+**Benchmarking:** `benchmarks/benchmark_pii.py` runs the detection pipeline against a 40-case corpus (`tests/privacy/fixtures/test_corpus.py`) and outputs precision/recall/F1 metrics. Use `--engine full` for the complete pipeline or `--compare` to diff two result files.
+
 ## Task Segmentation
 
 **Two segmentation modes** controlled by `segmentation_mode` config (`config.toml` or `--segmentation-mode` CLI flag, default `"llm"`):

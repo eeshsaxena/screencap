@@ -2,9 +2,9 @@
 """Standalone PII detection benchmark runner.
 
 Usage:
-    python scripts/benchmark_pii.py --engine presidio
-    python scripts/benchmark_pii.py --engine presidio-gliner
-    python scripts/benchmark_pii.py --compare benchmark_results/a.json benchmark_results/b.json
+    python benchmarks/benchmark_pii.py --engine presidio
+    python benchmarks/benchmark_pii.py --engine presidio-gliner
+    python benchmarks/benchmark_pii.py --compare benchmark_results/a.json benchmark_results/b.json
 """
 
 from __future__ import annotations
