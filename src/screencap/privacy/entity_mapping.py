@@ -9,7 +9,7 @@ from __future__ import annotations
 from screencap.privacy import EntityType
 
 # Presidio (spaCy NER backend) -> EntityType
-PRESIDIO_MAP: dict[str, str | None] = {
+PRESIDIO_MAP: dict[str, str] = {
     "PERSON": EntityType.PERSON,
     "EMAIL_ADDRESS": EntityType.EMAIL,
     "PHONE_NUMBER": EntityType.PHONE,
@@ -39,8 +39,3 @@ GLINER_ENTITY_MAPPING: dict[str, str] = {
     # "dob", "age", "gender", "ip address", "url", "passport number",
     # "driver license", "username", "password", "account number", etc.
 }
-
-
-def map_entity(source_label: str, mapping: dict[str, str | None]) -> str | None:
-    """Map a source label to EntityType. Returns None if unmapped/skipped."""
-    return mapping.get(source_label)

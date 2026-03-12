@@ -8,6 +8,7 @@ Supports two NER backends:
 from __future__ import annotations
 
 import logging
+from typing import Literal
 
 from screencap.privacy import Detection, EntityType
 from screencap.privacy.entity_mapping import GLINER_ENTITY_MAPPING, PRESIDIO_MAP
@@ -26,21 +27,24 @@ class PiiDetector:
         self,
         person_threshold: float = 0.5,
         person_allowlist: frozenset[str] = frozenset(),
-        ner_backend: str = "gliner",
+        ner_backend: Literal["gliner", "spacy"] = "gliner",
         gliner_model: str = "knowledgator/gliner-pii-base-v1.0",
-        gliner_threshold: float = 0.5,
     ) -> None:
         self._person_threshold = person_threshold
         self._person_allowlist = person_allowlist
 
         if ner_backend == "gliner":
             self._source = "pii-gliner"
-            self._init_gliner(gliner_model, gliner_threshold)
-        else:
+            self._init_gliner(gliner_model)
+        elif ner_backend == "spacy":
             self._source = "pii-presidio"
             self._init_spacy()
+        else:
+            raise ValueError(
+                f"Invalid ner_backend={ner_backend!r}. Must be 'gliner' or 'spacy'."
+            )
 
-    def _init_gliner(self, model: str, threshold: float) -> None:
+    def _init_gliner(self, model: str) -> None:
         from presidio_analyzer import AnalyzerEngine
         from presidio_analyzer.nlp_engine import NlpEngineProvider
         from presidio_analyzer.predefined_recognizers import GLiNERRecognizer

@@ -39,8 +39,8 @@ def _build_pipeline(engine: str) -> DetectionPipeline:
     if engine in ("presidio", "presidio-gliner"):
         from screencap.privacy.pii import PiiDetector
 
-        # Once GLiNER is integrated, this will pass ner_backend
-        detectors.append(PiiDetector())
+        ner_backend = "spacy" if engine == "presidio" else "gliner"
+        detectors.append(PiiDetector(ner_backend=ner_backend))
 
     return DetectionPipeline(detectors)
 
