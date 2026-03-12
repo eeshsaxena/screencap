@@ -447,6 +447,260 @@ EDGE_CASES = [
 
 
 # ---------------------------------------------------------------------------
+# 11. Terminal / accessibility text (false positive candidates)
+# ---------------------------------------------------------------------------
+
+TERMINAL_ACCESSIBILITY = [
+    # --- Terminal output (FP candidates) ---
+    CorpusCase(
+        id="term-01",
+        description="zsh prompt with username",
+        text="jose@MacBook-Pro screencap %",
+        expected=[],
+        is_false_positive=True,
+    ),
+    CorpusCase(
+        id="term-02",
+        description="bash prompt with path",
+        text="user@host:/var/log$ grep ERROR app.log",
+        expected=[],
+        is_false_positive=True,
+    ),
+    CorpusCase(
+        id="term-03",
+        description="brew list output",
+        text="cairo ffmpeg ghostscript harfbuzz libpng",
+        expected=[],
+        is_false_positive=True,
+    ),
+    CorpusCase(
+        id="term-04",
+        description="pip install output",
+        text=(
+            "Collecting presidio-analyzer>=2.2\n"
+            "  Downloading presidio_analyzer-2.2.355-py3-none-any.whl"
+        ),
+        expected=[],
+        is_false_positive=True,
+    ),
+    CorpusCase(
+        id="term-05",
+        description="docker ps output",
+        text=(
+            "CONTAINER ID  IMAGE          COMMAND    CREATED    STATUS    PORTS    NAMES\n"
+            "a1b2c3d4e5f6  postgres:15    postgres   2 hours    Up 2h     5432     my-db"
+        ),
+        expected=[],
+        is_false_positive=True,
+    ),
+    CorpusCase(
+        id="term-06",
+        description="git log --oneline",
+        text="a1b2c3d fix(privacy): prevent app_classes bypass\n34d0845 Merge pull request #83",
+        expected=[],
+        is_false_positive=True,
+    ),
+    CorpusCase(
+        id="term-07",
+        description="Python traceback",
+        text=(
+            'File "/usr/lib/python3.12/json/decoder.py", line 355, in raw_decode\n'
+            '    raise JSONDecodeError("Expecting value", s, err.value)'
+        ),
+        expected=[],
+        is_false_positive=True,
+    ),
+    CorpusCase(
+        id="term-08",
+        description="npm run output",
+        text="> screencap@0.10.0 build\n> tsc --build tsconfig.json",
+        expected=[],
+        is_false_positive=True,
+    ),
+    CorpusCase(
+        id="term-09",
+        description="ls -la output",
+        text="-rw-r--r--  1 jose  staff  4096 Mar 12 10:30 config.toml",
+        expected=[],
+        is_false_positive=True,
+    ),
+    CorpusCase(
+        id="term-10",
+        description="ps aux output",
+        text="jose     12345  0.0  0.1  408628  16384 s001  S    10:30AM   0:00.05 /usr/bin/python3",
+        expected=[],
+        is_false_positive=True,
+    ),
+    CorpusCase(
+        id="term-11",
+        description="Box-drawing characters",
+        text="┌─────────────────────────┐\n│  Settings               │\n└─────────────────────────┘",
+        expected=[],
+        is_false_positive=True,
+    ),
+    CorpusCase(
+        id="term-12",
+        description="env output (no secrets)",
+        text="SHELL=/bin/zsh\nHOME=/Users/jose\nPATH=/usr/local/bin:/usr/bin:/bin",
+        expected=[],
+        is_false_positive=True,
+    ),
+    CorpusCase(
+        id="term-13",
+        description="make build output",
+        text="gcc -Wall -O2 -o main main.c utils.c\ncc1: all warnings being treated as errors",
+        expected=[],
+        is_false_positive=True,
+    ),
+    CorpusCase(
+        id="term-14",
+        description="pytest output with test names",
+        text="tests/test_cli.py::test_start_recording PASSED\ntests/test_cli.py::test_stop_recording PASSED",
+        expected=[],
+        is_false_positive=True,
+    ),
+    CorpusCase(
+        id="term-15",
+        description="kubectl get pods output",
+        text="NAME                     READY   STATUS    RESTARTS   AGE\napi-server-7f8b9c6d4-x2k  1/1     Running   0          3d",
+        expected=[],
+        is_false_positive=True,
+    ),
+    CorpusCase(
+        id="term-16",
+        description="cargo build output",
+        text="   Compiling serde v1.0.197\n   Compiling tokio v1.36.0\n    Finished `release` profile [optimized] target(s) in 45.32s",
+        expected=[],
+        is_false_positive=True,
+    ),
+
+    # --- Real PII in terminal contexts (true positives) ---
+    CorpusCase(
+        id="term-tp-01",
+        description="git config with real email",
+        text="git config user.email jose.garcia@company.com",
+        expected=[ExpectedEntity("EMAIL", "jose.garcia@company.com")],
+    ),
+    CorpusCase(
+        id="term-tp-02",
+        description="export PASSWORD",
+        text="export DATABASE_PASSWORD=mysecretpassword123",
+        expected=[ExpectedEntity("PASSWORD", "DATABASE_PASSWORD=mysecretpassword123")],
+    ),
+    CorpusCase(
+        id="term-tp-03",
+        description="env with API key",
+        text="OPENAI_API_KEY=sk-AAAAAAAAAAAAAAAAAAAAT3BlbkFJBBBBBBBBBBBBBBBBBBBB",
+        expected=[ExpectedEntity("API_KEY", "sk-AAAAAAAAAAAAAAAAAAAAT3BlbkFJBBBBBBBBBBBBBBBBBBBB", "secrets")],
+    ),
+    CorpusCase(
+        id="term-tp-04",
+        description="curl with auth header",
+        text="curl -H 'Authorization: Bearer eyJhbGciOiJIUzI1NiJ9.eyJ0ZXN0IjoiMTIzIn0.abc123def456' https://api.example.com",
+        expected=[ExpectedEntity("API_KEY", "Bearer eyJhbGciOiJIUzI1NiJ9.eyJ0ZXN0IjoiMTIzIn0.abc123def456")],
+    ),
+    CorpusCase(
+        id="term-tp-05",
+        description="ssh command with username",
+        text="ssh admin@192.168.1.100 -i ~/.ssh/id_rsa",
+        expected=[ExpectedEntity("EMAIL", "admin@192.168.1.100")],
+    ),
+    CorpusCase(
+        id="term-tp-06",
+        description="AWS secret access key in env",
+        text="AWS_SECRET_ACCESS_KEY=wJalrXUtnFEMI/K7MDENG/bPxRfiCYEXAMPLEKEY",
+        expected=[ExpectedEntity("API_KEY", "wJalrXUtnFEMI/K7MDENG/bPxRfiCYEXAMPLEKEY")],
+    ),
+
+    # --- Harder mixed cases ---
+    CorpusCase(
+        id="term-hard-01",
+        description="URL with embedded credentials",
+        text="psql postgresql://admin:s3cretP@ss@db.prod.example.com:5432/myapp",
+        expected=[ExpectedEntity("CONNECTION_STRING", "postgresql://admin:s3cretP@ss@db.prod.example.com:5432/myapp")],
+    ),
+    CorpusCase(
+        id="term-hard-02",
+        description="Mixed secrets + noise in env dump",
+        text="LANG=en_US.UTF-8\nAWS_SECRET_ACCESS_KEY=wJalrXUtnFEMI/K7MDENG/bPxRfiCYEXAMPLEKEY\nTERM=xterm-256color",
+        expected=[ExpectedEntity("API_KEY", "wJalrXUtnFEMI/K7MDENG/bPxRfiCYEXAMPLEKEY")],
+    ),
+    CorpusCase(
+        id="term-hard-03",
+        description="Git diff with email added",
+        text='+    "email": "alice.jones@startup.io",\n-    "email": "placeholder@test.com",',
+        expected=[
+            ExpectedEntity("EMAIL", "alice.jones@startup.io"),
+            ExpectedEntity("EMAIL", "placeholder@test.com"),
+        ],
+    ),
+]
+
+# ---------------------------------------------------------------------------
+# 12. OCR screenshot false positives
+# ---------------------------------------------------------------------------
+
+OCR_SCREENSHOT_FPS = [
+    CorpusCase(
+        id="ocr-fp-01",
+        description="Gmail sidebar labels",
+        text="Inbox Starred Snoozed Sent Drafts More",
+        expected=[],
+        is_false_positive=True,
+    ),
+    CorpusCase(
+        id="ocr-fp-02",
+        description="macOS menu bar items",
+        text="File Edit View Window Help",
+        expected=[],
+        is_false_positive=True,
+    ),
+    CorpusCase(
+        id="ocr-fp-03",
+        description="Browser tab titles concatenated",
+        text="GitHub PRs Google Docs Figma Settings",
+        expected=[],
+        is_false_positive=True,
+    ),
+    CorpusCase(
+        id="ocr-fp-04",
+        description="Calendar month abbreviations",
+        text="Jan Feb Mar Apr May Jun Jul Aug Sep Oct Nov Dec",
+        expected=[],
+        is_false_positive=True,
+    ),
+    CorpusCase(
+        id="ocr-fp-05",
+        description="Finder toolbar buttons",
+        text="Back Forward View Group Share Edit Tags",
+        expected=[],
+        is_false_positive=True,
+    ),
+    CorpusCase(
+        id="ocr-fp-06",
+        description="Dock app names",
+        text="Safari Mail Maps Messages FaceTime Calendar Notes",
+        expected=[],
+        is_false_positive=True,
+    ),
+    CorpusCase(
+        id="ocr-fp-07",
+        description="VS Code status bar",
+        text="UTF-8  LF  Python  Ln 42, Col 15  Spaces: 4",
+        expected=[],
+        is_false_positive=True,
+    ),
+    CorpusCase(
+        id="ocr-fp-08",
+        description="Xcode build status",
+        text="Build Succeeded | 12 warnings | MyApp.app",
+        expected=[],
+        is_false_positive=True,
+    ),
+]
+
+
+# ---------------------------------------------------------------------------
 # All test cases combined
 # ---------------------------------------------------------------------------
 
@@ -461,6 +715,8 @@ ALL_TEST_CASES: list[CorpusCase] = (
     + NESTED_JSON
     + ADDITIONAL_PII
     + EDGE_CASES
+    + TERMINAL_ACCESSIBILITY
+    + OCR_SCREENSHOT_FPS
 )
 
 # Count for verification

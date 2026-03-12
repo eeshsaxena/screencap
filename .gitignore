@@ -18,6 +18,7 @@ venv/
 .pytest_cache/
 .coverage
 htmlcov/
+benchmark_results/
 
 # IDE
 .idea/
