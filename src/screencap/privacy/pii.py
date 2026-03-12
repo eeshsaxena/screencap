@@ -93,7 +93,7 @@ class PiiDetector:
                     continue
                 span = text[result.start : result.end].lower()
                 if span in self._person_allowlist:
-                    logger.debug("Allowlist suppressed PERSON: %r", span)
+                    logger.debug("Allowlist suppressed PERSON detection (len=%d)", len(span))
                     continue
 
             detections.append(

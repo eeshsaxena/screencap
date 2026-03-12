@@ -78,10 +78,51 @@ class DetectionResolver:
             else:
                 deduped.append(det)
 
-        # Phase 2: Resolve overlaps
-        result: list[Detection] = []
+        # Phase 2: Union overlapping spans from the SAME source.
+        # This must happen before cross-source resolution so that a
+        # different-source "keep both" break can't shadow a same-source
+        # overlap with an earlier entry.
+        by_source: dict[str, list[Detection]] = {}
         for det in deduped:
-            merged = False
+            by_source.setdefault(det.source, []).append(det)
+
+        same_source_merged: list[Detection] = []
+        for source_dets in by_source.values():
+            merged: list[Detection] = [source_dets[0]]
+            for det in source_dets[1:]:
+                prev = merged[-1]
+                if det.start < prev.end:
+                    # Check for compatible nesting before unioning
+                    is_nested = det.start >= prev.start and det.end <= prev.end
+                    is_prev_nested = prev.start >= det.start and prev.end <= det.end
+                    if is_nested and self._is_compatible_nesting(det, prev):
+                        merged.append(det)
+                        continue
+                    if is_prev_nested and self._is_compatible_nesting(prev, det):
+                        merged.append(det)
+                        continue
+                    # Overlapping within same source — union
+                    new_start = min(prev.start, det.start)
+                    new_end = max(prev.end, det.end)
+                    winner = det if det.score > prev.score else prev
+                    merged[-1] = Detection(
+                        entity_type=winner.entity_type,
+                        start=new_start,
+                        end=new_end,
+                        score=max(prev.score, det.score),
+                        source=winner.source,
+                    )
+                else:
+                    merged.append(det)
+            same_source_merged.extend(merged)
+
+        # Re-sort after same-source merging
+        same_source_merged.sort(key=lambda d: (d.start, -d.end))
+
+        # Phase 3: Resolve cross-source overlaps.
+        result: list[Detection] = []
+        for det in same_source_merged:
+            merged_flag = False
             for i in range(len(result) - 1, -1, -1):
                 prev = result[i]
 
@@ -93,52 +134,33 @@ class DetectionResolver:
                 is_nested = det.start >= prev.start and det.end <= prev.end
 
                 if is_nested:
-                    # Check compatible nesting (inner=det, outer=prev)
                     if self._is_compatible_nesting(det, prev):
-                        # Keep both
-                        break
+                        break  # Keep both
                     # Incompatible nesting — keep higher priority
                     prev_pri = self._get_priority(prev)
                     det_pri = self._get_priority(det)
                     if det_pri > prev_pri:
                         result[i] = det
-                    merged = True
+                    merged_flag = True
                     break
 
                 # Check if prev is nested inside det (det is wider)
                 is_prev_nested = prev.start >= det.start and prev.end <= det.end
                 if is_prev_nested:
                     if self._is_compatible_nesting(prev, det):
-                        # Keep both
-                        break
-                    # Incompatible — keep higher priority
+                        break  # Keep both
                     prev_pri = self._get_priority(prev)
                     det_pri = self._get_priority(det)
                     if det_pri >= prev_pri:
                         result[i] = det
-                    merged = True
+                    merged_flag = True
                     break
 
-                # Partial overlap
-                if det.source == prev.source:
-                    # Same source — union into wider span
-                    new_start = min(prev.start, det.start)
-                    new_end = max(prev.end, det.end)
-                    winner = det if det.score > prev.score else prev
-                    result[i] = Detection(
-                        entity_type=winner.entity_type,
-                        start=new_start,
-                        end=new_end,
-                        score=max(prev.score, det.score),
-                        source=winner.source,
-                    )
-                    merged = True
-                    break
-                else:
-                    # Different sources — keep BOTH (no union!)
-                    break
+                # Partial overlap, different sources (same-source already resolved)
+                # Keep BOTH — no union across sources
+                break
 
-            if not merged:
+            if not merged_flag:
                 result.append(det)
 
         return sorted(result, key=lambda d: (d.start, d.end))

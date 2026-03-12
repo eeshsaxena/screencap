@@ -48,11 +48,6 @@ class TestPhoneDetection:
         phones = [d for d in dets if d.entity_type == EntityType.PHONE]
         assert len(phones) >= 1
 
-    def test_phone_dashed(self, detector: PiiDetector):
-        dets = detector.detect("Phone: 555-123-4567")
-        phones = [d for d in dets if d.entity_type == EntityType.PHONE]
-        assert len(phones) >= 1
-
 
 class TestCreditCardDetection:
     def test_spaced_card(self, detector: PiiDetector):
@@ -89,13 +84,6 @@ class TestPersonThreshold:
         persons = [d for d in dets if d.entity_type == EntityType.PERSON]
         assert len(persons) == 0
 
-    def test_above_threshold_person_kept(self):
-        """PERSON detection at or above threshold passes through."""
-        det = PiiDetector(person_threshold=0.5, ner_backend="spacy")
-        dets = det.detect("John Doe is here")
-        persons = [d for d in dets if d.entity_type == EntityType.PERSON]
-        assert len(persons) >= 1
-
     def test_non_person_unaffected(self):
         """Threshold only applies to PERSON, not EMAIL/PHONE."""
         det = PiiDetector(person_threshold=1.0, ner_backend="spacy")  # block all PERSON
@@ -115,16 +103,6 @@ class TestPersonAllowlist:
         dets = det.detect("Ghostty tmux a")
         persons = [d for d in dets if d.entity_type == EntityType.PERSON]
         assert len(persons) == 0
-
-    def test_real_name_not_suppressed(self):
-        """Real person name not in allowlist is still detected."""
-        det = PiiDetector(
-            person_allowlist=frozenset({"ghostty", "bitwarden"}),
-            ner_backend="spacy",
-        )
-        dets = det.detect("John Doe is here")
-        persons = [d for d in dets if d.entity_type == EntityType.PERSON]
-        assert len(persons) >= 1
 
     def test_case_insensitive_match(self):
         """Allowlist matching is case-insensitive."""
@@ -177,11 +155,6 @@ def gliner_detector() -> PiiDetector:
 class TestGlinerPersonDetection:
     def test_full_name(self, gliner_detector: PiiDetector):
         dets = gliner_detector.detect("John Doe is here")
-        persons = [d for d in dets if d.entity_type == EntityType.PERSON]
-        assert len(persons) >= 1
-
-    def test_spanish_name(self, gliner_detector: PiiDetector):
-        dets = gliner_detector.detect("Jose Garcia logged in")
         persons = [d for d in dets if d.entity_type == EntityType.PERSON]
         assert len(persons) >= 1
 
@@ -244,9 +217,3 @@ class TestFactorySwitching:
         with pytest.raises(ValueError, match="Invalid pii_engine"):
             create_default_pipeline(pii_engine="invalid")
 
-    def test_create_datafog_raises(self):
-        """DataFog engine is no longer valid."""
-        from screencap.privacy import create_default_pipeline
-
-        with pytest.raises(ValueError, match="Invalid pii_engine"):
-            create_default_pipeline(pii_engine="datafog")

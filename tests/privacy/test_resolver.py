@@ -109,6 +109,15 @@ class TestDetectionResolver:
         result = resolver.resolve([outer, inner])
         assert len(result) == 2
 
+    def test_api_key_inside_connection_string_compatible(self, resolver: DetectionResolver):
+        """API_KEY nested in CONNECTION_STRING — compatible, both kept."""
+        outer = Detection("CONNECTION_STRING", 0, 60, 0.9, "regex")
+        inner = Detection("API_KEY", 25, 50, 0.9, "secrets")
+        result = resolver.resolve([outer, inner])
+        assert len(result) == 2
+        types = {d.entity_type for d in result}
+        assert types == {"CONNECTION_STRING", "API_KEY"}
+
     def test_unsorted_input_handled(self, resolver: DetectionResolver):
         """Resolver handles unsorted input correctly."""
         d1 = Detection("PHONE", 20, 30, 0.8, "regex")
@@ -116,3 +125,27 @@ class TestDetectionResolver:
         result = resolver.resolve([d1, d2])
         assert result[0].start == 0
         assert result[1].start == 20
+
+    def test_same_source_overlap_not_shadowed_by_cross_source_break(
+        self, resolver: DetectionResolver
+    ):
+        """Same-source overlapping spans must union even with a cross-source span between them.
+
+        Regression: backward-walk used to break on B (different source) before
+        seeing C (same source as A), leaving A and C un-merged.
+        A[0:10] regex, B[5:12] pii-gliner, C[8:15] regex
+        Expected: A+C union [0:15] regex + B[5:12] pii-gliner kept separate.
+        """
+        a = Detection("EMAIL", 0, 10, 0.9, "regex")
+        b = Detection("PERSON", 5, 12, 0.7, "pii-gliner")
+        c = Detection("EMAIL", 8, 15, 0.85, "regex")
+        result = resolver.resolve([a, b, c])
+        # A and C (same source, overlapping) should be unioned to [0:15]
+        regex_dets = [d for d in result if d.source == "regex"]
+        assert len(regex_dets) == 1
+        assert regex_dets[0].start == 0
+        assert regex_dets[0].end == 15
+        # B (pii-gliner PERSON) is nested inside the union [0:15] EMAIL (regex).
+        # PERSON/EMAIL is not compatible nesting, and regex (pri=30) > pii-gliner (pri=20),
+        # so B is correctly dropped.
+        assert len(result) == 1

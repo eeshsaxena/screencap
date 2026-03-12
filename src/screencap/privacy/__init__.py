@@ -122,10 +122,7 @@ def normalize_text(text: str) -> str:
 def _sanitize_error(error: Exception, input_text: str) -> str:
     """Sanitize error message — never log input text."""
     class_name = type(error).__name__
-    msg = str(error)
-    if input_text and len(input_text) >= 4:
-        msg = msg.replace(input_text, "[TEXT]")
-    return f"{class_name}: {msg[:80]}"
+    return f"{class_name} (message suppressed — may contain input text)"
 
 
 def _merge_detections(detections: list[Detection]) -> list[Detection]:
