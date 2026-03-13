@@ -1209,6 +1209,115 @@ def test_scrub_events_jsonl_handles_chunked_files(tmp_path, pipeline_and_anonymi
     assert "ssfsfodsufdouhhfwnenwekskjdhjsfhd" not in content
 
 
+def test_scrub_events_jsonl_shared_function_scrubs_all_fields(tmp_path, pipeline_and_anonymizer):
+    """scrub_events_jsonl() recursively scrubs all string fields, not just targeted ones.
+
+    This is the key improvement over the old chunk processor path which only
+    handled key.type/key.shortcut text and window.switch title.
+    """
+    from screencap.scrubber import scrub_events_jsonl
+
+    pipeline, anonymizer = pipeline_and_anonymizer
+
+    # Events with PII in various fields — some that the old chunk processor missed
+    events_data = [
+        {"_meta": True, "format_version": 2},
+        # key.type: targeted by _process_key_type_events AND _scrub_json_recursive
+        {
+            "type": "key.type",
+            "timestamp": 100.0,
+            "text": "John Smith",
+            "children": [
+                {"type": "key.down", "timestamp": 100.0, "key_char": "J"},
+                {"type": "key.up", "timestamp": 100.01, "key_char": "J"},
+            ],
+        },
+        # window.switch: title scrubbed by _scrub_json_recursive
+        {
+            "type": "window.switch",
+            "timestamp": 200.0,
+            "app_name": "Chrome",
+            "app_bundle_id": "com.google.Chrome",
+            "window_title": "Email from John Smith",
+            "window_id": "1",
+            "x": 0, "y": 0, "width": 800, "height": 600,
+        },
+        # mouse.singleclick: custom_field with PII, previously unhandled
+        {
+            "type": "mouse.singleclick",
+            "timestamp": 300.0,
+            "x": 100, "y": 200,
+            "description": "Clicked on John Smith profile",
+        },
+    ]
+
+    events_path = tmp_path / "events.jsonl"
+    with open(events_path, "w") as f:
+        for evt in events_data:
+            f.write(json.dumps(evt) + "\n")
+
+    had_errors = scrub_events_jsonl(events_path, pipeline, anonymizer)
+    assert had_errors is False
+
+    scrubbed = [
+        json.loads(line)
+        for line in events_path.read_text().splitlines()
+        if line.strip()
+    ]
+
+    # Meta line preserved unchanged
+    assert scrubbed[0]["_meta"] is True
+
+    # key.type: text anonymized, children key_char nulled
+    key_type = scrubbed[1]
+    assert "John Smith" not in str(key_type["text"])
+    assert key_type["text"] is not None  # anonymized, not null
+    for child in key_type["children"]:
+        assert child["key_char"] is None
+
+    # window.switch: title scrubbed
+    ws = scrubbed[2]
+    assert "John Smith" not in ws["window_title"]
+
+    # mouse.singleclick: custom field scrubbed by recursive walker
+    click = scrubbed[3]
+    assert "John Smith" not in click["description"]
+
+
+def test_scrub_events_jsonl_shared_function_returns_errors(tmp_path, pipeline_and_anonymizer):
+    """scrub_events_jsonl() returns True on malformed input without deleting original."""
+    from screencap.scrubber import scrub_events_jsonl
+
+    pipeline, anonymizer = pipeline_and_anonymizer
+
+    events_path = tmp_path / "events.jsonl"
+    events_path.write_text('{"_meta": true}\n{not valid json}\n')
+
+    had_errors = scrub_events_jsonl(events_path, pipeline, anonymizer)
+    assert had_errors is True
+    # Original file should still exist (caller decides cleanup policy)
+    assert events_path.exists()
+    # .tmp should be cleaned up
+    assert not (tmp_path / "events.jsonl.tmp").exists()
+
+
+def test_scrub_events_jsonl_shared_function_result_optional(tmp_path, pipeline_and_anonymizer):
+    """scrub_events_jsonl() works without a ScrubResult (chunk processor path)."""
+    from screencap.scrubber import scrub_events_jsonl
+
+    pipeline, anonymizer = pipeline_and_anonymizer
+
+    events_path = tmp_path / "events.jsonl"
+    events_path.write_text(
+        json.dumps({"_meta": True}) + "\n"
+        + json.dumps({"type": "key.type", "timestamp": 1.0, "text": "hello", "children": []}) + "\n"
+    )
+
+    # Calling without result= should not raise
+    had_errors = scrub_events_jsonl(events_path, pipeline, anonymizer)
+    assert had_errors is False
+
+
 def test_scrub_transcript_functions_work_on_chunked_filenames(tmp_path, pipeline_and_anonymizer):
     """_scrub_transcript_json/txt must work on chunked filenames (transcript_NNNN)."""
     pipeline, anonymizer = pipeline_and_anonymizer

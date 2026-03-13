@@ -1344,37 +1344,62 @@ def _scrub_events_jsonl(
 ) -> None:
     """Scrub combined keystroke sequences in events.jsonl and map back to DB.
 
-    1. Checks each event against blocked-app intervals — nulls content
-       for events during EXCLUDE/MASK_WINDOW periods.
-    2. Detects secrets in key.type event text fields (combined keystrokes).
-    3. Redacts key_char in JSONL children (both key.down and key.up).
-    4. Runs _scrub_json_recursive on ALL JSONL events for comprehensive PII scrub.
-    5. Maps redactions back to action_event DB rows.
-    6. Writes atomically (.tmp + rename).
-    7. Deletes file on any processing error (fail-safe).
+    Dispatches to ``scrub_events_jsonl()`` for each events file, then handles
+    error cleanup (deletes the original file on processing errors).
     """
     # Handle both legacy (events.jsonl) and chunked (events_NNNN.jsonl) layouts
     event_files = sorted(dst.glob("events*.jsonl"))
     if not event_files:
         return
 
-    for events_jsonl in event_files:
-        _scrub_single_events_jsonl(
-            events_jsonl, dst, pipeline, anonymizer, result, blocked_intervals,
+    for events_file in event_files:
+        had_errors = scrub_events_jsonl(
+            events_file,
+            pipeline,
+            anonymizer,
+            blocked_intervals=blocked_intervals,
             xref_detections=xref_detections,
+            db_dir=dst,
+            result=result,
         )
+        if had_errors:
+            events_file.unlink(missing_ok=True)
+            console.print(
+                "  [yellow]Warning: events.jsonl deleted due to processing errors[/]"
+            )
 
 
-def _scrub_single_events_jsonl(
+def scrub_events_jsonl(
     events_jsonl: Path,
-    dst: Path,
     pipeline,
     anonymizer,
-    result: ScrubResult,
+    *,
     blocked_intervals: list[_BlockedInterval] | None = None,
     xref_detections: list[_ElementStateDetection] | None = None,
-) -> None:
-    """Scrub a single events JSONL file."""
+    db_dir: Path | None = None,
+    result: ScrubResult | None = None,
+) -> bool:
+    """Scrub PII from an events JSONL file. Returns True if errors occurred.
+
+    Shared between the scrubber (full recording scrub) and the chunk processor
+    (inline cloud-intent scrub). On error, cleans up the .tmp file but does NOT
+    delete/rename the original — callers decide their own error policy.
+
+    Args:
+        events_jsonl: Path to the events JSONL file to scrub in-place.
+        pipeline: Detection pipeline instance.
+        anonymizer: Anonymizer instance.
+        blocked_intervals: Optional list of blocked-app time intervals.
+        xref_detections: Optional element_state cross-reference detections.
+        db_dir: If provided, batch-redact keystroke DB rows in this directory.
+        result: If provided, accumulate entity counts and audit entries.
+
+    Returns:
+        True if processing errors occurred, False on success.
+    """
+    # Use a local ScrubResult if caller doesn't need counts/audit.
+    _result = result if result is not None else ScrubResult()
+
     blocked_intervals = blocked_intervals or []
     blocked_starts = [iv.start for iv in blocked_intervals]
     had_errors = False
@@ -1407,7 +1432,7 @@ def _scrub_single_events_jsonl(
             blocked = _find_blocked_interval(event_ts, blocked_intervals, blocked_starts)
             if blocked is not None:
                 _null_event_content(event)
-                result.audit_entries.append(
+                _result.audit_entries.append(
                     AuditEntry(
                         timestamp=event_ts,
                         surface="event",
@@ -1420,41 +1445,39 @@ def _scrub_single_events_jsonl(
 
             # Targeted key.type detection for combined-text secrets
             _process_key_type_events(
-                event, pipeline, anonymizer, result, db_redactions
+                event, pipeline, anonymizer, _result, db_redactions
             )
 
             # Cross-reference element_state detections against keystrokes
             if xref_detections:
                 if event.get("type") == "key.type":
                     _cross_reference_key_type(
-                        event, xref_detections, result, db_redactions
+                        event, xref_detections, _result, db_redactions
                     )
                 elif event.get("type") == "mouse.drag":
                     for child in event.get("children", []):
                         if child.get("type") == "key.type":
                             _cross_reference_key_type(
-                                child, xref_detections, result, db_redactions
+                                child, xref_detections, _result, db_redactions
                             )
 
             # Comprehensive scrub: run recursive walker on ALL events
-            _scrub_json_recursive(event, pipeline, anonymizer, result)
+            _scrub_json_recursive(event, pipeline, anonymizer, _result)
 
             outfile.write(json.dumps(event, ensure_ascii=False) + "\n")
 
     # Batch DB redaction (single connection, single commit)
-    if db_redactions:
-        _redact_keystroke_db_rows(dst, db_redactions)
+    if db_redactions and db_dir is not None:
+        _redact_keystroke_db_rows(db_dir, db_redactions)
 
-    # Atomic write or delete on error
+    # Atomic rename on success, clean up .tmp on error
     if had_errors:
-        events_jsonl.unlink(missing_ok=True)
         if os.path.exists(tmp_path):
             os.unlink(tmp_path)
-        console.print(
-            "  [yellow]Warning: events.jsonl deleted due to processing errors[/]"
-        )
     else:
         os.rename(tmp_path, str(events_jsonl))
+
+    return had_errors
 
 
 # ---------------------------------------------------------------------------
@@ -1608,15 +1631,24 @@ def scrub_recording(
 
         privacy_config = get_privacy_config()
 
-        # Use the stricter of current config mode and capture-time intent
+        # Use the stricter of current config mode and capture-time intent.
+        # Cloud-intent recordings always force public mode for scrubbing
+        # parity with the chunk processor's export-time privacy filter.
         intent_path = dst / ".recording_intent"
         if intent_path.exists():
             try:
                 intent_data = json.loads(intent_path.read_text(encoding="utf-8"))
-                intent_mode = PrivacyMode(intent_data["privacy_mode"])
-                if _MODE_STRICTNESS[intent_mode] < _MODE_STRICTNESS[privacy_config.mode]:
+                destination = intent_data.get("destination", "")
+                if destination == "cloud":
                     from dataclasses import replace as _dc_replace
-                    privacy_config = _dc_replace(privacy_config, mode=intent_mode)
+                    privacy_config = _dc_replace(
+                        privacy_config, mode=PrivacyMode.PUBLIC,
+                    )
+                else:
+                    intent_mode = PrivacyMode(intent_data["privacy_mode"])
+                    if _MODE_STRICTNESS[intent_mode] < _MODE_STRICTNESS[privacy_config.mode]:
+                        from dataclasses import replace as _dc_replace
+                        privacy_config = _dc_replace(privacy_config, mode=intent_mode)
             except (json.JSONDecodeError, KeyError, ValueError, OSError):
                 pass  # Missing or malformed intent — use current config
 
