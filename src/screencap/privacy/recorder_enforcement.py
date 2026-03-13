@@ -50,8 +50,14 @@ import logging
 import threading
 import time
 from collections.abc import Callable
+from dataclasses import dataclass
 
-from screencap.privacy.actions import KEYSTROKE_CONTENT_FIELDS, PrivacyAction
+from screencap.privacy.actions import (
+    KEYSTROKE_CONTENT_FIELDS,
+    KEYSTROKE_NULL_ACTIONS,
+    VIDEO_BLOCK_ACTIONS,
+    PrivacyAction,
+)
 from screencap.privacy.context import DefaultContextClassifier, domain_from_url
 from screencap.privacy.policy import (
     DEFAULT_TRANSITION_HOLD_SECONDS,
@@ -64,9 +70,21 @@ from screencap.privacy.reasons import ReasonCode
 
 logger = logging.getLogger(__name__)
 
-# Actions that mean "this app should not be captured"
-# Import from actions.py — single source of truth shared with scrubber.
+# Actions that block screenshot capture entirely (only EXCLUDE now).
 from screencap.privacy.actions import BLOCK_ACTIONS as _BLOCK_ACTIONS
+
+
+@dataclass(frozen=True)
+class CaptureDisposition:
+    """Per-event capture decision with separate screen/video/keystroke gates.
+
+    Allows MASK_WINDOW apps to pass screenshots through while still
+    blocking video frames and nulling keystrokes.
+    """
+
+    screen_allowed: bool  # True for MASK_WINDOW, False for EXCLUDE
+    video_allowed: bool  # False for both MASK_WINDOW and EXCLUDE
+    keystrokes_allowed: bool  # False for both MASK_WINDOW and EXCLUDE
 
 
 _UNSET = object()
@@ -158,11 +176,25 @@ class RecorderPrivacyFilter:
             frozenset({PrivacyAction.OCR_FALLBACK}) if cloud_intent else frozenset()
         )
 
+        # Keystroke/video block sets — wider than _block_actions since
+        # MASK_WINDOW no longer blocks screenshots but still blocks
+        # keystrokes and video frames.
+        self._keystroke_null_actions = KEYSTROKE_NULL_ACTIONS | (
+            frozenset({PrivacyAction.OCR_FALLBACK}) if cloud_intent else frozenset()
+        )
+        self._video_block_actions = VIDEO_BLOCK_ACTIONS | (
+            frozenset({PrivacyAction.OCR_FALLBACK}) if cloud_intent else frozenset()
+        )
+
         # Mutable state (protected by _lock)
         # reason -> hold_until monotonic timestamp (0.0 = not active)
         self._blocked_reasons: dict[str, float] = {"initial": float("inf")}
         self._current_bundle_id: str = ""
         self._current_title: str = ""
+        # The PrivacyAction from the last on_window_event evaluation.
+        # Used by get_capture_disposition() to distinguish MASK_WINDOW
+        # from EXCLUDE when _blocked_reasons contains "app_policy".
+        self._current_app_action: PrivacyAction = PrivacyAction.EXCLUDE
 
         # Blocked interval tracking (for cloud-intent manifest metadata)
         self._blocked_intervals: list[dict] = []
@@ -213,19 +245,20 @@ class RecorderPrivacyFilter:
         )
         ctx = self._classifier.classify(meta)
         decision = self._evaluator.evaluate(ctx, meta)
-        now_blocked = decision.action in self._block_actions
 
-        # Cloud-intent: allow_apps overrides the matrix to ALLOW, which is
-        # correct for local recordings (OCR scrubbing handles redaction).
-        # But cloud video has no text redaction engine, so apps whose matrix
-        # action is OCR_FALLBACK must still be blocked even if allow_apps
-        # granted ALLOW.
-        if not now_blocked and self._cloud_override_actions:
+        # Determine effective action — cloud-intent may override allow_apps
+        effective_action = decision.action
+        if self._cloud_override_actions:
             matrix_action = get_matrix_action(
                 ctx.context_class, self._evaluator.config.mode,
             )
-            if matrix_action in self._cloud_override_actions:
-                now_blocked = True
+            if matrix_action in self._cloud_override_actions and effective_action not in self._block_actions:
+                effective_action = matrix_action
+
+        now_blocked = effective_action in self._block_actions
+        # Whether keystrokes/video need blocking (wider than screenshot blocking)
+        now_keystroke_blocked = effective_action in self._keystroke_null_actions
+        now_video_blocked = effective_action in self._video_block_actions
 
         now = time.monotonic()
         with self._lock:
@@ -243,6 +276,22 @@ class RecorderPrivacyFilter:
                 self._blocked_reasons["app_policy"] = now + self._hold_seconds
             # else: was not blocked, still not blocked — no change
 
+            # Track keystroke/video blocking independently of screenshot blocking.
+            # MASK_WINDOW apps don't set app_policy (screenshots pass) but
+            # still need keystroke nulling and video dropping.
+            was_ks_blocked = "app_keystrokes" in self._blocked_reasons
+            if now_keystroke_blocked:
+                self._blocked_reasons["app_keystrokes"] = float("inf")
+            elif was_ks_blocked:
+                self._blocked_reasons["app_keystrokes"] = now + self._hold_seconds
+
+            was_vid_blocked = "app_video" in self._blocked_reasons
+            if now_video_blocked:
+                self._blocked_reasons["app_video"] = float("inf")
+            elif was_vid_blocked:
+                self._blocked_reasons["app_video"] = now + self._hold_seconds
+
+            self._current_app_action = effective_action
             self._current_bundle_id = bundle_id
             self._current_title = title
 
@@ -305,33 +354,73 @@ class RecorderPrivacyFilter:
         with self._lock:
             self._blocked_reasons["filter_error"] = float("inf")
 
+    def _expire_holds(self, now: float) -> None:
+        """Remove expired hold timers (must be called with _lock held)."""
+        expired = []
+        for reason, hold_until in self._blocked_reasons.items():
+            if hold_until != float("inf") and now > hold_until:
+                expired.append(reason)
+        for reason in expired:
+            del self._blocked_reasons[reason]
+
     def is_screen_allowed(self, timestamp: float | None = None) -> bool:
         """Check whether screen capture is currently allowed.
 
-        Also checks macOS Secure Input mode (Layer 0) on each call.
+        Backward-compatible wrapper around ``get_capture_disposition()``.
 
         Args:
-            timestamp: Ignored (kept for API compatibility). The hold
-                check always uses the monotonic clock internally.
+            timestamp: Ignored (kept for API compatibility).
 
         Returns:
-            True if capture should proceed, False if blocked.
+            True if screenshot capture should proceed, False if blocked.
+        """
+        return self.get_capture_disposition().screen_allowed
+
+    def get_capture_disposition(self, timestamp: float | None = None) -> CaptureDisposition:
+        """Return separate screen/video/keystroke capture decisions.
+
+        Also checks macOS Secure Input mode (Layer 0) on each call.
+
+        - ``screen_allowed``: True unless an EXCLUDE app or
+          secure_input/secure_field/fail-closed is active.
+        - ``video_allowed``: False for EXCLUDE and MASK_WINDOW apps,
+          plus secure_input/secure_field/fail-closed.
+        - ``keystrokes_allowed``: False for EXCLUDE and MASK_WINDOW apps,
+          plus secure_input/secure_field/fail-closed.
+
+        Args:
+            timestamp: Ignored (kept for API compatibility).
         """
         now = time.monotonic()
         with self._lock:
             self._check_secure_input()
+            self._expire_holds(now)
 
-            # Clean up expired hold timers and check if any are still active.
-            # Strict > so a deadline of exactly `now` blocks for this cycle.
-            expired = []
-            for reason, hold_until in self._blocked_reasons.items():
-                if hold_until != float("inf") and now > hold_until:
-                    expired.append(reason)
+            # Screen blocking: only EXCLUDE + secure_input + secure_field + errors
+            screen_block_reasons = {
+                "app_policy", "secure_input", "secure_field",
+                "filter_error", "initial",
+            }
+            screen_blocked = bool(
+                self._blocked_reasons.keys() & screen_block_reasons
+            )
 
-            for reason in expired:
-                del self._blocked_reasons[reason]
+            # Keystroke/video blocking: adds app_keystrokes and app_video
+            keystroke_block_reasons = screen_block_reasons | {"app_keystrokes"}
+            keystrokes_blocked = bool(
+                self._blocked_reasons.keys() & keystroke_block_reasons
+            )
 
-            return len(self._blocked_reasons) == 0
+            video_block_reasons = screen_block_reasons | {"app_video"}
+            video_blocked = bool(
+                self._blocked_reasons.keys() & video_block_reasons
+            )
+
+            return CaptureDisposition(
+                screen_allowed=not screen_blocked,
+                video_allowed=not video_blocked,
+                keystrokes_allowed=not keystrokes_blocked,
+            )
 
     def record_block_start(self, ts: float) -> None:
         """Record the start of a blocked interval.

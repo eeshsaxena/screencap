@@ -413,7 +413,9 @@ def process_events(
             prev_screen_event = event
             if config.RECORD_FULL_VIDEO:
                 # Privacy filter: skip full-video frames for blocked apps
-                if screen_filter is not None and not screen_filter.is_screen_allowed(event.timestamp):
+                # Uses video_allowed (blocks for both EXCLUDE and MASK_WINDOW)
+                _vid_disp = screen_filter.get_capture_disposition(event.timestamp) if screen_filter is not None else None
+                if _vid_disp is not None and not _vid_disp.video_allowed:
                     _drops["privacy_full_video"] += 1
                     # Cloud-intent: push placeholder at 1 FPS instead of gap
                     if _cloud_placeholder:
@@ -436,7 +438,8 @@ def process_events(
                         _drops["full_video"] += 1
             elif _cloud_placeholder and config.RECORD_VIDEO:
                 # Action-gated mode: push placeholder on screen events during blocked intervals
-                if not screen_filter.is_screen_allowed(event.timestamp):
+                _vid_disp2 = screen_filter.get_capture_disposition(event.timestamp) if screen_filter is not None else None
+                if _vid_disp2 is not None and not _vid_disp2.video_allowed:
                     _push_placeholder_if_due(event.timestamp, event.data)
                 else:
                     _end_blocked_interval_if_active(event.timestamp)
@@ -529,12 +532,13 @@ def process_events(
             should_save_screen = prev_saved_screen_timestamp < prev_screen_event.timestamp
             current_hash: int | None = None
 
-            # Cache privacy check for this action event (avoids redundant lock + FFI)
-            _screen_allowed = screen_filter.is_screen_allowed(prev_screen_event.timestamp) if screen_filter is not None else True
+            # Cache privacy disposition for this action event (avoids redundant lock + FFI)
+            _disposition = screen_filter.get_capture_disposition(prev_screen_event.timestamp) if screen_filter is not None else None
+            _screen_allowed = _disposition.screen_allowed if _disposition is not None else True
 
-            # Privacy filter: suppress screenshot for blocked apps
-            if should_save_screen and screen_filter is not None:
-                if not _screen_allowed:
+            # Privacy filter: suppress screenshot for blocked apps (EXCLUDE only)
+            if should_save_screen and _disposition is not None:
+                if not _disposition.screen_allowed:
                     should_save_screen = False
                     _drops["privacy_screen"] += 1
                     # Cloud-intent: push placeholder at 1 FPS
@@ -596,7 +600,9 @@ def process_events(
                 events_to_write.append(
                     (prev_screen_event, screen_write_q, write_screen_event)
                 )
-                if config.RECORD_VIDEO and not config.RECORD_FULL_VIDEO:
+                # Video: use video_allowed gate (blocks for MASK_WINDOW + EXCLUDE)
+                _video_ok = _disposition.video_allowed if _disposition is not None else True
+                if config.RECORD_VIDEO and not config.RECORD_FULL_VIDEO and _video_ok:
                     video_event = prev_screen_event._replace(type="screen/video")
                     events_to_write.append(
                         (video_event, video_write_q, write_video_event)
@@ -606,10 +612,9 @@ def process_events(
                     events_to_write.append(
                         (prev_window_event, window_write_q, write_window_event)
                     )
-            # Privacy filter: null sensitive content for blocked apps/inputs.
-            # Applies to ALL action events (key, mouse, etc.) — if the screen
-            # is blocked, no content fields should survive to disk.
-            if screen_filter is not None and not _screen_allowed:
+            # Privacy filter: null sensitive content for blocked/masked apps.
+            # Uses keystrokes_allowed (nulls for both EXCLUDE and MASK_WINDOW).
+            if _disposition is not None and not _disposition.keystrokes_allowed:
                 screen_filter.null_keystroke_content(event.data)
                 _drops["privacy_keystroke"] += 1
 
