@@ -115,6 +115,41 @@ class TestPersonAllowlist:
         persons = [d for d in dets if d.entity_type == EntityType.PERSON]
         assert len(persons) == 0
 
+    def test_token_match_suppresses_single_word_from_multiword_app(self):
+        """Token from multi-word allowlist entry suppresses PERSON for that word."""
+        det = PiiDetector(
+            person_threshold=0.0,
+            person_allowlist=frozenset({"google chrome"}),
+            ner_backend="spacy",
+        )
+        dets = det.detect("Google logged in")
+        persons = [d for d in dets if d.entity_type == EntityType.PERSON]
+        assert len(persons) == 0
+
+    def test_short_tokens_not_added(self):
+        """Tokens < 3 chars from allowlist entries are not added to token set."""
+        det = PiiDetector(
+            person_threshold=0.0,
+            person_allowlist=frozenset({"tower of hanoi"}),
+            ner_backend="spacy",
+        )
+        # "of" (2 chars) should NOT be in the token set
+        assert "of" not in det._person_allowlist_tokens
+        # "tower" and "hanoi" (>= 3 chars) should be
+        assert "tower" in det._person_allowlist_tokens
+        assert "hanoi" in det._person_allowlist_tokens
+
+    def test_full_span_still_works(self):
+        """Full-span allowlist matching still works alongside token matching."""
+        det = PiiDetector(
+            person_threshold=1.0,
+            person_allowlist=frozenset({"ghostty"}),
+            ner_backend="spacy",
+        )
+        dets = det.detect("Ghostty tmux a")
+        persons = [d for d in dets if d.entity_type == EntityType.PERSON]
+        assert len(persons) == 0
+
 
 class TestOffsets:
     def test_offset_correctness(self, detector: PiiDetector):

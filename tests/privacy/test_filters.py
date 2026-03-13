@@ -63,6 +63,32 @@ class TestRejectUiKeywordPerson:
         assert hf.filter(keyword, [det]) == []
 
 
+class TestRejectAppNamePerson:
+    @pytest.mark.parametrize("name", [
+        "Homebrew", "Docker", "Ghostty", "Safari", "Figma",
+        "Terraform", "Kubernetes", "Python", "Elasticsearch", "Bitwarden",
+    ], ids=[
+        "cli-tool", "container", "terminal", "browser", "design",
+        "infra", "orchestrator", "language", "database", "password-mgr",
+    ])
+    def test_reject_software_names(self, hf: HeuristicFilter, name: str):
+        """Known software names flagged as PERSON are rejected."""
+        det = _det(EntityType.PERSON, 0, len(name))
+        assert hf.filter(name, [det]) == []
+
+    def test_real_person_survives(self, hf: HeuristicFilter):
+        """Real person names are NOT rejected by the software name filter."""
+        for name in ("Alice", "Sarah", "Robert", "James"):
+            det = _det(EntityType.PERSON, 0, len(name))
+            assert len(hf.filter(name, [det])) == 1, f"{name} should not be rejected"
+
+    def test_case_insensitive(self, hf: HeuristicFilter):
+        """Matching is case-insensitive: HOMEBREW, homebrew, Homebrew all rejected."""
+        for variant in ("HOMEBREW", "homebrew", "Homebrew"):
+            det = _det(EntityType.PERSON, 0, len(variant))
+            assert hf.filter(variant, [det]) == [], f"{variant} should be rejected"
+
+
 class TestKeepRealPerson:
     def test_keep_short_real_name(self, hf: HeuristicFilter):
         """'Li Wei' — 6 chars, passes short-person filter and is not a keyword/month."""
