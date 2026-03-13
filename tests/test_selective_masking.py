@@ -470,3 +470,159 @@ class TestScrubberSelectiveMasking:
         img_path = screenshots_dir / "100.0.jpg"
         assert img_path.exists(), "MASK_WINDOW should keep the file"
         assert _avg_brightness(img_path) < 50, "Should be fully masked"
+
+
+# ---------------------------------------------------------------------------
+# Background masking: ALLOW/TEXT_REDACT foreground + sensitive background
+# ---------------------------------------------------------------------------
+
+
+class TestBackgroundWindowMasking:
+    """Tests for masking sensitive background windows when the foreground
+    app evaluates to ALLOW or TEXT_REDACT.
+
+    This is the core bug fix: previously, ALLOW foreground caused the
+    entire screenshot to be kept as-is, even when Slack/Mail/etc were
+    visible in the background.
+    """
+
+    def _setup_scrub(self, tmp_path, *, foreground_bundle, foreground_title,
+                     geometry_windows, evaluator_kwargs=None,
+                     pixel_ratio=1.0, img_w=200, img_h=150):
+        """Common setup for background masking tests."""
+        from screencap.privacy.context import WindowContext
+        from screencap.scrubber import ScrubResult, _scrub_screenshots_with_policy
+
+        screenshots_dir = tmp_path / "screenshots"
+        screenshots_dir.mkdir()
+        _make_test_jpeg(screenshots_dir / "100.0.jpg", width=img_w, height=img_h)
+
+        db_path = tmp_path / "recording.db"
+        geom_data = json.dumps({
+            "windows": geometry_windows,
+            "display_bounds": [0.0, 0.0, float(img_w), float(img_h)],
+        })
+        _create_geometry_db(db_path, [(100.0, geom_data)])
+
+        kw = evaluator_kwargs or {}
+        evaluator = _make_evaluator(**kw)
+        classifier = DefaultContextClassifier()
+        window_events = [
+            WindowContext(timestamp=99.0, app_bundle_id=foreground_bundle,
+                          title=foreground_title)
+        ]
+        result = ScrubResult()
+
+        _scrub_screenshots_with_policy(
+            tmp_path, evaluator, classifier, window_events, result,
+            db_path=db_path, pixel_ratio=pixel_ratio,
+        )
+        return screenshots_dir / "100.0.jpg", result
+
+    def test_allow_foreground_masks_sensitive_background(self, tmp_path):
+        """ALLOW foreground (VS Code, internal mode) + MASK_WINDOW background
+        (banking app): banking region masked, VS Code region preserved."""
+        from PIL import Image
+
+        # Internal mode: CODE_EDITOR_TERMINAL → ALLOW, AUTH_FLOW → MASK_WINDOW
+        img_path, result = self._setup_scrub(
+            tmp_path,
+            foreground_bundle="com.microsoft.VSCode",
+            foreground_title="main.py",
+            evaluator_kwargs={"mode": "internal"},
+            geometry_windows=[
+                {"bundle_id": "com.microsoft.VSCode", "app_name": "VS Code",
+                 "x": 0, "y": 0, "width": 100, "height": 150},
+                {"bundle_id": "com.robinhood.Robinhood", "app_name": "Robinhood",
+                 "x": 100, "y": 0, "width": 100, "height": 150},
+            ],
+        )
+
+        assert img_path.exists()
+        img = Image.open(img_path).convert("RGB")
+        left_pixel = img.getpixel((25, 130))   # VS Code area, away from any label
+        right_pixel = img.getpixel((150, 130))  # Robinhood (banking) area, below label
+        img.close()
+
+        assert all(c > 200 for c in left_pixel), f"VS Code should be unmasked: {left_pixel}"
+        assert all(c < 50 for c in right_pixel), f"Banking app should be masked: {right_pixel}"
+
+        # Audit entry should reflect background masking
+        bg_entries = [e for e in result.audit_entries
+                      if e.reason == "background_windows_masked"]
+        assert len(bg_entries) == 1
+        assert bg_entries[0].evidence_type == "geometry"
+
+    def test_allow_foreground_exclude_background_masks_not_deletes(self, tmp_path):
+        """ALLOW foreground + EXCLUDE background (1Password):
+        background region masked (not file deleted) — foreground content preserved."""
+        from PIL import Image
+
+        # Internal mode: CODE_EDITOR_TERMINAL → ALLOW, PASSWORD_MANAGER → EXCLUDE
+        img_path, result = self._setup_scrub(
+            tmp_path,
+            foreground_bundle="com.microsoft.VSCode",
+            foreground_title="main.py",
+            evaluator_kwargs={"mode": "internal"},
+            geometry_windows=[
+                {"bundle_id": "com.microsoft.VSCode", "app_name": "VS Code",
+                 "x": 0, "y": 0, "width": 100, "height": 150},
+                {"bundle_id": "com.1password.1password", "app_name": "1Password",
+                 "x": 100, "y": 0, "width": 100, "height": 150},
+            ],
+        )
+
+        assert img_path.exists(), "File should NOT be deleted when foreground is ALLOW"
+        img = Image.open(img_path).convert("RGB")
+        right_pixel = img.getpixel((150, 130))  # 1Password area, below label text
+        img.close()
+        assert all(c < 50 for c in right_pixel), f"1Password should be masked: {right_pixel}"
+
+    def test_allow_foreground_all_allow_background_unchanged(self, tmp_path):
+        """ALLOW foreground + all ALLOW background: screenshot unchanged."""
+        # Internal mode: CODE_EDITOR_TERMINAL → ALLOW, ADMIN_CONSOLE → ALLOW
+        img_path, result = self._setup_scrub(
+            tmp_path,
+            foreground_bundle="com.microsoft.VSCode",
+            foreground_title="main.py",
+            evaluator_kwargs={"mode": "internal"},
+            geometry_windows=[
+                {"bundle_id": "com.microsoft.VSCode", "app_name": "VS Code",
+                 "x": 0, "y": 0, "width": 100, "height": 150},
+                {"bundle_id": "com.apple.Preview", "app_name": "Preview",
+                 "x": 100, "y": 0, "width": 100, "height": 150},
+            ],
+        )
+
+        assert img_path.exists()
+        assert _avg_brightness(img_path) > 200, "All-ALLOW screenshot should stay bright"
+        # No background_windows_masked audit entries
+        bg_entries = [e for e in result.audit_entries
+                      if e.reason == "background_windows_masked"]
+        assert len(bg_entries) == 0
+
+    def test_allow_foreground_no_geometry_unchanged(self, tmp_path):
+        """ALLOW foreground + no geometry data: screenshot kept as-is (fail-open)."""
+        from screencap.privacy.context import WindowContext
+        from screencap.scrubber import ScrubResult, _scrub_screenshots_with_policy
+
+        screenshots_dir = tmp_path / "screenshots"
+        screenshots_dir.mkdir()
+        _make_test_jpeg(screenshots_dir / "100.0.jpg")
+
+        # Internal mode: CODE_EDITOR_TERMINAL → ALLOW
+        evaluator = _make_evaluator(mode="internal")
+        classifier = DefaultContextClassifier()
+        window_events = [
+            WindowContext(timestamp=99.0, app_bundle_id="com.microsoft.VSCode",
+                          title="main.py")
+        ]
+        result = ScrubResult()
+
+        _scrub_screenshots_with_policy(
+            tmp_path, evaluator, classifier, window_events, result,
+        )
+
+        img_path = screenshots_dir / "100.0.jpg"
+        assert img_path.exists()
+        assert _avg_brightness(img_path) > 200, "No geometry = no masking"

@@ -403,14 +403,49 @@ def _scrub_screenshots_with_policy(
                 img_path.unlink()
                 actual_action = PrivacyAction.EXCLUDE
 
+        # --- Background masking for ALLOW / TEXT_REDACT ---
+        # The foreground app is safe, but sensitive background windows
+        # (Slack, Mail, etc.) may be visible behind it. Load stored
+        # window geometry and mask any background windows that evaluate
+        # to EXCLUDE or MASK_WINDOW.
+        bg_masked = False
+        if decision.action in (PrivacyAction.ALLOW, PrivacyAction.TEXT_REDACT):
+            if _geom_conn is not None and img_path.exists():
+                try:
+                    geom = load_window_geometry(db_path, ts, conn=_geom_conn)
+                    if geom is not None:
+                        from PIL import Image
+
+                        with Image.open(img_path) as probe:
+                            img_w, img_h = probe.size
+                        regions = window_regions_from_geometry(
+                            geom.windows, img_w, img_h, pixel_ratio,
+                            classifier, evaluator,
+                            display_origin=geom.display_origin,
+                        )
+                        if regions:
+                            mask_screenshot(
+                                img_path,
+                                ctx.context_class,
+                                regions=regions,
+                            )
+                            bg_masked = True
+                except Exception as exc:
+                    console.print(
+                        f"  [yellow]Warning: background masking failed for "
+                        f"{img_path.name} ({exc}) — keeping as-is[/]"
+                    )
+
         result.audit_entries.append(
             AuditEntry(
                 timestamp=ts,
                 surface="screenshot",
                 action=actual_action.value,
-                reason=decision.reason,
+                reason=decision.reason
+                    if not bg_masked else "background_windows_masked",
                 context_class=ctx.context_class.value,
-                evidence_type=ctx.confidence,
+                evidence_type=ctx.confidence
+                    if not bg_masked else "geometry",
             )
         )
 
