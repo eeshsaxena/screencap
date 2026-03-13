@@ -100,8 +100,12 @@ def _maybe_download_nlp_models() -> None:
 
     cache_dir = Path(os.environ.get("HF_HOME", "~/.cache/huggingface")).expanduser() / "hub"
     model_dir = cache_dir / "models--knowledgator--gliner-pii-base-v1.0"
-    if (model_dir / "snapshots").exists():
-        return  # already cached
+    blobs_dir = model_dir / "blobs"
+    if (model_dir / "snapshots").exists() and blobs_dir.is_dir():
+        # Check for .incomplete files — partial downloads from interrupted Ctrl+C
+        has_incomplete = any(blobs_dir.glob("*.incomplete"))
+        if not has_incomplete:
+            return  # fully cached
 
     console.print(
         "\n[bold]Privacy models not yet downloaded.[/bold] "
