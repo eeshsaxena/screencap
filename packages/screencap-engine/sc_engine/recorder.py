@@ -82,7 +82,7 @@ def _send_profiling_via_wormhole(profile_path: str) -> None:
         print(f"\nCancelled. File at: {profile_path}")
 
 
-Event = namedtuple("Event", ("timestamp", "type", "data"))
+Event = namedtuple("Event", ("timestamp", "type", "data", "extra"), defaults=(None,))
 
 # Placeholder frame interval for cloud-intent blocked intervals (1 FPS)
 _PLACEHOLDER_INTERVAL = 1.0
@@ -740,6 +740,17 @@ def write_screen_event(
                 png_data = output.getvalue()
             event_data["png_data"] = png_data
     crud.insert_screenshot(db, recording, event.timestamp, event_data)
+
+    # Persist window geometry alongside the screenshot (if captured)
+    window_geometries = event.extra
+    if window_geometries is not None:
+        try:
+            crud.insert_window_geometry(
+                db, recording, event.timestamp, json.dumps(window_geometries),
+            )
+        except Exception:
+            logger.debug("Failed to insert window geometry", exc_info=True)
+
     # disabled to increase perf
     # perf_q.put((event.type, event.timestamp, utils.get_timestamp()))
     return {**kwargs, "screenshots_dir": screenshots_dir}
@@ -1272,8 +1283,18 @@ def read_screen_events(
     fps = config.SCREEN_CAPTURE_FPS
     min_interval = 1.0 / fps if fps > 0 else 0.0
 
+    # Window geometry capture — import here to avoid module-level side effects
+    # in spawned child processes.
+    _get_geometries = None
+    try:
+        from sc_engine.window._macos import get_all_window_geometries
+        _get_geometries = get_all_window_geometries
+    except (ImportError, OSError):
+        pass
+
     logger.info(f"Starting (fps={fps}, min_interval={min_interval:.3f}s)")
     started = False
+    _geom_slow_count = 0
     while not terminate_processing.is_set():
         t_start = time.perf_counter()
         screenshot = utils.take_screenshot()
@@ -1281,6 +1302,24 @@ def read_screen_events(
         if screenshot is None:
             logger.warning("Screenshot was None")
             continue
+
+        # Capture window geometry immediately after screenshot for accurate bounds
+        window_geometries = None
+        if _get_geometries is not None:
+            t_geom_start = time.perf_counter()
+            try:
+                window_geometries = _get_geometries()
+            except Exception:
+                pass
+            t_geom = time.perf_counter() - t_geom_start
+            if t_geom > 0.01:
+                _geom_slow_count += 1
+                if _geom_slow_count <= 5:
+                    logger.warning(
+                        f"get_all_window_geometries took {t_geom*1000:.1f}ms "
+                        f"(>10ms threshold)"
+                    )
+
         if not started:
             started_event.set()
             started = True
@@ -1288,7 +1327,10 @@ def read_screen_events(
         if event_q.qsize() > int(event_q.maxsize * 0.75):
             time.sleep(0.1)
         try:
-            event_q.put(Event(utils.get_timestamp(), "screen", screenshot), timeout=0.5)
+            event_q.put(
+                Event(utils.get_timestamp(), "screen", screenshot, window_geometries),
+                timeout=0.5,
+            )
         except queue.Full:
             _drop_counts["screen"] = _drop_counts.get("screen", 0) + 1
             logger.debug("event_q full, dropping screen frame")

@@ -113,6 +113,82 @@ def get_active_window_state(read_window_data: bool) -> dict | None:
     return rval
 
 
+def get_all_window_geometries() -> list[dict]:
+    """Return bounds and ownership info for all visible normal-layer windows.
+
+    Uses the same ``CGWindowListCopyWindowInfo`` call as
+    ``get_active_window_meta()`` but returns the full filtered list
+    instead of only the frontmost window.
+
+    Each dict contains:
+        window_id, bundle_id, app_name, x, y, width, height, layer
+
+    Returns an empty list when the API call fails (e.g. permission
+    issues on macOS Sequoia+).
+    """
+    windows = Quartz.CGWindowListCopyWindowInfo(
+        (
+            Quartz.kCGWindowListExcludeDesktopElements
+            | Quartz.kCGWindowListOptionOnScreenOnly
+        ),
+        Quartz.kCGNullWindowID,
+    )
+    if windows is None:
+        return []
+
+    # Cache PID → bundle_id lookups (many windows share a PID)
+    pid_cache: dict[int, str | None] = {}
+    results = []
+
+    for win in windows:
+        layer = win.get("kCGWindowLayer", -1)
+        owner_name = win.get("kCGWindowOwnerName", "")
+        if layer != 0 or owner_name == "Window Server":
+            continue
+
+        bounds = win.get("kCGWindowBounds", {})
+        pid = win.get("kCGWindowOwnerPID", 0)
+
+        # Resolve bundle_id via NSRunningApplication (cached per PID)
+        if pid not in pid_cache:
+            try:
+                app = AppKit.NSRunningApplication.runningApplicationWithProcessIdentifier_(pid)
+                bid = str(app.bundleIdentifier()) if app and app.bundleIdentifier() else None
+            except Exception:
+                bid = None
+            pid_cache[pid] = bid
+
+        results.append({
+            "window_id": int(win.get("kCGWindowNumber", 0)),
+            "bundle_id": pid_cache[pid] or "",
+            "app_name": str(owner_name),
+            "x": float(bounds.get("X", 0)),
+            "y": float(bounds.get("Y", 0)),
+            "width": float(bounds.get("Width", 0)),
+            "height": float(bounds.get("Height", 0)),
+            "layer": int(layer),
+        })
+
+    return results
+
+
+def get_main_display_bounds() -> tuple[float, float, float, float]:
+    """Return (origin_x, origin_y, width, height) of the main display.
+
+    Uses ``CGDisplayBounds(CGMainDisplayID())`` to get the main
+    display rect in global coordinates. The main display always has
+    origin (0, 0) but secondary monitors may have negative coords.
+    """
+    main_id = Quartz.CGMainDisplayID()
+    rect = Quartz.CGDisplayBounds(main_id)
+    return (
+        float(Quartz.CGRectGetMinX(rect)),
+        float(Quartz.CGRectGetMinY(rect)),
+        float(Quartz.CGRectGetWidth(rect)),
+        float(Quartz.CGRectGetHeight(rect)),
+    )
+
+
 def get_active_window_meta() -> dict:
     """Get the metadata of the active window.
 

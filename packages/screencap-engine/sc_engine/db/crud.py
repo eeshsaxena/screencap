@@ -19,6 +19,7 @@ from sc_engine.db.models import (
     Recording,
     Screenshot,
     WindowEvent,
+    WindowGeometry,
 )
 
 # Type variable for generic model queries
@@ -31,6 +32,7 @@ screenshots = []
 window_events = []
 performance_stats = []
 memory_stats = []
+window_geometries = []
 
 
 def _insert(
@@ -85,6 +87,7 @@ def flush_buffers(session: SaSession) -> None:
         (action_events, ActionEvent),
         (screenshots, Screenshot),
         (window_events, WindowEvent),
+        (window_geometries, WindowGeometry),
         (performance_stats, PerformanceStat),
         (memory_stats, MemoryStat),
     ]
@@ -141,6 +144,29 @@ def insert_screenshot(
         "recording_timestamp": recording.timestamp,
     }
     _insert(session, event_data, Screenshot, screenshots)
+
+
+def insert_window_geometry(
+    session: SaSession,
+    recording: Recording,
+    screenshot_timestamp: float,
+    window_list_json: str,
+) -> None:
+    """Insert a window geometry snapshot for a screenshot.
+
+    Args:
+        session: The database session.
+        recording: The recording object.
+        screenshot_timestamp: The timestamp of the associated screenshot.
+        window_list_json: JSON-encoded list of window geometry dicts.
+    """
+    data = {
+        "recording_id": recording.id,
+        "recording_timestamp": recording.timestamp,
+        "screenshot_timestamp": screenshot_timestamp,
+        "window_list_json": window_list_json,
+    }
+    _insert(session, data, WindowGeometry, window_geometries)
 
 
 def insert_window_event(
