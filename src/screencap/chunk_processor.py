@@ -96,9 +96,15 @@ class ChunkProcessor:
             try:
                 from screencap.config import get_privacy_config
                 from screencap.privacy.context import DefaultContextClassifier
-                from screencap.privacy.policy import DefaultPolicyEvaluator
+                from screencap.privacy.policy import DefaultPolicyEvaluator, PrivacyMode
 
                 _pc = get_privacy_config()
+                # Cloud uploads must use public mode so that CHAT/EMAIL/etc.
+                # apps get MASK_WINDOW (blurred in screenshots) instead of
+                # TEXT_REDACT (which only scrubs text, not visuals).
+                if self._cloud_intent:
+                    from dataclasses import replace as _dc_replace
+                    _pc = _dc_replace(_pc, mode=PrivacyMode.PUBLIC)
                 self._masking_evaluator = DefaultPolicyEvaluator(_pc)
                 self._masking_classifier = DefaultContextClassifier(
                     app_classes=_pc.app_classes,
