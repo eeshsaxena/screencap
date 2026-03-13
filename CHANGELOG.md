@@ -5,6 +5,41 @@ All notable changes to this project will be documented in this file.
 The format is based on [Keep a Changelog](https://keepachangelog.com/),
 and this project adheres to [Semantic Versioning](https://semver.org/).
 
+## [0.11.0] - 2026-03-13
+
+### Added
+- **privacy:** Swap spaCy → GLiNER in Presidio, remove DataFog
+- **privacy:** Add DetectionResolver, HeuristicFilter, and composable filter pipeline
+- **privacy:** Add PII benchmark corpus and baseline measurement
+- **privacy:** Improve benchmark with coverage, source tracking, redaction check
+- **privacy:** Cross-reference element_state detections to scrub leaked keystrokes
+- **privacy:** Capture per-screenshot window geometry for selective masking
+- **privacy:** Split capture decisions for selective MASK_WINDOW handling
+- **privacy:** Selective per-window masking at scrub time
+- **privacy:** Mask chunk screenshots before cloud upload
+- **privacy:** Multi-monitor coordinate mapping for selective masking
+- **privacy:** Z-order-aware masking preserves foreground windows
+- **privacy:** Make privacy deps install by default
+- **privacy:** Download NLP models during setup wizard
+- **privacy:** Prompt for model download on screencap start
+
+### Fixed
+- **privacy:** Mask sensitive background windows in video frames at capture time
+- **privacy:** Force public mode for screenshot masking in cloud uploads
+- **privacy:** Force public mode for cloud uploads + shared scrubbing function
+- **privacy:** Don't use Rich spinner during model download
+- **privacy:** Detect partial model downloads from interrupted Ctrl+C
+- **privacy:** Always scrub before upload regardless of recording intent
+- **privacy:** Harden masking failure paths and review findings
+- **privacy:** Mask all sensitive background windows, fix geometry lookup
+- **privacy:** Mask sensitive background windows during scrub
+- **privacy:** Close review findings — fallback, video leak, dead code
+- **privacy:** Lowercase token allowlist, remove redundant short names
+- **privacy:** Reduce app/software name PERSON false positives
+- **privacy:** Fix xref span replacement, harden scrub pipeline
+- **privacy:** Address benchmark review findings
+- **privacy:** Address code review findings from GLiNER swap
+
 ## [0.10.0] - 2026-03-11
 
 ### Added
