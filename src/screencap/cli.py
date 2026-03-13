@@ -1609,10 +1609,18 @@ def setup(scan, show, reset):
     run_setup_wizard(scan_only=scan)
 
 
-_PRIVACY_EXTRAS_MSG = (
-    "[red]Error: Privacy dependencies not installed.[/red]\n"
-    "Install with: [bold]pip install screencap\\[privacy][/bold]"
-)
+def _privacy_extras_msg() -> str:
+    """Return the appropriate error message for missing privacy deps."""
+    if getattr(sys, "frozen", False):
+        return (
+            "[red]Error: Privacy features (scrub, cloud upload) require the "
+            "pip-installed version of screencap.[/red]\n"
+            "The binary distribution does not include privacy dependencies."
+        )
+    return (
+        "[red]Error: Privacy dependencies are missing.[/red]\n"
+        "Reinstall with: [bold]pip install screencap[/bold]"
+    )
 
 
 @cli.command()
@@ -1633,7 +1641,7 @@ def scrub(name: str, pii_engine: str | None) -> None:
         console.print(f"[red]Error:[/red] {e}")
         raise SystemExit(1)
     except ImportError as e:
-        console.print(_PRIVACY_EXTRAS_MSG)
+        console.print(_privacy_extras_msg())
         console.print(f"[dim]{e}[/dim]")
         raise SystemExit(1)
     except ValueError as e:

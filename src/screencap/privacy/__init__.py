@@ -338,7 +338,7 @@ def create_default_pipeline(
     except ImportError:
         logger.warning(
             "detect-secrets not installed — secrets detection disabled. "
-            "Install with: pip install 'screencap[privacy]'"
+            "Reinstall with: pip install screencap"
         )
 
     # PII engine selection: GLiNER (default) or spaCy (legacy)
@@ -381,13 +381,13 @@ def create_default_pipeline(
     if not pii_loaded:
         logger.warning(
             "No PII engine installed — PII detection disabled. "
-            "Install with: pip install 'presidio-analyzer[gliner]'"
+            "Reinstall with: pip install screencap"
         )
 
     if len(detectors) < 2:
         raise ImportError(
             "Privacy detection requires at least detect-secrets or a PII engine. "
-            "Install with: pip install 'screencap[privacy]'"
+            "Reinstall with: pip install screencap"
         )
 
     from screencap.privacy.filters import HeuristicFilter

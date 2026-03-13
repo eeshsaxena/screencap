@@ -17,6 +17,8 @@ dependencies = [
     "tomli>=2.0; python_version < '3.11'",
     "tomlkit>=0.12",
     "python-dotenv>=1.0",
+    "detect-secrets>=1.5.0,<2.0",
+    "presidio-analyzer[gliner]>=2.2",
 ]
 
 [project.optional-dependencies]
@@ -46,12 +48,9 @@ record = [
     "pyobjc-framework-Cocoa>=9.0; sys_platform == 'darwin'",
     "pyobjc-framework-CoreWLAN>=9.0; sys_platform == 'darwin'",
 ]
-privacy = [
-    "detect-secrets>=1.5.0,<2.0",
-    "presidio-analyzer[gliner]>=2.2",
-]
+privacy = []  # Moved to base dependencies as of v0.11.0
 dev = [
-    "screencap[record,privacy]",
+    "screencap[record]",
     "pytest>=7.0",
     "pytest-cov",
 ]
@@ -68,5 +67,5 @@ where = ["src", "packages/screencap-engine"]
 [tool.pytest.ini_options]
 testpaths = ["tests"]
 markers = [
-    "privacy: tests requiring privacy deps (detect-secrets, PII engine)",
+    "privacy: tests for privacy detection pipeline",
 ]
