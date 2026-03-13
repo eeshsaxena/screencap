@@ -15,6 +15,7 @@ from pathlib import Path
 
 import pytest
 
+from screencap.privacy.actions import PrivacyAction
 from screencap.privacy.context import (
     DefaultContextClassifier,
     load_window_geometry,
@@ -654,3 +655,116 @@ class TestBackgroundWindowMasking:
 
         assert all(c > 200 for c in left_pixel), f"VS Code should be unmasked: {left_pixel}"
         assert all(c < 50 for c in right_pixel), f"Slack (TEXT_REDACT) should be masked: {right_pixel}"
+
+
+# ---------------------------------------------------------------------------
+# Z-order-aware masking: foreground ALLOW windows cut through background masks
+# ---------------------------------------------------------------------------
+
+
+class TestZOrderMasking:
+    """Tests that non-masked foreground windows are never obscured by
+    masks applied to sensitive background windows behind them.
+
+    Uses internal mode where VS Code (CODE_EDITOR_TERMINAL) → ALLOW and
+    Slack (CHAT) → TEXT_REDACT. Passes _BG_MASK_ACTIONS to include
+    TEXT_REDACT in the mask trigger set (matching scrubber behavior).
+    """
+
+    _BG_MASK_ACTIONS = frozenset({
+        PrivacyAction.EXCLUDE,
+        PrivacyAction.MASK_WINDOW,
+        PrivacyAction.MASK_REGION,
+        PrivacyAction.TEXT_REDACT,
+        PrivacyAction.OCR_FALLBACK,
+    })
+
+    def test_foreground_allow_cuts_through_background_mask(self, tmp_path):
+        """VS Code (ALLOW) overlapping Slack (TEXT_REDACT): VS Code pixels preserved."""
+        from PIL import Image
+
+        classifier, evaluator = _make_classifier_evaluator(mode="internal")
+
+        # Slack covers full area, VS Code overlaps the left half (foreground)
+        windows = [
+            # Front-to-back order (CGWindowListCopyWindowInfo order)
+            {"bundle_id": "com.microsoft.VSCode", "app_name": "VS Code",
+             "x": 0, "y": 0, "width": 100, "height": 150},
+            {"bundle_id": "com.tinyspeck.slackmacgap", "app_name": "Slack",
+             "x": 0, "y": 0, "width": 200, "height": 150},
+        ]
+
+        regions = window_regions_from_geometry(
+            windows, 200, 150, 1.0, classifier, evaluator,
+            mask_actions=self._BG_MASK_ACTIONS,
+            respect_z_order=True,
+        )
+
+        # Should produce a bitmap-based region
+        assert len(regions) == 1
+        assert regions[0].label == "z_order_mask"
+
+        # Apply to an image and verify pixels
+        img_path = _make_test_jpeg(tmp_path / "test.jpg", width=200, height=150)
+        mask_screenshot(img_path, None, regions=regions)
+
+        img = Image.open(img_path).convert("RGB")
+        # Left half (VS Code foreground) should be preserved (bright)
+        left_pixel = img.getpixel((25, 75))
+        # Right half (Slack only, no foreground cover) should be masked (dark)
+        right_pixel = img.getpixel((150, 75))
+        img.close()
+
+        assert all(c > 200 for c in left_pixel), f"VS Code area should be unmasked: {left_pixel}"
+        assert all(c < 50 for c in right_pixel), f"Slack area should be masked: {right_pixel}"
+
+    def test_no_z_order_masks_entire_overlapping_region(self, tmp_path):
+        """Without z-order: VS Code + Slack overlap → Slack mask covers VS Code too."""
+        from PIL import Image
+
+        classifier, evaluator = _make_classifier_evaluator(mode="internal")
+
+        windows = [
+            {"bundle_id": "com.microsoft.VSCode", "app_name": "VS Code",
+             "x": 0, "y": 0, "width": 100, "height": 150},
+            {"bundle_id": "com.tinyspeck.slackmacgap", "app_name": "Slack",
+             "x": 0, "y": 0, "width": 200, "height": 150},
+        ]
+
+        regions = window_regions_from_geometry(
+            windows, 200, 150, 1.0, classifier, evaluator,
+            mask_actions=self._BG_MASK_ACTIONS,
+            respect_z_order=False,
+        )
+
+        # Without z-order, Slack produces a region covering the full 200px width
+        slack_regions = [r for r in regions if r.label == "chat"]
+        assert len(slack_regions) == 1
+        assert slack_regions[0].width == 200
+
+        img_path = _make_test_jpeg(tmp_path / "test.jpg", width=200, height=150)
+        mask_screenshot(img_path, None, regions=regions)
+
+        img = Image.open(img_path).convert("RGB")
+        # Left half should also be masked (no z-order awareness)
+        left_pixel = img.getpixel((25, 75))
+        img.close()
+        assert all(c < 50 for c in left_pixel), f"Without z-order, left should be masked: {left_pixel}"
+
+    def test_all_foreground_allow_no_mask_applied(self):
+        """All windows are ALLOW: z-order path returns empty list."""
+        classifier, evaluator = _make_classifier_evaluator(mode="internal")
+
+        windows = [
+            {"bundle_id": "com.microsoft.VSCode", "app_name": "VS Code",
+             "x": 0, "y": 0, "width": 200, "height": 150},
+            {"bundle_id": "com.apple.Preview", "app_name": "Preview",
+             "x": 50, "y": 50, "width": 100, "height": 100},
+        ]
+
+        regions = window_regions_from_geometry(
+            windows, 200, 150, 1.0, classifier, evaluator,
+            mask_actions=self._BG_MASK_ACTIONS,
+            respect_z_order=True,
+        )
+        assert len(regions) == 0

@@ -332,6 +332,7 @@ def _scrub_screenshots_with_policy(
                             geom.windows, img_w, img_h, pixel_ratio,
                             classifier, evaluator,
                             display_origin=geom.display_origin,
+                            respect_z_order=True,
                         )
                         if regions:
                             mask_screenshot(
@@ -431,6 +432,7 @@ def _scrub_screenshots_with_policy(
                             classifier, evaluator,
                             display_origin=geom.display_origin,
                             mask_actions=_BG_MASK_ACTIONS,
+                            respect_z_order=True,
                         )
                         if regions:
                             mask_screenshot(
