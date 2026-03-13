@@ -267,6 +267,22 @@ class PerformanceStat(Base):
     window_id = sa.Column(sa.String)
 
 
+class WindowGeometry(Base):
+    """Per-screenshot window geometry for selective masking.
+
+    Stores the complete on-screen window list at each screenshot
+    timestamp so scrub-time masking has accurate bounds.
+    """
+
+    __tablename__ = "window_geometry"
+
+    id = sa.Column(sa.Integer, primary_key=True)
+    recording_id = sa.Column(sa.ForeignKey("recording.id"))
+    recording_timestamp = sa.Column(ForceFloat)
+    screenshot_timestamp = sa.Column(ForceFloat, index=True)
+    window_list_json = sa.Column(sa.Text)
+
+
 class MemoryStat(Base):
     """Class representing a memory usage statistic in the database."""
 

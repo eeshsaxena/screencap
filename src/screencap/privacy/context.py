@@ -15,6 +15,7 @@ Owns:
 from __future__ import annotations
 
 import bisect
+import json
 import re
 import sqlite3
 from dataclasses import dataclass
@@ -121,6 +122,87 @@ def find_nearest_window(
 # ---------------------------------------------------------------------------
 # DB loaders (raw sqlite3, consistent with screencap layer)
 # ---------------------------------------------------------------------------
+
+
+@dataclass(frozen=True)
+class WindowGeometrySnapshot:
+    """Per-screenshot window geometry with display context."""
+
+    windows: list[dict]
+    display_origin: tuple[float, float] = (0.0, 0.0)
+
+
+# Cache table existence per connection to avoid repeated sqlite_master queries.
+# Keyed by id(connection). Safe because the table set never changes during a
+# scrub, and the cache is small (one entry per open connection).
+_geometry_table_cache: dict[int, bool] = {}
+
+
+def load_window_geometry(
+    db_path: Path,
+    screenshot_timestamp: float,
+    conn: sqlite3.Connection | None = None,
+) -> WindowGeometrySnapshot | None:
+    """Load the window geometry snapshot for a screenshot timestamp.
+
+    Queries the ``window_geometry`` table for an exact timestamp match.
+    Returns a ``WindowGeometrySnapshot`` or ``None`` if unavailable
+    (old recordings without the table, capture failure, etc.).
+
+    Args:
+        db_path: Path to the recording database.
+        screenshot_timestamp: Exact timestamp to look up.
+        conn: Optional open connection to reuse (avoids per-call overhead
+            when loading geometry for many screenshots in a loop).
+    """
+    own_conn = conn is None
+    if own_conn:
+        conn = sqlite3.connect(str(db_path))
+    try:
+        cur = conn.cursor()
+        # Check table existence once per connection (graceful for old recordings).
+        # The table set never changes during a scrub, so cache the result.
+        conn_id = id(conn)
+        if conn_id not in _geometry_table_cache:
+            tables = {r[0] for r in cur.execute(
+                "SELECT name FROM sqlite_master WHERE type='table'"
+            ).fetchall()}
+            _geometry_table_cache[conn_id] = "window_geometry" in tables
+        if not _geometry_table_cache[conn_id]:
+            return None
+
+        # Use tolerance-based lookup: screenshot filenames lose float
+        # precision (e.g. 1773413585.910469 vs DB 1773413585.9104693).
+        # 1ms tolerance is safely within a single screenshot interval.
+        cur.execute(
+            "SELECT window_list_json FROM window_geometry "
+            "WHERE abs(screenshot_timestamp - ?) < 0.001 "
+            "ORDER BY abs(screenshot_timestamp - ?) LIMIT 1",
+            (screenshot_timestamp, screenshot_timestamp),
+        )
+        row = cur.fetchone()
+        if row is None or row[0] is None:
+            return None
+
+        data = json.loads(row[0])
+
+        # Handle both formats:
+        # New: {"windows": [...], "display_bounds": [x, y, w, h]}
+        # Legacy: [...] (plain list of window dicts)
+        if isinstance(data, dict):
+            windows = data.get("windows", [])
+            bounds = data.get("display_bounds")
+            origin = (float(bounds[0]), float(bounds[1])) if bounds else (0.0, 0.0)
+        else:
+            windows = data
+            origin = (0.0, 0.0)
+
+        return WindowGeometrySnapshot(windows=windows, display_origin=origin)
+    except (sqlite3.OperationalError, json.JSONDecodeError):
+        return None
+    finally:
+        if own_conn:
+            conn.close()
 
 
 def load_window_events(db_path: Path) -> list[WindowContext]:

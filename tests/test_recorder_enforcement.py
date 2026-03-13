@@ -150,8 +150,12 @@ class TestRecorderPrivacyFilter:
         })
         assert f.is_screen_allowed() is False
 
-    def test_title_pattern_blocks_capture(self):
-        """A window matching a mask_title_patterns rule triggers block."""
+    def test_title_pattern_masks_window(self):
+        """A window matching a mask_title_patterns rule triggers MASK_WINDOW.
+
+        Screenshots pass through (for selective masking at scrub time),
+        but video and keystrokes are blocked.
+        """
         import re
 
         config = _make_config(
@@ -164,7 +168,10 @@ class TestRecorderPrivacyFilter:
             "title": "Inbox — Webmail",
         })
 
-        assert f.is_screen_allowed() is False
+        disp = f.get_capture_disposition()
+        assert disp.screen_allowed is True, "MASK_WINDOW allows screenshots"
+        assert disp.video_allowed is False, "MASK_WINDOW blocks video"
+        assert disp.keystrokes_allowed is False, "MASK_WINDOW blocks keystrokes"
 
 
 class TestFailClosed:

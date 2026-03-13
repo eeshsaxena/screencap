@@ -22,6 +22,17 @@ from screencap.privacy.actions import BLOCK_ACTIONS, KEYSTROKE_CONTENT_FIELDS, P
 from screencap.privacy.policy import DEFAULT_TRANSITION_HOLD_SECONDS
 from screencap.privacy.reasons import AuditEntry, ReasonCode
 
+# Actions that trigger masking for background windows. Everything except ALLOW —
+# we can't text-redact or OCR a partial screenshot region, so masking is the
+# only safe option for background windows.
+_BG_MASK_ACTIONS = frozenset({
+    PrivacyAction.EXCLUDE,
+    PrivacyAction.MASK_WINDOW,
+    PrivacyAction.MASK_REGION,
+    PrivacyAction.TEXT_REDACT,
+    PrivacyAction.OCR_FALLBACK,
+})
+
 console = Console()
 
 
@@ -260,20 +271,28 @@ def _scrub_screenshots_with_policy(
     classifier,
     window_events,
     result: ScrubResult,
+    db_path: Path | None = None,
+    pixel_ratio: float = 2.0,
 ) -> None:
     """Route screenshot files by policy/context.
 
     EXCLUDE → delete file.
-    MASK_WINDOW → apply full-window structural mask (phase 4).
+    MASK_WINDOW → selectively mask sensitive window regions using stored
+        geometry. Falls back to full-window mask when geometry unavailable.
     MASK_REGION → apply pane-level structural mask.
     OCR_FALLBACK → fail closed to MASK_WINDOW (no OCR engine available).
     TEXT_REDACT / ALLOW → keep file.
     """
     from screencap.privacy.context import (
         associate_screenshot,
+        load_window_geometry,
         parse_screenshot_timestamp,
     )
-    from screencap.privacy.masking import MaskStrategy, mask_screenshot
+    from screencap.privacy.masking import (
+        MaskStrategy,
+        mask_screenshot,
+        window_regions_from_geometry,
+    )
 
     screenshots_dir = dst / "screenshots"
     if not screenshots_dir.is_dir():
@@ -281,6 +300,14 @@ def _scrub_screenshots_with_policy(
 
     # Pre-compute timestamp lists once for all screenshot lookups
     window_timestamps = [w.timestamp for w in window_events] if window_events else []
+
+    # Open a shared connection for geometry lookups (avoids per-screenshot overhead)
+    _geom_conn = None
+    if db_path is not None:
+        try:
+            _geom_conn = sqlite3.connect(str(db_path))
+        except sqlite3.OperationalError:
+            pass
 
     for img_path in sorted(screenshots_dir.glob("*.jpg")):
         ts = parse_screenshot_timestamp(img_path.name)
@@ -301,20 +328,55 @@ def _scrub_screenshots_with_policy(
         if decision.action == PrivacyAction.EXCLUDE:
             img_path.unlink()
         elif decision.action == PrivacyAction.MASK_WINDOW:
-            try:
-                mask_screenshot(
-                    img_path,
-                    ctx.context_class,
-                    strategy=MaskStrategy.FULL_WINDOW,
-                    app_hint=meta.bundle_id,
-                )
-            except Exception as exc:
-                console.print(
-                    f"  [yellow]Warning: masking failed for {img_path.name} "
-                    f"({exc}) — deleting for safety[/]"
-                )
-                img_path.unlink()
-                actual_action = PrivacyAction.EXCLUDE
+            # Attempt selective masking using per-screenshot window geometry.
+            # Falls back to full-frame masking when geometry is unavailable.
+            selective_applied = False
+            if _geom_conn is not None:
+                try:
+                    geom = load_window_geometry(db_path, ts, conn=_geom_conn)
+                    if geom is not None:
+                        from PIL import Image
+
+                        with Image.open(img_path) as probe:
+                            img_w, img_h = probe.size
+                        regions = window_regions_from_geometry(
+                            geom.windows, img_w, img_h, pixel_ratio,
+                            classifier, evaluator,
+                            display_origin=geom.display_origin,
+                            respect_z_order=True,
+                        )
+                        if regions:
+                            mask_screenshot(
+                                img_path,
+                                ctx.context_class,
+                                regions=regions,
+                            )
+                            selective_applied = True
+                        # No regions = no sensitive windows visible; keep as-is
+                        else:
+                            selective_applied = True
+                except Exception as exc:
+                    console.print(
+                        f"  [yellow]Warning: selective masking failed for "
+                        f"{img_path.name} ({exc}) — falling back to full-frame[/]"
+                    )
+
+            if not selective_applied:
+                # Fallback: full-frame masking (original behavior)
+                try:
+                    mask_screenshot(
+                        img_path,
+                        ctx.context_class,
+                        strategy=MaskStrategy.FULL_WINDOW,
+                        app_hint=meta.bundle_id,
+                    )
+                except Exception as exc:
+                    console.print(
+                        f"  [yellow]Warning: masking failed for {img_path.name} "
+                        f"({exc}) — deleting for safety[/]"
+                    )
+                    img_path.unlink()
+                    actual_action = PrivacyAction.EXCLUDE
         elif decision.action == PrivacyAction.MASK_REGION:
             try:
                 mask_screenshot(
@@ -353,16 +415,67 @@ def _scrub_screenshots_with_policy(
                 img_path.unlink()
                 actual_action = PrivacyAction.EXCLUDE
 
+        # --- Background masking for ALLOW / TEXT_REDACT ---
+        # The foreground app is safe, but sensitive background windows
+        # (Slack, Mail, etc.) may be visible behind it.
+        bg_masked = False
+        if decision.action in (PrivacyAction.ALLOW, PrivacyAction.TEXT_REDACT):
+            if _geom_conn is not None and img_path.exists():
+                try:
+                    geom = load_window_geometry(db_path, ts, conn=_geom_conn)
+                    if geom is not None:
+                        from PIL import Image
+
+                        with Image.open(img_path) as probe:
+                            img_w, img_h = probe.size
+                        regions = window_regions_from_geometry(
+                            geom.windows, img_w, img_h, pixel_ratio,
+                            classifier, evaluator,
+                            display_origin=geom.display_origin,
+                            mask_actions=_BG_MASK_ACTIONS,
+                            respect_z_order=True,
+                        )
+                        if regions:
+                            mask_screenshot(
+                                img_path,
+                                ctx.context_class,
+                                regions=regions,
+                            )
+                            bg_masked = True
+                except Exception as exc:
+                    # Fail-closed: geometry found sensitive windows but masking
+                    # failed — fall back to full-frame mask rather than leaking.
+                    console.print(
+                        f"  [yellow]Warning: background masking failed for "
+                        f"{img_path.name} ({exc}) — applying full-frame mask[/]"
+                    )
+                    try:
+                        mask_screenshot(
+                            img_path,
+                            ctx.context_class,
+                            strategy=MaskStrategy.FULL_WINDOW,
+                            app_hint=meta.bundle_id,
+                        )
+                        bg_masked = True
+                    except Exception:
+                        img_path.unlink()
+                        actual_action = PrivacyAction.EXCLUDE
+
         result.audit_entries.append(
             AuditEntry(
                 timestamp=ts,
                 surface="screenshot",
                 action=actual_action.value,
-                reason=decision.reason,
+                reason=f"{decision.reason}+background_windows_masked"
+                    if bg_masked else decision.reason,
                 context_class=ctx.context_class.value,
-                evidence_type=ctx.confidence,
+                evidence_type=f"{ctx.confidence}+geometry"
+                    if bg_masked else ctx.confidence,
             )
         )
+
+    if _geom_conn is not None:
+        _geom_conn.close()
 
 
 # ---------------------------------------------------------------------------
@@ -1535,11 +1648,25 @@ def scrub_recording(
             )
             window_events = []
 
-    # 10. Policy-aware screenshot routing
+    # 10. Policy-aware screenshot routing (with selective masking)
     if evaluator and classifier:
+        # Read pixel_ratio from recording DB for Retina scaling
+        _pixel_ratio = 2.0  # safe default for Retina Macs
+        if db_path:
+            try:
+                with sqlite3.connect(str(db_path)) as _pr_conn:
+                    _pr_row = _pr_conn.execute(
+                        "SELECT pixel_ratio FROM recording LIMIT 1"
+                    ).fetchone()
+                    if _pr_row and _pr_row[0]:
+                        _pixel_ratio = float(_pr_row[0])
+            except (sqlite3.OperationalError, ValueError):
+                pass
+
         with console.status("Routing screenshots by policy..."):
             _scrub_screenshots_with_policy(
-                dst, evaluator, classifier, window_events, result
+                dst, evaluator, classifier, window_events, result,
+                db_path=db_path, pixel_ratio=_pixel_ratio,
             )
 
     # 11. Null DB rows during blocked-app intervals

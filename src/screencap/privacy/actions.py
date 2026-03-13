@@ -38,9 +38,19 @@ def stricter(a: PrivacyAction, b: PrivacyAction) -> PrivacyAction:
     return a if _ACTION_SEVERITY[a] <= _ACTION_SEVERITY[b] else b
 
 
-# Actions that mean "this app/surface should not be captured".
-# Used by both recorder_enforcement (capture-time) and scrubber (post-processing).
-BLOCK_ACTIONS = frozenset({PrivacyAction.EXCLUDE, PrivacyAction.MASK_WINDOW})
+# Actions that block screenshot capture entirely (frame dropped).
+# MASK_WINDOW is no longer here — screenshots are captured normally for
+# MASK_WINDOW apps and selectively masked at scrub time.
+BLOCK_ACTIONS = frozenset({PrivacyAction.EXCLUDE})
+
+# Actions that require keystroke content to be nulled before writing to DB.
+# Both EXCLUDE and MASK_WINDOW apps have sensitive content that must not
+# be stored in keystroke fields.
+KEYSTROKE_NULL_ACTIONS = frozenset({PrivacyAction.EXCLUDE, PrivacyAction.MASK_WINDOW})
+
+# Actions that block video frame capture. Video masking (decode/re-encode)
+# is out of scope, so both EXCLUDE and MASK_WINDOW drop video frames.
+VIDEO_BLOCK_ACTIONS = frozenset({PrivacyAction.EXCLUDE, PrivacyAction.MASK_WINDOW})
 
 
 # Keystroke content fields to null when blocking.
