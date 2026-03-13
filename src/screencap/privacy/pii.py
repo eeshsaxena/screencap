@@ -35,7 +35,7 @@ class PiiDetector:
         # Token-level allowlist: split each multi-word entry and keep tokens >= 3 chars.
         # Whitespace-only split preserves "Terminal.app" as one token (no dot/hyphen split).
         self._person_allowlist_tokens: frozenset[str] = frozenset(
-            token
+            token.lower()
             for entry in person_allowlist
             for token in entry.split()
             if len(token) >= 3

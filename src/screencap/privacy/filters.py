@@ -50,7 +50,7 @@ _SOFTWARE_NAMES = frozenset({
     # Languages (where name != common person name)
     "python", "golang", "typescript", "javascript", "kotlin", "swift",
     "elixir", "clojure", "haskell", "erlang", "scala", "fortran",
-    "cobol", "perl", "lua", "zig", "rust",
+    "cobol", "perl", "rust",
     # Ambiguous but accepted trade-off — tool names far more common than
     # person names in dev screen recordings
     "ruby", "julia", "hugo",
