@@ -15,7 +15,8 @@ from dataclasses import dataclass
 from enum import Enum
 from pathlib import Path
 
-from screencap.privacy.policy import ContextClass
+from screencap.privacy.actions import KEYSTROKE_NULL_ACTIONS
+from screencap.privacy.policy import ContextClass, FrameMetadata
 
 
 class MaskStrategy(Enum):
@@ -154,12 +155,8 @@ def window_regions_from_geometry(
     Returns:
         List of ``MaskRegion`` for all sensitive windows.
     """
-    from screencap.privacy.actions import BLOCK_ACTIONS, KEYSTROKE_NULL_ACTIONS
-    from screencap.privacy.policy import FrameMetadata
-
-    # Union of BLOCK_ACTIONS + KEYSTROKE_NULL_ACTIONS covers both EXCLUDE
-    # and MASK_WINDOW. Both should be masked in the screenshot.
-    mask_actions = BLOCK_ACTIONS | KEYSTROKE_NULL_ACTIONS
+    # KEYSTROKE_NULL_ACTIONS = {EXCLUDE, MASK_WINDOW} — both should be masked.
+    mask_actions = KEYSTROKE_NULL_ACTIONS
 
     regions: list[MaskRegion] = []
     disp_x, disp_y = display_origin
@@ -250,7 +247,7 @@ def _apply_mask_to_image(img, regions: list[MaskRegion]) -> None:
 
 def mask_screenshot(
     image_path: Path,
-    context_class: ContextClass,
+    context_class: ContextClass | None,
     strategy: MaskStrategy | None = None,
     app_hint: str = "",
     regions: list[MaskRegion] | None = None,

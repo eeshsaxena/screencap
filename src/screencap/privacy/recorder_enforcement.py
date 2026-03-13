@@ -53,6 +53,7 @@ from collections.abc import Callable
 from dataclasses import dataclass
 
 from screencap.privacy.actions import (
+    BLOCK_ACTIONS,
     KEYSTROKE_CONTENT_FIELDS,
     KEYSTROKE_NULL_ACTIONS,
     VIDEO_BLOCK_ACTIONS,
@@ -69,9 +70,6 @@ from screencap.privacy.policy import (
 from screencap.privacy.reasons import ReasonCode
 
 logger = logging.getLogger(__name__)
-
-# Actions that block screenshot capture entirely (only EXCLUDE now).
-from screencap.privacy.actions import BLOCK_ACTIONS as _BLOCK_ACTIONS
 
 
 @dataclass(frozen=True)
@@ -165,7 +163,7 @@ class RecorderPrivacyFilter:
         # (code editors, admin consoles) which would otherwise pass through
         # unredacted since no OCR redaction engine exists for video.
         self._cloud_intent = cloud_intent
-        self._block_actions = _BLOCK_ACTIONS | (
+        self._block_actions = BLOCK_ACTIONS | (
             frozenset({PrivacyAction.OCR_FALLBACK}) if cloud_intent else frozenset()
         )
         # Actions that trigger cloud-specific blocking even for allow_apps.
@@ -191,10 +189,6 @@ class RecorderPrivacyFilter:
         self._blocked_reasons: dict[str, float] = {"initial": float("inf")}
         self._current_bundle_id: str = ""
         self._current_title: str = ""
-        # The PrivacyAction from the last on_window_event evaluation.
-        # Used by get_capture_disposition() to distinguish MASK_WINDOW
-        # from EXCLUDE when _blocked_reasons contains "app_policy".
-        self._current_app_action: PrivacyAction = PrivacyAction.EXCLUDE
 
         # Blocked interval tracking (for cloud-intent manifest metadata)
         self._blocked_intervals: list[dict] = []
@@ -291,7 +285,6 @@ class RecorderPrivacyFilter:
             elif was_vid_blocked:
                 self._blocked_reasons["app_video"] = now + self._hold_seconds
 
-            self._current_app_action = effective_action
             self._current_bundle_id = bundle_id
             self._current_title = title
 

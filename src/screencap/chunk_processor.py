@@ -287,48 +287,61 @@ class ChunkProcessor:
             mask_screenshot,
             window_regions_from_geometry,
         )
-        from screencap.privacy.actions import PrivacyAction
-        from screencap.privacy.policy import FrameMetadata
+        from screencap.privacy.policy import ContextClass
 
         db_path = self._db_path
         masked_count = 0
+
+        # Shared connection for geometry lookups across the loop
+        _geom_conn = None
+        try:
+            _geom_conn = sqlite3.connect(str(db_path))
+        except Exception:
+            pass
 
         for img_path in sorted(screenshots_dir.glob("*.jpg")):
             ts = parse_screenshot_timestamp(img_path.name)
             if ts is None:
                 continue
 
-            # Classify the frontmost app (from window geometry) to check if masking needed
             geom = None
             try:
-                geom = load_window_geometry(db_path, ts)
+                geom = load_window_geometry(db_path, ts, conn=_geom_conn)
             except Exception:
                 pass
 
-            if geom is None:
-                continue  # No geometry → no selective masking needed for this screenshot
-
-            try:
-                from PIL import Image
-                with Image.open(img_path) as probe:
-                    img_w, img_h = probe.size
-
-                regions = window_regions_from_geometry(
-                    geom.windows, img_w, img_h, self._masking_pixel_ratio,
-                    self._masking_classifier, self._masking_evaluator,
-                    display_origin=geom.display_origin,
-                )
-                if regions:
-                    mask_screenshot(
-                        img_path,
-                        None,  # context_class not used with regions
-                        regions=regions,
-                    )
-                    masked_count += 1
-            except Exception:
-                # Fallback: full-frame masking
+            # Attempt selective masking if geometry is available
+            selective_applied = False
+            if geom is not None:
                 try:
-                    from screencap.privacy.policy import ContextClass
+                    from PIL import Image
+                    with Image.open(img_path) as probe:
+                        img_w, img_h = probe.size
+
+                    regions = window_regions_from_geometry(
+                        geom.windows, img_w, img_h, self._masking_pixel_ratio,
+                        self._masking_classifier, self._masking_evaluator,
+                        display_origin=geom.display_origin,
+                    )
+                    if regions:
+                        mask_screenshot(
+                            img_path,
+                            None,
+                            regions=regions,
+                        )
+                        masked_count += 1
+                    # No regions = no sensitive windows visible; keep as-is
+                    selective_applied = True
+                except Exception:
+                    logger.debug(
+                        f"Selective masking failed for {img_path.name}",
+                        exc_info=True,
+                    )
+
+            # Fallback: full-frame masking when geometry unavailable or
+            # selective masking failed. Conservative for cloud upload path.
+            if not selective_applied:
+                try:
                     mask_screenshot(
                         img_path,
                         ContextClass.UNKNOWN,
@@ -340,6 +353,9 @@ class ChunkProcessor:
                         f"Failed to mask screenshot {img_path.name}",
                         exc_info=True,
                     )
+
+        if _geom_conn is not None:
+            _geom_conn.close()
 
         if masked_count > 0:
             logger.info(f"Chunk {idx}: masked {masked_count} screenshots")

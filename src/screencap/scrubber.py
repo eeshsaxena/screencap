@@ -290,6 +290,14 @@ def _scrub_screenshots_with_policy(
     # Pre-compute timestamp lists once for all screenshot lookups
     window_timestamps = [w.timestamp for w in window_events] if window_events else []
 
+    # Open a shared connection for geometry lookups (avoids per-screenshot overhead)
+    _geom_conn = None
+    if db_path is not None:
+        try:
+            _geom_conn = sqlite3.connect(str(db_path))
+        except sqlite3.OperationalError:
+            pass
+
     for img_path in sorted(screenshots_dir.glob("*.jpg")):
         ts = parse_screenshot_timestamp(img_path.name)
         if ts is None:
@@ -312,9 +320,9 @@ def _scrub_screenshots_with_policy(
             # Attempt selective masking using per-screenshot window geometry.
             # Falls back to full-frame masking when geometry is unavailable.
             selective_applied = False
-            if db_path is not None:
+            if _geom_conn is not None:
                 try:
-                    geom = load_window_geometry(db_path, ts)
+                    geom = load_window_geometry(db_path, ts, conn=_geom_conn)
                     if geom is not None:
                         from PIL import Image
 
@@ -405,6 +413,9 @@ def _scrub_screenshots_with_policy(
                 evidence_type=ctx.confidence,
             )
         )
+
+    if _geom_conn is not None:
+        _geom_conn.close()
 
 
 # ---------------------------------------------------------------------------
@@ -1583,13 +1594,12 @@ def scrub_recording(
         _pixel_ratio = 2.0  # safe default for Retina Macs
         if db_path:
             try:
-                _pr_conn = sqlite3.connect(str(db_path))
-                _pr_row = _pr_conn.execute(
-                    "SELECT pixel_ratio FROM recording LIMIT 1"
-                ).fetchone()
-                if _pr_row and _pr_row[0]:
-                    _pixel_ratio = float(_pr_row[0])
-                _pr_conn.close()
+                with sqlite3.connect(str(db_path)) as _pr_conn:
+                    _pr_row = _pr_conn.execute(
+                        "SELECT pixel_ratio FROM recording LIMIT 1"
+                    ).fetchone()
+                    if _pr_row and _pr_row[0]:
+                        _pixel_ratio = float(_pr_row[0])
             except (sqlite3.OperationalError, ValueError):
                 pass
 

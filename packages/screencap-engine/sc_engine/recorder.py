@@ -357,19 +357,21 @@ def process_events(
                     and prev_screen_event is not None
                     and retention_filter.check_settle(time.monotonic())):
                 # Privacy filter: suppress settle frame for blocked apps
-                _settle_allowed = (
-                    screen_filter.is_screen_allowed(prev_screen_event.timestamp)
-                    if screen_filter is not None else True
+                _settle_disp = (
+                    screen_filter.get_capture_disposition(prev_screen_event.timestamp)
+                    if screen_filter is not None else None
                 )
-                if not _settle_allowed:
+                _settle_screen_ok = _settle_disp.screen_allowed if _settle_disp is not None else True
+                _settle_video_ok = _settle_disp.video_allowed if _settle_disp is not None else True
+                if not _settle_screen_ok:
                     _drops["privacy_settle_blocked"] += 1
                 else:
                     _drops["screen_settle_save"] += 1
-                    # Re-use existing fan-out: save screen + action-gated video
+                    # Fan-out: save screen; only save video if video is allowed
                     settle_events = [
                         (prev_screen_event, screen_write_q, write_screen_event),
                     ]
-                    if config.RECORD_VIDEO and not config.RECORD_FULL_VIDEO:
+                    if config.RECORD_VIDEO and not config.RECORD_FULL_VIDEO and _settle_video_ok:
                         settle_vid = prev_screen_event._replace(type="screen/video")
                         settle_events.append(
                             (settle_vid, video_write_q, write_video_event),
@@ -414,8 +416,8 @@ def process_events(
             if config.RECORD_FULL_VIDEO:
                 # Privacy filter: skip full-video frames for blocked apps
                 # Uses video_allowed (blocks for both EXCLUDE and MASK_WINDOW)
-                _vid_disp = screen_filter.get_capture_disposition(event.timestamp) if screen_filter is not None else None
-                if _vid_disp is not None and not _vid_disp.video_allowed:
+                _full_vid_disp = screen_filter.get_capture_disposition(event.timestamp) if screen_filter is not None else None
+                if _full_vid_disp is not None and not _full_vid_disp.video_allowed:
                     _drops["privacy_full_video"] += 1
                     # Cloud-intent: push placeholder at 1 FPS instead of gap
                     if _cloud_placeholder:
@@ -438,8 +440,8 @@ def process_events(
                         _drops["full_video"] += 1
             elif _cloud_placeholder and config.RECORD_VIDEO:
                 # Action-gated mode: push placeholder on screen events during blocked intervals
-                _vid_disp2 = screen_filter.get_capture_disposition(event.timestamp) if screen_filter is not None else None
-                if _vid_disp2 is not None and not _vid_disp2.video_allowed:
+                _gated_vid_disp = screen_filter.get_capture_disposition(event.timestamp) if screen_filter is not None else None
+                if _gated_vid_disp is not None and not _gated_vid_disp.video_allowed:
                     _push_placeholder_if_due(event.timestamp, event.data)
                 else:
                     _end_blocked_interval_if_active(event.timestamp)

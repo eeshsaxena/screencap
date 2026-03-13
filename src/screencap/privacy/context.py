@@ -15,6 +15,7 @@ Owns:
 from __future__ import annotations
 
 import bisect
+import json
 import re
 import sqlite3
 from dataclasses import dataclass
@@ -134,16 +135,23 @@ class WindowGeometrySnapshot:
 def load_window_geometry(
     db_path: Path,
     screenshot_timestamp: float,
+    conn: sqlite3.Connection | None = None,
 ) -> WindowGeometrySnapshot | None:
     """Load the window geometry snapshot for a screenshot timestamp.
 
     Queries the ``window_geometry`` table for an exact timestamp match.
     Returns a ``WindowGeometrySnapshot`` or ``None`` if unavailable
     (old recordings without the table, capture failure, etc.).
-    """
-    import json as _json
 
-    conn = sqlite3.connect(str(db_path))
+    Args:
+        db_path: Path to the recording database.
+        screenshot_timestamp: Exact timestamp to look up.
+        conn: Optional open connection to reuse (avoids per-call overhead
+            when loading geometry for many screenshots in a loop).
+    """
+    own_conn = conn is None
+    if own_conn:
+        conn = sqlite3.connect(str(db_path))
     try:
         cur = conn.cursor()
         # Check table existence (graceful for old recordings)
@@ -162,7 +170,7 @@ def load_window_geometry(
         if row is None or row[0] is None:
             return None
 
-        data = _json.loads(row[0])
+        data = json.loads(row[0])
 
         # Handle both formats:
         # New: {"windows": [...], "display_bounds": [x, y, w, h]}
@@ -176,10 +184,11 @@ def load_window_geometry(
             origin = (0.0, 0.0)
 
         return WindowGeometrySnapshot(windows=windows, display_origin=origin)
-    except (sqlite3.OperationalError, _json.JSONDecodeError):
+    except (sqlite3.OperationalError, json.JSONDecodeError):
         return None
     finally:
-        conn.close()
+        if own_conn:
+            conn.close()
 
 
 def load_window_events(db_path: Path) -> list[WindowContext]:
