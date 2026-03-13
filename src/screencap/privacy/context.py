@@ -123,6 +123,43 @@ def find_nearest_window(
 # ---------------------------------------------------------------------------
 
 
+def load_window_geometry(
+    db_path: Path,
+    screenshot_timestamp: float,
+) -> list[dict] | None:
+    """Load the window geometry snapshot for a screenshot timestamp.
+
+    Queries the ``window_geometry`` table for an exact timestamp match.
+    Returns the parsed JSON window list, or ``None`` if unavailable
+    (old recordings without the table, capture failure, etc.).
+    """
+    import json as _json
+
+    conn = sqlite3.connect(str(db_path))
+    try:
+        cur = conn.cursor()
+        # Check table existence (graceful for old recordings)
+        tables = {r[0] for r in cur.execute(
+            "SELECT name FROM sqlite_master WHERE type='table'"
+        ).fetchall()}
+        if "window_geometry" not in tables:
+            return None
+
+        cur.execute(
+            "SELECT window_list_json FROM window_geometry "
+            "WHERE screenshot_timestamp = ? LIMIT 1",
+            (screenshot_timestamp,),
+        )
+        row = cur.fetchone()
+        if row is None or row[0] is None:
+            return None
+        return _json.loads(row[0])
+    except (sqlite3.OperationalError, _json.JSONDecodeError):
+        return None
+    finally:
+        conn.close()
+
+
 def load_window_events(db_path: Path) -> list[WindowContext]:
     """Load window_event rows sorted by timestamp."""
     conn = sqlite3.connect(str(db_path))

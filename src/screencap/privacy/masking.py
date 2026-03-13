@@ -121,6 +121,93 @@ def pane_geometry(
 
 
 # ---------------------------------------------------------------------------
+# Per-window selective masking from stored geometry
+# ---------------------------------------------------------------------------
+
+
+def window_regions_from_geometry(
+    window_list: list[dict],
+    image_width: int,
+    image_height: int,
+    pixel_ratio: float,
+    classifier,
+    evaluator,
+    display_origin: tuple[float, float] = (0.0, 0.0),
+) -> list[MaskRegion]:
+    """Generate mask regions from per-screenshot window geometry.
+
+    Evaluates each window's bundle_id against the privacy policy and
+    returns a ``MaskRegion`` for every window whose action is EXCLUDE
+    or MASK_WINDOW.
+
+    Args:
+        window_list: Parsed JSON array from ``window_geometry.window_list_json``.
+        image_width: Screenshot width in pixels.
+        image_height: Screenshot height in pixels.
+        pixel_ratio: Retina scaling factor (1.0 or 2.0).
+        classifier: ``DefaultContextClassifier`` instance.
+        evaluator: ``DefaultPolicyEvaluator`` instance.
+        display_origin: ``(x, y)`` origin of the main display in global
+            coordinates. Window bounds are offset by this to map to the
+            screenshot coordinate space.
+
+    Returns:
+        List of ``MaskRegion`` for all sensitive windows.
+    """
+    from screencap.privacy.actions import BLOCK_ACTIONS, KEYSTROKE_NULL_ACTIONS
+    from screencap.privacy.policy import FrameMetadata
+
+    # Union of BLOCK_ACTIONS + KEYSTROKE_NULL_ACTIONS covers both EXCLUDE
+    # and MASK_WINDOW. Both should be masked in the screenshot.
+    mask_actions = BLOCK_ACTIONS | KEYSTROKE_NULL_ACTIONS
+
+    regions: list[MaskRegion] = []
+    disp_x, disp_y = display_origin
+
+    for win in window_list:
+        bundle_id = win.get("bundle_id", "")
+        if not bundle_id:
+            continue
+
+        meta = FrameMetadata(
+            bundle_id=bundle_id,
+            window_title=win.get("app_name", ""),
+            domain=None,
+            timestamp=0.0,
+        )
+        ctx = classifier.classify(meta)
+        decision = evaluator.evaluate(ctx, meta)
+
+        if decision.action not in mask_actions:
+            continue
+
+        # Convert from logical points to screenshot pixels
+        raw_x = (win.get("x", 0) - disp_x) * pixel_ratio
+        raw_y = (win.get("y", 0) - disp_y) * pixel_ratio
+        raw_w = win.get("width", 0) * pixel_ratio
+        raw_h = win.get("height", 0) * pixel_ratio
+
+        # Clip to image bounds — skip windows entirely outside
+        x1 = max(0, int(raw_x))
+        y1 = max(0, int(raw_y))
+        x2 = min(image_width, int(raw_x + raw_w))
+        y2 = min(image_height, int(raw_y + raw_h))
+
+        if x2 <= x1 or y2 <= y1:
+            continue  # window entirely outside screenshot bounds
+
+        regions.append(MaskRegion(
+            x=x1,
+            y=y1,
+            width=x2 - x1,
+            height=y2 - y1,
+            label=ctx.context_class.value,
+        ))
+
+    return regions
+
+
+# ---------------------------------------------------------------------------
 # Image mask rendering
 # ---------------------------------------------------------------------------
 
@@ -166,27 +253,46 @@ def mask_screenshot(
     context_class: ContextClass,
     strategy: MaskStrategy | None = None,
     app_hint: str = "",
+    regions: list[MaskRegion] | None = None,
 ) -> bool:
     """Apply structural masking to a screenshot based on context.
+
+    If ``regions`` is provided, masks only those specific regions
+    (selective per-window masking). Otherwise uses the full-window or
+    pane strategy.
 
     Returns True if masking was applied, False if no masking strategy
     exists for this context (caller should handle via other means).
     """
+    from PIL import Image
+
+    # Selective masking with pre-computed regions
+    if regions is not None:
+        if not regions:
+            return False  # no regions to mask
+        with Image.open(image_path) as probe:
+            converted = probe.convert("RGB")
+        try:
+            _apply_mask_to_image(converted, regions)
+            converted.save(image_path, "JPEG", quality=85, exif=b"")
+        finally:
+            converted.close()
+        return True
+
+    # Strategy-based masking (original behavior)
     if strategy is None:
         strategy = get_mask_strategy(context_class)
     if strategy is None:
         return False
-
-    from PIL import Image
 
     if strategy == MaskStrategy.FULL_WINDOW:
         # Read dimensions without decoding pixel data, then create blank image
         with Image.open(image_path) as probe:
             w, h = probe.size
         img = Image.new("RGB", (w, h), _MASK_COLOR)
-        regions = full_window_geometry(w, h, context_class)
+        full_regions = full_window_geometry(w, h, context_class)
         # Draw labels on the blank image
-        _apply_mask_to_image(img, regions)
+        _apply_mask_to_image(img, full_regions)
         img.save(image_path, "JPEG", quality=85, exif=b"")
         img.close()
     else:
@@ -194,8 +300,8 @@ def mask_screenshot(
             converted = probe.convert("RGB")
         try:
             w, h = converted.size
-            regions = pane_geometry(w, h, context_class, app_hint)
-            _apply_mask_to_image(converted, regions)
+            pane_regions = pane_geometry(w, h, context_class, app_hint)
+            _apply_mask_to_image(converted, pane_regions)
             converted.save(image_path, "JPEG", quality=85, exif=b"")
         finally:
             converted.close()
