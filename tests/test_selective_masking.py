@@ -626,3 +626,31 @@ class TestBackgroundWindowMasking:
         img_path = screenshots_dir / "100.0.jpg"
         assert img_path.exists()
         assert _avg_brightness(img_path) > 200, "No geometry = no masking"
+
+    def test_text_redact_background_masked_on_scrub(self, tmp_path):
+        """ALLOW foreground + TEXT_REDACT background (Slack in internal mode):
+        Slack region masked because we can't text-redact a partial region."""
+        from PIL import Image
+
+        # Internal mode: CODE_EDITOR_TERMINAL → ALLOW, CHAT → TEXT_REDACT
+        img_path, result = self._setup_scrub(
+            tmp_path,
+            foreground_bundle="com.microsoft.VSCode",
+            foreground_title="main.py",
+            evaluator_kwargs={"mode": "internal"},
+            geometry_windows=[
+                {"bundle_id": "com.microsoft.VSCode", "app_name": "VS Code",
+                 "x": 0, "y": 0, "width": 100, "height": 150},
+                {"bundle_id": "com.tinyspeck.slackmacgap", "app_name": "Slack",
+                 "x": 100, "y": 0, "width": 100, "height": 150},
+            ],
+        )
+
+        assert img_path.exists()
+        img = Image.open(img_path).convert("RGB")
+        left_pixel = img.getpixel((25, 130))   # VS Code area
+        right_pixel = img.getpixel((150, 130))  # Slack area
+        img.close()
+
+        assert all(c > 200 for c in left_pixel), f"VS Code should be unmasked: {left_pixel}"
+        assert all(c < 50 for c in right_pixel), f"Slack (TEXT_REDACT) should be masked: {right_pixel}"

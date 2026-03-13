@@ -96,11 +96,11 @@ _ACTION_MATRIX: dict[tuple[ContextClass, PrivacyMode], PrivacyAction] = {
     (ContextClass.BROWSER_UNVERIFIED, PrivacyMode.SHARED): PrivacyAction.OCR_FALLBACK,
     (ContextClass.BROWSER_UNVERIFIED, PrivacyMode.INTERNAL): PrivacyAction.ALLOW,
     # code_editor_terminal
-    (ContextClass.CODE_EDITOR_TERMINAL, PrivacyMode.PUBLIC): PrivacyAction.OCR_FALLBACK,
+    (ContextClass.CODE_EDITOR_TERMINAL, PrivacyMode.PUBLIC): PrivacyAction.TEXT_REDACT,
     (ContextClass.CODE_EDITOR_TERMINAL, PrivacyMode.SHARED): PrivacyAction.TEXT_REDACT,
     (ContextClass.CODE_EDITOR_TERMINAL, PrivacyMode.INTERNAL): PrivacyAction.ALLOW,
     # admin_console
-    (ContextClass.ADMIN_CONSOLE, PrivacyMode.PUBLIC): PrivacyAction.OCR_FALLBACK,
+    (ContextClass.ADMIN_CONSOLE, PrivacyMode.PUBLIC): PrivacyAction.TEXT_REDACT,
     (ContextClass.ADMIN_CONSOLE, PrivacyMode.SHARED): PrivacyAction.TEXT_REDACT,
     (ContextClass.ADMIN_CONSOLE, PrivacyMode.INTERNAL): PrivacyAction.ALLOW,
     # auth_flow — login/SSO pages get maximum protection

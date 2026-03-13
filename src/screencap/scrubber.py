@@ -406,8 +406,16 @@ def _scrub_screenshots_with_policy(
         # --- Background masking for ALLOW / TEXT_REDACT ---
         # The foreground app is safe, but sensitive background windows
         # (Slack, Mail, etc.) may be visible behind it. Load stored
-        # window geometry and mask any background windows that evaluate
-        # to EXCLUDE or MASK_WINDOW.
+        # window geometry and mask any background window whose action
+        # is stricter than ALLOW. We can't text-redact a partial
+        # screenshot region, so masking is the only safe option.
+        _BG_MASK_ACTIONS = frozenset({
+            PrivacyAction.EXCLUDE,
+            PrivacyAction.MASK_WINDOW,
+            PrivacyAction.MASK_REGION,
+            PrivacyAction.TEXT_REDACT,
+            PrivacyAction.OCR_FALLBACK,
+        })
         bg_masked = False
         if decision.action in (PrivacyAction.ALLOW, PrivacyAction.TEXT_REDACT):
             if _geom_conn is not None and img_path.exists():
@@ -422,6 +430,7 @@ def _scrub_screenshots_with_policy(
                             geom.windows, img_w, img_h, pixel_ratio,
                             classifier, evaluator,
                             display_origin=geom.display_origin,
+                            mask_actions=_BG_MASK_ACTIONS,
                         )
                         if regions:
                             mask_screenshot(

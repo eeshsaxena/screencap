@@ -161,10 +161,14 @@ def load_window_geometry(
         if "window_geometry" not in tables:
             return None
 
+        # Use tolerance-based lookup: screenshot filenames lose float
+        # precision (e.g. 1773413585.910469 vs DB 1773413585.9104693).
+        # 1ms tolerance is safely within a single screenshot interval.
         cur.execute(
             "SELECT window_list_json FROM window_geometry "
-            "WHERE screenshot_timestamp = ? LIMIT 1",
-            (screenshot_timestamp,),
+            "WHERE abs(screenshot_timestamp - ?) < 0.001 "
+            "ORDER BY abs(screenshot_timestamp - ?) LIMIT 1",
+            (screenshot_timestamp, screenshot_timestamp),
         )
         row = cur.fetchone()
         if row is None or row[0] is None:

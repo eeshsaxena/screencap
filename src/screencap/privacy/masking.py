@@ -15,7 +15,7 @@ from dataclasses import dataclass
 from enum import Enum
 from pathlib import Path
 
-from screencap.privacy.actions import KEYSTROKE_NULL_ACTIONS
+from screencap.privacy.actions import KEYSTROKE_NULL_ACTIONS, PrivacyAction
 from screencap.privacy.policy import ContextClass, FrameMetadata
 
 
@@ -134,12 +134,13 @@ def window_regions_from_geometry(
     classifier,
     evaluator,
     display_origin: tuple[float, float] = (0.0, 0.0),
+    mask_actions: frozenset[PrivacyAction] | None = None,
 ) -> list[MaskRegion]:
     """Generate mask regions from per-screenshot window geometry.
 
     Evaluates each window's bundle_id against the privacy policy and
-    returns a ``MaskRegion`` for every window whose action is EXCLUDE
-    or MASK_WINDOW.
+    returns a ``MaskRegion`` for every window whose action is in
+    ``mask_actions``.
 
     Args:
         window_list: Parsed JSON array from ``window_geometry.window_list_json``.
@@ -151,12 +152,16 @@ def window_regions_from_geometry(
         display_origin: ``(x, y)`` origin of the main display in global
             coordinates. Window bounds are offset by this to map to the
             screenshot coordinate space.
+        mask_actions: Set of ``PrivacyAction`` values that trigger masking.
+            Defaults to ``KEYSTROKE_NULL_ACTIONS`` (EXCLUDE, MASK_WINDOW).
+            Background masking should pass a broader set since we can't
+            text-redact a partial screenshot region.
 
     Returns:
         List of ``MaskRegion`` for all sensitive windows.
     """
-    # KEYSTROKE_NULL_ACTIONS = {EXCLUDE, MASK_WINDOW} — both should be masked.
-    mask_actions = KEYSTROKE_NULL_ACTIONS
+    if mask_actions is None:
+        mask_actions = KEYSTROKE_NULL_ACTIONS
 
     regions: list[MaskRegion] = []
     disp_x, disp_y = display_origin
