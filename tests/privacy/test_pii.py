@@ -115,6 +115,21 @@ class TestPersonAllowlist:
         persons = [d for d in dets if d.entity_type == EntityType.PERSON]
         assert len(persons) == 0
 
+    def test_token_match_suppresses_single_word_from_multiword_app(self):
+        """Token from multi-word allowlist entry suppresses PERSON for that word.
+
+        Real scenario: "Google Chrome" in allowlist (from system_metrics.json),
+        but NER detects standalone "Google" in keystroke text.
+        """
+        det = PiiDetector(
+            person_threshold=0.0,
+            person_allowlist=frozenset({"google chrome"}),
+            ner_backend="spacy",
+        )
+        dets = det.detect("Google logged in")
+        persons = [d for d in dets if d.entity_type == EntityType.PERSON]
+        assert len(persons) == 0
+
 
 class TestOffsets:
     def test_offset_correctness(self, detector: PiiDetector):

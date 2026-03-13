@@ -299,6 +299,46 @@ FALSE_POSITIVES = [
         expected=[],
         is_false_positive=True,
     ),
+    CorpusCase(
+        id="fp-13",
+        description="App name (Docker)",
+        text="Docker Desktop — Containers",
+        expected=[],
+        is_false_positive=True,
+        frequency=Frequency.MEDIUM,
+    ),
+    CorpusCase(
+        id="fp-14",
+        description="App name (Figma)",
+        text="Figma — Design System",
+        expected=[],
+        is_false_positive=True,
+        frequency=Frequency.MEDIUM,
+    ),
+    CorpusCase(
+        id="fp-15",
+        description="App name (Safari)",
+        text="Safari — Google Search",
+        expected=[],
+        is_false_positive=True,
+        frequency=Frequency.HIGH,
+    ),
+    CorpusCase(
+        id="fp-16",
+        description="CLI tool name (Cargo)",
+        text="Cargo build --release",
+        expected=[],
+        is_false_positive=True,
+        frequency=Frequency.HIGH,
+    ),
+    CorpusCase(
+        id="fp-17",
+        description="CLI tool name (kubectl)",
+        text="kubectl get pods -n production",
+        expected=[],
+        is_false_positive=True,
+        frequency=Frequency.MEDIUM,
+    ),
 ]
 
 # ---------------------------------------------------------------------------

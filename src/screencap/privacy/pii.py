@@ -32,6 +32,14 @@ class PiiDetector:
     ) -> None:
         self._person_threshold = person_threshold
         self._person_allowlist = person_allowlist
+        # Token-level allowlist: split each multi-word entry and keep tokens >= 3 chars.
+        # Whitespace-only split preserves "Terminal.app" as one token (no dot/hyphen split).
+        self._person_allowlist_tokens: frozenset[str] = frozenset(
+            token.lower()
+            for entry in person_allowlist
+            for token in entry.split()
+            if len(token) >= 3
+        )
 
         if ner_backend == "gliner":
             self._source = "pii-gliner"
@@ -94,6 +102,9 @@ class PiiDetector:
                 span = text[result.start : result.end].lower()
                 if span in self._person_allowlist:
                     logger.debug("Allowlist suppressed PERSON detection (len=%d)", len(span))
+                    continue
+                if span in self._person_allowlist_tokens:
+                    logger.debug("Token-allowlist suppressed PERSON (len=%d)", len(span))
                     continue
 
             detections.append(

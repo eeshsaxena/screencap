@@ -27,6 +27,35 @@ _UI_KEYWORDS = frozenset({
     "sent", "drafts", "more", "trash", "spam", "archive",
 })
 
+# Software/app/tool names that NER models misclassify as PERSON.
+# Individual words only (full-span matching via span.strip().lower()).
+# Names < 4 chars excluded — already caught by _reject_short_person.
+_SOFTWARE_NAMES = frozenset({
+    # macOS apps
+    "safari", "chrome", "firefox", "slack", "discord", "telegram",
+    "whatsapp", "signal", "notion", "figma", "sketch", "xcode",
+    "finder", "keynote", "pages", "numbers",
+    # Terminals / editors
+    "ghostty", "kitty", "alacritty", "iterm", "wezterm", "hyper",
+    "vscode", "sublime", "neovim", "emacs",
+    # CLI tools
+    "homebrew", "cargo", "rustup", "yarn", "pnpm", "pipx", "conda",
+    "docker", "kubectl", "kubernetes", "terraform", "ansible", "vagrant",
+    "gradle", "maven", "cmake", "webpack", "vite", "pytest", "jest", "ruff",
+    # Products / services
+    "github", "gitlab", "bitbucket", "jira", "linear", "vercel",
+    "netlify", "heroku", "cloudflare", "datadog", "sentry", "grafana",
+    "prometheus", "elasticsearch", "redis", "postgres", "mongodb",
+    "mysql", "nginx", "apache", "bitwarden",
+    # Languages (where name != common person name)
+    "python", "golang", "typescript", "javascript", "kotlin", "swift",
+    "elixir", "clojure", "haskell", "erlang", "scala", "fortran",
+    "cobol", "perl", "rust",
+    # Ambiguous but accepted trade-off — tool names far more common than
+    # person names in dev screen recordings
+    "ruby", "julia", "hugo",
+})
+
 _SSN_RE = re.compile(r"\d{3}-\d{2}-\d{4}")
 
 
@@ -45,6 +74,8 @@ class HeuristicFilter:
             if self._reject_month_person(span):
                 return True
             if self._reject_ui_keyword_person(span):
+                return True
+            if self._reject_app_name_person(span):
                 return True
 
         if det.entity_type == EntityType.ADDRESS:
@@ -88,6 +119,16 @@ class HeuristicFilter:
         in accessibility text from menu bars and sidebars.
         """
         return span.strip().lower() in _UI_KEYWORDS
+
+    @staticmethod
+    def _reject_app_name_person(span: str) -> bool:
+        """Reject PERSON matching known software/app/tool names.
+
+        Why: GLiNER flags capitalized app names (Ghostty, Homebrew, Docker)
+        as PERSON. These appear constantly in window titles, terminal output,
+        and accessibility text during dev screen recordings.
+        """
+        return span.strip().lower() in _SOFTWARE_NAMES
 
     @staticmethod
     def _reject_unicode_block_address(span: str) -> bool:

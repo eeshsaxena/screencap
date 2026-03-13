@@ -63,6 +63,29 @@ class TestRejectUiKeywordPerson:
         assert hf.filter(keyword, [det]) == []
 
 
+class TestRejectAppNamePerson:
+    def test_reject_app_name_in_window_title(self, hf: HeuristicFilter):
+        """'Docker' in window title flagged as PERSON — should be rejected.
+
+        Real scenario: GLiNER flags 'Docker' in 'Docker Desktop — Containers'
+        as PERSON. Proves the _SOFTWARE_NAMES mechanism works.
+        Case insensitivity tested implicitly (input 'Docker', set has 'docker').
+        """
+        text = "Docker Desktop — Containers"
+        det = _det(EntityType.PERSON, 0, 6)  # "Docker"
+        assert hf.filter(text, [det]) == []
+
+    def test_real_person_not_rejected_as_software(self, hf: HeuristicFilter):
+        """Real person names must survive the software name filter.
+
+        Safety check: if the set grows too broad or matching changes,
+        this catches it. Uses names >= 4 chars to isolate from _reject_short_person.
+        """
+        for name in ("Alice", "Sarah", "Robert", "James"):
+            det = _det(EntityType.PERSON, 0, len(name))
+            assert len(hf.filter(name, [det])) == 1, f"{name} should not be rejected"
+
+
 class TestKeepRealPerson:
     def test_keep_short_real_name(self, hf: HeuristicFilter):
         """'Li Wei' — 6 chars, passes short-person filter and is not a keyword/month."""
