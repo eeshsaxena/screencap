@@ -727,8 +727,8 @@ def _download_nlp_models() -> None:
     try:
         from screencap.privacy.pii import PiiDetector
 
-        with console.status("[bold]Downloading privacy models...[/bold]"):
-            PiiDetector()  # triggers HuggingFace download + spaCy model load
+        console.print("  Downloading privacy models (this may take a few minutes)...")
+        PiiDetector()  # triggers HuggingFace download + spaCy model load
         console.print("  [bold #22d3ee]\u2705 Privacy models downloaded[/bold #22d3ee]")
     except Exception as e:
         console.print(
