@@ -93,6 +93,29 @@ def _report_unclassified_apps(capture_dir) -> None:
     console.print("  Run [bold]screencap setup --scan[/bold] to classify them.")
 
 
+def _maybe_download_nlp_models() -> None:
+    """Download GLiNER + spaCy models if not already cached."""
+    import os
+    from pathlib import Path
+
+    cache_dir = Path(os.environ.get("HF_HOME", "~/.cache/huggingface")).expanduser() / "hub"
+    model_dir = cache_dir / "models--knowledgator--gliner-pii-base-v1.0"
+    if (model_dir / "snapshots").exists():
+        return  # already cached
+
+    console.print(
+        "\n[bold]Privacy models not yet downloaded.[/bold] "
+        "These are needed for scrubbing and cloud upload."
+    )
+    if click.confirm("Download now?", default=True):
+        from screencap.setup_wizard import _download_nlp_models
+        _download_nlp_models()
+    else:
+        console.print(
+            "[dim]Skipped. Models will download on first scrub or upload.[/dim]"
+        )
+
+
 def _maybe_prompt_privacy_setup() -> None:
     """Prompt for privacy setup on first run if [privacy] section is missing."""
     import sys as _sys  # use real sys, not the module-level reference
@@ -109,7 +132,9 @@ def _maybe_prompt_privacy_setup() -> None:
         cfg = _load_toml()
         privacy_section = cfg.get("privacy")
         if privacy_section is not None:
-            # Has a [privacy] section (even if empty or has setup_skipped)
+            # Has a [privacy] section — check if NLP models need downloading
+            if not getattr(_sys, "frozen", False):
+                _maybe_download_nlp_models()
             return
 
     console.print(
