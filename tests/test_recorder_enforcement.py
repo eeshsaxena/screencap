@@ -658,3 +658,112 @@ class TestBlockedIntervalTracking:
         intervals = f.get_blocked_intervals(90.0, 120.0)
         assert len(intervals) == 1
         assert intervals[0]["start_ts"] == 100.0
+
+
+class TestMaskFrame:
+    """Tests for mask_frame() — per-frame background window masking."""
+
+    def test_mask_frame_masks_slack_window_region(self):
+        """Cloud-intent mask_frame blurs Slack window regions in the image."""
+        from PIL import Image
+
+        config = _make_config(mode=PrivacyMode.INTERNAL)
+        f = RecorderPrivacyFilter(
+            config, cloud_intent=True, transition_hold_seconds=0.0,
+            secure_input_fn=None,
+        )
+
+        # White 200x200 image at 1x pixel ratio
+        img = Image.new("RGB", (200, 200), (255, 255, 255))
+
+        geometry = {
+            "windows": [
+                {
+                    "bundle_id": "com.tinyspeck.slackmacgap",
+                    "app_name": "Slack",
+                    "x": 10, "y": 10, "width": 50, "height": 50,
+                },
+            ],
+            "display_bounds": (0, 0, 200, 200),
+        }
+
+        f.mask_frame(img, geometry, pixel_ratio=1.0)
+
+        # The Slack region (10,10)-(60,60) should be masked (not white)
+        masked_pixel = img.getpixel((30, 30))
+        assert masked_pixel != (255, 255, 255), "Slack region should be masked"
+
+        # A pixel outside the Slack window should be unchanged
+        clean_pixel = img.getpixel((150, 150))
+        assert clean_pixel == (255, 255, 255), "Non-Slack region should be clean"
+        img.close()
+
+    def test_mask_frame_noop_without_cloud_intent(self):
+        """mask_frame is a no-op for local (non-cloud) recordings."""
+        from PIL import Image
+
+        config = _make_config(mode=PrivacyMode.INTERNAL)
+        f = RecorderPrivacyFilter(
+            config, cloud_intent=False, transition_hold_seconds=0.0,
+            secure_input_fn=None,
+        )
+
+        img = Image.new("RGB", (100, 100), (255, 255, 255))
+        geometry = {
+            "windows": [
+                {"bundle_id": "com.tinyspeck.slackmacgap", "app_name": "Slack",
+                 "x": 0, "y": 0, "width": 50, "height": 50},
+            ],
+            "display_bounds": (0, 0, 100, 100),
+        }
+
+        f.mask_frame(img, geometry, pixel_ratio=1.0)
+
+        # Should NOT be masked — local recording
+        pixel = img.getpixel((25, 25))
+        assert pixel == (255, 255, 255)
+        img.close()
+
+    def test_mask_frame_noop_with_no_geometry(self):
+        """mask_frame handles None geometry gracefully."""
+        from PIL import Image
+
+        config = _make_config()
+        f = RecorderPrivacyFilter(
+            config, cloud_intent=True, transition_hold_seconds=0.0,
+            secure_input_fn=None,
+        )
+
+        img = Image.new("RGB", (100, 100), (255, 255, 255))
+        f.mask_frame(img, None, pixel_ratio=1.0)
+
+        # Should NOT be masked — no geometry
+        pixel = img.getpixel((50, 50))
+        assert pixel == (255, 255, 255)
+        img.close()
+
+    def test_mask_frame_leaves_code_editor_unmasked(self):
+        """Code editors (even in public mode) get TEXT_REDACT, not MASK_WINDOW."""
+        from PIL import Image
+
+        config = _make_config(mode=PrivacyMode.INTERNAL)
+        f = RecorderPrivacyFilter(
+            config, cloud_intent=True, transition_hold_seconds=0.0,
+            secure_input_fn=None,
+        )
+
+        img = Image.new("RGB", (200, 200), (255, 255, 255))
+        geometry = {
+            "windows": [
+                {"bundle_id": "com.microsoft.VSCode", "app_name": "Visual Studio Code",
+                 "x": 0, "y": 0, "width": 100, "height": 100},
+            ],
+            "display_bounds": (0, 0, 200, 200),
+        }
+
+        f.mask_frame(img, geometry, pixel_ratio=1.0)
+
+        # VSCode in public mode → TEXT_REDACT (not MASK_WINDOW) → no pixel masking
+        pixel = img.getpixel((50, 50))
+        assert pixel == (255, 255, 255)
+        img.close()
