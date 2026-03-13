@@ -351,8 +351,8 @@ class TestInlineScrubbing:
         assert not events_path.exists()
         assert (cloud_capture_dir / "events_0000.jsonl.scrub_failed").exists()
 
-    def test_scrub_v2_key_type_nulls_pii(self, cloud_capture_dir, cloud_processor):
-        """v2 format: key.type text with PII should be nulled, children key_char too."""
+    def test_scrub_v2_key_type_anonymizes_pii(self, cloud_capture_dir, cloud_processor):
+        """v2 format: key.type text with PII → anonymized, children key_char nulled."""
         events = [
             {"_meta": True, "format_version": 2},
             {
@@ -377,7 +377,9 @@ class TestInlineScrubbing:
 
         scrubbed = [json.loads(line) for line in events_path.read_text().splitlines() if line.strip()]
         key_type = scrubbed[1]
-        assert key_type["text"] is None
+        # Text is anonymized (not null) — preserves context for downstream LLM
+        assert "John Smith" not in str(key_type["text"])
+        assert key_type["text"] is not None
         for child in key_type["children"]:
             assert child["key_char"] is None
 
@@ -403,8 +405,8 @@ class TestInlineScrubbing:
         scrubbed = [json.loads(line) for line in events_path.read_text().splitlines() if line.strip()]
         assert scrubbed[1]["text"] == "hello world"
 
-    def test_scrub_v2_key_shortcut_nulls_pii(self, cloud_capture_dir, cloud_processor):
-        """v2 format: key.shortcut with PII should null text and children key_char."""
+    def test_scrub_v2_key_shortcut_anonymizes_pii(self, cloud_capture_dir, cloud_processor):
+        """v2 format: key.shortcut with PII → text anonymized via recursive scrub."""
         events = [
             {"_meta": True, "format_version": 2},
             {
@@ -427,9 +429,8 @@ class TestInlineScrubbing:
 
         scrubbed = [json.loads(line) for line in events_path.read_text().splitlines() if line.strip()]
         shortcut = scrubbed[1]
-        assert shortcut["text"] is None
-        for child in shortcut["children"]:
-            assert child["key_char"] is None
+        # Text is anonymized by _scrub_json_recursive (not targeted key.type handler)
+        assert "John Smith" not in str(shortcut["text"])
 
     def test_scrub_v2_window_switch_title(self, cloud_capture_dir, cloud_processor):
         """v2 format: window.switch window_title with PII should be scrubbed."""

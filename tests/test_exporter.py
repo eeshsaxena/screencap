@@ -233,3 +233,36 @@ def test_privacy_filter_masks_titles(tmp_path):
     assert count == 1
     ws = json.loads(open(out_file).read().strip())
     assert ws["window_title"] == "Finder"  # masked to app_name
+
+
+def test_build_privacy_filter_cloud_intent_forces_public_mode():
+    """cloud_intent=True overrides configured privacy mode to public.
+
+    The public mode action matrix treats CHAT apps (Slack, Teams) as
+    MASK_WINDOW instead of TEXT_REDACT, which replaces the window title
+    with the app name — preventing leakage of Slack channel names etc.
+    """
+    from screencap.exporter import build_privacy_filter
+
+    # Slack (com.tinyspeck.slackmacgap) is classified as CHAT.
+    # internal mode → TEXT_REDACT (passes through with scrubbing).
+    # public mode → MASK_WINDOW (replaces title with app name).
+    slack_event = _make_window_switch(
+        ts=1.0, bundle_id="com.tinyspeck.slackmacgap", title="#secret-channel",
+    )
+    # model_copy to set app_name since _make_window_switch uses "Finder"
+    slack_event = slack_event.model_copy(update={"app_name": "Slack"})
+
+    # With cloud_intent=True, even if configured as "internal", should use public
+    pf_cloud = build_privacy_filter(privacy_mode="internal", cloud_intent=True)
+    result = pf_cloud(slack_event)
+    # MASK_WINDOW → title replaced with app name
+    assert result is not None
+    assert result.window_title == "Slack"
+    assert result.domain is None
+
+    # Without cloud_intent, internal mode lets CHAT through with original title
+    pf_local = build_privacy_filter(privacy_mode="internal", cloud_intent=False)
+    result_local = pf_local(slack_event)
+    assert result_local is not None
+    assert result_local.window_title == "#secret-channel"

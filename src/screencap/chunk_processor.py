@@ -96,9 +96,15 @@ class ChunkProcessor:
             try:
                 from screencap.config import get_privacy_config
                 from screencap.privacy.context import DefaultContextClassifier
-                from screencap.privacy.policy import DefaultPolicyEvaluator
+                from screencap.privacy.policy import DefaultPolicyEvaluator, PrivacyMode
 
                 _pc = get_privacy_config()
+                # Cloud uploads must use public mode so that CHAT/EMAIL/etc.
+                # apps get MASK_WINDOW (blurred in screenshots) instead of
+                # TEXT_REDACT (which only scrubs text, not visuals).
+                if self._cloud_intent:
+                    from dataclasses import replace as _dc_replace
+                    _pc = _dc_replace(_pc, mode=PrivacyMode.PUBLIC)
                 self._masking_evaluator = DefaultPolicyEvaluator(_pc)
                 self._masking_classifier = DefaultContextClassifier(
                     app_classes=_pc.app_classes,
@@ -765,48 +771,20 @@ class ChunkProcessor:
         return self._anonymizer.anonymize(result.normalized_text, result.detections)
 
     def _scrub_events_jsonl(self, path: Path) -> None:
-        """Scrub PII in events JSONL (v2 unified format).
+        """Scrub PII in events JSONL using the shared scrubber function.
 
-        - ``key.type`` events: detect PII in ``text`` field, null ``text``
-          and ``children[*].key_char`` if detected.
-        - ``key.shortcut`` events: same as key.type.
-        - ``window.switch`` events: scrub ``window_title`` field.
+        Delegates to ``scrub_events_jsonl()`` from the scrubber module for
+        full-depth recursive scrubbing of all string fields in all events.
         """
-        lines = path.read_text(encoding="utf-8").splitlines()
-        events = []
-        for line in lines:
-            if line.strip():
-                events.append(json.loads(line))
+        from screencap.scrubber import scrub_events_jsonl
 
-        for evt in events:
-            if evt.get("_meta"):
-                continue
-
-            evt_type = evt.get("type", "")
-
-            # key.type / key.shortcut: detect PII in text, null text + children key_char
-            if evt_type in ("key.type", "key.shortcut"):
-                text = evt.get("text", "")
-                if text and len(text) >= 4:
-                    scrubbed = self._scrub_text_field(text)
-                    if scrubbed != text:
-                        evt["text"] = None
-                        for child in evt.get("children", []):
-                            if "key_char" in child:
-                                child["key_char"] = None
-
-            # window.switch: scrub window_title
-            elif evt_type == "window.switch":
-                title = evt.get("window_title", "")
-                if title:
-                    evt["window_title"] = self._scrub_text_field(title)
-
-        # Atomic write
-        tmp_path = str(path) + ".tmp"
-        with open(tmp_path, "w", encoding="utf-8") as f:
-            for evt in events:
-                f.write(json.dumps(evt) + "\n")
-        os.rename(tmp_path, str(path))
+        had_errors = scrub_events_jsonl(
+            events_jsonl=path,
+            pipeline=self._pipeline,
+            anonymizer=self._anonymizer,
+        )
+        if had_errors:
+            _rename_scrub_failed(path)
 
     def _scrub_transcript_txt(self, path: Path) -> None:
         """Scrub PII from transcript .txt file."""

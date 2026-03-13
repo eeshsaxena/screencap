@@ -412,6 +412,13 @@ def process_events(
                 # behavior undefined, swallow for now
                 # XXX TODO: mitigate
         if event.type == "screen":
+            # Mask sensitive background window regions (e.g. Slack visible
+            # behind the active window) before the frame reaches any writer.
+            # The mask_frame method is a no-op when cloud_intent is False.
+            if screen_filter is not None and hasattr(screen_filter, "mask_frame"):
+                screen_filter.mask_frame(
+                    event.data, event.extra, recording.pixel_ratio,
+                )
             prev_screen_event = event
             if config.RECORD_FULL_VIDEO:
                 # Privacy filter: skip full-video frames for blocked apps

@@ -463,6 +463,62 @@ class RecorderPrivacyFilter:
                 })
             return result
 
+    def mask_frame(self, image, geometry: dict | None, pixel_ratio: float) -> None:
+        """Mask sensitive background window regions in a screenshot, in-place.
+
+        For cloud-intent recordings, evaluates every visible window against the
+        privacy policy (forced to public mode) and applies solid masks over
+        windows whose action is EXCLUDE or MASK_WINDOW.
+
+        This catches sensitive apps (Slack, email) visible in the background
+        that the foreground-only capture-time filter cannot block.
+
+        Args:
+            image: PIL Image to mask in-place.
+            geometry: Window geometry dict with "windows" and "display_bounds".
+            pixel_ratio: Retina scaling factor (e.g. 2.0).
+        """
+        if not self._cloud_intent or geometry is None:
+            return
+
+        windows = geometry.get("windows")
+        if not windows:
+            return
+
+        try:
+            from screencap.privacy.masking import (
+                _apply_mask_to_image,
+                window_regions_from_geometry,
+            )
+            from screencap.privacy.policy import PrivacyConfig, PrivacyMode
+
+            # Force public mode for cloud masking so CHAT/EMAIL/etc. get
+            # MASK_WINDOW instead of TEXT_REDACT (which can't mask pixels).
+            if not hasattr(self, "_masking_evaluator"):
+                from dataclasses import replace as _dc_replace
+                from screencap.privacy.policy import DefaultPolicyEvaluator
+                _cloud_config = _dc_replace(
+                    self._evaluator.config, mode=PrivacyMode.PUBLIC,
+                )
+                self._masking_evaluator = DefaultPolicyEvaluator(_cloud_config)
+
+            display_bounds = geometry.get("display_bounds", (0, 0, 0, 0))
+            display_origin = (display_bounds[0], display_bounds[1])
+
+            regions = window_regions_from_geometry(
+                windows,
+                image.width,
+                image.height,
+                pixel_ratio,
+                self._classifier,
+                self._masking_evaluator,
+                display_origin=display_origin,
+            )
+            if regions:
+                _apply_mask_to_image(image, regions)
+        except Exception:
+            pass  # Never block the recording pipeline on masking errors
+
     @staticmethod
     def null_keystroke_content(action_data: dict) -> None:
         """Null out keystroke content fields in an action event dict.

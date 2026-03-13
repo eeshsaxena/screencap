@@ -122,6 +122,11 @@ def build_privacy_filter(
     except ValueError:
         mode = PrivacyMode.INTERNAL
 
+    # Cloud uploads must use the strictest non-shared mode to prevent
+    # leaking window titles for apps like Slack/Teams (see action matrix).
+    if cloud_intent:
+        mode = PrivacyMode.PUBLIC
+
     # Load privacy config from config.toml
     try:
         from screencap.config import get_privacy_config
