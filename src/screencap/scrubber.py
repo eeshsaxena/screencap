@@ -22,6 +22,17 @@ from screencap.privacy.actions import BLOCK_ACTIONS, KEYSTROKE_CONTENT_FIELDS, P
 from screencap.privacy.policy import DEFAULT_TRANSITION_HOLD_SECONDS
 from screencap.privacy.reasons import AuditEntry, ReasonCode
 
+# Actions that trigger masking for background windows. Everything except ALLOW —
+# we can't text-redact or OCR a partial screenshot region, so masking is the
+# only safe option for background windows.
+_BG_MASK_ACTIONS = frozenset({
+    PrivacyAction.EXCLUDE,
+    PrivacyAction.MASK_WINDOW,
+    PrivacyAction.MASK_REGION,
+    PrivacyAction.TEXT_REDACT,
+    PrivacyAction.OCR_FALLBACK,
+})
+
 console = Console()
 
 
@@ -406,17 +417,7 @@ def _scrub_screenshots_with_policy(
 
         # --- Background masking for ALLOW / TEXT_REDACT ---
         # The foreground app is safe, but sensitive background windows
-        # (Slack, Mail, etc.) may be visible behind it. Load stored
-        # window geometry and mask any background window whose action
-        # is stricter than ALLOW. We can't text-redact a partial
-        # screenshot region, so masking is the only safe option.
-        _BG_MASK_ACTIONS = frozenset({
-            PrivacyAction.EXCLUDE,
-            PrivacyAction.MASK_WINDOW,
-            PrivacyAction.MASK_REGION,
-            PrivacyAction.TEXT_REDACT,
-            PrivacyAction.OCR_FALLBACK,
-        })
+        # (Slack, Mail, etc.) may be visible behind it.
         bg_masked = False
         if decision.action in (PrivacyAction.ALLOW, PrivacyAction.TEXT_REDACT):
             if _geom_conn is not None and img_path.exists():
@@ -442,21 +443,34 @@ def _scrub_screenshots_with_policy(
                             )
                             bg_masked = True
                 except Exception as exc:
+                    # Fail-closed: geometry found sensitive windows but masking
+                    # failed — fall back to full-frame mask rather than leaking.
                     console.print(
                         f"  [yellow]Warning: background masking failed for "
-                        f"{img_path.name} ({exc}) — keeping as-is[/]"
+                        f"{img_path.name} ({exc}) — applying full-frame mask[/]"
                     )
+                    try:
+                        mask_screenshot(
+                            img_path,
+                            ctx.context_class,
+                            strategy=MaskStrategy.FULL_WINDOW,
+                            app_hint=meta.bundle_id,
+                        )
+                        bg_masked = True
+                    except Exception:
+                        img_path.unlink()
+                        actual_action = PrivacyAction.EXCLUDE
 
         result.audit_entries.append(
             AuditEntry(
                 timestamp=ts,
                 surface="screenshot",
                 action=actual_action.value,
-                reason=decision.reason
-                    if not bg_masked else "background_windows_masked",
+                reason=f"{decision.reason}+background_windows_masked"
+                    if bg_masked else decision.reason,
                 context_class=ctx.context_class.value,
-                evidence_type=ctx.confidence
-                    if not bg_masked else "geometry",
+                evidence_type=f"{ctx.confidence}+geometry"
+                    if bg_masked else ctx.confidence,
             )
         )
 

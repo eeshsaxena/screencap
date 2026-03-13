@@ -132,6 +132,12 @@ class WindowGeometrySnapshot:
     display_origin: tuple[float, float] = (0.0, 0.0)
 
 
+# Cache table existence per connection to avoid repeated sqlite_master queries.
+# Keyed by id(connection). Safe because the table set never changes during a
+# scrub, and the cache is small (one entry per open connection).
+_geometry_table_cache: dict[int, bool] = {}
+
+
 def load_window_geometry(
     db_path: Path,
     screenshot_timestamp: float,
@@ -154,11 +160,15 @@ def load_window_geometry(
         conn = sqlite3.connect(str(db_path))
     try:
         cur = conn.cursor()
-        # Check table existence (graceful for old recordings)
-        tables = {r[0] for r in cur.execute(
-            "SELECT name FROM sqlite_master WHERE type='table'"
-        ).fetchall()}
-        if "window_geometry" not in tables:
+        # Check table existence once per connection (graceful for old recordings).
+        # The table set never changes during a scrub, so cache the result.
+        conn_id = id(conn)
+        if conn_id not in _geometry_table_cache:
+            tables = {r[0] for r in cur.execute(
+                "SELECT name FROM sqlite_master WHERE type='table'"
+            ).fetchall()}
+            _geometry_table_cache[conn_id] = "window_geometry" in tables
+        if not _geometry_table_cache[conn_id]:
             return None
 
         # Use tolerance-based lookup: screenshot filenames lose float

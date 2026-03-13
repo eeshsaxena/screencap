@@ -94,6 +94,7 @@ class ChunkProcessor:
                 )
             except Exception as e:
                 logger.warning(f"Could not init masking classifier: {e}")
+                self._upload_enabled = False
 
         self._chunk_results: dict[int, bool] = {}  # idx → all_uploaded
         self._status_lock = threading.Lock()
@@ -299,63 +300,66 @@ class ChunkProcessor:
         except Exception:
             pass
 
-        for img_path in sorted(screenshots_dir.glob("*.jpg")):
-            ts = parse_screenshot_timestamp(img_path.name)
-            if ts is None:
-                continue
+        try:
+            for img_path in sorted(screenshots_dir.glob("*.jpg")):
+                ts = parse_screenshot_timestamp(img_path.name)
+                if ts is None:
+                    continue
 
-            geom = None
-            try:
-                geom = load_window_geometry(db_path, ts, conn=_geom_conn)
-            except Exception:
-                pass
-
-            # Attempt selective masking if geometry is available
-            selective_applied = False
-            if geom is not None:
+                geom = None
                 try:
-                    from PIL import Image
-                    with Image.open(img_path) as probe:
-                        img_w, img_h = probe.size
+                    geom = load_window_geometry(db_path, ts, conn=_geom_conn)
+                except Exception:
+                    pass
 
-                    regions = window_regions_from_geometry(
-                        geom.windows, img_w, img_h, self._masking_pixel_ratio,
-                        self._masking_classifier, self._masking_evaluator,
-                        display_origin=geom.display_origin,
-                    )
-                    if regions:
+                # Attempt selective masking if geometry is available
+                selective_applied = False
+                if geom is not None:
+                    try:
+                        from PIL import Image
+                        with Image.open(img_path) as probe:
+                            img_w, img_h = probe.size
+
+                        regions = window_regions_from_geometry(
+                            geom.windows, img_w, img_h, self._masking_pixel_ratio,
+                            self._masking_classifier, self._masking_evaluator,
+                            display_origin=geom.display_origin,
+                        )
+                        if regions:
+                            mask_screenshot(
+                                img_path,
+                                None,
+                                regions=regions,
+                            )
+                            masked_count += 1
+                        # No regions = no sensitive windows visible; keep as-is
+                        selective_applied = True
+                    except Exception:
+                        logger.debug(
+                            f"Selective masking failed for {img_path.name}",
+                            exc_info=True,
+                        )
+
+                # Fallback: full-frame masking when geometry unavailable or
+                # selective masking failed. Conservative for cloud upload path.
+                if not selective_applied:
+                    try:
                         mask_screenshot(
                             img_path,
-                            None,
-                            regions=regions,
+                            ContextClass.UNKNOWN,
+                            strategy=MaskStrategy.FULL_WINDOW,
                         )
                         masked_count += 1
-                    # No regions = no sensitive windows visible; keep as-is
-                    selective_applied = True
-                except Exception:
-                    logger.debug(
-                        f"Selective masking failed for {img_path.name}",
-                        exc_info=True,
-                    )
-
-            # Fallback: full-frame masking when geometry unavailable or
-            # selective masking failed. Conservative for cloud upload path.
-            if not selective_applied:
-                try:
-                    mask_screenshot(
-                        img_path,
-                        ContextClass.UNKNOWN,
-                        strategy=MaskStrategy.FULL_WINDOW,
-                    )
-                    masked_count += 1
-                except Exception:
-                    logger.debug(
-                        f"Failed to mask screenshot {img_path.name}",
-                        exc_info=True,
-                    )
-
-        if _geom_conn is not None:
-            _geom_conn.close()
+                    except Exception:
+                        # Fail-closed: delete unmasked screenshot before cloud upload
+                        logger.warning(
+                            f"All masking failed for {img_path.name} — deleting for safety",
+                            exc_info=True,
+                        )
+                        img_path.unlink(missing_ok=True)
+        finally:
+            if _geom_conn is not None:
+                _geom_conn.close()
 
         if masked_count > 0:
             logger.info(f"Chunk {idx}: masked {masked_count} screenshots")

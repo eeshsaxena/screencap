@@ -16,7 +16,12 @@ from enum import Enum
 from pathlib import Path
 
 from screencap.privacy.actions import KEYSTROKE_NULL_ACTIONS, PrivacyAction
-from screencap.privacy.policy import ContextClass, FrameMetadata
+from screencap.privacy.context import DefaultContextClassifier
+from screencap.privacy.policy import (
+    ContextClass,
+    DefaultPolicyEvaluator,
+    FrameMetadata,
+)
 
 
 class MaskStrategy(Enum):
@@ -158,8 +163,8 @@ def window_regions_from_geometry(
     image_width: int,
     image_height: int,
     pixel_ratio: float,
-    classifier,
-    evaluator,
+    classifier: DefaultContextClassifier,
+    evaluator: DefaultPolicyEvaluator,
     display_origin: tuple[float, float] = (0.0, 0.0),
     mask_actions: frozenset[PrivacyAction] | None = None,
     respect_z_order: bool = False,

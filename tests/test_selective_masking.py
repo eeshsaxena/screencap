@@ -548,11 +548,11 @@ class TestBackgroundWindowMasking:
         assert all(c > 200 for c in left_pixel), f"VS Code should be unmasked: {left_pixel}"
         assert all(c < 50 for c in right_pixel), f"Banking app should be masked: {right_pixel}"
 
-        # Audit entry should reflect background masking
+        # Audit entry should reflect both foreground decision + background masking
         bg_entries = [e for e in result.audit_entries
-                      if e.reason == "background_windows_masked"]
+                      if "background_windows_masked" in e.reason]
         assert len(bg_entries) == 1
-        assert bg_entries[0].evidence_type == "geometry"
+        assert "geometry" in bg_entries[0].evidence_type
 
     def test_allow_foreground_exclude_background_masks_not_deletes(self, tmp_path):
         """ALLOW foreground + EXCLUDE background (1Password):
@@ -599,7 +599,7 @@ class TestBackgroundWindowMasking:
         assert _avg_brightness(img_path) > 200, "All-ALLOW screenshot should stay bright"
         # No background_windows_masked audit entries
         bg_entries = [e for e in result.audit_entries
-                      if e.reason == "background_windows_masked"]
+                      if "background_windows_masked" in e.reason]
         assert len(bg_entries) == 0
 
     def test_allow_foreground_no_geometry_unchanged(self, tmp_path):
