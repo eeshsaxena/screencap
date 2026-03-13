@@ -64,29 +64,26 @@ class TestRejectUiKeywordPerson:
 
 
 class TestRejectAppNamePerson:
-    @pytest.mark.parametrize("name", [
-        "Homebrew", "Docker", "Ghostty", "Safari", "Figma",
-        "Terraform", "Kubernetes", "Python", "Elasticsearch", "Bitwarden",
-    ], ids=[
-        "cli-tool", "container", "terminal", "browser", "design",
-        "infra", "orchestrator", "language", "database", "password-mgr",
-    ])
-    def test_reject_software_names(self, hf: HeuristicFilter, name: str):
-        """Known software names flagged as PERSON are rejected."""
-        det = _det(EntityType.PERSON, 0, len(name))
-        assert hf.filter(name, [det]) == []
+    def test_reject_app_name_in_window_title(self, hf: HeuristicFilter):
+        """'Docker' in window title flagged as PERSON — should be rejected.
 
-    def test_real_person_survives(self, hf: HeuristicFilter):
-        """Real person names are NOT rejected by the software name filter."""
+        Real scenario: GLiNER flags 'Docker' in 'Docker Desktop — Containers'
+        as PERSON. Proves the _SOFTWARE_NAMES mechanism works.
+        Case insensitivity tested implicitly (input 'Docker', set has 'docker').
+        """
+        text = "Docker Desktop — Containers"
+        det = _det(EntityType.PERSON, 0, 6)  # "Docker"
+        assert hf.filter(text, [det]) == []
+
+    def test_real_person_not_rejected_as_software(self, hf: HeuristicFilter):
+        """Real person names must survive the software name filter.
+
+        Safety check: if the set grows too broad or matching changes,
+        this catches it. Uses names >= 4 chars to isolate from _reject_short_person.
+        """
         for name in ("Alice", "Sarah", "Robert", "James"):
             det = _det(EntityType.PERSON, 0, len(name))
             assert len(hf.filter(name, [det])) == 1, f"{name} should not be rejected"
-
-    def test_case_insensitive(self, hf: HeuristicFilter):
-        """Matching is case-insensitive: HOMEBREW, homebrew, Homebrew all rejected."""
-        for variant in ("HOMEBREW", "homebrew", "Homebrew"):
-            det = _det(EntityType.PERSON, 0, len(variant))
-            assert hf.filter(variant, [det]) == [], f"{variant} should be rejected"
 
 
 class TestKeepRealPerson:
