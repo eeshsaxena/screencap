@@ -66,6 +66,9 @@ class ChunkProcessor:
         # Initialize scrubbing pipeline for cloud-intent recordings
         self._pipeline = None
         self._anonymizer = None
+        self._masking_classifier = None
+        self._masking_evaluator = None
+        self._masking_pixel_ratio = 2.0  # safe Retina default
         if cloud_intent and upload_enabled:
             try:
                 from screencap.privacy import Anonymizer, create_default_pipeline
@@ -77,6 +80,20 @@ class ChunkProcessor:
                     f"Privacy deps not installed — disabling uploads for safety: {e}"
                 )
                 self._upload_enabled = False
+
+            # Initialize classifier/evaluator for screenshot masking
+            try:
+                from screencap.config import get_privacy_config
+                from screencap.privacy.context import DefaultContextClassifier
+                from screencap.privacy.policy import DefaultPolicyEvaluator
+
+                _pc = get_privacy_config()
+                self._masking_evaluator = DefaultPolicyEvaluator(_pc)
+                self._masking_classifier = DefaultContextClassifier(
+                    app_classes=_pc.app_classes,
+                )
+            except Exception as e:
+                logger.warning(f"Could not init masking classifier: {e}")
 
         self._chunk_results: dict[int, bool] = {}  # idx → all_uploaded
         self._status_lock = threading.Lock()
@@ -208,6 +225,16 @@ class ChunkProcessor:
             if self._stop_event.is_set():
                 return
 
+        # 5b. Mask sensitive window regions in screenshots
+        if self._cloud_intent and self._masking_classifier is not None:
+            self._set_status(f"Chunk {idx}: masking screenshots...")
+            try:
+                self._mask_chunk_screenshots(idx, start_ts, end_ts)
+            except Exception:
+                logger.warning(f"Screenshot masking failed for chunk {idx}", exc_info=True)
+            if self._stop_event.is_set():
+                return
+
         # 6. Upload
         success = False
         if self._upload_enabled:
@@ -235,6 +262,86 @@ class ChunkProcessor:
             self._set_status(f"Chunk {idx} uploaded")
         else:
             self._set_status("")
+
+    def _mask_chunk_screenshots(self, idx: int, start_ts: float, end_ts: float) -> None:
+        """Mask sensitive window regions in chunk screenshots before upload.
+
+        Uses stored per-screenshot window geometry for selective masking.
+        Falls back to full-frame masking when geometry is unavailable.
+        Does NOT block the chunk pipeline on error.
+        """
+        if self._masking_classifier is None or self._masking_evaluator is None:
+            return
+
+        chunk_dir = self._capture_dir / f"chunk_{idx}"
+        screenshots_dir = chunk_dir / "screenshots"
+        if not screenshots_dir.is_dir():
+            return
+
+        from screencap.privacy.context import (
+            load_window_geometry,
+            parse_screenshot_timestamp,
+        )
+        from screencap.privacy.masking import (
+            MaskStrategy,
+            mask_screenshot,
+            window_regions_from_geometry,
+        )
+        from screencap.privacy.actions import PrivacyAction
+        from screencap.privacy.policy import FrameMetadata
+
+        db_path = self._db_path
+        masked_count = 0
+
+        for img_path in sorted(screenshots_dir.glob("*.jpg")):
+            ts = parse_screenshot_timestamp(img_path.name)
+            if ts is None:
+                continue
+
+            # Classify the frontmost app (from window geometry) to check if masking needed
+            geom = None
+            try:
+                geom = load_window_geometry(db_path, ts)
+            except Exception:
+                pass
+
+            if geom is None:
+                continue  # No geometry → no selective masking needed for this screenshot
+
+            try:
+                from PIL import Image
+                with Image.open(img_path) as probe:
+                    img_w, img_h = probe.size
+
+                regions = window_regions_from_geometry(
+                    geom, img_w, img_h, self._masking_pixel_ratio,
+                    self._masking_classifier, self._masking_evaluator,
+                )
+                if regions:
+                    mask_screenshot(
+                        img_path,
+                        None,  # context_class not used with regions
+                        regions=regions,
+                    )
+                    masked_count += 1
+            except Exception:
+                # Fallback: full-frame masking
+                try:
+                    from screencap.privacy.policy import ContextClass
+                    mask_screenshot(
+                        img_path,
+                        ContextClass.UNKNOWN,
+                        strategy=MaskStrategy.FULL_WINDOW,
+                    )
+                    masked_count += 1
+                except Exception:
+                    logger.debug(
+                        f"Failed to mask screenshot {img_path.name}",
+                        exc_info=True,
+                    )
+
+        if masked_count > 0:
+            logger.info(f"Chunk {idx}: masked {masked_count} screenshots")
 
     def _trigger_flush(self) -> None:
         """Trigger writer processes to flush DB buffers before event export.
