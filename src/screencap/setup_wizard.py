@@ -713,8 +713,28 @@ def run_setup_wizard(
     invalidate_config_cache()
 
     console.print(f"\n  [bold #22d3ee]\u2705 Privacy settings saved to {config_path}[/bold #22d3ee]")
+
+    # Pre-download NLP models so first scrub doesn't block on network
+    if not getattr(sys, "frozen", False):
+        _download_nlp_models()
+
     console.print("  Run [bold #22d3ee]screencap start[/bold #22d3ee] to begin recording.")
     return True
+
+
+def _download_nlp_models() -> None:
+    """Download GLiNER + spaCy models if not already cached."""
+    try:
+        from screencap.privacy.pii import PiiDetector
+
+        console.print("  Downloading privacy models (this may take a few minutes)...")
+        PiiDetector()  # triggers HuggingFace download + spaCy model load
+        console.print("  [bold #22d3ee]\u2705 Privacy models downloaded[/bold #22d3ee]")
+    except Exception as e:
+        console.print(
+            f"  [yellow]Could not download privacy models: {e}[/yellow]\n"
+            "  Models will download on first [bold]screencap scrub[/bold]."
+        )
 
 
 def show_current_config(config_path: Path | None = None) -> None:
