@@ -321,8 +321,9 @@ def _scrub_screenshots_with_policy(
                         with Image.open(img_path) as probe:
                             img_w, img_h = probe.size
                         regions = window_regions_from_geometry(
-                            geom, img_w, img_h, pixel_ratio,
+                            geom.windows, img_w, img_h, pixel_ratio,
                             classifier, evaluator,
+                            display_origin=geom.display_origin,
                         )
                         if regions:
                             mask_screenshot(

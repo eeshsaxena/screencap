@@ -314,8 +314,9 @@ class ChunkProcessor:
                     img_w, img_h = probe.size
 
                 regions = window_regions_from_geometry(
-                    geom, img_w, img_h, self._masking_pixel_ratio,
+                    geom.windows, img_w, img_h, self._masking_pixel_ratio,
                     self._masking_classifier, self._masking_evaluator,
+                    display_origin=geom.display_origin,
                 )
                 if regions:
                     mask_screenshot(

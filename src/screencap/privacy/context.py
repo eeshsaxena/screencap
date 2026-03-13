@@ -123,14 +123,22 @@ def find_nearest_window(
 # ---------------------------------------------------------------------------
 
 
+@dataclass(frozen=True)
+class WindowGeometrySnapshot:
+    """Per-screenshot window geometry with display context."""
+
+    windows: list[dict]
+    display_origin: tuple[float, float] = (0.0, 0.0)
+
+
 def load_window_geometry(
     db_path: Path,
     screenshot_timestamp: float,
-) -> list[dict] | None:
+) -> WindowGeometrySnapshot | None:
     """Load the window geometry snapshot for a screenshot timestamp.
 
     Queries the ``window_geometry`` table for an exact timestamp match.
-    Returns the parsed JSON window list, or ``None`` if unavailable
+    Returns a ``WindowGeometrySnapshot`` or ``None`` if unavailable
     (old recordings without the table, capture failure, etc.).
     """
     import json as _json
@@ -153,7 +161,21 @@ def load_window_geometry(
         row = cur.fetchone()
         if row is None or row[0] is None:
             return None
-        return _json.loads(row[0])
+
+        data = _json.loads(row[0])
+
+        # Handle both formats:
+        # New: {"windows": [...], "display_bounds": [x, y, w, h]}
+        # Legacy: [...] (plain list of window dicts)
+        if isinstance(data, dict):
+            windows = data.get("windows", [])
+            bounds = data.get("display_bounds")
+            origin = (float(bounds[0]), float(bounds[1])) if bounds else (0.0, 0.0)
+        else:
+            windows = data
+            origin = (0.0, 0.0)
+
+        return WindowGeometrySnapshot(windows=windows, display_origin=origin)
     except (sqlite3.OperationalError, _json.JSONDecodeError):
         return None
     finally:

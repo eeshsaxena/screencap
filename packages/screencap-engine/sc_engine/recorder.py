@@ -1291,9 +1291,11 @@ def read_screen_events(
     # Window geometry capture — import here to avoid module-level side effects
     # in spawned child processes.
     _get_geometries = None
+    _display_bounds = None
     try:
-        from sc_engine.window._macos import get_all_window_geometries
+        from sc_engine.window._macos import get_all_window_geometries, get_main_display_bounds
         _get_geometries = get_all_window_geometries
+        _display_bounds = get_main_display_bounds()  # (origin_x, origin_y, width, height)
     except (ImportError, OSError):
         pass
 
@@ -1313,7 +1315,12 @@ def read_screen_events(
         if _get_geometries is not None:
             t_geom_start = time.perf_counter()
             try:
-                window_geometries = _get_geometries()
+                _win_list = _get_geometries()
+                # Bundle display bounds with window list for multi-monitor support
+                window_geometries = {
+                    "windows": _win_list,
+                    "display_bounds": _display_bounds,
+                }
             except Exception:
                 pass
             t_geom = time.perf_counter() - t_geom_start
