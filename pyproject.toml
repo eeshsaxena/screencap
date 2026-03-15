@@ -18,7 +18,8 @@ dependencies = [
     "tomlkit>=0.12",
     "python-dotenv>=1.0",
     "detect-secrets>=1.5.0,<2.0",
-    "presidio-analyzer[gliner]>=2.2",
+    "presidio-analyzer>=2.2",
+    "fast-gliner>=0.1.12",
 ]
 
 [project.optional-dependencies]

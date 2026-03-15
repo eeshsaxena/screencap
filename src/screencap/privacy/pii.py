@@ -1,7 +1,7 @@
 """PiiDetector — wraps Presidio Analyzer for PII detection.
 
 Supports two NER backends:
-- 'gliner' (default): GLiNER model via Presidio's GLiNERRecognizer
+- 'gliner' (default): GLiNER model via fast-gliner (Rust ONNX inference)
 - 'spacy' (legacy): spaCy NER via Presidio's default SpacyRecognizer
 """
 
@@ -53,9 +53,61 @@ class PiiDetector:
             )
 
     def _init_gliner(self, model: str) -> None:
-        from presidio_analyzer import AnalyzerEngine
+        from presidio_analyzer import (
+            AnalysisExplanation,
+            AnalyzerEngine,
+            LocalRecognizer,
+            RecognizerResult,
+        )
         from presidio_analyzer.nlp_engine import NlpEngineProvider
-        from presidio_analyzer.predefined_recognizers import GLiNERRecognizer
+
+        class _FastGLiNERRecognizer(LocalRecognizer):
+            """Presidio recognizer wrapping fast_gliner for ONNX-based GLiNER inference."""
+
+            def __init__(
+                self,
+                model_id: str,
+                entity_mapping: dict[str, str],
+                threshold: float = 0.3,
+                supported_language: str = "en",
+            ):
+                self._model_id = model_id
+                self._entity_mapping = entity_mapping
+                self._gliner_labels = list(entity_mapping.keys())
+                self._threshold = threshold
+
+                super().__init__(
+                    supported_entities=list(set(entity_mapping.values())),
+                    name="FastGLiNERRecognizer",
+                    supported_language=supported_language,
+                )
+
+            def load(self) -> None:
+                from fast_gliner import FastGLiNER
+
+                self._model = FastGLiNER.from_pretrained(self._model_id)
+
+            def analyze(self, text, entities, nlp_artifacts=None):
+                predictions = self._model.predict_entities(text, self._gliner_labels)
+                results = []
+                for pred in predictions:
+                    if pred["score"] < self._threshold:
+                        continue
+                    presidio_type = self._entity_mapping.get(pred["label"])
+                    if presidio_type is None or (entities and presidio_type not in entities):
+                        continue
+                    results.append(RecognizerResult(
+                        entity_type=presidio_type,
+                        start=pred["start"],
+                        end=pred["end"],
+                        score=pred["score"],
+                        analysis_explanation=AnalysisExplanation(
+                            recognizer=self.name,
+                            original_score=pred["score"],
+                            textual_explanation=f"Identified as {presidio_type} by FastGLiNER",
+                        ),
+                    ))
+                return results
 
         # spaCy still needed for tokenization/sentence segmentation,
         # even though we replace its NER with GLiNER.
@@ -66,20 +118,17 @@ class PiiDetector:
             }
         ).create_engine()
 
-        gliner_recognizer = GLiNERRecognizer(
-            model_name=model,
+        recognizer = _FastGLiNERRecognizer(
+            model_id=model,
             entity_mapping=GLINER_ENTITY_MAPPING,
-            flat_ner=False,
-            multi_label=True,
-            map_location="cpu",
         )
 
         self._analyzer = AnalyzerEngine(nlp_engine=nlp_engine)
-        self._analyzer.registry.add_recognizer(gliner_recognizer)
+        self._analyzer.registry.add_recognizer(recognizer)
         # Remove spaCy NER to prevent double-detection on PERSON/LOCATION
         self._analyzer.registry.remove_recognizer("SpacyRecognizer")
 
-        logger.info("PiiDetector initialized with GLiNER backend (%s)", model)
+        logger.info("PiiDetector initialized with fast-gliner backend (%s)", model)
 
     def _init_spacy(self) -> None:
         from presidio_analyzer import AnalyzerEngine

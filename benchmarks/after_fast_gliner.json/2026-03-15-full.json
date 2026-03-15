@@ -1,0 +1,158 @@
+{
+  "per_type": {
+    "ADDRESS": {
+      "true_positives": 1,
+      "false_positives": 1,
+      "false_negatives": 0,
+      "exact_span_hits": 0,
+      "partial_overlap_hits": 1,
+      "avg_coverage": 0.3548387096774194,
+      "precision": 0.5,
+      "recall_exact": 0.0,
+      "recall_partial": 1.0,
+      "f1": 0.6666666666666666
+    },
+    "API_KEY": {
+      "true_positives": 6,
+      "false_positives": 0,
+      "false_negatives": 2,
+      "exact_span_hits": 5,
+      "partial_overlap_hits": 6,
+      "avg_coverage": 0.8458333333333333,
+      "precision": 1.0,
+      "recall_exact": 0.625,
+      "recall_partial": 0.75,
+      "f1": 0.8571428571428571
+    },
+    "CONNECTION_STRING": {
+      "true_positives": 4,
+      "false_positives": 0,
+      "false_negatives": 0,
+      "exact_span_hits": 4,
+      "partial_overlap_hits": 4,
+      "avg_coverage": 1.0,
+      "precision": 1.0,
+      "recall_exact": 1.0,
+      "recall_partial": 1.0,
+      "f1": 1.0
+    },
+    "CREDIT_CARD": {
+      "true_positives": 2,
+      "false_positives": 0,
+      "false_negatives": 0,
+      "exact_span_hits": 2,
+      "partial_overlap_hits": 2,
+      "avg_coverage": 1.0,
+      "precision": 1.0,
+      "recall_exact": 1.0,
+      "recall_partial": 1.0,
+      "f1": 1.0
+    },
+    "EMAIL": {
+      "true_positives": 11,
+      "false_positives": 0,
+      "false_negatives": 0,
+      "exact_span_hits": 10,
+      "partial_overlap_hits": 11,
+      "avg_coverage": 1.0,
+      "precision": 1.0,
+      "recall_exact": 0.9090909090909091,
+      "recall_partial": 1.0,
+      "f1": 1.0
+    },
+    "JWT": {
+      "true_positives": 3,
+      "false_positives": 0,
+      "false_negatives": 0,
+      "exact_span_hits": 2,
+      "partial_overlap_hits": 3,
+      "avg_coverage": 0.8442028985507246,
+      "precision": 1.0,
+      "recall_exact": 0.6666666666666666,
+      "recall_partial": 1.0,
+      "f1": 1.0
+    },
+    "PASSWORD": {
+      "true_positives": 7,
+      "false_positives": 0,
+      "false_negatives": 0,
+      "exact_span_hits": 5,
+      "partial_overlap_hits": 7,
+      "avg_coverage": 0.8443718443718443,
+      "precision": 1.0,
+      "recall_exact": 0.7142857142857143,
+      "recall_partial": 1.0,
+      "f1": 1.0
+    },
+    "PERSON": {
+      "true_positives": 8,
+      "false_positives": 3,
+      "false_negatives": 0,
+      "exact_span_hits": 1,
+      "partial_overlap_hits": 8,
+      "avg_coverage": 0.5786713286713286,
+      "precision": 0.7272727272727273,
+      "recall_exact": 0.125,
+      "recall_partial": 1.0,
+      "f1": 0.8421052631578948
+    },
+    "PHONE": {
+      "true_positives": 2,
+      "false_positives": 0,
+      "false_negatives": 0,
+      "exact_span_hits": 2,
+      "partial_overlap_hits": 2,
+      "avg_coverage": 1.0,
+      "precision": 1.0,
+      "recall_exact": 1.0,
+      "recall_partial": 1.0,
+      "f1": 1.0
+    },
+    "PRIVATE_KEY": {
+      "true_positives": 1,
+      "false_positives": 0,
+      "false_negatives": 0,
+      "exact_span_hits": 0,
+      "partial_overlap_hits": 1,
+      "avg_coverage": 0.6774193548387096,
+      "precision": 1.0,
+      "recall_exact": 0.0,
+      "recall_partial": 1.0,
+      "f1": 1.0
+    },
+    "SSN": {
+      "true_positives": 2,
+      "false_positives": 0,
+      "false_negatives": 0,
+      "exact_span_hits": 0,
+      "partial_overlap_hits": 2,
+      "avg_coverage": 1.0,
+      "precision": 1.0,
+      "recall_exact": 0.0,
+      "recall_partial": 1.0,
+      "f1": 1.0
+    }
+  },
+  "totals": {
+    "true_positives": 47,
+    "false_positives": 4,
+    "false_negatives": 2,
+    "precision": 0.9215686274509803,
+    "recall_partial": 0.9591836734693877,
+    "recall_exact": 0.6326530612244898,
+    "avg_coverage": 0.8548902191519541,
+    "f1": 0.9400000000000001,
+    "document_leak_rate": 0.05,
+    "document_leaks": 2,
+    "document_total": 40,
+    "redaction_survival_rate": 0.04081632653061224,
+    "redaction_survivals": 2,
+    "redaction_total": 49,
+    "weighted_fp_impact": 211.0
+  },
+  "fp_by_source": {
+    "pii-gliner": 4
+  },
+  "fp_cases_count": 41,
+  "tp_cases_count": 40
+}

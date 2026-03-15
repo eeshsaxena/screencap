@@ -357,8 +357,8 @@ def create_default_pipeline(
     except ImportError as exc:
         if pii_engine == "presidio-gliner":
             raise ImportError(
-                "GLiNER not installed. "
-                "Install with: pip install 'presidio-analyzer[gliner]'"
+                "fast-gliner not installed. "
+                "Install with: pip install fast-gliner"
             ) from exc
         if pii_engine == "presidio":
             raise ImportError(
@@ -368,6 +368,19 @@ def create_default_pipeline(
         # Auto-detect: GLiNER failed, try spaCy fallback
         if ner_backend == "gliner":
             logger.info("GLiNER not available, falling back to spaCy...")
+            try:
+                detectors.append(PiiDetector(
+                    person_threshold=person_threshold,
+                    person_allowlist=person_allowlist,
+                    ner_backend="spacy",
+                ))
+                pii_loaded = True
+            except ImportError:
+                pass
+    except (RuntimeError, KeyError, OSError) as exc:
+        # Model load failure: ONNX runtime error, architecture mismatch, file not found
+        logger.warning("GLiNER model failed to load: %s. Falling back to spaCy...", exc)
+        if ner_backend == "gliner":
             try:
                 detectors.append(PiiDetector(
                     person_threshold=person_threshold,
