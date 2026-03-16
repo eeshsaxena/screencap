@@ -80,17 +80,10 @@ class ChunkProcessor:
                     f"Privacy deps not available — disabling uploads for safety: {e}"
                 )
                 self._upload_enabled = False
-                import sys
-                if getattr(sys, "frozen", False):
-                    logger.warning(
-                        "Cloud upload requires the pip-installed version of screencap. "
-                        "The binary distribution does not include privacy dependencies."
-                    )
-                else:
-                    logger.warning(
-                        "Privacy dependencies are missing. "
-                        "Reinstall with: pip install screencap"
-                    )
+                logger.warning(
+                    "Privacy dependencies are missing. "
+                    "Reinstall with: pip install screencap"
+                )
 
             # Initialize classifier/evaluator for screenshot masking
             try:

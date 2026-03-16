@@ -52,6 +52,31 @@ except Exception:
     pass
 
 # ---------------------------------------------------------------------------
+# Privacy pipeline — GLiNER (fast-gliner) + Presidio + detect-secrets
+# ---------------------------------------------------------------------------
+privacy_packages = [
+    'presidio_analyzer',  # ships conf/*.yml recognizer configs loaded at runtime
+    'en_core_web_sm',     # spaCy model for tokenization (+ NER fallback)
+]
+
+for pkg in privacy_packages:
+    try:
+        d, b, h = collect_all(pkg)
+        all_datas += d
+        all_binaries += b
+        all_hiddenimports += h
+    except Exception:
+        pass
+
+# Presidio + en_core_web_sm need .dist-info for importlib_metadata lookups
+# (spacy.util.is_package() and catalogue entry points)
+for pkg in ['presidio_analyzer', 'en_core_web_sm']:
+    try:
+        all_datas += copy_metadata(pkg)
+    except Exception:
+        pass
+
+# ---------------------------------------------------------------------------
 # Hidden imports not auto-detected by PyInstaller
 # ---------------------------------------------------------------------------
 hidden_imports = [
@@ -63,6 +88,10 @@ hidden_imports = [
     'sqlalchemy.dialects.sqlite',
     # tomli for Python 3.10 (stdlib tomllib in 3.11+)
     'tomli',
+    # Privacy pipeline
+    'fast_gliner',
+    'detect_secrets',
+    'detect_secrets.plugins',
 ]
 
 all_hiddenimports += hidden_imports
@@ -86,11 +115,10 @@ a = Analysis(
     hooksconfig={},
     runtime_hooks=[],
     excludes=[
-        # Defensive excludes — these may be pulled in transitively by
-        # dependencies (e.g. numpy, Pillow) even though screencap doesn't use them
+        # Large ML frameworks — not used by screencap
         'torch', 'torchvision', 'torchaudio',
-        'transformers', 'huggingface_hub', 'tokenizers', 'safetensors',
-        'hf_xet',
+        'transformers', 'tokenizers', 'safetensors',
+        'hf_xet',                    # optional HF acceleration, not needed
         'cv2',
         'matplotlib', 'sympy', 'IPython', 'notebook', 'jupyter',
         'scipy', 'sklearn', 'faiss',
@@ -99,6 +127,11 @@ a = Analysis(
         'grpc', 'grpcio',
         'timm',
         '_gdcm', 'gdcm', 'pydicom',
+        # ONNX Runtime standalone package — minos 14.0, fails CI verification.
+        # fast-gliner statically links its own ONNX Runtime (minos 11.0).
+        'onnxruntime',
+        # Python GLiNER package (distinct from fast_gliner) — pulls in onnxruntime
+        'gliner',
     ],
     noarchive=False,
 )

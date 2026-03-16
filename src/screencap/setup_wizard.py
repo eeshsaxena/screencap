@@ -715,8 +715,7 @@ def run_setup_wizard(
     console.print(f"\n  [bold #22d3ee]\u2705 Privacy settings saved to {config_path}[/bold #22d3ee]")
 
     # Pre-download NLP models so first scrub doesn't block on network
-    if not getattr(sys, "frozen", False):
-        _download_nlp_models()
+    _download_nlp_models()
 
     console.print("  Run [bold #22d3ee]screencap start[/bold #22d3ee] to begin recording.")
     return True
