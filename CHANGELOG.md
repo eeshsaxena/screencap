@@ -5,6 +5,18 @@ All notable changes to this project will be documented in this file.
 The format is based on [Keep a Changelog](https://keepachangelog.com/),
 and this project adheres to [Semantic Versioning](https://semver.org/).
 
+## [0.12.0] - 2026-03-16
+
+### Added
+- **privacy:** Replace gliner+PyTorch with fast-gliner for ONNX NER inference
+
+### Fixed
+- **privacy:** Enable full privacy pipeline in PyInstaller binary
+- **privacy:** Raise on explicit gliner request failure, consolidate fallback logic
+- **privacy:** Use distribution-agnostic error messages, deduplicate spec list
+- **release:** Use native Intel runner for x86_64 build, add minos verification
+- **release:** Harden minos verification and skip latest.txt for pre-releases
+
 ## [0.11.0] - 2026-03-13
 
 ### Added
