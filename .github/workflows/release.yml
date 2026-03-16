@@ -52,8 +52,13 @@ jobs:
         run: |
           TARGET_MINOS="11.0"
           FAIL=0
+          COUNT=0
           while IFS= read -r f; do
+            COUNT=$((COUNT + 1))
             minos=$(otool -l "$f" 2>/dev/null | grep -A3 LC_BUILD_VERSION | grep minos | awk '{print $2}')
+            if [ -z "$minos" ]; then
+              minos=$(otool -l "$f" 2>/dev/null | grep -A3 LC_VERSION_MIN_MACOSX | grep version | head -1 | awk '{print $2}')
+            fi
             if [ -n "$minos" ]; then
               if [ "$(printf '%s\n' "$TARGET_MINOS" "$minos" | sort -V | tail -1)" != "$TARGET_MINOS" ]; then
                 echo "FAIL: $f has minos $minos (target: $TARGET_MINOS)"
@@ -61,11 +66,15 @@ jobs:
               fi
             fi
           done < <(find dist/screencap -type f \( -name "*.dylib" -o -name "*.so" -o -name "screencap" \))
+          if [ "$COUNT" -eq 0 ]; then
+            echo "::error::No binaries found to verify in dist/screencap"
+            exit 1
+          fi
           if [ "$FAIL" -ne 0 ]; then
             echo "::error::Bundled binaries exceed deployment target minos $TARGET_MINOS"
             exit 1
           fi
-          echo "All bundled binaries pass minos <= $TARGET_MINOS"
+          echo "All $COUNT bundled binaries pass minos <= $TARGET_MINOS"
 
       - name: Package tarball and checksum
         run: |
@@ -108,7 +117,11 @@ jobs:
           gcloud storage cp checksums.sha256 gs://screencap-releases/releases/v${VERSION}/
           # Upload/update install script
           gcloud storage cp scripts/install.sh gs://screencap-releases/releases/install.sh
-          # Update latest version pointer
+
+      - name: Update latest version pointer
+        if: "!contains(github.ref, '-')"
+        run: |
+          VERSION=${GITHUB_REF#refs/tags/v}
           echo "$VERSION" | gcloud storage cp - gs://screencap-releases/releases/latest.txt
 
       - name: Create GitHub Release
