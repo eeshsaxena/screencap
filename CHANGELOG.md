@@ -5,6 +5,11 @@ All notable changes to this project will be documented in this file.
 The format is based on [Keep a Changelog](https://keepachangelog.com/),
 and this project adheres to [Semantic Versioning](https://semver.org/).
 
+## [0.12.2] - 2026-03-16
+
+### Fixed
+- **release:** Raise x86_64 minos threshold to 14.0 (numpy/X11 PyPI wheels require it)
+
 ## [0.12.1] - 2026-03-16
 
 ### Fixed
