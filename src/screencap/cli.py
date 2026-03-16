@@ -137,8 +137,7 @@ def _maybe_prompt_privacy_setup() -> None:
         privacy_section = cfg.get("privacy")
         if privacy_section is not None:
             # Has a [privacy] section — check if NLP models need downloading
-            if not getattr(_sys, "frozen", False):
-                _maybe_download_nlp_models()
+            _maybe_download_nlp_models()
             return
 
     console.print(
@@ -1608,20 +1607,6 @@ def setup(scan, show, reset):
     run_setup_wizard(scan_only=scan)
 
 
-def _privacy_extras_msg() -> str:
-    """Return the appropriate error message for missing privacy deps."""
-    if getattr(sys, "frozen", False):
-        return (
-            "[red]Error: Privacy features (scrub, cloud upload) require the "
-            "pip-installed version of screencap.[/red]\n"
-            "The binary distribution does not include privacy dependencies."
-        )
-    return (
-        "[red]Error: Privacy dependencies are missing.[/red]\n"
-        "Reinstall with: [bold]pip install screencap[/bold]"
-    )
-
-
 @cli.command()
 @click.argument("name")
 @click.option(
@@ -1640,7 +1625,10 @@ def scrub(name: str, pii_engine: str | None) -> None:
         console.print(f"[red]Error:[/red] {e}")
         raise SystemExit(1)
     except ImportError as e:
-        console.print(_privacy_extras_msg())
+        console.print(
+            "[red]Error: Privacy dependencies are missing.[/red]\n"
+            "Reinstall or update screencap."
+        )
         console.print(f"[dim]{e}[/dim]")
         raise SystemExit(1)
     except ValueError as e:
