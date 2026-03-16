@@ -80,12 +80,19 @@ elif [ -z "$RC_FILE" ]; then
 fi
 
 # Verify installation
-if "$INSTALL_DIR/screencap/screencap" --version >/dev/null 2>&1; then
-    INSTALLED_VERSION=$("$INSTALL_DIR/screencap/screencap" --version 2>&1)
+VERIFY_OUTPUT=$("$INSTALL_DIR/screencap/screencap" --version 2>&1) && VERIFY_EXIT=0 || VERIFY_EXIT=$?
+if [ $VERIFY_EXIT -eq 0 ]; then
     echo ""
-    echo "screencap installed successfully! ($INSTALLED_VERSION)"
+    echo "screencap installed successfully! ($VERIFY_OUTPUT)"
 else
     echo "ERROR: Installation verification failed." >&2
+    if [ -n "$VERIFY_OUTPUT" ]; then
+        echo "Detail: $VERIFY_OUTPUT" >&2
+    else
+        echo "The binary exited without output. This usually means your macOS" >&2
+        echo "version is older than what the binary was built for." >&2
+        echo "Please report this at https://github.com/proteus-computer-use/screencap/issues" >&2
+    fi
     exit 1
 fi
 
