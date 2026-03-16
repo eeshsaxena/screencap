@@ -23,7 +23,7 @@ jobs:
           - runner: macos-15-intel
             arch: x86_64
             python-arch: x64
-            minos-target: "11.0"    # support Big Sur and later on Intel
+            minos-target: "14.0"    # numpy/X11 PyPI wheels target 14.0; revisit if pre-14 demand emerges
     runs-on: ${{ matrix.runner }}
     steps:
       - uses: actions/checkout@v4
