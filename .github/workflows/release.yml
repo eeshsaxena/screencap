@@ -19,9 +19,11 @@ jobs:
           - runner: macos-14
             arch: arm64
             python-arch: arm64
+            minos-target: "14.0"    # arm64 only exists on macOS 11+; PyPI wheels target 14.0
           - runner: macos-15-intel
             arch: x86_64
             python-arch: x64
+            minos-target: "11.0"    # support Big Sur and later on Intel
     runs-on: ${{ matrix.runner }}
     steps:
       - uses: actions/checkout@v4
@@ -50,7 +52,7 @@ jobs:
 
       - name: Verify deployment target (minos)
         run: |
-          TARGET_MINOS="11.0"
+          TARGET_MINOS="${{ matrix.minos-target }}"
           FAIL=0
           COUNT=0
           while IFS= read -r f; do
