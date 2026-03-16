@@ -338,7 +338,7 @@ def create_default_pipeline(
     except ImportError:
         logger.warning(
             "detect-secrets not installed — secrets detection disabled. "
-            "Reinstall with: pip install screencap"
+            "Reinstall or update screencap."
         )
 
     # PII engine selection: GLiNER (default) or spaCy (legacy)
@@ -359,12 +359,12 @@ def create_default_pipeline(
             if pii_engine == "presidio-gliner":
                 raise ImportError(
                     "fast-gliner not installed. "
-                    "Install with: pip install fast-gliner"
+                    "Reinstall or update screencap."
                 ) from exc
             if pii_engine == "presidio":
                 raise ImportError(
                     "Presidio not installed. "
-                    "Install with: pip install presidio-analyzer"
+                    "Reinstall or update screencap."
                 ) from exc
         else:
             # Model load failure: ONNX runtime error, architecture mismatch, file not found
@@ -392,13 +392,13 @@ def create_default_pipeline(
     if not pii_loaded:
         logger.warning(
             "No PII engine installed — PII detection disabled. "
-            "Reinstall with: pip install screencap"
+            "Reinstall or update screencap."
         )
 
     if len(detectors) < 2:
         raise ImportError(
             "Privacy detection requires at least detect-secrets or a PII engine. "
-            "Reinstall with: pip install screencap"
+            "Reinstall or update screencap."
         )
 
     from screencap.privacy.filters import HeuristicFilter

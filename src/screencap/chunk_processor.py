@@ -82,7 +82,7 @@ class ChunkProcessor:
                 self._upload_enabled = False
                 logger.warning(
                     "Privacy dependencies are missing. "
-                    "Reinstall with: pip install screencap"
+                    "Reinstall or update screencap."
                 )
 
             # Initialize classifier/evaluator for screenshot masking

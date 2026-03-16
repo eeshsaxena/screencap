@@ -70,7 +70,7 @@ for pkg in privacy_packages:
 
 # Presidio + en_core_web_sm need .dist-info for importlib_metadata lookups
 # (spacy.util.is_package() and catalogue entry points)
-for pkg in ['presidio_analyzer', 'en_core_web_sm']:
+for pkg in privacy_packages:
     try:
         all_datas += copy_metadata(pkg)
     except Exception:
