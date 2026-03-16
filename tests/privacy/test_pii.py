@@ -232,3 +232,83 @@ class TestFactorySwitching:
         with pytest.raises(ValueError, match="Invalid pii_engine"):
             create_default_pipeline(pii_engine="invalid")
 
+
+# ---------------------------------------------------------------------------
+# Model load failure fallback tests
+# ---------------------------------------------------------------------------
+
+
+class TestGlinerModelLoadFailureFallback:
+    """Verify create_default_pipeline() falls back to spaCy when fast-gliner
+    model fails to load (RuntimeError from ONNX, KeyError from architecture
+    mismatch, OSError from missing files)."""
+
+    def test_runtime_error_falls_back_to_spacy(self):
+        """ONNX tensor shape mismatch at model load → spaCy fallback activates."""
+        from unittest.mock import patch
+
+        from screencap.privacy import create_default_pipeline
+
+        with patch(
+            "screencap.privacy.pii.PiiDetector._init_gliner",
+            side_effect=RuntimeError("unexpected logits shape"),
+        ):
+            pipeline = create_default_pipeline()
+
+        # Pipeline should contain a PiiDetector with spaCy backend
+        pii_detectors = [
+            d for d in pipeline._detectors if type(d).__name__ == "PiiDetector"
+        ]
+        assert len(pii_detectors) == 1
+        assert pii_detectors[0]._source == "pii-presidio"  # spaCy source
+
+    def test_key_error_falls_back_to_spacy(self):
+        """Model architecture not recognized (e.g. 'modernbert') → spaCy fallback."""
+        from unittest.mock import patch
+
+        from screencap.privacy import create_default_pipeline
+
+        with patch(
+            "screencap.privacy.pii.PiiDetector._init_gliner",
+            side_effect=KeyError("modernbert"),
+        ):
+            pipeline = create_default_pipeline()
+
+        pii_detectors = [
+            d for d in pipeline._detectors if type(d).__name__ == "PiiDetector"
+        ]
+        assert len(pii_detectors) == 1
+        assert pii_detectors[0]._source == "pii-presidio"
+
+    def test_os_error_falls_back_to_spacy(self):
+        """Model file not found on disk → spaCy fallback activates."""
+        from unittest.mock import patch
+
+        from screencap.privacy import create_default_pipeline
+
+        with patch(
+            "screencap.privacy.pii.PiiDetector._init_gliner",
+            side_effect=OSError("model file not found"),
+        ):
+            pipeline = create_default_pipeline()
+
+        pii_detectors = [
+            d for d in pipeline._detectors if type(d).__name__ == "PiiDetector"
+        ]
+        assert len(pii_detectors) == 1
+        assert pii_detectors[0]._source == "pii-presidio"
+
+    def test_explicit_gliner_request_raises_on_model_failure(self):
+        """pii_engine='presidio-gliner' + model load failure → raises, no silent fallback."""
+        import pytest
+        from unittest.mock import patch
+
+        from screencap.privacy import create_default_pipeline
+
+        with patch(
+            "screencap.privacy.pii.PiiDetector._init_gliner",
+            side_effect=RuntimeError("ONNX tensor mismatch"),
+        ):
+            with pytest.raises(RuntimeError, match="fast-gliner model failed to load"):
+                create_default_pipeline(pii_engine="presidio-gliner")
+
