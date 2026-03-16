@@ -354,32 +354,30 @@ def create_default_pipeline(
             ner_backend=ner_backend,
         ))
         pii_loaded = True
-    except ImportError as exc:
-        if pii_engine == "presidio-gliner":
-            raise ImportError(
-                "fast-gliner not installed. "
-                "Install with: pip install fast-gliner"
-            ) from exc
-        if pii_engine == "presidio":
-            raise ImportError(
-                "Presidio not installed. "
-                "Install with: pip install presidio-analyzer"
-            ) from exc
+    except (ImportError, RuntimeError, KeyError, OSError) as exc:
+        if isinstance(exc, ImportError):
+            if pii_engine == "presidio-gliner":
+                raise ImportError(
+                    "fast-gliner not installed. "
+                    "Install with: pip install fast-gliner"
+                ) from exc
+            if pii_engine == "presidio":
+                raise ImportError(
+                    "Presidio not installed. "
+                    "Install with: pip install presidio-analyzer"
+                ) from exc
+        else:
+            # Model load failure: ONNX runtime error, architecture mismatch, file not found
+            if pii_engine == "presidio-gliner":
+                raise RuntimeError(
+                    f"fast-gliner model failed to load: {exc}"
+                ) from exc
+            logger.warning(
+                "GLiNER model failed to load (%s). Falling back to spaCy...",
+                type(exc).__name__,
+            )
+            logger.debug("GLiNER model load failure details:", exc_info=True)
         # Auto-detect: GLiNER failed, try spaCy fallback
-        if ner_backend == "gliner":
-            logger.info("GLiNER not available, falling back to spaCy...")
-            try:
-                detectors.append(PiiDetector(
-                    person_threshold=person_threshold,
-                    person_allowlist=person_allowlist,
-                    ner_backend="spacy",
-                ))
-                pii_loaded = True
-            except ImportError:
-                pass
-    except (RuntimeError, KeyError, OSError) as exc:
-        # Model load failure: ONNX runtime error, architecture mismatch, file not found
-        logger.warning("GLiNER model failed to load: %s. Falling back to spaCy...", exc)
         if ner_backend == "gliner":
             try:
                 detectors.append(PiiDetector(
