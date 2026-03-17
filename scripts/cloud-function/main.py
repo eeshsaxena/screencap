@@ -88,11 +88,25 @@ def get_upload_urls(request):
 
     action = data.get("action")
 
+    if action == "get-index":
+        return _handle_get_index(data)
     if action == "list":
         return _handle_list(data)
     if action == "sign-download":
         return _handle_sign_download(data)
     return _handle_upload(data)
+
+
+def _handle_get_index(data=None):
+    """Return the cross-recording session index."""
+    import json
+    blob = _bucket.blob("sessions/_index.json")
+    try:
+        raw = blob.download_as_bytes()
+        index = json.loads(raw)
+        return _cors(jsonify(index))
+    except Exception:
+        return _cors(jsonify({"version": 1, "recordings": {}, "total_recordings": 0}))
 
 
 def _handle_list(data=None):

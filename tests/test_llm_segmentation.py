@@ -508,12 +508,13 @@ class TestProcessV2Manifests:
         mock_bytes.side_effect = _mock_blob_bytes(events_chunk_0, events_chunk_1)
         mock_llm.return_value = None  # LLM failed
 
-        tasks, method, summary = _process_v2_manifests("test-rec", sample_manifests)
+        tasks, method, summary, tags = _process_v2_manifests("test-rec", sample_manifests)
 
         assert method == "idle"
         assert len(tasks) >= 1
         assert summary is not None
         assert "overview" in summary
+        assert tags == []
 
     @patch("main._call_llm")
     @patch("main._blob_bytes")
@@ -549,14 +550,16 @@ class TestProcessV2Manifests:
                 "time_breakdown": {"development": 70, "communication": 30},
                 "key_accomplishments": ["Wrote auth module"],
             },
+            "tags": ["python", "auth"],
         }
 
-        tasks, method, summary = _process_v2_manifests("test-rec", sample_manifests)
+        tasks, method, summary, tags = _process_v2_manifests("test-rec", sample_manifests)
 
         assert method == "llm"
         assert len(tasks) == 2
         assert tasks[0]["name"] == "Development in VSCode"
         assert summary["primary_focus"] == "development"
+        assert tags == ["python", "auth"]
 
 
 # ---------------------------------------------------------------------------
@@ -621,3 +624,223 @@ class TestSimplifiedManifest:
         data = json.loads(path.read_text())
         assert "format_version" not in data
         assert "tasks" in data
+
+
+# ---------------------------------------------------------------------------
+# Tests: _assign_folder_names with category prefix
+# ---------------------------------------------------------------------------
+
+class TestCategoryPrefix:
+    def test_dev_prefix(self):
+        from main import _assign_folder_names
+        tasks = [{"derived_name": "coding-auth", "category": "development"}]
+        folders = _assign_folder_names(tasks)
+        assert folders == ["dev_000_coding-auth"]
+
+    def test_oth_prefix(self):
+        from main import _assign_folder_names
+        tasks = [{"derived_name": "misc-stuff", "category": "other"}]
+        folders = _assign_folder_names(tasks)
+        assert folders == ["oth_000_misc-stuff"]
+
+    def test_missing_category_defaults(self):
+        from main import _assign_folder_names
+        tasks = [{"derived_name": "no-cat-task"}]
+        folders = _assign_folder_names(tasks)
+        assert folders == ["oth_000_no-cat-task"]
+
+    def test_mixed_categories(self):
+        from main import _assign_folder_names
+        tasks = [
+            {"derived_name": "code-work", "category": "development"},
+            {"derived_name": "email-check", "category": "communication"},
+            {"derived_name": "googling", "category": "research"},
+        ]
+        folders = _assign_folder_names(tasks)
+        assert folders == [
+            "dev_000_code-work",
+            "com_001_email-check",
+            "res_002_googling",
+        ]
+
+    def test_dedup_with_prefix(self):
+        from main import _assign_folder_names
+        tasks = [
+            {"derived_name": "coding", "category": "development"},
+            {"derived_name": "coding", "category": "development"},
+        ]
+        folders = _assign_folder_names(tasks)
+        assert folders == ["dev_000_coding", "dev_001_coding-1"]
+
+
+# ---------------------------------------------------------------------------
+# Tests: _validate_tags
+# ---------------------------------------------------------------------------
+
+class TestValidateTags:
+    def test_valid_tags(self):
+        from main import _validate_tags
+        assert _validate_tags(["python", "debugging"]) == ["python", "debugging"]
+
+    def test_invalid_chars_filtered(self):
+        from main import _validate_tags
+        assert _validate_tags(["Python!", "good-tag"]) == ["good-tag"]
+
+    def test_dedup(self):
+        from main import _validate_tags
+        assert _validate_tags(["a", "a", "b"]) == ["a", "b"]
+
+    def test_max_cap(self):
+        from main import _validate_tags
+        tags = [f"tag-{i}" for i in range(12)]
+        result = _validate_tags(tags)
+        assert len(result) == 8
+
+    def test_empty(self):
+        from main import _validate_tags
+        assert _validate_tags([]) == []
+
+    def test_non_string_filtered(self):
+        from main import _validate_tags
+        assert _validate_tags([123, None, "valid"]) == ["valid"]
+
+
+# ---------------------------------------------------------------------------
+# Tests: _update_session_index
+# ---------------------------------------------------------------------------
+
+class TestUpdateSessionIndex:
+    @patch("main._bucket")
+    def test_new_index_created(self, mock_bucket):
+        from main import _update_session_index
+
+        mock_blob = MagicMock()
+        mock_blob.reload.side_effect = Exception("Not Found")
+        mock_bucket.return_value.blob.return_value = mock_blob
+
+        timeline = {
+            "processed_at": "2026-03-16T00:00:00Z",
+            "segmentation_method": "llm",
+            "total_tasks": 2,
+            "total_duration_s": 3600.0,
+            "summary": {"primary_focus": "development", "overview": "Coded stuff."},
+            "tasks": [
+                {"category": "development", "folder": "dev_000_coding"},
+                {"category": "communication", "folder": "com_001_email"},
+            ],
+        }
+
+        _update_session_index("test-rec", timeline, ["python", "auth"])
+
+        mock_blob.upload_from_string.assert_called_once()
+        call_kwargs = mock_blob.upload_from_string.call_args
+        uploaded = json.loads(call_kwargs[0][0])
+        assert "test-rec" in uploaded["recordings"]
+        assert uploaded["recordings"]["test-rec"]["tags"] == ["python", "auth"]
+        assert uploaded["total_recordings"] == 1
+        assert call_kwargs[1]["if_generation_match"] == 0
+
+    @patch("main._bucket")
+    def test_existing_index_updated(self, mock_bucket):
+        from main import _update_session_index
+
+        existing_index = {
+            "version": 1,
+            "recordings": {
+                "old-rec": {"total_tasks": 1, "tags": []}
+            },
+        }
+
+        mock_blob = MagicMock()
+        mock_blob.generation = 5
+        mock_blob.download_as_bytes.return_value = json.dumps(existing_index).encode()
+        mock_bucket.return_value.blob.return_value = mock_blob
+
+        timeline = {
+            "processed_at": "2026-03-16T00:00:00Z",
+            "segmentation_method": "llm",
+            "total_tasks": 1,
+            "total_duration_s": 1800.0,
+            "summary": {"primary_focus": "research", "overview": "Researched."},
+            "tasks": [{"category": "research", "folder": "res_000_googling"}],
+        }
+
+        _update_session_index("new-rec", timeline, ["research"])
+
+        call_kwargs = mock_blob.upload_from_string.call_args
+        uploaded = json.loads(call_kwargs[0][0])
+        assert "old-rec" in uploaded["recordings"]
+        assert "new-rec" in uploaded["recordings"]
+        assert uploaded["total_recordings"] == 2
+        assert call_kwargs[1]["if_generation_match"] == 5
+
+    @patch("main._bucket")
+    def test_failure_does_not_crash(self, mock_bucket):
+        from main import _update_session_index
+
+        mock_bucket.return_value.blob.side_effect = Exception("GCS down")
+
+        # Should not raise
+        _update_session_index("test-rec", {}, [])
+
+
+# ---------------------------------------------------------------------------
+# Tests: idle-gap segmentation with category
+# ---------------------------------------------------------------------------
+
+class TestIdleGapCategory:
+    @patch("main._blob_bytes")
+    def test_code_app_gets_development(self, mock_bytes, sample_manifests):
+        from main import _simple_segment_from_events
+
+        events = [
+            {"_meta": True},
+            {"type": "window.switch", "timestamp": 1100.0,
+             "app_bundle_id": "com.microsoft.VSCode", "window_title": "test.py"},
+            {"type": "key.type", "timestamp": 1110.0, "text": "code"},
+        ]
+        data = "\n".join(json.dumps(e) for e in events) + "\n"
+        mock_bytes.side_effect = _mock_blob_bytes(data, "")
+
+        tasks = _simple_segment_from_events("test-rec", sample_manifests)
+        assert tasks[0]["category"] == "development"
+
+    @patch("main._blob_bytes")
+    def test_chat_app_gets_communication(self, mock_bytes, sample_manifests):
+        from main import _simple_segment_from_events
+
+        events = [
+            {"_meta": True},
+            {"type": "window.switch", "timestamp": 1100.0,
+             "app_bundle_id": "com.tinyspeck.slackmacgap", "window_title": "#dev"},
+            {"type": "key.type", "timestamp": 1110.0, "text": "hello"},
+        ]
+        data = "\n".join(json.dumps(e) for e in events) + "\n"
+        mock_bytes.side_effect = _mock_blob_bytes(data, "")
+
+        tasks = _simple_segment_from_events("test-rec", sample_manifests)
+        assert tasks[0]["category"] == "communication"
+
+    @patch("main._blob_bytes")
+    def test_unknown_app_gets_other(self, mock_bytes, sample_manifests):
+        from main import _simple_segment_from_events
+
+        events = [
+            {"_meta": True},
+            {"type": "window.switch", "timestamp": 1100.0,
+             "app_bundle_id": "com.unknown.app", "window_title": "Something"},
+            {"type": "key.type", "timestamp": 1110.0, "text": "stuff"},
+        ]
+        data = "\n".join(json.dumps(e) for e in events) + "\n"
+        mock_bytes.side_effect = _mock_blob_bytes(data, "")
+
+        tasks = _simple_segment_from_events("test-rec", sample_manifests)
+        assert tasks[0]["category"] == "other"
+
+    @patch("main._blob_bytes")
+    def test_no_events_gets_other(self, mock_bytes, sample_manifests):
+        from main import _simple_segment_from_events
+
+        mock_bytes.return_value = None
+        tasks = _simple_segment_from_events("test-rec", sample_manifests)
+        assert tasks[0]["category"] == "other"

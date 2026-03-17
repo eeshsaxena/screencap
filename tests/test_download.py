@@ -12,10 +12,14 @@ from screencap.cli import cli
 from screencap.download import (
     DOWNLOAD_STATUS_FILE,
     DownloadResult,
+    RemoteSession,
     _fmt_size,
     _resolve_dest_dir,
     _write_download_status,
+    fetch_session_index,
+    filter_urls_by_category,
     is_downloaded,
+    list_remote_sessions,
 )
 
 
@@ -743,5 +747,298 @@ def test_download_cli_short_flag(tmp_path):
         mock.patch("screencap.download.get_downloads_dir", return_value=tmp_path),
     ):
         result = runner.invoke(cli, ["download", "-j", "1"])
+
+    assert result.exit_code == 0
+
+
+# ---------------------------------------------------------------------------
+# Unit tests: fetch_session_index
+# ---------------------------------------------------------------------------
+
+
+def test_fetch_session_index_success():
+    mock_resp = mock.MagicMock()
+    mock_resp.status_code = 200
+    mock_resp.json.return_value = {
+        "version": 1,
+        "recordings": {
+            "rec-001": {"total_tasks": 2, "tags": ["python"]},
+        },
+        "total_recordings": 1,
+    }
+
+    with mock.patch("screencap.download.requests.post", return_value=mock_resp):
+        index = fetch_session_index()
+
+    assert "rec-001" in index["recordings"]
+    assert index["total_recordings"] == 1
+
+
+def test_fetch_session_index_failure():
+    import requests as req
+
+    with mock.patch("screencap.download.requests.post", side_effect=req.ConnectionError):
+        index = fetch_session_index()
+
+    assert index == {"version": 1, "recordings": {}}
+
+
+def test_fetch_session_index_server_error():
+    mock_resp = mock.MagicMock()
+    mock_resp.status_code = 500
+
+    with mock.patch("screencap.download.requests.post", return_value=mock_resp):
+        index = fetch_session_index()
+
+    assert index == {"version": 1, "recordings": {}}
+
+
+# ---------------------------------------------------------------------------
+# Unit tests: list_remote_sessions
+# ---------------------------------------------------------------------------
+
+
+def test_list_remote_sessions_no_filter():
+    index = {
+        "version": 1,
+        "recordings": {
+            "rec-001": {
+                "processed_at": "2026-03-16T00:00:00Z",
+                "total_tasks": 2,
+                "total_duration_s": 3600.0,
+                "primary_focus": "development",
+                "categories": ["development", "communication"],
+                "tags": ["python", "auth"],
+            },
+        },
+    }
+    with mock.patch("screencap.download.fetch_session_index", return_value=index):
+        sessions = list_remote_sessions()
+
+    assert len(sessions) == 1
+    assert sessions[0].name == "rec-001"
+    assert sessions[0].tags == ["python", "auth"]
+
+
+def test_list_remote_sessions_filter_tag():
+    index = {
+        "version": 1,
+        "recordings": {
+            "rec-001": {
+                "processed_at": "", "total_tasks": 1, "total_duration_s": 100,
+                "primary_focus": "development", "categories": ["development"],
+                "tags": ["python"],
+            },
+            "rec-002": {
+                "processed_at": "", "total_tasks": 1, "total_duration_s": 200,
+                "primary_focus": "research", "categories": ["research"],
+                "tags": ["javascript"],
+            },
+        },
+    }
+    with mock.patch("screencap.download.fetch_session_index", return_value=index):
+        sessions = list_remote_sessions(tag="python")
+
+    assert len(sessions) == 1
+    assert sessions[0].name == "rec-001"
+
+
+def test_list_remote_sessions_filter_category():
+    index = {
+        "version": 1,
+        "recordings": {
+            "rec-001": {
+                "processed_at": "", "total_tasks": 1, "total_duration_s": 100,
+                "primary_focus": "development", "categories": ["development"],
+                "tags": [],
+            },
+            "rec-002": {
+                "processed_at": "", "total_tasks": 1, "total_duration_s": 200,
+                "primary_focus": "research", "categories": ["research"],
+                "tags": [],
+            },
+        },
+    }
+    with mock.patch("screencap.download.fetch_session_index", return_value=index):
+        sessions = list_remote_sessions(category="research")
+
+    assert len(sessions) == 1
+    assert sessions[0].name == "rec-002"
+
+
+# ---------------------------------------------------------------------------
+# Unit tests: filter_urls_by_category
+# ---------------------------------------------------------------------------
+
+
+def test_filter_urls_by_category():
+    urls = {
+        "timeline.json": "https://signed/timeline",
+        "_processing_status.json": "https://signed/status",
+        "tasks/dev_000_coding/video.mp4": "https://signed/dev-video",
+        "tasks/dev_000_coding/events.jsonl": "https://signed/dev-events",
+        "tasks/com_001_email/video.mp4": "https://signed/com-video",
+        "tasks/res_002_research/video.mp4": "https://signed/res-video",
+    }
+
+    filtered = filter_urls_by_category(urls, "development")
+
+    assert "timeline.json" in filtered
+    assert "_processing_status.json" in filtered
+    assert "tasks/dev_000_coding/video.mp4" in filtered
+    assert "tasks/dev_000_coding/events.jsonl" in filtered
+    assert "tasks/com_001_email/video.mp4" not in filtered
+    assert "tasks/res_002_research/video.mp4" not in filtered
+
+
+def test_filter_urls_by_category_keeps_all_non_task_files():
+    urls = {
+        "timeline.json": "https://signed/timeline",
+        "some_other_file.json": "https://signed/other",
+    }
+    filtered = filter_urls_by_category(urls, "development")
+    assert len(filtered) == 2
+
+
+# ---------------------------------------------------------------------------
+# Unit tests: download_recording with category_filter
+# ---------------------------------------------------------------------------
+
+
+def test_download_with_category_filter(tmp_path):
+    from screencap.download import download_recording
+
+    mock_urls = {
+        "timeline.json": "https://signed/timeline",
+        "tasks/dev_000_coding/video.mp4": "https://signed/dev-video",
+        "tasks/com_001_email/video.mp4": "https://signed/com-video",
+    }
+
+    mock_resp = mock.MagicMock()
+    mock_resp.status_code = 200
+    mock_resp.headers = {"content-length": "50"}
+    mock_resp.raise_for_status = mock.MagicMock()
+    mock_resp.iter_content.return_value = [b"x" * 50]
+
+    with (
+        mock.patch("screencap.download.request_signed_urls", return_value=(mock_urls, "gs://...")),
+        mock.patch("screencap.download.requests.get", return_value=mock_resp),
+    ):
+        result = download_recording(
+            "my-rec", tmp_path, category_filter="development",
+        )
+
+    # Should download timeline.json + dev task, but not com task
+    assert "tasks/com_001_email/video.mp4" not in result.downloaded
+    assert len(result.downloaded) == 2  # timeline.json + dev video
+
+
+# ---------------------------------------------------------------------------
+# CLI tests: list --remote
+# ---------------------------------------------------------------------------
+
+
+def test_list_remote_sessions_cli():
+    runner = CliRunner()
+
+    sessions = [
+        RemoteSession(
+            name="rec-001",
+            processed_at="2026-03-16T00:00:00Z",
+            total_tasks=3,
+            total_duration_s=3600.0,
+            primary_focus="development",
+            categories=["development"],
+            tags=["python", "auth"],
+        ),
+    ]
+
+    with mock.patch("screencap.download.list_remote_sessions", return_value=sessions):
+        result = runner.invoke(cli, ["list", "--remote"])
+
+    assert result.exit_code == 0
+    assert "rec-001" in result.output
+    assert "python" in result.output
+
+
+def test_list_remote_sessions_cli_json():
+    runner = CliRunner()
+
+    sessions = [
+        RemoteSession(
+            name="rec-001",
+            processed_at="2026-03-16T00:00:00Z",
+            total_tasks=2,
+            total_duration_s=1800.0,
+            primary_focus="development",
+            categories=["development"],
+            tags=["python"],
+        ),
+    ]
+
+    with mock.patch("screencap.download.list_remote_sessions", return_value=sessions):
+        result = runner.invoke(cli, ["list", "--remote", "--json"])
+
+    assert result.exit_code == 0
+    data = json.loads(result.output)
+    assert len(data) == 1
+    assert data[0]["name"] == "rec-001"
+
+
+def test_list_remote_empty():
+    runner = CliRunner()
+
+    with mock.patch("screencap.download.list_remote_sessions", return_value=[]):
+        result = runner.invoke(cli, ["list", "--remote"])
+
+    assert result.exit_code == 0
+    assert "No remote sessions" in result.output
+
+
+def test_list_tag_without_remote():
+    runner = CliRunner()
+    result = runner.invoke(cli, ["list", "--tag", "python"])
+    assert result.exit_code == 0
+    assert "--tag and --category require --remote" in result.output
+
+
+# ---------------------------------------------------------------------------
+# CLI tests: download --category
+# ---------------------------------------------------------------------------
+
+
+def test_download_category_requires_sessions():
+    runner = CliRunner()
+    result = runner.invoke(cli, ["download", "rec-001", "--category", "development"])
+    assert result.exit_code == 1
+    assert "--category requires --sessions" in result.output
+
+
+def test_download_with_category_cli(tmp_path):
+    from screencap.download import RemoteRecording
+
+    remote = [RemoteRecording("rec-001", file_count=3, total_size=100)]
+    mock_urls = {
+        "timeline.json": "https://signed/timeline",
+        "tasks/dev_000_coding/video.mp4": "https://signed/dev-video",
+        "tasks/com_001_email/video.mp4": "https://signed/com-video",
+    }
+
+    mock_resp = mock.MagicMock()
+    mock_resp.status_code = 200
+    mock_resp.headers = {"content-length": "50"}
+    mock_resp.raise_for_status = mock.MagicMock()
+    mock_resp.iter_content.return_value = [b"x" * 50]
+
+    runner = CliRunner()
+    with (
+        mock.patch("screencap.download.list_remote_recordings", return_value=remote),
+        mock.patch("screencap.download.request_signed_urls", return_value=(mock_urls, "gs://...")),
+        mock.patch("screencap.download.requests.get", return_value=mock_resp),
+        mock.patch("screencap.config.get_sessions_dir", return_value=tmp_path),
+    ):
+        result = runner.invoke(cli, [
+            "download", "--sessions", "--category", "development",
+        ])
 
     assert result.exit_code == 0
