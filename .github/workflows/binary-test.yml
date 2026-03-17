@@ -52,6 +52,9 @@ jobs:
       - name: Install dependencies
         run: pip install -e ".[record]" && pip install pyinstaller
 
+      - name: Download spaCy model
+        run: python -m spacy download en_core_web_sm
+
       - name: Build frozen binary
         run: pyinstaller pyinstaller/screencap.spec
 
