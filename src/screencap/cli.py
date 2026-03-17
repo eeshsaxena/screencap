@@ -1735,10 +1735,16 @@ def _check_detect_secrets_plugins() -> tuple[str, bool, str]:
 
 
 def _check_spacy_model() -> tuple[str, bool, str]:
-    """Load en_core_web_sm spaCy model (verifies bundled model data)."""
+    """Load en_core_web_sm spaCy model (verifies bundled model data).
+
+    In frozen binaries, spacy.load() uses importlib.util.find_spec() which
+    can't locate bundled packages.  Importing the package first puts it in
+    sys.modules, where spacy.load() checks before find_spec().
+    """
     import traceback as _tb
     name = "spacy_model"
     try:
+        import en_core_web_sm  # noqa: F401 — ensures sys.modules entry for frozen binary
         import spacy
         spacy.load("en_core_web_sm")
         return name, True, ""
