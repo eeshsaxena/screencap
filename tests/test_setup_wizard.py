@@ -403,8 +403,13 @@ class TestRunSetupWizard:
             assert "com.figma.desktop" in doc["privacy"]["exclude_apps"]
             assert "com.figma.desktop" not in doc["privacy"].get("allow_apps", [])
 
-    def test_wizard_cancel(self, tmp_path):
-        """User cancels in TUI, no config saved."""
+    @pytest.mark.parametrize("choice, expected_mode, expected_upload", [
+        (1, "public", "cloud"),
+        (2, "internal", "local"),
+        (3, "internal", "ask"),
+    ])
+    def test_wizard_cancel_saves_destination(self, tmp_path, choice, expected_mode, expected_upload):
+        """User cancels TUI — destination preference still saved, no app keys written."""
         config_path = tmp_path / "config.toml"
         apps = [
             AppMetadata("/test/Slack.app", "com.tinyspeck.slackmacgap", "Slack"),
@@ -414,11 +419,50 @@ class TestRunSetupWizard:
              mock.patch("screencap.setup_wizard.click") as mock_click, \
              mock.patch("screencap.setup_wizard._run_tui", return_value=None):
             mock_stdin.isatty.return_value = True
-            mock_click.prompt.return_value = 2  # Local
+            mock_click.prompt.return_value = choice
 
             result = run_setup_wizard(config_path=config_path)
             assert result is False
-            assert not config_path.exists()
+            assert config_path.exists()
+            cfg = tomlkit.parse(config_path.read_text())
+            assert cfg["privacy"]["mode"] == expected_mode
+            assert cfg["privacy"]["upload_default"] == expected_upload
+            assert "exclude_apps" not in cfg["privacy"]
+            assert "allow_apps" not in cfg["privacy"]
+
+    def test_wizard_cancel_preserves_existing_app_config(self, tmp_path):
+        """TUI cancel preserves existing app classifications, only updates mode/upload_default."""
+        config_path = tmp_path / "config.toml"
+        config_path.write_text(
+            '[privacy]\n'
+            'mode = "internal"\n'
+            'upload_default = "local"\n'
+            'exclude_apps = ["com.1password.app"]\n'
+            'allow_apps = ["com.apple.Safari"]\n'
+            '\n'
+            '[privacy.app_classes]\n'
+            '"com.apple.Safari" = "browser"\n'
+        )
+        apps = [
+            AppMetadata("/test/Slack.app", "com.tinyspeck.slackmacgap", "Slack"),
+        ]
+        with mock.patch("sys.stdin") as mock_stdin, \
+             mock.patch("screencap.setup_wizard.discover_installed_apps", return_value=apps), \
+             mock.patch("screencap.setup_wizard.click") as mock_click, \
+             mock.patch("screencap.setup_wizard._run_tui", return_value=None):
+            mock_stdin.isatty.return_value = True
+            mock_click.prompt.return_value = 1  # Switch to Cloud
+
+            result = run_setup_wizard(config_path=config_path)
+            assert result is False
+            cfg = tomlkit.parse(config_path.read_text())
+            # Mode and upload_default updated
+            assert cfg["privacy"]["mode"] == "public"
+            assert cfg["privacy"]["upload_default"] == "cloud"
+            # Existing app classifications preserved
+            assert cfg["privacy"]["exclude_apps"] == ["com.1password.app"]
+            assert cfg["privacy"]["allow_apps"] == ["com.apple.Safari"]
+            assert cfg["privacy"]["app_classes"]["com.apple.Safari"] == "browser"
 
 
 class TestResetPrivacyConfig:
