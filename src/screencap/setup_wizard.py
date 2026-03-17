@@ -646,7 +646,19 @@ def run_setup_wizard(
         return False
 
     if overrides is None:
-        console.print("  [dim]Setup cancelled, no changes saved.[/dim]")
+        # Save destination preference even though app review was skipped
+        doc = _load_config_toml(config_path)
+        if "privacy" not in doc:
+            doc.add("privacy", tomlkit.table())
+        doc["privacy"]["mode"] = mode.value
+        doc["privacy"]["upload_default"] = upload_default
+        _save_config_atomic(config_path, doc)
+        from screencap.config import invalidate_config_cache
+        invalidate_config_cache()
+        console.print(
+            "  [dim]App review skipped. Destination preference saved.[/dim] "
+            "Run [bold]screencap setup[/bold] to classify apps."
+        )
         return False
 
     # Build final config from groups + overrides
