@@ -31,6 +31,29 @@ _LLM_ENRICHED_FIELDS = ("name", "description", "category", "apps_used", "confide
 MAX_MERGE_GAP = 5.0  # max seconds between consecutive chunk boundaries
 SLUG_MAX = 60
 
+_CATEGORY_PREFIX = {
+    "development": "dev",
+    "communication": "com",
+    "research": "res",
+    "admin": "adm",
+    "creative": "cre",
+    "other": "oth",
+}
+
+# Map _classify_app() output → task category for idle-gap/v1 fallback
+_APP_CAT_TO_TASK_CAT = {
+    "CODE": "development",
+    "BROWSER": "research",
+    "CHAT": "communication",
+    "EMAIL": "communication",
+    "DOCS": "creative",
+    "DESIGN": "creative",
+    "MEDIA": "other",
+    "SYSTEM": "admin",
+    "SOCIAL": "other",
+    "OTHER": "other",
+}
+
 _storage_client: storage.Client | None = None
 
 
@@ -252,7 +275,9 @@ def _assign_folder_names(tasks: list[dict]) -> list[str]:
             slug = f"{slug}-{seen[slug]}"
         else:
             seen[slug] = 0
-        folders.append(f"{i:03d}_{slug}")
+        cat = task.get("category", "other")
+        prefix = _CATEGORY_PREFIX.get(cat, "oth")
+        folders.append(f"{prefix}_{i:03d}_{slug}")
     return folders
 
 
@@ -621,20 +646,51 @@ def _cleanup_chunk_cache(
 # App category classification (inline — Cloud Run doesn't have screencap pkg)
 # ---------------------------------------------------------------------------
 
+# Synced from screencap.privacy.context BUNDLE_ID_MAP + BROWSER_BUNDLE_IDS.
+# ContextClass mapping: CODE_EDITOR_TERMINAL→CODE, EMAIL→EMAIL, CHAT→CHAT,
+# CALENDAR→CHAT, VIDEO_CALL→CHAT, ADMIN_CONSOLE→CODE, BANKING→OTHER,
+# PASSWORD_MANAGER→OTHER, browsers→BROWSER.
 _BUNDLE_CATEGORY: dict[str, str] = {
-    # CODE
+    # CODE — editors, terminals, IDEs, DB tools
     "com.microsoft.VSCode": "CODE",
+    "com.microsoft.VSCodeInsiders": "CODE",
     "com.apple.Terminal": "CODE",
     "com.googlecode.iterm2": "CODE",
+    "co.zeit.hyper": "CODE",
+    "dev.warp.Warp-Stable": "CODE",
+    "com.mitchellh.ghostty": "CODE",
+    "io.alacritty": "CODE",
+    "net.kovidgoyal.kitty": "CODE",
+    "com.github.nicegraphic.rio": "CODE",
     "com.jetbrains.intellij": "CODE",
     "com.jetbrains.pycharm": "CODE",
     "com.jetbrains.WebStorm": "CODE",
+    "com.jetbrains.goland": "CODE",
+    "com.jetbrains.CLion": "CODE",
+    "com.jetbrains.rider": "CODE",
+    "com.jetbrains.rubymine": "CODE",
+    "com.jetbrains.datagrip": "CODE",
     "com.sublimetext.4": "CODE",
     "com.sublimetext.3": "CODE",
-    "abnerworks.Typora": "CODE",
+    "com.sublimehq.Sublime-Merge": "CODE",
     "com.todesktop.230313mzl4w4u92": "CODE",  # Cursor
-    "dev.warp.Warp-Stable": "CODE",
+    "dev.zed.Zed": "CODE",
+    "com.github.atom": "CODE",
+    "com.panic.Nova": "CODE",
+    "com.barebones.bbedit": "CODE",
+    "com.coteditor.CotEditor": "CODE",
+    "com.macromates.TextMate": "CODE",
+    "com.apple.dt.Xcode": "CODE",
+    "com.neovide.neovide": "CODE",
+    "org.gnu.Emacs": "CODE",
+    "com.codeux.irc.textual5": "CODE",
+    "abnerworks.Typora": "CODE",
     "com.github.Electron": "CODE",
+    # CODE — admin/DB consoles
+    "com.amazon.awsvpnclient": "CODE",
+    "com.pgadmin.pgadmin4": "CODE",
+    "com.sequel-pro.sequel-pro": "CODE",
+    "com.tableplus.TablePlus": "CODE",
     # BROWSER
     "com.apple.Safari": "BROWSER",
     "com.google.Chrome": "BROWSER",
@@ -644,17 +700,52 @@ _BUNDLE_CATEGORY: dict[str, str] = {
     "company.thebrowser.Browser": "BROWSER",  # Arc
     "org.chromium.Chromium": "BROWSER",
     "com.microsoft.edgemac": "BROWSER",
-    # CHAT
+    "com.vivaldi.Vivaldi": "BROWSER",
+    "com.nickvision.nicegx.nicegx": "BROWSER",  # Orion
+    "org.waterfoxproject.waterfox": "BROWSER",
+    "org.torproject.torbrowser": "BROWSER",
+    # CHAT — messaging, video calls, calendar
     "com.tinyspeck.slackmacgap": "CHAT",
-    "com.apple.MobileSMS": "CHAT",
-    "ru.keepcoder.Telegram": "CHAT",
     "com.hnc.Discord": "CHAT",
-    "us.zoom.xos": "CHAT",
+    "com.facebook.archon": "CHAT",  # Messenger
+    "ru.keepcoder.Telegram": "CHAT",
+    "net.whatsapp.WhatsApp": "CHAT",
+    "com.apple.MobileSMS": "CHAT",  # Messages
     "com.microsoft.teams2": "CHAT",
+    "us.zoom.xos": "CHAT",
+    "com.skype.skype": "CHAT",
+    "org.whispersystems.signal-desktop": "CHAT",
+    "jp.naver.line.mac": "CHAT",
+    "com.viber.osx": "CHAT",
+    "com.tencent.xinWeChat": "CHAT",
+    "im.riot.app": "CHAT",  # Element
+    "com.beeper.beeper": "CHAT",
+    "com.cisco.webexmeetings": "CHAT",
+    "com.google.chat": "CHAT",
+    "com.mattermost.desktop": "CHAT",
+    "com.wire.WireForOSX": "CHAT",
+    # CHAT — video calls
+    "us.zoom.xos.meeting": "CHAT",
+    "com.google.meet": "CHAT",
+    "com.cisco.webex.meetingmanager": "CHAT",
+    "com.logmein.GoToMeeting": "CHAT",
+    "com.apple.FaceTime": "CHAT",
+    # CHAT — calendar
+    "com.apple.iCal": "CHAT",
+    "com.flexibits.fantastical2.mac": "CHAT",
+    "com.flexibits.fantastical": "CHAT",
+    "com.busymac.busycal3": "CHAT",
     # EMAIL
     "com.apple.mail": "EMAIL",
-    "com.readdle.smartemail-macos": "EMAIL",
     "com.microsoft.Outlook": "EMAIL",
+    "com.readdle.smartemail-macos": "EMAIL",
+    "com.freron.MailMate": "EMAIL",
+    "com.superhuman.electron": "EMAIL",
+    "com.mimestream.Mimestream": "EMAIL",
+    "it.bloop.airmail2": "EMAIL",
+    "com.postbox-inc.postbox": "EMAIL",
+    "com.canarymail.mac": "EMAIL",
+    "org.mozilla.thunderbird": "EMAIL",
     # DOCS
     "com.apple.iWork.Pages": "DOCS",
     "com.apple.iWork.Numbers": "DOCS",
@@ -679,37 +770,111 @@ _BUNDLE_CATEGORY: dict[str, str] = {
 }
 
 _DOMAIN_CATEGORY: dict[str, str] = {
+    # CODE
     "github.com": "CODE",
     "gitlab.com": "CODE",
     "stackoverflow.com": "CODE",
     "bitbucket.org": "CODE",
+    "codepen.io": "CODE",
+    "replit.com": "CODE",
+    "codesandbox.io": "CODE",
+    "jsfiddle.net": "CODE",
+    "npmjs.com": "CODE",
+    "pypi.org": "CODE",
+    "crates.io": "CODE",
+    "pkg.go.dev": "CODE",
+    "rubygems.org": "CODE",
+    "hub.docker.com": "CODE",
+    "vercel.com": "CODE",
+    "netlify.com": "CODE",
+    "heroku.com": "CODE",
+    "railway.app": "CODE",
+    "console.cloud.google.com": "CODE",
+    "console.aws.amazon.com": "CODE",
+    "portal.azure.com": "CODE",
+    # EMAIL
     "mail.google.com": "EMAIL",
     "outlook.live.com": "EMAIL",
     "outlook.office.com": "EMAIL",
+    "outlook.office365.com": "EMAIL",
+    "mail.yahoo.com": "EMAIL",
+    "mail.proton.me": "EMAIL",
+    "app.fastmail.com": "EMAIL",
+    # CHAT
     "slack.com": "CHAT",
+    "app.slack.com": "CHAT",
     "discord.com": "CHAT",
     "teams.microsoft.com": "CHAT",
+    "web.whatsapp.com": "CHAT",
+    "web.telegram.org": "CHAT",
+    "meet.google.com": "CHAT",
+    "zoom.us": "CHAT",
+    # DOCS
     "docs.google.com": "DOCS",
+    "sheets.google.com": "DOCS",
+    "slides.google.com": "DOCS",
     "notion.so": "DOCS",
     "www.notion.so": "DOCS",
     "coda.io": "DOCS",
+    "airtable.com": "DOCS",
+    "linear.app": "DOCS",
+    "clickup.com": "DOCS",
+    "asana.com": "DOCS",
+    "trello.com": "DOCS",
+    "jira.atlassian.com": "DOCS",
+    "confluence.atlassian.com": "DOCS",
+    # DESIGN
     "figma.com": "DESIGN",
     "www.figma.com": "DESIGN",
+    "canva.com": "DESIGN",
+    "www.canva.com": "DESIGN",
+    "dribbble.com": "DESIGN",
+    # MEDIA
     "youtube.com": "MEDIA",
     "www.youtube.com": "MEDIA",
+    "open.spotify.com": "MEDIA",
+    "music.apple.com": "MEDIA",
+    "soundcloud.com": "MEDIA",
+    "twitch.tv": "MEDIA",
+    "www.twitch.tv": "MEDIA",
+    "netflix.com": "MEDIA",
+    # SOCIAL
     "twitter.com": "SOCIAL",
     "x.com": "SOCIAL",
     "linkedin.com": "SOCIAL",
     "www.linkedin.com": "SOCIAL",
     "reddit.com": "SOCIAL",
     "www.reddit.com": "SOCIAL",
+    "facebook.com": "SOCIAL",
+    "www.facebook.com": "SOCIAL",
+    "instagram.com": "SOCIAL",
+    "www.instagram.com": "SOCIAL",
+    "news.ycombinator.com": "SOCIAL",
 }
+
+# Bundle-ID prefix heuristics for apps not in the static map.
+_BUNDLE_PREFIX_CATEGORY: list[tuple[str, str]] = [
+    ("com.jetbrains.", "CODE"),
+    ("com.sublimetext.", "CODE"),
+    ("com.sublimehq.", "CODE"),
+    ("com.apple.dt.", "CODE"),       # Xcode tools (Instruments, etc.)
+    ("com.apple.iWork.", "DOCS"),
+    ("com.microsoft.Word", "DOCS"),
+    ("com.microsoft.Excel", "DOCS"),
+    ("com.microsoft.Powerpoint", "DOCS"),
+]
 
 
 def _classify_app(bundle_id: str, title: str = "", domain: str = "") -> str:
     """Classify an app into a category from bundle ID, title, or domain."""
+    # 1. Exact bundle ID match
     if bundle_id in _BUNDLE_CATEGORY:
         return _BUNDLE_CATEGORY[bundle_id]
+    # 2. Bundle ID prefix heuristics
+    for prefix, cat in _BUNDLE_PREFIX_CATEGORY:
+        if bundle_id.startswith(prefix):
+            return cat
+    # 3. Domain match
     if domain:
         if domain in _DOMAIN_CATEGORY:
             return _DOMAIN_CATEGORY[domain]
@@ -984,13 +1149,19 @@ Also provide a SESSION SUMMARY:
 - time_breakdown: approximate percentage per category
 - key_accomplishments: 2-4 bullet points of specific things completed
 
+Also provide TAGS for the entire recording session:
+- tags: 3-8 lowercase hyphenated labels describing the session
+  (e.g., "python", "debugging", "email-triage", "code-review", "api-design")
+- Capture: languages, frameworks, tools, activity types, and domains
+- Use only lowercase letters, numbers, and hyphens
+
 RULES:
 - Every second of the recording must be covered by exactly one task (no gaps, no overlaps)
 - Name tasks by INTENT not by app name
 - A task should be at least 1 minute long
 - start_time of first task must be "0:00:00"
 
-Return ONLY valid JSON: {{"tasks": [...], "summary": {{...}}}}"""
+Return ONLY valid JSON: {{"tasks": [...], "summary": {{...}}, "tags": [...]}}"""
 
 _RESPONSE_SCHEMA = {
     "type": "object",
@@ -1032,8 +1203,12 @@ _RESPONSE_SCHEMA = {
             "required": ["overview", "primary_focus", "time_breakdown",
                          "key_accomplishments"],
         },
+        "tags": {
+            "type": "array",
+            "items": {"type": "string"},
+        },
     },
-    "required": ["tasks", "summary"],
+    "required": ["tasks", "summary", "tags"],
 }
 
 
@@ -1102,6 +1277,25 @@ def _call_gemini(prompt: str) -> dict | None:
 _VALID_CATEGORIES = frozenset(
     {"development", "communication", "research", "admin", "creative", "other"}
 )
+
+_TAG_RE = re.compile(r"^[a-z0-9][a-z0-9-]{0,30}$")
+_MAX_TAGS = 8
+
+
+def _validate_tags(raw: list) -> list[str]:
+    """Validate and normalize LLM-generated tags."""
+    seen: set[str] = set()
+    result: list[str] = []
+    for t in raw:
+        if not isinstance(t, str):
+            continue
+        t = t.lower().strip()
+        if _TAG_RE.match(t) and t not in seen:
+            seen.add(t)
+            result.append(t)
+        if len(result) >= _MAX_TAGS:
+            break
+    return result
 
 
 def _validate_llm_tasks(
@@ -1194,7 +1388,9 @@ def _validate_llm_tasks(
     if not summary.get("key_accomplishments"):
         summary["key_accomplishments"] = []
 
-    return {"tasks": converted, "summary": summary}
+    tags = _validate_tags(llm_result.get("tags", []))
+
+    return {"tasks": converted, "summary": summary, "tags": tags}
 
 
 # ---------------------------------------------------------------------------
@@ -1241,6 +1437,7 @@ def _simple_segment_from_events(
             "start_ts": session_start,
             "end_ts": session_end,
             "derived_name": "recording",
+            "category": "other",
             "dominant_app": "", "dominant_app_name": "",
             "dominant_title": "", "dominant_pct": 0.0,
             "all_apps": {}, "rest_after_s": 0.0, "event_count": 0,
@@ -1293,9 +1490,11 @@ def _simple_segment_from_events(
             else _slugify(app_name)
         )
 
+        app_cat = _classify_app(dom_bundle)
         task = {
             "start_ts": start, "end_ts": end,
             "derived_name": derived,
+            "category": _APP_CAT_TO_TASK_CAT.get(app_cat, "other"),
             "dominant_app": dom_bundle,
             "dominant_app_name": app_name,
             "dominant_title": dom_title[:80] if dom_title else "",
@@ -1383,13 +1582,14 @@ def _map_tasks_to_chunks(tasks: list[dict], manifests: list[dict]) -> list[dict]
 def _process_v2_manifests(
     recording_name: str,
     manifests: list[dict],
-) -> tuple[list[dict], str, dict | None]:
+) -> tuple[list[dict], str, dict | None, list[str]]:
     """Process v2 manifests: try LLM segmentation, fallback to idle-gap.
 
-    Returns (tasks, segmentation_method, summary_or_None).
+    Returns (tasks, segmentation_method, summary_or_None, tags).
     """
     tasks = None
     summary = None
+    tags: list[str] = []
     segmentation_method = "idle"
     activity_data = None
 
@@ -1421,6 +1621,7 @@ def _process_v2_manifests(
             if validated:
                 tasks = _map_tasks_to_chunks(validated["tasks"], manifests)
                 summary = validated["summary"]
+                tags = validated.get("tags", [])
                 segmentation_method = "llm"
                 log.info("%s: LLM segmentation → %d tasks", recording_name, len(tasks))
             else:
@@ -1443,7 +1644,73 @@ def _process_v2_manifests(
         segmentation_method = "idle"
         log.info("%s: simple segmentation → %d tasks", recording_name, len(tasks))
 
-    return tasks, segmentation_method, summary
+    return tasks, segmentation_method, summary, tags
+
+
+# ---------------------------------------------------------------------------
+# Cross-recording session index
+# ---------------------------------------------------------------------------
+
+def _update_session_index(
+    recording_name: str,
+    timeline: dict,
+    tags: list[str],
+    max_retries: int = 3,
+) -> None:
+    """Upsert this recording into sessions/_index.json with optimistic locking."""
+    index_blob_name = "sessions/_index.json"
+
+    for attempt in range(max_retries):
+        try:
+            blob = _bucket().blob(index_blob_name)
+            try:
+                blob.reload()
+                raw = blob.download_as_bytes()
+                index = json.loads(raw)
+                generation = blob.generation
+            except Exception:
+                index = {"version": 1, "recordings": {}}
+                generation = 0  # blob doesn't exist yet
+
+            # Build entry from timeline data
+            summary = timeline.get("summary", {})
+            task_entries = timeline.get("tasks", [])
+            index["recordings"][recording_name] = {
+                "processed_at": timeline.get("processed_at"),
+                "segmentation_method": timeline.get("segmentation_method"),
+                "total_tasks": timeline.get("total_tasks", 0),
+                "total_duration_s": timeline.get("total_duration_s", 0),
+                "primary_focus": summary.get("primary_focus", "other"),
+                "overview": (summary.get("overview") or "")[:200],
+                "categories": sorted(set(
+                    t.get("category", "other") for t in task_entries
+                )),
+                "tags": tags,
+                "task_folders": [
+                    {"folder": t.get("folder", ""), "category": t.get("category", "other")}
+                    for t in task_entries
+                ],
+            }
+            index["updated_at"] = datetime.now(timezone.utc).isoformat()
+            index["total_recordings"] = len(index["recordings"])
+
+            blob.upload_from_string(
+                json.dumps(index, indent=2, ensure_ascii=False),
+                content_type="application/json",
+                if_generation_match=generation,
+            )
+            log.info("Updated session index for %s", recording_name)
+            return
+
+        except Exception as exc:
+            if "PreconditionFailed" in type(exc).__name__ or "412" in str(exc):
+                log.info("Index write conflict (attempt %d/%d), retrying",
+                         attempt + 1, max_retries)
+                continue
+            log.warning("Failed to update session index: %s", exc)
+            return  # Non-retryable error — don't block processing
+
+    log.warning("Failed to update session index after %d retries", max_retries)
 
 
 # ---------------------------------------------------------------------------
@@ -1590,7 +1857,7 @@ def process_recording(cloud_event):
 
     if format_version >= 2:
         # v2 manifests — LLM segmentation path (with idle-gap fallback)
-        merged_tasks, segmentation_method, session_summary = _process_v2_manifests(
+        merged_tasks, segmentation_method, session_summary, session_tags = _process_v2_manifests(
             recording_name, manifests,
         )
         log.info(
@@ -1599,9 +1866,14 @@ def process_recording(cloud_event):
         )
     else:
         # Legacy v1 manifests — existing cross-chunk merge
+        session_tags: list[str] = []
         tasks_before = sum(len(m.get("tasks", [])) for m in manifests)
         rest_threshold = manifests[0].get("rest_threshold_secs", DEFAULT_REST_THRESHOLD)
         merged_tasks = _merge_tasks(manifests, rest_threshold)
+        for t in merged_tasks:
+            if "category" not in t:
+                app_cat = _classify_app(t.get("dominant_app", ""))
+                t["category"] = _APP_CAT_TO_TASK_CAT.get(app_cat, "other")
         log.info(
             "%s: v1 path — %d chunks, %d tasks before merge, %d after",
             recording_name, len(manifests), tasks_before, len(merged_tasks),
@@ -1664,6 +1936,7 @@ def process_recording(cloud_event):
         "total_chunks": len(manifests),
         "total_duration_s": round(total_duration, 1),
         "total_active_s": round(total_active_s, 1),
+        "tags": session_tags,
         "tasks": timeline_tasks,
     }
 
@@ -1678,6 +1951,11 @@ def process_recording(cloud_event):
         )
 
     _upload_json(f"{sessions_prefix}timeline.json", timeline)
+
+    try:
+        _update_session_index(recording_name, timeline, session_tags)
+    except Exception:
+        log.warning("Index update failed for %s", recording_name, exc_info=True)
 
     # Upload processing status
     _upload_json(f"{sessions_prefix}_processing_status.json", {
