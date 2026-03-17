@@ -1670,12 +1670,42 @@ def settings():
 
 
 def _check_presidio_analyzer() -> tuple[str, bool, str]:
-    """Instantiate AnalyzerEngine (loads bundled YAML recognizer configs)."""
+    """Instantiate AnalyzerEngine with no-op NLP (validates bundled YAML recognizer configs).
+
+    Uses a stub NLP engine to avoid triggering spaCy model loading, which in
+    a frozen binary calls sys.executable -m pip (i.e. screencap -m pip) and
+    crashes with a Click UsageError.  spaCy model loading is tested separately
+    by _check_spacy_model.
+    """
     import traceback as _tb
     name = "presidio_analyzer"
     try:
         from presidio_analyzer import AnalyzerEngine
-        AnalyzerEngine()
+        from presidio_analyzer.nlp_engine import NlpEngine, NlpArtifacts
+
+        class _NoOpNlpEngine(NlpEngine):
+            def load(self): pass
+            def is_loaded(self): return True
+            def process_text(self, text, language):
+                return NlpArtifacts(
+                    entities=[], tokens=[], lemmas=[],
+                    tokens_indices=[], dependencies=[],
+                    keywords=[], language=language,
+                )
+            def process_batch(self, texts, language, **kwargs):
+                for text in texts:
+                    yield text, self.process_text(text, language)
+            def is_stopword(self, word, language): return False
+            def is_punct(self, word, language): return False
+            def get_supported_entities(self): return []
+            def get_supported_languages(self): return ["en"]
+
+        analyzer = AnalyzerEngine(nlp_engine=_NoOpNlpEngine())
+        recognizers = analyzer.registry.get_recognizers(
+            language="en", all_fields=True,
+        )
+        if not recognizers:
+            return name, False, "No recognizers loaded — YAML config missing?"
         return name, True, ""
     except Exception:
         return name, False, _tb.format_exc()
@@ -1803,7 +1833,7 @@ def smoke_test(verbose):
     for check_fn in _SMOKE_CHECKS:
         try:
             result = check_fn()
-        except Exception:
+        except BaseException:
             result = (check_fn.__name__.replace("_check_", ""), False, traceback.format_exc())
         results.append(result)
 
