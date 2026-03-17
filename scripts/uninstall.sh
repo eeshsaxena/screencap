@@ -39,4 +39,4 @@ done
 echo "screencap uninstalled."
 echo "Note: ~/.screencap/recordings/ and ~/.screencap/config.toml were preserved."
 echo "Note: If Python was installed by the screencap installer, it was NOT removed."
-echo "      To remove it, use the Python uninstaller in /Applications/Python 3.12/"
+echo "      To remove it, check /Applications/ for a Python uninstaller."

@@ -107,6 +107,9 @@ install_python_pkg() {
 
     echo ""
     echo "This will install Python ${PYTHON_VERSION} system-wide (requires admin password)."
+    printf "Continue? [y/N] "
+    read -r answer < /dev/tty || answer="n"
+    case "$answer" in [yY]*) ;; *) echo "Aborted."; exit 1 ;; esac
     echo ""
     sudo installer -pkg "$SCRATCH_DIR/python.pkg" -target /
 }
@@ -146,6 +149,7 @@ install_via_pip() {
 
     # Fresh log for this install attempt
     : > "$PIP_LOG"
+    chmod 600 "$PIP_LOG"
 
     # Upgrade pip inside venv
     "$VENV_DIR/bin/pip" install --upgrade pip >>"$PIP_LOG" 2>&1
@@ -224,6 +228,11 @@ if [ -z "$VERSION" ]; then
     fi
 fi
 
+# Validate version format (digits and dots only)
+case "$VERSION" in
+    *[!0-9.]*) echo "ERROR: Invalid version format: $VERSION" >&2; exit 1 ;;
+esac
+
 # ---------------------------------------------------------------------------
 # Scratch directory (cleaned up on exit)
 # ---------------------------------------------------------------------------
@@ -249,6 +258,20 @@ if [ "$INSTALL_METHOD_OVERRIDE" = "pip" ]; then
     echo "Note: screencap requires Screen Recording and Accessibility"
     echo "permissions. You'll be prompted to grant these on first use."
     exit 0
+fi
+
+# Skip binary download if previous install used pip (saves ~30s + bandwidth)
+if [ -f "${HOME}/.screencap/.install_method" ] && [ "$INSTALL_METHOD_OVERRIDE" != "binary" ]; then
+    prev_method=$(cat "${HOME}/.screencap/.install_method")
+    if [ "$prev_method" = "pip" ]; then
+        echo "Previous install used pip — skipping binary download..."
+        install_via_pip
+        echo "Run 'screencap --help' to get started."
+        echo ""
+        echo "Note: screencap requires Screen Recording and Accessibility"
+        echo "permissions. You'll be prompted to grant these on first use."
+        exit 0
+    fi
 fi
 
 # ---------------------------------------------------------------------------
