@@ -44,6 +44,23 @@ def _fmt_size(nbytes: int) -> str:
     return f"{nbytes / (1024 * 1024 * 1024):.1f} GB"
 
 
+_CATEGORY_PREFIX = {
+    "development": "dev", "communication": "com", "research": "res",
+    "admin": "adm", "creative": "cre", "other": "oth",
+}
+
+
+@dataclass
+class RemoteSession:
+    name: str
+    processed_at: str
+    total_tasks: int
+    total_duration_s: float
+    primary_focus: str
+    categories: list[str]
+    tags: list[str]
+
+
 @dataclass
 class RemoteRecording:
     name: str
@@ -123,6 +140,55 @@ def list_remote_recordings(source: str = "recordings") -> list[RemoteRecording]:
     ]
 
 
+def fetch_session_index() -> dict:
+    """Fetch the cross-recording session index from the Cloud Function."""
+    url = _get_download_url()
+    try:
+        resp = requests.post(url, json={"action": "get-index"}, timeout=60)
+    except (requests.ConnectionError, requests.Timeout):
+        return {"version": 1, "recordings": {}}
+    if resp.status_code != 200:
+        return {"version": 1, "recordings": {}}
+    return resp.json()
+
+
+def list_remote_sessions(
+    tag: str | None = None,
+    category: str | None = None,
+) -> list[RemoteSession]:
+    """Fetch session index and optionally filter by tag or category."""
+    index = fetch_session_index()
+    sessions: list[RemoteSession] = []
+    for name, info in index.get("recordings", {}).items():
+        session = RemoteSession(
+            name=name,
+            processed_at=info.get("processed_at", ""),
+            total_tasks=info.get("total_tasks", 0),
+            total_duration_s=info.get("total_duration_s", 0),
+            primary_focus=info.get("primary_focus", "other"),
+            categories=info.get("categories", []),
+            tags=info.get("tags", []),
+        )
+        if tag and tag not in session.tags:
+            continue
+        if category and category not in session.categories:
+            continue
+        sessions.append(session)
+    return sessions
+
+
+def filter_urls_by_category(urls: dict[str, str], category: str) -> dict[str, str]:
+    """Filter download URLs to task folders matching a category prefix.
+
+    Always includes non-task files (timeline.json, _processing_status.json).
+    """
+    prefix = _CATEGORY_PREFIX.get(category, "oth")
+    return {
+        k: v for k, v in urls.items()
+        if f"tasks/{prefix}_" in k or "tasks/" not in k
+    }
+
+
 def request_signed_urls(
     recording_name: str, source: str = "recordings",
 ) -> tuple[dict[str, str], str]:
@@ -198,6 +264,7 @@ def download_recording(
     force: bool = False,
     jobs: int = 4,
     source: str = "recordings",
+    category_filter: str | None = None,
 ) -> DownloadResult:
     """Download all files for a single recording (or session).
 
@@ -218,6 +285,9 @@ def download_recording(
     # Get signed URLs (just before download to avoid expiry)
     urls, gcs_prefix = request_signed_urls(name, source=source)
     result.gcs_prefix = gcs_prefix
+
+    if category_filter:
+        urls = filter_urls_by_category(urls, category_filter)
 
     if not urls:
         console.print(f"  [dim]No files found for {name}.[/dim]")
