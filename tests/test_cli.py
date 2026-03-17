@@ -1277,3 +1277,66 @@ def test_upload_cloud_intent_proceeds(tmp_path):
     mock_upload.assert_called_once()
     # No scrub warning in output
     assert "scrub" not in result.output.lower()
+
+
+# --- _smoke-test command tests ---
+
+
+def test_smoke_test_hidden_from_help():
+    """_smoke-test should not appear in --help output."""
+    runner = CliRunner()
+    result = runner.invoke(cli, ["--help"])
+    assert result.exit_code == 0
+    assert "_smoke-test" not in result.output
+
+
+def _make_failing_check():
+    """Return a check function that fails with a traceback."""
+    def _check_broken():
+        import traceback as _tb
+        try:
+            raise RuntimeError("broken subsystem")
+        except Exception:
+            return "broken_check", False, _tb.format_exc()
+    return _check_broken
+
+
+def test_smoke_test_exits_nonzero_on_failure():
+    """_smoke-test exits 1 when any check fails — this is the CI contract."""
+    runner = CliRunner()
+    with mock.patch(
+        "screencap.cli._SMOKE_CHECKS",
+        [_make_failing_check()],
+    ):
+        result = runner.invoke(cli, ["_smoke-test"])
+    assert result.exit_code == 1
+    assert "FAIL" in result.output
+    # Non-verbose: shows error summary (last line of traceback), not full traceback
+    assert "RuntimeError: broken subsystem" in result.output
+    assert "Traceback" not in result.output
+
+
+def test_smoke_test_verbose_shows_full_traceback():
+    """--verbose shows the full traceback, not just the summary line."""
+    runner = CliRunner()
+    with mock.patch(
+        "screencap.cli._SMOKE_CHECKS",
+        [_make_failing_check()],
+    ):
+        result = runner.invoke(cli, ["_smoke-test", "--verbose"])
+    assert result.exit_code == 1
+    assert "Traceback" in result.output
+    assert "RuntimeError: broken subsystem" in result.output
+
+
+def test_smoke_test_exits_zero_on_all_pass():
+    """_smoke-test exits 0 when all checks pass and reports dev/frozen mode."""
+    runner = CliRunner()
+    with mock.patch(
+        "screencap.cli._SMOKE_CHECKS",
+        [lambda: ("always_passes", True, "")],
+    ):
+        result = runner.invoke(cli, ["_smoke-test"])
+    assert result.exit_code == 0
+    assert "PASS" in result.output
+    assert "dev install" in result.output

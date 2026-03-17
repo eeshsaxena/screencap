@@ -26,8 +26,9 @@ benchmark_results/
 *.swp
 *.swo
 
-# Project
-docs/
+# Project — ignore docs/ except docs/solutions/
+docs/*
+!docs/solutions/
 
 .claude/*
 !.claude/commands/

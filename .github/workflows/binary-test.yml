@@ -1,0 +1,94 @@
+name: Binary Smoke Test
+
+on:
+  pull_request:
+    paths:
+      - 'pyinstaller/**'
+      - 'pyproject.toml'
+      - 'src/screencap/privacy/**'
+      - 'src/screencap/cli.py'
+      - 'src/screencap/__init__.py'
+      - 'packages/screencap-engine/**'
+      - '.github/workflows/binary-test.yml'
+
+concurrency:
+  group: binary-test-${{ github.event.pull_request.number }}
+  cancel-in-progress: true
+
+permissions: {}
+
+jobs:
+  build-and-test:
+    if: github.event.pull_request.draft == false
+    permissions:
+      contents: read
+    env:
+      MACOSX_DEPLOYMENT_TARGET: "11.0"
+    strategy:
+      matrix:
+        include:
+          - runner: macos-14
+            arch: arm64
+            python-arch: arm64
+            minos-target: "14.0"
+          - runner: macos-15-intel
+            arch: x86_64
+            python-arch: x64
+            minos-target: "14.0"
+    runs-on: ${{ matrix.runner }}
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/setup-python@v5
+        with:
+          python-version: '3.12'
+          architecture: ${{ matrix.python-arch }}
+
+      - uses: actions/cache@v4
+        with:
+          path: ~/.cache/pip
+          key: ${{ runner.os }}-${{ matrix.runner }}-${{ matrix.arch }}-pip-${{ hashFiles('pyproject.toml') }}
+
+      - name: Install dependencies
+        run: pip install -e ".[record]" && pip install pyinstaller
+
+      - name: Download spaCy model
+        run: python -m spacy download en_core_web_sm
+
+      - name: Build frozen binary
+        run: pyinstaller pyinstaller/screencap.spec
+
+      - name: Smoke test (help)
+        run: ./dist/screencap/screencap --help
+
+      - name: Smoke test (subsystems)
+        run: ./dist/screencap/screencap _smoke-test
+        timeout-minutes: 2
+
+      - name: Verify deployment target (minos)
+        run: |
+          TARGET_MINOS="${{ matrix.minos-target }}"
+          FAIL=0
+          COUNT=0
+          while IFS= read -r f; do
+            COUNT=$((COUNT + 1))
+            minos=$(otool -l "$f" 2>/dev/null | grep -A3 LC_BUILD_VERSION | grep minos | awk '{print $2}')
+            if [ -z "$minos" ]; then
+              minos=$(otool -l "$f" 2>/dev/null | grep -A3 LC_VERSION_MIN_MACOSX | grep version | head -1 | awk '{print $2}')
+            fi
+            if [ -n "$minos" ]; then
+              if [ "$(printf '%s\n' "$TARGET_MINOS" "$minos" | sort -V | tail -1)" != "$TARGET_MINOS" ]; then
+                echo "FAIL: $f has minos $minos (target: $TARGET_MINOS)"
+                FAIL=1
+              fi
+            fi
+          done < <(find dist/screencap -type f \( -name "*.dylib" -o -name "*.so" -o -name "screencap" \))
+          if [ "$COUNT" -eq 0 ]; then
+            echo "::error::No binaries found to verify in dist/screencap"
+            exit 1
+          fi
+          if [ "$FAIL" -ne 0 ]; then
+            echo "::error::Bundled binaries exceed deployment target minos $TARGET_MINOS"
+            exit 1
+          fi
+          echo "All $COUNT bundled binaries pass minos <= $TARGET_MINOS"

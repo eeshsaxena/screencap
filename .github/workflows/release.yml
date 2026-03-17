@@ -41,14 +41,21 @@ jobs:
       - name: Install dependencies
         run: pip install -e ".[record]" && pip install pyinstaller
 
+      - name: Download spaCy model
+        run: python -m spacy download en_core_web_sm
+
       - name: Audit dependencies
         run: pip install pip-audit && pip-audit
 
       - name: Build frozen binary
         run: pyinstaller pyinstaller/screencap.spec
 
-      - name: Smoke test
+      - name: Smoke test (help)
         run: ./dist/screencap/screencap --help
+
+      - name: Smoke test (subsystems)
+        run: ./dist/screencap/screencap _smoke-test
+        timeout-minutes: 2
 
       - name: Verify deployment target (minos)
         run: |
@@ -148,3 +155,37 @@ jobs:
             checksums.sha256 \
           || gh release edit "v${VERSION}" \
             --notes-file release_notes.txt
+
+  verify-install:
+    needs: release
+    permissions:
+      contents: read
+    strategy:
+      matrix:
+        include:
+          - runner: macos-14
+            arch: arm64
+          - runner: macos-15-intel
+            arch: x86_64
+    runs-on: ${{ matrix.runner }}
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Install via install.sh
+        env:
+          SCREENCAP_VERSION: ${{ github.ref_name }}
+          SCREENCAP_NO_MODIFY_PATH: "1"
+          SCREENCAP_INSTALL_METHOD: "binary"
+        run: |
+          # install.sh expects version without v prefix
+          export SCREENCAP_VERSION="${SCREENCAP_VERSION#v}"
+          bash scripts/install.sh
+
+      - name: Strip quarantine
+        run: xattr -dr com.apple.quarantine ~/.screencap/bin/
+
+      - name: Verify installed binary
+        run: |
+          ~/.screencap/bin/screencap/screencap --version
+          ~/.screencap/bin/screencap/screencap _smoke-test
+        timeout-minutes: 2
