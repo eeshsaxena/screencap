@@ -102,6 +102,11 @@ all_hiddenimports += hidden_imports
 import os
 _root = os.path.abspath(os.path.join(SPECPATH, '..'))
 
+# UT1 domain blocklist data files (privacy context classification)
+import glob as _glob
+_ut1_files = _glob.glob(os.path.join(_root, 'src', 'screencap', 'privacy', 'data', 'ut1', '*.txt'))
+all_datas += [(f, os.path.join('screencap', 'privacy', 'data', 'ut1')) for f in _ut1_files]
+
 a = Analysis(
     ['main.py'],
     pathex=[

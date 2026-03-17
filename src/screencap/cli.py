@@ -1664,5 +1664,171 @@ def settings():
     console.print()
 
 
+# ---------------------------------------------------------------------------
+# _smoke-test (hidden) — validate critical subsystems load in frozen binary
+# ---------------------------------------------------------------------------
+
+
+def _check_presidio_analyzer() -> tuple[str, bool, str]:
+    """Instantiate AnalyzerEngine (loads bundled YAML recognizer configs)."""
+    import traceback as _tb
+    name = "presidio_analyzer"
+    try:
+        from presidio_analyzer import AnalyzerEngine
+        AnalyzerEngine()
+        return name, True, ""
+    except Exception:
+        return name, False, _tb.format_exc()
+
+
+def _check_fast_gliner() -> tuple[str, bool, str]:
+    """Import fast_gliner (verifies Rust extension + static ONNX)."""
+    import traceback as _tb
+    name = "fast_gliner"
+    try:
+        from fast_gliner import FastGLiNER  # noqa: F401
+        return name, True, ""
+    except Exception:
+        return name, False, _tb.format_exc()
+
+
+def _check_detect_secrets_plugins() -> tuple[str, bool, str]:
+    """Instantiate DetectSecretsDetector (validates all plugin submodules load)."""
+    import traceback as _tb
+    name = "detect_secrets_plugins"
+    try:
+        from screencap.privacy.secrets import DetectSecretsDetector
+        DetectSecretsDetector()
+        return name, True, ""
+    except Exception:
+        return name, False, _tb.format_exc()
+
+
+def _check_spacy_model() -> tuple[str, bool, str]:
+    """Load en_core_web_sm spaCy model (verifies bundled model data)."""
+    import traceback as _tb
+    name = "spacy_model"
+    try:
+        import spacy
+        spacy.load("en_core_web_sm")
+        return name, True, ""
+    except Exception:
+        return name, False, _tb.format_exc()
+
+
+def _check_av_codecs() -> tuple[str, bool, str]:
+    """Import av and verify libx264 codec (verifies ffmpeg dylibs)."""
+    import traceback as _tb
+    name = "av_codecs"
+    try:
+        import av
+        av.codec.Codec("libx264", "w")
+        return name, True, ""
+    except Exception:
+        return name, False, _tb.format_exc()
+
+
+def _check_pynput() -> tuple[str, bool, str]:
+    """Import pynput keyboard and mouse listeners (import only)."""
+    import traceback as _tb
+    name = "pynput"
+    try:
+        from pynput.keyboard import Listener as KL  # noqa: F401
+        from pynput.mouse import Listener as ML  # noqa: F401
+        return name, True, ""
+    except Exception:
+        return name, False, _tb.format_exc()
+
+
+def _check_sounddevice() -> tuple[str, bool, str]:
+    """Import sounddevice (import only — device enumeration needs permission)."""
+    import traceback as _tb
+    name = "sounddevice"
+    try:
+        import sounddevice  # noqa: F401
+        return name, True, ""
+    except Exception:
+        return name, False, _tb.format_exc()
+
+
+def _check_domain_index() -> tuple[str, bool, str]:
+    """Instantiate DefaultContextClassifier (exercises build_domain_index → load_ut1_domains)."""
+    import traceback as _tb
+    name = "domain_index"
+    try:
+        from screencap.privacy.context import DefaultContextClassifier
+        DefaultContextClassifier()
+        return name, True, ""
+    except Exception:
+        return name, False, _tb.format_exc()
+
+
+def _check_onnxruntime_excluded() -> tuple[str, bool, str]:
+    """Verify onnxruntime is NOT importable (confirms exclusion in spec)."""
+    name = "onnxruntime_excluded"
+    try:
+        import onnxruntime  # noqa: F401
+        return name, False, "onnxruntime should not be importable but was"
+    except ImportError:
+        return name, True, ""
+    except Exception:
+        import traceback as _tb
+        return name, False, _tb.format_exc()
+
+
+_SMOKE_CHECKS = [
+    _check_presidio_analyzer,
+    _check_fast_gliner,
+    _check_detect_secrets_plugins,
+    _check_spacy_model,
+    _check_av_codecs,
+    _check_pynput,
+    _check_sounddevice,
+    _check_domain_index,
+    _check_onnxruntime_excluded,
+]
+
+
+@cli.command("_smoke-test", hidden=True)
+@click.option("--verbose", "-v", is_flag=True, help="Show full tracebacks.")
+def smoke_test(verbose):
+    """Validate critical subsystems load correctly (internal)."""
+    import traceback
+
+    frozen = getattr(sys, "frozen", False)
+    mode = "frozen binary" if frozen else "dev install"
+    console.print(f"\nscreencap smoke test ({mode})\n")
+
+    results: list[tuple[str, bool, str]] = []
+    for check_fn in _SMOKE_CHECKS:
+        try:
+            result = check_fn()
+        except Exception:
+            result = (check_fn.__name__.replace("_check_", ""), False, traceback.format_exc())
+        results.append(result)
+
+        name, passed, err = result
+        if passed:
+            console.print(f"  [green]\\[PASS][/green] {name}")
+        else:
+            # err contains the full traceback; show last line for summary,
+            # full traceback when --verbose
+            err_summary = err.strip().rsplit("\n", 1)[-1]
+            console.print(f"  [red]\\[FAIL][/red] {name} — {err_summary}")
+            if verbose:
+                console.print(err)
+
+    passed_count = sum(1 for _, p, _ in results if p)
+    total = len(results)
+    failed_count = total - passed_count
+
+    console.print()
+    if failed_count:
+        console.print(f"{passed_count}/{total} checks passed, {failed_count} failed")
+        sys.exit(1)
+    else:
+        console.print(f"All {total} checks passed")
+
+
 if __name__ == "__main__":
     cli()
