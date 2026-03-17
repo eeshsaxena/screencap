@@ -5,6 +5,18 @@ All notable changes to this project will be documented in this file.
 The format is based on [Keep a Changelog](https://keepachangelog.com/),
 and this project adheres to [Semantic Versioning](https://semver.org/).
 
+## [0.12.3] - 2026-03-17
+
+### Added
+- **install:** Reactive pip fallback for incompatible binaries
+- **ci:** Add _smoke-test CLI command and binary smoke testing workflows
+
+### Fixed
+- **ci:** Prevent presidio AnalyzerEngine from spawning subprocesses in frozen binary
+- **ci:** Pre-import en_core_web_sm for frozen binary spaCy compatibility
+- **ci:** Install en_core_web_sm spaCy model before PyInstaller build
+- **install:** Harden install scripts from code review
+
 ## [0.12.2] - 2026-03-16
 
 ### Fixed
