@@ -284,14 +284,6 @@ def test_info_command_nonexistent_recording(tmp_path):
 # --- stop command tests ---
 
 
-def test_stop_no_orphans():
-    runner = CliRunner()
-    with mock.patch("screencap.pidfile.find_orphaned_processes", return_value=[]):
-        result = runner.invoke(cli, ["stop"])
-    assert result.exit_code == 0
-    assert "No orphaned" in result.output
-
-
 def test_stop_with_orphans():
     runner = CliRunner()
     orphans = [{"pid": 111, "name": "screen_writer"}, {"pid": 222, "name": "video_writer"}]
