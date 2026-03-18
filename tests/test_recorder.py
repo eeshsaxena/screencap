@@ -813,6 +813,180 @@ class TestPrivacyFilterInitFailure:
         assert exc_info.value.code == 1
 
 
+class TestSignalHandlerTiming:
+    """Tests for signal handler installation order and safety guards."""
+
+    def _get_start_recording_ast(self):
+        """Parse the AST of start_recording()."""
+        import screencap.recorder as mod
+
+        source = inspect.getsource(mod.start_recording)
+        return ast.parse(source)
+
+    def _find_function(self, tree, name):
+        """Find a FunctionDef by name in the AST."""
+        for node in ast.walk(tree):
+            if isinstance(node, ast.FunctionDef) and node.name == name:
+                return node
+        return None
+
+    def test_signal_handler_installed_before_recorder_enter(self):
+        """signal.signal(SIGINT/SIGTERM) must appear before Recorder() context entry.
+
+        The handler must be active during Recorder.__enter__() and wait_for_ready()
+        to prevent a window where signals are ignored or use default handlers.
+        """
+        tree = self._get_start_recording_ast()
+
+        # Find signal.signal(signal.SIGINT, ...) calls
+        sigint_lines = []
+        recorder_lines = []
+
+        for node in ast.walk(tree):
+            # Match signal.signal(signal.SIGINT, ...)
+            if (
+                isinstance(node, ast.Call)
+                and isinstance(node.func, ast.Attribute)
+                and node.func.attr == "signal"
+                and isinstance(node.func.value, ast.Name)
+                and node.func.value.id == "signal"
+                and node.args
+                and isinstance(node.args[0], ast.Attribute)
+                and node.args[0].attr == "SIGINT"
+            ):
+                sigint_lines.append(node.lineno)
+
+            # Match Recorder(...) as context manager (with statement)
+            if isinstance(node, ast.With):
+                for item in node.items:
+                    call = item.context_expr
+                    if (
+                        isinstance(call, ast.Call)
+                        and isinstance(call.func, ast.Name)
+                        and call.func.id == "Recorder"
+                    ):
+                        recorder_lines.append(node.lineno)
+
+        assert sigint_lines, "No signal.signal(SIGINT, ...) call found"
+        assert recorder_lines, "No 'with Recorder(...)' found"
+
+        first_sigint = min(sigint_lines)
+        first_recorder = min(recorder_lines)
+        assert first_sigint < first_recorder, (
+            f"signal.signal(SIGINT) at line {first_sigint} must come before "
+            f"Recorder() at line {first_recorder}"
+        )
+
+    def test_force_exit_guards_recorder_stop(self):
+        """_force_exit must guard recorder.stop() with 'if recorder is not None'.
+
+        When SIGINT arrives before Recorder.__enter__(), recorder is None.
+        Calling recorder.stop() without a guard would crash with AttributeError.
+        """
+        tree = self._get_start_recording_ast()
+        force_exit_fn = self._find_function(tree, "_force_exit")
+        assert force_exit_fn is not None, "_force_exit not found"
+
+        # Find all recorder.stop() calls
+        stop_calls = []
+        for node in ast.walk(force_exit_fn):
+            if (
+                isinstance(node, ast.Call)
+                and isinstance(node.func, ast.Attribute)
+                and node.func.attr == "stop"
+                and isinstance(node.func.value, ast.Name)
+                and node.func.value.id == "recorder"
+            ):
+                stop_calls.append(node)
+
+        assert stop_calls, "No recorder.stop() call found in _force_exit"
+
+        # Each recorder.stop() should be inside an 'if recorder is not None'
+        for stop_call in stop_calls:
+            # Walk up to find parent If node
+            found_guard = False
+            for node in ast.walk(force_exit_fn):
+                if isinstance(node, ast.If):
+                    # Check for 'recorder is not None' pattern
+                    test = node.test
+                    if (
+                        isinstance(test, ast.Compare)
+                        and isinstance(test.left, ast.Name)
+                        and test.left.id == "recorder"
+                        and any(isinstance(op, ast.IsNot) for op in test.ops)
+                    ):
+                        # Check if stop_call is in this If's body
+                        for child in ast.walk(node):
+                            if child is stop_call:
+                                found_guard = True
+                                break
+                if found_guard:
+                    break
+            assert found_guard, "recorder.stop() in _force_exit not guarded by 'if recorder is not None'"
+
+    def test_force_exit_fallback_to_active_children(self):
+        """Force-quit must fall back to multiprocessing.active_children() when _child_pids is empty."""
+        tree = self._get_start_recording_ast()
+        force_exit_fn = self._find_function(tree, "_force_exit")
+        assert force_exit_fn is not None
+
+        # Look for active_children() call in _force_exit
+        found = False
+        for node in ast.walk(force_exit_fn):
+            if (
+                isinstance(node, ast.Call)
+                and isinstance(node.func, ast.Attribute)
+                and node.func.attr == "active_children"
+            ):
+                found = True
+                break
+
+        assert found, (
+            "_force_exit must call multiprocessing.active_children() "
+            "as fallback when _child_pids is empty"
+        )
+
+    def test_sigterm_handler_guards_recorder_stop(self):
+        """_sigterm_handler must guard recorder.stop() with 'if recorder is not None'."""
+        tree = self._get_start_recording_ast()
+        sigterm_fn = self._find_function(tree, "_sigterm_handler")
+        assert sigterm_fn is not None, "_sigterm_handler not found"
+
+        # Find recorder.stop() calls
+        stop_calls = []
+        for node in ast.walk(sigterm_fn):
+            if (
+                isinstance(node, ast.Call)
+                and isinstance(node.func, ast.Attribute)
+                and node.func.attr == "stop"
+                and isinstance(node.func.value, ast.Name)
+                and node.func.value.id == "recorder"
+            ):
+                stop_calls.append(node)
+
+        assert stop_calls, "No recorder.stop() call found in _sigterm_handler"
+
+        # Each should be guarded
+        for stop_call in stop_calls:
+            found_guard = False
+            for node in ast.walk(sigterm_fn):
+                if isinstance(node, ast.If):
+                    test = node.test
+                    if (
+                        isinstance(test, ast.Compare)
+                        and isinstance(test.left, ast.Name)
+                        and test.left.id == "recorder"
+                        and any(isinstance(op, ast.IsNot) for op in test.ops)
+                    ):
+                        for child in ast.walk(node):
+                            if child is stop_call:
+                                found_guard = True
+                                break
+                if found_guard:
+                    break
+            assert found_guard, "recorder.stop() in _sigterm_handler not guarded by 'if recorder is not None'"
+
+
 class TestCloudIntentRecording:
     """Tests for cloud-intent recording behavior (Phases 3, 4)."""
 
