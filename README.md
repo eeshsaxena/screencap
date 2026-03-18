@@ -53,7 +53,7 @@ pip install -e ".[dev]"
 # start recording immediately — no prompts needed
 screencap start
 
-# Ctrl+C to stop → auto-transcribes audio → LLM names the recording
+# screencap stop (or Ctrl+C) to stop → auto-transcribes audio → LLM names the recording
 # e.g. rec-20260222T143000/ → stripe-webhook-debugging/
 
 # explicit name (skips auto-naming)
@@ -69,7 +69,18 @@ screencap view stripe-webhook-debugging
 screencap transcribe my-session
 ```
 
-Press **Ctrl+C** once to stop recording gracefully. Double Ctrl+C to force quit.
+### Stopping a recording
+
+The recommended way to stop a recording is `screencap stop` — it works from any terminal, any context (scripts, agents, background processes), and has a built-in fallback chain:
+
+```bash
+screencap stop          # graceful stop (sends SIGTERM, waits up to 30s)
+screencap stop --force  # force kill all recording processes immediately
+```
+
+If you're in the same terminal where the recording is running, **Ctrl+C** also works as a shortcut:
+- **Ctrl+C** once → graceful stop (same as `screencap stop`)
+- **Ctrl+C** twice → force quit (kills child processes, then exits)
 
 ## Commands
 
@@ -114,7 +125,7 @@ SCREENCAP_DISK_WARN_MB=0 SCREENCAP_DISK_STOP_MB=0 screencap start
 
 #### Auto-naming
 
-After Ctrl+C, the post-recording pipeline runs:
+After stopping, the post-recording pipeline runs:
 
 1. **Auto-transcribe** — If audio was captured, transcribes using the fastest available backend (faster-whisper → openai-whisper → OpenAI API → skip). Uses the `base` model for local backends.
 2. **LLM naming** — Assembles context (screenshots from DB, action events, window titles, transcript, running apps) and queries an LLM to generate a kebab-case directory name and description.
@@ -391,7 +402,14 @@ The detection pipeline applies a priority-based resolver to handle overlapping d
 
 ### `screencap stop`
 
-Terminate orphaned recording processes left behind by a crash or forced quit.
+Stop the active recording gracefully. This is the recommended way to stop any recording — it works from any terminal, scripts, agents, and background processes.
+
+1. Reads the pidfile to find the recording's parent process
+2. Sends SIGTERM for a graceful shutdown (flushes data, finalizes video, writes metrics)
+3. Waits up to 30 seconds for the process to exit
+4. If graceful stop times out, falls back to force-killing orphaned processes
+
+Also cleans up orphaned recording processes left behind by a crash or forced quit.
 
 | Flag | Description |
 |------|-------------|
