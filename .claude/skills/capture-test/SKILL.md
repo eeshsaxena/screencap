@@ -12,7 +12,7 @@ End-to-end sanity check for the screencap recording pipeline. Runs a real captur
 1. **Gather context** — Read conversation history or accept explicit args to determine what to test (e.g., "audio recording", "no-video mode", "default settings")
 2. **Start recording** — Run `screencap start` in the background with appropriate flags
 3. **User action phase** — Inform the user the recording is live and ask them to perform some actions (move mouse, type, click)
-4. **Stop recording** — Send SIGINT to gracefully stop after the user signals they're done (or after a timeout)
+4. **Stop recording** — Run `screencap stop` to gracefully stop after the user signals they're done (or after a timeout)
 5. **Validate capture** — Check all expected outputs exist and are valid
 6. **Visual inspection** — Read a sample of captured screenshots to visually confirm they contain screen content
 7. **Report** — Structured pass/fail summary
@@ -40,7 +40,7 @@ Run in a background shell:
 screencap start --name <test-name> --no-auto-name [flags from step 1]
 ```
 
-IMPORTANT: Use `run_in_background: true` for the Bash tool since recording blocks until SIGINT.
+IMPORTANT: Use `run_in_background: true` for the Bash tool since recording blocks until stopped.
 
 ### Step 3: User Action Phase
 
@@ -58,14 +58,14 @@ Wait for the user to respond. Do NOT automatically stop — let the user control
 
 ### Step 4: Stop Recording
 
-Send SIGINT to the recording process:
+Use `screencap stop` — the recommended way to stop any recording:
 ```bash
-kill -INT <pid>
+screencap stop
 ```
 
-Get the PID from the background shell. Wait a few seconds for graceful shutdown.
+This sends SIGTERM to the parent process (graceful shutdown), waits up to 30 seconds, and falls back to force-killing orphaned processes if needed. It reads the pidfile automatically — no PID management required.
 
-If the process doesn't stop within 10 seconds, send a second SIGINT (force quit).
+If `screencap stop` hangs or fails, fall back to `screencap stop --force` which skips SIGTERM and goes straight to SIGKILL on all recording processes.
 
 ### Step 5: Validate Capture
 

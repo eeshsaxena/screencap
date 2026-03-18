@@ -595,6 +595,12 @@ def start_recording(
     disk_check_interval = _DISK_CHECK_INTERVAL
     _disk_free_at_stop = 0.0
 
+    # Pre-initialize for signal handler closures (handlers installed before
+    # Recorder.__enter__ so signals work during the entire setup window).
+    recorder = None
+    _child_pids = []
+    _ctrl_c_count = 0
+
     try:
         # Build Recorder kwargs, only passing non-None values
         recorder_kwargs: dict = {
@@ -644,6 +650,90 @@ def start_recording(
                     )
 
         chunk_processor = None
+
+        # --- SIGINT handler (flag-based, no console.print inside) ---
+        # Installed BEFORE Recorder.__enter__() so signals are handled during
+        # the entire setup window (wait_for_ready, chunk processor init, etc.).
+        # Guards protect against variables not yet bound (recorder, _child_pids).
+        def _force_exit(sig, frame):
+            nonlocal _ctrl_c_count, _stop_reason
+            _ctrl_c_count += 1
+
+            if _ctrl_c_count == 1:
+                _stop_reason = "graceful"
+                _stop_event.set()
+                if recorder is not None:
+                    recorder.stop()
+                return
+
+            # 3rd+ Ctrl+C: exit immediately, no waiting
+            if _ctrl_c_count > 2:
+                os._exit(1)
+
+            # 2nd Ctrl+C: force-quit path
+            _stop_reason = "force"
+            _stop_event.set()
+
+            # Kill children using stored PIDs (signal-safe).
+            # Fall back to active_children() if PIDs not yet captured.
+            # Snapshot to avoid mutation during iteration (health
+            # check removes dead PIDs from the main thread).
+            _pids_snapshot = (
+                list(_child_pids) if _child_pids
+                else [c.pid for c in multiprocessing.active_children()]
+            )
+            for pid in _pids_snapshot:
+                try:
+                    os.kill(pid, signal.SIGTERM)
+                except (ProcessLookupError, PermissionError):
+                    pass
+            time.sleep(1)
+            for pid in _pids_snapshot:
+                try:
+                    os.kill(pid, signal.SIGKILL)
+                except (ProcessLookupError, PermissionError):
+                    pass
+
+            # Essential cleanup that os._exit would skip
+            try:
+                delete_pidfile()
+            except Exception:
+                pass
+            if _saved_stdout is not None:
+                sys.stdout = _saved_stdout
+            if _saved_stderr is not None:
+                sys.stderr = _saved_stderr
+
+            # Write sentinel locally for recovery via `screencap upload`
+            # (no upload — os._exit is imminent)
+            try:
+                _sentinel = {
+                    "version": 1,
+                    "recording_name": _recording_name,
+                    "completed_at": _dt.now(_tz.utc).isoformat(),
+                    "stop_reason": "force",
+                    "chunks_expected": len(list(capture_dir.glob("chunk_*_manifest.json"))),
+                    "sentinel_id": str(__import__('uuid').uuid4()),
+                }
+                (capture_dir / "recording_complete.json").write_text(
+                    _json.dumps(_sentinel, indent=2)
+                )
+            except Exception:
+                pass
+
+            os._exit(1)
+
+        signal.signal(signal.SIGINT, _force_exit)
+
+        # --- SIGTERM handler (for `screencap stop`) ---
+        def _sigterm_handler(sig, frame):
+            nonlocal _stop_reason
+            _stop_reason = "sigterm"
+            _stop_event.set()
+            if recorder is not None:
+                recorder.stop()
+
+        signal.signal(signal.SIGTERM, _sigterm_handler)
 
         with Recorder(
             str(capture_dir),
@@ -701,83 +791,6 @@ def start_recording(
             # Store raw PIDs for signal-safe force-exit (avoids
             # multiprocessing._children_lock which can deadlock in a handler).
             _child_pids = [child.pid for child in multiprocessing.active_children()]
-
-            # --- SIGINT handler (flag-based, no console.print inside) ---
-            _ctrl_c_count = 0
-
-            def _force_exit(sig, frame):
-                nonlocal _ctrl_c_count, _stop_reason
-                _ctrl_c_count += 1
-
-                if _ctrl_c_count == 1:
-                    _stop_reason = "graceful"
-                    _stop_event.set()
-                    recorder.stop()
-                    return
-
-                # 3rd+ Ctrl+C: exit immediately, no waiting
-                if _ctrl_c_count > 2:
-                    os._exit(1)
-
-                # 2nd Ctrl+C: force-quit path
-                _stop_reason = "force"
-                _stop_event.set()
-
-                # Kill children using stored PIDs (signal-safe).
-                # Snapshot to avoid mutation during iteration (health
-                # check removes dead PIDs from the main thread).
-                _pids_snapshot = list(_child_pids)
-                for pid in _pids_snapshot:
-                    try:
-                        os.kill(pid, signal.SIGTERM)
-                    except (ProcessLookupError, PermissionError):
-                        pass
-                time.sleep(1)
-                for pid in _pids_snapshot:
-                    try:
-                        os.kill(pid, signal.SIGKILL)
-                    except (ProcessLookupError, PermissionError):
-                        pass
-
-                # Essential cleanup that os._exit would skip
-                try:
-                    delete_pidfile()
-                except Exception:
-                    pass
-                if _saved_stdout is not None:
-                    sys.stdout = _saved_stdout
-                if _saved_stderr is not None:
-                    sys.stderr = _saved_stderr
-
-                # Write sentinel locally for recovery via `screencap upload`
-                # (no upload — os._exit is imminent)
-                try:
-                    _sentinel = {
-                        "version": 1,
-                        "recording_name": _recording_name,
-                        "completed_at": _dt.now(_tz.utc).isoformat(),
-                        "stop_reason": "force",
-                        "chunks_expected": len(list(capture_dir.glob("chunk_*_manifest.json"))),
-                        "sentinel_id": str(__import__('uuid').uuid4()),
-                    }
-                    (capture_dir / "recording_complete.json").write_text(
-                        _json.dumps(_sentinel, indent=2)
-                    )
-                except Exception:
-                    pass
-
-                os._exit(1)
-
-            signal.signal(signal.SIGINT, _force_exit)
-
-            # --- SIGTERM handler (for `screencap stop`) ---
-            def _sigterm_handler(sig, frame):
-                nonlocal _stop_reason
-                _stop_reason = "sigterm"
-                _stop_event.set()
-                recorder.stop()
-
-            signal.signal(signal.SIGTERM, _sigterm_handler)
 
             # --- Live recording display ---
             # We use transient=False and handle cleanup ourselves:

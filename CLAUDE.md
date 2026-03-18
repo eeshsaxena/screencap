@@ -33,7 +33,7 @@ No linting is configured for the root `screencap` package. The vendored sub-pack
 
 **Core modules (all in `src/screencap/`):**
 - `config.py` — reads `~/.screencap/config.toml` with env var overrides (`SCREENCAP_RECORDINGS_DIR`, `SCREENCAP_AUDIO_DEFAULT`). Priority: env vars > config.toml > defaults. Uses module-level `_config_cache` dict (reset to `None` in tests).
-- `recorder.py` — wraps `sc_engine.Recorder` context manager. Custom SIGINT handler: first Ctrl+C = graceful stop, second = force quit.
+- `recorder.py` — wraps `sc_engine.Recorder` context manager. Signal handlers installed BEFORE `Recorder.__enter__()` to cover the entire setup window. SIGINT: first = graceful stop, second = force quit (kills children + `os._exit`), third = immediate `os._exit`. SIGTERM: graceful stop (used by `screencap stop`). Handlers guard against `recorder=None` (signal during setup) and fall back to `multiprocessing.active_children()` when `_child_pids` is empty. The recommended way to stop a recording programmatically is `screencap stop` (sends SIGTERM, 30s timeout, fallback to force-kill). Ctrl+C is a convenience shortcut for foreground terminal use only.
 - `catalog.py` — scans recordings dir, reads metadata from SQLite. Supports two DB schemas: `recording.db` (tables: `recording`, `action_event`) and `capture.db` (tables: `capture`, `events`). Returns `RecordingInfo` NamedTuples.
 - `viewer.py` — opens `viewer.html` via macOS `open` command.
 
