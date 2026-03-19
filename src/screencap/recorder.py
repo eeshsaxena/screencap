@@ -47,6 +47,37 @@ class DiskFullError(Exception):
 # Helpers
 # ---------------------------------------------------------------------------
 
+
+class _NoCloseProxy:
+    """Queue proxy that forwards put/get but ignores close/cancel.
+
+    Used to prevent Recorder.__exit__() from closing queues that the
+    screencap layer (ChunkProcessor) still needs. The fan-out thread
+    reads self._chunk_process_q and calls put() — the proxy forwards
+    that to the real queue. __exit__() calls close() — the proxy no-ops.
+    """
+
+    __slots__ = ("_q",)
+
+    def __init__(self, q: multiprocessing.Queue) -> None:
+        self._q = q
+
+    def put(self, *a, **kw):
+        return self._q.put(*a, **kw)
+
+    def get(self, *a, **kw):
+        return self._q.get(*a, **kw)
+
+    def get_nowait(self):
+        return self._q.get_nowait()
+
+    def cancel_join_thread(self):
+        pass
+
+    def close(self):
+        pass
+
+
 def _fmt_duration(seconds: float) -> str:
     m, s = divmod(int(seconds), 60)
     h, m = divmod(m, 60)
@@ -752,6 +783,11 @@ def start_recording(
                     # Verify queues are real multiprocessing.Queue objects
                     if (_cpq is not None and _aaq is not None
                             and isinstance(_cpq, _mp.queues.Queue)):
+                        # Prevent __exit__() from closing queues while
+                        # ChunkProcessor is still reading. Replace attrs with
+                        # proxies that forward put/get but ignore close().
+                        recorder._chunk_process_q = _NoCloseProxy(_cpq)
+                        recorder._audio_ack_q = _NoCloseProxy(_aaq)
                         from screencap.chunk_processor import ChunkProcessor
                         from screencap.config import get_auto_delete_after_upload, get_rest_threshold
 
@@ -968,20 +1004,20 @@ def start_recording(
         except KeyboardInterrupt:
             console.print("[yellow]Force quit — current chunk may complete, queued chunks lost.[/yellow]")
             console.print("[dim]Run 'screencap upload' later to upload remaining files.[/dim]")
-
-        # Drain and close chunk/ack queues to prevent feeder-thread hangs.
-        for _q in (_cpq, _aaq):
-            if _q is not None:
-                try:
-                    while True:
-                        _q.get_nowait()
-                except Exception:
-                    pass
-                try:
-                    _q.cancel_join_thread()
-                    _q.close()
-                except Exception:
-                    pass
+        finally:
+            # Drain and close chunk/ack queues to prevent feeder-thread hangs.
+            for _q in (_cpq, _aaq):
+                if _q is not None:
+                    try:
+                        while True:
+                            _q.get_nowait()
+                    except Exception:
+                        pass
+                    try:
+                        _q.cancel_join_thread()
+                        _q.close()
+                    except Exception:
+                        pass
 
         # WAL checkpoint + upload recording.db
         _db_uploaded = False

@@ -901,25 +901,13 @@ def test_start_recording_multi_chunk_produces_all_chunk_files(recording_env):
         "Chunk 1 events file missing — ChunkProcessor didn't process chunk 1 (rotation message lost?)"
 
 
-@pytest.mark.xfail(
-    reason="Finding 005: Recorder.__exit__() closes _chunk_process_q before "
-    "ChunkProcessor drains it. Fix: remove _chunk_process_q from __exit__ cleanup.",
-    strict=True,
-)
 def test_chunk_processor_survives_queue_close_during_processing(tmp_path):
-    """Regression: Recorder.__exit__() closes _chunk_process_q before
-    ChunkProcessor finishes draining it.
+    """Regression for Finding 005: multi-chunk recordings only process chunk 0.
 
-    Reproduces the real shutdown race:
-    1. ChunkProcessor is reading from the queue
-    2. Messages are in the queue (rotation + poison pill)
-    3. The queue is closed (simulating Recorder.__exit__() cleanup)
-    4. ChunkProcessor should still process all messages that were
-       already in the queue before the close
-
-    This catches Finding 005: multi-chunk recordings only process chunk 0
-    because Recorder.__exit__() closes the queue before ChunkProcessor
-    reads the final_chunk message.
+    The fix transfers queue ownership from Recorder to the screencap layer
+    (nulling recorder._chunk_process_q so __exit__() skips it). This test
+    verifies the post-fix shutdown sequence: queue stays open, stop() sends
+    a poison pill, and all chunks are processed.
     """
     from screencap.chunk_processor import ChunkProcessor
 
@@ -961,24 +949,15 @@ def test_chunk_processor_survives_queue_close_during_processing(tmp_path):
             "rotation_time": t0 + 60,
         })
 
-        # Simulate Recorder.__exit__() closing the queue IMMEDIATELY
-        # after the fan-out thread has put messages — no sleep, no grace period.
-        # This is what happens in the real shutdown: __exit__() joins the
-        # fan-out thread, then closes all queues before ChunkProcessor
-        # has finished processing.
-        chunk_q.cancel_join_thread()
-        chunk_q.close()
-
-        # Now call stop — this is what start_recording() does after __exit__
-        # The poison pill put will fail (queue closed), but ChunkProcessor
-        # should still process messages that were already in the queue.
+        # Post-fix: queue stays open (ownership transferred to screencap layer).
+        # stop() sends poison pill via the open queue — graceful shutdown.
         cp.stop(timeout=10)
 
-    # BOTH chunks should have been processed despite queue closure
+    # BOTH chunks should have been processed
     assert (rec_dir / "events_0000.jsonl").exists(), \
-        "Chunk 0 not processed — queue closed before ChunkProcessor read it"
+        "Chunk 0 not processed"
     assert (rec_dir / "events_0001.jsonl").exists(), \
-        "Chunk 1 (final) not processed — queue closed before ChunkProcessor read final_chunk"
+        "Chunk 1 (final) not processed"
 
 
 # ---------------------------------------------------------------------------
