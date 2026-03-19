@@ -73,7 +73,7 @@ class ChunkProcessor:
         if cloud_intent and upload_enabled:
             try:
                 from screencap.privacy import Anonymizer, create_default_pipeline
-                self._pipeline = create_default_pipeline()
+                self._pipeline = create_default_pipeline(require_pii=True)
                 self._anonymizer = Anonymizer()
                 logger.info("Scrubbing pipeline initialized for cloud-intent recording")
             except Exception as e:
@@ -122,6 +122,11 @@ class ChunkProcessor:
         """Thread-safe status string for Rich Live display."""
         with self._status_lock:
             return self._status
+
+    @property
+    def upload_warning(self) -> str | None:
+        """Reason uploads were disabled, or None if uploads are healthy."""
+        return self._upload_disabled_reason
 
     def _set_status(self, s: str) -> None:
         with self._status_lock:

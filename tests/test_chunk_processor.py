@@ -266,6 +266,60 @@ class TestCloudIntentGating:
         assert cp._anonymizer is None
 
 
+class TestCloudProcessorRequiresPiiDetection:
+    """Cloud-intent ChunkProcessor must pass require_pii=True to the pipeline factory."""
+
+    def test_cloud_processor_requires_pii_detection(self, cloud_capture_dir):
+        """Exercises pipeline gating for cloud vs local intent.
+
+        1. Cloud-intent passes require_pii=True to create_default_pipeline
+        2. Pipeline failure exposes upload_warning property
+        3. Non-cloud skips pipeline init entirely
+        """
+        from screencap.chunk_processor import ChunkProcessor
+
+        q = multiprocessing.Queue()
+        ack_q = multiprocessing.Queue()
+
+        # 1. Cloud-intent: require_pii=True is passed
+        with patch(
+            "screencap.privacy.create_default_pipeline",
+        ) as mock_pipeline:
+            mock_pipeline.return_value = MagicMock()
+            with patch("screencap.privacy.Anonymizer"):
+                cp = ChunkProcessor(
+                    cloud_capture_dir, q, ack_q, recording_name="test",
+                    upload_enabled=True, auto_delete=False,
+                    cloud_intent=True,
+                )
+            mock_pipeline.assert_called_once()
+            _, kwargs = mock_pipeline.call_args
+            assert kwargs.get("require_pii") is True
+
+        # 2. Pipeline failure: upload_warning exposed
+        with patch(
+            "screencap.privacy.create_default_pipeline",
+            side_effect=ImportError("no PII models"),
+        ):
+            cp = ChunkProcessor(
+                cloud_capture_dir, q, ack_q, recording_name="test",
+                upload_enabled=True, auto_delete=False,
+                cloud_intent=True,
+            )
+            assert cp._upload_enabled is False
+            assert cp.upload_warning is not None
+            assert "no PII models" in cp.upload_warning
+
+        # 3. Non-cloud: pipeline not initialized, no warning
+        cp = ChunkProcessor(
+            cloud_capture_dir, q, ack_q, recording_name="test",
+            upload_enabled=True, auto_delete=False,
+            cloud_intent=False,
+        )
+        assert cp._pipeline is None
+        assert cp.upload_warning is None
+
+
 class TestInlineScrubbing:
     """Test inline scrubbing of text surfaces."""
 

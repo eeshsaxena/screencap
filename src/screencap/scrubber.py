@@ -1569,6 +1569,7 @@ def scrub_recording(
         pipeline = create_default_pipeline(
             pii_engine=pii_engine,
             person_allowlist=app_allowlist,
+            require_pii=True,
         )
 
     # 5. Create anonymizer

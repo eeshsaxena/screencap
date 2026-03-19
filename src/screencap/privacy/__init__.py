@@ -298,10 +298,38 @@ class Anonymizer:
 _VALID_PII_ENGINES = frozenset({"presidio", "presidio-gliner", None})
 
 
+def are_nlp_models_cached() -> bool:
+    """Check if both GLiNER and spaCy NLP models are available locally."""
+    import importlib.util
+    import os
+    from pathlib import Path
+
+    # Check GLiNER model in HuggingFace cache
+    cache_dir = Path(os.environ.get("HF_HOME", "~/.cache/huggingface")).expanduser() / "hub"
+    model_dir = cache_dir / "models--knowledgator--gliner-pii-base-v1.0"
+    blobs_dir = model_dir / "blobs"
+    if not (model_dir / "snapshots").exists():
+        return False
+    if not blobs_dir.is_dir():
+        return False
+    if any(blobs_dir.glob("*.incomplete")):
+        return False
+    # Ensure blobs/ actually contains model files (not just an empty directory)
+    if not any(f.is_file() for f in blobs_dir.iterdir() if not f.name.endswith(".incomplete")):
+        return False
+
+    # Check spaCy en_core_web_sm
+    if importlib.util.find_spec("en_core_web_sm") is None:
+        return False
+
+    return True
+
+
 def create_default_pipeline(
     pii_engine: str | None = None,
     person_threshold: float = 0.5,
     person_allowlist: frozenset[str] = frozenset(),
+    require_pii: bool = False,
 ) -> DetectionPipeline:
     """Create a pipeline with all available detectors.
 
@@ -393,6 +421,12 @@ def create_default_pipeline(
         logger.warning(
             "No PII engine installed — PII detection disabled. "
             "Reinstall or update screencap."
+        )
+
+    if require_pii and not pii_loaded:
+        raise ImportError(
+            "PII detection required for cloud upload but no NLP models available. "
+            "Run 'screencap setup --scan' to download models."
         )
 
     if len(detectors) < 2:
