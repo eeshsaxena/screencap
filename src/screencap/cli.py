@@ -21,6 +21,7 @@ def _stdin_is_tty() -> bool:
     """Check if stdin is a real TTY (not piped or redirected)."""
     return sys.stdin.isatty()
 
+
 _RECORD_EXTRAS_MSG = (
     "[red]Error: This command requires recording dependencies.[/red]\n"
     "Install them with: [bold]pip install screencap\\[record][/bold]"
@@ -101,7 +102,7 @@ def _maybe_download_nlp_models() -> None:
         )
 
 
-def _maybe_prompt_privacy_setup() -> None:
+def _maybe_prompt_privacy_setup(*, cloud_intent: bool = False) -> None:
     """Prompt for privacy setup on first run if [privacy] section is missing."""
     import sys as _sys  # use real sys, not the module-level reference
 
@@ -117,8 +118,10 @@ def _maybe_prompt_privacy_setup() -> None:
         cfg = _load_toml()
         privacy_section = cfg.get("privacy")
         if privacy_section is not None:
-            # Has a [privacy] section — check if NLP models need downloading
-            _maybe_download_nlp_models()
+            # Has a [privacy] section — check if NLP models need downloading.
+            # Skip for cloud-intent: the cloud gate handles model download.
+            if not cloud_intent:
+                _maybe_download_nlp_models()
             return
 
     console.print(
@@ -210,7 +213,7 @@ def start(
     capture_images = False if no_images else True  # Default ON (overrides upstream False)
     capture_window_data = False if no_window_data else None  # None = upstream default (True)
     # First-run privacy setup detection
-    _maybe_prompt_privacy_setup()
+    _maybe_prompt_privacy_setup(cloud_intent=destination == "cloud")
 
     # --- Resolve recording destination (cloud/local) ---
     from screencap.config import get_upload_default
@@ -269,7 +272,7 @@ def start(
             ):
                 try:
                     _download_nlp_models()
-                except Exception as exc:
+                except (OSError, RuntimeError, ImportError) as exc:
                     console.print(f"[yellow]Warning:[/] Download failed: {exc}")
             if not are_nlp_models_cached():
                 if click.confirm(

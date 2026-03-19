@@ -314,6 +314,9 @@ def are_nlp_models_cached() -> bool:
         return False
     if any(blobs_dir.glob("*.incomplete")):
         return False
+    # Ensure blobs/ actually contains model files (not just an empty directory)
+    if not any(f.is_file() for f in blobs_dir.iterdir() if not f.name.endswith(".incomplete")):
+        return False
 
     # Check spaCy en_core_web_sm
     if importlib.util.find_spec("en_core_web_sm") is None:

@@ -2,7 +2,6 @@
 
 from __future__ import annotations
 
-import importlib.util
 from pathlib import Path
 from unittest.mock import patch
 
@@ -323,12 +322,16 @@ class TestNlpModelAvailabilityGating:
         (blobs / "abc123.incomplete").touch()
         assert are_nlp_models_cached() is False
 
-        # 4. Remove .incomplete, but spaCy missing → False
+        # 4. Remove .incomplete but blobs/ is empty → False
         (blobs / "abc123.incomplete").unlink()
+        assert are_nlp_models_cached() is False
+
+        # 5. Add a real blob file, but spaCy missing → False
+        (blobs / "abc123").write_bytes(b"model data")
         with patch("importlib.util.find_spec", return_value=None):
             assert are_nlp_models_cached() is False
 
-        # 5. Both present → True
+        # 6. Both present → True
         with patch("importlib.util.find_spec", return_value=object()):  # any truthy value
             assert are_nlp_models_cached() is True
 

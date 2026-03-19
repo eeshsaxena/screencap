@@ -73,7 +73,7 @@ class ChunkProcessor:
         if cloud_intent and upload_enabled:
             try:
                 from screencap.privacy import Anonymizer, create_default_pipeline
-                self._pipeline = create_default_pipeline(require_pii=cloud_intent)
+                self._pipeline = create_default_pipeline(require_pii=True)
                 self._anonymizer = Anonymizer()
                 logger.info("Scrubbing pipeline initialized for cloud-intent recording")
             except Exception as e:
