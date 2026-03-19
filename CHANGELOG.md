@@ -5,6 +5,21 @@ All notable changes to this project will be documented in this file.
 The format is based on [Keep a Changelog](https://keepachangelog.com/),
 and this project adheres to [Semantic Versioning](https://semver.org/).
 
+## [0.12.4] - 2026-03-19
+
+### Added
+- **cli:** Add list --remote and download --category commands
+- **download:** Add remote session index, listing, and category filtering
+- **cloud-function:** Add get-index action for session index retrieval
+- **cloud-run:** Category prefixes, LLM tags, session index, expanded app list
+
+### Fixed
+- Reduce default chunk duration from 1 hour to 15 minutes
+- Prevent sentinel upload after force-stop and remove stale local sentinel
+- Gate sentinel upload behind all_chunks_uploaded()
+- Install SIGINT/SIGTERM handlers before Recorder.__enter__()
+- Preserve destination choice when setup wizard TUI is cancelled
+
 ## [0.12.3] - 2026-03-17
 
 ### Added
