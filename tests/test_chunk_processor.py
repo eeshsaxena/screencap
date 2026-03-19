@@ -984,3 +984,102 @@ class TestUploadGatingRetryRecovery:
         for i in range(5, 7):
             assert (tmp_path / f"chunk_{i:04d}.mp4").exists(), \
                 f"chunk_{i:04d}.mp4 should still exist (recent)"
+
+
+class TestPrivacyFailureDataLoss:
+    """Privacy pipeline init failure must not cause silent data loss.
+
+    When cloud_intent=True and the privacy pipeline fails to initialize,
+    _upload_enabled is set to False (fail-closed).  But _process_chunk must
+    NOT mark those chunks as success=True — otherwise all_chunks_uploaded()
+    returns True, triggering stub_recording() which deletes local media
+    while nothing was uploaded to GCS.
+    """
+
+    @mock.patch("screencap.chunk_processor.time.sleep")
+    @mock.patch("screencap.chunk_processor.upload_chunk_files", return_value=True)
+    def test_privacy_failure_prevents_false_success(self, mock_upload, mock_sleep, tmp_path):
+        """Cloud-intent + privacy ImportError → chunks NOT marked as success,
+        media files preserved on disk."""
+        from screencap.chunk_processor import ChunkProcessor
+
+        t0 = time.time()
+        _create_seven_chunk_db(tmp_path / "recording.db", t0)
+        _create_chunk_media_files(tmp_path, 7)
+
+        chunk_q = multiprocessing.Queue()
+        audio_q = multiprocessing.Queue()
+
+        with patch(
+            "screencap.privacy.create_default_pipeline",
+            side_effect=ImportError("test: no privacy deps"),
+        ):
+            cp = ChunkProcessor(
+                tmp_path, chunk_q, audio_q,
+                recording_name="test-privacy-fail",
+                upload_enabled=True,
+                auto_delete=True,
+                cloud_intent=True,
+            )
+
+        # Sanity: uploads were disabled by the ImportError
+        assert cp._upload_enabled is False
+
+        # Mock side effects not under test
+        cp._wait_for_audio = lambda *a, **kw: True
+        cp._transcribe = lambda *a, **kw: None
+        cp._generate_manifest = lambda *a, **kw: None
+
+        cp.start()
+        _enqueue_chunks(chunk_q, t0, 7)
+        cp.stop(timeout=30)
+
+        # Core assertion: chunks must NOT be marked as success
+        assert cp.all_chunks_uploaded() is False
+        n_uploaded, n_total = cp.upload_summary()
+        assert n_uploaded == 0
+        assert n_total == 7
+
+        # Upload was never attempted (disabled)
+        mock_upload.assert_not_called()
+
+        # ALL chunk media files must still exist — _delete_old_chunks must
+        # not have run because success was False for every chunk.
+        for i in range(7):
+            assert (tmp_path / f"chunk_{i:04d}.mp4").exists(), \
+                f"chunk_{i:04d}.mp4 was deleted — data loss!"
+            assert (tmp_path / f"audio_{i:04d}.flac").exists(), \
+                f"audio_{i:04d}.flac was deleted — data loss!"
+
+    def test_local_intent_unaffected(self, tmp_path):
+        """Local-intent with upload_enabled=False must still mark chunks as
+        success (regression guard)."""
+        from screencap.chunk_processor import ChunkProcessor
+
+        t0 = time.time()
+        _create_seven_chunk_db(tmp_path / "recording.db", t0)
+
+        chunk_q = multiprocessing.Queue()
+        audio_q = multiprocessing.Queue()
+
+        cp = ChunkProcessor(
+            tmp_path, chunk_q, audio_q,
+            recording_name="test-local",
+            upload_enabled=False,
+            auto_delete=False,
+            cloud_intent=False,
+        )
+
+        cp._wait_for_audio = lambda *a, **kw: True
+        cp._transcribe = lambda *a, **kw: None
+        cp._generate_manifest = lambda *a, **kw: None
+
+        cp.start()
+        _enqueue_chunks(chunk_q, t0, 3)
+        cp.stop(timeout=30)
+
+        # Local-intent: all chunks should be marked as success
+        assert cp.all_chunks_uploaded() is True
+        n_uploaded, n_total = cp.upload_summary()
+        assert n_uploaded == 3
+        assert n_total == 3

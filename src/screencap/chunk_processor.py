@@ -69,17 +69,19 @@ class ChunkProcessor:
         self._masking_classifier = None
         self._masking_evaluator = None
         self._masking_pixel_ratio = 2.0  # safe Retina default
+        self._upload_disabled_reason: str | None = None
         if cloud_intent and upload_enabled:
             try:
                 from screencap.privacy import Anonymizer, create_default_pipeline
                 self._pipeline = create_default_pipeline()
                 self._anonymizer = Anonymizer()
                 logger.info("Scrubbing pipeline initialized for cloud-intent recording")
-            except ImportError as e:
+            except Exception as e:
                 logger.error(
                     f"Privacy deps not available — disabling uploads for safety: {e}"
                 )
                 self._upload_enabled = False
+                self._upload_disabled_reason = f"Privacy deps not available: {e}"
                 logger.warning(
                     "Privacy dependencies are missing. "
                     "Reinstall or update screencap."
@@ -105,6 +107,8 @@ class ChunkProcessor:
             except Exception as e:
                 logger.warning(f"Could not init masking classifier: {e}")
                 self._upload_enabled = False
+                if self._upload_disabled_reason is None:
+                    self._upload_disabled_reason = f"Masking classifier init failed: {e}"
 
         self._chunk_results: dict[int, bool] = {}  # idx → all_uploaded
         self._status_lock = threading.Lock()
@@ -275,7 +279,7 @@ class ChunkProcessor:
             else:
                 logger.warning(f"No files found for chunk {idx}")
         else:
-            success = True  # upload disabled = success
+            success = self._upload_disabled_reason is None
 
         self._chunk_results[idx] = success
 
