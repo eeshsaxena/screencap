@@ -619,18 +619,42 @@ def run_setup_wizard(
     # Classify
     classified = _classify_with_overrides(apps, existing_ac, existing_exclude)
 
-    # In scan-only mode, filter to only truly unknown new apps
+    # In scan-only mode, scope to apps seen in recordings that are unclassified
     if scan_only:
-        configured_bids = set(existing_ac.keys()) | existing_exclude | existing_allow
-        new_classified = {
-            bid: (meta, cls, source)
-            for bid, (meta, cls, source) in classified.items()
-            if bid not in configured_bids and source == "unknown"
-        }
-        if not new_classified:
-            console.print("[green]All apps are already classified.[/green]")
+        from screencap.catalog import get_seen_bundle_ids
+
+        seen_bids = get_seen_bundle_ids()
+        known_bids = (
+            set(BUNDLE_ID_MAP.keys())
+            | set(existing_ac.keys())
+            | existing_exclude
+            | existing_allow
+        )
+        recording_unclassified = seen_bids - known_bids
+
+        if not recording_unclassified:
+            console.print("[green]No unclassified apps found in recordings.[/green]")
             return False
-        console.print(f"\nFound {len(new_classified)} new app(s).")
+
+        new_classified = {
+            bid: info for bid, info in classified.items()
+            if bid in recording_unclassified
+        }
+
+        # Warn about apps seen in recordings but not found on disk
+        missing = recording_unclassified - set(classified.keys())
+        if missing:
+            for bid in sorted(missing):
+                console.print(
+                    f"[dim]Note: {bid} was seen in a recording but is not "
+                    f"currently installed — skipping.[/dim]"
+                )
+
+        if not new_classified:
+            console.print("[green]All recording-seen apps are already classified.[/green]")
+            return False
+
+        console.print(f"\nFound {len(new_classified)} app(s) from recordings to classify.")
         classified = new_classified
 
     groups, auto_allowed = _group_apps(classified)

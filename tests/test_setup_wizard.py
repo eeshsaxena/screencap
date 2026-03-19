@@ -520,8 +520,8 @@ class TestCommentPreservation:
 
 
 class TestScanOnlyMode:
-    def test_scan_only_filters_to_new_unknown_apps(self, tmp_path):
-        """--scan mode should only show apps that heuristics can't classify."""
+    def test_scan_only_filters_to_recording_seen_apps(self, tmp_path):
+        """--scan mode should only show apps seen in recordings that are unclassified."""
         config_path = tmp_path / "config.toml"
         config_path.write_text(
             '[privacy]\n'
@@ -534,9 +534,13 @@ class TestScanOnlyMode:
             AppMetadata("/test/Configured.app", "com.example.configured", "Configured"),
             AppMetadata("/test/Preview.app", "com.apple.Preview", "Preview"),  # auto-classified
             AppMetadata("/test/New.app", "com.example.new", "New App"),  # truly unknown
+            AppMetadata("/test/Other.app", "com.example.other", "Other App"),  # unknown but not in recordings
         ]
+        # Only com.example.new was seen in a recording
+        seen_bids = {"com.example.configured", "com.apple.Preview", "com.example.new"}
         with mock.patch("sys.stdin") as mock_stdin, \
              mock.patch("screencap.setup_wizard.discover_installed_apps", return_value=apps), \
+             mock.patch("screencap.catalog.get_seen_bundle_ids", return_value=seen_bids), \
              mock.patch("screencap.setup_wizard._run_tui", return_value={}), \
              mock.patch("screencap.setup_wizard.click") as mock_click, \
              mock.patch("screencap.config.invalidate_config_cache"):
@@ -548,6 +552,8 @@ class TestScanOnlyMode:
             doc = tomlkit.parse(config_path.read_text())
             assert doc["privacy"]["app_classes"]["com.example.configured"] == "chat"
             assert "com.example.new" in doc["privacy"]["allow_apps"]
+            # com.example.other was NOT in recordings, should not appear
+            assert "com.example.other" not in doc["privacy"].get("allow_apps", [])
 
     @pytest.mark.parametrize("upload_default", ["cloud", "local"])
     def test_scan_only_preserves_upload_default(self, tmp_path, upload_default):
@@ -561,8 +567,10 @@ class TestScanOnlyMode:
         apps = [
             AppMetadata("/test/New.app", "com.example.new", "New App"),
         ]
+        seen_bids = {"com.example.new"}
         with mock.patch("sys.stdin") as mock_stdin, \
              mock.patch("screencap.setup_wizard.discover_installed_apps", return_value=apps), \
+             mock.patch("screencap.catalog.get_seen_bundle_ids", return_value=seen_bids), \
              mock.patch("screencap.setup_wizard._run_tui", return_value={}), \
              mock.patch("screencap.setup_wizard.click") as mock_click, \
              mock.patch("screencap.config.invalidate_config_cache"):
@@ -574,8 +582,8 @@ class TestScanOnlyMode:
             doc = tomlkit.parse(config_path.read_text())
             assert doc["privacy"]["upload_default"] == upload_default
 
-    def test_scan_only_all_classified(self, tmp_path):
-        """--scan with no new unknown apps reports all classified."""
+    def test_scan_only_no_unclassified_in_recordings(self, tmp_path):
+        """--scan with no unclassified recording-seen apps reports all classified."""
         config_path = tmp_path / "config.toml"
         config_path.write_text(
             '[privacy]\n'
@@ -584,9 +592,25 @@ class TestScanOnlyMode:
         apps = [
             AppMetadata("/test/Preview.app", "com.apple.Preview", "Preview"),
         ]
+        # Preview is in BUNDLE_ID_MAP, so all recording-seen apps are classified
+        seen_bids = {"com.apple.Preview"}
         with mock.patch("sys.stdin") as mock_stdin, \
              mock.patch("screencap.setup_wizard.discover_installed_apps", return_value=apps), \
+             mock.patch("screencap.catalog.get_seen_bundle_ids", return_value=seen_bids), \
              mock.patch("screencap.setup_wizard.click") as mock_click:
+            mock_stdin.isatty.return_value = True
+            result = run_setup_wizard(config_path=config_path, scan_only=True)
+            assert result is False
+
+    def test_scan_only_no_recordings(self, tmp_path):
+        """--scan with no recordings returns False."""
+        config_path = tmp_path / "config.toml"
+        config_path.write_text(
+            '[privacy]\n'
+            'mode = "internal"\n'
+        )
+        with mock.patch("sys.stdin") as mock_stdin, \
+             mock.patch("screencap.catalog.get_seen_bundle_ids", return_value=set()):
             mock_stdin.isatty.return_value = True
             result = run_setup_wizard(config_path=config_path, scan_only=True)
             assert result is False
