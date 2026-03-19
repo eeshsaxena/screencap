@@ -981,3 +981,51 @@ def test_chunk_processor_survives_queue_close_during_processing(tmp_path):
         "Chunk 0 not processed — queue closed before ChunkProcessor read it"
     assert (rec_dir / "events_0001.jsonl").exists(), \
         "Chunk 1 (final) not processed — queue closed before ChunkProcessor read final_chunk"
+
+
+# ---------------------------------------------------------------------------
+# Scenario 5: Non-chunked recording (legacy mode)
+# ---------------------------------------------------------------------------
+
+
+def test_non_chunked_recording_no_chunk_processor(recording_env):
+    """chunk_duration=0 disables chunking: no ChunkProcessor, no chunk_* files.
+
+    Mocked: sc_engine.Recorder (hardware), permissions, disk_usage, orphan
+    scan, metrics.
+    Real: config (env vars), pidfile (tmp_path), file I/O.
+    """
+    from screencap.recorder import start_recording
+
+    rec_dir = recording_env["recordings_dir"] / "test-no-chunks"
+
+    with (
+        mock.patch("sc_engine.Recorder", FakeRecorder),
+        mock.patch("screencap.recorder._check_macos_permissions"),
+        mock.patch("screencap.pidfile.find_orphaned_processes", return_value=[]),
+        mock.patch("shutil.disk_usage", return_value=_PLENTY_OF_DISK),
+        mock.patch("screencap.metrics.save_metrics"),
+        mock.patch("screencap.chunk_processor.ChunkProcessor") as MockCP,
+    ):
+        capture_dir, elapsed = start_recording(
+            name="test-no-chunks",
+            audio=False,
+            output_dir=rec_dir,
+            wifi_metrics=False,
+            app_versions=False,
+            chunk_duration=0,
+            verbose=True,
+        )
+
+    # ChunkProcessor should NOT have been instantiated
+    MockCP.assert_not_called()
+
+    # No chunk files should exist
+    assert not list(capture_dir.glob("chunk_*")), \
+        "No chunk_* files should exist in non-chunked mode"
+    assert not list(capture_dir.glob("events_*.jsonl")), \
+        "No per-chunk events_*.jsonl should exist in non-chunked mode"
+
+    # Recording should otherwise work — DB exists
+    assert (capture_dir / "recording.db").exists()
+    assert (capture_dir / ".recording_id").read_text().strip() == "test-no-chunks"
