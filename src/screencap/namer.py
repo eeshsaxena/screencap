@@ -219,7 +219,11 @@ def _summarize_action_events(db_path: Path, limit: int = 50) -> list[dict]:
             cur.execute(
                 "SELECT ae.name, we.title "
                 "FROM action_event ae "
-                "LEFT JOIN window_event we ON ae.window_event_id = we.id "
+                # Canonical cross-reference: the recorder always populates
+                # window_event_timestamp on action events. Timestamp-based
+                # joins are the standard pattern (see also capture.py).
+                "LEFT JOIN window_event we "
+                "ON ae.window_event_timestamp = we.timestamp "
                 "ORDER BY ae.timestamp "
                 "LIMIT 500"
             )

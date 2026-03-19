@@ -14,6 +14,7 @@ import pytest
 from screencap.namer import (
     _parse_llm_response,
     _run_provider_chain,
+    _summarize_action_events,
     _update_task_description,
     assemble_context,
     auto_name,
@@ -118,22 +119,33 @@ class TestParseLlmResponse:
 
 def _make_recording_db(db_path: Path, *, with_screenshots: bool = False, with_events: bool = False, with_windows: bool = False):
     """Create a minimal recording.db for testing."""
+    t = time.time()
     conn = sqlite3.connect(str(db_path))
     cur = conn.cursor()
 
     cur.execute(
         "CREATE TABLE recording (id INTEGER PRIMARY KEY, timestamp REAL, platform TEXT, task_description TEXT)"
     )
-    cur.execute("INSERT INTO recording VALUES (1, ?, 'darwin', '')", (time.time(),))
+    cur.execute("INSERT INTO recording VALUES (1, ?, 'darwin', '')", (t,))
 
     cur.execute(
         "CREATE TABLE action_event (id INTEGER PRIMARY KEY, name TEXT, timestamp REAL, "
-        "window_event_id INTEGER)"
+        "window_event_id INTEGER, window_event_timestamp REAL)"
     )
 
     if with_events:
-        cur.execute("INSERT INTO action_event VALUES (1, 'click', ?, NULL)", (time.time(),))
-        cur.execute("INSERT INTO action_event VALUES (2, 'type', ?, NULL)", (time.time() + 1,))
+        # Simulate chunked mode: window_event_id is NULL, but
+        # window_event_timestamp is populated (matching window_event.timestamp).
+        we_ts_1 = t if with_windows else None
+        we_ts_2 = t + 1 if with_windows else None
+        cur.execute(
+            "INSERT INTO action_event VALUES (1, 'click', ?, NULL, ?)",
+            (t + 0.1, we_ts_1),
+        )
+        cur.execute(
+            "INSERT INTO action_event VALUES (2, 'type', ?, NULL, ?)",
+            (t + 1.1, we_ts_2),
+        )
 
     cur.execute(
         "CREATE TABLE window_event (id INTEGER PRIMARY KEY, timestamp REAL, title TEXT, "
@@ -143,11 +155,11 @@ def _make_recording_db(db_path: Path, *, with_screenshots: bool = False, with_ev
     if with_windows:
         cur.execute(
             "INSERT INTO window_event VALUES (1, ?, 'My Document - VS Code', 'com.microsoft.VSCode', '1.90')",
-            (time.time(),),
+            (t,),
         )
         cur.execute(
             "INSERT INTO window_event VALUES (2, ?, 'GitHub Pull Request', 'com.google.Chrome', '131.0')",
-            (time.time() + 1,),
+            (t + 1,),
         )
 
     cur.execute(
@@ -172,6 +184,23 @@ def _make_recording_db(db_path: Path, *, with_screenshots: bool = False, with_ev
 
     conn.commit()
     conn.close()
+
+
+# ---------------------------------------------------------------------------
+# Summarize action events
+# ---------------------------------------------------------------------------
+
+
+class TestSummarizeActionEvents:
+    def test_returns_window_titles_with_null_fk(self, tmp_path):
+        """Chunked-mode recordings have window_event_id=NULL but
+        window_event_timestamp populated — namer must still resolve titles."""
+        db_path = tmp_path / "recording.db"
+        _make_recording_db(db_path, with_events=True, with_windows=True)
+        events = _summarize_action_events(db_path)
+        assert len(events) == 2
+        assert events[0] == {"event_type": "click", "window_title": "My Document - VS Code"}
+        assert events[1] == {"event_type": "type", "window_title": "GitHub Pull Request"}
 
 
 # ---------------------------------------------------------------------------
