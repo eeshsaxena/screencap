@@ -1,11 +1,7 @@
-"""CRUD operations for the recording database.
-
-Adapted for per-capture databases.
-Only import paths are changed; function signatures and logic are identical.
-"""
+"""CRUD operations for the recording database."""
 
 import json
-from typing import Any, TypeVar
+from typing import Any
 
 import sqlalchemy as sa
 from loguru import logger
@@ -21,9 +17,6 @@ from sc_engine.db.models import (
     WindowEvent,
     WindowGeometry,
 )
-
-# Type variable for generic model queries
-BaseModelType = TypeVar("BaseModelType")
 
 BATCH_SIZE = 1  # default; recorder overrides to 50 for throughput
 
@@ -256,30 +249,6 @@ def insert_recording(session: SaSession, recording_data: dict) -> Recording:
     session.commit()
     session.refresh(db_obj)
     return db_obj
-
-
-def _get(
-    session: SaSession,
-    table: BaseModelType,
-    recording_id: int,
-) -> list:
-    """Retrieve records from the database table based on the recording id.
-
-    Args:
-        session (sa.orm.Session): The database session.
-        table: The database table to query.
-        recording_id (int): The recording id.
-
-    Returns:
-        list: A list of records retrieved from the database table,
-          ordered by timestamp.
-    """
-    return (
-        session.query(table)
-        .filter(table.recording_id == recording_id)
-        .order_by(table.timestamp)
-        .all()
-    )
 
 
 def update_video_start_time(

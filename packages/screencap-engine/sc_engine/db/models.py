@@ -1,8 +1,4 @@
-"""SQLAlchemy models for the recording database.
-
-
-Only import paths are changed; column definitions and relationships are identical.
-"""
+"""SQLAlchemy models for the recording database."""
 
 import io
 
