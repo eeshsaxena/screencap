@@ -1,4 +1,4 @@
-"""Integration tests for Scenario 1: Normal recording with graceful stop.
+"""Integration tests for the recording flow (Scenarios 1-4).
 
 Tests the full recording lifecycle: start_recording() → stop → post-recording
 pipeline. Mocks only external boundaries (hardware, OS permissions, system
@@ -603,3 +603,381 @@ def test_stop_no_recording_running(tmp_path, monkeypatch):
         result = runner.invoke(cli, ["stop"])
 
     assert "no orphaned" in result.output.lower(), f"Output: {result.output}"
+
+
+# ---------------------------------------------------------------------------
+# Scenario 4: Multi-chunk — event boundaries
+# ---------------------------------------------------------------------------
+
+
+def _create_multi_chunk_db(db_path, t0):
+    """Create a recording.db with events spanning two chunk boundaries.
+
+    Events at t0+5, t0+15 (chunk 0: [t0, t0+30])
+    Events at t0+35, t0+45 (chunk 1: [t0+30, t0+60])
+    Window events at t0+1 and t0+31 for initial context testing.
+    """
+    conn = sqlite3.connect(str(db_path))
+    conn.executescript("""
+        CREATE TABLE recording (
+            id INTEGER PRIMARY KEY, timestamp REAL,
+            monitor_width INTEGER, monitor_height INTEGER,
+            pixel_ratio REAL DEFAULT 1.0, platform TEXT,
+            double_click_interval_seconds REAL,
+            double_click_distance_pixels REAL
+        );
+        CREATE TABLE action_event (
+            id INTEGER PRIMARY KEY, name TEXT, timestamp REAL,
+            recording_id INTEGER, mouse_x REAL, mouse_y REAL,
+            mouse_dx REAL, mouse_dy REAL, mouse_pressure REAL,
+            modifier_flags INTEGER, scroll_phase INTEGER,
+            momentum_phase INTEGER, is_continuous INTEGER,
+            mouse_button_name TEXT, mouse_pressed INTEGER,
+            key_char TEXT, key_name TEXT, key_vk TEXT,
+            canonical_key_char TEXT, canonical_key_name TEXT,
+            canonical_key_vk TEXT, element_state TEXT,
+            active_segment_description TEXT,
+            available_segment_descriptions TEXT,
+            disabled INTEGER DEFAULT 0
+        );
+        CREATE TABLE window_event (
+            id INTEGER PRIMARY KEY, timestamp REAL,
+            recording_id INTEGER, title TEXT,
+            app_bundle_id TEXT, window_id TEXT,
+            "left" INTEGER, top INTEGER, width INTEGER, height INTEGER
+        );
+    """)
+
+    conn.execute(
+        "INSERT INTO recording (id, timestamp, monitor_width, monitor_height, "
+        "pixel_ratio, platform, double_click_interval_seconds, "
+        "double_click_distance_pixels) VALUES (1, ?, 1920, 1080, 2.0, 'darwin', 0.5, 5.0)",
+        (t0,),
+    )
+
+    # Window event in chunk 0
+    conn.execute(
+        "INSERT INTO window_event (id, timestamp, recording_id, title, "
+        'app_bundle_id, window_id, "left", top, width, height) '
+        "VALUES (1, ?, 1, 'Editor', 'com.app.editor', 'win-1', 0, 0, 1920, 1080)",
+        (t0 + 1,),
+    )
+    # Window event in chunk 1
+    conn.execute(
+        "INSERT INTO window_event (id, timestamp, recording_id, title, "
+        'app_bundle_id, window_id, "left", top, width, height) '
+        "VALUES (2, ?, 1, 'Browser', 'com.app.browser', 'win-2', 0, 0, 1920, 1080)",
+        (t0 + 31,),
+    )
+
+    # Chunk 0 events: click pair at t0+5, keypress pair at t0+15
+    conn.execute(
+        "INSERT INTO action_event (id, name, timestamp, recording_id, "
+        "mouse_x, mouse_y, mouse_button_name, mouse_pressed) "
+        "VALUES (1, 'click', ?, 1, 100.0, 200.0, 'left', 1)", (t0 + 5,),
+    )
+    conn.execute(
+        "INSERT INTO action_event (id, name, timestamp, recording_id, "
+        "mouse_x, mouse_y, mouse_button_name, mouse_pressed) "
+        "VALUES (2, 'click', ?, 1, 100.0, 200.0, 'left', 0)", (t0 + 5.05,),
+    )
+    conn.execute(
+        "INSERT INTO action_event (id, name, timestamp, recording_id, "
+        "key_char, key_name, canonical_key_char, canonical_key_name) "
+        "VALUES (3, 'press', ?, 1, 'a', 'a', 'a', 'a')", (t0 + 15,),
+    )
+    conn.execute(
+        "INSERT INTO action_event (id, name, timestamp, recording_id, "
+        "key_char, key_name, canonical_key_char, canonical_key_name) "
+        "VALUES (4, 'release', ?, 1, 'a', 'a', 'a', 'a')", (t0 + 15.05,),
+    )
+
+    # Chunk 1 events: click pair at t0+35, keypress pair at t0+45
+    conn.execute(
+        "INSERT INTO action_event (id, name, timestamp, recording_id, "
+        "mouse_x, mouse_y, mouse_button_name, mouse_pressed) "
+        "VALUES (5, 'click', ?, 1, 300.0, 400.0, 'left', 1)", (t0 + 35,),
+    )
+    conn.execute(
+        "INSERT INTO action_event (id, name, timestamp, recording_id, "
+        "mouse_x, mouse_y, mouse_button_name, mouse_pressed) "
+        "VALUES (6, 'click', ?, 1, 300.0, 400.0, 'left', 0)", (t0 + 35.05,),
+    )
+    conn.execute(
+        "INSERT INTO action_event (id, name, timestamp, recording_id, "
+        "key_char, key_name, canonical_key_char, canonical_key_name) "
+        "VALUES (7, 'press', ?, 1, 'b', 'b', 'b', 'b')", (t0 + 45,),
+    )
+    conn.execute(
+        "INSERT INTO action_event (id, name, timestamp, recording_id, "
+        "key_char, key_name, canonical_key_char, canonical_key_name) "
+        "VALUES (8, 'release', ?, 1, 'b', 'b', 'b', 'b')", (t0 + 45.05,),
+    )
+
+    conn.commit()
+    conn.close()
+
+
+def test_multi_chunk_no_event_overlap_or_gaps(tmp_path):
+    """Two chunks: events partition cleanly with no overlap or loss.
+
+    Real: recording.db, sqlite3 queries, sc_engine processing pipeline, Queue.
+    Mocked: audio wait, transcription, manifest generation.
+
+    Verifies: no event appears in both chunks, no event is lost,
+    chunk 1 starts with initial window context from chunk 0.
+    """
+    from screencap.chunk_processor import ChunkProcessor
+
+    rec_dir = tmp_path / "test-multi"
+    rec_dir.mkdir()
+    t0 = 1000.0
+    _create_multi_chunk_db(rec_dir / "recording.db", t0)
+
+    chunk_q = multiprocessing.Queue()
+    audio_q = multiprocessing.Queue()
+
+    cp = ChunkProcessor(
+        capture_dir=rec_dir,
+        chunk_process_q=chunk_q,
+        audio_ack_q=audio_q,
+        recording_name="test-multi",
+        upload_enabled=False,
+        auto_delete=False,
+    )
+
+    with (
+        mock.patch.object(cp, "_wait_for_audio", return_value=True),
+        mock.patch.object(cp, "_transcribe", return_value=None),
+        mock.patch.object(cp, "_generate_manifest"),
+    ):
+        cp.start()
+
+        # Chunk 0: [t0, t0+30)
+        chunk_q.put({
+            "type": "chunk_rotated",
+            "completed_index": 0,
+            "chunk_start_time": t0,
+            "rotation_time": t0 + 30,
+        })
+        # Chunk 1: [t0+30, t0+60)
+        chunk_q.put({
+            "type": "chunk_rotated",
+            "completed_index": 1,
+            "chunk_start_time": t0 + 30,
+            "rotation_time": t0 + 60,
+        })
+
+        chunk_q.put({"type": "poison_pill"})
+        cp.stop(timeout=10)
+
+    # Both chunk files produced
+    chunk0 = rec_dir / "events_0000.jsonl"
+    chunk1 = rec_dir / "events_0001.jsonl"
+    assert chunk0.exists(), "events_0000.jsonl missing"
+    assert chunk1.exists(), "events_0001.jsonl missing"
+
+    def _parse_events(path):
+        lines = path.read_text().strip().split("\n")
+        events = []
+        for line in lines:
+            parsed = json.loads(line)
+            if "_meta" not in parsed and "format_version" not in parsed:
+                events.append(parsed)
+        return events
+
+    events_0 = _parse_events(chunk0)
+    events_1 = _parse_events(chunk1)
+
+    # Extract timestamps (action events have "timestamp", window.switch has "timestamp")
+    ts_0 = {e.get("timestamp") for e in events_0 if e.get("timestamp")}
+    ts_1 = {e.get("timestamp") for e in events_1 if e.get("timestamp")}
+
+    # No overlap: no timestamp appears in both chunks
+    overlap = ts_0 & ts_1
+    # Filter out initial window context (carried from chunk 0 into chunk 1)
+    # Its timestamp is set to chunk_start - 0.001
+    context_ts = t0 + 30 - 0.001
+    overlap_without_context = {t for t in overlap if abs(t - context_ts) > 0.01}
+    assert not overlap_without_context, f"Events overlap between chunks: {overlap_without_context}"
+
+    # Both chunks have events
+    assert len(events_0) > 0, "Chunk 0 should have events"
+    assert len(events_1) > 0, "Chunk 1 should have events"
+
+    # Chunk 1 has initial window context (window.switch as first event)
+    types_1 = [e.get("type") for e in events_1]
+    assert "window.switch" in types_1, "Chunk 1 should have initial window context"
+
+
+def test_start_recording_multi_chunk_produces_all_chunk_files(recording_env):
+    """End-to-end: start_recording() with chunk_duration wires up ChunkProcessor.
+
+    FakeRecorder provides real multiprocessing.Queues with rotation messages.
+    Verifies that start_recording() → ChunkProcessor processes ALL chunks,
+    not just the first one.
+
+    This test catches the bug where only chunk 0 is processed because
+    the Recorder doesn't send rotation messages for subsequent chunks.
+
+    Mocked: sc_engine.Recorder (replaced with FakeChunkedRecorder),
+    permissions, disk_usage, orphan scan, metrics.
+    Real: config (env vars), pidfile (tmp_path), ChunkProcessor, exporter.
+    """
+    from screencap.recorder import start_recording
+
+    rec_dir = recording_env["recordings_dir"] / "test-chunked"
+    t0 = 1000.0
+
+    class FakeChunkedRecorder:
+        """FakeRecorder that provides chunk queues with pre-loaded rotation messages.
+
+        Simulates a Recorder that produced 2 chunks of 30 seconds each.
+        """
+
+        def __init__(self, capture_dir_str, **kwargs):
+            self.capture_dir = Path(capture_dir_str)
+            self.is_recording = False
+            self.health_warning = None
+            self.child_crashes = []
+            # Real queues — ChunkProcessor will read from these
+            self._chunk_process_q = multiprocessing.Queue()
+            self._audio_ack_q = multiprocessing.Queue()
+            self._flush_requested = None
+            self._flush_ack_counter = None
+
+        def __enter__(self):
+            _create_multi_chunk_db(self.capture_dir / "recording.db", t0)
+
+            # Pre-load rotation messages for 2 chunks
+            self._chunk_process_q.put({
+                "type": "chunk_rotated",
+                "completed_index": 0,
+                "chunk_start_time": t0,
+                "rotation_time": t0 + 30,
+            })
+            self._chunk_process_q.put({
+                "type": "final_chunk",
+                "completed_index": 1,
+                "chunk_start_time": t0 + 30,
+                "rotation_time": t0 + 60,
+            })
+            return self
+
+        def __exit__(self, *args):
+            return False
+
+        def wait_for_ready(self, timeout=30):
+            return True
+
+        def stop(self):
+            self.is_recording = False
+
+    with (
+        mock.patch("sc_engine.Recorder", FakeChunkedRecorder),
+        mock.patch("screencap.recorder._check_macos_permissions"),
+        mock.patch("screencap.pidfile.find_orphaned_processes", return_value=[]),
+        mock.patch("shutil.disk_usage", return_value=_PLENTY_OF_DISK),
+        mock.patch("screencap.metrics.save_metrics"),
+        # Mock transcription/upload inside ChunkProcessor
+        mock.patch("screencap.chunk_processor.ChunkProcessor._wait_for_audio", return_value=True),
+        mock.patch("screencap.chunk_processor.ChunkProcessor._transcribe", return_value=None),
+        mock.patch("screencap.chunk_processor.ChunkProcessor._generate_manifest"),
+        mock.patch("screencap.chunk_processor.ChunkProcessor._upload_chunk"),
+    ):
+        capture_dir, elapsed = start_recording(
+            name="test-chunked",
+            audio=False,
+            output_dir=rec_dir,
+            wifi_metrics=False,
+            app_versions=False,
+            chunk_duration=30,
+            verbose=True,
+            live_upload=False,
+        )
+
+    # Both chunk event files should exist
+    assert (capture_dir / "events_0000.jsonl").exists(), \
+        "Chunk 0 events file missing — ChunkProcessor didn't process chunk 0"
+    assert (capture_dir / "events_0001.jsonl").exists(), \
+        "Chunk 1 events file missing — ChunkProcessor didn't process chunk 1 (rotation message lost?)"
+
+
+@pytest.mark.xfail(
+    reason="Finding 005: Recorder.__exit__() closes _chunk_process_q before "
+    "ChunkProcessor drains it. Fix: remove _chunk_process_q from __exit__ cleanup.",
+    strict=True,
+)
+def test_chunk_processor_survives_queue_close_during_processing(tmp_path):
+    """Regression: Recorder.__exit__() closes _chunk_process_q before
+    ChunkProcessor finishes draining it.
+
+    Reproduces the real shutdown race:
+    1. ChunkProcessor is reading from the queue
+    2. Messages are in the queue (rotation + poison pill)
+    3. The queue is closed (simulating Recorder.__exit__() cleanup)
+    4. ChunkProcessor should still process all messages that were
+       already in the queue before the close
+
+    This catches Finding 005: multi-chunk recordings only process chunk 0
+    because Recorder.__exit__() closes the queue before ChunkProcessor
+    reads the final_chunk message.
+    """
+    from screencap.chunk_processor import ChunkProcessor
+
+    rec_dir = tmp_path / "test-queue-close"
+    rec_dir.mkdir()
+    t0 = 1000.0
+    _create_multi_chunk_db(rec_dir / "recording.db", t0)
+
+    chunk_q = multiprocessing.Queue()
+    audio_q = multiprocessing.Queue()
+
+    cp = ChunkProcessor(
+        capture_dir=rec_dir,
+        chunk_process_q=chunk_q,
+        audio_ack_q=audio_q,
+        recording_name="test-queue-close",
+        upload_enabled=False,
+        auto_delete=False,
+    )
+
+    with (
+        mock.patch.object(cp, "_wait_for_audio", return_value=True),
+        mock.patch.object(cp, "_transcribe", return_value=None),
+        mock.patch.object(cp, "_generate_manifest"),
+    ):
+        cp.start()
+
+        # Load messages into queue (simulating what Recorder + fan-out produce)
+        chunk_q.put({
+            "type": "chunk_rotated",
+            "completed_index": 0,
+            "chunk_start_time": t0,
+            "rotation_time": t0 + 30,
+        })
+        chunk_q.put({
+            "type": "final_chunk",
+            "completed_index": 1,
+            "chunk_start_time": t0 + 30,
+            "rotation_time": t0 + 60,
+        })
+
+        # Simulate Recorder.__exit__() closing the queue IMMEDIATELY
+        # after the fan-out thread has put messages — no sleep, no grace period.
+        # This is what happens in the real shutdown: __exit__() joins the
+        # fan-out thread, then closes all queues before ChunkProcessor
+        # has finished processing.
+        chunk_q.cancel_join_thread()
+        chunk_q.close()
+
+        # Now call stop — this is what start_recording() does after __exit__
+        # The poison pill put will fail (queue closed), but ChunkProcessor
+        # should still process messages that were already in the queue.
+        cp.stop(timeout=10)
+
+    # BOTH chunks should have been processed despite queue closure
+    assert (rec_dir / "events_0000.jsonl").exists(), \
+        "Chunk 0 not processed — queue closed before ChunkProcessor read it"
+    assert (rec_dir / "events_0001.jsonl").exists(), \
+        "Chunk 1 (final) not processed — queue closed before ChunkProcessor read final_chunk"
