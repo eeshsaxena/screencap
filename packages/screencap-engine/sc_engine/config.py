@@ -53,7 +53,7 @@ class Settings(BaseSettings):
     SCREEN_CAPTURE_FPS: float = 20.0
 
     # Auto-cut video into chunks at this interval (seconds). 0 = legacy single-file.
-    VIDEO_CHUNK_DURATION: float = 3600.0
+    VIDEO_CHUNK_DURATION: float = 900.0
 
     # Skip post_process_events in chunked mode (set automatically)
     SKIP_POST_PROCESS: bool = False

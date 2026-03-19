@@ -956,7 +956,7 @@ def video_post_callback(state: dict) -> None:
 
 def chunked_video_pre_callback(
     db: crud.SaSession, recording: Recording, video_dir: str = None,
-    chunk_duration: float = 3600.0, chunk_rotate_q=None,
+    chunk_duration: float = 900.0, chunk_rotate_q=None,
 ) -> dict[str, Any]:
     """Pre-callback for chunked video mode using ChunkedVideoWriter."""
     init_screenshot = utils.take_screenshot()
