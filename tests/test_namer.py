@@ -198,12 +198,9 @@ class TestSummarizeActionEvents:
         db_path = tmp_path / "recording.db"
         _make_recording_db(db_path, with_events=True, with_windows=True)
         events = _summarize_action_events(db_path)
-        assert len(events) >= 1
-        titles = [e.get("window_title") for e in events]
-        assert any(t is not None for t in titles), (
-            "Expected at least one event with a window_title, "
-            f"got: {events}"
-        )
+        assert len(events) == 2
+        assert events[0] == {"event_type": "click", "window_title": "My Document - VS Code"}
+        assert events[1] == {"event_type": "type", "window_title": "GitHub Pull Request"}
 
 
 # ---------------------------------------------------------------------------
