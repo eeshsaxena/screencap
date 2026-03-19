@@ -997,8 +997,14 @@ def start_recording(
                     console.print(f"[yellow]Warning:[/yellow] DB upload failed: {e}")
 
         # Sentinel upload for cloud-intent recordings (triggers stitching)
-        _all_uploaded = chunk_processor.all_chunks_uploaded()
-        _n_uploaded, _n_processed = chunk_processor.upload_summary()
+        # If the processor was force-stopped (timeout), _chunk_results may
+        # be incomplete — a mid-flight chunk won't have an entry.  Don't
+        # trust all_chunks_uploaded() in that case.
+        _all_uploaded = (
+            chunk_processor.all_chunks_uploaded()
+            and not chunk_processor.was_force_stopped
+        )
+        _n_uploaded, _n_total = chunk_processor.upload_summary()
         _n_chunks = len(list(capture_dir.glob("chunk_*_manifest.json")))
 
         if cloud_intent and live_upload:
@@ -1019,20 +1025,8 @@ def start_recording(
                 except Exception as e:
                     if verbose:
                         console.print(f"[yellow]Warning:[/yellow] Sentinel upload failed: {e}")
-            else:
-                # Write sentinel locally for recovery, but don't upload
-                try:
-                    from screencap.chunk_processor import _build_sentinel_data
-                    _sentinel_data = _build_sentinel_data(
-                        _recording_name,
-                        stop_reason=_stop_reason or "graceful",
-                        chunks_expected=_n_chunks,
-                    )
-                    (capture_dir / "recording_complete.json").write_text(
-                        _json.dumps(_sentinel_data, indent=2)
-                    )
-                except Exception:
-                    pass
+            # else: no local sentinel — screencap upload generates a fresh
+            # one with the correct chunks_expected from manifests on disk.
 
         # Stub recording if all chunks AND (db or sentinel) uploaded
         _has_chunk_files = any(capture_dir.glob("chunk_*.mp4"))
@@ -1046,14 +1040,19 @@ def start_recording(
                 if verbose:
                     console.print(f"[yellow]Warning:[/yellow] Stub failed: {e}")
         elif live_upload and (not _all_uploaded or not _has_chunk_files):
-            if _n_processed == 0:
+            if chunk_processor.was_force_stopped:
+                console.print(
+                    "[yellow]Chunk processing timed out — some data may not have been uploaded. "
+                    f"Run 'screencap upload {_recording_name}' to complete the upload.[/yellow]"
+                )
+            elif _n_total == 0:
                 console.print(
                     "[yellow]No chunks were processed. "
                     f"Run 'screencap upload {_recording_name}' to upload.[/yellow]"
                 )
             else:
                 console.print(
-                    f"[yellow]{_n_uploaded} of {_n_processed} chunks uploaded. "
+                    f"[yellow]{_n_uploaded} of {_n_total} chunks uploaded. "
                     f"Run 'screencap upload {_recording_name}' to complete the upload.[/yellow]"
                 )
 

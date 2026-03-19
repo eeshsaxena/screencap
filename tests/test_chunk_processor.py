@@ -85,6 +85,24 @@ def test_all_chunks_uploaded_empty_returns_false(capture_dir):
     assert cp.all_chunks_uploaded() is False
 
 
+def test_was_force_stopped_reflects_stop_event(capture_dir):
+    """was_force_stopped is False normally, True after _stop_event is set."""
+    from screencap.chunk_processor import ChunkProcessor
+
+    q = multiprocessing.Queue()
+    ack_q = multiprocessing.Queue()
+
+    cp = ChunkProcessor(
+        capture_dir, q, ack_q, recording_name="test",
+        upload_enabled=False, auto_delete=False,
+    )
+    assert cp.was_force_stopped is False
+
+    # Simulate what stop() does when the thread times out
+    cp._stop_event.set()
+    assert cp.was_force_stopped is True
+
+
 # ---------------------------------------------------------------------------
 # Cloud-intent scrubbing tests
 # ---------------------------------------------------------------------------

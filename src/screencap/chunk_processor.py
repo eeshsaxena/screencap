@@ -143,6 +143,15 @@ class ChunkProcessor:
         n_uploaded = sum(1 for v in self._chunk_results.values() if v)
         return n_uploaded, n_total
 
+    @property
+    def was_force_stopped(self) -> bool:
+        """True if stop() timed out and had to force-stop the thread.
+
+        When True, _chunk_results may be incomplete — a chunk that was
+        mid-processing when _stop_event fired will have no entry.
+        """
+        return self._stop_event.is_set()
+
     def start(self) -> None:
         self._thread = threading.Thread(
             target=self._run, daemon=False, name="chunk_processor",
