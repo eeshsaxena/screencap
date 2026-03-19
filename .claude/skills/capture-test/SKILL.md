@@ -21,15 +21,21 @@ End-to-end sanity check for the screencap recording pipeline. Runs a real captur
 
 ### Step 1: Determine Test Scenario
 
+**The test must exercise the code path that was actually changed.** A sanity check that disables everything the fix touches is useless. Derive the scenario from what was modified in the current session:
+
 Check conversation context for what's being tested. If the user provided args, use those. Otherwise, derive from context:
 
-- If the user just modified `recorder.py` or `sc_engine` → test default capture settings
-- If they worked on audio → test with audio enabled
-- If they worked on screenshot capture → focus validation on screenshot quality
+- If changes touch `chunk_processor.py`, sentinel upload, chunk rotation, or the post-stop shutdown path in `recorder.py` → **test with video + audio + chunked mode** (`--chunk-duration 10`). This is the only way to exercise the ChunkProcessor pipeline. Without video, no chunks rotate. Without audio, the audio ack wait blocks for 60s per chunk.
+- If changes touch upload/cloud logic → **test with `--cloud`**. The upload bucket is public — no credentials needed. This exercises `live_upload=True` + `cloud_intent=True`, including sentinel upload and chunk upload gating.
+- If changes touch audio processing → test with audio enabled
+- If changes touch screenshot capture → focus validation on screenshot quality
+- If changes touch `recorder.py` signal handling or lifecycle → test default capture settings
 - If no specific context → run default sanity check (images + actions, no audio, no video)
 
-Default test flags: `--no-auto-name --no-video --no-audio --no-wifi-metrics --no-app-versions`
-These defaults keep the test fast and focused on the core capture pipeline. Override based on context or user args.
+**Default test flags:** `--no-auto-name --no-wifi-metrics --no-app-versions`
+Additional flags depend on context as described above. Only add `--no-video` or `--no-audio` when the code under test does not depend on those subsystems.
+
+**Duration guidance:** For chunked tests, tell the user to perform actions for **30-40 seconds** (enough for 3-4 chunk rotations at `--chunk-duration 10`). For non-chunked tests, 10-15 seconds is sufficient.
 
 ### Step 2: Start Recording
 
@@ -140,6 +146,27 @@ Print a structured report:
 Ask the user if they want to keep or delete the test recording:
 - Keep → leave it in `~/.screencap/recordings/`
 - Delete → `rm -rf ~/.screencap/recordings/<test-name>/`
+
+**Cloud recordings (--cloud):** If the test used `--cloud`, also clean up files uploaded to GCS. The bucket is `screencap-recordings` and files are stored under `recordings/<recording-name>/`.
+
+```bash
+# 1. Find the recording name (from .recording_id or the --name flag)
+RECORDING_NAME="<test-name>"
+
+# 2. Verify only our test recording files are listed (ALWAYS check before deleting)
+gsutil ls "gs://screencap-recordings/recordings/${RECORDING_NAME}/"
+
+# 3. Delete only our test recording
+gsutil -m rm -r "gs://screencap-recordings/recordings/${RECORDING_NAME}/"
+```
+
+**IMPORTANT:** Always list files first and visually confirm they belong to the test recording before deleting. Never use wildcards that could match other recordings. The bucket also has a `sessions/` prefix for processed recordings — check there too if the cloud stitcher has already processed the sentinel:
+```bash
+gsutil ls "gs://screencap-recordings/sessions/${RECORDING_NAME}/" 2>/dev/null
+gsutil -m rm -r "gs://screencap-recordings/sessions/${RECORDING_NAME}/" 2>/dev/null
+```
+
+**Note on cloud_intent + privacy pipeline:** If the privacy scrubbing pipeline fails to initialize (missing deps, config error), `ChunkProcessor` disables uploads silently (fail-closed). Chunks are marked as "success" locally but nothing reaches GCS. In this case there's nothing to clean up on GCS. Check: if `stub_recording()` ran (no local .mp4 files) but `gsutil ls` shows no files, uploads were silently disabled.
 
 ## Handling Args
 

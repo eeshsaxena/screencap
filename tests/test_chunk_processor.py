@@ -5,7 +5,9 @@ from __future__ import annotations
 import json
 import multiprocessing
 import time
+from collections import defaultdict
 from pathlib import Path
+from unittest import mock
 from unittest.mock import MagicMock, patch
 
 import pytest
@@ -81,6 +83,24 @@ def test_all_chunks_uploaded_empty_returns_false(capture_dir):
         upload_enabled=False, auto_delete=False,
     )
     assert cp.all_chunks_uploaded() is False
+
+
+def test_was_force_stopped_reflects_stop_event(capture_dir):
+    """was_force_stopped is False normally, True after _stop_event is set."""
+    from screencap.chunk_processor import ChunkProcessor
+
+    q = multiprocessing.Queue()
+    ack_q = multiprocessing.Queue()
+
+    cp = ChunkProcessor(
+        capture_dir, q, ack_q, recording_name="test",
+        upload_enabled=False, auto_delete=False,
+    )
+    assert cp.was_force_stopped is False
+
+    # Simulate what stop() does when the thread times out
+    cp._stop_event.set()
+    assert cp.was_force_stopped is True
 
 
 # ---------------------------------------------------------------------------
@@ -723,3 +743,244 @@ class TestUnifiedEventExport:
         events = [json.loads(line) for line in lines[1:]]
         # The valid click pair should still be exported
         assert any(e["type"] == "mouse.singleclick" for e in events)
+
+
+# ---------------------------------------------------------------------------
+# Upload gating integration tests — sentinel upload should be gated behind
+# all_chunks_uploaded().  These tests exercise the real ChunkProcessor thread
+# loop with real queues and the real _upload_chunk retry logic; only the HTTP
+# layer (upload_chunk_files) is mocked.
+# ---------------------------------------------------------------------------
+
+
+def _create_seven_chunk_db(db_path: Path, t0: float) -> None:
+    """Create a DB with events spanning 7 chunks (30s each)."""
+    import sqlite3
+
+    conn = sqlite3.connect(str(db_path))
+    conn.execute(
+        "CREATE TABLE action_event ("
+        "id INTEGER PRIMARY KEY, timestamp REAL, name TEXT, "
+        "mouse_x REAL, mouse_y REAL, mouse_dx REAL, mouse_dy REAL, "
+        "mouse_button_name TEXT, mouse_pressed INTEGER, "
+        "mouse_pressure REAL, modifier_flags INTEGER, "
+        "scroll_phase INTEGER, momentum_phase INTEGER, is_continuous INTEGER, "
+        "key_char TEXT, key_name TEXT, key_vk TEXT, "
+        "canonical_key_char TEXT, canonical_key_name TEXT, canonical_key_vk TEXT, "
+        "text TEXT, element_state TEXT, "
+        "active_segment_description TEXT, available_segment_descriptions TEXT)"
+    )
+    conn.execute(
+        "CREATE TABLE window_event ("
+        "id INTEGER PRIMARY KEY, timestamp REAL, title TEXT, "
+        "app_bundle_id TEXT, window_id TEXT, "
+        "left INTEGER, top INTEGER, width INTEGER, height INTEGER)"
+    )
+    conn.execute(
+        "CREATE TABLE recording (id INTEGER PRIMARY KEY, timestamp REAL)"
+    )
+    conn.execute("INSERT INTO recording VALUES (1, ?)", (t0,))
+    # Insert one click pair per chunk so _export_events has something to process
+    for i in range(7):
+        chunk_ts = t0 + i * 30 + 5
+        conn.execute(
+            "INSERT INTO action_event (timestamp, name, mouse_x, mouse_y, "
+            "mouse_button_name, mouse_pressed) VALUES (?, 'click', 100, 200, 'left', 1)",
+            (chunk_ts,),
+        )
+        conn.execute(
+            "INSERT INTO action_event (timestamp, name, mouse_x, mouse_y, "
+            "mouse_button_name, mouse_pressed) VALUES (?, 'click', 100, 200, 'left', 0)",
+            (chunk_ts + 0.1,),
+        )
+    conn.commit()
+    conn.close()
+
+
+def _create_chunk_media_files(capture_dir: Path, n_chunks: int) -> None:
+    """Create stub .mp4, .flac files for each chunk."""
+    for i in range(n_chunks):
+        (capture_dir / f"chunk_{i:04d}.mp4").write_bytes(b"\x00" * 1024)
+        (capture_dir / f"audio_{i:04d}.flac").write_bytes(b"\x00" * 512)
+
+
+def _build_chunk_processor(
+    capture_dir: Path,
+) -> tuple:
+    """Build a ChunkProcessor with upload enabled but side-effects mocked.
+
+    Returns (processor, chunk_queue).  The real _upload_chunk retry logic is
+    preserved — only upload_chunk_files (the HTTP layer) needs to be patched
+    by the caller via @mock.patch.
+    """
+    from screencap.chunk_processor import ChunkProcessor
+
+    chunk_q = multiprocessing.Queue()
+    audio_q = multiprocessing.Queue()
+    cp = ChunkProcessor(
+        capture_dir,
+        chunk_q,
+        audio_q,
+        recording_name="test-upload-gating",
+        upload_enabled=True,
+        auto_delete=True,
+        cloud_intent=False,  # skip privacy pipeline init
+    )
+
+    # Mock side effects that aren't under test
+    cp._wait_for_audio = lambda *a, **kw: True
+    cp._transcribe = lambda *a, **kw: None
+    cp._generate_manifest = lambda *a, **kw: None
+
+    return cp, chunk_q
+
+
+def _enqueue_chunks(q, t0: float, n: int) -> None:
+    """Put n chunk rotation messages into the queue."""
+    for i in range(n):
+        q.put({
+            "type": "chunk_rotated" if i < n - 1 else "final_chunk",
+            "completed_index": i,
+            "chunk_start_time": t0 + i * 30,
+            "rotation_time": t0 + (i + 1) * 30,
+        })
+
+
+class TestUploadGatingAllSucceed:
+    """Scenario 1: All 7 chunks upload successfully."""
+
+    @mock.patch("screencap.chunk_processor.time.sleep")
+    @mock.patch("screencap.chunk_processor.upload_chunk_files", return_value=True)
+    def test_seven_chunks_all_succeed(self, mock_upload, mock_sleep, tmp_path):
+        """Happy path: all chunks upload, cleanup runs, state is correct."""
+        t0 = time.time()
+        _create_seven_chunk_db(tmp_path / "recording.db", t0)
+        _create_chunk_media_files(tmp_path, 7)
+        cp, chunk_q = _build_chunk_processor(tmp_path)
+        cp.start()
+
+        _enqueue_chunks(chunk_q, t0, 7)
+        cp.stop(timeout=30)
+
+        # Core state
+        assert cp.all_chunks_uploaded() is True
+        n_uploaded, n_total = cp.upload_summary()
+        assert n_uploaded == 7
+        assert n_total == 7
+
+        # Upload called once per chunk (no retries needed)
+        assert mock_upload.call_count == 7
+
+        # Old chunk media cleaned up (keep_recent=2: only chunks 5,6 remain)
+        for i in range(5):
+            assert not (tmp_path / f"chunk_{i:04d}.mp4").exists(), \
+                f"chunk_{i:04d}.mp4 should have been cleaned up"
+            assert not (tmp_path / f"audio_{i:04d}.flac").exists(), \
+                f"audio_{i:04d}.flac should have been cleaned up"
+        for i in range(5, 7):
+            assert (tmp_path / f"chunk_{i:04d}.mp4").exists(), \
+                f"chunk_{i:04d}.mp4 should still exist (recent)"
+            assert (tmp_path / f"audio_{i:04d}.flac").exists(), \
+                f"audio_{i:04d}.flac should still exist (recent)"
+
+        # No retry backoff needed
+        mock_sleep.assert_not_called()
+
+
+class TestUploadGatingPartialFailure:
+    """Scenario 2: Chunk 3 fails permanently, rest succeed."""
+
+    @mock.patch("screencap.chunk_processor.time.sleep")
+    @mock.patch("screencap.chunk_processor.upload_chunk_files")
+    def test_seven_chunks_one_fails_permanently(self, mock_upload, mock_sleep, tmp_path):
+        """Chunk 3 fails both attempts. Retry called, files preserved for recovery."""
+
+        def upload_side_effect(recording_name, files, capture_dir):
+            for f in files:
+                if "chunk_0003" in f["name"]:
+                    raise ConnectionError("upload failed")
+            return True
+
+        mock_upload.side_effect = upload_side_effect
+
+        t0 = time.time()
+        _create_seven_chunk_db(tmp_path / "recording.db", t0)
+        _create_chunk_media_files(tmp_path, 7)
+        cp, chunk_q = _build_chunk_processor(tmp_path)
+        cp.start()
+
+        _enqueue_chunks(chunk_q, t0, 7)
+        cp.stop(timeout=30)
+
+        # Core state
+        assert cp.all_chunks_uploaded() is False
+        n_uploaded, n_total = cp.upload_summary()
+        assert n_uploaded == 6
+        assert n_total == 7
+
+        # Retry: 6 successes (once each) + 2 attempts for chunk 3 = 8
+        assert mock_upload.call_count == 8
+        # 5s backoff sleep between chunk 3's two attempts
+        mock_sleep.assert_called_once_with(5)
+
+        # Chunk 3 media files preserved on disk (not cleaned up)
+        assert (tmp_path / "chunk_0003.mp4").exists()
+        assert (tmp_path / "audio_0003.flac").exists()
+
+        # Successfully uploaded old chunks still cleaned up
+        for i in [0, 1, 2]:
+            assert not (tmp_path / f"chunk_{i:04d}.mp4").exists(), \
+                f"chunk_{i:04d}.mp4 should have been cleaned up (uploaded OK)"
+
+
+class TestUploadGatingRetryRecovery:
+    """Scenario 3: Chunk 3 fails first attempt, succeeds on retry."""
+
+    @mock.patch("screencap.chunk_processor.time.sleep")
+    @mock.patch("screencap.chunk_processor.upload_chunk_files")
+    def test_seven_chunks_one_recovers_on_retry(self, mock_upload, mock_sleep, tmp_path):
+        """Chunk 3 fails first attempt, succeeds on retry. End state = happy path."""
+
+        call_counts: dict[int, int] = defaultdict(int)
+
+        def upload_side_effect(recording_name, files, capture_dir):
+            chunk_id = None
+            for f in files:
+                if "chunk_0003" in f["name"]:
+                    chunk_id = 3
+                    break
+            if chunk_id == 3:
+                call_counts[3] += 1
+                if call_counts[3] == 1:
+                    raise ConnectionError("transient failure")
+            return True
+
+        mock_upload.side_effect = upload_side_effect
+
+        t0 = time.time()
+        _create_seven_chunk_db(tmp_path / "recording.db", t0)
+        _create_chunk_media_files(tmp_path, 7)
+        cp, chunk_q = _build_chunk_processor(tmp_path)
+        cp.start()
+
+        _enqueue_chunks(chunk_q, t0, 7)
+        cp.stop(timeout=30)
+
+        # Retry succeeded: all chunks marked as uploaded
+        assert cp.all_chunks_uploaded() is True
+        n_uploaded, n_total = cp.upload_summary()
+        assert n_uploaded == 7
+        assert n_total == 7
+
+        # Upload called 8 times: 6 once each + chunk 3 twice
+        assert mock_upload.call_count == 8
+        # Backoff sleep called once (before chunk 3's retry)
+        mock_sleep.assert_called_once_with(5)
+
+        # Chunk 3 treated as success: old chunks cleaned up normally
+        for i in range(5):
+            assert not (tmp_path / f"chunk_{i:04d}.mp4").exists(), \
+                f"chunk_{i:04d}.mp4 should have been cleaned up"
+        for i in range(5, 7):
+            assert (tmp_path / f"chunk_{i:04d}.mp4").exists(), \
+                f"chunk_{i:04d}.mp4 should still exist (recent)"

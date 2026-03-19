@@ -997,24 +997,40 @@ def start_recording(
                     console.print(f"[yellow]Warning:[/yellow] DB upload failed: {e}")
 
         # Sentinel upload for cloud-intent recordings (triggers stitching)
+        # If the processor was force-stopped (timeout), _chunk_results may
+        # be incomplete — a mid-flight chunk won't have an entry.  Don't
+        # trust all_chunks_uploaded() in that case.
+        _all_uploaded = (
+            chunk_processor.all_chunks_uploaded()
+            and not chunk_processor.was_force_stopped
+        )
+        _n_uploaded, _n_total = chunk_processor.upload_summary()
+        _n_chunks = len(list(capture_dir.glob("chunk_*_manifest.json")))
+
         if cloud_intent and live_upload:
-            try:
-                from screencap.chunk_processor import upload_sentinel
-                _n_chunks = len(list(capture_dir.glob("chunk_*_manifest.json")))
-                _sentinel_uploaded = upload_sentinel(
-                    capture_dir, _recording_name,
-                    stop_reason=_stop_reason or "graceful",
-                    chunks_expected=_n_chunks,
-                )
-                if not _sentinel_uploaded:
-                    console.print("[yellow]Sentinel upload failed — run 'screencap upload' to trigger stitching.[/yellow]")
-            except Exception as e:
-                if verbose:
-                    console.print(f"[yellow]Warning:[/yellow] Sentinel upload failed: {e}")
+            if _all_uploaded and _n_chunks > 0:
+                # All chunks uploaded — safe to trigger stitching
+                try:
+                    from screencap.chunk_processor import upload_sentinel
+                    _sentinel_uploaded = upload_sentinel(
+                        capture_dir, _recording_name,
+                        stop_reason=_stop_reason or "graceful",
+                        chunks_expected=_n_chunks,
+                    )
+                    if not _sentinel_uploaded:
+                        console.print(
+                            "[yellow]Sentinel upload failed — run "
+                            f"'screencap upload {_recording_name}' to trigger stitching.[/yellow]"
+                        )
+                except Exception as e:
+                    if verbose:
+                        console.print(f"[yellow]Warning:[/yellow] Sentinel upload failed: {e}")
+            # else: no local sentinel — screencap upload generates a fresh
+            # one with the correct chunks_expected from manifests on disk.
 
         # Stub recording if all chunks AND (db or sentinel) uploaded
         _has_chunk_files = any(capture_dir.glob("chunk_*.mp4"))
-        if chunk_processor.all_chunks_uploaded() and (_db_uploaded or _sentinel_uploaded) and live_upload and _has_chunk_files:
+        if _all_uploaded and (_db_uploaded or _sentinel_uploaded) and live_upload and _has_chunk_files:
             try:
                 from screencap.chunk_processor import stub_recording
                 deleted = stub_recording(capture_dir)
@@ -1023,10 +1039,22 @@ def start_recording(
             except Exception as e:
                 if verbose:
                     console.print(f"[yellow]Warning:[/yellow] Stub failed: {e}")
-        elif not chunk_processor.all_chunks_uploaded() or not _has_chunk_files:
-            console.print("[yellow]Some chunks failed to upload — run 'screencap upload' later.[/yellow]")
-            if not verbose:
-                console.print("[dim]Tip: re-run with --verbose for detailed diagnostics.[/dim]")
+        elif live_upload and (not _all_uploaded or not _has_chunk_files):
+            if chunk_processor.was_force_stopped:
+                console.print(
+                    "[yellow]Chunk processing timed out — some data may not have been uploaded. "
+                    f"Run 'screencap upload {_recording_name}' to complete the upload.[/yellow]"
+                )
+            elif _n_total == 0:
+                console.print(
+                    "[yellow]No chunks were processed. "
+                    f"Run 'screencap upload {_recording_name}' to upload.[/yellow]"
+                )
+            else:
+                console.print(
+                    f"[yellow]{_n_uploaded} of {_n_total} chunks uploaded. "
+                    f"Run 'screencap upload {_recording_name}' to complete the upload.[/yellow]"
+                )
 
     elapsed = time.time() - t0
 

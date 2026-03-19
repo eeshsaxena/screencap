@@ -133,6 +133,25 @@ class ChunkProcessor:
             return False
         return all(self._chunk_results.values())
 
+    def upload_summary(self) -> tuple[int, int]:
+        """Return (n_uploaded, n_total) from chunk results.
+
+        Must only be called after stop() — _chunk_results is not
+        thread-safe for concurrent reads.
+        """
+        n_total = len(self._chunk_results)
+        n_uploaded = sum(1 for v in self._chunk_results.values() if v)
+        return n_uploaded, n_total
+
+    @property
+    def was_force_stopped(self) -> bool:
+        """True if stop() timed out and had to force-stop the thread.
+
+        When True, _chunk_results may be incomplete — a chunk that was
+        mid-processing when _stop_event fired will have no entry.
+        """
+        return self._stop_event.is_set()
+
     def start(self) -> None:
         self._thread = threading.Thread(
             target=self._run, daemon=False, name="chunk_processor",
