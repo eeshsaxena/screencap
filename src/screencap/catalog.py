@@ -135,6 +135,47 @@ def _read_recording_meta(db_path: Path) -> tuple[float | None, float | None]:
         return None, None
 
 
+def get_seen_bundle_ids(directories: list[Path] | None = None) -> set[str]:
+    """Collect distinct app_bundle_id values from recording DBs.
+
+    Args:
+        directories: Specific recording dirs to scan. If None, scans all
+            recordings in the configured recordings dir.
+
+    Returns:
+        Set of bundle ID strings seen across all scanned recordings.
+    """
+    if directories is None:
+        rec_dir = get_recordings_dir()
+        if not rec_dir.exists():
+            return set()
+        directories = [d for d in rec_dir.iterdir() if d.is_dir()]
+
+    seen: set[str] = set()
+    for d in directories:
+        db_path = find_db(d)
+        if db_path is None:
+            continue
+        try:
+            conn = sqlite3.connect(str(db_path))
+            try:
+                cur = conn.cursor()
+                tables = {r[0] for r in cur.execute(
+                    "SELECT name FROM sqlite_master WHERE type='table'"
+                ).fetchall()}
+                if "window_event" in tables:
+                    rows = cur.execute(
+                        "SELECT DISTINCT app_bundle_id FROM window_event "
+                        "WHERE app_bundle_id IS NOT NULL AND app_bundle_id != ''"
+                    ).fetchall()
+                    seen.update(r[0] for r in rows)
+            finally:
+                conn.close()
+        except Exception:
+            continue
+    return seen
+
+
 def list_recordings(recordings_dir: Path | None = None) -> list[RecordingInfo]:
     """Scan recordings directory and return metadata for each."""
     if recordings_dir is None:

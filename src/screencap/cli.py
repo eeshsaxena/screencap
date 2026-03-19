@@ -36,37 +36,14 @@ def cli(ctx, no_update_check):
 
 def _report_unclassified_apps(capture_dir) -> None:
     """Report apps seen during recording that are not in privacy config."""
-    import sqlite3
-
-    from screencap.catalog import find_db
+    from screencap.catalog import get_seen_bundle_ids
     from screencap.config import get_privacy_config
     from screencap.privacy.context import BUNDLE_ID_MAP
 
-    db_path = find_db(capture_dir)
-    if not db_path:
+    seen_bids = get_seen_bundle_ids([capture_dir])
+    if not seen_bids:
         return
 
-    conn = sqlite3.connect(str(db_path))
-    try:
-        cur = conn.cursor()
-        tables = {r[0] for r in cur.execute(
-            "SELECT name FROM sqlite_master WHERE type='table'"
-        ).fetchall()}
-        if "window_event" not in tables:
-            return
-        rows = cur.execute(
-            "SELECT DISTINCT app_bundle_id FROM window_event "
-            "WHERE app_bundle_id IS NOT NULL AND app_bundle_id != ''"
-        ).fetchall()
-    finally:
-        conn.close()
-
-    if not rows:
-        return
-
-    seen_bids = {r[0] for r in rows}
-
-    # Get configured bundle IDs
     try:
         privacy_config = get_privacy_config()
     except Exception:
@@ -75,6 +52,7 @@ def _report_unclassified_apps(capture_dir) -> None:
     known_bids = (
         set(BUNDLE_ID_MAP.keys())
         | set(privacy_config.exclude_apps)
+        | set(privacy_config.allow_apps)
         | set(privacy_config.app_classes.keys())
     )
 

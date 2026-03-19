@@ -7,7 +7,7 @@ from pathlib import Path
 
 import pytest
 
-from screencap.catalog import find_db, list_recordings, read_intent
+from screencap.catalog import find_db, get_seen_bundle_ids, list_recordings, read_intent
 
 
 @pytest.fixture
@@ -194,3 +194,66 @@ def test_list_recordings_legacy_no_intent(recordings_dir):
     assert len(result) == 1
     assert result[0].name == "legacy-rec"
     assert result[0].intent is None
+
+
+# --- get_seen_bundle_ids tests ---
+
+
+def _make_recording_with_window_events(base: Path, name: str, bundle_ids: list[str]):
+    """Create a recording dir with window_event table containing given bundle IDs."""
+    d = base / name
+    d.mkdir(parents=True)
+    db_path = d / "recording.db"
+    conn = sqlite3.connect(str(db_path))
+    conn.execute(
+        "CREATE TABLE window_event "
+        "(timestamp REAL, app_bundle_id TEXT, title TEXT, window_id TEXT)"
+    )
+    for i, bid in enumerate(bundle_ids):
+        conn.execute(
+            "INSERT INTO window_event VALUES (?, ?, 'title', 'w1')",
+            (float(i), bid),
+        )
+    conn.commit()
+    conn.close()
+    return d
+
+
+def test_get_seen_bundle_ids_single_dir(tmp_path):
+    d = _make_recording_with_window_events(
+        tmp_path, "rec1", ["com.example.foo", "com.example.bar"]
+    )
+    result = get_seen_bundle_ids([d])
+    assert result == {"com.example.foo", "com.example.bar"}
+
+
+def test_get_seen_bundle_ids_multiple_dirs(tmp_path):
+    d1 = _make_recording_with_window_events(tmp_path, "rec1", ["com.example.foo"])
+    d2 = _make_recording_with_window_events(tmp_path, "rec2", ["com.example.bar"])
+    result = get_seen_bundle_ids([d1, d2])
+    assert result == {"com.example.foo", "com.example.bar"}
+
+
+def test_get_seen_bundle_ids_deduplicates(tmp_path):
+    d1 = _make_recording_with_window_events(tmp_path, "rec1", ["com.example.foo"])
+    d2 = _make_recording_with_window_events(tmp_path, "rec2", ["com.example.foo"])
+    result = get_seen_bundle_ids([d1, d2])
+    assert result == {"com.example.foo"}
+
+
+def test_get_seen_bundle_ids_no_window_event_table(tmp_path):
+    """Dirs without window_event table are silently skipped."""
+    d = tmp_path / "rec1"
+    d.mkdir()
+    db_path = d / "recording.db"
+    conn = sqlite3.connect(str(db_path))
+    conn.execute("CREATE TABLE recording (id INTEGER PRIMARY KEY)")
+    conn.commit()
+    conn.close()
+    result = get_seen_bundle_ids([d])
+    assert result == set()
+
+
+def test_get_seen_bundle_ids_empty_dirs(tmp_path):
+    result = get_seen_bundle_ids([])
+    assert result == set()

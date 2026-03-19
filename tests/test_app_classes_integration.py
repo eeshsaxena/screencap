@@ -140,6 +140,35 @@ class TestPostRecordingReport:
             mock_console.print.assert_not_called()
 
 
+    def test_no_report_for_allowed_apps(self, tmp_path):
+        import sqlite3
+        from unittest import mock
+
+        db_path = tmp_path / "recording.db"
+        conn = sqlite3.connect(str(db_path))
+        conn.execute(
+            "CREATE TABLE window_event "
+            "(timestamp REAL, app_bundle_id TEXT, title TEXT, window_id TEXT)"
+        )
+        conn.execute(
+            "INSERT INTO window_event VALUES (1.0, 'com.example.allowed', 'Allowed', 'w1')"
+        )
+        conn.commit()
+        conn.close()
+
+        config = PrivacyConfig(
+            mode=PrivacyMode.INTERNAL,
+            allow_apps=frozenset(["com.example.allowed"]),
+        )
+
+        with mock.patch("screencap.catalog.find_db", return_value=db_path), \
+             mock.patch("screencap.config.get_privacy_config", return_value=config), \
+             mock.patch("screencap.cli.console") as mock_console:
+            from screencap.cli import _report_unclassified_apps
+            _report_unclassified_apps(tmp_path)
+            mock_console.print.assert_not_called()
+
+
 class TestEndToEndConfigToAction:
     """Config → classifier → evaluator → action pipeline."""
 
