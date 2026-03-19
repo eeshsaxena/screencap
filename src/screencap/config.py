@@ -184,12 +184,12 @@ def get_disk_stop_mb() -> int:
 
 
 def get_chunk_duration() -> float:
-    """Return auto-cut chunk duration in seconds. Default 3600 (1 hour). 0 = legacy."""
+    """Return auto-cut chunk duration in seconds. Default 900 (15 min). 0 = legacy."""
     env = os.environ.get("SCREENCAP_CHUNK_DURATION")
     if env is not None:
         return float(env)
     cfg = _load_toml()
-    return float(cfg.get("chunk_duration", 3600.0))
+    return float(cfg.get("chunk_duration", 900.0))
 
 
 def get_auto_delete_after_upload() -> bool:

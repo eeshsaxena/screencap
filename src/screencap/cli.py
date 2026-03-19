@@ -180,7 +180,7 @@ def _maybe_prompt_privacy_setup() -> None:
 @click.option("--force", is_flag=True, default=False, help="Auto-clean orphaned processes before starting.")
 @click.option("--verbose", "-v", is_flag=True, default=False, help="Show all info/debug output during recording.")
 @click.option("--chunk-duration", type=float, default=None,
-              help="Auto-cut recording at this interval (seconds). Default: 3600 (1 hour). Set 0 to disable chunking.")
+              help="Auto-cut recording at this interval (seconds). Default: 900 (15 min). Set 0 to disable chunking.")
 @click.option("--no-live-upload", is_flag=True, default=False,
               help="Disable background upload of chunks during recording.")
 @click.option("--cloud", "destination", flag_value="cloud", default=None,
@@ -1726,7 +1726,14 @@ def settings():
     )
 
     chunk = get_chunk_duration()
-    chunk_str = f"{chunk:.0f}s ({chunk / 3600:.1f} hour)" if chunk > 0 else "disabled (legacy single-file)"
+    if chunk >= 3600:
+        chunk_str = f"{chunk:.0f}s ({chunk / 3600:.1f} hour)"
+    elif chunk >= 60:
+        chunk_str = f"{chunk:.0f}s ({chunk / 60:.0f} min)"
+    elif chunk > 0:
+        chunk_str = f"{chunk:.0f}s"
+    else:
+        chunk_str = "disabled (legacy single-file)"
     rest = get_rest_threshold()
 
     console.print("\n[bold]ScreenCap Configuration[/bold]\n")
