@@ -76,7 +76,7 @@ class ChunkProcessor:
                 self._pipeline = create_default_pipeline()
                 self._anonymizer = Anonymizer()
                 logger.info("Scrubbing pipeline initialized for cloud-intent recording")
-            except ImportError as e:
+            except Exception as e:
                 logger.error(
                     f"Privacy deps not available — disabling uploads for safety: {e}"
                 )
