@@ -52,6 +52,7 @@ def _report_unclassified_apps(capture_dir) -> None:
     known_bids = (
         set(BUNDLE_ID_MAP.keys())
         | set(privacy_config.exclude_apps)
+        | set(privacy_config.allow_apps)
         | set(privacy_config.app_classes.keys())
     )
 

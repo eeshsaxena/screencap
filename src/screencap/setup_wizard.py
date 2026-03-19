@@ -608,18 +608,8 @@ def run_setup_wizard(
             3: (PrivacyMode.INTERNAL, "ask"),
         }[dest_choice]
 
-    # Discover apps
-    with console.status("Scanning installed apps..."):
-        apps = discover_installed_apps(use_spotlight=True, spotlight_timeout=5.0)
-
-    if not apps:
-        console.print("[yellow]No apps found.[/yellow]")
-        return False
-
-    # Classify
-    classified = _classify_with_overrides(apps, existing_ac, existing_exclude)
-
-    # In scan-only mode, scope to apps seen in recordings that are unclassified
+    # In scan-only mode, check recordings first to avoid unnecessary Spotlight scan
+    recording_unclassified: set[str] | None = None
     if scan_only:
         from screencap.catalog import get_seen_bundle_ids
 
@@ -636,6 +626,19 @@ def run_setup_wizard(
             console.print("[green]No unclassified apps found in recordings.[/green]")
             return False
 
+    # Discover apps
+    with console.status("Scanning installed apps..."):
+        apps = discover_installed_apps(use_spotlight=True, spotlight_timeout=5.0)
+
+    if not apps:
+        console.print("[yellow]No apps found.[/yellow]")
+        return False
+
+    # Classify
+    classified = _classify_with_overrides(apps, existing_ac, existing_exclude)
+
+    # In scan-only mode, filter to recording-seen unclassified apps
+    if scan_only and recording_unclassified is not None:
         new_classified = {
             bid: info for bid, info in classified.items()
             if bid in recording_unclassified

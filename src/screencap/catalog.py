@@ -158,17 +158,19 @@ def get_seen_bundle_ids(directories: list[Path] | None = None) -> set[str]:
             continue
         try:
             conn = sqlite3.connect(str(db_path))
-            cur = conn.cursor()
-            tables = {r[0] for r in cur.execute(
-                "SELECT name FROM sqlite_master WHERE type='table'"
-            ).fetchall()}
-            if "window_event" in tables:
-                rows = cur.execute(
-                    "SELECT DISTINCT app_bundle_id FROM window_event "
-                    "WHERE app_bundle_id IS NOT NULL AND app_bundle_id != ''"
-                ).fetchall()
-                seen.update(r[0] for r in rows)
-            conn.close()
+            try:
+                cur = conn.cursor()
+                tables = {r[0] for r in cur.execute(
+                    "SELECT name FROM sqlite_master WHERE type='table'"
+                ).fetchall()}
+                if "window_event" in tables:
+                    rows = cur.execute(
+                        "SELECT DISTINCT app_bundle_id FROM window_event "
+                        "WHERE app_bundle_id IS NOT NULL AND app_bundle_id != ''"
+                    ).fetchall()
+                    seen.update(r[0] for r in rows)
+            finally:
+                conn.close()
         except Exception:
             continue
     return seen
