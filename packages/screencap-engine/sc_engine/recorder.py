@@ -2782,10 +2782,6 @@ def record(
 
     logger.info(f"Saved {recording_timestamp=}")
 
-    session = get_session_for_path(db_path)
-    if not getattr(config, 'SKIP_POST_PROCESS', False):
-        crud.post_process_events(session, recording)
-
     # --- Profiling summary ---
     _profile_duration = time.perf_counter() - _profile_start
     _profile_data = {
@@ -3093,9 +3089,7 @@ class Recorder:
             self._flush_requested = multiprocessing.Event()
             self._flush_ack_counter = multiprocessing.Value('i', 0)
 
-            # Auto-set skip_post_process and screenshot_min_interval for chunked mode
-            if self._recording_config.skip_post_process is None:
-                self._recording_config.skip_post_process = True
+            # Auto-set screenshot_min_interval for chunked mode
             if self._recording_config.screenshot_min_interval is None:
                 self._recording_config.screenshot_min_interval = 1.0
 

@@ -59,9 +59,7 @@ def create_test_recording_db(db_path, *, base_timestamp=None):
             recording_id INTEGER,
             recording_timestamp REAL,
             screenshot_timestamp REAL,
-            screenshot_id INTEGER,
             window_event_timestamp REAL,
-            window_event_id INTEGER,
             mouse_x REAL,
             mouse_y REAL,
             mouse_dx REAL,
@@ -151,32 +149,32 @@ def create_test_recording_db(db_path, *, base_timestamp=None):
     conn.execute(
         "INSERT INTO action_event "
         "(id, name, timestamp, recording_id, mouse_x, mouse_y, "
-        "mouse_button_name, mouse_pressed, window_event_id) "
-        "VALUES (1, 'click', ?, 1, 500.0, 300.0, 'left', 1, 1)",
-        (t + 0.5,),
+        "mouse_button_name, mouse_pressed, window_event_timestamp) "
+        "VALUES (1, 'click', ?, 1, 500.0, 300.0, 'left', 1, ?)",
+        (t + 0.5, t + 0.1),
     )
     conn.execute(
         "INSERT INTO action_event "
         "(id, name, timestamp, recording_id, mouse_x, mouse_y, "
-        "mouse_button_name, mouse_pressed, window_event_id) "
-        "VALUES (2, 'click', ?, 1, 500.0, 300.0, 'left', 0, 1)",
-        (t + 0.55,),
+        "mouse_button_name, mouse_pressed, window_event_timestamp) "
+        "VALUES (2, 'click', ?, 1, 500.0, 300.0, 'left', 0, ?)",
+        (t + 0.55, t + 0.1),
     )
 
     # Key press + release → will become KeyTypeEvent after processing
     conn.execute(
         "INSERT INTO action_event "
         "(id, name, timestamp, recording_id, key_char, key_name, "
-        "canonical_key_char, canonical_key_name) "
-        "VALUES (3, 'press', ?, 1, 'h', 'h', 'h', 'h')",
-        (t + 1.0,),
+        "canonical_key_char, canonical_key_name, window_event_timestamp) "
+        "VALUES (3, 'press', ?, 1, 'h', 'h', 'h', 'h', ?)",
+        (t + 1.0, t + 0.1),
     )
     conn.execute(
         "INSERT INTO action_event "
         "(id, name, timestamp, recording_id, key_char, key_name, "
-        "canonical_key_char, canonical_key_name) "
-        "VALUES (4, 'release', ?, 1, 'h', 'h', 'h', 'h')",
-        (t + 1.05,),
+        "canonical_key_char, canonical_key_name, window_event_timestamp) "
+        "VALUES (4, 'release', ?, 1, 'h', 'h', 'h', 'h', ?)",
+        (t + 1.05, t + 0.1),
     )
 
     conn.commit()

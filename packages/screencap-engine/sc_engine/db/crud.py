@@ -1,11 +1,7 @@
-"""CRUD operations for the recording database.
-
-Adapted for per-capture databases.
-Only import paths are changed; function signatures and logic are identical.
-"""
+"""CRUD operations for the recording database."""
 
 import json
-from typing import Any, TypeVar
+from typing import Any
 
 import sqlalchemy as sa
 from loguru import logger
@@ -21,9 +17,6 @@ from sc_engine.db.models import (
     WindowEvent,
     WindowGeometry,
 )
-
-# Type variable for generic model queries
-BaseModelType = TypeVar("BaseModelType")
 
 BATCH_SIZE = 1  # default; recorder overrides to 50 for throughput
 
@@ -258,30 +251,6 @@ def insert_recording(session: SaSession, recording_data: dict) -> Recording:
     return db_obj
 
 
-def _get(
-    session: SaSession,
-    table: BaseModelType,
-    recording_id: int,
-) -> list:
-    """Retrieve records from the database table based on the recording id.
-
-    Args:
-        session (sa.orm.Session): The database session.
-        table: The database table to query.
-        recording_id (int): The recording id.
-
-    Returns:
-        list: A list of records retrieved from the database table,
-          ordered by timestamp.
-    """
-    return (
-        session.query(table)
-        .filter(table.recording_id == recording_id)
-        .order_by(table.timestamp)
-        .all()
-    )
-
-
 def update_video_start_time(
     session: SaSession, recording: Recording, video_start_time: float
 ) -> None:
@@ -342,32 +311,3 @@ def insert_audio_info(
     session.commit()
 
 
-def post_process_events(session: SaSession, recording: Recording) -> None:
-    """Post-process events.
-
-    Links action events to their screenshots and window events via IDs
-    (during recording, only timestamps are stored; IDs are resolved after).
-
-    Args:
-        session (sa.orm.Session): The database session.
-        recording (Recording): The recording to post-process.
-    """
-    screenshots_list = _get(session, Screenshot, recording.id)
-    action_events_list = _get(session, ActionEvent, recording.id)
-    window_events_list = _get(session, WindowEvent, recording.id)
-
-    screenshot_timestamp_to_id_map = {
-        screenshot.timestamp: screenshot.id for screenshot in screenshots_list
-    }
-    window_event_timestamp_to_id_map = {
-        window_event.timestamp: window_event.id for window_event in window_events_list
-    }
-
-    for action_event in action_events_list:
-        action_event.screenshot_id = screenshot_timestamp_to_id_map.get(
-            action_event.screenshot_timestamp
-        )
-        action_event.window_event_id = window_event_timestamp_to_id_map.get(
-            action_event.window_event_timestamp
-        )
-    session.commit()
