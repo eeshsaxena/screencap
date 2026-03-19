@@ -5,6 +5,13 @@ All notable changes to this project will be documented in this file.
 The format is based on [Keep a Changelog](https://keepachangelog.com/),
 and this project adheres to [Semantic Versioning](https://semver.org/).
 
+## [0.12.6] - 2026-03-19
+
+### Fixed
+- Gate cloud uploads on NLP model availability
+- Prevent multi-chunk data loss via queue ownership proxy
+- Scope setup --scan to apps seen in recordings
+
 ## [0.12.5] - 2026-03-19
 
 ### Fixed
