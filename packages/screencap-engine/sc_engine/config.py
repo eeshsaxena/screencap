@@ -55,9 +55,6 @@ class Settings(BaseSettings):
     # Auto-cut video into chunks at this interval (seconds). 0 = legacy single-file.
     VIDEO_CHUNK_DURATION: float = 900.0
 
-    # Skip post_process_events in chunked mode (set automatically)
-    SKIP_POST_PROCESS: bool = False
-
     # Accessibility query tuning — controls how aggressively the recorder
     # queries the target app's accessibility tree during recording.
     # Minimum seconds between accessibility queries (0 = every event)
@@ -123,7 +120,6 @@ _FIELD_TO_CONFIG_ATTR = {
     "plot_performance": "PLOT_PERFORMANCE",
     "screen_capture_fps": "SCREEN_CAPTURE_FPS",
     "video_chunk_duration": "VIDEO_CHUNK_DURATION",
-    "skip_post_process": "SKIP_POST_PROCESS",
     "ax_query_interval": "AX_QUERY_INTERVAL",
     "ax_max_depth": "AX_MAX_DEPTH",
     "ax_dump_timeout": "AX_DUMP_TIMEOUT",
@@ -160,7 +156,6 @@ class RecordingConfig:
     plot_performance: bool | None = None
     screen_capture_fps: float | None = None
     video_chunk_duration: float | None = None
-    skip_post_process: bool | None = None
     ax_query_interval: float | None = None
     ax_max_depth: int | None = None
     ax_dump_timeout: float | None = None

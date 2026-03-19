@@ -342,32 +342,3 @@ def insert_audio_info(
     session.commit()
 
 
-def post_process_events(session: SaSession, recording: Recording) -> None:
-    """Post-process events.
-
-    Links action events to their screenshots and window events via IDs
-    (during recording, only timestamps are stored; IDs are resolved after).
-
-    Args:
-        session (sa.orm.Session): The database session.
-        recording (Recording): The recording to post-process.
-    """
-    screenshots_list = _get(session, Screenshot, recording.id)
-    action_events_list = _get(session, ActionEvent, recording.id)
-    window_events_list = _get(session, WindowEvent, recording.id)
-
-    screenshot_timestamp_to_id_map = {
-        screenshot.timestamp: screenshot.id for screenshot in screenshots_list
-    }
-    window_event_timestamp_to_id_map = {
-        window_event.timestamp: window_event.id for window_event in window_events_list
-    }
-
-    for action_event in action_events_list:
-        action_event.screenshot_id = screenshot_timestamp_to_id_map.get(
-            action_event.screenshot_timestamp
-        )
-        action_event.window_event_id = window_event_timestamp_to_id_map.get(
-            action_event.window_event_timestamp
-        )
-    session.commit()

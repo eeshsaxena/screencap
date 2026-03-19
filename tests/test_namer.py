@@ -130,20 +130,19 @@ def _make_recording_db(db_path: Path, *, with_screenshots: bool = False, with_ev
 
     cur.execute(
         "CREATE TABLE action_event (id INTEGER PRIMARY KEY, name TEXT, timestamp REAL, "
-        "window_event_id INTEGER, window_event_timestamp REAL)"
+        "window_event_timestamp REAL)"
     )
 
     if with_events:
-        # Simulate chunked mode: window_event_id is NULL, but
-        # window_event_timestamp is populated (matching window_event.timestamp).
+        # window_event_timestamp is the canonical cross-reference to window_event.
         we_ts_1 = t if with_windows else None
         we_ts_2 = t + 1 if with_windows else None
         cur.execute(
-            "INSERT INTO action_event VALUES (1, 'click', ?, NULL, ?)",
+            "INSERT INTO action_event VALUES (1, 'click', ?, ?)",
             (t + 0.1, we_ts_1),
         )
         cur.execute(
-            "INSERT INTO action_event VALUES (2, 'type', ?, NULL, ?)",
+            "INSERT INTO action_event VALUES (2, 'type', ?, ?)",
             (t + 1.1, we_ts_2),
         )
 
@@ -192,9 +191,9 @@ def _make_recording_db(db_path: Path, *, with_screenshots: bool = False, with_ev
 
 
 class TestSummarizeActionEvents:
-    def test_returns_window_titles_with_null_fk(self, tmp_path):
-        """Chunked-mode recordings have window_event_id=NULL but
-        window_event_timestamp populated — namer must still resolve titles."""
+    def test_returns_window_titles_via_timestamp(self, tmp_path):
+        """Namer resolves window titles via window_event_timestamp
+        cross-reference to window_event.timestamp."""
         db_path = tmp_path / "recording.db"
         _make_recording_db(db_path, with_events=True, with_windows=True)
         events = _summarize_action_events(db_path)

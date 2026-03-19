@@ -92,9 +92,7 @@ class ActionEvent(Base):
     recording_timestamp = sa.Column(ForceFloat)
     recording_id = sa.Column(sa.ForeignKey("recording.id"))
     screenshot_timestamp = sa.Column(ForceFloat)
-    screenshot_id = sa.Column(sa.ForeignKey("screenshot.id"))
     window_event_timestamp = sa.Column(ForceFloat)
-    window_event_id = sa.Column(sa.ForeignKey("window_event.id"))
     mouse_x = sa.Column(sa.Numeric(asdecimal=False))
     mouse_y = sa.Column(sa.Numeric(asdecimal=False))
     mouse_dx = sa.Column(sa.Numeric(asdecimal=False))
@@ -124,8 +122,6 @@ class ActionEvent(Base):
     children = sa.orm.relationship("ActionEvent")
 
     recording = sa.orm.relationship("Recording", back_populates="action_events")
-    screenshot = sa.orm.relationship("Screenshot", back_populates="action_event")
-    window_event = sa.orm.relationship("WindowEvent", back_populates="action_events")
 
     def __str__(self) -> str:
         """Return a string representation of the action event."""
@@ -173,7 +169,6 @@ class WindowEvent(Base):
     browser_url = sa.Column(sa.String)
 
     recording = sa.orm.relationship("Recording", back_populates="window_events")
-    action_events = sa.orm.relationship("ActionEvent", back_populates="window_event")
 
 
 class Screenshot(Base):
@@ -191,7 +186,6 @@ class Screenshot(Base):
     image_path = sa.Column(sa.String, nullable=True)
 
     recording = sa.orm.relationship("Recording", back_populates="screenshots")
-    action_event = sa.orm.relationship("ActionEvent", back_populates="screenshot")
 
     def __init__(
         self,

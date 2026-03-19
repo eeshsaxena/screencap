@@ -47,7 +47,7 @@ sc_engine/
   db/              # SQLAlchemy database layer
     __init__.py    # Engine, session factory, Base
     models.py      # Recording, ActionEvent, Screenshot, WindowEvent, PerformanceStat, MemoryStat
-    crud.py        # Insert functions, batch writing, post-processing
+    crud.py        # Insert functions, batch writing
   window/          # Platform-specific active window capture
   extensions/      # SynchronizedQueue (multiprocessing.Queue wrapper)
   utils.py         # Timestamps, screenshots, monitor dims

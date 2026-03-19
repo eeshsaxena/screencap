@@ -442,8 +442,7 @@ class CaptureSession:
             if not getattr(db_event, "disabled", False):
                 db_event_by_ts[db_event.timestamp] = db_event
 
-        # Build window_event lookup by timestamp (FK is often NULL, but
-        # window_event_timestamp on action_event IS populated).
+        # Build window_event lookup by timestamp (the canonical cross-reference).
         window_events_by_ts: dict[float, object] = {}
         for we in getattr(self._recording, "window_events", []):
             window_events_by_ts[we.timestamp] = we
@@ -480,14 +479,9 @@ class CaptureSession:
                     if element_state == {} or element_state is None:
                         element_state = None
 
-                # Window event — try FK relationship first, fall back to
-                # timestamp-based lookup (recorder sets window_event_timestamp
-                # but often leaves window_event_id NULL).
-                we = getattr(db_event, "window_event", None)
-                if we is None:
-                    we_ts = getattr(db_event, "window_event_timestamp", None)
-                    if we_ts is not None:
-                        we = window_events_by_ts.get(we_ts)
+                # Window event via timestamp cross-reference.
+                we_ts = getattr(db_event, "window_event_timestamp", None)
+                we = window_events_by_ts.get(we_ts) if we_ts is not None else None
 
                 if we is not None:
                     window_title = getattr(we, "title", None)
