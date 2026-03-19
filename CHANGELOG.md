@@ -5,6 +5,16 @@ All notable changes to this project will be documented in this file.
 The format is based on [Keep a Changelog](https://keepachangelog.com/),
 and this project adheres to [Semantic Versioning](https://semver.org/).
 
+## [0.12.5] - 2026-03-19
+
+### Fixed
+- Use timestamp-based join in namer to resolve window titles in chunked mode
+- Catch all exceptions from privacy pipeline init, not just ImportError
+- Prevent silent data loss when privacy pipeline fails to initialize
+
+### Changed
+- Remove unused FK columns from ActionEvent and delete post_process_events
+
 ## [0.12.4] - 2026-03-19
 
 ### Added
