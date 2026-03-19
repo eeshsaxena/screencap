@@ -2,6 +2,10 @@
 
 from __future__ import annotations
 
+import importlib.util
+from pathlib import Path
+from unittest.mock import patch
+
 import pytest
 
 from screencap.privacy import (
@@ -11,6 +15,8 @@ from screencap.privacy import (
     DetectionPipeline,
     DetectionResult,
     _merge_detections,
+    are_nlp_models_cached,
+    create_default_pipeline,
     normalize_text,
 )
 from screencap.privacy.filters import HeuristicFilter
@@ -282,3 +288,62 @@ class TestAnonymizer:
         # Should merge and produce single replacement
         assert "<EMAIL>" in result or "<API_KEY>" in result
         assert result.count("<") == 1  # only one tag
+
+
+# ---------------------------------------------------------------------------
+# NLP model availability gating
+# ---------------------------------------------------------------------------
+
+
+class TestNlpModelAvailabilityGating:
+    """Comprehensive test for are_nlp_models_cached() and require_pii parameter.
+
+    Uses real directory structures in tmp_path instead of excessive mocking.
+    Walks through all cache states in a single test, then verifies
+    create_default_pipeline(require_pii=...) behavior.
+    """
+
+    def test_nlp_model_availability_gating(self, tmp_path: Path, monkeypatch):
+        hub_dir = tmp_path / "hub"
+        hub_dir.mkdir()
+        model_dir = hub_dir / "models--knowledgator--gliner-pii-base-v1.0"
+        monkeypatch.setenv("HF_HOME", str(tmp_path))
+
+        # 1. Empty cache dir → False
+        assert are_nlp_models_cached() is False
+
+        # 2. GLiNER dir with blobs/ but no snapshots/ → False
+        model_dir.mkdir()
+        blobs = model_dir / "blobs"
+        blobs.mkdir()
+        assert are_nlp_models_cached() is False
+
+        # 3. Add snapshots/ but put a .incomplete file in blobs/ → False
+        (model_dir / "snapshots").mkdir()
+        (blobs / "abc123.incomplete").touch()
+        assert are_nlp_models_cached() is False
+
+        # 4. Remove .incomplete, but spaCy missing → False
+        (blobs / "abc123.incomplete").unlink()
+        with patch("importlib.util.find_spec", return_value=None):
+            assert are_nlp_models_cached() is False
+
+        # 5. Both present → True
+        with patch("importlib.util.find_spec", return_value=object()):  # any truthy value
+            assert are_nlp_models_cached() is True
+
+        # --- require_pii on create_default_pipeline ---
+
+        # 6. PiiDetector unavailable: require_pii=False succeeds, True raises
+        with patch("screencap.privacy.pii.PiiDetector", side_effect=ImportError("no model")):
+            # Default (False) — backward-compatible, returns pipeline with regex+secrets
+            pipeline = create_default_pipeline()
+            assert pipeline is not None
+
+            # Explicit False — same behavior
+            pipeline = create_default_pipeline(require_pii=False)
+            assert pipeline is not None
+
+            # require_pii=True — must raise
+            with pytest.raises(ImportError, match="PII detection required"):
+                create_default_pipeline(require_pii=True)

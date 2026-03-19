@@ -16,6 +16,11 @@ from screencap import __version__
 
 console = Console()
 
+
+def _stdin_is_tty() -> bool:
+    """Check if stdin is a real TTY (not piped or redirected)."""
+    return sys.stdin.isatty()
+
 _RECORD_EXTRAS_MSG = (
     "[red]Error: This command requires recording dependencies.[/red]\n"
     "Install them with: [bold]pip install screencap\\[record][/bold]"
@@ -71,26 +76,24 @@ def _report_unclassified_apps(capture_dir) -> None:
     console.print("  Run [bold]screencap setup --scan[/bold] to classify them.")
 
 
-def _maybe_download_nlp_models() -> None:
-    """Download GLiNER + spaCy models if not already cached."""
-    import os
-    from pathlib import Path
+def _download_nlp_models() -> None:
+    """Download GLiNER + spaCy models. Thin wrapper for testability."""
+    from screencap.setup_wizard import _download_nlp_models as _do_download
+    _do_download()
 
-    cache_dir = Path(os.environ.get("HF_HOME", "~/.cache/huggingface")).expanduser() / "hub"
-    model_dir = cache_dir / "models--knowledgator--gliner-pii-base-v1.0"
-    blobs_dir = model_dir / "blobs"
-    if (model_dir / "snapshots").exists() and blobs_dir.is_dir():
-        # Check for .incomplete files — partial downloads from interrupted Ctrl+C
-        has_incomplete = any(blobs_dir.glob("*.incomplete"))
-        if not has_incomplete:
-            return  # fully cached
+
+def _maybe_download_nlp_models() -> None:
+    """Prompt to download GLiNER + spaCy models if not already cached."""
+    from screencap.privacy import are_nlp_models_cached
+
+    if are_nlp_models_cached():
+        return  # fully cached
 
     console.print(
         "\n[bold]Privacy models not yet downloaded.[/bold] "
         "These are needed for scrubbing and cloud upload."
     )
     if click.confirm("Download now?", default=True):
-        from screencap.setup_wizard import _download_nlp_models
         _download_nlp_models()
     else:
         console.print(
@@ -248,6 +251,37 @@ def start(
     if is_cloud:
         from screencap.privacy.policy import PrivacyMode
         force_mode = PrivacyMode.PUBLIC
+
+    # --- Cloud NLP model gate ---
+    if is_cloud:
+        from screencap.privacy import are_nlp_models_cached
+        if not are_nlp_models_cached():
+            if not _stdin_is_tty():
+                console.print(
+                    "[red]Error:[/] NLP models required for cloud recording "
+                    "are not installed. Run [bold]screencap setup --scan[/bold] first."
+                )
+                raise SystemExit(1)
+            if click.confirm(
+                "NLP models needed for cloud PII scrubbing are not installed. "
+                "Download now?",
+                default=True,
+            ):
+                try:
+                    _download_nlp_models()
+                except Exception as exc:
+                    console.print(f"[yellow]Warning:[/] Download failed: {exc}")
+            if not are_nlp_models_cached():
+                if click.confirm(
+                    "Record locally instead? You can 'screencap upload' later "
+                    "once models are installed.",
+                    default=True,
+                ):
+                    is_cloud = False
+                    force_mode = None  # revert to configured mode
+                else:
+                    console.print("[red]Aborted.[/]")
+                    raise SystemExit(1)
 
     try:
         from screencap.recorder import DiskFullError, print_summary, start_recording

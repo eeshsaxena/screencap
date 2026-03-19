@@ -1216,6 +1216,110 @@ def test_start_cloud_and_local_last_wins(tmp_path):
     assert kwargs["cloud_intent"] is False
 
 
+def test_cloud_start_nlp_model_gate(tmp_path):
+    """Cloud recordings are gated on NLP model availability.
+
+    Exercises the full decision tree: models cached, download flow,
+    local fallback, abort, and non-interactive failure.
+    """
+    from screencap.privacy.policy import PrivacyMode
+
+    runner = CliRunner()
+    fake_dir = tmp_path / "test-rec"
+    fake_dir.mkdir()
+
+    def _invoke(args, **kw):
+        """Invoke CLI with os._exit patched (start() hard-exits after recording)."""
+        with mock.patch("os._exit"):
+            return runner.invoke(cli, ["start", "--name", "t"] + args, **kw)
+
+    tty = mock.patch("screencap.cli._stdin_is_tty", return_value=True)
+    no_setup = mock.patch("screencap.cli._maybe_prompt_privacy_setup")
+
+    # 1. Models cached → proceeds with cloud_intent=True
+    with (
+        no_setup, tty,
+        mock.patch("screencap.recorder.start_recording", return_value=(fake_dir, 42.0)) as mock_rec,
+        mock.patch("screencap.privacy.are_nlp_models_cached", return_value=True),
+    ):
+        result = _invoke(["--cloud"])
+        assert result.exit_code == 0, result.output
+        _, kwargs = mock_rec.call_args
+        assert kwargs["cloud_intent"] is True
+        assert kwargs["force_mode"] == PrivacyMode.PUBLIC
+
+    # 2. Models missing, download succeeds → cloud proceeds
+    call_count = 0
+
+    def cached_after_download():
+        nonlocal call_count
+        call_count += 1
+        return call_count > 1  # False first, True after download
+
+    with (
+        mock.patch("screencap.cli._maybe_prompt_privacy_setup"),
+        mock.patch("screencap.cli._stdin_is_tty", return_value=True),
+        mock.patch("screencap.recorder.start_recording", return_value=(fake_dir, 42.0)) as mock_rec,
+        mock.patch("screencap.privacy.are_nlp_models_cached", side_effect=cached_after_download),
+        mock.patch("screencap.cli._download_nlp_models"),
+    ):
+        call_count = 0
+        result = _invoke(["--cloud"], input="y\n")
+        assert result.exit_code == 0, result.output
+        _, kwargs = mock_rec.call_args
+        assert kwargs["cloud_intent"] is True
+
+    # 3. Models missing, download fails, user accepts local fallback
+    with (
+        mock.patch("screencap.cli._maybe_prompt_privacy_setup"),
+        mock.patch("screencap.cli._stdin_is_tty", return_value=True),
+        mock.patch("screencap.recorder.start_recording", return_value=(fake_dir, 42.0)) as mock_rec,
+        mock.patch("screencap.privacy.are_nlp_models_cached", return_value=False),
+        mock.patch("screencap.cli._download_nlp_models", side_effect=RuntimeError("network")),
+    ):
+        result = _invoke(["--cloud"], input="y\ny\n")
+        assert result.exit_code == 0, result.output
+        _, kwargs = mock_rec.call_args
+        assert kwargs["cloud_intent"] is False
+        assert kwargs["force_mode"] is None  # reverted from PUBLIC
+
+    # 4. Models missing, user declines download, declines local → abort
+    with (
+        mock.patch("screencap.cli._maybe_prompt_privacy_setup"),
+        mock.patch("screencap.cli._stdin_is_tty", return_value=True),
+        mock.patch("screencap.recorder.start_recording", return_value=(fake_dir, 42.0)) as mock_rec,
+        mock.patch("screencap.privacy.are_nlp_models_cached", return_value=False),
+    ):
+        result = _invoke(["--cloud"], input="n\nn\n")
+        assert result.exit_code != 0
+        mock_rec.assert_not_called()
+
+    # 5. Non-interactive, models missing → exit code 1 with actionable error
+    with (
+        mock.patch("screencap.cli._maybe_prompt_privacy_setup"),
+        mock.patch("screencap.cli._stdin_is_tty", return_value=False),
+        mock.patch("screencap.recorder.start_recording", return_value=(fake_dir, 42.0)) as mock_rec,
+        mock.patch("screencap.privacy.are_nlp_models_cached", return_value=False),
+    ):
+        result = _invoke(["--cloud"])
+        assert result.exit_code != 0
+        assert "screencap" in result.output and "setup" in result.output
+        mock_rec.assert_not_called()
+
+    # 6. Local-only → no model check (are_nlp_models_cached not called)
+    with (
+        mock.patch("screencap.cli._maybe_prompt_privacy_setup"),
+        mock.patch("screencap.cli._stdin_is_tty", return_value=True),
+        mock.patch("screencap.recorder.start_recording", return_value=(fake_dir, 42.0)) as mock_rec,
+        mock.patch("screencap.privacy.are_nlp_models_cached") as mock_cached,
+    ):
+        result = _invoke(["--local"])
+        assert result.exit_code == 0, result.output
+        mock_cached.assert_not_called()
+        _, kwargs = mock_rec.call_args
+        assert kwargs["cloud_intent"] is False
+
+
 def test_upload_skips_local_intent_in_all_mode(tmp_path):
     """upload --all skips recordings with local intent."""
     rec_dir = tmp_path / "local-rec"
