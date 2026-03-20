@@ -595,7 +595,7 @@ def run_setup_wizard(
     else:
         console.print(f"\n[bold #60a5fa]\u25c9 ScreenCap[/bold #60a5fa] [dim #a78bfa]Privacy Setup[/dim #a78bfa]\n")
         console.print("[bold]Where will your recordings go?[/bold]\n")
-        console.print("  [#818cf8]1.[/#818cf8] Cloud          \u2192 uploads to Claude (public privacy mode)")
+        console.print("  [#818cf8]1.[/#818cf8] Cloud          \u2192 uploads to Cloud (public privacy mode)")
         console.print("  [#818cf8]2.[/#818cf8] Local          \u2192 stays on this machine (internal privacy mode)")
         console.print("  [#818cf8]3.[/#818cf8] Ask every time\n")
 
