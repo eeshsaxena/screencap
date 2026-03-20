@@ -19,7 +19,7 @@ permissions: {}
 
 jobs:
   build-and-test:
-    if: github.event.pull_request.draft == false
+    if: false  # Disabled while GitHub Actions billing is being resolved
     permissions:
       contents: read
     env:
