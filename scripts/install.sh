@@ -282,50 +282,66 @@ TARBALL="screencap-${VERSION}-${ARCH}.tar.gz"
 
 echo "Installing screencap ${VERSION} for ${ARCH}..."
 
-curl -fsSL "${BASE_URL}/${TARBALL}" -o "$SCRATCH_DIR/${TARBALL}"
-curl -fsSL "${BASE_URL}/checksums.sha256" -o "$SCRATCH_DIR/checksums.sha256"
-
-# Verify checksum BEFORE extraction
-if ! (cd "$SCRATCH_DIR" && shasum -a 256 -c checksums.sha256 --ignore-missing); then
-    echo "ERROR: Checksum verification failed. Aborting." >&2
-    exit 1
+BINARY_DOWNLOAD_OK=true
+if ! curl -fsSL "${BASE_URL}/${TARBALL}" -o "$SCRATCH_DIR/${TARBALL}" 2>/dev/null; then
+    BINARY_DOWNLOAD_OK=false
+elif ! curl -fsSL "${BASE_URL}/checksums.sha256" -o "$SCRATCH_DIR/checksums.sha256" 2>/dev/null; then
+    BINARY_DOWNLOAD_OK=false
 fi
 
-# Extract (remove previous install to avoid "Can't replace directory" errors)
-rm -rf "$INSTALL_DIR/screencap"
-tar xzf "$SCRATCH_DIR/${TARBALL}" -C "$INSTALL_DIR"
-
-# ---------------------------------------------------------------------------
-# Verify binary — fall back to pip if incompatible
-# ---------------------------------------------------------------------------
-VERIFY_OUTPUT=$("$INSTALL_DIR/screencap/screencap" --version 2>&1) && VERIFY_EXIT=0 || VERIFY_EXIT=$?
-
-if [ "$VERIFY_EXIT" -eq 0 ]; then
-    INSTALL_METHOD="binary"
-    mkdir -p "${HOME}/.screencap"
-    echo "$INSTALL_METHOD" > "${HOME}/.screencap/.install_method"
-    echo ""
-    echo "screencap installed successfully! ($VERIFY_OUTPUT)"
-else
-    # SCREENCAP_INSTALL_METHOD=binary means binary-only, no fallback
+if [ "$BINARY_DOWNLOAD_OK" = false ]; then
     if [ "$INSTALL_METHOD_OVERRIDE" = "binary" ]; then
-        echo "ERROR: Installation verification failed." >&2
-        if [ -n "$VERIFY_OUTPUT" ]; then
-            echo "Detail: $VERIFY_OUTPUT" >&2
-        else
-            echo "The binary exited without output. This usually means your macOS" >&2
-            echo "version is older than what the binary was built for." >&2
-        fi
+        echo "ERROR: Pre-built binary for ${ARCH} is not available for v${VERSION}." >&2
         exit 1
     fi
 
-    echo ""
-    echo "The pre-built binary is not compatible with your system."
+    echo "Pre-built binary for ${ARCH} is not available for v${VERSION}."
     echo "Installing from source instead (this may take a few minutes)..."
     echo ""
-    # Clean up failed binary before pip fallback
-    rm -rf "$INSTALL_DIR/screencap"
     install_via_pip
+else
+    # Verify checksum BEFORE extraction
+    if ! (cd "$SCRATCH_DIR" && shasum -a 256 -c checksums.sha256 --ignore-missing); then
+        echo "ERROR: Checksum verification failed. Aborting." >&2
+        exit 1
+    fi
+
+    # Extract (remove previous install to avoid "Can't replace directory" errors)
+    rm -rf "$INSTALL_DIR/screencap"
+    tar xzf "$SCRATCH_DIR/${TARBALL}" -C "$INSTALL_DIR"
+
+    # -----------------------------------------------------------------------
+    # Verify binary — fall back to pip if incompatible
+    # -----------------------------------------------------------------------
+    VERIFY_OUTPUT=$("$INSTALL_DIR/screencap/screencap" --version 2>&1) && VERIFY_EXIT=0 || VERIFY_EXIT=$?
+
+    if [ "$VERIFY_EXIT" -eq 0 ]; then
+        INSTALL_METHOD="binary"
+        mkdir -p "${HOME}/.screencap"
+        echo "$INSTALL_METHOD" > "${HOME}/.screencap/.install_method"
+        echo ""
+        echo "screencap installed successfully! ($VERIFY_OUTPUT)"
+    else
+        # SCREENCAP_INSTALL_METHOD=binary means binary-only, no fallback
+        if [ "$INSTALL_METHOD_OVERRIDE" = "binary" ]; then
+            echo "ERROR: Installation verification failed." >&2
+            if [ -n "$VERIFY_OUTPUT" ]; then
+                echo "Detail: $VERIFY_OUTPUT" >&2
+            else
+                echo "The binary exited without output. This usually means your macOS" >&2
+                echo "version is older than what the binary was built for." >&2
+            fi
+            exit 1
+        fi
+
+        echo ""
+        echo "The pre-built binary is not compatible with your system."
+        echo "Installing from source instead (this may take a few minutes)..."
+        echo ""
+        # Clean up failed binary before pip fallback
+        rm -rf "$INSTALL_DIR/screencap"
+        install_via_pip
+    fi
 fi
 
 # ---------------------------------------------------------------------------
