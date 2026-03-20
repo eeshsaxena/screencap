@@ -85,7 +85,11 @@ class PiiDetector:
             def load(self) -> None:
                 from fast_gliner import FastGLiNER
 
-                self._model = FastGLiNER.from_pretrained(self._model_id)
+                from screencap.privacy import _GLINER_ONNX_VARIANT
+
+                self._model = FastGLiNER.from_pretrained(
+                    self._model_id, onnx_path=f"onnx/{_GLINER_ONNX_VARIANT}"
+                )
 
             def analyze(self, text, entities, nlp_artifacts=None):
                 predictions = self._model.predict_entities(text, self._gliner_labels)

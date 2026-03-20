@@ -296,6 +296,7 @@ class Anonymizer:
 # ---------------------------------------------------------------------------
 
 _VALID_PII_ENGINES = frozenset({"presidio", "presidio-gliner", None})
+_GLINER_ONNX_VARIANT = "model_quint8.onnx"
 
 
 def are_nlp_models_cached() -> bool:
@@ -308,7 +309,8 @@ def are_nlp_models_cached() -> bool:
     cache_dir = Path(os.environ.get("HF_HOME", "~/.cache/huggingface")).expanduser() / "hub"
     model_dir = cache_dir / "models--knowledgator--gliner-pii-base-v1.0"
     blobs_dir = model_dir / "blobs"
-    if not (model_dir / "snapshots").exists():
+    snapshots_dir = model_dir / "snapshots"
+    if not snapshots_dir.exists():
         return False
     if not blobs_dir.is_dir():
         return False
@@ -318,11 +320,53 @@ def are_nlp_models_cached() -> bool:
     if not any(f.is_file() for f in blobs_dir.iterdir() if not f.name.endswith(".incomplete")):
         return False
 
+    # Verify the expected ONNX variant is in the latest snapshot
+    snap_dirs = [d for d in snapshots_dir.iterdir() if d.is_dir()]
+    if not snap_dirs:
+        return False
+    latest = max(snap_dirs, key=lambda d: d.stat().st_mtime)
+    if not (latest / "onnx" / _GLINER_ONNX_VARIANT).exists():
+        return False
+
     # Check spaCy en_core_web_sm
     if importlib.util.find_spec("en_core_web_sm") is None:
         return False
 
     return True
+
+
+def _cleanup_stale_onnx_blobs() -> None:
+    """Remove unused ONNX model variants from HuggingFace cache."""
+    import os
+    from pathlib import Path
+
+    cache_dir = Path(os.environ.get("HF_HOME", "~/.cache/huggingface")).expanduser() / "hub"
+    model_dir = cache_dir / "models--knowledgator--gliner-pii-base-v1.0"
+    snapshots_dir = model_dir / "snapshots"
+    if not snapshots_dir.is_dir():
+        return
+
+    for snap in snapshots_dir.iterdir():
+        if not snap.is_dir():
+            continue
+        onnx_dir = snap / "onnx"
+        if not onnx_dir.is_dir():
+            continue
+        for onnx_file in onnx_dir.iterdir():
+            if onnx_file.name == _GLINER_ONNX_VARIANT:
+                continue
+            if onnx_file.suffix != ".onnx":
+                continue
+            if onnx_file.is_symlink():
+                blob_path = onnx_file.resolve()
+                if blob_path.is_file() and blob_path.is_relative_to(model_dir):
+                    logger.debug("Removing stale ONNX blob: %s", blob_path)
+                    blob_path.unlink()
+                logger.debug("Removing stale ONNX symlink: %s", onnx_file.name)
+                onnx_file.unlink()
+            elif onnx_file.is_file():
+                logger.debug("Removing stale ONNX file: %s", onnx_file.name)
+                onnx_file.unlink()
 
 
 def create_default_pipeline(
