@@ -5,11 +5,11 @@ Exercise the real SQLite → process_events → JSONL pipeline with no mocks.
 
 from __future__ import annotations
 
+import io
 import json
 import os
+import re
 from datetime import datetime
-
-import pytest
 
 import screencap
 
@@ -348,8 +348,12 @@ def test_export_exclude_moves(tmp_path):
     assert count_without == count_with - 3
 
 
-def test_privacy_filter_excludes_and_masks(tmp_path):
+def test_privacy_filter_excludes_and_masks(tmp_path, monkeypatch):
     """E5: Privacy filter in public mode — EXCLUDE suppresses, MASK_WINDOW replaces title."""
+    import screencap.config
+    monkeypatch.setattr(screencap.config, "_config_cache", None)
+    monkeypatch.delenv("SCREENCAP_PRIVACY_MODE", raising=False)
+
     rec_dir = tmp_path / "my-rec"
     rec_dir.mkdir()
 
@@ -403,8 +407,12 @@ def test_privacy_filter_excludes_and_masks(tmp_path):
     assert terminal_ws[0]["window_title"] == "bash — 80×24"
 
 
-def test_privacy_filter_cloud_intent(tmp_path):
+def test_privacy_filter_cloud_intent(tmp_path, monkeypatch):
     """E5.4: cloud_intent=True forces public mode — Slack goes from TEXT_REDACT to MASK_WINDOW."""
+    import screencap.config
+    monkeypatch.setattr(screencap.config, "_config_cache", None)
+    monkeypatch.delenv("SCREENCAP_PRIVACY_MODE", raising=False)
+
     rec_dir = tmp_path / "my-rec"
     rec_dir.mkdir()
 
@@ -424,7 +432,6 @@ def test_privacy_filter_cloud_intent(tmp_path):
 
     def _export_with_filter(pf):
         with Capture.load(str(rec_dir)) as capture:
-            import io
             buf = io.StringIO()
             _write_events(capture, buf, True, None, privacy_filter=pf)
             buf.seek(0)
@@ -474,7 +481,6 @@ def test_cli_export_creates_jsonl(tmp_path, monkeypatch):
     # --- E6.3: Output mentions event count ---
     assert "Exported" in result.output
     # Should contain a number
-    import re
     assert re.search(r"\d+", result.output)
 
 
