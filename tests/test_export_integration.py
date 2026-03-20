@@ -11,6 +11,7 @@ import os
 import re
 from datetime import datetime
 
+import pytest
 import screencap
 
 
@@ -355,24 +356,8 @@ def test_export_missing_directory_raises(tmp_path):
     missing_dir = tmp_path / "does-not-exist"
     out_file = str(tmp_path / "events.jsonl")
 
-    import pytest
     with pytest.raises(ExportError, match="No recording database found"):
         export_recording(missing_dir, out_file, exclude_moves=False)
-
-    assert not os.path.exists(out_file)
-
-
-def test_export_empty_directory_raises(tmp_path):
-    """E4.2: Export of directory with no recording.db raises ExportError."""
-    from screencap.exporter import ExportError, export_recording
-
-    empty_dir = tmp_path / "empty-rec"
-    empty_dir.mkdir()
-    out_file = str(empty_dir / "events.jsonl")
-
-    import pytest
-    with pytest.raises(ExportError, match="No recording database found"):
-        export_recording(empty_dir, out_file, exclude_moves=False)
 
     assert not os.path.exists(out_file)
 

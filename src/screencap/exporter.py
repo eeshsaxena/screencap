@@ -16,8 +16,6 @@ logger = logging.getLogger(__name__)
 class ExportError(Exception):
     """Export failed — wraps the underlying cause."""
 
-    pass
-
 
 def build_export_metadata(exclude_moves: bool) -> dict:
     """Build metadata dict for the JSONL header line."""
@@ -48,26 +46,28 @@ def export_recording(
     from sc_engine import Capture
 
     try:
-        with Capture.load(str(recording_dir)) as capture:
-            if output_path is None:
-                # Write to stdout — no atomic write needed
-                return _write_events(capture, sys.stdout, exclude_moves, metadata)
-
-            # Atomic write: .tmp → rename
-            tmp_path = output_path + ".tmp"
-            try:
-                with open(tmp_path, "w") as f:
-                    count = _write_events(capture, f, exclude_moves, metadata)
-                os.rename(tmp_path, output_path)
-                return count
-            except BaseException:
-                if os.path.exists(tmp_path):
-                    os.unlink(tmp_path)
-                raise
+        capture_ctx = Capture.load(str(recording_dir))
     except FileNotFoundError as e:
         raise ExportError(
             f"No recording database found in {recording_dir}"
         ) from e
+
+    with capture_ctx as capture:
+        if output_path is None:
+            # Write to stdout — no atomic write needed
+            return _write_events(capture, sys.stdout, exclude_moves, metadata)
+
+        # Atomic write: .tmp → rename
+        tmp_path = output_path + ".tmp"
+        try:
+            with open(tmp_path, "w") as f:
+                count = _write_events(capture, f, exclude_moves, metadata)
+            os.rename(tmp_path, output_path)
+            return count
+        except BaseException:
+            if os.path.exists(tmp_path):
+                os.unlink(tmp_path)
+            raise
 
 
 def _write_events(
