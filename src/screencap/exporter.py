@@ -13,6 +13,12 @@ from screencap import __version__
 logger = logging.getLogger(__name__)
 
 
+class ExportError(Exception):
+    """Export failed — wraps the underlying cause."""
+
+    pass
+
+
 def build_export_metadata(exclude_moves: bool) -> dict:
     """Build metadata dict for the JSONL header line."""
     return {
@@ -32,8 +38,9 @@ def export_recording(
 ) -> int:
     """Export a single recording to JSONL.
 
-    Returns event count on success, or -1 if the recording uses the
-    legacy capture.db format (unsupported).
+    Returns event count on success.  Raises ``ExportError`` if the
+    recording database cannot be found (missing directory, missing
+    recording.db, or legacy capture.db format).
 
     When *output_path* is a file path, uses atomic write (write to .tmp,
     rename on success).  When *output_path* is None, writes to stdout.
@@ -57,8 +64,10 @@ def export_recording(
                 if os.path.exists(tmp_path):
                     os.unlink(tmp_path)
                 raise
-    except FileNotFoundError:
-        return -1
+    except FileNotFoundError as e:
+        raise ExportError(
+            f"No recording database found in {recording_dir}"
+        ) from e
 
 
 def _write_events(

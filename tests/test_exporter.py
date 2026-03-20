@@ -11,7 +11,7 @@ from sc_engine.events import (
     MouseClickEvent,
     MouseButton,
 )
-from screencap.exporter import build_export_metadata, export_recording
+from screencap.exporter import ExportError, build_export_metadata, export_recording
 
 
 def _make_click(ts=1.0):
@@ -78,8 +78,8 @@ def test_export_recording_atomic_write_cleanup_on_failure(tmp_path):
     assert not os.path.exists(out_file)
 
 
-def test_export_recording_legacy_db_returns_negative(tmp_path):
-    """Legacy capture.db format should return -1."""
+def test_export_recording_missing_db_raises_export_error(tmp_path):
+    """Missing recording database should raise ExportError."""
     rec_dir = tmp_path / "old-rec"
     rec_dir.mkdir()
     out_file = str(rec_dir / "events.jsonl")
@@ -88,9 +88,9 @@ def test_export_recording_legacy_db_returns_negative(tmp_path):
         "sc_engine.capture.CaptureSession.load",
         side_effect=FileNotFoundError("Capture not found"),
     ):
-        count = export_recording(rec_dir, out_file, exclude_moves=False)
+        with pytest.raises(ExportError, match="No recording database found"):
+            export_recording(rec_dir, out_file, exclude_moves=False)
 
-    assert count == -1
     assert not os.path.exists(out_file)
 
 
