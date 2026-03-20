@@ -43,7 +43,10 @@ class Settings(BaseSettings):
     LOG_MEMORY: bool = False
     VIDEO_ENCODING: str = "libx264"
     VIDEO_PIXEL_FORMAT: str = "yuv444p"
+    VIDEO_CRF: int = 23
+    VIDEO_PRESET: str = "faster"
     VIDEO_GOP_SIZE: int = 48  # keyframe interval (frames); bounds max crash loss to 1 GOP
+    SCREENSHOT_JPEG_QUALITY: int = 85
     # sequences that when typed, will stop the recording of ActionEvents
     STOP_SEQUENCES: list[list[str]] = [
         list(stop_str) for stop_str in STOP_STRS
@@ -115,6 +118,9 @@ _FIELD_TO_CONFIG_ATTR = {
     "capture_full_video": "RECORD_FULL_VIDEO",
     "video_encoding": "VIDEO_ENCODING",
     "video_pixel_format": "VIDEO_PIXEL_FORMAT",
+    "video_crf": "VIDEO_CRF",
+    "video_preset": "VIDEO_PRESET",
+    "screenshot_jpeg_quality": "SCREENSHOT_JPEG_QUALITY",
     "stop_sequences": "STOP_SEQUENCES",
     "log_memory": "LOG_MEMORY",
     "plot_performance": "PLOT_PERFORMANCE",
@@ -151,6 +157,9 @@ class RecordingConfig:
     capture_full_video: bool | None = None
     video_encoding: str | None = None
     video_pixel_format: str | None = None
+    video_crf: int | None = None
+    video_preset: str | None = None
+    screenshot_jpeg_quality: int | None = None
     stop_sequences: list[list[str]] | None = None
     log_memory: bool | None = None
     plot_performance: bool | None = None

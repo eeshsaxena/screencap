@@ -31,10 +31,12 @@ def _make_test_image(width=100, height=100, color="red"):
 
 def _make_jpeg_bytes(img=None):
     """Return JPEG bytes for a test image."""
+    from sc_engine.config import config
+
     if img is None:
         img = _make_test_image()
     buf = io.BytesIO()
-    img.save(buf, format="JPEG", quality=95)
+    img.save(buf, format="JPEG", quality=config.SCREENSHOT_JPEG_QUALITY)
     return buf.getvalue()
 
 

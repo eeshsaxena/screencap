@@ -60,10 +60,10 @@ class VideoWriter:
         width: int,
         height: int,
         fps: int = 24,
-        codec: str = "libx264",
-        pix_fmt: str = "yuv444p",
-        crf: int = 0,
-        preset: str = "ultrafast",
+        codec: str | None = None,
+        pix_fmt: str | None = None,
+        crf: int | None = None,
+        preset: str | None = None,
     ) -> None:
         """Initialize video writer.
 
@@ -72,20 +72,20 @@ class VideoWriter:
             width: Video width in pixels.
             height: Video height in pixels.
             fps: Frames per second (default 24).
-            codec: Video codec (default libx264).
-            pix_fmt: Pixel format (default yuv444p for full color).
-            crf: Constant Rate Factor, 0 for lossless (default 0).
-            preset: Encoding preset (default ultrafast for real-time capture).
+            codec: Video codec (default from config.VIDEO_ENCODING).
+            pix_fmt: Pixel format (default from config.VIDEO_PIXEL_FORMAT).
+            crf: Constant Rate Factor (default from config.VIDEO_CRF).
+            preset: Encoding preset (default from config.VIDEO_PRESET).
         """
 
         self.output_path = Path(output_path)
         self.width = width
         self.height = height
         self.fps = fps
-        self.codec = codec
-        self.pix_fmt = pix_fmt
-        self.crf = crf
-        self.preset = preset
+        self.codec = codec if codec is not None else config.VIDEO_ENCODING
+        self.pix_fmt = pix_fmt if pix_fmt is not None else config.VIDEO_PIXEL_FORMAT
+        self.crf = crf if crf is not None else config.VIDEO_CRF
+        self.preset = preset if preset is not None else config.VIDEO_PRESET
 
         self._container = None
         self._stream = None
@@ -245,8 +245,8 @@ def initialize_video_writer(
     fps: int = 24,
     codec: str | None = None,
     pix_fmt: str | None = None,
-    crf: int = 0,
-    preset: str = "ultrafast",
+    crf: int | None = None,
+    preset: str | None = None,
 ) -> tuple[av.container.OutputContainer, av.stream.Stream, float]:
     """Initializes video writer and returns the container, stream, and base timestamp.
 
@@ -255,13 +255,10 @@ def initialize_video_writer(
         width (int): Width of the video.
         height (int): Height of the video.
         fps (int, optional): Frames per second of the video. Defaults to 24.
-        codec (str, optional): Codec used for encoding the video.
-            Defaults to 'libx264'.
-        pix_fmt (str, optional): Pixel format of the video. Defaults to 'yuv420p'.
-        crf (int, optional): Constant Rate Factor for encoding quality.
-            Defaults to 0 for lossless.
-        preset (str, optional): Encoding speed/quality trade-off.
-            Defaults to 'ultrafast' for real-time capture.
+        codec (str, optional): Codec (default from config.VIDEO_ENCODING).
+        pix_fmt (str, optional): Pixel format (default from config.VIDEO_PIXEL_FORMAT).
+        crf (int, optional): Constant Rate Factor (default from config.VIDEO_CRF).
+        preset (str, optional): Encoding preset (default from config.VIDEO_PRESET).
 
     Returns:
         tuple[av.container.OutputContainer, av.stream.Stream, float]: The initialized
@@ -271,6 +268,10 @@ def initialize_video_writer(
         codec = config.VIDEO_ENCODING
     if pix_fmt is None:
         pix_fmt = config.VIDEO_PIXEL_FORMAT
+    if crf is None:
+        crf = config.VIDEO_CRF
+    if preset is None:
+        preset = config.VIDEO_PRESET
 
     logger.info("initializing video stream...")
     video_container = av.open(output_path, mode="w", container_options=_FRAG_MP4_OPTIONS)
@@ -659,10 +660,10 @@ class ChunkedVideoWriter:
         height: int,
         chunk_duration: float = 600.0,  # 10 minutes
         fps: int = 24,
-        codec: str = "libx264",
-        pix_fmt: str = "yuv444p",
-        crf: int = 0,
-        preset: str = "ultrafast",
+        codec: str | None = None,
+        pix_fmt: str | None = None,
+        crf: int | None = None,
+        preset: str | None = None,
         chunk_rotate_q=None,
     ) -> None:
         """Initialize chunked video writer.
@@ -673,9 +674,9 @@ class ChunkedVideoWriter:
             height: Video height in pixels.
             chunk_duration: Duration of each chunk in seconds.
             fps: Frames per second.
-            codec: Video codec.
-            pix_fmt: Pixel format.
-            crf: Constant Rate Factor.
+            codec: Video codec (default from config.VIDEO_ENCODING).
+            pix_fmt: Pixel format (default from config.VIDEO_PIXEL_FORMAT).
+            crf: Constant Rate Factor (default from config.VIDEO_CRF).
             preset: Encoding preset.
             chunk_rotate_q: Optional multiprocessing.Queue for rotation notifications.
         """
@@ -686,10 +687,10 @@ class ChunkedVideoWriter:
         self.height = height
         self.chunk_duration = chunk_duration
         self.fps = fps
-        self.codec = codec
-        self.pix_fmt = pix_fmt
-        self.crf = crf
-        self.preset = preset
+        self.codec = codec if codec is not None else config.VIDEO_ENCODING
+        self.pix_fmt = pix_fmt if pix_fmt is not None else config.VIDEO_PIXEL_FORMAT
+        self.crf = crf if crf is not None else config.VIDEO_CRF
+        self.preset = preset if preset is not None else config.VIDEO_PRESET
         self.chunk_rotate_q = chunk_rotate_q
 
         self._current_writer: VideoWriter | None = None
