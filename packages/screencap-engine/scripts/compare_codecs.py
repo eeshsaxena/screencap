@@ -195,6 +195,17 @@ def load_real_frames(
 # ── Encoding benchmark ───────────────────────────────────────────────────────
 
 
+def _extract_all_frames(video_path: Path) -> list[Image.Image]:
+    """Decode all frames from a video file, avoiding timestamp tolerance issues."""
+    import av
+
+    container = av.open(str(video_path))
+    stream = container.streams.video[0]
+    frames = [frame.to_image() for frame in container.decode(stream)]
+    container.close()
+    return frames
+
+
 def benchmark_config(
     frames: list[Image.Image],
     output_dir: Path,
@@ -207,7 +218,7 @@ def benchmark_config(
     Returns per-frame timing, file size, decode time, and PSNR.
     """
     from sc_engine.comparison import compute_psnr
-    from sc_engine.video import VideoWriter, extract_frames
+    from sc_engine.video import VideoWriter
 
     label = f"CRF={crf} {pix_fmt} {preset}"
     video_path = output_dir / f"test_crf{crf}_{pix_fmt}_{preset}.mp4"
@@ -247,17 +258,14 @@ def benchmark_config(
         f"p95={float(np.percentile(per_frame_ms, 95)):.1f}ms"
     )
 
-    # ── Decode ──
+    # ── Decode all frames (avoids tolerance issues with lossy configs) ──
     decode_start = time.perf_counter()
-    timestamps = [i / 24.0 for i in range(len(frames))]
-    try:
-        extracted = extract_frames(video_path, timestamps, tolerance=0.1)
-    except ValueError:
-        extracted = extract_frames(
-            video_path, timestamps[: len(frames) // 2], tolerance=0.5
-        )
-    frames_cmp = frames[: len(extracted)]
+    extracted = _extract_all_frames(video_path)
     decode_time = time.perf_counter() - decode_start
+    # Match count: min of source frames and extracted frames
+    num_compare = min(len(frames), len(extracted))
+    frames_cmp = frames[:num_compare]
+    extracted = extracted[:num_compare]
 
     # ── Quality metrics ──
     psnrs = []
@@ -423,8 +431,6 @@ def save_side_by_side(
     encodes it with each config, extracts the frame back, and saves a comparison
     image with labels.
     """
-    from sc_engine.video import extract_frames
-
     if not frames:
         return None
 
@@ -444,7 +450,7 @@ def save_side_by_side(
         if not video_path.exists():
             continue
         try:
-            extracted = extract_frames(video_path, [0.0], tolerance=0.5)
+            extracted = _extract_all_frames(video_path)
             if extracted:
                 crop = extracted[0].crop(crop_box)
                 crops.append((r.label, crop))
