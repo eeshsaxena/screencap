@@ -392,13 +392,7 @@ def _auto_export(capture_dir: Path) -> None:
             count = export_recording(
                 capture_dir, str(jsonl_path), exclude_moves=False, metadata=meta,
             )
-        if count >= 0:
-            console.print(f"  [dim]Exported {count} events to events.jsonl[/dim]")
-        else:
-            console.print(
-                f"[yellow]Warning:[/yellow] Could not auto-export events.jsonl (legacy DB?). "
-                f"Run 'screencap export {capture_dir.name}' manually."
-            )
+        console.print(f"  [dim]Exported {count} events to events.jsonl[/dim]")
     except Exception as e:
         console.print(
             f"[yellow]Warning:[/yellow] Could not auto-export events.jsonl ({e}). "
@@ -747,16 +741,14 @@ def info(name, as_json):
 
 def _export_one(recording_dir, output_path, exclude_moves, err_console):
     """Export a single recording. Returns event count, or -1 on error."""
-    from screencap.exporter import build_export_metadata, export_recording
+    from screencap.exporter import ExportError, build_export_metadata, export_recording
 
     meta = build_export_metadata(exclude_moves)
-    count = export_recording(recording_dir, output_path, exclude_moves, metadata=meta)
-    if count == -1:
-        err_console.print(
-            f"[red]Error:[/red] No recording.db found in {recording_dir.name}. "
-            "Legacy capture.db format is not supported for export."
-        )
-    return count
+    try:
+        return export_recording(recording_dir, output_path, exclude_moves, metadata=meta)
+    except ExportError as e:
+        err_console.print(f"[red]Error:[/red] {e}")
+        return -1
 
 
 def _find_exportable_dirs(base_dir):
@@ -1403,10 +1395,7 @@ def upload(names, all_recordings, dry_run, force, jobs, no_delete):
                         from screencap.exporter import export_recording, build_export_metadata
                         meta = build_export_metadata(exclude_moves=False)
                         count = export_recording(d, str(jsonl_path), exclude_moves=False, metadata=meta)
-                        if count >= 0:
-                            console.print(f"  [dim]Exported {count} events to events.jsonl[/dim]")
-                        else:
-                            console.print(f"  [yellow]Warning:[/yellow] Export failed (legacy DB?), uploading without events.jsonl")
+                        console.print(f"  [dim]Exported {count} events to events.jsonl[/dim]")
                     except Exception as e:
                         console.print(f"  [yellow]Warning:[/yellow] Export failed ({e}), uploading without events.jsonl")
 

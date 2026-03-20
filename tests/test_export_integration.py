@@ -11,6 +11,7 @@ import os
 import re
 from datetime import datetime
 
+import pytest
 import screencap
 
 
@@ -346,6 +347,35 @@ def test_export_exclude_moves(tmp_path):
     # --- E3.4: Total event count lower than E1 (3 fewer — the move events) ---
     assert count_without < count_with
     assert count_without == count_with - 3
+
+
+def test_export_missing_directory_raises(tmp_path):
+    """E4.1: Export of non-existent directory raises ExportError."""
+    from screencap.exporter import ExportError, export_recording
+
+    missing_dir = tmp_path / "does-not-exist"
+    out_file = str(tmp_path / "events.jsonl")
+
+    with pytest.raises(ExportError, match="No recording database found"):
+        export_recording(missing_dir, out_file, exclude_moves=False)
+
+    assert not os.path.exists(out_file)
+
+
+def test_cli_export_missing_db_shows_error(tmp_path, monkeypatch):
+    """E4.3: CLI export of directory without recording.db shows error message."""
+    rec_dir = tmp_path / "no-db-rec"
+    rec_dir.mkdir()
+
+    monkeypatch.setenv("SCREENCAP_RECORDINGS_DIR", str(tmp_path))
+
+    from click.testing import CliRunner
+    from screencap.cli import cli
+
+    result = CliRunner().invoke(cli, ["export", "no-db-rec"])
+
+    assert result.exit_code != 0
+    assert "no recording database found" in result.output.lower()
 
 
 def test_privacy_filter_excludes_and_masks(tmp_path, monkeypatch):
