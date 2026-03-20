@@ -1,311 +1,532 @@
 #!/usr/bin/env python3
-"""Compare H.264 vs H.265 video codecs for capture.
+"""Benchmark H.264 encoding settings for screen capture.
 
-This script compares:
-1. File sizes between H.264 (libx264) and H.265 (libx265)
-2. Frame extraction accuracy (PSNR, mean diff)
-3. Encoding/decoding performance
+Tests a matrix of encoding parameters to find the best trade-off between
+file size, encode speed, CPU overhead, and visual quality for screen content.
+
+Matrix dimensions:
+- CRF: 0 (lossless baseline), 23, 25, 28
+- Pixel format: yuv444p (full chroma), yuv420p (chroma subsampled)
+- Preset: ultrafast, faster, fast
 
 Usage:
-    uv run python scripts/compare_codecs.py --duration 5
+    # Synthetic frames (default)
+    uv run python scripts/compare_codecs.py
 
-Note: Requires libx265 to be available in your ffmpeg/av installation.
+    # Real frames from a recording directory
+    uv run python scripts/compare_codecs.py --frames-dir ~/.screencap/recordings/my-session/
+
+    # Quick test with fewer frames
+    uv run python scripts/compare_codecs.py -n 30
+
+    # Keep video files for manual inspection
+    uv run python scripts/compare_codecs.py --keep-videos -o /tmp/codec_results
 """
+
+from __future__ import annotations
 
 import argparse
 import shutil
 import tempfile
 import time
-from dataclasses import dataclass
+from dataclasses import dataclass, field
 from pathlib import Path
 
 import numpy as np
 from PIL import Image
 
 
+# ── Data classes ──────────────────────────────────────────────────────────────
+
+
 @dataclass
 class CodecResult:
-    """Results from testing a codec."""
-    codec: str
+    """Results from testing one encoding configuration."""
+
+    crf: int
+    pix_fmt: str
+    preset: str
     file_size_bytes: int
-    encode_time_seconds: float
-    decode_time_seconds: float
+    total_encode_time_s: float
+    decode_time_s: float
     mean_diff: float
     max_diff: float
     psnr: float
     num_frames: int
+    per_frame_times_ms: list[float] = field(default_factory=list)
+    # Burst stats (filled separately)
+    burst_cpu_time_s: float | None = None
+    burst_wall_time_s: float | None = None
+    burst_frames: int = 0
+
+    @property
+    def label(self) -> str:
+        return f"CRF={self.crf} {self.pix_fmt} {self.preset}"
+
+    @property
+    def size_mb(self) -> float:
+        return self.file_size_bytes / (1024 * 1024)
+
+    @property
+    def mean_frame_time_ms(self) -> float:
+        if not self.per_frame_times_ms:
+            return 0.0
+        return sum(self.per_frame_times_ms) / len(self.per_frame_times_ms)
+
+    @property
+    def p95_frame_time_ms(self) -> float:
+        if not self.per_frame_times_ms:
+            return 0.0
+        return float(np.percentile(self.per_frame_times_ms, 95))
 
 
-def generate_test_frames(num_frames: int, width: int = 1920, height: int = 1080) -> list[Image.Image]:
-    """Generate test frames with realistic content variation.
+# ── Frame generators ─────────────────────────────────────────────────────────
 
-    Creates frames that simulate screen capture with:
-    - Text-like patterns
-    - Gradients
-    - Sharp edges
-    - Some temporal consistency (slight changes between frames)
+
+def generate_synthetic_frames(
+    num_frames: int, width: int = 1920, height: int = 1080
+) -> list[Image.Image]:
+    """Generate synthetic frames simulating screen content.
+
+    Creates frames with text-like patterns, editor windows, terminals,
+    and temporal variation (cursor movement, typing simulation).
     """
-    print(f"Generating {num_frames} test frames ({width}x{height})...")
+    print(f"Generating {num_frames} synthetic frames ({width}x{height})...")
     frames = []
+    np.random.seed(42)
 
-    np.random.seed(42)  # Reproducible
-
-    # Base pattern (simulates a desktop background)
+    # Dark background with gradient
     base = np.zeros((height, width, 3), dtype=np.uint8)
-
-    # Add gradient background
     for y in range(height):
-        base[y, :, 0] = int(30 + 20 * (y / height))  # Dark blue gradient
+        base[y, :, 0] = int(30 + 20 * (y / height))
         base[y, :, 1] = int(40 + 30 * (y / height))
         base[y, :, 2] = int(60 + 40 * (y / height))
 
-    # Add some "window" rectangles
+    # Window regions
     windows = [
-        (100, 100, 800, 600, (40, 44, 52)),    # Dark window
-        (850, 150, 1000, 500, (255, 255, 255)), # Light window
-        (200, 650, 600, 350, (30, 30, 30)),     # Terminal-like
+        (100, 100, 800, 600, (40, 44, 52)),  # Dark editor
+        (850, 150, 1000, 500, (255, 255, 255)),  # Light browser
+        (200, 650, 600, 350, (30, 30, 30)),  # Terminal
     ]
-
     for x, y, w, h, color in windows:
-        base[y:y+h, x:x+w] = color
+        base[y : y + h, x : x + w] = color
+
+    # Add simulated "code" lines -- colored syntax on dark bg
+    for line_idx in range(25):
+        ly = 120 + line_idx * 20
+        if ly + 12 > 700:
+            break
+        indent = np.random.randint(0, 6) * 20
+        kw_len = np.random.randint(30, 120)
+        base[ly : ly + 12, 120 + indent : 120 + indent + kw_len, :] = [
+            80 + np.random.randint(0, 100),
+            140 + np.random.randint(0, 80),
+            200 + np.random.randint(0, 55),
+        ]
 
     for i in range(num_frames):
         frame = base.copy()
 
-        # Add cursor movement (small red square)
+        # Cursor movement
         cursor_x = 100 + int(400 * np.sin(i * 0.1))
         cursor_y = 300 + int(200 * np.cos(i * 0.15))
-        frame[cursor_y:cursor_y+20, cursor_x:cursor_x+15] = (255, 0, 0)
+        frame[cursor_y : cursor_y + 20, cursor_x : cursor_x + 15] = (255, 0, 0)
 
-        # Add some "typing" in the terminal area (random noise to simulate text)
+        # Typing simulation in terminal
         text_y = 680 + (i % 10) * 20
         if text_y < 980:
             noise = np.random.randint(150, 255, (15, 300, 3), dtype=np.uint8)
-            frame[text_y:text_y+15, 220:520] = noise
+            frame[text_y : text_y + 15, 220:520] = noise
 
-        # Add timestamp-like text area
-        frame[50:70, 1700:1900] = np.random.randint(200, 255, (20, 200, 3), dtype=np.uint8)
+        # Timestamp area
+        frame[50:70, 1700:1900] = np.random.randint(
+            200, 255, (20, 200, 3), dtype=np.uint8
+        )
 
         frames.append(Image.fromarray(frame))
-
         if (i + 1) % 50 == 0:
             print(f"  Generated {i + 1}/{num_frames} frames")
 
     return frames
 
 
-def test_codec(
+def load_real_frames(
+    frames_dir: Path, max_frames: int | None = None
+) -> list[Image.Image]:
+    """Load real screenshot frames from a recording directory.
+
+    Looks for PNG/JPEG files in the directory (and screenshots/ subdirectory).
+    Returns frames sorted by filename (assumed chronological).
+    """
+    search_dirs = [frames_dir]
+    screenshots_subdir = frames_dir / "screenshots"
+    if screenshots_subdir.is_dir():
+        search_dirs.append(screenshots_subdir)
+
+    paths: list[Path] = []
+    for d in search_dirs:
+        paths.extend(sorted(d.glob("*.png")))
+        paths.extend(sorted(d.glob("*.jpg")))
+        paths.extend(sorted(d.glob("*.jpeg")))
+
+    # Deduplicate and sort
+    paths = sorted(set(paths), key=lambda p: p.name)
+
+    if not paths:
+        raise FileNotFoundError(f"No PNG/JPEG files found in {frames_dir}")
+
+    if max_frames and len(paths) > max_frames:
+        # Sample evenly
+        indices = np.linspace(0, len(paths) - 1, max_frames, dtype=int)
+        paths = [paths[i] for i in indices]
+
+    print(f"Loading {len(paths)} real frames from {frames_dir}...")
+    frames = []
+    for p in paths:
+        img = Image.open(p).convert("RGB")
+        frames.append(img)
+        if len(frames) % 20 == 0:
+            print(f"  Loaded {len(frames)}/{len(paths)}")
+
+    print(f"  Frame size: {frames[0].size[0]}x{frames[0].size[1]}")
+    return frames
+
+
+# ── Encoding benchmark ───────────────────────────────────────────────────────
+
+
+def benchmark_config(
     frames: list[Image.Image],
-    codec: str,
     output_dir: Path,
-    crf: int = 0,
-    pix_fmt: str = "yuv444p",
+    crf: int,
+    pix_fmt: str,
+    preset: str,
 ) -> CodecResult:
-    """Test a codec and return results.
+    """Benchmark one encoding configuration.
 
-    Args:
-        frames: List of PIL Images to encode.
-        codec: Codec name (libx264 or libx265).
-        output_dir: Directory to write video file.
-        crf: Constant Rate Factor (0 = lossless).
-        pix_fmt: Pixel format.
-
-    Returns:
-        CodecResult with metrics.
+    Returns per-frame timing, file size, decode time, and PSNR.
     """
     from sc_engine.comparison import compute_psnr
     from sc_engine.video import VideoWriter, extract_frames
 
-    video_path = output_dir / f"test_{codec}.mp4"
+    label = f"CRF={crf} {pix_fmt} {preset}"
+    video_path = output_dir / f"test_crf{crf}_{pix_fmt}_{preset}.mp4"
     width, height = frames[0].size
 
-    print(f"\nTesting {codec}...")
-    print(f"  Settings: CRF={crf}, pix_fmt={pix_fmt}")
+    print(f"\n  [{label}]")
 
-    # Encode
-    print(f"  Encoding {len(frames)} frames...")
-    encode_start = time.time()
+    # ── Encode with per-frame timing ──
+    per_frame_ms: list[float] = []
+    encode_start = time.perf_counter()
 
     writer = VideoWriter(
         video_path,
         width=width,
         height=height,
         fps=24,
-        codec=codec,
+        codec="libx264",
         pix_fmt=pix_fmt,
         crf=crf,
-        preset="medium",  # Faster for testing
+        preset=preset,
     )
 
     for i, frame in enumerate(frames):
-        timestamp = i / 24.0  # 24 fps
+        timestamp = i / 24.0
+        t0 = time.perf_counter()
         writer.write_frame(frame, timestamp)
+        t1 = time.perf_counter()
+        per_frame_ms.append((t1 - t0) * 1000)
 
     writer.close()
-    encode_time = time.time() - encode_start
+    total_encode = time.perf_counter() - encode_start
 
-    # Get file size
     file_size = video_path.stat().st_size
-    print(f"  File size: {file_size / 1024 / 1024:.2f} MB")
-    print(f"  Encode time: {encode_time:.2f}s")
+    print(f"    Size: {file_size / 1024 / 1024:.2f} MB | Encode: {total_encode:.2f}s")
+    print(
+        f"    Frame time: mean={sum(per_frame_ms) / len(per_frame_ms):.1f}ms "
+        f"p95={float(np.percentile(per_frame_ms, 95)):.1f}ms"
+    )
 
-    # Decode and compare
-    print("  Extracting frames for comparison...")
-    decode_start = time.time()
-
-    # Extract frames at same timestamps
+    # ── Decode ──
+    decode_start = time.perf_counter()
     timestamps = [i / 24.0 for i in range(len(frames))]
-
     try:
         extracted = extract_frames(video_path, timestamps, tolerance=0.1)
-    except ValueError as e:
-        print(f"  Warning: Could not extract all frames: {e}")
-        # Try with larger tolerance
-        extracted = extract_frames(video_path, timestamps[:len(frames)//2], tolerance=0.5)
-        frames = frames[:len(extracted)]
+    except ValueError:
+        extracted = extract_frames(
+            video_path, timestamps[: len(frames) // 2], tolerance=0.5
+        )
+    frames_cmp = frames[: len(extracted)]
+    decode_time = time.perf_counter() - decode_start
 
-    decode_time = time.time() - decode_start
-    print(f"  Decode time: {decode_time:.2f}s")
-
-    # Compare frames
-    print("  Computing accuracy metrics...")
+    # ── Quality metrics ──
+    psnrs = []
     diffs = []
     max_diffs = []
-    psnrs = []
-
-    for orig, extr in zip(frames, extracted):
-        # Ensure same size
+    for orig, extr in zip(frames_cmp, extracted):
         if orig.size != extr.size:
             extr = extr.resize(orig.size, Image.Resampling.LANCZOS)
-
-        # Convert to arrays
         orig_arr = np.array(orig.convert("RGB"), dtype=np.float64)
         extr_arr = np.array(extr.convert("RGB"), dtype=np.float64)
-
         diff = np.abs(orig_arr - extr_arr)
         diffs.append(np.mean(diff))
         max_diffs.append(np.max(diff))
-        psnrs.append(compute_psnr(np.array(orig.convert("RGB")), np.array(extr.convert("RGB"))))
+        psnrs.append(
+            compute_psnr(
+                np.array(orig.convert("RGB")), np.array(extr.convert("RGB"))
+            )
+        )
 
-    mean_diff = np.mean(diffs)
-    max_diff = np.max(max_diffs)
-    mean_psnr = np.mean([p for p in psnrs if p != float("inf")])
-
-    print(f"  Mean pixel diff: {mean_diff:.4f}")
-    print(f"  Max pixel diff: {max_diff:.4f}")
-    print(f"  Mean PSNR: {mean_psnr:.2f} dB")
+    finite_psnrs = [p for p in psnrs if p != float("inf")]
+    mean_psnr = float(np.mean(finite_psnrs)) if finite_psnrs else float("inf")
+    print(f"    PSNR: {mean_psnr:.1f} dB | Mean diff: {np.mean(diffs):.2f}")
 
     return CodecResult(
-        codec=codec,
+        crf=crf,
+        pix_fmt=pix_fmt,
+        preset=preset,
         file_size_bytes=file_size,
-        encode_time_seconds=encode_time,
-        decode_time_seconds=decode_time,
-        mean_diff=mean_diff,
-        max_diff=max_diff,
+        total_encode_time_s=total_encode,
+        decode_time_s=decode_time,
+        mean_diff=float(np.mean(diffs)),
+        max_diff=float(np.max(max_diffs)),
         psnr=mean_psnr,
-        num_frames=len(frames),
+        num_frames=len(frames_cmp),
+        per_frame_times_ms=per_frame_ms,
     )
 
 
-def print_comparison(results: list[CodecResult]) -> None:
-    """Print comparison table."""
-    print("\n" + "=" * 70)
-    print("CODEC COMPARISON RESULTS")
-    print("=" * 70)
+# ── Burst CPU benchmark ──────────────────────────────────────────────────────
 
-    # Header
-    print(f"{'Codec':<12} {'Size (MB)':<12} {'Encode (s)':<12} {'Decode (s)':<12} {'Mean Diff':<12} {'PSNR (dB)':<12}")
-    print("-" * 70)
+
+def burst_benchmark(
+    frames: list[Image.Image],
+    output_dir: Path,
+    crf: int,
+    pix_fmt: str,
+    preset: str,
+    fps: int = 10,
+    duration_s: int = 5,
+) -> tuple[float, float, int]:
+    """Simulate burst encoding at a given fps for duration_s.
+
+    Returns (cpu_time_s, wall_time_s, num_frames).
+    Uses time.process_time() for CPU time measurement.
+    """
+    from sc_engine.video import VideoWriter
+
+    num_burst = fps * duration_s
+    # Cycle through available frames
+    burst_frames = [frames[i % len(frames)] for i in range(num_burst)]
+    width, height = burst_frames[0].size
+
+    video_path = output_dir / f"burst_crf{crf}_{pix_fmt}_{preset}.mp4"
+
+    writer = VideoWriter(
+        video_path,
+        width=width,
+        height=height,
+        fps=fps,
+        codec="libx264",
+        pix_fmt=pix_fmt,
+        crf=crf,
+        preset=preset,
+    )
+
+    interval = 1.0 / fps
+    cpu_start = time.process_time()
+    wall_start = time.perf_counter()
+
+    for i, frame in enumerate(burst_frames):
+        timestamp = i * interval
+        writer.write_frame(frame, timestamp)
+
+    writer.close()
+    cpu_time = time.process_time() - cpu_start
+    wall_time = time.perf_counter() - wall_start
+
+    # Clean up burst file
+    video_path.unlink(missing_ok=True)
+
+    return cpu_time, wall_time, num_burst
+
+
+# ── Output ────────────────────────────────────────────────────────────────────
+
+
+def print_results_table(
+    results: list[CodecResult], baseline: CodecResult | None
+) -> None:
+    """Print formatted comparison table."""
+    print("\n" + "=" * 110)
+    print("ENCODING MATRIX RESULTS")
+    print("=" * 110)
+
+    header = (
+        f"{'Config':<30} {'Size (MB)':>10} {'vs base':>8} "
+        f"{'Encode(s)':>10} {'Frame(ms)':>10} {'p95(ms)':>8} "
+        f"{'PSNR(dB)':>9} {'MeanDiff':>9}"
+    )
+    print(header)
+    print("-" * 110)
 
     for r in results:
-        size_mb = r.file_size_bytes / 1024 / 1024
-        print(f"{r.codec:<12} {size_mb:<12.2f} {r.encode_time_seconds:<12.2f} {r.decode_time_seconds:<12.2f} {r.mean_diff:<12.4f} {r.psnr:<12.2f}")
+        if baseline and baseline.file_size_bytes > 0:
+            ratio = f"{r.file_size_bytes / baseline.file_size_bytes:.1%}"
+        else:
+            ratio = "-"
 
-    print("-" * 70)
+        line = (
+            f"{r.label:<30} {r.size_mb:>10.2f} {ratio:>8} "
+            f"{r.total_encode_time_s:>10.2f} {r.mean_frame_time_ms:>10.1f} "
+            f"{r.p95_frame_time_ms:>8.1f} "
+            f"{r.psnr:>9.1f} {r.mean_diff:>9.2f}"
+        )
+        print(line)
 
-    # Comparison
-    if len(results) >= 2:
-        h264 = next((r for r in results if "264" in r.codec), None)
-        h265 = next((r for r in results if "265" in r.codec), None)
+    print("-" * 110)
 
-        if h264 and h265:
-            size_reduction = (1 - h265.file_size_bytes / h264.file_size_bytes) * 100
-            print("\nH.265 vs H.264:")
-            print(f"  Size reduction: {size_reduction:.1f}%")
-            print(f"  Quality difference (PSNR): {h265.psnr - h264.psnr:+.2f} dB")
-            print(f"  Encode time ratio: {h265.encode_time_seconds / h264.encode_time_seconds:.2f}x")
+    # Burst table
+    burst_results = [r for r in results if r.burst_cpu_time_s is not None]
+    if burst_results:
+        print("\nBURST ENCODING (10fps x 5s = 50 frames)")
+        print("-" * 80)
+        print(
+            f"{'Config':<30} {'CPU(s)':>8} {'Wall(s)':>8} "
+            f"{'CPU/frame(ms)':>14} {'Headroom':>10}"
+        )
+        print("-" * 80)
+        for r in burst_results:
+            cpu_per_frame = (
+                (r.burst_cpu_time_s / r.burst_frames * 1000)
+                if r.burst_frames
+                else 0
+            )
+            # At 10fps, budget is 100ms per frame
+            headroom = 100.0 - cpu_per_frame
+            print(
+                f"{r.label:<30} {r.burst_cpu_time_s:>8.2f} "
+                f"{r.burst_wall_time_s:>8.2f} "
+                f"{cpu_per_frame:>14.1f} {headroom:>9.1f}ms"
+            )
+        print("-" * 80)
 
 
-def generate_comparison_plot(results: list[CodecResult], output_path: Path) -> None:
-    """Generate comparison plot."""
-    try:
-        import matplotlib
-        matplotlib.use("Agg")
-        import matplotlib.pyplot as plt
-    except ImportError:
-        print("matplotlib not available, skipping plot generation")
-        return
+def save_side_by_side(
+    frames: list[Image.Image],
+    results: list[CodecResult],
+    output_dir: Path,
+) -> Path | None:
+    """Generate side-by-side visual comparison of a cropped text region.
 
-    fig, axes = plt.subplots(1, 3, figsize=(15, 5))
+    Picks a region from the first frame that likely contains text/code content,
+    encodes it with each config, extracts the frame back, and saves a comparison
+    image with labels.
+    """
+    from sc_engine.video import extract_frames
 
-    codecs = [r.codec for r in results]
+    if not frames:
+        return None
 
-    # File size
-    ax1 = axes[0]
-    sizes = [r.file_size_bytes / 1024 / 1024 for r in results]
-    bars1 = ax1.bar(codecs, sizes, color=['#3498db', '#e74c3c'])
-    ax1.set_ylabel("File Size (MB)")
-    ax1.set_title("File Size Comparison")
-    for bar, size in zip(bars1, sizes):
-        ax1.text(bar.get_x() + bar.get_width()/2, bar.get_height() + 0.1,
-                 f'{size:.1f}', ha='center', va='bottom')
+    src = frames[0]
+    w, h = src.size
 
-    # Encoding time
-    ax2 = axes[1]
-    times = [r.encode_time_seconds for r in results]
-    bars2 = ax2.bar(codecs, times, color=['#3498db', '#e74c3c'])
-    ax2.set_ylabel("Encode Time (s)")
-    ax2.set_title("Encoding Speed")
-    for bar, t in zip(bars2, times):
-        ax2.text(bar.get_x() + bar.get_width()/2, bar.get_height() + 0.1,
-                 f'{t:.1f}s', ha='center', va='bottom')
+    # Crop a region likely to contain text (code editor area)
+    crop_x = min(100, w - 400)
+    crop_y = min(100, h - 200)
+    crop_box = (crop_x, crop_y, min(crop_x + 400, w), min(crop_y + 200, h))
+    original_crop = src.crop(crop_box)
 
-    # Quality (PSNR)
-    ax3 = axes[2]
-    psnrs = [r.psnr for r in results]
-    bars3 = ax3.bar(codecs, psnrs, color=['#3498db', '#e74c3c'])
-    ax3.set_ylabel("PSNR (dB)")
-    ax3.set_title("Quality (higher = better)")
-    ax3.set_ylim(min(psnrs) - 5, max(psnrs) + 5)
-    for bar, p in zip(bars3, psnrs):
-        ax3.text(bar.get_x() + bar.get_width()/2, bar.get_height() + 0.5,
-                 f'{p:.1f}', ha='center', va='bottom')
+    crops: list[tuple[str, Image.Image]] = [("Original", original_crop)]
 
-    plt.tight_layout()
-    plt.savefig(output_path, dpi=150, bbox_inches="tight")
-    plt.close()
-    print(f"\nComparison plot saved to: {output_path}")
+    for r in results:
+        video_path = output_dir / f"test_crf{r.crf}_{r.pix_fmt}_{r.preset}.mp4"
+        if not video_path.exists():
+            continue
+        try:
+            extracted = extract_frames(video_path, [0.0], tolerance=0.5)
+            if extracted:
+                crop = extracted[0].crop(crop_box)
+                crops.append((r.label, crop))
+        except Exception:
+            continue
+
+    if len(crops) < 2:
+        return None
+
+    # Build grid image
+    crop_w, crop_h = original_crop.size
+    label_height = 25
+    tile_h = crop_h + label_height
+    cols = min(len(crops), 4)
+    rows = (len(crops) + cols - 1) // cols
+    canvas_w = cols * crop_w
+    canvas_h = rows * tile_h
+
+    canvas = Image.new("RGB", (canvas_w, canvas_h), (255, 255, 255))
+
+    for idx, (_label, crop_img) in enumerate(crops):
+        col = idx % cols
+        row = idx // cols
+        x_off = col * crop_w
+        y_off = row * tile_h + label_height
+        canvas.paste(crop_img, (x_off, y_off))
+
+    output_path = output_dir / "side_by_side.png"
+    canvas.save(output_path)
+    print(f"\nSide-by-side comparison saved: {output_path}")
+    return output_path
+
+
+# ── Main ──────────────────────────────────────────────────────────────────────
 
 
 def main():
-    parser = argparse.ArgumentParser(description="Compare H.264 vs H.265 codecs")
+    parser = argparse.ArgumentParser(
+        description="Benchmark H.264 encoding settings for screen capture"
+    )
     parser.add_argument(
-        "--num-frames", "-n",
+        "--num-frames",
+        "-n",
         type=int,
         default=100,
-        help="Number of test frames (default: 100)",
+        help="Number of frames to encode (default: 100)",
+    )
+    parser.add_argument(
+        "--frames-dir",
+        type=str,
+        default=None,
+        help="Directory with real PNG/JPEG screenshots instead of synthetic frames",
     )
     parser.add_argument(
         "--crf",
-        type=int,
-        default=0,
-        help="CRF value, 0=lossless (default: 0)",
+        type=str,
+        default="0,23,25,28",
+        help="Comma-separated CRF values to test (default: 0,23,25,28)",
     )
     parser.add_argument(
-        "--output-dir", "-o",
+        "--pix-fmt",
+        type=str,
+        default="yuv444p,yuv420p",
+        help="Comma-separated pixel formats (default: yuv444p,yuv420p)",
+    )
+    parser.add_argument(
+        "--preset",
+        type=str,
+        default="ultrafast,faster,fast",
+        help="Comma-separated presets (default: ultrafast,faster,fast)",
+    )
+    parser.add_argument(
+        "--skip-burst",
+        action="store_true",
+        help="Skip burst encoding benchmark",
+    )
+    parser.add_argument(
+        "--output-dir",
+        "-o",
         type=str,
         default=None,
-        help="Output directory for results",
+        help="Output directory for results (default: temp dir)",
     )
     parser.add_argument(
         "--keep-videos",
@@ -314,55 +535,84 @@ def main():
     )
     args = parser.parse_args()
 
-    # Setup output directory
+    crfs = [int(c) for c in args.crf.split(",")]
+    pix_fmts = [p.strip() for p in args.pix_fmt.split(",")]
+    presets = [p.strip() for p in args.preset.split(",")]
+
+    total_configs = len(crfs) * len(pix_fmts) * len(presets)
+
+    # Output directory
     if args.output_dir:
         output_dir = Path(args.output_dir)
         output_dir.mkdir(parents=True, exist_ok=True)
         cleanup = False
     else:
-        output_dir = Path(tempfile.mkdtemp(prefix="codec_compare_"))
+        output_dir = Path(tempfile.mkdtemp(prefix="codec_benchmark_"))
         cleanup = not args.keep_videos
 
-    print("=" * 70)
-    print("H.264 vs H.265 Codec Comparison")
-    print("=" * 70)
+    print("=" * 110)
+    print("H.264 Encoding Settings Benchmark")
+    print("=" * 110)
+    print(
+        f"Matrix: {len(crfs)} CRFs x {len(pix_fmts)} pix_fmts "
+        f"x {len(presets)} presets = {total_configs} configs"
+    )
+    print(f"Output: {output_dir}")
 
     try:
-        # Generate test frames
-        frames = generate_test_frames(args.num_frames)
+        # ── Load frames ──
+        if args.frames_dir:
+            frames = load_real_frames(
+                Path(args.frames_dir), max_frames=args.num_frames
+            )
+        else:
+            frames = generate_synthetic_frames(args.num_frames)
 
-        # Test both codecs
-        results = []
+        # ── Run matrix ──
+        results: list[CodecResult] = []
+        baseline: CodecResult | None = None
 
-        # H.264
-        try:
-            result_h264 = test_codec(frames, "libx264", output_dir, crf=args.crf)
-            results.append(result_h264)
-        except Exception as e:
-            print(f"H.264 test failed: {e}")
+        for crf in crfs:
+            for pix_fmt in pix_fmts:
+                for preset in presets:
+                    result = benchmark_config(
+                        frames, output_dir, crf, pix_fmt, preset
+                    )
+                    results.append(result)
+                    # First result is the baseline
+                    if baseline is None:
+                        baseline = result
 
-        # H.265
-        try:
-            result_h265 = test_codec(frames, "libx265", output_dir, crf=args.crf)
-            results.append(result_h265)
-        except Exception as e:
-            print(f"H.265 test failed: {e}")
-            print("Note: libx265 may not be available in your ffmpeg installation")
+        # ── Burst benchmark ──
+        if not args.skip_burst:
+            print("\n" + "=" * 80)
+            print("BURST ENCODING BENCHMARK (10fps x 5s)")
+            print("=" * 80)
+            for r in results:
+                cpu_t, wall_t, n = burst_benchmark(
+                    frames, output_dir, r.crf, r.pix_fmt, r.preset
+                )
+                r.burst_cpu_time_s = cpu_t
+                r.burst_wall_time_s = wall_t
+                r.burst_frames = n
+                cpu_per_frame = cpu_t / n * 1000
+                print(
+                    f"  [{r.label}] CPU: {cpu_t:.2f}s, "
+                    f"Wall: {wall_t:.2f}s, {cpu_per_frame:.1f}ms/frame"
+                )
 
-        if results:
-            print_comparison(results)
+        # ── Print results ──
+        print_results_table(results, baseline)
 
-            # Generate plot
-            plot_path = Path(__file__).parent.parent / "docs" / "images" / "codec_comparison.png"
-            plot_path.parent.mkdir(parents=True, exist_ok=True)
-            generate_comparison_plot(results, plot_path)
+        # ── Side-by-side visual ──
+        save_side_by_side(frames, results, output_dir)
 
     finally:
         if cleanup:
             print(f"\nCleaning up {output_dir}...")
             shutil.rmtree(output_dir, ignore_errors=True)
         else:
-            print(f"\nVideo files saved in: {output_dir}")
+            print(f"\nResults saved in: {output_dir}")
 
 
 if __name__ == "__main__":
