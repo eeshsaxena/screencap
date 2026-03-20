@@ -309,7 +309,8 @@ def are_nlp_models_cached() -> bool:
     cache_dir = Path(os.environ.get("HF_HOME", "~/.cache/huggingface")).expanduser() / "hub"
     model_dir = cache_dir / "models--knowledgator--gliner-pii-base-v1.0"
     blobs_dir = model_dir / "blobs"
-    if not (model_dir / "snapshots").exists():
+    snapshots_dir = model_dir / "snapshots"
+    if not snapshots_dir.exists():
         return False
     if not blobs_dir.is_dir():
         return False
@@ -320,13 +321,12 @@ def are_nlp_models_cached() -> bool:
         return False
 
     # Verify the expected ONNX variant is in the latest snapshot
-    snapshots_dir = model_dir / "snapshots"
-    if snapshots_dir.is_dir():
-        snap_dirs = [d for d in snapshots_dir.iterdir() if d.is_dir()]
-        if snap_dirs:
-            latest = max(snap_dirs, key=lambda d: d.stat().st_mtime)
-            if not (latest / "onnx" / _GLINER_ONNX_VARIANT).exists():
-                return False
+    snap_dirs = [d for d in snapshots_dir.iterdir() if d.is_dir()]
+    if not snap_dirs:
+        return False
+    latest = max(snap_dirs, key=lambda d: d.stat().st_mtime)
+    if not (latest / "onnx" / _GLINER_ONNX_VARIANT).exists():
+        return False
 
     # Check spaCy en_core_web_sm
     if importlib.util.find_spec("en_core_web_sm") is None:
@@ -359,10 +359,13 @@ def _cleanup_stale_onnx_blobs() -> None:
                 continue
             if onnx_file.is_symlink():
                 blob_path = onnx_file.resolve()
-                if blob_path.is_file():
+                if blob_path.is_file() and blob_path.is_relative_to(model_dir):
+                    logger.debug("Removing stale ONNX blob: %s", blob_path)
                     blob_path.unlink()
+                logger.debug("Removing stale ONNX symlink: %s", onnx_file.name)
                 onnx_file.unlink()
             elif onnx_file.is_file():
+                logger.debug("Removing stale ONNX file: %s", onnx_file.name)
                 onnx_file.unlink()
 
 

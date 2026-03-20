@@ -328,24 +328,27 @@ class TestNlpModelAvailabilityGating:
         (blobs / "abc123.incomplete").unlink()
         assert are_nlp_models_cached() is False
 
-        # 5. Add a real blob file, but no ONNX variant in snapshot → False
+        # 5. Add a real blob file, but snapshots/ has no subdirs → False
         (blobs / "abc123").write_bytes(b"model data")
+        assert are_nlp_models_cached() is False
+
+        # 6. Add snapshot revision, but no ONNX variant in it → False
         snap_rev = model_dir / "snapshots" / "abc123rev"
         snap_rev.mkdir(parents=True)
         assert are_nlp_models_cached() is False
 
-        # 6. Add wrong ONNX variant (full-precision) → still False
+        # 7. Add wrong ONNX variant (full-precision) → still False
         onnx_dir = snap_rev / "onnx"
         onnx_dir.mkdir()
         (onnx_dir / "model.onnx").write_bytes(b"full precision")
         assert are_nlp_models_cached() is False
 
-        # 7. Add expected quantized variant, but spaCy missing → False
+        # 8. Add expected quantized variant, but spaCy missing → False
         (onnx_dir / _GLINER_ONNX_VARIANT).write_bytes(b"quantized")
         with patch("importlib.util.find_spec", return_value=None):
             assert are_nlp_models_cached() is False
 
-        # 8. Both GLiNER quantized variant and spaCy present → True
+        # 9. Both GLiNER quantized variant and spaCy present → True
         with patch("importlib.util.find_spec", return_value=object()):
             assert are_nlp_models_cached() is True
 
@@ -399,6 +402,25 @@ class TestNlpModelAvailabilityGating:
         assert not full_blob.exists()
         assert not (onnx_dir / "model_fp16.onnx").exists()
         assert not fp16_blob.exists()
+
+    def test_cleanup_stale_onnx_blobs_regular_files(self, tmp_path: Path, monkeypatch):
+        """Cleanup removes non-symlink ONNX files too."""
+        hub_dir = tmp_path / "hub"
+        model_dir = hub_dir / "models--knowledgator--gliner-pii-base-v1.0"
+        snap_rev = model_dir / "snapshots" / "rev1"
+        onnx_dir = snap_rev / "onnx"
+        onnx_dir.mkdir(parents=True)
+
+        monkeypatch.setenv("HF_HOME", str(tmp_path))
+
+        # Regular files (not symlinks)
+        (onnx_dir / "model.onnx").write_bytes(b"full")
+        (onnx_dir / _GLINER_ONNX_VARIANT).write_bytes(b"quantized")
+
+        _cleanup_stale_onnx_blobs()
+
+        assert (onnx_dir / _GLINER_ONNX_VARIANT).exists()
+        assert not (onnx_dir / "model.onnx").exists()
 
     def test_cleanup_stale_onnx_blobs_no_snapshot(self, tmp_path: Path, monkeypatch):
         """Cleanup is a no-op when no snapshot directory exists."""
