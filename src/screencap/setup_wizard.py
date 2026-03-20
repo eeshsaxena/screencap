@@ -768,6 +768,12 @@ def _download_nlp_models() -> None:
         console.print("  Downloading privacy models (this may take a few minutes)...")
         PiiDetector()  # triggers HuggingFace download + spaCy model load
         console.print("  [bold #22d3ee]\u2705 Privacy models downloaded[/bold #22d3ee]")
+
+        from screencap.privacy import _cleanup_stale_onnx_blobs
+        try:
+            _cleanup_stale_onnx_blobs()
+        except Exception:
+            pass  # cleanup is best-effort
     except Exception as e:
         console.print(
             f"  [yellow]Could not download privacy models: {e}[/yellow]\n"

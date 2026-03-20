@@ -13,6 +13,8 @@ from screencap.privacy import (
     Detection,
     DetectionPipeline,
     DetectionResult,
+    _GLINER_ONNX_VARIANT,
+    _cleanup_stale_onnx_blobs,
     _merge_detections,
     are_nlp_models_cached,
     create_default_pipeline,
@@ -326,13 +328,25 @@ class TestNlpModelAvailabilityGating:
         (blobs / "abc123.incomplete").unlink()
         assert are_nlp_models_cached() is False
 
-        # 5. Add a real blob file, but spaCy missing → False
+        # 5. Add a real blob file, but no ONNX variant in snapshot → False
         (blobs / "abc123").write_bytes(b"model data")
+        snap_rev = model_dir / "snapshots" / "abc123rev"
+        snap_rev.mkdir(parents=True)
+        assert are_nlp_models_cached() is False
+
+        # 6. Add wrong ONNX variant (full-precision) → still False
+        onnx_dir = snap_rev / "onnx"
+        onnx_dir.mkdir()
+        (onnx_dir / "model.onnx").write_bytes(b"full precision")
+        assert are_nlp_models_cached() is False
+
+        # 7. Add expected quantized variant, but spaCy missing → False
+        (onnx_dir / _GLINER_ONNX_VARIANT).write_bytes(b"quantized")
         with patch("importlib.util.find_spec", return_value=None):
             assert are_nlp_models_cached() is False
 
-        # 6. Both present → True
-        with patch("importlib.util.find_spec", return_value=object()):  # any truthy value
+        # 8. Both GLiNER quantized variant and spaCy present → True
+        with patch("importlib.util.find_spec", return_value=object()):
             assert are_nlp_models_cached() is True
 
         # --- require_pii on create_default_pipeline ---
@@ -350,3 +364,44 @@ class TestNlpModelAvailabilityGating:
             # require_pii=True — must raise
             with pytest.raises(ImportError, match="PII detection required"):
                 create_default_pipeline(require_pii=True)
+
+    def test_cleanup_stale_onnx_blobs(self, tmp_path: Path, monkeypatch):
+        hub_dir = tmp_path / "hub"
+        model_dir = hub_dir / "models--knowledgator--gliner-pii-base-v1.0"
+        snap_rev = model_dir / "snapshots" / "rev1"
+        onnx_dir = snap_rev / "onnx"
+        blobs_dir = model_dir / "blobs"
+        onnx_dir.mkdir(parents=True)
+        blobs_dir.mkdir(parents=True)
+
+        monkeypatch.setenv("HF_HOME", str(tmp_path))
+
+        # Create blobs and symlinks for three ONNX variants
+        full_blob = blobs_dir / "sha_full"
+        full_blob.write_bytes(b"x" * 100)
+        fp16_blob = blobs_dir / "sha_fp16"
+        fp16_blob.write_bytes(b"x" * 50)
+        quant_blob = blobs_dir / "sha_quant"
+        quant_blob.write_bytes(b"x" * 25)
+
+        (onnx_dir / "model.onnx").symlink_to(full_blob)
+        (onnx_dir / "model_fp16.onnx").symlink_to(fp16_blob)
+        (onnx_dir / _GLINER_ONNX_VARIANT).symlink_to(quant_blob)
+
+        _cleanup_stale_onnx_blobs()
+
+        # Quantized variant and its blob survive
+        assert (onnx_dir / _GLINER_ONNX_VARIANT).exists()
+        assert quant_blob.exists()
+
+        # Stale variants and their blobs are removed
+        assert not (onnx_dir / "model.onnx").exists()
+        assert not full_blob.exists()
+        assert not (onnx_dir / "model_fp16.onnx").exists()
+        assert not fp16_blob.exists()
+
+    def test_cleanup_stale_onnx_blobs_no_snapshot(self, tmp_path: Path, monkeypatch):
+        """Cleanup is a no-op when no snapshot directory exists."""
+        monkeypatch.setenv("HF_HOME", str(tmp_path))
+        (tmp_path / "hub").mkdir()
+        _cleanup_stale_onnx_blobs()  # should not raise
