@@ -6,16 +6,14 @@ the screencap-engine Pydantic event models.
 
 from __future__ import annotations
 
+import os
 import re
 from typing import Any, TypeVar
-
-import os
 
 from screencap.engine.events import (
     ActionEvent,
     BaseEvent,
     Event,
-    WindowSwitchEvent,
     KeyDownEvent,
     KeyShortcutEvent,
     KeyTypeEvent,
@@ -31,6 +29,7 @@ from screencap.engine.events import (
     MouseSmartMagnifyEvent,
     MouseUpEvent,
     SpecialKeyEvent,
+    WindowSwitchEvent,
 )
 
 # Type variable for event types

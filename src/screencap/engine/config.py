@@ -27,7 +27,7 @@ class Settings(BaseSettings):
     2. .env file
     3. Default values
 
-    
+
     """
 
     # API keys

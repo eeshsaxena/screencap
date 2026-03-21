@@ -205,7 +205,7 @@ class WrapStdout:
     """Wrapper for multiprocessing process targets.
 
     Ensures that stdout/stderr are properly redirected in child processes.
-    
+
     """
 
     def __init__(self, fn: Callable) -> None:

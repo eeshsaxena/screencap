@@ -14,7 +14,6 @@ from typing import Any
 
 from loguru import logger
 
-
 _SENTINEL = object()
 
 

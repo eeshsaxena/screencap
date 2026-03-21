@@ -12,14 +12,12 @@ from typing import TYPE_CHECKING, Iterator
 from screencap.engine.convert import dict_to_action_event
 from screencap.engine.events import (
     ActionEvent as PydanticActionEvent,
-    BaseEvent,
-    WindowSwitchEvent,
 )
 from screencap.engine.events import (
+    BaseEvent,
     KeyDownEvent,
     KeyShortcutEvent,
     KeyTypeEvent,
-    KeyUpEvent,
     MouseMoveEvent,
     SpecialKeyEvent,
 )

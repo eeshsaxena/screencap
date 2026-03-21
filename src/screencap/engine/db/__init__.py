@@ -109,8 +109,7 @@ def create_db(db_path: str, echo: bool = False) -> tuple:
 
 def _sa_type_to_sqlite(sa_col) -> str:
     """Map a SQLAlchemy column type to a SQLite type string for ALTER TABLE."""
-    from sqlalchemy import Boolean, Integer, LargeBinary, Numeric, String, Text, JSON
-    from sqlalchemy import TypeDecorator
+    from sqlalchemy import JSON, Boolean, Integer, LargeBinary, Numeric, String, Text, TypeDecorator
 
     col_type = sa_col.type
     if isinstance(col_type, TypeDecorator):

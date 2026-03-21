@@ -33,18 +33,20 @@ from pynput import keyboard, mouse
 from tqdm import tqdm
 
 from screencap.engine import utils, video, window
+from screencap.engine.ax_cache import AXQueryCache
+from screencap.engine.config import RecordingConfig, config
+from screencap.engine.db import create_db, crud, get_session_for_path
+from screencap.engine.db.models import ActionEvent, Recording
+from screencap.engine.dedup import dhash, hamming_distance
+from screencap.engine.extensions import synchronized_queue as sq
+from screencap.engine.retention import RetentionDecision, ScreenRetentionFilter
 from screencap.engine.window.ax_browser_url import (
     ALL_KNOWN_BROWSER_BUNDLES as _BROWSER_BUNDLES,
+)
+from screencap.engine.window.ax_browser_url import (
     extract_browser_url,
     invalidate_url_cache,
 )
-from screencap.engine.ax_cache import AXQueryCache
-from screencap.engine.config import RecordingConfig, config
-from screencap.engine.dedup import dhash, hamming_distance
-from screencap.engine.retention import RetentionDecision, ScreenRetentionFilter
-from screencap.engine.db import create_db, crud, get_session_for_path
-from screencap.engine.db.models import ActionEvent, Recording
-from screencap.engine.extensions import synchronized_queue as sq
 
 try:
     import soundfile
@@ -1306,7 +1308,10 @@ def read_screen_events(
     _get_geometries = None
     _display_bounds = None
     try:
-        from screencap.engine.window._macos import get_all_window_geometries, get_main_display_bounds
+        from screencap.engine.window._macos import (
+            get_all_window_geometries,
+            get_main_display_bounds,
+        )
         _get_geometries = get_all_window_geometries
         _display_bounds = get_main_display_bounds()  # (origin_x, origin_y, width, height)
     except (ImportError, OSError):

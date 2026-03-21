@@ -17,7 +17,6 @@ Returns ``None`` on any failure — the caller falls back to
 from __future__ import annotations
 
 import sys
-import time
 from typing import Any
 
 from loguru import logger
