@@ -5,6 +5,20 @@ All notable changes to this project will be documented in this file.
 The format is based on [Keep a Changelog](https://keepachangelog.com/),
 and this project adheres to [Semantic Versioning](https://semver.org/).
 
+## [0.12.7] - 2026-03-21
+
+### Changed
+- Video/screenshot compression defaults for ~9x recording size reduction
+- GLiNER switched to quantized ONNX model (634 MB → 188 MB binary)
+
+### Fixed
+- Guard gesture_callback against tap-disabled sentinel events
+- Warn on export of empty recording instead of crashing
+- Harden ONNX cache check and stale blob cleanup
+- Fall back to pip install when arch binary unavailable in install.sh
+- export_recording raises ExportError instead of returning -1
+- Correct typo in setup wizard cloud option text
+
 ## [0.12.6] - 2026-03-19
 
 ### Fixed
