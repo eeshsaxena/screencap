@@ -111,11 +111,14 @@ a = Analysis(
     ['main.py'],
     pathex=[
         os.path.join(_root, 'src'),
-        os.path.join(_root, 'packages', 'screencap-engine'),
     ],
     binaries=all_binaries,
     datas=all_datas,
-    hiddenimports=all_hiddenimports,
+    hiddenimports=all_hiddenimports + [
+        # Engine sub-package: dynamic imports not traced by PyInstaller
+        'screencap.engine.window._macos',
+        'screencap.engine.platform.darwin',
+    ],
     hookspath=[],
     hooksconfig={},
     runtime_hooks=[],

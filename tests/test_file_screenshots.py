@@ -31,7 +31,7 @@ def _make_test_image(width=100, height=100, color="red"):
 
 def _make_jpeg_bytes(img=None):
     """Return JPEG bytes for a test image."""
-    from sc_engine.config import config
+    from screencap.engine.config import config
 
     if img is None:
         img = _make_test_image()
@@ -97,7 +97,7 @@ class TestWriteScreenEvent:
         """With screenshots_dir set, saves JPEG file and stores path in event_data."""
         from unittest.mock import MagicMock
 
-        from sc_engine.db.models import Recording
+        from screencap.engine.db.models import Recording
 
         screenshots_dir = tmp_path / "screenshots"
         screenshots_dir.mkdir()
@@ -114,10 +114,10 @@ class TestWriteScreenEvent:
         recording = MagicMock(spec=Recording)
         perf_q = MagicMock()
 
-        with mock.patch("sc_engine.recorder.config") as mock_config:
+        with mock.patch("screencap.engine.recorder.config") as mock_config:
             mock_config.RECORD_IMAGES = True
             mock_config.SCREENSHOT_JPEG_QUALITY = 85
-            from sc_engine.recorder import write_screen_event
+            from screencap.engine.recorder import write_screen_event
 
             state = write_screen_event(
                 db, recording, event, perf_q,
@@ -137,13 +137,13 @@ class TestWriteScreenEvent:
         assert file_stat.st_mode & 0o777 == 0o600
 
         # Verify crud.insert_screenshot was called with image_path
-        from sc_engine.db import crud
+        from screencap.engine.db import crud
 
         db_call = db  # the mock
         # The insert_screenshot call should have image_path in event_data
         crud_call = None
-        with mock.patch("sc_engine.recorder.crud") as mock_crud, \
-             mock.patch("sc_engine.recorder.config") as mock_config:
+        with mock.patch("screencap.engine.recorder.crud") as mock_crud, \
+             mock.patch("screencap.engine.recorder.config") as mock_config:
             mock_config.RECORD_IMAGES = True
             mock_config.SCREENSHOT_JPEG_QUALITY = 85
             state = write_screen_event(
@@ -169,11 +169,11 @@ class TestWriteScreenEvent:
         event.data = img
         event.timestamp = 1709641234.567000
 
-        with mock.patch("sc_engine.recorder.crud") as mock_crud, \
-             mock.patch("sc_engine.recorder.config") as mock_config:
+        with mock.patch("screencap.engine.recorder.crud") as mock_crud, \
+             mock.patch("screencap.engine.recorder.config") as mock_config:
             mock_config.RECORD_IMAGES = True
             mock_config.SCREENSHOT_JPEG_QUALITY = 85
-            from sc_engine.recorder import write_screen_event
+            from screencap.engine.recorder import write_screen_event
 
             state = write_screen_event(
                 MagicMock(), MagicMock(), event, MagicMock(),
@@ -197,10 +197,10 @@ class TestWriteScreenEvent:
             event.data = _make_test_image()
             event.timestamp = bad_ts
 
-            with mock.patch("sc_engine.recorder.crud") as mock_crud, \
-                 mock.patch("sc_engine.recorder.config") as mock_config:
+            with mock.patch("screencap.engine.recorder.crud") as mock_crud, \
+                 mock.patch("screencap.engine.recorder.config") as mock_config:
                 mock_config.RECORD_IMAGES = True
-                from sc_engine.recorder import write_screen_event
+                from screencap.engine.recorder import write_screen_event
 
                 write_screen_event(
                     MagicMock(), MagicMock(), event, MagicMock(),
@@ -221,12 +221,12 @@ class TestWriteScreenEvent:
         event.data = _make_test_image()
         event.timestamp = 1709641234.567000
 
-        with mock.patch("sc_engine.recorder.crud") as mock_crud, \
-             mock.patch("sc_engine.recorder.config") as mock_config, \
-             mock.patch("sc_engine.recorder.logger") as mock_logger:
+        with mock.patch("screencap.engine.recorder.crud") as mock_crud, \
+             mock.patch("screencap.engine.recorder.config") as mock_config, \
+             mock.patch("screencap.engine.recorder.logger") as mock_logger:
             mock_config.RECORD_IMAGES = True
             # Use a non-existent path to trigger OSError
-            from sc_engine.recorder import write_screen_event
+            from screencap.engine.recorder import write_screen_event
 
             state = write_screen_event(
                 MagicMock(), MagicMock(), event, MagicMock(),
@@ -245,10 +245,10 @@ class TestWriteScreenEvent:
         event.data = _make_test_image()
         event.timestamp = 1709641234.567000
 
-        with mock.patch("sc_engine.recorder.crud"), \
-             mock.patch("sc_engine.recorder.config") as mock_config:
+        with mock.patch("screencap.engine.recorder.crud"), \
+             mock.patch("screencap.engine.recorder.config") as mock_config:
             mock_config.RECORD_IMAGES = False
-            from sc_engine.recorder import write_screen_event
+            from screencap.engine.recorder import write_screen_event
 
             state = write_screen_event(
                 MagicMock(), MagicMock(), event, MagicMock(),
@@ -265,7 +265,7 @@ class TestScreenPreCallback:
     def test_creates_directory(self, tmp_path):
         from unittest.mock import MagicMock
 
-        from sc_engine.recorder import screen_pre_callback
+        from screencap.engine.recorder import screen_pre_callback
 
         screenshots_dir = tmp_path / "screenshots"
         assert not screenshots_dir.exists()
@@ -282,7 +282,7 @@ class TestScreenPreCallback:
     def test_none_screenshots_dir(self):
         from unittest.mock import MagicMock
 
-        from sc_engine.recorder import screen_pre_callback
+        from screencap.engine.recorder import screen_pre_callback
 
         state = screen_pre_callback(MagicMock(), MagicMock(), screenshots_dir=None)
         assert state == {"screenshots_dir": None}
@@ -323,7 +323,7 @@ class TestGetFrameAtScreenshotFallback:
         """get_frame_at returns nearest screenshot image when no video exists."""
         capture_dir, timestamps = self._make_capture_with_screenshots(tmp_path)
 
-        from sc_engine.capture import CaptureSession
+        from screencap.engine.capture import CaptureSession
 
         session = CaptureSession.load(capture_dir)
         try:
@@ -337,7 +337,7 @@ class TestGetFrameAtScreenshotFallback:
         """get_frame_at returns the screenshot closest to the requested timestamp."""
         capture_dir, timestamps = self._make_capture_with_screenshots(tmp_path)
 
-        from sc_engine.capture import CaptureSession
+        from screencap.engine.capture import CaptureSession
 
         session = CaptureSession.load(capture_dir)
         try:
@@ -351,7 +351,7 @@ class TestGetFrameAtScreenshotFallback:
         """get_frame_at returns None when no screenshot is within tolerance."""
         capture_dir, timestamps = self._make_capture_with_screenshots(tmp_path)
 
-        from sc_engine.capture import CaptureSession
+        from screencap.engine.capture import CaptureSession
 
         session = CaptureSession.load(capture_dir)
         try:
@@ -369,7 +369,7 @@ class TestGetFrameAtScreenshotFallback:
         db_path = capture_dir / "recording.db"
         _make_recording_db(db_path, with_image_path=True, screenshots=[])
 
-        from sc_engine.capture import CaptureSession
+        from screencap.engine.capture import CaptureSession
 
         session = CaptureSession.load(capture_dir)
         try:
@@ -503,7 +503,7 @@ class TestBackwardCompatibility:
 
     def test_screenshot_image_property_with_blobs(self):
         """Screenshot.image property still works with png_data blobs."""
-        from sc_engine.db.models import Screenshot
+        from screencap.engine.db.models import Screenshot
 
         img = _make_test_image()
         buf = io.BytesIO()
@@ -516,7 +516,7 @@ class TestBackwardCompatibility:
 
     def test_image_path_column_exists_on_model(self):
         """Screenshot model has image_path column."""
-        from sc_engine.db.models import Screenshot
+        from screencap.engine.db.models import Screenshot
 
         assert hasattr(Screenshot, "image_path")
 
@@ -538,8 +538,8 @@ class TestSamplesGlobs:
             img = _make_test_image()
             img.save(screenshots_dir / f"{i}.jpg", format="JPEG")
 
-        with mock.patch("sc_engine.samples.get_example_path", return_value=tmp_path):
-            from sc_engine.samples import get_example_info
+        with mock.patch("screencap.engine.samples.get_example_path", return_value=tmp_path):
+            from screencap.engine.samples import get_example_info
 
             info = get_example_info("test")
             assert info["screenshot_count"] == 3
@@ -553,8 +553,8 @@ class TestSamplesGlobs:
         _make_test_image().save(screenshots_dir / "1.png", format="PNG")
         _make_test_image().save(screenshots_dir / "2.jpg", format="JPEG")
 
-        with mock.patch("sc_engine.samples.get_example_path", return_value=tmp_path):
-            from sc_engine.samples import get_example_info
+        with mock.patch("screencap.engine.samples.get_example_path", return_value=tmp_path):
+            from screencap.engine.samples import get_example_info
 
             info = get_example_info("test")
             assert info["screenshot_count"] == 2
@@ -567,8 +567,8 @@ class TestSamplesGlobs:
         _make_test_image().save(screenshots_dir / "1.jpg", format="JPEG")
         _make_test_image().save(screenshots_dir / "2.png", format="PNG")
 
-        with mock.patch("sc_engine.samples.get_example_path", return_value=tmp_path):
-            from sc_engine.samples import get_example_screenshots
+        with mock.patch("screencap.engine.samples.get_example_path", return_value=tmp_path):
+            from screencap.engine.samples import get_example_screenshots
 
             paths = get_example_screenshots("test")
             extensions = {p.suffix for p in paths}

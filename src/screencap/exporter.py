@@ -43,7 +43,7 @@ def export_recording(
     When *output_path* is a file path, uses atomic write (write to .tmp,
     rename on success).  When *output_path* is None, writes to stdout.
     """
-    from sc_engine import Capture
+    from screencap.engine import Capture
 
     try:
         capture_ctx = Capture.load(str(recording_dir))
@@ -92,7 +92,7 @@ def _write_events(
     """
     import click
 
-    from sc_engine.events import WindowSwitchEvent
+    from screencap.engine.events import WindowSwitchEvent
 
     if metadata is not None:
         click.echo(json.dumps(metadata), file=out_file)

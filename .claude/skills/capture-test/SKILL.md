@@ -1,6 +1,6 @@
 ---
 name: capture-test
-description: End-to-end capture pipeline sanity check. Runs a real screencap recording, asks the user to perform actions, then validates the captured data (files, DB, screenshots). Use when testing capture changes, verifying the recording pipeline works, or after modifying recorder/catalog code. Triggers on "test capture", "capture test", "sanity check", "test recording pipeline", or after changes to recorder.py, catalog.py, or sc_engine.
+description: End-to-end capture pipeline sanity check. Runs a real screencap recording, asks the user to perform actions, then validates the captured data (files, DB, screenshots). Use when testing capture changes, verifying the recording pipeline works, or after modifying recorder/catalog code. Triggers on "test capture", "capture test", "sanity check", "test recording pipeline", or after changes to recorder.py, catalog.py, or screencap.engine.
 ---
 
 # Capture Pipeline Test

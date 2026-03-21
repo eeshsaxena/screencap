@@ -115,7 +115,7 @@ class TestOrphanDetection:
             mock.patch("screencap.pidfile.terminate_processes") as mock_term,
             mock.patch("screencap.pidfile.delete_pidfile"),
             mock.patch("screencap.pidfile.write_pidfile"),
-            mock.patch("sc_engine.Recorder") as MockRecorder,
+            mock.patch("screencap.engine.Recorder") as MockRecorder,
         ):
             MockRecorder.return_value.__enter__ = mock.MagicMock(return_value=mock_recorder)
             MockRecorder.return_value.__exit__ = mock.MagicMock(return_value=False)
@@ -151,7 +151,7 @@ class TestPermissionPrompting:
         ):
             mock_sys.platform = "darwin"
             with mock.patch(
-                "sc_engine.platform.darwin.DarwinPlatform",
+                "screencap.engine.platform.darwin.DarwinPlatform",
                 platform,
             ):
                 _check_macos_permissions()
@@ -169,7 +169,7 @@ class TestPermissionPrompting:
             mock.patch("screencap.recorder.subprocess") as mock_subprocess,
             mock.patch("screencap.recorder.console") as mock_console,
             mock.patch(
-                "sc_engine.platform.darwin.DarwinPlatform",
+                "screencap.engine.platform.darwin.DarwinPlatform",
                 platform,
             ),
         ):
@@ -198,7 +198,7 @@ class TestPermissionPrompting:
             mock.patch("screencap.recorder.console") as mock_console,
             mock.patch("screencap.recorder._check_permission_fresh", side_effect=[True, True]),
             mock.patch(
-                "sc_engine.platform.darwin.DarwinPlatform",
+                "screencap.engine.platform.darwin.DarwinPlatform",
                 platform,
             ),
         ):
@@ -225,7 +225,7 @@ class TestPermissionPrompting:
             mock.patch("screencap.recorder.console") as mock_console,
             mock.patch("screencap.recorder._check_permission_fresh", return_value=False),
             mock.patch(
-                "sc_engine.platform.darwin.DarwinPlatform",
+                "screencap.engine.platform.darwin.DarwinPlatform",
                 platform,
             ),
         ):
@@ -252,7 +252,7 @@ class TestPermissionPrompting:
             mock.patch("screencap.recorder.console") as mock_console,
             mock.patch("screencap.recorder._check_permission_fresh", side_effect=fresh_results),
             mock.patch(
-                "sc_engine.platform.darwin.DarwinPlatform",
+                "screencap.engine.platform.darwin.DarwinPlatform",
                 platform,
             ),
         ):
@@ -285,7 +285,7 @@ class TestPermissionPrompting:
             mock.patch("screencap.recorder.console") as mock_console,
             mock.patch("screencap.recorder._check_permission_fresh", side_effect=fresh_results),
             mock.patch(
-                "sc_engine.platform.darwin.DarwinPlatform",
+                "screencap.engine.platform.darwin.DarwinPlatform",
                 platform,
             ),
         ):
@@ -333,7 +333,7 @@ class TestPermissionPrompting:
 
         with (
             mock.patch("screencap.recorder.sys") as mock_sys,
-            mock.patch.dict("sys.modules", {"sc_engine.platform.darwin": None}),
+            mock.patch.dict("sys.modules", {"screencap.engine.platform.darwin": None}),
         ):
             mock_sys.platform = "darwin"
             _check_macos_permissions()
@@ -370,7 +370,7 @@ class TestPreRecordingDiskCheck:
             mock.patch("screencap.pidfile.find_orphaned_processes", return_value=[]),
             mock.patch("screencap.pidfile.write_pidfile"),
             mock.patch("screencap.pidfile.delete_pidfile"),
-            mock.patch("sc_engine.Recorder") as MockRecorder,
+            mock.patch("screencap.engine.Recorder") as MockRecorder,
         ):
             MockRecorder.return_value.__enter__ = mock.MagicMock(return_value=mock_recorder)
             MockRecorder.return_value.__exit__ = mock.MagicMock(return_value=False)
@@ -431,7 +431,7 @@ class TestPreRecordingDiskCheck:
             mock.patch("screencap.pidfile.find_orphaned_processes", return_value=[]),
             mock.patch("screencap.pidfile.write_pidfile"),
             mock.patch("screencap.pidfile.delete_pidfile"),
-            mock.patch("sc_engine.Recorder") as MockRecorder,
+            mock.patch("screencap.engine.Recorder") as MockRecorder,
         ):
             MockRecorder.return_value.__enter__ = mock.MagicMock(return_value=mock_recorder)
             MockRecorder.return_value.__exit__ = mock.MagicMock(return_value=False)
@@ -461,7 +461,7 @@ class TestPreRecordingDiskCheck:
             mock.patch("screencap.pidfile.find_orphaned_processes", return_value=[]),
             mock.patch("screencap.pidfile.write_pidfile"),
             mock.patch("screencap.pidfile.delete_pidfile"),
-            mock.patch("sc_engine.Recorder") as MockRecorder,
+            mock.patch("screencap.engine.Recorder") as MockRecorder,
         ):
             MockRecorder.return_value.__enter__ = mock.MagicMock(return_value=mock_recorder)
             MockRecorder.return_value.__exit__ = mock.MagicMock(return_value=False)
@@ -555,7 +555,7 @@ class TestPrivacyFilterInitFailure:
                 "screencap.privacy.recorder_enforcement.RecorderPrivacyFilter",
                 side_effect=RuntimeError("missing dep"),
             ),
-            mock.patch("sc_engine.Recorder"),
+            mock.patch("screencap.engine.Recorder"),
         ):
             with pytest.raises(SystemExit):
                 start_recording("test", output_dir=tmp_path / "test-rec")
@@ -581,7 +581,7 @@ class TestPrivacyFilterInitFailure:
                 "screencap.privacy.recorder_enforcement.RecorderPrivacyFilter",
                 side_effect=RuntimeError("missing dep"),
             ),
-            mock.patch("sc_engine.Recorder") as MockRecorder,
+            mock.patch("screencap.engine.Recorder") as MockRecorder,
             pytest.raises(SystemExit) as exc_info,
         ):
             MockRecorder.return_value.__enter__ = mock.MagicMock()
@@ -793,8 +793,8 @@ class TestCloudIntentRecording:
                 "screencap.privacy.recorder_enforcement.RecorderPrivacyFilter",
                 side_effect=lambda config, **kw: FakeFilter(config, **kw),
             ),
-            mock.patch("sc_engine.Recorder") as MockRecorder,
-            mock.patch("sc_engine.config.config") as mock_engine_config,
+            mock.patch("screencap.engine.Recorder") as MockRecorder,
+            mock.patch("screencap.engine.config.config") as mock_engine_config,
         ):
             mock_engine_config.RECORD_WINDOW_DATA = True
             MockRecorder.return_value.__enter__ = mock.MagicMock()
@@ -825,8 +825,8 @@ class TestCloudIntentRecording:
             mock.patch("shutil.disk_usage", return_value=_PLENTY_OF_DISK),
             mock.patch("screencap.config.get_privacy_config", return_value=config),
             mock.patch("screencap.privacy.recorder_enforcement.RecorderPrivacyFilter") as MockFilter,
-            mock.patch("sc_engine.Recorder") as MockRecorder,
-            mock.patch("sc_engine.config.config") as mock_engine_config,
+            mock.patch("screencap.engine.Recorder") as MockRecorder,
+            mock.patch("screencap.engine.config.config") as mock_engine_config,
             mock.patch("screencap.recorder.console") as mock_console,
         ):
             mock_engine_config.RECORD_WINDOW_DATA = True

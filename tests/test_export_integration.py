@@ -20,7 +20,7 @@ def create_export_test_db(db_path, *, include_moves=True, extra_window_events=No
 
     Returns dict with counts/metadata for assertion.
     """
-    from sc_engine.db import create_db, crud
+    from screencap.engine.db import create_db, crud
 
     engine, Session = create_db(str(db_path))
     session = Session()
@@ -405,7 +405,7 @@ def test_privacy_filter_excludes_and_masks(tmp_path, monkeypatch):
     ]
     create_export_test_db(rec_dir / "recording.db", extra_window_events=extra_windows)
 
-    from sc_engine import Capture
+    from screencap.engine import Capture
     from screencap.exporter import _write_events, build_privacy_filter
 
     pf = build_privacy_filter(privacy_mode="public", cloud_intent=False)
@@ -457,7 +457,7 @@ def test_privacy_filter_cloud_intent(tmp_path, monkeypatch):
     ]
     create_export_test_db(rec_dir / "recording.db", extra_window_events=extra_windows)
 
-    from sc_engine import Capture
+    from screencap.engine import Capture
     from screencap.exporter import _write_events, build_privacy_filter
 
     def _export_with_filter(pf):

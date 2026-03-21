@@ -17,7 +17,7 @@ Design decisions:
   resuming capture. Covers macOS app-switch animations (200-350ms)
   with margin. The cost is a few missed frames of the new (allowed) app,
   which is acceptable since post-processing preserves them regardless.
-- Thread-safe: called from the event_processor thread in sc_engine.
+- Thread-safe: called from the event_processor thread in screencap.engine.
 - No ScreenCaptureKit native boundary yet — this is Python-layer
   enforcement that filters in process_events() before screen events
   reach the write queue. A native helper is the future path for true
@@ -126,7 +126,7 @@ class RecorderPrivacyFilter:
     ``is_screen_allowed()`` returns False if ANY source is active or
     within its hold period.
 
-    Usage from sc_engine integration::
+    Usage from screencap.engine integration::
 
         filter = RecorderPrivacyFilter(privacy_config)
 
@@ -217,7 +217,7 @@ class RecorderPrivacyFilter:
         arrives. Must be fast (<1ms) to stay off the hot path.
 
         Args:
-            window_data: The window event data dict from sc_engine,
+            window_data: The window event data dict from screencap.engine,
                 containing at least 'app_bundle_id' and 'title'.
         """
         bundle_id = window_data.get("app_bundle_id") or ""

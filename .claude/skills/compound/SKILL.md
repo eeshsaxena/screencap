@@ -1,196 +1,222 @@
 ---
 name: compound
-description: Document a solved problem as a self-contained solution doc in docs/solutions/. Use after solving a non-trivial bug or debugging session. Triggers on "compound this", "document this solution", "write this up", "that was hard, let's document it", "save this solution", "record this fix".
+description: Document a solved problem, completed feature, porting decision, or architecture learning to compound team knowledge. Auto-triggers on "that worked", "it's fixed", "feature complete", "porting done". Creates one MD file per item in docs/solutions/[category]/. Use after research, planning, implementation, or debugging sessions.
+disable-model-invocation: false
+allowed-tools: Read, Write, Edit, Bash, Grep, Glob, Agent
 ---
 
-# Compound — Document a Solved Problem
+# Compound — Capture Knowledge While It's Fresh
 
-Capture a solved problem as a self-contained solution document in `docs/solutions/`. Each doc must be understandable by a developer who has never seen the codebase and only has access to `docs/solutions/`.
+**Purpose:** After you finish research, planning, implementation, or debugging — document what you learned so the next conversation starts smarter, not from scratch.
 
-## Handling Args
+**One file per item.** `docs/solutions/[category]/[filename].md` with YAML frontmatter for searchability.
 
-- `/compound` — document the most recent fix from conversation context
-- `/compound "brief description"` — seed subagents with additional context about what to document
-- If the user provides context after the command, use it to focus the research
+## When to Invoke
 
-## Instructions
+**Auto-detect phrases:** "that worked", "it's fixed", "working now", "feature complete", "porting done", "problem solved", "implementation done"
 
-### Step 1: Check for Existing Documentation
+**Manual:** `/compound [brief context]`
 
-Before creating a new doc, check if the problem is already documented:
+**Good candidates:**
+- Non-trivial bugs that took investigation
+- Feature implementations with design decisions
+- Cross-platform porting decisions (macOS ↔ Windows)
+- Architecture choices with trade-offs
+- Dependency decisions (why X over Y)
+- Performance discoveries
+- Privacy system rules learned
 
+**Skip:** Simple typos, obvious fixes, trivial one-liners.
+
+## Execution
+
+### Phase 1: Gather Context (from conversation history)
+
+Extract ALL of these from the current conversation:
+
+**Required:**
+- **What was done:** Feature, bug fix, porting task, research finding
+- **Problem/Goal:** What triggered this work
+- **Symptoms:** Error messages, user-visible behavior, or feature requirements
+- **Solution:** What actually worked (code changes, config, architecture)
+- **Why it works:** Technical explanation of root cause or design rationale
+
+**If available:**
+- **What didn't work:** Failed approaches and why they failed
+- **Platform specifics:** macOS vs Windows differences discovered
+- **Dependencies involved:** Libraries, APIs, Win32 calls, pyobjc frameworks
+- **Files changed:** Key files with line numbers
+- **Prevention/gotchas:** How to avoid issues next time
+
+**If critical context is missing, ask:**
 ```
-Glob: docs/solutions/**/*.md
-```
-
-If a matching doc exists, **update it** instead of creating a duplicate. Tell the user: "Found existing doc at `<path>` — I'll update it rather than create a duplicate."
-
-### Step 2: Parallel Research (Subagents)
-
-Launch these subagents **in parallel** using the Agent tool. Each must return **text data only** — no file writes.
-
-**Subagent 1: Context & Solution Extractor**
-
-```
-You are researching a solved problem. DO NOT write any files. Return TEXT DATA only.
-
-From the conversation history, extract:
-
-1. **Context**: What is the system/component? How is it deployed/used? (2-3 sentences a newcomer would understand — no jargon without explanation)
-2. **Problem**: What happened? Exact error messages in code blocks, environment details (OS version, architecture, CI runner)
-3. **Root Causes**: Full chain from trigger to failure for each root cause. Answer "why" at each step.
-4. **Investigation Steps**: Numbered chronological list — include dead ends and what didn't work
-5. **Working Solution**: For each fix, the conceptual explanation + code with file paths and enough context to apply standalone
-
-Return all sections as markdown text.
-```
-
-**Subagent 2: Prevention & Classification**
-
-```
-You are analyzing a solved problem for prevention and classification. DO NOT write any files. Return TEXT DATA only.
-
-Return:
-
-1. **Prevention Strategies**: How to avoid this class of problem. Include checklists, warning signs, CI checks.
-2. **Category**: One of: build-errors, runtime-errors, test-failures, performance-issues, integration-issues (or suggest a new one if none fit)
-3. **Filename slug**: Descriptive, e.g. pyinstaller-frozen-binary-ci-failures
-4. **YAML frontmatter** with these fields:
-   - title: "Short descriptive title"
-   - problem_type: build-and-packaging | runtime | test-failure | performance | integration
-   - component: comma-separated affected components
-   - symptoms: list of exact error messages
-   - root_causes: list of one-sentence root causes
-   - tags: list of searchable keywords
-
-Do NOT include `date` — the orchestrator sets that.
-
-Return all as markdown/YAML text.
+I need a few details to document this properly:
+1. What was the main problem/goal?
+2. Which files/modules were involved?
+3. What was the key insight or root cause?
 ```
 
-**Subagent 3: Related Docs Finder**
+### Phase 2: Classify and Generate Path
 
+**Determine `problem_type` from context:**
+
+| problem_type | Category Directory | When to Use |
+|---|---|---|
+| `bug_fix` | `docs/solutions/bug-fixes/` | Fixed a bug (crash, wrong behavior) |
+| `feature` | `docs/solutions/features/` | Implemented new functionality |
+| `porting` | `docs/solutions/porting/` | Cross-platform macOS ↔ Windows work |
+| `performance` | `docs/solutions/performance/` | Speed, memory, or resource optimization |
+| `architecture` | `docs/solutions/architecture/` | Design decisions, refactors, patterns |
+| `dependency` | `docs/solutions/dependencies/` | Library choices, API decisions, version issues |
+| `privacy` | `docs/solutions/privacy/` | Privacy system rules, PII detection, scrubbing |
+| `build_packaging` | `docs/solutions/build-packaging/` | PyInstaller, Inno Setup, CI/CD, distribution |
+| `testing` | `docs/solutions/testing/` | Test infrastructure, fixtures, CI |
+| `config` | `docs/solutions/config/` | Config system, paths, env vars |
+
+**Generate filename:** `[slug]-[YYYYMMDD].md`
+- Lowercase, hyphens, no special chars, < 80 chars
+- Example: `uwp-applicationframehost-resolution-20260317.md`
+
+**Check for existing similar docs:**
+```bash
+grep -rl "[key symptom or topic]" docs/solutions/ 2>/dev/null
 ```
-You are finding related documentation. DO NOT write any files. Return TEXT DATA only.
 
-Derive 2-3 search terms from the problem description, then search for:
-1. Existing docs in docs/solutions/ that relate to this problem
-2. Source files that were changed or are referenced by the fix
-3. Key git commits: run git log --oneline --grep="<term>" for each search term
+### Phase 3: Write the Document
 
-Return a ## Related Documentation section with:
-- Cross-references to other docs/solutions/ files (if any exist)
-- Links to source files (e.g. pyinstaller/screencap.spec, src/screencap/cli.py)
-- Key commit SHAs with one-line descriptions
-- NEVER link to docs/epics/, docs/plans/, docs/tickets/
-```
+Create the file at `docs/solutions/[category]/[filename].md`.
 
-### Step 3: Assemble & Write
-
-**Wait for all subagents to complete**, then:
-
-1. Collect all text results
-2. Set `date` to today's date
-3. Assemble into the document template below
-4. Create directory: `mkdir -p docs/solutions/<category>/`
-5. Write the single file: `docs/solutions/<category>/<slug>.md`
-
-### Step 4: Post-Write Verification
-
-After writing the file, re-read it with the Read tool and verify:
-
-| Check | How to verify |
-|---|---|
-| Context is newcomer-friendly | No unexplained jargon, no assumed project knowledge |
-| Error messages are exact | In code blocks, not paraphrased |
-| Root cause chain is complete | Every "why" has an answer |
-| Code blocks are standalone | Include file paths, enough context to apply without reading full source |
-| Related links resolve | Run Glob to verify referenced files exist |
-| No dead-end links | No references to docs/epics/, docs/plans/, docs/tickets/ |
-
-If any check fails, fix the section. Then tell the user: "Solution doc created at `<path>`. Want me to adjust anything?"
-
-## Document Template
+**Use this exact structure:**
 
 ```markdown
 ---
-title: "Short descriptive title of the problem and fix"
-date: YYYY-MM-DD
-problem_type: build-and-packaging | runtime | test-failure | performance | integration
-component: comma-separated list of affected components
+title: [Clear descriptive title]
+date: [YYYY-MM-DD]
+problem_type: [from enum above]
+component: [primary module/subsystem affected]
+platform: [macos|windows|cross-platform]
+severity: [critical|high|medium|low]
 symptoms:
-  - "Exact error message or observable behavior 1"
-  - "Exact error message or observable behavior 2"
-root_causes:
-  - "Technical root cause 1 — one sentence"
-  - "Technical root cause 2 — one sentence"
-tags:
-  - relevant
-  - searchable
-  - keywords
+  - "[Observable symptom 1]"
+  - "[Observable symptom 2]"
+root_cause: [1-line technical root cause]
+tags: [keyword1, keyword2, keyword3]
+files_changed:
+  - [path/to/key/file1.py]
+  - [path/to/key/file2.py]
 ---
 
-# Title matching the frontmatter
+# [Clear Problem/Feature Title]
 
-## Context
+## Problem / Goal
+[1-3 sentences: what triggered this work, what was observed or needed]
 
-2-3 sentences explaining what this project/component is and how the
-affected system works. A developer with zero project context should
-understand the domain after reading this paragraph.
+## What Didn't Work
+[Skip this section if solution was immediate]
 
-## Problem
+**Attempt 1:** [What was tried]
+- **Why it failed:** [Technical reason]
 
-What happened. Include the exact error output the user/CI saw.
-Use code blocks for error messages. Be specific about the environment.
+**Attempt 2:** [What was tried]
+- **Why it failed:** [Technical reason]
 
-## Root Cause Analysis
+## Solution
 
-For each root cause, explain the full chain from trigger to failure.
-Use ### subheadings if there are multiple root causes.
-Include the "why" at each step.
+[The actual fix/implementation that worked]
 
-## Investigation Steps
+**Key changes:**
+```python
+# Before (if bug fix):
+[problematic code]
 
-Numbered list of what was tried, in chronological order.
-Include what didn't work and why.
-
-## Working Solution
-
-### Fix N: Descriptive name
-
-Explain the fix conceptually, then show the code.
-Include file paths. Show enough context to apply standalone.
-
-## Prevention Strategies
-
-How to avoid this class of problem in the future.
-Include checklists, warning signs, CI checks.
-
-## Related Documentation
-
-- Cross-reference other docs/solutions/ files
-- Link to source files changed by the fix
-- Key commit SHAs with one-line descriptions
-- NEVER link to docs/epics/, docs/plans/, docs/tickets/
+# After:
+[fixed code with explanation]
 ```
 
-## Key Principles
+**Files changed:**
+- `path/to/file.py:123` — [what changed and why]
 
-- **Self-contained**: Every doc readable by someone with zero project context and only `docs/solutions/` access. Always include Context section. Never reference planning docs.
-- **Exact**: Copy-paste error messages, include file paths and line numbers, name exact versions (macOS 11.7.5, not "older macOS").
-- **Investigation trail**: Dead ends save the next person time. The numbered steps are often the most valuable section.
-- **Prevention compounds**: Without prevention strategies, it's a postmortem. With them, you've made the next engineer faster.
+## Why This Works
 
-## What NOT to Document
+[Technical explanation — root cause analysis for bugs, design rationale for features]
 
-Skip if any of these apply:
-- Simple typo or obvious one-liner fix
-- No general lesson (only affected one conversation)
-- Fix is just "update the dependency" with no deeper insight
-- Already covered by an existing solution doc (update that one instead)
-- The debugging didn't require multiple attempts or non-obvious investigation
+1. [Key insight 1]
+2. [Key insight 2]
 
-## Naming Conventions
+## Platform Notes
+[Skip if not relevant]
 
-Good: `pyinstaller-frozen-binary-ci-failures.md`, `macos-pre14-binary-install-failure.md`
-Bad: `fix-bug.md`, `2026-03-17-issue.md`, `pr-95-fixes.md`
+| Aspect | macOS | Windows |
+|--------|-------|---------|
+| [API] | [macOS approach] | [Windows approach] |
+
+## Prevention / Gotchas
+
+- [How to avoid this issue in future]
+- [What to watch out for]
+- [Testing strategy]
+
+## Related
+
+- [Link to related docs/solutions/ files if any]
+- [Link to relevant GitHub issues/PRs]
+```
+
+### Phase 4: Present Results
+
+```
+✓ Knowledge compounded
+
+File created:
+  docs/solutions/[category]/[filename].md
+
+Summary:
+  Type: [problem_type]
+  Platform: [platform]
+  Key insight: [1-line summary of root cause or decision]
+
+What's next?
+1. Continue working (recommended)
+2. Add to critical patterns (docs/solutions/patterns/critical-patterns.md)
+3. Link to related documentation
+4. View the documentation
+5. Other
+```
+
+**Handle responses:**
+
+**Option 2 — Critical Patterns:**
+Extract the key lesson as a ❌ WRONG vs ✅ CORRECT pattern and append to `docs/solutions/patterns/critical-patterns.md`. These get read by future sessions.
+
+**Option 3 — Link Related:**
+Add cross-references between this doc and related docs.
+
+## Quality Rules
+
+**Good documentation has:**
+- Exact error messages (copy-paste)
+- Specific file:line references
+- Code examples (before/after for bugs, key snippets for features)
+- "Why" not just "what"
+- Platform-specific notes for porting work
+- Failed attempts documented (saves future investigation time)
+
+**Avoid:**
+- Vague descriptions ("fixed the thing")
+- Missing technical details
+- Just code dumps without explanation
+- No prevention guidance
+
+## The Compounding Philosophy
+
+```
+Research → Plan → Implement → Debug → Document → Deploy
+    ↑                                       ↓
+    └───── Next session starts HERE ────────┘
+```
+
+First time solving "UWP ApplicationFrameHost PID resolution" → 2 hours of research.
+Document it → `docs/solutions/porting/uwp-applicationframehost-resolution-20260317.md` (5 min).
+Next time → 2 minutes to look up the solution.
+
+**Each unit of engineering work should make subsequent units easier — not harder.**

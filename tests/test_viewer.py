@@ -50,9 +50,9 @@ class TestOpenViewerMaxEventsWiring:
             with mock.patch("screencap.viewer.find_db", return_value=rec_dir / "recording.db"):
                 with mock.patch("screencap.viewer.subprocess"):
                     with mock.patch.dict("sys.modules", {
-                        "sc_engine": fake_engine,
-                        "sc_engine.visualize": mock.MagicMock(),
-                        "sc_engine.visualize.html": fake_html_module,
+                        "screencap.engine": fake_engine,
+                        "screencap.engine.visualize": mock.MagicMock(),
+                        "screencap.engine.visualize.html": fake_html_module,
                     }):
                         from screencap.viewer import open_viewer
                         open_viewer("test-rec", **kwargs)

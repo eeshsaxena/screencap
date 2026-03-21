@@ -24,7 +24,7 @@ import pytest
 
 def _make_recorder_for_drain_test():
     """Create a minimal Recorder with real pipe, bypassing full __init__."""
-    from sc_engine.recorder import Recorder
+    from screencap.engine.recorder import Recorder
 
     r = Recorder.__new__(Recorder)
     r._child_crashes = []

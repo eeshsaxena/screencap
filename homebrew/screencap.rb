@@ -13,10 +13,7 @@ class Screencap < Formula
   def install
     venv = virtualenv_create(libexec, "python3.12")
 
-    # Install vendored packages first
-    venv.pip_install buildpath/"packages/screencap-engine"
-
-    # Install screencap itself
+    # Install screencap (engine is now an internal sub-package)
     venv.pip_install_and_link buildpath
   end
 

@@ -596,9 +596,9 @@ class ChunkProcessor:
         unmerged — this is an accepted trade-off documented as a known
         limitation (orphan events at boundaries).
         """
-        from sc_engine.convert import dict_to_action_event
-        from sc_engine.events import MouseMoveEvent
-        from sc_engine.processing import (
+        from screencap.engine.convert import dict_to_action_event
+        from screencap.engine.events import MouseMoveEvent
+        from screencap.engine.processing import (
             deduplicate_window_events,
             interleave_window_events,
             process_events,
