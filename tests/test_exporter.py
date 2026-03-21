@@ -78,6 +78,24 @@ def test_export_recording_atomic_write_cleanup_on_failure(tmp_path):
     assert not os.path.exists(out_file)
 
 
+def test_export_recording_warns_on_zero_events(tmp_path, caplog):
+    """Zero-event export emits a logger warning."""
+    rec_dir = tmp_path / "empty-rec"
+    rec_dir.mkdir()
+    out_file = str(rec_dir / "events.jsonl")
+
+    capture = _mock_capture(export_events=[])
+
+    with mock.patch("sc_engine.capture.CaptureSession.load", return_value=capture):
+        import logging
+        with caplog.at_level(logging.WARNING, logger="screencap.exporter"):
+            count = export_recording(rec_dir, out_file, exclude_moves=False, metadata=build_export_metadata(False))
+
+    assert count == 0
+    assert "Recording exported with 0 events" in caplog.text
+    assert str(rec_dir) in caplog.text
+
+
 def test_export_recording_missing_db_raises_export_error(tmp_path):
     """Missing recording database should raise ExportError."""
     rec_dir = tmp_path / "old-rec"

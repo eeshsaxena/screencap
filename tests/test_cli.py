@@ -680,7 +680,7 @@ def test_export_legacy_db_error(tmp_path):
 
 
 def test_export_empty_recording(tmp_path):
-    """Empty recording produces empty events.jsonl."""
+    """Empty recording produces events.jsonl with meta header and warning."""
     rec_dir = tmp_path / "empty-rec"
     rec_dir.mkdir()
 
@@ -700,6 +700,37 @@ def test_export_empty_recording(tmp_path):
     content = out_file.read_text().strip()
     header = json.loads(content)
     assert header["_meta"] is True
+    assert "Recording contains no events" in result.output
+
+
+def test_export_batch_warns_only_for_empty(tmp_path):
+    """Batch export shows warning only for empty recordings."""
+    rec_a = tmp_path / "has-events"
+    rec_a.mkdir()
+    (rec_a / "recording.db").touch()
+    rec_b = tmp_path / "no-events"
+    rec_b.mkdir()
+    (rec_b / "recording.db").touch()
+
+    cap_with = _mock_capture(events=[_mock_event()])
+    cap_empty = _mock_capture(events=[])
+
+    def load_side_effect(path):
+        if "has-events" in path:
+            return cap_with
+        return cap_empty
+
+    runner = CliRunner()
+
+    with (
+        mock.patch("screencap.config.get_recordings_dir", return_value=tmp_path),
+        mock.patch("sc_engine.capture.CaptureSession.load", side_effect=load_side_effect),
+    ):
+        result = runner.invoke(cli, ["export", "--all"])
+
+    assert result.exit_code == 0
+    assert "Recording 'no-events' contains no events" in result.output
+    assert "Recording 'has-events' contains no events" not in result.output
 
 
 def test_export_multiple_events(tmp_path):
