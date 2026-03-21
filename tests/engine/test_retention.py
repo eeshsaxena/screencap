@@ -4,7 +4,7 @@ from __future__ import annotations
 
 import pytest
 
-from sc_engine.retention import RetentionDecision, ScreenRetentionFilter
+from screencap.engine.retention import RetentionDecision, ScreenRetentionFilter
 
 
 class TestDragLifecycle:

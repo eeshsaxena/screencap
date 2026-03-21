@@ -8,7 +8,7 @@ from unittest import mock
 
 import pytest
 
-from sc_engine.extensions.synchronized_queue import SynchronizedQueue
+from screencap.engine.extensions.synchronized_queue import SynchronizedQueue
 
 
 def _child_check_maxsize(q, result_q):
@@ -27,7 +27,7 @@ def _child_check_maxsize(q, result_q):
 @pytest.fixture(autouse=True)
 def _set_start_time():
     """Ensure get_timestamp() works in all tests."""
-    from sc_engine import utils
+    from screencap.engine import utils
     utils.set_start_time(time.time())
     yield
 
@@ -127,7 +127,7 @@ class TestProcessEvent:
     """Test that process_event returns True/False on success/failure."""
 
     def test_returns_true_on_successful_put(self):
-        from sc_engine.recorder import process_event
+        from screencap.engine.recorder import process_event
 
         write_q = SynchronizedQueue(maxsize=10)
         perf_q = SynchronizedQueue()
@@ -144,7 +144,7 @@ class TestProcessEvent:
         perf_q.join_thread()
 
     def test_returns_false_when_queue_full(self):
-        from sc_engine.recorder import process_event
+        from screencap.engine.recorder import process_event
 
         write_q = SynchronizedQueue(maxsize=1)
         perf_q = SynchronizedQueue()
@@ -161,7 +161,7 @@ class TestProcessEvent:
         perf_q.join_thread()
 
     def test_shorter_timeout_during_shutdown(self):
-        from sc_engine.recorder import process_event
+        from screencap.engine.recorder import process_event
 
         write_q = SynchronizedQueue(maxsize=1)
         perf_q = SynchronizedQueue()
@@ -196,7 +196,7 @@ class TestTriggerActionEvent:
 
     def test_move_uses_put_nowait(self):
         """Mouse moves should use put_nowait (silent drop on full)."""
-        from sc_engine.recorder import trigger_action_event
+        from screencap.engine.recorder import trigger_action_event
 
         event_q = queue.Queue(maxsize=1)
         event_q.put("filler")
@@ -207,7 +207,7 @@ class TestTriggerActionEvent:
 
     def test_click_drops_with_warning_on_full(self):
         """Clicks should drop with a warning when queue is full."""
-        from sc_engine.recorder import trigger_action_event
+        from screencap.engine.recorder import trigger_action_event
 
         event_q = queue.Queue(maxsize=1)
         event_q.put("filler")
@@ -222,7 +222,7 @@ class TestTriggerActionEvent:
 
     def test_click_succeeds_when_queue_has_room(self):
         """Clicks should be queued normally when there's room."""
-        from sc_engine.recorder import trigger_action_event
+        from screencap.engine.recorder import trigger_action_event
 
         event_q = queue.Queue(maxsize=5)
 
@@ -242,7 +242,7 @@ class TestDropCounting:
 
     def test_action_drop_counted(self):
         """Non-move action drops should be counted in _drop_counts."""
-        import sc_engine.recorder as rec
+        import screencap.engine.recorder as rec
 
         rec._drop_counts = {}
         event_q = queue.Queue(maxsize=1)
@@ -253,7 +253,7 @@ class TestDropCounting:
 
     def test_move_drop_not_counted(self):
         """Mouse move drops are silent and should not be counted."""
-        import sc_engine.recorder as rec
+        import screencap.engine.recorder as rec
 
         rec._drop_counts = {}
         event_q = queue.Queue(maxsize=1)
@@ -264,7 +264,7 @@ class TestDropCounting:
 
     def test_process_event_drop_not_in_drop_counts(self):
         """process_event uses local _drops — module _drop_counts stays clean."""
-        import sc_engine.recorder as rec
+        import screencap.engine.recorder as rec
 
         rec._drop_counts = {}
         write_q = SynchronizedQueue(maxsize=1)

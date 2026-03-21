@@ -4,7 +4,7 @@ import numpy as np
 import pytest
 from PIL import Image
 
-from sc_engine.comparison import (
+from screencap.engine.comparison import (
     ComparisonReport,
     FrameComparison,
     compare_frames,
@@ -171,7 +171,7 @@ class TestCompareVideoToImages:
 
     def test_compare_video_to_images_nonexistent_video(self, tmp_path):
         """Test that nonexistent video raises error."""
-        from sc_engine.comparison import compare_video_to_images
+        from screencap.engine.comparison import compare_video_to_images
 
         img = Image.new("RGB", (100, 100), color="red")
         images = [(1.0, img)]
@@ -186,7 +186,7 @@ class TestPlotComparison:
     def test_plot_empty_report(self):
         """Test plotting empty report returns None."""
         pytest.importorskip("matplotlib", exc_type=ImportError)
-        from sc_engine.comparison import plot_comparison
+        from screencap.engine.comparison import plot_comparison
 
         report = ComparisonReport()
         result = plot_comparison(report)
@@ -195,7 +195,7 @@ class TestPlotComparison:
     def test_plot_returns_image(self):
         """Test that plot returns a PIL Image."""
         pytest.importorskip("matplotlib", exc_type=ImportError)
-        from sc_engine.comparison import plot_comparison
+        from screencap.engine.comparison import plot_comparison
 
         report = ComparisonReport(
             comparisons=[
@@ -210,7 +210,7 @@ class TestPlotComparison:
     def test_plot_saves_to_file(self, tmp_path):
         """Test that plot can save to file."""
         pytest.importorskip("matplotlib", exc_type=ImportError)
-        from sc_engine.comparison import plot_comparison
+        from screencap.engine.comparison import plot_comparison
 
         report = ComparisonReport(
             comparisons=[

@@ -1,7 +1,7 @@
 """Tests for event schemas."""
 
 
-from sc_engine.events import (
+from screencap.engine.events import (
     AudioChunkEvent,
     EventType,
     KeyDownEvent,

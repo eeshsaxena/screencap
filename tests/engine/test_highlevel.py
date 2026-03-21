@@ -9,12 +9,12 @@ from pathlib import Path
 
 import pytest
 
-from sc_engine.capture import Capture
-from sc_engine.db import create_db, crud
+from screencap.engine.capture import Capture
+from screencap.engine.db import create_db, crud
 
 # Recorder requires pynput which needs a display server
 try:
-    from sc_engine.recorder import Recorder
+    from screencap.engine.recorder import Recorder
 except ImportError:
     Recorder = None
 
@@ -403,7 +403,7 @@ class TestCaptureEdgeCases:
         })
 
         # Disable the second event directly in the DB
-        from sc_engine.db.models import ActionEvent
+        from screencap.engine.db.models import ActionEvent
         disabled_event = session.query(ActionEvent).filter(
             ActionEvent.mouse_x == 70.0
         ).first()
@@ -539,7 +539,7 @@ class TestPixelRatio:
         }
         crud.insert_recording(session, recording_data)
 
-        from sc_engine.visualize.html import create_html
+        from screencap.engine.visualize.html import create_html
         html = create_html(capture_path)
         assert "const pixelRatio=2.0;" in html
 
@@ -604,7 +604,7 @@ class TestViewerDownsampling:
 
     def test_type_aware_keeps_all_clicks_samples_moves(self):
         """With 30 clicks + 100 moves and budget 50, all 30 clicks kept, 20 moves sampled."""
-        from sc_engine.visualize.html import create_html
+        from screencap.engine.visualize.html import create_html
 
         ts = time.time()
         clicks = [self._make_fake_action("mouse.singleclick", ts + i) for i in range(30)]
@@ -634,7 +634,7 @@ class TestViewerDownsampling:
 
     def test_no_downsampling_when_under_budget(self):
         """Events under max_events are not downsampled and show no banner."""
-        from sc_engine.visualize.html import create_html
+        from screencap.engine.visualize.html import create_html
 
         ts = time.time()
         actions = [self._make_fake_action("mouse.singleclick", ts + i) for i in range(10)]
@@ -646,7 +646,7 @@ class TestViewerDownsampling:
 
     def test_all_non_moves_exceed_budget_samples_uniformly(self):
         """When clicks alone exceed budget, they are uniformly sampled."""
-        from sc_engine.visualize.html import create_html
+        from screencap.engine.visualize.html import create_html
 
         ts = time.time()
         actions = [self._make_fake_action("mouse.singleclick", ts + i) for i in range(100)]
@@ -668,7 +668,7 @@ class TestRecordingConfig:
 
     def test_config_override_applies_and_restores(self):
         """Test that config_override patches and restores config."""
-        from sc_engine.config import (
+        from screencap.engine.config import (
             RecordingConfig,
             config,
             config_override,
@@ -688,7 +688,7 @@ class TestRecordingConfig:
 
     def test_config_override_none_values_unchanged(self):
         """Test that None values in RecordingConfig don't change config."""
-        from sc_engine.config import (
+        from screencap.engine.config import (
             RecordingConfig,
             config,
             config_override,
@@ -701,7 +701,7 @@ class TestRecordingConfig:
 
     def test_config_override_restores_on_exception(self):
         """Test that config is restored even if body raises."""
-        from sc_engine.config import (
+        from screencap.engine.config import (
             RecordingConfig,
             config,
             config_override,

@@ -7,8 +7,8 @@ import av
 import pytest
 from PIL import Image
 
-from sc_engine import utils
-from sc_engine.video import (
+from screencap.engine import utils
+from screencap.engine.video import (
     initialize_video_writer,
     write_video_frame,
 )

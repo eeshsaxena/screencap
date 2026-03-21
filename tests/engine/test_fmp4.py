@@ -11,7 +11,7 @@ import time
 import av
 import pytest
 
-from sc_engine.video import (
+from screencap.engine.video import (
     _FRAG_MP4_OPTIONS,
     _is_fragmented_mp4,
     extract_frames,
@@ -241,7 +241,7 @@ class TestGetVideoInfoDuration:
             close=real_container.close,
         )
 
-        with patch("sc_engine.video.av.open", return_value=fake_container):
+        with patch("screencap.engine.video.av.open", return_value=fake_container):
             info = get_video_info(str(path))
 
         assert info["duration"] is not None
@@ -304,7 +304,7 @@ class TestDefaultEncodingRoundtrip:
         """VideoWriter with config defaults produces playable fMP4, extract_frames works."""
         from PIL import Image
 
-        from sc_engine.video import VideoWriter, extract_frames
+        from screencap.engine.video import VideoWriter, extract_frames
 
         output = tmp_path / "defaults.mp4"
         width, height = 200, 200

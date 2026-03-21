@@ -1,10 +1,10 @@
-"""Tests for sc_engine.dedup — perceptual hashing utilities."""
+"""Tests for screencap.engine.dedup — perceptual hashing utilities."""
 
 from __future__ import annotations
 
 from PIL import Image
 
-from sc_engine.dedup import dhash, hamming_distance
+from screencap.engine.dedup import dhash, hamming_distance
 
 
 def _solid_image(color: int, size: tuple[int, int] = (100, 100)) -> Image.Image:

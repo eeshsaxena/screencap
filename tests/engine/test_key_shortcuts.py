@@ -1,6 +1,6 @@
 """Tests for keyboard shortcut detection."""
 
-from sc_engine.events import (
+from screencap.engine.events import (
     KeyDownEvent,
     KeyShortcutEvent,
     KeyTypeEvent,
@@ -12,7 +12,7 @@ from sc_engine.events import (
     MouseScrollEvent,
     MouseUpEvent,
 )
-from sc_engine.processing import (
+from screencap.engine.processing import (
     detect_key_shortcuts,
     merge_consecutive_keyboard_events,
     process_events,

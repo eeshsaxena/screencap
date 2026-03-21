@@ -4,7 +4,7 @@ import time
 
 import pytest
 
-from sc_engine.stats import CaptureStats, PerfStat
+from screencap.engine.stats import CaptureStats, PerfStat
 
 
 class TestPerfStat:
@@ -177,7 +177,7 @@ class TestPlotCapturePerformance:
 
     def test_plot_nonexistent_capture(self, tmp_path):
         """Test plotting a nonexistent capture raises error."""
-        from sc_engine.stats import plot_capture_performance
+        from screencap.engine.stats import plot_capture_performance
 
         with pytest.raises(FileNotFoundError):
             plot_capture_performance(tmp_path / "nonexistent")
@@ -185,8 +185,8 @@ class TestPlotCapturePerformance:
     def test_plot_empty_capture(self, tmp_path):
         """Test plotting an empty capture."""
         pytest.importorskip("matplotlib")
-        from sc_engine.stats import plot_capture_performance
-        from sc_engine.storage import create_capture
+        from screencap.engine.stats import plot_capture_performance
+        from screencap.engine.storage import create_capture
 
         # Create an empty capture
         capture, storage = create_capture(
@@ -203,9 +203,9 @@ class TestPlotCapturePerformance:
         pytest.importorskip("matplotlib")
         from PIL import Image
 
-        from sc_engine.events import MouseButton, MouseDownEvent
-        from sc_engine.stats import plot_capture_performance
-        from sc_engine.storage import create_capture
+        from screencap.engine.events import MouseButton, MouseDownEvent
+        from screencap.engine.stats import plot_capture_performance
+        from screencap.engine.storage import create_capture
 
         # Create a capture with events
         capture, storage = create_capture(
@@ -234,9 +234,9 @@ class TestPlotCapturePerformance:
     def test_plot_capture_saves_to_file(self, tmp_path):
         """Test plotting a capture and saving to file."""
         pytest.importorskip("matplotlib")
-        from sc_engine.events import MouseButton, MouseDownEvent
-        from sc_engine.stats import plot_capture_performance
-        from sc_engine.storage import create_capture
+        from screencap.engine.events import MouseButton, MouseDownEvent
+        from screencap.engine.stats import plot_capture_performance
+        from screencap.engine.storage import create_capture
 
         # Create a capture with events
         capture, storage = create_capture(

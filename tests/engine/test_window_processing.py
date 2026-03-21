@@ -1,8 +1,8 @@
-"""Tests for window event processing in sc_engine.processing."""
+"""Tests for window event processing in screencap.engine.processing."""
 
 from __future__ import annotations
 
-from sc_engine.events import (
+from screencap.engine.events import (
     EventType,
     MouseClickEvent,
     MouseButton,
@@ -10,7 +10,7 @@ from sc_engine.events import (
     MouseUpEvent,
     WindowSwitchEvent,
 )
-from sc_engine.processing import deduplicate_window_events, interleave_window_events
+from screencap.engine.processing import deduplicate_window_events, interleave_window_events
 
 
 def _win_row(ts, bundle_id="com.apple.finder", window_id="1", title="Finder"):

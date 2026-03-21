@@ -1,10 +1,10 @@
-"""Tests for sc_engine.window.ax_browser_url — browser URL extraction."""
+"""Tests for screencap.engine.window.ax_browser_url — browser URL extraction."""
 
 from __future__ import annotations
 
 from unittest.mock import MagicMock, patch
 
-from sc_engine.window.ax_browser_url import (
+from screencap.engine.window.ax_browser_url import (
     extract_browser_url,
     invalidate_url_cache,
     is_incognito,
@@ -145,7 +145,7 @@ class TestExtractBrowserUrl:
         mock_as = _patch_ax(window)
 
         with patch.dict(
-            "sc_engine.window.ax_browser_url.__dict__",
+            "screencap.engine.window.ax_browser_url.__dict__",
             {"_ApplicationServices": mock_as},
         ):
             result = extract_browser_url(
@@ -167,7 +167,7 @@ class TestExtractBrowserUrl:
         mock_as = _patch_ax(window)
 
         with patch.dict(
-            "sc_engine.window.ax_browser_url.__dict__",
+            "screencap.engine.window.ax_browser_url.__dict__",
             {"_ApplicationServices": mock_as},
         ):
             result = extract_browser_url(
@@ -189,7 +189,7 @@ class TestExtractBrowserUrl:
         mock_as = _patch_ax(window)
 
         with patch.dict(
-            "sc_engine.window.ax_browser_url.__dict__",
+            "screencap.engine.window.ax_browser_url.__dict__",
             {"_ApplicationServices": mock_as},
         ):
             result = extract_browser_url(
@@ -207,7 +207,7 @@ class TestExtractBrowserUrl:
         mock_as = _patch_ax(window)
 
         with patch.dict(
-            "sc_engine.window.ax_browser_url.__dict__",
+            "screencap.engine.window.ax_browser_url.__dict__",
             {"_ApplicationServices": mock_as},
         ):
             result = extract_browser_url(
@@ -225,7 +225,7 @@ class TestExtractBrowserUrl:
         mock_as = _patch_ax(window)
 
         with patch.dict(
-            "sc_engine.window.ax_browser_url.__dict__",
+            "screencap.engine.window.ax_browser_url.__dict__",
             {"_ApplicationServices": mock_as},
         ):
             r1 = extract_browser_url(
@@ -249,7 +249,7 @@ class TestExtractBrowserUrl:
         mock_as = _patch_ax(window)
 
         with patch.dict(
-            "sc_engine.window.ax_browser_url.__dict__",
+            "screencap.engine.window.ax_browser_url.__dict__",
             {"_ApplicationServices": mock_as},
         ):
             r1 = extract_browser_url(
@@ -278,7 +278,7 @@ class TestExtractBrowserUrl:
         mock_as.AXUIElementCopyAttributeValue.return_value = (-25204, None)
 
         with patch.dict(
-            "sc_engine.window.ax_browser_url.__dict__",
+            "screencap.engine.window.ax_browser_url.__dict__",
             {"_ApplicationServices": mock_as},
         ):
             result = extract_browser_url(
@@ -296,7 +296,7 @@ class TestExtractBrowserUrl:
         mock_as.AXUIElementCreateApplication.side_effect = RuntimeError("boom")
 
         with patch.dict(
-            "sc_engine.window.ax_browser_url.__dict__",
+            "screencap.engine.window.ax_browser_url.__dict__",
             {"_ApplicationServices": mock_as},
         ):
             result = extract_browser_url(
@@ -340,7 +340,7 @@ class TestExtractBrowserUrl:
         mock_as.AXUIElementCopyAttributeValue.side_effect = _copy_attr
 
         with patch.dict(
-            "sc_engine.window.ax_browser_url.__dict__",
+            "screencap.engine.window.ax_browser_url.__dict__",
             {"_ApplicationServices": mock_as},
         ):
             result = extract_browser_url(
@@ -360,7 +360,7 @@ class TestExtractBrowserUrl:
         mock_as = _patch_ax(window)
 
         with patch.dict(
-            "sc_engine.window.ax_browser_url.__dict__",
+            "screencap.engine.window.ax_browser_url.__dict__",
             {"_ApplicationServices": mock_as},
         ):
             result = extract_browser_url(

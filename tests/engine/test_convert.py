@@ -1,9 +1,9 @@
-"""Tests for sc_engine.convert — dict-based event conversion."""
+"""Tests for screencap.engine.convert — dict-based event conversion."""
 
 from __future__ import annotations
 
-from sc_engine.convert import dict_to_action_event, dict_to_window_switch
-from sc_engine.events import (
+from screencap.engine.convert import dict_to_action_event, dict_to_window_switch
+from screencap.engine.events import (
     EventType,
     KeyDownEvent,
     KeyUpEvent,

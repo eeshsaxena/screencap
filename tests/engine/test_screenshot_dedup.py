@@ -12,11 +12,11 @@ from unittest import mock
 import pytest
 from PIL import Image
 
-from sc_engine import utils
-from sc_engine.config import config
-from sc_engine.dedup import dhash
-from sc_engine.extensions.synchronized_queue import SynchronizedQueue
-from sc_engine.recorder import Event, process_events
+from screencap.engine import utils
+from screencap.engine.config import config
+from screencap.engine.dedup import dhash
+from screencap.engine.extensions.synchronized_queue import SynchronizedQueue
+from screencap.engine.recorder import Event, process_events
 
 # ---------------------------------------------------------------------------
 # Helpers
@@ -157,9 +157,9 @@ def _run_process_events(events: list[Event], screen_filter=None):
     t = threading.Thread(target=set_terminate)
     t.start()
 
-    with mock.patch("sc_engine.recorder.process_event", side_effect=fake_process_event):
+    with mock.patch("screencap.engine.recorder.process_event", side_effect=fake_process_event):
         # Capture _drops from inside process_events via _drop_counts
-        from sc_engine import recorder as rec_mod
+        from screencap.engine import recorder as rec_mod
         old_drops = dict(rec_mod._drop_counts)
         rec_mod._drop_counts = {}
 
@@ -423,7 +423,7 @@ class TestActionAwareSavesDragFrames:
             _move_event(t0 + 0.31),
         ]
 
-        with mock.patch("sc_engine.recorder.time") as mock_time:
+        with mock.patch("screencap.engine.recorder.time") as mock_time:
             mock_time.monotonic = clock
             mock_time.time = time.time
             screen_count, action_count, _, drops = _run_process_events(events)
@@ -457,7 +457,7 @@ class TestActionAwareTypingUsesTimeFloor:
             _press_event(t0 + 0.61),
         ]
 
-        with mock.patch("sc_engine.recorder.time") as mock_time:
+        with mock.patch("screencap.engine.recorder.time") as mock_time:
             mock_time.monotonic = clock
             mock_time.time = time.time
             screen_count, action_count, _, drops = _run_process_events(events)
@@ -489,7 +489,7 @@ class TestActionAwareWithDedupFallthrough:
             _action_event(t0 + 0.51),        # BASELINE → dHash → time floor skip
         ]
 
-        with mock.patch("sc_engine.recorder.time") as mock_time:
+        with mock.patch("screencap.engine.recorder.time") as mock_time:
             mock_time.monotonic = clock
             mock_time.time = time.time
             screen_count, _, _, drops = _run_process_events(events)
@@ -548,7 +548,7 @@ class TestSettleFrameSavesAfterScrollSilence:
             _scroll_event(t0 + 0.01),
         ]
 
-        with mock.patch("sc_engine.recorder.time") as mock_time:
+        with mock.patch("screencap.engine.recorder.time") as mock_time:
             mock_time.monotonic = clock
             mock_time.time = time.time
             screen_count, _, _, drops = _run_process_events(events)
@@ -593,11 +593,11 @@ class TestSettleFrameSavesAfterScrollSilence:
         t = threading.Thread(target=set_terminate)
         t.start()
 
-        with mock.patch("sc_engine.recorder.time") as mock_time, \
-             mock.patch("sc_engine.recorder.process_event", side_effect=capture_process_event):
+        with mock.patch("screencap.engine.recorder.time") as mock_time, \
+             mock.patch("screencap.engine.recorder.process_event", side_effect=capture_process_event):
             mock_time.monotonic = clock
             mock_time.time = time.time
-            from sc_engine import recorder as rec_mod
+            from screencap.engine import recorder as rec_mod
             old_drops = dict(rec_mod._drop_counts)
             rec_mod._drop_counts = {}
 
@@ -645,7 +645,7 @@ class TestSettleFrameBlockedByPrivacy:
         # Allow screens during scroll processing, block at settle time
         sf = _SwitchingScreenFilter(allow_count=2)
 
-        with mock.patch("sc_engine.recorder.time") as mock_time:
+        with mock.patch("screencap.engine.recorder.time") as mock_time:
             mock_time.monotonic = clock
             mock_time.time = time.time
             screen_count, _, _, drops = _run_process_events(

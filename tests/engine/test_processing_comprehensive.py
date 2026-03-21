@@ -6,7 +6,7 @@ thorough coverage of edge cases in event merging.
 
 import pytest
 
-from sc_engine.events import (
+from screencap.engine.events import (
     KeyDownEvent,
     KeyShortcutEvent,
     KeyTypeEvent,
@@ -24,7 +24,7 @@ from sc_engine.events import (
     MouseUpEvent,
     WindowStateEvent,
 )
-from sc_engine.processing import (
+from screencap.engine.processing import (
     DOUBLE_CLICK_DISTANCE_PIXELS,
     DOUBLE_CLICK_INTERVAL_SECONDS,
     DRAG_DISTANCE_THRESHOLD,
@@ -816,7 +816,7 @@ class TestGestureEventTypes:
 
     def test_get_action_events_includes_gestures(self, ts):
         """Magnify/rotate included in get_action_events output."""
-        from sc_engine.processing import get_action_events
+        from screencap.engine.processing import get_action_events
 
         events = [
             MouseMagnifyEvent(timestamp=ts.next(), x=100, y=100, magnification=0.05),
@@ -897,7 +897,7 @@ class TestSmartMagnifyEventTypes:
 
     def test_smart_magnify_in_get_action_events(self, ts):
         """SmartMagnify included in get_action_events output."""
-        from sc_engine.processing import get_action_events
+        from screencap.engine.processing import get_action_events
 
         events = [
             MouseSmartMagnifyEvent(timestamp=ts.next(), x=100, y=100),
@@ -911,7 +911,7 @@ class TestSmartMagnifyEventTypes:
 
     def test_smart_magnify_db_roundtrip(self, tmp_path):
         """SmartMagnify events persist through CaptureStorage write/read."""
-        from sc_engine.storage import Capture, CaptureStorage
+        from screencap.engine.storage import Capture, CaptureStorage
 
         db_path = tmp_path / "test.db"
         storage = CaptureStorage(db_path)
@@ -934,7 +934,7 @@ class TestSmartMagnifyEventTypes:
     def test_convert_action_event_smart_magnify(self):
         """Legacy DB conversion handles smart_magnify events."""
         from unittest.mock import MagicMock
-        from sc_engine.capture import _convert_action_event
+        from screencap.engine.capture import _convert_action_event
 
         db_event = MagicMock()
         db_event.name = "smart_magnify"
@@ -949,8 +949,8 @@ class TestSmartMagnifyEventTypes:
 
     def test_event_type_map_includes_all_gestures(self):
         """EVENT_TYPE_MAP includes magnify, rotate, and smart_magnify."""
-        from sc_engine.events import EventType
-        from sc_engine.storage import EVENT_TYPE_MAP
+        from screencap.engine.events import EventType
+        from screencap.engine.storage import EVENT_TYPE_MAP
 
         assert EventType.MOUSE_MAGNIFY.value in EVENT_TYPE_MAP
         assert EventType.MOUSE_ROTATE.value in EVENT_TYPE_MAP

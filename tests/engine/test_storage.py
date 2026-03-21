@@ -5,7 +5,7 @@ from pathlib import Path
 
 import pytest
 
-from sc_engine.events import (
+from screencap.engine.events import (
     EventType,
     KeyDownEvent,
     MouseButton,
@@ -13,7 +13,7 @@ from sc_engine.events import (
     MouseMoveEvent,
     MouseUpEvent,
 )
-from sc_engine.storage import (
+from screencap.engine.storage import (
     Capture,
     CaptureStorage,
     create_capture,

@@ -25,11 +25,11 @@ from pathlib import Path
 import psutil
 import pytest
 
-from sc_engine.capture import CaptureSession
+from screencap.engine.capture import CaptureSession
 
 # Recorder requires pynput which needs a display server
 try:
-    from sc_engine.recorder import Recorder
+    from screencap.engine.recorder import Recorder
 except ImportError:
     Recorder = None
 

@@ -1,7 +1,7 @@
 """Tests for event processing pipeline."""
 
 
-from sc_engine.events import (
+from screencap.engine.events import (
     KeyDownEvent,
     KeyShortcutEvent,
     KeyTypeEvent,
@@ -16,7 +16,7 @@ from sc_engine.events import (
     MouseUpEvent,
     SpecialKeyEvent,
 )
-from sc_engine.processing import (
+from screencap.engine.processing import (
     detect_drag_events,
     merge_consecutive_keyboard_events,
     merge_consecutive_mouse_click_events,
@@ -243,7 +243,7 @@ class TestSpecialKeyProcessing:
 
     def test_ctrl_f5_still_produces_shortcut(self):
         """Test that Ctrl+F5 still produces KeyShortcutEvent, no regression."""
-        from sc_engine.processing import detect_key_shortcuts
+        from screencap.engine.processing import detect_key_shortcuts
         events = [
             KeyDownEvent(timestamp=1.0, key_name="ctrl"),
             KeyDownEvent(timestamp=1.05, key_name="f5"),
@@ -309,7 +309,7 @@ class TestSpecialKeyProcessing:
 
     def test_media_key_during_modifier_hold(self):
         """Cmd held + volume up should not break keyboard buffer."""
-        from sc_engine.processing import detect_key_shortcuts
+        from screencap.engine.processing import detect_key_shortcuts
         events = [
             KeyDownEvent(timestamp=1.0, key_name="cmd"),
             KeyDownEvent(timestamp=1.1, key_name="media_volume_up"),
@@ -347,7 +347,7 @@ class TestSpecialKeyProcessing:
     def test_serialization_roundtrip(self):
         """Test that SpecialKeyEvent serializes and deserializes correctly."""
         import json
-        from sc_engine.storage import EVENT_TYPE_MAP
+        from screencap.engine.storage import EVENT_TYPE_MAP
 
         event = SpecialKeyEvent(
             timestamp=1.0,
