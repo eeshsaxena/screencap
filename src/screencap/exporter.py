@@ -55,7 +55,10 @@ def export_recording(
     with capture_ctx as capture:
         if output_path is None:
             # Write to stdout — no atomic write needed
-            return _write_events(capture, sys.stdout, exclude_moves, metadata)
+            count = _write_events(capture, sys.stdout, exclude_moves, metadata)
+            if count == 0:
+                logger.warning("Recording exported with 0 events: %s", recording_dir)
+            return count
 
         # Atomic write: .tmp → rename
         tmp_path = output_path + ".tmp"
@@ -63,6 +66,8 @@ def export_recording(
             with open(tmp_path, "w") as f:
                 count = _write_events(capture, f, exclude_moves, metadata)
             os.rename(tmp_path, output_path)
+            if count == 0:
+                logger.warning("Recording exported with 0 events: %s", recording_dir)
             return count
         except BaseException:
             if os.path.exists(tmp_path):

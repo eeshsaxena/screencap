@@ -393,6 +393,8 @@ def _auto_export(capture_dir: Path) -> None:
                 capture_dir, str(jsonl_path), exclude_moves=False, metadata=meta,
             )
         console.print(f"  [dim]Exported {count} events to events.jsonl[/dim]")
+        if count == 0:
+            console.print("[yellow]Warning:[/yellow] Recording contains no events.")
     except Exception as e:
         console.print(
             f"[yellow]Warning:[/yellow] Could not auto-export events.jsonl ({e}). "
@@ -826,6 +828,8 @@ def export(name, all_recordings, downloads, output, use_stdout, exclude_moves):
             count = _export_one(rec_dir, out, exclude_moves, err_console)
             if count >= 0:
                 err_console.print(f"Exported {count} events to [bold]{out}[/bold]")
+                if count == 0:
+                    err_console.print(f"[yellow]Warning:[/yellow] Recording '{rec_dir.name}' contains no events.")
                 exported += 1
             else:
                 failed += 1
@@ -861,6 +865,8 @@ def export(name, all_recordings, downloads, output, use_stdout, exclude_moves):
     count = _export_one(recording_dir, output_path, exclude_moves, err_console)
     if count < 0:
         sys.exit(1)
+    if count == 0:
+        err_console.print("[yellow]Warning:[/yellow] Recording contains no events.")
     if output_path:
         err_console.print(f"Exported {count} events to [bold]{output_path}[/bold]")
 
@@ -1396,6 +1402,8 @@ def upload(names, all_recordings, dry_run, force, jobs, no_delete):
                         meta = build_export_metadata(exclude_moves=False)
                         count = export_recording(d, str(jsonl_path), exclude_moves=False, metadata=meta)
                         console.print(f"  [dim]Exported {count} events to events.jsonl[/dim]")
+                        if count == 0:
+                            console.print("[yellow]Warning:[/yellow] Recording contains no events.")
                     except Exception as e:
                         console.print(f"  [yellow]Warning:[/yellow] Export failed ({e}), uploading without events.jsonl")
 
