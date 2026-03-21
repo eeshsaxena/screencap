@@ -741,7 +741,7 @@ def write_screen_event(
                 filename = f"{ts:.6f}.jpg"
                 file_path = os.path.join(screenshots_dir, filename)
                 try:
-                    image.save(file_path, format="JPEG", quality=95)
+                    image.save(file_path, format="JPEG", quality=config.SCREENSHOT_JPEG_QUALITY)
                     os.chmod(file_path, 0o600)
                     event_data["image_path"] = f"screenshots/{filename}"
                 except OSError:
@@ -750,7 +750,7 @@ def write_screen_event(
                     )
         else:
             with io.BytesIO() as output:
-                image.save(output, format="JPEG", quality=95)
+                image.save(output, format="JPEG", quality=config.SCREENSHOT_JPEG_QUALITY)
                 png_data = output.getvalue()
             event_data["png_data"] = png_data
     crud.insert_screenshot(db, recording, event.timestamp, event_data)
@@ -971,6 +971,10 @@ def chunked_video_pre_callback(
         width=screen_width,
         height=screen_height,
         chunk_duration=chunk_duration,
+        codec=config.VIDEO_ENCODING,
+        pix_fmt=config.VIDEO_PIXEL_FORMAT,
+        crf=config.VIDEO_CRF,
+        preset=config.VIDEO_PRESET,
         chunk_rotate_q=chunk_rotate_q,
     )
 
@@ -2914,6 +2918,9 @@ class Recorder:
         capture_full_video: bool | None = None,
         video_encoding: str | None = None,
         video_pixel_format: str | None = None,
+        video_crf: int | None = None,
+        video_preset: str | None = None,
+        screenshot_jpeg_quality: int | None = None,
         stop_sequences: list[list[str]] | None = None,
         log_memory: bool | None = None,
         plot_performance: bool | None = None,
@@ -2944,6 +2951,9 @@ class Recorder:
             capture_full_video=capture_full_video,
             video_encoding=video_encoding,
             video_pixel_format=video_pixel_format,
+            video_crf=video_crf,
+            video_preset=video_preset,
+            screenshot_jpeg_quality=screenshot_jpeg_quality,
             stop_sequences=stop_sequences,
             log_memory=log_memory,
             plot_performance=plot_performance,

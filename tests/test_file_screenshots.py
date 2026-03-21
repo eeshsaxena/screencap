@@ -31,10 +31,12 @@ def _make_test_image(width=100, height=100, color="red"):
 
 def _make_jpeg_bytes(img=None):
     """Return JPEG bytes for a test image."""
+    from sc_engine.config import config
+
     if img is None:
         img = _make_test_image()
     buf = io.BytesIO()
-    img.save(buf, format="JPEG", quality=95)
+    img.save(buf, format="JPEG", quality=config.SCREENSHOT_JPEG_QUALITY)
     return buf.getvalue()
 
 
@@ -114,6 +116,7 @@ class TestWriteScreenEvent:
 
         with mock.patch("sc_engine.recorder.config") as mock_config:
             mock_config.RECORD_IMAGES = True
+            mock_config.SCREENSHOT_JPEG_QUALITY = 85
             from sc_engine.recorder import write_screen_event
 
             state = write_screen_event(
@@ -142,6 +145,7 @@ class TestWriteScreenEvent:
         with mock.patch("sc_engine.recorder.crud") as mock_crud, \
              mock.patch("sc_engine.recorder.config") as mock_config:
             mock_config.RECORD_IMAGES = True
+            mock_config.SCREENSHOT_JPEG_QUALITY = 85
             state = write_screen_event(
                 db, recording, event, perf_q,
                 screenshots_dir=str(screenshots_dir),
@@ -168,6 +172,7 @@ class TestWriteScreenEvent:
         with mock.patch("sc_engine.recorder.crud") as mock_crud, \
              mock.patch("sc_engine.recorder.config") as mock_config:
             mock_config.RECORD_IMAGES = True
+            mock_config.SCREENSHOT_JPEG_QUALITY = 85
             from sc_engine.recorder import write_screen_event
 
             state = write_screen_event(

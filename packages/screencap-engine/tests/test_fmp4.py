@@ -295,3 +295,40 @@ class TestMoveMovAtomGuard:
         with patch("subprocess.run") as mock_run:
             move_moov_atom(str(path))
             mock_run.assert_not_called()
+
+
+class TestDefaultEncodingRoundtrip:
+    """Test that new default encoding settings (CRF 23, faster) produce valid fMP4."""
+
+    def test_videowriter_default_settings_roundtrip(self, tmp_path):
+        """VideoWriter with config defaults produces playable fMP4, extract_frames works."""
+        from PIL import Image
+
+        from sc_engine.video import VideoWriter, extract_frames
+
+        output = tmp_path / "defaults.mp4"
+        width, height = 200, 200
+
+        # Write 10 frames using config defaults (CRF 23, faster, yuv444p)
+        writer = VideoWriter(output, width=width, height=height, fps=24)
+        source_frames = []
+        for i in range(10):
+            img = Image.new("RGB", (width, height), color=(50 + i * 20, 100, 150))
+            source_frames.append(img)
+            writer.write_frame(img, i / 24.0)
+        writer.close()
+
+        # File should exist and be smaller than lossless
+        assert output.exists()
+        file_size = output.stat().st_size
+        assert file_size > 0
+
+        # Should be valid fMP4
+        assert _is_fragmented_mp4(str(output))
+
+        # extract_frames should work
+        timestamps = [i / 24.0 for i in range(10)]
+        extracted = extract_frames(output, timestamps, tolerance=0.5)
+        assert len(extracted) == 10
+        for frame in extracted:
+            assert frame.size == (width, height)
