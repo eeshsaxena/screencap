@@ -5,6 +5,16 @@ All notable changes to this project will be documented in this file.
 The format is based on [Keep a Changelog](https://keepachangelog.com/),
 and this project adheres to [Semantic Versioning](https://semver.org/).
 
+## [0.13.0] - 2026-03-21
+
+### Changed
+- Migrate engine from separate `sc_engine` package to `screencap.engine` sub-package
+- Merge build system into single `pyproject.toml`
+- Unify scrub pipeline shared between scrubber and chunk processor
+
+### Fixed
+- Resolve migration todos — stale strings, mock method, egg-info cleanup
+
 ## [0.12.7] - 2026-03-21
 
 ### Changed
