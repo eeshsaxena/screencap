@@ -257,20 +257,10 @@ class ChunkProcessor:
                 logger.warning(f"Failed to get blocked_intervals for chunk {idx}", exc_info=True)
         self._generate_manifest(idx, start_ts, end_ts, blocked_intervals=blocked_intervals)
 
-        # 5. Scrub text surfaces for cloud-intent recordings
+        # 5. Scrub text surfaces + mask screenshots for cloud-intent recordings
         if self._cloud_intent and self._pipeline is not None:
             self._set_status(f"Chunk {idx}: scrubbing...")
-            self._scrub_chunk_files(idx, transcript_path)
-            if self._stop_event.is_set():
-                return
-
-        # 5b. Mask sensitive window regions in screenshots
-        if self._cloud_intent and self._masking_classifier is not None:
-            self._set_status(f"Chunk {idx}: masking screenshots...")
-            try:
-                self._mask_chunk_screenshots(idx, start_ts, end_ts)
-            except Exception:
-                logger.warning(f"Screenshot masking failed for chunk {idx}", exc_info=True)
+            self._scrub_chunk_files(idx, start_ts, end_ts, transcript_path)
             if self._stop_event.is_set():
                 return
 
@@ -302,105 +292,7 @@ class ChunkProcessor:
         else:
             self._set_status("")
 
-    def _mask_chunk_screenshots(self, idx: int, start_ts: float, end_ts: float) -> None:
-        """Mask sensitive window regions in chunk screenshots before upload.
-
-        Uses stored per-screenshot window geometry for selective masking.
-        Falls back to full-frame masking when geometry is unavailable.
-        Does NOT block the chunk pipeline on error.
-        """
-        if self._masking_classifier is None or self._masking_evaluator is None:
-            return
-
-        chunk_dir = self._capture_dir / f"chunk_{idx}"
-        screenshots_dir = chunk_dir / "screenshots"
-        if not screenshots_dir.is_dir():
-            return
-
-        from screencap.privacy.context import (
-            load_window_geometry,
-            parse_screenshot_timestamp,
-        )
-        from screencap.privacy.masking import (
-            MaskStrategy,
-            mask_screenshot,
-            window_regions_from_geometry,
-        )
-        from screencap.privacy.policy import ContextClass
-
-        db_path = self._db_path
-        masked_count = 0
-
-        # Shared connection for geometry lookups across the loop
-        _geom_conn = None
-        try:
-            _geom_conn = sqlite3.connect(str(db_path))
-        except Exception:
-            pass
-
-        try:
-            for img_path in sorted(screenshots_dir.glob("*.jpg")):
-                ts = parse_screenshot_timestamp(img_path.name)
-                if ts is None:
-                    continue
-
-                geom = None
-                try:
-                    geom = load_window_geometry(db_path, ts, conn=_geom_conn)
-                except Exception:
-                    pass
-
-                # Attempt selective masking if geometry is available
-                selective_applied = False
-                if geom is not None:
-                    try:
-                        from PIL import Image
-                        with Image.open(img_path) as probe:
-                            img_w, img_h = probe.size
-
-                        regions = window_regions_from_geometry(
-                            geom.windows, img_w, img_h, self._masking_pixel_ratio,
-                            self._masking_classifier, self._masking_evaluator,
-                            display_origin=geom.display_origin,
-                        )
-                        if regions:
-                            mask_screenshot(
-                                img_path,
-                                None,
-                                regions=regions,
-                            )
-                            masked_count += 1
-                        # No regions = no sensitive windows visible; keep as-is
-                        selective_applied = True
-                    except Exception:
-                        logger.debug(
-                            f"Selective masking failed for {img_path.name}",
-                            exc_info=True,
-                        )
-
-                # Fallback: full-frame masking when geometry unavailable or
-                # selective masking failed. Conservative for cloud upload path.
-                if not selective_applied:
-                    try:
-                        mask_screenshot(
-                            img_path,
-                            ContextClass.UNKNOWN,
-                            strategy=MaskStrategy.FULL_WINDOW,
-                        )
-                        masked_count += 1
-                    except Exception:
-                        # Fail-closed: delete unmasked screenshot before cloud upload
-                        logger.warning(
-                            f"All masking failed for {img_path.name} — deleting for safety",
-                            exc_info=True,
-                        )
-                        img_path.unlink(missing_ok=True)
-        finally:
-            if _geom_conn is not None:
-                _geom_conn.close()
-
-        if masked_count > 0:
-            logger.info(f"Chunk {idx}: masked {masked_count} screenshots")
+    # _mask_chunk_screenshots removed — replaced by scrub_pipeline.mask_screenshots()
 
     def _trigger_flush(self) -> None:
         """Trigger writer processes to flush DB buffers before event export.
@@ -733,139 +625,111 @@ class ChunkProcessor:
             segmentation_mode=self._segmentation_mode,
         )
 
-    def _scrub_chunk_files(self, idx: int, transcript_path: Path | None) -> None:
-        """Inline-scrub text surfaces before upload for cloud-intent recordings.
+    def _scrub_chunk_files(
+        self, idx: int, start_ts: float, end_ts: float,
+        transcript_path: Path | None,
+    ) -> None:
+        """Scrub text surfaces + mask screenshots using the shared pipeline.
 
-        Scrubs events JSONL (combined keystroke aggregation), transcript .txt/.json,
-        and manifest dominant_title. Uses atomic writes (.tmp + rename).
-        Per-field failure → <SCRUB_FAILED> sentinel. Per-file failure → file
-        marked for skip (renamed to .scrub_failed).
+        Builds a full ScrubContext (blocked intervals, secure-field intervals,
+        xref detections) then delegates to pipeline functions. Closes privacy
+        gaps G1-G6 that the old per-method approach missed.
         """
+        from screencap.scrub_pipeline import (
+            ScrubResult,
+            build_scrub_context,
+            mask_screenshots,
+            scrub_events_jsonl,
+            scrub_manifest,
+            scrub_transcripts,
+        )
+
+        scrub_result = ScrubResult()
+
+        # Build full scrub context: blocked intervals + xref from DB
+        ctx = build_scrub_context(
+            self._db_path,
+            self._masking_evaluator,
+            self._masking_classifier,
+            time_range=(start_ts, end_ts),
+            pipeline=self._pipeline,
+            anonymizer=self._anonymizer,
+            pixel_ratio=self._masking_pixel_ratio,
+        )
+
         # --- Events JSONL ---
         events_path = self._capture_dir / f"events_{idx:04d}.jsonl"
         if events_path.exists():
             try:
-                self._scrub_events_jsonl(events_path)
+                had_errors = scrub_events_jsonl(
+                    events_path,
+                    self._pipeline,
+                    self._anonymizer,
+                    ctx=ctx,
+                    result=scrub_result,
+                )
+                if had_errors:
+                    _rename_scrub_failed(events_path)
             except Exception as e:
                 logger.error(f"Chunk {idx}: events JSONL scrub failed, skipping file: {e}")
                 _rename_scrub_failed(events_path)
 
-        # --- Transcript .txt ---
+        # --- Transcripts (.txt + .json) ---
+        transcript_paths = []
         if transcript_path and transcript_path.exists():
-            try:
-                self._scrub_transcript_txt(transcript_path)
-            except Exception as e:
-                logger.error(f"Chunk {idx}: transcript .txt scrub failed, skipping file: {e}")
-                _rename_scrub_failed(transcript_path)
-
-        # --- Transcript .json (defense-in-depth) ---
+            transcript_paths.append(transcript_path)
         transcript_json = self._capture_dir / f"transcript_{idx:04d}.json"
         if transcript_json.exists():
+            transcript_paths.append(transcript_json)
+        if transcript_paths:
             try:
-                self._scrub_transcript_json(transcript_json)
+                scrub_transcripts(
+                    transcript_paths,
+                    self._pipeline,
+                    self._anonymizer,
+                    result=scrub_result,
+                )
             except Exception as e:
-                logger.error(f"Chunk {idx}: transcript .json scrub failed, skipping file: {e}")
-                _rename_scrub_failed(transcript_json)
+                logger.error(f"Chunk {idx}: transcript scrub failed: {e}")
+                for tp in transcript_paths:
+                    if tp.exists():
+                        _rename_scrub_failed(tp)
 
-        # --- Manifest (dominant_title + derived_name) ---
+        # --- Manifest ---
         manifest_path = self._capture_dir / f"chunk_{idx:04d}_manifest.json"
         if manifest_path.exists():
             try:
-                self._scrub_manifest(manifest_path)
+                scrub_manifest(
+                    manifest_path,
+                    self._pipeline,
+                    self._anonymizer,
+                    result=scrub_result,
+                )
             except Exception as e:
                 logger.error(f"Chunk {idx}: manifest scrub failed, skipping file: {e}")
                 _rename_scrub_failed(manifest_path)
 
-    def _scrub_text_field(self, text: str) -> str:
-        """Run a single text field through the pipeline. Returns scrubbed text.
+        # --- Screenshots (policy-aware masking via shared pipeline) ---
+        chunk_dir = self._capture_dir / f"chunk_{idx}"
+        screenshots_dir = chunk_dir / "screenshots"
+        if screenshots_dir.is_dir() and ctx.evaluator is not None:
+            try:
+                mask_screenshots(
+                    screenshots_dir, ctx,
+                    db_path=self._db_path,
+                    result=scrub_result,
+                )
+            except Exception:
+                logger.warning(f"Screenshot masking failed for chunk {idx}", exc_info=True)
+                # Fail-closed: delete all unmasked screenshots before upload
+                for img in screenshots_dir.glob("*.jpg"):
+                    img.unlink(missing_ok=True)
 
-        On AllDetectorsFailedError returns '<SCRUB_FAILED>'.
-        """
-        from screencap.privacy import AllDetectorsFailedError
-
-        if not text or not text.strip():
-            return text
-        try:
-            result = self._pipeline.detect(text)
-        except AllDetectorsFailedError:
-            return "<SCRUB_FAILED>"
-        return self._anonymizer.anonymize(result.normalized_text, result.detections)
-
-    def _scrub_events_jsonl(self, path: Path) -> None:
-        """Scrub PII in events JSONL using the shared scrubber function.
-
-        Delegates to ``scrub_events_jsonl()`` from the scrubber module for
-        full-depth recursive scrubbing of all string fields in all events.
-        """
-        from screencap.scrubber import scrub_events_jsonl
-
-        had_errors = scrub_events_jsonl(
-            events_jsonl=path,
-            pipeline=self._pipeline,
-            anonymizer=self._anonymizer,
-        )
-        if had_errors:
-            _rename_scrub_failed(path)
-
-    def _scrub_transcript_txt(self, path: Path) -> None:
-        """Scrub PII from transcript .txt file."""
-        text = path.read_text(encoding="utf-8")
-        scrubbed = self._scrub_text_field(text)
-        tmp_path = str(path) + ".tmp"
-        with open(tmp_path, "w", encoding="utf-8") as f:
-            f.write(scrubbed)
-        os.rename(tmp_path, str(path))
-
-    def _scrub_transcript_json(self, path: Path) -> None:
-        """Scrub PII from transcript .json file (text + segments)."""
-        data = json.loads(path.read_text(encoding="utf-8"))
-        if isinstance(data, dict):
-            if "text" in data and isinstance(data["text"], str):
-                data["text"] = self._scrub_text_field(data["text"])
-            if "segments" in data and isinstance(data["segments"], list):
-                for seg in data["segments"]:
-                    if isinstance(seg, dict) and isinstance(seg.get("text"), str):
-                        seg["text"] = self._scrub_text_field(seg["text"])
-        tmp_path = str(path) + ".tmp"
-        with open(tmp_path, "w", encoding="utf-8") as f:
-            json.dump(data, f, indent=2)
-        os.rename(tmp_path, str(path))
-
-    def _scrub_manifest(self, path: Path) -> None:
-        """Scrub PII from manifest.
-
-        v2 manifests (format_version: 2) have no tasks/titles — nothing to scrub.
-        Legacy manifests: scrub dominant_title and re-derive task name.
-        """
-        data = json.loads(path.read_text(encoding="utf-8"))
-
-        # v2 manifests have no text fields to scrub
-        if data.get("format_version", 0) >= 2:
-            return
-
-        # Legacy manifest: scrub task titles
-        from screencap.task_manifest import _derive_task_name
-
-        for task in data.get("tasks", []):
-            title = task.get("dominant_title", "")
-            if title:
-                scrubbed_title = self._scrub_text_field(title)
-                task["dominant_title"] = scrubbed_title
-                task["derived_name"] = _derive_task_name({
-                    "bundle_id": task.get("dominant_app", ""),
-                    "title": scrubbed_title,
-                })
-        if data.get("tasks"):
-            primary = max(
-                data["tasks"],
-                key=lambda t: t.get("end_ts", 0) - t.get("start_ts", 0),
-            )["derived_name"]
-            data.setdefault("summary", {})["primary_task"] = primary
-
-        tmp_path = str(path) + ".tmp"
-        with open(tmp_path, "w", encoding="utf-8") as f:
-            json.dump(data, f, indent=2)
-        os.rename(tmp_path, str(path))
+        # G6: Log audit entries
+        if scrub_result.audit_entries:
+            logger.info(
+                f"Chunk {idx}: scrubbed with {len(scrub_result.audit_entries)} audit entries"
+            )
 
     def _collect_chunk_files(self, idx: int, transcript_path: Path | None) -> list[dict]:
         """Collect files belonging to this chunk for upload.

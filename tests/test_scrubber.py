@@ -10,16 +10,19 @@ from unittest import mock
 
 import pytest
 
-from screencap.scrubber import (
+from screencap.scrub_pipeline import (
     ScrubResult,
+    _scrub_json_recursive,
+    _scrub_transcript_json,
+    _scrub_transcript_txt,
+    scrub_events_jsonl,
+)
+from screencap.scrubber import (
     _build_app_allowlist,
     _scrub_db,
     _scrub_events_jsonl,
-    _scrub_json_recursive,
     _scrub_metrics,
     _scrub_text,
-    _scrub_transcript_json,
-    _scrub_transcript_txt,
     scrub_recording,
 )
 
@@ -1215,7 +1218,7 @@ def test_scrub_events_jsonl_shared_function_scrubs_all_fields(tmp_path, pipeline
     This is the key improvement over the old chunk processor path which only
     handled key.type/key.shortcut text and window.switch title.
     """
-    from screencap.scrubber import scrub_events_jsonl
+    from screencap.scrub_pipeline import scrub_events_jsonl
 
     pipeline, anonymizer = pipeline_and_anonymizer
 
@@ -1286,7 +1289,7 @@ def test_scrub_events_jsonl_shared_function_scrubs_all_fields(tmp_path, pipeline
 
 def test_scrub_events_jsonl_shared_function_returns_errors(tmp_path, pipeline_and_anonymizer):
     """scrub_events_jsonl() returns True on malformed input without deleting original."""
-    from screencap.scrubber import scrub_events_jsonl
+    from screencap.scrub_pipeline import scrub_events_jsonl
 
     pipeline, anonymizer = pipeline_and_anonymizer
 
@@ -1303,7 +1306,7 @@ def test_scrub_events_jsonl_shared_function_returns_errors(tmp_path, pipeline_an
 
 def test_scrub_events_jsonl_shared_function_result_optional(tmp_path, pipeline_and_anonymizer):
     """scrub_events_jsonl() works without a ScrubResult (chunk processor path)."""
-    from screencap.scrubber import scrub_events_jsonl
+    from screencap.scrub_pipeline import scrub_events_jsonl
 
     pipeline, anonymizer = pipeline_and_anonymizer
 

@@ -401,7 +401,7 @@ class TestScrubberSelectiveMasking:
         from PIL import Image
 
         from screencap.privacy.context import WindowContext
-        from screencap.scrubber import ScrubResult, _scrub_screenshots_with_policy
+        from screencap.scrub_pipeline import ScrubContext, ScrubResult, mask_screenshots
 
         screenshots_dir = tmp_path / "screenshots"
         screenshots_dir.mkdir()
@@ -431,11 +431,10 @@ class TestScrubberSelectiveMasking:
             WindowContext(timestamp=99.0, app_bundle_id="com.tinyspeck.slackmacgap", title="Slack")
         ]
         result = ScrubResult()
+        ctx = ScrubContext(window_events=window_events, evaluator=evaluator,
+                           classifier=classifier, pixel_ratio=1.0)
 
-        _scrub_screenshots_with_policy(
-            tmp_path, evaluator, classifier, window_events, result,
-            db_path=db_path, pixel_ratio=1.0,
-        )
+        mask_screenshots(screenshots_dir, ctx, db_path=db_path, result=result)
 
         img_path = screenshots_dir / "100.0.jpg"
         assert img_path.exists()
@@ -451,7 +450,7 @@ class TestScrubberSelectiveMasking:
     def test_fallback_to_full_frame_without_geometry(self, tmp_path):
         """No geometry DB → MASK_WINDOW falls back to full-frame masking (not deletion)."""
         from screencap.privacy.context import WindowContext
-        from screencap.scrubber import ScrubResult, _scrub_screenshots_with_policy
+        from screencap.scrub_pipeline import ScrubContext, ScrubResult, mask_screenshots
 
         screenshots_dir = tmp_path / "screenshots"
         screenshots_dir.mkdir()
@@ -463,10 +462,10 @@ class TestScrubberSelectiveMasking:
             WindowContext(timestamp=99.0, app_bundle_id="com.tinyspeck.slackmacgap", title="Slack")
         ]
         result = ScrubResult()
+        ctx = ScrubContext(window_events=window_events, evaluator=evaluator,
+                           classifier=classifier)
 
-        _scrub_screenshots_with_policy(
-            tmp_path, evaluator, classifier, window_events, result,
-        )
+        mask_screenshots(screenshots_dir, ctx, result=result)
 
         img_path = screenshots_dir / "100.0.jpg"
         assert img_path.exists(), "MASK_WINDOW should keep the file"
@@ -492,7 +491,7 @@ class TestBackgroundWindowMasking:
                      pixel_ratio=1.0, img_w=200, img_h=150):
         """Common setup for background masking tests."""
         from screencap.privacy.context import WindowContext
-        from screencap.scrubber import ScrubResult, _scrub_screenshots_with_policy
+        from screencap.scrub_pipeline import ScrubContext, ScrubResult, mask_screenshots
 
         screenshots_dir = tmp_path / "screenshots"
         screenshots_dir.mkdir()
@@ -513,11 +512,10 @@ class TestBackgroundWindowMasking:
                           title=foreground_title)
         ]
         result = ScrubResult()
+        ctx = ScrubContext(window_events=window_events, evaluator=evaluator,
+                           classifier=classifier, pixel_ratio=pixel_ratio)
 
-        _scrub_screenshots_with_policy(
-            tmp_path, evaluator, classifier, window_events, result,
-            db_path=db_path, pixel_ratio=pixel_ratio,
-        )
+        mask_screenshots(screenshots_dir, ctx, db_path=db_path, result=result)
         return screenshots_dir / "100.0.jpg", result
 
     def test_allow_foreground_masks_sensitive_background(self, tmp_path):
@@ -605,7 +603,7 @@ class TestBackgroundWindowMasking:
     def test_allow_foreground_no_geometry_unchanged(self, tmp_path):
         """ALLOW foreground + no geometry data: screenshot kept as-is (fail-open)."""
         from screencap.privacy.context import WindowContext
-        from screencap.scrubber import ScrubResult, _scrub_screenshots_with_policy
+        from screencap.scrub_pipeline import ScrubContext, ScrubResult, mask_screenshots
 
         screenshots_dir = tmp_path / "screenshots"
         screenshots_dir.mkdir()
@@ -619,10 +617,10 @@ class TestBackgroundWindowMasking:
                           title="main.py")
         ]
         result = ScrubResult()
+        ctx = ScrubContext(window_events=window_events, evaluator=evaluator,
+                           classifier=classifier)
 
-        _scrub_screenshots_with_policy(
-            tmp_path, evaluator, classifier, window_events, result,
-        )
+        mask_screenshots(screenshots_dir, ctx, result=result)
 
         img_path = screenshots_dir / "100.0.jpg"
         assert img_path.exists()

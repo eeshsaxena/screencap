@@ -30,7 +30,7 @@ from screencap.privacy.policy import (
     PrivacyMode,
     parse_privacy_config,
 )
-from screencap.scrubber import ScrubResult, _scrub_screenshots_with_policy
+from screencap.scrub_pipeline import ScrubContext, ScrubResult, mask_screenshots
 
 pytestmark = pytest.mark.privacy
 
@@ -117,11 +117,16 @@ class TestMaskWindowIntegration:
         classifier = DefaultContextClassifier()
         window_events = _make_window_events(window_specs)
         result = ScrubResult()
-        return tmp_path, evaluator, classifier, window_events, result
+        ctx = ScrubContext(
+            window_events=window_events,
+            evaluator=evaluator,
+            classifier=classifier,
+        )
+        return tmp_path, ctx, result
 
     def test_keeps_file_with_masked_content(self, tmp_path):
         """MASK_WINDOW: file still exists but pixel content is darkened."""
-        dst, evaluator, classifier, window_events, result = self._setup(
+        dst, ctx, result = self._setup(
             tmp_path,
             timestamps=[22.0],
             # Slack (chat) in public → MASK_WINDOW
@@ -130,16 +135,14 @@ class TestMaskWindowIntegration:
         img_path = dst / "screenshots" / "22.0.jpg"
         original_brightness = _avg_brightness(img_path)
 
-        _scrub_screenshots_with_policy(
-            dst, evaluator, classifier, window_events, result
-        )
+        mask_screenshots(dst / "screenshots", ctx, result=result)
 
         assert img_path.exists(), "MASK_WINDOW should keep the file, not delete it"
         assert _avg_brightness(img_path) < original_brightness * 0.3
 
     def test_fallback_deletes_on_corrupt_image(self, tmp_path):
         """MASK_WINDOW on a corrupt file → deleted safely, audit says exclude."""
-        dst, evaluator, classifier, window_events, result = self._setup(
+        dst, ctx, result = self._setup(
             tmp_path,
             timestamps=[22.0],
             window_specs=[(20.0, "com.tinyspeck.slackmacgap")],
@@ -148,9 +151,7 @@ class TestMaskWindowIntegration:
         corrupt_path = dst / "screenshots" / "22.0.jpg"
         corrupt_path.write_bytes(b"not a jpeg")
 
-        _scrub_screenshots_with_policy(
-            dst, evaluator, classifier, window_events, result
-        )
+        mask_screenshots(dst / "screenshots", ctx, result=result)
 
         assert not corrupt_path.exists(), "Corrupt image should be deleted for safety"
         # Audit must reflect what actually happened (exclude), not what was attempted
@@ -175,10 +176,13 @@ class TestMaskWindowIntegration:
         classifier = DefaultContextClassifier()
         window_events = _make_window_events(surfaces)
         result = ScrubResult()
-
-        _scrub_screenshots_with_policy(
-            tmp_path, evaluator, classifier, window_events, result
+        ctx = ScrubContext(
+            window_events=window_events,
+            evaluator=evaluator,
+            classifier=classifier,
         )
+
+        mask_screenshots(screenshots_dir, ctx, result=result)
 
         for ts, bundle_id in surfaces:
             img_path = screenshots_dir / f"{ts}.jpg"
@@ -194,14 +198,12 @@ class TestMaskWindowIntegration:
 
     def test_exclude_still_deletes(self, tmp_path):
         """EXCLUDE (password manager) still deletes — masking doesn't interfere."""
-        dst, evaluator, classifier, window_events, result = self._setup(
+        dst, ctx, result = self._setup(
             tmp_path,
             timestamps=[22.0],
             window_specs=[(20.0, "com.1password.1password")],
         )
 
-        _scrub_screenshots_with_policy(
-            dst, evaluator, classifier, window_events, result
-        )
+        mask_screenshots(dst / "screenshots", ctx, result=result)
 
         assert not (dst / "screenshots" / "22.0.jpg").exists()

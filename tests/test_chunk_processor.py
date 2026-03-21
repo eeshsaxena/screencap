@@ -325,6 +325,8 @@ class TestInlineScrubbing:
 
     def test_scrub_transcripts_txt_and_json(self, cloud_capture_dir, cloud_processor):
         """Both transcript formats must have PII replaced, including segment text."""
+        from screencap.scrub_pipeline import scrub_transcripts
+
         txt_path = cloud_capture_dir / "transcript_0000.txt"
         txt_path.write_text("Meeting with John Smith about the project")
 
@@ -337,8 +339,7 @@ class TestInlineScrubbing:
         }))
 
         cp = cloud_processor
-        cp._scrub_transcript_txt(txt_path)
-        cp._scrub_transcript_json(json_path)
+        scrub_transcripts([txt_path, json_path], cp._pipeline, cp._anonymizer)
 
         # .txt
         txt_result = txt_path.read_text()
@@ -353,6 +354,8 @@ class TestInlineScrubbing:
 
     def test_scrub_manifest_dominant_title(self, cloud_capture_dir, cloud_processor):
         """Manifest dominant_title must be scrubbed and derived_name re-derived."""
+        from screencap.scrub_pipeline import scrub_manifest
+
         manifest_path = cloud_capture_dir / "chunk_0000_manifest.json"
         manifest_path.write_text(json.dumps({
             "chunk_index": 0,
@@ -367,7 +370,7 @@ class TestInlineScrubbing:
         }))
 
         cp = cloud_processor
-        cp._scrub_manifest(manifest_path)
+        scrub_manifest(manifest_path, cp._pipeline, cp._anonymizer)
 
         data = json.loads(manifest_path.read_text())
         task = data["tasks"][0]
@@ -377,6 +380,8 @@ class TestInlineScrubbing:
 
     def test_scrub_v2_manifest_skips(self, cloud_capture_dir, cloud_processor):
         """v2 manifests have no text fields — scrub should be a no-op."""
+        from screencap.scrub_pipeline import scrub_manifest
+
         manifest_path = cloud_capture_dir / "chunk_0000_manifest.json"
         original = {
             "format_version": 2,
@@ -388,38 +393,40 @@ class TestInlineScrubbing:
         }
         manifest_path.write_text(json.dumps(original))
 
-        cloud_processor._scrub_manifest(manifest_path)
+        cp = cloud_processor
+        scrub_manifest(manifest_path, cp._pipeline, cp._anonymizer)
 
         # File should be unchanged
         data = json.loads(manifest_path.read_text())
         assert data == original
 
-    def test_scrub_text_field_returns_sentinel_on_all_detectors_failed(
+    def test_scrub_text_returns_sentinel_on_all_detectors_failed(
         self, cloud_capture_dir, cloud_processor,
     ):
-        """_scrub_text_field must return '<SCRUB_FAILED>' when all detectors fail."""
+        """scrub_text must return '<SCRUB_FAILED>' when all detectors fail."""
         from screencap.privacy import AllDetectorsFailedError
+        from screencap.scrub_pipeline import scrub_text
 
         cloud_processor._pipeline.detect = MagicMock(
             side_effect=AllDetectorsFailedError("all failed"),
         )
 
-        result = cloud_processor._scrub_text_field("some sensitive text")
-        assert result == "<SCRUB_FAILED>"
+        scrubbed, _ = scrub_text("some sensitive text", cloud_processor._pipeline, cloud_processor._anonymizer)
+        assert scrubbed == "<SCRUB_FAILED>"
 
     def test_scrub_chunk_files_renames_on_per_file_failure(
         self, cloud_capture_dir, cloud_processor,
     ):
-        """_scrub_chunk_files must rename a file to .scrub_failed when its scrub raises."""
-        # Write a valid events file but make the scrub method raise
+        """_scrub_chunk_files must rename a file to .scrub_failed when events scrub raises."""
+        # Write a valid events file but make the pipeline scrub raise
         events_path = cloud_capture_dir / "events_0000.jsonl"
         events_path.write_text('{"name":"click"}\n')
 
-        with patch.object(
-            cloud_processor, "_scrub_events_jsonl",
+        with patch(
+            "screencap.scrub_pipeline.scrub_events_jsonl",
             side_effect=RuntimeError("simulated scrub failure"),
         ):
-            cloud_processor._scrub_chunk_files(0, None)
+            cloud_processor._scrub_chunk_files(0, 1000.0, 2000.0, None)
 
         # Original file should be renamed, not uploaded
         assert not events_path.exists()
@@ -427,6 +434,8 @@ class TestInlineScrubbing:
 
     def test_scrub_v2_key_type_anonymizes_pii(self, cloud_capture_dir, cloud_processor):
         """v2 format: key.type text with PII → anonymized, children key_char nulled."""
+        from screencap.scrub_pipeline import scrub_events_jsonl
+
         events = [
             {"_meta": True, "format_version": 2},
             {
@@ -447,7 +456,8 @@ class TestInlineScrubbing:
             for evt in events:
                 f.write(json.dumps(evt) + "\n")
 
-        cloud_processor._scrub_events_jsonl(events_path)
+        cp = cloud_processor
+        scrub_events_jsonl(events_path, cp._pipeline, cp._anonymizer)
 
         scrubbed = [json.loads(line) for line in events_path.read_text().splitlines() if line.strip()]
         key_type = scrubbed[1]
@@ -459,6 +469,8 @@ class TestInlineScrubbing:
 
     def test_scrub_v2_key_type_leaves_clean(self, cloud_capture_dir, cloud_processor):
         """v2 format: key.type text without PII should be left unchanged."""
+        from screencap.scrub_pipeline import scrub_events_jsonl
+
         events = [
             {"_meta": True, "format_version": 2},
             {
@@ -474,13 +486,16 @@ class TestInlineScrubbing:
             for evt in events:
                 f.write(json.dumps(evt) + "\n")
 
-        cloud_processor._scrub_events_jsonl(events_path)
+        cp = cloud_processor
+        scrub_events_jsonl(events_path, cp._pipeline, cp._anonymizer)
 
         scrubbed = [json.loads(line) for line in events_path.read_text().splitlines() if line.strip()]
         assert scrubbed[1]["text"] == "hello world"
 
     def test_scrub_v2_key_shortcut_anonymizes_pii(self, cloud_capture_dir, cloud_processor):
         """v2 format: key.shortcut with PII → text anonymized via recursive scrub."""
+        from screencap.scrub_pipeline import scrub_events_jsonl
+
         events = [
             {"_meta": True, "format_version": 2},
             {
@@ -499,7 +514,8 @@ class TestInlineScrubbing:
             for evt in events:
                 f.write(json.dumps(evt) + "\n")
 
-        cloud_processor._scrub_events_jsonl(events_path)
+        cp = cloud_processor
+        scrub_events_jsonl(events_path, cp._pipeline, cp._anonymizer)
 
         scrubbed = [json.loads(line) for line in events_path.read_text().splitlines() if line.strip()]
         shortcut = scrubbed[1]
@@ -508,6 +524,8 @@ class TestInlineScrubbing:
 
     def test_scrub_v2_window_switch_title(self, cloud_capture_dir, cloud_processor):
         """v2 format: window.switch window_title with PII should be scrubbed."""
+        from screencap.scrub_pipeline import scrub_events_jsonl
+
         events = [
             {"_meta": True, "format_version": 2},
             {
@@ -526,7 +544,8 @@ class TestInlineScrubbing:
             for evt in events:
                 f.write(json.dumps(evt) + "\n")
 
-        cloud_processor._scrub_events_jsonl(events_path)
+        cp = cloud_processor
+        scrub_events_jsonl(events_path, cp._pipeline, cp._anonymizer)
 
         scrubbed = [json.loads(line) for line in events_path.read_text().splitlines() if line.strip()]
         ws = scrubbed[1]

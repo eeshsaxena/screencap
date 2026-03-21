@@ -7,13 +7,14 @@ import sqlite3
 
 import pytest
 
-from screencap.scrubber import (
+from screencap.scrub_pipeline import (
+    ElementStateDetection as _ElementStateDetection,
+    ScrubContext,
     ScrubResult,
-    _build_xref_lookup,
     _cross_reference_key_type,
-    _ElementStateDetection,
-    _scrub_events_jsonl,
+    build_xref_lookup as _build_xref_lookup,
 )
+from screencap.scrubber import _scrub_events_jsonl
 from screencap.privacy.reasons import ReasonCode
 
 pytestmark = pytest.mark.privacy
@@ -325,7 +326,7 @@ class TestScrubEventsJsonlWithXref:
         # Run JSONL scrub with xref
         result = ScrubResult()
         _scrub_events_jsonl(
-            rec, pipeline, anonymizer, result, xref_detections=xref
+            rec, pipeline, anonymizer, result, ctx=ScrubContext(xref_detections=xref)
         )
 
         # Verify key_chars are nulled in JSONL output
