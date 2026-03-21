@@ -8,7 +8,9 @@ from __future__ import annotations
 
 from contextlib import contextmanager
 from dataclasses import dataclass, fields
+from typing import Literal
 
+from pydantic import Field
 from pydantic_settings import BaseSettings
 
 STOP_STRS = [
@@ -43,10 +45,13 @@ class Settings(BaseSettings):
     LOG_MEMORY: bool = False
     VIDEO_ENCODING: str = "libx264"
     VIDEO_PIXEL_FORMAT: str = "yuv444p"
-    VIDEO_CRF: int = 23
-    VIDEO_PRESET: str = "faster"
+    VIDEO_CRF: int = Field(default=23, ge=0, le=51)
+    VIDEO_PRESET: Literal[
+        "ultrafast", "superfast", "veryfast", "faster", "fast",
+        "medium", "slow", "slower", "veryslow", "placebo",
+    ] = "faster"
     VIDEO_GOP_SIZE: int = 48  # keyframe interval (frames); bounds max crash loss to 1 GOP
-    SCREENSHOT_JPEG_QUALITY: int = 85
+    SCREENSHOT_JPEG_QUALITY: int = Field(default=85, ge=1, le=95)
     # sequences that when typed, will stop the recording of ActionEvents
     STOP_SEQUENCES: list[list[str]] = [
         list(stop_str) for stop_str in STOP_STRS

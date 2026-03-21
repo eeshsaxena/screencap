@@ -116,6 +116,7 @@ class TestWriteScreenEvent:
 
         with mock.patch("sc_engine.recorder.config") as mock_config:
             mock_config.RECORD_IMAGES = True
+            mock_config.SCREENSHOT_JPEG_QUALITY = 85
             from sc_engine.recorder import write_screen_event
 
             state = write_screen_event(
@@ -144,6 +145,7 @@ class TestWriteScreenEvent:
         with mock.patch("sc_engine.recorder.crud") as mock_crud, \
              mock.patch("sc_engine.recorder.config") as mock_config:
             mock_config.RECORD_IMAGES = True
+            mock_config.SCREENSHOT_JPEG_QUALITY = 85
             state = write_screen_event(
                 db, recording, event, perf_q,
                 screenshots_dir=str(screenshots_dir),
@@ -170,6 +172,7 @@ class TestWriteScreenEvent:
         with mock.patch("sc_engine.recorder.crud") as mock_crud, \
              mock.patch("sc_engine.recorder.config") as mock_config:
             mock_config.RECORD_IMAGES = True
+            mock_config.SCREENSHOT_JPEG_QUALITY = 85
             from sc_engine.recorder import write_screen_event
 
             state = write_screen_event(

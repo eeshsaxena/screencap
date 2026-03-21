@@ -199,11 +199,9 @@ def _extract_all_frames(video_path: Path) -> list[Image.Image]:
     """Decode all frames from a video file, avoiding timestamp tolerance issues."""
     import av
 
-    container = av.open(str(video_path))
-    stream = container.streams.video[0]
-    frames = [frame.to_image() for frame in container.decode(stream)]
-    container.close()
-    return frames
+    with av.open(str(video_path)) as container:
+        stream = container.streams.video[0]
+        return [frame.to_image() for frame in container.decode(stream)]
 
 
 def benchmark_config(
@@ -454,7 +452,8 @@ def save_side_by_side(
             if extracted:
                 crop = extracted[0].crop(crop_box)
                 crops.append((r.label, crop))
-        except Exception:
+        except Exception as exc:
+            print(f"  Warning: could not extract frame for {r.label}: {exc}")
             continue
 
     if len(crops) < 2:
@@ -470,13 +469,17 @@ def save_side_by_side(
     canvas_h = rows * tile_h
 
     canvas = Image.new("RGB", (canvas_w, canvas_h), (255, 255, 255))
+    from PIL import ImageDraw
 
-    for idx, (_label, crop_img) in enumerate(crops):
+    draw = ImageDraw.Draw(canvas)
+
+    for idx, (label, crop_img) in enumerate(crops):
         col = idx % cols
         row = idx // cols
         x_off = col * crop_w
-        y_off = row * tile_h + label_height
-        canvas.paste(crop_img, (x_off, y_off))
+        y_off = row * tile_h
+        draw.text((x_off + 4, y_off + 4), label, fill=(0, 0, 0))
+        canvas.paste(crop_img, (x_off, y_off + label_height))
 
     output_path = output_dir / "side_by_side.png"
     canvas.save(output_path)
