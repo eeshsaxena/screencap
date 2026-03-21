@@ -1867,6 +1867,10 @@ def read_gesture_events(
     NS_EVENT_TYPE_SWIPE = 31
     NS_EVENT_TYPE_SMART_MAGNIFY = 32
 
+    # CGEventTap sentinel types — macOS delivers these when a tap is disabled.
+    _TAP_DISABLED_BY_TIMEOUT = Quartz.kCGEventTapDisabledByTimeout
+    _TAP_DISABLED_BY_USER_INPUT = Quartz.kCGEventTapDisabledByUserInput
+
     # CGEventTap mask: type 29 (NSEventTypeGesture) for trackpad gestures,
     # plus mouse event types for pressure extraction (Force Touch / tablet).
     gesture_mask = (
@@ -1908,6 +1912,16 @@ def read_gesture_events(
         (for pressure extraction from Force Touch trackpads and tablets).
         """
         global _current_pressure, _current_modifier_flags, _current_scroll_phase, _current_momentum_phase, _current_is_continuous
+
+        # Handle tap-disabled sentinel events before any NSEvent conversion.
+        # macOS delivers these when the tap is auto-disabled (e.g. callback
+        # took too long or SecureInput activated). Re-enable immediately
+        # rather than waiting for the periodic timer (up to 500ms).
+        if event_type in (_TAP_DISABLED_BY_TIMEOUT, _TAP_DISABLED_BY_USER_INPUT):
+            logger.debug("Gesture event tap disabled (type=%s), re-enabling", event_type)
+            Quartz.CGEventTapEnable(tap, True)
+            return cg_event
+
         try:
             ns_event = NSEvent.eventWithCGEvent_(cg_event)
             if ns_event is None:
@@ -2341,7 +2355,9 @@ def record(
                  _q.kCGHeadInsertEventTap, _q.kCGEventTapOptionListenOnly,
                  _q.CGEventTapEnable, _q.CGEventTapIsEnabled,
                  _q.CGEventGetLocation, _q.CFAbsoluteTimeGetCurrent,
-                 _q.CGEventGetFlags, _q.CGEventGetIntegerValueField)
+                 _q.CGEventGetFlags, _q.CGEventGetIntegerValueField,
+                 _q.kCGEventTapDisabledByTimeout,
+                 _q.kCGEventTapDisabledByUserInput)
             _ = _ns.eventWithCGEvent_
         except (ImportError, AttributeError):
             pass  # pyobjc not available; gesture capture will be skipped
