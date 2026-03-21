@@ -1,7 +1,7 @@
 """Event processing pipeline for merging raw events into higher-level actions.
 
 This module ports legacy event processing functions to work with
-the screencap-engine Pydantic event models.
+the screencap engine Pydantic event models.
 """
 
 from __future__ import annotations

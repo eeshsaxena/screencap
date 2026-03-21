@@ -1,1 +1,1 @@
-"""Tests for screencap-engine."""
+"""Tests for screencap engine."""

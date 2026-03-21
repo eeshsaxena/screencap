@@ -1,4 +1,4 @@
-"""Command-line interface for screencap-engine.
+"""Command-line interface for screencap engine.
 
 Usage:
     capture record ./my_capture

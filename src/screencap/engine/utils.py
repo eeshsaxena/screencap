@@ -1,4 +1,4 @@
-"""Utility functions for screencap-engine.
+"""Utility functions for screencap engine.
 
 Timestamp management, screenshot capture,
 and multiprocessing helpers. Only import paths are changed.

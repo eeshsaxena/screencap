@@ -516,6 +516,14 @@ class _SwitchingScreenFilter:
         self._call_count += 1
         return self._call_count <= self._allow_count
 
+    def get_capture_disposition(self, timestamp=None):
+        allowed = self.is_screen_allowed(timestamp)
+        return _CaptureDisposition(
+            screen_allowed=allowed,
+            video_allowed=allowed,
+            keystrokes_allowed=allowed,
+        )
+
     def on_window_event(self, data):
         pass
 
@@ -524,6 +532,15 @@ class _SwitchingScreenFilter:
 
     def fail_closed(self):
         pass
+
+
+class _CaptureDisposition:
+    __slots__ = ("screen_allowed", "video_allowed", "keystrokes_allowed")
+
+    def __init__(self, screen_allowed, video_allowed, keystrokes_allowed):
+        self.screen_allowed = screen_allowed
+        self.video_allowed = video_allowed
+        self.keystrokes_allowed = keystrokes_allowed
 
     def null_keystroke_content(self, data):
         pass

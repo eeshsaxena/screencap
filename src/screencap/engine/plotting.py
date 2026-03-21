@@ -1,7 +1,7 @@
 """Plotting utilities for performance visualization.
 
 Only the plot_performance function
-and its dependencies. Import paths adapted for screencap-engine.
+and its dependencies. Import paths adapted for screencap engine.
 """
 
 import os

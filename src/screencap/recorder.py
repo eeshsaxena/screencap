@@ -1,4 +1,4 @@
-"""Wrap screencap-engine Recorder for screencap."""
+"""Wrap screencap engine Recorder for screencap."""
 
 from __future__ import annotations
 
