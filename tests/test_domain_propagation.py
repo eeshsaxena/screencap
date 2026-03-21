@@ -356,7 +356,7 @@ class TestBuildBlockedIntervalsDomain:
     def test_banking_domain_produces_blocked_interval(self):
         from screencap.privacy.context import DefaultContextClassifier
         from screencap.privacy.policy import DefaultPolicyEvaluator
-        from screencap.scrubber import _build_blocked_intervals
+        from screencap.scrub_pipeline import build_blocked_intervals as _build_blocked_intervals
 
         config = _make_config()
         evaluator = DefaultPolicyEvaluator(config)
@@ -385,7 +385,7 @@ class TestBuildBlockedIntervalsDomain:
     def test_safe_domain_no_blocked_interval(self):
         from screencap.privacy.context import DefaultContextClassifier
         from screencap.privacy.policy import DefaultPolicyEvaluator
-        from screencap.scrubber import _build_blocked_intervals
+        from screencap.scrub_pipeline import build_blocked_intervals as _build_blocked_intervals
 
         config = _make_config()
         evaluator = DefaultPolicyEvaluator(config)
@@ -409,7 +409,8 @@ class TestNullDbBrowserUrl:
     """_null_db_rows_for_intervals NULLs browser_url during blocked intervals."""
 
     def test_browser_url_nulled_in_blocked_interval(self, tmp_path):
-        from screencap.scrubber import ScrubResult, _BlockedInterval, _null_db_rows_for_intervals
+        from screencap.scrub_pipeline import BlockedInterval as _BlockedInterval, ScrubResult
+        from screencap.scrubber import _null_db_rows_for_intervals
 
         db_path = tmp_path / "recording.db"
         _create_recording_db(db_path, with_browser_url=True)
@@ -453,7 +454,8 @@ class TestNullDbBrowserUrl:
 
     def test_old_db_without_browser_url_no_crash(self, tmp_path):
         """Old DBs without browser_url column don't crash."""
-        from screencap.scrubber import ScrubResult, _BlockedInterval, _null_db_rows_for_intervals
+        from screencap.scrub_pipeline import BlockedInterval as _BlockedInterval, ScrubResult
+        from screencap.scrubber import _null_db_rows_for_intervals
 
         db_path = tmp_path / "recording.db"
         _create_recording_db(db_path, with_browser_url=False)
@@ -483,7 +485,7 @@ class TestNullEventContentWindowSwitch:
     """_null_event_content nulls window_title and domain on window.switch events."""
 
     def test_window_switch_fields_nulled(self):
-        from screencap.scrubber import _null_event_content
+        from screencap.scrub_pipeline import null_event_content as _null_event_content
 
         event = {
             "type": "window.switch",
@@ -500,7 +502,7 @@ class TestNullEventContentWindowSwitch:
         assert event["timestamp"] == 1.0
 
     def test_non_window_event_unchanged(self):
-        from screencap.scrubber import _null_event_content
+        from screencap.scrub_pipeline import null_event_content as _null_event_content
 
         event = {
             "type": "key.type",

@@ -721,6 +721,9 @@ class ChunkProcessor:
                 )
             except Exception:
                 logger.warning(f"Screenshot masking failed for chunk {idx}", exc_info=True)
+                # Fail-closed: delete all unmasked screenshots before upload
+                for img in screenshots_dir.glob("*.jpg"):
+                    img.unlink(missing_ok=True)
 
         # G6: Log audit entries
         if scrub_result.audit_entries:

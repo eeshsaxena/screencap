@@ -16,6 +16,7 @@ from screencap.scrub_pipeline import (
     ScrubContext,
     ScrubResult,
     build_scrub_context,
+    mask_screenshots,
     scrub_events_jsonl,
     scrub_transcripts,
 )
@@ -466,3 +467,97 @@ class TestBuildScrubContext:
 
         ctx = build_scrub_context(db_path)
         assert ctx.blocked_intervals == []
+
+
+# ---------------------------------------------------------------------------
+# G4: Shared mask_screenshots integration
+# ---------------------------------------------------------------------------
+
+
+class TestMaskScreenshotsIntegration:
+    """G4: mask_screenshots is the shared function used by both callers."""
+
+    def _make_jpeg(self, path):
+        from PIL import Image
+        img = Image.new("RGB", (100, 80), (255, 255, 255))
+        img.save(path, "JPEG")
+
+    def test_exclude_app_deletes_screenshot(self, tmp_path):
+        """EXCLUDE app screenshot is deleted by mask_screenshots."""
+        from screencap.privacy.context import DefaultContextClassifier, WindowContext
+        from screencap.privacy.policy import DefaultPolicyEvaluator, parse_privacy_config
+
+        screenshots_dir = tmp_path / "screenshots"
+        screenshots_dir.mkdir()
+        self._make_jpeg(screenshots_dir / "5.0.jpg")
+
+        cfg = parse_privacy_config({"privacy": {
+            "mode": "public",
+            "exclude_apps": ["com.1password.1password"],
+        }})
+        evaluator = DefaultPolicyEvaluator(cfg)
+        classifier = DefaultContextClassifier()
+        window_events = [
+            WindowContext(timestamp=1.0, app_bundle_id="com.1password.1password", title="")
+        ]
+
+        ctx = ScrubContext(
+            window_events=window_events,
+            evaluator=evaluator,
+            classifier=classifier,
+        )
+        result = ScrubResult()
+        mask_screenshots(screenshots_dir, ctx, result=result)
+
+        assert not (screenshots_dir / "5.0.jpg").exists()
+        assert len(result.audit_entries) == 1
+        assert result.audit_entries[0].action == "exclude"
+
+    def test_mask_window_app_keeps_masked_file(self, tmp_path):
+        """MASK_WINDOW app screenshot is kept but content is masked."""
+        from PIL import Image
+
+        from screencap.privacy.context import DefaultContextClassifier, WindowContext
+        from screencap.privacy.policy import DefaultPolicyEvaluator, parse_privacy_config
+
+        screenshots_dir = tmp_path / "screenshots"
+        screenshots_dir.mkdir()
+        img_path = screenshots_dir / "5.0.jpg"
+        self._make_jpeg(img_path)
+        original = Image.open(img_path).convert("L")
+        original_brightness = sum(original.getdata()) / len(list(original.getdata()))
+        original.close()
+
+        cfg = parse_privacy_config({"privacy": {"mode": "public"}})
+        evaluator = DefaultPolicyEvaluator(cfg)
+        classifier = DefaultContextClassifier()
+        window_events = [
+            WindowContext(timestamp=1.0, app_bundle_id="com.tinyspeck.slackmacgap", title="Slack")
+        ]
+
+        ctx = ScrubContext(
+            window_events=window_events,
+            evaluator=evaluator,
+            classifier=classifier,
+        )
+        result = ScrubResult()
+        mask_screenshots(screenshots_dir, ctx, result=result)
+
+        assert img_path.exists(), "MASK_WINDOW should keep the file"
+        masked = Image.open(img_path).convert("L")
+        masked_brightness = sum(masked.getdata()) / len(list(masked.getdata()))
+        masked.close()
+        assert masked_brightness < original_brightness * 0.3
+
+    def test_no_evaluator_is_noop(self, tmp_path):
+        """mask_screenshots with no evaluator does nothing."""
+        screenshots_dir = tmp_path / "screenshots"
+        screenshots_dir.mkdir()
+        self._make_jpeg(screenshots_dir / "5.0.jpg")
+
+        ctx = ScrubContext()  # no evaluator/classifier
+        result = ScrubResult()
+        mask_screenshots(screenshots_dir, ctx, result=result)
+
+        assert (screenshots_dir / "5.0.jpg").exists()
+        assert len(result.audit_entries) == 0

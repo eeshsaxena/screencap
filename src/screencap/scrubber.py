@@ -18,65 +18,18 @@ from screencap.privacy.actions import KEYSTROKE_CONTENT_FIELDS, PrivacyAction
 from screencap.privacy.reasons import AuditEntry, ReasonCode
 from screencap.scrub_pipeline import (
     BlockedInterval,
-    ElementStateDetection,
     ScrubContext,
     ScrubResult,
-    build_blocked_intervals,
     build_scrub_context,
-    build_secure_field_intervals,
     build_xref_lookup,
-    find_blocked_interval,
     mask_screenshots,
-    merge_intervals,
-    null_event_content,
     scrub_events_jsonl,
-    scrub_manifest,
     scrub_text,
     scrub_transcripts,
     _scrub_json_recursive,
 )
 
 console = Console()
-
-# Backward-compat aliases for tests that import private names.
-# Pipeline types/functions are re-exported under their old names.
-_BlockedInterval = BlockedInterval
-_ElementStateDetection = ElementStateDetection
-_build_blocked_intervals = build_blocked_intervals
-_build_secure_field_intervals = build_secure_field_intervals
-_merge_intervals = merge_intervals
-_find_blocked_interval = find_blocked_interval
-_null_event_content = null_event_content
-_build_xref_lookup = build_xref_lookup
-
-# Re-export pipeline's private functions for test compat.
-from screencap.scrub_pipeline import (
-    _cross_reference_key_type,
-    _scrub_transcript_json,
-    _scrub_transcript_txt,
-)
-
-
-def _scrub_screenshots_with_policy(
-    dst: Path,
-    evaluator,
-    classifier,
-    window_events,
-    result: ScrubResult,
-    db_path: Path | None = None,
-    pixel_ratio: float = 2.0,
-) -> None:
-    """Backward-compat wrapper — delegates to ``mask_screenshots``."""
-    ctx = ScrubContext(
-        window_events=window_events,
-        evaluator=evaluator,
-        classifier=classifier,
-        pixel_ratio=pixel_ratio,
-    )
-    mask_screenshots(
-        dst / "screenshots", ctx,
-        db_path=db_path, result=result,
-    )
 
 
 def _build_app_allowlist(metrics_path: Path) -> frozenset[str]:
@@ -115,7 +68,7 @@ def _copytree_ignore(directory: str, entries: list[str]) -> set[str]:
 
 
 def _null_db_rows_for_intervals(
-    dst: Path, intervals: list[_BlockedInterval], result: ScrubResult
+    dst: Path, intervals: list[BlockedInterval], result: ScrubResult
 ) -> None:
     """Null out action_event and window_event columns during blocked-app intervals."""
     if not intervals:
@@ -502,8 +455,7 @@ def _scrub_events_jsonl(
     pipeline,
     anonymizer,
     result: ScrubResult,
-    blocked_intervals: list[BlockedInterval] | None = None,
-    xref_detections: list[ElementStateDetection] | None = None,
+    ctx: ScrubContext | None = None,
 ) -> None:
     """Scrub combined keystroke sequences in events.jsonl and map back to DB.
 
@@ -519,8 +471,7 @@ def _scrub_events_jsonl(
             events_file,
             pipeline,
             anonymizer,
-            blocked_intervals=blocked_intervals,
-            xref_detections=xref_detections,
+            ctx=ctx,
             db_dir=dst,
             result=result,
         )
@@ -729,14 +680,13 @@ def scrub_recording(
         raw_detections = _scrub_db(dst, pipeline, anonymizer, result)
 
     # 12b. Build cross-reference lookup from element_state detections
-    xref_detections = build_xref_lookup(raw_detections)
+    scrub_ctx.xref_detections = build_xref_lookup(raw_detections)
 
     # 13. Scrub combined keystroke sequences in events.jsonl
     with console.status("Scrubbing keystroke sequences..."):
         try:
             _scrub_events_jsonl(
-                dst, pipeline, anonymizer, result, scrub_ctx.blocked_intervals,
-                xref_detections=xref_detections,
+                dst, pipeline, anonymizer, result, ctx=scrub_ctx,
             )
         except Exception as exc:
             console.print(

@@ -28,14 +28,17 @@ from screencap.privacy.policy import (
     parse_privacy_config,
 )
 from screencap.privacy.reasons import AuditEntry
-from screencap.scrubber import (
+from screencap.scrub_pipeline import (
+    BlockedInterval as _BlockedInterval,
+    ScrubContext,
     ScrubResult,
-    _BlockedInterval,
-    _build_blocked_intervals,
-    _build_secure_field_intervals,
+    build_blocked_intervals as _build_blocked_intervals,
+    build_secure_field_intervals as _build_secure_field_intervals,
+    mask_screenshots,
+)
+from screencap.scrubber import (
     _null_db_rows_for_intervals,
     _scrub_events_jsonl,
-    _scrub_screenshots_with_policy,
     _write_audit_log,
 )
 
@@ -125,6 +128,17 @@ class TestScreenshotRouting:
             (screenshots_dir / f"{ts}.jpg").write_bytes(b"\xff\xd8\xff")
         return tmp_path
 
+    def _mask(self, dst, evaluator, classifier, window_events, result, **kwargs):
+        ctx = ScrubContext(
+            window_events=window_events,
+            evaluator=evaluator,
+            classifier=classifier,
+            pixel_ratio=kwargs.get("pixel_ratio", 2.0),
+        )
+        mask_screenshots(dst / "screenshots", ctx, result=result, **{
+            k: v for k, v in kwargs.items() if k != "pixel_ratio"
+        })
+
     def test_excluded_app_screenshot_deleted(self, tmp_path):
         """Screenshot during 1Password frontmost period → file deleted."""
         dst = self._setup_screenshots(tmp_path, [22.0])
@@ -139,9 +153,7 @@ class TestScreenshotRouting:
         ])
         result = ScrubResult()
 
-        _scrub_screenshots_with_policy(
-            dst, evaluator, classifier, window_events, result
-        )
+        self._mask(dst, evaluator, classifier, window_events, result)
 
         assert not (dst / "screenshots" / "22.0.jpg").exists()
 
@@ -155,9 +167,7 @@ class TestScreenshotRouting:
         ])
         result = ScrubResult()
 
-        _scrub_screenshots_with_policy(
-            dst, evaluator, classifier, window_events, result
-        )
+        self._mask(dst, evaluator, classifier, window_events, result)
 
         assert (dst / "screenshots" / "15.0.jpg").exists()
 
@@ -180,9 +190,7 @@ class TestScreenshotRouting:
         ])
         result = ScrubResult()
 
-        _scrub_screenshots_with_policy(
-            dst, evaluator, classifier, window_events, result
-        )
+        self._mask(dst, evaluator, classifier, window_events, result)
 
         assert img_path.exists(), "OCR_FALLBACK should mask, not delete"
         assert len(result.audit_entries) == 1
@@ -201,9 +209,7 @@ class TestScreenshotRouting:
         ])
         result = ScrubResult()
 
-        _scrub_screenshots_with_policy(
-            dst, evaluator, classifier, window_events, result
-        )
+        self._mask(dst, evaluator, classifier, window_events, result)
 
         assert len(result.audit_entries) == 1
         entry = result.audit_entries[0]
@@ -262,7 +268,7 @@ class TestEventsJsonlBlockedIntervals:
         ]
         result = ScrubResult()
 
-        _scrub_events_jsonl(rec, pipeline, anonymizer, result, intervals)
+        _scrub_events_jsonl(rec, pipeline, anonymizer, result, ctx=ScrubContext(blocked_intervals=intervals))
 
         lines = [
             json.loads(l)
@@ -300,7 +306,7 @@ class TestEventsJsonlBlockedIntervals:
         ]
         result = ScrubResult()
 
-        _scrub_events_jsonl(rec, pipeline, anonymizer, result, intervals)
+        _scrub_events_jsonl(rec, pipeline, anonymizer, result, ctx=ScrubContext(blocked_intervals=intervals))
 
         lines = [
             json.loads(l)
@@ -612,7 +618,7 @@ class TestNestedEventNulling:
             )
         ]
         result = ScrubResult()
-        _scrub_events_jsonl(rec, pipeline, anonymizer, result, intervals)
+        _scrub_events_jsonl(rec, pipeline, anonymizer, result, ctx=ScrubContext(blocked_intervals=intervals))
 
         output = [
             json.loads(l)

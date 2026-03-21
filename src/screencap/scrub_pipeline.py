@@ -149,7 +149,7 @@ def build_blocked_intervals(
     evaluator,
     classifier,
 ) -> list[BlockedInterval]:
-    """Build intervals where the frontmost app triggers EXCLUDE or MASK_WINDOW.
+    """Build intervals where the frontmost app triggers EXCLUDE.
 
     Each window event defines a period from its timestamp to the next
     window event's timestamp (or infinity for the last event).
@@ -216,6 +216,8 @@ def build_secure_field_intervals(
     own_conn = conn is None
     if own_conn:
         _conn = sqlite3.connect(str(db_path))
+        _conn.execute("PRAGMA busy_timeout=5000")
+        _conn.execute("PRAGMA query_only=ON")
     else:
         _conn = conn
 
@@ -529,19 +531,8 @@ def build_scrub_context(
     if db_path is None:
         return ctx
 
-    # Read pixel_ratio from DB if not provided
     if pixel_ratio is not None:
         ctx.pixel_ratio = pixel_ratio
-    else:
-        try:
-            with sqlite3.connect(str(db_path)) as pr_conn:
-                pr_row = pr_conn.execute(
-                    "SELECT pixel_ratio FROM recording LIMIT 1"
-                ).fetchone()
-                if pr_row and pr_row[0]:
-                    ctx.pixel_ratio = float(pr_row[0])
-        except (sqlite3.OperationalError, ValueError):
-            pass  # keep default 2.0
 
     # Open a read-only connection for context queries
     conn: sqlite3.Connection | None = None
@@ -549,6 +540,17 @@ def build_scrub_context(
         conn = sqlite3.connect(str(db_path))
         conn.execute("PRAGMA busy_timeout=5000")
         conn.execute("PRAGMA query_only=ON")
+
+        # Read pixel_ratio from DB if not provided
+        if pixel_ratio is None:
+            try:
+                pr_row = conn.execute(
+                    "SELECT pixel_ratio FROM recording LIMIT 1"
+                ).fetchone()
+                if pr_row and pr_row[0]:
+                    ctx.pixel_ratio = float(pr_row[0])
+            except (sqlite3.OperationalError, ValueError):
+                pass  # keep default 2.0
 
         # Load window events
         from screencap.privacy.context import load_window_events
