@@ -865,10 +865,10 @@ def export(name, all_recordings, downloads, output, use_stdout, exclude_moves):
     count = _export_one(recording_dir, output_path, exclude_moves, err_console)
     if count < 0:
         sys.exit(1)
-    if count == 0:
-        err_console.print("[yellow]Warning:[/yellow] Recording contains no events.")
     if output_path:
         err_console.print(f"Exported {count} events to [bold]{output_path}[/bold]")
+    if count == 0:
+        err_console.print("[yellow]Warning:[/yellow] Recording contains no events.")
 
 
 @cli.command()
