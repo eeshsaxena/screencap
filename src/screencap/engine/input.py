@@ -16,7 +16,7 @@ from pynput import mouse as _pynput_mouse
 if TYPE_CHECKING:
     from pynput import keyboard, mouse
 
-from sc_engine.events import (
+from screencap.engine.events import (
     KeyDownEvent,
     KeyUpEvent,
     MouseButton,

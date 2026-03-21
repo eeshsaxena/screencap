@@ -8,7 +8,7 @@ from typing import Any
 
 from loguru import logger
 
-from sc_engine.config import config
+from screencap.engine.config import config
 
 impl = None
 try:

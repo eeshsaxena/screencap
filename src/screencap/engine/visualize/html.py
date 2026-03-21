@@ -15,7 +15,7 @@ from typing import TYPE_CHECKING
 if TYPE_CHECKING:
     from PIL import Image
 
-    from sc_engine.capture import CaptureSession
+    from screencap.engine.capture import CaptureSession
 
 
 def _even_indices(n: int, k: int) -> list[int]:
@@ -54,7 +54,7 @@ def create_html(
     Returns:
         HTML string if output is None, otherwise None after writing file.
     """
-    from sc_engine.capture import CaptureSession
+    from screencap.engine.capture import CaptureSession
 
     # Treat 0 or negative as "no limit"
     if max_events is not None and max_events <= 0:

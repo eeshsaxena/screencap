@@ -11,7 +11,7 @@ from typing import Any, TypeVar
 
 import os
 
-from sc_engine.events import (
+from screencap.engine.events import (
     ActionEvent,
     BaseEvent,
     Event,
@@ -951,7 +951,7 @@ def get_screen_events(events: list[Event]) -> list[Event]:
     Returns:
         Only screen frame events.
     """
-    from sc_engine.events import ScreenFrameEvent
+    from screencap.engine.events import ScreenFrameEvent
 
     return [e for e in events if isinstance(e, ScreenFrameEvent)]
 
@@ -965,7 +965,7 @@ def get_audio_events(events: list[Event]) -> list[Event]:
     Returns:
         Only audio chunk events.
     """
-    from sc_engine.events import AudioChunkEvent
+    from screencap.engine.events import AudioChunkEvent
 
     return [e for e in events if isinstance(e, AudioChunkEvent)]
 
@@ -994,7 +994,7 @@ def deduplicate_window_events(
     Returns:
         Deduplicated list of WindowSwitchEvent instances.
     """
-    from sc_engine.convert import dict_to_window_switch
+    from screencap.engine.convert import dict_to_window_switch
 
     result: list[WindowSwitchEvent] = []
     last_key: tuple[str | None, str | None] = (None, None)

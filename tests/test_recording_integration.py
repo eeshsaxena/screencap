@@ -31,7 +31,7 @@ _PLENTY_OF_DISK = DiskUsage(total=500e9, used=100e9, free=400e9)
 def create_test_recording_db(db_path, *, base_timestamp=None):
     """Create a recording.db with realistic test data.
 
-    Schema matches sc_engine/db/models.py. Inserts enough events to exercise
+    Schema matches screencap.engine/db/models.py. Inserts enough events to exercise
     the export pipeline: a click pair (→ MouseClickEvent), a keypress pair
     (→ KeyTypeEvent), and a window event (→ WindowSwitchEvent).
     """
@@ -183,7 +183,7 @@ def create_test_recording_db(db_path, *, base_timestamp=None):
 
 
 class FakeRecorder:
-    """Stand-in for sc_engine.Recorder (external hardware boundary).
+    """Stand-in for screencap.engine.Recorder (external hardware boundary).
 
     Creates a recording.db on __enter__ so downstream code (export, catalog)
     works with real data. Sets is_recording=False so the live-display loop
@@ -258,7 +258,7 @@ def recording_env(tmp_path, monkeypatch):
 def test_normal_recording_lifecycle(recording_env):
     """Full lifecycle: start_recording() → immediate stop → verify cleanup.
 
-    Mocked: sc_engine.Recorder (hardware), permissions, disk_usage, orphan
+    Mocked: screencap.engine.Recorder (hardware), permissions, disk_usage, orphan
     scan, metrics.
     Real: config (env vars), pidfile (tmp_path), file I/O.
 
@@ -270,7 +270,7 @@ def test_normal_recording_lifecycle(recording_env):
     pid_file = recording_env["pid_file"]
 
     with (
-        mock.patch("sc_engine.Recorder", FakeRecorder),
+        mock.patch("screencap.engine.Recorder", FakeRecorder),
         mock.patch("screencap.recorder._check_macos_permissions"),
         mock.patch("screencap.pidfile.find_orphaned_processes", return_value=[]),
         mock.patch("shutil.disk_usage", return_value=_PLENTY_OF_DISK),
@@ -324,7 +324,7 @@ def test_normal_recording_lifecycle(recording_env):
 def test_auto_export_produces_valid_events_jsonl(tmp_path):
     """Real export pipeline: recording.db → export_recording() → events.jsonl.
 
-    No mocking — exercises sc_engine.Capture.load() and the full 11-stage
+    No mocking — exercises screencap.engine.Capture.load() and the full 11-stage
     event processing pipeline with real SQLite data.
 
     Covers: B1, B2, B3.
@@ -410,7 +410,7 @@ def test_pidfile_write_read_delete_real_filesystem(tmp_path, monkeypatch):
 def test_chunk_processor_single_chunk_export(tmp_path):
     """ChunkProcessor exports events from a real recording.db.
 
-    Real: recording.db, sqlite3 queries, sc_engine processing pipeline, Queue.
+    Real: recording.db, sqlite3 queries, screencap.engine processing pipeline, Queue.
     Mocked: audio wait, transcription, manifest generation (no real audio/upload).
 
     Covers: C2, C3.
@@ -719,7 +719,7 @@ def _create_multi_chunk_db(db_path, t0):
 def test_multi_chunk_no_event_overlap_or_gaps(tmp_path):
     """Two chunks: events partition cleanly with no overlap or loss.
 
-    Real: recording.db, sqlite3 queries, sc_engine processing pipeline, Queue.
+    Real: recording.db, sqlite3 queries, screencap.engine processing pipeline, Queue.
     Mocked: audio wait, transcription, manifest generation.
 
     Verifies: no event appears in both chunks, no event is lost,
@@ -818,7 +818,7 @@ def test_start_recording_multi_chunk_produces_all_chunk_files(recording_env):
     This test catches the bug where only chunk 0 is processed because
     the Recorder doesn't send rotation messages for subsequent chunks.
 
-    Mocked: sc_engine.Recorder (replaced with FakeChunkedRecorder),
+    Mocked: screencap.engine.Recorder (replaced with FakeChunkedRecorder),
     permissions, disk_usage, orphan scan, metrics.
     Real: config (env vars), pidfile (tmp_path), ChunkProcessor, exporter.
     """
@@ -872,7 +872,7 @@ def test_start_recording_multi_chunk_produces_all_chunk_files(recording_env):
             self.is_recording = False
 
     with (
-        mock.patch("sc_engine.Recorder", FakeChunkedRecorder),
+        mock.patch("screencap.engine.Recorder", FakeChunkedRecorder),
         mock.patch("screencap.recorder._check_macos_permissions"),
         mock.patch("screencap.pidfile.find_orphaned_processes", return_value=[]),
         mock.patch("shutil.disk_usage", return_value=_PLENTY_OF_DISK),
@@ -968,7 +968,7 @@ def test_chunk_processor_survives_queue_close_during_processing(tmp_path):
 def test_non_chunked_recording_no_chunk_processor(recording_env):
     """chunk_duration=0 disables chunking: no ChunkProcessor, no chunk_* files.
 
-    Mocked: sc_engine.Recorder (hardware), permissions, disk_usage, orphan
+    Mocked: screencap.engine.Recorder (hardware), permissions, disk_usage, orphan
     scan, metrics.
     Real: config (env vars), pidfile (tmp_path), file I/O.
     """
@@ -977,7 +977,7 @@ def test_non_chunked_recording_no_chunk_processor(recording_env):
     rec_dir = recording_env["recordings_dir"] / "test-no-chunks"
 
     with (
-        mock.patch("sc_engine.Recorder", FakeRecorder),
+        mock.patch("screencap.engine.Recorder", FakeRecorder),
         mock.patch("screencap.recorder._check_macos_permissions"),
         mock.patch("screencap.pidfile.find_orphaned_processes", return_value=[]),
         mock.patch("shutil.disk_usage", return_value=_PLENTY_OF_DISK),

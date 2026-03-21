@@ -54,11 +54,11 @@ def delete_pidfile() -> None:
 
 
 def _is_screencap_process(pid: int) -> bool:
-    """Check if a PID is actually a screencap/sc_engine process."""
+    """Check if a PID is actually a screencap process."""
     try:
         proc = psutil.Process(pid)
         cmdline = " ".join(proc.cmdline()).lower()
-        return "sc_engine" in cmdline or "screencap" in cmdline
+        return "screencap" in cmdline
     except (psutil.NoSuchProcess, psutil.AccessDenied, psutil.ZombieProcess):
         return False
 
@@ -95,7 +95,7 @@ def find_orphaned_processes() -> list[dict[str, int | str]]:
             cmdline = " ".join(proc.info.get("cmdline") or []).lower()
             if (
                 proc.pid != os.getpid()
-                and ("sc_engine" in cmdline or "screencap" in cmdline)
+                and "screencap" in cmdline
                 and "recorder" in cmdline
             ):
                 orphans.append({"pid": proc.pid, "name": proc.info.get("name", "unknown")})

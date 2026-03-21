@@ -33,7 +33,7 @@ def record(
     """
     import time
 
-    from sc_engine.recorder import Recorder
+    from screencap.engine.recorder import Recorder
 
     output_dir = str(Path(output_dir).resolve())
 
@@ -85,8 +85,8 @@ def visualize(
     import subprocess
     import sys
 
-    from sc_engine.visualize import create_demo, create_html
-    from sc_engine.visualize.html import (
+    from screencap.engine.visualize import create_demo, create_html
+    from screencap.engine.visualize.html import (
         DEFAULT_VIEWER_FRAME_QUALITY,
         DEFAULT_VIEWER_FRAME_SCALE,
         DEFAULT_VIEWER_MAX_EVENTS,
@@ -128,7 +128,7 @@ def info(capture_dir: str) -> None:
     Args:
         capture_dir: Path to capture directory.
     """
-    from sc_engine.capture import CaptureSession
+    from screencap.engine.capture import CaptureSession
 
     capture = CaptureSession.load(capture_dir)
 
@@ -189,7 +189,7 @@ def transcribe(
 
     # Auto-detect backend if not specified
     if backend == "auto":
-        from sc_engine.audio import _get_best_transcription_backend
+        from screencap.engine.audio import _get_best_transcription_backend
         backend = _get_best_transcription_backend()
         print(f"Auto-detected backend: {backend}")
 
@@ -212,7 +212,7 @@ def _transcribe_api(
 ) -> None:
     """Transcribe using OpenAI Whisper API."""
 
-    from sc_engine.config import settings
+    from screencap.engine.config import settings
 
     if not settings.openai_api_key:
         print("OpenAI API key not found.")
@@ -377,7 +377,7 @@ def share(action: str, path_or_code: str, output_dir: str = ".") -> None:
         capture share receive 7-guitarist-revenge
         capture share receive 7-guitarist-revenge ./recordings
     """
-    from sc_engine.share import receive, send
+    from screencap.engine.share import receive, send
 
     if action == "send":
         send(path_or_code)

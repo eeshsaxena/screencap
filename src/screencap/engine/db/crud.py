@@ -7,7 +7,7 @@ import sqlalchemy as sa
 from loguru import logger
 from sqlalchemy.orm import Session as SaSession
 
-from sc_engine.db.models import (
+from screencap.engine.db.models import (
     ActionEvent,
     AudioInfo,
     MemoryStat,

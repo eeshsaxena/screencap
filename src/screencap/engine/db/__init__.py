@@ -100,7 +100,7 @@ def create_db(db_path: str, echo: bool = False) -> tuple:
     engine = get_engine(db_url, echo=echo)
 
     # Import models to ensure they are registered with Base
-    from sc_engine.db import models  # noqa: F401
+    from screencap.engine.db import models  # noqa: F401
 
     Base.metadata.create_all(engine)
     Session = get_session_maker(engine)
@@ -147,7 +147,7 @@ def _migrate_schema(db_path: str) -> None:
     """
     import sqlite3
 
-    from sc_engine.db import models  # noqa: F401 — registers models
+    from screencap.engine.db import models  # noqa: F401 — registers models
 
     conn = sqlite3.connect(db_path)
     cur = conn.cursor()

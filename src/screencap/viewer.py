@@ -125,8 +125,8 @@ def open_viewer(
         else:
             console.print("[dim]viewer.html not found, generating...[/dim]")
         try:
-            from sc_engine import create_html
-            from sc_engine.visualize.html import (
+            from screencap.engine import create_html
+            from screencap.engine.visualize.html import (
                 DEFAULT_VIEWER_FRAME_QUALITY,
                 DEFAULT_VIEWER_FRAME_SCALE,
             )

@@ -261,7 +261,7 @@ def _suppress_output() -> None:
     os.environ["SC_LOG_LEVEL"] = "ERROR"
     os.environ["TQDM_DISABLE"] = "1"
     # Override loguru directly in the main process — the env var only
-    # takes effect on fresh imports (child processes).  If sc_engine
+    # takes effect on fresh imports (child processes).  If screencap.engine
     # was already imported, loguru is already configured at INFO.
     try:
         from loguru import logger as _sc_logger
@@ -344,7 +344,7 @@ def _check_macos_permissions() -> None:
         return
 
     try:
-        from sc_engine.platform.darwin import DarwinPlatform
+        from screencap.engine.platform.darwin import DarwinPlatform
     except ImportError:
         return
 
@@ -502,7 +502,7 @@ def start_recording(
     capture_dir.mkdir(parents=True, exist_ok=True)
 
     # Suppress loguru/tqdm noise unless --verbose.
-    # Must happen BEFORE any sc_engine import (including the
+    # Must happen BEFORE any screencap.engine import (including the
     # screen-recording permission check below) so the env var is set
     # when the module-level loguru config runs for the first time.
     if not verbose:
@@ -524,7 +524,7 @@ def start_recording(
     status.start()
 
     # Heavy import — deferred here to keep `screencap --help` fast.
-    from sc_engine import Recorder
+    from screencap.engine import Recorder
 
     if Recorder is None:
         status.stop()
@@ -559,7 +559,7 @@ def start_recording(
         # app is frontmost.  If window data capture is disabled (via CLI
         # flag or RECORD_WINDOW_DATA env var), the filter would silently
         # never block anything — warn and skip instead.
-        from sc_engine.config import config as _engine_config
+        from screencap.engine.config import config as _engine_config
 
         _effective_window_data = (
             capture_window_data

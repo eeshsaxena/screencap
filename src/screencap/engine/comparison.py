@@ -162,7 +162,7 @@ def compare_video_to_images(
     Returns:
         ComparisonReport with frame-by-frame comparisons.
     """
-    from sc_engine.video import extract_frames
+    from screencap.engine.video import extract_frames
 
     video_path = Path(video_path)
 

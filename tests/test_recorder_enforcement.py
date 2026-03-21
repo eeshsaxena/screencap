@@ -449,7 +449,7 @@ class TestKeystrokeBlocking:
         is_screen_allowed() → null_keystroke_content() protocol,
         key content is nulled; when allowed, it's preserved.
 
-        This mirrors the process_events() integration in sc_engine:
+        This mirrors the process_events() integration in screencap.engine:
             if not screen_filter.is_screen_allowed():
                 screen_filter.null_keystroke_content(event.data)
         """

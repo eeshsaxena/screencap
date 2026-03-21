@@ -14,7 +14,7 @@ from typing import TYPE_CHECKING, Iterator
 if TYPE_CHECKING:
     from PIL import Image
 
-    from sc_engine.capture import CaptureSession
+    from screencap.engine.capture import CaptureSession
 
 
 def create_demo(
@@ -46,7 +46,7 @@ def create_demo(
     Returns:
         GIF bytes if output is None, otherwise None.
     """
-    from sc_engine.capture import CaptureSession
+    from screencap.engine.capture import CaptureSession
 
     # Load capture if path provided
     if isinstance(capture_or_path, (str, Path)):
@@ -103,7 +103,7 @@ def _generate_frames(
     """
     from PIL import Image
 
-    from sc_engine.visualize.overlays import annotate_frame
+    from screencap.engine.visualize.overlays import annotate_frame
 
     # Get actions with screenshots
     actions = list(capture.actions())

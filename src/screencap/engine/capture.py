@@ -9,13 +9,13 @@ from dataclasses import dataclass
 from pathlib import Path
 from typing import TYPE_CHECKING, Iterator
 
-from sc_engine.convert import dict_to_action_event
-from sc_engine.events import (
+from screencap.engine.convert import dict_to_action_event
+from screencap.engine.events import (
     ActionEvent as PydanticActionEvent,
     BaseEvent,
     WindowSwitchEvent,
 )
-from sc_engine.events import (
+from screencap.engine.events import (
     KeyDownEvent,
     KeyShortcutEvent,
     KeyTypeEvent,
@@ -23,7 +23,7 @@ from sc_engine.events import (
     MouseMoveEvent,
     SpecialKeyEvent,
 )
-from sc_engine.processing import (
+from screencap.engine.processing import (
     deduplicate_window_events,
     interleave_window_events,
     process_events,
@@ -224,8 +224,8 @@ class CaptureSession:
         if not db_path.exists():
             raise FileNotFoundError(f"Capture not found: {capture_dir}")
 
-        from sc_engine.db import get_session_for_path
-        from sc_engine.db.models import Recording
+        from screencap.engine.db import get_session_for_path
+        from screencap.engine.db.models import Recording
 
         session = get_session_for_path(str(db_path))
         try:
@@ -529,7 +529,7 @@ class CaptureSession:
         video_path = self.video_path
         if video_path is not None:
             try:
-                from sc_engine.video import extract_frame
+                from screencap.engine.video import extract_frame
 
                 # Convert to video-relative timestamp
                 video_start = self._recording.video_start_time or self._recording.timestamp
@@ -585,7 +585,7 @@ class CaptureSession:
 
     def _build_screenshot_index(self) -> list[tuple[float, Path]]:
         """Build sorted list of (timestamp, file_path) from DB image_path values."""
-        from sc_engine.db.models import Screenshot
+        from screencap.engine.db.models import Screenshot
 
         index = []
         try:

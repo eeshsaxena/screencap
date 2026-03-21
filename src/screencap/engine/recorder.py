@@ -5,7 +5,7 @@ adaptation for per-capture databases.
 
 Usage:
 
-    $ python -m sc_engine.recorder "<description of task>"
+    $ python -m screencap.engine.recorder "<description of task>"
 
 """
 
@@ -32,19 +32,19 @@ from pympler import tracker
 from pynput import keyboard, mouse
 from tqdm import tqdm
 
-from sc_engine import utils, video, window
-from sc_engine.window.ax_browser_url import (
+from screencap.engine import utils, video, window
+from screencap.engine.window.ax_browser_url import (
     ALL_KNOWN_BROWSER_BUNDLES as _BROWSER_BUNDLES,
     extract_browser_url,
     invalidate_url_cache,
 )
-from sc_engine.ax_cache import AXQueryCache
-from sc_engine.config import RecordingConfig, config
-from sc_engine.dedup import dhash, hamming_distance
-from sc_engine.retention import RetentionDecision, ScreenRetentionFilter
-from sc_engine.db import create_db, crud, get_session_for_path
-from sc_engine.db.models import ActionEvent, Recording
-from sc_engine.extensions import synchronized_queue as sq
+from screencap.engine.ax_cache import AXQueryCache
+from screencap.engine.config import RecordingConfig, config
+from screencap.engine.dedup import dhash, hamming_distance
+from screencap.engine.retention import RetentionDecision, ScreenRetentionFilter
+from screencap.engine.db import create_db, crud, get_session_for_path
+from screencap.engine.db.models import ActionEvent, Recording
+from screencap.engine.extensions import synchronized_queue as sq
 
 try:
     import soundfile
@@ -826,7 +826,7 @@ def write_events(
         config_overrides: Optional dict of config overrides to apply in child process.
             Spawn mode on macOS re-imports modules, losing in-memory config changes.
     """
-    from sc_engine.config import apply_config_overrides
+    from screencap.engine.config import apply_config_overrides
     apply_config_overrides(config_overrides)
 
     utils.set_start_time(recording.timestamp)
@@ -1306,7 +1306,7 @@ def read_screen_events(
     _get_geometries = None
     _display_bounds = None
     try:
-        from sc_engine.window._macos import get_all_window_geometries, get_main_display_bounds
+        from screencap.engine.window._macos import get_all_window_geometries, get_main_display_bounds
         _get_geometries = get_all_window_geometries
         _display_bounds = get_main_display_bounds()  # (origin_x, origin_y, width, height)
     except (ImportError, OSError):
@@ -1432,7 +1432,7 @@ def read_window_events(
         ] != prev_window_data.get("window_id"):
             # TODO: fix exception sometimes triggered by the next line on win32:
             #   File "\Python39\lib\threading.py" line 917, in run
-            #   File "sc_engine/recorder.py" in read window events
+            #   File "screencap.engine/recorder.py" in read window events
             #   File "...\env\lib\site-packages\loguru\logger.py" line 1977, in info
             #   File "...\env\lib\site-packages\loguru\_logger.py", line 1964, in _log
             #       for handler in core.handlers.values):
@@ -1622,7 +1622,7 @@ def create_recording(
     os.makedirs(capture_dir, exist_ok=True)
     db_path = os.path.join(capture_dir, "recording.db")
 
-    from sc_engine.platform import get_display_pixel_ratio
+    from screencap.engine.platform import get_display_pixel_ratio
 
     timestamp = utils.set_start_time()
     monitor_width, monitor_height = utils.get_monitor_dims()
@@ -2324,7 +2324,7 @@ def record(
     # Build config overrides dict to propagate to spawned child processes.
     # On macOS, spawn mode re-imports modules, losing in-memory config changes.
     if recording_config is not None:
-        from sc_engine.config import build_config_overrides
+        from screencap.engine.config import build_config_overrides
         _config_overrides = build_config_overrides(recording_config)
     else:
         _config_overrides = None
@@ -2791,7 +2791,7 @@ def record(
     # disabled to increase perf
     # if config.PLOT_PERFORMANCE:
     #     try:
-    #         from sc_engine import plotting
+    #         from screencap.engine import plotting
     #
     #         session = get_session_for_path(db_path)
     #         plotting.plot_performance(
@@ -2951,7 +2951,7 @@ class Recorder:
     ) -> None:
         from pathlib import Path
 
-        from sc_engine.config import RecordingConfig
+        from screencap.engine.config import RecordingConfig
 
         self.capture_dir = str(Path(capture_dir).resolve())
         self.task_description = task_description
@@ -3049,7 +3049,7 @@ class Recorder:
 
     def _run_record(self) -> None:
         """Thread target: apply config overrides, then call record()."""
-        from sc_engine.config import config_override
+        from screencap.engine.config import config_override
 
         with config_override(self._recording_config):
             record(
@@ -3224,7 +3224,7 @@ class Recorder:
         """
         if self._capture is None and not self.is_recording:
             try:
-                from sc_engine.capture import CaptureSession
+                from screencap.engine.capture import CaptureSession
 
                 self._capture = CaptureSession.load(self.capture_dir)
             except FileNotFoundError:

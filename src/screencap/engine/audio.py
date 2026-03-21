@@ -12,7 +12,7 @@ import time
 from pathlib import Path
 from typing import TYPE_CHECKING, Any, Callable
 
-from sc_engine.events import AudioChunkEvent
+from screencap.engine.events import AudioChunkEvent
 
 if TYPE_CHECKING:
     import numpy as np

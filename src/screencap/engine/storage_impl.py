@@ -14,7 +14,7 @@ from typing import Any, Iterator
 
 from pydantic import BaseModel, Field
 
-from sc_engine.events import (
+from screencap.engine.events import (
     AudioChunkEvent,
     Event,
     EventType,

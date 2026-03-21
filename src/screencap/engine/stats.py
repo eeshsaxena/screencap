@@ -185,7 +185,7 @@ def plot_capture_performance(
     Returns:
         PIL Image if neither output_path nor show.
     """
-    from sc_engine.storage import load_capture
+    from screencap.engine.storage import load_capture
 
     capture, storage = load_capture(capture_dir)
 

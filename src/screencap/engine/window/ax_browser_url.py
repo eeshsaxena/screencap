@@ -296,7 +296,7 @@ def extract_browser_url(
 
 def _extract_url(pid: int, bundle_id: str) -> str | None:
     """Core extraction: get the focused window and apply browser strategy."""
-    from sc_engine.config import config
+    from screencap.engine.config import config
 
     app_ref = _ApplicationServices.AXUIElementCreateApplication(pid)
     _ApplicationServices.AXUIElementSetMessagingTimeout(app_ref, config.AX_ELEMENT_TIMEOUT)

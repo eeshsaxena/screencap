@@ -7,7 +7,7 @@ from unittest import mock
 
 import pytest
 
-from sc_engine.events import (
+from screencap.engine.events import (
     MouseClickEvent,
     MouseButton,
 )
@@ -47,7 +47,7 @@ def test_export_recording_no_metadata(tmp_path):
 
     capture = _mock_capture()
 
-    with mock.patch("sc_engine.capture.CaptureSession.load", return_value=capture):
+    with mock.patch("screencap.engine.capture.CaptureSession.load", return_value=capture):
         count = export_recording(rec_dir, out_file, exclude_moves=False, metadata=None)
 
     assert count == 1
@@ -68,7 +68,7 @@ def test_export_recording_atomic_write_cleanup_on_failure(tmp_path):
         capture.export_events.side_effect = RuntimeError("boom")
         return capture
 
-    with mock.patch("sc_engine.capture.CaptureSession.load", side_effect=failing_capture):
+    with mock.patch("screencap.engine.capture.CaptureSession.load", side_effect=failing_capture):
         try:
             export_recording(rec_dir, out_file, exclude_moves=False)
         except RuntimeError:
@@ -86,7 +86,7 @@ def test_export_recording_warns_on_zero_events(tmp_path, caplog):
 
     capture = _mock_capture(export_events=[])
 
-    with mock.patch("sc_engine.capture.CaptureSession.load", return_value=capture):
+    with mock.patch("screencap.engine.capture.CaptureSession.load", return_value=capture):
         import logging
         with caplog.at_level(logging.WARNING, logger="screencap.exporter"):
             count = export_recording(rec_dir, out_file, exclude_moves=False, metadata=build_export_metadata(False))
@@ -103,7 +103,7 @@ def test_export_recording_missing_db_raises_export_error(tmp_path):
     out_file = str(rec_dir / "events.jsonl")
 
     with mock.patch(
-        "sc_engine.capture.CaptureSession.load",
+        "screencap.engine.capture.CaptureSession.load",
         side_effect=FileNotFoundError("Capture not found"),
     ):
         with pytest.raises(ExportError, match="No recording database found"):

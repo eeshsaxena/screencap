@@ -9,7 +9,7 @@ from __future__ import annotations
 
 from urllib.parse import urlparse
 
-from sc_engine.events import (
+from screencap.engine.events import (
     ActionEvent,
     KeyDownEvent,
     KeyUpEvent,

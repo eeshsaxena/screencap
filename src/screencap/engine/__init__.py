@@ -6,32 +6,32 @@ Platform-agnostic event streams with time-aligned media.
 __version__ = "0.1.0"
 
 # High-level APIs (primary interface)
-from sc_engine.capture import Action, Capture, CaptureSession
+from screencap.engine.capture import Action, Capture, CaptureSession
 
 # Frame comparison utilities
-from sc_engine.comparison import (
+from screencap.engine.comparison import (
     ComparisonReport,
     FrameComparison,
     compare_frames,
     compare_video_to_images,
     plot_comparison,
 )
-from sc_engine.config import RecordingConfig
-from sc_engine.db.models import (
+from screencap.engine.config import RecordingConfig
+from screencap.engine.db.models import (
     ActionEvent as DBActionEvent,
 )
 
 # Database models (low-level)
-from sc_engine.db.models import (
+from screencap.engine.db.models import (
     Recording,
     Screenshot,
 )
-from sc_engine.db.models import (
+from screencap.engine.db.models import (
     WindowEvent as DBWindowEvent,
 )
 
 # Event types
-from sc_engine.events import (
+from screencap.engine.events import (
     ActionEvent,
     AudioChunkEvent,
     AudioEvent,
@@ -58,7 +58,7 @@ from sc_engine.events import (
 )
 
 # Event processing
-from sc_engine.processing import (
+from screencap.engine.processing import (
     detect_drag_events,
     detect_key_shortcuts,
     get_action_events,
@@ -77,19 +77,19 @@ from sc_engine.processing import (
 # Recorder requires pynput which needs a display server (X11/Wayland/macOS/Windows).
 # Make it optional so the package is importable in headless environments (CI, servers).
 try:
-    from sc_engine.recorder import Recorder
+    from screencap.engine.recorder import Recorder
 except ImportError:
     Recorder = None  # type: ignore[assignment,misc]
 
 # Performance statistics
-from sc_engine.stats import (
+from screencap.engine.stats import (
     CaptureStats,
     PerfStat,
     plot_capture_performance,
 )
 
 # Visualization
-from sc_engine.visualize import create_demo, create_html
+from screencap.engine.visualize import create_demo, create_html
 
 __all__ = [
     # Version

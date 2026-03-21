@@ -5,7 +5,7 @@ Provides tools to visualize and explore recorded GUI interactions:
 - create_html: Generate interactive HTML viewer with audio playback
 """
 
-from sc_engine.visualize.demo import create_demo
-from sc_engine.visualize.html import create_html
+from screencap.engine.visualize.demo import create_demo
+from screencap.engine.visualize.html import create_html
 
 __all__ = ["create_demo", "create_html"]

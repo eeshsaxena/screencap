@@ -583,7 +583,7 @@ class TestPlaceholderFrame:
 
     def test_make_placeholder_frame_dimensions(self):
         """Placeholder frame has correct dimensions and color."""
-        from sc_engine.recorder import _make_placeholder_frame
+        from screencap.engine.recorder import _make_placeholder_frame
 
         frame = _make_placeholder_frame(1920, 1080)
         assert frame.size == (1920, 1080)

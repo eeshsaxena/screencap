@@ -12,7 +12,7 @@ import threading
 from pathlib import Path
 from typing import TYPE_CHECKING, Any, Iterator
 
-from sc_engine.events import (
+from screencap.engine.events import (
     AudioChunkEvent,
     Event,
     EventType,
@@ -34,7 +34,7 @@ from sc_engine.events import (
 )
 
 if TYPE_CHECKING:
-    from sc_engine.storage_impl import Capture
+    from screencap.engine.storage_impl import Capture
 
 
 # Event type to class mapping
@@ -251,7 +251,7 @@ class SQLiteStorage:
         Returns:
             Capture object or None if not found.
         """
-        from sc_engine.storage_impl import Capture
+        from screencap.engine.storage_impl import Capture
 
         cursor = self.conn.cursor()
         cursor.execute("SELECT * FROM capture ORDER BY started_at DESC LIMIT 1")

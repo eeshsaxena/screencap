@@ -20,7 +20,7 @@ except ImportError as e:
 
 from loguru import logger
 
-from sc_engine.config import config
+from screencap.engine.config import config
 
 # Attributes worth capturing — keeps IPC to the target app minimal.
 # Avoid AXDocument/AXURL (filesystem I/O) and AXHidden (app-level, not element).

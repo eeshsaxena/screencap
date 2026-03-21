@@ -5,7 +5,7 @@ import io
 import sqlalchemy as sa
 from PIL import Image
 
-from sc_engine.db import Base
+from screencap.engine.db import Base
 
 
 # https://groups.google.com/g/sqlalchemy/c/wlr7sShU6-k
@@ -210,7 +210,7 @@ class Screenshot(Base):
     @classmethod
     def take_screenshot(cls) -> "Screenshot":
         """Capture a screenshot."""
-        from sc_engine import utils
+        from screencap.engine import utils
 
         image = utils.take_screenshot()
         screenshot = Screenshot(image=image)
