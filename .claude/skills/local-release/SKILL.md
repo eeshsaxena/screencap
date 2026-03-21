@@ -1,17 +1,17 @@
 ---
 name: local-release
-description: Build and release screencap locally for ARM (arm64). Use when CI is unavailable (billing limits, runner outages) or you want to release an arm64-only build. Intel users auto-fallback to pip install. Triggers on "local release", "release locally", "build and release", "arm release", "release arm64", or when CI release fails.
+description: Bump version, build, and release screencap locally for ARM (arm64). Mirrors the /release flow (version bump, changelog, commit, tag, push) but builds locally instead of triggering GH Actions. Use when CI is unavailable (billing limits, runner outages) or you want to release an arm64-only build. Intel users auto-fallback to pip install. Triggers on "local release", "release locally", "build and release", "arm release", "release arm64", or when CI release fails.
 ---
 
 # Local Release (ARM64)
 
-Build a PyInstaller binary on the local Mac (arm64) and publish it to GCS + GitHub Releases. Intel (x86_64) users will automatically fall back to pip-based install via `install.sh`.
+Bump version, update changelog, commit, tag, push, then build a PyInstaller binary locally and publish to GCS + GitHub Releases. This mirrors the `/release` flow but builds on the local Mac instead of triggering GitHub Actions.
 
 ## Handling Args
 
-- `/local-release` — build + release the version already in `pyproject.toml`
-- `/local-release 0.13.0` — bump to specified version first, then build + release
-- `/local-release --build-only` — build and smoke test without uploading/releasing
+- `/local-release` — prompt for version, then bump + build + release
+- `/local-release 0.13.0` — bump to specified version, then build + release
+- `/local-release --build-only` — build and smoke test without uploading/releasing (still bumps version)
 - `/local-release --release-only` — skip build, upload existing `dist/` artifacts (for re-runs after a failed upload)
 
 ## Prerequisites
@@ -20,20 +20,35 @@ Before starting, verify:
 1. `gcloud` CLI is installed and authenticated with write access to `gs://screencap-releases`
 2. `gh` CLI is authenticated with repo write access
 3. On an Apple Silicon Mac (arm64)
+4. Working directory is clean (`git status` shows no uncommitted changes other than skill/docs files)
 
 ## Instructions
 
-### Step 1: Resolve Version
+### Step 1: Determine New Version
 
-Read the current version from `pyproject.toml` (line 7: `version = "X.Y.Z"`).
+Read the current version from `pyproject.toml`.
 
-If the user provided a version arg:
-- Update `pyproject.toml` version field
-- Check CHANGELOG.md has a section for this version; warn if missing
+If the user did NOT provide a version arg:
+- Show the commits since the last tag: `git log $(git describe --tags --abbrev=0)..HEAD --oneline --no-merges`
+- Suggest a version (patch for fixes, minor for features) and ask the user to confirm
 
-Report: "Building screencap v{VERSION} for arm64."
+If the user provided a version arg, use that directly.
 
-### Step 2: Build (skip if `--release-only`)
+Report: "Releasing screencap v{VERSION} for arm64."
+
+### Step 2: Bump Version and Update CHANGELOG
+
+1. Update `pyproject.toml` version field
+2. Add a new section to CHANGELOG.md for this version with today's date
+   - Categorize commits since the last tag into Added/Changed/Fixed/Removed sections
+   - Only include user-facing changes (skip docs, CI, test-only, benchmark commits)
+3. Commit both files: `git commit -m "release: v{VERSION}"`
+4. Create tag: `git tag v{VERSION}`
+5. Push commit and tag: `git push origin main && git push origin v{VERSION}`
+
+This push will also trigger the GH Actions release workflow. If CI is working, it will produce x86_64 binaries too. If CI is down, the local arm64 build below covers it.
+
+### Step 3: Build (skip if `--release-only`)
 
 Run each command sequentially, stopping on failure:
 
@@ -44,11 +59,11 @@ pip install -e ".[record]" && pip install pyinstaller
 # Download spaCy model (needed for privacy pipeline in frozen binary)
 python -m spacy download en_core_web_sm
 
-# Build the frozen binary
-pyinstaller pyinstaller/screencap.spec
+# Build the frozen binary (use -y to overwrite existing dist/)
+pyinstaller pyinstaller/screencap.spec -y
 ```
 
-### Step 3: Smoke Test (skip if `--release-only`)
+### Step 4: Smoke Test (skip if `--release-only`)
 
 ```bash
 ./dist/screencap/screencap --help
@@ -57,7 +72,7 @@ pyinstaller pyinstaller/screencap.spec
 
 Both must exit 0. If `_smoke-test` fails, stop and report the error.
 
-### Step 4: Package
+### Step 5: Package
 
 ```bash
 VERSION=$(python -c "import tomllib; print(tomllib.load(open('pyproject.toml','rb'))['project']['version'])")
@@ -69,7 +84,7 @@ Display the checksum for the user to verify.
 
 **Stop here if `--build-only`** — report the tarball path and checksum.
 
-### Step 5: Upload to GCS
+### Step 6: Upload to GCS
 
 ```bash
 VERSION=$(python -c "import tomllib; print(tomllib.load(open('pyproject.toml','rb'))['project']['version'])")
@@ -84,7 +99,7 @@ Verify upload:
 gcloud storage ls "gs://screencap-releases/releases/v${VERSION}/"
 ```
 
-### Step 6: Create GitHub Release
+### Step 7: Create GitHub Release
 
 Extract release notes from CHANGELOG.md, then create the release:
 
@@ -106,13 +121,13 @@ gh release create "v${VERSION}" \
     checksums.sha256
 ```
 
-If the release tag already exists (e.g., from a previous failed CI attempt), use `gh release edit` to update it and upload the assets:
+If the release tag already exists (e.g., GH Actions already created it), use `gh release edit` to update it and upload the assets:
 ```bash
 gh release edit "v${VERSION}" --notes-file /tmp/release_notes.txt
 gh release upload "v${VERSION}" "screencap-${VERSION}-arm64.tar.gz" checksums.sha256 --clobber
 ```
 
-### Step 7: Verify Install
+### Step 8: Verify Install
 
 Run the install script against the just-published release:
 ```bash
@@ -121,7 +136,7 @@ xattr -dr com.apple.quarantine ~/.screencap/bin/
 ~/.screencap/bin/screencap/screencap --version
 ```
 
-### Step 8: Cleanup
+### Step 9: Cleanup
 
 Remove local build artifacts:
 ```bash
@@ -130,7 +145,7 @@ rm -f screencap-*.tar.gz checksums.sha256 /tmp/release_notes.txt
 
 Do NOT `rm -rf dist/` or `rm -rf build/` — those are reusable for subsequent builds.
 
-### Step 9: Report
+### Step 10: Report
 
 ```
 ## Local Release: v{VERSION}
@@ -157,5 +172,4 @@ install from source via pip when running install.sh.
 
 - This skill produces an **arm64-only release**. x86_64 binaries require an Intel Mac or CI.
 - The `install.sh` script will fall back to pip install for Intel users when no x86_64 tarball is available.
-- If CI billing is restored later, you can re-run the CI workflow to add the x86_64 binary to the same release.
-- The existing `/release` skill handles the normal CI-based flow (version bump + tag push). Use `/local-release` only when CI is unavailable.
+- The tag push may also trigger the GH Actions `release.yml` workflow. If CI is working, it will add x86_64 binaries to the same release. If CI is down, the local arm64 build is sufficient.
