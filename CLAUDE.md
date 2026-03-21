@@ -4,7 +4,7 @@ This file provides guidance to Claude Code (claude.ai/code) when working with co
 
 ## Project Overview
 
-ScreenCap is a macOS CLI for screen recording. It wraps the vendored screencap-engine package (`sc_engine` module). Python >= 3.10, macOS only.
+ScreenCap is a macOS CLI for screen recording. The recording engine lives at `src/screencap/engine/` as an internal sub-package. Python >= 3.10, macOS only.
 
 ## Common Commands
 
@@ -23,7 +23,7 @@ pytest tests/test_catalog.py::test_list_recordings_empty
 pytest tests/ -v --cov
 ```
 
-No linting is configured for the root `screencap` package. The vendored sub-packages use `ruff` (run inside their directories with `uv run ruff check .`).
+Linting uses `ruff` for the engine sub-package: `ruff check src/screencap/engine/`.
 
 ## Architecture
 
@@ -33,14 +33,25 @@ No linting is configured for the root `screencap` package. The vendored sub-pack
 
 **Core modules (all in `src/screencap/`):**
 - `config.py` — reads `~/.screencap/config.toml` with env var overrides (`SCREENCAP_RECORDINGS_DIR`, `SCREENCAP_AUDIO_DEFAULT`). Priority: env vars > config.toml > defaults. Uses module-level `_config_cache` dict (reset to `None` in tests).
-- `recorder.py` — wraps `sc_engine.Recorder` context manager. Signal handlers installed BEFORE `Recorder.__enter__()` to cover the entire setup window. SIGINT: first = graceful stop, second = force quit (kills children + `os._exit`), third = immediate `os._exit`. SIGTERM: graceful stop (used by `screencap stop`). Handlers guard against `recorder=None` (signal during setup) and fall back to `multiprocessing.active_children()` when `_child_pids` is empty. The recommended way to stop a recording programmatically is `screencap stop` (sends SIGTERM, 30s timeout, fallback to force-kill). Ctrl+C is a convenience shortcut for foreground terminal use only.
+- `recorder.py` — wraps `screencap.engine.Recorder` context manager. Signal handlers installed BEFORE `Recorder.__enter__()` to cover the entire setup window. SIGINT: first = graceful stop, second = force quit (kills children + `os._exit`), third = immediate `os._exit`. SIGTERM: graceful stop (used by `screencap stop`). Handlers guard against `recorder=None` (signal during setup) and fall back to `multiprocessing.active_children()` when `_child_pids` is empty. The recommended way to stop a recording programmatically is `screencap stop` (sends SIGTERM, 30s timeout, fallback to force-kill). Ctrl+C is a convenience shortcut for foreground terminal use only.
 - `catalog.py` — scans recordings dir, reads metadata from SQLite. Supports two DB schemas: `recording.db` (tables: `recording`, `action_event`) and `capture.db` (tables: `capture`, `events`). Returns `RecordingInfo` NamedTuples.
 - `viewer.py` — opens `viewer.html` via macOS `open` command.
 
-**Vendored packages (under `packages/`):**
-- `screencap-engine` (`sc_engine`) — multi-process recording (pynput, mss, av/ffmpeg, sounddevice). SQLAlchemy for per-capture SQLite DBs. Has its own entry point (`capture`).
+**Engine sub-package (`src/screencap/engine/`):**
+- Multi-process recording engine (pynput, mss, av/ffmpeg, sounddevice). SQLAlchemy for per-capture SQLite DBs.
+- `engine/recorder.py` — multi-process recorder (reader threads → event_q → writer processes)
+- `engine/capture.py` — `CaptureSession` class for loading and iterating events/actions
+- `engine/events.py` — Pydantic event models (MouseMoveEvent, KeyDownEvent, etc.)
+- `engine/processing.py` — 11-stage event merging pipeline (clicks, drags, typing)
+- `engine/db/` — SQLAlchemy database layer (Engine, session factory, Base, models, CRUD)
+- `engine/window/` — platform-specific active window capture
+- `engine/config.py` — recording config (pydantic-settings, RECORD_VIDEO, RECORD_AUDIO, etc.)
+- `engine/video.py` — video encoding (av/ffmpeg)
+- `engine/audio.py` — audio recording + transcription
+- `engine/dedup.py` — perceptual hashing (dHash) for screenshot deduplication
+- `engine/visualize/` — demo GIF and HTML viewer generation
 
-The vendored package is co-installed via the root `pyproject.toml` `packages.find.where` — it is NOT a separate pip install.
+All engine imports from `screencap` source are deferred (inside function bodies) to keep `screencap --help` fast. The `engine/__init__.py` does heavy re-exports (~60 symbols).
 
 ## Privacy System (`src/screencap/privacy/`)
 
@@ -66,9 +77,9 @@ Two-layer privacy enforcement: capture-time filtering + post-recording scrubbing
 ## Export System
 
 **Unified processing pipeline:** Both CLI `screencap export` and the chunk processor share the same event processing path:
-1. Raw DB rows → `dict_to_action_event()` (`sc_engine/convert.py`) → Pydantic events
-2. `process_events()` (`sc_engine/processing.py`) — 11-stage merge/detect pipeline
-3. `deduplicate_window_events()` + `interleave_window_events()` (`sc_engine/processing.py`)
+1. Raw DB rows → `dict_to_action_event()` (`screencap/engine/convert.py`) → Pydantic events
+2. `process_events()` (`screencap/engine/processing.py`) — 11-stage merge/detect pipeline
+3. `deduplicate_window_events()` + `interleave_window_events()` (`screencap/engine/processing.py`)
 4. Privacy filtering (screencap layer) → JSONL serialization via `model_dump_json()`
 
 **Two export paths:**
@@ -81,7 +92,7 @@ Two-layer privacy enforcement: capture-time filtering + post-recording scrubbing
 - `window.switch` events are deduplicated by `(app_bundle_id, window_id)` — title-only changes are ignored
 - `mouse.move` events excluded by default in both paths
 
-**Privacy-aware `window.switch` events:** EXCLUDE apps → suppressed entirely, MASK_WINDOW → title replaced with app name, OCR_FALLBACK → suppressed for cloud-intent uploads. Privacy filtering happens in the screencap layer (`exporter.py` / `chunk_processor.py`), not in `sc_engine`.
+**Privacy-aware `window.switch` events:** EXCLUDE apps → suppressed entirely, MASK_WINDOW → title replaced with app name, OCR_FALLBACK → suppressed for cloud-intent uploads. Privacy filtering happens in the screencap layer (`exporter.py` / `chunk_processor.py`), not in `screencap.engine`.
 
 **Scrubbing pipeline:** `_scrub_events_jsonl()` scrubs `key.type` and `key.shortcut` text + children `key_char`, and `window.switch` titles.
 

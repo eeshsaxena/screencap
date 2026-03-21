@@ -2,18 +2,18 @@
 title: CGEventTap disabled sentinel causes NSEvent assertion failure in gesture_callback
 date: 2026-03-21
 problem_type: bug_fix
-component: sc_engine.recorder
+component: screencap.engine.recorder
 platform: macos
 severity: medium
 symptoms:
   - "unrecognized type is 4294967294"
   - "*** Assertion failure in -[NSEvent _initWithCGEvent:eventRef:], NSEvent.m:1871"
-  - "ERROR | sc_engine.recorder:gesture_callback — Error in gesture event callback"
+  - "ERROR | screencap.engine.recorder:gesture_callback — Error in gesture event callback"
   - "Gesture events missed for up to 500ms during tap-disabled recovery"
 root_cause: gesture_callback calls NSEvent.eventWithCGEvent_() before checking for tap-disabled sentinel event types that AppKit cannot convert
 tags: [CGEventTap, NSEvent, gesture, kCGEventTapDisabledByTimeout, kCGEventTapDisabledByUserInput, pyobjc, SecureInput]
 files_changed:
-  - packages/screencap-engine/sc_engine/recorder.py
+  - src/screencap/engine/recorder.py
 ---
 
 # CGEventTap Disabled Sentinel Causes NSEvent Assertion Failure
@@ -51,9 +51,9 @@ def gesture_callback(_proxy, event_type, cg_event, _refcon):
 ```
 
 **Files changed:**
-- `packages/screencap-engine/sc_engine/recorder.py:1870` — Bound `_TAP_DISABLED_BY_TIMEOUT` and `_TAP_DISABLED_BY_USER_INPUT` as local constants in `read_gesture_events()`
-- `packages/screencap-engine/sc_engine/recorder.py:1916` — Added sentinel guard before `NSEvent.eventWithCGEvent_()`
-- `packages/screencap-engine/sc_engine/recorder.py:2355` — Added both constants to PyObjC warmup block
+- `src/screencap/engine/recorder.py:1870` — Bound `_TAP_DISABLED_BY_TIMEOUT` and `_TAP_DISABLED_BY_USER_INPUT` as local constants in `read_gesture_events()`
+- `src/screencap/engine/recorder.py:1916` — Added sentinel guard before `NSEvent.eventWithCGEvent_()`
+- `src/screencap/engine/recorder.py:2355` — Added both constants to PyObjC warmup block
 
 ## Why This Works
 

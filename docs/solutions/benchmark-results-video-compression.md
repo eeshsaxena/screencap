@@ -2,7 +2,7 @@
 
 **Date:** 2026-03-20
 **Source:** `capture-test-20260318-085835` (1048 screenshots, 3024x1964, sampled 100 frames)
-**Script:** `packages/screencap-engine/scripts/compare_codecs.py`
+**Script:** `scripts/compare_codecs.py`
 
 ## Chosen defaults
 
