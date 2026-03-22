@@ -1,6 +1,5 @@
 """Tests for video module."""
 
-import tempfile
 import time
 
 import av
@@ -25,32 +24,58 @@ def _init_timestamp():
 class TestWriteVideoFrame:
     """Tests for write_video_frame."""
 
-    def test_write_frame_basic(self):
+    def test_write_frame_basic(self, tmp_path):
         """Test writing a basic video frame."""
-        with tempfile.NamedTemporaryFile(suffix=".mp4", delete=False) as f:
-            container, stream, start_ts = initialize_video_writer(
-                f.name, 100, 100
-            )
-            img = Image.new("RGB", (100, 100), color="red")
-            last_pts = write_video_frame(
-                container, stream, img, start_ts + 0.1, start_ts, 0
-            )
-            assert last_pts > 0
-            container.close()
+        output = tmp_path / "test.mp4"
+        container, stream, start_ts = initialize_video_writer(
+            str(output), 100, 100
+        )
+        img = Image.new("RGB", (100, 100), color="red")
+        last_pts = write_video_frame(
+            container, stream, img, start_ts + 0.1, start_ts, 0
+        )
+        assert last_pts > 0
+        container.close()
 
-    def test_write_frame_force_key_frame(self):
+    def test_write_frame_force_key_frame(self, tmp_path):
         """Test writing a video frame with force_key_frame=True."""
-        with tempfile.NamedTemporaryFile(suffix=".mp4", delete=False) as f:
-            container, stream, start_ts = initialize_video_writer(
-                f.name, 100, 100
-            )
-            img = Image.new("RGB", (100, 100), color="blue")
+        output = tmp_path / "test.mp4"
+        container, stream, start_ts = initialize_video_writer(
+            str(output), 100, 100
+        )
+        img = Image.new("RGB", (100, 100), color="blue")
+        last_pts = write_video_frame(
+            container, stream, img, start_ts + 0.1, start_ts, 0,
+            force_key_frame=True,
+        )
+        assert last_pts > 0
+        container.close()
+
+    def test_pts_starts_at_zero_with_delayed_first_frame(self, tmp_path):
+        """Legacy API: first frame arrives 30s late but PTS should start at 0."""
+        output = tmp_path / "test.mp4"
+        base = time.time()
+        container, stream, start_ts = initialize_video_writer(
+            str(output), 100, 100
+        )
+        last_pts = 0
+        for i in range(5):
+            img = Image.new("RGB", (100, 100), color=(i * 50, 0, 0))
             last_pts = write_video_frame(
-                container, stream, img, start_ts + 0.1, start_ts, 0,
-                force_key_frame=True,
+                container, stream, img, start_ts + 30.0 + i * 0.5, start_ts + 30.0, last_pts
             )
-            assert last_pts > 0
-            container.close()
+        for packet in stream.encode():
+            container.mux(packet)
+        container.close()
+
+        read_container = av.open(str(output))
+        first_frame = next(read_container.decode(video=0))
+        first_pts_sec = float(first_frame.pts * first_frame.time_base)
+        read_container.close()
+
+        assert first_pts_sec < 1.0, (
+            f"First frame PTS {first_pts_sec:.3f}s should be near 0, not offset"
+        )
 
     def test_pict_type_enum(self):
         """Test that PictureType.I is valid for pict_type assignment."""
