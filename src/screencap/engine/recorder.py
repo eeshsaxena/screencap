@@ -995,20 +995,27 @@ def chunked_write_video_event(
     perf_q: sq.SynchronizedQueue,
     chunked_writer: "video.ChunkedVideoWriter" = None,
     video_start_timestamp: float = 0,
+    _video_start_updated: bool = False,
     **kwargs: dict,
 ) -> dict[str, Any]:
     """Write a screen event using ChunkedVideoWriter."""
     assert event.type == "screen/video"
     screenshot_image = event.data
     screenshot_timestamp = event.timestamp
-    force_key_frame = not hasattr(chunked_writer, '_has_written')
-    if force_key_frame:
-        chunked_writer._has_written = True
-    chunked_writer.write_frame(screenshot_image, screenshot_timestamp, force_key_frame)
+    chunked_writer.write_frame(screenshot_image, screenshot_timestamp)
+
+    # Update DB video_start_time to the actual first frame's timestamp
+    # so that CaptureSession.get_frame_at() computes correct offsets.
+    if not _video_start_updated and chunked_writer.start_time is not None:
+        crud.update_video_start_time(db, recording_timestamp, chunked_writer.start_time)
+        video_start_timestamp = chunked_writer.start_time
+        _video_start_updated = True
+
     return {
         **kwargs,
         "chunked_writer": chunked_writer,
         "video_start_timestamp": video_start_timestamp,
+        "_video_start_updated": _video_start_updated,
         "last_frame": screenshot_image,
         "last_frame_timestamp": screenshot_timestamp,
     }
@@ -1052,7 +1059,6 @@ def write_video_event(
     video_stream: av.stream.Stream,
     video_start_timestamp: float,
     last_pts: int = 0,
-    num_copies: int = 2,
     **kwargs: dict,
 ) -> dict[str, Any]:
     """Write a screen event to the video file and update the performance queue.
@@ -1068,7 +1074,6 @@ def write_video_event(
         video_start_timestamp (float): The base timestamp from which the video
             recording started.
         last_pts: The last presentation timestamp.
-        num_copies: The number of times to write the frame.
 
     Returns:
         dict containing state.
@@ -1077,20 +1082,15 @@ def write_video_event(
     screenshot_image = event.data
     screenshot_timestamp = event.timestamp
     force_key_frame = last_pts == 0
-    # ensure that the first frame is available (otherwise occasionally it is not)
-    # TODO: why isn't force_key_frame sufficient?
-    if last_pts != 0:
-        num_copies = 1
-    for _ in range(num_copies):
-        last_pts = video.write_video_frame(
-            video_container,
-            video_stream,
-            screenshot_image,
-            screenshot_timestamp,
-            video_start_timestamp,
-            last_pts,
-            force_key_frame,
-        )
+    last_pts = video.write_video_frame(
+        video_container,
+        video_stream,
+        screenshot_image,
+        screenshot_timestamp,
+        video_start_timestamp,
+        last_pts,
+        force_key_frame,
+    )
     # disabled to increase perf
     # perf_q.put((event.type, event.timestamp, utils.get_timestamp()))
     return {
