@@ -110,6 +110,13 @@ class ChunkProcessor:
                 if self._upload_disabled_reason is None:
                     self._upload_disabled_reason = f"Masking classifier init failed: {e}"
 
+        # Safety invariant: never delete local files unless uploads are enabled.
+        # This covers: (1) caller passes upload_enabled=False (e.g. --no-live-upload),
+        # (2) privacy pipeline init failure sets _upload_enabled=False.
+        if not self._upload_enabled and self._auto_delete:
+            self._auto_delete = False
+            logger.info("Forced auto_delete=False because uploads are disabled")
+
         self._chunk_results: dict[int, bool] = {}  # idx → all_uploaded
         self._status_lock = threading.Lock()
         self._status: str = ""
@@ -219,6 +226,12 @@ class ChunkProcessor:
                 self._chunk_results[idx] = False
 
     def _process_chunk(self, msg: dict) -> None:
+        if self._auto_delete and not self._upload_enabled:
+            raise RuntimeError(
+                "invariant violated: auto_delete=True with uploads disabled — "
+                "this would cause silent data loss"
+            )
+
         idx = msg["completed_index"]
         start_ts = msg["chunk_start_time"]
         end_ts = msg["rotation_time"]

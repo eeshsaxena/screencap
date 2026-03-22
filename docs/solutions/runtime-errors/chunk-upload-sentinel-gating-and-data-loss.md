@@ -47,7 +47,7 @@ Four related bugs in the recording shutdown path, all stemming from incorrect as
 
 **Bug 3 — Stale recovery sentinel (fixed):** The degraded shutdown path wrote a local `recording_complete.json` with `chunks_expected` from the current manifest count on disk. If manifests hadn't been generated yet, `chunks_expected` was 0. `screencap upload` only regenerates the sentinel when the file is absent, so the stale sentinel was uploaded unchanged.
 
-**Bug 4 — Silent data loss on privacy failure (found, not yet fixed):** When the privacy scrubbing pipeline fails to initialize, `_upload_enabled` is set to `False`. But `_process_chunk()` treats this as `success = True` (line 268: `upload disabled = success`). All chunks are marked uploaded, sentinel goes to GCS, `stub_recording()` deletes local files. Nothing is on GCS — recording is silently destroyed.
+**Bug 4 — Silent data loss on privacy failure (fixed 2026-03-22):** When the privacy scrubbing pipeline fails to initialize, `_upload_enabled` is set to `False`. The `_upload_disabled_reason` sentinel ensures `success = False` for all chunks, preventing deletion. Additionally, the constructor now forces `_auto_delete = False` whenever `_upload_enabled = False`, closing a secondary gap where caller-disabled uploads (`--no-live-upload`) could still trigger deletion. See Fix 4 below.
 
 ## Root Cause Analysis
 
@@ -152,9 +152,19 @@ When `True`, `_all_uploaded` is `False` regardless of `_chunk_results` contents.
 
 The degraded shutdown `else` branch no longer writes a local `recording_complete.json`. The `screencap upload` recovery path at `cli.py:1401-1417` already generates a fresh sentinel with the correct `chunks_expected` from current manifests on disk when the file is absent.
 
-### Bug 4: Not yet fixed
+### Fix 4: `_upload_disabled_reason` sentinel + `_auto_delete` invariant (2026-03-22)
 
-The fix requires distinguishing "uploads intentionally disabled" from "uploads disabled due to error." Proposed: add `_upload_disabled_reason: str | None` to ChunkProcessor. When `None`, disabled is intentional (`success = True`). When set, disabled is due to failure (`success = False`), preventing `stub_recording()` from deleting local files.
+Two-layer fix for silent data loss when privacy pipeline fails:
+
+1. **`_upload_disabled_reason: str | None`** — distinguishes "uploads intentionally disabled" (`None` → `success = True`) from "disabled due to error" (set → `success = False`). This was partially implemented earlier; the sentinel mechanism correctly prevents `stub_recording()` via `all_chunks_uploaded() = False`.
+
+2. **Constructor invariant: `_auto_delete = False` when `_upload_enabled = False`** — closes an additional gap where `upload_enabled=False` from the caller (e.g., `--cloud --no-live-upload`) combined with `auto_delete=True` would delete files that were never uploaded. The invariant is enforced at the end of `__init__` regardless of *why* uploads are disabled.
+
+3. **`upload_warning` surfaced in shutdown output** — the `upload_warning` property (which held the specific failure reason) was never read by any code. Now the recorder shutdown path displays it instead of the generic "N of M chunks uploaded" message.
+
+4. **Sentinel gate tightened for cloud-intent** — `stub_recording()` now requires `_sentinel_uploaded = True` for cloud-intent recordings, not just `_db_uploaded or _sentinel_uploaded`. Without the sentinel, Cloud Run stitching never triggers, so local files must be preserved.
+
+Tests: `test_upload_disabled_from_caller_prevents_deletion`, `test_masking_classifier_failure_prevents_deletion`, `test_stub_recording_not_called_when_uploads_disabled`, `test_upload_warning_surfaced_at_stop`, `test_sentinel_not_uploaded_without_sentinel_for_cloud`.
 
 ## Prevention Strategies
 

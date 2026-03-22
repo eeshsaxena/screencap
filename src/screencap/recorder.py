@@ -1064,9 +1064,17 @@ def start_recording(
             # else: no local sentinel — screencap upload generates a fresh
             # one with the correct chunks_expected from manifests on disk.
 
-        # Stub recording if all chunks AND (db or sentinel) uploaded
+        # Stub recording if all chunks AND sentinel uploaded (for cloud-intent)
+        # For cloud-intent, require _sentinel_uploaded specifically — without
+        # the sentinel, Cloud Run stitching never triggers, so local files
+        # must be preserved for recovery via 'screencap upload'.
         _has_chunk_files = any(capture_dir.glob("chunk_*.mp4"))
-        if _all_uploaded and (_db_uploaded or _sentinel_uploaded) and live_upload and _has_chunk_files:
+        _safe_to_stub = _all_uploaded and live_upload and _has_chunk_files
+        if cloud_intent:
+            _safe_to_stub = _safe_to_stub and _sentinel_uploaded
+        else:
+            _safe_to_stub = _safe_to_stub and (_db_uploaded or _sentinel_uploaded)
+        if _safe_to_stub:
             try:
                 from screencap.chunk_processor import stub_recording
                 deleted = stub_recording(capture_dir)
@@ -1085,6 +1093,15 @@ def start_recording(
                 console.print(
                     "[yellow]No chunks were processed. "
                     f"Run 'screencap upload {_recording_name}' to upload.[/yellow]"
+                )
+            elif chunk_processor.upload_warning:
+                # Surface the specific reason uploads were disabled
+                console.print(
+                    f"[yellow]Uploads disabled: {chunk_processor.upload_warning}[/yellow]"
+                )
+                console.print(
+                    f"[yellow]Local files preserved. "
+                    f"Run 'screencap upload {_recording_name}' after fixing the issue.[/yellow]"
                 )
             else:
                 console.print(

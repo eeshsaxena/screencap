@@ -1156,3 +1156,112 @@ class TestPrivacyFailureDataLoss:
         n_uploaded, n_total = cp.upload_summary()
         assert n_uploaded == 3
         assert n_total == 3
+
+    @mock.patch("screencap.chunk_processor.time.sleep")
+    @mock.patch("screencap.chunk_processor.upload_chunk_files", return_value=True)
+    def test_upload_disabled_from_caller_prevents_deletion(
+        self, mock_upload, mock_sleep, tmp_path,
+    ):
+        """T2: upload_enabled=False from caller + auto_delete=True must NOT delete files.
+
+        This is the --cloud --no-live-upload scenario: cloud_intent=True but
+        upload_enabled=False from the caller. The constructor must force
+        _auto_delete=False to prevent deletion of never-uploaded files.
+        """
+        from screencap.chunk_processor import ChunkProcessor
+
+        t0 = time.time()
+        _create_seven_chunk_db(tmp_path / "recording.db", t0)
+        _create_chunk_media_files(tmp_path, 7)
+
+        chunk_q = multiprocessing.Queue()
+        audio_q = multiprocessing.Queue()
+
+        cp = ChunkProcessor(
+            tmp_path, chunk_q, audio_q,
+            recording_name="test-no-live-upload",
+            upload_enabled=False,
+            auto_delete=True,  # caller passes True (cloud_intent && config)
+            cloud_intent=True,
+        )
+
+        # Constructor must have forced _auto_delete to False
+        assert cp._auto_delete is False, (
+            "_auto_delete must be False when upload_enabled=False — "
+            "cannot delete files that were never uploaded"
+        )
+
+        cp._wait_for_audio = lambda *a, **kw: True
+        cp._transcribe = lambda *a, **kw: None
+        cp._generate_manifest = lambda *a, **kw: None
+
+        cp.start()
+        _enqueue_chunks(chunk_q, t0, 7)
+        cp.stop(timeout=30)
+
+        # Upload was never attempted
+        mock_upload.assert_not_called()
+
+        # ALL media files must still exist
+        for i in range(7):
+            assert (tmp_path / f"chunk_{i:04d}.mp4").exists(), \
+                f"chunk_{i:04d}.mp4 was deleted — data loss!"
+            assert (tmp_path / f"audio_{i:04d}.flac").exists(), \
+                f"audio_{i:04d}.flac was deleted — data loss!"
+
+    @mock.patch("screencap.chunk_processor.time.sleep")
+    @mock.patch("screencap.chunk_processor.upload_chunk_files", return_value=True)
+    def test_masking_classifier_failure_prevents_deletion(
+        self, mock_upload, mock_sleep, tmp_path,
+    ):
+        """T3: Masking classifier init fails (pipeline OK) → files preserved.
+
+        When create_default_pipeline succeeds but the masking classifier
+        raises, _upload_enabled is set to False. Media files must not be
+        deleted even with auto_delete=True.
+        """
+        from screencap.chunk_processor import ChunkProcessor
+
+        t0 = time.time()
+        _create_seven_chunk_db(tmp_path / "recording.db", t0)
+        _create_chunk_media_files(tmp_path, 7)
+
+        chunk_q = multiprocessing.Queue()
+        audio_q = multiprocessing.Queue()
+
+        with patch("screencap.privacy.create_default_pipeline") as mock_pipeline, \
+             patch("screencap.privacy.Anonymizer"), \
+             patch("screencap.config.get_privacy_config", side_effect=RuntimeError("masking init failed")):
+            mock_pipeline.return_value = MagicMock()
+            cp = ChunkProcessor(
+                tmp_path, chunk_q, audio_q,
+                recording_name="test-masking-fail",
+                upload_enabled=True,
+                auto_delete=True,
+                cloud_intent=True,
+            )
+
+        # Pipeline succeeded but masking failed → uploads disabled
+        assert cp._upload_enabled is False
+        assert cp._pipeline is not None  # pipeline was set before masking failed
+        assert cp.upload_warning is not None
+        assert cp._auto_delete is False, (
+            "_auto_delete must be False when uploads are disabled due to masking failure"
+        )
+
+        cp._wait_for_audio = lambda *a, **kw: True
+        cp._transcribe = lambda *a, **kw: None
+        cp._generate_manifest = lambda *a, **kw: None
+
+        cp.start()
+        _enqueue_chunks(chunk_q, t0, 7)
+        cp.stop(timeout=30)
+
+        # Chunks must NOT be marked as success
+        assert cp.all_chunks_uploaded() is False
+        mock_upload.assert_not_called()
+
+        # ALL media files must still exist
+        for i in range(7):
+            assert (tmp_path / f"chunk_{i:04d}.mp4").exists(), \
+                f"chunk_{i:04d}.mp4 was deleted — data loss!"
