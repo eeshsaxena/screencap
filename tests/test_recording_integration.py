@@ -1006,3 +1006,307 @@ def test_non_chunked_recording_no_chunk_processor(recording_env):
     # Recording should otherwise work — DB exists
     assert (capture_dir / "recording.db").exists()
     assert (capture_dir / ".recording_id").read_text().strip() == "test-no-chunks"
+
+
+# ---------------------------------------------------------------------------
+# Scenario 6: Guard gate — privacy failure must not cause data loss
+# ---------------------------------------------------------------------------
+
+
+def test_stub_recording_not_called_when_uploads_disabled(recording_env):
+    """T4: Privacy pipeline failure → stub_recording() never called → files preserved.
+
+    When cloud_intent=True and the privacy pipeline fails to init,
+    all_chunks_uploaded() returns False. The recorder shutdown path must NOT
+    call stub_recording(), preserving all local media files.
+    """
+    from screencap.recorder import start_recording
+
+    rec_dir = recording_env["recordings_dir"] / "test-guard-gate"
+    t0 = 1000.0
+
+    class FakeCloudRecorder:
+        def __init__(self, capture_dir_str, **kwargs):
+            self.capture_dir = Path(capture_dir_str)
+            self.is_recording = False
+            self.health_warning = None
+            self.child_crashes = []
+            self._chunk_process_q = multiprocessing.Queue()
+            self._audio_ack_q = multiprocessing.Queue()
+            self._flush_requested = None
+            self._flush_ack_counter = None
+
+        def __enter__(self):
+            _create_multi_chunk_db(self.capture_dir / "recording.db", t0)
+            # Create media files that must be preserved
+            for i in range(2):
+                (self.capture_dir / f"chunk_{i:04d}.mp4").write_bytes(b"\x00" * 1024)
+                (self.capture_dir / f"audio_{i:04d}.flac").write_bytes(b"\x00" * 512)
+
+            self._chunk_process_q.put({
+                "type": "chunk_rotated",
+                "completed_index": 0,
+                "chunk_start_time": t0,
+                "rotation_time": t0 + 30,
+            })
+            self._chunk_process_q.put({
+                "type": "final_chunk",
+                "completed_index": 1,
+                "chunk_start_time": t0 + 30,
+                "rotation_time": t0 + 60,
+            })
+            return self
+
+        def __exit__(self, *args):
+            return False
+
+        def wait_for_ready(self, timeout=30):
+            return True
+
+        def stop(self):
+            self.is_recording = False
+
+    with (
+        mock.patch("screencap.engine.Recorder", FakeCloudRecorder),
+        mock.patch("screencap.recorder._check_macos_permissions"),
+        mock.patch("screencap.pidfile.find_orphaned_processes", return_value=[]),
+        mock.patch("shutil.disk_usage", return_value=_PLENTY_OF_DISK),
+        mock.patch("screencap.metrics.save_metrics"),
+        # Privacy pipeline fails → uploads disabled
+        mock.patch(
+            "screencap.privacy.create_default_pipeline",
+            side_effect=ImportError("test: no privacy deps"),
+        ),
+        # Mock side effects inside ChunkProcessor
+        mock.patch("screencap.chunk_processor.ChunkProcessor._wait_for_audio", return_value=True),
+        mock.patch("screencap.chunk_processor.ChunkProcessor._transcribe", return_value=None),
+        mock.patch("screencap.chunk_processor.ChunkProcessor._generate_manifest"),
+        # stub_recording must NOT be called
+        mock.patch("screencap.chunk_processor.stub_recording") as mock_stub,
+        # upload_sentinel must NOT be called
+        mock.patch("screencap.chunk_processor.upload_sentinel") as mock_sentinel,
+    ):
+        capture_dir, elapsed = start_recording(
+            name="test-guard-gate",
+            audio=False,
+            output_dir=rec_dir,
+            wifi_metrics=False,
+            app_versions=False,
+            chunk_duration=30,
+            verbose=True,
+            live_upload=True,
+            cloud_intent=True,
+        )
+
+    # stub_recording must NOT have been called — data loss prevention
+    mock_stub.assert_not_called()
+    # sentinel must NOT have been uploaded (uploads disabled)
+    mock_sentinel.assert_not_called()
+
+    # ALL media files must still exist
+    for i in range(2):
+        assert (capture_dir / f"chunk_{i:04d}.mp4").exists(), \
+            f"chunk_{i:04d}.mp4 was deleted — data loss! stub_recording() ran when it shouldn't"
+        assert (capture_dir / f"audio_{i:04d}.flac").exists(), \
+            f"audio_{i:04d}.flac was deleted — data loss!"
+
+
+def test_upload_warning_surfaced_at_stop(recording_env):
+    """T5: When upload_warning is set, stop output shows the specific failure reason.
+
+    The recorder shutdown path must display the upload_warning from
+    ChunkProcessor instead of the generic 'N of M chunks uploaded' message.
+    """
+    from screencap.recorder import start_recording
+
+    rec_dir = recording_env["recordings_dir"] / "test-warning"
+    t0 = 1000.0
+
+    class FakeCloudRecorder:
+        def __init__(self, capture_dir_str, **kwargs):
+            self.capture_dir = Path(capture_dir_str)
+            self.is_recording = False
+            self.health_warning = None
+            self.child_crashes = []
+            self._chunk_process_q = multiprocessing.Queue()
+            self._audio_ack_q = multiprocessing.Queue()
+            self._flush_requested = None
+            self._flush_ack_counter = None
+
+        def __enter__(self):
+            _create_multi_chunk_db(self.capture_dir / "recording.db", t0)
+            self._chunk_process_q.put({
+                "type": "final_chunk",
+                "completed_index": 0,
+                "chunk_start_time": t0,
+                "rotation_time": t0 + 30,
+            })
+            return self
+
+        def __exit__(self, *args):
+            return False
+
+        def wait_for_ready(self, timeout=30):
+            return True
+
+        def stop(self):
+            self.is_recording = False
+
+    captured_output = []
+
+    with (
+        mock.patch("screencap.engine.Recorder", FakeCloudRecorder),
+        mock.patch("screencap.recorder._check_macos_permissions"),
+        mock.patch("screencap.pidfile.find_orphaned_processes", return_value=[]),
+        mock.patch("shutil.disk_usage", return_value=_PLENTY_OF_DISK),
+        mock.patch("screencap.metrics.save_metrics"),
+        mock.patch(
+            "screencap.privacy.create_default_pipeline",
+            side_effect=ImportError("test: missing GLiNER models"),
+        ),
+        mock.patch("screencap.chunk_processor.ChunkProcessor._wait_for_audio", return_value=True),
+        mock.patch("screencap.chunk_processor.ChunkProcessor._transcribe", return_value=None),
+        mock.patch("screencap.chunk_processor.ChunkProcessor._generate_manifest"),
+    ):
+        # Wrap console.print to capture output
+        import screencap.recorder
+        _real_print = screencap.recorder.console.print
+
+        def _spy_print(*args, **kwargs):
+            captured_output.append(" ".join(str(a) for a in args))
+            return _real_print(*args, **kwargs)
+
+        with mock.patch.object(screencap.recorder.console, "print", side_effect=_spy_print):
+            capture_dir, elapsed = start_recording(
+                name="test-warning",
+                audio=False,
+                output_dir=rec_dir,
+                wifi_metrics=False,
+                app_versions=False,
+                chunk_duration=30,
+                verbose=True,
+                live_upload=True,
+                cloud_intent=True,
+            )
+
+    # The shutdown message (the last few lines of output) must contain the
+    # specific failure reason. The generic "N of M chunks uploaded" alone
+    # is insufficient — the user needs to know WHY uploads failed.
+    # Look at messages after the banner (last 5 lines are the shutdown path).
+    shutdown_output = "\n".join(captured_output[-5:]) if len(captured_output) >= 5 else "\n".join(captured_output)
+    has_specific_reason = (
+        "privacy" in shutdown_output.lower()
+        or "GLiNER" in shutdown_output
+        or "scrub" in shutdown_output.lower()
+        or "deps" in shutdown_output.lower()
+    )
+    assert has_specific_reason, (
+        f"Shutdown output must include the specific failure reason, not just "
+        f"a generic upload count. Got shutdown output:\n{shutdown_output}"
+    )
+
+
+def test_sentinel_not_uploaded_without_sentinel_for_cloud(recording_env):
+    """T6: Cloud-intent: stub_recording() requires _sentinel_uploaded=True.
+
+    When all chunks upload successfully but sentinel upload fails,
+    stub_recording() must NOT be called — even if _db_uploaded is True.
+    Without the sentinel, Cloud Run stitching never triggers, so deleting
+    local files would make the recording unrecoverable.
+    """
+    from screencap.recorder import start_recording
+
+    rec_dir = recording_env["recordings_dir"] / "test-sentinel-gate"
+    t0 = 1000.0
+
+    class FakeCloudRecorderWithUpload:
+        def __init__(self, capture_dir_str, **kwargs):
+            self.capture_dir = Path(capture_dir_str)
+            self.is_recording = False
+            self.health_warning = None
+            self.child_crashes = []
+            self._chunk_process_q = multiprocessing.Queue()
+            self._audio_ack_q = multiprocessing.Queue()
+            self._flush_requested = None
+            self._flush_ack_counter = None
+
+        def __enter__(self):
+            _create_multi_chunk_db(self.capture_dir / "recording.db", t0)
+            # Create media + manifest files
+            for i in range(2):
+                (self.capture_dir / f"chunk_{i:04d}.mp4").write_bytes(b"\x00" * 1024)
+                (self.capture_dir / f"audio_{i:04d}.flac").write_bytes(b"\x00" * 512)
+                (self.capture_dir / f"chunk_{i:04d}_manifest.json").write_text("{}")
+
+            self._chunk_process_q.put({
+                "type": "chunk_rotated",
+                "completed_index": 0,
+                "chunk_start_time": t0,
+                "rotation_time": t0 + 30,
+            })
+            self._chunk_process_q.put({
+                "type": "final_chunk",
+                "completed_index": 1,
+                "chunk_start_time": t0 + 30,
+                "rotation_time": t0 + 60,
+            })
+            return self
+
+        def __exit__(self, *args):
+            return False
+
+        def wait_for_ready(self, timeout=30):
+            return True
+
+        def stop(self):
+            self.is_recording = False
+
+    # Build a real PrivacyConfig for the recorder's capture-time enforcement
+    from screencap.privacy.policy import PrivacyConfig, PrivacyMode
+    _test_privacy_config = PrivacyConfig(mode=PrivacyMode.PUBLIC)
+
+    with (
+        mock.patch("screencap.engine.Recorder", FakeCloudRecorderWithUpload),
+        mock.patch("screencap.recorder._check_macos_permissions"),
+        mock.patch("screencap.pidfile.find_orphaned_processes", return_value=[]),
+        mock.patch("shutil.disk_usage", return_value=_PLENTY_OF_DISK),
+        mock.patch("screencap.metrics.save_metrics"),
+        # All chunks upload successfully
+        mock.patch("screencap.chunk_processor.upload_chunk_files", return_value=True),
+        # Pipeline init succeeds inside ChunkProcessor (mock the import path)
+        mock.patch("screencap.privacy.create_default_pipeline") as mock_pipeline,
+        mock.patch("screencap.privacy.Anonymizer"),
+        # Provide real PrivacyConfig for capture-time enforcement
+        mock.patch("screencap.config.get_privacy_config", return_value=_test_privacy_config),
+        mock.patch("screencap.chunk_processor.ChunkProcessor._wait_for_audio", return_value=True),
+        mock.patch("screencap.chunk_processor.ChunkProcessor._transcribe", return_value=None),
+        mock.patch("screencap.chunk_processor.ChunkProcessor._generate_manifest"),
+        mock.patch("screencap.chunk_processor.time.sleep"),
+        # Sentinel upload FAILS
+        mock.patch("screencap.chunk_processor.upload_sentinel", return_value=False) as mock_sentinel,
+        # stub_recording must NOT be called
+        mock.patch("screencap.chunk_processor.stub_recording") as mock_stub,
+    ):
+        mock_pipeline.return_value = mock.MagicMock()
+        capture_dir, elapsed = start_recording(
+            name="test-sentinel-gate",
+            audio=False,
+            output_dir=rec_dir,
+            wifi_metrics=False,
+            app_versions=False,
+            chunk_duration=30,
+            verbose=True,
+            live_upload=True,
+            cloud_intent=True,
+        )
+
+    # Sentinel upload was attempted (all chunks succeeded)
+    mock_sentinel.assert_called_once()
+
+    # stub_recording must NOT have been called — sentinel failed
+    mock_stub.assert_not_called()
+
+    # Media files must still exist
+    for i in range(2):
+        assert (capture_dir / f"chunk_{i:04d}.mp4").exists(), \
+            f"chunk_{i:04d}.mp4 was deleted — data loss! stub_recording ran without sentinel"
