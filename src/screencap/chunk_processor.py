@@ -226,6 +226,12 @@ class ChunkProcessor:
                 self._chunk_results[idx] = False
 
     def _process_chunk(self, msg: dict) -> None:
+        if self._auto_delete and not self._upload_enabled:
+            raise RuntimeError(
+                "invariant violated: auto_delete=True with uploads disabled — "
+                "this would cause silent data loss"
+            )
+
         idx = msg["completed_index"]
         start_ts = msg["chunk_start_time"]
         end_ts = msg["rotation_time"]

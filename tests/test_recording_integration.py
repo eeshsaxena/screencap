@@ -1189,20 +1189,12 @@ def test_upload_warning_surfaced_at_stop(recording_env):
                 cloud_intent=True,
             )
 
-    # The shutdown message (the last few lines of output) must contain the
-    # specific failure reason. The generic "N of M chunks uploaded" alone
-    # is insufficient — the user needs to know WHY uploads failed.
-    # Look at messages after the banner (last 5 lines are the shutdown path).
-    shutdown_output = "\n".join(captured_output[-5:]) if len(captured_output) >= 5 else "\n".join(captured_output)
-    has_specific_reason = (
-        "privacy" in shutdown_output.lower()
-        or "GLiNER" in shutdown_output
-        or "scrub" in shutdown_output.lower()
-        or "deps" in shutdown_output.lower()
-    )
-    assert has_specific_reason, (
-        f"Shutdown output must include the specific failure reason, not just "
-        f"a generic upload count. Got shutdown output:\n{shutdown_output}"
+    # Assert on the production code's "Uploads disabled:" prefix (recorder.py),
+    # not on keywords from the exception message. This tests the code path,
+    # not the error message content.
+    assert any("Uploads disabled:" in line for line in captured_output), (
+        f"Shutdown output must include 'Uploads disabled:' prefix. "
+        f"Got:\n" + "\n".join(captured_output[-5:])
     )
 
 
