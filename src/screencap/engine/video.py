@@ -104,7 +104,12 @@ class VideoWriter:
         self._stream.width = self.width
         self._stream.height = self.height
         self._stream.pix_fmt = self.pix_fmt
-        self._stream.options = {"crf": str(self.crf), "preset": self.preset, "g": str(config.VIDEO_GOP_SIZE)}
+        self._stream.options = {
+            "crf": str(self.crf),
+            "preset": self.preset,
+            "g": str(config.VIDEO_GOP_SIZE),
+            "bf": "0",
+        }
 
     @property
     def start_time(self) -> float | None:
@@ -154,7 +159,6 @@ class VideoWriter:
 
             # Encode and write
             for packet in self._stream.encode(av_frame):
-                packet.pts = pts
                 self._container.mux(packet)
 
             # Track last frame for finalization
@@ -183,7 +187,6 @@ class VideoWriter:
                 av_frame.pts = pts
 
                 for packet in self._stream.encode(av_frame):
-                    packet.pts = pts
                     self._container.mux(packet)
 
             # Flush the stream
@@ -279,7 +282,7 @@ def initialize_video_writer(
     video_stream.width = width
     video_stream.height = height
     video_stream.pix_fmt = pix_fmt
-    video_stream.options = {"crf": str(crf), "preset": preset, "g": str(config.VIDEO_GOP_SIZE)}
+    video_stream.options = {"crf": str(crf), "preset": preset, "g": str(config.VIDEO_GOP_SIZE), "bf": "0"}
 
     base_timestamp = utils.get_timestamp()
 
@@ -349,7 +352,6 @@ def write_video_frame(
 
     # Encode and write the frame
     for packet in video_stream.encode(av_frame):
-        packet.pts = pts
         video_container.mux(packet)
 
     return last_pts  # Return the updated last_pts for the next call
