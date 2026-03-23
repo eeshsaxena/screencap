@@ -243,3 +243,156 @@ class FakeRecorder:
 
         session.close()
         engine.dispose()
+
+
+# ---------------------------------------------------------------------------
+# recording_dir — full recording directory structure with real DB
+# ---------------------------------------------------------------------------
+
+
+@pytest.fixture
+def recording_dir(tmp_path):
+    """Scaffold a recording directory with real engine DB and seed data.
+
+    Creates ``<tmp_path>/recordings/test-rec/recording.db`` with a window
+    event, click pair, and keypress pair — enough for the export pipeline
+    to produce valid JSONL output.  Returns the recording directory Path.
+    """
+    from screencap.engine.db import create_db, crud
+
+    recordings_dir = tmp_path / "recordings"
+    rec_dir = recordings_dir / "test-rec"
+    rec_dir.mkdir(parents=True)
+
+    db_path = rec_dir / "recording.db"
+    engine, Session = create_db(str(db_path))
+    session = Session()
+
+    t = 1000.0
+    recording = crud.insert_recording(session, {
+        "timestamp": t,
+        "platform": "darwin",
+        "monitor_width": 1920,
+        "monitor_height": 1080,
+        "pixel_ratio": 2.0,
+        "double_click_interval_seconds": 0.5,
+        "double_click_distance_pixels": 5.0,
+    })
+
+    crud.insert_window_event(session, recording, t + 0.1, {
+        "title": "Documents",
+        "app_bundle_id": "com.apple.finder",
+        "window_id": "win-1",
+        "left": 0, "top": 0, "width": 1920, "height": 1080,
+    })
+    crud.insert_action_event(session, recording, t + 0.5, {
+        "name": "click",
+        "mouse_x": 500.0, "mouse_y": 300.0,
+        "mouse_button_name": "left", "mouse_pressed": True,
+        "window_event_timestamp": t + 0.1,
+    })
+    crud.insert_action_event(session, recording, t + 0.55, {
+        "name": "click",
+        "mouse_x": 500.0, "mouse_y": 300.0,
+        "mouse_button_name": "left", "mouse_pressed": False,
+        "window_event_timestamp": t + 0.1,
+    })
+    crud.insert_action_event(session, recording, t + 1.0, {
+        "name": "press",
+        "key_char": "h", "key_name": "h",
+        "canonical_key_char": "h", "canonical_key_name": "h",
+        "window_event_timestamp": t + 0.1,
+    })
+    crud.insert_action_event(session, recording, t + 1.05, {
+        "name": "release",
+        "key_char": "h", "key_name": "h",
+        "canonical_key_char": "h", "canonical_key_name": "h",
+        "window_event_timestamp": t + 0.1,
+    })
+
+    session.close()
+    engine.dispose()
+
+    return rec_dir
+
+
+# ---------------------------------------------------------------------------
+# FakeChunkedRecorder — FakeRecorder with pre-loaded chunk rotation messages
+# ---------------------------------------------------------------------------
+
+
+class FakeChunkedRecorder(FakeRecorder):
+    """FakeRecorder that provides chunk queues with pre-loaded rotation messages.
+
+    Simulates a Recorder that produced 2 chunks of 30 seconds each.
+    Uses real multiprocessing.Queue instances so ChunkProcessor works
+    without modification.
+    """
+
+    def __init__(self, capture_dir_str, **kwargs):
+        import multiprocessing
+
+        super().__init__(capture_dir_str, **kwargs)
+        self._chunk_process_q = multiprocessing.Queue()
+        self._audio_ack_q = multiprocessing.Queue()
+
+    def __enter__(self):
+        self._create_db()
+        self._create_multi_chunk_data()
+        self._load_chunk_messages()
+        return self
+
+    def _create_multi_chunk_data(self):
+        """Add chunk-1 events to the existing DB via raw sqlite3.
+
+        The base _create_db already creates events at t=1000.0–1001.05
+        (chunk 0). This adds events in the [t+30, t+60) range for chunk 1.
+        """
+        import sqlite3
+
+        db_path = Path(self.capture_dir) / "recording.db"
+        conn = sqlite3.connect(str(db_path))
+        t = 1000.0
+
+        # Window event in chunk 1
+        conn.execute(
+            "INSERT INTO window_event "
+            "(timestamp, recording_id, title, app_bundle_id, window_id, "
+            '"left", top, width, height) '
+            "VALUES (?, 1, 'Browser', 'com.app.browser', 'win-2', "
+            "0, 0, 1920, 1080)",
+            (t + 31,),
+        )
+        # Click pair in chunk 1
+        conn.execute(
+            "INSERT INTO action_event "
+            "(name, timestamp, recording_id, mouse_x, mouse_y, "
+            "mouse_button_name, mouse_pressed) "
+            "VALUES ('click', ?, 1, 300.0, 400.0, 'left', 1)",
+            (t + 35,),
+        )
+        conn.execute(
+            "INSERT INTO action_event "
+            "(name, timestamp, recording_id, mouse_x, mouse_y, "
+            "mouse_button_name, mouse_pressed) "
+            "VALUES ('click', ?, 1, 300.0, 400.0, 'left', 0)",
+            (t + 35.05,),
+        )
+        conn.commit()
+        conn.close()
+
+    def _load_chunk_messages(self):
+        """Pre-load rotation messages for 2 chunks."""
+        t = 1000.0
+        self._chunk_process_q.put({
+            "type": "chunk_rotated",
+            "completed_index": 0,
+            "chunk_start_time": t,
+            "rotation_time": t + 30,
+        })
+        self._chunk_process_q.put({
+            "type": "final_chunk",
+            "completed_index": 1,
+            "chunk_start_time": t + 30,
+            "rotation_time": t + 60,
+        })
