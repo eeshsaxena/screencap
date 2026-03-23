@@ -180,3 +180,245 @@ class TestChunkedVideoWriterPTS:
             assert first_pts_sec < 1.0, (
                 f"{chunk_path.name}: first PTS={first_pts_sec:.3f}s, expected near 0"
             )
+
+
+def _video_writer_subprocess(output_dir, frame_q, chunk_q, result_q, terminate, started):
+    """Subprocess target: mimics write_events loop with ChunkedVideoWriter.
+
+    Must be at module level for macOS spawn-mode pickling.
+    """
+    try:
+        writer = ChunkedVideoWriter(
+            output_dir=output_dir, width=100, height=100,
+            chunk_duration=0.5,  # 0.5s chunks
+            chunk_rotate_q=chunk_q,
+        )
+        started.set()
+        while not terminate.is_set():
+            try:
+                img, ts = frame_q.get(timeout=0.05)
+            except Exception:
+                continue
+            # This is the call that can crash during rotation
+            writer.write_frame(img, ts)
+        writer.close()
+        result_q.put({"status": "ok"})
+    except Exception as e:
+        import traceback
+        result_q.put({
+            "status": "error",
+            "error": str(e),
+            "traceback": traceback.format_exc(),
+        })
+
+
+class TestChunkedVideoWriterRotation:
+    """Verify ChunkedVideoWriter rotates chunks and continues recording."""
+
+    def test_rotation_continues_writing_action_gated(self, tmp_path):
+        """Frames written after chunk rotation produce a valid second chunk.
+
+        Reproduces the action-gated pattern: sparse frames with gaps.
+        The writer must rotate at the chunk boundary and continue writing
+        to the new chunk without crashing.
+        """
+        from multiprocessing import Queue
+
+        chunk_q = Queue()
+        writer = ChunkedVideoWriter(
+            output_dir=tmp_path, width=100, height=100,
+            chunk_duration=2.0,  # 2-second chunks for fast test
+            chunk_rotate_q=chunk_q,
+        )
+        base = time.time()
+
+        # Chunk 0: 3 frames in first 1.5s (action-gated: sparse)
+        for i in range(3):
+            img = Image.new("RGB", (100, 100), color=(i * 80, 0, 0))
+            writer.write_frame(img, base + i * 0.5)
+
+        # Chunk 1: frame arrives at 2.5s (past boundary) — triggers rotation
+        img_after = Image.new("RGB", (100, 100), color=(0, 255, 0))
+        writer.write_frame(img_after, base + 2.5)
+
+        # More frames in chunk 1
+        for i in range(2):
+            img = Image.new("RGB", (100, 100), color=(0, i * 100, 0))
+            writer.write_frame(img, base + 3.0 + i * 0.5)
+
+        writer.close()
+
+        # Verify both chunks exist and are playable
+        chunks = sorted(tmp_path.glob("chunk_*.mp4"))
+        assert len(chunks) == 2, f"Expected 2 chunks, got {len(chunks)}: {chunks}"
+
+        for chunk_path in chunks:
+            container = av.open(str(chunk_path))
+            frames = list(container.decode(video=0))
+            container.close()
+            assert len(frames) > 0, f"{chunk_path.name} has no frames"
+
+        # Verify rotation event was emitted
+        msg = chunk_q.get(timeout=1)
+        assert msg["type"] == "chunk_rotated"
+        assert msg["completed_index"] == 0
+
+    def test_rotation_with_large_idle_gap(self, tmp_path):
+        """Action-gated: long idle gap then activity should rotate cleanly.
+
+        Simulates a user who is idle for 10 seconds (far past the 2s chunk
+        boundary), then resumes activity. The writer must rotate and the
+        new chunk's PTS should start near 0.
+        """
+        writer = ChunkedVideoWriter(
+            output_dir=tmp_path, width=100, height=100,
+            chunk_duration=2.0,
+        )
+        base = time.time()
+
+        # Single frame in chunk 0
+        writer.write_frame(
+            Image.new("RGB", (100, 100), color="red"), base
+        )
+
+        # 10-second idle gap, then activity — crosses chunk boundary
+        writer.write_frame(
+            Image.new("RGB", (100, 100), color="blue"), base + 10.0
+        )
+
+        writer.close()
+
+        chunks = sorted(tmp_path.glob("chunk_*.mp4"))
+        assert len(chunks) == 2, f"Expected 2 chunks, got {len(chunks)}: {chunks}"
+
+        # Second chunk's PTS should start near 0, not at 10s
+        container = av.open(str(chunks[1]))
+        first_frame = next(container.decode(video=0))
+        pts_sec = float(first_frame.pts * first_frame.time_base)
+        container.close()
+        assert pts_sec < 1.0, f"Chunk 1 PTS starts at {pts_sec:.3f}s, expected near 0"
+
+    def test_video_writer_process_survives_chunk_rotation(self, tmp_path):
+        """Video writer process stays alive through chunk rotation.
+
+        Reproduces the bug where local recordings stop at chunk boundary
+        because the video writer process crashes during rotation, triggering
+        critical-task-death detection.
+
+        Exercises ChunkedVideoWriter.write_frame() → _start_new_chunk() →
+        VideoWriter.close() in a real subprocess (spawn mode on macOS),
+        which is the same execution context as the production video writer.
+        """
+        import multiprocessing
+
+        chunk_q = multiprocessing.Queue()
+        result_q = multiprocessing.Queue()
+        frame_q = multiprocessing.Queue()
+        terminate = multiprocessing.Event()
+        started = multiprocessing.Event()
+
+        writer_proc = multiprocessing.Process(
+            target=_video_writer_subprocess,
+            args=(str(tmp_path), frame_q, chunk_q, result_q, terminate, started),
+        )
+        writer_proc.start()
+        assert started.wait(timeout=10), "Video writer subprocess did not start"
+
+        # Simulate action-gated frames: burst, gap, burst (crosses boundary)
+        base = time.time()
+
+        # Chunk 0: 3 frames in first 0.3s
+        for i in range(3):
+            img = Image.new("RGB", (100, 100), color=(i * 80, 0, 0))
+            frame_q.put((img, base + i * 0.1))
+
+        # Wait past the 0.5s chunk boundary
+        time.sleep(1.0)
+
+        # Post-boundary frames — triggers rotation, where crashes happen
+        for i in range(3):
+            img = Image.new("RGB", (100, 100), color=(0, i * 80, 0))
+            frame_q.put((img, base + 1.0 + i * 0.1))
+
+        time.sleep(0.5)  # Let frames be processed
+
+        # KEY ASSERTION: process must still be alive after chunk rotation
+        assert writer_proc.is_alive(), (
+            f"Video writer process died during chunk rotation "
+            f"(exitcode={writer_proc.exitcode})"
+        )
+
+        # Clean shutdown
+        terminate.set()
+        writer_proc.join(timeout=10)
+        assert writer_proc.exitcode == 0, (
+            f"Video writer exited with code {writer_proc.exitcode}"
+        )
+
+        # Check subprocess result for exceptions
+        result = result_q.get(timeout=1)
+        assert result["status"] == "ok", (
+            f"Subprocess error: {result.get('error')}\n{result.get('traceback')}"
+        )
+
+        # Verify chunks were produced
+        chunks = sorted(tmp_path.glob("chunk_*.mp4"))
+        assert len(chunks) >= 2, f"Expected >= 2 chunks, got {len(chunks)}"
+
+    def test_rotation_survives_close_exception(self, tmp_path):
+        """Writer continues recording even if VideoWriter.close() raises
+        during chunk rotation (e.g. PTS error, disk I/O, GIL deadlock).
+
+        Without defensive error handling in _start_new_chunk(), this
+        exception would propagate up through write_frame() → write_events()
+        and kill the video writer process.
+        """
+        from unittest.mock import patch
+
+        writer = ChunkedVideoWriter(
+            output_dir=tmp_path, width=100, height=100,
+            chunk_duration=2.0,
+        )
+        base = time.time()
+
+        # Write frames to chunk 0
+        for i in range(3):
+            img = Image.new("RGB", (100, 100), color=(i * 80, 0, 0))
+            writer.write_frame(img, base + i * 0.5)
+
+        # Patch VideoWriter.close to raise on the NEXT call (rotation close)
+        original_close = VideoWriter.close
+        close_call_count = 0
+
+        def exploding_close(self):
+            nonlocal close_call_count
+            close_call_count += 1
+            if close_call_count == 1:
+                raise RuntimeError("Simulated PTS/encoding failure during close")
+            return original_close(self)
+
+        with patch.object(VideoWriter, "close", exploding_close):
+            # This frame crosses the boundary — triggers rotation
+            # _start_new_chunk() calls close() which raises, but should recover
+            img_after = Image.new("RGB", (100, 100), color=(0, 255, 0))
+            writer.write_frame(img_after, base + 2.5)
+
+        # More frames in chunk 1 — proves the writer is still functional
+        for i in range(2):
+            img = Image.new("RGB", (100, 100), color=(0, i * 100, 0))
+            writer.write_frame(img, base + 3.0 + i * 0.5)
+
+        writer.close()
+
+        # Chunk 0 may be missing/corrupt (close failed and container was
+        # never flushed), but chunk 1 must exist and be playable
+        chunks = sorted(tmp_path.glob("chunk_*.mp4"))
+        assert any("chunk_0001" in c.name for c in chunks), (
+            f"Expected chunk_0001.mp4 after recovery, got: {chunks}"
+        )
+
+        chunk_1 = tmp_path / "chunk_0001.mp4"
+        container = av.open(str(chunk_1))
+        frames = list(container.decode(video=0))
+        container.close()
+        assert len(frames) > 0, "Chunk 1 has no frames after rotation recovery"

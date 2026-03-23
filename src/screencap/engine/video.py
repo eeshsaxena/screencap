@@ -716,9 +716,23 @@ class ChunkedVideoWriter:
         return self.output_dir / f"chunk_{index:04d}.mp4"
 
     def _start_new_chunk(self, timestamp: float) -> None:
-        """Start a new video chunk."""
+        """Start a new video chunk.
+
+        Defensively handles errors during the previous chunk's close and new
+        chunk creation so that a single rotation failure cannot kill the video
+        writer process (and therefore the entire recording).
+        """
         if self._current_writer is not None:
-            self._current_writer.close()
+            try:
+                self._current_writer.close()
+            except Exception:
+                logger.exception(
+                    "Error closing chunk {} during rotation — "
+                    "continuing with new chunk (at most one final frame lost)",
+                    self._chunk_index - 1,
+                )
+                # Ensure old writer is discarded even on failure
+                self._current_writer = None
             # Notify about completed chunk
             if self.chunk_rotate_q is not None:
                 try:
