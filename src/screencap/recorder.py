@@ -535,9 +535,9 @@ def start_recording(
         raise SystemExit(1)
 
     # --- Privacy: capture-time enforcement ---
-    # Cloud-intent recordings always use PUBLIC mode — this is intentionally
-    # "looser" than INTERNAL because PUBLIC triggers OCR_FALLBACK for code
-    # editors, which the cloud block set catches. INTERNAL would ALLOW them.
+    # Cloud-intent recordings always use PUBLIC mode — this is stricter than
+    # INTERNAL because PUBLIC triggers MASK_WINDOW for email/chat/calendar
+    # (vs ALLOW in INTERNAL) and TEXT_REDACT for code editors (vs ALLOW).
     if cloud_intent:
         from screencap.privacy.policy import PrivacyMode as _PrivacyMode
         force_mode = _PrivacyMode.PUBLIC
@@ -593,7 +593,7 @@ def start_recording(
         console.print("[bold yellow]⚠ Cloud Recording Privacy Notice[/bold yellow]")
         console.print("This recording will be uploaded. Privacy protections active:")
         console.print("  • Sensitive apps (email, chat, banking, passwords) are automatically blocked")
-        console.print("  • Code editors and admin consoles are captured with best-effort text redaction")
+        console.print("  • Code editors and admin consoles are captured; keystroke text is scrubbed for PII before upload")
         console.print("  • Audio continues recording during all intervals, including blocked apps")
         console.print("  [dim]Avoid displaying passwords, API keys, or personal information on screen.[/dim]")
         console.print()
