@@ -188,15 +188,13 @@ class FakeRecorder:
 
     def _create_db(self):
         """Create a recording.db with minimal realistic data."""
-        import time as _time
-
         from screencap.engine.db import create_db, crud
 
         db_path = Path(self.capture_dir) / "recording.db"
         engine, Session = create_db(str(db_path))
         session = Session()
 
-        t = _time.time()
+        t = 1000.0
         recording = crud.insert_recording(session, {
             "timestamp": t,
             "platform": "darwin",

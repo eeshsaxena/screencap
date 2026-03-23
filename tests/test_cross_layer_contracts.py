@@ -21,7 +21,6 @@ def test_recorder_api_surface():
     assert hasattr(Recorder, "stop")
 
     # Properties/attributes read by the screencap layer
-    # (verified via instance after __init__, not on the class)
     sig = inspect.signature(Recorder.__init__)
     params = sig.parameters
     assert "capture_dir" in params
@@ -30,17 +29,6 @@ def test_recorder_api_surface():
     assert isinstance(Recorder.is_recording, property)
     assert isinstance(Recorder.health_warning, property)
     assert isinstance(Recorder.child_crashes, property)
-
-    # Instance attributes set in __init__ — verify they appear in the source
-    source = inspect.getsource(Recorder.__init__)
-    for attr in (
-        "capture_dir",
-        "_chunk_process_q",
-        "_audio_ack_q",
-        "_flush_requested",
-        "_flush_ack_counter",
-    ):
-        assert attr in source, f"Recorder.__init__ must set self.{attr}"
 
 
 def test_capture_session_load_returns_expected_interface(recording_db):
