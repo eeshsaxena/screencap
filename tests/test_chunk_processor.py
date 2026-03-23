@@ -14,23 +14,9 @@ import pytest
 
 
 @pytest.fixture
-def capture_dir(tmp_path):
-    """Create a minimal capture directory."""
-    db_path = tmp_path / "recording.db"
-    # Create minimal SQLite DB with action_event table
-    import sqlite3
-
-    conn = sqlite3.connect(str(db_path))
-    conn.execute(
-        "CREATE TABLE action_event (id INTEGER PRIMARY KEY, timestamp REAL, type TEXT, data TEXT)"
-    )
-    conn.execute(
-        "CREATE TABLE recording (id INTEGER PRIMARY KEY, timestamp REAL)"
-    )
-    conn.execute("INSERT INTO recording VALUES (1, 1000.0)")
-    conn.commit()
-    conn.close()
-    return tmp_path
+def capture_dir(recording_db):
+    """Capture directory with a real engine DB schema."""
+    return recording_db.db_path.parent
 
 
 def test_run_loop_survives_long_idle_and_responds(capture_dir):
@@ -109,37 +95,9 @@ def test_was_force_stopped_reflects_stop_event(capture_dir):
 
 
 @pytest.fixture
-def cloud_capture_dir(tmp_path):
-    """Capture dir with recording.db including window_event table."""
-    import sqlite3
-
-    db_path = tmp_path / "recording.db"
-    conn = sqlite3.connect(str(db_path))
-    conn.execute(
-        "CREATE TABLE action_event ("
-        "id INTEGER PRIMARY KEY, timestamp REAL, name TEXT, "
-        "mouse_x REAL, mouse_y REAL, mouse_dx REAL, mouse_dy REAL, "
-        "mouse_button_name TEXT, mouse_pressed INTEGER, "
-        "mouse_pressure REAL, modifier_flags INTEGER, "
-        "scroll_phase INTEGER, momentum_phase INTEGER, is_continuous INTEGER, "
-        "key_char TEXT, key_name TEXT, key_vk TEXT, "
-        "canonical_key_char TEXT, canonical_key_name TEXT, canonical_key_vk TEXT, "
-        "text TEXT, element_state TEXT, "
-        "active_segment_description TEXT, available_segment_descriptions TEXT)"
-    )
-    conn.execute(
-        "CREATE TABLE window_event ("
-        "id INTEGER PRIMARY KEY, timestamp REAL, title TEXT, "
-        "app_bundle_id TEXT, window_id TEXT, "
-        "left INTEGER, top INTEGER, width INTEGER, height INTEGER)"
-    )
-    conn.execute(
-        "CREATE TABLE recording (id INTEGER PRIMARY KEY, timestamp REAL)"
-    )
-    conn.execute("INSERT INTO recording VALUES (1, 1000.0)")
-    conn.commit()
-    conn.close()
-    return tmp_path
+def cloud_capture_dir(recording_db):
+    """Capture dir with a real engine DB schema including all tables."""
+    return recording_db.db_path.parent
 
 
 def _make_mock_pipeline():
@@ -617,34 +575,34 @@ class TestPlaceholderFrame:
 class TestUnifiedEventExport:
     """Tests for the unified _export_events pipeline (Phase 3)."""
 
-    def _insert_action(self, conn, ts, name="click", **kwargs):
-        """Insert an action_event row."""
-        cols = {"timestamp": ts, "name": name}
-        cols.update(kwargs)
-        keys = ", ".join(cols.keys())
-        placeholders = ", ".join("?" * len(cols))
-        conn.execute(f"INSERT INTO action_event ({keys}) VALUES ({placeholders})", list(cols.values()))
+    @staticmethod
+    def _insert_action(rdb, ts, name="click", **kwargs):
+        """Insert an action_event using the shared recording_db session."""
+        from screencap.engine.db import crud
 
-    def _insert_window(self, conn, ts, title="Finder", bundle_id="com.apple.finder", window_id="1"):
-        """Insert a window_event row."""
-        conn.execute(
-            "INSERT INTO window_event (timestamp, title, app_bundle_id, window_id, "
-            "\"left\", top, width, height) VALUES (?, ?, ?, ?, 0, 0, 800, 600)",
-            (ts, title, bundle_id, window_id),
-        )
+        data = dict(kwargs)
+        data["name"] = name
+        crud.insert_action_event(rdb.session, rdb.recording, ts, data)
 
-    def test_produces_processed_events(self, cloud_capture_dir):
+    @staticmethod
+    def _insert_window(rdb, ts, title="Finder", bundle_id="com.apple.finder", window_id="1"):
+        """Insert a window_event using the shared recording_db session."""
+        from screencap.engine.db import crud
+
+        crud.insert_window_event(rdb.session, rdb.recording, ts, {
+            "title": title,
+            "app_bundle_id": bundle_id,
+            "window_id": window_id,
+            "left": 0, "top": 0, "width": 800, "height": 600,
+        })
+
+    def test_produces_processed_events(self, cloud_capture_dir, recording_db):
         """_export_events should produce processed Pydantic events, not raw DB rows."""
-        import sqlite3
-
-        conn = sqlite3.connect(str(cloud_capture_dir / "recording.db"))
         # Insert a click down + up → should be merged into mouse.singleclick
-        self._insert_action(conn, 1000.0, "click", mouse_x=100, mouse_y=200,
+        self._insert_action(recording_db, 1000.0, "click", mouse_x=100, mouse_y=200,
                             mouse_button_name="left", mouse_pressed=1)
-        self._insert_action(conn, 1000.1, "click", mouse_x=100, mouse_y=200,
+        self._insert_action(recording_db, 1000.1, "click", mouse_x=100, mouse_y=200,
                             mouse_button_name="left", mouse_pressed=0)
-        conn.commit()
-        conn.close()
 
         from screencap.chunk_processor import ChunkProcessor
 
@@ -673,20 +631,15 @@ class TestUnifiedEventExport:
         # Should NOT have raw "click" entries
         assert not any(e.get("name") == "click" for e in events)
 
-    def test_includes_window_switch_events(self, cloud_capture_dir):
+    def test_includes_window_switch_events(self, cloud_capture_dir, recording_db):
         """_export_events should include deduplicated window.switch events."""
-        import sqlite3
-
-        conn = sqlite3.connect(str(cloud_capture_dir / "recording.db"))
-        self._insert_window(conn, 1000.0, "Documents", "com.apple.finder", "1")
-        self._insert_window(conn, 1000.5, "Downloads", "com.apple.finder", "1")  # same window, title change
-        self._insert_window(conn, 1001.0, "Google", "com.google.Chrome", "2")  # different window
-        self._insert_action(conn, 1000.2, "click", mouse_x=100, mouse_y=200,
+        self._insert_window(recording_db, 1000.0, "Documents", "com.apple.finder", "1")
+        self._insert_window(recording_db, 1000.5, "Downloads", "com.apple.finder", "1")  # same window, title change
+        self._insert_window(recording_db, 1001.0, "Google", "com.google.Chrome", "2")  # different window
+        self._insert_action(recording_db, 1000.2, "click", mouse_x=100, mouse_y=200,
                             mouse_button_name="left", mouse_pressed=1)
-        self._insert_action(conn, 1000.3, "click", mouse_x=100, mouse_y=200,
+        self._insert_action(recording_db, 1000.3, "click", mouse_x=100, mouse_y=200,
                             mouse_button_name="left", mouse_pressed=0)
-        conn.commit()
-        conn.close()
 
         from screencap.chunk_processor import ChunkProcessor
 
@@ -708,19 +661,14 @@ class TestUnifiedEventExport:
         assert ws_events[0]["app_bundle_id"] == "com.apple.finder"
         assert ws_events[1]["app_bundle_id"] == "com.google.Chrome"
 
-    def test_initial_window_context(self, cloud_capture_dir):
+    def test_initial_window_context(self, cloud_capture_dir, recording_db):
         """First window.switch should be from before chunk start (initial context)."""
-        import sqlite3
-
-        conn = sqlite3.connect(str(cloud_capture_dir / "recording.db"))
         # Window event before chunk start
-        self._insert_window(conn, 999.0, "Pre-chunk App", "com.example.app", "10")
-        self._insert_action(conn, 1000.2, "click", mouse_x=100, mouse_y=200,
+        self._insert_window(recording_db, 999.0, "Pre-chunk App", "com.example.app", "10")
+        self._insert_action(recording_db, 1000.2, "click", mouse_x=100, mouse_y=200,
                             mouse_button_name="left", mouse_pressed=1)
-        self._insert_action(conn, 1000.3, "click", mouse_x=100, mouse_y=200,
+        self._insert_action(recording_db, 1000.3, "click", mouse_x=100, mouse_y=200,
                             mouse_button_name="left", mouse_pressed=0)
-        conn.commit()
-        conn.close()
 
         from screencap.chunk_processor import ChunkProcessor
 
@@ -756,18 +704,13 @@ class TestUnifiedEventExport:
         assert (cloud_capture_dir / "events_0000.jsonl").exists()
         assert not (cloud_capture_dir / "events_0000.jsonl.tmp").exists()
 
-    def test_excludes_mouse_move_by_default(self, cloud_capture_dir):
+    def test_excludes_mouse_move_by_default(self, cloud_capture_dir, recording_db):
         """Mouse.move events should be excluded by default."""
-        import sqlite3
-
-        conn = sqlite3.connect(str(cloud_capture_dir / "recording.db"))
-        self._insert_action(conn, 1000.0, "move", mouse_x=100, mouse_y=200)
-        self._insert_action(conn, 1000.1, "click", mouse_x=100, mouse_y=200,
+        self._insert_action(recording_db, 1000.0, "move", mouse_x=100, mouse_y=200)
+        self._insert_action(recording_db, 1000.1, "click", mouse_x=100, mouse_y=200,
                             mouse_button_name="left", mouse_pressed=1)
-        self._insert_action(conn, 1000.2, "click", mouse_x=100, mouse_y=200,
+        self._insert_action(recording_db, 1000.2, "click", mouse_x=100, mouse_y=200,
                             mouse_button_name="left", mouse_pressed=0)
-        conn.commit()
-        conn.close()
 
         from screencap.chunk_processor import ChunkProcessor
 
@@ -784,21 +727,16 @@ class TestUnifiedEventExport:
         events = [json.loads(line) for line in lines[1:]]
         assert not any(e["type"] == "mouse.move" for e in events)
 
-    def test_malformed_rows_skipped_gracefully(self, cloud_capture_dir):
+    def test_malformed_rows_skipped_gracefully(self, cloud_capture_dir, recording_db):
         """Rows that fail conversion should be skipped without crashing export."""
-        import sqlite3
-
-        conn = sqlite3.connect(str(cloud_capture_dir / "recording.db"))
         # Valid click pair
-        self._insert_action(conn, 1000.0, "click", mouse_x=100, mouse_y=200,
+        self._insert_action(recording_db, 1000.0, "click", mouse_x=100, mouse_y=200,
                             mouse_button_name="left", mouse_pressed=1)
-        self._insert_action(conn, 1000.1, "click", mouse_x=100, mouse_y=200,
+        self._insert_action(recording_db, 1000.1, "click", mouse_x=100, mouse_y=200,
                             mouse_button_name="left", mouse_pressed=0)
         # Malformed: click with mouse_pressed=None → dict_to_action_event returns None
-        self._insert_action(conn, 1000.5, "click", mouse_x=50, mouse_y=50,
+        self._insert_action(recording_db, 1000.5, "click", mouse_x=50, mouse_y=50,
                             mouse_button_name="left")  # mouse_pressed defaults to NULL
-        conn.commit()
-        conn.close()
 
         from screencap.chunk_processor import ChunkProcessor
 
@@ -828,46 +766,38 @@ class TestUnifiedEventExport:
 
 def _create_seven_chunk_db(db_path: Path, t0: float) -> None:
     """Create a DB with events spanning 7 chunks (30s each)."""
-    import sqlite3
+    from screencap.engine.db import create_db, crud
 
-    conn = sqlite3.connect(str(db_path))
-    conn.execute(
-        "CREATE TABLE action_event ("
-        "id INTEGER PRIMARY KEY, timestamp REAL, name TEXT, "
-        "mouse_x REAL, mouse_y REAL, mouse_dx REAL, mouse_dy REAL, "
-        "mouse_button_name TEXT, mouse_pressed INTEGER, "
-        "mouse_pressure REAL, modifier_flags INTEGER, "
-        "scroll_phase INTEGER, momentum_phase INTEGER, is_continuous INTEGER, "
-        "key_char TEXT, key_name TEXT, key_vk TEXT, "
-        "canonical_key_char TEXT, canonical_key_name TEXT, canonical_key_vk TEXT, "
-        "text TEXT, element_state TEXT, "
-        "active_segment_description TEXT, available_segment_descriptions TEXT)"
-    )
-    conn.execute(
-        "CREATE TABLE window_event ("
-        "id INTEGER PRIMARY KEY, timestamp REAL, title TEXT, "
-        "app_bundle_id TEXT, window_id TEXT, "
-        "left INTEGER, top INTEGER, width INTEGER, height INTEGER)"
-    )
-    conn.execute(
-        "CREATE TABLE recording (id INTEGER PRIMARY KEY, timestamp REAL)"
-    )
-    conn.execute("INSERT INTO recording VALUES (1, ?)", (t0,))
+    engine, Session = create_db(str(db_path))
+    session = Session()
+    recording = crud.insert_recording(session, {
+        "timestamp": t0,
+        "platform": "darwin",
+        "monitor_width": 1920,
+        "monitor_height": 1080,
+        "pixel_ratio": 2.0,
+        "double_click_interval_seconds": 0.5,
+        "double_click_distance_pixels": 5.0,
+    })
     # Insert one click pair per chunk so _export_events has something to process
     for i in range(7):
         chunk_ts = t0 + i * 30 + 5
-        conn.execute(
-            "INSERT INTO action_event (timestamp, name, mouse_x, mouse_y, "
-            "mouse_button_name, mouse_pressed) VALUES (?, 'click', 100, 200, 'left', 1)",
-            (chunk_ts,),
-        )
-        conn.execute(
-            "INSERT INTO action_event (timestamp, name, mouse_x, mouse_y, "
-            "mouse_button_name, mouse_pressed) VALUES (?, 'click', 100, 200, 'left', 0)",
-            (chunk_ts + 0.1,),
-        )
-    conn.commit()
-    conn.close()
+        crud.insert_action_event(session, recording, chunk_ts, {
+            "name": "click",
+            "mouse_x": 100.0,
+            "mouse_y": 200.0,
+            "mouse_button_name": "left",
+            "mouse_pressed": True,
+        })
+        crud.insert_action_event(session, recording, chunk_ts + 0.1, {
+            "name": "click",
+            "mouse_x": 100.0,
+            "mouse_y": 200.0,
+            "mouse_button_name": "left",
+            "mouse_pressed": False,
+        })
+    session.close()
+    engine.dispose()
 
 
 def _create_chunk_media_files(capture_dir: Path, n_chunks: int) -> None:

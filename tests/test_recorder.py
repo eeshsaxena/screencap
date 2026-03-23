@@ -96,11 +96,9 @@ class TestOrphanDetection:
 
     def test_start_force_clean_removes_orphans(self, tmp_path):
         """start_recording with force_clean=True should clean orphans and continue."""
-        from screencap.recorder import start_recording
+        from tests.conftest import FakeRecorder
 
-        mock_recorder = mock.MagicMock()
-        mock_recorder.wait_for_ready.return_value = True
-        mock_recorder.is_recording = False
+        from screencap.recorder import start_recording
 
         orphans = [{"pid": 123, "name": "writer"}]
 
@@ -115,11 +113,8 @@ class TestOrphanDetection:
             mock.patch("screencap.pidfile.terminate_processes") as mock_term,
             mock.patch("screencap.pidfile.delete_pidfile"),
             mock.patch("screencap.pidfile.write_pidfile"),
-            mock.patch("screencap.engine.Recorder") as MockRecorder,
+            mock.patch("screencap.engine.Recorder", FakeRecorder),
         ):
-            MockRecorder.return_value.__enter__ = mock.MagicMock(return_value=mock_recorder)
-            MockRecorder.return_value.__exit__ = mock.MagicMock(return_value=False)
-
             start_recording("test", output_dir=tmp_path / "test-rec", force_clean=True)
 
         mock_term.assert_called_once_with(orphans, force=True)
@@ -351,11 +346,9 @@ class TestPreRecordingDiskCheck:
 
     def test_sufficient_space_passes(self, tmp_path):
         """Recording starts normally when there is enough disk space."""
-        from screencap.recorder import start_recording
+        from tests.conftest import FakeRecorder
 
-        mock_recorder = mock.MagicMock()
-        mock_recorder.wait_for_ready.return_value = True
-        mock_recorder.is_recording = False
+        from screencap.recorder import start_recording
 
         # 10 GB free — well above default 2000 MB warn threshold
         fake_usage = DiskUsage(total=100e9, used=90e9, free=10e9)
@@ -370,11 +363,8 @@ class TestPreRecordingDiskCheck:
             mock.patch("screencap.pidfile.find_orphaned_processes", return_value=[]),
             mock.patch("screencap.pidfile.write_pidfile"),
             mock.patch("screencap.pidfile.delete_pidfile"),
-            mock.patch("screencap.engine.Recorder") as MockRecorder,
+            mock.patch("screencap.engine.Recorder", FakeRecorder),
         ):
-            MockRecorder.return_value.__enter__ = mock.MagicMock(return_value=mock_recorder)
-            MockRecorder.return_value.__exit__ = mock.MagicMock(return_value=False)
-
             capture_dir, elapsed = start_recording("test", output_dir=tmp_path / "test-rec")
             assert capture_dir.exists()
 
