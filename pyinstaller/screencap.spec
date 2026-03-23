@@ -126,7 +126,6 @@ a = Analysis(
         # Large ML frameworks — not used by screencap
         'torch', 'torchvision', 'torchaudio',
         'transformers', 'tokenizers', 'safetensors',
-        'hf_xet',                    # optional HF acceleration, not needed
         'cv2',
         'matplotlib', 'sympy', 'IPython', 'notebook', 'jupyter',
         'scipy', 'sklearn', 'faiss',
