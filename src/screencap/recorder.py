@@ -593,7 +593,7 @@ def start_recording(
         console.print("[bold yellow]⚠ Cloud Recording Privacy Notice[/bold yellow]")
         console.print("This recording will be uploaded. Privacy protections active:")
         console.print("  • Sensitive apps (email, chat, banking, passwords) are automatically blocked")
-        console.print("  • Code editors and admin consoles are blocked (no text redaction available)")
+        console.print("  • Code editors and admin consoles are captured with best-effort text redaction")
         console.print("  • Audio continues recording during all intervals, including blocked apps")
         console.print("  [dim]Avoid displaying passwords, API keys, or personal information on screen.[/dim]")
         console.print()

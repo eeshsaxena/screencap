@@ -40,8 +40,8 @@ class TestRecorderDomainPropagation:
     """RecorderPrivacyFilter reads browser_url and classifies by domain."""
 
     def test_browser_on_safe_domain_allowed(self):
-        """Chrome on github.com → CODE_EDITOR_TERMINAL → OCR_FALLBACK (public).
-        Non-cloud OCR_FALLBACK passes through."""
+        """Chrome on github.com → CODE_EDITOR_TERMINAL → TEXT_REDACT (public).
+        TEXT_REDACT passes through capture-time filters."""
         config = _make_config()
         f = RecorderPrivacyFilter(
             config, transition_hold_seconds=0.0, secure_input_fn=None,
@@ -52,8 +52,8 @@ class TestRecorderDomainPropagation:
             "title": "GitHub",
             "browser_url": "https://github.com/user/repo",
         })
-        # github.com → CODE_EDITOR_TERMINAL → OCR_FALLBACK in public
-        # Non-cloud: OCR_FALLBACK is not in the block set → allowed
+        # github.com → CODE_EDITOR_TERMINAL → TEXT_REDACT in public
+        # TEXT_REDACT is not in the block set → allowed
         assert f.is_screen_allowed() is True
 
     def test_browser_on_banking_domain_excluded(self):
@@ -131,8 +131,8 @@ class TestExportDomainPropagation:
             domain="github.com",
         )
         result = pf(event)
-        # github.com → CODE_EDITOR_TERMINAL → OCR_FALLBACK in public
-        # Non-cloud → not suppressed
+        # github.com → CODE_EDITOR_TERMINAL → TEXT_REDACT in public
+        # TEXT_REDACT → not suppressed
         assert result is not None
         assert result.domain == "github.com"
 
@@ -401,7 +401,7 @@ class TestBuildBlockedIntervalsDomain:
         ]
 
         intervals = _build_blocked_intervals(events, evaluator, classifier)
-        # github.com → CODE_EDITOR_TERMINAL → OCR_FALLBACK (not in BLOCK_ACTIONS)
+        # github.com → CODE_EDITOR_TERMINAL → TEXT_REDACT (not in BLOCK_ACTIONS)
         assert len(intervals) == 0
 
 

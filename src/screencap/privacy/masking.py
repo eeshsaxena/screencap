@@ -46,7 +46,7 @@ _SURFACE_STRATEGY: dict[ContextClass, MaskStrategy] = {
     ContextClass.BROWSER_UNVERIFIED: MaskStrategy.FULL_WINDOW,
     ContextClass.UNKNOWN: MaskStrategy.FULL_WINDOW,
     # PASSWORD_MANAGER / BANKING -> EXCLUDE (no masking, file deleted)
-    # CODE_EDITOR_TERMINAL / ADMIN_CONSOLE -> OCR_FALLBACK (no masking)
+    # CODE_EDITOR_TERMINAL / ADMIN_CONSOLE -> TEXT_REDACT (no masking needed)
 }
 
 

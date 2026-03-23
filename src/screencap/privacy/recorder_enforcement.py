@@ -57,7 +57,6 @@ from screencap.privacy.actions import (
     KEYSTROKE_CONTENT_FIELDS,
     KEYSTROKE_NULL_ACTIONS,
     VIDEO_BLOCK_ACTIONS,
-    PrivacyAction,
 )
 from screencap.privacy.context import DefaultContextClassifier, domain_from_url
 from screencap.privacy.policy import (
@@ -65,7 +64,6 @@ from screencap.privacy.policy import (
     DefaultPolicyEvaluator,
     FrameMetadata,
     PrivacyConfig,
-    get_matrix_action,
 )
 from screencap.privacy.reasons import ReasonCode
 
@@ -159,30 +157,14 @@ class RecorderPrivacyFilter:
         self._lock = threading.Lock()
         self._hold_seconds = transition_hold_seconds
 
-        # Cloud-intent: expand block set to include OCR_FALLBACK apps
-        # (code editors, admin consoles) which would otherwise pass through
-        # unredacted since no OCR redaction engine exists for video.
         self._cloud_intent = cloud_intent
-        self._block_actions = BLOCK_ACTIONS | (
-            frozenset({PrivacyAction.OCR_FALLBACK}) if cloud_intent else frozenset()
-        )
-        # Actions that trigger cloud-specific blocking even for allow_apps.
-        # allow_apps overrides the matrix to ALLOW, which is correct for local
-        # recordings (OCR scrubbing happens post-capture). But cloud video
-        # has no text redaction — so OCR_FALLBACK apps must still be blocked.
-        self._cloud_override_actions = (
-            frozenset({PrivacyAction.OCR_FALLBACK}) if cloud_intent else frozenset()
-        )
+        self._block_actions = BLOCK_ACTIONS
 
         # Keystroke/video block sets — wider than _block_actions since
         # MASK_WINDOW no longer blocks screenshots but still blocks
         # keystrokes and video frames.
-        self._keystroke_null_actions = KEYSTROKE_NULL_ACTIONS | (
-            frozenset({PrivacyAction.OCR_FALLBACK}) if cloud_intent else frozenset()
-        )
-        self._video_block_actions = VIDEO_BLOCK_ACTIONS | (
-            frozenset({PrivacyAction.OCR_FALLBACK}) if cloud_intent else frozenset()
-        )
+        self._keystroke_null_actions = KEYSTROKE_NULL_ACTIONS
+        self._video_block_actions = VIDEO_BLOCK_ACTIONS
 
         # Mutable state (protected by _lock)
         # reason -> hold_until monotonic timestamp (0.0 = not active)
@@ -240,15 +222,7 @@ class RecorderPrivacyFilter:
         ctx = self._classifier.classify(meta)
         decision = self._evaluator.evaluate(ctx, meta)
 
-        # Determine effective action — cloud-intent may override allow_apps
         effective_action = decision.action
-        if self._cloud_override_actions:
-            matrix_action = get_matrix_action(
-                ctx.context_class, self._evaluator.config.mode,
-            )
-            if matrix_action in self._cloud_override_actions and effective_action not in self._block_actions:
-                effective_action = matrix_action
-
         now_blocked = effective_action in self._block_actions
         # Whether keystrokes/video need blocking (wider than screenshot blocking)
         now_keystroke_blocked = effective_action in self._keystroke_null_actions

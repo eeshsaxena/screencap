@@ -186,7 +186,7 @@ class TestScreenshotRouting:
         evaluator = _make_evaluator(mode="public")
         classifier = DefaultContextClassifier()
         window_events = _make_window_events([
-            (10.0, "com.microsoft.VSCode"),  # code_editor + public → OCR_FALLBACK
+            (10.0, "com.microsoft.VSCode"),  # code_editor + public → TEXT_REDACT
         ])
         result = ScrubResult()
 

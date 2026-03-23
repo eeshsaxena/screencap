@@ -189,6 +189,6 @@ class TestEndToEndConfigToAction:
         ctx = classifier.classify(meta)
         decision = evaluator.evaluate(ctx, meta)
 
-        # code_editor_terminal in public mode → OCR_FALLBACK
+        # code_editor_terminal in public mode → TEXT_REDACT
         from screencap.privacy.actions import PrivacyAction
-        assert decision.action == PrivacyAction.OCR_FALLBACK
+        assert decision.action == PrivacyAction.TEXT_REDACT
