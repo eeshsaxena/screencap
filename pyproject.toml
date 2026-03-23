@@ -74,6 +74,7 @@ asyncio_mode = "auto"
 markers = [
     "privacy: tests for privacy detection pipeline",
     "slow: marks tests as slow / integration (deselect with '-m \"not slow\"')",
+    "macos_hw: tests that mock macOS-specific APIs (accessibility, CoreWLAN, AppKit, permissions)",
 ]
 
 [tool.ruff]

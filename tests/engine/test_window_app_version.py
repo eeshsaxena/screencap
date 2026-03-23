@@ -2,6 +2,10 @@
 
 from unittest import mock
 
+import pytest
+
+pytestmark = pytest.mark.macos_hw
+
 
 def _make_quartz_meta(*, owner_name="Safari", window_name="My Page",
                       pid=1234, window_id=42,

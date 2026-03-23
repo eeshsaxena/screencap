@@ -4,6 +4,10 @@ from __future__ import annotations
 
 from unittest.mock import MagicMock, patch
 
+import pytest
+
+pytestmark = pytest.mark.macos_hw
+
 from screencap.engine.window.ax_browser_url import (
     extract_browser_url,
     invalidate_url_cache,
