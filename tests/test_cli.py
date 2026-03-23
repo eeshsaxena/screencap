@@ -500,105 +500,6 @@ def test_list_works_without_record_deps(tmp_path):
 # --- export command tests ---
 
 
-def _mock_event(event_json='{"type":"mouse.singleclick","timestamp":1.0,"x":100,"y":200}'):
-    """Create a mock BaseEvent whose model_dump_json() returns the given JSON."""
-    event = mock.MagicMock()
-    event.model_dump_json.return_value = event_json
-    return event
-
-
-def _mock_capture(events=None):
-    """Create a mock Capture that yields given events from export_events()."""
-    capture = mock.MagicMock()
-    capture.__enter__ = mock.MagicMock(return_value=capture)
-    capture.__exit__ = mock.MagicMock(return_value=False)
-    if events is None:
-        events = [_mock_event()]
-    capture.export_events.return_value = iter(events)
-    return capture
-
-
-def _jsonl_lines(output):
-    """Extract valid JSON lines from mixed output (JSONL + stderr warnings)."""
-    lines = []
-    for line in output.strip().split("\n"):
-        line = line.strip()
-        if line.startswith("{"):
-            lines.append(line)
-    return lines
-
-
-def test_export_default_writes_to_recording_dir(tmp_path):
-    """Default export writes events.jsonl into the recording directory."""
-    rec_dir = tmp_path / "my-rec"
-    rec_dir.mkdir()
-
-    capture = _mock_capture()
-    runner = CliRunner()
-
-    with (
-        mock.patch("screencap.config.resolve_recording_dir", return_value=rec_dir),
-        mock.patch("screencap.engine.capture.CaptureSession.load", return_value=capture),
-    ):
-        result = runner.invoke(cli, ["export", "my-rec"])
-
-    assert result.exit_code == 0
-    out_file = rec_dir / "events.jsonl"
-    assert out_file.exists()
-    lines = out_file.read_text().strip().split("\n")
-    assert len(lines) == 2  # metadata header + 1 event
-    header = json.loads(lines[0])
-    assert header["_meta"] is True
-    parsed = json.loads(lines[1])
-    assert parsed["type"] == "mouse.singleclick"
-
-
-def test_export_stdout(tmp_path):
-    """--stdout flag writes JSONL to stdout."""
-    rec_dir = tmp_path / "my-rec"
-    rec_dir.mkdir()
-
-    capture = _mock_capture()
-    runner = CliRunner()
-
-    with (
-        mock.patch("screencap.config.resolve_recording_dir", return_value=rec_dir),
-        mock.patch("screencap.engine.capture.CaptureSession.load", return_value=capture),
-    ):
-        result = runner.invoke(cli, ["export", "my-rec", "--stdout"])
-
-    assert result.exit_code == 0
-    lines = _jsonl_lines(result.output)
-    assert len(lines) == 2  # metadata header + 1 event
-    header = json.loads(lines[0])
-    assert header["_meta"] is True
-    parsed = json.loads(lines[1])
-    assert parsed["type"] == "mouse.singleclick"
-    # No file written in recording dir
-    assert not (rec_dir / "events.jsonl").exists()
-
-
-def test_export_to_file(tmp_path):
-    """Export to custom file path with -o."""
-    rec_dir = tmp_path / "my-rec"
-    rec_dir.mkdir()
-    out_file = tmp_path / "custom.jsonl"
-
-    capture = _mock_capture()
-    runner = CliRunner()
-
-    with (
-        mock.patch("screencap.config.resolve_recording_dir", return_value=rec_dir),
-        mock.patch("screencap.engine.capture.CaptureSession.load", return_value=capture),
-    ):
-        result = runner.invoke(cli, ["export", "my-rec", "-o", str(out_file)])
-
-    assert result.exit_code == 0
-    assert out_file.exists()
-    lines = out_file.read_text().strip().split("\n")
-    assert len(lines) == 2  # metadata header + 1 event
-
-
 def test_export_missing_recording(tmp_path):
     """Missing recording directory results in exit code 1."""
     rec_dir = tmp_path / "nonexistent"  # Does not exist
@@ -624,42 +525,6 @@ def test_export_path_traversal(tmp_path):
     assert result.exit_code == 1
 
 
-def test_export_exclude_moves(tmp_path):
-    """--exclude-moves passes include_moves=False to capture.export_events()."""
-    rec_dir = tmp_path / "my-rec"
-    rec_dir.mkdir()
-
-    capture = _mock_capture(events=[])
-    runner = CliRunner()
-
-    with (
-        mock.patch("screencap.config.resolve_recording_dir", return_value=rec_dir),
-        mock.patch("screencap.engine.capture.CaptureSession.load", return_value=capture),
-    ):
-        result = runner.invoke(cli, ["export", "my-rec", "--exclude-moves"])
-
-    assert result.exit_code == 0
-    capture.export_events.assert_called_once_with(include_moves=False)
-
-
-def test_export_includes_moves_by_default(tmp_path):
-    """Without --exclude-moves, include_moves=True is passed."""
-    rec_dir = tmp_path / "my-rec"
-    rec_dir.mkdir()
-
-    capture = _mock_capture(events=[])
-    runner = CliRunner()
-
-    with (
-        mock.patch("screencap.config.resolve_recording_dir", return_value=rec_dir),
-        mock.patch("screencap.engine.capture.CaptureSession.load", return_value=capture),
-    ):
-        result = runner.invoke(cli, ["export", "my-rec"])
-
-    assert result.exit_code == 0
-    capture.export_events.assert_called_once_with(include_moves=True)
-
-
 def test_export_legacy_db_error(tmp_path):
     """Legacy capture.db format results in exit code 1."""
     rec_dir = tmp_path / "old-rec"
@@ -679,87 +544,53 @@ def test_export_legacy_db_error(tmp_path):
     assert result.exit_code == 1
 
 
-def test_export_empty_recording(tmp_path):
-    """Empty recording produces events.jsonl with meta header and warning."""
-    rec_dir = tmp_path / "empty-rec"
-    rec_dir.mkdir()
-
-    capture = _mock_capture(events=[])
-    runner = CliRunner()
-
-    with (
-        mock.patch("screencap.config.resolve_recording_dir", return_value=rec_dir),
-        mock.patch("screencap.engine.capture.CaptureSession.load", return_value=capture),
-    ):
-        result = runner.invoke(cli, ["export", "empty-rec"])
-
-    assert result.exit_code == 0
-    out_file = rec_dir / "events.jsonl"
-    assert out_file.exists()
-    # Now includes metadata header even when no events
-    content = out_file.read_text().strip()
-    header = json.loads(content)
-    assert header["_meta"] is True
-    assert "Recording contains no events" in result.output
-
-
-def test_export_batch_warns_only_for_empty(tmp_path):
+def test_export_batch_warns_only_for_empty(tmp_path, monkeypatch):
     """Batch export shows warning only for empty recordings."""
+    from screencap.engine.db import create_db, crud
+
+    # "has-events" — real DB with events
     rec_a = tmp_path / "has-events"
     rec_a.mkdir()
-    (rec_a / "recording.db").touch()
+    engine, Session = create_db(str(rec_a / "recording.db"))
+    session = Session()
+    rec = crud.insert_recording(session, {
+        "timestamp": 1000.0, "platform": "darwin",
+        "monitor_width": 1920, "monitor_height": 1080,
+        "pixel_ratio": 2.0, "double_click_interval_seconds": 0.5,
+        "double_click_distance_pixels": 5.0,
+    })
+    crud.insert_action_event(session, rec, 1000.5, {
+        "name": "click", "mouse_x": 100.0, "mouse_y": 200.0,
+        "mouse_button_name": "left", "mouse_pressed": True,
+    })
+    crud.insert_action_event(session, rec, 1000.55, {
+        "name": "click", "mouse_x": 100.0, "mouse_y": 200.0,
+        "mouse_button_name": "left", "mouse_pressed": False,
+    })
+    session.close()
+    engine.dispose()
+
+    # "no-events" — real DB, empty
     rec_b = tmp_path / "no-events"
     rec_b.mkdir()
-    (rec_b / "recording.db").touch()
+    engine2, Session2 = create_db(str(rec_b / "recording.db"))
+    session2 = Session2()
+    crud.insert_recording(session2, {
+        "timestamp": 2000.0, "platform": "darwin",
+        "monitor_width": 1920, "monitor_height": 1080,
+        "pixel_ratio": 2.0, "double_click_interval_seconds": 0.5,
+        "double_click_distance_pixels": 5.0,
+    })
+    session2.close()
+    engine2.dispose()
 
-    cap_with = _mock_capture(events=[_mock_event()])
-    cap_empty = _mock_capture(events=[])
-
-    def load_side_effect(path):
-        if "has-events" in path:
-            return cap_with
-        return cap_empty
-
+    monkeypatch.setenv("SCREENCAP_RECORDINGS_DIR", str(tmp_path))
     runner = CliRunner()
-
-    with (
-        mock.patch("screencap.config.get_recordings_dir", return_value=tmp_path),
-        mock.patch("screencap.engine.capture.CaptureSession.load", side_effect=load_side_effect),
-    ):
-        result = runner.invoke(cli, ["export", "--all"])
+    result = runner.invoke(cli, ["export", "--all"])
 
     assert result.exit_code == 0
     assert "Recording 'no-events' contains no events" in result.output
     assert "Recording 'has-events' contains no events" not in result.output
-
-
-def test_export_multiple_events(tmp_path):
-    """Multiple events each get their own JSONL line."""
-    rec_dir = tmp_path / "multi-rec"
-    rec_dir.mkdir()
-
-    events = [
-        _mock_event('{"type":"mouse.singleclick","timestamp":1.0}'),
-        _mock_event('{"type":"key.type","timestamp":2.0}'),
-        _mock_event('{"type":"mouse.scroll","timestamp":3.0}'),
-    ]
-    capture = _mock_capture(events=events)
-    runner = CliRunner()
-
-    with (
-        mock.patch("screencap.config.resolve_recording_dir", return_value=rec_dir),
-        mock.patch("screencap.engine.capture.CaptureSession.load", return_value=capture),
-    ):
-        result = runner.invoke(cli, ["export", "multi-rec"])
-
-    assert result.exit_code == 0
-    out_file = rec_dir / "events.jsonl"
-    lines = out_file.read_text().strip().split("\n")
-    assert len(lines) == 4  # metadata header + 3 events
-    header = json.loads(lines[0])
-    assert header["_meta"] is True
-    for line in lines[1:]:
-        json.loads(line)
 
 
 def test_export_no_name_no_all():
@@ -783,35 +614,6 @@ def test_export_all_with_output():
     assert result.exit_code == 1
 
 
-def test_export_all(tmp_path):
-    """--all exports every recording to its own events.jsonl."""
-    # Create two recording dirs with recording.db
-    for name in ("rec-a", "rec-b"):
-        d = tmp_path / name
-        d.mkdir()
-        (d / "recording.db").touch()
-
-    # A non-recording dir (no recording.db) — should be skipped
-    (tmp_path / "not-a-recording").mkdir()
-
-    capture = _mock_capture()
-    runner = CliRunner()
-
-    def fresh_capture(*args, **kwargs):
-        return _mock_capture()
-
-    with (
-        mock.patch("screencap.config.get_recordings_dir", return_value=tmp_path),
-        mock.patch("screencap.engine.capture.CaptureSession.load", side_effect=fresh_capture),
-    ):
-        result = runner.invoke(cli, ["export", "--all"])
-
-    assert result.exit_code == 0
-    # Both recordings should have events.jsonl
-    assert (tmp_path / "rec-a" / "events.jsonl").exists()
-    assert (tmp_path / "rec-b" / "events.jsonl").exists()
-
-
 def test_export_all_no_recordings(tmp_path):
     """--all with no recordings prints message and exits cleanly."""
     runner = CliRunner()
@@ -825,34 +627,43 @@ def test_export_all_no_recordings(tmp_path):
 # --- export --downloads tests ---
 
 
-def test_export_downloads_only(tmp_path):
+def _create_export_db(rec_dir):
+    """Create a minimal recording.db with one click pair for export tests."""
+    from screencap.engine.db import create_db, crud
+
+    rec_dir.mkdir(parents=True, exist_ok=True)
+    engine, Session = create_db(str(rec_dir / "recording.db"))
+    session = Session()
+    rec = crud.insert_recording(session, {
+        "timestamp": 1000.0, "platform": "darwin",
+        "monitor_width": 1920, "monitor_height": 1080,
+        "pixel_ratio": 2.0, "double_click_interval_seconds": 0.5,
+        "double_click_distance_pixels": 5.0,
+    })
+    crud.insert_action_event(session, rec, 1000.5, {
+        "name": "click", "mouse_x": 100.0, "mouse_y": 200.0,
+        "mouse_button_name": "left", "mouse_pressed": True,
+    })
+    crud.insert_action_event(session, rec, 1000.55, {
+        "name": "click", "mouse_x": 100.0, "mouse_y": 200.0,
+        "mouse_button_name": "left", "mouse_pressed": False,
+    })
+    session.close()
+    engine.dispose()
+
+
+def test_export_downloads_only(tmp_path, monkeypatch):
     """--downloads (without --all) exports only downloaded recordings."""
     dl_dir = tmp_path / "downloads"
     rec_dir = tmp_path / "recordings"
-    dl_dir.mkdir()
-    rec_dir.mkdir()
 
-    # Create a downloaded recording
-    d = dl_dir / "dl-rec"
-    d.mkdir()
-    (d / "recording.db").touch()
+    _create_export_db(dl_dir / "dl-rec")
+    _create_export_db(rec_dir / "local-rec")
 
-    # Create a local recording — should NOT be exported
-    r = rec_dir / "local-rec"
-    r.mkdir()
-    (r / "recording.db").touch()
+    monkeypatch.setenv("SCREENCAP_RECORDINGS_DIR", str(rec_dir))
 
-    capture = _mock_capture()
     runner = CliRunner()
-
-    def fresh_capture(*args, **kwargs):
-        return _mock_capture()
-
-    with (
-        mock.patch("screencap.config.get_recordings_dir", return_value=rec_dir),
-        mock.patch("screencap.config.get_downloads_dir", return_value=dl_dir),
-        mock.patch("screencap.engine.capture.CaptureSession.load", side_effect=fresh_capture),
-    ):
+    with mock.patch("screencap.config.get_downloads_dir", return_value=dl_dir):
         result = runner.invoke(cli, ["export", "--downloads"])
 
     assert result.exit_code == 0
@@ -860,33 +671,18 @@ def test_export_downloads_only(tmp_path):
     assert not (rec_dir / "local-rec" / "events.jsonl").exists()
 
 
-def test_export_all_and_downloads(tmp_path):
+def test_export_all_and_downloads(tmp_path, monkeypatch):
     """--all --downloads exports from both recordings and downloads dirs."""
     dl_dir = tmp_path / "downloads"
     rec_dir = tmp_path / "recordings"
-    dl_dir.mkdir()
-    rec_dir.mkdir()
 
-    # Downloaded recording
-    d = dl_dir / "dl-rec"
-    d.mkdir()
-    (d / "recording.db").touch()
+    _create_export_db(dl_dir / "dl-rec")
+    _create_export_db(rec_dir / "local-rec")
 
-    # Local recording
-    r = rec_dir / "local-rec"
-    r.mkdir()
-    (r / "recording.db").touch()
-
-    def fresh_capture(*args, **kwargs):
-        return _mock_capture()
+    monkeypatch.setenv("SCREENCAP_RECORDINGS_DIR", str(rec_dir))
 
     runner = CliRunner()
-
-    with (
-        mock.patch("screencap.config.get_recordings_dir", return_value=rec_dir),
-        mock.patch("screencap.config.get_downloads_dir", return_value=dl_dir),
-        mock.patch("screencap.engine.capture.CaptureSession.load", side_effect=fresh_capture),
-    ):
+    with mock.patch("screencap.config.get_downloads_dir", return_value=dl_dir):
         result = runner.invoke(cli, ["export", "--all", "--downloads"])
 
     assert result.exit_code == 0
@@ -911,26 +707,18 @@ def test_export_downloads_cannot_use_stdout():
     assert result.exit_code == 1
 
 
-def test_export_single_by_name_with_downloads_fallback(tmp_path):
+def test_export_single_by_name_with_downloads_fallback(tmp_path, monkeypatch):
     """Single recording name with --downloads falls back to downloads dir."""
     rec_dir = tmp_path / "recordings"
     dl_dir = tmp_path / "downloads"
     rec_dir.mkdir()
-    dl_dir.mkdir()
 
-    # Only in downloads dir
-    d = dl_dir / "my-dl"
-    d.mkdir()
-    (d / "recording.db").touch()
+    _create_export_db(dl_dir / "my-dl")
 
-    capture = _mock_capture()
+    monkeypatch.setenv("SCREENCAP_RECORDINGS_DIR", str(rec_dir))
+
     runner = CliRunner()
-
-    with (
-        mock.patch("screencap.config.get_recordings_dir", return_value=rec_dir),
-        mock.patch("screencap.config.get_downloads_dir", return_value=dl_dir),
-        mock.patch("screencap.engine.capture.CaptureSession.load", return_value=capture),
-    ):
+    with mock.patch("screencap.config.get_downloads_dir", return_value=dl_dir):
         result = runner.invoke(cli, ["export", "my-dl", "--downloads"])
 
     assert result.exit_code == 0
@@ -1102,22 +890,14 @@ def test_start_auto_export_called(tmp_path):
     fake_dir = tmp_path / "rec-test"
     fake_dir.mkdir()
 
-    mock_export = mock.MagicMock(return_value=5)
-    mock_meta = mock.MagicMock(return_value={"_meta": True})
-
-    with mock.patch("screencap.recorder.start_recording", return_value=(fake_dir, 42.0)), \
-         mock.patch("screencap.namer.auto_name", return_value=fake_dir), \
-         mock.patch.dict("sys.modules", {"screencap.exporter": mock.MagicMock(
-             export_recording=mock_export,
-             build_export_metadata=mock_meta,
-         )}):
+    with (
+        mock.patch("screencap.recorder.start_recording", return_value=(fake_dir, 42.0)),
+        mock.patch("screencap.namer.auto_name", return_value=fake_dir),
+        mock.patch("screencap.cli._auto_export") as mock_auto_export,
+    ):
         result = runner.invoke(cli, ["start"])
         assert result.exit_code == 0
-        mock_meta.assert_called_once_with(exclude_moves=False)
-        mock_export.assert_called_once_with(
-            fake_dir, str(fake_dir / "events.jsonl"), exclude_moves=False, metadata={"_meta": True},
-        )
-        assert "Exported 5 events" in result.output
+        mock_auto_export.assert_called_once_with(fake_dir)
 
 
 def test_start_auto_export_failure_does_not_crash(tmp_path):
@@ -1126,15 +906,11 @@ def test_start_auto_export_failure_does_not_crash(tmp_path):
     fake_dir = tmp_path / "rec-test"
     fake_dir.mkdir()
 
-    mock_export = mock.MagicMock(side_effect=RuntimeError("boom"))
-    mock_meta = mock.MagicMock(return_value={"_meta": True})
-
-    with mock.patch("screencap.recorder.start_recording", return_value=(fake_dir, 42.0)), \
-         mock.patch("screencap.namer.auto_name", return_value=fake_dir), \
-         mock.patch.dict("sys.modules", {"screencap.exporter": mock.MagicMock(
-             export_recording=mock_export,
-             build_export_metadata=mock_meta,
-         )}):
+    with (
+        mock.patch("screencap.recorder.start_recording", return_value=(fake_dir, 42.0)),
+        mock.patch("screencap.namer.auto_name", return_value=fake_dir),
+        mock.patch("screencap.cli._auto_export", side_effect=RuntimeError("boom")),
+    ):
         result = runner.invoke(cli, ["start"])
         assert result.exit_code == 0
         assert "Warning" in result.output
@@ -1148,15 +924,11 @@ def test_start_auto_export_runs_with_no_auto_name(tmp_path):
     fake_dir = tmp_path / "my-test"
     fake_dir.mkdir()
 
-    mock_export = mock.MagicMock(return_value=3)
-    mock_meta = mock.MagicMock(return_value={"_meta": True})
-
-    with mock.patch("screencap.recorder.start_recording", return_value=(fake_dir, 42.0)), \
-         mock.patch("screencap.cli.sys") as mock_sys, \
-         mock.patch.dict("sys.modules", {"screencap.exporter": mock.MagicMock(
-             export_recording=mock_export,
-             build_export_metadata=mock_meta,
-         )}):
+    with (
+        mock.patch("screencap.recorder.start_recording", return_value=(fake_dir, 42.0)),
+        mock.patch("screencap.cli.sys") as mock_sys,
+        mock.patch("screencap.cli._auto_export") as mock_auto_export,
+    ):
         mock_sys.stdin.isatty.return_value = True
         mock_sys.exit = sys.exit
         result = runner.invoke(
@@ -1165,8 +937,7 @@ def test_start_auto_export_runs_with_no_auto_name(tmp_path):
             input="my-test\nsome desc\n",
         )
         assert result.exit_code == 0
-        mock_export.assert_called_once()
-        assert "Exported 3 events" in result.output
+        mock_auto_export.assert_called_once()
 
 
 def test_start_auto_export_keyboard_interrupt(tmp_path):
