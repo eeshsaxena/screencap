@@ -35,28 +35,24 @@ class TestOpenViewerMaxEventsWiring:
     """Tests that open_viewer correctly passes max_events to create_html."""
 
     def _call_open_viewer(self, tmp_path, **kwargs):
-        """Call open_viewer with mocked create_html, return call kwargs."""
+        """Call open_viewer with targeted patches on deferred imports."""
+        from screencap.viewer import open_viewer
+
         rec_dir = tmp_path / "test-rec"
         rec_dir.mkdir()
 
         mock_create = mock.MagicMock(return_value=None)
-        fake_engine = mock.MagicMock()
-        fake_engine.create_html = mock_create
-        fake_html_module = mock.MagicMock()
-        fake_html_module.DEFAULT_VIEWER_FRAME_SCALE = 0.5
-        fake_html_module.DEFAULT_VIEWER_FRAME_QUALITY = 75
 
-        with mock.patch("screencap.viewer.resolve_recording_dir", return_value=rec_dir):
-            with mock.patch("screencap.viewer.find_db", return_value=rec_dir / "recording.db"):
-                with mock.patch("screencap.viewer.subprocess"):
-                    with mock.patch.dict("sys.modules", {
-                        "screencap.engine": fake_engine,
-                        "screencap.engine.visualize": mock.MagicMock(),
-                        "screencap.engine.visualize.html": fake_html_module,
-                    }):
-                        from screencap.viewer import open_viewer
-                        open_viewer("test-rec", **kwargs)
-                        return mock_create.call_args
+        with (
+            mock.patch("screencap.viewer.resolve_recording_dir", return_value=rec_dir),
+            mock.patch("screencap.viewer.find_db", return_value=rec_dir / "recording.db"),
+            mock.patch("screencap.viewer.subprocess"),
+            mock.patch("screencap.engine.create_html", mock_create),
+            mock.patch("screencap.engine.visualize.html.DEFAULT_VIEWER_FRAME_SCALE", 0.5),
+            mock.patch("screencap.engine.visualize.html.DEFAULT_VIEWER_FRAME_QUALITY", 75),
+        ):
+            open_viewer("test-rec", **kwargs)
+            return mock_create.call_args
 
     @pytest.mark.parametrize("input_val, expected", [
         (0, 0),         # 0 passed through (create_html API handles conversion)
