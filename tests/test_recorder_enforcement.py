@@ -516,39 +516,8 @@ class TestKeystrokeBlocking:
         assert data["timestamp"] == 1234567890.0
 
 
-class TestCloudIntentBlocking:
-    """Tests for Phase 2: OCR_FALLBACK apps blocked for cloud-intent."""
-
-    def test_cloud_intent_blocks_ocr_fallback_apps(self):
-        """OCR_FALLBACK apps (code editors) are blocked for cloud-intent."""
-        config = _make_config()
-        f = RecorderPrivacyFilter(
-            config, transition_hold_seconds=0.0, secure_input_fn=None,
-            cloud_intent=True,
-        )
-
-        # VSCode gets OCR_FALLBACK in public mode (code editor)
-        f.on_window_event({
-            "app_bundle_id": "com.microsoft.VSCode",
-            "title": "main.py — project",
-        })
-
-        assert f.is_screen_allowed() is False
-
-    def test_non_cloud_allows_ocr_fallback_apps(self):
-        """OCR_FALLBACK apps pass through for non-cloud recordings."""
-        config = _make_config()
-        f = RecorderPrivacyFilter(
-            config, transition_hold_seconds=0.0, secure_input_fn=None,
-            cloud_intent=False,
-        )
-
-        f.on_window_event({
-            "app_bundle_id": "com.microsoft.VSCode",
-            "title": "main.py — project",
-        })
-
-        assert f.is_screen_allowed() is True
+class TestCloudIntent:
+    """Tests for cloud_intent parameter on RecorderPrivacyFilter."""
 
     def test_cloud_intent_attribute_exposed(self):
         """cloud_intent attribute is accessible (used by process_events)."""

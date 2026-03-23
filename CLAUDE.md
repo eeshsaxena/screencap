@@ -92,7 +92,7 @@ Two-layer privacy enforcement: capture-time filtering + post-recording scrubbing
 - `window.switch` events are deduplicated by `(app_bundle_id, window_id)` — title-only changes are ignored
 - `mouse.move` events excluded by default in both paths
 
-**Privacy-aware `window.switch` events:** EXCLUDE apps → suppressed entirely, MASK_WINDOW → title replaced with app name, OCR_FALLBACK → suppressed for cloud-intent uploads. Privacy filtering happens in the screencap layer (`exporter.py` / `chunk_processor.py`), not in `screencap.engine`.
+**Privacy-aware `window.switch` events:** EXCLUDE apps → suppressed entirely, MASK_WINDOW → title replaced with app name, TEXT_REDACT → passes through with post-capture scrubbing. Privacy filtering happens in the screencap layer (`exporter.py` / `chunk_processor.py`), not in `screencap.engine`.
 
 **Scrubbing pipeline:** `_scrub_events_jsonl()` scrubs `key.type` and `key.shortcut` text + children `key_char`, and `window.switch` titles.
 

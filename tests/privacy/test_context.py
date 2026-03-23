@@ -491,7 +491,7 @@ class TestKeywordDetection:
         assert result.confidence == "domain+keyword"
 
     def test_github_login_picks_auth_flow(self):
-        """github.com/login: CODE_EDITOR_TERMINAL (OCR_FALLBACK in public) vs AUTH_FLOW (EXCLUDE) → AUTH_FLOW wins."""
+        """github.com/login: CODE_EDITOR_TERMINAL (TEXT_REDACT in public) vs AUTH_FLOW (EXCLUDE) → AUTH_FLOW wins."""
         meta = FrameMetadata(
             bundle_id="com.google.Chrome",
             domain="github.com",

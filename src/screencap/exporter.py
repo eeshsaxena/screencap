@@ -170,9 +170,6 @@ def build_privacy_filter(
         if action == PrivacyAction.EXCLUDE:
             return None
 
-        if cloud_intent and action == PrivacyAction.OCR_FALLBACK:
-            return None
-
         if action == PrivacyAction.MASK_WINDOW:
             return event.model_copy(update={
                 "window_title": event.app_name,
