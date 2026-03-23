@@ -16,52 +16,71 @@ def recordings_dir(tmp_path):
 
 
 def _make_recording(base: Path, name: str, *, audio: bool = False, duration: float = 60.0):
-    """Create a minimal mock recording directory with recording.db."""
+    """Create a recording directory with real engine DB schema."""
+    from screencap.engine.db import create_db, crud
+
     d = base / name
     d.mkdir(parents=True)
 
     db_path = d / "recording.db"
-    conn = sqlite3.connect(str(db_path))
-    cur = conn.cursor()
-
-    cur.execute("""
-        CREATE TABLE recording (
-            id INTEGER PRIMARY KEY,
-            timestamp REAL,
-            monitor_width INTEGER,
-            monitor_height INTEGER,
-            double_click_interval_seconds REAL,
-            double_click_distance_pixels REAL,
-            platform TEXT,
-            task_description TEXT,
-            video_start_time REAL,
-            config TEXT,
-            original_recording_id INTEGER
-        )
-    """)
-    cur.execute("""
-        CREATE TABLE action_event (
-            id INTEGER PRIMARY KEY,
-            timestamp REAL,
-            recording_id INTEGER,
-            name TEXT
-        )
-    """)
-
     started = time.time() - duration
-    cur.execute(
-        "INSERT INTO recording (id, timestamp, platform) VALUES (1, ?, 'darwin')",
-        (started,),
-    )
-    cur.execute(
-        "INSERT INTO action_event (id, timestamp, recording_id, name) VALUES (1, ?, 1, 'click')",
-        (started + duration,),
-    )
-    conn.commit()
-    conn.close()
+    engine, Session = create_db(str(db_path))
+    session = Session()
+
+    recording = crud.insert_recording(session, {
+        "timestamp": started,
+        "platform": "darwin",
+        "monitor_width": 1920,
+        "monitor_height": 1080,
+        "pixel_ratio": 2.0,
+        "double_click_interval_seconds": 0.5,
+        "double_click_distance_pixels": 5.0,
+    })
+    crud.insert_action_event(session, recording, started + duration, {
+        "name": "click",
+        "mouse_x": 100.0,
+        "mouse_y": 200.0,
+        "mouse_button_name": "left",
+        "mouse_pressed": True,
+    })
+    session.close()
+    engine.dispose()
 
     if audio:
         (d / "audio.flac").write_bytes(b"fake")
+
+    return d
+
+
+def _make_recording_with_window_events(base: Path, name: str, bundle_ids: list[str]):
+    """Create a recording dir with real engine DB and window events."""
+    from screencap.engine.db import create_db, crud
+
+    d = base / name
+    d.mkdir(parents=True)
+
+    db_path = d / "recording.db"
+    engine, Session = create_db(str(db_path))
+    session = Session()
+
+    recording = crud.insert_recording(session, {
+        "timestamp": 1000.0,
+        "platform": "darwin",
+        "monitor_width": 1920,
+        "monitor_height": 1080,
+        "pixel_ratio": 2.0,
+        "double_click_interval_seconds": 0.5,
+        "double_click_distance_pixels": 5.0,
+    })
+    for i, bid in enumerate(bundle_ids):
+        crud.insert_window_event(session, recording, 1000.0 + i, {
+            "title": "title",
+            "app_bundle_id": bid,
+            "window_id": "w1",
+            "left": 0, "top": 0, "width": 1920, "height": 1080,
+        })
+    session.close()
+    engine.dispose()
 
     return d
 
@@ -197,26 +216,6 @@ def test_list_recordings_legacy_no_intent(recordings_dir):
 
 
 # --- get_seen_bundle_ids tests ---
-
-
-def _make_recording_with_window_events(base: Path, name: str, bundle_ids: list[str]):
-    """Create a recording dir with window_event table containing given bundle IDs."""
-    d = base / name
-    d.mkdir(parents=True)
-    db_path = d / "recording.db"
-    conn = sqlite3.connect(str(db_path))
-    conn.execute(
-        "CREATE TABLE window_event "
-        "(timestamp REAL, app_bundle_id TEXT, title TEXT, window_id TEXT)"
-    )
-    for i, bid in enumerate(bundle_ids):
-        conn.execute(
-            "INSERT INTO window_event VALUES (?, ?, 'title', 'w1')",
-            (float(i), bid),
-        )
-    conn.commit()
-    conn.close()
-    return d
 
 
 def test_get_seen_bundle_ids_single_dir(tmp_path):
