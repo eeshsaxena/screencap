@@ -3,6 +3,8 @@
 import json
 from unittest import mock
 
+import pytest
+
 from screencap.metrics import (
     METRICS_FILENAME,
     _collect_locale,
@@ -382,6 +384,7 @@ def _make_mock_wifi_client(iface=None):
     return client
 
 
+@pytest.mark.macos_hw
 def test_collect_wifi_static_happy_path():
     """Connected WiFi returns connected=True and phy_mode string."""
     iface = _make_mock_wifi_interface()
@@ -396,6 +399,7 @@ def test_collect_wifi_static_happy_path():
     assert result == {"connected": True, "phy_mode": "802.11ax"}
 
 
+@pytest.mark.macos_hw
 def test_collect_wifi_static_ssid_nil_but_rssi_nonzero():
     """macOS 14+ returns nil ssid without Location Services; RSSI fallback detects connected."""
     iface = _make_mock_wifi_interface(ssid=None, phy_mode=6, rssi=-44)
@@ -411,6 +415,7 @@ def test_collect_wifi_static_ssid_nil_but_rssi_nonzero():
     assert result["phy_mode"] == "802.11ax"
 
 
+@pytest.mark.macos_hw
 def test_collect_wifi_static_no_interface():
     """No WiFi hardware returns None fields."""
     client = _make_mock_wifi_client(iface=None)
@@ -424,6 +429,7 @@ def test_collect_wifi_static_no_interface():
     assert result == {"connected": None, "phy_mode": None}
 
 
+@pytest.mark.macos_hw
 def test_collect_wifi_static_not_connected():
     """WiFi interface exists but not connected (ssid=None and rssi=0)."""
     iface = _make_mock_wifi_interface(ssid=None, rssi=0)
@@ -438,6 +444,7 @@ def test_collect_wifi_static_not_connected():
     assert result["connected"] is False
 
 
+@pytest.mark.macos_hw
 def test_collect_wifi_static_import_error():
     """CoreWLAN not installed returns None."""
     with mock.patch.dict("sys.modules", {"CoreWLAN": None}):
@@ -446,6 +453,7 @@ def test_collect_wifi_static_import_error():
     assert result is None
 
 
+@pytest.mark.macos_hw
 def test_collect_wifi_dynamic_happy_path():
     """Connected WiFi returns RSSI and TX rate."""
     iface = _make_mock_wifi_interface(rssi=-55, tx_rate=540.0)
@@ -460,6 +468,7 @@ def test_collect_wifi_dynamic_happy_path():
     assert result == {"rssi_dbm": -55, "tx_rate_mbps": 540.0}
 
 
+@pytest.mark.macos_hw
 def test_collect_wifi_dynamic_rssi_zero_sentinel():
     """RSSI of 0 is treated as invalid and stored as None."""
     iface = _make_mock_wifi_interface(rssi=0, tx_rate=867.0)
@@ -475,6 +484,7 @@ def test_collect_wifi_dynamic_rssi_zero_sentinel():
     assert result["tx_rate_mbps"] == 867.0
 
 
+@pytest.mark.macos_hw
 def test_collect_wifi_dynamic_no_interface():
     """No WiFi hardware returns None fields for dynamic metrics."""
     client = _make_mock_wifi_client(iface=None)
@@ -488,6 +498,7 @@ def test_collect_wifi_dynamic_no_interface():
     assert result == {"rssi_dbm": None, "tx_rate_mbps": None}
 
 
+@pytest.mark.macos_hw
 def test_collect_wifi_dynamic_import_error():
     """CoreWLAN not installed returns None for dynamic."""
     with mock.patch.dict("sys.modules", {"CoreWLAN": None}):
@@ -583,6 +594,7 @@ def _make_mock_running_app(*, name="Finder", bundle_id="com.apple.finder",
     return app, url, info_dict
 
 
+@pytest.mark.macos_hw
 def test_collect_running_applications_happy_path():
     """Mock NSWorkspace, verify list shape with sorted output."""
     app1 = mock.Mock()
@@ -634,6 +646,7 @@ def test_collect_running_applications_happy_path():
     assert result[1]["version"] == "131.0.6778.86"
 
 
+@pytest.mark.macos_hw
 def test_collect_running_applications_import_error():
     """pyobjc absent returns None."""
     with mock.patch.dict("sys.modules", {"AppKit": None}):
@@ -641,6 +654,7 @@ def test_collect_running_applications_import_error():
     assert result is None
 
 
+@pytest.mark.macos_hw
 def test_collect_running_applications_partial_failure():
     """One app raises, others succeed."""
     good_app = mock.Mock()
@@ -676,6 +690,7 @@ def test_collect_running_applications_partial_failure():
     assert result[0]["name"] == "Finder"
 
 
+@pytest.mark.macos_hw
 def test_collect_running_applications_no_bundle_id_skipped():
     """Apps with nil bundleIdentifier are excluded."""
     app = mock.Mock()
@@ -702,6 +717,7 @@ def test_collect_running_applications_no_bundle_id_skipped():
     assert len(result) == 0
 
 
+@pytest.mark.macos_hw
 def test_collect_running_applications_version_fallback():
     """CFBundleShortVersionString absent, falls back to CFBundleVersion."""
     app = mock.Mock()

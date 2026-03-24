@@ -557,6 +557,49 @@ def test_cli_export_not_found(tmp_path, monkeypatch):
     assert "not found" in result.output.lower() or "error" in result.output.lower()
 
 
+def test_export_no_metadata_header(tmp_path):
+    """Passing metadata=None omits the header line — only events in output."""
+    rec_dir = tmp_path / "my-rec"
+    rec_dir.mkdir()
+    create_export_test_db(rec_dir / "recording.db")
+
+    from screencap.exporter import export_recording
+
+    out_file = str(rec_dir / "events.jsonl")
+    count = export_recording(rec_dir, out_file, exclude_moves=False, metadata=None)
+
+    assert count > 0
+    lines = open(out_file).read().strip().split("\n")
+    # No header — first line should be an event, not _meta
+    first = json.loads(lines[0])
+    assert "_meta" not in first
+    assert "type" in first
+
+
+def test_export_atomic_write_cleanup_on_failure(tmp_path):
+    """On failure mid-export, .tmp file is cleaned up and output does not exist."""
+    rec_dir = tmp_path / "my-rec"
+    rec_dir.mkdir()
+    create_export_test_db(rec_dir / "recording.db")
+
+    from unittest import mock
+
+    from screencap.exporter import export_recording
+
+    out_file = str(rec_dir / "events.jsonl")
+
+    # Patch _write_events to explode after Capture.load succeeds
+    with mock.patch(
+        "screencap.exporter._write_events",
+        side_effect=RuntimeError("boom"),
+    ):
+        with pytest.raises(RuntimeError, match="boom"):
+            export_recording(rec_dir, out_file, exclude_moves=False)
+
+    assert not os.path.exists(out_file + ".tmp")
+    assert not os.path.exists(out_file)
+
+
 def test_cli_export_all(tmp_path, monkeypatch):
     """E6.6: --all exports multiple recordings."""
     for name in ["rec-a", "rec-b"]:

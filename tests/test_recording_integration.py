@@ -29,187 +29,67 @@ _PLENTY_OF_DISK = DiskUsage(total=500e9, used=100e9, free=400e9)
 
 
 def create_test_recording_db(db_path, *, base_timestamp=None):
-    """Create a recording.db with realistic test data.
+    """Create a recording.db with realistic test data using the engine API.
 
-    Schema matches screencap.engine/db/models.py. Inserts enough events to exercise
-    the export pipeline: a click pair (→ MouseClickEvent), a keypress pair
-    (→ KeyTypeEvent), and a window event (→ WindowSwitchEvent).
+    Uses screencap.engine.db.create_db + crud so the schema always matches
+    the real engine. Inserts a click pair, keypress pair, and window event.
     """
+    from screencap.engine.db import create_db, crud
+
     t = base_timestamp or time.time()
-    conn = sqlite3.connect(str(db_path))
-    conn.executescript("""
-        CREATE TABLE IF NOT EXISTS recording (
-            id INTEGER PRIMARY KEY,
-            timestamp REAL,
-            monitor_width INTEGER,
-            monitor_height INTEGER,
-            pixel_ratio REAL DEFAULT 1.0,
-            double_click_interval_seconds REAL,
-            double_click_distance_pixels REAL,
-            platform TEXT,
-            task_description TEXT,
-            video_start_time REAL,
-            config TEXT,
-            original_recording_id INTEGER
-        );
-        CREATE TABLE IF NOT EXISTS action_event (
-            id INTEGER PRIMARY KEY,
-            name TEXT,
-            timestamp REAL,
-            recording_id INTEGER,
-            recording_timestamp REAL,
-            screenshot_timestamp REAL,
-            window_event_timestamp REAL,
-            mouse_x REAL,
-            mouse_y REAL,
-            mouse_dx REAL,
-            mouse_dy REAL,
-            mouse_pressure REAL,
-            modifier_flags INTEGER,
-            scroll_phase INTEGER,
-            momentum_phase INTEGER,
-            is_continuous INTEGER,
-            active_segment_description TEXT,
-            available_segment_descriptions TEXT,
-            mouse_button_name TEXT,
-            mouse_pressed INTEGER,
-            key_name TEXT,
-            key_char TEXT,
-            key_vk TEXT,
-            canonical_key_name TEXT,
-            canonical_key_char TEXT,
-            canonical_key_vk TEXT,
-            parent_id INTEGER,
-            element_state TEXT,
-            disabled INTEGER DEFAULT 0
-        );
-        CREATE TABLE IF NOT EXISTS window_event (
-            id INTEGER PRIMARY KEY,
-            recording_timestamp REAL,
-            recording_id INTEGER,
-            timestamp REAL,
-            state TEXT,
-            title TEXT,
-            "left" INTEGER,
-            top INTEGER,
-            width INTEGER,
-            height INTEGER,
-            window_id TEXT,
-            app_bundle_id TEXT,
-            app_version TEXT,
-            browser_url TEXT
-        );
-        CREATE TABLE IF NOT EXISTS screenshot (
-            id INTEGER PRIMARY KEY,
-            recording_timestamp REAL,
-            recording_id INTEGER,
-            timestamp REAL,
-            png_data BLOB,
-            png_diff_data BLOB,
-            png_diff_mask_data BLOB,
-            image_path TEXT
-        );
-        CREATE TABLE IF NOT EXISTS audio_info (
-            id INTEGER PRIMARY KEY,
-            timestamp REAL,
-            recording_timestamp REAL,
-            recording_id INTEGER,
-            sample_rate INTEGER,
-            words_with_timestamps TEXT
-        );
-        CREATE TABLE IF NOT EXISTS window_geometry (
-            id INTEGER PRIMARY KEY,
-            recording_id INTEGER,
-            recording_timestamp REAL,
-            screenshot_timestamp REAL,
-            window_list_json TEXT
-        );
-    """)
+    engine, Session = create_db(str(db_path))
+    session = Session()
 
-    # Recording metadata
-    conn.execute(
-        "INSERT INTO recording "
-        "(id, timestamp, monitor_width, monitor_height, pixel_ratio, "
-        "platform, double_click_interval_seconds, double_click_distance_pixels) "
-        "VALUES (1, ?, 1920, 1080, 2.0, 'darwin', 0.5, 5.0)",
-        (t,),
-    )
+    recording = crud.insert_recording(session, {
+        "timestamp": t,
+        "platform": "darwin",
+        "monitor_width": 1920,
+        "monitor_height": 1080,
+        "pixel_ratio": 2.0,
+        "double_click_interval_seconds": 0.5,
+        "double_click_distance_pixels": 5.0,
+    })
 
-    # Window event (before action events so it's first chronologically)
-    conn.execute(
-        "INSERT INTO window_event "
-        "(id, timestamp, recording_id, title, app_bundle_id, window_id, "
-        '"left", top, width, height) '
-        "VALUES (1, ?, 1, 'Documents', 'com.apple.finder', 'win-1', "
-        "0, 0, 1920, 1080)",
-        (t + 0.1,),
-    )
+    crud.insert_window_event(session, recording, t + 0.1, {
+        "title": "Documents",
+        "app_bundle_id": "com.apple.finder",
+        "window_id": "win-1",
+        "left": 0, "top": 0, "width": 1920, "height": 1080,
+    })
 
-    # Mouse click: down + up → will become MouseClickEvent after processing
-    conn.execute(
-        "INSERT INTO action_event "
-        "(id, name, timestamp, recording_id, mouse_x, mouse_y, "
-        "mouse_button_name, mouse_pressed, window_event_timestamp) "
-        "VALUES (1, 'click', ?, 1, 500.0, 300.0, 'left', 1, ?)",
-        (t + 0.5, t + 0.1),
-    )
-    conn.execute(
-        "INSERT INTO action_event "
-        "(id, name, timestamp, recording_id, mouse_x, mouse_y, "
-        "mouse_button_name, mouse_pressed, window_event_timestamp) "
-        "VALUES (2, 'click', ?, 1, 500.0, 300.0, 'left', 0, ?)",
-        (t + 0.55, t + 0.1),
-    )
+    crud.insert_action_event(session, recording, t + 0.5, {
+        "name": "click",
+        "mouse_x": 500.0, "mouse_y": 300.0,
+        "mouse_button_name": "left", "mouse_pressed": True,
+        "window_event_timestamp": t + 0.1,
+    })
+    crud.insert_action_event(session, recording, t + 0.55, {
+        "name": "click",
+        "mouse_x": 500.0, "mouse_y": 300.0,
+        "mouse_button_name": "left", "mouse_pressed": False,
+        "window_event_timestamp": t + 0.1,
+    })
 
-    # Key press + release → will become KeyTypeEvent after processing
-    conn.execute(
-        "INSERT INTO action_event "
-        "(id, name, timestamp, recording_id, key_char, key_name, "
-        "canonical_key_char, canonical_key_name, window_event_timestamp) "
-        "VALUES (3, 'press', ?, 1, 'h', 'h', 'h', 'h', ?)",
-        (t + 1.0, t + 0.1),
-    )
-    conn.execute(
-        "INSERT INTO action_event "
-        "(id, name, timestamp, recording_id, key_char, key_name, "
-        "canonical_key_char, canonical_key_name, window_event_timestamp) "
-        "VALUES (4, 'release', ?, 1, 'h', 'h', 'h', 'h', ?)",
-        (t + 1.05, t + 0.1),
-    )
+    crud.insert_action_event(session, recording, t + 1.0, {
+        "name": "press",
+        "key_char": "h", "key_name": "h",
+        "canonical_key_char": "h", "canonical_key_name": "h",
+        "window_event_timestamp": t + 0.1,
+    })
+    crud.insert_action_event(session, recording, t + 1.05, {
+        "name": "release",
+        "key_char": "h", "key_name": "h",
+        "canonical_key_char": "h", "canonical_key_name": "h",
+        "window_event_timestamp": t + 0.1,
+    })
 
-    conn.commit()
-    conn.close()
+    session.close()
+    engine.dispose()
     return db_path
 
 
-class FakeRecorder:
-    """Stand-in for screencap.engine.Recorder (external hardware boundary).
-
-    Creates a recording.db on __enter__ so downstream code (export, catalog)
-    works with real data. Sets is_recording=False so the live-display loop
-    exits immediately.
-    """
-
-    def __init__(self, capture_dir_str, **kwargs):
-        self.capture_dir = Path(capture_dir_str)
-        self.is_recording = False
-        self.health_warning = None   # Prevents false "child_crash" detection
-        self.child_crashes = []
-        self._stopped = False
-
-    def __enter__(self):
-        create_test_recording_db(self.capture_dir / "recording.db")
-        return self
-
-    def __exit__(self, *args):
-        return False
-
-    def wait_for_ready(self, timeout=30):
-        return True
-
-    def stop(self):
-        self.is_recording = False
-        self._stopped = True
+# Import shared FakeRecorder from conftest (available via pytest fixture discovery)
+from tests.conftest import FakeRecorder
 
 
 # ---------------------------------------------------------------------------
@@ -611,109 +491,74 @@ def test_stop_no_recording_running(tmp_path, monkeypatch):
 def _create_multi_chunk_db(db_path, t0):
     """Create a recording.db with events spanning two chunk boundaries.
 
+    Uses screencap.engine.db API so the schema always matches production.
     Events at t0+5, t0+15 (chunk 0: [t0, t0+30])
     Events at t0+35, t0+45 (chunk 1: [t0+30, t0+60])
     Window events at t0+1 and t0+31 for initial context testing.
     """
-    conn = sqlite3.connect(str(db_path))
-    conn.executescript("""
-        CREATE TABLE recording (
-            id INTEGER PRIMARY KEY, timestamp REAL,
-            monitor_width INTEGER, monitor_height INTEGER,
-            pixel_ratio REAL DEFAULT 1.0, platform TEXT,
-            double_click_interval_seconds REAL,
-            double_click_distance_pixels REAL
-        );
-        CREATE TABLE action_event (
-            id INTEGER PRIMARY KEY, name TEXT, timestamp REAL,
-            recording_id INTEGER, mouse_x REAL, mouse_y REAL,
-            mouse_dx REAL, mouse_dy REAL, mouse_pressure REAL,
-            modifier_flags INTEGER, scroll_phase INTEGER,
-            momentum_phase INTEGER, is_continuous INTEGER,
-            mouse_button_name TEXT, mouse_pressed INTEGER,
-            key_char TEXT, key_name TEXT, key_vk TEXT,
-            canonical_key_char TEXT, canonical_key_name TEXT,
-            canonical_key_vk TEXT, element_state TEXT,
-            active_segment_description TEXT,
-            available_segment_descriptions TEXT,
-            disabled INTEGER DEFAULT 0
-        );
-        CREATE TABLE window_event (
-            id INTEGER PRIMARY KEY, timestamp REAL,
-            recording_id INTEGER, title TEXT,
-            app_bundle_id TEXT, window_id TEXT,
-            "left" INTEGER, top INTEGER, width INTEGER, height INTEGER
-        );
-    """)
+    from screencap.engine.db import create_db, crud
 
-    conn.execute(
-        "INSERT INTO recording (id, timestamp, monitor_width, monitor_height, "
-        "pixel_ratio, platform, double_click_interval_seconds, "
-        "double_click_distance_pixels) VALUES (1, ?, 1920, 1080, 2.0, 'darwin', 0.5, 5.0)",
-        (t0,),
-    )
+    engine, Session = create_db(str(db_path))
+    session = Session()
 
-    # Window event in chunk 0
-    conn.execute(
-        "INSERT INTO window_event (id, timestamp, recording_id, title, "
-        'app_bundle_id, window_id, "left", top, width, height) '
-        "VALUES (1, ?, 1, 'Editor', 'com.app.editor', 'win-1', 0, 0, 1920, 1080)",
-        (t0 + 1,),
-    )
-    # Window event in chunk 1
-    conn.execute(
-        "INSERT INTO window_event (id, timestamp, recording_id, title, "
-        'app_bundle_id, window_id, "left", top, width, height) '
-        "VALUES (2, ?, 1, 'Browser', 'com.app.browser', 'win-2', 0, 0, 1920, 1080)",
-        (t0 + 31,),
-    )
+    recording = crud.insert_recording(session, {
+        "timestamp": t0,
+        "platform": "darwin",
+        "monitor_width": 1920,
+        "monitor_height": 1080,
+        "pixel_ratio": 2.0,
+        "double_click_interval_seconds": 0.5,
+        "double_click_distance_pixels": 5.0,
+    })
 
-    # Chunk 0 events: click pair at t0+5, keypress pair at t0+15
-    conn.execute(
-        "INSERT INTO action_event (id, name, timestamp, recording_id, "
-        "mouse_x, mouse_y, mouse_button_name, mouse_pressed) "
-        "VALUES (1, 'click', ?, 1, 100.0, 200.0, 'left', 1)", (t0 + 5,),
-    )
-    conn.execute(
-        "INSERT INTO action_event (id, name, timestamp, recording_id, "
-        "mouse_x, mouse_y, mouse_button_name, mouse_pressed) "
-        "VALUES (2, 'click', ?, 1, 100.0, 200.0, 'left', 0)", (t0 + 5.05,),
-    )
-    conn.execute(
-        "INSERT INTO action_event (id, name, timestamp, recording_id, "
-        "key_char, key_name, canonical_key_char, canonical_key_name) "
-        "VALUES (3, 'press', ?, 1, 'a', 'a', 'a', 'a')", (t0 + 15,),
-    )
-    conn.execute(
-        "INSERT INTO action_event (id, name, timestamp, recording_id, "
-        "key_char, key_name, canonical_key_char, canonical_key_name) "
-        "VALUES (4, 'release', ?, 1, 'a', 'a', 'a', 'a')", (t0 + 15.05,),
-    )
+    # Window events
+    crud.insert_window_event(session, recording, t0 + 1, {
+        "title": "Editor", "app_bundle_id": "com.app.editor",
+        "window_id": "win-1", "left": 0, "top": 0, "width": 1920, "height": 1080,
+    })
+    crud.insert_window_event(session, recording, t0 + 31, {
+        "title": "Browser", "app_bundle_id": "com.app.browser",
+        "window_id": "win-2", "left": 0, "top": 0, "width": 1920, "height": 1080,
+    })
 
-    # Chunk 1 events: click pair at t0+35, keypress pair at t0+45
-    conn.execute(
-        "INSERT INTO action_event (id, name, timestamp, recording_id, "
-        "mouse_x, mouse_y, mouse_button_name, mouse_pressed) "
-        "VALUES (5, 'click', ?, 1, 300.0, 400.0, 'left', 1)", (t0 + 35,),
-    )
-    conn.execute(
-        "INSERT INTO action_event (id, name, timestamp, recording_id, "
-        "mouse_x, mouse_y, mouse_button_name, mouse_pressed) "
-        "VALUES (6, 'click', ?, 1, 300.0, 400.0, 'left', 0)", (t0 + 35.05,),
-    )
-    conn.execute(
-        "INSERT INTO action_event (id, name, timestamp, recording_id, "
-        "key_char, key_name, canonical_key_char, canonical_key_name) "
-        "VALUES (7, 'press', ?, 1, 'b', 'b', 'b', 'b')", (t0 + 45,),
-    )
-    conn.execute(
-        "INSERT INTO action_event (id, name, timestamp, recording_id, "
-        "key_char, key_name, canonical_key_char, canonical_key_name) "
-        "VALUES (8, 'release', ?, 1, 'b', 'b', 'b', 'b')", (t0 + 45.05,),
-    )
+    # Chunk 0 events
+    crud.insert_action_event(session, recording, t0 + 5, {
+        "name": "click", "mouse_x": 100.0, "mouse_y": 200.0,
+        "mouse_button_name": "left", "mouse_pressed": True,
+    })
+    crud.insert_action_event(session, recording, t0 + 5.05, {
+        "name": "click", "mouse_x": 100.0, "mouse_y": 200.0,
+        "mouse_button_name": "left", "mouse_pressed": False,
+    })
+    crud.insert_action_event(session, recording, t0 + 15, {
+        "name": "press", "key_char": "a", "key_name": "a",
+        "canonical_key_char": "a", "canonical_key_name": "a",
+    })
+    crud.insert_action_event(session, recording, t0 + 15.05, {
+        "name": "release", "key_char": "a", "key_name": "a",
+        "canonical_key_char": "a", "canonical_key_name": "a",
+    })
 
-    conn.commit()
-    conn.close()
+    # Chunk 1 events
+    crud.insert_action_event(session, recording, t0 + 35, {
+        "name": "click", "mouse_x": 300.0, "mouse_y": 400.0,
+        "mouse_button_name": "left", "mouse_pressed": True,
+    })
+    crud.insert_action_event(session, recording, t0 + 35.05, {
+        "name": "click", "mouse_x": 300.0, "mouse_y": 400.0,
+        "mouse_button_name": "left", "mouse_pressed": False,
+    })
+    crud.insert_action_event(session, recording, t0 + 45, {
+        "name": "press", "key_char": "b", "key_name": "b",
+        "canonical_key_char": "b", "canonical_key_name": "b",
+    })
+    crud.insert_action_event(session, recording, t0 + 45.05, {
+        "name": "release", "key_char": "b", "key_name": "b",
+        "canonical_key_char": "b", "canonical_key_name": "b",
+    })
+
+    session.close()
+    engine.dispose()
 
 
 def test_multi_chunk_no_event_overlap_or_gaps(tmp_path):
@@ -836,7 +681,7 @@ def test_start_recording_multi_chunk_produces_all_chunk_files(recording_env):
         def __init__(self, capture_dir_str, **kwargs):
             self.capture_dir = Path(capture_dir_str)
             self.is_recording = False
-            self.health_warning = None
+            self.health_warning = ""
             self.child_crashes = []
             # Real queues — ChunkProcessor will read from these
             self._chunk_process_q = multiprocessing.Queue()
@@ -1029,7 +874,7 @@ def test_stub_recording_not_called_when_uploads_disabled(recording_env):
         def __init__(self, capture_dir_str, **kwargs):
             self.capture_dir = Path(capture_dir_str)
             self.is_recording = False
-            self.health_warning = None
+            self.health_warning = ""
             self.child_crashes = []
             self._chunk_process_q = multiprocessing.Queue()
             self._audio_ack_q = multiprocessing.Queue()
@@ -1126,7 +971,7 @@ def test_upload_warning_surfaced_at_stop(recording_env):
         def __init__(self, capture_dir_str, **kwargs):
             self.capture_dir = Path(capture_dir_str)
             self.is_recording = False
-            self.health_warning = None
+            self.health_warning = ""
             self.child_crashes = []
             self._chunk_process_q = multiprocessing.Queue()
             self._audio_ack_q = multiprocessing.Queue()
@@ -1215,7 +1060,7 @@ def test_sentinel_not_uploaded_without_sentinel_for_cloud(recording_env):
         def __init__(self, capture_dir_str, **kwargs):
             self.capture_dir = Path(capture_dir_str)
             self.is_recording = False
-            self.health_warning = None
+            self.health_warning = ""
             self.child_crashes = []
             self._chunk_process_q = multiprocessing.Queue()
             self._audio_ack_q = multiprocessing.Queue()
