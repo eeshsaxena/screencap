@@ -352,6 +352,44 @@ class TestNamerFileScreenshots:
         result = _sample_screenshots_from_db(db_path)
         assert len(result) == 3
 
+    def test_handles_old_db_without_image_path_column(self, tmp_path):
+        """namer works on old DBs that don't have the image_path column.
+
+        Uses raw sqlite3 intentionally — the engine API always creates
+        image_path, so it cannot produce the old schema this test covers.
+        """
+        import sqlite3
+
+        db_path = tmp_path / "recording.db"
+        conn = sqlite3.connect(str(db_path))
+        cur = conn.cursor()
+        cur.execute(
+            "CREATE TABLE recording (id INTEGER PRIMARY KEY, timestamp REAL, "
+            "platform TEXT, task_description TEXT, video_start_time REAL)"
+        )
+        cur.execute("INSERT INTO recording VALUES (1, 1000.0, 'darwin', '', NULL)")
+        cur.execute(
+            "CREATE TABLE screenshot (id INTEGER PRIMARY KEY, "
+            "recording_timestamp REAL, recording_id INTEGER, "
+            "timestamp REAL, png_data BLOB)"
+        )
+        img = _make_test_image()
+        buf = io.BytesIO()
+        img.save(buf, format="PNG")
+        png_bytes = buf.getvalue()
+        for i in range(3):
+            cur.execute(
+                "INSERT INTO screenshot VALUES (?, 1000.0, 1, ?, ?)",
+                (i + 1, 1709641234.0 + i, png_bytes),
+            )
+        conn.commit()
+        conn.close()
+
+        from screencap.namer import _sample_screenshots_from_db
+
+        result = _sample_screenshots_from_db(db_path)
+        assert len(result) == 3
+
     def test_prefers_files_over_blobs(self, tmp_path):
         """When both image_path and png_data exist, prefers file-based."""
         capture_dir = tmp_path

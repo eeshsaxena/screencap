@@ -93,18 +93,6 @@ class RecordingDB:
             "canonical_key_name": char,
         })
 
-    def add_screenshot(self, ts_offset, *, image_path=None, png_data=None):
-        """Insert a screenshot at base_ts + ts_offset."""
-        from screencap.engine.db import crud
-
-        ts = self._base_ts + ts_offset
-        event_data = {}
-        if image_path is not None:
-            event_data["image_path"] = image_path
-        if png_data is not None:
-            event_data["png_data"] = png_data
-        crud.insert_screenshot(self.session, self.recording, ts, event_data)
-
     def add_window_event(
         self, ts_offset, *, title="Editor", bundle_id="com.app.editor",
         window_id="win-1", left=0, top=0, width=1920, height=1080,

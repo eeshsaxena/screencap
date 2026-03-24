@@ -13,7 +13,6 @@ from PIL import Image
 
 from screencap.engine import utils
 from screencap.engine.config import config
-from screencap.engine.dedup import dhash
 from screencap.engine.recorder import Event, process_events
 
 # ---------------------------------------------------------------------------
