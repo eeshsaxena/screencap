@@ -6,7 +6,6 @@ import multiprocessing
 import queue
 import threading
 import time
-from collections import namedtuple
 from unittest import mock
 
 import pytest
@@ -14,8 +13,6 @@ from PIL import Image
 
 from screencap.engine import utils
 from screencap.engine.config import config
-from screencap.engine.dedup import dhash
-from screencap.engine.extensions.synchronized_queue import SynchronizedQueue
 from screencap.engine.recorder import Event, process_events
 
 # ---------------------------------------------------------------------------
@@ -112,8 +109,20 @@ def _recording():
     return rec
 
 
+class _CollectorQueue:
+    """Lightweight queue sink that collects items written by process_event."""
+
+    def __init__(self):
+        self.items: list[Event] = []
+
+    def put(self, item, timeout=None):
+        self.items.append(item)
+
+
 def _run_process_events(events: list[Event], screen_filter=None):
     """Feed events through process_events() and return written event types + drop counts.
+
+    Uses real process_event (no mock) with collector queues as sinks.
 
     Returns (screen_count, action_count, action_events_data, drop_counts_dict).
     action_events_data: list of event.data dicts for each action written.
@@ -122,12 +131,11 @@ def _run_process_events(events: list[Event], screen_filter=None):
     for ev in events:
         event_q.put(ev)
 
-    # Mock write queues — just accept everything
-    screen_wq = mock.MagicMock(spec=SynchronizedQueue)
-    action_wq = mock.MagicMock(spec=SynchronizedQueue)
-    window_wq = mock.MagicMock(spec=SynchronizedQueue)
-    video_wq = mock.MagicMock(spec=SynchronizedQueue)
-    perf_q = mock.MagicMock(spec=SynchronizedQueue)
+    screen_wq = _CollectorQueue()
+    action_wq = _CollectorQueue()
+    window_wq = _CollectorQueue()
+    video_wq = _CollectorQueue()
+    perf_q = _CollectorQueue()
 
     recording = _recording()
     terminate = multiprocessing.Event()
@@ -137,18 +145,6 @@ def _run_process_events(events: list[Event], screen_filter=None):
     num_window = multiprocessing.Value("i", 0)
     num_video = multiprocessing.Value("i", 0)
 
-    # Mock process_event to always succeed and capture what's written
-    written_types = []
-    action_data = []
-
-    original_process_event = None
-
-    def fake_process_event(event, wq, wfn, rec, pq, tp):
-        written_types.append(event.type)
-        if event.type == "action":
-            action_data.append(dict(event.data))
-        return True
-
     # Signal terminate after queue drains
     def set_terminate():
         time.sleep(0.1)
@@ -157,25 +153,25 @@ def _run_process_events(events: list[Event], screen_filter=None):
     t = threading.Thread(target=set_terminate)
     t.start()
 
-    with mock.patch("screencap.engine.recorder.process_event", side_effect=fake_process_event):
-        # Capture _drops from inside process_events via _drop_counts
-        from screencap.engine import recorder as rec_mod
-        old_drops = dict(rec_mod._drop_counts)
-        rec_mod._drop_counts = {}
+    # Capture _drops from inside process_events via _drop_counts
+    from screencap.engine import recorder as rec_mod
+    old_drops = dict(rec_mod._drop_counts)
+    rec_mod._drop_counts = {}
 
-        process_events(
-            event_q, screen_wq, action_wq, window_wq, video_wq,
-            perf_q, recording, terminate, started,
-            num_screen, num_action, num_window, num_video,
-            screen_filter=screen_filter,
-        )
-        drops = dict(rec_mod._drop_counts)
-        rec_mod._drop_counts = old_drops
+    process_events(
+        event_q, screen_wq, action_wq, window_wq, video_wq,
+        perf_q, recording, terminate, started,
+        num_screen, num_action, num_window, num_video,
+        screen_filter=screen_filter,
+    )
+    drops = dict(rec_mod._drop_counts)
+    rec_mod._drop_counts = old_drops
 
     t.join()
 
-    screen_count = written_types.count("screen")
-    action_count = written_types.count("action")
+    screen_count = len(screen_wq.items)
+    action_count = len(action_wq.items)
+    action_data = [dict(ev.data) for ev in action_wq.items]
     return screen_count, action_count, action_data, drops
 
 
@@ -588,15 +584,15 @@ class TestSettleFrameSavesAfterScrollSilence:
             _scroll_event(t0 + 0.01),
         ]
 
-        written_types = []
-
-        def capture_process_event(event, wq, wfn, rec, pq, tp):
-            written_types.append(event.type)
-            return True
-
         event_q = queue.Queue()
         for ev in events:
             event_q.put(ev)
+
+        screen_wq = _CollectorQueue()
+        action_wq = _CollectorQueue()
+        window_wq = _CollectorQueue()
+        video_wq = _CollectorQueue()
+        perf_q = _CollectorQueue()
 
         recording = _recording()
         terminate = multiprocessing.Event()
@@ -610,8 +606,7 @@ class TestSettleFrameSavesAfterScrollSilence:
         t = threading.Thread(target=set_terminate)
         t.start()
 
-        with mock.patch("screencap.engine.recorder.time") as mock_time, \
-             mock.patch("screencap.engine.recorder.process_event", side_effect=capture_process_event):
+        with mock.patch("screencap.engine.recorder.time") as mock_time:
             mock_time.monotonic = clock
             mock_time.time = time.time
             from screencap.engine import recorder as rec_mod
@@ -620,11 +615,7 @@ class TestSettleFrameSavesAfterScrollSilence:
 
             process_events(
                 event_q,
-                mock.MagicMock(spec=SynchronizedQueue),
-                mock.MagicMock(spec=SynchronizedQueue),
-                mock.MagicMock(spec=SynchronizedQueue),
-                mock.MagicMock(spec=SynchronizedQueue),
-                mock.MagicMock(spec=SynchronizedQueue),
+                screen_wq, action_wq, window_wq, video_wq, perf_q,
                 recording, terminate, started,
                 nums["screen"], nums["action"], nums["window"],
                 nums["video"],
@@ -636,6 +627,10 @@ class TestSettleFrameSavesAfterScrollSilence:
 
         assert drops.get("screen_settle_save", 0) >= 1
         # Settle should write both screen and screen/video
+        written_types = (
+            [ev.type for ev in screen_wq.items]
+            + [ev.type for ev in video_wq.items]
+        )
         assert "screen" in written_types
         assert "screen/video" in written_types
 
