@@ -5,6 +5,17 @@ All notable changes to this project will be documented in this file.
 The format is based on [Keep a Changelog](https://keepachangelog.com/),
 and this project adheres to [Semantic Versioning](https://semver.org/).
 
+## [0.13.1] - 2026-03-23
+
+### Fixed
+- Video PTS offset and corruption in action-gated recording mode
+- Update DB video_start_time on first frame, remove num_copies workaround
+- Defensive error handling in ChunkedVideoWriter chunk rotation
+- Runtime invariant check and hardened T5 assertion
+- Prevent silent data loss when chunk uploads are disabled
+- Correct inaccurate cloud privacy notice and remove dead OCR_FALLBACK code
+- Remove hf_xet from PyInstaller excludes list
+
 ## [0.13.0] - 2026-03-21
 
 ### Changed
