@@ -1,7 +1,6 @@
 """Tests for screencap CLI argument parsing."""
 
 import json
-import sqlite3
 import sys
 import time
 from unittest import mock
@@ -153,24 +152,28 @@ def test_view_not_found(tmp_path):
 
 
 def _make_recording_dir(base, name, *, duration=60.0, with_metrics=False):
-    """Create a minimal recording dir with DB and optional metrics."""
+    """Create a minimal recording dir with real engine DB and optional metrics."""
+    from screencap.engine.db import create_db, crud
+
     rec_dir = base / name
     rec_dir.mkdir(parents=True)
 
     db_path = rec_dir / "recording.db"
-    conn = sqlite3.connect(str(db_path))
-    cur = conn.cursor()
-    cur.execute(
-        "CREATE TABLE recording (id INTEGER PRIMARY KEY, timestamp REAL, platform TEXT)"
-    )
-    cur.execute(
-        "CREATE TABLE action_event (id INTEGER PRIMARY KEY, timestamp REAL)"
-    )
     started = time.time() - duration
-    cur.execute("INSERT INTO recording VALUES (1, ?, 'darwin')", (started,))
-    cur.execute("INSERT INTO action_event VALUES (1, ?)", (started + duration,))
-    conn.commit()
-    conn.close()
+    engine, Session = create_db(str(db_path))
+    session = Session()
+    rec = crud.insert_recording(session, {
+        "timestamp": started, "platform": "darwin",
+        "monitor_width": 1920, "monitor_height": 1080,
+        "pixel_ratio": 2.0, "double_click_interval_seconds": 0.5,
+        "double_click_distance_pixels": 5.0,
+    })
+    crud.insert_action_event(session, rec, started + duration, {
+        "name": "click", "mouse_x": 100.0, "mouse_y": 200.0,
+        "mouse_button_name": "left", "mouse_pressed": True,
+    })
+    session.close()
+    engine.dispose()
 
     if with_metrics:
         metrics = {

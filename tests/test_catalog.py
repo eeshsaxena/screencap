@@ -123,30 +123,8 @@ def test_skips_non_recording_dirs(recordings_dir):
     assert len(result) == 0
 
 
-def test_finds_capture_db(recordings_dir):
-    """Recordings with capture.db (legacy name) should also be found."""
-    d = recordings_dir / "legacy-rec"
-    d.mkdir(parents=True)
-    db_path = d / "capture.db"
-    conn = sqlite3.connect(str(db_path))
-    cur = conn.cursor()
-    cur.execute("CREATE TABLE recording (id INTEGER PRIMARY KEY, timestamp REAL, platform TEXT)")
-    cur.execute("CREATE TABLE action_event (id INTEGER PRIMARY KEY, timestamp REAL)")
-    started = time.time() - 45
-    cur.execute("INSERT INTO recording VALUES (1, ?, 'darwin')", (started,))
-    cur.execute("INSERT INTO action_event VALUES (1, ?)", (started + 45,))
-    conn.commit()
-    conn.close()
-
-    result = list_recordings(recordings_dir)
-    assert len(result) == 1
-    assert result[0].name == "legacy-rec"
-
-
-def test_find_db_prefers_recording_db(tmp_path):
-    """If both recording.db and capture.db exist, recording.db wins."""
+def test_find_db_returns_recording_db(tmp_path):
     (tmp_path / "recording.db").touch()
-    (tmp_path / "capture.db").touch()
     assert find_db(tmp_path).name == "recording.db"
 
 

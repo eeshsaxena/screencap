@@ -681,7 +681,7 @@ def test_start_recording_multi_chunk_produces_all_chunk_files(recording_env):
         def __init__(self, capture_dir_str, **kwargs):
             self.capture_dir = Path(capture_dir_str)
             self.is_recording = False
-            self.health_warning = None
+            self.health_warning = ""
             self.child_crashes = []
             # Real queues — ChunkProcessor will read from these
             self._chunk_process_q = multiprocessing.Queue()
@@ -874,7 +874,7 @@ def test_stub_recording_not_called_when_uploads_disabled(recording_env):
         def __init__(self, capture_dir_str, **kwargs):
             self.capture_dir = Path(capture_dir_str)
             self.is_recording = False
-            self.health_warning = None
+            self.health_warning = ""
             self.child_crashes = []
             self._chunk_process_q = multiprocessing.Queue()
             self._audio_ack_q = multiprocessing.Queue()
@@ -971,7 +971,7 @@ def test_upload_warning_surfaced_at_stop(recording_env):
         def __init__(self, capture_dir_str, **kwargs):
             self.capture_dir = Path(capture_dir_str)
             self.is_recording = False
-            self.health_warning = None
+            self.health_warning = ""
             self.child_crashes = []
             self._chunk_process_q = multiprocessing.Queue()
             self._audio_ack_q = multiprocessing.Queue()
@@ -1060,7 +1060,7 @@ def test_sentinel_not_uploaded_without_sentinel_for_cloud(recording_env):
         def __init__(self, capture_dir_str, **kwargs):
             self.capture_dir = Path(capture_dir_str)
             self.is_recording = False
-            self.health_warning = None
+            self.health_warning = ""
             self.child_crashes = []
             self._chunk_process_q = multiprocessing.Queue()
             self._audio_ack_q = multiprocessing.Queue()
