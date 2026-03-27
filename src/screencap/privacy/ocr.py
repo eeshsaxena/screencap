@@ -67,6 +67,8 @@ class VisionOcr:
 
         with objc.autorelease_pool():
             img_data = NSData.dataWithContentsOfFile_(str(image_path))
+            if img_data is None:
+                raise OSError(f"Failed to load image data: {image_path}")
             handler = (
                 self._Vision.VNImageRequestHandler.alloc().initWithData_options_(
                     img_data, None
@@ -94,15 +96,11 @@ class VisionOcr:
                 text = str(top.string())
                 bbox = _vision_bbox_to_pixels(obs.boundingBox(), im_w, im_h)
 
-                # Capture candidate ref for the char_bboxes closure
-                _candidate = top
-                _im_w, _im_h = im_w, im_h
-
                 blocks.append(
                     OcrTextBlock(
                         text=text,
                         bbox=bbox,
-                        char_bboxes=_make_char_bboxes(_candidate, _im_w, _im_h),
+                        char_bboxes=_make_char_bboxes(top, im_w, im_h),
                     )
                 )
 

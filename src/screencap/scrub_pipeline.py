@@ -1206,7 +1206,7 @@ def ocr_mask_screenshot(
         # Build offset mapping: detection offsets are into normalized text,
         # but char_bboxes expects offsets into the original OCR text.
         normalized = normalize_text(block.text)
-        if len(normalized) != len(block.text):
+        if normalized != block.text:
             offset_map = build_offset_map(block.text, normalized)
         else:
             offset_map = None  # identity — no remapping needed
