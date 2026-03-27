@@ -12,6 +12,7 @@ from __future__ import annotations
 
 import json
 import sqlite3
+import sys
 from pathlib import Path
 
 import pytest
@@ -171,10 +172,13 @@ class TestScreenshotRouting:
 
         assert (dst / "screenshots" / "15.0.jpg").exists()
 
-    def test_ocr_fallback_fails_closed_to_mask_window(self, tmp_path):
-        """OCR_FALLBACK with no OCR engine fails closed to MASK_WINDOW:
+    def test_ocr_fallback_without_vision_falls_to_mask_window(self, tmp_path):
+        """OCR_FALLBACK with Vision unavailable fails closed to MASK_WINDOW:
         file is kept but pixels are replaced with a mask."""
+        from unittest.mock import patch
         from PIL import Image
+
+        from screencap.privacy.actions import ActionDecision
 
         dst = self._setup_screenshots(tmp_path, [15.0])
         # Write a real JPEG so masking succeeds
@@ -183,14 +187,25 @@ class TestScreenshotRouting:
         img.save(img_path, "JPEG")
         img.close()
 
-        evaluator = _make_evaluator(mode="public")
+        class _OcrFallbackEvaluator:
+            def evaluate(self, context, metadata, mode=None):
+                return ActionDecision(
+                    action=PrivacyAction.OCR_FALLBACK,
+                    reason="test_ocr_fallback",
+                )
+
         classifier = DefaultContextClassifier()
         window_events = _make_window_events([
-            (10.0, "com.microsoft.VSCode"),  # code_editor + public → TEXT_REDACT
+            (10.0, "com.microsoft.VSCode"),
         ])
         result = ScrubResult()
 
-        self._mask(dst, evaluator, classifier, window_events, result)
+        # Patch VisionOcr to simulate missing Vision framework
+        with patch(
+            "screencap.privacy.ocr.VisionOcr",
+            side_effect=ImportError("No module named 'Vision'"),
+        ):
+            self._mask(dst, _OcrFallbackEvaluator(), classifier, window_events, result)
 
         assert img_path.exists(), "OCR_FALLBACK should mask, not delete"
         assert len(result.audit_entries) == 1
@@ -218,6 +233,160 @@ class TestScreenshotRouting:
         assert entry.reason == "policy_excluded_app"
         # Export-safe: no raw text in any field
         assert "1password" not in entry.evidence_type
+
+
+# ---------------------------------------------------------------------------
+# OCR_FALLBACK integration
+# ---------------------------------------------------------------------------
+
+
+class TestOcrFallbackIntegration:
+    """End-to-end tests for OCR_FALLBACK branch in mask_screenshots()."""
+
+    def _setup_real_jpeg(self, tmp_path, text: str, ts: float = 15.0) -> Path:
+        """Create a recording dir with a real JPEG containing rendered text."""
+        from PIL import Image, ImageDraw, ImageFont
+
+        screenshots_dir = tmp_path / "screenshots"
+        screenshots_dir.mkdir()
+        img_path = screenshots_dir / f"{ts}.jpg"
+        img = Image.new("RGB", (800, 200), (255, 255, 255))
+        draw = ImageDraw.Draw(img)
+        try:
+            font = ImageFont.truetype("/System/Library/Fonts/Helvetica.ttc", 36)
+        except OSError:
+            font = ImageFont.load_default(size=36)
+        draw.text((40, 60), text, fill=(0, 0, 0), font=font)
+        img.save(img_path, "JPEG", quality=95)
+        img.close()
+        return tmp_path
+
+    def _make_ocr_fallback_evaluator(self):
+        """Return an evaluator that always yields OCR_FALLBACK."""
+        from screencap.privacy.actions import ActionDecision
+
+        class _OcrFallbackEvaluator:
+            def evaluate(self, context, metadata, mode=None):
+                return ActionDecision(
+                    action=PrivacyAction.OCR_FALLBACK,
+                    reason="test_ocr_fallback",
+                )
+
+        return _OcrFallbackEvaluator()
+
+    @pytest.mark.skipif(
+        sys.platform != "darwin", reason="Vision framework requires macOS"
+    )
+    def test_ocr_fallback_masks_pii(self, tmp_path):
+        """OCR_FALLBACK with PII in screenshot → file masked, audit records OCR_FALLBACK."""
+        from PIL import Image
+
+        dst = self._setup_real_jpeg(tmp_path, "Email: alice@example.com")
+        img_path = dst / "screenshots" / "15.0.jpg"
+
+        # Read original pixel data for comparison
+        with Image.open(img_path) as orig:
+            orig_bytes = orig.tobytes()
+
+        evaluator = self._make_ocr_fallback_evaluator()
+        classifier = DefaultContextClassifier()
+        window_events = _make_window_events([(10.0, "com.apple.Safari")])
+        result = ScrubResult()
+
+        ctx = ScrubContext(
+            window_events=window_events,
+            evaluator=evaluator,
+            classifier=classifier,
+        )
+        mask_screenshots(dst / "screenshots", ctx, result=result)
+
+        assert img_path.exists(), "OCR_FALLBACK should mask, not delete"
+        # Pixels should differ (masking applied)
+        with Image.open(img_path) as masked:
+            assert masked.tobytes() != orig_bytes
+        assert len(result.audit_entries) == 1
+        assert result.audit_entries[0].action == "ocr_fallback"
+
+    @pytest.mark.skipif(
+        sys.platform != "darwin", reason="Vision framework requires macOS"
+    )
+    def test_ocr_fallback_clean_text_passes_through(self, tmp_path):
+        """OCR_FALLBACK with no PII → file untouched, audit records ALLOW."""
+        dst = self._setup_real_jpeg(tmp_path, "Hello World 2026")
+        img_path = dst / "screenshots" / "15.0.jpg"
+
+        evaluator = self._make_ocr_fallback_evaluator()
+        classifier = DefaultContextClassifier()
+        window_events = _make_window_events([(10.0, "com.apple.Safari")])
+        result = ScrubResult()
+
+        ctx = ScrubContext(
+            window_events=window_events,
+            evaluator=evaluator,
+            classifier=classifier,
+        )
+        mask_screenshots(dst / "screenshots", ctx, result=result)
+
+        assert img_path.exists()
+        assert len(result.audit_entries) == 1
+        assert result.audit_entries[0].action == "allow"
+
+    def test_ocr_fallback_ocr_failure_falls_to_mask_window(self, tmp_path):
+        """OCR error → MASK_WINDOW (fail-closed)."""
+        from unittest.mock import patch
+        from PIL import Image
+
+        dst = self._setup_real_jpeg(tmp_path, "Some text here")
+        img_path = dst / "screenshots" / "15.0.jpg"
+
+        evaluator = self._make_ocr_fallback_evaluator()
+        classifier = DefaultContextClassifier()
+        window_events = _make_window_events([(10.0, "com.apple.Safari")])
+        result = ScrubResult()
+
+        ctx = ScrubContext(
+            window_events=window_events,
+            evaluator=evaluator,
+            classifier=classifier,
+        )
+        # Patch ocr_mask_screenshot to simulate OCR failure
+        with patch(
+            "screencap.scrub_pipeline.ocr_mask_screenshot",
+            side_effect=RuntimeError("OCR engine failed"),
+        ):
+            mask_screenshots(dst / "screenshots", ctx, result=result)
+
+        assert img_path.exists(), "Should fall back to MASK_WINDOW, not delete"
+        assert len(result.audit_entries) == 1
+        assert result.audit_entries[0].action == "mask_window"
+
+    def test_ocr_fallback_vision_unavailable(self, tmp_path):
+        """Vision not installed → MASK_WINDOW (graceful degradation)."""
+        from unittest.mock import patch
+
+        dst = self._setup_real_jpeg(tmp_path, "Some text here")
+        img_path = dst / "screenshots" / "15.0.jpg"
+
+        evaluator = self._make_ocr_fallback_evaluator()
+        classifier = DefaultContextClassifier()
+        window_events = _make_window_events([(10.0, "com.apple.Safari")])
+        result = ScrubResult()
+
+        ctx = ScrubContext(
+            window_events=window_events,
+            evaluator=evaluator,
+            classifier=classifier,
+        )
+        # Patch VisionOcr constructor to raise ImportError — _ocr will be None
+        with patch(
+            "screencap.privacy.ocr.VisionOcr",
+            side_effect=ImportError("No module named 'Vision'"),
+        ):
+            mask_screenshots(dst / "screenshots", ctx, result=result)
+
+        assert img_path.exists(), "Should fall back to MASK_WINDOW"
+        assert len(result.audit_entries) == 1
+        assert result.audit_entries[0].action == "mask_window"
 
 
 # ---------------------------------------------------------------------------
