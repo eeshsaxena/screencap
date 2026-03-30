@@ -51,10 +51,10 @@ class TestActionMatrix:
                 f"{ctx.value}: public={pub.value} is less strict than internal={internal.value}"
             )
 
-    def test_unknown_fails_closed_in_public(self):
+    def test_unknown_allows_in_public(self):
         assert (
             get_matrix_action(ContextClass.UNKNOWN, PrivacyMode.PUBLIC)
-            == PrivacyAction.MASK_WINDOW
+            == PrivacyAction.ALLOW
         )
 
     # New ContextClass matrix entries (pinned values for security-sensitive classes)

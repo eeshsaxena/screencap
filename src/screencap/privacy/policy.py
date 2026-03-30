@@ -115,9 +115,9 @@ _ACTION_MATRIX: dict[tuple[ContextClass, PrivacyMode], PrivacyAction] = {
     (ContextClass.CLOUD_STORAGE, PrivacyMode.PUBLIC): PrivacyAction.MASK_WINDOW,
     (ContextClass.CLOUD_STORAGE, PrivacyMode.SHARED): PrivacyAction.MASK_REGION,
     (ContextClass.CLOUD_STORAGE, PrivacyMode.INTERNAL): PrivacyAction.ALLOW,
-    # unknown — fail closed in public
-    (ContextClass.UNKNOWN, PrivacyMode.PUBLIC): PrivacyAction.MASK_WINDOW,
-    (ContextClass.UNKNOWN, PrivacyMode.SHARED): PrivacyAction.OCR_FALLBACK,
+    # unknown — allow by default, sensitive apps have explicit classes
+    (ContextClass.UNKNOWN, PrivacyMode.PUBLIC): PrivacyAction.ALLOW,
+    (ContextClass.UNKNOWN, PrivacyMode.SHARED): PrivacyAction.ALLOW,
     (ContextClass.UNKNOWN, PrivacyMode.INTERNAL): PrivacyAction.ALLOW,
 }
 
