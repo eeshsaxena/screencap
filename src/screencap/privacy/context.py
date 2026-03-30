@@ -333,6 +333,8 @@ BUNDLE_ID_MAP: dict[str, ContextClass] = {
     "com.cisco.webex.meetingmanager": ContextClass.VIDEO_CALL,
     "com.logmein.GoToMeeting": ContextClass.VIDEO_CALL,
     "com.apple.FaceTime": ContextClass.VIDEO_CALL,
+    # File managers
+    "com.apple.finder": ContextClass.CODE_EDITOR_TERMINAL,
     # Code editors / terminals
     "com.microsoft.VSCode": ContextClass.CODE_EDITOR_TERMINAL,
     "com.apple.Terminal": ContextClass.CODE_EDITOR_TERMINAL,
@@ -366,7 +368,9 @@ BUNDLE_ID_MAP: dict[str, ContextClass] = {
     "com.microsoft.VSCodeInsiders": ContextClass.CODE_EDITOR_TERMINAL,
     "com.sublimetext.3": ContextClass.CODE_EDITOR_TERMINAL,
     "com.sublimehq.Sublime-Merge": ContextClass.CODE_EDITOR_TERMINAL,
-    # Admin consoles
+    # Admin consoles / infrastructure
+    "com.electron.dockerdesktop": ContextClass.ADMIN_CONSOLE,
+    "io.tailscale.ipn.macsys": ContextClass.ADMIN_CONSOLE,
     "com.amazon.awsvpnclient": ContextClass.ADMIN_CONSOLE,
     "com.pgadmin.pgadmin4": ContextClass.ADMIN_CONSOLE,
     "com.sequel-pro.sequel-pro": ContextClass.ADMIN_CONSOLE,
