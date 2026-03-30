@@ -77,7 +77,10 @@ class VisionOcr:
             req = self._Vision.VNRecognizeTextRequest.alloc().init()
             req.setRecognitionLevel_(0)  # accurate
             if roi is not None:
-                # Vision CGRect: (x, y, w, h) normalized, bottom-left origin
+                # Vision CGRect: (x, y, w, h) normalized, bottom-left origin.
+                # Vision returns observation bounding boxes in full-image
+                # normalized coordinates regardless of ROI, so no offset
+                # correction is needed downstream.
                 req.setRegionOfInterest_(roi)
 
             success, error = handler.performRequests_error_([req], None)
