@@ -147,3 +147,52 @@ class TestBuildOffsetMap:
         assert offset_map[3] == 4  # l
         assert offset_map[4] == 5  # o
         assert offset_map[5] == 6  # end sentinel
+
+
+# ---- _vision_bbox_to_pixels ROI remapping --------------------------------
+
+
+class TestVisionBboxToPixels:
+    """Pure-math tests for ROI coordinate remapping (no Vision framework)."""
+
+    @staticmethod
+    def _mock_bbox(x, y, w, h):
+        origin = type("O", (), {"x": x, "y": y})()
+        size = type("S", (), {"width": w, "height": h})()
+        return type("B", (), {"origin": origin, "size": size})()
+
+    def test_no_roi_identity(self):
+        from screencap.privacy.ocr import _vision_bbox_to_pixels
+
+        bbox = self._mock_bbox(0.25, 0.75, 0.5, 0.125)
+        x, y, w, h = _vision_bbox_to_pixels(bbox, 2000, 1000)
+        assert x == 500   # 0.25 * 2000
+        assert w == 1000  # 0.5 * 2000
+        assert h == 125   # 0.125 * 1000
+        # y flipped: (1.0 - 0.75 - 0.125) * 1000 = 0.125 * 1000 = 125
+        assert y == 125
+
+    def test_roi_remaps_to_full_image(self):
+        from screencap.privacy.ocr import _vision_bbox_to_pixels
+
+        # ROI covers the right half of the image
+        roi = (0.5, 0.0, 0.5, 1.0)
+        # Text block at (0.25, 0.75) within the ROI
+        bbox = self._mock_bbox(0.25, 0.75, 0.5, 0.125)
+
+        x, y, w, h = _vision_bbox_to_pixels(bbox, 2000, 1000, roi)
+        # norm_x = 0.5 + 0.25*0.5 = 0.625 → pixel 1250
+        assert x == 1250
+        # norm_w = 0.5 * 0.5 = 0.25 → pixel 500
+        assert w == 500
+        # norm_y = 0.0 + 0.75*1.0 = 0.75, norm_h = 0.125*1.0 = 0.125
+        # y = (1.0 - 0.75 - 0.125) * 1000 = 125
+        assert y == 125
+
+    def test_roi_none_same_as_no_roi(self):
+        from screencap.privacy.ocr import _vision_bbox_to_pixels
+
+        bbox = self._mock_bbox(0.25, 0.5, 0.4, 0.1)
+        result_none = _vision_bbox_to_pixels(bbox, 1920, 1080, None)
+        result_no_arg = _vision_bbox_to_pixels(bbox, 1920, 1080)
+        assert result_none == result_no_arg

@@ -81,7 +81,7 @@ _PATH_CONTEXT_RE = re.compile(r"_PATH\s*[=:]", re.IGNORECASE)
 
 # File path values (starting with /, ~, . or having known extensions)
 _FILE_PATH_VALUE_RE = re.compile(
-    r"""^["']?(?:[/~.]|[\w.\-]+\.(?:pem|key|crt|pub|cert|json|yaml|yml|toml|cfg|ini|conf|log|sock))["']?$"""
+    r"""^["']?(?:[/~.]\S*|[\w.\-]+\.(?:pem|crt|pub|cert|json|yaml|yml|toml|cfg|ini|conf|log|sock))["']?$"""
 )
 
 _SSN_RE = re.compile(r"\d{3}-\d{2}-\d{4}")

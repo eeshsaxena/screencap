@@ -879,7 +879,7 @@ OCR_REAL_WORLD = [
         text="User: john.smith@company.com | Phone: (555) 123-4567",
         expected=[
             ExpectedEntity("EMAIL", "john.smith@company.com"),
-            ExpectedEntity("PHONE_NUMBER", "(555) 123-4567"),
+            ExpectedEntity("PHONE", "(555) 123-4567"),
         ],
         frequency=Frequency.MEDIUM,
     ),
