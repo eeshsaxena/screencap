@@ -561,3 +561,390 @@ class TestMaskScreenshotsIntegration:
 
         assert (screenshots_dir / "5.0.jpg").exists()
         assert len(result.audit_entries) == 0
+
+
+# ---------------------------------------------------------------------------
+# G5: Phase 2 OCR pass on TEXT_REDACT/ALLOW screenshots
+# ---------------------------------------------------------------------------
+
+
+class TestOcrPassTextRedactAllow:
+    """Phase 2: OCR-based PII masking for TEXT_REDACT and ALLOW screenshots."""
+
+    def _setup_real_jpeg(self, tmp_path, text: str, ts: float = 15.0) -> Path:
+        from PIL import Image, ImageDraw, ImageFont
+
+        screenshots_dir = tmp_path / "screenshots"
+        screenshots_dir.mkdir(exist_ok=True)
+        img_path = screenshots_dir / f"{ts}.jpg"
+        img = Image.new("RGB", (800, 200), (255, 255, 255))
+        draw = ImageDraw.Draw(img)
+        try:
+            font = ImageFont.truetype("/System/Library/Fonts/Helvetica.ttc", 36)
+        except OSError:
+            font = ImageFont.load_default(size=36)
+        draw.text((40, 60), text, fill=(0, 0, 0), font=font)
+        img.save(img_path, "JPEG", quality=95)
+        img.close()
+        return tmp_path
+
+    def _make_evaluator(self, action: PrivacyAction):
+        from screencap.privacy.actions import ActionDecision
+
+        class _FixedEvaluator:
+            def evaluate(self, context, metadata, mode=None):
+                return ActionDecision(action=action, reason="test_ocr_phase2")
+
+        return _FixedEvaluator()
+
+    def _mask(self, dst, evaluator, window_events, result):
+        from screencap.privacy.context import DefaultContextClassifier
+
+        ctx = ScrubContext(
+            window_events=window_events,
+            evaluator=evaluator,
+            classifier=DefaultContextClassifier(),
+        )
+        mask_screenshots(dst / "screenshots", ctx, result=result)
+
+    def _window_events(self, ts=10.0, bundle="com.microsoft.VSCode"):
+        from screencap.privacy.context import WindowContext
+
+        return [WindowContext(timestamp=ts, app_bundle_id=bundle, title="")]
+
+    @pytest.mark.skipif(
+        __import__("sys").platform != "darwin", reason="Vision framework requires macOS"
+    )
+    def test_text_redact_ocr_masks_pii(self, tmp_path):
+        """TEXT_REDACT screenshot with PII → OCR detects and masks regions."""
+        from PIL import Image
+
+        dst = self._setup_real_jpeg(tmp_path, "Email: alice@example.com")
+        img_path = dst / "screenshots" / "15.0.jpg"
+
+        with Image.open(img_path) as orig:
+            orig_bytes = orig.tobytes()
+
+        result = ScrubResult()
+        self._mask(
+            dst,
+            self._make_evaluator(PrivacyAction.TEXT_REDACT),
+            self._window_events(),
+            result,
+        )
+
+        assert img_path.exists()
+        with Image.open(img_path) as masked:
+            assert masked.tobytes() != orig_bytes, "PII regions should be masked"
+        assert len(result.audit_entries) == 1
+        assert "ocr_masked" in result.audit_entries[0].reason
+
+    @pytest.mark.skipif(
+        __import__("sys").platform != "darwin", reason="Vision framework requires macOS"
+    )
+    def test_allow_ocr_masks_pii(self, tmp_path):
+        """ALLOW screenshot with PII → OCR detects and masks regions."""
+        from PIL import Image
+
+        dst = self._setup_real_jpeg(tmp_path, "Email: bob@example.com")
+        img_path = dst / "screenshots" / "15.0.jpg"
+
+        with Image.open(img_path) as orig:
+            orig_bytes = orig.tobytes()
+
+        result = ScrubResult()
+        self._mask(
+            dst,
+            self._make_evaluator(PrivacyAction.ALLOW),
+            self._window_events(),
+            result,
+        )
+
+        assert img_path.exists()
+        with Image.open(img_path) as masked:
+            assert masked.tobytes() != orig_bytes, "PII regions should be masked"
+        assert len(result.audit_entries) == 1
+        assert "ocr_masked" in result.audit_entries[0].reason
+
+    def test_ocr_skipped_when_fully_masked(self, tmp_path):
+        """When background masking covers entire image, OCR is skipped."""
+        from unittest.mock import patch
+
+        dst = self._setup_real_jpeg(tmp_path, "Some PII: test@test.com")
+
+        result = ScrubResult()
+        evaluator = self._make_evaluator(PrivacyAction.TEXT_REDACT)
+
+        # Patch _is_fully_masked to return True
+        with patch(
+            "screencap.scrub_pipeline._is_fully_masked", return_value=True,
+        ), patch(
+            "screencap.scrub_pipeline.ocr_mask_screenshot",
+        ) as mock_ocr:
+            self._mask(dst, evaluator, self._window_events(), result)
+
+        mock_ocr.assert_not_called()
+
+    def test_dhash_cache_reuses_regions(self, tmp_path):
+        """Two identical JPEGs → OCR called once, second reuses cache."""
+        from unittest.mock import patch, MagicMock
+        from screencap.privacy.masking import MaskRegion
+
+        # Create two identical screenshots
+        self._setup_real_jpeg(tmp_path, "some text", ts=15.0)
+        self._setup_real_jpeg(tmp_path, "some text", ts=16.0)
+
+        fake_regions = [MaskRegion(x=10, y=10, width=50, height=20, label="TEST")]
+
+        call_count = 0
+        original_ocr_mask = None
+
+        def counting_ocr(*args, **kwargs):
+            nonlocal call_count
+            call_count += 1
+            return fake_regions
+
+        result = ScrubResult()
+        evaluator = self._make_evaluator(PrivacyAction.TEXT_REDACT)
+
+        with patch(
+            "screencap.scrub_pipeline.ocr_mask_screenshot",
+            side_effect=counting_ocr,
+        ):
+            self._mask(tmp_path, evaluator, self._window_events(), result)
+
+        assert call_count == 1, f"OCR should be called once (first), got {call_count}"
+        assert len(result.audit_entries) == 2
+        # Second screenshot should be a cache hit
+        assert "ocr_cache_hit" in result.audit_entries[1].reason
+
+    def test_dhash_cache_invalidated_on_bounds_change(self, tmp_path):
+        """Two identical JPEGs but different window geometry → OCR called twice."""
+        from unittest.mock import patch
+        from screencap.privacy.masking import MaskRegion
+
+        self._setup_real_jpeg(tmp_path, "some text", ts=15.0)
+        self._setup_real_jpeg(tmp_path, "some text", ts=16.0)
+
+        call_count = 0
+
+        def counting_ocr(*args, **kwargs):
+            nonlocal call_count
+            call_count += 1
+            return []
+
+        # Return different bounds for each call
+        bounds_sequence = iter([
+            (0, 0, 400, 200),   # first screenshot
+            (100, 0, 400, 200), # second — different position
+        ])
+
+        def varying_bounds(*args, **kwargs):
+            return next(bounds_sequence, None)
+
+        result = ScrubResult()
+        evaluator = self._make_evaluator(PrivacyAction.TEXT_REDACT)
+
+        with patch(
+            "screencap.scrub_pipeline.ocr_mask_screenshot",
+            side_effect=counting_ocr,
+        ), patch(
+            "screencap.scrub_pipeline._active_window_bounds",
+            side_effect=varying_bounds,
+        ):
+            self._mask(tmp_path, evaluator, self._window_events(), result)
+
+        assert call_count == 2, f"OCR should be called for both (bounds differ), got {call_count}"
+
+    def test_ocr_failure_text_redact_falls_to_mask_window(self, tmp_path):
+        """OCR error on TEXT_REDACT → file exists with MASK_WINDOW audit."""
+        from unittest.mock import patch
+
+        dst = self._setup_real_jpeg(tmp_path, "Some text here")
+        img_path = dst / "screenshots" / "15.0.jpg"
+
+        result = ScrubResult()
+        evaluator = self._make_evaluator(PrivacyAction.TEXT_REDACT)
+
+        with patch(
+            "screencap.scrub_pipeline.ocr_mask_screenshot",
+            side_effect=RuntimeError("OCR engine failed"),
+        ):
+            self._mask(dst, evaluator, self._window_events(), result)
+
+        assert img_path.exists(), "Should MASK_WINDOW, not delete"
+        assert len(result.audit_entries) == 1
+        assert result.audit_entries[0].action == "mask_window"
+        assert "ocr_failed" in result.audit_entries[0].reason
+
+    def test_no_geometry_ocr_runs_full_image(self, tmp_path):
+        """No window_geometry table → OCR runs with roi=None (full image)."""
+        from unittest.mock import patch
+        from screencap.privacy.masking import MaskRegion
+
+        dst = self._setup_real_jpeg(tmp_path, "Email: test@test.com")
+
+        captured_roi = []
+
+        def capturing_ocr(img_path, pipeline, ocr, roi=None):
+            captured_roi.append(roi)
+            return [MaskRegion(x=10, y=10, width=50, height=20, label="EMAIL")]
+
+        result = ScrubResult()
+        evaluator = self._make_evaluator(PrivacyAction.TEXT_REDACT)
+
+        # No db_path → no geometry → no active window bounds → roi=None
+        with patch(
+            "screencap.scrub_pipeline.ocr_mask_screenshot",
+            side_effect=capturing_ocr,
+        ):
+            self._mask(dst, evaluator, self._window_events(), result)
+
+        assert len(captured_roi) == 1
+        assert captured_roi[0] is None, "ROI should be None when no geometry"
+
+    @pytest.mark.skipif(
+        __import__("sys").platform != "darwin", reason="Vision framework requires macOS"
+    )
+    def test_allow_clean_text_no_masking(self, tmp_path):
+        """ALLOW screenshot with no PII → file untouched, audit shows ocr_clean."""
+        from PIL import Image
+
+        dst = self._setup_real_jpeg(tmp_path, "Hello World 2026")
+        img_path = dst / "screenshots" / "15.0.jpg"
+
+        with Image.open(img_path) as orig:
+            orig_bytes = orig.tobytes()
+
+        result = ScrubResult()
+        self._mask(
+            dst,
+            self._make_evaluator(PrivacyAction.ALLOW),
+            self._window_events(),
+            result,
+        )
+
+        assert img_path.exists()
+        with Image.open(img_path) as after:
+            assert after.tobytes() == orig_bytes, "No PII → no masking"
+        assert len(result.audit_entries) == 1
+        assert "ocr_clean" in result.audit_entries[0].reason
+
+
+# ---------------------------------------------------------------------------
+# G6: Unit tests for Phase 2 helper functions
+# ---------------------------------------------------------------------------
+
+
+class TestIsFullyMasked:
+    """Unit tests for _is_fully_masked()."""
+
+    def _make_jpeg(self, path, w=100, h=80):
+        from PIL import Image
+        img = Image.new("RGB", (w, h), (255, 255, 255))
+        img.save(path, "JPEG")
+
+    def test_returns_true_when_regions_cover_full_image(self, tmp_path):
+        from screencap.scrub_pipeline import _is_fully_masked
+        from screencap.privacy.masking import MaskRegion
+
+        img_path = tmp_path / "test.jpg"
+        self._make_jpeg(img_path, 100, 80)
+        regions = [MaskRegion(x=0, y=0, width=100, height=80)]
+        assert _is_fully_masked(img_path, regions) is True
+
+    def test_returns_false_when_regions_partial(self, tmp_path):
+        from screencap.scrub_pipeline import _is_fully_masked
+        from screencap.privacy.masking import MaskRegion
+
+        img_path = tmp_path / "test.jpg"
+        self._make_jpeg(img_path, 100, 80)
+        regions = [MaskRegion(x=0, y=0, width=50, height=40)]  # 25% coverage
+        assert _is_fully_masked(img_path, regions) is False
+
+    def test_returns_false_when_no_regions(self, tmp_path):
+        from screencap.scrub_pipeline import _is_fully_masked
+
+        img_path = tmp_path / "test.jpg"
+        self._make_jpeg(img_path)
+        assert _is_fully_masked(img_path, None) is False
+        assert _is_fully_masked(img_path, []) is False
+
+
+class TestActiveWindowBounds:
+    """Unit tests for _active_window_bounds()."""
+
+    def test_finds_window_by_bundle_id(self):
+        from screencap.scrub_pipeline import _active_window_bounds
+        from screencap.privacy.context import WindowGeometrySnapshot
+
+        geom = WindowGeometrySnapshot(
+            windows=[
+                {"bundle_id": "com.apple.finder", "x": 0, "y": 0, "width": 100, "height": 100},
+                {"bundle_id": "com.microsoft.VSCode", "x": 50, "y": 25, "width": 200, "height": 150},
+            ],
+            display_origin=(0.0, 0.0),
+        )
+        bounds = _active_window_bounds(geom, "com.microsoft.VSCode", 2.0, 800, 600)
+        # pixel coords: x=50*2=100, y=25*2=50, w=200*2=400, h=150*2=300
+        assert bounds == (100, 50, 400, 300)
+
+    def test_falls_back_to_first_window(self):
+        from screencap.scrub_pipeline import _active_window_bounds
+        from screencap.privacy.context import WindowGeometrySnapshot
+
+        geom = WindowGeometrySnapshot(
+            windows=[
+                {"bundle_id": "com.apple.finder", "x": 10, "y": 20, "width": 100, "height": 80},
+            ],
+            display_origin=(0.0, 0.0),
+        )
+        bounds = _active_window_bounds(geom, "com.nonexistent.app", 1.0, 200, 200)
+        assert bounds == (10, 20, 100, 80)
+
+    def test_returns_none_when_no_geometry(self):
+        from screencap.scrub_pipeline import _active_window_bounds
+
+        assert _active_window_bounds(None, "any", 2.0, 800, 600) is None
+
+    def test_returns_none_when_empty_windows(self):
+        from screencap.scrub_pipeline import _active_window_bounds
+        from screencap.privacy.context import WindowGeometrySnapshot
+
+        geom = WindowGeometrySnapshot(windows=[], display_origin=(0.0, 0.0))
+        assert _active_window_bounds(geom, "any", 2.0, 800, 600) is None
+
+
+class TestActiveWindowRoi:
+    """Unit tests for _active_window_roi()."""
+
+    def test_converts_pixel_bounds_to_vision_coords(self):
+        from screencap.scrub_pipeline import _active_window_roi
+
+        # Window at top-left quarter: (0, 0, 400, 300) in 800x600 image
+        roi = _active_window_roi((0, 0, 400, 300), 800, 600)
+        x, y, w, h = roi
+        assert w == pytest.approx(0.5)   # 400/800
+        assert h == pytest.approx(0.5)   # 300/600
+        assert x == pytest.approx(0.0)
+        # Y-flipped: top-left in PIL → bottom-left in Vision
+        # roi_y = 1.0 - 0.0 - 0.5 = 0.5
+        assert y == pytest.approx(0.5)
+
+    def test_full_image_roi(self):
+        from screencap.scrub_pipeline import _active_window_roi
+
+        roi = _active_window_roi((0, 0, 800, 600), 800, 600)
+        assert roi == pytest.approx((0.0, 0.0, 1.0, 1.0))
+
+    def test_bottom_right_window(self):
+        from screencap.scrub_pipeline import _active_window_roi
+
+        # Window at bottom-right: (400, 300, 400, 300) in 800x600
+        roi = _active_window_roi((400, 300, 400, 300), 800, 600)
+        x, y, w, h = roi
+        assert x == pytest.approx(0.5)   # 400/800
+        assert w == pytest.approx(0.5)   # 400/800
+        assert h == pytest.approx(0.5)   # 300/600
+        # Y-flipped: y1=300/600=0.5, roi_y=1.0-0.5-0.5=0.0
+        assert y == pytest.approx(0.0)
