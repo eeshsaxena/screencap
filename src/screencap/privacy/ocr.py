@@ -79,8 +79,7 @@ class VisionOcr:
             if roi is not None:
                 # PyObjC expects CGRect as ((x, y), (width, height)), not
                 # a flat (x, y, w, h) tuple.  Vision uses normalized coords
-                # with bottom-left origin.  Returned bounding boxes are in
-                # full-image coordinates regardless of ROI.
+                # with bottom-left origin.
                 x, y, w, h = roi
                 req.setRegionOfInterest_(((x, y), (w, h)))
 
@@ -98,13 +97,13 @@ class VisionOcr:
                     continue
                 top = candidate[0]
                 text = str(top.string())
-                bbox = _vision_bbox_to_pixels(obs.boundingBox(), im_w, im_h)
+                bbox = _vision_bbox_to_pixels(obs.boundingBox(), im_w, im_h, roi)
 
                 blocks.append(
                     OcrTextBlock(
                         text=text,
                         bbox=bbox,
-                        char_bboxes=_make_char_bboxes(top, im_w, im_h),
+                        char_bboxes=_make_char_bboxes(top, im_w, im_h, roi),
                     )
                 )
 
@@ -114,7 +113,10 @@ class VisionOcr:
 
 
 def _make_char_bboxes(
-    cand: object, w: int, h: int
+    cand: object,
+    w: int,
+    h: int,
+    roi: tuple[float, float, float, float] | None = None,
 ) -> Callable[[int, int], tuple[int, int, int, int] | None]:
     """Factory to create a char_bboxes closure for a VNRecognizedText candidate."""
 
@@ -127,7 +129,7 @@ def _make_char_bboxes(
             return None
         # boundingBoxForRange returns a VNRectangleObservation;
         # extract the normalized CGRect via .boundingBox().
-        return _vision_bbox_to_pixels(obs.boundingBox(), w, h)
+        return _vision_bbox_to_pixels(obs.boundingBox(), w, h, roi)
 
     return char_bboxes
 
@@ -136,12 +138,30 @@ def _vision_bbox_to_pixels(
     bbox: object,
     im_w: int,
     im_h: int,
+    roi: tuple[float, float, float, float] | None = None,
 ) -> tuple[int, int, int, int]:
-    """Convert Vision normalized coords (bottom-left origin) to PIL pixels (top-left origin)."""
-    x = int(bbox.origin.x * im_w)  # type: ignore[union-attr]
-    y = int((1.0 - bbox.origin.y - bbox.size.height) * im_h)  # type: ignore[union-attr]
-    w = int(bbox.size.width * im_w)  # type: ignore[union-attr]
-    h = int(bbox.size.height * im_h)  # type: ignore[union-attr]
+    """Convert Vision normalized coords (bottom-left origin) to PIL pixels (top-left origin).
+
+    When *roi* is provided, Vision returns coordinates relative to the ROI
+    region rather than the full image.  This function remaps them back to
+    full-image coordinates before converting to pixels.
+    """
+    norm_x = bbox.origin.x  # type: ignore[union-attr]
+    norm_y = bbox.origin.y  # type: ignore[union-attr]
+    norm_w = bbox.size.width  # type: ignore[union-attr]
+    norm_h = bbox.size.height  # type: ignore[union-attr]
+
+    if roi is not None:
+        roi_x, roi_y, roi_w, roi_h = roi
+        norm_x = roi_x + norm_x * roi_w
+        norm_y = roi_y + norm_y * roi_h
+        norm_w = norm_w * roi_w
+        norm_h = norm_h * roi_h
+
+    x = int(norm_x * im_w)
+    y = int((1.0 - norm_y - norm_h) * im_h)
+    w = int(norm_w * im_w)
+    h = int(norm_h * im_h)
     return (x, y, w, h)
 
 
