@@ -461,6 +461,7 @@ class RecorderPrivacyFilter:
 
         try:
             from screencap.privacy.masking import (
+                _apply_bitmap_mask_to_image,
                 _apply_mask_to_image,
                 window_regions_from_geometry,
             )
@@ -487,9 +488,17 @@ class RecorderPrivacyFilter:
                 self._classifier,
                 self._masking_evaluator,
                 display_origin=display_origin,
+                respect_z_order=True,
             )
             if regions:
-                _apply_mask_to_image(image, regions)
+                mask_bmp = getattr(regions[0], "_mask_bitmap", None)
+                if mask_bmp is not None:
+                    try:
+                        _apply_bitmap_mask_to_image(image, mask_bmp)
+                    finally:
+                        mask_bmp.close()
+                else:
+                    _apply_mask_to_image(image, regions)
         except Exception:
             pass  # Never block the recording pipeline on masking errors
 
