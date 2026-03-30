@@ -85,6 +85,27 @@ _PATTERNS: list[tuple[re.Pattern[str], str, float]] = [
         EntityType.SSN,
         0.9,
     ),
+    # Stripe publishable keys (sk_live/sk_test already covered by detect-secrets).
+    # Uses \S instead of [A-Za-z0-9] to tolerate OCR artifacts (e.g. Ø for 0).
+    (
+        re.compile(r"""\bpk_(?:live|test)_\S{20,}"""),
+        EntityType.API_KEY,
+        0.9,
+    ),
+    # Generic secret/key/token assignments with unquoted values.
+    # Excludes quoted values (handled by detect-secrets KeywordDetector)
+    # and file paths (start with / or ~) to reduce false positives.
+    # Allows optional whitespace after _ before keyword (OCR: JWT_ SECRET).
+    # Value class includes @ to tolerate OCR digit→@ substitution.
+    (
+        re.compile(
+            r"""(?i)\b\w+_\s*(?:SECRET|KEY|TOKEN)\s*=\s*"""
+            r"""(?!["'/~])"""
+            r"""([A-Za-z0-9_\-+/.@]{24,})""",
+        ),
+        EntityType.API_KEY,
+        0.85,
+    ),
 ]
 
 

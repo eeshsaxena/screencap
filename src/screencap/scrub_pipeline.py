@@ -1181,8 +1181,8 @@ def ocr_mask_screenshot(
 
     When *roi* is provided it is passed through to
     ``ocr.recognize(image_path, roi=roi)`` to restrict OCR to a sub-region.
-    Vision returns bounding boxes in full-image coordinates regardless of ROI,
-    so no offset correction is needed.
+    VisionOcr remaps ROI-relative bounding boxes to full-image coordinates
+    internally, so callers do not need offset correction.
 
     Detection errors are caught **per text block**: if ``pipeline.detect()``
     raises (e.g. ``AllDetectorsFailedError``), the entire text block is masked
