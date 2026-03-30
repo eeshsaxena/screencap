@@ -48,6 +48,7 @@ record = [
     "pyobjc-framework-ApplicationServices>=9.0; sys_platform == 'darwin'",
     "pyobjc-framework-Cocoa>=9.0; sys_platform == 'darwin'",
     "pyobjc-framework-CoreWLAN>=9.0; sys_platform == 'darwin'",
+    "pyobjc-framework-Vision>=9.0; sys_platform == 'darwin'",
 ]
 privacy = []  # Moved to base dependencies as of v0.11.0
 dev = [

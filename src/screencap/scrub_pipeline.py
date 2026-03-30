@@ -1156,6 +1156,81 @@ def _scrub_transcript_txt(
 # ---------------------------------------------------------------------------
 
 
+def _pad_bbox(
+    bbox: tuple[int, int, int, int], pad: int, im_w: int, im_h: int,
+) -> tuple[int, int, int, int]:
+    """Add padding to a bounding box, clamped to image bounds."""
+    x, y, w, h = bbox
+    x1 = max(0, x - pad)
+    y1 = max(0, y - pad)
+    x2 = min(im_w, x + w + pad)
+    y2 = min(im_h, y + h + pad)
+    return (x1, y1, x2 - x1, y2 - y1)
+
+
+def ocr_mask_screenshot(
+    image_path: Path,
+    pipeline: object,
+    ocr: object,
+) -> list:
+    """OCR a screenshot, detect PII, return mask regions.
+
+    Returns an empty list if no PII is detected.  Raises on OCR failure
+    (caller is responsible for fail-closed behavior).
+
+    Detection errors are caught **per text block**: if ``pipeline.detect()``
+    raises (e.g. ``AllDetectorsFailedError``), the entire text block is masked
+    as a precaution rather than escalating to MASK_WINDOW for the whole image.
+    """
+    from screencap.privacy.masking import MaskRegion
+    from screencap.privacy.ocr import build_offset_map
+    from screencap.privacy import normalize_text
+
+    result = ocr.recognize(image_path)
+    if not result.text_blocks:
+        return []
+
+    regions: list[MaskRegion] = []
+    for block in result.text_blocks:
+        try:
+            det_result = pipeline.detect(block.text)
+        except Exception:
+            # Detection failure on this block — fail closed to full-block mask
+            x, y, w, h = _pad_bbox(block.bbox, 3, result.image_width, result.image_height)
+            regions.append(MaskRegion(x=x, y=y, width=w, height=h, label="DETECTION_ERROR"))
+            continue
+
+        if not det_result.detections:
+            continue
+
+        # Build offset mapping: detection offsets are into normalized text,
+        # but char_bboxes expects offsets into the original OCR text.
+        normalized = normalize_text(block.text)
+        if normalized != block.text:
+            offset_map = build_offset_map(block.text, normalized)
+        else:
+            offset_map = None  # identity — no remapping needed
+
+        for det in det_result.detections:
+            if offset_map is not None:
+                orig_start = offset_map[det.start]
+                orig_end = offset_map[det.end]
+                orig_len = orig_end - orig_start
+            else:
+                orig_start = det.start
+                orig_len = det.end - det.start
+
+            char_box = block.char_bboxes(orig_start, orig_len)
+            if char_box is not None:
+                x, y, w, h = _pad_bbox(char_box, 3, result.image_width, result.image_height)
+            else:
+                # boundingBoxForRange failed — mask entire text block
+                x, y, w, h = _pad_bbox(block.bbox, 3, result.image_width, result.image_height)
+            regions.append(MaskRegion(x=x, y=y, width=w, height=h, label=det.entity_type))
+
+    return regions
+
+
 def mask_screenshots(
     screenshots_dir: Path,
     ctx: ScrubContext,
@@ -1172,7 +1247,7 @@ def mask_screenshots(
     EXCLUDE → delete file.
     MASK_WINDOW → selective mask via geometry, fallback to full-frame.
     MASK_REGION → pane-level structural mask.
-    OCR_FALLBACK → fail closed to MASK_WINDOW.
+    OCR_FALLBACK → OCR-based PII masking, fail closed to MASK_WINDOW.
     TEXT_REDACT / ALLOW → keep file (but check background windows).
     """
     if not screenshots_dir.is_dir():
@@ -1194,6 +1269,23 @@ def mask_screenshots(
         mask_screenshot,
         window_regions_from_geometry,
     )
+
+    # Try to create OCR + detection pipeline for OCR_FALLBACK.
+    _ocr = None
+    _pipeline = None
+    try:
+        from screencap.privacy.ocr import VisionOcr
+        _ocr = VisionOcr()
+        from screencap.privacy import create_default_pipeline
+        _pipeline = create_default_pipeline()
+    except ImportError:
+        logger.warning(
+            "pyobjc-framework-Vision not installed; OCR_FALLBACK will use MASK_WINDOW"
+        )
+    except Exception:
+        logger.warning(
+            "Failed to initialize OCR engine; OCR_FALLBACK will use MASK_WINDOW"
+        )
 
     window_timestamps = [w.timestamp for w in ctx.window_events] if ctx.window_events else []
 
@@ -1282,21 +1374,51 @@ def mask_screenshots(
                     img_path.unlink()
                     actual_action = PrivacyAction.EXCLUDE
         elif decision.action == PrivacyAction.OCR_FALLBACK:
-            try:
-                mask_screenshot(
-                    img_path,
-                    ctx_class.context_class,
-                    strategy=MaskStrategy.FULL_WINDOW,
-                    app_hint=meta.bundle_id,
-                )
-                actual_action = PrivacyAction.MASK_WINDOW
-            except Exception:
-                img_path.unlink()
-                actual_action = PrivacyAction.EXCLUDE
+            if _ocr is not None and _pipeline is not None:
+                try:
+                    regions = ocr_mask_screenshot(img_path, _pipeline, _ocr)
+                    if regions:
+                        mask_screenshot(img_path, ctx_class.context_class, regions=regions)
+                        actual_action = PrivacyAction.OCR_FALLBACK
+                    else:
+                        # No PII detected — leave screenshot as-is
+                        actual_action = PrivacyAction.ALLOW
+                except Exception:
+                    # Fail closed: OCR error → MASK_WINDOW
+                    try:
+                        mask_screenshot(
+                            img_path,
+                            ctx_class.context_class,
+                            strategy=MaskStrategy.FULL_WINDOW,
+                            app_hint=meta.bundle_id,
+                        )
+                        actual_action = PrivacyAction.MASK_WINDOW
+                    except Exception:
+                        img_path.unlink()
+                        actual_action = PrivacyAction.EXCLUDE
+            else:
+                # Vision not available — fall back to MASK_WINDOW
+                try:
+                    mask_screenshot(
+                        img_path,
+                        ctx_class.context_class,
+                        strategy=MaskStrategy.FULL_WINDOW,
+                        app_hint=meta.bundle_id,
+                    )
+                    actual_action = PrivacyAction.MASK_WINDOW
+                except Exception:
+                    img_path.unlink()
+                    actual_action = PrivacyAction.EXCLUDE
 
-        # Background masking for ALLOW / TEXT_REDACT
+        # Background masking for screenshots that keep foreground content.
+        # OCR_FALLBACK with successful OCR has surgical foreground masking —
+        # background windows must also be masked to prevent PII leakage.
         bg_masked = False
-        if decision.action in (PrivacyAction.ALLOW, PrivacyAction.TEXT_REDACT):
+        if actual_action in (
+            PrivacyAction.ALLOW,
+            PrivacyAction.TEXT_REDACT,
+            PrivacyAction.OCR_FALLBACK,
+        ):
             if _geom_conn is not None and img_path.exists():
                 try:
                     geom = load_window_geometry(db_path, ts, conn=_geom_conn)
