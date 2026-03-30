@@ -1188,9 +1188,9 @@ def ocr_mask_screenshot(
     raises (e.g. ``AllDetectorsFailedError``), the entire text block is masked
     as a precaution rather than escalating to MASK_WINDOW for the whole image.
     """
+    from screencap.privacy import normalize_text
     from screencap.privacy.masking import MaskRegion
     from screencap.privacy.ocr import build_offset_map
-    from screencap.privacy import normalize_text
 
     result = ocr.recognize(image_path, roi=roi)
     if not result.text_blocks:
@@ -1579,8 +1579,9 @@ def mask_screenshots(
                 fully_masked = False  # conservative: run OCR
 
             if not fully_masked:
-                from screencap.engine.dedup import dhash, hamming_distance
                 from PIL import Image
+
+                from screencap.engine.dedup import dhash, hamming_distance
 
                 # Open image for dimensions + dHash; skip OCR if unreadable
                 current_hash = None
