@@ -775,6 +775,85 @@ OCR_SCREENSHOT_FPS = [
 
 
 # ---------------------------------------------------------------------------
+# 13. OCR real-world: text from common developer screen content
+# ---------------------------------------------------------------------------
+
+OCR_REAL_WORLD = [
+    # --- True positives: real PII that must be caught ---
+    CorpusCase(
+        id="ocr-rw-01",
+        description="Terminal with AWS secret key export",
+        text="export AWS_SECRET_ACCESS_KEY=wJalrXUtnFEMI/K7MDENG/bPxRfiCYEXAMPLEKEY",
+        expected=[ExpectedEntity("API_KEY", "wJalrXUtnFEMI/K7MDENG/bPxRfiCYEXAMPLEKEY", source="secrets")],
+        frequency=Frequency.LOW,
+    ),
+    CorpusCase(
+        id="ocr-rw-02",
+        description="Browser admin panel with user record",
+        text="User: john.smith@company.com | Phone: (555) 123-4567",
+        expected=[
+            ExpectedEntity("EMAIL", "john.smith@company.com"),
+            ExpectedEntity("PHONE_NUMBER", "(555) 123-4567"),
+        ],
+        frequency=Frequency.MEDIUM,
+    ),
+    CorpusCase(
+        id="ocr-rw-03",
+        description="Git log author line",
+        text="Author: Jane Doe <jane@company.com>",
+        expected=[
+            ExpectedEntity("PERSON", "Jane Doe"),
+            ExpectedEntity("EMAIL", "jane@company.com"),
+        ],
+        frequency=Frequency.MEDIUM,
+    ),
+    CorpusCase(
+        id="ocr-rw-04",
+        description="Database table output with email and SSN",
+        text="| id | email              | ssn         |\n| 42 | test@example.com  | 123-45-6789 |",
+        expected=[
+            ExpectedEntity("EMAIL", "test@example.com"),
+            ExpectedEntity("SSN", "123-45-6789"),
+        ],
+        frequency=Frequency.LOW,
+    ),
+    # --- False positives: developer content that must NOT trigger ---
+    CorpusCase(
+        id="ocr-rw-05",
+        description="Python import statements",
+        text="import os\nfrom pathlib import Path",
+        expected=[],
+        is_false_positive=True,
+        frequency=Frequency.HIGH,
+    ),
+    CorpusCase(
+        id="ocr-rw-06",
+        description="Terminal shell prompt with hostname",
+        text="user@hostname:~/project$ git log --oneline",
+        expected=[],
+        is_false_positive=True,
+        frequency=Frequency.HIGH,
+    ),
+    CorpusCase(
+        id="ocr-rw-07",
+        description="Python class with name-like identifier",
+        text="class PersonManager:\n    def find_by_name(self, johnson):",
+        expected=[],
+        is_false_positive=True,
+        frequency=Frequency.HIGH,
+    ),
+    CorpusCase(
+        id="ocr-rw-08",
+        description="VS Code status bar with language and encoding",
+        text="File  Edit  View  Terminal  Help  |  main  ●  UTF-8  LF  Python",
+        expected=[],
+        is_false_positive=True,
+        frequency=Frequency.HIGH,
+    ),
+]
+
+
+# ---------------------------------------------------------------------------
 # All test cases combined
 # ---------------------------------------------------------------------------
 
@@ -791,6 +870,7 @@ ALL_TEST_CASES: list[CorpusCase] = (
     + EDGE_CASES
     + TERMINAL_ACCESSIBILITY
     + OCR_SCREENSHOT_FPS
+    + OCR_REAL_WORLD
 )
 
 # Count for verification
