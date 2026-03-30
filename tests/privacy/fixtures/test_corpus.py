@@ -139,6 +139,36 @@ TYPED_CREDENTIALS = [
         text="STRIPE_KEY=sk_live_" + "a" * 24,
         expected=[ExpectedEntity("API_KEY", "sk_live_" + "a" * 24, "secrets")],
     ),
+    CorpusCase(
+        id="cred-11",
+        description="Stripe publishable key (live)",
+        text="PUBLIC_API_KEY=pk_live_51NXwT8cHf0vYAjQK9LzB3pM6R8gWx2F",
+        expected=[ExpectedEntity("API_KEY", "pk_live_51NXwT8cHf0vYAjQK9LzB3pM6R8gWx2F", "regex")],
+    ),
+    CorpusCase(
+        id="cred-12",
+        description="Stripe publishable key (test)",
+        text="STRIPE_PK=pk_test_51NXwT8cHf0vYAjQK9LzB3pM6R8gWx2F",
+        expected=[ExpectedEntity("API_KEY", "pk_test_51NXwT8cHf0vYAjQK9LzB3pM6R8gWx2F", "regex")],
+    ),
+    CorpusCase(
+        id="cred-13",
+        description="JWT secret (unquoted hex)",
+        text="JWT_SECRET=289e31d47526d6fa0e3289d15c4b1e72a4567890abcdef",
+        expected=[ExpectedEntity("API_KEY", "289e31d47526d6fa0e3289d15c4b1e72a4567890abcdef")],
+    ),
+    CorpusCase(
+        id="cred-14",
+        description="GitHub client secret (unquoted)",
+        text="GITHUB_CLIENT_SECRET=ghclientsecretvalue1234567890abc",
+        expected=[ExpectedEntity("API_KEY", "ghclientsecretvalue1234567890abc")],
+    ),
+    CorpusCase(
+        id="cred-15",
+        description="API key with generic _KEY= pattern",
+        text="PROVER_API_KEY=sk_prover_8f7e6d5c4b3a2z1y0x9w8v7u",
+        expected=[ExpectedEntity("API_KEY", "sk_prover_8f7e6d5c4b3a2z1y0x9w8v7u")],
+    ),
 ]
 
 # ---------------------------------------------------------------------------
@@ -771,6 +801,62 @@ OCR_SCREENSHOT_FPS = [
         is_false_positive=True,
         frequency=Frequency.MEDIUM,
     ),
+    CorpusCase(
+        id="ocr-fp-09",
+        description="Filename flagged as PERSON (CLAUDE.md)",
+        text="CLAUDE.md - VS Code",
+        expected=[],
+        is_false_positive=True,
+        frequency=Frequency.HIGH,
+    ),
+    CorpusCase(
+        id="ocr-fp-10",
+        description="Tool name in status bar (Prettier)",
+        text="Prettier · UTF-8 · LF",
+        expected=[],
+        is_false_positive=True,
+        frequency=Frequency.HIGH,
+    ),
+    CorpusCase(
+        id="ocr-fp-11",
+        description="Editor cursor position as ADDRESS",
+        text="Ln 17, Col 31  Spaces: 4  UTF-8",
+        expected=[],
+        is_false_positive=True,
+        frequency=Frequency.HIGH,
+    ),
+    CorpusCase(
+        id="ocr-fp-12",
+        description="File path value flagged as PASSWORD",
+        text='CLIENT_KEY_PATH="client_key.pem"',
+        expected=[],
+        is_false_positive=True,
+        frequency=Frequency.MEDIUM,
+    ),
+    CorpusCase(
+        id="ocr-fp-13",
+        description="Code comment keywords (openssl rand)",
+        text="# openssl rand -hex 32",
+        expected=[],
+        is_false_positive=True,
+        frequency=Frequency.HIGH,
+    ),
+    CorpusCase(
+        id="ocr-fp-14",
+        description="SSH key path (not a secret value)",
+        text="SSH_KEY=/Users/dev/.ssh/id_rsa",
+        expected=[],
+        is_false_positive=True,
+        frequency=Frequency.MEDIUM,
+    ),
+    CorpusCase(
+        id="ocr-fp-15",
+        description="Cache key config value (not a secret)",
+        text="CACHE_KEY=my_app_prefix_v2_prod",
+        expected=[],
+        is_false_positive=True,
+        frequency=Frequency.MEDIUM,
+    ),
 ]
 
 
@@ -784,7 +870,7 @@ OCR_REAL_WORLD = [
         id="ocr-rw-01",
         description="Terminal with AWS secret key export",
         text="export AWS_SECRET_ACCESS_KEY=wJalrXUtnFEMI/K7MDENG/bPxRfiCYEXAMPLEKEY",
-        expected=[ExpectedEntity("API_KEY", "wJalrXUtnFEMI/K7MDENG/bPxRfiCYEXAMPLEKEY", source="secrets")],
+        expected=[ExpectedEntity("API_KEY", "wJalrXUtnFEMI/K7MDENG/bPxRfiCYEXAMPLEKEY")],
         frequency=Frequency.LOW,
     ),
     CorpusCase(
