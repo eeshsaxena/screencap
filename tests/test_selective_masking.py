@@ -766,3 +766,37 @@ class TestZOrderMasking:
             respect_z_order=True,
         )
         assert len(regions) == 0
+
+    def test_mask_frame_respects_z_order(self):
+        """mask_frame() uses z-order: ALLOW foreground hides MASK_WINDOW background."""
+        from PIL import Image
+
+        config = _make_config(mode=PrivacyMode.PUBLIC)
+        pf = RecorderPrivacyFilter(config, cloud_intent=True)
+
+        img = Image.new("RGB", (200, 150), (255, 255, 255))
+        geometry = {
+            "windows": [
+                # Front-to-back: VS Code foreground covers left half
+                {"bundle_id": "com.microsoft.VSCode", "app_name": "VS Code",
+                 "x": 0, "y": 0, "width": 100, "height": 150},
+                # Slack background spans full width
+                {"bundle_id": "com.tinyspeck.slackmacgap", "app_name": "Slack",
+                 "x": 0, "y": 0, "width": 200, "height": 150},
+            ],
+            "display_bounds": [0, 0, 200, 150],
+        }
+
+        pf.mask_frame(img, geometry, 1.0)
+
+        # Left half (VS Code foreground) should be preserved (bright)
+        left_pixel = img.getpixel((25, 75))
+        assert all(c > 200 for c in left_pixel), (
+            f"VS Code area should be unmasked: {left_pixel}"
+        )
+        # Right half (Slack only, no foreground cover) should be masked (dark)
+        right_pixel = img.getpixel((150, 75))
+        assert all(c < 50 for c in right_pixel), (
+            f"Slack area should be masked: {right_pixel}"
+        )
+        img.close()
