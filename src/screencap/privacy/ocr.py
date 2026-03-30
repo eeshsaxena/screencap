@@ -77,11 +77,12 @@ class VisionOcr:
             req = self._Vision.VNRecognizeTextRequest.alloc().init()
             req.setRecognitionLevel_(0)  # accurate
             if roi is not None:
-                # Vision CGRect: (x, y, w, h) normalized, bottom-left origin.
-                # Vision returns observation bounding boxes in full-image
-                # normalized coordinates regardless of ROI, so no offset
-                # correction is needed downstream.
-                req.setRegionOfInterest_(roi)
+                # PyObjC expects CGRect as ((x, y), (width, height)), not
+                # a flat (x, y, w, h) tuple.  Vision uses normalized coords
+                # with bottom-left origin.  Returned bounding boxes are in
+                # full-image coordinates regardless of ROI.
+                x, y, w, h = roi
+                req.setRegionOfInterest_(((x, y), (w, h)))
 
             success, error = handler.performRequests_error_([req], None)
             if not success:

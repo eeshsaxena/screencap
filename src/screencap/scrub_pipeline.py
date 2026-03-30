@@ -1687,10 +1687,11 @@ def mask_screenshots(
                 reason=f"{decision.reason}+background_windows_masked{ocr_detail}"
                     if bg_masked else f"{decision.reason}{ocr_detail}",
                 context_class=ctx_class.context_class.value,
-                evidence_type=f"{ctx_class.confidence}+geometry+ocr"
-                    if (bg_masked or ocr_ran or cache_hit)
-                    else (f"{ctx_class.confidence}+geometry"
-                          if bg_masked else ctx_class.confidence),
+                evidence_type=(
+                    f"{ctx_class.confidence}"
+                    + ("+geometry" if bg_masked else "")
+                    + ("+ocr" if (ocr_ran or cache_hit) else "")
+                ),
             )
         )
 
