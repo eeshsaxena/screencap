@@ -1237,27 +1237,6 @@ def ocr_mask_screenshot(
     return regions
 
 
-def _is_fully_masked(
-    img_path: Path,
-    bg_regions: list | None,
-) -> bool:
-    """Return True if background masking covers the entire image.
-
-    Uses a conservative pixel-area check (sum of region areas >= image area).
-    Overlapping regions can overcount, so this may return True when not 100%
-    covered — acceptable because background masking has already handled
-    sensitive regions.
-    """
-    if not bg_regions:
-        return False
-    from PIL import Image
-
-    with Image.open(img_path) as img:
-        img_area = img.size[0] * img.size[1]
-    mask_area = sum(r.width * r.height for r in bg_regions)
-    return mask_area >= img_area
-
-
 def _active_window_bounds(
     geom: object,
     bundle_id: str,
@@ -1509,40 +1488,141 @@ def mask_screenshots(
                     img_path.unlink()
                     actual_action = PrivacyAction.EXCLUDE
 
-        # Background masking for screenshots that keep foreground content.
-        # OCR_FALLBACK with successful OCR has surgical foreground masking —
-        # background windows must also be masked to prevent PII leakage.
-        bg_masked = False
-        bg_regions = None
+        # Load geometry once — used by both OCR and background masking.
         geom = None
+        if _geom_conn is not None and img_path.exists():
+            try:
+                geom = load_window_geometry(db_path, ts, conn=_geom_conn)
+            except Exception:
+                pass
+
+        # --- Phase 2: OCR pass on foreground content ---
+        # Run BEFORE background masking so OCR sees the original
+        # foreground content (bg masking can destroy text).
+        ocr_regions: list = []
+        ocr_ran = False
+        cache_hit = False
+        if (
+            _ocr is not None
+            and _pipeline is not None
+            and img_path.exists()
+            and decision.action in (PrivacyAction.ALLOW, PrivacyAction.TEXT_REDACT)
+            and actual_action not in (PrivacyAction.EXCLUDE, PrivacyAction.MASK_WINDOW)
+        ):
+            from PIL import Image
+
+            from screencap.engine.dedup import dhash, hamming_distance
+
+            # Open image for dimensions + dHash; skip OCR if unreadable
+            current_hash = None
+            img_w_ocr = img_h_ocr = 0
+            try:
+                with Image.open(img_path) as img:
+                    img_w_ocr, img_h_ocr = img.size
+                    try:
+                        current_hash = dhash(img)
+                    except Exception:
+                        pass  # dHash failed — skip cache, still run OCR
+            except Exception:
+                pass  # image unreadable — skip entire OCR pass
+
+            if img_w_ocr > 0 and img_h_ocr > 0:
+                active_bounds = _active_window_bounds(
+                    geom, meta.bundle_id, ctx.pixel_ratio,
+                    img_w_ocr, img_h_ocr,
+                )
+
+                cache_hit = (
+                    current_hash is not None
+                    and _prev_hash is not None
+                    and hamming_distance(current_hash, _prev_hash) <= _DHASH_THRESHOLD
+                    and active_bounds == _prev_bounds
+                )
+
+                if cache_hit and _prev_ocr_regions is not None:
+                    ocr_regions = _prev_ocr_regions
+                else:
+                    cache_hit = False
+                    roi = (
+                        _active_window_roi(active_bounds, img_w_ocr, img_h_ocr)
+                        if active_bounds
+                        else None
+                    )
+                    try:
+                        ocr_regions = ocr_mask_screenshot(
+                            img_path, _pipeline, _ocr, roi=roi,
+                        )
+                        ocr_ran = True
+                    except Exception:
+                        # Fail-closed: OCR error → MASK_WINDOW
+                        try:
+                            mask_screenshot(
+                                img_path,
+                                ctx_class.context_class,
+                                strategy=MaskStrategy.FULL_WINDOW,
+                                app_hint=meta.bundle_id,
+                            )
+                            actual_action = PrivacyAction.MASK_WINDOW
+                        except Exception:
+                            img_path.unlink()
+                            actual_action = PrivacyAction.EXCLUDE
+
+                # Apply OCR mask regions
+                if ocr_regions and actual_action not in (
+                    PrivacyAction.MASK_WINDOW, PrivacyAction.EXCLUDE,
+                ):
+                    try:
+                        mask_screenshot(
+                            img_path, ctx_class.context_class,
+                            regions=ocr_regions,
+                        )
+                    except Exception:
+                        try:
+                            mask_screenshot(
+                                img_path,
+                                ctx_class.context_class,
+                                strategy=MaskStrategy.FULL_WINDOW,
+                                app_hint=meta.bundle_id,
+                            )
+                            actual_action = PrivacyAction.MASK_WINDOW
+                        except Exception:
+                            img_path.unlink()
+                            actual_action = PrivacyAction.EXCLUDE
+
+                # Update dHash cache
+                if current_hash is not None:
+                    _prev_hash = current_hash
+                    _prev_bounds = active_bounds
+                    _prev_ocr_regions = ocr_regions
+
+        # Background masking for screenshots that keep foreground content.
+        # Runs AFTER OCR so foreground PII is already handled.
+        bg_masked = False
         if actual_action in (
             PrivacyAction.ALLOW,
             PrivacyAction.TEXT_REDACT,
             PrivacyAction.OCR_FALLBACK,
         ):
-            if _geom_conn is not None and img_path.exists():
+            if _geom_conn is not None and img_path.exists() and geom is not None:
                 try:
-                    geom = load_window_geometry(db_path, ts, conn=_geom_conn)
-                    if geom is not None:
-                        from PIL import Image
+                    from PIL import Image
 
-                        with Image.open(img_path) as probe:
-                            img_w, img_h = probe.size
-                        regions = window_regions_from_geometry(
-                            geom.windows, img_w, img_h, ctx.pixel_ratio,
-                            classifier, evaluator,
-                            display_origin=geom.display_origin,
-                            mask_actions=_BG_MASK_ACTIONS,
-                            respect_z_order=True,
+                    with Image.open(img_path) as probe:
+                        img_w, img_h = probe.size
+                    regions = window_regions_from_geometry(
+                        geom.windows, img_w, img_h, ctx.pixel_ratio,
+                        classifier, evaluator,
+                        display_origin=geom.display_origin,
+                        mask_actions=_BG_MASK_ACTIONS,
+                        respect_z_order=True,
+                    )
+                    if regions:
+                        mask_screenshot(
+                            img_path,
+                            ctx_class.context_class,
+                            regions=regions,
                         )
-                        if regions:
-                            mask_screenshot(
-                                img_path,
-                                ctx_class.context_class,
-                                regions=regions,
-                            )
-                            bg_masked = True
-                            bg_regions = regions
+                        bg_masked = True
                 except Exception as exc:
                     logger.debug(
                         f"Background masking failed for {img_path.name} ({exc})"
@@ -1558,112 +1638,6 @@ def mask_screenshots(
                     except Exception:
                         img_path.unlink()
                         actual_action = PrivacyAction.EXCLUDE
-
-        # --- Phase 2: OCR pass on foreground content ---
-        # After background masking, scan TEXT_REDACT/ALLOW screenshots for
-        # PII in the foreground window via OCR.  dHash dedup skips OCR on
-        # perceptually identical consecutive screenshots.
-        ocr_regions: list = []
-        ocr_ran = False
-        cache_hit = False
-        if (
-            _ocr is not None
-            and _pipeline is not None
-            and img_path.exists()
-            and decision.action in (PrivacyAction.ALLOW, PrivacyAction.TEXT_REDACT)
-            and actual_action not in (PrivacyAction.EXCLUDE, PrivacyAction.MASK_WINDOW)
-        ):
-            try:
-                fully_masked = _is_fully_masked(img_path, bg_regions)
-            except Exception:
-                fully_masked = False  # conservative: run OCR
-
-            if not fully_masked:
-                from PIL import Image
-
-                from screencap.engine.dedup import dhash, hamming_distance
-
-                # Open image for dimensions + dHash; skip OCR if unreadable
-                current_hash = None
-                img_w_ocr = img_h_ocr = 0
-                try:
-                    with Image.open(img_path) as img:
-                        img_w_ocr, img_h_ocr = img.size
-                        try:
-                            current_hash = dhash(img)
-                        except Exception:
-                            pass  # dHash failed — skip cache, still run OCR
-                except Exception:
-                    pass  # image unreadable — skip entire OCR pass
-
-                if img_w_ocr > 0 and img_h_ocr > 0:
-                    active_bounds = _active_window_bounds(
-                        geom, meta.bundle_id, ctx.pixel_ratio,
-                        img_w_ocr, img_h_ocr,
-                    )
-
-                    cache_hit = (
-                        current_hash is not None
-                        and _prev_hash is not None
-                        and hamming_distance(current_hash, _prev_hash) <= _DHASH_THRESHOLD
-                        and active_bounds == _prev_bounds
-                    )
-
-                    if cache_hit and _prev_ocr_regions is not None:
-                        ocr_regions = _prev_ocr_regions
-                    else:
-                        cache_hit = False
-                        roi = (
-                            _active_window_roi(active_bounds, img_w_ocr, img_h_ocr)
-                            if active_bounds
-                            else None
-                        )
-                        try:
-                            ocr_regions = ocr_mask_screenshot(
-                                img_path, _pipeline, _ocr, roi=roi,
-                            )
-                            ocr_ran = True
-                        except Exception:
-                            # Fail-closed: OCR error → MASK_WINDOW
-                            try:
-                                mask_screenshot(
-                                    img_path,
-                                    ctx_class.context_class,
-                                    strategy=MaskStrategy.FULL_WINDOW,
-                                    app_hint=meta.bundle_id,
-                                )
-                                actual_action = PrivacyAction.MASK_WINDOW
-                            except Exception:
-                                img_path.unlink()
-                                actual_action = PrivacyAction.EXCLUDE
-
-                    # Apply OCR mask regions
-                    if ocr_regions and actual_action not in (
-                        PrivacyAction.MASK_WINDOW, PrivacyAction.EXCLUDE,
-                    ):
-                        try:
-                            mask_screenshot(
-                                img_path, ctx_class.context_class,
-                                regions=ocr_regions,
-                            )
-                        except Exception:
-                            try:
-                                mask_screenshot(
-                                    img_path,
-                                    ctx_class.context_class,
-                                    strategy=MaskStrategy.FULL_WINDOW,
-                                    app_hint=meta.bundle_id,
-                                )
-                                actual_action = PrivacyAction.MASK_WINDOW
-                            except Exception:
-                                img_path.unlink()
-                                actual_action = PrivacyAction.EXCLUDE
-
-                    # Update dHash cache
-                    if current_hash is not None:
-                        _prev_hash = current_hash
-                        _prev_bounds = active_bounds
-                        _prev_ocr_regions = ocr_regions
 
         # Build audit trail with OCR detail
         ocr_detail = ""

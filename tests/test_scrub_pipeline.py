@@ -666,25 +666,6 @@ class TestOcrPassTextRedactAllow:
         assert len(result.audit_entries) == 1
         assert "ocr_masked" in result.audit_entries[0].reason
 
-    def test_ocr_skipped_when_fully_masked(self, tmp_path):
-        """When background masking covers entire image, OCR is skipped."""
-        from unittest.mock import patch
-
-        dst = self._setup_real_jpeg(tmp_path, "Some PII: test@test.com")
-
-        result = ScrubResult()
-        evaluator = self._make_evaluator(PrivacyAction.TEXT_REDACT)
-
-        # Patch _is_fully_masked to return True
-        with patch(
-            "screencap.scrub_pipeline._is_fully_masked", return_value=True,
-        ), patch(
-            "screencap.scrub_pipeline.ocr_mask_screenshot",
-        ) as mock_ocr:
-            self._mask(dst, evaluator, self._window_events(), result)
-
-        mock_ocr.assert_not_called()
-
     def test_dhash_cache_reuses_regions(self, tmp_path):
         """Two identical JPEGs → OCR called once, second reuses cache."""
         from unittest.mock import patch, MagicMock
@@ -834,41 +815,6 @@ class TestOcrPassTextRedactAllow:
 # ---------------------------------------------------------------------------
 # G6: Unit tests for Phase 2 helper functions
 # ---------------------------------------------------------------------------
-
-
-class TestIsFullyMasked:
-    """Unit tests for _is_fully_masked()."""
-
-    def _make_jpeg(self, path, w=100, h=80):
-        from PIL import Image
-        img = Image.new("RGB", (w, h), (255, 255, 255))
-        img.save(path, "JPEG")
-
-    def test_returns_true_when_regions_cover_full_image(self, tmp_path):
-        from screencap.scrub_pipeline import _is_fully_masked
-        from screencap.privacy.masking import MaskRegion
-
-        img_path = tmp_path / "test.jpg"
-        self._make_jpeg(img_path, 100, 80)
-        regions = [MaskRegion(x=0, y=0, width=100, height=80)]
-        assert _is_fully_masked(img_path, regions) is True
-
-    def test_returns_false_when_regions_partial(self, tmp_path):
-        from screencap.scrub_pipeline import _is_fully_masked
-        from screencap.privacy.masking import MaskRegion
-
-        img_path = tmp_path / "test.jpg"
-        self._make_jpeg(img_path, 100, 80)
-        regions = [MaskRegion(x=0, y=0, width=50, height=40)]  # 25% coverage
-        assert _is_fully_masked(img_path, regions) is False
-
-    def test_returns_false_when_no_regions(self, tmp_path):
-        from screencap.scrub_pipeline import _is_fully_masked
-
-        img_path = tmp_path / "test.jpg"
-        self._make_jpeg(img_path)
-        assert _is_fully_masked(img_path, None) is False
-        assert _is_fully_masked(img_path, []) is False
 
 
 class TestActiveWindowBounds:
