@@ -222,14 +222,24 @@ class TestFailClosed:
 class TestSecureInputDetection:
     """Tests for Layer 0: CGSIsSecureEventInputSet detection."""
 
-    def test_secure_input_active_blocks_capture(self):
-        """When secure input fn returns True, capture is blocked."""
+    def test_secure_input_active_blocks_keystrokes_not_screenshots(self):
+        """Secure input blocks keystrokes but NOT screenshots.
+
+        CGSIsSecureEventInputSet is system-wide — a background app
+        enabling it must not block an allowed foreground app's screen
+        capture. Only keystroke content is sensitive in this scenario.
+        """
         config = _make_config()
         f = RecorderPrivacyFilter(
             config, transition_hold_seconds=0.0, secure_input_fn=lambda: True
         )
 
-        assert f.is_screen_allowed() is False
+        # Clear initial fail-closed state
+        f.on_window_event(_ALLOWED_EVENT)
+
+        disp = f.get_capture_disposition()
+        assert disp.screen_allowed is True, "secure_input should not block screenshots"
+        assert disp.keystrokes_allowed is False, "secure_input should block keystrokes"
 
     def test_secure_input_none_allows_capture(self):
         """When secure input fn is None (unavailable), capture is allowed."""
@@ -242,7 +252,7 @@ class TestSecureInputDetection:
         assert f.is_screen_allowed() is True
 
     def test_secure_input_hold_after_deactivation(self):
-        """After secure input deactivates, hold period applies."""
+        """After secure input deactivates, keystroke hold period applies."""
         hold = 1.0
         secure_active = [True]  # Mutable so we can toggle
         config = _make_config()
@@ -257,20 +267,26 @@ class TestSecureInputDetection:
 
         now = time.monotonic()
         with patch("screencap.privacy.recorder_enforcement.time") as mock_time:
-            # Secure input active — blocked
+            # Secure input active — keystrokes blocked, screenshots allowed
             mock_time.monotonic.return_value = now
-            assert f.is_screen_allowed() is False
+            disp = f.get_capture_disposition()
+            assert disp.screen_allowed is True
+            assert disp.keystrokes_allowed is False
 
             # Deactivate secure input
             secure_active[0] = False
 
-            # During hold: still blocked (hold timer set from previous call)
+            # During hold: keystrokes still blocked
             mock_time.monotonic.return_value = now + 0.5
-            assert f.is_screen_allowed() is False
+            disp = f.get_capture_disposition()
+            assert disp.screen_allowed is True
+            assert disp.keystrokes_allowed is False
 
-            # After hold: allowed
+            # After hold: keystrokes allowed
             mock_time.monotonic.return_value = now + hold + 0.1
-            assert f.is_screen_allowed() is True
+            disp = f.get_capture_disposition()
+            assert disp.screen_allowed is True
+            assert disp.keystrokes_allowed is True
 
     def test_secure_input_exception_degrades_gracefully(self):
         """If secure_input_fn raises, capture is not affected."""
@@ -356,8 +372,13 @@ class TestAXSecureTextField:
 class TestMultiReasonComposition:
     """Tests for independent blocking sources composing via OR logic."""
 
-    def test_secure_input_blocks_even_when_app_allowed(self):
-        """Secure input blocks even for a normally-allowed app."""
+    def test_secure_input_blocks_keystrokes_even_when_app_allowed(self):
+        """Secure input blocks keystrokes (not screenshots) for allowed apps.
+
+        A background password manager enabling Secure Input should
+        protect keystroke content but not block screen capture of
+        the allowed foreground app.
+        """
         config = _make_config()
         f = RecorderPrivacyFilter(
             config, transition_hold_seconds=0.0, secure_input_fn=lambda: True
@@ -368,7 +389,9 @@ class TestMultiReasonComposition:
             "title": "main.py — project",
         })
 
-        assert f.is_screen_allowed() is False
+        disp = f.get_capture_disposition()
+        assert disp.screen_allowed is True, "foreground allowed app should capture screenshots"
+        assert disp.keystrokes_allowed is False, "secure_input should still null keystrokes"
 
     def test_one_reason_clears_other_still_blocks(self):
         """When one reason clears but another is still active, stays blocked."""
@@ -393,8 +416,8 @@ class TestMultiReasonComposition:
         secure_active[0] = False
         assert f.is_screen_allowed() is False
 
-    def test_all_reasons_clear_allows(self):
-        """When all blocking reasons clear, capture is allowed."""
+    def test_all_reasons_clear_allows_keystrokes(self):
+        """When all blocking reasons clear, keystrokes are allowed."""
         secure_active = [True]
         config = _make_config()
         f = RecorderPrivacyFilter(
@@ -405,12 +428,16 @@ class TestMultiReasonComposition:
 
         f.on_window_event(_ALLOWED_EVENT)
 
-        # Secure input blocks
-        assert f.is_screen_allowed() is False
+        # Secure input blocks keystrokes (not screenshots)
+        disp = f.get_capture_disposition()
+        assert disp.screen_allowed is True
+        assert disp.keystrokes_allowed is False
 
-        # Clear secure input
+        # Clear secure input — keystrokes now allowed
         secure_active[0] = False
-        assert f.is_screen_allowed() is True
+        disp = f.get_capture_disposition()
+        assert disp.screen_allowed is True
+        assert disp.keystrokes_allowed is True
 
 
 class TestKeystrokeBlocking:

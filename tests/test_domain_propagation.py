@@ -70,7 +70,11 @@ class TestRecorderDomainPropagation:
         assert f.is_screen_allowed() is False
 
     def test_browser_on_email_domain_masked(self):
-        """Chrome on mail.google.com → EMAIL → MASK_WINDOW (public) → blocked."""
+        """Chrome on mail.google.com → EMAIL → MASK_WINDOW (public).
+
+        MASK_WINDOW allows screenshots (masked at scrub time) but
+        blocks video and keystrokes.
+        """
         config = _make_config()
         f = RecorderPrivacyFilter(
             config, transition_hold_seconds=0.0, secure_input_fn=None,
@@ -80,10 +84,17 @@ class TestRecorderDomainPropagation:
             "title": "Inbox - Gmail",
             "browser_url": "https://mail.google.com/mail/u/0/#inbox",
         })
-        assert f.is_screen_allowed() is False
+        disp = f.get_capture_disposition()
+        assert disp.screen_allowed is True, "MASK_WINDOW allows screenshots"
+        assert disp.video_allowed is False, "MASK_WINDOW blocks video"
+        assert disp.keystrokes_allowed is False, "MASK_WINDOW blocks keystrokes"
 
     def test_browser_no_url_falls_to_unverified(self):
-        """Chrome with no browser_url → BROWSER_UNVERIFIED → MASK_WINDOW (public)."""
+        """Chrome with no browser_url → BROWSER_UNVERIFIED → MASK_WINDOW (public).
+
+        MASK_WINDOW allows screenshots (masked at scrub time) but
+        blocks video and keystrokes.
+        """
         config = _make_config()
         f = RecorderPrivacyFilter(
             config, transition_hold_seconds=0.0, secure_input_fn=None,
@@ -92,8 +103,11 @@ class TestRecorderDomainPropagation:
             "app_bundle_id": "com.google.Chrome",
             "title": "Some Page",
         })
-        # No browser_url → domain=None → BROWSER_UNVERIFIED → MASK_WINDOW → blocked
-        assert f.is_screen_allowed() is False
+        # No browser_url → domain=None → BROWSER_UNVERIFIED → MASK_WINDOW
+        disp = f.get_capture_disposition()
+        assert disp.screen_allowed is True, "MASK_WINDOW allows screenshots"
+        assert disp.video_allowed is False, "MASK_WINDOW blocks video"
+        assert disp.keystrokes_allowed is False, "MASK_WINDOW blocks keystrokes"
 
 
 # ---------------------------------------------------------------------------

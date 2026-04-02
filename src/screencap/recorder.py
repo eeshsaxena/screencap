@@ -1073,7 +1073,10 @@ def start_recording(
         if cloud_intent:
             _safe_to_stub = _safe_to_stub and _sentinel_uploaded
         else:
-            _safe_to_stub = _safe_to_stub and (_db_uploaded or _sentinel_uploaded)
+            # Non-cloud-intent: the chunk processor never uploads media
+            # (upload_enabled is always False for local-intent recordings).
+            # Don't stub — the local media files are the only copy.
+            _safe_to_stub = False
         if _safe_to_stub:
             try:
                 from screencap.chunk_processor import stub_recording
