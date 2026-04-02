@@ -11,8 +11,12 @@ tab-level content, OCR-based redaction).
 Design decisions:
 - Screenshots AND keystrokes: when any blocking reason fires, both
   screenshots are dropped and keystroke content is nulled before writing.
-- Multiple blocking sources: secure input, secure field, excluded app,
-  and policy block are tracked independently with per-source hold timers.
+- Multiple blocking sources: secure field, excluded app, and policy
+  block are tracked independently with per-source hold timers.
+  Secure input (CGSIsSecureEventInputSet) is tracked separately and
+  only blocks keystrokes — not screenshots or video — because the
+  flag is system-wide and a background app enabling it should not
+  block screen capture of an allowed foreground app.
 - Transition hold: 1.0s after a blocking source deactivates before
   resuming capture. Covers macOS app-switch animations (200-350ms)
   with margin. The cost is a few missed frames of the new (allowed) app,
@@ -117,12 +121,17 @@ class RecorderPrivacyFilter:
 
     Blocking sources are tracked independently:
     - ``app_policy`` — from window event classification (excluded app,
-      password manager, etc.)
+      password manager, etc.)  [blocks screen + video + keystrokes]
     - ``secure_input`` — from macOS CGSIsSecureEventInputSet
+      [blocks keystrokes ONLY — the flag is system-wide so a
+      background app enabling it must not block an allowed foreground
+      app's screenshots/video]
     - ``secure_field`` — from AXSecureTextField in element_state
+      [blocks screen + video + keystrokes]
 
-    ``is_screen_allowed()`` returns False if ANY source is active or
-    within its hold period.
+    ``is_screen_allowed()`` returns False if ``app_policy``,
+    ``secure_field``, ``filter_error``, or ``initial`` is active.
+    ``secure_input`` only gates keystrokes.
 
     Usage from screencap.engine integration::
 
@@ -349,9 +358,9 @@ class RecorderPrivacyFilter:
         Also checks macOS Secure Input mode (Layer 0) on each call.
 
         - ``screen_allowed``: True unless an EXCLUDE app or
-          secure_input/secure_field/fail-closed is active.
+          secure_field/fail-closed is active.
         - ``video_allowed``: False for EXCLUDE and MASK_WINDOW apps,
-          plus secure_input/secure_field/fail-closed.
+          plus secure_field/fail-closed.
         - ``keystrokes_allowed``: False for EXCLUDE and MASK_WINDOW apps,
           plus secure_input/secure_field/fail-closed.
 
@@ -363,17 +372,25 @@ class RecorderPrivacyFilter:
             self._check_secure_input()
             self._expire_holds(now)
 
-            # Screen blocking: only EXCLUDE + secure_input + secure_field + errors
+            # Screen blocking: EXCLUDE + secure_field + errors.
+            # secure_input is intentionally excluded here — it is a
+            # system-wide macOS flag that background apps can trigger.
+            # A background password manager enabling Secure Input must
+            # not block an allowed foreground app's screenshots.
             screen_block_reasons = {
-                "app_policy", "secure_input", "secure_field",
+                "app_policy", "secure_field",
                 "filter_error", "initial",
             }
             screen_blocked = bool(
                 self._blocked_reasons.keys() & screen_block_reasons
             )
 
-            # Keystroke/video blocking: adds app_keystrokes and app_video
-            keystroke_block_reasons = screen_block_reasons | {"app_keystrokes"}
+            # Keystroke blocking: adds secure_input (keystroke-specific
+            # protection — what CGSIsSecureEventInputSet is actually
+            # about) and app_keystrokes (MASK_WINDOW apps).
+            keystroke_block_reasons = screen_block_reasons | {
+                "app_keystrokes", "secure_input",
+            }
             keystrokes_blocked = bool(
                 self._blocked_reasons.keys() & keystroke_block_reasons
             )
