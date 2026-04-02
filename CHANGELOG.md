@@ -5,6 +5,32 @@ All notable changes to this project will be documented in this file.
 The format is based on [Keep a Changelog](https://keepachangelog.com/),
 and this project adheres to [Semantic Versioning](https://semver.org/).
 
+## [0.14.0] - 2026-04-02
+
+### Added
+- **cli:** Add "both" recording destination — upload to cloud AND keep a local copy
+- **cli:** Print recording viewer URLs after successful upload and cloud recording
+- **privacy:** Add opt-in PII/secrets scrubbing for local recordings with interactive prompt
+- **privacy:** Add OCR-based PII masking for TEXT_REDACT and OCR_FALLBACK screenshots
+- **privacy:** OCR pass for ALLOW screenshots using macOS Vision framework
+- **llm:** Richer task descriptions and session summaries with longer field limits
+
+### Fixed
+- **window:** Use visual z-order for active window detection instead of keyboard focus
+- **privacy:** Enable background window masking for all recordings (not just cloud)
+- **privacy:** Force PUBLIC mode for "both" destination in scrubber
+- **privacy:** Secure input (CGSIsSecureEventInputSet) blocks keystrokes only, not screenshots
+- **privacy:** Allow unknown apps by default in public mode
+- **privacy:** Respect z-order in mask_frame to avoid masking occluded windows
+- **privacy:** Improve OCR PII detection accuracy and bounding box remapping
+- **privacy:** Add Finder, Docker Desktop, Tailscale to BUNDLE_ID_MAP
+- **recorder:** Prevent local file deletion for local-intent and "both" recordings
+- **chunk-processor:** Simplify scrub gate to respect user opt-in
+
+### Changed
+- **setup:** Add "Both" option to setup wizard destination choices
+- **config:** Accept "both" as valid upload_default value
+
 ## [0.13.1] - 2026-03-23
 
 ### Fixed
