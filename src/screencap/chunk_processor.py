@@ -280,8 +280,9 @@ class ChunkProcessor:
                 logger.warning(f"Failed to get blocked_intervals for chunk {idx}", exc_info=True)
         self._generate_manifest(idx, start_ts, end_ts, blocked_intervals=blocked_intervals)
 
-        # 5. Scrub text surfaces + mask screenshots (cloud-intent or user-opted-in)
-        if (self._cloud_intent or self._scrub_enabled) and self._pipeline is not None:
+        # 5. Scrub text surfaces + mask screenshots when user opted in.
+        # Cloud uploads are also scrubbed by `screencap upload` before sending.
+        if self._scrub_enabled and self._pipeline is not None:
             self._set_status(f"Chunk {idx}: scrubbing...")
             self._scrub_chunk_files(idx, start_ts, end_ts, transcript_path)
             if self._stop_event.is_set():
