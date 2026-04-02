@@ -634,7 +634,7 @@ def scrub_recording(
             try:
                 intent_data = json.loads(intent_path.read_text(encoding="utf-8"))
                 destination = intent_data.get("destination", "")
-                if destination == "cloud":
+                if destination in ("cloud", "both"):
                     from dataclasses import replace as _dc_replace
                     privacy_config = _dc_replace(
                         privacy_config, mode=PrivacyMode.PUBLIC,
