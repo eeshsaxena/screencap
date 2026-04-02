@@ -47,6 +47,7 @@ class ChunkProcessor:
         privacy_mode: str = "internal",
         screen_filter=None,
         segmentation_mode: str = "llm",
+        scrub_enabled: bool = False,
     ) -> None:
         self._capture_dir = Path(capture_dir)
         self._db_path = self._capture_dir / "recording.db"
@@ -62,30 +63,38 @@ class ChunkProcessor:
         self._privacy_mode = privacy_mode
         self._screen_filter = screen_filter
         self._segmentation_mode = segmentation_mode
+        self._scrub_enabled = scrub_enabled
 
-        # Initialize scrubbing pipeline for cloud-intent recordings
+        # Initialize scrubbing pipeline when scrubbing is enabled
+        # (cloud-intent always scrubs; local recordings scrub when user opts in)
+        _should_init_scrub = (cloud_intent and upload_enabled) or scrub_enabled
         self._pipeline = None
         self._anonymizer = None
         self._masking_classifier = None
         self._masking_evaluator = None
         self._masking_pixel_ratio = 2.0  # safe Retina default
         self._upload_disabled_reason: str | None = None
-        if cloud_intent and upload_enabled:
+        if _should_init_scrub:
             try:
                 from screencap.privacy import Anonymizer, create_default_pipeline
                 self._pipeline = create_default_pipeline(require_pii=True)
                 self._anonymizer = Anonymizer()
-                logger.info("Scrubbing pipeline initialized for cloud-intent recording")
+                logger.info("Scrubbing pipeline initialized")
             except Exception as e:
-                logger.error(
-                    f"Privacy deps not available — disabling uploads for safety: {e}"
-                )
-                self._upload_enabled = False
-                self._upload_disabled_reason = f"Privacy deps not available: {e}"
-                logger.warning(
-                    "Privacy dependencies are missing. "
-                    "Reinstall or update screencap."
-                )
+                if cloud_intent and upload_enabled:
+                    logger.error(
+                        f"Privacy deps not available — disabling uploads for safety: {e}"
+                    )
+                    self._upload_enabled = False
+                    self._upload_disabled_reason = f"Privacy deps not available: {e}"
+                    logger.warning(
+                        "Privacy dependencies are missing. "
+                        "Reinstall or update screencap."
+                    )
+                else:
+                    # Local recording: scrubbing is best-effort, don't block recording
+                    logger.warning(f"Scrubbing pipeline unavailable (non-fatal): {e}")
+                    self._scrub_enabled = False
 
             # Initialize classifier/evaluator for screenshot masking
             try:
@@ -106,9 +115,10 @@ class ChunkProcessor:
                 )
             except Exception as e:
                 logger.warning(f"Could not init masking classifier: {e}")
-                self._upload_enabled = False
-                if self._upload_disabled_reason is None:
-                    self._upload_disabled_reason = f"Masking classifier init failed: {e}"
+                if cloud_intent and upload_enabled:
+                    self._upload_enabled = False
+                    if self._upload_disabled_reason is None:
+                        self._upload_disabled_reason = f"Masking classifier init failed: {e}"
 
         # Safety invariant: never delete local files unless uploads are enabled.
         # This covers: (1) caller passes upload_enabled=False (e.g. --no-live-upload),
@@ -270,8 +280,8 @@ class ChunkProcessor:
                 logger.warning(f"Failed to get blocked_intervals for chunk {idx}", exc_info=True)
         self._generate_manifest(idx, start_ts, end_ts, blocked_intervals=blocked_intervals)
 
-        # 5. Scrub text surfaces + mask screenshots for cloud-intent recordings
-        if self._cloud_intent and self._pipeline is not None:
+        # 5. Scrub text surfaces + mask screenshots (cloud-intent or user-opted-in)
+        if (self._cloud_intent or self._scrub_enabled) and self._pipeline is not None:
             self._set_status(f"Chunk {idx}: scrubbing...")
             self._scrub_chunk_files(idx, start_ts, end_ts, transcript_path)
             if self._stop_event.is_set():
