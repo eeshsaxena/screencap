@@ -17,7 +17,7 @@ INTENT_FILE = ".recording_intent"
 def read_intent(directory: Path) -> str | None:
     """Read the recording intent from a .recording_intent file.
 
-    Returns 'cloud', 'local', or None if the file is missing/corrupt.
+    Returns 'cloud', 'local', 'both', or None if the file is missing/corrupt.
     """
     intent_path = directory / INTENT_FILE
     if not intent_path.exists():

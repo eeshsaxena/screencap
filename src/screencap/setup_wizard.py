@@ -595,17 +595,19 @@ def run_setup_wizard(
     else:
         console.print(f"\n[bold #60a5fa]\u25c9 ScreenCap[/bold #60a5fa] [dim #a78bfa]Privacy Setup[/dim #a78bfa]\n")
         console.print("[bold]Where will your recordings go?[/bold]\n")
-        console.print("  [#818cf8]1.[/#818cf8] Cloud          \u2192 uploads to Cloud (public privacy mode)")
-        console.print("  [#818cf8]2.[/#818cf8] Local          \u2192 stays on this machine (internal privacy mode)")
-        console.print("  [#818cf8]3.[/#818cf8] Ask every time\n")
+        console.print("  [#818cf8]1.[/#818cf8] Cloud          \u2192 upload to cloud (public privacy mode)")
+        console.print("  [#818cf8]2.[/#818cf8] Local          \u2192 stay on this machine (internal privacy mode)")
+        console.print("  [#818cf8]3.[/#818cf8] Both           \u2192 upload to cloud AND keep a local copy")
+        console.print("  [#818cf8]4.[/#818cf8] Ask every time\n")
 
-        _default_choice = {"cloud": 1, "local": 2, "ask": 3}.get(existing_upload_default, 2)
-        dest_choice = click.prompt("  Choice", type=click.IntRange(1, 3), default=_default_choice)
+        _default_choice = {"cloud": 1, "local": 2, "both": 3, "ask": 4}.get(existing_upload_default, 2)
+        dest_choice = click.prompt("  Choice", type=click.IntRange(1, 4), default=_default_choice)
 
         mode, upload_default = {
             1: (PrivacyMode.PUBLIC, "cloud"),
             2: (PrivacyMode.INTERNAL, "local"),
-            3: (PrivacyMode.INTERNAL, "ask"),
+            3: (PrivacyMode.PUBLIC, "both"),
+            4: (PrivacyMode.INTERNAL, "ask"),
         }[dest_choice]
 
     # In scan-only mode, check recordings first to avoid unnecessary Spotlight scan

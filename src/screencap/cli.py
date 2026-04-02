@@ -171,6 +171,8 @@ def _maybe_prompt_privacy_setup(*, cloud_intent: bool = False) -> None:
               help="Record for cloud upload (forces public privacy mode).")
 @click.option("--local", "destination", flag_value="local",
               help="Record for local use only (uses configured privacy mode).")
+@click.option("--both", "destination", flag_value="both",
+              help="Upload to cloud AND keep local copy (public privacy mode, no auto-delete).")
 @click.option("--segmentation-mode", type=click.Choice(["llm", "idle"], case_sensitive=False),
               default=None, help="Task segmentation: 'llm' (server-side) or 'idle' (gap detection).")
 @click.option("--no-scrub", is_flag=True, default=False,
@@ -232,26 +234,27 @@ def start(
                 "\n[bold]Recording destination:[/bold]"
             )
             console.print(
-                "  Cloud recordings use public privacy mode -- email, chat, calendar,"
+                "  [bold]cloud[/bold]  — upload to cloud (public privacy mode)"
             )
             console.print(
-                "  and banking apps are blocked or masked. Data may be used in public datasets."
+                "  [bold]local[/bold]  — stay on this machine (configured privacy mode)"
             )
             console.print(
-                "\n  Local recordings use your configured privacy mode and stay on this machine.\n"
+                "  [bold]both[/bold]   — upload to cloud AND keep a local copy\n"
             )
             destination = click.prompt(
-                "Cloud or local?",
-                type=click.Choice(["cloud", "local"], case_sensitive=False),
+                "Destination",
+                type=click.Choice(["cloud", "local", "both"], case_sensitive=False),
                 default="local",
             )
             intent_source = "prompt"
         else:
             destination = upload_default
             intent_source = "config_default"
-    # else: destination was set by --cloud or --local flag, intent_source stays "flag"
+    # else: destination was set by --cloud, --local, or --both flag, intent_source stays "flag"
 
-    is_cloud = destination == "cloud"
+    is_cloud = destination in ("cloud", "both")
+    keep_local = destination in ("local", "both")
     force_mode = None
     if is_cloud:
         from screencap.privacy.policy import PrivacyMode
@@ -314,6 +317,7 @@ def start(
             live_upload=not no_live_upload,
             force_mode=force_mode,
             cloud_intent=is_cloud,
+            keep_local=keep_local,
             intent_source=intent_source,
             segmentation_mode=seg_mode,
             scrub_enabled=scrub_enabled,
@@ -1479,6 +1483,16 @@ def upload(names, all_recordings, dry_run, force, jobs, no_delete):
                     )
                 else:
                     console.print(f"\n[green]Uploaded {d.name}[/green] ({summary})")
+                # Print viewer URLs
+                _rec_name = result.recording or d.name
+                _raw_url = f"https://screencap.sh/?source=recordings&recording={_rec_name}#data"
+                _session_url = f"https://screencap.sh/?source=sessions&recording={_rec_name}#data"
+                console.print(
+                    f"  [dim]View (raw):[/dim] [link={_raw_url}]{_raw_url}[/link]"
+                )
+                console.print(
+                    f"  [dim]View (processed, ~2 min):[/dim] [link={_session_url}]{_session_url}[/link]"
+                )
         except FileNotFoundError as e:
             console.print(f"[red]Error:[/red] {e}")
             all_failed += 1
