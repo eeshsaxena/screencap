@@ -694,8 +694,8 @@ class TestMaskFrame:
         assert clean_pixel == (255, 255, 255), "Non-Slack region should be clean"
         img.close()
 
-    def test_mask_frame_noop_without_cloud_intent(self):
-        """mask_frame is a no-op for local (non-cloud) recordings."""
+    def test_mask_frame_works_for_local_recordings(self):
+        """mask_frame masks sensitive windows even for local recordings."""
         from PIL import Image
 
         config = _make_config(mode=PrivacyMode.INTERNAL)
@@ -715,9 +715,13 @@ class TestMaskFrame:
 
         f.mask_frame(img, geometry, pixel_ratio=1.0)
 
-        # Should NOT be masked — local recording
-        pixel = img.getpixel((25, 25))
-        assert pixel == (255, 255, 255)
+        # Slack region should be masked (same behavior as cloud-intent)
+        masked_pixel = img.getpixel((25, 25))
+        assert masked_pixel != (255, 255, 255), "Slack region should be masked"
+
+        # Non-Slack region should be clean
+        clean_pixel = img.getpixel((75, 75))
+        assert clean_pixel == (255, 255, 255), "Non-Slack region should be clean"
         img.close()
 
     def test_mask_frame_noop_with_no_geometry(self):
