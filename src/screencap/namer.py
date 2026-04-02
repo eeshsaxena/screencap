@@ -29,7 +29,8 @@ You are naming a screen recording. Based on the provided context (audio transcri
 screenshots, application activity, window titles), generate:
 
 1. A short kebab-case slug for the directory name (e.g., "stripe-webhook-debugging")
-2. A one-sentence description of what the user was doing
+2. A 2-3 sentence description: what the user was working on, specific actions or
+   outcomes observed, and which tools or files were involved. Be concrete, not generic.
 
 Rules for the slug:
 - Lowercase letters, numbers, and hyphens only: [a-z0-9-]+

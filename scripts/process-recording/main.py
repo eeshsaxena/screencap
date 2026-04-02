@@ -1137,14 +1137,19 @@ INSTRUCTIONS:
 For each task return:
 - start_time: relative timestamp (matching timeline format, e.g. "0:02:00")
 - end_time: relative timestamp
-- name: 3-8 word descriptive name (e.g., "Debugging auth service login flow")
-- description: 1-2 sentence summary of what the user did
+- name: 2-3 words capturing the core task (NOT the app name)
+  Good: "Fix login", "Draft roadmap", "Deploy hotfix", "Review PR", "Write tests"
+  Bad: "Used VSCode", "Chrome session", "Terminal work", "Coding task"
+- description: 3-5 sentences covering what was being worked on, specific actions taken,
+  outcomes or blockers encountered, and tools/files involved.
+  Be concrete — mention file names, URLs, error messages, or people when visible.
 - category: one of [development, communication, research, admin, creative, other]
 - apps_used: list of apps involved
 - confidence: high | medium | low
 
 Also provide a SESSION SUMMARY:
-- overview: 2-3 sentence description of what the user accomplished
+- overview: 4-6 sentence description of what the user accomplished, including specific
+  outcomes, tools used, and any notable blockers or achievements
 - primary_focus: the main category of work
 - time_breakdown: approximate percentage per category
 - key_accomplishments: 2-4 bullet points of specific things completed
@@ -1341,14 +1346,14 @@ def _validate_llm_tasks(
         if cat not in _VALID_CATEGORIES:
             cat = "other"
 
-        name = (task.get("name") or f"Task {i + 1}").strip()[:50]
+        name = (task.get("name") or f"Task {i + 1}").strip()[:80]
 
         converted.append({
             "start_ts": start_unix,
             "end_ts": end_unix,
             "name": name,
             "derived_name": _slugify(name),
-            "description": (task.get("description") or "")[:200],
+            "description": (task.get("description") or "")[:600],
             "category": cat,
             "apps_used": task.get("apps_used", []),
             "confidence": task.get("confidence", "medium"),
@@ -1681,7 +1686,7 @@ def _update_session_index(
                 "total_tasks": timeline.get("total_tasks", 0),
                 "total_duration_s": timeline.get("total_duration_s", 0),
                 "primary_focus": summary.get("primary_focus", "other"),
-                "overview": (summary.get("overview") or "")[:200],
+                "overview": (summary.get("overview") or "")[:600],
                 "categories": sorted(set(
                     t.get("category", "other") for t in task_entries
                 )),
