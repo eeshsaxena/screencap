@@ -231,11 +231,11 @@ def get_segmentation_mode() -> str:
 
 
 def get_upload_default() -> str:
-    """Return default recording destination: 'local', 'cloud', or 'ask'.
+    """Return default recording destination: 'local', 'cloud', 'both', or 'ask'.
 
     Priority: SCREENCAP_UPLOAD_DEFAULT env var > privacy.upload_default config > 'ask'.
     """
-    valid = ("local", "cloud", "ask")
+    valid = ("local", "cloud", "both", "ask")
     env = os.environ.get("SCREENCAP_UPLOAD_DEFAULT")
     if env is not None:
         val = env.strip().lower()

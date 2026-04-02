@@ -417,6 +417,7 @@ def start_recording(
     live_upload: bool = True,
     force_mode: "PrivacyMode | None" = None,
     cloud_intent: bool = False,
+    keep_local: bool = True,
     intent_source: str = "flag",
     segmentation_mode: str = "llm",
     scrub_enabled: bool = True,
@@ -658,9 +659,15 @@ def start_recording(
         import json as _json
         from datetime import datetime as _dt, timezone as _tz
 
+        if cloud_intent and keep_local:
+            _destination = "both"
+        elif cloud_intent:
+            _destination = "cloud"
+        else:
+            _destination = "local"
         _intent_data = {
             "version": 1,
-            "destination": "cloud" if cloud_intent else "local",
+            "destination": _destination,
             "privacy_mode": privacy_config.mode.value if privacy_config else "internal",
             "created_at": _dt.now(_tz.utc).isoformat(),
             "source": intent_source,
@@ -796,7 +803,7 @@ def start_recording(
                         _flush_req = getattr(recorder, '_flush_requested', None)
                         _flush_ctr = getattr(recorder, '_flush_ack_counter', None)
 
-                        # Local-intent recordings must not live-upload raw data
+                        # cloud_intent enables uploads; keep_local disables auto-delete
                         _effective_upload = live_upload if cloud_intent else False
 
                         chunk_processor = ChunkProcessor(
@@ -805,7 +812,7 @@ def start_recording(
                             _aaq,
                             recording_name=name,
                             upload_enabled=_effective_upload,
-                            auto_delete=cloud_intent and get_auto_delete_after_upload(),
+                            auto_delete=cloud_intent and not keep_local and get_auto_delete_after_upload(),
                             rest_threshold=get_rest_threshold(),
                             flush_requested=_flush_req,
                             flush_ack_counter=_flush_ctr,
@@ -1055,7 +1062,18 @@ def start_recording(
                         stop_reason=_stop_reason or "graceful",
                         chunks_expected=_n_chunks,
                     )
-                    if not _sentinel_uploaded:
+                    if _sentinel_uploaded:
+                        _raw_url = f"https://screencap.sh/?source=recordings&recording={_recording_name}#data"
+                        _session_url = f"https://screencap.sh/?source=sessions&recording={_recording_name}#data"
+                        console.print(
+                            f"\n  [dim]View (raw):[/dim] "
+                            f"[link={_raw_url}]{_raw_url}[/link]"
+                        )
+                        console.print(
+                            f"  [dim]View (processed, ~2 min):[/dim] "
+                            f"[link={_session_url}]{_session_url}[/link]"
+                        )
+                    else:
                         console.print(
                             "[yellow]Sentinel upload failed — run "
                             f"'screencap upload {_recording_name}' to trigger stitching.[/yellow]"
@@ -1066,16 +1084,14 @@ def start_recording(
             # else: no local sentinel — screencap upload generates a fresh
             # one with the correct chunks_expected from manifests on disk.
 
-        # Stub recording: delete raw media (screenshots, video, audio) after
-        # successful cloud upload. Local recordings are never stubbed —
-        # their media files are the only copy.
+        # Stub recording: delete raw media only for cloud-only recordings
+        # (not "both" — keep_local means local files must be preserved).
         _has_chunk_files = any(capture_dir.glob("chunk_*.mp4"))
         _safe_to_stub = _all_uploaded and live_upload and _has_chunk_files
-        if cloud_intent:
-            # Require sentinel upload — without it, Cloud Run stitching
-            # never triggers and local files are the recovery path.
+        if cloud_intent and not keep_local:
             _safe_to_stub = _safe_to_stub and _sentinel_uploaded
         else:
+            # Local or "both": never delete local media files
             _safe_to_stub = False
         if _safe_to_stub:
             try:
@@ -1087,29 +1103,26 @@ def start_recording(
                 if verbose:
                     console.print(f"[yellow]Warning:[/yellow] Stub failed: {e}")
         elif live_upload and (not _all_uploaded or not _has_chunk_files):
+            _upload_cmd = f"screencap upload {_recording_name}"
             if chunk_processor.was_force_stopped:
                 console.print(
-                    "[yellow]Chunk processing timed out — some data may not have been uploaded. "
-                    f"Run 'screencap upload {_recording_name}' to complete the upload.[/yellow]"
+                    "[yellow]Some chunks may not have been uploaded (processing timed out).\n"
+                    f"  Run [bold]{_upload_cmd}[/bold] to upload remaining data.[/yellow]"
                 )
             elif _n_total == 0:
                 console.print(
-                    "[yellow]No chunks were processed. "
-                    f"Run 'screencap upload {_recording_name}' to upload.[/yellow]"
+                    "[yellow]No chunks were uploaded.\n"
+                    f"  Run [bold]{_upload_cmd}[/bold] to upload the recording.[/yellow]"
                 )
             elif chunk_processor.upload_warning:
-                # Surface the specific reason uploads were disabled
                 console.print(
-                    f"[yellow]Uploads disabled: {chunk_processor.upload_warning}[/yellow]"
-                )
-                console.print(
-                    f"[yellow]Local files preserved. "
-                    f"Run 'screencap upload {_recording_name}' after fixing the issue.[/yellow]"
+                    f"[yellow]Uploads disabled: {chunk_processor.upload_warning}\n"
+                    f"  Run [bold]{_upload_cmd}[/bold] after fixing the issue.[/yellow]"
                 )
             else:
                 console.print(
-                    f"[yellow]{_n_uploaded} of {_n_total} chunks uploaded. "
-                    f"Run 'screencap upload {_recording_name}' to complete the upload.[/yellow]"
+                    f"[yellow]{_n_uploaded} of {_n_total} chunks uploaded.\n"
+                    f"  Run [bold]{_upload_cmd}[/bold] to upload the rest.[/yellow]"
                 )
 
     elapsed = time.time() - t0
