@@ -419,6 +419,7 @@ def start_recording(
     cloud_intent: bool = False,
     intent_source: str = "flag",
     segmentation_mode: str = "llm",
+    scrub_enabled: bool = True,
 ) -> tuple[Path, float]:
     """Start a screen capture recording. Blocks until Ctrl+C."""
     if audio is None:
@@ -812,6 +813,7 @@ def start_recording(
                             privacy_mode=privacy_config.mode.value if privacy_config else "internal",
                             screen_filter=screen_filter,
                             segmentation_mode=segmentation_mode,
+                            scrub_enabled=scrub_enabled,
                         )
                         chunk_processor.start()
                 except Exception as _chunk_init_err:
@@ -1064,18 +1066,16 @@ def start_recording(
             # else: no local sentinel — screencap upload generates a fresh
             # one with the correct chunks_expected from manifests on disk.
 
-        # Stub recording if all chunks AND sentinel uploaded (for cloud-intent)
-        # For cloud-intent, require _sentinel_uploaded specifically — without
-        # the sentinel, Cloud Run stitching never triggers, so local files
-        # must be preserved for recovery via 'screencap upload'.
+        # Stub recording: delete raw media (screenshots, video, audio) after
+        # successful cloud upload. Local recordings are never stubbed —
+        # their media files are the only copy.
         _has_chunk_files = any(capture_dir.glob("chunk_*.mp4"))
         _safe_to_stub = _all_uploaded and live_upload and _has_chunk_files
         if cloud_intent:
+            # Require sentinel upload — without it, Cloud Run stitching
+            # never triggers and local files are the recovery path.
             _safe_to_stub = _safe_to_stub and _sentinel_uploaded
         else:
-            # Non-cloud-intent: the chunk processor never uploads media
-            # (upload_enabled is always False for local-intent recordings).
-            # Don't stub — the local media files are the only copy.
             _safe_to_stub = False
         if _safe_to_stub:
             try:

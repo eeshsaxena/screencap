@@ -173,11 +173,13 @@ def _maybe_prompt_privacy_setup(*, cloud_intent: bool = False) -> None:
               help="Record for local use only (uses configured privacy mode).")
 @click.option("--segmentation-mode", type=click.Choice(["llm", "idle"], case_sensitive=False),
               default=None, help="Task segmentation: 'llm' (server-side) or 'idle' (gap detection).")
+@click.option("--no-scrub", is_flag=True, default=False,
+              help="Disable PII/secrets scrubbing for this recording.")
 def start(
     name, description, no_audio, no_video, no_images, no_window_data,
     output, no_wifi_metrics, no_app_versions,
     no_auto_name, local_only, force, verbose, chunk_duration, no_live_upload,
-    destination, segmentation_mode,
+    destination, segmentation_mode, no_scrub,
 ):
     """Record a screen capture session. Ctrl+C to stop."""
     from datetime import datetime
@@ -286,6 +288,14 @@ def start(
                     console.print("[red]Aborted.[/]")
                     raise SystemExit(1)
 
+    # --- Redaction prompt ---
+    scrub_enabled = not no_scrub
+    if scrub_enabled and _stdin_is_tty():
+        scrub_enabled = click.confirm(
+            "Redact sensitive info (passwords, emails, keys) from this recording?",
+            default=True,
+        )
+
     try:
         from screencap.recorder import DiskFullError, print_summary, start_recording
     except ImportError:
@@ -306,6 +316,7 @@ def start(
             cloud_intent=is_cloud,
             intent_source=intent_source,
             segmentation_mode=seg_mode,
+            scrub_enabled=scrub_enabled,
         )
     except DiskFullError as e:
         capture_dir, elapsed = e.capture_dir, e.elapsed

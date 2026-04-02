@@ -192,11 +192,12 @@ def get_main_display_bounds() -> tuple[float, float, float, float]:
 def get_active_window_meta() -> dict:
     """Get the metadata of the active window.
 
-    Prefers the keyboard-focused app (via NSWorkspace) over raw z-order.
-    Background apps may have overlay/helper windows that sit above the
-    focused app in the CGWindowList z-order, causing the privacy filter
-    to misidentify which app is active. Falls back to z-order [0] if
-    NSWorkspace lookup fails.
+    Uses the visually topmost window (CGWindowList z-order) rather than
+    the keyboard-focused app (NSWorkspace).  The screenshot captures
+    what is visually on screen, so the privacy decision should match.
+    If an excluded app (e.g. Ghostty) has keyboard focus but a browser
+    covers the screen, z-order[0] = browser → ALLOW, and background
+    excluded windows are masked by ``mask_frame()`` instead.
 
     Returns:
         dict: A dictionary containing the metadata of the active window.
@@ -213,26 +214,6 @@ def get_active_window_meta() -> dict:
         for win in windows
         if win["kCGWindowLayer"] == 0 and win["kCGWindowOwnerName"] != "Window Server"
     ]
-
-    # Prefer window from the keyboard-focused app over z-order.
-    # Select the largest window (by area) to skip toolbar/panel windows.
-    try:
-        frontmost = AppKit.NSWorkspace.sharedWorkspace().frontmostApplication()
-        if frontmost is not None:
-            frontmost_pid = frontmost.processIdentifier()
-            best_win = None
-            best_area = 0
-            for win in active_windows_info:
-                if win.get("kCGWindowOwnerPID") == frontmost_pid:
-                    bounds = win.get("kCGWindowBounds", {})
-                    area = bounds.get("Width", 0) * bounds.get("Height", 0)
-                    if area > best_area:
-                        best_area = area
-                        best_win = win
-            if best_win is not None:
-                return best_win
-    except Exception:
-        pass  # Fall through to z-order
 
     active_window_info = active_windows_info[0]
     return active_window_info

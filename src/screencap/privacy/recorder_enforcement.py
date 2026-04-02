@@ -457,19 +457,21 @@ class RecorderPrivacyFilter:
     def mask_frame(self, image, geometry: dict | None, pixel_ratio: float) -> None:
         """Mask sensitive background window regions in a screenshot, in-place.
 
-        For cloud-intent recordings, evaluates every visible window against the
-        privacy policy (forced to public mode) and applies solid masks over
-        windows whose action is EXCLUDE or MASK_WINDOW.
+        Evaluates every visible window against the privacy policy (forced to
+        public mode) and applies solid masks over windows whose action is
+        EXCLUDE or MASK_WINDOW.
 
-        This catches sensitive apps (Slack, email) visible in the background
-        that the foreground-only capture-time filter cannot block.
+        This catches sensitive apps (Slack, email, terminals) visible in the
+        background that the foreground-only capture-time filter cannot block.
+        Runs for both local and cloud-intent recordings — ``mask_frame()``
+        only modifies pixel data in-place and never deletes local files.
 
         Args:
             image: PIL Image to mask in-place.
             geometry: Window geometry dict with "windows" and "display_bounds".
             pixel_ratio: Retina scaling factor (e.g. 2.0).
         """
-        if not self._cloud_intent or geometry is None:
+        if geometry is None:
             return
 
         windows = geometry.get("windows")
