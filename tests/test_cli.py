@@ -40,7 +40,7 @@ def test_start_auto_name(tmp_path):
     runner = CliRunner()
     fake_dir = tmp_path / "rec-test"
     fake_dir.mkdir()
-    with mock.patch("screencap.recorder.start_recording", return_value=(fake_dir, 42.0)) as mock_rec, \
+    with mock.patch("screencap.recorder.start_recording", return_value=(fake_dir, 42.0, None, None)) as mock_rec, \
          mock.patch("screencap.namer.auto_name", return_value=fake_dir) as mock_namer:
         result = runner.invoke(cli, ["start"])
         assert result.exit_code == 0
@@ -55,7 +55,7 @@ def test_start_no_auto_name_interactive(tmp_path):
     runner = CliRunner()
     fake_dir = tmp_path / "my-test"
     fake_dir.mkdir()
-    with mock.patch("screencap.recorder.start_recording", return_value=(fake_dir, 42.0)) as mock_rec, \
+    with mock.patch("screencap.recorder.start_recording", return_value=(fake_dir, 42.0, None, None)) as mock_rec, \
          mock.patch("screencap.cli.sys") as mock_sys:
         mock_sys.stdin.isatty.return_value = True
         mock_sys.exit = sys.exit
@@ -76,7 +76,7 @@ def test_start_with_flags(tmp_path):
     runner = CliRunner()
     fake_dir = tmp_path / "test-rec"
     fake_dir.mkdir()
-    with mock.patch("screencap.recorder.start_recording", return_value=(fake_dir, 42.0)) as mock_rec:
+    with mock.patch("screencap.recorder.start_recording", return_value=(fake_dir, 42.0, None, None)) as mock_rec:
         result = runner.invoke(
             cli,
             ["start", "--name", "test-rec", "--no-audio", "-d", "demo"],
@@ -99,7 +99,7 @@ def test_start_no_wifi_metrics(tmp_path):
     runner = CliRunner()
     fake_dir = tmp_path / "test-rec"
     fake_dir.mkdir()
-    with mock.patch("screencap.recorder.start_recording", return_value=(fake_dir, 42.0)) as mock_rec:
+    with mock.patch("screencap.recorder.start_recording", return_value=(fake_dir, 42.0, None, None)) as mock_rec:
         result = runner.invoke(
             cli,
             ["start", "--name", "test-rec", "--no-wifi-metrics"],
@@ -122,7 +122,7 @@ def test_start_no_app_versions(tmp_path):
     runner = CliRunner()
     fake_dir = tmp_path / "test-rec"
     fake_dir.mkdir()
-    with mock.patch("screencap.recorder.start_recording", return_value=(fake_dir, 42.0)) as mock_rec:
+    with mock.patch("screencap.recorder.start_recording", return_value=(fake_dir, 42.0, None, None)) as mock_rec:
         result = runner.invoke(
             cli,
             ["start", "--name", "test-rec", "--no-app-versions"],
@@ -328,7 +328,7 @@ def test_start_force_cleans_orphans(tmp_path):
         mock.patch("screencap.pidfile.terminate_processes") as mock_term,
         mock.patch("screencap.pidfile.delete_pidfile"),
         mock.patch("screencap.pidfile.write_pidfile"),
-        mock.patch("screencap.recorder.start_recording", return_value=(fake_dir, 42.0)) as mock_rec,
+        mock.patch("screencap.recorder.start_recording", return_value=(fake_dir, 42.0, None, None)) as mock_rec,
     ):
         result = runner.invoke(cli, ["start", "--name", "test", "--force"])
     assert result.exit_code == 0
@@ -360,7 +360,7 @@ def test_start_no_video_flag(tmp_path):
     runner = CliRunner()
     fake_dir = tmp_path / "test-rec"
     fake_dir.mkdir()
-    with mock.patch("screencap.recorder.start_recording", return_value=(fake_dir, 42.0)) as mock_rec:
+    with mock.patch("screencap.recorder.start_recording", return_value=(fake_dir, 42.0, None, None)) as mock_rec:
         result = runner.invoke(cli, ["start", "--name", "test-rec", "--no-video"])
     assert result.exit_code == 0
     _, kwargs = mock_rec.call_args
@@ -372,7 +372,7 @@ def test_start_no_images_flag(tmp_path):
     runner = CliRunner()
     fake_dir = tmp_path / "test-rec"
     fake_dir.mkdir()
-    with mock.patch("screencap.recorder.start_recording", return_value=(fake_dir, 42.0)) as mock_rec:
+    with mock.patch("screencap.recorder.start_recording", return_value=(fake_dir, 42.0, None, None)) as mock_rec:
         result = runner.invoke(cli, ["start", "--name", "test-rec", "--no-images"])
     assert result.exit_code == 0
     _, kwargs = mock_rec.call_args
@@ -384,7 +384,7 @@ def test_start_no_window_data_flag(tmp_path):
     runner = CliRunner()
     fake_dir = tmp_path / "test-rec"
     fake_dir.mkdir()
-    with mock.patch("screencap.recorder.start_recording", return_value=(fake_dir, 42.0)) as mock_rec:
+    with mock.patch("screencap.recorder.start_recording", return_value=(fake_dir, 42.0, None, None)) as mock_rec:
         result = runner.invoke(cli, ["start", "--name", "test-rec", "--no-window-data"])
     assert result.exit_code == 0
     _, kwargs = mock_rec.call_args
@@ -396,7 +396,7 @@ def test_start_name_skips_auto_naming(tmp_path):
     runner = CliRunner()
     fake_dir = tmp_path / "my-recording"
     fake_dir.mkdir()
-    with mock.patch("screencap.recorder.start_recording", return_value=(fake_dir, 42.0)) as mock_rec, \
+    with mock.patch("screencap.recorder.start_recording", return_value=(fake_dir, 42.0, None, None)) as mock_rec, \
          mock.patch("screencap.namer.auto_name") as mock_namer:
         result = runner.invoke(cli, ["start", "--name", "my-recording"])
     assert result.exit_code == 0
@@ -408,7 +408,7 @@ def test_start_local_only_flag(tmp_path):
     runner = CliRunner()
     fake_dir = tmp_path / "rec-test"
     fake_dir.mkdir()
-    with mock.patch("screencap.recorder.start_recording", return_value=(fake_dir, 42.0)) as mock_rec, \
+    with mock.patch("screencap.recorder.start_recording", return_value=(fake_dir, 42.0, None, None)) as mock_rec, \
          mock.patch("screencap.namer.auto_name", return_value=fake_dir) as mock_namer:
         result = runner.invoke(cli, ["start", "--local-only"])
     assert result.exit_code == 0
@@ -894,7 +894,7 @@ def test_start_auto_export_called(tmp_path):
     fake_dir.mkdir()
 
     with (
-        mock.patch("screencap.recorder.start_recording", return_value=(fake_dir, 42.0)),
+        mock.patch("screencap.recorder.start_recording", return_value=(fake_dir, 42.0, None, None)),
         mock.patch("screencap.namer.auto_name", return_value=fake_dir),
         mock.patch("screencap.cli._auto_export") as mock_auto_export,
     ):
@@ -910,7 +910,7 @@ def test_start_auto_export_failure_does_not_crash(tmp_path):
     fake_dir.mkdir()
 
     with (
-        mock.patch("screencap.recorder.start_recording", return_value=(fake_dir, 42.0)),
+        mock.patch("screencap.recorder.start_recording", return_value=(fake_dir, 42.0, None, None)),
         mock.patch("screencap.namer.auto_name", return_value=fake_dir),
         mock.patch("screencap.cli._auto_export", side_effect=RuntimeError("boom")),
     ):
@@ -928,7 +928,7 @@ def test_start_auto_export_runs_with_no_auto_name(tmp_path):
     fake_dir.mkdir()
 
     with (
-        mock.patch("screencap.recorder.start_recording", return_value=(fake_dir, 42.0)),
+        mock.patch("screencap.recorder.start_recording", return_value=(fake_dir, 42.0, None, None)),
         mock.patch("screencap.cli.sys") as mock_sys,
         mock.patch("screencap.cli._auto_export") as mock_auto_export,
     ):
@@ -948,7 +948,7 @@ def test_start_auto_export_keyboard_interrupt(tmp_path):
     runner = CliRunner()
     fake_dir = tmp_path / "rec-test"
     fake_dir.mkdir()
-    with mock.patch("screencap.recorder.start_recording", return_value=(fake_dir, 42.0)), \
+    with mock.patch("screencap.recorder.start_recording", return_value=(fake_dir, 42.0, None, None)), \
          mock.patch("screencap.namer.auto_name", return_value=fake_dir), \
          mock.patch("screencap.cli._auto_export", side_effect=KeyboardInterrupt):
         result = runner.invoke(cli, ["start"])
@@ -967,7 +967,7 @@ def test_start_cloud_flag(tmp_path):
     runner = CliRunner()
     fake_dir = tmp_path / "test-rec"
     fake_dir.mkdir()
-    with mock.patch("screencap.recorder.start_recording", return_value=(fake_dir, 42.0)) as mock_rec:
+    with mock.patch("screencap.recorder.start_recording", return_value=(fake_dir, 42.0, None, None)) as mock_rec:
         result = runner.invoke(cli, ["start", "--name", "test", "--cloud"])
     assert result.exit_code == 0
     mock_rec.assert_called_once()
@@ -982,7 +982,7 @@ def test_start_local_flag(tmp_path):
     runner = CliRunner()
     fake_dir = tmp_path / "test-rec"
     fake_dir.mkdir()
-    with mock.patch("screencap.recorder.start_recording", return_value=(fake_dir, 42.0)) as mock_rec:
+    with mock.patch("screencap.recorder.start_recording", return_value=(fake_dir, 42.0, None, None)) as mock_rec:
         result = runner.invoke(cli, ["start", "--name", "test", "--local"])
     assert result.exit_code == 0
     mock_rec.assert_called_once()
@@ -997,7 +997,7 @@ def test_start_no_flag_non_interactive(tmp_path):
     runner = CliRunner()
     fake_dir = tmp_path / "test-rec"
     fake_dir.mkdir()
-    with mock.patch("screencap.recorder.start_recording", return_value=(fake_dir, 42.0)) as mock_rec:
+    with mock.patch("screencap.recorder.start_recording", return_value=(fake_dir, 42.0, None, None)) as mock_rec:
         result = runner.invoke(cli, ["start", "--name", "test"])
     assert result.exit_code == 0
     mock_rec.assert_called_once()
@@ -1012,7 +1012,7 @@ def test_start_cloud_and_local_last_wins(tmp_path):
     runner = CliRunner()
     fake_dir = tmp_path / "test-rec"
     fake_dir.mkdir()
-    with mock.patch("screencap.recorder.start_recording", return_value=(fake_dir, 42.0)) as mock_rec:
+    with mock.patch("screencap.recorder.start_recording", return_value=(fake_dir, 42.0, None, None)) as mock_rec:
         result = runner.invoke(cli, ["start", "--name", "test", "--cloud", "--local"])
     assert result.exit_code == 0
     _, kwargs = mock_rec.call_args
@@ -1044,7 +1044,7 @@ def test_cloud_start_nlp_model_gate(tmp_path):
     # 1. Models cached → proceeds with cloud_intent=True
     with (
         no_setup, tty,
-        mock.patch("screencap.recorder.start_recording", return_value=(fake_dir, 42.0)) as mock_rec,
+        mock.patch("screencap.recorder.start_recording", return_value=(fake_dir, 42.0, None, None)) as mock_rec,
         mock.patch("screencap.privacy.are_nlp_models_cached", return_value=True),
     ):
         result = _invoke(["--cloud"])
@@ -1064,7 +1064,7 @@ def test_cloud_start_nlp_model_gate(tmp_path):
     with (
         mock.patch("screencap.cli._maybe_prompt_privacy_setup"),
         mock.patch("screencap.cli._stdin_is_tty", return_value=True),
-        mock.patch("screencap.recorder.start_recording", return_value=(fake_dir, 42.0)) as mock_rec,
+        mock.patch("screencap.recorder.start_recording", return_value=(fake_dir, 42.0, None, None)) as mock_rec,
         mock.patch("screencap.privacy.are_nlp_models_cached", side_effect=cached_after_download),
         mock.patch("screencap.cli._download_nlp_models"),
     ):
@@ -1078,7 +1078,7 @@ def test_cloud_start_nlp_model_gate(tmp_path):
     with (
         mock.patch("screencap.cli._maybe_prompt_privacy_setup"),
         mock.patch("screencap.cli._stdin_is_tty", return_value=True),
-        mock.patch("screencap.recorder.start_recording", return_value=(fake_dir, 42.0)) as mock_rec,
+        mock.patch("screencap.recorder.start_recording", return_value=(fake_dir, 42.0, None, None)) as mock_rec,
         mock.patch("screencap.privacy.are_nlp_models_cached", return_value=False),
         mock.patch("screencap.cli._download_nlp_models", side_effect=RuntimeError("network")),
     ):
@@ -1092,7 +1092,7 @@ def test_cloud_start_nlp_model_gate(tmp_path):
     with (
         mock.patch("screencap.cli._maybe_prompt_privacy_setup"),
         mock.patch("screencap.cli._stdin_is_tty", return_value=True),
-        mock.patch("screencap.recorder.start_recording", return_value=(fake_dir, 42.0)) as mock_rec,
+        mock.patch("screencap.recorder.start_recording", return_value=(fake_dir, 42.0, None, None)) as mock_rec,
         mock.patch("screencap.privacy.are_nlp_models_cached", return_value=False),
     ):
         result = _invoke(["--cloud"], input="n\nn\n")
@@ -1103,7 +1103,7 @@ def test_cloud_start_nlp_model_gate(tmp_path):
     with (
         mock.patch("screencap.cli._maybe_prompt_privacy_setup"),
         mock.patch("screencap.cli._stdin_is_tty", return_value=False),
-        mock.patch("screencap.recorder.start_recording", return_value=(fake_dir, 42.0)) as mock_rec,
+        mock.patch("screencap.recorder.start_recording", return_value=(fake_dir, 42.0, None, None)) as mock_rec,
         mock.patch("screencap.privacy.are_nlp_models_cached", return_value=False),
     ):
         result = _invoke(["--cloud"])
@@ -1115,7 +1115,7 @@ def test_cloud_start_nlp_model_gate(tmp_path):
     with (
         mock.patch("screencap.cli._maybe_prompt_privacy_setup"),
         mock.patch("screencap.cli._stdin_is_tty", return_value=True),
-        mock.patch("screencap.recorder.start_recording", return_value=(fake_dir, 42.0)) as mock_rec,
+        mock.patch("screencap.recorder.start_recording", return_value=(fake_dir, 42.0, None, None)) as mock_rec,
         mock.patch("screencap.privacy.are_nlp_models_cached") as mock_cached,
     ):
         result = _invoke(["--local"])

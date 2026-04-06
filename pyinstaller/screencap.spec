@@ -118,6 +118,8 @@ a = Analysis(
         # Engine sub-package: dynamic imports not traced by PyInstaller
         'screencap.engine.window._macos',
         'screencap.engine.platform.darwin',
+        # Menu bar subprocess (spawned via multiprocessing.Process)
+        'screencap.menubar',
     ],
     hookspath=[],
     hooksconfig={},

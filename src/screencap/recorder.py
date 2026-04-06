@@ -38,9 +38,17 @@ _DISK_CHECK_INTERVAL = 30  # seconds between disk space checks
 class DiskFullError(Exception):
     """Raised when recording auto-stops due to low disk space."""
 
-    def __init__(self, capture_dir: Path, elapsed: float):
+    def __init__(
+        self,
+        capture_dir: Path,
+        elapsed: float,
+        menubar_proc: multiprocessing.Process | None = None,
+        menubar_state_file: Path | None = None,
+    ):
         self.capture_dir = capture_dir
         self.elapsed = elapsed
+        self.menubar_proc = menubar_proc
+        self.menubar_state_file = menubar_state_file
 
 
 # ---------------------------------------------------------------------------
@@ -161,6 +169,9 @@ def _build_live_display(name: str, elapsed: float, pulse_on: bool, disk_warning:
     line2.append("  ·  ", style="dim")
     line2.append("Ctrl+C ×2", style="#818cf8")
     line2.append(" force quit", style="dim")
+    line2.append("  ·  ", style="dim")
+    line2.append("● Menu bar", style="#f472b6")
+    line2.append(" also available", style="dim")
 
     content = Text()
     content.append_text(line1)
@@ -398,6 +409,54 @@ def _check_macos_permissions() -> None:
 
 
 # ---------------------------------------------------------------------------
+# Menu bar helpers
+# ---------------------------------------------------------------------------
+
+
+def _spawn_menubar(
+    recording_name: str, start_time: float, state_file: Path,
+) -> multiprocessing.Process | None:
+    """Spawn the menu bar status item as a daemon subprocess.
+
+    Returns the Process object on success, or None if spawn fails.
+    The process is daemonic so it is killed when the parent exits.
+    """
+    from screencap.menubar import _run_menubar
+
+    proc = multiprocessing.Process(
+        target=_run_menubar,
+        args=(os.getpid(), recording_name, start_time, str(state_file)),
+        daemon=True,
+        name="menubar",
+    )
+    proc.start()
+    return proc
+
+
+def _kill_menubar(
+    proc: multiprocessing.Process | None,
+    state_file: Path | None = None,
+) -> None:
+    """Terminate the menu bar subprocess.  Safe to call multiple times."""
+    if proc is None:
+        return
+    # Signal via state file first (allows clean AppKit shutdown)
+    if state_file is not None:
+        try:
+            from screencap.menubar import STATE_DONE
+            state_file.write_text(STATE_DONE)
+        except Exception:
+            pass
+    # SIGKILL immediately — the menu bar is a UI helper, no data to flush.
+    pid = getattr(proc, "pid", None)
+    if pid:
+        try:
+            os.kill(pid, signal.SIGKILL)
+        except (ProcessLookupError, PermissionError):
+            pass
+
+
+# ---------------------------------------------------------------------------
 # Main recording function
 # ---------------------------------------------------------------------------
 
@@ -421,7 +480,7 @@ def start_recording(
     intent_source: str = "flag",
     segmentation_mode: str = "llm",
     scrub_enabled: bool = True,
-) -> tuple[Path, float]:
+) -> tuple[Path, float, multiprocessing.Process | None, Path | None]:
     """Start a screen capture recording. Blocks until Ctrl+C."""
     if audio is None:
         audio = get_audio_default()
@@ -633,6 +692,8 @@ def start_recording(
     recorder = None
     _child_pids = []
     _ctrl_c_count = 0
+    _menubar_proc = None
+    _menubar_state_file = None
 
     try:
         # Build Recorder kwargs, only passing non-None values
@@ -695,7 +756,7 @@ def start_recording(
         # the entire setup window (wait_for_ready, chunk processor init, etc.).
         # Guards protect against variables not yet bound (recorder, _child_pids).
         def _force_exit(sig, frame):
-            nonlocal _ctrl_c_count, _stop_reason
+            nonlocal _ctrl_c_count, _stop_reason, _menubar_proc
             _ctrl_c_count += 1
 
             if _ctrl_c_count == 1:
@@ -705,8 +766,26 @@ def start_recording(
                     recorder.stop()
                 return
 
-            # 3rd+ Ctrl+C: exit immediately, no waiting
+            if _ctrl_c_count == 2:
+                # Write hint to stderr (stdout may be suppressed)
+                try:
+                    sys.__stderr__.write(
+                        "\n  \033[1;35m⚡ Force quitting\033[0m — "
+                        "terminating all processes...\n"
+                        "  \033[2mStill stuck? Run: "
+                        "\033[0;1mscreencap stop --force\033[0m\n\n"
+                    )
+                    sys.__stderr__.flush()
+                except Exception:
+                    pass
+
+            # 3rd+ Ctrl+C: immediate exit — raw SIGKILL, no escalation
             if _ctrl_c_count > 2:
+                if _menubar_proc is not None and _menubar_proc.pid:
+                    try:
+                        os.kill(_menubar_proc.pid, signal.SIGKILL)
+                    except (ProcessLookupError, PermissionError):
+                        pass
                 os._exit(1)
 
             # 2nd Ctrl+C: force-quit path
@@ -760,6 +839,8 @@ def start_recording(
             except Exception:
                 pass
 
+            _kill_menubar(_menubar_proc, _menubar_state_file)
+            _menubar_proc = None
             os._exit(1)
 
         signal.signal(signal.SIGINT, _force_exit)
@@ -774,11 +855,36 @@ def start_recording(
 
         signal.signal(signal.SIGTERM, _sigterm_handler)
 
+        # Temporarily redirect stderr to /dev/null while creating the
+        # Recorder.  The multiprocessing resource_tracker is lazily spawned
+        # on the first multiprocessing primitive (Event/Value/Queue) and
+        # inherits sys.stderr at that moment.  By pointing stderr at
+        # /dev/null, the tracker's output (KeyError tracebacks at shutdown)
+        # goes nowhere.  We restore stderr immediately after so real errors
+        # are still visible.
+        _real_stderr_fd = os.dup(2)
+        try:
+            _devnull_fd = os.open(os.devnull, os.O_WRONLY)
+            os.dup2(_devnull_fd, 2)
+            os.close(_devnull_fd)
+        except OSError:
+            _real_stderr_fd = None
+
         with Recorder(
             str(capture_dir),
             **recorder_kwargs,
             screen_filter=screen_filter,
         ) as recorder:
+            # Restore real stderr now that the resource tracker has spawned
+            # with /dev/null as its stderr.
+            if _real_stderr_fd is not None:
+                try:
+                    os.dup2(_real_stderr_fd, 2)
+                    os.close(_real_stderr_fd)
+                except OSError:
+                    pass
+                _real_stderr_fd = None
+
             recorder.wait_for_ready(timeout=30)
             status.stop()
 
@@ -836,6 +942,17 @@ def start_recording(
             # Store raw PIDs for signal-safe force-exit (avoids
             # multiprocessing._children_lock which can deadlock in a handler).
             _child_pids = [child.pid for child in multiprocessing.active_children()]
+
+            # Spawn menu bar status item (non-blocking, best-effort)
+            try:
+                _menubar_state_file = capture_dir / ".menubar_state"
+                _menubar_proc = _spawn_menubar(name, t0, _menubar_state_file)
+                console.print(
+                    "  [#f472b6]●[/#f472b6] [dim]Menu bar active — "
+                    "click the [#f472b6]red dot[/#f472b6] in your menu bar to stop[/dim]"
+                )
+            except Exception:
+                _menubar_proc = None  # Menu bar is nice-to-have, not critical
 
             # --- Live recording display ---
             # We use transient=False and handle cleanup ourselves:
@@ -907,11 +1024,31 @@ def start_recording(
                             style="#f59e0b",
                         ))
                     elif _stop_reason == "graceful":
-                        live.update(Text("  ■ Stopping recording...", style="#a78bfa"))
+                        _stop_msg = Text()
+                        _stop_msg.append("  ■ Stopping recording... ", style="#a78bfa")
+                        _stop_msg.append("post-processing may take a moment", style="dim")
+                        _stop_msg.append("\n    ", style="dim")
+                        _stop_msg.append("From another terminal: ", style="dim")
+                        _stop_msg.append("screencap stop", style="bold")
+                        _stop_msg.append("  or  ", style="dim")
+                        _stop_msg.append("screencap stop --force", style="bold")
+                        live.update(_stop_msg)
+                    elif _stop_reason == "sigterm":
+                        _stop_msg = Text()
+                        _stop_msg.append("  ■ Stopping recording... ", style="#a78bfa")
+                        _stop_msg.append("post-processing may take a moment", style="dim")
+                        live.update(_stop_msg)
                     elif _stop_reason == "force":
                         live.update(Text("  ⚡ Force quitting — terminating processes...", style="#f472b6"))
                     else:
                         live.update(Text(""))
+
+                    if _menubar_state_file is not None:
+                        try:
+                            from screencap.menubar import STATE_PROCESSING
+                            _menubar_state_file.write_text(STATE_PROCESSING)
+                        except Exception:
+                            pass
 
             # Suppress stdout before Recorder.__exit__ runs (profile block),
             # but redirect stderr to a log file so subprocess errors are captured.
@@ -972,6 +1109,15 @@ def start_recording(
         atexit.unregister(_cleanup_children)
         delete_pidfile()
 
+        # Restore stderr fd if it wasn't restored earlier (e.g. exception
+        # during Recorder.__enter__).
+        if _real_stderr_fd is not None:
+            try:
+                os.dup2(_real_stderr_fd, 2)
+                os.close(_real_stderr_fd)
+            except OSError:
+                pass
+
         # Best-effort LOCAL sentinel write for unhandled exceptions (Step 3d)
         # Do NOT upload here — chunk_processor hasn't stopped yet, so chunks
         # may still be uploading.  Uploading sentinel now would trigger the
@@ -1008,11 +1154,28 @@ def start_recording(
     # --- ChunkProcessor shutdown + DB checkpoint ---
     if chunk_processor is not None:
         try:
-            with console.status("[dim]Processing final chunk...[/dim]"):
-                chunk_processor.stop(timeout=300)
+            # Send poison pill; the thread will exit once the current chunk
+            # finishes.  Poll its status string so the spinner reflects the
+            # actual step (transcribing, scrubbing, uploading, etc.)
+            try:
+                chunk_processor._q.put({"type": "poison_pill"}, timeout=5)
+            except Exception:
+                pass
+            _cp_thread = chunk_processor._thread
+            _cp_deadline = time.time() + 300
+            with console.status("[dim]Finishing up...[/dim]") as _cp_spinner:
+                while _cp_thread is not None and _cp_thread.is_alive():
+                    if time.time() > _cp_deadline:
+                        break
+                    _step = chunk_processor.status
+                    if _step:
+                        _cp_spinner.update(f"[dim]{_step}[/dim]")
+                    _cp_thread.join(timeout=0.5)
+            # Mark stop complete so .stop() doesn't re-send the poison pill
+            chunk_processor._thread = None
         except KeyboardInterrupt:
-            console.print("[yellow]Force quit — current chunk may complete, queued chunks lost.[/yellow]")
-            console.print("[dim]Run 'screencap upload' later to upload remaining files.[/dim]")
+            console.print("[yellow]Force quit — data is saved on disk.[/yellow]")
+            console.print("[dim]Run [bold]screencap upload[/bold] later to upload remaining files.[/dim]")
         finally:
             # Drain and close chunk/ack queues to prevent feeder-thread hangs.
             for _q in (_cpq, _aaq):
@@ -1132,6 +1295,8 @@ def start_recording(
         _restore_output()
 
     if _stop_reason == "disk_full":
-        raise DiskFullError(capture_dir, elapsed)
+        raise DiskFullError(
+            capture_dir, elapsed, _menubar_proc, _menubar_state_file,
+        )
 
-    return capture_dir, elapsed
+    return capture_dir, elapsed, _menubar_proc, _menubar_state_file
