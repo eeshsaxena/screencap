@@ -38,9 +38,17 @@ _DISK_CHECK_INTERVAL = 30  # seconds between disk space checks
 class DiskFullError(Exception):
     """Raised when recording auto-stops due to low disk space."""
 
-    def __init__(self, capture_dir: Path, elapsed: float):
+    def __init__(
+        self,
+        capture_dir: Path,
+        elapsed: float,
+        menubar_proc: multiprocessing.Process | None = None,
+        menubar_state_file: Path | None = None,
+    ):
         self.capture_dir = capture_dir
         self.elapsed = elapsed
+        self.menubar_proc = menubar_proc
+        self.menubar_state_file = menubar_state_file
 
 
 # ---------------------------------------------------------------------------
@@ -472,7 +480,7 @@ def start_recording(
     intent_source: str = "flag",
     segmentation_mode: str = "llm",
     scrub_enabled: bool = True,
-) -> tuple[Path, float]:
+) -> tuple[Path, float, multiprocessing.Process | None, Path | None]:
     """Start a screen capture recording. Blocks until Ctrl+C."""
     if audio is None:
         audio = get_audio_default()
@@ -684,6 +692,8 @@ def start_recording(
     recorder = None
     _child_pids = []
     _ctrl_c_count = 0
+    _menubar_proc = None
+    _menubar_state_file = None
 
     try:
         # Build Recorder kwargs, only passing non-None values
@@ -1183,6 +1193,8 @@ def start_recording(
         _restore_output()
 
     if _stop_reason == "disk_full":
-        raise DiskFullError(capture_dir, elapsed)
+        raise DiskFullError(
+            capture_dir, elapsed, _menubar_proc, _menubar_state_file,
+        )
 
-    return capture_dir, elapsed
+    return capture_dir, elapsed, _menubar_proc, _menubar_state_file
