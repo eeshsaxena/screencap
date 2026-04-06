@@ -295,19 +295,22 @@ def start(
     scrub_enabled = not no_scrub
     if scrub_enabled and _stdin_is_tty():
         scrub_enabled = click.confirm(
-            "Redact sensitive info (passwords, emails, keys) from this recording?",
+            "Redact sensitive info (passwords, emails, keys) from this recording?\n"
+            "  Note: redaction adds extra post-processing time after recording stops",
             default=True,
         )
 
     try:
-        from screencap.recorder import DiskFullError, print_summary, start_recording
+        from screencap.recorder import DiskFullError, _kill_menubar, print_summary, start_recording
     except ImportError:
         console.print(_RECORD_EXTRAS_MSG)
         raise SystemExit(1)
 
     disk_full = False
+    _menubar_proc = None
+    _menubar_state_file = None
     try:
-        capture_dir, elapsed = start_recording(
+        capture_dir, elapsed, _menubar_proc, _menubar_state_file = start_recording(
             name, description or None, audio, output,
             wifi_metrics=wifi_metrics, app_versions=app_versions, force_clean=force,
             capture_video=capture_video, capture_images=capture_images,
@@ -324,6 +327,7 @@ def start(
         )
     except DiskFullError as e:
         capture_dir, elapsed = e.capture_dir, e.elapsed
+        _menubar_proc, _menubar_state_file = e.menubar_proc, e.menubar_state_file
         disk_full = True
         console.print("[yellow]Skipping auto-naming/transcription: disk space is low.[/yellow]")
     except ImportError:
@@ -339,13 +343,30 @@ def start(
     final_name = name
     final_dir = capture_dir
 
+    # Check if user renamed the recording from the menu bar
+    try:
+        from screencap.menubar import RENAME_FILENAME
+        _rename_file = capture_dir / RENAME_FILENAME
+        if _rename_file.exists():
+            _new_name = _rename_file.read_text().strip()
+            if _new_name and _new_name != name:
+                new_dir = capture_dir.parent / _new_name
+                if not new_dir.exists():
+                    capture_dir.rename(new_dir)
+                    final_name = _new_name
+                    final_dir = new_dir
+                    capture_dir = new_dir
+            _rename_file.unlink(missing_ok=True)
+    except Exception:
+        pass
+
     # Auto-export events.jsonl for downstream scrubbing
     try:
         _auto_export(capture_dir)
     except KeyboardInterrupt:
         console.print("[yellow]Export cancelled.[/yellow]")
 
-    if auto_name_enabled and not disk_full:
+    if auto_name_enabled and not disk_full and final_name == name:
         # Auto-transcribe if audio was captured
         # In chunked mode, per-chunk transcription is handled by ChunkProcessor
         has_chunk_transcripts = any(capture_dir.glob("transcript_*.txt"))
@@ -379,20 +400,12 @@ def start(
     except Exception:
         pass  # non-blocking
 
-    # Hard-exit to avoid multiprocessing feeder-thread atexit hangs.
-    # All recording data is flushed to disk by this point.
-    # Kill the resource tracker first so it can't warn about leaked semaphores.
+    # Kill menu bar and hard-exit.  Recorder.__exit__ already joined all
+    # child processes; os._exit() cleans up everything else instantly.
+    # The resource tracker's stderr was redirected to /dev/null at Recorder
+    # creation time, so any cleanup output goes nowhere.
+    _kill_menubar(_menubar_proc, _menubar_state_file)
     import os as _os
-    try:
-        from multiprocessing.resource_tracker import _resource_tracker
-        if _resource_tracker._pid is not None:
-            _os.kill(_resource_tracker._pid, 9)
-            try:
-                _os.waitpid(_resource_tracker._pid, _os.WNOHANG)
-            except ChildProcessError:
-                pass
-    except Exception:
-        pass
     _os._exit(0)
 
 
@@ -919,13 +932,31 @@ def stop(force):
                 except (ProcessLookupError, PermissionError):
                     pass
                 else:
-                    # Wait for graceful shutdown (up to 30s)
-                    for _ in range(60):
-                        if not _pid_exists(parent_pid):
-                            break
-                        _time.sleep(0.5)
-                    if not _pid_exists(parent_pid):
-                        console.print("Recording stopped gracefully.")
+                    # Wait for graceful shutdown (up to 30s) with progress
+                    _timed_out = True
+                    try:
+                        with console.status(
+                            "[dim]Waiting for recording to stop "
+                            "(post-processing may take a moment)...[/dim]"
+                        ) as _wait_status:
+                            for _tick in range(60):
+                                if not _pid_exists(parent_pid):
+                                    _timed_out = False
+                                    break
+                                if _tick == 20:  # 10s elapsed
+                                    _wait_status.update(
+                                        "[dim]Still waiting... use [bold]screencap stop --force[/bold] "
+                                        "to kill immediately[/dim]"
+                                    )
+                                _time.sleep(0.5)
+                    except KeyboardInterrupt:
+                        console.print(
+                            "\n[yellow]Interrupted — escalating to force kill.[/yellow]\n"
+                            "[dim]Tip: [bold]screencap stop --force[/bold] "
+                            "skips the graceful wait[/dim]"
+                        )
+                    if not _timed_out or not _pid_exists(parent_pid):
+                        console.print("[#22d3ee]Recording stopped.[/#22d3ee]")
                         delete_pidfile()
                         return
                     console.print("[yellow]Graceful stop timed out — falling back to force kill.[/yellow]")
