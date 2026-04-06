@@ -156,7 +156,7 @@ def test_normal_recording_lifecycle(recording_env):
         mock.patch("shutil.disk_usage", return_value=_PLENTY_OF_DISK),
         mock.patch("screencap.metrics.save_metrics"),
     ):
-        capture_dir, elapsed = start_recording(
+        capture_dir, elapsed, _, _ = start_recording(
             name="test-rec",
             audio=False,
             output_dir=rec_dir,
@@ -728,7 +728,7 @@ def test_start_recording_multi_chunk_produces_all_chunk_files(recording_env):
         mock.patch("screencap.chunk_processor.ChunkProcessor._generate_manifest"),
         mock.patch("screencap.chunk_processor.ChunkProcessor._upload_chunk"),
     ):
-        capture_dir, elapsed = start_recording(
+        capture_dir, elapsed, _, _ = start_recording(
             name="test-chunked",
             audio=False,
             output_dir=rec_dir,
@@ -829,7 +829,7 @@ def test_non_chunked_recording_no_chunk_processor(recording_env):
         mock.patch("screencap.metrics.save_metrics"),
         mock.patch("screencap.chunk_processor.ChunkProcessor") as MockCP,
     ):
-        capture_dir, elapsed = start_recording(
+        capture_dir, elapsed, _, _ = start_recording(
             name="test-no-chunks",
             audio=False,
             output_dir=rec_dir,
@@ -931,7 +931,7 @@ def test_stub_recording_not_called_when_uploads_disabled(recording_env):
         # upload_sentinel must NOT be called
         mock.patch("screencap.chunk_processor.upload_sentinel") as mock_sentinel,
     ):
-        capture_dir, elapsed = start_recording(
+        capture_dir, elapsed, _, _ = start_recording(
             name="test-guard-gate",
             audio=False,
             output_dir=rec_dir,
@@ -1022,7 +1022,7 @@ def test_upload_warning_surfaced_at_stop(recording_env):
             return _real_print(*args, **kwargs)
 
         with mock.patch.object(screencap.recorder.console, "print", side_effect=_spy_print):
-            capture_dir, elapsed = start_recording(
+            capture_dir, elapsed, _, _ = start_recording(
                 name="test-warning",
                 audio=False,
                 output_dir=rec_dir,
@@ -1125,7 +1125,7 @@ def test_sentinel_not_uploaded_without_sentinel_for_cloud(recording_env):
         mock.patch("screencap.chunk_processor.stub_recording") as mock_stub,
     ):
         mock_pipeline.return_value = mock.MagicMock()
-        capture_dir, elapsed = start_recording(
+        capture_dir, elapsed, _, _ = start_recording(
             name="test-sentinel-gate",
             audio=False,
             output_dir=rec_dir,

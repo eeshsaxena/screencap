@@ -53,6 +53,7 @@ try:
 except ImportError:
     soundfile = None
 
+
 def _send_profiling_via_wormhole(profile_path: str) -> None:
     """Auto-send profiling JSON via Magic Wormhole after recording."""
     import shutil
@@ -2785,6 +2786,7 @@ def record(
             pass
 
     terminate_perf_event.set()
+
     # disabled to increase perf
     # join_tasks(
     #     [
@@ -3162,6 +3164,14 @@ class Recorder:
                 try:
                     q.cancel_join_thread()
                     q.close()
+                except Exception:
+                    pass
+
+        # Close pipe connections (plain file descriptors — always safe).
+        for conn in (self._status_recv, self._status_send):
+            if conn is not None:
+                try:
+                    conn.close()
                 except Exception:
                     pass
 

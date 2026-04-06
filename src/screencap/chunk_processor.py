@@ -247,7 +247,7 @@ class ChunkProcessor:
         end_ts = msg["rotation_time"]
         is_final = msg.get("type") == "final_chunk"
 
-        self._set_status(f"Chunk {idx}: waiting for audio...")
+        self._set_status("Waiting for audio...")
 
         # 1. Wait for audio ack
         self._wait_for_audio(idx, is_final=is_final)
@@ -255,23 +255,23 @@ class ChunkProcessor:
             return
 
         # 2. Transcribe audio
-        self._set_status(f"Chunk {idx}: transcribing...")
+        self._set_status("Transcribing audio...")
         transcript_path = self._transcribe(idx)
         if self._stop_event.is_set():
             return
 
         # 3. Flush writer buffers → export events from DB
-        self._set_status(f"Chunk {idx}: flushing writers...")
+        self._set_status("Flushing buffers...")
         self._trigger_flush()
         if self._stop_event.is_set():
             return
-        self._set_status(f"Chunk {idx}: exporting events...")
+        self._set_status("Exporting events...")
         self._export_events(idx, start_ts, end_ts)
         if self._stop_event.is_set():
             return
 
         # 4. Generate task manifest (with blocked intervals if available)
-        self._set_status(f"Chunk {idx}: generating manifest...")
+        self._set_status("Generating manifest...")
         blocked_intervals = None
         if self._screen_filter is not None and hasattr(self._screen_filter, 'get_blocked_intervals'):
             try:
@@ -281,9 +281,8 @@ class ChunkProcessor:
         self._generate_manifest(idx, start_ts, end_ts, blocked_intervals=blocked_intervals)
 
         # 5. Scrub text surfaces + mask screenshots when user opted in.
-        # Cloud uploads are also scrubbed by `screencap upload` before sending.
         if self._scrub_enabled and self._pipeline is not None:
-            self._set_status(f"Chunk {idx}: scrubbing...")
+            self._set_status("Redacting sensitive data...")
             self._scrub_chunk_files(idx, start_ts, end_ts, transcript_path)
             if self._stop_event.is_set():
                 return
@@ -291,7 +290,7 @@ class ChunkProcessor:
         # 6. Upload
         success = False
         if self._upload_enabled:
-            self._set_status(f"Chunk {idx}: uploading...")
+            self._set_status("Uploading...")
             files = self._collect_chunk_files(idx, transcript_path)
             if files:
                 success = self._upload_chunk(idx, files)
@@ -310,9 +309,7 @@ class ChunkProcessor:
         n_done = sum(1 for v in self._chunk_results.values() if v)
         if self._total_freed > 0:
             freed_str = _fmt_bytes(self._total_freed)
-            self._set_status(f"{n_done} chunks uploaded, {freed_str} freed")
-        elif n_done > 0:
-            self._set_status(f"Chunk {idx} uploaded")
+            self._set_status(f"{n_done} chunks done, {freed_str} freed")
         else:
             self._set_status("")
 

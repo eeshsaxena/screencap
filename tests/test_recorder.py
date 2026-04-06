@@ -365,7 +365,7 @@ class TestPreRecordingDiskCheck:
             mock.patch("screencap.pidfile.delete_pidfile"),
             mock.patch("screencap.engine.Recorder", FakeRecorder),
         ):
-            capture_dir, elapsed = start_recording("test", output_dir=tmp_path / "test-rec")
+            capture_dir, elapsed, _, _ = start_recording("test", output_dir=tmp_path / "test-rec")
             assert capture_dir.exists()
 
     def test_insufficient_space_aborts(self, tmp_path):
@@ -427,7 +427,7 @@ class TestPreRecordingDiskCheck:
             MockRecorder.return_value.__exit__ = mock.MagicMock(return_value=False)
 
             # Should not raise — fail-open behavior
-            capture_dir, elapsed = start_recording("test", output_dir=tmp_path / "test-rec", verbose=True)
+            capture_dir, elapsed, _, _ = start_recording("test", output_dir=tmp_path / "test-rec", verbose=True)
             assert capture_dir.exists()
 
     def test_warn_mb_zero_disables_check(self, tmp_path):
@@ -456,7 +456,7 @@ class TestPreRecordingDiskCheck:
             MockRecorder.return_value.__enter__ = mock.MagicMock(return_value=mock_recorder)
             MockRecorder.return_value.__exit__ = mock.MagicMock(return_value=False)
 
-            capture_dir, _ = start_recording("test", output_dir=tmp_path / "test-rec")
+            capture_dir, _, _, _ = start_recording("test", output_dir=tmp_path / "test-rec")
             assert capture_dir.exists()
 
     def test_check_runs_before_mkdir(self, tmp_path):
