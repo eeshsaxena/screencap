@@ -161,6 +161,9 @@ def _build_live_display(name: str, elapsed: float, pulse_on: bool, disk_warning:
     line2.append("  ·  ", style="dim")
     line2.append("Ctrl+C ×2", style="#818cf8")
     line2.append(" force quit", style="dim")
+    line2.append("  ·  ", style="dim")
+    line2.append("● Menu bar", style="#f472b6")
+    line2.append(" also available", style="dim")
 
     content = Text()
     content.append_text(line1)
@@ -395,6 +398,54 @@ def _check_macos_permissions() -> None:
             console.print(f"\n  [red]Error:[/red] {name} was not granted in time.")
             console.print("  Grant the permission and re-run: screencap start")
             raise SystemExit(1)
+
+
+# ---------------------------------------------------------------------------
+# Menu bar helpers
+# ---------------------------------------------------------------------------
+
+
+def _spawn_menubar(
+    recording_name: str, start_time: float, state_file: Path,
+) -> multiprocessing.Process | None:
+    """Spawn the menu bar status item as a daemon subprocess.
+
+    Returns the Process object on success, or None if spawn fails.
+    The process is daemonic so it is killed when the parent exits.
+    """
+    from screencap.menubar import _run_menubar
+
+    proc = multiprocessing.Process(
+        target=_run_menubar,
+        args=(os.getpid(), recording_name, start_time, str(state_file)),
+        daemon=True,
+        name="menubar",
+    )
+    proc.start()
+    return proc
+
+
+def _kill_menubar(
+    proc: multiprocessing.Process | None,
+    state_file: Path | None = None,
+) -> None:
+    """Terminate the menu bar subprocess.  Safe to call multiple times."""
+    if proc is None:
+        return
+    # Signal via state file first (allows clean AppKit shutdown)
+    if state_file is not None:
+        try:
+            from screencap.menubar import STATE_DONE
+            state_file.write_text(STATE_DONE)
+        except Exception:
+            pass
+    # SIGKILL immediately — the menu bar is a UI helper, no data to flush.
+    pid = getattr(proc, "pid", None)
+    if pid:
+        try:
+            os.kill(pid, signal.SIGKILL)
+        except (ProcessLookupError, PermissionError):
+            pass
 
 
 # ---------------------------------------------------------------------------
