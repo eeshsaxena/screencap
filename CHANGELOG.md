@@ -5,6 +5,17 @@ All notable changes to this project will be documented in this file.
 The format is based on [Keep a Changelog](https://keepachangelog.com/),
 and this project adheres to [Semantic Versioning](https://semver.org/).
 
+## [0.15.0] - 2026-04-07
+
+### Added
+- **menubar:** Add macOS menu bar status item with pulsing red dot timer, rename field, and stop button
+- **recorder:** Integrate menu bar lifecycle into recording (spawn, signal handlers, state file)
+- **recorder:** Improve shutdown and post-processing UX with status polling and hints
+- **cli:** Wire menu bar into start/stop commands with progress spinner and rename support
+
+### Changed
+- **recorder:** Extend start_recording return type and DiskFullError for menu bar process
+
 ## [0.14.0] - 2026-04-02
 
 ### Added
