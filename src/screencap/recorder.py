@@ -1024,7 +1024,20 @@ def start_recording(
                             style="#f59e0b",
                         ))
                     elif _stop_reason == "graceful":
-                        live.update(Text("  ■ Stopping recording...", style="#a78bfa"))
+                        _stop_msg = Text()
+                        _stop_msg.append("  ■ Stopping recording... ", style="#a78bfa")
+                        _stop_msg.append("post-processing may take a moment", style="dim")
+                        _stop_msg.append("\n    ", style="dim")
+                        _stop_msg.append("From another terminal: ", style="dim")
+                        _stop_msg.append("screencap stop", style="bold")
+                        _stop_msg.append("  or  ", style="dim")
+                        _stop_msg.append("screencap stop --force", style="bold")
+                        live.update(_stop_msg)
+                    elif _stop_reason == "sigterm":
+                        _stop_msg = Text()
+                        _stop_msg.append("  ■ Stopping recording... ", style="#a78bfa")
+                        _stop_msg.append("post-processing may take a moment", style="dim")
+                        live.update(_stop_msg)
                     elif _stop_reason == "force":
                         live.update(Text("  ⚡ Force quitting — terminating processes...", style="#f472b6"))
                     else:
@@ -1141,11 +1154,28 @@ def start_recording(
     # --- ChunkProcessor shutdown + DB checkpoint ---
     if chunk_processor is not None:
         try:
-            with console.status("[dim]Processing final chunk...[/dim]"):
-                chunk_processor.stop(timeout=300)
+            # Send poison pill; the thread will exit once the current chunk
+            # finishes.  Poll its status string so the spinner reflects the
+            # actual step (transcribing, scrubbing, uploading, etc.)
+            try:
+                chunk_processor._q.put({"type": "poison_pill"}, timeout=5)
+            except Exception:
+                pass
+            _cp_thread = chunk_processor._thread
+            _cp_deadline = time.time() + 300
+            with console.status("[dim]Finishing up...[/dim]") as _cp_spinner:
+                while _cp_thread is not None and _cp_thread.is_alive():
+                    if time.time() > _cp_deadline:
+                        break
+                    _step = chunk_processor.status
+                    if _step:
+                        _cp_spinner.update(f"[dim]{_step}[/dim]")
+                    _cp_thread.join(timeout=0.5)
+            # Mark stop complete so .stop() doesn't re-send the poison pill
+            chunk_processor._thread = None
         except KeyboardInterrupt:
-            console.print("[yellow]Force quit — current chunk may complete, queued chunks lost.[/yellow]")
-            console.print("[dim]Run 'screencap upload' later to upload remaining files.[/dim]")
+            console.print("[yellow]Force quit — data is saved on disk.[/yellow]")
+            console.print("[dim]Run [bold]screencap upload[/bold] later to upload remaining files.[/dim]")
         finally:
             # Drain and close chunk/ack queues to prevent feeder-thread hangs.
             for _q in (_cpq, _aaq):
