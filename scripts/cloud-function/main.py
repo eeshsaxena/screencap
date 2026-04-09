@@ -127,12 +127,16 @@ def _handle_list(data=None):
         if len(parts) < 3 or not parts[2]:
             continue
         rec_name = parts[1]
+        if parts[2] == "_unlisted":
+            recordings[rec_name]["unlisted"] = True
+            continue
         recordings[rec_name]["file_count"] += 1
         recordings[rec_name]["total_size"] += blob.size or 0
 
     result = [
-        {"name": name, **info}
+        {"name": name, "file_count": info["file_count"], "total_size": info["total_size"]}
         for name, info in sorted(recordings.items())
+        if not info.get("unlisted")
     ]
     return _cors(jsonify({"recordings": result}))
 

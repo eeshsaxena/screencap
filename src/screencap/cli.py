@@ -177,13 +177,22 @@ def _maybe_prompt_privacy_setup(*, cloud_intent: bool = False) -> None:
               default=None, help="Task segmentation: 'llm' (server-side) or 'idle' (gap detection).")
 @click.option("--no-scrub", is_flag=True, default=False,
               help="Disable PII/secrets scrubbing for this recording.")
+@click.option("--unlisted", is_flag=True, default=False,
+              help="Hide this recording from the website (still uploads, just not listed).")
 def start(
     name, description, no_audio, no_video, no_images, no_window_data,
     output, no_wifi_metrics, no_app_versions,
     no_auto_name, local_only, force, verbose, chunk_duration, no_live_upload,
-    destination, segmentation_mode, no_scrub,
+    destination, segmentation_mode, no_scrub, unlisted,
 ):
-    """Record a screen capture session. Ctrl+C to stop."""
+    """Record a screen capture session. Ctrl+C to stop.
+
+    \b
+    Visibility:
+      Cloud recordings are shown on the website by default.
+      --unlisted                hide this recording (still uploads, just not listed)
+      screencap settings        view/change the default visibility setting
+    """
     from datetime import datetime
 
     from screencap.config import get_auto_name, get_auto_name_local_only, get_segmentation_mode
@@ -300,6 +309,45 @@ def start(
             default=True,
         )
 
+    # --- Website visibility ---
+    from screencap.config import _CONFIG_PATH, _load_toml, get_show_on_website
+
+    if unlisted:
+        show_on_website = False
+    elif is_cloud:
+        # First cloud recording: prompt if show_on_website has never been set
+        cfg = _load_toml()
+        if "show_on_website" not in cfg and _stdin_is_tty():
+            console.print()
+            console.print(
+                "[bold]Would you like your recordings to be visible on the website?[/bold]"
+            )
+            console.print(
+                "  [dim]Yes = your sessions will appear in the public viewer\n"
+                "  No  = recordings still upload, but won't be listed on the site\n"
+                "  Change later with: screencap settings --set show_on_website=true\n"
+                "  Or pass --unlisted to hide individual recordings.[/dim]"
+            )
+            show_on_website = click.confirm(
+                "Show recordings on the website?",
+                default=True,
+            )
+            from screencap.config import invalidate_config_cache
+            from screencap.setup_wizard import _load_config_toml, _save_config_atomic
+
+            doc = _load_config_toml(_CONFIG_PATH)
+            doc["show_on_website"] = show_on_website
+            _save_config_atomic(_CONFIG_PATH, doc)
+            invalidate_config_cache()
+            if show_on_website:
+                console.print("[dim]Saved. Recordings will be visible. Use --unlisted to hide individual ones.[/dim]")
+            else:
+                console.print("[dim]Saved. Recordings will be hidden from the site by default.[/dim]")
+        else:
+            show_on_website = get_show_on_website()
+    else:
+        show_on_website = True  # irrelevant for local-only recordings
+
     try:
         from screencap.recorder import DiskFullError, _kill_menubar, print_summary, start_recording
     except ImportError:
@@ -324,6 +372,7 @@ def start(
             intent_source=intent_source,
             segmentation_mode=seg_mode,
             scrub_enabled=scrub_enabled,
+            show_on_website=show_on_website,
         )
     except DiskFullError as e:
         capture_dir, elapsed = e.capture_dir, e.elapsed
@@ -1464,13 +1513,20 @@ def upload(names, all_recordings, dry_run, force, jobs, no_delete):
                     _rec_id_path = d / ".recording_id"
                     _rec_name = _rec_id_path.read_text().strip() if _rec_id_path.exists() else d.name
                     _chunk_count = len(list(d.glob("chunk_*_manifest.json")))
+                    show_on_website = True
+                    _intent_path = d / ".recording_intent"
+                    if _intent_path.exists():
+                        try:
+                            show_on_website = json.loads(_intent_path.read_text()).get("show_on_website", True)
+                        except Exception:
+                            pass
                     _sentinel_data = _build_sentinel_data(
                         recording_name=_rec_name,
                         stop_reason="manual_upload",
                         chunks_expected=_chunk_count,
+                        show_on_website=show_on_website,
                     )
-                    import json as _json
-                    _sentinel_path.write_text(_json.dumps(_sentinel_data, indent=2))
+                    _sentinel_path.write_text(json.dumps(_sentinel_data, indent=2))
                 except Exception:
                     pass
 
@@ -1781,18 +1837,94 @@ def scrub(name: str, pii_engine: str | None) -> None:
 
 
 @cli.command()
-def settings():
-    """Show current ScreenCap configuration."""
+@click.option("--set", "set_pair", default=None, metavar="KEY=VALUE",
+              help="Change a setting, e.g. --set show_on_website=true")
+def settings(set_pair):
+    """Show or change ScreenCap configuration.
+
+    \b
+    View all settings:
+      screencap settings
+
+    \b
+    Change a setting:
+      screencap settings --set show_on_website=false
+      screencap settings --set audio_default=true
+      screencap settings --set upload_default=cloud
+
+    \b
+    Changeable keys:
+      show_on_website    Show recordings on the website (true/false)
+      audio_default      Record audio by default (true/false)
+      auto_name          LLM auto-naming after recording (true/false)
+      upload_default     Default destination (local/cloud/both/ask)
+    """
     from screencap.config import (
+        _CONFIG_PATH,
         get_audio_default,
         get_auto_delete_after_upload,
         get_auto_name,
         get_chunk_duration,
         get_recordings_dir,
         get_rest_threshold,
+        get_show_on_website,
         get_upload_default,
+        invalidate_config_cache,
     )
 
+    # --- Set a value ---
+    if set_pair:
+        if "=" not in set_pair:
+            console.print("[red]Error:[/red] Use KEY=VALUE format, e.g. --set show_on_website=false")
+            raise SystemExit(1)
+
+        key, raw_value = set_pair.split("=", 1)
+        key = key.strip()
+        raw_value = raw_value.strip()
+
+        # Validate key and parse value
+        _BOOL_KEYS = {"show_on_website", "audio_default", "auto_name", "auto_name_local_only",
+                       "auto_update", "auto_delete_after_upload", "wifi_metrics", "app_versions"}
+        _CHOICE_KEYS = {"upload_default": ("local", "cloud", "both", "ask"),
+                         "segmentation_mode": ("llm", "idle")}
+
+        if key in _BOOL_KEYS:
+            if raw_value.lower() in ("true", "1", "yes"):
+                value = True
+            elif raw_value.lower() in ("false", "0", "no"):
+                value = False
+            else:
+                console.print(f"[red]Error:[/red] {key} must be true or false, got: {raw_value}")
+                raise SystemExit(1)
+        elif key in _CHOICE_KEYS:
+            valid = _CHOICE_KEYS[key]
+            if raw_value.lower() not in valid:
+                console.print(f"[red]Error:[/red] {key} must be one of {valid}, got: {raw_value}")
+                raise SystemExit(1)
+            value = raw_value.lower()
+        else:
+            all_keys = sorted(_BOOL_KEYS | set(_CHOICE_KEYS.keys()))
+            console.print(f"[red]Error:[/red] Unknown setting: {key}")
+            console.print(f"[dim]Available: {', '.join(all_keys)}[/dim]")
+            raise SystemExit(1)
+
+        from screencap.setup_wizard import _load_config_toml, _save_config_atomic
+
+        doc = _load_config_toml(_CONFIG_PATH)
+        # upload_default lives under [privacy], others are top-level
+        if key == "upload_default":
+            import tomlkit
+            if "privacy" not in doc:
+                doc.add("privacy", tomlkit.table())
+            doc["privacy"]["upload_default"] = value
+        else:
+            doc[key] = value
+        _save_config_atomic(_CONFIG_PATH, doc)
+        invalidate_config_cache()
+        console.print(f"  [bold]{key}[/bold] = {value}")
+        return
+
+    # --- Display all settings ---
     chunk = get_chunk_duration()
     if chunk >= 3600:
         chunk_str = f"{chunk:.0f}s ({chunk / 3600:.1f} hour)"
@@ -1803,15 +1935,19 @@ def settings():
     else:
         chunk_str = "disabled (legacy single-file)"
     rest = get_rest_threshold()
+    show = get_show_on_website()
 
-    console.print("\n[bold]ScreenCap Configuration[/bold]\n")
+    console.print("\n[bold]ScreenCap Settings[/bold]\n")
+    console.print(f"  Show on website:          {'yes' if show else 'no'}")
+    console.print(f"  Upload default:           {get_upload_default()}")
+    console.print(f"  Audio default:            {'enabled' if get_audio_default() else 'disabled'}")
+    console.print(f"  Auto-name:                {'enabled' if get_auto_name() else 'disabled'}")
     console.print(f"  Chunk duration:           {chunk_str}")
     console.print(f"  Auto-delete after upload: {'enabled' if get_auto_delete_after_upload() else 'disabled'}")
     console.print(f"  Rest threshold:           {rest:.0f}s ({rest / 60:.0f} min)")
     console.print(f"  Recordings dir:           {get_recordings_dir()}")
-    console.print(f"  Audio default:            {'enabled' if get_audio_default() else 'disabled'}")
-    console.print(f"  Auto-name:                {'enabled' if get_auto_name() else 'disabled'}")
-    console.print(f"  Upload default:           {get_upload_default()}")
+    console.print()
+    console.print("[dim]  Change with: screencap settings --set KEY=VALUE[/dim]")
     console.print()
 
 

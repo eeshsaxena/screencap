@@ -48,6 +48,7 @@ class ChunkProcessor:
         screen_filter=None,
         segmentation_mode: str = "llm",
         scrub_enabled: bool = False,
+        show_on_website: bool = True,
     ) -> None:
         self._capture_dir = Path(capture_dir)
         self._db_path = self._capture_dir / "recording.db"
@@ -64,6 +65,7 @@ class ChunkProcessor:
         self._screen_filter = screen_filter
         self._segmentation_mode = segmentation_mode
         self._scrub_enabled = scrub_enabled
+        self._show_on_website = show_on_website
 
         # Initialize scrubbing pipeline when scrubbing is enabled
         # (cloud-intent always scrubs; local recordings scrub when user opts in)
@@ -776,6 +778,12 @@ class ChunkProcessor:
             elif path.exists() and path.stat().st_size == 0:
                 logger.info(f"Skipping 0-byte file: {name}")
 
+        # Upload _unlisted marker on first chunk when recording is hidden
+        if idx == 0 and not self._show_on_website:
+            marker_path = self._capture_dir / "_unlisted"
+            marker_path.touch(exist_ok=True)
+            files.append({"name": "_unlisted", "path": marker_path})
+
         return files
 
     def _upload_chunk(self, idx: int, files: list[dict]) -> bool:
@@ -980,6 +988,8 @@ def _build_sentinel_data(
     recording_name: str,
     stop_reason: str,
     chunks_expected: int,
+    *,
+    show_on_website: bool = True,
 ) -> dict:
     """Build sentinel dict for recording_complete.json."""
     import uuid
@@ -995,6 +1005,7 @@ def _build_sentinel_data(
         "screencap_version": __version__,
         "chunks_expected": chunks_expected,
         "sentinel_id": str(uuid.uuid4()),
+        "show_on_website": show_on_website,
     }
 
 
@@ -1004,6 +1015,7 @@ def upload_sentinel(
     *,
     stop_reason: str = "graceful",
     chunks_expected: int = 0,
+    show_on_website: bool = True,
 ) -> bool:
     """Create and upload recording_complete.json sentinel to trigger stitching.
 
@@ -1012,7 +1024,10 @@ def upload_sentinel(
     """
     from screencap.upload import FileInfo, _content_type, request_signed_urls
 
-    sentinel_data = _build_sentinel_data(recording_name, stop_reason, chunks_expected)
+    sentinel_data = _build_sentinel_data(
+        recording_name, stop_reason, chunks_expected,
+        show_on_website=show_on_website,
+    )
     sentinel_path = capture_dir / "recording_complete.json"
 
     # Write locally (atomic: tmp + rename)
