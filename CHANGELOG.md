@@ -5,6 +5,26 @@ All notable changes to this project will be documented in this file.
 The format is based on [Keep a Changelog](https://keepachangelog.com/),
 and this project adheres to [Semantic Versioning](https://semver.org/).
 
+## [0.16.0] - 2026-04-09
+
+### Added
+- **exporter:** Add override loading in export paths and app list tests
+- **menubar:** Add real-time app/tab list with colored marks and toggles
+- **privacy:** Add runtime override support to RecorderPrivacyFilter
+- **recorder:** Add IPC queues for menu bar app list and override flow
+- **privacy:** Add shared override utilities and PASSWORD_MANAGER_BUNDLES
+- **privacy:** Add extract_root_domain() for subdomain collapsing
+- **engine:** Add app_name to window event pipeline and DB model
+- **cli:** Add --set flag to settings command for changing config values
+- **cloud:** Filter unlisted recordings from listings and propagate to session index
+- **chunk-processor:** Upload _unlisted marker and add visibility to sentinel
+- **recorder:** Propagate show_on_website through intent and sentinel
+- **cli:** Add --unlisted flag and first-run visibility prompt
+- **config:** Add show_on_website setting for recording visibility
+
+### Fixed
+- **engine:** Fix .pop() mutation bug and always invalidate browser URL cache
+
 ## [0.14.0] - 2026-04-02
 
 ### Added
