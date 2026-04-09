@@ -1681,6 +1681,7 @@ def _update_session_index(
             summary = timeline.get("summary", {})
             task_entries = timeline.get("tasks", [])
             index["recordings"][recording_name] = {
+                "show_on_website": timeline.get("show_on_website", True),
                 "processed_at": timeline.get("processed_at"),
                 "segmentation_method": timeline.get("segmentation_method"),
                 "total_tasks": timeline.get("total_tasks", 0),
@@ -1754,6 +1755,7 @@ def process_recording(cloud_event):
             return
         trigger_id = sentinel.get("sentinel_id", "")
         chunks_expected = sentinel.get("chunks_expected", 0)
+        show_on_website = sentinel.get("show_on_website")
     else:
         # Legacy recording.db trigger
         db_data = _blob_bytes(object_name)
@@ -1762,6 +1764,13 @@ def process_recording(cloud_event):
             return
         trigger_id = _md5_bytes(db_data)
         chunks_expected = 0
+        show_on_website = None
+
+    # Resolve visibility: sentinel field is authoritative; fall back to
+    # _unlisted marker blob only for legacy sentinels that lack the field.
+    if show_on_website is None:
+        unlisted_blob = _bucket().blob(f"recordings/{recording_name}/_unlisted")
+        show_on_website = not unlisted_blob.exists()
 
     # Idempotency check
     if _check_idempotency(sessions_prefix, trigger_id):
@@ -1934,6 +1943,7 @@ def process_recording(cloud_event):
     # Build timeline.json
     timeline = {
         "recording_name": recording_name,
+        "show_on_website": show_on_website,
         "segmentation_method": segmentation_method,
         "processed_at": datetime.now(timezone.utc).isoformat(),
         "processor_version": PROCESSOR_VERSION,
@@ -1956,6 +1966,13 @@ def process_recording(cloud_event):
         )
 
     _upload_json(f"{sessions_prefix}timeline.json", timeline)
+
+    if not show_on_website:
+        try:
+            _upload_text(f"{sessions_prefix}_unlisted", "")
+            log.info("Uploaded _unlisted marker for %s", recording_name)
+        except Exception:
+            log.warning("Failed to upload _unlisted marker for %s", recording_name, exc_info=True)
 
     try:
         _update_session_index(recording_name, timeline, session_tags)
