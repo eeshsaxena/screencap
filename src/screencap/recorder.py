@@ -480,6 +480,7 @@ def start_recording(
     intent_source: str = "flag",
     segmentation_mode: str = "llm",
     scrub_enabled: bool = True,
+    show_on_website: bool = True,
 ) -> tuple[Path, float, multiprocessing.Process | None, Path | None]:
     """Start a screen capture recording. Blocks until Ctrl+C."""
     if audio is None:
@@ -659,6 +660,12 @@ def start_recording(
         console.print("  [dim]Avoid displaying passwords, API keys, or personal information on screen.[/dim]")
         console.print()
 
+    if cloud_intent:
+        if show_on_website:
+            console.print("[dim]This recording will be visible on the website (use --unlisted to hide)[/dim]")
+        else:
+            console.print("[dim]This recording will not be visible on the website (change in screencap settings)[/dim]")
+
     try:
         from screencap.metrics import save_metrics
 
@@ -730,6 +737,7 @@ def start_recording(
             "version": 1,
             "destination": _destination,
             "privacy_mode": privacy_config.mode.value if privacy_config else "internal",
+            "show_on_website": show_on_website,
             "created_at": _dt.now(_tz.utc).isoformat(),
             "source": intent_source,
         }
@@ -832,6 +840,7 @@ def start_recording(
                     "stop_reason": "force",
                     "chunks_expected": len(list(capture_dir.glob("chunk_*_manifest.json"))),
                     "sentinel_id": str(__import__('uuid').uuid4()),
+                    "show_on_website": show_on_website,
                 }
                 (capture_dir / "recording_complete.json").write_text(
                     _json.dumps(_sentinel, indent=2)
@@ -927,6 +936,7 @@ def start_recording(
                             screen_filter=screen_filter,
                             segmentation_mode=segmentation_mode,
                             scrub_enabled=scrub_enabled,
+                            show_on_website=show_on_website,
                         )
                         chunk_processor.start()
                 except Exception as _chunk_init_err:
@@ -1129,6 +1139,7 @@ def start_recording(
                 _n_chunks = len(list(capture_dir.glob("chunk_*_manifest.json")))
                 _sentinel_data = _build_sentinel_data(
                     _recording_name, stop_reason="exception", chunks_expected=_n_chunks,
+                    show_on_website=show_on_website,
                 )
                 _sentinel_path = capture_dir / "recording_complete.json"
                 _sentinel_path.write_text(_json.dumps(_sentinel_data, indent=2))
@@ -1224,6 +1235,7 @@ def start_recording(
                         capture_dir, _recording_name,
                         stop_reason=_stop_reason or "graceful",
                         chunks_expected=_n_chunks,
+                        show_on_website=show_on_website,
                     )
                     if _sentinel_uploaded:
                         _raw_url = f"https://screencap.sh/?source=recordings&recording={_recording_name}#data"
