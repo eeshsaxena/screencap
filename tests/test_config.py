@@ -179,6 +179,76 @@ class TestDiskStopMb:
                 get_disk_stop_mb()
 
 
+# --- show_on_website config tests ---
+
+
+class TestShowOnWebsite:
+    """Tests for get_show_on_website()."""
+
+    def test_default_value(self):
+        import screencap.config as cfg
+        from screencap.config import get_show_on_website
+
+        env = {k: v for k, v in os.environ.items() if k != "SCREENCAP_SHOW_ON_WEBSITE"}
+        with mock.patch.dict(os.environ, env, clear=True):
+            cfg._config_cache = {}  # empty config — no show_on_website key
+            assert get_show_on_website() is True
+
+    def test_env_var_true(self):
+        from screencap.config import get_show_on_website
+
+        with mock.patch.dict(os.environ, {"SCREENCAP_SHOW_ON_WEBSITE": "1"}):
+            assert get_show_on_website() is True
+
+    def test_env_var_false(self):
+        from screencap.config import get_show_on_website
+
+        with mock.patch.dict(os.environ, {"SCREENCAP_SHOW_ON_WEBSITE": "false"}):
+            assert get_show_on_website() is False
+
+    def test_toml_value(self):
+        import screencap.config as cfg
+        from screencap.config import get_show_on_website
+
+        env = {k: v for k, v in os.environ.items() if k != "SCREENCAP_SHOW_ON_WEBSITE"}
+        with mock.patch.dict(os.environ, env, clear=True):
+            cfg._config_cache = {"show_on_website": False}
+            assert get_show_on_website() is False
+
+    def test_env_overrides_toml(self):
+        import screencap.config as cfg
+        from screencap.config import get_show_on_website
+
+        cfg._config_cache = {"show_on_website": False}
+        with mock.patch.dict(os.environ, {"SCREENCAP_SHOW_ON_WEBSITE": "yes"}):
+            assert get_show_on_website() is True
+
+    def test_env_var_no(self):
+        from screencap.config import get_show_on_website
+
+        with mock.patch.dict(os.environ, {"SCREENCAP_SHOW_ON_WEBSITE": "no"}):
+            assert get_show_on_website() is False
+
+
+# --- sentinel show_on_website tests ---
+
+
+class TestSentinelShowOnWebsite:
+    """Tests for show_on_website in _build_sentinel_data()."""
+
+    def test_default_true(self):
+        from screencap.chunk_processor import _build_sentinel_data
+
+        data = _build_sentinel_data("rec", "graceful", 1)
+        assert data["show_on_website"] is True
+
+    def test_explicit_false(self):
+        from screencap.chunk_processor import _build_sentinel_data
+
+        data = _build_sentinel_data("rec", "graceful", 1, show_on_website=False)
+        assert data["show_on_website"] is False
+
+
 # --- upload default config tests ---
 
 

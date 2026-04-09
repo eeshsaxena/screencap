@@ -230,6 +230,15 @@ def get_segmentation_mode() -> str:
     return val
 
 
+def get_show_on_website() -> bool:
+    """Return whether recordings should be visible on the website. Default True."""
+    env = os.environ.get("SCREENCAP_SHOW_ON_WEBSITE")
+    if env is not None:
+        return env.lower() in ("1", "true", "yes")
+    cfg = _load_toml()
+    return cfg.get("show_on_website", True)
+
+
 def get_upload_default() -> str:
     """Return default recording destination: 'local', 'cloud', 'both', or 'ask'.
 
