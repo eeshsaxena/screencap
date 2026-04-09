@@ -70,6 +70,32 @@ KEYSTROKE_CONTENT_FIELDS = frozenset({
 })
 
 
+# String values of actions that indicate exclusion from capture.
+# Used by the menu bar UI and override system which operate on string
+# action values across IPC boundaries.
+EXCLUDED_ACTION_VALUES = frozenset(a.value for a in KEYSTROKE_NULL_ACTIONS)
+
+
+def make_override_key(bundle_id: str, domain: str | None) -> str:
+    """Build a canonical override key for an app or browser tab.
+
+    Native apps: ``"com.microsoft.VSCode"``
+    Browser tabs: ``"com.google.Chrome::chase.com"``
+    """
+    return f"{bundle_id}::{domain}" if domain else bundle_id
+
+
+def resolve_override(
+    overrides: dict[str, str], bundle_id: str, domain: str | None,
+) -> str | None:
+    """Look up an override, falling back from domain-level to app-level."""
+    key = make_override_key(bundle_id, domain)
+    action = overrides.get(key)
+    if action is None and domain:
+        action = overrides.get(bundle_id)
+    return action
+
+
 @dataclass(frozen=True)
 class ActionDecision:
     """Result of a policy evaluation."""

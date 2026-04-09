@@ -460,6 +460,7 @@ def process_events(
             # Notify privacy filter of window change
             if screen_filter is not None:
                 try:
+                    screen_filter.poll_overrides()
                     screen_filter.on_window_event(event.data)
                 except Exception:
                     _drops["privacy_filter_error"] += 1
@@ -1420,11 +1421,12 @@ def read_window_events(
             _wid = str(window_data.get("window_id") or "")
             _title = window_data.get("title") or ""
             if _pid is not None:
-                # Invalidate cache on window change so we re-query the URL.
-                # Only invalidate on window_id change — title-only changes
-                # (e.g. Gmail unread count) don't change the URL.
-                if _wid != str(prev_window_data.get("window_id") or ""):
-                    invalidate_url_cache(_pid, _wid)
+                # Always invalidate the URL cache for browser windows.
+                # Tab switches keep the same window_id and sometimes
+                # the same kCGWindowName (Chrome returns empty name),
+                # so the only reliable way to detect tab changes is to
+                # re-query the address bar on every poll cycle (~5ms).
+                invalidate_url_cache(_pid, _wid)
                 window_data["browser_url"] = extract_browser_url(
                     _pid, _bundle, _wid, _title,
                 )
@@ -1443,9 +1445,7 @@ def read_window_events(
             #   File "...\env\lib\site-packages\loguru\_logger.py", line 1964, in _log
             #       for handler in core.handlers.values):
             #   RuntimeError: dictionary changed size during iteration
-            _window_data = window_data
-            _window_data.pop("state")
-            _window_data.pop("browser_url", None)
+            _window_data = {k: v for k, v in window_data.items() if k not in ("state", "browser_url")}
             logger.info(f"{_window_data=}")
         if window_data != prev_window_data:
             logger.debug("Queuing window event for writing")

@@ -121,6 +121,27 @@ def _is_tld_like(parent: str) -> bool:
 
 
 
+def extract_root_domain(domain: str) -> str:
+    """Collapse subdomains to the registrable root domain.
+
+    Uses ``_SLD_SUFFIXES`` for known second-level suffixes (co.uk, com.au, etc.).
+
+    Examples::
+
+        secure.chase.com     → chase.com
+        login.bank.co.uk     → bank.co.uk
+        a.b.c.example.com    → example.com
+        github.com           → github.com
+    """
+    parts = domain.lower().rstrip(".").split(".")
+    if len(parts) <= 2:
+        return ".".join(parts)
+    # Check for two-part TLD (e.g., co.uk)
+    if len(parts) >= 3 and parts[-2] in _SLD_SUFFIXES:
+        return ".".join(parts[-3:])
+    return ".".join(parts[-2:])
+
+
 def build_domain_index(
     ut1: dict[str, ContextClass] | None = None,
     supplement: dict[str, ContextClass] | None = None,

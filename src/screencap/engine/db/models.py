@@ -163,6 +163,7 @@ class WindowEvent(Base):
     app_bundle_id = sa.Column(sa.String)
     app_version = sa.Column(sa.String)
     browser_url = sa.Column(sa.String)
+    app_name = sa.Column(sa.String)
 
     recording = sa.orm.relationship("Recording", back_populates="window_events")
 

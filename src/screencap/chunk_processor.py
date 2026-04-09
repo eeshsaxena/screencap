@@ -565,6 +565,7 @@ class ChunkProcessor:
                 pf = build_privacy_filter(
                     privacy_mode=self._privacy_mode,
                     cloud_intent=True,
+                    capture_dir=self._capture_dir,
                 )
                 window_switches = [
                     filtered for ws in window_switches

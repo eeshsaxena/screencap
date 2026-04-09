@@ -32,9 +32,6 @@ from screencap.privacy.policy import (
     get_matrix_action,
 )
 
-
-
-
 # ---------------------------------------------------------------------------
 # Screenshot timestamp parsing
 # ---------------------------------------------------------------------------
@@ -376,6 +373,11 @@ BUNDLE_ID_MAP: dict[str, ContextClass] = {
     "com.sequel-pro.sequel-pro": ContextClass.ADMIN_CONSOLE,
     "com.tableplus.TablePlus": ContextClass.ADMIN_CONSOLE,
 }
+
+# Password manager bundle IDs — derived from BUNDLE_ID_MAP.
+PASSWORD_MANAGER_BUNDLES: frozenset[str] = frozenset(
+    bid for bid, cls in BUNDLE_ID_MAP.items() if cls == ContextClass.PASSWORD_MANAGER
+)
 
 # Known browser bundle IDs.
 BROWSER_BUNDLE_IDS: frozenset[str] = frozenset({
