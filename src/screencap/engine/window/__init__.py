@@ -47,6 +47,7 @@ def get_active_window_data(
     window_id = state["window_id"]
     window_data = {
         "title": title,
+        "app_name": state.get("app_name", ""),
         "left": left,
         "top": top,
         "width": width,

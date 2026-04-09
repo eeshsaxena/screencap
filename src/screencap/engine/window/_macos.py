@@ -92,8 +92,11 @@ def get_active_window_state(read_window_data: bool) -> dict | None:
     # Look up app bundle ID and version from the owning process.
     app_bundle_id, app_version = _get_app_version_info(meta["kCGWindowOwnerPID"])
 
+    app_name = str(meta.get("kCGWindowOwnerName", ""))
+
     rval = {
         "title": title,
+        "app_name": app_name,
         "left": left,
         "top": top,
         "width": width,
