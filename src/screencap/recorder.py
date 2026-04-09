@@ -12,6 +12,15 @@ import sys
 import threading
 import time
 import warnings
+
+# Suppress "leaked semaphore objects" warnings from the multiprocessing
+# resource_tracker subprocess.  These are cosmetic — the OS reclaims the
+# semaphores at process exit.  The env var is inherited by the tracker
+# subprocess before its warnings module is initialised.
+_pw = os.environ.get("PYTHONWARNINGS", "")
+_filter = "ignore::UserWarning:multiprocessing.resource_tracker"
+if _filter not in _pw:
+    os.environ["PYTHONWARNINGS"] = f"{_pw},{_filter}" if _pw else _filter
 from pathlib import Path
 
 from rich import box
@@ -414,7 +423,11 @@ def _check_macos_permissions() -> None:
 
 
 def _spawn_menubar(
-    recording_name: str, start_time: float, state_file: Path,
+    recording_name: str,
+    start_time: float,
+    state_file: Path,
+    window_feed_q: multiprocessing.Queue | None = None,
+    override_q: multiprocessing.Queue | None = None,
 ) -> multiprocessing.Process | None:
     """Spawn the menu bar status item as a daemon subprocess.
 
@@ -425,7 +438,8 @@ def _spawn_menubar(
 
     proc = multiprocessing.Process(
         target=_run_menubar,
-        args=(os.getpid(), recording_name, start_time, str(state_file)),
+        args=(os.getpid(), recording_name, start_time, str(state_file),
+              window_feed_q, override_q),
         daemon=True,
         name="menubar",
     )
@@ -596,6 +610,12 @@ def start_recording(
         )
         raise SystemExit(1)
 
+    # --- Menu bar IPC queues ---
+    # Created early so they can be passed to both the privacy filter
+    # (which feeds window events) and the menu bar subprocess.
+    _menubar_window_feed_q = multiprocessing.Queue()  # unbounded: recorder→menubar
+    _menubar_override_q = multiprocessing.Queue()      # unbounded: menubar→recorder
+
     # --- Privacy: capture-time enforcement ---
     # Cloud-intent recordings always use PUBLIC mode — this is stricter than
     # INTERNAL because PUBLIC triggers MASK_WINDOW for email/chat/calendar
@@ -606,6 +626,7 @@ def start_recording(
 
     screen_filter = None
     privacy_config = None
+    _override_file = capture_dir / ".menubar_overrides.json"
     try:
         from screencap.config import get_privacy_config
         from screencap.privacy.recorder_enforcement import RecorderPrivacyFilter
@@ -634,7 +655,13 @@ def start_recording(
                 "requires window data. Disabled because window data capture is off."
             )
         else:
-            screen_filter = RecorderPrivacyFilter(privacy_config, cloud_intent=cloud_intent)
+            screen_filter = RecorderPrivacyFilter(
+                privacy_config,
+                cloud_intent=cloud_intent,
+                window_feed_q=_menubar_window_feed_q,
+                override_q=_menubar_override_q,
+                override_file=_override_file,
+            )
             if verbose:
                 console.print(f"[dim]Privacy mode: {privacy_config.mode.value}[/dim]")
     except Exception as e:
@@ -956,7 +983,11 @@ def start_recording(
             # Spawn menu bar status item (non-blocking, best-effort)
             try:
                 _menubar_state_file = capture_dir / ".menubar_state"
-                _menubar_proc = _spawn_menubar(name, t0, _menubar_state_file)
+                _menubar_proc = _spawn_menubar(
+                    name, t0, _menubar_state_file,
+                    window_feed_q=_menubar_window_feed_q,
+                    override_q=_menubar_override_q,
+                )
                 console.print(
                     "  [#f472b6]●[/#f472b6] [dim]Menu bar active — "
                     "click the [#f472b6]red dot[/#f472b6] in your menu bar to stop[/dim]"
@@ -1052,6 +1083,13 @@ def start_recording(
                         live.update(Text("  ⚡ Force quitting — terminating processes...", style="#f472b6"))
                     else:
                         live.update(Text(""))
+
+                    # Drain pending menu bar overrides before final flush
+                    if screen_filter is not None:
+                        try:
+                            screen_filter.poll_overrides()
+                        except Exception:
+                            pass
 
                     if _menubar_state_file is not None:
                         try:
