@@ -50,7 +50,9 @@ This is deferred because:
 
 from __future__ import annotations
 
+import json
 import logging
+import queue as _queue_mod
 import threading
 import time
 from collections.abc import Callable
@@ -61,15 +63,17 @@ from screencap.privacy.actions import (
     KEYSTROKE_CONTENT_FIELDS,
     KEYSTROKE_NULL_ACTIONS,
     VIDEO_BLOCK_ACTIONS,
+    PrivacyAction,
+    resolve_override,
 )
 from screencap.privacy.context import DefaultContextClassifier, domain_from_url
+from screencap.privacy.domain_loader import extract_root_domain
 from screencap.privacy.policy import (
     DEFAULT_TRANSITION_HOLD_SECONDS,
     DefaultPolicyEvaluator,
     FrameMetadata,
     PrivacyConfig,
 )
-from screencap.privacy.reasons import ReasonCode
 
 logger = logging.getLogger(__name__)
 
@@ -158,6 +162,9 @@ class RecorderPrivacyFilter:
         transition_hold_seconds: float = DEFAULT_TRANSITION_HOLD_SECONDS,
         secure_input_fn: Callable[[], bool] | None = _UNSET,
         cloud_intent: bool = False,
+        window_feed_q=None,
+        override_q=None,
+        override_file=None,
     ) -> None:
         self._evaluator = DefaultPolicyEvaluator(config)
         self._classifier = DefaultContextClassifier(
@@ -184,6 +191,12 @@ class RecorderPrivacyFilter:
         # Blocked interval tracking (for cloud-intent manifest metadata)
         self._blocked_intervals: list[dict] = []
         self._current_block_start: float | None = None
+
+        # Menu bar IPC
+        self._window_feed_q = window_feed_q
+        self._override_q = override_q
+        self._override_file = override_file
+        self._runtime_overrides: dict[str, str] = {}
 
         # Secure Input detection (Layer 0)
         if secure_input_fn is _UNSET:
@@ -221,17 +234,28 @@ class RecorderPrivacyFilter:
             domain = domain_from_url(browser_url)
             logger.debug("Domain from browser_url: %s", domain)
 
-        meta = FrameMetadata(
-            bundle_id=bundle_id,
-            window_title=title,
-            domain=domain,
-            timestamp=time.monotonic(),
-            browser_url=browser_url,
-        )
-        ctx = self._classifier.classify(meta)
-        decision = self._evaluator.evaluate(ctx, meta)
+        # Check runtime overrides (user toggles from menu bar)
+        override_action_str = None
+        if self._runtime_overrides:
+            override_domain = extract_root_domain(domain) if domain else None
+            with self._lock:
+                override_action_str = resolve_override(
+                    self._runtime_overrides, bundle_id, override_domain,
+                )
 
-        effective_action = decision.action
+        if override_action_str is not None:
+            effective_action = PrivacyAction(override_action_str)
+        else:
+            meta = FrameMetadata(
+                bundle_id=bundle_id,
+                window_title=title,
+                domain=domain,
+                timestamp=time.monotonic(),
+                browser_url=browser_url,
+            )
+            ctx = self._classifier.classify(meta)
+            decision = self._evaluator.evaluate(ctx, meta)
+            effective_action = decision.action
         now_blocked = effective_action in self._block_actions
         # Whether keystrokes/video need blocking (wider than screenshot blocking)
         now_keystroke_blocked = effective_action in self._keystroke_null_actions
@@ -270,6 +294,48 @@ class RecorderPrivacyFilter:
 
             self._current_bundle_id = bundle_id
             self._current_title = title
+
+        # Feed window event summary to menu bar (non-blocking, best-effort)
+        if self._window_feed_q is not None:
+            try:
+                display_domain = extract_root_domain(domain) if domain else None
+                self._window_feed_q.put_nowait({
+                    "app_name": window_data.get("app_name") or "",
+                    "bundle_id": bundle_id,
+                    "domain": display_domain,
+                    "action": effective_action.value,
+                    "ts": time.time(),
+                })
+            except Exception:
+                pass  # Menu bar feed is non-critical
+
+    def poll_overrides(self) -> None:
+        """Drain the override queue from the menu bar (non-blocking).
+
+        Called from ``process_events()`` on each window event and during
+        recorder shutdown to ensure all user toggles are applied.
+        """
+        if self._override_q is None:
+            return
+        changed = False
+        while True:
+            try:
+                override = self._override_q.get_nowait()
+            except (_queue_mod.Empty, OSError):
+                break
+            key = override["key"]
+            action = override["action"]
+            with self._lock:
+                self._runtime_overrides[key] = action
+            changed = True
+        # Batch-write once after draining all pending overrides
+        if changed and self._override_file is not None:
+            try:
+                self._override_file.write_text(
+                    json.dumps(self._runtime_overrides, indent=2)
+                )
+            except Exception:
+                pass
 
     def on_action_event(self, action_data: dict) -> None:
         """Check action event for AXSecureTextField (Layer 1).
@@ -484,12 +550,13 @@ class RecorderPrivacyFilter:
                 _apply_mask_to_image,
                 window_regions_from_geometry,
             )
-            from screencap.privacy.policy import PrivacyConfig, PrivacyMode
+            from screencap.privacy.policy import PrivacyMode
 
             # Force public mode for cloud masking so CHAT/EMAIL/etc. get
             # MASK_WINDOW instead of TEXT_REDACT (which can't mask pixels).
             if not hasattr(self, "_masking_evaluator"):
                 from dataclasses import replace as _dc_replace
+
                 from screencap.privacy.policy import DefaultPolicyEvaluator
                 _cloud_config = _dc_replace(
                     self._evaluator.config, mode=PrivacyMode.PUBLIC,

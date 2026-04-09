@@ -460,6 +460,7 @@ def process_events(
             # Notify privacy filter of window change
             if screen_filter is not None:
                 try:
+                    screen_filter.poll_overrides()
                     screen_filter.on_window_event(event.data)
                 except Exception:
                     _drops["privacy_filter_error"] += 1
