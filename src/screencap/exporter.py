@@ -111,12 +111,15 @@ def _write_events(
 def build_privacy_filter(
     privacy_mode: str = "internal",
     cloud_intent: bool = False,
+    capture_dir=None,
 ):
     """Build a privacy filter callback for window.switch events.
 
     Args:
         privacy_mode: Privacy mode string (public/shared/internal).
         cloud_intent: Whether this export is destined for cloud upload.
+        capture_dir: Path to the capture directory (for loading menu bar
+            overrides from ``.menubar_overrides.json``).
 
     Returns:
         Callable that takes a WindowSwitchEvent and returns the event
@@ -153,10 +156,40 @@ def build_privacy_filter(
     classifier = DefaultContextClassifier(app_classes=privacy_cfg.app_classes)
     evaluator = DefaultPolicyEvaluator(privacy_cfg)
 
+    # Load session overrides from menu bar toggles
+    runtime_overrides: dict[str, str] = {}
+    if capture_dir is not None:
+        from pathlib import Path
+
+        override_path = Path(capture_dir) / ".menubar_overrides.json"
+        if override_path.exists():
+            import json
+
+            try:
+                runtime_overrides = json.loads(override_path.read_text())
+            except Exception:
+                logger.debug("Could not load menu bar overrides")
+
     def _filter(event):
         from screencap.privacy.policy import FrameMetadata
 
         bundle_id = event.app_bundle_id or ""
+
+        # Check runtime overrides first (user toggles from menu bar)
+        if runtime_overrides:
+            from screencap.privacy.actions import resolve_override
+            from screencap.privacy.domain_loader import extract_root_domain
+
+            domain = getattr(event, "domain", None)
+            root_domain = extract_root_domain(domain) if domain else None
+            override_action = resolve_override(
+                runtime_overrides, bundle_id, root_domain,
+            )
+            if override_action == "exclude":
+                return None
+            if override_action == "allow":
+                return event
+
         metadata = FrameMetadata(
             bundle_id=bundle_id,
             window_title=event.window_title,
