@@ -401,6 +401,18 @@ def process_events(
             started = True
         logger.trace(f"{event=}")
         assert event.type in EVENT_TYPES, event
+        # Drain the override queue on EVERY event (not just window
+        # events) so a menubar Disable toggle takes effect within one
+        # event cycle even when the user stays on the same tab. The
+        # filter re-evaluates its cached window state internally when a
+        # new override is drained, updating the blocked state on the
+        # spot.
+        if screen_filter is not None:
+            try:
+                screen_filter.poll_overrides()
+            except Exception:
+                _drops["privacy_filter_error"] += 1
+                screen_filter.fail_closed()
         if prev_event is not None:
             try:
                 assert event.timestamp > prev_event.timestamp, (
@@ -457,10 +469,11 @@ def process_events(
                     _end_blocked_interval_if_active(event.timestamp)
         elif event.type == "window":
             prev_window_event = event
-            # Notify privacy filter of window change
+            # Notify privacy filter of window change. poll_overrides
+            # already ran at the top of the loop, so on_window_event
+            # will see any pending overrides.
             if screen_filter is not None:
                 try:
-                    screen_filter.poll_overrides()
                     screen_filter.on_window_event(event.data)
                 except Exception:
                     _drops["privacy_filter_error"] += 1
