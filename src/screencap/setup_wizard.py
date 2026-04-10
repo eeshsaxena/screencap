@@ -9,9 +9,7 @@ non-privacy sections and comments via tomlkit.
 
 from __future__ import annotations
 
-import os
 import sys
-import tempfile
 from pathlib import Path
 
 import click
@@ -27,6 +25,7 @@ from screencap.app_discovery import (
     discover_installed_apps,
     is_background_app,
 )
+from screencap.config import save_config_atomic
 from screencap.privacy.context import BUNDLE_ID_MAP
 from screencap.privacy.policy import ContextClass, PrivacyMode
 
@@ -171,24 +170,12 @@ def _load_config_toml(config_path: Path) -> tomlkit.TOMLDocument:
 
 
 def _save_config_atomic(config_path: Path, doc: tomlkit.TOMLDocument) -> None:
-    """Write config atomically via temp file + rename."""
-    config_path.parent.mkdir(parents=True, exist_ok=True)
-    fd, tmp_path = tempfile.mkstemp(
-        dir=str(config_path.parent),
-        suffix=".toml.tmp",
-    )
-    closed = False
-    try:
-        os.write(fd, tomlkit.dumps(doc).encode())
-        os.close(fd)
-        closed = True
-        os.rename(tmp_path, str(config_path))
-    except Exception:
-        if not closed:
-            os.close(fd)
-        if os.path.exists(tmp_path):
-            os.unlink(tmp_path)
-        raise
+    """Write config atomically via temp file + rename.
+
+    Thin wrapper around ``screencap.config.save_config_atomic`` — kept here
+    for backward compatibility with existing imports in cli.py and tests.
+    """
+    save_config_atomic(config_path, doc)
 
 
 def _build_save_doc(
