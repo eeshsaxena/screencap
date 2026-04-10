@@ -4,12 +4,17 @@ from __future__ import annotations
 
 import os
 import sys
+import tempfile
 from pathlib import Path
+from typing import TYPE_CHECKING
 
 if sys.version_info >= (3, 11):
     import tomllib
 else:
     import tomli as tomllib
+
+if TYPE_CHECKING:
+    import tomlkit
 
 _DEFAULT_BASE = Path.home() / ".screencap"
 _DEFAULT_RECORDINGS = _DEFAULT_BASE / "recordings"
@@ -35,6 +40,36 @@ def invalidate_config_cache() -> None:
     """Reset the config cache so the next read re-loads from disk."""
     global _config_cache
     _config_cache = None
+
+
+def save_config_atomic(
+    config_path: Path, doc: "tomlkit.TOMLDocument",
+) -> None:
+    """Write a tomlkit document atomically (tempfile + os.rename).
+
+    Single source of truth for atomic config writes — used by both the
+    setup wizard and the runtime privacy persistence layer. Preserves
+    comments and formatting via tomlkit.
+    """
+    import tomlkit  # local import — keeps `screencap --help` fast
+
+    config_path.parent.mkdir(parents=True, exist_ok=True)
+    fd, tmp_path = tempfile.mkstemp(
+        dir=str(config_path.parent),
+        suffix=".toml.tmp",
+    )
+    closed = False
+    try:
+        os.write(fd, tomlkit.dumps(doc).encode())
+        os.close(fd)
+        closed = True
+        os.rename(tmp_path, str(config_path))
+    except Exception:
+        if not closed:
+            os.close(fd)
+        if os.path.exists(tmp_path):
+            os.unlink(tmp_path)
+        raise
 
 
 def get_recordings_dir() -> Path:
@@ -278,6 +313,24 @@ def get_privacy_config():
     from screencap.privacy.policy import parse_privacy_config
 
     return parse_privacy_config(_load_toml())
+
+
+def get_first_seen_prompt_enabled() -> bool:
+    """Return whether the first-seen privacy prompt is enabled. Default True.
+
+    Reads ``[menubar].first_seen_prompt`` from config.toml.
+    Env var ``SCREENCAP_FIRST_SEEN_PROMPT`` overrides the config.
+    """
+    env = os.environ.get("SCREENCAP_FIRST_SEEN_PROMPT")
+    if env is not None:
+        return env.lower() in ("1", "true", "yes")
+    cfg = _load_toml()
+    section = cfg.get("menubar", {})
+    if isinstance(section, dict):
+        val = section.get("first_seen_prompt", True)
+        if isinstance(val, bool):
+            return val
+    return True
 
 
 def resolve_recording_dir(name: str) -> Path:

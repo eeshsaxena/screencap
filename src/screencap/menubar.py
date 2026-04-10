@@ -8,6 +8,11 @@ bar.  The dropdown contains a labelled editable recording name, elapsed time,
 a live list of detected apps/browser tabs with inclusion/exclusion toggles,
 and a "Stop Recording" button.  It communicates with the parent process via a
 state file, a window feed queue, and an override queue.
+
+When ``prompt_enabled`` is True, the subprocess also shows a transient
+non-activating NSPanel the first time a never-before-seen ``(app, domain)``
+pair becomes the frontmost window during a recording. The panel offers
+"Always disable", "Disable for this recording", and "Keep recording".
 """
 
 from __future__ import annotations
@@ -18,11 +23,31 @@ import queue as _queue_mod
 import signal
 import sys
 import time
+from collections import deque
+from dataclasses import dataclass, field
 from pathlib import Path
 
 from screencap.pidfile import _is_screencap_process
 from screencap.privacy.actions import EXCLUDED_ACTION_VALUES, make_override_key
 from screencap.privacy.context import PASSWORD_MANAGER_BUNDLES
+
+# Debug log — written by the menubar subprocess so we can post-mortem
+# what the prompt path saw. Disabled by default; set
+# SCREENCAP_MENUBAR_DEBUG=1 to enable.
+_DEBUG_LOG_PATH = Path.home() / ".screencap" / "menubar_debug.log"
+
+
+def _dlog(msg: str) -> None:
+    """Append a debug line to ``~/.screencap/menubar_debug.log`` if enabled."""
+    if not os.environ.get("SCREENCAP_MENUBAR_DEBUG"):
+        return
+    try:
+        _DEBUG_LOG_PATH.parent.mkdir(parents=True, exist_ok=True)
+        with open(_DEBUG_LOG_PATH, "a") as f:
+            f.write(f"[{time.time():.3f}] [pid={os.getpid()}] {msg}\n")
+    except Exception:
+        pass
+
 
 # Animation / timing constants
 _PULSE_FRAMES = 20        # frames per breathing cycle
@@ -32,10 +57,118 @@ _TIME_UPDATE_MOD = 6       # timer text every 6 ticks → ~0.5 s
 _STOP_ESCALATE_S = 8       # seconds before SIGTERM → SIGKILL
 _MAX_DRAIN_PER_TICK = 20   # max window events to drain per slow tick
 
+# Prompt timing / queue caps
+_PROMPT_AUTO_DISMISS_S = 10.0    # seconds before auto-dismiss = "Keep recording"
+_PROMPT_MAX_PENDING = 3          # FIFO depth; older entries dropped on overflow
+
 # State file protocol (shared with recorder.py / cli.py)
 STATE_PROCESSING = "processing"
 STATE_DONE = "done"
 RENAME_FILENAME = ".menubar_rename"
+
+
+# ---------------------------------------------------------------------------
+# PromptState — pure-Python state machine for the first-seen prompt queue
+# ---------------------------------------------------------------------------
+
+
+@dataclass(frozen=True)
+class PromptDecision:
+    """A queued first-seen prompt waiting to be shown to the user."""
+
+    bundle_id: str
+    domain: str | None
+    app_name: str
+
+    @property
+    def key(self) -> str:
+        return make_override_key(self.bundle_id, self.domain)
+
+
+@dataclass
+class PromptState:
+    """Pure-Python queue + dedup state for first-seen prompts.
+
+    Decoupled from AppKit so it can be unit-tested without an
+    NSApplication. The menubar delegate owns one instance and calls
+    :meth:`should_prompt` from the window-event drain loop, then
+    :meth:`enqueue` if the prompt is warranted, then :meth:`pop_next`
+    when the panel slot opens up.
+    """
+
+    max_pending: int = _PROMPT_MAX_PENDING
+    _prompted: set[str] = field(default_factory=set)
+    _pending: deque[PromptDecision] = field(default_factory=deque)
+
+    def should_prompt(
+        self,
+        bundle_id: str,
+        domain: str | None,
+        action: str,
+        is_password_manager: bool,
+        is_browser_header: bool,
+    ) -> bool:
+        """Decide whether a first-seen window event warrants a prompt.
+
+        Skips:
+        - Empty bundle IDs (defensive)
+        - Password managers (already protected by the matrix EXCLUDE)
+        - Browser-name headers (only the per-domain entries are useful)
+        - Apps the policy already excludes (in EXCLUDED_ACTION_VALUES)
+        - Keys already prompted in this session
+        """
+        if not bundle_id:
+            return False
+        if is_password_manager:
+            return False
+        if is_browser_header:
+            return False
+        if action in EXCLUDED_ACTION_VALUES:
+            return False
+        key = make_override_key(bundle_id, domain)
+        if key in self._prompted:
+            return False
+        return True
+
+    def enqueue(self, decision: PromptDecision) -> None:
+        """Queue a prompt and mark its key as prompted (so we don't re-add).
+
+        On overflow (more than ``max_pending`` queued), drops the oldest
+        entry — the user has clearly switched apps too fast for the
+        prompt to be useful for early entries.
+        """
+        self._prompted.add(decision.key)
+        self._pending.append(decision)
+        while len(self._pending) > self.max_pending:
+            self._pending.popleft()
+
+    def pop_next(
+        self, current_frontmost_key: str | None = None,
+    ) -> PromptDecision | None:
+        """Return the next prompt to show, dropping stale entries.
+
+        A queued prompt is "stale" if its key is no longer the frontmost
+        window key — the user has already moved on, so prompting now
+        would be confusing. Stale entries are silently discarded.
+
+        Returns ``None`` if the queue is empty (after dropping stale).
+        """
+        while self._pending:
+            decision = self._pending.popleft()
+            if (
+                current_frontmost_key is not None
+                and decision.key != current_frontmost_key
+            ):
+                # Stale — user moved on. Drop and try the next entry.
+                continue
+            return decision
+        return None
+
+    def has_pending(self) -> bool:
+        return bool(self._pending)
+
+    def already_prompted(self, key: str) -> bool:
+        return key in self._prompted
 
 
 def _run_menubar(
@@ -45,8 +178,16 @@ def _run_menubar(
     state_file: str,
     window_feed_q=None,
     override_q=None,
+    prompt_enabled: bool = True,
 ) -> None:
     """Main entry point — must run on the main thread of the subprocess."""
+    _dlog(
+        f"_run_menubar START: parent_pid={parent_pid} name={recording_name!r} "
+        f"prompt_enabled={prompt_enabled} "
+        f"window_feed_q={window_feed_q is not None} "
+        f"override_q={override_q is not None}"
+    )
+
     # Reset inherited signal handlers from parent recorder process
     signal.signal(signal.SIGINT, signal.SIG_DFL)
     signal.signal(signal.SIGTERM, signal.SIG_DFL)
@@ -56,6 +197,9 @@ def _run_menubar(
             NSApplication,
             NSApplicationActivationPolicyAccessory,
             NSAttributedString,
+            NSBackingStoreBuffered,
+            NSBezelStyleRounded,
+            NSButton,
             NSColor,
             NSFont,
             NSFontAttributeName,
@@ -64,15 +208,27 @@ def _run_menubar(
             NSMenu,
             NSMenuItem,
             NSObject,
+            NSPanel,
+            NSScreen,
             NSStatusBar,
+            NSStatusWindowLevel,
             NSTextField,
             NSTextFieldSquareBezel,
             NSTimer,
             NSVariableStatusItemLength,
+            NSWindowStyleMaskClosable,
+            NSWindowStyleMaskNonactivatingPanel,
+            NSWindowStyleMaskTitled,
+            NSWindowStyleMaskUtilityWindow,
         )
-        from Foundation import NSMakeRect, NSMutableAttributedString
+        from Foundation import (
+            NSMakePoint,
+            NSMakeRect,
+            NSMutableAttributedString,
+        )
         from objc import super as objc_super  # noqa: A004
-    except ImportError:
+    except ImportError as exc:
+        _dlog(f"_run_menubar: AppKit ImportError: {exc!r} — exiting")
         return  # AppKit unavailable — exit silently
 
     _state_path = Path(state_file)
@@ -177,6 +333,14 @@ def _run_menubar(
             # Menu bar IPC
             self._window_feed_q = window_feed_q
             self._override_q = override_q
+
+            # First-seen prompt state
+            self._prompt_enabled = prompt_enabled
+            self._prompt_state = PromptState()
+            self._active_panel = None
+            self._active_panel_decision = None
+            self._prompt_dismiss_timer = None
+            self._current_frontmost_key = None
 
             # App/tab list state
             # key → {app_name, bundle_id, domain, action, label, menu_item,
@@ -302,7 +466,13 @@ def _run_menubar(
             app_name = evt.get("app_name", "") or bundle_id.rsplit(".", 1)[-1]
             action = evt.get("action", "allow")
 
+            _dlog(
+                f"window_evt: bundle={bundle_id!r} domain={domain!r} "
+                f"app={app_name!r} action={action!r}"
+            )
+
             if not bundle_id:
+                _dlog("  → skipped (empty bundle_id)")
                 return
 
             key = make_override_key(bundle_id, domain)
@@ -375,8 +545,47 @@ def _run_menubar(
                 }
                 self._item_order.append(key)
 
-            # Track whether the currently active app is excluded (for dot color)
+                # CRITICAL: update _current_frontmost_key BEFORE the prompt
+                # logic. _maybe_show_next_prompt's pop_next() uses this for
+                # the staleness check; if we don't update first, the
+                # just-enqueued decision is compared against the *previous*
+                # event's key and silently dropped as stale.
+                self._current_frontmost_key = key
+
+                # First-seen prompt: ask the user whether to disable
+                # recording for this app/site. Only fires for genuinely
+                # new keys (this branch is the dedup gate).
+                _dlog(
+                    f"  first_seen branch for key={key!r}; "
+                    f"prompt_enabled={self._prompt_enabled} is_pw={is_pw}"
+                )
+                if self._prompt_enabled:
+                    decided = self._prompt_state.should_prompt(
+                        bundle_id, domain, action,
+                        is_password_manager=is_pw,
+                        is_browser_header=False,
+                    )
+                    _dlog(f"  should_prompt returned {decided}")
+                    if decided:
+                        self._prompt_state.enqueue(PromptDecision(
+                            bundle_id=bundle_id, domain=domain, app_name=app_name,
+                        ))
+                        _dlog(
+                            f"  enqueued; calling _maybe_show_next_prompt "
+                            f"(active_panel={self._active_panel is not None})"
+                        )
+                        try:
+                            self._maybe_show_next_prompt()
+                        except Exception as exc:  # noqa: BLE001
+                            _dlog(f"  EXCEPTION in _maybe_show_next_prompt: {exc!r}")
+
+            # Track whether the currently active app is excluded (for dot color).
+            # Note: _current_frontmost_key was already set above (in the
+            # first-seen branch) or stays at its previous value (in the
+            # already-seen branch — which is also correct because the user
+            # is on the same app).
             self._is_active_excluded = action in EXCLUDED_ACTION_VALUES
+            self._current_frontmost_key = key
 
         def _add_browser_header(self, bundle_id, app_name):
             """Add a non-clickable browser name header."""
@@ -431,6 +640,8 @@ def _run_menubar(
                         break
                     self._process_window_event(evt)
                     drained += 1
+                if drained > 0:
+                    _dlog(f"tick: drained {drained} window event(s)")
 
             # ---- Pulse animation (every tick) ----
             if not self._is_processing:
@@ -520,6 +731,220 @@ def _run_menubar(
                 except Exception:
                     pass
 
+        # ---- First-seen prompt ----
+
+        def _maybe_show_next_prompt(self):
+            """Pop the next pending prompt and show it as a non-activating panel.
+
+            No-op if a panel is already visible (one at a time) or the
+            queue is empty / all entries are stale.
+            """
+            _dlog(
+                f"_maybe_show_next_prompt: active_panel="
+                f"{self._active_panel is not None} "
+                f"frontmost_key={self._current_frontmost_key!r}"
+            )
+            if self._active_panel is not None:
+                _dlog("  → already showing a panel, skip")
+                return
+            decision = self._prompt_state.pop_next(self._current_frontmost_key)
+            _dlog(f"  pop_next returned: {decision!r}")
+            if decision is None:
+                return
+            _dlog(f"  building NSPanel for {decision.bundle_id!r}")
+
+            # Build the panel content
+            panel_w, panel_h = 340, 170
+            panel = NSPanel.alloc().initWithContentRect_styleMask_backing_defer_(
+                NSMakeRect(0, 0, panel_w, panel_h),
+                NSWindowStyleMaskNonactivatingPanel
+                | NSWindowStyleMaskTitled
+                | NSWindowStyleMaskClosable
+                | NSWindowStyleMaskUtilityWindow,
+                NSBackingStoreBuffered,
+                False,
+            )
+            panel.setLevel_(NSStatusWindowLevel)
+            panel.setHidesOnDeactivate_(False)
+            panel.setReleasedWhenClosed_(False)
+            panel.setTitle_("ScreenCap")
+            panel.setFloatingPanel_(True)
+            panel.setBecomesKeyOnlyIfNeeded_(True)
+
+            content = panel.contentView()
+
+            # Header label
+            header = NSTextField.alloc().initWithFrame_(
+                NSMakeRect(16, panel_h - 38, panel_w - 32, 20),
+            )
+            header.setStringValue_("New app/website detected during recording")
+            header.setBezeled_(False)
+            header.setDrawsBackground_(False)
+            header.setEditable_(False)
+            header.setSelectable_(False)
+            header.setFont_(NSFont.boldSystemFontOfSize_(13.0))
+            content.addSubview_(header)
+
+            # Detail label — app name (and domain if browser tab)
+            if decision.domain:
+                detail_text = (
+                    f"{decision.domain}  ({decision.app_name})"
+                )
+            else:
+                detail_text = (
+                    f"{decision.app_name}  ({decision.bundle_id})"
+                )
+            detail = NSTextField.alloc().initWithFrame_(
+                NSMakeRect(16, panel_h - 64, panel_w - 32, 20),
+            )
+            detail.setStringValue_(detail_text)
+            detail.setBezeled_(False)
+            detail.setDrawsBackground_(False)
+            detail.setEditable_(False)
+            detail.setSelectable_(False)
+            detail.setFont_(NSFont.systemFontOfSize_(12.0))
+            detail.cell().setLineBreakMode_(NSLineBreakByTruncatingTail)
+            content.addSubview_(detail)
+
+            # Buttons — stacked vertically, "Keep recording" at bottom (default)
+            btn_w, btn_h = panel_w - 32, 28
+            y_top = 16 + btn_h * 2 + 8
+            y_mid = 16 + btn_h + 4
+            y_bot = 16
+
+            always_btn = NSButton.alloc().initWithFrame_(
+                NSMakeRect(16, y_top, btn_w, btn_h),
+            )
+            always_btn.setTitle_("Always disable")
+            always_btn.setBezelStyle_(NSBezelStyleRounded)
+            always_btn.setTarget_(self)
+            always_btn.setAction_("promptDisableAlways:")
+            content.addSubview_(always_btn)
+
+            once_btn = NSButton.alloc().initWithFrame_(
+                NSMakeRect(16, y_mid, btn_w, btn_h),
+            )
+            once_btn.setTitle_("Disable for this recording")
+            once_btn.setBezelStyle_(NSBezelStyleRounded)
+            once_btn.setTarget_(self)
+            once_btn.setAction_("promptDisableOnce:")
+            content.addSubview_(once_btn)
+
+            keep_btn = NSButton.alloc().initWithFrame_(
+                NSMakeRect(16, y_bot, btn_w, btn_h),
+            )
+            keep_btn.setTitle_("Keep recording")
+            keep_btn.setBezelStyle_(NSBezelStyleRounded)
+            keep_btn.setTarget_(self)
+            keep_btn.setAction_("promptKeep:")
+            keep_btn.setKeyEquivalent_("\r")  # Return = default action
+            content.addSubview_(keep_btn)
+
+            # Position near the menu bar status item, top-right of screen
+            try:
+                screen_frame = NSScreen.mainScreen().visibleFrame()
+                x = (
+                    screen_frame.origin.x
+                    + screen_frame.size.width
+                    - panel_w - 12
+                )
+                y = (
+                    screen_frame.origin.y
+                    + screen_frame.size.height
+                    - panel_h - 12
+                )
+                panel.setFrameOrigin_(NSMakePoint(x, y))
+            except Exception:
+                pass  # Use default position on positioning failure
+
+            self._active_panel = panel
+            self._active_panel_decision = decision
+
+            panel.orderFrontRegardless()
+            _dlog(
+                f"  orderFrontRegardless called; isVisible="
+                f"{bool(panel.isVisible())} isOnActiveSpace="
+                f"{bool(panel.isOnActiveSpace())}"
+            )
+
+            # Auto-dismiss after _PROMPT_AUTO_DISMISS_S = "Keep recording"
+            self._prompt_dismiss_timer = (
+                NSTimer.scheduledTimerWithTimeInterval_target_selector_userInfo_repeats_(
+                    _PROMPT_AUTO_DISMISS_S, self, "promptAutoDismiss:",
+                    None, False,
+                )
+            )
+
+        def _send_disable_override(self):
+            """Push an exclude override for the active panel's decision.
+
+            Mirrors ``toggleApp_``: writes to override_q and updates the
+            existing menu list mark immediately.
+            """
+            d = self._active_panel_decision
+            if d is None or self._override_q is None:
+                return
+            key = make_override_key(d.bundle_id, d.domain)
+            try:
+                self._override_q.put_nowait({
+                    "key": key,
+                    "bundle_id": d.bundle_id,
+                    "domain": d.domain,
+                    "action": "exclude",
+                })
+            except Exception:
+                return
+            # Reflect in the existing menu item, if present
+            info = self._detected_items.get(key)
+            if info is not None and not info.get("is_password_manager") \
+                    and not info.get("is_header"):
+                info["action"] = "exclude"
+                info["user_toggled"] = True
+                self._update_item_title(info)
+
+        def _dismiss_active_panel(self):
+            """Tear down the visible panel (if any) and show the next one."""
+            if self._prompt_dismiss_timer is not None:
+                try:
+                    self._prompt_dismiss_timer.invalidate()
+                except Exception:
+                    pass
+                self._prompt_dismiss_timer = None
+            if self._active_panel is not None:
+                try:
+                    self._active_panel.orderOut_(None)
+                except Exception:
+                    pass
+                self._active_panel = None
+                self._active_panel_decision = None
+            # Show the next queued prompt, if any
+            self._maybe_show_next_prompt()
+
+        def promptKeep_(self, sender):
+            """User chose to keep recording — no override, no persist."""
+            self._dismiss_active_panel()
+
+        def promptDisableOnce_(self, sender):
+            """User chose to disable for this recording only."""
+            self._send_disable_override()
+            self._dismiss_active_panel()
+
+        def promptDisableAlways_(self, sender):
+            """User chose to disable AND persist to ~/.screencap/config.toml."""
+            d = self._active_panel_decision
+            self._send_disable_override()
+            if d is not None:
+                try:
+                    from screencap.privacy.persistence import persist_disable
+                    persist_disable(d.bundle_id, d.domain)
+                except Exception:
+                    pass  # Best-effort; per-recording override still applied
+            self._dismiss_active_panel()
+
+        def promptAutoDismiss_(self, timer):
+            """NSTimer callback — equivalent to "Keep recording"."""
+            self._dismiss_active_panel()
+
         def stopRecording_(self, sender):
             """Send SIGTERM to parent; escalates to SIGKILL after timeout."""
             try:
@@ -530,6 +955,12 @@ def _run_menubar(
                 pass
 
         def _cleanup(self):
+            # Dismiss any visible prompt panel before tearing down AppKit
+            if self._active_panel is not None or self._prompt_dismiss_timer is not None:
+                try:
+                    self._dismiss_active_panel()
+                except Exception:
+                    pass
             NSStatusBar.systemStatusBar().removeStatusItem_(self._status_item)
             if self._timer:
                 self._timer.invalidate()

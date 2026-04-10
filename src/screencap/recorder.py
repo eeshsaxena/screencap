@@ -428,18 +428,24 @@ def _spawn_menubar(
     state_file: Path,
     window_feed_q: multiprocessing.Queue | None = None,
     override_q: multiprocessing.Queue | None = None,
+    prompt_enabled: bool = True,
 ) -> multiprocessing.Process | None:
     """Spawn the menu bar status item as a daemon subprocess.
 
     Returns the Process object on success, or None if spawn fails.
     The process is daemonic so it is killed when the parent exits.
+
+    Args:
+        prompt_enabled: When True, the menubar shows a non-activating
+            NSPanel the first time a never-seen ``(app, domain)`` pair
+            becomes the frontmost window during the recording.
     """
     from screencap.menubar import _run_menubar
 
     proc = multiprocessing.Process(
         target=_run_menubar,
         args=(os.getpid(), recording_name, start_time, str(state_file),
-              window_feed_q, override_q),
+              window_feed_q, override_q, prompt_enabled),
         daemon=True,
         name="menubar",
     )
@@ -982,11 +988,13 @@ def start_recording(
 
             # Spawn menu bar status item (non-blocking, best-effort)
             try:
+                from screencap.config import get_first_seen_prompt_enabled
                 _menubar_state_file = capture_dir / ".menubar_state"
                 _menubar_proc = _spawn_menubar(
                     name, t0, _menubar_state_file,
                     window_feed_q=_menubar_window_feed_q,
                     override_q=_menubar_override_q,
+                    prompt_enabled=get_first_seen_prompt_enabled(),
                 )
                 console.print(
                     "  [#f472b6]●[/#f472b6] [dim]Menu bar active — "
