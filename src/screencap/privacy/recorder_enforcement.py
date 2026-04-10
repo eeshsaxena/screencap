@@ -187,6 +187,12 @@ class RecorderPrivacyFilter:
         self._blocked_reasons: dict[str, float] = {"initial": float("inf")}
         self._current_bundle_id: str = ""
         self._current_title: str = ""
+        # Cached most-recent window event so poll_overrides can replay
+        # the gating evaluation immediately when a new override arrives
+        # — without this, the override only takes effect on the NEXT
+        # real window event, which may be many seconds away if the user
+        # stays on the same tab.
+        self._current_window_data: dict | None = None
 
         # Blocked interval tracking (for cloud-intent manifest metadata)
         self._blocked_intervals: list[dict] = []
@@ -294,6 +300,7 @@ class RecorderPrivacyFilter:
 
             self._current_bundle_id = bundle_id
             self._current_title = title
+            self._current_window_data = window_data
 
         # Feed window event summary to menu bar (non-blocking, best-effort)
         if self._window_feed_q is not None:
@@ -312,8 +319,11 @@ class RecorderPrivacyFilter:
     def poll_overrides(self) -> None:
         """Drain the override queue from the menu bar (non-blocking).
 
-        Called from ``process_events()`` on each window event and during
-        recorder shutdown to ensure all user toggles are applied.
+        Called from ``process_events()`` on every event iteration so a
+        user toggle takes effect within one event cycle even when no
+        new window event arrives. When a new override is drained, the
+        most-recently-cached window state is re-evaluated against the
+        new override so the filter's blocked state updates immediately.
         """
         if self._override_q is None:
             return
@@ -328,14 +338,30 @@ class RecorderPrivacyFilter:
             with self._lock:
                 self._runtime_overrides[key] = action
             changed = True
+        if not changed:
+            return
         # Batch-write once after draining all pending overrides
-        if changed and self._override_file is not None:
+        if self._override_file is not None:
             try:
                 self._override_file.write_text(
                     json.dumps(self._runtime_overrides, indent=2)
                 )
             except Exception:
                 pass
+        # Replay the gating evaluation against the cached current window
+        # so the new override takes effect immediately. Without this, the
+        # filter's _blocked_reasons["app_policy"] stays in whatever state
+        # the LAST real window event left it, and the user keeps capturing
+        # the disabled target until they switch tabs.
+        with self._lock:
+            cached = self._current_window_data
+        if cached is not None:
+            try:
+                self.on_window_event(cached)
+            except Exception:
+                # Re-evaluation must never crash the recorder; fail safe
+                # by setting the filter-error block reason.
+                self.fail_closed()
 
     def on_action_event(self, action_data: dict) -> None:
         """Check action event for AXSecureTextField (Layer 1).

@@ -179,13 +179,15 @@ def _run_menubar(
     window_feed_q=None,
     override_q=None,
     prompt_enabled: bool = True,
+    disable_q=None,
 ) -> None:
     """Main entry point — must run on the main thread of the subprocess."""
     _dlog(
         f"_run_menubar START: parent_pid={parent_pid} name={recording_name!r} "
         f"prompt_enabled={prompt_enabled} "
         f"window_feed_q={window_feed_q is not None} "
-        f"override_q={override_q is not None}"
+        f"override_q={override_q is not None} "
+        f"disable_q={disable_q is not None}"
     )
 
     # Reset inherited signal handlers from parent recorder process
@@ -333,6 +335,7 @@ def _run_menubar(
             # Menu bar IPC
             self._window_feed_q = window_feed_q
             self._override_q = override_q
+            self._disable_q = disable_q  # retroactive scrub channel
 
             # First-seen prompt state
             self._prompt_enabled = prompt_enabled
@@ -719,7 +722,7 @@ def _run_menubar(
             info["user_toggled"] = True
             self._update_item_title(info)
 
-            # Send override to recorder
+            # Send override to recorder (forward gating)
             if self._override_q is not None:
                 try:
                     self._override_q.put_nowait({
@@ -730,6 +733,17 @@ def _run_menubar(
                     })
                 except Exception:
                     pass
+
+            # Re-enable does NOT restore deleted rows — the disable
+            # channel is one-way: forward gating reverses, scrubbed
+            # history does not.
+            if new_action in EXCLUDED_ACTION_VALUES:
+                self._emit_disable_message(
+                    bundle_id=info["bundle_id"],
+                    app_name=info.get("app_name"),
+                    domain=info["domain"],
+                    source="menubar",
+                )
 
         # ---- First-seen prompt ----
 
@@ -875,12 +889,31 @@ def _run_menubar(
                 )
             )
 
-        def _send_disable_override(self):
-            """Push an exclude override for the active panel's decision.
+        def _emit_disable_message(
+            self, *, bundle_id, app_name, domain, source,
+        ):
+            """Publish a retroactive-scrub job to the recorder side.
 
-            Mirrors ``toggleApp_``: writes to override_q and updates the
-            existing menu list mark immediately.
+            Best-effort; the queue is unbounded so put_nowait should not
+            normally block, but we tolerate ``Full`` and serialization
+            errors silently rather than crashing the menubar UI.
             """
+            if self._disable_q is None:
+                return
+            try:
+                self._disable_q.put_nowait({
+                    "kind": "domain" if domain else "app",
+                    "bundle_id": bundle_id,
+                    "app_name": app_name,
+                    "root_domain": domain,
+                    "ts_unix": time.time(),
+                    "source": source,
+                })
+            except Exception:
+                pass
+
+        def _send_disable_override(self):
+            """Push an exclude override for the active panel's decision."""
             d = self._active_panel_decision
             if d is None or self._override_q is None:
                 return
@@ -894,6 +927,12 @@ def _run_menubar(
                 })
             except Exception:
                 return
+            self._emit_disable_message(
+                bundle_id=d.bundle_id,
+                app_name=d.app_name,
+                domain=d.domain,
+                source="menubar_prompt",
+            )
             # Reflect in the existing menu item, if present
             info = self._detected_items.get(key)
             if info is not None and not info.get("is_password_manager") \
