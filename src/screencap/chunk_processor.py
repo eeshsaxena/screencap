@@ -43,6 +43,7 @@ class ChunkProcessor:
         rest_threshold: float = 120.0,
         flush_requested=None,      # multiprocessing.Event — triggers writer buffer flush
         flush_ack_counter=None,    # multiprocessing.Value('i') — counts writer acks
+        flush_lock=None,           # threading.Lock — serializes flushes with scrub_worker
         cloud_intent: bool = False,
         privacy_mode: str = "internal",
         screen_filter=None,
@@ -60,6 +61,7 @@ class ChunkProcessor:
         self._rest_threshold = rest_threshold
         self._flush_requested = flush_requested
         self._flush_ack_counter = flush_ack_counter
+        self._flush_lock = flush_lock
         self._cloud_intent = cloud_intent
         self._privacy_mode = privacy_mode
         self._screen_filter = screen_filter
@@ -322,38 +324,49 @@ class ChunkProcessor:
 
         Cross-process flush protocol: sets flush_requested Event → writers
         call flush_buffers() and increment counter → we wait and clear.
+
+        ``flush_lock`` (a threading.Lock owned by the recorder) serializes
+        this call with ScrubWorker._trigger_flush so the two consumers
+        don't race on the shared flush_ack_counter — one would otherwise
+        zero out the other's in-flight ack count mid-poll.
         """
         if self._flush_requested is None or self._flush_ack_counter is None:
             return
 
-        with self._flush_ack_counter.get_lock():
-            self._flush_ack_counter.value = 0
+        if self._flush_lock is not None:
+            self._flush_lock.acquire()
+        try:
+            with self._flush_ack_counter.get_lock():
+                self._flush_ack_counter.value = 0
 
-        self._flush_requested.set()
+            self._flush_requested.set()
 
-        # Poll for acks — wait up to 5s, stop early once acks stabilize
-        deadline = time.time() + 5.0
-        prev_acked = 0
-        stable_since = time.time()
-        while time.time() < deadline and not self._stop_event.is_set():
-            time.sleep(0.1)
+            # Poll for acks — wait up to 5s, stop early once acks stabilize
+            deadline = time.time() + 5.0
+            prev_acked = 0
+            stable_since = time.time()
+            while time.time() < deadline and not self._stop_event.is_set():
+                time.sleep(0.1)
+                with self._flush_ack_counter.get_lock():
+                    acked = self._flush_ack_counter.value
+                if acked > prev_acked:
+                    prev_acked = acked
+                    stable_since = time.time()
+                elif acked > 0 and time.time() - stable_since > 1.0:
+                    # No new acks for 1s after at least one — all active writers done
+                    break
+
+            self._flush_requested.clear()
+
             with self._flush_ack_counter.get_lock():
                 acked = self._flush_ack_counter.value
-            if acked > prev_acked:
-                prev_acked = acked
-                stable_since = time.time()
-            elif acked > 0 and time.time() - stable_since > 1.0:
-                # No new acks for 1s after at least one — all active writers done
-                break
-
-        self._flush_requested.clear()
-
-        with self._flush_ack_counter.get_lock():
-            acked = self._flush_ack_counter.value
-        if acked == 0:
-            logger.debug("Flush skipped: writers already finished")
-        else:
-            logger.info(f"Flush: {acked} writer(s) flushed buffers")
+            if acked == 0:
+                logger.debug("Flush skipped: writers already finished")
+            else:
+                logger.info(f"Flush: {acked} writer(s) flushed buffers")
+        finally:
+            if self._flush_lock is not None:
+                self._flush_lock.release()
 
     def _wait_for_audio(self, idx: int, *, is_final: bool = False) -> None:
         """Wait for audio process to confirm rotation/finalization."""

@@ -429,6 +429,7 @@ def _spawn_menubar(
     window_feed_q: multiprocessing.Queue | None = None,
     override_q: multiprocessing.Queue | None = None,
     prompt_enabled: bool = True,
+    disable_q: multiprocessing.Queue | None = None,
 ) -> multiprocessing.Process | None:
     """Spawn the menu bar status item as a daemon subprocess.
 
@@ -439,13 +440,17 @@ def _spawn_menubar(
         prompt_enabled: When True, the menubar shows a non-activating
             NSPanel the first time a never-seen ``(app, domain)`` pair
             becomes the frontmost window during the recording.
+        disable_q: Optional queue the menubar writes to when the user
+            toggles a target to ``exclude``. The recorder's scrub worker
+            consumes this queue to retroactively delete already-captured
+            rows for that target.
     """
     from screencap.menubar import _run_menubar
 
     proc = multiprocessing.Process(
         target=_run_menubar,
         args=(os.getpid(), recording_name, start_time, str(state_file),
-              window_feed_q, override_q, prompt_enabled),
+              window_feed_q, override_q, prompt_enabled, disable_q),
         daemon=True,
         name="menubar",
     )
@@ -621,6 +626,7 @@ def start_recording(
     # (which feeds window events) and the menu bar subprocess.
     _menubar_window_feed_q = multiprocessing.Queue()  # unbounded: recorder→menubar
     _menubar_override_q = multiprocessing.Queue()      # unbounded: menubar→recorder
+    _menubar_disable_q = multiprocessing.Queue()       # unbounded: menubar→scrub_worker (retroactive)
 
     # --- Privacy: capture-time enforcement ---
     # Cloud-intent recordings always use PUBLIC mode — this is stricter than
@@ -734,6 +740,12 @@ def start_recording(
     _ctrl_c_count = 0
     _menubar_proc = None
     _menubar_state_file = None
+    _scrub_worker = None
+    # Shared lock that serializes engine-flush handshakes between
+    # chunk_processor and scrub_worker — both consume the same
+    # flush_ack_counter on the engine Recorder, so racing them would
+    # zero out each other's in-flight ack counts mid-poll.
+    _engine_flush_lock = threading.Lock()
 
     try:
         # Build Recorder kwargs, only passing non-None values
@@ -964,6 +976,7 @@ def start_recording(
                             rest_threshold=get_rest_threshold(),
                             flush_requested=_flush_req,
                             flush_ack_counter=_flush_ctr,
+                            flush_lock=_engine_flush_lock,
                             cloud_intent=cloud_intent,
                             privacy_mode=privacy_config.mode.value if privacy_config else "internal",
                             screen_filter=screen_filter,
@@ -995,6 +1008,7 @@ def start_recording(
                     window_feed_q=_menubar_window_feed_q,
                     override_q=_menubar_override_q,
                     prompt_enabled=get_first_seen_prompt_enabled(),
+                    disable_q=_menubar_disable_q,
                 )
                 console.print(
                     "  [#f472b6]●[/#f472b6] [dim]Menu bar active — "
@@ -1002,6 +1016,28 @@ def start_recording(
                 )
             except Exception:
                 _menubar_proc = None  # Menu bar is nice-to-have, not critical
+
+            # Sidecar thread that retroactively deletes rows from
+            # recording.db for any target the user toggles to "exclude".
+            # Shares the engine flush primitives + lock with chunk_processor
+            # so buffered writer rows are committed before SELECT.
+            try:
+                from screencap.privacy.scrub_worker import ScrubWorker
+                _scrub_worker = ScrubWorker(
+                    disable_q=_menubar_disable_q,
+                    recording_db_path=capture_dir / "recording.db",
+                    capture_dir=capture_dir,
+                    flush_requested=getattr(recorder, '_flush_requested', None),
+                    flush_ack_counter=getattr(recorder, '_flush_ack_counter', None),
+                    flush_lock=_engine_flush_lock,
+                )
+                _scrub_worker.start()
+            except Exception as _sw_err:
+                _scrub_worker = None
+                if verbose:
+                    console.print(
+                        f"[yellow]Warning:[/yellow] Scrub worker failed to start: {_sw_err}"
+                    )
 
             # --- Live recording display ---
             # We use transient=False and handle cleanup ourselves:
@@ -1208,6 +1244,64 @@ def start_recording(
         if verbose:
             console.print(f"[yellow]Warning:[/yellow] Could not collect end metrics: {e}")
 
+    # End-of-recording catch-all scrub: enumerate every "exclude" target
+    # in .menubar_overrides.json and queue one final disable message per
+    # target on disable_q. This catches activity captured AFTER the user
+    # toggled disable but BEFORE the recording stopped — those rows were
+    # buffered in the engine writer and would otherwise leak into the
+    # final recording. Must run BEFORE scrub_worker.stop() so the worker
+    # processes them in the same drain pass.
+    try:
+        import json as _json
+        _override_path = capture_dir / ".menubar_overrides.json"
+        if _override_path.exists() and _scrub_worker is not None:
+            try:
+                _overrides_state = _json.loads(_override_path.read_text())
+            except Exception:
+                _overrides_state = {}
+            from screencap.privacy.actions import EXCLUDED_ACTION_VALUES
+            _now = time.time()
+            for _key, _action in _overrides_state.items():
+                if _action not in EXCLUDED_ACTION_VALUES:
+                    continue
+                # Override key shape: "bundle_id" or "bundle_id::domain"
+                if "::" in _key:
+                    _bundle, _dom = _key.split("::", 1)
+                    _msg = {
+                        "kind": "domain",
+                        "bundle_id": _bundle,
+                        "app_name": None,
+                        "root_domain": _dom,
+                        "ts_unix": _now,
+                        "source": "shutdown_catchall",
+                    }
+                else:
+                    _msg = {
+                        "kind": "app",
+                        "bundle_id": _key,
+                        "app_name": None,
+                        "root_domain": None,
+                        "ts_unix": _now,
+                        "source": "shutdown_catchall",
+                    }
+                try:
+                    _menubar_disable_q.put_nowait(_msg)
+                except Exception:
+                    pass
+    except Exception as _catchall_err:
+        if verbose:
+            console.print(
+                f"[yellow]Warning:[/yellow] Catch-all scrub queue failed: {_catchall_err}"
+            )
+
+    # Drain disable jobs BEFORE chunk_processor finalizes so any in-flight
+    # retroactive deletes land before the WAL checkpoint and DB upload.
+    if _scrub_worker is not None:
+        try:
+            _scrub_worker.stop(timeout=30.0)
+        except Exception:
+            pass
+
     # --- ChunkProcessor shutdown + DB checkpoint ---
     if chunk_processor is not None:
         try:
@@ -1234,8 +1328,8 @@ def start_recording(
             console.print("[yellow]Force quit — data is saved on disk.[/yellow]")
             console.print("[dim]Run [bold]screencap upload[/bold] later to upload remaining files.[/dim]")
         finally:
-            # Drain and close chunk/ack queues to prevent feeder-thread hangs.
-            for _q in (_cpq, _aaq):
+            # Drain and close queues to prevent feeder-thread hangs.
+            for _q in (_cpq, _aaq, _menubar_disable_q):
                 if _q is not None:
                     try:
                         while True:
