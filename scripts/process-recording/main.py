@@ -24,7 +24,7 @@ logging.basicConfig(level=logging.INFO, format="%(levelname)s %(message)s")
 log = logging.getLogger(__name__)
 
 BUCKET = os.environ.get("SCREENCAP_BUCKET", "screencap-recordings")
-PROCESSOR_VERSION = "2.0.0"
+PROCESSOR_VERSION = "2.1.0"
 MAX_ACTIVITY_ENTRIES = 200  # cap activity timeline entries for LLM context
 DEFAULT_REST_THRESHOLD = 120.0
 _LLM_ENRICHED_FIELDS = ("name", "description", "category", "apps_used", "confidence")
@@ -1239,24 +1239,21 @@ def _call_llm(prompt: str) -> dict | None:
 
 
 def _call_gemini(prompt: str) -> dict | None:
-    """Call Gemini Flash via Vertex AI. Returns parsed JSON or None."""
+    """Call Gemini Flash via Google AI API. Returns parsed JSON or None."""
     try:
-        from google.cloud import aiplatform  # noqa: F811
-        from vertexai.generative_models import GenerativeModel, GenerationConfig
+        from google import genai
+        from google.genai import types
 
-        project = os.environ.get("GOOGLE_CLOUD_PROJECT") or os.environ.get("GCP_PROJECT")
-        location = os.environ.get("GOOGLE_CLOUD_LOCATION", "us-central1")
-
-        if not project:
-            log.info("No GCP project configured for Gemini, skipping")
+        api_key = os.environ.get("GOOGLE_GENAI_API_KEY")
+        if not api_key:
+            log.info("No GOOGLE_GENAI_API_KEY configured, skipping Gemini")
             return None
 
-        aiplatform.init(project=project, location=location)
-
-        model = GenerativeModel("gemini-2.0-flash-001")
-        response = model.generate_content(
-            prompt,
-            generation_config=GenerationConfig(
+        client = genai.Client(api_key=api_key)
+        response = client.models.generate_content(
+            model="gemini-2.5-flash",
+            contents=prompt,
+            config=types.GenerateContentConfig(
                 response_mime_type="application/json",
                 response_schema=_RESPONSE_SCHEMA,
                 temperature=0.1,
@@ -1268,7 +1265,7 @@ def _call_gemini(prompt: str) -> dict | None:
         return result
 
     except ImportError:
-        log.info("vertexai not installed, skipping Gemini")
+        log.info("google-genai not installed, skipping Gemini")
         return None
     except Exception:
         log.warning("Gemini call failed", exc_info=True)
