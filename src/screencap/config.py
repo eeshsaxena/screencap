@@ -315,6 +315,24 @@ def get_privacy_config():
     return parse_privacy_config(_load_toml())
 
 
+def get_first_seen_prompt_enabled() -> bool:
+    """Return whether the first-seen privacy prompt is enabled. Default True.
+
+    Reads ``[menubar].first_seen_prompt`` from config.toml.
+    Env var ``SCREENCAP_FIRST_SEEN_PROMPT`` overrides the config.
+    """
+    env = os.environ.get("SCREENCAP_FIRST_SEEN_PROMPT")
+    if env is not None:
+        return env.lower() in ("1", "true", "yes")
+    cfg = _load_toml()
+    section = cfg.get("menubar", {})
+    if isinstance(section, dict):
+        val = section.get("first_seen_prompt", True)
+        if isinstance(val, bool):
+            return val
+    return True
+
+
 def resolve_recording_dir(name: str) -> Path:
     """Resolve a recording name to a directory path, with traversal protection.
 
