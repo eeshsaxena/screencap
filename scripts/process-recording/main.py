@@ -74,9 +74,94 @@ def _bucket() -> storage.Bucket:
 
 def _slugify(text: str, max_len: int = 40) -> str:
     s = text.lower()
+    # Strip PII placeholder tags like <PERSON>, <EMAIL>, etc.
+    s = re.sub(r"<[A-Z_]+>", "", s)
     s = re.sub(r"[^\w\s-]", "", s)
     s = re.sub(r"[\s_]+", "-", s).strip("-")
     return (s or "untitled")[:max_len]
+
+
+def _clean_title(title: str) -> str:
+    """Clean a window title for display: strip PII tags, version suffixes, noise."""
+    if not title:
+        return ""
+    # Remove PII placeholder tags
+    title = re.sub(r"\s*<[A-Z_]+>\s*", " ", title).strip()
+    # Remove common noise suffixes
+    for suffix in (" — Ghostty", " - Ghostty", " — Terminal", " - Terminal"):
+        if title.endswith(suffix):
+            title = title[: -len(suffix)].strip()
+    # Remove version strings like "v0.11.0", "v1.2.0"
+    title = re.sub(r"\s*v\d+\.\d+\.\d+\s*", " ", title).strip()
+    return title
+
+
+def _derive_display_name(
+    recording_name: str,
+    tasks: list[dict],
+    summary: dict | None,
+    segmentation_method: str,
+) -> str:
+    """Generate a human-readable display name for the recording session.
+
+    Priority:
+    1. LLM summary overview → extract key theme
+    2. Primary task name (if LLM-named)
+    3. Dominant app + activity description
+    4. Formatted timestamp from recording name
+    """
+    # If LLM provided a summary, derive from key_accomplishments or primary_focus
+    if segmentation_method == "llm" and summary:
+        accomplishments = summary.get("key_accomplishments", [])
+        if accomplishments and accomplishments[0]:
+            name = accomplishments[0].strip()
+            if len(name) > 50:
+                name = name[:47] + "..."
+            return name
+        # Use first task name if LLM-generated
+        for t in tasks:
+            if t.get("name"):
+                return t["name"]
+
+    # Fallback: build from dominant app/category info
+    if tasks:
+        # Collect unique app names
+        apps = []
+        for t in tasks:
+            app_name = t.get("dominant_app_name", "")
+            if app_name and app_name not in apps:
+                apps.append(app_name)
+
+        # Collect unique categories
+        cats = []
+        for t in tasks:
+            cat = t.get("category", "other")
+            if cat not in cats:
+                cats.append(cat)
+
+        _CAT_ACTIVITY = {
+            "development": "Development",
+            "research": "Research & Browsing",
+            "communication": "Communication",
+            "admin": "System Administration",
+            "creative": "Creative Work",
+            "other": "Session",
+        }
+
+        primary_cat = cats[0] if cats else "other"
+        activity = _CAT_ACTIVITY.get(primary_cat, "Session")
+
+        if apps:
+            top_apps = apps[:2]
+            return f"{activity} in {', '.join(top_apps)}"
+        return activity
+
+    # Last resort: format the recording name timestamp
+    m = re.match(r"rec-(\d{4})(\d{2})(\d{2})T(\d{2})(\d{2})(\d{2})", recording_name)
+    if m:
+        y, mo, d, h, mi, s = m.groups()
+        return f"Session {y}-{mo}-{d} {h}:{mi}"
+    return recording_name
 
 
 def _duration_human(secs: float) -> str:
@@ -874,7 +959,28 @@ def _classify_app(bundle_id: str, title: str = "", domain: str = "") -> str:
     for prefix, cat in _BUNDLE_PREFIX_CATEGORY:
         if bundle_id.startswith(prefix):
             return cat
-    # 3. Domain match
+    # 3. Windows exe name classification
+    exe_lower = bundle_id.lower()
+    if exe_lower.endswith(".exe"):
+        exe_name = exe_lower[:-4]
+        _EXE_CATEGORY = {
+            "code": "CODE", "vscode": "CODE", "cursor": "CODE",
+            "cmd": "CODE", "powershell": "CODE", "windowsterminal": "CODE",
+            "wt": "CODE", "python": "CODE", "python3": "CODE",
+            "node": "CODE", "git-bash": "CODE", "mintty": "CODE",
+            "devenv": "CODE",  # Visual Studio
+            "notepad": "DOCS", "notepad++": "CODE", "wordpad": "DOCS",
+            "chrome": "BROWSER", "firefox": "BROWSER", "msedge": "BROWSER",
+            "brave": "BROWSER", "opera": "BROWSER", "vivaldi": "BROWSER",
+            "slack": "CHAT", "discord": "CHAT", "teams": "CHAT",
+            "zoom": "CHAT", "outlook": "EMAIL",
+            "explorer": "SYSTEM", "taskmgr": "SYSTEM",
+            "winword": "DOCS", "excel": "DOCS", "powerpnt": "DOCS",
+            "screencap": "CODE",
+        }
+        if exe_name in _EXE_CATEGORY:
+            return _EXE_CATEGORY[exe_name]
+    # 4. Domain match
     if domain:
         if domain in _DOMAIN_CATEGORY:
             return _DOMAIN_CATEGORY[domain]
@@ -885,11 +991,33 @@ def _classify_app(bundle_id: str, title: str = "", domain: str = "") -> str:
 
 
 def _app_name_short(bundle_id: str) -> str:
-    """Extract short app name from bundle ID."""
+    """Extract short, human-readable app name from bundle ID or exe name."""
     if not bundle_id:
         return "Unknown"
+    # Windows exe names: "Notepad.exe", "screencap.exe", "python.exe"
+    if bundle_id.lower().endswith(".exe"):
+        return bundle_id[:-4]
+    # macOS bundle IDs: "com.mitchellh.ghostty" → "Ghostty"
     parts = bundle_id.split(".")
-    return parts[-1] if len(parts) >= 3 else bundle_id
+    name = parts[-1] if len(parts) >= 3 else bundle_id
+    # Known display names for common apps
+    _DISPLAY_NAMES = {
+        "ghostty": "Ghostty",
+        "VSCode": "VS Code",
+        "VSCodeInsiders": "VS Code Insiders",
+        "Terminal": "Terminal",
+        "iterm2": "iTerm",
+        "Chrome": "Chrome",
+        "Safari": "Safari",
+        "firefox": "Firefox",
+        "slackmacgap": "Slack",
+        "Discord": "Discord",
+        "finder": "Finder",
+        "mail": "Mail",
+        "Outlook": "Outlook",
+        "teams2": "Teams",
+    }
+    return _DISPLAY_NAMES.get(name, name.replace("-", " ").title())
 
 
 # ---------------------------------------------------------------------------
@@ -1485,7 +1613,8 @@ def _simple_segment_from_events(
                 break
 
         app_name = _app_name_short(dom_bundle) if dom_bundle else "unknown"
-        title_slug = _slugify(dom_title[:30]) if dom_title else ""
+        clean_title = _clean_title(dom_title[:60]) if dom_title else ""
+        title_slug = _slugify(clean_title) if clean_title else ""
         derived = (
             f"{_slugify(app_name)}-{title_slug}"
             if title_slug and title_slug != "untitled"
@@ -1519,6 +1648,7 @@ def _stats_summary(activity_entries: list[dict], tasks: list[dict]) -> dict:
     """Generate a stats-based summary when LLM is unavailable."""
     cat_time: dict[str, float] = {}
     unique_apps: set[str] = set()
+    app_display_names: list[str] = []
 
     for e in activity_entries:
         dur = e.get("end_ts", 0) - e.get("start_ts", 0)
@@ -1526,6 +1656,8 @@ def _stats_summary(activity_entries: list[dict], tasks: list[dict]) -> dict:
         cat_time[cat] = cat_time.get(cat, 0) + dur
         if e.get("app"):
             unique_apps.add(e["app"])
+            if e["app"] not in app_display_names:
+                app_display_names.append(e["app"])
 
     total_time = sum(cat_time.values()) or 1.0
     time_breakdown = {
@@ -1536,8 +1668,27 @@ def _stats_summary(activity_entries: list[dict], tasks: list[dict]) -> dict:
 
     dominant_cat = max(cat_time, key=cat_time.get) if cat_time else "other"
 
+    # Build a descriptive overview from task data
+    task_cat = _APP_CAT_TO_TASK_CAT.get(dominant_cat, "other")
+    _CAT_LABELS = {
+        "development": "development work",
+        "research": "web research and browsing",
+        "communication": "communication",
+        "admin": "system administration",
+        "creative": "creative work",
+        "other": "general computing",
+    }
+    focus_label = _CAT_LABELS.get(task_cat, "general work")
+    top_apps = app_display_names[:4]
+    app_str = ", ".join(top_apps) if top_apps else "various applications"
+    total_dur = _duration_human(total_time)
+
+    overview = f"Session focused on {focus_label} using {app_str}."
+    if len(tasks) > 1:
+        overview += f" Contained {len(tasks)} distinct activities over {total_dur}."
+
     return {
-        "overview": f"Recording with {len(tasks)} tasks across {len(unique_apps)} apps.",
+        "overview": overview,
         "primary_focus": dominant_cat.lower(),
         "time_breakdown": time_breakdown,
         "key_accomplishments": [],
@@ -1679,6 +1830,7 @@ def _update_session_index(
             task_entries = timeline.get("tasks", [])
             index["recordings"][recording_name] = {
                 "show_on_website": timeline.get("show_on_website", True),
+                "display_name": timeline.get("display_name"),
                 "processed_at": timeline.get("processed_at"),
                 "segmentation_method": timeline.get("segmentation_method"),
                 "total_tasks": timeline.get("total_tasks", 0),
@@ -1937,9 +2089,15 @@ def process_recording(cloud_event):
     if merged_tasks:
         total_duration = merged_tasks[-1]["end_ts"] - merged_tasks[0]["start_ts"]
 
+    # Generate display name
+    display_name = _derive_display_name(
+        recording_name, timeline_tasks, session_summary, segmentation_method,
+    )
+
     # Build timeline.json
     timeline = {
         "recording_name": recording_name,
+        "display_name": display_name,
         "show_on_website": show_on_website,
         "segmentation_method": segmentation_method,
         "processed_at": datetime.now(timezone.utc).isoformat(),

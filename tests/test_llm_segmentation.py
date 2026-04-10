@@ -196,8 +196,8 @@ class TestDeriveActivitySummary:
         timeline = result["summary"]["timeline"]
         assert len(timeline) >= 3  # VSCode, Chrome, VSCode (merged), Slack
 
-        # First entry should be VSCode
-        assert timeline[0]["app"] == "VSCode"
+        # First entry should be VSCode (display name from _DISPLAY_NAMES map)
+        assert timeline[0]["app"] == "VS Code"
         assert timeline[0]["cat"] == "CODE"
 
     @patch("main._blob_bytes")
@@ -478,8 +478,12 @@ class TestStatsSummary:
         summary = _stats_summary(entries, tasks)
 
         assert "overview" in summary
-        assert "1 tasks" in summary["overview"]
-        assert "2 apps" in summary["overview"]
+        # New overview format: "Session focused on <focus> using <apps>."
+        # _stats_summary uses entries' "app" field as-is, so the test fixture's
+        # raw "VSCode"/"Chrome" strings flow through unchanged.
+        assert "development work" in summary["overview"]
+        assert "VSCode" in summary["overview"]
+        assert "Chrome" in summary["overview"]
         assert summary["primary_focus"] == "code"
         assert "CODE" in summary["time_breakdown"]
         assert summary["key_accomplishments"] == []
@@ -488,7 +492,10 @@ class TestStatsSummary:
         from main import _stats_summary
 
         summary = _stats_summary([], [])
-        assert summary["overview"] == "Recording with 0 tasks across 0 apps."
+        # Empty entries fall back to "general computing" / "various applications"
+        assert summary["overview"] == (
+            "Session focused on general computing using various applications."
+        )
         assert summary["key_accomplishments"] == []
 
 
