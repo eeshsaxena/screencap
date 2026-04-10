@@ -543,6 +543,92 @@ class TestKeystrokeBlocking:
         assert data["timestamp"] == 1234567890.0
 
 
+class TestPollOverridesReevaluation:
+    """Regression for chrome-session: poll_overrides() must re-evaluate
+    the cached current window state when a new override is drained, so
+    the override takes effect immediately even when no new window event
+    arrives. Without this, the user can disable a target while staying
+    on the same tab and the filter never updates its blocked state.
+    """
+
+    def _drain_q(self, q, override):
+        q.put_nowait(override)
+
+    @staticmethod
+    def _put_and_settle(q, override):
+        """mp.Queue.put_nowait uses an internal feeder thread that takes
+        a few ms to make the item visible to get_nowait. The production
+        recorder loops at ~300ms so this is never an issue in practice,
+        but tests must wait briefly to avoid a race."""
+        import time as _time
+        q.put(override)
+        _time.sleep(0.1)
+
+    def test_override_takes_effect_on_cached_window_without_new_event(self):
+        import multiprocessing as mp
+        config = _make_config()
+        override_q = mp.Queue()
+        f = RecorderPrivacyFilter(
+            config, transition_hold_seconds=0.0, secure_input_fn=None,
+            override_q=override_q,
+        )
+
+        # User is currently on chrome github.com — filter sees the
+        # window event and (with no override yet) allows capture.
+        f.on_window_event({
+            "app_bundle_id": "com.google.Chrome",
+            "title": "GitHub - Change is constant",
+            "browser_url": "https://github.com/proteus/screencap",
+        })
+        assert f.is_screen_allowed() is True
+
+        # User clicks Disable in the menubar — override lands on the queue.
+        self._put_and_settle(override_q, {
+            "key": "com.google.Chrome::github.com",
+            "bundle_id": "com.google.Chrome",
+            "domain": "github.com",
+            "action": "exclude",
+        })
+
+        # Without poll_overrides being called, capture is still allowed.
+        assert f.is_screen_allowed() is True
+
+        # poll_overrides drains the queue AND replays the cached window
+        # event against the new override → blocked state updates.
+        f.poll_overrides()
+        assert f.is_screen_allowed() is False
+
+    def test_override_drain_without_cached_window_is_safe(self):
+        """If no window event has arrived yet, poll_overrides should
+        drain the queue without crashing — the override is stored and
+        will be applied to the first real window event."""
+        import multiprocessing as mp
+        config = _make_config()
+        override_q = mp.Queue()
+        f = RecorderPrivacyFilter(
+            config, transition_hold_seconds=0.0, secure_input_fn=None,
+            override_q=override_q,
+        )
+
+        self._put_and_settle(override_q, {
+            "key": "com.google.Chrome::github.com",
+            "bundle_id": "com.google.Chrome",
+            "domain": "github.com",
+            "action": "exclude",
+        })
+
+        # Should not raise even though no window event has been seen yet.
+        f.poll_overrides()
+
+        # First window event for the disabled target → blocked
+        f.on_window_event({
+            "app_bundle_id": "com.google.Chrome",
+            "title": "GitHub",
+            "browser_url": "https://github.com/",
+        })
+        assert f.is_screen_allowed() is False
+
+
 class TestCloudIntent:
     """Tests for cloud_intent parameter on RecorderPrivacyFilter."""
 
