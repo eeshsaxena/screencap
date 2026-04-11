@@ -28,6 +28,7 @@ from rich.panel import Panel
 from rich.text import Text
 
 from screencap import __version__
+from screencap._startup import close_queues_safely as _close_queues_safely
 from screencap.config import (
     get_app_versions,
     get_audio_default,
@@ -428,6 +429,8 @@ def _spawn_menubar(
     override_q: multiprocessing.Queue | None = None,
     prompt_enabled: bool = True,
     disable_q: multiprocessing.Queue | None = None,
+    *,
+    audio_enabled: bool = True,
 ) -> multiprocessing.Process | None:
     """Spawn the menu bar status item as a daemon subprocess.
 
@@ -442,6 +445,10 @@ def _spawn_menubar(
             toggles a target to ``exclude``. The recorder's scrub worker
             consumes this queue to retroactively delete already-captured
             rows for that target.
+        audio_enabled: Initial state of the "Audio (next recording)"
+            toggle shown in the menu.  Legacy / non-session path only —
+            in session mode the :class:`SessionController` passes the
+            value directly to ``_run_menubar``.
     """
     from screencap.menubar import _run_menubar
 
@@ -449,6 +456,7 @@ def _spawn_menubar(
         target=_run_menubar,
         args=(os.getpid(), recording_name, start_time, str(state_file),
               window_feed_q, override_q, prompt_enabled, disable_q),
+        kwargs={"audio_enabled": audio_enabled},
         daemon=True,
         name="menubar",
     )
@@ -504,8 +512,24 @@ def start_recording(
     segmentation_mode: str = "llm",
     scrub_enabled: bool = True,
     show_on_website: bool = True,
+    *,
+    # Session-controller worker-mode hooks. These are private and must
+    # only be set by screencap.session.run_recording_worker.
+    _external_window_feed_q: "multiprocessing.Queue | None" = None,
+    _external_override_q: "multiprocessing.Queue | None" = None,
+    _external_disable_q: "multiprocessing.Queue | None" = None,
+    _skip_menubar_spawn: bool = False,
+    _skip_pidfile: bool = False,
+    _skip_sigint_handler: bool = False,
 ) -> tuple[Path, float, multiprocessing.Process | None, Path | None]:
-    """Start a screen capture recording. Blocks until Ctrl+C."""
+    """Start a screen capture recording. Blocks until Ctrl+C.
+
+    The ``_external_*`` / ``_skip_*`` keyword-only parameters are used
+    by :class:`screencap.session.SessionController` to run this function
+    as a Recording Worker subprocess inside a longer-lived session. They
+    default to the legacy one-shot behaviour so existing callers and
+    tests continue to work unchanged.
+    """
     if audio is None:
         audio = get_audio_default()
     if wifi_metrics is None:
@@ -626,9 +650,23 @@ def start_recording(
     # --- Menu bar IPC queues ---
     # Created early so they can be passed to both the privacy filter
     # (which feeds window events) and the menu bar subprocess.
-    _menubar_window_feed_q = multiprocessing.Queue()  # unbounded: recorder→menubar
-    _menubar_override_q = multiprocessing.Queue()      # unbounded: menubar→recorder
-    _menubar_disable_q = multiprocessing.Queue()       # unbounded: menubar→scrub_worker (retroactive)
+    #
+    # In session-controller worker mode (``_external_*`` queues are not
+    # None), the controller has already created these queues and shares
+    # them with the persistent menubar; reuse them instead of creating
+    # fresh ones so the menubar sees events from this worker.
+    if _external_window_feed_q is not None:
+        _menubar_window_feed_q = _external_window_feed_q
+    else:
+        _menubar_window_feed_q = multiprocessing.Queue()  # unbounded: recorder→menubar
+    if _external_override_q is not None:
+        _menubar_override_q = _external_override_q
+    else:
+        _menubar_override_q = multiprocessing.Queue()      # unbounded: menubar→recorder
+    if _external_disable_q is not None:
+        _menubar_disable_q = _external_disable_q
+    else:
+        _menubar_disable_q = multiprocessing.Queue()       # unbounded: menubar→scrub_worker (retroactive)
 
     # --- Privacy: capture-time enforcement ---
     # Cloud-intent recordings always use PUBLIC mode — this is stricter than
@@ -899,7 +937,8 @@ def start_recording(
             _menubar_proc = None
             os._exit(1)
 
-        signal.signal(signal.SIGINT, _force_exit)
+        if not _skip_sigint_handler:
+            signal.signal(signal.SIGINT, _force_exit)
 
         # --- SIGTERM handler (for `screencap stop`) ---
         def _sigterm_handler(sig, frame):
@@ -1002,34 +1041,41 @@ def start_recording(
                 except Exception as _chunk_init_err:
                     console.print(f"[yellow]Warning:[/yellow] ChunkProcessor failed to start: {_chunk_init_err}")
 
-            # Write PID file tracking all child processes
-            child_pids = [
-                {"pid": child.pid, "name": child.name}
-                for child in multiprocessing.active_children()
-            ]
-            write_pidfile(capture_dir, child_pids)
+            # Write PID file tracking all child processes. Skipped in
+            # session-controller worker mode — the controller owns the
+            # pidfile and writes it once at startup.
+            if not _skip_pidfile:
+                child_pids = [
+                    {"pid": child.pid, "name": child.name}
+                    for child in multiprocessing.active_children()
+                ]
+                write_pidfile(capture_dir, child_pids)
 
             # Store raw PIDs for signal-safe force-exit (avoids
             # multiprocessing._children_lock which can deadlock in a handler).
             _child_pids = [child.pid for child in multiprocessing.active_children()]
 
-            # Spawn menu bar status item (non-blocking, best-effort)
-            try:
-                from screencap.config import get_first_seen_prompt_enabled
-                _menubar_state_file = capture_dir / ".menubar_state"
-                _menubar_proc = _spawn_menubar(
-                    name, t0, _menubar_state_file,
-                    window_feed_q=_menubar_window_feed_q,
-                    override_q=_menubar_override_q,
-                    prompt_enabled=get_first_seen_prompt_enabled(),
-                    disable_q=_menubar_disable_q,
-                )
-                console.print(
-                    "  [#f472b6]●[/#f472b6] [dim]Menu bar active — "
-                    "click the [#f472b6]red dot[/#f472b6] in your menu bar to stop[/dim]"
-                )
-            except Exception:
-                _menubar_proc = None  # Menu bar is nice-to-have, not critical
+            # Spawn menu bar status item (non-blocking, best-effort).
+            # Skipped in worker mode: the controller already has a
+            # persistent menubar talking over the injected queues.
+            if not _skip_menubar_spawn:
+                try:
+                    from screencap.config import get_first_seen_prompt_enabled
+                    _menubar_state_file = capture_dir / ".menubar_state"
+                    _menubar_proc = _spawn_menubar(
+                        name, t0, _menubar_state_file,
+                        window_feed_q=_menubar_window_feed_q,
+                        override_q=_menubar_override_q,
+                        prompt_enabled=get_first_seen_prompt_enabled(),
+                        disable_q=_menubar_disable_q,
+                        audio_enabled=audio,
+                    )
+                    console.print(
+                        "  [#f472b6]●[/#f472b6] [dim]Menu bar active — "
+                        "click the [#f472b6]red dot[/#f472b6] in your menu bar to stop[/dim]"
+                    )
+                except Exception:
+                    _menubar_proc = None  # Menu bar is nice-to-have, not critical
 
             # Sidecar thread that retroactively deletes rows from
             # recording.db for any target the user toggles to "exclude".
@@ -1217,10 +1263,12 @@ def start_recording(
 
         status.stop()
         # Restore default handlers
-        signal.signal(signal.SIGINT, signal.default_int_handler)
+        if not _skip_sigint_handler:
+            signal.signal(signal.SIGINT, signal.default_int_handler)
         signal.signal(signal.SIGTERM, signal.SIG_DFL)
         atexit.unregister(_cleanup_children)
-        delete_pidfile()
+        if not _skip_pidfile:
+            delete_pidfile()
 
         # Restore stderr fd if it wasn't restored earlier (e.g. exception
         # during Recorder.__enter__).
@@ -1349,19 +1397,13 @@ def start_recording(
             console.print("[yellow]Force quit — data is saved on disk.[/yellow]")
             console.print("[dim]Run [bold]screencap upload[/bold] later to upload remaining files.[/dim]")
         finally:
-            # Drain and close queues to prevent feeder-thread hangs.
-            for _q in (_cpq, _aaq, _menubar_disable_q):
-                if _q is not None:
-                    try:
-                        while True:
-                            _q.get_nowait()
-                    except Exception:
-                        pass
-                    try:
-                        _q.cancel_join_thread()
-                        _q.close()
-                    except Exception:
-                        pass
+            # In session-controller worker mode the menubar queues are
+            # owned by the controller and reused across recordings; they
+            # must NOT be closed here.
+            if _external_disable_q is None:
+                _close_queues_safely(_cpq, _aaq, _menubar_disable_q)
+            else:
+                _close_queues_safely(_cpq, _aaq)
 
         # WAL checkpoint + upload recording.db
         _db_uploaded = False
