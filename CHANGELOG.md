@@ -5,6 +5,33 @@ All notable changes to this project will be documented in this file.
 The format is based on [Keep a Changelog](https://keepachangelog.com/),
 and this project adheres to [Semantic Versioning](https://semver.org/).
 
+## [0.17.0] - 2026-04-11
+
+### Added
+- **Back-to-back recordings:** `screencap start` is now a long-lived session — hit Start, Stop, Start again from the menu bar without restarting the CLI, while the previous recording transcribes and uploads quietly in the background
+- **Menu bar session controls:** The status-bar menu is now a full session UI with Start Recording, Stop Recording, and Quit ScreenCap items that swap in place as the session state changes
+- **Audio toggle in the menu bar:** Flip microphone capture on or off for the next recording straight from the menu bar — the choice is persisted to `config.toml` and applied to subsequent recordings in the current session without a restart
+- **First-seen app prompts:** The first time a new app or website appears on screen during a recording, the menu bar now pops up a prompt asking whether to allow, mask, or exclude it — and remembers your answer for next time
+- **Retroactive scrubbing:** When you toggle an app or domain to "exclude" mid-recording, a new sidecar worker reaches back into the capture DB and deletes everything already recorded for that target, not just future events
+- **Scrub audit log:** Every retroactive scrub decision is written to a disable log with timestamps and source, so you can review exactly what got wiped and why
+- **Override replay over cached windows:** Flipping an override now re-evaluates the privacy filter against cached window history, so earlier events flip to the correct gated state instead of leaking because they were already written
+- **Cloud Run display names and categorisation:** Recordings processed in Cloud Run now carry human-readable display names, classify Windows apps, and strip PII tags from task descriptions before they land in the viewer
+- **Gemini on google-genai SDK:** Cloud Run's LLM segmentation pipeline now talks to Gemini through the modern `google-genai` client instead of the legacy Vertex AI SDK — no config changes needed
+- **Persist-disable for privacy decisions:** Mid-recording privacy choices can now be saved so the same app is blocked by default in future sessions, not just the current one
+- **Per-session scrub worker lifecycle:** The recorder now owns scrub-worker startup, shutdown, and a shared flush lock so retroactive deletes stay consistent across chunk boundaries
+- **Menu bar disable events:** Toggling an app in the menu bar now publishes a disable event on the IPC bus immediately, giving the scrub worker a wake-up signal instead of waiting for the next poll
+- **Session-worker injection hooks:** `start_recording` accepts external IPC queues and skip flags so the Session Controller can run it as a subprocess while reusing the persistent menu bar
+- **First-seen prompt wiring:** The `prompt_enabled` flag now flows from config through the recorder into the menu bar subprocess so the first-seen prompt can be turned off globally from one place
+- **`set_audio_default()` config helper:** A new setter writes the audio preference back to `config.toml` via tomlkit, preserving comments and formatting on round-trip
+- **`get_first_seen_prompt_enabled()` config reader:** A matching getter exposes the first-seen prompt flag so the recorder and menu bar agree on the current value
+- **Shared `_startup` helper module:** New module consolidates multiprocessing resource-tracker silencing and queue cleanup, previously inlined in `recorder.py` and now reused by the Session Controller too
+
+### Fixed
+- **Recording duration is now accurate:** Elapsed time is measured from engine-ready (not metrics-scan start) and frozen at stop (not after post-capture cleanup), so the Duration in the summary matches what `ffprobe` reports on the actual chunk files
+
+### Changed
+- **Shared atomic config save:** `save_config_atomic` is now a shared helper used by both the setup wizard and the new audio-default setter instead of being duplicated across modules
+
 ## [0.16.0] - 2026-04-09
 
 ### Added
