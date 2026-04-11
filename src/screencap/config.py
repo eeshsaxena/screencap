@@ -93,6 +93,26 @@ def get_audio_default() -> bool:
     return cfg.get("audio_default", True)
 
 
+def set_audio_default(value: bool) -> None:
+    """Persist the default audio setting to ``config.toml``.
+
+    Uses tomlkit via the setup-wizard loader/saver pair so comments and
+    formatting are preserved. Mirrors the path taken by
+    ``screencap settings --set audio_default=…`` (cli.py:1911).
+
+    Invalidates the in-process config cache so subsequent reads in the
+    same process observe the new value. Cross-process invalidation is
+    not required — each ``screencap start`` is a fresh Python process
+    with an empty cache.
+    """
+    from screencap.setup_wizard import _load_config_toml, _save_config_atomic
+
+    doc = _load_config_toml(_CONFIG_PATH)
+    doc["audio_default"] = value
+    _save_config_atomic(_CONFIG_PATH, doc)
+    invalidate_config_cache()
+
+
 def get_wifi_metrics() -> bool:
     """Return whether WiFi metrics collection is enabled (True = on)."""
     env = os.environ.get("SCREENCAP_WIFI_METRICS")
