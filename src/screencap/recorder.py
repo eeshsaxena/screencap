@@ -604,6 +604,10 @@ def start_recording(
     if verbose:
         console.print(f"[dim]Audio: {'on' if audio else 'off'}[/dim]")
 
+    # ``t0`` is the reference for the live timer / summary duration.
+    # We seed it here so it's defined for early-exit paths, but it's
+    # reset to the actual engine-ready moment inside the ``with
+    # Recorder(...)`` block below — see the comment there for why.
     t0 = time.time()
     status = console.status("[bold]Initializing capture...[/bold]")
     status.start()
@@ -940,6 +944,18 @@ def start_recording(
             recorder.wait_for_ready(timeout=30)
             status.stop()
 
+            # Reset ``t0`` to the moment the engine is confirmed ready.
+            # Everything above this point — metrics scan (wifi + app
+            # versions can be 30-60s on busy Macs), engine spawn,
+            # writer-process startup, ``wait_for_ready`` — is setup
+            # overhead that the user does NOT perceive as "recording
+            # time". Counting it inflates the reported Duration by
+            # many tens of seconds and makes the summary disagree with
+            # ``ffprobe chunk_0000.mp4``. Starting the clock here
+            # yields an elapsed value that matches the video file to
+            # within ~100 ms.
+            t0 = time.time()
+
             # Start ChunkProcessor if chunking is enabled
             if chunking_enabled:
                 try:
@@ -1044,6 +1060,13 @@ def start_recording(
             # every panel line (including borders) with the new content.
             # transient=True has an off-by-one bug with Panel borders
             # on signal interrupt, leaving the top border as a remnant.
+            # ``elapsed`` is updated inside the Live loop and then frozen
+            # in the loop's ``finally`` block so the returned value
+            # reflects the user-visible recording duration (the number
+            # shown in the live status bar) and NOT the total wall clock
+            # that includes the multi-minute post-capture cleanup
+            # (ChunkProcessor drain, DB upload, sentinel upload).
+            elapsed = 0.0
             with Live(
                 _build_live_display(name, 0.0, True),
                 console=console,
@@ -1438,7 +1461,13 @@ def start_recording(
                     f"  Run [bold]{_upload_cmd}[/bold] to upload the rest.[/yellow]"
                 )
 
-    elapsed = time.time() - t0
+    # NOTE: intentionally NOT recomputing ``elapsed = time.time() - t0``
+    # here. The live loop above already froze ``elapsed`` at the moment
+    # the user stopped the recording — that's the number shown in the
+    # status bar. Reassigning now would inflate the summary's Duration
+    # field by the wall-clock cost of the post-capture cleanup
+    # (ChunkProcessor drain, DB upload, sentinel upload), which can be
+    # minutes for chunked cloud recordings.
 
     # Restore output if we suppressed it
     if not verbose:
