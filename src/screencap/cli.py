@@ -195,7 +195,12 @@ def start(
     """
     from datetime import datetime
 
-    from screencap.config import get_auto_name, get_auto_name_local_only, get_segmentation_mode
+    from screencap.config import (
+        get_audio_default,
+        get_auto_name,
+        get_auto_name_local_only,
+        get_segmentation_mode,
+    )
 
     # Resolve segmentation mode: CLI flag > config.toml > default
     seg_mode = segmentation_mode or get_segmentation_mode()
@@ -217,7 +222,9 @@ def start(
             # Generate timestamp-based temp name
             name = f"rec-{datetime.now().strftime('%Y%m%dT%H%M%S')}"
 
-    audio = not no_audio
+    # --no-audio wins; otherwise fall back to the persisted default so the
+    # menu-bar "Audio (next recording)" toggle actually reaches new sessions.
+    audio = False if no_audio else get_audio_default()
     wifi_metrics = not no_wifi_metrics
     app_versions = not no_app_versions
 
@@ -348,8 +355,125 @@ def start(
     else:
         show_on_website = True  # irrelevant for local-only recordings
 
+    # --- Hand off to the Session Controller ---
+    # ``screencap start`` is a long-lived session: the controller spawns
+    # the menu bar once, runs each recording in its own Recording Worker
+    # subprocess, and detaches post-processing into a separate
+    # Post-Process Worker subprocess so a second recording can start
+    # while the previous one is still transcribing / uploading.
+    #
+    # Setting ``SCREENCAP_LEGACY_START=1`` falls back to the classic
+    # one-shot code path. This is used by the test suite (which mocks
+    # ``screencap.recorder.start_recording`` at module level — the mock
+    # does not cross the subprocess boundary of the session controller)
+    # and as an escape hatch if the controller regresses in production.
+    import os as _os_start
+
+    if _os_start.environ.get("SCREENCAP_LEGACY_START") == "1":
+        _legacy_start_recording(
+            name=name,
+            description=description,
+            audio=audio,
+            output=output,
+            wifi_metrics=wifi_metrics,
+            app_versions=app_versions,
+            force=force,
+            capture_video=capture_video,
+            capture_images=capture_images,
+            capture_window_data=capture_window_data,
+            verbose=verbose,
+            chunk_duration=chunk_duration,
+            no_live_upload=no_live_upload,
+            force_mode=force_mode,
+            is_cloud=is_cloud,
+            keep_local=keep_local,
+            intent_source=intent_source,
+            seg_mode=seg_mode,
+            scrub_enabled=scrub_enabled,
+            show_on_website=show_on_website,
+            auto_name_enabled=auto_name_enabled,
+            local_only=local_only,
+        )
+        return
+
     try:
-        from screencap.recorder import DiskFullError, _kill_menubar, print_summary, start_recording
+        from screencap.session import SessionController
+    except ImportError:
+        console.print(_RECORD_EXTRAS_MSG)
+        raise SystemExit(1)
+
+    cli_args = {
+        "name": name,
+        "description": description or None,
+        "audio": audio,
+        "output": output,
+        "wifi_metrics": wifi_metrics,
+        "app_versions": app_versions,
+        "force_clean": force,
+        "capture_video": capture_video,
+        "capture_images": capture_images,
+        "capture_window_data": capture_window_data,
+        "verbose": verbose,
+        "chunk_duration": chunk_duration,
+        "live_upload": not no_live_upload,
+        "force_mode": force_mode,
+        "cloud_intent": is_cloud,
+        "keep_local": keep_local,
+        "intent_source": intent_source,
+        "segmentation_mode": seg_mode,
+        "scrub_enabled": scrub_enabled,
+        "show_on_website": show_on_website,
+        "auto_name_enabled": auto_name_enabled,
+        "local_only": local_only,
+    }
+
+    controller = SessionController(cli_args)
+    try:
+        controller.run()
+    except SystemExit:
+        raise
+    except Exception as exc:  # noqa: BLE001
+        console.print(f"[red]Session controller error:[/red] {exc}")
+        raise SystemExit(1)
+
+
+def _legacy_start_recording(
+    *,
+    name,
+    description,
+    audio,
+    output,
+    wifi_metrics,
+    app_versions,
+    force,
+    capture_video,
+    capture_images,
+    capture_window_data,
+    verbose,
+    chunk_duration,
+    no_live_upload,
+    force_mode,
+    is_cloud,
+    keep_local,
+    intent_source,
+    seg_mode,
+    scrub_enabled,
+    show_on_website,
+    auto_name_enabled,
+    local_only,
+) -> None:
+    """Classic one-shot ``screencap start`` code path (pre-Session Controller).
+
+    Kept for the test suite and for ``SCREENCAP_LEGACY_START=1`` users.
+    Functionally identical to the previous inline body of ``start()``.
+    """
+    try:
+        from screencap.recorder import (
+            DiskFullError,
+            _kill_menubar,
+            print_summary,
+            start_recording,
+        )
     except ImportError:
         console.print(_RECORD_EXTRAS_MSG)
         raise SystemExit(1)
@@ -360,7 +484,8 @@ def start(
     try:
         capture_dir, elapsed, _menubar_proc, _menubar_state_file = start_recording(
             name, description or None, audio, output,
-            wifi_metrics=wifi_metrics, app_versions=app_versions, force_clean=force,
+            wifi_metrics=wifi_metrics, app_versions=app_versions,
+            force_clean=force,
             capture_video=capture_video, capture_images=capture_images,
             capture_window_data=capture_window_data,
             verbose=verbose,
@@ -378,21 +503,16 @@ def start(
         capture_dir, elapsed = e.capture_dir, e.elapsed
         _menubar_proc, _menubar_state_file = e.menubar_proc, e.menubar_state_file
         disk_full = True
-        console.print("[yellow]Skipping auto-naming/transcription: disk space is low.[/yellow]")
+        console.print(
+            "[yellow]Skipping auto-naming/transcription: disk space is low.[/yellow]"
+        )
     except ImportError:
         console.print(_RECORD_EXTRAS_MSG)
         raise SystemExit(1)
 
-    # --- Post-recording pipeline ---
-    # Order matters: export must run before auto-name, which may rename the directory.
-    # 1. Auto-export events.jsonl (unconditional)
-    # 2. Auto-transcribe audio (if auto_name_enabled and audio exists)
-    # 3. Auto-name via LLM (if auto_name_enabled; may rename capture_dir -> final_dir)
-    # 4. Print summary
     final_name = name
     final_dir = capture_dir
 
-    # Check if user renamed the recording from the menu bar
     try:
         from screencap.menubar import RENAME_FILENAME
         _rename_file = capture_dir / RENAME_FILENAME
@@ -409,25 +529,26 @@ def start(
     except Exception:
         pass
 
-    # Auto-export events.jsonl for downstream scrubbing
     try:
         _auto_export(capture_dir)
     except KeyboardInterrupt:
         console.print("[yellow]Export cancelled.[/yellow]")
 
     if auto_name_enabled and not disk_full and final_name == name:
-        # Auto-transcribe if audio was captured
-        # In chunked mode, per-chunk transcription is handled by ChunkProcessor
         has_chunk_transcripts = any(capture_dir.glob("transcript_*.txt"))
         audio_path = capture_dir / "audio.flac"
-        if audio and not has_chunk_transcripts and audio_path.exists() and audio_path.stat().st_size >= 1024:
+        if (
+            audio
+            and not has_chunk_transcripts
+            and audio_path.exists()
+            and audio_path.stat().st_size >= 1024
+        ):
             try:
                 _auto_transcribe(capture_dir, audio_path)
             except KeyboardInterrupt:
                 console.print("[yellow]Transcription cancelled.[/yellow]")
 
-        # LLM auto-naming
-        skip_rename = output is not None  # User chose a specific path
+        skip_rename = output is not None
         try:
             from screencap.namer import auto_name as do_auto_name
 
@@ -439,20 +560,17 @@ def start(
                 )
             final_name = final_dir.name
         except KeyboardInterrupt:
-            console.print("[yellow]Naming cancelled — keeping timestamp name[/yellow]")
+            console.print(
+                "[yellow]Naming cancelled — keeping timestamp name[/yellow]"
+            )
 
     print_summary(final_name, final_dir, elapsed)
 
-    # Post-recording new-app report
     try:
         _report_unclassified_apps(final_dir)
     except Exception:
-        pass  # non-blocking
+        pass
 
-    # Kill menu bar and hard-exit.  Recorder.__exit__ already joined all
-    # child processes; os._exit() cleans up everything else instantly.
-    # The resource tracker's stderr was redirected to /dev/null at Recorder
-    # creation time, so any cleanup output goes nowhere.
     _kill_menubar(_menubar_proc, _menubar_state_file)
     import os as _os
     _os._exit(0)
