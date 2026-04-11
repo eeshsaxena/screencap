@@ -7,9 +7,22 @@ schema always matches production.
 
 from __future__ import annotations
 
+import os
 from pathlib import Path
 
 import pytest
+
+
+# ---------------------------------------------------------------------------
+# Force the legacy ``screencap start`` code path for the whole test run.
+#
+# The SessionController spawns a Recording Worker subprocess which calls
+# ``start_recording`` in a fresh interpreter — monkey-patching the symbol
+# in the test process does not propagate there. The legacy one-shot path
+# keeps ``start_recording`` in-process so ``mock.patch`` works as expected.
+# ---------------------------------------------------------------------------
+
+os.environ.setdefault("SCREENCAP_LEGACY_START", "1")
 
 
 # ---------------------------------------------------------------------------

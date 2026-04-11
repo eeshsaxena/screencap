@@ -67,6 +67,56 @@ def test_missing_config_file():
         assert result == {}
 
 
+def test_set_audio_default_round_trip(tmp_path):
+    """``set_audio_default`` → ``get_audio_default`` round-trips via tomlkit."""
+    import screencap.config as cfg
+    from screencap.config import get_audio_default, set_audio_default
+
+    cfg_path = tmp_path / "config.toml"
+    cfg_path.write_text("# header comment\naudio_default = true\n")
+
+    env = {k: v for k, v in os.environ.items() if k != "SCREENCAP_AUDIO_DEFAULT"}
+    with (
+        mock.patch.object(cfg, "_CONFIG_PATH", cfg_path),
+        mock.patch.dict(os.environ, env, clear=True),
+    ):
+        cfg._config_cache = None
+        assert get_audio_default() is True
+
+        set_audio_default(False)
+        # set_audio_default should invalidate the cache, so a fresh
+        # get_audio_default() within the same process observes the write.
+        assert get_audio_default() is False
+
+        # tomlkit round-trip must preserve the leading comment.
+        text = cfg_path.read_text()
+        assert "# header comment" in text
+        assert "audio_default = false" in text
+
+        # Flip back to true to exercise the other direction.
+        set_audio_default(True)
+        assert get_audio_default() is True
+
+
+def test_set_audio_default_creates_file(tmp_path):
+    """``set_audio_default`` works even when config.toml does not exist yet."""
+    import screencap.config as cfg
+    from screencap.config import get_audio_default, set_audio_default
+
+    cfg_path = tmp_path / "config.toml"
+    assert not cfg_path.exists()
+
+    env = {k: v for k, v in os.environ.items() if k != "SCREENCAP_AUDIO_DEFAULT"}
+    with (
+        mock.patch.object(cfg, "_CONFIG_PATH", cfg_path),
+        mock.patch.dict(os.environ, env, clear=True),
+    ):
+        cfg._config_cache = None
+        set_audio_default(False)
+        assert cfg_path.exists()
+        assert get_audio_default() is False
+
+
 # --- disk threshold config tests ---
 
 

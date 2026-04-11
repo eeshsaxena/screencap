@@ -66,6 +66,14 @@ STATE_PROCESSING = "processing"
 STATE_DONE = "done"
 RENAME_FILENAME = ".menubar_rename"
 
+# Session-mode controller state strings. Duplicated here — rather than
+# importing :class:`screencap.session.SessionState` — so the menubar
+# subprocess doesn't pull in the 1k-line session module (and its
+# multiprocessing / rich / OrderedDict imports) just to read an enum.
+SESSION_STATE_IDLE = "idle"
+SESSION_STATE_RECORDING = "recording"
+SESSION_STATE_STOPPING = "stopping"
+
 
 # ---------------------------------------------------------------------------
 # PromptState — pure-Python state machine for the first-seen prompt queue
@@ -180,14 +188,39 @@ def _run_menubar(
     override_q=None,
     prompt_enabled: bool = True,
     disable_q=None,
+    *,
+    control_q=None,
+    menubar_event_q=None,
+    session_mode: bool = False,
+    audio_enabled: bool = True,
 ) -> None:
-    """Main entry point — must run on the main thread of the subprocess."""
+    """Main entry point — must run on the main thread of the subprocess.
+
+    Two operating modes:
+
+    * **Legacy mode** (``session_mode=False``): the menubar is spawned
+      per-recording by ``recorder.start_recording``. Window events come
+      from ``window_feed_q``; overrides go to ``override_q``; stop is
+      signalled by SIGTERM'ing the parent.
+
+    * **Session mode** (``session_mode=True``): the menubar is spawned
+      once by the :class:`SessionController` and persists across many
+      recordings. ``control_q`` is the multiplexed controller→menubar
+      channel (window events + state transitions + pp status).
+      ``menubar_event_q`` is the menubar→controller reply channel (Start
+      / Stop / Quit clicks, overrides, disables). The legacy ``*_q``
+      params are ignored.
+    """
     _dlog(
         f"_run_menubar START: parent_pid={parent_pid} name={recording_name!r} "
         f"prompt_enabled={prompt_enabled} "
         f"window_feed_q={window_feed_q is not None} "
         f"override_q={override_q is not None} "
-        f"disable_q={disable_q is not None}"
+        f"disable_q={disable_q is not None} "
+        f"session_mode={session_mode} "
+        f"control_q={control_q is not None} "
+        f"menubar_event_q={menubar_event_q is not None} "
+        f"audio_enabled={audio_enabled}"
     )
 
     # Reset inherited signal handlers from parent recorder process
@@ -337,6 +370,20 @@ def _run_menubar(
             self._override_q = override_q
             self._disable_q = disable_q  # retroactive scrub channel
 
+            # Session-mode IPC (controller <-> menubar). In session mode
+            # the controller owns the lifecycle and the menubar is long
+            # lived; the three legacy queues above are ignored.
+            self._session_mode = session_mode
+            self._control_q = control_q
+            self._menubar_event_q = menubar_event_q
+            # Session state drives the top-slot button and menu layout.
+            # "idle" = ▶ Start, "recording" = ■ Stop, "stopping" = hourglass.
+            self._session_state = (
+                SESSION_STATE_IDLE if session_mode else SESSION_STATE_RECORDING
+            )
+            self._pending_pp_count = 0
+            self._recording_name = recording_name
+
             # First-seen prompt state
             self._prompt_enabled = prompt_enabled
             self._prompt_state = PromptState()
@@ -344,6 +391,12 @@ def _run_menubar(
             self._active_panel_decision = None
             self._prompt_dismiss_timer = None
             self._current_frontmost_key = None
+
+            # Audio default toggle state. Reflects the next recording's
+            # audio setting; cannot change the current recording mid-stream
+            # (engine audio process is spawned once at recorder startup).
+            self._audio_enabled = audio_enabled
+            self._audio_item = None  # set by _build_recording_menu
 
             # App/tab list state
             # key → {app_name, bundle_id, domain, action, label, menu_item,
@@ -383,6 +436,26 @@ def _run_menubar(
         def _build_recording_menu(self):
             menu = NSMenu.alloc().init()
 
+            # Action button at the top (slot 0). Title + action swap on
+            # state transitions so the user sees "Stop Recording" while
+            # RECORDING and "▶ Start Recording" while IDLE — without
+            # reflowing the menu. Stored as ``self._action_item`` so
+            # ``_refresh_action_item`` can mutate it in place.
+            if self._session_mode and self._session_state == SESSION_STATE_IDLE:
+                action_title = "\u25b6 Start Recording"
+                action_selector = "startRecording:"
+            else:
+                action_title = "Stop Recording"
+                action_selector = "stopRecording:"
+            action_item = NSMenuItem.alloc().initWithTitle_action_keyEquivalent_(
+                action_title, action_selector, "",
+            )
+            action_item.setTarget_(self)
+            menu.addItem_(action_item)
+            self._action_item = action_item
+
+            menu.addItem_(NSMenuItem.separatorItem())
+
             # Label for the name field
             label_item = NSMenuItem.alloc().initWithTitle_action_keyEquivalent_(
                 "Name", None, "",
@@ -419,6 +492,29 @@ def _run_menubar(
 
             menu.addItem_(NSMenuItem.separatorItem())
 
+            # Audio default toggle — affects the NEXT recording.  The
+            # current recording's audio state is locked at recorder
+            # startup (engine audio process is spawned once, no
+            # pause/resume hook).  Clicking writes config.toml and, in
+            # session mode, pushes an ``audio_toggle`` event to the
+            # controller so the next ``_on_start_click`` honours the
+            # new value without waiting for a fresh session.
+            audio_state = "ON" if self._audio_enabled else "OFF"
+            audio_mark = "\u2713" if self._audio_enabled else "\u2717"
+            audio_color = _green_color if self._audio_enabled else _red_color
+            audio_attr = _build_menu_item_title(
+                audio_mark, audio_color, "",
+                f"Audio (next recording): {audio_state}",
+            )
+            self._audio_item = NSMenuItem.alloc().initWithTitle_action_keyEquivalent_(
+                "", "toggleAudio:", "",
+            )
+            self._audio_item.setAttributedTitle_(audio_attr)
+            self._audio_item.setTarget_(self)
+            menu.addItem_(self._audio_item)
+
+            menu.addItem_(NSMenuItem.separatorItem())
+
             # Detected Apps & Tabs header
             apps_header = NSMenuItem.alloc().initWithTitle_action_keyEquivalent_(
                 "Detected Apps & Tabs", None, "",
@@ -426,17 +522,27 @@ def _run_menubar(
             apps_header.setEnabled_(False)
             menu.addItem_(apps_header)
 
-            # Track where new app items get inserted (before the stop separator)
+            # Track where new app items get inserted. Apps land BELOW
+            # the header and ABOVE the trailing separator + Quit item,
+            # so ``_insert_index`` captures the position right after
+            # the header. Each insert increments ``_insert_index`` so
+            # the trailing separator + Quit stay pinned to the bottom
+            # of the menu as apps accumulate.
             self._insert_index = menu.numberOfItems()
 
-            menu.addItem_(NSMenuItem.separatorItem())
-
-            # Stop Recording
-            stop_item = NSMenuItem.alloc().initWithTitle_action_keyEquivalent_(
-                "Stop Recording", "stopRecording:", "",
-            )
-            stop_item.setTarget_(self)
-            menu.addItem_(stop_item)
+            # Session-mode Quit item pinned to the bottom of the menu,
+            # separated from the apps list. Only shown in session mode;
+            # legacy one-shot mode has no persistent session to quit.
+            if self._session_mode:
+                menu.addItem_(NSMenuItem.separatorItem())
+                quit_item = NSMenuItem.alloc().initWithTitle_action_keyEquivalent_(
+                    "Quit ScreenCap", "quitSession:", "",
+                )
+                quit_item.setTarget_(self)
+                menu.addItem_(quit_item)
+                self._quit_item = quit_item
+            else:
+                self._quit_item = None
 
             self._status_item.setMenu_(menu)
 
@@ -627,14 +733,129 @@ def _run_menubar(
                 _build_menu_item_title(mark, color, indent, info["label"])
             )
 
+        # ---- Controller message handling (session mode) ----
+
+        def _handle_control_msg(self, msg):
+            """Dispatch a single message drained from ``control_q``."""
+            if not isinstance(msg, dict):
+                return
+            mtype = msg.get("type")
+            if mtype == "window_event":
+                data = msg.get("data")
+                if isinstance(data, dict):
+                    self._process_window_event(data)
+                return
+            if mtype == "state":
+                new_state = msg.get("state", "idle")
+                self._session_state = new_state
+                if "name" in msg and msg.get("name"):
+                    self._recording_name = msg["name"]
+                if "start_time" in msg and msg.get("start_time"):
+                    try:
+                        self._start_time = float(msg["start_time"])
+                    except (TypeError, ValueError):
+                        pass
+                if "pending" in msg:
+                    try:
+                        self._pending_pp_count = int(msg["pending"])
+                    except (TypeError, ValueError):
+                        pass
+                self._refresh_action_item()
+                return
+            if mtype in ("pp_status", "pp_done"):
+                try:
+                    self._pending_pp_count = int(msg.get("pending", 0))
+                except (TypeError, ValueError):
+                    self._pending_pp_count = 0
+                self._refresh_action_item()
+                return
+            if mtype == "session_reset":
+                # Clear detected app list + first-seen dedup so the next
+                # recording starts with a fresh Apps/Tabs list.
+                try:
+                    menu = self._status_item.menu()
+                    for info in list(self._detected_items.values()):
+                        item = info.get("menu_item")
+                        if item is not None:
+                            idx = menu.indexOfItem_(item)
+                            if idx != -1:
+                                menu.removeItemAtIndex_(idx)
+                                self._insert_index -= 1
+                    self._detected_items.clear()
+                    self._item_order.clear()
+                    self._browser_last_item.clear()
+                except Exception:
+                    pass
+                self._prompt_state = PromptState()
+                return
+            if mtype == "shutdown":
+                self._cleanup()
+                return
+
+        def _refresh_action_item(self):
+            """Swap the action item's title + selector for the current state.
+
+            No-ops when neither the state nor the pending count has
+            changed since the last call, so AppKit setters don't churn
+            on every duplicate ``state`` / ``pp_status`` message.
+            """
+            item = getattr(self, "_action_item", None)
+            if item is None:
+                return
+            rendered_key = (self._session_state, self._pending_pp_count)
+            if rendered_key == getattr(self, "_action_item_rendered_key", None):
+                return
+            self._action_item_rendered_key = rendered_key
+
+            state = self._session_state
+            if state == SESSION_STATE_IDLE:
+                title = "\u25b6 Start Recording"
+                selector = "startRecording:"
+                if self._pending_pp_count > 0:
+                    title = (
+                        f"{title}   (processing {self._pending_pp_count}…)"
+                    )
+            elif state == SESSION_STATE_STOPPING:
+                title = "Stopping…"
+                selector = None
+            else:  # SESSION_STATE_RECORDING
+                title = "\u25a0 Stop Recording"
+                selector = "stopRecording:"
+            try:
+                item.setTitle_(title)
+                if selector is None:
+                    item.setAction_(None)
+                    item.setEnabled_(False)
+                else:
+                    item.setAction_(selector)
+                    item.setTarget_(self)
+                    item.setEnabled_(True)
+            except Exception:
+                pass
+
         # ---- Timer ----
 
         def tick_(self, timer):
             self._tick_count += 1
             elapsed = time.time() - self._start_time
 
-            # ---- Drain window feed queue (every tick for instant updates) ----
-            if self._window_feed_q is not None and not self._is_processing:
+            # ---- Drain controller channel (session mode) ----
+            if self._session_mode and self._control_q is not None:
+                drained = 0
+                while drained < _MAX_DRAIN_PER_TICK:
+                    try:
+                        msg = self._control_q.get_nowait()
+                    except (_queue_mod.Empty, OSError):
+                        break
+                    self._handle_control_msg(msg)
+                    drained += 1
+
+            # ---- Drain window feed queue (legacy mode) ----
+            if (
+                not self._session_mode
+                and self._window_feed_q is not None
+                and not self._is_processing
+            ):
                 drained = 0
                 while drained < _MAX_DRAIN_PER_TICK:
                     try:
@@ -646,10 +867,25 @@ def _run_menubar(
                 if drained > 0:
                     _dlog(f"tick: drained {drained} window event(s)")
 
+            # In session mode the "elapsed" timer only runs during the
+            # RECORDING state — in IDLE we freeze it at 0 so the menubar
+            # reflects "no capture in progress" until the next Start.
+            _not_recording = (
+                self._session_mode
+                and self._session_state != SESSION_STATE_RECORDING
+            )
+            if _not_recording:
+                elapsed = 0.0
+
             # ---- Pulse animation (every tick) ----
             if not self._is_processing:
                 self._pulse_idx = (self._pulse_idx + 1) % _PULSE_FRAMES
-                dots = _pulse_dots_gray if self._is_active_excluded else _pulse_dots_red
+                # In session IDLE state, use the gray palette so the
+                # status-bar dot clearly indicates "not recording".
+                if _not_recording:
+                    dots = _pulse_dots_gray
+                else:
+                    dots = _pulse_dots_gray if self._is_active_excluded else _pulse_dots_red
                 self._status_item.button().setAttributedTitle_(
                     _build_bar_title(dots[self._pulse_idx], elapsed)
                 )
@@ -722,15 +958,27 @@ def _run_menubar(
             info["user_toggled"] = True
             self._update_item_title(info)
 
-            # Send override to recorder (forward gating)
-            if self._override_q is not None:
+            override_payload = {
+                "key": key,
+                "bundle_id": info["bundle_id"],
+                "domain": info["domain"],
+                "action": new_action,
+            }
+
+            # Send override to recorder (forward gating). In session mode
+            # the controller owns the per-worker override_q, so we
+            # publish onto menubar_event_q and let it forward.
+            if self._session_mode and self._menubar_event_q is not None:
                 try:
-                    self._override_q.put_nowait({
-                        "key": key,
-                        "bundle_id": info["bundle_id"],
-                        "domain": info["domain"],
-                        "action": new_action,
+                    self._menubar_event_q.put_nowait({
+                        "type": "override",
+                        "data": override_payload,
                     })
+                except Exception:
+                    pass
+            elif self._override_q is not None:
+                try:
+                    self._override_q.put_nowait(override_payload)
                 except Exception:
                     pass
 
@@ -744,6 +992,53 @@ def _run_menubar(
                     domain=info["domain"],
                     source="menubar",
                 )
+
+        def _update_audio_item_title(self):
+            """Rebuild the audio item's attributed title from self._audio_enabled."""
+            if self._audio_item is None:
+                return
+            mark = "\u2713" if self._audio_enabled else "\u2717"
+            color = _green_color if self._audio_enabled else _red_color
+            state = "ON" if self._audio_enabled else "OFF"
+            attr = _build_menu_item_title(
+                mark, color, "",
+                f"Audio (next recording): {state}",
+            )
+            try:
+                self._audio_item.setAttributedTitle_(attr)
+            except Exception:
+                pass
+
+        def toggleAudio_(self, sender):
+            """Flip the next-recording audio default.
+
+            Writes ``config.toml`` so the change survives across
+            ``screencap start`` invocations.  In session mode also pushes
+            an ``audio_toggle`` event to the controller via
+            ``menubar_event_q`` so the new value applies to the next
+            recording started within the current session (which reads
+            from ``SessionController._audio_effective``, not
+            ``config.toml``).
+            """
+            new_value = not self._audio_enabled
+            try:
+                from screencap.config import set_audio_default
+                set_audio_default(new_value)
+            except Exception as exc:
+                _dlog(f"toggleAudio_: set_audio_default failed: {exc!r}")
+                return  # keep delegate state consistent with disk
+
+            self._audio_enabled = new_value
+            self._update_audio_item_title()
+
+            if self._session_mode and self._menubar_event_q is not None:
+                try:
+                    self._menubar_event_q.put_nowait({
+                        "type": "audio_toggle",
+                        "value": new_value,
+                    })
+                except Exception as exc:
+                    _dlog(f"toggleAudio_: menubar_event_q put failed: {exc!r}")
 
         # ---- First-seen prompt ----
 
@@ -894,21 +1189,32 @@ def _run_menubar(
         ):
             """Publish a retroactive-scrub job to the recorder side.
 
-            Best-effort; the queue is unbounded so put_nowait should not
-            normally block, but we tolerate ``Full`` and serialization
-            errors silently rather than crashing the menubar UI.
+            In session mode this is forwarded via ``menubar_event_q``;
+            the controller routes it to the active recording worker's
+            ``disable_q``. In legacy mode it goes directly onto the
+            worker's ``disable_q``. Best-effort either way.
             """
+            payload = {
+                "kind": "domain" if domain else "app",
+                "bundle_id": bundle_id,
+                "app_name": app_name,
+                "root_domain": domain,
+                "ts_unix": time.time(),
+                "source": source,
+            }
+            if self._session_mode and self._menubar_event_q is not None:
+                try:
+                    self._menubar_event_q.put_nowait({
+                        "type": "disable",
+                        "data": payload,
+                    })
+                except Exception:
+                    pass
+                return
             if self._disable_q is None:
                 return
             try:
-                self._disable_q.put_nowait({
-                    "kind": "domain" if domain else "app",
-                    "bundle_id": bundle_id,
-                    "app_name": app_name,
-                    "root_domain": domain,
-                    "ts_unix": time.time(),
-                    "source": source,
-                })
+                self._disable_q.put_nowait(payload)
             except Exception:
                 pass
 
@@ -985,12 +1291,42 @@ def _run_menubar(
             self._dismiss_active_panel()
 
         def stopRecording_(self, sender):
-            """Send SIGTERM to parent; escalates to SIGKILL after timeout."""
+            """Request stop.
+
+            Session mode: publish ``stop_click`` on ``menubar_event_q``
+            so the controller can orchestrate a clean stop + transition
+            to Idle. Legacy mode: SIGTERM the parent (the old one-shot
+            recorder path).
+            """
+            if self._session_mode and self._menubar_event_q is not None:
+                try:
+                    self._menubar_event_q.put_nowait({"type": "stop_click"})
+                except Exception:
+                    pass
+                return
             try:
                 if _is_screencap_process(self._parent_pid):
                     os.kill(self._parent_pid, signal.SIGTERM)
                     self._stop_sent_at = time.time()
             except (ProcessLookupError, PermissionError):
+                pass
+
+        def startRecording_(self, sender):
+            """Session mode: ask the controller to begin a new recording."""
+            if not self._session_mode or self._menubar_event_q is None:
+                return
+            try:
+                self._menubar_event_q.put_nowait({"type": "start_click"})
+            except Exception:
+                pass
+
+        def quitSession_(self, sender):
+            """Session mode: ask the controller to tear down the session."""
+            if not self._session_mode or self._menubar_event_q is None:
+                return
+            try:
+                self._menubar_event_q.put_nowait({"type": "quit_click"})
+            except Exception:
                 pass
 
         def _cleanup(self):
