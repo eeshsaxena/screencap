@@ -1,6 +1,13 @@
 """Wrap screencap engine Recorder for screencap."""
 
+# ruff: noqa: I001
+# Load-bearing import order: ``screencap._startup`` must come before
+# ``multiprocessing`` so its PYTHONWARNINGS filter is set before the
+# resource_tracker subprocess spawns.
+
 from __future__ import annotations
+
+from screencap import _startup  # noqa: F401
 
 import atexit
 import multiprocessing
@@ -12,15 +19,6 @@ import sys
 import threading
 import time
 import warnings
-
-# Suppress "leaked semaphore objects" warnings from the multiprocessing
-# resource_tracker subprocess.  These are cosmetic — the OS reclaims the
-# semaphores at process exit.  The env var is inherited by the tracker
-# subprocess before its warnings module is initialised.
-_pw = os.environ.get("PYTHONWARNINGS", "")
-_filter = "ignore::UserWarning:multiprocessing.resource_tracker"
-if _filter not in _pw:
-    os.environ["PYTHONWARNINGS"] = f"{_pw},{_filter}" if _pw else _filter
 from pathlib import Path
 
 from rich import box
