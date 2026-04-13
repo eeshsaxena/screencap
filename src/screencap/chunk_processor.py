@@ -11,7 +11,6 @@ import json
 import logging
 import os
 import sqlite3
-import sys
 import threading
 import time
 from pathlib import Path
@@ -1000,7 +999,7 @@ def upload_sentinel(
     Always creates the local file even if upload fails (for recovery via
     ``screencap upload``).  Returns True if upload succeeded.
     """
-    from screencap.upload import FileInfo, _content_type, request_signed_urls
+    from screencap.upload import FileInfo, request_signed_urls
 
     sentinel_data = _build_sentinel_data(
         recording_name, stop_reason, chunks_expected,
@@ -1050,7 +1049,6 @@ def stub_recording(recording_dir: Path) -> list[str]:
         "recording_complete.json",
     }
     keep_prefixes = (".chunk_", "chunk_")
-    keep_suffixes = ("_manifest.json", ".json", ".txt")
     deleted = []
 
     for p in sorted(recording_dir.iterdir()):
