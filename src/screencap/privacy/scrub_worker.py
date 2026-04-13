@@ -42,6 +42,7 @@ import time
 from pathlib import Path
 from typing import Any
 
+from screencap._flush import wait_for_writer_flush
 from screencap.privacy.context import domain_from_url
 from screencap.privacy.disable_log import DisableLogWriter
 from screencap.privacy.domain_loader import extract_root_domain
@@ -65,10 +66,6 @@ _QUEUE_POLL_TIMEOUT = 5.0
 # most recent same-bundle window event so we never extend further back
 # than the previous page in the same browser process.
 _INTERVAL_PRELUDE_SECONDS = 2.0
-
-# Engine flush poll budget — must be ≤ chunk_processor's deadline.
-_FLUSH_DEADLINE_SECONDS = 5.0
-_FLUSH_STABLE_SECONDS = 1.0
 
 _EMPTY_COUNTS: dict[str, int] = {
     "window_events": 0,
@@ -193,50 +190,19 @@ class ScrubWorker:
     def _trigger_flush(self) -> None:
         """Force engine writer processes to commit buffered inserts.
 
-        Mirrors :meth:`ChunkProcessor._trigger_flush`. The
-        ``flush_ack_counter`` is shared with chunk_processor and writer
-        processes — ``flush_lock`` (a threading.Lock owned by the
-        recorder) serializes the two consumers so one's reset doesn't
-        zero out the other's in-flight ack count.
+        Shares the handshake with :meth:`ChunkProcessor._trigger_flush`
+        via ``flush_lock`` so the two consumers don't race on the shared
+        ``flush_ack_counter``. Released before the SQLite SELECT/DELETE
+        so chunk_processor isn't blocked while we're scrubbing rows.
         """
-        if self._flush_requested is None or self._flush_ack_counter is None:
-            return
-
-        # Held only for the duration of the flush handshake — released
-        # before the SQLite SELECT/DELETE so chunk_processor isn't
-        # blocked while we're scrubbing rows.
-        if self._flush_lock is not None:
-            self._flush_lock.acquire()
-        try:
-            with self._flush_ack_counter.get_lock():
-                self._flush_ack_counter.value = 0
-
-            self._flush_requested.set()
-
-            deadline = time.time() + _FLUSH_DEADLINE_SECONDS
-            prev_acked = 0
-            stable_since = time.time()
-            while time.time() < deadline and not self._stop_event.is_set():
-                time.sleep(0.1)
-                with self._flush_ack_counter.get_lock():
-                    acked = self._flush_ack_counter.value
-                if acked > prev_acked:
-                    prev_acked = acked
-                    stable_since = time.time()
-                elif acked > 0 and time.time() - stable_since > _FLUSH_STABLE_SECONDS:
-                    break
-
-            self._flush_requested.clear()
-
-            with self._flush_ack_counter.get_lock():
-                acked = self._flush_ack_counter.value
-            if acked == 0:
-                logger.debug("scrub_worker: flush skipped (no writers acked)")
-            else:
-                logger.info("scrub_worker: flushed %d writer(s)", acked)
-        finally:
-            if self._flush_lock is not None:
-                self._flush_lock.release()
+        wait_for_writer_flush(
+            flush_requested=self._flush_requested,
+            flush_ack_counter=self._flush_ack_counter,
+            flush_lock=self._flush_lock,
+            stop_event=self._stop_event,
+            logger=logger,
+            caller="scrub_worker",
+        )
 
     # ------------------------------------------------------------------
     # Job handling
