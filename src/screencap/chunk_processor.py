@@ -11,10 +11,11 @@ import json
 import logging
 import os
 import sqlite3
-import sys
 import threading
 import time
 from pathlib import Path
+
+from screencap._flush import wait_for_writer_flush
 
 logger = logging.getLogger(__name__)
 
@@ -320,53 +321,15 @@ class ChunkProcessor:
     # _mask_chunk_screenshots removed — replaced by scrub_pipeline.mask_screenshots()
 
     def _trigger_flush(self) -> None:
-        """Trigger writer processes to flush DB buffers before event export.
-
-        Cross-process flush protocol: sets flush_requested Event → writers
-        call flush_buffers() and increment counter → we wait and clear.
-
-        ``flush_lock`` (a threading.Lock owned by the recorder) serializes
-        this call with ScrubWorker._trigger_flush so the two consumers
-        don't race on the shared flush_ack_counter — one would otherwise
-        zero out the other's in-flight ack count mid-poll.
-        """
-        if self._flush_requested is None or self._flush_ack_counter is None:
-            return
-
-        if self._flush_lock is not None:
-            self._flush_lock.acquire()
-        try:
-            with self._flush_ack_counter.get_lock():
-                self._flush_ack_counter.value = 0
-
-            self._flush_requested.set()
-
-            # Poll for acks — wait up to 5s, stop early once acks stabilize
-            deadline = time.time() + 5.0
-            prev_acked = 0
-            stable_since = time.time()
-            while time.time() < deadline and not self._stop_event.is_set():
-                time.sleep(0.1)
-                with self._flush_ack_counter.get_lock():
-                    acked = self._flush_ack_counter.value
-                if acked > prev_acked:
-                    prev_acked = acked
-                    stable_since = time.time()
-                elif acked > 0 and time.time() - stable_since > 1.0:
-                    # No new acks for 1s after at least one — all active writers done
-                    break
-
-            self._flush_requested.clear()
-
-            with self._flush_ack_counter.get_lock():
-                acked = self._flush_ack_counter.value
-            if acked == 0:
-                logger.debug("Flush skipped: writers already finished")
-            else:
-                logger.info(f"Flush: {acked} writer(s) flushed buffers")
-        finally:
-            if self._flush_lock is not None:
-                self._flush_lock.release()
+        """Trigger writer processes to flush DB buffers before event export."""
+        wait_for_writer_flush(
+            flush_requested=self._flush_requested,
+            flush_ack_counter=self._flush_ack_counter,
+            flush_lock=self._flush_lock,
+            stop_event=self._stop_event,
+            logger=logger,
+            caller="chunk_processor",
+        )
 
     def _wait_for_audio(self, idx: int, *, is_final: bool = False) -> None:
         """Wait for audio process to confirm rotation/finalization."""
@@ -1036,7 +999,7 @@ def upload_sentinel(
     Always creates the local file even if upload fails (for recovery via
     ``screencap upload``).  Returns True if upload succeeded.
     """
-    from screencap.upload import FileInfo, _content_type, request_signed_urls
+    from screencap.upload import FileInfo, request_signed_urls
 
     sentinel_data = _build_sentinel_data(
         recording_name, stop_reason, chunks_expected,
@@ -1086,7 +1049,6 @@ def stub_recording(recording_dir: Path) -> list[str]:
         "recording_complete.json",
     }
     keep_prefixes = (".chunk_", "chunk_")
-    keep_suffixes = ("_manifest.json", ".json", ".txt")
     deleted = []
 
     for p in sorted(recording_dir.iterdir()):
