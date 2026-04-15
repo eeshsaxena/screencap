@@ -554,6 +554,45 @@ class TestBlockedIntervalsInManifest:
             {"start_ts": 1000.5, "end_ts": 1010.0, "reason": "app_policy"},
         ]
 
+    def test_manifest_generation_failure_deletes_partial_file_and_fails_chunk(
+        self, cloud_capture_dir,
+    ):
+        """If _generate_manifest raises, any partially-written manifest must
+        be removed so a subsequent ``screencap upload`` doesn't ship a
+        truncated JSON, and the chunk must be marked failed."""
+        from screencap.chunk_processor import ChunkProcessor
+
+        q = multiprocessing.Queue()
+        ack_q = multiprocessing.Queue()
+
+        cp = ChunkProcessor(
+            cloud_capture_dir, q, ack_q, recording_name="test",
+            upload_enabled=False, auto_delete=False, cloud_intent=False,
+        )
+
+        partial = cloud_capture_dir / "chunk_0000_manifest.json"
+
+        def failing_generate(idx, *args, **kwargs):
+            # Simulate a mid-write failure that leaves a partial file on disk.
+            partial.write_text('{"partial":')
+            raise RuntimeError("manifest write blew up")
+
+        with patch.object(cp, "_generate_manifest", side_effect=failing_generate), \
+             patch.object(cp, "_wait_for_audio"), \
+             patch.object(cp, "_transcribe", return_value=None), \
+             patch.object(cp, "_trigger_flush"), \
+             patch.object(cp, "_export_events"):
+            try:
+                cp._process_chunk({
+                    "completed_index": 0,
+                    "chunk_start_time": 1000.0,
+                    "rotation_time": 1060.0,
+                })
+            except RuntimeError:
+                pass
+
+        assert not partial.exists(), "partial manifest must be removed"
+
 
 class TestPlaceholderFrame:
     """Tests for Phase 1: placeholder frame generation."""

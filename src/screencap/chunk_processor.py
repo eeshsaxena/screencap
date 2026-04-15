@@ -342,7 +342,14 @@ class ChunkProcessor:
                 blocked_intervals = self._screen_filter.get_blocked_intervals(start_ts, end_ts) or None
             except Exception:
                 logger.warning(f"Failed to get blocked_intervals for chunk {idx}", exc_info=True)
-        self._generate_manifest(idx, start_ts, end_ts, blocked_intervals=blocked_intervals)
+        try:
+            self._generate_manifest(idx, start_ts, end_ts, blocked_intervals=blocked_intervals)
+        except Exception:
+            logger.exception(f"Chunk {idx}: manifest generation failed")
+            # Remove any partially-written manifest so a later retry
+            # (or screencap upload) doesn't ship a truncated file.
+            (self._capture_dir / f"chunk_{idx:04d}_manifest.json").unlink(missing_ok=True)
+            raise
 
         # 5. Scrub text surfaces + mask screenshots when user opted in.
         if self._scrub_enabled and self._pipeline is not None:
