@@ -418,6 +418,7 @@ class ChunkProcessor:
             except Exception:
                 continue
         logger.warning(f"Audio ack for chunk {idx} not received in 60s, proceeding")
+        self._set_status("Audio ack timeout — proceeding")
 
     def _transcribe(self, idx: int) -> Path | None:
         """Transcribe audio chunk quietly (no print output). Returns transcript path or None."""

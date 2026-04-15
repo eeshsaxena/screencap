@@ -769,7 +769,16 @@ def auto_name(
     result = _run_provider_chain(context, local_only=local_only)
 
     if not result:
-        console.print("[dim]Auto-naming skipped — no LLM provider available.[/dim]")
+        hint = (
+            "install Ollama or set ANTHROPIC_API_KEY / OPENAI_API_KEY"
+            if local_only
+            else "check claude/chatgpt CLI, API keys, or Ollama"
+        )
+        console.print(
+            f"[yellow]Warning:[/yellow] auto-naming failed — no LLM provider responded. "
+            f"Saved as [bold]{capture_dir.name}[/bold] "
+            f"([dim]{hint}[/dim])"
+        )
         return capture_dir
 
     slug = result["slug"]
