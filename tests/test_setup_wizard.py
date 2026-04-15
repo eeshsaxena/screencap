@@ -102,6 +102,39 @@ class TestGroupApps:
         assert len(auto_allowed) == 1
         assert all(len(g) == 0 for g in groups.values())
 
+    def test_category_safe_force_review_lands_in_unclassified(self):
+        """Under force_review (scan mode), category_safe apps surface for user review."""
+        classified = {
+            "notion.id": (_make_app("notion.id", "Notion"), ContextClass.UNKNOWN, "category_safe"),
+        }
+        groups, auto_allowed = _group_apps(classified, force_review=True)
+        assert len(auto_allowed) == 0
+        assert len(groups["unclassified"]) == 1
+        assert groups["unclassified"][0][0].bundle_id == "notion.id"
+
+    def test_force_review_covers_all_safe_sources(self):
+        """Lifecycle/decoration/apple_prefix apps also surface under force_review."""
+        classified = {
+            "com.example.updater": (_make_app("com.example.updater", "AppUpdater"), ContextClass.UNKNOWN, "lifecycle"),
+            "com.example.widget": (_make_app("com.example.widget", "Widget"), ContextClass.UNKNOWN, "decoration"),
+            "com.apple.Something": (_make_app("com.apple.Something", "Something"), ContextClass.UNKNOWN, "apple_prefix"),
+        }
+        groups, auto_allowed = _group_apps(classified, force_review=True)
+        assert len(auto_allowed) == 0
+        assert len(groups["unclassified"]) == 3
+
+    def test_force_review_still_filters_background_daemons(self):
+        """Genuine LSUIElement/LSBackgroundOnly daemons stay auto-allowed even under force_review."""
+        classified = {
+            "com.example.daemon": (
+                _make_app("com.example.daemon", "SomeDaemon", is_background=True),
+                ContextClass.UNKNOWN, "category_safe",
+            ),
+        }
+        groups, auto_allowed = _group_apps(classified, force_review=True)
+        assert len(auto_allowed) == 1
+        assert all(len(g) == 0 for g in groups.values())
+
     def test_background_apps_auto_allowed(self):
         classified = {
             "com.example.agent": (
