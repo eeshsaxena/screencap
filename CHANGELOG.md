@@ -5,6 +5,11 @@ All notable changes to this project will be documented in this file.
 The format is based on [Keep a Changelog](https://keepachangelog.com/),
 and this project adheres to [Semantic Versioning](https://semver.org/).
 
+## [Unreleased]
+
+### Fixed
+- **Unlisted cloud recordings no longer report chunk 0 as failed:** The `_unlisted` marker is now accepted by the Cloud Function's filename regex, and the client treats marker files as non-core so a server rejection never marks the chunk as failed. Previously every unlisted recording surfaced `Server returned no URL for core file _unlisted` and `0 of 1 chunks uploaded` even though the actual media uploaded fine.
+
 ## [0.17.1] - 2026-04-13
 
 Re-release of v0.17.0 — republished to retrigger the CI release workflow. Binary content is identical to v0.17.0; entries below mirror that release for convenience.

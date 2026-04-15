@@ -44,7 +44,7 @@ MAX_FILES = 500
 # Only allow safe characters in recording and file names.
 # Slashes allowed in file names (for subdirectories like screenshots/0.png).
 _RECORDING_RE = re.compile(r"^[a-zA-Z0-9][a-zA-Z0-9._-]{0,255}$")
-_FILENAME_RE = re.compile(r"^[a-zA-Z0-9][a-zA-Z0-9._/-]{0,511}$")
+_FILENAME_RE = re.compile(r"^[a-zA-Z0-9_][a-zA-Z0-9._/-]{0,511}$")
 
 CORS_HEADERS = {
     "Access-Control-Allow-Origin": "*",

@@ -1195,3 +1195,115 @@ class TestPrivacyFailureDataLoss:
         for i in range(7):
             assert (tmp_path / f"chunk_{i:04d}.mp4").exists(), \
                 f"chunk_{i:04d}.mp4 was deleted — data loss!"
+
+
+
+# ---------------------------------------------------------------------------
+# _unlisted marker behaviour
+# ---------------------------------------------------------------------------
+
+
+class TestUnlistedMarker:
+    """The _unlisted marker is non-core; a server rejection must not fail the chunk."""
+
+    def test_collect_chunk_files_includes_unlisted_when_hidden(self, cloud_capture_dir):
+        """Chunk 0 appends _unlisted when show_on_website=False."""
+        from screencap.chunk_processor import ChunkProcessor
+
+        q = multiprocessing.Queue()
+        ack_q = multiprocessing.Queue()
+
+        (cloud_capture_dir / "chunk_0000.mp4").write_bytes(b"v")
+        (cloud_capture_dir / "audio_0000.flac").write_bytes(b"a")
+        (cloud_capture_dir / "events_0000.jsonl").write_text("{}\n")
+
+        cp = ChunkProcessor(
+            cloud_capture_dir, q, ack_q, recording_name="test",
+            upload_enabled=False, auto_delete=False,
+            show_on_website=False,
+        )
+        names = [f["name"] for f in cp._collect_chunk_files(0, None)]
+        assert "_unlisted" in names
+
+    def test_collect_chunk_files_omits_unlisted_when_visible(self, cloud_capture_dir):
+        """Default visible recordings must not upload a marker."""
+        from screencap.chunk_processor import ChunkProcessor
+
+        q = multiprocessing.Queue()
+        ack_q = multiprocessing.Queue()
+
+        (cloud_capture_dir / "chunk_0000.mp4").write_bytes(b"v")
+
+        cp = ChunkProcessor(
+            cloud_capture_dir, q, ack_q, recording_name="test",
+            upload_enabled=False, auto_delete=False,
+            show_on_website=True,
+        )
+        names = [f["name"] for f in cp._collect_chunk_files(0, None)]
+        assert "_unlisted" not in names
+
+    def test_collect_chunk_files_omits_unlisted_for_later_chunks(self, cloud_capture_dir):
+        """Marker is only appended on chunk 0, not subsequent chunks."""
+        from screencap.chunk_processor import ChunkProcessor
+
+        q = multiprocessing.Queue()
+        ack_q = multiprocessing.Queue()
+
+        (cloud_capture_dir / "chunk_0001.mp4").write_bytes(b"v")
+
+        cp = ChunkProcessor(
+            cloud_capture_dir, q, ack_q, recording_name="test",
+            upload_enabled=False, auto_delete=False,
+            show_on_website=False,
+        )
+        names = [f["name"] for f in cp._collect_chunk_files(1, None)]
+        assert "_unlisted" not in names
+
+    def test_upload_chunk_files_unlisted_rejection_non_fatal(self, tmp_path):
+        """Server omitting _unlisted from signed-url response must not fail the chunk."""
+        from screencap.chunk_processor import upload_chunk_files
+
+        chunk_path = tmp_path / "chunk_0000.mp4"
+        chunk_path.write_bytes(b"v")
+        marker_path = tmp_path / "_unlisted"
+        marker_path.touch()
+
+        files = [
+            {"name": "chunk_0000.mp4", "path": chunk_path},
+            {"name": "_unlisted", "path": marker_path},
+        ]
+
+        # Server returns a URL for the media file but silently drops _unlisted
+        # (legacy behaviour — mirrors what the old filename regex did).
+        def fake_request_signed_urls(recording_name, file_infos):
+            return ({"chunk_0000.mp4": "https://example.com/signed"}, "gs://bucket/test/")
+
+        with mock.patch(
+            "screencap.upload.request_signed_urls",
+            side_effect=fake_request_signed_urls,
+        ), mock.patch(
+            "screencap.chunk_processor._upload_single"
+        ) as mock_upload_single:
+            result = upload_chunk_files("test", files, tmp_path)
+
+        assert result is True, (
+            "Missing URL for _unlisted must not fail the chunk — it is non-core"
+        )
+        # Only the core media file was actually uploaded
+        assert mock_upload_single.call_count == 1
+
+    def test_upload_chunk_files_core_rejection_still_fatal(self, tmp_path):
+        """A genuine core-file rejection must still fail the chunk."""
+        from screencap.chunk_processor import upload_chunk_files
+
+        chunk_path = tmp_path / "chunk_0000.mp4"
+        chunk_path.write_bytes(b"v")
+        files = [{"name": "chunk_0000.mp4", "path": chunk_path}]
+
+        with mock.patch(
+            "screencap.upload.request_signed_urls",
+            return_value=({}, "gs://bucket/test/"),
+        ):
+            result = upload_chunk_files("test", files, tmp_path)
+
+        assert result is False

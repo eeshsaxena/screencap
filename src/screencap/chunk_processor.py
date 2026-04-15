@@ -828,6 +828,12 @@ def _save_transcript_quiet(
     )
 
 
+# Marker files that are not part of the recording payload and must never
+# fail the chunk if the server rejects them (e.g. legacy Cloud Functions
+# whose filename regex forbade a leading underscore).
+_NON_CORE_NAMES = frozenset({"_unlisted"})
+
+
 def upload_chunk_files(
     recording_name: str, files: list[dict], capture_dir: Path,
 ) -> bool:
@@ -863,12 +869,17 @@ def upload_chunk_files(
 
     core_ok = True
     for fi in file_infos:
-        is_core = not fi.name.startswith("transcript")
+        is_core = (
+            not fi.name.startswith("transcript")
+            and fi.name not in _NON_CORE_NAMES
+        )
         if fi.name not in urls:
             # Server didn't return a URL at all — file was rejected/unknown
             if is_core:
                 logger.error(f"Server returned no URL for core file {fi.name}")
                 core_ok = False
+            else:
+                logger.warning(f"Server did not accept non-core file {fi.name}")
             continue
         url = urls[fi.name]
         if url is None:

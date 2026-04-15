@@ -1241,3 +1241,19 @@ def test_smoke_test_exits_zero_on_all_pass():
     assert result.exit_code == 0
     assert "PASS" in result.output
     assert "dev install" in result.output
+
+
+def test_cloud_function_filename_regex_allows_marker():
+    """Regression: _unlisted marker must match the server filename regex."""
+    import re
+    # Mirror the regex at scripts/cloud-function/main.py:47 — duplicated here
+    # so the test does not need to import the cloud-function module (which
+    # pulls in Flask / GCP clients not available in the dev test env).
+    filename_re = re.compile(r"^[a-zA-Z0-9_][a-zA-Z0-9._/-]{0,511}$")
+    assert filename_re.match("_unlisted")
+    assert filename_re.match("chunk_0000.mp4")
+    assert filename_re.match("screenshots/0.jpg")
+    # Hidden dotfiles and traversal must still be rejected
+    assert not filename_re.match(".hidden")
+    assert not filename_re.match("-leading-dash")
+    assert not filename_re.match("/absolute/path")
