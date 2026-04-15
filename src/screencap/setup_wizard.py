@@ -116,6 +116,7 @@ def _classify_with_overrides(
 
 def _group_apps(
     classified: dict[str, tuple[AppMetadata, ContextClass, str]],
+    force_review: bool = False,
 ) -> tuple[
     dict[str, list[tuple[AppMetadata, ContextClass, str]]],
     list[tuple[AppMetadata, ContextClass, str]],
@@ -124,6 +125,11 @@ def _group_apps(
 
     Background apps and safe auto-classified apps are collected separately
     (silently auto-allowed, not shown in wizard).
+
+    When ``force_review`` is True (scan mode), safe-source auto-allow is
+    disabled so every recording-seen app surfaces in the "Needs your input"
+    group — genuine background daemons (LSUIElement/LSBackgroundOnly) are
+    still filtered out.
 
     Returns:
         (groups, auto_allowed) where groups are the visible display groups
@@ -138,8 +144,7 @@ def _group_apps(
     auto_allowed: list[tuple[AppMetadata, ContextClass, str]] = []
 
     for _bid, (meta, cls, source) in classified.items():
-        # Background apps and safe-classified apps are silently auto-allowed
-        if is_background_app(meta) or source in _SAFE_SOURCES:
+        if is_background_app(meta) or (not force_review and source in _SAFE_SOURCES):
             auto_allowed.append((meta, cls, source))
             continue
 
@@ -149,7 +154,7 @@ def _group_apps(
             groups["communication"].append((meta, cls, source))
         elif cls in _CODE_CLASSES:
             groups["safe"].append((meta, cls, source))
-        elif source == "unknown":
+        elif source == "unknown" or force_review:
             groups["unclassified"].append((meta, cls, source))
         else:
             # known_app, apple_sensitive, pattern_rule, category_map
@@ -649,7 +654,7 @@ def run_setup_wizard(
         console.print(f"\nFound {len(new_classified)} app(s) from recordings to classify.")
         classified = new_classified
 
-    groups, auto_allowed = _group_apps(classified)
+    groups, auto_allowed = _group_apps(classified, force_review=scan_only)
 
     # Interactive review via curses TUI
     try:
