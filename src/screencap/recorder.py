@@ -10,6 +10,7 @@ from __future__ import annotations
 from screencap import _startup  # noqa: F401
 
 import atexit
+import json
 import multiprocessing
 import os
 import shutil
@@ -259,6 +260,56 @@ def print_summary(name: str, capture_dir: Path, elapsed: float) -> None:
         console.print(f"    [bold #22d3ee]{cmd:<38}[/bold #22d3ee] [dim]{desc}[/dim]")
 
     console.print()
+
+
+FOLLOWUP_FORCE_STOPPED = "force_stopped"
+FOLLOWUP_NONE_UPLOADED = "none_uploaded"
+FOLLOWUP_UPLOAD_DISABLED = "upload_disabled"
+FOLLOWUP_PARTIAL = "partial"
+
+_FOLLOWUP_MESSAGES = {
+    FOLLOWUP_FORCE_STOPPED: lambda d, cmd: (
+        "Some chunks may not have been uploaded (processing timed out).\n"
+        f"  Run [bold]{cmd}[/bold] to upload remaining data."
+    ),
+    FOLLOWUP_NONE_UPLOADED: lambda d, cmd: (
+        "No chunks were uploaded.\n"
+        f"  Run [bold]{cmd}[/bold] to upload the recording."
+    ),
+    FOLLOWUP_UPLOAD_DISABLED: lambda d, cmd: (
+        f"Uploads disabled: {d.get('upload_warning')}\n"
+        f"  Run [bold]{cmd}[/bold] after fixing the issue."
+    ),
+    FOLLOWUP_PARTIAL: lambda d, cmd: (
+        f"{d.get('n_uploaded', 0)} of {d.get('n_total', 0)} chunks uploaded.\n"
+        f"  Run [bold]{cmd}[/bold] to upload the rest."
+    ),
+}
+
+
+def print_upload_followup(recording_name: str, capture_dir: Path) -> None:
+    """Print the deferred upload follow-up warning, if any.
+
+    ``start_recording`` writes ``.upload_followup.json`` when the live-upload
+    path did not fully succeed. The CLI / session controller invokes this
+    helper *after* any post-recording rename so the suggested
+    ``screencap upload <name>`` command matches the final on-disk directory.
+    No-op if the follow-up file is missing.
+    """
+    followup_path = capture_dir / ".upload_followup.json"
+    try:
+        data = json.loads(followup_path.read_text())
+    except FileNotFoundError:
+        return
+    except (OSError, ValueError):
+        followup_path.unlink(missing_ok=True)
+        return
+
+    msg = _FOLLOWUP_MESSAGES.get(data.get("kind"))
+    if msg is not None:
+        console.print(f"[yellow]{msg(data, f'screencap upload {recording_name}')}[/yellow]")
+
+    followup_path.unlink(missing_ok=True)
 
 
 # ---------------------------------------------------------------------------
@@ -1481,27 +1532,27 @@ def start_recording(
                 if verbose:
                     console.print(f"[yellow]Warning:[/yellow] Stub failed: {e}")
         elif live_upload and (not _all_uploaded or not _has_chunk_files):
-            _upload_cmd = f"screencap upload {_recording_name}"
+            # Defer the warning print until after the post-recording rename
+            # (menubar / auto-name) so the suggested `screencap upload <name>`
+            # command matches the final on-disk directory. See
+            # print_upload_followup() below.
             if chunk_processor.was_force_stopped:
-                console.print(
-                    "[yellow]Some chunks may not have been uploaded (processing timed out).\n"
-                    f"  Run [bold]{_upload_cmd}[/bold] to upload remaining data.[/yellow]"
-                )
+                _followup_kind = FOLLOWUP_FORCE_STOPPED
             elif _n_total == 0:
-                console.print(
-                    "[yellow]No chunks were uploaded.\n"
-                    f"  Run [bold]{_upload_cmd}[/bold] to upload the recording.[/yellow]"
-                )
+                _followup_kind = FOLLOWUP_NONE_UPLOADED
             elif chunk_processor.upload_warning:
-                console.print(
-                    f"[yellow]Uploads disabled: {chunk_processor.upload_warning}\n"
-                    f"  Run [bold]{_upload_cmd}[/bold] after fixing the issue.[/yellow]"
-                )
+                _followup_kind = FOLLOWUP_UPLOAD_DISABLED
             else:
-                console.print(
-                    f"[yellow]{_n_uploaded} of {_n_total} chunks uploaded.\n"
-                    f"  Run [bold]{_upload_cmd}[/bold] to upload the rest.[/yellow]"
-                )
+                _followup_kind = FOLLOWUP_PARTIAL
+            try:
+                (capture_dir / ".upload_followup.json").write_text(json.dumps({
+                    "kind": _followup_kind,
+                    "n_uploaded": _n_uploaded,
+                    "n_total": _n_total,
+                    "upload_warning": chunk_processor.upload_warning or None,
+                }))
+            except OSError:
+                pass
 
     # NOTE: intentionally NOT recomputing ``elapsed = time.time() - t0``
     # here. The live loop above already froze ``elapsed`` at the moment

@@ -1243,6 +1243,55 @@ def test_smoke_test_exits_zero_on_all_pass():
     assert "dev install" in result.output
 
 
+def _collect_followup_output(recording_name, capture_dir):
+    """Run print_upload_followup and return the joined console.print args."""
+    from screencap.recorder import print_upload_followup
+
+    with mock.patch("screencap.recorder.console.print") as mock_print:
+        print_upload_followup(recording_name, capture_dir)
+    return "\n".join(
+        " ".join(str(a) for a in call.args)
+        for call in mock_print.call_args_list
+    )
+
+
+def test_print_upload_followup_uses_final_name_after_rename(tmp_path):
+    """Follow-up warning must name the final (post-rename) directory."""
+    renamed_dir = tmp_path / "my-awesome-task"
+    renamed_dir.mkdir()
+    (renamed_dir / ".upload_followup.json").write_text(json.dumps({
+        "kind": "partial",
+        "n_uploaded": 2,
+        "n_total": 3,
+        "upload_warning": None,
+    }))
+
+    output = _collect_followup_output("my-awesome-task", renamed_dir)
+
+    assert "screencap upload my-awesome-task" in output
+    assert "2 of 3 chunks uploaded" in output
+    assert not (renamed_dir / ".upload_followup.json").exists()
+
+
+def test_print_upload_followup_noop_without_marker(tmp_path):
+    """Missing .upload_followup.json is a no-op."""
+    output = _collect_followup_output("whatever", tmp_path)
+    assert output == ""
+
+
+def test_print_upload_followup_force_stopped_message(tmp_path):
+    """force_stopped kind emits the timeout message."""
+    (tmp_path / ".upload_followup.json").write_text(json.dumps({
+        "kind": "force_stopped",
+        "n_uploaded": 0,
+        "n_total": 0,
+        "upload_warning": None,
+    }))
+    output = _collect_followup_output("rec-X", tmp_path)
+    assert "processing timed out" in output
+    assert "screencap upload rec-X" in output
+
+
 def test_cloud_function_filename_regex_allows_marker():
     """Regression: _unlisted marker must match the server filename regex."""
     import re

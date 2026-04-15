@@ -9,6 +9,7 @@ and this project adheres to [Semantic Versioning](https://semver.org/).
 
 ### Fixed
 - **Unlisted cloud recordings no longer report chunk 0 as failed:** The `_unlisted` marker is now accepted by the Cloud Function's filename regex, and the client treats marker files as non-core so a server rejection never marks the chunk as failed. Previously every unlisted recording surfaced `Server returned no URL for core file _unlisted` and `0 of 1 chunks uploaded` even though the actual media uploaded fine.
+- **Post-rename upload follow-up warning names the right directory:** When a recording was renamed via the menu bar or the auto-namer, the `Run screencap upload <name>` hint shown on partial uploads used to print the original timestamp-based name, which no longer matched any on-disk directory. The hint is now emitted after the rename completes, using the final directory name.
 
 ## [0.17.1] - 2026-04-13
 

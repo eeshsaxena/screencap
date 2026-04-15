@@ -564,6 +564,9 @@ def _legacy_start_recording(
                 "[yellow]Naming cancelled — keeping timestamp name[/yellow]"
             )
 
+    from screencap.recorder import print_upload_followup
+    print_upload_followup(final_name, final_dir)
+
     print_summary(final_name, final_dir, elapsed)
 
     try:

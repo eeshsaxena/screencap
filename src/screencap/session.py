@@ -359,7 +359,7 @@ def _postprocess_pipeline(
 
     # Summary + unclassified-apps report (best-effort, non-fatal)
     try:
-        from screencap.recorder import print_summary
+        from screencap.recorder import print_summary, print_upload_followup
 
         # We don't have elapsed inside the post-process worker — read it
         # from .recording_ready if present.
@@ -367,6 +367,7 @@ def _postprocess_pipeline(
             elapsed = float(_read_recording_ready(final_dir).get("elapsed", 0.0))
         except (TypeError, ValueError):
             elapsed = 0.0
+        print_upload_followup(final_name, final_dir)
         print_summary(final_name, final_dir, elapsed)
     except Exception:
         pass
