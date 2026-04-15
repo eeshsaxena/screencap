@@ -957,12 +957,15 @@ def test_stub_recording_not_called_when_uploads_disabled(recording_env):
 
 
 def test_upload_warning_surfaced_at_stop(recording_env):
-    """T5: When upload_warning is set, stop output shows the specific failure reason.
+    """T5: When upload_warning is set, the follow-up surfaces the specific failure reason.
 
-    The recorder shutdown path must display the upload_warning from
-    ChunkProcessor instead of the generic 'N of M chunks uploaded' message.
+    The recorder writes ``.upload_followup.json`` with ``kind="upload_disabled"``
+    and the specific warning text; the CLI / session controller prints it
+    (via ``print_upload_followup``) after any post-recording rename, so the
+    suggested ``screencap upload <name>`` command matches the final on-disk
+    directory.
     """
-    from screencap.recorder import start_recording
+    from screencap.recorder import print_upload_followup, start_recording
 
     rec_dir = recording_env["recordings_dir"] / "test-warning"
     t0 = 1000.0
@@ -997,8 +1000,6 @@ def test_upload_warning_surfaced_at_stop(recording_env):
         def stop(self):
             self.is_recording = False
 
-    captured_output = []
-
     with (
         mock.patch("screencap.engine.Recorder", FakeCloudRecorder),
         mock.patch("screencap.recorder._check_macos_permissions"),
@@ -1013,34 +1014,39 @@ def test_upload_warning_surfaced_at_stop(recording_env):
         mock.patch("screencap.chunk_processor.ChunkProcessor._transcribe", return_value=None),
         mock.patch("screencap.chunk_processor.ChunkProcessor._generate_manifest"),
     ):
-        # Wrap console.print to capture output
-        import screencap.recorder
-        _real_print = screencap.recorder.console.print
+        capture_dir, elapsed, _, _ = start_recording(
+            name="test-warning",
+            audio=False,
+            output_dir=rec_dir,
+            wifi_metrics=False,
+            app_versions=False,
+            chunk_duration=30,
+            verbose=True,
+            live_upload=True,
+            cloud_intent=True,
+        )
 
-        def _spy_print(*args, **kwargs):
-            captured_output.append(" ".join(str(a) for a in args))
-            return _real_print(*args, **kwargs)
+    # The recorder must have written the follow-up state with the
+    # upload-disabled kind + a concrete warning message.
+    followup = json.loads((capture_dir / ".upload_followup.json").read_text())
+    assert followup["kind"] == "upload_disabled"
+    assert followup["upload_warning"], "upload_warning text must be populated"
 
-        with mock.patch.object(screencap.recorder.console, "print", side_effect=_spy_print):
-            capture_dir, elapsed, _, _ = start_recording(
-                name="test-warning",
-                audio=False,
-                output_dir=rec_dir,
-                wifi_metrics=False,
-                app_versions=False,
-                chunk_duration=30,
-                verbose=True,
-                live_upload=True,
-                cloud_intent=True,
-            )
+    # The CLI renders the message via print_upload_followup after any rename.
+    captured_output = []
+    import screencap.recorder as recorder_mod
 
-    # Assert on the production code's "Uploads disabled:" prefix (recorder.py),
-    # not on keywords from the exception message. This tests the code path,
-    # not the error message content.
+    def _spy_print(*args, **kwargs):
+        captured_output.append(" ".join(str(a) for a in args))
+
+    with mock.patch.object(recorder_mod.console, "print", side_effect=_spy_print):
+        print_upload_followup("test-warning", capture_dir)
+
     assert any("Uploads disabled:" in line for line in captured_output), (
-        f"Shutdown output must include 'Uploads disabled:' prefix. "
-        f"Got:\n" + "\n".join(captured_output[-5:])
+        f"print_upload_followup must render 'Uploads disabled:'. "
+        f"Got:\n" + "\n".join(captured_output)
     )
+    assert any("screencap upload test-warning" in line for line in captured_output)
 
 
 def test_sentinel_not_uploaded_without_sentinel_for_cloud(recording_env):

@@ -174,6 +174,65 @@ class ChunkProcessor:
         n_uploaded = sum(1 for v in self._chunk_results.values() if v)
         return n_uploaded, n_total
 
+    def reconcile_against_gcs(self) -> int:
+        """Re-check GCS for chunks currently marked as failed.
+
+        _upload_chunk() returns False whenever any core file's PUT raises
+        — but files that PUT before the failure remain in GCS. We
+        re-request signed URLs for every failed chunk in a single batch;
+        the server returns ``url=None`` for files it already has. When
+        every core file on disk comes back ``None``, we flip
+        ``_chunk_results[idx] = True``.
+
+        Must only be called after stop(). Returns the number of
+        entries flipped from False to True.
+        """
+        if not self._upload_enabled:
+            return 0
+
+        from screencap.upload import FileInfo, _content_type, request_signed_urls
+
+        all_file_infos: list[FileInfo] = []
+        per_chunk_names: dict[int, list[str]] = {}
+        for idx, ok in self._chunk_results.items():
+            if ok:
+                continue
+            names: list[str] = []
+            for f in self._collect_chunk_files(idx, None):
+                if f["name"] in _NON_CORE_NAMES:
+                    continue
+                path: Path = f["path"]
+                try:
+                    size = path.stat().st_size
+                except FileNotFoundError:
+                    continue
+                all_file_infos.append(FileInfo(
+                    name=f["name"], path=path,
+                    content_type=_content_type(path), size=size,
+                ))
+                names.append(f["name"])
+            if names:
+                per_chunk_names[idx] = names
+
+        if not all_file_infos:
+            return 0
+
+        try:
+            urls, _ = request_signed_urls(self._recording_name, all_file_infos)
+        except Exception as e:
+            logger.debug(f"Reconcile: request_signed_urls failed: {e}")
+            return 0
+
+        flipped = 0
+        for idx, names in per_chunk_names.items():
+            # Server returns url=None for already-uploaded files; a missing
+            # key means the server didn't confirm, so we stay conservative.
+            if all(name in urls and urls[name] is None for name in names):
+                self._chunk_results[idx] = True
+                flipped += 1
+                logger.info(f"Reconciled chunk {idx}: all core files already in GCS")
+        return flipped
+
     @property
     def was_force_stopped(self) -> bool:
         """True if stop() timed out and had to force-stop the thread.
@@ -283,7 +342,14 @@ class ChunkProcessor:
                 blocked_intervals = self._screen_filter.get_blocked_intervals(start_ts, end_ts) or None
             except Exception:
                 logger.warning(f"Failed to get blocked_intervals for chunk {idx}", exc_info=True)
-        self._generate_manifest(idx, start_ts, end_ts, blocked_intervals=blocked_intervals)
+        try:
+            self._generate_manifest(idx, start_ts, end_ts, blocked_intervals=blocked_intervals)
+        except Exception:
+            logger.exception(f"Chunk {idx}: manifest generation failed")
+            # Remove any partially-written manifest so a later retry
+            # (or screencap upload) doesn't ship a truncated file.
+            (self._capture_dir / f"chunk_{idx:04d}_manifest.json").unlink(missing_ok=True)
+            raise
 
         # 5. Scrub text surfaces + mask screenshots when user opted in.
         if self._scrub_enabled and self._pipeline is not None:
@@ -828,6 +894,12 @@ def _save_transcript_quiet(
     )
 
 
+# Marker files that are not part of the recording payload and must never
+# fail the chunk if the server rejects them (e.g. legacy Cloud Functions
+# whose filename regex forbade a leading underscore).
+_NON_CORE_NAMES = frozenset({"_unlisted"})
+
+
 def upload_chunk_files(
     recording_name: str, files: list[dict], capture_dir: Path,
 ) -> bool:
@@ -863,12 +935,17 @@ def upload_chunk_files(
 
     core_ok = True
     for fi in file_infos:
-        is_core = not fi.name.startswith("transcript")
+        is_core = (
+            not fi.name.startswith("transcript")
+            and fi.name not in _NON_CORE_NAMES
+        )
         if fi.name not in urls:
             # Server didn't return a URL at all — file was rejected/unknown
             if is_core:
                 logger.error(f"Server returned no URL for core file {fi.name}")
                 core_ok = False
+            else:
+                logger.warning(f"Server did not accept non-core file {fi.name}")
             continue
         url = urls[fi.name]
         if url is None:

@@ -2258,8 +2258,28 @@ def record_audio(
             except Exception as e:
                 logger.error(f"Final audio flush failed: {e}")
 
+    # Send final audio ack BEFORE closing the FLAC writer. sf_writer.close()
+    # can block for seconds on FLAC header finalization or raise on disk
+    # errors; the chunk_processor is waiting on this ack with a 60s budget,
+    # and losing it to a slow/failing close() triggers a spurious
+    # "Audio ack for chunk N not received in 60s" warning even though the
+    # chunk's files upload cleanly. The ack shape doesn't depend on writer
+    # state — just the current chunk index.
+    if audio_ack_q is not None:
+        try:
+            audio_ack_q.put(
+                {"type": "audio_final", "completed_index": _current_chunk_idx[0]},
+                timeout=5,
+            )
+        except Exception:
+            logger.error("Failed to send audio_final ack")
+
+    if sf_writer_ref[0] is not None:
         # Close writer — finalizes FLAC headers
-        sf_writer_ref[0].close()
+        try:
+            sf_writer_ref[0].close()
+        except Exception as e:
+            logger.error(f"sf_writer close failed: {e}")
 
     # Derive current audio path from chunk index (audio_flac_path may be stale
     # if chunks were rotated/deleted during recording)
@@ -2268,13 +2288,6 @@ def record_audio(
     else:
         _final_audio_path = audio_flac_path
     logger.info(f"Audio saved to {_final_audio_path}")
-
-    # Send final audio ack
-    if audio_ack_q is not None:
-        try:
-            audio_ack_q.put({"type": "audio_final", "completed_index": _current_chunk_idx[0]}, timeout=5)
-        except Exception:
-            logger.error("Failed to send audio_final ack")
 
     if not _final_audio_path.exists():
         logger.info("Final audio file not on disk (may have been uploaded and deleted)")

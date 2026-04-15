@@ -554,6 +554,45 @@ class TestBlockedIntervalsInManifest:
             {"start_ts": 1000.5, "end_ts": 1010.0, "reason": "app_policy"},
         ]
 
+    def test_manifest_generation_failure_deletes_partial_file_and_fails_chunk(
+        self, cloud_capture_dir,
+    ):
+        """If _generate_manifest raises, any partially-written manifest must
+        be removed so a subsequent ``screencap upload`` doesn't ship a
+        truncated JSON, and the chunk must be marked failed."""
+        from screencap.chunk_processor import ChunkProcessor
+
+        q = multiprocessing.Queue()
+        ack_q = multiprocessing.Queue()
+
+        cp = ChunkProcessor(
+            cloud_capture_dir, q, ack_q, recording_name="test",
+            upload_enabled=False, auto_delete=False, cloud_intent=False,
+        )
+
+        partial = cloud_capture_dir / "chunk_0000_manifest.json"
+
+        def failing_generate(idx, *args, **kwargs):
+            # Simulate a mid-write failure that leaves a partial file on disk.
+            partial.write_text('{"partial":')
+            raise RuntimeError("manifest write blew up")
+
+        with patch.object(cp, "_generate_manifest", side_effect=failing_generate), \
+             patch.object(cp, "_wait_for_audio"), \
+             patch.object(cp, "_transcribe", return_value=None), \
+             patch.object(cp, "_trigger_flush"), \
+             patch.object(cp, "_export_events"):
+            try:
+                cp._process_chunk({
+                    "completed_index": 0,
+                    "chunk_start_time": 1000.0,
+                    "rotation_time": 1060.0,
+                })
+            except RuntimeError:
+                pass
+
+        assert not partial.exists(), "partial manifest must be removed"
+
 
 class TestPlaceholderFrame:
     """Tests for Phase 1: placeholder frame generation."""
@@ -1195,3 +1234,258 @@ class TestPrivacyFailureDataLoss:
         for i in range(7):
             assert (tmp_path / f"chunk_{i:04d}.mp4").exists(), \
                 f"chunk_{i:04d}.mp4 was deleted — data loss!"
+
+
+
+# ---------------------------------------------------------------------------
+# _unlisted marker behaviour
+# ---------------------------------------------------------------------------
+
+
+class TestUnlistedMarker:
+    """The _unlisted marker is non-core; a server rejection must not fail the chunk."""
+
+    def test_collect_chunk_files_includes_unlisted_when_hidden(self, cloud_capture_dir):
+        """Chunk 0 appends _unlisted when show_on_website=False."""
+        from screencap.chunk_processor import ChunkProcessor
+
+        q = multiprocessing.Queue()
+        ack_q = multiprocessing.Queue()
+
+        (cloud_capture_dir / "chunk_0000.mp4").write_bytes(b"v")
+        (cloud_capture_dir / "audio_0000.flac").write_bytes(b"a")
+        (cloud_capture_dir / "events_0000.jsonl").write_text("{}\n")
+
+        cp = ChunkProcessor(
+            cloud_capture_dir, q, ack_q, recording_name="test",
+            upload_enabled=False, auto_delete=False,
+            show_on_website=False,
+        )
+        names = [f["name"] for f in cp._collect_chunk_files(0, None)]
+        assert "_unlisted" in names
+
+    def test_collect_chunk_files_omits_unlisted_when_visible(self, cloud_capture_dir):
+        """Default visible recordings must not upload a marker."""
+        from screencap.chunk_processor import ChunkProcessor
+
+        q = multiprocessing.Queue()
+        ack_q = multiprocessing.Queue()
+
+        (cloud_capture_dir / "chunk_0000.mp4").write_bytes(b"v")
+
+        cp = ChunkProcessor(
+            cloud_capture_dir, q, ack_q, recording_name="test",
+            upload_enabled=False, auto_delete=False,
+            show_on_website=True,
+        )
+        names = [f["name"] for f in cp._collect_chunk_files(0, None)]
+        assert "_unlisted" not in names
+
+    def test_collect_chunk_files_omits_unlisted_for_later_chunks(self, cloud_capture_dir):
+        """Marker is only appended on chunk 0, not subsequent chunks."""
+        from screencap.chunk_processor import ChunkProcessor
+
+        q = multiprocessing.Queue()
+        ack_q = multiprocessing.Queue()
+
+        (cloud_capture_dir / "chunk_0001.mp4").write_bytes(b"v")
+
+        cp = ChunkProcessor(
+            cloud_capture_dir, q, ack_q, recording_name="test",
+            upload_enabled=False, auto_delete=False,
+            show_on_website=False,
+        )
+        names = [f["name"] for f in cp._collect_chunk_files(1, None)]
+        assert "_unlisted" not in names
+
+    def test_upload_chunk_files_unlisted_rejection_non_fatal(self, tmp_path):
+        """Server omitting _unlisted from signed-url response must not fail the chunk."""
+        from screencap.chunk_processor import upload_chunk_files
+
+        chunk_path = tmp_path / "chunk_0000.mp4"
+        chunk_path.write_bytes(b"v")
+        marker_path = tmp_path / "_unlisted"
+        marker_path.touch()
+
+        files = [
+            {"name": "chunk_0000.mp4", "path": chunk_path},
+            {"name": "_unlisted", "path": marker_path},
+        ]
+
+        # Server returns a URL for the media file but silently drops _unlisted
+        # (legacy behaviour — mirrors what the old filename regex did).
+        def fake_request_signed_urls(recording_name, file_infos):
+            return ({"chunk_0000.mp4": "https://example.com/signed"}, "gs://bucket/test/")
+
+        with mock.patch(
+            "screencap.upload.request_signed_urls",
+            side_effect=fake_request_signed_urls,
+        ), mock.patch(
+            "screencap.chunk_processor._upload_single"
+        ) as mock_upload_single:
+            result = upload_chunk_files("test", files, tmp_path)
+
+        assert result is True, (
+            "Missing URL for _unlisted must not fail the chunk — it is non-core"
+        )
+        # Only the core media file was actually uploaded
+        assert mock_upload_single.call_count == 1
+
+    def test_upload_chunk_files_core_rejection_still_fatal(self, tmp_path):
+        """A genuine core-file rejection must still fail the chunk."""
+        from screencap.chunk_processor import upload_chunk_files
+
+        chunk_path = tmp_path / "chunk_0000.mp4"
+        chunk_path.write_bytes(b"v")
+        files = [{"name": "chunk_0000.mp4", "path": chunk_path}]
+
+        with mock.patch(
+            "screencap.upload.request_signed_urls",
+            return_value=({}, "gs://bucket/test/"),
+        ):
+            result = upload_chunk_files("test", files, tmp_path)
+
+        assert result is False
+
+
+# ---------------------------------------------------------------------------
+# GCS reconciliation tests
+# ---------------------------------------------------------------------------
+
+
+class TestReconcileAgainstGcs:
+    """After stop(), flip _chunk_results[idx] to True for chunks whose core
+    files are all present in GCS. _upload_chunk() returns False on any
+    single per-file PUT exception, but the other files stay in the
+    bucket — the counter must reflect that."""
+
+    def _make_chunk_files(self, capture_dir: Path, idx: int) -> None:
+        """Write non-empty core files for chunk `idx` on disk."""
+        for name in (
+            f"chunk_{idx:04d}.mp4",
+            f"audio_{idx:04d}.flac",
+            f"events_{idx:04d}.jsonl",
+            f"chunk_{idx:04d}_manifest.json",
+        ):
+            (capture_dir / name).write_bytes(b"x")
+
+    def _make_cp(self, capture_dir, *, upload_enabled=True):
+        from screencap.chunk_processor import ChunkProcessor
+
+        q = multiprocessing.Queue()
+        ack_q = multiprocessing.Queue()
+        return ChunkProcessor(
+            capture_dir, q, ack_q,
+            recording_name="rec",
+            upload_enabled=upload_enabled,
+            auto_delete=False,
+        )
+
+    def test_flips_false_to_true_when_all_files_already_uploaded(self, capture_dir):
+        """Server says url=None for every core file → flip to True."""
+        cp = self._make_cp(capture_dir)
+        cp._chunk_results[1] = False
+        self._make_chunk_files(capture_dir, 1)
+
+        all_already_uploaded = {
+            "chunk_0001.mp4": None,
+            "audio_0001.flac": None,
+            "events_0001.jsonl": None,
+            "chunk_0001_manifest.json": None,
+        }
+        with mock.patch(
+            "screencap.upload.request_signed_urls",
+            return_value=(all_already_uploaded, "gs://bucket/rec/"),
+        ):
+            flipped = cp.reconcile_against_gcs()
+
+        assert flipped == 1
+        assert cp._chunk_results[1] is True
+
+    def test_keeps_false_when_one_file_missing_from_gcs(self, capture_dir):
+        """Server returns a fresh URL for one file → chunk stays False."""
+        cp = self._make_cp(capture_dir)
+        cp._chunk_results[1] = False
+        self._make_chunk_files(capture_dir, 1)
+
+        partial = {
+            "chunk_0001.mp4": None,
+            "audio_0001.flac": None,
+            "events_0001.jsonl": "https://gcs/signed-url-for-pending-upload",
+            "chunk_0001_manifest.json": None,
+        }
+        with mock.patch(
+            "screencap.upload.request_signed_urls",
+            return_value=(partial, "gs://bucket/rec/"),
+        ):
+            flipped = cp.reconcile_against_gcs()
+
+        assert flipped == 0
+        assert cp._chunk_results[1] is False
+
+    def test_skips_already_successful_chunks(self, capture_dir):
+        """Chunks already True are not re-checked."""
+        cp = self._make_cp(capture_dir)
+        cp._chunk_results[0] = True
+        cp._chunk_results[1] = False
+        self._make_chunk_files(capture_dir, 1)
+
+        calls: list[str] = []
+
+        def spy(recording_name, files):
+            calls.append(recording_name)
+            return (
+                {fi.name: None for fi in files},
+                "gs://bucket/rec/",
+            )
+
+        with mock.patch("screencap.upload.request_signed_urls", side_effect=spy):
+            cp.reconcile_against_gcs()
+
+        assert len(calls) == 1  # only chunk 1 queried, not chunk 0
+
+    def test_returns_zero_when_uploads_disabled(self, capture_dir):
+        """Don't hit the network when uploads are disabled."""
+        cp = self._make_cp(capture_dir, upload_enabled=False)
+        cp._chunk_results[1] = False
+        self._make_chunk_files(capture_dir, 1)
+
+        with mock.patch(
+            "screencap.upload.request_signed_urls",
+            side_effect=AssertionError("must not be called"),
+        ):
+            flipped = cp.reconcile_against_gcs()
+
+        assert flipped == 0
+        assert cp._chunk_results[1] is False
+
+    def test_skips_chunks_with_no_files_on_disk(self, capture_dir):
+        """If the chunk's local files are gone, no reconciliation is possible."""
+        cp = self._make_cp(capture_dir)
+        cp._chunk_results[1] = False
+        # No files on disk for chunk 1.
+
+        with mock.patch(
+            "screencap.upload.request_signed_urls",
+            side_effect=AssertionError("must not be called"),
+        ):
+            flipped = cp.reconcile_against_gcs()
+
+        assert flipped == 0
+        assert cp._chunk_results[1] is False
+
+    def test_swallows_request_signed_urls_errors(self, capture_dir):
+        """A transient failure during reconcile must not raise — we still
+        want to print the counter with the best info we have."""
+        cp = self._make_cp(capture_dir)
+        cp._chunk_results[1] = False
+        self._make_chunk_files(capture_dir, 1)
+
+        with mock.patch(
+            "screencap.upload.request_signed_urls",
+            side_effect=RuntimeError("upstream down"),
+        ):
+            flipped = cp.reconcile_against_gcs()
+
+        assert flipped == 0
+        assert cp._chunk_results[1] is False
