@@ -24,6 +24,8 @@ _CONFIG_PATH = _DEFAULT_BASE / "config.toml"
 
 _config_cache: dict | None = None
 
+_BOOL_TRUE = ("1", "true", "yes")
+
 
 def _load_toml() -> dict:
     global _config_cache
@@ -40,6 +42,42 @@ def invalidate_config_cache() -> None:
     """Reset the config cache so the next read re-loads from disk."""
     global _config_cache
     _config_cache = None
+
+
+def _parse_bool_env(env_name: str, cfg_key: str, default: bool) -> bool:
+    """Env var (truthy → bool) > config.toml > default."""
+    env = os.environ.get(env_name)
+    if env is not None:
+        return env.lower() in _BOOL_TRUE
+    return _load_toml().get(cfg_key, default)
+
+
+def _parse_nonneg_int_env(env_name: str, cfg_key: str, default: int) -> int:
+    """Non-negative integer: env var > config.toml > default.
+
+    Exits with a message if the env var is non-integer or negative, or if
+    the config.toml value is not an int.
+    """
+    env = os.environ.get(env_name)
+    if env is not None:
+        env = env.strip()
+        try:
+            val = int(env)
+        except ValueError:
+            raise SystemExit(
+                f"Error: {env_name} must be an integer, got: {env!r}"
+            )
+        if val < 0:
+            raise SystemExit(
+                f"Error: {env_name} cannot be negative, got: {val}"
+            )
+        return val
+    val = _load_toml().get(cfg_key, default)
+    if not isinstance(val, int):
+        raise SystemExit(
+            f"Error: {cfg_key} in config.toml must be an integer, got: {val!r}"
+        )
+    return val
 
 
 def save_config_atomic(
@@ -86,11 +124,7 @@ def get_recordings_dir() -> Path:
 
 def get_audio_default() -> bool:
     """Return default audio setting (True = on)."""
-    env = os.environ.get("SCREENCAP_AUDIO_DEFAULT")
-    if env is not None:
-        return env.lower() in ("1", "true", "yes")
-    cfg = _load_toml()
-    return cfg.get("audio_default", True)
+    return _parse_bool_env("SCREENCAP_AUDIO_DEFAULT", "audio_default", True)
 
 
 def set_audio_default(value: bool) -> None:
@@ -115,47 +149,29 @@ def set_audio_default(value: bool) -> None:
 
 def get_wifi_metrics() -> bool:
     """Return whether WiFi metrics collection is enabled (True = on)."""
-    env = os.environ.get("SCREENCAP_WIFI_METRICS")
-    if env is not None:
-        return env.lower() in ("1", "true", "yes")
-    cfg = _load_toml()
-    return cfg.get("wifi_metrics", True)
+    return _parse_bool_env("SCREENCAP_WIFI_METRICS", "wifi_metrics", True)
 
 
 def get_app_versions() -> bool:
     """Return whether running-application version capture is enabled (True = on)."""
-    env = os.environ.get("SCREENCAP_APP_VERSIONS")
-    if env is not None:
-        return env.lower() in ("1", "true", "yes")
-    cfg = _load_toml()
-    return cfg.get("app_versions", True)
+    return _parse_bool_env("SCREENCAP_APP_VERSIONS", "app_versions", True)
 
 
 def get_auto_name() -> bool:
     """Return whether LLM auto-naming is enabled after recording (True = on)."""
-    env = os.environ.get("SCREENCAP_AUTO_NAME")
-    if env is not None:
-        return env.lower() in ("1", "true", "yes")
-    cfg = _load_toml()
-    return cfg.get("auto_name", True)
+    return _parse_bool_env("SCREENCAP_AUTO_NAME", "auto_name", True)
 
 
 def get_auto_update() -> bool:
     """Return whether auto-update checking is enabled (True = on)."""
-    env = os.environ.get("SCREENCAP_AUTO_UPDATE")
-    if env is not None:
-        return env.lower() in ("1", "true", "yes")
-    cfg = _load_toml()
-    return cfg.get("auto_update", True)
+    return _parse_bool_env("SCREENCAP_AUTO_UPDATE", "auto_update", True)
 
 
 def get_auto_name_local_only() -> bool:
     """Return whether LLM auto-naming is restricted to local providers only."""
-    env = os.environ.get("SCREENCAP_AUTO_NAME_LOCAL_ONLY")
-    if env is not None:
-        return env.lower() in ("1", "true", "yes")
-    cfg = _load_toml()
-    return cfg.get("auto_name_local_only", False)
+    return _parse_bool_env(
+        "SCREENCAP_AUTO_NAME_LOCAL_ONLY", "auto_name_local_only", False,
+    )
 
 
 def get_downloads_dir() -> Path:
@@ -190,52 +206,12 @@ def get_base_dir() -> Path:
 
 def get_disk_warn_mb() -> int:
     """Minimum free MB to start recording / show warning. Default 2000."""
-    env = os.environ.get("SCREENCAP_DISK_WARN_MB")
-    if env is not None:
-        env = env.strip()
-        try:
-            val = int(env)
-        except ValueError:
-            raise SystemExit(
-                f"Error: SCREENCAP_DISK_WARN_MB must be an integer, got: {env!r}"
-            )
-        if val < 0:
-            raise SystemExit(
-                f"Error: SCREENCAP_DISK_WARN_MB cannot be negative, got: {val}"
-            )
-        return val
-    cfg = _load_toml()
-    val = cfg.get("disk_warn_mb", 2000)
-    if not isinstance(val, int):
-        raise SystemExit(
-            f"Error: disk_warn_mb in config.toml must be an integer, got: {val!r}"
-        )
-    return val
+    return _parse_nonneg_int_env("SCREENCAP_DISK_WARN_MB", "disk_warn_mb", 2000)
 
 
 def get_disk_stop_mb() -> int:
     """Free MB threshold to auto-stop recording. Default 500."""
-    env = os.environ.get("SCREENCAP_DISK_STOP_MB")
-    if env is not None:
-        env = env.strip()
-        try:
-            val = int(env)
-        except ValueError:
-            raise SystemExit(
-                f"Error: SCREENCAP_DISK_STOP_MB must be an integer, got: {env!r}"
-            )
-        if val < 0:
-            raise SystemExit(
-                f"Error: SCREENCAP_DISK_STOP_MB cannot be negative, got: {val}"
-            )
-        return val
-    cfg = _load_toml()
-    val = cfg.get("disk_stop_mb", 500)
-    if not isinstance(val, int):
-        raise SystemExit(
-            f"Error: disk_stop_mb in config.toml must be an integer, got: {val!r}"
-        )
-    return val
+    return _parse_nonneg_int_env("SCREENCAP_DISK_STOP_MB", "disk_stop_mb", 500)
 
 
 def get_chunk_duration() -> float:
@@ -249,11 +225,9 @@ def get_chunk_duration() -> float:
 
 def get_auto_delete_after_upload() -> bool:
     """Return whether to auto-delete chunks after confirmed upload. Default True."""
-    env = os.environ.get("SCREENCAP_AUTO_DELETE")
-    if env is not None:
-        return env.lower() in ("1", "true", "yes")
-    cfg = _load_toml()
-    return cfg.get("auto_delete_after_upload", True)
+    return _parse_bool_env(
+        "SCREENCAP_AUTO_DELETE", "auto_delete_after_upload", True,
+    )
 
 
 def get_rest_threshold() -> float:
@@ -287,11 +261,7 @@ def get_segmentation_mode() -> str:
 
 def get_show_on_website() -> bool:
     """Return whether recordings should be visible on the website. Default True."""
-    env = os.environ.get("SCREENCAP_SHOW_ON_WEBSITE")
-    if env is not None:
-        return env.lower() in ("1", "true", "yes")
-    cfg = _load_toml()
-    return cfg.get("show_on_website", True)
+    return _parse_bool_env("SCREENCAP_SHOW_ON_WEBSITE", "show_on_website", True)
 
 
 def get_upload_default() -> str:
