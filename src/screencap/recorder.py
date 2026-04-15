@@ -1469,6 +1469,25 @@ def start_recording(
                 if verbose:
                     console.print(f"[yellow]Warning:[/yellow] DB upload failed: {e}")
 
+        # Reconcile _chunk_results against GCS before reading the counter.
+        # A single failed PUT in upload_chunk_files() marks the whole chunk
+        # as False even when the other core files already landed in the
+        # bucket. Re-request signed URLs — the server returns url=None for
+        # files it already has, so chunks whose core files are all present
+        # flip back to True.
+        if live_upload:
+            try:
+                _flipped = chunk_processor.reconcile_against_gcs()
+                if _flipped > 0 and verbose:
+                    console.print(
+                        f"[dim]Reconciled {_flipped} chunk(s) against GCS[/dim]"
+                    )
+            except Exception as e:
+                if verbose:
+                    console.print(
+                        f"[yellow]Warning:[/yellow] GCS reconcile failed: {e}"
+                    )
+
         # Sentinel upload for cloud-intent recordings (triggers stitching)
         # If the processor was force-stopped (timeout), _chunk_results may
         # be incomplete — a mid-flight chunk won't have an entry.  Don't

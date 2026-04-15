@@ -174,6 +174,65 @@ class ChunkProcessor:
         n_uploaded = sum(1 for v in self._chunk_results.values() if v)
         return n_uploaded, n_total
 
+    def reconcile_against_gcs(self) -> int:
+        """Re-check GCS for chunks currently marked as failed.
+
+        _upload_chunk() returns False whenever any core file's PUT raises
+        — but files that PUT before the failure remain in GCS. We
+        re-request signed URLs for every failed chunk in a single batch;
+        the server returns ``url=None`` for files it already has. When
+        every core file on disk comes back ``None``, we flip
+        ``_chunk_results[idx] = True``.
+
+        Must only be called after stop(). Returns the number of
+        entries flipped from False to True.
+        """
+        if not self._upload_enabled:
+            return 0
+
+        from screencap.upload import FileInfo, _content_type, request_signed_urls
+
+        all_file_infos: list[FileInfo] = []
+        per_chunk_names: dict[int, list[str]] = {}
+        for idx, ok in self._chunk_results.items():
+            if ok:
+                continue
+            names: list[str] = []
+            for f in self._collect_chunk_files(idx, None):
+                if f["name"] in _NON_CORE_NAMES:
+                    continue
+                path: Path = f["path"]
+                try:
+                    size = path.stat().st_size
+                except FileNotFoundError:
+                    continue
+                all_file_infos.append(FileInfo(
+                    name=f["name"], path=path,
+                    content_type=_content_type(path), size=size,
+                ))
+                names.append(f["name"])
+            if names:
+                per_chunk_names[idx] = names
+
+        if not all_file_infos:
+            return 0
+
+        try:
+            urls, _ = request_signed_urls(self._recording_name, all_file_infos)
+        except Exception as e:
+            logger.debug(f"Reconcile: request_signed_urls failed: {e}")
+            return 0
+
+        flipped = 0
+        for idx, names in per_chunk_names.items():
+            # Server returns url=None for already-uploaded files; a missing
+            # key means the server didn't confirm, so we stay conservative.
+            if all(name in urls and urls[name] is None for name in names):
+                self._chunk_results[idx] = True
+                flipped += 1
+                logger.info(f"Reconciled chunk {idx}: all core files already in GCS")
+        return flipped
+
     @property
     def was_force_stopped(self) -> bool:
         """True if stop() timed out and had to force-stop the thread.
