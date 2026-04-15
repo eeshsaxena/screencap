@@ -234,6 +234,9 @@ def run_recording_worker(args: dict) -> None:
 # ---------------------------------------------------------------------------
 
 
+_POSTPROCESS_TIMEOUT_S = int(os.environ.get("SCREENCAP_POSTPROCESS_TIMEOUT", "900"))
+
+
 def run_postprocess_worker(args: dict) -> None:
     """Post-Process Worker subprocess entry point.
 
@@ -241,6 +244,11 @@ def run_postprocess_worker(args: dict) -> None:
     pipeline that used to live inline in ``cli.py:386-450``. Detaches from
     the controller's process group and ignores ``SIGINT`` so a Ctrl+C on
     the controller's tty does not cancel post-processing.
+
+    A SIGALRM watchdog (default 15 min, override via
+    ``SCREENCAP_POSTPROCESS_TIMEOUT`` env var) aborts the pipeline if any
+    stage hangs — prevents the worker from blocking session shutdown
+    indefinitely when a provider / network call wedges.
     """
     try:
         os.setpgrp()
@@ -248,6 +256,14 @@ def run_postprocess_worker(args: dict) -> None:
         pass
     signal.signal(signal.SIGINT, signal.SIG_IGN)
     # Let SIGTERM kill us (used by the controller's force-quit path).
+
+    def _timeout_handler(signum, frame):
+        raise TimeoutError(
+            f"post-processing exceeded {_POSTPROCESS_TIMEOUT_S}s timeout"
+        )
+
+    signal.signal(signal.SIGALRM, _timeout_handler)
+    signal.alarm(_POSTPROCESS_TIMEOUT_S)
 
     from screencap.session import _postprocess_pipeline  # local import
 
@@ -263,7 +279,10 @@ def run_postprocess_worker(args: dict) -> None:
             disk_full=args.get("disk_full", False),
             verbose=args.get("verbose", False),
         )
+    except TimeoutError as exc:
+        console.print(f"[red]Post-processing timed out:[/red] {exc}")
     finally:
+        signal.alarm(0)
         try:
             (capture_dir / ".postprocess_done").write_text(
                 json.dumps({"completed_at": time.time()}),
