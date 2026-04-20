@@ -57,6 +57,10 @@ _TIME_UPDATE_MOD = 6       # timer text every 6 ticks → ~0.5 s
 _STOP_ESCALATE_S = 8       # seconds before SIGTERM → SIGKILL
 _MAX_DRAIN_PER_TICK = 20   # max window events to drain per slow tick
 
+# Status-bar glyphs. Filled = recording/processing; hollow = idle.
+_GLYPH_FILLED = "\u25cf"   # ●
+_GLYPH_HOLLOW = "\u25cb"   # ○
+
 # Prompt timing / queue caps
 _PROMPT_AUTO_DISMISS_S = 10.0    # seconds before auto-dismiss = "Keep recording"
 _PROMPT_MAX_PENDING = 3          # FIFO depth; older entries dropped on overflow
@@ -317,26 +321,36 @@ def _run_menubar(
         result.appendAttributedString_(label_part)
         return result
 
-    def _build_bar_title(dot_color, elapsed_s):
-        """Build an attributed string  ``● HH:MM:SS``  for the status item."""
-        h, rem = divmod(int(elapsed_s), 3600)
-        m, s = divmod(rem, 60)
+    def _build_bar_title(dot_color, elapsed_s, *, glyph=_GLYPH_FILLED, show_time=True):
+        """Build an attributed string for the status item.
+
+        ``show_time=True`` → ``<glyph> HH:MM:SS`` (recording / processing).
+        ``show_time=False`` → ``<glyph>`` alone (idle — no recording in progress).
+        """
         dot_part = NSAttributedString.alloc().initWithString_attributes_(
-            "\u25cf ", {
+            f"{glyph} " if show_time else glyph, {
                 NSForegroundColorAttributeName: dot_color,
                 NSFontAttributeName: _dot_font,
             },
         )
-        time_part = NSAttributedString.alloc().initWithString_attributes_(
-            f"{h:02d}:{m:02d}:{s:02d}", {
-                NSForegroundColorAttributeName: _time_color,
-                NSFontAttributeName: _time_font,
-            },
-        )
         result = NSMutableAttributedString.alloc().init()
         result.appendAttributedString_(dot_part)
-        result.appendAttributedString_(time_part)
+        if show_time:
+            h, rem = divmod(int(elapsed_s), 3600)
+            m, s = divmod(rem, 60)
+            time_part = NSAttributedString.alloc().initWithString_attributes_(
+                f"{h:02d}:{m:02d}:{s:02d}", {
+                    NSForegroundColorAttributeName: _time_color,
+                    NSFontAttributeName: _time_font,
+                },
+            )
+            result.appendAttributedString_(time_part)
         return result
+
+    def _build_idle_bar_title():
+        return _build_bar_title(
+            _time_color, 0.0, glyph=_GLYPH_HOLLOW, show_time=False,
+        )
 
     # ---- Delegates ----
 
@@ -415,9 +429,20 @@ def _run_menubar(
                     NSVariableStatusItemLength
                 )
             )
-            self._status_item.button().setAttributedTitle_(
-                _build_bar_title(_pulse_dots_red[0], 0.0)
-            )
+            # Track whether the idle (hollow-circle, no-timer) title is
+            # already painted — idle is static so we avoid redundant
+            # AppKit setter calls every tick.
+            self._idle_rendered = False
+            # Last dropdown "Elapsed …" string, used to suppress same-value
+            # setTitle_ calls across the ObjC bridge (fires twice/sec).
+            self._last_elapsed_title = ""
+            if self._session_mode and self._session_state == SESSION_STATE_IDLE:
+                self._status_item.button().setAttributedTitle_(_build_idle_bar_title())
+                self._idle_rendered = True
+            else:
+                self._status_item.button().setAttributedTitle_(
+                    _build_bar_title(_pulse_dots_red[0], 0.0)
+                )
 
             self._name_delegate = NameFieldDelegate.alloc().init()
             self._build_recording_menu()
@@ -880,21 +905,30 @@ def _run_menubar(
             # ---- Pulse animation (every tick) ----
             if not self._is_processing:
                 self._pulse_idx = (self._pulse_idx + 1) % _PULSE_FRAMES
-                # In session IDLE state, use the gray palette so the
-                # status-bar dot clearly indicates "not recording".
                 if _not_recording:
-                    dots = _pulse_dots_gray
+                    # Idle: static hollow circle, no timer — clearly
+                    # "not recording, click to start". Painted once per
+                    # transition to avoid churning AppKit every tick.
+                    if not self._idle_rendered:
+                        self._status_item.button().setAttributedTitle_(
+                            _build_idle_bar_title()
+                        )
+                        self._idle_rendered = True
                 else:
+                    self._idle_rendered = False
                     dots = _pulse_dots_gray if self._is_active_excluded else _pulse_dots_red
-                self._status_item.button().setAttributedTitle_(
-                    _build_bar_title(dots[self._pulse_idx], elapsed)
-                )
+                    self._status_item.button().setAttributedTitle_(
+                        _build_bar_title(dots[self._pulse_idx], elapsed)
+                    )
 
             # ---- Update dropdown timer (~0.5 s) ----
             if self._tick_count % _TIME_UPDATE_MOD == 0 and not self._is_processing:
                 h, rem = divmod(int(elapsed), 3600)
                 m, s = divmod(rem, 60)
-                self._time_item.setTitle_(f"Elapsed  {h:02d}:{m:02d}:{s:02d}")
+                title = f"Elapsed  {h:02d}:{m:02d}:{s:02d}"
+                if title != self._last_elapsed_title:
+                    self._time_item.setTitle_(title)
+                    self._last_elapsed_title = title
 
             # ---- Heavy checks (~1 s) ----
             if self._tick_count % _SLOW_CHECK_MOD != 0:
