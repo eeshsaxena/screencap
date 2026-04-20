@@ -1,0 +1,21 @@
+# Applied only to the x86_64 build leg via PIP_CONSTRAINT. Forces wheels with
+# minos <= 11.0 for Big Sur compat. MACOSX_DEPLOYMENT_TARGET alone does not
+# filter pip's wheel selection — pip reads the runner's actual OS version,
+# which on macos-15-intel picks macosx_14_0 wheels and fails the minos check.
+
+# numpy 2.1+ ships macosx_14_0_x86_64 wheels pip prefers over macosx_10_13.
+numpy>=1.20.0,<2.1
+
+# av 14+ has no cp312 x86_64 wheel; 13.x ships macosx_10_13_x86_64.
+av>=13.0,<14
+
+# Matches the pyproject.toml <0.2 cap; hard-pin for deterministic resolution.
+fast-gliner==0.1.12
+
+# 5.x wheel tags not yet validated.
+ctranslate2>=4.0,<5.0
+
+# Excluded from the PyInstaller bundle (see pyinstaller/screencap.spec), but
+# faster-whisper declares a hard dep so pip still resolves it. 1.20+ tags as
+# macosx_13_0+; cap to 1.19.2 (last with macosx_11_0_universal2).
+onnxruntime<=1.19.2

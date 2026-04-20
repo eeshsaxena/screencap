@@ -23,7 +23,7 @@ jobs:
           - runner: macos-15-intel
             arch: x86_64
             python-arch: x64
-            minos-target: "14.0"    # numpy/X11 PyPI wheels target 14.0; revisit if pre-14 demand emerges
+            minos-target: "11.0"    # Big Sur compat; MACOSX_DEPLOYMENT_TARGET=11.0 already keeps pip on <=10_13 wheels
     runs-on: ${{ matrix.runner }}
     steps:
       - uses: actions/checkout@v4
@@ -36,9 +36,16 @@ jobs:
       - uses: actions/cache@v4
         with:
           path: ~/.cache/pip
-          key: ${{ runner.os }}-${{ matrix.runner }}-${{ matrix.arch }}-pip-${{ hashFiles('pyproject.toml') }}
+          key: ${{ runner.os }}-${{ matrix.runner }}-${{ matrix.arch }}-pip-${{ hashFiles('pyproject.toml', 'pyinstaller/constraints-x86_64.txt') }}
 
-      - name: Install dependencies
+      - name: Install dependencies (arm64)
+        if: matrix.arch == 'arm64'
+        run: pip install -e ".[record]" && pip install pyinstaller
+
+      - name: Install dependencies (x86_64 with Big Sur constraints)
+        if: matrix.arch == 'x86_64'
+        env:
+          PIP_CONSTRAINT: ${{ github.workspace }}/pyinstaller/constraints-x86_64.txt
         run: pip install -e ".[record]" && pip install pyinstaller
 
       - name: Download spaCy model
