@@ -7,6 +7,11 @@ and this project adheres to [Semantic Versioning](https://semver.org/).
 
 ## [Unreleased]
 
+## [0.18.0] - 2026-04-20
+
+### Added
+- **Failed-chunk reconciliation against GCS after stop:** The chunk processor now reconciles failed chunks against GCS state after a recording stops, recovering transient upload errors without user intervention.
+
 ### Fixed
 - **Intel (x86_64) binary now installs on macOS Big Sur (11.0+) again:** Lowered the x86_64 minos target back to 11.0 (was raised to 14.0 in v0.12.2) and added hard-pinned `pyinstaller/constraints-x86_64.txt` (`numpy<2.1`, `av<14`, `onnxruntime<=1.19.2`, `fast-gliner==0.1.12`, `ctranslate2<5.0`) so the Intel build only bundles wheels with Mach-O minos ≤ 11.0. ARM64 build is unchanged. Note: on Big Sur, `fast-gliner`'s bundled ONNX Runtime may fail at first PII detection and transparently fall through to the existing spaCy fallback in `screencap.privacy` (only in auto mode; explicit `pii_engine=presidio-gliner` still hard-fails).
 - **`install.sh` no longer strands failed Big Sur installs in pip-fallback mode:** Removed the "skip binary if previous install used pip" shortcut. Users who hit the broken v0.17.1 x86_64 binary now recover automatically on re-install.
@@ -15,6 +20,16 @@ and this project adheres to [Semantic Versioning](https://semver.org/).
 - **Dropped `magic-wormhole` from `[record]` extras:** It was never imported in `src/`; all usage was subprocess-based via `shutil.which("wormhole")`. Internal tooling (`engine/share.py`, `_send_profiling_via_wormhole` when `send_profile=True`, Fire `capture share` subcommand) now gracefully prints "wormhole not found" if invoked. The feature was never part of the user-facing Click CLI. Eliminates the transitive `autobahn` 25.x x86_64 wheel problem and shrinks both arch bundles.
 - **Unlisted cloud recordings no longer report chunk 0 as failed:** The `_unlisted` marker is now accepted by the Cloud Function's filename regex, and the client treats marker files as non-core so a server rejection never marks the chunk as failed. Previously every unlisted recording surfaced `Server returned no URL for core file _unlisted` and `0 of 1 chunks uploaded` even though the actual media uploaded fine.
 - **Post-rename upload follow-up warning names the right directory:** When a recording was renamed via the menu bar or the auto-namer, the `Run screencap upload <name>` hint shown on partial uploads used to print the original timestamp-based name, which no longer matched any on-disk directory. The hint is now emitted after the rename completes, using the final directory name.
+- **Post-process worker now has a SIGALRM watchdog:** A hung post-process step no longer stalls the session; the watchdog fires and releases the worker so subsequent recordings can start.
+- **Silent audio-ack and auto-name failures are now surfaced:** Previously these errors were swallowed; they now appear in logs and user-facing notifications so misbehaviour is diagnosable.
+- **Menu bar shows a hollow circle when idle:** Replaces the pulsing dot that looked like an ongoing recording when no recording was in progress.
+- **Setup wizard `--scan` now includes safe-source apps seen during recording:** Previously these were routed past the review step, hiding them from the user.
+- **Audio final-ack sent before closing FLAC writer:** Prevents a race where the last audio chunk could be truncated on stop.
+- **Partial manifest removed on generation failure:** Avoids half-written manifests that blocked subsequent uploads.
+
+### Changed
+- **Bool/int env-var parsers extracted into shared helpers:** Removes duplicated parsing logic across the `config` module.
+- **Writer-flush handshake extracted into shared `_flush` helper:** Reused by the sidecar scrub worker for consistent flush semantics.
 
 ## [0.17.1] - 2026-04-13
 
