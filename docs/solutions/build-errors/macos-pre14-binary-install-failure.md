@@ -127,7 +127,7 @@ Redesigned install script with binary-first, pip-fallback architecture:
    - If no Python, downloads python.org `.pkg` with SHA-256 + code signature verification
    - Creates venv at `~/.screencap/venv`, installs `screencap[record]`
    - Creates wrapper script (not symlink) at same PATH location
-4. Records install method to `~/.screencap/.install_method` — future upgrades skip binary download
+4. Always attempts binary on re-install; falls back to pip only when binary download or verify fails (no persistent install-method marker)
 
 Override controls: `SCREENCAP_INSTALL_METHOD=pip` forces pip, `=binary` forces binary-only (CI).
 
@@ -158,9 +158,9 @@ Two-layer smoke testing:
 
 `verify-install` job runs install.sh on both architectures after GCS upload, then runs `--version` + `_smoke-test`. Catches install script bugs, GCS upload issues, and checksum mismatches.
 
-### 4. Install method memory
+### 4. Binary-first install on every run
 
-`~/.screencap/.install_method` persists across upgrades. Users who needed pip fallback once won't be retried with binary on every update.
+`install.sh` always attempts the binary first, falling back to pip only on download or verify failure. An earlier version persisted the install method to `~/.screencap/.install_method` and skipped the binary on subsequent runs if the marker was `pip`; that trap stranded users whose first install hit a broken binary. Users who want pip unconditionally can set `SCREENCAP_INSTALL_METHOD=pip`.
 
 ### 5. Key insight: `minos` is contagious
 

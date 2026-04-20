@@ -173,10 +173,6 @@ exec "$HOME/.screencap/venv/bin/screencap" "$@"
 WRAPPER
     chmod +x "$INSTALL_DIR/screencap/screencap"
 
-    # Record install method
-    INSTALL_METHOD="pip"
-    echo "$INSTALL_METHOD" > "${HOME}/.screencap/.install_method"
-
     # Verify pip install
     verify_out=$("$INSTALL_DIR/screencap/screencap" --version 2>&1) && verify_rc=0 || verify_rc=$?
     if [ "$verify_rc" -eq 0 ]; then
@@ -228,10 +224,12 @@ if [ -z "$VERSION" ]; then
     fi
 fi
 
-# Validate version format (digits and dots only)
-case "$VERSION" in
-    *[!0-9.]*) echo "ERROR: Invalid version format: $VERSION" >&2; exit 1 ;;
-esac
+# Validate version format — SemVer with optional pre-release (e.g. 0.18.0-rc1).
+# Must match the regex enforced by release.yml's version-format check.
+if ! echo "$VERSION" | grep -Eq '^[0-9]+\.[0-9]+\.[0-9]+(-[a-zA-Z0-9.]+)?$'; then
+    echo "ERROR: Invalid version format: $VERSION" >&2
+    exit 1
+fi
 
 # ---------------------------------------------------------------------------
 # Scratch directory (cleaned up on exit)
@@ -260,22 +258,8 @@ if [ "$INSTALL_METHOD_OVERRIDE" = "pip" ]; then
     exit 0
 fi
 
-# Skip binary download if previous install used pip (saves ~30s + bandwidth)
-if [ -f "${HOME}/.screencap/.install_method" ] && [ "$INSTALL_METHOD_OVERRIDE" != "binary" ]; then
-    prev_method=$(cat "${HOME}/.screencap/.install_method")
-    if [ "$prev_method" = "pip" ]; then
-        echo "Previous install used pip — skipping binary download..."
-        install_via_pip
-        echo "Run 'screencap --help' to get started."
-        echo ""
-        echo "Note: screencap requires Screen Recording and Accessibility"
-        echo "permissions. You'll be prompted to grant these on first use."
-        exit 0
-    fi
-fi
-
 # ---------------------------------------------------------------------------
-# Binary install attempt
+# Binary install attempt (falls back to pip on verification failure)
 # ---------------------------------------------------------------------------
 BASE_URL="${DIST_BASE_URL}/v${VERSION}"
 TARBALL="screencap-${VERSION}-${ARCH}.tar.gz"
@@ -317,8 +301,6 @@ else
 
     if [ "$VERIFY_EXIT" -eq 0 ]; then
         INSTALL_METHOD="binary"
-        mkdir -p "${HOME}/.screencap"
-        echo "$INSTALL_METHOD" > "${HOME}/.screencap/.install_method"
         echo ""
         echo "screencap installed successfully! ($VERIFY_OUTPUT)"
     else
