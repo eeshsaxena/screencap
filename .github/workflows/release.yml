@@ -96,14 +96,23 @@ jobs:
         run: |
           VERSION=${GITHUB_REF#refs/tags/v}
           tar czf screencap-${VERSION}-${{ matrix.arch }}.tar.gz -C dist screencap/
-          shasum -a 256 screencap-${VERSION}-${{ matrix.arch }}.tar.gz >> checksums.sha256
+          shasum -a 256 screencap-${VERSION}-${{ matrix.arch }}.tar.gz > checksums-${{ matrix.arch }}.sha256
 
-      - uses: actions/upload-artifact@v4
+      - id: auth
+        uses: google-github-actions/auth@v2
         with:
-          name: screencap-${{ matrix.arch }}
-          path: |
-            screencap-*.tar.gz
-            checksums.sha256
+          credentials_json: ${{ secrets.GCP_SA_KEY }}
+
+      - uses: google-github-actions/setup-gcloud@v2
+
+      - name: Upload tarball to GCS
+        # Bypasses actions/upload-artifact entirely — the artifact storage quota
+        # kept blocking releases. Each build job uploads its own tarball + per-arch
+        # checksum file directly to GCS. The release job reads them back.
+        run: |
+          VERSION=${GITHUB_REF#refs/tags/v}
+          gcloud storage cp "screencap-${VERSION}-${{ matrix.arch }}.tar.gz" "gs://screencap-releases/releases/v${VERSION}/"
+          gcloud storage cp "checksums-${{ matrix.arch }}.sha256" "gs://screencap-releases/releases/v${VERSION}/"
 
   release:
     needs: build
@@ -113,11 +122,6 @@ jobs:
     steps:
       - uses: actions/checkout@v4
 
-      - uses: actions/download-artifact@v4
-
-      - name: Merge checksums
-        run: cat */checksums.sha256 > checksums.sha256
-
       - id: auth
         uses: google-github-actions/auth@v2
         with:
@@ -125,13 +129,19 @@ jobs:
 
       - uses: google-github-actions/setup-gcloud@v2
 
-      - name: Upload to GCS
+      - name: Fetch build outputs from GCS
         run: |
           VERSION=${GITHUB_REF#refs/tags/v}
-          # Upload versioned artifacts
-          gcloud storage cp */screencap-*.tar.gz gs://screencap-releases/releases/v${VERSION}/
-          gcloud storage cp checksums.sha256 gs://screencap-releases/releases/v${VERSION}/
-          # Upload/update install script
+          mkdir -p gcs-download
+          gcloud storage cp "gs://screencap-releases/releases/v${VERSION}/screencap-*.tar.gz" gcs-download/
+          gcloud storage cp "gs://screencap-releases/releases/v${VERSION}/checksums-*.sha256" gcs-download/
+          # Merge per-arch checksums into a single combined file the installer reads.
+          cat gcs-download/checksums-*.sha256 > gcs-download/checksums.sha256
+
+      - name: Upload merged checksums and install.sh to GCS
+        run: |
+          VERSION=${GITHUB_REF#refs/tags/v}
+          gcloud storage cp gcs-download/checksums.sha256 "gs://screencap-releases/releases/v${VERSION}/"
           gcloud storage cp scripts/install.sh gs://screencap-releases/releases/install.sh
 
       - name: Create GitHub Release
@@ -149,13 +159,15 @@ jobs:
           if [ ! -s release_notes.txt ]; then
             echo "See [CHANGELOG.md](CHANGELOG.md) for details." > release_notes.txt
           fi
-          gh release create "v${VERSION}" \
+          if ! gh release create "v${VERSION}" \
             --title "v${VERSION}" \
             --notes-file release_notes.txt \
-            */screencap-*.tar.gz \
-            checksums.sha256 \
-          || gh release edit "v${VERSION}" \
-            --notes-file release_notes.txt
+            gcs-download/screencap-*.tar.gz \
+            gcs-download/checksums.sha256; then
+            # Release already exists — update notes and overwrite assets.
+            gh release edit "v${VERSION}" --notes-file release_notes.txt
+            gh release upload "v${VERSION}" gcs-download/screencap-*.tar.gz gcs-download/checksums.sha256 --clobber
+          fi
 
   verify-install:
     needs: release
