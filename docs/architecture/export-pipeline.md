@@ -1,0 +1,128 @@
+# Export Pipeline
+
+## What it does
+
+Converts raw events stored in SQLite into the `events.jsonl` format that downstream tools (viewer, scrubber, Cloud Run) consume. Two callers, one shared processing chain.
+
+## Two callers, one chain
+
+```
+                       raw DB rows (action_event + window_event)
+                                    │
+                                    ▼
+                       dict_to_action_event / dict_to_window_switch
+                                    │
+                                    ▼
+                       process_events() — 11-stage merge pipeline
+                                    │
+                                    ▼
+                       drop MouseMoveEvent (default; --include-moves)
+                                    │
+                                    ▼
+                       deduplicate_window_events()
+                                    │
+                                    ▼  (privacy filter on window switches)
+                       interleave_window_events()
+                                    │
+                                    ▼
+                       _meta header line + events as JSONL
+                                    │
+                ┌───────────────────┴────────────────────┐
+                │                                        │
+                ▼                                        ▼
+        screencap export                      chunk_processor (per-chunk)
+        (CLI command)                         events_NNNN.jsonl
+        events.jsonl
+        (full recording)
+```
+
+### Caller 1 — `screencap export` (full recording)
+
+Lives in `screencap/exporter.py`. Used by the CLI `export` command.
+
+Path: `CaptureSession.load(dir)` → `capture.export_events(include_moves)` → uses SQLAlchemy ORM to read all events, runs `process_events`, returns flat list. The exporter wraps with the `_meta` header and applies the privacy filter to `WindowSwitchEvent`s if cloud intent.
+
+Atomic write: `output.tmp` → `os.rename(output)`.
+
+### Caller 2 — chunk processor (per-chunk during recording)
+
+Lives in `screencap/chunk_processor.py`. Used during cloud-intent recordings. Triggered on each chunk rotation.
+
+Path: raw `sqlite3` queries (read-only, `PRAGMA query_only=ON`):
+
+```sql
+-- chunk events
+SELECT * FROM action_event WHERE timestamp >= ? AND timestamp < ? ORDER BY timestamp;
+SELECT * FROM window_event WHERE timestamp >= ? AND timestamp < ? ORDER BY timestamp;
+
+-- initial window context (the last switch BEFORE the chunk's start_ts)
+SELECT * FROM window_event WHERE timestamp < ? ORDER BY timestamp DESC LIMIT 1;
+```
+
+The initial window event has its timestamp rewritten to `start_ts - 0.001` so it sorts before the first chunk event. This guarantees the first action in the chunk has a known window context even if no window switch happened during the chunk.
+
+Then runs the same shared chain. Atomic write: `events_NNNN.jsonl.tmp` → `os.rename`.
+
+## events.jsonl format v2
+
+```jsonl
+{"_meta": true, "format_version": 2, "screencap_version": "0.18.0", "exported_at": "2026-...", "exclude_moves": true}
+{"timestamp": 1700000000.123, "type": "window.switch", "app_name": "Visual Studio Code", "app_bundle_id": "com.microsoft.VSCode", "window_title": "<...>", ...}
+{"timestamp": 1700000000.456, "type": "mouse.singleclick", "x": 100, "y": 200, "button": "left", "children": [...]}
+{"timestamp": 1700000000.789, "type": "key.type", "text": "hello", "children": [...]}
+...
+```
+
+- **Line 1** is always the `_meta` dict (plain `json.dumps`).
+- **Subsequent lines** are Pydantic events serialized via `.model_dump_json()`.
+- Events are time-ordered.
+- `mouse.move` events are excluded by default (both paths). `--include-moves` keeps them.
+
+## Privacy-aware window switches
+
+`build_privacy_filter(privacy_mode, cloud_intent, capture_dir)` in `exporter.py` returns a closure that:
+
+1. Checks `.menubar_overrides.json` for runtime user toggles. `"exclude"` → return `None` (suppressed). `"allow"` → unchanged.
+2. Otherwise runs `DefaultContextClassifier.classify` + `DefaultPolicyEvaluator.evaluate`.
+3. Applies the resulting `PrivacyAction`:
+   - **EXCLUDE** → return `None`. Event suppressed entirely.
+   - **MASK_WINDOW** → return `event.model_copy(update={"window_title": event.app_name, "domain": None})`. Title becomes app name; domain nulled.
+   - **TEXT_REDACT, ALLOW, others** → return event unchanged. Scrubbing of `key.type` text and similar is deferred to the scrub pipeline.
+4. If `cloud_intent=True`, mode is forced to `PUBLIC`.
+
+The closure is passed as `privacy_filter` to `_write_events()`; `None` returns are skipped.
+
+## Window switch deduplication
+
+`deduplicate_window_events()` collapses raw window event rows on `(app_bundle_id, window_id)`. Title-only changes within the same window do NOT trigger a new switch event. A late-arriving `browser_url` (common with async AX URL extraction) patches the `domain` of the already-emitted event via `model_copy()`.
+
+## Load-bearing invariants
+
+- **First line is always `_meta`.** Skip it during parse — it's the format version + metadata, not an event. Parsers should check `data.get("_meta")` to identify it.
+- **`format_version: 2` is current.** v1 manifests existed historically; v2 is the live format. Bumping requires updating Cloud Run's manifest routing too.
+- **Atomic write everywhere.** Both paths use `.tmp` + `os.rename`. Crash mid-write leaves no partial JSONL, only the prior version (or nothing).
+- **Dedup on `(app_bundle_id, window_id)`, not title.** Title-only changes are noise.
+- **Initial window context query timestamp rewrite is required.** `start_ts - 0.001` ensures the synthetic event sorts first. Removing the rewrite breaks the first-action window-context guarantee.
+- **Cloud intent forces PUBLIC privacy mode.** Local recordings respect the config-file mode. Don't assume the configured mode applies — check `cloud_intent`.
+- **MASK_WINDOW null both `window_title` AND `domain`.** Replacing only the title would still leak via `domain` for browsers.
+- **Mouse.move excluded by default.** Including moves bloats the JSONL by 100×+. Only re-enable for specific tools (debugging, UI replay).
+- **Chunk processor uses raw sqlite3, not SQLAlchemy.** Loads faster, avoids ORM overhead, and `query_only=ON` is read-safe during writes.
+- **`build_privacy_filter` reads `.menubar_overrides.json` at filter construction.** Subsequent menubar toggles do not affect an in-flight export.
+- **Filter `None` return = suppress.** Don't return the unmodified event by mistake — it would defeat EXCLUDE.
+
+## Before you change it
+
+- Bumping `format_version`: every consumer (viewer, scrubber, Cloud Run) must handle both versions or be updated in lockstep.
+- Adding a field to the `_meta` header: `build_export_metadata` is the single place to change. Ensure consumers handle missing fields (older recordings will lack new keys).
+- Changing the privacy filter for window switches: it ALSO runs at scrub time on `WindowSwitchEvent` text. Don't add side effects (e.g., logging) — runs on every event.
+- Adding a new event type: the chunk processor's raw-sqlite3 query reads `action_event.*` flat — make sure the new type's columns are already in the schema. Otherwise migrate first.
+- Changing the chunk time-range query: `[start_ts, end_ts)` is half-open; events at exactly `end_ts` belong to the next chunk. Test boundary handling.
+- Removing `mouse.move` from raw capture entirely: would simplify export but break drag detection (stage 9 needs the moves to compute distance).
+
+## See also
+
+- [event-system.md](./event-system.md) — the 11-stage pipeline applied here
+- [database.md](./database.md) — raw rows + schema
+- [privacy.md](./privacy.md) — what the privacy filter checks
+- [scrubbing.md](./scrubbing.md) — post-export text scrubbing
+- [segmentation.md](./segmentation.md) — what the manifest carries alongside JSONL
