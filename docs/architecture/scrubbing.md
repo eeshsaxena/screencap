@@ -61,15 +61,21 @@ The chunk processor calls `scrub_pipeline` functions inline at each chunk rotati
 
 **Gated by `_scrub_enabled`.** The scrub call (`_scrub_chunk_files`) only runs when `self._scrub_enabled and self._pipeline is not None`. `--no-scrub` on `screencap start` sets `scrub_enabled=False` and skips this entirely.
 
+There are two upload paths, and they treat scrubbing differently:
+
+- **Live chunk upload** (during recording, when `upload_enabled=True` on the chunk processor): uploads each chunk as it rotates. Scrubbing is gated by `_scrub_enabled`. With `--no-scrub`, chunks reach GCS unscrubbed.
+- **Manual `screencap upload`** (after recording, separate command): **always** runs `scrub_recording()` first, regardless of `--no-scrub` at recording time. The CLI literally has the comment "Always scrub before upload" and aborts upload on scrub failure. The scrubbed `<name>-scrubbed/` copy is what gets uploaded.
+
 What this means in practice:
 
-| State | Capture-time enforcement | Per-chunk scrub | Pre-upload scrub |
+| State | Capture-time enforcement | Per-chunk scrub (live upload) | Pre-upload scrub (manual `screencap upload`) |
 |---|---|---|---|
-| Cloud intent, scrub on (default) | ✓ | ✓ | n/a (already scrubbed in chunks) |
-| Cloud intent, `--no-scrub` | ✓ | ✗ | ✗ |
-| Local intent | ✓ (per local mode) | ✗ | only if user runs `screencap scrub` |
+| Cloud intent, scrub on, live upload | ✓ | ✓ | n/a (chunks already uploaded) |
+| Cloud intent, `--no-scrub`, live upload | ✓ | ✗ | n/a (chunks already uploaded) |
+| Manual `screencap upload` | ✓ (during recording) | n/a (not live) | ✓ always |
+| Local intent, no upload | ✓ (per local mode) | n/a | only if user runs `screencap scrub` |
 
-Capture-time enforcement always applies (the `RecorderPrivacyFilter` runs regardless of `--no-scrub`). What `--no-scrub` disables is the post-capture detection-pipeline pass over text content. EXCLUDE-blocked apps are still never written to disk; what may slip through is PII/secrets in events from non-blocked apps.
+Capture-time enforcement always applies (the `RecorderPrivacyFilter` runs regardless of `--no-scrub`). What `--no-scrub` disables is the post-capture detection-pipeline pass over text content during live chunk upload. EXCLUDE-blocked apps are still never written to disk; what may slip through to GCS during a `--no-scrub` live upload is PII/secrets in events from non-blocked apps.
 
 ### Flavor 3 — Live cascade-delete (`privacy/scrub_worker.py`)
 

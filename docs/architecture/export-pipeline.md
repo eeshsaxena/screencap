@@ -50,6 +50,8 @@ Atomic write: `output.tmp` → `os.rename(output)`.
 
 Lives in `screencap/chunk_processor.py`. Used during cloud-intent recordings. Triggered on each chunk rotation.
 
+This is the **only** path that produces v2-format `events_NNNN.jsonl` (with `_meta` header, processed events, deduplicated window switches, privacy filter applied).
+
 Path: raw `sqlite3` queries (read-only, `PRAGMA query_only=ON`):
 
 ```sql
@@ -64,6 +66,36 @@ SELECT * FROM window_event WHERE timestamp < ? ORDER BY timestamp DESC LIMIT 1;
 The initial window event has its timestamp rewritten to `start_ts - 0.001` so it sorts before the first chunk event. This guarantees the first action in the chunk has a known window context even if no window switch happened during the chunk.
 
 Then runs the same shared chain. Atomic write: `events_NNNN.jsonl.tmp` → `os.rename`.
+
+### Caller 3 — manual upload recovery (`_recover_chunk_metadata`)
+
+Lives in `screencap/cli.py:_recover_chunk_metadata`, invoked by `screencap upload` when chunk videos exist on disk but `events_NNNN.jsonl` files are missing (e.g., the `ChunkProcessor` thread crashed during recording but media files were already written).
+
+**This path produces a different format from Caller 2.** It writes raw `action_event` rows directly:
+
+```python
+rows = conn.execute(
+    "SELECT * FROM action_event WHERE timestamp >= ? AND timestamp < ? ORDER BY timestamp",
+    (c_start, c_end),
+).fetchall()
+with open(jsonl_path, "w") as f:
+    for row in rows:
+        f.write(json.dumps(dict(row)) + "\n")
+```
+
+Differences vs the v2 format:
+
+| Aspect | v2 (chunk processor) | Recovery (`_recover_chunk_metadata`) |
+|---|---|---|
+| `_meta` header line | yes | **no** |
+| Window switch events | yes (deduplicated, interleaved) | **no — only `action_event` rows** |
+| Pydantic event types (`mouse.singleclick`, `key.type`, `mouse.drag`, …) | yes | **no — raw rows with `name = "click"`/`"press"`/etc.** |
+| 11-stage processing | yes | **no** |
+| Privacy filter on window switches | yes | **n/a (no window events at all)** |
+| Initial window context | yes | no |
+| Atomic write (`.tmp` + `os.rename`) | yes | **no — direct write** |
+
+Cloud Run's LLM activity summary depends on `window.switch` entries, so recovered chunks degrade the segmentation quality — the LLM sees no app or window context. Treat this as a fallback for partially-failed recordings, not as a substitute for the chunk processor's output.
 
 ## events.jsonl format v2
 
@@ -100,7 +132,7 @@ This filter is currently invoked **only by the chunk processor** when building p
 
 ## Load-bearing invariants
 
-- **First line is always `_meta`.** Skip it during parse — it's the format version + metadata, not an event. Parsers should check `data.get("_meta")` to identify it.
+- **First line is `_meta` for chunk-processor output.** Recovery output (`_recover_chunk_metadata`) skips the header and writes raw DB rows. Parsers should check `data.get("_meta")` to identify the header — and tolerate its absence on recovery files.
 - **`format_version: 2` is current.** v1 manifests existed historically; v2 is the live format. Bumping requires updating Cloud Run's manifest routing too.
 - **Atomic write everywhere.** Both paths use `.tmp` + `os.rename`. Crash mid-write leaves no partial JSONL, only the prior version (or nothing).
 - **Privacy filter applies only to the chunk path.** CLI `screencap export` does not run a privacy filter. Cloud-safety on full export must come from capture-time enforcement (already-blocked content was never written) and post-hoc scrubbing.

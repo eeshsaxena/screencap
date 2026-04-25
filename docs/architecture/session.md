@@ -201,7 +201,7 @@ Context assembly: up to 5 sample screenshots (resized to 1024px wide, base64 JPE
 
 ## Load-bearing invariants
 
-- **`_startup` imported BEFORE `multiprocessing`.** `session.py:30` is `from screencap import _startup` with `# noqa: F401`. The module sets `PYTHONWARNINGS` for `multiprocessing.resource_tracker`. `resource_tracker` is spawned lazily from any multiprocessing import; it inherits env at spawn. Reordering imports breaks warning suppression.
+- **`_startup` imported BEFORE `multiprocessing`.** `session.py` does `from screencap import _startup` (with `# noqa: F401`) at the very top of its imports. The module sets `PYTHONWARNINGS` for `multiprocessing.resource_tracker`. `resource_tracker` is spawned lazily from any multiprocessing import; it inherits env at spawn. Reordering imports breaks warning suppression.
 - **Workers must `os.setpgrp()`.** Otherwise tty SIGINT reaches them and the controller's three-tap pattern doesn't work.
 - **Workers ignore SIGINT.** Without `SIG_IGN`, the worker's own signal handler runs in addition to the controller's.
 - **`_on_stop_click` is non-blocking.** Don't add `proc.join()`. The whole point is to let the next recording start while the previous one cleans up.
