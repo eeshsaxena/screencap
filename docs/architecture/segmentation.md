@@ -183,11 +183,14 @@ Written to `sessions/<name>/timeline.json` after Cloud Run processing.
 
 CLI flag: `screencap start --segmentation-mode [idle|llm]`. The flag takes priority over the config file value. Invalid values exit with a helpful error.
 
-The mode is captured at recording start and persisted in the manifest format. Cloud Run reads `manifests[0].get("format_version", 0)` and routes: `>= 2` → LLM path, `< 2` (including missing key, which the legacy manifest never sets) → idle-gap merge path. Independent of any current config setting.
+The mode is captured at recording start and persisted **via the manifest format** (the manifest type itself encodes the choice — `format_version: 2` for LLM, no `format_version` for legacy). Cloud Run reads `manifests[0].get("format_version", 0)` and routes: `>= 2` → LLM path, `< 2` (including missing key, which legacy never sets) → idle-gap merge path. Independent of any current config setting.
+
+> **Recovery exception.** The mode is **not** stored in `.recording_intent`. If the original chunk processor failed and `screencap upload` runs `_recover_chunk_metadata` to backfill manifests, that recovery path calls `get_segmentation_mode()` against current config — not the mode in effect at recording time. If the user changed `segmentation_mode` in `config.toml` between recording and upload, recovered manifests will use the new mode. Either persist `segmentation_mode` in `.recording_intent`, or treat the upload-time config as authoritative for recovered chunks; today the code does the latter.
 
 ## Load-bearing invariants
 
 - **Manifest `format_version` is the source of truth for Cloud Run.** Reading `config.toml` server-side would be wrong — the recording was created with a specific mode and that decision is baked into the manifest. Legacy manifests omit the key entirely; Cloud Run reads with `.get("format_version", 0)` so missing → 0 → idle-gap path. Don't add `format_version: 1` to legacy manifests; the test suite asserts its absence.
+- **Segmentation mode is NOT persisted in `.recording_intent`.** Recovery (`_recover_chunk_metadata`) reads current `get_segmentation_mode()` to fill in missing manifests. Recordings whose original chunk processor failed will be recovered with the live config's mode, not the mode that was in force when recording started.
 - **CLI flag wins over config.toml.** `--segmentation-mode` is captured at recording start.
 - **`_LLM_ENRICHED_FIELDS`** (`name`, `description`, `category`, `apps_used`, `confidence`) are conditional. Idle-segmented tasks lack them. Frontend code must handle missing keys.
 - **Tag regex `^[a-z0-9][a-z0-9-]{0,30}$`, max 8 tags.** Validation strips invalid tags, dedups, caps. Don't bypass — Cloud Run's tag system depends on these constraints.

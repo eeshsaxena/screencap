@@ -107,10 +107,13 @@ Cloud Run's LLM activity summary depends on `window.switch` entries, so recovere
 ...
 ```
 
-- **Line 1** is always the `_meta` dict (plain `json.dumps`).
-- **Subsequent lines** are Pydantic events serialized via `.model_dump_json()`.
+- **Line 1** is always the `_meta` dict (plain `json.dumps`) for chunk-processor and CLI export output. Recovery output omits it.
+- **Subsequent lines** are Pydantic events serialized via `.model_dump_json()` (chunk + CLI export) or raw DB row dicts (recovery).
 - Events are time-ordered.
-- `mouse.move` events are excluded by default (both paths). `--include-moves` keeps them.
+- **`mouse.move` defaults differ by path**:
+  - **CLI `screencap export`** uses `--exclude-moves` (default `False`), so moves are **included** by default. The auto-export run after recording also passes `exclude_moves=False` explicitly. Pass `--exclude-moves` to drop them.
+  - **Chunk processor** drops moves unconditionally — bloat reduction for cloud uploads.
+  - **Recovery** keeps whatever raw rows exist (no filtering at all).
 
 ## Privacy-aware window switches (chunk path only)
 
@@ -134,13 +137,13 @@ This filter is currently invoked **only by the chunk processor** when building p
 
 - **First line is `_meta` for chunk-processor output.** Recovery output (`_recover_chunk_metadata`) skips the header and writes raw DB rows. Parsers should check `data.get("_meta")` to identify the header — and tolerate its absence on recovery files.
 - **`format_version: 2` is current.** v1 manifests existed historically; v2 is the live format. Bumping requires updating Cloud Run's manifest routing too.
-- **Atomic write everywhere.** Both paths use `.tmp` + `os.rename`. Crash mid-write leaves no partial JSONL, only the prior version (or nothing).
+- **Atomic write for CLI export and chunk processor.** Both use `.tmp` + `os.rename`. Crash mid-write leaves no partial JSONL, only the prior version (or nothing). **Recovery (`_recover_chunk_metadata`) writes directly with `open(...)` — not atomic.** A crash during recovery can leave a partial file on disk; the `force` flag re-runs it from scratch.
 - **Privacy filter applies only to the chunk path.** CLI `screencap export` does not run a privacy filter. Cloud-safety on full export must come from capture-time enforcement (already-blocked content was never written) and post-hoc scrubbing.
 - **Dedup on `(app_bundle_id, window_id)`, not title.** Title-only changes are noise.
 - **Initial window context query timestamp rewrite is required.** `start_ts - 0.001` ensures the synthetic event sorts first. Removing the rewrite breaks the first-action window-context guarantee.
 - **Cloud intent forces PUBLIC privacy mode.** Local recordings respect the config-file mode. Don't assume the configured mode applies — check `cloud_intent`.
 - **MASK_WINDOW null both `window_title` AND `domain`.** Replacing only the title would still leak via `domain` for browsers.
-- **Mouse.move excluded by default.** Including moves bloats the JSONL by 100×+. Only re-enable for specific tools (debugging, UI replay).
+- **Mouse.move handling diverges by caller.** The chunk processor drops moves unconditionally; CLI/auto export keeps them by default and requires `--exclude-moves` to drop. Don't assume "moves excluded" universally — including them bloats the JSONL by 100×+, but it's the CLI default.
 - **Chunk processor uses raw sqlite3, not SQLAlchemy.** Loads faster, avoids ORM overhead, and `query_only=ON` is read-safe during writes.
 - **`build_privacy_filter` reads `.menubar_overrides.json` at filter construction.** Subsequent menubar toggles do not affect an in-flight export.
 - **Filter `None` return = suppress.** Don't return the unmodified event by mistake — it would defeat EXCLUDE.
