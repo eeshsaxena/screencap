@@ -17,20 +17,22 @@ Splits a recording into discrete tasks (e.g., "writing tests for module X", "res
        │                          │
        ▼                          ▼
 ─── Path 1: idle-gap ───      ─── Path 2: LLM ───
-                                                  
+
 client-side segmentation     client writes minimal manifest
 in chunk_processor           (stats + chunk boundaries only)
        │                          │
        ▼                          ▼
 chunk_NNNN_manifest.json     chunk_NNNN_manifest.json
-{
-  "format_version": 1,         {
-  "tasks": [                     "format_version": 2,
-    {derived_name, dominant_app, "stats": {total_events, ...},
-     duration, ...},             "blocked_intervals": [...]
-    ...                         }
-  ]
-}
+{                            {
+  "chunk_index": 0,            "format_version": 2,
+  "chunk_start": ...,          "chunk_index": 0,
+  "tasks": [                   "stats": {total_events, ...},
+    {derived_name,             "blocked_intervals": [...]
+     dominant_app, ...},     }
+    ...
+  ],
+  "summary": {...}
+}                            ← legacy has NO format_version key
        │                          │
        ▼                          ▼
 ─── upload to GCS ──────────────────────────
@@ -46,7 +48,7 @@ cross-chunk tasks               LLM segmentation via Gemini
 sessions/<name>/timeline.json with segmentation_method
 ```
 
-## Path 1: idle-gap (v1)
+## Path 1: idle-gap (legacy, no format_version)
 
 `task_manifest._generate_manifest_legacy` runs at chunk rotation when `segmentation_mode == "idle"`. It:
 
@@ -54,9 +56,25 @@ sessions/<name>/timeline.json with segmentation_method
 2. `_segment_tasks(events, rest_threshold=120s)`: walks events sorted by timestamp; splits into a new task whenever the inter-event gap exceeds `rest_threshold`.
 3. For each task computes `dominant_app` via `_compute_dominant_app`: builds wall-clock dwell time per bundle ID using the window event timeline, returns the longest.
 4. Derives a name via `_derive_task_name`: applies `_TITLE_PARSERS` regex per known app (VS Code, Chrome, Safari, Firefox, Slack, Terminal, iTerm2, Finder), or falls back to slugified `app_name + title`.
-5. Writes manifest with full `tasks` array.
+5. Writes manifest with full `tasks` array. **No `format_version` key is written** — this is how Cloud Run distinguishes legacy from v2.
 
 Cloud Run's `_merge_tasks` then glues cross-chunk tasks: if the last task of chunk N has `rest_after_s == 0`, the chunk gap ≤ 5s, and the inter-task idle is below threshold, it merges with the first task of chunk N+1. Re-computes the dominant app.
+
+Legacy manifest shape:
+
+```json
+{
+  "chunk_index": 0,
+  "chunk_start": 1700000000.0,
+  "chunk_end": 1700000060.0,
+  "rest_threshold_secs": 120,
+  "tasks": [
+    {"derived_name": "vscode-auth", "dominant_app": "...", "start_ts": ..., "end_ts": ..., ...}
+  ],
+  "summary": {"total_tasks": 1, "total_active_s": 60.0, ...},
+  "blocked_intervals": [...]
+}
+```
 
 ## Path 2: LLM (v2, default)
 
@@ -165,11 +183,11 @@ Written to `sessions/<name>/timeline.json` after Cloud Run processing.
 
 CLI flag: `screencap start --segmentation-mode [idle|llm]`. The flag takes priority over the config file value. Invalid values exit with a helpful error.
 
-The mode is captured at recording start and persisted in the manifest format (v1 vs v2). Cloud Run reads `manifests[0]["format_version"]` and routes accordingly — independent of any current config setting.
+The mode is captured at recording start and persisted in the manifest format. Cloud Run reads `manifests[0].get("format_version", 0)` and routes: `>= 2` → LLM path, `< 2` (including missing key, which the legacy manifest never sets) → idle-gap merge path. Independent of any current config setting.
 
 ## Load-bearing invariants
 
-- **Manifest `format_version` is the source of truth for Cloud Run.** Reading `config.toml` server-side would be wrong — the recording was created with a specific mode and that decision is baked into the manifest.
+- **Manifest `format_version` is the source of truth for Cloud Run.** Reading `config.toml` server-side would be wrong — the recording was created with a specific mode and that decision is baked into the manifest. Legacy manifests omit the key entirely; Cloud Run reads with `.get("format_version", 0)` so missing → 0 → idle-gap path. Don't add `format_version: 1` to legacy manifests; the test suite asserts its absence.
 - **CLI flag wins over config.toml.** `--segmentation-mode` is captured at recording start.
 - **`_LLM_ENRICHED_FIELDS`** (`name`, `description`, `category`, `apps_used`, `confidence`) are conditional. Idle-segmented tasks lack them. Frontend code must handle missing keys.
 - **Tag regex `^[a-z0-9][a-z0-9-]{0,30}$`, max 8 tags.** Validation strips invalid tags, dedups, caps. Don't bypass — Cloud Run's tag system depends on these constraints.

@@ -40,7 +40,9 @@ Converts raw events stored in SQLite into the `events.jsonl` format that downstr
 
 Lives in `screencap/exporter.py`. Used by the CLI `export` command.
 
-Path: `CaptureSession.load(dir)` → `capture.export_events(include_moves)` → uses SQLAlchemy ORM to read all events, runs `process_events`, returns flat list. The exporter wraps with the `_meta` header and applies the privacy filter to `WindowSwitchEvent`s if cloud intent.
+Path: `CaptureSession.load(dir)` → `capture.export_events(include_moves)` → uses SQLAlchemy ORM to read all events, runs `process_events`, returns flat list. The exporter wraps with the `_meta` header and writes JSONL.
+
+> **No privacy filter on this path.** `_write_events` accepts a `privacy_filter` kwarg, but `export_recording` and the CLI's `_export_one` never pass one. CLI export emits events as captured. If the recording was made with cloud intent, capture-time enforcement and post-hoc scrubbing are the privacy guarantees, not export-time filtering.
 
 Atomic write: `output.tmp` → `os.rename(output)`.
 
@@ -78,7 +80,7 @@ Then runs the same shared chain. Atomic write: `events_NNNN.jsonl.tmp` → `os.r
 - Events are time-ordered.
 - `mouse.move` events are excluded by default (both paths). `--include-moves` keeps them.
 
-## Privacy-aware window switches
+## Privacy-aware window switches (chunk path only)
 
 `build_privacy_filter(privacy_mode, cloud_intent, capture_dir)` in `exporter.py` returns a closure that:
 
@@ -90,7 +92,7 @@ Then runs the same shared chain. Atomic write: `events_NNNN.jsonl.tmp` → `os.r
    - **TEXT_REDACT, ALLOW, others** → return event unchanged. Scrubbing of `key.type` text and similar is deferred to the scrub pipeline.
 4. If `cloud_intent=True`, mode is forced to `PUBLIC`.
 
-The closure is passed as `privacy_filter` to `_write_events()`; `None` returns are skipped.
+This filter is currently invoked **only by the chunk processor** when building per-chunk JSONL during cloud-intent recordings. The factory exists in `exporter.py` (and the kwarg slot exists in `_write_events`), but the full-recording CLI export path does not call it.
 
 ## Window switch deduplication
 
@@ -101,6 +103,7 @@ The closure is passed as `privacy_filter` to `_write_events()`; `None` returns a
 - **First line is always `_meta`.** Skip it during parse — it's the format version + metadata, not an event. Parsers should check `data.get("_meta")` to identify it.
 - **`format_version: 2` is current.** v1 manifests existed historically; v2 is the live format. Bumping requires updating Cloud Run's manifest routing too.
 - **Atomic write everywhere.** Both paths use `.tmp` + `os.rename`. Crash mid-write leaves no partial JSONL, only the prior version (or nothing).
+- **Privacy filter applies only to the chunk path.** CLI `screencap export` does not run a privacy filter. Cloud-safety on full export must come from capture-time enforcement (already-blocked content was never written) and post-hoc scrubbing.
 - **Dedup on `(app_bundle_id, window_id)`, not title.** Title-only changes are noise.
 - **Initial window context query timestamp rewrite is required.** `start_ts - 0.001` ensures the synthetic event sorts first. Removing the rewrite breaks the first-action window-context guarantee.
 - **Cloud intent forces PUBLIC privacy mode.** Local recordings respect the config-file mode. Don't assume the configured mode applies — check `cloud_intent`.

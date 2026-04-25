@@ -70,16 +70,16 @@ ScreenCap is a macOS CLI for screen recording with a privacy-aware capture pipel
 
 ## Cross-cutting conventions
 
-These apply codebase-wide. Every architecture doc assumes them.
+These are patterns the codebase mostly follows. Some are enforced by structure (layering, recording dir layout); others are aspirational and have exceptions. When in doubt, check what the surrounding code does.
 
-- **Layering**: `engine/` is the core capture machine (heavy deps, headless-unfriendly). `screencap/` is the user-facing layer. `scripts/process-recording/` and `scripts/cloud-function/` are separate deployables.
-- **Deferred imports**: Heavy imports happen inside Click command bodies, not at module top. Keeps `screencap --help` fast.
-- **Atomic writes**: All file writes (config.toml, manifests, JSONL, signed URLs) go through tempfile + `os.rename`. `save_config_atomic` is the canonical pattern.
-- **Config priority**: env var > `~/.screencap/config.toml` > hardcoded default. After every write, call `invalidate_config_cache()`.
-- **Path traversal guard**: All recording-name-from-user inputs go through `resolve_recording_dir()`.
-- **No bare `print()`**: All user-facing output goes through `rich.console.Console`. Module-level `console = Console()` is the convention.
-- **`from __future__ import annotations`** at the top of every source file.
-- **Recording dirs** live at `~/.screencap/recordings/<name>/`. The directory IS the unit of identity; `.recording_id` carries the canonical name.
+- **Layering**: `engine/` is the core capture machine (heavy deps, headless-unfriendly). `screencap/` is the user-facing layer. `scripts/process-recording/` and `scripts/cloud-function/` are separate deployables. *Enforced.*
+- **Deferred imports**: Heavy imports happen inside Click command bodies, not at module top, to keep `screencap --help` fast. *Enforced for the CLI hot path; not universal.*
+- **Atomic writes**: Critical state files (config.toml via `save_config_atomic`, JSONL exports, scrubbed outputs) write through tempfile + `os.rename`. *Aspirational, not universal — e.g. `task_manifest` writes manifests directly with `Path.write_text()`. Add atomic writes when the file matters; not every write needs it.*
+- **Config priority**: env var > `~/.screencap/config.toml` > hardcoded default. After every write to the TOML, call `invalidate_config_cache()`. *Enforced for `screencap/config.py` getters.*
+- **Path traversal guard**: User-supplied recording names go through `resolve_recording_dir()`. *Enforced for CLI-facing entry points (export, scrub, view, info, etc.).*
+- **No bare `print()` for user output**: User-facing output goes through `rich.console.Console`. Module-level `console = Console()` is the pattern. *Enforced for the CLI; library modules may use `loguru` instead.*
+- **`from __future__ import annotations`**: Common, but **not universal** — some modules (notably most of `privacy/`, `menubar.py`, `app_discovery.py`) omit it. Add it for new files unless there's a specific reason not to.
+- **Recording dirs** live at `~/.screencap/recordings/<name>/`. The directory IS the unit of identity; `.recording_id` carries the canonical name. *Enforced.*
 
 ## When to add a new file here
 

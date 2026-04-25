@@ -57,9 +57,19 @@ Triggered by `screencap scrub <name>` or automatically before `screencap upload`
 
 ### Flavor 2 — Per-chunk scrub during recording (chunk processor)
 
-When recording is cloud-intent and `--no-scrub` is not set, the chunk processor calls `scrub_pipeline` functions inline at each chunk rotation: `scrub_events_jsonl` over `events_NNNN.jsonl`, `mask_screenshots` over `screenshots/` for that time range, `scrub_transcripts` for `transcript_NNNN.*`. Output is uploaded directly.
+The chunk processor calls `scrub_pipeline` functions inline at each chunk rotation: `scrub_events_jsonl` over `events_NNNN.jsonl`, `mask_screenshots` over `screenshots/` for that time range, `scrub_transcripts` for `transcript_NNNN.*`. Output is uploaded directly.
 
-This means cloud uploads never carry unscrubbed data. The post-hoc flavor is for local recordings or for testing.
+**Gated by `_scrub_enabled`.** The scrub call (`_scrub_chunk_files`) only runs when `self._scrub_enabled and self._pipeline is not None`. `--no-scrub` on `screencap start` sets `scrub_enabled=False` and skips this entirely.
+
+What this means in practice:
+
+| State | Capture-time enforcement | Per-chunk scrub | Pre-upload scrub |
+|---|---|---|---|
+| Cloud intent, scrub on (default) | ✓ | ✓ | n/a (already scrubbed in chunks) |
+| Cloud intent, `--no-scrub` | ✓ | ✗ | ✗ |
+| Local intent | ✓ (per local mode) | ✗ | only if user runs `screencap scrub` |
+
+Capture-time enforcement always applies (the `RecorderPrivacyFilter` runs regardless of `--no-scrub`). What `--no-scrub` disables is the post-capture detection-pipeline pass over text content. EXCLUDE-blocked apps are still never written to disk; what may slip through is PII/secrets in events from non-blocked apps.
 
 ### Flavor 3 — Live cascade-delete (`privacy/scrub_worker.py`)
 
