@@ -92,7 +92,7 @@ When an app transitions blocked→allowed, the reason isn't deleted — it's set
 `DefaultContextClassifier.classify()` 5-step priority:
 
 1. User config override (`app_classes` dict) — except `BROWSER_UNVERIFIED` falls through.
-2. `BUNDLE_ID_MAP` — ~80 known bundle IDs (password managers, banking, email, chat, calendar, video call, code editors, admin consoles).
+2. `BUNDLE_ID_MAP` — ~90 known bundle IDs (password managers, banking, email, chat, calendar, video call, code editors, admin consoles).
 3. Known browser (`BROWSER_BUNDLE_IDS`): if domain present, run `_classify_domain()` (O(1) hash lookup with parent-domain walk-up, skipping TLD-like suffixes like `co.uk`) and `_detect_keyword_flow()` (URL path + subdomain tokens for auth/payment); pick stricter.
 4. Title heuristics (regex match against compiled patterns: inbox, slack, calendar, meeting, password, 2fa, bank).
 5. Explicit `UNKNOWN`.
