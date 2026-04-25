@@ -1,17 +1,17 @@
 ---
 name: list-tickets
-description: List all open tickets organized by epic with status and priority. Shows what's pending, in-progress, blocked, or planned. Sorted by priority (urgent > high > medium > low > unset). Use when you want to see the ticket backlog, check what's blocked, find work to do, or get a status overview. Triggers on "list tickets", "ticket status", "what's open", "what needs work", "backlog", "show tickets", "ticket overview", "what's blocked".
+description: List all open tickets with status and priority. Shows what's pending, in-progress, blocked, or planned. Sorted by priority (urgent > high > medium > low > unset). Use when you want to see the ticket backlog, check what's blocked, find work to do, or get a status overview. Triggers on "list tickets", "ticket status", "what's open", "what needs work", "backlog", "show tickets", "ticket overview", "what's blocked".
 ---
 
-# List Tickets by Epic
+# List Tickets
 
-Show all open tickets across epics with their status, priority, type, and blockers — sorted by priority within each epic.
+Show all open tickets with their status, priority, type, and blockers — sorted by priority.
 
 ## Instructions
 
-### Step 1: Scan All Epics for Open Tickets
+### Step 1: Scan Open Tickets
 
-For each directory under `docs/epics/*/tickets/`, list all `.md` files. These are the open (non-archived) tickets. Archived tickets live in `docs/epics/*/archived/tickets/` — skip those unless the user explicitly asks for them.
+List all `.md` files directly in `docs/tickets/`. These are the open (non-archived) tickets. Archived tickets live in `docs/tickets/archived/` — skip those unless the user explicitly asks for them.
 
 ### Step 2: Parse Ticket Metadata
 
@@ -45,16 +45,16 @@ If a ticket has `blocked_by` in frontmatter, or its body contains "Blocked by" w
 ### Step 4: Check for Args
 
 Handle optional filtering:
-- `/list-tickets` — all open tickets across all epics, sorted by priority
-- `/list-tickets 01` or `/list-tickets privacy` — filter to a specific epic
+- `/list-tickets` — all open tickets, sorted by priority
 - `/list-tickets high` or `/list-tickets urgent` — filter by priority
 - `/list-tickets blocked` — show only blocked tickets
 - `/list-tickets in-progress` — show only in-progress tickets
 - `/list-tickets feat` or `/list-tickets fix` — filter by type
+- `/list-tickets archived` — show archived tickets instead of open
 
 ### Step 5: Render Output
 
-Present tickets grouped by epic, sorted by priority within each group.
+Present tickets grouped by priority (urgent first), sorted by date (newest first) within each priority group.
 
 **Priority sort order**: urgent > high > medium > low > unset
 
@@ -63,42 +63,47 @@ Format:
 ```
 ## Ticket Status Overview
 
-### 01 — Privacy & Redaction (6 open)
+### URGENT (1 open)
 
-| # | Priority | Status | Title | Blocked? |
-|---|----------|--------|-------|----------|
-| 1 | URGENT | backlog | Reduce PII false positives in accessibility text | — |
-| 2 | HIGH | open | Audio files have no redaction — only deletion | — |
-|   |          |        | _Partially implemented (2026-03-08): Safety fallback merged via PR #65_ | |
-| 3 | HIGH | open | Video files have no redaction — only deletion | — |
-| 4 | HIGH | backlog | Reduce PII false positives in screenshot OCR | — |
-| 5 | HIGH | — | Browser URL via accessibility API | — |
-| 6 | MEDIUM | backlog | Auto-export scrubbed copies | — |
+| # | Status | Title | Blocked? |
+|---|--------|-------|----------|
+| 1 | backlog | Reduce PII false positives in accessibility text | — |
 
 ---
 
-### 07 — Cloud & Uploads (1 open)
+### HIGH (3 open)
 
-| # | Priority | Status | Title | Blocked? |
-|---|----------|--------|-------|----------|
-| 1 | MEDIUM | open | Add screenshots to chunk uploads | Blocked by: video-no-redaction |
+| # | Status | Title | Blocked? |
+|---|--------|-------|----------|
+| 1 | open | Audio files have no redaction — only deletion | — |
+|   |        | _Partially implemented (2026-03-08): Safety fallback merged via PR #65_ | |
+| 2 | open | Video files have no redaction — only deletion | — |
+| 3 | backlog | Reduce PII false positives in screenshot OCR | — |
+
+---
+
+### MEDIUM (1 open)
+
+| # | Status | Title | Blocked? |
+|---|--------|-------|----------|
+| 1 | open | Add screenshots to chunk uploads | Blocked by: video-no-redaction |
 
 ---
 ...
 
 ### Summary
-Total: N open tickets across M epics
+Total: N open tickets
 By priority: X urgent, Y high, Z medium, W low, V unset
 By status: A open, B backlog, C in-progress, D blocked
 ```
 
 ### Formatting Rules
 
-- Sort epics by their numeric prefix (01, 02, 03...)
-- Within each epic, sort tickets by priority (urgent first), then by date (newest first)
+- Sort by priority (urgent > high > medium > low > unset)
+- Within each priority group, sort by date (newest first)
 - Show the inline status update (if any) as an indented italic line under the ticket
 - Blocked tickets: show what blocks them in the last column
-- Epics with no open tickets: skip entirely (don't show empty epics)
+- Priority groups with no open tickets: skip entirely
 - Priority display: URGENT in bold, HIGH in bold, medium/low/unset in normal case
 
 ### Step 6: Offer Follow-up
@@ -107,7 +112,7 @@ After showing the overview, offer:
 ```
 Want me to:
 - Read a specific ticket? (give the number or name)
-- Show archived/completed tickets for an epic?
+- Show archived/completed tickets?
 - Create a new ticket?
 - Update a ticket's status?
 ```
