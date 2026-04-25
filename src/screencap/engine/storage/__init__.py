@@ -4,10 +4,10 @@ This module provides storage backends for persisting captured GUI events.
 The primary implementation uses SQLite for reliable, portable storage.
 
 Usage:
-    from screencap.engine.storage import SQLiteStorage
+    from screencap.engine.storage import CaptureStorage
 
     # Create storage
-    storage = SQLiteStorage("./capture/capture.db")
+    storage = CaptureStorage("./capture/capture.db")
 
     # Write events
     storage.write_event(event)
@@ -22,11 +22,7 @@ from __future__ import annotations
 
 from pathlib import Path
 
-# Import SQLite-specific implementation
-from screencap.engine.storage.sqlite import SQLiteStorage
-
-# Re-export from the original storage module for backward compatibility
-from screencap.engine.storage_impl import (
+from screencap.engine.storage.sqlite import (
     EVENT_TYPE_MAP,
     Capture,
     CaptureStorage,
@@ -53,7 +49,6 @@ def get_storage(db_path: str | Path) -> CaptureStorage:
 __all__ = [
     # Storage classes
     "CaptureStorage",
-    "SQLiteStorage",
     # Data models
     "Capture",
     "Stream",

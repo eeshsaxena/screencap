@@ -6,14 +6,18 @@ from pathlib import Path
 import pytest
 
 from screencap.engine.events import (
+    BaseEvent,
     EventType,
     KeyDownEvent,
+    KeyShortcutEvent,
     MouseButton,
     MouseDownEvent,
     MouseMoveEvent,
     MouseUpEvent,
+    WindowSwitchEvent,
 )
 from screencap.engine.storage import (
+    EVENT_TYPE_MAP,
     Capture,
     CaptureStorage,
     create_capture,
@@ -272,3 +276,94 @@ class TestCaptureModel:
             metadata={"user": "test_user", "version": "1.0"},
         )
         assert capture.metadata["user"] == "test_user"
+
+
+def _concrete_event_classes():
+    """Yield (subclass, event_type_value) for every concrete BaseEvent subclass."""
+    from typing import Literal, get_args, get_origin
+
+    for cls in BaseEvent.__subclasses__():
+        type_field = cls.model_fields.get("type")
+        if type_field is None:
+            continue
+        annotation = type_field.annotation
+        if get_origin(annotation) is not Literal:
+            continue
+        args = get_args(annotation)
+        if len(args) != 1:
+            continue
+        member = args[0]
+        value = member.value if hasattr(member, "value") else member
+        yield cls, value
+
+
+class TestEventTypeMap:
+    """EVENT_TYPE_MAP must cover every concrete BaseEvent subclass.
+
+    Locks completeness so future drift (a new event type added without a
+    corresponding map entry, or a map entry pointing at the wrong class)
+    fails loudly instead of silently dropping events on read.
+    """
+
+    @pytest.mark.parametrize(
+        "event_class,event_type_value",
+        list(_concrete_event_classes()),
+        ids=lambda value: value.__name__ if isinstance(value, type) else str(value),
+    )
+    def test_subclass_has_map_entry(self, event_class, event_type_value):
+        assert event_type_value in EVENT_TYPE_MAP, (
+            f"{event_class.__name__} (type={event_type_value!r}) is missing from "
+            f"EVENT_TYPE_MAP — events of this type would silently drop on read."
+        )
+        assert EVENT_TYPE_MAP[event_type_value] is event_class, (
+            f"EVENT_TYPE_MAP[{event_type_value!r}] is "
+            f"{EVENT_TYPE_MAP[event_type_value].__name__}, expected {event_class.__name__}"
+        )
+
+    def test_key_shortcut_entry(self):
+        assert EVENT_TYPE_MAP[EventType.KEY_SHORTCUT.value] is KeyShortcutEvent
+
+    def test_window_switch_entry(self):
+        assert EVENT_TYPE_MAP[EventType.WINDOW_SWITCH.value] is WindowSwitchEvent
+
+
+class TestNewEventRoundTrip:
+    """Round-trip persistence for the two event types added to EVENT_TYPE_MAP."""
+
+    def test_key_shortcut_round_trip(self, temp_db):
+        with CaptureStorage(temp_db) as storage:
+            event = KeyShortcutEvent(timestamp=1.0, keys=["ctrl", "z"])
+            storage.write_event(event)
+
+            events = storage.get_events()
+
+        assert len(events) == 1
+        loaded = events[0]
+        assert isinstance(loaded, KeyShortcutEvent)
+        assert loaded.keys == ["ctrl", "z"]
+        assert loaded.text == "Ctrl+z"
+
+    def test_window_switch_round_trip(self, temp_db):
+        with CaptureStorage(temp_db) as storage:
+            event = WindowSwitchEvent(
+                timestamp=1.0,
+                app_name="Finder",
+                app_bundle_id="com.apple.finder",
+                window_title="Documents",
+                window_id="123",
+                x=0,
+                y=0,
+                width=800,
+                height=600,
+            )
+            storage.write_event(event)
+
+            events = storage.get_events()
+
+        assert len(events) == 1
+        loaded = events[0]
+        assert isinstance(loaded, WindowSwitchEvent)
+        assert loaded.app_name == "Finder"
+        assert loaded.app_bundle_id == "com.apple.finder"
+        assert loaded.window_title == "Documents"
+        assert loaded.window_id == "123"
