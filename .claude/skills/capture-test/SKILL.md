@@ -79,7 +79,7 @@ Run these checks against the recording directory (`~/.screencap/recordings/<test
 
 #### 5a. File Structure Checks
 - [ ] Recording directory exists
-- [ ] Database file exists (`recording.db` or `capture.db`)
+- [ ] Database file exists (`recording.db`)
 - [ ] `screenshots/` directory exists (if images were enabled)
 - [ ] Screenshots directory has at least 1 file
 - [ ] If audio was enabled: `audio.flac` exists and is > 1KB

@@ -61,7 +61,7 @@ ScreenCap is a macOS CLI for screen recording with a privacy-aware capture pipel
 |---|---|
 | [recording-engine.md](./recording-engine.md) | Multi-process capture: reader threads, event_q, writer processes, signal handling, chunk rotation, on-disk layout |
 | [event-system.md](./event-system.md) | Pydantic event models, the 11-stage processing pipeline, raw → semantic event promotion |
-| [database.md](./database.md) | The two SQLite schemas (`recording.db` SQLAlchemy + `capture.db` raw), catalog detection, migration |
+| [database.md](./database.md) | The `recording.db` SQLite schema, SQLAlchemy + raw access patterns, in-place migration |
 | [privacy.md](./privacy.md) | Two-layer enforcement: capture-time filter (action matrix, blocking sources, fail-closed) + detection pipeline (PII/secrets) |
 | [scrubbing.md](./scrubbing.md) | Three scrub flavors: post-hoc full scrub, per-chunk during cloud-intent recording, live cascade-delete from menubar |
 | [export-pipeline.md](./export-pipeline.md) | events.jsonl format v2, the shared processing chain, privacy-aware window switches |
