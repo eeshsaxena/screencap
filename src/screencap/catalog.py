@@ -10,7 +10,6 @@ from typing import NamedTuple
 
 from screencap.config import get_recordings_dir
 
-DB_NAMES = ("recording.db",)
 INTENT_FILE = ".recording_intent"
 
 

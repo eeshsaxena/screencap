@@ -34,7 +34,6 @@ from screencap.engine.events import (
     WindowSwitchEvent,
 )
 
-
 EVENT_TYPE_MAP: dict[str, type[Event]] = {
     EventType.MOUSE_MOVE.value: MouseMoveEvent,
     EventType.MOUSE_DOWN.value: MouseDownEvent,

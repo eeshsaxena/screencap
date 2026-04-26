@@ -130,6 +130,5 @@ Two-layer privacy enforcement: capture-time filtering + post-recording scrubbing
 - Heavy imports are deferred inside CLI command bodies to keep `screencap --help` fast.
 - All source files use `from __future__ import annotations`.
 - SQLite access in the `screencap` layer uses raw `sqlite3`, not SQLAlchemy.
-- Dual DB schema support: `catalog.py` detects which schema via `sqlite_master` queries.
 - Recording dirs live at `~/.screencap/recordings/<name>/`.
 - Tests use `click.testing.CliRunner`, `unittest.mock.patch`, and `tmp_path` fixtures with inline SQLite setup.
