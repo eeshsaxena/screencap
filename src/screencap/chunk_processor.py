@@ -10,12 +10,12 @@ from __future__ import annotations
 import json
 import logging
 import os
-import sqlite3
 import threading
 import time
 from pathlib import Path
 
 from screencap._flush import wait_for_writer_flush
+from screencap.recording_db import Connection, OperationalError, Row, has_table, open_recording_db
 
 logger = logging.getLogger(__name__)
 
@@ -567,116 +567,128 @@ class ChunkProcessor:
         if jsonl_path.exists():
             return jsonl_path
 
-        conn = sqlite3.connect(str(self._db_path))
-        conn.execute("PRAGMA busy_timeout=5000")
-        conn.execute("PRAGMA query_only=ON")
-        conn.row_factory = sqlite3.Row
         try:
-            # 1. Query action events and convert to Pydantic
-            action_rows = conn.execute(
-                "SELECT * FROM action_event WHERE timestamp >= ? AND timestamp < ? ORDER BY timestamp",
-                (start_ts, end_ts),
-            ).fetchall()
+            with open_recording_db(self._db_path, row_factory=Row) as conn:
+                # 1. Query action events and convert to Pydantic
+                action_rows = conn.execute(
+                    "SELECT * FROM action_event WHERE timestamp >= ? AND timestamp < ? ORDER BY timestamp",
+                    (start_ts, end_ts),
+                ).fetchall()
 
-            raw_events = []
-            for row in action_rows:
-                try:
-                    evt = dict_to_action_event(dict(row))
-                    if evt is not None:
-                        raw_events.append(evt)
-                except Exception:
-                    logger.debug(f"Skipping malformed action event at ts={row['timestamp']}")
+                raw_events = []
+                for row in action_rows:
+                    try:
+                        evt = dict_to_action_event(dict(row))
+                        if evt is not None:
+                            raw_events.append(evt)
+                    except Exception:
+                        logger.debug(f"Skipping malformed action event at ts={row['timestamp']}")
 
-            # 2. Run through processing pipeline
-            processed = process_events(raw_events)
+                # 2. Run through processing pipeline
+                processed = process_events(raw_events)
 
-            # 3. Exclude mouse.move by default
-            processed = [e for e in processed if not isinstance(e, MouseMoveEvent)]
+                # 3. Exclude mouse.move by default
+                processed = [e for e in processed if not isinstance(e, MouseMoveEvent)]
 
-            # 4. Query window events for deduplication
-            window_rows = self._query_window_events(conn, start_ts, end_ts)
+                # 4. Query window events for deduplication
+                window_rows = self._query_window_events(conn, start_ts, end_ts)
 
-            # 5. Add initial window context (last window before chunk start)
-            initial_ctx = self._query_initial_window_context(conn, start_ts)
-            if initial_ctx is not None:
-                window_rows = [initial_ctx] + window_rows
+                # 5. Add initial window context (last window before chunk start)
+                initial_ctx = self._query_initial_window_context(conn, start_ts)
+                if initial_ctx is not None:
+                    window_rows = [initial_ctx] + window_rows
 
-            window_switches = deduplicate_window_events(window_rows)
+                window_switches = deduplicate_window_events(window_rows)
 
-            # 6. Apply privacy filter for cloud-intent
-            if self._cloud_intent:
-                pf = build_privacy_filter(
-                    privacy_mode=self._privacy_mode,
-                    cloud_intent=True,
-                    capture_dir=self._capture_dir,
+                # 6. Apply privacy filter for cloud-intent
+                if self._cloud_intent:
+                    pf = build_privacy_filter(
+                        privacy_mode=self._privacy_mode,
+                        cloud_intent=True,
+                        capture_dir=self._capture_dir,
+                    )
+                    window_switches = [
+                        filtered for ws in window_switches
+                        if (filtered := pf(ws)) is not None
+                    ]
+
+                # 7. Interleave
+                combined = interleave_window_events(processed, window_switches)
+
+                # 8. Build metadata header
+                meta = build_export_metadata(exclude_moves=True)
+
+                # 9. Atomic write
+                tmp_path = str(jsonl_path) + ".tmp"
+                with open(tmp_path, "w") as f:
+                    f.write(json.dumps(meta) + "\n")
+                    for evt in combined:
+                        f.write(evt.model_dump_json() + "\n")
+                os.rename(tmp_path, str(jsonl_path))
+
+                n_action = len(processed)
+                n_window = len(window_switches)
+                logger.info(
+                    f"Exported {n_action} action + {n_window} window events to {jsonl_path.name}"
                 )
-                window_switches = [
-                    filtered for ws in window_switches
-                    if (filtered := pf(ws)) is not None
-                ]
-
-            # 7. Interleave
-            combined = interleave_window_events(processed, window_switches)
-
-            # 8. Build metadata header
-            meta = build_export_metadata(exclude_moves=True)
-
-            # 9. Atomic write
-            tmp_path = str(jsonl_path) + ".tmp"
-            with open(tmp_path, "w") as f:
-                f.write(json.dumps(meta) + "\n")
-                for evt in combined:
-                    f.write(evt.model_dump_json() + "\n")
-            os.rename(tmp_path, str(jsonl_path))
-
-            n_action = len(processed)
-            n_window = len(window_switches)
-            logger.info(
-                f"Exported {n_action} action + {n_window} window events to {jsonl_path.name}"
-            )
         except Exception:
             # Clean up partial .tmp on failure
             tmp_path = str(jsonl_path) + ".tmp"
             if os.path.exists(tmp_path):
                 os.unlink(tmp_path)
             raise
-        finally:
-            conn.close()
 
         return jsonl_path
 
     def _query_window_events(
-        self, conn: sqlite3.Connection, start_ts: float, end_ts: float,
+        self, conn: Connection, start_ts: float, end_ts: float,
     ) -> list[dict]:
-        """Query window_event table for a time range. Returns list of dicts."""
+        """Query window_event table for a time range. Returns list of dicts.
+
+        ``has_table`` covers the missing-table case. The inner SELECT is
+        wrapped because chunk export runs concurrently with the live writer:
+        a 5s busy_timeout that expires must not abort the whole chunk export.
+        Returning an empty list degrades gracefully to "no window context for
+        this chunk" rather than failing the chunk.
+        """
+        if not has_table(conn, "window_event"):
+            logger.debug("window_event table not found, skipping window events")
+            return []
         try:
             rows = conn.execute(
                 "SELECT * FROM window_event WHERE timestamp >= ? AND timestamp < ? ORDER BY timestamp",
                 (start_ts, end_ts),
             ).fetchall()
-            return [dict(r) for r in rows]
-        except sqlite3.OperationalError:
-            # window_event table may not exist in older DBs
-            logger.debug("window_event table not found, skipping window events")
+        except OperationalError as exc:
+            logger.warning("window_event query failed (skipping): %s", exc)
             return []
+        return [dict(r) for r in rows]
 
     def _query_initial_window_context(
-        self, conn: sqlite3.Connection, start_ts: float,
+        self, conn: Connection, start_ts: float,
     ) -> dict | None:
-        """Query the last window_event before chunk start for initial context."""
+        """Query the last window_event before chunk start for initial context.
+
+        Same fail-soft contract as ``_query_window_events`` — a busy-timeout
+        or transient SQLite error returns None rather than aborting the
+        chunk export.
+        """
+        if not has_table(conn, "window_event"):
+            return None
         try:
             row = conn.execute(
                 "SELECT * FROM window_event WHERE timestamp < ? ORDER BY timestamp DESC LIMIT 1",
                 (start_ts,),
             ).fetchone()
-            if row is not None:
-                d = dict(row)
-                # Set timestamp to just before chunk start so it appears first
-                d["timestamp"] = start_ts - 0.001
-                return d
+        except OperationalError as exc:
+            logger.warning("initial window_event query failed (skipping): %s", exc)
             return None
-        except sqlite3.OperationalError:
-            return None
+        if row is not None:
+            d = dict(row)
+            # Set timestamp to just before chunk start so it appears first
+            d["timestamp"] = start_ts - 0.001
+            return d
+        return None
 
     def _generate_manifest(
         self, idx: int, start_ts: float, end_ts: float,
@@ -1008,9 +1020,8 @@ def checkpoint_and_upload_db(
 
     # Checkpoint — fold WAL into main DB
     try:
-        conn = sqlite3.connect(str(db_path))
-        result = conn.execute("PRAGMA wal_checkpoint(TRUNCATE)").fetchone()
-        conn.close()
+        with open_recording_db(db_path, read_only=False) as conn:
+            result = conn.execute("PRAGMA wal_checkpoint(TRUNCATE)").fetchone()
         if result and result[0] > 0:
             logger.warning(f"WAL checkpoint: {result[0]} blocked pages")
     except Exception as e:

@@ -3,12 +3,12 @@
 from __future__ import annotations
 
 import json
-import sqlite3
 from datetime import datetime
 from pathlib import Path
 from typing import NamedTuple
 
 from screencap.config import get_recordings_dir
+from screencap.recording_db import has_table, open_recording_db
 
 INTENT_FILE = ".recording_intent"
 
@@ -87,27 +87,19 @@ def find_db(directory: Path) -> Path | None:
 def _read_recording_meta(db_path: Path) -> tuple[float | None, float | None]:
     """Read (started_timestamp, duration_seconds) from a recording.db."""
     try:
-        conn = sqlite3.connect(str(db_path))
-        cur = conn.cursor()
+        with open_recording_db(db_path) as conn:
+            started: float | None = None
+            duration: float | None = None
 
-        cur.execute("SELECT name FROM sqlite_master WHERE type='table'")
-        tables = {row[0] for row in cur.fetchall()}
+            if has_table(conn, "recording"):
+                row = conn.execute("SELECT timestamp FROM recording LIMIT 1").fetchone()
+                started = float(row[0]) if row and row[0] else None
+                if started and has_table(conn, "action_event"):
+                    ev = conn.execute("SELECT MAX(timestamp) FROM action_event").fetchone()
+                    if ev and ev[0] is not None:
+                        duration = float(ev[0]) - started
 
-        started = None
-        duration = None
-
-        if "recording" in tables:
-            cur.execute("SELECT timestamp FROM recording LIMIT 1")
-            row = cur.fetchone()
-            started = float(row[0]) if row and row[0] else None
-            if started and "action_event" in tables:
-                cur.execute("SELECT MAX(timestamp) FROM action_event")
-                ev = cur.fetchone()
-                if ev and ev[0] is not None:
-                    duration = float(ev[0]) - started
-
-        conn.close()
-        return started, duration
+            return started, duration
     except Exception:
         return None, None
 
@@ -134,20 +126,13 @@ def get_seen_bundle_ids(directories: list[Path] | None = None) -> set[str]:
         if db_path is None:
             continue
         try:
-            conn = sqlite3.connect(str(db_path))
-            try:
-                cur = conn.cursor()
-                tables = {r[0] for r in cur.execute(
-                    "SELECT name FROM sqlite_master WHERE type='table'"
-                ).fetchall()}
-                if "window_event" in tables:
-                    rows = cur.execute(
+            with open_recording_db(db_path) as conn:
+                if has_table(conn, "window_event"):
+                    rows = conn.execute(
                         "SELECT DISTINCT app_bundle_id FROM window_event "
                         "WHERE app_bundle_id IS NOT NULL AND app_bundle_id != ''"
                     ).fetchall()
                     seen.update(r[0] for r in rows)
-            finally:
-                conn.close()
         except Exception:
             continue
     return seen

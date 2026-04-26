@@ -105,15 +105,14 @@ def is_uploaded(recording_dir: Path) -> bool:
 
 def _wal_checkpoint(recording_dir: Path) -> None:
     """Checkpoint recording.db WAL to ensure a clean DB file for upload."""
-    import sqlite3
+    from screencap.recording_db import open_recording_db
 
     db_path = recording_dir / "recording.db"
     if not db_path.exists():
         return
     try:
-        conn = sqlite3.connect(str(db_path))
-        conn.execute("PRAGMA wal_checkpoint(TRUNCATE)")
-        conn.close()
+        with open_recording_db(db_path, read_only=False) as conn:
+            conn.execute("PRAGMA wal_checkpoint(TRUNCATE)")
     except Exception:
         pass  # best-effort — upload proceeds even if checkpoint fails
 
