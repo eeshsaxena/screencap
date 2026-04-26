@@ -39,19 +39,8 @@ from screencap.engine.events import (
 )
 
 # =============================================================================
-# Capture and Stream Models
+# Capture Model
 # =============================================================================
-
-
-class Stream(BaseModel):
-    """A time-ordered sequence of events of a single type.
-
-    Streams organize events by category: action (input), screen, or audio.
-    """
-
-    id: str = Field(description="Unique stream identifier")
-    stream_type: str = Field(description="Stream type: 'action' | 'screen' | 'audio'")
-    events: list[Event] = Field(default_factory=list, description="Time-ordered events")
 
 
 class Capture(BaseModel):
@@ -346,7 +335,7 @@ class CaptureStorage:
                 "INSERT INTO events (timestamp, type, data, parent_id) VALUES (?, ?, ?, ?)",
                 (
                     event.timestamp,
-                    event.type if isinstance(event.type, str) else event.type.value,
+                    event.type,
                     json.dumps(event_dict),
                     parent_id,
                 ),
@@ -376,7 +365,7 @@ class CaptureStorage:
                 "INSERT INTO events (timestamp, type, data, parent_id) VALUES (?, ?, ?, ?)",
                 (
                     event.timestamp,
-                    event.type if isinstance(event.type, str) else event.type.value,
+                    event.type,
                     json.dumps(event_dict),
                     None,
                 ),
@@ -393,7 +382,7 @@ class CaptureStorage:
                         "INSERT INTO events (timestamp, type, data, parent_id) VALUES (?, ?, ?, ?)",
                         (
                             child.timestamp,
-                            child.type if isinstance(child.type, str) else child.type.value,
+                            child.type,
                             json.dumps(child_dict),
                             event_id,
                         ),
@@ -549,13 +538,14 @@ def _detect_platform() -> str:
 
 
 def _detect_screen_size() -> tuple[int, int]:
-    """Detect screen dimensions."""
-    try:
-        from PIL import ImageGrab
-        screenshot = ImageGrab.grab()
-        return screenshot.size
-    except Exception:
-        return (1920, 1080)  # Fallback default
+    """Detect screen dimensions.
+
+    Uses Quartz on macOS (via ``engine.utils.get_monitor_dims``) to avoid the
+    PIL/CGWindowListCreateImage path, which is throttled to ~30s per call on
+    macOS Sequoia.
+    """
+    from screencap.engine.utils import get_monitor_dims
+    return get_monitor_dims()
 
 
 def create_capture(
@@ -635,7 +625,6 @@ __all__ = [
     "Capture",
     "CaptureStorage",
     "EVENT_TYPE_MAP",
-    "Stream",
     "create_capture",
     "load_capture",
 ]
