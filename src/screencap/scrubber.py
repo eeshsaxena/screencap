@@ -337,21 +337,6 @@ def _scrub_recording_schema(
     return element_state_detections
 
 
-def _scrub_capture_schema(
-    conn: sqlite3.Connection,
-    tables: set[str],
-    pipeline,
-    anonymizer,
-    result: ScrubResult,
-) -> None:
-    """Scrub a capture.db schema."""
-    if "capture" in tables:
-        _try_scrub_text_column(conn, "capture", "task_description", pipeline, anonymizer, result)
-
-    if "events" in tables:
-        _try_scrub_json_column(conn, "events", "data", pipeline, anonymizer, result)
-
-
 def _scrub_db(
     dst: Path,
     pipeline,
@@ -382,9 +367,7 @@ def _scrub_db(
             cur.execute("DELETE FROM audio_info")
             result.deleted_files.append("audio_info table (spoken words)")
 
-        if "capture" in tables:
-            _scrub_capture_schema(conn, tables, pipeline, anonymizer, result)
-        elif "recording" in tables:
+        if "recording" in tables:
             element_state_detections = _scrub_recording_schema(
                 conn, tables, pipeline, anonymizer, result
             )
