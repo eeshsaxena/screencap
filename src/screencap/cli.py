@@ -1427,7 +1427,7 @@ def _recover_chunk_metadata(
     but chunk video files were created. Uses recording.db to derive chunk
     time ranges and generate the metadata files the Cloud Run processor needs.
     """
-    import sqlite3
+    from screencap.recording_db import Row, open_recording_db
 
     chunk_videos = sorted(recording_dir.glob("chunk_*.mp4"))
     if not chunk_videos:
@@ -1457,48 +1457,40 @@ def _recover_chunk_metadata(
 
     # Derive chunk time ranges from recording.db
     try:
-        conn = sqlite3.connect(str(db_path))
-        conn.execute("PRAGMA busy_timeout=5000")
-        conn.execute("PRAGMA query_only=ON")
-        conn.row_factory = sqlite3.Row
+        with open_recording_db(db_path, row_factory=Row) as conn:
+            # Get recording start time (video_start_time is when first frame was captured)
+            rec = conn.execute("SELECT timestamp FROM recording LIMIT 1").fetchone()
+            if not rec:
+                return
+            rec_start = rec["timestamp"]
 
-        # Get recording start time (video_start_time is when first frame was captured)
-        rec = conn.execute("SELECT timestamp FROM recording LIMIT 1").fetchone()
-        if not rec:
-            conn.close()
-            return
-        rec_start = rec["timestamp"]
+            # Get the first and last action event timestamps
+            first_evt = conn.execute("SELECT MIN(timestamp) as ts FROM action_event").fetchone()
+            last_evt = conn.execute("SELECT MAX(timestamp) as ts FROM action_event").fetchone()
+            if not first_evt or first_evt["ts"] is None:
+                return
 
-        # Get the first and last action event timestamps
-        first_evt = conn.execute("SELECT MIN(timestamp) as ts FROM action_event").fetchone()
-        last_evt = conn.execute("SELECT MAX(timestamp) as ts FROM action_event").fetchone()
-        if not first_evt or first_evt["ts"] is None:
-            conn.close()
-            return
+            first_ts = first_evt["ts"]
+            last_ts = last_evt["ts"]
+            n_chunks = len(chunk_videos)
 
-        first_ts = first_evt["ts"]
-        last_ts = last_evt["ts"]
-        n_chunks = len(chunk_videos)
+            # Determine chunk duration from config
+            from screencap.config import get_chunk_duration
+            chunk_dur = get_chunk_duration()
+            if chunk_dur <= 0:
+                # Estimate from recording span and chunk count
+                chunk_dur = (last_ts - first_ts) / max(n_chunks, 1)
 
-        # Determine chunk duration from config
-        from screencap.config import get_chunk_duration
-        chunk_dur = get_chunk_duration()
-        if chunk_dur <= 0:
-            # Estimate from recording span and chunk count
-            chunk_dur = (last_ts - first_ts) / max(n_chunks, 1)
-
-        # Compute chunk boundaries: chunk N covers [start + N*dur, start + (N+1)*dur)
-        # Use recording start (or first event) as the base
-        base_ts = min(rec_start, first_ts)
-        chunk_ranges = []
-        for idx in range(n_chunks):
-            c_start = base_ts + idx * chunk_dur
-            c_end = base_ts + (idx + 1) * chunk_dur
-            if idx == n_chunks - 1:
-                c_end = max(c_end, last_ts + 1.0)  # last chunk extends to cover all events
-            chunk_ranges.append((idx, c_start, c_end))
-
-        conn.close()
+            # Compute chunk boundaries: chunk N covers [start + N*dur, start + (N+1)*dur)
+            # Use recording start (or first event) as the base
+            base_ts = min(rec_start, first_ts)
+            chunk_ranges = []
+            for idx in range(n_chunks):
+                c_start = base_ts + idx * chunk_dur
+                c_end = base_ts + (idx + 1) * chunk_dur
+                if idx == n_chunks - 1:
+                    c_end = max(c_end, last_ts + 1.0)  # last chunk extends to cover all events
+                chunk_ranges.append((idx, c_start, c_end))
     except Exception as e:
         console.print(f"  [yellow]Warning:[/yellow] Could not derive chunk ranges: {e}")
         return
@@ -1528,26 +1520,21 @@ def _recover_chunk_metadata(
 
             exported = 0
             try:
-                conn = sqlite3.connect(str(db_path))
-                conn.execute("PRAGMA busy_timeout=5000")
-                conn.execute("PRAGMA query_only=ON")
-                conn.row_factory = sqlite3.Row
-
-                for idx, c_start, c_end in chunk_ranges:
-                    if idx in missing_events:
-                        try:
-                            rows = conn.execute(
-                                "SELECT * FROM action_event WHERE timestamp >= ? AND timestamp < ? ORDER BY timestamp",
-                                (c_start, c_end),
-                            ).fetchall()
-                            jsonl_path = recording_dir / f"events_{idx:04d}.jsonl"
-                            with open(jsonl_path, "w") as f:
-                                for row in rows:
-                                    f.write(_json.dumps(dict(row)) + "\n")
-                            exported += 1
-                        except Exception as e:
-                            console.print(f"  [yellow]Warning:[/yellow] Event export failed for chunk {idx}: {e}")
-                conn.close()
+                with open_recording_db(db_path, row_factory=Row) as conn:
+                    for idx, c_start, c_end in chunk_ranges:
+                        if idx in missing_events:
+                            try:
+                                rows = conn.execute(
+                                    "SELECT * FROM action_event WHERE timestamp >= ? AND timestamp < ? ORDER BY timestamp",
+                                    (c_start, c_end),
+                                ).fetchall()
+                                jsonl_path = recording_dir / f"events_{idx:04d}.jsonl"
+                                with open(jsonl_path, "w") as f:
+                                    for row in rows:
+                                        f.write(_json.dumps(dict(row)) + "\n")
+                                exported += 1
+                            except Exception as e:
+                                console.print(f"  [yellow]Warning:[/yellow] Event export failed for chunk {idx}: {e}")
             except Exception as e:
                 console.print(f"  [yellow]Warning:[/yellow] Could not export chunk events: {e}")
             if exported:
