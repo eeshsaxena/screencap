@@ -52,7 +52,7 @@ def get_external_examples_dir() -> Path:
             # Check for demo directories at repo level
             for demo_name in ["turn-off-nightshift", "demo_new", "demo_capture"]:
                 demo_path = current / demo_name
-                if demo_path.exists() and (demo_path / "capture.db").exists():
+                if demo_path.exists() and (demo_path / "recording.db").exists():
                     return current
         current = current.parent
     return Path()  # Return empty path if not found
@@ -72,14 +72,14 @@ def list_examples() -> list[str]:
     bundled_dir = get_examples_dir()
     if bundled_dir.exists():
         for path in bundled_dir.iterdir():
-            if path.is_dir() and (path / "capture.db").exists():
+            if path.is_dir() and (path / "recording.db").exists():
                 examples.add(path.name)
 
     # Check external examples (repo root demos)
     external_dir = get_external_examples_dir()
     if external_dir.exists():
         for path in external_dir.iterdir():
-            if path.is_dir() and (path / "capture.db").exists():
+            if path.is_dir() and (path / "recording.db").exists():
                 # Skip non-demo directories
                 if path.name.startswith(("demo_", "turn-off")):
                     examples.add(path.name)
@@ -101,12 +101,12 @@ def get_example_path(name: str) -> Path:
     """
     # Check bundled examples first
     bundled_path = get_examples_dir() / name
-    if bundled_path.exists() and (bundled_path / "capture.db").exists():
+    if bundled_path.exists() and (bundled_path / "recording.db").exists():
         return bundled_path
 
     # Check external examples
     external_path = get_external_examples_dir() / name
-    if external_path.exists() and (external_path / "capture.db").exists():
+    if external_path.exists() and (external_path / "recording.db").exists():
         return external_path
 
     # Not found - provide helpful error
