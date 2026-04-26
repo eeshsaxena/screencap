@@ -1122,7 +1122,7 @@ def upload_sentinel(
 def stub_recording(recording_dir: Path) -> list[str]:
     """Delete media files from a fully-uploaded recording, keeping metadata."""
     keep_patterns = {
-        "recording.db", "capture.db", ".upload_status.json",
+        "recording.db", ".upload_status.json",
         "session_summary.json", "profiling.json",
         "recording_complete.json",
     }

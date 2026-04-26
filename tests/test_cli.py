@@ -528,8 +528,8 @@ def test_export_path_traversal(tmp_path):
     assert result.exit_code == 1
 
 
-def test_export_legacy_db_error(tmp_path):
-    """Legacy capture.db format results in exit code 1."""
+def test_export_missing_db_error(tmp_path):
+    """Missing recording database results in exit code 1."""
     rec_dir = tmp_path / "old-rec"
     rec_dir.mkdir()
 

@@ -331,47 +331,6 @@ def test_scrub_recording_schema(recording_dir, tmp_path, pipeline_and_anonymizer
     conn.close()
 
 
-def test_scrub_capture_schema(tmp_path, pipeline_and_anonymizer):
-    """capture.db with PII in task_description and events.data → PII replaced."""
-    pipeline, anonymizer = pipeline_and_anonymizer
-    rec = tmp_path / "cap-recording"
-    rec.mkdir()
-
-    db = sqlite3.connect(str(rec / "capture.db"))
-    db.execute(
-        "CREATE TABLE capture (id INTEGER PRIMARY KEY, task_description TEXT, started_at REAL, ended_at REAL)"
-    )
-    db.execute(
-        "INSERT INTO capture VALUES (1, 'Email John Doe at john.doe@example.com', 1000, 2000)"
-    )
-    db.execute(
-        "CREATE TABLE events (id INTEGER PRIMARY KEY, timestamp REAL, data TEXT)"
-    )
-    db.execute(
-        "INSERT INTO events VALUES (1, 1001, ?)",
-        (json.dumps({"type": "key", "text": "Hello John Doe"}),),
-    )
-    db.commit()
-    db.close()
-
-    result = ScrubResult()
-    _scrub_db(rec, pipeline, anonymizer, result)
-
-    conn = sqlite3.connect(str(rec / "capture.db"))
-    cur = conn.cursor()
-
-    cur.execute("SELECT task_description FROM capture")
-    task = cur.fetchone()[0]
-    assert "John Doe" not in task
-    assert "john.doe@example.com" not in task
-
-    cur.execute("SELECT data FROM events")
-    data = json.loads(cur.fetchone()[0])
-    assert "John Doe" not in json.dumps(data)
-
-    conn.close()
-
-
 def test_scrub_db_no_db(tmp_path, pipeline_and_anonymizer):
     """Recording dir with no DB → warning, no crash."""
     pipeline, anonymizer = pipeline_and_anonymizer

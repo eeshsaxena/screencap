@@ -451,3 +451,35 @@ AudioEvent = AudioChunkEvent
 WindowEvent = WindowStateEvent | WindowSwitchEvent
 
 Event = ActionEvent | ScreenEvent | AudioEvent | WindowEvent
+
+
+# =============================================================================
+# Event-type registry
+# =============================================================================
+#
+# Canonical mapping from event ``type`` string discriminators to their Pydantic
+# event classes. Test suite locks completeness via ``TestEventTypeMap`` so any
+# new ``BaseEvent`` subclass added without a registry entry fails loudly
+# instead of silently dropping on deserialization.
+
+EVENT_TYPE_MAP: dict[str, type[Event]] = {
+    EventType.MOUSE_MOVE.value: MouseMoveEvent,
+    EventType.MOUSE_DOWN.value: MouseDownEvent,
+    EventType.MOUSE_UP.value: MouseUpEvent,
+    EventType.MOUSE_SCROLL.value: MouseScrollEvent,
+    EventType.MOUSE_MAGNIFY.value: MouseMagnifyEvent,
+    EventType.MOUSE_ROTATE.value: MouseRotateEvent,
+    EventType.MOUSE_SMART_MAGNIFY.value: MouseSmartMagnifyEvent,
+    EventType.KEY_DOWN.value: KeyDownEvent,
+    EventType.KEY_UP.value: KeyUpEvent,
+    EventType.SCREEN_FRAME.value: ScreenFrameEvent,
+    EventType.AUDIO_CHUNK.value: AudioChunkEvent,
+    EventType.MOUSE_SINGLECLICK.value: MouseClickEvent,
+    EventType.MOUSE_DOUBLECLICK.value: MouseDoubleClickEvent,
+    EventType.MOUSE_DRAG.value: MouseDragEvent,
+    EventType.KEY_TYPE.value: KeyTypeEvent,
+    EventType.KEY_SHORTCUT.value: KeyShortcutEvent,
+    EventType.KEY_SPECIAL.value: SpecialKeyEvent,
+    EventType.WINDOW_STATE.value: WindowStateEvent,
+    EventType.WINDOW_SWITCH.value: WindowSwitchEvent,
+}

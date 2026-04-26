@@ -110,14 +110,6 @@ def open_viewer(
         if db is None:
             raise FileNotFoundError(f"No recording database found in {rec_dir}")
 
-        # Only recording.db is supported by create_html (CaptureSession).
-        # Legacy capture.db has a different schema and can't be auto-generated.
-        if db.name == "capture.db":
-            raise FileNotFoundError(
-                f"viewer.html missing and cannot auto-generate for legacy capture.db format.\n"
-                f"Try: capture visualize {rec_dir} --html"
-            )
-
         if viewer.exists():
             size_mb = viewer.stat().st_size / 1_000_000
             console.print(f"[dim]Regenerating viewer.html ({size_mb:.0f} MB)...[/dim]")

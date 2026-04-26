@@ -399,7 +399,7 @@ def resolve_recording_dirs(
         for d in sorted(recordings_dir.iterdir()):
             if not d.is_dir():
                 continue
-            if any((d / db).exists() for db in ("recording.db", "capture.db")):
+            if (d / "recording.db").exists():
                 dirs.append(d)
         if not dirs:
             raise FileNotFoundError("No recordings found.")

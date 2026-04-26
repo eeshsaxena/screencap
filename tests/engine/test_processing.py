@@ -347,7 +347,7 @@ class TestSpecialKeyProcessing:
     def test_serialization_roundtrip(self):
         """Test that SpecialKeyEvent serializes and deserializes correctly."""
         import json
-        from screencap.engine.storage import EVENT_TYPE_MAP
+        from screencap.engine.events import EVENT_TYPE_MAP
 
         event = SpecialKeyEvent(
             timestamp=1.0,

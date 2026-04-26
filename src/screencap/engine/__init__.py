@@ -85,7 +85,6 @@ except ImportError:
 from screencap.engine.stats import (
     CaptureStats,
     PerfStat,
-    plot_capture_performance,
 )
 
 # Visualization
@@ -150,7 +149,6 @@ __all__ = [
     # Performance statistics
     "CaptureStats",
     "PerfStat",
-    "plot_capture_performance",
     # Frame comparison
     "ComparisonReport",
     "FrameComparison",

@@ -37,8 +37,8 @@ def export_recording(
     """Export a single recording to JSONL.
 
     Returns event count on success.  Raises ``ExportError`` if the
-    recording database cannot be found (missing directory, missing
-    recording.db, or legacy capture.db format).
+    recording database cannot be found (missing directory or missing
+    recording.db).
 
     When *output_path* is a file path, uses atomic write (write to .tmp,
     rename on success).  When *output_path* is None, writes to stdout.
