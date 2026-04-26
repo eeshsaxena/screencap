@@ -11,8 +11,9 @@ from __future__ import annotations
 import json
 import logging
 import re
-import sqlite3
 from pathlib import Path
+
+from screencap.recording_db import Row, open_recording_db
 
 logger = logging.getLogger(__name__)
 
@@ -69,11 +70,7 @@ def _generate_manifest_v2(
     manifest_path = capture_dir / f"chunk_{chunk_idx:04d}_manifest.json"
 
     db_path = capture_dir / "recording.db"
-    conn = sqlite3.connect(str(db_path))
-    conn.execute("PRAGMA busy_timeout=5000")
-    conn.execute("PRAGMA query_only=ON")
-
-    try:
+    with open_recording_db(db_path) as conn:
         total_events = conn.execute(
             """SELECT COUNT(*) FROM action_event
                WHERE timestamp >= ? AND timestamp < ?
@@ -86,8 +83,6 @@ def _generate_manifest_v2(
                WHERE timestamp >= ? AND timestamp < ?""",
             (start_ts, end_ts),
         ).fetchone()[0]
-    finally:
-        conn.close()
 
     manifest = {
         "format_version": 2,
@@ -142,12 +137,7 @@ def _generate_manifest_legacy(
         return manifest_path
 
     db_path = capture_dir / "recording.db"
-    conn = sqlite3.connect(str(db_path))
-    conn.execute("PRAGMA busy_timeout=5000")
-    conn.execute("PRAGMA query_only=ON")
-    conn.row_factory = sqlite3.Row
-
-    try:
+    with open_recording_db(db_path, row_factory=Row) as conn:
         events = conn.execute(
             """SELECT timestamp, name FROM action_event
                WHERE timestamp >= ? AND timestamp < ?
@@ -171,8 +161,6 @@ def _generate_manifest_legacy(
                ORDER BY timestamp DESC LIMIT 1""",
             (start_ts,),
         ).fetchone()
-    finally:
-        conn.close()
 
     tasks = _segment_tasks(events, rest_threshold)
 
