@@ -39,10 +39,18 @@ from __future__ import annotations
 import sqlite3
 from contextlib import contextmanager
 from pathlib import Path
-from sqlite3 import Connection, Cursor, Row
+from sqlite3 import Connection, Cursor, OperationalError, Row
 from typing import Iterator
 
-__all__ = ["open_recording_db", "has_table", "has_column", "Connection", "Cursor", "Row"]
+__all__ = [
+    "open_recording_db",
+    "has_table",
+    "has_column",
+    "Connection",
+    "Cursor",
+    "OperationalError",
+    "Row",
+]
 
 
 @contextmanager

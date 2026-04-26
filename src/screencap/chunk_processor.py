@@ -15,7 +15,7 @@ import time
 from pathlib import Path
 
 from screencap._flush import wait_for_writer_flush
-from screencap.recording_db import Connection, Row, has_table, open_recording_db
+from screencap.recording_db import Connection, OperationalError, Row, has_table, open_recording_db
 
 logger = logging.getLogger(__name__)
 
@@ -643,26 +643,46 @@ class ChunkProcessor:
     def _query_window_events(
         self, conn: Connection, start_ts: float, end_ts: float,
     ) -> list[dict]:
-        """Query window_event table for a time range. Returns list of dicts."""
+        """Query window_event table for a time range. Returns list of dicts.
+
+        ``has_table`` covers the missing-table case. The inner SELECT is
+        wrapped because chunk export runs concurrently with the live writer:
+        a 5s busy_timeout that expires must not abort the whole chunk export.
+        Returning an empty list degrades gracefully to "no window context for
+        this chunk" rather than failing the chunk.
+        """
         if not has_table(conn, "window_event"):
             logger.debug("window_event table not found, skipping window events")
             return []
-        rows = conn.execute(
-            "SELECT * FROM window_event WHERE timestamp >= ? AND timestamp < ? ORDER BY timestamp",
-            (start_ts, end_ts),
-        ).fetchall()
+        try:
+            rows = conn.execute(
+                "SELECT * FROM window_event WHERE timestamp >= ? AND timestamp < ? ORDER BY timestamp",
+                (start_ts, end_ts),
+            ).fetchall()
+        except OperationalError as exc:
+            logger.warning("window_event query failed (skipping): %s", exc)
+            return []
         return [dict(r) for r in rows]
 
     def _query_initial_window_context(
         self, conn: Connection, start_ts: float,
     ) -> dict | None:
-        """Query the last window_event before chunk start for initial context."""
+        """Query the last window_event before chunk start for initial context.
+
+        Same fail-soft contract as ``_query_window_events`` — a busy-timeout
+        or transient SQLite error returns None rather than aborting the
+        chunk export.
+        """
         if not has_table(conn, "window_event"):
             return None
-        row = conn.execute(
-            "SELECT * FROM window_event WHERE timestamp < ? ORDER BY timestamp DESC LIMIT 1",
-            (start_ts,),
-        ).fetchone()
+        try:
+            row = conn.execute(
+                "SELECT * FROM window_event WHERE timestamp < ? ORDER BY timestamp DESC LIMIT 1",
+                (start_ts,),
+            ).fetchone()
+        except OperationalError as exc:
+            logger.warning("initial window_event query failed (skipping): %s", exc)
+            return None
         if row is not None:
             d = dict(row)
             # Set timestamp to just before chunk start so it appears first
