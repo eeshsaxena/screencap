@@ -10,6 +10,7 @@ and this project adheres to [Semantic Versioning](https://semver.org/).
 ### Removed
 - **Legacy `capture.db` schema support:** The upstream-project `capture.db` schema (read, write, scrub, viewer, samples paths) is no longer supported. Recordings produced in that format are no longer readable; only `recording.db` (the live engine schema) is supported. `screencap list` skips directories without a `recording.db`.
 - **`screencap.engine.plot_capture_performance`:** Removed alongside the legacy storage layer (`Capture`, `CaptureStorage`, `create_capture`, `load_capture`, `get_storage`). No in-tree consumer existed; visualization tooling.
+- **`screencap.engine.storage` package:** The package's only remaining symbol (`EVENT_TYPE_MAP`) moved into `screencap.engine.events`, which already owns the event class definitions the registry indexes. Update imports from `from screencap.engine.storage import EVENT_TYPE_MAP` to `from screencap.engine.events import EVENT_TYPE_MAP`.
 
 ## [0.18.0] - 2026-04-20
 

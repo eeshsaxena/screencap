@@ -927,8 +927,7 @@ class TestSmartMagnifyEventTypes:
 
     def test_event_type_map_includes_all_gestures(self):
         """EVENT_TYPE_MAP includes magnify, rotate, and smart_magnify."""
-        from screencap.engine.events import EventType
-        from screencap.engine.storage import EVENT_TYPE_MAP
+        from screencap.engine.events import EVENT_TYPE_MAP, EventType
 
         assert EventType.MOUSE_MAGNIFY.value in EVENT_TYPE_MAP
         assert EventType.MOUSE_ROTATE.value in EVENT_TYPE_MAP

@@ -12,12 +12,12 @@ from __future__ import annotations
 import pytest
 
 from screencap.engine.events import (
+    EVENT_TYPE_MAP,
     BaseEvent,
     EventType,
     KeyShortcutEvent,
     WindowSwitchEvent,
 )
-from screencap.engine.storage import EVENT_TYPE_MAP
 
 
 def _concrete_event_classes():
