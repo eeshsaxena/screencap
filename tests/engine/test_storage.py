@@ -2,9 +2,6 @@
 
 from __future__ import annotations
 
-import tempfile
-from pathlib import Path
-
 import pytest
 
 from screencap.engine.events import (
@@ -13,6 +10,7 @@ from screencap.engine.events import (
     KeyDownEvent,
     KeyShortcutEvent,
     MouseButton,
+    MouseClickEvent,
     MouseDownEvent,
     MouseMoveEvent,
     MouseUpEvent,
@@ -27,35 +25,19 @@ from screencap.engine.storage import (
 )
 
 
-@pytest.fixture
-def temp_db():
-    """Create a temporary database file."""
-    with tempfile.NamedTemporaryFile(suffix=".db", delete=False) as f:
-        db_path = f.name
-    yield db_path
-    # Cleanup
-    Path(db_path).unlink(missing_ok=True)
-
-
-@pytest.fixture
-def temp_dir():
-    """Create a temporary directory for captures."""
-    with tempfile.TemporaryDirectory() as tmpdir:
-        yield tmpdir
-
-
 class TestCaptureStorage:
     """Tests for CaptureStorage class."""
 
-    def test_init_storage(self, temp_db):
+    def test_init_storage(self, tmp_path):
         """Test storage initialization."""
-        storage = CaptureStorage(temp_db)
-        assert storage.db_path == Path(temp_db)
+        db_path = tmp_path / "capture.db"
+        storage = CaptureStorage(db_path)
+        assert storage.db_path == db_path
         storage.close()
 
-    def test_context_manager(self, temp_db):
+    def test_context_manager(self, tmp_path):
         """Test storage as context manager."""
-        with CaptureStorage(temp_db) as storage:
+        with CaptureStorage(tmp_path / "capture.db") as storage:
             assert storage.is_open is False  # Connection created lazily
             capture = Capture(
                 id="test",
@@ -67,9 +49,9 @@ class TestCaptureStorage:
             storage.init_capture(capture)
             assert storage.is_open is True
 
-    def test_init_and_get_capture(self, temp_db):
+    def test_init_and_get_capture(self, tmp_path):
         """Test initializing and retrieving capture metadata."""
-        with CaptureStorage(temp_db) as storage:
+        with CaptureStorage(tmp_path / "capture.db") as storage:
             capture = Capture(
                 id="abc123",
                 started_at=1234567890.0,
@@ -86,9 +68,9 @@ class TestCaptureStorage:
             assert retrieved.platform == "darwin"
             assert retrieved.task_description == "Test task"
 
-    def test_update_capture(self, temp_db):
+    def test_update_capture(self, tmp_path):
         """Test updating capture metadata."""
-        with CaptureStorage(temp_db) as storage:
+        with CaptureStorage(tmp_path / "capture.db") as storage:
             capture = Capture(
                 id="abc123",
                 started_at=1234567890.0,
@@ -106,9 +88,9 @@ class TestCaptureStorage:
             assert retrieved.ended_at == 1234567900.0
             assert retrieved.task_description == "Updated task"
 
-    def test_write_and_get_event(self, temp_db):
+    def test_write_and_get_event(self, tmp_path):
         """Test writing and retrieving a single event."""
-        with CaptureStorage(temp_db) as storage:
+        with CaptureStorage(tmp_path / "capture.db") as storage:
             event = MouseMoveEvent(
                 timestamp=1234567890.0,
                 x=100.0,
@@ -122,9 +104,9 @@ class TestCaptureStorage:
             assert events[0].x == 100.0
             assert events[0].y == 200.0
 
-    def test_write_multiple_events(self, temp_db):
+    def test_write_multiple_events(self, tmp_path):
         """Test writing multiple events."""
-        with CaptureStorage(temp_db) as storage:
+        with CaptureStorage(tmp_path / "capture.db") as storage:
             events = [
                 MouseMoveEvent(timestamp=1.0, x=100.0, y=100.0),
                 MouseMoveEvent(timestamp=2.0, x=200.0, y=200.0),
@@ -136,9 +118,9 @@ class TestCaptureStorage:
             retrieved = storage.get_events()
             assert len(retrieved) == 4
 
-    def test_get_events_by_time_range(self, temp_db):
+    def test_get_events_by_time_range(self, tmp_path):
         """Test filtering events by timestamp."""
-        with CaptureStorage(temp_db) as storage:
+        with CaptureStorage(tmp_path / "capture.db") as storage:
             events = [
                 MouseMoveEvent(timestamp=1.0, x=100.0, y=100.0),
                 MouseMoveEvent(timestamp=5.0, x=200.0, y=200.0),
@@ -151,9 +133,9 @@ class TestCaptureStorage:
             assert len(filtered) == 1
             assert filtered[0].x == 200.0
 
-    def test_get_events_by_type(self, temp_db):
+    def test_get_events_by_type(self, tmp_path):
         """Test filtering events by type."""
-        with CaptureStorage(temp_db) as storage:
+        with CaptureStorage(tmp_path / "capture.db") as storage:
             events = [
                 MouseMoveEvent(timestamp=1.0, x=100.0, y=100.0),
                 MouseDownEvent(timestamp=2.0, x=100.0, y=100.0, button=MouseButton.LEFT),
@@ -169,9 +151,9 @@ class TestCaptureStorage:
             key_events = storage.get_events(event_types=[EventType.KEY_DOWN])
             assert len(key_events) == 1
 
-    def test_get_event_count(self, temp_db):
+    def test_get_event_count(self, tmp_path):
         """Test getting event counts."""
-        with CaptureStorage(temp_db) as storage:
+        with CaptureStorage(tmp_path / "capture.db") as storage:
             events = [
                 MouseMoveEvent(timestamp=1.0, x=100.0, y=100.0),
                 MouseMoveEvent(timestamp=2.0, x=200.0, y=200.0),
@@ -183,9 +165,9 @@ class TestCaptureStorage:
             assert storage.get_event_count(EventType.MOUSE_MOVE) == 2
             assert storage.get_event_count(EventType.KEY_DOWN) == 1
 
-    def test_iter_events(self, temp_db):
+    def test_iter_events(self, tmp_path):
         """Test iterating over events."""
-        with CaptureStorage(temp_db) as storage:
+        with CaptureStorage(tmp_path / "capture.db") as storage:
             events = [
                 MouseMoveEvent(timestamp=float(i), x=float(i * 10), y=float(i * 10))
                 for i in range(100)
@@ -201,10 +183,10 @@ class TestCaptureStorage:
 class TestCreateAndLoadCapture:
     """Tests for create_capture and load_capture functions."""
 
-    def test_create_capture(self, temp_dir):
+    def test_create_capture(self, tmp_path):
         """Test creating a new capture."""
         capture, storage = create_capture(
-            capture_dir=temp_dir,
+            capture_dir=tmp_path,
             platform="darwin",
             screen_width=1920,
             screen_height=1080,
@@ -218,11 +200,11 @@ class TestCreateAndLoadCapture:
 
         storage.close()
 
-    def test_load_capture(self, temp_dir):
+    def test_load_capture(self, tmp_path):
         """Test loading an existing capture."""
         # Create capture
         capture, storage = create_capture(
-            capture_dir=temp_dir,
+            capture_dir=tmp_path,
             platform="linux",
             screen_width=2560,
             screen_height=1440,
@@ -232,7 +214,7 @@ class TestCreateAndLoadCapture:
         storage.close()
 
         # Load capture
-        loaded_capture, loaded_storage = load_capture(temp_dir)
+        loaded_capture, loaded_storage = load_capture(tmp_path)
 
         assert loaded_capture is not None
         assert loaded_capture.id == capture_id
@@ -243,10 +225,10 @@ class TestCreateAndLoadCapture:
 
         loaded_storage.close()
 
-    def test_load_nonexistent_capture(self, temp_dir):
+    def test_load_nonexistent_capture(self, tmp_path):
         """Test loading a capture that doesn't exist."""
         with pytest.raises(FileNotFoundError):
-            load_capture(Path(temp_dir) / "nonexistent")
+            load_capture(tmp_path / "nonexistent")
 
 
 class TestCaptureModel:
@@ -332,8 +314,8 @@ class TestEventTypeMap:
 class TestNewEventRoundTrip:
     """Round-trip persistence for the two event types added to EVENT_TYPE_MAP."""
 
-    def test_key_shortcut_round_trip(self, temp_db):
-        with CaptureStorage(temp_db) as storage:
+    def test_key_shortcut_round_trip(self, tmp_path):
+        with CaptureStorage(tmp_path / "capture.db") as storage:
             event = KeyShortcutEvent(timestamp=1.0, keys=["ctrl", "z"])
             storage.write_event(event)
 
@@ -345,8 +327,8 @@ class TestNewEventRoundTrip:
         assert loaded.keys == ["ctrl", "z"]
         assert loaded.text == "Ctrl+z"
 
-    def test_window_switch_round_trip(self, temp_db):
-        with CaptureStorage(temp_db) as storage:
+    def test_window_switch_round_trip(self, tmp_path):
+        with CaptureStorage(tmp_path / "capture.db") as storage:
             event = WindowSwitchEvent(
                 timestamp=1.0,
                 app_name="Finder",
@@ -369,3 +351,97 @@ class TestNewEventRoundTrip:
         assert loaded.app_bundle_id == "com.apple.finder"
         assert loaded.window_title == "Documents"
         assert loaded.window_id == "123"
+
+
+class TestChildrenRoundTrip:
+    """Parent-child persistence: write_event recurses into children, get_events
+    skips them by default and surfaces them with include_children=True."""
+
+    def test_mouse_click_with_children_round_trip(self, tmp_path):
+        down = MouseDownEvent(timestamp=1.0, x=10.0, y=20.0, button=MouseButton.LEFT)
+        up = MouseUpEvent(timestamp=1.1, x=10.0, y=20.0, button=MouseButton.LEFT)
+        click = MouseClickEvent(
+            timestamp=1.05,
+            x=10.0,
+            y=20.0,
+            button=MouseButton.LEFT,
+            children=[down, up],
+        )
+
+        with CaptureStorage(tmp_path / "capture.db") as storage:
+            parent_id = storage.write_event(click)
+
+            # Default read excludes child rows
+            top_level = storage.get_events()
+            assert len(top_level) == 1
+            assert isinstance(top_level[0], MouseClickEvent)
+
+            # include_children=True returns parent + children, preserving order
+            all_events = storage.get_events(include_children=True)
+            assert len(all_events) == 3
+            assert isinstance(all_events[0], MouseDownEvent)
+            assert isinstance(all_events[1], MouseClickEvent)
+            assert isinstance(all_events[2], MouseUpEvent)
+
+            # Child payloads survive the JSON round-trip (not just types)
+            assert all_events[0].x == 10.0
+            assert all_events[0].y == 20.0
+            assert all_events[0].button == MouseButton.LEFT
+            assert all_events[2].x == 10.0
+            assert all_events[2].y == 20.0
+            assert all_events[2].button == MouseButton.LEFT
+
+            # parent_id chain is persisted: children point at the click row
+            cursor = storage.conn.cursor()
+            cursor.execute(
+                "SELECT id, type, parent_id FROM events ORDER BY id"
+            )
+            rows = cursor.fetchall()
+
+        assert rows[0]["id"] == parent_id
+        assert rows[0]["parent_id"] is None
+        assert rows[1]["parent_id"] == parent_id
+        assert rows[1]["type"] == EventType.MOUSE_DOWN.value
+        assert rows[2]["parent_id"] == parent_id
+        assert rows[2]["type"] == EventType.MOUSE_UP.value
+
+    def test_mouse_click_with_children_via_write_events(self, tmp_path):
+        """write_events has its own inline child-write loop distinct from
+        write_event's recursion. The dead `event.type` ternary fix touched
+        both paths, so both need round-trip coverage."""
+        down = MouseDownEvent(timestamp=1.0, x=10.0, y=20.0, button=MouseButton.LEFT)
+        up = MouseUpEvent(timestamp=1.1, x=10.0, y=20.0, button=MouseButton.LEFT)
+        click = MouseClickEvent(
+            timestamp=1.05,
+            x=10.0,
+            y=20.0,
+            button=MouseButton.LEFT,
+            children=[down, up],
+        )
+
+        with CaptureStorage(tmp_path / "capture.db") as storage:
+            storage.write_events([click])
+
+            top_level = storage.get_events()
+            assert len(top_level) == 1
+            assert isinstance(top_level[0], MouseClickEvent)
+
+            all_events = storage.get_events(include_children=True)
+            assert len(all_events) == 3
+            assert isinstance(all_events[0], MouseDownEvent)
+            assert isinstance(all_events[1], MouseClickEvent)
+            assert isinstance(all_events[2], MouseUpEvent)
+
+            cursor = storage.conn.cursor()
+            cursor.execute("SELECT id, type, parent_id FROM events ORDER BY id")
+            rows = cursor.fetchall()
+
+        # write_events INSERTs parent first, then children, so id-order is
+        # [click, down, up] regardless of timestamp.
+        parent_id = rows[0]["id"]
+        assert rows[0]["type"] == EventType.MOUSE_SINGLECLICK.value
+        assert rows[0]["parent_id"] is None
+        assert rows[1]["parent_id"] == parent_id
+        assert rows[1]["type"] == EventType.MOUSE_DOWN.value
+        assert rows[2]["parent_id"] == parent_id
+        assert rows[2]["type"] == EventType.MOUSE_UP.value

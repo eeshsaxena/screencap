@@ -26,7 +26,6 @@ from screencap.engine.storage.sqlite import (
     EVENT_TYPE_MAP,
     Capture,
     CaptureStorage,
-    Stream,
     create_capture,
     load_capture,
 )
@@ -51,7 +50,6 @@ __all__ = [
     "CaptureStorage",
     # Data models
     "Capture",
-    "Stream",
     # Mappings
     "EVENT_TYPE_MAP",
     # Convenience functions
