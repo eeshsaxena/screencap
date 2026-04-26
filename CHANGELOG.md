@@ -12,6 +12,9 @@ and this project adheres to [Semantic Versioning](https://semver.org/).
 - **`screencap.engine.plot_capture_performance`:** Removed alongside the legacy storage layer (`Capture`, `CaptureStorage`, `create_capture`, `load_capture`, `get_storage`). No in-tree consumer existed; visualization tooling.
 - **`screencap.engine.storage` package:** The package's only remaining symbol (`EVENT_TYPE_MAP`) moved into `screencap.engine.events`, which already owns the event class definitions the registry indexes. Update imports from `from screencap.engine.storage import EVENT_TYPE_MAP` to `from screencap.engine.events import EVENT_TYPE_MAP`.
 
+### Internal
+- **Consolidated `recording.db` open + column-presence checks behind `screencap.recording_db`:** New module exports `open_recording_db` (a `@contextmanager` that opens a SQLite connection with the canonical `busy_timeout` and read-only PRAGMAs), `has_table`, and `has_column`. Replaces 14 scattered `sqlite_master` queries and per-consumer `PRAGMA table_info` blocks across `catalog.py`, `chunk_processor.py`, `cli.py`, `namer.py`, `scrub_pipeline.py`, `scrubber.py`, `task_manifest.py`, `upload.py`, and `privacy/context.py`. The screencap layer's `import sqlite3` surface drops from 10 sites to 2 (`recording_db` itself plus `privacy/scrub_worker.py`, which keeps its own connection for live-writer concurrency reasons documented inline). Also removes the `_geometry_table_cache` module-level dict in `privacy/context.py` — its per-loop amortisation role is now filled by `mask_screenshots` hoisting `has_table('window_geometry')` above its per-screenshot loop.
+
 ## [0.18.0] - 2026-04-20
 
 ### Added
