@@ -134,10 +134,10 @@ def _load_geometry_row(
 ) -> WindowGeometrySnapshot | None:
     """Read the window_geometry row nearest to ``screenshot_timestamp``.
 
-    Internal helper for callers that have already verified the
-    ``window_geometry`` table exists (e.g., ``mask_screenshots`` hoists
-    the ``has_table`` check above its per-screenshot loop). Public callers
-    should use ``load_window_geometry`` instead.
+    Skips the ``has_table`` check; the caller must have already verified
+    the table exists. Used by ``mask_screenshots`` to amortise that check
+    across a per-screenshot loop. Standalone callers should use
+    ``load_window_geometry``.
     """
     try:
         # Tolerance-based lookup: screenshot filenames lose float precision
@@ -187,11 +187,11 @@ def load_window_geometry(
     Args:
         db_path: Path to the recording database.
         screenshot_timestamp: Exact timestamp to look up.
-        conn: Optional open connection to reuse (avoids per-call overhead
-            when loading geometry for many screenshots in a loop). Callers
-            that hold an open connection across many calls and want to skip
-            the per-call ``has_table`` check should call ``_load_geometry_row``
-            directly after running ``has_table`` once.
+        conn: Optional open connection to reuse — avoids re-opening the
+            DB when loading geometry for many screenshots from one caller.
+            Each call still runs ``has_table``; loops that load geometry
+            for hundreds of screenshots want ``_load_geometry_row``
+            (private) with a hoisted ``has_table`` check instead.
     """
     if conn is not None:
         if not has_table(conn, "window_geometry"):

@@ -190,3 +190,13 @@ class TestHasColumn:
         _make_old_schema_db(db_path)
         with open_recording_db(db_path) as conn:
             assert has_column(conn, "no_such_table", "anything") is False
+
+    def test_rejects_non_identifier_table_name(self, tmp_path):
+        """A SQL-injection-shaped table name is rejected before PRAGMA runs."""
+        db_path = tmp_path / "recording.db"
+        _make_old_schema_db(db_path)
+        with open_recording_db(db_path) as conn:
+            with pytest.raises(ValueError):
+                has_column(conn, "recording; DROP TABLE recording", "id")
+            with pytest.raises(ValueError):
+                has_column(conn, "with space", "id")
