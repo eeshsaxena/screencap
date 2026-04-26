@@ -17,7 +17,6 @@ from __future__ import annotations
 import bisect
 import json
 import re
-import sqlite3
 from dataclasses import dataclass
 from pathlib import Path
 from urllib.parse import unquote, urlparse
@@ -31,6 +30,7 @@ from screencap.privacy.policy import (
     PrivacyMode,
     get_matrix_action,
 )
+from screencap.recording_db import Connection, has_column, has_table, open_recording_db
 
 # ---------------------------------------------------------------------------
 # Screenshot timestamp parsing
@@ -129,20 +129,58 @@ class WindowGeometrySnapshot:
     display_origin: tuple[float, float] = (0.0, 0.0)
 
 
-# Cache table existence per connection to avoid repeated sqlite_master queries.
-# Keyed by id(connection). Safe because the table set never changes during a
-# scrub, and the cache is small (one entry per open connection).
-_geometry_table_cache: dict[int, bool] = {}
+def _load_geometry_row(
+    conn: Connection, screenshot_timestamp: float,
+) -> WindowGeometrySnapshot | None:
+    """Read the window_geometry row nearest to ``screenshot_timestamp``.
+
+    Internal helper for callers that have already verified the
+    ``window_geometry`` table exists (e.g., ``mask_screenshots`` hoists
+    the ``has_table`` check above its per-screenshot loop). Public callers
+    should use ``load_window_geometry`` instead.
+    """
+    try:
+        # Tolerance-based lookup: screenshot filenames lose float precision
+        # (e.g. 1773413585.910469 vs DB 1773413585.9104693). 1ms tolerance is
+        # safely within a single screenshot interval.
+        row = conn.execute(
+            "SELECT window_list_json FROM window_geometry "
+            "WHERE abs(screenshot_timestamp - ?) < 0.001 "
+            "ORDER BY abs(screenshot_timestamp - ?) LIMIT 1",
+            (screenshot_timestamp, screenshot_timestamp),
+        ).fetchone()
+    except Exception:
+        return None
+    if row is None or row[0] is None:
+        return None
+
+    try:
+        data = json.loads(row[0])
+    except (json.JSONDecodeError, TypeError):
+        return None
+
+    # Handle both formats:
+    # New: {"windows": [...], "display_bounds": [x, y, w, h]}
+    # Legacy: [...] (plain list of window dicts)
+    if isinstance(data, dict):
+        windows = data.get("windows", [])
+        bounds = data.get("display_bounds")
+        origin = (float(bounds[0]), float(bounds[1])) if bounds else (0.0, 0.0)
+    else:
+        windows = data
+        origin = (0.0, 0.0)
+
+    return WindowGeometrySnapshot(windows=windows, display_origin=origin)
 
 
 def load_window_geometry(
     db_path: Path,
     screenshot_timestamp: float,
-    conn: sqlite3.Connection | None = None,
+    conn: Connection | None = None,
 ) -> WindowGeometrySnapshot | None:
     """Load the window geometry snapshot for a screenshot timestamp.
 
-    Queries the ``window_geometry`` table for an exact timestamp match.
+    Queries the ``window_geometry`` table for the nearest timestamp match.
     Returns a ``WindowGeometrySnapshot`` or ``None`` if unavailable
     (old recordings without the table, capture failure, etc.).
 
@@ -150,84 +188,42 @@ def load_window_geometry(
         db_path: Path to the recording database.
         screenshot_timestamp: Exact timestamp to look up.
         conn: Optional open connection to reuse (avoids per-call overhead
-            when loading geometry for many screenshots in a loop).
+            when loading geometry for many screenshots in a loop). Callers
+            that hold an open connection across many calls and want to skip
+            the per-call ``has_table`` check should call ``_load_geometry_row``
+            directly after running ``has_table`` once.
     """
-    own_conn = conn is None
-    if own_conn:
-        conn = sqlite3.connect(str(db_path))
+    if conn is not None:
+        if not has_table(conn, "window_geometry"):
+            return None
+        return _load_geometry_row(conn, screenshot_timestamp)
+
     try:
-        cur = conn.cursor()
-        # Check table existence once per connection (graceful for old recordings).
-        # The table set never changes during a scrub, so cache the result.
-        conn_id = id(conn)
-        if conn_id not in _geometry_table_cache:
-            tables = {r[0] for r in cur.execute(
-                "SELECT name FROM sqlite_master WHERE type='table'"
-            ).fetchall()}
-            _geometry_table_cache[conn_id] = "window_geometry" in tables
-        if not _geometry_table_cache[conn_id]:
-            return None
-
-        # Use tolerance-based lookup: screenshot filenames lose float
-        # precision (e.g. 1773413585.910469 vs DB 1773413585.9104693).
-        # 1ms tolerance is safely within a single screenshot interval.
-        cur.execute(
-            "SELECT window_list_json FROM window_geometry "
-            "WHERE abs(screenshot_timestamp - ?) < 0.001 "
-            "ORDER BY abs(screenshot_timestamp - ?) LIMIT 1",
-            (screenshot_timestamp, screenshot_timestamp),
-        )
-        row = cur.fetchone()
-        if row is None or row[0] is None:
-            return None
-
-        data = json.loads(row[0])
-
-        # Handle both formats:
-        # New: {"windows": [...], "display_bounds": [x, y, w, h]}
-        # Legacy: [...] (plain list of window dicts)
-        if isinstance(data, dict):
-            windows = data.get("windows", [])
-            bounds = data.get("display_bounds")
-            origin = (float(bounds[0]), float(bounds[1])) if bounds else (0.0, 0.0)
-        else:
-            windows = data
-            origin = (0.0, 0.0)
-
-        return WindowGeometrySnapshot(windows=windows, display_origin=origin)
-    except (sqlite3.OperationalError, json.JSONDecodeError):
+        with open_recording_db(db_path) as own_conn:
+            if not has_table(own_conn, "window_geometry"):
+                return None
+            return _load_geometry_row(own_conn, screenshot_timestamp)
+    except Exception:
         return None
-    finally:
-        if own_conn:
-            conn.close()
 
 
 def load_window_events(db_path: Path) -> list[WindowContext]:
     """Load window_event rows sorted by timestamp."""
-    conn = sqlite3.connect(str(db_path))
-    try:
-        cur = conn.cursor()
-        tables = {r[0] for r in cur.execute(
-            "SELECT name FROM sqlite_master WHERE type='table'"
-        ).fetchall()}
-        if "window_event" not in tables:
+    with open_recording_db(db_path) as conn:
+        if not has_table(conn, "window_event"):
             return []
 
-        # Check if browser_url column exists (backward compat with old DBs)
-        we_cols = {
-            r[1] for r in cur.execute("PRAGMA table_info(window_event)").fetchall()
-        }
-        has_browser_url = "browser_url" in we_cols
+        has_browser_url = has_column(conn, "window_event", "browser_url")
 
         if has_browser_url:
-            cur.execute(
+            cur = conn.execute(
                 "SELECT timestamp, app_bundle_id, title, window_id, browser_url "
                 "FROM window_event "
                 "WHERE timestamp IS NOT NULL "
                 "ORDER BY timestamp"
             )
         else:
-            cur.execute(
+            cur = conn.execute(
                 "SELECT timestamp, app_bundle_id, title, window_id "
                 "FROM window_event "
                 "WHERE timestamp IS NOT NULL "
@@ -248,8 +244,6 @@ def load_window_events(db_path: Path) -> list[WindowContext]:
                 browser_url=raw_url or None,
             ))
         return results
-    finally:
-        conn.close()
 
 
 def domain_from_url(url: str) -> str | None:

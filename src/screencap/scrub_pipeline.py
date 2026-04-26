@@ -19,7 +19,6 @@ import json
 import logging
 import os
 import re
-import sqlite3
 from collections import Counter
 from dataclasses import dataclass, field
 from pathlib import Path
@@ -27,6 +26,7 @@ from pathlib import Path
 from screencap.privacy.actions import BLOCK_ACTIONS, KEYSTROKE_CONTENT_FIELDS, PrivacyAction
 from screencap.privacy.policy import DEFAULT_TRANSITION_HOLD_SECONDS
 from screencap.privacy.reasons import AuditEntry, ReasonCode
+from screencap.recording_db import Connection, has_column, has_table, open_recording_db
 
 logger = logging.getLogger(__name__)
 
@@ -196,7 +196,7 @@ def build_secure_field_intervals(
     hold_seconds: float = DEFAULT_TRANSITION_HOLD_SECONDS,
     *,
     time_range: tuple[float, float] | None = None,
-    conn: sqlite3.Connection | None = None,
+    conn: Connection | None = None,
 ) -> list[BlockedInterval]:
     """Build blocked intervals from action events with AXSecureTextField.
 
@@ -213,89 +213,82 @@ def build_secure_field_intervals(
     if db_path is None and conn is None:
         return []
 
-    own_conn = conn is None
-    if own_conn:
-        _conn = sqlite3.connect(str(db_path))
-        _conn.execute("PRAGMA busy_timeout=5000")
-        _conn.execute("PRAGMA query_only=ON")
+    if conn is not None:
+        return _build_secure_field_intervals_with_conn(
+            conn, hold_seconds, time_range=time_range,
+        )
+    with open_recording_db(db_path) as own_conn:
+        return _build_secure_field_intervals_with_conn(
+            own_conn, hold_seconds, time_range=time_range,
+        )
+
+
+def _build_secure_field_intervals_with_conn(
+    conn: Connection,
+    hold_seconds: float,
+    *,
+    time_range: tuple[float, float] | None,
+) -> list[BlockedInterval]:
+    if not has_table(conn, "action_event"):
+        return []
+    if not has_column(conn, "action_event", "element_state"):
+        return []
+
+    if time_range is not None:
+        rows = conn.execute(
+            "SELECT timestamp, element_state FROM action_event "
+            "WHERE element_state IS NOT NULL AND timestamp IS NOT NULL "
+            "AND timestamp >= ? AND timestamp < ? "
+            "ORDER BY timestamp",
+            (time_range[0], time_range[1]),
+        ).fetchall()
     else:
-        _conn = conn
+        rows = conn.execute(
+            "SELECT timestamp, element_state FROM action_event "
+            "WHERE element_state IS NOT NULL AND timestamp IS NOT NULL "
+            "ORDER BY timestamp"
+        ).fetchall()
 
-    try:
-        tables = {
-            r[0]
-            for r in _conn.execute(
-                "SELECT name FROM sqlite_master WHERE type='table'"
-            ).fetchall()
-        }
-        if "action_event" not in tables:
-            return []
+    raw_intervals: list[tuple[float, float]] = []
+    for ts, es_raw in rows:
+        if not es_raw:
+            continue
+        try:
+            es = json.loads(es_raw) if isinstance(es_raw, str) else es_raw
+        except (json.JSONDecodeError, TypeError):
+            continue
+        if not isinstance(es, dict):
+            continue
+        if (
+            es.get("AXRole") == "AXSecureTextField"
+            or es.get("AXSubrole") == "AXSecureTextField"
+        ):
+            raw_intervals.append((float(ts), float(ts) + hold_seconds))
 
-        ae_cols = {
-            r[1]
-            for r in _conn.execute("PRAGMA table_info(action_event)").fetchall()
-        }
-        if "element_state" not in ae_cols:
-            return []
+    if not raw_intervals:
+        return []
 
-        if time_range is not None:
-            rows = _conn.execute(
-                "SELECT timestamp, element_state FROM action_event "
-                "WHERE element_state IS NOT NULL AND timestamp IS NOT NULL "
-                "AND timestamp >= ? AND timestamp < ? "
-                "ORDER BY timestamp",
-                (time_range[0], time_range[1]),
-            ).fetchall()
+    # Merge overlapping/adjacent intervals
+    merged: list[BlockedInterval] = []
+    cur_start, cur_end = raw_intervals[0]
+    for start, end in raw_intervals[1:]:
+        if start <= cur_end:
+            cur_end = max(cur_end, end)
         else:
-            rows = _conn.execute(
-                "SELECT timestamp, element_state FROM action_event "
-                "WHERE element_state IS NOT NULL AND timestamp IS NOT NULL "
-                "ORDER BY timestamp"
-            ).fetchall()
-
-        raw_intervals: list[tuple[float, float]] = []
-        for ts, es_raw in rows:
-            if not es_raw:
-                continue
-            try:
-                es = json.loads(es_raw) if isinstance(es_raw, str) else es_raw
-            except (json.JSONDecodeError, TypeError):
-                continue
-            if not isinstance(es, dict):
-                continue
-            if (
-                es.get("AXRole") == "AXSecureTextField"
-                or es.get("AXSubrole") == "AXSecureTextField"
-            ):
-                raw_intervals.append((float(ts), float(ts) + hold_seconds))
-
-        if not raw_intervals:
-            return []
-
-        # Merge overlapping/adjacent intervals
-        merged: list[BlockedInterval] = []
-        cur_start, cur_end = raw_intervals[0]
-        for start, end in raw_intervals[1:]:
-            if start <= cur_end:
-                cur_end = max(cur_end, end)
-            else:
-                merged.append(BlockedInterval(
-                    start=cur_start,
-                    end=cur_end,
-                    action=PrivacyAction.EXCLUDE,
-                    reason=ReasonCode.SECURE_FIELD_DETECTED,
-                ))
-                cur_start, cur_end = start, end
-        merged.append(BlockedInterval(
-            start=cur_start,
-            end=cur_end,
-            action=PrivacyAction.EXCLUDE,
-            reason=ReasonCode.SECURE_FIELD_DETECTED,
-        ))
-        return merged
-    finally:
-        if own_conn:
-            _conn.close()
+            merged.append(BlockedInterval(
+                start=cur_start,
+                end=cur_end,
+                action=PrivacyAction.EXCLUDE,
+                reason=ReasonCode.SECURE_FIELD_DETECTED,
+            ))
+            cur_start, cur_end = start, end
+    merged.append(BlockedInterval(
+        start=cur_start,
+        end=cur_end,
+        action=PrivacyAction.EXCLUDE,
+        reason=ReasonCode.SECURE_FIELD_DETECTED,
+    ))
+    return merged
 
 
 def merge_intervals(
@@ -398,7 +391,7 @@ def collect_xref_from_db(
     anonymizer,
     *,
     time_range: tuple[float, float] | None = None,
-    conn: sqlite3.Connection | None = None,
+    conn: Connection | None = None,
 ) -> list[ElementStateDetection]:
     """Read-only collection of element_state xref detections from the DB.
 
@@ -413,87 +406,82 @@ def collect_xref_from_db(
         time_range: Optional (start, end) to scope queries for chunks.
         conn: Optional existing connection (for reuse).
     """
-    own_conn = conn is None
-    if own_conn:
-        _conn = sqlite3.connect(str(db_path))
-        _conn.execute("PRAGMA busy_timeout=5000")
-        _conn.execute("PRAGMA query_only=ON")
-    else:
-        _conn = conn
-
     try:
-        tables = {
-            r[0]
-            for r in _conn.execute(
-                "SELECT name FROM sqlite_master WHERE type='table'"
-            ).fetchall()
-        }
-        if "action_event" not in tables:
-            return []
-
-        ae_cols = {
-            r[1]
-            for r in _conn.execute("PRAGMA table_info(action_event)").fetchall()
-        }
-        if "element_state" not in ae_cols:
-            return []
-
-        if time_range is not None:
-            rows = _conn.execute(
-                "SELECT id, timestamp, element_state FROM action_event "
-                "WHERE element_state IS NOT NULL AND timestamp IS NOT NULL "
-                "AND timestamp >= ? AND timestamp < ? "
-                "ORDER BY timestamp",
-                (time_range[0], time_range[1]),
-            ).fetchall()
-        else:
-            rows = _conn.execute(
-                "SELECT id, timestamp, element_state FROM action_event "
-                "WHERE element_state IS NOT NULL AND timestamp IS NOT NULL "
-                "ORDER BY timestamp"
-            ).fetchall()
-
-        # Parse each element_state JSON, extract AXValue, run detection
-        raw_detections: dict[int, dict] = {}
-        _result = ScrubResult()  # throwaway — we only want detections
-
-        for row_id, timestamp, es_raw in rows:
-            if not es_raw:
-                continue
-            try:
-                es = json.loads(es_raw) if isinstance(es_raw, str) else es_raw
-            except (json.JSONDecodeError, TypeError):
-                continue
-            if not isinstance(es, dict):
-                continue
-
-            ax_value = es.get("AXValue")
-            if not ax_value or not isinstance(ax_value, str) or not ax_value.strip():
-                continue
-
-            _, det_result = scrub_text(ax_value, pipeline, anonymizer, result=_result)
-            if det_result is not None and det_result.detections:
-                per_row_dets = []
-                for det in det_result.detections:
-                    original_text = det_result.normalized_text[det.start:det.end]
-                    per_row_dets.append({
-                        "original_text": original_text,
-                        "entity_type": det.entity_type,
-                        "score": det.score,
-                    })
-                if per_row_dets:
-                    raw_detections[row_id] = {
-                        "timestamp": timestamp,
-                        "detections": per_row_dets,
-                    }
-
-        return build_xref_lookup(raw_detections)
+        if conn is not None:
+            return _collect_xref_with_conn(
+                conn, pipeline, anonymizer, time_range=time_range,
+            )
+        with open_recording_db(db_path) as own_conn:
+            return _collect_xref_with_conn(
+                own_conn, pipeline, anonymizer, time_range=time_range,
+            )
     except Exception:
         logger.debug("xref collection failed", exc_info=True)
         return []
-    finally:
-        if own_conn:
-            _conn.close()
+
+
+def _collect_xref_with_conn(
+    conn: Connection,
+    pipeline,
+    anonymizer,
+    *,
+    time_range: tuple[float, float] | None,
+) -> list[ElementStateDetection]:
+    if not has_table(conn, "action_event"):
+        return []
+    if not has_column(conn, "action_event", "element_state"):
+        return []
+
+    if time_range is not None:
+        rows = conn.execute(
+            "SELECT id, timestamp, element_state FROM action_event "
+            "WHERE element_state IS NOT NULL AND timestamp IS NOT NULL "
+            "AND timestamp >= ? AND timestamp < ? "
+            "ORDER BY timestamp",
+            (time_range[0], time_range[1]),
+        ).fetchall()
+    else:
+        rows = conn.execute(
+            "SELECT id, timestamp, element_state FROM action_event "
+            "WHERE element_state IS NOT NULL AND timestamp IS NOT NULL "
+            "ORDER BY timestamp"
+        ).fetchall()
+
+    # Parse each element_state JSON, extract AXValue, run detection
+    raw_detections: dict[int, dict] = {}
+    _result = ScrubResult()  # throwaway — we only want detections
+
+    for row_id, timestamp, es_raw in rows:
+        if not es_raw:
+            continue
+        try:
+            es = json.loads(es_raw) if isinstance(es_raw, str) else es_raw
+        except (json.JSONDecodeError, TypeError):
+            continue
+        if not isinstance(es, dict):
+            continue
+
+        ax_value = es.get("AXValue")
+        if not ax_value or not isinstance(ax_value, str) or not ax_value.strip():
+            continue
+
+        _, det_result = scrub_text(ax_value, pipeline, anonymizer, result=_result)
+        if det_result is not None and det_result.detections:
+            per_row_dets = []
+            for det in det_result.detections:
+                original_text = det_result.normalized_text[det.start:det.end]
+                per_row_dets.append({
+                    "original_text": original_text,
+                    "entity_type": det.entity_type,
+                    "score": det.score,
+                })
+            if per_row_dets:
+                raw_detections[row_id] = {
+                    "timestamp": timestamp,
+                    "detections": per_row_dets,
+                }
+
+    return build_xref_lookup(raw_detections)
 
 
 # ---------------------------------------------------------------------------
@@ -535,134 +523,109 @@ def build_scrub_context(
         ctx.pixel_ratio = pixel_ratio
 
     # Open a read-only connection for context queries
-    conn: sqlite3.Connection | None = None
     try:
-        conn = sqlite3.connect(str(db_path))
-        conn.execute("PRAGMA busy_timeout=5000")
-        conn.execute("PRAGMA query_only=ON")
+        with open_recording_db(db_path) as conn:
+            # Read pixel_ratio from DB if not provided
+            if pixel_ratio is None:
+                try:
+                    pr_row = conn.execute(
+                        "SELECT pixel_ratio FROM recording LIMIT 1"
+                    ).fetchone()
+                    if pr_row and pr_row[0]:
+                        ctx.pixel_ratio = float(pr_row[0])
+                except (Exception, ValueError):
+                    pass  # keep default 2.0
 
-        # Read pixel_ratio from DB if not provided
-        if pixel_ratio is None:
-            try:
-                pr_row = conn.execute(
-                    "SELECT pixel_ratio FROM recording LIMIT 1"
-                ).fetchone()
-                if pr_row and pr_row[0]:
-                    ctx.pixel_ratio = float(pr_row[0])
-            except (sqlite3.OperationalError, ValueError):
-                pass  # keep default 2.0
+            # Load window events
+            from screencap.privacy.context import load_window_events
 
-        # Load window events
-        from screencap.privacy.context import load_window_events
+            if time_range is not None:
+                # Scoped load for chunk processor
+                try:
+                    if has_table(conn, "window_event"):
+                        from screencap.privacy.context import WindowContext, domain_from_url
 
-        if time_range is not None:
-            # Scoped load for chunk processor
-            try:
-                conn.row_factory = sqlite3.Row
-                tables = {
-                    r[0]
-                    for r in conn.execute(
-                        "SELECT name FROM sqlite_master WHERE type='table'"
-                    ).fetchall()
-                }
-                if "window_event" in tables:
-                    from screencap.privacy.context import WindowContext, domain_from_url
+                        has_browser_url = has_column(conn, "window_event", "browser_url")
 
-                    we_cols = {
-                        r[1]
-                        for r in conn.execute(
-                            "PRAGMA table_info(window_event)"
-                        ).fetchall()
-                    }
-                    has_browser_url = "browser_url" in we_cols
+                        # Include the last event before range start for initial context
+                        if has_browser_url:
+                            rows = conn.execute(
+                                "SELECT timestamp, app_bundle_id, title, window_id, browser_url "
+                                "FROM window_event "
+                                "WHERE timestamp IS NOT NULL AND timestamp < ? "
+                                "ORDER BY timestamp DESC LIMIT 1",
+                                (time_range[0],),
+                            ).fetchall()
+                            rows += conn.execute(
+                                "SELECT timestamp, app_bundle_id, title, window_id, browser_url "
+                                "FROM window_event "
+                                "WHERE timestamp IS NOT NULL "
+                                "AND timestamp >= ? AND timestamp < ? "
+                                "ORDER BY timestamp",
+                                (time_range[0], time_range[1]),
+                            ).fetchall()
+                        else:
+                            rows = conn.execute(
+                                "SELECT timestamp, app_bundle_id, title, window_id "
+                                "FROM window_event "
+                                "WHERE timestamp IS NOT NULL AND timestamp < ? "
+                                "ORDER BY timestamp DESC LIMIT 1",
+                                (time_range[0],),
+                            ).fetchall()
+                            rows += conn.execute(
+                                "SELECT timestamp, app_bundle_id, title, window_id "
+                                "FROM window_event "
+                                "WHERE timestamp IS NOT NULL "
+                                "AND timestamp >= ? AND timestamp < ? "
+                                "ORDER BY timestamp",
+                                (time_range[0], time_range[1]),
+                            ).fetchall()
 
-                    # Include the last event before range start for initial context
-                    if has_browser_url:
-                        rows = conn.execute(
-                            "SELECT timestamp, app_bundle_id, title, window_id, browser_url "
-                            "FROM window_event "
-                            "WHERE timestamp IS NOT NULL AND timestamp < ? "
-                            "ORDER BY timestamp DESC LIMIT 1",
-                            (time_range[0],),
-                        ).fetchall()
-                        rows += conn.execute(
-                            "SELECT timestamp, app_bundle_id, title, window_id, browser_url "
-                            "FROM window_event "
-                            "WHERE timestamp IS NOT NULL "
-                            "AND timestamp >= ? AND timestamp < ? "
-                            "ORDER BY timestamp",
-                            (time_range[0], time_range[1]),
-                        ).fetchall()
-                    else:
-                        rows = conn.execute(
-                            "SELECT timestamp, app_bundle_id, title, window_id "
-                            "FROM window_event "
-                            "WHERE timestamp IS NOT NULL AND timestamp < ? "
-                            "ORDER BY timestamp DESC LIMIT 1",
-                            (time_range[0],),
-                        ).fetchall()
-                        rows += conn.execute(
-                            "SELECT timestamp, app_bundle_id, title, window_id "
-                            "FROM window_event "
-                            "WHERE timestamp IS NOT NULL "
-                            "AND timestamp >= ? AND timestamp < ? "
-                            "ORDER BY timestamp",
-                            (time_range[0], time_range[1]),
-                        ).fetchall()
+                        for row in rows:
+                            domain = None
+                            raw_url = row[4] if has_browser_url else None
+                            if raw_url:
+                                domain = domain_from_url(raw_url)
+                            ctx.window_events.append(WindowContext(
+                                timestamp=float(row[0]),
+                                app_bundle_id=row[1] or "",
+                                title=row[2] or "",
+                                window_id=row[3] or "",
+                                domain=domain,
+                                browser_url=raw_url or None,
+                            ))
+                except Exception:
+                    logger.debug("Failed to load scoped window events", exc_info=True)
+            else:
+                # Full load for scrubber path
+                try:
+                    ctx.window_events = load_window_events(db_path)
+                except Exception:
+                    logger.debug("Failed to load window events", exc_info=True)
 
-                    for row in rows:
-                        domain = None
-                        raw_url = row[4] if has_browser_url else None
-                        if raw_url:
-                            domain = domain_from_url(raw_url)
-                        ctx.window_events.append(WindowContext(
-                            timestamp=float(row[0]),
-                            app_bundle_id=row[1] or "",
-                            title=row[2] or "",
-                            window_id=row[3] or "",
-                            domain=domain,
-                            browser_url=raw_url or None,
-                        ))
-                conn.row_factory = None
-            except Exception:
-                logger.debug("Failed to load scoped window events", exc_info=True)
-        else:
-            # Full load for scrubber path
-            try:
-                ctx.window_events = load_window_events(db_path)
-            except Exception:
-                logger.debug("Failed to load window events", exc_info=True)
+            # Build blocked-app intervals
+            if evaluator is not None and classifier is not None and ctx.window_events:
+                ctx.blocked_intervals = build_blocked_intervals(
+                    ctx.window_events, evaluator, classifier,
+                )
 
-        # Build blocked-app intervals
-        if evaluator is not None and classifier is not None and ctx.window_events:
-            ctx.blocked_intervals = build_blocked_intervals(
-                ctx.window_events, evaluator, classifier,
+            # Build secure-field intervals
+            secure_intervals = build_secure_field_intervals(
+                db_path, time_range=time_range, conn=conn,
             )
+            if secure_intervals:
+                ctx.blocked_intervals = merge_intervals(
+                    ctx.blocked_intervals, secure_intervals,
+                )
 
-        # Build secure-field intervals
-        secure_intervals = build_secure_field_intervals(
-            db_path, time_range=time_range, conn=conn,
-        )
-        if secure_intervals:
-            ctx.blocked_intervals = merge_intervals(
-                ctx.blocked_intervals, secure_intervals,
-            )
-
-        # Collect xref detections (chunk path only — scrubber collects during DB scrub)
-        if pipeline is not None and anonymizer is not None:
-            ctx.xref_detections = collect_xref_from_db(
-                db_path, pipeline, anonymizer,
-                time_range=time_range, conn=conn,
-            )
-
+            # Collect xref detections (chunk path only — scrubber collects during DB scrub)
+            if pipeline is not None and anonymizer is not None:
+                ctx.xref_detections = collect_xref_from_db(
+                    db_path, pipeline, anonymizer,
+                    time_range=time_range, conn=conn,
+                )
     except Exception:
         logger.debug("build_scrub_context failed, using empty context", exc_info=True)
-    finally:
-        if conn is not None:
-            try:
-                conn.close()
-            except Exception:
-                pass
 
     return ctx
 
@@ -1026,44 +989,36 @@ def _redact_keystroke_db_rows(dst: Path, redactions: list[dict]) -> None:
     if db_path is None:
         return
 
-    conn = sqlite3.connect(str(db_path))
-    try:
-        tables = {
-            r[0]
-            for r in conn.execute(
-                "SELECT name FROM sqlite_master WHERE type='table'"
-            ).fetchall()
-        }
-        if "action_event" not in tables:
-            return
+    with open_recording_db(db_path, read_only=False) as conn:
+        try:
+            if not has_table(conn, "action_event"):
+                return
 
-        ids_to_redact: list[int] = []
-        for r in redactions:
-            name = "press" if r["type"] == "key.down" else "release"
-            row = conn.execute(
-                "SELECT id FROM action_event "
-                "WHERE name = ? AND timestamp = ? AND key_char = ? LIMIT 1",
-                (name, r["timestamp"], r["key_char"]),
-            ).fetchone()
-            if row:
-                ids_to_redact.append(row[0])
+            ids_to_redact: list[int] = []
+            for r in redactions:
+                name = "press" if r["type"] == "key.down" else "release"
+                row = conn.execute(
+                    "SELECT id FROM action_event "
+                    "WHERE name = ? AND timestamp = ? AND key_char = ? LIMIT 1",
+                    (name, r["timestamp"], r["key_char"]),
+                ).fetchone()
+                if row:
+                    ids_to_redact.append(row[0])
 
-        if ids_to_redact:
-            for i in range(0, len(ids_to_redact), 500):
-                chunk = ids_to_redact[i : i + 500]
-                placeholders = ",".join("?" * len(chunk))
-                conn.execute(
-                    f"UPDATE action_event "
-                    f"SET key_char = NULL, canonical_key_char = NULL "
-                    f"WHERE id IN ({placeholders})",
-                    chunk,
-                )
-            conn.commit()
-    except Exception:
-        conn.rollback()
-        raise
-    finally:
-        conn.close()
+            if ids_to_redact:
+                for i in range(0, len(ids_to_redact), 500):
+                    chunk = ids_to_redact[i : i + 500]
+                    placeholders = ",".join("?" * len(chunk))
+                    conn.execute(
+                        f"UPDATE action_event "
+                        f"SET key_char = NULL, canonical_key_char = NULL "
+                        f"WHERE id IN ({placeholders})",
+                        chunk,
+                    )
+                conn.commit()
+        except Exception:
+            conn.rollback()
+            raise
 
 
 # ---------------------------------------------------------------------------
@@ -1330,8 +1285,8 @@ def mask_screenshots(
     classifier = ctx.classifier
 
     from screencap.privacy.context import (
+        _load_geometry_row,
         associate_screenshot,
-        load_window_geometry,
         parse_screenshot_timestamp,
     )
     from screencap.privacy.masking import (
@@ -1359,12 +1314,35 @@ def mask_screenshots(
 
     window_timestamps = [w.timestamp for w in ctx.window_events] if ctx.window_events else []
 
-    _geom_conn = None
+    # Open the geometry connection once for the whole loop. Hoist the
+    # window_geometry has_table check out of the per-screenshot path so the
+    # loop body uses _load_geometry_row directly (skips the per-call table
+    # introspection that load_window_geometry would otherwise repeat).
+    _geom_cm = None
+    _geom_conn: Connection | None = None
+    has_geometry = False
     if db_path is not None:
         try:
-            _geom_conn = sqlite3.connect(str(db_path))
-        except sqlite3.OperationalError:
-            pass
+            _geom_cm = open_recording_db(db_path)
+            _geom_conn = _geom_cm.__enter__()
+            has_geometry = has_table(_geom_conn, "window_geometry")
+        except Exception:
+            if _geom_cm is not None:
+                try:
+                    _geom_cm.__exit__(None, None, None)
+                except Exception:
+                    pass
+                _geom_cm = None
+            _geom_conn = None
+            has_geometry = False
+
+    def _maybe_geom(ts: float):
+        if _geom_conn is None or not has_geometry:
+            return None
+        try:
+            return _load_geometry_row(_geom_conn, ts)
+        except Exception:
+            return None
 
     # dHash cache for OCR dedup — single-entry, local to this invocation.
     # Tighter threshold (5) than capture-time dedup (8) because a false
@@ -1392,9 +1370,9 @@ def mask_screenshots(
             img_path.unlink()
         elif decision.action == PrivacyAction.MASK_WINDOW:
             selective_applied = False
-            if _geom_conn is not None:
+            if has_geometry:
                 try:
-                    geom = load_window_geometry(db_path, ts, conn=_geom_conn)
+                    geom = _maybe_geom(ts)
                     if geom is not None:
                         from PIL import Image
 
@@ -1490,11 +1468,8 @@ def mask_screenshots(
 
         # Load geometry once — used by both OCR and background masking.
         geom = None
-        if _geom_conn is not None and img_path.exists():
-            try:
-                geom = load_window_geometry(db_path, ts, conn=_geom_conn)
-            except Exception:
-                pass
+        if has_geometry and img_path.exists():
+            geom = _maybe_geom(ts)
 
         # --- Phase 2: OCR pass on foreground content ---
         # Run BEFORE background masking so OCR sees the original
@@ -1605,7 +1580,7 @@ def mask_screenshots(
             PrivacyAction.TEXT_REDACT,
             PrivacyAction.OCR_FALLBACK,
         ):
-            if _geom_conn is not None and img_path.exists() and geom is not None:
+            if has_geometry and img_path.exists() and geom is not None:
                 try:
                     from PIL import Image
 
@@ -1671,8 +1646,11 @@ def mask_screenshots(
             )
         )
 
-    if _geom_conn is not None:
-        _geom_conn.close()
+    if _geom_cm is not None:
+        try:
+            _geom_cm.__exit__(None, None, None)
+        except Exception:
+            pass
 
 
 # ---------------------------------------------------------------------------

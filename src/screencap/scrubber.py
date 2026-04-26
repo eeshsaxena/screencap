@@ -6,7 +6,6 @@ import dataclasses
 import json
 import os
 import shutil
-import sqlite3
 from pathlib import Path
 
 from rich.console import Console
@@ -16,6 +15,7 @@ from screencap.catalog import find_db
 from screencap.config import get_recordings_dir, resolve_recording_dir
 from screencap.privacy.actions import KEYSTROKE_CONTENT_FIELDS, PrivacyAction
 from screencap.privacy.reasons import AuditEntry, ReasonCode
+from screencap.recording_db import Connection, has_column, has_table, open_recording_db
 from screencap.scrub_pipeline import (
     BlockedInterval,
     ScrubContext,
@@ -77,81 +77,69 @@ def _null_db_rows_for_intervals(
     if db_path is None:
         return
 
-    conn = sqlite3.connect(str(db_path))
-    try:
-        tables = {
-            r[0]
-            for r in conn.execute(
-                "SELECT name FROM sqlite_master WHERE type='table'"
-            ).fetchall()
-        }
+    with open_recording_db(db_path, read_only=False) as conn:
+        try:
+            has_actions = has_table(conn, "action_event")
+            has_windows = has_table(conn, "window_event")
 
-        # Build SET clause from canonical field list, skipping columns
-        # absent in older recordings.
-        ae_cols: set[str] = set()
-        if "action_event" in tables:
-            ae_cols = {
-                r[1]
-                for r in conn.execute("PRAGMA table_info(action_event)").fetchall()
-            }
-        null_fields = sorted(f for f in KEYSTROKE_CONTENT_FIELDS if f in ae_cols)
-        ae_set_clause = ", ".join(f"{f} = NULL" for f in null_fields)
+            # Build SET clause from canonical field list, skipping columns
+            # absent in older recordings.
+            null_fields: list[str] = []
+            if has_actions:
+                null_fields = sorted(
+                    f for f in KEYSTROKE_CONTENT_FIELDS
+                    if has_column(conn, "action_event", f)
+                )
+            ae_set_clause = ", ".join(f"{f} = NULL" for f in null_fields)
 
-        # Build window_event SET clause — include browser_url if column exists
-        we_null_cols = ["title", "state"]
-        if "window_event" in tables:
-            we_cols = {
-                r[1]
-                for r in conn.execute("PRAGMA table_info(window_event)").fetchall()
-            }
-            if "browser_url" in we_cols:
+            # Build window_event SET clause — include browser_url if column exists
+            we_null_cols = ["title", "state"]
+            if has_windows and has_column(conn, "window_event", "browser_url"):
                 we_null_cols.append("browser_url")
-        we_set_clause = ", ".join(f"{c} = NULL" for c in we_null_cols)
+            we_set_clause = ", ".join(f"{c} = NULL" for c in we_null_cols)
 
-        for iv in intervals:
-            if iv.end == float("inf"):
-                ae_sql = (
-                    f"UPDATE action_event SET {ae_set_clause} "
-                    "WHERE timestamp >= ?"
-                )
-                ae_params = (iv.start,)
-                we_sql = (
-                    f"UPDATE window_event SET {we_set_clause} "
-                    "WHERE timestamp >= ?"
-                )
-                we_params = (iv.start,)
-            else:
-                ae_sql = (
-                    f"UPDATE action_event SET {ae_set_clause} "
-                    "WHERE timestamp >= ? AND timestamp < ?"
-                )
-                ae_params = (iv.start, iv.end)
-                we_sql = (
-                    f"UPDATE window_event SET {we_set_clause} "
-                    "WHERE timestamp >= ? AND timestamp < ?"
-                )
-                we_params = (iv.start, iv.end)
+            for iv in intervals:
+                if iv.end == float("inf"):
+                    ae_sql = (
+                        f"UPDATE action_event SET {ae_set_clause} "
+                        "WHERE timestamp >= ?"
+                    )
+                    ae_params = (iv.start,)
+                    we_sql = (
+                        f"UPDATE window_event SET {we_set_clause} "
+                        "WHERE timestamp >= ?"
+                    )
+                    we_params = (iv.start,)
+                else:
+                    ae_sql = (
+                        f"UPDATE action_event SET {ae_set_clause} "
+                        "WHERE timestamp >= ? AND timestamp < ?"
+                    )
+                    ae_params = (iv.start, iv.end)
+                    we_sql = (
+                        f"UPDATE window_event SET {we_set_clause} "
+                        "WHERE timestamp >= ? AND timestamp < ?"
+                    )
+                    we_params = (iv.start, iv.end)
 
-            if "action_event" in tables and ae_set_clause:
-                conn.execute(ae_sql, ae_params)
+                if has_actions and ae_set_clause:
+                    conn.execute(ae_sql, ae_params)
 
-            if "window_event" in tables:
-                conn.execute(we_sql, we_params)
+                if has_windows:
+                    conn.execute(we_sql, we_params)
 
-            result.audit_entries.append(
-                AuditEntry(
-                    timestamp=iv.start,
-                    surface="db_field",
-                    action=iv.action.value,
-                    reason=iv.reason,
+                result.audit_entries.append(
+                    AuditEntry(
+                        timestamp=iv.start,
+                        surface="db_field",
+                        action=iv.action.value,
+                        reason=iv.reason,
+                    )
                 )
-            )
-        conn.commit()
-    except Exception:
-        conn.rollback()
-        raise
-    finally:
-        conn.close()
+            conn.commit()
+        except Exception:
+            conn.rollback()
+            raise
 
 
 # Scrubber-local wrapper for _scrub_text with console output.
@@ -175,7 +163,7 @@ def _scrub_text(
 
 
 def _scrub_json_column(
-    conn: sqlite3.Connection,
+    conn: Connection,
     table: str,
     col: str,
     pipeline,
@@ -193,15 +181,14 @@ def _scrub_json_column(
     write_cur = conn.cursor()
     # Include timestamp when collecting detections (needed for xref matching).
     # Fall back to no-timestamp query if the column doesn't exist.
-    has_timestamp = False
-    if row_detection_collector is not None:
-        try:
-            read_cur.execute(
-                f"SELECT id, {col}, timestamp FROM {table} WHERE {col} IS NOT NULL"
-            )
-            has_timestamp = True
-        except sqlite3.OperationalError:
-            read_cur.execute(f"SELECT id, {col} FROM {table} WHERE {col} IS NOT NULL")
+    has_timestamp = (
+        row_detection_collector is not None
+        and has_column(conn, table, "timestamp")
+    )
+    if has_timestamp:
+        read_cur.execute(
+            f"SELECT id, {col}, timestamp FROM {table} WHERE {col} IS NOT NULL"
+        )
     else:
         read_cur.execute(f"SELECT id, {col} FROM {table} WHERE {col} IS NOT NULL")
     for row in read_cur:
@@ -241,7 +228,7 @@ def _scrub_json_column(
 
 
 def _scrub_text_column(
-    conn: sqlite3.Connection,
+    conn: Connection,
     table: str,
     col: str,
     pipeline,
@@ -263,23 +250,21 @@ def _scrub_text_column(
             )
 
 
-def _try_scrub_text_column(
-    conn: sqlite3.Connection,
+def _maybe_scrub_text_column(
+    conn: Connection,
     table: str,
     col: str,
     pipeline,
     anonymizer,
     result: ScrubResult,
 ) -> None:
-    """Scrub a text column, silently skipping if the column doesn't exist."""
-    try:
+    """Scrub a text column only if the column exists on this recording."""
+    if has_column(conn, table, col):
         _scrub_text_column(conn, table, col, pipeline, anonymizer, result)
-    except sqlite3.OperationalError:
-        pass
 
 
-def _try_scrub_json_column(
-    conn: sqlite3.Connection,
+def _maybe_scrub_json_column(
+    conn: Connection,
     table: str,
     col: str,
     pipeline,
@@ -287,19 +272,16 @@ def _try_scrub_json_column(
     result: ScrubResult,
     row_detection_collector: dict[int, dict] | None = None,
 ) -> None:
-    """Scrub a JSON column, silently skipping if the column doesn't exist."""
-    try:
+    """Scrub a JSON column only if the column exists on this recording."""
+    if has_column(conn, table, col):
         _scrub_json_column(
             conn, table, col, pipeline, anonymizer, result,
             row_detection_collector=row_detection_collector,
         )
-    except sqlite3.OperationalError:
-        pass
 
 
 def _scrub_recording_schema(
-    conn: sqlite3.Connection,
-    tables: set[str],
+    conn: Connection,
     pipeline,
     anonymizer,
     result: ScrubResult,
@@ -311,10 +293,10 @@ def _scrub_recording_schema(
     """
     element_state_detections: dict[int, dict] = {}
 
-    if "recording" in tables:
-        _try_scrub_text_column(conn, "recording", "task_description", pipeline, anonymizer, result)
+    if has_table(conn, "recording"):
+        _maybe_scrub_text_column(conn, "recording", "task_description", pipeline, anonymizer, result)
 
-    if "action_event" in tables:
+    if has_table(conn, "action_event"):
         for col in (
             "key_char",
             "canonical_key_char",
@@ -323,16 +305,16 @@ def _scrub_recording_schema(
             "active_segment_description",
             "available_segment_descriptions",
         ):
-            _try_scrub_text_column(conn, "action_event", col, pipeline, anonymizer, result)
-        _try_scrub_json_column(
+            _maybe_scrub_text_column(conn, "action_event", col, pipeline, anonymizer, result)
+        _maybe_scrub_json_column(
             conn, "action_event", "element_state", pipeline, anonymizer, result,
             row_detection_collector=element_state_detections,
         )
 
-    if "window_event" in tables:
-        _try_scrub_text_column(conn, "window_event", "title", pipeline, anonymizer, result)
-        _try_scrub_json_column(conn, "window_event", "state", pipeline, anonymizer, result)
-        _try_scrub_text_column(conn, "window_event", "browser_url", pipeline, anonymizer, result)
+    if has_table(conn, "window_event"):
+        _maybe_scrub_text_column(conn, "window_event", "title", pipeline, anonymizer, result)
+        _maybe_scrub_json_column(conn, "window_event", "state", pipeline, anonymizer, result)
+        _maybe_scrub_text_column(conn, "window_event", "browser_url", pipeline, anonymizer, result)
 
     return element_state_detections
 
@@ -353,36 +335,30 @@ def _scrub_db(
         return {}
 
     element_state_detections: dict[int, dict] = {}
-    conn = sqlite3.connect(str(db_path))
-    try:
-        cur = conn.cursor()
-        cur.execute("SELECT name FROM sqlite_master WHERE type='table'")
-        tables = {row[0] for row in cur.fetchall()}
+    with open_recording_db(db_path, read_only=False) as conn:
+        try:
+            # Delete unscrubable binary/audio data from DB
+            if has_table(conn, "screenshot"):
+                conn.execute("DELETE FROM screenshot")
+                result.deleted_files.append("screenshot table (binary BLOBs)")
+            if has_table(conn, "audio_info"):
+                conn.execute("DELETE FROM audio_info")
+                result.deleted_files.append("audio_info table (spoken words)")
 
-        # Delete unscrubable binary/audio data from DB
-        if "screenshot" in tables:
-            cur.execute("DELETE FROM screenshot")
-            result.deleted_files.append("screenshot table (binary BLOBs)")
-        if "audio_info" in tables:
-            cur.execute("DELETE FROM audio_info")
-            result.deleted_files.append("audio_info table (spoken words)")
+            if has_table(conn, "recording"):
+                element_state_detections = _scrub_recording_schema(
+                    conn, pipeline, anonymizer, result
+                )
+            else:
+                console.print(
+                    "  [yellow]Warning: unrecognized database schema — "
+                    "database text was NOT scrubbed[/]"
+                )
 
-        if "recording" in tables:
-            element_state_detections = _scrub_recording_schema(
-                conn, tables, pipeline, anonymizer, result
-            )
-        else:
-            console.print(
-                "  [yellow]Warning: unrecognized database schema — "
-                "database text was NOT scrubbed[/]"
-            )
-
-        conn.commit()
-    except Exception:
-        conn.rollback()
-        raise
-    finally:
-        conn.close()
+            conn.commit()
+        except Exception:
+            conn.rollback()
+            raise
 
     return element_state_detections
 
