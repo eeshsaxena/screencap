@@ -383,6 +383,14 @@ class TestChildrenRoundTrip:
             assert isinstance(all_events[1], MouseClickEvent)
             assert isinstance(all_events[2], MouseUpEvent)
 
+            # Child payloads survive the JSON round-trip (not just types)
+            assert all_events[0].x == 10.0
+            assert all_events[0].y == 20.0
+            assert all_events[0].button == MouseButton.LEFT
+            assert all_events[2].x == 10.0
+            assert all_events[2].y == 20.0
+            assert all_events[2].button == MouseButton.LEFT
+
             # parent_id chain is persisted: children point at the click row
             cursor = storage.conn.cursor()
             cursor.execute(
@@ -391,6 +399,47 @@ class TestChildrenRoundTrip:
             rows = cursor.fetchall()
 
         assert rows[0]["id"] == parent_id
+        assert rows[0]["parent_id"] is None
+        assert rows[1]["parent_id"] == parent_id
+        assert rows[1]["type"] == EventType.MOUSE_DOWN.value
+        assert rows[2]["parent_id"] == parent_id
+        assert rows[2]["type"] == EventType.MOUSE_UP.value
+
+    def test_mouse_click_with_children_via_write_events(self, tmp_path):
+        """write_events has its own inline child-write loop distinct from
+        write_event's recursion. The dead `event.type` ternary fix touched
+        both paths, so both need round-trip coverage."""
+        down = MouseDownEvent(timestamp=1.0, x=10.0, y=20.0, button=MouseButton.LEFT)
+        up = MouseUpEvent(timestamp=1.1, x=10.0, y=20.0, button=MouseButton.LEFT)
+        click = MouseClickEvent(
+            timestamp=1.05,
+            x=10.0,
+            y=20.0,
+            button=MouseButton.LEFT,
+            children=[down, up],
+        )
+
+        with CaptureStorage(tmp_path / "capture.db") as storage:
+            storage.write_events([click])
+
+            top_level = storage.get_events()
+            assert len(top_level) == 1
+            assert isinstance(top_level[0], MouseClickEvent)
+
+            all_events = storage.get_events(include_children=True)
+            assert len(all_events) == 3
+            assert isinstance(all_events[0], MouseDownEvent)
+            assert isinstance(all_events[1], MouseClickEvent)
+            assert isinstance(all_events[2], MouseUpEvent)
+
+            cursor = storage.conn.cursor()
+            cursor.execute("SELECT id, type, parent_id FROM events ORDER BY id")
+            rows = cursor.fetchall()
+
+        # write_events INSERTs parent first, then children, so id-order is
+        # [click, down, up] regardless of timestamp.
+        parent_id = rows[0]["id"]
+        assert rows[0]["type"] == EventType.MOUSE_SINGLECLICK.value
         assert rows[0]["parent_id"] is None
         assert rows[1]["parent_id"] == parent_id
         assert rows[1]["type"] == EventType.MOUSE_DOWN.value
