@@ -718,20 +718,11 @@ def _update_task_description(db_path: Path, description: str) -> None:
         tables = {row[0] for row in cur.fetchall()}
 
         if "recording" in tables:
-            # Check if task_description column exists
             cur.execute("PRAGMA table_info(recording)")
             columns = {row[1] for row in cur.fetchall()}
             if "task_description" in columns:
                 cur.execute(
                     "UPDATE recording SET task_description = ?",
-                    (description,),
-                )
-        elif "capture" in tables:
-            cur.execute("PRAGMA table_info(capture)")
-            columns = {row[1] for row in cur.fetchall()}
-            if "task_description" in columns:
-                cur.execute(
-                    "UPDATE capture SET task_description = ?",
                     (description,),
                 )
 
