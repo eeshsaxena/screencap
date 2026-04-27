@@ -163,13 +163,21 @@ The cloud-bound chunk processor and recovery both pass this filter into `unified
 
 The shape is deliberate: returning `None` for the non-cloud path lets call sites wire the factory **unconditionally** — `window_filter=build_cloud_window_filter(self._cloud_intent, ...)` — eliminating the `if cloud_intent: build_filter() else None` pattern. That conditional pattern is exactly the failure mode that produced the prior Slack-title leak (a path that bypassed the filter when reviewer vigilance lapsed); removing the conditional removes the failure mode.
 
-Defense-in-depth: `tests/test_privacy_filter_call_graph.py` is a static AST walker (CI guard) that scans `src/screencap/`. It enforces three rules:
+Defense-in-depth: `tests/test_privacy_filter_call_graph.py` is a static AST walker (CI guard) that scans `src/screencap/`. It enforces four rules:
 
 1. `build_privacy_filter` is imported only from `privacy/filter.py` (declaration site) and the `exporter.py` backward-compat re-export. Any other import path within `src/screencap/` fails the test.
-2. Calls to `unified_export_events(...)` from `src/screencap/chunk_processor.py` and `src/screencap/cli.py` (recovery) do NOT pass `window_filter=None` as a literal `None`. CLI export's `CaptureSession.export_events` (`src/screencap/engine/capture.py`) is the legitimate `window_filter=None` site and is exempted by file path.
-3. `build_cloud_window_filter` is the only public callable that constructs a cloud-mode filter; `build_privacy_filter(cloud_intent=False, ...)` (or `cloud_intent` literally `False`) from any caller other than itself or its tests fails the test.
+2. Every call to `unified_export_events(...)` from a cloud-bound file (every file under `src/screencap/` except `engine/capture.py`, the CLI-export site) MUST explicitly pass a `window_filter=` kwarg, AND that value must not be a literal `None`. Two regression vectors are caught: (a) the omitted-kwarg case (`unified_export_events(rows, windows)` falls through to the function default `window_filter=None` and silently leaks titles), and (b) the literal `window_filter=None` case (a deliberate or careless bypass of `build_cloud_window_filter`). CLI export's `CaptureSession.export_events` (`src/screencap/engine/capture.py`) is the only legitimate `window_filter=None` site and is exempted by file path.
+3. `build_privacy_filter` is module-private to `privacy/filter.py`. Any direct call from any other file under `src/screencap/` fails the test, regardless of arguments. `build_cloud_window_filter` is the only sanctioned constructor for production code. The exporter re-export remains for backward-compat *imports* (test files depend on it), but production code must not invoke the symbol — going through the factory means cloud-bound construction stays centralized in one place with one set of pre-flight checks.
+4. Legacy literal-`cloud_intent=False` check, preserved alongside (3) for defense in depth: a literal `False` constant in the `cloud_intent` kwarg position from outside the factory home is also flagged. With (3) in place this is moot for production code, but the helper machinery is exercised by sensitivity self-tests that pin the original Unit 8 enforcement contract.
 
-The guard catches import-path violations and literal `None` in kwarg position. It does **not** catch logic copy-paste (a future caller open-coding the closure pattern with `DefaultPolicyEvaluator` + `DefaultContextClassifier` inline) — that vector is covered by code review and by this document naming the factory as the only sanctioned constructor.
+**Known limitation: the AST walker matches direct name and attribute references only.** Local aliasing defeats the matcher silently:
+
+- **Local `as` aliasing.** `from screencap.engine.export import unified_export_events as fn` then `fn(rows, windows, window_filter=None)`. The walker sees `Call(func=Name("fn"), ...)`, not `unified_export_events`, and the call escapes detection.
+- **Variable-assignment aliasing.** `_alias = unified_export_events` followed by `_alias(...)`. Same blind spot.
+- **Dynamic imports / `getattr` lookups.** `importlib.import_module("screencap.engine.export").unified_export_events(...)` or `getattr(mod, "unified_export_events")(...)`. The symbol name appears only as a string literal, invisible to AST-name matching.
+- **Logic copy-paste.** A future caller could open-code the `DefaultPolicyEvaluator` + `DefaultContextClassifier` closure pattern inline. The Slack-leak prior incident was exactly this shape.
+
+These vectors are mitigated by code review; this document names `build_cloud_window_filter` as the only sanctioned constructor. A reviewer who sees an alias or a dynamic lookup of either `unified_export_events` or `build_privacy_filter` in a new code path should treat it as a warning sign and reject the change unless the call site goes through the factory.
 
 ## Recovery's privacy posture — call-site context, not the intent file
 

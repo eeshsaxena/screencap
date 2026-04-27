@@ -12,15 +12,6 @@ from typing import IO, TYPE_CHECKING, Callable, Iterable
 
 from screencap import __version__
 
-# Backward-compat re-exports: `build_privacy_filter` moved to
-# `screencap.privacy.filter` so cloud callers (chunk processor, recovery)
-# can import from a neutral location. Existing tests and downstream
-# imports of `screencap.exporter.build_privacy_filter` continue to work.
-from screencap.privacy.filter import (  # noqa: F401
-    build_cloud_window_filter,
-    build_privacy_filter,
-)
-
 if TYPE_CHECKING:  # pragma: no cover - import-only typing hint
     from screencap.engine.capture import CaptureSession
     from screencap.engine.events import BaseEvent, WindowSwitchEvent

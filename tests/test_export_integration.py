@@ -406,7 +406,8 @@ def test_privacy_filter_excludes_and_masks(tmp_path, monkeypatch):
     create_export_test_db(rec_dir / "recording.db", extra_window_events=extra_windows)
 
     from screencap.engine import Capture
-    from screencap.exporter import _write_events, build_privacy_filter
+    from screencap.exporter import _write_events
+    from screencap.privacy.filter import build_privacy_filter
 
     pf = build_privacy_filter(privacy_mode="public", cloud_intent=False)
     out_file = rec_dir / "events.jsonl"
@@ -458,7 +459,8 @@ def test_privacy_filter_cloud_intent(tmp_path, monkeypatch):
     create_export_test_db(rec_dir / "recording.db", extra_window_events=extra_windows)
 
     from screencap.engine import Capture
-    from screencap.exporter import _write_events, build_privacy_filter
+    from screencap.exporter import _write_events
+    from screencap.privacy.filter import build_privacy_filter
 
     def _export_with_filter(pf):
         with Capture.load(str(rec_dir)) as capture:

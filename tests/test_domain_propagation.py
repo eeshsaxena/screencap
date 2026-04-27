@@ -128,7 +128,7 @@ class TestExportDomainPropagation:
 
     def test_filter_uses_domain_for_classification(self):
         """Export privacy filter reads domain from WindowSwitchEvent."""
-        from screencap.exporter import build_privacy_filter
+        from screencap.privacy.filter import build_privacy_filter
         from screencap.engine.events import WindowSwitchEvent
 
         with _mock_privacy_config():
@@ -152,7 +152,7 @@ class TestExportDomainPropagation:
 
     def test_filter_excludes_banking_domain(self):
         """Export privacy filter suppresses events for EXCLUDE domains."""
-        from screencap.exporter import build_privacy_filter
+        from screencap.privacy.filter import build_privacy_filter
         from screencap.engine.events import WindowSwitchEvent
 
         with _mock_privacy_config():
@@ -172,7 +172,7 @@ class TestExportDomainPropagation:
 
     def test_filter_masks_email_domain(self):
         """MASK_WINDOW domains get title masked and domain set to None."""
-        from screencap.exporter import build_privacy_filter
+        from screencap.privacy.filter import build_privacy_filter
         from screencap.engine.events import WindowSwitchEvent
 
         with _mock_privacy_config():
@@ -194,7 +194,7 @@ class TestExportDomainPropagation:
 
     def test_filter_no_domain_falls_to_unverified(self):
         """Browser without domain → BROWSER_UNVERIFIED → MASK_WINDOW."""
-        from screencap.exporter import build_privacy_filter
+        from screencap.privacy.filter import build_privacy_filter
         from screencap.engine.events import WindowSwitchEvent
 
         with _mock_privacy_config():
