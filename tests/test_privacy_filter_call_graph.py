@@ -480,3 +480,24 @@ class TestCheckerCoverage:
         assert "engine/export.py" in rels
         assert "privacy/filter.py" in rels
         assert "exporter.py" in rels
+
+    def test_allow_list_paths_exist_on_disk(self):
+        """Every path in an allow-list must resolve to a real file under
+        ``src/screencap/``. A phantom entry from a rename silently
+        disables enforcement for the renamed file — the new path is no
+        longer exempt (correct), but the phantom entry hides the rename
+        from this coverage test, letting allow-list rot creep in over
+        time. Failing fast on a missing file forces a deliberate update.
+        """
+        src = _src_root()
+        for allow_list_name, paths in (
+            ("_BUILD_PRIVACY_FILTER_HOMES", _BUILD_PRIVACY_FILTER_HOMES),
+            ("_UNIFIED_EXPORT_NONE_OK", _UNIFIED_EXPORT_NONE_OK),
+            ("_CLOUD_FALSE_FACTORY_HOMES", _CLOUD_FALSE_FACTORY_HOMES),
+        ):
+            for rel_path in paths:
+                assert (src / rel_path).is_file(), (
+                    f"{allow_list_name} contains '{rel_path}' but no such "
+                    f"file exists under {src}. A rename probably orphaned "
+                    f"the entry — update the allow-list."
+                )

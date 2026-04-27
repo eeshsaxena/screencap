@@ -98,9 +98,11 @@ class TestReturnType:
     """The function returns an Iterator, not a list."""
 
     def test_returns_iterator(self):
+        from collections.abc import Iterator
+
         result = unified_export_events([], [])
         # Iterator: yields and is consumed. Not a list.
-        assert iter(result) is result or hasattr(result, "__next__")
+        assert isinstance(result, Iterator)
         assert not isinstance(result, list)
 
     def test_iterator_is_exhausted_after_consumption(self):

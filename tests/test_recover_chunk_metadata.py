@@ -69,6 +69,28 @@ def _patch_short_chunk_duration():
 class TestRequiredKeywordContract:
     """The cloud_bound keyword MUST be required, not defaulted."""
 
+    def test_signature_has_no_default_for_cloud_bound(self):
+        """The runtime TypeError test below catches a removed kwarg, but a
+        future refactor that swallows ``cloud_bound`` into ``**kwargs`` (or
+        adds a default) would silently regress to the unsafe path while
+        still appearing to "require" the keyword. Pin the contract at the
+        signature level so both regressions fail CI.
+        """
+        import inspect
+
+        from screencap.cli import _recover_chunk_metadata
+
+        params = inspect.signature(_recover_chunk_metadata).parameters
+        assert "cloud_bound" in params, (
+            "cloud_bound kwarg removed from _recover_chunk_metadata — "
+            "the upload recovery path must always pass it explicitly."
+        )
+        assert params["cloud_bound"].default is inspect.Parameter.empty, (
+            "cloud_bound now has a default — recovery must require the "
+            "caller to assert the cloud-bound posture explicitly. See "
+            "CLAUDE.md: 'cloud_bound is a REQUIRED keyword (no default)'."
+        )
+
     def test_omitting_cloud_bound_raises_type_error(self, recording_db):
         """Calling without cloud_bound= must raise TypeError, not silently fail-OPEN."""
         from screencap.cli import _recover_chunk_metadata
