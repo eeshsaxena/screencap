@@ -1481,13 +1481,14 @@ def _recover_chunk_metadata(
         return
 
     # Stale .tmp cleanup sweep: a previous SIGKILL/OOM may have left
-    # events_NNNN.jsonl.tmp files for chunks we're about to re-recover.
-    # write_events_jsonl also cleans its own .tmp, but this defense-in-depth
-    # sweep covers chunks we plan to skip (e.g. corrupt-row failures) where
-    # write_events_jsonl is never reached.
+    # .tmp files for chunks we're about to re-recover.
+    # write_events_jsonl / generate_manifest also clean their own .tmp,
+    # but this defense-in-depth sweep covers chunks we plan to skip
+    # (e.g. corrupt-row failures) where the writer is never reached.
     for idx in missing_events:
-        stale_tmp = recording_dir / f"events_{idx:04d}.jsonl.tmp"
-        stale_tmp.unlink(missing_ok=True)
+        (recording_dir / f"events_{idx:04d}.jsonl.tmp").unlink(missing_ok=True)
+    for idx in missing_manifests:
+        (recording_dir / f"chunk_{idx:04d}_manifest.json.tmp").unlink(missing_ok=True)
 
     # Derive chunk time ranges from recording.db
     try:
@@ -1566,15 +1567,6 @@ def _recover_chunk_metadata(
                 except Exception:
                     privacy_mode = "internal"
 
-            # Build the cloud window filter unconditionally via the
-            # sanctioned factory. Returns None when cloud_bound=False so
-            # callers do not need an if/else (Unit 1 contract).
-            window_filter = build_cloud_window_filter(
-                cloud_bound=cloud_bound,
-                privacy_mode=privacy_mode,
-                capture_dir=recording_dir,
-            )
-
             exported = 0
             try:
                 with open_recording_db(db_path, row_factory=Row) as conn:
@@ -1596,6 +1588,18 @@ def _recover_chunk_metadata(
                         jsonl_path = recording_dir / f"events_{idx:04d}.jsonl"
 
                         try:
+                            # Build the cloud window filter inside the
+                            # per-chunk try so a config-load failure
+                            # (e.g. InvalidPrivacyConfigError, which is
+                            # not caught inside build_privacy_filter)
+                            # marks one chunk as failed instead of
+                            # aborting the whole recovery (R5/Unit 1).
+                            window_filter = build_cloud_window_filter(
+                                cloud_bound=cloud_bound,
+                                privacy_mode=privacy_mode,
+                                capture_dir=recording_dir,
+                            )
+
                             # Action SELECT with R16 disabled filter
                             action_rows = [
                                 dict(r) for r in conn.execute(
