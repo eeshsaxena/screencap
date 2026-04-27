@@ -19,6 +19,7 @@ Covers Unit 1 of the unified-export-callable refactor:
 from __future__ import annotations
 
 import json
+import re
 from unittest.mock import patch
 
 from screencap.engine.events import WindowSwitchEvent
@@ -26,7 +27,7 @@ from screencap.privacy.filter import (
     build_cloud_window_filter,
     build_privacy_filter,
 )
-from screencap.privacy.policy import PrivacyConfig, PrivacyMode
+from screencap.privacy.policy import ContextClass, PrivacyConfig, PrivacyMode
 
 
 def _public_config():
@@ -514,3 +515,200 @@ class TestCloudIntentSkipsMenubarOverrides:
         result = pf(slack_event)
         assert result is not None
         assert result.window_title == slack_event.app_name
+
+
+# ---------------------------------------------------------------------------
+# P3: cloud_intent=True must neutralize ``allow_apps`` from PrivacyConfig
+# ---------------------------------------------------------------------------
+
+
+class TestCloudIntentSkipsAllowApps:
+    """Cloud-bound exports MUST NOT honor ``[privacy].allow_apps`` from
+    ``config.toml``.
+
+    ``DefaultPolicyEvaluator.evaluate`` lets ``allow_apps`` win over the
+    matrix unless the matrix verdict is EXCLUDE — so ``allow_apps``
+    containing a chat app (e.g. Slack, ``CHAT`` → MASK_WINDOW under PUBLIC)
+    would otherwise return ALLOW and leak the original window title into
+    cloud-bound JSONL. This is the same loosening vector as the menubar
+    override fix (todo 005), but at the policy-config layer.
+
+    Other config knobs (``exclude_apps``, ``mask_domains``,
+    ``mask_title_patterns``) only TIGHTEN the matrix and remain in effect
+    for cloud-bound exports.
+    """
+
+    def _slack_event(self):
+        return _make_event(
+            bundle_id="com.tinyspeck.slackmacgap",
+            app_name="Slack",
+            window_title="#secret-channel — Slack",
+            domain="slack.com",
+        )
+
+    def test_cloud_bound_neutralizes_allow_apps_for_chat(self, tmp_path):
+        """Cloud-bound + ``allow_apps=['com.tinyspeck.slackmacgap']`` →
+        Slack title still masked. The matrix verdict (CHAT, PUBLIC =
+        MASK_WINDOW) wins because cloud_intent neutralizes ``allow_apps``."""
+        cfg = PrivacyConfig(
+            mode=PrivacyMode.INTERNAL,
+            allow_apps=frozenset(["com.tinyspeck.slackmacgap"]),
+        )
+        with patch(
+            "screencap.config.get_privacy_config", return_value=cfg,
+        ):
+            pf = build_cloud_window_filter(
+                cloud_bound=True,
+                privacy_mode="internal",
+                capture_dir=tmp_path,
+            )
+
+        slack_event = self._slack_event()
+        result = pf(slack_event)
+        # MASK_WINDOW posture: title replaced with app_name, domain nulled.
+        # If allow_apps had won, the original title would have passed through.
+        assert result is not None
+        assert result.window_title == slack_event.app_name
+        assert result.domain is None
+
+    def test_local_filter_still_honors_allow_apps(self, tmp_path):
+        """Non-cloud (``cloud_intent=False``) + same ``allow_apps`` →
+        original Slack title passes through. Preserves existing user-level
+        allow behavior when not cloud-bound."""
+        cfg = PrivacyConfig(
+            mode=PrivacyMode.PUBLIC,
+            allow_apps=frozenset(["com.tinyspeck.slackmacgap"]),
+        )
+        with patch(
+            "screencap.config.get_privacy_config", return_value=cfg,
+        ):
+            pf = build_privacy_filter(
+                privacy_mode="public",
+                cloud_intent=False,
+                capture_dir=tmp_path,
+            )
+
+        slack_event = self._slack_event()
+        result = pf(slack_event)
+        # ALLOW from allow_apps → event passes through unchanged.
+        assert result is not None
+        assert result.window_title == "#secret-channel — Slack"
+        # domain preserved (ALLOW does not null it).
+        assert result.domain == "slack.com"
+
+    def test_cloud_bound_still_honors_exclude_apps(self, tmp_path):
+        """Regression: ``exclude_apps`` is a TIGHTENING knob and must
+        still apply for cloud-bound exports. VSCode under PUBLIC matrix
+        is TEXT_REDACT (passes through), but with ``exclude_apps`` set it
+        is dropped."""
+        cfg = PrivacyConfig(
+            mode=PrivacyMode.INTERNAL,
+            exclude_apps=frozenset(["com.microsoft.VSCode"]),
+        )
+        with patch(
+            "screencap.config.get_privacy_config", return_value=cfg,
+        ):
+            pf = build_cloud_window_filter(
+                cloud_bound=True,
+                privacy_mode="internal",
+                capture_dir=tmp_path,
+            )
+
+        event = _make_event(
+            bundle_id="com.microsoft.VSCode",
+            app_name="Visual Studio Code",
+            window_title="main.py",
+        )
+        # exclude_apps wins (highest precedence) — event suppressed.
+        assert pf(event) is None
+
+    def test_cloud_bound_still_honors_mask_domains(self, tmp_path):
+        """Regression: ``mask_domains`` is a TIGHTENING knob and must
+        still apply for cloud-bound exports. Chrome on a domain in
+        ``mask_domains`` → MASK_WINDOW (forced)."""
+        cfg = PrivacyConfig(
+            mode=PrivacyMode.INTERNAL,
+            mask_domains=frozenset(["example.com"]),
+            app_classes={
+                "com.google.Chrome": ContextClass.BROWSER_UNVERIFIED,
+            },
+        )
+        with patch(
+            "screencap.config.get_privacy_config", return_value=cfg,
+        ):
+            pf = build_cloud_window_filter(
+                cloud_bound=True,
+                privacy_mode="internal",
+                capture_dir=tmp_path,
+            )
+
+        event = _make_event(
+            bundle_id="com.google.Chrome",
+            app_name="Google Chrome",
+            window_title="Example — Chrome",
+            domain="example.com",
+        )
+        result = pf(event)
+        # mask_domains forces at least MASK_WINDOW — title masked, domain nulled.
+        assert result is not None
+        assert result.window_title == event.app_name
+        assert result.domain is None
+
+    def test_cloud_bound_still_honors_mask_title_patterns(self, tmp_path):
+        """Regression: ``mask_title_patterns`` is a TIGHTENING knob and
+        must still apply for cloud-bound exports. A title matching a
+        configured pattern → MASK_WINDOW (forced)."""
+        cfg = PrivacyConfig(
+            mode=PrivacyMode.INTERNAL,
+            mask_title_patterns=(re.compile(r"\bSECRET\b"),),
+        )
+        with patch(
+            "screencap.config.get_privacy_config", return_value=cfg,
+        ):
+            pf = build_cloud_window_filter(
+                cloud_bound=True,
+                privacy_mode="internal",
+                capture_dir=tmp_path,
+            )
+
+        event = _make_event(
+            bundle_id="com.apple.Terminal",
+            app_name="Terminal",
+            window_title="bash — SECRET project",
+        )
+        result = pf(event)
+        # title pattern forces MASK_WINDOW — title masked to app_name.
+        assert result is not None
+        assert result.window_title == event.app_name
+        assert result.domain is None
+
+    def test_cloud_bound_browser_in_allow_apps_still_neutralized(self, tmp_path):
+        """Browser-refinement edge case: even if a non-chat bundle were
+        marked as ``BROWSER_UNVERIFIED`` and put in ``allow_apps``, the
+        cloud-bound filter neutralizes ``allow_apps`` so the matrix
+        decides. Sanity check that the browser-refinement code path in
+        ``DefaultPolicyEvaluator`` is moot when ``allow_apps`` is empty."""
+        cfg = PrivacyConfig(
+            mode=PrivacyMode.INTERNAL,
+            allow_apps=frozenset(["com.tinyspeck.slackmacgap"]),
+            # Silly classification but exercises the browser-refinement branch.
+            app_classes={
+                "com.tinyspeck.slackmacgap": ContextClass.BROWSER_UNVERIFIED,
+            },
+        )
+        with patch(
+            "screencap.config.get_privacy_config", return_value=cfg,
+        ):
+            pf = build_cloud_window_filter(
+                cloud_bound=True,
+                privacy_mode="internal",
+                capture_dir=tmp_path,
+            )
+
+        slack_event = self._slack_event()
+        result = pf(slack_event)
+        # BROWSER_UNVERIFIED under PUBLIC is MASK_WINDOW. With allow_apps
+        # neutralized, the matrix decides → title masked.
+        assert result is not None
+        assert result.window_title == slack_event.app_name
+        assert result.domain is None

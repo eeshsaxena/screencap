@@ -17,6 +17,7 @@ Two public constructors:
 
 from __future__ import annotations
 
+import dataclasses
 import json
 import logging
 from pathlib import Path
@@ -72,6 +73,15 @@ def build_privacy_filter(
         from screencap.privacy.policy import PrivacyConfig
 
         privacy_cfg = PrivacyConfig(mode=mode)
+
+    # Cloud-bound posture cannot be loosened by user config. ``allow_apps``
+    # would otherwise win over the PUBLIC matrix's MASK_WINDOW for chat
+    # apps (the same loosening vector as menubar overrides — see todo 005
+    # for the parallel fix at the runtime-override layer). Other knobs
+    # (``exclude_apps``, ``mask_domains``, ``mask_title_patterns``) only
+    # tighten the matrix and remain in effect for cloud.
+    if cloud_intent:
+        privacy_cfg = dataclasses.replace(privacy_cfg, allow_apps=frozenset())
 
     classifier = DefaultContextClassifier(app_classes=privacy_cfg.app_classes)
     evaluator = DefaultPolicyEvaluator(privacy_cfg)
