@@ -10,6 +10,15 @@ from datetime import datetime, timezone
 
 from screencap import __version__
 
+# Backward-compat re-exports: `build_privacy_filter` moved to
+# `screencap.privacy.filter` so cloud callers (chunk processor, recovery)
+# can import from a neutral location. Existing tests and downstream
+# imports of `screencap.exporter.build_privacy_filter` continue to work.
+from screencap.privacy.filter import (  # noqa: F401
+    build_cloud_window_filter,
+    build_privacy_filter,
+)
+
 logger = logging.getLogger(__name__)
 
 
@@ -106,109 +115,3 @@ def _write_events(
         click.echo(event.model_dump_json(), file=out_file)
         count += 1
     return count
-
-
-def build_privacy_filter(
-    privacy_mode: str = "internal",
-    cloud_intent: bool = False,
-    capture_dir=None,
-):
-    """Build a privacy filter callback for window.switch events.
-
-    Args:
-        privacy_mode: Privacy mode string (public/shared/internal).
-        cloud_intent: Whether this export is destined for cloud upload.
-        capture_dir: Path to the capture directory (for loading menu bar
-            overrides from ``.menubar_overrides.json``).
-
-    Returns:
-        Callable that takes a WindowSwitchEvent and returns the event
-        (possibly with masked title), or None to suppress it.
-    """
-    from screencap.privacy.actions import PrivacyAction
-    from screencap.privacy.context import DefaultContextClassifier
-    from screencap.privacy.policy import (
-        DefaultPolicyEvaluator,
-        PrivacyMode,
-    )
-
-    try:
-        mode = PrivacyMode(privacy_mode)
-    except ValueError:
-        mode = PrivacyMode.INTERNAL
-
-    # Cloud uploads must use the strictest non-shared mode to prevent
-    # leaking window titles for apps like Slack/Teams (see action matrix).
-    if cloud_intent:
-        mode = PrivacyMode.PUBLIC
-
-    # Load privacy config from config.toml
-    try:
-        from screencap.config import get_privacy_config
-
-        privacy_cfg = get_privacy_config()
-    except (ImportError, FileNotFoundError, KeyError, ValueError):
-        logger.debug("Could not load privacy config, using defaults")
-        from screencap.privacy.policy import PrivacyConfig
-
-        privacy_cfg = PrivacyConfig(mode=mode)
-
-    classifier = DefaultContextClassifier(app_classes=privacy_cfg.app_classes)
-    evaluator = DefaultPolicyEvaluator(privacy_cfg)
-
-    # Load session overrides from menu bar toggles
-    runtime_overrides: dict[str, str] = {}
-    if capture_dir is not None:
-        from pathlib import Path
-
-        override_path = Path(capture_dir) / ".menubar_overrides.json"
-        if override_path.exists():
-            import json
-
-            try:
-                runtime_overrides = json.loads(override_path.read_text())
-            except Exception:
-                logger.debug("Could not load menu bar overrides")
-
-    def _filter(event):
-        from screencap.privacy.policy import FrameMetadata
-
-        bundle_id = event.app_bundle_id or ""
-
-        # Check runtime overrides first (user toggles from menu bar)
-        if runtime_overrides:
-            from screencap.privacy.actions import resolve_override
-            from screencap.privacy.domain_loader import extract_root_domain
-
-            domain = getattr(event, "domain", None)
-            root_domain = extract_root_domain(domain) if domain else None
-            override_action = resolve_override(
-                runtime_overrides, bundle_id, root_domain,
-            )
-            if override_action == "exclude":
-                return None
-            if override_action == "allow":
-                return event
-
-        metadata = FrameMetadata(
-            bundle_id=bundle_id,
-            window_title=event.window_title,
-            domain=event.domain,
-            timestamp=event.timestamp,
-        )
-        ctx = classifier.classify(metadata)
-        decision = evaluator.evaluate(ctx, metadata, mode)
-        action = decision.action
-
-        if action == PrivacyAction.EXCLUDE:
-            return None
-
-        if action == PrivacyAction.MASK_WINDOW:
-            return event.model_copy(update={
-                "window_title": event.app_name,
-                "domain": None,
-            })
-
-        return event
-
-    return _filter

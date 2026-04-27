@@ -1,0 +1,399 @@
+"""Tests for the privacy filter factory in ``screencap.privacy.filter``.
+
+Covers Unit 1 of the unified-export-callable refactor:
+
+- ``build_cloud_window_filter`` factory: returns ``None`` for non-cloud,
+  cloud-mode filter for cloud (forces PUBLIC mode).
+- ``build_privacy_filter`` null-bundle-id fail-closed (R17 regression):
+  None / empty / whitespace-only ``app_bundle_id`` → suppressed.
+- Load-bearing architecture invariants: EXCLUDE → suppressed; MASK_WINDOW
+  → ``window_title == app_name`` AND ``domain is None``; ALLOW → unchanged.
+- ``.menubar_overrides.json``: missing file is fine; malformed JSON falls
+  back to policy evaluation without raising.
+- Import paths: both the new neutral location and the backward-compat
+  ``screencap.exporter`` re-export resolve to the same callable.
+"""
+
+from __future__ import annotations
+
+import json
+from unittest.mock import patch
+
+from screencap.engine.events import WindowSwitchEvent
+from screencap.privacy.filter import (
+    build_cloud_window_filter,
+    build_privacy_filter,
+)
+from screencap.privacy.policy import PrivacyConfig, PrivacyMode
+
+
+def _public_config():
+    """Patch ``get_privacy_config`` to return a clean PUBLIC-mode config.
+
+    Avoids picking up whatever the developer has in ``~/.screencap/config.toml``
+    so test outcomes are deterministic.
+    """
+    return patch(
+        "screencap.config.get_privacy_config",
+        return_value=PrivacyConfig(mode=PrivacyMode.PUBLIC),
+    )
+
+
+def _make_event(
+    *,
+    bundle_id: str | None = "com.apple.Terminal",
+    app_name: str = "Terminal",
+    window_title: str = "bash — 80x24",
+    domain: str | None = None,
+) -> WindowSwitchEvent:
+    return WindowSwitchEvent(
+        timestamp=1000.0,
+        app_name=app_name,
+        app_bundle_id=bundle_id,
+        window_title=window_title,
+        window_id="100",
+        x=0,
+        y=0,
+        width=1512,
+        height=982,
+        domain=domain,
+    )
+
+
+# ---------------------------------------------------------------------------
+# build_cloud_window_filter — factory dispatch
+# ---------------------------------------------------------------------------
+
+
+class TestCloudWindowFilterFactory:
+    def test_cloud_bound_false_returns_none(self, tmp_path):
+        """``cloud_bound=False`` returns ``None`` so callers can wire
+        the factory unconditionally without an ``if/else``."""
+        result = build_cloud_window_filter(
+            cloud_bound=False,
+            privacy_mode="internal",
+            capture_dir=tmp_path,
+        )
+        assert result is None
+
+    def test_cloud_bound_true_returns_callable(self, tmp_path):
+        """``cloud_bound=True`` returns a callable filter."""
+        with _public_config():
+            pf = build_cloud_window_filter(
+                cloud_bound=True,
+                privacy_mode="internal",
+                capture_dir=tmp_path,
+            )
+        assert pf is not None
+        assert callable(pf)
+
+    def test_cloud_bound_true_forces_public_mode(self, tmp_path):
+        """``cloud_bound=True`` ignores the supplied ``privacy_mode`` and
+        applies PUBLIC mode (cloud_intent → PUBLIC override). Slack
+        (CHAT) is TEXT_REDACT under INTERNAL but MASK_WINDOW under PUBLIC."""
+        with _public_config():
+            pf = build_cloud_window_filter(
+                cloud_bound=True,
+                privacy_mode="internal",
+                capture_dir=tmp_path,
+            )
+
+        slack_event = _make_event(
+            bundle_id="com.tinyspeck.slackmacgap",
+            app_name="Slack",
+            window_title="#secret-channel — Slack",
+        )
+        result = pf(slack_event)
+
+        # PUBLIC mode for CHAT → MASK_WINDOW → title masked to app_name,
+        # domain nulled. Under INTERNAL the title would have passed through.
+        assert result is not None
+        assert result.window_title == "Slack"
+        assert result.domain is None
+
+
+# ---------------------------------------------------------------------------
+# R17: null/empty/whitespace bundle_id is fail-closed
+# ---------------------------------------------------------------------------
+
+
+class TestNullBundleIdFailClosed:
+    """Regression suite for the pre-existing fail-open at
+    ``docs/tickets/2026-03-20-fix-null-bundle-id-privacy-leak.md``.
+
+    Before R17, a window event with ``app_bundle_id=None`` reached the
+    classifier as the empty string, was classified as UNKNOWN, and most
+    modes routed UNKNOWN to ALLOW — leaking the original window title.
+    """
+
+    def test_none_bundle_id_returns_none(self, tmp_path):
+        with _public_config():
+            pf = build_privacy_filter(
+                privacy_mode="public", capture_dir=tmp_path,
+            )
+        event = _make_event(
+            bundle_id=None,
+            app_name="Passwords",
+            window_title="Passwords Passwords",
+        )
+        assert pf(event) is None
+
+    def test_empty_string_bundle_id_returns_none(self, tmp_path):
+        with _public_config():
+            pf = build_privacy_filter(
+                privacy_mode="public", capture_dir=tmp_path,
+            )
+        event = _make_event(
+            bundle_id="",
+            app_name="Passwords",
+            window_title="Passwords Passwords",
+        )
+        assert pf(event) is None
+
+    def test_whitespace_only_bundle_id_returns_none(self, tmp_path):
+        with _public_config():
+            pf = build_privacy_filter(
+                privacy_mode="public", capture_dir=tmp_path,
+            )
+        event = _make_event(
+            bundle_id="   ",
+            app_name="Passwords",
+            window_title="Passwords Passwords",
+        )
+        assert pf(event) is None
+
+    def test_cloud_factory_also_rejects_null_bundle_id(self, tmp_path):
+        """The factory inherits the fail-closed guard (it composes
+        ``build_privacy_filter`` underneath)."""
+        with _public_config():
+            pf = build_cloud_window_filter(
+                cloud_bound=True,
+                privacy_mode="internal",
+                capture_dir=tmp_path,
+            )
+        event = _make_event(
+            bundle_id=None,
+            app_name="Slack",
+            window_title="#secret-channel — Slack",
+        )
+        assert pf(event) is None
+
+
+# ---------------------------------------------------------------------------
+# Action-matrix outcomes — load-bearing architecture invariants
+# ---------------------------------------------------------------------------
+
+
+class TestActionMatrixInvariants:
+    def test_exclude_app_returns_none(self, tmp_path):
+        """1Password (PASSWORD_MANAGER) → EXCLUDE in every mode → None."""
+        with _public_config():
+            pf = build_privacy_filter(
+                privacy_mode="public", capture_dir=tmp_path,
+            )
+        event = _make_event(
+            bundle_id="com.1password.1password",
+            app_name="1Password",
+            window_title="1Password — Vault",
+        )
+        assert pf(event) is None
+
+    def test_mask_window_nulls_title_and_domain(self, tmp_path):
+        """MASK_WINDOW must replace ``window_title`` with ``app_name`` AND
+        null ``domain``. Both halves are load-bearing per
+        ``docs/architecture/export-pipeline.md:145``."""
+        with _public_config():
+            pf = build_privacy_filter(
+                privacy_mode="public", capture_dir=tmp_path,
+            )
+        event = _make_event(
+            bundle_id="com.tinyspeck.slackmacgap",
+            app_name="Slack",
+            window_title="#secret-channel — Slack",
+            domain="slack.com",
+        )
+        result = pf(event)
+        assert result is not None
+        assert result.window_title == "Slack"
+        assert result.domain is None
+        # Other fields preserved
+        assert result.app_bundle_id == "com.tinyspeck.slackmacgap"
+        assert result.window_id == "100"
+
+    def test_allow_app_passes_through_unchanged(self, tmp_path):
+        """Terminal (CODE_EDITOR_TERMINAL + INTERNAL → ALLOW) is returned
+        as-is, including the original title."""
+        with _public_config():
+            pf = build_privacy_filter(
+                privacy_mode="internal", capture_dir=tmp_path,
+            )
+        event = _make_event(
+            bundle_id="com.apple.Terminal",
+            app_name="Terminal",
+            window_title="bash — 80x24",
+        )
+        result = pf(event)
+        assert result is not None
+        assert result.window_title == "bash — 80x24"
+        assert result.app_bundle_id == "com.apple.Terminal"
+
+
+# ---------------------------------------------------------------------------
+# .menubar_overrides.json — present / absent / malformed
+# ---------------------------------------------------------------------------
+
+
+class TestMenubarOverridesLoading:
+    def test_no_overrides_file_present(self, tmp_path):
+        """Absence of ``.menubar_overrides.json`` is the common case and
+        must not raise. The filter still works via policy evaluation."""
+        assert not (tmp_path / ".menubar_overrides.json").exists()
+
+        with _public_config():
+            pf = build_privacy_filter(
+                privacy_mode="internal", capture_dir=tmp_path,
+            )
+        event = _make_event(
+            bundle_id="com.apple.Terminal",
+            app_name="Terminal",
+            window_title="bash — 80x24",
+        )
+        # Falls through to matrix → ALLOW (Terminal in INTERNAL).
+        assert pf(event) is not None
+
+    def test_malformed_overrides_file_does_not_raise(self, tmp_path):
+        """Garbage JSON in the overrides file is logged at debug and
+        ignored — the filter falls back to the policy matrix."""
+        (tmp_path / ".menubar_overrides.json").write_text(
+            "this is not valid json {"
+        )
+
+        with _public_config():
+            pf = build_privacy_filter(
+                privacy_mode="internal", capture_dir=tmp_path,
+            )
+        event = _make_event(
+            bundle_id="com.apple.Terminal",
+            app_name="Terminal",
+            window_title="bash — 80x24",
+        )
+        # No exception; filter still produces a verdict from the matrix.
+        assert pf(event) is not None
+
+    def test_capture_dir_none_skips_override_loading(self):
+        """``capture_dir=None`` skips override loading entirely (used by
+        tests and ad-hoc callers)."""
+        with _public_config():
+            pf = build_privacy_filter(
+                privacy_mode="public", capture_dir=None,
+            )
+        event = _make_event(
+            bundle_id="com.apple.Terminal",
+            app_name="Terminal",
+            window_title="bash — 80x24",
+        )
+        # Terminal under PUBLIC → TEXT_REDACT → passes through.
+        assert pf(event) is not None
+
+    def test_override_exclude_is_honored(self, tmp_path):
+        """When the overrides file marks an app as ``exclude``, the
+        filter returns None even if the matrix would have allowed it."""
+        overrides = {"com.microsoft.VSCode": "exclude"}
+        (tmp_path / ".menubar_overrides.json").write_text(json.dumps(overrides))
+
+        with _public_config():
+            pf = build_privacy_filter(
+                privacy_mode="internal", capture_dir=tmp_path,
+            )
+        event = _make_event(
+            bundle_id="com.microsoft.VSCode",
+            app_name="Visual Studio Code",
+            window_title="main.py",
+        )
+        assert pf(event) is None
+
+
+# ---------------------------------------------------------------------------
+# Integration — import paths
+# ---------------------------------------------------------------------------
+
+
+class TestImportPaths:
+    """The factory and the moved ``build_privacy_filter`` must be importable
+    from the new neutral location AND from the legacy ``screencap.exporter``
+    backward-compat re-export. Cloud callers import from
+    ``screencap.privacy.filter``; existing tests and downstream code import
+    from ``screencap.exporter``. Both paths must resolve to the same callable.
+    """
+
+    def test_import_from_privacy_filter_module(self):
+        from screencap.privacy.filter import (  # noqa: F401
+            build_cloud_window_filter,
+            build_privacy_filter,
+        )
+
+    def test_import_from_exporter_resolves_same_object(self):
+        from screencap.exporter import build_cloud_window_filter as exp_factory
+        from screencap.exporter import build_privacy_filter as exp_filter
+        from screencap.privacy.filter import (
+            build_cloud_window_filter as pf_factory,
+        )
+        from screencap.privacy.filter import build_privacy_filter as pf_filter
+        assert exp_filter is pf_filter
+        assert exp_factory is pf_factory
+
+    def test_chunk_processor_import_path_works(self):
+        """Chunk processor was updated to import from the new location."""
+        from screencap.privacy.filter import build_privacy_filter
+
+        with _public_config():
+            pf = build_privacy_filter(
+                privacy_mode="internal", cloud_intent=True,
+            )
+        assert callable(pf)
+
+
+# ---------------------------------------------------------------------------
+# Sanity: cloud_intent=True still forces PUBLIC even on direct call
+# ---------------------------------------------------------------------------
+
+
+class TestCloudIntentOverride:
+    """Verifies the load-bearing ``cloud_intent → PUBLIC`` override at
+    ``filter.py:`` is preserved verbatim from its original location at
+    ``exporter.py:142-143``. Slack is the canonical case: CHAT is
+    TEXT_REDACT under INTERNAL (passes through) but MASK_WINDOW under
+    PUBLIC (title masked)."""
+
+    def test_internal_mode_passes_chat_through(self, tmp_path):
+        with _public_config():
+            pf = build_privacy_filter(
+                privacy_mode="internal",
+                cloud_intent=False,
+                capture_dir=tmp_path,
+            )
+        event = _make_event(
+            bundle_id="com.tinyspeck.slackmacgap",
+            app_name="Slack",
+            window_title="#secret-channel — Slack",
+        )
+        result = pf(event)
+        assert result is not None
+        assert result.window_title == "#secret-channel — Slack"
+
+    def test_internal_mode_with_cloud_intent_masks_chat(self, tmp_path):
+        with _public_config():
+            pf = build_privacy_filter(
+                privacy_mode="internal",
+                cloud_intent=True,
+                capture_dir=tmp_path,
+            )
+        event = _make_event(
+            bundle_id="com.tinyspeck.slackmacgap",
+            app_name="Slack",
+            window_title="#secret-channel — Slack",
+        )
+        result = pf(event)
+        assert result is not None
+        assert result.window_title == "Slack"
+        assert result.domain is None

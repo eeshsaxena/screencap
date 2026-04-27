@@ -561,7 +561,8 @@ class ChunkProcessor:
             interleave_window_events,
             process_events,
         )
-        from screencap.exporter import build_export_metadata, build_privacy_filter
+        from screencap.exporter import build_export_metadata
+        from screencap.privacy.filter import build_privacy_filter
 
         jsonl_path = self._capture_dir / f"events_{idx:04d}.jsonl"
         if jsonl_path.exists():
