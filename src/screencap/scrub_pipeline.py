@@ -24,7 +24,12 @@ from contextlib import ExitStack
 from dataclasses import dataclass, field
 from pathlib import Path
 
-from screencap.privacy.actions import BLOCK_ACTIONS, KEYSTROKE_CONTENT_FIELDS, PrivacyAction
+from screencap.privacy.actions import (
+    BLOCK_ACTIONS,
+    KEYSTROKE_CONTENT_FIELDS,
+    SCRUB_BLOCK_ACTIONS,
+    PrivacyAction,
+)
 from screencap.privacy.policy import DEFAULT_TRANSITION_HOLD_SECONDS
 from screencap.privacy.reasons import AuditEntry, ReasonCode
 from screencap.recording_db import Connection, has_column, has_table, open_recording_db
@@ -149,11 +154,22 @@ def build_blocked_intervals(
     window_events,
     evaluator,
     classifier,
+    *,
+    actions: frozenset[PrivacyAction] = BLOCK_ACTIONS,
 ) -> list[BlockedInterval]:
-    """Build intervals where the frontmost app triggers EXCLUDE.
+    """Build intervals where the frontmost app triggers a blocking action.
 
     Each window event defines a period from its timestamp to the next
     window event's timestamp (or infinity for the last event).
+
+    Args:
+        window_events: Ordered list of WindowContext.
+        evaluator: Policy evaluator that returns ActionDecision per frame.
+        classifier: Context classifier mapping frames to ContextClass.
+        actions: Set of PrivacyActions that mark an interval as blocked.
+            Defaults to BLOCK_ACTIONS (screenshot capture-time semantics, just
+            EXCLUDE). Pass SCRUB_BLOCK_ACTIONS for scrub-time pointer
+            suppression (EXCLUDE/MASK_WINDOW/TEXT_REDACT/OCR_FALLBACK).
     """
     from screencap.privacy.policy import FrameMetadata
 
@@ -179,7 +195,7 @@ def build_blocked_intervals(
         ctx = classifier.classify(meta)
         decision = evaluator.evaluate(ctx, meta)
 
-        if decision.action in BLOCK_ACTIONS:
+        if decision.action in actions:
             intervals.append(
                 BlockedInterval(
                     start=we.timestamp,
@@ -604,10 +620,15 @@ def build_scrub_context(
                 except Exception:
                     logger.debug("Failed to load window events", exc_info=True)
 
-            # Build blocked-app intervals
+            # Build blocked-app intervals using scrub-time action set.
+            # SCRUB_BLOCK_ACTIONS expands beyond capture-time BLOCK_ACTIONS
+            # to also cover MASK_WINDOW/TEXT_REDACT/OCR_FALLBACK so that
+            # mouse pointer geometry inside redacted/masked content is
+            # suppressed in cloud-bound JSONL (R6/R12).
             if evaluator is not None and classifier is not None and ctx.window_events:
                 ctx.blocked_intervals = build_blocked_intervals(
                     ctx.window_events, evaluator, classifier,
+                    actions=SCRUB_BLOCK_ACTIONS,
                 )
 
             # Build secure-field intervals
@@ -929,8 +950,34 @@ def scrub_events_jsonl(
                 outfile.write(json.dumps(event, ensure_ascii=False) + "\n")
                 continue
 
-            # Check blocked-app intervals
+            # R6/R12: Drop standalone mouse.move events whose timestamp falls
+            # in a blocked interval (SCRUB_BLOCK_ACTIONS). Pointer geometry
+            # leaks coarse interaction patterns inside redacted/masked content
+            # — coordinates on retained events are unaffected.
             event_ts = event.get("timestamp", 0.0)
+            if event.get("type") == "mouse.move":
+                if find_blocked_interval(event_ts, _blocked, blocked_starts) is not None:
+                    continue
+
+            # R6/R12: Filter mouse.move children of mouse.drag events whose
+            # timestamps fall in blocked intervals. The drag itself is
+            # retained (its content is nulled below if the drag is in a
+            # blocked interval); only the in-interval mouse.move waypoints
+            # are dropped from its children list.
+            if event.get("type") == "mouse.drag" and _blocked:
+                children = event.get("children")
+                if children:
+                    event["children"] = [
+                        c for c in children
+                        if not (
+                            c.get("type") == "mouse.move"
+                            and find_blocked_interval(
+                                c.get("timestamp", 0.0), _blocked, blocked_starts,
+                            ) is not None
+                        )
+                    ]
+
+            # Check blocked-app intervals
             blocked = find_blocked_interval(event_ts, _blocked, blocked_starts)
             if blocked is not None:
                 null_event_content(event)

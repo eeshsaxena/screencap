@@ -52,6 +52,18 @@ KEYSTROKE_NULL_ACTIONS = frozenset({PrivacyAction.EXCLUDE, PrivacyAction.MASK_WI
 # is out of scope, so both EXCLUDE and MASK_WINDOW drop video frames.
 VIDEO_BLOCK_ACTIONS = frozenset({PrivacyAction.EXCLUDE, PrivacyAction.MASK_WINDOW})
 
+# Privacy actions that suppress mouse pointer geometry at scrub time.
+# Distinct from BLOCK_ACTIONS (screenshot capture-time) — pointer geometry
+# leaks coarse interaction patterns inside redacted/masked content
+# (which terminal line was being edited, which credentials field was being
+# hovered, browsing patterns inside unverified tabs).
+SCRUB_BLOCK_ACTIONS = frozenset({
+    PrivacyAction.EXCLUDE,
+    PrivacyAction.MASK_WINDOW,
+    PrivacyAction.TEXT_REDACT,
+    PrivacyAction.OCR_FALLBACK,
+})
+
 
 # Keystroke content fields to null when blocking.
 # Single source of truth used by both recorder_enforcement (capture-time)

@@ -894,3 +894,404 @@ class TestActiveWindowRoi:
         assert h == pytest.approx(0.5)   # 300/600
         # Y-flipped: y1=300/600=0.5, roi_y=1.0-0.5-0.5=0.0
         assert y == pytest.approx(0.0)
+
+
+# ---------------------------------------------------------------------------
+# Unit 2 (R6/R12): Pointer-coordinate suppression in SCRUB_BLOCK_ACTIONS
+# intervals — drop in-interval mouse.move events from cloud-bound JSONL
+# ---------------------------------------------------------------------------
+
+
+def _make_move(ts: float, x: float = 100.0, y: float = 200.0) -> dict:
+    return {"type": "mouse.move", "timestamp": ts, "x": x, "y": y, "path": []}
+
+
+def _read_events(path: Path) -> list[dict]:
+    return [json.loads(l) for l in path.read_text().splitlines() if l.strip()]
+
+
+def _scrub_with_intervals(
+    tmp_path: Path,
+    events: list[dict],
+    intervals: list[BlockedInterval],
+    *,
+    xref: list[ElementStateDetection] | None = None,
+) -> tuple[list[dict], ScrubResult]:
+    """Helper: write events JSONL, run scrub_events_jsonl, return scrubbed events."""
+    pipeline, anonymizer = _make_pipeline()
+    events_path = tmp_path / "events_0000.jsonl"
+    _write_events_jsonl(events_path, events)
+    ctx = ScrubContext(
+        blocked_intervals=intervals,
+        xref_detections=xref or [],
+    )
+    result = ScrubResult()
+    scrub_events_jsonl(
+        events_path, pipeline, anonymizer,
+        ctx=ctx, result=result,
+    )
+    return _read_events(events_path), result
+
+
+class TestMouseMoveSuppression:
+    """R6/R12: drop in-interval mouse.move events at scrub time."""
+
+    def test_mask_window_drops_in_interval_mouse_moves(self, tmp_path):
+        """Moves before/during/after a MASK_WINDOW interval — only in-interval dropped."""
+        events = [
+            _make_move(900.0),   # before
+            _make_move(1005.0),  # in interval
+            _make_move(1007.0),  # in interval
+            _make_move(1100.0),  # after
+        ]
+        intervals = [
+            BlockedInterval(
+                start=1000.0, end=1010.0,
+                action=PrivacyAction.MASK_WINDOW,
+                reason=ReasonCode.POLICY_MODE_DEFAULT,
+            ),
+        ]
+        scrubbed, _ = _scrub_with_intervals(tmp_path, events, intervals)
+
+        # Filter out the meta header (line 0)
+        moves = [e for e in scrubbed if e.get("type") == "mouse.move"]
+        timestamps = sorted(e["timestamp"] for e in moves)
+        assert timestamps == [900.0, 1100.0]
+
+    def test_exclude_drops_moves_and_nulls_keystrokes(self, tmp_path):
+        """EXCLUDE interval — moves dropped, keystroke content nulled (existing)."""
+        events = [
+            _make_move(1005.0),   # in interval — dropped
+            {
+                "type": "key.type",
+                "timestamp": 1006.0,
+                "text": "secret",
+                "children": [
+                    {"type": "key.down", "timestamp": 1006.0, "key_char": "s"},
+                ],
+            },
+            _make_move(1100.0),   # after — kept
+        ]
+        intervals = [
+            BlockedInterval(
+                start=1000.0, end=1010.0,
+                action=PrivacyAction.EXCLUDE,
+                reason=ReasonCode.POLICY_EXCLUDED_APP,
+            ),
+        ]
+        scrubbed, _ = _scrub_with_intervals(tmp_path, events, intervals)
+
+        moves = [e for e in scrubbed if e.get("type") == "mouse.move"]
+        assert [m["timestamp"] for m in moves] == [1100.0]
+
+        keys = [e for e in scrubbed if e.get("type") == "key.type"]
+        assert len(keys) == 1
+        assert keys[0]["text"] is None
+        assert keys[0]["children"][0]["key_char"] is None
+
+    def test_text_redact_drops_in_interval_moves(self, tmp_path):
+        """TEXT_REDACT interval — moves dropped (validates expanded set)."""
+        events = [
+            _make_move(900.0),
+            _make_move(1005.0),
+            _make_move(1100.0),
+        ]
+        intervals = [
+            BlockedInterval(
+                start=1000.0, end=1010.0,
+                action=PrivacyAction.TEXT_REDACT,
+                reason=ReasonCode.POLICY_MODE_DEFAULT,
+            ),
+        ]
+        scrubbed, _ = _scrub_with_intervals(tmp_path, events, intervals)
+
+        moves = [e for e in scrubbed if e.get("type") == "mouse.move"]
+        assert sorted(m["timestamp"] for m in moves) == [900.0, 1100.0]
+
+    def test_ocr_fallback_drops_in_interval_moves(self, tmp_path):
+        """OCR_FALLBACK interval — moves dropped."""
+        events = [
+            _make_move(1005.0),
+            _make_move(2005.0),
+        ]
+        intervals = [
+            BlockedInterval(
+                start=1000.0, end=1500.0,
+                action=PrivacyAction.OCR_FALLBACK,
+                reason=ReasonCode.POLICY_MODE_DEFAULT,
+            ),
+        ]
+        scrubbed, _ = _scrub_with_intervals(tmp_path, events, intervals)
+
+        moves = [e for e in scrubbed if e.get("type") == "mouse.move"]
+        assert [m["timestamp"] for m in moves] == [2005.0]
+
+    def test_drag_in_interval_keeps_drag_drops_move_children(self, tmp_path):
+        """mouse.drag with mouse.move children — children dropped, drag retained."""
+        events = [
+            {
+                "type": "mouse.drag",
+                "timestamp": 1005.0,
+                "x": 100.0,
+                "y": 200.0,
+                "dx": 50.0,
+                "dy": 30.0,
+                "button": "left",
+                "children": [
+                    {
+                        "type": "mouse.down",
+                        "timestamp": 1005.0,
+                        "x": 100.0, "y": 200.0,
+                        "button": "left",
+                    },
+                    _make_move(1005.5, 110.0, 210.0),  # in-interval child
+                    _make_move(1006.0, 130.0, 220.0),  # in-interval child
+                    {
+                        "type": "mouse.up",
+                        "timestamp": 1007.0,
+                        "x": 150.0, "y": 230.0,
+                        "button": "left",
+                    },
+                ],
+            },
+        ]
+        intervals = [
+            BlockedInterval(
+                start=1000.0, end=1010.0,
+                action=PrivacyAction.MASK_WINDOW,
+                reason=ReasonCode.POLICY_MODE_DEFAULT,
+            ),
+        ]
+        scrubbed, _ = _scrub_with_intervals(tmp_path, events, intervals)
+
+        drags = [e for e in scrubbed if e.get("type") == "mouse.drag"]
+        assert len(drags) == 1, "mouse.drag itself must be retained"
+        child_types = [c.get("type") for c in drags[0]["children"]]
+        assert "mouse.move" not in child_types, "in-interval mouse.move children dropped"
+        # mouse.down and mouse.up children retained
+        assert child_types == ["mouse.down", "mouse.up"]
+
+    def test_drag_outside_interval_keeps_all_children(self, tmp_path):
+        """drag with mouse.move children outside any blocked interval — all kept."""
+        events = [
+            {
+                "type": "mouse.drag",
+                "timestamp": 2000.0,
+                "x": 100.0, "y": 200.0,
+                "dx": 50.0, "dy": 30.0,
+                "button": "left",
+                "children": [
+                    _make_move(2000.5, 110.0, 210.0),
+                    _make_move(2001.0, 130.0, 220.0),
+                ],
+            },
+        ]
+        intervals = [
+            BlockedInterval(
+                start=1000.0, end=1010.0,
+                action=PrivacyAction.MASK_WINDOW,
+                reason=ReasonCode.POLICY_MODE_DEFAULT,
+            ),
+        ]
+        scrubbed, _ = _scrub_with_intervals(tmp_path, events, intervals)
+
+        drags = [e for e in scrubbed if e.get("type") == "mouse.drag"]
+        assert len(drags) == 1
+        child_types = [c.get("type") for c in drags[0]["children"]]
+        assert child_types.count("mouse.move") == 2, "moves outside intervals retained"
+
+    def test_empty_intervals_no_drops(self, tmp_path):
+        """Empty intervals list — no events dropped (regression check)."""
+        events = [
+            _make_move(900.0),
+            _make_move(1005.0),
+            _make_move(1100.0),
+        ]
+        scrubbed, _ = _scrub_with_intervals(tmp_path, events, [])
+
+        moves = [e for e in scrubbed if e.get("type") == "mouse.move"]
+        assert sorted(m["timestamp"] for m in moves) == [900.0, 1005.0, 1100.0]
+
+    def test_all_events_outside_intervals_unchanged(self, tmp_path):
+        """All events outside blocked intervals — output identical (no side effect)."""
+        events = [
+            _make_move(900.0),
+            _make_move(950.0),
+            {
+                "type": "mouse.singleclick",
+                "timestamp": 970.0,
+                "x": 100.0, "y": 200.0,
+                "button": "left",
+                "children": [],
+            },
+        ]
+        intervals = [
+            BlockedInterval(
+                start=2000.0, end=3000.0,
+                action=PrivacyAction.EXCLUDE,
+                reason=ReasonCode.POLICY_EXCLUDED_APP,
+            ),
+        ]
+        scrubbed, _ = _scrub_with_intervals(tmp_path, events, intervals)
+
+        # All 3 events written + meta header
+        non_meta = [e for e in scrubbed if not e.get("_meta")]
+        assert len(non_meta) == 3
+        moves = [e for e in non_meta if e.get("type") == "mouse.move"]
+        assert sorted(m["timestamp"] for m in moves) == [900.0, 950.0]
+
+    def test_allow_action_does_not_drop_moves(self, tmp_path):
+        """ALLOW interval — no events dropped (ALLOW not in SCRUB_BLOCK_ACTIONS).
+
+        The scrubber's blocked_intervals list is built from SCRUB_BLOCK_ACTIONS,
+        so ALLOW frames never produce a BlockedInterval. We assert this
+        invariant by verifying the dropping logic only triggers on intervals
+        that are present — an ALLOW frame produces no interval, so its
+        timestamps aren't dropped.
+        """
+        # No intervals are produced for ALLOW frames; this test verifies
+        # that the find_blocked_interval lookup never matches.
+        events = [
+            _make_move(1005.0),
+            _make_move(1006.0),
+        ]
+        scrubbed, _ = _scrub_with_intervals(tmp_path, events, [])
+
+        moves = [e for e in scrubbed if e.get("type") == "mouse.move"]
+        assert len(moves) == 2
+
+    def test_mouse_move_at_interval_boundaries(self, tmp_path):
+        """Boundary timestamps follow half-open [start, end) convention."""
+        events = [
+            _make_move(999.999),   # just before — kept
+            _make_move(1000.0),    # exactly at start — dropped (start is inclusive)
+            _make_move(1009.999),  # just before end — dropped
+            _make_move(1010.0),    # exactly at end — kept (end is exclusive)
+        ]
+        intervals = [
+            BlockedInterval(
+                start=1000.0, end=1010.0,
+                action=PrivacyAction.MASK_WINDOW,
+                reason=ReasonCode.POLICY_MODE_DEFAULT,
+            ),
+        ]
+        scrubbed, _ = _scrub_with_intervals(tmp_path, events, intervals)
+
+        moves = [e for e in scrubbed if e.get("type") == "mouse.move"]
+        timestamps = sorted(m["timestamp"] for m in moves)
+        assert timestamps == [999.999, 1010.0]
+
+    def test_non_mouse_move_in_interval_still_nulled_not_dropped(self, tmp_path):
+        """Non-mouse.move events in blocked intervals → content nulled, event retained."""
+        events = [
+            {
+                "type": "key.type",
+                "timestamp": 1005.0,
+                "text": "secret",
+                "children": [
+                    {"type": "key.down", "timestamp": 1005.0, "key_char": "s"},
+                ],
+            },
+            {
+                "type": "mouse.singleclick",
+                "timestamp": 1006.0,
+                "x": 100.0, "y": 200.0,
+                "button": "left",
+                "children": [],
+            },
+        ]
+        intervals = [
+            BlockedInterval(
+                start=1000.0, end=1010.0,
+                action=PrivacyAction.EXCLUDE,
+                reason=ReasonCode.POLICY_EXCLUDED_APP,
+            ),
+        ]
+        scrubbed, _ = _scrub_with_intervals(tmp_path, events, intervals)
+
+        non_meta = [e for e in scrubbed if not e.get("_meta")]
+        assert len(non_meta) == 2  # both retained
+        key = next(e for e in non_meta if e["type"] == "key.type")
+        assert key["text"] is None
+        click = next(e for e in non_meta if e["type"] == "mouse.singleclick")
+        # Click coords are NOT touched (R6 only drops moves; clicks pass through)
+        assert click["x"] == 100.0
+
+
+class TestSCRUBBlockActionsIntegration:
+    """Verify SCRUB_BLOCK_ACTIONS expanded set is used by build_scrub_context."""
+
+    def test_text_redact_app_produces_blocked_interval_via_context(self, tmp_path):
+        """build_scrub_context → SCRUB_BLOCK_ACTIONS → TEXT_REDACT app intervals exist."""
+        from screencap.privacy.context import DefaultContextClassifier
+        from screencap.privacy.policy import (
+            DefaultPolicyEvaluator,
+            parse_privacy_config,
+        )
+
+        db_path = tmp_path / "recording.db"
+        _create_recording_db(
+            db_path,
+            window_events=[
+                # VSCode → CODE_EDITOR_TERMINAL → TEXT_REDACT under PUBLIC mode
+                {"timestamp": 1000.0, "app_bundle_id": "com.microsoft.VSCode"},
+                {"timestamp": 2000.0, "app_bundle_id": "com.apple.finder"},
+            ],
+        )
+
+        cfg = parse_privacy_config({"privacy": {"mode": "public"}})
+        evaluator = DefaultPolicyEvaluator(cfg)
+        classifier = DefaultContextClassifier()
+
+        ctx = build_scrub_context(db_path, evaluator, classifier)
+
+        # Under PUBLIC mode VSCode is TEXT_REDACT, which is in
+        # SCRUB_BLOCK_ACTIONS. With the old BLOCK_ACTIONS (EXCLUDE only),
+        # there would be zero intervals. Now there must be one covering the
+        # VSCode timestamp range.
+        assert any(
+            iv.start == 1000.0 and iv.action == PrivacyAction.TEXT_REDACT
+            for iv in ctx.blocked_intervals
+        ), f"Expected TEXT_REDACT interval, got {ctx.blocked_intervals!r}"
+
+    def test_build_blocked_intervals_default_unchanged(self):
+        """Default actions=BLOCK_ACTIONS preserves screenshot-only semantics.
+
+        Regression check: callers that pass no actions kwarg get the
+        capture-time semantics (only EXCLUDE → blocked). This is what
+        test_domain_propagation.py and test_scrubber_policy.py rely on.
+        """
+        from screencap.privacy.context import (
+            DefaultContextClassifier,
+            WindowContext,
+        )
+        from screencap.privacy.policy import (
+            DefaultPolicyEvaluator,
+            parse_privacy_config,
+        )
+        from screencap.scrub_pipeline import build_blocked_intervals
+
+        cfg = parse_privacy_config({"privacy": {"mode": "public"}})
+        evaluator = DefaultPolicyEvaluator(cfg)
+        classifier = DefaultContextClassifier()
+
+        # VSCode → TEXT_REDACT under PUBLIC mode (not in default BLOCK_ACTIONS)
+        events = [
+            WindowContext(
+                timestamp=1.0,
+                app_bundle_id="com.microsoft.VSCode",
+                title="main.py",
+            ),
+        ]
+
+        # Default actions=BLOCK_ACTIONS — TEXT_REDACT does NOT match
+        intervals_default = build_blocked_intervals(events, evaluator, classifier)
+        assert intervals_default == []
+
+        # Explicit actions=SCRUB_BLOCK_ACTIONS — TEXT_REDACT DOES match
+        from screencap.privacy.actions import SCRUB_BLOCK_ACTIONS as _SBA
+        intervals_scrub = build_blocked_intervals(
+            events, evaluator, classifier, actions=_SBA,
+        )
+        assert len(intervals_scrub) == 1
+        assert intervals_scrub[0].action == PrivacyAction.TEXT_REDACT
