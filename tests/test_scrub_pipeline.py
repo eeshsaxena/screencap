@@ -1305,6 +1305,228 @@ class TestMaskRegionPointerSuppression:
         assert "mouse.move" not in child_types, "move children dropped"
 
 
+class TestMergedMouseMoveTimeRangeLeak:
+    """P1: ``merge_consecutive_mouse_move_events`` collapses a run of raw
+    moves into one event whose ``timestamp`` is the START of the run and
+    ``last_timestamp`` is the END. Pre-fix, the scrub layer's drop check
+    used ``find_blocked_interval(timestamp)`` — a point lookup at the START
+    timestamp — so a merge that began BEFORE a blocked interval but ended
+    INSIDE it (e.g. window switch into Slack mid-drag) slipped past the
+    drop check. The merged event then leaked coordinates from inside the
+    sensitive interval via ``path`` waypoints / ``x``/``y`` (last position).
+
+    The fix adds ``last_timestamp`` to ``MouseMoveEvent`` and switches the
+    drop check to a range-overlap test — any merge whose ``[timestamp,
+    last_timestamp]`` span intersects a blocked interval is dropped.
+    """
+
+    def _make_merged_move(
+        self,
+        ts: float,
+        last_ts: float,
+        path: list[tuple[float, float]],
+    ) -> dict:
+        """Build a merged mouse.move JSONL event mimicking what
+        ``merge_consecutive_mouse_move_events`` produces."""
+        last_x, last_y = path[-1]
+        return {
+            "type": "mouse.move",
+            "timestamp": ts,
+            "last_timestamp": last_ts,
+            "x": last_x,
+            "y": last_y,
+            "path": path,
+        }
+
+    def test_merged_move_spanning_into_interval_dropped(self, tmp_path):
+        """Regression: merged move whose ``timestamp`` lies BEFORE a blocked
+        interval but whose ``last_timestamp`` lies INSIDE it must be DROPPED.
+
+        Pre-fix this would have leaked coordinates inside the interval
+        (the path waypoint at (210, 310) and the final x/y) via the
+        ``find_blocked_interval(0.9)`` returning None — point lookup misses
+        the merge tail crossing the boundary.
+        """
+        events = [
+            self._make_merged_move(
+                ts=0.9,
+                last_ts=1.10,
+                path=[(100.0, 200.0), (210.0, 310.0), (220.0, 320.0)],
+            ),
+        ]
+        intervals = [
+            BlockedInterval(
+                start=1.0, end=1.2,
+                action=PrivacyAction.MASK_WINDOW,
+                reason=ReasonCode.POLICY_MODE_DEFAULT,
+            ),
+        ]
+        scrubbed, _ = _scrub_with_intervals(tmp_path, events, intervals)
+
+        moves = [e for e in scrubbed if e.get("type") == "mouse.move"]
+        assert moves == [], (
+            "Merged move spanning into MASK_WINDOW interval must be dropped; "
+            "leaking the in-interval path waypoint and last (x, y) violates the "
+            "cloud-bound pointer-suppression guarantee."
+        )
+
+    def test_merged_move_entirely_before_interval_retained(self, tmp_path):
+        """Negative: merged move ending BEFORE the blocked interval starts
+        is retained — the merged span doesn't intersect any block."""
+        events = [
+            self._make_merged_move(
+                ts=0.9,
+                last_ts=0.95,
+                path=[(100.0, 200.0), (110.0, 210.0)],
+            ),
+        ]
+        intervals = [
+            BlockedInterval(
+                start=1.0, end=1.2,
+                action=PrivacyAction.MASK_WINDOW,
+                reason=ReasonCode.POLICY_MODE_DEFAULT,
+            ),
+        ]
+        scrubbed, _ = _scrub_with_intervals(tmp_path, events, intervals)
+
+        moves = [e for e in scrubbed if e.get("type") == "mouse.move"]
+        assert len(moves) == 1
+        assert moves[0]["timestamp"] == 0.9
+
+    def test_unmerged_single_move_outside_interval_retained(self, tmp_path):
+        """Negative: a single (unmerged) move with no ``last_timestamp``
+        outside any interval is retained. Confirms the helper degenerates
+        to a point-lookup when ``last_timestamp`` is missing."""
+        events = [_make_move(0.9)]  # no last_timestamp field
+        intervals = [
+            BlockedInterval(
+                start=1.0, end=1.2,
+                action=PrivacyAction.MASK_WINDOW,
+                reason=ReasonCode.POLICY_MODE_DEFAULT,
+            ),
+        ]
+        scrubbed, _ = _scrub_with_intervals(tmp_path, events, intervals)
+
+        moves = [e for e in scrubbed if e.get("type") == "mouse.move"]
+        assert len(moves) == 1
+        assert moves[0]["timestamp"] == 0.9
+        assert "last_timestamp" not in moves[0] or moves[0].get("last_timestamp") is None
+
+    def test_drag_child_merged_move_spanning_into_interval_dropped(self, tmp_path):
+        """Drag children: an inline merged ``mouse.move`` child whose span
+        crosses into a blocked interval is dropped from ``children``.
+        Same range-overlap semantics as the standalone drop check."""
+        merged_child_in = self._make_merged_move(
+            ts=0.9,
+            last_ts=1.10,
+            path=[(100.0, 200.0), (210.0, 310.0)],
+        )
+        merged_child_out = self._make_merged_move(
+            ts=0.5,
+            last_ts=0.6,
+            path=[(50.0, 50.0), (55.0, 55.0)],
+        )
+        events = [
+            {
+                "type": "mouse.drag",
+                "timestamp": 0.4,
+                "x": 50.0, "y": 50.0,
+                "dx": 200.0, "dy": 270.0,
+                "button": "left",
+                "children": [
+                    {
+                        "type": "mouse.down",
+                        "timestamp": 0.4,
+                        "x": 50.0, "y": 50.0,
+                        "button": "left",
+                    },
+                    merged_child_out,  # entirely before interval — kept
+                    merged_child_in,   # spans into interval — dropped
+                    {
+                        "type": "mouse.up",
+                        "timestamp": 1.3,
+                        "x": 220.0, "y": 320.0,
+                        "button": "left",
+                    },
+                ],
+            },
+        ]
+        intervals = [
+            BlockedInterval(
+                start=1.0, end=1.2,
+                action=PrivacyAction.MASK_WINDOW,
+                reason=ReasonCode.POLICY_MODE_DEFAULT,
+            ),
+        ]
+        scrubbed, _ = _scrub_with_intervals(tmp_path, events, intervals)
+
+        drags = [e for e in scrubbed if e.get("type") == "mouse.drag"]
+        assert len(drags) == 1, "drag retained"
+        children = drags[0]["children"]
+        # The merged_child_out (0.5, 0.6) is retained; merged_child_in (0.9, 1.10) dropped
+        move_children = [c for c in children if c.get("type") == "mouse.move"]
+        assert len(move_children) == 1, (
+            "merged drag child spanning into blocked interval must be dropped"
+        )
+        assert move_children[0]["timestamp"] == 0.5
+
+    def test_merged_move_last_timestamp_at_interval_start_boundary_retained(
+        self, tmp_path,
+    ):
+        """Boundary: merged move whose ``last_timestamp`` lands EXACTLY on
+        an interval ``start_ts`` is RETAINED (half-open ``[start, end)``
+        convention — start is inclusive for events AT the boundary, but
+        a move ending AT the boundary did not cross into the interval)."""
+        events = [
+            self._make_merged_move(
+                ts=0.9,
+                last_ts=1.0,  # exactly at interval start
+                path=[(100.0, 200.0), (110.0, 210.0)],
+            ),
+        ]
+        intervals = [
+            BlockedInterval(
+                start=1.0, end=1.2,
+                action=PrivacyAction.MASK_WINDOW,
+                reason=ReasonCode.POLICY_MODE_DEFAULT,
+            ),
+        ]
+        scrubbed, _ = _scrub_with_intervals(tmp_path, events, intervals)
+
+        moves = [e for e in scrubbed if e.get("type") == "mouse.move"]
+        assert len(moves) == 1, (
+            "merged move ending exactly at interval start (half-open boundary) "
+            "must be retained"
+        )
+
+    def test_merged_move_last_timestamp_just_past_interval_start_dropped(
+        self, tmp_path,
+    ):
+        """Boundary: merged move whose ``last_timestamp`` is one millisecond
+        PAST the interval start is DROPPED — the move tail crossed into
+        the blocked interval and may carry in-interval coordinates."""
+        events = [
+            self._make_merged_move(
+                ts=0.9,
+                last_ts=1.001,  # one ms past interval start
+                path=[(100.0, 200.0), (110.0, 210.0)],
+            ),
+        ]
+        intervals = [
+            BlockedInterval(
+                start=1.0, end=1.2,
+                action=PrivacyAction.MASK_WINDOW,
+                reason=ReasonCode.POLICY_MODE_DEFAULT,
+            ),
+        ]
+        scrubbed, _ = _scrub_with_intervals(tmp_path, events, intervals)
+
+        moves = [e for e in scrubbed if e.get("type") == "mouse.move"]
+        assert moves == [], (
+            "merged move whose last_timestamp crosses into interval must be dropped"
+        )
+
+
 class TestDragCoordinateNulling:
     """Todo 003: ``null_event_content`` must zero mouse coordinate fields
     on retained mouse events (drag/click/scroll/etc.) inside a

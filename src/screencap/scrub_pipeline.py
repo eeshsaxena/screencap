@@ -345,6 +345,55 @@ def find_blocked_interval(
     return None
 
 
+def _interval_intersects(
+    start_ts: float,
+    end_ts: float,
+    intervals: list[BlockedInterval],
+    _starts: list[float] | None = None,
+) -> BlockedInterval | None:
+    """Return any blocked interval that intersects ``[start_ts, end_ts]``.
+
+    Used by the scrub layer to drop ``mouse.move`` events whose merged span
+    crosses into a blocked interval. ``merge_consecutive_mouse_move_events``
+    collapses runs of raw moves into a single event whose ``timestamp`` is
+    the start and ``last_timestamp`` the end — a point-lookup at the start
+    timestamp would miss merges that begin before a blocked interval and end
+    inside it (the leak this helper closes).
+
+    Half-open overlap semantics matching ``find_blocked_interval``: an
+    interval ``[i.start, i.end)`` intersects the move span if
+    ``i.start <= end_ts AND i.end > start_ts``. A move whose ``end_ts``
+    lands exactly on ``i.start`` does NOT intersect (boundary excluded,
+    consistent with the half-open ``find_blocked_interval`` convention),
+    while ``end_ts > i.start`` does (the move tail crossed the boundary).
+
+    For unmerged moves, callers should pass ``end_ts == start_ts`` — this
+    degenerates to a point lookup matching ``find_blocked_interval``
+    semantics.
+    """
+    if not intervals:
+        return None
+    if _starts is None:
+        _starts = [iv.start for iv in intervals]
+
+    # Cheap path: if the start timestamp is inside an interval, return it.
+    hit = find_blocked_interval(start_ts, intervals, _starts)
+    if hit is not None:
+        return hit
+
+    # Otherwise look for an interval starting after start_ts but before end_ts
+    # (the merge spans into a later blocked interval). bisect_right returns
+    # the first index whose start > start_ts; we walk forward checking
+    # i.start < end_ts (the move tail enters the interval before the head
+    # of the move tail). Half-open: i.start == end_ts does not intersect.
+    if end_ts <= start_ts:
+        return None
+    idx = bisect.bisect_right(_starts, start_ts)
+    if idx < len(intervals) and intervals[idx].start < end_ts:
+        return intervals[idx]
+    return None
+
+
 def null_event_content(event: dict) -> None:
     """Null out sensitive content fields in an event dict in-place (recursive).
 
@@ -973,20 +1022,34 @@ def scrub_events_jsonl(
                 outfile.write(json.dumps(event, ensure_ascii=False) + "\n")
                 continue
 
-            # R6/R12: Drop standalone mouse.move events whose timestamp falls
-            # in a blocked interval (SCRUB_BLOCK_ACTIONS). Pointer geometry
-            # leaks coarse interaction patterns inside redacted/masked content
-            # — coordinates on retained events are unaffected.
+            # R6/R12: Drop standalone mouse.move events whose merged span
+            # crosses a blocked interval (SCRUB_BLOCK_ACTIONS). Pointer
+            # geometry leaks coarse interaction patterns inside redacted/
+            # masked content — coordinates on retained events are unaffected.
+            #
+            # ``last_timestamp`` is set by ``merge_consecutive_mouse_move_events``
+            # when a run of moves is collapsed; the range check covers the
+            # case where the merge START lands BEFORE a blocked interval but
+            # the merge END (last waypoint) lands INSIDE it. Pre-fix, the
+            # point-lookup at ``timestamp`` slipped these merged events past
+            # the drop check and leaked in-interval coordinates via ``path``
+            # waypoints / ``x``/``y`` (last position).
             event_ts = event.get("timestamp", 0.0)
             if event.get("type") == "mouse.move":
-                if find_blocked_interval(event_ts, _blocked, blocked_starts) is not None:
+                end_ts = event.get("last_timestamp")
+                if end_ts is None:
+                    end_ts = event_ts
+                if _interval_intersects(
+                    event_ts, end_ts, _blocked, blocked_starts,
+                ) is not None:
                     continue
 
             # R6/R12: Filter mouse.move children of mouse.drag events whose
-            # timestamps fall in blocked intervals. The drag itself is
+            # merged span crosses blocked intervals. The drag itself is
             # retained (its content is nulled below if the drag is in a
-            # blocked interval); only the in-interval mouse.move waypoints
-            # are dropped from its children list.
+            # blocked interval); only in-interval mouse.move waypoints
+            # are dropped from its children list. Same range-overlap
+            # semantics as the standalone drop above.
             if event.get("type") == "mouse.drag" and _blocked:
                 children = event.get("children")
                 if children:
@@ -994,8 +1057,13 @@ def scrub_events_jsonl(
                         c for c in children
                         if not (
                             c.get("type") == "mouse.move"
-                            and find_blocked_interval(
-                                c.get("timestamp", 0.0), _blocked, blocked_starts,
+                            and _interval_intersects(
+                                c.get("timestamp", 0.0),
+                                c.get("last_timestamp")
+                                    if c.get("last_timestamp") is not None
+                                    else c.get("timestamp", 0.0),
+                                _blocked,
+                                blocked_starts,
                             ) is not None
                         )
                     ]
