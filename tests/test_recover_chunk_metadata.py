@@ -554,6 +554,95 @@ class TestOlderSchemaWithoutWindowEventTable:
         )
 
 
+class TestPerRecordingClickThresholds:
+    """P2 regression: recovery must use the recording's per-recording
+    click thresholds, not the engine defaults.
+
+    Pre-fix, ``_recover_chunk_metadata`` called ``unified_export_events``
+    without ``double_click_interval``/``double_click_distance``, so the
+    callable used the default 0.5s/5px thresholds regardless of what the
+    recording.db row recorded. For recordings that overrode the defaults
+    (e.g. ``double_click_interval_seconds=0.3``), recovery emitted
+    different click merges than the live chunk processor, breaking the
+    byte-identical contract on the recovered JSONL.
+
+    See ``tests/test_unified_export_contract.py::TestNonDefaultThresholds
+    Agreement`` for the cross-caller contract assertion. This test pins
+    the recovery-only behaviour: at a 0.3s threshold, two clicks 0.4s
+    apart MUST yield two ``mouse.singleclick`` events, not a
+    ``mouse.doubleclick``.
+    """
+
+    def test_recovery_respects_per_recording_double_click_interval(
+        self, recording_db,
+    ):
+        """Recording with interval=0.3s + two clicks 0.4s apart yields two
+        singleclicks. Pre-fix this would have produced one doubleclick.
+        """
+        from sqlalchemy import text
+
+        from screencap.cli import _recover_chunk_metadata
+        from screencap.engine.db import crud
+
+        capture_dir = _capture_dir(recording_db)
+        _stub_chunk_video(capture_dir, 0)
+
+        # Override the fixture's default 0.5s threshold to a strict 0.3s.
+        # The threshold columns are nullable; rewriting the row matches
+        # what the engine's recorder would do for a user with a custom
+        # config.toml double_click_interval_seconds.
+        with recording_db.engine.begin() as conn:
+            conn.execute(
+                text(
+                    "UPDATE recording SET "
+                    "double_click_interval_seconds = 0.3, "
+                    "double_click_distance_pixels = 5.0"
+                ),
+            )
+
+        # Two click pairs 0.4s apart (gap between MouseDowns = 0.4s).
+        # Default threshold (0.5s) would merge → one doubleclick.
+        # Per-recording 0.3s threshold should NOT merge → two singleclicks.
+        ts = recording_db.recording.timestamp
+        for offset in (0.10, 0.50):
+            crud.insert_action_event(
+                recording_db.session, recording_db.recording, ts + offset,
+                {
+                    "name": "click",
+                    "mouse_x": 100.0, "mouse_y": 100.0,
+                    "mouse_button_name": "left",
+                    "mouse_pressed": True,
+                },
+            )
+            crud.insert_action_event(
+                recording_db.session, recording_db.recording, ts + offset + 0.01,
+                {
+                    "name": "click",
+                    "mouse_x": 100.0, "mouse_y": 100.0,
+                    "mouse_button_name": "left",
+                    "mouse_pressed": False,
+                },
+            )
+
+        with _patch_short_chunk_duration():
+            _recover_chunk_metadata(
+                capture_dir, Console(), force=True, cloud_bound=False,
+            )
+
+        _meta, events = _read_events_jsonl(capture_dir / "events_0000.jsonl")
+        types = [e.get("type") for e in events]
+        # Pre-fix expectation (using ignored 0.5s default): one doubleclick.
+        # Post-fix expectation (using 0.3s recording value): two singleclicks.
+        assert "mouse.doubleclick" not in types, (
+            "Recovery used the engine default 0.5s threshold instead of the "
+            "recording's 0.3s value — the P2 regression. Two clicks 0.4s "
+            "apart merged into a doubleclick when they should not have."
+        )
+        assert types.count("mouse.singleclick") == 2, (
+            f"Expected 2 singleclicks at 0.3s threshold, got types={types}"
+        )
+
+
 class TestRecoveryScrubberChain:
     """Load-bearing ordering: recovery + scrubber together produce the
     full cloud-bound privacy posture (masked titles + no in-interval mouse.move).

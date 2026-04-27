@@ -778,3 +778,127 @@ class TestContractTightness:
             "Sanity check failed: a 1-character mutation did NOT break "
             "the equality comparison. The contract test is not tight."
         )
+
+
+# ---------------------------------------------------------------------------
+# Per-recording click thresholds — the P2 fix vector
+# ---------------------------------------------------------------------------
+
+
+class TestNonDefaultThresholdsAgreement:
+    """Per-recording ``double_click_interval_seconds`` must reach all three
+    callers identically. This is the P2 regression vector: pre-fix, recovery
+    used the engine defaults (0.5s / 5px) while CLI export and chunk
+    processor used the recording's own thresholds, so a recording with a
+    tighter interval produced different click merges in recovered JSONL
+    than in the original chunk JSONL.
+
+    The fixture below configures the recording with ``interval=0.3s`` and
+    inserts two click pairs 0.4s apart. At the strict threshold the two
+    pairs do NOT merge into a doubleclick (0.4 > 0.3), so all three callers
+    must emit two ``mouse.singleclick`` events. Pre-fix, recovery used the
+    default 0.5s threshold (0.4 < 0.5) and emitted one ``mouse.doubleclick``
+    instead, breaking the byte-identical contract.
+
+    The default-threshold fixture in :func:`_build_full_fixture` cannot
+    catch this regression because both clicks fall inside the 0.5s default
+    window — recovery's ignored kwargs match the defaults coincidentally.
+    """
+
+    def _set_recording_thresholds(self, recording_db, *, interval, distance):
+        """Override the fixture's default 0.5s/5px threshold columns.
+
+        The ``recording_db`` fixture inserts a recording with
+        ``double_click_interval_seconds=0.5``; tests that need a non-default
+        value rewrite the row directly via SQLAlchemy so the rest of the
+        fixture state stays consistent.
+        """
+        from sqlalchemy import text
+
+        with recording_db.engine.begin() as conn:
+            conn.execute(
+                text(
+                    "UPDATE recording SET "
+                    "double_click_interval_seconds = :i, "
+                    "double_click_distance_pixels = :d"
+                ),
+                {"i": interval, "d": distance},
+            )
+
+    def _build_two_clicks_fixture(self, recording_db) -> tuple[float, float]:
+        """Two click pairs 0.4s apart — tightly inside the default window
+        but outside a 0.3s override.
+
+        Each pair is a down/up at the same coordinates 0.01s apart. The
+        gap between the two ``MouseDown`` events is 0.4s, which is the
+        critical interval for double-click detection in
+        :func:`process_events`.
+        """
+        # Pair 1 at 0.10s, pair 2 at 0.50s → gap between downs = 0.40s.
+        _insert_action(
+            recording_db, 0.10, "click",
+            mouse_x=100, mouse_y=100,
+            mouse_button_name="left", mouse_pressed=1,
+        )
+        _insert_action(
+            recording_db, 0.11, "click",
+            mouse_x=100, mouse_y=100,
+            mouse_button_name="left", mouse_pressed=0,
+        )
+        _insert_action(
+            recording_db, 0.50, "click",
+            mouse_x=100, mouse_y=100,
+            mouse_button_name="left", mouse_pressed=1,
+        )
+        _insert_action(
+            recording_db, 0.51, "click",
+            mouse_x=100, mouse_y=100,
+            mouse_button_name="left", mouse_pressed=0,
+        )
+        recording_db.session.commit()
+
+        base = recording_db._base_ts
+        return (base, base + 5.0)
+
+    def test_three_callers_agree_under_tight_threshold(self, recording_db):
+        """All three callers must emit two singleclicks at interval=0.3s.
+
+        Pre-fix this test would have failed: recovery would have emitted
+        one ``mouse.doubleclick`` (using the default 0.5s threshold via the
+        kwarg default in :func:`unified_export_events`) while CLI export
+        and chunk processor would have emitted two ``mouse.singleclick``
+        events (using the recording's 0.3s value). The byte-identical
+        comparison ``chunk_lines == recovery_lines`` would have asserted.
+        """
+        self._set_recording_thresholds(recording_db, interval=0.3, distance=5.0)
+        rec_dir = recording_db.db_path.parent
+        start_ts, end_ts = self._build_two_clicks_fixture(recording_db)
+
+        cli_lines = _run_cli_path(rec_dir, include_moves=True)
+        chunk_lines = _run_chunk_path(
+            rec_dir, start_ts, end_ts, cloud_intent=False,
+        )
+        recovery_lines = _run_recovery_path(
+            rec_dir, start_ts, end_ts, cloud_bound=False,
+        )
+
+        # Behavioural assertion: at the strict 0.3s threshold the two
+        # click pairs (gap = 0.4s) must NOT merge.
+        cli_types = [json.loads(ln).get("type") for ln in cli_lines]
+        assert "mouse.doubleclick" not in cli_types, (
+            "CLI export must respect the recording's 0.3s threshold "
+            "(no doubleclick at 0.4s gap)."
+        )
+        assert cli_types.count("mouse.singleclick") == 2
+
+        # Byte-identical contract: all three callers agree.
+        assert cli_lines == chunk_lines, (
+            "CLI vs chunk diverged under non-default click threshold."
+        )
+        assert chunk_lines == recovery_lines, (
+            "Chunk vs recovery diverged under non-default click threshold "
+            "— the P2 regression vector. Recovery must pass the recording's "
+            "double_click_* thresholds to unified_export_events; using the "
+            "engine defaults breaks the byte-identical contract for any "
+            "recording that overrode the defaults."
+        )

@@ -1491,13 +1491,30 @@ def _recover_chunk_metadata(
         (recording_dir / f"chunk_{idx:04d}_manifest.json.tmp").unlink(missing_ok=True)
 
     # Derive chunk time ranges from recording.db
+    # Per-recording click thresholds (P2 fix): the chunk processor and the
+    # CLI export both pass the recording's own ``double_click_*`` values to
+    # the unified callable. Recovery must do the same — otherwise a
+    # recording with non-default thresholds (e.g. interval=0.3s) would have
+    # its recovered JSONL emit different click merges than the original
+    # chunk export, breaking the byte-identical contract for non-default
+    # configurations. Falls back to engine defaults (0.5s / 5px) when the
+    # threshold columns are NULL or the row is absent.
+    double_click_interval = 0.5
+    double_click_distance = 5.0
     try:
         with open_recording_db(db_path, row_factory=Row) as conn:
-            # Get recording start time (video_start_time is when first frame was captured)
-            rec = conn.execute("SELECT timestamp FROM recording LIMIT 1").fetchone()
+            # Get recording start time + click thresholds in one SELECT.
+            rec = conn.execute(
+                "SELECT timestamp, double_click_interval_seconds, "
+                "double_click_distance_pixels FROM recording LIMIT 1"
+            ).fetchone()
             if not rec:
                 return
             rec_start = rec["timestamp"]
+            if rec["double_click_interval_seconds"] is not None:
+                double_click_interval = float(rec["double_click_interval_seconds"])
+            if rec["double_click_distance_pixels"] is not None:
+                double_click_distance = float(rec["double_click_distance_pixels"])
 
             # Get the first and last action event timestamps
             first_evt = conn.execute("SELECT MIN(timestamp) as ts FROM action_event").fetchone()
@@ -1641,10 +1658,16 @@ def _recover_chunk_metadata(
 
                             # Run the unified callable. Returns an iterator;
                             # write_events_jsonl streams it to disk atomically.
+                            # Pass per-recording click thresholds (P2 fix) so
+                            # recovery's merge behaviour matches the live chunk
+                            # processor for recordings with non-default
+                            # double_click_* values.
                             events_iter = unified_export_events(
                                 action_rows,
                                 window_rows,
                                 initial_window_row=initial_window_row,
+                                double_click_interval=double_click_interval,
+                                double_click_distance=double_click_distance,
                                 window_filter=window_filter,
                             )
 
