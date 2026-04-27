@@ -17,12 +17,12 @@ Two public constructors:
 
 from __future__ import annotations
 
+import json
 import logging
+from pathlib import Path
 from typing import TYPE_CHECKING, Callable
 
 if TYPE_CHECKING:
-    from pathlib import Path
-
     from screencap.engine.events import WindowSwitchEvent
 
 logger = logging.getLogger(__name__)
@@ -31,8 +31,8 @@ logger = logging.getLogger(__name__)
 def build_privacy_filter(
     privacy_mode: str = "internal",
     cloud_intent: bool = False,
-    capture_dir=None,
-):
+    capture_dir: Path | None = None,
+) -> Callable[[WindowSwitchEvent], WindowSwitchEvent | None]:
     """Build a privacy filter callback for window.switch events.
 
     Args:
@@ -79,18 +79,14 @@ def build_privacy_filter(
     # Load session overrides from menu bar toggles
     runtime_overrides: dict[str, str] = {}
     if capture_dir is not None:
-        from pathlib import Path
-
         override_path = Path(capture_dir) / ".menubar_overrides.json"
         if override_path.exists():
-            import json
-
             try:
                 runtime_overrides = json.loads(override_path.read_text())
             except Exception:
                 logger.debug("Could not load menu bar overrides")
 
-    def _filter(event):
+    def _filter(event: WindowSwitchEvent) -> WindowSwitchEvent | None:
         from screencap.privacy.policy import FrameMetadata
 
         # Fail-closed on null/empty/whitespace bundle_id (R17). macOS
@@ -144,8 +140,8 @@ def build_privacy_filter(
 def build_cloud_window_filter(
     cloud_bound: bool,
     privacy_mode: str = "internal",
-    capture_dir: "Path | None" = None,
-) -> Callable[["WindowSwitchEvent"], "WindowSwitchEvent | None"] | None:
+    capture_dir: Path | None = None,
+) -> Callable[[WindowSwitchEvent], WindowSwitchEvent | None] | None:
     """Sanctioned constructor for cloud-bound window-event filtering.
 
     Cloud-bound callers MUST go through this factory rather than calling

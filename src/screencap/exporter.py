@@ -8,7 +8,7 @@ import os
 import sys
 from datetime import datetime, timezone
 from pathlib import Path
-from typing import TYPE_CHECKING, Iterable
+from typing import IO, TYPE_CHECKING, Callable, Iterable
 
 from screencap import __version__
 
@@ -22,7 +22,8 @@ from screencap.privacy.filter import (  # noqa: F401
 )
 
 if TYPE_CHECKING:  # pragma: no cover - import-only typing hint
-    from screencap.engine.events import BaseEvent
+    from screencap.engine.capture import CaptureSession
+    from screencap.engine.events import BaseEvent, WindowSwitchEvent
 
 logger = logging.getLogger(__name__)
 
@@ -43,7 +44,7 @@ def build_export_metadata(exclude_moves: bool) -> dict:
 
 
 def export_recording(
-    recording_dir,
+    recording_dir: Path | str,
     output_path: str | None,
     exclude_moves: bool,
     metadata: dict | None = None,
@@ -154,11 +155,11 @@ def write_events_jsonl(
 
 
 def _write_events(
-    capture,
-    out_file,
+    capture: CaptureSession,
+    out_file: IO[str],
     exclude_moves: bool,
     metadata: dict | None,
-    privacy_filter=None,
+    privacy_filter: Callable[[WindowSwitchEvent], WindowSwitchEvent | None] | None = None,
 ) -> int:
     """Stream events to an open file handle. Returns event count.
 
