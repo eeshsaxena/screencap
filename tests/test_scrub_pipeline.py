@@ -1182,7 +1182,13 @@ class TestMouseMoveSuppression:
         assert timestamps == [999.999, 1010.0]
 
     def test_non_mouse_move_in_interval_still_nulled_not_dropped(self, tmp_path):
-        """Non-mouse.move events in blocked intervals → content nulled, event retained."""
+        """Non-mouse.move events in blocked intervals → content nulled, event retained.
+
+        Mouse coordinate fields on retained mouse events are now also nulled
+        (R6/R12 fix for drag-coord leak — clicks/drags/scrolls inside blocked
+        intervals get x/y/dx/dy zeroed so coarse interaction geometry doesn't
+        leak alongside the nulled key content).
+        """
         events = [
             {
                 "type": "key.type",
@@ -1214,8 +1220,213 @@ class TestMouseMoveSuppression:
         key = next(e for e in non_meta if e["type"] == "key.type")
         assert key["text"] is None
         click = next(e for e in non_meta if e["type"] == "mouse.singleclick")
-        # Click coords are NOT touched (R6 only drops moves; clicks pass through)
-        assert click["x"] == 100.0
+        # Mouse coord fields zeroed by null_event_content for retained
+        # mouse events in SCRUB_BLOCK_ACTIONS intervals (event shape
+        # preserved: timestamp/type/button intact, positional fields nulled).
+        assert click["x"] is None
+        assert click["y"] is None
+        assert click["timestamp"] == 1006.0
+        assert click["type"] == "mouse.singleclick"
+        assert click["button"] == "left"
+
+
+class TestMaskRegionPointerSuppression:
+    """Todo 002: ``PrivacyAction.MASK_REGION`` is in SCRUB_BLOCK_ACTIONS so
+    pointer geometry inside MASK_REGION intervals is dropped at scrub time.
+
+    Forward-looking: shared mode (which routes EMAIL/CHAT/CALENDAR/
+    VIDEO_CALL/CLOUD_STORAGE → MASK_REGION) is currently gated by
+    ``parse_privacy_config``, but direct ``PrivacyConfig`` construction —
+    common in tests, possible in any future programmatic caller —
+    bypasses the gate. This test constructs the ``BlockedInterval``
+    directly (mirroring the existing TEXT_REDACT/OCR_FALLBACK pattern)
+    so the suppression posture is verifiable today.
+    """
+
+    def test_mask_region_drops_in_interval_mouse_moves(self, tmp_path):
+        """MASK_REGION interval — in-interval mouse.move events dropped."""
+        events = [
+            _make_move(900.0),
+            _make_move(1005.0),
+            _make_move(1100.0),
+        ]
+        intervals = [
+            BlockedInterval(
+                start=1000.0, end=1010.0,
+                action=PrivacyAction.MASK_REGION,
+                reason=ReasonCode.POLICY_MODE_DEFAULT,
+            ),
+        ]
+        scrubbed, _ = _scrub_with_intervals(tmp_path, events, intervals)
+
+        moves = [e for e in scrubbed if e.get("type") == "mouse.move"]
+        assert sorted(m["timestamp"] for m in moves) == [900.0, 1100.0]
+
+    def test_mask_region_drag_drops_move_children(self, tmp_path):
+        """MASK_REGION drag — move children dropped (mirrors MASK_WINDOW
+        behavior; covered by the same in-interval child-filter at
+        ``scrub_pipeline.py:967-978``)."""
+        events = [
+            {
+                "type": "mouse.drag",
+                "timestamp": 1005.0,
+                "x": 100.0, "y": 200.0,
+                "dx": 50.0, "dy": 30.0,
+                "button": "left",
+                "children": [
+                    {
+                        "type": "mouse.down",
+                        "timestamp": 1005.0,
+                        "x": 100.0, "y": 200.0,
+                        "button": "left",
+                    },
+                    _make_move(1005.5, 110.0, 210.0),
+                    {
+                        "type": "mouse.up",
+                        "timestamp": 1006.0,
+                        "x": 150.0, "y": 230.0,
+                        "button": "left",
+                    },
+                ],
+            },
+        ]
+        intervals = [
+            BlockedInterval(
+                start=1000.0, end=1010.0,
+                action=PrivacyAction.MASK_REGION,
+                reason=ReasonCode.POLICY_MODE_DEFAULT,
+            ),
+        ]
+        scrubbed, _ = _scrub_with_intervals(tmp_path, events, intervals)
+
+        drags = [e for e in scrubbed if e.get("type") == "mouse.drag"]
+        assert len(drags) == 1, "drag retained"
+        child_types = [c.get("type") for c in drags[0]["children"]]
+        assert "mouse.move" not in child_types, "move children dropped"
+
+
+class TestDragCoordinateNulling:
+    """Todo 003: ``null_event_content`` must zero mouse coordinate fields
+    on retained mouse events (drag/click/scroll/etc.) inside a
+    SCRUB_BLOCK_ACTIONS interval. Drag-child mouse.move waypoints are
+    already dropped by the existing in-interval child filter; this
+    closes the parent-drag positional-envelope leak (start/end coords,
+    displacement) and the analogous leak on retained click/scroll.
+    """
+
+    def test_drag_in_interval_nulls_all_coordinate_fields(self, tmp_path):
+        """A mouse.drag whose timestamp lands in a SCRUB_BLOCK_ACTIONS
+        interval emits an event with all coordinate fields null but
+        timestamp/type/button intact (event shape preserved for audit)."""
+        events = [
+            {
+                "type": "mouse.drag",
+                "timestamp": 1005.0,
+                "x": 120.0,
+                "y": 340.0,
+                "dx": 380.0,
+                "dy": 0.0,
+                "button": "left",
+                "children": [
+                    {
+                        "type": "mouse.down",
+                        "timestamp": 1005.0,
+                        "x": 120.0, "y": 340.0,
+                        "button": "left",
+                    },
+                    {
+                        "type": "mouse.up",
+                        "timestamp": 1006.0,
+                        "x": 500.0, "y": 340.0,
+                        "button": "left",
+                    },
+                ],
+            },
+        ]
+        intervals = [
+            BlockedInterval(
+                start=1000.0, end=1010.0,
+                action=PrivacyAction.EXCLUDE,
+                reason=ReasonCode.POLICY_EXCLUDED_APP,
+            ),
+        ]
+        scrubbed, _ = _scrub_with_intervals(tmp_path, events, intervals)
+
+        drags = [e for e in scrubbed if e.get("type") == "mouse.drag"]
+        assert len(drags) == 1
+        drag = drags[0]
+        # All positional fields nulled — no leak of (120, 340) → (500, 340)
+        assert drag["x"] is None
+        assert drag["y"] is None
+        assert drag["dx"] is None
+        assert drag["dy"] is None
+        # Shape preserved: timestamp/type/button intact for audit
+        assert drag["timestamp"] == 1005.0
+        assert drag["type"] == "mouse.drag"
+        assert drag["button"] == "left"
+        # Drag children (mouse.down/mouse.up) — also mouse events,
+        # also nulled by the recursive null_event_content walk
+        for child in drag["children"]:
+            assert child["x"] is None
+            assert child["y"] is None
+
+    def test_scroll_in_interval_nulls_dx_dy(self, tmp_path):
+        """mouse.scroll inside blocked interval — dx/dy nulled too."""
+        events = [
+            {
+                "type": "mouse.scroll",
+                "timestamp": 1005.0,
+                "x": 200.0, "y": 400.0,
+                "dx": 0.0, "dy": -120.0,
+            },
+        ]
+        intervals = [
+            BlockedInterval(
+                start=1000.0, end=1010.0,
+                action=PrivacyAction.MASK_WINDOW,
+                reason=ReasonCode.POLICY_MODE_DEFAULT,
+            ),
+        ]
+        scrubbed, _ = _scrub_with_intervals(tmp_path, events, intervals)
+
+        scrolls = [e for e in scrubbed if e.get("type") == "mouse.scroll"]
+        assert len(scrolls) == 1
+        scroll = scrolls[0]
+        assert scroll["x"] is None
+        assert scroll["y"] is None
+        assert scroll["dx"] is None
+        assert scroll["dy"] is None
+        assert scroll["timestamp"] == 1005.0  # shape preserved
+
+    def test_drag_outside_interval_keeps_coordinates(self, tmp_path):
+        """Drag outside any blocked interval — coordinates preserved
+        (regression check: nulling only fires inside intervals)."""
+        events = [
+            {
+                "type": "mouse.drag",
+                "timestamp": 2000.0,
+                "x": 120.0, "y": 340.0,
+                "dx": 380.0, "dy": 0.0,
+                "button": "left",
+                "children": [],
+            },
+        ]
+        intervals = [
+            BlockedInterval(
+                start=1000.0, end=1010.0,
+                action=PrivacyAction.EXCLUDE,
+                reason=ReasonCode.POLICY_EXCLUDED_APP,
+            ),
+        ]
+        scrubbed, _ = _scrub_with_intervals(tmp_path, events, intervals)
+
+        drags = [e for e in scrubbed if e.get("type") == "mouse.drag"]
+        assert len(drags) == 1
+        drag = drags[0]
+        assert drag["x"] == 120.0
+        assert drag["y"] == 340.0
+        assert drag["dx"] == 380.0
+        assert drag["dy"] == 0.0
 
 
 class TestSCRUBBlockActionsIntegration:
@@ -1295,3 +1506,70 @@ class TestSCRUBBlockActionsIntegration:
         )
         assert len(intervals_scrub) == 1
         assert intervals_scrub[0].action == PrivacyAction.TEXT_REDACT
+
+
+class TestBuildScrubContextFailureLogging:
+    """Todo 022: ``build_scrub_context`` outer-except path must emit a
+    WARNING log so silent disabling of pointer suppression is visible to
+    operators. The previous ``except Exception: pass`` swallowed every
+    failure (busy SQLite, missing window_event table on older recordings,
+    OOM during interval construction) and returned an empty context with
+    no signal — the entire recording's mouse.move suppression silently
+    disabled with ``had_errors=False`` from the downstream scrubber.
+    """
+
+    def test_warning_logged_on_outer_except(self, tmp_path, caplog):
+        """Force the outer try/except to fire by patching
+        ``open_recording_db`` to raise. Assert WARNING-level log is
+        emitted naming the failure cause and that the returned context
+        is still empty (graceful degradation preserved)."""
+        import logging
+        from unittest.mock import patch
+
+        db_path = tmp_path / "recording.db"
+        _create_recording_db(db_path)
+
+        with patch(
+            "screencap.scrub_pipeline.open_recording_db",
+            side_effect=RuntimeError("simulated DB busy"),
+        ), caplog.at_level(logging.WARNING, logger="screencap.scrub_pipeline"):
+            ctx = build_scrub_context(db_path, evaluator=None, classifier=None)
+
+        # Empty context returned (graceful degradation preserved)
+        assert ctx.blocked_intervals == []
+        assert ctx.window_events == []
+
+        # WARNING log captured naming the failure cause
+        warnings = [
+            r for r in caplog.records
+            if r.levelno == logging.WARNING
+            and "build_scrub_context failed" in r.getMessage()
+        ]
+        assert len(warnings) == 1, (
+            f"Expected exactly one WARNING log, got: {[r.getMessage() for r in caplog.records]}"
+        )
+        msg = warnings[0].getMessage()
+        assert "pointer suppression DISABLED" in msg
+        assert "simulated DB busy" in msg
+
+    def test_normal_path_does_not_log_warning(self, tmp_path, caplog):
+        """Successful build_scrub_context emits no WARNING (regression check
+        — the warning must be tied to the failure path, not unconditional)."""
+        import logging
+
+        db_path = tmp_path / "recording.db"
+        _create_recording_db(db_path)
+
+        with caplog.at_level(logging.WARNING, logger="screencap.scrub_pipeline"):
+            ctx = build_scrub_context(db_path, evaluator=None, classifier=None)
+
+        warnings = [
+            r for r in caplog.records
+            if r.levelno == logging.WARNING
+            and "build_scrub_context failed" in r.getMessage()
+        ]
+        assert warnings == [], (
+            f"Unexpected WARNING on success path: {[r.getMessage() for r in warnings]}"
+        )
+        # Sanity: context was built (no exception)
+        assert isinstance(ctx.blocked_intervals, list)

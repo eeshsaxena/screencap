@@ -57,9 +57,18 @@ VIDEO_BLOCK_ACTIONS = frozenset({PrivacyAction.EXCLUDE, PrivacyAction.MASK_WINDO
 # leaks coarse interaction patterns inside redacted/masked content
 # (which terminal line was being edited, which credentials field was being
 # hovered, browsing patterns inside unverified tabs).
+#
+# MASK_REGION is included for forward-looking shared-mode rollout: shared
+# mode routes EMAIL/CHAT/CALENDAR/VIDEO_CALL/CLOUD_STORAGE → MASK_REGION,
+# and pointer geometry inside those regions is comparably sensitive (which
+# message thread, calendar event, or call participant was being hovered).
+# Shared mode is currently gated by ``parse_privacy_config`` raising
+# ``InvalidPrivacyConfigError``, but direct ``PrivacyConfig`` construction
+# bypasses that gate. Including MASK_REGION here closes the leak proactively.
 SCRUB_BLOCK_ACTIONS = frozenset({
     PrivacyAction.EXCLUDE,
     PrivacyAction.MASK_WINDOW,
+    PrivacyAction.MASK_REGION,
     PrivacyAction.TEXT_REDACT,
     PrivacyAction.OCR_FALLBACK,
 })
@@ -79,6 +88,30 @@ KEYSTROKE_CONTENT_FIELDS = frozenset({
     "element_state",
     "active_segment_description",
     "available_segment_descriptions",
+})
+
+
+# Mouse coordinate fields nulled when a mouse event lands inside a
+# SCRUB_BLOCK_ACTIONS interval. Drag-child mouse.move waypoints are dropped
+# entirely by the scrub layer; the parent drag (and clicks/scrolls/etc.)
+# survive but with positional fields zeroed so coarse interaction geometry
+# doesn't leak (which file was dragged, which range was selected).
+#
+# Field names mirror the Pydantic event schema in
+# ``src/screencap/engine/events.py``:
+#   - ``x``/``y``: every mouse event
+#   - ``dx``/``dy``: ``MouseScrollEvent``, ``MouseDragEvent``
+#   - ``path``: ``MouseMoveEvent`` waypoints (list of (x, y) tuples)
+#   - ``magnification``: ``MouseMagnifyEvent``
+#   - ``rotation``: ``MouseRotateEvent``
+MOUSE_COORDINATE_FIELDS = frozenset({
+    "x",
+    "y",
+    "dx",
+    "dy",
+    "path",
+    "magnification",
+    "rotation",
 })
 
 

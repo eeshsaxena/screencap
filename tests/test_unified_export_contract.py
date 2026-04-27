@@ -39,6 +39,8 @@ from pathlib import Path
 from unittest import mock
 from unittest.mock import MagicMock
 
+import pytest
+
 from screencap.privacy.policy import PrivacyConfig, PrivacyMode
 
 # ---------------------------------------------------------------------------
@@ -614,6 +616,136 @@ class TestEdgeCaseDragAtChunkBoundary:
 # ---------------------------------------------------------------------------
 # Tightness sanity check — does the contract test catch a 1-line drift?
 # ---------------------------------------------------------------------------
+
+
+class TestInitialWindowRowDivergence:
+    """Pre-chunk window event covers the ``initial_window_row`` injection
+    path that the chunk processor and recovery share but the CLI does not.
+
+    Both chunk and recovery look up the most recent window event before
+    ``start_ts`` and rewrite its timestamp to ``start_ts - 0.001`` so it
+    surfaces as the first interleaved event. CLI export sees the full
+    recording and passes ``initial_window_row=None`` (capture.py:462).
+
+    This fixture pins:
+    1. Chunk and recovery emit a *byte-identical* synthesized initial
+       window line at ``base_ts - 0.001`` (the divergence vector).
+    2. CLI's first non-meta line has timestamp ``>= base_ts`` — the
+       documented and intentional asymmetry vs chunk/recovery.
+
+    Without a negative-offset window event in the fixture the
+    ``initial_window_row`` lookup returns ``None`` and the entire path is
+    invisible — chunk and recovery would both happily skip it and the
+    contract test would still pass.
+    """
+
+    def _build_initial_window_fixture(self, rdb) -> tuple[float, float]:
+        """Variant fixture: a window event at ``ts_offset = -0.5``.
+
+        The pre-chunk window event lives 0.5s before ``base_ts`` so it
+        falls outside the chunk's ``[base_ts, base_ts + 5)`` slice but
+        feeds the ``initial_window_row`` lookup. A handful of in-range
+        actions follow so the JSONL is non-trivial.
+        """
+        # Pre-chunk window context: Finder switch at -0.5s. Outside the
+        # chunk slice; only reachable via the initial_window_row lookup.
+        _insert_window(
+            rdb,
+            -0.5,
+            title="Pre-chunk Documents",
+            bundle_id="com.apple.finder",
+            window_id="finder-pre",
+        )
+
+        # In-range click pair to ensure post-meta lines exist.
+        _insert_action(
+            rdb, 0.20, "click",
+            mouse_x=100, mouse_y=100,
+            mouse_button_name="left", mouse_pressed=1,
+        )
+        _insert_action(
+            rdb, 0.25, "click",
+            mouse_x=100, mouse_y=100,
+            mouse_button_name="left", mouse_pressed=0,
+        )
+
+        rdb.session.commit()
+
+        base = rdb._base_ts
+        return (base, base + 5.0)
+
+    def test_chunk_and_recovery_inject_synthesized_initial_window(
+        self, recording_db,
+    ):
+        """Chunk and recovery both synthesize an initial window line at
+        ``base_ts - 0.001`` from the pre-chunk window event. The two paths
+        must agree byte-for-byte on this line and on the rest of the
+        post-meta output.
+        """
+        rec_dir = recording_db.db_path.parent
+        start_ts, end_ts = self._build_initial_window_fixture(recording_db)
+
+        chunk_lines = _run_chunk_path(
+            rec_dir, start_ts, end_ts, cloud_intent=False,
+        )
+        recovery_lines = _run_recovery_path(
+            rec_dir, start_ts, end_ts, cloud_bound=False,
+        )
+
+        # 1. Chunk and recovery agree on every post-meta line, including
+        #    the synthesized initial-window-row.
+        assert chunk_lines == recovery_lines, (
+            "Chunk vs recovery diverged on the initial_window_row path — "
+            "the synthesized window event at start_ts - 0.001 must match "
+            "byte-for-byte between the two raw-sqlite3 callers."
+        )
+
+        # 2. The first emitted line is the synthesized window.switch with
+        #    timestamp == base_ts - 0.001 (divergence-path fingerprint).
+        assert chunk_lines, "Fixture must emit at least one event"
+        first = json.loads(chunk_lines[0])
+        assert first["type"] == "window.switch", (
+            "First emitted line must be the synthesized initial window "
+            f"event; got type={first.get('type')!r}"
+        )
+        assert first["app_bundle_id"] == "com.apple.finder"
+        assert first["timestamp"] == pytest.approx(start_ts - 0.001), (
+            "Synthesized initial window event must be rewritten to "
+            f"start_ts - 0.001; got {first['timestamp']!r}"
+        )
+
+    def test_cli_does_not_inject_initial_window_row(self, recording_db):
+        """CLI passes ``initial_window_row=None`` by design (it sees the
+        full recording rather than a slice). Its first emitted line must
+        therefore have a timestamp ``>= base_ts``, NOT the synthesized
+        ``base_ts - 0.001`` that chunk/recovery produce.
+
+        This is the documented asymmetry between the CLI path and the
+        slice-based callers — encoded as an explicit assertion rather than
+        a comment so a future refactor that accidentally wires
+        ``initial_window_row`` through the CLI path would break this test.
+        """
+        rec_dir = recording_db.db_path.parent
+        start_ts, _end_ts = self._build_initial_window_fixture(recording_db)
+
+        cli_lines = _run_cli_path(rec_dir, include_moves=True)
+
+        assert cli_lines, "CLI must emit at least one event"
+        first = json.loads(cli_lines[0])
+        # CLI sees the actual pre-chunk window event with its real
+        # timestamp (base_ts - 0.5), NOT a rewritten base_ts - 0.001.
+        # The first non-meta line is the original window.switch at -0.5.
+        assert first["type"] == "window.switch"
+        # CLI's first window event preserves the original timestamp; it
+        # does not get rewritten to start_ts - 0.001 like chunk/recovery do.
+        assert first["timestamp"] != pytest.approx(start_ts - 0.001), (
+            "CLI must NOT rewrite the pre-chunk window event timestamp — "
+            "that rewrite is a chunk/recovery-only behaviour. If this "
+            "fails, CLI started injecting initial_window_row, which is a "
+            "behaviour change that must be reviewed."
+        )
+        # Sanity: CLI's first ts is the actual stored ts (base_ts - 0.5).
+        assert first["timestamp"] == pytest.approx(start_ts - 0.5)
 
 
 class TestContractTightness:

@@ -27,6 +27,7 @@ from pathlib import Path
 from screencap.privacy.actions import (
     BLOCK_ACTIONS,
     KEYSTROKE_CONTENT_FIELDS,
+    MOUSE_COORDINATE_FIELDS,
     SCRUB_BLOCK_ACTIONS,
     PrivacyAction,
 )
@@ -348,7 +349,11 @@ def null_event_content(event: dict) -> None:
     """Null out sensitive content fields in an event dict in-place (recursive).
 
     Handles nested structures like key.type inside mouse.drag.children,
-    and window.switch title/domain fields.
+    window.switch title/domain fields, and mouse coordinate fields on
+    retained mouse events (e.g. a ``mouse.drag`` whose timestamp lands in
+    a SCRUB_BLOCK_ACTIONS interval — its content is nulled but the event
+    is retained for audit shape; pointer geometry must also be zeroed
+    so coarse interaction patterns don't leak).
     """
     for fld in KEYSTROKE_CONTENT_FIELDS:
         if fld in event:
@@ -356,6 +361,14 @@ def null_event_content(event: dict) -> None:
     if event.get("type") == "window.switch":
         event["window_title"] = None
         event["domain"] = None
+    # R6/R12: zero positional fields on retained mouse events so drag
+    # envelope (start/end coords, displacement, waypoints) doesn't leak
+    # from blocked intervals. Recurses into drag children below.
+    event_type = event.get("type", "")
+    if isinstance(event_type, str) and event_type.startswith("mouse."):
+        for fld in MOUSE_COORDINATE_FIELDS:
+            if fld in event:
+                event[fld] = None
     for child in event.get("children", []):
         null_event_content(child)
 
@@ -646,8 +659,18 @@ def build_scrub_context(
                     db_path, pipeline, anonymizer,
                     time_range=time_range, conn=conn,
                 )
-    except Exception:
-        logger.debug("build_scrub_context failed, using empty context", exc_info=True)
+    except Exception as e:
+        # Loud signal: silent failure here disables ALL pointer-geometry
+        # suppression for the recording (empty blocked_intervals → no
+        # mouse.move drops, no drag-coord nulling). Operators must see
+        # this in logs to investigate the underlying cause (busy SQLite,
+        # missing window_event table on older recordings, OOM, etc.).
+        logger.warning(
+            "build_scrub_context failed; pointer suppression DISABLED "
+            "for this recording: %s",
+            e,
+            exc_info=True,
+        )
 
     return ctx
 

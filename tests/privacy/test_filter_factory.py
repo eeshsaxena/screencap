@@ -10,8 +10,10 @@ Covers Unit 1 of the unified-export-callable refactor:
   → ``window_title == app_name`` AND ``domain is None``; ALLOW → unchanged.
 - ``.menubar_overrides.json``: missing file is fine; malformed JSON falls
   back to policy evaluation without raising.
-- Import paths: both the new neutral location and the backward-compat
-  ``screencap.exporter`` re-export resolve to the same callable.
+- Import paths: ``build_privacy_filter`` and ``build_cloud_window_filter``
+  are importable only from the canonical ``screencap.privacy.filter``
+  location. The historical ``screencap.exporter`` re-export was removed
+  in todo 019.
 """
 
 from __future__ import annotations
@@ -206,15 +208,19 @@ class TestActionMatrixInvariants:
             pf = build_privacy_filter(
                 privacy_mode="public", capture_dir=tmp_path,
             )
-        event = _make_event(
+        slack_event = _make_event(
             bundle_id="com.tinyspeck.slackmacgap",
             app_name="Slack",
             window_title="#secret-channel — Slack",
             domain="slack.com",
         )
-        result = pf(event)
+        result = pf(slack_event)
         assert result is not None
-        assert result.window_title == "Slack"
+        # Compare against the input's app_name rather than a hardcoded string
+        # so a regression in dict_to_window_switch's app_name derivation
+        # (e.g., bundle "com.tinyspeck.slackmacgap" → "Slackmacgap") would
+        # surface here. Mirrors test_chunk_processor.py:885.
+        assert result.window_title == slack_event.app_name
         assert result.domain is None
         # Other fields preserved
         assert result.app_bundle_id == "com.tinyspeck.slackmacgap"
@@ -319,11 +325,11 @@ class TestMenubarOverridesLoading:
 
 
 class TestImportPaths:
-    """The factory and the moved ``build_privacy_filter`` must be importable
-    from the new neutral location AND from the legacy ``screencap.exporter``
-    backward-compat re-export. Cloud callers import from
-    ``screencap.privacy.filter``; existing tests and downstream code import
-    from ``screencap.exporter``. Both paths must resolve to the same callable.
+    """``build_privacy_filter`` and ``build_cloud_window_filter`` are
+    importable only from the canonical ``screencap.privacy.filter``
+    location. The legacy ``screencap.exporter`` re-export was removed
+    in todo 019; ``screencap.privacy.filter`` is now the single source
+    of truth.
     """
 
     def test_import_from_privacy_filter_module(self):
@@ -332,18 +338,8 @@ class TestImportPaths:
             build_privacy_filter,
         )
 
-    def test_import_from_exporter_resolves_same_object(self):
-        from screencap.exporter import build_cloud_window_filter as exp_factory
-        from screencap.exporter import build_privacy_filter as exp_filter
-        from screencap.privacy.filter import (
-            build_cloud_window_filter as pf_factory,
-        )
-        from screencap.privacy.filter import build_privacy_filter as pf_filter
-        assert exp_filter is pf_filter
-        assert exp_factory is pf_factory
-
     def test_chunk_processor_import_path_works(self):
-        """Chunk processor was updated to import from the new location."""
+        """Chunk processor imports from the canonical location."""
         from screencap.privacy.filter import build_privacy_filter
 
         with _public_config():
@@ -397,3 +393,124 @@ class TestCloudIntentOverride:
         assert result is not None
         assert result.window_title == "Slack"
         assert result.domain is None
+
+
+# ---------------------------------------------------------------------------
+# Todo 005: cloud_intent=True must skip .menubar_overrides.json entirely
+# ---------------------------------------------------------------------------
+
+
+class TestCloudIntentSkipsMenubarOverrides:
+    """Cloud-bound exports MUST NOT honor ``.menubar_overrides.json``.
+
+    The override file is user-writable in the recording directory and was
+    designed for capture-time / local-recording posture. Without this guard,
+    an ``allow`` entry for a chat app (e.g. Slack) would bypass the matrix's
+    MASK_WINDOW decision and leak the original window title into cloud-bound
+    JSONL — defeating the cloud-intent → PUBLIC mode escalation.
+
+    Local (non-cloud) behavior is unchanged: overrides still apply.
+    """
+
+    def _slack_event(self):
+        return _make_event(
+            bundle_id="com.tinyspeck.slackmacgap",
+            app_name="Slack",
+            window_title="#secret-channel — Slack",
+        )
+
+    def test_cloud_bound_ignores_allow_override_for_chat(self, tmp_path):
+        """``cloud_bound=True`` + ``.menubar_overrides.json`` with an
+        ``allow`` entry for Slack — title is the masked app name, not
+        the original (matrix MASK_WINDOW verdict applied)."""
+        overrides = {"com.tinyspeck.slackmacgap": "allow"}
+        (tmp_path / ".menubar_overrides.json").write_text(json.dumps(overrides))
+
+        with _public_config():
+            pf = build_cloud_window_filter(
+                cloud_bound=True,
+                privacy_mode="internal",
+                capture_dir=tmp_path,
+            )
+
+        slack_event = self._slack_event()
+        result = pf(slack_event)
+        assert result is not None
+        # Compare against the event's app_name rather than hardcoding
+        # "Slack" so the assertion stays accurate if MASK_WINDOW
+        # ever changes its replacement strategy.
+        assert result.window_title == slack_event.app_name
+        assert result.domain is None
+
+    def test_local_filter_still_honors_allow_override(self, tmp_path):
+        """``cloud_bound=False`` (and direct ``cloud_intent=False``):
+        the override file is still loaded and ``allow`` still bypasses
+        matrix verdicts. This preserves the local-recording UX where
+        users can toggle apps via the menubar."""
+        overrides = {"com.tinyspeck.slackmacgap": "allow"}
+        (tmp_path / ".menubar_overrides.json").write_text(json.dumps(overrides))
+
+        with _public_config():
+            pf = build_privacy_filter(
+                privacy_mode="public",
+                cloud_intent=False,
+                capture_dir=tmp_path,
+            )
+
+        result = pf(self._slack_event())
+        # ``allow`` override returns the event unchanged — original title
+        # passes through (under PUBLIC matrix Slack would be MASK_WINDOW).
+        assert result is not None
+        assert result.window_title == "#secret-channel — Slack"
+
+    def test_cloud_bound_ignores_exclude_override_too(self, tmp_path):
+        """Recommended posture (Option A): ``cloud_intent=True`` skips
+        ALL overrides — including ``exclude`` entries that would tighten
+        the matrix verdict. Cloud-bound posture is fully driven by the
+        matrix; if a user wants to exclude an app from cloud, they must
+        configure ``exclude_apps`` in ``config.toml``.
+
+        The asymmetry: ``exclude`` overrides could in principle still
+        tighten (they only restrict, never loosen the matrix), but the
+        simpler "skip ALL overrides for cloud" rule is preferred — it
+        makes the cloud boundary trivially auditable. We pick a
+        non-EXCLUDE-by-matrix bundle (Visual Studio Code → TEXT_REDACT
+        under PUBLIC) so the test verifies the override is NOT applied
+        (the event would be suppressed if it were applied)."""
+        overrides = {"com.microsoft.VSCode": "exclude"}
+        (tmp_path / ".menubar_overrides.json").write_text(json.dumps(overrides))
+
+        with _public_config():
+            pf = build_cloud_window_filter(
+                cloud_bound=True,
+                privacy_mode="internal",
+                capture_dir=tmp_path,
+            )
+
+        event = _make_event(
+            bundle_id="com.microsoft.VSCode",
+            app_name="Visual Studio Code",
+            window_title="main.py",
+        )
+        result = pf(event)
+        # Exclude override NOT applied — VSCode under PUBLIC mode is
+        # TEXT_REDACT, which passes through unchanged via the matrix.
+        # If the override had been honored, result would be None.
+        assert result is not None
+
+    def test_cloud_bound_with_no_override_file_works(self, tmp_path):
+        """No override file at all + ``cloud_bound=True`` — sanity check
+        that the override-skip path doesn't raise on a missing file."""
+        assert not (tmp_path / ".menubar_overrides.json").exists()
+
+        with _public_config():
+            pf = build_cloud_window_filter(
+                cloud_bound=True,
+                privacy_mode="internal",
+                capture_dir=tmp_path,
+            )
+
+        slack_event = self._slack_event()
+        result = pf(slack_event)
+        assert result is not None
+        assert result.window_title == slack_event.app_name

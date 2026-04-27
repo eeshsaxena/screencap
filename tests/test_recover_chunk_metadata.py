@@ -495,6 +495,65 @@ class TestStaleTmpCleanup:
 # ---------------------------------------------------------------------------
 
 
+class TestOlderSchemaWithoutWindowEventTable:
+    """Older recordings predate the ``window_event`` table.
+
+    ``_recover_chunk_metadata`` checks ``has_window_table`` at
+    ``cli.py:1577`` and skips both the per-chunk window SELECT and the
+    ``initial_window_row`` lookup when the table is absent. Without this
+    guard, raw sqlite3 would raise on the missing table and abort the whole
+    recovery. The branch is reachable in production (older recordings may
+    still be uploaded) but ``create_db()`` always materializes the full
+    schema, leaving this branch untested by every other recovery test.
+    """
+
+    def test_recovery_succeeds_without_window_event_table(self, recording_db):
+        """Drop ``window_event`` from the schema; recovery still produces
+        a valid v2 JSONL containing the action events but zero
+        ``window.switch`` events.
+        """
+        from sqlalchemy import text
+
+        from screencap.cli import _recover_chunk_metadata
+
+        capture_dir = _capture_dir(recording_db)
+        _stub_chunk_video(capture_dir, 0)
+
+        # Insert a couple of action events that the recovery must keep.
+        recording_db.add_click(0.5)
+        recording_db.add_keypress(0.7, char="a")
+
+        # Drop the window_event table to simulate an older-schema DB.
+        # Use the SQLAlchemy + DROP TABLE approach (rather than raw DDL)
+        # so the rest of the schema stays exactly what create_db() would
+        # produce — keeps the fixture infrastructure consistent with the
+        # other recovery tests while exercising the older-schema guard.
+        with recording_db.engine.begin() as conn:
+            conn.execute(text("DROP TABLE window_event"))
+
+        with _patch_short_chunk_duration():
+            _recover_chunk_metadata(
+                capture_dir, Console(), force=True, cloud_bound=True,
+            )
+
+        jsonl_path = capture_dir / "events_0000.jsonl"
+        assert jsonl_path.exists(), (
+            "Recovery must produce a JSONL even when window_event "
+            "table is absent (older-schema guard at cli.py:1577)"
+        )
+        meta, events = _read_events_jsonl(jsonl_path)
+        assert meta["_meta"] is True
+        assert meta["format_version"] == 2
+        # Action events still flow through.
+        assert events, "Action events must be present in the recovered JSONL"
+        # Zero window.switch events because the source table doesn't exist.
+        ws = [e for e in events if e.get("type") == "window.switch"]
+        assert ws == [], (
+            "Older-schema recording must produce zero window.switch events; "
+            f"got {len(ws)}: {ws}"
+        )
+
+
 class TestRecoveryScrubberChain:
     """Load-bearing ordering: recovery + scrubber together produce the
     full cloud-bound privacy posture (masked titles + no in-interval mouse.move).

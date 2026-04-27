@@ -76,9 +76,20 @@ def build_privacy_filter(
     classifier = DefaultContextClassifier(app_classes=privacy_cfg.app_classes)
     evaluator = DefaultPolicyEvaluator(privacy_cfg)
 
-    # Load session overrides from menu bar toggles
+    # Load session overrides from menu bar toggles.
+    #
+    # Cloud-bound exports MUST NOT honor ``.menubar_overrides.json``: the
+    # override file is user-writable in the recording dir and was designed
+    # for capture-time / local-recording posture. An ``allow`` entry for a
+    # chat app (e.g. Slack) would otherwise bypass the matrix's MASK_WINDOW
+    # decision and leak the original window title into cloud-bound JSONL.
+    # Skipping the file load entirely keeps ``runtime_overrides`` empty so
+    # the closure's override-consultation block becomes a no-op for cloud.
+    # Apps that genuinely need to flow to cloud should be added to
+    # ``allow_apps`` in ``config.toml`` (which has matrix EXCLUDE
+    # guard rails) rather than via this file.
     runtime_overrides: dict[str, str] = {}
-    if capture_dir is not None:
+    if capture_dir is not None and not cloud_intent:
         override_path = Path(capture_dir) / ".menubar_overrides.json"
         if override_path.exists():
             try:
