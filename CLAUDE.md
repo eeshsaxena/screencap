@@ -76,25 +76,28 @@ Two-layer privacy enforcement: capture-time filtering + post-recording scrubbing
 
 ## Export System
 
-**Unified processing pipeline:** Both CLI `screencap export` and the chunk processor share the same event processing path:
+**Unified processing pipeline:** All three export callers (CLI export, chunk processor, recovery) route through `unified_export_events` in `src/screencap/engine/export.py` — the single source of truth for the row-to-Pydantic-event transform:
 1. Raw DB rows → `dict_to_action_event()` (`screencap/engine/convert.py`) → Pydantic events
 2. `process_events()` (`screencap/engine/processing.py`) — 11-stage merge/detect pipeline
-3. `deduplicate_window_events()` + `interleave_window_events()` (`screencap/engine/processing.py`)
-4. Privacy filtering (screencap layer) → JSONL serialization via `model_dump_json()`
+3. `deduplicate_window_events()` + optional `window_filter` + `interleave_window_events()` (`screencap/engine/processing.py`)
+4. Returns `Iterator[BaseEvent]` — no DB, no file I/O, no privacy semantics for mouse coordinates. Callers handle row fetching, `disabled` filter, `mouse.move` opt-out, `_meta` header, and atomic writes.
 
-**Two export paths:**
-- **CLI export** (`src/screencap/exporter.py`) — `CaptureSession.export_events()` → `_write_events()`. Full recording export with optional privacy filter.
-- **Chunk processor** (`src/screencap/chunk_processor.py:_export_events()`) — per-chunk time-range export using raw `sqlite3` queries → shared pipeline. Includes initial window context (last window event before chunk start).
+**Three callers, one callable:**
+- **CLI export** (`src/screencap/exporter.py`) — `screencap export <recording>` → `Capture.load(...).export_events(include_moves)` (which delegates to `unified_export_events` with `window_filter=None`, materialized to a `list[BaseEvent]` to preserve the public ORM contract) → `_write_events()` for the file/stdout write. Atomic `.tmp` + `os.rename` for files; stdout for `output_path is None`. No privacy filter.
+- **Chunk processor** (`src/screencap/chunk_processor.py:_export_events()`) — per-chunk time-range export using raw `sqlite3` queries (with `(disabled IS NULL OR NOT disabled)` filter) → `unified_export_events` (with `window_filter=build_cloud_window_filter(self._cloud_intent, ...)`) → `write_events_jsonl` (shared streaming atomic writer). Includes initial window context (last window event before chunk start, timestamp rewritten to `start_ts - 0.001`).
+- **Recovery** (`src/screencap/cli.py:_recover_chunk_metadata`) — invoked by `screencap upload` when chunk videos exist but `events_NNNN.jsonl` files are missing. Same fetch + `unified_export_events` + `write_events_jsonl` path as the chunk processor. **`cloud_bound: bool` is a REQUIRED keyword** (no default — omitting it raises `TypeError`); `screencap upload` always passes `cloud_bound=True` regardless of `.recording_intent`. Recovery now produces v2 format byte-identical to the chunk processor for the same time range (modulo the `_meta` `exported_at`).
 
 **`events.jsonl` format (v2):**
 - Line 1: `_meta` header with `format_version: 2`, `screencap_version`, `exported_at`
 - Remaining lines: Pydantic event JSON — processed action events (`mouse.singleclick`, `key.type`, etc.) interleaved with `window.switch` events
 - `window.switch` events are deduplicated by `(app_bundle_id, window_id)` — title-only changes are ignored
-- `mouse.move` events excluded by default in both paths
+- `mouse.move` events kept by default on all three paths; CLI exposes `--exclude-moves` for opt-out. Cloud Run filters moves at iteration time; the scrub layer drops in-interval moves for sensitive contexts.
 
-**Privacy-aware `window.switch` events:** EXCLUDE apps → suppressed entirely, MASK_WINDOW → title replaced with app name, TEXT_REDACT → passes through with post-capture scrubbing. Privacy filtering happens in the screencap layer (`exporter.py` / `chunk_processor.py`), not in `screencap.engine`.
+**Privacy-aware `window.switch` events:** EXCLUDE apps → suppressed entirely, MASK_WINDOW → title replaced with app name (and `domain` nulled), TEXT_REDACT → passes through with post-capture scrubbing. Cloud-bound callers (chunk processor and recovery) MUST construct the filter via `build_cloud_window_filter(cloud_bound, privacy_mode, capture_dir)` in `src/screencap/privacy/filter.py` — the factory returns `None` when `cloud_bound=False` and a cloud-mode filter when `True`. Wiring it unconditionally (`window_filter=build_cloud_window_filter(...)`) eliminates the `if cloud_intent: build_filter() else None` pattern that previously caused the Slack-title leak. The CI guard at `tests/test_privacy_filter_call_graph.py` is an AST walker that scans `src/screencap/` and fails the build if any caller imports `build_privacy_filter` directly outside sanctioned sites or passes `window_filter=None` literally to `unified_export_events` from cloud-bound code.
 
-**Scrubbing pipeline:** `_scrub_events_jsonl()` scrubs `key.type` and `key.shortcut` text + children `key_char`, and `window.switch` titles.
+**Recovery's privacy posture is driven by call-site context** (the `cloud_bound` parameter), not by `.recording_intent`. The reasoning: `screencap upload` knows the data is becoming cloud-bound at upload time regardless of what the intent file says, which closes the local-then-uploaded threat case (recording captured as `destination=local` and later uploaded would otherwise leak titles). `.recording_intent` is documented as the fallback for hypothetical future non-upload recovery contexts (none exist today).
+
+**Scrubbing pipeline:** `_scrub_events_jsonl()` scrubs `key.type` and `key.shortcut` text + children `key_char`, and `window.switch` titles. **It also drops `mouse.move` events whose timestamp falls inside an interval whose privacy action is in `SCRUB_BLOCK_ACTIONS = {EXCLUDE, MASK_WINDOW, TEXT_REDACT, OCR_FALLBACK}`** (defined in `src/screencap/privacy/actions.py`). This is broader than `BLOCK_ACTIONS` — TEXT_REDACT covers code editors / admin consoles, OCR_FALLBACK covers unverified browsers — because pointer geometry inside content-sensitive contexts is comparably sensitive (which terminal line was being edited, which credentials field was being hovered). Drag children with inline `mouse.move` entries are dropped via the same predicate. **Load-bearing ordering:** `_recover_chunk_metadata` MUST be followed by `scrub_recording` for cloud-bound recordings before upload — the scrub-layer pointer suppression only protects recovered cloud-bound JSONL when this ordering holds.
 
 **Detection pipeline (`src/screencap/privacy/`):**
 - `__init__.py` — `DetectionPipeline` composes detectors → resolver → filters. `Detection` dataclass, `EntityType` constants, `TextDetector`/`DetectionFilter` protocols, `Anonymizer`, `create_default_pipeline()` factory.
