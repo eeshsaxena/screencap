@@ -57,9 +57,6 @@ from screencap.engine.events import (
     WindowStateEvent,
 )
 
-# Unified row-to-event transform
-from screencap.engine.export import unified_export_events
-
 # Event processing
 from screencap.engine.processing import (
     detect_drag_events,
@@ -149,8 +146,6 @@ __all__ = [
     "get_action_events",
     "get_screen_events",
     "get_audio_events",
-    # Unified export
-    "unified_export_events",
     # Performance statistics
     "CaptureStats",
     "PerfStat",

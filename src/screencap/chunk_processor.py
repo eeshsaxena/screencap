@@ -26,10 +26,6 @@ from screencap.recording_db import (
 
 logger = logging.getLogger(__name__)
 
-def _safe_delete(path: Path) -> None:
-    """Permanently delete a file from the filesystem."""
-    path.unlink()
-
 
 class ChunkProcessor:
     """Process completed recording chunks in the background.
@@ -964,7 +960,7 @@ class ChunkProcessor:
                 if path.exists():
                     try:
                         freed += path.stat().st_size
-                        _safe_delete(path)
+                        path.unlink()
                         logger.info(f"Deleted {path.name}")
                     except OSError as e:
                         logger.warning(f"Failed to delete {path.name}: {e}")
@@ -1238,7 +1234,7 @@ def stub_recording(recording_dir: Path) -> list[str]:
             continue
         if p.suffix in (".mp4", ".flac", ".jsonl", ".png", ".jpg"):
             try:
-                _safe_delete(p)
+                p.unlink()
                 deleted.append(p.name)
             except OSError as e:
                 logger.warning(f"Failed to delete {p.name}: {e}")
@@ -1249,7 +1245,7 @@ def stub_recording(recording_dir: Path) -> list[str]:
         for p in screenshots_dir.iterdir():
             if p.is_file():
                 try:
-                    _safe_delete(p)
+                    p.unlink()
                     deleted.append(f"screenshots/{p.name}")
                 except OSError:
                     pass

@@ -46,10 +46,15 @@ import tracemalloc
 from dataclasses import asdict, dataclass
 from pathlib import Path
 
+from rich.console import Console
+
 # Ensure the project root is importable.
 _project_root = Path(__file__).resolve().parent.parent
 sys.path.insert(0, str(_project_root / "src"))
 sys.path.insert(0, str(_project_root))
+
+console = Console()
+err_console = Console(stderr=True)
 
 
 # ---------------------------------------------------------------------------
@@ -357,7 +362,7 @@ def run_pipeline(
     tracemalloc.stop()
 
     if had_errors:
-        print(f"  [warn] scrub reported errors for {label}", file=sys.stderr)
+        err_console.print(f"  [yellow][warn][/yellow] scrub reported errors for {label}")
 
     return PipelineResult(
         label=label,
@@ -593,21 +598,21 @@ def main() -> int:
     # Quiet down screencap's INFO logging during the run.
     logging.basicConfig(level=logging.WARNING)
 
-    print("Generating synthetic corpus...")
+    console.print("Generating synthetic corpus...")
     action_rows, window_rows, blocked_intervals, stats = generate_synthetic_corpus(
         chunk_seconds=args.chunk_seconds, seed=args.seed,
     )
-    print(
+    console.print(
         f"  rows: {stats.mouse_move_rows:,} mouse.move + "
         f"{stats.other_action_rows:,} other actions + "
         f"{stats.window_rows} window events"
     )
-    print(
+    console.print(
         f"  intervals: {stats.mask_window_intervals} MASK_WINDOW + "
         f"{stats.allow_intervals} ALLOW"
     )
 
-    print("Initializing scrubber pipeline (Presidio + GLiNER warmup)...")
+    console.print("Initializing scrubber pipeline (Presidio + GLiNER warmup)...")
     pipeline, anonymizer = _make_scrubber()
 
     with tempfile.TemporaryDirectory(prefix="benchmark_mouse_move_bloat_") as td:
@@ -621,26 +626,26 @@ def main() -> int:
         # before the post-Unit-6 measurement.
         pre_rows = [r for r in action_rows if r["name"] != "move"]
 
-        print("\nRun 1 — pre-Unit-6 baseline (mouse.move rows dropped before callable)...")
+        console.print("\nRun 1 — pre-Unit-6 baseline (mouse.move rows dropped before callable)...")
         pre_result = run_pipeline(
             "baseline_no_moves",
             pre_rows, window_rows, blocked_intervals,
             pipeline, anonymizer, out_dir,
         )
-        print(
+        console.print(
             f"  {pre_result.events_written:,} events, "
             f"{_fmt_bytes(pre_result.jsonl_bytes)}, "
             f"export={pre_result.export_seconds:.2f}s, "
             f"scrub={pre_result.scrub_seconds:.2f}s"
         )
 
-        print("Run 2 — post-Unit-6 (mouse.move kept by default)...")
+        console.print("Run 2 — post-Unit-6 (mouse.move kept by default)...")
         post_result = run_pipeline(
             "post_unit6_keep_moves",
             action_rows, window_rows, blocked_intervals,
             pipeline, anonymizer, out_dir,
         )
-        print(
+        console.print(
             f"  {post_result.events_written:,} events, "
             f"{_fmt_bytes(post_result.jsonl_bytes)}, "
             f"export={post_result.export_seconds:.2f}s, "
@@ -649,8 +654,8 @@ def main() -> int:
 
     gate_passed, details = evaluate_gate(post_result, pre_result)
     report = render_report(stats, post_result, pre_result, gate_passed, details)
-    print()
-    print(report)
+    console.print()
+    console.print(report)
 
     if args.json is not None:
         payload = {
@@ -662,7 +667,7 @@ def main() -> int:
         }
         args.json.parent.mkdir(parents=True, exist_ok=True)
         args.json.write_text(json.dumps(payload, indent=2))
-        print(f"\nMeasurements written to {args.json}")
+        console.print(f"\nMeasurements written to {args.json}")
 
     # Exit non-zero on synthetic-gate breach so CI / orchestrator can
     # detect it without parsing the report.
