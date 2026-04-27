@@ -622,6 +622,172 @@ def test_cli_export_all(tmp_path, monkeypatch):
 
 
 # ============================================================================
+# CaptureSession.export_events — Unit 5 unified-callable behavioral contracts
+# ============================================================================
+#
+# These tests pin the per-recording threshold + disabled-row + include_moves
+# behaviors that must survive the refactor to ``unified_export_events``.
+# Cross-references the public-signature contract in
+# ``tests/test_cross_layer_contracts.py:35-45``.
+
+
+def _build_recording_with_thresholds(
+    db_path,
+    *,
+    interval=None,
+    distance=None,
+):
+    """Create a recording.db where the click-threshold columns may be NULL.
+
+    ``interval=None`` and ``distance=None`` leave the threshold columns NULL
+    so we can verify the engine's fallback to ``process_events`` defaults
+    (0.5s / 5px).
+    """
+    from screencap.engine.db import create_db, crud
+
+    engine, Session = create_db(str(db_path))
+    session = Session()
+    rec_data = {
+        "timestamp": 1000.0,
+        "platform": "darwin",
+        "monitor_width": 1024,
+        "monitor_height": 768,
+    }
+    if interval is not None:
+        rec_data["double_click_interval_seconds"] = interval
+    if distance is not None:
+        rec_data["double_click_distance_pixels"] = distance
+    recording = crud.insert_recording(session, rec_data)
+
+    # Two click pairs 0.40s apart — at the boundary between default 0.5s
+    # (merge → doubleclick) and a tighter 0.3s override (no merge → two
+    # singleclicks).
+    for ts in (1001.0, 1001.40):
+        crud.insert_action_event(session, recording, ts, {
+            "name": "click",
+            "mouse_x": 100.0,
+            "mouse_y": 100.0,
+            "mouse_button_name": "left",
+            "mouse_pressed": True,
+        })
+        crud.insert_action_event(session, recording, ts + 0.01, {
+            "name": "click",
+            "mouse_x": 100.0,
+            "mouse_y": 100.0,
+            "mouse_button_name": "left",
+            "mouse_pressed": False,
+        })
+    session.close()
+    return recording
+
+
+def test_export_events_per_recording_click_threshold_propagates(tmp_path):
+    """U5.1: Per-recording ``double_click_interval_seconds`` reaches the
+    unified pipeline.
+
+    Two click pairs are 0.4s apart. With the default 0.5s interval this
+    merges to a single ``mouse.doubleclick``. With a tight 0.3s
+    per-recording threshold the second pair is too late, so we expect two
+    separate ``mouse.singleclick`` events.
+    """
+    rec_dir = tmp_path / "tight-rec"
+    rec_dir.mkdir()
+    _build_recording_with_thresholds(
+        rec_dir / "recording.db", interval=0.3, distance=5.0,
+    )
+
+    from screencap.engine import Capture
+
+    with Capture.load(str(rec_dir)) as capture:
+        events = capture.export_events(include_moves=False)
+
+    types = [e.type for e in events]
+    # Tight interval → no doubleclick, two singleclicks.
+    assert "mouse.doubleclick" not in types
+    assert types.count("mouse.singleclick") == 2
+
+
+def test_export_events_null_thresholds_fallback_to_defaults(tmp_path):
+    """U5.2: NULL ``double_click_*`` columns fall back to engine defaults.
+
+    Same fixture as U5.1 but with both threshold columns NULL. Default
+    interval (0.5s) is wider than the 0.4s click gap, so the two pairs
+    merge into one ``mouse.doubleclick``.
+    """
+    rec_dir = tmp_path / "null-rec"
+    rec_dir.mkdir()
+    _build_recording_with_thresholds(
+        rec_dir / "recording.db", interval=None, distance=None,
+    )
+
+    from screencap.engine import Capture
+
+    with Capture.load(str(rec_dir)) as capture:
+        events = capture.export_events(include_moves=False)
+
+    types = [e.type for e in events]
+    # Default interval (0.5s) > 0.4s gap → merges to one doubleclick.
+    assert types.count("mouse.doubleclick") == 1
+    assert "mouse.singleclick" not in types
+
+
+def test_export_events_disabled_rows_excluded(tmp_path):
+    """U5.3: ``action_event.disabled=True`` rows never reach the unified
+    pipeline.
+
+    The disabled-row filter is applied at the row-fetch boundary inside
+    ``CaptureSession.export_events`` (R16). A click with ``disabled=True``
+    should not appear in the output as a ``mouse.singleclick``.
+    """
+    from screencap.engine import Capture
+    from screencap.engine.db import create_db, crud
+    from screencap.engine.db.models import ActionEvent
+
+    rec_dir = tmp_path / "disabled-rec"
+    rec_dir.mkdir()
+    db_path = rec_dir / "recording.db"
+
+    engine, Session = create_db(str(db_path))
+    session = Session()
+    recording = crud.insert_recording(session, {
+        "timestamp": 1000.0,
+        "platform": "darwin",
+        "monitor_width": 1024,
+        "monitor_height": 768,
+    })
+    # Two click pairs. The second pair (at 1003.0) will be disabled.
+    for ts in (1001.0, 1003.0):
+        crud.insert_action_event(session, recording, ts, {
+            "name": "click",
+            "mouse_x": 50.0,
+            "mouse_y": 50.0,
+            "mouse_button_name": "left",
+            "mouse_pressed": True,
+        })
+        crud.insert_action_event(session, recording, ts + 0.01, {
+            "name": "click",
+            "mouse_x": 50.0,
+            "mouse_y": 50.0,
+            "mouse_button_name": "left",
+            "mouse_pressed": False,
+        })
+    # Disable both rows of the second pair.
+    for evt in session.query(ActionEvent).filter(ActionEvent.timestamp >= 1003.0):
+        evt.disabled = True
+    session.commit()
+    session.close()
+
+    with Capture.load(str(rec_dir)) as capture:
+        events = capture.export_events(include_moves=False)
+
+    click_events = [e for e in events if e.type == "mouse.singleclick"]
+    # Only the first (enabled) click pair survives.
+    assert len(click_events) == 1
+    # It must be the surviving (timestamp=1001.x) click, not the disabled one.
+    assert all(abs(e.timestamp - 1001.0) < 0.05 for e in click_events)
+
+
+# ============================================================================
 # write_events_jsonl — Unit 4 streaming writer
 # ============================================================================
 #
