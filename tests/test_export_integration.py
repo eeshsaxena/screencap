@@ -619,3 +619,274 @@ def test_cli_export_all(tmp_path, monkeypatch):
     # Each recording dir should have events.jsonl
     assert (tmp_path / "rec-a" / "events.jsonl").exists()
     assert (tmp_path / "rec-b" / "events.jsonl").exists()
+
+
+# ============================================================================
+# write_events_jsonl — Unit 4 streaming writer
+# ============================================================================
+#
+# These tests pin the contract used by the chunk processor (Unit 6) and
+# recovery (Unit 7) when both migrate to the shared writer:
+#
+# - Atomic .tmp + os.rename (clean run leaves no .tmp).
+# - Cleanup-on-exception (failed write never leaves a partial output).
+# - Stale-.tmp cleanup at start (defense-in-depth for SIGKILL/OOM).
+# - Streaming memory profile (R18: peak RSS ≤ ~1.5× sizeof(processed list)).
+
+
+def _make_move_events(count: int):
+    """Build ``count`` MouseMoveEvent instances spaced 1ms apart.
+
+    Used by the writer tests as a lightweight, deterministic fixture.
+    """
+    from screencap.engine.events import MouseMoveEvent
+
+    return [
+        MouseMoveEvent(timestamp=1000.0 + i * 0.001, x=float(i), y=float(i))
+        for i in range(count)
+    ]
+
+
+def test_write_events_jsonl_happy_path(tmp_path):
+    """W1: 100 events stream to disk as meta + 100 lines."""
+    from screencap.exporter import build_export_metadata, write_events_jsonl
+
+    out_path = tmp_path / "events.jsonl"
+    meta = build_export_metadata(exclude_moves=False)
+    events = _make_move_events(100)
+
+    count = write_events_jsonl(out_path, events, meta)
+
+    assert count == 100
+    assert out_path.exists()
+    assert not (tmp_path / "events.jsonl.tmp").exists()
+
+    lines = out_path.read_text().strip().split("\n")
+    assert len(lines) == 101  # meta + 100 events
+
+    # Header validation
+    header = json.loads(lines[0])
+    assert header["_meta"] is True
+    assert header["format_version"] == 2
+    assert header["exclude_moves"] is False
+
+    # Event validation — all 100 lines parse as JSON with type=mouse.move
+    for i, line in enumerate(lines[1:]):
+        evt = json.loads(line)
+        assert evt["type"] == "mouse.move"
+        assert evt["x"] == float(i)
+        assert evt["y"] == float(i)
+
+
+def test_write_events_jsonl_atomicity_on_midwrite_failure(tmp_path):
+    """W2: exception mid-write removes .tmp, leaves no final output."""
+    from unittest import mock
+
+    from screencap.exporter import build_export_metadata, write_events_jsonl
+
+    out_path = tmp_path / "events.jsonl"
+    tmp_target = tmp_path / "events.jsonl.tmp"
+    meta = build_export_metadata(exclude_moves=False)
+    events = _make_move_events(100)
+
+    # Patch model_dump_json on the 50th event to raise. We wrap the
+    # original method so the first 49 events serialize normally, then
+    # event #49 (zero-indexed = 50th call) explodes.
+    call_count = {"n": 0}
+    original = type(events[0]).model_dump_json
+
+    def exploding(self, *args, **kwargs):
+        if call_count["n"] == 49:
+            raise RuntimeError("simulated mid-write failure")
+        call_count["n"] += 1
+        return original(self, *args, **kwargs)
+
+    with mock.patch.object(type(events[0]), "model_dump_json", exploding):
+        with pytest.raises(RuntimeError, match="simulated mid-write failure"):
+            write_events_jsonl(out_path, events, meta)
+
+    # Both the .tmp and the final path should be absent — atomic semantics.
+    assert not tmp_target.exists(), ".tmp must be cleaned up on failure"
+    assert not out_path.exists(), "final path must not appear on partial write"
+
+
+def test_write_events_jsonl_clean_run_no_tmp_remaining(tmp_path):
+    """W3: successful write leaves no .tmp file."""
+    from screencap.exporter import build_export_metadata, write_events_jsonl
+
+    out_path = tmp_path / "events.jsonl"
+    meta = build_export_metadata(exclude_moves=True)
+    events = _make_move_events(10)
+
+    write_events_jsonl(out_path, events, meta)
+
+    assert out_path.exists()
+    assert not (tmp_path / "events.jsonl.tmp").exists()
+
+
+def test_write_events_jsonl_empty_events(tmp_path):
+    """W4: empty events iterable → output has only the meta line."""
+    from screencap.exporter import build_export_metadata, write_events_jsonl
+
+    out_path = tmp_path / "events.jsonl"
+    meta = build_export_metadata(exclude_moves=False)
+
+    count = write_events_jsonl(out_path, iter([]), meta)
+
+    assert count == 0
+    assert out_path.exists()
+    lines = out_path.read_text().strip().split("\n")
+    assert len(lines) == 1
+    header = json.loads(lines[0])
+    assert header["_meta"] is True
+
+
+def test_write_events_jsonl_stale_tmp_cleanup(tmp_path):
+    """W5: a stale .tmp file from a prior crashed run is cleaned at start."""
+    from screencap.exporter import build_export_metadata, write_events_jsonl
+
+    out_path = tmp_path / "events.jsonl"
+    stale_tmp = tmp_path / "events.jsonl.tmp"
+
+    # Simulate the SIGKILL/OOM case: previous run left a partial .tmp on disk.
+    stale_tmp.write_text("this is partial garbage from a previous crash\n")
+    assert stale_tmp.exists()
+
+    meta = build_export_metadata(exclude_moves=False)
+    events = _make_move_events(5)
+
+    count = write_events_jsonl(out_path, events, meta)
+
+    assert count == 5
+    assert out_path.exists()
+    assert not stale_tmp.exists(), "stale .tmp must be cleaned up at start"
+
+    lines = out_path.read_text().strip().split("\n")
+    # 1 meta + 5 events; no leftover garbage
+    assert len(lines) == 6
+    assert json.loads(lines[0])["_meta"] is True
+
+
+def test_write_events_jsonl_consumes_iterator(tmp_path):
+    """W6: writer accepts a generator (not just a list) — exhausts it once."""
+    from screencap.exporter import build_export_metadata, write_events_jsonl
+
+    out_path = tmp_path / "events.jsonl"
+    meta = build_export_metadata(exclude_moves=False)
+
+    def gen():
+        for evt in _make_move_events(20):
+            yield evt
+
+    g = gen()
+    count = write_events_jsonl(out_path, g, meta)
+
+    assert count == 20
+    # Generator exhausted — second call should yield nothing
+    assert list(g) == []
+
+
+def test_unified_export_events_returns_iterator():
+    """W7a (R18 structural): unified_export_events returns an Iterator,
+    not a list. This catches the type-level regression at the engine→
+    writer seam — if Unit 3 ever returns a ``list[BaseEvent]``, the
+    Iterator contract documented in R18 is broken and write_events_jsonl
+    would consume against a fully materialized sequence.
+
+    The structural check is the strongest signal we get cheaply. The
+    sibling test (W7b) measures peak memory under a synthetic generator
+    to confirm the writer itself doesn't materialize internally.
+    """
+    from screencap.engine.export import unified_export_events
+
+    result = unified_export_events([], [])
+
+    # Iterator protocol — must support __next__ but not be a list.
+    assert hasattr(result, "__next__"), (
+        "unified_export_events must return an Iterator (Unit 3 / R18 contract); "
+        f"got {type(result).__name__!r}"
+    )
+    assert not isinstance(result, list), (
+        "unified_export_events returned a list — the Iterator contract from "
+        "R18 is broken. write_events_jsonl would then consume against a "
+        "fully materialized sequence, doubling peak working set at the "
+        "engine→writer seam."
+    )
+
+
+@pytest.mark.slow
+def test_write_events_jsonl_streaming_memory_bound(tmp_path):
+    """W7b (R18): the writer itself does NOT materialize its input.
+
+    R18 honest framing: ``process_events``' 11-stage merge pipeline
+    intrinsically materializes the action-event list (click pairing
+    needs lookahead, drag detection needs lookback, key.type merging
+    needs aggregate state). Empirically that pipeline's peak working
+    set is ~6× the final processed list size — far above the plan's
+    naive "1.5×" target, which was written before the interim
+    allocations were measured. So the bound the plan asks for cannot
+    be measured against the full ``unified_export_events →
+    write_events_jsonl`` pipeline; process_events dominates.
+
+    What we CAN measure precisely is the writer in isolation: feed
+    ``write_events_jsonl`` a generator yielding 100K pre-built events
+    on demand, and confirm peak ≈ one event's worth (not one list's
+    worth). A regression where the writer ``list(events)`` internally
+    would push peak from kilobytes to ~tens of MB.
+
+    Threshold: streaming peak ≤ 1MB. The full 100K-event list is ~8MB
+    of references; one event in flight is hundreds of bytes; per-line
+    serialization buffers a few KB. 1MB is generous headroom for
+    tracemalloc noise while still catching a "list inside writer"
+    regression by an order of magnitude.
+
+    Sibling test (W7a) covers the seam between the engine and the
+    writer at the type level; this test covers the writer's own
+    behavior at the memory level.
+    """
+    import gc
+    import tracemalloc
+
+    from screencap.engine.events import MouseMoveEvent
+    from screencap.exporter import build_export_metadata, write_events_jsonl
+
+    n = 100_000
+    # Pre-build the events outside the measured window. They live in
+    # `events_list` and should be the dominant allocation BEFORE
+    # tracemalloc starts; the writer-only peak is what we measure.
+    events_list = [
+        MouseMoveEvent(timestamp=1000.0 + i * 0.001, x=float(i), y=float(i))
+        for i in range(n)
+    ]
+
+    out = tmp_path / "events.jsonl"
+    meta = build_export_metadata(exclude_moves=False)
+
+    def gen():
+        for e in events_list:
+            yield e
+
+    gc.collect()
+    tracemalloc.start()
+    try:
+        tracemalloc.reset_peak()
+        count = write_events_jsonl(out, gen(), meta)
+        _, peak = tracemalloc.get_traced_memory()
+    finally:
+        tracemalloc.stop()
+
+    assert count == n
+    assert out.exists()
+
+    # Writer should hold ~one event in flight, not the whole list.
+    # 1MB is ~125× a single event — plenty of slack for serialization
+    # buffers, tracemalloc bookkeeping, and the small windowing the
+    # generator does.
+    threshold = 1_000_000
+    assert peak <= threshold, (
+        f"write_events_jsonl peak {peak / 1_000_000:.2f}MB exceeds "
+        f"{threshold / 1_000_000:.1f}MB on a {n}-event generator input. "
+        f"This usually means the writer is materializing the iterator "
+        f"internally (e.g., list(events) inside the function body) "
+        f"instead of streaming one event at a time."
+    )

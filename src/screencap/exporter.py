@@ -7,6 +7,8 @@ import logging
 import os
 import sys
 from datetime import datetime, timezone
+from pathlib import Path
+from typing import TYPE_CHECKING, Iterable
 
 from screencap import __version__
 
@@ -18,6 +20,9 @@ from screencap.privacy.filter import (  # noqa: F401
     build_cloud_window_filter,
     build_privacy_filter,
 )
+
+if TYPE_CHECKING:  # pragma: no cover - import-only typing hint
+    from screencap.engine.events import BaseEvent
 
 logger = logging.getLogger(__name__)
 
@@ -82,6 +87,72 @@ def export_recording(
         return count
 
 
+def write_events_jsonl(
+    out_path: Path,
+    events: Iterable[BaseEvent],
+    meta: dict,
+) -> int:
+    """Stream events to ``out_path`` atomically as JSONL.
+
+    Writes ``meta`` as line 1, then iterates ``events`` writing
+    ``event.model_dump_json() + "\\n"`` per line. The actual writes go to
+    ``out_path.with_suffix(out_path.suffix + ".tmp")``; on success the
+    .tmp file is renamed onto ``out_path`` (atomic on POSIX). On any
+    exception during the write loop the .tmp file is removed and the
+    exception re-raises.
+
+    Streaming is load-bearing: under R11 the chunk processor keeps
+    ``mouse.move`` events by default, so a worst-case idle-reading
+    recording can produce tens of MB of events. Iterating one event at a
+    time bounds peak writer-side memory regardless of the input size.
+
+    Stale-.tmp cleanup: any pre-existing .tmp at the target path is
+    removed before opening the new one. This is defense-in-depth for the
+    SIGKILL/OOM case where a previous run left a partial file behind.
+
+    Args:
+        out_path: Final destination path for the JSONL file. The .tmp
+            sibling is derived by appending ``.tmp`` to the suffix
+            (e.g. ``events.jsonl`` → ``events.jsonl.tmp``).
+        events: Iterable of Pydantic events. Consumed lazily; supports
+            iterators from ``unified_export_events``.
+        meta: Header dict written as line 1 via ``json.dumps(meta)``.
+            Typically built via :func:`build_export_metadata`. Required
+            (no implicit "skip header" path here — callers that want a
+            header-less file must use a different writer).
+
+    Returns:
+        Count of events written, **excluding** the meta line. Matches the
+        return signature of the legacy :func:`_write_events` helper.
+
+    Raises:
+        Any exception raised by the events iterator, by Pydantic's
+        ``model_dump_json``, or by the underlying file I/O is propagated
+        after the .tmp file is unlinked.
+    """
+    tmp_path = out_path.with_suffix(out_path.suffix + ".tmp")
+
+    # Stale .tmp cleanup: a previous SIGKILL/OOM may have left a partial
+    # file at this path. Drop it before we start writing.
+    tmp_path.unlink(missing_ok=True)
+
+    count = 0
+    try:
+        with open(tmp_path, "w") as f:
+            f.write(json.dumps(meta) + "\n")
+            for event in events:
+                f.write(event.model_dump_json() + "\n")
+                count += 1
+        os.rename(tmp_path, out_path)
+    except BaseException:
+        # Cleanup-on-exception. Use missing_ok in case the open() itself
+        # failed before the file was created.
+        tmp_path.unlink(missing_ok=True)
+        raise
+
+    return count
+
+
 def _write_events(
     capture,
     out_file,
@@ -90,6 +161,11 @@ def _write_events(
     privacy_filter=None,
 ) -> int:
     """Stream events to an open file handle. Returns event count.
+
+    Legacy helper retained as a thin shim for backward compatibility.
+    The ``privacy_filter`` kwarg is wired through here today; Unit 5
+    will retire it once ``CaptureSession.export_events`` calls the
+    unified callable with ``window_filter`` upstream.
 
     Args:
         capture: CaptureSession instance.
