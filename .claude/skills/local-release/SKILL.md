@@ -101,8 +101,15 @@ PY_UNIVERSAL=$(find /Library/Frameworks/Python.framework/Versions/3.12 -name pyt
 arch -x86_64 "$PY_UNIVERSAL" -m venv .venv-x86_64
 arch -x86_64 .venv-x86_64/bin/pip install --upgrade pip
 
-# Apply the x86_64 constraint file — same as CI — so pip selects wheels with minos <= 11.0
-arch -x86_64 env PIP_CONSTRAINT="$PWD/pyinstaller/constraints-x86_64.txt" \
+# Apply the x86_64 constraint file — same as CI — so pip selects wheels with minos <= 11.0.
+# MACOSX_DEPLOYMENT_TARGET=11.0 mirrors the workflow-level setting in
+# .github/workflows/release.yml for any build-time tooling that reads it
+# (PyInstaller bootloader build, C extensions compiled from source, etc.).
+# Note: it does NOT shift pip's wheel-tag preference — packaging.tags reads
+# platform.mac_ver() at runtime, so on a Tahoe (macOS 26.x) host pip still
+# prefers macosx_26_0 → macosx_14_0 → ... wheels regardless of this env.
+# Wheel selection is enforced by the version pins in constraints-x86_64.txt.
+arch -x86_64 env MACOSX_DEPLOYMENT_TARGET=11.0 PIP_CONSTRAINT="$PWD/pyinstaller/constraints-x86_64.txt" \
   .venv-x86_64/bin/pip install -e ".[record]"
 arch -x86_64 .venv-x86_64/bin/pip install pyinstaller
 arch -x86_64 .venv-x86_64/bin/python -m spacy download en_core_web_sm
@@ -274,4 +281,4 @@ an x86_64 tarball exists at gs://screencap-releases/releases/v{VERSION}/.
 - Do NOT update `gs://screencap-releases/releases/latest.txt` from this skill. That promotion is owned by CI's `promote-latest` job (gated on `verify-install`). Promoting locally would bypass verify-install on the matching arch's runner.
 - Do NOT overwrite `gs://screencap-releases/releases/install.sh` from this skill. That file is updated by CI's `release` job at release time.
 - If CI fails after the tag is pushed, this skill fills the gap by publishing the missing tarball(s) to the versioned GCS path and the matching GH release assets. Users who pin `SCREENCAP_VERSION=X.Y.Z` get the local build. Users who run the default `curl install.sh` still get whatever `latest.txt` points to.
-- For `--arch both` on an Apple Silicon Mac under Rosetta: the x86_64 build uses `PIP_CONSTRAINT=pyinstaller/constraints-x86_64.txt` (forces numpy<2.1, av<14, onnxruntime<=1.19.2, etc.) so the resulting minos stays ≤ 11.0 even though Homebrew libraries on the host are arm64-native. The minos-verify step (Step 4) is the authoritative gate.
+- For `--arch both` on an Apple Silicon Mac under Rosetta: the x86_64 build uses `MACOSX_DEPLOYMENT_TARGET=11.0` + `PIP_CONSTRAINT=pyinstaller/constraints-x86_64.txt` (forces numpy<2.0, av<14, onnxruntime<=1.19.2, etc.) so the resulting minos stays ≤ 11.0 even though Homebrew libraries on the host are arm64-native. The minos-verify step (Step 4) is the authoritative gate.
