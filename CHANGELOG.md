@@ -5,7 +5,30 @@ All notable changes to this project will be documented in this file.
 The format is based on [Keep a Changelog](https://keepachangelog.com/),
 and this project adheres to [Semantic Versioning](https://semver.org/).
 
-## [Unreleased]
+## [0.19.0] - 2026-04-28
+
+### Added
+- **Unified export pipeline (`unified_export_events`):** All three export callers — CLI export, the chunk processor, and recovery in `screencap upload` — now route through a single `Iterator[BaseEvent]` callable in `screencap.engine.export`. Eliminates the prior three near-duplicate row-to-event transforms and the `if cloud_intent: build_filter() else None` pattern that previously caused a Slack-title leak. Recovery now produces v2 JSONL byte-identical to the chunk processor for the same time range.
+- **`write_events_jsonl` streaming writer:** Shared atomic writer used by chunk processing and recovery — writes `_meta` header + Pydantic event JSON to a `.tmp` file, then `os.rename`s into place.
+- **`build_cloud_window_filter` factory:** Single sanctioned construction site for cloud-bound `window.switch` filters in `src/screencap/privacy/filter.py`. Returns `None` when `cloud_bound=False`; an AST-walker CI guard at `tests/test_privacy_filter_call_graph.py` fails the build if any caller passes `window_filter=None` to `unified_export_events` from cloud-bound code.
+
+### Fixed
+- **Slack-title leak in cloud-bound exports closed:** Local recordings later uploaded via `screencap upload` no longer leak window titles. `screencap upload` now always passes `cloud_bound=True` to recovery regardless of `.recording_intent`, which closes the local-then-uploaded threat case.
+- **Scrub-time pointer suppression:** `mouse.move` events whose timestamp falls inside an interval whose privacy action is in `SCRUB_BLOCK_ACTIONS = {EXCLUDE, MASK_WINDOW, TEXT_REDACT, OCR_FALLBACK}` are now dropped during scrubbing — broader than the prior `BLOCK_ACTIONS` so pointer geometry inside content-sensitive contexts (code editors, admin consoles, unverified browsers) is suppressed.
+- **Drag children dropped + parent nulled when drag spans into a blocked interval.** Inline `mouse.move` entries inside merged drag events are dropped via the same predicate.
+- **Overlapping blocked intervals are now handled correctly in scrub-time lookup.**
+- **`allow_apps` neutralized for cloud-bound filter:** Allow-listed apps no longer override matrix EXCLUDE/MASK_WINDOW decisions for cloud uploads; this matches the documented invariant that `allow_apps` cannot bypass matrix EXCLUDE.
+- **Pointer / region / override leaks closed across the privacy layer**, with test coverage gaps filled.
+- **`window_event.disabled` parity in CLI export:** CLI export now applies the same forward-looking `disabled` semantics as the chunk processor.
+- **Recovery threshold SELECT guarded against older-schema DBs.**
+- **Per-recording click thresholds passed through recovery** so chunk-recovered events match live-capture thresholds.
+- **`unified_export_events` catches conversion exceptions per row** instead of aborting the whole export.
+- **Chunk processor preserves fail-soft on `window_event` lock contention.**
+- **Per-chunk fail-soft on filter construction + manifest `.tmp` sweep** in CLI chunk handling.
+
+### Changed
+- **Cloud Run release upload bypasses GH Actions artifact quota:** `release.yml` now uploads tarballs directly to GCS instead of round-tripping through the GH artifact store.
+- **Public-surface type annotations tightened in `privacy` and `exporter`.**
 
 ### Removed
 - **Legacy `capture.db` schema support:** The upstream-project `capture.db` schema (read, write, scrub, viewer, samples paths) is no longer supported. Recordings produced in that format are no longer readable; only `recording.db` (the live engine schema) is supported. `screencap list` skips directories without a `recording.db`.
