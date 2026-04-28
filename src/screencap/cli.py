@@ -1194,6 +1194,106 @@ def export(name, all_recordings, downloads, output, use_stdout, exclude_moves, p
 @cli.command()
 @click.option("--json", "as_json", is_flag=True, default=False,
               help="Emit machine-readable JSON to stdout (no styling, no rich output).")
+@click.option("--include-spotlight", is_flag=True, default=False,
+              help="Also scan via mdfind (slower, more complete). Default: filesystem-only.")
+def apps(as_json, include_spotlight):
+    """List installed macOS apps with their privacy-resolved actions.
+
+    Wraps app_discovery.discover_installed_apps() and evaluates the privacy
+    matrix (with user overrides) for each. Designed for the SwiftUI Privacy
+    pane to render per-app toggles and state badges.
+
+    Output (per app, when --json is set):
+      bundle_id, display_name, path, icon_path, context_class,
+      classification_source, resolved_action, in_exclude_apps,
+      in_allow_apps, is_matrix_exclude
+    """
+    import json as _json
+
+    err_console = Console(stderr=True)
+
+    try:
+        from screencap.app_discovery import auto_classify_detailed, discover_installed_apps
+        from screencap.privacy.actions import PrivacyAction
+        from screencap.privacy.policy import (
+            ContextResult,
+            DefaultPolicyEvaluator,
+            FrameMetadata,
+            PrivacyMode,
+            get_matrix_action,
+        )
+    except ImportError:
+        err_console.print(_RECORD_EXTRAS_MSG)
+        raise SystemExit(1)
+
+    try:
+        from screencap.config import get_privacy_config
+        privacy_cfg = get_privacy_config()
+    except Exception:
+        from screencap.privacy.policy import PrivacyConfig
+        privacy_cfg = PrivacyConfig()
+
+    evaluator = DefaultPolicyEvaluator(privacy_cfg)
+
+    try:
+        installed = discover_installed_apps(use_spotlight=include_spotlight)
+    except Exception as exc:
+        if as_json:
+            sys.stdout.write(_json.dumps({"apps": [], "error": str(exc)}) + "\n")
+            sys.stdout.flush()
+            return
+        err_console.print(f"[red]Error:[/red] {exc}")
+        raise SystemExit(1)
+
+    rows = []
+    for meta in installed:
+        classification = auto_classify_detailed(meta)
+        ctx_class = classification.context_class
+        is_matrix_exclude = all(
+            get_matrix_action(ctx_class, m) == PrivacyAction.EXCLUDE
+            for m in PrivacyMode
+        )
+        frame = FrameMetadata(bundle_id=meta.bundle_id, window_title=meta.display_name)
+        # auto_classify_detailed returns ClassificationResult; the evaluator
+        # expects ContextResult — bridge the two by constructing a fresh
+        # ContextResult that carries the bundle ID as evidence.
+        ctx_result = ContextResult(
+            context_class=ctx_class,
+            confidence="bundle_id",
+            evidence=meta.bundle_id,
+        )
+        decision = evaluator.evaluate(ctx_result, frame)
+
+        rows.append({
+            "bundle_id": meta.bundle_id,
+            "display_name": meta.display_name,
+            "path": meta.path,
+            "icon_path": "",  # populated by SwiftUI from .app/Contents/Resources/<icon>
+            "context_class": ctx_class.value,
+            "classification_source": classification.source,
+            "resolved_action": decision.action.value,
+            "in_exclude_apps": meta.bundle_id in privacy_cfg.exclude_apps,
+            "in_allow_apps": meta.bundle_id in privacy_cfg.allow_apps,
+            "is_matrix_exclude": is_matrix_exclude,
+        })
+
+    if as_json:
+        sys.stdout.write(_json.dumps({"apps": rows}) + "\n")
+        sys.stdout.flush()
+        return
+
+    console.print(f"\n[bold]{len(rows)} apps installed[/bold]\n")
+    for row in rows:
+        badge = "[red]EXCLUDE[/red]" if row["resolved_action"] == "exclude" else (
+            "[yellow]MASK[/yellow]" if "mask" in row["resolved_action"] else "[green]ALLOW[/green]"
+        )
+        console.print(f"  {badge} {row['display_name']} ({row['bundle_id']})")
+    console.print()
+
+
+@cli.command()
+@click.option("--json", "as_json", is_flag=True, default=False,
+              help="Emit machine-readable JSON to stdout (no styling, no rich output).")
 def status(as_json):
     """Report recording state without IPC.
 
