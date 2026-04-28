@@ -406,6 +406,115 @@ class TestEdgeCases:
 
 
 # ---------------------------------------------------------------------------
+# Conversion-exception tolerance (regression: pre-refactor chunk processor's
+# try/except around dict_to_action_event was lost, causing a single bad row
+# to crash the entire chunk export).
+# ---------------------------------------------------------------------------
+
+
+class TestMalformedRowToleratesExceptions:
+    """Rows that raise during ``dict_to_action_event`` are skipped, not propagated.
+
+    Restored from the pre-refactor chunk processor's behavior. Without this,
+    one bad row crashes the entire chunk export, and recovery's
+    skip-on-error policy then loses the WHOLE chunk instead of just the bad
+    row. ``TestEdgeCases.test_all_malformed_action_rows_yields_no_events``
+    covers the None-return path; this class covers the raise path.
+    """
+
+    def test_row_raising_validation_error_is_skipped(self, caplog):
+        """A click row with a non-numeric ``timestamp`` raises Pydantic
+        ``ValidationError`` inside the converter. The unified pipeline must
+        skip it (with a debug log) and continue processing the surrounding
+        good rows, yielding the expected merged event(s).
+        """
+        # Two good clicks at the same position bracketing a bad row. The
+        # good pair (down at t=1.0, up at t=2.0) merges into a singleclick
+        # via process_events.
+        good_down = _action_row(
+            1.0, "click", mouse_x=100, mouse_y=200, mouse_pressed=True,
+        )
+        good_up = _action_row(
+            2.0, "click", mouse_x=100, mouse_y=200, mouse_pressed=False,
+        )
+        # `timestamp="not-a-number"` triggers a Pydantic float_parsing
+        # validation error inside MouseDownEvent construction. Confirmed
+        # by direct invocation of dict_to_action_event with this input.
+        bad_row = {
+            "name": "click",
+            "timestamp": "not-a-number",
+            "mouse_button_name": "left",
+            "mouse_pressed": True,
+            "mouse_x": 100,
+            "mouse_y": 200,
+            "mouse_pressure": None,
+            "modifier_flags": None,
+            "mouse_dx": 0,
+            "mouse_dy": 0,
+            "key_char": None,
+            "key_name": None,
+            "key_vk": None,
+            "canonical_key_char": None,
+            "canonical_key_name": None,
+            "canonical_key_vk": None,
+            "scroll_phase": None,
+            "momentum_phase": None,
+            "is_continuous": None,
+        }
+
+        import logging
+
+        with caplog.at_level(logging.DEBUG, logger="screencap.engine.export"):
+            events = list(unified_export_events(
+                [good_down, bad_row, good_up], [],
+            ))
+
+        # The good down/up pair merged into one MouseClickEvent.
+        # The bad row was skipped, not propagated.
+        assert len(events) == 1
+        assert isinstance(events[0], MouseClickEvent)
+        assert events[0].x == 100
+        assert events[0].y == 200
+
+        # A debug log was emitted for the skipped row, including its
+        # malformed timestamp value for traceability.
+        assert any(
+            "Skipping malformed action event" in rec.message
+            and "not-a-number" in rec.message
+            for rec in caplog.records
+        ), f"Expected skip-debug log; got: {[r.message for r in caplog.records]}"
+
+    def test_multiple_raising_rows_all_skipped(self):
+        """Several rows that raise are all skipped; surrounding good rows
+        still produce the expected output.
+        """
+        good_move = _action_row(1.0, "move", mouse_x=10, mouse_y=20)
+        # Use a sentinel object that fails Pydantic float coercion
+        # (confirmed via direct dict_to_action_event invocation).
+        sentinel = object()
+        bad1 = {
+            "name": "move",
+            "timestamp": sentinel,
+            "mouse_x": 0,
+            "mouse_y": 0,
+            "mouse_pressure": None,
+            "modifier_flags": None,
+        }
+        bad2 = {
+            "name": "smart_magnify",
+            "timestamp": 1.5,
+            "mouse_x": sentinel,  # raises TypeError inside float() coercion
+            "mouse_y": 0,
+        }
+
+        events = list(unified_export_events([good_move, bad1, bad2], []))
+        # The single good move survives; both bad rows are skipped.
+        assert len(events) == 1
+        assert isinstance(events[0], MouseMoveEvent)
+        assert events[0].x == 10
+
+
+# ---------------------------------------------------------------------------
 # window_filter (R5).
 # ---------------------------------------------------------------------------
 

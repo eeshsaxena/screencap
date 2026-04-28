@@ -20,6 +20,7 @@ suppression at the scrub layer, not here). Callers handle:
 
 from __future__ import annotations
 
+import logging
 from typing import TYPE_CHECKING, Callable, Iterator
 
 from screencap.engine.events import BaseEvent, WindowSwitchEvent
@@ -34,6 +35,8 @@ from screencap.engine.processing import (
 
 if TYPE_CHECKING:  # pragma: no cover - import-only typing hint
     from screencap.engine.events import ActionEvent
+
+logger = logging.getLogger(__name__)
 
 
 def unified_export_events(
@@ -51,9 +54,15 @@ def unified_export_events(
     Steps (mirroring today's CLI export):
 
     1. Convert ``action_rows`` to Pydantic action events via
-       ``dict_to_action_event``; rows that return ``None`` are skipped
-       silently (matching the chunk processor's tolerance for malformed
-       rows).
+       ``dict_to_action_event``; rows that return ``None`` (unrecognized
+       shapes) are skipped silently, and rows that **raise** during
+       conversion (e.g., Pydantic ``ValidationError`` on type-wrong
+       fields, ``KeyError``, ``TypeError``) are also skipped with a
+       debug-level log entry. This mirrors the pre-refactor chunk
+       processor's tolerance — without the inner try/except, one bad
+       row would crash the entire chunk export, and recovery's
+       skip-on-error policy would then lose the WHOLE chunk instead
+       of just the bad row.
     2. Run ``process_events`` (the 11-stage merge pipeline) with the
        provided thresholds.
     3. ``MouseMoveEvent`` is **not** filtered here (R7). Callers that
@@ -116,10 +125,25 @@ def unified_export_events(
     """
     from screencap.engine.convert import dict_to_action_event
 
-    # 1. Convert action_rows to Pydantic events; skip rows that return None.
+    # 1. Convert action_rows to Pydantic events; skip rows that fail
+    #    conversion. ``dict_to_action_event`` returns ``None`` for
+    #    unrecognized shapes (handled silently) but can RAISE for
+    #    type-wrong values (Pydantic ``ValidationError``, ``KeyError``,
+    #    ``TypeError``, etc.). Mirrors the pre-refactor chunk processor's
+    #    tolerance — without this try/except, one bad row would crash
+    #    the entire chunk export, and recovery's skip-on-error policy
+    #    would then lose the WHOLE chunk instead of just the bad row.
     actions: list[ActionEvent] = []
     for row in action_rows:
-        evt = dict_to_action_event(row)
+        try:
+            evt = dict_to_action_event(row)
+        except Exception as exc:
+            logger.debug(
+                "Skipping malformed action event at ts=%s: %s",
+                row.get("timestamp", "?"),
+                exc,
+            )
+            continue
         if evt is not None:
             actions.append(evt)
 
