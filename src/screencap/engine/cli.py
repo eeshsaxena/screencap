@@ -85,7 +85,8 @@ def visualize(
     import subprocess
     import sys
 
-    from screencap.engine.visualize import create_demo, create_html
+    from screencap.engine.visualize import create_html
+    from screencap.engine.visualize.demo import create_demo
     from screencap.engine.visualize.html import (
         DEFAULT_VIEWER_FRAME_QUALITY,
         DEFAULT_VIEWER_FRAME_SCALE,
