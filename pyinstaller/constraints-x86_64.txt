@@ -3,8 +3,11 @@
 # filter pip's wheel selection — pip reads the runner's actual OS version,
 # which on macos-15-intel picks macosx_14_0 wheels and fails the minos check.
 
-# numpy 2.1+ ships macosx_14_0_x86_64 wheels pip prefers over macosx_10_13.
-numpy>=1.20.0,<2.1
+# numpy 2.0+ ships only macosx_14_0_x86_64 wheels for cp312 — there is no
+# macosx_11_0 cp312 x86_64 wheel for the 2.0.x line, so pip cannot pick a
+# Big-Sur-compatible wheel even with MACOSX_DEPLOYMENT_TARGET=11.0 set.
+# 1.26.4 is the last cp312 line with macosx_10_9_x86_64 wheels.
+numpy>=1.20.0,<2.0
 
 # av 14+ has no cp312 x86_64 wheel; 13.x ships macosx_10_13_x86_64.
 av>=13.0,<14
