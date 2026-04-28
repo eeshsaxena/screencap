@@ -483,6 +483,16 @@ class SessionController:
                 sys.stdout.write(json.dumps({"status": "already_running", "owner": exc.owner}) + "\n")
                 sys.stdout.flush()
                 raise SystemExit(2) from None
+            # Unit 8a: emit the `started` lifecycle event for SwiftUI.
+            try:
+                from screencap.cli import _emit_event
+                _emit_event(
+                    "started",
+                    capture_dir=str(Path(".").resolve()),
+                    claimant=claimant,
+                )
+            except Exception:
+                pass
         except SystemExit:
             raise
         except Exception:
@@ -929,7 +939,30 @@ class SessionController:
 
     def _enqueue_postprocess_for_worker(self, rw: _RecordingWorker) -> None:
         """Build a :class:`PostProcessJob` from a finished worker and queue it."""
-        disk_full = bool(_read_recording_ready(rw.capture_dir).get("disk_full", False))
+        ready_meta = _read_recording_ready(rw.capture_dir)
+        disk_full = bool(ready_meta.get("disk_full", False))
+
+        # Unit 8a: emit recording_finalized as soon as the recording worker's
+        # capture has finished writing (`.recording_ready`) — this is what
+        # SwiftUI polls on for Recordings list refresh, and it fires well
+        # before background post-processing (chunk upload / NLP scrub) returns.
+        try:
+            from screencap.cli import _emit_event
+            _emit_event(
+                "recording_finalized",
+                name=rw.name,
+                duration_seconds=float(ready_meta.get("elapsed", 0.0)),
+                force_stopped=bool(ready_meta.get("force_stopped", False)),
+                disk_full=disk_full,
+            )
+            if disk_full:
+                _emit_event(
+                    "disk_full",
+                    name=rw.name,
+                    capture_dir=str(rw.capture_dir),
+                )
+        except Exception:
+            pass
 
         job = PostProcessJob(
             name=rw.name,

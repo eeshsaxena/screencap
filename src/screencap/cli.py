@@ -83,6 +83,44 @@ def _download_nlp_models() -> None:
     _do_download()
 
 
+# ---------------------------------------------------------------------------
+# Unit 8a: structured stderr event contract
+# ---------------------------------------------------------------------------
+#
+# SwiftUI's RecorderController.spawn parses these line-buffered JSON events
+# off the screencap subprocess's stderr to drive UI state transitions. Schema
+# is the cross-language contract — see docs/research/stderr-event-schema.md.
+#
+# Events: started, chunk_finalized, recording_finalized, disk_full,
+#         permission_lost, stopped
+# Exit codes: 0=clean, 2=lock-held (Unit 3), 3=permission_lost (Unit 8),
+#             4=disk_full
+#
+# ``permission_lost`` is emitted from src/screencap/recorder.py (Unit 8).
+# ``chunk_finalized`` is emitted from src/screencap/session.py.
+# ``disk_full`` is emitted from src/screencap/session.py (DiskFullError catch).
+# All other events are emitted from the screencap start command flow below.
+
+_EVENT_SCHEMA_VERSION = 1
+
+
+def _emit_event(event_type: str, **fields) -> None:
+    """Write a single JSON line to stderr describing a recorder lifecycle event.
+
+    Always flushes — SwiftUI's line-buffered reader needs immediate delivery.
+    Failures are swallowed so a broken stderr never breaks the recorder.
+    """
+    import json as _json
+    import time as _time
+
+    payload = {"type": event_type, "ts": _time.time(), **fields}
+    try:
+        sys.stderr.write(_json.dumps(payload) + "\n")
+        sys.stderr.flush()
+    except Exception:
+        pass
+
+
 def _maybe_download_nlp_models() -> None:
     """Prompt to download GLiNER + spaCy models if not already cached."""
     from screencap.privacy import are_nlp_models_cached
@@ -513,13 +551,20 @@ def start(
     }
 
     controller = SessionController(cli_args)
+    # SessionController.__init__ already claimed the lock + emitted `started`
+    # via the path inside session.py — no need to re-emit here.
+    exit_code = 0
     try:
         controller.run()
-    except SystemExit:
+    except SystemExit as se:
+        exit_code = int(getattr(se, "code", 0) or 0)
+        _emit_event("stopped", exit_code=exit_code)
         raise
     except Exception as exc:  # noqa: BLE001
         console.print(f"[red]Session controller error:[/red] {exc}")
+        _emit_event("stopped", exit_code=1, error=str(exc))
         raise SystemExit(1)
+    _emit_event("stopped", exit_code=exit_code)
 
 
 def _legacy_start_recording(
