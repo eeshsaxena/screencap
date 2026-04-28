@@ -215,6 +215,32 @@ def _run_menubar(
       / Stop / Quit clicks, overrides, disables). The legacy ``*_q``
       params are ignored.
     """
+    # Unit 6 (v1 transitional): when the SwiftUI app spawns ``screencap
+    # start`` with ``SCREENCAP_PARENT=swiftui``, the SwiftUI shell owns
+    # the menu bar. Returning here keeps the rest of the SessionController
+    # lifecycle intact — best-effort writes to ``_control_q`` succeed
+    # without a consumer (per docs/architecture/session.md). Standalone
+    # CLI invocations (no env var) get the rumps menu bar as before.
+    # Full deletion of this module + the cross-cutting refactor (IPC
+    # cleanup, `.menubar_overrides.json` migration, [menubar] config
+    # removal, scrub_worker rewiring) is a separate v2 cleanup ticket.
+    # Note: this env var is a behavior-routing hint, NOT an
+    # authentication mechanism — any local process that sets it gets
+    # the no-op behavior. Do not use it for security decisions.
+    if os.environ.get("SCREENCAP_PARENT") == "swiftui":
+        try:
+            import json as _json
+            sys.stderr.write(
+                _json.dumps({
+                    "type": "menubar_neutralized_by_env",
+                    "env": "SCREENCAP_PARENT=swiftui",
+                }) + "\n"
+            )
+            sys.stderr.flush()
+        except Exception:
+            pass
+        return
+
     _dlog(
         f"_run_menubar START: parent_pid={parent_pid} name={recording_name!r} "
         f"prompt_enabled={prompt_enabled} "
