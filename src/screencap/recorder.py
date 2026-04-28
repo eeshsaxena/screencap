@@ -620,6 +620,21 @@ def start_recording(
     else:
         capture_dir = get_recordings_dir() / name
 
+    # Process-exclusive lock — only the standalone CLI direct path claims
+    # here. In session mode the SessionController parent has already claimed
+    # at __init__, and workers (start_recording invoked with
+    # _skip_pidfile=True) inherit that lock by being children.
+    if not _skip_pidfile:
+        from screencap.pidfile import LockContended, claim_lock
+
+        claimant = "swiftui" if os.environ.get("SCREENCAP_PARENT") == "swiftui" else "cli"
+        try:
+            claim_lock(capture_dir, claimant=claimant)
+        except LockContended as exc:
+            sys.stdout.write(json.dumps({"status": "already_running", "owner": exc.owner}) + "\n")
+            sys.stdout.flush()
+            raise SystemExit(2) from None
+
     if capture_dir.exists() and any(capture_dir.iterdir()):
         console.print(
             f"[red]Error:[/red] Directory already exists and is not empty: {capture_dir}"

@@ -466,6 +466,28 @@ class SessionController:
             write_pidfile(Path("."), [])
         except Exception:
             pass
+
+        # Process-exclusive lock — held for the controller's lifetime so a
+        # second `screencap start` during inter-recording idle is rejected.
+        # Workers (run_recording_worker → start_recording with
+        # _skip_pidfile=True) do NOT claim; they inherit the controller's lock
+        # by virtue of being children. Lock auto-releases on death even if
+        # explicit cleanup is missed.
+        try:
+            from screencap.pidfile import LockContended, claim_lock
+
+            claimant = "swiftui" if os.environ.get("SCREENCAP_PARENT") == "swiftui" else "cli"
+            try:
+                claim_lock(Path("."), claimant=claimant)
+            except LockContended as exc:
+                sys.stdout.write(json.dumps({"status": "already_running", "owner": exc.owner}) + "\n")
+                sys.stdout.flush()
+                raise SystemExit(2) from None
+        except SystemExit:
+            raise
+        except Exception:
+            pass
+
         atexit.register(self._atexit_cleanup)
 
         # Spawn menubar once up-front. It will initially render the IDLE

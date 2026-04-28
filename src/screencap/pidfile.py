@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import fcntl
 import json
 import os
 import signal
@@ -12,6 +13,25 @@ import psutil
 
 _DEFAULT_BASE = Path.home() / ".screencap"
 PID_FILE = _DEFAULT_BASE / "recording.pid"
+
+# Process-exclusive lock file (separate from PID_FILE so legacy readers of
+# recording.pid keep working unchanged). Kernel-managed flock auto-releases
+# on process death — no stale-lock cleanup needed.
+LOCK_DIR = _DEFAULT_BASE / "run"
+LOCK_FILE = LOCK_DIR / "recording.lock"
+
+# Module-global fd holding the active flock. Held for the lifetime of the
+# claiming process; kernel releases on death even if release_lock() is not
+# called. A second claim_lock() in the same process is a no-op.
+_LOCKED_FD: int | None = None
+
+
+class LockContended(Exception):
+    """Raised when claim_lock cannot acquire the lock — another holder is alive."""
+
+    def __init__(self, owner: dict | None = None):
+        self.owner = owner or {}
+        super().__init__(f"recording lock held by another process: {self.owner}")
 
 
 def write_pidfile(
@@ -158,3 +178,114 @@ def _pid_exists(pid: int) -> bool:
         return psutil.pid_exists(pid)
     except Exception:
         return False
+
+
+def claim_lock(capture_dir: Path | str, claimant: str = "cli") -> int:
+    """Acquire an exclusive flock on LOCK_FILE; write JSON metadata into it.
+
+    Args:
+        capture_dir: Recording directory (informational; written into the lock).
+        claimant: "cli" for standalone invocations, "swiftui" when spawned by
+            the SwiftUI app (via ``SCREENCAP_PARENT=swiftui``).
+
+    Returns:
+        The locked file descriptor (kept open; held in module-global state).
+        Subsequent calls in the same process are no-ops and return the same fd.
+
+    Raises:
+        LockContended: If another live process holds the lock. The exception
+            carries the existing lock metadata in ``.owner`` for diagnostics.
+    """
+    global _LOCKED_FD
+    if _LOCKED_FD is not None:
+        return _LOCKED_FD
+
+    LOCK_DIR.mkdir(parents=True, exist_ok=True)
+    fd = os.open(str(LOCK_FILE), os.O_RDWR | os.O_CREAT, 0o600)
+    try:
+        fcntl.flock(fd, fcntl.LOCK_EX | fcntl.LOCK_NB)
+    except BlockingIOError:
+        try:
+            existing = json.loads(LOCK_FILE.read_text() or "{}")
+        except (json.JSONDecodeError, OSError):
+            existing = {}
+        os.close(fd)
+        raise LockContended(owner=existing) from None
+
+    metadata = {
+        "pid": os.getpid(),
+        "started_at": time.time(),
+        "capture_dir": str(capture_dir),
+        "claimant": claimant,
+    }
+    payload = json.dumps(metadata).encode()
+    os.ftruncate(fd, 0)
+    os.lseek(fd, 0, os.SEEK_SET)
+    os.write(fd, payload)
+    os.fsync(fd)
+
+    _LOCKED_FD = fd
+    return fd
+
+
+def release_lock() -> None:
+    """Release the flock held by this process. No-op if not held.
+
+    Kernel auto-releases on process death; calling this is optional but lets
+    long-lived parents (e.g., SessionController across multiple recordings)
+    explicitly release between recordings if ever needed.
+    """
+    global _LOCKED_FD
+    if _LOCKED_FD is None:
+        return
+    try:
+        fcntl.flock(_LOCKED_FD, fcntl.LOCK_UN)
+    except OSError:
+        pass
+    try:
+        os.close(_LOCKED_FD)
+    except OSError:
+        pass
+    _LOCKED_FD = None
+
+
+def read_lock_metadata() -> dict | None:
+    """Read the lock file's JSON content without acquiring the flock.
+
+    Used by ``screencap status --json`` and ``screencap stop`` to inspect the
+    current holder without contending. Returns None if the file is missing or
+    unparseable (treat as "no recording active").
+    """
+    if not LOCK_FILE.exists():
+        return None
+    try:
+        return json.loads(LOCK_FILE.read_text())
+    except (json.JSONDecodeError, OSError):
+        return None
+
+
+def lock_is_active() -> bool:
+    """Return True iff some live process holds the flock on LOCK_FILE.
+
+    Detects the stale-lock case (file exists, last holder died, kernel
+    auto-released) by attempting a non-blocking flock on a probe fd; success
+    means no holder. Probe lock is released immediately.
+    """
+    if not LOCK_FILE.exists():
+        return False
+    try:
+        probe_fd = os.open(str(LOCK_FILE), os.O_RDWR)
+    except OSError:
+        return False
+    try:
+        try:
+            fcntl.flock(probe_fd, fcntl.LOCK_EX | fcntl.LOCK_NB)
+            fcntl.flock(probe_fd, fcntl.LOCK_UN)
+            return False
+        except BlockingIOError:
+            return True
+    finally:
+        try:
+            os.close(probe_fd)
+        except OSError:
+            pass

@@ -1083,6 +1083,7 @@ def stop(force):
             _pid_exists,
             delete_pidfile,
             find_orphaned_processes,
+            read_lock_metadata,
             read_pidfile,
             terminate_processes,
         )
@@ -1090,11 +1091,22 @@ def stop(force):
         console.print(_RECORD_EXTRAS_MSG)
         raise SystemExit(1)
 
-    # Try graceful shutdown via SIGTERM to parent process first
+    # Try graceful shutdown via SIGTERM to parent process first.
+    # Prefer the flock-protected lock metadata (Unit 3) — it's the canonical
+    # owner and works correctly for multiprocessing.spawn workers (per
+    # docs/tickets/high-2026-03-10-fix-orphan-detection-spawn-workers.md).
+    # Fall back to legacy recording.pid for back-compat with any holder that
+    # hasn't migrated.
     if not force:
-        data = read_pidfile()
-        if data and data.get("parent_pid"):
-            parent_pid = data["parent_pid"]
+        lock_meta = read_lock_metadata()
+        parent_pid = None
+        if lock_meta and lock_meta.get("pid"):
+            parent_pid = lock_meta["pid"]
+        else:
+            data = read_pidfile()
+            if data and data.get("parent_pid"):
+                parent_pid = data["parent_pid"]
+        if parent_pid is not None:
             if _pid_exists(parent_pid) and _is_screencap_process(parent_pid):
                 console.print(f"Sending stop signal to recording (PID {parent_pid})...")
                 try:
