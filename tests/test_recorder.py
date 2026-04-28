@@ -113,7 +113,7 @@ class TestOrphanDetection:
             mock.patch("screencap.pidfile.terminate_processes") as mock_term,
             mock.patch("screencap.pidfile.delete_pidfile"),
             mock.patch("screencap.pidfile.write_pidfile"),
-            mock.patch("screencap.engine.Recorder", FakeRecorder),
+            mock.patch("screencap.engine.recorder.Recorder", FakeRecorder),
         ):
             start_recording("test", output_dir=tmp_path / "test-rec", force_clean=True)
 
@@ -363,7 +363,7 @@ class TestPreRecordingDiskCheck:
             mock.patch("screencap.pidfile.find_orphaned_processes", return_value=[]),
             mock.patch("screencap.pidfile.write_pidfile"),
             mock.patch("screencap.pidfile.delete_pidfile"),
-            mock.patch("screencap.engine.Recorder", FakeRecorder),
+            mock.patch("screencap.engine.recorder.Recorder", FakeRecorder),
         ):
             capture_dir, elapsed, _, _ = start_recording("test", output_dir=tmp_path / "test-rec")
             assert capture_dir.exists()
@@ -421,7 +421,7 @@ class TestPreRecordingDiskCheck:
             mock.patch("screencap.pidfile.find_orphaned_processes", return_value=[]),
             mock.patch("screencap.pidfile.write_pidfile"),
             mock.patch("screencap.pidfile.delete_pidfile"),
-            mock.patch("screencap.engine.Recorder") as MockRecorder,
+            mock.patch("screencap.engine.recorder.Recorder") as MockRecorder,
         ):
             MockRecorder.return_value.__enter__ = mock.MagicMock(return_value=mock_recorder)
             MockRecorder.return_value.__exit__ = mock.MagicMock(return_value=False)
@@ -451,7 +451,7 @@ class TestPreRecordingDiskCheck:
             mock.patch("screencap.pidfile.find_orphaned_processes", return_value=[]),
             mock.patch("screencap.pidfile.write_pidfile"),
             mock.patch("screencap.pidfile.delete_pidfile"),
-            mock.patch("screencap.engine.Recorder") as MockRecorder,
+            mock.patch("screencap.engine.recorder.Recorder") as MockRecorder,
         ):
             MockRecorder.return_value.__enter__ = mock.MagicMock(return_value=mock_recorder)
             MockRecorder.return_value.__exit__ = mock.MagicMock(return_value=False)
@@ -545,7 +545,7 @@ class TestPrivacyFilterInitFailure:
                 "screencap.privacy.recorder_enforcement.RecorderPrivacyFilter",
                 side_effect=RuntimeError("missing dep"),
             ),
-            mock.patch("screencap.engine.Recorder"),
+            mock.patch("screencap.engine.recorder.Recorder"),
         ):
             with pytest.raises(SystemExit):
                 start_recording("test", output_dir=tmp_path / "test-rec")
@@ -571,7 +571,7 @@ class TestPrivacyFilterInitFailure:
                 "screencap.privacy.recorder_enforcement.RecorderPrivacyFilter",
                 side_effect=RuntimeError("missing dep"),
             ),
-            mock.patch("screencap.engine.Recorder") as MockRecorder,
+            mock.patch("screencap.engine.recorder.Recorder") as MockRecorder,
             pytest.raises(SystemExit) as exc_info,
         ):
             MockRecorder.return_value.__enter__ = mock.MagicMock()
@@ -783,7 +783,7 @@ class TestCloudIntentRecording:
                 "screencap.privacy.recorder_enforcement.RecorderPrivacyFilter",
                 side_effect=lambda config, **kw: FakeFilter(config, **kw),
             ),
-            mock.patch("screencap.engine.Recorder") as MockRecorder,
+            mock.patch("screencap.engine.recorder.Recorder") as MockRecorder,
             mock.patch("screencap.engine.config.config") as mock_engine_config,
         ):
             mock_engine_config.RECORD_WINDOW_DATA = True
@@ -815,7 +815,7 @@ class TestCloudIntentRecording:
             mock.patch("shutil.disk_usage", return_value=_PLENTY_OF_DISK),
             mock.patch("screencap.config.get_privacy_config", return_value=config),
             mock.patch("screencap.privacy.recorder_enforcement.RecorderPrivacyFilter") as MockFilter,
-            mock.patch("screencap.engine.Recorder") as MockRecorder,
+            mock.patch("screencap.engine.recorder.Recorder") as MockRecorder,
             mock.patch("screencap.engine.config.config") as mock_engine_config,
             mock.patch("screencap.recorder.console") as mock_console,
         ):
@@ -836,3 +836,41 @@ class TestCloudIntentRecording:
         print_calls = [str(c) for c in mock_console.print.call_args_list]
         warning_printed = any("Cloud Recording Privacy Notice" in str(c) for c in print_calls)
         assert warning_printed, f"Privacy warning not found in console output: {print_calls}"
+
+
+class TestHeadlessRecorderUnavailable:
+    """Verifies the friendly headless fallback when screencap.engine.recorder cannot be imported."""
+
+    def test_recorder_import_failure_exits_with_friendly_message(self, tmp_path):
+        """When screencap.engine.recorder is unimportable, start_recording exits 1 with the friendly message.
+
+        The function-local import in recorder.py:691 sits inside a try/except ImportError that
+        sets Recorder = None and triggers the user-facing 'Recorder not available' message.
+        Poisoning sys.modules forces the ImportError branch.
+        """
+        from screencap.recorder import start_recording
+
+        with (
+            mock.patch("screencap.recorder._check_macos_permissions"),
+            mock.patch("screencap.recorder.get_audio_default", return_value=False),
+            mock.patch("screencap.recorder.get_wifi_metrics", return_value=False),
+            mock.patch("screencap.recorder.get_disk_warn_mb", return_value=2000),
+            mock.patch("screencap.recorder.get_disk_stop_mb", return_value=500),
+            mock.patch("shutil.disk_usage", return_value=_PLENTY_OF_DISK),
+            mock.patch("screencap.pidfile.find_orphaned_processes", return_value=[]),
+            mock.patch("screencap.pidfile.write_pidfile"),
+            mock.patch("screencap.pidfile.delete_pidfile"),
+            mock.patch.dict(sys.modules, {"screencap.engine.recorder": None}),
+            mock.patch("screencap.recorder.console") as mock_console,
+        ):
+            with pytest.raises(SystemExit) as exc_info:
+                start_recording("test", output_dir=tmp_path / "test-rec")
+
+        assert exc_info.value.code == 1
+        print_calls = [str(c) for c in mock_console.print.call_args_list]
+        assert any("Recorder not available" in c for c in print_calls), (
+            f"Friendly headless message not found in console output: {print_calls}"
+        )
+        assert any("pynput" in c for c in print_calls), (
+            f"pynput dependency hint not found in console output: {print_calls}"
+        )

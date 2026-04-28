@@ -51,7 +51,7 @@ Linting uses `ruff` for the engine sub-package: `ruff check src/screencap/engine
 - `engine/dedup.py` — perceptual hashing (dHash) for screenshot deduplication
 - `engine/visualize/` — demo GIF and HTML viewer generation
 
-All engine imports from `screencap` source are deferred (inside function bodies) to keep `screencap --help` fast. The `engine/__init__.py` does heavy re-exports (~60 symbols).
+All engine imports from `screencap` source are deferred (inside function bodies) to keep `screencap --help` fast. `engine/__init__.py` exposes a curated 4-name surface (`Capture`, `CaptureSession`, `create_html`, `__version__`); deeper symbols import directly from their submodules.
 
 ## Privacy System (`src/screencap/privacy/`)
 
@@ -135,3 +135,4 @@ Two-layer privacy enforcement: capture-time filtering + post-recording scrubbing
 - SQLite access in the `screencap` layer uses raw `sqlite3`, not SQLAlchemy.
 - Recording dirs live at `~/.screencap/recordings/<name>/`.
 - Tests use `click.testing.CliRunner`, `unittest.mock.patch`, and `tmp_path` fixtures with inline SQLite setup.
+- `engine/__init__.py` exposes only `Capture`, `CaptureSession`, `create_html`, and `__version__`; all other engine symbols import from their defining submodules.
