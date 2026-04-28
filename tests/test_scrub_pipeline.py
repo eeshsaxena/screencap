@@ -1026,8 +1026,14 @@ class TestMouseMoveSuppression:
         moves = [e for e in scrubbed if e.get("type") == "mouse.move"]
         assert [m["timestamp"] for m in moves] == [2005.0]
 
-    def test_drag_in_interval_keeps_drag_drops_move_children(self, tmp_path):
-        """mouse.drag with mouse.move children — children dropped, drag retained."""
+    def test_drag_in_interval_keeps_drag_drops_all_in_interval_children(
+        self, tmp_path,
+    ):
+        """mouse.drag with all children inside a blocked interval — drag
+        retained as audit shell with coordinates nulled, but EVERY child
+        whose timestamp lands inside the interval is dropped (mouse.move
+        AND mouse.down AND mouse.up all carry coordinates inside the
+        blocked interval)."""
         events = [
             {
                 "type": "mouse.drag",
@@ -1065,11 +1071,21 @@ class TestMouseMoveSuppression:
         scrubbed, _ = _scrub_with_intervals(tmp_path, events, intervals)
 
         drags = [e for e in scrubbed if e.get("type") == "mouse.drag"]
-        assert len(drags) == 1, "mouse.drag itself must be retained"
-        child_types = [c.get("type") for c in drags[0]["children"]]
-        assert "mouse.move" not in child_types, "in-interval mouse.move children dropped"
-        # mouse.down and mouse.up children retained
-        assert child_types == ["mouse.down", "mouse.up"]
+        assert len(drags) == 1, "mouse.drag itself must be retained as audit shell"
+        # Every child timestamp (1005.0, 1005.5, 1006.0, 1007.0) lands
+        # inside [1000.0, 1010.0) — all dropped regardless of type.
+        # Pre-fix the mouse.down/mouse.up survived and leaked the
+        # start/end coordinates of the drag.
+        assert drags[0]["children"] == [], (
+            "all children with timestamps inside the blocked interval must "
+            "be dropped (mouse.up/mouse.down leak coordinates as much as "
+            "mouse.move waypoints do)"
+        )
+        # Parent drag coordinates also nulled (pre-existing behavior).
+        assert drags[0]["x"] is None
+        assert drags[0]["y"] is None
+        assert drags[0]["dx"] is None
+        assert drags[0]["dy"] is None
 
     def test_drag_outside_interval_keeps_all_children(self, tmp_path):
         """drag with mouse.move children outside any blocked interval — all kept."""
@@ -1470,13 +1486,18 @@ class TestMergedMouseMoveTimeRangeLeak:
         )
         assert move_children[0]["timestamp"] == 0.5
 
-    def test_merged_move_last_timestamp_at_interval_start_boundary_retained(
+    def test_merged_move_last_timestamp_at_interval_start_boundary_dropped(
         self, tmp_path,
     ):
-        """Boundary: merged move whose ``last_timestamp`` lands EXACTLY on
-        an interval ``start_ts`` is RETAINED (half-open ``[start, end)``
-        convention — start is inclusive for events AT the boundary, but
-        a move ending AT the boundary did not cross into the interval)."""
+        """M-1 fix: merged move whose ``last_timestamp`` lands EXACTLY on
+        an interval ``start_ts`` is DROPPED. The half-open ``[start, end)``
+        convention makes ``start`` inclusive — the last waypoint at
+        ``t == blocked.start`` IS inside the blocked interval and may
+        carry in-interval pointer coordinates. Pre-fix the forward branch
+        of ``_interval_intersects`` used ``i.start < end_ts`` (strict),
+        so ``10 < 10`` was False and the move slipped through, leaking
+        the last waypoint's coordinates. Post-fix the check is
+        ``i.start <= end_ts`` (inclusive)."""
         events = [
             self._make_merged_move(
                 ts=0.9,
@@ -1494,9 +1515,10 @@ class TestMergedMouseMoveTimeRangeLeak:
         scrubbed, _ = _scrub_with_intervals(tmp_path, events, intervals)
 
         moves = [e for e in scrubbed if e.get("type") == "mouse.move"]
-        assert len(moves) == 1, (
-            "merged move ending exactly at interval start (half-open boundary) "
-            "must be retained"
+        assert moves == [], (
+            "merged move ending exactly at interval start (half-open boundary, "
+            "start inclusive) must be dropped — the last waypoint is AT the "
+            "blocked interval's start"
         )
 
     def test_merged_move_last_timestamp_just_past_interval_start_dropped(
@@ -2197,3 +2219,534 @@ class TestOverlappingIntervalsLookup:
             "must be dropped despite a shorter secure-field EXCLUDE "
             "interval starting at 1020 having already ended."
         )
+
+
+class TestDragSpansIntoBlockedInterval:
+    """Bug H: a ``mouse.drag`` whose START is OUTSIDE a blocked interval
+    but whose CHILDREN extend INTO the interval was leaking the END
+    coordinate ``(x+dx, y+dy)`` and any non-mouse.move children
+    (mouse.up/mouse.down) whose timestamps landed inside the interval.
+
+    Pre-fix the parent-only ``find_blocked_interval(event_ts)`` check
+    saw the drag's start outside any interval and skipped nulling.
+    The mouse.move children filter dropped only mouse.move children,
+    leaving mouse.up/mouse.down survivors with in-interval coordinates.
+
+    Post-fix: compute the drag's effective span from its children, range-
+    overlap-test it, and if any overlap exists drop EVERY in-interval
+    child plus null the parent drag's coordinate fields.
+    """
+
+    def test_drag_starts_outside_ends_inside_blocked_interval(self, tmp_path):
+        """Drag start at t=0.9 (outside), mouse.up child at t=1.5 (inside
+        [1.0, 2.0) MASK_WINDOW). Pre-fix the parent x/y/dx/dy survived
+        and the mouse.up child survived too. Post-fix everything is
+        suppressed."""
+        events = [
+            {
+                "type": "mouse.drag",
+                "timestamp": 0.9,
+                "x": 100.0, "y": 200.0,
+                "dx": 400.0, "dy": 100.0,
+                "button": "left",
+                "children": [
+                    {
+                        "type": "mouse.down",
+                        "timestamp": 0.9,
+                        "x": 100.0, "y": 200.0,
+                        "button": "left",
+                    },
+                    {
+                        "type": "mouse.up",
+                        "timestamp": 1.5,  # inside blocked interval
+                        "x": 500.0, "y": 300.0,
+                        "button": "left",
+                    },
+                ],
+            },
+        ]
+        intervals = [
+            BlockedInterval(
+                start=1.0, end=2.0,
+                action=PrivacyAction.MASK_WINDOW,
+                reason=ReasonCode.POLICY_MODE_DEFAULT,
+            ),
+        ]
+        scrubbed, result = _scrub_with_intervals(tmp_path, events, intervals)
+
+        drags = [e for e in scrubbed if e.get("type") == "mouse.drag"]
+        assert len(drags) == 1
+        drag = drags[0]
+        # Parent coords nulled (pre-fix these survived)
+        assert drag["x"] is None
+        assert drag["y"] is None
+        assert drag["dx"] is None
+        assert drag["dy"] is None
+        # Audit shape preserved
+        assert drag["timestamp"] == 0.9
+        assert drag["button"] == "left"
+
+        # mouse.up child at 1.5 dropped (was leaking END coordinate)
+        child_types = [c.get("type") for c in drag["children"]]
+        assert "mouse.up" not in child_types
+        # mouse.down at 0.9 (outside interval) is retained
+        assert child_types == ["mouse.down"]
+        kept_down = drag["children"][0]
+        # The retained mouse.down's own coordinates are nulled by the
+        # recursive null_event_content walk on the parent drag — any
+        # drag that touches a blocked interval has the whole envelope
+        # suppressed.
+        assert kept_down["x"] is None
+        assert kept_down["y"] is None
+
+        # Audit entry recorded
+        assert any(
+            e.surface == "event" and e.action == PrivacyAction.MASK_WINDOW.value
+            for e in result.audit_entries
+        )
+
+    def test_drag_starts_inside_ends_outside_blocked_interval(self, tmp_path):
+        """Drag start at t=1.5 (inside MASK_WINDOW [1.0, 2.0)), mouse.up
+        child at t=2.5 (outside, in ALLOW). Any overlap means parent
+        nulled — pre-existing single-interval behavior covers START
+        inside, but we add an explicit test for symmetry."""
+        events = [
+            {
+                "type": "mouse.drag",
+                "timestamp": 1.5,
+                "x": 100.0, "y": 200.0,
+                "dx": 400.0, "dy": 100.0,
+                "button": "left",
+                "children": [
+                    {
+                        "type": "mouse.down",
+                        "timestamp": 1.5,
+                        "x": 100.0, "y": 200.0,
+                        "button": "left",
+                    },
+                    {
+                        "type": "mouse.up",
+                        "timestamp": 2.5,  # outside blocked interval
+                        "x": 500.0, "y": 300.0,
+                        "button": "left",
+                    },
+                ],
+            },
+        ]
+        intervals = [
+            BlockedInterval(
+                start=1.0, end=2.0,
+                action=PrivacyAction.MASK_WINDOW,
+                reason=ReasonCode.POLICY_MODE_DEFAULT,
+            ),
+        ]
+        scrubbed, _ = _scrub_with_intervals(tmp_path, events, intervals)
+
+        drags = [e for e in scrubbed if e.get("type") == "mouse.drag"]
+        assert len(drags) == 1
+        drag = drags[0]
+        # Parent coords nulled (start inside)
+        assert drag["x"] is None
+        assert drag["y"] is None
+        assert drag["dx"] is None
+        assert drag["dy"] is None
+
+        # mouse.down at 1.5 (inside) dropped, mouse.up at 2.5 (outside) kept
+        child_types = [c.get("type") for c in drag["children"]]
+        assert "mouse.down" not in child_types
+        assert child_types == ["mouse.up"]
+
+    def test_drag_entirely_outside_blocked_intervals_keeps_everything(
+        self, tmp_path,
+    ):
+        """Regression: drag entirely outside any blocked interval — parent
+        coords AND children kept, nothing nulled."""
+        events = [
+            {
+                "type": "mouse.drag",
+                "timestamp": 5.0,
+                "x": 100.0, "y": 200.0,
+                "dx": 50.0, "dy": 30.0,
+                "button": "left",
+                "children": [
+                    {
+                        "type": "mouse.down",
+                        "timestamp": 5.0,
+                        "x": 100.0, "y": 200.0,
+                        "button": "left",
+                    },
+                    {
+                        "type": "mouse.up",
+                        "timestamp": 5.5,
+                        "x": 150.0, "y": 230.0,
+                        "button": "left",
+                    },
+                ],
+            },
+        ]
+        intervals = [
+            BlockedInterval(
+                start=1.0, end=2.0,
+                action=PrivacyAction.MASK_WINDOW,
+                reason=ReasonCode.POLICY_MODE_DEFAULT,
+            ),
+        ]
+        scrubbed, result = _scrub_with_intervals(tmp_path, events, intervals)
+
+        drags = [e for e in scrubbed if e.get("type") == "mouse.drag"]
+        assert len(drags) == 1
+        drag = drags[0]
+        # Coords preserved
+        assert drag["x"] == 100.0
+        assert drag["y"] == 200.0
+        assert drag["dx"] == 50.0
+        assert drag["dy"] == 30.0
+        # Children preserved with coords
+        child_types = [c.get("type") for c in drag["children"]]
+        assert child_types == ["mouse.down", "mouse.up"]
+        for c in drag["children"]:
+            assert c["x"] is not None
+            assert c["y"] is not None
+
+        # No event-surface audit entry for this drag (no overlap)
+        drag_audits = [
+            e for e in result.audit_entries
+            if e.surface == "event" and e.timestamp == 5.0
+        ]
+        assert drag_audits == []
+
+    def test_drag_entirely_inside_blocked_interval(self, tmp_path):
+        """Pre-existing case: drag with start AND end inside a blocked
+        interval — parent nulled, all children dropped (regression check
+        that the new range-overlap branch still handles this correctly)."""
+        events = [
+            {
+                "type": "mouse.drag",
+                "timestamp": 1.2,
+                "x": 100.0, "y": 200.0,
+                "dx": 50.0, "dy": 30.0,
+                "button": "left",
+                "children": [
+                    {
+                        "type": "mouse.down",
+                        "timestamp": 1.2,
+                        "x": 100.0, "y": 200.0,
+                        "button": "left",
+                    },
+                    {
+                        "type": "mouse.up",
+                        "timestamp": 1.7,
+                        "x": 150.0, "y": 230.0,
+                        "button": "left",
+                    },
+                ],
+            },
+        ]
+        intervals = [
+            BlockedInterval(
+                start=1.0, end=2.0,
+                action=PrivacyAction.EXCLUDE,
+                reason=ReasonCode.POLICY_EXCLUDED_APP,
+            ),
+        ]
+        scrubbed, _ = _scrub_with_intervals(tmp_path, events, intervals)
+
+        drags = [e for e in scrubbed if e.get("type") == "mouse.drag"]
+        assert len(drags) == 1
+        drag = drags[0]
+        assert drag["x"] is None and drag["y"] is None
+        assert drag["dx"] is None and drag["dy"] is None
+        # All children inside [1.0, 2.0) → all dropped
+        assert drag["children"] == []
+
+    def test_drag_with_mouse_up_child_inside_blocked_interval(self, tmp_path):
+        """Targeted: drag with one in-interval mouse.up child — that
+        child is dropped (NEW behavior; pre-fix only mouse.move children
+        were dropped, mouse.up survived and leaked the END coordinate)."""
+        events = [
+            {
+                "type": "mouse.drag",
+                "timestamp": 0.5,
+                "x": 100.0, "y": 200.0,
+                "dx": 400.0, "dy": 100.0,
+                "button": "left",
+                "children": [
+                    {
+                        "type": "mouse.down",
+                        "timestamp": 0.5,
+                        "x": 100.0, "y": 200.0,
+                        "button": "left",
+                    },
+                    {
+                        "type": "mouse.up",
+                        "timestamp": 1.5,  # inside [1.0, 2.0)
+                        "x": 500.0, "y": 300.0,
+                        "button": "left",
+                    },
+                ],
+            },
+        ]
+        intervals = [
+            BlockedInterval(
+                start=1.0, end=2.0,
+                action=PrivacyAction.MASK_WINDOW,
+                reason=ReasonCode.POLICY_MODE_DEFAULT,
+            ),
+        ]
+        scrubbed, _ = _scrub_with_intervals(tmp_path, events, intervals)
+
+        drag = next(e for e in scrubbed if e.get("type") == "mouse.drag")
+        child_types = [c.get("type") for c in drag["children"]]
+        # mouse.up at 1.5 dropped — it carried (500, 300) inside the
+        # blocked interval. mouse.down at 0.5 (outside) is kept.
+        assert "mouse.up" not in child_types
+        assert child_types == ["mouse.down"]
+
+    def test_drag_with_mixed_children_all_in_interval_types_dropped(
+        self, tmp_path,
+    ):
+        """Drag with mouse.move + mouse.up + key.type children all
+        inside the blocked interval — every in-interval child dropped
+        regardless of type (mouse.move and mouse.up leak coordinates;
+        key.type leaks content)."""
+        events = [
+            {
+                "type": "mouse.drag",
+                "timestamp": 0.5,
+                "x": 100.0, "y": 200.0,
+                "dx": 400.0, "dy": 100.0,
+                "button": "left",
+                "children": [
+                    {
+                        "type": "mouse.down",
+                        "timestamp": 0.5,
+                        "x": 100.0, "y": 200.0,
+                        "button": "left",
+                    },
+                    _make_move(1.2, 200.0, 220.0),  # in interval
+                    {
+                        "type": "key.type",  # in interval
+                        "timestamp": 1.3,
+                        "text": "secret",
+                        "children": [
+                            {"type": "key.down", "timestamp": 1.3, "key_char": "s"},
+                        ],
+                    },
+                    {
+                        "type": "mouse.up",
+                        "timestamp": 1.5,  # in interval
+                        "x": 500.0, "y": 300.0,
+                        "button": "left",
+                    },
+                ],
+            },
+        ]
+        intervals = [
+            BlockedInterval(
+                start=1.0, end=2.0,
+                action=PrivacyAction.MASK_WINDOW,
+                reason=ReasonCode.POLICY_MODE_DEFAULT,
+            ),
+        ]
+        scrubbed, _ = _scrub_with_intervals(tmp_path, events, intervals)
+
+        drag = next(e for e in scrubbed if e.get("type") == "mouse.drag")
+        child_types = [c.get("type") for c in drag["children"]]
+        # Only the mouse.down at 0.5 (outside the interval) survives;
+        # mouse.move/key.type/mouse.up at 1.2/1.3/1.5 (inside) are
+        # dropped regardless of event type.
+        assert child_types == ["mouse.down"]
+
+    def test_drag_last_child_timestamp_at_interval_start_boundary(
+        self, tmp_path,
+    ):
+        """Boundary (M-1 + H interaction): drag's last child timestamp
+        lands EXACTLY on the blocked interval's start. Post-M-1 fix the
+        forward branch of ``_interval_intersects`` is inclusive so the
+        drag span ``[0.5, 1.0]`` IS detected as overlapping the
+        blocked interval ``[1.0, 2.0)``. Pre-fix the strict ``<`` would
+        miss this and the drag would survive intact, leaking the
+        boundary mouse.up coordinates."""
+        events = [
+            {
+                "type": "mouse.drag",
+                "timestamp": 0.5,
+                "x": 100.0, "y": 200.0,
+                "dx": 400.0, "dy": 100.0,
+                "button": "left",
+                "children": [
+                    {
+                        "type": "mouse.down",
+                        "timestamp": 0.5,
+                        "x": 100.0, "y": 200.0,
+                        "button": "left",
+                    },
+                    {
+                        "type": "mouse.up",
+                        "timestamp": 1.0,  # exactly at interval start
+                        "x": 500.0, "y": 300.0,
+                        "button": "left",
+                    },
+                ],
+            },
+        ]
+        intervals = [
+            BlockedInterval(
+                start=1.0, end=2.0,
+                action=PrivacyAction.MASK_WINDOW,
+                reason=ReasonCode.POLICY_MODE_DEFAULT,
+            ),
+        ]
+        scrubbed, _ = _scrub_with_intervals(tmp_path, events, intervals)
+
+        drag = next(e for e in scrubbed if e.get("type") == "mouse.drag")
+        # Drag span [0.5, 1.0] overlaps blocked [1.0, 2.0) at the
+        # boundary — parent nulled, mouse.up at boundary dropped.
+        assert drag["x"] is None
+        assert drag["y"] is None
+        child_types = [c.get("type") for c in drag["children"]]
+        assert "mouse.up" not in child_types
+
+    def test_drag_with_no_children_and_overlap(self, tmp_path):
+        """Edge case: drag with no children — drag span degenerates to
+        a point at ``event_ts``. With ``event_ts`` inside the blocked
+        interval the existing point-lookup branch already nulls the
+        drag (this test just confirms the new branch doesn't regress
+        the empty-children path)."""
+        events = [
+            {
+                "type": "mouse.drag",
+                "timestamp": 1.5,
+                "x": 100.0, "y": 200.0,
+                "dx": 50.0, "dy": 30.0,
+                "button": "left",
+                "children": [],
+            },
+        ]
+        intervals = [
+            BlockedInterval(
+                start=1.0, end=2.0,
+                action=PrivacyAction.MASK_WINDOW,
+                reason=ReasonCode.POLICY_MODE_DEFAULT,
+            ),
+        ]
+        scrubbed, _ = _scrub_with_intervals(tmp_path, events, intervals)
+
+        drag = next(e for e in scrubbed if e.get("type") == "mouse.drag")
+        assert drag["x"] is None
+        assert drag["y"] is None
+        assert drag["dx"] is None
+        assert drag["dy"] is None
+
+
+class TestIntervalIntersectsBoundary:
+    """Bug M-1: ``_interval_intersects`` second branch had an off-by-one
+    error — used strict ``intervals[idx].start < end_ts`` so a merged
+    move whose ``last_timestamp == blocked.start`` was missed
+    (``10 < 10`` is False), leaking the last waypoint's coordinates
+    inside the blocked interval. Fix is one character: ``<`` → ``<=``.
+    """
+
+    def test_merged_move_last_timestamp_equals_interval_start_intersects(self):
+        """``_interval_intersects(0.9, 1.0, [(1.0, 1.2)])`` must return
+        the interval — the last waypoint at t=1.0 is AT the blocked
+        interval's start, which is inside the half-open ``[1.0, 1.2)``
+        (start inclusive). Pre-fix returned None (``1.0 < 1.0`` is False)."""
+        from screencap.scrub_pipeline import _interval_intersects
+
+        intervals = [
+            BlockedInterval(
+                start=1.0, end=1.2,
+                action=PrivacyAction.MASK_WINDOW,
+                reason=ReasonCode.POLICY_MODE_DEFAULT,
+            ),
+        ]
+        hit = _interval_intersects(0.9, 1.0, intervals)
+        assert hit is not None, (
+            "merged move ending at the boundary (last_timestamp == "
+            "blocked.start) must intersect — pre-fix `start < end_ts` "
+            "missed this"
+        )
+        assert hit.start == 1.0
+
+    def test_merged_move_last_timestamp_just_before_interval_start_no_intersect(
+        self,
+    ):
+        """``_interval_intersects(0.9, 0.999, [(1.0, 1.2)])`` returns None
+        — the move ends BEFORE the interval starts (no overlap)."""
+        from screencap.scrub_pipeline import _interval_intersects
+
+        intervals = [
+            BlockedInterval(
+                start=1.0, end=1.2,
+                action=PrivacyAction.MASK_WINDOW,
+                reason=ReasonCode.POLICY_MODE_DEFAULT,
+            ),
+        ]
+        assert _interval_intersects(0.9, 0.999, intervals) is None
+
+    def test_merged_move_end_at_interval_end_boundary(self):
+        """Boundary case: merged move ``[0.5, 1.2]`` over
+        ``[(1.0, 1.2), (1.2, 1.5)]``. The first interval contains
+        ``start_ts=0.5``? No — but the forward branch finds
+        ``intervals[0].start = 1.0 <= 1.2`` → intersects. If a NEXT
+        interval starts at 1.2 (touching), the move's end touches that
+        next interval too — but we only return the first match found
+        by the cheap path / forward bisect, so the assertion is just
+        that SOME interval is returned."""
+        from screencap.scrub_pipeline import _interval_intersects
+
+        intervals = [
+            BlockedInterval(
+                start=1.0, end=1.2,
+                action=PrivacyAction.MASK_WINDOW,
+                reason=ReasonCode.POLICY_MODE_DEFAULT,
+            ),
+            BlockedInterval(
+                start=1.2, end=1.5,
+                action=PrivacyAction.EXCLUDE,
+                reason=ReasonCode.POLICY_EXCLUDED_APP,
+            ),
+        ]
+        hit = _interval_intersects(0.5, 1.2, intervals)
+        # The cheap path: find_blocked_interval(0.5) → None (before all).
+        # Forward: bisect_right([1.0, 1.2], 0.5) = 0 → intervals[0].start = 1.0
+        # 1.0 <= 1.2 → return (1.0, 1.2).
+        assert hit is not None
+        assert hit.start == 1.0
+
+    def test_unmerged_move_at_interval_start_handled_by_first_branch(self):
+        """An unmerged move (``end_ts == start_ts``) AT the interval start
+        is caught by the cheap path (first branch) via
+        ``find_blocked_interval``. The second branch's inclusive ``<=``
+        is only relevant for real ranges (``end_ts > start_ts``), so
+        this assertion confirms the unmerged path still returns the
+        interval correctly via the cheap path."""
+        from screencap.scrub_pipeline import _interval_intersects
+
+        intervals = [
+            BlockedInterval(
+                start=1.0, end=1.2,
+                action=PrivacyAction.MASK_WINDOW,
+                reason=ReasonCode.POLICY_MODE_DEFAULT,
+            ),
+        ]
+        # Unmerged: start_ts == end_ts == 1.0 → cheap path:
+        # find_blocked_interval(1.0) → 1.0 <= 1.0 < 1.2 → return interval.
+        hit = _interval_intersects(1.0, 1.0, intervals)
+        assert hit is not None and hit.start == 1.0
+
+    def test_unmerged_move_just_before_interval_returns_none(self):
+        """Unmerged move (``end_ts == start_ts``) at ``ts=0.999`` does
+        NOT intersect ``[1.0, 1.2)``. Verifies the second branch's
+        early-return ``end_ts <= start_ts`` does not falsely match."""
+        from screencap.scrub_pipeline import _interval_intersects
+
+        intervals = [
+            BlockedInterval(
+                start=1.0, end=1.2,
+                action=PrivacyAction.MASK_WINDOW,
+                reason=ReasonCode.POLICY_MODE_DEFAULT,
+            ),
+        ]
+        assert _interval_intersects(0.999, 0.999, intervals) is None

@@ -388,10 +388,14 @@ def _interval_intersects(
 
     Half-open overlap semantics matching ``find_blocked_interval``: an
     interval ``[i.start, i.end)`` intersects the move span if
-    ``i.start <= end_ts AND i.end > start_ts``. A move whose ``end_ts``
-    lands exactly on ``i.start`` does NOT intersect (boundary excluded,
-    consistent with the half-open ``find_blocked_interval`` convention),
-    while ``end_ts > i.start`` does (the move tail crossed the boundary).
+    ``i.start <= end_ts AND i.end > start_ts``. A merged move whose
+    ``end_ts`` (last waypoint timestamp) lands exactly on ``i.start``
+    DOES intersect — the last waypoint is AT ``i.start``, which is
+    inside the half-open ``[i.start, i.end)`` interval (start
+    inclusive). The early-return ``end_ts <= start_ts`` handles the
+    point-lookup case before we reach the forward branch, so the
+    inclusive ``i.start <= end_ts`` check there only triggers when
+    ``end_ts > start_ts`` (a real range).
 
     For unmerged moves, callers should pass ``end_ts == start_ts`` — this
     degenerates to a point lookup matching ``find_blocked_interval``
@@ -422,15 +426,21 @@ def _interval_intersects(
     if hit is not None:
         return hit
 
-    # Otherwise look for an interval starting after start_ts but before end_ts
-    # (the merge spans into a later blocked interval). bisect_right returns
-    # the first index whose start > start_ts; we walk forward checking
-    # i.start < end_ts (the move tail enters the interval before the head
-    # of the move tail). Half-open: i.start == end_ts does not intersect.
+    # Otherwise look for an interval starting after start_ts but before
+    # end_ts (the merge spans into a later blocked interval).
+    # bisect_right returns the first index whose start > start_ts; we
+    # walk forward checking i.start <= end_ts. The check is INCLUSIVE
+    # because the move's last waypoint is AT end_ts: when
+    # end_ts == i.start, the last waypoint lands exactly on the start
+    # of the blocked interval, which IS inside the half-open
+    # ``[i.start, i.end)`` interval (start inclusive). The early-return
+    # ``end_ts <= start_ts`` above handles the point-lookup case before
+    # we reach this branch, so ``<=`` here only triggers for real ranges
+    # (end_ts > start_ts).
     if end_ts <= start_ts:
         return None
     idx = bisect.bisect_right(_starts, start_ts)
-    if idx < len(intervals) and intervals[idx].start < end_ts:
+    if idx < len(intervals) and intervals[idx].start <= end_ts:
         return intervals[idx]
     return None
 
@@ -1085,31 +1095,87 @@ def scrub_events_jsonl(
                 ) is not None:
                     continue
 
-            # R6/R12: Filter mouse.move children of mouse.drag events whose
-            # merged span crosses blocked intervals. The drag itself is
-            # retained (its content is nulled below if the drag is in a
-            # blocked interval); only in-interval mouse.move waypoints
-            # are dropped from its children list. Same range-overlap
-            # semantics as the standalone drop above.
+            # R6/R12: Drag-aware blocked-interval handling. A drag's
+            # parent timestamp is its START — but the drag PATH (children
+            # mouse.move waypoints + mouse.up endpoint) can extend INTO
+            # a blocked interval even when the start is outside. Pre-fix,
+            # the parent ``find_blocked_interval(event_ts)`` check below
+            # only fired on drags whose START was inside, leaking the END
+            # coordinate ``(x+dx, y+dy)`` plus any non-mouse.move children
+            # whose timestamps landed inside the blocked interval.
+            #
+            # The fix: compute the drag's effective span from its
+            # children, range-overlap-test it against the blocked
+            # intervals, and if any overlap exists drop EVERY in-interval
+            # child (regardless of type — mouse.up/mouse.down/key.type
+            # all leak coordinates or content) plus null the parent
+            # drag's coordinate fields. Children entirely outside any
+            # blocked interval are kept.
             if event.get("type") == "mouse.drag" and _blocked:
-                children = event.get("children")
-                if children:
-                    event["children"] = [
-                        c for c in children
-                        if not (
-                            c.get("type") == "mouse.move"
-                            and _interval_intersects(
-                                c.get("timestamp", 0.0),
-                                c.get("last_timestamp")
-                                    if c.get("last_timestamp") is not None
-                                    else c.get("timestamp", 0.0),
-                                _blocked,
-                                blocked_starts,
-                            ) is not None
-                        )
-                    ]
+                children = event.get("children") or []
+                drag_start = event_ts
+                drag_end = drag_start
+                for c in children:
+                    c_ts = c.get("timestamp", drag_start)
+                    c_end = c.get("last_timestamp", c_ts)
+                    if c_end > drag_end:
+                        drag_end = c_end
+                    if c_ts > drag_end:
+                        drag_end = c_ts
 
-            # Check blocked-app intervals
+                drag_overlap = _interval_intersects(
+                    drag_start, drag_end, _blocked, blocked_starts,
+                )
+                if drag_overlap is not None:
+                    # Drop children whose own timestamp lands inside any
+                    # blocked interval. Pointer geometry inside a blocked
+                    # interval leaks regardless of event type — a
+                    # mouse.up at the end of a drag carries the END
+                    # coordinate just as much as the parent's (x+dx, y+dy).
+                    kept: list[dict] = []
+                    for c in children:
+                        c_ts = c.get("timestamp", drag_start)
+                        if find_blocked_interval(
+                            c_ts, _blocked, blocked_starts,
+                        ) is not None:
+                            continue
+                        # Also drop merged-move children whose own span
+                        # extends INTO a blocked interval (covers the
+                        # pre-existing case where a merged move starts
+                        # outside but ends inside).
+                        if c.get("type") == "mouse.move":
+                            c_end = c.get("last_timestamp", c_ts)
+                            if _interval_intersects(
+                                c_ts, c_end, _blocked, blocked_starts,
+                            ) is not None:
+                                continue
+                        kept.append(c)
+                    event["children"] = kept
+
+                    # Null the parent drag's content + coordinate fields.
+                    # null_event_content recurses into surviving children
+                    # too — for retained mouse children that means their
+                    # own x/y get zeroed (they're in a mouse.* type so the
+                    # MOUSE_COORDINATE_FIELDS branch fires). This is the
+                    # right behavior: any drag that touches a blocked
+                    # interval has leaked geometry, so the whole envelope
+                    # is suppressed.
+                    null_event_content(event)
+                    _result.audit_entries.append(
+                        AuditEntry(
+                            timestamp=event_ts,
+                            surface="event",
+                            action=drag_overlap.action.value,
+                            reason=drag_overlap.reason,
+                        )
+                    )
+                    outfile.write(json.dumps(event, ensure_ascii=False) + "\n")
+                    continue
+
+            # Check blocked-app intervals (non-drag events: regular
+            # clicks, key events, etc. — for these the parent timestamp
+            # IS the event time, so a point-lookup is correct). Drags
+            # are handled above with the range-overlap branch.
             blocked = find_blocked_interval(event_ts, _blocked, blocked_starts)
             if blocked is not None:
                 null_event_content(event)
