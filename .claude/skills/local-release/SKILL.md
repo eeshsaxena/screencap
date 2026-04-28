@@ -102,8 +102,13 @@ arch -x86_64 "$PY_UNIVERSAL" -m venv .venv-x86_64
 arch -x86_64 .venv-x86_64/bin/pip install --upgrade pip
 
 # Apply the x86_64 constraint file — same as CI — so pip selects wheels with minos <= 11.0.
-# MACOSX_DEPLOYMENT_TARGET=11.0 mirrors the workflow-level setting in .github/workflows/release.yml
-# so pip's wheel-tag preference matches CI even on a Tahoe (macOS 26.x) host.
+# MACOSX_DEPLOYMENT_TARGET=11.0 mirrors the workflow-level setting in
+# .github/workflows/release.yml for any build-time tooling that reads it
+# (PyInstaller bootloader build, C extensions compiled from source, etc.).
+# Note: it does NOT shift pip's wheel-tag preference — packaging.tags reads
+# platform.mac_ver() at runtime, so on a Tahoe (macOS 26.x) host pip still
+# prefers macosx_26_0 → macosx_14_0 → ... wheels regardless of this env.
+# Wheel selection is enforced by the version pins in constraints-x86_64.txt.
 arch -x86_64 env MACOSX_DEPLOYMENT_TARGET=11.0 PIP_CONSTRAINT="$PWD/pyinstaller/constraints-x86_64.txt" \
   .venv-x86_64/bin/pip install -e ".[record]"
 arch -x86_64 .venv-x86_64/bin/pip install pyinstaller
