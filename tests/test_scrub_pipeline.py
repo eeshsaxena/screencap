@@ -1795,3 +1795,405 @@ class TestBuildScrubContextFailureLogging:
         )
         # Sanity: context was built (no exception)
         assert isinstance(ctx.blocked_intervals, list)
+
+
+class TestOverlappingIntervalsLookup:
+    """P1-overlap: ``find_blocked_interval`` and ``_interval_intersects``
+    must handle overlapping intervals. ``merge_intervals`` only sorts by
+    ``start`` and explicitly tolerates overlaps — a long app-window
+    MASK_WINDOW interval can be concatenated with a short, nested
+    secure-field EXCLUDE interval (both produced by ``build_scrub_context``).
+
+    Pre-fix, ``find_blocked_interval`` did a single point lookup at
+    ``bisect_right(_starts, ts) - 1``. With intervals
+    ``[(10, 100, MASK_WINDOW), (20, 21, EXCLUDE)]`` and ``ts=30``:
+
+    * ``bisect_right([10, 20], 30) - 1 = 1`` → checks ``(20, 21)``,
+      ``20 <= 30 < 21`` is False → returns ``None``.
+    * Pointer events at ``ts=30`` leak from inside the MASK_WINDOW
+      interval that was masked by the closer-but-shorter EXCLUDE.
+
+    The fix walks backwards through earlier intervals (all of which
+    have ``start <= ts`` by sorted order) until one with ``end > ts``
+    is found.
+    """
+
+    def test_regression_short_interval_masks_long_overlapping_interval(self):
+        """Exact user scenario: ``[(10, 100, MASK_WINDOW), (20, 21, EXCLUDE)]``
+        with ``ts=30`` must return the MASK_WINDOW interval (was None pre-fix).
+        """
+        from screencap.scrub_pipeline import find_blocked_interval
+
+        intervals = [
+            BlockedInterval(
+                start=10.0, end=100.0,
+                action=PrivacyAction.MASK_WINDOW,
+                reason=ReasonCode.POLICY_MODE_DEFAULT,
+            ),
+            BlockedInterval(
+                start=20.0, end=21.0,
+                action=PrivacyAction.EXCLUDE,
+                reason=ReasonCode.SECURE_FIELD_DETECTED,
+            ),
+        ]
+
+        hit = find_blocked_interval(30.0, intervals)
+        assert hit is not None, (
+            "Pre-fix bisect picked the closer-but-shorter EXCLUDE interval and "
+            "returned None — leaking pointer events at ts=30 from inside the "
+            "long MASK_WINDOW interval."
+        )
+        assert hit.start == 10.0
+        assert hit.end == 100.0
+        assert hit.action == PrivacyAction.MASK_WINDOW
+
+    def test_multi_overlap_nested_intervals(self):
+        """Three nested intervals — every timestamp inside the outer interval
+        must hit some interval (not None) regardless of how the bisect lookup
+        positions the cursor."""
+        from screencap.scrub_pipeline import find_blocked_interval
+
+        intervals = [
+            BlockedInterval(
+                start=0.0, end=100.0,
+                action=PrivacyAction.MASK_WINDOW,
+                reason=ReasonCode.POLICY_MODE_DEFAULT,
+            ),
+            BlockedInterval(
+                start=10.0, end=50.0,
+                action=PrivacyAction.TEXT_REDACT,
+                reason=ReasonCode.POLICY_MODE_DEFAULT,
+            ),
+            BlockedInterval(
+                start=20.0, end=30.0,
+                action=PrivacyAction.EXCLUDE,
+                reason=ReasonCode.SECURE_FIELD_DETECTED,
+            ),
+        ]
+
+        # ts=5: only outer (0, 100) contains it
+        hit = find_blocked_interval(5.0, intervals)
+        assert hit is not None and hit.start == 0.0
+
+        # ts=15: outer + middle contain it; either is acceptable
+        hit = find_blocked_interval(15.0, intervals)
+        assert hit is not None
+        assert hit.start <= 15.0 < hit.end
+
+        # ts=25: all three contain it; latest-start (innermost) wins from
+        # the bisect cursor — but any non-None is correct
+        hit = find_blocked_interval(25.0, intervals)
+        assert hit is not None
+        assert hit.start <= 25.0 < hit.end
+
+        # ts=40: only outer + middle (TEXT_REDACT) contain it; innermost
+        # has ended, but the walk-backwards must skip it and find the
+        # middle one — pre-fix would return None here
+        hit = find_blocked_interval(40.0, intervals)
+        assert hit is not None
+        assert hit.start <= 40.0 < hit.end
+
+        # ts=75: only outer contains it; walk-backwards must skip the
+        # middle (ended at 50) and find the outer — pre-fix would also
+        # return None here
+        hit = find_blocked_interval(75.0, intervals)
+        assert hit is not None
+        assert hit.start == 0.0
+        assert hit.end == 100.0
+
+        # ts=150: nothing contains it
+        assert find_blocked_interval(150.0, intervals) is None
+
+    def test_overlap_boundary_lookups(self):
+        """Boundary semantics for overlapping intervals:
+
+        * ``ts=15`` is inside both (10, 20) and (15, 25) — half-open
+          [start, end) means start is inclusive, end exclusive — must
+          return one of them (not None).
+        * ``ts=22`` is past (10, 20) but inside (15, 25) — pre-fix the
+          bisect cursor would land on (15, 25), find ``15 <= 22 < 25``
+          → True, return it. Post-fix: same result. Importantly, even
+          if (15, 25) had ended at 20, the walk would step back to (10,
+          20) and reject it (``22 >= 20``) → None, which is correct.
+        """
+        from screencap.scrub_pipeline import find_blocked_interval
+
+        intervals = [
+            BlockedInterval(
+                start=10.0, end=20.0,
+                action=PrivacyAction.MASK_WINDOW,
+                reason=ReasonCode.POLICY_MODE_DEFAULT,
+            ),
+            BlockedInterval(
+                start=15.0, end=25.0,
+                action=PrivacyAction.TEXT_REDACT,
+                reason=ReasonCode.POLICY_MODE_DEFAULT,
+            ),
+        ]
+
+        # ts=15: both contain it
+        hit = find_blocked_interval(15.0, intervals)
+        assert hit is not None
+        assert hit.start <= 15.0 < hit.end
+
+        # ts=22: only (15, 25) contains it
+        hit = find_blocked_interval(22.0, intervals)
+        assert hit is not None
+        assert hit.start == 15.0
+        assert hit.end == 25.0
+
+        # ts=20: only (15, 25) contains it (end of (10, 20) is exclusive)
+        hit = find_blocked_interval(20.0, intervals)
+        assert hit is not None
+        assert hit.start == 15.0
+        assert hit.end == 25.0
+
+        # ts=25: nothing contains it
+        assert find_blocked_interval(25.0, intervals) is None
+
+    def test_pure_non_overlap_unchanged(self):
+        """Non-overlapping cases still work — picks one from existing tests
+        to confirm the walk-backwards loop terminates after one iteration
+        and behaves identically to the original point lookup."""
+        from screencap.scrub_pipeline import find_blocked_interval
+
+        intervals = [
+            BlockedInterval(
+                start=100.0, end=200.0,
+                action=PrivacyAction.MASK_WINDOW,
+                reason=ReasonCode.POLICY_MODE_DEFAULT,
+            ),
+            BlockedInterval(
+                start=300.0, end=400.0,
+                action=PrivacyAction.EXCLUDE,
+                reason=ReasonCode.POLICY_EXCLUDED_APP,
+            ),
+            BlockedInterval(
+                start=500.0, end=600.0,
+                action=PrivacyAction.TEXT_REDACT,
+                reason=ReasonCode.POLICY_MODE_DEFAULT,
+            ),
+        ]
+
+        # Inside first
+        hit = find_blocked_interval(150.0, intervals)
+        assert hit is not None and hit.start == 100.0
+
+        # Between first and second — pre-fix returned None; post-fix
+        # also returns None (walk steps back to (100, 200), rejects, then
+        # idx=-1 — terminates correctly)
+        assert find_blocked_interval(250.0, intervals) is None
+
+        # Inside second
+        hit = find_blocked_interval(350.0, intervals)
+        assert hit is not None and hit.start == 300.0
+
+        # Inside third
+        hit = find_blocked_interval(550.0, intervals)
+        assert hit is not None and hit.start == 500.0
+
+        # Past end of all
+        assert find_blocked_interval(700.0, intervals) is None
+
+        # Before start of all
+        assert find_blocked_interval(50.0, intervals) is None
+
+    def test_interval_intersects_with_overlap_in_first_branch(self):
+        """``_interval_intersects([5, 15], …)`` over
+        ``[(10, 100), (20, 21)]`` — first branch must find ``(10, 100)``.
+
+        Trace:
+        * ``find_blocked_interval(5)`` walks back from
+          ``bisect_right([10, 20], 5) - 1 = -1`` → None.
+        * Forward branch: ``bisect_right([10, 20], 5) = 0`` →
+          ``intervals[0] = (10, 100)``, ``10 < 15 = end_ts`` → return.
+        """
+        from screencap.scrub_pipeline import _interval_intersects
+
+        intervals = [
+            BlockedInterval(
+                start=10.0, end=100.0,
+                action=PrivacyAction.MASK_WINDOW,
+                reason=ReasonCode.POLICY_MODE_DEFAULT,
+            ),
+            BlockedInterval(
+                start=20.0, end=21.0,
+                action=PrivacyAction.EXCLUDE,
+                reason=ReasonCode.SECURE_FIELD_DETECTED,
+            ),
+        ]
+
+        # Span [5, 15] — start before all, end inside (10, 100)
+        hit = _interval_intersects(5.0, 15.0, intervals)
+        assert hit is not None
+        assert hit.start == 10.0
+        assert hit.end == 100.0
+
+        # Span [105, 110] — entirely past all intervals
+        assert _interval_intersects(105.0, 110.0, intervals) is None
+
+        # Span [25, 30] — entirely inside (10, 100), past (20, 21).
+        # First branch: find_blocked_interval(25) walks back from
+        # idx = bisect_right([10, 20], 25) - 1 = 1 → check (20, 21):
+        # 20 <= 25 < 21 is False → walk back to idx=0 → (10, 100):
+        # 10 <= 25 < 100 → return (10, 100). Pre-fix this returned None.
+        hit = _interval_intersects(25.0, 30.0, intervals)
+        assert hit is not None
+        assert hit.start == 10.0
+
+    def test_merged_move_overlap_regression(self, tmp_path):
+        """P1-overlap end-to-end: merged ``mouse.move`` whose start lands
+        in the gap after a short EXCLUDE but inside the still-active long
+        MASK_WINDOW must be DROPPED.
+
+        Intervals: ``[(10, 100, MASK_WINDOW), (20, 21, EXCLUDE)]``.
+        Merged move ``[15, 35]`` — start at 15 is inside MASK_WINDOW, end
+        at 35 is also inside MASK_WINDOW. Pre-fix, the first branch of
+        ``_interval_intersects`` called ``find_blocked_interval(15)``
+        which returned None (bisect picked the closer-but-shorter
+        EXCLUDE). The forward branch then checked the FIRST interval
+        starting after 15 — that's (20, 21) which does start before 35,
+        so it would have correctly returned (20, 21) → drop. But for a
+        merge entirely INSIDE the MASK_WINDOW (e.g., [25, 35]), the
+        forward branch would find no later interval at all (idx=2 out
+        of range) and return None — leaking coordinates.
+        """
+        from screencap.scrub_pipeline import _interval_intersects
+
+        intervals = [
+            BlockedInterval(
+                start=10.0, end=100.0,
+                action=PrivacyAction.MASK_WINDOW,
+                reason=ReasonCode.POLICY_MODE_DEFAULT,
+            ),
+            BlockedInterval(
+                start=20.0, end=21.0,
+                action=PrivacyAction.EXCLUDE,
+                reason=ReasonCode.SECURE_FIELD_DETECTED,
+            ),
+        ]
+
+        # Merged move [15, 35] — start 15 is inside MASK_WINDOW; first
+        # branch must find (10, 100).
+        hit = _interval_intersects(15.0, 35.0, intervals)
+        assert hit is not None and hit.start == 10.0
+
+        # Merged move [25, 35] — entirely inside MASK_WINDOW, past
+        # EXCLUDE. Pre-fix this would have returned None (first branch
+        # missed MASK_WINDOW because EXCLUDE was closer; forward branch
+        # found no interval starting after 25).
+        hit = _interval_intersects(25.0, 35.0, intervals)
+        assert hit is not None and hit.start == 10.0
+
+        # Now exercise the JSONL drop path with the same scenario:
+        # merged move with start 25 and last_timestamp 35 must be dropped.
+        events = [
+            {
+                "type": "mouse.move",
+                "timestamp": 25.0,
+                "last_timestamp": 35.0,
+                "x": 220.0, "y": 320.0,
+                "path": [(100.0, 200.0), (220.0, 320.0)],
+            },
+        ]
+        scrubbed, _ = _scrub_with_intervals(tmp_path, events, intervals)
+
+        moves = [e for e in scrubbed if e.get("type") == "mouse.move"]
+        assert moves == [], (
+            "Merged move entirely inside the long MASK_WINDOW (with a nested "
+            "shorter EXCLUDE earlier in the list) must be dropped — pre-fix the "
+            "bisect lookup picked the closer EXCLUDE and missed the "
+            "still-active MASK_WINDOW."
+        )
+
+    def test_build_scrub_context_overlap_drops_in_window_move(self, tmp_path):
+        """Integration: ``build_scrub_context`` with a MASK_WINDOW app and
+        a nested AXSecureTextField produces overlapping intervals
+        (long MASK_WINDOW + short EXCLUDE). A ``mouse.move`` at a
+        timestamp inside the MASK_WINDOW but past the EXCLUDE must be
+        dropped from the scrubbed JSONL.
+
+        This is the cross-layer regression: ``build_scrub_context``
+        actually composes overlapping intervals via ``merge_intervals``
+        in the wild — Slack / 1Password during a screen recording.
+        """
+        from screencap.privacy.context import DefaultContextClassifier
+        from screencap.privacy.policy import (
+            DefaultPolicyEvaluator,
+            parse_privacy_config,
+        )
+
+        db_path = tmp_path / "recording.db"
+        # 1Password is in PASSWORD_MANAGER context → MASK_WINDOW (or
+        # EXCLUDE depending on mode); use Slack which is in CHAT context
+        # under PUBLIC mode → MASK_WINDOW for the long-overlap interval.
+        # Add an action_event with AXSecureTextField at 1020.0 to inject
+        # a short overlapping EXCLUDE.
+        _create_recording_db(
+            db_path,
+            window_events=[
+                # Slack chat session from 1000 to 1100 — MASK_WINDOW
+                {"timestamp": 1000.0, "app_bundle_id": "com.tinyspeck.slackmacgap"},
+                # Switch to a non-blocked app at 1100
+                {"timestamp": 1100.0, "app_bundle_id": "com.apple.finder"},
+            ],
+            action_events=[
+                # Secure-field event inside the Slack interval — EXCLUDE
+                # spans roughly (1020.0, 1020.0 + DEFAULT_TRANSITION_HOLD)
+                {
+                    "timestamp": 1020.0,
+                    "name": "press",
+                    "key_char": "x",
+                    "element_state": json.dumps({"AXRole": "AXSecureTextField"}),
+                },
+            ],
+        )
+
+        cfg = parse_privacy_config({"privacy": {"mode": "public"}})
+        evaluator = DefaultPolicyEvaluator(cfg)
+        classifier = DefaultContextClassifier()
+
+        ctx = build_scrub_context(
+            db_path,
+            evaluator=evaluator,
+            classifier=classifier,
+        )
+
+        # Sanity: we got both kinds of intervals — long Slack MASK_WINDOW
+        # and short secure-field EXCLUDE.
+        assert any(
+            iv.action == PrivacyAction.MASK_WINDOW
+            for iv in ctx.blocked_intervals
+        ), f"Expected a MASK_WINDOW interval; got {ctx.blocked_intervals}"
+        assert any(
+            iv.action == PrivacyAction.EXCLUDE
+            and iv.reason == ReasonCode.SECURE_FIELD_DETECTED
+            for iv in ctx.blocked_intervals
+        ), f"Expected a secure-field EXCLUDE interval; got {ctx.blocked_intervals}"
+
+        # Mouse move at 1030.0 — past the secure-field EXCLUDE interval
+        # (which ends ~1021.0), but still inside the Slack MASK_WINDOW
+        # (1000.0 → 1100.0). Pre-fix, the bisect cursor would land on
+        # the secure-field EXCLUDE (closer start than Slack), find it
+        # had ended, and return None — leaking the move from inside
+        # the masked Slack window.
+        events = [_make_move(1030.0, 200.0, 300.0)]
+        events_path = tmp_path / "events_0000.jsonl"
+        _write_events_jsonl(events_path, events)
+
+        pipeline, anonymizer = _make_pipeline()
+        result = ScrubResult()
+        scrub_events_jsonl(
+            events_path, pipeline, anonymizer,
+            ctx=ctx, result=result,
+        )
+
+        scrubbed = [
+            json.loads(l) for l in events_path.read_text().splitlines() if l.strip()
+        ]
+        moves = [e for e in scrubbed if e.get("type") == "mouse.move"]
+        assert moves == [], (
+            "mouse.move at ts=1030 inside the Slack MASK_WINDOW (1000→1100) "
+            "must be dropped despite a shorter secure-field EXCLUDE "
+            "interval starting at 1020 having already ended."
+        )

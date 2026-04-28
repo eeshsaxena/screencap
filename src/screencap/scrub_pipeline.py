@@ -314,9 +314,12 @@ def merge_intervals(
 ) -> list[BlockedInterval]:
     """Concatenate and sort interval lists by start time.
 
-    Overlapping intervals are tolerated — find_blocked_interval only
-    needs to answer "is this timestamp blocked?" and bisect handles
-    overlaps correctly for that purpose.
+    Intervals may overlap (e.g., a long app-window MASK_WINDOW interval
+    with nested short secure-field EXCLUDE intervals from
+    ``build_scrub_context``). ``find_blocked_interval`` handles overlaps
+    by walking backwards through all prior intervals whose ``start <=
+    timestamp``; ``_interval_intersects`` relies on that fix in its
+    first branch.
     """
     all_intervals: list[BlockedInterval] = []
     for ivs in interval_lists:
@@ -330,18 +333,41 @@ def find_blocked_interval(
     intervals: list[BlockedInterval],
     _starts: list[float] | None = None,
 ) -> BlockedInterval | None:
-    """Return the blocked interval containing timestamp, or None.
+    """Return any blocked interval containing timestamp, or None.
 
     Pass _starts (pre-computed [iv.start for iv in intervals]) to avoid
     rebuilding the list on every call.
+
+    Handles overlapping intervals correctly: walks backwards through all
+    intervals whose ``start <= timestamp``, returning the first one whose
+    ``end > timestamp``. ``O(k)`` where ``k`` = overlap depth at this
+    timestamp; typically 1 for non-overlapping intervals, small for the
+    overlapping case (long app-window interval + nested short
+    secure-field interval).
+
+    Pre-fix, this used a single point-lookup at
+    ``bisect_right(_starts, timestamp) - 1`` and missed the case where
+    the closest-by-start interval ended before ``timestamp`` while a
+    longer earlier interval still contained it (e.g. a 1-second
+    secure-field EXCLUDE nested inside a 90-second MASK_WINDOW would
+    leak pointer events at timestamps after the EXCLUDE ended but
+    inside the MASK_WINDOW).
     """
     if not intervals:
         return None
     if _starts is None:
         _starts = [iv.start for iv in intervals]
+    # bisect_right returns the first index whose start > timestamp.
+    # idx-1 is the latest interval with start <= timestamp; walk
+    # backwards through earlier intervals (which all also have
+    # start <= timestamp by sorted order) until we find one with
+    # end > timestamp.
     idx = bisect.bisect_right(_starts, timestamp) - 1
-    if idx >= 0 and intervals[idx].start <= timestamp < intervals[idx].end:
-        return intervals[idx]
+    while idx >= 0:
+        iv = intervals[idx]
+        if iv.start <= timestamp < iv.end:
+            return iv
+        idx -= 1
     return None
 
 
@@ -370,6 +396,17 @@ def _interval_intersects(
     For unmerged moves, callers should pass ``end_ts == start_ts`` — this
     degenerates to a point lookup matching ``find_blocked_interval``
     semantics.
+
+    Correctness note for overlapping intervals: this helper relies on
+    ``find_blocked_interval`` (first branch) to handle the overlapping
+    case where ``start_ts`` is inside a longer interval whose
+    ``start`` lies before a shorter, later-starting interval (e.g.,
+    a long MASK_WINDOW with a nested short secure-field EXCLUDE).
+    The forward branch (looking for an interval starting after
+    ``start_ts`` but before ``end_ts``) only needs to check
+    ``intervals[idx]`` because intervals are sorted by ``start`` —
+    if the first interval after ``start_ts`` does not begin before
+    ``end_ts``, no later interval will either.
     """
     if not intervals:
         return None
@@ -377,6 +414,10 @@ def _interval_intersects(
         _starts = [iv.start for iv in intervals]
 
     # Cheap path: if the start timestamp is inside an interval, return it.
+    # Relies on the overlap-aware find_blocked_interval — a point lookup
+    # at start_ts that walks backwards through prior overlapping intervals
+    # so a long MASK_WINDOW containing start_ts is found even when a
+    # shorter, later-starting interval would otherwise mask it.
     hit = find_blocked_interval(start_ts, intervals, _starts)
     if hit is not None:
         return hit
