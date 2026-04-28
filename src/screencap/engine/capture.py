@@ -21,9 +21,8 @@ from screencap.engine.events import (
     MouseMoveEvent,
     SpecialKeyEvent,
 )
+from screencap.engine.export import unified_export_events
 from screencap.engine.processing import (
-    deduplicate_window_events,
-    interleave_window_events,
     process_events,
 )
 
@@ -31,21 +30,22 @@ if TYPE_CHECKING:
     from PIL import Image
 
 
-def _convert_action_event(db_event) -> PydanticActionEvent | None:
-    """Convert a SQLAlchemy ActionEvent to a Pydantic event.
+def _action_event_to_dict(db_event) -> dict:
+    """Convert a SQLAlchemy ActionEvent to a row dict.
 
-    Thin wrapper around :func:`dict_to_action_event` that extracts
-    a dict from the ORM object.
+    Mirrors the column shape consumed by
+    :func:`screencap.engine.convert.dict_to_action_event` (the same dict
+    shape produced by the chunk processor's raw ``sqlite3.Row`` reads).
+    Use ``getattr`` with defaults so missing columns (older DB schemas)
+    don't crash.
 
     Args:
         db_event: SQLAlchemy ActionEvent instance.
 
     Returns:
-        Pydantic event or None if unrecognized.
+        Row dict suitable for the unified export pipeline.
     """
-    # Build a dict from the ORM object's columns.  Use getattr with
-    # defaults so missing columns (older DB schemas) don't crash.
-    row = {
+    return {
         "timestamp": db_event.timestamp,
         "name": db_event.name,
         "mouse_x": getattr(db_event, "mouse_x", None),
@@ -66,7 +66,21 @@ def _convert_action_event(db_event) -> PydanticActionEvent | None:
         "canonical_key_char": getattr(db_event, "canonical_key_char", None),
         "canonical_key_vk": getattr(db_event, "canonical_key_vk", None),
     }
-    return dict_to_action_event(row)
+
+
+def _convert_action_event(db_event) -> PydanticActionEvent | None:
+    """Convert a SQLAlchemy ActionEvent to a Pydantic event.
+
+    Thin wrapper around :func:`dict_to_action_event` that extracts
+    a dict from the ORM object via :func:`_action_event_to_dict`.
+
+    Args:
+        db_event: SQLAlchemy ActionEvent instance.
+
+    Returns:
+        Pydantic event or None if unrecognized.
+    """
+    return dict_to_action_event(_action_event_to_dict(db_event))
 
 
 @dataclass
@@ -382,27 +396,70 @@ class CaptureSession:
         Privacy filtering is NOT applied here — callers (exporter,
         chunk processor) apply their own privacy policy.
 
+        Delegates to :func:`screencap.engine.export.unified_export_events`
+        — the single source of truth for the row-to-event transform shared
+        by every export caller (CLI ``screencap export``, chunk processor,
+        recovery). ORM-to-dict conversion happens inside this method;
+        click thresholds and the ``include_moves`` filter stay at this
+        layer (R7, R8). ``initial_window_row=None`` because full-recording
+        exports do not prepend pre-chunk window context (R15).
+
+        Materialization boundary: ``unified_export_events`` returns an
+        ``Iterator[BaseEvent]`` for callers that stream directly to the
+        writer (chunk processor, recovery via ``write_events_jsonl``).
+        ``CaptureSession`` wraps the iterator with ``list(...)`` to keep
+        its public ``list[BaseEvent]`` return contract — see
+        ``tests/test_cross_layer_contracts.py`` lines 35-45.
+
         Args:
             include_moves: Whether to include mouse.move events.
 
         Returns:
             Combined list of action + window.switch events, sorted by timestamp.
         """
-        # 1. Process action events through the merge pipeline
-        raw = self.raw_events()
-        processed = process_events(
-            raw,
-            double_click_interval=self._recording.double_click_interval_seconds or 0.5,
-            double_click_distance=self._recording.double_click_distance_pixels or 5,
-        )
+        # 1. Build action_rows from ORM iteration with the disabled
+        #    filter applied at the row-fetch boundary (mirrors
+        #    raw_events() at line 367 — see R16).
+        action_rows: list[dict] = []
+        for db_event in self._recording.action_events:
+            if getattr(db_event, "disabled", False):
+                continue
+            action_rows.append(_action_event_to_dict(db_event))
 
-        # Filter moves if not requested
-        if not include_moves:
-            processed = [e for e in processed if not isinstance(e, MouseMoveEvent)]
+        # 2. Forward-looking parity with chunk processor's
+        #    ``_disabled_clause``: when a future migration adds
+        #    ``window_event.disabled``, chunk + recovery + CLI must all
+        #    filter it. The ``WindowEvent`` ORM model doesn't have the
+        #    column today (adding it would break older DBs that lack
+        #    it — same failure mode as the recently-fixed P2 recovery
+        #    bug), so we pre-fetch disabled IDs via raw SQL and skip
+        #    them during ORM iteration. Fail-soft: this is a
+        #    forward-looking concern, not load-bearing for the current
+        #    schema, so any error leaves the set empty (= no rows
+        #    skipped, matching today's behavior).
+        disabled_window_ids: set[int] = set()
+        try:
+            from screencap.recording_db import has_column, open_recording_db
 
-        # 2. Build deduplicated window.switch events from DB
-        window_rows = []
+            db_path = self.capture_dir / "recording.db"
+            with open_recording_db(db_path) as conn:
+                if has_column(conn, "window_event", "disabled"):
+                    rows = conn.execute(
+                        "SELECT id FROM window_event "
+                        "WHERE disabled IS NOT NULL AND disabled"
+                    ).fetchall()
+                    disabled_window_ids = {r[0] for r in rows}
+        except Exception:
+            pass
+
+        # 3. Build window_rows from ORM relationship. Already ordered
+        #    by timestamp via the ``order_by`` on the SQLAlchemy
+        #    relationship. Skip rows whose id is in
+        #    ``disabled_window_ids`` (forward-looking parity above).
+        window_rows: list[dict] = []
         for we in getattr(self._recording, "window_events", []):
+            if we.id in disabled_window_ids:
+                continue
             window_rows.append({
                 "timestamp": we.timestamp,
                 "app_bundle_id": getattr(we, "app_bundle_id", None),
@@ -414,11 +471,33 @@ class CaptureSession:
                 "height": getattr(we, "height", 0),
                 "browser_url": getattr(we, "browser_url", None),
             })
-        # window_events ORM relationship is already ordered by timestamp
-        window_switches = deduplicate_window_events(window_rows)
 
-        # 3. Interleave by timestamp
-        return interleave_window_events(processed, window_switches)
+        # 3. Run the unified pipeline. ``initial_window_row=None`` per
+        #    R15 (full-recording exports do not prepend pre-chunk
+        #    context). ``window_filter=None`` because CLI export does
+        #    not currently apply a privacy filter at this layer (the
+        #    test-only path goes through ``_write_events`` which wraps
+        #    the events post-hoc).
+        result = list(unified_export_events(
+            action_rows,
+            window_rows,
+            initial_window_row=None,
+            double_click_interval=(
+                self._recording.double_click_interval_seconds or 0.5
+            ),
+            double_click_distance=(
+                self._recording.double_click_distance_pixels or 5.0
+            ),
+            window_filter=None,
+        ))
+
+        # 4. Per R7, the unified callable does not drop MouseMoveEvent
+        #    itself. Apply the caller-side ``--exclude-moves`` filter
+        #    here when the user opts out of moves.
+        if not include_moves:
+            result = [e for e in result if not isinstance(e, MouseMoveEvent)]
+
+        return result
 
     def actions(self, include_moves: bool = False) -> Iterator[Action]:
         """Iterate over processed actions.

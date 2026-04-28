@@ -505,12 +505,20 @@ def merge_consecutive_mouse_move_events(events: list[ActionEvent]) -> list[Actio
                 ev = ev.model_copy(update={"path": [(ev.x, ev.y)]})
             result.append(ev)
         else:
-            # Create merged move event with final position and last pressure
+            # Create merged move event with final position and last pressure.
+            # ``last_timestamp`` carries the end of the merged span so the
+            # scrub layer can detect blocked-interval intersection across the
+            # full [first, last] window (a run of moves around a window
+            # switch into a MASK_WINDOW app would otherwise leak coordinates
+            # via ``timestamp`` alone — pre-fix, the start timestamp lands
+            # before the blocked interval and slips past the point-lookup
+            # ``find_blocked_interval`` check).
             first = move_buffer[0]
             last = move_buffer[-1]
             path = [(m.x, m.y) for m in move_buffer]
             merged = MouseMoveEvent(
                 timestamp=first.timestamp,
+                last_timestamp=last.timestamp,
                 x=last.x,
                 y=last.y,
                 pressure=last.pressure,

@@ -91,6 +91,15 @@ class MouseMoveEvent(BaseEvent):
         description="All (x, y) waypoints. Single-element for unmerged moves, "
                     "multi-element when consecutive moves are merged.",
     )
+    last_timestamp: float | None = Field(
+        default=None,
+        description=(
+            "End timestamp for merged consecutive moves. None for unmerged moves "
+            "(timestamp is both start and end). Set by merge_consecutive_mouse_move_events "
+            "when buffer length > 1. Used by the scrub layer to detect blocked-interval "
+            "intersection across the merged span."
+        ),
+    )
 
 
 class MouseDownEvent(BaseEvent):

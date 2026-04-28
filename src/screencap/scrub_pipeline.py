@@ -24,7 +24,14 @@ from contextlib import ExitStack
 from dataclasses import dataclass, field
 from pathlib import Path
 
-from screencap.privacy.actions import BLOCK_ACTIONS, KEYSTROKE_CONTENT_FIELDS, PrivacyAction
+from screencap.privacy.actions import (
+    BLOCK_ACTIONS,
+    KEYSTROKE_CONTENT_FIELDS,
+    MOUSE_COORDINATE_FIELDS,
+    SCRUB_BLOCK_ACTIONS,
+    SCRUB_CONTENT_NULL_ACTIONS,
+    PrivacyAction,
+)
 from screencap.privacy.policy import DEFAULT_TRANSITION_HOLD_SECONDS
 from screencap.privacy.reasons import AuditEntry, ReasonCode
 from screencap.recording_db import Connection, has_column, has_table, open_recording_db
@@ -149,11 +156,22 @@ def build_blocked_intervals(
     window_events,
     evaluator,
     classifier,
+    *,
+    actions: frozenset[PrivacyAction] = BLOCK_ACTIONS,
 ) -> list[BlockedInterval]:
-    """Build intervals where the frontmost app triggers EXCLUDE.
+    """Build intervals where the frontmost app triggers a blocking action.
 
     Each window event defines a period from its timestamp to the next
     window event's timestamp (or infinity for the last event).
+
+    Args:
+        window_events: Ordered list of WindowContext.
+        evaluator: Policy evaluator that returns ActionDecision per frame.
+        classifier: Context classifier mapping frames to ContextClass.
+        actions: Set of PrivacyActions that mark an interval as blocked.
+            Defaults to BLOCK_ACTIONS (screenshot capture-time semantics, just
+            EXCLUDE). Pass SCRUB_BLOCK_ACTIONS for scrub-time pointer
+            suppression (EXCLUDE/MASK_WINDOW/TEXT_REDACT/OCR_FALLBACK).
     """
     from screencap.privacy.policy import FrameMetadata
 
@@ -179,7 +197,7 @@ def build_blocked_intervals(
         ctx = classifier.classify(meta)
         decision = evaluator.evaluate(ctx, meta)
 
-        if decision.action in BLOCK_ACTIONS:
+        if decision.action in actions:
             intervals.append(
                 BlockedInterval(
                     start=we.timestamp,
@@ -297,9 +315,12 @@ def merge_intervals(
 ) -> list[BlockedInterval]:
     """Concatenate and sort interval lists by start time.
 
-    Overlapping intervals are tolerated — find_blocked_interval only
-    needs to answer "is this timestamp blocked?" and bisect handles
-    overlaps correctly for that purpose.
+    Intervals may overlap (e.g., a long app-window MASK_WINDOW interval
+    with nested short secure-field EXCLUDE intervals from
+    ``build_scrub_context``). ``find_blocked_interval`` handles overlaps
+    by walking backwards through all prior intervals whose ``start <=
+    timestamp``; ``_interval_intersects`` relies on that fix in its
+    first branch.
     """
     all_intervals: list[BlockedInterval] = []
     for ivs in interval_lists:
@@ -313,26 +334,145 @@ def find_blocked_interval(
     intervals: list[BlockedInterval],
     _starts: list[float] | None = None,
 ) -> BlockedInterval | None:
-    """Return the blocked interval containing timestamp, or None.
+    """Return any blocked interval containing timestamp, or None.
 
     Pass _starts (pre-computed [iv.start for iv in intervals]) to avoid
     rebuilding the list on every call.
+
+    Handles overlapping intervals correctly: walks backwards through all
+    intervals whose ``start <= timestamp``, returning the first one whose
+    ``end > timestamp``. ``O(k)`` where ``k`` = overlap depth at this
+    timestamp; typically 1 for non-overlapping intervals, small for the
+    overlapping case (long app-window interval + nested short
+    secure-field interval).
+
+    Pre-fix, this used a single point-lookup at
+    ``bisect_right(_starts, timestamp) - 1`` and missed the case where
+    the closest-by-start interval ended before ``timestamp`` while a
+    longer earlier interval still contained it (e.g. a 1-second
+    secure-field EXCLUDE nested inside a 90-second MASK_WINDOW would
+    leak pointer events at timestamps after the EXCLUDE ended but
+    inside the MASK_WINDOW).
     """
     if not intervals:
         return None
     if _starts is None:
         _starts = [iv.start for iv in intervals]
+    # bisect_right returns the first index whose start > timestamp.
+    # idx-1 is the latest interval with start <= timestamp; walk
+    # backwards through earlier intervals (which all also have
+    # start <= timestamp by sorted order) until we find one with
+    # end > timestamp.
     idx = bisect.bisect_right(_starts, timestamp) - 1
-    if idx >= 0 and intervals[idx].start <= timestamp < intervals[idx].end:
+    while idx >= 0:
+        iv = intervals[idx]
+        if iv.start <= timestamp < iv.end:
+            return iv
+        idx -= 1
+    return None
+
+
+def _interval_intersects(
+    start_ts: float,
+    end_ts: float,
+    intervals: list[BlockedInterval],
+    _starts: list[float] | None = None,
+) -> BlockedInterval | None:
+    """Return any blocked interval that intersects ``[start_ts, end_ts]``.
+
+    Used by the scrub layer to drop ``mouse.move`` events whose merged span
+    crosses into a blocked interval. ``merge_consecutive_mouse_move_events``
+    collapses runs of raw moves into a single event whose ``timestamp`` is
+    the start and ``last_timestamp`` the end — a point-lookup at the start
+    timestamp would miss merges that begin before a blocked interval and end
+    inside it (the leak this helper closes).
+
+    Half-open overlap semantics matching ``find_blocked_interval``: an
+    interval ``[i.start, i.end)`` intersects the move span if
+    ``i.start <= end_ts AND i.end > start_ts``. A merged move whose
+    ``end_ts`` (last waypoint timestamp) lands exactly on ``i.start``
+    DOES intersect — the last waypoint is AT ``i.start``, which is
+    inside the half-open ``[i.start, i.end)`` interval (start
+    inclusive). The early-return ``end_ts <= start_ts`` handles the
+    point-lookup case before we reach the forward branch, so the
+    inclusive ``i.start <= end_ts`` check there only triggers when
+    ``end_ts > start_ts`` (a real range).
+
+    For unmerged moves, callers should pass ``end_ts == start_ts`` — this
+    degenerates to a point lookup matching ``find_blocked_interval``
+    semantics.
+
+    Correctness note for overlapping intervals: this helper relies on
+    ``find_blocked_interval`` (first branch) to handle the overlapping
+    case where ``start_ts`` is inside a longer interval whose
+    ``start`` lies before a shorter, later-starting interval (e.g.,
+    a long MASK_WINDOW with a nested short secure-field EXCLUDE).
+    The forward branch (looking for an interval starting after
+    ``start_ts`` but before ``end_ts``) only needs to check
+    ``intervals[idx]`` because intervals are sorted by ``start`` —
+    if the first interval after ``start_ts`` does not begin before
+    ``end_ts``, no later interval will either.
+    """
+    if not intervals:
+        return None
+    if _starts is None:
+        _starts = [iv.start for iv in intervals]
+
+    # Cheap path: if the start timestamp is inside an interval, return it.
+    # Relies on the overlap-aware find_blocked_interval — a point lookup
+    # at start_ts that walks backwards through prior overlapping intervals
+    # so a long MASK_WINDOW containing start_ts is found even when a
+    # shorter, later-starting interval would otherwise mask it.
+    hit = find_blocked_interval(start_ts, intervals, _starts)
+    if hit is not None:
+        return hit
+
+    # Otherwise look for an interval starting after start_ts but before
+    # end_ts (the merge spans into a later blocked interval).
+    # bisect_right returns the first index whose start > start_ts; we
+    # walk forward checking i.start <= end_ts. The check is INCLUSIVE
+    # because the move's last waypoint is AT end_ts: when
+    # end_ts == i.start, the last waypoint lands exactly on the start
+    # of the blocked interval, which IS inside the half-open
+    # ``[i.start, i.end)`` interval (start inclusive). The early-return
+    # ``end_ts <= start_ts`` above handles the point-lookup case before
+    # we reach this branch, so ``<=`` here only triggers for real ranges
+    # (end_ts > start_ts).
+    if end_ts <= start_ts:
+        return None
+    idx = bisect.bisect_right(_starts, start_ts)
+    if idx < len(intervals) and intervals[idx].start <= end_ts:
         return intervals[idx]
     return None
 
 
-def null_event_content(event: dict) -> None:
-    """Null out sensitive content fields in an event dict in-place (recursive).
+def null_pointer_geometry(event: dict) -> None:
+    """Zero mouse coordinate fields on retained mouse events. Recurses.
 
-    Handles nested structures like key.type inside mouse.drag.children,
-    and window.switch title/domain fields.
+    Used when a mouse event's timestamp lands inside a SCRUB_BLOCK_ACTIONS
+    interval — pointer geometry leaks coarse interaction patterns inside
+    redacted/masked content, regardless of whether text content is
+    sensitive (TEXT_REDACT/OCR_FALLBACK keystrokes go through PII
+    detection; their pointer coordinates do not).
+    """
+    event_type = event.get("type", "")
+    if isinstance(event_type, str) and event_type.startswith("mouse."):
+        for fld in MOUSE_COORDINATE_FIELDS:
+            if fld in event:
+                event[fld] = None
+    for child in event.get("children", []):
+        null_pointer_geometry(child)
+
+
+def null_text_content(event: dict) -> None:
+    """Null keystroke text + window.switch title/domain. Recurses into children.
+
+    Recurses into ``children`` to cover ``key.type`` nested inside
+    ``mouse.drag``.
+
+    Used when an event's timestamp lands inside a SCRUB_CONTENT_NULL_ACTIONS
+    interval (EXCLUDE/MASK_WINDOW) — text content is wholesale-suppressed
+    in those contexts.
     """
     for fld in KEYSTROKE_CONTENT_FIELDS:
         if fld in event:
@@ -341,7 +481,19 @@ def null_event_content(event: dict) -> None:
         event["window_title"] = None
         event["domain"] = None
     for child in event.get("children", []):
-        null_event_content(child)
+        null_text_content(child)
+
+
+def null_event_content(event: dict) -> None:
+    """Backward-compat: null both pointer geometry and text content.
+
+    Maintained for any external caller; ``scrub_events_jsonl`` now calls
+    the granular helpers directly so SCRUB_BLOCK_ACTIONS pointer
+    suppression can run independently of SCRUB_CONTENT_NULL_ACTIONS text
+    nulling.
+    """
+    null_pointer_geometry(event)
+    null_text_content(event)
 
 
 # ---------------------------------------------------------------------------
@@ -604,10 +756,15 @@ def build_scrub_context(
                 except Exception:
                     logger.debug("Failed to load window events", exc_info=True)
 
-            # Build blocked-app intervals
+            # Build blocked-app intervals using scrub-time action set.
+            # SCRUB_BLOCK_ACTIONS expands beyond capture-time BLOCK_ACTIONS
+            # to also cover MASK_WINDOW/TEXT_REDACT/OCR_FALLBACK so that
+            # mouse pointer geometry inside redacted/masked content is
+            # suppressed in cloud-bound JSONL (R6/R12).
             if evaluator is not None and classifier is not None and ctx.window_events:
                 ctx.blocked_intervals = build_blocked_intervals(
                     ctx.window_events, evaluator, classifier,
+                    actions=SCRUB_BLOCK_ACTIONS,
                 )
 
             # Build secure-field intervals
@@ -625,8 +782,18 @@ def build_scrub_context(
                     db_path, pipeline, anonymizer,
                     time_range=time_range, conn=conn,
                 )
-    except Exception:
-        logger.debug("build_scrub_context failed, using empty context", exc_info=True)
+    except Exception as e:
+        # Loud signal: silent failure here disables ALL pointer-geometry
+        # suppression for the recording (empty blocked_intervals → no
+        # mouse.move drops, no drag-coord nulling). Operators must see
+        # this in logs to investigate the underlying cause (busy SQLite,
+        # missing window_event table on older recordings, OOM, etc.).
+        logger.warning(
+            "build_scrub_context failed; pointer suppression DISABLED "
+            "for this recording: %s",
+            e,
+            exc_info=True,
+        )
 
     return ctx
 
@@ -929,11 +1096,137 @@ def scrub_events_jsonl(
                 outfile.write(json.dumps(event, ensure_ascii=False) + "\n")
                 continue
 
-            # Check blocked-app intervals
+            # R6/R12: Drop standalone mouse.move events whose merged span
+            # crosses a blocked interval (SCRUB_BLOCK_ACTIONS). Pointer
+            # geometry leaks coarse interaction patterns inside redacted/
+            # masked content — coordinates on retained events are unaffected.
+            #
+            # ``last_timestamp`` is set by ``merge_consecutive_mouse_move_events``
+            # when a run of moves is collapsed; the range check covers the
+            # case where the merge START lands BEFORE a blocked interval but
+            # the merge END (last waypoint) lands INSIDE it. Pre-fix, the
+            # point-lookup at ``timestamp`` slipped these merged events past
+            # the drop check and leaked in-interval coordinates via ``path``
+            # waypoints / ``x``/``y`` (last position).
             event_ts = event.get("timestamp", 0.0)
+            if event.get("type") == "mouse.move":
+                end_ts = event.get("last_timestamp")
+                if end_ts is None:
+                    end_ts = event_ts
+                if _interval_intersects(
+                    event_ts, end_ts, _blocked, blocked_starts,
+                ) is not None:
+                    continue
+
+            # R6/R12: Drag-aware blocked-interval handling. A drag's
+            # parent timestamp is its START — but the drag PATH (children
+            # mouse.move waypoints + mouse.up endpoint) can extend INTO
+            # a blocked interval even when the start is outside. Pre-fix,
+            # the parent ``find_blocked_interval(event_ts)`` check below
+            # only fired on drags whose START was inside, leaking the END
+            # coordinate ``(x+dx, y+dy)`` plus any non-mouse.move children
+            # whose timestamps landed inside the blocked interval.
+            #
+            # The fix: compute the drag's effective span from its
+            # children, range-overlap-test it against the blocked
+            # intervals, and if any overlap exists drop EVERY in-interval
+            # child (regardless of type — mouse.up/mouse.down/key.type
+            # all leak coordinates or content) plus null the parent
+            # drag's coordinate fields. Children entirely outside any
+            # blocked interval are kept.
+            if event.get("type") == "mouse.drag" and _blocked:
+                children = event.get("children") or []
+                drag_start = event_ts
+                drag_end = drag_start
+                for c in children:
+                    c_ts = c.get("timestamp", drag_start)
+                    c_end = c.get("last_timestamp", c_ts)
+                    if c_end > drag_end:
+                        drag_end = c_end
+                    if c_ts > drag_end:
+                        drag_end = c_ts
+
+                drag_overlap = _interval_intersects(
+                    drag_start, drag_end, _blocked, blocked_starts,
+                )
+                if drag_overlap is not None:
+                    # Drop children whose own timestamp lands inside any
+                    # blocked interval. Pointer geometry inside a blocked
+                    # interval leaks regardless of event type — a
+                    # mouse.up at the end of a drag carries the END
+                    # coordinate just as much as the parent's (x+dx, y+dy).
+                    kept: list[dict] = []
+                    for c in children:
+                        c_ts = c.get("timestamp", drag_start)
+                        if find_blocked_interval(
+                            c_ts, _blocked, blocked_starts,
+                        ) is not None:
+                            continue
+                        # Also drop merged-move children whose own span
+                        # extends INTO a blocked interval (covers the
+                        # pre-existing case where a merged move starts
+                        # outside but ends inside).
+                        if c.get("type") == "mouse.move":
+                            c_end = c.get("last_timestamp", c_ts)
+                            if _interval_intersects(
+                                c_ts, c_end, _blocked, blocked_starts,
+                            ) is not None:
+                                continue
+                        kept.append(c)
+                    event["children"] = kept
+
+                    # Always null the parent drag's pointer geometry on
+                    # overlap — the drag envelope (start/end coords,
+                    # displacement) leaks the in-interval portion of the
+                    # gesture regardless of action type. ``null_pointer_geometry``
+                    # recurses into surviving children, so retained mouse
+                    # children also have their coords zeroed.
+                    null_pointer_geometry(event)
+
+                    if drag_overlap.action in SCRUB_CONTENT_NULL_ACTIONS:
+                        # EXCLUDE / MASK_WINDOW: also null text content
+                        # (key.type children, window titles). Recurses
+                        # into surviving children.
+                        null_text_content(event)
+                    else:
+                        # TEXT_REDACT / OCR_FALLBACK / MASK_REGION: pointer
+                        # is already suppressed; run PII detection on
+                        # surviving key.type children before writing the
+                        # drag, since the drag is written + ``continue``d
+                        # here and would otherwise bypass the PII detection
+                        # loop further below.
+                        _process_key_type_events(
+                            event, pipeline, anonymizer, _result, db_redactions,
+                        )
+                        if _xref:
+                            for child in event.get("children", []):
+                                if child.get("type") == "key.type":
+                                    _cross_reference_key_type(
+                                        child, _xref, _result, db_redactions,
+                                    )
+
+                    _result.audit_entries.append(
+                        AuditEntry(
+                            timestamp=event_ts,
+                            surface="event",
+                            action=drag_overlap.action.value,
+                            reason=drag_overlap.reason,
+                        )
+                    )
+                    outfile.write(json.dumps(event, ensure_ascii=False) + "\n")
+                    continue
+
+            # Check blocked-app intervals (non-drag events: regular
+            # clicks, key events, etc. — for these the parent timestamp
+            # IS the event time, so a point-lookup is correct). Drags
+            # are handled above with the range-overlap branch.
             blocked = find_blocked_interval(event_ts, _blocked, blocked_starts)
             if blocked is not None:
-                null_event_content(event)
+                # Pointer geometry is suppressed for ANY SCRUB_BLOCK_ACTIONS
+                # interval (pointer position leaks coarse patterns
+                # regardless of action).
+                null_pointer_geometry(event)
+
                 _result.audit_entries.append(
                     AuditEntry(
                         timestamp=event_ts,
@@ -942,8 +1235,19 @@ def scrub_events_jsonl(
                         reason=blocked.reason,
                     )
                 )
-                outfile.write(json.dumps(event, ensure_ascii=False) + "\n")
-                continue
+
+                if blocked.action in SCRUB_CONTENT_NULL_ACTIONS:
+                    # EXCLUDE / MASK_WINDOW: also null keystroke text +
+                    # window titles. Don't fall through to PII detection
+                    # — content is wholesale-suppressed in these contexts.
+                    null_text_content(event)
+                    outfile.write(json.dumps(event, ensure_ascii=False) + "\n")
+                    continue
+
+                # TEXT_REDACT / OCR_FALLBACK / MASK_REGION: pointer
+                # suppressed above; let text fall through to PII
+                # detection below so detected entities are scrubbed
+                # without wholesale-nulling clean content.
 
             # Targeted key.type detection for combined-text secrets
             _process_key_type_events(

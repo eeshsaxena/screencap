@@ -231,7 +231,7 @@ class TestRuntimeOverrides:
 class TestBuildPrivacyFilterOverrides:
     def test_loads_overrides_from_file(self, tmp_path):
         """build_privacy_filter() loads .menubar_overrides.json if present."""
-        from screencap.exporter import build_privacy_filter
+        from screencap.privacy.filter import build_privacy_filter
 
         overrides = {"com.tinyspeck.slackmacgap": "allow"}
         (tmp_path / ".menubar_overrides.json").write_text(json.dumps(overrides))
@@ -255,7 +255,7 @@ class TestBuildPrivacyFilterOverrides:
 
     def test_override_exclude_returns_none(self, tmp_path):
         """build_privacy_filter() returns None for override-excluded events."""
-        from screencap.exporter import build_privacy_filter
+        from screencap.privacy.filter import build_privacy_filter
 
         overrides = {"com.microsoft.VSCode": "exclude"}
         (tmp_path / ".menubar_overrides.json").write_text(json.dumps(overrides))
@@ -277,7 +277,7 @@ class TestBuildPrivacyFilterOverrides:
 
     def test_no_override_file_is_fine(self, tmp_path):
         """build_privacy_filter() works normally when no overrides file exists."""
-        from screencap.exporter import build_privacy_filter
+        from screencap.privacy.filter import build_privacy_filter
 
         pf = build_privacy_filter(
             privacy_mode="internal",
