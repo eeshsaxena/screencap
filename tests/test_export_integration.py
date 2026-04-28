@@ -790,6 +790,188 @@ def test_export_events_disabled_rows_excluded(tmp_path):
 
 
 # ============================================================================
+# CaptureSession.export_events — forward-looking window_event.disabled parity
+# ============================================================================
+#
+# These tests pin the symmetry between CLI export, chunk processor, and
+# recovery for the (currently absent) ``window_event.disabled`` column.
+# Today the column doesn't exist on any schema, but chunk processor and
+# recovery already gate it via ``has_column`` so a future migration that
+# adds it filters disabled rows on those two paths. CLI export iterates
+# the SQLAlchemy ``WindowEvent`` ORM model (which has no ``disabled``
+# attribute), so without the raw-SQL pre-pass added in the M-2 fix, CLI
+# export would silently emit disabled rows while the other two paths
+# filter them — exactly the kind of three-caller asymmetry the unified-
+# export refactor exists to prevent.
+
+
+class TestWindowEventDisabledForwardLooking:
+    """Forward-looking parity for ``window_event.disabled``.
+
+    Two cases:
+
+    1. Modern schema (no ``disabled`` column): CLI export behavior is
+       unchanged — every window_event row in the DB still appears in the
+       output.
+    2. Forward-looking schema with the column: rows with ``disabled=1``
+       are dropped from the output, matching what chunk processor and
+       recovery already do via ``_disabled_clause``.
+
+    The fix adds a raw-SQL pre-pass in
+    ``CaptureSession.export_events`` to fetch disabled IDs and skip them
+    during ORM iteration. Adding the column to the ``WindowEvent`` ORM
+    model is NOT safe because older DBs lack the column and SQLAlchemy
+    SELECTs would fail on them (the same failure mode as the recently-
+    fixed P2 recovery bug).
+    """
+
+    def _build_capture(
+        self, capture_dir, *, include_disabled_window=False,
+    ):
+        """Create a recording.db with three window_event rows.
+
+        When ``include_disabled_window`` is True, the middle row's
+        ``window_id`` is "200" — the test then ALTERs the table to add
+        a ``disabled`` column and marks that row disabled.
+        """
+        from screencap.engine.db import create_db, crud
+
+        capture_dir.mkdir(exist_ok=True)
+        db_path = capture_dir / "recording.db"
+
+        engine, Session = create_db(str(db_path))
+        session = Session()
+
+        recording = crud.insert_recording(session, {
+            "timestamp": 1000.0,
+            "platform": "darwin",
+            "monitor_width": 1024,
+            "monitor_height": 768,
+            "double_click_interval_seconds": 0.5,
+            "double_click_distance_pixels": 5.0,
+        })
+
+        # Three window events. With dedup-by-(bundle_id, window_id) the
+        # three distinct window_ids each produce a separate
+        # ``window.switch`` event in the output.
+        crud.insert_window_event(session, recording, 1001.0, {
+            "title": "Editor — main.py",
+            "app_bundle_id": "com.editor.app",
+            "window_id": "100",
+            "left": 0, "top": 0, "width": 1024, "height": 768,
+        })
+        crud.insert_window_event(session, recording, 1002.0, {
+            "title": "Browser — example.com",
+            "app_bundle_id": "com.browser.app",
+            "window_id": "200",
+            "left": 0, "top": 0, "width": 1024, "height": 768,
+        })
+        crud.insert_window_event(session, recording, 1003.0, {
+            "title": "Terminal — bash",
+            "app_bundle_id": "com.terminal.app",
+            "window_id": "300",
+            "left": 0, "top": 0, "width": 1024, "height": 768,
+        })
+
+        # Need at least one action event so the export pipeline has a
+        # row to anchor — without action_events the unified pipeline
+        # still emits window.switch events but adding one keeps the
+        # fixture closer to a real recording.
+        crud.insert_action_event(session, recording, 1004.0, {
+            "name": "click",
+            "mouse_x": 50.0, "mouse_y": 50.0,
+            "mouse_button_name": "left",
+            "mouse_pressed": True,
+        })
+        crud.insert_action_event(session, recording, 1004.01, {
+            "name": "click",
+            "mouse_x": 50.0, "mouse_y": 50.0,
+            "mouse_button_name": "left",
+            "mouse_pressed": False,
+        })
+
+        session.commit()
+        session.close()
+        engine.dispose()
+
+        if include_disabled_window:
+            # Forward-looking schema: ALTER TABLE to add the column,
+            # then mark window_id=200 as disabled. This mirrors what a
+            # future migration would do (but isn't done today). Use raw
+            # sqlite3 to avoid touching the ORM model.
+            import sqlite3
+
+            with sqlite3.connect(str(db_path)) as conn:
+                conn.execute(
+                    "ALTER TABLE window_event "
+                    "ADD COLUMN disabled BOOLEAN DEFAULT 0"
+                )
+                conn.execute(
+                    "UPDATE window_event SET disabled = 1 "
+                    "WHERE window_id = '200'"
+                )
+                conn.commit()
+
+        return db_path
+
+    def test_modern_schema_no_disabled_column_unchanged_behavior(self, tmp_path):
+        """No ``window_event.disabled`` column → all 3 window events emit.
+
+        Pins that the raw-SQL pre-pass is a no-op for the current schema:
+        ``has_column`` returns False, the disabled-id set stays empty,
+        and every ORM row passes through.
+        """
+        from screencap.engine import Capture
+
+        capture_dir = tmp_path / "modern-rec"
+        self._build_capture(capture_dir, include_disabled_window=False)
+
+        with Capture.load(str(capture_dir)) as capture:
+            events = capture.export_events(include_moves=False)
+
+        ws = [e for e in events if e.type == "window.switch"]
+        bundles = {e.app_bundle_id for e in ws}
+        assert bundles == {
+            "com.editor.app", "com.browser.app", "com.terminal.app",
+        }, (
+            "All 3 window_event rows must emit on the current schema "
+            f"(no disabled column gating); got bundles={bundles}"
+        )
+
+    def test_forward_looking_schema_disabled_rows_filtered(self, tmp_path):
+        """Forward-looking ``window_event.disabled`` column is honored.
+
+        With the column present and window_id=200 marked disabled, CLI
+        export must skip that row — matching what chunk processor and
+        recovery already do via ``_disabled_clause``.
+
+        Pre-fix this test FAILS: the ORM iterator can't see a column
+        the model doesn't define, so the disabled row leaks into the
+        output. Post-fix the raw-SQL pre-pass fetches the disabled id
+        and the ORM loop skips it.
+        """
+        from screencap.engine import Capture
+
+        capture_dir = tmp_path / "future-rec"
+        self._build_capture(capture_dir, include_disabled_window=True)
+
+        with Capture.load(str(capture_dir)) as capture:
+            events = capture.export_events(include_moves=False)
+
+        ws = [e for e in events if e.type == "window.switch"]
+        bundles = {e.app_bundle_id for e in ws}
+        assert "com.browser.app" not in bundles, (
+            "window_event row with disabled=1 leaked into CLI export "
+            "— forward-looking parity with chunk processor + recovery "
+            f"is broken; got bundles={bundles}"
+        )
+        # The other two rows must still pass through.
+        assert bundles == {"com.editor.app", "com.terminal.app"}, (
+            f"Expected only the two non-disabled bundles; got {bundles}"
+        )
+
+
+# ============================================================================
 # write_events_jsonl — Unit 4 streaming writer
 # ============================================================================
 #

@@ -426,11 +426,40 @@ class CaptureSession:
                 continue
             action_rows.append(_action_event_to_dict(db_event))
 
-        # 2. Build window_rows from ORM relationship. Already ordered
+        # 2. Forward-looking parity with chunk processor's
+        #    ``_disabled_clause``: when a future migration adds
+        #    ``window_event.disabled``, chunk + recovery + CLI must all
+        #    filter it. The ``WindowEvent`` ORM model doesn't have the
+        #    column today (adding it would break older DBs that lack
+        #    it — same failure mode as the recently-fixed P2 recovery
+        #    bug), so we pre-fetch disabled IDs via raw SQL and skip
+        #    them during ORM iteration. Fail-soft: this is a
+        #    forward-looking concern, not load-bearing for the current
+        #    schema, so any error leaves the set empty (= no rows
+        #    skipped, matching today's behavior).
+        disabled_window_ids: set[int] = set()
+        try:
+            from screencap.recording_db import has_column, open_recording_db
+
+            db_path = self.capture_dir / "recording.db"
+            with open_recording_db(db_path) as conn:
+                if has_column(conn, "window_event", "disabled"):
+                    rows = conn.execute(
+                        "SELECT id FROM window_event "
+                        "WHERE disabled IS NOT NULL AND disabled"
+                    ).fetchall()
+                    disabled_window_ids = {r[0] for r in rows}
+        except Exception:
+            pass
+
+        # 3. Build window_rows from ORM relationship. Already ordered
         #    by timestamp via the ``order_by`` on the SQLAlchemy
-        #    relationship.
+        #    relationship. Skip rows whose id is in
+        #    ``disabled_window_ids`` (forward-looking parity above).
         window_rows: list[dict] = []
         for we in getattr(self._recording, "window_events", []):
+            if we.id in disabled_window_ids:
+                continue
             window_rows.append({
                 "timestamp": we.timestamp,
                 "app_bundle_id": getattr(we, "app_bundle_id", None),
