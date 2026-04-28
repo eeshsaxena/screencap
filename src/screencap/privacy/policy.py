@@ -75,22 +75,30 @@ _ACTION_MATRIX: dict[tuple[ContextClass, PrivacyMode], PrivacyAction] = {
     (ContextClass.BANKING, PrivacyMode.PUBLIC): PrivacyAction.EXCLUDE,
     (ContextClass.BANKING, PrivacyMode.SHARED): PrivacyAction.EXCLUDE,
     (ContextClass.BANKING, PrivacyMode.INTERNAL): PrivacyAction.MASK_WINDOW,
+    # email / chat / calendar / video_call under INTERNAL → MASK_WINDOW.
+    # Privacy-improving change vs. the prior TEXT_REDACT default: window
+    # contents are blurred end-to-end (video frames blocked, keystrokes
+    # nulled, screenshots masked at scrub time) instead of relying on
+    # post-capture text scrubbing for personal/workplace conversations.
+    # Aligns with the friend-onboarding "safe defaults" intent — see
+    # docs/brainstorms/2026-04-27-native-macos-ui-v1-requirements.md (R20)
+    # and the v1 plan's Unit 7a discussion of the workflow impact.
     # email
     (ContextClass.EMAIL, PrivacyMode.PUBLIC): PrivacyAction.MASK_WINDOW,
     (ContextClass.EMAIL, PrivacyMode.SHARED): PrivacyAction.MASK_REGION,
-    (ContextClass.EMAIL, PrivacyMode.INTERNAL): PrivacyAction.TEXT_REDACT,
+    (ContextClass.EMAIL, PrivacyMode.INTERNAL): PrivacyAction.MASK_WINDOW,
     # chat
     (ContextClass.CHAT, PrivacyMode.PUBLIC): PrivacyAction.MASK_WINDOW,
     (ContextClass.CHAT, PrivacyMode.SHARED): PrivacyAction.MASK_REGION,
-    (ContextClass.CHAT, PrivacyMode.INTERNAL): PrivacyAction.TEXT_REDACT,
+    (ContextClass.CHAT, PrivacyMode.INTERNAL): PrivacyAction.MASK_WINDOW,
     # calendar
     (ContextClass.CALENDAR, PrivacyMode.PUBLIC): PrivacyAction.MASK_WINDOW,
     (ContextClass.CALENDAR, PrivacyMode.SHARED): PrivacyAction.MASK_REGION,
-    (ContextClass.CALENDAR, PrivacyMode.INTERNAL): PrivacyAction.TEXT_REDACT,
+    (ContextClass.CALENDAR, PrivacyMode.INTERNAL): PrivacyAction.MASK_WINDOW,
     # video_call
     (ContextClass.VIDEO_CALL, PrivacyMode.PUBLIC): PrivacyAction.MASK_WINDOW,
     (ContextClass.VIDEO_CALL, PrivacyMode.SHARED): PrivacyAction.MASK_REGION,
-    (ContextClass.VIDEO_CALL, PrivacyMode.INTERNAL): PrivacyAction.TEXT_REDACT,
+    (ContextClass.VIDEO_CALL, PrivacyMode.INTERNAL): PrivacyAction.MASK_WINDOW,
     # browser_unverified
     (ContextClass.BROWSER_UNVERIFIED, PrivacyMode.PUBLIC): PrivacyAction.MASK_WINDOW,
     (ContextClass.BROWSER_UNVERIFIED, PrivacyMode.SHARED): PrivacyAction.OCR_FALLBACK,

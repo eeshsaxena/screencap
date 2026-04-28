@@ -102,6 +102,28 @@ def _maybe_download_nlp_models() -> None:
         )
 
 
+_MATRIX_ACK_KEY = "matrix_acknowledged_v2026_04"
+
+
+def _write_privacy_flag(key: str, value: object) -> None:
+    """Write a single [privacy] scalar via tomlkit, preserving comments and order.
+
+    Used by the matrix-acknowledgement flow and by setup-skip — both need to
+    set a single bool without disturbing other [privacy] keys (R16 invariant).
+    """
+    import tomlkit
+
+    from screencap.config import _CONFIG_PATH, invalidate_config_cache
+    from screencap.setup_wizard import _load_config_toml, _save_config_atomic
+
+    doc = _load_config_toml(_CONFIG_PATH)
+    if "privacy" not in doc:
+        doc.add("privacy", tomlkit.table())
+    doc["privacy"][key] = value
+    _save_config_atomic(_CONFIG_PATH, doc)
+    invalidate_config_cache()
+
+
 def _maybe_prompt_privacy_setup(*, cloud_intent: bool = False) -> None:
     """Prompt for privacy setup on first run if [privacy] section is missing."""
     import sys as _sys  # use real sys, not the module-level reference
@@ -111,18 +133,19 @@ def _maybe_prompt_privacy_setup(*, cloud_intent: bool = False) -> None:
 
     from screencap.config import _CONFIG_PATH, _load_toml
 
-    if not _CONFIG_PATH.exists():
-        # No config file at all — still prompt
-        pass
-    else:
+    is_new_user = True
+    if _CONFIG_PATH.exists():
         cfg = _load_toml()
         privacy_section = cfg.get("privacy")
         if privacy_section is not None:
             # Has a [privacy] section — check if NLP models need downloading.
             # Skip for cloud-intent: the cloud gate handles model download.
+            is_new_user = False
             if not cloud_intent:
                 _maybe_download_nlp_models()
-            return
+
+    if not is_new_user:
+        return
 
     console.print(
         "\n[bold]Privacy setup not configured.[/bold] "
@@ -132,21 +155,82 @@ def _maybe_prompt_privacy_setup(*, cloud_intent: bool = False) -> None:
         from screencap.setup_wizard import run_setup_wizard
         run_setup_wizard()
     else:
-        # Write setup_skipped flag to prevent re-prompting
-        import tomlkit
-        from screencap.config import invalidate_config_cache
-        from screencap.setup_wizard import _load_config_toml, _save_config_atomic
-
-        doc = _load_config_toml(_CONFIG_PATH)
-        if "privacy" not in doc:
-            doc.add("privacy", tomlkit.table())
-        doc["privacy"]["setup_skipped"] = True
-        _save_config_atomic(_CONFIG_PATH, doc)
-        invalidate_config_cache()
+        _write_privacy_flag("setup_skipped", True)
         console.print(
             "[dim]Skipped. Recordings will stay local with default privacy settings. "
             "Run 'screencap setup' anytime.[/dim]"
         )
+
+    # New-user path always pre-acknowledges the matrix correction so the
+    # migration prompt never fires for someone who has only ever seen the
+    # corrected matrix (Unit 7a release sequencing).
+    try:
+        _write_privacy_flag(_MATRIX_ACK_KEY, True)
+    except Exception:
+        pass
+
+
+def _maybe_prompt_matrix_acknowledgement() -> None:
+    """One-time on-upgrade acknowledgement of the privacy matrix correction.
+
+    The Unit 7a matrix change tightens CHAT/EMAIL/CALENDAR/VIDEO_CALL under
+    ``mode = internal`` from TEXT_REDACT to MASK_WINDOW. Existing CLI users
+    who relied on text-redacted transcripts of conversation apps will see a
+    real workflow change (video frames blocked, keystrokes nulled, screenshots
+    full-window-blurred). This prints a one-line note + 5-second prompt the
+    first time after upgrade so they aren't surprised. The flag is written
+    regardless of the user's keystroke; recording continues either way.
+
+    Skipped silently when:
+      - flag already set (acknowledged on a prior run, or pre-set for new users)
+      - mode is not ``internal`` (matrix change doesn't apply)
+      - stdin is not a TTY (non-interactive — e.g., SwiftUI subprocess)
+      - ``SCREENCAP_MATRIX_ACK=true`` (SwiftUI sets this; the flag still gets
+        written so future invocations don't re-check)
+    """
+    import sys as _sys
+
+    from screencap.config import _CONFIG_PATH, _load_toml
+    from screencap.privacy.policy import PrivacyMode
+
+    if not _CONFIG_PATH.exists():
+        return
+    cfg = _load_toml()
+    privacy_section = cfg.get("privacy") or {}
+    if privacy_section.get(_MATRIX_ACK_KEY):
+        return
+
+    mode_str = (privacy_section.get("mode") or "internal").lower()
+    try:
+        mode = PrivacyMode(mode_str)
+    except ValueError:
+        return
+    if mode is not PrivacyMode.INTERNAL:
+        # Matrix change doesn't affect non-internal modes for chat/email/cal/vc.
+        return
+
+    import os as _os
+    env_ack = _os.environ.get("SCREENCAP_MATRIX_ACK", "").lower() == "true"
+    interactive = _sys.stdin.isatty() and not env_ack
+
+    if interactive:
+        console.print(
+            "[yellow]Privacy default changed:[/yellow] chat / email / calendar / "
+            "video-call apps under [bold]mode = internal[/bold] now mask the window "
+            "instead of text-redacting it. Press [bold]Y[/bold] within 5s to "
+            "acknowledge. Recording continues either way."
+        )
+        try:
+            import select
+
+            select.select([_sys.stdin], [], [], 5.0)
+        except Exception:
+            pass
+
+    try:
+        _write_privacy_flag(_MATRIX_ACK_KEY, True)
+    except Exception:
+        pass
 
 
 @cli.command()
@@ -234,6 +318,7 @@ def start(
     capture_window_data = False if no_window_data else None  # None = upstream default (True)
     # First-run privacy setup detection
     _maybe_prompt_privacy_setup(cloud_intent=destination == "cloud")
+    _maybe_prompt_matrix_acknowledgement()
 
     # --- Resolve recording destination (cloud/local) ---
     from screencap.config import get_upload_default
