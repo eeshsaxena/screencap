@@ -841,7 +841,7 @@ class TestCloudIntentRecording:
 class TestHeadlessRecorderUnavailable:
     """Verifies the friendly headless fallback when screencap.engine.recorder cannot be imported."""
 
-    def test_recorder_import_failure_exits_with_friendly_message(self, tmp_path, capsys):
+    def test_recorder_import_failure_exits_with_friendly_message(self, tmp_path):
         """When screencap.engine.recorder is unimportable, start_recording exits 1 with the friendly message.
 
         The function-local import in recorder.py:691 sits inside a try/except ImportError that
@@ -861,11 +861,16 @@ class TestHeadlessRecorderUnavailable:
             mock.patch("screencap.pidfile.write_pidfile"),
             mock.patch("screencap.pidfile.delete_pidfile"),
             mock.patch.dict(sys.modules, {"screencap.engine.recorder": None}),
+            mock.patch("screencap.recorder.console") as mock_console,
         ):
             with pytest.raises(SystemExit) as exc_info:
                 start_recording("test", output_dir=tmp_path / "test-rec")
 
         assert exc_info.value.code == 1
-        captured = capsys.readouterr()
-        assert "Recorder not available" in captured.out
-        assert "pynput" in captured.out
+        print_calls = [str(c) for c in mock_console.print.call_args_list]
+        assert any("Recorder not available" in c for c in print_calls), (
+            f"Friendly headless message not found in console output: {print_calls}"
+        )
+        assert any("pynput" in c for c in print_calls), (
+            f"pynput dependency hint not found in console output: {print_calls}"
+        )

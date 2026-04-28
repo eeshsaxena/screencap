@@ -6,6 +6,8 @@ neighbourhood) into the eager import chain. Programmatic demo generation
 lives at ``screencap.engine.visualize.demo.create_demo``.
 """
 
+from __future__ import annotations
+
 from screencap.engine.visualize.html import create_html
 
 __all__ = ["create_html"]

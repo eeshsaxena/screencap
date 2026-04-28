@@ -138,7 +138,7 @@ def recording_env(tmp_path, monkeypatch):
 def test_normal_recording_lifecycle(recording_env):
     """Full lifecycle: start_recording() → immediate stop → verify cleanup.
 
-    Mocked: screencap.engine.Recorder (hardware), permissions, disk_usage, orphan
+    Mocked: screencap.engine.recorder.Recorder (hardware), permissions, disk_usage, orphan
     scan, metrics.
     Real: config (env vars), pidfile (tmp_path), file I/O.
 
@@ -663,7 +663,7 @@ def test_start_recording_multi_chunk_produces_all_chunk_files(recording_env):
     This test catches the bug where only chunk 0 is processed because
     the Recorder doesn't send rotation messages for subsequent chunks.
 
-    Mocked: screencap.engine.Recorder (replaced with FakeChunkedRecorder),
+    Mocked: screencap.engine.recorder.Recorder (replaced with FakeChunkedRecorder),
     permissions, disk_usage, orphan scan, metrics.
     Real: config (env vars), pidfile (tmp_path), ChunkProcessor, exporter.
     """
@@ -813,7 +813,7 @@ def test_chunk_processor_survives_queue_close_during_processing(tmp_path):
 def test_non_chunked_recording_no_chunk_processor(recording_env):
     """chunk_duration=0 disables chunking: no ChunkProcessor, no chunk_* files.
 
-    Mocked: screencap.engine.Recorder (hardware), permissions, disk_usage, orphan
+    Mocked: screencap.engine.recorder.Recorder (hardware), permissions, disk_usage, orphan
     scan, metrics.
     Real: config (env vars), pidfile (tmp_path), file I/O.
     """

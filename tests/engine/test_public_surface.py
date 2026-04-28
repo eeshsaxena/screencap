@@ -15,7 +15,6 @@ import os
 import subprocess
 import sys
 
-
 # Watchlist (prefix-match against sys.modules keys). Update with care:
 # every entry is a documented architectural boundary, not noise.
 HEAVY_IMPORT_PREFIXES: tuple[str, ...] = (
@@ -41,7 +40,7 @@ def test_engine_import_does_not_pull_heavy_deps() -> None:
         "import screencap.engine, sys\n"
         f"prefixes = {HEAVY_IMPORT_PREFIXES!r}\n"
         "leaked = sorted(m for m in sys.modules if m.startswith(prefixes))\n"
-        "print(leaked, file=sys.stderr)\n"  # diagnostic survives the exit
+        "if leaked: print(leaked, file=sys.stderr)\n"  # diagnostic on failure only
         "sys.exit(1 if leaked else 0)\n"
     )
     # Suppress coverage's subprocess bootstrap so its sitecustomize-driven
