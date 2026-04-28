@@ -468,6 +468,35 @@ def _check_macos_permissions() -> None:
 
 
 # ---------------------------------------------------------------------------
+# Unit 8: mid-recording permission revocation watcher
+# ---------------------------------------------------------------------------
+
+
+def _check_permissions_now() -> tuple[bool, str | None]:
+    """Probe the three TCC permissions; return (all_ok, missing_name).
+
+    Designed to run on the recorder's main loop every ~3-5s. Returns
+    (False, "screen_recording" | "accessibility" | "input_monitoring") on
+    the first detected revocation. Microphone is intentionally NOT polled
+    here — audio loss should not abort a video-only capture.
+    """
+    if sys.platform != "darwin":
+        return True, None
+    try:
+        from screencap.engine.platform.darwin import DarwinPlatform
+    except ImportError:
+        return True, None
+
+    if not DarwinPlatform.is_screen_recording_enabled():
+        return False, "screen_recording"
+    if not DarwinPlatform.is_accessibility_enabled():
+        return False, "accessibility"
+    if not DarwinPlatform.is_input_monitoring_enabled():
+        return False, "input_monitoring"
+    return True, None
+
+
+# ---------------------------------------------------------------------------
 # Menu bar helpers
 # ---------------------------------------------------------------------------
 
@@ -1184,10 +1213,36 @@ def start_recording(
                 console=console,
                 refresh_per_second=2,
             ) as live:
+                _last_perm_check = 0.0
+                _PERM_CHECK_INTERVAL = 3.0  # seconds — Unit 8 detection SLA: <10s
                 try:
                     while recorder.is_recording and not _stop_event.is_set():
                         elapsed = time.time() - t0
                         pulse_on = int(elapsed) % 2 == 0
+
+                        # Unit 8: mid-recording permission revocation watcher.
+                        # Engine-side defense for the silent-black-frame TCC
+                        # bypass anti-pattern. SwiftUI also polls independently
+                        # (5s + on NSWorkspace activation), but this catches
+                        # the case where the SwiftUI watcher misses a transition.
+                        if elapsed - _last_perm_check >= _PERM_CHECK_INTERVAL:
+                            _last_perm_check = elapsed
+                            _ok, _missing = _check_permissions_now()
+                            if not _ok and not _stop_event.is_set():
+                                _stop_reason = f"permission_revoked_{_missing}"
+                                # Emit the structured stderr event for SwiftUI
+                                # consumption (Unit 8a contract).
+                                try:
+                                    from screencap.cli import _emit_event
+                                    _emit_event(
+                                        "permission_lost",
+                                        permission=_missing,
+                                        elapsed=elapsed,
+                                    )
+                                except Exception:
+                                    pass
+                                _stop_event.set()
+                                recorder.stop()
 
                         # Periodic disk space check
                         if elapsed - last_disk_check >= disk_check_interval:
