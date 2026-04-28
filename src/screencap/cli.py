@@ -1024,16 +1024,47 @@ def info(name, as_json):
             console.print(f"\n  [dim]No end snapshot (recording may have been interrupted).[/dim]")
 
 
-def _export_one(recording_dir, output_path, exclude_moves, err_console):
-    """Export a single recording. Returns event count, or -1 on error."""
+def _export_one(recording_dir, output_path, exclude_moves, err_console, privacy_filter=None):
+    """Export a single recording. Returns event count, or -1 on error.
+
+    When *privacy_filter* is supplied, it is applied to window.switch events
+    during export — used by the ``--privacy-filter`` flag (Unit 4d).
+    """
     from screencap.exporter import ExportError, build_export_metadata, export_recording
 
     meta = build_export_metadata(exclude_moves)
     try:
-        return export_recording(recording_dir, output_path, exclude_moves, metadata=meta)
+        return export_recording(
+            recording_dir, output_path, exclude_moves,
+            metadata=meta, privacy_filter=privacy_filter,
+        )
     except ExportError as e:
         err_console.print(f"[red]Error:[/red] {e}")
         return -1
+
+
+def _build_export_privacy_filter(recording_dir):
+    """Build a privacy filter for ``--privacy-filter`` exports.
+
+    Resolves the configured ``[privacy].mode`` from config.toml, defaulting
+    to ``internal`` if not set. ``cloud_intent=False`` because CLI exports
+    are local-only by default; cloud-bound paths use the dedicated
+    ``build_cloud_window_filter`` constructor.
+    """
+    from screencap.exporter import build_privacy_filter
+
+    try:
+        from screencap.config import _load_toml
+        privacy_section = (_load_toml().get("privacy") or {})
+        mode = privacy_section.get("mode") or "internal"
+    except Exception:
+        mode = "internal"
+
+    return build_privacy_filter(
+        privacy_mode=mode,
+        cloud_intent=False,
+        capture_dir=recording_dir,
+    )
 
 
 def _find_exportable_dirs(base_dir):
@@ -1057,7 +1088,11 @@ def _find_exportable_dirs(base_dir):
               help="Write to stdout instead of a file.")
 @click.option("--exclude-moves", is_flag=True, default=False,
               help="Exclude mouse move events from output.")
-def export(name, all_recordings, downloads, output, use_stdout, exclude_moves):
+@click.option("--privacy-filter", "privacy_filter_enabled", is_flag=True, default=False,
+              help="Apply window-event privacy filter (suppress EXCLUDE app windows, "
+                   "mask MASK_WINDOW titles). Off by default — turn on for SwiftUI viewer "
+                   "or other downstream consumers that need privacy-filtered events.")
+def export(name, all_recordings, downloads, output, use_stdout, exclude_moves, privacy_filter_enabled):
     """Export recording events as JSONL for training.
 
     WARNING: Export includes all captured keystrokes (passwords, API keys,
@@ -1108,7 +1143,8 @@ def export(name, all_recordings, downloads, output, use_stdout, exclude_moves):
         for i, rec_dir in enumerate(dirs, 1):
             err_console.print(f"\n[bold][{i}/{total}][/bold] {rec_dir.name}")
             out = str(rec_dir / "events.jsonl")
-            count = _export_one(rec_dir, out, exclude_moves, err_console)
+            pf = _build_export_privacy_filter(rec_dir) if privacy_filter_enabled else None
+            count = _export_one(rec_dir, out, exclude_moves, err_console, privacy_filter=pf)
             if count >= 0:
                 err_console.print(f"Exported {count} events to [bold]{out}[/bold]")
                 if count == 0:
@@ -1145,13 +1181,84 @@ def export(name, all_recordings, downloads, output, use_stdout, exclude_moves):
     else:
         output_path = str(recording_dir / "events.jsonl")
 
-    count = _export_one(recording_dir, output_path, exclude_moves, err_console)
+    pf = _build_export_privacy_filter(recording_dir) if privacy_filter_enabled else None
+    count = _export_one(recording_dir, output_path, exclude_moves, err_console, privacy_filter=pf)
     if count < 0:
         sys.exit(1)
     if output_path:
         err_console.print(f"Exported {count} events to [bold]{output_path}[/bold]")
     if count == 0:
         err_console.print("[yellow]Warning:[/yellow] Recording contains no events.")
+
+
+@cli.command()
+@click.option("--json", "as_json", is_flag=True, default=False,
+              help="Emit machine-readable JSON to stdout (no styling, no rich output).")
+def status(as_json):
+    """Report recording state without IPC.
+
+    Reads the flock-protected ``recording.lock`` content (Unit 3) and the
+    config flags. Designed for SwiftUI's 1Hz poll loop — light dependencies,
+    no SessionController spawn, no AppKit. Always exits 0.
+    """
+    import json as _json
+    import time as _time
+
+    from screencap.pidfile import lock_is_active, read_lock_metadata
+
+    # 1. Recording state — flock probe is the canonical "is something live"
+    # answer; the metadata file's content can lag (kernel auto-releases the
+    # flock on death but file content stays).
+    is_recording = lock_is_active()
+    metadata = read_lock_metadata() if is_recording else None
+
+    payload: dict = {"is_recording": bool(is_recording)}
+    if is_recording and metadata is not None:
+        started_at = metadata.get("started_at")
+        if isinstance(started_at, (int, float)):
+            payload["started_at"] = float(started_at)
+            payload["elapsed"] = max(0.0, _time.time() - float(started_at))
+        if metadata.get("capture_dir"):
+            payload["capture_dir"] = metadata["capture_dir"]
+        if metadata.get("claimant"):
+            payload["claimant"] = metadata["claimant"]
+    elif read_lock_metadata() is not None and not is_recording:
+        # Lock file exists but no holder — surface the stale-file warning so
+        # debugging is easier without breaking the boolean contract.
+        payload["warning"] = "lock_unparseable_or_stale"
+
+    # 2. Config readiness flags — cheap and useful for first-run UI.
+    try:
+        from screencap.config import _load_toml
+        privacy_section = (_load_toml().get("privacy") or {})
+        payload["privacy_configured"] = bool(privacy_section)
+    except Exception:
+        payload["privacy_configured"] = False
+
+    try:
+        from screencap.privacy import are_nlp_models_cached
+        payload["nlp_models_cached"] = bool(are_nlp_models_cached())
+    except Exception:
+        payload["nlp_models_cached"] = False
+
+    if as_json:
+        sys.stdout.write(_json.dumps(payload) + "\n")
+        sys.stdout.flush()
+        return
+
+    # Pretty output for human callers.
+    if payload["is_recording"]:
+        elapsed = payload.get("elapsed")
+        if elapsed is not None:
+            console.print(f"[#22d3ee]Recording[/#22d3ee] — {int(elapsed)}s elapsed")
+        else:
+            console.print("[#22d3ee]Recording[/#22d3ee] — (start time unknown)")
+        if payload.get("capture_dir"):
+            console.print(f"  Capture dir: {payload['capture_dir']}")
+        if payload.get("claimant"):
+            console.print(f"  Claimant: {payload['claimant']}")
+    else:
+        console.print("[dim]Not recording.[/dim]")
 
 
 @cli.command()
@@ -2054,10 +2161,11 @@ def scrub(name: str, pii_engine: str | None) -> None:
         raise SystemExit(1)
 
 
-@cli.command()
+@cli.group(invoke_without_command=True)
 @click.option("--set", "set_pair", default=None, metavar="KEY=VALUE",
               help="Change a setting, e.g. --set show_on_website=true")
-def settings(set_pair):
+@click.pass_context
+def settings(ctx, set_pair):
     """Show or change ScreenCap configuration.
 
     \b
@@ -2071,12 +2179,21 @@ def settings(set_pair):
       screencap settings --set upload_default=cloud
 
     \b
+    Mutate a privacy list (Unit 4b):
+      screencap settings privacy exclude_apps add com.example.foo
+      screencap settings privacy allow_apps remove com.tinyspeck.slackmacgap
+      screencap settings privacy mode set internal
+
+    \b
     Changeable keys:
       show_on_website    Show recordings on the website (true/false)
       audio_default      Record audio by default (true/false)
       auto_name          LLM auto-naming after recording (true/false)
       upload_default     Default destination (local/cloud/both/ask)
     """
+    if ctx.invoked_subcommand is not None:
+        # privacy subcommand path — defer to the subcommand handler.
+        return
     from screencap.config import (
         _CONFIG_PATH,
         get_audio_default,
@@ -2167,6 +2284,158 @@ def settings(set_pair):
     console.print()
     console.print("[dim]  Change with: screencap settings --set KEY=VALUE[/dim]")
     console.print()
+
+
+_PRIVACY_LIST_FIELDS = ("exclude_apps", "allow_apps", "mask_domains", "mask_title_patterns")
+_PRIVACY_SCALAR_FIELDS = ("mode", "setup_skipped", "matrix_acknowledged_v2026_04")
+_PRIVACY_MAP_FIELDS = ("app_classes",)
+_PRIVACY_MODE_VALUES = ("public", "shared", "internal")
+
+
+def _privacy_list_field_value(value: str) -> str:
+    """Normalize a list-field value before adding/removing."""
+    return value.strip()
+
+
+def _matrix_excludes_for_class(ctx_class) -> bool:
+    """Return True if the matrix forces EXCLUDE for this class in every mode.
+
+    Used to reject ``allow_apps add`` for password-manager bundles that the
+    matrix unconditionally excludes — the user's allow-list cannot bypass the
+    matrix EXCLUDE invariant (per ``policy.py:389+``).
+    """
+    from screencap.privacy.policy import (
+        PrivacyAction,
+        PrivacyMode,
+        get_matrix_action,
+    )
+
+    return all(
+        get_matrix_action(ctx_class, m) == PrivacyAction.EXCLUDE
+        for m in PrivacyMode
+    )
+
+
+@settings.command("privacy")
+@click.argument("field")
+@click.argument("op", type=click.Choice(["add", "remove", "set"]))
+@click.argument("value")
+def settings_privacy(field, op, value):
+    """Mutate a [privacy] field in config.toml (Unit 4b).
+
+    \b
+    Examples:
+      screencap settings privacy exclude_apps add com.example.foo
+      screencap settings privacy allow_apps remove com.example.bar
+      screencap settings privacy mode set internal
+
+    Writes through tomlkit so existing comments and key order are preserved
+    (R16 invariant). Idempotent: add of an already-present value is a no-op,
+    remove of an absent value is a no-op (both exit 0).
+
+    Validation: rejects writes that would bypass a matrix EXCLUDE (e.g.,
+    adding a password-manager bundle ID to allow_apps).
+    """
+    import tomlkit
+
+    from screencap.config import _CONFIG_PATH, invalidate_config_cache
+    from screencap.setup_wizard import _load_config_toml, _save_config_atomic
+
+    field = field.strip()
+    is_list = field in _PRIVACY_LIST_FIELDS
+    is_scalar = field in _PRIVACY_SCALAR_FIELDS
+    is_map = field in _PRIVACY_MAP_FIELDS
+
+    if not (is_list or is_scalar or is_map):
+        all_fields = sorted(_PRIVACY_LIST_FIELDS + _PRIVACY_SCALAR_FIELDS + _PRIVACY_MAP_FIELDS)
+        console.print(f"[red]Error:[/red] Unknown privacy field: {field}")
+        console.print(f"[dim]Available: {', '.join(all_fields)}[/dim]")
+        raise SystemExit(1)
+
+    if is_list and op == "set":
+        console.print(f"[red]Error:[/red] {field} is a list — use add/remove, not set.")
+        raise SystemExit(1)
+    if is_scalar and op != "set":
+        console.print(f"[red]Error:[/red] {field} is a scalar — use set, not {op}.")
+        raise SystemExit(1)
+
+    value = _privacy_list_field_value(value)
+
+    # Scalar normalization & validation
+    parsed_value: object = value
+    if is_scalar:
+        if field == "mode":
+            if value.lower() not in _PRIVACY_MODE_VALUES:
+                console.print(
+                    f"[red]Error:[/red] mode must be one of "
+                    f"{_PRIVACY_MODE_VALUES}, got: {value}"
+                )
+                raise SystemExit(1)
+            parsed_value = value.lower()
+        elif field in ("setup_skipped", "matrix_acknowledged_v2026_04"):
+            if value.lower() in ("true", "1", "yes"):
+                parsed_value = True
+            elif value.lower() in ("false", "0", "no"):
+                parsed_value = False
+            else:
+                console.print(
+                    f"[red]Error:[/red] {field} must be true/false, got: {value}"
+                )
+                raise SystemExit(1)
+
+    # Matrix-invariant guard: reject loosening EXCLUDE-class apps via allow_apps
+    if is_list and field == "allow_apps" and op == "add":
+        from screencap.privacy.context import BUNDLE_ID_MAP
+        ctx_class = BUNDLE_ID_MAP.get(value)
+        if ctx_class is not None and _matrix_excludes_for_class(ctx_class):
+            console.print(
+                f"[red]Error:[/red] '{value}' is in {ctx_class.value} which the privacy "
+                "matrix unconditionally excludes — allow_apps cannot loosen this."
+            )
+            raise SystemExit(1)
+
+    doc = _load_config_toml(_CONFIG_PATH)
+    if "privacy" not in doc:
+        doc.add("privacy", tomlkit.table())
+    privacy_tbl = doc["privacy"]
+
+    if is_list:
+        existing = list(privacy_tbl.get(field, []))
+        if op == "add":
+            if value in existing:
+                # Idempotent no-op
+                console.print(f"[dim]{field} already contains {value} — no change.[/dim]")
+                return
+            existing.append(value)
+        else:  # remove
+            if value not in existing:
+                console.print(f"[dim]{field} does not contain {value} — no change.[/dim]")
+                return
+            existing.remove(value)
+        privacy_tbl[field] = existing
+    elif is_scalar:
+        privacy_tbl[field] = parsed_value
+    else:
+        # Map field (app_classes) — accept BUNDLE=CLASS syntax in `value`.
+        if "=" not in value:
+            console.print(
+                f"[red]Error:[/red] map field {field} requires BUNDLE_ID=CLASS, got: {value}"
+            )
+            raise SystemExit(1)
+        bundle, ctx_str = value.split("=", 1)
+        bundle, ctx_str = bundle.strip(), ctx_str.strip()
+        if op == "remove":
+            cur = dict(privacy_tbl.get(field, {}))
+            cur.pop(bundle, None)
+            privacy_tbl[field] = cur
+        else:  # add or set
+            cur = dict(privacy_tbl.get(field, {}))
+            cur[bundle] = ctx_str
+            privacy_tbl[field] = cur
+
+    _save_config_atomic(_CONFIG_PATH, doc)
+    invalidate_config_cache()
+    console.print(f"  [bold]privacy.{field}[/bold] {op} {value}")
 
 
 # ---------------------------------------------------------------------------

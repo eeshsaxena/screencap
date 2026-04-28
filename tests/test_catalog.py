@@ -193,6 +193,48 @@ def test_list_recordings_legacy_no_intent(recordings_dir):
     assert result[0].intent is None
 
 
+# --- Unit 4c: raw started_at + duration_seconds for SwiftUI consumers ---
+
+
+def test_list_recordings_populates_raw_started_at(recordings_dir):
+    """RecordingInfo.started_at carries the Unix timestamp from the recording row."""
+    d = _make_recording(recordings_dir, "raw-fields-rec", duration=42.5)
+    result = list_recordings(recordings_dir)
+    assert len(result) == 1
+    info = result[0]
+    assert info.started_at is not None
+    assert isinstance(info.started_at, float)
+    # Started ~42.5s ago, so it should be in the past
+    assert info.started_at < time.time()
+    # Sanity: the formatted date matches the raw timestamp
+    from datetime import datetime
+    assert datetime.fromtimestamp(info.started_at).strftime("%Y-%m-%d") == info.date
+
+
+def test_list_recordings_populates_raw_duration_seconds(recordings_dir):
+    """RecordingInfo.duration_seconds carries the raw float duration."""
+    _make_recording(recordings_dir, "duration-rec", duration=125.0)
+    result = list_recordings(recordings_dir)
+    info = result[0]
+    assert info.duration_seconds is not None
+    assert isinstance(info.duration_seconds, float)
+    assert info.duration_seconds > 0
+    # Sanity: formatted duration matches the raw float
+    # (should be "2m 5s" for 125s)
+    assert "2m" in info.duration
+
+
+def test_recording_info_namedtuple_asdict_includes_new_fields(recordings_dir):
+    """_asdict() serializes the new fields (so JSON output picks them up)."""
+    _make_recording(recordings_dir, "asdict-rec", duration=10.0)
+    info = list_recordings(recordings_dir)[0]
+    d = info._asdict()
+    assert "started_at" in d
+    assert "duration_seconds" in d
+    assert d["started_at"] is not None
+    assert d["duration_seconds"] is not None
+
+
 # --- get_seen_bundle_ids tests ---
 
 

@@ -33,6 +33,7 @@ def export_recording(
     output_path: str | None,
     exclude_moves: bool,
     metadata: dict | None = None,
+    privacy_filter=None,
 ) -> int:
     """Export a single recording to JSONL.
 
@@ -42,6 +43,9 @@ def export_recording(
 
     When *output_path* is a file path, uses atomic write (write to .tmp,
     rename on success).  When *output_path* is None, writes to stdout.
+
+    When *privacy_filter* is supplied, it is applied to every
+    ``WindowSwitchEvent`` — see ``_write_events`` for the contract.
     """
     from screencap.engine import Capture
 
@@ -55,13 +59,19 @@ def export_recording(
     with capture_ctx as capture:
         if output_path is None:
             # Write to stdout — no atomic write needed
-            count = _write_events(capture, sys.stdout, exclude_moves, metadata)
+            count = _write_events(
+                capture, sys.stdout, exclude_moves, metadata,
+                privacy_filter=privacy_filter,
+            )
         else:
             # Atomic write: .tmp → rename
             tmp_path = output_path + ".tmp"
             try:
                 with open(tmp_path, "w") as f:
-                    count = _write_events(capture, f, exclude_moves, metadata)
+                    count = _write_events(
+                        capture, f, exclude_moves, metadata,
+                        privacy_filter=privacy_filter,
+                    )
                 os.rename(tmp_path, output_path)
             except BaseException:
                 if os.path.exists(tmp_path):
