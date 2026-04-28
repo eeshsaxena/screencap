@@ -1503,18 +1503,34 @@ def _recover_chunk_metadata(
     double_click_distance = 5.0
     try:
         with open_recording_db(db_path, row_factory=Row) as conn:
-            # Get recording start time + click thresholds in one SELECT.
-            rec = conn.execute(
-                "SELECT timestamp, double_click_interval_seconds, "
-                "double_click_distance_pixels FROM recording LIMIT 1"
-            ).fetchone()
+            # Build the SELECT column list, gating per-recording click
+            # thresholds on their presence in the schema. Older recording.db
+            # files predate these columns; without the guard, an unconditional
+            # SELECT raises OperationalError which the outer except catches
+            # and silently aborts recovery for the entire recording (P2 bug).
+            # Mirrors chunk_processor._load_click_thresholds' fail-soft
+            # fallback to engine defaults (0.5s / 5px).
+            has_thresholds = (
+                has_column(conn, "recording", "double_click_interval_seconds")
+                and has_column(conn, "recording", "double_click_distance_pixels")
+            )
+            if has_thresholds:
+                rec = conn.execute(
+                    "SELECT timestamp, double_click_interval_seconds, "
+                    "double_click_distance_pixels FROM recording LIMIT 1"
+                ).fetchone()
+                if rec:
+                    if rec["double_click_interval_seconds"] is not None:
+                        double_click_interval = float(rec["double_click_interval_seconds"])
+                    if rec["double_click_distance_pixels"] is not None:
+                        double_click_distance = float(rec["double_click_distance_pixels"])
+            else:
+                rec = conn.execute(
+                    "SELECT timestamp FROM recording LIMIT 1"
+                ).fetchone()
             if not rec:
                 return
             rec_start = rec["timestamp"]
-            if rec["double_click_interval_seconds"] is not None:
-                double_click_interval = float(rec["double_click_interval_seconds"])
-            if rec["double_click_distance_pixels"] is not None:
-                double_click_distance = float(rec["double_click_distance_pixels"])
 
             # Get the first and last action event timestamps
             first_evt = conn.execute("SELECT MIN(timestamp) as ts FROM action_event").fetchone()
