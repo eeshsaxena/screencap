@@ -29,6 +29,7 @@ from screencap.privacy.actions import (
     KEYSTROKE_CONTENT_FIELDS,
     MOUSE_COORDINATE_FIELDS,
     SCRUB_BLOCK_ACTIONS,
+    SCRUB_CONTENT_NULL_ACTIONS,
     PrivacyAction,
 )
 from screencap.privacy.policy import DEFAULT_TRANSITION_HOLD_SECONDS
@@ -445,15 +446,33 @@ def _interval_intersects(
     return None
 
 
-def null_event_content(event: dict) -> None:
-    """Null out sensitive content fields in an event dict in-place (recursive).
+def null_pointer_geometry(event: dict) -> None:
+    """Zero mouse coordinate fields on retained mouse events. Recurses.
 
-    Handles nested structures like key.type inside mouse.drag.children,
-    window.switch title/domain fields, and mouse coordinate fields on
-    retained mouse events (e.g. a ``mouse.drag`` whose timestamp lands in
-    a SCRUB_BLOCK_ACTIONS interval — its content is nulled but the event
-    is retained for audit shape; pointer geometry must also be zeroed
-    so coarse interaction patterns don't leak).
+    Used when a mouse event's timestamp lands inside a SCRUB_BLOCK_ACTIONS
+    interval — pointer geometry leaks coarse interaction patterns inside
+    redacted/masked content, regardless of whether text content is
+    sensitive (TEXT_REDACT/OCR_FALLBACK keystrokes go through PII
+    detection; their pointer coordinates do not).
+    """
+    event_type = event.get("type", "")
+    if isinstance(event_type, str) and event_type.startswith("mouse."):
+        for fld in MOUSE_COORDINATE_FIELDS:
+            if fld in event:
+                event[fld] = None
+    for child in event.get("children", []):
+        null_pointer_geometry(child)
+
+
+def null_text_content(event: dict) -> None:
+    """Null keystroke text + window.switch title/domain. Recurses into children.
+
+    Recurses into ``children`` to cover ``key.type`` nested inside
+    ``mouse.drag``.
+
+    Used when an event's timestamp lands inside a SCRUB_CONTENT_NULL_ACTIONS
+    interval (EXCLUDE/MASK_WINDOW) — text content is wholesale-suppressed
+    in those contexts.
     """
     for fld in KEYSTROKE_CONTENT_FIELDS:
         if fld in event:
@@ -461,16 +480,20 @@ def null_event_content(event: dict) -> None:
     if event.get("type") == "window.switch":
         event["window_title"] = None
         event["domain"] = None
-    # R6/R12: zero positional fields on retained mouse events so drag
-    # envelope (start/end coords, displacement, waypoints) doesn't leak
-    # from blocked intervals. Recurses into drag children below.
-    event_type = event.get("type", "")
-    if isinstance(event_type, str) and event_type.startswith("mouse."):
-        for fld in MOUSE_COORDINATE_FIELDS:
-            if fld in event:
-                event[fld] = None
     for child in event.get("children", []):
-        null_event_content(child)
+        null_text_content(child)
+
+
+def null_event_content(event: dict) -> None:
+    """Backward-compat: null both pointer geometry and text content.
+
+    Maintained for any external caller; ``scrub_events_jsonl`` now calls
+    the granular helpers directly so SCRUB_BLOCK_ACTIONS pointer
+    suppression can run independently of SCRUB_CONTENT_NULL_ACTIONS text
+    nulling.
+    """
+    null_pointer_geometry(event)
+    null_text_content(event)
 
 
 # ---------------------------------------------------------------------------
@@ -1152,15 +1175,36 @@ def scrub_events_jsonl(
                         kept.append(c)
                     event["children"] = kept
 
-                    # Null the parent drag's content + coordinate fields.
-                    # null_event_content recurses into surviving children
-                    # too — for retained mouse children that means their
-                    # own x/y get zeroed (they're in a mouse.* type so the
-                    # MOUSE_COORDINATE_FIELDS branch fires). This is the
-                    # right behavior: any drag that touches a blocked
-                    # interval has leaked geometry, so the whole envelope
-                    # is suppressed.
-                    null_event_content(event)
+                    # Always null the parent drag's pointer geometry on
+                    # overlap — the drag envelope (start/end coords,
+                    # displacement) leaks the in-interval portion of the
+                    # gesture regardless of action type. ``null_pointer_geometry``
+                    # recurses into surviving children, so retained mouse
+                    # children also have their coords zeroed.
+                    null_pointer_geometry(event)
+
+                    if drag_overlap.action in SCRUB_CONTENT_NULL_ACTIONS:
+                        # EXCLUDE / MASK_WINDOW: also null text content
+                        # (key.type children, window titles). Recurses
+                        # into surviving children.
+                        null_text_content(event)
+                    else:
+                        # TEXT_REDACT / OCR_FALLBACK / MASK_REGION: pointer
+                        # is already suppressed; run PII detection on
+                        # surviving key.type children before writing the
+                        # drag, since the drag is written + ``continue``d
+                        # here and would otherwise bypass the PII detection
+                        # loop further below.
+                        _process_key_type_events(
+                            event, pipeline, anonymizer, _result, db_redactions,
+                        )
+                        if _xref:
+                            for child in event.get("children", []):
+                                if child.get("type") == "key.type":
+                                    _cross_reference_key_type(
+                                        child, _xref, _result, db_redactions,
+                                    )
+
                     _result.audit_entries.append(
                         AuditEntry(
                             timestamp=event_ts,
@@ -1178,7 +1222,11 @@ def scrub_events_jsonl(
             # are handled above with the range-overlap branch.
             blocked = find_blocked_interval(event_ts, _blocked, blocked_starts)
             if blocked is not None:
-                null_event_content(event)
+                # Pointer geometry is suppressed for ANY SCRUB_BLOCK_ACTIONS
+                # interval (pointer position leaks coarse patterns
+                # regardless of action).
+                null_pointer_geometry(event)
+
                 _result.audit_entries.append(
                     AuditEntry(
                         timestamp=event_ts,
@@ -1187,8 +1235,19 @@ def scrub_events_jsonl(
                         reason=blocked.reason,
                     )
                 )
-                outfile.write(json.dumps(event, ensure_ascii=False) + "\n")
-                continue
+
+                if blocked.action in SCRUB_CONTENT_NULL_ACTIONS:
+                    # EXCLUDE / MASK_WINDOW: also null keystroke text +
+                    # window titles. Don't fall through to PII detection
+                    # — content is wholesale-suppressed in these contexts.
+                    null_text_content(event)
+                    outfile.write(json.dumps(event, ensure_ascii=False) + "\n")
+                    continue
+
+                # TEXT_REDACT / OCR_FALLBACK / MASK_REGION: pointer
+                # suppressed above; let text fall through to PII
+                # detection below so detected entities are scrubbed
+                # without wholesale-nulling clean content.
 
             # Targeted key.type detection for combined-text secrets
             _process_key_type_events(

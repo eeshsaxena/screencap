@@ -74,6 +74,21 @@ SCRUB_BLOCK_ACTIONS = frozenset({
 })
 
 
+# Privacy actions that null keystroke text + window titles at scrub time.
+# Mirrors KEYSTROKE_NULL_ACTIONS at capture time. Distinct from
+# SCRUB_BLOCK_ACTIONS (pointer suppression set), which is broader because
+# pointer geometry is sensitive in more contexts (TEXT_REDACT,
+# OCR_FALLBACK, MASK_REGION) than text content. Inside those contexts,
+# keystrokes pass through to PII detection rather than being nulled
+# wholesale — TEXT_REDACT/OCR_FALLBACK actions are by design "let the
+# detector handle it, preserve clean text"; MASK_REGION masks a screen
+# region but keystrokes typically aren't sensitive in that context.
+SCRUB_CONTENT_NULL_ACTIONS = frozenset({
+    PrivacyAction.EXCLUDE,
+    PrivacyAction.MASK_WINDOW,
+})
+
+
 # Keystroke content fields to null when blocking.
 # Single source of truth used by both recorder_enforcement (capture-time)
 # and scrubber (post-processing).

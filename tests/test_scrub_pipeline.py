@@ -2750,3 +2750,471 @@ class TestIntervalIntersectsBoundary:
             ),
         ]
         assert _interval_intersects(0.999, 0.999, intervals) is None
+
+
+# ---------------------------------------------------------------------------
+# Finding 1: SCRUB_CONTENT_NULL_ACTIONS gating — pointer suppression and
+# text nulling are NOW differentiated.
+#
+# Pre-fix: any SCRUB_BLOCK_ACTIONS interval (including TEXT_REDACT,
+# OCR_FALLBACK, MASK_REGION) wholesale-nulled keystroke text + window
+# titles via ``null_event_content``. That defeated TEXT_REDACT's design
+# intent of "let the PII detector scrub PII, preserve clean text"; it
+# also wholesale-nulled OCR_FALLBACK (browser unverified under SHARED)
+# and MASK_REGION (chat/email under SHARED) keystrokes which is
+# unnecessarily destructive.
+#
+# Post-fix:
+#   * SCRUB_CONTENT_NULL_ACTIONS = {EXCLUDE, MASK_WINDOW} → text nulled
+#     wholesale (existing behavior preserved).
+#   * SCRUB_BLOCK_ACTIONS \ SCRUB_CONTENT_NULL_ACTIONS = {TEXT_REDACT,
+#     OCR_FALLBACK, MASK_REGION} → pointer geometry suppressed but text
+#     passes through to PII detection.
+# ---------------------------------------------------------------------------
+
+
+class TestScrubContentNullActionsGating:
+    """Finding 1: pointer suppression vs text nulling is now action-gated.
+
+    Pre-fix `null_event_content` was called for any SCRUB_BLOCK_ACTIONS
+    interval, wholesale-nulling keystroke text + window titles. Post-fix
+    only SCRUB_CONTENT_NULL_ACTIONS = {EXCLUDE, MASK_WINDOW} trigger
+    that wholesale nulling; TEXT_REDACT / OCR_FALLBACK / MASK_REGION
+    pass key.type text through to PII detection while still suppressing
+    pointer coordinates.
+    """
+
+    @staticmethod
+    def _key_type(ts: float, text: str = "John Smith") -> dict:
+        """key.type whose text contains the mock pipeline's PERSON entity."""
+        return {
+            "type": "key.type",
+            "timestamp": ts,
+            "text": text,
+            "children": [
+                {"type": "key.down", "timestamp": ts, "key_char": text[0]},
+            ],
+        }
+
+    # -------- key.type events: regression (wholesale null preserved) -----
+
+    def test_exclude_interval_nulls_key_type_text(self, tmp_path):
+        """REGRESSION: EXCLUDE interval still wholesale-nulls key.type text."""
+        events = [self._key_type(1005.0, "John Smith")]
+        intervals = [
+            BlockedInterval(
+                start=1000.0, end=1010.0,
+                action=PrivacyAction.EXCLUDE,
+                reason=ReasonCode.POLICY_EXCLUDED_APP,
+            ),
+        ]
+        scrubbed, _ = _scrub_with_intervals(tmp_path, events, intervals)
+        key = next(e for e in scrubbed if e.get("type") == "key.type")
+        assert key["text"] is None
+        assert key["children"][0]["key_char"] is None
+
+    def test_mask_window_interval_nulls_key_type_text(self, tmp_path):
+        """REGRESSION: MASK_WINDOW interval still wholesale-nulls key.type text."""
+        events = [self._key_type(1005.0, "John Smith")]
+        intervals = [
+            BlockedInterval(
+                start=1000.0, end=1010.0,
+                action=PrivacyAction.MASK_WINDOW,
+                reason=ReasonCode.POLICY_MODE_DEFAULT,
+            ),
+        ]
+        scrubbed, _ = _scrub_with_intervals(tmp_path, events, intervals)
+        key = next(e for e in scrubbed if e.get("type") == "key.type")
+        assert key["text"] is None
+        assert key["children"][0]["key_char"] is None
+
+    # -------- key.type events: NEW differentiated behavior --------------
+
+    def test_text_redact_interval_passes_key_type_text_through_pii(self, tmp_path):
+        """NEW: TEXT_REDACT interval — text passes through, PII gets redacted.
+
+        Pre-fix `text` was nulled wholesale. Post-fix the mock pipeline
+        detects "John Smith" → PERSON, so the text becomes ``<PERSON>``
+        (anonymized) rather than ``None`` (wholesale-nulled).
+        """
+        events = [self._key_type(1005.0, "John Smith")]
+        intervals = [
+            BlockedInterval(
+                start=1000.0, end=1010.0,
+                action=PrivacyAction.TEXT_REDACT,
+                reason=ReasonCode.POLICY_MODE_DEFAULT,
+            ),
+        ]
+        scrubbed, _ = _scrub_with_intervals(tmp_path, events, intervals)
+        key = next(e for e in scrubbed if e.get("type") == "key.type")
+        assert key["text"] is not None, (
+            "TEXT_REDACT must NOT wholesale-null text — it goes through PII detection"
+        )
+        assert key["text"] == "<PERSON>", (
+            f"PII detector should anonymize 'John Smith' → '<PERSON>'; got {key['text']!r}"
+        )
+
+    def test_text_redact_interval_clean_text_passes_through_unchanged(self, tmp_path):
+        """NEW: TEXT_REDACT with no PII — text preserved verbatim.
+
+        This is the load-bearing case: the whole point of TEXT_REDACT is
+        to preserve clean text intact while only scrubbing detected PII.
+        """
+        events = [self._key_type(1005.0, "hello world")]
+        intervals = [
+            BlockedInterval(
+                start=1000.0, end=1010.0,
+                action=PrivacyAction.TEXT_REDACT,
+                reason=ReasonCode.POLICY_MODE_DEFAULT,
+            ),
+        ]
+        scrubbed, _ = _scrub_with_intervals(tmp_path, events, intervals)
+        key = next(e for e in scrubbed if e.get("type") == "key.type")
+        assert key["text"] == "hello world", (
+            f"clean text inside TEXT_REDACT must be preserved verbatim; got {key['text']!r}"
+        )
+
+    def test_ocr_fallback_interval_passes_key_type_text_through_pii(self, tmp_path):
+        """NEW: OCR_FALLBACK interval — text passes through to PII detection."""
+        events = [self._key_type(1005.0, "John Smith")]
+        intervals = [
+            BlockedInterval(
+                start=1000.0, end=1010.0,
+                action=PrivacyAction.OCR_FALLBACK,
+                reason=ReasonCode.POLICY_MODE_DEFAULT,
+            ),
+        ]
+        scrubbed, _ = _scrub_with_intervals(tmp_path, events, intervals)
+        key = next(e for e in scrubbed if e.get("type") == "key.type")
+        assert key["text"] == "<PERSON>", (
+            f"OCR_FALLBACK must anonymize PII without wholesale nulling; got {key['text']!r}"
+        )
+
+    def test_mask_region_interval_passes_key_type_text_through_pii(self, tmp_path):
+        """NEW: MASK_REGION interval — text passes through to PII detection."""
+        events = [self._key_type(1005.0, "John Smith")]
+        intervals = [
+            BlockedInterval(
+                start=1000.0, end=1010.0,
+                action=PrivacyAction.MASK_REGION,
+                reason=ReasonCode.POLICY_MODE_DEFAULT,
+            ),
+        ]
+        scrubbed, _ = _scrub_with_intervals(tmp_path, events, intervals)
+        key = next(e for e in scrubbed if e.get("type") == "key.type")
+        assert key["text"] == "<PERSON>", (
+            f"MASK_REGION must anonymize PII without wholesale nulling; got {key['text']!r}"
+        )
+
+    # -------- mouse events: pointer suppression still applies ----------
+
+    def test_text_redact_interval_nulls_mouse_singleclick_coords(self, tmp_path):
+        """NEW: TEXT_REDACT interval — pointer coordinates still nulled.
+
+        Pointer geometry leaks coarse interaction patterns inside
+        redacted/masked content even when text passes through PII
+        detection. Pointer suppression covers ALL of SCRUB_BLOCK_ACTIONS.
+        """
+        events = [
+            {
+                "type": "mouse.singleclick",
+                "timestamp": 1005.0,
+                "x": 100.0, "y": 200.0,
+                "button": "left",
+                "children": [],
+            },
+        ]
+        intervals = [
+            BlockedInterval(
+                start=1000.0, end=1010.0,
+                action=PrivacyAction.TEXT_REDACT,
+                reason=ReasonCode.POLICY_MODE_DEFAULT,
+            ),
+        ]
+        scrubbed, _ = _scrub_with_intervals(tmp_path, events, intervals)
+        click = next(e for e in scrubbed if e.get("type") == "mouse.singleclick")
+        assert click["x"] is None
+        assert click["y"] is None
+        # Shape preserved
+        assert click["timestamp"] == 1005.0
+        assert click["button"] == "left"
+
+    def test_ocr_fallback_interval_nulls_mouse_scroll_coords(self, tmp_path):
+        """NEW: OCR_FALLBACK interval — mouse.scroll dx/dy/x/y nulled."""
+        events = [
+            {
+                "type": "mouse.scroll",
+                "timestamp": 1005.0,
+                "x": 200.0, "y": 400.0,
+                "dx": 0.0, "dy": -120.0,
+            },
+        ]
+        intervals = [
+            BlockedInterval(
+                start=1000.0, end=1010.0,
+                action=PrivacyAction.OCR_FALLBACK,
+                reason=ReasonCode.POLICY_MODE_DEFAULT,
+            ),
+        ]
+        scrubbed, _ = _scrub_with_intervals(tmp_path, events, intervals)
+        scroll = next(e for e in scrubbed if e.get("type") == "mouse.scroll")
+        assert scroll["x"] is None
+        assert scroll["y"] is None
+        assert scroll["dx"] is None
+        assert scroll["dy"] is None
+
+    def test_mask_region_interval_nulls_mouse_singleclick_coords(self, tmp_path):
+        """NEW: MASK_REGION interval — pointer coordinates still nulled."""
+        events = [
+            {
+                "type": "mouse.singleclick",
+                "timestamp": 1005.0,
+                "x": 100.0, "y": 200.0,
+                "button": "left",
+                "children": [],
+            },
+        ]
+        intervals = [
+            BlockedInterval(
+                start=1000.0, end=1010.0,
+                action=PrivacyAction.MASK_REGION,
+                reason=ReasonCode.POLICY_MODE_DEFAULT,
+            ),
+        ]
+        scrubbed, _ = _scrub_with_intervals(tmp_path, events, intervals)
+        click = next(e for e in scrubbed if e.get("type") == "mouse.singleclick")
+        assert click["x"] is None
+        assert click["y"] is None
+
+    # -------- window.switch events --------
+
+    def test_text_redact_interval_preserves_window_switch_title(self, tmp_path):
+        """NEW: ``window.switch`` title in TEXT_REDACT interval preserved.
+
+        ``window.switch`` is its own event type (not key.* or mouse.*).
+        Pre-fix `null_event_content` always nulled the title; post-fix
+        ``null_text_content`` only fires for SCRUB_CONTENT_NULL_ACTIONS.
+        Post-fix: title passes through (no PII path applies, so plain
+        text survives intact). Cloud-bound callers separately scrub
+        window.switch titles via the privacy filter at export time.
+        """
+        events = [
+            {
+                "type": "window.switch",
+                "timestamp": 1005.0,
+                "window_title": "Some Title",
+                "domain": "example.com",
+                "app_bundle_id": "com.example.app",
+            },
+        ]
+        intervals = [
+            BlockedInterval(
+                start=1000.0, end=1010.0,
+                action=PrivacyAction.TEXT_REDACT,
+                reason=ReasonCode.POLICY_MODE_DEFAULT,
+            ),
+        ]
+        scrubbed, _ = _scrub_with_intervals(tmp_path, events, intervals)
+        ws = next(e for e in scrubbed if e.get("type") == "window.switch")
+        assert ws["window_title"] == "Some Title", (
+            "TEXT_REDACT must NOT wholesale-null window.switch titles"
+        )
+        assert ws["domain"] == "example.com"
+
+    def test_exclude_interval_nulls_window_switch_title(self, tmp_path):
+        """REGRESSION: EXCLUDE interval still wholesale-nulls window.switch title."""
+        events = [
+            {
+                "type": "window.switch",
+                "timestamp": 1005.0,
+                "window_title": "Sensitive Title",
+                "domain": "secret.example.com",
+                "app_bundle_id": "com.example.app",
+            },
+        ]
+        intervals = [
+            BlockedInterval(
+                start=1000.0, end=1010.0,
+                action=PrivacyAction.EXCLUDE,
+                reason=ReasonCode.POLICY_EXCLUDED_APP,
+            ),
+        ]
+        scrubbed, _ = _scrub_with_intervals(tmp_path, events, intervals)
+        ws = next(e for e in scrubbed if e.get("type") == "window.switch")
+        assert ws["window_title"] is None
+        assert ws["domain"] is None
+
+    # -------- drag with key.type child --------
+
+    def test_text_redact_drag_runs_pii_detection_on_key_type_children(self, tmp_path):
+        """NEW: TEXT_REDACT drag — surviving key.type children go through PII detection.
+
+        Subtle: the drag branch writes + ``continue``s, so its key.type
+        children would otherwise bypass `_process_key_type_events`. The
+        non-CONTENT_NULL branch must explicitly invoke PII detection on
+        the drag's surviving children before writing.
+        """
+        events = [
+            {
+                "type": "mouse.drag",
+                "timestamp": 0.5,
+                "x": 100.0, "y": 200.0,
+                "dx": 400.0, "dy": 100.0,
+                "button": "left",
+                "children": [
+                    {
+                        "type": "mouse.down",
+                        "timestamp": 0.5,
+                        "x": 100.0, "y": 200.0,
+                        "button": "left",
+                    },
+                    # key.type child OUTSIDE the blocked interval (so it
+                    # survives the in-interval child filter) — but the
+                    # drag's overall span still overlaps the interval, so
+                    # the drag falls into the overlap branch.
+                    {
+                        "type": "key.type",
+                        "timestamp": 0.7,
+                        "text": "John Smith",
+                        "children": [
+                            {"type": "key.down", "timestamp": 0.7, "key_char": "J"},
+                        ],
+                    },
+                    {
+                        "type": "mouse.up",
+                        "timestamp": 1.5,  # in-interval — dropped
+                        "x": 500.0, "y": 300.0,
+                        "button": "left",
+                    },
+                ],
+            },
+        ]
+        intervals = [
+            BlockedInterval(
+                start=1.0, end=2.0,
+                action=PrivacyAction.TEXT_REDACT,
+                reason=ReasonCode.POLICY_MODE_DEFAULT,
+            ),
+        ]
+        scrubbed, _ = _scrub_with_intervals(tmp_path, events, intervals)
+        drag = next(e for e in scrubbed if e.get("type") == "mouse.drag")
+        # Pointer geometry suppressed regardless
+        assert drag["x"] is None
+        assert drag["y"] is None
+        # The key.type child survives but its text is PII-anonymized
+        key_children = [c for c in drag["children"] if c.get("type") == "key.type"]
+        assert len(key_children) == 1
+        assert key_children[0]["text"] == "<PERSON>", (
+            "TEXT_REDACT drag must run PII detection on surviving key.type "
+            f"children; got text={key_children[0]['text']!r}"
+        )
+
+    def test_exclude_drag_nulls_key_type_child_text(self, tmp_path):
+        """REGRESSION: EXCLUDE drag — key.type child text wholesale-nulled."""
+        events = [
+            {
+                "type": "mouse.drag",
+                "timestamp": 0.5,
+                "x": 100.0, "y": 200.0,
+                "dx": 400.0, "dy": 100.0,
+                "button": "left",
+                "children": [
+                    {
+                        "type": "mouse.down",
+                        "timestamp": 0.5,
+                        "x": 100.0, "y": 200.0,
+                        "button": "left",
+                    },
+                    # key.type child OUTSIDE the blocked interval, so it
+                    # survives the in-interval child filter — but the
+                    # whole drag is in EXCLUDE → text wholesale-nulled.
+                    {
+                        "type": "key.type",
+                        "timestamp": 0.7,
+                        "text": "John Smith",
+                        "children": [
+                            {"type": "key.down", "timestamp": 0.7, "key_char": "J"},
+                        ],
+                    },
+                    {
+                        "type": "mouse.up",
+                        "timestamp": 1.5,  # in-interval — dropped
+                        "x": 500.0, "y": 300.0,
+                        "button": "left",
+                    },
+                ],
+            },
+        ]
+        intervals = [
+            BlockedInterval(
+                start=1.0, end=2.0,
+                action=PrivacyAction.EXCLUDE,
+                reason=ReasonCode.POLICY_EXCLUDED_APP,
+            ),
+        ]
+        scrubbed, _ = _scrub_with_intervals(tmp_path, events, intervals)
+        drag = next(e for e in scrubbed if e.get("type") == "mouse.drag")
+        key_children = [c for c in drag["children"] if c.get("type") == "key.type"]
+        assert len(key_children) == 1
+        assert key_children[0]["text"] is None, (
+            "EXCLUDE drag must wholesale-null key.type child text"
+        )
+        assert key_children[0]["children"][0]["key_char"] is None
+
+    # -------- audit entries --------
+
+    def test_audit_entry_emitted_for_text_redact_interval(self, tmp_path):
+        """Audit entry must fire for TEXT_REDACT intervals even though
+        text is not nulled wholesale. The audit is the operator-facing
+        signal that a SCRUB_BLOCK_ACTIONS interval ran (regardless of
+        whether the action is in SCRUB_CONTENT_NULL_ACTIONS or not)."""
+        events = [self._key_type(1005.0, "John Smith")]
+        intervals = [
+            BlockedInterval(
+                start=1000.0, end=1010.0,
+                action=PrivacyAction.TEXT_REDACT,
+                reason=ReasonCode.POLICY_MODE_DEFAULT,
+            ),
+        ]
+        _, result = _scrub_with_intervals(tmp_path, events, intervals)
+        event_audits = [
+            e for e in result.audit_entries
+            if e.surface == "event" and e.action == PrivacyAction.TEXT_REDACT.value
+        ]
+        assert len(event_audits) == 1, (
+            f"Expected one TEXT_REDACT event audit, got {result.audit_entries}"
+        )
+
+    def test_audit_entry_emitted_for_ocr_fallback_interval(self, tmp_path):
+        """Audit fires for OCR_FALLBACK intervals."""
+        events = [self._key_type(1005.0, "hello")]
+        intervals = [
+            BlockedInterval(
+                start=1000.0, end=1010.0,
+                action=PrivacyAction.OCR_FALLBACK,
+                reason=ReasonCode.POLICY_MODE_DEFAULT,
+            ),
+        ]
+        _, result = _scrub_with_intervals(tmp_path, events, intervals)
+        event_audits = [
+            e for e in result.audit_entries
+            if e.surface == "event" and e.action == PrivacyAction.OCR_FALLBACK.value
+        ]
+        assert len(event_audits) == 1
+
+    def test_audit_entry_emitted_for_mask_region_interval(self, tmp_path):
+        """Audit fires for MASK_REGION intervals."""
+        events = [self._key_type(1005.0, "hello")]
+        intervals = [
+            BlockedInterval(
+                start=1000.0, end=1010.0,
+                action=PrivacyAction.MASK_REGION,
+                reason=ReasonCode.POLICY_MODE_DEFAULT,
+            ),
+        ]
+        _, result = _scrub_with_intervals(tmp_path, events, intervals)
+        event_audits = [
+            e for e in result.audit_entries
+            if e.surface == "event" and e.action == PrivacyAction.MASK_REGION.value
+        ]
+        assert len(event_audits) == 1
