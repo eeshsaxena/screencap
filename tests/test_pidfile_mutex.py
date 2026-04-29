@@ -103,6 +103,92 @@ class TestClaimLock:
         don't need to track held-state)."""
         assert pidfile.update_lock_metadata("/tmp/whatever") is False
 
+    def test_claim_lock_initializes_recording_fields_to_none(self, tmp_path):
+        """Per-recording state starts null. SessionController claims the lock
+        at __init__; the per-recording fields stay null until _on_start_click
+        plumbs them in via update_lock_metadata. status --json must read
+        is_recording from these fields, not from lock_is_active."""
+        pidfile.claim_lock(None, claimant="cli")
+        meta = pidfile.read_lock_metadata()
+        assert meta["recording_started_at"] is None
+        assert meta["recording_name"] is None
+        # Controller-init started_at is still set (distinct field).
+        assert isinstance(meta["started_at"], float)
+
+    def test_update_lock_metadata_sets_per_recording_fields(self, tmp_path):
+        """Passing recording_started_at + recording_name plumbs them in
+        without touching pid / claimant / controller-init started_at."""
+        pidfile.claim_lock(None, claimant="swiftui")
+        controller_started_at = pidfile.read_lock_metadata()["started_at"]
+
+        rec_dir = tmp_path / "rec-A"
+        ok = pidfile.update_lock_metadata(
+            rec_dir,
+            recording_started_at=controller_started_at + 5.0,
+            recording_name="rec-A",
+        )
+        assert ok is True
+
+        meta = pidfile.read_lock_metadata()
+        assert meta["capture_dir"] == str(rec_dir)
+        assert meta["recording_started_at"] == controller_started_at + 5.0
+        assert meta["recording_name"] == "rec-A"
+        # Controller-init fields preserved.
+        assert meta["started_at"] == controller_started_at
+        assert meta["claimant"] == "swiftui"
+
+    def test_update_lock_metadata_back_to_back_recordings_refresh_started_at(self, tmp_path):
+        """The bug this fixes: previously update_lock_metadata only mutated
+        capture_dir, so back-to-back recordings reported the same elapsed
+        time (the controller-init timestamp) instead of refreshing on each
+        new capture."""
+        pidfile.claim_lock(None, claimant="cli")
+
+        # First recording.
+        pidfile.update_lock_metadata(
+            tmp_path / "rec-1",
+            recording_started_at=1000.0,
+            recording_name="rec-1",
+        )
+        assert pidfile.read_lock_metadata()["recording_started_at"] == 1000.0
+
+        # Second recording in the same controller — must refresh.
+        pidfile.update_lock_metadata(
+            tmp_path / "rec-2",
+            recording_started_at=2000.0,
+            recording_name="rec-2",
+        )
+        meta = pidfile.read_lock_metadata()
+        assert meta["recording_started_at"] == 2000.0
+        assert meta["recording_name"] == "rec-2"
+        assert meta["capture_dir"] == str(tmp_path / "rec-2")
+
+    def test_clear_lock_recording_nulls_per_recording_fields(self, tmp_path):
+        """_on_stop_click calls clear_lock_recording so status --json reports
+        is_recording=false immediately, even though the controller still
+        holds the flock."""
+        pidfile.claim_lock(None, claimant="cli")
+        pidfile.update_lock_metadata(
+            tmp_path / "rec-1",
+            recording_started_at=1000.0,
+            recording_name="rec-1",
+        )
+
+        ok = pidfile.clear_lock_recording()
+        assert ok is True
+
+        meta = pidfile.read_lock_metadata()
+        assert meta["capture_dir"] is None
+        assert meta["recording_started_at"] is None
+        assert meta["recording_name"] is None
+        # Controller fields preserved — the flock is still held.
+        assert isinstance(meta["pid"], int)
+        assert meta["claimant"] == "cli"
+        assert isinstance(meta["started_at"], float)
+
+    def test_clear_lock_recording_returns_false_when_not_held(self):
+        assert pidfile.clear_lock_recording() is False
+
     def test_flock_oserror_does_not_leak_fd(self, monkeypatch, tmp_path):
         """Todo 008: any flock failure that isn't BlockingIOError must close
         the fd opened on the previous line. Without this, NFS EOPNOTSUPP /

@@ -172,6 +172,92 @@ class TestStatusJson:
         # Verify the probe itself was never called.
         m.assert_not_called()
 
+    def test_flock_held_without_recording_reports_not_recording(self, tmp_path):
+        """Lock is_active vs is_recording — the bug this fixes.
+
+        SessionController holds the flock for its whole lifetime (multi-
+        recording session). Between recordings _on_stop_click clears the
+        per-recording fields. status --json must report is_recording=false
+        even though lock_is_active() returns true, otherwise the elapsed
+        time would keep ticking off the controller's startup timestamp.
+        """
+        # Simulate the inter-recording state: flock held, no recording.
+        pidfile.claim_lock(None, claimant="swiftui")
+        try:
+            result = _run_status_json()
+        finally:
+            pidfile.release_lock()
+
+        payload = json.loads(result.output.strip())
+        assert payload["is_recording"] is False
+        assert payload["started_at"] is None
+        assert payload["elapsed"] is None
+        assert payload["capture_dir"] is None
+
+    def test_recording_active_uses_per_recording_started_at(self, tmp_path):
+        """Once update_lock_metadata sets recording_started_at, status reports
+        is_recording=true and elapsed counts from THAT timestamp, not from
+        the controller-init timestamp written by claim_lock."""
+        import time as _time
+        pidfile.claim_lock(None, claimant="swiftui")
+        # Pretend the controller has been alive for a while before this
+        # recording starts — controller_started_at is much older than
+        # the recording_started_at we'll plumb in next.
+        controller_meta = pidfile.read_lock_metadata()
+        controller_age = _time.time() - controller_meta["started_at"]
+        # Sanity: claim was just now, so age is near-zero.
+        assert controller_age >= 0
+
+        # Plumb in a per-recording timestamp 0.5s ago.
+        rec_started = _time.time() - 0.5
+        pidfile.update_lock_metadata(
+            tmp_path / "rec-X",
+            recording_started_at=rec_started,
+            recording_name="rec-X",
+        )
+
+        try:
+            result = _run_status_json()
+        finally:
+            pidfile.release_lock()
+
+        payload = json.loads(result.output.strip())
+        assert payload["is_recording"] is True
+        # started_at reflects the recording, not the controller. elapsed
+        # is ~0.5s, NOT the controller's age.
+        assert abs(payload["started_at"] - rec_started) < 0.01
+        assert 0.4 <= payload["elapsed"] < 2.0
+        assert payload["capture_dir"] == str(tmp_path / "rec-X")
+
+    def test_clear_recording_then_status_reports_idle(self, tmp_path):
+        """The Stop button path: claim → update → clear. status flips back
+        to is_recording=false even though the controller still holds the
+        flock for the next recording in the session."""
+        import time as _time
+        pidfile.claim_lock(None, claimant="swiftui")
+        pidfile.update_lock_metadata(
+            tmp_path / "rec-Y",
+            recording_started_at=_time.time(),
+            recording_name="rec-Y",
+        )
+        # Confirm we're recording.
+        active_payload = json.loads(_run_status_json().output.strip())
+        assert active_payload["is_recording"] is True
+
+        # Now clear (mimics _on_stop_click).
+        pidfile.clear_lock_recording()
+
+        try:
+            result = _run_status_json()
+        finally:
+            pidfile.release_lock()
+
+        payload = json.loads(result.output.strip())
+        assert payload["is_recording"] is False
+        assert payload["started_at"] is None
+        assert payload["elapsed"] is None
+        assert payload["capture_dir"] is None
+
 
 class TestStatusHumanOutput:
     """When stdout is a TTY (no `--json` flag), the user sees human output.

@@ -709,6 +709,10 @@ def start_recording(
 
         claimant = resolve_claimant()
         try:
+            # Standalone single-recording path: capture_dir is known now, so
+            # claim_lock writes recording_started_at = now and
+            # recording_name = capture_dir.name in one shot. status --json
+            # then reports is_recording=true with a fresh elapsed time.
             claim_lock(capture_dir, claimant=claimant)
         except LockContended as exc:
             # Lifecycle events go on stderr (todo 004): stdout is reserved for

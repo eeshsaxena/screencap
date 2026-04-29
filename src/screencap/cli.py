@@ -1529,18 +1529,34 @@ def status(as_json, no_nlp_check):
         privacy_configured: bool
         nlp_models_cached: bool | None  # None when --no-nlp-check is set
 
-    # Read lock state once — flock probe is the canonical "is something live"
-    # answer; the metadata file's content can lag (kernel auto-releases the
-    # flock on death but file content stays).
-    is_recording = lock_is_active()
+    # Two distinct facts about the lock:
+    #   1. lock_is_active() — flock probe. True iff a process holds the lock.
+    #      In session mode this is the controller's lifetime, NOT a single
+    #      recording's lifetime.
+    #   2. recording_started_at in metadata — set by SessionController on
+    #      _on_start_click, cleared on _on_stop_click. The canonical
+    #      "is a recording capture in progress?" signal.
+    #
+    # SwiftUI's elapsed-time UI must read recording_started_at, not the
+    # controller-init started_at. Without this distinction, the previous
+    # design left status reporting is_recording=true and a stale elapsed
+    # time after the user clicked Stop in the menubar (the controller
+    # was still alive between recordings).
+    flock_held = lock_is_active()
     metadata = read_lock_metadata()
+    recording_started_at = None
+    if metadata is not None:
+        rec_ts = metadata.get("recording_started_at")
+        if isinstance(rec_ts, (int, float)):
+            recording_started_at = float(rec_ts)
+    is_recording = flock_held and recording_started_at is not None
 
     payload: StatusPayload = {
         "ok": True,
         # Independent from stderr-event schema version (todo 009) — status
         # payload evolves separately.
         "schema_version": _STATUS_SCHEMA_VERSION,
-        "is_recording": bool(is_recording),
+        "is_recording": is_recording,
         "started_at": None,
         "elapsed": None,
         "capture_dir": None,
@@ -1556,15 +1572,15 @@ def status(as_json, no_nlp_check):
         payload["nlp_models_cached"] = None
 
     if is_recording and metadata is not None:
-        started_at = metadata.get("started_at")
-        if isinstance(started_at, (int, float)):
-            payload["started_at"] = float(started_at)
-            payload["elapsed"] = max(0.0, _time.time() - float(started_at))
+        # started_at + elapsed track THE recording, not the controller —
+        # so back-to-back recordings each report a fresh elapsed time.
+        payload["started_at"] = recording_started_at
+        payload["elapsed"] = max(0.0, _time.time() - recording_started_at)
         if metadata.get("capture_dir"):
             payload["capture_dir"] = metadata["capture_dir"]
         if metadata.get("claimant"):
             payload["claimant"] = metadata["claimant"]
-    elif not is_recording and LOCK_FILE.exists():
+    elif not flock_held and LOCK_FILE.exists():
         # Lock file exists but flock probe says no holder. Distinguish:
         #   - file unparseable (corrupt JSON) → metadata is None
         #   - file present + parseable + no holder → metadata is dict

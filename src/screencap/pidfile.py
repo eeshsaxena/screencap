@@ -233,11 +233,37 @@ def claim_lock(capture_dir: Path | str | None, claimant: str = "cli") -> int:
     # is left in a confused state where the module thinks no lock is held
     # but the kernel still has it.
     try:
+        now = time.time()
+        # Per-recording state semantics:
+        #   - SessionController path (multi-recording session): claim_lock(None)
+        #     initializes both per-recording fields to None. _on_start_click
+        #     calls update_lock_metadata(...) to set them; _on_stop_click
+        #     calls clear_lock_recording() to clear.
+        #   - Standalone CLI path (single recording): claim_lock(capture_dir)
+        #     treats the call itself as "this is the recording starting now"
+        #     and sets recording_started_at = now + recording_name from the
+        #     dir basename. No follow-up update_lock_metadata needed.
+        # `is_recording` reported by `screencap status --json` checks
+        # (recording_started_at is not None), NOT lock_is_active — so a
+        # long-lived SessionController between recordings correctly reports
+        # is_recording=false even while still holding the flock.
+        capture_dir_str = str(capture_dir) if capture_dir is not None else None
+        recording_started_at = now if capture_dir is not None else None
+        recording_name = (
+            Path(str(capture_dir)).name if capture_dir is not None else None
+        )
         metadata = {
             "pid": os.getpid(),
-            "started_at": time.time(),
-            "capture_dir": str(capture_dir) if capture_dir is not None else None,
+            # Controller startup time. Distinct from the per-recording
+            # `recording_started_at` field below — `started_at` describes
+            # when the lock holder came alive, NOT when the most recent
+            # recording started. SwiftUI's elapsed-time UI must read
+            # `recording_started_at`, never this field.
+            "started_at": now,
+            "capture_dir": capture_dir_str,
             "claimant": claimant,
+            "recording_started_at": recording_started_at,
+            "recording_name": recording_name,
         }
         payload = json.dumps(metadata).encode()
         os.ftruncate(fd, 0)
@@ -273,13 +299,25 @@ def _reset_for_tests() -> None:
         _LOCKED_FD = None
 
 
-def update_lock_metadata(capture_dir: Path | str) -> bool:
-    """Update the held lock file's ``capture_dir`` field in place (todo 014).
+def update_lock_metadata(
+    capture_dir: Path | str,
+    *,
+    recording_started_at: float | None = None,
+    recording_name: str | None = None,
+) -> bool:
+    """Plumb per-recording state into the held lock file in place.
 
     Called from ``SessionController._on_start_click`` once the per-recording
-    directory is allocated, so ``screencap status --json`` (and any consumer
-    reading the lock metadata) reflects the live recording's path instead of
-    the placeholder ``null`` written by ``claim_lock``.
+    directory is allocated, so ``screencap status --json`` reports the live
+    recording's path, name, and elapsed time instead of stale placeholders.
+
+    Updates three fields atomically while preserving everything else (pid,
+    claimant, controller-init started_at):
+      - ``capture_dir`` always
+      - ``recording_started_at`` when supplied (caller passes ``time.time()``
+        on session start — the previous design left this at controller-init
+        time so back-to-back recordings reported the wrong elapsed time)
+      - ``recording_name`` when supplied
 
     Returns ``True`` on success, ``False`` if the process doesn't currently
     hold the lock (no-op so callers don't need to track state).
@@ -293,6 +331,43 @@ def update_lock_metadata(capture_dir: Path | str) -> bool:
         # racing read-modify-write is impossible from another process.
         existing = read_lock_metadata() or {}
         existing["capture_dir"] = str(capture_dir)
+        if recording_started_at is not None:
+            existing["recording_started_at"] = float(recording_started_at)
+        if recording_name is not None:
+            existing["recording_name"] = recording_name
+        payload = json.dumps(existing).encode()
+        os.ftruncate(_LOCKED_FD, 0)
+        os.lseek(_LOCKED_FD, 0, os.SEEK_SET)
+        os.write(_LOCKED_FD, payload)
+        os.fsync(_LOCKED_FD)
+        return True
+    except OSError:
+        return False
+
+
+def clear_lock_recording() -> bool:
+    """Clear per-recording state from the held lock file.
+
+    Called from ``SessionController._on_stop_click`` so that
+    ``screencap status --json`` reports ``is_recording: false`` immediately
+    after stop, even though the controller still holds the flock for its
+    long-lived multi-recording session. Without this, status would report
+    is_recording=true and a stale elapsed time between recordings.
+
+    Sets ``capture_dir``, ``recording_started_at``, and ``recording_name``
+    to None. Preserves pid, claimant, and the controller-init ``started_at``.
+
+    Returns ``True`` on success, ``False`` if the process doesn't currently
+    hold the lock.
+    """
+    global _LOCKED_FD
+    if _LOCKED_FD is None:
+        return False
+    try:
+        existing = read_lock_metadata() or {}
+        existing["capture_dir"] = None
+        existing["recording_started_at"] = None
+        existing["recording_name"] = None
         payload = json.dumps(existing).encode()
         os.ftruncate(_LOCKED_FD, 0)
         os.lseek(_LOCKED_FD, 0, os.SEEK_SET)

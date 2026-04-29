@@ -767,13 +767,19 @@ class SessionController:
 
         name, capture_dir = self._allocate_capture_dir(base_name)
 
-        # Plumb the per-recording dir into lock metadata so `screencap status
-        # --json` reports the live recording's path (todo 014). Best-effort:
-        # if we don't currently hold the lock (shouldn't happen — we acquired
-        # at __init__), log and continue.
+        # Plumb per-recording state into lock metadata so `screencap status
+        # --json` reports is_recording=true with the live recording's path,
+        # name, and a fresh elapsed time. The recording_started_at field is
+        # what powers SwiftUI's elapsed-time UI — passing time.time() here
+        # (instead of relying on the controller-init started_at) means
+        # back-to-back recordings each get a correct elapsed time.
         try:
             from screencap.pidfile import update_lock_metadata
-            update_lock_metadata(capture_dir)
+            update_lock_metadata(
+                capture_dir,
+                recording_started_at=time.time(),
+                recording_name=name,
+            )
         except Exception:
             pass
 
@@ -904,6 +910,17 @@ class SessionController:
         # though the worker subprocess is still finalizing in the
         # background.
         self._state = SessionState.IDLE
+
+        # Clear per-recording state from the lock metadata so
+        # `screencap status --json` reports is_recording=false immediately,
+        # even though the controller still holds the flock for the next
+        # recording in this session. Without this, status would lie about
+        # the recording state between recordings.
+        try:
+            from screencap.pidfile import clear_lock_recording
+            clear_lock_recording()
+        except Exception:
+            pass
         self._push_control({
             "type": "state",
             "state": SessionState.IDLE.value,
