@@ -201,6 +201,12 @@ def claim_lock(capture_dir: Path | str, claimant: str = "cli") -> int:
         return _LOCKED_FD
 
     LOCK_DIR.mkdir(parents=True, exist_ok=True)
+    # Explicit perms on the dir so the lockfile content (PID, started_at,
+    # capture_dir) is not world-readable even on misconfigured umasks (todo 042).
+    try:
+        os.chmod(LOCK_DIR, 0o700)
+    except OSError:
+        pass
     fd = os.open(str(LOCK_FILE), os.O_RDWR | os.O_CREAT, 0o600)
     try:
         fcntl.flock(fd, fcntl.LOCK_EX | fcntl.LOCK_NB)
@@ -212,17 +218,28 @@ def claim_lock(capture_dir: Path | str, claimant: str = "cli") -> int:
         os.close(fd)
         raise LockContended(owner=existing) from None
 
-    metadata = {
-        "pid": os.getpid(),
-        "started_at": time.time(),
-        "capture_dir": str(capture_dir),
-        "claimant": claimant,
-    }
-    payload = json.dumps(metadata).encode()
-    os.ftruncate(fd, 0)
-    os.lseek(fd, 0, os.SEEK_SET)
-    os.write(fd, payload)
-    os.fsync(fd)
+    # If the metadata-write sequence raises after flock succeeds, close the
+    # fd so the kernel releases the lock immediately — otherwise the caller
+    # is left in a confused state where the module thinks no lock is held
+    # but the kernel still has it (todo 032).
+    try:
+        metadata = {
+            "pid": os.getpid(),
+            "started_at": time.time(),
+            "capture_dir": str(capture_dir),
+            "claimant": claimant,
+        }
+        payload = json.dumps(metadata).encode()
+        os.ftruncate(fd, 0)
+        os.lseek(fd, 0, os.SEEK_SET)
+        os.write(fd, payload)
+        os.fsync(fd)
+    except Exception:
+        try:
+            os.close(fd)  # releases the flock
+        except OSError:
+            pass
+        raise
 
     _LOCKED_FD = fd
     return fd

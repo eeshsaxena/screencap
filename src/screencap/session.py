@@ -215,15 +215,25 @@ def run_recording_worker(args: dict) -> None:
     # finished cleanly before spawning the post-process worker.
     try:
         if capture_dir is not None:
+            # Merge the recorder's stop-meta sidecar (force_stopped +
+            # terminated_reason) into the manifest so SessionController.run()
+            # can propagate the correct SystemExit code (todo 002, 009).
+            stop_meta: dict = {}
+            try:
+                meta_path = capture_dir / ".recording_stop_meta.json"
+                if meta_path.exists():
+                    stop_meta = json.loads(meta_path.read_text() or "{}")
+            except Exception:
+                pass
+            ready_payload = {
+                "elapsed": elapsed,
+                "completed_at": time.time(),
+                "disk_full": disk_full,
+                "force_stopped": bool(stop_meta.get("force_stopped", False)),
+                "terminated_reason": stop_meta.get("terminated_reason"),
+            }
             (capture_dir / ".recording_ready").write_text(
-                json.dumps(
-                    {
-                        "elapsed": elapsed,
-                        "completed_at": time.time(),
-                        "disk_full": disk_full,
-                    },
-                    indent=2,
-                ),
+                json.dumps(ready_payload, indent=2),
             )
     except Exception:
         pass
@@ -436,6 +446,11 @@ class SessionController:
         # session. Used to decide if the CLI-supplied ``--name`` should
         # apply (only to the very first recording).
         self._started_any = False
+        # Most recent terminal reason from any finished recording worker
+        # (read from ``.recording_ready``'s ``terminated_reason`` field).
+        # ``run()`` uses this to propagate the documented exit-code contract
+        # (3 = permission_lost, 4 = disk_full) to the SwiftUI shell.
+        self._terminated_reason: str | None = None
 
         # Effective audio state for the next recording. Seeded from
         # cli_args so ``--no-audio`` is honoured for the first recording,
@@ -473,28 +488,36 @@ class SessionController:
         # _skip_pidfile=True) do NOT claim; they inherit the controller's lock
         # by virtue of being children. Lock auto-releases on death even if
         # explicit cleanup is missed.
-        try:
-            from screencap.pidfile import LockContended, claim_lock
+        from screencap._stderr_events import emit_event as _emit_event, resolve_claimant
+        from screencap.config import get_recordings_dir
+        from screencap.pidfile import LockContended, claim_lock
 
-            claimant = "swiftui" if os.environ.get("SCREENCAP_PARENT") == "swiftui" else "cli"
+        claimant = resolve_claimant()
+        try:
+            claim_lock(Path("."), claimant=claimant)
+        except LockContended as exc:
+            # Lifecycle events go on stderr (not stdout). SwiftUI's
+            # RecorderController parses these as the canonical contract; stdout
+            # is reserved for human-readable rich output.
             try:
-                claim_lock(Path("."), claimant=claimant)
-            except LockContended as exc:
-                sys.stdout.write(json.dumps({"status": "already_running", "owner": exc.owner}) + "\n")
-                sys.stdout.flush()
-                raise SystemExit(2) from None
-            # Unit 8a: emit the `started` lifecycle event for SwiftUI.
-            try:
-                from screencap.cli import _emit_event
-                _emit_event(
-                    "started",
-                    capture_dir=str(Path(".").resolve()),
-                    claimant=claimant,
-                )
+                _emit_event("lock_contended", owner=exc.owner)
             except Exception:
                 pass
-        except SystemExit:
-            raise
+            raise SystemExit(2) from None
+        # OSError / PermissionError from flock or metadata-write must NOT be
+        # swallowed (todo 014) — running without the mutex risks two concurrent
+        # recorders. Let them propagate to the cli.py exit handler.
+
+        # Unit 8a: emit the `started` lifecycle event for SwiftUI.
+        # capture_dir is the recordings ROOT dir at this point — the per-
+        # recording capture_dir is allocated later in `_on_start_click` and
+        # is not knowable here.
+        try:
+            _emit_event(
+                "started",
+                capture_dir=str(get_recordings_dir()),
+                claimant=claimant,
+            )
         except Exception:
             pass
 
@@ -941,13 +964,19 @@ class SessionController:
         """Build a :class:`PostProcessJob` from a finished worker and queue it."""
         ready_meta = _read_recording_ready(rw.capture_dir)
         disk_full = bool(ready_meta.get("disk_full", False))
+        # Latch the terminated_reason for run()'s exit-code propagation. The
+        # latest finished worker wins — appropriate because the CLI flow ends
+        # one recording per invocation in practice.
+        _term_reason = ready_meta.get("terminated_reason")
+        if isinstance(_term_reason, str) and _term_reason:
+            self._terminated_reason = _term_reason
 
         # Unit 8a: emit recording_finalized as soon as the recording worker's
         # capture has finished writing (`.recording_ready`) — this is what
         # SwiftUI polls on for Recordings list refresh, and it fires well
         # before background post-processing (chunk upload / NLP scrub) returns.
         try:
-            from screencap.cli import _emit_event
+            from screencap._stderr_events import emit_event as _emit_event
             _emit_event(
                 "recording_finalized",
                 name=rw.name,
@@ -1243,3 +1272,15 @@ class SessionController:
                 })
 
         self._do_shutdown()
+
+        # Exit-code contract (todo 002): translate the latched terminated_reason
+        # into the documented SystemExit code so cli.py's exit handler can emit
+        # `stopped` with the matching exit_code and SwiftUI gets the fast-path
+        # disambiguation it expects.
+        _exit_map = {
+            "permission_lost": 3,
+            "disk_full": 4,
+        }
+        _code = _exit_map.get(self._terminated_reason)
+        if _code is not None:
+            raise SystemExit(_code)

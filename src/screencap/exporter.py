@@ -7,8 +7,12 @@ import logging
 import os
 import sys
 from datetime import datetime, timezone
+from typing import TYPE_CHECKING, Callable
 
 from screencap import __version__
+
+if TYPE_CHECKING:  # pragma: no cover
+    from screencap.engine.events import WindowSwitchEvent
 
 logger = logging.getLogger(__name__)
 
@@ -28,12 +32,15 @@ def build_export_metadata(exclude_moves: bool) -> dict:
     }
 
 
+PrivacyFilter = Callable[["WindowSwitchEvent"], "WindowSwitchEvent | None"]
+
+
 def export_recording(
     recording_dir,
     output_path: str | None,
     exclude_moves: bool,
     metadata: dict | None = None,
-    privacy_filter=None,
+    privacy_filter: PrivacyFilter | None = None,
 ) -> int:
     """Export a single recording to JSONL.
 
@@ -88,7 +95,7 @@ def _write_events(
     out_file,
     exclude_moves: bool,
     metadata: dict | None,
-    privacy_filter=None,
+    privacy_filter: PrivacyFilter | None = None,
 ) -> int:
     """Stream events to an open file handle. Returns event count.
 

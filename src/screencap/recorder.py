@@ -654,14 +654,19 @@ def start_recording(
     # at __init__, and workers (start_recording invoked with
     # _skip_pidfile=True) inherit that lock by being children.
     if not _skip_pidfile:
+        from screencap._stderr_events import emit_event as _emit_event, resolve_claimant
         from screencap.pidfile import LockContended, claim_lock
 
-        claimant = "swiftui" if os.environ.get("SCREENCAP_PARENT") == "swiftui" else "cli"
+        claimant = resolve_claimant()
         try:
             claim_lock(capture_dir, claimant=claimant)
         except LockContended as exc:
-            sys.stdout.write(json.dumps({"status": "already_running", "owner": exc.owner}) + "\n")
-            sys.stdout.flush()
+            # Lifecycle events go on stderr (todo 004): stdout is reserved for
+            # human-readable rich output.
+            try:
+                _emit_event("lock_contended", owner=exc.owner)
+            except Exception:
+                pass
             raise SystemExit(2) from None
 
     if capture_dir.exists() and any(capture_dir.iterdir()):
@@ -1233,7 +1238,7 @@ def start_recording(
                                 # Emit the structured stderr event for SwiftUI
                                 # consumption (Unit 8a contract).
                                 try:
-                                    from screencap.cli import _emit_event
+                                    from screencap._stderr_events import emit_event as _emit_event
                                     _emit_event(
                                         "permission_lost",
                                         permission=_missing,
@@ -1654,6 +1659,29 @@ def start_recording(
     # Restore output if we suppressed it
     if not verbose:
         _restore_output()
+
+    # Sidecar metadata for the worker → .recording_ready merge (todo 002, 009).
+    # Writes force_stopped + terminated_reason so SessionController can
+    # propagate the right SystemExit code to the SwiftUI shell.
+    try:
+        _force_stopped = bool(
+            getattr(chunk_processor, "was_force_stopped", False)
+            or _stop_reason in ("force", "child_crash")
+        )
+        _term_reason = None
+        if _stop_reason == "disk_full":
+            _term_reason = "disk_full"
+        elif _stop_reason and _stop_reason.startswith("permission_revoked_"):
+            _term_reason = "permission_lost"
+        elif _stop_reason in ("force", "child_crash"):
+            _term_reason = "force_killed"
+        (capture_dir / ".recording_stop_meta.json").write_text(json.dumps({
+            "force_stopped": _force_stopped,
+            "terminated_reason": _term_reason,
+            "stop_reason_raw": _stop_reason or None,
+        }))
+    except OSError:
+        pass
 
     if _stop_reason == "disk_full":
         raise DiskFullError(

@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import json
+import logging
 import sys
 
 import click
@@ -15,11 +16,23 @@ from rich.table import Table
 from screencap import __version__
 
 console = Console()
+logger = logging.getLogger(__name__)
 
 
 def _stdin_is_tty() -> bool:
     """Check if stdin is a real TTY (not piped or redirected)."""
     return sys.stdin.isatty()
+
+
+def _should_default_to_json() -> bool:
+    """Default value for ``--json`` flags on read-only commands.
+
+    True when stdout is NOT a TTY — i.e., output is being piped to a file
+    or another command. Auto-detection eliminates a footgun where an agent
+    forgets the flag and parses Rich-formatted output (todo 038). Tests can
+    monkey-patch this helper to override the auto-detect.
+    """
+    return not sys.stdout.isatty()
 
 
 _RECORD_EXTRAS_MSG = (
@@ -89,7 +102,8 @@ def _download_nlp_models() -> None:
 #
 # SwiftUI's RecorderController.spawn parses these line-buffered JSON events
 # off the screencap subprocess's stderr to drive UI state transitions. Schema
-# is the cross-language contract — see docs/research/stderr-event-schema.md.
+# is the cross-language contract — see
+# docs/research/2026-04-28-stderr-event-schema.md.
 #
 # Events: started, chunk_finalized, recording_finalized, disk_full,
 #         permission_lost, stopped
@@ -101,24 +115,10 @@ def _download_nlp_models() -> None:
 # ``disk_full`` is emitted from src/screencap/session.py (DiskFullError catch).
 # All other events are emitted from the screencap start command flow below.
 
-_EVENT_SCHEMA_VERSION = 1
-
-
-def _emit_event(event_type: str, **fields) -> None:
-    """Write a single JSON line to stderr describing a recorder lifecycle event.
-
-    Always flushes — SwiftUI's line-buffered reader needs immediate delivery.
-    Failures are swallowed so a broken stderr never breaks the recorder.
-    """
-    import json as _json
-    import time as _time
-
-    payload = {"type": event_type, "ts": _time.time(), **fields}
-    try:
-        sys.stderr.write(_json.dumps(payload) + "\n")
-        sys.stderr.flush()
-    except Exception:
-        pass
+# `_emit_event` lives in the stdlib-only `screencap._stderr_events` module so
+# spawn workers and the recording hot loop can import it without dragging
+# Click + rich Console into the child process.
+from screencap._stderr_events import _EVENT_SCHEMA_VERSION, emit_event as _emit_event  # noqa: E402,F401
 
 
 def _maybe_download_nlp_models() -> None:
@@ -205,7 +205,10 @@ def _maybe_prompt_privacy_setup(*, cloud_intent: bool = False) -> None:
     try:
         _write_privacy_flag(_MATRIX_ACK_KEY, True)
     except Exception:
-        pass
+        # Log at debug — disk full / permission denied here makes the prompt
+        # fire on every subsequent start, so a quiet diagnostic helps debug
+        # "why does the prompt keep appearing" without affecting UX (todo 031).
+        logger.debug("Failed to pre-set matrix ack flag", exc_info=True)
 
 
 def _maybe_prompt_matrix_acknowledgement() -> None:
@@ -249,7 +252,13 @@ def _maybe_prompt_matrix_acknowledgement() -> None:
 
     import os as _os
     env_ack = _os.environ.get("SCREENCAP_MATRIX_ACK", "").lower() == "true"
-    interactive = _sys.stdin.isatty() and not env_ack
+    # Treat any known scripted parent (SwiftUI subprocess spawn) as
+    # auto-acknowledged so a 5-second `select.select` doesn't stall first
+    # start (todo 019). SwiftUI may not have plumbed SCREENCAP_MATRIX_ACK
+    # explicitly yet — SCREENCAP_PARENT=swiftui is sufficient evidence
+    # the prompt would never be displayed to a human anyway.
+    parent_swiftui = _os.environ.get("SCREENCAP_PARENT") == "swiftui"
+    interactive = _sys.stdin.isatty() and not env_ack and not parent_swiftui
 
     if interactive:
         console.print(
@@ -268,7 +277,9 @@ def _maybe_prompt_matrix_acknowledgement() -> None:
     try:
         _write_privacy_flag(_MATRIX_ACK_KEY, True)
     except Exception:
-        pass
+        # Same rationale as the new-user pre-set: log so debugging is possible
+        # without breaking the user's recording (todo 031).
+        logger.debug("Failed to write matrix ack flag", exc_info=True)
 
 
 @cli.command()
@@ -550,11 +561,15 @@ def start(
         "local_only": local_only,
     }
 
-    controller = SessionController(cli_args)
-    # SessionController.__init__ already claimed the lock + emitted `started`
-    # via the path inside session.py — no need to re-emit here.
+    # SessionController(...) is INSIDE the try block so a SystemExit raised
+    # from __init__ (e.g. exit code 2 on lock contention, exit code 3 on
+    # permission_lost) goes through the same `stopped` event emission path.
+    # Without this, exit-2 silently bypassed the terminal event (todo 004).
     exit_code = 0
     try:
+        controller = SessionController(cli_args)
+        # SessionController.__init__ already claimed the lock + emitted `started`
+        # via the path inside session.py — no need to re-emit here.
         controller.run()
     except SystemExit as se:
         exit_code = int(getattr(se, "code", 0) or 0)
@@ -1237,8 +1252,10 @@ def export(name, all_recordings, downloads, output, use_stdout, exclude_moves, p
 
 
 @cli.command()
-@click.option("--json", "as_json", is_flag=True, default=False,
-              help="Emit machine-readable JSON to stdout (no styling, no rich output).")
+@click.option("--json", "as_json", is_flag=True,
+              default=lambda: _should_default_to_json(),
+              help="Emit machine-readable JSON to stdout (no styling, no rich output). "
+                   "Auto-detected when stdout is not a TTY.")
 @click.option("--include-spotlight", is_flag=True, default=False,
               help="Also scan via mdfind (slower, more complete). Default: filesystem-only.")
 def apps(as_json, include_spotlight):
@@ -1337,8 +1354,10 @@ def apps(as_json, include_spotlight):
 
 
 @cli.command()
-@click.option("--json", "as_json", is_flag=True, default=False,
-              help="Emit machine-readable JSON to stdout (no styling, no rich output).")
+@click.option("--json", "as_json", is_flag=True,
+              default=lambda: _should_default_to_json(),
+              help="Emit machine-readable JSON to stdout (no styling, no rich output). "
+                   "Auto-detected when stdout is not a TTY.")
 def status(as_json):
     """Report recording state without IPC.
 
@@ -1348,16 +1367,45 @@ def status(as_json):
     """
     import json as _json
     import time as _time
+    from typing import TypedDict
 
-    from screencap.pidfile import lock_is_active, read_lock_metadata
+    from screencap._stderr_events import _EVENT_SCHEMA_VERSION
+    from screencap.pidfile import LOCK_FILE, lock_is_active, read_lock_metadata
 
-    # 1. Recording state — flock probe is the canonical "is something live"
+    class StatusPayload(TypedDict):
+        """Schema for `screencap status --json` output (todo 036).
+
+        Symmetric: every key is always present so SwiftUI's parser doesn't
+        need conditional unwraps. Unknown values are ``None`` / ``False``.
+        """
+        schema_version: int
+        is_recording: bool
+        started_at: float | None
+        elapsed: float | None
+        capture_dir: str | None
+        claimant: str | None
+        warning: str | None
+        privacy_configured: bool
+        nlp_models_cached: bool
+
+    # Read lock state once — flock probe is the canonical "is something live"
     # answer; the metadata file's content can lag (kernel auto-releases the
     # flock on death but file content stays).
     is_recording = lock_is_active()
-    metadata = read_lock_metadata() if is_recording else None
+    metadata = read_lock_metadata()
 
-    payload: dict = {"is_recording": bool(is_recording)}
+    payload: StatusPayload = {
+        "schema_version": _EVENT_SCHEMA_VERSION,
+        "is_recording": bool(is_recording),
+        "started_at": None,
+        "elapsed": None,
+        "capture_dir": None,
+        "claimant": None,
+        "warning": None,
+        "privacy_configured": False,
+        "nlp_models_cached": False,
+    }
+
     if is_recording and metadata is not None:
         started_at = metadata.get("started_at")
         if isinstance(started_at, (int, float)):
@@ -1367,24 +1415,28 @@ def status(as_json):
             payload["capture_dir"] = metadata["capture_dir"]
         if metadata.get("claimant"):
             payload["claimant"] = metadata["claimant"]
-    elif read_lock_metadata() is not None and not is_recording:
-        # Lock file exists but no holder — surface the stale-file warning so
-        # debugging is easier without breaking the boolean contract.
-        payload["warning"] = "lock_unparseable_or_stale"
+    elif not is_recording and LOCK_FILE.exists():
+        # Lock file exists but flock probe says no holder. Distinguish:
+        #   - file unparseable (corrupt JSON) → metadata is None
+        #   - file present + parseable + no holder → metadata is dict
+        if metadata is None:
+            payload["warning"] = "lock_unparseable"
+        else:
+            payload["warning"] = "lock_stale"
 
-    # 2. Config readiness flags — cheap and useful for first-run UI.
+    # Config readiness flags — cheap and useful for first-run UI.
     try:
         from screencap.config import _load_toml
         privacy_section = (_load_toml().get("privacy") or {})
         payload["privacy_configured"] = bool(privacy_section)
     except Exception:
-        payload["privacy_configured"] = False
+        pass
 
     try:
         from screencap.privacy import are_nlp_models_cached
         payload["nlp_models_cached"] = bool(are_nlp_models_cached())
     except Exception:
-        payload["nlp_models_cached"] = False
+        pass
 
     if as_json:
         sys.stdout.write(_json.dumps(payload) + "\n")
@@ -2432,9 +2484,14 @@ def settings(ctx, set_pair):
 
 
 _PRIVACY_LIST_FIELDS = ("exclude_apps", "allow_apps", "mask_domains", "mask_title_patterns")
-_PRIVACY_SCALAR_FIELDS = ("mode", "setup_skipped", "matrix_acknowledged_v2026_04")
+# `matrix_acknowledged_v2026_04` is NOT exposed here (todo 012) — it's an
+# internal migration flag written by `_maybe_prompt_matrix_acknowledgement`
+# and should not be flippable from a `screencap settings` invocation.
+_PRIVACY_SCALAR_FIELDS = ("mode", "setup_skipped")
 _PRIVACY_MAP_FIELDS = ("app_classes",)
-_PRIVACY_MODE_VALUES = ("public", "shared", "internal")
+# `shared` is reserved for MASK_REGION (not yet implemented); accepting it
+# would write an unenforceable value that crashes the next start (todo 011).
+_PRIVACY_MODE_VALUES = ("public", "internal")
 
 
 def _privacy_list_field_value(value: str) -> str:
@@ -2442,12 +2499,18 @@ def _privacy_list_field_value(value: str) -> str:
     return value.strip()
 
 
-def _matrix_excludes_for_class(ctx_class) -> bool:
-    """Return True if the matrix forces EXCLUDE for this class in every mode.
+def _matrix_blocks_allow_for_class(ctx_class, configured_mode: str) -> "PrivacyAction | None":
+    """Return the matrix action if it blocks ``allow_apps`` at this mode, else None.
 
-    Used to reject ``allow_apps add`` for password-manager bundles that the
-    matrix unconditionally excludes — the user's allow-list cannot bypass the
-    matrix EXCLUDE invariant (per ``policy.py:389+``).
+    Blocks loosening via ``allow_apps`` when the matrix at the user's configured
+    mode produces EXCLUDE / MASK_WINDOW / TEXT_REDACT for this class. Without
+    this guard, ``allow_apps add com.tinyspeck.slackmacgap`` (CHAT, MASK_WINDOW
+    under ``internal``) would silently bypass Unit 7a's strengthening.
+
+    PASSWORD_MANAGER (EXCLUDE in every mode) is always blocked. BANKING
+    (MASK_WINDOW under ``internal``) is also blocked. BROWSER_UNVERIFIED
+    (ALLOW under ``internal``) is *not* blocked — users can still allow
+    a browser explicitly.
     """
     from screencap.privacy.policy import (
         PrivacyAction,
@@ -2455,17 +2518,26 @@ def _matrix_excludes_for_class(ctx_class) -> bool:
         get_matrix_action,
     )
 
-    return all(
-        get_matrix_action(ctx_class, m) == PrivacyAction.EXCLUDE
-        for m in PrivacyMode
+    blocking = (
+        PrivacyAction.EXCLUDE,
+        PrivacyAction.MASK_WINDOW,
+        PrivacyAction.TEXT_REDACT,
     )
+    try:
+        mode = PrivacyMode(configured_mode)
+    except ValueError:
+        mode = PrivacyMode.INTERNAL
+    action = get_matrix_action(ctx_class, mode)
+    return action if action in blocking else None
 
 
 @settings.command("privacy")
 @click.argument("field")
 @click.argument("op", type=click.Choice(["add", "remove", "set"]))
 @click.argument("value")
-def settings_privacy(field, op, value):
+@click.option("--json", "as_json", is_flag=True, default=False,
+              help="Emit machine-readable JSON to stdout instead of prose to stderr.")
+def settings_privacy(field, op, value, as_json):
     """Mutate a [privacy] field in config.toml (Unit 4b).
 
     \b
@@ -2481,10 +2553,26 @@ def settings_privacy(field, op, value):
     Validation: rejects writes that would bypass a matrix EXCLUDE (e.g.,
     adding a password-manager bundle ID to allow_apps).
     """
+    import json as _json
+
     import tomlkit
 
     from screencap.config import _CONFIG_PATH, invalidate_config_cache
     from screencap.setup_wizard import _load_config_toml, _save_config_atomic
+
+    # Diagnostics / status messages go on stderr so stdout stays clean for
+    # any future structured output (todo 006, todo 016).
+    err_console = Console(stderr=True)
+
+    def _result(ok: bool, *, exit_code: int = 0, **payload_fields):
+        """Emit the result and exit. Prose to stderr; JSON to stdout when --json."""
+        if as_json:
+            payload = {"ok": ok, **payload_fields}
+            click.echo(_json.dumps(payload))
+        # Prose was already printed via err_console at the call site (or the
+        # success block at the end); nothing to do here for prose mode.
+        if exit_code:
+            raise SystemExit(exit_code)
 
     field = field.strip()
     is_list = field in _PRIVACY_LIST_FIELDS
@@ -2493,16 +2581,16 @@ def settings_privacy(field, op, value):
 
     if not (is_list or is_scalar or is_map):
         all_fields = sorted(_PRIVACY_LIST_FIELDS + _PRIVACY_SCALAR_FIELDS + _PRIVACY_MAP_FIELDS)
-        console.print(f"[red]Error:[/red] Unknown privacy field: {field}")
-        console.print(f"[dim]Available: {', '.join(all_fields)}[/dim]")
-        raise SystemExit(1)
+        err_console.print(f"[red]Error:[/red] Unknown privacy field: {field}")
+        err_console.print(f"[dim]Available: {', '.join(all_fields)}[/dim]")
+        _result(False, exit_code=1, error=f"unknown_field:{field}")
 
     if is_list and op == "set":
-        console.print(f"[red]Error:[/red] {field} is a list — use add/remove, not set.")
-        raise SystemExit(1)
+        err_console.print(f"[red]Error:[/red] {field} is a list — use add/remove, not set.")
+        _result(False, exit_code=1, error=f"list_field_set_op:{field}")
     if is_scalar and op != "set":
-        console.print(f"[red]Error:[/red] {field} is a scalar — use set, not {op}.")
-        raise SystemExit(1)
+        err_console.print(f"[red]Error:[/red] {field} is a scalar — use set, not {op}.")
+        _result(False, exit_code=1, error=f"scalar_field_bad_op:{field}={op}")
 
     value = _privacy_list_field_value(value)
 
@@ -2511,76 +2599,109 @@ def settings_privacy(field, op, value):
     if is_scalar:
         if field == "mode":
             if value.lower() not in _PRIVACY_MODE_VALUES:
-                console.print(
+                err_console.print(
                     f"[red]Error:[/red] mode must be one of "
                     f"{_PRIVACY_MODE_VALUES}, got: {value}"
                 )
-                raise SystemExit(1)
+                _result(False, exit_code=1, error=f"invalid_mode:{value}")
             parsed_value = value.lower()
-        elif field in ("setup_skipped", "matrix_acknowledged_v2026_04"):
+        elif field == "setup_skipped":
             if value.lower() in ("true", "1", "yes"):
                 parsed_value = True
             elif value.lower() in ("false", "0", "no"):
                 parsed_value = False
             else:
-                console.print(
+                err_console.print(
                     f"[red]Error:[/red] {field} must be true/false, got: {value}"
                 )
-                raise SystemExit(1)
-
-    # Matrix-invariant guard: reject loosening EXCLUDE-class apps via allow_apps
-    if is_list and field == "allow_apps" and op == "add":
-        from screencap.privacy.context import BUNDLE_ID_MAP
-        ctx_class = BUNDLE_ID_MAP.get(value)
-        if ctx_class is not None and _matrix_excludes_for_class(ctx_class):
-            console.print(
-                f"[red]Error:[/red] '{value}' is in {ctx_class.value} which the privacy "
-                "matrix unconditionally excludes — allow_apps cannot loosen this."
-            )
-            raise SystemExit(1)
+                _result(False, exit_code=1, error=f"invalid_bool:{field}={value}")
 
     doc = _load_config_toml(_CONFIG_PATH)
     if "privacy" not in doc:
         doc.add("privacy", tomlkit.table())
     privacy_tbl = doc["privacy"]
 
+    # Matrix-invariant guard: reject loosening any matrix-blocked class via
+    # allow_apps (todo 005). Evaluated at the *configured mode* — under
+    # `internal` this catches CHAT/EMAIL/CALENDAR/VIDEO_CALL (MASK_WINDOW)
+    # in addition to PASSWORD_MANAGER (EXCLUDE). Defaults to "internal" when
+    # mode is unset.
+    if is_list and field == "allow_apps" and op == "add":
+        from screencap.privacy.context import BUNDLE_ID_MAP
+        ctx_class = BUNDLE_ID_MAP.get(value)
+        configured_mode = str(privacy_tbl.get("mode") or "internal")
+        if ctx_class is not None:
+            blocking_action = _matrix_blocks_allow_for_class(ctx_class, configured_mode)
+            if blocking_action is not None:
+                err_console.print(
+                    f"[red]Error:[/red] '{value}' is in {ctx_class.value} which the "
+                    f"privacy matrix at mode={configured_mode!r} produces "
+                    f"{blocking_action.value} — allow_apps cannot loosen this. "
+                    f"Set mode=public to capture broadly, or override at the "
+                    f"per-app level via app_classes."
+                )
+                _result(
+                    False,
+                    exit_code=1,
+                    error=f"matrix_blocks_allow:{ctx_class.value}@{configured_mode}",
+                )
+
     if is_list:
         existing = list(privacy_tbl.get(field, []))
         if op == "add":
             if value in existing:
                 # Idempotent no-op
-                console.print(f"[dim]{field} already contains {value} — no change.[/dim]")
+                err_console.print(f"[dim]{field} already contains {value} — no change.[/dim]")
+                _result(True, changed=False, field=field, op=op, value=value)
                 return
             existing.append(value)
         else:  # remove
             if value not in existing:
-                console.print(f"[dim]{field} does not contain {value} — no change.[/dim]")
+                err_console.print(f"[dim]{field} does not contain {value} — no change.[/dim]")
+                _result(True, changed=False, field=field, op=op, value=value)
                 return
             existing.remove(value)
         privacy_tbl[field] = existing
     elif is_scalar:
         privacy_tbl[field] = parsed_value
     else:
-        # Map field (app_classes) — accept BUNDLE=CLASS syntax in `value`.
-        if "=" not in value:
-            console.print(
-                f"[red]Error:[/red] map field {field} requires BUNDLE_ID=CLASS, got: {value}"
-            )
-            raise SystemExit(1)
-        bundle, ctx_str = value.split("=", 1)
-        bundle, ctx_str = bundle.strip(), ctx_str.strip()
+        # Map field (app_classes) — `add`/`set` use BUNDLE=CLASS syntax;
+        # `remove` accepts just the bundle ID (no class required for removal).
         if op == "remove":
+            bundle = value.split("=", 1)[0].strip()
             cur = dict(privacy_tbl.get(field, {}))
             cur.pop(bundle, None)
             privacy_tbl[field] = cur
         else:  # add or set
+            if "=" not in value:
+                err_console.print(
+                    f"[red]Error:[/red] map field {field} requires BUNDLE_ID=CLASS for {op}, got: {value}"
+                )
+                _result(False, exit_code=1, error=f"map_value_missing_eq:{field}={value}")
+            bundle, ctx_str = value.split("=", 1)
+            bundle, ctx_str = bundle.strip(), ctx_str.strip()
+            # Validate CLASS against ContextClass enum so we don't silently
+            # corrupt config with a typo that crashes the next start
+            # (todo 010). Accept upper/lower case input; normalize to value.
+            from screencap.privacy.policy import ContextClass
+            valid_classes = {c.value for c in ContextClass}
+            normalized = ctx_str.lower()
+            if normalized not in valid_classes:
+                err_console.print(
+                    f"[red]Error:[/red] Unknown context class: {ctx_str}"
+                )
+                err_console.print(
+                    f"[dim]Available: {', '.join(sorted(valid_classes))}[/dim]"
+                )
+                _result(False, exit_code=1, error=f"unknown_context_class:{ctx_str}")
             cur = dict(privacy_tbl.get(field, {}))
-            cur[bundle] = ctx_str
+            cur[bundle] = normalized
             privacy_tbl[field] = cur
 
     _save_config_atomic(_CONFIG_PATH, doc)
     invalidate_config_cache()
-    console.print(f"  [bold]privacy.{field}[/bold] {op} {value}")
+    err_console.print(f"  [bold]privacy.{field}[/bold] {op} {value}")
+    _result(True, changed=True, field=field, op=op, value=value)
 
 
 # ---------------------------------------------------------------------------
