@@ -146,7 +146,7 @@ def _migrate_schema(db_path: str) -> None:
     """
     import sqlite3
 
-    from screencap.engine.db import models  # noqa: F401 — registers models
+    from screencap.engine.db import models  # noqa: F401 - registers models
 
     conn = sqlite3.connect(db_path)
     cur = conn.cursor()
@@ -171,6 +171,37 @@ def _migrate_schema(db_path: str) -> None:
 
     conn.commit()
     conn.close()
+
+
+def _ensure_network_tables(engine) -> bool:
+    """Idempotently create the network_event table if missing.
+
+    `Table.create(engine, checkfirst=True)` is a no-op when the table
+    already exists, so this is safe to invoke unconditionally on every
+    `Capture.load()`. The wider `_migrate_schema()` only ALTER-adds
+    columns to existing tables - it does NOT create missing tables -
+    so old recording.db files that pre-date the network feature would
+    otherwise crash on first network query.
+
+    Readonly DBs (e.g. `chmod 444`) raise `sqlalchemy.exc.OperationalError`
+    matching "readonly database" or "attempt to write a readonly database".
+    On readonly: skip migration, return False so the caller can mark the
+    capture as network-unavailable. Other exceptions propagate.
+
+    Returns:
+        True if the table is present (created or already existed),
+        False if the DB is readonly (creation skipped).
+    """
+    from screencap.engine.db import models  # noqa: F401 - registers models
+
+    try:
+        models.NetworkEvent.__table__.create(engine, checkfirst=True)
+        return True
+    except sa.exc.OperationalError as e:
+        msg = str(e).lower()
+        if "readonly database" in msg or "attempt to write a readonly database" in msg:
+            return False
+        raise
 
 
 def get_session_for_path(db_path: str, echo: bool = False):
