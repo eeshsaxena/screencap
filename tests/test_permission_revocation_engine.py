@@ -44,61 +44,34 @@ class TestCheckPermissionsNow:
         assert missing is None
 
     def test_all_granted_returns_ok(self, monkeypatch):
+        """Post-todo-002: watcher uses _check_permission_fresh (subprocess);
+        mock that helper directly instead of the in-process DarwinPlatform."""
         from screencap import recorder
 
         monkeypatch.setattr(sys, "platform", "darwin")
+        monkeypatch.setattr(recorder, "_check_permission_fresh", lambda name: True)
 
-        # Stub DarwinPlatform so all checks return True
-        class _StubDarwin:
-            @staticmethod
-            def is_screen_recording_enabled():
-                return True
-
-            @staticmethod
-            def is_accessibility_enabled():
-                return True
-
-            @staticmethod
-            def is_input_monitoring_enabled():
-                return True
-
-        monkeypatch.setitem(
-            sys.modules,
-            "screencap.engine.platform.darwin",
-            mock.MagicMock(DarwinPlatform=_StubDarwin),
-        )
         ok, missing = recorder._check_permissions_now()
         assert ok is True
         assert missing is None
 
     @pytest.mark.parametrize("revoked,expected_name", [
-        ("screen_recording", "screen_recording"),
-        ("accessibility", "accessibility"),
-        ("input_monitoring", "input_monitoring"),
+        ("Screen Recording", "screen_recording"),
+        ("Accessibility", "accessibility"),
+        ("Input Monitoring", "input_monitoring"),
     ])
     def test_revoked_permission_reported(self, monkeypatch, revoked, expected_name):
+        """Post-todo-002: revoke a single TCC permission via the fresh-subprocess
+        helper and assert the watcher reports it."""
         from screencap import recorder
 
         monkeypatch.setattr(sys, "platform", "darwin")
 
-        class _StubDarwin:
-            @staticmethod
-            def is_screen_recording_enabled():
-                return revoked != "screen_recording"
+        def _fresh(name: str) -> bool:
+            return name != revoked
 
-            @staticmethod
-            def is_accessibility_enabled():
-                return revoked != "accessibility"
+        monkeypatch.setattr(recorder, "_check_permission_fresh", _fresh)
 
-            @staticmethod
-            def is_input_monitoring_enabled():
-                return revoked != "input_monitoring"
-
-        monkeypatch.setitem(
-            sys.modules,
-            "screencap.engine.platform.darwin",
-            mock.MagicMock(DarwinPlatform=_StubDarwin),
-        )
         ok, missing = recorder._check_permissions_now()
         assert ok is False
         assert missing == expected_name
@@ -109,28 +82,33 @@ class TestCheckPermissionsNow:
         from screencap import recorder
 
         monkeypatch.setattr(sys, "platform", "darwin")
+        monkeypatch.setattr(recorder, "_check_permission_fresh", lambda name: False)
 
-        class _StubDarwin:
-            @staticmethod
-            def is_screen_recording_enabled():
-                return False
-
-            @staticmethod
-            def is_accessibility_enabled():
-                return False
-
-            @staticmethod
-            def is_input_monitoring_enabled():
-                return False
-
-        monkeypatch.setitem(
-            sys.modules,
-            "screencap.engine.platform.darwin",
-            mock.MagicMock(DarwinPlatform=_StubDarwin),
-        )
         ok, missing = recorder._check_permissions_now()
         assert ok is False
         assert missing == "screen_recording"
+
+    def test_pyobjc_bridge_error_does_not_crash_recorder(self, monkeypatch):
+        """Todo 013: PyObjC bridge errors (objc.error, runtime errors during
+        Sequoia overlays / system update prompts) propagated uncaught into
+        the recording hot loop. Now wrapped in try/except — broker errors
+        are treated as 'permission still valid for this tick' so the watcher
+        retries on the next interval instead of killing the recorder."""
+        from screencap import recorder
+
+        monkeypatch.setattr(sys, "platform", "darwin")
+
+        def _broken(name):
+            raise RuntimeError("simulated PyObjC bridge failure")
+
+        monkeypatch.setattr(recorder, "_check_permission_fresh", _broken)
+
+        # Must not raise — and must report "all ok" because the bridge
+        # failure can't be distinguished from a real revocation, so we
+        # fail open for this tick.
+        ok, missing = recorder._check_permissions_now()
+        assert ok is True
+        assert missing is None
 
     def test_missing_darwin_module_returns_ok(self, monkeypatch):
         """If the darwin module isn't importable, fail-open (don't kill the

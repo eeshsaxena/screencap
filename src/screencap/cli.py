@@ -273,8 +273,24 @@ def _maybe_prompt_matrix_acknowledgement() -> None:
         console.print(
             "[yellow]Privacy default changed:[/yellow] chat / email / calendar / "
             "video-call apps under [bold]mode = internal[/bold] now mask the window "
-            "instead of text-redacting it. Press [bold]Y[/bold] within 5s to "
-            "acknowledge. Recording continues either way."
+            "instead of text-redacting it."
+        )
+        # Disclosure for the AI-assistant reclassification (todo 031). The
+        # plan deliberately keeps these as BROWSER_UNVERIFIED → ALLOW so a
+        # friend recording \"let me show you my AI tool\" stays useful, but
+        # an upgrading user deserves to know their conversation contents
+        # will be captured raw before the flag flips silently.
+        console.print(
+            "[yellow]Also new:[/yellow] ChatGPT, Claude, and Perplexity desktop "
+            "apps now classify as [bold]browser_unverified[/bold] — under "
+            "[bold]mode = internal[/bold] their conversation contents are "
+            "[bold]captured unredacted[/bold]. Opt out per-app with: "
+            "[dim]screencap settings privacy exclude_apps add com.openai.chat[/dim] "
+            "(or com.anthropic.claudefordesktop, ai.perplexity.mac)."
+        )
+        console.print(
+            "Press [bold]Y[/bold] within 5s to acknowledge. Recording "
+            "continues either way."
         )
         try:
             import select
@@ -1115,19 +1131,52 @@ def _export_one(recording_dir, output_path, exclude_moves, err_console, privacy_
 def _build_export_privacy_filter(recording_dir):
     """Build a privacy filter for ``--privacy-filter`` exports.
 
-    Resolves the configured ``[privacy].mode`` from config.toml, defaulting
-    to ``internal`` if not set. ``cloud_intent=False`` because CLI exports
-    are local-only by default; cloud-bound paths use the dedicated
-    ``build_cloud_window_filter`` constructor.
+    Resolves the recording's privacy mode from ``<recording_dir>/.recording_intent``
+    first (todo 001) — that's the mode the user was recording under at capture
+    time and the only mode whose semantics correctly describe what's safe to
+    export. Falls back to the current ``[privacy].mode`` from ``config.toml``
+    only when the intent file is absent (legacy recordings predating the
+    intent file); a stderr warning surfaces the fallback.
+
+    ``cloud_intent=False`` because CLI exports are local-only by default;
+    cloud-bound paths use the dedicated ``build_cloud_window_filter``
+    constructor.
     """
+    from pathlib import Path as _Path
+
     from screencap.exporter import build_privacy_filter
 
-    try:
-        from screencap.config import _load_toml
-        privacy_section = (_load_toml().get("privacy") or {})
-        mode = privacy_section.get("mode") or "internal"
-    except Exception:
-        mode = "internal"
+    err_console = Console(stderr=True)
+    mode = None
+
+    # Recording-time mode from .recording_intent (canonical source).
+    intent_path = _Path(recording_dir) / ".recording_intent"
+    if intent_path.exists():
+        try:
+            import json as _json
+            intent_data = _json.loads(intent_path.read_text())
+            recording_mode = intent_data.get("privacy_mode")
+            if recording_mode:
+                mode = str(recording_mode)
+        except (OSError, ValueError):
+            pass
+
+    if mode is None:
+        # Fallback for recordings without .recording_intent — surface to the
+        # user that we're using current config, which may be stricter or
+        # looser than the recording-time posture.
+        try:
+            from screencap.config import _load_toml
+            privacy_section = (_load_toml().get("privacy") or {})
+            mode = privacy_section.get("mode") or "internal"
+        except Exception:
+            mode = "internal"
+        err_console.print(
+            f"[yellow]Warning:[/yellow] No .recording_intent in "
+            f"{recording_dir.name if hasattr(recording_dir, 'name') else recording_dir} — "
+            f"applying current config mode={mode!r}. Re-record under the desired "
+            f"mode for accurate filtering."
+        )
 
     return build_privacy_filter(
         privacy_mode=mode,
@@ -2672,24 +2721,44 @@ def settings_privacy(field, op, value, as_json):
     # `internal` this catches CHAT/EMAIL/CALENDAR/VIDEO_CALL (MASK_WINDOW)
     # in addition to PASSWORD_MANAGER (EXCLUDE). Defaults to "internal" when
     # mode is unset.
+    #
+    # Also consults the on-disk app_classes overrides (todo 030) so that a
+    # bundle absent from BUNDLE_ID_MAP but reclassified by the user as a
+    # sensitive class (e.g., `app_classes set com.example.foo=password_manager`)
+    # cannot be allow-listed in a follow-up call.
     if is_list and field == "allow_apps" and op == "add":
         from screencap.privacy.context import BUNDLE_ID_MAP
-        ctx_class = BUNDLE_ID_MAP.get(value)
+        from screencap.privacy.policy import ContextClass
         configured_mode = str(privacy_tbl.get("mode") or "internal")
-        if ctx_class is not None:
-            blocking_action = _matrix_blocks_allow_for_class(ctx_class, configured_mode)
+
+        # Effective class: app_classes override > BUNDLE_ID_MAP > None.
+        effective_class = None
+        app_classes_overrides = dict(privacy_tbl.get("app_classes", {}))
+        override_str = app_classes_overrides.get(value)
+        if override_str:
+            try:
+                effective_class = ContextClass(str(override_str).lower())
+            except ValueError:
+                effective_class = None
+        if effective_class is None:
+            effective_class = BUNDLE_ID_MAP.get(value)
+
+        if effective_class is not None:
+            blocking_action = _matrix_blocks_allow_for_class(
+                effective_class, configured_mode,
+            )
             if blocking_action is not None:
                 err_console.print(
-                    f"[red]Error:[/red] '{value}' is in {ctx_class.value} which the "
+                    f"[red]Error:[/red] '{value}' is in {effective_class.value} which the "
                     f"privacy matrix at mode={configured_mode!r} produces "
                     f"{blocking_action.value} — allow_apps cannot loosen this. "
                     f"Set mode=public to capture broadly, or override at the "
-                    f"per-app level via app_classes."
+                    f"per-app level via app_classes (subject to the same guard)."
                 )
                 _result(
                     False,
                     exit_code=1,
-                    error=f"matrix_blocks_allow:{ctx_class.value}@{configured_mode}",
+                    error=f"matrix_blocks_allow:{effective_class.value}@{configured_mode}",
                 )
 
     if is_list:
@@ -2729,6 +2798,7 @@ def settings_privacy(field, op, value, as_json):
             # Validate CLASS against ContextClass enum so we don't silently
             # corrupt config with a typo that crashes the next start
             # (todo 010). Accept upper/lower case input; normalize to value.
+            from screencap.privacy.context import BUNDLE_ID_MAP
             from screencap.privacy.policy import ContextClass
             valid_classes = {c.value for c in ContextClass}
             normalized = ctx_str.lower()
@@ -2740,7 +2810,54 @@ def settings_privacy(field, op, value, as_json):
                     f"[dim]Available: {', '.join(sorted(valid_classes))}[/dim]"
                 )
                 _result(False, exit_code=1, error=f"unknown_context_class:{ctx_str}")
-            cur = dict(privacy_tbl.get(field, {}))
+
+            # Matrix-EXCLUDE invariant for app_classes (todo 006). Without
+            # this guard, a user could `app_classes set com.1password.1password=unknown`
+            # to reclassify the bundle out of PASSWORD_MANAGER, then
+            # `allow_apps add com.1password.1password` (matrix now ALLOW).
+            # Reject any reclassification that would loosen a currently-
+            # blocked class. The check evaluates the OLD class (from
+            # BUNDLE_ID_MAP or a prior app_classes override) against the
+            # matrix at the configured mode — if it's a blocked class, the
+            # new class must not be more permissive at that mode.
+            old_class = None
+            existing_overrides = dict(privacy_tbl.get(field, {}))
+            existing_override = existing_overrides.get(bundle)
+            if existing_override:
+                try:
+                    old_class = ContextClass(str(existing_override).lower())
+                except ValueError:
+                    old_class = None
+            if old_class is None:
+                old_class = BUNDLE_ID_MAP.get(bundle)
+
+            if old_class is not None:
+                configured_mode = str(privacy_tbl.get("mode") or "internal")
+                old_blocking = _matrix_blocks_allow_for_class(old_class, configured_mode)
+                new_class = ContextClass(normalized)
+                new_blocking = _matrix_blocks_allow_for_class(new_class, configured_mode)
+                # Loosening: old class WAS blocked; new class is NOT blocked
+                # (or is blocked with a less-strict action — but the matrix
+                # function returns None for ALLOW, so any None means looser).
+                if old_blocking is not None and new_blocking is None:
+                    err_console.print(
+                        f"[red]Error:[/red] reclassifying '{bundle}' from "
+                        f"{old_class.value} to {new_class.value} would loosen "
+                        f"the matrix at mode={configured_mode!r} from "
+                        f"{old_blocking.value} to allow — rejected. "
+                        f"Set mode=public if you want broader capture, or "
+                        f"keep the existing classification."
+                    )
+                    _result(
+                        False,
+                        exit_code=1,
+                        error=(
+                            f"matrix_invariant_blocks_reclassify:"
+                            f"{old_class.value}→{new_class.value}@{configured_mode}"
+                        ),
+                    )
+
+            cur = existing_overrides
             cur[bundle] = normalized
             privacy_tbl[field] = cur
 

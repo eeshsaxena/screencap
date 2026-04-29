@@ -179,6 +179,47 @@ class TestMatrixExcludeGuard:
         result = _invoke("exclude_apps", "add", "com.1password.1password")
         assert result.exit_code == 0
 
+    def test_app_classes_cannot_loosen_password_manager(self):
+        """Todo 006 invariant: reclassifying 1Password from PASSWORD_MANAGER
+        to UNKNOWN would change matrix evaluation from EXCLUDE → ALLOW under
+        internal mode, defeating the password-manager guard. Must be rejected
+        before persisting."""
+        result = _invoke("app_classes", "set", "com.1password.1password=unknown")
+        assert result.exit_code != 0
+        out = result.output.lower()
+        assert "matrix_invariant" in out or "loosen" in out or "rejected" in out
+        # Config must NOT have been mutated.
+        cfg = _read_cfg()
+        assert "com.1password.1password" not in cfg.get("privacy", {}).get("app_classes", {})
+
+    def test_app_classes_can_set_chat_to_chat(self):
+        """Same-class write is a no-op-shaped accept (no loosening)."""
+        # Slack is already CHAT in BUNDLE_ID_MAP; setting to CHAT again is fine.
+        result = _invoke("app_classes", "set", "com.tinyspeck.slackmacgap=chat")
+        assert result.exit_code == 0
+
+    def test_app_classes_can_set_unknown_to_chat(self):
+        """Strictening direction: UNKNOWN bundle reclassified to CHAT (which
+        has matrix=MASK_WINDOW under internal). Strictening is always allowed."""
+        result = _invoke("app_classes", "set", "com.example.fictional=chat")
+        assert result.exit_code == 0
+        cfg = _read_cfg()
+        assert cfg["privacy"]["app_classes"]["com.example.fictional"] == "chat"
+
+    def test_allow_apps_blocked_via_app_classes_override(self):
+        """Todo 030: a bundle absent from BUNDLE_ID_MAP but reclassified by
+        the user as a sensitive class via app_classes cannot be allow-listed.
+        The two-step bypass (set + add) must fail at the second step."""
+        # Step 1: classify a fictional bundle as banking (strictening — allowed).
+        ok1 = _invoke("app_classes", "set", "com.example.fakebank=banking")
+        assert ok1.exit_code == 0
+        # Step 2: try to allow-list it. Should reject because banking@internal
+        # produces MASK_WINDOW.
+        result = _invoke("allow_apps", "add", "com.example.fakebank")
+        assert result.exit_code != 0
+        out = result.output.lower()
+        assert "banking" in out or "mask_window" in out
+
 
 # ---------------------------------------------------------------------------
 # R16 round-trip: mode preservation across mutations

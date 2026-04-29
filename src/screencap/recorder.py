@@ -381,6 +381,14 @@ _PERMISSION_CHECK_CODE: dict[str, str] = {
     "Input Monitoring": (
         "import Quartz; print(bool(Quartz.CGPreflightListenEventAccess()))"
     ),
+    # Screen Recording entry added (todo 002) so the mid-recording watcher
+    # can use the fresh-subprocess path. macOS caches TCC state per-process,
+    # so an in-process CGPreflightScreenCaptureAccess() call inside the
+    # recorder's main loop returns the cached value at recorder start —
+    # never the live state — defeating the whole point of the watcher.
+    "Screen Recording": (
+        "import Quartz; print(bool(Quartz.CGPreflightScreenCaptureAccess()))"
+    ),
 }
 
 
@@ -475,24 +483,40 @@ def _check_macos_permissions() -> None:
 def _check_permissions_now() -> tuple[bool, str | None]:
     """Probe the three TCC permissions; return (all_ok, missing_name).
 
-    Designed to run on the recorder's main loop every ~3-5s. Returns
+    Designed to run on the recorder's main loop every ~5s. Returns
     (False, "screen_recording" | "accessibility" | "input_monitoring") on
     the first detected revocation. Microphone is intentionally NOT polled
     here — audio loss should not abort a video-only capture.
+
+    Uses fresh subprocesses (todo 002) instead of in-process PyObjC calls
+    because macOS caches TCC state per-process — an in-process call from
+    the recorder's main loop returns the cached value at recorder startup,
+    not the live state. The 50-100ms-per-call subprocess cost happens once
+    every 5s and is bounded against recording's existing CPU footprint.
+
+    PyObjC bridge errors are swallowed (todo 013) — a transient Quartz
+    failure (Sequoia overlays, system update prompts) must NOT crash the
+    recorder mid-recording. The watcher treats any subprocess error as
+    "permission still valid" for that tick; a real revocation surfaces on
+    the next tick once the bridge recovers.
     """
     if sys.platform != "darwin":
         return True, None
-    try:
-        from screencap.engine.platform.darwin import DarwinPlatform
-    except ImportError:
-        return True, None
 
-    if not DarwinPlatform.is_screen_recording_enabled():
-        return False, "screen_recording"
-    if not DarwinPlatform.is_accessibility_enabled():
-        return False, "accessibility"
-    if not DarwinPlatform.is_input_monitoring_enabled():
-        return False, "input_monitoring"
+    # Order matters — Screen Recording is the most user-impactful loss
+    # (capture goes black), so report it first when multiple are revoked.
+    for tcc_name, missing_label in (
+        ("Screen Recording", "screen_recording"),
+        ("Accessibility", "accessibility"),
+        ("Input Monitoring", "input_monitoring"),
+    ):
+        try:
+            granted = _check_permission_fresh(tcc_name)
+        except Exception:
+            # Bridge failure — assume granted for this tick; next tick retries.
+            continue
+        if not granted:
+            return False, missing_label
     return True, None
 
 
@@ -1219,7 +1243,10 @@ def start_recording(
                 refresh_per_second=2,
             ) as live:
                 _last_perm_check = 0.0
-                _PERM_CHECK_INTERVAL = 3.0  # seconds — Unit 8 detection SLA: <10s
+                # 5s interval (todo 002) bounds the subprocess cost from the
+                # fresh-TCC-check path. Combined with SwiftUI's own 5s poll,
+                # detection SLA stays well under 10s.
+                _PERM_CHECK_INTERVAL = 5.0
                 try:
                     while recorder.is_recording and not _stop_event.is_set():
                         elapsed = time.time() - t0

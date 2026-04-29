@@ -141,6 +141,77 @@ class TestExportPrivacyFilterFlag:
                     f"EXCLUDE-class window.switch leaked: {evt}"
                 )
 
+    def test_filter_uses_recording_time_mode_from_intent_file(self, tmp_path):
+        """Todo 001: `--privacy-filter` resolves the privacy mode from
+        `<recording_dir>/.recording_intent` (recording-time posture), not
+        from the current config.toml. Without this fix, a user who recorded
+        under `mode=public` (BROWSER_UNVERIFIED → MASK_WINDOW) and later
+        switched to `mode=internal` (BROWSER_UNVERIFIED → ALLOW) would get
+        their browser-window events leaked at export time.
+
+        Setup: write `.recording_intent` saying the recording was made under
+        `public` mode, then put `internal` in the config. Confirm that
+        Slack (CHAT) under public stays MASK_WINDOW (would also be
+        MASK_WINDOW under internal post-Unit-7a, but this asserts the
+        intent file IS being consulted via the diagnostic stderr surface).
+        """
+        rec_dir = _make_recording_with_slack(tmp_path)
+
+        # Write the recording-time intent: public mode at capture time.
+        import json as _json
+        (rec_dir / ".recording_intent").write_text(_json.dumps({
+            "version": 1,
+            "destination": "local",
+            "privacy_mode": "public",
+            "created_at": "2026-04-28T12:00:00Z",
+            "source": "flag",
+        }))
+
+        # Set the current config to a different mode (would silently flip
+        # behavior for any consumer that read config.toml instead of
+        # .recording_intent).
+        cfg_path = tmp_path / "config.toml"
+        cfg_path.write_text('[privacy]\nmode = "internal"\n')
+        import screencap.config
+        original_path = screencap.config._CONFIG_PATH
+        try:
+            screencap.config._CONFIG_PATH = cfg_path
+            screencap.config._config_cache = None
+
+            runner = CliRunner()
+            result = runner.invoke(
+                cli,
+                ["export", "test-rec", "--stdout", "--privacy-filter"],
+                catch_exceptions=False,
+            )
+        finally:
+            screencap.config._CONFIG_PATH = original_path
+            screencap.config._config_cache = None
+
+        assert result.exit_code == 0
+        # Slack masked at recording-time mode (public → CHAT → MASK_WINDOW).
+        # The fallback warning about "no .recording_intent" must NOT appear.
+        assert "No .recording_intent" not in result.stderr
+        titles = _slack_window_titles(result.stdout)
+        assert titles == ["Slackmacgap"]
+
+    def test_filter_falls_back_to_config_with_warning_on_legacy_recording(self, tmp_path):
+        """Legacy recording without `.recording_intent` → fall through to
+        current config.toml mode and surface a stderr warning so the user
+        knows the export is using current config, not recording-time
+        posture."""
+        rec_dir = _make_recording_with_slack(tmp_path)
+        # No .recording_intent file written.
+
+        runner = CliRunner()
+        result = runner.invoke(
+            cli,
+            ["export", "test-rec", "--stdout", "--privacy-filter"],
+            catch_exceptions=False,
+        )
+        assert result.exit_code == 0
+        assert "No .recording_intent" in result.stderr or "applying current config" in result.stderr
+
     def test_filter_with_public_mode(self, tmp_path):
         """Mode = public (set in config) → still masks CHAT (matrix says
         MASK_WINDOW under public too)."""
