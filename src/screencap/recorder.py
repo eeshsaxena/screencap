@@ -690,7 +690,12 @@ def start_recording(
     status.start()
 
     # Heavy import — deferred here to keep `screencap --help` fast.
-    from screencap.engine import Recorder
+    # Function-local try/except preserves the headless-friendly fallback
+    # after the engine package's eager `Recorder` re-export was removed.
+    try:
+        from screencap.engine.recorder import Recorder
+    except ImportError:
+        Recorder = None
 
     if Recorder is None:
         status.stop()
