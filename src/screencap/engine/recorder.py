@@ -915,6 +915,135 @@ def write_events(
     logger.info(f"{event_type=} done")
 
 
+def _network_event_to_db_dict(event: Any, kind: str) -> dict[str, Any]:
+    """Convert a Pydantic network event to the dict shape ``crud.insert_network_event`` expects.
+
+    Pydantic events carry ``body_sha256_hex: str | None``; the DB column is
+    raw 32 bytes. Pydantic ``headers: list[tuple[str, str]]`` is JSON-encoded
+    into ``headers_json``. Per-kind fields (status / method / direction /
+    frame_type) are looked up only if present.
+
+    For ``ws_upgrade``: response headers go to ``headers_json``, request
+    headers (if present in ``details_json``) stay in ``details_json``.
+    For ``drop_burst``: ``flow_id`` is None (no associated flow).
+    """
+    from screencap.engine.convert import hex_to_bytes
+
+    headers_pairs = list(getattr(event, "headers", []) or [])
+    sha_hex = getattr(event, "body_sha256_hex", None)
+    sha_bytes = hex_to_bytes(sha_hex) if sha_hex else None
+
+    details = getattr(event, "details_json", None)
+    out: dict[str, Any] = {
+        "kind": kind,
+        "flow_id": getattr(event, "flow_id", None),
+        "method": getattr(event, "method", None),
+        "url": getattr(event, "url", None),
+        "host": getattr(event, "host", None),
+        "status": getattr(event, "status", None),
+        "headers_json": json.dumps(headers_pairs) if headers_pairs else None,
+        "body_size": getattr(event, "body_size", None),
+        "body_sha256": sha_bytes,
+        "content_type": getattr(event, "content_type", None),
+        "direction": getattr(event, "direction", None),
+        "frame_type": getattr(event, "frame_type", None),
+        "http_version": getattr(event, "http_version", None),
+        "details_json": json.dumps(details) if details else None,
+        "timestamp": getattr(event, "timestamp", 0.0),
+        "timestamp_ns": getattr(event, "timestamp_ns", 0),
+    }
+    return out
+
+
+def write_network_events(
+    write_q: sq.SynchronizedQueue,
+    num_events: multiprocessing.Value,
+    perf_q: sq.SynchronizedQueue,
+    recording: Recording,
+    db_path: str,
+    terminate_processing: multiprocessing.Event,
+    started_event: multiprocessing.Event,
+    config_overrides: dict[str, object] | None = None,
+    flush_requested=None,
+    flush_ack_counter=None,
+) -> None:
+    """Writer process for network events.
+
+    Distinct from :func:`write_events` because it must handle five subtypes
+    (``network.request`` / ``network.response`` / ``network.ws_upgrade`` /
+    ``network.ws_frame`` / ``network.drop_burst``) sharing one queue, and
+    cannot use the ``assert event.type == event_type`` check from
+    :func:`write_events` (which would fail on every dotted type name).
+
+    Persists each event to ``recording.db.network_event`` via
+    :func:`crud.insert_network_event`. The DB ``kind`` column gets the
+    short form (``request``, ``response``, etc.) -- the dotted form lives
+    only on the Pydantic event for events.jsonl emission (V1.75).
+    """
+    from screencap.engine.config import apply_config_overrides
+    apply_config_overrides(config_overrides)
+
+    utils.set_start_time(recording.timestamp)
+
+    logger.info("network_event_writer starting")
+    signal.signal(signal.SIGINT, signal.SIG_IGN)
+    crud.BATCH_SIZE = 50
+    session = get_session_for_path(db_path)
+
+    # Maps the EventType.value (dotted form) to the DB `kind` short form.
+    _KIND_MAP = {
+        "network.request": "request",
+        "network.response": "response",
+        "network.ws_upgrade": "ws_upgrade",
+        "network.ws_frame": "ws_frame",
+        "network.drop_burst": "drop_burst",
+    }
+
+    started = False
+    num_processed = 0
+    try:
+        while not terminate_processing.is_set() or not write_q.empty():
+            if not started:
+                started_event.set()
+                started = True
+            try:
+                event = write_q.get_nowait()
+            except queue.Empty:
+                # Mid-recording flush hook (chunked mode).
+                if flush_requested is not None and flush_requested.is_set():
+                    crud.flush_buffers(session)
+                    with flush_ack_counter.get_lock():
+                        flush_ack_counter.value += 1
+                time.sleep(0.01)
+                continue
+            try:
+                event_type_value = (
+                    event.type.value if hasattr(event.type, "value") else event.type
+                )
+            except AttributeError:
+                logger.debug("network writer: dropping event without type field: %r", event)
+                continue
+            kind = _KIND_MAP.get(event_type_value)
+            if kind is None:
+                logger.debug(
+                    "network writer: dropping event with unknown type %r", event_type_value
+                )
+                continue
+            try:
+                event_dict = _network_event_to_db_dict(event, kind)
+                crud.insert_network_event(session, recording, event_dict)
+            except Exception as exc:  # noqa: BLE001 — never let one bad row kill the writer
+                logger.warning("network writer: insert failed for kind=%s: %s", kind, exc)
+                continue
+            num_processed += 1
+            with num_events.get_lock():
+                num_events.value += 1
+    finally:
+        crud.flush_buffers(session)
+
+    logger.info(f"network_event_writer done; processed={num_processed}")
+
+
 def video_pre_callback(
     db: crud.SaSession, recording: Recording, video_dir: str = None,
 ) -> dict[str, Any]:
@@ -2312,6 +2441,379 @@ def record_audio(
 
 @logger.catch
 @utils.trace(logger)
+def _setup_network_capture(
+    *,
+    recording,
+    capture_dir: str,
+    db_path: str,
+    network_config: Any,
+    privacy_config: Any,
+    proxy_port: int,
+    terminate_processing,  # multiprocessing.Event
+    num_network_events,  # multiprocessing.Value
+    task_started_events: dict,
+    task_by_name: dict,
+    config_overrides: dict | None,
+    flush_requested,
+    flush_ack_counter,
+    handoff_ready_event=None,
+) -> dict[str, Any]:
+    """Set up the V1 network capture pipeline inside :func:`record`.
+
+    Order of operations (load-bearing):
+        1. Snapshot system proxy state to ``<capture_dir>/.proxy_state.json``
+           AND a durable copy under ``~/.screencap/proxy/snapshots/``.
+        2. Spawn the network writer process consuming ``network_write_q``.
+        3. Spawn the proxy ``mp.Process`` (mitmproxy DumpMaster + addon)
+           via ``multiprocessing.get_context("spawn")``.
+        4. Wait up to 10s on ``started_event``; abort + restore on timeout.
+        5. Write the global sentinel + per-recording handoff atomically.
+        6. Signal ``handoff_ready_event`` so SessionController's daemon
+           thread registers the proxy PID via ``pidfile.add_child``.
+        7. Flip system proxy via a single ``osascript with administrator
+           privileges`` call.
+        8. Spawn the network reader thread (drains proxy out_q ->
+           ``network_write_q`` directly; bypasses ``event_q``).
+
+    Returns a dict capturing the state needed for teardown:
+        write_q, proxy_proc, reader_thread, snapshot, sentinel_path,
+        recording_dir, services_at_start.
+    """
+    from pathlib import Path as _Path
+
+    from screencap.network import lifecycle as _net_lifecycle
+    from screencap.network import system_proxy as _net_proxy
+    from screencap.network.proxy_runner import run_proxy
+
+    capture_dir_path = _Path(capture_dir)
+    capture_dir_path.mkdir(parents=True, exist_ok=True)
+    proxy_log_path = capture_dir_path / ".mitmdump.log"
+    snapshot_path = capture_dir_path / ".proxy_state.json"
+    durable_dir = _Path("~/.screencap/proxy/snapshots").expanduser()
+    durable_dir.mkdir(parents=True, exist_ok=True)
+    durable_snapshot_path = durable_dir / f"{recording.id}.proxy_state.json"
+    confdir = _Path("~/.screencap/proxy").expanduser()
+    worker_pid = os.getpid()
+    started_at = time.time()
+    worker_create_time = _net_lifecycle.proc_create_time(worker_pid)
+    worker_cmdline_tail = _net_lifecycle.cmdline_tail(worker_pid)
+
+    # (1) Snapshot system proxy BEFORE any mutation. Also enumerate active
+    # services for the stop-time coverage-gap diff.
+    services_at_start = _net_proxy.list_active_services()
+    snapshot = _net_proxy.snapshot_all()
+    snapshot_extra = {
+        "recording_id": str(recording.id),
+        "recording_dir": str(capture_dir_path),
+        "snapshot_path": str(snapshot_path),
+        "worker_pid": worker_pid,
+        "worker_create_time": worker_create_time,
+        "worker_cmdline_tail": worker_cmdline_tail,
+        "started_at": started_at,
+        "port": proxy_port,
+    }
+    _net_proxy.write_snapshot(snapshot, snapshot_path, extra=snapshot_extra)
+    _net_proxy.write_snapshot(snapshot, durable_snapshot_path, extra=snapshot_extra)
+
+    # (2) Network write queue + writer process.
+    network_write_q = sq.SynchronizedQueue(maxsize=100)  # _META_QUEUE_SIZE
+    writer_started = task_started_events.setdefault(
+        "network_event_writer", multiprocessing.Event()
+    )
+    network_event_writer = multiprocessing.Process(
+        target=utils.WrapStdout(write_network_events),
+        args=(
+            network_write_q,
+            num_network_events,
+            None,  # perf_q — currently unused for network writer
+            recording,
+            db_path,
+            terminate_processing,
+            writer_started,
+        ),
+        kwargs={
+            "config_overrides": config_overrides,
+            "flush_requested": flush_requested,
+            "flush_ack_counter": flush_ack_counter,
+        },
+        name="network_event_writer",
+    )
+    network_event_writer.start()
+    task_by_name["network_event_writer"] = network_event_writer
+
+    # (3) Spawn proxy mp.Process via spawn context.
+    spawn_ctx = multiprocessing.get_context("spawn")
+    proxy_out_q = spawn_ctx.Queue(maxsize=1000)
+    started_event = spawn_ctx.Event()
+    proxy_proc = spawn_ctx.Process(
+        target=run_proxy,
+        args=(
+            proxy_out_q,
+            recording.id,
+            network_config,
+            privacy_config,
+            proxy_port,
+            proxy_log_path,
+            started_event,
+            confdir,
+        ),
+        name="network_proxy",
+    )
+    proxy_proc.start()
+    proxy_pid = proxy_proc.pid
+
+    # (4) Wait for proxy ready.
+    if not started_event.wait(timeout=10.0):
+        logger.error("network proxy failed to start within 10s")
+        try:
+            proxy_proc.terminate()
+            proxy_proc.join(timeout=5)
+        finally:
+            # Snapshot exists but no mutation occurred — clean up.
+            try:
+                snapshot_path.unlink()
+            except FileNotFoundError:
+                pass
+            try:
+                durable_snapshot_path.unlink()
+            except FileNotFoundError:
+                pass
+        terminate_processing.set()
+        raise RuntimeError(
+            "network proxy did not become ready within 10s. See "
+            f"{proxy_log_path} for details."
+        )
+
+    proxy_create_time = _net_lifecycle.proc_create_time(proxy_pid)
+    proxy_cmdline_tail = _net_lifecycle.cmdline_tail(proxy_pid)
+
+    # (5) Sentinel + handoff atomic writes BEFORE flipping system proxy.
+    _net_lifecycle.write_sentinel(
+        worker_pid=worker_pid,
+        worker_create_time=worker_create_time,
+        worker_cmdline_tail=worker_cmdline_tail,
+        proxy_pid=proxy_pid,
+        proxy_create_time=proxy_create_time,
+        proxy_cmdline_tail=proxy_cmdline_tail,
+        started_at=started_at,
+        port=proxy_port,
+        recording_dir=str(capture_dir_path),
+        snapshot_path=str(snapshot_path),
+    )
+    _net_lifecycle.write_network_child_handoff(
+        capture_dir_path,
+        proxy_pid=proxy_pid,
+        worker_pid=worker_pid,
+        started_at=started_at,
+    )
+
+    # (6) Signal SessionController to register the proxy PID.
+    if handoff_ready_event is not None:
+        handoff_ready_event.set()
+
+    # (7) Flip system proxy via single osascript admin call.
+    try:
+        _net_proxy.set_proxy_all("127.0.0.1", proxy_port, services_at_start)
+    except _net_proxy.SystemProxyError:
+        # Restore from snapshot — leave the user's network in a working state.
+        try:
+            _net_proxy.restore_all(snapshot)
+        except Exception:  # noqa: BLE001
+            logger.exception("system proxy restore after failed set also failed")
+        terminate_processing.set()
+        raise
+
+    # (8) Spawn reader thread (drains proxy out_q -> network_write_q).
+    reader_started = task_started_events.setdefault(
+        "network_event_reader", threading.Event()
+    )
+    reader_thread = threading.Thread(
+        target=_network_event_reader_loop,
+        args=(proxy_out_q, network_write_q, terminate_processing, reader_started),
+        name="network_event_reader",
+        daemon=True,
+    )
+    reader_thread.start()
+    task_by_name["network_event_reader"] = reader_thread
+
+    return {
+        "write_q": network_write_q,
+        "proxy_proc": proxy_proc,
+        "proxy_out_q": proxy_out_q,
+        "reader_thread": reader_thread,
+        "snapshot": snapshot,
+        "snapshot_path": snapshot_path,
+        "durable_snapshot_path": durable_snapshot_path,
+        "recording_dir": capture_dir_path,
+        "services_at_start": services_at_start,
+        "proxy_pid": proxy_pid,
+    }
+
+
+def _network_event_reader_loop(
+    out_q,  # multiprocessing.Queue
+    network_write_q: sq.SynchronizedQueue,
+    terminate_event,  # multiprocessing.Event
+    started_event: threading.Event,
+) -> None:
+    """Drain the proxy mp.Queue into ``network_write_q``.
+
+    Two output paths:
+    1. Regular network events -> ``network_write_q`` (writer process inserts).
+       NetworkPinFailureEvent (control-only) -> ``console.print`` once per host.
+    2. On ``network_write_q.put`` timeout, accumulate per-host drop counts and
+       synthesize a ``NetworkDropBurstEvent(source="reader")`` once per second
+       (or on terminate). The drop burst itself is put with timeout=1.0; if
+       even that fails the writer is hung -> log fatal.
+    """
+    from screencap.engine.events import NetworkDropBurstEvent, NetworkPinFailureEvent
+
+    started_event.set()
+    seen_pin_hosts: set[str] = set()
+    seen_pin_lock = threading.Lock()
+    from rich.console import Console as _RichConsole
+
+    drop_count = 0
+    drop_hosts: set[str] = set()
+    drop_window_start_ns: int | None = None
+    _console = _RichConsole(stderr=True)
+
+    def _flush_drop_burst() -> None:
+        nonlocal drop_count, drop_hosts, drop_window_start_ns
+        if drop_count <= 0 or drop_window_start_ns is None:
+            return
+        burst = NetworkDropBurstEvent(
+            timestamp=drop_window_start_ns / 1e9,
+            timestamp_ns=drop_window_start_ns,
+            details_json={
+                "dropped_count": drop_count,
+                "hosts_affected": sorted(drop_hosts),
+                "source": "reader",
+            },
+        )
+        try:
+            network_write_q.put(burst, timeout=1.0)
+        except queue.Full:
+            logger.fatal(
+                "network_event_reader: drop_burst put timed out; writer is hung "
+                "(dropped %d events across %d hosts)",
+                drop_count,
+                len(drop_hosts),
+            )
+        drop_count = 0
+        drop_hosts = set()
+        drop_window_start_ns = None
+
+    while not terminate_event.is_set():
+        try:
+            event = out_q.get(timeout=0.05)
+        except queue.Empty:
+            # Tick the drop-burst window even when no events are flowing.
+            if drop_window_start_ns is not None:
+                if time.time_ns() - drop_window_start_ns >= 1_000_000_000:
+                    _flush_drop_burst()
+            continue
+        if isinstance(event, NetworkPinFailureEvent):
+            host = getattr(event, "host", "?")
+            with seen_pin_lock:
+                if host not in seen_pin_hosts:
+                    seen_pin_hosts.add(host)
+                    _console.print(
+                        f"[yellow]Tunneled {host} (cert pinning detected; subsequent "
+                        f"traffic will pass through unobserved).[/yellow]"
+                    )
+            continue
+        try:
+            network_write_q.put(event, timeout=0.05)
+        except queue.Full:
+            drop_count += 1
+            drop_hosts.add(str(getattr(event, "host", "?")))
+            if drop_window_start_ns is None:
+                drop_window_start_ns = time.time_ns()
+
+    # Final flush on terminate.
+    _flush_drop_burst()
+
+
+def _teardown_network_capture(state: dict[str, Any]) -> None:
+    """Engine-owned teardown — single owner of proxy/system-proxy state.
+
+    Runs IN THIS ORDER (minimizes the dead-listener window for the user's
+    new connections at the cost of a longer in-flight WebSocket interruption):
+
+    1. Restore system proxy FIRST from the start-time snapshot. The user's
+       new connections route around the dying proxy as soon as this returns.
+       Already-open long-lived connections (Slack WebSocket, gRPC streams)
+       continue routing through mitmproxy until step 3 terminates it; they
+       see a connection drop mid-stream then reconnect under the restored
+       proxy config.
+    2. Write `<recording_dir>/.proxy_restored` so SessionController's
+       _reap_finishing_workers sees an authoritative "do nothing" signal.
+    3. Terminate the proxy mp.Process (5s grace, then kill).
+    4. Diff active services vs the start-time snapshot; write the
+       `.network_services_changed.json` coverage-gap marker if any
+       services were added/removed mid-recording (e.g. user enabled VPN).
+    5. Delete the global sentinel + per-recording handoff + durable
+       snapshot copy.
+    """
+    from screencap.network import lifecycle as _net_lifecycle
+    from screencap.network import system_proxy as _net_proxy
+
+    snapshot = state["snapshot"]
+    durable_snapshot_path = state["durable_snapshot_path"]
+    recording_dir = state["recording_dir"]
+    services_at_start = state["services_at_start"]
+    proxy_proc = state["proxy_proc"]
+    reader_thread = state["reader_thread"]
+
+    # (1) Restore system proxy FIRST.
+    try:
+        _net_proxy.restore_all(snapshot)
+        logger.info("system proxy restored from snapshot")
+    except Exception:  # noqa: BLE001 — restore should never block teardown
+        logger.exception("system proxy restore failed during teardown")
+
+    # (2) Marker file.
+    try:
+        (recording_dir / ".proxy_restored").write_text(str(time.time()))
+    except OSError:
+        logger.exception("failed to write .proxy_restored marker")
+
+    # (3) Terminate proxy mp.Process.
+    try:
+        if proxy_proc.is_alive():
+            proxy_proc.terminate()
+            proxy_proc.join(timeout=5)
+            if proxy_proc.is_alive():
+                logger.warning("proxy did not exit on SIGTERM; killing")
+                proxy_proc.kill()
+                proxy_proc.join(timeout=2)
+    except Exception:  # noqa: BLE001
+        logger.exception("error terminating proxy mp.Process")
+
+    # Reader thread will exit once the writer is drained and terminate is set.
+    if reader_thread.is_alive():
+        reader_thread.join(timeout=2)
+
+    # (4) Coverage-gap diff.
+    try:
+        services_at_stop = _net_proxy.list_active_services()
+        marker_path = recording_dir / ".network_services_changed.json"
+        _net_proxy.services_changed_marker(
+            services_at_start, services_at_stop, marker_path
+        )
+    except Exception:  # noqa: BLE001
+        logger.exception("services-changed diff failed")
+
+    # (5) Delete sentinel + handoff + durable snapshot.
+    _net_lifecycle.delete_sentinel()
+    _net_lifecycle.delete_network_child_handoff(recording_dir)
+    try:
+        durable_snapshot_path.unlink()
+    except FileNotFoundError:
+        pass
+
+
 def record(
     task_description: str,
     capture_dir: str = None,
@@ -2337,6 +2839,12 @@ def record(
     audio_rotate_q=None,
     audio_ack_q=None,
     screen_filter: Any | None = None,
+    # --- network proxy capture (V1) ---
+    network: bool = False,
+    network_handoff_ready=None,  # multiprocessing.Event | None — see comment near `terminate_processing`
+    network_config: Any | None = None,
+    privacy_config: Any | None = None,
+    network_proxy_port: int | None = None,
 ) -> None:
     """Record Screenshots/ActionEvents/WindowEvents.
 
@@ -2347,6 +2855,14 @@ def record(
         terminate_recording: An event to signal the termination of the recording.
         status_pipe: A connection to communicate recording status.
         log_memory: Whether to log memory usage.
+        network: When True, spawn the mitmproxy capture pipeline.
+        network_handoff_ready: SessionController-supplied mp.Event signaled
+            after the proxy PID is registered in the handoff file.
+        network_config: NetworkConfig instance (V1 fields only).
+        privacy_config: PrivacyConfig instance (mask_domains is consumed
+            by the proxy ignore_hosts regex; other fields not used at proxy layer).
+        network_proxy_port: Pre-flight-negotiated port; engine flips system
+            proxy to point at this port after the listener is ready.
     """
     assert config.RECORD_VIDEO or config.RECORD_IMAGES, (
         config.RECORD_VIDEO,
@@ -2402,6 +2918,9 @@ def record(
     action_write_q = sq.SynchronizedQueue(maxsize=_META_QUEUE_SIZE)
     window_write_q = sq.SynchronizedQueue(maxsize=_META_QUEUE_SIZE)
     video_write_q = sq.SynchronizedQueue(maxsize=_IMAGE_QUEUE_SIZE)
+    # Network capture queue + state. Lazily initialised below when network=True.
+    network_write_q: sq.SynchronizedQueue | None = None
+    _network_state: dict[str, Any] | None = None  # holds proxy_proc, reader_thread, snapshot, sentinel info
     # perf_q: unbounded — tiny 3-tuples (~120 bytes each), bounded perf_q
     # risks cascade deadlock (all writers block → all write queues fill)
     # Reset module-level drop counters for this recording session
@@ -2594,6 +3113,34 @@ def record(
         window_event_writer.start()
         task_by_name["window_event_writer"] = window_event_writer
 
+    if network:
+        # ----- Network capture setup (V1 — single-owner; engine layer) -----
+        # Engine is the SINGLE OWNER of system-proxy snapshot/set/restore. The
+        # top-level `recorder.start_recording()` does NOT touch system proxy
+        # state -- only the engine `record()` does, here.
+        try:
+            _network_state = _setup_network_capture(
+                recording=recording,
+                capture_dir=capture_dir,
+                db_path=db_path,
+                network_config=network_config,
+                privacy_config=privacy_config,
+                proxy_port=network_proxy_port,
+                terminate_processing=terminate_processing,
+                num_network_events=multiprocessing.Value("i", 0),
+                task_started_events=task_started_events,
+                task_by_name=task_by_name,
+                config_overrides=_config_overrides,
+                flush_requested=flush_requested,
+                flush_ack_counter=flush_ack_counter,
+                handoff_ready_event=network_handoff_ready,
+            )
+            network_write_q = _network_state["write_q"]
+        except Exception as exc:  # noqa: BLE001 — abort recording cleanly on setup failure
+            logger.error("network capture setup failed: %s", exc)
+            terminate_processing.set()
+            raise
+
     if config.RECORD_VIDEO:
         _use_chunked = config.VIDEO_CHUNK_DURATION > 0
         if _use_chunked:
@@ -2781,6 +3328,17 @@ def record(
                         task.kill()
                         task.join(timeout=2)
 
+    # Network teardown — runs FIRST in this block (before joining other writers)
+    # because the engine is the SINGLE OWNER of system-proxy state and we
+    # want to restore the user's proxy config as early as possible. The
+    # restore-FIRST order minimizes the dead-listener window for new
+    # connections (see _teardown_network_capture docstring).
+    if _network_state is not None:
+        try:
+            _teardown_network_capture(_network_state)
+        except Exception:  # noqa: BLE001
+            logger.exception("network teardown failed")
+
     # Reader threads and lightweight writers — 10s is enough
     join_tasks(
         [
@@ -2792,6 +3350,8 @@ def record(
             "screen_event_writer",
             "action_event_writer",
             "window_event_writer",
+            "network_event_writer",
+            "network_event_reader",
         ]
     )
     # Video finalization can take >10s (ffmpeg fMP4 close) — give it 30s
@@ -2803,8 +3363,10 @@ def record(
     join_tasks(["audio_recorder"], timeout=15.0)
 
     # Clean up SynchronizedQueues to prevent feeder-thread hangs at atexit.
-    for q in (screen_write_q, action_write_q, window_write_q,
-              browser_write_q, video_write_q, perf_q):
+    _cleanup_qs = [screen_write_q, action_write_q, window_write_q, video_write_q, perf_q]
+    if network_write_q is not None:
+        _cleanup_qs.append(network_write_q)
+    for q in _cleanup_qs:
         try:
             q.cancel_join_thread()
             q.close()
@@ -2981,6 +3543,12 @@ class Recorder:
         send_profile: bool = False,
         video_chunk_duration: float | None = None,
         screen_filter: Any | None = None,
+        # --- Network proxy capture (V1) ---
+        network: bool = False,
+        network_handoff_ready=None,
+        network_config: Any | None = None,
+        privacy_config: Any | None = None,
+        network_proxy_port: int | None = None,
     ) -> None:
         from pathlib import Path
 
@@ -2990,6 +3558,11 @@ class Recorder:
         self.task_description = task_description
         self._send_profile = send_profile
         self._screen_filter = screen_filter
+        self._network = network
+        self._network_handoff_ready = network_handoff_ready
+        self._network_config = network_config
+        self._privacy_config = privacy_config
+        self._network_proxy_port = network_proxy_port
 
         # Build recording config from constructor params
         self._recording_config = RecordingConfig(
@@ -3103,6 +3676,11 @@ class Recorder:
                 audio_rotate_q=self._audio_rotate_q,
                 audio_ack_q=self._audio_ack_q,
                 screen_filter=self._screen_filter,
+                network=self._network,
+                network_handoff_ready=self._network_handoff_ready,
+                network_config=self._network_config,
+                privacy_config=self._privacy_config,
+                network_proxy_port=self._network_proxy_port,
             )
 
     def _forward_fanout_msg(self, msg) -> None:
