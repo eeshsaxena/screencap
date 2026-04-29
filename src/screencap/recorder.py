@@ -362,9 +362,16 @@ def _open_privacy_settings(pane: str) -> None:
     """Open System Settings to a specific Privacy & Security pane.
 
     pane: one of 'Privacy_ScreenCapture', 'Privacy_Accessibility', 'Privacy_ListenEvent'
+
+    Uses the macOS 13+ ``.extension`` URL form. The legacy
+    ``com.apple.preference.security`` form lands on a generic page on macOS 26+.
+    Kept in sync with the SwiftUI ``PermissionController.openSystemSettings`` helper.
     """
     subprocess.run(
-        ["open", f"x-apple.systempreferences:com.apple.preference.security?{pane}"],
+        [
+            "open",
+            f"x-apple.systempreferences:com.apple.settings.PrivacySecurity.extension?{pane}",
+        ],
         check=False,
     )
 

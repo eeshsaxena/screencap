@@ -1,0 +1,13 @@
+# xcodegen generates this from project.yml; we don't check it in.
+ScreenCap.xcodeproj/
+
+# Xcode user data
+xcuserdata/
+*.xcworkspace/xcuserdata/
+
+# Build products
+build/
+DerivedData/
+
+# macOS
+.DS_Store
