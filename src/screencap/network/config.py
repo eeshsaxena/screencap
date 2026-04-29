@@ -1,10 +1,16 @@
-"""Network proxy logging config (V1).
+"""Network proxy logging config (V1 + V1.5).
 
 Parses the ``[network]`` section of ``~/.screencap/config.toml`` into a
-frozen :class:`NetworkConfig`. V1 fields only — body capture (the
-``capture_bodies_for`` field) is V1.5 and is not stored on the dataclass.
-If the user has it set in their config, we log a one-time warning and
-ignore it.
+frozen :class:`NetworkConfig`.
+
+V1 fields: ``extra_blocklist``, ``proxy_port``, ``override_default_blocklist``,
+``body_size_cap``.
+
+V1.5 fields: ``capture_bodies_for``, ``override_default_capture_bodies_for``.
+The ``body_size_cap`` field is unchanged in V1.5 — it gains body-retention
+semantics on top of its V1 streaming/hashing-threshold meaning, with no
+schema change. See :data:`screencap.network.blocklist.DEFAULT_CAPTURE_BODIES_FOR`
+for the curated default allowlist and the inclusion criteria.
 """
 
 from __future__ import annotations
@@ -32,7 +38,7 @@ class InvalidNetworkConfigError(Exception):
 
 @dataclass(frozen=True)
 class NetworkConfig:
-    """Parsed ``[network]`` section from ``config.toml`` (V1 fields only).
+    """Parsed ``[network]`` section from ``config.toml``.
 
     V1 fields:
         extra_blocklist: Lowercase host suffixes (frozenset). Suffix-match
@@ -46,16 +52,37 @@ class NetworkConfig:
             :data:`DEFAULT_BLOCKLIST` is NOT applied; only ``extra_blocklist``
             and ``privacy.mask_domains`` are honored (plus the IP-literal
             anchors that always run).
-        body_size_cap: Streaming/hashing threshold in bytes. V1 doesn't
-            retain body bytes, but the addon still needs a number to decide
-            whether to install the chunk-hashing transformer vs buffer for
-            sha256.
+        body_size_cap: Streaming/hashing threshold in bytes. In V1 this
+            controls only whether the addon installs the chunk-hashing
+            transformer vs buffers for sha256; no body bytes are retained.
+            In V1.5 the same value layers body-retention semantics on top:
+            bodies > cap stay metadata-only across all hosts, bodies ≤ cap
+            from a host in the effective :data:`DEFAULT_CAPTURE_BODIES_FOR`
+            allowlist become candidates for encryption.
+
+    V1.5 fields:
+        capture_bodies_for: Lowercase host suffixes (frozenset) to retain
+            body bytes for, on top of (or replacing — see the override
+            field below) :data:`DEFAULT_CAPTURE_BODIES_FOR`. Supports the
+            ``*.example.com`` wildcard form (stripped to the bare apex by
+            :func:`_matches_suffix`). The blocklist always wins on overlap
+            (a host in both this allowlist and any blocklist source is
+            blocked, never body-captured).
+        override_default_capture_bodies_for: When True, the user's
+            ``capture_bodies_for`` REPLACES :data:`DEFAULT_CAPTURE_BODIES_FOR`
+            entirely. When False (default), the two are unioned. An empty
+            effective allowlist (override=True + empty user list) is a
+            valid "metadata-only for all hosts" posture and triggers a
+            pre-flight warning; see
+            :func:`screencap.network.blocklist.effective_capture_bodies_for`.
     """
 
     extra_blocklist: frozenset[str] = field(default_factory=frozenset)
     proxy_port: int = 0  # 0 = auto-negotiate within 8080-8090
     override_default_blocklist: bool = False
     body_size_cap: int = 100_000
+    capture_bodies_for: frozenset[str] = field(default_factory=frozenset)
+    override_default_capture_bodies_for: bool = False
 
 
 def parse_network_config(section: dict | None) -> NetworkConfig:
@@ -127,11 +154,27 @@ def parse_network_config(section: dict | None) -> NetworkConfig:
             f"{_BODY_SIZE_CAP_MAX}], got {raw_cap}"
         )
 
-    # capture_bodies_for — V1.5 field, ignored in V1 with a one-time warning.
-    if "capture_bodies_for" in section:
-        console.print(
-            "[yellow]warning:[/yellow] body capture is V1.5; "
-            "`capture_bodies_for` is currently ignored"
+    # capture_bodies_for (V1.5)
+    raw_capture = section.get("capture_bodies_for", [])
+    if not isinstance(raw_capture, list):
+        raise InvalidNetworkConfigError(
+            "network.capture_bodies_for must be a list, got "
+            f"{type(raw_capture).__name__}"
+        )
+    for i, host in enumerate(raw_capture):
+        if not isinstance(host, str):
+            raise InvalidNetworkConfigError(
+                f"network.capture_bodies_for[{i}] must be a string, got "
+                f"{type(host).__name__}"
+            )
+    capture_bodies_for = frozenset(h.lower() for h in raw_capture)
+
+    # override_default_capture_bodies_for (V1.5)
+    raw_override_capture = section.get("override_default_capture_bodies_for", False)
+    if not isinstance(raw_override_capture, bool):
+        raise InvalidNetworkConfigError(
+            "network.override_default_capture_bodies_for must be a bool, got "
+            f"{type(raw_override_capture).__name__}"
         )
 
     return NetworkConfig(
@@ -139,4 +182,6 @@ def parse_network_config(section: dict | None) -> NetworkConfig:
         proxy_port=raw_port,
         override_default_blocklist=raw_override,
         body_size_cap=raw_cap,
+        capture_bodies_for=capture_bodies_for,
+        override_default_capture_bodies_for=raw_override_capture,
     )

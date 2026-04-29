@@ -1,4 +1,4 @@
-"""Tests for screencap.network.config (V1)."""
+"""Tests for screencap.network.config (V1 + V1.5)."""
 
 from __future__ import annotations
 
@@ -22,6 +22,8 @@ class TestParseNetworkConfig:
         assert cfg.proxy_port == 0
         assert cfg.override_default_blocklist is False
         assert cfg.body_size_cap == 100_000
+        assert cfg.capture_bodies_for == frozenset()
+        assert cfg.override_default_capture_bodies_for is False
 
     def test_none_section_defaults(self):
         cfg = parse_network_config(None)
@@ -47,16 +49,46 @@ class TestParseNetworkConfig:
         cfg = parse_network_config({"body_size_cap": 1024 * 512})
         assert cfg.body_size_cap == 524_288
 
-    def test_capture_bodies_for_warns_and_ignored(self, capsys):
-        # capture_bodies_for is V1.5; should emit a warning and NOT
-        # become a field on NetworkConfig.
+    def test_capture_bodies_for_parses_to_lowercase_frozenset(self, capsys):
+        # V1.5: capture_bodies_for is now a real field (V1's warn-and-ignore
+        # behavior is gone — verify no warning fires).
         cfg = parse_network_config({
-            "capture_bodies_for": ["github.com"],
+            "capture_bodies_for": ["*.GitHub.com", "Notion.so"],
         })
-        assert not hasattr(cfg, "capture_bodies_for")
+        assert cfg.capture_bodies_for == frozenset({"*.github.com", "notion.so"})
         captured = capsys.readouterr()
-        assert "V1.5" in captured.out
-        assert "capture_bodies_for" in captured.out
+        # Anti-regression for the V1 warning path.
+        assert "V1.5" not in captured.out
+        assert "ignored" not in captured.out
+
+    def test_override_default_capture_bodies_for_true(self):
+        cfg = parse_network_config({"override_default_capture_bodies_for": True})
+        assert cfg.override_default_capture_bodies_for is True
+
+    def test_override_default_capture_bodies_for_false_explicit(self):
+        cfg = parse_network_config({"override_default_capture_bodies_for": False})
+        assert cfg.override_default_capture_bodies_for is False
+
+    def test_capture_bodies_for_not_a_list(self):
+        with pytest.raises(
+            InvalidNetworkConfigError,
+            match="network.capture_bodies_for must be a list",
+        ):
+            parse_network_config({"capture_bodies_for": "github.com"})
+
+    def test_capture_bodies_for_non_string_entry(self):
+        with pytest.raises(
+            InvalidNetworkConfigError,
+            match=r"network\.capture_bodies_for\[0\] must be a string",
+        ):
+            parse_network_config({"capture_bodies_for": [42]})
+
+    def test_override_default_capture_bodies_for_wrong_type(self):
+        with pytest.raises(
+            InvalidNetworkConfigError,
+            match="network.override_default_capture_bodies_for must be a bool",
+        ):
+            parse_network_config({"override_default_capture_bodies_for": "yes"})
 
     # ----- error cases -----
 
