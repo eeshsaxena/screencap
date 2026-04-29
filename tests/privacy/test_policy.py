@@ -288,3 +288,42 @@ def test_get_privacy_config_from_toml(monkeypatch, tmp_path):
     result = config.get_privacy_config()
     assert isinstance(result, PrivacyConfig)
     assert result.mode == PrivacyMode.PUBLIC
+
+
+# ---------------------------------------------------------------------------
+# Cross-process transport (network proxy reads PrivacyConfig in a child mp.Process)
+# ---------------------------------------------------------------------------
+
+
+def test_privacy_config_pickle_round_trip():
+    """PrivacyConfig must pickle for cross-process transport.
+
+    The network proxy mp.Process is spawned with PrivacyConfig in its args
+    (mask_domains feeds the host-block decision). __post_init__ wraps
+    app_classes in MappingProxyType which is not picklable by default;
+    __getstate__/__setstate__ unwrap-and-rewrap to restore the invariant
+    on the receiving side.
+    """
+    import pickle
+    from types import MappingProxyType
+
+    cfg = parse_privacy_config(
+        {
+            "privacy": {
+                "mode": "internal",
+                "exclude_apps": ["com.example.bar"],
+                "mask_domains": ["chase.com", "1password.com"],
+                "app_classes": {"com.example.foo": "auth_flow"},
+            }
+        }
+    )
+    assert isinstance(cfg.app_classes, MappingProxyType)
+
+    restored = pickle.loads(pickle.dumps(cfg))
+    assert isinstance(restored, PrivacyConfig)
+    assert isinstance(restored.app_classes, MappingProxyType)
+    assert dict(cfg.app_classes) == dict(restored.app_classes)
+    assert restored.mask_domains == cfg.mask_domains
+    assert restored.exclude_apps == cfg.exclude_apps
+    assert restored.mode == cfg.mode
+    assert cfg == restored
