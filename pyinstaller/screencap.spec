@@ -77,6 +77,30 @@ for pkg in privacy_packages:
         pass
 
 # ---------------------------------------------------------------------------
+# Network proxy logging — mitmproxy + cryptography + transitive HTTP/WS deps
+#
+# Per the institutional learning in the network proxy plan: do NOT wrap
+# each collect_all in a bare try/except — that pattern silently swallows
+# missing packages and is exactly the bundling failure mode Unit 7 aims
+# to catch. Errors propagate; a missing wheel must fail the build.
+# ---------------------------------------------------------------------------
+network_packages = [
+    'mitmproxy',         # core proxy event loop + Options + DumpMaster
+    'mitmproxy_rs',      # native Rust extension (TLS / IO primitives)
+    'cryptography',      # native dylibs (libcrypto, libssl) for CA + TLS
+    'wsproto',           # WebSocket protocol (mitmproxy WS support)
+    'h2',                # HTTP/2 frame parsing
+    'h11',               # HTTP/1.1 parsing
+    'kaitaistruct',      # binary protocol parser used by mitmproxy
+]
+
+for pkg in network_packages:
+    d, b, h = collect_all(pkg)
+    all_datas += d
+    all_binaries += b
+    all_hiddenimports += h
+
+# ---------------------------------------------------------------------------
 # Hidden imports not auto-detected by PyInstaller
 # ---------------------------------------------------------------------------
 hidden_imports = [
