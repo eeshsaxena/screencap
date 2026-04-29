@@ -32,6 +32,7 @@ There is now a single on-disk schema — `recording.db` — managed by SQLAlchem
 | `performance_stat` | Per-event timing | `event_type`, `start_time`/`end_time` (ns), `window_id` |
 | `window_geometry` | All-windows snapshot per frame | `screenshot_timestamp` (indexed), `window_list_json` |
 | `memory_stat` | RSS over time | `memory_usage_bytes`, `timestamp` |
+| `network_event` | HTTP/HTTPS + WebSocket capture metadata (V1 only when `screencap start --network`) | `kind` enum (`request`/`response`/`ws_upgrade`/`ws_frame`/`drop_burst`), `flow_id`, `method`, `url`, `host`, `status`, `headers_json`, `body_size`, `body_sha256` (raw 32 bytes), `content_type`, `direction`, `frame_type`, `details_json` (kind-dependent payload), `timestamp_ns` (indexed for sort) |
 
 Relationships cascade `all, delete-orphan`. `Recording.original_recording_id` self-references for copies.
 
@@ -96,3 +97,4 @@ Reader patterns in use:
 - [event-system.md](./event-system.md) — `dict_to_action_event` converts rows to events
 - [scrubbing.md](./scrubbing.md) — how the scrubber and live worker mutate the DB
 - [export-pipeline.md](./export-pipeline.md) — chunk processor's raw-sqlite3 reads
+- [network-capture.md](./network-capture.md) — `network_event` table written by the V1 network capture pipeline; metadata-only in V1, body columns added in V1.5 alongside `network_event_meta` for KEK/DEK

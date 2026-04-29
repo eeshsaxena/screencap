@@ -192,5 +192,6 @@ Per entity type, the filter rejects known false-positive patterns:
 - [scrubbing.md](./scrubbing.md) — how layer 2 is invoked over a recording
 - [recording-engine.md](./recording-engine.md) — how layer 1 gates reach writes
 - [export-pipeline.md](./export-pipeline.md) — privacy filter on window switches at export
+- [network-capture.md](./network-capture.md) — V1 network capture inherits `mask_domains` for the proxy `ignore_hosts` regex (HTTPS CONNECT layer); does NOT inherit `exclude_apps` (bundle-ID filter, no per-process attribution at the proxy layer); `network/redaction.py` is the single source of truth for capture-time auth/header/query-param scrubs (R10) imported by the addon
 - `decisions/` — fail-closed default + env-tightens-only + MASK_WINDOW captures rationale
 - `research/` — UT1 blocklist sourcing, GLiNER vs Presidio benchmarks

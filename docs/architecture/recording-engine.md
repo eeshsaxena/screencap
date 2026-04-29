@@ -98,5 +98,6 @@ All under `~/.screencap/recordings/<name>/`:
 - [event-system.md](./event-system.md) — what flows through the queues
 - [database.md](./database.md) — what the writers write
 - [privacy.md](./privacy.md) — how `RecorderPrivacyFilter` gates capture
+- [network-capture.md](./network-capture.md) — `screencap start --network` runs a parallel pipeline (mitmproxy + addon + reader thread + writer process) that bypasses `event_q` and is owned end-to-end by the engine layer
 - [session.md](./session.md) — how `SessionController` spawns the recorder
 - `CLAUDE.md` (root) — `take_screenshot()` and `get_monitor_dims()` macOS notes
