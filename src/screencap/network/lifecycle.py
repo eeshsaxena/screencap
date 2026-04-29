@@ -666,6 +666,95 @@ def _run_admin_auth_trial() -> None:
         )
 
 
+def full_uninstall(
+    *,
+    confdir: Path | None = None,
+    sentinel_path: Path | None = None,
+    lock_path: Path | None = None,
+    durable_dir: Path | None = None,
+    recordings_dirs: list[Path] | None = None,
+) -> None:
+    """Uninstall the screencap proxy CA + clean up our state.
+
+    Order is load-bearing per R4 and R20:
+        1. ``restore_orphaned_proxy_state()`` FIRST -- leave the user's
+           network in a working state regardless of how they got here.
+        2. Read ``CertIdentity`` from ``<confdir>/ca-identity.json`` and
+           call ``ca_lifecycle.uninstall_ca`` (SHA-256 primary, SHA-1
+           fallback for older macOS, CN-fallback if the identity file is
+           missing). All "not found" exits are treated as success.
+        3. Delete ``<confdir>/`` contents -- but ONLY ours. NEVER touch
+           ``~/.mitmproxy/`` (mitmproxy's own user dir, possibly an
+           unrelated install). If ``~/.mitmproxy/`` exists, log an
+           informational notice that it is being left untouched.
+        4. Delete the global sentinel + lock file.
+
+    Idempotent: every step gracefully handles "already done" / "never
+    existed". No ``--remove-kek`` in V1 (V1.5 work).
+    """
+    from screencap.network import ca_lifecycle as _ca
+
+    confdir = confdir or _DEFAULT_PROXY_DIR
+    sentinel_path = sentinel_path or _DEFAULT_SENTINEL_PATH
+    lock_path = lock_path or _DEFAULT_LOCK_PATH
+    durable_dir = durable_dir or _DEFAULT_PROXY_SNAPSHOTS_DIR
+
+    # (1) Restore orphaned state FIRST.
+    try:
+        restore_orphaned_proxy_state(
+            sentinel_path=sentinel_path,
+            durable_dir=durable_dir,
+            recordings_dirs=recordings_dirs,
+        )
+    except Exception:  # noqa: BLE001
+        logger.exception("restore_orphaned_proxy_state failed during uninstall")
+
+    # (2) Uninstall the CA (idempotent at the helper level).
+    identity_path = confdir / "ca-identity.json"
+    identity = None
+    if identity_path.exists():
+        try:
+            data = json.loads(identity_path.read_text())
+            identity = _ca.CertIdentity(
+                cn=data["cn"],
+                sha256_hex=data["sha256_hex"],
+                sha1_hex=data["sha1_hex"],
+            )
+        except (OSError, json.JSONDecodeError, KeyError):
+            logger.warning(
+                "ca-identity.json at %s is unreadable; "
+                "falling back to CN-based delete",
+                identity_path,
+            )
+    try:
+        _ca.uninstall_ca(identity)
+    except Exception:  # noqa: BLE001
+        logger.exception("uninstall_ca failed; continuing cleanup")
+
+    # (3) Delete OUR proxy dir -- never ~/.mitmproxy/.
+    home = Path("~").expanduser()
+    user_mitmproxy_dir = home / ".mitmproxy"
+    if user_mitmproxy_dir.exists():
+        console.print(
+            f"[blue]note:[/blue] {user_mitmproxy_dir} exists but was not "
+            f"modified (it belongs to a separate mitmproxy install)."
+        )
+    if confdir.exists():
+        try:
+            import shutil
+
+            shutil.rmtree(confdir)
+        except OSError:
+            logger.exception("failed to delete %s", confdir)
+
+    # (4) Delete sentinel + lock file.
+    delete_sentinel(sentinel_path)
+    try:
+        lock_path.unlink()
+    except FileNotFoundError:
+        pass
+
+
 # Re-export list_active_services for convenience in callers that already
 # imported `lifecycle`.
 __all__ = [
@@ -678,6 +767,7 @@ __all__ = [
     "cmdline_tail",
     "delete_network_child_handoff",
     "delete_sentinel",
+    "full_uninstall",
     "is_pid_alive_with_create_time",
     "list_active_services",
     "preflight_or_raise",

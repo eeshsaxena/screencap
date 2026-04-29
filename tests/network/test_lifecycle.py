@@ -367,3 +367,131 @@ class TestRestoreOrphanedProxyState:
         # Timed out — skipped, snapshot preserved (so a future retry can still run).
         assert result == []
         assert snapshot_path.exists()
+
+
+# ---------------------------------------------------------------------------
+# full_uninstall orchestrator (Unit 8)
+# ---------------------------------------------------------------------------
+
+
+class TestFullUninstall:
+    """V1 uninstall flow: restore-FIRST, delete-second."""
+
+    def test_restore_runs_before_uninstall(self, tmp_path: Path):
+        """Plan R4: any termination path eventually restores proxy state."""
+        from screencap.network import lifecycle as life
+
+        confdir = tmp_path / "proxy"
+        confdir.mkdir()
+        sentinel = tmp_path / ".network_active"
+        lock = tmp_path / ".network_active.lock"
+        durable = tmp_path / "snapshots"
+
+        call_order: list[str] = []
+        with (
+            patch.object(life, "restore_orphaned_proxy_state",
+                         side_effect=lambda **kw: call_order.append("restore") or [])
+            as restore_mock,
+            patch("screencap.network.ca_lifecycle.uninstall_ca",
+                  side_effect=lambda *a, **kw: call_order.append("uninstall_ca"))
+            as uninstall_mock,
+        ):
+            life.full_uninstall(
+                confdir=confdir,
+                sentinel_path=sentinel,
+                lock_path=lock,
+                durable_dir=durable,
+            )
+        assert call_order == ["restore", "uninstall_ca"]
+        restore_mock.assert_called_once()
+        uninstall_mock.assert_called_once()
+
+    def test_deletes_proxy_dir_only(self, tmp_path: Path):
+        """Confdir contents removed; ~/.mitmproxy/ untouched (per plan)."""
+        from screencap.network import lifecycle as life
+
+        confdir = tmp_path / "proxy"
+        confdir.mkdir()
+        (confdir / "mitmproxy-ca.pem").write_text("dummy")
+        (confdir / "ca-identity.json").write_text("{}")
+        sentinel = tmp_path / ".network_active"
+        lock = tmp_path / ".network_active.lock"
+
+        with (
+            patch.object(life, "restore_orphaned_proxy_state", return_value=[]),
+            patch("screencap.network.ca_lifecycle.uninstall_ca"),
+            patch("subprocess.run", return_value=_completed()),
+        ):
+            life.full_uninstall(
+                confdir=confdir,
+                sentinel_path=sentinel,
+                lock_path=lock,
+                durable_dir=tmp_path / "snapshots",
+            )
+        assert not confdir.exists(), "proxy dir should be deleted"
+
+    def test_deletes_sentinel_and_lock(self, tmp_path: Path):
+        from screencap.network import lifecycle as life
+
+        sentinel = tmp_path / ".network_active"
+        sentinel.write_text("{}")
+        lock = tmp_path / ".network_active.lock"
+        lock.touch()
+        confdir = tmp_path / "proxy"
+
+        with (
+            patch.object(life, "restore_orphaned_proxy_state", return_value=[]),
+            patch("screencap.network.ca_lifecycle.uninstall_ca"),
+        ):
+            life.full_uninstall(
+                confdir=confdir,
+                sentinel_path=sentinel,
+                lock_path=lock,
+                durable_dir=tmp_path / "snapshots",
+            )
+        assert not sentinel.exists()
+        assert not lock.exists()
+
+    def test_idempotent_on_clean_state(self, tmp_path: Path):
+        """Second invocation on already-uninstalled state succeeds silently."""
+        from screencap.network import lifecycle as life
+
+        with (
+            patch.object(life, "restore_orphaned_proxy_state", return_value=[]),
+            patch("screencap.network.ca_lifecycle.uninstall_ca"),
+        ):
+            # First call: nothing to clean.
+            life.full_uninstall(
+                confdir=tmp_path / "missing-proxy",
+                sentinel_path=tmp_path / "missing-sentinel",
+                lock_path=tmp_path / "missing-lock",
+                durable_dir=tmp_path / "missing-snapshots",
+            )
+            # Second call: same state, no errors.
+            life.full_uninstall(
+                confdir=tmp_path / "missing-proxy",
+                sentinel_path=tmp_path / "missing-sentinel",
+                lock_path=tmp_path / "missing-lock",
+                durable_dir=tmp_path / "missing-snapshots",
+            )
+
+    def test_missing_ca_identity_falls_through(self, tmp_path: Path):
+        """If ca-identity.json is missing, uninstall_ca is called with None."""
+        from screencap.network import lifecycle as life
+
+        confdir = tmp_path / "proxy"
+        confdir.mkdir()
+        # No ca-identity.json present.
+
+        with (
+            patch.object(life, "restore_orphaned_proxy_state", return_value=[]),
+            patch("screencap.network.ca_lifecycle.uninstall_ca") as uninstall_mock,
+        ):
+            life.full_uninstall(
+                confdir=confdir,
+                sentinel_path=tmp_path / ".network_active",
+                lock_path=tmp_path / ".network_active.lock",
+                durable_dir=tmp_path / "snapshots",
+            )
+        # uninstall_ca called with None -- the helper falls back to CN-delete.
+        uninstall_mock.assert_called_once_with(None)
