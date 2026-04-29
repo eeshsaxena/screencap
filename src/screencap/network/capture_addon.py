@@ -281,11 +281,17 @@ class NetworkCapture:
             self._runtime_tunnel_hosts: set[str] = _pin.load_known_pinned_hosts()
         except Exception:  # noqa: BLE001 — pre-loaded cache is best-effort
             self._runtime_tunnel_hosts = set()
-        # Track each host's first-seen-pinned timestamp so we can emit a
-        # network.tunneled summary event at done() (V1.5 task 11).
-        self._tunnel_started_at: dict[str, float] = {
-            h: time.time() for h in self._runtime_tunnel_hosts
-        }
+        # V1.5: hosts ACTUALLY OBSERVED as tunneled during this recording
+        # (subset of ``_runtime_tunnel_hosts``). Populated from
+        # ``tls_clienthello`` (when ``ignore_connection`` fires) and
+        # ``error()`` (mid-recording new pin failure). ``done()`` emits
+        # one ``network.tunneled`` event per host in THIS set, NOT the
+        # cache — otherwise every recording would emit bogus tunneled
+        # events for every host the user has ever encountered.
+        self._observed_tunnel_hosts: set[str] = set()
+        # Track each host's first-observed-this-recording timestamp so
+        # the network.tunneled event has accurate started_at.
+        self._tunnel_started_at: dict[str, float] = {}
         self._pin_failure_emitted: set[str] = set()
         self._loop: asyncio.AbstractEventLoop | None = None
         self._drop_burst_timer_handle: asyncio.TimerHandle | None = None
@@ -322,11 +328,15 @@ class NetworkCapture:
             self._emit_drop_burst(blocking=True)
 
         # V1.5 task 11: emit one network.tunneled event per host that was
-        # tunneled at any point during this recording. Lets the training
-        # pipeline mark API-not-observable time spans rather than
-        # silently treating them as no-traffic windows.
+        # ACTUALLY OBSERVED as tunneled during this recording. Iterates
+        # ``_observed_tunnel_hosts`` (populated by tls_clienthello and
+        # error()) rather than ``_runtime_tunnel_hosts`` (which would
+        # include every host the user has ever pinned across all past
+        # recordings — a bogus signal). Lets the training pipeline mark
+        # API-not-observable time spans rather than silently treating
+        # them as no-traffic windows.
         now = time.time()
-        for host in sorted(self._runtime_tunnel_hosts):
+        for host in sorted(self._observed_tunnel_hosts):
             started_at = self._tunnel_started_at.get(host, now)
             duration = max(0.0, now - started_at)
             try:
@@ -605,6 +615,12 @@ class NetworkCapture:
             return
         if sni and sni in self._runtime_tunnel_hosts:
             data.ignore_connection = True
+            # Mark observed-this-recording so done() emits a
+            # network.tunneled event covering the actual tunneled span.
+            sni_lc = sni.lower()
+            if sni_lc not in self._observed_tunnel_hosts:
+                self._observed_tunnel_hosts.add(sni_lc)
+                self._tunnel_started_at.setdefault(sni_lc, time.time())
 
     def error(self, flow: Any) -> None:
         """Classify TLS-pinning failures, emit one-time pin notice.
@@ -626,18 +642,28 @@ class NetworkCapture:
             _log(self._log_path, f"flow error host={host} msg={err_msg!r}")
 
             if host and _is_tls_pin_failure(err_msg):
-                if host not in self._runtime_tunnel_hosts:
-                    self._runtime_tunnel_hosts.add(host)
-                    self._tunnel_started_at[host] = time.time()
+                host_lc = host.lower()
+                if host_lc not in self._runtime_tunnel_hosts:
+                    self._runtime_tunnel_hosts.add(host_lc)
                     # V1.5: persist for the next recording so this host
                     # never fails its first connection again. Best-effort.
                     try:
                         from screencap.network import (  # noqa: PLC0415
                             pinned_hosts as _pin,
                         )
-                        _pin.add_known_pinned_host(host)
+                        _pin.add_known_pinned_host(host_lc)
                     except Exception:  # noqa: BLE001
-                        _log(self._log_path, f"failed to persist pinned host {host}")
+                        _log(
+                            self._log_path,
+                            f"failed to persist pinned host {host_lc}",
+                        )
+                # Mark observed-this-recording (whether the host is
+                # newly-detected or was pre-loaded from cache and just
+                # failed for the first time this recording). done()
+                # uses _observed_tunnel_hosts to emit network.tunneled.
+                if host_lc not in self._observed_tunnel_hosts:
+                    self._observed_tunnel_hosts.add(host_lc)
+                    self._tunnel_started_at.setdefault(host_lc, time.time())
                 if host not in self._pin_failure_emitted:
                     self._pin_failure_emitted.add(host)
                     pin_event = NetworkPinFailureEvent(

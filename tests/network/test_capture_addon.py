@@ -802,6 +802,38 @@ class TestTlsClienthello:
         capture.tls_clienthello(d)
         assert d.ignore_connection is False
 
+    def test_observed_tunnel_hosts_records_only_seen(self):
+        """V1.5 P2 #4: ``_observed_tunnel_hosts`` must NOT be seeded
+        from the persistent cache. Only hosts whose tunnel was actually
+        triggered during this recording (via tls_clienthello or error)
+        end up in the observed set, so done() does not emit
+        ``network.tunneled`` events for hosts the user never touched.
+        """
+        capture, _ = _make_capture()
+        # Pre-populate the runtime cache (mirroring what __init__ does
+        # from the persistent JSON file). The observed set must remain
+        # empty until something actually fires.
+        capture._runtime_tunnel_hosts.update({"cached-a.com", "cached-b.com"})
+        assert capture._observed_tunnel_hosts == set()
+
+        # tls_clienthello for a cached host marks it observed.
+        @dataclass
+        class FakeClientHello:
+            sni: str = "cached-a.com"
+
+        @dataclass
+        class FakeData:
+            client_hello: FakeClientHello = field(default_factory=FakeClientHello)
+            ignore_connection: bool = False
+
+        capture.tls_clienthello(FakeData())
+        # Only the host that was actually seen ends up in the observed
+        # set; the other cached host stays out.
+        assert capture._observed_tunnel_hosts == {"cached-a.com"}
+        # Started_at is populated for the observed host only.
+        assert "cached-a.com" in capture._tunnel_started_at
+        assert "cached-b.com" not in capture._tunnel_started_at
+
 
 # ---------------------------------------------------------------------------
 # done() — final flush + log
@@ -820,6 +852,48 @@ class TestDone:
         assert len(bursts) == 1
         # Shutdown line written.
         assert "shutdown:" in log_path.read_text()
+
+    def test_done_emits_tunneled_only_for_observed_hosts(self, tmp_path):
+        """V1.5 P2 #4: ``done()`` iterates the observed set, not the
+        full cache. Pre-loading 5 hosts in the cache and observing only
+        1 must produce exactly 1 ``network.tunneled`` event.
+        """
+        from screencap.engine.events import NetworkTunneledEvent
+
+        log_path = tmp_path / "log.txt"
+        capture, out_q = _make_capture(log_path=log_path)
+        # Cache has many old hosts; only one is observed this recording.
+        capture._runtime_tunnel_hosts.update({
+            "old-1.com", "old-2.com", "old-3.com",
+            "old-4.com", "observed.com",
+        })
+        capture._observed_tunnel_hosts.add("observed.com")
+        capture._tunnel_started_at["observed.com"] = 100.0
+
+        capture.done()
+
+        events = _drain(out_q)
+        tunneled = [e for e in events if isinstance(e, NetworkTunneledEvent)]
+        # Exactly one event, for the observed host only.
+        assert len(tunneled) == 1
+        assert tunneled[0].host == "observed.com"
+        assert tunneled[0].started_at == 100.0
+
+    def test_done_emits_zero_tunneled_when_nothing_observed(self, tmp_path):
+        """Cache loaded but no host observed → zero network.tunneled."""
+        from screencap.engine.events import NetworkTunneledEvent
+
+        log_path = tmp_path / "log.txt"
+        capture, out_q = _make_capture(log_path=log_path)
+        capture._runtime_tunnel_hosts.update({
+            "cached-a.com", "cached-b.com", "cached-c.com",
+        })
+        # _observed_tunnel_hosts intentionally empty.
+        capture.done()
+
+        events = _drain(out_q)
+        tunneled = [e for e in events if isinstance(e, NetworkTunneledEvent)]
+        assert tunneled == []
 
 
 # ---------------------------------------------------------------------------
