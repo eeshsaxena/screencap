@@ -6,14 +6,19 @@ struct ScreenCapApp: App {
 
     @StateObject private var recorder = RecorderController()
     @StateObject private var permissions = PermissionController()
+    @StateObject private var index = RecordingsIndex()
 
     var body: some Scene {
         WindowGroup("ScreenCap") {
             MainWindow()
                 .environmentObject(recorder)
                 .environmentObject(permissions)
-                .frame(minWidth: 720, minHeight: 480)
-                .onAppear { appDelegate.bind(recorder: recorder) }
+                .environmentObject(index)
+                .frame(minWidth: 880, minHeight: 560)
+                .onAppear {
+                    appDelegate.bind(recorder: recorder)
+                    recorder.bindIndex(index)
+                }
         }
         .windowResizability(.contentSize)
         .commands {

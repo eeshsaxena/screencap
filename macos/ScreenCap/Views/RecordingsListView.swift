@@ -1,0 +1,184 @@
+import SwiftUI
+
+/// Date-grouped recordings list (Unit 12). Default state: all recordings,
+/// newest day first. When `filterDay` is set, shows only recordings from that
+/// day; "Show all" breadcrumb clears the filter.
+///
+/// Row click triggers Unit 14a (`screencap view <name>` link-out to the user's
+/// default browser) — replaced by the native viewer in v1.1.
+struct RecordingsListView: View {
+    @EnvironmentObject private var index: RecordingsIndex
+
+    @Binding var filterDay: Date?
+    /// Lets the parent navigate back to the calendar when the user clicks a
+    /// date header (per origin's Visual Aid section nav contract).
+    var onSelectDayHeader: (Date) -> Void
+
+    @State private var rowError: String?
+
+    var body: some View {
+        VStack(alignment: .leading, spacing: 0) {
+            header
+            Divider()
+            content
+        }
+    }
+
+    private var header: some View {
+        HStack {
+            if let day = filterDay {
+                Button {
+                    filterDay = nil
+                } label: {
+                    HStack(spacing: 4) {
+                        Image(systemName: "chevron.left")
+                        Text("Show all")
+                    }
+                }
+                .buttonStyle(.borderless)
+
+                Text("·")
+                    .foregroundStyle(.secondary)
+
+                Text(longFormat(day))
+                    .font(.headline)
+            } else {
+                Text("All Recordings")
+                    .font(.headline)
+            }
+            Spacer()
+            Text("\(visibleRecordings.count)")
+                .font(.subheadline)
+                .foregroundStyle(.secondary)
+        }
+        .padding(.horizontal, 20)
+        .padding(.vertical, 12)
+    }
+
+    @ViewBuilder
+    private var content: some View {
+        if let day = filterDay, visibleRecordings.isEmpty {
+            VStack(spacing: 8) {
+                Text("No recordings on \(longFormat(day))")
+                    .font(.body)
+                    .foregroundStyle(.secondary)
+                Button("Show all recordings") { filterDay = nil }
+                    .buttonStyle(.borderless)
+            }
+            .frame(maxWidth: .infinity, maxHeight: .infinity)
+            .padding(40)
+        } else if visibleRecordings.isEmpty {
+            VStack(spacing: 8) {
+                Text("No recordings yet")
+                    .font(.body)
+                    .foregroundStyle(.secondary)
+            }
+            .frame(maxWidth: .infinity, maxHeight: .infinity)
+            .padding(40)
+        } else {
+            List {
+                if filterDay == nil {
+                    ForEach(index.groupedByDay(), id: \.day) { group in
+                        Section {
+                            ForEach(group.recordings) { rec in
+                                row(for: rec)
+                            }
+                        } header: {
+                            Button {
+                                onSelectDayHeader(group.day)
+                            } label: {
+                                HStack {
+                                    Text(longFormat(group.day))
+                                        .font(.subheadline.bold())
+                                    Image(systemName: "chevron.right")
+                                        .font(.caption2)
+                                        .foregroundStyle(.secondary)
+                                }
+                            }
+                            .buttonStyle(.plain)
+                        }
+                    }
+                } else {
+                    ForEach(visibleRecordings) { rec in
+                        row(for: rec)
+                    }
+                }
+            }
+            .listStyle(.inset)
+        }
+    }
+
+    @ViewBuilder
+    private func row(for rec: RecordingSummary) -> some View {
+        Button {
+            openInBrowser(rec)
+        } label: {
+            HStack(spacing: 12) {
+                VStack(alignment: .leading, spacing: 2) {
+                    Text(rec.name)
+                        .font(.body)
+                    HStack(spacing: 8) {
+                        Text(rec.startedTimeOfDay)
+                        Text("·")
+                        Text(rec.duration)
+                        if rec.hasAudio {
+                            Text("·")
+                            Image(systemName: "waveform")
+                        }
+                        if rec.isStub {
+                            Text("·")
+                            Text("incomplete")
+                                .foregroundStyle(.orange)
+                        }
+                    }
+                    .font(.caption)
+                    .foregroundStyle(.secondary)
+                }
+                Spacer()
+                Text(rec.sizeMB)
+                    .font(.caption)
+                    .foregroundStyle(.tertiary)
+                Image(systemName: "play.circle")
+                    .foregroundStyle(.secondary)
+            }
+            .contentShape(Rectangle())
+        }
+        .buttonStyle(.plain)
+        .alert("Failed to open recording", isPresented: errorBinding) {
+            Button("OK") { rowError = nil }
+        } message: {
+            Text(rowError ?? "")
+        }
+    }
+
+    private var errorBinding: Binding<Bool> {
+        Binding(
+            get: { rowError != nil },
+            set: { if !$0 { rowError = nil } }
+        )
+    }
+
+    private var visibleRecordings: [RecordingSummary] {
+        if let day = filterDay {
+            return index.recordings(on: day)
+        }
+        return index.recordings.sorted { ($0.startedAt ?? 0) > ($1.startedAt ?? 0) }
+    }
+
+    private func longFormat(_ day: Date) -> String {
+        let formatter = DateFormatter()
+        formatter.dateStyle = .full
+        return formatter.string(from: day)
+    }
+
+    /// Unit 14a: shell out to `screencap view <name>`. The Python side
+    /// regenerates `viewer.html` if needed and `open`s it in the default
+    /// browser. Fire-and-forget — we don't poll for completion.
+    private func openInBrowser(_ rec: RecordingSummary) {
+        do {
+            _ = try CLIClient.runDetached(["view", rec.name])
+        } catch {
+            rowError = error.localizedDescription
+        }
+    }
+}
