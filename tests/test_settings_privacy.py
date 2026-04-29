@@ -609,3 +609,27 @@ class TestJsonOutput:
         payload = _last_json_line(result.output)
         assert payload["ok"] is False
         assert "error" in payload
+
+    def test_envelope_keys_symmetric_success_and_error(self):
+        """Schema v2 (todo 011) — ``settings privacy --json`` must emit the
+        same key set on success AND error so an agent has one parser shape.
+        """
+        expected_keys = {
+            "ok", "schema_version", "changed", "field", "op", "value", "error",
+        }
+
+        success = _invoke(
+            "exclude_apps", "add", "com.example.symmetric", as_json=True,
+        )
+        success_payload = _last_json_line(success.output)
+        assert set(success_payload.keys()) == expected_keys
+        assert success_payload["error"] is None
+        assert success_payload["schema_version"] == 2
+
+        error = _invoke("no_such_field", "set", "value", as_json=True)
+        error_payload = _last_json_line(error.output)
+        assert set(error_payload.keys()) == expected_keys
+        assert error_payload["field"] == "no_such_field"
+        assert error_payload["op"] == "set"
+        assert error_payload["value"] == "value"
+        assert error_payload["changed"] is False

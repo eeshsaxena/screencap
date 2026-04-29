@@ -15,7 +15,12 @@ import sys
 # subprocess (chunk_processor, scrub_worker) emit events line-by-line as
 # SwiftUI's RecorderController.spawn expects. Set BEFORE any import that
 # might cache buffering state.
-os.environ.setdefault("PYTHONUNBUFFERED", "1")
+#
+# Force-set rather than `setdefault`: a stale `PYTHONUNBUFFERED=0` from a
+# parent shell or launchd plist would otherwise leave stderr block-buffered
+# and the SwiftUI line-reader would stall waiting for `started` until the
+# pipe buffer fills. Line-buffered stderr is non-negotiable on this CLI.
+os.environ["PYTHONUNBUFFERED"] = "1"
 
 import click
 from dotenv import load_dotenv
@@ -41,7 +46,7 @@ def _stdin_is_tty() -> bool:
 # payload tweak can be signalled without disturbing the event stream.
 _STATUS_SCHEMA_VERSION = 1
 _APPS_SCHEMA_VERSION = 1
-_SETTINGS_PRIVACY_SCHEMA_VERSION = 1
+_SETTINGS_PRIVACY_SCHEMA_VERSION = 2
 
 
 def _should_default_to_json() -> bool:
@@ -176,6 +181,16 @@ def _config_lock_path():
     return _DEFAULT_BASE / "run" / "config.lock"
 
 
+_PRIVACY_CONFIG_FLOCK_TIMEOUT_S = 5.0
+
+
+class PrivacyConfigLockTimeout(RuntimeError):
+    """Raised when the advisory flock on config.lock can't be acquired in
+    ``_PRIVACY_CONFIG_FLOCK_TIMEOUT_S``. Surfaces a stuck holder (e.g., a
+    crashed peer on NFS / sshfs) so ``screencap start`` and
+    ``screencap settings privacy`` fail fast instead of hanging."""
+
+
 @contextlib.contextmanager
 def _privacy_config_writer():
     """Read-modify-write the privacy config under an advisory flock (todo 025).
@@ -186,11 +201,20 @@ def _privacy_config_writer():
     silently drop one of the writes (todo 015). ``_save_config_atomic``
     provides write-atomicity, not lost-update protection — the flock does.
 
+    The acquire is non-blocking with a bounded retry loop (todo 006). A
+    blocking ``flock(LOCK_EX)`` could hang ``screencap start`` indefinitely
+    if a stale holder kept the lock — Python's ``fcntl.flock`` only raises
+    on signal interruption. We poll every 100ms up to
+    ``_PRIVACY_CONFIG_FLOCK_TIMEOUT_S``; on timeout we raise
+    ``PrivacyConfigLockTimeout`` so the caller can surface a clear error
+    rather than stalling silently.
+
     Yields the tomlkit doc. The caller mutates in-place; on context exit
     (without exception) the doc is atomically saved and the config cache is
     invalidated. On exception the file is left untouched.
     """
     import fcntl as _fcntl
+    import time as _time
 
     from screencap.config import _CONFIG_PATH, invalidate_config_cache
     from screencap.setup_wizard import _load_config_toml, _save_config_atomic
@@ -199,7 +223,22 @@ def _privacy_config_writer():
     lock_path.parent.mkdir(parents=True, exist_ok=True)
     fd = os.open(str(lock_path), os.O_RDWR | os.O_CREAT, 0o600)
     try:
-        _fcntl.flock(fd, _fcntl.LOCK_EX)  # blocking — wait for our turn
+        deadline = _time.monotonic() + _PRIVACY_CONFIG_FLOCK_TIMEOUT_S
+        while True:
+            try:
+                _fcntl.flock(fd, _fcntl.LOCK_EX | _fcntl.LOCK_NB)
+                break
+            except BlockingIOError:
+                if _time.monotonic() >= deadline:
+                    raise PrivacyConfigLockTimeout(
+                        f"Could not acquire {lock_path} within "
+                        f"{_PRIVACY_CONFIG_FLOCK_TIMEOUT_S:.0f}s — another "
+                        f"screencap process may be holding the lock or have "
+                        f"exited without releasing it. Re-run after the other "
+                        f"process completes, or remove {lock_path} if no "
+                        f"screencap process is active."
+                    )
+                _time.sleep(0.1)
         doc = _load_config_toml(_CONFIG_PATH)
         yield doc
         # Only reached on the no-exception path.
@@ -327,6 +366,36 @@ def _maybe_prompt_matrix_acknowledgement() -> None:
     # the prompt would never be displayed to a human anyway.
     parent_swiftui = _os.environ.get("SCREENCAP_PARENT") == "swiftui"
     interactive = _sys.stdin.isatty() and not env_ack and not parent_swiftui
+
+    # Defer the disclosure to SwiftUI via a structured stderr event (todo
+    # 013). Without this, the SwiftUI shell silently auto-acks the matrix
+    # tightening on every first start, and users only discover the
+    # behavior change when their Slack / Gmail recordings come back empty
+    # or their AI conversations land unredacted in the cloud. Emitting
+    # ``matrix_disclosure_required`` lets SwiftUI render a one-time modal
+    # the next time the app foregrounds; the integrator is expected to
+    # re-launch with ``SCREENCAP_MATRIX_ACK=true`` after the user clears
+    # the modal so this branch falls through to the flag write below.
+    if parent_swiftui and not env_ack:
+        try:
+            from screencap._stderr_events import (
+                EVENT_MATRIX_DISCLOSURE_REQUIRED,
+                emit_event as _emit_event,
+            )
+            _emit_event(
+                EVENT_MATRIX_DISCLOSURE_REQUIRED,
+                changes=[
+                    "chat_email_calendar_video_call_mask_window",
+                    "ai_assistant_browser_unverified",
+                ],
+                opt_out_command_examples=[
+                    "screencap settings privacy exclude_apps add com.openai.chat",
+                    "screencap settings privacy exclude_apps add com.anthropic.claudefordesktop",
+                    "screencap settings privacy exclude_apps add ai.perplexity.mac",
+                ],
+            )
+        except Exception:
+            pass
 
     if interactive:
         console.print(
@@ -754,6 +823,23 @@ def _legacy_start_recording(
         console.print(_RECORD_EXTRAS_MSG)
         raise SystemExit(1)
 
+    # Cross-language event contract (todo 016): the SwiftUI shell relies on
+    # ``started`` and ``stopped`` to drive UI state. The legacy path is a
+    # documented escape hatch (``SCREENCAP_LEGACY_START=1``) and does not
+    # build a SessionController, so the events are emitted here directly.
+    # Without these wires, a SwiftUI launch falling onto the legacy path
+    # would line-read silence then EOF and never transition out of
+    # "starting" state.
+    try:
+        from screencap._stderr_events import (
+            EVENT_STARTED,
+            emit_event as _emit_event_legacy,
+            resolve_claimant,
+        )
+        _emit_event_legacy(EVENT_STARTED, claimant=resolve_claimant())
+    except Exception:
+        pass
+
     disk_full = False
     _menubar_proc = None
     _menubar_state_file = None
@@ -851,6 +937,19 @@ def _legacy_start_recording(
         pass
 
     _kill_menubar(_menubar_proc, _menubar_state_file)
+
+    # Mirror the SessionController exit path so SwiftUI sees `stopped`
+    # before the process disappears (todo 016). Use ``os._exit`` after the
+    # emit so any background threads (chunk_processor watcher, post-
+    # processing pool) don't keep the interpreter alive.
+    try:
+        from screencap._stderr_events import (
+            EVENT_STOPPED,
+            emit_event as _emit_event_legacy,
+        )
+        _emit_event_legacy(EVENT_STOPPED, exit_code=0)
+    except Exception:
+        pass
     import os as _os
     _os._exit(0)
 
@@ -1733,13 +1832,19 @@ def stop(force):
         try:
             import psutil as _psutil
             proc_create_time = _psutil.Process(parent_pid).create_time()
-            # 1s tolerance: lock metadata's started_at is wall-clock from
-            # before fork; create_time is monotonic from after fork.
-            # On macOS the gap is sub-second; 1s is generous.
-            if proc_create_time > float(lock_started_at) + 1.0:
+            # 60s tolerance (todo 014): both lock_started_at (time.time at
+            # claim_lock) and psutil.Process.create_time on macOS are wall-
+            # clock — a forward NTP step between claim and stop (common on
+            # laptops resuming from sleep) would otherwise null the legit
+            # parent_pid and silently turn `screencap stop` into a no-op
+            # because find_orphaned_processes() returns [] while the parent
+            # lives. Real PID recycles after process death involve much
+            # larger elapsed times; 60s absorbs routine NTP jumps without
+            # weakening the guard's intent.
+            if proc_create_time > float(lock_started_at) + 60.0:
                 console.print(
                     f"[yellow]Warning:[/yellow] PID {parent_pid} appears recycled "
-                    f"(process started after the recording's lock metadata). "
+                    f"(process started >60s after the recording's lock metadata). "
                     f"Skipping direct kill; falling through to orphan scan."
                 )
                 parent_pid = None
@@ -3038,18 +3143,42 @@ def settings_privacy(field, op, value, as_json):
     # any future structured output.
     err_console = Console(stderr=True)
 
-    def _result(ok: bool, *, exit_code: int = 0, **payload_fields):
+    def _result(
+        ok: bool,
+        *,
+        exit_code: int = 0,
+        error: str | None = None,
+        changed: bool = False,
+    ):
         """Emit the result and exit. Prose to stderr; JSON to stdout when --json.
 
-        Uniform envelope (todo 020): every payload carries `ok` +
-        `schema_version` so a single SwiftUI / agent parser handles all
-        --json endpoints.
+        Symmetric envelope (todo 011, schema v2): every payload carries the
+        same key set on success AND error — ``ok``, ``schema_version``,
+        ``changed``, ``field``, ``op``, ``value``, ``error``. Absent values
+        serialize as JSON null. Eliminates the asymmetric branch agents had
+        to write under v1, where ``error`` was missing on success and
+        ``field``/``op``/``value`` were missing on error. Mirrors the
+        "every key always present" contract of ``status --json``.
+
+        ``field``, ``op``, and ``value`` are always populated from the
+        outer-scope arguments — the callsite never has to thread them
+        through. The post-normalization values are reported (e.g., scalar
+        ``parsed_value`` becomes a real bool / lowercased string), which
+        is what an agent will care about.
         """
         if as_json:
+            try:
+                _value: object = parsed_value if is_scalar else value
+            except NameError:
+                _value = value
             payload = {
                 "ok": ok,
                 "schema_version": _SETTINGS_PRIVACY_SCHEMA_VERSION,
-                **payload_fields,
+                "changed": bool(changed),
+                "field": field,
+                "op": op,
+                "value": _value,
+                "error": error,
             }
             click.echo(_json.dumps(payload))
         # Prose was already printed via err_console at the call site (or the
@@ -3124,7 +3253,7 @@ def settings_privacy(field, op, value, as_json):
 
     if changed:
         err_console.print(f"  [bold]privacy.{field}[/bold] {op} {value}")
-        _result(True, changed=True, field=field, op=op, value=value)
+        _result(True, changed=True)
 
 
 def _settings_privacy_apply(
@@ -3239,13 +3368,13 @@ def _settings_privacy_apply(
             if value in arr:
                 # Idempotent no-op
                 err_console.print(f"[dim]{field} already contains {value} — no change.[/dim]")
-                _result(True, changed=False, field=field, op=op, value=value)
+                _result(True, changed=False)
                 return False
             arr.append(value)
         else:  # remove
             if value not in arr:
                 err_console.print(f"[dim]{field} does not contain {value} — no change.[/dim]")
-                _result(True, changed=False, field=field, op=op, value=value)
+                _result(True, changed=False)
                 return False
             arr.remove(value)
     elif is_scalar:

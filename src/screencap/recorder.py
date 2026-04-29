@@ -1803,8 +1803,25 @@ def start_recording(
             "terminated_reason": _term_reason,
             "stop_reason_raw": _stop_reason or None,
         }))
-    except OSError:
-        pass
+    except OSError as exc:
+        # Failure here breaks the documented exit-code contract (todo 005
+        # / R6): SessionController.run() reads the absent sidecar, leaves
+        # _terminated_reason=None, and exits 0 even on permission_lost /
+        # disk_full. Surface as a structured event so SwiftUI can correlate
+        # the unexpected exit_code=0 with a real terminal-reason failure.
+        try:
+            from screencap._stderr_events import (
+                EVENT_TERMINATED_REASON_PERSIST_FAILED,
+                emit_event as _emit_event,
+            )
+            _emit_event(
+                EVENT_TERMINATED_REASON_PERSIST_FAILED,
+                error=str(exc),
+                capture_dir=str(capture_dir),
+                terminated_reason=_term_reason,
+            )
+        except Exception:
+            pass
 
     if _stop_reason == "disk_full":
         raise DiskFullError(

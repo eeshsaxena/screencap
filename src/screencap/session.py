@@ -788,8 +788,24 @@ class SessionController:
                 recording_started_at=time.time(),
                 recording_name=name,
             )
-        except Exception:
-            pass
+        except Exception as exc:
+            # Failure here means `status --json` will report
+            # is_recording=false for a live recording (todo 005 / R4) —
+            # SwiftUI's elapsed-time UI silently desynchronizes. Surface
+            # the failure as a structured stderr event so the integrator
+            # can react; recording continues either way.
+            try:
+                from screencap._stderr_events import (
+                    EVENT_LOCK_METADATA_WRITE_FAILED,
+                    emit_event as _emit_event,
+                )
+                _emit_event(
+                    EVENT_LOCK_METADATA_WRITE_FAILED,
+                    error=str(exc),
+                    capture_dir=str(capture_dir),
+                )
+            except Exception:
+                pass
 
         queues = _RWQueues(
             window_feed_q=multiprocessing.Queue(),

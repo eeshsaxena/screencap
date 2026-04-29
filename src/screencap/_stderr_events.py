@@ -10,7 +10,9 @@ The schema is the cross-language contract — see
 
 Active events (emitted in v1):
   started, lock_contended, recording_finalized, disk_full,
-  permission_lost, stopped, menubar_neutralized_by_env
+  permission_lost, stopped, menubar_neutralized_by_env,
+  matrix_disclosure_required, lock_metadata_write_failed,
+  terminated_reason_persist_failed
 
 Reserved events (schema documented, NOT emitted in v1 — todo 004):
   chunk_finalized — wiring deferred to a follow-up that touches
@@ -43,6 +45,10 @@ EVENT_DISK_FULL = "disk_full"
 EVENT_PERMISSION_LOST = "permission_lost"
 EVENT_STOPPED = "stopped"
 EVENT_MENUBAR_NEUTRALIZED_BY_ENV = "menubar_neutralized_by_env"
+# Disclosure / failure-surface events (todo 005, todo 013).
+EVENT_MATRIX_DISCLOSURE_REQUIRED = "matrix_disclosure_required"
+EVENT_LOCK_METADATA_WRITE_FAILED = "lock_metadata_write_failed"
+EVENT_TERMINATED_REASON_PERSIST_FAILED = "terminated_reason_persist_failed"
 
 
 def resolve_claimant() -> str:
@@ -90,4 +96,7 @@ __all__ = [
     "EVENT_PERMISSION_LOST",
     "EVENT_STOPPED",
     "EVENT_MENUBAR_NEUTRALIZED_BY_ENV",
+    "EVENT_MATRIX_DISCLOSURE_REQUIRED",
+    "EVENT_LOCK_METADATA_WRITE_FAILED",
+    "EVENT_TERMINATED_REASON_PERSIST_FAILED",
 ]
