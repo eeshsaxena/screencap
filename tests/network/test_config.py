@@ -15,7 +15,11 @@ class TestParseNetworkConfig:
     def test_empty_section_defaults(self):
         cfg = parse_network_config({})
         assert cfg.extra_blocklist == frozenset()
-        assert cfg.proxy_port == 8080
+        # Default 0 means auto-negotiate within 8080-8090. Setting a
+        # non-zero default would shadow the auto-negotiate branch in
+        # preflight_or_raise (a busy 8080 would hard-fail instead of
+        # falling back to 8081).
+        assert cfg.proxy_port == 0
         assert cfg.override_default_blocklist is False
         assert cfg.body_size_cap == 100_000
 
@@ -69,10 +73,17 @@ class TestParseNetworkConfig:
         ):
             parse_network_config({"extra_blocklist": ["ok.com", 42]})
 
-    @pytest.mark.parametrize("port", [0, 1023, 65536, 99999])
+    @pytest.mark.parametrize("port", [-1, 1023, 65536, 99999])
     def test_proxy_port_out_of_range(self, port):
+        # 0 is now a valid sentinel ("auto-negotiate") so it's tested
+        # separately below — only non-zero values outside [1024, 65535]
+        # should raise.
         with pytest.raises(InvalidNetworkConfigError, match="network.proxy_port"):
             parse_network_config({"proxy_port": port})
+
+    def test_proxy_port_zero_is_auto_negotiate(self):
+        cfg = parse_network_config({"proxy_port": 0})
+        assert cfg.proxy_port == 0
 
     def test_proxy_port_wrong_type(self):
         with pytest.raises(InvalidNetworkConfigError, match="must be an integer"):

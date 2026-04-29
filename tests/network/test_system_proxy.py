@@ -282,3 +282,41 @@ class TestServicesChangedMarker:
         )
         assert wrote is False
         assert not marker_path.exists()
+
+
+# ---------------------------------------------------------------------------
+# Regression: set -e prefix so non-final command failures propagate
+# (PR #156 review P1-1)
+# ---------------------------------------------------------------------------
+
+
+class TestSetEPropagation:
+    """Without `set -e`, joining commands with `;` masks all but the
+    last command's exit status. A failed mid-script `setwebproxy` would
+    be silently ignored if the trailing `setwebproxystate on` succeeds,
+    leaving system proxy state partially changed."""
+
+    def test_set_commands_have_set_e_prefix(self):
+        cmd = _build_set_commands("127.0.0.1", 8080, ["Wi-Fi", "Ethernet"])
+        assert cmd.startswith("set -e; "), (
+            f"missing 'set -e' prefix; without it, partial failures are "
+            f"masked. Got: {cmd[:60]!r}"
+        )
+
+    def test_restore_commands_have_set_e_prefix(self):
+        snapshot = {
+            "Wi-Fi": ServiceProxyState(
+                service_name="Wi-Fi",
+                web_proxy={"Enabled": "No", "Server": "", "Port": 0},
+                secure_web_proxy={"Enabled": "Yes", "Server": "x", "Port": 9},
+                bypass_domains=(),
+            ),
+        }
+        cmd = _build_restore_commands(snapshot)
+        assert cmd.startswith("set -e; "), (
+            f"missing 'set -e' prefix on restore; got: {cmd[:60]!r}"
+        )
+
+    def test_set_e_does_not_break_empty_services(self):
+        # Empty-services case still returns the no-op `:` shell command.
+        assert _build_set_commands("127.0.0.1", 8080, []) == ":"

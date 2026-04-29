@@ -207,6 +207,11 @@ def read_snapshot(path: Path) -> tuple[dict[str, ServiceProxyState], dict[str, A
 def _build_set_commands(host: str, port: int, services: list[str]) -> str:
     """Return the `;`-joined networksetup commands to enable proxy on each
     service. All values are shell-quoted to defeat injection via service names.
+
+    Prefixed with ``set -e`` so /bin/sh exits non-zero on the first failed
+    command. Without it, joining with ``;`` only propagates the LAST
+    command's exit status — a failed mid-script ``setwebproxy`` would be
+    silently masked by a successful ``setsecurewebproxystate`` later.
     """
     if not services:
         return ":"  # no-op shell command
@@ -219,7 +224,7 @@ def _build_set_commands(host: str, port: int, services: list[str]) -> str:
         cmds.append(f"{shlex.quote(_NETWORKSETUP)} -setsecurewebproxy {qsvc} {qhost} {qport}")
         cmds.append(f"{shlex.quote(_NETWORKSETUP)} -setwebproxystate {qsvc} on")
         cmds.append(f"{shlex.quote(_NETWORKSETUP)} -setsecurewebproxystate {qsvc} on")
-    return "; ".join(cmds)
+    return "set -e; " + "; ".join(cmds)
 
 
 def _run_admin_osascript(shell_command: str, prompt: str) -> None:
@@ -289,7 +294,9 @@ def _build_restore_commands(snapshot: dict[str, ServiceProxyState]) -> str:
             f"{shlex.quote(_NETWORKSETUP)} -setsecurewebproxystate {qsvc} "
             f"{'on' if was_sec_enabled else 'off'}"
         )
-    return "; ".join(cmds) if cmds else ":"
+    # Prefix with `set -e` so /bin/sh exits non-zero on first failure.
+    # See _build_set_commands for the same rationale.
+    return ("set -e; " + "; ".join(cmds)) if cmds else ":"
 
 
 def restore_all(snapshot: dict[str, ServiceProxyState], *, prompt: str | None = None) -> None:

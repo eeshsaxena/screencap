@@ -495,3 +495,63 @@ class TestFullUninstall:
             )
         # uninstall_ca called with None -- the helper falls back to CN-delete.
         uninstall_mock.assert_called_once_with(None)
+
+
+# ---------------------------------------------------------------------------
+# Regression: durable snapshot deletion uses recording_id from extra,
+# not path.stem (PR #156 review P2-2)
+# ---------------------------------------------------------------------------
+
+
+class TestDurableSnapshotCleanup:
+    """When restoring an orphan from a per-recording .proxy_state.json
+    path, the durable copy at ~/.screencap/proxy/snapshots/<rec_id>.proxy_state.json
+    must also be deleted. Deriving the recording_id from path.stem
+    yields '.proxy_state' (the per-recording filename has no rec_id),
+    so the durable copy survives and the next pre-flight scan
+    re-triggers restore — a second admin prompt for the same orphan.
+    """
+
+    def test_durable_copy_deleted_via_recording_id_from_extra(self, tmp_path: Path):
+        from screencap.network import lifecycle as life
+
+        rec_dir = tmp_path / "rec-A"
+        rec_dir.mkdir()
+        # Per-recording snapshot — stem is ".proxy_state" (no rec_id).
+        per_rec = rec_dir / ".proxy_state.json"
+        # Durable copy keyed by recording_id.
+        durable_dir = tmp_path / "snapshots"
+        durable_dir.mkdir()
+        durable = durable_dir / "rec-A.proxy_state.json"
+
+        snapshot = {
+            "Wi-Fi": ServiceProxyState(
+                service_name="Wi-Fi",
+                web_proxy={"Enabled": "No", "Server": "", "Port": 0},
+                secure_web_proxy={"Enabled": "No", "Server": "", "Port": 0},
+                bypass_domains=(),
+            )
+        }
+        extra = {
+            "worker_pid": 999999,  # dead
+            "worker_create_time": 1.0,
+            "worker_cmdline_tail": "x",
+            "recording_dir": str(rec_dir),
+            "recording_id": "rec-A",
+        }
+        write_snapshot(snapshot, per_rec, extra=extra)
+        write_snapshot(snapshot, durable, extra=extra)
+
+        with patch("subprocess.run", return_value=_completed()):
+            life.restore_orphaned_proxy_state(
+                sentinel_path=tmp_path / "sentinel-missing",
+                durable_dir=durable_dir,
+                recordings_dirs=[tmp_path],
+            )
+
+        # BOTH copies removed -- the bug was that durable survived
+        # because recording_id was derived from per_rec.stem (=".proxy_state").
+        assert not per_rec.exists(), "per-recording snapshot not deleted"
+        assert not durable.exists(), (
+            "durable copy survived — next scan would re-prompt for the same orphan"
+        )

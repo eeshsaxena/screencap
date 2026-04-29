@@ -37,7 +37,11 @@ class NetworkConfig:
     V1 fields:
         extra_blocklist: Lowercase host suffixes (frozenset). Suffix-match
             semantics mirror :attr:`PrivacyConfig.mask_domains`.
-        proxy_port: TCP port the local mitmproxy listens on.
+        proxy_port: TCP port the local mitmproxy listens on. Default ``0``
+            means "auto-negotiate the first free port in 8080-8090". Set
+            to a specific value (1024-65535) to pin a port; if pinned and
+            busy, pre-flight aborts with an actionable error rather than
+            falling back.
         override_default_blocklist: When True, the curated
             :data:`DEFAULT_BLOCKLIST` is NOT applied; only ``extra_blocklist``
             and ``privacy.mask_domains`` are honored (plus the IP-literal
@@ -49,7 +53,7 @@ class NetworkConfig:
     """
 
     extra_blocklist: frozenset[str] = field(default_factory=frozenset)
-    proxy_port: int = 8080
+    proxy_port: int = 0  # 0 = auto-negotiate within 8080-8090
     override_default_blocklist: bool = False
     body_size_cap: int = 100_000
 
@@ -89,18 +93,18 @@ def parse_network_config(section: dict | None) -> NetworkConfig:
             )
     extra_blocklist = frozenset(h.lower() for h in raw_blocklist)
 
-    # proxy_port
-    raw_port = section.get("proxy_port", 8080)
+    # proxy_port (0 = auto-negotiate; non-zero = pin to that exact port)
+    raw_port = section.get("proxy_port", 0)
     # NB: bool is a subclass of int — reject it explicitly so a stray
     # ``proxy_port = true`` doesn't slip through.
     if not isinstance(raw_port, int) or isinstance(raw_port, bool):
         raise InvalidNetworkConfigError(
             f"network.proxy_port must be an integer, got {type(raw_port).__name__}"
         )
-    if not (_PROXY_PORT_MIN <= raw_port <= _PROXY_PORT_MAX):
+    if raw_port != 0 and not (_PROXY_PORT_MIN <= raw_port <= _PROXY_PORT_MAX):
         raise InvalidNetworkConfigError(
-            f"network.proxy_port must be in [{_PROXY_PORT_MIN}, "
-            f"{_PROXY_PORT_MAX}], got {raw_port}"
+            f"network.proxy_port must be 0 (auto-negotiate) or in "
+            f"[{_PROXY_PORT_MIN}, {_PROXY_PORT_MAX}], got {raw_port}"
         )
 
     # override_default_blocklist

@@ -455,9 +455,17 @@ def restore_orphaned_proxy_state(
             path.unlink()
         except FileNotFoundError:
             pass
-        # Durable copy
-        recording_id = path.stem.replace(".proxy_state", "")
-        durable_copy = (durable_dir or _DEFAULT_PROXY_SNAPSHOTS_DIR) / f"{recording_id}.proxy_state.json"
+        # Durable copy. Use the recording_id from `extra` (the source of
+        # truth written by _setup_network_capture); deriving from
+        # `path.stem` is wrong for per-recording paths -- their stem is
+        # ".proxy_state" (no recording_id), so the durable copy would
+        # not be found and the next pre-flight scan would re-trigger
+        # restore for the same orphan, prompting the user a second time.
+        recording_id = extra.get("recording_id") if extra else None
+        if recording_id:
+            durable_copy = (durable_dir or _DEFAULT_PROXY_SNAPSHOTS_DIR) / f"{recording_id}.proxy_state.json"
+        else:
+            durable_copy = path  # already deleted above; unlink below is a no-op
         try:
             durable_copy.unlink()
         except FileNotFoundError:

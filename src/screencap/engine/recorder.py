@@ -2498,78 +2498,61 @@ def _setup_network_capture(
     worker_create_time = _net_lifecycle.proc_create_time(worker_pid)
     worker_cmdline_tail = _net_lifecycle.cmdline_tail(worker_pid)
 
-    # (1) Snapshot system proxy BEFORE any mutation. Also enumerate active
-    # services for the stop-time coverage-gap diff.
-    services_at_start = _net_proxy.list_active_services()
-    snapshot = _net_proxy.snapshot_all()
-    snapshot_extra = {
-        "recording_id": str(recording.id),
-        "recording_dir": str(capture_dir_path),
-        "snapshot_path": str(snapshot_path),
-        "worker_pid": worker_pid,
-        "worker_create_time": worker_create_time,
-        "worker_cmdline_tail": worker_cmdline_tail,
-        "started_at": started_at,
-        "port": proxy_port,
-    }
-    _net_proxy.write_snapshot(snapshot, snapshot_path, extra=snapshot_extra)
-    _net_proxy.write_snapshot(snapshot, durable_snapshot_path, extra=snapshot_extra)
+    # Resources that need cleanup on partial-setup failure. The
+    # caller (`record()`) only runs `_teardown_network_capture` when
+    # `_network_state` is non-None, which only happens on full success.
+    # Anything spawned, written, or flipped before the function returns
+    # must be undone here on exception.
+    snapshot: dict | None = None
+    services_at_start: list[str] = []
+    network_event_writer: multiprocessing.Process | None = None
+    network_write_q: sq.SynchronizedQueue | None = None
+    proxy_proc = None
+    proxy_out_q = None
+    sentinel_written = False
+    handoff_written = False
+    proxy_flipped = False
+    snapshots_written = False
 
-    # (2) Network write queue + writer process.
-    network_write_q = sq.SynchronizedQueue(maxsize=100)  # _META_QUEUE_SIZE
-    writer_started = task_started_events.setdefault(
-        "network_event_writer", multiprocessing.Event()
-    )
-    network_event_writer = multiprocessing.Process(
-        target=utils.WrapStdout(write_network_events),
-        args=(
-            network_write_q,
-            num_network_events,
-            None,  # perf_q — currently unused for network writer
-            recording,
-            db_path,
-            terminate_processing,
-            writer_started,
-        ),
-        kwargs={
-            "config_overrides": config_overrides,
-            "flush_requested": flush_requested,
-            "flush_ack_counter": flush_ack_counter,
-        },
-        name="network_event_writer",
-    )
-    network_event_writer.start()
-    task_by_name["network_event_writer"] = network_event_writer
-
-    # (3) Spawn proxy mp.Process via spawn context.
-    spawn_ctx = multiprocessing.get_context("spawn")
-    proxy_out_q = spawn_ctx.Queue(maxsize=1000)
-    started_event = spawn_ctx.Event()
-    proxy_proc = spawn_ctx.Process(
-        target=run_proxy,
-        args=(
-            proxy_out_q,
-            recording.id,
-            network_config,
-            privacy_config,
-            proxy_port,
-            proxy_log_path,
-            started_event,
-            confdir,
-        ),
-        name="network_proxy",
-    )
-    proxy_proc.start()
-    proxy_pid = proxy_proc.pid
-
-    # (4) Wait for proxy ready.
-    if not started_event.wait(timeout=10.0):
-        logger.error("network proxy failed to start within 10s")
-        try:
-            proxy_proc.terminate()
-            proxy_proc.join(timeout=5)
-        finally:
-            # Snapshot exists but no mutation occurred — clean up.
+    def _cleanup_partial() -> None:
+        # Undo in reverse order. Each step is best-effort + idempotent.
+        if proxy_flipped and snapshot is not None:
+            try:
+                _net_proxy.restore_all(snapshot)
+            except Exception:  # noqa: BLE001
+                logger.exception(
+                    "_setup_network_capture cleanup: restore_all failed",
+                )
+        if sentinel_written:
+            _net_lifecycle.delete_sentinel()
+        if handoff_written:
+            _net_lifecycle.delete_network_child_handoff(capture_dir_path)
+        if proxy_proc is not None:
+            try:
+                if proxy_proc.is_alive():
+                    proxy_proc.terminate()
+                    proxy_proc.join(timeout=5)
+                    if proxy_proc.is_alive():
+                        proxy_proc.kill()
+                        proxy_proc.join(timeout=2)
+            except Exception:  # noqa: BLE001
+                logger.exception(
+                    "_setup_network_capture cleanup: proxy_proc terminate failed",
+                )
+        if network_event_writer is not None:
+            try:
+                terminate_processing.set()
+                if network_event_writer.is_alive():
+                    network_event_writer.join(timeout=5)
+                    if network_event_writer.is_alive():
+                        network_event_writer.terminate()
+                        network_event_writer.join(timeout=2)
+                task_by_name.pop("network_event_writer", None)
+            except Exception:  # noqa: BLE001
+                logger.exception(
+                    "_setup_network_capture cleanup: writer terminate failed",
+                )
+        if snapshots_written:
             try:
                 snapshot_path.unlink()
             except FileNotFoundError:
@@ -2578,49 +2561,121 @@ def _setup_network_capture(
                 durable_snapshot_path.unlink()
             except FileNotFoundError:
                 pass
-        terminate_processing.set()
-        raise RuntimeError(
-            "network proxy did not become ready within 10s. See "
-            f"{proxy_log_path} for details."
-        )
 
-    proxy_create_time = _net_lifecycle.proc_create_time(proxy_pid)
-    proxy_cmdline_tail = _net_lifecycle.cmdline_tail(proxy_pid)
-
-    # (5) Sentinel + handoff atomic writes BEFORE flipping system proxy.
-    _net_lifecycle.write_sentinel(
-        worker_pid=worker_pid,
-        worker_create_time=worker_create_time,
-        worker_cmdline_tail=worker_cmdline_tail,
-        proxy_pid=proxy_pid,
-        proxy_create_time=proxy_create_time,
-        proxy_cmdline_tail=proxy_cmdline_tail,
-        started_at=started_at,
-        port=proxy_port,
-        recording_dir=str(capture_dir_path),
-        snapshot_path=str(snapshot_path),
-    )
-    _net_lifecycle.write_network_child_handoff(
-        capture_dir_path,
-        proxy_pid=proxy_pid,
-        worker_pid=worker_pid,
-        started_at=started_at,
-    )
-
-    # (6) Signal SessionController to register the proxy PID.
-    if handoff_ready_event is not None:
-        handoff_ready_event.set()
-
-    # (7) Flip system proxy via single osascript admin call.
     try:
+        # (1) Snapshot system proxy BEFORE any mutation. Also enumerate active
+        # services for the stop-time coverage-gap diff.
+        services_at_start = _net_proxy.list_active_services()
+        snapshot = _net_proxy.snapshot_all()
+        snapshot_extra = {
+            "recording_id": str(recording.id),
+            "recording_dir": str(capture_dir_path),
+            "snapshot_path": str(snapshot_path),
+            "worker_pid": worker_pid,
+            "worker_create_time": worker_create_time,
+            "worker_cmdline_tail": worker_cmdline_tail,
+            "started_at": started_at,
+            "port": proxy_port,
+        }
+        _net_proxy.write_snapshot(snapshot, snapshot_path, extra=snapshot_extra)
+        _net_proxy.write_snapshot(snapshot, durable_snapshot_path, extra=snapshot_extra)
+        snapshots_written = True
+
+        # (2) Network write queue + writer process.
+        network_write_q = sq.SynchronizedQueue(maxsize=100)  # _META_QUEUE_SIZE
+        writer_started = task_started_events.setdefault(
+            "network_event_writer", multiprocessing.Event()
+        )
+        network_event_writer = multiprocessing.Process(
+            target=utils.WrapStdout(write_network_events),
+            args=(
+                network_write_q,
+                num_network_events,
+                None,  # perf_q — currently unused for network writer
+                recording,
+                db_path,
+                terminate_processing,
+                writer_started,
+            ),
+            kwargs={
+                "config_overrides": config_overrides,
+                "flush_requested": flush_requested,
+                "flush_ack_counter": flush_ack_counter,
+            },
+            name="network_event_writer",
+        )
+        network_event_writer.start()
+        task_by_name["network_event_writer"] = network_event_writer
+
+        # (3) Spawn proxy mp.Process via spawn context.
+        spawn_ctx = multiprocessing.get_context("spawn")
+        proxy_out_q = spawn_ctx.Queue(maxsize=1000)
+        started_event = spawn_ctx.Event()
+        proxy_proc = spawn_ctx.Process(
+            target=run_proxy,
+            args=(
+                proxy_out_q,
+                recording.id,
+                network_config,
+                privacy_config,
+                proxy_port,
+                proxy_log_path,
+                started_event,
+                confdir,
+            ),
+            name="network_proxy",
+        )
+        proxy_proc.start()
+        proxy_pid = proxy_proc.pid
+
+        # (4) Wait for proxy ready.
+        if not started_event.wait(timeout=10.0):
+            logger.error("network proxy failed to start within 10s")
+            raise RuntimeError(
+                "network proxy did not become ready within 10s. See "
+                f"{proxy_log_path} for details."
+            )
+
+        proxy_create_time = _net_lifecycle.proc_create_time(proxy_pid)
+        proxy_cmdline_tail = _net_lifecycle.cmdline_tail(proxy_pid)
+
+        # (5) Sentinel + handoff atomic writes BEFORE flipping system proxy.
+        _net_lifecycle.write_sentinel(
+            worker_pid=worker_pid,
+            worker_create_time=worker_create_time,
+            worker_cmdline_tail=worker_cmdline_tail,
+            proxy_pid=proxy_pid,
+            proxy_create_time=proxy_create_time,
+            proxy_cmdline_tail=proxy_cmdline_tail,
+            started_at=started_at,
+            port=proxy_port,
+            recording_dir=str(capture_dir_path),
+            snapshot_path=str(snapshot_path),
+        )
+        sentinel_written = True
+        _net_lifecycle.write_network_child_handoff(
+            capture_dir_path,
+            proxy_pid=proxy_pid,
+            worker_pid=worker_pid,
+            started_at=started_at,
+        )
+        handoff_written = True
+
+        # (6) Signal SessionController to register the proxy PID.
+        if handoff_ready_event is not None:
+            handoff_ready_event.set()
+
+        # (7) Flip system proxy via single osascript admin call. The
+        # except below is folded into the outer try/except so the
+        # cleanup helper can also undo the proxy_flipped step.
         _net_proxy.set_proxy_all("127.0.0.1", proxy_port, services_at_start)
-    except _net_proxy.SystemProxyError:
-        # Restore from snapshot — leave the user's network in a working state.
-        try:
-            _net_proxy.restore_all(snapshot)
-        except Exception:  # noqa: BLE001
-            logger.exception("system proxy restore after failed set also failed")
+        proxy_flipped = True
+    except BaseException:
+        # Includes KeyboardInterrupt during `started_event.wait` and any
+        # SystemProxyError from set_proxy_all. Cleanup undoes whatever
+        # was set up before re-raising.
         terminate_processing.set()
+        _cleanup_partial()
         raise
 
     # (8) Spawn reader thread (drains proxy out_q -> network_write_q).
@@ -2704,15 +2759,8 @@ def _network_event_reader_loop(
         drop_hosts = set()
         drop_window_start_ns = None
 
-    while not terminate_event.is_set():
-        try:
-            event = out_q.get(timeout=0.05)
-        except queue.Empty:
-            # Tick the drop-burst window even when no events are flowing.
-            if drop_window_start_ns is not None:
-                if time.time_ns() - drop_window_start_ns >= 1_000_000_000:
-                    _flush_drop_burst()
-            continue
+    def _process_event(event: object) -> None:
+        nonlocal drop_count, drop_window_start_ns
         if isinstance(event, NetworkPinFailureEvent):
             host = getattr(event, "host", "?")
             with seen_pin_lock:
@@ -2722,7 +2770,7 @@ def _network_event_reader_loop(
                         f"[yellow]Tunneled {host} (cert pinning detected; subsequent "
                         f"traffic will pass through unobserved).[/yellow]"
                     )
-            continue
+            return
         try:
             network_write_q.put(event, timeout=0.05)
         except queue.Full:
@@ -2731,7 +2779,39 @@ def _network_event_reader_loop(
             if drop_window_start_ns is None:
                 drop_window_start_ns = time.time_ns()
 
-    # Final flush on terminate.
+    # Main phase: drain out_q until terminate is set.
+    while not terminate_event.is_set():
+        try:
+            event = out_q.get(timeout=0.05)
+        except queue.Empty:
+            # Tick the drop-burst window even when no events are flowing.
+            if drop_window_start_ns is not None:
+                if time.time_ns() - drop_window_start_ns >= 1_000_000_000:
+                    _flush_drop_burst()
+            continue
+        _process_event(event)
+
+    # Drain phase: terminate is set, but the proxy mp.Process may still
+    # be flushing its final events into out_q (the engine teardown
+    # restores system proxy first, THEN terminates the proxy). Without
+    # this, events the addon already pushed but the reader hasn't
+    # consumed get silently dropped — the writer's
+    # `not write_q.empty()` drain guarantee is upstream of the bottleneck.
+    # mp.Queue.empty() is unreliable across processes, so use empty-poll
+    # counting: bail out after `_DRAIN_EMPTY_THRESHOLD` consecutive empty
+    # gets (~250ms of true emptiness).
+    _DRAIN_EMPTY_THRESHOLD = 5
+    empty_polls = 0
+    while empty_polls < _DRAIN_EMPTY_THRESHOLD:
+        try:
+            event = out_q.get(timeout=0.05)
+        except queue.Empty:
+            empty_polls += 1
+            continue
+        empty_polls = 0
+        _process_event(event)
+
+    # Final flush of any pending drop-burst aggregation.
     _flush_drop_burst()
 
 
