@@ -135,3 +135,7 @@ Two-layer privacy enforcement: capture-time filtering + post-recording scrubbing
 - SQLite access in the `screencap` layer uses raw `sqlite3`, not SQLAlchemy.
 - Recording dirs live at `~/.screencap/recordings/<name>/`.
 - Tests use `click.testing.CliRunner`, `unittest.mock.patch`, and `tmp_path` fixtures with inline SQLite setup.
+
+## Documented Solutions
+
+`docs/solutions/` — documented solutions to past problems (bugs, best practices, workflow patterns), organized by category with YAML frontmatter (`module`, `tags`, `problem_type`). Relevant when implementing or debugging in documented areas.
