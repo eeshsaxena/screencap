@@ -728,6 +728,157 @@ def test_export_single_by_name_with_downloads_fallback(tmp_path, monkeypatch):
     assert (dl_dir / "my-dl" / "events.jsonl").exists()
 
 
+# --- export with V1.5 NetworkScrubPipeline tests ---
+
+
+def _create_v15_export_db(rec_dir):
+    """Create a recording.db with a NetworkEventMeta row (V1.5 vintage)."""
+    from screencap.engine.db import create_db, crud
+    from screencap.network import crypto
+
+    rec_dir.mkdir(parents=True, exist_ok=True)
+    engine, Session = create_db(str(rec_dir / "recording.db"))
+    session = Session()
+    rec = crud.insert_recording(session, {
+        "timestamp": 1000.0, "platform": "darwin",
+        "monitor_width": 1920, "monitor_height": 1080,
+        "pixel_ratio": 2.0, "double_click_interval_seconds": 0.5,
+        "double_click_distance_pixels": 5.0,
+    })
+    crud.insert_action_event(session, rec, 1000.5, {
+        "name": "click", "mouse_x": 100.0, "mouse_y": 200.0,
+        "mouse_button_name": "left", "mouse_pressed": True,
+    })
+    crud.insert_action_event(session, rec, 1000.55, {
+        "name": "click", "mouse_x": 100.0, "mouse_y": 200.0,
+        "mouse_button_name": "left", "mouse_pressed": False,
+    })
+    # Insert a NetworkEventMeta row to simulate a V1.5 recording.
+    kek = crypto._generate_kek()
+    dek = crypto.generate_dek()
+    wrapped, nonce = crypto.wrap_dek(dek, kek)
+    crud.insert_network_event_meta(
+        session,
+        recording_id=rec.id,
+        dek_wrapped=wrapped,
+        dek_nonce=nonce,
+    )
+    session.close()
+    engine.dispose()
+    return kek
+
+
+def test_export_with_encrypted_recording_constructs_pipeline(
+    tmp_path, monkeypatch,
+):
+    """When the recording has a NetworkEventMeta row, _export_one
+    constructs a NetworkScrubPipeline and forwards it to export_recording."""
+    rec_dir = tmp_path / "recordings"
+    _create_v15_export_db(rec_dir / "v15-rec")
+    monkeypatch.setenv("SCREENCAP_RECORDINGS_DIR", str(rec_dir))
+
+    runner = CliRunner()
+
+    # Stub out the actual NetworkScrubPipeline so we don't need the
+    # real Keychain (and to capture the construction args). Patch the
+    # symbol where it's looked up inside _export_one (re-imported there
+    # from screencap.network.export_pipeline).
+    captured = {}
+
+    class _StubPipeline:
+        def __init__(self, db_path, recording_id):
+            captured["db_path"] = db_path
+            captured["recording_id"] = recording_id
+
+        def decrypt_and_scrub(self, evt):  # pragma: no cover - unused
+            return evt
+
+    with (
+        mock.patch(
+            "screencap.network.export_pipeline.NetworkScrubPipeline",
+            _StubPipeline,
+        ),
+        mock.patch(
+            "screencap.exporter.export_recording",
+            return_value=2,
+        ) as mock_export,
+    ):
+        result = runner.invoke(cli, ["export", "v15-rec"])
+
+    assert result.exit_code == 0, result.output
+    assert "db_path" in captured, "Pipeline was not constructed"
+    assert captured["db_path"].endswith("recording.db")
+    # Pipeline forwarded as the new kwarg on export_recording.
+    mock_export.assert_called_once()
+    kwargs = mock_export.call_args.kwargs
+    assert "network_scrub_pipeline" in kwargs
+    assert kwargs["network_scrub_pipeline"] is not None
+
+
+def test_export_with_v1_recording_no_pipeline(tmp_path, monkeypatch):
+    """V1-vintage recording (no NetworkEventMeta row) → no pipeline
+    construction; export_recording receives ``None``."""
+    rec_dir = tmp_path / "recordings"
+    _create_export_db(rec_dir / "v1-rec")  # No meta row
+    monkeypatch.setenv("SCREENCAP_RECORDINGS_DIR", str(rec_dir))
+
+    runner = CliRunner()
+
+    construction_calls = []
+
+    class _StubPipeline:
+        def __init__(self, db_path, recording_id):
+            construction_calls.append((db_path, recording_id))
+
+        def decrypt_and_scrub(self, evt):  # pragma: no cover - unused
+            return evt
+
+    with (
+        mock.patch(
+            "screencap.network.export_pipeline.NetworkScrubPipeline",
+            _StubPipeline,
+        ),
+        mock.patch(
+            "screencap.exporter.export_recording",
+            return_value=2,
+        ) as mock_export,
+    ):
+        result = runner.invoke(cli, ["export", "v1-rec"])
+
+    assert result.exit_code == 0, result.output
+    assert construction_calls == [], (
+        "NetworkScrubPipeline must NOT be constructed for V1-vintage "
+        "recordings (no NetworkEventMeta row)"
+    )
+    kwargs = mock_export.call_args.kwargs
+    assert kwargs.get("network_scrub_pipeline") is None
+
+
+def test_export_kek_unavailable_fails_loud(tmp_path, monkeypatch):
+    """When KEK is unavailable (Keychain failure), CLI export exits
+    non-zero with the actionable regenerate message."""
+    from screencap.network.export_pipeline import KekUnavailableError
+
+    rec_dir = tmp_path / "recordings"
+    _create_v15_export_db(rec_dir / "v15-rec")
+    monkeypatch.setenv("SCREENCAP_RECORDINGS_DIR", str(rec_dir))
+
+    runner = CliRunner()
+
+    with mock.patch(
+        "screencap.network.export_pipeline.NetworkScrubPipeline",
+        side_effect=KekUnavailableError("keychain locked"),
+    ):
+        result = runner.invoke(cli, ["export", "v15-rec"])
+
+    assert result.exit_code == 1, result.output
+    # The actionable error message must mention the regenerate path.
+    # rich's console wraps long lines, so collapse whitespace before matching.
+    flattened = " ".join(result.output.split())
+    assert "Cannot decrypt network bodies" in flattened
+    assert "screencap network uninstall" in flattened
+
+
 # --- upload auto-export tests ---
 
 

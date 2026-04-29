@@ -863,3 +863,127 @@ class TestNetworkRowsParameter:
         result = unified_export_events([], [], network_rows=rows)
         assert isinstance(result, _Iterator)
         assert not isinstance(result, list)
+
+
+# ---------------------------------------------------------------------------
+# V1.5: network_scrub_pipeline kwarg
+# ---------------------------------------------------------------------------
+
+
+class _RecordingFakePipeline:
+    """Test double for NetworkScrubPipeline.
+
+    Records the capture-side events it receives and returns a marker
+    payload via ``decrypt_and_scrub`` so the test can assert the
+    pipeline was invoked AND that its output reaches the iterator.
+    """
+
+    def __init__(self):
+        self.calls: list = []
+
+    def decrypt_and_scrub(self, capture_event):
+        self.calls.append(capture_event)
+        # Return an export-side event with a marker body_text. The
+        # capture-side event types are mapped to export-side classes
+        # by the real pipeline; this fake just builds the matching
+        # one so the iterator output is well-typed.
+        from screencap.engine.events import (
+            NetworkRequestEvent,
+            NetworkRequestExportEvent,
+            NetworkResponseEvent,
+            NetworkResponseExportEvent,
+            NetworkWebSocketFrameEvent,
+            NetworkWebSocketFrameExportEvent,
+            NetworkWebSocketUpgradeEvent,
+            NetworkWebSocketUpgradeExportEvent,
+        )
+
+        if isinstance(capture_event, NetworkRequestEvent):
+            cls = NetworkRequestExportEvent
+        elif isinstance(capture_event, NetworkResponseEvent):
+            cls = NetworkResponseExportEvent
+        elif isinstance(capture_event, NetworkWebSocketUpgradeEvent):
+            cls = NetworkWebSocketUpgradeExportEvent
+        elif isinstance(capture_event, NetworkWebSocketFrameEvent):
+            cls = NetworkWebSocketFrameExportEvent
+        else:
+            raise ValueError(f"unexpected: {type(capture_event)}")
+
+        data = capture_event.model_dump()
+        for key in ("body_ciphertext", "body_nonce", "body_aad"):
+            data.pop(key, None)
+        data["body_text"] = "FAKE-SCRUBBED"
+        return cls(**data)
+
+
+class TestNetworkScrubPipelineKwarg:
+    """``network_scrub_pipeline`` is consumed exactly when supplied."""
+
+    def test_pipeline_applied_to_ciphertext_rows(self):
+        """When a pipeline is provided, network rows are converted to
+        export-side events via the pipeline."""
+        from screencap.engine.events import NetworkRequestExportEvent
+
+        pipeline = _RecordingFakePipeline()
+        rows = [_network_row(1.0, kind="request", host="x.example")]
+        result = list(unified_export_events(
+            [], [],
+            network_rows=rows,
+            network_scrub_pipeline=pipeline,
+        ))
+        assert len(pipeline.calls) == 1, (
+            "Pipeline.decrypt_and_scrub was not invoked for the row"
+        )
+        assert len(result) == 1
+        # The event in the iterator is the export-side class, not the
+        # capture-side class -- ciphertext can never reach JSONL by
+        # construction.
+        assert isinstance(result[0], NetworkRequestExportEvent)
+        assert result[0].body_text == "FAKE-SCRUBBED"
+
+    def test_pipeline_none_keeps_capture_side_behaviour(self):
+        """Explicit ``network_scrub_pipeline=None`` → capture-side
+        events as today (V1 behaviour preserved)."""
+        from screencap.engine.events import NetworkRequestEvent
+
+        rows = [_network_row(1.0, kind="request", host="x.example")]
+        result = list(unified_export_events(
+            [], [],
+            network_rows=rows,
+            network_scrub_pipeline=None,
+        ))
+        assert len(result) == 1
+        assert isinstance(result[0], NetworkRequestEvent), (
+            "Without a pipeline, the iterator must yield capture-side "
+            "events identical to today's V1 behaviour."
+        )
+
+    def test_drop_burst_passes_through_pipeline_unchanged(self):
+        """``NetworkDropBurstEvent`` has no ciphertext fields and
+        skips the pipeline -- the pipeline must NOT be invoked for it
+        and the drop-burst row must still surface in the iterator."""
+        from screencap.engine.events import NetworkDropBurstEvent
+
+        pipeline = _RecordingFakePipeline()
+        rows = [
+            _network_row(
+                1.0,
+                kind="drop_burst",
+                details_json='{"dropped_count": 3, "hosts_affected": ["x.example"], "source": "addon"}',
+                # drop_burst rows never carry method/url/host fields.
+                method=None,
+                url=None,
+                host="",
+            ),
+        ]
+        result = list(unified_export_events(
+            [], [],
+            network_rows=rows,
+            network_scrub_pipeline=pipeline,
+        ))
+        assert pipeline.calls == [], (
+            "drop_burst events must NOT be routed through the scrub "
+            "pipeline (they have no body to decrypt)."
+        )
+        assert len(result) == 1
+        assert isinstance(result[0], NetworkDropBurstEvent)

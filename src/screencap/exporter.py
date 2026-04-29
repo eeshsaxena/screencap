@@ -15,6 +15,7 @@ from screencap import __version__
 if TYPE_CHECKING:  # pragma: no cover - import-only typing hint
     from screencap.engine.capture import CaptureSession
     from screencap.engine.events import BaseEvent, WindowSwitchEvent
+    from screencap.network.export_pipeline import NetworkScrubPipeline
 
 logger = logging.getLogger(__name__)
 
@@ -39,6 +40,8 @@ def export_recording(
     output_path: str | None,
     exclude_moves: bool,
     metadata: dict | None = None,
+    *,
+    network_scrub_pipeline: "NetworkScrubPipeline | None" = None,
 ) -> int:
     """Export a single recording to JSONL.
 
@@ -48,6 +51,19 @@ def export_recording(
 
     When *output_path* is a file path, uses atomic write (write to .tmp,
     rename on success).  When *output_path* is None, writes to stdout.
+
+    Args:
+        recording_dir: Path to recording directory.
+        output_path: Output file path or None for stdout.
+        exclude_moves: When True, ``mouse.move`` events are dropped.
+        metadata: Optional ``_meta`` header dict; built via
+            :func:`build_export_metadata` by callers.
+        network_scrub_pipeline: Optional V1.5
+            :class:`NetworkScrubPipeline`. Forwarded into
+            :meth:`CaptureSession.export_events` so encrypted bodies
+            (when network rows are wired in V1.75) are decrypted +
+            scrubbed before reaching JSONL. ``None`` (the default)
+            preserves V1 behaviour.
     """
     from screencap.engine import Capture
 
@@ -61,13 +77,25 @@ def export_recording(
     with capture_ctx as capture:
         if output_path is None:
             # Write to stdout — no atomic write needed
-            count = _write_events(capture, sys.stdout, exclude_moves, metadata)
+            count = _write_events(
+                capture,
+                sys.stdout,
+                exclude_moves,
+                metadata,
+                network_scrub_pipeline=network_scrub_pipeline,
+            )
         else:
             # Atomic write: .tmp → rename
             tmp_path = output_path + ".tmp"
             try:
                 with open(tmp_path, "w") as f:
-                    count = _write_events(capture, f, exclude_moves, metadata)
+                    count = _write_events(
+                        capture,
+                        f,
+                        exclude_moves,
+                        metadata,
+                        network_scrub_pipeline=network_scrub_pipeline,
+                    )
                 os.rename(tmp_path, output_path)
             except BaseException:
                 if os.path.exists(tmp_path):
@@ -151,6 +179,8 @@ def _write_events(
     exclude_moves: bool,
     metadata: dict | None,
     privacy_filter: Callable[[WindowSwitchEvent], WindowSwitchEvent | None] | None = None,
+    *,
+    network_scrub_pipeline: "NetworkScrubPipeline | None" = None,
 ) -> int:
     """Stream events to an open file handle. Returns event count.
 
@@ -166,6 +196,13 @@ def _write_events(
         metadata: Optional metadata dict for header line.
         privacy_filter: Optional callable(WindowSwitchEvent) -> WindowSwitchEvent | None.
             Returns None to suppress the event, or a modified event (e.g. masked title).
+        network_scrub_pipeline: Optional V1.5 ``NetworkScrubPipeline``.
+            Forwarded into :meth:`CaptureSession.export_events` so
+            encrypted network bodies are decrypted + scrubbed at the
+            row-conversion boundary (no-op while V1's
+            ``Capture.export_events`` keeps ``network_rows=None``;
+            wiring V1.5 -- when row fetching lands -- requires no
+            further changes here).
     """
     import click
 
@@ -175,7 +212,10 @@ def _write_events(
         click.echo(json.dumps(metadata), file=out_file)
 
     count = 0
-    for event in capture.export_events(include_moves=not exclude_moves):
+    for event in capture.export_events(
+        include_moves=not exclude_moves,
+        network_scrub_pipeline=network_scrub_pipeline,
+    ):
         if isinstance(event, WindowSwitchEvent) and privacy_filter is not None:
             event = privacy_filter(event)
             if event is None:

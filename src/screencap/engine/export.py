@@ -36,6 +36,7 @@ from screencap.engine.processing import (
 
 if TYPE_CHECKING:  # pragma: no cover - import-only typing hint
     from screencap.engine.events import ActionEvent
+    from screencap.network.export_pipeline import NetworkScrubPipeline
 
 logger = logging.getLogger(__name__)
 
@@ -50,6 +51,7 @@ def unified_export_events(
     key_type_merge_interval: float = KEY_TYPE_MERGE_INTERVAL_SECONDS,
     window_filter: Callable[[WindowSwitchEvent], WindowSwitchEvent | None] | None = None,
     network_rows: list[dict] | None = None,
+    network_scrub_pipeline: "NetworkScrubPipeline | None" = None,
 ) -> Iterator[BaseEvent]:
     """Convert raw DB row dicts into a time-ordered Pydantic event stream.
 
@@ -132,11 +134,28 @@ def unified_export_events(
             is gated on V1.75's cloud-bound filter wiring; V1's
             premise validation runs against ``recording.db.network_event``
             directly via ``screencap _network-dump``.
+        network_scrub_pipeline: Optional V1.5 :class:`NetworkScrubPipeline`
+            instance. When provided, network rows with ``body_ciphertext``
+            are decrypted, scrubbed, and yielded as export-side events
+            (``NetworkRequestExportEvent`` etc. with ``body_text``);
+            rows without ciphertext (V1-vintage) pass through as
+            capture-side events with no body data. When ``None`` (the
+            default), the function emits capture-side events directly --
+            **DO NOT use this on cloud-bound paths**, capture-side
+            events carry ``body_ciphertext`` fields that must never
+            reach JSONL. Construction of the pipeline (KEK lookup,
+            DEK unwrap, ``DetectionPipeline`` init) happens at the
+            CALLER; this function only consumes a ready pipeline.
 
     Yields:
         ``BaseEvent`` instances in non-decreasing timestamp order:
         processed ``ActionEvent`` types interleaved with
         ``WindowSwitchEvent`` instances (and, in V1.75+, network events).
+        When ``network_scrub_pipeline`` is provided, network entries are
+        the export-side ``Network*ExportEvent`` classes (bare
+        ``BaseModel`` -- not ``BaseEvent`` subclasses, but the
+        timestamp-ordered merge still works because they expose
+        ``timestamp`` like ``BaseEvent``).
     """
     from screencap.engine.convert import dict_to_action_event, dict_to_network_event
 
@@ -196,6 +215,15 @@ def unified_export_events(
     #    exception tolerance mirrors the action-row block above so a
     #    single malformed row is debug-logged and skipped (V1 keeps the
     #    metadata in the DB regardless; JSONL emission lands in V1.75).
+    #
+    #    V1.5: when ``network_scrub_pipeline`` is provided, the
+    #    capture-side event is converted to its export-side counterpart
+    #    via ``decrypt_and_scrub`` -- ciphertext fields are decrypted,
+    #    plaintext is scrubbed by the DetectionPipeline, and the result
+    #    is an export-side class (``Network*ExportEvent``) with
+    #    ``body_text`` populated. Capture-side ciphertext NEVER reaches
+    #    the iterator output by construction. Pipeline construction
+    #    (KEK + DEK + DetectionPipeline) is the caller's responsibility.
     if network_rows is not None:
         network_events: list[BaseEvent] = []
         for row in network_rows:
@@ -208,7 +236,35 @@ def unified_export_events(
                     exc,
                 )
                 continue
-            if net_evt is not None:
+            if net_evt is None:
+                continue
+            if network_scrub_pipeline is not None:
+                # V1.5: decrypt + scrub. The ``NetworkDropBurstEvent``
+                # has no ciphertext fields and is not one of the four
+                # body-bearing kinds the pipeline supports; pass it
+                # through unchanged so drop-burst metadata still flows
+                # to JSONL when bodies are encrypted.
+                from screencap.engine.events import (  # noqa: PLC0415
+                    NetworkDropBurstEvent,
+                )
+
+                if isinstance(net_evt, NetworkDropBurstEvent):
+                    network_events.append(net_evt)
+                else:
+                    try:
+                        export_evt = network_scrub_pipeline.decrypt_and_scrub(
+                            net_evt,
+                        )
+                    except Exception as exc:
+                        logger.debug(
+                            "Skipping network event whose decrypt+scrub "
+                            "raised at ts=%s: %s",
+                            row.get("timestamp", "?"),
+                            exc,
+                        )
+                        continue
+                    network_events.append(export_evt)
+            else:
                 network_events.append(net_evt)
         # Defensive sort - callers fetch by ``ORDER BY timestamp_ns``
         # but the dict-input contract cannot enforce that. Sorting

@@ -971,12 +971,94 @@ def info(name, as_json):
 
 
 def _export_one(recording_dir, output_path, exclude_moves, err_console):
-    """Export a single recording. Returns event count, or -1 on error."""
+    """Export a single recording. Returns event count, or -1 on error.
+
+    V1.5: when the recording has encrypted network bodies (a
+    ``network_event_meta`` row exists), construct a
+    :class:`NetworkScrubPipeline` for decrypt+scrub of bodies at the
+    row-conversion boundary. Pipeline construction triggers a Keychain
+    prompt on first call and a silent read thereafter ("Always Allow"
+    trusted-binary extension); failure raises
+    :class:`KekUnavailableError` and we fail-loud per the V1.5 ticket's
+    "KEK-missing semantics" lock.
+    """
+    import logging
+    from pathlib import Path
+
     from screencap.exporter import ExportError, build_export_metadata, export_recording
+    from screencap.network.export_pipeline import (
+        KekUnavailableError,
+        NetworkScrubPipeline,
+        recording_has_encrypted_bodies,
+    )
+
+    logger = logging.getLogger(__name__)
 
     meta = build_export_metadata(exclude_moves)
+
+    # V1.5: per-recording pipeline construction. The cheap meta-row
+    # check skips the Keychain prompt for V1-vintage recordings.
+    network_scrub_pipeline = None
+    db_path = str(Path(recording_dir) / "recording.db")
     try:
-        return export_recording(recording_dir, output_path, exclude_moves, metadata=meta)
+        if Path(db_path).exists():
+            from screencap.engine.db import (
+                _ensure_network_tables,
+                get_engine,
+                get_session_for_path,
+            )
+            from screencap.engine.db.models import Recording
+
+            # Ensure the table exists (legacy DBs predate the feature).
+            try:
+                engine = get_engine(f"sqlite:///{db_path}")
+                _ensure_network_tables(engine)
+                engine.dispose()
+            except Exception:
+                pass
+            # Look up the recording_id from the DB and check for the
+            # meta row. The recording_id is a fixed integer per
+            # recording.db; one Recording row per file.
+            session = get_session_for_path(db_path)
+            try:
+                rec = session.query(Recording).first()
+                recording_id = rec.id if rec is not None else None
+            finally:
+                session.close()
+            if recording_id is not None and recording_has_encrypted_bodies(
+                db_path, recording_id,
+            ):
+                try:
+                    network_scrub_pipeline = NetworkScrubPipeline(
+                        db_path, recording_id,
+                    )
+                except KekUnavailableError as e:
+                    err_console.print(
+                        f"[red]Error:[/red] Cannot decrypt network bodies: {e}. "
+                        "Run `screencap network uninstall && screencap start "
+                        "--network` to regenerate (existing encrypted bodies "
+                        "will be lost).",
+                    )
+                    return -1
+    except KekUnavailableError:
+        # Re-raise wrapped errors -- the inner block already printed
+        # the actionable message. Fall through to return -1.
+        return -1
+    except Exception as e:
+        # Defensive: any unexpected error setting up the pipeline
+        # check should not crash the export. Log + fall through to
+        # the V1 path (no scrub pipeline). KekUnavailableError above
+        # is the fail-loud branch.
+        logger.debug("Skipping network-scrub-pipeline setup: %s", e)
+
+    try:
+        return export_recording(
+            recording_dir,
+            output_path,
+            exclude_moves,
+            metadata=meta,
+            network_scrub_pipeline=network_scrub_pipeline,
+        )
     except ExportError as e:
         err_console.print(f"[red]Error:[/red] {e}")
         return -1

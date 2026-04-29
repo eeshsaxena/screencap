@@ -29,6 +29,8 @@ from screencap.engine.processing import (
 if TYPE_CHECKING:
     from PIL import Image
 
+    from screencap.network.export_pipeline import NetworkScrubPipeline
+
 
 def _action_event_to_dict(db_event) -> dict:
     """Convert a SQLAlchemy ActionEvent to a row dict.
@@ -401,7 +403,12 @@ class CaptureSession:
                 events.append(pydantic_event)
         return events
 
-    def export_events(self, include_moves: bool = False) -> list[BaseEvent]:
+    def export_events(
+        self,
+        include_moves: bool = False,
+        *,
+        network_scrub_pipeline: "NetworkScrubPipeline | None" = None,
+    ) -> list[BaseEvent]:
         """Produce a combined, time-ordered list of processed action events
         and deduplicated window.switch events for JSONL export.
 
@@ -427,8 +434,24 @@ class CaptureSession:
         its public ``list[BaseEvent]`` return contract — see
         ``tests/test_cross_layer_contracts.py`` lines 35-45.
 
+        V1 keeps ``network_rows=None`` here -- the explicit
+        ``screencap export`` callsite passes through the unified
+        callable but doesn't fetch network rows for V1 (per the V1
+        scope guard, JSONL emission of network events is V1.75 work).
+        The ``network_scrub_pipeline`` kwarg is the V1.5 hook for
+        decrypting + scrubbing encrypted bodies once row fetching is
+        wired in V1.75; passing it today is a no-op when
+        ``network_rows=None``.
+
         Args:
             include_moves: Whether to include mouse.move events.
+            network_scrub_pipeline: Optional V1.5 ``NetworkScrubPipeline``.
+                Forwarded to ``unified_export_events`` so that, when
+                callers begin supplying ``network_rows``, encrypted
+                bodies are decrypted + scrubbed at the row-conversion
+                boundary. Construct via
+                ``screencap.network.export_pipeline.NetworkScrubPipeline``;
+                ``None`` (the default) preserves V1 behaviour.
 
         Returns:
             Combined list of action + window.switch events, sorted by timestamp.
@@ -505,6 +528,7 @@ class CaptureSession:
                 self._recording.double_click_distance_pixels or 5.0
             ),
             window_filter=None,
+            network_scrub_pipeline=network_scrub_pipeline,
         ))
 
         # 4. Per R7, the unified callable does not drop MouseMoveEvent
