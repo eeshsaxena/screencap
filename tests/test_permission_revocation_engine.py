@@ -88,12 +88,28 @@ class TestCheckPermissionsNow:
         assert ok is False
         assert missing == "screen_recording"
 
+    def test_probe_failure_does_not_trigger_revocation(self, monkeypatch):
+        """Tri-state contract: _check_permission_fresh returns None when the
+        subprocess probe fails (timeout, OSError, unparseable stdout). The
+        watcher must NOT treat None as a revocation — that would kill the
+        recording on a transient Quartz hiccup. Previously a bool-only
+        contract returned False on probe failure → permission_lost emitted →
+        recording aborted.
+        """
+        from screencap import recorder
+
+        monkeypatch.setattr(sys, "platform", "darwin")
+        monkeypatch.setattr(recorder, "_check_permission_fresh", lambda name: None)
+
+        ok, missing = recorder._check_permissions_now()
+        assert ok is True
+        assert missing is None
+
     def test_pyobjc_bridge_error_does_not_crash_recorder(self, monkeypatch):
-        """Todo 013: PyObjC bridge errors (objc.error, runtime errors during
-        Sequoia overlays / system update prompts) propagated uncaught into
-        the recording hot loop. Now wrapped in try/except — broker errors
-        are treated as 'permission still valid for this tick' so the watcher
-        retries on the next interval instead of killing the recorder."""
+        """Defensive belt-and-suspenders: even if _check_permission_fresh
+        raises (a future regression that breaks the documented tri-state
+        contract), the watcher's outer try/except catches it and treats
+        the tick as 'couldn't determine' rather than killing the recorder."""
         from screencap import recorder
 
         monkeypatch.setattr(sys, "platform", "darwin")
@@ -103,12 +119,55 @@ class TestCheckPermissionsNow:
 
         monkeypatch.setattr(recorder, "_check_permission_fresh", _broken)
 
-        # Must not raise — and must report "all ok" because the bridge
-        # failure can't be distinguished from a real revocation, so we
-        # fail open for this tick.
         ok, missing = recorder._check_permissions_now()
         assert ok is True
         assert missing is None
+
+    def test_explicit_false_still_triggers_revocation(self, monkeypatch):
+        """Tri-state's other half: a clean False (probe succeeded, permission
+        denied) MUST still trigger revocation. Otherwise the fix would mask
+        real revocations as 'couldn't determine'."""
+        from screencap import recorder
+
+        monkeypatch.setattr(sys, "platform", "darwin")
+
+        def _denied(name):
+            # Screen Recording is denied; everything else granted.
+            return False if name == "Screen Recording" else True
+
+        monkeypatch.setattr(recorder, "_check_permission_fresh", _denied)
+
+        ok, missing = recorder._check_permissions_now()
+        assert ok is False
+        assert missing == "screen_recording"
+
+    def test_check_permission_fresh_returns_none_on_subprocess_timeout(self, monkeypatch):
+        """Direct check on the helper: subprocess timeout → None (not False).
+        Pin the contract — the previous bool-only return was the root cause
+        of the false-revocation bug."""
+        import subprocess as _subprocess
+        from screencap import recorder
+
+        def _timeout(*args, **kwargs):
+            raise _subprocess.TimeoutExpired(cmd=args[0], timeout=5)
+
+        monkeypatch.setattr(_subprocess, "run", _timeout)
+        result = recorder._check_permission_fresh("Screen Recording")
+        assert result is None, f"timeout should return None, got {result!r}"
+
+    def test_check_permission_fresh_returns_none_on_unparseable_stdout(self, monkeypatch):
+        """Defensive: if the subprocess succeeds but emits something other
+        than "True"/"False" (Python startup error, garbage), treat as
+        couldn't-determine rather than denied."""
+        import subprocess as _subprocess
+        from screencap import recorder
+
+        class _FakeResult:
+            stdout = "ImportError: traceback...\n"
+
+        monkeypatch.setattr(_subprocess, "run", lambda *a, **k: _FakeResult())
+        result = recorder._check_permission_fresh("Screen Recording")
+        assert result is None
 
     def test_missing_darwin_module_returns_ok(self, monkeypatch):
         """If the darwin module isn't importable, fail-open (don't kill the

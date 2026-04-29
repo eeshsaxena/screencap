@@ -392,19 +392,35 @@ _PERMISSION_CHECK_CODE: dict[str, str] = {
 }
 
 
-def _check_permission_fresh(name: str) -> bool:
-    """Check a permission in a fresh subprocess to bypass OS-level caching."""
+def _check_permission_fresh(name: str) -> bool | None:
+    """Check a permission in a fresh subprocess to bypass OS-level caching.
+
+    Tri-state return:
+      - ``True``  — probe succeeded, permission granted
+      - ``False`` — probe succeeded, permission denied
+      - ``None``  — probe FAILED (subprocess timeout, OSError, missing
+                    PERMISSION_CHECK_CODE entry, or unparseable stdout).
+                    Caller must treat this as "couldn't determine" and
+                    NOT as "denied" — otherwise a transient Quartz/PyObjC
+                    hiccup during a Sequoia overlay would kill the
+                    in-progress recording.
+    """
     code = _PERMISSION_CHECK_CODE.get(name)
     if not code:
-        return False
+        return None
     try:
         result = subprocess.run(
             [sys.executable, "-c", code],
             capture_output=True, text=True, timeout=5,
         )
-        return result.stdout.strip() == "True"
     except Exception:
+        return None
+    out = result.stdout.strip()
+    if out == "True":
+        return True
+    if out == "False":
         return False
+    return None
 
 
 def _check_macos_permissions() -> None:
@@ -494,11 +510,13 @@ def _check_permissions_now() -> tuple[bool, str | None]:
     not the live state. The 50-100ms-per-call subprocess cost happens once
     every 5s and is bounded against recording's existing CPU footprint.
 
-    PyObjC bridge errors are swallowed (todo 013) — a transient Quartz
-    failure (Sequoia overlays, system update prompts) must NOT crash the
-    recorder mid-recording. The watcher treats any subprocess error as
-    "permission still valid" for that tick; a real revocation surfaces on
-    the next tick once the bridge recovers.
+    Probe failures are FAIL-OPEN: ``_check_permission_fresh`` returns
+    tri-state and we only treat an explicit ``False`` as a revocation. A
+    subprocess timeout, OSError, or unparseable stdout returns ``None`` —
+    we skip that permission for this tick and retry on the next. Without
+    this distinction (the previous bool-only path) a transient Quartz /
+    PyObjC hiccup during a Sequoia overlay would kill the in-progress
+    recording.
     """
     if sys.platform != "darwin":
         return True, None
@@ -513,9 +531,17 @@ def _check_permissions_now() -> tuple[bool, str | None]:
         try:
             granted = _check_permission_fresh(tcc_name)
         except Exception:
-            # Bridge failure — assume granted for this tick; next tick retries.
+            # Defensive belt-and-suspenders: _check_permission_fresh already
+            # returns None on subprocess errors, but a future change could
+            # cause it to raise. Treat any raise as "couldn't determine"
+            # rather than risk killing the recording.
+            granted = None
+        if granted is None:
+            # Probe failed — couldn't determine state. Fail-open for this
+            # tick; if the permission really is revoked, the next tick will
+            # see a clean False and report it.
             continue
-        if not granted:
+        if granted is False:
             return False, missing_label
     return True, None
 
