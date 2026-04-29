@@ -123,3 +123,4 @@ pynput starts its own background thread inside `listener.start()`. Callbacks run
 - [recording-engine.md](./recording-engine.md) — how raw events reach the pipeline
 - [export-pipeline.md](./export-pipeline.md) — how processed events become events.jsonl
 - [database.md](./database.md) — how raw events are stored
+- [network-capture.md](./network-capture.md) — 5 additional event types (`network.request`, `network.response`, `network.ws_upgrade`, `network.ws_frame`, `network.drop_burst`) live alongside `BaseEvent` but bypass `process_events()` entirely; plus `NetworkPinFailureEvent` (a control-only `pydantic.BaseModel`, NOT a `BaseEvent` — never persisted, never serialized to JSONL)

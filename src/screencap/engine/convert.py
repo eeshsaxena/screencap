@@ -7,7 +7,10 @@ event models.  Used by both CaptureSession (ORM) and the chunk processor
 
 from __future__ import annotations
 
+import json
 from urllib.parse import urlparse
+
+from loguru import logger
 
 from screencap.engine.events import (
     ActionEvent,
@@ -21,8 +24,38 @@ from screencap.engine.events import (
     MouseScrollEvent,
     MouseSmartMagnifyEvent,
     MouseUpEvent,
+    NetworkDropBurstEvent,
+    NetworkEvent,
+    NetworkRequestEvent,
+    NetworkResponseEvent,
+    NetworkWebSocketFrameEvent,
+    NetworkWebSocketUpgradeEvent,
     WindowSwitchEvent,
 )
+
+
+def bytes_to_hex(b: bytes | None) -> str | None:
+    """Convert a raw bytes digest to lowercase hex.
+
+    Single source of truth for the bytes -> hex conversion at every
+    DB-to-Pydantic boundary in the codebase. Returns None for None
+    input so callers can blindly forward.
+    """
+    if b is None:
+        return None
+    return b.hex()
+
+
+def hex_to_bytes(s: str | None) -> bytes | None:
+    """Convert a lowercase hex digest to raw bytes.
+
+    Inverse of :func:`bytes_to_hex`. Returns None for None input
+    or for empty strings (latter mirrors NULL semantics in SQLite
+    where empty BLOB is sometimes coerced to ``""``).
+    """
+    if s is None or s == "":
+        return None
+    return bytes.fromhex(s)
 
 
 def dict_to_action_event(row: dict) -> ActionEvent | None:
@@ -168,3 +201,177 @@ def dict_to_window_switch(row: dict) -> WindowSwitchEvent:
         height=row.get("height") or 0,
         domain=domain,
     )
+
+
+def _parse_headers_json(value) -> list[tuple[str, str]]:
+    """Parse a `headers_json` column value into a list of (name, value) tuples.
+
+    Accepts either a JSON-encoded string or a Python list (some callers
+    may have already deserialized). Returns an empty list on missing /
+    malformed input.
+    """
+    if value is None:
+        return []
+    if isinstance(value, str):
+        if not value:
+            return []
+        try:
+            value = json.loads(value)
+        except (json.JSONDecodeError, ValueError):
+            logger.debug(f"dict_to_network_event: bad headers_json={value!r}")
+            return []
+    if not isinstance(value, list):
+        return []
+    out: list[tuple[str, str]] = []
+    for item in value:
+        if isinstance(item, (list, tuple)) and len(item) == 2:
+            name, val = item
+            out.append((str(name), str(val)))
+    return out
+
+
+def _parse_details_json(value) -> dict | None:
+    """Parse a `details_json` column value into a dict.
+
+    Returns None on missing / malformed input. Strings get JSON-decoded;
+    already-decoded dicts pass through.
+    """
+    if value is None:
+        return None
+    if isinstance(value, str):
+        if not value:
+            return None
+        try:
+            return json.loads(value)
+        except (json.JSONDecodeError, ValueError):
+            logger.debug(f"dict_to_network_event: bad details_json={value!r}")
+            return None
+    if isinstance(value, dict):
+        return value
+    return None
+
+
+def _coerce_sha256_hex(value) -> str | None:
+    """Normalize a `body_sha256` column value to lowercase hex (or None).
+
+    The DB column is `LargeBinary(32)` so the natural value is `bytes`,
+    but some sqlite paths surface it as ``memoryview``. Already-hex
+    strings pass through unchanged (lowercased) for forward compatibility.
+    """
+    if value is None:
+        return None
+    if isinstance(value, (bytes, bytearray)):
+        return bytes_to_hex(bytes(value))
+    if isinstance(value, memoryview):
+        return bytes_to_hex(value.tobytes())
+    if isinstance(value, str):
+        return value.lower() or None
+    return None
+
+
+def dict_to_network_event(row: dict) -> NetworkEvent | None:
+    """Convert a network_event DB row dict to a Pydantic network event.
+
+    Dispatches on the `kind` column (short form: request / response /
+    ws_upgrade / ws_frame / drop_burst). Mirrors the exception tolerance
+    of :func:`dict_to_action_event` - returns None on unknown kind, logs
+    and returns None when conversion fails.
+
+    Args:
+        row: Dict with network_event DB column names.
+
+    Returns:
+        Pydantic event or None if kind unrecognized / conversion failed.
+    """
+    kind = row.get("kind")
+    if not kind:
+        return None
+
+    ts = row.get("timestamp", 0.0)
+    ts_ns = row.get("timestamp_ns") or 0
+    flow_id = row.get("flow_id") or ""
+    host = row.get("host") or ""
+
+    try:
+        if kind == "request":
+            return NetworkRequestEvent(
+                timestamp=ts,
+                timestamp_ns=ts_ns,
+                flow_id=flow_id,
+                method=row.get("method") or "",
+                url=row.get("url") or "",
+                host=host,
+                headers=_parse_headers_json(row.get("headers_json")),
+                body_size=row.get("body_size"),
+                body_sha256_hex=_coerce_sha256_hex(row.get("body_sha256")),
+                content_type=row.get("content_type"),
+                http_version=row.get("http_version"),
+            )
+        elif kind == "response":
+            return NetworkResponseEvent(
+                timestamp=ts,
+                timestamp_ns=ts_ns,
+                flow_id=flow_id,
+                host=host,
+                status=int(row.get("status") or 0),
+                headers=_parse_headers_json(row.get("headers_json")),
+                body_size=row.get("body_size"),
+                body_sha256_hex=_coerce_sha256_hex(row.get("body_sha256")),
+                content_type=row.get("content_type"),
+                http_version=row.get("http_version"),
+            )
+        elif kind == "ws_upgrade":
+            return NetworkWebSocketUpgradeEvent(
+                timestamp=ts,
+                timestamp_ns=ts_ns,
+                flow_id=flow_id,
+                url=row.get("url") or "",
+                host=host,
+                status=int(row.get("status") or 101),
+                headers=_parse_headers_json(row.get("headers_json")),
+                http_version=row.get("http_version"),
+                details_json=_parse_details_json(row.get("details_json")),
+            )
+        elif kind == "ws_frame":
+            direction = row.get("direction")
+            frame_type = row.get("frame_type")
+            if direction not in ("sent", "received"):
+                logger.debug(
+                    f"dict_to_network_event: bad ws_frame direction={direction!r}"
+                )
+                return None
+            if frame_type not in ("text", "binary"):
+                logger.debug(
+                    f"dict_to_network_event: bad ws_frame frame_type={frame_type!r}"
+                )
+                return None
+            return NetworkWebSocketFrameEvent(
+                timestamp=ts,
+                timestamp_ns=ts_ns,
+                flow_id=flow_id,
+                host=host,
+                direction=direction,
+                frame_type=frame_type,
+                body_size=row.get("body_size"),
+                body_sha256_hex=_coerce_sha256_hex(row.get("body_sha256")),
+            )
+        elif kind == "drop_burst":
+            details = _parse_details_json(row.get("details_json"))
+            if details is None:
+                # drop_burst details_json is REQUIRED per schema; treat as
+                # malformed and skip rather than emit a partially-empty event.
+                logger.debug(
+                    "dict_to_network_event: drop_burst row missing details_json"
+                )
+                return None
+            return NetworkDropBurstEvent(
+                timestamp=ts,
+                timestamp_ns=ts_ns,
+                details_json=details,
+            )
+    except Exception as e:  # pragma: no cover - defensive
+        logger.debug(f"dict_to_network_event: failed to convert kind={kind!r}: {e}")
+        return None
+
+    logger.debug(f"dict_to_network_event: unknown kind={kind!r}")
+    return None

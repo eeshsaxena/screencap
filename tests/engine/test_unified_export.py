@@ -682,3 +682,184 @@ class TestTypeContract:
             assert isinstance(evt, BaseEvent)
             # use_enum_values stores .type as the string value.
             assert evt.type in {t.value for t in EventType}
+
+
+# ---------------------------------------------------------------------------
+# Network row support (V1: parameter passthrough; callers keep network_rows=None).
+# ---------------------------------------------------------------------------
+
+
+def _network_row(
+    ts: float,
+    *,
+    kind: str = "request",
+    flow_id: str = "flow-1",
+    method: str | None = "GET",
+    url: str | None = "https://example.com/api",
+    host: str = "example.com",
+    status: int | None = None,
+    headers_json: str | None = None,
+    body_size: int | None = 0,
+    body_sha256: bytes | None = None,
+    content_type: str | None = "text/plain",
+    direction: str | None = None,
+    frame_type: str | None = None,
+    http_version: str | None = "HTTP/1.1",
+    details_json: str | None = None,
+    timestamp_ns: int | None = None,
+) -> dict:
+    """Return a row dict matching network_event DB column shape.
+
+    Only the columns that ``dict_to_network_event`` reads are populated;
+    the converter is robust to missing keys via ``row.get`` so we keep
+    the helper minimal.
+    """
+    return {
+        "kind": kind,
+        "flow_id": flow_id,
+        "method": method,
+        "url": url,
+        "host": host,
+        "status": status,
+        "headers_json": headers_json,
+        "body_size": body_size,
+        "body_sha256": body_sha256,
+        "content_type": content_type,
+        "direction": direction,
+        "frame_type": frame_type,
+        "http_version": http_version,
+        "details_json": details_json,
+        "timestamp": ts,
+        "timestamp_ns": timestamp_ns if timestamp_ns is not None else int(ts * 1e9),
+    }
+
+
+class TestNetworkRowsParameter:
+    """``network_rows`` extension preserves prior behaviour and interleaves correctly."""
+
+    def test_network_rows_none_matches_pre_network_signature(self):
+        """``network_rows=None`` (default) → behaves identically to action+window only."""
+        action_rows = [
+            _action_row(2.0, "click", mouse_x=10, mouse_y=20, mouse_pressed=True),
+            _action_row(2.05, "click", mouse_x=10, mouse_y=20, mouse_pressed=False),
+        ]
+        window_rows = [_window_row(1.0)]
+        baseline = list(unified_export_events(action_rows, window_rows))
+        with_none = list(
+            unified_export_events(action_rows, window_rows, network_rows=None),
+        )
+        assert [type(e) for e in baseline] == [type(e) for e in with_none]
+        assert [e.timestamp for e in baseline] == [e.timestamp for e in with_none]
+
+    def test_empty_network_rows_list_matches_baseline(self):
+        """``network_rows=[]`` → identical to ``network_rows=None``."""
+        action_rows = [
+            _action_row(2.0, "move", mouse_x=10, mouse_y=20),
+        ]
+        baseline = list(unified_export_events(action_rows, []))
+        empty = list(unified_export_events(action_rows, [], network_rows=[]))
+        assert [type(e) for e in baseline] == [type(e) for e in empty]
+
+    def test_network_rows_interleave_into_combined_stream(self):
+        """Network rows produce a single time-ordered iterator alongside actions+windows."""
+        action_rows = [
+            _action_row(2.0, "click", mouse_x=10, mouse_y=20, mouse_pressed=True),
+            _action_row(2.05, "click", mouse_x=10, mouse_y=20, mouse_pressed=False),
+        ]
+        window_rows = [_window_row(1.0)]
+        network_rows = [
+            _network_row(1.5, kind="request", host="api.example.com"),
+            _network_row(3.0, kind="response", status=200, host="api.example.com"),
+        ]
+        result = list(unified_export_events(
+            action_rows, window_rows, network_rows=network_rows,
+        ))
+        timestamps = [e.timestamp for e in result]
+        assert timestamps == sorted(timestamps), (
+            f"Expected non-decreasing timestamps, got {timestamps}"
+        )
+        types = [e.type for e in result]
+        # window.switch at t=1.0, network.request at t=1.5,
+        # mouse.singleclick at t=2.0, network.response at t=3.0.
+        assert types == [
+            "window.switch",
+            "network.request",
+            "mouse.singleclick",
+            "network.response",
+        ]
+
+    def test_malformed_network_row_skipped_not_propagated(self, caplog):
+        """A row with an invalid ``kind`` or missing required field is skipped, not raised."""
+        import logging
+
+        good_request = _network_row(1.0, kind="request", host="api.good.example")
+        # ``ws_frame`` requires ``direction in {"sent","received"}``; passing
+        # an unknown direction makes ``dict_to_network_event`` return None
+        # rather than raising. Use a row that triggers a real exception path
+        # by feeding a non-numeric ``status`` to a "response" row (forces
+        # int() coercion failure inside the converter's try/except).
+        bad_response = _network_row(
+            2.0, kind="response", status="not-a-number", host="api.good.example",
+        )
+        good_response = _network_row(
+            3.0, kind="response", status=200, host="api.good.example",
+        )
+
+        with caplog.at_level(logging.DEBUG):
+            events = list(unified_export_events(
+                [], [], network_rows=[good_request, bad_response, good_response],
+            ))
+
+        # The two good rows survive; the bad row was skipped without
+        # losing the rest of the chunk.
+        assert len(events) == 2
+        types = [e.type for e in events]
+        assert "network.request" in types
+        assert "network.response" in types
+
+    def test_unknown_network_kind_is_skipped_silently(self):
+        """``dict_to_network_event`` returns ``None`` for unknown kinds → row dropped, no raise."""
+        rows = [
+            _network_row(1.0, kind="not-a-real-kind", host="x.example"),
+            _network_row(2.0, kind="request", host="x.example"),
+        ]
+        result = list(unified_export_events([], [], network_rows=rows))
+        assert len(result) == 1
+        assert result[0].type == "network.request"
+
+    def test_three_way_tie_break_window_then_action_then_network(self):
+        """Tie-breaker at the same timestamp resolves window-first, action-second, network-third."""
+        # All three event sources share timestamp 5.0 exactly.
+        action_rows = [
+            _action_row(5.0, "move", mouse_x=10, mouse_y=20),
+        ]
+        window_rows = [_window_row(5.0)]
+        network_rows = [_network_row(5.0, kind="request", host="example.com")]
+
+        result = list(unified_export_events(
+            action_rows, window_rows, network_rows=network_rows,
+        ))
+        # Filter to events at t=5.0 in case anything else slips in.
+        equal_ts_events = [e for e in result if e.timestamp == 5.0]
+        types = [e.type for e in equal_ts_events]
+        assert types == ["window.switch", "mouse.move", "network.request"], (
+            f"Tie-break order broken: {types}"
+        )
+
+    def test_network_rows_only_no_actions_or_windows(self):
+        """Network rows alone produce an iterator of only network events."""
+        rows = [
+            _network_row(1.0, kind="request"),
+            _network_row(2.0, kind="response", status=200),
+        ]
+        result = list(unified_export_events([], [], network_rows=rows))
+        assert [e.type for e in result] == ["network.request", "network.response"]
+
+    def test_network_rows_returned_in_iterator_form(self):
+        """Network branch preserves the ``Iterator`` return contract."""
+        from collections.abc import Iterator as _Iterator
+
+        rows = [_network_row(1.0, kind="request")]
+        result = unified_export_events([], [], network_rows=rows)
+        assert isinstance(result, _Iterator)
+        assert not isinstance(result, list)

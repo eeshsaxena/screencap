@@ -1306,3 +1306,79 @@ def test_cloud_function_filename_regex_allows_marker():
     assert not filename_re.match(".hidden")
     assert not filename_re.match("-leading-dash")
     assert not filename_re.match("/absolute/path")
+
+
+# ---------------------------------------------------------------------------
+# `screencap network` command group (Unit 8)
+# ---------------------------------------------------------------------------
+
+
+class TestNetworkCommandGroup:
+    """V1 surface: `screencap network uninstall` + `screencap network restore`."""
+
+    def test_network_help_lists_subcommands(self):
+        runner = CliRunner()
+        result = runner.invoke(cli, ["network", "--help"])
+        assert result.exit_code == 0
+        assert "uninstall" in result.output
+        assert "restore" in result.output
+
+    def test_network_restore_no_orphans(self, tmp_path, monkeypatch):
+        """No snapshots → friendly message, exit 0."""
+        from unittest.mock import patch as _patch
+
+        monkeypatch.setenv("HOME", str(tmp_path))
+        runner = CliRunner()
+        with _patch(
+            "screencap.network.lifecycle.restore_orphaned_proxy_state",
+            return_value=[],
+        ):
+            result = runner.invoke(cli, ["network", "restore"])
+        assert result.exit_code == 0
+        assert "No orphaned proxy state found" in result.output
+
+    def test_network_restore_with_orphans(self, tmp_path, monkeypatch):
+        """Restored snapshots → success line + per-path bullets."""
+        from pathlib import Path as _Path
+        from unittest.mock import patch as _patch
+
+        monkeypatch.setenv("HOME", str(tmp_path))
+        fake_paths = [_Path("/tmp/rec-1/.proxy_state.json")]
+        runner = CliRunner()
+        with _patch(
+            "screencap.network.lifecycle.restore_orphaned_proxy_state",
+            return_value=fake_paths,
+        ):
+            result = runner.invoke(cli, ["network", "restore"])
+        assert result.exit_code == 0
+        assert "Restored proxy state for 1" in result.output
+        assert "/tmp/rec-1/.proxy_state.json" in result.output
+
+    def test_network_uninstall_idempotent(self, tmp_path, monkeypatch):
+        """Second invocation on already-uninstalled state succeeds silently."""
+        from unittest.mock import patch as _patch
+
+        monkeypatch.setenv("HOME", str(tmp_path))
+        runner = CliRunner()
+        with _patch(
+            "screencap.network.lifecycle.full_uninstall"
+        ) as full_mock:
+            r1 = runner.invoke(cli, ["network", "uninstall"])
+            r2 = runner.invoke(cli, ["network", "uninstall"])
+        assert r1.exit_code == 0
+        assert r2.exit_code == 0
+        assert full_mock.call_count == 2
+        assert "Done" in r1.output
+
+    def test_network_uninstall_calls_full_uninstall(self, tmp_path, monkeypatch):
+        """The CLI subcommand delegates to lifecycle.full_uninstall()."""
+        from unittest.mock import patch as _patch
+
+        monkeypatch.setenv("HOME", str(tmp_path))
+        runner = CliRunner()
+        with _patch(
+            "screencap.network.lifecycle.full_uninstall"
+        ) as full_mock:
+            result = runner.invoke(cli, ["network", "uninstall"])
+        assert result.exit_code == 0
+        full_mock.assert_called_once()

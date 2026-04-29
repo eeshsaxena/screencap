@@ -925,3 +925,64 @@ class TestRecoveryScrubberChain:
         assert slack_post, "Slack window.switch should still be present post-scrub"
         post_title = slack_post[0].get("window_title")
         assert post_title is None or "Sensitive" not in post_title
+
+
+# ---------------------------------------------------------------------------
+# V1 scope guard: zero network.* lines in recovered chunk JSONL
+# ---------------------------------------------------------------------------
+
+
+class TestV1NetworkScopeGuard:
+    """V1 contract: recovery emits ZERO network.* lines.
+
+    Mirrors the chunk_processor scope guard. JSONL emission of network
+    events is deferred to V1.75 alongside the cloud bucket policy +
+    build_cloud_network_filter factory; V1 keeps network events DB-only.
+    """
+
+    def test_no_network_lines_in_recovered_jsonl(self, recording_db):
+        """Seeded network_event row in DB → zero network.* in JSONL."""
+        from screencap.cli import _recover_chunk_metadata
+        from screencap.engine.db import crud
+
+        capture_dir = _capture_dir(recording_db)
+        _stub_chunk_video(capture_dir, 0)
+        # An action so the chunk is non-empty.
+        recording_db.add_click(0.5)
+        # And a network_event row inside the chunk window.
+        ts = recording_db._base_ts + 0.5
+        crud.insert_network_event(
+            recording_db.session,
+            recording_db.recording,
+            {
+                "kind": "request",
+                "flow_id": "flow-1",
+                "method": "GET",
+                "url": "https://example.com/api",
+                "host": "example.com",
+                "headers_json": json.dumps([["Host", "example.com"]]),
+                "body_size": 0,
+                "body_sha256": None,
+                "content_type": None,
+                "direction": None,
+                "frame_type": None,
+                "http_version": "HTTP/1.1",
+                "details_json": None,
+                "timestamp": ts,
+                "timestamp_ns": int(ts * 1_000_000_000),
+            },
+        )
+        crud.flush_buffers(recording_db.session)
+
+        # Recovery is the cloud-bound path; V1 must STILL not emit
+        # network rows because the row-fetch query is gated on V1.75.
+        with _patch_short_chunk_duration():
+            _recover_chunk_metadata(
+                capture_dir, Console(), force=True, cloud_bound=True,
+            )
+
+        _meta, events = _read_events_jsonl(capture_dir / "events_0000.jsonl")
+        types = [e.get("type") for e in events]
+        assert all(not (t or "").startswith("network.") for t in types), (
+            f"V1 recovery must emit zero network.* lines; got types: {types}"
+        )

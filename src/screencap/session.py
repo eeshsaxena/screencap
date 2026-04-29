@@ -45,11 +45,14 @@ from enum import Enum
 from pathlib import Path
 from typing import Any
 
+import logging
+
 from rich.console import Console
 
 from screencap._startup import close_queues_safely as _close_queues_safely
 
 console = Console()
+logger = logging.getLogger(__name__)
 
 
 # ---------------------------------------------------------------------------
@@ -184,6 +187,7 @@ def run_recording_worker(args: dict) -> None:
             segmentation_mode=args.get("segmentation_mode", "llm"),
             scrub_enabled=args.get("scrub_enabled", True),
             show_on_website=args.get("show_on_website", True),
+            network=args.get("network", False),
             # Worker-mode injection points ------------------------------------
             _external_window_feed_q=args["_window_feed_q"],
             _external_override_q=args["_override_q"],
@@ -191,6 +195,7 @@ def run_recording_worker(args: dict) -> None:
             _skip_menubar_spawn=True,
             _skip_pidfile=True,
             _skip_sigint_handler=True,
+            network_handoff_ready=args.get("_network_handoff_ready"),
         )
     except DiskFullError as exc:
         disk_full = True
@@ -701,6 +706,14 @@ class SessionController:
             disable_q=multiprocessing.Queue(),
         )
 
+        # Network handoff event — created here when --network is in play, so
+        # the SessionController-side daemon thread (below) can wait on the
+        # SAME mp.Event the worker signals after writing the handoff file.
+        network_enabled = bool(self._cli_args.get("network", False))
+        network_handoff_ready: multiprocessing.Event | None = None
+        if network_enabled:
+            network_handoff_ready = multiprocessing.Event()
+
         worker_args = {
             "name": name,
             "description": self._cli_args.get("description"),
@@ -726,6 +739,8 @@ class SessionController:
             "_window_feed_q": queues.window_feed_q,
             "_override_q": queues.override_q,
             "_disable_q": queues.disable_q,
+            "network": network_enabled,
+            "_network_handoff_ready": network_handoff_ready,
         }
 
         proc = multiprocessing.Process(
@@ -744,6 +759,19 @@ class SessionController:
         )
         rw.forwarder_thread = self._start_window_forwarder(rw)
         self._current_worker = rw
+
+        # Network handoff registration: when --network is enabled, the worker
+        # writes <capture_dir>/.network_child.json after the proxy mp.Process
+        # is alive; we wait on the mp.Event in a daemon thread so the menubar
+        # main loop is not blocked by the 10s + DB-setup window.
+        if network_enabled and network_handoff_ready is not None:
+            handoff_thread = threading.Thread(
+                target=self._wait_for_network_handoff,
+                args=(network_handoff_ready, capture_dir, proc.pid),
+                name=f"network_handoff_{name}",
+                daemon=True,
+            )
+            handoff_thread.start()
 
         # Tell the menubar about the new recording.
         self._push_control({"type": "session_reset"})
@@ -789,6 +817,120 @@ class SessionController:
         t = threading.Thread(target=_forward, name="rw_forward", daemon=True)
         t.start()
         return t
+
+    def _reap_network_state(self, rw: "_RecordingWorker") -> None:
+        """When a worker is reaped, ensure network state is clean.
+
+        Called from ``_reap_finishing_workers`` for every exited worker.
+        For workers that DID run engine teardown, ``.proxy_restored`` is
+        present and this is a near-no-op (just deregisters the pidfile
+        child and deletes the handoff). For workers that died unexpectedly
+        (e.g. SIGKILL between handoff-write and engine teardown), this
+        runs orphan-cleanup so the user's system proxy is not left
+        pointing at a dead port.
+        """
+        from screencap import pidfile as _pidfile
+        from screencap.network import lifecycle as _net_lifecycle
+
+        capture_dir = rw.capture_dir
+        proxy_restored = (capture_dir / ".proxy_restored").exists()
+        handoff = _net_lifecycle.read_network_child_handoff(capture_dir)
+
+        # If neither the marker nor the handoff exists, this was likely
+        # a non-network recording — skip.
+        if not proxy_restored and handoff is None:
+            return
+
+        if not proxy_restored:
+            # Worker died without running engine teardown. Run orphan-cleanup.
+            try:
+                _net_lifecycle.restore_orphaned_proxy_state()
+            except Exception:  # noqa: BLE001
+                logger.exception("orphan proxy restore in reap path failed")
+
+        # Deregister pidfile child + delete handoff (idempotent).
+        try:
+            _pidfile.remove_child("mitmproxy")
+        except Exception:  # noqa: BLE001
+            pass
+        try:
+            _net_lifecycle.delete_network_child_handoff(capture_dir)
+        except Exception:  # noqa: BLE001
+            pass
+
+    def _wait_for_network_handoff(
+        self,
+        handoff_ready: multiprocessing.Event,
+        capture_dir: Path,
+        worker_pid: int,
+    ) -> None:
+        """Wait for the worker to publish .network_child.json, then register
+        the proxy PID via pidfile.add_child so terminate_processes can reach
+        it.
+
+        The worker signals ``handoff_ready`` AFTER atomic-writing the handoff
+        file; we wait up to 15s (covers 10s wait_for_ready + DB setup +
+        slack). On timeout, fall back to reading the file directly; if it's
+        absent or unparseable AND the worker is dead, run the orphan-cleanup
+        restore. Daemon thread always exits within ~46s (15s wait + bounded
+        validation + 30s subprocess timeout cap).
+        """
+        from screencap import pidfile as _pidfile
+        from screencap.network import lifecycle as _net_lifecycle
+
+        signaled = handoff_ready.wait(timeout=15.0)
+        if signaled:
+            handoff = _net_lifecycle.read_network_child_handoff(capture_dir)
+            if handoff is None:
+                logger.warning(
+                    "network handoff signaled but file unreadable for %s",
+                    capture_dir,
+                )
+                return
+            proxy_pid = handoff["proxy_pid"]
+            handoff_worker_pid = handoff["worker_pid"]
+            proxy_create_time = _net_lifecycle.proc_create_time(proxy_pid)
+            proxy_cmdline_tail = _net_lifecycle.cmdline_tail(proxy_pid)
+            # F3-v9 PID-reuse defense before registering.
+            if not _net_lifecycle.is_pid_alive_with_create_time(
+                proxy_pid,
+                expected_create_time=proxy_create_time,
+                expected_cmdline_tail=proxy_cmdline_tail,
+            ):
+                logger.warning(
+                    "network handoff: proxy PID %s failed liveness check",
+                    proxy_pid,
+                )
+                return
+            try:
+                _pidfile.add_child(
+                    "mitmproxy",
+                    proxy_pid=proxy_pid,
+                    worker_pid=handoff_worker_pid,
+                    proxy_create_time=proxy_create_time,
+                    proxy_cmdline_tail=proxy_cmdline_tail,
+                )
+            except Exception:  # noqa: BLE001
+                logger.exception("failed to register proxy in recording.pid")
+            return
+
+        # Timeout — fall back to reading the file directly. If the worker
+        # SIGKILLed between handoff-write and event-signal, this still works.
+        handoff = _net_lifecycle.read_network_child_handoff(capture_dir)
+        if handoff is None:
+            # Worker may be dead and never wrote the file. Run orphan-cleanup
+            # so the user's system proxy is not left pointing at a dead port.
+            try:
+                import psutil as _psutil
+
+                worker_alive = _psutil.pid_exists(worker_pid)
+            except Exception:  # noqa: BLE001
+                worker_alive = False
+            if not worker_alive:
+                try:
+                    _net_lifecycle.restore_orphaned_proxy_state()
+                except Exception:  # noqa: BLE001
+                    logger.exception("orphan proxy restore failed")
 
     def _on_stop_click(self) -> None:
         """Handle a Stop Recording click from the menubar.
@@ -883,6 +1025,12 @@ class SessionController:
         self._finishing_workers = still_finishing
 
         for rw in reaped:
+            # Network teardown backstop: if the worker exited without writing
+            # .proxy_restored, run orphan-cleanup so the user's system proxy
+            # is not left pointing at a dead port. Then deregister the
+            # mitmproxy child from the pidfile + delete the handoff file.
+            self._reap_network_state(rw)
+
             self._enqueue_postprocess_for_worker(rw)
             # Wait briefly for the forwarder thread to notice the dead
             # worker and exit on its own, then release the per-recording

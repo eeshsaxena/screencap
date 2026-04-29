@@ -75,6 +75,12 @@ class Recording(Base):
         "AudioInfo", back_populates="recording", cascade="all, delete-orphan",
         order_by="AudioInfo.timestamp",
     )
+    network_events = sa.orm.relationship(
+        "NetworkEvent",
+        back_populates="recording",
+        order_by="NetworkEvent.timestamp_ns",
+        cascade="all, delete-orphan",
+    )
 
 
 class ActionEvent(Base):
@@ -284,3 +290,72 @@ class MemoryStat(Base):
     recording_id = sa.Column(sa.ForeignKey("recording.id"))
     memory_usage_bytes = sa.Column(ForceFloat)
     timestamp = sa.Column(ForceFloat)
+
+
+# Allowed values for NetworkEvent.kind. The DB column stores the SHORT form
+# (no "network." prefix); the Pydantic class's `type` field uses the dotted
+# EventType enum value. CRUD translates between them.
+NETWORK_EVENT_KINDS = ("request", "response", "ws_upgrade", "ws_frame", "drop_burst")
+
+
+class NetworkEvent(Base):
+    """A single network event captured by the system proxy.
+
+    V1 schema is metadata-only - body bytes are hashed-and-discarded by
+    the addon, never stored. The `kind` column stores the SHORT form
+    (request / response / ws_upgrade / ws_frame / drop_burst) for compact
+    SQL; the Pydantic event class's `type` field uses the dotted form
+    (network.request etc.).
+
+    `headers_json` holds the JSON-encoded `list[list[str, str]]` ordered
+    name/value pairs. For `kind="ws_upgrade"`, this column holds the
+    response (101 Switching Protocols) headers; the request headers go
+    in `details_json["request_headers"]`.
+
+    `details_json` is a kind-dependent JSON payload:
+      - `drop_burst`: {"dropped_count": int, "hosts_affected": [...],
+                       "source": "addon" | "reader"}
+      - `ws_upgrade`: {"request_headers": [[name, value], ...]}
+      - other kinds: NULL
+    """
+
+    __tablename__ = "network_event"
+    __table_args__ = (
+        sa.CheckConstraint(
+            "kind IN ('request', 'response', 'ws_upgrade', 'ws_frame', 'drop_burst')",
+            name="ck_network_event_kind",
+        ),
+    )
+
+    id = sa.Column(sa.Integer, primary_key=True)
+    recording_id = sa.Column(
+        sa.ForeignKey("recording.id", ondelete="CASCADE"), nullable=False
+    )
+
+    kind = sa.Column(sa.Text, nullable=False)
+    flow_id = sa.Column(sa.Text, nullable=True)
+
+    method = sa.Column(sa.Text, nullable=True)
+    url = sa.Column(sa.Text, nullable=True)
+    host = sa.Column(sa.Text, nullable=True)
+    status = sa.Column(sa.Integer, nullable=True)
+
+    # JSON-encoded list[list[str, str]] - ordered name/value pairs, NOT a dict
+    # (multi-value headers like duplicate Set-Cookie cannot survive a JSON dict).
+    headers_json = sa.Column(sa.Text, nullable=True)
+
+    body_size = sa.Column(sa.Integer, nullable=True)
+    body_sha256 = sa.Column(sa.LargeBinary(32), nullable=True)
+
+    content_type = sa.Column(sa.Text, nullable=True)
+    direction = sa.Column(sa.Text, nullable=True)
+    frame_type = sa.Column(sa.Text, nullable=True)
+    http_version = sa.Column(sa.Text, nullable=True)
+
+    # Kind-dependent JSON payload (see class docstring).
+    details_json = sa.Column(sa.Text, nullable=True)
+
+    timestamp = sa.Column(ForceFloat, nullable=False)
+    timestamp_ns = sa.Column(sa.BigInteger, nullable=False, index=True)
+
+    recording = sa.orm.relationship("Recording", back_populates="network_events")

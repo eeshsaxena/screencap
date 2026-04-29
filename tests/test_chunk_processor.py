@@ -742,6 +742,67 @@ class TestUnifiedEventExport:
 
         assert (cloud_capture_dir / "events_0000.jsonl").exists()
         assert not (cloud_capture_dir / "events_0000.jsonl.tmp").exists()
+    def test_v1_scope_guard_no_network_lines_in_chunk_jsonl(
+        self, cloud_capture_dir, recording_db,
+    ):
+        """V1 contract: chunk JSONL contains ZERO network.* lines.
+
+        The plan defers all JSONL emission of network events to V1.75
+        alongside the cloud bucket policy + build_cloud_network_filter
+        factory. V1 keeps network events DB-only -- the auto-export +
+        screencap upload paths cannot distinguish local-vs-cloud intent
+        at runtime, so wiring network rows into the chunk_processor
+        would silently leak metadata to the cloud bucket.
+        """
+        from screencap.engine.db import crud
+        from screencap.chunk_processor import ChunkProcessor
+
+        crud.insert_network_event(
+            recording_db.session,
+            recording_db.recording,
+            {
+                "kind": "request",
+                "flow_id": "flow-1",
+                "method": "GET",
+                "url": "https://example.com/api",
+                "host": "example.com",
+                "headers_json": json.dumps([["Host", "example.com"]]),
+                "body_size": 0,
+                "body_sha256": None,
+                "content_type": None,
+                "direction": None,
+                "frame_type": None,
+                "http_version": "HTTP/1.1",
+                "details_json": None,
+                "timestamp": 1000.5,
+                "timestamp_ns": 1_000_500_000_000,
+            },
+        )
+        crud.flush_buffers(recording_db.session)
+        self._insert_action(
+            recording_db, 1000.1, "click", mouse_x=1, mouse_y=2,
+            mouse_button_name="left", mouse_pressed=1,
+        )
+        self._insert_action(
+            recording_db, 1000.2, "click", mouse_x=1, mouse_y=2,
+            mouse_button_name="left", mouse_pressed=0,
+        )
+
+        q = multiprocessing.Queue()
+        ack_q = multiprocessing.Queue()
+        cp = ChunkProcessor(
+            cloud_capture_dir, q, ack_q, recording_name="test",
+            upload_enabled=False, auto_delete=False,
+        )
+        cp._export_events(0, 999.0, 1001.0)
+
+        lines = (cloud_capture_dir / "events_0000.jsonl").read_text().splitlines()
+        events = [json.loads(line) for line in lines if line.strip()]
+        types = [e.get("type") for e in events if not e.get("_meta")]
+        assert all(not (t or "").startswith("network.") for t in types), (
+            f"V1 must emit zero network.* lines; got types: {types}"
+        )
+
 
     def test_retains_mouse_move_events(self, cloud_capture_dir, recording_db):
         """R11 behavioral change: chunk export now KEEPS ``mouse.move`` events

@@ -260,4 +260,5 @@ A successor plan should retire this scaffolding by moving pointer suppression to
 - [privacy.md](./privacy.md) — what the privacy filter checks
 - [scrubbing.md](./scrubbing.md) — post-export text scrubbing and pointer-suppression intervals
 - [segmentation.md](./segmentation.md) — what the manifest carries alongside JSONL
+- [network-capture.md](./network-capture.md) — `unified_export_events` gained a kw-only `network_rows` parameter in V1, but every caller passes `None` — JSONL emission of network events is V1.75-coupled with the cloud bucket policy + `build_cloud_network_filter` factory; V1 keeps DB-only emission. Three explicit scope-guard tests assert zero `network.*` lines in CLI export, chunk JSONL, and recovery JSONL.
 - [Unified-callable refactor plan](../plans/2026-04-26-001-refactor-unified-export-callable-plan.md) — the plan that landed this structure (three callers, one callable; factory; scrub-layer pointer suppression; recovery format parity)

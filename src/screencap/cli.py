@@ -177,13 +177,25 @@ def _maybe_prompt_privacy_setup(*, cloud_intent: bool = False) -> None:
               default=None, help="Task segmentation: 'llm' (server-side) or 'idle' (gap detection).")
 @click.option("--no-scrub", is_flag=True, default=False,
               help="Disable PII/secrets scrubbing for this recording.")
+@click.option(
+    "--network",
+    is_flag=True,
+    default=False,
+    help=(
+        "Capture HTTP/HTTPS request/response metadata as a system proxy. "
+        "Off by default. First use installs a 30-day CA into your login "
+        "Keychain (one prompt) and configures the system web proxy (one "
+        "admin prompt). Bodies are NOT retained in V1; metadata only. "
+        "Run `screencap network restore` to recover proxy state after a crash."
+    ),
+)
 @click.option("--unlisted", is_flag=True, default=False,
               help="Hide this recording from the website (still uploads, just not listed).")
 def start(
     name, description, no_audio, no_video, no_images, no_window_data,
     output, no_wifi_metrics, no_app_versions,
     no_auto_name, local_only, force, verbose, chunk_duration, no_live_upload,
-    destination, segmentation_mode, no_scrub, unlisted,
+    destination, segmentation_mode, no_scrub, network, unlisted,
 ):
     """Record a screen capture session. Ctrl+C to stop.
 
@@ -402,6 +414,24 @@ def start(
         console.print(_RECORD_EXTRAS_MSG)
         raise SystemExit(1)
 
+    # Pin spawn mode at CLI entry BEFORE any mp.Queue/mp.Process is constructed.
+    # AES-GCM nonce safety (V1.5+) depends on os.urandom being independently
+    # seeded in the child; under fork mode the child inherits parent state.
+    # Asserting only inside run_proxy() is too late -- the parent has already
+    # forked/spawned by then. The `allow_none=True` is load-bearing: without
+    # it, get_start_method freezes the start-method context as a side effect.
+    if network:
+        import multiprocessing as _mp_init
+        _current_start = _mp_init.get_start_method(allow_none=True)
+        if _current_start is None:
+            _mp_init.set_start_method("spawn", force=True)
+        elif _current_start != "spawn":
+            console.print(
+                f"[red]Error:[/red] multiprocessing start method is "
+                f"{_current_start!r}; --network requires 'spawn'."
+            )
+            raise SystemExit(1)
+
     cli_args = {
         "name": name,
         "description": description or None,
@@ -425,6 +455,7 @@ def start(
         "show_on_website": show_on_website,
         "auto_name_enabled": auto_name_enabled,
         "local_only": local_only,
+        "network": network,
     }
 
     controller = SessionController(cli_args)
@@ -2404,6 +2435,52 @@ def _check_onnxruntime_excluded() -> tuple[str, bool, str]:
         return name, False, _tb.format_exc()
 
 
+@cli.group("network")
+def network_group() -> None:
+    """Manage the network capture CA + recover from crashes."""
+
+
+@network_group.command("uninstall")
+def network_uninstall_cmd() -> None:
+    """Remove the screencap proxy CA from your Keychain + clean up state.
+
+    Restores any orphaned proxy state FIRST (so your network is left
+    working regardless of how you got here), then uninstalls the CA
+    and deletes ~/.screencap/proxy/.
+
+    Never touches ~/.mitmproxy/ (which may belong to a separate
+    mitmproxy install).
+    """
+    from screencap.network.lifecycle import full_uninstall
+
+    console.print("[bold]Uninstalling screencap network capture...[/bold]")
+    full_uninstall()
+    console.print("[green]Done.[/green]")
+
+
+@network_group.command("restore")
+def network_restore_cmd() -> None:
+    """Restore system proxy state after a recording crash.
+
+    Idempotent: safe to run anytime. Scans for orphaned snapshots
+    (global sentinel + durable copies + per-recording-dir scan) and
+    restores via osascript admin. No-op if no orphans are found.
+    """
+    from screencap.network.lifecycle import restore_orphaned_proxy_state
+
+    console.print("[bold]Scanning for orphaned proxy state...[/bold]")
+    restored = restore_orphaned_proxy_state()
+    if restored:
+        console.print(
+            f"[green]Restored proxy state for {len(restored)} orphaned "
+            f"recording(s):[/green]"
+        )
+        for path in restored:
+            console.print(f"  • {path}")
+    else:
+        console.print("No orphaned proxy state found.")
+
+
 _SMOKE_CHECKS = [
     _check_presidio_analyzer,
     _check_fast_gliner,
@@ -2456,6 +2533,147 @@ def smoke_test(verbose):
         sys.exit(1)
     else:
         console.print(f"All {total} checks passed")
+
+
+# ---------------------------------------------------------------------------
+# _network-dump (hidden) - inspect captured network_event rows
+# ---------------------------------------------------------------------------
+
+
+@cli.command("_network-dump", hidden=True)
+@click.argument("name")
+@click.option("--limit", "limit", type=int, default=50, show_default=True,
+              help="Maximum number of rows to print.")
+@click.option("--kind", "kind", type=click.Choice([
+                  "request", "response", "ws_upgrade", "ws_frame", "drop_burst",
+              ]), default=None,
+              help="Filter rows by network event kind.")
+@click.option("--host", "host_substr", default=None,
+              help="Case-insensitive host substring filter.")
+@click.option("--verbose", "-v", is_flag=True, default=False,
+              help="Also print headers and details_json payloads.")
+def network_dump(name, limit, kind, host_substr, verbose):
+    """Inspect captured network_event rows for a recording (V1 debug helper).
+
+    V1 ships network capture as DB-only - events.jsonl contains zero
+    ``network.*`` lines. This subcommand reads the recording's
+    ``recording.db`` directly and prints the seeded rows for premise
+    validation. JSONL emission lands in V1.75 alongside the cloud-bound
+    network filter.
+    """
+    import sqlite3
+    from datetime import datetime
+
+    from screencap.config import get_recordings_dir
+
+    recording_dir = get_recordings_dir() / name
+    if not recording_dir.exists():
+        console.print(f"[red]Error:[/red] Recording not found: {name}")
+        sys.exit(1)
+    db_path = recording_dir / "recording.db"
+    if not db_path.is_file():
+        console.print(
+            f"[red]Error:[/red] recording.db not found in {recording_dir}",
+        )
+        sys.exit(1)
+
+    # Read-only URI mode keeps the helper safe alongside any concurrent
+    # reader (V1 has no live writer at inspection time, but URI ro is
+    # explicit about intent).
+    uri = f"file:{db_path}?mode=ro"
+    try:
+        conn = sqlite3.connect(uri, uri=True)
+    except sqlite3.OperationalError as exc:
+        console.print(f"[red]Error:[/red] failed to open {db_path}: {exc}")
+        sys.exit(1)
+    try:
+        conn.row_factory = sqlite3.Row
+        # Friendly message for pre-feature DBs / recordings made without --network.
+        cur = conn.execute(
+            "SELECT name FROM sqlite_master WHERE type='table' AND name='network_event'",
+        )
+        if cur.fetchone() is None:
+            console.print(
+                "No network events captured in this recording. "
+                "Did you start with --network?",
+            )
+            return
+
+        sql = "SELECT * FROM network_event WHERE 1 = 1"
+        params: list[object] = []
+        if kind is not None:
+            sql += " AND kind = ?"
+            params.append(kind)
+        if host_substr:
+            sql += " AND lower(host) LIKE ?"
+            params.append(f"%{host_substr.lower()}%")
+        # ``ORDER BY timestamp_ns`` is load-bearing - without it the rows
+        # are not guaranteed to be time-ordered (the table has an index
+        # on timestamp_ns but no implicit ordering on a SELECT *).
+        sql += " ORDER BY timestamp_ns LIMIT ?"
+        params.append(int(limit))
+        rows = conn.execute(sql, params).fetchall()
+
+        if not rows:
+            console.print(
+                "No network events captured in this recording. "
+                "Did you start with --network?",
+            )
+            return
+
+        for row in rows:
+            ts = row["timestamp"]
+            try:
+                ts_iso = datetime.fromtimestamp(float(ts)).isoformat(
+                    timespec="milliseconds",
+                )
+            except (TypeError, ValueError, OSError):
+                ts_iso = str(ts)
+
+            row_kind = row["kind"] or ""
+            method = row["method"] or "-"
+            host = row["host"] or "-"
+            status = row["status"] if row["status"] is not None else "-"
+            body_size = row["body_size"] if row["body_size"] is not None else 0
+            sha = row["body_sha256"]
+            if isinstance(sha, (bytes, bytearray, memoryview)):
+                sha_hex = bytes(sha).hex()
+                short_sha = sha_hex[:12]
+            else:
+                short_sha = "-"
+
+            url = row["url"] or "-"
+            if len(url) > 120:
+                url = url[:117] + "..."
+
+            console.print(
+                f"{ts_iso} {row_kind} {method} {host} {status} "
+                f"{body_size}B sha={short_sha}... {url}"
+            )
+
+            if verbose:
+                headers_json = row["headers_json"]
+                if headers_json:
+                    try:
+                        headers = json.loads(headers_json)
+                    except (TypeError, ValueError):
+                        headers = None
+                    if headers:
+                        console.print("    [dim]headers:[/dim]")
+                        for entry in headers:
+                            if isinstance(entry, (list, tuple)) and len(entry) == 2:
+                                console.print(f"      {entry[0]}: {entry[1]}")
+                            else:
+                                console.print(f"      {entry!r}")
+                details_json = row["details_json"]
+                if details_json:
+                    try:
+                        details = json.loads(details_json)
+                    except (TypeError, ValueError):
+                        details = details_json
+                    console.print(f"    [dim]details:[/dim] {details!r}")
+    finally:
+        conn.close()
 
 
 if __name__ == "__main__":

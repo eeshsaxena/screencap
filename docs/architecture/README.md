@@ -65,6 +65,7 @@ ScreenCap is a macOS CLI for screen recording with a privacy-aware capture pipel
 | [privacy.md](./privacy.md) | Two-layer enforcement: capture-time filter (action matrix, blocking sources, fail-closed) + detection pipeline (PII/secrets) |
 | [scrubbing.md](./scrubbing.md) | Three scrub flavors: post-hoc full scrub, per-chunk during cloud-intent recording, live cascade-delete from menubar |
 | [export-pipeline.md](./export-pipeline.md) | events.jsonl format v2, the shared processing chain, privacy-aware window switches |
+| [network-capture.md](./network-capture.md) | V1 network proxy logging: mitmproxy embedded as `mp.Process`, system proxy lifecycle, three-layer privacy, R10 redaction. Phasing: V1 metadata-only DB-only, V1.5 bodies+encryption, V1.75 cloud upload |
 | [segmentation.md](./segmentation.md) | Task segmentation: client v1 idle-gap vs Cloud Run v2 LLM (Gemini), validation + fallback |
 | [session.md](./session.md) | SessionController lifecycle, menubar subprocess (legacy + session modes), IPC topology, post-process worker |
 

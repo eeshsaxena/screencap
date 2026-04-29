@@ -236,10 +236,23 @@ class CaptureSession:
         if not db_path.exists():
             raise FileNotFoundError(f"Capture not found: {capture_dir}")
 
-        from screencap.engine.db import get_session_for_path
+        from screencap.engine.db import _ensure_network_tables, get_session_for_path
         from screencap.engine.db.models import Recording
 
         session = get_session_for_path(str(db_path))
+
+        # V1 network logging: idempotently create the network_event table
+        # for old recording.db files that pre-date the feature. Readonly
+        # DBs (chmod 444) skip migration and surface as the
+        # _network_tables_unavailable instance attribute below.
+        network_tables_ok = True
+        try:
+            network_tables_ok = _ensure_network_tables(session.get_bind())
+        except Exception:
+            # Defensive: any unexpected error degrades to "tables unavailable"
+            # rather than failing capture load entirely.
+            network_tables_ok = False
+
         try:
             recording = session.query(Recording).first()
         except Exception:
@@ -250,7 +263,10 @@ class CaptureSession:
             session.close()
             raise FileNotFoundError(f"Invalid capture (no recording found): {capture_dir}")
 
-        return cls(capture_dir, session, recording)
+        capture = cls(capture_dir, session, recording)
+        if not network_tables_ok:
+            capture._network_tables_unavailable = True
+        return capture
 
     @property
     def id(self) -> str:
