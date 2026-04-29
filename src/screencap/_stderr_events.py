@@ -32,6 +32,19 @@ from typing import Any
 _EVENT_SCHEMA_VERSION = 1
 
 
+# Event-type constants (todo 026). Use these everywhere instead of raw
+# string literals so a typo at an emit site fails at import time, renaming
+# is a single-site change, and tests share the same names as production.
+EVENT_STARTED = "started"
+EVENT_LOCK_CONTENDED = "lock_contended"
+EVENT_CHUNK_FINALIZED = "chunk_finalized"
+EVENT_RECORDING_FINALIZED = "recording_finalized"
+EVENT_DISK_FULL = "disk_full"
+EVENT_PERMISSION_LOST = "permission_lost"
+EVENT_STOPPED = "stopped"
+EVENT_MENUBAR_NEUTRALIZED_BY_ENV = "menubar_neutralized_by_env"
+
+
 def resolve_claimant() -> str:
     """Resolve the lock claimant identity from the SCREENCAP_PARENT env var.
 
@@ -65,4 +78,16 @@ def emit_event(event_type: str, **fields: Any) -> None:
         pass
 
 
-__all__ = ["emit_event", "resolve_claimant", "_EVENT_SCHEMA_VERSION"]
+__all__ = [
+    "emit_event",
+    "resolve_claimant",
+    "_EVENT_SCHEMA_VERSION",
+    "EVENT_STARTED",
+    "EVENT_LOCK_CONTENDED",
+    "EVENT_CHUNK_FINALIZED",
+    "EVENT_RECORDING_FINALIZED",
+    "EVENT_DISK_FULL",
+    "EVENT_PERMISSION_LOST",
+    "EVENT_STOPPED",
+    "EVENT_MENUBAR_NEUTRALIZED_BY_ENV",
+]

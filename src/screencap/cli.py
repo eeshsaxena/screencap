@@ -138,7 +138,16 @@ def _download_nlp_models() -> None:
 # `_emit_event` lives in the stdlib-only `screencap._stderr_events` module so
 # spawn workers and the recording hot loop can import it without dragging
 # Click + rich Console into the child process.
-from screencap._stderr_events import _EVENT_SCHEMA_VERSION, emit_event as _emit_event  # noqa: E402,F401
+from screencap._stderr_events import (  # noqa: E402,F401
+    _EVENT_SCHEMA_VERSION,
+    EVENT_DISK_FULL,
+    EVENT_LOCK_CONTENDED,
+    EVENT_PERMISSION_LOST,
+    EVENT_RECORDING_FINALIZED,
+    EVENT_STARTED,
+    EVENT_STOPPED,
+    emit_event as _emit_event,
+)
 
 
 def _maybe_download_nlp_models() -> None:
@@ -654,13 +663,13 @@ def start(
         controller.run()
     except SystemExit as se:
         exit_code = int(getattr(se, "code", 0) or 0)
-        _emit_event("stopped", exit_code=exit_code)
+        _emit_event(EVENT_STOPPED, exit_code=exit_code)
         raise
     except Exception as exc:  # noqa: BLE001
         console.print(f"[red]Session controller error:[/red] {exc}")
-        _emit_event("stopped", exit_code=1, error=str(exc))
+        _emit_event(EVENT_STOPPED, exit_code=1, error=str(exc))
         raise SystemExit(1)
-    _emit_event("stopped", exit_code=exit_code)
+    _emit_event(EVENT_STOPPED, exit_code=exit_code)
 
 
 def _legacy_start_recording(
@@ -1484,7 +1493,12 @@ def apps(as_json, include_spotlight):
               default=lambda: _should_default_to_json(),
               help="Emit machine-readable JSON to stdout (no styling, no rich output). "
                    "Auto-detected when stdout is not a TTY.")
-def status(as_json):
+@click.option("--no-nlp-check", is_flag=True, default=False,
+              help="Skip the are_nlp_models_cached() probe. SwiftUI / agents "
+                   "polling at 1Hz can pass this to shave fixed cost off the "
+                   "hot path (todo 018). nlp_models_cached field is reported "
+                   "as null when skipped.")
+def status(as_json, no_nlp_check):
     """Report recording state without IPC.
 
     Reads the flock-protected ``recording.lock`` content (Unit 3) and the
@@ -1513,7 +1527,7 @@ def status(as_json):
         claimant: str | None
         warning: str | None
         privacy_configured: bool
-        nlp_models_cached: bool
+        nlp_models_cached: bool | None  # None when --no-nlp-check is set
 
     # Read lock state once — flock probe is the canonical "is something live"
     # answer; the metadata file's content can lag (kernel auto-releases the
@@ -1535,6 +1549,11 @@ def status(as_json):
         "privacy_configured": False,
         "nlp_models_cached": False,
     }
+    if no_nlp_check:
+        # Caller opted out of the cache probe (todo 018). Report null so
+        # consumers can distinguish "skipped by request" from "checked,
+        # not cached" (False).
+        payload["nlp_models_cached"] = None
 
     if is_recording and metadata is not None:
         started_at = metadata.get("started_at")
@@ -1562,11 +1581,12 @@ def status(as_json):
     except Exception:
         pass
 
-    try:
-        from screencap.privacy import are_nlp_models_cached
-        payload["nlp_models_cached"] = bool(are_nlp_models_cached())
-    except Exception:
-        pass
+    if not no_nlp_check:
+        try:
+            from screencap.privacy import are_nlp_models_cached
+            payload["nlp_models_cached"] = bool(are_nlp_models_cached())
+        except Exception:
+            pass
 
     if as_json:
         sys.stdout.write(_json.dumps(payload) + "\n")

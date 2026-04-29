@@ -157,6 +157,21 @@ class TestStatusJson:
         assert "nlp_models_cached" in payload
         assert isinstance(payload["nlp_models_cached"], bool)
 
+    def test_no_nlp_check_flag_skips_probe(self):
+        """Todo 018: --no-nlp-check skips the are_nlp_models_cached() probe
+        and reports null. SwiftUI polling at high cadence opts out."""
+        from unittest import mock
+        runner = CliRunner()
+        with mock.patch("screencap.privacy.are_nlp_models_cached") as m:
+            result = runner.invoke(
+                cli, ["status", "--json", "--no-nlp-check"], catch_exceptions=False,
+            )
+        assert result.exit_code == 0
+        payload = json.loads(result.output.strip())
+        assert payload["nlp_models_cached"] is None
+        # Verify the probe itself was never called.
+        m.assert_not_called()
+
 
 class TestStatusHumanOutput:
     """When stdout is a TTY (no `--json` flag), the user sees human output.

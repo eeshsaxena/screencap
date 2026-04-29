@@ -678,7 +678,7 @@ def start_recording(
     # at __init__, and workers (start_recording invoked with
     # _skip_pidfile=True) inherit that lock by being children.
     if not _skip_pidfile:
-        from screencap._stderr_events import emit_event as _emit_event, resolve_claimant
+        from screencap._stderr_events import emit_event as _emit_event, resolve_claimant, EVENT_LOCK_CONTENDED
         from screencap.pidfile import LockContended, claim_lock
 
         claimant = resolve_claimant()
@@ -688,7 +688,7 @@ def start_recording(
             # Lifecycle events go on stderr (todo 004): stdout is reserved for
             # human-readable rich output.
             try:
-                _emit_event("lock_contended", owner=exc.owner)
+                _emit_event(EVENT_LOCK_CONTENDED, owner=exc.owner)
             except Exception:
                 pass
             raise SystemExit(2) from None
@@ -1265,7 +1265,7 @@ def start_recording(
                                 # Emit the structured stderr event for SwiftUI
                                 # consumption (Unit 8a contract).
                                 try:
-                                    from screencap._stderr_events import emit_event as _emit_event
+                                    from screencap._stderr_events import emit_event as _emit_event, EVENT_PERMISSION_LOST
                                     _emit_event(
                                         "permission_lost",
                                         permission=_missing,

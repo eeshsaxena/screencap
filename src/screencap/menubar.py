@@ -229,8 +229,8 @@ def _run_menubar(
     # the no-op behavior. Do not use it for security decisions.
     if os.environ.get("SCREENCAP_PARENT") == "swiftui":
         try:
-            from screencap._stderr_events import emit_event as _emit_event
-            _emit_event("menubar_neutralized_by_env", env="SCREENCAP_PARENT=swiftui")
+            from screencap._stderr_events import emit_event as _emit_event, EVENT_MENUBAR_NEUTRALIZED_BY_ENV
+            _emit_event(EVENT_MENUBAR_NEUTRALIZED_BY_ENV, env="SCREENCAP_PARENT=swiftui")
         except Exception:
             pass
         return

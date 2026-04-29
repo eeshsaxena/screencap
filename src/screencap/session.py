@@ -488,7 +488,12 @@ class SessionController:
         # _skip_pidfile=True) do NOT claim; they inherit the controller's lock
         # by virtue of being children. Lock auto-releases on death even if
         # explicit cleanup is missed.
-        from screencap._stderr_events import emit_event as _emit_event, resolve_claimant
+        from screencap._stderr_events import (
+            EVENT_LOCK_CONTENDED,
+            EVENT_STARTED,
+            emit_event as _emit_event,
+            resolve_claimant,
+        )
         from screencap.pidfile import LockContended, claim_lock
 
         claimant = resolve_claimant()
@@ -504,7 +509,7 @@ class SessionController:
             # RecorderController parses these as the canonical contract; stdout
             # is reserved for human-readable rich output.
             try:
-                _emit_event("lock_contended", owner=exc.owner)
+                _emit_event(EVENT_LOCK_CONTENDED, owner=exc.owner)
             except Exception:
                 pass
             raise SystemExit(2) from None
@@ -518,7 +523,7 @@ class SessionController:
         # construct paths via ``screencap list --json`` or by polling
         # ``screencap status --json`` once a recording is active.
         try:
-            _emit_event("started", claimant=claimant)
+            _emit_event(EVENT_STARTED, claimant=claimant)
         except Exception:
             pass
 
@@ -587,8 +592,8 @@ class SessionController:
             # from the unconditional os._exit(1) used below for the 3rd-tap
             # unrecoverable path.
             try:
-                from screencap._stderr_events import emit_event as _emit_event
-                _emit_event("stopped", exit_code=5)
+                from screencap._stderr_events import emit_event as _emit_event, EVENT_DISK_FULL, EVENT_RECORDING_FINALIZED, EVENT_STOPPED
+                _emit_event(EVENT_STOPPED, exit_code=5)
             except Exception:
                 pass
             os._exit(5)
@@ -998,7 +1003,7 @@ class SessionController:
         # SwiftUI polls on for Recordings list refresh, and it fires well
         # before background post-processing (chunk upload / NLP scrub) returns.
         try:
-            from screencap._stderr_events import emit_event as _emit_event
+            from screencap._stderr_events import emit_event as _emit_event, EVENT_DISK_FULL, EVENT_RECORDING_FINALIZED, EVENT_STOPPED
             _emit_event(
                 "recording_finalized",
                 name=rw.name,
@@ -1138,7 +1143,7 @@ class SessionController:
             # disk_full=False because the chunk-processor timeout case is
             # the typical path here, not a disk-space failure.
             try:
-                from screencap._stderr_events import emit_event as _emit_event
+                from screencap._stderr_events import emit_event as _emit_event, EVENT_DISK_FULL, EVENT_RECORDING_FINALIZED, EVENT_STOPPED
                 ready_meta = _read_recording_ready(rw.capture_dir)
                 _emit_event(
                     "recording_finalized",
