@@ -926,6 +926,13 @@ def _network_event_to_db_dict(event: Any, kind: str) -> dict[str, Any]:
     For ``ws_upgrade``: response headers go to ``headers_json``, request
     headers (if present in ``details_json``) stay in ``details_json``.
     For ``drop_burst``: ``flow_id`` is None (no associated flow).
+
+    V1.5 body-encryption fields (``body_ciphertext`` / ``body_nonce`` /
+    ``body_aad``) flow through ``getattr`` like any other column. The
+    addon populates them on encrypted body events; the writer persists
+    them so the export-time scrub pipeline can decrypt at read time.
+    Without this passthrough, encrypted bodies would arrive with all
+    three columns NULL — silently breaking the entire V1.5 contract.
     """
     from screencap.engine.convert import hex_to_bytes
 
@@ -951,6 +958,9 @@ def _network_event_to_db_dict(event: Any, kind: str) -> dict[str, Any]:
         "headers_json": json.dumps(headers_pairs) if headers_pairs else None,
         "body_size": getattr(event, "body_size", None),
         "body_sha256": sha_bytes,
+        "body_ciphertext": getattr(event, "body_ciphertext", None),
+        "body_nonce": getattr(event, "body_nonce", None),
+        "body_aad": getattr(event, "body_aad", None),
         "content_type": getattr(event, "content_type", None),
         "direction": getattr(event, "direction", None),
         "frame_type": getattr(event, "frame_type", None),
