@@ -453,3 +453,172 @@ class TestDictToNetworkEvent:
         event = dict_to_network_event(row)
         assert isinstance(event, NetworkRequestEvent)
         assert event.headers == [("A", "1"), ("B", "2")]
+
+
+# =============================================================================
+# V1.5 body-encryption conversion tests
+# =============================================================================
+
+
+class TestDictToNetworkEventV15:
+    """V1.5 body-encryption fields populate cleanly through the converter."""
+
+    def test_request_with_ciphertext(self):
+        """V1.5 row with all three ciphertext fields populated."""
+        from screencap.engine.convert import dict_to_network_event
+        from screencap.engine.events import NetworkRequestEvent
+
+        ciphertext = b"\xde\xad\xbe\xef" * 4
+        nonce = b"\x00" * 12
+        aad = b"recording_id=1|flow=abc"
+        row = {
+            "kind": "request",
+            "timestamp": 1.0,
+            "timestamp_ns": 1_000_000_000,
+            "flow_id": "flow-1",
+            "method": "POST",
+            "url": "https://example.com/api",
+            "host": "example.com",
+            "body_size": 16,
+            "body_ciphertext": ciphertext,
+            "body_nonce": nonce,
+            "body_aad": aad,
+        }
+        event = dict_to_network_event(row)
+        assert isinstance(event, NetworkRequestEvent)
+        assert event.body_ciphertext == ciphertext
+        assert event.body_nonce == nonce
+        assert event.body_aad == aad
+
+    def test_response_with_ciphertext(self):
+        from screencap.engine.convert import dict_to_network_event
+        from screencap.engine.events import NetworkResponseEvent
+
+        ciphertext = b"\x01\x02" * 8
+        nonce = b"\x11" * 12
+        aad = b"recording_id=2|flow=def"
+        row = {
+            "kind": "response",
+            "timestamp": 2.0,
+            "timestamp_ns": 2_000_000_000,
+            "flow_id": "flow-2",
+            "host": "api.example.com",
+            "status": 200,
+            "body_ciphertext": ciphertext,
+            "body_nonce": nonce,
+            "body_aad": aad,
+        }
+        event = dict_to_network_event(row)
+        assert isinstance(event, NetworkResponseEvent)
+        assert event.body_ciphertext == ciphertext
+
+    def test_ws_upgrade_with_ciphertext(self):
+        from screencap.engine.convert import dict_to_network_event
+        from screencap.engine.events import NetworkWebSocketUpgradeEvent
+
+        ciphertext = b"\xab" * 32
+        nonce = b"\x22" * 12
+        aad = b"recording_id=3|flow=ws"
+        row = {
+            "kind": "ws_upgrade",
+            "timestamp": 3.0,
+            "timestamp_ns": 3_000_000_000,
+            "flow_id": "ws-1",
+            "url": "wss://chat.example.com/socket",
+            "host": "chat.example.com",
+            "status": 101,
+            "body_ciphertext": ciphertext,
+            "body_nonce": nonce,
+            "body_aad": aad,
+        }
+        event = dict_to_network_event(row)
+        assert isinstance(event, NetworkWebSocketUpgradeEvent)
+        assert event.body_ciphertext == ciphertext
+
+    def test_ws_frame_with_ciphertext(self):
+        from screencap.engine.convert import dict_to_network_event
+        from screencap.engine.events import NetworkWebSocketFrameEvent
+
+        ciphertext = b"\xff" * 16
+        nonce = b"\x33" * 12
+        aad = b"recording_id=4|flow=ws_frame"
+        row = {
+            "kind": "ws_frame",
+            "timestamp": 4.0,
+            "timestamp_ns": 4_000_000_000,
+            "flow_id": "ws-1",
+            "host": "chat.example.com",
+            "direction": "received",
+            "frame_type": "text",
+            "body_ciphertext": ciphertext,
+            "body_nonce": nonce,
+            "body_aad": aad,
+        }
+        event = dict_to_network_event(row)
+        assert isinstance(event, NetworkWebSocketFrameEvent)
+        assert event.body_ciphertext == ciphertext
+
+    def test_v1_row_without_ciphertext_columns(self):
+        """Backward-compat: V1 rows (no ciphertext columns) convert with body fields = None."""
+        from screencap.engine.convert import dict_to_network_event
+        from screencap.engine.events import NetworkRequestEvent
+
+        # No body_ciphertext / body_nonce / body_aad keys at all
+        row = {
+            "kind": "request",
+            "timestamp": 1.0,
+            "timestamp_ns": 1_000_000_000,
+            "flow_id": "f",
+            "method": "GET",
+            "url": "https://x.com/",
+            "host": "x.com",
+        }
+        event = dict_to_network_event(row)
+        assert isinstance(event, NetworkRequestEvent)
+        assert event.body_ciphertext is None
+        assert event.body_nonce is None
+        assert event.body_aad is None
+
+    def test_explicit_none_ciphertext(self):
+        """Explicit None values produce None on the Pydantic event."""
+        from screencap.engine.convert import dict_to_network_event
+        from screencap.engine.events import NetworkRequestEvent
+
+        row = {
+            "kind": "request",
+            "timestamp": 1.0,
+            "timestamp_ns": 1_000_000_000,
+            "flow_id": "f",
+            "method": "GET",
+            "url": "https://x.com/",
+            "host": "x.com",
+            "body_ciphertext": None,
+            "body_nonce": None,
+            "body_aad": None,
+        }
+        event = dict_to_network_event(row)
+        assert isinstance(event, NetworkRequestEvent)
+        assert event.body_ciphertext is None
+
+    def test_memoryview_ciphertext_coerced_to_bytes(self):
+        """sqlite3 may surface BLOB columns as memoryview - convert to bytes."""
+        from screencap.engine.convert import dict_to_network_event
+        from screencap.engine.events import NetworkRequestEvent
+
+        raw = b"\x01\x02\x03"
+        row = {
+            "kind": "request",
+            "timestamp": 1.0,
+            "timestamp_ns": 1_000_000_000,
+            "flow_id": "f",
+            "method": "GET",
+            "url": "https://x.com/",
+            "host": "x.com",
+            "body_ciphertext": memoryview(raw),
+            "body_nonce": memoryview(b"\x00" * 12),
+            "body_aad": memoryview(b"a"),
+        }
+        event = dict_to_network_event(row)
+        assert isinstance(event, NetworkRequestEvent)
+        assert isinstance(event.body_ciphertext, bytes)
+        assert event.body_ciphertext == raw

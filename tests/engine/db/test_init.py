@@ -152,12 +152,13 @@ class TestEnsureNetworkTables:
         finally:
             capture.close()
 
-    def test_v1_does_not_create_network_event_meta(self, legacy_capture_dir):
-        """V1 does NOT create network_event_meta - that's V1.5.
+    def test_v1_5_creates_network_event_meta(self, legacy_capture_dir):
+        """V1.5: _ensure_network_tables also creates network_event_meta.
 
-        Locks the V1 scope: if a future V1.5 implementation lands the
-        meta table, this test must be updated. Catching its premature
-        appearance here closes the V1/V1.5 leakage gap.
+        V1 scope was metadata-only and intentionally omitted this table;
+        V1.5 introduces per-recording KEK-wrapped DEK metadata for body
+        encryption-at-rest. Loading a recording.db that pre-dates V1.5
+        must create both `network_event` and `network_event_meta`.
         """
         from screencap.engine.capture import Capture
 
@@ -171,9 +172,55 @@ class TestEnsureNetworkTables:
                 "SELECT name FROM sqlite_master WHERE type='table' "
                 "AND name='network_event_meta'"
             )
-            assert cur.fetchone() is None, (
-                "V1 must NOT create network_event_meta - that table is V1.5."
+            assert cur.fetchone() is not None, (
+                "V1.5: network_event_meta should be created by "
+                "_ensure_network_tables."
             )
+            # Spot-check expected columns
+            cur = conn.execute("PRAGMA table_info(network_event_meta)")
+            cols = {row[1] for row in cur.fetchall()}
+            assert "recording_id" in cols
+            assert "dek_wrapped" in cols
+            assert "dek_nonce" in cols
+            assert "created_at" in cols
+            # Locked: no kek_version column in V1.5 (rotation deferred to V2)
+            assert "kek_version" not in cols, (
+                "V1.5 explicitly omits kek_version - KEK rotation is V2."
+            )
+        finally:
+            conn.close()
+
+    def test_ensure_network_tables_idempotent_on_meta(self, legacy_capture_dir):
+        """V1.5: second call to _ensure_network_tables must be a no-op for meta.
+
+        Mirrors the existing `test_idempotent_on_second_load` behavior for
+        the new V1.5 meta table - ensures `Table.create(engine, checkfirst=True)`
+        works for both tables.
+        """
+        from screencap.engine.capture import Capture
+
+        # First load creates both tables
+        capture1 = Capture.load(legacy_capture_dir)
+        capture1.close()
+
+        # Second load must not crash on existing meta table
+        capture2 = Capture.load(legacy_capture_dir)
+        try:
+            assert capture2._recording is not None
+        finally:
+            capture2.close()
+
+        # Both tables still present
+        db_path = legacy_capture_dir / "recording.db"
+        conn = sqlite3.connect(str(db_path))
+        try:
+            for table_name in ("network_event", "network_event_meta"):
+                cur = conn.execute(
+                    "SELECT name FROM sqlite_master WHERE type='table' "
+                    "AND name=?",
+                    (table_name,),
+                )
+                assert cur.fetchone() is not None, f"{table_name} should still exist"
         finally:
             conn.close()
 

@@ -1,6 +1,7 @@
 """CRUD operations for the recording database."""
 
 import json
+import time
 from typing import Any
 
 import sqlalchemy as sa
@@ -12,6 +13,7 @@ from screencap.engine.db.models import (
     AudioInfo,
     MemoryStat,
     NetworkEvent,
+    NetworkEventMeta,
     PerformanceStat,
     Recording,
     Screenshot,
@@ -202,6 +204,14 @@ def insert_network_event(
     `headers_json` and `details_json` should be JSON-encoded strings;
     `body_sha256` should be raw 32-byte digest (not hex).
 
+    V1.5 body-encryption fields (`body_ciphertext`, `body_nonce`,
+    `body_aad`) are passed through `event_data` like any other column.
+    The schema's CheckConstraint enforces AAD-non-null when ciphertext
+    is non-null on fresh V1.5 recordings; callers MUST always pass AAD
+    alongside ciphertext to satisfy the application-layer invariant on
+    migrated recordings (where the constraint cannot be retroactively
+    added without a table rewrite).
+
     Args:
         session: The database session.
         recording: The recording object.
@@ -212,6 +222,42 @@ def insert_network_event(
         "recording_id": recording.id,
     }
     _insert(session, event_data, NetworkEvent, network_events)
+
+
+def insert_network_event_meta(
+    session: SaSession,
+    recording_id: int,
+    dek_wrapped: bytes,
+    dek_nonce: bytes,
+    created_at: float | None = None,
+) -> None:
+    """Insert the per-recording KEK-wrapped DEK metadata row (V1.5).
+
+    One-shot per recording: NetworkEventMeta is a single row written
+    once at recording start, before the proxy mp.Process spawns. There
+    is no buffer (unlike `insert_network_event`) - the meta row must
+    be visible by the time the addon emits its first encrypted body
+    so export-time decryption can resolve the DEK.
+
+    Args:
+        session: The database session.
+        recording_id: ID of the recording this meta row belongs to.
+        dek_wrapped: AES-GCM ciphertext of the per-recording DEK
+            (wrapped with the long-lived KEK).
+        dek_nonce: 12-byte nonce used to wrap the DEK.
+        created_at: Unix seconds at recording start. Defaults to
+            `time.time()` if not provided.
+    """
+    if created_at is None:
+        created_at = time.time()
+    meta = NetworkEventMeta(
+        recording_id=recording_id,
+        dek_wrapped=dek_wrapped,
+        dek_nonce=dek_nonce,
+        created_at=created_at,
+    )
+    session.add(meta)
+    session.commit()
 
 
 def insert_perf_stat(

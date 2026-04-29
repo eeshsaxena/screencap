@@ -269,6 +269,24 @@ def _coerce_sha256_hex(value) -> str | None:
     return None
 
 
+def _coerce_blob(value) -> bytes | None:
+    """Normalize a SQLAlchemy/sqlite3 LargeBinary column value to bytes (or None).
+
+    Accepts ``bytes`` / ``bytearray`` / ``memoryview`` and returns canonical
+    ``bytes``. Returns None for None or unsupported types so callers can
+    blindly forward V1 rows (where the ciphertext columns may be absent).
+    """
+    if value is None:
+        return None
+    if isinstance(value, bytes):
+        return value
+    if isinstance(value, bytearray):
+        return bytes(value)
+    if isinstance(value, memoryview):
+        return value.tobytes()
+    return None
+
+
 def dict_to_network_event(row: dict) -> NetworkEvent | None:
     """Convert a network_event DB row dict to a Pydantic network event.
 
@@ -276,6 +294,11 @@ def dict_to_network_event(row: dict) -> NetworkEvent | None:
     ws_upgrade / ws_frame / drop_burst). Mirrors the exception tolerance
     of :func:`dict_to_action_event` - returns None on unknown kind, logs
     and returns None when conversion fails.
+
+    V1.5 body-encryption columns (`body_ciphertext`, `body_nonce`,
+    `body_aad`) are forwarded as bytes when present on the row. V1 rows
+    (without these columns) convert cleanly with body fields = None
+    because `row.get(...)` defaults to None.
 
     Args:
         row: Dict with network_event DB column names.
@@ -292,6 +315,10 @@ def dict_to_network_event(row: dict) -> NetworkEvent | None:
     flow_id = row.get("flow_id") or ""
     host = row.get("host") or ""
 
+    body_ciphertext = _coerce_blob(row.get("body_ciphertext"))
+    body_nonce = _coerce_blob(row.get("body_nonce"))
+    body_aad = _coerce_blob(row.get("body_aad"))
+
     try:
         if kind == "request":
             return NetworkRequestEvent(
@@ -306,6 +333,9 @@ def dict_to_network_event(row: dict) -> NetworkEvent | None:
                 body_sha256_hex=_coerce_sha256_hex(row.get("body_sha256")),
                 content_type=row.get("content_type"),
                 http_version=row.get("http_version"),
+                body_ciphertext=body_ciphertext,
+                body_nonce=body_nonce,
+                body_aad=body_aad,
             )
         elif kind == "response":
             return NetworkResponseEvent(
@@ -319,6 +349,9 @@ def dict_to_network_event(row: dict) -> NetworkEvent | None:
                 body_sha256_hex=_coerce_sha256_hex(row.get("body_sha256")),
                 content_type=row.get("content_type"),
                 http_version=row.get("http_version"),
+                body_ciphertext=body_ciphertext,
+                body_nonce=body_nonce,
+                body_aad=body_aad,
             )
         elif kind == "ws_upgrade":
             return NetworkWebSocketUpgradeEvent(
@@ -331,6 +364,9 @@ def dict_to_network_event(row: dict) -> NetworkEvent | None:
                 headers=_parse_headers_json(row.get("headers_json")),
                 http_version=row.get("http_version"),
                 details_json=_parse_details_json(row.get("details_json")),
+                body_ciphertext=body_ciphertext,
+                body_nonce=body_nonce,
+                body_aad=body_aad,
             )
         elif kind == "ws_frame":
             direction = row.get("direction")
@@ -354,6 +390,9 @@ def dict_to_network_event(row: dict) -> NetworkEvent | None:
                 frame_type=frame_type,
                 body_size=row.get("body_size"),
                 body_sha256_hex=_coerce_sha256_hex(row.get("body_sha256")),
+                body_ciphertext=body_ciphertext,
+                body_nonce=body_nonce,
+                body_aad=body_aad,
             )
         elif kind == "drop_burst":
             details = _parse_details_json(row.get("details_json"))
