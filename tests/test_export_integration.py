@@ -1240,3 +1240,63 @@ def test_write_events_jsonl_streaming_memory_bound(tmp_path):
         f"internally (e.g., list(events) inside the function body) "
         f"instead of streaming one event at a time."
     )
+
+
+def test_v1_scope_guard_no_network_lines_in_capture_export(tmp_path):
+    """V1 contract: Capture.export_events() emits ZERO network.* lines.
+
+    The CLI export path calls Capture.export_events() which in turn
+    delegates to unified_export_events with network_rows=None (per V1
+    plan scope at lines 919-921 + 47-48). Wiring network_rows in V1
+    would silently leak metadata to cloud the next time a user runs
+    `screencap upload` on a previously-recorded local session.
+    """
+    from screencap.engine.db import crud
+    from screencap.exporter import build_export_metadata, export_recording
+
+    rec_dir = tmp_path / "v1-network-rec"
+    rec_dir.mkdir()
+    db_path = rec_dir / "recording.db"
+
+    # Seed standard test data + a network_event row.
+    create_export_test_db(db_path)
+
+    # Insert a network_event row directly via crud + get_session_for_path.
+    from screencap.engine.db import get_session_for_path
+
+    session = get_session_for_path(str(db_path))
+    recording = session.query(crud.Recording).first()
+    crud.insert_network_event(
+        session,
+        recording,
+        {
+            "kind": "request",
+            "flow_id": "flow-X",
+            "method": "GET",
+            "url": "https://example.com/api/secret",
+            "host": "example.com",
+            "headers_json": json.dumps([["Host", "example.com"]]),
+            "body_size": 0,
+            "body_sha256": None,
+            "content_type": None,
+            "direction": None,
+            "frame_type": None,
+            "http_version": "HTTP/1.1",
+            "details_json": None,
+            "timestamp": 1004.0,
+            "timestamp_ns": 1_004_000_000_000,
+        },
+    )
+    crud.flush_buffers(session)
+    session.close()
+
+    out_file = str(rec_dir / "events.jsonl")
+    meta = build_export_metadata(exclude_moves=False)
+    export_recording(rec_dir, out_file, exclude_moves=False, metadata=meta)
+
+    lines = open(out_file).read().strip().split("\n")
+    events = [json.loads(line) for line in lines[1:]]  # skip _meta
+    types = [e.get("type") for e in events]
+    assert all(not (t or "").startswith("network.") for t in types), (
+        f"V1 Capture.export_events() must emit zero network.* lines; got types: {types}"
+    )

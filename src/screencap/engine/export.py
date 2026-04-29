@@ -29,6 +29,7 @@ from screencap.engine.processing import (
     DOUBLE_CLICK_INTERVAL_SECONDS,
     KEY_TYPE_MERGE_INTERVAL_SECONDS,
     deduplicate_window_events,
+    interleave_network_events,
     interleave_window_events,
     process_events,
 )
@@ -48,6 +49,7 @@ def unified_export_events(
     double_click_distance: float = DOUBLE_CLICK_DISTANCE_PIXELS,
     key_type_merge_interval: float = KEY_TYPE_MERGE_INTERVAL_SECONDS,
     window_filter: Callable[[WindowSwitchEvent], WindowSwitchEvent | None] | None = None,
+    network_rows: list[dict] | None = None,
 ) -> Iterator[BaseEvent]:
     """Convert raw DB row dicts into a time-ordered Pydantic event stream.
 
@@ -59,7 +61,7 @@ def unified_export_events(
        conversion (e.g., Pydantic ``ValidationError`` on type-wrong
        fields, ``KeyError``, ``TypeError``) are also skipped with a
        debug-level log entry. This mirrors the pre-refactor chunk
-       processor's tolerance — without the inner try/except, one bad
+       processor's tolerance - without the inner try/except, one bad
        row would crash the entire chunk export, and recovery's
        skip-on-error policy would then lose the WHOLE chunk instead
        of just the bad row.
@@ -70,7 +72,7 @@ def unified_export_events(
        consuming the iterator.
     4. If ``initial_window_row`` is provided, prepend it to ``window_rows``
        before deduplication. The caller is responsible for any
-       timestamp rewrite (R3 — typically ``start_ts - 0.001``).
+       timestamp rewrite (R3 - typically ``start_ts - 0.001``).
     5. Run ``deduplicate_window_events`` over the (optionally prepended)
        window rows to produce ``WindowSwitchEvent`` instances keyed by
        ``(app_bundle_id, window_id)``.
@@ -79,15 +81,21 @@ def unified_export_events(
        are dropped.
     7. Run ``interleave_window_events`` to merge action and window
        sequences into a single time-ordered list.
-    8. Yield each event from the combined sequence.
+    8. If ``network_rows`` is provided (V1: every caller keeps it
+       ``None`` - events.jsonl emission of ``network.*`` lines is V1.75),
+       convert each row via ``dict_to_network_event`` (per-row exception
+       tolerance mirrors the action-row block above), then call
+       ``interleave_network_events`` so the final stream is window-first,
+       action-second, network-third on equality.
+    9. Yield each event from the combined sequence.
 
     R18 honest framing: the function returns an ``Iterator``, but
     ``process_events``' 11-stage merge pipeline materializes its
-    action-event list internally — click pairing needs lookahead, drag
+    action-event list internally - click pairing needs lookahead, drag
     detection needs lookback, key.type merging needs aggregate state.
     The engine cannot stream through that stage. This iterator yields
     events from the materialized post-``interleave`` sequence one at a
-    time, which avoids ONE extra list copy at the engine→writer
+    time, which avoids ONE extra list copy at the engine->writer
     boundary. Peak RSS is bounded by ``process_events``' working set
     (~the size of the materialized action-event list), not by single
     event size.
@@ -117,20 +125,27 @@ def unified_export_events(
             ``screencap.privacy.filter.build_cloud_window_filter`` (R5).
             ``None`` (the default) passes all dedup'd window events
             through unchanged.
+        network_rows: Optional dict rows from ``network_event`` table
+            (sorted by timestamp). When ``None`` (the default), the
+            output contains zero ``network.*`` events. **In V1, every
+            caller passes ``None``** - JSONL emission of network events
+            is gated on V1.75's cloud-bound filter wiring; V1's
+            premise validation runs against ``recording.db.network_event``
+            directly via ``screencap _network-dump``.
 
     Yields:
         ``BaseEvent`` instances in non-decreasing timestamp order:
         processed ``ActionEvent`` types interleaved with
-        ``WindowSwitchEvent`` instances.
+        ``WindowSwitchEvent`` instances (and, in V1.75+, network events).
     """
-    from screencap.engine.convert import dict_to_action_event
+    from screencap.engine.convert import dict_to_action_event, dict_to_network_event
 
     # 1. Convert action_rows to Pydantic events; skip rows that fail
     #    conversion. ``dict_to_action_event`` returns ``None`` for
     #    unrecognized shapes (handled silently) but can RAISE for
     #    type-wrong values (Pydantic ``ValidationError``, ``KeyError``,
     #    ``TypeError``, etc.). Mirrors the pre-refactor chunk processor's
-    #    tolerance — without this try/except, one bad row would crash
+    #    tolerance - without this try/except, one bad row would crash
     #    the entire chunk export, and recovery's skip-on-error policy
     #    would then lose the WHOLE chunk instead of just the bad row.
     actions: list[ActionEvent] = []
@@ -148,7 +163,7 @@ def unified_export_events(
             actions.append(evt)
 
     # 2. Run the merge pipeline. Note: process_events materializes the
-    #    full list — the iterator return type does not stream through
+    #    full list - the iterator return type does not stream through
     #    this stage (see docstring R18 discussion).
     processed = process_events(
         actions,
@@ -177,6 +192,30 @@ def unified_export_events(
     # 7. Interleave action and window sequences by timestamp.
     combined = interleave_window_events(processed, window_switches)
 
-    # 8. Yield one event at a time. This trims a list copy at the
-    #    engine→writer boundary (R18) without changing peak RSS.
+    # 8. Convert + interleave network rows when supplied. Per-row
+    #    exception tolerance mirrors the action-row block above so a
+    #    single malformed row is debug-logged and skipped (V1 keeps the
+    #    metadata in the DB regardless; JSONL emission lands in V1.75).
+    if network_rows is not None:
+        network_events: list[BaseEvent] = []
+        for row in network_rows:
+            try:
+                net_evt = dict_to_network_event(row)
+            except Exception as exc:
+                logger.debug(
+                    "Skipping malformed network event at ts=%s: %s",
+                    row.get("timestamp", "?"),
+                    exc,
+                )
+                continue
+            if net_evt is not None:
+                network_events.append(net_evt)
+        # Defensive sort - callers fetch by ``ORDER BY timestamp_ns``
+        # but the dict-input contract cannot enforce that. Sorting
+        # here keeps the merge invariant intact for any caller.
+        network_events.sort(key=lambda e: e.timestamp)
+        combined = interleave_network_events(combined, network_events)
+
+    # 9. Yield one event at a time. This trims a list copy at the
+    #    engine->writer boundary (R18) without changing peak RSS.
     yield from combined
