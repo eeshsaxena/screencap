@@ -73,6 +73,37 @@ struct MainWindow: View {
                 .help("Refresh recordings")
             }
         }
+        .onChange(of: section) { new in
+            if new != .recordings { selectedDate = nil }
+        }
+    }
+
+    private var sidebar: some View {
+        List(selection: $section) {
+            NavigationLink(value: Section.calendar) {
+                Label("Calendar", systemImage: "calendar")
+            }
+            NavigationLink(value: Section.recordings) {
+                Label("Recordings", systemImage: "list.bullet.rectangle")
+            }
+            NavigationLink(value: Section.privacy) {
+                Label("Privacy", systemImage: "lock.shield")
+            }
+            .disabled(true)
+        }
+        .listStyle(.sidebar)
+        .frame(minWidth: 180)
+        .navigationTitle("ScreenCap")
+        .toolbar {
+            ToolbarItem(placement: .primaryAction) {
+                Button {
+                    Task { await index.refresh() }
+                } label: {
+                    Image(systemName: "arrow.clockwise")
+                }
+                .help("Refresh recordings")
+            }
+        }
     }
 
     @ViewBuilder
