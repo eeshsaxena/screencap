@@ -12,11 +12,12 @@ import io
 import json
 import re
 import shutil
-import sqlite3
 import subprocess
 from pathlib import Path
 
 from rich.console import Console
+
+from screencap.recording_db import Connection, Cursor, has_column, has_table, open_recording_db
 
 console = Console()
 
@@ -55,44 +56,30 @@ def _sample_screenshots_from_db(db_path: Path, max_count: int = 5) -> list[str]:
     png_data blobs. Samples first, last, and evenly-spaced screenshots.
     """
     try:
-        conn = sqlite3.connect(str(db_path))
-        cur = conn.cursor()
+        with open_recording_db(db_path) as conn:
+            if not has_table(conn, "screenshot"):
+                return []
 
-        # Check which tables exist
-        cur.execute("SELECT name FROM sqlite_master WHERE type='table'")
-        tables = {row[0] for row in cur.fetchall()}
+            recording_dir = db_path.parent
+            cur = conn.cursor()
 
-        if "screenshot" not in tables:
-            conn.close()
-            return []
+            # Try file-based screenshots first
+            if has_column(conn, "screenshot", "image_path"):
+                result = _sample_screenshots_from_files(
+                    conn, cur, recording_dir, max_count
+                )
+                if result:
+                    return result
 
-        # Check if image_path column exists
-        cur.execute("PRAGMA table_info(screenshot)")
-        columns = {row[1] for row in cur.fetchall()}
-        has_image_path = "image_path" in columns
-
-        recording_dir = db_path.parent
-
-        # Try file-based screenshots first
-        if has_image_path:
-            result = _sample_screenshots_from_files(
-                conn, cur, recording_dir, max_count
-            )
-            if result:
-                conn.close()
-                return result
-
-        # Fall back to blob-based screenshots
-        result = _sample_screenshots_from_blobs(conn, cur, max_count)
-        conn.close()
-        return result
+            # Fall back to blob-based screenshots
+            return _sample_screenshots_from_blobs(conn, cur, max_count)
     except Exception:
         return []
 
 
 def _sample_screenshots_from_files(
-    conn: sqlite3.Connection,
-    cur: sqlite3.Cursor,
+    conn: Connection,
+    cur: Cursor,
     recording_dir: Path,
     max_count: int,
 ) -> list[str]:
@@ -126,8 +113,8 @@ def _sample_screenshots_from_files(
 
 
 def _sample_screenshots_from_blobs(
-    conn: sqlite3.Connection,
-    cur: sqlite3.Cursor,
+    conn: Connection,
+    cur: Cursor,
     max_count: int,
 ) -> list[str]:
     """Sample screenshots from png_data blobs in DB."""
@@ -207,44 +194,41 @@ def _resize_and_encode(img) -> str:
 def _summarize_action_events(db_path: Path, limit: int = 50) -> list[dict]:
     """Extract deduplicated (name, window_title, app) tuples from action events."""
     try:
-        conn = sqlite3.connect(str(db_path))
-        cur = conn.cursor()
+        with open_recording_db(db_path) as conn:
+            events = []
+            seen = set()
 
-        cur.execute("SELECT name FROM sqlite_master WHERE type='table'")
-        tables = {row[0] for row in cur.fetchall()}
+            has_actions = has_table(conn, "action_event")
+            has_windows = has_table(conn, "window_event")
 
-        events = []
-        seen = set()
+            if has_actions and has_windows:
+                rows = conn.execute(
+                    "SELECT ae.name, we.title "
+                    "FROM action_event ae "
+                    # Canonical cross-reference: the recorder always populates
+                    # window_event_timestamp on action events. Timestamp-based
+                    # joins are the standard pattern (see also capture.py).
+                    "LEFT JOIN window_event we "
+                    "ON ae.window_event_timestamp = we.timestamp "
+                    "ORDER BY ae.timestamp "
+                    "LIMIT 500"
+                ).fetchall()
+                for row in rows:
+                    key = (row[0], row[1])
+                    if key not in seen:
+                        seen.add(key)
+                        events.append({"event_type": row[0], "window_title": row[1]})
+                        if len(events) >= limit:
+                            break
+            elif has_actions:
+                rows = conn.execute(
+                    "SELECT DISTINCT name FROM action_event ORDER BY timestamp LIMIT ?",
+                    (limit,),
+                ).fetchall()
+                for row in rows:
+                    events.append({"event_type": row[0]})
 
-        if "action_event" in tables and "window_event" in tables:
-            cur.execute(
-                "SELECT ae.name, we.title "
-                "FROM action_event ae "
-                # Canonical cross-reference: the recorder always populates
-                # window_event_timestamp on action events. Timestamp-based
-                # joins are the standard pattern (see also capture.py).
-                "LEFT JOIN window_event we "
-                "ON ae.window_event_timestamp = we.timestamp "
-                "ORDER BY ae.timestamp "
-                "LIMIT 500"
-            )
-            for row in cur.fetchall():
-                key = (row[0], row[1])
-                if key not in seen:
-                    seen.add(key)
-                    events.append({"event_type": row[0], "window_title": row[1]})
-                    if len(events) >= limit:
-                        break
-        elif "action_event" in tables:
-            cur.execute(
-                "SELECT DISTINCT name FROM action_event ORDER BY timestamp LIMIT ?",
-                (limit,),
-            )
-            for row in cur.fetchall():
-                events.append({"event_type": row[0]})
-
-        conn.close()
-        return events
+            return events
     except Exception:
         return []
 
@@ -252,23 +236,15 @@ def _summarize_action_events(db_path: Path, limit: int = 50) -> list[dict]:
 def _collect_window_titles(db_path: Path) -> list[str]:
     """Extract unique window titles from window_event table."""
     try:
-        conn = sqlite3.connect(str(db_path))
-        cur = conn.cursor()
-
-        cur.execute("SELECT name FROM sqlite_master WHERE type='table'")
-        tables = {row[0] for row in cur.fetchall()}
-
-        titles = []
-        if "window_event" in tables:
-            cur.execute(
+        with open_recording_db(db_path) as conn:
+            if not has_table(conn, "window_event"):
+                return []
+            rows = conn.execute(
                 "SELECT DISTINCT title FROM window_event "
                 "WHERE title IS NOT NULL AND title != '' "
                 "LIMIT 100"
-            )
-            titles = [row[0] for row in cur.fetchall()]
-
-        conn.close()
-        return titles
+            ).fetchall()
+            return [row[0] for row in rows]
     except Exception:
         return []
 
@@ -711,32 +687,13 @@ def _run_provider_chain(context: dict, local_only: bool = False) -> dict | None:
 def _update_task_description(db_path: Path, description: str) -> None:
     """Update task_description in the recording table."""
     try:
-        conn = sqlite3.connect(str(db_path))
-        cur = conn.cursor()
-
-        cur.execute("SELECT name FROM sqlite_master WHERE type='table'")
-        tables = {row[0] for row in cur.fetchall()}
-
-        if "recording" in tables:
-            # Check if task_description column exists
-            cur.execute("PRAGMA table_info(recording)")
-            columns = {row[1] for row in cur.fetchall()}
-            if "task_description" in columns:
-                cur.execute(
+        with open_recording_db(db_path, read_only=False) as conn:
+            if has_table(conn, "recording") and has_column(conn, "recording", "task_description"):
+                conn.execute(
                     "UPDATE recording SET task_description = ?",
                     (description,),
                 )
-        elif "capture" in tables:
-            cur.execute("PRAGMA table_info(capture)")
-            columns = {row[1] for row in cur.fetchall()}
-            if "task_description" in columns:
-                cur.execute(
-                    "UPDATE capture SET task_description = ?",
-                    (description,),
-                )
-
-        conn.commit()
-        conn.close()
+                conn.commit()
     except Exception:
         pass
 

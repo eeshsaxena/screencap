@@ -191,6 +191,20 @@ class PrivacyConfig:
         if isinstance(self.app_classes, dict):
             object.__setattr__(self, "app_classes", MappingProxyType(self.app_classes))
 
+    def __getstate__(self) -> dict[str, object]:
+        # MappingProxyType is not picklable; convert to plain dict for transport.
+        # __post_init__ on the unpickled instance re-wraps it.
+        state = self.__dict__.copy()
+        if isinstance(state.get("app_classes"), MappingProxyType):
+            state["app_classes"] = dict(state["app_classes"])
+        # mask_title_patterns: re.Pattern is picklable in 3.7+; leave as-is.
+        return state
+
+    def __setstate__(self, state: dict[str, object]) -> None:
+        for key, value in state.items():
+            object.__setattr__(self, key, value)
+        self.__post_init__()
+
 
 class InvalidPrivacyConfigError(Exception):
     """Raised when the [privacy] config section is malformed."""

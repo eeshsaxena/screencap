@@ -79,7 +79,7 @@ Run these checks against the recording directory (`~/.screencap/recordings/<test
 
 #### 5a. File Structure Checks
 - [ ] Recording directory exists
-- [ ] Database file exists (`recording.db` or `capture.db`)
+- [ ] Database file exists (`recording.db`)
 - [ ] `screenshots/` directory exists (if images were enabled)
 - [ ] Screenshots directory has at least 1 file
 - [ ] If audio was enabled: `audio.flac` exists and is > 1KB
@@ -87,8 +87,8 @@ Run these checks against the recording directory (`~/.screencap/recordings/<test
 
 #### 5b. Database Checks
 Open the SQLite DB and verify:
-- [ ] Expected tables exist (`recording` + `action_event`, or `capture` + `events`)
-- [ ] Recording/capture row exists with a valid timestamp
+- [ ] Expected tables exist (`recording` + `action_event`)
+- [ ] Recording row exists with a valid timestamp
 - [ ] At least 1 action event was recorded
 - [ ] Event timestamps are within a reasonable range (between recording start and now)
 - [ ] Multiple event types present (mouse moves, clicks, key presses — at least 2 types)

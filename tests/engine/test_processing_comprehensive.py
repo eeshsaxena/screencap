@@ -909,28 +909,6 @@ class TestSmartMagnifyEventTypes:
         assert isinstance(result[0], MouseSmartMagnifyEvent)
         assert isinstance(result[1], MouseMagnifyEvent)
 
-    def test_smart_magnify_db_roundtrip(self, tmp_path):
-        """SmartMagnify events persist through CaptureStorage write/read."""
-        from screencap.engine.storage import Capture, CaptureStorage
-
-        db_path = tmp_path / "test.db"
-        storage = CaptureStorage(db_path)
-        capture = Capture(
-            id="test", started_at=0.0, platform="darwin",
-            screen_width=1920, screen_height=1080,
-        )
-        storage.init_capture(capture)
-
-        ev = MouseSmartMagnifyEvent(timestamp=1.0, x=500, y=300)
-        storage.write_event(ev)
-
-        events = storage.get_events()
-        assert len(events) == 1
-        assert isinstance(events[0], MouseSmartMagnifyEvent)
-        assert events[0].x == 500
-        assert events[0].y == 300
-        storage.close()
-
     def test_convert_action_event_smart_magnify(self):
         """Legacy DB conversion handles smart_magnify events."""
         from unittest.mock import MagicMock
@@ -949,8 +927,7 @@ class TestSmartMagnifyEventTypes:
 
     def test_event_type_map_includes_all_gestures(self):
         """EVENT_TYPE_MAP includes magnify, rotate, and smart_magnify."""
-        from screencap.engine.events import EventType
-        from screencap.engine.storage import EVENT_TYPE_MAP
+        from screencap.engine.events import EVENT_TYPE_MAP, EventType
 
         assert EventType.MOUSE_MAGNIFY.value in EVENT_TYPE_MAP
         assert EventType.MOUSE_ROTATE.value in EVENT_TYPE_MAP

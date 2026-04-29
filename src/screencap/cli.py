@@ -400,13 +400,25 @@ def _maybe_prompt_matrix_acknowledgement() -> None:
               default=None, help="Task segmentation: 'llm' (server-side) or 'idle' (gap detection).")
 @click.option("--no-scrub", is_flag=True, default=False,
               help="Disable PII/secrets scrubbing for this recording.")
+@click.option(
+    "--network",
+    is_flag=True,
+    default=False,
+    help=(
+        "Capture HTTP/HTTPS request/response metadata as a system proxy. "
+        "Off by default. First use installs a 30-day CA into your login "
+        "Keychain (one prompt) and configures the system web proxy (one "
+        "admin prompt). Bodies are NOT retained in V1; metadata only. "
+        "Run `screencap network restore` to recover proxy state after a crash."
+    ),
+)
 @click.option("--unlisted", is_flag=True, default=False,
               help="Hide this recording from the website (still uploads, just not listed).")
 def start(
     name, description, no_audio, no_video, no_images, no_window_data,
     output, no_wifi_metrics, no_app_versions,
     no_auto_name, local_only, force, verbose, chunk_duration, no_live_upload,
-    destination, segmentation_mode, no_scrub, unlisted,
+    destination, segmentation_mode, no_scrub, network, unlisted,
 ):
     """Record a screen capture session. Ctrl+C to stop.
 
@@ -626,6 +638,24 @@ def start(
         console.print(_RECORD_EXTRAS_MSG)
         raise SystemExit(1)
 
+    # Pin spawn mode at CLI entry BEFORE any mp.Queue/mp.Process is constructed.
+    # AES-GCM nonce safety (V1.5+) depends on os.urandom being independently
+    # seeded in the child; under fork mode the child inherits parent state.
+    # Asserting only inside run_proxy() is too late -- the parent has already
+    # forked/spawned by then. The `allow_none=True` is load-bearing: without
+    # it, get_start_method freezes the start-method context as a side effect.
+    if network:
+        import multiprocessing as _mp_init
+        _current_start = _mp_init.get_start_method(allow_none=True)
+        if _current_start is None:
+            _mp_init.set_start_method("spawn", force=True)
+        elif _current_start != "spawn":
+            console.print(
+                f"[red]Error:[/red] multiprocessing start method is "
+                f"{_current_start!r}; --network requires 'spawn'."
+            )
+            raise SystemExit(1)
+
     cli_args = {
         "name": name,
         "description": description or None,
@@ -649,6 +679,7 @@ def start(
         "show_on_website": show_on_website,
         "auto_name_enabled": auto_name_enabled,
         "local_only": local_only,
+        "network": network,
     }
 
     # SessionController(...) is INSIDE the try block so a SystemExit raised
@@ -1209,7 +1240,7 @@ def _build_export_privacy_filter(recording_dir):
     """
     from pathlib import Path as _Path
 
-    from screencap.exporter import build_privacy_filter
+    from screencap.privacy.filter import build_privacy_filter
 
     err_console = Console(stderr=True)
     mode = None
@@ -2049,14 +2080,39 @@ def _run_api_transcription(api_key, audio_path, transcript_path, transcript_json
 
 def _recover_chunk_metadata(
     recording_dir: Path, console: "Console", *, force: bool = False,
+    cloud_bound: bool,
 ) -> None:
     """Generate per-chunk manifests + events JSONL when chunks exist but metadata doesn't.
 
     This is a recovery path for when ChunkProcessor failed during recording
     but chunk video files were created. Uses recording.db to derive chunk
     time ranges and generate the metadata files the Cloud Run processor needs.
+
+    The ``cloud_bound`` keyword argument is REQUIRED (no default) — omitting
+    it raises ``TypeError`` at the call site rather than silently falling
+    open. ``screencap upload`` always passes ``cloud_bound=True`` regardless
+    of ``.recording_intent`` content, because at upload time the data IS
+    becoming cloud-bound by user choice. This closes the local-then-uploaded
+    threat case (recording captured as ``destination=local``, later uploaded).
+
+    LOAD-BEARING ORDERING: ``_recover_chunk_metadata`` MUST be followed by
+    ``scrub_recording`` for cloud-bound recordings before upload. The
+    scrub-layer pointer suppression (Unit 2) only protects recovered
+    cloud-bound JSONL when this ordering holds. The upload command's
+    ``cli.py:1614 → 1641-1646`` sequencing satisfies this. Reordering or
+    adding a recovery path that bypasses the scrubber MUST replicate the
+    in-interval ``mouse.move`` drop at the engine layer or the cloud-bound
+    privacy posture silently degrades.
+
+    Skip-on-error policy: if ``unified_export_events`` raises mid-chunk on
+    a corrupt action_event row that trips ``process_events`` aggregate-state
+    or ``interleave_window_events``, we log a warning and skip writing
+    that chunk's ``events_NNNN.jsonl`` (no file written). Other chunks
+    proceed normally. ``screencap upload --force`` re-runs recovery once
+    underlying data is fixed. Recovery's previous "raw dump tolerates
+    everything" behaviour is intentionally retired by this refactor.
     """
-    import sqlite3
+    from screencap.recording_db import Row, has_column, has_table, open_recording_db
 
     chunk_videos = sorted(recording_dir.glob("chunk_*.mp4"))
     if not chunk_videos:
@@ -2084,50 +2140,85 @@ def _recover_chunk_metadata(
     if not missing_manifests and not missing_events:
         return
 
+    # Stale .tmp cleanup sweep: a previous SIGKILL/OOM may have left
+    # .tmp files for chunks we're about to re-recover.
+    # write_events_jsonl / generate_manifest also clean their own .tmp,
+    # but this defense-in-depth sweep covers chunks we plan to skip
+    # (e.g. corrupt-row failures) where the writer is never reached.
+    for idx in missing_events:
+        (recording_dir / f"events_{idx:04d}.jsonl.tmp").unlink(missing_ok=True)
+    for idx in missing_manifests:
+        (recording_dir / f"chunk_{idx:04d}_manifest.json.tmp").unlink(missing_ok=True)
+
     # Derive chunk time ranges from recording.db
+    # Per-recording click thresholds (P2 fix): the chunk processor and the
+    # CLI export both pass the recording's own ``double_click_*`` values to
+    # the unified callable. Recovery must do the same — otherwise a
+    # recording with non-default thresholds (e.g. interval=0.3s) would have
+    # its recovered JSONL emit different click merges than the original
+    # chunk export, breaking the byte-identical contract for non-default
+    # configurations. Falls back to engine defaults (0.5s / 5px) when the
+    # threshold columns are NULL or the row is absent.
+    double_click_interval = 0.5
+    double_click_distance = 5.0
     try:
-        conn = sqlite3.connect(str(db_path))
-        conn.execute("PRAGMA busy_timeout=5000")
-        conn.execute("PRAGMA query_only=ON")
-        conn.row_factory = sqlite3.Row
+        with open_recording_db(db_path, row_factory=Row) as conn:
+            # Build the SELECT column list, gating per-recording click
+            # thresholds on their presence in the schema. Older recording.db
+            # files predate these columns; without the guard, an unconditional
+            # SELECT raises OperationalError which the outer except catches
+            # and silently aborts recovery for the entire recording (P2 bug).
+            # Mirrors chunk_processor._load_click_thresholds' fail-soft
+            # fallback to engine defaults (0.5s / 5px).
+            has_thresholds = (
+                has_column(conn, "recording", "double_click_interval_seconds")
+                and has_column(conn, "recording", "double_click_distance_pixels")
+            )
+            if has_thresholds:
+                rec = conn.execute(
+                    "SELECT timestamp, double_click_interval_seconds, "
+                    "double_click_distance_pixels FROM recording LIMIT 1"
+                ).fetchone()
+                if rec:
+                    if rec["double_click_interval_seconds"] is not None:
+                        double_click_interval = float(rec["double_click_interval_seconds"])
+                    if rec["double_click_distance_pixels"] is not None:
+                        double_click_distance = float(rec["double_click_distance_pixels"])
+            else:
+                rec = conn.execute(
+                    "SELECT timestamp FROM recording LIMIT 1"
+                ).fetchone()
+            if not rec:
+                return
+            rec_start = rec["timestamp"]
 
-        # Get recording start time (video_start_time is when first frame was captured)
-        rec = conn.execute("SELECT timestamp FROM recording LIMIT 1").fetchone()
-        if not rec:
-            conn.close()
-            return
-        rec_start = rec["timestamp"]
+            # Get the first and last action event timestamps
+            first_evt = conn.execute("SELECT MIN(timestamp) as ts FROM action_event").fetchone()
+            last_evt = conn.execute("SELECT MAX(timestamp) as ts FROM action_event").fetchone()
+            if not first_evt or first_evt["ts"] is None:
+                return
 
-        # Get the first and last action event timestamps
-        first_evt = conn.execute("SELECT MIN(timestamp) as ts FROM action_event").fetchone()
-        last_evt = conn.execute("SELECT MAX(timestamp) as ts FROM action_event").fetchone()
-        if not first_evt or first_evt["ts"] is None:
-            conn.close()
-            return
+            first_ts = first_evt["ts"]
+            last_ts = last_evt["ts"]
+            n_chunks = len(chunk_videos)
 
-        first_ts = first_evt["ts"]
-        last_ts = last_evt["ts"]
-        n_chunks = len(chunk_videos)
+            # Determine chunk duration from config
+            from screencap.config import get_chunk_duration
+            chunk_dur = get_chunk_duration()
+            if chunk_dur <= 0:
+                # Estimate from recording span and chunk count
+                chunk_dur = (last_ts - first_ts) / max(n_chunks, 1)
 
-        # Determine chunk duration from config
-        from screencap.config import get_chunk_duration
-        chunk_dur = get_chunk_duration()
-        if chunk_dur <= 0:
-            # Estimate from recording span and chunk count
-            chunk_dur = (last_ts - first_ts) / max(n_chunks, 1)
-
-        # Compute chunk boundaries: chunk N covers [start + N*dur, start + (N+1)*dur)
-        # Use recording start (or first event) as the base
-        base_ts = min(rec_start, first_ts)
-        chunk_ranges = []
-        for idx in range(n_chunks):
-            c_start = base_ts + idx * chunk_dur
-            c_end = base_ts + (idx + 1) * chunk_dur
-            if idx == n_chunks - 1:
-                c_end = max(c_end, last_ts + 1.0)  # last chunk extends to cover all events
-            chunk_ranges.append((idx, c_start, c_end))
-
-        conn.close()
+            # Compute chunk boundaries: chunk N covers [start + N*dur, start + (N+1)*dur)
+            # Use recording start (or first event) as the base
+            base_ts = min(rec_start, first_ts)
+            chunk_ranges = []
+            for idx in range(n_chunks):
+                c_start = base_ts + idx * chunk_dur
+                c_end = base_ts + (idx + 1) * chunk_dur
+                if idx == n_chunks - 1:
+                    c_end = max(c_end, last_ts + 1.0)  # last chunk extends to cover all events
+                chunk_ranges.append((idx, c_start, c_end))
     except Exception as e:
         console.print(f"  [yellow]Warning:[/yellow] Could not derive chunk ranges: {e}")
         return
@@ -2150,37 +2241,148 @@ def _recover_chunk_metadata(
             if generated:
                 console.print(f"  [dim]Generated {generated} chunk manifest(s)[/dim]")
 
-    # Generate missing per-chunk events
+    # Generate missing per-chunk events via the unified export pipeline
     if missing_events:
         with console.status("[dim]Exporting per-chunk events...[/dim]"):
-            import json as _json
+            from screencap.engine.export import unified_export_events
+            from screencap.exporter import build_export_metadata, write_events_jsonl
+            from screencap.privacy.filter import build_cloud_window_filter
+
+            # Resolve privacy_mode: prefer the locked-at-record-time value
+            # in .recording_intent (matches what the live chunk processor
+            # used) and fall back to current config when the intent file
+            # is missing/corrupt.
+            privacy_mode = _read_intent_privacy_mode(recording_dir)
+            if privacy_mode is None:
+                try:
+                    from screencap.config import get_privacy_config
+                    privacy_mode = get_privacy_config().mode.value
+                except Exception:
+                    privacy_mode = "internal"
 
             exported = 0
             try:
-                conn = sqlite3.connect(str(db_path))
-                conn.execute("PRAGMA busy_timeout=5000")
-                conn.execute("PRAGMA query_only=ON")
-                conn.row_factory = sqlite3.Row
+                with open_recording_db(db_path, row_factory=Row) as conn:
+                    action_disabled_clause = (
+                        " AND (disabled IS NULL OR NOT disabled)"
+                        if has_column(conn, "action_event", "disabled") else ""
+                    )
+                    has_window_table = has_table(conn, "window_event")
+                    window_disabled_clause = (
+                        " AND (disabled IS NULL OR NOT disabled)"
+                        if has_window_table and has_column(conn, "window_event", "disabled")
+                        else ""
+                    )
 
-                for idx, c_start, c_end in chunk_ranges:
-                    if idx in missing_events:
+                    for idx, c_start, c_end in chunk_ranges:
+                        if idx not in missing_events:
+                            continue
+
+                        jsonl_path = recording_dir / f"events_{idx:04d}.jsonl"
+
                         try:
-                            rows = conn.execute(
-                                "SELECT * FROM action_event WHERE timestamp >= ? AND timestamp < ? ORDER BY timestamp",
-                                (c_start, c_end),
-                            ).fetchall()
-                            jsonl_path = recording_dir / f"events_{idx:04d}.jsonl"
-                            with open(jsonl_path, "w") as f:
-                                for row in rows:
-                                    f.write(_json.dumps(dict(row)) + "\n")
+                            # Build the cloud window filter inside the
+                            # per-chunk try so a config-load failure
+                            # (e.g. InvalidPrivacyConfigError, which is
+                            # not caught inside build_privacy_filter)
+                            # marks one chunk as failed instead of
+                            # aborting the whole recovery (R5/Unit 1).
+                            window_filter = build_cloud_window_filter(
+                                cloud_bound=cloud_bound,
+                                privacy_mode=privacy_mode,
+                                capture_dir=recording_dir,
+                            )
+
+                            # Action SELECT with R16 disabled filter
+                            action_rows = [
+                                dict(r) for r in conn.execute(
+                                    "SELECT * FROM action_event "
+                                    "WHERE timestamp >= ? AND timestamp < ?"
+                                    + action_disabled_clause
+                                    + " ORDER BY timestamp",
+                                    (c_start, c_end),
+                                ).fetchall()
+                            ]
+
+                            # Window SELECT with R16 disabled filter
+                            window_rows: list[dict] = []
+                            initial_window_row: dict | None = None
+                            if has_window_table:
+                                window_rows = [
+                                    dict(r) for r in conn.execute(
+                                        "SELECT * FROM window_event "
+                                        "WHERE timestamp >= ? AND timestamp < ?"
+                                        + window_disabled_clause
+                                        + " ORDER BY timestamp",
+                                        (c_start, c_end),
+                                    ).fetchall()
+                                ]
+                                # Initial window context: last window event
+                                # before chunk start, with timestamp rewritten
+                                # to fall just before the chunk so it appears
+                                # first after dedup/interleave.
+                                init_row = conn.execute(
+                                    "SELECT * FROM window_event "
+                                    "WHERE timestamp < ?"
+                                    + window_disabled_clause
+                                    + " ORDER BY timestamp DESC LIMIT 1",
+                                    (c_start,),
+                                ).fetchone()
+                                if init_row is not None:
+                                    initial_window_row = dict(init_row)
+                                    initial_window_row["timestamp"] = c_start - 0.001
+
+                            # Run the unified callable. Returns an iterator;
+                            # write_events_jsonl streams it to disk atomically.
+                            # Pass per-recording click thresholds (P2 fix) so
+                            # recovery's merge behaviour matches the live chunk
+                            # processor for recordings with non-default
+                            # double_click_* values.
+                            events_iter = unified_export_events(
+                                action_rows,
+                                window_rows,
+                                initial_window_row=initial_window_row,
+                                double_click_interval=double_click_interval,
+                                double_click_distance=double_click_distance,
+                                window_filter=window_filter,
+                            )
+
+                            meta = build_export_metadata(exclude_moves=False)
+                            write_events_jsonl(jsonl_path, events_iter, meta)
                             exported += 1
                         except Exception as e:
-                            console.print(f"  [yellow]Warning:[/yellow] Event export failed for chunk {idx}: {e}")
-                conn.close()
+                            # Skip-on-error: a corrupt row that trips
+                            # process_events or interleave invalidates this
+                            # chunk's export. Other chunks proceed normally.
+                            # write_events_jsonl already removed any partial
+                            # .tmp; no events_NNNN.jsonl is written.
+                            console.print(
+                                f"  [yellow]Warning:[/yellow] Event export failed for chunk {idx}: {e}"
+                            )
             except Exception as e:
                 console.print(f"  [yellow]Warning:[/yellow] Could not export chunk events: {e}")
             if exported:
                 console.print(f"  [dim]Exported events for {exported} chunk(s)[/dim]")
+
+
+def _read_intent_privacy_mode(recording_dir: Path) -> str | None:
+    """Read ``privacy_mode`` from ``.recording_intent``, or ``None`` if absent.
+
+    Mirrors :func:`screencap.catalog.read_intent`'s fail-safe behaviour:
+    parse errors, missing keys, and missing files all return ``None`` so
+    the caller falls back to whatever default it considers safe.
+    """
+    intent_path = recording_dir / ".recording_intent"
+    if not intent_path.exists():
+        return None
+    try:
+        data = json.loads(intent_path.read_text())
+    except Exception:
+        return None
+    mode = data.get("privacy_mode")
+    if isinstance(mode, str):
+        return mode
+    return None
 
 
 @cli.command()
@@ -2252,8 +2454,21 @@ def upload(names, all_recordings, dry_run, force, jobs, no_delete):
                     except Exception as e:
                         console.print(f"  [yellow]Warning:[/yellow] Export failed ({e}), uploading without events.jsonl")
 
-            # Recovery: generate per-chunk manifests + events if chunks exist but metadata doesn't
-            _recover_chunk_metadata(d, console, force=force)
+            # Recovery: generate per-chunk manifests + events if chunks exist but metadata doesn't.
+            # cloud_bound=True UNCONDITIONALLY: at upload time, the data IS becoming
+            # cloud-bound by user choice — regardless of what `.recording_intent`
+            # records. This closes the local-then-uploaded threat case (a recording
+            # captured as destination=local, later uploaded by the user). The
+            # `cloud_bound` keyword is REQUIRED on _recover_chunk_metadata so a
+            # forgotten argument is a TypeError, not a silent fail-OPEN.
+            #
+            # LOAD-BEARING ORDERING (do not reorder): this `_recover_chunk_metadata`
+            # call MUST be followed by `scrub_recording` below (lines 1782-1786).
+            # The scrub-layer pointer suppression (Unit 2) only protects recovered
+            # cloud-bound JSONL when this ordering holds. Reordering or adding a
+            # recovery path that bypasses the scrubber must replicate the
+            # in-interval mouse.move drop at the engine layer.
+            _recover_chunk_metadata(d, console, force=force, cloud_bound=True)
 
             # Recovery: generate sentinel file if missing (crash/force-quit recovery)
             _sentinel_path = d / "recording_complete.json"
@@ -3232,6 +3447,52 @@ def _check_onnxruntime_excluded() -> tuple[str, bool, str]:
         return name, False, _tb.format_exc()
 
 
+@cli.group("network")
+def network_group() -> None:
+    """Manage the network capture CA + recover from crashes."""
+
+
+@network_group.command("uninstall")
+def network_uninstall_cmd() -> None:
+    """Remove the screencap proxy CA from your Keychain + clean up state.
+
+    Restores any orphaned proxy state FIRST (so your network is left
+    working regardless of how you got here), then uninstalls the CA
+    and deletes ~/.screencap/proxy/.
+
+    Never touches ~/.mitmproxy/ (which may belong to a separate
+    mitmproxy install).
+    """
+    from screencap.network.lifecycle import full_uninstall
+
+    console.print("[bold]Uninstalling screencap network capture...[/bold]")
+    full_uninstall()
+    console.print("[green]Done.[/green]")
+
+
+@network_group.command("restore")
+def network_restore_cmd() -> None:
+    """Restore system proxy state after a recording crash.
+
+    Idempotent: safe to run anytime. Scans for orphaned snapshots
+    (global sentinel + durable copies + per-recording-dir scan) and
+    restores via osascript admin. No-op if no orphans are found.
+    """
+    from screencap.network.lifecycle import restore_orphaned_proxy_state
+
+    console.print("[bold]Scanning for orphaned proxy state...[/bold]")
+    restored = restore_orphaned_proxy_state()
+    if restored:
+        console.print(
+            f"[green]Restored proxy state for {len(restored)} orphaned "
+            f"recording(s):[/green]"
+        )
+        for path in restored:
+            console.print(f"  • {path}")
+    else:
+        console.print("No orphaned proxy state found.")
+
+
 _SMOKE_CHECKS = [
     _check_presidio_analyzer,
     _check_fast_gliner,
@@ -3284,6 +3545,147 @@ def smoke_test(verbose):
         sys.exit(1)
     else:
         console.print(f"All {total} checks passed")
+
+
+# ---------------------------------------------------------------------------
+# _network-dump (hidden) - inspect captured network_event rows
+# ---------------------------------------------------------------------------
+
+
+@cli.command("_network-dump", hidden=True)
+@click.argument("name")
+@click.option("--limit", "limit", type=int, default=50, show_default=True,
+              help="Maximum number of rows to print.")
+@click.option("--kind", "kind", type=click.Choice([
+                  "request", "response", "ws_upgrade", "ws_frame", "drop_burst",
+              ]), default=None,
+              help="Filter rows by network event kind.")
+@click.option("--host", "host_substr", default=None,
+              help="Case-insensitive host substring filter.")
+@click.option("--verbose", "-v", is_flag=True, default=False,
+              help="Also print headers and details_json payloads.")
+def network_dump(name, limit, kind, host_substr, verbose):
+    """Inspect captured network_event rows for a recording (V1 debug helper).
+
+    V1 ships network capture as DB-only - events.jsonl contains zero
+    ``network.*`` lines. This subcommand reads the recording's
+    ``recording.db`` directly and prints the seeded rows for premise
+    validation. JSONL emission lands in V1.75 alongside the cloud-bound
+    network filter.
+    """
+    import sqlite3
+    from datetime import datetime
+
+    from screencap.config import get_recordings_dir
+
+    recording_dir = get_recordings_dir() / name
+    if not recording_dir.exists():
+        console.print(f"[red]Error:[/red] Recording not found: {name}")
+        sys.exit(1)
+    db_path = recording_dir / "recording.db"
+    if not db_path.is_file():
+        console.print(
+            f"[red]Error:[/red] recording.db not found in {recording_dir}",
+        )
+        sys.exit(1)
+
+    # Read-only URI mode keeps the helper safe alongside any concurrent
+    # reader (V1 has no live writer at inspection time, but URI ro is
+    # explicit about intent).
+    uri = f"file:{db_path}?mode=ro"
+    try:
+        conn = sqlite3.connect(uri, uri=True)
+    except sqlite3.OperationalError as exc:
+        console.print(f"[red]Error:[/red] failed to open {db_path}: {exc}")
+        sys.exit(1)
+    try:
+        conn.row_factory = sqlite3.Row
+        # Friendly message for pre-feature DBs / recordings made without --network.
+        cur = conn.execute(
+            "SELECT name FROM sqlite_master WHERE type='table' AND name='network_event'",
+        )
+        if cur.fetchone() is None:
+            console.print(
+                "No network events captured in this recording. "
+                "Did you start with --network?",
+            )
+            return
+
+        sql = "SELECT * FROM network_event WHERE 1 = 1"
+        params: list[object] = []
+        if kind is not None:
+            sql += " AND kind = ?"
+            params.append(kind)
+        if host_substr:
+            sql += " AND lower(host) LIKE ?"
+            params.append(f"%{host_substr.lower()}%")
+        # ``ORDER BY timestamp_ns`` is load-bearing - without it the rows
+        # are not guaranteed to be time-ordered (the table has an index
+        # on timestamp_ns but no implicit ordering on a SELECT *).
+        sql += " ORDER BY timestamp_ns LIMIT ?"
+        params.append(int(limit))
+        rows = conn.execute(sql, params).fetchall()
+
+        if not rows:
+            console.print(
+                "No network events captured in this recording. "
+                "Did you start with --network?",
+            )
+            return
+
+        for row in rows:
+            ts = row["timestamp"]
+            try:
+                ts_iso = datetime.fromtimestamp(float(ts)).isoformat(
+                    timespec="milliseconds",
+                )
+            except (TypeError, ValueError, OSError):
+                ts_iso = str(ts)
+
+            row_kind = row["kind"] or ""
+            method = row["method"] or "-"
+            host = row["host"] or "-"
+            status = row["status"] if row["status"] is not None else "-"
+            body_size = row["body_size"] if row["body_size"] is not None else 0
+            sha = row["body_sha256"]
+            if isinstance(sha, (bytes, bytearray, memoryview)):
+                sha_hex = bytes(sha).hex()
+                short_sha = sha_hex[:12]
+            else:
+                short_sha = "-"
+
+            url = row["url"] or "-"
+            if len(url) > 120:
+                url = url[:117] + "..."
+
+            console.print(
+                f"{ts_iso} {row_kind} {method} {host} {status} "
+                f"{body_size}B sha={short_sha}... {url}"
+            )
+
+            if verbose:
+                headers_json = row["headers_json"]
+                if headers_json:
+                    try:
+                        headers = json.loads(headers_json)
+                    except (TypeError, ValueError):
+                        headers = None
+                    if headers:
+                        console.print("    [dim]headers:[/dim]")
+                        for entry in headers:
+                            if isinstance(entry, (list, tuple)) and len(entry) == 2:
+                                console.print(f"      {entry[0]}: {entry[1]}")
+                            else:
+                                console.print(f"      {entry!r}")
+                details_json = row["details_json"]
+                if details_json:
+                    try:
+                        details = json.loads(details_json)
+                    except (TypeError, ValueError):
+                        details = details_json
+                    console.print(f"    [dim]details:[/dim] {details!r}")
+    finally:
+        conn.close()
 
 
 if __name__ == "__main__":

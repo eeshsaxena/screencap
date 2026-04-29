@@ -3,8 +3,15 @@
 # filter pip's wheel selection — pip reads the runner's actual OS version,
 # which on macos-15-intel picks macosx_14_0 wheels and fails the minos check.
 
-# numpy 2.1+ ships macosx_14_0_x86_64 wheels pip prefers over macosx_10_13.
-numpy>=1.20.0,<2.1
+# numpy 2.0.x ships BOTH macosx_10_9_x86_64 and macosx_14_0_x86_64 cp312
+# wheels. On macOS 14+ runners (CI's macos-15-intel and local Tahoe hosts)
+# pip prefers the higher-targeted wheel — macosx_14_0 — which has minos=14.0
+# and fails the Big Sur minos<=11.0 gate. MACOSX_DEPLOYMENT_TARGET=11.0
+# doesn't override this preference because packaging.tags reads
+# platform.mac_ver() at runtime, not the env var.
+# Capping to <2.0 lands on numpy 1.26.4, which only ships a macosx_10_9
+# cp312 x86_64 wheel — pip has no choice and the resulting bundle passes.
+numpy>=1.20.0,<2.0
 
 # av 14+ has no cp312 x86_64 wheel; 13.x ships macosx_10_13_x86_64.
 av>=13.0,<14

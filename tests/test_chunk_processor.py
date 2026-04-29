@@ -742,13 +742,79 @@ class TestUnifiedEventExport:
 
         assert (cloud_capture_dir / "events_0000.jsonl").exists()
         assert not (cloud_capture_dir / "events_0000.jsonl.tmp").exists()
+    def test_v1_scope_guard_no_network_lines_in_chunk_jsonl(
+        self, cloud_capture_dir, recording_db,
+    ):
+        """V1 contract: chunk JSONL contains ZERO network.* lines.
 
-    def test_excludes_mouse_move_by_default(self, cloud_capture_dir, recording_db):
-        """Mouse.move events should be excluded by default."""
+        The plan defers all JSONL emission of network events to V1.75
+        alongside the cloud bucket policy + build_cloud_network_filter
+        factory. V1 keeps network events DB-only -- the auto-export +
+        screencap upload paths cannot distinguish local-vs-cloud intent
+        at runtime, so wiring network rows into the chunk_processor
+        would silently leak metadata to the cloud bucket.
+        """
+        from screencap.engine.db import crud
+        from screencap.chunk_processor import ChunkProcessor
+
+        crud.insert_network_event(
+            recording_db.session,
+            recording_db.recording,
+            {
+                "kind": "request",
+                "flow_id": "flow-1",
+                "method": "GET",
+                "url": "https://example.com/api",
+                "host": "example.com",
+                "headers_json": json.dumps([["Host", "example.com"]]),
+                "body_size": 0,
+                "body_sha256": None,
+                "content_type": None,
+                "direction": None,
+                "frame_type": None,
+                "http_version": "HTTP/1.1",
+                "details_json": None,
+                "timestamp": 1000.5,
+                "timestamp_ns": 1_000_500_000_000,
+            },
+        )
+        crud.flush_buffers(recording_db.session)
+        self._insert_action(
+            recording_db, 1000.1, "click", mouse_x=1, mouse_y=2,
+            mouse_button_name="left", mouse_pressed=1,
+        )
+        self._insert_action(
+            recording_db, 1000.2, "click", mouse_x=1, mouse_y=2,
+            mouse_button_name="left", mouse_pressed=0,
+        )
+
+        q = multiprocessing.Queue()
+        ack_q = multiprocessing.Queue()
+        cp = ChunkProcessor(
+            cloud_capture_dir, q, ack_q, recording_name="test",
+            upload_enabled=False, auto_delete=False,
+        )
+        cp._export_events(0, 999.0, 1001.0)
+
+        lines = (cloud_capture_dir / "events_0000.jsonl").read_text().splitlines()
+        events = [json.loads(line) for line in lines if line.strip()]
+        types = [e.get("type") for e in events if not e.get("_meta")]
+        assert all(not (t or "").startswith("network.") for t in types), (
+            f"V1 must emit zero network.* lines; got types: {types}"
+        )
+
+
+    def test_retains_mouse_move_events(self, cloud_capture_dir, recording_db):
+        """R11 behavioral change: chunk export now KEEPS ``mouse.move`` events
+        by default. Pointer suppression for sensitive intervals lives at the
+        scrub layer (Unit 2), not at the chunk-export boundary. This is the
+        load-bearing behavioral switch the unified-export refactor ships.
+        """
         self._insert_action(recording_db, 1000.0, "move", mouse_x=100, mouse_y=200)
-        self._insert_action(recording_db, 1000.1, "click", mouse_x=100, mouse_y=200,
+        self._insert_action(recording_db, 1000.05, "move", mouse_x=110, mouse_y=210)
+        self._insert_action(recording_db, 1000.1, "click", mouse_x=120, mouse_y=220,
                             mouse_button_name="left", mouse_pressed=1)
-        self._insert_action(recording_db, 1000.2, "click", mouse_x=100, mouse_y=200,
+        self._insert_action(recording_db, 1000.2, "click", mouse_x=120, mouse_y=220,
                             mouse_button_name="left", mouse_pressed=0)
 
         from screencap.chunk_processor import ChunkProcessor
@@ -763,8 +829,14 @@ class TestUnifiedEventExport:
         cp._export_events(0, 999.0, 1001.0)
 
         lines = (cloud_capture_dir / "events_0000.jsonl").read_text().strip().split("\n")
+        # Header asserts moves are kept (build_export_metadata(exclude_moves=False)).
+        header = json.loads(lines[0])
+        assert header["exclude_moves"] is False
         events = [json.loads(line) for line in lines[1:]]
-        assert not any(e["type"] == "mouse.move" for e in events)
+        moves = [e for e in events if e["type"] == "mouse.move"]
+        assert moves, "R11: chunk processor must keep mouse.move events"
+        # Click pair still merged into singleclick alongside the moves.
+        assert any(e["type"] == "mouse.singleclick" for e in events)
 
     def test_malformed_rows_skipped_gracefully(self, cloud_capture_dir, recording_db):
         """Rows that fail conversion should be skipped without crashing export."""
@@ -793,6 +865,537 @@ class TestUnifiedEventExport:
         events = [json.loads(line) for line in lines[1:]]
         # The valid click pair should still be exported
         assert any(e["type"] == "mouse.singleclick" for e in events)
+
+    # ------------------------------------------------------------------
+    # Cloud privacy filter wiring (R5 / R12) — the load-bearing behavior
+    # this unit ships. Cloud-bound chunks must apply the cloud window
+    # filter; non-cloud chunks must not.
+    # ------------------------------------------------------------------
+
+    @staticmethod
+    def _public_privacy_config():
+        """Patch ``get_privacy_config`` to a clean PUBLIC-mode config.
+
+        Mirrors ``tests/privacy/test_filter_factory.py`` so policy
+        outcomes don't depend on the developer's local config.toml.
+        """
+        from screencap.privacy.policy import PrivacyConfig, PrivacyMode
+
+        return mock.patch(
+            "screencap.config.get_privacy_config",
+            return_value=PrivacyConfig(mode=PrivacyMode.PUBLIC),
+        )
+
+    def test_cloud_intent_applies_window_filter(
+        self, cloud_capture_dir, recording_db,
+    ):
+        """cloud_intent=True → ``build_cloud_window_filter`` produces a
+        cloud-mode filter that masks MASK_WINDOW titles and suppresses
+        EXCLUDE windows. Slack (CHAT) → MASK_WINDOW under PUBLIC →
+        title replaced by app_name. 1Password (PASSWORD_MANAGER) →
+        EXCLUDE in every mode → switch suppressed entirely.
+        """
+        # Slack: MASK_WINDOW under PUBLIC (cloud_intent forces PUBLIC).
+        self._insert_window(
+            recording_db, 1000.0,
+            title="#secret-channel - Slack",
+            bundle_id="com.tinyspeck.slackmacgap",
+            window_id="slack-1",
+        )
+        # 1Password: PASSWORD_MANAGER → EXCLUDE in every mode.
+        self._insert_window(
+            recording_db, 1000.5,
+            title="My Personal Vault",
+            bundle_id="com.1password.1password",
+            window_id="1pw-1",
+        )
+        # Anchor an action so combined output is non-empty.
+        self._insert_action(recording_db, 1000.7, "click", mouse_x=10, mouse_y=10,
+                            mouse_button_name="left", mouse_pressed=1)
+        self._insert_action(recording_db, 1000.8, "click", mouse_x=10, mouse_y=10,
+                            mouse_button_name="left", mouse_pressed=0)
+
+        from screencap.chunk_processor import ChunkProcessor
+
+        q = multiprocessing.Queue()
+        ack_q = multiprocessing.Queue()
+
+        # cloud_intent=True triggers privacy-pipeline init; mock the
+        # heavy dependencies so this stays a pure unit test.
+        with mock.patch("screencap.privacy.create_default_pipeline", return_value=MagicMock()), \
+             mock.patch("screencap.privacy.Anonymizer"):
+            cp = ChunkProcessor(
+                cloud_capture_dir, q, ack_q, recording_name="test",
+                upload_enabled=False, auto_delete=False,
+                cloud_intent=True, privacy_mode="internal",
+            )
+
+        with self._public_privacy_config():
+            cp._export_events(0, 999.0, 1001.0)
+
+        lines = (cloud_capture_dir / "events_0000.jsonl").read_text().strip().split("\n")
+        events = [json.loads(line) for line in lines[1:]]
+        ws = [e for e in events if e["type"] == "window.switch"]
+        bundles = {e["app_bundle_id"] for e in ws}
+
+        # 1Password switches are suppressed entirely.
+        assert "com.1password.1password" not in bundles
+        # Slack switches are kept but title masked to app_name.
+        slack = next((e for e in ws if e["app_bundle_id"] == "com.tinyspeck.slackmacgap"), None)
+        assert slack is not None
+        assert slack["window_title"] == slack["app_name"]
+        assert slack["domain"] is None
+
+    def test_non_cloud_intent_skips_window_filter(
+        self, cloud_capture_dir, recording_db,
+    ):
+        """cloud_intent=False → factory returns ``None`` → engine does not
+        apply privacy filtering. Slack title passes through unchanged.
+        """
+        self._insert_window(
+            recording_db, 1000.0,
+            title="#secret-channel - Slack",
+            bundle_id="com.tinyspeck.slackmacgap",
+            window_id="slack-1",
+        )
+        self._insert_action(recording_db, 1000.7, "click", mouse_x=10, mouse_y=10,
+                            mouse_button_name="left", mouse_pressed=1)
+        self._insert_action(recording_db, 1000.8, "click", mouse_x=10, mouse_y=10,
+                            mouse_button_name="left", mouse_pressed=0)
+
+        from screencap.chunk_processor import ChunkProcessor
+
+        q = multiprocessing.Queue()
+        ack_q = multiprocessing.Queue()
+        cp = ChunkProcessor(
+            cloud_capture_dir, q, ack_q, recording_name="test",
+            upload_enabled=False, auto_delete=False,
+            cloud_intent=False,
+        )
+
+        with self._public_privacy_config():
+            cp._export_events(0, 999.0, 1001.0)
+
+        lines = (cloud_capture_dir / "events_0000.jsonl").read_text().strip().split("\n")
+        events = [json.loads(line) for line in lines[1:]]
+        slack = next((e for e in events
+                      if e["type"] == "window.switch"
+                      and e["app_bundle_id"] == "com.tinyspeck.slackmacgap"), None)
+        assert slack is not None
+        # Title unchanged because no engine-layer filter applied.
+        assert slack["window_title"] == "#secret-channel - Slack"
+
+    # ------------------------------------------------------------------
+    # Per-recording click thresholds (R4) propagate via cached __init__
+    # values so the per-chunk SELECT under live-writer lock contention is
+    # avoided.
+    # ------------------------------------------------------------------
+
+    def test_per_recording_click_thresholds_cached_at_init(self, tmp_path):
+        """ChunkProcessor caches click thresholds at __init__ rather than
+        re-querying per chunk. Custom thresholds in the ``recording`` row
+        flow through to ``unified_export_events`` via the cached values.
+        """
+        from screencap.engine.db import create_db, crud
+
+        db_path = tmp_path / "recording.db"
+        engine, Session = create_db(str(db_path))
+        session = Session()
+        crud.insert_recording(session, {
+            "timestamp": 1000.0,
+            "platform": "darwin",
+            "monitor_width": 1920,
+            "monitor_height": 1080,
+            "pixel_ratio": 2.0,
+            # Atypical thresholds — easy to spot in the cached attrs.
+            "double_click_interval_seconds": 1.25,
+            "double_click_distance_pixels": 17.0,
+        })
+        session.close()
+        engine.dispose()
+
+        from screencap.chunk_processor import ChunkProcessor
+
+        q = multiprocessing.Queue()
+        ack_q = multiprocessing.Queue()
+        cp = ChunkProcessor(
+            tmp_path, q, ack_q, recording_name="test",
+            upload_enabled=False, auto_delete=False,
+        )
+        assert cp._click_interval == 1.25
+        assert cp._click_distance == 17.0
+
+    def test_click_thresholds_default_when_db_missing(self, tmp_path):
+        """No recording.db → defaults (0.5s / 5px) without raising."""
+        from screencap.chunk_processor import ChunkProcessor
+
+        q = multiprocessing.Queue()
+        ack_q = multiprocessing.Queue()
+        cp = ChunkProcessor(
+            tmp_path, q, ack_q, recording_name="test",
+            upload_enabled=False, auto_delete=False,
+        )
+        assert cp._click_interval == 0.5
+        assert cp._click_distance == 5.0
+
+    def test_click_thresholds_default_when_recording_row_null(self, tmp_path):
+        """Recording row exists but threshold columns are NULL → defaults."""
+        from screencap.engine.db import create_db, crud
+
+        db_path = tmp_path / "recording.db"
+        engine, Session = create_db(str(db_path))
+        session = Session()
+        crud.insert_recording(session, {
+            "timestamp": 1000.0,
+            "platform": "darwin",
+            "monitor_width": 1920,
+            "monitor_height": 1080,
+            "pixel_ratio": 2.0,
+            # Both NULL.
+        })
+        session.close()
+        engine.dispose()
+
+        from screencap.chunk_processor import ChunkProcessor
+
+        q = multiprocessing.Queue()
+        ack_q = multiprocessing.Queue()
+        cp = ChunkProcessor(
+            tmp_path, q, ack_q, recording_name="test",
+            upload_enabled=False, auto_delete=False,
+        )
+        assert cp._click_interval == 0.5
+        assert cp._click_distance == 5.0
+
+    def test_click_thresholds_propagate_to_unified_callable(
+        self, cloud_capture_dir, recording_db,
+    ):
+        """The cached thresholds are passed through to
+        ``unified_export_events``. Spy on the callable and assert it
+        receives the values cached at __init__.
+        """
+        # Override threshold values in the existing recording row so
+        # the cache picks atypical numbers.
+        from sqlalchemy import update
+
+        from screencap.engine.db.models import Recording
+
+        recording_db.session.execute(
+            update(Recording).values(
+                double_click_interval_seconds=0.75,
+                double_click_distance_pixels=9.0,
+            )
+        )
+        recording_db.session.commit()
+
+        # Anchor a click pair.
+        self._insert_action(recording_db, 1000.0, "click", mouse_x=10, mouse_y=10,
+                            mouse_button_name="left", mouse_pressed=1)
+        self._insert_action(recording_db, 1000.05, "click", mouse_x=10, mouse_y=10,
+                            mouse_button_name="left", mouse_pressed=0)
+
+        from screencap.chunk_processor import ChunkProcessor
+
+        q = multiprocessing.Queue()
+        ack_q = multiprocessing.Queue()
+        cp = ChunkProcessor(
+            cloud_capture_dir, q, ack_q, recording_name="test",
+            upload_enabled=False, auto_delete=False,
+        )
+        assert cp._click_interval == 0.75
+        assert cp._click_distance == 9.0
+
+        captured = {}
+        from screencap.engine.export import unified_export_events as _real
+
+        def spy(*args, **kwargs):
+            captured.update(kwargs)
+            return _real(*args, **kwargs)
+
+        with mock.patch(
+            "screencap.engine.export.unified_export_events", side_effect=spy,
+        ):
+            cp._export_events(0, 999.0, 1001.0)
+
+        assert captured["double_click_interval"] == 0.75
+        assert captured["double_click_distance"] == 9.0
+
+    # ------------------------------------------------------------------
+    # Disabled-row filter (R16) at the SELECT layer for both action and
+    # window queries.
+    # ------------------------------------------------------------------
+
+    def test_disabled_action_rows_filtered_at_select(
+        self, cloud_capture_dir, recording_db,
+    ):
+        """``action_event`` rows with ``disabled=True`` are dropped at the
+        SELECT layer (R16). The disabled click never reaches the unified
+        callable.
+        """
+        from sqlalchemy import update
+
+        from screencap.engine.db.models import ActionEvent
+
+        # Insert two click pairs.
+        self._insert_action(recording_db, 1000.0, "click", mouse_x=10, mouse_y=10,
+                            mouse_button_name="left", mouse_pressed=1)
+        self._insert_action(recording_db, 1000.05, "click", mouse_x=10, mouse_y=10,
+                            mouse_button_name="left", mouse_pressed=0)
+        self._insert_action(recording_db, 1000.5, "click", mouse_x=200, mouse_y=200,
+                            mouse_button_name="left", mouse_pressed=1)
+        self._insert_action(recording_db, 1000.55, "click", mouse_x=200, mouse_y=200,
+                            mouse_button_name="left", mouse_pressed=0)
+
+        # Mark the second pair disabled.
+        recording_db.session.execute(
+            update(ActionEvent)
+            .where(ActionEvent.timestamp >= 1000.5)
+            .values(disabled=True)
+        )
+        recording_db.session.commit()
+
+        from screencap.chunk_processor import ChunkProcessor
+
+        q = multiprocessing.Queue()
+        ack_q = multiprocessing.Queue()
+        cp = ChunkProcessor(
+            cloud_capture_dir, q, ack_q, recording_name="test",
+            upload_enabled=False, auto_delete=False,
+        )
+
+        cp._export_events(0, 999.0, 1001.0)
+
+        lines = (cloud_capture_dir / "events_0000.jsonl").read_text().strip().split("\n")
+        events = [json.loads(line) for line in lines[1:]]
+        clicks = [e for e in events if e["type"] == "mouse.singleclick"]
+        # Only the first (enabled) pair survives.
+        assert len(clicks) == 1
+        assert clicks[0]["x"] == 10
+
+    def test_disabled_window_rows_filtered_when_column_present(
+        self, cloud_capture_dir, recording_db,
+    ):
+        """When ``window_event.disabled`` exists, disabled rows are filtered
+        at the SELECT layer too. The default schema does not include this
+        column on ``window_event``; we add it via ALTER for the test and
+        verify the chunk processor's ``has_column`` guard takes the
+        filtering branch.
+        """
+        # Add the column to the DB so ``has_column`` returns True.
+        recording_db.engine.dispose()
+        recording_db.session.close()
+        import sqlite3 as _sqlite
+
+        _conn = _sqlite.connect(str(recording_db.db_path))
+        _conn.execute(
+            "ALTER TABLE window_event ADD COLUMN disabled BOOLEAN DEFAULT 0"
+        )
+        _conn.commit()
+
+        # Insert two distinct windows; mark the second disabled.
+        _conn.execute(
+            "INSERT INTO window_event "
+            "(recording_id, timestamp, title, app_bundle_id, window_id, "
+            "left, top, width, height, disabled) "
+            "VALUES (?, ?, ?, ?, ?, 0, 0, 800, 600, 0)",
+            (recording_db.recording.id, 1000.0, "Finder", "com.apple.finder", "win-1"),
+        )
+        _conn.execute(
+            "INSERT INTO window_event "
+            "(recording_id, timestamp, title, app_bundle_id, window_id, "
+            "left, top, width, height, disabled) "
+            "VALUES (?, ?, ?, ?, ?, 0, 0, 800, 600, 1)",
+            (recording_db.recording.id, 1000.5, "Chrome", "com.google.Chrome", "win-2"),
+        )
+        _conn.commit()
+        _conn.close()
+
+        from screencap.chunk_processor import ChunkProcessor
+
+        q = multiprocessing.Queue()
+        ack_q = multiprocessing.Queue()
+        cp = ChunkProcessor(
+            cloud_capture_dir, q, ack_q, recording_name="test",
+            upload_enabled=False, auto_delete=False,
+        )
+
+        cp._export_events(0, 999.0, 1001.0)
+
+        lines = (cloud_capture_dir / "events_0000.jsonl").read_text().strip().split("\n")
+        events = [json.loads(line) for line in lines[1:]]
+        bundles = {e["app_bundle_id"] for e in events if e["type"] == "window.switch"}
+        # Disabled Chrome row must not appear; enabled Finder must.
+        assert "com.apple.finder" in bundles
+        assert "com.google.Chrome" not in bundles
+
+    # ------------------------------------------------------------------
+    # Edge cases: chunks with only one of (actions, windows) populated.
+    # ------------------------------------------------------------------
+
+    def test_chunk_with_only_window_switches(self, cloud_capture_dir, recording_db):
+        """Chunk with no actions but with window switches → output has
+        only window events.
+        """
+        self._insert_window(recording_db, 1000.0, "Finder", "com.apple.finder", "win-1")
+        self._insert_window(recording_db, 1000.5, "Chrome", "com.google.Chrome", "win-2")
+
+        from screencap.chunk_processor import ChunkProcessor
+
+        q = multiprocessing.Queue()
+        ack_q = multiprocessing.Queue()
+        cp = ChunkProcessor(
+            cloud_capture_dir, q, ack_q, recording_name="test",
+            upload_enabled=False, auto_delete=False,
+        )
+
+        cp._export_events(0, 999.0, 1001.0)
+
+        lines = (cloud_capture_dir / "events_0000.jsonl").read_text().strip().split("\n")
+        events = [json.loads(line) for line in lines[1:]]
+        types = {e["type"] for e in events}
+        assert types == {"window.switch"}
+        assert len(events) == 2
+
+    def test_chunk_with_only_actions(self, cloud_capture_dir, recording_db):
+        """Chunk with no window switches and no initial-window-context →
+        output has only action events (no window.switch entries).
+        """
+        self._insert_action(recording_db, 1000.0, "click", mouse_x=10, mouse_y=10,
+                            mouse_button_name="left", mouse_pressed=1)
+        self._insert_action(recording_db, 1000.05, "click", mouse_x=10, mouse_y=10,
+                            mouse_button_name="left", mouse_pressed=0)
+
+        from screencap.chunk_processor import ChunkProcessor
+
+        q = multiprocessing.Queue()
+        ack_q = multiprocessing.Queue()
+        cp = ChunkProcessor(
+            cloud_capture_dir, q, ack_q, recording_name="test",
+            upload_enabled=False, auto_delete=False,
+        )
+
+        cp._export_events(0, 999.0, 1001.0)
+
+        lines = (cloud_capture_dir / "events_0000.jsonl").read_text().strip().split("\n")
+        events = [json.loads(line) for line in lines[1:]]
+        assert events  # non-empty
+        assert not any(e["type"] == "window.switch" for e in events)
+
+    # ------------------------------------------------------------------
+    # Atomicity / fail-soft regression coverage.
+    # ------------------------------------------------------------------
+
+    def test_atomic_write_cleans_tmp_on_mid_write_exception(
+        self, cloud_capture_dir, recording_db,
+    ):
+        """Mid-write exception → ``.tmp`` removed, ``events_*.jsonl`` not
+        created. The shared ``write_events_jsonl`` helper handles the
+        cleanup; this regression locks in the contract from the chunk
+        processor's perspective.
+        """
+        self._insert_action(recording_db, 1000.0, "click", mouse_x=10, mouse_y=10,
+                            mouse_button_name="left", mouse_pressed=1)
+        self._insert_action(recording_db, 1000.05, "click", mouse_x=10, mouse_y=10,
+                            mouse_button_name="left", mouse_pressed=0)
+
+        from screencap.chunk_processor import ChunkProcessor
+
+        q = multiprocessing.Queue()
+        ack_q = multiprocessing.Queue()
+        cp = ChunkProcessor(
+            cloud_capture_dir, q, ack_q, recording_name="test",
+            upload_enabled=False, auto_delete=False,
+        )
+
+        # Force the unified callable to yield events that explode on
+        # serialization. Use a generator that raises mid-stream.
+        def _exploding(*_a, **_kw):
+            yield from ()  # produce zero events first
+            raise RuntimeError("simulated mid-write failure")
+
+        with mock.patch(
+            "screencap.engine.export.unified_export_events",
+            side_effect=_exploding,
+        ):
+            with pytest.raises(RuntimeError):
+                cp._export_events(0, 999.0, 1001.0)
+
+        out = cloud_capture_dir / "events_0000.jsonl"
+        tmp = cloud_capture_dir / "events_0000.jsonl.tmp"
+        assert not out.exists(), "output must not be created on failure"
+        assert not tmp.exists(), ".tmp must be cleaned up on failure"
+
+    def test_action_select_busy_timeout_fail_soft(
+        self, cloud_capture_dir, recording_db,
+    ):
+        """OperationalError on the action SELECT (busy_timeout from live
+        writer contention) propagates through the cleanup-on-exception
+        path and is caught by the chunk-processor's outer ``_run``
+        ``except Exception``. _export_events itself raises so the caller
+        can mark the chunk failed; it does NOT crash the thread.
+
+        Regression test for the new ``disabled``-row predicate not
+        widening the failure surface beyond the previous fail-soft
+        contract.
+        """
+        from contextlib import contextmanager
+
+        from screencap.chunk_processor import ChunkProcessor
+        from screencap.recording_db import OperationalError as _OpErr
+        from screencap.recording_db import open_recording_db as _real_open
+
+        # Anchor at least one row so the SELECT executes against a
+        # populated table.
+        self._insert_action(recording_db, 1000.0, "click", mouse_x=10, mouse_y=10,
+                            mouse_button_name="left", mouse_pressed=1)
+
+        q = multiprocessing.Queue()
+        ack_q = multiprocessing.Queue()
+        cp = ChunkProcessor(
+            cloud_capture_dir, q, ack_q, recording_name="test",
+            upload_enabled=False, auto_delete=False,
+        )
+
+        # Wrap the connection yielded by ``open_recording_db`` so the
+        # action SELECT raises OperationalError but other queries
+        # (PRAGMAs, has_column probes) still hit the real connection.
+        # sqlite3.Connection is immutable, so we proxy through a tiny
+        # passthrough class.
+        class _ProxyConn:
+            def __init__(self, real):
+                self._real = real
+
+            def __getattr__(self, name):
+                return getattr(self._real, name)
+
+            def execute(self, sql, *args, **kwargs):
+                if sql.startswith("SELECT * FROM action_event"):
+                    raise _OpErr("database is locked")
+                return self._real.execute(sql, *args, **kwargs)
+
+            @property
+            def row_factory(self):
+                return self._real.row_factory
+
+            @row_factory.setter
+            def row_factory(self, value):
+                self._real.row_factory = value
+
+        @contextmanager
+        def patched_open(path, **kwargs):
+            with _real_open(path, **kwargs) as real:
+                yield _ProxyConn(real)
+
+        with mock.patch(
+            "screencap.chunk_processor.open_recording_db", patched_open,
+        ):
+            with pytest.raises(_OpErr):
+                cp._export_events(0, 999.0, 1001.0)
+
+        out = cloud_capture_dir / "events_0000.jsonl"
+        tmp = cloud_capture_dir / "events_0000.jsonl.tmp"
+        assert not out.exists()
+        assert not tmp.exists()
 
 
 # ---------------------------------------------------------------------------

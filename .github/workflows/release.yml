@@ -38,6 +38,12 @@ jobs:
           path: ~/.cache/pip
           key: ${{ runner.os }}-${{ matrix.runner }}-${{ matrix.arch }}-pip-${{ hashFiles('pyproject.toml', 'pyinstaller/constraints-x86_64.txt') }}
 
+      - name: Upgrade pip past CVE-2026-3219
+        # Runner-shipped pip 26.0.1 is flagged by `pip-audit` at the Audit
+        # Dependencies step; pip 26.1 is the fix release for the tar/ZIP
+        # polyglot issue (pypa/pip#13870, GHSA-58qw-9mgm-455v).
+        run: pip install --upgrade "pip>=26.1"
+
       - name: Install dependencies (arm64)
         if: matrix.arch == 'arm64'
         run: pip install -e ".[record]" && pip install pyinstaller

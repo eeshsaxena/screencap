@@ -7,12 +7,14 @@ import logging
 import os
 import sys
 from datetime import datetime, timezone
-from typing import TYPE_CHECKING, Callable
+from pathlib import Path
+from typing import IO, TYPE_CHECKING, Callable, Iterable
 
 from screencap import __version__
 
-if TYPE_CHECKING:  # pragma: no cover
-    from screencap.engine.events import WindowSwitchEvent
+if TYPE_CHECKING:  # pragma: no cover - import-only typing hint
+    from screencap.engine.capture import CaptureSession
+    from screencap.engine.events import BaseEvent, WindowSwitchEvent
 
 logger = logging.getLogger(__name__)
 
@@ -36,7 +38,7 @@ PrivacyFilter = Callable[["WindowSwitchEvent"], "WindowSwitchEvent | None"]
 
 
 def export_recording(
-    recording_dir,
+    recording_dir: Path | str,
     output_path: str | None,
     exclude_moves: bool,
     metadata: dict | None = None,
@@ -45,8 +47,8 @@ def export_recording(
     """Export a single recording to JSONL.
 
     Returns event count on success.  Raises ``ExportError`` if the
-    recording database cannot be found (missing directory, missing
-    recording.db, or legacy capture.db format).
+    recording database cannot be found (missing directory or missing
+    recording.db).
 
     When *output_path* is a file path, uses atomic write (write to .tmp,
     rename on success).  When *output_path* is None, writes to stdout.
@@ -90,14 +92,85 @@ def export_recording(
         return count
 
 
+def write_events_jsonl(
+    out_path: Path,
+    events: Iterable[BaseEvent],
+    meta: dict,
+) -> int:
+    """Stream events to ``out_path`` atomically as JSONL.
+
+    Writes ``meta`` as line 1, then iterates ``events`` writing
+    ``event.model_dump_json() + "\\n"`` per line. The actual writes go to
+    ``out_path.with_suffix(out_path.suffix + ".tmp")``; on success the
+    .tmp file is renamed onto ``out_path`` (atomic on POSIX). On any
+    exception during the write loop the .tmp file is removed and the
+    exception re-raises.
+
+    Streaming is load-bearing: under R11 the chunk processor keeps
+    ``mouse.move`` events by default, so a worst-case idle-reading
+    recording can produce tens of MB of events. Iterating one event at a
+    time bounds peak writer-side memory regardless of the input size.
+
+    Stale-.tmp cleanup: any pre-existing .tmp at the target path is
+    removed before opening the new one. This is defense-in-depth for the
+    SIGKILL/OOM case where a previous run left a partial file behind.
+
+    Args:
+        out_path: Final destination path for the JSONL file. The .tmp
+            sibling is derived by appending ``.tmp`` to the suffix
+            (e.g. ``events.jsonl`` → ``events.jsonl.tmp``).
+        events: Iterable of Pydantic events. Consumed lazily; supports
+            iterators from ``unified_export_events``.
+        meta: Header dict written as line 1 via ``json.dumps(meta)``.
+            Typically built via :func:`build_export_metadata`. Required
+            (no implicit "skip header" path here — callers that want a
+            header-less file must use a different writer).
+
+    Returns:
+        Count of events written, **excluding** the meta line. Matches the
+        return signature of the legacy :func:`_write_events` helper.
+
+    Raises:
+        Any exception raised by the events iterator, by Pydantic's
+        ``model_dump_json``, or by the underlying file I/O is propagated
+        after the .tmp file is unlinked.
+    """
+    tmp_path = out_path.with_suffix(out_path.suffix + ".tmp")
+
+    # Stale .tmp cleanup: a previous SIGKILL/OOM may have left a partial
+    # file at this path. Drop it before we start writing.
+    tmp_path.unlink(missing_ok=True)
+
+    count = 0
+    try:
+        with open(tmp_path, "w") as f:
+            f.write(json.dumps(meta) + "\n")
+            for event in events:
+                f.write(event.model_dump_json() + "\n")
+                count += 1
+        os.rename(tmp_path, out_path)
+    except BaseException:
+        # Cleanup-on-exception. Use missing_ok in case the open() itself
+        # failed before the file was created.
+        tmp_path.unlink(missing_ok=True)
+        raise
+
+    return count
+
+
 def _write_events(
-    capture,
-    out_file,
+    capture: CaptureSession,
+    out_file: IO[str],
     exclude_moves: bool,
     metadata: dict | None,
     privacy_filter: PrivacyFilter | None = None,
 ) -> int:
     """Stream events to an open file handle. Returns event count.
+
+    Legacy helper retained as a thin shim for backward compatibility.
+    The ``privacy_filter`` kwarg is wired through here today; Unit 5
+    will retire it once ``CaptureSession.export_events`` calls the
+    unified callable with ``window_filter`` upstream.
 
     Args:
         capture: CaptureSession instance.
@@ -123,109 +196,3 @@ def _write_events(
         click.echo(event.model_dump_json(), file=out_file)
         count += 1
     return count
-
-
-def build_privacy_filter(
-    privacy_mode: str = "internal",
-    cloud_intent: bool = False,
-    capture_dir=None,
-):
-    """Build a privacy filter callback for window.switch events.
-
-    Args:
-        privacy_mode: Privacy mode string (public/shared/internal).
-        cloud_intent: Whether this export is destined for cloud upload.
-        capture_dir: Path to the capture directory (for loading menu bar
-            overrides from ``.menubar_overrides.json``).
-
-    Returns:
-        Callable that takes a WindowSwitchEvent and returns the event
-        (possibly with masked title), or None to suppress it.
-    """
-    from screencap.privacy.actions import PrivacyAction
-    from screencap.privacy.context import DefaultContextClassifier
-    from screencap.privacy.policy import (
-        DefaultPolicyEvaluator,
-        PrivacyMode,
-    )
-
-    try:
-        mode = PrivacyMode(privacy_mode)
-    except ValueError:
-        mode = PrivacyMode.INTERNAL
-
-    # Cloud uploads must use the strictest non-shared mode to prevent
-    # leaking window titles for apps like Slack/Teams (see action matrix).
-    if cloud_intent:
-        mode = PrivacyMode.PUBLIC
-
-    # Load privacy config from config.toml
-    try:
-        from screencap.config import get_privacy_config
-
-        privacy_cfg = get_privacy_config()
-    except (ImportError, FileNotFoundError, KeyError, ValueError):
-        logger.debug("Could not load privacy config, using defaults")
-        from screencap.privacy.policy import PrivacyConfig
-
-        privacy_cfg = PrivacyConfig(mode=mode)
-
-    classifier = DefaultContextClassifier(app_classes=privacy_cfg.app_classes)
-    evaluator = DefaultPolicyEvaluator(privacy_cfg)
-
-    # Load session overrides from menu bar toggles
-    runtime_overrides: dict[str, str] = {}
-    if capture_dir is not None:
-        from pathlib import Path
-
-        override_path = Path(capture_dir) / ".menubar_overrides.json"
-        if override_path.exists():
-            import json
-
-            try:
-                runtime_overrides = json.loads(override_path.read_text())
-            except Exception:
-                logger.debug("Could not load menu bar overrides")
-
-    def _filter(event):
-        from screencap.privacy.policy import FrameMetadata
-
-        bundle_id = event.app_bundle_id or ""
-
-        # Check runtime overrides first (user toggles from menu bar)
-        if runtime_overrides:
-            from screencap.privacy.actions import resolve_override
-            from screencap.privacy.domain_loader import extract_root_domain
-
-            domain = getattr(event, "domain", None)
-            root_domain = extract_root_domain(domain) if domain else None
-            override_action = resolve_override(
-                runtime_overrides, bundle_id, root_domain,
-            )
-            if override_action == "exclude":
-                return None
-            if override_action == "allow":
-                return event
-
-        metadata = FrameMetadata(
-            bundle_id=bundle_id,
-            window_title=event.window_title,
-            domain=event.domain,
-            timestamp=event.timestamp,
-        )
-        ctx = classifier.classify(metadata)
-        decision = evaluator.evaluate(ctx, metadata, mode)
-        action = decision.action
-
-        if action == PrivacyAction.EXCLUDE:
-            return None
-
-        if action == PrivacyAction.MASK_WINDOW:
-            return event.model_copy(update={
-                "window_title": event.app_name,
-                "domain": None,
-            })
-
-        return event
-
-    return _filter

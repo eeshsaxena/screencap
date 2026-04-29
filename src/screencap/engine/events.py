@@ -48,6 +48,13 @@ class EventType(str, Enum):
     KEY_SHORTCUT = "key.shortcut"
     KEY_SPECIAL = "key.special"
 
+    # Network events (V1 - metadata-only schema)
+    NETWORK_REQUEST = "network.request"
+    NETWORK_RESPONSE = "network.response"
+    NETWORK_WS_UPGRADE = "network.ws_upgrade"
+    NETWORK_WS_FRAME = "network.ws_frame"
+    NETWORK_DROP_BURST = "network.drop_burst"
+
 
 class MouseButton(str, Enum):
     """Mouse button names."""
@@ -90,6 +97,15 @@ class MouseMoveEvent(BaseEvent):
         default_factory=list,
         description="All (x, y) waypoints. Single-element for unmerged moves, "
                     "multi-element when consecutive moves are merged.",
+    )
+    last_timestamp: float | None = Field(
+        default=None,
+        description=(
+            "End timestamp for merged consecutive moves. None for unmerged moves "
+            "(timestamp is both start and end). Set by merge_consecutive_mouse_move_events "
+            "when buffer length > 1. Used by the scrub layer to detect blocked-interval "
+            "intersection across the merged span."
+        ),
     )
 
 
@@ -168,7 +184,7 @@ class MouseSmartMagnifyEvent(BaseEvent):
     """Two-finger double-tap zoom toggle (macOS SmartMagnify).
 
     Corresponds to macOS NSEventTypeSmartMagnify (type 32).
-    This is a discrete toggle event — it zooms to fit a region
+    This is a discrete toggle event - it zooms to fit a region
     then zooms back out. No delta or direction is available.
     """
 
@@ -275,7 +291,7 @@ class WindowStateEvent(BaseEvent):
 class WindowSwitchEvent(BaseEvent):
     """Standalone event emitted when the active app or window changes.
 
-    Deduplicated by (app_bundle_id, window_id) — captures actual window
+    Deduplicated by (app_bundle_id, window_id) - captures actual window
     switches, ignores title-only changes. Used in events.jsonl export.
     """
 
@@ -378,7 +394,7 @@ class KeyShortcutEvent(BaseEvent):
     contains modifier keys combined with a non-printable regular key,
     or Ctrl/Alt/Cmd combined with any key.
 
-    Example: Ctrl+z → keys=["ctrl", "z"], text="Ctrl+z"
+    Example: Ctrl+z -> keys=["ctrl", "z"], text="Ctrl+z"
     """
 
     type: Literal[EventType.KEY_SHORTCUT] = EventType.KEY_SHORTCUT
@@ -403,8 +419,8 @@ class SpecialKeyEvent(BaseEvent):
     Created by merge_consecutive_keyboard_events() when adjacent
     key-down/key-up pairs are detected for special keys.
 
-    Example: Play/Pause → key_name="media_play_pause", text="Play/Pause"
-    Example: F5 → key_name="f5", text="F5"
+    Example: Play/Pause -> key_name="media_play_pause", text="Play/Pause"
+    Example: F5 -> key_name="f5", text="F5"
     """
 
     type: Literal[EventType.KEY_SPECIAL] = EventType.KEY_SPECIAL
@@ -420,6 +436,180 @@ class SpecialKeyEvent(BaseEvent):
         if self.key_name.startswith("brightness_"):
             return self.key_name.replace("_", " ").title()
         return self.key_name.upper()
+
+
+# =============================================================================
+# Network Events (V1 - metadata-only schema)
+# =============================================================================
+#
+# Single Pydantic class per kind. NO body_ciphertext / body_nonce / body_aad /
+# body_text fields in V1 - those are V1.5 (which introduces a dual capture/export
+# class family to keep ciphertext from leaking to JSONL by construction).
+#
+# body_sha256_hex is a lowercase hex string (NOT raw bytes) - Pydantic 2's
+# default JSON serializer UTF-8-decodes raw bytes which fails for binary
+# digests. The DB column stays LargeBinary(32); convert.dict_to_network_event
+# calls .hex() to populate this field.
+#
+# headers is a list of (name, value) tuples (NOT a dict) - preserves multi-value
+# headers like duplicate Set-Cookie which a JSON dict cannot represent.
+
+
+class NetworkRequestEvent(BaseEvent):
+    """HTTP request observed by the system proxy.
+
+    Metadata only in V1: no body bytes are retained - the addon hashes
+    each body and discards the bytes. body_size is the observed Content-Length
+    (or counted streamed bytes); body_sha256_hex is the hex digest if the
+    body was hashed; otherwise both are None.
+    """
+
+    type: Literal[EventType.NETWORK_REQUEST] = EventType.NETWORK_REQUEST
+    timestamp_ns: int = Field(description="High-precision sort key (time.time_ns())")
+    flow_id: str = Field(description="mitmproxy flow id (correlates request/response/ws frames)")
+    method: str = Field(description="HTTP method, e.g. 'GET', 'POST'")
+    url: str = Field(description="Full request URL")
+    host: str = Field(description="Request host (lowercase)")
+    headers: list[tuple[str, str]] = Field(
+        default_factory=list,
+        description="Ordered name/value pairs (preserves multi-value headers)",
+    )
+    body_size: int | None = Field(
+        default=None,
+        description="Observed body size in bytes (None if unknown or no body)",
+    )
+    body_sha256_hex: str | None = Field(
+        default=None,
+        description="Lowercase hex of SHA-256(body), or None if no body / not hashed",
+    )
+    content_type: str | None = Field(default=None, description="Content-Type header value")
+    http_version: str | None = Field(default=None, description="HTTP/1.1 / HTTP/2 / HTTP/3")
+
+
+class NetworkResponseEvent(BaseEvent):
+    """HTTP response observed by the system proxy."""
+
+    type: Literal[EventType.NETWORK_RESPONSE] = EventType.NETWORK_RESPONSE
+    timestamp_ns: int = Field(description="High-precision sort key (time.time_ns())")
+    flow_id: str = Field(description="mitmproxy flow id (correlates with request)")
+    host: str = Field(description="Request host (lowercase)")
+    status: int = Field(description="HTTP status code")
+    headers: list[tuple[str, str]] = Field(
+        default_factory=list,
+        description="Ordered name/value pairs (preserves multi-value headers)",
+    )
+    body_size: int | None = Field(
+        default=None,
+        description="Observed body size in bytes (None if unknown or no body)",
+    )
+    body_sha256_hex: str | None = Field(
+        default=None,
+        description="Lowercase hex of SHA-256(body), or None if no body / not hashed",
+    )
+    content_type: str | None = Field(default=None, description="Content-Type header value")
+    http_version: str | None = Field(default=None, description="HTTP/1.1 / HTTP/2 / HTTP/3")
+
+
+class NetworkWebSocketUpgradeEvent(BaseEvent):
+    """WebSocket upgrade (HTTP 101 Switching Protocols).
+
+    `headers` carries the response headers (the 101 response). The request
+    headers are stored in `details_json["request_headers"]` because this is
+    the only event kind that needs both header sets in a single row.
+    """
+
+    type: Literal[EventType.NETWORK_WS_UPGRADE] = EventType.NETWORK_WS_UPGRADE
+    timestamp_ns: int = Field(description="High-precision sort key (time.time_ns())")
+    flow_id: str = Field(description="mitmproxy flow id")
+    url: str = Field(description="WebSocket URL (ws:// or wss://)")
+    host: str = Field(description="Host (lowercase)")
+    status: int = Field(default=101, description="Upgrade status code (101)")
+    headers: list[tuple[str, str]] = Field(
+        default_factory=list,
+        description="Response (101) headers",
+    )
+    http_version: str | None = Field(default=None, description="HTTP version of the upgrade")
+    details_json: dict | None = Field(
+        default=None,
+        description="Carries request_headers for the upgrade: "
+                    "{'request_headers': [[name, value], ...]}",
+    )
+
+
+class NetworkWebSocketFrameEvent(BaseEvent):
+    """A single WebSocket frame (one event per frame).
+
+    `direction` is "sent" (client to server) or "received" (server to client).
+    `frame_type` is "text" or "binary" (control frames are not emitted as
+    events in V1).
+    """
+
+    type: Literal[EventType.NETWORK_WS_FRAME] = EventType.NETWORK_WS_FRAME
+    timestamp_ns: int = Field(description="High-precision sort key (time.time_ns())")
+    flow_id: str = Field(description="mitmproxy flow id (correlates with upgrade)")
+    host: str = Field(description="Host (lowercase)")
+    direction: Literal["sent", "received"] = Field(
+        description="'sent' = client->server, 'received' = server->client",
+    )
+    frame_type: Literal["text", "binary"] = Field(description="WebSocket frame type")
+    body_size: int | None = Field(
+        default=None,
+        description="Observed frame payload size in bytes",
+    )
+    body_sha256_hex: str | None = Field(
+        default=None,
+        description="Lowercase hex of SHA-256(payload), or None if not hashed",
+    )
+
+
+class NetworkDropBurstEvent(BaseEvent):
+    """A burst of network events were dropped due to backpressure.
+
+    Emitted by either the addon (proxy -> reader queue full) or the
+    reader thread (reader -> writer queue full). `flow_id` is None
+    because a drop burst is not tied to a single flow.
+
+    `details_json` carries the full payload:
+        {
+            "dropped_count": int,
+            "hosts_affected": [str, ...],
+            "source": "addon" | "reader",
+        }
+    """
+
+    type: Literal[EventType.NETWORK_DROP_BURST] = EventType.NETWORK_DROP_BURST
+    timestamp_ns: int = Field(description="High-precision sort key (time.time_ns())")
+    details_json: dict = Field(
+        description="{'dropped_count': int, 'hosts_affected': [...], "
+                    "'source': 'addon'|'reader'}",
+    )
+
+
+# =============================================================================
+# Network sideband (control-only - NOT a BaseEvent)
+# =============================================================================
+
+
+class NetworkPinFailureEvent(BaseModel):
+    """Control-only sideband message for cert-pinning failures.
+
+    NOT a BaseEvent - does not have a `type` field, is not in EventType,
+    is not in EVENT_TYPE_MAP, is not persisted to network_event, and never
+    crosses an export boundary. Defined here purely for type-safety on
+    the proxy -> reader thread channel so the reader can `isinstance` check
+    before dispatching.
+
+    The `TestEventTypeMap` at tests/engine/test_storage.py walks every
+    concrete BaseEvent subclass and requires registration in
+    EVENT_TYPE_MAP. Subclassing BaseEvent here would break that test -
+    a guard test in tests/engine/test_events.py asserts this stays a
+    bare BaseModel.
+    """
+
+    timestamp: float = Field(description="Unix timestamp of failure")
+    timestamp_ns: int = Field(description="High-precision sort key")
+    host: str = Field(description="Host that failed pinning")
+    reason: str = Field(description="Short human-readable reason")
 
 
 # =============================================================================
@@ -450,4 +640,49 @@ AudioEvent = AudioChunkEvent
 
 WindowEvent = WindowStateEvent | WindowSwitchEvent
 
-Event = ActionEvent | ScreenEvent | AudioEvent | WindowEvent
+NetworkEvent = (
+    NetworkRequestEvent
+    | NetworkResponseEvent
+    | NetworkWebSocketUpgradeEvent
+    | NetworkWebSocketFrameEvent
+    | NetworkDropBurstEvent
+)
+
+Event = ActionEvent | ScreenEvent | AudioEvent | WindowEvent | NetworkEvent
+
+
+# =============================================================================
+# Event-type registry
+# =============================================================================
+#
+# Canonical mapping from event ``type`` string discriminators to their Pydantic
+# event classes. Test suite locks completeness via ``TestEventTypeMap`` so any
+# new ``BaseEvent`` subclass added without a registry entry fails loudly
+# instead of silently dropping on deserialization.
+
+EVENT_TYPE_MAP: dict[str, type[Event]] = {
+    EventType.MOUSE_MOVE.value: MouseMoveEvent,
+    EventType.MOUSE_DOWN.value: MouseDownEvent,
+    EventType.MOUSE_UP.value: MouseUpEvent,
+    EventType.MOUSE_SCROLL.value: MouseScrollEvent,
+    EventType.MOUSE_MAGNIFY.value: MouseMagnifyEvent,
+    EventType.MOUSE_ROTATE.value: MouseRotateEvent,
+    EventType.MOUSE_SMART_MAGNIFY.value: MouseSmartMagnifyEvent,
+    EventType.KEY_DOWN.value: KeyDownEvent,
+    EventType.KEY_UP.value: KeyUpEvent,
+    EventType.SCREEN_FRAME.value: ScreenFrameEvent,
+    EventType.AUDIO_CHUNK.value: AudioChunkEvent,
+    EventType.MOUSE_SINGLECLICK.value: MouseClickEvent,
+    EventType.MOUSE_DOUBLECLICK.value: MouseDoubleClickEvent,
+    EventType.MOUSE_DRAG.value: MouseDragEvent,
+    EventType.KEY_TYPE.value: KeyTypeEvent,
+    EventType.KEY_SHORTCUT.value: KeyShortcutEvent,
+    EventType.KEY_SPECIAL.value: SpecialKeyEvent,
+    EventType.WINDOW_STATE.value: WindowStateEvent,
+    EventType.WINDOW_SWITCH.value: WindowSwitchEvent,
+    EventType.NETWORK_REQUEST.value: NetworkRequestEvent,
+    EventType.NETWORK_RESPONSE.value: NetworkResponseEvent,
+    EventType.NETWORK_WS_UPGRADE.value: NetworkWebSocketUpgradeEvent,
+    EventType.NETWORK_WS_FRAME.value: NetworkWebSocketFrameEvent,
+    EventType.NETWORK_DROP_BURST.value: NetworkDropBurstEvent,
+}

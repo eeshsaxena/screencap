@@ -19,14 +19,22 @@ import json
 import logging
 import os
 import re
-import sqlite3
 from collections import Counter
+from contextlib import ExitStack
 from dataclasses import dataclass, field
 from pathlib import Path
 
-from screencap.privacy.actions import BLOCK_ACTIONS, KEYSTROKE_CONTENT_FIELDS, PrivacyAction
+from screencap.privacy.actions import (
+    BLOCK_ACTIONS,
+    KEYSTROKE_CONTENT_FIELDS,
+    MOUSE_COORDINATE_FIELDS,
+    SCRUB_BLOCK_ACTIONS,
+    SCRUB_CONTENT_NULL_ACTIONS,
+    PrivacyAction,
+)
 from screencap.privacy.policy import DEFAULT_TRANSITION_HOLD_SECONDS
 from screencap.privacy.reasons import AuditEntry, ReasonCode
+from screencap.recording_db import Connection, has_column, has_table, open_recording_db
 
 logger = logging.getLogger(__name__)
 
@@ -148,11 +156,22 @@ def build_blocked_intervals(
     window_events,
     evaluator,
     classifier,
+    *,
+    actions: frozenset[PrivacyAction] = BLOCK_ACTIONS,
 ) -> list[BlockedInterval]:
-    """Build intervals where the frontmost app triggers EXCLUDE.
+    """Build intervals where the frontmost app triggers a blocking action.
 
     Each window event defines a period from its timestamp to the next
     window event's timestamp (or infinity for the last event).
+
+    Args:
+        window_events: Ordered list of WindowContext.
+        evaluator: Policy evaluator that returns ActionDecision per frame.
+        classifier: Context classifier mapping frames to ContextClass.
+        actions: Set of PrivacyActions that mark an interval as blocked.
+            Defaults to BLOCK_ACTIONS (screenshot capture-time semantics, just
+            EXCLUDE). Pass SCRUB_BLOCK_ACTIONS for scrub-time pointer
+            suppression (EXCLUDE/MASK_WINDOW/TEXT_REDACT/OCR_FALLBACK).
     """
     from screencap.privacy.policy import FrameMetadata
 
@@ -178,7 +197,7 @@ def build_blocked_intervals(
         ctx = classifier.classify(meta)
         decision = evaluator.evaluate(ctx, meta)
 
-        if decision.action in BLOCK_ACTIONS:
+        if decision.action in actions:
             intervals.append(
                 BlockedInterval(
                     start=we.timestamp,
@@ -196,7 +215,7 @@ def build_secure_field_intervals(
     hold_seconds: float = DEFAULT_TRANSITION_HOLD_SECONDS,
     *,
     time_range: tuple[float, float] | None = None,
-    conn: sqlite3.Connection | None = None,
+    conn: Connection | None = None,
 ) -> list[BlockedInterval]:
     """Build blocked intervals from action events with AXSecureTextField.
 
@@ -213,89 +232,82 @@ def build_secure_field_intervals(
     if db_path is None and conn is None:
         return []
 
-    own_conn = conn is None
-    if own_conn:
-        _conn = sqlite3.connect(str(db_path))
-        _conn.execute("PRAGMA busy_timeout=5000")
-        _conn.execute("PRAGMA query_only=ON")
+    if conn is not None:
+        return _build_secure_field_intervals_with_conn(
+            conn, hold_seconds, time_range=time_range,
+        )
+    with open_recording_db(db_path) as own_conn:
+        return _build_secure_field_intervals_with_conn(
+            own_conn, hold_seconds, time_range=time_range,
+        )
+
+
+def _build_secure_field_intervals_with_conn(
+    conn: Connection,
+    hold_seconds: float,
+    *,
+    time_range: tuple[float, float] | None,
+) -> list[BlockedInterval]:
+    if not has_table(conn, "action_event"):
+        return []
+    if not has_column(conn, "action_event", "element_state"):
+        return []
+
+    if time_range is not None:
+        rows = conn.execute(
+            "SELECT timestamp, element_state FROM action_event "
+            "WHERE element_state IS NOT NULL AND timestamp IS NOT NULL "
+            "AND timestamp >= ? AND timestamp < ? "
+            "ORDER BY timestamp",
+            (time_range[0], time_range[1]),
+        ).fetchall()
     else:
-        _conn = conn
+        rows = conn.execute(
+            "SELECT timestamp, element_state FROM action_event "
+            "WHERE element_state IS NOT NULL AND timestamp IS NOT NULL "
+            "ORDER BY timestamp"
+        ).fetchall()
 
-    try:
-        tables = {
-            r[0]
-            for r in _conn.execute(
-                "SELECT name FROM sqlite_master WHERE type='table'"
-            ).fetchall()
-        }
-        if "action_event" not in tables:
-            return []
+    raw_intervals: list[tuple[float, float]] = []
+    for ts, es_raw in rows:
+        if not es_raw:
+            continue
+        try:
+            es = json.loads(es_raw) if isinstance(es_raw, str) else es_raw
+        except (json.JSONDecodeError, TypeError):
+            continue
+        if not isinstance(es, dict):
+            continue
+        if (
+            es.get("AXRole") == "AXSecureTextField"
+            or es.get("AXSubrole") == "AXSecureTextField"
+        ):
+            raw_intervals.append((float(ts), float(ts) + hold_seconds))
 
-        ae_cols = {
-            r[1]
-            for r in _conn.execute("PRAGMA table_info(action_event)").fetchall()
-        }
-        if "element_state" not in ae_cols:
-            return []
+    if not raw_intervals:
+        return []
 
-        if time_range is not None:
-            rows = _conn.execute(
-                "SELECT timestamp, element_state FROM action_event "
-                "WHERE element_state IS NOT NULL AND timestamp IS NOT NULL "
-                "AND timestamp >= ? AND timestamp < ? "
-                "ORDER BY timestamp",
-                (time_range[0], time_range[1]),
-            ).fetchall()
+    # Merge overlapping/adjacent intervals
+    merged: list[BlockedInterval] = []
+    cur_start, cur_end = raw_intervals[0]
+    for start, end in raw_intervals[1:]:
+        if start <= cur_end:
+            cur_end = max(cur_end, end)
         else:
-            rows = _conn.execute(
-                "SELECT timestamp, element_state FROM action_event "
-                "WHERE element_state IS NOT NULL AND timestamp IS NOT NULL "
-                "ORDER BY timestamp"
-            ).fetchall()
-
-        raw_intervals: list[tuple[float, float]] = []
-        for ts, es_raw in rows:
-            if not es_raw:
-                continue
-            try:
-                es = json.loads(es_raw) if isinstance(es_raw, str) else es_raw
-            except (json.JSONDecodeError, TypeError):
-                continue
-            if not isinstance(es, dict):
-                continue
-            if (
-                es.get("AXRole") == "AXSecureTextField"
-                or es.get("AXSubrole") == "AXSecureTextField"
-            ):
-                raw_intervals.append((float(ts), float(ts) + hold_seconds))
-
-        if not raw_intervals:
-            return []
-
-        # Merge overlapping/adjacent intervals
-        merged: list[BlockedInterval] = []
-        cur_start, cur_end = raw_intervals[0]
-        for start, end in raw_intervals[1:]:
-            if start <= cur_end:
-                cur_end = max(cur_end, end)
-            else:
-                merged.append(BlockedInterval(
-                    start=cur_start,
-                    end=cur_end,
-                    action=PrivacyAction.EXCLUDE,
-                    reason=ReasonCode.SECURE_FIELD_DETECTED,
-                ))
-                cur_start, cur_end = start, end
-        merged.append(BlockedInterval(
-            start=cur_start,
-            end=cur_end,
-            action=PrivacyAction.EXCLUDE,
-            reason=ReasonCode.SECURE_FIELD_DETECTED,
-        ))
-        return merged
-    finally:
-        if own_conn:
-            _conn.close()
+            merged.append(BlockedInterval(
+                start=cur_start,
+                end=cur_end,
+                action=PrivacyAction.EXCLUDE,
+                reason=ReasonCode.SECURE_FIELD_DETECTED,
+            ))
+            cur_start, cur_end = start, end
+    merged.append(BlockedInterval(
+        start=cur_start,
+        end=cur_end,
+        action=PrivacyAction.EXCLUDE,
+        reason=ReasonCode.SECURE_FIELD_DETECTED,
+    ))
+    return merged
 
 
 def merge_intervals(
@@ -303,9 +315,12 @@ def merge_intervals(
 ) -> list[BlockedInterval]:
     """Concatenate and sort interval lists by start time.
 
-    Overlapping intervals are tolerated — find_blocked_interval only
-    needs to answer "is this timestamp blocked?" and bisect handles
-    overlaps correctly for that purpose.
+    Intervals may overlap (e.g., a long app-window MASK_WINDOW interval
+    with nested short secure-field EXCLUDE intervals from
+    ``build_scrub_context``). ``find_blocked_interval`` handles overlaps
+    by walking backwards through all prior intervals whose ``start <=
+    timestamp``; ``_interval_intersects`` relies on that fix in its
+    first branch.
     """
     all_intervals: list[BlockedInterval] = []
     for ivs in interval_lists:
@@ -319,26 +334,145 @@ def find_blocked_interval(
     intervals: list[BlockedInterval],
     _starts: list[float] | None = None,
 ) -> BlockedInterval | None:
-    """Return the blocked interval containing timestamp, or None.
+    """Return any blocked interval containing timestamp, or None.
 
     Pass _starts (pre-computed [iv.start for iv in intervals]) to avoid
     rebuilding the list on every call.
+
+    Handles overlapping intervals correctly: walks backwards through all
+    intervals whose ``start <= timestamp``, returning the first one whose
+    ``end > timestamp``. ``O(k)`` where ``k`` = overlap depth at this
+    timestamp; typically 1 for non-overlapping intervals, small for the
+    overlapping case (long app-window interval + nested short
+    secure-field interval).
+
+    Pre-fix, this used a single point-lookup at
+    ``bisect_right(_starts, timestamp) - 1`` and missed the case where
+    the closest-by-start interval ended before ``timestamp`` while a
+    longer earlier interval still contained it (e.g. a 1-second
+    secure-field EXCLUDE nested inside a 90-second MASK_WINDOW would
+    leak pointer events at timestamps after the EXCLUDE ended but
+    inside the MASK_WINDOW).
     """
     if not intervals:
         return None
     if _starts is None:
         _starts = [iv.start for iv in intervals]
+    # bisect_right returns the first index whose start > timestamp.
+    # idx-1 is the latest interval with start <= timestamp; walk
+    # backwards through earlier intervals (which all also have
+    # start <= timestamp by sorted order) until we find one with
+    # end > timestamp.
     idx = bisect.bisect_right(_starts, timestamp) - 1
-    if idx >= 0 and intervals[idx].start <= timestamp < intervals[idx].end:
+    while idx >= 0:
+        iv = intervals[idx]
+        if iv.start <= timestamp < iv.end:
+            return iv
+        idx -= 1
+    return None
+
+
+def _interval_intersects(
+    start_ts: float,
+    end_ts: float,
+    intervals: list[BlockedInterval],
+    _starts: list[float] | None = None,
+) -> BlockedInterval | None:
+    """Return any blocked interval that intersects ``[start_ts, end_ts]``.
+
+    Used by the scrub layer to drop ``mouse.move`` events whose merged span
+    crosses into a blocked interval. ``merge_consecutive_mouse_move_events``
+    collapses runs of raw moves into a single event whose ``timestamp`` is
+    the start and ``last_timestamp`` the end — a point-lookup at the start
+    timestamp would miss merges that begin before a blocked interval and end
+    inside it (the leak this helper closes).
+
+    Half-open overlap semantics matching ``find_blocked_interval``: an
+    interval ``[i.start, i.end)`` intersects the move span if
+    ``i.start <= end_ts AND i.end > start_ts``. A merged move whose
+    ``end_ts`` (last waypoint timestamp) lands exactly on ``i.start``
+    DOES intersect — the last waypoint is AT ``i.start``, which is
+    inside the half-open ``[i.start, i.end)`` interval (start
+    inclusive). The early-return ``end_ts <= start_ts`` handles the
+    point-lookup case before we reach the forward branch, so the
+    inclusive ``i.start <= end_ts`` check there only triggers when
+    ``end_ts > start_ts`` (a real range).
+
+    For unmerged moves, callers should pass ``end_ts == start_ts`` — this
+    degenerates to a point lookup matching ``find_blocked_interval``
+    semantics.
+
+    Correctness note for overlapping intervals: this helper relies on
+    ``find_blocked_interval`` (first branch) to handle the overlapping
+    case where ``start_ts`` is inside a longer interval whose
+    ``start`` lies before a shorter, later-starting interval (e.g.,
+    a long MASK_WINDOW with a nested short secure-field EXCLUDE).
+    The forward branch (looking for an interval starting after
+    ``start_ts`` but before ``end_ts``) only needs to check
+    ``intervals[idx]`` because intervals are sorted by ``start`` —
+    if the first interval after ``start_ts`` does not begin before
+    ``end_ts``, no later interval will either.
+    """
+    if not intervals:
+        return None
+    if _starts is None:
+        _starts = [iv.start for iv in intervals]
+
+    # Cheap path: if the start timestamp is inside an interval, return it.
+    # Relies on the overlap-aware find_blocked_interval — a point lookup
+    # at start_ts that walks backwards through prior overlapping intervals
+    # so a long MASK_WINDOW containing start_ts is found even when a
+    # shorter, later-starting interval would otherwise mask it.
+    hit = find_blocked_interval(start_ts, intervals, _starts)
+    if hit is not None:
+        return hit
+
+    # Otherwise look for an interval starting after start_ts but before
+    # end_ts (the merge spans into a later blocked interval).
+    # bisect_right returns the first index whose start > start_ts; we
+    # walk forward checking i.start <= end_ts. The check is INCLUSIVE
+    # because the move's last waypoint is AT end_ts: when
+    # end_ts == i.start, the last waypoint lands exactly on the start
+    # of the blocked interval, which IS inside the half-open
+    # ``[i.start, i.end)`` interval (start inclusive). The early-return
+    # ``end_ts <= start_ts`` above handles the point-lookup case before
+    # we reach this branch, so ``<=`` here only triggers for real ranges
+    # (end_ts > start_ts).
+    if end_ts <= start_ts:
+        return None
+    idx = bisect.bisect_right(_starts, start_ts)
+    if idx < len(intervals) and intervals[idx].start <= end_ts:
         return intervals[idx]
     return None
 
 
-def null_event_content(event: dict) -> None:
-    """Null out sensitive content fields in an event dict in-place (recursive).
+def null_pointer_geometry(event: dict) -> None:
+    """Zero mouse coordinate fields on retained mouse events. Recurses.
 
-    Handles nested structures like key.type inside mouse.drag.children,
-    and window.switch title/domain fields.
+    Used when a mouse event's timestamp lands inside a SCRUB_BLOCK_ACTIONS
+    interval — pointer geometry leaks coarse interaction patterns inside
+    redacted/masked content, regardless of whether text content is
+    sensitive (TEXT_REDACT/OCR_FALLBACK keystrokes go through PII
+    detection; their pointer coordinates do not).
+    """
+    event_type = event.get("type", "")
+    if isinstance(event_type, str) and event_type.startswith("mouse."):
+        for fld in MOUSE_COORDINATE_FIELDS:
+            if fld in event:
+                event[fld] = None
+    for child in event.get("children", []):
+        null_pointer_geometry(child)
+
+
+def null_text_content(event: dict) -> None:
+    """Null keystroke text + window.switch title/domain. Recurses into children.
+
+    Recurses into ``children`` to cover ``key.type`` nested inside
+    ``mouse.drag``.
+
+    Used when an event's timestamp lands inside a SCRUB_CONTENT_NULL_ACTIONS
+    interval (EXCLUDE/MASK_WINDOW) — text content is wholesale-suppressed
+    in those contexts.
     """
     for fld in KEYSTROKE_CONTENT_FIELDS:
         if fld in event:
@@ -347,7 +481,19 @@ def null_event_content(event: dict) -> None:
         event["window_title"] = None
         event["domain"] = None
     for child in event.get("children", []):
-        null_event_content(child)
+        null_text_content(child)
+
+
+def null_event_content(event: dict) -> None:
+    """Backward-compat: null both pointer geometry and text content.
+
+    Maintained for any external caller; ``scrub_events_jsonl`` now calls
+    the granular helpers directly so SCRUB_BLOCK_ACTIONS pointer
+    suppression can run independently of SCRUB_CONTENT_NULL_ACTIONS text
+    nulling.
+    """
+    null_pointer_geometry(event)
+    null_text_content(event)
 
 
 # ---------------------------------------------------------------------------
@@ -398,7 +544,7 @@ def collect_xref_from_db(
     anonymizer,
     *,
     time_range: tuple[float, float] | None = None,
-    conn: sqlite3.Connection | None = None,
+    conn: Connection | None = None,
 ) -> list[ElementStateDetection]:
     """Read-only collection of element_state xref detections from the DB.
 
@@ -413,87 +559,82 @@ def collect_xref_from_db(
         time_range: Optional (start, end) to scope queries for chunks.
         conn: Optional existing connection (for reuse).
     """
-    own_conn = conn is None
-    if own_conn:
-        _conn = sqlite3.connect(str(db_path))
-        _conn.execute("PRAGMA busy_timeout=5000")
-        _conn.execute("PRAGMA query_only=ON")
-    else:
-        _conn = conn
-
     try:
-        tables = {
-            r[0]
-            for r in _conn.execute(
-                "SELECT name FROM sqlite_master WHERE type='table'"
-            ).fetchall()
-        }
-        if "action_event" not in tables:
-            return []
-
-        ae_cols = {
-            r[1]
-            for r in _conn.execute("PRAGMA table_info(action_event)").fetchall()
-        }
-        if "element_state" not in ae_cols:
-            return []
-
-        if time_range is not None:
-            rows = _conn.execute(
-                "SELECT id, timestamp, element_state FROM action_event "
-                "WHERE element_state IS NOT NULL AND timestamp IS NOT NULL "
-                "AND timestamp >= ? AND timestamp < ? "
-                "ORDER BY timestamp",
-                (time_range[0], time_range[1]),
-            ).fetchall()
-        else:
-            rows = _conn.execute(
-                "SELECT id, timestamp, element_state FROM action_event "
-                "WHERE element_state IS NOT NULL AND timestamp IS NOT NULL "
-                "ORDER BY timestamp"
-            ).fetchall()
-
-        # Parse each element_state JSON, extract AXValue, run detection
-        raw_detections: dict[int, dict] = {}
-        _result = ScrubResult()  # throwaway — we only want detections
-
-        for row_id, timestamp, es_raw in rows:
-            if not es_raw:
-                continue
-            try:
-                es = json.loads(es_raw) if isinstance(es_raw, str) else es_raw
-            except (json.JSONDecodeError, TypeError):
-                continue
-            if not isinstance(es, dict):
-                continue
-
-            ax_value = es.get("AXValue")
-            if not ax_value or not isinstance(ax_value, str) or not ax_value.strip():
-                continue
-
-            _, det_result = scrub_text(ax_value, pipeline, anonymizer, result=_result)
-            if det_result is not None and det_result.detections:
-                per_row_dets = []
-                for det in det_result.detections:
-                    original_text = det_result.normalized_text[det.start:det.end]
-                    per_row_dets.append({
-                        "original_text": original_text,
-                        "entity_type": det.entity_type,
-                        "score": det.score,
-                    })
-                if per_row_dets:
-                    raw_detections[row_id] = {
-                        "timestamp": timestamp,
-                        "detections": per_row_dets,
-                    }
-
-        return build_xref_lookup(raw_detections)
+        if conn is not None:
+            return _collect_xref_with_conn(
+                conn, pipeline, anonymizer, time_range=time_range,
+            )
+        with open_recording_db(db_path) as own_conn:
+            return _collect_xref_with_conn(
+                own_conn, pipeline, anonymizer, time_range=time_range,
+            )
     except Exception:
         logger.debug("xref collection failed", exc_info=True)
         return []
-    finally:
-        if own_conn:
-            _conn.close()
+
+
+def _collect_xref_with_conn(
+    conn: Connection,
+    pipeline,
+    anonymizer,
+    *,
+    time_range: tuple[float, float] | None,
+) -> list[ElementStateDetection]:
+    if not has_table(conn, "action_event"):
+        return []
+    if not has_column(conn, "action_event", "element_state"):
+        return []
+
+    if time_range is not None:
+        rows = conn.execute(
+            "SELECT id, timestamp, element_state FROM action_event "
+            "WHERE element_state IS NOT NULL AND timestamp IS NOT NULL "
+            "AND timestamp >= ? AND timestamp < ? "
+            "ORDER BY timestamp",
+            (time_range[0], time_range[1]),
+        ).fetchall()
+    else:
+        rows = conn.execute(
+            "SELECT id, timestamp, element_state FROM action_event "
+            "WHERE element_state IS NOT NULL AND timestamp IS NOT NULL "
+            "ORDER BY timestamp"
+        ).fetchall()
+
+    # Parse each element_state JSON, extract AXValue, run detection
+    raw_detections: dict[int, dict] = {}
+    _result = ScrubResult()  # throwaway — we only want detections
+
+    for row_id, timestamp, es_raw in rows:
+        if not es_raw:
+            continue
+        try:
+            es = json.loads(es_raw) if isinstance(es_raw, str) else es_raw
+        except (json.JSONDecodeError, TypeError):
+            continue
+        if not isinstance(es, dict):
+            continue
+
+        ax_value = es.get("AXValue")
+        if not ax_value or not isinstance(ax_value, str) or not ax_value.strip():
+            continue
+
+        _, det_result = scrub_text(ax_value, pipeline, anonymizer, result=_result)
+        if det_result is not None and det_result.detections:
+            per_row_dets = []
+            for det in det_result.detections:
+                original_text = det_result.normalized_text[det.start:det.end]
+                per_row_dets.append({
+                    "original_text": original_text,
+                    "entity_type": det.entity_type,
+                    "score": det.score,
+                })
+            if per_row_dets:
+                raw_detections[row_id] = {
+                    "timestamp": timestamp,
+                    "detections": per_row_dets,
+                }
+
+    return build_xref_lookup(raw_detections)
 
 
 # ---------------------------------------------------------------------------
@@ -535,134 +676,124 @@ def build_scrub_context(
         ctx.pixel_ratio = pixel_ratio
 
     # Open a read-only connection for context queries
-    conn: sqlite3.Connection | None = None
     try:
-        conn = sqlite3.connect(str(db_path))
-        conn.execute("PRAGMA busy_timeout=5000")
-        conn.execute("PRAGMA query_only=ON")
+        with open_recording_db(db_path) as conn:
+            # Read pixel_ratio from DB if not provided
+            if pixel_ratio is None:
+                try:
+                    pr_row = conn.execute(
+                        "SELECT pixel_ratio FROM recording LIMIT 1"
+                    ).fetchone()
+                    if pr_row and pr_row[0]:
+                        ctx.pixel_ratio = float(pr_row[0])
+                except (Exception, ValueError):
+                    pass  # keep default 2.0
 
-        # Read pixel_ratio from DB if not provided
-        if pixel_ratio is None:
-            try:
-                pr_row = conn.execute(
-                    "SELECT pixel_ratio FROM recording LIMIT 1"
-                ).fetchone()
-                if pr_row and pr_row[0]:
-                    ctx.pixel_ratio = float(pr_row[0])
-            except (sqlite3.OperationalError, ValueError):
-                pass  # keep default 2.0
+            # Load window events
+            from screencap.privacy.context import load_window_events
 
-        # Load window events
-        from screencap.privacy.context import load_window_events
+            if time_range is not None:
+                # Scoped load for chunk processor
+                try:
+                    if has_table(conn, "window_event"):
+                        from screencap.privacy.context import WindowContext, domain_from_url
 
-        if time_range is not None:
-            # Scoped load for chunk processor
-            try:
-                conn.row_factory = sqlite3.Row
-                tables = {
-                    r[0]
-                    for r in conn.execute(
-                        "SELECT name FROM sqlite_master WHERE type='table'"
-                    ).fetchall()
-                }
-                if "window_event" in tables:
-                    from screencap.privacy.context import WindowContext, domain_from_url
+                        has_browser_url = has_column(conn, "window_event", "browser_url")
 
-                    we_cols = {
-                        r[1]
-                        for r in conn.execute(
-                            "PRAGMA table_info(window_event)"
-                        ).fetchall()
-                    }
-                    has_browser_url = "browser_url" in we_cols
+                        # Include the last event before range start for initial context
+                        if has_browser_url:
+                            rows = conn.execute(
+                                "SELECT timestamp, app_bundle_id, title, window_id, browser_url "
+                                "FROM window_event "
+                                "WHERE timestamp IS NOT NULL AND timestamp < ? "
+                                "ORDER BY timestamp DESC LIMIT 1",
+                                (time_range[0],),
+                            ).fetchall()
+                            rows += conn.execute(
+                                "SELECT timestamp, app_bundle_id, title, window_id, browser_url "
+                                "FROM window_event "
+                                "WHERE timestamp IS NOT NULL "
+                                "AND timestamp >= ? AND timestamp < ? "
+                                "ORDER BY timestamp",
+                                (time_range[0], time_range[1]),
+                            ).fetchall()
+                        else:
+                            rows = conn.execute(
+                                "SELECT timestamp, app_bundle_id, title, window_id "
+                                "FROM window_event "
+                                "WHERE timestamp IS NOT NULL AND timestamp < ? "
+                                "ORDER BY timestamp DESC LIMIT 1",
+                                (time_range[0],),
+                            ).fetchall()
+                            rows += conn.execute(
+                                "SELECT timestamp, app_bundle_id, title, window_id "
+                                "FROM window_event "
+                                "WHERE timestamp IS NOT NULL "
+                                "AND timestamp >= ? AND timestamp < ? "
+                                "ORDER BY timestamp",
+                                (time_range[0], time_range[1]),
+                            ).fetchall()
 
-                    # Include the last event before range start for initial context
-                    if has_browser_url:
-                        rows = conn.execute(
-                            "SELECT timestamp, app_bundle_id, title, window_id, browser_url "
-                            "FROM window_event "
-                            "WHERE timestamp IS NOT NULL AND timestamp < ? "
-                            "ORDER BY timestamp DESC LIMIT 1",
-                            (time_range[0],),
-                        ).fetchall()
-                        rows += conn.execute(
-                            "SELECT timestamp, app_bundle_id, title, window_id, browser_url "
-                            "FROM window_event "
-                            "WHERE timestamp IS NOT NULL "
-                            "AND timestamp >= ? AND timestamp < ? "
-                            "ORDER BY timestamp",
-                            (time_range[0], time_range[1]),
-                        ).fetchall()
-                    else:
-                        rows = conn.execute(
-                            "SELECT timestamp, app_bundle_id, title, window_id "
-                            "FROM window_event "
-                            "WHERE timestamp IS NOT NULL AND timestamp < ? "
-                            "ORDER BY timestamp DESC LIMIT 1",
-                            (time_range[0],),
-                        ).fetchall()
-                        rows += conn.execute(
-                            "SELECT timestamp, app_bundle_id, title, window_id "
-                            "FROM window_event "
-                            "WHERE timestamp IS NOT NULL "
-                            "AND timestamp >= ? AND timestamp < ? "
-                            "ORDER BY timestamp",
-                            (time_range[0], time_range[1]),
-                        ).fetchall()
+                        for row in rows:
+                            domain = None
+                            raw_url = row[4] if has_browser_url else None
+                            if raw_url:
+                                domain = domain_from_url(raw_url)
+                            ctx.window_events.append(WindowContext(
+                                timestamp=float(row[0]),
+                                app_bundle_id=row[1] or "",
+                                title=row[2] or "",
+                                window_id=row[3] or "",
+                                domain=domain,
+                                browser_url=raw_url or None,
+                            ))
+                except Exception:
+                    logger.debug("Failed to load scoped window events", exc_info=True)
+            else:
+                # Full load for scrubber path
+                try:
+                    ctx.window_events = load_window_events(db_path)
+                except Exception:
+                    logger.debug("Failed to load window events", exc_info=True)
 
-                    for row in rows:
-                        domain = None
-                        raw_url = row[4] if has_browser_url else None
-                        if raw_url:
-                            domain = domain_from_url(raw_url)
-                        ctx.window_events.append(WindowContext(
-                            timestamp=float(row[0]),
-                            app_bundle_id=row[1] or "",
-                            title=row[2] or "",
-                            window_id=row[3] or "",
-                            domain=domain,
-                            browser_url=raw_url or None,
-                        ))
-                conn.row_factory = None
-            except Exception:
-                logger.debug("Failed to load scoped window events", exc_info=True)
-        else:
-            # Full load for scrubber path
-            try:
-                ctx.window_events = load_window_events(db_path)
-            except Exception:
-                logger.debug("Failed to load window events", exc_info=True)
+            # Build blocked-app intervals using scrub-time action set.
+            # SCRUB_BLOCK_ACTIONS expands beyond capture-time BLOCK_ACTIONS
+            # to also cover MASK_WINDOW/TEXT_REDACT/OCR_FALLBACK so that
+            # mouse pointer geometry inside redacted/masked content is
+            # suppressed in cloud-bound JSONL (R6/R12).
+            if evaluator is not None and classifier is not None and ctx.window_events:
+                ctx.blocked_intervals = build_blocked_intervals(
+                    ctx.window_events, evaluator, classifier,
+                    actions=SCRUB_BLOCK_ACTIONS,
+                )
 
-        # Build blocked-app intervals
-        if evaluator is not None and classifier is not None and ctx.window_events:
-            ctx.blocked_intervals = build_blocked_intervals(
-                ctx.window_events, evaluator, classifier,
+            # Build secure-field intervals
+            secure_intervals = build_secure_field_intervals(
+                db_path, time_range=time_range, conn=conn,
             )
+            if secure_intervals:
+                ctx.blocked_intervals = merge_intervals(
+                    ctx.blocked_intervals, secure_intervals,
+                )
 
-        # Build secure-field intervals
-        secure_intervals = build_secure_field_intervals(
-            db_path, time_range=time_range, conn=conn,
+            # Collect xref detections (chunk path only — scrubber collects during DB scrub)
+            if pipeline is not None and anonymizer is not None:
+                ctx.xref_detections = collect_xref_from_db(
+                    db_path, pipeline, anonymizer,
+                    time_range=time_range, conn=conn,
+                )
+    except Exception as e:
+        # Loud signal: silent failure here disables ALL pointer-geometry
+        # suppression for the recording (empty blocked_intervals → no
+        # mouse.move drops, no drag-coord nulling). Operators must see
+        # this in logs to investigate the underlying cause (busy SQLite,
+        # missing window_event table on older recordings, OOM, etc.).
+        logger.warning(
+            "build_scrub_context failed; pointer suppression DISABLED "
+            "for this recording: %s",
+            e,
+            exc_info=True,
         )
-        if secure_intervals:
-            ctx.blocked_intervals = merge_intervals(
-                ctx.blocked_intervals, secure_intervals,
-            )
-
-        # Collect xref detections (chunk path only — scrubber collects during DB scrub)
-        if pipeline is not None and anonymizer is not None:
-            ctx.xref_detections = collect_xref_from_db(
-                db_path, pipeline, anonymizer,
-                time_range=time_range, conn=conn,
-            )
-
-    except Exception:
-        logger.debug("build_scrub_context failed, using empty context", exc_info=True)
-    finally:
-        if conn is not None:
-            try:
-                conn.close()
-            except Exception:
-                pass
 
     return ctx
 
@@ -965,11 +1096,137 @@ def scrub_events_jsonl(
                 outfile.write(json.dumps(event, ensure_ascii=False) + "\n")
                 continue
 
-            # Check blocked-app intervals
+            # R6/R12: Drop standalone mouse.move events whose merged span
+            # crosses a blocked interval (SCRUB_BLOCK_ACTIONS). Pointer
+            # geometry leaks coarse interaction patterns inside redacted/
+            # masked content — coordinates on retained events are unaffected.
+            #
+            # ``last_timestamp`` is set by ``merge_consecutive_mouse_move_events``
+            # when a run of moves is collapsed; the range check covers the
+            # case where the merge START lands BEFORE a blocked interval but
+            # the merge END (last waypoint) lands INSIDE it. Pre-fix, the
+            # point-lookup at ``timestamp`` slipped these merged events past
+            # the drop check and leaked in-interval coordinates via ``path``
+            # waypoints / ``x``/``y`` (last position).
             event_ts = event.get("timestamp", 0.0)
+            if event.get("type") == "mouse.move":
+                end_ts = event.get("last_timestamp")
+                if end_ts is None:
+                    end_ts = event_ts
+                if _interval_intersects(
+                    event_ts, end_ts, _blocked, blocked_starts,
+                ) is not None:
+                    continue
+
+            # R6/R12: Drag-aware blocked-interval handling. A drag's
+            # parent timestamp is its START — but the drag PATH (children
+            # mouse.move waypoints + mouse.up endpoint) can extend INTO
+            # a blocked interval even when the start is outside. Pre-fix,
+            # the parent ``find_blocked_interval(event_ts)`` check below
+            # only fired on drags whose START was inside, leaking the END
+            # coordinate ``(x+dx, y+dy)`` plus any non-mouse.move children
+            # whose timestamps landed inside the blocked interval.
+            #
+            # The fix: compute the drag's effective span from its
+            # children, range-overlap-test it against the blocked
+            # intervals, and if any overlap exists drop EVERY in-interval
+            # child (regardless of type — mouse.up/mouse.down/key.type
+            # all leak coordinates or content) plus null the parent
+            # drag's coordinate fields. Children entirely outside any
+            # blocked interval are kept.
+            if event.get("type") == "mouse.drag" and _blocked:
+                children = event.get("children") or []
+                drag_start = event_ts
+                drag_end = drag_start
+                for c in children:
+                    c_ts = c.get("timestamp", drag_start)
+                    c_end = c.get("last_timestamp", c_ts)
+                    if c_end > drag_end:
+                        drag_end = c_end
+                    if c_ts > drag_end:
+                        drag_end = c_ts
+
+                drag_overlap = _interval_intersects(
+                    drag_start, drag_end, _blocked, blocked_starts,
+                )
+                if drag_overlap is not None:
+                    # Drop children whose own timestamp lands inside any
+                    # blocked interval. Pointer geometry inside a blocked
+                    # interval leaks regardless of event type — a
+                    # mouse.up at the end of a drag carries the END
+                    # coordinate just as much as the parent's (x+dx, y+dy).
+                    kept: list[dict] = []
+                    for c in children:
+                        c_ts = c.get("timestamp", drag_start)
+                        if find_blocked_interval(
+                            c_ts, _blocked, blocked_starts,
+                        ) is not None:
+                            continue
+                        # Also drop merged-move children whose own span
+                        # extends INTO a blocked interval (covers the
+                        # pre-existing case where a merged move starts
+                        # outside but ends inside).
+                        if c.get("type") == "mouse.move":
+                            c_end = c.get("last_timestamp", c_ts)
+                            if _interval_intersects(
+                                c_ts, c_end, _blocked, blocked_starts,
+                            ) is not None:
+                                continue
+                        kept.append(c)
+                    event["children"] = kept
+
+                    # Always null the parent drag's pointer geometry on
+                    # overlap — the drag envelope (start/end coords,
+                    # displacement) leaks the in-interval portion of the
+                    # gesture regardless of action type. ``null_pointer_geometry``
+                    # recurses into surviving children, so retained mouse
+                    # children also have their coords zeroed.
+                    null_pointer_geometry(event)
+
+                    if drag_overlap.action in SCRUB_CONTENT_NULL_ACTIONS:
+                        # EXCLUDE / MASK_WINDOW: also null text content
+                        # (key.type children, window titles). Recurses
+                        # into surviving children.
+                        null_text_content(event)
+                    else:
+                        # TEXT_REDACT / OCR_FALLBACK / MASK_REGION: pointer
+                        # is already suppressed; run PII detection on
+                        # surviving key.type children before writing the
+                        # drag, since the drag is written + ``continue``d
+                        # here and would otherwise bypass the PII detection
+                        # loop further below.
+                        _process_key_type_events(
+                            event, pipeline, anonymizer, _result, db_redactions,
+                        )
+                        if _xref:
+                            for child in event.get("children", []):
+                                if child.get("type") == "key.type":
+                                    _cross_reference_key_type(
+                                        child, _xref, _result, db_redactions,
+                                    )
+
+                    _result.audit_entries.append(
+                        AuditEntry(
+                            timestamp=event_ts,
+                            surface="event",
+                            action=drag_overlap.action.value,
+                            reason=drag_overlap.reason,
+                        )
+                    )
+                    outfile.write(json.dumps(event, ensure_ascii=False) + "\n")
+                    continue
+
+            # Check blocked-app intervals (non-drag events: regular
+            # clicks, key events, etc. — for these the parent timestamp
+            # IS the event time, so a point-lookup is correct). Drags
+            # are handled above with the range-overlap branch.
             blocked = find_blocked_interval(event_ts, _blocked, blocked_starts)
             if blocked is not None:
-                null_event_content(event)
+                # Pointer geometry is suppressed for ANY SCRUB_BLOCK_ACTIONS
+                # interval (pointer position leaks coarse patterns
+                # regardless of action).
+                null_pointer_geometry(event)
+
                 _result.audit_entries.append(
                     AuditEntry(
                         timestamp=event_ts,
@@ -978,8 +1235,19 @@ def scrub_events_jsonl(
                         reason=blocked.reason,
                     )
                 )
-                outfile.write(json.dumps(event, ensure_ascii=False) + "\n")
-                continue
+
+                if blocked.action in SCRUB_CONTENT_NULL_ACTIONS:
+                    # EXCLUDE / MASK_WINDOW: also null keystroke text +
+                    # window titles. Don't fall through to PII detection
+                    # — content is wholesale-suppressed in these contexts.
+                    null_text_content(event)
+                    outfile.write(json.dumps(event, ensure_ascii=False) + "\n")
+                    continue
+
+                # TEXT_REDACT / OCR_FALLBACK / MASK_REGION: pointer
+                # suppressed above; let text fall through to PII
+                # detection below so detected entities are scrubbed
+                # without wholesale-nulling clean content.
 
             # Targeted key.type detection for combined-text secrets
             _process_key_type_events(
@@ -1026,44 +1294,36 @@ def _redact_keystroke_db_rows(dst: Path, redactions: list[dict]) -> None:
     if db_path is None:
         return
 
-    conn = sqlite3.connect(str(db_path))
-    try:
-        tables = {
-            r[0]
-            for r in conn.execute(
-                "SELECT name FROM sqlite_master WHERE type='table'"
-            ).fetchall()
-        }
-        if "action_event" not in tables:
-            return
+    with open_recording_db(db_path, read_only=False) as conn:
+        try:
+            if not has_table(conn, "action_event"):
+                return
 
-        ids_to_redact: list[int] = []
-        for r in redactions:
-            name = "press" if r["type"] == "key.down" else "release"
-            row = conn.execute(
-                "SELECT id FROM action_event "
-                "WHERE name = ? AND timestamp = ? AND key_char = ? LIMIT 1",
-                (name, r["timestamp"], r["key_char"]),
-            ).fetchone()
-            if row:
-                ids_to_redact.append(row[0])
+            ids_to_redact: list[int] = []
+            for r in redactions:
+                name = "press" if r["type"] == "key.down" else "release"
+                row = conn.execute(
+                    "SELECT id FROM action_event "
+                    "WHERE name = ? AND timestamp = ? AND key_char = ? LIMIT 1",
+                    (name, r["timestamp"], r["key_char"]),
+                ).fetchone()
+                if row:
+                    ids_to_redact.append(row[0])
 
-        if ids_to_redact:
-            for i in range(0, len(ids_to_redact), 500):
-                chunk = ids_to_redact[i : i + 500]
-                placeholders = ",".join("?" * len(chunk))
-                conn.execute(
-                    f"UPDATE action_event "
-                    f"SET key_char = NULL, canonical_key_char = NULL "
-                    f"WHERE id IN ({placeholders})",
-                    chunk,
-                )
-            conn.commit()
-    except Exception:
-        conn.rollback()
-        raise
-    finally:
-        conn.close()
+            if ids_to_redact:
+                for i in range(0, len(ids_to_redact), 500):
+                    chunk = ids_to_redact[i : i + 500]
+                    placeholders = ",".join("?" * len(chunk))
+                    conn.execute(
+                        f"UPDATE action_event "
+                        f"SET key_char = NULL, canonical_key_char = NULL "
+                        f"WHERE id IN ({placeholders})",
+                        chunk,
+                    )
+                conn.commit()
+        except Exception:
+            conn.rollback()
+            raise
 
 
 # ---------------------------------------------------------------------------
@@ -1330,8 +1590,8 @@ def mask_screenshots(
     classifier = ctx.classifier
 
     from screencap.privacy.context import (
+        _load_geometry_row,
         associate_screenshot,
-        load_window_geometry,
         parse_screenshot_timestamp,
     )
     from screencap.privacy.masking import (
@@ -1359,110 +1619,104 @@ def mask_screenshots(
 
     window_timestamps = [w.timestamp for w in ctx.window_events] if ctx.window_events else []
 
-    _geom_conn = None
-    if db_path is not None:
-        try:
-            _geom_conn = sqlite3.connect(str(db_path))
-        except sqlite3.OperationalError:
-            pass
-
-    # dHash cache for OCR dedup — single-entry, local to this invocation.
-    # Tighter threshold (5) than capture-time dedup (8) because a false
-    # cache hit means reusing OCR results from a slightly different image.
-    _DHASH_THRESHOLD = 5
-    _prev_hash: int | None = None
-    _prev_bounds: tuple[int, int, int, int] | None = None
-    _prev_ocr_regions: list | None = None
-
-    for img_path in sorted(screenshots_dir.glob("*.jpg")):
-        ts = parse_screenshot_timestamp(img_path.name)
-        if ts is None:
-            continue
-
-        meta = associate_screenshot(
-            ts, ctx.window_events,
-            _window_timestamps=window_timestamps,
-        )
-        ctx_class = classifier.classify(meta)
-        decision = evaluator.evaluate(ctx_class, meta)
-
-        actual_action = decision.action
-
-        if decision.action == PrivacyAction.EXCLUDE:
-            img_path.unlink()
-        elif decision.action == PrivacyAction.MASK_WINDOW:
-            selective_applied = False
-            if _geom_conn is not None:
-                try:
-                    geom = load_window_geometry(db_path, ts, conn=_geom_conn)
-                    if geom is not None:
-                        from PIL import Image
-
-                        with Image.open(img_path) as probe:
-                            img_w, img_h = probe.size
-                        regions = window_regions_from_geometry(
-                            geom.windows, img_w, img_h, ctx.pixel_ratio,
-                            classifier, evaluator,
-                            display_origin=geom.display_origin,
-                            respect_z_order=True,
-                        )
-                        if regions:
-                            mask_screenshot(
-                                img_path,
-                                ctx_class.context_class,
-                                regions=regions,
-                            )
-                            selective_applied = True
-                        else:
-                            selective_applied = True
-                except Exception as exc:
-                    logger.debug(
-                        f"Selective masking failed for {img_path.name} ({exc})"
-                    )
-
-            if not selective_applied:
-                try:
-                    mask_screenshot(
-                        img_path,
-                        ctx_class.context_class,
-                        strategy=MaskStrategy.FULL_WINDOW,
-                        app_hint=meta.bundle_id,
-                    )
-                except Exception:
-                    img_path.unlink()
-                    actual_action = PrivacyAction.EXCLUDE
-        elif decision.action == PrivacyAction.MASK_REGION:
+    with ExitStack() as stack:
+        # Hoist the window_geometry has_table check above the per-screenshot
+        # loop so the loop body uses _load_geometry_row directly (skips the
+        # per-call introspection that load_window_geometry would otherwise
+        # repeat). ExitStack guarantees the geometry connection closes on any
+        # exception inside the loop.
+        _geom_conn: Connection | None = None
+        has_geometry = False
+        if db_path is not None:
             try:
-                mask_screenshot(
-                    img_path,
-                    ctx_class.context_class,
-                    strategy=MaskStrategy.PANE,
-                    app_hint=meta.bundle_id,
-                )
+                _geom_conn = stack.enter_context(open_recording_db(db_path))
+                has_geometry = has_table(_geom_conn, "window_geometry")
             except Exception:
+                _geom_conn = None
+                has_geometry = False
+
+        def _maybe_geom(ts: float):
+            if _geom_conn is None or not has_geometry:
+                return None
+            try:
+                return _load_geometry_row(_geom_conn, ts)
+            except Exception:
+                return None
+
+        # dHash cache for OCR dedup — single-entry, local to this invocation.
+        # Tighter threshold (5) than capture-time dedup (8) because a false
+        # cache hit means reusing OCR results from a slightly different image.
+        _DHASH_THRESHOLD = 5
+        _prev_hash: int | None = None
+        _prev_bounds: tuple[int, int, int, int] | None = None
+        _prev_ocr_regions: list | None = None
+
+        for img_path in sorted(screenshots_dir.glob("*.jpg")):
+            ts = parse_screenshot_timestamp(img_path.name)
+            if ts is None:
+                continue
+
+            meta = associate_screenshot(
+                ts, ctx.window_events,
+                _window_timestamps=window_timestamps,
+            )
+            ctx_class = classifier.classify(meta)
+            decision = evaluator.evaluate(ctx_class, meta)
+
+            actual_action = decision.action
+
+            if decision.action == PrivacyAction.EXCLUDE:
+                img_path.unlink()
+            elif decision.action == PrivacyAction.MASK_WINDOW:
+                selective_applied = False
+                if has_geometry:
+                    try:
+                        geom = _maybe_geom(ts)
+                        if geom is not None:
+                            from PIL import Image
+
+                            with Image.open(img_path) as probe:
+                                img_w, img_h = probe.size
+                            regions = window_regions_from_geometry(
+                                geom.windows, img_w, img_h, ctx.pixel_ratio,
+                                classifier, evaluator,
+                                display_origin=geom.display_origin,
+                                respect_z_order=True,
+                            )
+                            if regions:
+                                mask_screenshot(
+                                    img_path,
+                                    ctx_class.context_class,
+                                    regions=regions,
+                                )
+                                selective_applied = True
+                            else:
+                                selective_applied = True
+                    except Exception as exc:
+                        logger.debug(
+                            f"Selective masking failed for {img_path.name} ({exc})"
+                        )
+
+                if not selective_applied:
+                    try:
+                        mask_screenshot(
+                            img_path,
+                            ctx_class.context_class,
+                            strategy=MaskStrategy.FULL_WINDOW,
+                            app_hint=meta.bundle_id,
+                        )
+                    except Exception:
+                        img_path.unlink()
+                        actual_action = PrivacyAction.EXCLUDE
+            elif decision.action == PrivacyAction.MASK_REGION:
                 try:
                     mask_screenshot(
                         img_path,
                         ctx_class.context_class,
-                        strategy=MaskStrategy.FULL_WINDOW,
+                        strategy=MaskStrategy.PANE,
                         app_hint=meta.bundle_id,
                     )
-                    actual_action = PrivacyAction.MASK_WINDOW
                 except Exception:
-                    img_path.unlink()
-                    actual_action = PrivacyAction.EXCLUDE
-        elif decision.action == PrivacyAction.OCR_FALLBACK:
-            if _ocr is not None and _pipeline is not None:
-                try:
-                    regions = ocr_mask_screenshot(img_path, _pipeline, _ocr)
-                    if regions:
-                        mask_screenshot(img_path, ctx_class.context_class, regions=regions)
-                        actual_action = PrivacyAction.OCR_FALLBACK
-                    else:
-                        # No PII detected — leave screenshot as-is
-                        actual_action = PrivacyAction.ALLOW
-                except Exception:
-                    # Fail closed: OCR error → MASK_WINDOW
                     try:
                         mask_screenshot(
                             img_path,
@@ -1474,161 +1728,31 @@ def mask_screenshots(
                     except Exception:
                         img_path.unlink()
                         actual_action = PrivacyAction.EXCLUDE
-            else:
-                # Vision not available — fall back to MASK_WINDOW
-                try:
-                    mask_screenshot(
-                        img_path,
-                        ctx_class.context_class,
-                        strategy=MaskStrategy.FULL_WINDOW,
-                        app_hint=meta.bundle_id,
-                    )
-                    actual_action = PrivacyAction.MASK_WINDOW
-                except Exception:
-                    img_path.unlink()
-                    actual_action = PrivacyAction.EXCLUDE
-
-        # Load geometry once — used by both OCR and background masking.
-        geom = None
-        if _geom_conn is not None and img_path.exists():
-            try:
-                geom = load_window_geometry(db_path, ts, conn=_geom_conn)
-            except Exception:
-                pass
-
-        # --- Phase 2: OCR pass on foreground content ---
-        # Run BEFORE background masking so OCR sees the original
-        # foreground content (bg masking can destroy text).
-        ocr_regions: list = []
-        ocr_ran = False
-        cache_hit = False
-        if (
-            _ocr is not None
-            and _pipeline is not None
-            and img_path.exists()
-            and decision.action in (PrivacyAction.ALLOW, PrivacyAction.TEXT_REDACT)
-            and actual_action not in (PrivacyAction.EXCLUDE, PrivacyAction.MASK_WINDOW)
-        ):
-            from PIL import Image
-
-            from screencap.engine.dedup import dhash, hamming_distance
-
-            # Open image for dimensions + dHash; skip OCR if unreadable
-            current_hash = None
-            img_w_ocr = img_h_ocr = 0
-            try:
-                with Image.open(img_path) as img:
-                    img_w_ocr, img_h_ocr = img.size
+            elif decision.action == PrivacyAction.OCR_FALLBACK:
+                if _ocr is not None and _pipeline is not None:
                     try:
-                        current_hash = dhash(img)
+                        regions = ocr_mask_screenshot(img_path, _pipeline, _ocr)
+                        if regions:
+                            mask_screenshot(img_path, ctx_class.context_class, regions=regions)
+                            actual_action = PrivacyAction.OCR_FALLBACK
+                        else:
+                            # No PII detected — leave screenshot as-is
+                            actual_action = PrivacyAction.ALLOW
                     except Exception:
-                        pass  # dHash failed — skip cache, still run OCR
-            except Exception:
-                pass  # image unreadable — skip entire OCR pass
-
-            if img_w_ocr > 0 and img_h_ocr > 0:
-                active_bounds = _active_window_bounds(
-                    geom, meta.bundle_id, ctx.pixel_ratio,
-                    img_w_ocr, img_h_ocr,
-                )
-
-                cache_hit = (
-                    current_hash is not None
-                    and _prev_hash is not None
-                    and hamming_distance(current_hash, _prev_hash) <= _DHASH_THRESHOLD
-                    and active_bounds == _prev_bounds
-                )
-
-                if cache_hit and _prev_ocr_regions is not None:
-                    ocr_regions = _prev_ocr_regions
+                        # Fail closed: OCR error → MASK_WINDOW
+                        try:
+                            mask_screenshot(
+                                img_path,
+                                ctx_class.context_class,
+                                strategy=MaskStrategy.FULL_WINDOW,
+                                app_hint=meta.bundle_id,
+                            )
+                            actual_action = PrivacyAction.MASK_WINDOW
+                        except Exception:
+                            img_path.unlink()
+                            actual_action = PrivacyAction.EXCLUDE
                 else:
-                    cache_hit = False
-                    roi = (
-                        _active_window_roi(active_bounds, img_w_ocr, img_h_ocr)
-                        if active_bounds
-                        else None
-                    )
-                    try:
-                        ocr_regions = ocr_mask_screenshot(
-                            img_path, _pipeline, _ocr, roi=roi,
-                        )
-                        ocr_ran = True
-                    except Exception:
-                        # Fail-closed: OCR error → MASK_WINDOW
-                        try:
-                            mask_screenshot(
-                                img_path,
-                                ctx_class.context_class,
-                                strategy=MaskStrategy.FULL_WINDOW,
-                                app_hint=meta.bundle_id,
-                            )
-                            actual_action = PrivacyAction.MASK_WINDOW
-                        except Exception:
-                            img_path.unlink()
-                            actual_action = PrivacyAction.EXCLUDE
-
-                # Apply OCR mask regions
-                if ocr_regions and actual_action not in (
-                    PrivacyAction.MASK_WINDOW, PrivacyAction.EXCLUDE,
-                ):
-                    try:
-                        mask_screenshot(
-                            img_path, ctx_class.context_class,
-                            regions=ocr_regions,
-                        )
-                    except Exception:
-                        try:
-                            mask_screenshot(
-                                img_path,
-                                ctx_class.context_class,
-                                strategy=MaskStrategy.FULL_WINDOW,
-                                app_hint=meta.bundle_id,
-                            )
-                            actual_action = PrivacyAction.MASK_WINDOW
-                        except Exception:
-                            img_path.unlink()
-                            actual_action = PrivacyAction.EXCLUDE
-
-                # Update dHash cache
-                if current_hash is not None:
-                    _prev_hash = current_hash
-                    _prev_bounds = active_bounds
-                    _prev_ocr_regions = ocr_regions
-
-        # Background masking for screenshots that keep foreground content.
-        # Skip when OCR already handled foreground PII — bg masking with
-        # incomplete geometry can over-mask the foreground content.
-        bg_masked = False
-        _skip_bg = ocr_ran or cache_hit
-        if not _skip_bg and actual_action in (
-            PrivacyAction.ALLOW,
-            PrivacyAction.TEXT_REDACT,
-            PrivacyAction.OCR_FALLBACK,
-        ):
-            if _geom_conn is not None and img_path.exists() and geom is not None:
-                try:
-                    from PIL import Image
-
-                    with Image.open(img_path) as probe:
-                        img_w, img_h = probe.size
-                    regions = window_regions_from_geometry(
-                        geom.windows, img_w, img_h, ctx.pixel_ratio,
-                        classifier, evaluator,
-                        display_origin=geom.display_origin,
-                        mask_actions=_BG_MASK_ACTIONS,
-                        respect_z_order=True,
-                    )
-                    if regions:
-                        mask_screenshot(
-                            img_path,
-                            ctx_class.context_class,
-                            regions=regions,
-                        )
-                        bg_masked = True
-                except Exception as exc:
-                    logger.debug(
-                        f"Background masking failed for {img_path.name} ({exc})"
-                    )
+                    # Vision not available — fall back to MASK_WINDOW
                     try:
                         mask_screenshot(
                             img_path,
@@ -1636,43 +1760,190 @@ def mask_screenshots(
                             strategy=MaskStrategy.FULL_WINDOW,
                             app_hint=meta.bundle_id,
                         )
-                        bg_masked = True
+                        actual_action = PrivacyAction.MASK_WINDOW
                     except Exception:
                         img_path.unlink()
                         actual_action = PrivacyAction.EXCLUDE
 
-        # Build audit trail with OCR detail
-        ocr_detail = ""
-        if _ocr is not None and decision.action in (
-            PrivacyAction.ALLOW, PrivacyAction.TEXT_REDACT,
-        ):
-            if actual_action in (PrivacyAction.MASK_WINDOW, PrivacyAction.EXCLUDE):
-                ocr_detail = "+ocr_failed"
-            elif cache_hit:
-                ocr_detail = f"+ocr_cache_hit({len(ocr_regions)})"
-            elif ocr_ran and ocr_regions:
-                ocr_detail = f"+ocr_masked({len(ocr_regions)})"
-            elif ocr_ran:
-                ocr_detail = "+ocr_clean"
+            # Load geometry once — used by both OCR and background masking.
+            geom = None
+            if has_geometry and img_path.exists():
+                geom = _maybe_geom(ts)
 
-        _result.audit_entries.append(
-            AuditEntry(
-                timestamp=ts,
-                surface="screenshot",
-                action=actual_action.value,
-                reason=f"{decision.reason}+background_windows_masked{ocr_detail}"
-                    if bg_masked else f"{decision.reason}{ocr_detail}",
-                context_class=ctx_class.context_class.value,
-                evidence_type=(
-                    f"{ctx_class.confidence}"
-                    + ("+geometry" if bg_masked else "")
-                    + ("+ocr" if (ocr_ran or cache_hit) else "")
-                ),
-            )
+            # --- Phase 2: OCR pass on foreground content ---
+            # Run BEFORE background masking so OCR sees the original
+            # foreground content (bg masking can destroy text).
+            ocr_regions: list = []
+            ocr_ran = False
+            cache_hit = False
+            if (
+                _ocr is not None
+                and _pipeline is not None
+                and img_path.exists()
+                and decision.action in (PrivacyAction.ALLOW, PrivacyAction.TEXT_REDACT)
+                and actual_action not in (PrivacyAction.EXCLUDE, PrivacyAction.MASK_WINDOW)
+            ):
+                from PIL import Image
+
+                from screencap.engine.dedup import dhash, hamming_distance
+
+                # Open image for dimensions + dHash; skip OCR if unreadable
+                current_hash = None
+                img_w_ocr = img_h_ocr = 0
+                try:
+                    with Image.open(img_path) as img:
+                        img_w_ocr, img_h_ocr = img.size
+                        try:
+                            current_hash = dhash(img)
+                        except Exception:
+                            pass  # dHash failed — skip cache, still run OCR
+                except Exception:
+                    pass  # image unreadable — skip entire OCR pass
+
+                if img_w_ocr > 0 and img_h_ocr > 0:
+                    active_bounds = _active_window_bounds(
+                        geom, meta.bundle_id, ctx.pixel_ratio,
+                        img_w_ocr, img_h_ocr,
+                    )
+
+                    cache_hit = (
+                        current_hash is not None
+                        and _prev_hash is not None
+                        and hamming_distance(current_hash, _prev_hash) <= _DHASH_THRESHOLD
+                        and active_bounds == _prev_bounds
+                    )
+
+                    if cache_hit and _prev_ocr_regions is not None:
+                        ocr_regions = _prev_ocr_regions
+                    else:
+                        cache_hit = False
+                        roi = (
+                            _active_window_roi(active_bounds, img_w_ocr, img_h_ocr)
+                            if active_bounds
+                            else None
+                        )
+                        try:
+                            ocr_regions = ocr_mask_screenshot(
+                                img_path, _pipeline, _ocr, roi=roi,
+                            )
+                            ocr_ran = True
+                        except Exception:
+                            # Fail-closed: OCR error → MASK_WINDOW
+                            try:
+                                mask_screenshot(
+                                    img_path,
+                                    ctx_class.context_class,
+                                    strategy=MaskStrategy.FULL_WINDOW,
+                                    app_hint=meta.bundle_id,
+                                )
+                                actual_action = PrivacyAction.MASK_WINDOW
+                            except Exception:
+                                img_path.unlink()
+                                actual_action = PrivacyAction.EXCLUDE
+
+                    # Apply OCR mask regions
+                    if ocr_regions and actual_action not in (
+                        PrivacyAction.MASK_WINDOW, PrivacyAction.EXCLUDE,
+                    ):
+                        try:
+                            mask_screenshot(
+                                img_path, ctx_class.context_class,
+                                regions=ocr_regions,
+                            )
+                        except Exception:
+                            try:
+                                mask_screenshot(
+                                    img_path,
+                                    ctx_class.context_class,
+                                    strategy=MaskStrategy.FULL_WINDOW,
+                                    app_hint=meta.bundle_id,
+                                )
+                                actual_action = PrivacyAction.MASK_WINDOW
+                            except Exception:
+                                img_path.unlink()
+                                actual_action = PrivacyAction.EXCLUDE
+
+                    # Update dHash cache
+                    if current_hash is not None:
+                        _prev_hash = current_hash
+                        _prev_bounds = active_bounds
+                        _prev_ocr_regions = ocr_regions
+
+            # Background masking for screenshots that keep foreground content.
+            # Skip when OCR already handled foreground PII — bg masking with
+            # incomplete geometry can over-mask the foreground content.
+            bg_masked = False
+            _skip_bg = ocr_ran or cache_hit
+            if not _skip_bg and actual_action in (
+                PrivacyAction.ALLOW,
+                PrivacyAction.TEXT_REDACT,
+                PrivacyAction.OCR_FALLBACK,
+            ):
+                if has_geometry and img_path.exists() and geom is not None:
+                    try:
+                        from PIL import Image
+
+                        with Image.open(img_path) as probe:
+                            img_w, img_h = probe.size
+                        regions = window_regions_from_geometry(
+                            geom.windows, img_w, img_h, ctx.pixel_ratio,
+                            classifier, evaluator,
+                            display_origin=geom.display_origin,
+                            mask_actions=_BG_MASK_ACTIONS,
+                            respect_z_order=True,
+                        )
+                        if regions:
+                            mask_screenshot(
+                                img_path,
+                                ctx_class.context_class,
+                                regions=regions,
+                            )
+                            bg_masked = True
+                    except Exception as exc:
+                        logger.debug(
+                            f"Background masking failed for {img_path.name} ({exc})"
+                        )
+                        try:
+                            mask_screenshot(
+                                img_path,
+                                ctx_class.context_class,
+                                strategy=MaskStrategy.FULL_WINDOW,
+                                app_hint=meta.bundle_id,
+                            )
+                            bg_masked = True
+                        except Exception:
+                            img_path.unlink()
+                            actual_action = PrivacyAction.EXCLUDE
+
+            # Build audit trail with OCR detail
+            ocr_detail = ""
+            if _ocr is not None and decision.action in (
+                PrivacyAction.ALLOW, PrivacyAction.TEXT_REDACT,
+            ):
+                if actual_action in (PrivacyAction.MASK_WINDOW, PrivacyAction.EXCLUDE):
+                    ocr_detail = "+ocr_failed"
+                elif cache_hit:
+                    ocr_detail = f"+ocr_cache_hit({len(ocr_regions)})"
+                elif ocr_ran and ocr_regions:
+                    ocr_detail = f"+ocr_masked({len(ocr_regions)})"
+                elif ocr_ran:
+                    ocr_detail = "+ocr_clean"
+
+            _result.audit_entries.append(
+                AuditEntry(
+                    timestamp=ts,
+                    surface="screenshot",
+                    action=actual_action.value,
+                    reason=f"{decision.reason}+background_windows_masked{ocr_detail}"
+                        if bg_masked else f"{decision.reason}{ocr_detail}",
+                    context_class=ctx_class.context_class.value,
+                    evidence_type=(
+                        f"{ctx_class.confidence}"
+                        + ("+geometry" if bg_masked else "")
+                        + ("+ocr" if (ocr_ran or cache_hit) else "")
+                    ),
+                )
         )
-
-    if _geom_conn is not None:
-        _geom_conn.close()
 
 
 # ---------------------------------------------------------------------------

@@ -505,12 +505,20 @@ def merge_consecutive_mouse_move_events(events: list[ActionEvent]) -> list[Actio
                 ev = ev.model_copy(update={"path": [(ev.x, ev.y)]})
             result.append(ev)
         else:
-            # Create merged move event with final position and last pressure
+            # Create merged move event with final position and last pressure.
+            # ``last_timestamp`` carries the end of the merged span so the
+            # scrub layer can detect blocked-interval intersection across the
+            # full [first, last] window (a run of moves around a window
+            # switch into a MASK_WINDOW app would otherwise leak coordinates
+            # via ``timestamp`` alone — pre-fix, the start timestamp lands
+            # before the blocked interval and slips past the point-lookup
+            # ``find_blocked_interval`` check).
             first = move_buffer[0]
             last = move_buffer[-1]
             path = [(m.x, m.y) for m in move_buffer]
             merged = MouseMoveEvent(
                 timestamp=first.timestamp,
+                last_timestamp=last.timestamp,
                 x=last.x,
                 y=last.y,
                 pressure=last.pressure,
@@ -1050,5 +1058,47 @@ def interleave_window_events(
     while wi < len(window_events):
         result.append(window_events[wi])
         wi += 1
+
+    return result
+
+
+def interleave_network_events(
+    combined_events: list[BaseEvent],
+    network_events: list[BaseEvent],
+) -> list[BaseEvent]:
+    """Merge network events into a pre-merged action+window timeline by timestamp.
+
+    Both lists must be sorted by timestamp. On equality, pre-existing events
+    come first (mirrors :func:`interleave_window_events`'s ``<=`` convention
+    so the final order is window-first / action-second / network-third).
+
+    Args:
+        combined_events: Pre-merged action + window events
+            (output of :func:`interleave_window_events`).
+        network_events: Sorted list of network event Pydantic instances
+            (any ``BaseEvent`` subclass - typically ``NetworkRequestEvent``,
+            ``NetworkResponseEvent``, etc.).
+
+    Returns:
+        Combined, time-ordered list.
+    """
+    result: list[BaseEvent] = []
+    ci, ni = 0, 0
+
+    while ci < len(combined_events) and ni < len(network_events):
+        if combined_events[ci].timestamp <= network_events[ni].timestamp:
+            result.append(combined_events[ci])
+            ci += 1
+        else:
+            result.append(network_events[ni])
+            ni += 1
+
+    # Drain remaining
+    while ci < len(combined_events):
+        result.append(combined_events[ci])
+        ci += 1
+    while ni < len(network_events):
+        result.append(network_events[ni])
+        ni += 1
 
     return result

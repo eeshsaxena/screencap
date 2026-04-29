@@ -347,7 +347,7 @@ class TestSpecialKeyProcessing:
     def test_serialization_roundtrip(self):
         """Test that SpecialKeyEvent serializes and deserializes correctly."""
         import json
-        from screencap.engine.storage import EVENT_TYPE_MAP
+        from screencap.engine.events import EVENT_TYPE_MAP
 
         event = SpecialKeyEvent(
             timestamp=1.0,
@@ -485,6 +485,52 @@ class TestMergeConsecutiveMouseMoveEvents:
         """MouseMoveEvent created without path should default to empty list."""
         event = MouseMoveEvent(timestamp=1.0, x=5.0, y=5.0)
         assert event.path == []
+
+    def test_merge_sets_last_timestamp(self):
+        """A merged run carries ``last_timestamp`` covering the full span.
+
+        P1 fix (privacy): the scrub layer needs the END timestamp of the
+        merged span, not just the START, to detect intersection with a
+        blocked interval. Without ``last_timestamp``, a run of moves
+        crossing into a MASK_WINDOW interval would slip past the
+        ``find_blocked_interval(timestamp)`` point lookup and leak
+        coordinates from inside the sensitive interval.
+        """
+        events = [
+            MouseMoveEvent(timestamp=1.0, x=0.0, y=0.0),
+            MouseMoveEvent(timestamp=1.1, x=10.0, y=5.0),
+            MouseMoveEvent(timestamp=1.2, x=20.0, y=10.0),
+        ]
+        result = merge_consecutive_mouse_move_events(events)
+        assert len(result) == 1
+        merged = result[0]
+        assert merged.timestamp == 1.0
+        assert merged.last_timestamp == 1.2
+
+    def test_single_move_has_no_last_timestamp(self):
+        """A single (unmerged) move leaves ``last_timestamp=None``.
+
+        Single moves have ``timestamp == last_timestamp`` implicitly — the
+        scrub layer treats ``None`` as a degenerate point, equivalent to
+        ``find_blocked_interval(timestamp)``. Storing ``None`` keeps the
+        on-disk JSONL unchanged for the common (unmerged) case.
+        """
+        events = [MouseMoveEvent(timestamp=1.0, x=50.0, y=75.0)]
+        result = merge_consecutive_mouse_move_events(events)
+        assert len(result) == 1
+        assert result[0].last_timestamp is None
+        # Sanity: path is still populated for single moves
+        assert result[0].path == [(50.0, 75.0)]
+
+    def test_default_last_timestamp_is_none(self):
+        """``MouseMoveEvent`` created without ``last_timestamp`` defaults to None.
+
+        Existing test fixtures and ``convert.py`` / ``input.py`` callers
+        that build ``MouseMoveEvent`` without the new field continue to
+        work without any code change.
+        """
+        event = MouseMoveEvent(timestamp=1.0, x=5.0, y=5.0)
+        assert event.last_timestamp is None
 
 
 class TestMergeConsecutiveMouseScrollEvents:

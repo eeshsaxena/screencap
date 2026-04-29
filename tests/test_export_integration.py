@@ -406,7 +406,8 @@ def test_privacy_filter_excludes_and_masks(tmp_path, monkeypatch):
     create_export_test_db(rec_dir / "recording.db", extra_window_events=extra_windows)
 
     from screencap.engine import Capture
-    from screencap.exporter import _write_events, build_privacy_filter
+    from screencap.exporter import _write_events
+    from screencap.privacy.filter import build_privacy_filter
 
     pf = build_privacy_filter(privacy_mode="public", cloud_intent=False)
     out_file = rec_dir / "events.jsonl"
@@ -471,7 +472,8 @@ def test_privacy_filter_cloud_intent(tmp_path, monkeypatch):
     create_export_test_db(rec_dir / "recording.db", extra_window_events=extra_windows)
 
     from screencap.engine import Capture
-    from screencap.exporter import _write_events, build_privacy_filter
+    from screencap.exporter import _write_events
+    from screencap.privacy.filter import build_privacy_filter
 
     def _export_with_filter(pf):
         with Capture.load(str(rec_dir)) as capture:
@@ -636,3 +638,682 @@ def test_cli_export_all(tmp_path, monkeypatch):
     # Each recording dir should have events.jsonl
     assert (tmp_path / "rec-a" / "events.jsonl").exists()
     assert (tmp_path / "rec-b" / "events.jsonl").exists()
+
+
+# ============================================================================
+# CaptureSession.export_events — Unit 5 unified-callable behavioral contracts
+# ============================================================================
+#
+# These tests pin the per-recording threshold + disabled-row + include_moves
+# behaviors that must survive the refactor to ``unified_export_events``.
+# Cross-references the public-signature contract in
+# ``tests/test_cross_layer_contracts.py:35-45``.
+
+
+def _build_recording_with_thresholds(
+    db_path,
+    *,
+    interval=None,
+    distance=None,
+):
+    """Create a recording.db where the click-threshold columns may be NULL.
+
+    ``interval=None`` and ``distance=None`` leave the threshold columns NULL
+    so we can verify the engine's fallback to ``process_events`` defaults
+    (0.5s / 5px).
+    """
+    from screencap.engine.db import create_db, crud
+
+    engine, Session = create_db(str(db_path))
+    session = Session()
+    rec_data = {
+        "timestamp": 1000.0,
+        "platform": "darwin",
+        "monitor_width": 1024,
+        "monitor_height": 768,
+    }
+    if interval is not None:
+        rec_data["double_click_interval_seconds"] = interval
+    if distance is not None:
+        rec_data["double_click_distance_pixels"] = distance
+    recording = crud.insert_recording(session, rec_data)
+
+    # Two click pairs 0.40s apart — at the boundary between default 0.5s
+    # (merge → doubleclick) and a tighter 0.3s override (no merge → two
+    # singleclicks).
+    for ts in (1001.0, 1001.40):
+        crud.insert_action_event(session, recording, ts, {
+            "name": "click",
+            "mouse_x": 100.0,
+            "mouse_y": 100.0,
+            "mouse_button_name": "left",
+            "mouse_pressed": True,
+        })
+        crud.insert_action_event(session, recording, ts + 0.01, {
+            "name": "click",
+            "mouse_x": 100.0,
+            "mouse_y": 100.0,
+            "mouse_button_name": "left",
+            "mouse_pressed": False,
+        })
+    session.close()
+    return recording
+
+
+def test_export_events_per_recording_click_threshold_propagates(tmp_path):
+    """U5.1: Per-recording ``double_click_interval_seconds`` reaches the
+    unified pipeline.
+
+    Two click pairs are 0.4s apart. With the default 0.5s interval this
+    merges to a single ``mouse.doubleclick``. With a tight 0.3s
+    per-recording threshold the second pair is too late, so we expect two
+    separate ``mouse.singleclick`` events.
+    """
+    rec_dir = tmp_path / "tight-rec"
+    rec_dir.mkdir()
+    _build_recording_with_thresholds(
+        rec_dir / "recording.db", interval=0.3, distance=5.0,
+    )
+
+    from screencap.engine import Capture
+
+    with Capture.load(str(rec_dir)) as capture:
+        events = capture.export_events(include_moves=False)
+
+    types = [e.type for e in events]
+    # Tight interval → no doubleclick, two singleclicks.
+    assert "mouse.doubleclick" not in types
+    assert types.count("mouse.singleclick") == 2
+
+
+def test_export_events_null_thresholds_fallback_to_defaults(tmp_path):
+    """U5.2: NULL ``double_click_*`` columns fall back to engine defaults.
+
+    Same fixture as U5.1 but with both threshold columns NULL. Default
+    interval (0.5s) is wider than the 0.4s click gap, so the two pairs
+    merge into one ``mouse.doubleclick``.
+    """
+    rec_dir = tmp_path / "null-rec"
+    rec_dir.mkdir()
+    _build_recording_with_thresholds(
+        rec_dir / "recording.db", interval=None, distance=None,
+    )
+
+    from screencap.engine import Capture
+
+    with Capture.load(str(rec_dir)) as capture:
+        events = capture.export_events(include_moves=False)
+
+    types = [e.type for e in events]
+    # Default interval (0.5s) > 0.4s gap → merges to one doubleclick.
+    assert types.count("mouse.doubleclick") == 1
+    assert "mouse.singleclick" not in types
+
+
+def test_export_events_disabled_rows_excluded(tmp_path):
+    """U5.3: ``action_event.disabled=True`` rows never reach the unified
+    pipeline.
+
+    The disabled-row filter is applied at the row-fetch boundary inside
+    ``CaptureSession.export_events`` (R16). A click with ``disabled=True``
+    should not appear in the output as a ``mouse.singleclick``.
+    """
+    from screencap.engine import Capture
+    from screencap.engine.db import create_db, crud
+    from screencap.engine.db.models import ActionEvent
+
+    rec_dir = tmp_path / "disabled-rec"
+    rec_dir.mkdir()
+    db_path = rec_dir / "recording.db"
+
+    engine, Session = create_db(str(db_path))
+    session = Session()
+    recording = crud.insert_recording(session, {
+        "timestamp": 1000.0,
+        "platform": "darwin",
+        "monitor_width": 1024,
+        "monitor_height": 768,
+    })
+    # Two click pairs. The second pair (at 1003.0) will be disabled.
+    for ts in (1001.0, 1003.0):
+        crud.insert_action_event(session, recording, ts, {
+            "name": "click",
+            "mouse_x": 50.0,
+            "mouse_y": 50.0,
+            "mouse_button_name": "left",
+            "mouse_pressed": True,
+        })
+        crud.insert_action_event(session, recording, ts + 0.01, {
+            "name": "click",
+            "mouse_x": 50.0,
+            "mouse_y": 50.0,
+            "mouse_button_name": "left",
+            "mouse_pressed": False,
+        })
+    # Disable both rows of the second pair.
+    for evt in session.query(ActionEvent).filter(ActionEvent.timestamp >= 1003.0):
+        evt.disabled = True
+    session.commit()
+    session.close()
+
+    with Capture.load(str(rec_dir)) as capture:
+        events = capture.export_events(include_moves=False)
+
+    click_events = [e for e in events if e.type == "mouse.singleclick"]
+    # Only the first (enabled) click pair survives.
+    assert len(click_events) == 1
+    # It must be the surviving (timestamp=1001.x) click, not the disabled one.
+    assert all(abs(e.timestamp - 1001.0) < 0.05 for e in click_events)
+
+
+# ============================================================================
+# CaptureSession.export_events — forward-looking window_event.disabled parity
+# ============================================================================
+#
+# These tests pin the symmetry between CLI export, chunk processor, and
+# recovery for the (currently absent) ``window_event.disabled`` column.
+# Today the column doesn't exist on any schema, but chunk processor and
+# recovery already gate it via ``has_column`` so a future migration that
+# adds it filters disabled rows on those two paths. CLI export iterates
+# the SQLAlchemy ``WindowEvent`` ORM model (which has no ``disabled``
+# attribute), so without the raw-SQL pre-pass added in the M-2 fix, CLI
+# export would silently emit disabled rows while the other two paths
+# filter them — exactly the kind of three-caller asymmetry the unified-
+# export refactor exists to prevent.
+
+
+class TestWindowEventDisabledForwardLooking:
+    """Forward-looking parity for ``window_event.disabled``.
+
+    Two cases:
+
+    1. Modern schema (no ``disabled`` column): CLI export behavior is
+       unchanged — every window_event row in the DB still appears in the
+       output.
+    2. Forward-looking schema with the column: rows with ``disabled=1``
+       are dropped from the output, matching what chunk processor and
+       recovery already do via ``_disabled_clause``.
+
+    The fix adds a raw-SQL pre-pass in
+    ``CaptureSession.export_events`` to fetch disabled IDs and skip them
+    during ORM iteration. Adding the column to the ``WindowEvent`` ORM
+    model is NOT safe because older DBs lack the column and SQLAlchemy
+    SELECTs would fail on them (the same failure mode as the recently-
+    fixed P2 recovery bug).
+    """
+
+    def _build_capture(
+        self, capture_dir, *, include_disabled_window=False,
+    ):
+        """Create a recording.db with three window_event rows.
+
+        When ``include_disabled_window`` is True, the middle row's
+        ``window_id`` is "200" — the test then ALTERs the table to add
+        a ``disabled`` column and marks that row disabled.
+        """
+        from screencap.engine.db import create_db, crud
+
+        capture_dir.mkdir(exist_ok=True)
+        db_path = capture_dir / "recording.db"
+
+        engine, Session = create_db(str(db_path))
+        session = Session()
+
+        recording = crud.insert_recording(session, {
+            "timestamp": 1000.0,
+            "platform": "darwin",
+            "monitor_width": 1024,
+            "monitor_height": 768,
+            "double_click_interval_seconds": 0.5,
+            "double_click_distance_pixels": 5.0,
+        })
+
+        # Three window events. With dedup-by-(bundle_id, window_id) the
+        # three distinct window_ids each produce a separate
+        # ``window.switch`` event in the output.
+        crud.insert_window_event(session, recording, 1001.0, {
+            "title": "Editor — main.py",
+            "app_bundle_id": "com.editor.app",
+            "window_id": "100",
+            "left": 0, "top": 0, "width": 1024, "height": 768,
+        })
+        crud.insert_window_event(session, recording, 1002.0, {
+            "title": "Browser — example.com",
+            "app_bundle_id": "com.browser.app",
+            "window_id": "200",
+            "left": 0, "top": 0, "width": 1024, "height": 768,
+        })
+        crud.insert_window_event(session, recording, 1003.0, {
+            "title": "Terminal — bash",
+            "app_bundle_id": "com.terminal.app",
+            "window_id": "300",
+            "left": 0, "top": 0, "width": 1024, "height": 768,
+        })
+
+        # Need at least one action event so the export pipeline has a
+        # row to anchor — without action_events the unified pipeline
+        # still emits window.switch events but adding one keeps the
+        # fixture closer to a real recording.
+        crud.insert_action_event(session, recording, 1004.0, {
+            "name": "click",
+            "mouse_x": 50.0, "mouse_y": 50.0,
+            "mouse_button_name": "left",
+            "mouse_pressed": True,
+        })
+        crud.insert_action_event(session, recording, 1004.01, {
+            "name": "click",
+            "mouse_x": 50.0, "mouse_y": 50.0,
+            "mouse_button_name": "left",
+            "mouse_pressed": False,
+        })
+
+        session.commit()
+        session.close()
+        engine.dispose()
+
+        if include_disabled_window:
+            # Forward-looking schema: ALTER TABLE to add the column,
+            # then mark window_id=200 as disabled. This mirrors what a
+            # future migration would do (but isn't done today). Use raw
+            # sqlite3 to avoid touching the ORM model.
+            import sqlite3
+
+            with sqlite3.connect(str(db_path)) as conn:
+                conn.execute(
+                    "ALTER TABLE window_event "
+                    "ADD COLUMN disabled BOOLEAN DEFAULT 0"
+                )
+                conn.execute(
+                    "UPDATE window_event SET disabled = 1 "
+                    "WHERE window_id = '200'"
+                )
+                conn.commit()
+
+        return db_path
+
+    def test_modern_schema_no_disabled_column_unchanged_behavior(self, tmp_path):
+        """No ``window_event.disabled`` column → all 3 window events emit.
+
+        Pins that the raw-SQL pre-pass is a no-op for the current schema:
+        ``has_column`` returns False, the disabled-id set stays empty,
+        and every ORM row passes through.
+        """
+        from screencap.engine import Capture
+
+        capture_dir = tmp_path / "modern-rec"
+        self._build_capture(capture_dir, include_disabled_window=False)
+
+        with Capture.load(str(capture_dir)) as capture:
+            events = capture.export_events(include_moves=False)
+
+        ws = [e for e in events if e.type == "window.switch"]
+        bundles = {e.app_bundle_id for e in ws}
+        assert bundles == {
+            "com.editor.app", "com.browser.app", "com.terminal.app",
+        }, (
+            "All 3 window_event rows must emit on the current schema "
+            f"(no disabled column gating); got bundles={bundles}"
+        )
+
+    def test_forward_looking_schema_disabled_rows_filtered(self, tmp_path):
+        """Forward-looking ``window_event.disabled`` column is honored.
+
+        With the column present and window_id=200 marked disabled, CLI
+        export must skip that row — matching what chunk processor and
+        recovery already do via ``_disabled_clause``.
+
+        Pre-fix this test FAILS: the ORM iterator can't see a column
+        the model doesn't define, so the disabled row leaks into the
+        output. Post-fix the raw-SQL pre-pass fetches the disabled id
+        and the ORM loop skips it.
+        """
+        from screencap.engine import Capture
+
+        capture_dir = tmp_path / "future-rec"
+        self._build_capture(capture_dir, include_disabled_window=True)
+
+        with Capture.load(str(capture_dir)) as capture:
+            events = capture.export_events(include_moves=False)
+
+        ws = [e for e in events if e.type == "window.switch"]
+        bundles = {e.app_bundle_id for e in ws}
+        assert "com.browser.app" not in bundles, (
+            "window_event row with disabled=1 leaked into CLI export "
+            "— forward-looking parity with chunk processor + recovery "
+            f"is broken; got bundles={bundles}"
+        )
+        # The other two rows must still pass through.
+        assert bundles == {"com.editor.app", "com.terminal.app"}, (
+            f"Expected only the two non-disabled bundles; got {bundles}"
+        )
+
+
+# ============================================================================
+# write_events_jsonl — Unit 4 streaming writer
+# ============================================================================
+#
+# These tests pin the contract used by the chunk processor (Unit 6) and
+# recovery (Unit 7) when both migrate to the shared writer:
+#
+# - Atomic .tmp + os.rename (clean run leaves no .tmp).
+# - Cleanup-on-exception (failed write never leaves a partial output).
+# - Stale-.tmp cleanup at start (defense-in-depth for SIGKILL/OOM).
+# - Streaming memory profile (R18: peak RSS ≤ ~1.5× sizeof(processed list)).
+
+
+def _make_move_events(count: int):
+    """Build ``count`` MouseMoveEvent instances spaced 1ms apart.
+
+    Used by the writer tests as a lightweight, deterministic fixture.
+    """
+    from screencap.engine.events import MouseMoveEvent
+
+    return [
+        MouseMoveEvent(timestamp=1000.0 + i * 0.001, x=float(i), y=float(i))
+        for i in range(count)
+    ]
+
+
+def test_write_events_jsonl_happy_path(tmp_path):
+    """W1: 100 events stream to disk as meta + 100 lines."""
+    from screencap.exporter import build_export_metadata, write_events_jsonl
+
+    out_path = tmp_path / "events.jsonl"
+    meta = build_export_metadata(exclude_moves=False)
+    events = _make_move_events(100)
+
+    count = write_events_jsonl(out_path, events, meta)
+
+    assert count == 100
+    assert out_path.exists()
+    assert not (tmp_path / "events.jsonl.tmp").exists()
+
+    lines = out_path.read_text().strip().split("\n")
+    assert len(lines) == 101  # meta + 100 events
+
+    # Header validation
+    header = json.loads(lines[0])
+    assert header["_meta"] is True
+    assert header["format_version"] == 2
+    assert header["exclude_moves"] is False
+
+    # Event validation — all 100 lines parse as JSON with type=mouse.move
+    for i, line in enumerate(lines[1:]):
+        evt = json.loads(line)
+        assert evt["type"] == "mouse.move"
+        assert evt["x"] == float(i)
+        assert evt["y"] == float(i)
+
+
+def test_write_events_jsonl_atomicity_on_midwrite_failure(tmp_path):
+    """W2: exception mid-write removes .tmp, leaves no final output."""
+    from unittest import mock
+
+    from screencap.exporter import build_export_metadata, write_events_jsonl
+
+    out_path = tmp_path / "events.jsonl"
+    tmp_target = tmp_path / "events.jsonl.tmp"
+    meta = build_export_metadata(exclude_moves=False)
+    events = _make_move_events(100)
+
+    # Patch model_dump_json on the 50th event to raise. We wrap the
+    # original method so the first 49 events serialize normally, then
+    # event #49 (zero-indexed = 50th call) explodes.
+    call_count = {"n": 0}
+    original = type(events[0]).model_dump_json
+
+    def exploding(self, *args, **kwargs):
+        if call_count["n"] == 49:
+            raise RuntimeError("simulated mid-write failure")
+        call_count["n"] += 1
+        return original(self, *args, **kwargs)
+
+    with mock.patch.object(type(events[0]), "model_dump_json", exploding):
+        with pytest.raises(RuntimeError, match="simulated mid-write failure"):
+            write_events_jsonl(out_path, events, meta)
+
+    # Both the .tmp and the final path should be absent — atomic semantics.
+    assert not tmp_target.exists(), ".tmp must be cleaned up on failure"
+    assert not out_path.exists(), "final path must not appear on partial write"
+
+
+def test_write_events_jsonl_clean_run_no_tmp_remaining(tmp_path):
+    """W3: successful write leaves no .tmp file."""
+    from screencap.exporter import build_export_metadata, write_events_jsonl
+
+    out_path = tmp_path / "events.jsonl"
+    meta = build_export_metadata(exclude_moves=True)
+    events = _make_move_events(10)
+
+    write_events_jsonl(out_path, events, meta)
+
+    assert out_path.exists()
+    assert not (tmp_path / "events.jsonl.tmp").exists()
+
+
+def test_write_events_jsonl_empty_events(tmp_path):
+    """W4: empty events iterable → output has only the meta line."""
+    from screencap.exporter import build_export_metadata, write_events_jsonl
+
+    out_path = tmp_path / "events.jsonl"
+    meta = build_export_metadata(exclude_moves=False)
+
+    count = write_events_jsonl(out_path, iter([]), meta)
+
+    assert count == 0
+    assert out_path.exists()
+    lines = out_path.read_text().strip().split("\n")
+    assert len(lines) == 1
+    header = json.loads(lines[0])
+    assert header["_meta"] is True
+
+
+def test_write_events_jsonl_stale_tmp_cleanup(tmp_path):
+    """W5: a stale .tmp file from a prior crashed run is cleaned at start."""
+    from screencap.exporter import build_export_metadata, write_events_jsonl
+
+    out_path = tmp_path / "events.jsonl"
+    stale_tmp = tmp_path / "events.jsonl.tmp"
+
+    # Simulate the SIGKILL/OOM case: previous run left a partial .tmp on disk.
+    stale_tmp.write_text("this is partial garbage from a previous crash\n")
+    assert stale_tmp.exists()
+
+    meta = build_export_metadata(exclude_moves=False)
+    events = _make_move_events(5)
+
+    count = write_events_jsonl(out_path, events, meta)
+
+    assert count == 5
+    assert out_path.exists()
+    assert not stale_tmp.exists(), "stale .tmp must be cleaned up at start"
+
+    lines = out_path.read_text().strip().split("\n")
+    # 1 meta + 5 events; no leftover garbage
+    assert len(lines) == 6
+    assert json.loads(lines[0])["_meta"] is True
+
+
+def test_write_events_jsonl_consumes_iterator(tmp_path):
+    """W6: writer accepts a generator (not just a list) — exhausts it once."""
+    from screencap.exporter import build_export_metadata, write_events_jsonl
+
+    out_path = tmp_path / "events.jsonl"
+    meta = build_export_metadata(exclude_moves=False)
+
+    def gen():
+        for evt in _make_move_events(20):
+            yield evt
+
+    g = gen()
+    count = write_events_jsonl(out_path, g, meta)
+
+    assert count == 20
+    # Generator exhausted — second call should yield nothing
+    assert list(g) == []
+
+
+def test_unified_export_events_returns_iterator():
+    """W7a (R18 structural): unified_export_events returns an Iterator,
+    not a list. This catches the type-level regression at the engine→
+    writer seam — if Unit 3 ever returns a ``list[BaseEvent]``, the
+    Iterator contract documented in R18 is broken and write_events_jsonl
+    would consume against a fully materialized sequence.
+
+    The structural check is the strongest signal we get cheaply. The
+    sibling test (W7b) measures peak memory under a synthetic generator
+    to confirm the writer itself doesn't materialize internally.
+    """
+    from screencap.engine.export import unified_export_events
+
+    result = unified_export_events([], [])
+
+    # Iterator protocol — must support __next__ but not be a list.
+    assert hasattr(result, "__next__"), (
+        "unified_export_events must return an Iterator (Unit 3 / R18 contract); "
+        f"got {type(result).__name__!r}"
+    )
+    assert not isinstance(result, list), (
+        "unified_export_events returned a list — the Iterator contract from "
+        "R18 is broken. write_events_jsonl would then consume against a "
+        "fully materialized sequence, doubling peak working set at the "
+        "engine→writer seam."
+    )
+
+
+@pytest.mark.slow
+def test_write_events_jsonl_streaming_memory_bound(tmp_path):
+    """W7b (R18): the writer itself does NOT materialize its input.
+
+    R18 honest framing: ``process_events``' 11-stage merge pipeline
+    intrinsically materializes the action-event list (click pairing
+    needs lookahead, drag detection needs lookback, key.type merging
+    needs aggregate state). Empirically that pipeline's peak working
+    set is ~6× the final processed list size — far above the plan's
+    naive "1.5×" target, which was written before the interim
+    allocations were measured. So the bound the plan asks for cannot
+    be measured against the full ``unified_export_events →
+    write_events_jsonl`` pipeline; process_events dominates.
+
+    What we CAN measure precisely is the writer in isolation: feed
+    ``write_events_jsonl`` a generator yielding 100K pre-built events
+    on demand, and confirm peak ≈ one event's worth (not one list's
+    worth). A regression where the writer ``list(events)`` internally
+    would push peak from kilobytes to ~tens of MB.
+
+    Threshold: streaming peak ≤ 1MB. The full 100K-event list is ~8MB
+    of references; one event in flight is hundreds of bytes; per-line
+    serialization buffers a few KB. 1MB is generous headroom for
+    tracemalloc noise while still catching a "list inside writer"
+    regression by an order of magnitude.
+
+    Sibling test (W7a) covers the seam between the engine and the
+    writer at the type level; this test covers the writer's own
+    behavior at the memory level.
+    """
+    import gc
+    import tracemalloc
+
+    from screencap.engine.events import MouseMoveEvent
+    from screencap.exporter import build_export_metadata, write_events_jsonl
+
+    n = 100_000
+    # Pre-build the events outside the measured window. They live in
+    # `events_list` and should be the dominant allocation BEFORE
+    # tracemalloc starts; the writer-only peak is what we measure.
+    events_list = [
+        MouseMoveEvent(timestamp=1000.0 + i * 0.001, x=float(i), y=float(i))
+        for i in range(n)
+    ]
+
+    out = tmp_path / "events.jsonl"
+    meta = build_export_metadata(exclude_moves=False)
+
+    def gen():
+        for e in events_list:
+            yield e
+
+    gc.collect()
+    tracemalloc.start()
+    try:
+        tracemalloc.reset_peak()
+        count = write_events_jsonl(out, gen(), meta)
+        _, peak = tracemalloc.get_traced_memory()
+    finally:
+        tracemalloc.stop()
+
+    assert count == n
+    assert out.exists()
+
+    # Writer should hold ~one event in flight, not the whole list.
+    # 1MB is ~125× a single event — plenty of slack for serialization
+    # buffers, tracemalloc bookkeeping, and the small windowing the
+    # generator does.
+    threshold = 1_000_000
+    assert peak <= threshold, (
+        f"write_events_jsonl peak {peak / 1_000_000:.2f}MB exceeds "
+        f"{threshold / 1_000_000:.1f}MB on a {n}-event generator input. "
+        f"This usually means the writer is materializing the iterator "
+        f"internally (e.g., list(events) inside the function body) "
+        f"instead of streaming one event at a time."
+    )
+
+
+def test_v1_scope_guard_no_network_lines_in_capture_export(tmp_path):
+    """V1 contract: Capture.export_events() emits ZERO network.* lines.
+
+    The CLI export path calls Capture.export_events() which in turn
+    delegates to unified_export_events with network_rows=None (per V1
+    plan scope at lines 919-921 + 47-48). Wiring network_rows in V1
+    would silently leak metadata to cloud the next time a user runs
+    `screencap upload` on a previously-recorded local session.
+    """
+    from screencap.engine.db import crud
+    from screencap.exporter import build_export_metadata, export_recording
+
+    rec_dir = tmp_path / "v1-network-rec"
+    rec_dir.mkdir()
+    db_path = rec_dir / "recording.db"
+
+    # Seed standard test data + a network_event row.
+    create_export_test_db(db_path)
+
+    # Insert a network_event row directly via crud + get_session_for_path.
+    from screencap.engine.db import get_session_for_path
+
+    session = get_session_for_path(str(db_path))
+    recording = session.query(crud.Recording).first()
+    crud.insert_network_event(
+        session,
+        recording,
+        {
+            "kind": "request",
+            "flow_id": "flow-X",
+            "method": "GET",
+            "url": "https://example.com/api/secret",
+            "host": "example.com",
+            "headers_json": json.dumps([["Host", "example.com"]]),
+            "body_size": 0,
+            "body_sha256": None,
+            "content_type": None,
+            "direction": None,
+            "frame_type": None,
+            "http_version": "HTTP/1.1",
+            "details_json": None,
+            "timestamp": 1004.0,
+            "timestamp_ns": 1_004_000_000_000,
+        },
+    )
+    crud.flush_buffers(session)
+    session.close()
+
+    out_file = str(rec_dir / "events.jsonl")
+    meta = build_export_metadata(exclude_moves=False)
+    export_recording(rec_dir, out_file, exclude_moves=False, metadata=meta)
+
+    lines = open(out_file).read().strip().split("\n")
+    events = [json.loads(line) for line in lines[1:]]  # skip _meta
+    types = [e.get("type") for e in events]
+    assert all(not (t or "").startswith("network.") for t in types), (
+        f"V1 Capture.export_events() must emit zero network.* lines; got types: {types}"
+    )

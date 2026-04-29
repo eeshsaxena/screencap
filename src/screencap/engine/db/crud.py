@@ -11,6 +11,7 @@ from screencap.engine.db.models import (
     ActionEvent,
     AudioInfo,
     MemoryStat,
+    NetworkEvent,
     PerformanceStat,
     Recording,
     Screenshot,
@@ -26,6 +27,7 @@ window_events = []
 performance_stats = []
 memory_stats = []
 window_geometries = []
+network_events = []
 
 
 def _insert(
@@ -83,12 +85,13 @@ def flush_buffers(session: SaSession) -> None:
         (window_geometries, WindowGeometry),
         (performance_stats, PerformanceStat),
         (memory_stats, MemoryStat),
+        (network_events, NetworkEvent),
     ]
     for buffer, table in _buffer_table_pairs:
         if buffer:
             session.execute(sa.insert(table), buffer)
     session.commit()
-    # Clear only after commit succeeds — avoids silent data loss on I/O error.
+    # Clear only after commit succeeds - avoids silent data loss on I/O error.
     for buffer, _ in _buffer_table_pairs:
         buffer.clear()
 
@@ -183,6 +186,32 @@ def insert_window_event(
         "recording_timestamp": recording.timestamp,
     }
     _insert(session, event_data, WindowEvent, window_events)
+
+
+def insert_network_event(
+    session: SaSession,
+    recording: Recording,
+    event_data: dict[str, Any],
+) -> None:
+    """Insert a network event into the database.
+
+    The caller is expected to have already populated `kind`, `timestamp`,
+    and `timestamp_ns` in `event_data`. `recording_id` is injected here
+    so call sites do not need to thread the recording through.
+
+    `headers_json` and `details_json` should be JSON-encoded strings;
+    `body_sha256` should be raw 32-byte digest (not hex).
+
+    Args:
+        session: The database session.
+        recording: The recording object.
+        event_data: The event data dict (matching NetworkEvent column names).
+    """
+    event_data = {
+        **event_data,
+        "recording_id": recording.id,
+    }
+    _insert(session, event_data, NetworkEvent, network_events)
 
 
 def insert_perf_stat(
@@ -309,5 +338,3 @@ def insert_audio_info(
     )
     session.add(audio_info)
     session.commit()
-
-

@@ -11,6 +11,7 @@ src/screencap/__pycache__
 
 # Environments
 .venv/
+.venv-*/
 venv/
 .env
 
@@ -29,6 +30,7 @@ benchmark_results/
 # Project — ignore docs/ except docs/solutions/
 docs/*
 !docs/solutions/
+!docs/architecture/
 
 .claude/*
 !.claude/commands/

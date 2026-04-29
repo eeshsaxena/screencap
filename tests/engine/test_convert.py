@@ -230,3 +230,226 @@ class TestDictToWindowSwitch:
             }
             event = dict_to_window_switch(row)
             assert event.domain is None, f"Expected None for browser_url={browser_url!r}"
+
+
+# =============================================================================
+# Network event conversion tests (V1)
+# =============================================================================
+
+
+class TestBytesToHexHelpers:
+    """Hex round-trip helpers shared between V1 and V1.5 paths."""
+
+    def test_bytes_to_hex_none(self):
+        from screencap.engine.convert import bytes_to_hex
+
+        assert bytes_to_hex(None) is None
+
+    def test_bytes_to_hex_round_trip(self):
+        from screencap.engine.convert import bytes_to_hex, hex_to_bytes
+
+        digest = b"\x01\x02\x03\x04" + b"\x00" * 28
+        assert len(digest) == 32
+        h = bytes_to_hex(digest)
+        assert isinstance(h, str)
+        assert h == h.lower()
+        assert h == "01020304" + "00" * 28
+        assert hex_to_bytes(h) == digest
+
+    def test_hex_to_bytes_none_and_empty(self):
+        from screencap.engine.convert import hex_to_bytes
+
+        assert hex_to_bytes(None) is None
+        assert hex_to_bytes("") is None
+
+
+class TestDictToNetworkEvent:
+    """Test dict_to_network_event for each kind."""
+
+    def test_request_kind(self):
+        import json
+
+        from screencap.engine.convert import dict_to_network_event
+        from screencap.engine.events import NetworkRequestEvent
+
+        digest = b"\xaa" * 32
+        row = {
+            "kind": "request",
+            "timestamp": 1.5,
+            "timestamp_ns": 1_500_000_000,
+            "flow_id": "flow-1",
+            "method": "POST",
+            "url": "https://example.com/api",
+            "host": "example.com",
+            "headers_json": json.dumps([
+                ["Content-Type", "application/json"],
+                ["X-Trace", "abc"],
+            ]),
+            "body_size": 42,
+            "body_sha256": digest,
+            "content_type": "application/json",
+            "http_version": "HTTP/1.1",
+        }
+        event = dict_to_network_event(row)
+        assert isinstance(event, NetworkRequestEvent)
+        assert event.method == "POST"
+        assert event.host == "example.com"
+        assert event.body_size == 42
+        assert event.body_sha256_hex == "aa" * 32
+        assert event.headers == [("Content-Type", "application/json"), ("X-Trace", "abc")]
+
+    def test_response_kind(self):
+        import json
+
+        from screencap.engine.convert import dict_to_network_event
+        from screencap.engine.events import NetworkResponseEvent
+
+        row = {
+            "kind": "response",
+            "timestamp": 2.0,
+            "timestamp_ns": 2_000_000_000,
+            "flow_id": "flow-1",
+            "host": "example.com",
+            "status": 200,
+            "headers_json": json.dumps([["Content-Type", "text/html"]]),
+            "body_size": 1024,
+            "body_sha256": None,
+            "content_type": "text/html",
+            "http_version": "HTTP/2",
+        }
+        event = dict_to_network_event(row)
+        assert isinstance(event, NetworkResponseEvent)
+        assert event.status == 200
+        assert event.body_sha256_hex is None
+        assert event.http_version == "HTTP/2"
+
+    def test_ws_upgrade_kind(self):
+        import json
+
+        from screencap.engine.convert import dict_to_network_event
+        from screencap.engine.events import NetworkWebSocketUpgradeEvent
+
+        row = {
+            "kind": "ws_upgrade",
+            "timestamp": 3.0,
+            "timestamp_ns": 3_000_000_000,
+            "flow_id": "ws-1",
+            "url": "wss://chat.example.com/socket",
+            "host": "chat.example.com",
+            "status": 101,
+            "headers_json": json.dumps([
+                ["Upgrade", "websocket"],
+                ["Connection", "Upgrade"],
+            ]),
+            "http_version": "HTTP/1.1",
+            "details_json": json.dumps({
+                "request_headers": [
+                    ["Sec-WebSocket-Key", "abc=="],
+                ],
+            }),
+        }
+        event = dict_to_network_event(row)
+        assert isinstance(event, NetworkWebSocketUpgradeEvent)
+        assert event.url == "wss://chat.example.com/socket"
+        assert event.details_json == {
+            "request_headers": [["Sec-WebSocket-Key", "abc=="]],
+        }
+        assert len(event.headers) == 2
+
+    def test_ws_frame_kind(self):
+        from screencap.engine.convert import dict_to_network_event
+        from screencap.engine.events import NetworkWebSocketFrameEvent
+
+        digest = b"\xbb" * 32
+        row = {
+            "kind": "ws_frame",
+            "timestamp": 4.0,
+            "timestamp_ns": 4_000_000_000,
+            "flow_id": "ws-1",
+            "host": "chat.example.com",
+            "direction": "received",
+            "frame_type": "binary",
+            "body_size": 256,
+            "body_sha256": digest,
+        }
+        event = dict_to_network_event(row)
+        assert isinstance(event, NetworkWebSocketFrameEvent)
+        assert event.direction == "received"
+        assert event.frame_type == "binary"
+        assert event.body_sha256_hex == "bb" * 32
+
+    def test_drop_burst_kind(self):
+        import json
+
+        from screencap.engine.convert import dict_to_network_event
+        from screencap.engine.events import NetworkDropBurstEvent
+
+        row = {
+            "kind": "drop_burst",
+            "timestamp": 5.0,
+            "timestamp_ns": 5_000_000_000,
+            "details_json": json.dumps({
+                "dropped_count": 3,
+                "hosts_affected": ["a.com", "b.com"],
+                "source": "addon",
+            }),
+        }
+        event = dict_to_network_event(row)
+        assert isinstance(event, NetworkDropBurstEvent)
+        assert event.details_json["dropped_count"] == 3
+        assert event.details_json["source"] == "addon"
+        assert event.details_json["hosts_affected"] == ["a.com", "b.com"]
+
+    def test_unknown_kind_returns_none(self):
+        from screencap.engine.convert import dict_to_network_event
+
+        assert dict_to_network_event({"kind": "no_such_kind"}) is None
+        assert dict_to_network_event({"kind": ""}) is None
+        assert dict_to_network_event({}) is None
+
+    def test_ws_frame_invalid_direction_returns_none(self):
+        """Conversion-layer guard: malformed direction is dropped, not raised."""
+        from screencap.engine.convert import dict_to_network_event
+
+        row = {
+            "kind": "ws_frame",
+            "timestamp": 1.0,
+            "timestamp_ns": 1,
+            "flow_id": "f",
+            "host": "h",
+            "direction": "garbage",
+            "frame_type": "text",
+        }
+        assert dict_to_network_event(row) is None
+
+    def test_drop_burst_missing_details_returns_none(self):
+        """drop_burst requires details_json - missing => None."""
+        from screencap.engine.convert import dict_to_network_event
+
+        assert (
+            dict_to_network_event({
+                "kind": "drop_burst",
+                "timestamp": 1.0,
+                "timestamp_ns": 1,
+            })
+            is None
+        )
+
+    def test_already_decoded_headers_pass_through(self):
+        """headers_json may arrive as a list (some callers pre-decode)."""
+        from screencap.engine.convert import dict_to_network_event
+        from screencap.engine.events import NetworkRequestEvent
+
+        row = {
+            "kind": "request",
+            "timestamp": 1.0,
+            "timestamp_ns": 1,
+            "flow_id": "f",
+            "method": "GET",
+            "url": "https://x.com/",
+            "host": "x.com",
+            "headers_json": [["A", "1"], ["B", "2"]],
+        }
+        event = dict_to_network_event(row)
+        assert isinstance(event, NetworkRequestEvent)
+        assert event.headers == [("A", "1"), ("B", "2")]

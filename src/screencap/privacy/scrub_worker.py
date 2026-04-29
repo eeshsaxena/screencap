@@ -451,6 +451,20 @@ class ScrubWorker:
         if not self._db_path.exists():
             return dict(_EMPTY_COUNTS)
 
+        # NOTE: this site deliberately bypasses screencap.recording_db.open_recording_db.
+        # scrub_worker is the privacy enforcement worker that runs concurrently with the
+        # engine's live recorder writes. It needs:
+        #   - busy_timeout=10000 (vs the helper default of 5000) to absorb engine commits;
+        #   - the wait_for_writer_flush lifecycle hooks at scrub_worker.py:45;
+        # neither of which the standard helper exposes.
+        #
+        # If a future engine schema adds a column scrub_worker should also scrub, update
+        # the call sites below — these are the evolving columns/tables this worker reads:
+        #   - window_event.browser_url (scrub_worker.py:317-320)
+        #   - screenshot.image_path (scrub_worker.py:377/383/385)
+        #   - window_geometry table DELETE (scrub_worker.py:525)
+        # When that list grows, prefer extending open_recording_db with a busy_timeout
+        # parameter and migrating this site over keeping a parallel implementation.
         conn = sqlite3.connect(str(self._db_path))
         # Match the engine writer's busy_timeout so a long-running engine
         # commit doesn't immediately fail this transaction.

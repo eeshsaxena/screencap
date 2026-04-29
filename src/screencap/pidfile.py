@@ -5,7 +5,6 @@ from __future__ import annotations
 import fcntl
 import json
 import os
-import signal
 import time
 from pathlib import Path
 
@@ -73,14 +72,42 @@ def delete_pidfile() -> None:
     PID_FILE.unlink(missing_ok=True)
 
 
-def _is_screencap_process(pid: int) -> bool:
-    """Check if a PID is actually a screencap process."""
+def _is_screencap_process(
+    pid: int,
+    name_allowlist: set[str] | None = None,
+) -> bool:
+    """Check if a PID belongs to the screencap process tree.
+
+    The default heuristic checks for ``"screencap"`` in the cmdline. Network
+    proxy children (``mp.Process`` running mitmproxy DumpMaster under macOS
+    ``spawn`` mode) carry NO "screencap" substring in their cmdline -- their
+    cmdline is the Python interpreter path + the multiprocessing bootstrap
+    args. ``name_allowlist`` widens the filter to also accept any cmdline
+    that contains one of the supplied names (e.g. ``{"mitmproxy"}`` from
+    the recording.pid children entries).
+    """
     try:
         proc = psutil.Process(pid)
         cmdline = " ".join(proc.cmdline()).lower()
-        return "screencap" in cmdline
     except (psutil.NoSuchProcess, psutil.AccessDenied, psutil.ZombieProcess):
         return False
+    if "screencap" in cmdline:
+        return True
+    if name_allowlist:
+        for name in name_allowlist:
+            if name.lower() in cmdline:
+                return True
+    return False
+
+
+def _name_allowlist_from_children(children: list[dict[str, object]]) -> set[str]:
+    """Extract `{"name": "mitmproxy", ...}` entries from the children list."""
+    names: set[str] = set()
+    for child in children or []:
+        name = child.get("name") if isinstance(child, dict) else None
+        if isinstance(name, str) and name:
+            names.add(name)
+    return names
 
 
 def find_orphaned_processes() -> list[dict[str, int | str]]:
@@ -96,10 +123,11 @@ def find_orphaned_processes() -> list[dict[str, int | str]]:
     if data:
         parent_pid = data.get("parent_pid")
         parent_alive = _pid_exists(parent_pid) if parent_pid else False
+        allowlist = _name_allowlist_from_children(data.get("children", []))
 
         for child in data.get("children", []):
             pid = child.get("pid")
-            if pid and _pid_exists(pid) and _is_screencap_process(pid):
+            if pid and _pid_exists(pid) and _is_screencap_process(pid, allowlist):
                 orphans.append(child)
 
         # If parent is still alive and managing children, they're not orphans
@@ -139,12 +167,13 @@ def terminate_processes(
         List of processes that were successfully terminated.
     """
     terminated = []
+    allowlist = _name_allowlist_from_children(pids)
 
     for entry in pids:
         pid = entry.get("pid")
         if not pid or not _pid_exists(pid):
             continue
-        if not _is_screencap_process(pid):
+        if not _is_screencap_process(pid, allowlist):
             continue
 
         try:
@@ -444,3 +473,66 @@ def lock_is_active() -> bool:
             os.close(probe_fd)
         except OSError:
             pass
+
+
+def _atomic_write_pidfile(data: dict) -> None:
+    """Write the PID file atomically (.tmp + os.replace)."""
+    PID_FILE.parent.mkdir(parents=True, exist_ok=True)
+    tmp_path = PID_FILE.with_suffix(PID_FILE.suffix + ".tmp")
+    with tmp_path.open("w", encoding="utf-8") as fh:
+        json.dump(data, fh, indent=2)
+        fh.flush()
+        os.fsync(fh.fileno())
+    os.replace(tmp_path, PID_FILE)
+
+
+def add_child(
+    name: str,
+    *,
+    proxy_pid: int,
+    worker_pid: int,
+    proxy_create_time: float,
+    proxy_cmdline_tail: str,
+) -> None:
+    """Append a child process entry to the PID file.
+
+    Used by the SessionController's network-handoff daemon thread after the
+    proxy mp.Process is alive. The ``name`` field also widens
+    ``_is_screencap_process``'s cmdline filter so ``terminate_processes``
+    can reach the proxy on shutdown (mitmproxy's spawn-mode cmdline does
+    NOT contain "screencap").
+
+    Idempotent: if an entry with the same name already exists, it is
+    REPLACED with the new values. Atomic-write protects against partial
+    writes.
+    """
+    data = read_pidfile() or {
+        "parent_pid": os.getpid(),
+        "children": [],
+        "started_at": time.time(),
+    }
+    children = [c for c in data.get("children", []) if c.get("name") != name]
+    children.append({
+        "name": name,
+        "pid": proxy_pid,
+        "worker_pid": worker_pid,
+        "create_time": proxy_create_time,
+        "cmdline_tail": proxy_cmdline_tail,
+    })
+    data["children"] = children
+    _atomic_write_pidfile(data)
+
+
+def remove_child(name: str) -> None:
+    """Remove a child process entry from the PID file by ``name``.
+
+    No-op if the PID file is missing or the entry is absent.
+    """
+    data = read_pidfile()
+    if not data:
+        return
+    children = [c for c in data.get("children", []) if c.get("name") != name]
+    if len(children) == len(data.get("children", [])):
+        return  # nothing changed
+    data["children"] = children
+    _atomic_write_pidfile(data)

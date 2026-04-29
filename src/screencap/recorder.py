@@ -642,6 +642,7 @@ def start_recording(
     segmentation_mode: str = "llm",
     scrub_enabled: bool = True,
     show_on_website: bool = True,
+    network: bool = False,
     *,
     # Session-controller worker-mode hooks. These are private and must
     # only be set by screencap.session.run_recording_worker.
@@ -651,6 +652,7 @@ def start_recording(
     _skip_menubar_spawn: bool = False,
     _skip_pidfile: bool = False,
     _skip_sigint_handler: bool = False,
+    network_handoff_ready=None,  # multiprocessing.Event | None — signaled after the proxy PID is registered in the handoff file
 ) -> tuple[Path, float, multiprocessing.Process | None, Path | None]:
     """Start a screen capture recording. Blocks until Ctrl+C.
 
@@ -791,7 +793,12 @@ def start_recording(
     status.start()
 
     # Heavy import — deferred here to keep `screencap --help` fast.
-    from screencap.engine import Recorder
+    # Function-local try/except preserves the headless-friendly fallback
+    # after the engine package's eager `Recorder` re-export was removed.
+    try:
+        from screencap.engine.recorder import Recorder
+    except ImportError:
+        Recorder = None
 
     if Recorder is None:
         status.stop()
@@ -941,12 +948,49 @@ def start_recording(
     # zero out each other's in-flight ack counts mid-poll.
     _engine_flush_lock = threading.Lock()
 
+    # ----- Network proxy capture (V1) — pre-flight + lock + config -----
+    _network_lock_handle = None
+    _network_config = None
+    _network_proxy_port: int | None = None
+    if network:
+        try:
+            from screencap.config import get_network_config
+            from screencap.network.lifecycle import (
+                acquire_network_lock,
+                preflight_or_raise,
+            )
+
+            _network_config = get_network_config()
+            # Acquire global single-instance lock BEFORE any user-facing
+            # prompt so concurrent --network starts race out cleanly.
+            _network_lock_handle = acquire_network_lock()
+            # Pre-flight: stale cleanup, mitmproxy import check, port
+            # auto-negotiation, networksetup callable, admin auth, CA
+            # verify+install, proxy dir setup. Any failure raises
+            # actionable; recording aborts cleanly.
+            _network_proxy_port = preflight_or_raise(
+                _network_config,
+                privacy_config,
+                recording_dir=capture_dir,
+            )
+        except Exception as exc:  # noqa: BLE001
+            console.print(f"[red]Error:[/red] {exc}")
+            if _network_lock_handle is not None:
+                _network_lock_handle.release()
+            raise SystemExit(1) from exc
+
     try:
         # Build Recorder kwargs, only passing non-None values
         recorder_kwargs: dict = {
             "task_description": desc,
             "capture_audio": audio,
         }
+        if network:
+            recorder_kwargs["network"] = True
+            recorder_kwargs["network_handoff_ready"] = network_handoff_ready
+            recorder_kwargs["network_config"] = _network_config
+            recorder_kwargs["privacy_config"] = privacy_config
+            recorder_kwargs["network_proxy_port"] = _network_proxy_port
         if capture_video is not None:
             recorder_kwargs["capture_video"] = capture_video
         else:
@@ -1452,6 +1496,16 @@ def start_recording(
         atexit.unregister(_cleanup_children)
         if not _skip_pidfile:
             delete_pidfile()
+
+        # Release the network single-instance flock if we acquired one.
+        # The OS would release it on process death anyway, but explicit
+        # release lets re-entrant in-process callers (rare in production
+        # but common in tests) re-acquire without a stale-fd dance.
+        if _network_lock_handle is not None:
+            try:
+                _network_lock_handle.release()
+            except Exception:  # noqa: BLE001
+                pass
 
         # Restore stderr fd if it wasn't restored earlier (e.g. exception
         # during Recorder.__enter__).
