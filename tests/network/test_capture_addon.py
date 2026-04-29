@@ -140,6 +140,9 @@ def _make_capture(
     mask_domains: set[str] | None = None,
     log_path: Path | None = None,
     qsize: int = 100,
+    dek: bytes | None = None,
+    capture_bodies_for: set[str] | None = None,
+    override_default_capture_bodies_for: bool = True,
 ) -> tuple[NetworkCapture, queue.Queue]:
     # Synchronous queue (queue.Queue) for tests - mp.Queue uses an async
     # feeder thread which causes flaky get_nowait reads in single-test
@@ -151,6 +154,10 @@ def _make_capture(
         proxy_port=8080,
         override_default_blocklist=True,  # tests opt out of curated list
         body_size_cap=body_size_cap,
+        capture_bodies_for=frozenset(capture_bodies_for or set()),
+        # Default True so V1.5 tests opt out of the curated allowlist;
+        # individual tests that need the curated list set this to False.
+        override_default_capture_bodies_for=override_default_capture_bodies_for,
     )
     pc = PrivacyConfig(
         mask_domains=frozenset(mask_domains or set()),
@@ -162,6 +169,7 @@ def _make_capture(
             network_config=nc,
             privacy_config=pc,
             log_path=log_path,
+            dek=dek,
         ),
         out_q,
     )
@@ -839,3 +847,407 @@ class TestRunning:
             capture._drop_burst_timer_handle.cancel()
 
         asyncio.run(_drive())
+
+
+# ---------------------------------------------------------------------------
+# V1.5 body capture (encryption)
+# ---------------------------------------------------------------------------
+
+
+class TestV15BodyCapture:
+    """Body-encryption hot path. The Unit 4 brief enumerates the scenarios
+    in /docs/tickets/medium-2026-04-27-feat-network-logging-v1.5-bodies.md.
+    """
+
+    _TEST_DEK = b"\x11" * 32  # deterministic 32-byte DEK for tests
+
+    def test_dek_none_keeps_v1_metadata_only(self):
+        # V1 caller (no DEK supplied). Even for an allowlisted host, the
+        # event must NOT carry body_ciphertext / body_nonce / body_aad.
+        capture, out_q = _make_capture(
+            dek=None,
+            capture_bodies_for={"example.com"},
+            override_default_capture_bodies_for=True,
+        )
+        body = b'{"hello":"world"}'
+        flow = FakeFlow(
+            request=FakeRequest(
+                method="POST",
+                host="example.com",
+                headers=FakeHeaders([("Content-Length", str(len(body)))]),
+                raw_content=body,
+                content=body,
+            ),
+            response=FakeResponse(
+                status_code=200,
+                headers=FakeHeaders([("Content-Length", "0")]),
+                raw_content=b"",
+                content=b"",
+            ),
+        )
+        capture.requestheaders(flow)
+        capture.request(flow)
+        capture.responseheaders(flow)
+        capture.response(flow)
+
+        events = _drain(out_q)
+        for e in events:
+            assert e.body_ciphertext is None
+            assert e.body_nonce is None
+            assert e.body_aad is None
+
+    def test_allowlisted_small_body_round_trips(self):
+        from screencap.network import crypto as _crypto
+
+        body = b'{"hello":"world"}'
+        capture, out_q = _make_capture(
+            dek=self._TEST_DEK,
+            capture_bodies_for={"example.com"},
+            override_default_capture_bodies_for=True,
+        )
+        flow = FakeFlow(
+            id="round-trip-flow",
+            request=FakeRequest(
+                method="POST",
+                url="https://example.com/api",
+                host="example.com",
+                headers=FakeHeaders([("Content-Length", str(len(body)))]),
+                raw_content=body,
+                content=body,
+            ),
+            response=FakeResponse(
+                status_code=200,
+                headers=FakeHeaders([("Content-Length", "0")]),
+                raw_content=b"",
+                content=b"",
+            ),
+        )
+        capture.requestheaders(flow)
+        capture.request(flow)
+        capture.responseheaders(flow)
+        capture.response(flow)
+
+        events = _drain(out_q)
+        req = next(e for e in events if isinstance(e, NetworkRequestEvent))
+
+        assert req.body_ciphertext is not None
+        assert req.body_nonce is not None and len(req.body_nonce) == 12
+        assert req.body_aad is not None
+        # body_size / body_sha256_hex on the WIRE bytes — unchanged from V1.
+        assert req.body_size == len(body)
+        assert req.body_sha256_hex == hashlib.sha256(body).hexdigest()
+
+        plaintext = _crypto.decrypt_body(
+            req.body_ciphertext, req.body_nonce, self._TEST_DEK, req.body_aad
+        )
+        assert plaintext == body
+
+    def test_host_not_in_allowlist_metadata_only(self):
+        body = b'{"some":"data"}'
+        capture, out_q = _make_capture(
+            dek=self._TEST_DEK,
+            capture_bodies_for={"example.com"},
+            override_default_capture_bodies_for=True,
+        )
+        flow = FakeFlow(
+            request=FakeRequest(
+                method="POST",
+                host="random.example.org",  # NOT in the allowlist
+                headers=FakeHeaders([("Content-Length", str(len(body)))]),
+                raw_content=body,
+                content=body,
+            ),
+            response=FakeResponse(
+                status_code=200,
+                headers=FakeHeaders([("Content-Length", "0")]),
+                raw_content=b"",
+                content=b"",
+            ),
+        )
+        capture.requestheaders(flow)
+        capture.request(flow)
+        capture.responseheaders(flow)
+        capture.response(flow)
+
+        events = _drain(out_q)
+        req = next(e for e in events if isinstance(e, NetworkRequestEvent))
+        assert req.body_ciphertext is None
+        assert req.body_nonce is None
+        assert req.body_aad is None
+        # Metadata is still emitted as in V1.
+        assert req.body_size == len(body)
+        assert req.body_sha256_hex == hashlib.sha256(body).hexdigest()
+
+    def test_blocklist_wins_over_allowlist(self):
+        # User added "chase.com" to BOTH capture_bodies_for AND mask_domains
+        # (or it's in DEFAULT_BLOCKLIST). Blocklist wins; the request is
+        # blocked entirely (no event at all), but if we also exclude the
+        # blocklist test scope by using mask_domains directly, requestheaders
+        # marks the flow blocked. Test the precedence at the
+        # is_host_in_capture_bodies_for layer: the body-capture predicate
+        # MUST return False even when both lists match.
+        body = b'{"sensitive":"data"}'
+        # mask_domains here covers "chase.com" — that's the user's privacy
+        # blocklist input. Same host is allowlisted but block wins.
+        capture, out_q = _make_capture(
+            dek=self._TEST_DEK,
+            capture_bodies_for={"chase.com"},
+            override_default_capture_bodies_for=True,
+            mask_domains={"chase.com"},
+        )
+        flow = FakeFlow(
+            request=FakeRequest(
+                method="POST",
+                host="chase.com",
+                headers=FakeHeaders([("Content-Length", str(len(body)))]),
+                raw_content=body,
+                content=body,
+            ),
+        )
+        capture.requestheaders(flow)
+        # Blocked at requestheaders → no event emitted at all.
+        capture.request(flow)
+
+        events = _drain(out_q)
+        # Either zero events (blocked entirely) or a metadata-only event
+        # without ciphertext. The contract is: ciphertext MUST NOT appear.
+        assert all(e.body_ciphertext is None for e in events)
+        assert all(e.body_nonce is None for e in events)
+        assert all(e.body_aad is None for e in events)
+
+    def test_decoded_body_over_cap_metadata_only(self):
+        # Compressed-bypass guard. Wire bytes pass the cap but decoded
+        # bytes blow past it: body MUST NOT be encrypted.
+        wire = b"\x1f\x8b" + b"\x00" * 5_000  # tiny gzip envelope
+        decoded = b"x" * 200_001  # 200 KB decoded body
+        capture, out_q = _make_capture(
+            dek=self._TEST_DEK,
+            capture_bodies_for={"example.com"},
+            override_default_capture_bodies_for=True,
+            body_size_cap=100_000,
+        )
+        flow = FakeFlow(
+            request=FakeRequest(
+                method="GET",
+                host="example.com",
+                headers=FakeHeaders(),
+                raw_content=b"",
+                content=b"",
+            ),
+            response=FakeResponse(
+                status_code=200,
+                headers=FakeHeaders(
+                    [
+                        ("Content-Encoding", "gzip"),
+                        ("Content-Length", str(len(wire))),
+                    ]
+                ),
+                raw_content=wire,
+                content=decoded,
+            ),
+        )
+        capture.requestheaders(flow)
+        capture.request(flow)
+        capture.responseheaders(flow)
+        capture.response(flow)
+
+        events = _drain(out_q)
+        resp = next(e for e in events if isinstance(e, NetworkResponseEvent))
+        # Wire body_size still populated — V1 invariant unchanged.
+        assert resp.body_size == len(wire)
+        assert resp.body_sha256_hex == hashlib.sha256(wire).hexdigest()
+        # Body NOT encrypted because decoded > cap.
+        assert resp.body_ciphertext is None
+        assert resp.body_nonce is None
+        assert resp.body_aad is None
+
+    def test_streaming_engaged_metadata_only(self):
+        # Streaming was used → wire bytes were chunk-hashed; we don't
+        # buffer to encrypt.
+        capture, out_q = _make_capture(
+            dek=self._TEST_DEK,
+            capture_bodies_for={"example.com"},
+            override_default_capture_bodies_for=True,
+            body_size_cap=100_000,
+        )
+        flow = FakeFlow(
+            id="streamed-flow",
+            request=FakeRequest(host="example.com", headers=FakeHeaders()),
+            response=FakeResponse(
+                status_code=200,
+                headers=FakeHeaders([("Content-Length", "100001")]),
+                raw_content=b"",
+                # decoded set, but the streaming-engaged check should
+                # short-circuit before we even look at decoded.
+                content=b"x" * 100,
+            ),
+        )
+        capture.requestheaders(flow)
+        capture.request(flow)
+        capture.responseheaders(flow)
+
+        # The transformer was installed by responseheaders().
+        assert callable(flow.response.stream)
+
+        # Drive the transformer end-to-end so stream_state has resp_sha.
+        chunk = b"abc" * 1000
+        flow.response.stream(chunk)
+        flow.response.stream(b"")  # terminal — finalizes hash
+        assert "resp_sha" in capture._stream_state[flow.id]
+
+        capture.response(flow)
+        events = _drain(out_q)
+        resp = next(e for e in events if isinstance(e, NetworkResponseEvent))
+        # Streaming sha applied; encryption NOT engaged.
+        assert resp.body_ciphertext is None
+        assert resp.body_nonce is None
+        assert resp.body_aad is None
+        assert resp.body_size == len(chunk)
+
+    def test_websocket_frame_encrypted_for_allowlisted_host(self):
+        from screencap.network import crypto as _crypto
+
+        capture, out_q = _make_capture(
+            dek=self._TEST_DEK,
+            capture_bodies_for={"example.com"},
+            override_default_capture_bodies_for=True,
+        )
+        payload = b"hello-ws"
+        flow = FakeFlow(
+            id="ws-flow-1",
+            request=FakeRequest(
+                method="GET",
+                url="ws://example.com/ws",
+                host="example.com",
+                headers=FakeHeaders([("Upgrade", "websocket")]),
+            ),
+            websocket=FakeWSData(
+                messages=[
+                    FakeWSMessage(
+                        content=payload, from_client=True, is_text=True
+                    )
+                ]
+            ),
+        )
+        capture.websocket_message(flow)
+
+        events = _drain(out_q)
+        frame = next(
+            e for e in events if isinstance(e, NetworkWebSocketFrameEvent)
+        )
+        assert frame.body_ciphertext is not None
+        assert frame.body_nonce is not None and len(frame.body_nonce) == 12
+        assert frame.body_aad is not None
+
+        plaintext = _crypto.decrypt_body(
+            frame.body_ciphertext,
+            frame.body_nonce,
+            self._TEST_DEK,
+            frame.body_aad,
+        )
+        assert plaintext == payload
+
+    def test_aad_consistency_with_event_fields(self):
+        # The AAD persisted on the event (body_aad) MUST equal the AAD
+        # reconstructed from (recording_id, flow_id, type, timestamp_ns)
+        # via crypto.aad_bytes — that's the "single source of truth"
+        # invariant the export-time scrubber relies on.
+        from screencap.engine.events import EventType
+        from screencap.network import crypto as _crypto
+
+        body = b"AAD-consistency-check-payload"
+        capture, out_q = _make_capture(
+            dek=self._TEST_DEK,
+            capture_bodies_for={"example.com"},
+            override_default_capture_bodies_for=True,
+        )
+        flow = FakeFlow(
+            id="aad-flow-007",
+            request=FakeRequest(
+                method="POST",
+                host="example.com",
+                headers=FakeHeaders([("Content-Length", str(len(body)))]),
+                raw_content=body,
+                content=body,
+            ),
+            response=FakeResponse(
+                status_code=200,
+                headers=FakeHeaders([("Content-Length", "0")]),
+                raw_content=b"",
+                content=b"",
+            ),
+        )
+        capture.requestheaders(flow)
+        capture.request(flow)
+        capture.responseheaders(flow)
+        capture.response(flow)
+
+        events = _drain(out_q)
+        req = next(e for e in events if isinstance(e, NetworkRequestEvent))
+
+        # Reconstruct AAD from the event's own fields. recording_id is
+        # 42 (from _make_capture) and the type is the request enum.
+        reconstructed = _crypto.aad_bytes(
+            recording_id=42,
+            flow_id=req.flow_id,
+            event_type=EventType.NETWORK_REQUEST.value,
+            ts_ns=req.timestamp_ns,
+        )
+        assert reconstructed == req.body_aad
+
+        # And the reconstructed AAD must decrypt the persisted ciphertext.
+        plaintext = _crypto.decrypt_body(
+            req.body_ciphertext, req.body_nonce, self._TEST_DEK, reconstructed
+        )
+        assert plaintext == body
+
+    def test_encrypt_failure_falls_through_to_metadata(
+        self, monkeypatch, tmp_path
+    ):
+        # Patch crypto.encrypt_body to raise — the addon MUST log the
+        # failure and emit a metadata-only event without crashing.
+        from screencap.network import capture_addon as _capture_addon_mod
+
+        def boom(*_args, **_kwargs):
+            raise RuntimeError("simulated encryption failure")
+
+        monkeypatch.setattr(
+            _capture_addon_mod._crypto, "encrypt_body", boom
+        )
+
+        log_path = tmp_path / "log.txt"
+        body = b'{"hello":"world"}'
+        capture, out_q = _make_capture(
+            dek=self._TEST_DEK,
+            capture_bodies_for={"example.com"},
+            override_default_capture_bodies_for=True,
+            log_path=log_path,
+        )
+        flow = FakeFlow(
+            id="boom-flow",
+            request=FakeRequest(
+                method="POST",
+                host="example.com",
+                headers=FakeHeaders([("Content-Length", str(len(body)))]),
+                raw_content=body,
+                content=body,
+            ),
+            response=FakeResponse(
+                status_code=200,
+                headers=FakeHeaders([("Content-Length", "0")]),
+                raw_content=b"",
+                content=b"",
+            ),
+        )
+        capture.requestheaders(flow)
+        capture.request(flow)  # MUST NOT raise
+        capture.responseheaders(flow)
+        capture.response(flow)
+
+        events = _drain(out_q)
+        req = next(e for e in events if isinstance(e, NetworkRequestEvent))
+        assert req.body_ciphertext is None
+        assert req.body_nonce is None
+        assert req.body_aad is None
+        # Failure logged.
+        assert "body-encrypt failed" in log_path.read_text()
