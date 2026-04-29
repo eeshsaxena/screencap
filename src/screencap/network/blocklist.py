@@ -140,11 +140,22 @@ def build_ignore_hosts_regex(
 
     Combines ``privacy_config.mask_domains`` ∪
     ``network_config.extra_blocklist`` ∪ (:data:`DEFAULT_BLOCKLIST`
-    unless overridden), produces a per-host suffix-anchored regex, and
-    appends IP-literal anchors. The regex matches any port (not just
-    443) so non-standard HTTPS deployments are also bypassed.
+    unless overridden), produces a per-host suffix-anchored regex.
+    The regex matches any port (not just 443) so non-standard HTTPS
+    deployments are also bypassed.
 
     Returned strings are intended for ``re.compile(..., re.IGNORECASE)``.
+
+    **No IP-literal anchors here.** mitmproxy's ``ignore_hosts`` matches
+    against ``server.peername`` (the resolved IP after DNS) AND
+    ``server.address`` (the original hostname). Including an IPv4 or
+    IPv6 anchor in this list causes EVERY connection to be tunneled --
+    every connection has a resolved peername, and a regex like
+    ``^\\d+\\.\\d+\\.\\d+\\.\\d+:\\d+$`` matches that peername. The
+    addon's :func:`is_host_blocked` first-check at ``request()`` time
+    is the right place to gate IP-literal CONNECTs (it sees the original
+    ``flow.request.host`` -- the literal IP only when the user typed
+    one, not the resolved IP for a hostname).
     """
     entries: set[str] = set()
     entries.update(privacy_config.mask_domains)
@@ -164,11 +175,5 @@ def build_ignore_hosts_regex(
         # at any port. \d+ keeps the regex flexible across non-443
         # deployments.
         patterns.append(rf"^(.+\.)?{escaped}:\d+$")
-
-    # IP-literal anchors are always active — even when the user opts
-    # out of DEFAULT_BLOCKLIST, we never proxy raw IPs (no SNI = no
-    # safe way to gate body capture).
-    patterns.append(r"^\d+\.\d+\.\d+\.\d+:\d+$")
-    patterns.append(r"^\[?[0-9a-f:]+\]?:\d+$")
 
     return patterns

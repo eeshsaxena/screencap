@@ -147,9 +147,31 @@ class TestBuildIgnoreHostsRegex:
         patterns = build_ignore_hosts_regex(_privacy(), net)
         for p in patterns:
             re.compile(p, re.IGNORECASE)
-        # IP-literal anchors always present.
-        assert any(r"\d+\.\d+\.\d+\.\d+" in p for p in patterns)
-        assert any("0-9a-f:" in p for p in patterns)
+        # No IP-literal anchors here -- mitmproxy matches ignore_hosts
+        # against the resolved peername (always an IP), so an IPv4
+        # anchor would tunnel every connection. IP-literal blocking
+        # lives in the addon's is_host_blocked first-check.
+        assert not any(r"\d+\.\d+\.\d+\.\d+" in p for p in patterns)
+        assert not any("0-9a-f:" in p for p in patterns)
+
+    def test_normal_host_does_not_match(self):
+        """Regression: regex must NOT match a normal hostname like google.com.
+
+        Combined with mitmproxy's behavior of also testing against the
+        resolved peername, ANY pattern that matches an IPv4-shaped string
+        causes universal passthrough. Test both the original hostname and
+        a representative resolved IP.
+        """
+        net = _network()  # use the default blocklist
+        patterns = build_ignore_hosts_regex(_privacy(), net)
+        for p in patterns:
+            assert not re.search(p, "google.com:443", re.IGNORECASE), (
+                f"pattern unexpectedly matches google.com:443: {p}"
+            )
+            assert not re.search(p, "142.250.190.46:443", re.IGNORECASE), (
+                f"pattern unexpectedly matches an IPv4 peername: {p} "
+                f"(would cause universal passthrough)"
+            )
 
     def test_chase_com_matches_with_subdomain(self):
         privacy = _privacy({"chase.com"})
@@ -168,15 +190,7 @@ class TestBuildIgnoreHostsRegex:
         net = _network(extra={"mycompany.com"}, override_default=True)
         patterns = build_ignore_hosts_regex(_privacy(), net)
         compiled = [re.compile(p, re.IGNORECASE) for p in patterns]
-
-        # A clearly unrelated host should not match any of the
-        # domain anchors. (IPs do match the IP-literal anchors,
-        # but `github.com:443` is not an IP.)
-        assert not any(
-            r.match("github.com:443") and "0-9a-f" not in r.pattern
-            and r"\d+\.\d+\.\d+\.\d+" not in r.pattern
-            for r in compiled
-        )
+        assert not any(r.match("github.com:443") for r in compiled)
 
     def test_override_default_drops_curated(self):
         net = _network(extra=set(), override_default=True)
@@ -184,15 +198,8 @@ class TestBuildIgnoreHostsRegex:
         # Curated entries should not appear as suffix anchors.
         assert not any("chase" in p for p in patterns)
         assert not any("stripe" in p for p in patterns)
-        # IP-literal anchors still present.
-        assert any(r"\d+\.\d+\.\d+\.\d+" in p for p in patterns)
-
-    def test_ip_literal_regex_matches(self):
-        net = _network(override_default=True)
-        patterns = build_ignore_hosts_regex(_privacy(), net)
-        compiled = [re.compile(p, re.IGNORECASE) for p in patterns]
-        assert any(r.match("192.168.1.1:443") for r in compiled)
-        assert any(r.match("[::1]:443") for r in compiled)
+        # And NO IP-literal anchors either (would universal-passthrough).
+        assert not any(r"\d+\.\d+\.\d+\.\d+" in p for p in patterns)
 
     def test_default_blocklist_contents_cover_critical_entries(self):
         # Spot-check a representative subset; the full inventory is in
