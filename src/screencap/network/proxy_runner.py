@@ -236,8 +236,12 @@ def run_proxy(
         loop = master_holder.get("loop")
         if master is None or loop is None:
             return
+        # mitmproxy 11.x's Master.shutdown is a SYNC function (sets an
+        # internal flag); calling it returns None, so
+        # asyncio.run_coroutine_threadsafe fails with "A coroutine object
+        # is required". Schedule the sync call on the loop thread instead.
         try:
-            asyncio.run_coroutine_threadsafe(master.shutdown(), loop)
+            loop.call_soon_threadsafe(master.shutdown)
         except Exception as exc:  # noqa: BLE001
             _emit_log(log_path, f"WARN: SIGTERM handler error: {exc!r}")
 
