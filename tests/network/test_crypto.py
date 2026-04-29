@@ -28,6 +28,7 @@ import pytest
 from cryptography.exceptions import InvalidTag
 from cryptography.hazmat.primitives.ciphers.aead import AESGCM
 
+from screencap.network import crypto
 from screencap.network.crypto import (
     DEK_WRAP_AAD,
     KEK_ACCOUNT,
@@ -44,6 +45,43 @@ from screencap.network.crypto import (
 # ---------------------------------------------------------------------------
 # get_or_create_kek
 # ---------------------------------------------------------------------------
+
+
+class TestGetKek:
+    """``get_kek`` is the read-only counterpart to ``get_or_create_kek``.
+    Export-time paths use this so a missing KEK surfaces as ``None``
+    rather than triggering silent re-creation. Critical for keeping
+    ``screencap network remove-kek`` sticky.
+    """
+
+    def test_returns_bytes_when_present(self):
+        existing = base64.b64encode(b"\xcd" * 32).decode("ascii")
+        with patch("keyring.get_password", return_value=existing) as mock_get:
+            kek = crypto.get_kek()
+        assert kek == b"\xcd" * 32
+        mock_get.assert_called_once_with(SERVICE, KEK_ACCOUNT)
+
+    def test_returns_none_when_missing(self):
+        with patch("keyring.get_password", return_value=None) as mock_get, \
+             patch("keyring.set_password") as mock_set:
+            kek = crypto.get_kek()
+        assert kek is None
+        mock_get.assert_called_once_with(SERVICE, KEK_ACCOUNT)
+        # The critical invariant: read-only — never writes a fresh KEK.
+        mock_set.assert_not_called()
+
+    def test_does_not_regenerate_after_remove_kek(self):
+        """Sequence: get_kek -> None (entry removed) -> caller's choice.
+        Calling get_kek a second time must STILL return None (no silent
+        regeneration). This is what makes `network remove-kek` sticky.
+        """
+        with patch("keyring.get_password", return_value=None), \
+             patch("keyring.set_password") as mock_set:
+            first = crypto.get_kek()
+            second = crypto.get_kek()
+        assert first is None
+        assert second is None
+        mock_set.assert_not_called()
 
 
 class TestGetOrCreateKek:

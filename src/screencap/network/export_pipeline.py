@@ -121,12 +121,26 @@ class NetworkScrubPipeline:
                 "(V1-vintage recording or non-network capture)"
             )
 
-        # KEK lookup -- may raise on Keychain access failure (user
-        # cancelled dialog, locked Keychain, no backend).
+        # KEK lookup is READ-ONLY at export time. ``get_kek()`` returns
+        # None when the Keychain entry is absent (e.g. the user ran
+        # ``screencap network remove-kek``); we surface that as
+        # KekUnavailableError rather than silently regenerating a fresh
+        # KEK -- which would then fail the unwrap with a confusing
+        # InvalidTag, AND make ``network remove-kek`` non-sticky.
         try:
-            kek = crypto.get_or_create_kek()
+            kek = crypto.get_kek()
         except Exception as exc:
             raise KekUnavailableError(f"KEK unavailable: {exc}") from exc
+        if kek is None:
+            raise KekUnavailableError(
+                f"KEK is not present in the Keychain "
+                f"(service={crypto.SERVICE!r}, account={crypto.KEK_ACCOUNT!r}). "
+                "If you removed it via `screencap network remove-kek`, "
+                "any prior encrypted recordings are now undecryptable. "
+                "Run `screencap network uninstall && screencap start "
+                "--network` to regenerate a fresh KEK; existing encrypted "
+                "bodies will be lost."
+            )
 
         # Unwrap the per-recording DEK once. ``InvalidTag`` here means
         # either the wrapped DEK is corrupt or the KEK has rotated and

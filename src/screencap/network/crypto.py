@@ -103,6 +103,35 @@ def _generate_kek() -> bytes:
 # ---------------------------------------------------------------------------
 
 
+def get_kek() -> bytes | None:
+    """Read-only KEK lookup. Returns ``None`` if no KEK is stored.
+
+    Use this from export-time paths (:class:`NetworkScrubPipeline`,
+    ``screencap export``) where a missing KEK means the recording is
+    undecryptable and the user should be told — never silently
+    re-create one. ``screencap network remove-kek`` relies on this
+    distinction to be sticky: with the read-only helper, a user who
+    explicitly removed the KEK does NOT get a fresh one regenerated
+    on the next ``screencap export``.
+
+    Capture-time paths (``screencap start --network`` pre-flight)
+    use :func:`get_or_create_kek` instead — they DO want first-run
+    creation behavior.
+
+    Raises:
+        keyring.errors.KeyringError: on Keychain access failure
+            (e.g. locked Keychain, no Keychain backend available).
+            User-cancelled prompts surface here too.
+    """
+    # Lazy import: see get_or_create_kek for rationale.
+    import keyring
+
+    stored = keyring.get_password(SERVICE, KEK_ACCOUNT)
+    if stored is None:
+        return None
+    return base64.b64decode(stored.encode("ascii"))
+
+
 def get_or_create_kek() -> bytes:
     """Return the long-lived 256-bit Key Encryption Key.
 
@@ -113,8 +142,12 @@ def get_or_create_kek() -> bytes:
     for it; subsequent calls read silently after the user clicks
     "Always Allow".
 
-    Subsequent calls read silently and decode the base64 form back to
-    the original 32 bytes.
+    **Use this from capture-time paths only** (``screencap start
+    --network`` pre-flight). Export-time paths must call :func:`get_kek`
+    instead — silently re-creating a missing KEK during export would
+    make ``screencap network remove-kek`` non-sticky and produce a
+    confusing "decryption failed" error after the wasted Keychain
+    write.
 
     Threat model: any same-user "Always Allow"-trusted binary can read
     the KEK silently. This is the V1.5 acceptance per the locked
@@ -139,9 +172,9 @@ def get_or_create_kek() -> bytes:
     # imports could block ``screencap --help``.
     import keyring
 
-    stored = keyring.get_password(SERVICE, KEK_ACCOUNT)
-    if stored is not None:
-        return base64.b64decode(stored.encode("ascii"))
+    existing = get_kek()
+    if existing is not None:
+        return existing
 
     # First call -- generate, persist, return.
     kek = _generate_kek()

@@ -315,6 +315,32 @@ class TestKekUnavailableAtConstruction:
             with pytest.raises(KekUnavailableError, match="DEK unwrap failed"):
                 NetworkScrubPipeline(db_path, recording_id)
 
+    def test_missing_kek_raises_without_regenerating(self, tmp_path):
+        """``get_kek`` returns None (entry removed by ``network remove-kek``)
+        → KekUnavailableError surfaces with the actionable message AND
+        ``keyring.set_password`` is never called.
+
+        This is the load-bearing test for the read-only export-time KEK
+        contract. With the prior ``get_or_create_kek`` semantics, a
+        missing entry would silently regenerate a fresh KEK, then the
+        unwrap would fail with InvalidTag (confusing) AND the user's
+        ``network remove-kek`` would be effectively reversed by the
+        next export attempt. The split into ``get_kek`` (read-only) +
+        ``get_or_create_kek`` (capture-time only) closes that gap.
+        """
+        db_path, recording_id, _kek, _dek = _setup_recording(tmp_path)
+
+        with (
+            patch("keyring.get_password", return_value=None),
+            patch("keyring.set_password") as mock_set,
+        ):
+            with pytest.raises(
+                KekUnavailableError,
+                match="not present in the Keychain",
+            ):
+                NetworkScrubPipeline(db_path, recording_id)
+            mock_set.assert_not_called()
+
 
 class TestMetaRowMissingRaises:
     def test_no_network_event_meta_row_raises_kek_unavailable(self, tmp_path):
