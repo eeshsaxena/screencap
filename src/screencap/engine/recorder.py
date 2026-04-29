@@ -2457,15 +2457,24 @@ def _setup_network_capture(
     flush_requested,
     flush_ack_counter,
     handoff_ready_event=None,
+    dek: bytes | None = None,
+    dek_wrapped: bytes | None = None,
+    dek_nonce: bytes | None = None,
 ) -> dict[str, Any]:
     """Set up the V1 network capture pipeline inside :func:`record`.
 
     Order of operations (load-bearing):
         1. Snapshot system proxy state to ``<capture_dir>/.proxy_state.json``
            AND a durable copy under ``~/.screencap/proxy/snapshots/``.
+        0.5. (V1.5 only) Persist the wrapped DEK to ``network_event_meta``
+           BEFORE the proxy spawns so any encrypted body event the addon
+           emits has a meta row to look up at export time. Skipped when
+           ``dek_wrapped`` is None (V1 / metadata-only callers).
         2. Spawn the network writer process consuming ``network_write_q``.
         3. Spawn the proxy ``mp.Process`` (mitmproxy DumpMaster + addon)
-           via ``multiprocessing.get_context("spawn")``.
+           via ``multiprocessing.get_context("spawn")``. The plaintext
+           ``dek`` is forwarded to ``run_proxy`` (V1.5); pickled across
+           the spawn boundary.
         4. Wait up to 10s on ``started_event``; abort + restore on timeout.
         5. Write the global sentinel + per-recording handoff atomically.
         6. Signal ``handoff_ready_event`` so SessionController's daemon
@@ -2581,6 +2590,23 @@ def _setup_network_capture(
         _net_proxy.write_snapshot(snapshot, durable_snapshot_path, extra=snapshot_extra)
         snapshots_written = True
 
+        # (0.5) V1.5 — persist the wrapped DEK before the proxy spawns
+        # so any encrypted body event the addon emits has a meta row to
+        # look up at export time. Skipped when dek_wrapped is None
+        # (V1 / metadata-only path; the meta row is irrelevant if no
+        # body bytes are ever encrypted).
+        if dek_wrapped is not None:
+            session = get_session_for_path(db_path)
+            try:
+                crud.insert_network_event_meta(
+                    session,
+                    recording_id=recording.id,
+                    dek_wrapped=dek_wrapped,
+                    dek_nonce=dek_nonce,
+                )
+            finally:
+                session.close()
+
         # (2) Network write queue + writer process.
         network_write_q = sq.SynchronizedQueue(maxsize=100)  # _META_QUEUE_SIZE
         writer_started = task_started_events.setdefault(
@@ -2622,6 +2648,7 @@ def _setup_network_capture(
                 proxy_log_path,
                 started_event,
                 confdir,
+                dek,
             ),
             name="network_proxy",
         )
@@ -2925,6 +2952,10 @@ def record(
     network_config: Any | None = None,
     privacy_config: Any | None = None,
     network_proxy_port: int | None = None,
+    # --- network body capture (V1.5) ---
+    dek: bytes | None = None,
+    dek_wrapped: bytes | None = None,
+    dek_nonce: bytes | None = None,
 ) -> None:
     """Record Screenshots/ActionEvents/WindowEvents.
 
@@ -2943,6 +2974,16 @@ def record(
             by the proxy ignore_hosts regex; other fields not used at proxy layer).
         network_proxy_port: Pre-flight-negotiated port; engine flips system
             proxy to point at this port after the listener is ready.
+        dek: V1.5 plaintext per-recording Data Encryption Key (32 bytes).
+            ``None`` (default) for V1 callers; the addon then emits
+            metadata-only events. When set, body bytes for hosts in the
+            effective allowlist are AES-256-GCM-encrypted with this key.
+        dek_wrapped: V1.5 KEK-wrapped DEK ciphertext (with GCM tag).
+            ``None`` for V1; when set, persisted to ``network_event_meta``
+            before the proxy spawns so export-time decryption can resolve
+            the DEK without re-reading the KEK.
+        dek_nonce: V1.5 12-byte AES-GCM nonce used to wrap ``dek``.
+            ``None`` for V1.
     """
     assert config.RECORD_VIDEO or config.RECORD_IMAGES, (
         config.RECORD_VIDEO,
@@ -3214,6 +3255,9 @@ def record(
                 flush_requested=flush_requested,
                 flush_ack_counter=flush_ack_counter,
                 handoff_ready_event=network_handoff_ready,
+                dek=dek,
+                dek_wrapped=dek_wrapped,
+                dek_nonce=dek_nonce,
             )
             network_write_q = _network_state["write_q"]
         except Exception as exc:  # noqa: BLE001 — abort recording cleanly on setup failure
@@ -3629,6 +3673,10 @@ class Recorder:
         network_config: Any | None = None,
         privacy_config: Any | None = None,
         network_proxy_port: int | None = None,
+        # --- Network body capture (V1.5) ---
+        dek: bytes | None = None,
+        dek_wrapped: bytes | None = None,
+        dek_nonce: bytes | None = None,
     ) -> None:
         from pathlib import Path
 
@@ -3643,6 +3691,14 @@ class Recorder:
         self._network_config = network_config
         self._privacy_config = privacy_config
         self._network_proxy_port = network_proxy_port
+        # V1.5 body-encryption material. None for V1 callers / no-network
+        # recordings; set by top-level start_recording when --network is
+        # active. dek plaintext is forwarded to the proxy mp.Process via
+        # the spawn pickler; dek_wrapped/dek_nonce are persisted into
+        # network_event_meta by _setup_network_capture.
+        self._dek = dek
+        self._dek_wrapped = dek_wrapped
+        self._dek_nonce = dek_nonce
 
         # Build recording config from constructor params
         self._recording_config = RecordingConfig(
@@ -3761,6 +3817,9 @@ class Recorder:
                 network_config=self._network_config,
                 privacy_config=self._privacy_config,
                 network_proxy_port=self._network_proxy_port,
+                dek=self._dek,
+                dek_wrapped=self._dek_wrapped,
+                dek_nonce=self._dek_nonce,
             )
 
     def _forward_fanout_msg(self, msg) -> None:
