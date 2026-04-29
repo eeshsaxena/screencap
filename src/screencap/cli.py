@@ -2517,6 +2517,38 @@ def _check_onnxruntime_excluded() -> tuple[str, bool, str]:
         return name, False, _tb.format_exc()
 
 
+def _check_keyring_macos_backend() -> tuple[str, bool, str]:
+    """Verify the macOS Keychain backend is importable + selected.
+
+    V1.5 stores the network-body KEK in the user's login keychain via
+    keyring. PyInstaller cannot trace `keyring.get_keyring()`'s string-
+    based backend lookup, so the spec adds `keyring.backends.macOS` as
+    an explicit hidden import. This check confirms the bundle picked it
+    up — the import is itself the test, plus a sanity check that the
+    runtime backend is not the in-memory fallback (which would silently
+    lose the KEK across recorder runs).
+    """
+    name = "keyring_macos_backend"
+    try:
+        import traceback as _tb
+        import keyring  # noqa: PLC0415
+        import keyring.backends.macOS  # noqa: PLC0415, F401
+        backend = keyring.get_keyring()
+        backend_name = type(backend).__name__
+        # On non-Darwin or in test environments the backend may not be
+        # the macOS one — but in a real frozen binary on macOS we expect
+        # `Keyring` from `keyring.backends.macOS`. Accept any non-fail
+        # backend; surface the name in the message for visibility.
+        if backend_name in ("fail", "Null"):
+            return name, False, (
+                f"keyring backend is {backend_name} (no usable backend); "
+                f"frozen binary failed to bundle keyring.backends.macOS"
+            )
+        return name, True, ""
+    except Exception:
+        return name, False, _tb.format_exc()
+
+
 @cli.group("network")
 def network_group() -> None:
     """Manage the network capture CA + recover from crashes."""
@@ -2573,6 +2605,7 @@ _SMOKE_CHECKS = [
     _check_sounddevice,
     _check_domain_index,
     _check_onnxruntime_excluded,
+    _check_keyring_macos_backend,
 ]
 
 
