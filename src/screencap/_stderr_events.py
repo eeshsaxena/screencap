@@ -8,12 +8,18 @@ events off the screencap subprocess's stderr to drive UI state transitions.
 The schema is the cross-language contract — see
 ``docs/research/2026-04-28-stderr-event-schema.md``.
 
-Events: started, lock_contended, chunk_finalized, recording_finalized,
-disk_full, permission_lost, stopped, menubar_neutralized_by_env
+Active events (emitted in v1):
+  started, lock_contended, recording_finalized, disk_full,
+  permission_lost, stopped, menubar_neutralized_by_env
+
+Reserved events (schema documented, NOT emitted in v1 — todo 004):
+  chunk_finalized — wiring deferred to a follow-up that touches
+  chunk_processor.py. SwiftUI consumers should treat absence as
+  informational, not authoritative; do not block on it.
 
 Exit codes (terminal exit_code on the ``stopped`` event matches the
 process exit code): 0=clean, 2=lock-held, 3=permission_lost, 4=disk_full,
-1=generic failure.
+5=user-initiated force-quit, 1=generic failure.
 """
 
 from __future__ import annotations

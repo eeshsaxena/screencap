@@ -73,6 +73,13 @@ class TestAppsJsonOutput:
         assert "apps" in payload
         assert len(payload["apps"]) == 6
 
+    def test_envelope_carries_ok_and_schema_version(self):
+        """Uniform JSON envelope (todo 020) — `ok` + `schema_version` lead."""
+        payload = json.loads(_invoke_apps_json().stdout.strip())
+        assert payload["ok"] is True
+        assert isinstance(payload["schema_version"], int)
+        assert payload["schema_version"] >= 1
+
     def test_each_app_has_required_fields(self):
         payload = json.loads(_invoke_apps_json().stdout.strip())
         for app in payload["apps"]:
@@ -161,16 +168,21 @@ class TestUserOverridesReflected:
 
 
 class TestErrorPath:
-    def test_discovery_error_returns_empty_list_with_diagnostic(self):
+    def test_discovery_error_exits_nonzero_and_emits_envelope(self):
+        """Error path exits 1 (todo 019) so agents that check exit code first
+        don't silently skip a discovery failure as if it were an empty result."""
         runner = CliRunner()
         with mock.patch(
             "screencap.app_discovery.discover_installed_apps",
             side_effect=FileNotFoundError("/Applications missing"),
         ):
             result = runner.invoke(cli, ["apps", "--json"], catch_exceptions=False)
-        assert result.exit_code == 0  # graceful degradation
+        assert result.exit_code == 1
         payload = json.loads(result.stdout.strip())
-        assert payload == {"apps": [], "error": "/Applications missing"}
+        assert payload["ok"] is False
+        assert payload["apps"] == []
+        assert payload["error"] == "/Applications missing"
+        assert payload["schema_version"] >= 1
 
 
 class TestSpotlightFlag:

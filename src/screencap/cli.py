@@ -24,6 +24,15 @@ def _stdin_is_tty() -> bool:
     return sys.stdin.isatty()
 
 
+# Per-endpoint schema versions for `--json` output. Independent from the
+# stderr-event schema (todo 009) so a future stderr-event change doesn't
+# silently bump the version SwiftUI reads from `status --json`, and a status
+# payload tweak can be signalled without disturbing the event stream.
+_STATUS_SCHEMA_VERSION = 1
+_APPS_SCHEMA_VERSION = 1
+_SETTINGS_PRIVACY_SCHEMA_VERSION = 1
+
+
 def _should_default_to_json() -> bool:
     """Default value for ``--json`` flags on read-only commands.
 
@@ -1300,11 +1309,19 @@ def apps(as_json, include_spotlight):
     try:
         installed = discover_installed_apps(use_spotlight=include_spotlight)
     except Exception as exc:
+        # Uniform JSON envelope (todo 020) + non-zero exit on JSON error
+        # (todo 019) — agents that check exit code first don't silently
+        # skip a discovery failure as if it were an empty result.
         if as_json:
-            sys.stdout.write(_json.dumps({"apps": [], "error": str(exc)}) + "\n")
+            sys.stdout.write(_json.dumps({
+                "ok": False,
+                "schema_version": _APPS_SCHEMA_VERSION,
+                "apps": [],
+                "error": str(exc),
+            }) + "\n")
             sys.stdout.flush()
-            return
-        err_console.print(f"[red]Error:[/red] {exc}")
+        else:
+            err_console.print(f"[red]Error:[/red] {exc}")
         raise SystemExit(1)
 
     rows = []
@@ -1340,7 +1357,11 @@ def apps(as_json, include_spotlight):
         })
 
     if as_json:
-        sys.stdout.write(_json.dumps({"apps": rows}) + "\n")
+        sys.stdout.write(_json.dumps({
+            "ok": True,
+            "schema_version": _APPS_SCHEMA_VERSION,
+            "apps": rows,
+        }) + "\n")
         sys.stdout.flush()
         return
 
@@ -1369,15 +1390,16 @@ def status(as_json):
     import time as _time
     from typing import TypedDict
 
-    from screencap._stderr_events import _EVENT_SCHEMA_VERSION
     from screencap.pidfile import LOCK_FILE, lock_is_active, read_lock_metadata
 
     class StatusPayload(TypedDict):
-        """Schema for `screencap status --json` output (todo 036).
+        """Schema for `screencap status --json` output.
 
         Symmetric: every key is always present so SwiftUI's parser doesn't
         need conditional unwraps. Unknown values are ``None`` / ``False``.
+        Uniform envelope (todo 020): `ok` + `schema_version` lead the payload.
         """
+        ok: bool
         schema_version: int
         is_recording: bool
         started_at: float | None
@@ -1395,7 +1417,10 @@ def status(as_json):
     metadata = read_lock_metadata()
 
     payload: StatusPayload = {
-        "schema_version": _EVENT_SCHEMA_VERSION,
+        "ok": True,
+        # Independent from stderr-event schema version (todo 009) — status
+        # payload evolves separately.
+        "schema_version": _STATUS_SCHEMA_VERSION,
         "is_recording": bool(is_recording),
         "started_at": None,
         "elapsed": None,
@@ -2535,23 +2560,35 @@ def _matrix_blocks_allow_for_class(ctx_class, configured_mode: str) -> "PrivacyA
 @click.argument("field")
 @click.argument("op", type=click.Choice(["add", "remove", "set"]))
 @click.argument("value")
-@click.option("--json", "as_json", is_flag=True, default=False,
-              help="Emit machine-readable JSON to stdout instead of prose to stderr.")
+@click.option("--json", "as_json", is_flag=True,
+              default=lambda: _should_default_to_json(),
+              help="Emit machine-readable JSON to stdout instead of prose to stderr. "
+                   "Auto-detected when stdout is not a TTY (todo 021).")
 def settings_privacy(field, op, value, as_json):
     """Mutate a [privacy] field in config.toml (Unit 4b).
+
+    \b
+    Valid FIELD names (todo 022):
+      list fields (add/remove): exclude_apps, allow_apps, mask_domains,
+                                mask_title_patterns
+      scalar fields (set):      mode (public|internal), setup_skipped (bool)
+      map fields (BUNDLE=CLASS): app_classes
 
     \b
     Examples:
       screencap settings privacy exclude_apps add com.example.foo
       screencap settings privacy allow_apps remove com.example.bar
       screencap settings privacy mode set internal
+      screencap settings privacy app_classes set com.example.foo=chat
 
     Writes through tomlkit so existing comments and key order are preserved
     (R16 invariant). Idempotent: add of an already-present value is a no-op,
     remove of an absent value is a no-op (both exit 0).
 
-    Validation: rejects writes that would bypass a matrix EXCLUDE (e.g.,
-    adding a password-manager bundle ID to allow_apps).
+    Validation (todo 022): rejects ``allow_apps add`` for any bundle ID whose
+    matrix action at the configured mode is EXCLUDE, MASK_WINDOW, or
+    TEXT_REDACT — not just EXCLUDE. Use ``screencap apps --json`` to check
+    ``resolved_action`` before attempting allow_apps add.
     """
     import json as _json
 
@@ -2565,9 +2602,18 @@ def settings_privacy(field, op, value, as_json):
     err_console = Console(stderr=True)
 
     def _result(ok: bool, *, exit_code: int = 0, **payload_fields):
-        """Emit the result and exit. Prose to stderr; JSON to stdout when --json."""
+        """Emit the result and exit. Prose to stderr; JSON to stdout when --json.
+
+        Uniform envelope (todo 020): every payload carries `ok` +
+        `schema_version` so a single SwiftUI / agent parser handles all
+        --json endpoints.
+        """
         if as_json:
-            payload = {"ok": ok, **payload_fields}
+            payload = {
+                "ok": ok,
+                "schema_version": _SETTINGS_PRIVACY_SCHEMA_VERSION,
+                **payload_fields,
+            }
             click.echo(_json.dumps(payload))
         # Prose was already printed via err_console at the call site (or the
         # success block at the end); nothing to do here for prose mode.

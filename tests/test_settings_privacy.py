@@ -298,13 +298,13 @@ class TestJsonOutput:
         )
         assert result.exit_code == 0
         payload = _last_json_line(result.output)
-        assert payload == {
-            "ok": True,
-            "changed": True,
-            "field": "exclude_apps",
-            "op": "add",
-            "value": "com.example.json_test",
-        }
+        # Uniform envelope (todo 020): ok + schema_version lead, then payload.
+        assert payload["ok"] is True
+        assert payload["schema_version"] >= 1
+        assert payload["changed"] is True
+        assert payload["field"] == "exclude_apps"
+        assert payload["op"] == "add"
+        assert payload["value"] == "com.example.json_test"
 
     def test_idempotent_noop_emits_changed_false(self):
         _invoke("exclude_apps", "add", "com.example.dup")

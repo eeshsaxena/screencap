@@ -180,11 +180,15 @@ def _pid_exists(pid: int) -> bool:
         return False
 
 
-def claim_lock(capture_dir: Path | str, claimant: str = "cli") -> int:
+def claim_lock(capture_dir: Path | str | None, claimant: str = "cli") -> int:
     """Acquire an exclusive flock on LOCK_FILE; write JSON metadata into it.
 
     Args:
-        capture_dir: Recording directory (informational; written into the lock).
+        capture_dir: Per-recording directory if known (legacy single-shot
+            ``screencap start`` knows it at this point). ``None`` when called
+            from SessionController init — the per-recording dir is allocated
+            later and plumbed in via :func:`update_lock_metadata` (todo 014).
+            Persisted as ``null`` in the JSON when ``None``.
         claimant: "cli" for standalone invocations, "swiftui" when spawned by
             the SwiftUI app (via ``SCREENCAP_PARENT=swiftui``).
 
@@ -226,7 +230,7 @@ def claim_lock(capture_dir: Path | str, claimant: str = "cli") -> int:
         metadata = {
             "pid": os.getpid(),
             "started_at": time.time(),
-            "capture_dir": str(capture_dir),
+            "capture_dir": str(capture_dir) if capture_dir is not None else None,
             "claimant": claimant,
         }
         payload = json.dumps(metadata).encode()
@@ -243,6 +247,36 @@ def claim_lock(capture_dir: Path | str, claimant: str = "cli") -> int:
 
     _LOCKED_FD = fd
     return fd
+
+
+def update_lock_metadata(capture_dir: Path | str) -> bool:
+    """Update the held lock file's ``capture_dir`` field in place (todo 014).
+
+    Called from ``SessionController._on_start_click`` once the per-recording
+    directory is allocated, so ``screencap status --json`` (and any consumer
+    reading the lock metadata) reflects the live recording's path instead of
+    the placeholder ``null`` written by ``claim_lock``.
+
+    Returns ``True`` on success, ``False`` if the process doesn't currently
+    hold the lock (no-op so callers don't need to track state).
+    """
+    global _LOCKED_FD
+    if _LOCKED_FD is None:
+        return False
+    try:
+        # Re-read the metadata so we don't lose the pid/started_at/claimant
+        # written at claim time. The file is held by our own flock, so a
+        # racing read-modify-write is impossible from another process.
+        existing = read_lock_metadata() or {}
+        existing["capture_dir"] = str(capture_dir)
+        payload = json.dumps(existing).encode()
+        os.ftruncate(_LOCKED_FD, 0)
+        os.lseek(_LOCKED_FD, 0, os.SEEK_SET)
+        os.write(_LOCKED_FD, payload)
+        os.fsync(_LOCKED_FD)
+        return True
+    except OSError:
+        return False
 
 
 def release_lock() -> None:

@@ -67,6 +67,42 @@ class TestClaimLock:
     def test_release_when_not_held_is_noop(self):
         pidfile.release_lock()  # must not raise
 
+    def test_claim_lock_accepts_none_capture_dir(self, tmp_path):
+        """Post-todo-014: SessionController claims with capture_dir=None at
+        controller-init time (the per-recording dir isn't allocated yet);
+        update_lock_metadata() plumbs the real dir in later. Lock metadata
+        must persist `capture_dir: null`, not the cwd or the literal string
+        \"None\"."""
+        pidfile.claim_lock(None, claimant="swiftui")
+        meta = pidfile.read_lock_metadata()
+        assert meta is not None
+        assert meta["capture_dir"] is None
+        assert meta["claimant"] == "swiftui"
+
+    def test_update_lock_metadata_writes_per_recording_dir(self, tmp_path):
+        """update_lock_metadata replaces the placeholder capture_dir with the
+        per-recording directory once allocated, without disturbing the other
+        metadata fields (pid / started_at / claimant)."""
+        pidfile.claim_lock(None, claimant="swiftui")
+        meta_before = pidfile.read_lock_metadata()
+        assert meta_before["capture_dir"] is None
+
+        rec_dir = tmp_path / "rec-1"
+        ok = pidfile.update_lock_metadata(rec_dir)
+        assert ok is True
+
+        meta_after = pidfile.read_lock_metadata()
+        assert meta_after["capture_dir"] == str(rec_dir)
+        # Other metadata preserved.
+        assert meta_after["pid"] == meta_before["pid"]
+        assert meta_after["started_at"] == meta_before["started_at"]
+        assert meta_after["claimant"] == "swiftui"
+
+    def test_update_lock_metadata_returns_false_when_not_held(self):
+        """No lock held → update is a safe no-op returning False (callers
+        don't need to track held-state)."""
+        assert pidfile.update_lock_metadata("/tmp/whatever") is False
+
 
 class TestReadLockMetadata:
     def test_missing_file_returns_none(self):

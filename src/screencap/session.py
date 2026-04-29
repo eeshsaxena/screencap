@@ -489,12 +489,16 @@ class SessionController:
         # by virtue of being children. Lock auto-releases on death even if
         # explicit cleanup is missed.
         from screencap._stderr_events import emit_event as _emit_event, resolve_claimant
-        from screencap.config import get_recordings_dir
         from screencap.pidfile import LockContended, claim_lock
 
         claimant = resolve_claimant()
         try:
-            claim_lock(Path("."), claimant=claimant)
+            # capture_dir=None: at controller-init time the per-recording dir
+            # isn't allocated yet. Lock metadata's ``capture_dir`` stays null
+            # until ``_on_start_click`` runs and calls ``update_lock_metadata``
+            # (todo 014). Avoids the previous bug where the cwd / recordings-root
+            # leaked into status output as if it were the per-recording path.
+            claim_lock(None, claimant=claimant)
         except LockContended as exc:
             # Lifecycle events go on stderr (not stdout). SwiftUI's
             # RecorderController parses these as the canonical contract; stdout
@@ -505,19 +509,16 @@ class SessionController:
                 pass
             raise SystemExit(2) from None
         # OSError / PermissionError from flock or metadata-write must NOT be
-        # swallowed (todo 014) — running without the mutex risks two concurrent
+        # swallowed — running without the mutex risks two concurrent
         # recorders. Let them propagate to the cli.py exit handler.
 
-        # Unit 8a: emit the `started` lifecycle event for SwiftUI.
-        # capture_dir is the recordings ROOT dir at this point — the per-
-        # recording capture_dir is allocated later in `_on_start_click` and
-        # is not knowable here.
+        # Unit 8a: emit the `started` lifecycle event for SwiftUI. Carries
+        # only the claimant. The per-recording capture_dir is delivered
+        # later via ``recording_finalized.name`` (todo 010); SwiftUI consumers
+        # construct paths via ``screencap list --json`` or by polling
+        # ``screencap status --json`` once a recording is active.
         try:
-            _emit_event(
-                "started",
-                capture_dir=str(get_recordings_dir()),
-                claimant=claimant,
-            )
+            _emit_event("started", claimant=claimant)
         except Exception:
             pass
 
@@ -749,6 +750,16 @@ class SessionController:
         self._started_any = True
 
         name, capture_dir = self._allocate_capture_dir(base_name)
+
+        # Plumb the per-recording dir into lock metadata so `screencap status
+        # --json` reports the live recording's path (todo 014). Best-effort:
+        # if we don't currently hold the lock (shouldn't happen — we acquired
+        # at __init__), log and continue.
+        try:
+            from screencap.pidfile import update_lock_metadata
+            update_lock_metadata(capture_dir)
+        except Exception:
+            pass
 
         queues = _RWQueues(
             window_feed_q=multiprocessing.Queue(),

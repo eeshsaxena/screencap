@@ -98,32 +98,25 @@ class TestEventSchemas:
         assert isinstance(evt["capture_dir"], str)
         assert evt["claimant"] in ("cli", "swiftui")
 
-    def test_started_capture_dir_points_at_recordings_root(self, tmp_path, monkeypatch):
-        """Semantic check (todo 039): the `capture_dir` in the `started` event
-        must point at the recordings ROOT dir as resolved by
-        `screencap.config.get_recordings_dir()` — not the controller's cwd.
-        Replaces the previous `isinstance(str)` test that allowed the bug at
-        session.py:491 to ship undetected."""
-        recordings_dir = tmp_path / "fake-screencap" / "recordings"
-        recordings_dir.mkdir(parents=True)
-        monkeypatch.setenv("SCREENCAP_RECORDINGS_DIR", str(recordings_dir))
-
-        # Build the started-event payload via the same path SessionController
-        # uses (resolve_claimant + get_recordings_dir) — pinned so a future
-        # regression to Path('.').resolve() fails the test.
+    def test_started_does_not_carry_capture_dir(self):
+        """Post-todo-010: `started` no longer carries `capture_dir`. The
+        per-recording dir isn't allocated until `_on_start_click` runs, so
+        emitting any path here would mislead SwiftUI consumers into
+        building wrong viewer URLs. Consumers learn the per-recording path
+        from `recording_finalized.name` + `screencap status --json`."""
         from screencap._stderr_events import emit_event, resolve_claimant
-        from screencap.config import get_recordings_dir, invalidate_config_cache
 
-        invalidate_config_cache()
         out = _capture_stderr(lambda: emit_event(
             "started",
-            capture_dir=str(get_recordings_dir()),
             claimant=resolve_claimant(),
         ))
         evt = _parse_lines(out)[0]
-        assert evt["capture_dir"] == str(recordings_dir), (
-            f"capture_dir should be the recordings root, got {evt['capture_dir']!r}"
+        assert evt["type"] == "started"
+        assert "capture_dir" not in evt, (
+            f"`started` event must not carry capture_dir (todo 010), got {evt!r}"
         )
+        # claimant remains the canonical identity field on this event.
+        assert evt["claimant"] in ("cli", "swiftui")
 
     def test_recording_finalized_schema(self):
         from screencap.cli import _emit_event
@@ -156,19 +149,29 @@ class TestEventSchemas:
         assert evt["capture_dir"] == "/tmp/rec-x"
 
     def test_permission_lost_schema(self):
+        """Pin the contract against what production actually emits (todo 005).
+
+        Production at `recorder.py:_check_permissions_now` emits one of
+        `screen_recording`, `accessibility`, `input_monitoring` with no
+        `since_frame` field. The previous test asserted `microphone` (never
+        emitted) and `since_frame` (never sent), which was false coverage —
+        SwiftUI's parser would only fail on the first real revocation.
+        """
         from screencap.cli import _emit_event
 
         out = _capture_stderr(lambda: _emit_event(
             "permission_lost",
             permission="screen_recording",
-            since_frame=42,
             elapsed=10.5,
         ))
         evt = _parse_lines(out)[0]
         assert evt["type"] == "permission_lost"
-        assert evt["permission"] in ("screen_recording", "accessibility", "microphone")
-        assert isinstance(evt["since_frame"], int)
+        # Reserved values: `microphone` is documented in the schema doc but
+        # not emitted in v1; production-emittable values are the three below.
+        assert evt["permission"] in ("screen_recording", "accessibility", "input_monitoring")
         assert isinstance(evt["elapsed"], float)
+        # `since_frame` is reserved (schema-doc) but not currently emitted —
+        # do not assert on it.
 
     def test_stopped_schema(self):
         from screencap.cli import _emit_event
@@ -178,8 +181,12 @@ class TestEventSchemas:
         assert evt["type"] == "stopped"
         assert evt["exit_code"] == 0
 
-    def test_chunk_finalized_reserved_schema(self):
-        """Schema is reserved for future chunk_processor wiring (Unit 8a doc)."""
+    def test_chunk_finalized_reserved_schema_serializes(self):
+        """Schema reserved post-v1 (todo 004): the helper still serializes
+        the documented payload for any future emission, but no production
+        site fires this event in v1. Module docstring + schema doc both
+        flag it as reserved — SwiftUI consumers should treat absence as
+        informational, not authoritative."""
         from screencap.cli import _emit_event
 
         out = _capture_stderr(lambda: _emit_event(
@@ -191,6 +198,24 @@ class TestEventSchemas:
         assert evt["type"] == "chunk_finalized"
         assert isinstance(evt["chunk_index"], int)
         assert isinstance(evt["path"], str)
+
+    def test_chunk_finalized_not_emitted_in_production(self):
+        """Sanity guard: no source file under src/screencap/ calls
+        emit_event("chunk_finalized", ...) in v1. This will fail loud if
+        someone wires emission without also updating todo 004's deferral
+        notes in the module docstring + schema doc."""
+        from pathlib import Path
+
+        src_dir = Path(__file__).parent.parent / "src" / "screencap"
+        offenders = []
+        for py_file in src_dir.rglob("*.py"):
+            text = py_file.read_text()
+            if 'emit_event("chunk_finalized"' in text or "emit_event('chunk_finalized'" in text:
+                offenders.append(str(py_file.relative_to(src_dir)))
+        assert offenders == [], (
+            f"chunk_finalized is reserved post-v1 (todo 004) but emitted from: {offenders}. "
+            "Update the module docstring + schema doc to mark it active before wiring."
+        )
 
 
 class TestStreamSeparation:

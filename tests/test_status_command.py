@@ -62,6 +62,7 @@ class TestStatusJson:
         result = _run_status_json()
         assert result.exit_code == 0
         payload = json.loads(result.output.strip())
+        assert payload["ok"] is True  # uniform envelope (todo 020)
         assert payload["is_recording"] is False
         # Symmetric payload (todo 026): keys are always present, with None when
         # the recording-state info isn't applicable.
@@ -69,6 +70,8 @@ class TestStatusJson:
         assert payload["started_at"] is None
         assert payload["capture_dir"] is None
         assert payload["claimant"] is None
+        # Per-endpoint schema version (todo 009) — independent from stderr-event
+        # schema; do not couple them.
         assert payload["schema_version"] == 1
 
     def test_active_lock_returns_recording_metadata(self, tmp_path):
