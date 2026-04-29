@@ -28,6 +28,9 @@ dependencies = [
     # mitmproxy 11.1+ and 12.x require Python >=3.12; only 11.0.x supports
     # the project's Python 3.10 floor. Revisit if we bump min Python.
     "mitmproxy>=11.0,<11.1",
+    # V1.5 body-encryption KEK lives in macOS Keychain via the keyring
+    # backend. ``keyring.backends.macOS`` ships with the keyring distro.
+    "keyring>=24",
 ]
 
 [project.optional-dependencies]
