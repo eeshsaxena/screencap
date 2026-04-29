@@ -2,8 +2,25 @@
 
 from __future__ import annotations
 
+import contextlib
 import json
+import logging
+import os
 import sys
+
+# Line-buffered stderr is part of the SwiftUI cross-language event contract
+# (todo 012). PyInstaller-frozen binaries don't always honour
+# `sys.stderr.flush()` alone — the env var propagates to all spawn workers
+# and child processes via inheritance, so the recorder's hot loop and any
+# subprocess (chunk_processor, scrub_worker) emit events line-by-line as
+# SwiftUI's RecorderController.spawn expects. Set BEFORE any import that
+# might cache buffering state.
+#
+# Force-set rather than `setdefault`: a stale `PYTHONUNBUFFERED=0` from a
+# parent shell or launchd plist would otherwise leave stderr block-buffered
+# and the SwiftUI line-reader would stall waiting for `started` until the
+# pipe buffer fills. Line-buffered stderr is non-negotiable on this CLI.
+os.environ["PYTHONUNBUFFERED"] = "1"
 
 import click
 from dotenv import load_dotenv
@@ -15,11 +32,34 @@ from rich.table import Table
 from screencap import __version__
 
 console = Console()
+logger = logging.getLogger(__name__)
 
 
 def _stdin_is_tty() -> bool:
     """Check if stdin is a real TTY (not piped or redirected)."""
     return sys.stdin.isatty()
+
+
+# Per-endpoint schema versions for `--json` output. Independent from the
+# stderr-event schema (todo 009) so a future stderr-event change doesn't
+# silently bump the version SwiftUI reads from `status --json`, and a status
+# payload tweak can be signalled without disturbing the event stream.
+_STATUS_SCHEMA_VERSION = 1
+_APPS_SCHEMA_VERSION = 2
+_SETTINGS_PRIVACY_SCHEMA_VERSION = 2
+_SETTINGS_SCHEMA_VERSION = 1
+_STOP_SCHEMA_VERSION = 1
+
+
+def _should_default_to_json() -> bool:
+    """Default value for ``--json`` flags on read-only commands.
+
+    True when stdout is NOT a TTY — i.e., output is being piped to a file
+    or another command. Auto-detection eliminates a footgun where an agent
+    forgets the flag and parses Rich-formatted output (todo 038). Tests can
+    monkey-patch this helper to override the auto-detect.
+    """
+    return not sys.stdout.isatty()
 
 
 _RECORD_EXTRAS_MSG = (
@@ -83,6 +123,34 @@ def _download_nlp_models() -> None:
     _do_download()
 
 
+# ---------------------------------------------------------------------------
+# Unit 8a: structured stderr event contract
+# ---------------------------------------------------------------------------
+#
+# SwiftUI's RecorderController.spawn parses these line-buffered JSON events
+# off the screencap subprocess's stderr to drive UI state transitions. Schema
+# is the cross-language contract — see
+# docs/research/2026-04-28-stderr-event-schema.md.
+#
+# Events: started, chunk_finalized, recording_finalized, disk_full,
+#         permission_lost, stopped
+# Exit codes: 0=clean, 2=lock-held (Unit 3), 3=permission_lost (Unit 8),
+#             4=disk_full
+#
+# ``permission_lost`` is emitted from src/screencap/recorder.py (Unit 8).
+# ``chunk_finalized`` is emitted from src/screencap/session.py.
+# ``disk_full`` is emitted from src/screencap/session.py (DiskFullError catch).
+# All other events are emitted from the screencap start command flow below.
+
+# `_emit_event` lives in the stdlib-only `screencap._stderr_events` module so
+# spawn workers and the recording hot loop can import it without dragging
+# Click + rich Console into the child process.
+from screencap._stderr_events import (  # noqa: E402
+    EVENT_STOPPED,
+    emit_event as _emit_event,
+)
+
+
 def _maybe_download_nlp_models() -> None:
     """Prompt to download GLiNER + spaCy models if not already cached."""
     from screencap.privacy import are_nlp_models_cached
@@ -102,6 +170,107 @@ def _maybe_download_nlp_models() -> None:
         )
 
 
+_MATRIX_ACK_KEY = "matrix_acknowledged_v2026_04"
+
+
+def _config_lock_path():
+    """Return the path of the advisory config lock (sibling of recording.lock).
+
+    Lazy resolution so test fixtures that monkey-patch ``_DEFAULT_BASE``
+    pick up the right path each call.
+    """
+    from screencap.config import _DEFAULT_BASE
+    return _DEFAULT_BASE / "run" / "config.lock"
+
+
+_PRIVACY_CONFIG_FLOCK_TIMEOUT_S = 5.0
+
+
+class PrivacyConfigLockTimeout(RuntimeError):
+    """Raised when the advisory flock on config.lock can't be acquired in
+    ``_PRIVACY_CONFIG_FLOCK_TIMEOUT_S``. Surfaces a stuck holder (e.g., a
+    crashed peer on NFS / sshfs) so ``screencap start`` and
+    ``screencap settings privacy`` fail fast instead of hanging."""
+
+
+@contextlib.contextmanager
+def _privacy_config_writer():
+    """Read-modify-write the privacy config under an advisory flock (todo 025).
+
+    Holds an exclusive flock on ``~/.screencap/run/config.lock`` for the
+    duration of the read → mutate → save cycle. Without this, two concurrent
+    ``screencap settings privacy`` invocations race on read-modify-write and
+    silently drop one of the writes (todo 015). ``_save_config_atomic``
+    provides write-atomicity, not lost-update protection — the flock does.
+
+    The acquire is non-blocking with a bounded retry loop (todo 006). A
+    blocking ``flock(LOCK_EX)`` could hang ``screencap start`` indefinitely
+    if a stale holder kept the lock — Python's ``fcntl.flock`` only raises
+    on signal interruption. We poll every 100ms up to
+    ``_PRIVACY_CONFIG_FLOCK_TIMEOUT_S``; on timeout we raise
+    ``PrivacyConfigLockTimeout`` so the caller can surface a clear error
+    rather than stalling silently.
+
+    Yields the tomlkit doc. The caller mutates in-place; on context exit
+    (without exception) the doc is atomically saved and the config cache is
+    invalidated. On exception the file is left untouched.
+    """
+    import fcntl as _fcntl
+    import time as _time
+
+    from screencap.config import _CONFIG_PATH, invalidate_config_cache
+    from screencap.setup_wizard import _load_config_toml, _save_config_atomic
+
+    lock_path = _config_lock_path()
+    lock_path.parent.mkdir(parents=True, exist_ok=True)
+    fd = os.open(str(lock_path), os.O_RDWR | os.O_CREAT, 0o600)
+    try:
+        deadline = _time.monotonic() + _PRIVACY_CONFIG_FLOCK_TIMEOUT_S
+        while True:
+            try:
+                _fcntl.flock(fd, _fcntl.LOCK_EX | _fcntl.LOCK_NB)
+                break
+            except BlockingIOError:
+                if _time.monotonic() >= deadline:
+                    raise PrivacyConfigLockTimeout(
+                        f"Could not acquire {lock_path} within "
+                        f"{_PRIVACY_CONFIG_FLOCK_TIMEOUT_S:.0f}s — another "
+                        f"screencap process may be holding the lock or have "
+                        f"exited without releasing it. Re-run after the other "
+                        f"process completes, or remove {lock_path} if no "
+                        f"screencap process is active."
+                    )
+                _time.sleep(0.1)
+        doc = _load_config_toml(_CONFIG_PATH)
+        yield doc
+        # Only reached on the no-exception path.
+        _save_config_atomic(_CONFIG_PATH, doc)
+        invalidate_config_cache()
+    finally:
+        try:
+            _fcntl.flock(fd, _fcntl.LOCK_UN)
+        except OSError:
+            pass
+        try:
+            os.close(fd)
+        except OSError:
+            pass
+
+
+def _write_privacy_flag(key: str, value: object) -> None:
+    """Write a single [privacy] scalar via tomlkit, preserving comments and order.
+
+    Used by the matrix-acknowledgement flow and by setup-skip — both need to
+    set a single bool without disturbing other [privacy] keys (R16 invariant).
+    """
+    import tomlkit
+
+    with _privacy_config_writer() as doc:
+        if "privacy" not in doc:
+            doc.add("privacy", tomlkit.table())
+        doc["privacy"][key] = value
+
+
 def _maybe_prompt_privacy_setup(*, cloud_intent: bool = False) -> None:
     """Prompt for privacy setup on first run if [privacy] section is missing."""
     import sys as _sys  # use real sys, not the module-level reference
@@ -111,18 +280,19 @@ def _maybe_prompt_privacy_setup(*, cloud_intent: bool = False) -> None:
 
     from screencap.config import _CONFIG_PATH, _load_toml
 
-    if not _CONFIG_PATH.exists():
-        # No config file at all — still prompt
-        pass
-    else:
+    is_new_user = True
+    if _CONFIG_PATH.exists():
         cfg = _load_toml()
         privacy_section = cfg.get("privacy")
         if privacy_section is not None:
             # Has a [privacy] section — check if NLP models need downloading.
             # Skip for cloud-intent: the cloud gate handles model download.
+            is_new_user = False
             if not cloud_intent:
                 _maybe_download_nlp_models()
-            return
+
+    if not is_new_user:
+        return
 
     console.print(
         "\n[bold]Privacy setup not configured.[/bold] "
@@ -132,21 +302,143 @@ def _maybe_prompt_privacy_setup(*, cloud_intent: bool = False) -> None:
         from screencap.setup_wizard import run_setup_wizard
         run_setup_wizard()
     else:
-        # Write setup_skipped flag to prevent re-prompting
-        import tomlkit
-        from screencap.config import invalidate_config_cache
-        from screencap.setup_wizard import _load_config_toml, _save_config_atomic
-
-        doc = _load_config_toml(_CONFIG_PATH)
-        if "privacy" not in doc:
-            doc.add("privacy", tomlkit.table())
-        doc["privacy"]["setup_skipped"] = True
-        _save_config_atomic(_CONFIG_PATH, doc)
-        invalidate_config_cache()
+        _write_privacy_flag("setup_skipped", True)
         console.print(
             "[dim]Skipped. Recordings will stay local with default privacy settings. "
             "Run 'screencap setup' anytime.[/dim]"
         )
+
+    # New-user path always pre-acknowledges the matrix correction so the
+    # migration prompt never fires for someone who has only ever seen the
+    # corrected matrix (Unit 7a release sequencing).
+    try:
+        _write_privacy_flag(_MATRIX_ACK_KEY, True)
+    except Exception:
+        # Log at debug — disk full / permission denied here makes the prompt
+        # fire on every subsequent start, so a quiet diagnostic helps debug
+        # "why does the prompt keep appearing" without affecting UX (todo 031).
+        logger.debug("Failed to pre-set matrix ack flag", exc_info=True)
+
+
+def _maybe_prompt_matrix_acknowledgement() -> None:
+    """One-time on-upgrade acknowledgement of the privacy matrix correction.
+
+    The Unit 7a matrix change tightens CHAT/EMAIL/CALENDAR/VIDEO_CALL under
+    ``mode = internal`` from TEXT_REDACT to MASK_WINDOW. Existing CLI users
+    who relied on text-redacted transcripts of conversation apps will see a
+    real workflow change (video frames blocked, keystrokes nulled, screenshots
+    full-window-blurred). This prints a one-line note + 5-second prompt the
+    first time after upgrade so they aren't surprised. The flag is written
+    regardless of the user's keystroke; recording continues either way.
+
+    Skipped silently when:
+      - flag already set (acknowledged on a prior run, or pre-set for new users)
+      - mode is not ``internal`` (matrix change doesn't apply)
+      - stdin is not a TTY (non-interactive — e.g., SwiftUI subprocess)
+      - ``SCREENCAP_MATRIX_ACK=true`` (SwiftUI sets this; the flag still gets
+        written so future invocations don't re-check)
+    """
+    import sys as _sys
+
+    from screencap.config import _CONFIG_PATH, _load_toml
+    from screencap.privacy.policy import PrivacyMode
+
+    if not _CONFIG_PATH.exists():
+        return
+    cfg = _load_toml()
+    privacy_section = cfg.get("privacy") or {}
+    if privacy_section.get(_MATRIX_ACK_KEY):
+        return
+
+    mode_str = (privacy_section.get("mode") or "internal").lower()
+    try:
+        mode = PrivacyMode(mode_str)
+    except ValueError:
+        return
+    if mode is not PrivacyMode.INTERNAL:
+        # Matrix change doesn't affect non-internal modes for chat/email/cal/vc.
+        return
+
+    import os as _os
+    env_ack = _os.environ.get("SCREENCAP_MATRIX_ACK", "").lower() == "true"
+    # Treat any known scripted parent (SwiftUI subprocess spawn) as
+    # auto-acknowledged so a 5-second `select.select` doesn't stall first
+    # start (todo 019). SwiftUI may not have plumbed SCREENCAP_MATRIX_ACK
+    # explicitly yet — SCREENCAP_PARENT=swiftui is sufficient evidence
+    # the prompt would never be displayed to a human anyway.
+    parent_swiftui = _os.environ.get("SCREENCAP_PARENT") == "swiftui"
+    interactive = _sys.stdin.isatty() and not env_ack and not parent_swiftui
+
+    # Defer the disclosure to SwiftUI via a structured stderr event (todo
+    # 013). Without this, the SwiftUI shell silently auto-acks the matrix
+    # tightening on every first start, and users only discover the
+    # behavior change when their Slack / Gmail recordings come back empty
+    # or their AI conversations land unredacted in the cloud. Emitting
+    # ``matrix_disclosure_required`` lets SwiftUI render a one-time modal
+    # the next time the app foregrounds; the integrator is expected to
+    # re-launch with ``SCREENCAP_MATRIX_ACK=true`` after the user clears
+    # the modal so this branch falls through to the flag write below.
+    if parent_swiftui and not env_ack:
+        try:
+            from screencap._stderr_events import (
+                EVENT_MATRIX_DISCLOSURE_REQUIRED,
+                emit_event as _emit_event,
+            )
+            _emit_event(
+                EVENT_MATRIX_DISCLOSURE_REQUIRED,
+                changes=[
+                    "chat_email_calendar_video_call_mask_window",
+                    "ai_assistant_browser_unverified",
+                ],
+                opt_out_command_examples=[
+                    "screencap settings privacy exclude_apps add com.openai.chat",
+                    "screencap settings privacy exclude_apps add com.anthropic.claudefordesktop",
+                    "screencap settings privacy exclude_apps add ai.perplexity.mac",
+                ],
+            )
+        except Exception:
+            pass
+
+    if interactive:
+        console.print(
+            "[yellow]Privacy default changed:[/yellow] chat / email / calendar / "
+            "video-call apps under [bold]mode = internal[/bold] now mask the window "
+            "instead of text-redacting it."
+        )
+        # Disclosure for the AI-assistant reclassification (todo 031). The
+        # plan deliberately keeps these as BROWSER_UNVERIFIED → ALLOW so a
+        # friend recording \"let me show you my AI tool\" stays useful, but
+        # an upgrading user deserves to know their conversation contents
+        # will be captured raw before the flag flips silently.
+        console.print(
+            "[yellow]Also new:[/yellow] ChatGPT, Claude, and Perplexity desktop "
+            "apps now classify as [bold]browser_unverified[/bold] — under "
+            "[bold]mode = internal[/bold] their conversation contents are "
+            "[bold]captured unredacted[/bold]. Opt out per-app with: "
+            "[dim]screencap settings privacy exclude_apps add com.openai.chat[/dim] "
+            "(or com.anthropic.claudefordesktop, ai.perplexity.mac)."
+        )
+        console.print(
+            "Press [bold]Y[/bold] within 5s to acknowledge. Recording "
+            "continues either way."
+        )
+        try:
+            import select
+
+            select.select([_sys.stdin], [], [], 5.0)
+        except BaseException:
+            # Widen to BaseException so KeyboardInterrupt during the 5s
+            # wait does not skip the ack-flag write below — otherwise the
+            # prompt re-fires on every subsequent ``screencap start`` until
+            # the user lets it time out.
+            pass
+
+    try:
+        _write_privacy_flag(_MATRIX_ACK_KEY, True)
+    except Exception:
+        # Same rationale as the new-user pre-set: log so debugging is possible
+        # without breaking the user's recording (todo 031).
+        logger.debug("Failed to write matrix ack flag", exc_info=True)
 
 
 @cli.command()
@@ -204,6 +496,18 @@ def start(
       Cloud recordings are shown on the website by default.
       --unlisted                hide this recording (still uploads, just not listed)
       screencap settings        view/change the default visibility setting
+
+    \b
+    Exit codes (cross-language contract for SwiftUI / agent consumers):
+      0  Clean stop
+      1  Generic failure (uncaught exception, child crash)
+      2  Lock-already-held (another recording is active)
+      3  Permission lost mid-recording (Screen Recording / Accessibility / Input Monitoring)
+      4  Disk full
+      5  User-initiated force-quit (2-tap Ctrl+C)
+
+    Lifecycle events are emitted as line-buffered JSON on stderr — see
+    docs/research/2026-04-28-stderr-event-schema.md.
     """
     from datetime import datetime
 
@@ -246,6 +550,7 @@ def start(
     capture_window_data = False if no_window_data else None  # None = upstream default (True)
     # First-run privacy setup detection
     _maybe_prompt_privacy_setup(cloud_intent=destination == "cloud")
+    _maybe_prompt_matrix_acknowledgement()
 
     # --- Resolve recording destination (cloud/local) ---
     from screencap.config import get_upload_default
@@ -458,14 +763,25 @@ def start(
         "network": network,
     }
 
-    controller = SessionController(cli_args)
+    # SessionController(...) is INSIDE the try block so a SystemExit raised
+    # from __init__ (e.g. exit code 2 on lock contention, exit code 3 on
+    # permission_lost) goes through the same `stopped` event emission path.
+    # Without this, exit-2 silently bypassed the terminal event (todo 004).
+    exit_code = 0
     try:
+        controller = SessionController(cli_args)
+        # SessionController.__init__ already claimed the lock + emitted `started`
+        # via the path inside session.py — no need to re-emit here.
         controller.run()
-    except SystemExit:
+    except SystemExit as se:
+        exit_code = int(getattr(se, "code", 0) or 0)
+        _emit_event(EVENT_STOPPED, exit_code=exit_code)
         raise
     except Exception as exc:  # noqa: BLE001
         console.print(f"[red]Session controller error:[/red] {exc}")
+        _emit_event(EVENT_STOPPED, exit_code=1, error=str(exc))
         raise SystemExit(1)
+    _emit_event(EVENT_STOPPED, exit_code=exit_code)
 
 
 def _legacy_start_recording(
@@ -508,6 +824,23 @@ def _legacy_start_recording(
     except ImportError:
         console.print(_RECORD_EXTRAS_MSG)
         raise SystemExit(1)
+
+    # Cross-language event contract (todo 016): the SwiftUI shell relies on
+    # ``started`` and ``stopped`` to drive UI state. The legacy path is a
+    # documented escape hatch (``SCREENCAP_LEGACY_START=1``) and does not
+    # build a SessionController, so the events are emitted here directly.
+    # Without these wires, a SwiftUI launch falling onto the legacy path
+    # would line-read silence then EOF and never transition out of
+    # "starting" state.
+    try:
+        from screencap._stderr_events import (
+            EVENT_STARTED,
+            emit_event as _emit_event_legacy,
+            resolve_claimant,
+        )
+        _emit_event_legacy(EVENT_STARTED, claimant=resolve_claimant())
+    except Exception:
+        pass
 
     disk_full = False
     _menubar_proc = None
@@ -606,6 +939,19 @@ def _legacy_start_recording(
         pass
 
     _kill_menubar(_menubar_proc, _menubar_state_file)
+
+    # Mirror the SessionController exit path so SwiftUI sees `stopped`
+    # before the process disappears (todo 016). Use ``os._exit`` after the
+    # emit so any background threads (chunk_processor watcher, post-
+    # processing pool) don't keep the interpreter alive.
+    try:
+        from screencap._stderr_events import (
+            EVENT_STOPPED,
+            emit_event as _emit_event_legacy,
+        )
+        _emit_event_legacy(EVENT_STOPPED, exit_code=0)
+    except Exception:
+        pass
     import os as _os
     _os._exit(0)
 
@@ -690,7 +1036,9 @@ def _auto_transcribe(capture_dir, audio_path):
 
 
 @cli.command("list")
-@click.option("--json", "as_json", is_flag=True, help="Output as JSON.")
+@click.option("--json", "as_json", is_flag=True,
+              default=lambda: _should_default_to_json(),
+              help="Output as JSON. Auto-detected when stdout is not a TTY (todo 030).")
 @click.option(
     "--sort",
     type=click.Choice(["name", "date", "duration"], case_sensitive=False),
@@ -844,7 +1192,9 @@ def view(name, regenerate, max_events):
 
 @cli.command()
 @click.argument("name")
-@click.option("--json", "as_json", is_flag=True, help="Output as JSON.")
+@click.option("--json", "as_json", is_flag=True,
+              default=lambda: _should_default_to_json(),
+              help="Output as JSON. Auto-detected when stdout is not a TTY (todo 030).")
 def info(name, as_json):
     """Show details and system metrics for a recording."""
     from screencap.catalog import find_db, read_drops, _read_recording_meta
@@ -970,8 +1320,11 @@ def info(name, as_json):
             console.print(f"\n  [dim]No end snapshot (recording may have been interrupted).[/dim]")
 
 
-def _export_one(recording_dir, output_path, exclude_moves, err_console):
+def _export_one(recording_dir, output_path, exclude_moves, err_console, privacy_filter=None):
     """Export a single recording. Returns event count, or -1 on error.
+
+    When *privacy_filter* is supplied, it is applied to window.switch events
+    during export — used by the ``--privacy-filter`` flag (Unit 4d).
 
     V1.5: when the recording has encrypted network bodies (a
     ``network_event_meta`` row exists), construct a
@@ -1057,11 +1410,89 @@ def _export_one(recording_dir, output_path, exclude_moves, err_console):
             output_path,
             exclude_moves,
             metadata=meta,
+            privacy_filter=privacy_filter,
             network_scrub_pipeline=network_scrub_pipeline,
         )
     except ExportError as e:
         err_console.print(f"[red]Error:[/red] {e}")
         return -1
+
+
+def _build_export_privacy_filter(recording_dir):
+    """Build a privacy filter for ``--privacy-filter`` exports.
+
+    Resolves the recording's privacy mode from ``<recording_dir>/.recording_intent``
+    first (todo 001) — that's the mode the user was recording under at capture
+    time and the only mode whose semantics correctly describe what's safe to
+    export. Falls back to the current ``[privacy].mode`` from ``config.toml``
+    only when the intent file is absent (legacy recordings predating the
+    intent file); a stderr warning surfaces the fallback.
+
+    ``cloud_intent=False`` because CLI exports are local-only by default;
+    cloud-bound paths use the dedicated ``build_cloud_window_filter``
+    constructor.
+    """
+    from pathlib import Path as _Path
+
+    from screencap.privacy.filter import build_local_window_filter
+
+    err_console = Console(stderr=True)
+    mode = None
+
+    # Recording-time mode from .recording_intent (canonical source).
+    intent_path = _Path(recording_dir) / ".recording_intent"
+    if intent_path.exists():
+        try:
+            import json as _json
+            intent_data = _json.loads(intent_path.read_text())
+            recording_mode = intent_data.get("privacy_mode")
+            if recording_mode:
+                mode = str(recording_mode)
+        except (OSError, ValueError):
+            pass
+
+    if mode is None:
+        # Fallback for recordings without .recording_intent — surface to the
+        # user that we're using current config, which may be stricter or
+        # looser than the recording-time posture.
+        try:
+            from screencap.config import _load_toml
+            privacy_section = (_load_toml().get("privacy") or {})
+            mode = privacy_section.get("mode") or "internal"
+        except Exception:
+            mode = "internal"
+        rec_name = (
+            recording_dir.name if hasattr(recording_dir, "name")
+            else str(recording_dir)
+        )
+        err_console.print(
+            f"[yellow]Warning:[/yellow] No .recording_intent in "
+            f"{rec_name} — "
+            f"applying current config mode={mode!r}. Re-record under the desired "
+            f"mode for accurate filtering."
+        )
+        # Machine-parseable mirror of the warning (todo 010): when stdout is
+        # piped to a parser the Rich prose above is unreadable, so emit a
+        # tagged JSON line on stderr that an agent batch-running
+        # ``export --all --privacy-filter`` can grep for to enumerate
+        # legacy-fallback recordings without screen-scraping rich output.
+        if not sys.stdout.isatty():
+            try:
+                import json as _json
+                sys.stderr.write(_json.dumps({
+                    "type": "warn",
+                    "code": "no_recording_intent",
+                    "recording": rec_name,
+                    "fallback_mode": mode,
+                }) + "\n")
+                sys.stderr.flush()
+            except Exception:
+                pass
+
+    return build_local_window_filter(
+        privacy_mode=mode,
+        capture_dir=recording_dir,
+    )
 
 
 def _find_exportable_dirs(base_dir):
@@ -1085,7 +1516,11 @@ def _find_exportable_dirs(base_dir):
               help="Write to stdout instead of a file.")
 @click.option("--exclude-moves", is_flag=True, default=False,
               help="Exclude mouse move events from output.")
-def export(name, all_recordings, downloads, output, use_stdout, exclude_moves):
+@click.option("--privacy-filter", "privacy_filter_enabled", is_flag=True, default=False,
+              help="Apply window-event privacy filter (suppress EXCLUDE app windows, "
+                   "mask MASK_WINDOW titles). Off by default — turn on for SwiftUI viewer "
+                   "or other downstream consumers that need privacy-filtered events.")
+def export(name, all_recordings, downloads, output, use_stdout, exclude_moves, privacy_filter_enabled):
     """Export recording events as JSONL for training.
 
     WARNING: Export includes all captured keystrokes (passwords, API keys,
@@ -1136,7 +1571,8 @@ def export(name, all_recordings, downloads, output, use_stdout, exclude_moves):
         for i, rec_dir in enumerate(dirs, 1):
             err_console.print(f"\n[bold][{i}/{total}][/bold] {rec_dir.name}")
             out = str(rec_dir / "events.jsonl")
-            count = _export_one(rec_dir, out, exclude_moves, err_console)
+            pf = _build_export_privacy_filter(rec_dir) if privacy_filter_enabled else None
+            count = _export_one(rec_dir, out, exclude_moves, err_console, privacy_filter=pf)
             if count >= 0:
                 err_console.print(f"Exported {count} events to [bold]{out}[/bold]")
                 if count == 0:
@@ -1173,7 +1609,8 @@ def export(name, all_recordings, downloads, output, use_stdout, exclude_moves):
     else:
         output_path = str(recording_dir / "events.jsonl")
 
-    count = _export_one(recording_dir, output_path, exclude_moves, err_console)
+    pf = _build_export_privacy_filter(recording_dir) if privacy_filter_enabled else None
+    count = _export_one(recording_dir, output_path, exclude_moves, err_console, privacy_filter=pf)
     if count < 0:
         sys.exit(1)
     if output_path:
@@ -1183,12 +1620,329 @@ def export(name, all_recordings, downloads, output, use_stdout, exclude_moves):
 
 
 @cli.command()
+@click.option("--json", "as_json", is_flag=True,
+              default=lambda: _should_default_to_json(),
+              help="Emit machine-readable JSON to stdout (no styling, no rich output). "
+                   "Auto-detected when stdout is not a TTY.")
+@click.option("--include-spotlight", is_flag=True, default=False,
+              help="Also scan via mdfind (slower, more complete). Default: filesystem-only.")
+def apps(as_json, include_spotlight):
+    """List installed macOS apps with their privacy-resolved actions.
+
+    Wraps app_discovery.discover_installed_apps() and evaluates the privacy
+    matrix (with user overrides) for each. Designed for the SwiftUI Privacy
+    pane to render per-app toggles and state badges.
+
+    Output (per app, when --json is set):
+      bundle_id, display_name, path, icon_path, context_class,
+      classification_source, resolved_action, in_exclude_apps,
+      in_allow_apps, is_matrix_exclude, has_per_frame_overrides
+
+    has_per_frame_overrides is true when ``mask_domains`` or
+    ``mask_title_patterns`` is non-empty in config.toml. The per-app
+    ``resolved_action`` is computed without per-frame domain / title
+    context, so an ``allow`` row can still produce ``mask_window`` at
+    runtime when one of those overrides fires. SwiftUI should decorate
+    "Allowed*" badges accordingly.
+    """
+    import json as _json
+
+    err_console = Console(stderr=True)
+
+    try:
+        from screencap.app_discovery import auto_classify_detailed, discover_installed_apps
+        from screencap.privacy.actions import PrivacyAction
+        from screencap.privacy.policy import (
+            ContextResult,
+            DefaultPolicyEvaluator,
+            FrameMetadata,
+            PrivacyMode,
+            get_matrix_action,
+        )
+    except ImportError:
+        err_console.print(_RECORD_EXTRAS_MSG)
+        raise SystemExit(1)
+
+    try:
+        from screencap.config import get_privacy_config
+        privacy_cfg = get_privacy_config()
+    except Exception:
+        from screencap.privacy.policy import PrivacyConfig
+        privacy_cfg = PrivacyConfig()
+
+    evaluator = DefaultPolicyEvaluator(privacy_cfg)
+
+    try:
+        installed = discover_installed_apps(use_spotlight=include_spotlight)
+    except Exception as exc:
+        # Uniform JSON envelope (todo 020) + non-zero exit on JSON error
+        # (todo 019) — agents that check exit code first don't silently
+        # skip a discovery failure as if it were an empty result.
+        if as_json:
+            sys.stdout.write(_json.dumps({
+                "ok": False,
+                "schema_version": _APPS_SCHEMA_VERSION,
+                "apps": [],
+                "error": str(exc),
+            }) + "\n")
+            sys.stdout.flush()
+        else:
+            err_console.print(f"[red]Error:[/red] {exc}")
+        raise SystemExit(1)
+
+    # ``has_per_frame_overrides`` (todo 008, schema v2): per-app
+    # ``resolved_action`` is computed from FrameMetadata that only carries
+    # ``bundle_id`` + ``display_name``, so it cannot reflect ``mask_domains``
+    # (policy step 3) or ``mask_title_patterns`` (policy step 4) — those
+    # only fire against per-frame ``domain`` / ``window_title`` at capture
+    # time. Surface the existence of those rules so a SwiftUI badge for an
+    # ``allow``-resolved app can decorate "*" with a tooltip warning.
+    has_per_frame_overrides = bool(
+        privacy_cfg.mask_domains or privacy_cfg.mask_title_patterns,
+    )
+
+    rows = []
+    for meta in installed:
+        classification = auto_classify_detailed(meta)
+        ctx_class = classification.context_class
+        is_matrix_exclude = all(
+            get_matrix_action(ctx_class, m) == PrivacyAction.EXCLUDE
+            for m in PrivacyMode
+        )
+        frame = FrameMetadata(bundle_id=meta.bundle_id, window_title=meta.display_name)
+        # auto_classify_detailed returns ClassificationResult; the evaluator
+        # expects ContextResult — bridge the two by constructing a fresh
+        # ContextResult that carries the bundle ID as evidence.
+        ctx_result = ContextResult(
+            context_class=ctx_class,
+            confidence="bundle_id",
+            evidence=meta.bundle_id,
+        )
+        decision = evaluator.evaluate(ctx_result, frame)
+
+        rows.append({
+            "bundle_id": meta.bundle_id,
+            "display_name": meta.display_name,
+            "path": meta.path,
+            "icon_path": "",  # populated by SwiftUI from .app/Contents/Resources/<icon>
+            "context_class": ctx_class.value,
+            "classification_source": classification.source,
+            "resolved_action": decision.action.value,
+            "in_exclude_apps": meta.bundle_id in privacy_cfg.exclude_apps,
+            "in_allow_apps": meta.bundle_id in privacy_cfg.allow_apps,
+            "is_matrix_exclude": is_matrix_exclude,
+            "has_per_frame_overrides": has_per_frame_overrides,
+        })
+
+    if as_json:
+        sys.stdout.write(_json.dumps({
+            "ok": True,
+            "schema_version": _APPS_SCHEMA_VERSION,
+            "apps": rows,
+        }) + "\n")
+        sys.stdout.flush()
+        return
+
+    console.print(f"\n[bold]{len(rows)} apps installed[/bold]\n")
+    for row in rows:
+        badge = "[red]EXCLUDE[/red]" if row["resolved_action"] == "exclude" else (
+            "[yellow]MASK[/yellow]" if "mask" in row["resolved_action"] else "[green]ALLOW[/green]"
+        )
+        console.print(f"  {badge} {row['display_name']} ({row['bundle_id']})")
+    console.print()
+
+
+@cli.command()
+@click.option("--json", "as_json", is_flag=True,
+              default=lambda: _should_default_to_json(),
+              help="Emit machine-readable JSON to stdout (no styling, no rich output). "
+                   "Auto-detected when stdout is not a TTY.")
+@click.option("--no-nlp-check", is_flag=True, default=False,
+              help="Skip the are_nlp_models_cached() probe. SwiftUI / agents "
+                   "polling at 1Hz can pass this to shave fixed cost off the "
+                   "hot path (todo 018). nlp_models_cached field is reported "
+                   "as null when skipped.")
+def status(as_json, no_nlp_check):
+    """Report recording state without IPC.
+
+    Reads the flock-protected ``recording.lock`` content (Unit 3) and the
+    config flags. Designed for SwiftUI's 1Hz poll loop — light dependencies,
+    no SessionController spawn, no AppKit. Always exits 0.
+    """
+    import json as _json
+    import time as _time
+    from typing import TypedDict
+
+    from screencap.pidfile import LOCK_FILE, lock_is_active, read_lock_metadata
+
+    class StatusPayload(TypedDict):
+        """Schema for `screencap status --json` output.
+
+        Symmetric: every key is always present so SwiftUI's parser doesn't
+        need conditional unwraps. Unknown values are ``None`` / ``False``.
+        Uniform envelope (todo 020): `ok` + `schema_version` lead the payload.
+        """
+        ok: bool
+        schema_version: int
+        is_recording: bool
+        started_at: float | None
+        elapsed: float | None
+        capture_dir: str | None
+        claimant: str | None
+        warning: str | None
+        privacy_configured: bool
+        nlp_models_cached: bool | None  # None when --no-nlp-check is set
+
+    # Two distinct facts about the lock:
+    #   1. lock_is_active() — flock probe. True iff a process holds the lock.
+    #      In session mode this is the controller's lifetime, NOT a single
+    #      recording's lifetime.
+    #   2. recording_started_at in metadata — set by SessionController on
+    #      _on_start_click, cleared on _on_stop_click. The canonical
+    #      "is a recording capture in progress?" signal.
+    #
+    # SwiftUI's elapsed-time UI must read recording_started_at, not the
+    # controller-init started_at. Without this distinction, the previous
+    # design left status reporting is_recording=true and a stale elapsed
+    # time after the user clicked Stop in the menubar (the controller
+    # was still alive between recordings).
+    flock_held = lock_is_active()
+    metadata = read_lock_metadata()
+    recording_started_at = None
+    if metadata is not None:
+        rec_ts = metadata.get("recording_started_at")
+        if isinstance(rec_ts, (int, float)):
+            recording_started_at = float(rec_ts)
+    is_recording = flock_held and recording_started_at is not None
+
+    payload: StatusPayload = {
+        "ok": True,
+        # Independent from stderr-event schema version (todo 009) — status
+        # payload evolves separately.
+        "schema_version": _STATUS_SCHEMA_VERSION,
+        "is_recording": is_recording,
+        "started_at": None,
+        "elapsed": None,
+        "capture_dir": None,
+        "claimant": None,
+        "warning": None,
+        "privacy_configured": False,
+        "nlp_models_cached": False,
+    }
+    if no_nlp_check:
+        # Caller opted out of the cache probe (todo 018). Report null so
+        # consumers can distinguish "skipped by request" from "checked,
+        # not cached" (False).
+        payload["nlp_models_cached"] = None
+
+    if is_recording and metadata is not None:
+        # started_at + elapsed track THE recording, not the controller —
+        # so back-to-back recordings each report a fresh elapsed time.
+        payload["started_at"] = recording_started_at
+        payload["elapsed"] = max(0.0, _time.time() - recording_started_at)
+        if metadata.get("capture_dir"):
+            payload["capture_dir"] = metadata["capture_dir"]
+        if metadata.get("claimant"):
+            payload["claimant"] = metadata["claimant"]
+    elif not flock_held and LOCK_FILE.exists():
+        # Lock file exists but flock probe says no holder. Distinguish:
+        #   - file unparseable (corrupt JSON) → metadata is None
+        #   - file present + parseable + no holder → metadata is dict
+        if metadata is None:
+            payload["warning"] = "lock_unparseable"
+        else:
+            payload["warning"] = "lock_stale"
+
+    # Config readiness flags — cheap and useful for first-run UI.
+    try:
+        from screencap.config import _load_toml
+        privacy_section = (_load_toml().get("privacy") or {})
+        payload["privacy_configured"] = bool(privacy_section)
+    except Exception:
+        pass
+
+    if not no_nlp_check:
+        try:
+            from screencap.privacy import are_nlp_models_cached
+            payload["nlp_models_cached"] = bool(are_nlp_models_cached())
+        except Exception:
+            pass
+
+    if as_json:
+        sys.stdout.write(_json.dumps(payload) + "\n")
+        sys.stdout.flush()
+        return
+
+    # Pretty output for human callers.
+    if payload["is_recording"]:
+        elapsed = payload.get("elapsed")
+        if elapsed is not None:
+            console.print(f"[#22d3ee]Recording[/#22d3ee] — {int(elapsed)}s elapsed")
+        else:
+            console.print("[#22d3ee]Recording[/#22d3ee] — (start time unknown)")
+        if payload.get("capture_dir"):
+            console.print(f"  Capture dir: {payload['capture_dir']}")
+        if payload.get("claimant"):
+            console.print(f"  Claimant: {payload['claimant']}")
+    else:
+        console.print("[dim]Not recording.[/dim]")
+
+
+@cli.command()
 @click.option("--force", is_flag=True, help="Skip SIGTERM and go straight to SIGKILL.")
-def stop(force):
-    """Stop recording processes."""
+@click.option("--json", "as_json", is_flag=True,
+              default=lambda: _should_default_to_json(),
+              help="Emit machine-readable JSON to stdout instead of prose. "
+                   "Auto-detected when stdout is not a TTY (todo 009).")
+def stop(force, as_json):
+    """Stop recording processes.
+
+    \b
+    Without --force: send SIGTERM to the lock owner, wait up to 30s for
+    a clean shutdown, then fall through to an orphan-children scan.
+
+    \b
+    With --force: SIGKILL the lock owner directly (so a hung-but-alive
+    SessionController can be taken down — find_orphaned_processes returns
+    nothing while the parent lives), then run the orphan-children scan.
+    Use this only when the graceful path has already failed; previously
+    --force was a no-op against a live parent and is now actively
+    destructive against the recording session.
+
+    \b
+    --json envelope (todo 009):
+      {ok, schema_version, action, pid, killed,
+       orphans_terminated, error}
+    action ∈ {"sigterm", "sigkill", "none", "no_owner"}.
+    """
     import os as _os
     import signal as _signal
     import time as _time
+
+    # Track outcome across exit points so the JSON envelope describes the
+    # actual lifecycle (todo 009). Updated in place by the SIGTERM /
+    # SIGKILL / orphan-scan branches; emitted from the helper below before
+    # every return / SystemExit.
+    _stop_outcome: dict = {
+        "action": "none",
+        "pid": None,
+        "killed": False,
+        "orphans_terminated": 0,
+        "error": None,
+    }
+
+    def _emit_stop_result(*, ok: bool, exit_code: int = 0) -> None:
+        if as_json:
+            import json as _json
+            payload = {
+                "ok": ok,
+                "schema_version": _STOP_SCHEMA_VERSION,
+                **_stop_outcome,
+            }
+            sys.stdout.write(_json.dumps(payload) + "\n")
+            sys.stdout.flush()
+        if exit_code:
+            raise SystemExit(exit_code)
 
     try:
         from screencap.pidfile import (
@@ -1196,71 +1950,185 @@ def stop(force):
             _pid_exists,
             delete_pidfile,
             find_orphaned_processes,
+            read_lock_metadata,
             read_pidfile,
             terminate_processes,
         )
     except ImportError:
-        console.print(_RECORD_EXTRAS_MSG)
-        raise SystemExit(1)
+        if not as_json:
+            console.print(_RECORD_EXTRAS_MSG)
+        _stop_outcome["error"] = "record_extras_not_installed"
+        _emit_stop_result(ok=False, exit_code=1)
+        return
 
-    # Try graceful shutdown via SIGTERM to parent process first
-    if not force:
+    # Identify the lock owner. Prefer the flock-protected lock metadata
+    # (Unit 3) — it's the canonical owner and works correctly for
+    # multiprocessing.spawn workers (per
+    # docs/tickets/high-2026-03-10-fix-orphan-detection-spawn-workers.md).
+    # Fall back to legacy recording.pid for back-compat with any holder
+    # that hasn't migrated.
+    #
+    # This identification step runs in BOTH the graceful and --force paths.
+    # Without it, --force would skip straight to find_orphaned_processes(),
+    # which returns [] when the SessionController parent is alive — meaning
+    # `screencap stop --force` against a hung-but-alive controller did
+    # nothing.
+    lock_meta = read_lock_metadata()
+    parent_pid = None
+    lock_started_at = None
+    if lock_meta and lock_meta.get("pid"):
+        parent_pid = lock_meta["pid"]
+        lock_started_at = lock_meta.get("started_at")
+    else:
         data = read_pidfile()
         if data and data.get("parent_pid"):
             parent_pid = data["parent_pid"]
-            if _pid_exists(parent_pid) and _is_screencap_process(parent_pid):
-                console.print(f"Sending stop signal to recording (PID {parent_pid})...")
-                try:
-                    _os.kill(parent_pid, _signal.SIGTERM)
-                except (ProcessLookupError, PermissionError):
-                    pass
+            lock_started_at = data.get("started_at")
+
+    # PID-recycle guard (todo 007) — verify the live PID's create_time is
+    # within tolerance of the lock metadata's started_at. macOS recycles
+    # PIDs aggressively (~99k space), so a long-dead recorder's PID could
+    # belong to an unrelated process by the time the user runs `stop`.
+    # Applies to both graceful and --force paths — force-killing the wrong
+    # process is even worse than SIGTERM-ing it.
+    if parent_pid is not None and lock_started_at is not None:
+        try:
+            import psutil as _psutil
+            proc_create_time = _psutil.Process(parent_pid).create_time()
+            # 60s tolerance (todo 014): both lock_started_at (time.time at
+            # claim_lock) and psutil.Process.create_time on macOS are wall-
+            # clock — a forward NTP step between claim and stop (common on
+            # laptops resuming from sleep) would otherwise null the legit
+            # parent_pid and silently turn `screencap stop` into a no-op
+            # because find_orphaned_processes() returns [] while the parent
+            # lives. Real PID recycles after process death involve much
+            # larger elapsed times; 60s absorbs routine NTP jumps without
+            # weakening the guard's intent.
+            if proc_create_time > float(lock_started_at) + 60.0:
+                console.print(
+                    f"[yellow]Warning:[/yellow] PID {parent_pid} appears recycled "
+                    f"(process started >60s after the recording's lock metadata). "
+                    f"Skipping direct kill; falling through to orphan scan."
+                )
+                parent_pid = None
+        except (_psutil.NoSuchProcess, _psutil.AccessDenied, _psutil.ZombieProcess):
+            # No process at that PID — nothing to stop directly; fall
+            # through to the orphan scan.
+            parent_pid = None
+        except Exception:
+            # Unexpected psutil failure: stay conservative and skip the
+            # direct kill rather than risk killing an unrelated process.
+            parent_pid = None
+
+    if parent_pid is not None and _pid_exists(parent_pid) and _is_screencap_process(parent_pid):
+        _stop_outcome["pid"] = int(parent_pid)
+        if force:
+            # --force path: SIGKILL the lock owner directly. This is the
+            # only way to take down a hung-but-alive SessionController, since
+            # find_orphaned_processes() returns [] while the parent lives.
+            _stop_outcome["action"] = "sigkill"
+            if not as_json:
+                console.print(f"[yellow]Force-killing recording (PID {parent_pid})...[/yellow]")
+            try:
+                _os.kill(parent_pid, _signal.SIGKILL)
+            except (ProcessLookupError, PermissionError) as exc:
+                # Surface as a non-zero exit (todo 009): an agent that
+                # invokes ``stop --force`` and gets exit 0 will assume the
+                # session is dead. PermissionError most commonly means the
+                # PID belongs to a different uid (recycled across users).
+                _stop_outcome["error"] = f"sigkill_failed:{type(exc).__name__}:{exc}"
+                if not as_json:
+                    console.print(f"[red]Failed to SIGKILL PID {parent_pid}: {exc}[/red]")
+                _emit_stop_result(ok=False, exit_code=1)
+                return
+            else:
+                # Brief wait for the kernel to reap; then confirm.
+                for _ in range(10):
+                    if not _pid_exists(parent_pid):
+                        break
+                    _time.sleep(0.1)
+                if not _pid_exists(parent_pid):
+                    _stop_outcome["killed"] = True
+                    if not as_json:
+                        console.print("[#22d3ee]Recording force-stopped.[/#22d3ee]")
                 else:
-                    # Wait for graceful shutdown (up to 30s) with progress
-                    _timed_out = True
-                    try:
-                        with console.status(
-                            "[dim]Waiting for recording to stop "
-                            "(post-processing may take a moment)...[/dim]"
-                        ) as _wait_status:
-                            for _tick in range(60):
-                                if not _pid_exists(parent_pid):
-                                    _timed_out = False
-                                    break
-                                if _tick == 20:  # 10s elapsed
-                                    _wait_status.update(
-                                        "[dim]Still waiting... use [bold]screencap stop --force[/bold] "
-                                        "to kill immediately[/dim]"
-                                    )
-                                _time.sleep(0.5)
-                    except KeyboardInterrupt:
+                    _stop_outcome["error"] = "sigkill_uninterruptible"
+                    if not as_json:
+                        console.print(
+                            f"[yellow]Warning:[/yellow] PID {parent_pid} still alive after "
+                            "SIGKILL — process may be uninterruptible (D-state)."
+                        )
+            delete_pidfile()
+            # Fall through to orphan scan in case force-kill left children.
+        else:
+            _stop_outcome["action"] = "sigterm"
+            if not as_json:
+                console.print(f"Sending stop signal to recording (PID {parent_pid})...")
+            try:
+                _os.kill(parent_pid, _signal.SIGTERM)
+            except (ProcessLookupError, PermissionError):
+                pass
+            else:
+                # Wait for graceful shutdown (up to 30s) with progress
+                _timed_out = True
+                try:
+                    with console.status(
+                        "[dim]Waiting for recording to stop "
+                        "(post-processing may take a moment)...[/dim]"
+                    ) as _wait_status:
+                        for _tick in range(60):
+                            if not _pid_exists(parent_pid):
+                                _timed_out = False
+                                break
+                            if _tick == 20:  # 10s elapsed
+                                _wait_status.update(
+                                    "[dim]Still waiting... use [bold]screencap stop --force[/bold] "
+                                    "to kill immediately[/dim]"
+                                )
+                            _time.sleep(0.5)
+                except KeyboardInterrupt:
+                    if not as_json:
                         console.print(
                             "\n[yellow]Interrupted — escalating to force kill.[/yellow]\n"
                             "[dim]Tip: [bold]screencap stop --force[/bold] "
                             "skips the graceful wait[/dim]"
                         )
-                    if not _timed_out or not _pid_exists(parent_pid):
+                if not _timed_out or not _pid_exists(parent_pid):
+                    _stop_outcome["killed"] = True
+                    if not as_json:
                         console.print("[#22d3ee]Recording stopped.[/#22d3ee]")
-                        delete_pidfile()
-                        return
+                    delete_pidfile()
+                    _emit_stop_result(ok=True)
+                    return
+                if not as_json:
                     console.print("[yellow]Graceful stop timed out — falling back to force kill.[/yellow]")
 
     orphans = find_orphaned_processes()
     if not orphans:
-        console.print("[dim]No orphaned recording processes found.[/dim]")
+        if _stop_outcome["action"] == "none":
+            _stop_outcome["action"] = "no_owner"
+        if not as_json:
+            console.print("[dim]No orphaned recording processes found.[/dim]")
+        _emit_stop_result(ok=True)
         return
 
-    console.print(f"Found {len(orphans)} orphaned recording process(es).")
+    if not as_json:
+        console.print(f"Found {len(orphans)} orphaned recording process(es).")
     terminated = terminate_processes(orphans, force=force)
-
-    for entry in terminated:
-        console.print(f"  Terminated {entry.get('name', 'unknown')} (PID {entry['pid']})... done")
-
+    _stop_outcome["orphans_terminated"] = len(terminated)
     if terminated:
-        console.print(f"Cleaned up {len(terminated)} process(es).")
-    else:
-        console.print("[yellow]Could not terminate any processes.[/yellow]")
+        _stop_outcome["killed"] = True
+
+    if not as_json:
+        for entry in terminated:
+            console.print(f"  Terminated {entry.get('name', 'unknown')} (PID {entry['pid']})... done")
+        if terminated:
+            console.print(f"Cleaned up {len(terminated)} process(es).")
+        else:
+            console.print("[yellow]Could not terminate any processes.[/yellow]")
 
     delete_pidfile()
+    _emit_stop_result(ok=True)
 
 
 @cli.command()
@@ -2254,10 +3122,14 @@ def scrub(name: str, pii_engine: str | None) -> None:
         raise SystemExit(1)
 
 
-@cli.command()
+@cli.group(invoke_without_command=True)
 @click.option("--set", "set_pair", default=None, metavar="KEY=VALUE",
               help="Change a setting, e.g. --set show_on_website=true")
-def settings(set_pair):
+@click.option("--json", "as_json", is_flag=True,
+              default=lambda: _should_default_to_json(),
+              help="Emit settings as JSON. Auto-detected when stdout is not a TTY (todo 012).")
+@click.pass_context
+def settings(ctx, set_pair, as_json):
     """Show or change ScreenCap configuration.
 
     \b
@@ -2271,12 +3143,21 @@ def settings(set_pair):
       screencap settings --set upload_default=cloud
 
     \b
+    Mutate a privacy list (Unit 4b):
+      screencap settings privacy exclude_apps add com.example.foo
+      screencap settings privacy allow_apps remove com.tinyspeck.slackmacgap
+      screencap settings privacy mode set internal
+
+    \b
     Changeable keys:
       show_on_website    Show recordings on the website (true/false)
       audio_default      Record audio by default (true/false)
       auto_name          LLM auto-naming after recording (true/false)
       upload_default     Default destination (local/cloud/both/ask)
     """
+    if ctx.invoked_subcommand is not None:
+        # privacy subcommand path — defer to the subcommand handler.
+        return
     from screencap.config import (
         _CONFIG_PATH,
         get_audio_default,
@@ -2344,6 +3225,34 @@ def settings(set_pair):
 
     # --- Display all settings ---
     chunk = get_chunk_duration()
+    rest = get_rest_threshold()
+    show = get_show_on_website()
+
+    # Structured payload first so the same field set drives both JSON and
+    # prose paths. ``settings --json`` (todo 012) is the read-side analogue
+    # of the existing ``settings privacy --json`` mutation surface — agents
+    # need a stable shape they can diff.
+    settings_payload = {
+        "show_on_website": bool(show),
+        "upload_default": str(get_upload_default()),
+        "audio_default": bool(get_audio_default()),
+        "auto_name": bool(get_auto_name()),
+        "chunk_duration": float(chunk),
+        "auto_delete_after_upload": bool(get_auto_delete_after_upload()),
+        "rest_threshold_seconds": float(rest),
+        "recordings_dir": str(get_recordings_dir()),
+    }
+
+    if as_json:
+        import json as _json
+        sys.stdout.write(_json.dumps({
+            "ok": True,
+            "schema_version": _SETTINGS_SCHEMA_VERSION,
+            "settings": settings_payload,
+        }) + "\n")
+        sys.stdout.flush()
+        return
+
     if chunk >= 3600:
         chunk_str = f"{chunk:.0f}s ({chunk / 3600:.1f} hour)"
     elif chunk >= 60:
@@ -2352,8 +3261,6 @@ def settings(set_pair):
         chunk_str = f"{chunk:.0f}s"
     else:
         chunk_str = "disabled (legacy single-file)"
-    rest = get_rest_threshold()
-    show = get_show_on_website()
 
     console.print("\n[bold]ScreenCap Settings[/bold]\n")
     console.print(f"  Show on website:          {'yes' if show else 'no'}")
@@ -2367,6 +3274,487 @@ def settings(set_pair):
     console.print()
     console.print("[dim]  Change with: screencap settings --set KEY=VALUE[/dim]")
     console.print()
+
+
+_PRIVACY_LIST_FIELDS = ("exclude_apps", "allow_apps", "mask_domains", "mask_title_patterns")
+# `matrix_acknowledged_v2026_04` is NOT exposed here (todo 012) — it's an
+# internal migration flag written by `_maybe_prompt_matrix_acknowledgement`
+# and should not be flippable from a `screencap settings` invocation.
+_PRIVACY_SCALAR_FIELDS = ("mode", "setup_skipped")
+_PRIVACY_MAP_FIELDS = ("app_classes",)
+# `shared` is reserved for MASK_REGION (not yet implemented); accepting it
+# would write an unenforceable value that crashes the next start (todo 011).
+_PRIVACY_MODE_VALUES = ("public", "internal")
+
+
+def _privacy_list_field_value(value: str) -> str:
+    """Normalize a list-field value before adding/removing."""
+    return value.strip()
+
+
+def _matrix_blocks_allow_for_class(ctx_class, configured_mode: str) -> "PrivacyAction | None":
+    """Return the matrix action if it blocks ``allow_apps`` at this mode, else None.
+
+    Blocks loosening via ``allow_apps`` when the matrix at the user's configured
+    mode produces EXCLUDE / MASK_WINDOW / TEXT_REDACT for this class. Without
+    this guard, ``allow_apps add com.tinyspeck.slackmacgap`` (CHAT, MASK_WINDOW
+    under ``internal``) would silently bypass Unit 7a's strengthening.
+
+    PASSWORD_MANAGER (EXCLUDE in every mode) is always blocked. BANKING
+    (MASK_WINDOW under ``internal``) is also blocked. BROWSER_UNVERIFIED
+    (ALLOW under ``internal``) is *not* blocked — users can still allow
+    a browser explicitly.
+    """
+    from screencap.privacy.policy import (
+        PrivacyAction,
+        PrivacyMode,
+        get_matrix_action,
+    )
+
+    blocking = (
+        PrivacyAction.EXCLUDE,
+        PrivacyAction.MASK_WINDOW,
+        PrivacyAction.TEXT_REDACT,
+    )
+    try:
+        mode = PrivacyMode(configured_mode)
+    except ValueError:
+        mode = PrivacyMode.INTERNAL
+    action = get_matrix_action(ctx_class, mode)
+    return action if action in blocking else None
+
+
+@settings.command("privacy")
+@click.argument("field")
+@click.argument("op", type=click.Choice(["add", "remove", "set"]))
+@click.argument("value")
+@click.option("--json", "as_json", is_flag=True,
+              default=lambda: _should_default_to_json(),
+              help="Emit machine-readable JSON to stdout instead of prose to stderr. "
+                   "Auto-detected when stdout is not a TTY (todo 021).")
+def settings_privacy(field, op, value, as_json):
+    """Mutate a [privacy] field in config.toml (Unit 4b).
+
+    \b
+    Valid FIELD names (todo 022):
+      list fields (add/remove): exclude_apps, allow_apps, mask_domains,
+                                mask_title_patterns
+      scalar fields (set):      mode (public|internal), setup_skipped (bool)
+      map fields (BUNDLE=CLASS): app_classes
+
+    \b
+    Examples:
+      screencap settings privacy exclude_apps add com.example.foo
+      screencap settings privacy allow_apps remove com.example.bar
+      screencap settings privacy mode set internal
+      screencap settings privacy app_classes set com.example.foo=chat
+
+    Writes through tomlkit so existing comments and key order are preserved
+    (R16 invariant). Idempotent: add of an already-present value is a no-op,
+    remove of an absent value is a no-op (both exit 0).
+
+    Validation (todo 022): rejects ``allow_apps add`` for any bundle ID whose
+    matrix action at the configured mode is EXCLUDE, MASK_WINDOW, or
+    TEXT_REDACT — not just EXCLUDE. Use ``screencap apps --json`` to check
+    ``resolved_action`` before attempting allow_apps add.
+    """
+    import json as _json
+
+    import tomlkit
+
+    # Diagnostics / status messages go on stderr so stdout stays clean for
+    # any future structured output.
+    err_console = Console(stderr=True)
+
+    def _result(
+        ok: bool,
+        *,
+        exit_code: int = 0,
+        error: str | None = None,
+        changed: bool = False,
+    ):
+        """Emit the result and exit. Prose to stderr; JSON to stdout when --json.
+
+        Symmetric envelope (todo 011, schema v2): every payload carries the
+        same key set on success AND error — ``ok``, ``schema_version``,
+        ``changed``, ``field``, ``op``, ``value``, ``error``. Absent values
+        serialize as JSON null. Eliminates the asymmetric branch agents had
+        to write under v1, where ``error`` was missing on success and
+        ``field``/``op``/``value`` were missing on error. Mirrors the
+        "every key always present" contract of ``status --json``.
+
+        ``field``, ``op``, and ``value`` are always populated from the
+        outer-scope arguments — the callsite never has to thread them
+        through. The post-normalization values are reported (e.g., scalar
+        ``parsed_value`` becomes a real bool / lowercased string), which
+        is what an agent will care about.
+        """
+        if as_json:
+            try:
+                _value: object = parsed_value if is_scalar else value
+            except NameError:
+                _value = value
+            payload = {
+                "ok": ok,
+                "schema_version": _SETTINGS_PRIVACY_SCHEMA_VERSION,
+                "changed": bool(changed),
+                "field": field,
+                "op": op,
+                "value": _value,
+                "error": error,
+            }
+            click.echo(_json.dumps(payload))
+        # Prose was already printed via err_console at the call site (or the
+        # success block at the end); nothing to do here for prose mode.
+        if exit_code:
+            raise SystemExit(exit_code)
+
+    field = field.strip()
+    is_list = field in _PRIVACY_LIST_FIELDS
+    is_scalar = field in _PRIVACY_SCALAR_FIELDS
+    is_map = field in _PRIVACY_MAP_FIELDS
+
+    if not (is_list or is_scalar or is_map):
+        all_fields = sorted(_PRIVACY_LIST_FIELDS + _PRIVACY_SCALAR_FIELDS + _PRIVACY_MAP_FIELDS)
+        err_console.print(f"[red]Error:[/red] Unknown privacy field: {field}")
+        err_console.print(f"[dim]Available: {', '.join(all_fields)}[/dim]")
+        _result(False, exit_code=1, error=f"unknown_field:{field}")
+
+    if is_list and op == "set":
+        err_console.print(f"[red]Error:[/red] {field} is a list — use add/remove, not set.")
+        _result(False, exit_code=1, error=f"list_field_set_op:{field}")
+    if is_scalar and op != "set":
+        err_console.print(f"[red]Error:[/red] {field} is a scalar — use set, not {op}.")
+        _result(False, exit_code=1, error=f"scalar_field_bad_op:{field}={op}")
+
+    value = _privacy_list_field_value(value)
+
+    # Scalar normalization & validation
+    parsed_value: object = value
+    if is_scalar:
+        if field == "mode":
+            if value.lower() not in _PRIVACY_MODE_VALUES:
+                err_console.print(
+                    f"[red]Error:[/red] mode must be one of "
+                    f"{_PRIVACY_MODE_VALUES}, got: {value}"
+                )
+                _result(False, exit_code=1, error=f"invalid_mode:{value}")
+            parsed_value = value.lower()
+        elif field == "setup_skipped":
+            if value.lower() in ("true", "1", "yes"):
+                parsed_value = True
+            elif value.lower() in ("false", "0", "no"):
+                parsed_value = False
+            else:
+                err_console.print(
+                    f"[red]Error:[/red] {field} must be true/false, got: {value}"
+                )
+                _result(False, exit_code=1, error=f"invalid_bool:{field}={value}")
+
+    # Open the config under an advisory flock (todo 015 + 025). The
+    # context manager handles load → flock → mutate → atomic-save →
+    # invalidate-cache. Two concurrent `screencap settings privacy`
+    # invocations now serialize at the flock instead of racing on the
+    # read-modify-write cycle.
+    with _privacy_config_writer() as doc:
+        if "privacy" not in doc:
+            doc.add("privacy", tomlkit.table())
+        privacy_tbl = doc["privacy"]
+
+        changed = _settings_privacy_apply(
+            privacy_tbl=privacy_tbl,
+            field=field,
+            op=op,
+            value=value,
+            is_list=is_list,
+            is_scalar=is_scalar,
+            parsed_value=parsed_value,
+            err_console=err_console,
+            tomlkit=tomlkit,
+            _result=_result,
+        )
+
+    if changed:
+        err_console.print(f"  [bold]privacy.{field}[/bold] {op} {value}")
+        _result(True, changed=True)
+
+
+def _settings_privacy_apply(
+    *,
+    privacy_tbl,
+    field: str,
+    op: str,
+    value: str,
+    is_list: bool,
+    is_scalar: bool,
+    parsed_value,
+    err_console,
+    tomlkit,
+    _result,
+) -> bool:
+    """Apply a single privacy mutation to the in-memory tomlkit privacy table.
+
+    Returns ``True`` when the table was actually changed (caller should
+    surface the success result), ``False`` for an idempotent no-op (the
+    no-op result was already emitted in-place via ``_result``). Hard
+    errors raise ``SystemExit`` via ``_result(exit_code=...)`` and never
+    return.
+
+    Extracted from settings_privacy so the read-modify-write helper
+    (`_privacy_config_writer`) can wrap it with an advisory flock without
+    leaking a hundred-line block into the context manager body. Mutates
+    list fields in-place via tomlkit Array's append/remove (todo 016) so
+    inline comments and per-item formatting survive.
+    """
+    # Matrix-invariant guard: reject loosening any matrix-blocked class via
+    # allow_apps (todo 005). Evaluated at the *configured mode* — under
+    # `internal` this catches CHAT/EMAIL/CALENDAR/VIDEO_CALL (MASK_WINDOW)
+    # in addition to PASSWORD_MANAGER (EXCLUDE). Defaults to "internal" when
+    # mode is unset.
+    #
+    # Also consults the on-disk app_classes overrides (todo 030) so that a
+    # bundle absent from BUNDLE_ID_MAP but reclassified by the user as a
+    # sensitive class (e.g., `app_classes set com.example.foo=password_manager`)
+    # cannot be allow-listed in a follow-up call.
+    if is_list and field == "allow_apps" and op == "add":
+        from screencap.privacy.context import BROWSER_BUNDLE_IDS, BUNDLE_ID_MAP
+        from screencap.privacy.policy import ContextClass
+        configured_mode = str(privacy_tbl.get("mode") or "internal")
+
+        # Effective class: app_classes override > BUNDLE_ID_MAP > BROWSER_BUNDLE_IDS > None.
+        # BROWSER_BUNDLE_IDS resolves to BROWSER_UNVERIFIED at runtime via
+        # the classifier's browser detection, so a browser bundle is
+        # legitimately allow-listable even though it isn't in BUNDLE_ID_MAP.
+        effective_class = None
+        app_classes_overrides = dict(privacy_tbl.get("app_classes", {}))
+        override_str = app_classes_overrides.get(value)
+        if override_str:
+            try:
+                effective_class = ContextClass(str(override_str).lower())
+            except ValueError:
+                effective_class = None
+        if effective_class is None:
+            effective_class = BUNDLE_ID_MAP.get(value)
+        if effective_class is None and value in BROWSER_BUNDLE_IDS:
+            effective_class = ContextClass.BROWSER_UNVERIFIED
+
+        if effective_class is not None:
+            blocking_action = _matrix_blocks_allow_for_class(
+                effective_class, configured_mode,
+            )
+            if blocking_action is not None:
+                err_console.print(
+                    f"[red]Error:[/red] '{value}' is in {effective_class.value} which the "
+                    f"privacy matrix at mode={configured_mode!r} produces "
+                    f"{blocking_action.value} — allow_apps cannot loosen this. "
+                    f"Set mode=public to capture broadly, or override at the "
+                    f"per-app level via app_classes (subject to the same guard)."
+                )
+                _result(
+                    False,
+                    exit_code=1,
+                    error=f"matrix_blocks_allow:{effective_class.value}@{configured_mode}",
+                )
+        else:
+            # Unknown bundle (no BUNDLE_ID_MAP entry, no app_classes
+            # override) — fail-closed (Finding 001 Variant A). The runtime
+            # evaluator's strictness floor (policy.py allow_apps step)
+            # already blocks loosening when a downstream classifier
+            # resolves the bundle to CHAT/EMAIL/etc., so the harm window
+            # is narrow. But the CLI add-time path stays explicit: require
+            # the user to classify the bundle first, so the matrix can
+            # reason about it. Keeps the privacy-first posture symmetric
+            # with how PASSWORD_MANAGER and friends are handled.
+            err_console.print(
+                f"[red]Error:[/red] '{value}' is not in BUNDLE_ID_MAP and has no "
+                f"app_classes override — refusing to allow-list an unclassified "
+                f"bundle. Run [bold]screencap settings privacy app_classes set "
+                f"{value}=<class>[/bold] first (e.g., browser_unverified for an "
+                f"AI tool), then add to allow_apps if needed."
+            )
+            _result(
+                False,
+                exit_code=1,
+                error=f"unknown_bundle_id:{value}",
+            )
+
+    if is_list:
+        # Mutate the tomlkit Array in place (todo 016) so per-item inline
+        # comments and multi-line formatting survive. The previous
+        # `list(privacy_tbl.get(field, []))` + reassign approach silently
+        # destroyed all tomlkit metadata.
+        arr = privacy_tbl.get(field)
+        if arr is None:
+            arr = tomlkit.array()
+            privacy_tbl[field] = arr
+        if op == "add":
+            if value in arr:
+                # Idempotent no-op
+                err_console.print(f"[dim]{field} already contains {value} — no change.[/dim]")
+                _result(True, changed=False)
+                return False
+            arr.append(value)
+        else:  # remove
+            if value not in arr:
+                err_console.print(f"[dim]{field} does not contain {value} — no change.[/dim]")
+                _result(True, changed=False)
+                return False
+            arr.remove(value)
+    elif is_scalar:
+        privacy_tbl[field] = parsed_value
+    else:
+        # Map field (app_classes) — `add`/`set` use BUNDLE=CLASS syntax;
+        # `remove` accepts just the bundle ID (no class required for removal).
+        if op == "remove":
+            bundle = value.split("=", 1)[0].strip()
+            cur = dict(privacy_tbl.get(field, {}))
+            existing_override = cur.get(bundle)
+            # Matrix-floor guard for `remove` (Finding 001 Variant C).
+            # The two-step bypass: `set X=password_manager` (accepted as
+            # tightening) → `remove X` (no check) → `allow_apps add X`
+            # (effective_class is now None → guard at line 3172 short-
+            # circuits → bundle ALLOWed at runtime). Reject the remove if
+            # it would loosen the matrix at the configured mode (e.g.,
+            # PASSWORD_MANAGER → BUNDLE_ID_MAP fallback or UNKNOWN).
+            if existing_override:
+                from screencap.privacy.actions import _ACTION_SEVERITY
+                from screencap.privacy.context import BUNDLE_ID_MAP as _BUNDLE_MAP
+                from screencap.privacy.policy import (
+                    ContextClass,
+                    PrivacyMode,
+                    get_matrix_action,
+                )
+                configured_mode = str(privacy_tbl.get("mode") or "internal")
+                try:
+                    _mode_enum = PrivacyMode(configured_mode)
+                except ValueError:
+                    _mode_enum = PrivacyMode.INTERNAL
+                try:
+                    old_class = ContextClass(str(existing_override).lower())
+                except ValueError:
+                    old_class = None
+                fallback_class = _BUNDLE_MAP.get(bundle, ContextClass.UNKNOWN)
+                if old_class is not None:
+                    old_action = get_matrix_action(old_class, _mode_enum)
+                    new_action = get_matrix_action(fallback_class, _mode_enum)
+                    if _ACTION_SEVERITY[new_action] > _ACTION_SEVERITY[old_action]:
+                        err_console.print(
+                            f"[red]Error:[/red] removing the '{bundle}' classification "
+                            f"would revert it from {old_class.value} ({old_action.value}) "
+                            f"to {fallback_class.value} ({new_action.value}) at "
+                            f"mode={configured_mode!r} — that loosens the matrix and is "
+                            f"rejected. To intentionally weaken, set the bundle to a "
+                            f"more permissive class explicitly via app_classes set, "
+                            f"which is subject to the same severity guard."
+                        )
+                        _result(
+                            False,
+                            exit_code=1,
+                            error=(
+                                f"matrix_invariant_blocks_remove:"
+                                f"{old_class.value}→{fallback_class.value}@{configured_mode}"
+                            ),
+                        )
+            cur.pop(bundle, None)
+            privacy_tbl[field] = cur
+        else:  # add or set
+            if "=" not in value:
+                err_console.print(
+                    f"[red]Error:[/red] map field {field} requires BUNDLE_ID=CLASS for {op}, got: {value}"
+                )
+                _result(False, exit_code=1, error=f"map_value_missing_eq:{field}={value}")
+            bundle, ctx_str = value.split("=", 1)
+            bundle, ctx_str = bundle.strip(), ctx_str.strip()
+            # Validate CLASS against ContextClass enum so we don't silently
+            # corrupt config with a typo that crashes the next start
+            # (todo 010). Accept upper/lower case input; normalize to value.
+            from screencap.privacy.context import BUNDLE_ID_MAP
+            from screencap.privacy.policy import ContextClass
+            valid_classes = {c.value for c in ContextClass}
+            normalized = ctx_str.lower()
+            if normalized not in valid_classes:
+                err_console.print(
+                    f"[red]Error:[/red] Unknown context class: {ctx_str}"
+                )
+                err_console.print(
+                    f"[dim]Available: {', '.join(sorted(valid_classes))}[/dim]"
+                )
+                _result(False, exit_code=1, error=f"unknown_context_class:{ctx_str}")
+
+            # Matrix-EXCLUDE invariant for app_classes (todo 006). Without
+            # this guard, a user could `app_classes set com.1password.1password=unknown`
+            # to reclassify the bundle out of PASSWORD_MANAGER, then
+            # `allow_apps add com.1password.1password` (matrix now ALLOW).
+            # Reject any reclassification that would loosen a currently-
+            # blocked class. The check evaluates the OLD class (from
+            # BUNDLE_ID_MAP or a prior app_classes override) against the
+            # matrix at the configured mode — if it's a blocked class, the
+            # new class must not be more permissive at that mode.
+            old_class = None
+            existing_overrides = dict(privacy_tbl.get(field, {}))
+            existing_override = existing_overrides.get(bundle)
+            if existing_override:
+                try:
+                    old_class = ContextClass(str(existing_override).lower())
+                except ValueError:
+                    old_class = None
+            if old_class is None:
+                old_class = BUNDLE_ID_MAP.get(bundle)
+            # Implicit baseline for unknown bundles is UNKNOWN (Finding 001
+            # Variant B). The previous gate (`if old_class is not None`)
+            # short-circuited for any bundle absent from BUNDLE_ID_MAP and
+            # without a prior override, accepting any reclassification —
+            # including writing the same UNKNOWN class back, or escalating
+            # in either direction without comparison. Treat unknown bundles
+            # as if their effective class were UNKNOWN so the severity
+            # comparison below applies symmetrically.
+            if old_class is None:
+                old_class = ContextClass.UNKNOWN
+
+            if old_class is not None:
+                configured_mode = str(privacy_tbl.get("mode") or "internal")
+                from screencap.privacy.actions import _ACTION_SEVERITY
+                from screencap.privacy.policy import (
+                    PrivacyMode,
+                    get_matrix_action,
+                )
+                try:
+                    _mode_enum = PrivacyMode(configured_mode)
+                except ValueError:
+                    _mode_enum = PrivacyMode.INTERNAL
+                new_class = ContextClass(normalized)
+                old_action = get_matrix_action(old_class, _mode_enum)
+                new_action = get_matrix_action(new_class, _mode_enum)
+                # Compare action SEVERITY directly (not just whether the new
+                # action is "blocking"). Higher severity = looser. Reject
+                # any reclassification that loosens the matrix at the
+                # configured mode — covers EXCLUDE→MASK_WINDOW (e.g.,
+                # password_manager → chat) which the previous
+                # blocking-vs-non-blocking check missed because both endpoints
+                # were "blocking".
+                if _ACTION_SEVERITY[new_action] > _ACTION_SEVERITY[old_action]:
+                    err_console.print(
+                        f"[red]Error:[/red] reclassifying '{bundle}' from "
+                        f"{old_class.value} to {new_class.value} would loosen "
+                        f"the matrix at mode={configured_mode!r} from "
+                        f"{old_action.value} to {new_action.value} — rejected. "
+                        f"Set mode=public if you want broader capture, or "
+                        f"keep the existing classification."
+                    )
+                    _result(
+                        False,
+                        exit_code=1,
+                        error=(
+                            f"matrix_invariant_blocks_reclassify:"
+                            f"{old_class.value}→{new_class.value}@{configured_mode}"
+                        ),
+                    )
+
+            cur = existing_overrides
+            cur[bundle] = normalized
+            privacy_tbl[field] = cur
+
+    return True
 
 
 # ---------------------------------------------------------------------------

@@ -381,22 +381,46 @@ _PERMISSION_CHECK_CODE: dict[str, str] = {
     "Input Monitoring": (
         "import Quartz; print(bool(Quartz.CGPreflightListenEventAccess()))"
     ),
+    # Screen Recording entry added (todo 002) so the mid-recording watcher
+    # can use the fresh-subprocess path. macOS caches TCC state per-process,
+    # so an in-process CGPreflightScreenCaptureAccess() call inside the
+    # recorder's main loop returns the cached value at recorder start —
+    # never the live state — defeating the whole point of the watcher.
+    "Screen Recording": (
+        "import Quartz; print(bool(Quartz.CGPreflightScreenCaptureAccess()))"
+    ),
 }
 
 
-def _check_permission_fresh(name: str) -> bool:
-    """Check a permission in a fresh subprocess to bypass OS-level caching."""
+def _check_permission_fresh(name: str) -> bool | None:
+    """Check a permission in a fresh subprocess to bypass OS-level caching.
+
+    Tri-state return:
+      - ``True``  — probe succeeded, permission granted
+      - ``False`` — probe succeeded, permission denied
+      - ``None``  — probe FAILED (subprocess timeout, OSError, missing
+                    PERMISSION_CHECK_CODE entry, or unparseable stdout).
+                    Caller must treat this as "couldn't determine" and
+                    NOT as "denied" — otherwise a transient Quartz/PyObjC
+                    hiccup during a Sequoia overlay would kill the
+                    in-progress recording.
+    """
     code = _PERMISSION_CHECK_CODE.get(name)
     if not code:
-        return False
+        return None
     try:
         result = subprocess.run(
             [sys.executable, "-c", code],
             capture_output=True, text=True, timeout=5,
         )
-        return result.stdout.strip() == "True"
     except Exception:
+        return None
+    out = result.stdout.strip()
+    if out == "True":
+        return True
+    if out == "False":
         return False
+    return None
 
 
 def _check_macos_permissions() -> None:
@@ -452,19 +476,83 @@ def _check_macos_permissions() -> None:
             console.print("    screencap start")
             raise SystemExit(1)
 
-        # Non-restart permission — poll with subprocess checks until granted
+        # Non-restart permission — poll with subprocess checks until granted.
+        # _check_permission_fresh is tri-state (True / False / None); only
+        # ``is True`` counts as "granted". None (probe failed) keeps polling.
         with console.status(f"[bold]  Waiting for {name}...[/bold]"):
             for _ in range(120):
                 time.sleep(1)
-                if _check_permission_fresh(name):
+                if _check_permission_fresh(name) is True:
                     break
 
-        if _check_permission_fresh(name):
+        result = _check_permission_fresh(name)
+        if result is True:
             console.print(f"  [green]✓[/green] {name} granted!\n")
         else:
-            console.print(f"\n  [red]Error:[/red] {name} was not granted in time.")
+            if result is None:
+                console.print(
+                    f"\n  [yellow]Warning:[/yellow] Could not verify "
+                    f"{name} (subprocess probe failed)."
+                )
+            else:
+                console.print(f"\n  [red]Error:[/red] {name} was not granted in time.")
             console.print("  Grant the permission and re-run: screencap start")
             raise SystemExit(1)
+
+
+# ---------------------------------------------------------------------------
+# Unit 8: mid-recording permission revocation watcher
+# ---------------------------------------------------------------------------
+
+
+def _check_permissions_now() -> tuple[bool, str | None]:
+    """Probe the three TCC permissions; return (all_ok, missing_name).
+
+    Designed to run on the recorder's main loop every ~5s. Returns
+    (False, "screen_recording" | "accessibility" | "input_monitoring") on
+    the first detected revocation. Microphone is intentionally NOT polled
+    here — audio loss should not abort a video-only capture.
+
+    Uses fresh subprocesses (todo 002) instead of in-process PyObjC calls
+    because macOS caches TCC state per-process — an in-process call from
+    the recorder's main loop returns the cached value at recorder startup,
+    not the live state. The 50-100ms-per-call subprocess cost happens once
+    every 5s and is bounded against recording's existing CPU footprint.
+
+    Probe failures are FAIL-OPEN: ``_check_permission_fresh`` returns
+    tri-state and we only treat an explicit ``False`` as a revocation. A
+    subprocess timeout, OSError, or unparseable stdout returns ``None`` —
+    we skip that permission for this tick and retry on the next. Without
+    this distinction (the previous bool-only path) a transient Quartz /
+    PyObjC hiccup during a Sequoia overlay would kill the in-progress
+    recording.
+    """
+    if sys.platform != "darwin":
+        return True, None
+
+    # Order matters — Screen Recording is the most user-impactful loss
+    # (capture goes black), so report it first when multiple are revoked.
+    for tcc_name, missing_label in (
+        ("Screen Recording", "screen_recording"),
+        ("Accessibility", "accessibility"),
+        ("Input Monitoring", "input_monitoring"),
+    ):
+        try:
+            granted = _check_permission_fresh(tcc_name)
+        except Exception:
+            # Defensive belt-and-suspenders: _check_permission_fresh already
+            # returns None on subprocess errors, but a future change could
+            # cause it to raise. Treat any raise as "couldn't determine"
+            # rather than risk killing the recording.
+            granted = None
+        if granted is None:
+            # Probe failed — couldn't determine state. Fail-open for this
+            # tick; if the permission really is revoked, the next tick will
+            # see a clean False and report it.
+            continue
+        if granted is False:
+            return False, missing_label
+    return True, None
 
 
 # ---------------------------------------------------------------------------
@@ -621,6 +709,30 @@ def start_recording(
         capture_dir = Path(output_dir)
     else:
         capture_dir = get_recordings_dir() / name
+
+    # Process-exclusive lock — only the standalone CLI direct path claims
+    # here. In session mode the SessionController parent has already claimed
+    # at __init__, and workers (start_recording invoked with
+    # _skip_pidfile=True) inherit that lock by being children.
+    if not _skip_pidfile:
+        from screencap._stderr_events import emit_event as _emit_event, resolve_claimant, EVENT_LOCK_CONTENDED
+        from screencap.pidfile import LockContended, claim_lock
+
+        claimant = resolve_claimant()
+        try:
+            # Standalone single-recording path: capture_dir is known now, so
+            # claim_lock writes recording_started_at = now and
+            # recording_name = capture_dir.name in one shot. status --json
+            # then reports is_recording=true with a fresh elapsed time.
+            claim_lock(capture_dir, claimant=claimant)
+        except LockContended as exc:
+            # Lifecycle events go on stderr (todo 004): stdout is reserved for
+            # human-readable rich output.
+            try:
+                _emit_event(EVENT_LOCK_CONTENDED, owner=exc.owner)
+            except Exception:
+                pass
+            raise SystemExit(2) from None
 
     if capture_dir.exists() and any(capture_dir.iterdir()):
         console.print(
@@ -1259,10 +1371,42 @@ def start_recording(
                 console=console,
                 refresh_per_second=2,
             ) as live:
+                _last_perm_check = 0.0
+                # 5s interval (todo 002) bounds the subprocess cost from the
+                # fresh-TCC-check path. Combined with SwiftUI's own 5s poll,
+                # detection SLA stays well under 10s.
+                _PERM_CHECK_INTERVAL = 5.0
                 try:
                     while recorder.is_recording and not _stop_event.is_set():
                         elapsed = time.time() - t0
                         pulse_on = int(elapsed) % 2 == 0
+
+                        # Unit 8: mid-recording permission revocation watcher.
+                        # Engine-side defense for the silent-black-frame TCC
+                        # bypass anti-pattern. SwiftUI also polls independently
+                        # (5s + on NSWorkspace activation), but this catches
+                        # the case where the SwiftUI watcher misses a transition.
+                        if elapsed - _last_perm_check >= _PERM_CHECK_INTERVAL:
+                            _last_perm_check = elapsed
+                            _ok, _missing = _check_permissions_now()
+                            if not _ok and not _stop_event.is_set():
+                                _stop_reason = f"permission_revoked_{_missing}"
+                                # Emit the structured stderr event for SwiftUI
+                                # consumption (Unit 8a contract).
+                                try:
+                                    from screencap._stderr_events import (
+                                        EVENT_PERMISSION_LOST,
+                                        emit_event as _emit_event,
+                                    )
+                                    _emit_event(
+                                        EVENT_PERMISSION_LOST,
+                                        permission=_missing,
+                                        elapsed=elapsed,
+                                    )
+                                except Exception:
+                                    pass
+                                _stop_event.set()
+                                recorder.stop()
 
                         # Periodic disk space check
                         if elapsed - last_disk_check >= disk_check_interval:
@@ -1684,6 +1828,46 @@ def start_recording(
     # Restore output if we suppressed it
     if not verbose:
         _restore_output()
+
+    # Sidecar metadata for the worker → .recording_ready merge (todo 002, 009).
+    # Writes force_stopped + terminated_reason so SessionController can
+    # propagate the right SystemExit code to the SwiftUI shell.
+    try:
+        _force_stopped = bool(
+            getattr(chunk_processor, "was_force_stopped", False)
+            or _stop_reason in ("force", "child_crash")
+        )
+        _term_reason = None
+        if _stop_reason == "disk_full":
+            _term_reason = "disk_full"
+        elif _stop_reason and _stop_reason.startswith("permission_revoked_"):
+            _term_reason = "permission_lost"
+        elif _stop_reason in ("force", "child_crash"):
+            _term_reason = "force_killed"
+        (capture_dir / ".recording_stop_meta.json").write_text(json.dumps({
+            "force_stopped": _force_stopped,
+            "terminated_reason": _term_reason,
+            "stop_reason_raw": _stop_reason or None,
+        }))
+    except OSError as exc:
+        # Failure here breaks the documented exit-code contract (todo 005
+        # / R6): SessionController.run() reads the absent sidecar, leaves
+        # _terminated_reason=None, and exits 0 even on permission_lost /
+        # disk_full. Surface as a structured event so SwiftUI can correlate
+        # the unexpected exit_code=0 with a real terminal-reason failure.
+        try:
+            from screencap._stderr_events import (
+                EVENT_TERMINATED_REASON_PERSIST_FAILED,
+                emit_event as _emit_event,
+            )
+            _emit_event(
+                EVENT_TERMINATED_REASON_PERSIST_FAILED,
+                error=str(exc),
+                capture_dir=str(capture_dir),
+                terminated_reason=_term_reason,
+            )
+        except Exception:
+            pass
 
     if _stop_reason == "disk_full":
         raise DiskFullError(

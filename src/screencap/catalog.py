@@ -41,6 +41,12 @@ class RecordingInfo(NamedTuple):
     chunks_total: int = 0  # number of video chunks (0 = legacy single-file)
     chunks_uploaded: int = 0  # number of chunks with upload status files
     intent: str | None = None  # "cloud", "local", or None (legacy)
+    # Raw values for SwiftUI consumers (Unit 4c). The pre-formatted ``date``
+    # / ``duration`` strings remain for backward compatibility with anything
+    # that reads the existing JSON; SwiftUI uses these unformatted fields
+    # for HH:MM rendering, sorting, and date-bucket grouping.
+    started_at: float | None = None  # Unix timestamp from the recording row
+    duration_seconds: float | None = None  # raw seconds, source of `duration`
 
 
 def _fmt_duration(seconds: float | None) -> str:
@@ -209,6 +215,8 @@ def list_recordings(recordings_dir: Path | None = None) -> list[RecordingInfo]:
                 chunks_total=chunks_total,
                 chunks_uploaded=chunks_uploaded,
                 intent=intent,
+                started_at=started,
+                duration_seconds=duration,
             )
         )
 

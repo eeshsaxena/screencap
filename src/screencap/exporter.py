@@ -35,11 +35,15 @@ def build_export_metadata(exclude_moves: bool) -> dict:
     }
 
 
+PrivacyFilter = Callable[["WindowSwitchEvent"], "WindowSwitchEvent | None"]
+
+
 def export_recording(
     recording_dir: Path | str,
     output_path: str | None,
     exclude_moves: bool,
     metadata: dict | None = None,
+    privacy_filter: PrivacyFilter | None = None,
     *,
     network_scrub_pipeline: "NetworkScrubPipeline | None" = None,
 ) -> int:
@@ -52,12 +56,16 @@ def export_recording(
     When *output_path* is a file path, uses atomic write (write to .tmp,
     rename on success).  When *output_path* is None, writes to stdout.
 
+    When *privacy_filter* is supplied, it is applied to every
+    ``WindowSwitchEvent`` — see ``_write_events`` for the contract.
+
     Args:
         recording_dir: Path to recording directory.
         output_path: Output file path or None for stdout.
         exclude_moves: When True, ``mouse.move`` events are dropped.
         metadata: Optional ``_meta`` header dict; built via
             :func:`build_export_metadata` by callers.
+        privacy_filter: Optional ``WindowSwitchEvent`` filter callable.
         network_scrub_pipeline: Optional V1.5
             :class:`NetworkScrubPipeline`. Forwarded into
             :meth:`CaptureSession.export_events` so encrypted bodies
@@ -82,6 +90,7 @@ def export_recording(
                 sys.stdout,
                 exclude_moves,
                 metadata,
+                privacy_filter=privacy_filter,
                 network_scrub_pipeline=network_scrub_pipeline,
             )
         else:
@@ -94,6 +103,7 @@ def export_recording(
                         f,
                         exclude_moves,
                         metadata,
+                        privacy_filter=privacy_filter,
                         network_scrub_pipeline=network_scrub_pipeline,
                     )
                 os.rename(tmp_path, output_path)
@@ -178,7 +188,7 @@ def _write_events(
     out_file: IO[str],
     exclude_moves: bool,
     metadata: dict | None,
-    privacy_filter: Callable[[WindowSwitchEvent], WindowSwitchEvent | None] | None = None,
+    privacy_filter: PrivacyFilter | None = None,
     *,
     network_scrub_pipeline: "NetworkScrubPipeline | None" = None,
 ) -> int:
