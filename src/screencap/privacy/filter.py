@@ -192,3 +192,37 @@ def build_cloud_window_filter(
         cloud_intent=True,
         capture_dir=capture_dir,
     )
+
+
+def build_local_window_filter(
+    privacy_mode: str = "internal",
+    capture_dir: Path | None = None,
+) -> Callable[[WindowSwitchEvent], WindowSwitchEvent | None]:
+    """Sanctioned constructor for local-only (non-cloud) window-event filtering.
+
+    Local callers MUST go through this factory rather than calling
+    ``build_privacy_filter`` directly with ``cloud_intent=False``. The AST
+    CI guard at ``tests/test_privacy_filter_call_graph.py`` enforces this
+    boundary so ad-hoc filter construction outside ``screencap.privacy.filter``
+    cannot drift away from the documented contract.
+
+    Symmetric with :func:`build_cloud_window_filter` — but always returns
+    a filter (no ``cloud_bound``-style structural switch); the caller has
+    already decided to apply privacy filtering by calling this constructor.
+
+    Args:
+        privacy_mode: Configured privacy mode string. Resolved to
+            ``PrivacyMode.INTERNAL`` if unparseable.
+        capture_dir: Path to the capture directory. Used for loading
+            ``.menubar_overrides.json`` (consulted only on the local path —
+            cloud-bound exports skip it intentionally).
+
+    Returns:
+        A filter callable that takes a ``WindowSwitchEvent`` and returns
+        the (possibly masked) event or ``None`` to suppress.
+    """
+    return build_privacy_filter(
+        privacy_mode=privacy_mode,
+        cloud_intent=False,
+        capture_dir=capture_dir,
+    )

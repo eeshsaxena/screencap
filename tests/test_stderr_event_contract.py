@@ -82,9 +82,13 @@ class TestEventSchemas:
 
     These are golden-file assertions against the schema doc — any change to
     field names or types must update the doc AND bump _EVENT_SCHEMA_VERSION.
+    Every event payload MUST carry ``schema_version``; SwiftUI parsers use
+    it for runtime breaking-change detection. Each test below asserts the
+    field is present and equals the current contract value.
     """
 
     def test_started_schema(self):
+        from screencap._stderr_events import _EVENT_SCHEMA_VERSION
         from screencap.cli import _emit_event
 
         out = _capture_stderr(lambda: _emit_event(
@@ -95,6 +99,7 @@ class TestEventSchemas:
         evt = _parse_lines(out)[0]
         assert set(evt.keys()) >= {"type", "ts", "capture_dir", "claimant"}
         assert evt["type"] == "started"
+        assert evt["schema_version"] == _EVENT_SCHEMA_VERSION
         assert isinstance(evt["capture_dir"], str)
         assert evt["claimant"] in ("cli", "swiftui")
 
@@ -119,6 +124,7 @@ class TestEventSchemas:
         assert evt["claimant"] in ("cli", "swiftui")
 
     def test_recording_finalized_schema(self):
+        from screencap._stderr_events import _EVENT_SCHEMA_VERSION
         from screencap.cli import _emit_event
 
         out = _capture_stderr(lambda: _emit_event(
@@ -130,12 +136,14 @@ class TestEventSchemas:
         ))
         evt = _parse_lines(out)[0]
         assert evt["type"] == "recording_finalized"
+        assert evt["schema_version"] == _EVENT_SCHEMA_VERSION
         assert isinstance(evt["name"], str)
         assert isinstance(evt["duration_seconds"], float)
         assert isinstance(evt["force_stopped"], bool)
         assert isinstance(evt["disk_full"], bool)
 
     def test_disk_full_schema(self):
+        from screencap._stderr_events import _EVENT_SCHEMA_VERSION
         from screencap.cli import _emit_event
 
         out = _capture_stderr(lambda: _emit_event(
@@ -145,6 +153,7 @@ class TestEventSchemas:
         ))
         evt = _parse_lines(out)[0]
         assert evt["type"] == "disk_full"
+        assert evt["schema_version"] == _EVENT_SCHEMA_VERSION
         assert evt["name"] == "rec-x"
         assert evt["capture_dir"] == "/tmp/rec-x"
 
@@ -157,6 +166,7 @@ class TestEventSchemas:
         emitted) and `since_frame` (never sent), which was false coverage —
         SwiftUI's parser would only fail on the first real revocation.
         """
+        from screencap._stderr_events import _EVENT_SCHEMA_VERSION
         from screencap.cli import _emit_event
 
         out = _capture_stderr(lambda: _emit_event(
@@ -166,6 +176,7 @@ class TestEventSchemas:
         ))
         evt = _parse_lines(out)[0]
         assert evt["type"] == "permission_lost"
+        assert evt["schema_version"] == _EVENT_SCHEMA_VERSION
         # Reserved values: `microphone` is documented in the schema doc but
         # not emitted in v1; production-emittable values are the three below.
         assert evt["permission"] in ("screen_recording", "accessibility", "input_monitoring")
@@ -174,11 +185,13 @@ class TestEventSchemas:
         # do not assert on it.
 
     def test_stopped_schema(self):
+        from screencap._stderr_events import _EVENT_SCHEMA_VERSION
         from screencap.cli import _emit_event
 
         out = _capture_stderr(lambda: _emit_event("stopped", exit_code=0))
         evt = _parse_lines(out)[0]
         assert evt["type"] == "stopped"
+        assert evt["schema_version"] == _EVENT_SCHEMA_VERSION
         assert evt["exit_code"] == 0
 
     def test_chunk_finalized_reserved_schema_serializes(self):

@@ -476,17 +476,26 @@ def _check_macos_permissions() -> None:
             console.print("    screencap start")
             raise SystemExit(1)
 
-        # Non-restart permission — poll with subprocess checks until granted
+        # Non-restart permission — poll with subprocess checks until granted.
+        # _check_permission_fresh is tri-state (True / False / None); only
+        # ``is True`` counts as "granted". None (probe failed) keeps polling.
         with console.status(f"[bold]  Waiting for {name}...[/bold]"):
             for _ in range(120):
                 time.sleep(1)
-                if _check_permission_fresh(name):
+                if _check_permission_fresh(name) is True:
                     break
 
-        if _check_permission_fresh(name):
+        result = _check_permission_fresh(name)
+        if result is True:
             console.print(f"  [green]✓[/green] {name} granted!\n")
         else:
-            console.print(f"\n  [red]Error:[/red] {name} was not granted in time.")
+            if result is None:
+                console.print(
+                    f"\n  [yellow]Warning:[/yellow] Could not verify "
+                    f"{name} (subprocess probe failed)."
+                )
+            else:
+                console.print(f"\n  [red]Error:[/red] {name} was not granted in time.")
             console.print("  Grant the permission and re-run: screencap start")
             raise SystemExit(1)
 
@@ -1339,9 +1348,12 @@ def start_recording(
                                 # Emit the structured stderr event for SwiftUI
                                 # consumption (Unit 8a contract).
                                 try:
-                                    from screencap._stderr_events import emit_event as _emit_event, EVENT_PERMISSION_LOST
+                                    from screencap._stderr_events import (
+                                        EVENT_PERMISSION_LOST,
+                                        emit_event as _emit_event,
+                                    )
                                     _emit_event(
-                                        "permission_lost",
+                                        EVENT_PERMISSION_LOST,
                                         permission=_missing,
                                         elapsed=elapsed,
                                     )

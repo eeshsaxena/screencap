@@ -138,13 +138,7 @@ def _download_nlp_models() -> None:
 # `_emit_event` lives in the stdlib-only `screencap._stderr_events` module so
 # spawn workers and the recording hot loop can import it without dragging
 # Click + rich Console into the child process.
-from screencap._stderr_events import (  # noqa: E402,F401
-    _EVENT_SCHEMA_VERSION,
-    EVENT_DISK_FULL,
-    EVENT_LOCK_CONTENDED,
-    EVENT_PERMISSION_LOST,
-    EVENT_RECORDING_FINALIZED,
-    EVENT_STARTED,
+from screencap._stderr_events import (  # noqa: E402
     EVENT_STOPPED,
     emit_event as _emit_event,
 )
@@ -361,7 +355,11 @@ def _maybe_prompt_matrix_acknowledgement() -> None:
             import select
 
             select.select([_sys.stdin], [], [], 5.0)
-        except Exception:
+        except BaseException:
+            # Widen to BaseException so KeyboardInterrupt during the 5s
+            # wait does not skip the ack-flag write below — otherwise the
+            # prompt re-fires on every subsequent ``screencap start`` until
+            # the user lets it time out.
             pass
 
     try:
@@ -427,6 +425,18 @@ def start(
       Cloud recordings are shown on the website by default.
       --unlisted                hide this recording (still uploads, just not listed)
       screencap settings        view/change the default visibility setting
+
+    \b
+    Exit codes (cross-language contract for SwiftUI / agent consumers):
+      0  Clean stop
+      1  Generic failure (uncaught exception, child crash)
+      2  Lock-already-held (another recording is active)
+      3  Permission lost mid-recording (Screen Recording / Accessibility / Input Monitoring)
+      4  Disk full
+      5  User-initiated force-quit (2-tap Ctrl+C)
+
+    Lifecycle events are emitted as line-buffered JSON on stderr — see
+    docs/research/2026-04-28-stderr-event-schema.md.
     """
     from datetime import datetime
 
@@ -1240,7 +1250,7 @@ def _build_export_privacy_filter(recording_dir):
     """
     from pathlib import Path as _Path
 
-    from screencap.privacy.filter import build_privacy_filter
+    from screencap.privacy.filter import build_local_window_filter
 
     err_console = Console(stderr=True)
     mode = None
@@ -1274,9 +1284,8 @@ def _build_export_privacy_filter(recording_dir):
             f"mode for accurate filtering."
         )
 
-    return build_privacy_filter(
+    return build_local_window_filter(
         privacy_mode=mode,
-        cloud_intent=False,
         capture_dir=recording_dir,
     )
 
@@ -1658,7 +1667,20 @@ def status(as_json, no_nlp_check):
 @cli.command()
 @click.option("--force", is_flag=True, help="Skip SIGTERM and go straight to SIGKILL.")
 def stop(force):
-    """Stop recording processes."""
+    """Stop recording processes.
+
+    \b
+    Without --force: send SIGTERM to the lock owner, wait up to 30s for
+    a clean shutdown, then fall through to an orphan-children scan.
+
+    \b
+    With --force: SIGKILL the lock owner directly (so a hung-but-alive
+    SessionController can be taken down — find_orphaned_processes returns
+    nothing while the parent lives), then run the orphan-children scan.
+    Use this only when the graceful path has already failed; previously
+    --force was a no-op against a live parent and is now actively
+    destructive against the recording session.
+    """
     import os as _os
     import signal as _signal
     import time as _time
@@ -3143,11 +3165,14 @@ def _settings_privacy_apply(
     # sensitive class (e.g., `app_classes set com.example.foo=password_manager`)
     # cannot be allow-listed in a follow-up call.
     if is_list and field == "allow_apps" and op == "add":
-        from screencap.privacy.context import BUNDLE_ID_MAP
+        from screencap.privacy.context import BROWSER_BUNDLE_IDS, BUNDLE_ID_MAP
         from screencap.privacy.policy import ContextClass
         configured_mode = str(privacy_tbl.get("mode") or "internal")
 
-        # Effective class: app_classes override > BUNDLE_ID_MAP > None.
+        # Effective class: app_classes override > BUNDLE_ID_MAP > BROWSER_BUNDLE_IDS > None.
+        # BROWSER_BUNDLE_IDS resolves to BROWSER_UNVERIFIED at runtime via
+        # the classifier's browser detection, so a browser bundle is
+        # legitimately allow-listable even though it isn't in BUNDLE_ID_MAP.
         effective_class = None
         app_classes_overrides = dict(privacy_tbl.get("app_classes", {}))
         override_str = app_classes_overrides.get(value)
@@ -3158,6 +3183,8 @@ def _settings_privacy_apply(
                 effective_class = None
         if effective_class is None:
             effective_class = BUNDLE_ID_MAP.get(value)
+        if effective_class is None and value in BROWSER_BUNDLE_IDS:
+            effective_class = ContextClass.BROWSER_UNVERIFIED
 
         if effective_class is not None:
             blocking_action = _matrix_blocks_allow_for_class(
@@ -3176,6 +3203,28 @@ def _settings_privacy_apply(
                     exit_code=1,
                     error=f"matrix_blocks_allow:{effective_class.value}@{configured_mode}",
                 )
+        else:
+            # Unknown bundle (no BUNDLE_ID_MAP entry, no app_classes
+            # override) — fail-closed (Finding 001 Variant A). The runtime
+            # evaluator's strictness floor (policy.py allow_apps step)
+            # already blocks loosening when a downstream classifier
+            # resolves the bundle to CHAT/EMAIL/etc., so the harm window
+            # is narrow. But the CLI add-time path stays explicit: require
+            # the user to classify the bundle first, so the matrix can
+            # reason about it. Keeps the privacy-first posture symmetric
+            # with how PASSWORD_MANAGER and friends are handled.
+            err_console.print(
+                f"[red]Error:[/red] '{value}' is not in BUNDLE_ID_MAP and has no "
+                f"app_classes override — refusing to allow-list an unclassified "
+                f"bundle. Run [bold]screencap settings privacy app_classes set "
+                f"{value}=<class>[/bold] first (e.g., browser_unverified for an "
+                f"AI tool), then add to allow_apps if needed."
+            )
+            _result(
+                False,
+                exit_code=1,
+                error=f"unknown_bundle_id:{value}",
+            )
 
     if is_list:
         # Mutate the tomlkit Array in place (todo 016) so per-item inline
@@ -3207,6 +3256,53 @@ def _settings_privacy_apply(
         if op == "remove":
             bundle = value.split("=", 1)[0].strip()
             cur = dict(privacy_tbl.get(field, {}))
+            existing_override = cur.get(bundle)
+            # Matrix-floor guard for `remove` (Finding 001 Variant C).
+            # The two-step bypass: `set X=password_manager` (accepted as
+            # tightening) → `remove X` (no check) → `allow_apps add X`
+            # (effective_class is now None → guard at line 3172 short-
+            # circuits → bundle ALLOWed at runtime). Reject the remove if
+            # it would loosen the matrix at the configured mode (e.g.,
+            # PASSWORD_MANAGER → BUNDLE_ID_MAP fallback or UNKNOWN).
+            if existing_override:
+                from screencap.privacy.actions import _ACTION_SEVERITY
+                from screencap.privacy.context import BUNDLE_ID_MAP as _BUNDLE_MAP
+                from screencap.privacy.policy import (
+                    ContextClass,
+                    PrivacyMode,
+                    get_matrix_action,
+                )
+                configured_mode = str(privacy_tbl.get("mode") or "internal")
+                try:
+                    _mode_enum = PrivacyMode(configured_mode)
+                except ValueError:
+                    _mode_enum = PrivacyMode.INTERNAL
+                try:
+                    old_class = ContextClass(str(existing_override).lower())
+                except ValueError:
+                    old_class = None
+                fallback_class = _BUNDLE_MAP.get(bundle, ContextClass.UNKNOWN)
+                if old_class is not None:
+                    old_action = get_matrix_action(old_class, _mode_enum)
+                    new_action = get_matrix_action(fallback_class, _mode_enum)
+                    if _ACTION_SEVERITY[new_action] > _ACTION_SEVERITY[old_action]:
+                        err_console.print(
+                            f"[red]Error:[/red] removing the '{bundle}' classification "
+                            f"would revert it from {old_class.value} ({old_action.value}) "
+                            f"to {fallback_class.value} ({new_action.value}) at "
+                            f"mode={configured_mode!r} — that loosens the matrix and is "
+                            f"rejected. To intentionally weaken, set the bundle to a "
+                            f"more permissive class explicitly via app_classes set, "
+                            f"which is subject to the same severity guard."
+                        )
+                        _result(
+                            False,
+                            exit_code=1,
+                            error=(
+                                f"matrix_invariant_blocks_remove:"
+                                f"{old_class.value}→{fallback_class.value}@{configured_mode}"
+                            ),
+                        )
             cur.pop(bundle, None)
             privacy_tbl[field] = cur
         else:  # add or set
@@ -3252,6 +3348,16 @@ def _settings_privacy_apply(
                     old_class = None
             if old_class is None:
                 old_class = BUNDLE_ID_MAP.get(bundle)
+            # Implicit baseline for unknown bundles is UNKNOWN (Finding 001
+            # Variant B). The previous gate (`if old_class is not None`)
+            # short-circuited for any bundle absent from BUNDLE_ID_MAP and
+            # without a prior override, accepting any reclassification —
+            # including writing the same UNKNOWN class back, or escalating
+            # in either direction without comparison. Treat unknown bundles
+            # as if their effective class were UNKNOWN so the severity
+            # comparison below applies symmetrically.
+            if old_class is None:
+                old_class = ContextClass.UNKNOWN
 
             if old_class is not None:
                 configured_mode = str(privacy_tbl.get("mode") or "internal")

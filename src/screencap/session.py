@@ -597,7 +597,10 @@ class SessionController:
             # from the unconditional os._exit(1) used below for the 3rd-tap
             # unrecoverable path.
             try:
-                from screencap._stderr_events import emit_event as _emit_event, EVENT_DISK_FULL, EVENT_RECORDING_FINALIZED, EVENT_STOPPED
+                from screencap._stderr_events import (
+                    EVENT_STOPPED,
+                    emit_event as _emit_event,
+                )
                 _emit_event(EVENT_STOPPED, exit_code=5)
             except Exception:
                 pass
@@ -1168,9 +1171,13 @@ class SessionController:
         # SwiftUI polls on for Recordings list refresh, and it fires well
         # before background post-processing (chunk upload / NLP scrub) returns.
         try:
-            from screencap._stderr_events import emit_event as _emit_event, EVENT_DISK_FULL, EVENT_RECORDING_FINALIZED, EVENT_STOPPED
+            from screencap._stderr_events import (
+                EVENT_DISK_FULL,
+                EVENT_RECORDING_FINALIZED,
+                emit_event as _emit_event,
+            )
             _emit_event(
-                "recording_finalized",
+                EVENT_RECORDING_FINALIZED,
                 name=rw.name,
                 duration_seconds=float(ready_meta.get("elapsed", 0.0)),
                 force_stopped=bool(ready_meta.get("force_stopped", False)),
@@ -1178,7 +1185,7 @@ class SessionController:
             )
             if disk_full:
                 _emit_event(
-                    "disk_full",
+                    EVENT_DISK_FULL,
                     name=rw.name,
                     capture_dir=str(rw.capture_dir),
                 )
@@ -1308,10 +1315,13 @@ class SessionController:
             # disk_full=False because the chunk-processor timeout case is
             # the typical path here, not a disk-space failure.
             try:
-                from screencap._stderr_events import emit_event as _emit_event, EVENT_DISK_FULL, EVENT_RECORDING_FINALIZED, EVENT_STOPPED
+                from screencap._stderr_events import (
+                    EVENT_RECORDING_FINALIZED,
+                    emit_event as _emit_event,
+                )
                 ready_meta = _read_recording_ready(rw.capture_dir)
                 _emit_event(
-                    "recording_finalized",
+                    EVENT_RECORDING_FINALIZED,
                     name=rw.name,
                     duration_seconds=float(ready_meta.get("elapsed", 0.0)),
                     force_stopped=True,
@@ -1505,13 +1515,17 @@ class SessionController:
 
         self._do_shutdown()
 
-        # Exit-code contract (todo 002): translate the latched terminated_reason
-        # into the documented SystemExit code so cli.py's exit handler can emit
+        # Exit-code contract: translate the latched terminated_reason into
+        # the documented SystemExit code so cli.py's exit handler can emit
         # `stopped` with the matching exit_code and SwiftUI gets the fast-path
-        # disambiguation it expects.
+        # disambiguation it expects. ``force_killed`` covers worker-side
+        # ``child_crash`` and ``force`` stop reasons — without it, an engine
+        # crash mid-recording would exit 0 and SwiftUI would display
+        # "Recording complete".
         _exit_map = {
             "permission_lost": 3,
             "disk_full": 4,
+            "force_killed": 1,
         }
         _code = _exit_map.get(self._terminated_reason)
         if _code is not None:

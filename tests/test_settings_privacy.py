@@ -228,6 +228,93 @@ class TestMatrixExcludeGuard:
         cfg = _read_cfg()
         assert cfg["privacy"]["app_classes"]["com.openai.chat"] == "chat"
 
+
+class TestMatrixFloorUnknownBundles:
+    """Finding 001 — fail-closed for bundles not in BUNDLE_ID_MAP and not
+    classified via app_classes. The runtime evaluator's strictness floor
+    mostly mitigates the harm, but the CLI add-time path stays explicit:
+    refuse to allow-list an unclassified bundle, and prevent the two-step
+    bypass (set X=password_manager → remove X → allow_apps add X).
+    """
+
+    def test_allow_apps_add_rejects_unknown_bundle(self):
+        """Variant A: bundle absent from BUNDLE_ID_MAP and not overridden via
+        app_classes — refuse the add. Caller must classify first."""
+        result = _invoke("allow_apps", "add", "com.example.fictional-unknown")
+        assert result.exit_code != 0
+        out = result.output.lower()
+        assert "unknown_bundle_id" in out or "unclassified" in out
+
+    def test_allow_apps_add_succeeds_for_known_browser(self):
+        """Counter-test: a real BUNDLE_ID_MAP browser entry still works
+        (proves the unknown-bundle guard isn't blocking everything)."""
+        result = _invoke("allow_apps", "add", "com.brave.Browser")
+        assert result.exit_code == 0
+
+    def test_allow_apps_add_succeeds_after_explicit_app_classes_set(self):
+        """The fail-closed message tells the user to set app_classes first.
+        Verify that path works: classify, then add."""
+        ok = _invoke("app_classes", "set",
+                     "com.example.fictional-tool=browser_unverified")
+        assert ok.exit_code == 0
+        result = _invoke("allow_apps", "add", "com.example.fictional-tool")
+        assert result.exit_code == 0
+
+    def test_app_classes_set_unknown_bundle_to_unknown_class(self):
+        """Variant B partial: setting an unknown bundle to UNKNOWN class is
+        a no-op transition (UNKNOWN→UNKNOWN). Severity compare allows it."""
+        result = _invoke("app_classes", "set", "com.example.foo=unknown")
+        assert result.exit_code == 0
+
+    def test_app_classes_remove_rejects_loosening_password_manager(self):
+        """Variant C — the load-bearing fix. Set 1Password (already in
+        BUNDLE_ID_MAP as PASSWORD_MANAGER) to itself, then try to remove
+        — fails because removing would still leave fallback=PASSWORD_MANAGER.
+        Use a fictional bundle with a tight override instead."""
+        # Step 1: classify a fictional bundle as password_manager (tightening,
+        # accepted).
+        ok = _invoke("app_classes", "set",
+                     "com.example.fake-vault=password_manager")
+        assert ok.exit_code == 0
+        # Step 2: try to remove the override. Fallback would be UNKNOWN (no
+        # BUNDLE_ID_MAP entry) which is ALLOW under internal — that's a
+        # loosen from EXCLUDE → ALLOW. Must reject.
+        result = _invoke("app_classes", "remove", "com.example.fake-vault")
+        assert result.exit_code != 0
+        out = result.output.lower()
+        assert "matrix_invariant_blocks_remove" in out or "loosen" in out
+
+    def test_app_classes_remove_allows_when_fallback_is_same_or_stricter(self):
+        """Removing an override that re-routes to BUNDLE_ID_MAP at the same
+        or stricter class is fine. Use Slack: BUNDLE_ID_MAP → CHAT
+        (MASK_WINDOW under internal). Set override=email (also MASK_WINDOW
+        under internal) — removing the override drops back to CHAT, same
+        severity. Accepted."""
+        # Slack is in BUNDLE_ID_MAP as CHAT. Override to EMAIL (also
+        # MASK_WINDOW under internal — same severity).
+        ok = _invoke("app_classes", "set",
+                     "com.tinyspeck.slackmacgap=email")
+        assert ok.exit_code == 0
+        # Remove the override. Falls back to CHAT (BUNDLE_ID_MAP). Same
+        # severity → accepted.
+        result = _invoke("app_classes", "remove", "com.tinyspeck.slackmacgap")
+        assert result.exit_code == 0
+
+    def test_two_step_bypass_blocked_at_remove(self):
+        """The full Variant C chain: set X=password_manager →
+        remove X (REJECTED here) → would-be allow_apps add X never reached."""
+        ok = _invoke("app_classes", "set",
+                     "com.example.bypass-attempt=password_manager")
+        assert ok.exit_code == 0
+        result = _invoke("app_classes", "remove",
+                         "com.example.bypass-attempt")
+        # Bypass blocked at the remove step.
+        assert result.exit_code != 0
+        # Confirm config still has the override (remove was rejected).
+        cfg = _read_cfg()
+        assert (cfg["privacy"]["app_classes"]["com.example.bypass-attempt"]
+                == "password_manager")
+
     def test_app_classes_can_set_chat_to_chat(self):
         """Same-class write is a no-op-shaped accept (no loosening)."""
         # Slack is already CHAT in BUNDLE_ID_MAP; setting to CHAT again is fine.
@@ -273,7 +360,10 @@ class TestTomlkitCommentPreservation:
     def test_array_inline_comment_survives_add(self):
         from screencap.config import _CONFIG_PATH
 
-        # Write an array with an inline comment.
+        # Write an array with an inline comment. Use a real browser bundle
+        # for the new entry so the matrix-floor guard (Finding 001 Variant A)
+        # accepts it — the test is about tomlkit comment preservation, not
+        # the allow_apps gate.
         _write_config(_CONFIG_PATH, """
 [privacy]
 mode = "internal"
@@ -283,7 +373,7 @@ allow_apps = [
 ]
 """.lstrip())
 
-        result = _invoke("allow_apps", "add", "com.example.gamma")
+        result = _invoke("allow_apps", "add", "com.apple.Safari")
         assert result.exit_code == 0
 
         # The inline comment + multi-line formatting should survive.
@@ -292,7 +382,7 @@ allow_apps = [
             f"inline comment was destroyed. Content:\n{content}"
         )
         # The new value should be present.
-        assert "com.example.gamma" in content
+        assert "com.apple.Safari" in content
 
     def test_section_layout_survives_remove(self):
         from screencap.config import _CONFIG_PATH
@@ -385,13 +475,16 @@ class TestRoundTripModePreservation:
         assert _read_cfg()["privacy"]["mode"] == "public"
 
     def test_other_keys_preserved_when_setting_mode(self):
+        # ``allow_apps add`` requires a known/classifiable bundle (Finding 001
+        # Variant A); use a real browser so the test exercises round-trip
+        # preservation rather than the matrix-floor guard.
         _invoke("exclude_apps", "add", "com.example.x")
-        _invoke("allow_apps", "add", "com.example.y")
+        _invoke("allow_apps", "add", "com.apple.Safari")
         _invoke("mode", "set", "internal")
         cfg = _read_cfg()["privacy"]
         assert cfg["mode"] == "internal"
         assert "com.example.x" in cfg["exclude_apps"]
-        assert "com.example.y" in cfg["allow_apps"]
+        assert "com.apple.Safari" in cfg["allow_apps"]
 
 
 # ---------------------------------------------------------------------------
@@ -418,7 +511,13 @@ class TestAppClassesMapField:
         assert _read_cfg()["privacy"]["app_classes"]["com.example.lower"] == "email"
 
     def test_add_then_remove(self):
-        _invoke("app_classes", "add", "com.example.gone=EMAIL")
+        # Use UNKNOWN as the override class so the post-remove fallback
+        # (UNKNOWN for an unmapped bundle) produces the same matrix action
+        # — the Finding 001 Variant C guard rejects ANY remove that loosens
+        # the matrix at the configured mode. EMAIL→UNKNOWN would loosen
+        # TEXT_REDACT to ALLOW under ``internal`` and is therefore blocked
+        # (covered separately in ``TestMatrixFloorUnknownBundles``).
+        _invoke("app_classes", "add", "com.example.gone=UNKNOWN")
         result = _invoke("app_classes", "remove", "com.example.gone")
         assert result.exit_code == 0
         assert "com.example.gone" not in _read_cfg()["privacy"].get("app_classes", {})
