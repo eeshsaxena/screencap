@@ -20,6 +20,14 @@ dependencies = [
     "detect-secrets>=1.5.0,<2.0",
     "presidio-analyzer>=2.2",
     "fast-gliner>=0.1.12,<0.2",
+    # Network proxy logging (V1):
+    # cryptography upper cap aligned with mitmproxy 11.0.2's
+    # `Requires-Dist: cryptography<44.1,>=42.0` -- without the cap,
+    # future cryptography 44.1+ releases conflict with the mitmproxy pin.
+    "cryptography>=43,<44.1",
+    # mitmproxy 11.1+ and 12.x require Python >=3.12; only 11.0.x supports
+    # the project's Python 3.10 floor. Revisit if we bump min Python.
+    "mitmproxy>=11.0,<11.1",
 ]
 
 [project.optional-dependencies]
@@ -50,8 +58,19 @@ record = [
     "pyobjc-framework-Vision>=9.0; sys_platform == 'darwin'",
 ]
 privacy = []  # Moved to base dependencies as of v0.11.0
+build = [
+    # PyInstaller pinning per `pyinstaller-hooks-contrib` issue #736 --
+    # 6.0+ ships the keyring.backends.macOS hook needed for V1.5's
+    # Keychain KEK; the contrib bump pulls in current Pillow/AVFoundation
+    # hooks. Network proxy logging (V1) doesn't itself touch PyInstaller,
+    # but the version is documented here so the V1.5/V1.75 bump-up has
+    # a single source of truth.
+    "pyinstaller>=6.0",
+    "pyinstaller-hooks-contrib>=2024.7",
+]
 dev = [
     "screencap[record]",
+    "screencap[build]",
     "pytest>=7.0",
     "pytest-cov",
     "pytest-asyncio>=0.23.0",
