@@ -366,6 +366,17 @@ BUNDLE_ID_MAP: dict[str, ContextClass] = {
     "com.pgadmin.pgadmin4": ContextClass.ADMIN_CONSOLE,
     "com.sequel-pro.sequel-pro": ContextClass.ADMIN_CONSOLE,
     "com.tableplus.TablePlus": ContextClass.ADMIN_CONSOLE,
+    # AI assistants — desktop wrappers around browser-style chat surfaces.
+    # Reclassification rule (from origin A11): an app belongs in
+    # BROWSER_UNVERIFIED (not CHAT) if its primary surface is the user
+    # reading content the user themselves typed, the way they would in a
+    # browser tab. ChatGPT / Claude / Perplexity desktop fit this — they
+    # are not interpersonal communication tools and friend-onboarding
+    # recordings of "let me show you my AI tool" should be useful by
+    # default. Under PrivacyMode.INTERNAL, BROWSER_UNVERIFIED → ALLOW.
+    "com.openai.chat": ContextClass.BROWSER_UNVERIFIED,
+    "com.anthropic.claudefordesktop": ContextClass.BROWSER_UNVERIFIED,
+    "ai.perplexity.mac": ContextClass.BROWSER_UNVERIFIED,
 }
 
 # Password manager bundle IDs — derived from BUNDLE_ID_MAP.

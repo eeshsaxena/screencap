@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import fcntl
 import json
 import os
 import time
@@ -11,6 +12,25 @@ import psutil
 
 _DEFAULT_BASE = Path.home() / ".screencap"
 PID_FILE = _DEFAULT_BASE / "recording.pid"
+
+# Process-exclusive lock file (separate from PID_FILE so legacy readers of
+# recording.pid keep working unchanged). Kernel-managed flock auto-releases
+# on process death — no stale-lock cleanup needed.
+LOCK_DIR = _DEFAULT_BASE / "run"
+LOCK_FILE = LOCK_DIR / "recording.lock"
+
+# Module-global fd holding the active flock. Held for the lifetime of the
+# claiming process; kernel releases on death even if release_lock() is not
+# called. A second claim_lock() in the same process is a no-op.
+_LOCKED_FD: int | None = None
+
+
+class LockContended(Exception):
+    """Raised when claim_lock cannot acquire the lock — another holder is alive."""
+
+    def __init__(self, owner: dict | None = None):
+        self.owner = owner or {}
+        super().__init__(f"recording lock held by another process: {self.owner}")
 
 
 def write_pidfile(
@@ -187,6 +207,272 @@ def _pid_exists(pid: int) -> bool:
         return psutil.pid_exists(pid)
     except Exception:
         return False
+
+
+def claim_lock(capture_dir: Path | str | None, claimant: str = "cli") -> int:
+    """Acquire an exclusive flock on LOCK_FILE; write JSON metadata into it.
+
+    Args:
+        capture_dir: Per-recording directory if known (legacy single-shot
+            ``screencap start`` knows it at this point). ``None`` when called
+            from SessionController init — the per-recording dir is allocated
+            later and plumbed in via :func:`update_lock_metadata` (todo 014).
+            Persisted as ``null`` in the JSON when ``None``.
+        claimant: "cli" for standalone invocations, "swiftui" when spawned by
+            the SwiftUI app (via ``SCREENCAP_PARENT=swiftui``).
+
+    Returns:
+        The locked file descriptor (kept open; held in module-global state).
+        Subsequent calls in the same process are no-ops and return the same fd.
+
+    Raises:
+        LockContended: If another live process holds the lock. The exception
+            carries the existing lock metadata in ``.owner`` for diagnostics.
+    """
+    global _LOCKED_FD
+    if _LOCKED_FD is not None:
+        return _LOCKED_FD
+
+    LOCK_DIR.mkdir(parents=True, exist_ok=True)
+    # Explicit perms on the dir so the lockfile content (PID, started_at,
+    # capture_dir) is not world-readable even on misconfigured umasks.
+    try:
+        os.chmod(LOCK_DIR, 0o700)
+    except OSError:
+        pass
+    fd = os.open(str(LOCK_FILE), os.O_RDWR | os.O_CREAT, 0o600)
+    try:
+        fcntl.flock(fd, fcntl.LOCK_EX | fcntl.LOCK_NB)
+    except BlockingIOError:
+        try:
+            existing = json.loads(LOCK_FILE.read_text() or "{}")
+        except (json.JSONDecodeError, OSError):
+            existing = {}
+        os.close(fd)
+        raise LockContended(owner=existing) from None
+    except OSError:
+        # Other flock failures (NFS EOPNOTSUPP, virtual-filesystem EINVAL,
+        # EBADF) must not leak the just-opened fd (todo 008). Close before
+        # propagating; the cli.py outer handler decides how to surface it.
+        os.close(fd)
+        raise
+
+    # If the metadata-write sequence raises after flock succeeds, close the
+    # fd so the kernel releases the lock immediately — otherwise the caller
+    # is left in a confused state where the module thinks no lock is held
+    # but the kernel still has it.
+    try:
+        now = time.time()
+        # Per-recording state semantics:
+        #   - SessionController path (multi-recording session): claim_lock(None)
+        #     initializes both per-recording fields to None. _on_start_click
+        #     calls update_lock_metadata(...) to set them; _on_stop_click
+        #     calls clear_lock_recording() to clear.
+        #   - Standalone CLI path (single recording): claim_lock(capture_dir)
+        #     treats the call itself as "this is the recording starting now"
+        #     and sets recording_started_at = now + recording_name from the
+        #     dir basename. No follow-up update_lock_metadata needed.
+        # `is_recording` reported by `screencap status --json` checks
+        # (recording_started_at is not None), NOT lock_is_active — so a
+        # long-lived SessionController between recordings correctly reports
+        # is_recording=false even while still holding the flock.
+        capture_dir_str = str(capture_dir) if capture_dir is not None else None
+        recording_started_at = now if capture_dir is not None else None
+        recording_name = (
+            Path(str(capture_dir)).name if capture_dir is not None else None
+        )
+        metadata = {
+            "pid": os.getpid(),
+            # Controller startup time. Distinct from the per-recording
+            # `recording_started_at` field below — `started_at` describes
+            # when the lock holder came alive, NOT when the most recent
+            # recording started. SwiftUI's elapsed-time UI must read
+            # `recording_started_at`, never this field.
+            "started_at": now,
+            "capture_dir": capture_dir_str,
+            "claimant": claimant,
+            "recording_started_at": recording_started_at,
+            "recording_name": recording_name,
+        }
+        payload = json.dumps(metadata).encode()
+        os.ftruncate(fd, 0)
+        os.lseek(fd, 0, os.SEEK_SET)
+        os.write(fd, payload)
+        os.fsync(fd)
+    except Exception:
+        try:
+            os.close(fd)  # releases the flock
+        except OSError:
+            pass
+        raise
+
+    _LOCKED_FD = fd
+    return fd
+
+
+def _reset_for_tests() -> None:
+    """Test-isolation hook (todo 029) — reset module-global lock state so
+    in-process tests that monkey-patch LOCK_FILE / LOCK_DIR can safely call
+    claim_lock without inheriting a prior test's fd.
+
+    Releases the held flock if any, then clears _LOCKED_FD. Idempotent.
+    Used by fixtures in tests/test_pidfile_mutex.py and
+    tests/test_status_command.py — production code should never call this.
+    """
+    global _LOCKED_FD
+    if _LOCKED_FD is not None:
+        try:
+            release_lock()
+        except Exception:
+            pass
+        _LOCKED_FD = None
+
+
+def update_lock_metadata(
+    capture_dir: Path | str,
+    *,
+    recording_started_at: float | None = None,
+    recording_name: str | None = None,
+) -> bool:
+    """Plumb per-recording state into the held lock file in place.
+
+    Called from ``SessionController._on_start_click`` once the per-recording
+    directory is allocated, so ``screencap status --json`` reports the live
+    recording's path, name, and elapsed time instead of stale placeholders.
+
+    Updates three fields atomically while preserving everything else (pid,
+    claimant, controller-init started_at):
+      - ``capture_dir`` always
+      - ``recording_started_at`` when supplied (caller passes ``time.time()``
+        on session start — the previous design left this at controller-init
+        time so back-to-back recordings reported the wrong elapsed time)
+      - ``recording_name`` when supplied
+
+    Returns ``True`` on success, ``False`` if the process doesn't currently
+    hold the lock (no-op so callers don't need to track state).
+    """
+    global _LOCKED_FD
+    if _LOCKED_FD is None:
+        return False
+    try:
+        # Re-read the metadata so we don't lose the pid/started_at/claimant
+        # written at claim time. The file is held by our own flock, so a
+        # racing read-modify-write is impossible from another process.
+        existing = read_lock_metadata() or {}
+        existing["capture_dir"] = str(capture_dir)
+        if recording_started_at is not None:
+            existing["recording_started_at"] = float(recording_started_at)
+        if recording_name is not None:
+            existing["recording_name"] = recording_name
+        payload = json.dumps(existing).encode()
+        os.ftruncate(_LOCKED_FD, 0)
+        os.lseek(_LOCKED_FD, 0, os.SEEK_SET)
+        os.write(_LOCKED_FD, payload)
+        os.fsync(_LOCKED_FD)
+        return True
+    except OSError:
+        return False
+
+
+def clear_lock_recording() -> bool:
+    """Clear per-recording state from the held lock file.
+
+    Called from ``SessionController._on_stop_click`` so that
+    ``screencap status --json`` reports ``is_recording: false`` immediately
+    after stop, even though the controller still holds the flock for its
+    long-lived multi-recording session. Without this, status would report
+    is_recording=true and a stale elapsed time between recordings.
+
+    Sets ``capture_dir``, ``recording_started_at``, and ``recording_name``
+    to None. Preserves pid, claimant, and the controller-init ``started_at``.
+
+    Returns ``True`` on success, ``False`` if the process doesn't currently
+    hold the lock.
+    """
+    global _LOCKED_FD
+    if _LOCKED_FD is None:
+        return False
+    try:
+        existing = read_lock_metadata() or {}
+        existing["capture_dir"] = None
+        existing["recording_started_at"] = None
+        existing["recording_name"] = None
+        payload = json.dumps(existing).encode()
+        os.ftruncate(_LOCKED_FD, 0)
+        os.lseek(_LOCKED_FD, 0, os.SEEK_SET)
+        os.write(_LOCKED_FD, payload)
+        os.fsync(_LOCKED_FD)
+        return True
+    except OSError:
+        return False
+
+
+def release_lock() -> None:
+    """Release the flock held by this process. No-op if not held.
+
+    Kernel auto-releases on process death; calling this is optional but lets
+    long-lived parents (e.g., SessionController across multiple recordings)
+    explicitly release between recordings if ever needed.
+    """
+    global _LOCKED_FD
+    if _LOCKED_FD is None:
+        return
+    try:
+        fcntl.flock(_LOCKED_FD, fcntl.LOCK_UN)
+    except OSError:
+        pass
+    try:
+        os.close(_LOCKED_FD)
+    except OSError:
+        pass
+    _LOCKED_FD = None
+
+
+def read_lock_metadata() -> dict | None:
+    """Read the lock file's JSON content without acquiring the flock.
+
+    Used by ``screencap status --json`` and ``screencap stop`` to inspect the
+    current holder without contending. Returns None if the file is missing or
+    unparseable (treat as "no recording active").
+    """
+    if not LOCK_FILE.exists():
+        return None
+    try:
+        return json.loads(LOCK_FILE.read_text())
+    except (json.JSONDecodeError, OSError):
+        return None
+
+
+def lock_is_active() -> bool:
+    """Return True iff some live process holds the flock on LOCK_FILE.
+
+    Detects the stale-lock case (file exists, last holder died, kernel
+    auto-released) by attempting a non-blocking flock on a probe fd; success
+    means no holder. Probe lock is released immediately.
+
+    Opens read-only (todo 028) — flock(LOCK_EX | LOCK_NB) only requires read
+    access on macOS/BSD, and a future permission-hardening pass that
+    restricts write on the lockfile (e.g., root-owned + group-readable)
+    would silently break detection if we required RDWR here.
+    """
+    if not LOCK_FILE.exists():
+        return False
+    try:
+        probe_fd = os.open(str(LOCK_FILE), os.O_RDONLY)
+    except OSError:
+        return False
+    try:
+        try:
+            fcntl.flock(probe_fd, fcntl.LOCK_EX | fcntl.LOCK_NB)
+            fcntl.flock(probe_fd, fcntl.LOCK_UN)
+            return False
+        except BlockingIOError:
+            return True
+    finally:
+        try:
+            os.close(probe_fd)
+        except OSError:
+            pass
 
 
 def _atomic_write_pidfile(data: dict) -> None:

@@ -75,22 +75,30 @@ _ACTION_MATRIX: dict[tuple[ContextClass, PrivacyMode], PrivacyAction] = {
     (ContextClass.BANKING, PrivacyMode.PUBLIC): PrivacyAction.EXCLUDE,
     (ContextClass.BANKING, PrivacyMode.SHARED): PrivacyAction.EXCLUDE,
     (ContextClass.BANKING, PrivacyMode.INTERNAL): PrivacyAction.MASK_WINDOW,
+    # email / chat / calendar / video_call under INTERNAL → MASK_WINDOW.
+    # Privacy-improving change vs. the prior TEXT_REDACT default: window
+    # contents are blurred end-to-end (video frames blocked, keystrokes
+    # nulled, screenshots masked at scrub time) instead of relying on
+    # post-capture text scrubbing for personal/workplace conversations.
+    # Aligns with the friend-onboarding "safe defaults" intent — see
+    # docs/brainstorms/2026-04-27-native-macos-ui-v1-requirements.md (R20)
+    # and the v1 plan's Unit 7a discussion of the workflow impact.
     # email
     (ContextClass.EMAIL, PrivacyMode.PUBLIC): PrivacyAction.MASK_WINDOW,
     (ContextClass.EMAIL, PrivacyMode.SHARED): PrivacyAction.MASK_REGION,
-    (ContextClass.EMAIL, PrivacyMode.INTERNAL): PrivacyAction.TEXT_REDACT,
+    (ContextClass.EMAIL, PrivacyMode.INTERNAL): PrivacyAction.MASK_WINDOW,
     # chat
     (ContextClass.CHAT, PrivacyMode.PUBLIC): PrivacyAction.MASK_WINDOW,
     (ContextClass.CHAT, PrivacyMode.SHARED): PrivacyAction.MASK_REGION,
-    (ContextClass.CHAT, PrivacyMode.INTERNAL): PrivacyAction.TEXT_REDACT,
+    (ContextClass.CHAT, PrivacyMode.INTERNAL): PrivacyAction.MASK_WINDOW,
     # calendar
     (ContextClass.CALENDAR, PrivacyMode.PUBLIC): PrivacyAction.MASK_WINDOW,
     (ContextClass.CALENDAR, PrivacyMode.SHARED): PrivacyAction.MASK_REGION,
-    (ContextClass.CALENDAR, PrivacyMode.INTERNAL): PrivacyAction.TEXT_REDACT,
+    (ContextClass.CALENDAR, PrivacyMode.INTERNAL): PrivacyAction.MASK_WINDOW,
     # video_call
     (ContextClass.VIDEO_CALL, PrivacyMode.PUBLIC): PrivacyAction.MASK_WINDOW,
     (ContextClass.VIDEO_CALL, PrivacyMode.SHARED): PrivacyAction.MASK_REGION,
-    (ContextClass.VIDEO_CALL, PrivacyMode.INTERNAL): PrivacyAction.TEXT_REDACT,
+    (ContextClass.VIDEO_CALL, PrivacyMode.INTERNAL): PrivacyAction.MASK_WINDOW,
     # browser_unverified
     (ContextClass.BROWSER_UNVERIFIED, PrivacyMode.PUBLIC): PrivacyAction.MASK_WINDOW,
     (ContextClass.BROWSER_UNVERIFIED, PrivacyMode.SHARED): PrivacyAction.OCR_FALLBACK,
@@ -437,11 +445,19 @@ class DefaultPolicyEvaluator:
                 evidence=metadata.bundle_id,
             )
 
-        # 2. Explicit app allow (unless matrix says EXCLUDE)
+        # 2. Explicit app allow (subject to the matrix-strictness floor)
         # For browsers: allow_apps means "capture by default" but the URL
         # classifier's per-site decisions still apply. When the classifier
         # refined the context beyond BROWSER_UNVERIFIED, fall through to
         # the matrix so sensitive sites are still gated.
+        #
+        # Matrix-strictness floor (mirrors the CLI guard at
+        # cli._matrix_blocks_allow_for_class): allow_apps cannot loosen the
+        # matrix when it produces EXCLUDE / MASK_WINDOW / TEXT_REDACT. The
+        # CLI prevents NEW additions of those bundles, but EXISTING entries
+        # from before Unit 7a (e.g., a pre-existing Slack allowlist that
+        # used to evaluate to ALLOW under the old TEXT_REDACT default) must
+        # not silently re-enable raw capture under the tightened defaults.
         if metadata.bundle_id and self._config.is_allowed_app(metadata.bundle_id):
             matrix_action = get_matrix_action(context.context_class, mode)
             if matrix_action == PrivacyAction.EXCLUDE:
@@ -450,19 +466,25 @@ class DefaultPolicyEvaluator:
                     reason=ReasonCode.POLICY_EXCLUDED_APP,
                     evidence=f"matrix override: {context.context_class.value}",
                 )
-            # Browser with refined context → let the matrix decide
-            is_browser = (
-                self._config.app_classes.get(metadata.bundle_id)
-                == ContextClass.BROWSER_UNVERIFIED
-            )
-            if is_browser and context.context_class != ContextClass.BROWSER_UNVERIFIED:
-                pass  # fall through to matrix (step 5)
+            if matrix_action in (PrivacyAction.MASK_WINDOW, PrivacyAction.TEXT_REDACT):
+                # allow_apps doesn't override these either — fall through
+                # to step 5 (matrix decision) so the user gets the matrix's
+                # action instead of an unintended ALLOW.
+                pass
             else:
-                return ActionDecision(
-                    action=PrivacyAction.ALLOW,
-                    reason=ReasonCode.POLICY_ALLOWED_APP,
-                    evidence=metadata.bundle_id,
+                # Browser with refined context → let the matrix decide
+                is_browser = (
+                    self._config.app_classes.get(metadata.bundle_id)
+                    == ContextClass.BROWSER_UNVERIFIED
                 )
+                if is_browser and context.context_class != ContextClass.BROWSER_UNVERIFIED:
+                    pass  # fall through to matrix (step 5)
+                else:
+                    return ActionDecision(
+                        action=PrivacyAction.ALLOW,
+                        reason=ReasonCode.POLICY_ALLOWED_APP,
+                        evidence=metadata.bundle_id,
+                    )
 
         # 3. Domain mask
         if metadata.domain and self._config.is_masked_domain(metadata.domain):

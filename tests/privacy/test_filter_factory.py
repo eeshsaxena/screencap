@@ -358,11 +358,15 @@ class TestImportPaths:
 class TestCloudIntentOverride:
     """Verifies the load-bearing ``cloud_intent → PUBLIC`` override at
     ``filter.py:`` is preserved verbatim from its original location at
-    ``exporter.py:142-143``. Slack is the canonical case: CHAT is
-    TEXT_REDACT under INTERNAL (passes through) but MASK_WINDOW under
-    PUBLIC (title masked)."""
+    ``exporter.py:142-143``. Slack is the canonical case post-Unit-7a:
+    CHAT under INTERNAL is MASK_WINDOW (title masked). Under PUBLIC it
+    is also MASK_WINDOW. Both modes mask the title; the cloud_intent
+    uplift is invisible for CHAT specifically — see other classes for
+    a visible internal-vs-public differential."""
 
-    def test_internal_mode_passes_chat_through(self, tmp_path):
+    def test_internal_mode_masks_chat_window_title(self, tmp_path):
+        """Post-Unit-7a: CHAT under internal = MASK_WINDOW. Slack title
+        masked to app_name regardless of cloud_intent."""
         with _public_config():
             pf = build_privacy_filter(
                 privacy_mode="internal",
@@ -376,7 +380,7 @@ class TestCloudIntentOverride:
         )
         result = pf(event)
         assert result is not None
-        assert result.window_title == "#secret-channel — Slack"
+        assert result.window_title == "Slack"
 
     def test_internal_mode_with_cloud_intent_masks_chat(self, tmp_path):
         with _public_config():
@@ -571,10 +575,13 @@ class TestCloudIntentSkipsAllowApps:
         assert result.window_title == slack_event.app_name
         assert result.domain is None
 
-    def test_local_filter_still_honors_allow_apps(self, tmp_path):
-        """Non-cloud (``cloud_intent=False``) + same ``allow_apps`` →
-        original Slack title passes through. Preserves existing user-level
-        allow behavior when not cloud-bound."""
+    def test_local_filter_respects_matrix_floor_over_allow_apps(self, tmp_path):
+        """Non-cloud (``cloud_intent=False``) + ``allow_apps`` containing
+        Slack under PUBLIC mode → title still masked. The runtime
+        evaluator's strictness floor (Finding 3) blocks ``allow_apps`` from
+        loosening matrix MASK_WINDOW / TEXT_REDACT just like the CLI add-time
+        guard rejects new additions. An EXISTING allow_apps entry from
+        before that floor was added must NOT silently bypass the matrix."""
         cfg = PrivacyConfig(
             mode=PrivacyMode.PUBLIC,
             allow_apps=frozenset(["com.tinyspeck.slackmacgap"]),
@@ -590,11 +597,11 @@ class TestCloudIntentSkipsAllowApps:
 
         slack_event = self._slack_event()
         result = pf(slack_event)
-        # ALLOW from allow_apps → event passes through unchanged.
+        # MASK_WINDOW wins over allow_apps. Title masked to app_name,
+        # domain nulled.
         assert result is not None
-        assert result.window_title == "#secret-channel — Slack"
-        # domain preserved (ALLOW does not null it).
-        assert result.domain == "slack.com"
+        assert result.window_title == "Slack"
+        assert result.domain is None
 
     def test_cloud_bound_still_honors_exclude_apps(self, tmp_path):
         """Regression: ``exclude_apps`` is a TIGHTENING knob and must

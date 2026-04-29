@@ -5,6 +5,46 @@ All notable changes to this project will be documented in this file.
 The format is based on [Keep a Changelog](https://keepachangelog.com/),
 and this project adheres to [Semantic Versioning](https://semver.org/).
 
+## [Unreleased]
+
+### Changed
+- **`screencap stop --force` now actively kills the live SessionController.**
+  Previous behavior: `--force` skipped the SIGTERM/wait branch and fell
+  through to `find_orphaned_processes()`, which returns `[]` whenever the
+  parent is alive — so against a hung-but-alive controller the flag was
+  effectively a no-op. New behavior: identify the lock owner from the
+  flock-protected lock metadata (or legacy `recording.pid` as fallback),
+  apply the PID-recycle guard (`psutil.create_time` within 1s tolerance
+  of `started_at`), and SIGKILL the parent directly before scanning for
+  orphan children. Motivated by the concurrent-start mutex on
+  `~/.screencap/run/recording.lock` (see
+  `docs/tickets/medium-2026-03-10-block-concurrent-recording-start.md`):
+  the only way a hung-but-alive controller can be displaced is by killing
+  it. Migration: any wrapper that defensively passed `--force` expecting
+  a no-op against a live recording will now terminate the session — drop
+  the flag for the graceful path or drop the call entirely.
+
+### Fixed
+- **Privacy matrix-floor bypass closed for unknown bundles.** The
+  `screencap settings privacy` mutator now fails closed when
+  `allow_apps add` targets a bundle that is neither in `BUNDLE_ID_MAP`
+  nor `BROWSER_BUNDLE_IDS` and has no `app_classes` override (Finding
+  001 Variant A). `app_classes set` treats unknown bundles as if their
+  effective class were `UNKNOWN` so the strictness comparison applies
+  symmetrically (Variant B), and `app_classes remove` rejects any
+  removal that would loosen the matrix at the configured mode (Variant
+  C — closes the two-step bypass `set X=password_manager` →
+  `remove X` → `allow_apps add X`). Severity is compared via
+  `_ACTION_SEVERITY` so EXCLUDE → MASK_WINDOW transitions (e.g.,
+  `password_manager` → `chat`) are also caught.
+- **AST CI guard symmetric for local + cloud filters.** Added
+  `build_local_window_filter` in `screencap.privacy.filter` so
+  CLI-side local-only callers route through a sanctioned factory
+  rather than calling `build_privacy_filter` directly. The AST guard
+  at `tests/test_privacy_filter_call_graph.py` now passes for both
+  cloud-bound and local construction sites; ad-hoc filter assembly
+  outside `screencap.privacy.filter` continues to fail the build.
+
 ## [0.19.0] - 2026-04-28
 
 ### Added

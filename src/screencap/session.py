@@ -220,15 +220,25 @@ def run_recording_worker(args: dict) -> None:
     # finished cleanly before spawning the post-process worker.
     try:
         if capture_dir is not None:
+            # Merge the recorder's stop-meta sidecar (force_stopped +
+            # terminated_reason) into the manifest so SessionController.run()
+            # can propagate the correct SystemExit code (todo 002, 009).
+            stop_meta: dict = {}
+            try:
+                meta_path = capture_dir / ".recording_stop_meta.json"
+                if meta_path.exists():
+                    stop_meta = json.loads(meta_path.read_text() or "{}")
+            except Exception:
+                pass
+            ready_payload = {
+                "elapsed": elapsed,
+                "completed_at": time.time(),
+                "disk_full": disk_full,
+                "force_stopped": bool(stop_meta.get("force_stopped", False)),
+                "terminated_reason": stop_meta.get("terminated_reason"),
+            }
             (capture_dir / ".recording_ready").write_text(
-                json.dumps(
-                    {
-                        "elapsed": elapsed,
-                        "completed_at": time.time(),
-                        "disk_full": disk_full,
-                    },
-                    indent=2,
-                ),
+                json.dumps(ready_payload, indent=2),
             )
     except Exception:
         pass
@@ -441,6 +451,11 @@ class SessionController:
         # session. Used to decide if the CLI-supplied ``--name`` should
         # apply (only to the very first recording).
         self._started_any = False
+        # Most recent terminal reason from any finished recording worker
+        # (read from ``.recording_ready``'s ``terminated_reason`` field).
+        # ``run()`` uses this to propagate the documented exit-code contract
+        # (3 = permission_lost, 4 = disk_full) to the SwiftUI shell.
+        self._terminated_reason: str | None = None
 
         # Effective audio state for the next recording. Seeded from
         # cli_args so ``--no-audio`` is honoured for the first recording,
@@ -471,6 +486,52 @@ class SessionController:
             write_pidfile(Path("."), [])
         except Exception:
             pass
+
+        # Process-exclusive lock — held for the controller's lifetime so a
+        # second `screencap start` during inter-recording idle is rejected.
+        # Workers (run_recording_worker → start_recording with
+        # _skip_pidfile=True) do NOT claim; they inherit the controller's lock
+        # by virtue of being children. Lock auto-releases on death even if
+        # explicit cleanup is missed.
+        from screencap._stderr_events import (
+            EVENT_LOCK_CONTENDED,
+            EVENT_STARTED,
+            emit_event as _emit_event,
+            resolve_claimant,
+        )
+        from screencap.pidfile import LockContended, claim_lock
+
+        claimant = resolve_claimant()
+        try:
+            # capture_dir=None: at controller-init time the per-recording dir
+            # isn't allocated yet. Lock metadata's ``capture_dir`` stays null
+            # until ``_on_start_click`` runs and calls ``update_lock_metadata``
+            # (todo 014). Avoids the previous bug where the cwd / recordings-root
+            # leaked into status output as if it were the per-recording path.
+            claim_lock(None, claimant=claimant)
+        except LockContended as exc:
+            # Lifecycle events go on stderr (not stdout). SwiftUI's
+            # RecorderController parses these as the canonical contract; stdout
+            # is reserved for human-readable rich output.
+            try:
+                _emit_event(EVENT_LOCK_CONTENDED, owner=exc.owner)
+            except Exception:
+                pass
+            raise SystemExit(2) from None
+        # OSError / PermissionError from flock or metadata-write must NOT be
+        # swallowed — running without the mutex risks two concurrent
+        # recorders. Let them propagate to the cli.py exit handler.
+
+        # Unit 8a: emit the `started` lifecycle event for SwiftUI. Carries
+        # only the claimant. The per-recording capture_dir is delivered
+        # later via ``recording_finalized.name`` (todo 010); SwiftUI consumers
+        # construct paths via ``screencap list --json`` or by polling
+        # ``screencap status --json`` once a recording is active.
+        try:
+            _emit_event(EVENT_STARTED, claimant=claimant)
+        except Exception:
+            pass
+
         atexit.register(self._atexit_cleanup)
 
         # Spawn menubar once up-front. It will initially render the IDLE
@@ -530,9 +591,23 @@ class SessionController:
                 delete_pidfile()
             except Exception:
                 pass
-            os._exit(1)
+            # Best-effort terminal event so SwiftUI's RecorderController can
+            # disambiguate force-quit from stderr EOF (todo 003). Exit code 5
+            # is reserved for "user-initiated force-quit" (todo 023) — distinct
+            # from the unconditional os._exit(1) used below for the 3rd-tap
+            # unrecoverable path.
+            try:
+                from screencap._stderr_events import (
+                    EVENT_STOPPED,
+                    emit_event as _emit_event,
+                )
+                _emit_event(EVENT_STOPPED, exit_code=5)
+            except Exception:
+                pass
+            os._exit(5)
 
-        # 3rd tap+: raw immediate exit.
+        # 3rd tap+: raw immediate exit. No event emit — by this point the
+        # user is signalling that even cleanup should be skipped.
         os._exit(1)
 
     def _sigterm_handler(self, signum: int, frame: Any) -> None:
@@ -699,6 +774,38 @@ class SessionController:
         self._started_any = True
 
         name, capture_dir = self._allocate_capture_dir(base_name)
+
+        # Plumb per-recording state into lock metadata so `screencap status
+        # --json` reports is_recording=true with the live recording's path,
+        # name, and a fresh elapsed time. The recording_started_at field is
+        # what powers SwiftUI's elapsed-time UI — passing time.time() here
+        # (instead of relying on the controller-init started_at) means
+        # back-to-back recordings each get a correct elapsed time.
+        try:
+            from screencap.pidfile import update_lock_metadata
+            update_lock_metadata(
+                capture_dir,
+                recording_started_at=time.time(),
+                recording_name=name,
+            )
+        except Exception as exc:
+            # Failure here means `status --json` will report
+            # is_recording=false for a live recording (todo 005 / R4) —
+            # SwiftUI's elapsed-time UI silently desynchronizes. Surface
+            # the failure as a structured stderr event so the integrator
+            # can react; recording continues either way.
+            try:
+                from screencap._stderr_events import (
+                    EVENT_LOCK_METADATA_WRITE_FAILED,
+                    emit_event as _emit_event,
+                )
+                _emit_event(
+                    EVENT_LOCK_METADATA_WRITE_FAILED,
+                    error=str(exc),
+                    capture_dir=str(capture_dir),
+                )
+            except Exception:
+                pass
 
         queues = _RWQueues(
             window_feed_q=multiprocessing.Queue(),
@@ -964,6 +1071,17 @@ class SessionController:
         # though the worker subprocess is still finalizing in the
         # background.
         self._state = SessionState.IDLE
+
+        # Clear per-recording state from the lock metadata so
+        # `screencap status --json` reports is_recording=false immediately,
+        # even though the controller still holds the flock for the next
+        # recording in this session. Without this, status would lie about
+        # the recording state between recordings.
+        try:
+            from screencap.pidfile import clear_lock_recording
+            clear_lock_recording()
+        except Exception:
+            pass
         self._push_control({
             "type": "state",
             "state": SessionState.IDLE.value,
@@ -1055,7 +1173,40 @@ class SessionController:
 
     def _enqueue_postprocess_for_worker(self, rw: _RecordingWorker) -> None:
         """Build a :class:`PostProcessJob` from a finished worker and queue it."""
-        disk_full = bool(_read_recording_ready(rw.capture_dir).get("disk_full", False))
+        ready_meta = _read_recording_ready(rw.capture_dir)
+        disk_full = bool(ready_meta.get("disk_full", False))
+        # Latch the terminated_reason for run()'s exit-code propagation. The
+        # latest finished worker wins — appropriate because the CLI flow ends
+        # one recording per invocation in practice.
+        _term_reason = ready_meta.get("terminated_reason")
+        if isinstance(_term_reason, str) and _term_reason:
+            self._terminated_reason = _term_reason
+
+        # Unit 8a: emit recording_finalized as soon as the recording worker's
+        # capture has finished writing (`.recording_ready`) — this is what
+        # SwiftUI polls on for Recordings list refresh, and it fires well
+        # before background post-processing (chunk upload / NLP scrub) returns.
+        try:
+            from screencap._stderr_events import (
+                EVENT_DISK_FULL,
+                EVENT_RECORDING_FINALIZED,
+                emit_event as _emit_event,
+            )
+            _emit_event(
+                EVENT_RECORDING_FINALIZED,
+                name=rw.name,
+                duration_seconds=float(ready_meta.get("elapsed", 0.0)),
+                force_stopped=bool(ready_meta.get("force_stopped", False)),
+                disk_full=disk_full,
+            )
+            if disk_full:
+                _emit_event(
+                    EVENT_DISK_FULL,
+                    name=rw.name,
+                    capture_dir=str(rw.capture_dir),
+                )
+        except Exception:
+            pass
 
         job = PostProcessJob(
             name=rw.name,
@@ -1173,6 +1324,27 @@ class SessionController:
                 rw.queues.override_q,
                 rw.queues.disable_q,
             )
+            # Force-killed workers never reach the natural reap path that
+            # emits recording_finalized via _enqueue_postprocess_for_worker.
+            # Emit the terminal lifecycle event here so SwiftUI's
+            # Recordings list refreshes for stuck recordings (todo 027).
+            # disk_full=False because the chunk-processor timeout case is
+            # the typical path here, not a disk-space failure.
+            try:
+                from screencap._stderr_events import (
+                    EVENT_RECORDING_FINALIZED,
+                    emit_event as _emit_event,
+                )
+                ready_meta = _read_recording_ready(rw.capture_dir)
+                _emit_event(
+                    EVENT_RECORDING_FINALIZED,
+                    name=rw.name,
+                    duration_seconds=float(ready_meta.get("elapsed", 0.0)),
+                    force_stopped=True,
+                    disk_full=bool(ready_meta.get("disk_full", False)),
+                )
+            except Exception:
+                pass
         self._finishing_workers = []
 
         if self._active_postprocess is not None:
@@ -1194,9 +1366,14 @@ class SessionController:
         _close_queues_safely(self._control_q, self._menubar_event_q)
 
         try:
-            from screencap.pidfile import delete_pidfile
+            from screencap.pidfile import delete_pidfile, release_lock
 
             delete_pidfile()
+            # Explicit release (todo 024) — kernel auto-releases on death,
+            # but on a clean shutdown we want the lockfile content empty so
+            # status --json doesn't briefly show a stale capture_dir while
+            # the shell finishes wrapping up.
+            release_lock()
         except Exception:
             pass
 
@@ -1208,6 +1385,13 @@ class SessionController:
                     child.terminate()
                 except Exception:
                     pass
+        except Exception:
+            pass
+        # Explicit lock release on atexit (todo 024) so unit tests and
+        # interpreter shutdown paths leave a clean state.
+        try:
+            from screencap.pidfile import release_lock
+            release_lock()
         except Exception:
             pass
 
@@ -1334,5 +1518,31 @@ class SessionController:
                     "state": SessionState.IDLE.value,
                     "pending": self._total_pending_count(),
                 })
+                # Clear per-recording lock metadata so `screencap status
+                # --json` reports is_recording=false. Without this, a
+                # disk_full / permission_lost / crash exit leaves
+                # recording_started_at populated and status keeps
+                # reporting a growing elapsed time forever.
+                try:
+                    from screencap.pidfile import clear_lock_recording
+                    clear_lock_recording()
+                except Exception:
+                    pass
 
         self._do_shutdown()
+
+        # Exit-code contract: translate the latched terminated_reason into
+        # the documented SystemExit code so cli.py's exit handler can emit
+        # `stopped` with the matching exit_code and SwiftUI gets the fast-path
+        # disambiguation it expects. ``force_killed`` covers worker-side
+        # ``child_crash`` and ``force`` stop reasons — without it, an engine
+        # crash mid-recording would exit 0 and SwiftUI would display
+        # "Recording complete".
+        _exit_map = {
+            "permission_lost": 3,
+            "disk_full": 4,
+            "force_killed": 1,
+        }
+        _code = _exit_map.get(self._terminated_reason)
+        if _code is not None:
+            raise SystemExit(_code)
