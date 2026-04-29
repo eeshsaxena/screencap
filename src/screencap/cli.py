@@ -4,7 +4,17 @@ from __future__ import annotations
 
 import json
 import logging
+import os
 import sys
+
+# Line-buffered stderr is part of the SwiftUI cross-language event contract
+# (todo 012). PyInstaller-frozen binaries don't always honour
+# `sys.stderr.flush()` alone — the env var propagates to all spawn workers
+# and child processes via inheritance, so the recorder's hot loop and any
+# subprocess (chunk_processor, scrub_worker) emit events line-by-line as
+# SwiftUI's RecorderController.spawn expects. Set BEFORE any import that
+# might cache buffering state.
+os.environ.setdefault("PYTHONUNBUFFERED", "1")
 
 import click
 from dotenv import load_dotenv
@@ -1563,12 +1573,46 @@ def stop(force):
     if not force:
         lock_meta = read_lock_metadata()
         parent_pid = None
+        lock_started_at = None
         if lock_meta and lock_meta.get("pid"):
             parent_pid = lock_meta["pid"]
+            lock_started_at = lock_meta.get("started_at")
         else:
             data = read_pidfile()
             if data and data.get("parent_pid"):
                 parent_pid = data["parent_pid"]
+                lock_started_at = data.get("started_at")
+
+        # PID-recycle guard (todo 007) — verify the live PID's create_time is
+        # within tolerance of the lock metadata's started_at. macOS recycles
+        # PIDs aggressively (~99k space), so a long-dead recorder's PID could
+        # belong to an unrelated process by the time the user runs `stop`.
+        # Sending SIGTERM to a recycled PID would terminate that unrelated
+        # process — `_is_screencap_process` cmdline-grep is fuzzy enough to
+        # let the wrong target through. create_time pinning is deterministic.
+        if parent_pid is not None and lock_started_at is not None:
+            try:
+                import psutil as _psutil
+                proc_create_time = _psutil.Process(parent_pid).create_time()
+                # 1s tolerance: lock metadata's started_at is wall-clock from
+                # before fork; create_time is monotonic from after fork.
+                # On macOS the gap is sub-second; 1s is generous.
+                if proc_create_time > float(lock_started_at) + 1.0:
+                    console.print(
+                        f"[yellow]Warning:[/yellow] PID {parent_pid} appears recycled "
+                        f"(process started after the recording's lock metadata). "
+                        f"Skipping graceful stop; falling through to orphan scan."
+                    )
+                    parent_pid = None
+            except (_psutil.NoSuchProcess, _psutil.AccessDenied, _psutil.ZombieProcess):
+                # No process at that PID — nothing to stop gracefully; fall
+                # through to the orphan scan.
+                parent_pid = None
+            except Exception:
+                # Unexpected psutil failure: stay conservative and skip the
+                # SIGTERM rather than risk killing an unrelated process.
+                parent_pid = None
+
         if parent_pid is not None:
             if _pid_exists(parent_pid) and _is_screencap_process(parent_pid):
                 console.print(f"Sending stop signal to recording (PID {parent_pid})...")

@@ -581,9 +581,20 @@ class SessionController:
                 delete_pidfile()
             except Exception:
                 pass
-            os._exit(1)
+            # Best-effort terminal event so SwiftUI's RecorderController can
+            # disambiguate force-quit from stderr EOF (todo 003). Exit code 5
+            # is reserved for "user-initiated force-quit" (todo 023) — distinct
+            # from the unconditional os._exit(1) used below for the 3rd-tap
+            # unrecoverable path.
+            try:
+                from screencap._stderr_events import emit_event as _emit_event
+                _emit_event("stopped", exit_code=5)
+            except Exception:
+                pass
+            os._exit(5)
 
-        # 3rd tap+: raw immediate exit.
+        # 3rd tap+: raw immediate exit. No event emit — by this point the
+        # user is signalling that even cleanup should be skipped.
         os._exit(1)
 
     def _sigterm_handler(self, signum: int, frame: Any) -> None:
@@ -1120,6 +1131,24 @@ class SessionController:
                 rw.queues.override_q,
                 rw.queues.disable_q,
             )
+            # Force-killed workers never reach the natural reap path that
+            # emits recording_finalized via _enqueue_postprocess_for_worker.
+            # Emit the terminal lifecycle event here so SwiftUI's
+            # Recordings list refreshes for stuck recordings (todo 027).
+            # disk_full=False because the chunk-processor timeout case is
+            # the typical path here, not a disk-space failure.
+            try:
+                from screencap._stderr_events import emit_event as _emit_event
+                ready_meta = _read_recording_ready(rw.capture_dir)
+                _emit_event(
+                    "recording_finalized",
+                    name=rw.name,
+                    duration_seconds=float(ready_meta.get("elapsed", 0.0)),
+                    force_stopped=True,
+                    disk_full=bool(ready_meta.get("disk_full", False)),
+                )
+            except Exception:
+                pass
         self._finishing_workers = []
 
         if self._active_postprocess is not None:
@@ -1141,9 +1170,14 @@ class SessionController:
         _close_queues_safely(self._control_q, self._menubar_event_q)
 
         try:
-            from screencap.pidfile import delete_pidfile
+            from screencap.pidfile import delete_pidfile, release_lock
 
             delete_pidfile()
+            # Explicit release (todo 024) — kernel auto-releases on death,
+            # but on a clean shutdown we want the lockfile content empty so
+            # status --json doesn't briefly show a stale capture_dir while
+            # the shell finishes wrapping up.
+            release_lock()
         except Exception:
             pass
 
@@ -1155,6 +1189,13 @@ class SessionController:
                     child.terminate()
                 except Exception:
                     pass
+        except Exception:
+            pass
+        # Explicit lock release on atexit (todo 024) so unit tests and
+        # interpreter shutdown paths leave a clean state.
+        try:
+            from screencap.pidfile import release_lock
+            release_lock()
         except Exception:
             pass
 

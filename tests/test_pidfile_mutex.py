@@ -103,6 +103,92 @@ class TestClaimLock:
         don't need to track held-state)."""
         assert pidfile.update_lock_metadata("/tmp/whatever") is False
 
+    def test_flock_oserror_does_not_leak_fd(self, monkeypatch, tmp_path):
+        """Todo 008: any flock failure that isn't BlockingIOError must close
+        the fd opened on the previous line. Without this, NFS EOPNOTSUPP /
+        virtual-FS EINVAL leak the fd for the lifetime of the process."""
+        import fcntl as _fcntl
+
+        # Reset to clean state
+        if pidfile._LOCKED_FD is not None:
+            pidfile.release_lock()
+
+        opened_fds = []
+        original_open = os.open
+
+        def _tracking_open(*args, **kwargs):
+            fd = original_open(*args, **kwargs)
+            opened_fds.append(fd)
+            return fd
+
+        monkeypatch.setattr(os, "open", _tracking_open)
+
+        def _flock_eio(*args, **kwargs):
+            raise OSError(5, "simulated EIO from flock")
+
+        monkeypatch.setattr(_fcntl, "flock", _flock_eio)
+
+        with pytest.raises(OSError, match="simulated"):
+            pidfile.claim_lock(tmp_path / "cap")
+
+        # No leaked fd: each opened fd was closed by the OSError-handling path.
+        for fd in opened_fds:
+            with pytest.raises(OSError):
+                os.fstat(fd)
+
+
+class TestLockIsActiveReadOnly:
+    def test_lock_is_active_works_with_readonly_open(self, tmp_path, monkeypatch):
+        """Todo 028: lock_is_active probe opens RDONLY so a future
+        permission-hardening pass (root-owned + group-readable lockfile)
+        doesn't silently break detection. Verify the probe still works
+        when O_RDWR would have failed."""
+        import errno
+
+        if pidfile._LOCKED_FD is not None:
+            pidfile.release_lock()
+
+        # Hold the lock from this process so the probe should report active.
+        pidfile.claim_lock(tmp_path / "cap")
+        try:
+            # Sanity: probe reports active under normal conditions.
+            assert pidfile.lock_is_active() is True
+
+            # Now monkey-patch os.open to fail on O_RDWR but succeed on O_RDONLY,
+            # simulating a permission-restricted lockfile.
+            original_open = os.open
+
+            def _restrict_rdwr(path, flags, *args, **kwargs):
+                if flags & os.O_RDWR:
+                    raise PermissionError(errno.EACCES, "simulated RDWR denial")
+                return original_open(path, flags, *args, **kwargs)
+
+            monkeypatch.setattr(os, "open", _restrict_rdwr)
+
+            # Probe must still succeed via O_RDONLY — would return False if
+            # we had stayed on O_RDWR.
+            assert pidfile.lock_is_active() is True
+        finally:
+            pidfile.release_lock()
+
+
+class TestResetForTests:
+    def test_reset_clears_state(self, tmp_path):
+        """Todo 029: _reset_for_tests is the documented contract for tests
+        that need to claim_lock without inheriting prior state."""
+        pidfile.claim_lock(tmp_path / "cap")
+        assert pidfile._LOCKED_FD is not None
+
+        pidfile._reset_for_tests()
+        assert pidfile._LOCKED_FD is None
+
+    def test_reset_is_idempotent(self):
+        """No held lock → reset is a safe no-op."""
+        if pidfile._LOCKED_FD is not None:
+            pidfile.release_lock()
+        pidfile._reset_for_tests()  # must not raise
+        pidfile._reset_for_tests()  # call twice — still safe
+
 
 class TestReadLockMetadata:
     def test_missing_file_returns_none(self):

@@ -206,7 +206,7 @@ def claim_lock(capture_dir: Path | str | None, claimant: str = "cli") -> int:
 
     LOCK_DIR.mkdir(parents=True, exist_ok=True)
     # Explicit perms on the dir so the lockfile content (PID, started_at,
-    # capture_dir) is not world-readable even on misconfigured umasks (todo 042).
+    # capture_dir) is not world-readable even on misconfigured umasks.
     try:
         os.chmod(LOCK_DIR, 0o700)
     except OSError:
@@ -221,11 +221,17 @@ def claim_lock(capture_dir: Path | str | None, claimant: str = "cli") -> int:
             existing = {}
         os.close(fd)
         raise LockContended(owner=existing) from None
+    except OSError:
+        # Other flock failures (NFS EOPNOTSUPP, virtual-filesystem EINVAL,
+        # EBADF) must not leak the just-opened fd (todo 008). Close before
+        # propagating; the cli.py outer handler decides how to surface it.
+        os.close(fd)
+        raise
 
     # If the metadata-write sequence raises after flock succeeds, close the
     # fd so the kernel releases the lock immediately — otherwise the caller
     # is left in a confused state where the module thinks no lock is held
-    # but the kernel still has it (todo 032).
+    # but the kernel still has it.
     try:
         metadata = {
             "pid": os.getpid(),
@@ -247,6 +253,24 @@ def claim_lock(capture_dir: Path | str | None, claimant: str = "cli") -> int:
 
     _LOCKED_FD = fd
     return fd
+
+
+def _reset_for_tests() -> None:
+    """Test-isolation hook (todo 029) — reset module-global lock state so
+    in-process tests that monkey-patch LOCK_FILE / LOCK_DIR can safely call
+    claim_lock without inheriting a prior test's fd.
+
+    Releases the held flock if any, then clears _LOCKED_FD. Idempotent.
+    Used by fixtures in tests/test_pidfile_mutex.py and
+    tests/test_status_command.py — production code should never call this.
+    """
+    global _LOCKED_FD
+    if _LOCKED_FD is not None:
+        try:
+            release_lock()
+        except Exception:
+            pass
+        _LOCKED_FD = None
 
 
 def update_lock_metadata(capture_dir: Path | str) -> bool:
@@ -321,11 +345,16 @@ def lock_is_active() -> bool:
     Detects the stale-lock case (file exists, last holder died, kernel
     auto-released) by attempting a non-blocking flock on a probe fd; success
     means no holder. Probe lock is released immediately.
+
+    Opens read-only (todo 028) — flock(LOCK_EX | LOCK_NB) only requires read
+    access on macOS/BSD, and a future permission-hardening pass that
+    restricts write on the lockfile (e.g., root-owned + group-readable)
+    would silently break detection if we required RDWR here.
     """
     if not LOCK_FILE.exists():
         return False
     try:
-        probe_fd = os.open(str(LOCK_FILE), os.O_RDWR)
+        probe_fd = os.open(str(LOCK_FILE), os.O_RDONLY)
     except OSError:
         return False
     try:
