@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import contextlib
 import json
 import logging
 import os
@@ -162,6 +163,56 @@ def _maybe_download_nlp_models() -> None:
 _MATRIX_ACK_KEY = "matrix_acknowledged_v2026_04"
 
 
+def _config_lock_path():
+    """Return the path of the advisory config lock (sibling of recording.lock).
+
+    Lazy resolution so test fixtures that monkey-patch ``_DEFAULT_BASE``
+    pick up the right path each call.
+    """
+    from screencap.config import _DEFAULT_BASE
+    return _DEFAULT_BASE / "run" / "config.lock"
+
+
+@contextlib.contextmanager
+def _privacy_config_writer():
+    """Read-modify-write the privacy config under an advisory flock (todo 025).
+
+    Holds an exclusive flock on ``~/.screencap/run/config.lock`` for the
+    duration of the read → mutate → save cycle. Without this, two concurrent
+    ``screencap settings privacy`` invocations race on read-modify-write and
+    silently drop one of the writes (todo 015). ``_save_config_atomic``
+    provides write-atomicity, not lost-update protection — the flock does.
+
+    Yields the tomlkit doc. The caller mutates in-place; on context exit
+    (without exception) the doc is atomically saved and the config cache is
+    invalidated. On exception the file is left untouched.
+    """
+    import fcntl as _fcntl
+
+    from screencap.config import _CONFIG_PATH, invalidate_config_cache
+    from screencap.setup_wizard import _load_config_toml, _save_config_atomic
+
+    lock_path = _config_lock_path()
+    lock_path.parent.mkdir(parents=True, exist_ok=True)
+    fd = os.open(str(lock_path), os.O_RDWR | os.O_CREAT, 0o600)
+    try:
+        _fcntl.flock(fd, _fcntl.LOCK_EX)  # blocking — wait for our turn
+        doc = _load_config_toml(_CONFIG_PATH)
+        yield doc
+        # Only reached on the no-exception path.
+        _save_config_atomic(_CONFIG_PATH, doc)
+        invalidate_config_cache()
+    finally:
+        try:
+            _fcntl.flock(fd, _fcntl.LOCK_UN)
+        except OSError:
+            pass
+        try:
+            os.close(fd)
+        except OSError:
+            pass
+
+
 def _write_privacy_flag(key: str, value: object) -> None:
     """Write a single [privacy] scalar via tomlkit, preserving comments and order.
 
@@ -170,15 +221,10 @@ def _write_privacy_flag(key: str, value: object) -> None:
     """
     import tomlkit
 
-    from screencap.config import _CONFIG_PATH, invalidate_config_cache
-    from screencap.setup_wizard import _load_config_toml, _save_config_atomic
-
-    doc = _load_config_toml(_CONFIG_PATH)
-    if "privacy" not in doc:
-        doc.add("privacy", tomlkit.table())
-    doc["privacy"][key] = value
-    _save_config_atomic(_CONFIG_PATH, doc)
-    invalidate_config_cache()
+    with _privacy_config_writer() as doc:
+        if "privacy" not in doc:
+            doc.add("privacy", tomlkit.table())
+        doc["privacy"][key] = value
 
 
 def _maybe_prompt_privacy_setup(*, cloud_intent: bool = False) -> None:
@@ -2687,11 +2733,8 @@ def settings_privacy(field, op, value, as_json):
 
     import tomlkit
 
-    from screencap.config import _CONFIG_PATH, invalidate_config_cache
-    from screencap.setup_wizard import _load_config_toml, _save_config_atomic
-
     # Diagnostics / status messages go on stderr so stdout stays clean for
-    # any future structured output (todo 006, todo 016).
+    # any future structured output.
     err_console = Console(stderr=True)
 
     def _result(ok: bool, *, exit_code: int = 0, **payload_fields):
@@ -2755,11 +2798,61 @@ def settings_privacy(field, op, value, as_json):
                 )
                 _result(False, exit_code=1, error=f"invalid_bool:{field}={value}")
 
-    doc = _load_config_toml(_CONFIG_PATH)
-    if "privacy" not in doc:
-        doc.add("privacy", tomlkit.table())
-    privacy_tbl = doc["privacy"]
+    # Open the config under an advisory flock (todo 015 + 025). The
+    # context manager handles load → flock → mutate → atomic-save →
+    # invalidate-cache. Two concurrent `screencap settings privacy`
+    # invocations now serialize at the flock instead of racing on the
+    # read-modify-write cycle.
+    with _privacy_config_writer() as doc:
+        if "privacy" not in doc:
+            doc.add("privacy", tomlkit.table())
+        privacy_tbl = doc["privacy"]
 
+        changed = _settings_privacy_apply(
+            privacy_tbl=privacy_tbl,
+            field=field,
+            op=op,
+            value=value,
+            is_list=is_list,
+            is_scalar=is_scalar,
+            parsed_value=parsed_value,
+            err_console=err_console,
+            tomlkit=tomlkit,
+            _result=_result,
+        )
+
+    if changed:
+        err_console.print(f"  [bold]privacy.{field}[/bold] {op} {value}")
+        _result(True, changed=True, field=field, op=op, value=value)
+
+
+def _settings_privacy_apply(
+    *,
+    privacy_tbl,
+    field: str,
+    op: str,
+    value: str,
+    is_list: bool,
+    is_scalar: bool,
+    parsed_value,
+    err_console,
+    tomlkit,
+    _result,
+) -> bool:
+    """Apply a single privacy mutation to the in-memory tomlkit privacy table.
+
+    Returns ``True`` when the table was actually changed (caller should
+    surface the success result), ``False`` for an idempotent no-op (the
+    no-op result was already emitted in-place via ``_result``). Hard
+    errors raise ``SystemExit`` via ``_result(exit_code=...)`` and never
+    return.
+
+    Extracted from settings_privacy so the read-modify-write helper
+    (`_privacy_config_writer`) can wrap it with an advisory flock without
+    leaking a hundred-line block into the context manager body. Mutates
+    list fields in-place via tomlkit Array's append/remove (todo 016) so
+    inline comments and per-item formatting survive.
+    """
     # Matrix-invariant guard: reject loosening any matrix-blocked class via
     # allow_apps (todo 005). Evaluated at the *configured mode* — under
     # `internal` this catches CHAT/EMAIL/CALENDAR/VIDEO_CALL (MASK_WINDOW)
@@ -2806,21 +2899,27 @@ def settings_privacy(field, op, value, as_json):
                 )
 
     if is_list:
-        existing = list(privacy_tbl.get(field, []))
+        # Mutate the tomlkit Array in place (todo 016) so per-item inline
+        # comments and multi-line formatting survive. The previous
+        # `list(privacy_tbl.get(field, []))` + reassign approach silently
+        # destroyed all tomlkit metadata.
+        arr = privacy_tbl.get(field)
+        if arr is None:
+            arr = tomlkit.array()
+            privacy_tbl[field] = arr
         if op == "add":
-            if value in existing:
+            if value in arr:
                 # Idempotent no-op
                 err_console.print(f"[dim]{field} already contains {value} — no change.[/dim]")
                 _result(True, changed=False, field=field, op=op, value=value)
-                return
-            existing.append(value)
+                return False
+            arr.append(value)
         else:  # remove
-            if value not in existing:
+            if value not in arr:
                 err_console.print(f"[dim]{field} does not contain {value} — no change.[/dim]")
                 _result(True, changed=False, field=field, op=op, value=value)
-                return
-            existing.remove(value)
-        privacy_tbl[field] = existing
+                return False
+            arr.remove(value)
     elif is_scalar:
         privacy_tbl[field] = parsed_value
     else:
@@ -2905,10 +3004,7 @@ def settings_privacy(field, op, value, as_json):
             cur[bundle] = normalized
             privacy_tbl[field] = cur
 
-    _save_config_atomic(_CONFIG_PATH, doc)
-    invalidate_config_cache()
-    err_console.print(f"  [bold]privacy.{field}[/bold] {op} {value}")
-    _result(True, changed=True, field=field, op=op, value=value)
+    return True
 
 
 # ---------------------------------------------------------------------------

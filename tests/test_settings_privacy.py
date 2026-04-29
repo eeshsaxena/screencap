@@ -35,6 +35,12 @@ def _read_cfg() -> dict:
     return tomllib.loads(_CONFIG_PATH.read_text())
 
 
+def _write_config(path: Path, body: str) -> None:
+    """Write `body` to `path`, creating parents as needed."""
+    path.parent.mkdir(parents=True, exist_ok=True)
+    path.write_text(body)
+
+
 def _invoke(*args, as_json=False):
     runner = CliRunner()
     full_args = ["settings", "privacy"]
@@ -224,6 +230,117 @@ class TestMatrixExcludeGuard:
 # ---------------------------------------------------------------------------
 # R16 round-trip: mode preservation across mutations
 # ---------------------------------------------------------------------------
+
+
+class TestTomlkitCommentPreservation:
+    """Todo 016: list-field mutations must preserve inline TOML comments
+    and multi-line array formatting. The previous list()-and-reassign
+    approach silently destroyed all tomlkit metadata. R16 round-trip
+    invariant claims comment preservation; the tomllib-based round-trip
+    test passes either way (it strips comments before assertion). This
+    test reads the raw file content."""
+
+    def test_array_inline_comment_survives_add(self):
+        from screencap.config import _CONFIG_PATH
+
+        # Write an array with an inline comment.
+        _write_config(_CONFIG_PATH, """
+[privacy]
+mode = "internal"
+allow_apps = [
+    "com.example.alpha",  # approved by security 2026-04
+    "com.example.beta",
+]
+""".lstrip())
+
+        result = _invoke("allow_apps", "add", "com.example.gamma")
+        assert result.exit_code == 0
+
+        # The inline comment + multi-line formatting should survive.
+        content = _CONFIG_PATH.read_text()
+        assert "approved by security 2026-04" in content, (
+            f"inline comment was destroyed. Content:\n{content}"
+        )
+        # The new value should be present.
+        assert "com.example.gamma" in content
+
+    def test_section_layout_survives_remove(self):
+        from screencap.config import _CONFIG_PATH
+
+        _write_config(_CONFIG_PATH, """
+# Privacy posture for this machine
+[privacy]
+mode = "internal"  # see docs/privacy.md for matrix
+exclude_apps = ["com.example.x"]
+""".lstrip())
+
+        result = _invoke("exclude_apps", "remove", "com.example.x")
+        assert result.exit_code == 0
+
+        content = _CONFIG_PATH.read_text()
+        assert "see docs/privacy.md" in content
+        assert "Privacy posture for this machine" in content
+
+
+def _hold_config_lock_in_child(lock_path, started_q, hold_seconds):
+    """Subprocess target: hold the config flock for `hold_seconds`."""
+    import fcntl as _fcntl
+    import os as _os
+    import time as _time
+
+    fd = _os.open(str(lock_path), _os.O_RDWR | _os.O_CREAT, 0o600)
+    _fcntl.flock(fd, _fcntl.LOCK_EX)
+    started_q.put("acquired")
+    _time.sleep(hold_seconds)
+
+
+class TestConcurrentMutations:
+    """Todo 015: concurrent settings privacy invocations must not lose
+    updates. The advisory flock on ~/.screencap/run/config.lock serializes
+    the read-modify-write cycle."""
+
+    def test_concurrent_writers_do_not_lose_updates(self, tmp_path):
+        """Holds the config flock from a child process; the parent
+        invocation should block on the flock and complete after release,
+        with both writes present."""
+        import multiprocessing
+        import time as _time
+
+        from screencap.cli import _config_lock_path
+
+        # Pre-create the directory so the child can open the lock file
+        _config_lock_path().parent.mkdir(parents=True, exist_ok=True)
+
+        ctx = multiprocessing.get_context("spawn")
+        started_q = ctx.Queue()
+        # Hold for 1.5s — long enough that the parent invocation must wait.
+        proc = ctx.Process(
+            target=_hold_config_lock_in_child,
+            args=(_config_lock_path(), started_q, 1.5),
+        )
+        proc.start()
+        try:
+            assert started_q.get(timeout=5) == "acquired"
+
+            # While the child holds the flock, the parent's invoke should
+            # block on the flock acquire. Time it.
+            t0 = _time.time()
+            result = _invoke("exclude_apps", "add", "com.example.contended")
+            elapsed = _time.time() - t0
+
+            assert result.exit_code == 0
+            # Parent had to wait for the child to release — at least ~1s
+            # of the 1.5s hold should be observed.
+            assert elapsed >= 0.8, (
+                f"parent didn't block on flock — elapsed={elapsed:.2f}s "
+                "suggests the lock is not actually serializing writes"
+            )
+            assert "com.example.contended" in _read_cfg()["privacy"]["exclude_apps"]
+        finally:
+            proc.join(timeout=5)
+            if proc.is_alive():
+                proc.terminate()
+                proc.join(timeout=5)
 
 
 class TestRoundTripModePreservation:
