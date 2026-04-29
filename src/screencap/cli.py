@@ -1411,6 +1411,7 @@ def _export_one(recording_dir, output_path, exclude_moves, err_console, privacy_
             exclude_moves,
             metadata=meta,
             privacy_filter=privacy_filter,
+            include_network=True,
             network_scrub_pipeline=network_scrub_pipeline,
         )
     except ExportError as e:

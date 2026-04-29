@@ -813,6 +813,10 @@ def test_export_with_encrypted_recording_constructs_pipeline(
     kwargs = mock_export.call_args.kwargs
     assert "network_scrub_pipeline" in kwargs
     assert kwargs["network_scrub_pipeline"] is not None
+    # V1.5 P1 #2: explicit-export must opt in to network row emission.
+    # Without this flag, network_scrub_pipeline construction is wasted
+    # because Capture.export_events skips network_rows entirely.
+    assert kwargs.get("include_network") is True
 
 
 def test_export_with_v1_recording_no_pipeline(tmp_path, monkeypatch):
@@ -852,6 +856,37 @@ def test_export_with_v1_recording_no_pipeline(tmp_path, monkeypatch):
     )
     kwargs = mock_export.call_args.kwargs
     assert kwargs.get("network_scrub_pipeline") is None
+
+
+def test_auto_export_does_not_include_network(tmp_path, monkeypatch):
+    """Cloud-safety guarantee: ``_auto_export`` (post-recording, feeds
+    ``screencap upload``) must NOT pass ``include_network=True``. V1.5
+    keeps network row emission gated to the explicit ``screencap export``
+    CLI path; V1.75 will land the cloud-bound filter factory before any
+    network row reaches a cloud bucket.
+    """
+    from screencap.cli import _auto_export
+
+    rec_dir = tmp_path / "auto-rec"
+    rec_dir.mkdir()
+    # Touch a recording.db file so export_recording's existence check
+    # short-circuits to the mock without actually loading anything.
+
+    with mock.patch(
+        "screencap.exporter.export_recording", return_value=0,
+    ) as mock_export:
+        # _auto_export catches its own exceptions; we just need to
+        # confirm the call shape regardless of the result.
+        _auto_export(rec_dir)
+
+    assert mock_export.called
+    kwargs = mock_export.call_args.kwargs
+    # The flag must be absent OR False — never True from _auto_export.
+    assert not kwargs.get("include_network", False), (
+        "_auto_export must not include_network=True; that flag is "
+        "reserved for the explicit `screencap export` CLI path until "
+        "V1.75 ships build_cloud_network_filter."
+    )
 
 
 def test_export_kek_unavailable_fails_loud(tmp_path, monkeypatch):

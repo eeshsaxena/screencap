@@ -45,6 +45,7 @@ def export_recording(
     metadata: dict | None = None,
     privacy_filter: PrivacyFilter | None = None,
     *,
+    include_network: bool = False,
     network_scrub_pipeline: "NetworkScrubPipeline | None" = None,
 ) -> int:
     """Export a single recording to JSONL.
@@ -66,12 +67,17 @@ def export_recording(
         metadata: Optional ``_meta`` header dict; built via
             :func:`build_export_metadata` by callers.
         privacy_filter: Optional ``WindowSwitchEvent`` filter callable.
+        include_network: V1.5 explicit-export flag. When True, network
+            events are emitted into the JSONL stream. Default False to
+            preserve V1 cloud-safety on shared callers (``_auto_export``
+            feeds cloud upload via the same export pipeline).
         network_scrub_pipeline: Optional V1.5
-            :class:`NetworkScrubPipeline`. Forwarded into
-            :meth:`CaptureSession.export_events` so encrypted bodies
-            (when network rows are wired in V1.75) are decrypted +
-            scrubbed before reaching JSONL. ``None`` (the default)
-            preserves V1 behaviour.
+            :class:`NetworkScrubPipeline`. Required when
+            ``include_network=True`` AND the recording has encrypted
+            bodies. Forwarded into :meth:`CaptureSession.export_events`
+            so ciphertext is decrypted + PII-scrubbed at the row-conversion
+            boundary; ``None`` is fine for V1-vintage / metadata-only
+            recordings.
     """
     from screencap.engine import Capture
 
@@ -91,6 +97,7 @@ def export_recording(
                 exclude_moves,
                 metadata,
                 privacy_filter=privacy_filter,
+                include_network=include_network,
                 network_scrub_pipeline=network_scrub_pipeline,
             )
         else:
@@ -104,6 +111,7 @@ def export_recording(
                         exclude_moves,
                         metadata,
                         privacy_filter=privacy_filter,
+                        include_network=include_network,
                         network_scrub_pipeline=network_scrub_pipeline,
                     )
                 os.rename(tmp_path, output_path)
@@ -190,6 +198,7 @@ def _write_events(
     metadata: dict | None,
     privacy_filter: PrivacyFilter | None = None,
     *,
+    include_network: bool = False,
     network_scrub_pipeline: "NetworkScrubPipeline | None" = None,
 ) -> int:
     """Stream events to an open file handle. Returns event count.
@@ -224,6 +233,7 @@ def _write_events(
     count = 0
     for event in capture.export_events(
         include_moves=not exclude_moves,
+        include_network=include_network,
         network_scrub_pipeline=network_scrub_pipeline,
     ):
         if isinstance(event, WindowSwitchEvent) and privacy_filter is not None:
