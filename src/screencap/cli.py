@@ -177,13 +177,25 @@ def _maybe_prompt_privacy_setup(*, cloud_intent: bool = False) -> None:
               default=None, help="Task segmentation: 'llm' (server-side) or 'idle' (gap detection).")
 @click.option("--no-scrub", is_flag=True, default=False,
               help="Disable PII/secrets scrubbing for this recording.")
+@click.option(
+    "--network",
+    is_flag=True,
+    default=False,
+    help=(
+        "Capture HTTP/HTTPS request/response metadata as a system proxy. "
+        "Off by default. First use installs a 30-day CA into your login "
+        "Keychain (one prompt) and configures the system web proxy (one "
+        "admin prompt). Bodies are NOT retained in V1; metadata only. "
+        "Run `screencap network restore` to recover proxy state after a crash."
+    ),
+)
 @click.option("--unlisted", is_flag=True, default=False,
               help="Hide this recording from the website (still uploads, just not listed).")
 def start(
     name, description, no_audio, no_video, no_images, no_window_data,
     output, no_wifi_metrics, no_app_versions,
     no_auto_name, local_only, force, verbose, chunk_duration, no_live_upload,
-    destination, segmentation_mode, no_scrub, unlisted,
+    destination, segmentation_mode, no_scrub, network, unlisted,
 ):
     """Record a screen capture session. Ctrl+C to stop.
 
@@ -402,6 +414,24 @@ def start(
         console.print(_RECORD_EXTRAS_MSG)
         raise SystemExit(1)
 
+    # Pin spawn mode at CLI entry BEFORE any mp.Queue/mp.Process is constructed.
+    # AES-GCM nonce safety (V1.5+) depends on os.urandom being independently
+    # seeded in the child; under fork mode the child inherits parent state.
+    # Asserting only inside run_proxy() is too late -- the parent has already
+    # forked/spawned by then. The `allow_none=True` is load-bearing: without
+    # it, get_start_method freezes the start-method context as a side effect.
+    if network:
+        import multiprocessing as _mp_init
+        _current_start = _mp_init.get_start_method(allow_none=True)
+        if _current_start is None:
+            _mp_init.set_start_method("spawn", force=True)
+        elif _current_start != "spawn":
+            console.print(
+                f"[red]Error:[/red] multiprocessing start method is "
+                f"{_current_start!r}; --network requires 'spawn'."
+            )
+            raise SystemExit(1)
+
     cli_args = {
         "name": name,
         "description": description or None,
@@ -425,6 +455,7 @@ def start(
         "show_on_website": show_on_website,
         "auto_name_enabled": auto_name_enabled,
         "local_only": local_only,
+        "network": network,
     }
 
     controller = SessionController(cli_args)
