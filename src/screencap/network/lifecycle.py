@@ -538,11 +538,17 @@ def preflight_or_raise(
         2. mitmproxy import check (no UI).
         3. Port auto-negotiation 8080-8090 (no UI).
         4. networksetup callable check (no UI).
-        5. Admin auth obtained for networksetup via osascript trial
-           (FIRST user prompt).
-        6. CA verify; if missing/expired, generate + install (Keychain
-           prompt — SECOND user prompt).
-        7. Set up ~/.screencap/proxy/ (mkdir 700 + xattr + iCloud check).
+        5. CA verify; if missing/expired, generate + install (Keychain
+           prompt — first run only).
+        6. Set up ~/.screencap/proxy/ (mkdir 700 + xattr + iCloud check).
+
+    The admin auth prompt for ``networksetup`` happens AFTER pre-flight
+    returns -- the engine layer's ``set_proxy_all`` is the first
+    osascript admin call. There is no separate pre-flight auth "trial"
+    because each fresh ``osascript with administrator privileges``
+    invocation is its own auth context, so a no-op echo would only
+    add a redundant prompt without seeding any cache reused by the
+    real flip.
     """
     proxy_dir = confdir or _DEFAULT_PROXY_DIR
 
@@ -595,17 +601,13 @@ def preflight_or_raise(
             "networksetup is not callable. This feature requires macOS."
         ) from exc
 
-    # (5) Admin auth trial — single osascript admin call to seed the auth
-    # cache; subsequent set_proxy_all uses the cached auth.
-    try:
-        _run_admin_auth_trial()
-    except subprocess.TimeoutExpired as exc:
-        raise AdminAuthDeniedError(
-            "admin auth dialog timed out. Run `screencap start --network` "
-            "again and accept the prompt."
-        ) from exc
-
-    # (6) CA verify; install if needed.
+    # (5) CA verify; install if needed.
+    # (Note: there is no separate pre-flight admin auth "trial." Each fresh
+    # `osascript with administrator privileges` invocation is its own auth
+    # context, so a no-op echo would only ADD a redundant prompt without
+    # seeding any cache reused by `set_proxy_all`. The actual proxy flip
+    # in the engine layer is the FIRST admin prompt; the teardown restore
+    # is the second.)
     from screencap.network import ca_lifecycle  # noqa: PLC0415
 
     ca_pem = proxy_dir / "mitmproxy-ca.pem"
@@ -627,7 +629,7 @@ def preflight_or_raise(
             f"[yellow]Re-installed screencap proxy CA[/yellow] (CN={identity.cn})."
         )
 
-    # (7) Setup proxy dir + iCloud warning for the recording dir.
+    # (6) Setup proxy dir + iCloud warning for the recording dir.
     ca_lifecycle.setup_proxy_dir(proxy_dir)
     if recording_dir is not None:
         if ca_lifecycle.check_icloud_sync(recording_dir):
@@ -638,32 +640,6 @@ def preflight_or_raise(
             )
 
     return port
-
-
-def _run_admin_auth_trial() -> None:
-    """Single osascript admin call to seed the macOS auth cache.
-
-    The actual command is a no-op (echo); the goal is to surface the admin
-    dialog up-front rather than mid-recording.
-    """
-    apple_script = (
-        'do shell script "echo screencap-network-preflight" '
-        'with administrator privileges '
-        'with prompt "screencap needs admin access to configure your network '
-        'proxy for capture (will be restored on stop)"'
-    )
-    result = subprocess.run(
-        ["/usr/bin/osascript", "-e", apple_script],
-        capture_output=True,
-        text=True,
-        check=False,
-        timeout=120,  # 2 min for the user to respond
-    )
-    if result.returncode != 0:
-        raise AdminAuthDeniedError(
-            f"admin auth was not granted (exit {result.returncode}): "
-            f"{result.stderr.strip() or result.stdout.strip()}"
-        )
 
 
 def full_uninstall(
