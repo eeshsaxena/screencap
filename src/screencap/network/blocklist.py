@@ -1,0 +1,174 @@
+"""Network blocklist: HTTPS CONNECT gating + HTTP request gating.
+
+The host-blocking logic is a free function consumed at two sites:
+1. :func:`build_ignore_hosts_regex` — produces regex strings for
+   mitmproxy's ``ignore_hosts`` option (HTTPS CONNECT level — these
+   hosts never get TLS-intercepted).
+2. The capture addon's request hooks (HTTP gating — see Unit 4).
+
+It is **not** a method on :class:`RecorderPrivacyFilter`; that class is
+screen / keystroke only.
+"""
+
+from __future__ import annotations
+
+import ipaddress
+import re
+from typing import TYPE_CHECKING
+
+if TYPE_CHECKING:
+    from screencap.network.config import NetworkConfig
+    from screencap.privacy.policy import PrivacyConfig
+
+
+# Curated default blocklist for sensitive third-party properties.
+#
+# Inclusion criteria:
+#   - Financial services (retail banking)
+#   - Password managers
+#   - Auth providers (OAuth/SAML/SSO endpoints)
+#   - Payment processors (auth surface, not the data API per se)
+#   - Healthcare patient portals
+#
+# Notes on edge cases:
+#   - ``stripe.com`` is included because the auth + checkout flow lives
+#     at the bare apex; the public REST data surface is at
+#     ``api.stripe.com`` — users can opt back in via
+#     ``override_default_blocklist`` if they need the API.
+#   - All entries are stored as suffix patterns. ``foo.com`` matches
+#     ``foo.com`` and ``*.foo.com`` (per :func:`is_host_blocked`).
+DEFAULT_BLOCKLIST: frozenset[str] = frozenset({
+    # Password managers
+    "1password.com",
+    "1password.ca",
+    "vault.bitwarden.com",
+    "bitwarden.com",
+    "lastpass.com",
+    # Retail banking
+    "chase.com",
+    "bankofamerica.com",
+    "wellsfargo.com",
+    "capitalone.com",
+    "hsbc.com",
+    # Financial data / aggregators
+    "plaid.com",
+    # Payments (auth surface — see note above)
+    "stripe.com",
+    # Identity providers / SSO
+    "okta.com",
+    "auth0.com",
+    "accounts.google.com",
+    "login.microsoftonline.com",
+})
+
+
+def is_ip_literal(host: str) -> bool:
+    """Return ``True`` iff ``host`` is an IPv4 or IPv6 literal.
+
+    Accepts the bracketed form for IPv6 (``[::1]``) as well as the bare
+    form (``::1``). Returns ``False`` (rather than raising) on empty
+    input or any host that doesn't parse as an IP literal.
+    """
+    if not host:
+        return False
+    candidate = host.strip("[]")
+    if not candidate:
+        return False
+    try:
+        ipaddress.ip_address(candidate)
+    except ValueError:
+        return False
+    return True
+
+
+def _matches_suffix(host: str, entry: str) -> bool:
+    """Suffix-match a host against a blocklist entry.
+
+    Wildcard form (``*.foo.com``) and bare form (``foo.com``) are
+    treated identically: the host must equal the bare apex or end with
+    ``"." + apex``. **Never** uses substring containment — that's a
+    privacy bypass (e.g., ``foo.com.evil.com`` would erroneously match).
+    """
+    bare = entry.lower()
+    if bare.startswith("*."):
+        bare = bare[2:]
+    host = host.lower()
+    return host == bare or host.endswith("." + bare)
+
+
+def is_host_blocked(
+    host: str,
+    privacy_config: "PrivacyConfig",
+    network_config: "NetworkConfig",
+) -> bool:
+    """Return ``True`` iff network capture for ``host`` should be skipped.
+
+    Combines four sources:
+        1. ``privacy_config.mask_domains`` (suffix match via
+           :meth:`PrivacyConfig.is_masked_domain`).
+        2. ``network_config.extra_blocklist`` (suffix match).
+        3. :data:`DEFAULT_BLOCKLIST` — applied unless
+           ``network_config.override_default_blocklist`` is True.
+        4. IP literals (always blocked).
+    """
+    if not host:
+        return False
+
+    if is_ip_literal(host):
+        return True
+
+    if privacy_config.is_masked_domain(host):
+        return True
+
+    for entry in network_config.extra_blocklist:
+        if _matches_suffix(host, entry):
+            return True
+
+    if not network_config.override_default_blocklist:
+        for entry in DEFAULT_BLOCKLIST:
+            if _matches_suffix(host, entry):
+                return True
+
+    return False
+
+
+def build_ignore_hosts_regex(
+    privacy_config: "PrivacyConfig",
+    network_config: "NetworkConfig",
+) -> list[str]:
+    """Build mitmproxy ``ignore_hosts`` regex list from blocklist sources.
+
+    Combines ``privacy_config.mask_domains`` ∪
+    ``network_config.extra_blocklist`` ∪ (:data:`DEFAULT_BLOCKLIST`
+    unless overridden), produces a per-host suffix-anchored regex, and
+    appends IP-literal anchors. The regex matches any port (not just
+    443) so non-standard HTTPS deployments are also bypassed.
+
+    Returned strings are intended for ``re.compile(..., re.IGNORECASE)``.
+    """
+    entries: set[str] = set()
+    entries.update(privacy_config.mask_domains)
+    entries.update(network_config.extra_blocklist)
+    if not network_config.override_default_blocklist:
+        entries.update(DEFAULT_BLOCKLIST)
+
+    patterns: list[str] = []
+    for entry in sorted(entries):
+        bare = entry.lower()
+        if bare.startswith("*."):
+            bare = bare[2:]
+        if not bare:
+            continue
+        escaped = re.escape(bare)
+        # ^(.+\.)?{escaped}:\d+$ matches the bare apex and any subdomain
+        # at any port. \d+ keeps the regex flexible across non-443
+        # deployments.
+        patterns.append(rf"^(.+\.)?{escaped}:\d+$")
+
+    # IP-literal anchors are always active — even when the user opts
+    # out of DEFAULT_BLOCKLIST, we never proxy raw IPs (no SNI = no
+    # safe way to gate body capture).
+    patterns.append(r"^\d+\.\d+\.\d+\.\d+:\d+$")
+    patterns.append(r"^\[?[0-9a-f:]+\]?:\d+$")
+
+    return patterns

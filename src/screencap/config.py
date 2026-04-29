@@ -305,6 +305,17 @@ def get_privacy_config():
     return parse_privacy_config(_load_toml())
 
 
+def get_network_config():
+    """Return a NetworkConfig parsed from [network] in config.toml.
+
+    V1 fields only — see :class:`screencap.network.config.NetworkConfig`.
+    Deferred import to avoid circular deps and keep CLI startup fast.
+    """
+    from screencap.network.config import parse_network_config
+
+    return parse_network_config(_load_toml().get("network", {}))
+
+
 def get_first_seen_prompt_enabled() -> bool:
     """Return whether the first-seen privacy prompt is enabled. Default True.
 
