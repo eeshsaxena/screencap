@@ -105,32 +105,38 @@ def _eval_for(evaluator, bundle_id, title="Whatever", domain=None):
     return evaluator.evaluate(context, metadata)
 
 
-class TestAllowAppsBeatsMaskWindow:
-    """allow_apps must override MASK_WINDOW for non-EXCLUDE matrix classes.
+class TestAllowAppsRespectsMatrixFloor:
+    """allow_apps observes the matrix-strictness floor at the configured mode.
 
-    A user who explicitly allow-listed Slack expecting a captured recording
-    must keep getting ALLOW even after Unit 7a tightened the default. The
-    documented precedence at policy.py:389+ is:
-      exclude_apps > allow_apps > mask_domains > mask_title_patterns > matrix
+    The CLI guard (cli._matrix_blocks_allow_for_class) rejects new
+    additions of bundles whose matrix action is EXCLUDE / MASK_WINDOW /
+    TEXT_REDACT. The runtime evaluator must apply the same floor so an
+    EXISTING entry (carried over from before the guard or from a prior
+    privacy mode) does not silently bypass the matrix.
+
+    Documented precedence at policy.py:389+:
+      exclude_apps > matrix-floor(allow_apps) > mask_domains > mask_title_patterns > matrix
     """
 
-    def test_allow_apps_overrides_chat_mask_window_under_internal(self):
-        """User-allowed Slack under internal → ALLOW (overrides matrix MASK_WINDOW)."""
+    def test_allow_apps_respects_chat_mask_window_floor_under_internal(self):
+        """Pre-existing Slack in allow_apps under internal → MASK_WINDOW
+        (matrix wins). Previously this evaluated to ALLOW, defeating
+        Unit 7a's tightening for upgrading users."""
         evaluator = _evaluator(
             mode="internal",
             allow_apps=["com.tinyspeck.slackmacgap"],
         )
         decision = _eval_for(evaluator, "com.tinyspeck.slackmacgap")
-        assert decision.action == PrivacyAction.ALLOW
+        assert decision.action == PrivacyAction.MASK_WINDOW
 
-    def test_allow_apps_overrides_email_mask_window_under_internal(self):
-        """User-allowed Mail.app under internal → ALLOW."""
+    def test_allow_apps_respects_email_mask_window_floor_under_internal(self):
+        """Pre-existing Mail.app in allow_apps under internal → MASK_WINDOW."""
         evaluator = _evaluator(
             mode="internal",
             allow_apps=["com.apple.mail"],
         )
         decision = _eval_for(evaluator, "com.apple.mail")
-        assert decision.action == PrivacyAction.ALLOW
+        assert decision.action == PrivacyAction.MASK_WINDOW
 
     def test_allow_apps_cannot_override_password_manager_exclude(self):
         """1Password stays EXCLUDE even when allow-listed (PASSWORD_MANAGER invariant)."""
@@ -170,3 +176,71 @@ def test_known_chat_like_bundles_resolve_to_mask_window_under_internal(bundle_id
     evaluator = _evaluator(mode="internal")
     decision = _eval_for(evaluator, bundle_id)
     assert decision.action == PrivacyAction.MASK_WINDOW
+
+
+# ---------------------------------------------------------------------------
+# Runtime allow_apps strictness floor — pre-existing entries must NOT
+# silently bypass Unit 7a's matrix tightening.
+# ---------------------------------------------------------------------------
+
+
+class TestAllowAppsStrictnessFloor:
+    """The CLI guard rejects new allow_apps additions for matrix-blocked
+    classes. The runtime evaluator must apply the same floor to existing
+    on-disk entries — otherwise an upgrading user with Slack already in
+    allow_apps gets raw capture under internal mode (defeating Unit 7a).
+    """
+
+    def test_existing_chat_allow_does_not_bypass_mask_window(self):
+        """Pre-existing Slack in allow_apps under internal mode → should
+        evaluate to MASK_WINDOW (matrix), NOT ALLOW (allow_apps override).
+        """
+        evaluator = _evaluator(
+            mode="internal",
+            allow_apps=["com.tinyspeck.slackmacgap"],
+        )
+        decision = _eval_for(evaluator, "com.tinyspeck.slackmacgap")
+        assert decision.action == PrivacyAction.MASK_WINDOW, (
+            f"existing allow_apps must not bypass MASK_WINDOW, got {decision.action}"
+        )
+
+    def test_existing_email_allow_does_not_bypass_mask_window(self):
+        evaluator = _evaluator(
+            mode="internal",
+            allow_apps=["com.apple.mail"],
+        )
+        decision = _eval_for(evaluator, "com.apple.mail")
+        assert decision.action == PrivacyAction.MASK_WINDOW
+
+    def test_existing_admin_console_allow_does_not_bypass_text_redact(self):
+        """ADMIN_CONSOLE under PUBLIC = TEXT_REDACT. allow_apps must not
+        bypass that — text-redact is the matrix's explicit decision."""
+        evaluator = _evaluator(
+            mode="public",
+            allow_apps=["com.electron.dockerdesktop"],
+        )
+        decision = _eval_for(evaluator, "com.electron.dockerdesktop")
+        # Under public, ADMIN_CONSOLE → TEXT_REDACT. allow_apps does not
+        # override.
+        assert decision.action == PrivacyAction.TEXT_REDACT
+
+    def test_browser_unverified_allow_still_works(self):
+        """Strictness floor only blocks the matrix-blocked actions
+        (EXCLUDE/MASK_WINDOW/TEXT_REDACT). BROWSER_UNVERIFIED under internal
+        is ALLOW — allow_apps is a no-op there but evaluation still
+        produces ALLOW."""
+        evaluator = _evaluator(
+            mode="internal",
+            allow_apps=["com.openai.chat"],
+        )
+        decision = _eval_for(evaluator, "com.openai.chat")
+        assert decision.action == PrivacyAction.ALLOW
+
+    def test_password_manager_allow_still_excludes(self):
+        """Existing behavior preserved: matrix EXCLUDE wins over allow_apps."""
+        evaluator = _evaluator(
+            mode="internal",
+            allow_apps=["com.1password.1password"],
+        )
+        decision = _eval_for(evaluator, "com.1password.1password")
+        assert decision.action == PrivacyAction.EXCLUDE

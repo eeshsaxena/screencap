@@ -1344,6 +1344,16 @@ class SessionController:
                     "state": SessionState.IDLE.value,
                     "pending": self._total_pending_count(),
                 })
+                # Clear per-recording lock metadata so `screencap status
+                # --json` reports is_recording=false. Without this, a
+                # disk_full / permission_lost / crash exit leaves
+                # recording_started_at populated and status keeps
+                # reporting a growing elapsed time forever.
+                try:
+                    from screencap.pidfile import clear_lock_recording
+                    clear_lock_recording()
+                except Exception:
+                    pass
 
         self._do_shutdown()
 

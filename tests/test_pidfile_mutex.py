@@ -189,6 +189,72 @@ class TestClaimLock:
     def test_clear_lock_recording_returns_false_when_not_held(self):
         assert pidfile.clear_lock_recording() is False
 
+
+class TestStopForceTargetsLockOwner:
+    """`screencap stop --force` must SIGKILL the lock owner directly.
+    Previously it skipped the lock-owner path (gated by `if not force:`)
+    and only scanned orphans — but find_orphaned_processes() returns []
+    while the SessionController parent is alive (pidfile.py:107). Result:
+    `stop --force` against a hung-but-alive controller did nothing.
+    """
+
+    def test_stop_force_kills_lock_owner_via_metadata(self, tmp_path, monkeypatch):
+        """Hold the lock from a child process; verify `screencap stop --force`
+        sends SIGKILL to that child's PID. Uses CliRunner + lock-metadata
+        path; doesn't actually spawn a recorder."""
+        import multiprocessing
+        import time as _time
+        from click.testing import CliRunner
+
+        from screencap.cli import cli
+
+        # Pre-create the lock dir so the child can open the file.
+        pidfile.LOCK_DIR.mkdir(parents=True, exist_ok=True)
+
+        ctx = multiprocessing.get_context("spawn")
+        started_q = ctx.Queue()
+        # Hold the lock with our test claimant for a long time so the
+        # parent stop call can target the child.
+        proc = ctx.Process(
+            target=_hold_lock_with_claimant,
+            args=(pidfile.LOCK_FILE, pidfile.LOCK_DIR, started_q, "cli", 30.0),
+        )
+        proc.start()
+        try:
+            assert started_q.get(timeout=5) == "ready"
+            child_pid = proc.pid
+
+            # _is_screencap_process inspects cmdline for "screencap" — our
+            # child's cmdline is the python interpreter running the test
+            # subprocess target, which won't match. Stub it to True for
+            # this child PID so the stop command's safety check passes.
+            from screencap import pidfile as _pidfile_module
+            original_is_screencap = _pidfile_module._is_screencap_process
+
+            def _is_screencap_stub(pid):
+                if pid == child_pid:
+                    return True
+                return original_is_screencap(pid)
+
+            monkeypatch.setattr(_pidfile_module, "_is_screencap_process", _is_screencap_stub)
+
+            runner = CliRunner()
+            result = runner.invoke(cli, ["stop", "--force"], catch_exceptions=False)
+            assert result.exit_code == 0
+            # Force-kill output should reference the lock-owner PID.
+            assert f"PID {child_pid}" in result.output or "Force-killing" in result.output
+
+            # Wait for the kernel to reap.
+            for _ in range(20):
+                if not proc.is_alive():
+                    break
+                _time.sleep(0.1)
+            assert not proc.is_alive(), "child should have been SIGKILLed"
+        finally:
+            if proc.is_alive():
+                proc.kill()
+                proc.join(timeout=5)
+
     def test_flock_oserror_does_not_leak_fd(self, monkeypatch, tmp_path):
         """Todo 008: any flock failure that isn't BlockingIOError must close
         the fd opened on the previous line. Without this, NFS EOPNOTSUPP /

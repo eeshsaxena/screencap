@@ -139,8 +139,12 @@ class TestUserOverridesReflected:
         assert slack["in_exclude_apps"] is True
         assert slack["resolved_action"] == "exclude"
 
-    def test_in_allow_apps_overrides_mask(self, tmp_path):
-        """allow_apps + CHAT (non-EXCLUDE matrix class) → resolved_action = ALLOW."""
+    def test_in_allow_apps_respects_matrix_floor(self, tmp_path):
+        """allow_apps for CHAT under internal does NOT override the matrix
+        MASK_WINDOW floor (Finding 3 — runtime evaluator was missing the
+        same guard the CLI add-time path enforces). The Privacy pane shows
+        the bundle as in_allow_apps=true but resolved_action=mask_window
+        so the user sees the actual capture posture."""
         from screencap.config import _CONFIG_PATH
         _CONFIG_PATH.write_text(
             '[privacy]\nmode = "internal"\nallow_apps = ["com.tinyspeck.slackmacgap"]\n'
@@ -150,7 +154,8 @@ class TestUserOverridesReflected:
         payload = json.loads(_invoke_apps_json().stdout.strip())
         slack = _by_bundle(payload, "com.tinyspeck.slackmacgap")
         assert slack["in_allow_apps"] is True
-        assert slack["resolved_action"] == "allow"
+        # Floor wins: matrix decides, not allow_apps.
+        assert slack["resolved_action"] == "mask_window"
 
     def test_password_manager_stays_excluded_even_when_allow_listed(self, tmp_path):
         """Matrix EXCLUDE (PASSWORD_MANAGER) cannot be loosened by allow_apps."""

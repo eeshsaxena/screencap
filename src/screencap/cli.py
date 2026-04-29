@@ -1646,91 +1646,119 @@ def stop(force):
         console.print(_RECORD_EXTRAS_MSG)
         raise SystemExit(1)
 
-    # Try graceful shutdown via SIGTERM to parent process first.
-    # Prefer the flock-protected lock metadata (Unit 3) — it's the canonical
-    # owner and works correctly for multiprocessing.spawn workers (per
+    # Identify the lock owner. Prefer the flock-protected lock metadata
+    # (Unit 3) — it's the canonical owner and works correctly for
+    # multiprocessing.spawn workers (per
     # docs/tickets/high-2026-03-10-fix-orphan-detection-spawn-workers.md).
-    # Fall back to legacy recording.pid for back-compat with any holder that
-    # hasn't migrated.
-    if not force:
-        lock_meta = read_lock_metadata()
-        parent_pid = None
-        lock_started_at = None
-        if lock_meta and lock_meta.get("pid"):
-            parent_pid = lock_meta["pid"]
-            lock_started_at = lock_meta.get("started_at")
-        else:
-            data = read_pidfile()
-            if data and data.get("parent_pid"):
-                parent_pid = data["parent_pid"]
-                lock_started_at = data.get("started_at")
+    # Fall back to legacy recording.pid for back-compat with any holder
+    # that hasn't migrated.
+    #
+    # This identification step runs in BOTH the graceful and --force paths.
+    # Without it, --force would skip straight to find_orphaned_processes(),
+    # which returns [] when the SessionController parent is alive — meaning
+    # `screencap stop --force` against a hung-but-alive controller did
+    # nothing.
+    lock_meta = read_lock_metadata()
+    parent_pid = None
+    lock_started_at = None
+    if lock_meta and lock_meta.get("pid"):
+        parent_pid = lock_meta["pid"]
+        lock_started_at = lock_meta.get("started_at")
+    else:
+        data = read_pidfile()
+        if data and data.get("parent_pid"):
+            parent_pid = data["parent_pid"]
+            lock_started_at = data.get("started_at")
 
-        # PID-recycle guard (todo 007) — verify the live PID's create_time is
-        # within tolerance of the lock metadata's started_at. macOS recycles
-        # PIDs aggressively (~99k space), so a long-dead recorder's PID could
-        # belong to an unrelated process by the time the user runs `stop`.
-        # Sending SIGTERM to a recycled PID would terminate that unrelated
-        # process — `_is_screencap_process` cmdline-grep is fuzzy enough to
-        # let the wrong target through. create_time pinning is deterministic.
-        if parent_pid is not None and lock_started_at is not None:
+    # PID-recycle guard (todo 007) — verify the live PID's create_time is
+    # within tolerance of the lock metadata's started_at. macOS recycles
+    # PIDs aggressively (~99k space), so a long-dead recorder's PID could
+    # belong to an unrelated process by the time the user runs `stop`.
+    # Applies to both graceful and --force paths — force-killing the wrong
+    # process is even worse than SIGTERM-ing it.
+    if parent_pid is not None and lock_started_at is not None:
+        try:
+            import psutil as _psutil
+            proc_create_time = _psutil.Process(parent_pid).create_time()
+            # 1s tolerance: lock metadata's started_at is wall-clock from
+            # before fork; create_time is monotonic from after fork.
+            # On macOS the gap is sub-second; 1s is generous.
+            if proc_create_time > float(lock_started_at) + 1.0:
+                console.print(
+                    f"[yellow]Warning:[/yellow] PID {parent_pid} appears recycled "
+                    f"(process started after the recording's lock metadata). "
+                    f"Skipping direct kill; falling through to orphan scan."
+                )
+                parent_pid = None
+        except (_psutil.NoSuchProcess, _psutil.AccessDenied, _psutil.ZombieProcess):
+            # No process at that PID — nothing to stop directly; fall
+            # through to the orphan scan.
+            parent_pid = None
+        except Exception:
+            # Unexpected psutil failure: stay conservative and skip the
+            # direct kill rather than risk killing an unrelated process.
+            parent_pid = None
+
+    if parent_pid is not None and _pid_exists(parent_pid) and _is_screencap_process(parent_pid):
+        if force:
+            # --force path: SIGKILL the lock owner directly. This is the
+            # only way to take down a hung-but-alive SessionController, since
+            # find_orphaned_processes() returns [] while the parent lives.
+            console.print(f"[yellow]Force-killing recording (PID {parent_pid})...[/yellow]")
             try:
-                import psutil as _psutil
-                proc_create_time = _psutil.Process(parent_pid).create_time()
-                # 1s tolerance: lock metadata's started_at is wall-clock from
-                # before fork; create_time is monotonic from after fork.
-                # On macOS the gap is sub-second; 1s is generous.
-                if proc_create_time > float(lock_started_at) + 1.0:
-                    console.print(
-                        f"[yellow]Warning:[/yellow] PID {parent_pid} appears recycled "
-                        f"(process started after the recording's lock metadata). "
-                        f"Skipping graceful stop; falling through to orphan scan."
-                    )
-                    parent_pid = None
-            except (_psutil.NoSuchProcess, _psutil.AccessDenied, _psutil.ZombieProcess):
-                # No process at that PID — nothing to stop gracefully; fall
-                # through to the orphan scan.
-                parent_pid = None
-            except Exception:
-                # Unexpected psutil failure: stay conservative and skip the
-                # SIGTERM rather than risk killing an unrelated process.
-                parent_pid = None
-
-        if parent_pid is not None:
-            if _pid_exists(parent_pid) and _is_screencap_process(parent_pid):
-                console.print(f"Sending stop signal to recording (PID {parent_pid})...")
-                try:
-                    _os.kill(parent_pid, _signal.SIGTERM)
-                except (ProcessLookupError, PermissionError):
-                    pass
+                _os.kill(parent_pid, _signal.SIGKILL)
+            except (ProcessLookupError, PermissionError) as exc:
+                console.print(f"[red]Failed to SIGKILL PID {parent_pid}: {exc}[/red]")
+            else:
+                # Brief wait for the kernel to reap; then confirm.
+                for _ in range(10):
+                    if not _pid_exists(parent_pid):
+                        break
+                    _time.sleep(0.1)
+                if not _pid_exists(parent_pid):
+                    console.print("[#22d3ee]Recording force-stopped.[/#22d3ee]")
                 else:
-                    # Wait for graceful shutdown (up to 30s) with progress
-                    _timed_out = True
-                    try:
-                        with console.status(
-                            "[dim]Waiting for recording to stop "
-                            "(post-processing may take a moment)...[/dim]"
-                        ) as _wait_status:
-                            for _tick in range(60):
-                                if not _pid_exists(parent_pid):
-                                    _timed_out = False
-                                    break
-                                if _tick == 20:  # 10s elapsed
-                                    _wait_status.update(
-                                        "[dim]Still waiting... use [bold]screencap stop --force[/bold] "
-                                        "to kill immediately[/dim]"
-                                    )
-                                _time.sleep(0.5)
-                    except KeyboardInterrupt:
-                        console.print(
-                            "\n[yellow]Interrupted — escalating to force kill.[/yellow]\n"
-                            "[dim]Tip: [bold]screencap stop --force[/bold] "
-                            "skips the graceful wait[/dim]"
-                        )
-                    if not _timed_out or not _pid_exists(parent_pid):
-                        console.print("[#22d3ee]Recording stopped.[/#22d3ee]")
-                        delete_pidfile()
-                        return
-                    console.print("[yellow]Graceful stop timed out — falling back to force kill.[/yellow]")
+                    console.print(
+                        f"[yellow]Warning:[/yellow] PID {parent_pid} still alive after "
+                        "SIGKILL — process may be uninterruptible (D-state)."
+                    )
+            delete_pidfile()
+            # Fall through to orphan scan in case force-kill left children.
+        else:
+            console.print(f"Sending stop signal to recording (PID {parent_pid})...")
+            try:
+                _os.kill(parent_pid, _signal.SIGTERM)
+            except (ProcessLookupError, PermissionError):
+                pass
+            else:
+                # Wait for graceful shutdown (up to 30s) with progress
+                _timed_out = True
+                try:
+                    with console.status(
+                        "[dim]Waiting for recording to stop "
+                        "(post-processing may take a moment)...[/dim]"
+                    ) as _wait_status:
+                        for _tick in range(60):
+                            if not _pid_exists(parent_pid):
+                                _timed_out = False
+                                break
+                            if _tick == 20:  # 10s elapsed
+                                _wait_status.update(
+                                    "[dim]Still waiting... use [bold]screencap stop --force[/bold] "
+                                    "to kill immediately[/dim]"
+                                )
+                            _time.sleep(0.5)
+                except KeyboardInterrupt:
+                    console.print(
+                        "\n[yellow]Interrupted — escalating to force kill.[/yellow]\n"
+                        "[dim]Tip: [bold]screencap stop --force[/bold] "
+                        "skips the graceful wait[/dim]"
+                    )
+                if not _timed_out or not _pid_exists(parent_pid):
+                    console.print("[#22d3ee]Recording stopped.[/#22d3ee]")
+                    delete_pidfile()
+                    return
+                console.print("[yellow]Graceful stop timed out — falling back to force kill.[/yellow]")
 
     orphans = find_orphaned_processes()
     if not orphans:
@@ -3012,18 +3040,31 @@ def _settings_privacy_apply(
 
             if old_class is not None:
                 configured_mode = str(privacy_tbl.get("mode") or "internal")
-                old_blocking = _matrix_blocks_allow_for_class(old_class, configured_mode)
+                from screencap.privacy.actions import _ACTION_SEVERITY
+                from screencap.privacy.policy import (
+                    PrivacyMode,
+                    get_matrix_action,
+                )
+                try:
+                    _mode_enum = PrivacyMode(configured_mode)
+                except ValueError:
+                    _mode_enum = PrivacyMode.INTERNAL
                 new_class = ContextClass(normalized)
-                new_blocking = _matrix_blocks_allow_for_class(new_class, configured_mode)
-                # Loosening: old class WAS blocked; new class is NOT blocked
-                # (or is blocked with a less-strict action — but the matrix
-                # function returns None for ALLOW, so any None means looser).
-                if old_blocking is not None and new_blocking is None:
+                old_action = get_matrix_action(old_class, _mode_enum)
+                new_action = get_matrix_action(new_class, _mode_enum)
+                # Compare action SEVERITY directly (not just whether the new
+                # action is "blocking"). Higher severity = looser. Reject
+                # any reclassification that loosens the matrix at the
+                # configured mode — covers EXCLUDE→MASK_WINDOW (e.g.,
+                # password_manager → chat) which the previous
+                # blocking-vs-non-blocking check missed because both endpoints
+                # were "blocking".
+                if _ACTION_SEVERITY[new_action] > _ACTION_SEVERITY[old_action]:
                     err_console.print(
                         f"[red]Error:[/red] reclassifying '{bundle}' from "
                         f"{old_class.value} to {new_class.value} would loosen "
                         f"the matrix at mode={configured_mode!r} from "
-                        f"{old_blocking.value} to allow — rejected. "
+                        f"{old_action.value} to {new_action.value} — rejected. "
                         f"Set mode=public if you want broader capture, or "
                         f"keep the existing classification."
                     )

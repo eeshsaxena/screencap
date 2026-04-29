@@ -198,6 +198,36 @@ class TestMatrixExcludeGuard:
         cfg = _read_cfg()
         assert "com.1password.1password" not in cfg.get("privacy", {}).get("app_classes", {})
 
+    def test_app_classes_cannot_loosen_password_manager_to_chat(self):
+        """Severity-based guard: reclassifying 1Password (PASSWORD_MANAGER,
+        matrix=EXCLUDE) to CHAT (matrix=MASK_WINDOW under internal) would
+        loosen EXCLUDE → MASK_WINDOW. The previous blocking-vs-non-blocking
+        check missed this because both endpoints are 'blocking' actions."""
+        result = _invoke("app_classes", "set", "com.1password.1password=chat")
+        assert result.exit_code != 0
+        out = result.output.lower()
+        assert "loosen" in out or "matrix_invariant" in out
+        # Config not mutated.
+        cfg = _read_cfg()
+        assert "com.1password.1password" not in cfg.get("privacy", {}).get("app_classes", {})
+
+    def test_app_classes_cannot_loosen_chat_to_browser_unverified(self):
+        """CHAT (MASK_WINDOW under internal) → BROWSER_UNVERIFIED (ALLOW)
+        is a clear loosening. The original check would have caught this
+        too, but the test pins the regression to keep the cross-tier
+        coverage explicit."""
+        result = _invoke("app_classes", "set", "com.tinyspeck.slackmacgap=browser_unverified")
+        assert result.exit_code != 0
+
+    def test_app_classes_can_strictern_browser_to_chat(self):
+        """Strictening direction is always allowed: BROWSER_UNVERIFIED
+        (ALLOW under internal) → CHAT (MASK_WINDOW) is the user opting
+        in to stricter handling."""
+        result = _invoke("app_classes", "set", "com.openai.chat=chat")
+        assert result.exit_code == 0
+        cfg = _read_cfg()
+        assert cfg["privacy"]["app_classes"]["com.openai.chat"] == "chat"
+
     def test_app_classes_can_set_chat_to_chat(self):
         """Same-class write is a no-op-shaped accept (no loosening)."""
         # Slack is already CHAT in BUNDLE_ID_MAP; setting to CHAT again is fine.

@@ -431,11 +431,19 @@ class DefaultPolicyEvaluator:
                 evidence=metadata.bundle_id,
             )
 
-        # 2. Explicit app allow (unless matrix says EXCLUDE)
+        # 2. Explicit app allow (subject to the matrix-strictness floor)
         # For browsers: allow_apps means "capture by default" but the URL
         # classifier's per-site decisions still apply. When the classifier
         # refined the context beyond BROWSER_UNVERIFIED, fall through to
         # the matrix so sensitive sites are still gated.
+        #
+        # Matrix-strictness floor (mirrors the CLI guard at
+        # cli._matrix_blocks_allow_for_class): allow_apps cannot loosen the
+        # matrix when it produces EXCLUDE / MASK_WINDOW / TEXT_REDACT. The
+        # CLI prevents NEW additions of those bundles, but EXISTING entries
+        # from before Unit 7a (e.g., a pre-existing Slack allowlist that
+        # used to evaluate to ALLOW under the old TEXT_REDACT default) must
+        # not silently re-enable raw capture under the tightened defaults.
         if metadata.bundle_id and self._config.is_allowed_app(metadata.bundle_id):
             matrix_action = get_matrix_action(context.context_class, mode)
             if matrix_action == PrivacyAction.EXCLUDE:
@@ -444,19 +452,25 @@ class DefaultPolicyEvaluator:
                     reason=ReasonCode.POLICY_EXCLUDED_APP,
                     evidence=f"matrix override: {context.context_class.value}",
                 )
-            # Browser with refined context → let the matrix decide
-            is_browser = (
-                self._config.app_classes.get(metadata.bundle_id)
-                == ContextClass.BROWSER_UNVERIFIED
-            )
-            if is_browser and context.context_class != ContextClass.BROWSER_UNVERIFIED:
-                pass  # fall through to matrix (step 5)
+            if matrix_action in (PrivacyAction.MASK_WINDOW, PrivacyAction.TEXT_REDACT):
+                # allow_apps doesn't override these either — fall through
+                # to step 5 (matrix decision) so the user gets the matrix's
+                # action instead of an unintended ALLOW.
+                pass
             else:
-                return ActionDecision(
-                    action=PrivacyAction.ALLOW,
-                    reason=ReasonCode.POLICY_ALLOWED_APP,
-                    evidence=metadata.bundle_id,
+                # Browser with refined context → let the matrix decide
+                is_browser = (
+                    self._config.app_classes.get(metadata.bundle_id)
+                    == ContextClass.BROWSER_UNVERIFIED
                 )
+                if is_browser and context.context_class != ContextClass.BROWSER_UNVERIFIED:
+                    pass  # fall through to matrix (step 5)
+                else:
+                    return ActionDecision(
+                        action=PrivacyAction.ALLOW,
+                        reason=ReasonCode.POLICY_ALLOWED_APP,
+                        evidence=metadata.bundle_id,
+                    )
 
         # 3. Domain mask
         if metadata.domain and self._config.is_masked_domain(metadata.domain):
