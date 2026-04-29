@@ -54,6 +54,7 @@ class EventType(str, Enum):
     NETWORK_WS_UPGRADE = "network.ws_upgrade"
     NETWORK_WS_FRAME = "network.ws_frame"
     NETWORK_DROP_BURST = "network.drop_burst"
+    NETWORK_TUNNELED = "network.tunneled"
 
 
 class MouseButton(str, Enum):
@@ -818,6 +819,30 @@ class NetworkDropBurstEvent(BaseEvent):
     )
 
 
+class NetworkTunneledEvent(BaseEvent):
+    """V1.5: time span during which a host was unobservable due to TLS pinning.
+
+    Emitted at recording end (addon ``done()``) — one event per host that
+    was added to the runtime tunnel-set during the recording. Lets the
+    training pipeline mark "API-not-observable" time spans rather than
+    silently treating them as "no traffic happened."
+
+    Distinct from :class:`NetworkPinFailureEvent`, which is a control-only
+    sideband message printed once on first detection. ``NetworkTunneledEvent``
+    is a real persisted DB row and a JSONL line, summarizing the entire span.
+    """
+
+    type: Literal[EventType.NETWORK_TUNNELED] = EventType.NETWORK_TUNNELED
+    timestamp_ns: int = Field(description="High-precision sort key (time.time_ns())")
+    host: str = Field(description="Host that was tunneled (lowercase)")
+    started_at: float = Field(
+        description="Unix seconds — first time the host was added to the runtime tunnel set",
+    )
+    duration_seconds: float = Field(
+        description="Elapsed seconds from started_at to recording end (or now)",
+    )
+
+
 # =============================================================================
 # Network sideband (control-only - NOT a BaseEvent)
 # =============================================================================
@@ -879,6 +904,7 @@ NetworkEvent = (
     | NetworkWebSocketUpgradeEvent
     | NetworkWebSocketFrameEvent
     | NetworkDropBurstEvent
+    | NetworkTunneledEvent
 )
 
 Event = ActionEvent | ScreenEvent | AudioEvent | WindowEvent | NetworkEvent
@@ -918,4 +944,5 @@ EVENT_TYPE_MAP: dict[str, type[Event]] = {
     EventType.NETWORK_WS_UPGRADE.value: NetworkWebSocketUpgradeEvent,
     EventType.NETWORK_WS_FRAME.value: NetworkWebSocketFrameEvent,
     EventType.NETWORK_DROP_BURST.value: NetworkDropBurstEvent,
+    EventType.NETWORK_TUNNELED.value: NetworkTunneledEvent,
 }

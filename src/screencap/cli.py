@@ -2572,6 +2572,44 @@ def network_uninstall_cmd() -> None:
     console.print("[green]Done.[/green]")
 
 
+@network_group.command("preload-pin")
+@click.argument("host")
+def network_preload_pin_cmd(host: str) -> None:
+    """Add HOST to the persistent known-pinned-hosts cache.
+
+    The capture addon detects cert-pinned hosts at runtime and adds
+    them to ``~/.screencap/known_pinned_hosts.json`` so the next
+    recording skips the MITM attempt and tunnels them directly.
+    Use this command to seed a host manually without having to
+    record once and fail (e.g. an internal banking app you already
+    know is pinned).
+
+    Idempotent: re-adding an existing host is a no-op.
+    """
+    from screencap.network.pinned_hosts import (
+        add_known_pinned_host,
+        load_known_pinned_hosts,
+    )
+
+    host_lc = host.strip().lower()
+    if not host_lc:
+        console.print("[red]Error:[/red] host must be non-empty")
+        sys.exit(1)
+    if add_known_pinned_host(host_lc):
+        console.print(
+            f"[green]Added[/green] {host_lc} to "
+            f"~/.screencap/known_pinned_hosts.json. Next --network "
+            f"recording will tunnel it directly."
+        )
+    else:
+        existing = load_known_pinned_hosts()
+        if host_lc in existing:
+            console.print(f"[dim]{host_lc} already in known-pinned-hosts list.[/dim]")
+        else:
+            console.print(f"[red]Failed to persist[/red] {host_lc}")
+            sys.exit(1)
+
+
 @network_group.command("remove-kek")
 @click.option(
     "--force",

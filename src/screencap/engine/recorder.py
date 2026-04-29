@@ -934,6 +934,13 @@ def _network_event_to_db_dict(event: Any, kind: str) -> dict[str, Any]:
     sha_bytes = hex_to_bytes(sha_hex) if sha_hex else None
 
     details = getattr(event, "details_json", None)
+    # V1.5 network.tunneled has its own payload shape; lift to details_json
+    # so the existing storage column carries it forward without a new column.
+    if kind == "tunneled":
+        details = {
+            "started_at": getattr(event, "started_at", 0.0),
+            "duration_seconds": getattr(event, "duration_seconds", 0.0),
+        }
     out: dict[str, Any] = {
         "kind": kind,
         "flow_id": getattr(event, "flow_id", None),
@@ -997,6 +1004,7 @@ def write_network_events(
         "network.ws_upgrade": "ws_upgrade",
         "network.ws_frame": "ws_frame",
         "network.drop_burst": "drop_burst",
+        "network.tunneled": "tunneled",
     }
 
     started = False

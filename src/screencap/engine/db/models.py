@@ -301,7 +301,9 @@ class MemoryStat(Base):
 # Allowed values for NetworkEvent.kind. The DB column stores the SHORT form
 # (no "network." prefix); the Pydantic class's `type` field uses the dotted
 # EventType enum value. CRUD translates between them.
-NETWORK_EVENT_KINDS = ("request", "response", "ws_upgrade", "ws_frame", "drop_burst")
+NETWORK_EVENT_KINDS = (
+    "request", "response", "ws_upgrade", "ws_frame", "drop_burst", "tunneled",
+)
 
 
 class NetworkEvent(Base):
@@ -346,7 +348,8 @@ class NetworkEvent(Base):
     __tablename__ = "network_event"
     __table_args__ = (
         sa.CheckConstraint(
-            "kind IN ('request', 'response', 'ws_upgrade', 'ws_frame', 'drop_burst')",
+            "kind IN ('request', 'response', 'ws_upgrade', 'ws_frame', "
+            "'drop_burst', 'tunneled')",
             name="ck_network_event_kind",
         ),
         sa.CheckConstraint(

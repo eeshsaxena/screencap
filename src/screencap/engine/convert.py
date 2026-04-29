@@ -28,6 +28,7 @@ from screencap.engine.events import (
     NetworkEvent,
     NetworkRequestEvent,
     NetworkResponseEvent,
+    NetworkTunneledEvent,
     NetworkWebSocketFrameEvent,
     NetworkWebSocketUpgradeEvent,
     WindowSwitchEvent,
@@ -407,6 +408,20 @@ def dict_to_network_event(row: dict) -> NetworkEvent | None:
                 timestamp=ts,
                 timestamp_ns=ts_ns,
                 details_json=details,
+            )
+        elif kind == "tunneled":
+            details = _parse_details_json(row.get("details_json"))
+            if details is None:
+                logger.debug(
+                    "dict_to_network_event: tunneled row missing details_json"
+                )
+                return None
+            return NetworkTunneledEvent(
+                timestamp=ts,
+                timestamp_ns=ts_ns,
+                host=row.get("host", ""),
+                started_at=details.get("started_at", 0.0),
+                duration_seconds=details.get("duration_seconds", 0.0),
             )
     except Exception as e:  # pragma: no cover - defensive
         logger.debug(f"dict_to_network_event: failed to convert kind={kind!r}: {e}")

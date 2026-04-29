@@ -95,6 +95,7 @@ from screencap.engine.events import (
     NetworkPinFailureEvent,
     NetworkRequestEvent,
     NetworkResponseEvent,
+    NetworkTunneledEvent,
     NetworkWebSocketFrameEvent,
     NetworkWebSocketUpgradeEvent,
 )
@@ -271,7 +272,20 @@ class NetworkCapture:
         self._dropped_count: int = 0
         self._dropped_hosts: set[str] = set()
         self._dropped_window_start_ns: int | None = None
-        self._runtime_tunnel_hosts: set[str] = set()
+        # V1.5: seed runtime_tunnel_hosts with previously-detected pinned
+        # hosts so a host that failed in recording N never fails again in
+        # recording N+1. Best-effort load — file IO errors give an empty
+        # set (V1 behavior preserved).
+        from screencap.network import pinned_hosts as _pin  # noqa: PLC0415
+        try:
+            self._runtime_tunnel_hosts: set[str] = _pin.load_known_pinned_hosts()
+        except Exception:  # noqa: BLE001 — pre-loaded cache is best-effort
+            self._runtime_tunnel_hosts = set()
+        # Track each host's first-seen-pinned timestamp so we can emit a
+        # network.tunneled summary event at done() (V1.5 task 11).
+        self._tunnel_started_at: dict[str, float] = {
+            h: time.time() for h in self._runtime_tunnel_hosts
+        }
         self._pin_failure_emitted: set[str] = set()
         self._loop: asyncio.AbstractEventLoop | None = None
         self._drop_burst_timer_handle: asyncio.TimerHandle | None = None
@@ -306,6 +320,26 @@ class NetworkCapture:
         flushed_count = self._dropped_count
         if flushed_count > 0:
             self._emit_drop_burst(blocking=True)
+
+        # V1.5 task 11: emit one network.tunneled event per host that was
+        # tunneled at any point during this recording. Lets the training
+        # pipeline mark API-not-observable time spans rather than
+        # silently treating them as no-traffic windows.
+        now = time.time()
+        for host in sorted(self._runtime_tunnel_hosts):
+            started_at = self._tunnel_started_at.get(host, now)
+            duration = max(0.0, now - started_at)
+            try:
+                tunneled_event = NetworkTunneledEvent(
+                    timestamp=now,
+                    timestamp_ns=time.time_ns(),
+                    host=host,
+                    started_at=started_at,
+                    duration_seconds=duration,
+                )
+                self._enqueue(tunneled_event, host=host)
+            except Exception:  # noqa: BLE001
+                _log(self._log_path, f"failed to emit network.tunneled for {host}")
 
         _log(
             self._log_path,
@@ -592,7 +626,18 @@ class NetworkCapture:
             _log(self._log_path, f"flow error host={host} msg={err_msg!r}")
 
             if host and _is_tls_pin_failure(err_msg):
-                self._runtime_tunnel_hosts.add(host)
+                if host not in self._runtime_tunnel_hosts:
+                    self._runtime_tunnel_hosts.add(host)
+                    self._tunnel_started_at[host] = time.time()
+                    # V1.5: persist for the next recording so this host
+                    # never fails its first connection again. Best-effort.
+                    try:
+                        from screencap.network import (  # noqa: PLC0415
+                            pinned_hosts as _pin,
+                        )
+                        _pin.add_known_pinned_host(host)
+                    except Exception:  # noqa: BLE001
+                        _log(self._log_path, f"failed to persist pinned host {host}")
                 if host not in self._pin_failure_emitted:
                     self._pin_failure_emitted.add(host)
                     pin_event = NetworkPinFailureEvent(
