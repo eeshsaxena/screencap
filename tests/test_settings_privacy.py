@@ -35,9 +35,13 @@ def _read_cfg() -> dict:
     return tomllib.loads(_CONFIG_PATH.read_text())
 
 
-def _invoke(*args):
+def _invoke(*args, as_json=False):
     runner = CliRunner()
-    return runner.invoke(cli, ["settings", "privacy", *args], catch_exceptions=False)
+    full_args = ["settings", "privacy"]
+    if as_json:
+        full_args.append("--json")
+    full_args.extend(args)
+    return runner.invoke(cli, full_args, catch_exceptions=False)
 
 
 # ---------------------------------------------------------------------------
@@ -127,12 +131,48 @@ class TestMatrixExcludeGuard:
         assert result.exit_code != 0
         assert "PASSWORD_MANAGER" in result.output or "matrix" in result.output
 
-    def test_allow_apps_can_add_chat_app(self):
-        """CHAT is masked (MASK_WINDOW under internal) but not unconditionally
-        EXCLUDED — allow_apps add succeeds."""
+    def test_allow_apps_cannot_add_chat_app_under_internal(self):
+        """CHAT under internal is MASK_WINDOW — allow_apps cannot loosen
+        Unit 7a's strengthening for conversation apps (todo 005)."""
+        # default mode is internal in the test setup
         result = _invoke("allow_apps", "add", "com.tinyspeck.slackmacgap")
+        assert result.exit_code != 0
+        out = result.output.lower()
+        assert "chat" in out and "mask_window" in out
+
+    def test_allow_apps_can_add_chat_app_under_public(self):
+        """Under mode=public the matrix produces MASK_WINDOW for CHAT, so
+        allow_apps still blocks (todo 005 gates EXCLUDE/MASK_WINDOW/TEXT_REDACT)."""
+        _invoke("mode", "set", "public")
+        result = _invoke("allow_apps", "add", "com.tinyspeck.slackmacgap")
+        assert result.exit_code != 0
+        out = result.output.lower()
+        assert "chat" in out
+
+    def test_allow_apps_can_add_browser(self):
+        """BROWSER_UNVERIFIED is ALLOW under internal — explicit allow OK."""
+        result = _invoke("allow_apps", "add", "com.brave.Browser")
         assert result.exit_code == 0
-        assert "com.tinyspeck.slackmacgap" in _read_cfg()["privacy"]["allow_apps"]
+        assert "com.brave.Browser" in _read_cfg()["privacy"]["allow_apps"]
+
+    def test_allow_apps_cannot_add_banking_app_under_internal(self):
+        """BANKING under internal is MASK_WINDOW — must be blocked."""
+        result = _invoke("allow_apps", "add", "com.robinhood.release.Robinhood")
+        # If Robinhood isn't in the bundle map this test is vacuous; pick a
+        # known-mapped bundle. Use a representative banking bundle ID that's
+        # in BUNDLE_ID_MAP.
+        from screencap.privacy.context import BUNDLE_ID_MAP
+        from screencap.privacy.policy import ContextClass
+        banking_bundle = next(
+            (bid for bid, cls in BUNDLE_ID_MAP.items() if cls == ContextClass.BANKING),
+            None,
+        )
+        if banking_bundle is None:
+            pytest.skip("No BANKING bundle in BUNDLE_ID_MAP")
+        result = _invoke("allow_apps", "add", banking_bundle)
+        assert result.exit_code != 0
+        out = result.output.lower()
+        assert "banking" in out or "mask_window" in out
 
     def test_exclude_apps_can_add_password_manager(self):
         """exclude_apps can always add anything — strictening is safe."""
@@ -164,3 +204,121 @@ class TestRoundTripModePreservation:
         assert cfg["mode"] == "internal"
         assert "com.example.x" in cfg["exclude_apps"]
         assert "com.example.y" in cfg["allow_apps"]
+
+
+# ---------------------------------------------------------------------------
+# Map field — app_classes (todo 023)
+# ---------------------------------------------------------------------------
+
+
+class TestAppClassesMapField:
+    def test_set_valid_context_class(self):
+        # Input is case-insensitive but stored as the lowercase enum.value
+        result = _invoke("app_classes", "set", "com.example.foo=BROWSER_UNVERIFIED")
+        assert result.exit_code == 0
+        cfg = _read_cfg()["privacy"]
+        assert cfg["app_classes"]["com.example.foo"] == "browser_unverified"
+
+    def test_add_valid_context_class(self):
+        result = _invoke("app_classes", "add", "com.example.bar=CHAT")
+        assert result.exit_code == 0
+        assert _read_cfg()["privacy"]["app_classes"]["com.example.bar"] == "chat"
+
+    def test_add_lowercase_valid_context_class(self):
+        result = _invoke("app_classes", "add", "com.example.lower=email")
+        assert result.exit_code == 0
+        assert _read_cfg()["privacy"]["app_classes"]["com.example.lower"] == "email"
+
+    def test_add_then_remove(self):
+        _invoke("app_classes", "add", "com.example.gone=EMAIL")
+        result = _invoke("app_classes", "remove", "com.example.gone")
+        assert result.exit_code == 0
+        assert "com.example.gone" not in _read_cfg()["privacy"].get("app_classes", {})
+
+    def test_set_invalid_context_class_rejected(self):
+        """A typo'd class string must be caught at write time, not on next
+        start (todo 010). Otherwise PrivacyConfig.parse crashes the recorder."""
+        result = _invoke("app_classes", "set", "com.example.bad=NOT_A_REAL_CLASS")
+        assert result.exit_code != 0
+        assert "Unknown context class" in result.output or "NOT_A_REAL_CLASS" in result.output
+
+    def test_value_missing_equals_rejected(self):
+        result = _invoke("app_classes", "set", "com.example.no_equals_here")
+        assert result.exit_code != 0
+        assert "BUNDLE_ID=CLASS" in result.output or "requires" in result.output
+
+
+# ---------------------------------------------------------------------------
+# Internal-flag isolation (todo 012)
+# ---------------------------------------------------------------------------
+
+
+class TestMatrixAckFlagNotPublic:
+    def test_matrix_ack_flag_not_settable_via_cli(self):
+        """The migration flag is internal — the public scalar list must not
+        expose it to scripted callers."""
+        result = _invoke("matrix_acknowledged_v2026_04", "set", "true")
+        assert result.exit_code != 0
+        assert "Unknown privacy field" in result.output
+
+    def test_shared_mode_rejected(self):
+        """`shared` is reserved for MASK_REGION; PrivacyConfig.parse rejects
+        it. The CLI must not write an unenforceable mode (todo 011)."""
+        result = _invoke("mode", "set", "shared")
+        assert result.exit_code != 0
+        assert "must be one of" in result.output
+
+
+# ---------------------------------------------------------------------------
+# --json output (todo 016)
+# ---------------------------------------------------------------------------
+
+
+def _last_json_line(text: str) -> dict:
+    """Find the last line of `text` that parses as JSON. CliRunner combines
+    stdout and stderr; the JSON success/error payload lives among prose."""
+    import json as _json
+    last = None
+    for line in text.strip().splitlines():
+        line = line.strip()
+        if not line.startswith("{"):
+            continue
+        try:
+            last = _json.loads(line)
+        except _json.JSONDecodeError:
+            continue
+    assert last is not None, f"no JSON line found in: {text!r}"
+    return last
+
+
+class TestJsonOutput:
+    def test_success_emits_json(self):
+        result = _invoke(
+            "exclude_apps", "add", "com.example.json_test", as_json=True,
+        )
+        assert result.exit_code == 0
+        payload = _last_json_line(result.output)
+        assert payload == {
+            "ok": True,
+            "changed": True,
+            "field": "exclude_apps",
+            "op": "add",
+            "value": "com.example.json_test",
+        }
+
+    def test_idempotent_noop_emits_changed_false(self):
+        _invoke("exclude_apps", "add", "com.example.dup")
+        result = _invoke(
+            "exclude_apps", "add", "com.example.dup", as_json=True,
+        )
+        assert result.exit_code == 0
+        payload = _last_json_line(result.output)
+        assert payload["ok"] is True
+        assert payload["changed"] is False
+
+    def test_error_emits_ok_false_with_error_field(self):
+        result = _invoke("no_such_field", "set", "value", as_json=True)
+        assert result.exit_code != 0
+        payload = _last_json_line(result.output)
+        assert payload["ok"] is False
+        assert "error" in payload

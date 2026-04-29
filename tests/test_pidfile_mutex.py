@@ -111,7 +111,16 @@ class TestLockIsActive:
 
 
 def _claim_in_child(lock_path, started_q, hold_seconds):
-    """Subprocess target: claim the lock, signal parent, hold, then exit."""
+    """Subprocess target: claim the lock at ``lock_path``, signal, hold, exit.
+
+    Uses raw ``fcntl.flock`` — NOT ``pidfile.claim_lock`` — because the
+    parent test fixture monkey-patches ``pidfile.LOCK_FILE`` to a tmp_path
+    location, but the patch doesn't survive ``multiprocessing.spawn``
+    re-import. The child would otherwise lock a different path
+    (``~/.screencap/run/recording.lock``) and the parent's contention check
+    would never fire (false negative). Production ``claim_lock`` metadata-
+    write is covered by ``test_metadata_written_on_claim`` intra-process.
+    """
     import fcntl as _fcntl
     import os as _os
 

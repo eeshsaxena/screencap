@@ -9,6 +9,7 @@ from __future__ import annotations
 
 import json
 import os
+import sys
 import time
 from pathlib import Path
 
@@ -62,8 +63,13 @@ class TestStatusJson:
         assert result.exit_code == 0
         payload = json.loads(result.output.strip())
         assert payload["is_recording"] is False
-        assert "elapsed" not in payload
-        assert "started_at" not in payload
+        # Symmetric payload (todo 026): keys are always present, with None when
+        # the recording-state info isn't applicable.
+        assert payload["elapsed"] is None
+        assert payload["started_at"] is None
+        assert payload["capture_dir"] is None
+        assert payload["claimant"] is None
+        assert payload["schema_version"] == 1
 
     def test_active_lock_returns_recording_metadata(self, tmp_path):
         capture_dir = tmp_path / "test-rec"
@@ -111,8 +117,19 @@ class TestStatusJson:
         assert result.exit_code == 0
         payload = json.loads(result.output.strip())
         assert payload["is_recording"] is False
-        # The stale-file warning surfaces so debugging is easier.
-        assert payload.get("warning") == "lock_unparseable_or_stale"
+        # Stale-file warning surfaces so debugging is easier (todo 015 split:
+        # parseable JSON + no holder → "lock_stale", malformed → "lock_unparseable").
+        assert payload["warning"] == "lock_stale"
+
+    def test_unparseable_lock_reports_warning(self, tmp_path):
+        """Malformed JSON in the lock file → warning="lock_unparseable" (todo 015)."""
+        pidfile.LOCK_DIR.mkdir(parents=True, exist_ok=True)
+        pidfile.LOCK_FILE.write_text("{not valid json")
+        result = _run_status_json()
+        assert result.exit_code == 0
+        payload = json.loads(result.output.strip())
+        assert payload["is_recording"] is False
+        assert payload["warning"] == "lock_unparseable"
 
     def test_includes_privacy_configured_flag(self, tmp_path):
         import screencap.config
@@ -139,13 +156,26 @@ class TestStatusJson:
 
 
 class TestStatusHumanOutput:
-    def test_no_lock_human_output(self):
+    """When stdout is a TTY (no `--json` flag), the user sees human output.
+
+    CliRunner doesn't simulate a TTY by default, so since todo 038 added
+    auto-JSON-when-stdout-is-not-a-TTY, these tests must explicitly request
+    human output by patching `sys.stdout.isatty` to return True.
+    """
+
+    def test_no_lock_human_output(self, monkeypatch):
+        # Override the auto-JSON-when-piped helper so the human-output path
+        # is exercised even though CliRunner wraps stdout with a non-TTY pipe.
+        import screencap.cli as _cli
+        monkeypatch.setattr(_cli, "_should_default_to_json", lambda: False)
         runner = CliRunner()
         result = runner.invoke(cli, ["status"], catch_exceptions=False)
         assert result.exit_code == 0
         assert "Not recording" in result.output
 
-    def test_active_lock_human_output(self, tmp_path):
+    def test_active_lock_human_output(self, tmp_path, monkeypatch):
+        import screencap.cli as _cli
+        monkeypatch.setattr(_cli, "_should_default_to_json", lambda: False)
         pidfile.claim_lock(tmp_path / "rec", claimant="cli")
         try:
             runner = CliRunner()

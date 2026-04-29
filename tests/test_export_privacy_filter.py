@@ -105,6 +105,42 @@ class TestExportPrivacyFilterFlag:
                 terminal_titles.append(evt.get("window_title"))
         assert "bash — 80×24" in terminal_titles  # unmasked
 
+    def test_filter_drops_password_manager_window_event(self, tmp_path):
+        """EXCLUDE-class apps (1Password = PASSWORD_MANAGER, EXCLUDE in every
+        mode) must have their window.switch events suppressed entirely — not
+        just masked. A regression to MASK_WINDOW would silently leak the
+        timestamp during which a password manager was foregrounded (todo 024)."""
+        rec_dir = tmp_path / "test-rec"
+        rec_dir.mkdir()
+        extra_windows = [
+            {
+                "timestamp": 1009.0,
+                "title": "Vault: My Logins",
+                "app_bundle_id": "com.1password.1password",
+                "window_id": "500",
+                "left": 0, "top": 0, "width": 1512, "height": 982,
+            },
+        ]
+        create_export_test_db(rec_dir / "recording.db", extra_window_events=extra_windows)
+        runner = CliRunner()
+        result = runner.invoke(
+            cli,
+            ["export", "test-rec", "--stdout", "--privacy-filter"],
+            catch_exceptions=False,
+        )
+        assert result.exit_code == 0
+        # NO window.switch event for the password manager should appear in
+        # the filtered output (the filter returns None → event is dropped).
+        for line in result.stdout.strip().splitlines():
+            try:
+                evt = json.loads(line)
+            except json.JSONDecodeError:
+                continue
+            if evt.get("type") == "window.switch":
+                assert evt.get("app_bundle_id") != "com.1password.1password", (
+                    f"EXCLUDE-class window.switch leaked: {evt}"
+                )
+
     def test_filter_with_public_mode(self, tmp_path):
         """Mode = public (set in config) → still masks CHAT (matrix says
         MASK_WINDOW under public too)."""

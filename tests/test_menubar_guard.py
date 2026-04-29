@@ -20,21 +20,30 @@ from screencap import menubar
 
 
 def test_returns_immediately_when_swiftui_env_set(monkeypatch, capsys):
-    """SCREENCAP_PARENT=swiftui → _run_menubar returns immediately, no AppKit init."""
+    """SCREENCAP_PARENT=swiftui → _run_menubar returns before any AppKit init."""
     monkeypatch.setenv("SCREENCAP_PARENT", "swiftui")
 
-    start = time.monotonic()
+    # Sentinel-based proof (todo 040): stub AppKit so any access past the
+    # guard raises a sentinel exception. If the guard fires correctly, the
+    # function returns cleanly; if a regression lets execution proceed past
+    # the guard, the sentinel raises and the test fails — no timing heuristic.
+    import sys
+
+    sentinel = RuntimeError("guard returned but execution continued past it")
+
+    class _StubAppKit:
+        def __getattr__(self, name):
+            raise sentinel
+
+    monkeypatch.setitem(sys.modules, "AppKit", _StubAppKit())
+
+    # Should return cleanly without hitting the AppKit stub.
     menubar._run_menubar(
         parent_pid=os.getpid(),
         recording_name="probe",
         start_time=time.time(),
         state_file="",
     )
-    elapsed = time.monotonic() - start
-
-    # Sub-second exit means we never touched AppKit / NSApplication / rumps.
-    # AppKit init alone takes hundreds of ms.
-    assert elapsed < 0.5, f"guard should be fast, took {elapsed:.3f}s"
 
     # Guard emits a structured stderr warning so misconfiguration is observable.
     captured = capsys.readouterr()
