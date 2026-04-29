@@ -239,18 +239,29 @@ def unified_export_events(
             if net_evt is None:
                 continue
             if network_scrub_pipeline is not None:
-                # V1.5: decrypt + scrub. The ``NetworkDropBurstEvent``
-                # has no ciphertext fields and is not one of the four
-                # body-bearing kinds the pipeline supports; pass it
-                # through unchanged so drop-burst metadata still flows
-                # to JSONL when bodies are encrypted.
+                # V1.5: decrypt + scrub the body-bearing event types
+                # only. Other network event kinds (drop_burst, tunneled)
+                # have no ciphertext fields and pass through unchanged
+                # so their metadata still flows to JSONL even when
+                # bodies are encrypted. Without this whitelist,
+                # ``decrypt_and_scrub`` raises ValueError on the
+                # non-body kinds and they are silently dropped from
+                # the export stream — losing the drop-burst /
+                # API-not-observable signal exactly when it's most
+                # needed.
                 from screencap.engine.events import (  # noqa: PLC0415
-                    NetworkDropBurstEvent,
+                    NetworkRequestEvent,
+                    NetworkResponseEvent,
+                    NetworkWebSocketFrameEvent,
+                    NetworkWebSocketUpgradeEvent,
                 )
 
-                if isinstance(net_evt, NetworkDropBurstEvent):
-                    network_events.append(net_evt)
-                else:
+                if isinstance(net_evt, (
+                    NetworkRequestEvent,
+                    NetworkResponseEvent,
+                    NetworkWebSocketUpgradeEvent,
+                    NetworkWebSocketFrameEvent,
+                )):
                     try:
                         export_evt = network_scrub_pipeline.decrypt_and_scrub(
                             net_evt,
@@ -264,6 +275,9 @@ def unified_export_events(
                         )
                         continue
                     network_events.append(export_evt)
+                else:
+                    # drop_burst, tunneled, future non-body kinds.
+                    network_events.append(net_evt)
             else:
                 network_events.append(net_evt)
         # Defensive sort - callers fetch by ``ORDER BY timestamp_ns``

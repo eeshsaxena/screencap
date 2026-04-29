@@ -987,3 +987,39 @@ class TestNetworkScrubPipelineKwarg:
         )
         assert len(result) == 1
         assert isinstance(result[0], NetworkDropBurstEvent)
+
+    def test_tunneled_passes_through_pipeline_unchanged(self):
+        """V1.5 P2 #5: ``NetworkTunneledEvent`` has no ciphertext
+        fields. The original whitelist only allowed drop_burst through
+        the pipeline, so tunneled events were sent to
+        ``decrypt_and_scrub``, raised ValueError, and got silently
+        dropped — losing the API-not-observable signal exactly when
+        the recording is encrypted (the case where it's most useful).
+        """
+        from screencap.engine.events import NetworkTunneledEvent
+
+        pipeline = _RecordingFakePipeline()
+        rows = [
+            _network_row(
+                1.0,
+                kind="tunneled",
+                host="pinned.example.com",
+                method=None,
+                url=None,
+                details_json=(
+                    '{"started_at": 100.0, "duration_seconds": 30.0}'
+                ),
+            ),
+        ]
+        result = list(unified_export_events(
+            [], [],
+            network_rows=rows,
+            network_scrub_pipeline=pipeline,
+        ))
+        assert pipeline.calls == [], (
+            "tunneled events must NOT be routed through the scrub "
+            "pipeline (they have no body to decrypt)."
+        )
+        assert len(result) == 1
+        assert isinstance(result[0], NetworkTunneledEvent)
+        assert result[0].host == "pinned.example.com"
