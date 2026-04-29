@@ -1533,3 +1533,104 @@ class TestNetworkCommandGroup:
             result = runner.invoke(cli, ["network", "uninstall"])
         assert result.exit_code == 0
         full_mock.assert_called_once()
+
+
+class TestNetworkRemoveKekCommand:
+    """V1.5 surface: `screencap network remove-kek` + safety check."""
+
+    def _make_recording_with_meta(self, recordings_dir, name: str) -> None:
+        """Create a recording dir with a recording.db that has a network_event_meta row."""
+        from screencap.engine.db import (
+            create_db,
+            crud,
+            get_session_for_path,
+        )
+
+        rec_dir = recordings_dir / name
+        rec_dir.mkdir(parents=True)
+        db_path = rec_dir / "recording.db"
+        # create_db writes a fresh schema. Then insert a recording row + meta.
+        create_db(str(db_path))
+        session = get_session_for_path(str(db_path))
+        try:
+            from screencap.engine.db.models import Recording
+            rec = Recording(
+                task_description=name,
+                timestamp=1.0,
+            )
+            session.add(rec)
+            session.commit()
+            crud.insert_network_event_meta(
+                session,
+                recording_id=rec.id,
+                dek_wrapped=b"\x00" * 32,
+                dek_nonce=b"\x00" * 12,
+            )
+        finally:
+            session.close()
+
+    def test_remove_kek_no_encrypted_recordings_succeeds(self, tmp_path, monkeypatch):
+        from unittest.mock import patch as _patch
+
+        recordings_dir = tmp_path / "recordings"
+        recordings_dir.mkdir()
+        monkeypatch.setenv("SCREENCAP_RECORDINGS_DIR", str(recordings_dir))
+
+        runner = CliRunner()
+        with _patch("keyring.delete_password") as delete_mock:
+            result = runner.invoke(cli, ["network", "remove-kek"])
+        assert result.exit_code == 0
+        delete_mock.assert_called_once()
+
+    def test_remove_kek_blocked_by_encrypted_recording(self, tmp_path, monkeypatch):
+        from unittest.mock import patch as _patch
+
+        recordings_dir = tmp_path / "recordings"
+        recordings_dir.mkdir()
+        monkeypatch.setenv("SCREENCAP_RECORDINGS_DIR", str(recordings_dir))
+        self._make_recording_with_meta(recordings_dir, "rec-encrypted")
+
+        runner = CliRunner()
+        with _patch("keyring.delete_password") as delete_mock:
+            result = runner.invoke(cli, ["network", "remove-kek"])
+        assert result.exit_code == 1
+        assert "rec-encrypted" in result.output
+        assert "Refusing to delete KEK" in result.output
+        # Critically: the deletion is NOT performed.
+        delete_mock.assert_not_called()
+
+    def test_remove_kek_force_overrides_safety(self, tmp_path, monkeypatch):
+        from unittest.mock import patch as _patch
+
+        recordings_dir = tmp_path / "recordings"
+        recordings_dir.mkdir()
+        monkeypatch.setenv("SCREENCAP_RECORDINGS_DIR", str(recordings_dir))
+        self._make_recording_with_meta(recordings_dir, "rec-encrypted")
+
+        runner = CliRunner()
+        with _patch("keyring.delete_password") as delete_mock:
+            result = runner.invoke(cli, ["network", "remove-kek", "--force"])
+        assert result.exit_code == 0
+        assert "--force given" in result.output
+        delete_mock.assert_called_once()
+
+    def test_remove_kek_idempotent_when_kek_absent(self, tmp_path, monkeypatch):
+        """No KEK in keychain → still exits 0 (idempotent)."""
+        from unittest.mock import patch as _patch
+
+        recordings_dir = tmp_path / "recordings"
+        recordings_dir.mkdir()
+        monkeypatch.setenv("SCREENCAP_RECORDINGS_DIR", str(recordings_dir))
+
+        # Simulate keyring's PasswordDeleteError shape with the friendly text.
+        class _FakeNoSuchPassword(Exception):
+            pass
+        _FakeNoSuchPassword.__name__ = "PasswordDeleteError"
+        runner = CliRunner()
+        with _patch(
+            "keyring.delete_password",
+            side_effect=_FakeNoSuchPassword("no such password"),
+        ):
+            result = runner.invoke(cli, ["network", "remove-kek"])
+        assert result.exit_code == 0
+        assert "already removed" in result.output

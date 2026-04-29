@@ -2572,6 +2572,104 @@ def network_uninstall_cmd() -> None:
     console.print("[green]Done.[/green]")
 
 
+@network_group.command("remove-kek")
+@click.option(
+    "--force",
+    is_flag=True,
+    help="Proceed even if encrypted recordings exist on disk.",
+)
+def network_remove_kek_cmd(force: bool) -> None:
+    """Delete the network-body KEK from your Keychain.
+
+    The KEK is the long-lived key that wraps every recording's per-recording
+    DEK. Without it, the V1.5+ network bodies in past recordings cannot be
+    decrypted — they become permanently inaccessible. This is the right
+    command to run when:
+
+    \b
+    - Rotating the KEK (you are about to start fresh; existing encrypted
+      recordings will become undecryptable).
+    - Selling/disposing the device (combined with `screencap network uninstall`
+      and shredding the recordings directory).
+
+    Safety check (unless --force):
+        Scans the configured recordings directory for any recording whose
+        DB has a `network_event_meta` row (i.e. would be decryptable today)
+        and refuses to proceed if any are found, listing them.
+
+    Limitation: recordings written under `--output <custom-path>` are NOT
+    discovered by this scan because we do not track custom output paths
+    after the recording ends. If you have ever used `--output`, you must
+    audit those locations yourself before passing --force.
+    """
+    from screencap.catalog import list_recordings
+    from screencap.config import get_recordings_dir
+    from screencap.engine.db import get_session_for_path
+    from screencap.engine.db.models import NetworkEventMeta
+    from screencap.network import crypto
+
+    encrypted_recordings: list[str] = []
+    recordings_dir = get_recordings_dir()
+    for rec in list_recordings():
+        db_path = recordings_dir / rec.name / "recording.db"
+        if not db_path.exists():
+            continue
+        try:
+            session = get_session_for_path(str(db_path))
+        except Exception:
+            continue
+        try:
+            has_meta = (
+                session.query(NetworkEventMeta).first() is not None
+            )
+        except Exception:
+            has_meta = False
+        finally:
+            session.close()
+        if has_meta:
+            encrypted_recordings.append(rec.name)
+
+    if encrypted_recordings and not force:
+        console.print(
+            f"[red]Refusing to delete KEK:[/red] {len(encrypted_recordings)} "
+            f"recording(s) on disk have encrypted network bodies that depend "
+            f"on this KEK:"
+        )
+        for name in encrypted_recordings:
+            console.print(f"  • {name}")
+        console.print(
+            "\n[yellow]Deleting the KEK will make these recordings' "
+            "network bodies permanently undecryptable.[/yellow] Either "
+            "export them first (`screencap export <name>`) or pass "
+            "[bold]--force[/bold] to proceed anyway."
+        )
+        console.print(
+            "\n[dim]Note:[/dim] recordings written with --output <custom-path> "
+            "are NOT included in this scan."
+        )
+        sys.exit(1)
+
+    if encrypted_recordings and force:
+        console.print(
+            f"[yellow]--force given;[/yellow] {len(encrypted_recordings)} "
+            f"encrypted recording(s) will become undecryptable."
+        )
+
+    try:
+        import keyring  # noqa: PLC0415
+        keyring.delete_password(crypto.SERVICE, crypto.KEK_ACCOUNT)
+        console.print("[green]KEK removed from Keychain.[/green]")
+    except Exception as exc:
+        # PasswordDeleteError is the typical "no such password" — treat
+        # as a no-op success so the command is idempotent.
+        msg = str(exc).lower()
+        if "no such password" in msg or "not found" in msg or "passworddeleteerror" in type(exc).__name__.lower():
+            console.print("[dim]No KEK present in Keychain (already removed).[/dim]")
+        else:
+            console.print(f"[red]Failed to delete KEK:[/red] {exc}")
+            sys.exit(1)
+
+
 @network_group.command("restore")
 def network_restore_cmd() -> None:
     """Restore system proxy state after a recording crash.
