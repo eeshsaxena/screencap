@@ -251,11 +251,13 @@ enum CLIClient {
     /// Spawns a long-lived subprocess and streams stderr lines to `onStderrLine`.
     /// Used by RecorderController for `screencap start` (event contract per Unit 8a).
     /// The caller retains the returned SpawnedProcess and calls `terminate()` to stop.
+    /// `onTerminated` runs after the subprocess exits, after pipe cleanup.
     static func spawn(
         args: [String],
         extraEnv: [String: String] = [:],
         onStderrLine: @escaping @Sendable (String) -> Void,
-        onStdoutLine: (@Sendable (String) -> Void)? = nil
+        onStdoutLine: (@Sendable (String) -> Void)? = nil,
+        onTerminated: (@Sendable (Int32) -> Void)? = nil
     ) throws -> SpawnedProcess {
         let (executable, leading) = try resolveBinary()
         let process = Process()
@@ -288,7 +290,7 @@ enum CLIClient {
             stdoutBufferOpt?.feed(data)
         }
 
-        process.terminationHandler = { _ in
+        process.terminationHandler = { proc in
             // Order matters and so does completeness:
             // 1. Nil the readabilityHandler so no further chunks dispatch.
             // 2. Drain anything still in the pipe to EOF — Apple does NOT
@@ -300,6 +302,8 @@ enum CLIClient {
             //    closed its end, so readToEnd returns immediately with
             //    whatever's buffered.
             // 3. Flush the LineBuffer (any final partial line goes out).
+            // 4. Notify the optional `onTerminated` callback with the exit
+            //    code so RecorderController can react to process exit.
             stderrPipe.fileHandleForReading.readabilityHandler = nil
             stdoutPipe.fileHandleForReading.readabilityHandler = nil
             if let remaining = try? stderrPipe.fileHandleForReading.readToEnd(),
@@ -312,6 +316,7 @@ enum CLIClient {
             }
             stderrBuffer.flush()
             stdoutBufferOpt?.flush()
+            onTerminated?(proc.terminationStatus)
         }
 
         do {

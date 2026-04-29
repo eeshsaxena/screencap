@@ -18,6 +18,7 @@ struct ScreenCapApp: App {
                 .onAppear {
                     appDelegate.bind(recorder: recorder)
                     recorder.bindIndex(index)
+                    recorder.bindPermissions(permissions)
                 }
         }
         .windowResizability(.contentSize)

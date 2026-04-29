@@ -5,7 +5,7 @@ import SwiftUI
 /// recordings list to that day; "Show all" clears the filter. Privacy is a
 /// stub until Unit 18.
 ///
-/// Unit 13 will overlay a recording banner on the detail area.
+/// Unit 13 overlays the recording banner at the top of the detail area.
 struct MainWindow: View {
     @EnvironmentObject private var recorder: RecorderController
     @EnvironmentObject private var permissions: PermissionController
@@ -22,7 +22,22 @@ struct MainWindow: View {
         NavigationSplitView {
             sidebar
         } detail: {
-            detail
+            VStack(spacing: 0) {
+                RecordingBanner()
+                    .padding(.horizontal, 16)
+                    .padding(.top, recorder.state.isRecording ? 12 : 0)
+                detail
+            }
+            .overlay(alignment: .top) {
+                if let err = recorder.lastError {
+                    Text(err)
+                        .font(.caption)
+                        .padding(8)
+                        .background(.red.opacity(0.15), in: RoundedRectangle(cornerRadius: 6))
+                        .padding(.top, 4)
+                        .transition(.opacity)
+                }
+            }
         }
         .sheet(isPresented: $showingPermissionsSheet) {
             FirstRunPermissionsView(isPresented: $showingPermissionsSheet)
@@ -56,37 +71,6 @@ struct MainWindow: View {
                 Label("Recordings", systemImage: "list.bullet.rectangle")
             }
             NavigationLink(value: SidebarSection.privacy) {
-                Label("Privacy", systemImage: "lock.shield")
-            }
-            .disabled(true)
-        }
-        .listStyle(.sidebar)
-        .frame(minWidth: 180)
-        .navigationTitle("ScreenCap")
-        .toolbar {
-            ToolbarItem(placement: .primaryAction) {
-                Button {
-                    Task { await index.refresh() }
-                } label: {
-                    Image(systemName: "arrow.clockwise")
-                }
-                .help("Refresh recordings")
-            }
-        }
-        .onChange(of: section) { new in
-            if new != .recordings { selectedDate = nil }
-        }
-    }
-
-    private var sidebar: some View {
-        List(selection: $section) {
-            NavigationLink(value: Section.calendar) {
-                Label("Calendar", systemImage: "calendar")
-            }
-            NavigationLink(value: Section.recordings) {
-                Label("Recordings", systemImage: "list.bullet.rectangle")
-            }
-            NavigationLink(value: Section.privacy) {
                 Label("Privacy", systemImage: "lock.shield")
             }
             .disabled(true)
