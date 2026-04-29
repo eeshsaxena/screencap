@@ -31,7 +31,7 @@ import sys
 import time
 from typing import Any
 
-_EVENT_SCHEMA_VERSION = 1
+EVENT_SCHEMA_VERSION = 1
 
 
 # Event-type constants (todo 026). Use these everywhere instead of raw
@@ -74,7 +74,7 @@ def emit_event(event_type: str, **fields: Any) -> None:
     payload = {
         "type": event_type,
         "ts": time.time(),
-        "schema_version": _EVENT_SCHEMA_VERSION,
+        "schema_version": EVENT_SCHEMA_VERSION,
         **fields,
     }
     try:
@@ -87,7 +87,7 @@ def emit_event(event_type: str, **fields: Any) -> None:
 __all__ = [
     "emit_event",
     "resolve_claimant",
-    "_EVENT_SCHEMA_VERSION",
+    "EVENT_SCHEMA_VERSION",
     "EVENT_STARTED",
     "EVENT_LOCK_CONTENDED",
     "EVENT_CHUNK_FINALIZED",

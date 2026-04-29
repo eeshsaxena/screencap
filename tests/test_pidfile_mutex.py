@@ -237,6 +237,14 @@ class TestStopForceTargetsLockOwner:
                 return original_is_screencap(pid)
 
             monkeypatch.setattr(_pidfile_module, "_is_screencap_process", _is_screencap_stub)
+            # Force prose output so the existing assertion on PID text
+            # holds — CliRunner makes stdout non-TTY which would otherwise
+            # auto-flip ``stop --json`` (todo 009). We're testing the
+            # process side here, not the JSON envelope.
+            from screencap import cli as _cli_module
+            monkeypatch.setattr(
+                _cli_module, "_should_default_to_json", lambda: False,
+            )
 
             runner = CliRunner()
             result = runner.invoke(cli, ["stop", "--force"], catch_exceptions=False)
@@ -254,6 +262,110 @@ class TestStopForceTargetsLockOwner:
             if proc.is_alive():
                 proc.kill()
                 proc.join(timeout=5)
+
+    def test_pid_recycle_guard_skips_when_create_time_too_late(self, tmp_path, monkeypatch):
+        """Todo 017: when ``psutil.Process.create_time()`` is more than the
+        tolerance window after the lock metadata's ``started_at``, the guard
+        nulls ``parent_pid`` and falls through to the orphan scan instead of
+        SIGTERM/SIGKILL-ing what could be a recycled, unrelated PID.
+
+        Without this branch under test, a regression that inverts the
+        comparison (`<` instead of `>`) would not fail any test today.
+        """
+        import multiprocessing
+        import time as _time
+        from click.testing import CliRunner
+
+        from screencap.cli import cli
+
+        pidfile.LOCK_DIR.mkdir(parents=True, exist_ok=True)
+        ctx = multiprocessing.get_context("spawn")
+        started_q = ctx.Queue()
+        proc = ctx.Process(
+            target=_hold_lock_with_claimant,
+            args=(pidfile.LOCK_FILE, pidfile.LOCK_DIR, started_q, "cli", 30.0),
+        )
+        proc.start()
+        try:
+            assert started_q.get(timeout=5) == "ready"
+            child_pid = proc.pid
+
+            from screencap import pidfile as _pidfile_module
+            monkeypatch.setattr(
+                _pidfile_module, "_is_screencap_process",
+                lambda pid: pid == child_pid,
+            )
+            from screencap import cli as _cli_module
+            monkeypatch.setattr(
+                _cli_module, "_should_default_to_json", lambda: False,
+            )
+
+            # Force the recycle-detected branch by reporting a fabricated
+            # create_time well past the 60s tolerance (todo 014 widened
+            # this window — we still need to exceed it).
+            real_meta = _pidfile_module.read_lock_metadata()
+            assert real_meta is not None
+            recycled_create_time = float(real_meta["started_at"]) + 1000.0
+
+            import psutil
+            real_process = psutil.Process
+
+            def _wrapped_process(pid, *a, **kw):
+                # Selective override — only intercept the targeted PID so
+                # ``process_iter`` (used by find_orphaned_processes) keeps
+                # working for every other process on the system.
+                proc = real_process(pid, *a, **kw)
+                if pid == child_pid:
+                    proc.create_time = lambda: recycled_create_time
+                return proc
+
+            monkeypatch.setattr(psutil, "Process", _wrapped_process)
+
+            runner = CliRunner()
+            result = runner.invoke(cli, ["stop", "--force"], catch_exceptions=False)
+            assert result.exit_code == 0
+            # The recycle-detected branch should have nulled parent_pid;
+            # the child must STILL be alive (we never sent SIGKILL).
+            assert "appears recycled" in result.output
+            assert proc.is_alive(), "recycle guard fired but process was killed anyway"
+        finally:
+            if proc.is_alive():
+                proc.kill()
+                proc.join(timeout=5)
+
+    def test_pid_recycle_guard_skips_on_psutil_no_such_process(self, tmp_path, monkeypatch):
+        """Todo 017: if psutil cannot find the recorded PID, the guard
+        falls through to the orphan scan with a nulled parent_pid rather
+        than risking a kill against an unrelated process."""
+        from click.testing import CliRunner
+
+        from screencap.cli import cli
+
+        pidfile.LOCK_DIR.mkdir(parents=True, exist_ok=True)
+        # Manually plant a lock metadata entry that points at a PID that
+        # almost certainly doesn't exist.
+        if pidfile._LOCKED_FD is not None:
+            pidfile.release_lock()
+        pidfile.claim_lock(tmp_path / "cap")
+        try:
+            import psutil
+            real_process = psutil.Process
+            recorded_pid = pidfile.read_lock_metadata()["pid"]
+
+            def _wrapped_process(pid, *a, **kw):
+                if pid == recorded_pid:
+                    raise psutil.NoSuchProcess(pid)
+                return real_process(pid, *a, **kw)
+
+            monkeypatch.setattr(psutil, "Process", _wrapped_process)
+
+            runner = CliRunner()
+            result = runner.invoke(cli, ["stop"], catch_exceptions=False)
+            # Should exit cleanly — no parent to stop, no orphans either.
+            assert result.exit_code == 0
+        finally:
+            if pidfile._LOCKED_FD is not None:
+                pidfile.release_lock()
 
     def test_flock_oserror_does_not_leak_fd(self, monkeypatch, tmp_path):
         """Todo 008: any flock failure that isn't BlockingIOError must close

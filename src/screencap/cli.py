@@ -45,8 +45,10 @@ def _stdin_is_tty() -> bool:
 # silently bump the version SwiftUI reads from `status --json`, and a status
 # payload tweak can be signalled without disturbing the event stream.
 _STATUS_SCHEMA_VERSION = 1
-_APPS_SCHEMA_VERSION = 1
+_APPS_SCHEMA_VERSION = 2
 _SETTINGS_PRIVACY_SCHEMA_VERSION = 2
+_SETTINGS_SCHEMA_VERSION = 1
+_STOP_SCHEMA_VERSION = 1
 
 
 def _should_default_to_json() -> bool:
@@ -1034,7 +1036,9 @@ def _auto_transcribe(capture_dir, audio_path):
 
 
 @cli.command("list")
-@click.option("--json", "as_json", is_flag=True, help="Output as JSON.")
+@click.option("--json", "as_json", is_flag=True,
+              default=lambda: _should_default_to_json(),
+              help="Output as JSON. Auto-detected when stdout is not a TTY (todo 030).")
 @click.option(
     "--sort",
     type=click.Choice(["name", "date", "duration"], case_sensitive=False),
@@ -1188,7 +1192,9 @@ def view(name, regenerate, max_events):
 
 @cli.command()
 @click.argument("name")
-@click.option("--json", "as_json", is_flag=True, help="Output as JSON.")
+@click.option("--json", "as_json", is_flag=True,
+              default=lambda: _should_default_to_json(),
+              help="Output as JSON. Auto-detected when stdout is not a TTY (todo 030).")
 def info(name, as_json):
     """Show details and system metrics for a recording."""
     from screencap.catalog import find_db, read_drops, _read_recording_meta
@@ -1376,12 +1382,33 @@ def _build_export_privacy_filter(recording_dir):
             mode = privacy_section.get("mode") or "internal"
         except Exception:
             mode = "internal"
+        rec_name = (
+            recording_dir.name if hasattr(recording_dir, "name")
+            else str(recording_dir)
+        )
         err_console.print(
             f"[yellow]Warning:[/yellow] No .recording_intent in "
-            f"{recording_dir.name if hasattr(recording_dir, 'name') else recording_dir} — "
+            f"{rec_name} — "
             f"applying current config mode={mode!r}. Re-record under the desired "
             f"mode for accurate filtering."
         )
+        # Machine-parseable mirror of the warning (todo 010): when stdout is
+        # piped to a parser the Rich prose above is unreadable, so emit a
+        # tagged JSON line on stderr that an agent batch-running
+        # ``export --all --privacy-filter`` can grep for to enumerate
+        # legacy-fallback recordings without screen-scraping rich output.
+        if not sys.stdout.isatty():
+            try:
+                import json as _json
+                sys.stderr.write(_json.dumps({
+                    "type": "warn",
+                    "code": "no_recording_intent",
+                    "recording": rec_name,
+                    "fallback_mode": mode,
+                }) + "\n")
+                sys.stderr.flush()
+            except Exception:
+                pass
 
     return build_local_window_filter(
         privacy_mode=mode,
@@ -1530,7 +1557,14 @@ def apps(as_json, include_spotlight):
     Output (per app, when --json is set):
       bundle_id, display_name, path, icon_path, context_class,
       classification_source, resolved_action, in_exclude_apps,
-      in_allow_apps, is_matrix_exclude
+      in_allow_apps, is_matrix_exclude, has_per_frame_overrides
+
+    has_per_frame_overrides is true when ``mask_domains`` or
+    ``mask_title_patterns`` is non-empty in config.toml. The per-app
+    ``resolved_action`` is computed without per-frame domain / title
+    context, so an ``allow`` row can still produce ``mask_window`` at
+    runtime when one of those overrides fires. SwiftUI should decorate
+    "Allowed*" badges accordingly.
     """
     import json as _json
 
@@ -1577,6 +1611,17 @@ def apps(as_json, include_spotlight):
             err_console.print(f"[red]Error:[/red] {exc}")
         raise SystemExit(1)
 
+    # ``has_per_frame_overrides`` (todo 008, schema v2): per-app
+    # ``resolved_action`` is computed from FrameMetadata that only carries
+    # ``bundle_id`` + ``display_name``, so it cannot reflect ``mask_domains``
+    # (policy step 3) or ``mask_title_patterns`` (policy step 4) — those
+    # only fire against per-frame ``domain`` / ``window_title`` at capture
+    # time. Surface the existence of those rules so a SwiftUI badge for an
+    # ``allow``-resolved app can decorate "*" with a tooltip warning.
+    has_per_frame_overrides = bool(
+        privacy_cfg.mask_domains or privacy_cfg.mask_title_patterns,
+    )
+
     rows = []
     for meta in installed:
         classification = auto_classify_detailed(meta)
@@ -1607,6 +1652,7 @@ def apps(as_json, include_spotlight):
             "in_exclude_apps": meta.bundle_id in privacy_cfg.exclude_apps,
             "in_allow_apps": meta.bundle_id in privacy_cfg.allow_apps,
             "is_matrix_exclude": is_matrix_exclude,
+            "has_per_frame_overrides": has_per_frame_overrides,
         })
 
     if as_json:
@@ -1765,7 +1811,11 @@ def status(as_json, no_nlp_check):
 
 @cli.command()
 @click.option("--force", is_flag=True, help="Skip SIGTERM and go straight to SIGKILL.")
-def stop(force):
+@click.option("--json", "as_json", is_flag=True,
+              default=lambda: _should_default_to_json(),
+              help="Emit machine-readable JSON to stdout instead of prose. "
+                   "Auto-detected when stdout is not a TTY (todo 009).")
+def stop(force, as_json):
     """Stop recording processes.
 
     \b
@@ -1779,10 +1829,41 @@ def stop(force):
     Use this only when the graceful path has already failed; previously
     --force was a no-op against a live parent and is now actively
     destructive against the recording session.
+
+    \b
+    --json envelope (todo 009):
+      {ok, schema_version, action, pid, killed,
+       orphans_terminated, error}
+    action ∈ {"sigterm", "sigkill", "none", "no_owner"}.
     """
     import os as _os
     import signal as _signal
     import time as _time
+
+    # Track outcome across exit points so the JSON envelope describes the
+    # actual lifecycle (todo 009). Updated in place by the SIGTERM /
+    # SIGKILL / orphan-scan branches; emitted from the helper below before
+    # every return / SystemExit.
+    _stop_outcome: dict = {
+        "action": "none",
+        "pid": None,
+        "killed": False,
+        "orphans_terminated": 0,
+        "error": None,
+    }
+
+    def _emit_stop_result(*, ok: bool, exit_code: int = 0) -> None:
+        if as_json:
+            import json as _json
+            payload = {
+                "ok": ok,
+                "schema_version": _STOP_SCHEMA_VERSION,
+                **_stop_outcome,
+            }
+            sys.stdout.write(_json.dumps(payload) + "\n")
+            sys.stdout.flush()
+        if exit_code:
+            raise SystemExit(exit_code)
 
     try:
         from screencap.pidfile import (
@@ -1795,8 +1876,11 @@ def stop(force):
             terminate_processes,
         )
     except ImportError:
-        console.print(_RECORD_EXTRAS_MSG)
-        raise SystemExit(1)
+        if not as_json:
+            console.print(_RECORD_EXTRAS_MSG)
+        _stop_outcome["error"] = "record_extras_not_installed"
+        _emit_stop_result(ok=False, exit_code=1)
+        return
 
     # Identify the lock owner. Prefer the flock-protected lock metadata
     # (Unit 3) — it's the canonical owner and works correctly for
@@ -1858,15 +1942,26 @@ def stop(force):
             parent_pid = None
 
     if parent_pid is not None and _pid_exists(parent_pid) and _is_screencap_process(parent_pid):
+        _stop_outcome["pid"] = int(parent_pid)
         if force:
             # --force path: SIGKILL the lock owner directly. This is the
             # only way to take down a hung-but-alive SessionController, since
             # find_orphaned_processes() returns [] while the parent lives.
-            console.print(f"[yellow]Force-killing recording (PID {parent_pid})...[/yellow]")
+            _stop_outcome["action"] = "sigkill"
+            if not as_json:
+                console.print(f"[yellow]Force-killing recording (PID {parent_pid})...[/yellow]")
             try:
                 _os.kill(parent_pid, _signal.SIGKILL)
             except (ProcessLookupError, PermissionError) as exc:
-                console.print(f"[red]Failed to SIGKILL PID {parent_pid}: {exc}[/red]")
+                # Surface as a non-zero exit (todo 009): an agent that
+                # invokes ``stop --force`` and gets exit 0 will assume the
+                # session is dead. PermissionError most commonly means the
+                # PID belongs to a different uid (recycled across users).
+                _stop_outcome["error"] = f"sigkill_failed:{type(exc).__name__}:{exc}"
+                if not as_json:
+                    console.print(f"[red]Failed to SIGKILL PID {parent_pid}: {exc}[/red]")
+                _emit_stop_result(ok=False, exit_code=1)
+                return
             else:
                 # Brief wait for the kernel to reap; then confirm.
                 for _ in range(10):
@@ -1874,16 +1969,22 @@ def stop(force):
                         break
                     _time.sleep(0.1)
                 if not _pid_exists(parent_pid):
-                    console.print("[#22d3ee]Recording force-stopped.[/#22d3ee]")
+                    _stop_outcome["killed"] = True
+                    if not as_json:
+                        console.print("[#22d3ee]Recording force-stopped.[/#22d3ee]")
                 else:
-                    console.print(
-                        f"[yellow]Warning:[/yellow] PID {parent_pid} still alive after "
-                        "SIGKILL — process may be uninterruptible (D-state)."
-                    )
+                    _stop_outcome["error"] = "sigkill_uninterruptible"
+                    if not as_json:
+                        console.print(
+                            f"[yellow]Warning:[/yellow] PID {parent_pid} still alive after "
+                            "SIGKILL — process may be uninterruptible (D-state)."
+                        )
             delete_pidfile()
             # Fall through to orphan scan in case force-kill left children.
         else:
-            console.print(f"Sending stop signal to recording (PID {parent_pid})...")
+            _stop_outcome["action"] = "sigterm"
+            if not as_json:
+                console.print(f"Sending stop signal to recording (PID {parent_pid})...")
             try:
                 _os.kill(parent_pid, _signal.SIGTERM)
             except (ProcessLookupError, PermissionError):
@@ -1907,34 +2008,48 @@ def stop(force):
                                 )
                             _time.sleep(0.5)
                 except KeyboardInterrupt:
-                    console.print(
-                        "\n[yellow]Interrupted — escalating to force kill.[/yellow]\n"
-                        "[dim]Tip: [bold]screencap stop --force[/bold] "
-                        "skips the graceful wait[/dim]"
-                    )
+                    if not as_json:
+                        console.print(
+                            "\n[yellow]Interrupted — escalating to force kill.[/yellow]\n"
+                            "[dim]Tip: [bold]screencap stop --force[/bold] "
+                            "skips the graceful wait[/dim]"
+                        )
                 if not _timed_out or not _pid_exists(parent_pid):
-                    console.print("[#22d3ee]Recording stopped.[/#22d3ee]")
+                    _stop_outcome["killed"] = True
+                    if not as_json:
+                        console.print("[#22d3ee]Recording stopped.[/#22d3ee]")
                     delete_pidfile()
+                    _emit_stop_result(ok=True)
                     return
-                console.print("[yellow]Graceful stop timed out — falling back to force kill.[/yellow]")
+                if not as_json:
+                    console.print("[yellow]Graceful stop timed out — falling back to force kill.[/yellow]")
 
     orphans = find_orphaned_processes()
     if not orphans:
-        console.print("[dim]No orphaned recording processes found.[/dim]")
+        if _stop_outcome["action"] == "none":
+            _stop_outcome["action"] = "no_owner"
+        if not as_json:
+            console.print("[dim]No orphaned recording processes found.[/dim]")
+        _emit_stop_result(ok=True)
         return
 
-    console.print(f"Found {len(orphans)} orphaned recording process(es).")
+    if not as_json:
+        console.print(f"Found {len(orphans)} orphaned recording process(es).")
     terminated = terminate_processes(orphans, force=force)
-
-    for entry in terminated:
-        console.print(f"  Terminated {entry.get('name', 'unknown')} (PID {entry['pid']})... done")
-
+    _stop_outcome["orphans_terminated"] = len(terminated)
     if terminated:
-        console.print(f"Cleaned up {len(terminated)} process(es).")
-    else:
-        console.print("[yellow]Could not terminate any processes.[/yellow]")
+        _stop_outcome["killed"] = True
+
+    if not as_json:
+        for entry in terminated:
+            console.print(f"  Terminated {entry.get('name', 'unknown')} (PID {entry['pid']})... done")
+        if terminated:
+            console.print(f"Cleaned up {len(terminated)} process(es).")
+        else:
+            console.print("[yellow]Could not terminate any processes.[/yellow]")
 
     delete_pidfile()
+    _emit_stop_result(ok=True)
 
 
 @cli.command()
@@ -2931,8 +3046,11 @@ def scrub(name: str, pii_engine: str | None) -> None:
 @cli.group(invoke_without_command=True)
 @click.option("--set", "set_pair", default=None, metavar="KEY=VALUE",
               help="Change a setting, e.g. --set show_on_website=true")
+@click.option("--json", "as_json", is_flag=True,
+              default=lambda: _should_default_to_json(),
+              help="Emit settings as JSON. Auto-detected when stdout is not a TTY (todo 012).")
 @click.pass_context
-def settings(ctx, set_pair):
+def settings(ctx, set_pair, as_json):
     """Show or change ScreenCap configuration.
 
     \b
@@ -3028,6 +3146,34 @@ def settings(ctx, set_pair):
 
     # --- Display all settings ---
     chunk = get_chunk_duration()
+    rest = get_rest_threshold()
+    show = get_show_on_website()
+
+    # Structured payload first so the same field set drives both JSON and
+    # prose paths. ``settings --json`` (todo 012) is the read-side analogue
+    # of the existing ``settings privacy --json`` mutation surface — agents
+    # need a stable shape they can diff.
+    settings_payload = {
+        "show_on_website": bool(show),
+        "upload_default": str(get_upload_default()),
+        "audio_default": bool(get_audio_default()),
+        "auto_name": bool(get_auto_name()),
+        "chunk_duration": float(chunk),
+        "auto_delete_after_upload": bool(get_auto_delete_after_upload()),
+        "rest_threshold_seconds": float(rest),
+        "recordings_dir": str(get_recordings_dir()),
+    }
+
+    if as_json:
+        import json as _json
+        sys.stdout.write(_json.dumps({
+            "ok": True,
+            "schema_version": _SETTINGS_SCHEMA_VERSION,
+            "settings": settings_payload,
+        }) + "\n")
+        sys.stdout.flush()
+        return
+
     if chunk >= 3600:
         chunk_str = f"{chunk:.0f}s ({chunk / 3600:.1f} hour)"
     elif chunk >= 60:
@@ -3036,8 +3182,6 @@ def settings(ctx, set_pair):
         chunk_str = f"{chunk:.0f}s"
     else:
         chunk_str = "disabled (legacy single-file)"
-    rest = get_rest_threshold()
-    show = get_show_on_website()
 
     console.print("\n[bold]ScreenCap Settings[/bold]\n")
     console.print(f"  Show on website:          {'yes' if show else 'no'}")
