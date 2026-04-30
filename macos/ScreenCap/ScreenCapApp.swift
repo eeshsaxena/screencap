@@ -1,6 +1,7 @@
 import SwiftUI
 
-@main
+// `@main` lives on `main.swift` instead — that file routes `--check-permission`
+// invocations to a fresh-process TCC check before SwiftUI boots.
 struct ScreenCapApp: App {
     @NSApplicationDelegateAdaptor(AppDelegate.self) private var appDelegate
 

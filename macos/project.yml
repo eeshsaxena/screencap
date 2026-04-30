@@ -53,3 +53,19 @@ targets:
           "${SRCROOT}/ScreenCap/Scripts/embed-cli.sh"
         basedOnDependencyAnalysis: false
         showEnvVarsInLog: false
+
+schemes:
+  ScreenCap:
+    build:
+      targets:
+        ScreenCap: all
+    run:
+      config: Debug
+    test:
+      config: Debug
+    profile:
+      config: Release
+    analyze:
+      config: Debug
+    archive:
+      config: Release

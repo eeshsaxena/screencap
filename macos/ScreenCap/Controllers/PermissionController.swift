@@ -129,11 +129,25 @@ final class PermissionController: ObservableObject {
     }
 
     /// Recomputes all four permission statuses without prompting.
+    ///
+    /// Each check spawns a short-lived helper subprocess (this same .app with
+    /// `--check-permission <name>`) so it gets a fresh TCC query. The
+    /// in-process variants of these APIs cache the value at process start
+    /// and ignore any grant the user makes afterwards — that's why our
+    /// previous walkthrough kept showing red dots even after the user
+    /// granted in System Settings.
     func refresh() {
-        screenRecording = Self.checkScreenRecording()
-        accessibility = Self.checkAccessibility()
-        inputMonitoring = Self.checkInputMonitoring()
-        microphone = Self.checkMicrophone()
+        Task { @MainActor in
+            async let sr = Self.checkViaSubprocess("screen_recording")
+            async let ax = Self.checkViaSubprocess("accessibility")
+            async let im = Self.checkViaSubprocess("input_monitoring")
+            async let mic = Self.checkViaSubprocess("microphone")
+            let (s, a, i, m) = await (sr, ax, im, mic)
+            self.screenRecording = s
+            self.accessibility = a
+            self.inputMonitoring = i
+            self.microphone = m
+        }
     }
 
     /// Triggers the system permission prompt for `pane` and then opens the
@@ -173,35 +187,40 @@ final class PermissionController: ObservableObject {
         }
     }
 
-    // MARK: - Silent checks
+    // MARK: - Fresh-process checks
 
-    private static func checkScreenRecording() -> PermissionStatus {
-        // CGPreflightScreenCaptureAccess returns Bool; no notDetermined distinction.
-        CGPreflightScreenCaptureAccess() ? .granted : .denied
-    }
+    private struct CheckResult: Decodable { let granted: Bool }
 
-    private static func checkAccessibility() -> PermissionStatus {
-        let options: NSDictionary = [kAXTrustedCheckOptionPrompt.takeUnretainedValue() as String: false]
-        return AXIsProcessTrustedWithOptions(options) ? .granted : .denied
-    }
-
-    private static func checkInputMonitoring() -> PermissionStatus {
-        // IOHIDCheckAccess is the supported public API for the same TCC bucket
-        // the CLI checks via private CGPreflightListenEventAccess.
-        switch IOHIDCheckAccess(kIOHIDRequestTypeListenEvent) {
-        case kIOHIDAccessTypeGranted: return .granted
-        case kIOHIDAccessTypeDenied:  return .denied
-        case kIOHIDAccessTypeUnknown: return .notDetermined
-        default:                      return .notDetermined
-        }
-    }
-
-    private static func checkMicrophone() -> PermissionStatus {
-        switch AVCaptureDevice.authorizationStatus(for: .audio) {
-        case .authorized:        return .granted
-        case .denied, .restricted: return .denied
-        case .notDetermined:     return .notDetermined
-        @unknown default:        return .notDetermined
+    /// Spawns this binary with `--check-permission <name>` and parses the JSON
+    /// it prints. Falls back to `.notDetermined` on any failure so the UI
+    /// never wedges into a wrong-color state because of a transient launch
+    /// problem.
+    private static func checkViaSubprocess(_ permissionName: String) async -> PermissionStatus {
+        guard let executablePath = Bundle.main.executablePath else { return .notDetermined }
+        return await withCheckedContinuation { (continuation: CheckedContinuation<PermissionStatus, Never>) in
+            DispatchQueue.global(qos: .userInitiated).async {
+                let process = Process()
+                process.executableURL = URL(fileURLWithPath: executablePath)
+                process.arguments = ["--check-permission", permissionName]
+                let stdout = Pipe()
+                process.standardOutput = stdout
+                process.standardError = Pipe()
+                do {
+                    try process.run()
+                } catch {
+                    continuation.resume(returning: .notDetermined)
+                    return
+                }
+                process.waitUntilExit()
+                let data = (try? stdout.fileHandleForReading.readToEnd()) ?? Data()
+                guard process.terminationStatus == 0,
+                      let result = try? JSONDecoder().decode(CheckResult.self, from: data)
+                else {
+                    continuation.resume(returning: .notDetermined)
+                    return
+                }
+                continuation.resume(returning: result.granted ? .granted : .denied)
+            }
         }
     }
 }
