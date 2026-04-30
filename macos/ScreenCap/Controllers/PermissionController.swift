@@ -136,6 +136,35 @@ final class PermissionController: ObservableObject {
         microphone = Self.checkMicrophone()
     }
 
+    /// Triggers the system permission prompt for `pane` and then opens the
+    /// matching Privacy & Security pane. The request API is what registers
+    /// the app in the TCC database — without it, the app won't appear in the
+    /// pane's app list, so the user can't toggle anything on. After the user
+    /// returns from System Settings the 1Hz poll picks up the new state.
+    ///
+    /// Microphone uses an async callback; we don't block on it because the
+    /// pane should open immediately either way.
+    func requestAndOpenSettings(for pane: PrivacyPane) {
+        switch pane {
+        case .screenRecording:
+            // Triggers the "<App> would like to record this computer's screen"
+            // prompt the first time. No-op once the user has answered.
+            _ = CGRequestScreenCaptureAccess()
+        case .accessibility:
+            let options: NSDictionary = [kAXTrustedCheckOptionPrompt.takeUnretainedValue() as String: true]
+            _ = AXIsProcessTrustedWithOptions(options)
+        case .inputMonitoring:
+            // IOHIDRequestAccess shows the prompt and registers the app in
+            // the Input Monitoring list. Returns true if granted.
+            _ = IOHIDRequestAccess(kIOHIDRequestTypeListenEvent)
+        case .microphone:
+            AVCaptureDevice.requestAccess(for: .audio) { _ in
+                Task { @MainActor in self.refresh() }
+            }
+        }
+        openSystemSettings(for: pane)
+    }
+
     /// Opens System Settings to the requested pane. Tries the macOS 13+ .extension
     /// URL first; falls back to the generic Privacy & Security page if unavailable.
     func openSystemSettings(for pane: PrivacyPane) {

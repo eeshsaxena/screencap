@@ -82,7 +82,7 @@ struct FirstRunPermissionsView: View {
 
             if !status.isGranted {
                 Button("Open System Settings") {
-                    permissions.openSystemSettings(for: pane)
+                    permissions.requestAndOpenSettings(for: pane)
                 }
                 .buttonStyle(.borderedProminent)
             } else {
