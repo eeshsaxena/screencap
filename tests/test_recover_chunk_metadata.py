@@ -123,26 +123,12 @@ class TestRequiredKeywordContract:
 
 
 class TestHappyPath:
-    """Recovery emits v2 format: meta header + processed events + window switches."""
+    """Recovery emits v2 format: meta header + processed events + window switches.
 
-    def test_produces_v2_meta_header(self, recording_db):
-        """First line of recovered JSONL is the v2 _meta header."""
-        from screencap.cli import _recover_chunk_metadata
-
-        capture_dir = _capture_dir(recording_db)
-        _stub_chunk_video(capture_dir, 0)
-        recording_db.add_click(0.5)
-
-        with _patch_short_chunk_duration():
-            _recover_chunk_metadata(
-                capture_dir, Console(), force=True, cloud_bound=False,
-            )
-
-        jsonl_path = capture_dir / "events_0000.jsonl"
-        assert jsonl_path.exists()
-        meta, _events = _read_events_jsonl(jsonl_path)
-        assert meta["_meta"] is True
-        assert meta["format_version"] == 2
+    Cross-caller byte-identical equivalence with the chunk processor is pinned
+    by ``tests/test_unified_export_contract.py``. We keep one sanity check here
+    that recovery actually runs the processing pipeline (not raw row dumps).
+    """
 
     def test_produces_processed_pydantic_events(self, recording_db):
         """Click pair gets merged into mouse.singleclick (not raw rows)."""
@@ -164,27 +150,6 @@ class TestHappyPath:
         )
         # Direct contrast with today's degraded format: no raw 'name' rows
         assert not any(e.get("name") == "click" for e in events)
-
-    def test_includes_window_switch_events(self, recording_db):
-        """Window events show up as deduplicated window.switch events."""
-        from screencap.cli import _recover_chunk_metadata
-
-        capture_dir = _capture_dir(recording_db)
-        _stub_chunk_video(capture_dir, 0)
-        recording_db.add_window_event(
-            0.1, title="Editor", bundle_id="com.apple.finder", window_id="w1",
-        )
-        recording_db.add_click(0.5)
-
-        with _patch_short_chunk_duration():
-            _recover_chunk_metadata(
-                capture_dir, Console(), force=True, cloud_bound=False,
-            )
-
-        _meta, events = _read_events_jsonl(capture_dir / "events_0000.jsonl")
-        ws = [e for e in events if e.get("type") == "window.switch"]
-        assert ws, "Recovery must emit window.switch events"
-        assert ws[0]["app_bundle_id"] == "com.apple.finder"
 
 
 # ---------------------------------------------------------------------------
