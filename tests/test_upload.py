@@ -6,6 +6,7 @@ import json
 import sqlite3
 from unittest import mock
 
+import pytest
 from click.testing import CliRunner
 
 from screencap.cli import cli
@@ -907,24 +908,11 @@ def test_upload_cli_jobs_flag_accepted(tmp_path):
     assert result.exit_code == 0
 
 
-def test_upload_cli_jobs_0_rejected():
-    """CLI --jobs 0 should be rejected by Click validation."""
+@pytest.mark.parametrize("bad_value", ["0", "-1", "abc"])
+def test_upload_cli_jobs_invalid_rejected(bad_value):
+    """CLI --jobs rejects 0, negatives, and non-integers via Click validation."""
     runner = CliRunner()
-    result = runner.invoke(cli, ["upload", "my-rec", "--jobs", "0"])
-    assert result.exit_code != 0
-
-
-def test_upload_cli_jobs_negative_rejected():
-    """CLI --jobs -1 should be rejected."""
-    runner = CliRunner()
-    result = runner.invoke(cli, ["upload", "my-rec", "--jobs", "-1"])
-    assert result.exit_code != 0
-
-
-def test_upload_cli_jobs_abc_rejected():
-    """CLI --jobs abc should be rejected."""
-    runner = CliRunner()
-    result = runner.invoke(cli, ["upload", "my-rec", "--jobs", "abc"])
+    result = runner.invoke(cli, ["upload", "my-rec", "--jobs", bad_value])
     assert result.exit_code != 0
 
 
