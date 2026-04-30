@@ -1,5 +1,8 @@
 """Tests for event processing pipeline."""
 
+from __future__ import annotations
+
+import pytest
 
 from screencap.engine.events import (
     KeyDownEvent,
@@ -11,17 +14,29 @@ from screencap.engine.events import (
     MouseDoubleClickEvent,
     MouseDownEvent,
     MouseDragEvent,
+    MouseMagnifyEvent,
     MouseMoveEvent,
+    MouseRotateEvent,
     MouseScrollEvent,
+    MouseSmartMagnifyEvent,
     MouseUpEvent,
     SpecialKeyEvent,
+    WindowStateEvent,
 )
 from screencap.engine.processing import (
+    DOUBLE_CLICK_DISTANCE_PIXELS,
+    DOUBLE_CLICK_INTERVAL_SECONDS,
+    DRAG_DISTANCE_THRESHOLD,
+    KEY_TYPE_MERGE_INTERVAL_SECONDS,
     detect_drag_events,
+    detect_key_shortcuts,
+    get_action_events,
     merge_consecutive_keyboard_events,
     merge_consecutive_mouse_click_events,
+    merge_consecutive_mouse_magnify_events,
     merge_consecutive_mouse_move_events,
     merge_consecutive_mouse_scroll_events,
+    merge_sequential_key_type_events,
     process_events,
     remove_invalid_keyboard_events,
     remove_redundant_mouse_move_events,
@@ -29,65 +44,37 @@ from screencap.engine.processing import (
 
 
 class TestRemoveInvalidKeyboardEvents:
-    """Tests for remove_invalid_keyboard_events."""
-
-    def test_removes_empty_key_events(self):
-        """Test that events with no key info are removed."""
+    def test_removes_events_with_no_key_info_keeps_vk_only(self):
         events = [
-            KeyDownEvent(timestamp=1.0),  # No key info
-            KeyDownEvent(timestamp=2.0, key_char="a"),  # Valid
-            KeyUpEvent(timestamp=3.0),  # No key info
+            KeyDownEvent(timestamp=1.0),  # no key info — drop
+            KeyDownEvent(timestamp=2.0, key_char="a"),
+            KeyUpEvent(timestamp=3.0),  # no key info — drop
+            KeyDownEvent(timestamp=4.0, key_vk="21"),  # vk-only is valid (e.g. brightness pre-mapping)
+            KeyDownEvent(timestamp=5.0, key_name="shift"),
         ]
         result = remove_invalid_keyboard_events(events)
-        assert len(result) == 1
-        assert result[0].key_char == "a"
-
-    def test_keeps_valid_key_events(self):
-        """Test that valid key events are kept."""
-        events = [
-            KeyDownEvent(timestamp=1.0, key_char="a"),
-            KeyDownEvent(timestamp=2.0, key_name="shift"),
-            KeyDownEvent(timestamp=3.0, key_vk="65"),
+        assert [(e.key_char, e.key_vk, e.key_name) for e in result] == [
+            ("a", None, None),
+            (None, "21", None),
+            (None, None, "shift"),
         ]
-        result = remove_invalid_keyboard_events(events)
-        assert len(result) == 3
 
 
 class TestRemoveRedundantMouseMoveEvents:
-    """Tests for remove_redundant_mouse_move_events."""
-
-    def test_removes_duplicate_positions(self):
-        """Test that consecutive moves to same position are removed."""
+    def test_removes_duplicate_positions_only(self):
         events = [
             MouseMoveEvent(timestamp=1.0, x=100.0, y=100.0),
-            MouseMoveEvent(timestamp=2.0, x=100.0, y=100.0),  # Duplicate
+            MouseMoveEvent(timestamp=2.0, x=100.0, y=100.0),  # duplicate — drop
             MouseMoveEvent(timestamp=3.0, x=200.0, y=200.0),
         ]
         result = remove_redundant_mouse_move_events(events)
-        assert len(result) == 2
-        assert result[0].x == 100.0
-        assert result[1].x == 200.0
-
-    def test_keeps_different_positions(self):
-        """Test that moves to different positions are kept."""
-        events = [
-            MouseMoveEvent(timestamp=1.0, x=100.0, y=100.0),
-            MouseMoveEvent(timestamp=2.0, x=100.0, y=101.0),
-            MouseMoveEvent(timestamp=3.0, x=101.0, y=101.0),
-        ]
-        result = remove_redundant_mouse_move_events(events)
-        assert len(result) == 3
+        assert [(e.x, e.y) for e in result] == [(100.0, 100.0), (200.0, 200.0)]
 
 
 class TestMergeConsecutiveKeyboardEvents:
-    """Tests for merge_consecutive_keyboard_events."""
+    """Keyboard merging: KeyDown/KeyUp pairs → KeyTypeEvent / SpecialKeyEvent."""
 
-    def test_merges_typed_text(self):
-        """Test merging key events into typed text.
-
-        Note: Each press/release cycle creates a separate KeyTypeEvent.
-        This matches legacy behavior of grouping by pressed state.
-        """
+    def test_press_release_pairs_become_keytype_events(self):
         events = [
             KeyDownEvent(timestamp=1.0, key_char="h"),
             KeyUpEvent(timestamp=1.1, key_char="h"),
@@ -95,14 +82,12 @@ class TestMergeConsecutiveKeyboardEvents:
             KeyUpEvent(timestamp=1.3, key_char="i"),
         ]
         result = merge_consecutive_keyboard_events(events)
-        # Each key press/release pair becomes a separate KeyTypeEvent
-        assert len(result) == 2
-        assert all(isinstance(r, KeyTypeEvent) for r in result)
-        assert result[0].text == "h"
-        assert result[1].text == "i"
+        assert [(type(r).__name__, r.text) for r in result] == [
+            ("KeyTypeEvent", "h"),
+            ("KeyTypeEvent", "i"),
+        ]
 
-    def test_preserves_non_keyboard_events(self):
-        """Test that non-keyboard events break the merge."""
+    def test_mouse_event_flushes_buffer_when_no_keys_held(self):
         events = [
             KeyDownEvent(timestamp=1.0, key_char="a"),
             KeyUpEvent(timestamp=1.1, key_char="a"),
@@ -111,282 +96,34 @@ class TestMergeConsecutiveKeyboardEvents:
             KeyUpEvent(timestamp=2.1, key_char="b"),
         ]
         result = merge_consecutive_keyboard_events(events)
-        assert len(result) == 3  # KeyTypeEvent("a"), MouseMove, KeyTypeEvent("b")
+        assert [type(r).__name__ for r in result] == [
+            "KeyTypeEvent",
+            "MouseMoveEvent",
+            "KeyTypeEvent",
+        ]
 
-
-class TestSpecialKeyProcessing:
-    """Tests for special key (media, function, etc.) handling in the processing pipeline."""
-
-    def test_standalone_media_key_wrapped(self):
-        """Test that media key press/release pair is wrapped into SpecialKeyEvent."""
+    @pytest.mark.parametrize("key_name,expected_text", [
+        ("media_play_pause", "Play/Pause"),
+        ("media_volume_up", "Volume/Up"),
+        ("media_brightness_up", "Brightness/Up"),
+        ("brightness_up", "Brightness Up"),
+        ("media_next", "Next"),
+        ("f5", "F5"),
+        ("f12", "F12"),
+        ("insert", "INSERT"),
+    ])
+    def test_special_key_pair_wraps_with_correct_text(self, key_name, expected_text):
         events = [
-            KeyDownEvent(timestamp=1.0, key_name="media_play_pause"),
-            KeyUpEvent(timestamp=1.1, key_name="media_play_pause"),
+            KeyDownEvent(timestamp=1.0, key_name=key_name),
+            KeyUpEvent(timestamp=1.1, key_name=key_name),
         ]
         result = merge_consecutive_keyboard_events(events)
         assert len(result) == 1
         assert isinstance(result[0], SpecialKeyEvent)
-        assert result[0].key_name == "media_play_pause"
-        assert result[0].text == "Play/Pause"
-        assert len(result[0].children) == 2
+        assert result[0].key_name == key_name
+        assert result[0].text == expected_text
 
-    def test_regular_keys_still_merge_with_media_interspersed(self):
-        """Test: type 'abc' -> press Play -> type 'def' produces correct sequence."""
-        events = [
-            # Type "a"
-            KeyDownEvent(timestamp=1.0, key_char="a"),
-            KeyUpEvent(timestamp=1.1, key_char="a"),
-            # Type "b"
-            KeyDownEvent(timestamp=1.2, key_char="b"),
-            KeyUpEvent(timestamp=1.3, key_char="b"),
-            # Type "c"
-            KeyDownEvent(timestamp=1.4, key_char="c"),
-            KeyUpEvent(timestamp=1.5, key_char="c"),
-            # Media key
-            KeyDownEvent(timestamp=2.0, key_name="media_play_pause"),
-            KeyUpEvent(timestamp=2.1, key_name="media_play_pause"),
-            # Type "d"
-            KeyDownEvent(timestamp=3.0, key_char="d"),
-            KeyUpEvent(timestamp=3.1, key_char="d"),
-            # Type "e"
-            KeyDownEvent(timestamp=3.2, key_char="e"),
-            KeyUpEvent(timestamp=3.3, key_char="e"),
-            # Type "f"
-            KeyDownEvent(timestamp=3.4, key_char="f"),
-            KeyUpEvent(timestamp=3.5, key_char="f"),
-        ]
-        result = merge_consecutive_keyboard_events(events)
-
-        # Expect: KeyTypeEvent("a"), KeyTypeEvent("b"), KeyTypeEvent("c"),
-        #         SpecialKeyEvent(media_play_pause),
-        #         KeyTypeEvent("d"), KeyTypeEvent("e"), KeyTypeEvent("f")
-        assert len(result) == 7
-
-        assert isinstance(result[0], KeyTypeEvent) and result[0].text == "a"
-        assert isinstance(result[1], KeyTypeEvent) and result[1].text == "b"
-        assert isinstance(result[2], KeyTypeEvent) and result[2].text == "c"
-
-        assert isinstance(result[3], SpecialKeyEvent)
-        assert result[3].key_name == "media_play_pause"
-
-        assert isinstance(result[4], KeyTypeEvent) and result[4].text == "d"
-        assert isinstance(result[5], KeyTypeEvent) and result[5].text == "e"
-        assert isinstance(result[6], KeyTypeEvent) and result[6].text == "f"
-
-    def test_brightness_key_wrapped(self):
-        """Test that brightness key events are wrapped into SpecialKeyEvent."""
-        events = [
-            KeyDownEvent(timestamp=1.0, key_name="media_brightness_up", key_vk="21"),
-            KeyUpEvent(timestamp=1.1, key_name="media_brightness_up", key_vk="21"),
-        ]
-        result = merge_consecutive_keyboard_events(events)
-        assert len(result) == 1
-        assert isinstance(result[0], SpecialKeyEvent)
-        assert result[0].key_name == "media_brightness_up"
-
-    def test_volume_key_wrapped(self):
-        """Test that volume key events are wrapped into SpecialKeyEvent."""
-        events = [
-            KeyDownEvent(timestamp=1.0, key_name="media_volume_up"),
-            KeyUpEvent(timestamp=1.1, key_name="media_volume_up"),
-        ]
-        result = merge_consecutive_keyboard_events(events)
-        assert len(result) == 1
-        assert isinstance(result[0], SpecialKeyEvent)
-        assert result[0].key_name == "media_volume_up"
-        assert result[0].text == "Volume/Up"
-
-    def test_remove_invalid_keeps_vk_only_events(self):
-        """Test that remove_invalid_keyboard_events passes events with only key_vk set."""
-        events = [
-            KeyDownEvent(timestamp=1.0, key_vk="21"),  # brightness key before mapping
-            KeyDownEvent(timestamp=2.0, key_char="a"),
-            KeyDownEvent(timestamp=3.0),  # truly empty — should be removed
-        ]
-        result = remove_invalid_keyboard_events(events)
-        assert len(result) == 2
-        assert result[0].key_vk == "21"
-        assert result[1].key_char == "a"
-
-    def test_media_key_in_full_pipeline(self):
-        """Test media keys through the full process_events pipeline."""
-        events = [
-            KeyDownEvent(timestamp=1.0, key_char="a"),
-            KeyUpEvent(timestamp=1.1, key_char="a"),
-            KeyDownEvent(timestamp=2.0, key_name="media_play_pause"),
-            KeyUpEvent(timestamp=2.1, key_name="media_play_pause"),
-            KeyDownEvent(timestamp=3.0, key_char="b"),
-            KeyUpEvent(timestamp=3.1, key_char="b"),
-        ]
-        result = process_events(events)
-
-        # Should have: KeyTypeEvent("a"), SpecialKeyEvent(media_play_pause), KeyTypeEvent("b")
-        assert len(result) == 3
-        assert isinstance(result[0], KeyTypeEvent)
-        assert result[0].text == "a"
-        assert isinstance(result[1], SpecialKeyEvent)
-        assert result[1].key_name == "media_play_pause"
-        assert isinstance(result[2], KeyTypeEvent)
-        assert result[2].text == "b"
-
-    def test_standalone_function_key_wrapped(self):
-        """Test that standalone F5 press produces SpecialKeyEvent."""
-        events = [
-            KeyDownEvent(timestamp=1.0, key_name="f5"),
-            KeyUpEvent(timestamp=1.1, key_name="f5"),
-        ]
-        result = merge_consecutive_keyboard_events(events)
-        assert len(result) == 1
-        assert isinstance(result[0], SpecialKeyEvent)
-        assert result[0].key_name == "f5"
-        assert result[0].text == "F5"
-
-    def test_ctrl_f5_still_produces_shortcut(self):
-        """Test that Ctrl+F5 still produces KeyShortcutEvent, no regression."""
-        from screencap.engine.processing import detect_key_shortcuts
-        events = [
-            KeyDownEvent(timestamp=1.0, key_name="ctrl"),
-            KeyDownEvent(timestamp=1.05, key_name="f5"),
-            KeyUpEvent(timestamp=1.1, key_name="f5"),
-            KeyUpEvent(timestamp=1.15, key_name="ctrl"),
-        ]
-        merged = merge_consecutive_keyboard_events(events)
-        result = detect_key_shortcuts(merged)
-        assert len(result) == 1
-        assert isinstance(result[0], KeyShortcutEvent)
-        assert result[0].keys == ["ctrl", "f5"]
-
-    def test_media_key_between_text(self):
-        """Test: type 'a' -> press media_next -> type 'b'."""
-        events = [
-            KeyDownEvent(timestamp=1.0, key_char="a"),
-            KeyUpEvent(timestamp=1.1, key_char="a"),
-            KeyDownEvent(timestamp=2.0, key_name="media_next"),
-            KeyUpEvent(timestamp=2.1, key_name="media_next"),
-            KeyDownEvent(timestamp=3.0, key_char="b"),
-            KeyUpEvent(timestamp=3.1, key_char="b"),
-        ]
-        result = merge_consecutive_keyboard_events(events)
-        assert len(result) == 3
-        assert isinstance(result[0], KeyTypeEvent) and result[0].text == "a"
-        assert isinstance(result[1], SpecialKeyEvent) and result[1].key_name == "media_next"
-        assert isinstance(result[2], KeyTypeEvent) and result[2].text == "b"
-
-    def test_auto_repeat_volume(self):
-        """Test auto-repeat: multiple downs then one up. Final down+up should wrap."""
-        events = [
-            KeyDownEvent(timestamp=1.0, key_name="media_volume_up"),
-            KeyDownEvent(timestamp=1.1, key_name="media_volume_up"),
-            KeyDownEvent(timestamp=1.2, key_name="media_volume_up"),
-            KeyUpEvent(timestamp=1.3, key_name="media_volume_up"),
-        ]
-        result = merge_consecutive_keyboard_events(events)
-        # Each down except the last emits as raw (pending is replaced).
-        # The last down+up wraps into SpecialKeyEvent.
-        special = [e for e in result if isinstance(e, SpecialKeyEvent)]
-        raw_downs = [e for e in result if isinstance(e, KeyDownEvent)]
-        assert len(special) == 1
-        assert special[0].key_name == "media_volume_up"
-        assert len(raw_downs) == 2  # first two downs emitted as raw
-
-    def test_orphan_down_at_end(self):
-        """Test that an unpaired down at recording end passes through as raw."""
-        events = [
-            KeyDownEvent(timestamp=1.0, key_name="media_play_pause"),
-        ]
-        result = merge_consecutive_keyboard_events(events)
-        assert len(result) == 1
-        assert isinstance(result[0], KeyDownEvent)
-
-    def test_orphan_up_at_start(self):
-        """Test that an unpaired up at recording start passes through as raw."""
-        events = [
-            KeyUpEvent(timestamp=1.0, key_name="media_play_pause"),
-        ]
-        result = merge_consecutive_keyboard_events(events)
-        assert len(result) == 1
-        assert isinstance(result[0], KeyUpEvent)
-
-    def test_media_key_during_modifier_hold(self):
-        """Cmd held + volume up should not break keyboard buffer."""
-        from screencap.engine.processing import detect_key_shortcuts
-        events = [
-            KeyDownEvent(timestamp=1.0, key_name="cmd"),
-            KeyDownEvent(timestamp=1.1, key_name="media_volume_up"),
-            KeyUpEvent(timestamp=1.15, key_name="media_volume_up"),
-            KeyDownEvent(timestamp=1.2, key_name="c", key_char="c"),
-            KeyUpEvent(timestamp=1.25, key_name="c", key_char="c"),
-            KeyUpEvent(timestamp=1.3, key_name="cmd"),
-        ]
-        merged = merge_consecutive_keyboard_events(events)
-        # Buffer stays open because cmd is held throughout.
-        # After flushing: one KeyTypeEvent with all children (including media key)
-        assert len(merged) == 1
-        assert isinstance(merged[0], KeyTypeEvent)
-        # detect_key_shortcuts should convert to KeyShortcutEvent
-        result = detect_key_shortcuts(merged)
-        assert len(result) == 1
-        assert isinstance(result[0], KeyShortcutEvent)
-        # cmd is a modifier; the first non-modifier key (media_volume_up) becomes the regular key
-        assert "cmd" in result[0].keys
-
-    def test_non_adjacent_pair_emits_raw(self):
-        """down(media_play), mouse_move, up(media_play) → raw events (not paired)."""
-        events = [
-            KeyDownEvent(timestamp=1.0, key_name="media_play_pause"),
-            MouseMoveEvent(timestamp=1.05, x=100.0, y=100.0),
-            KeyUpEvent(timestamp=1.1, key_name="media_play_pause"),
-        ]
-        result = merge_consecutive_keyboard_events(events)
-        # The mouse move breaks adjacency, so down emits raw, mouse passes through, up emits raw
-        assert len(result) == 3
-        assert isinstance(result[0], KeyDownEvent)
-        assert isinstance(result[1], MouseMoveEvent)
-        assert isinstance(result[2], KeyUpEvent)
-
-    def test_serialization_roundtrip(self):
-        """Test that SpecialKeyEvent serializes and deserializes correctly."""
-        import json
-        from screencap.engine.events import EVENT_TYPE_MAP
-
-        event = SpecialKeyEvent(
-            timestamp=1.0,
-            key_name="media_play_pause",
-            children=[
-                KeyDownEvent(timestamp=1.0, key_name="media_play_pause"),
-                KeyUpEvent(timestamp=1.1, key_name="media_play_pause"),
-            ],
-        )
-
-        # model_dump_json
-        json_str = event.model_dump_json()
-        data = json.loads(json_str)
-        assert data["type"] == "key.special"
-        assert data["key_name"] == "media_play_pause"
-        assert data["text"] == "Play/Pause"
-
-        # Deserialize via EVENT_TYPE_MAP
-        event_class = EVENT_TYPE_MAP[data["type"]]
-        restored = event_class(**{k: v for k, v in data.items() if k != "text"})
-        assert isinstance(restored, SpecialKeyEvent)
-        assert restored.key_name == "media_play_pause"
-        assert restored.text == "Play/Pause"
-
-    def test_special_key_text_formatting(self):
-        """Test text computed field for various key types."""
-        assert SpecialKeyEvent(timestamp=0, key_name="media_play_pause").text == "Play/Pause"
-        assert SpecialKeyEvent(timestamp=0, key_name="media_volume_up").text == "Volume/Up"
-        assert SpecialKeyEvent(timestamp=0, key_name="brightness_up").text == "Brightness Up"
-        assert SpecialKeyEvent(timestamp=0, key_name="f5").text == "F5"
-        assert SpecialKeyEvent(timestamp=0, key_name="f12").text == "F12"
-        assert SpecialKeyEvent(timestamp=0, key_name="insert").text == "INSERT"
-
-    def test_common_editing_keys_not_wrapped(self):
-        """Space, backspace, esc, enter, arrows etc. should NOT become SpecialKeyEvent.
-
-        On macOS these keys have key_name set and key_char=None, but they are
-        common editing/navigation keys that belong in the KeyTypeEvent flow.
-        """
+    def test_common_editing_keys_are_not_wrapped_as_special(self):
         editing_keys = [
             "space", "backspace", "enter", "return", "tab", "escape",
             "delete", "up", "down", "left", "right",
@@ -398,44 +135,114 @@ class TestSpecialKeyProcessing:
                 KeyUpEvent(timestamp=1.1, key_name=key_name),
             ]
             result = merge_consecutive_keyboard_events(events)
-            for ev in result:
-                assert not isinstance(ev, SpecialKeyEvent), (
-                    f"{key_name} should NOT be wrapped as SpecialKeyEvent"
-                )
+            assert not any(isinstance(ev, SpecialKeyEvent) for ev in result), (
+                f"{key_name} should flow through KeyTypeEvent, not become SpecialKeyEvent"
+            )
+
+    def test_special_key_between_typed_chars_preserves_segments(self):
+        ts = 1.0
+        events = []
+        for char in "abc":
+            events += [KeyDownEvent(timestamp=ts, key_char=char),
+                       KeyUpEvent(timestamp=ts + 0.05, key_char=char)]
+            ts += 0.1
+        events += [KeyDownEvent(timestamp=ts, key_name="media_play_pause"),
+                   KeyUpEvent(timestamp=ts + 0.05, key_name="media_play_pause")]
+        ts += 0.1
+        for char in "def":
+            events += [KeyDownEvent(timestamp=ts, key_char=char),
+                       KeyUpEvent(timestamp=ts + 0.05, key_char=char)]
+            ts += 0.1
+
+        result = merge_consecutive_keyboard_events(events)
+        assert [type(r).__name__ for r in result] == [
+            "KeyTypeEvent", "KeyTypeEvent", "KeyTypeEvent",
+            "SpecialKeyEvent",
+            "KeyTypeEvent", "KeyTypeEvent", "KeyTypeEvent",
+        ]
+        typed_chars = [r.text for r in result if isinstance(r, KeyTypeEvent)]
+        assert typed_chars == ["a", "b", "c", "d", "e", "f"]
+        assert isinstance(result[3], SpecialKeyEvent)
+        assert result[3].key_name == "media_play_pause"
+
+    def test_orphan_special_key_down_passes_through_as_raw(self):
+        events = [KeyDownEvent(timestamp=1.0, key_name="media_play_pause")]
+        result = merge_consecutive_keyboard_events(events)
+        assert result == events
+
+    def test_orphan_special_key_up_passes_through_as_raw(self):
+        events = [KeyUpEvent(timestamp=1.0, key_name="media_play_pause")]
+        result = merge_consecutive_keyboard_events(events)
+        assert result == events
+
+    def test_special_key_with_intervening_mouse_emits_as_raw(self):
+        """down(media), mouse_move, up(media) → all three pass through; no SpecialKeyEvent
+        because the media key down/up are not adjacent."""
+        events = [
+            KeyDownEvent(timestamp=1.0, key_name="media_play_pause"),
+            MouseMoveEvent(timestamp=1.05, x=100.0, y=100.0),
+            KeyUpEvent(timestamp=1.1, key_name="media_play_pause"),
+        ]
+        result = merge_consecutive_keyboard_events(events)
+        assert [type(r).__name__ for r in result] == [
+            "KeyDownEvent", "MouseMoveEvent", "KeyUpEvent",
+        ]
+
+    def test_auto_repeat_special_key_emits_intermediates_as_raw(self):
+        """Multi-down, single-up: only the final pair wraps; earlier downs are raw."""
+        events = [
+            KeyDownEvent(timestamp=1.0, key_name="media_volume_up"),
+            KeyDownEvent(timestamp=1.1, key_name="media_volume_up"),
+            KeyDownEvent(timestamp=1.2, key_name="media_volume_up"),
+            KeyUpEvent(timestamp=1.3, key_name="media_volume_up"),
+        ]
+        result = merge_consecutive_keyboard_events(events)
+        special = [e for e in result if isinstance(e, SpecialKeyEvent)]
+        raw_downs = [e for e in result if isinstance(e, KeyDownEvent)]
+        assert len(special) == 1
+        assert len(raw_downs) == 2
+
+    def test_modifier_held_keeps_buffer_open_across_mouse_events(self):
+        """Cmd held while mouse moves: mouse emits inline, but the keyboard buffer
+        survives until cmd-up so detect_key_shortcuts can fire (Cmd+C scenario)."""
+        events = [
+            KeyDownEvent(timestamp=1.0, key_name="cmd"),
+            MouseMoveEvent(timestamp=1.05, x=200.0, y=200.0),
+            KeyDownEvent(timestamp=1.1, key_char="c"),
+            KeyUpEvent(timestamp=1.15, key_char="c"),
+            KeyUpEvent(timestamp=1.2, key_name="cmd"),
+        ]
+        merged = merge_consecutive_keyboard_events(events)
+        assert sum(1 for e in merged if isinstance(e, MouseMoveEvent)) == 1
+        type_events = [e for e in merged if isinstance(e, KeyTypeEvent)]
+        assert len(type_events) == 1
+        assert len(type_events[0].children) == 4  # cmd_dn, c_dn, c_up, cmd_up
+
+        shortcuts = detect_key_shortcuts(merged)
+        assert any(isinstance(e, KeyShortcutEvent) for e in shortcuts)
+
+    def test_multi_modifier_shortcut_with_interleaved_mouse(self):
+        """Cmd, mouse, Shift, mouse, Z, Shift-up, Cmd-up → 1 KeyTypeEvent + 2 mouse moves."""
+        events = [
+            KeyDownEvent(timestamp=1.0, key_name="cmd"),
+            MouseMoveEvent(timestamp=1.1, x=100.0, y=100.0),
+            KeyDownEvent(timestamp=1.2, key_name="shift"),
+            MouseMoveEvent(timestamp=1.3, x=200.0, y=200.0),
+            KeyDownEvent(timestamp=1.4, key_char="z"),
+            KeyUpEvent(timestamp=1.5, key_char="z"),
+            KeyUpEvent(timestamp=1.6, key_name="shift"),
+            KeyUpEvent(timestamp=1.7, key_name="cmd"),
+        ]
+        result = merge_consecutive_keyboard_events(events)
+        type_events = [e for e in result if isinstance(e, KeyTypeEvent)]
+        mouse_events = [e for e in result if isinstance(e, MouseMoveEvent)]
+        assert len(type_events) == 1
+        assert len(mouse_events) == 2
+        assert len(type_events[0].children) == 6
 
 
 class TestMergeConsecutiveMouseMoveEvents:
-    """Tests for merge_consecutive_mouse_move_events."""
-
-    def test_merges_consecutive_moves(self):
-        """Test merging consecutive mouse moves."""
-        events = [
-            MouseMoveEvent(timestamp=1.0, x=100.0, y=100.0),
-            MouseMoveEvent(timestamp=1.1, x=110.0, y=110.0),
-            MouseMoveEvent(timestamp=1.2, x=120.0, y=120.0),
-        ]
-        result = merge_consecutive_mouse_move_events(events)
-        assert len(result) == 1
-        # Should have final position
-        assert result[0].x == 120.0
-        assert result[0].y == 120.0
-
-    def test_single_move_not_merged(self):
-        """Test that a single move is not modified."""
-        events = [MouseMoveEvent(timestamp=1.0, x=100.0, y=100.0)]
-        result = merge_consecutive_mouse_move_events(events)
-        assert len(result) == 1
-        assert result[0].x == 100.0
-
-    def test_single_move_has_path(self):
-        """Single (unmerged) move should have path=[(x, y)]."""
-        events = [MouseMoveEvent(timestamp=1.0, x=50.0, y=75.0)]
-        result = merge_consecutive_mouse_move_events(events)
-        assert len(result) == 1
-        assert result[0].path == [(50.0, 75.0)]
-
-    def test_merged_moves_preserve_all_waypoints(self):
-        """Merged moves should have path with all intermediate positions."""
+    def test_merges_to_final_position_with_full_path(self):
         events = [
             MouseMoveEvent(timestamp=1.0, x=0.0, y=0.0),
             MouseMoveEvent(timestamp=1.1, x=10.0, y=5.0),
@@ -444,17 +251,15 @@ class TestMergeConsecutiveMouseMoveEvents:
         ]
         result = merge_consecutive_mouse_move_events(events)
         assert len(result) == 1
-        assert result[0].x == 30.0
-        assert result[0].y == 15.0
-        assert result[0].path == [
-            (0.0, 0.0),
-            (10.0, 5.0),
-            (20.0, 10.0),
-            (30.0, 15.0),
-        ]
+        assert (result[0].x, result[0].y) == (30.0, 15.0)
+        assert result[0].path == [(0.0, 0.0), (10.0, 5.0), (20.0, 10.0), (30.0, 15.0)]
 
-    def test_interrupted_moves_each_have_path(self):
-        """Moves interrupted by other events each get their own path."""
+    def test_single_move_keeps_path_as_self(self):
+        events = [MouseMoveEvent(timestamp=1.0, x=50.0, y=75.0)]
+        result = merge_consecutive_mouse_move_events(events)
+        assert result[0].path == [(50.0, 75.0)]
+
+    def test_scroll_interrupts_creates_separate_move_groups(self):
         events = [
             MouseMoveEvent(timestamp=1.0, x=0.0, y=0.0),
             MouseMoveEvent(timestamp=1.1, x=10.0, y=10.0),
@@ -463,81 +268,31 @@ class TestMergeConsecutiveMouseMoveEvents:
         ]
         result = merge_consecutive_mouse_move_events(events)
         moves = [e for e in result if isinstance(e, MouseMoveEvent)]
-        assert len(moves) == 2
-        assert moves[0].path == [(0.0, 0.0), (10.0, 10.0)]
-        assert moves[1].path == [(20.0, 20.0)]
+        assert [m.path for m in moves] == [[(0.0, 0.0), (10.0, 10.0)], [(20.0, 20.0)]]
 
-    def test_path_serializes_as_nested_arrays(self):
-        """path should serialize as [[x1,y1],[x2,y2],...] in JSON."""
-        event = MouseMoveEvent(
-            timestamp=1.0, x=20.0, y=10.0,
-            path=[(0.0, 0.0), (10.0, 5.0), (20.0, 10.0)],
-        )
-        data = event.model_dump()
-        assert data["path"] == [(0.0, 0.0), (10.0, 5.0), (20.0, 10.0)]
-        # JSON round-trip
-        import json
-        json_str = event.model_dump_json()
-        parsed = json.loads(json_str)
-        assert parsed["path"] == [[0.0, 0.0], [10.0, 5.0], [20.0, 10.0]]
-
-    def test_default_path_is_empty_list(self):
-        """MouseMoveEvent created without path should default to empty list."""
-        event = MouseMoveEvent(timestamp=1.0, x=5.0, y=5.0)
-        assert event.path == []
-
-    def test_merge_sets_last_timestamp(self):
-        """A merged run carries ``last_timestamp`` covering the full span.
-
-        P1 fix (privacy): the scrub layer needs the END timestamp of the
-        merged span, not just the START, to detect intersection with a
-        blocked interval. Without ``last_timestamp``, a run of moves
-        crossing into a MASK_WINDOW interval would slip past the
-        ``find_blocked_interval(timestamp)`` point lookup and leak
-        coordinates from inside the sensitive interval.
-        """
-        events = [
+    def test_merged_run_carries_last_timestamp(self):
+        """P1 privacy fix: the scrub layer needs the END of a merged span to
+        detect intersection with a blocked interval. Without last_timestamp,
+        a run of moves crossing into a MASK_WINDOW interval would slip past
+        the point-lookup find_blocked_interval(timestamp) check.
+        Single (unmerged) moves leave last_timestamp=None — the scrub layer
+        treats None as a degenerate point at `timestamp`."""
+        merged = merge_consecutive_mouse_move_events([
             MouseMoveEvent(timestamp=1.0, x=0.0, y=0.0),
             MouseMoveEvent(timestamp=1.1, x=10.0, y=5.0),
             MouseMoveEvent(timestamp=1.2, x=20.0, y=10.0),
-        ]
-        result = merge_consecutive_mouse_move_events(events)
-        assert len(result) == 1
-        merged = result[0]
+        ])[0]
         assert merged.timestamp == 1.0
         assert merged.last_timestamp == 1.2
 
-    def test_single_move_has_no_last_timestamp(self):
-        """A single (unmerged) move leaves ``last_timestamp=None``.
-
-        Single moves have ``timestamp == last_timestamp`` implicitly — the
-        scrub layer treats ``None`` as a degenerate point, equivalent to
-        ``find_blocked_interval(timestamp)``. Storing ``None`` keeps the
-        on-disk JSONL unchanged for the common (unmerged) case.
-        """
-        events = [MouseMoveEvent(timestamp=1.0, x=50.0, y=75.0)]
-        result = merge_consecutive_mouse_move_events(events)
-        assert len(result) == 1
-        assert result[0].last_timestamp is None
-        # Sanity: path is still populated for single moves
-        assert result[0].path == [(50.0, 75.0)]
-
-    def test_default_last_timestamp_is_none(self):
-        """``MouseMoveEvent`` created without ``last_timestamp`` defaults to None.
-
-        Existing test fixtures and ``convert.py`` / ``input.py`` callers
-        that build ``MouseMoveEvent`` without the new field continue to
-        work without any code change.
-        """
-        event = MouseMoveEvent(timestamp=1.0, x=5.0, y=5.0)
-        assert event.last_timestamp is None
+        single = merge_consecutive_mouse_move_events(
+            [MouseMoveEvent(timestamp=1.0, x=50.0, y=75.0)]
+        )[0]
+        assert single.last_timestamp is None
 
 
 class TestMergeConsecutiveMouseScrollEvents:
-    """Tests for merge_consecutive_mouse_scroll_events."""
-
-    def test_merges_scroll_deltas(self):
-        """Test that scroll deltas are summed."""
+    def test_consecutive_scrolls_sum_deltas(self):
         events = [
             MouseScrollEvent(timestamp=1.0, x=100.0, y=100.0, dx=0.0, dy=-1.0),
             MouseScrollEvent(timestamp=1.1, x=100.0, y=100.0, dx=0.0, dy=-2.0),
@@ -545,14 +300,22 @@ class TestMergeConsecutiveMouseScrollEvents:
         ]
         result = merge_consecutive_mouse_scroll_events(events)
         assert len(result) == 1
-        assert result[0].dy == -4.0  # Sum of all dy values
+        assert result[0].dy == -4.0
+
+    def test_move_interrupts_creates_separate_scroll_groups(self):
+        events = [
+            MouseScrollEvent(timestamp=1.0, x=100.0, y=100.0, dx=2.0, dy=0.0),
+            MouseScrollEvent(timestamp=1.1, x=100.0, y=100.0, dx=1.0, dy=0.0),
+            MouseMoveEvent(timestamp=1.2, x=200.0, y=200.0),
+            MouseScrollEvent(timestamp=1.3, x=200.0, y=200.0, dx=0.0, dy=1.0),
+        ]
+        result = merge_consecutive_mouse_scroll_events(events)
+        scrolls = [e for e in result if isinstance(e, MouseScrollEvent)]
+        assert [(s.dx, s.dy) for s in scrolls] == [(3.0, 0.0), (0.0, 1.0)]
 
 
 class TestMergeConsecutiveMouseClickEvents:
-    """Tests for merge_consecutive_mouse_click_events."""
-
-    def test_creates_single_click(self):
-        """Test single click detection."""
+    def test_down_up_pair_becomes_single_click(self):
         events = [
             MouseDownEvent(timestamp=1.0, x=100.0, y=100.0, button=MouseButton.LEFT),
             MouseUpEvent(timestamp=1.1, x=100.0, y=100.0, button=MouseButton.LEFT),
@@ -562,8 +325,7 @@ class TestMergeConsecutiveMouseClickEvents:
         assert isinstance(result[0], MouseClickEvent)
         assert result[0].button == MouseButton.LEFT
 
-    def test_creates_double_click(self):
-        """Test double click detection."""
+    def test_two_quick_close_clicks_become_double_click(self):
         events = [
             MouseDownEvent(timestamp=1.0, x=100.0, y=100.0, button=MouseButton.LEFT),
             MouseUpEvent(timestamp=1.05, x=100.0, y=100.0, button=MouseButton.LEFT),
@@ -574,8 +336,7 @@ class TestMergeConsecutiveMouseClickEvents:
         assert len(result) == 1
         assert isinstance(result[0], MouseDoubleClickEvent)
 
-    def test_separate_clicks_too_far_apart(self):
-        """Test that clicks too far apart in time stay separate."""
+    def test_clicks_far_apart_in_time_stay_separate(self):
         events = [
             MouseDownEvent(timestamp=1.0, x=100.0, y=100.0, button=MouseButton.LEFT),
             MouseUpEvent(timestamp=1.05, x=100.0, y=100.0, button=MouseButton.LEFT),
@@ -583,15 +344,36 @@ class TestMergeConsecutiveMouseClickEvents:
             MouseUpEvent(timestamp=3.05, x=100.0, y=100.0, button=MouseButton.LEFT),
         ]
         result = merge_consecutive_mouse_click_events(events)
-        assert len(result) == 2
         assert all(isinstance(r, MouseClickEvent) for r in result)
+        assert len(result) == 2
+
+    def test_clicks_far_apart_spatially_stay_separate(self):
+        dt = DOUBLE_CLICK_INTERVAL_SECONDS / 10
+        distance = DOUBLE_CLICK_DISTANCE_PIXELS * 3
+        events = [
+            MouseDownEvent(timestamp=1.0, x=100.0, y=100.0, button=MouseButton.LEFT),
+            MouseUpEvent(timestamp=1.0 + dt, x=100.0, y=100.0, button=MouseButton.LEFT),
+            MouseDownEvent(timestamp=1.0 + 2 * dt, x=100.0 + distance, y=100.0, button=MouseButton.LEFT),
+            MouseUpEvent(timestamp=1.0 + 3 * dt, x=100.0 + distance, y=100.0, button=MouseButton.LEFT),
+        ]
+        result = merge_consecutive_mouse_click_events(events)
+        assert all(isinstance(r, MouseClickEvent) for r in result)
+        assert len(result) == 2
+
+    def test_different_buttons_dont_merge_into_double_click(self):
+        events = [
+            MouseDownEvent(timestamp=1.0, x=100.0, y=100.0, button=MouseButton.LEFT),
+            MouseUpEvent(timestamp=1.05, x=100.0, y=100.0, button=MouseButton.LEFT),
+            MouseDownEvent(timestamp=1.1, x=100.0, y=100.0, button=MouseButton.RIGHT),
+            MouseUpEvent(timestamp=1.15, x=100.0, y=100.0, button=MouseButton.RIGHT),
+        ]
+        result = merge_consecutive_mouse_click_events(events)
+        assert len(result) == 2
+        assert not any(isinstance(r, MouseDoubleClickEvent) for r in result)
 
 
 class TestDetectDragEvents:
-    """Tests for detect_drag_events."""
-
-    def test_detects_drag(self):
-        """Test drag detection from down + moves + up."""
+    def test_down_moves_up_creates_drag(self):
         events = [
             MouseDownEvent(timestamp=1.0, x=100.0, y=100.0, button=MouseButton.LEFT),
             MouseMoveEvent(timestamp=1.1, x=150.0, y=150.0),
@@ -600,51 +382,313 @@ class TestDetectDragEvents:
         ]
         result = detect_drag_events(events)
         assert len(result) == 1
-        assert isinstance(result[0], MouseDragEvent)
-        assert result[0].x == 100.0  # start position
-        assert result[0].dx == 100.0  # displacement (200 - 100)
+        drag = result[0]
+        assert isinstance(drag, MouseDragEvent)
+        assert (drag.x, drag.y, drag.dx, drag.dy) == (100.0, 100.0, 100.0, 100.0)
 
-    def test_no_drag_for_small_movement(self):
-        """Test that small movements don't create drags."""
+    def test_short_movement_does_not_create_drag(self):
         events = [
             MouseDownEvent(timestamp=1.0, x=100.0, y=100.0, button=MouseButton.LEFT),
             MouseMoveEvent(timestamp=1.1, x=101.0, y=101.0),
             MouseUpEvent(timestamp=1.2, x=102.0, y=102.0, button=MouseButton.LEFT),
         ]
         result = detect_drag_events(events)
-        # Should not create drag due to small distance
+        assert not any(isinstance(e, MouseDragEvent) for e in result)
+
+    def test_fast_drag_with_no_intermediate_moves_still_detected(self):
+        dist = DRAG_DISTANCE_THRESHOLD + 10
+        events = [
+            MouseDownEvent(timestamp=1.0, x=100.0, y=100.0, button=MouseButton.LEFT),
+            MouseUpEvent(timestamp=1.1, x=100.0 + dist, y=100.0, button=MouseButton.LEFT),
+        ]
+        drags = [e for e in detect_drag_events(events) if isinstance(e, MouseDragEvent)]
+        assert len(drags) == 1
+        assert drags[0].dx == dist
+
+    def test_keyboard_event_during_drag_is_tolerated(self):
+        events = [
+            MouseDownEvent(timestamp=1.0, x=100.0, y=100.0, button=MouseButton.LEFT),
+            MouseMoveEvent(timestamp=1.1, x=150.0, y=150.0),
+            KeyDownEvent(timestamp=1.15, key_char="a"),
+            MouseMoveEvent(timestamp=1.2, x=200.0, y=200.0),
+            MouseUpEvent(timestamp=1.3, x=200.0, y=200.0, button=MouseButton.LEFT),
+        ]
+        drags = [e for e in detect_drag_events(events) if isinstance(e, MouseDragEvent)]
+        assert len(drags) == 1
+        assert any(isinstance(c, KeyDownEvent) for c in drags[0].children)
+
+    def test_scroll_event_during_drag_is_tolerated(self):
+        events = [
+            MouseDownEvent(timestamp=1.0, x=100.0, y=100.0, button=MouseButton.LEFT),
+            MouseMoveEvent(timestamp=1.1, x=150.0, y=150.0),
+            MouseScrollEvent(timestamp=1.15, x=150.0, y=150.0, dx=0.0, dy=3.0),
+            MouseMoveEvent(timestamp=1.2, x=200.0, y=200.0),
+            MouseUpEvent(timestamp=1.3, x=200.0, y=200.0, button=MouseButton.LEFT),
+        ]
+        drags = [e for e in detect_drag_events(events) if isinstance(e, MouseDragEvent)]
+        assert len(drags) == 1
+        assert any(isinstance(c, MouseScrollEvent) for c in drags[0].children)
+
+    def test_second_button_press_during_drag_keeps_original_drag(self):
+        events = [
+            MouseDownEvent(timestamp=1.0, x=100.0, y=100.0, button=MouseButton.LEFT),
+            MouseMoveEvent(timestamp=1.1, x=150.0, y=150.0),
+            MouseDownEvent(timestamp=1.15, x=150.0, y=150.0, button=MouseButton.RIGHT),
+            MouseUpEvent(timestamp=1.2, x=150.0, y=150.0, button=MouseButton.RIGHT),
+            MouseMoveEvent(timestamp=1.25, x=200.0, y=200.0),
+            MouseUpEvent(timestamp=1.3, x=200.0, y=200.0, button=MouseButton.LEFT),
+        ]
+        drags = [e for e in detect_drag_events(events) if isinstance(e, MouseDragEvent)]
+        assert len(drags) == 1
+        assert drags[0].button == MouseButton.LEFT
+
+    def test_wrong_button_up_does_not_end_drag(self):
+        """RMB up mid-LMB-drag is a sibling, not an end. Drag ends on matching LMB up."""
+        events = [
+            MouseDownEvent(timestamp=1.0, x=100.0, y=100.0, button=MouseButton.LEFT),
+            MouseMoveEvent(timestamp=1.1, x=150.0, y=150.0),
+            MouseUpEvent(timestamp=1.15, x=150.0, y=150.0, button=MouseButton.RIGHT),
+            MouseMoveEvent(timestamp=1.2, x=200.0, y=200.0),
+            MouseUpEvent(timestamp=1.3, x=200.0, y=200.0, button=MouseButton.LEFT),
+        ]
+        drags = [e for e in detect_drag_events(events) if isinstance(e, MouseDragEvent)]
+        assert len(drags) == 1
+        assert drags[0].dx == 100.0
+
+    def test_window_event_flushes_incomplete_drag(self):
+        events = [
+            MouseDownEvent(timestamp=1.0, x=100.0, y=100.0, button=MouseButton.LEFT),
+            MouseMoveEvent(timestamp=1.1, x=150.0, y=150.0),
+            WindowStateEvent(
+                timestamp=1.15, title="Test", left=0, top=0,
+                width=800, height=600, window_id=1,
+            ),
+            MouseMoveEvent(timestamp=1.2, x=200.0, y=200.0),
+            MouseUpEvent(timestamp=1.3, x=200.0, y=200.0, button=MouseButton.LEFT),
+        ]
+        result = detect_drag_events(events)
         assert not any(isinstance(e, MouseDragEvent) for e in result)
 
 
-class TestProcessEvents:
-    """Tests for full processing pipeline."""
-
-    def test_full_pipeline(self):
-        """Test complete processing pipeline."""
+class TestGestureEvents:
+    def test_consecutive_magnify_events_sum_deltas(self):
         events = [
-            # Mouse movement
+            MouseMagnifyEvent(timestamp=1.0, x=100, y=100, magnification=0.02),
+            MouseMagnifyEvent(timestamp=1.1, x=100, y=100, magnification=0.03),
+            MouseMagnifyEvent(timestamp=1.2, x=100, y=100, magnification=0.05),
+        ]
+        result = merge_consecutive_mouse_magnify_events(events)
+        assert len(result) == 1
+        assert abs(result[0].magnification - 0.10) < 1e-9
+
+    def test_move_interrupts_creates_separate_magnify_groups(self):
+        events = [
+            MouseMagnifyEvent(timestamp=1.0, x=100, y=100, magnification=0.02),
+            MouseMagnifyEvent(timestamp=1.1, x=100, y=100, magnification=0.03),
+            MouseMoveEvent(timestamp=1.2, x=200, y=200),
+            MouseMagnifyEvent(timestamp=1.3, x=200, y=200, magnification=0.01),
+        ]
+        result = merge_consecutive_mouse_magnify_events(events)
+        mags = [e for e in result if isinstance(e, MouseMagnifyEvent)]
+        assert [round(m.magnification, 2) for m in mags] == [0.05, 0.01]
+
+    def test_smart_magnify_does_not_merge_with_neighbors(self):
+        """SmartMagnify is an instantaneous toggle (two-finger double-tap zoom),
+        not a continuous gesture; consecutive events stay distinct."""
+        events = [
+            MouseSmartMagnifyEvent(timestamp=1.0, x=100, y=100),
+            MouseSmartMagnifyEvent(timestamp=1.1, x=100, y=100),
+        ]
+        result = process_events(events)
+        assert sum(1 for e in result if isinstance(e, MouseSmartMagnifyEvent)) == 2
+
+    def test_get_action_events_includes_all_gesture_types(self):
+        events = [
+            MouseMagnifyEvent(timestamp=1.0, x=100, y=100, magnification=0.05),
+            MouseRotateEvent(timestamp=1.1, x=100, y=100, rotation=30.0),
+            MouseSmartMagnifyEvent(timestamp=1.2, x=100, y=100),
+        ]
+        assert len(get_action_events(events)) == 3
+
+
+class TestMergeSequentialKeyTypeEvents:
+    """Word-level merge of KeyTypeEvents produced by merge_consecutive_keyboard_events."""
+
+    @staticmethod
+    def _kt(char: str, timestamp: float) -> KeyTypeEvent:
+        return KeyTypeEvent(
+            timestamp=timestamp,
+            text=char,
+            children=[
+                KeyDownEvent(timestamp=timestamp, key_char=char),
+                KeyUpEvent(timestamp=timestamp + 0.05, key_char=char),
+            ],
+        )
+
+    def test_close_keytypes_merge_into_word(self):
+        events = [self._kt(c, i * 0.1) for i, c in enumerate("hello")]
+        result = merge_sequential_key_type_events(events)
+        assert len(result) == 1
+        assert result[0].text == "hello"
+        assert result[0].timestamp == 0.0
+        assert len(result[0].children) == 10  # 5 keys × (down + up)
+
+    @pytest.mark.parametrize("gap_seconds,expected", [
+        (KEY_TYPE_MERGE_INTERVAL_SECONDS - 0.1, ["hi"]),
+        (KEY_TYPE_MERGE_INTERVAL_SECONDS, ["h", "i"]),
+        (KEY_TYPE_MERGE_INTERVAL_SECONDS + 0.1, ["h", "i"]),
+    ])
+    def test_gap_at_or_above_threshold_splits(self, gap_seconds, expected):
+        events = [self._kt("h", 0.0), self._kt("i", gap_seconds)]
+        assert [r.text for r in merge_sequential_key_type_events(events)] == expected
+
+    def test_punctuation_merges_into_the_word(self):
+        events = [self._kt(c, i * 0.1) for i, c in enumerate("he,")]
+        result = merge_sequential_key_type_events(events)
+        assert len(result) == 1
+        assert result[0].text == "he,"
+
+    def test_whitespace_is_a_word_boundary(self):
+        events = [self._kt(c, i * 0.1) for i, c in enumerate("hi b")]
+        result = merge_sequential_key_type_events(events)
+        assert [r.text for r in result] == ["hi", " ", "b"]
+
+    def test_nonprintable_keytype_is_a_word_boundary(self):
+        backspace = KeyTypeEvent(
+            timestamp=0.2, text="",
+            children=[
+                KeyDownEvent(timestamp=0.2, key_name="backspace"),
+                KeyUpEvent(timestamp=0.25, key_name="backspace"),
+            ],
+        )
+        events = [self._kt("h", 0.0), self._kt("e", 0.1), backspace, self._kt("l", 0.3)]
+        result = merge_sequential_key_type_events(events)
+        assert [r.text for r in result] == ["he", "", "l"]
+
+    def test_keyshortcut_is_a_word_boundary(self):
+        shortcut = KeyShortcutEvent(
+            timestamp=0.3,
+            keys=["ctrl", "z"],
+            children=[
+                KeyDownEvent(timestamp=0.3, key_name="ctrl"),
+                KeyDownEvent(timestamp=0.31, key_char="z"),
+                KeyUpEvent(timestamp=0.35, key_char="z"),
+                KeyUpEvent(timestamp=0.36, key_name="ctrl"),
+            ],
+        )
+        events = [self._kt("a", 0.0), self._kt("b", 0.1), shortcut, self._kt("c", 0.4)]
+        result = merge_sequential_key_type_events(events)
+        assert [type(r).__name__ for r in result] == [
+            "KeyTypeEvent", "KeyShortcutEvent", "KeyTypeEvent",
+        ]
+        assert (result[0].text, result[2].text) == ("ab", "c")
+
+    def test_non_keyboard_event_is_a_word_boundary(self):
+        events = [
+            self._kt("a", 0.0),
+            self._kt("b", 0.1),
+            MouseMoveEvent(timestamp=0.2, x=100.0, y=100.0),
+            self._kt("c", 0.3),
+        ]
+        result = merge_sequential_key_type_events(events)
+        assert [type(r).__name__ for r in result] == [
+            "KeyTypeEvent", "MouseMoveEvent", "KeyTypeEvent",
+        ]
+        assert (result[0].text, result[2].text) == ("ab", "c")
+
+    def test_interval_zero_disables_merging(self):
+        events = [self._kt(c, i * 0.1) for i, c in enumerate("abc")]
+        result = merge_sequential_key_type_events(events, interval=0)
+        assert [r.text for r in result] == ["a", "b", "c"]
+
+    def test_multi_char_keytype_event_participates_in_merge(self):
+        """A KeyTypeEvent already carrying multi-char text (auto-replace, IME)
+        joins the surrounding word."""
+        first = KeyTypeEvent(
+            timestamp=0.0, text="th",
+            children=[
+                KeyDownEvent(timestamp=0.0, key_char="t"),
+                KeyDownEvent(timestamp=0.02, key_char="h"),
+                KeyUpEvent(timestamp=0.04, key_char="t"),
+                KeyUpEvent(timestamp=0.05, key_char="h"),
+            ],
+        )
+        events = [first, self._kt("e", 0.1)]
+        result = merge_sequential_key_type_events(events)
+        assert len(result) == 1
+        assert result[0].text == "the"
+
+
+class TestProcessEvents:
+    def test_pipeline_merges_moves_clicks_and_typed_text(self):
+        events = [
             MouseMoveEvent(timestamp=1.0, x=100.0, y=100.0),
-            MouseMoveEvent(timestamp=1.1, x=100.0, y=100.0),  # Redundant
+            MouseMoveEvent(timestamp=1.1, x=100.0, y=100.0),  # redundant
             MouseMoveEvent(timestamp=1.2, x=200.0, y=200.0),
-            # Click
             MouseDownEvent(timestamp=2.0, x=200.0, y=200.0, button=MouseButton.LEFT),
             MouseUpEvent(timestamp=2.1, x=200.0, y=200.0, button=MouseButton.LEFT),
-            # Type
             KeyDownEvent(timestamp=3.0, key_char="a"),
             KeyUpEvent(timestamp=3.1, key_char="a"),
             KeyDownEvent(timestamp=3.2, key_char="b"),
             KeyUpEvent(timestamp=3.3, key_char="b"),
         ]
         result = process_events(events)
-
-        # Should have: merged move, single click, key types
         types = [type(e).__name__ for e in result]
         assert "MouseMoveEvent" in types
         assert "MouseClickEvent" in types
-        assert "KeyTypeEvent" in types
-
-        # Check that keyboard events were merged into KeyTypeEvents
-        # The sequential merge step combines "a" and "b" (200ms apart < 500ms threshold)
+        # "a" and "b" are 200ms apart < 500ms — merge into one word
         key_types = [e for e in result if isinstance(e, KeyTypeEvent)]
-        assert len(key_types) == 1
-        assert key_types[0].text == "ab"
+        assert [k.text for k in key_types] == ["ab"]
+
+    def test_blender_style_workflow_classifies_events_correctly(self):
+        """End-to-end on a realistic 3D-app session: orbit drag, pan drag with
+        shift, pinch zoom, constrained LMB drag, RMB cancel."""
+        dist = DRAG_DISTANCE_THRESHOLD + 20
+        ts = 0.0
+
+        def step(dt: float = 0.1) -> float:
+            nonlocal ts
+            ts += dt
+            return ts
+
+        shift_tap = KeyTypeEvent(
+            timestamp=step(),
+            text="",
+            children=[
+                KeyDownEvent(timestamp=ts - 0.05, key_name="shift"),
+                KeyUpEvent(timestamp=ts, key_name="shift"),
+            ],
+        )
+
+        events = [
+            # MMB orbit
+            MouseDownEvent(timestamp=step(), x=400, y=400, button=MouseButton.MIDDLE),
+            MouseMoveEvent(timestamp=step(), x=400 + dist, y=400 + dist),
+            MouseUpEvent(timestamp=step(), x=400 + dist, y=400 + dist, button=MouseButton.MIDDLE),
+            # Shift+MMB pan
+            MouseDownEvent(timestamp=step(), x=400, y=400, button=MouseButton.MIDDLE),
+            shift_tap,
+            MouseMoveEvent(timestamp=step(), x=400, y=400 + dist),
+            MouseUpEvent(timestamp=step(), x=400, y=400 + dist, button=MouseButton.MIDDLE),
+            # Pinch zoom
+            MouseMagnifyEvent(timestamp=step(), x=500, y=500, magnification=0.02),
+            MouseMagnifyEvent(timestamp=step(), x=500, y=500, magnification=0.03),
+            MouseMagnifyEvent(timestamp=step(), x=500, y=500, magnification=0.05),
+            # LMB drag
+            MouseDownEvent(timestamp=step(), x=300, y=300, button=MouseButton.LEFT),
+            MouseMoveEvent(timestamp=step(), x=300 + dist, y=300),
+            MouseMoveEvent(timestamp=step(), x=300 + dist * 2, y=300),
+            MouseUpEvent(timestamp=step(), x=300 + dist * 2, y=300, button=MouseButton.LEFT),
+            # RMB click
+            MouseDownEvent(timestamp=step(), x=300, y=300, button=MouseButton.RIGHT),
+            MouseUpEvent(timestamp=step(), x=300, y=300, button=MouseButton.RIGHT),
+        ]
+        result = process_events(events)
+        drags = [e for e in result if isinstance(e, MouseDragEvent)]
+        magnifies = [e for e in result if isinstance(e, MouseMagnifyEvent)]
+        clicks = [e for e in result if isinstance(e, (MouseClickEvent, MouseDoubleClickEvent))]
+
+        assert len(drags) == 3
+        assert len(magnifies) == 1
+        assert abs(magnifies[0].magnification - 0.10) < 1e-9
+        assert len(clicks) >= 1
