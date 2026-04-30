@@ -445,6 +445,28 @@ class TestRecordingHasEncryptedBodies:
         # The wrapped DEK is on disk regardless — that's a separate question.
         assert recording_has_wrapped_dek(db_path, recording_id) is True
 
+    def test_returns_false_on_pre_network_legacy_db(self, tmp_path):
+        """Truly pre-V1 DB: ``network_event`` table doesn't exist at
+        all. ``_migrate_schema`` only adds columns to existing tables,
+        not missing tables, so the table stays missing on legacy
+        recordings. The helper must catch the OperationalError and
+        return False rather than crash. Same legacy path applies to
+        ``recording_has_wrapped_dek`` (network_event_meta table).
+        """
+        import sqlite3
+        db_path = str(tmp_path / "legacy.db")
+        # Bare-minimum recording table; no network_event /
+        # network_event_meta tables.
+        conn = sqlite3.connect(db_path)
+        conn.execute("CREATE TABLE recording (id INTEGER PRIMARY KEY)")
+        conn.execute("INSERT INTO recording (id) VALUES (1)")
+        conn.commit()
+        conn.close()
+
+        # Both helpers must return False without raising.
+        assert recording_has_encrypted_bodies(db_path, 1) is False
+        assert recording_has_wrapped_dek(db_path, 1) is False
+
     def test_returns_true_when_at_least_one_ciphertext_row(self, tmp_path):
         """Recording with at least one row carrying ciphertext requires
         KEK access at export time and blocks remove-kek."""

@@ -927,6 +927,59 @@ class TestDone:
         tunneled = [e for e in events if isinstance(e, NetworkTunneledEvent)]
         assert tunneled == []
 
+    def test_done_flushes_drops_caused_by_tunneled_emission(self, tmp_path):
+        """V1.5 P3: tunneled emission can itself hit queue.Full and
+        accumulate drops in _dropped_count. The first flush at the top
+        of done() runs BEFORE tunneled emission, so without a second
+        flush after, those shutdown-emission drops are silently lost.
+
+        Approach: stub _enqueue so every tunneled put becomes a drop
+        (simulates "queue is full for the duration of done()"), but
+        leave _emit_drop_burst untouched so the second flush can reach
+        out_q. Verify the second flush emits a burst with dropped_count
+        equal to the observed-host count.
+        """
+        from screencap.engine.events import NetworkDropBurstEvent
+
+        log_path = tmp_path / "log.txt"
+        capture, out_q = _make_capture(log_path=log_path, qsize=20)
+
+        # Three observed pinned hosts — the loop in done() will emit
+        # three NetworkTunneledEvents and our stubbed _enqueue will
+        # convert each into a drop.
+        capture._observed_tunnel_hosts.update({
+            "host-a.com", "host-b.com", "host-c.com",
+        })
+        capture._tunnel_started_at = {
+            "host-a.com": 100.0,
+            "host-b.com": 100.0,
+            "host-c.com": 100.0,
+        }
+
+        # Stub _enqueue to count drops directly; bypass the real put.
+        # _emit_drop_burst still uses self._out_q.put for the burst.
+        original_record_drop = capture._record_drop
+        def _stub_enqueue(event, *, host):  # noqa: ARG001
+            original_record_drop(host)
+        capture._enqueue = _stub_enqueue
+
+        capture.done()
+
+        events = _drain(out_q)
+        bursts = [e for e in events if isinstance(e, NetworkDropBurstEvent)]
+        assert len(bursts) == 1, (
+            f"expected exactly one drop_burst from the second flush, "
+            f"got {len(bursts)}"
+        )
+        burst = bursts[0]
+        assert burst.details_json["dropped_count"] == 3, (
+            f"expected 3 drops (one per observed host), got "
+            f"{burst.details_json['dropped_count']}"
+        )
+        assert set(burst.details_json["hosts_affected"]) == {
+            "host-a.com", "host-b.com", "host-c.com",
+        }
+
 
 # ---------------------------------------------------------------------------
 # running() loop capture

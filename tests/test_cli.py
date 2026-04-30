@@ -732,7 +732,15 @@ def test_export_single_by_name_with_downloads_fallback(tmp_path, monkeypatch):
 
 
 def _create_v15_export_db(rec_dir):
-    """Create a recording.db with a NetworkEventMeta row (V1.5 vintage)."""
+    """Create a recording.db with a V1.5 encrypted body (meta + ciphertext).
+
+    A meta row alone is not enough — after the PR #157 review, the
+    ``recording_has_encrypted_bodies`` predicate queries actual
+    ``body_ciphertext IS NOT NULL`` rows so metadata-only V1.5
+    recordings (where the user only browsed non-allowlisted hosts)
+    don't trigger Keychain prompts. Tests that simulate "encrypted
+    recording" must therefore insert at least one ciphertext row.
+    """
     from screencap.engine.db import create_db, crud
     from screencap.network import crypto
 
@@ -753,7 +761,7 @@ def _create_v15_export_db(rec_dir):
         "name": "click", "mouse_x": 100.0, "mouse_y": 200.0,
         "mouse_button_name": "left", "mouse_pressed": False,
     })
-    # Insert a NetworkEventMeta row to simulate a V1.5 recording.
+    # V1.5 wrapped DEK — every --network recording gets one of these.
     kek = crypto._generate_kek()
     dek = crypto.generate_dek()
     wrapped, nonce = crypto.wrap_dek(dek, kek)
@@ -763,6 +771,24 @@ def _create_v15_export_db(rec_dir):
         dek_wrapped=wrapped,
         dek_nonce=nonce,
     )
+    # ALSO insert a ciphertext-bearing network_event row so
+    # recording_has_encrypted_bodies returns True. This is what marks
+    # the recording as "actually has encrypted bodies on disk" rather
+    # than just "V1.5 vintage."
+    crud.insert_network_event(session, rec, {
+        "kind": "request",
+        "flow_id": "f1",
+        "method": "POST",
+        "url": "https://api.github.com/x",
+        "host": "api.github.com",
+        "body_ciphertext": b"\xde\xad\xbe\xef" * 4,
+        "body_nonce": b"\x01" * 12,
+        "body_aad": b"some-aad",
+        "timestamp": 1000.7,
+        "timestamp_ns": 1_000_700_000_000,
+    })
+    crud.flush_buffers(session)
+    session.commit()
     session.close()
     engine.dispose()
     return kek

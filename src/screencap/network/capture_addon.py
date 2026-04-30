@@ -323,6 +323,8 @@ class NetworkCapture:
                 pass
             self._drop_burst_timer_handle = None
 
+        # First flush captures everything accumulated DURING the
+        # recording. After this, _dropped_count is reset to 0.
         flushed_count = self._dropped_count
         if flushed_count > 0:
             self._emit_drop_burst(blocking=True)
@@ -350,6 +352,17 @@ class NetworkCapture:
                 self._enqueue(tunneled_event, host=host)
             except Exception:  # noqa: BLE001
                 _log(self._log_path, f"failed to emit network.tunneled for {host}")
+
+        # Second flush: tunneled emissions above can themselves hit
+        # queue.Full (every _enqueue routes through _record_drop on
+        # backpressure). Without this second flush, drops attributed to
+        # shutdown emission are silently lost — the consumer would see
+        # network.tunneled events for some hosts but no marker that the
+        # rest got dropped. Flushes are idempotent (zero-count is a
+        # no-op), so an extra flush when no shutdown drops occurred
+        # costs nothing.
+        if self._dropped_count > 0:
+            self._emit_drop_burst(blocking=True)
 
         _log(
             self._log_path,

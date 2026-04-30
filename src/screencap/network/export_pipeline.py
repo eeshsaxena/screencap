@@ -377,6 +377,7 @@ def recording_has_encrypted_bodies(db_path: str, recording_id: int) -> bool:
         before the meta row was inserted.
     """
     from sqlalchemy import select  # noqa: PLC0415
+    from sqlalchemy.exc import OperationalError  # noqa: PLC0415
 
     from screencap.engine.db import get_session_for_path  # noqa: PLC0415
     from screencap.engine.db.models import NetworkEvent  # noqa: PLC0415
@@ -390,7 +391,18 @@ def recording_has_encrypted_bodies(db_path: str, recording_id: int) -> bool:
             .where(NetworkEvent.body_ciphertext.isnot(None))
             .limit(1)
         )
-        return session.execute(stmt).first() is not None
+        try:
+            return session.execute(stmt).first() is not None
+        except OperationalError as exc:
+            # Pre-network legacy DB: the network_event table doesn't
+            # exist yet. ``_migrate_schema`` only adds columns to
+            # existing tables — missing tables stay missing. Treating
+            # this as "no encrypted bodies" is the correct answer for
+            # any caller deciding whether to construct a scrub pipeline
+            # or whether to block ``network remove-kek``.
+            if "no such table" in str(exc).lower():
+                return False
+            raise
     finally:
         session.close()
 
@@ -406,16 +418,25 @@ def recording_has_wrapped_dek(db_path: str, recording_id: int) -> bool:
     ciphertext-presence helper for "do we need a Keychain prompt to
     export this."
     """
+    from sqlalchemy.exc import OperationalError  # noqa: PLC0415
+
     from screencap.engine.db import get_session_for_path  # noqa: PLC0415
     from screencap.engine.db.models import NetworkEventMeta  # noqa: PLC0415
 
     session = get_session_for_path(db_path)
     try:
-        meta = (
-            session.query(NetworkEventMeta)
-            .filter(NetworkEventMeta.recording_id == recording_id)
-            .one_or_none()
-        )
+        try:
+            meta = (
+                session.query(NetworkEventMeta)
+                .filter(NetworkEventMeta.recording_id == recording_id)
+                .one_or_none()
+            )
+        except OperationalError as exc:
+            # Pre-network legacy DB — ``network_event_meta`` table is
+            # absent. Same rationale as ``recording_has_encrypted_bodies``.
+            if "no such table" in str(exc).lower():
+                return False
+            raise
     finally:
         session.close()
     return meta is not None
