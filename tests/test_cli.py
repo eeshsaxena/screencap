@@ -1,14 +1,37 @@
 """Tests for screencap CLI argument parsing."""
 
 import json
-import sys
 import time
+from contextlib import contextmanager
 from unittest import mock
 
+import pytest
 from click.testing import CliRunner
 
 from screencap.cli import cli
-from screencap import pidfile
+
+
+@contextmanager
+def _safe_start_prompts():
+    """Patch the four entry points that interact with stdin or hard-exit during
+    `screencap start` so the command can run as a unit test:
+
+      _maybe_prompt_privacy_setup          # may launch setup wizard
+      _maybe_prompt_matrix_acknowledgement # 5s select.select on stdin
+      _stdin_is_tty                        # gates redaction + website prompts
+      os._exit                             # `start` hard-exits to bypass background threads
+
+    Tests still need to mock `screencap.recorder.start_recording` (and
+    optionally `screencap.cli._auto_export`) themselves; this helper only
+    neutralizes the prompt/exit path.
+    """
+    with (
+        mock.patch("screencap.cli._maybe_prompt_privacy_setup"),
+        mock.patch("screencap.cli._maybe_prompt_matrix_acknowledgement"),
+        mock.patch("screencap.cli._stdin_is_tty", return_value=False),
+        mock.patch("os._exit"),
+    ):
+        yield
 
 
 def test_version():
@@ -622,9 +645,14 @@ def test_cloud_start_nlp_model_gate(tmp_path):
     fake_dir.mkdir()
 
     def _invoke(args, **kw):
-        """Invoke CLI with os._exit patched (start() hard-exits after recording)."""
+        """Invoke CLI with os._exit patched (start() hard-exits after recording).
+
+        `--no-scrub` is required because this test forces ``_stdin_is_tty=True``
+        for the cloud-gate prompts; without it, the redaction prompt fires and
+        the test aborts.
+        """
         with mock.patch("os._exit"):
-            return runner.invoke(cli, ["start", "--name", "t"] + args, **kw)
+            return runner.invoke(cli, ["start", "--name", "t", "--no-scrub"] + args, **kw)
 
     tty = mock.patch("screencap.cli._stdin_is_tty", return_value=True)
     no_setup = mock.patch("screencap.cli._maybe_prompt_privacy_setup")
@@ -894,6 +922,216 @@ def test_cloud_function_filename_regex_allows_marker():
     assert not filename_re.match(".hidden")
     assert not filename_re.match("-leading-dash")
     assert not filename_re.match("/absolute/path")
+
+
+# ---------------------------------------------------------------------------
+# `screencap start` flag/path tests
+#
+# These exercise `start` with the prompt entry points patched via
+# _safe_start_prompts() so the test can't trigger interactive setup, write
+# the user's privacy config, or block on stdin.
+# ---------------------------------------------------------------------------
+
+
+@pytest.mark.parametrize("flag,kwarg,expected", [
+    ("--no-video", "capture_video", False),
+    ("--no-images", "capture_images", False),
+    ("--no-window-data", "capture_window_data", False),
+    ("--no-wifi-metrics", "wifi_metrics", False),
+    ("--no-app-versions", "app_versions", False),
+])
+def test_start_capture_flag_propagates_to_recorder(tmp_path, flag, kwarg, expected):
+    """Each capture-opt-out flag flows through to the matching start_recording kwarg."""
+    runner = CliRunner()
+    fake_dir = tmp_path / "test-rec"
+    fake_dir.mkdir()
+    with _safe_start_prompts(), mock.patch(
+        "screencap.recorder.start_recording",
+        return_value=(fake_dir, 42.0, None, None),
+    ) as mock_rec:
+        result = runner.invoke(cli, ["start", "--name", "test-rec", flag])
+    assert result.exit_code == 0, result.output
+    _, kwargs = mock_rec.call_args
+    assert kwargs[kwarg] is expected
+
+
+@pytest.mark.parametrize("args,expected_cloud,expected_source", [
+    ([], False, "non_interactive_default"),
+    (["--cloud"], True, "flag"),
+    (["--local"], False, "flag"),
+])
+def test_start_intent_flag_resolves_to_recorder_kwargs(
+    tmp_path, args, expected_cloud, expected_source,
+):
+    """--cloud / --local / no-flag map to cloud_intent + intent_source on the recorder call.
+    Cloud also forces force_mode=PrivacyMode.PUBLIC."""
+    from screencap.privacy.policy import PrivacyMode
+
+    runner = CliRunner()
+    fake_dir = tmp_path / "test-rec"
+    fake_dir.mkdir()
+    with (
+        _safe_start_prompts(),
+        mock.patch("screencap.privacy.are_nlp_models_cached", return_value=True),
+        mock.patch(
+            "screencap.recorder.start_recording",
+            return_value=(fake_dir, 42.0, None, None),
+        ) as mock_rec,
+    ):
+        result = runner.invoke(cli, ["start", "--name", "test", *args])
+    assert result.exit_code == 0, result.output
+    _, kwargs = mock_rec.call_args
+    assert kwargs["cloud_intent"] is expected_cloud
+    assert kwargs["intent_source"] == expected_source
+    assert kwargs["force_mode"] == (PrivacyMode.PUBLIC if expected_cloud else None)
+
+
+def test_start_cloud_then_local_resolves_to_local(tmp_path):
+    """Click flag_value semantics: when both --cloud and --local are passed,
+    the last one on the command line wins. Regression for an earlier bug
+    where the order was reversed."""
+    runner = CliRunner()
+    fake_dir = tmp_path / "test-rec"
+    fake_dir.mkdir()
+    with _safe_start_prompts(), mock.patch(
+        "screencap.recorder.start_recording",
+        return_value=(fake_dir, 42.0, None, None),
+    ) as mock_rec:
+        result = runner.invoke(
+            cli, ["start", "--name", "test", "--cloud", "--local"],
+        )
+    assert result.exit_code == 0, result.output
+    _, kwargs = mock_rec.call_args
+    assert kwargs["cloud_intent"] is False
+    assert kwargs["force_mode"] is None
+
+
+def test_start_force_flag_passes_force_clean_to_recorder(tmp_path):
+    """`start --force` triggers orphan cleanup and forwards force_clean=True."""
+    runner = CliRunner()
+    fake_dir = tmp_path / "test"
+    fake_dir.mkdir()
+    orphans = [{"pid": 444, "name": "old_writer"}]
+    with (
+        _safe_start_prompts(),
+        mock.patch("screencap.pidfile.find_orphaned_processes", return_value=orphans),
+        mock.patch("screencap.pidfile.terminate_processes"),
+        mock.patch("screencap.pidfile.delete_pidfile"),
+        mock.patch("screencap.pidfile.write_pidfile"),
+        mock.patch(
+            "screencap.recorder.start_recording",
+            return_value=(fake_dir, 42.0, None, None),
+        ) as mock_rec,
+    ):
+        result = runner.invoke(cli, ["start", "--name", "test", "--force"])
+    assert result.exit_code == 0, result.output
+    _, kwargs = mock_rec.call_args
+    assert kwargs["force_clean"] is True
+
+
+def test_start_without_force_exits_when_orphans_present():
+    """Without --force, start exits non-zero rather than racing the orphans."""
+    runner = CliRunner()
+    orphans = [{"pid": 555, "name": "old_writer"}]
+    with (
+        _safe_start_prompts(),
+        mock.patch("screencap.pidfile.find_orphaned_processes", return_value=orphans),
+        mock.patch("screencap.pidfile.terminate_processes"),
+        mock.patch("screencap.pidfile.delete_pidfile"),
+        mock.patch("screencap.recorder.start_recording", side_effect=SystemExit(1)),
+    ):
+        result = runner.invoke(cli, ["start", "--name", "test"])
+    assert result.exit_code == 1
+
+
+def test_start_disk_full_skips_auto_naming_but_prints_summary(tmp_path):
+    """DiskFullError from start_recording is caught: the post-recording pipeline
+    skips auto-naming/transcription, but the summary still prints so the user
+    sees what was captured."""
+    from screencap.recorder import DiskFullError
+
+    runner = CliRunner()
+    fake_dir = tmp_path / "rec-test"
+    fake_dir.mkdir()
+    with (
+        _safe_start_prompts(),
+        mock.patch(
+            "screencap.recorder.start_recording",
+            side_effect=DiskFullError(fake_dir, 42.0),
+        ),
+        mock.patch("screencap.namer.auto_name") as mock_namer,
+    ):
+        result = runner.invoke(cli, ["start", "--name", "rec-test"])
+    assert result.exit_code == 0
+    assert "Skipping auto-naming/transcription" in result.output
+    assert "Recording complete" in result.output
+    mock_namer.assert_not_called()
+
+
+def test_start_auto_export_called_with_capture_dir(tmp_path):
+    """Auto-export runs after recording with the capture dir."""
+    runner = CliRunner()
+    fake_dir = tmp_path / "rec-test"
+    fake_dir.mkdir()
+    with (
+        _safe_start_prompts(),
+        mock.patch(
+            "screencap.recorder.start_recording",
+            return_value=(fake_dir, 42.0, None, None),
+        ),
+        mock.patch("screencap.namer.auto_name", return_value=fake_dir),
+        mock.patch("screencap.cli._auto_export") as mock_auto_export,
+    ):
+        result = runner.invoke(cli, ["start", "--name", "rec-test"])
+    assert result.exit_code == 0, result.output
+    assert "Recording complete" in result.output
+    mock_auto_export.assert_called_once_with(fake_dir)
+
+
+def test_start_auto_export_keyboard_interrupt_does_not_abort(tmp_path):
+    """Ctrl-C during auto-export prints 'Export cancelled.' and the pipeline
+    continues to the summary instead of crashing."""
+    runner = CliRunner()
+    fake_dir = tmp_path / "rec-test"
+    fake_dir.mkdir()
+    with (
+        _safe_start_prompts(),
+        mock.patch(
+            "screencap.recorder.start_recording",
+            return_value=(fake_dir, 42.0, None, None),
+        ),
+        mock.patch("screencap.namer.auto_name", return_value=fake_dir),
+        mock.patch("screencap.cli._auto_export", side_effect=KeyboardInterrupt),
+    ):
+        result = runner.invoke(cli, ["start", "--name", "rec-test"])
+    assert result.exit_code == 0, result.output
+    assert "Export cancelled." in result.output
+    assert "Recording complete" in result.output
+
+
+def test_start_auto_export_internal_failure_warns_but_succeeds(tmp_path):
+    """When export_recording inside _auto_export raises, the warning path
+    inside _auto_export catches it; start still finishes with exit 0 and the
+    summary prints."""
+    runner = CliRunner()
+    fake_dir = tmp_path / "rec-test"
+    fake_dir.mkdir()
+    with (
+        _safe_start_prompts(),
+        mock.patch(
+            "screencap.recorder.start_recording",
+            return_value=(fake_dir, 42.0, None, None),
+        ),
+        mock.patch("screencap.namer.auto_name", return_value=fake_dir),
+        mock.patch(
+            "screencap.exporter.export_recording", side_effect=RuntimeError("boom"),
+        ),
+    ):
+        result = runner.invoke(cli, ["start", "--name", "rec-test"])
+    assert result.exit_code == 0, result.output
+    assert "Could not auto-export" in result.output
+    assert "boom" in result.output
+    assert "Recording complete" in result.output
 
 
 # ---------------------------------------------------------------------------
