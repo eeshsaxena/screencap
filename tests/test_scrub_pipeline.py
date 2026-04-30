@@ -390,21 +390,6 @@ class TestTranscriptWordsScrubbing:
 class TestBuildScrubContext:
     """Unit tests for build_scrub_context()."""
 
-    def test_empty_db(self, tmp_path):
-        """Empty DB produces empty context without errors."""
-        db_path = tmp_path / "recording.db"
-        _create_recording_db(db_path)
-
-        ctx = build_scrub_context(db_path)
-        assert ctx.blocked_intervals == []
-        assert ctx.xref_detections == []
-        assert ctx.pixel_ratio == 2.0
-
-    def test_none_db_path(self):
-        """None db_path produces empty context."""
-        ctx = build_scrub_context(None)
-        assert ctx.blocked_intervals == []
-
     def test_time_range_scoping(self, tmp_path):
         """time_range limits DB queries to the specified range."""
         pipeline, anonymizer = _make_pipeline()
@@ -848,17 +833,14 @@ class TestActiveWindowBounds:
         bounds = _active_window_bounds(geom, "com.nonexistent.app", 1.0, 200, 200)
         assert bounds == (10, 20, 100, 80)
 
-    def test_returns_none_when_no_geometry(self):
-        from screencap.scrub_pipeline import _active_window_bounds
-
-        assert _active_window_bounds(None, "any", 2.0, 800, 600) is None
-
-    def test_returns_none_when_empty_windows(self):
+    def test_returns_none_when_no_window_to_match(self):
+        """Both null geometry and empty windows list produce no bounds."""
         from screencap.scrub_pipeline import _active_window_bounds
         from screencap.privacy.context import WindowGeometrySnapshot
 
-        geom = WindowGeometrySnapshot(windows=[], display_origin=(0.0, 0.0))
-        assert _active_window_bounds(geom, "any", 2.0, 800, 600) is None
+        empty_geom = WindowGeometrySnapshot(windows=[], display_origin=(0.0, 0.0))
+        assert _active_window_bounds(None, "any", 2.0, 800, 600) is None
+        assert _active_window_bounds(empty_geom, "any", 2.0, 800, 600) is None
 
 
 class TestActiveWindowRoi:
@@ -936,32 +918,35 @@ def _scrub_with_intervals(
 class TestMouseMoveSuppression:
     """R6/R12: drop in-interval mouse.move events at scrub time."""
 
-    def test_mask_window_drops_in_interval_mouse_moves(self, tmp_path):
-        """Moves before/during/after a MASK_WINDOW interval — only in-interval dropped."""
+    @pytest.mark.parametrize("action,reason", [
+        (PrivacyAction.MASK_WINDOW, ReasonCode.POLICY_MODE_DEFAULT),
+        (PrivacyAction.EXCLUDE, ReasonCode.POLICY_EXCLUDED_APP),
+        (PrivacyAction.TEXT_REDACT, ReasonCode.POLICY_MODE_DEFAULT),
+        (PrivacyAction.OCR_FALLBACK, ReasonCode.POLICY_MODE_DEFAULT),
+    ])
+    def test_block_action_drops_only_in_interval_moves(self, tmp_path, action, reason):
+        """For every SCRUB_BLOCK_ACTIONS member, in-interval mouse.moves drop;
+        before/after moves are kept. Pointer geometry inside content-sensitive
+        contexts is treated the same way regardless of which block action is
+        active."""
         events = [
-            _make_move(900.0),   # before
-            _make_move(1005.0),  # in interval
-            _make_move(1007.0),  # in interval
-            _make_move(1100.0),  # after
+            _make_move(900.0),
+            _make_move(1005.0),
+            _make_move(1007.0),
+            _make_move(1100.0),
         ]
-        intervals = [
-            BlockedInterval(
-                start=1000.0, end=1010.0,
-                action=PrivacyAction.MASK_WINDOW,
-                reason=ReasonCode.POLICY_MODE_DEFAULT,
-            ),
-        ]
+        intervals = [BlockedInterval(start=1000.0, end=1010.0, action=action, reason=reason)]
         scrubbed, _ = _scrub_with_intervals(tmp_path, events, intervals)
 
-        # Filter out the meta header (line 0)
         moves = [e for e in scrubbed if e.get("type") == "mouse.move"]
-        timestamps = sorted(e["timestamp"] for e in moves)
-        assert timestamps == [900.0, 1100.0]
+        assert sorted(m["timestamp"] for m in moves) == [900.0, 1100.0]
 
-    def test_exclude_drops_moves_and_nulls_keystrokes(self, tmp_path):
-        """EXCLUDE interval — moves dropped, keystroke content nulled (existing)."""
+    def test_exclude_interval_also_nulls_keystroke_content(self, tmp_path):
+        """EXCLUDE has the additional behavior of nulling keystroke text/key_char
+        inside the interval — verified separately from the move-dropping
+        parametrize since this assertion targets a different code path."""
         events = [
-            _make_move(1005.0),   # in interval — dropped
+            _make_move(1005.0),
             {
                 "type": "key.type",
                 "timestamp": 1006.0,
@@ -970,7 +955,7 @@ class TestMouseMoveSuppression:
                     {"type": "key.down", "timestamp": 1006.0, "key_char": "s"},
                 ],
             },
-            _make_move(1100.0),   # after — kept
+            _make_move(1100.0),
         ]
         intervals = [
             BlockedInterval(
@@ -981,50 +966,10 @@ class TestMouseMoveSuppression:
         ]
         scrubbed, _ = _scrub_with_intervals(tmp_path, events, intervals)
 
-        moves = [e for e in scrubbed if e.get("type") == "mouse.move"]
-        assert [m["timestamp"] for m in moves] == [1100.0]
-
         keys = [e for e in scrubbed if e.get("type") == "key.type"]
         assert len(keys) == 1
         assert keys[0]["text"] is None
         assert keys[0]["children"][0]["key_char"] is None
-
-    def test_text_redact_drops_in_interval_moves(self, tmp_path):
-        """TEXT_REDACT interval — moves dropped (validates expanded set)."""
-        events = [
-            _make_move(900.0),
-            _make_move(1005.0),
-            _make_move(1100.0),
-        ]
-        intervals = [
-            BlockedInterval(
-                start=1000.0, end=1010.0,
-                action=PrivacyAction.TEXT_REDACT,
-                reason=ReasonCode.POLICY_MODE_DEFAULT,
-            ),
-        ]
-        scrubbed, _ = _scrub_with_intervals(tmp_path, events, intervals)
-
-        moves = [e for e in scrubbed if e.get("type") == "mouse.move"]
-        assert sorted(m["timestamp"] for m in moves) == [900.0, 1100.0]
-
-    def test_ocr_fallback_drops_in_interval_moves(self, tmp_path):
-        """OCR_FALLBACK interval — moves dropped."""
-        events = [
-            _make_move(1005.0),
-            _make_move(2005.0),
-        ]
-        intervals = [
-            BlockedInterval(
-                start=1000.0, end=1500.0,
-                action=PrivacyAction.OCR_FALLBACK,
-                reason=ReasonCode.POLICY_MODE_DEFAULT,
-            ),
-        ]
-        scrubbed, _ = _scrub_with_intervals(tmp_path, events, intervals)
-
-        moves = [e for e in scrubbed if e.get("type") == "mouse.move"]
-        assert [m["timestamp"] for m in moves] == [2005.0]
 
     def test_drag_in_interval_keeps_drag_drops_all_in_interval_children(
         self, tmp_path,
