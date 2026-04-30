@@ -28,50 +28,36 @@ from screencap.namer import (
 
 
 class TestValidateSlug:
-    def test_valid_simple(self):
-        assert validate_slug("hello") is True
+    @pytest.mark.parametrize(
+        "slug",
+        [
+            "hello",
+            "stripe-webhook-debugging",
+            "fix-bug-42",
+            "abc",  # min length
+            "123",  # all numbers
+            "42-fix",  # number prefix
+        ],
+    )
+    def test_valid(self, slug):
+        assert validate_slug(slug) is True
 
-    def test_valid_kebab(self):
-        assert validate_slug("stripe-webhook-debugging") is True
-
-    def test_valid_with_numbers(self):
-        assert validate_slug("fix-bug-42") is True
-
-    def test_valid_min_length(self):
-        assert validate_slug("abc") is True
-
-    def test_invalid_too_short(self):
-        assert validate_slug("ab") is False
-
-    def test_invalid_too_long(self):
-        assert validate_slug("a" * 61) is False
-
-    def test_invalid_uppercase(self):
-        assert validate_slug("Hello-World") is False
-
-    def test_invalid_leading_hyphen(self):
-        assert validate_slug("-leading") is False
-
-    def test_invalid_trailing_hyphen(self):
-        assert validate_slug("trailing-") is False
-
-    def test_invalid_double_hyphen(self):
-        assert validate_slug("double--hyphen") is False
-
-    def test_invalid_underscore(self):
-        assert validate_slug("has_underscore") is False
-
-    def test_invalid_spaces(self):
-        assert validate_slug("has space") is False
-
-    def test_invalid_not_string(self):
-        assert validate_slug(123) is False
-
-    def test_valid_all_numbers(self):
-        assert validate_slug("123") is True
-
-    def test_valid_number_prefix(self):
-        assert validate_slug("42-fix") is True
+    @pytest.mark.parametrize(
+        "slug",
+        [
+            "ab",  # too short
+            "a" * 61,  # too long
+            "Hello-World",  # uppercase
+            "-leading",
+            "trailing-",
+            "double--hyphen",
+            "has_underscore",
+            "has space",
+            123,  # not a string
+        ],
+    )
+    def test_invalid(self, slug):
+        assert validate_slug(slug) is False
 
 
 # ---------------------------------------------------------------------------
