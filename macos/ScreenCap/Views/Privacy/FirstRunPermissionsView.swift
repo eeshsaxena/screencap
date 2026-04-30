@@ -41,11 +41,27 @@ struct FirstRunPermissionsView: View {
                 )
             }
 
-            HStack {
-                Spacer()
-                Button("Done") { isPresented = false }
-                    .keyboardShortcut(.defaultAction)
-                    .disabled(!permissions.allRequiredGranted)
+            // macOS caches TCC state per-process — once you grant a
+            // permission in System Settings, this app doesn't see the change
+            // until it relaunches. Standard Mac-app pattern (Loom, 1Password,
+            // …) is an explicit Quit & Relaunch.
+            VStack(alignment: .leading, spacing: 8) {
+                Text("After granting permissions in System Settings, quit and relaunch ScreenCap to apply.")
+                    .font(.caption)
+                    .foregroundStyle(.secondary)
+
+                HStack {
+                    Button("Quit & Relaunch") {
+                        permissions.relaunchApplication()
+                    }
+                    .buttonStyle(.bordered)
+
+                    Spacer()
+
+                    Button("Done") { isPresented = false }
+                        .keyboardShortcut(.defaultAction)
+                        .disabled(!permissions.allRequiredGranted)
+                }
             }
         }
         .padding(28)

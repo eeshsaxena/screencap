@@ -130,23 +130,28 @@ final class PermissionController: ObservableObject {
 
     /// Recomputes all four permission statuses without prompting.
     ///
-    /// Each check spawns a short-lived helper subprocess (this same .app with
-    /// `--check-permission <name>`) so it gets a fresh TCC query. The
-    /// in-process variants of these APIs cache the value at process start
-    /// and ignore any grant the user makes afterwards — that's why our
-    /// previous walkthrough kept showing red dots even after the user
-    /// granted in System Settings.
+    /// These APIs cache their result at process launch — a grant made after
+    /// launch does NOT show up here until the next process start. The walkthrough
+    /// surfaces a "Quit & Relaunch" button to drive the restart explicitly.
     func refresh() {
-        Task { @MainActor in
-            async let sr = Self.checkViaSubprocess("screen_recording")
-            async let ax = Self.checkViaSubprocess("accessibility")
-            async let im = Self.checkViaSubprocess("input_monitoring")
-            async let mic = Self.checkViaSubprocess("microphone")
-            let (s, a, i, m) = await (sr, ax, im, mic)
-            self.screenRecording = s
-            self.accessibility = a
-            self.inputMonitoring = i
-            self.microphone = m
+        screenRecording = Self.checkScreenRecording()
+        accessibility = Self.checkAccessibility()
+        inputMonitoring = Self.checkInputMonitoring()
+        microphone = Self.checkMicrophone()
+    }
+
+    /// Spawns a fresh ScreenCap.app via LaunchServices (preserves TCC bundle
+    /// identity) and quits the current process so the new instance reads the
+    /// latest TCC state at launch. Standard Mac-app pattern after a permission
+    /// grant — Loom, 1Password, etc. all do this.
+    func relaunchApplication() {
+        let bundleURL = Bundle.main.bundleURL
+        let configuration = NSWorkspace.OpenConfiguration()
+        configuration.createsNewApplicationInstance = true
+        NSWorkspace.shared.openApplication(at: bundleURL, configuration: configuration) { _, _ in
+            DispatchQueue.main.async {
+                NSApp.terminate(nil)
+            }
         }
     }
 
@@ -187,40 +192,36 @@ final class PermissionController: ObservableObject {
         }
     }
 
-    // MARK: - Fresh-process checks
+    // MARK: - Silent in-process checks
+    //
+    // These cache at process start. The walkthrough's `Quit & Relaunch`
+    // button is what gets the user to a fresh process when they've granted
+    // a permission post-launch.
 
-    private struct CheckResult: Decodable { let granted: Bool }
+    private static func checkScreenRecording() -> PermissionStatus {
+        CGPreflightScreenCaptureAccess() ? .granted : .denied
+    }
 
-    /// Spawns this binary with `--check-permission <name>` and parses the JSON
-    /// it prints. Falls back to `.notDetermined` on any failure so the UI
-    /// never wedges into a wrong-color state because of a transient launch
-    /// problem.
-    private static func checkViaSubprocess(_ permissionName: String) async -> PermissionStatus {
-        guard let executablePath = Bundle.main.executablePath else { return .notDetermined }
-        return await withCheckedContinuation { (continuation: CheckedContinuation<PermissionStatus, Never>) in
-            DispatchQueue.global(qos: .userInitiated).async {
-                let process = Process()
-                process.executableURL = URL(fileURLWithPath: executablePath)
-                process.arguments = ["--check-permission", permissionName]
-                let stdout = Pipe()
-                process.standardOutput = stdout
-                process.standardError = Pipe()
-                do {
-                    try process.run()
-                } catch {
-                    continuation.resume(returning: .notDetermined)
-                    return
-                }
-                process.waitUntilExit()
-                let data = (try? stdout.fileHandleForReading.readToEnd()) ?? Data()
-                guard process.terminationStatus == 0,
-                      let result = try? JSONDecoder().decode(CheckResult.self, from: data)
-                else {
-                    continuation.resume(returning: .notDetermined)
-                    return
-                }
-                continuation.resume(returning: result.granted ? .granted : .denied)
-            }
+    private static func checkAccessibility() -> PermissionStatus {
+        let options: NSDictionary = [kAXTrustedCheckOptionPrompt.takeUnretainedValue() as String: false]
+        return AXIsProcessTrustedWithOptions(options) ? .granted : .denied
+    }
+
+    private static func checkInputMonitoring() -> PermissionStatus {
+        switch IOHIDCheckAccess(kIOHIDRequestTypeListenEvent) {
+        case kIOHIDAccessTypeGranted: return .granted
+        case kIOHIDAccessTypeDenied:  return .denied
+        case kIOHIDAccessTypeUnknown: return .notDetermined
+        default:                      return .notDetermined
+        }
+    }
+
+    private static func checkMicrophone() -> PermissionStatus {
+        switch AVCaptureDevice.authorizationStatus(for: .audio) {
+        case .authorized:        return .granted
+        case .denied, .restricted: return .denied
+        case .notDetermined:     return .notDetermined
+        @unknown default:        return .notDetermined
         }
     }
 }
