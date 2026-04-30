@@ -2729,7 +2729,13 @@ def _setup_network_capture(
     )
     reader_thread = threading.Thread(
         target=_network_event_reader_loop,
-        args=(proxy_out_q, network_write_q, terminate_processing, reader_started),
+        args=(
+            proxy_out_q,
+            network_write_q,
+            terminate_processing,
+            reader_started,
+            proxy_proc,
+        ),
         name="network_event_reader",
         daemon=True,
     )
@@ -2755,6 +2761,7 @@ def _network_event_reader_loop(
     network_write_q: sq.SynchronizedQueue,
     terminate_event,  # multiprocessing.Event
     started_event: threading.Event,
+    proxy_proc=None,  # multiprocessing.Process | None — for liveness-bound drain
 ) -> None:
     """Drain the proxy mp.Queue into ``network_write_q``.
 
@@ -2836,22 +2843,34 @@ def _network_event_reader_loop(
             continue
         _process_event(event)
 
-    # Drain phase: terminate is set, but the proxy mp.Process may still
-    # be flushing its final events into out_q (the engine teardown
-    # restores system proxy first, THEN terminates the proxy). Without
-    # this, events the addon already pushed but the reader hasn't
-    # consumed get silently dropped — the writer's
-    # `not write_q.empty()` drain guarantee is upstream of the bottleneck.
-    # mp.Queue.empty() is unreliable across processes, so use empty-poll
-    # counting: bail out after `_DRAIN_EMPTY_THRESHOLD` consecutive empty
-    # gets (~250ms of true emptiness).
+    # Drain phase: terminate is set, but the proxy mp.Process is STILL
+    # ALIVE because the engine teardown restores system proxy first
+    # (osascript admin auth, can take seconds) before terminating it.
+    # The addon's done() hook emits final events (notably
+    # NetworkTunneledEvent — one per observed pinned host) AFTER
+    # SIGTERM reaches mitmproxy, which only happens later in
+    # _teardown_network_capture's step (3). A fixed 250ms empty-poll
+    # timeout would exit the reader before those final events land,
+    # silently dropping them.
+    #
+    # Correct loop: keep reading while the proxy is alive. Once the
+    # OS reports the proxy exited, do a tail drain (5 empty polls,
+    # ~250ms) to catch any events still in flight on the cross-process
+    # mp.Queue. ``proxy_proc=None`` (test path / legacy callers) falls
+    # back to the timeout-only behavior.
     _DRAIN_EMPTY_THRESHOLD = 5
     empty_polls = 0
-    while empty_polls < _DRAIN_EMPTY_THRESHOLD:
+    while True:
         try:
             event = out_q.get(timeout=0.05)
         except queue.Empty:
             empty_polls += 1
+            # Exit only when the proxy has actually exited AND we've
+            # observed N consecutive empty polls. The proxy_proc==None
+            # path keeps the legacy timeout-only contract.
+            proxy_dead = proxy_proc is None or not proxy_proc.is_alive()
+            if proxy_dead and empty_polls >= _DRAIN_EMPTY_THRESHOLD:
+                break
             continue
         empty_polls = 0
         _process_event(event)

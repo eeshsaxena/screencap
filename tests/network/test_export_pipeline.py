@@ -27,7 +27,8 @@ from unittest.mock import patch
 
 import pytest
 
-from screencap.engine.db import create_db, crud
+from screencap.engine.db import create_db, crud, get_session_for_path
+from screencap.engine.db.models import Recording
 from screencap.engine.events import (
     NetworkRequestEvent,
     NetworkRequestExportEvent,
@@ -43,6 +44,7 @@ from screencap.network.export_pipeline import (
     KekUnavailableError,
     NetworkScrubPipeline,
     recording_has_encrypted_bodies,
+    recording_has_wrapped_dek,
 )
 
 # ---------------------------------------------------------------------------
@@ -381,9 +383,16 @@ class TestMetaRowMissingRaises:
 
 
 class TestRecordingHasEncryptedBodies:
-    def test_returns_true_when_meta_row_exists(self, tmp_path):
-        db_path, recording_id, _kek, _dek = _setup_recording(tmp_path)
-        assert recording_has_encrypted_bodies(db_path, recording_id) is True
+    """Regression for PR #157 review P2: meta-row presence is NOT a
+    correct proxy for 'has encrypted bodies'. Pre-flight writes the
+    meta row for every V1.5 --network recording, so a metadata-only
+    capture (allowlist-miss) was incorrectly reported as encrypted —
+    triggering spurious Keychain prompts at export and blocking
+    `network remove-kek`.
+
+    The fix queries actual ciphertext rows. The wrapped-DEK presence
+    question is now ``recording_has_wrapped_dek``.
+    """
 
     def test_returns_false_when_meta_row_absent(self, tmp_path):
         db_path = str(tmp_path / "recording.db")
@@ -405,6 +414,62 @@ class TestRecordingHasEncryptedBodies:
             engine.dispose()
 
         assert recording_has_encrypted_bodies(db_path, recording_id) is False
+
+    def test_returns_false_when_meta_present_but_no_ciphertext_rows(
+        self, tmp_path,
+    ):
+        """V1.5 metadata-only recording: the meta row exists (pre-flight
+        wrote it) but no flow matched the body-capture allowlist, so
+        every ``body_ciphertext`` is NULL. KEK access is unnecessary
+        at export time.
+        """
+        db_path, recording_id, _kek, _dek = _setup_recording(tmp_path)
+        # Insert a metadata-only row (no body_ciphertext).
+        session = get_session_for_path(db_path)
+        try:
+            rec = session.query(Recording).first()
+            crud.insert_network_event(session, rec, {
+                "kind": "request",
+                "flow_id": "f1",
+                "method": "GET",
+                "url": "https://random.example.com/",
+                "host": "random.example.com",
+                "timestamp": 1.0,
+                "timestamp_ns": 1_000_000_000,
+            })
+            crud.flush_buffers(session)
+            session.commit()
+        finally:
+            session.close()
+        assert recording_has_encrypted_bodies(db_path, recording_id) is False
+        # The wrapped DEK is on disk regardless — that's a separate question.
+        assert recording_has_wrapped_dek(db_path, recording_id) is True
+
+    def test_returns_true_when_at_least_one_ciphertext_row(self, tmp_path):
+        """Recording with at least one row carrying ciphertext requires
+        KEK access at export time and blocks remove-kek."""
+        db_path, recording_id, _kek, _dek = _setup_recording(tmp_path)
+        session = get_session_for_path(db_path)
+        try:
+            rec = session.query(Recording).first()
+            crud.insert_network_event(session, rec, {
+                "kind": "request",
+                "flow_id": "f1",
+                "method": "POST",
+                "url": "https://api.github.com/x",
+                "host": "api.github.com",
+                "body_ciphertext": b"\xde\xad\xbe\xef" * 4,
+                "body_nonce": b"\x01" * 12,
+                "body_aad": b"some-aad",
+                "timestamp": 1.0,
+                "timestamp_ns": 1_000_000_000,
+            })
+            crud.flush_buffers(session)
+            session.commit()
+        finally:
+            session.close()
+        assert recording_has_encrypted_bodies(db_path, recording_id) is True
+        assert recording_has_wrapped_dek(db_path, recording_id) is True
 
 
 # ---------------------------------------------------------------------------

@@ -1349,9 +1349,18 @@ def _export_one(recording_dir, output_path, exclude_moves, err_console, privacy_
 
     meta = build_export_metadata(exclude_moves)
 
-    # V1.5: per-recording pipeline construction. The cheap meta-row
-    # check skips the Keychain prompt for V1-vintage recordings.
+    # V1.5: per-recording pipeline construction. The cheap ciphertext
+    # check skips the Keychain prompt for V1-vintage AND for V1.5
+    # metadata-only recordings (allowlist-miss).
     network_scrub_pipeline = None
+    # When pipeline construction fails defensively (the broad-Exception
+    # branch below), we MUST NOT also pass include_network=True with a
+    # null pipeline — capture-side events with body_ciphertext bytes
+    # would reach Pydantic JSON serialization, violating the V1.5
+    # invariant that ciphertext can never reach JSONL by construction.
+    # Track the safe-to-emit flag separately so the broad-Exception
+    # path can degrade by suppressing network rows entirely.
+    include_network = True
     db_path = str(Path(recording_dir) / "recording.db")
     try:
         if Path(db_path).exists():
@@ -1398,11 +1407,21 @@ def _export_one(recording_dir, output_path, exclude_moves, err_console, privacy_
         # the actionable message. Fall through to return -1.
         return -1
     except Exception as e:
-        # Defensive: any unexpected error setting up the pipeline
-        # check should not crash the export. Log + fall through to
-        # the V1 path (no scrub pipeline). KekUnavailableError above
-        # is the fail-loud branch.
-        logger.debug("Skipping network-scrub-pipeline setup: %s", e)
+        # Defensive: any unexpected error setting up the pipeline check
+        # should not crash the export. Drop network rows entirely from
+        # this export (include_network=False) — keeping include_network
+        # true with pipeline=None would feed capture-side events with
+        # raw ciphertext bytes to Pydantic's JSON serializer, violating
+        # the V1.5 schema invariant. KekUnavailableError above is the
+        # fail-loud branch; this is the fail-closed branch for
+        # everything else.
+        logger.debug("Skipping network rows in export: %s", e)
+        err_console.print(
+            "[yellow]Warning:[/yellow] could not set up network scrub "
+            "pipeline; export will omit network events for this "
+            "recording.",
+        )
+        include_network = False
 
     try:
         return export_recording(
@@ -1411,7 +1430,7 @@ def _export_one(recording_dir, output_path, exclude_moves, err_console, privacy_
             exclude_moves,
             metadata=meta,
             privacy_filter=privacy_filter,
-            include_network=True,
+            include_network=include_network,
             network_scrub_pipeline=network_scrub_pipeline,
         )
     except ExportError as e:
@@ -4020,9 +4039,13 @@ def network_remove_kek_cmd(force: bool) -> None:
       and shredding the recordings directory).
 
     Safety check (unless --force):
-        Scans the configured recordings directory for any recording whose
-        DB has a `network_event_meta` row (i.e. would be decryptable today)
-        and refuses to proceed if any are found, listing them.
+        Scans the configured recordings directory for any recording with
+        at least one ``network_event`` row carrying non-NULL
+        ``body_ciphertext`` and refuses to proceed if any are found,
+        listing them. V1.5 metadata-only recordings (where the user
+        only browsed non-allowlisted hosts) have no ciphertext rows
+        and do NOT block removal — those have a wrapped DEK on disk
+        but nothing to decrypt with it.
 
     Limitation: recordings written under `--output <custom-path>` are NOT
     discovered by this scan because we do not track custom output paths
@@ -4032,7 +4055,7 @@ def network_remove_kek_cmd(force: bool) -> None:
     from screencap.catalog import list_recordings
     from screencap.config import get_recordings_dir
     from screencap.engine.db import get_session_for_path
-    from screencap.engine.db.models import NetworkEventMeta
+    from screencap.engine.db.models import NetworkEvent, Recording
     from screencap.network import crypto
 
     encrypted_recordings: list[str] = []
@@ -4046,14 +4069,22 @@ def network_remove_kek_cmd(force: bool) -> None:
         except Exception:
             continue
         try:
-            has_meta = (
-                session.query(NetworkEventMeta).first() is not None
-            )
+            recording_row = session.query(Recording).first()
+            if recording_row is None:
+                has_ciphertext = False
+            else:
+                has_ciphertext = (
+                    session.query(NetworkEvent.id)
+                    .filter(NetworkEvent.recording_id == recording_row.id)
+                    .filter(NetworkEvent.body_ciphertext.isnot(None))
+                    .first()
+                    is not None
+                )
         except Exception:
-            has_meta = False
+            has_ciphertext = False
         finally:
             session.close()
-        if has_meta:
+        if has_ciphertext:
             encrypted_recordings.append(rec.name)
 
     if encrypted_recordings and not force:

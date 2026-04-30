@@ -112,3 +112,96 @@ class TestReaderDrainOnTerminate:
             "reader thread did not exit within drain budget; the empty-poll "
             "exit condition may be broken"
         )
+
+
+class TestReaderDrainBoundedByProxyLiveness:
+    """Regression for PR #157 review P1.
+
+    The 250ms empty-poll drain was too short: ``_teardown_network_capture``
+    restores system proxy FIRST (osascript admin auth, can take seconds)
+    and only then calls ``proxy_proc.terminate()``. The addon's
+    ``done()`` hook emits ``network.tunneled`` events when SIGTERM
+    finally reaches mitmproxy, well after a fixed-duration drain would
+    have exited. Tying the drain exit condition to proxy liveness keeps
+    the reader alive long enough to receive those final events.
+    """
+
+    def test_drain_waits_for_proxy_to_exit_before_giving_up(self):
+        """Reader must NOT exit while proxy_proc.is_alive() returns True.
+
+        Simulates a slow teardown: terminate fires immediately but the
+        proxy reports alive for 300ms (longer than the legacy 250ms
+        budget) before going dead and pushing one final event. The
+        event MUST be forwarded.
+        """
+        out_q: _queue_mod.Queue = _queue_mod.Queue()
+        write_q = MagicMock()
+        terminate_event = threading.Event()
+        started_event = threading.Event()
+
+        # Fake proxy_proc whose is_alive() flips False after a delay.
+        proxy_alive = threading.Event()
+        proxy_alive.set()  # initially alive
+
+        class FakeProxyProc:
+            def is_alive(self_inner):
+                return proxy_alive.is_set()
+
+        proxy_proc = FakeProxyProc()
+
+        thread = threading.Thread(
+            target=_network_event_reader_loop,
+            args=(out_q, write_q, terminate_event, started_event, proxy_proc),
+            daemon=True,
+        )
+        thread.start()
+        assert started_event.wait(timeout=2.0)
+
+        # Terminate immediately; queue stays empty for 400ms (exceeds
+        # the legacy 250ms drain budget).
+        terminate_event.set()
+        time.sleep(0.4)
+        # Reader MUST still be alive — it's waiting on proxy.
+        assert thread.is_alive(), (
+            "reader exited before proxy died; drain is still time-bounded "
+            "and would lose events emitted by addon done() during teardown"
+        )
+
+        # Now simulate the late event from addon done() and proxy exit.
+        late_event = _make_request_event("late-from-done.example.com")
+        out_q.put(late_event)
+        proxy_alive.clear()  # proxy_proc now reports dead
+
+        thread.join(timeout=2.0)
+        assert not thread.is_alive(), "reader did not exit after proxy died"
+
+        forwarded = [call.args[0] for call in write_q.put.call_args_list]
+        forwarded_hosts = [getattr(e, "host", None) for e in forwarded]
+        assert "late-from-done.example.com" in forwarded_hosts, (
+            "late event from addon done() lost — drain exited too early"
+        )
+
+    def test_proxy_proc_none_keeps_legacy_timeout_only_path(self):
+        """Test path / legacy callers pass proxy_proc=None and rely on
+        the 250ms empty-poll budget. Verify that contract still holds.
+        """
+        out_q: _queue_mod.Queue = _queue_mod.Queue()
+        write_q = MagicMock()
+        terminate_event = threading.Event()
+        started_event = threading.Event()
+
+        thread = threading.Thread(
+            target=_network_event_reader_loop,
+            args=(out_q, write_q, terminate_event, started_event, None),
+            daemon=True,
+        )
+        thread.start()
+        assert started_event.wait(timeout=2.0)
+
+        terminate_event.set()
+        thread.join(timeout=1.0)
+        assert not thread.is_alive(), (
+            "proxy_proc=None path must keep the legacy timeout-only "
+            "exit behavior for backward compatibility with tests / "
+            "callers that don't supply a proxy_proc"
+        )

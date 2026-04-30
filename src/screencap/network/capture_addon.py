@@ -608,16 +608,28 @@ class NetworkCapture:
     # ------------------------------------------------------------------
 
     def tls_clienthello(self, data: Any) -> None:
-        """If the SNI is in our runtime-tunnel set, opt-out of MITM."""
+        """If the SNI is in our runtime-tunnel set, opt-out of MITM.
+
+        DNS / SNI hostnames are case-insensitive per RFC 6066, so the
+        membership check MUST lowercase the SNI before comparing —
+        the cache stores lowercased entries (per
+        ``pinned_hosts.load_known_pinned_hosts``). Without this,
+        a client sending ``Pinned.Example.com`` would miss
+        ``pinned.example.com`` in the cache, the addon would attempt
+        MITM, the cert pin would fail, and the persistent cache that
+        Unit 10 added would be defeated for any mixed-case SNI.
+        """
         try:
             sni = data.client_hello.sni
         except AttributeError:
             return
-        if sni and sni in self._runtime_tunnel_hosts:
+        if not sni:
+            return
+        sni_lc = sni.lower()
+        if sni_lc in self._runtime_tunnel_hosts:
             data.ignore_connection = True
             # Mark observed-this-recording so done() emits a
             # network.tunneled event covering the actual tunneled span.
-            sni_lc = sni.lower()
             if sni_lc not in self._observed_tunnel_hosts:
                 self._observed_tunnel_hosts.add(sni_lc)
                 self._tunnel_started_at.setdefault(sni_lc, time.time())

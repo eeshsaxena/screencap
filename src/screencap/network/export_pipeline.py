@@ -349,21 +349,62 @@ class NetworkScrubPipeline:
 
 
 def recording_has_encrypted_bodies(db_path: str, recording_id: int) -> bool:
-    """Return ``True`` iff the recording has a ``network_event_meta`` row.
+    """Return ``True`` iff the recording has at least one row with
+    ``body_ciphertext IS NOT NULL``.
 
     Cheap pre-check used by callers that want to decide between the V1
     metadata-only path (no scrub pipeline) and V1.5 (with pipeline)
     without paying the Keychain prompt cost on V1-vintage recordings.
+
+    **NOT the same as "has a meta row":** ``_setup_network_capture``
+    writes a ``network_event_meta`` row for EVERY V1.5 ``--network``
+    recording (so the addon's encryption path always has a meta row to
+    look up at export time, regardless of whether any flow actually
+    matched the body-capture allowlist). A recording where the user
+    only browsed non-allowlisted hosts has the meta row but every
+    ``body_ciphertext`` is NULL — KEK access is unnecessary at export
+    time, and ``screencap network remove-kek`` should be allowed.
 
     Args:
         db_path: Path to the recording's ``recording.db`` file.
         recording_id: ID of the recording to check.
 
     Returns:
-        ``True`` when a meta row exists for this recording (V1.5
-        recording with at least one encrypted body candidate); ``False``
-        otherwise (V1-vintage, non-network, or V1.5 recording where the
-        proxy crashed before the meta row was inserted).
+        ``True`` when at least one ``network_event`` row for this
+        recording carries non-NULL ciphertext; ``False`` for V1-vintage
+        recordings, non-network captures, V1.5 captures where no flow
+        was body-allowlisted, and V1.5 captures whose proxy crashed
+        before the meta row was inserted.
+    """
+    from sqlalchemy import select  # noqa: PLC0415
+
+    from screencap.engine.db import get_session_for_path  # noqa: PLC0415
+    from screencap.engine.db.models import NetworkEvent  # noqa: PLC0415
+
+    session = get_session_for_path(db_path)
+    try:
+        # Limit 1 — we only care about existence, not count.
+        stmt = (
+            select(NetworkEvent.id)
+            .where(NetworkEvent.recording_id == recording_id)
+            .where(NetworkEvent.body_ciphertext.isnot(None))
+            .limit(1)
+        )
+        return session.execute(stmt).first() is not None
+    finally:
+        session.close()
+
+
+def recording_has_wrapped_dek(db_path: str, recording_id: int) -> bool:
+    """Return ``True`` iff the recording has a ``network_event_meta`` row.
+
+    Distinct from :func:`recording_has_encrypted_bodies`: this is
+    "V1.5-vintage recording" — the meta row was written at pre-flight
+    regardless of whether any flow ever matched the body-capture
+    allowlist. Use this for "do we need to keep the DEK around" /
+    "is this a V1.5 recording at all" questions; use the
+    ciphertext-presence helper for "do we need a Keychain prompt to
+    export this."
     """
     from screencap.engine.db import get_session_for_path  # noqa: PLC0415
     from screencap.engine.db.models import NetworkEventMeta  # noqa: PLC0415
@@ -384,4 +425,5 @@ __all__ = [
     "KekUnavailableError",
     "NetworkScrubPipeline",
     "recording_has_encrypted_bodies",
+    "recording_has_wrapped_dek",
 ]

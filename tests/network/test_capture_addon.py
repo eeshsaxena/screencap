@@ -802,6 +802,38 @@ class TestTlsClienthello:
         capture.tls_clienthello(d)
         assert d.ignore_connection is False
 
+    def test_mixed_case_sni_matches_lowercased_cache(self):
+        """V1.5 P2 fix: SNI is case-insensitive per RFC 6066. The
+        persistent pinned-host cache stores lowercased entries (see
+        pinned_hosts.load_known_pinned_hosts). The membership check
+        in tls_clienthello must lowercase the SNI before comparing,
+        or the cache that's supposed to prevent the per-recording
+        first-failure is defeated for any client that sends mixed-case
+        SNI (Pinned.Example.com would miss pinned.example.com).
+        """
+        capture, _ = _make_capture()
+        capture._runtime_tunnel_hosts.add("pinned.example.com")
+
+        @dataclass
+        class FakeClientHello:
+            sni: str = "Pinned.Example.COM"  # mixed case
+
+        @dataclass
+        class FakeData:
+            client_hello: FakeClientHello = field(default_factory=FakeClientHello)
+            ignore_connection: bool = False
+
+        d = FakeData()
+        capture.tls_clienthello(d)
+        assert d.ignore_connection is True, (
+            "mixed-case SNI must still match the lowercased cache; "
+            "otherwise the persistent pinned-host cache breaks"
+        )
+        # The observed-set entry is also lowercased so done() emits
+        # a single network.tunneled regardless of SNI casing.
+        assert "pinned.example.com" in capture._observed_tunnel_hosts
+        assert "Pinned.Example.COM" not in capture._observed_tunnel_hosts
+
     def test_observed_tunnel_hosts_records_only_seen(self):
         """V1.5 P2 #4: ``_observed_tunnel_hosts`` must NOT be seeded
         from the persistent cache. Only hosts whose tunnel was actually

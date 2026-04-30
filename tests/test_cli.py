@@ -914,6 +914,56 @@ def test_export_kek_unavailable_fails_loud(tmp_path, monkeypatch):
     assert "screencap network uninstall" in flattened
 
 
+def test_export_pipeline_setup_unexpected_error_drops_network_rows(
+    tmp_path, monkeypatch,
+):
+    """When pipeline construction raises something other than
+    KekUnavailableError (defensive fallback path), CLI export must
+    DROP network rows from the output rather than feed unscrubbed
+    capture-side events with body_ciphertext bytes to Pydantic's JSON
+    serializer.
+
+    Regression for PR #157 review P1: previously the broad-Exception
+    branch fell through with include_network=True and pipeline=None,
+    which violated the V1.5 schema invariant 'ciphertext can never
+    reach JSONL by construction.' The fix is to set
+    include_network=False on that branch and warn the user.
+    """
+    rec_dir = tmp_path / "recordings"
+    _create_v15_export_db(rec_dir / "v15-rec")
+    monkeypatch.setenv("SCREENCAP_RECORDINGS_DIR", str(rec_dir))
+
+    runner = CliRunner()
+
+    with (
+        mock.patch(
+            "screencap.network.export_pipeline.NetworkScrubPipeline",
+            side_effect=RuntimeError("simulated unexpected pipeline error"),
+        ),
+        mock.patch(
+            "screencap.exporter.export_recording", return_value=0,
+        ) as mock_export,
+    ):
+        result = runner.invoke(cli, ["export", "v15-rec"])
+
+    # The export still runs (don't crash on unexpected pipeline
+    # errors) — but it MUST NOT include network rows.
+    assert result.exit_code == 0, result.output
+    assert mock_export.called
+    kwargs = mock_export.call_args.kwargs
+    assert kwargs.get("include_network") is False, (
+        "broad-Exception fallback must drop network rows entirely; "
+        "leaving include_network=True with pipeline=None feeds "
+        "ciphertext bytes to the JSONL writer"
+    )
+    assert kwargs.get("network_scrub_pipeline") is None
+    # User sees a yellow warning so they know network events were
+    # silently omitted.
+    flattened = " ".join(result.output.split())
+    assert "Warning" in flattened
+    assert "omit network events" in flattened
+
+
 # --- upload auto-export tests ---
 
 
@@ -1573,8 +1623,21 @@ class TestNetworkCommandGroup:
 class TestNetworkRemoveKekCommand:
     """V1.5 surface: `screencap network remove-kek` + safety check."""
 
-    def _make_recording_with_meta(self, recordings_dir, name: str) -> None:
-        """Create a recording dir with a recording.db that has a network_event_meta row."""
+    def _make_recording(
+        self,
+        recordings_dir,
+        name: str,
+        *,
+        with_meta: bool = True,
+        with_ciphertext: bool = True,
+    ) -> None:
+        """Create a recording dir with a recording.db.
+
+        ``with_meta``: insert a network_event_meta row (V1.5 vintage).
+        ``with_ciphertext``: insert a network_event row with non-NULL
+        body_ciphertext (must be True to block remove-kek per the
+        post-PR-#157 ciphertext-presence semantics).
+        """
         from screencap.engine.db import (
             create_db,
             crud,
@@ -1584,7 +1647,6 @@ class TestNetworkRemoveKekCommand:
         rec_dir = recordings_dir / name
         rec_dir.mkdir(parents=True)
         db_path = rec_dir / "recording.db"
-        # create_db writes a fresh schema. Then insert a recording row + meta.
         create_db(str(db_path))
         session = get_session_for_path(str(db_path))
         try:
@@ -1595,12 +1657,28 @@ class TestNetworkRemoveKekCommand:
             )
             session.add(rec)
             session.commit()
-            crud.insert_network_event_meta(
-                session,
-                recording_id=rec.id,
-                dek_wrapped=b"\x00" * 32,
-                dek_nonce=b"\x00" * 12,
-            )
+            if with_meta:
+                crud.insert_network_event_meta(
+                    session,
+                    recording_id=rec.id,
+                    dek_wrapped=b"\x00" * 32,
+                    dek_nonce=b"\x00" * 12,
+                )
+            if with_ciphertext:
+                crud.insert_network_event(session, rec, {
+                    "kind": "request",
+                    "flow_id": "f1",
+                    "method": "POST",
+                    "url": "https://api.github.com/x",
+                    "host": "api.github.com",
+                    "body_ciphertext": b"\xde\xad\xbe\xef" * 4,
+                    "body_nonce": b"\x01" * 12,
+                    "body_aad": b"some-aad",
+                    "timestamp": 1.0,
+                    "timestamp_ns": 1_000_000_000,
+                })
+                crud.flush_buffers(session)
+                session.commit()
         finally:
             session.close()
 
@@ -1623,7 +1701,7 @@ class TestNetworkRemoveKekCommand:
         recordings_dir = tmp_path / "recordings"
         recordings_dir.mkdir()
         monkeypatch.setenv("SCREENCAP_RECORDINGS_DIR", str(recordings_dir))
-        self._make_recording_with_meta(recordings_dir, "rec-encrypted")
+        self._make_recording(recordings_dir, "rec-encrypted")
 
         runner = CliRunner()
         with _patch("keyring.delete_password") as delete_mock:
@@ -1640,7 +1718,7 @@ class TestNetworkRemoveKekCommand:
         recordings_dir = tmp_path / "recordings"
         recordings_dir.mkdir()
         monkeypatch.setenv("SCREENCAP_RECORDINGS_DIR", str(recordings_dir))
-        self._make_recording_with_meta(recordings_dir, "rec-encrypted")
+        self._make_recording(recordings_dir, "rec-encrypted")
 
         runner = CliRunner()
         with _patch("keyring.delete_password") as delete_mock:
@@ -1648,6 +1726,40 @@ class TestNetworkRemoveKekCommand:
         assert result.exit_code == 0
         assert "--force given" in result.output
         delete_mock.assert_called_once()
+
+    def test_remove_kek_does_not_block_metadata_only_recording(
+        self, tmp_path, monkeypatch,
+    ):
+        """V1.5 P2 fix: a recording where the user only browsed
+        non-allowlisted hosts has a network_event_meta row (pre-flight
+        always inserts one) but every body_ciphertext is NULL. Such a
+        recording must NOT block ``network remove-kek`` — the wrapped
+        DEK on disk is decryption-irrelevant.
+
+        Before this fix, the safety scan blocked remove-kek for ANY
+        V1.5 --network recording, regardless of whether ciphertext was
+        actually persisted.
+        """
+        from unittest.mock import patch as _patch
+
+        recordings_dir = tmp_path / "recordings"
+        recordings_dir.mkdir()
+        monkeypatch.setenv("SCREENCAP_RECORDINGS_DIR", str(recordings_dir))
+        # V1.5 metadata-only: meta row present, NO ciphertext rows.
+        self._make_recording(
+            recordings_dir,
+            "rec-metadata-only",
+            with_meta=True,
+            with_ciphertext=False,
+        )
+
+        runner = CliRunner()
+        with _patch("keyring.delete_password") as delete_mock:
+            result = runner.invoke(cli, ["network", "remove-kek"])
+        assert result.exit_code == 0, result.output
+        # The deletion DID proceed — no encrypted bodies exist on disk.
+        delete_mock.assert_called_once()
+        assert "Refusing to delete KEK" not in result.output
 
     def test_remove_kek_idempotent_when_kek_absent(self, tmp_path, monkeypatch):
         """No KEK in keychain → still exits 0 (idempotent)."""
