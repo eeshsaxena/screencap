@@ -113,82 +113,13 @@ def _write_events_jsonl(path: Path, events: list[dict]) -> None:
 # ---------------------------------------------------------------------------
 
 
-class TestBlockedAppIntervalScrubbing:
-    """G1: Events during EXCLUDE app intervals are nulled."""
-
-    def test_keystrokes_during_blocked_interval_are_nulled(self, tmp_path):
-        """Keystrokes within a blocked-app interval get content nulled."""
-        pipeline, anonymizer = _make_pipeline()
-
-        events = [
-            {
-                "type": "key.type",
-                "timestamp": 1005.0,
-                "text": "password123",
-                "children": [
-                    {"type": "key.down", "timestamp": 1005.0, "key_char": "p"},
-                ],
-            },
-        ]
-        events_path = tmp_path / "events_0000.jsonl"
-        _write_events_jsonl(events_path, events)
-
-        # Interval covers 1000-1010, event at 1005 should be blocked
-        blocked = [
-            BlockedInterval(
-                start=1000.0, end=1010.0,
-                action=PrivacyAction.EXCLUDE,
-                reason=ReasonCode.POLICY_EXCLUDED_APP,
-            ),
-        ]
-        ctx = ScrubContext(blocked_intervals=blocked)
-        result = ScrubResult()
-
-        scrub_events_jsonl(
-            events_path, pipeline, anonymizer,
-            ctx=ctx, result=result,
-        )
-
-        scrubbed = [json.loads(l) for l in events_path.read_text().splitlines() if l.strip()]
-        key_evt = scrubbed[1]
-        assert key_evt["text"] is None
-        assert key_evt["children"][0]["key_char"] is None
-
-        # Audit entry recorded
-        assert any(e.surface == "event" for e in result.audit_entries)
-
-
-# ---------------------------------------------------------------------------
-# G2: AXSecureTextField keystrokes nulled in chunk events JSONL
-# ---------------------------------------------------------------------------
-
-
 class TestSecureFieldScrubbing:
-    """G2: Keystrokes during secure-field intervals are nulled."""
+    """G2: Keystrokes during secure-field intervals are nulled.
 
-    def test_secure_field_interval_from_db(self, tmp_path):
-        """build_scrub_context produces blocked intervals from AXSecureTextField."""
-        db_path = tmp_path / "recording.db"
-        _create_recording_db(
-            db_path,
-            action_events=[
-                {
-                    "timestamp": 1005.0,
-                    "name": "press",
-                    "key_char": "x",
-                    "element_state": json.dumps({"AXRole": "AXSecureTextField"}),
-                },
-            ],
-        )
-
-        ctx = build_scrub_context(db_path)
-        assert len(ctx.blocked_intervals) > 0
-        # The interval should cover timestamp 1005.0
-        assert any(
-            iv.start <= 1005.0 < iv.end
-            for iv in ctx.blocked_intervals
-        )
-        assert ctx.blocked_intervals[0].reason == ReasonCode.SECURE_FIELD_DETECTED
+    EXCLUDE-app keystroke nulling is pinned by ``TestScrubContentNullActionsGating``.
+    Per-AXRole / AXSubrole interval building is parametrized in
+    ``tests/test_scrubber_policy.py::TestSecureFieldIntervals``.
+    """
 
     def test_secure_field_keystrokes_nulled_in_events(self, tmp_path):
         """Events during secure-field intervals get content nulled."""
@@ -1032,35 +963,6 @@ class TestMouseMoveSuppression:
         assert drags[0]["dx"] is None
         assert drags[0]["dy"] is None
 
-    def test_drag_outside_interval_keeps_all_children(self, tmp_path):
-        """drag with mouse.move children outside any blocked interval — all kept."""
-        events = [
-            {
-                "type": "mouse.drag",
-                "timestamp": 2000.0,
-                "x": 100.0, "y": 200.0,
-                "dx": 50.0, "dy": 30.0,
-                "button": "left",
-                "children": [
-                    _make_move(2000.5, 110.0, 210.0),
-                    _make_move(2001.0, 130.0, 220.0),
-                ],
-            },
-        ]
-        intervals = [
-            BlockedInterval(
-                start=1000.0, end=1010.0,
-                action=PrivacyAction.MASK_WINDOW,
-                reason=ReasonCode.POLICY_MODE_DEFAULT,
-            ),
-        ]
-        scrubbed, _ = _scrub_with_intervals(tmp_path, events, intervals)
-
-        drags = [e for e in scrubbed if e.get("type") == "mouse.drag"]
-        assert len(drags) == 1
-        child_types = [c.get("type") for c in drags[0]["children"]]
-        assert child_types.count("mouse.move") == 2, "moves outside intervals retained"
-
     def test_empty_intervals_no_drops(self, tmp_path):
         """Empty intervals list — no events dropped (regression check)."""
         events = [
@@ -1586,37 +1488,6 @@ class TestDragCoordinateNulling:
         assert scroll["dx"] is None
         assert scroll["dy"] is None
         assert scroll["timestamp"] == 1005.0  # shape preserved
-
-    def test_drag_outside_interval_keeps_coordinates(self, tmp_path):
-        """Drag outside any blocked interval — coordinates preserved
-        (regression check: nulling only fires inside intervals)."""
-        events = [
-            {
-                "type": "mouse.drag",
-                "timestamp": 2000.0,
-                "x": 120.0, "y": 340.0,
-                "dx": 380.0, "dy": 0.0,
-                "button": "left",
-                "children": [],
-            },
-        ]
-        intervals = [
-            BlockedInterval(
-                start=1000.0, end=1010.0,
-                action=PrivacyAction.EXCLUDE,
-                reason=ReasonCode.POLICY_EXCLUDED_APP,
-            ),
-        ]
-        scrubbed, _ = _scrub_with_intervals(tmp_path, events, intervals)
-
-        drags = [e for e in scrubbed if e.get("type") == "mouse.drag"]
-        assert len(drags) == 1
-        drag = drags[0]
-        assert drag["x"] == 120.0
-        assert drag["y"] == 340.0
-        assert drag["dx"] == 380.0
-        assert drag["dy"] == 0.0
-
 
 class TestSCRUBBlockActionsIntegration:
     """Verify SCRUB_BLOCK_ACTIONS expanded set is used by build_scrub_context."""

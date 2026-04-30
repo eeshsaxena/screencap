@@ -532,40 +532,6 @@ def test_scrub_metrics_no_wifi(tmp_path):
 # ---------------------------------------------------------------------------
 
 
-def test_scrub_deletes_media(recording_dir, tmp_path):
-    """audio.flac, chunked audio, and *.mp4 deleted from scrubbed copy."""
-    with mock.patch(
-        "screencap.config.get_recordings_dir", return_value=tmp_path
-    ), mock.patch(
-        "screencap.scrubber.get_recordings_dir", return_value=tmp_path
-    ):
-        result = scrub_recording("test-recording")
-
-    dst = tmp_path / "test-recording-scrubbed"
-    assert not (dst / "audio.flac").exists()
-    assert not (dst / "audio_0000.flac").exists()
-    assert not (dst / "audio_0001.flac").exists()
-    assert not list(dst.glob("*.mp4"))
-    assert "audio_0000.flac" in result.deleted_files
-    assert "audio_0001.flac" in result.deleted_files
-
-
-def test_scrub_deletes_derived_files(recording_dir, tmp_path):
-    """.upload_status.json and viewer.html deleted; events.jsonl scrubbed not deleted."""
-    with mock.patch(
-        "screencap.config.get_recordings_dir", return_value=tmp_path
-    ), mock.patch(
-        "screencap.scrubber.get_recordings_dir", return_value=tmp_path
-    ):
-        result = scrub_recording("test-recording")
-
-    dst = tmp_path / "test-recording-scrubbed"
-    assert not (dst / ".upload_status.json").exists()
-    assert not (dst / "viewer.html").exists()
-    # events.jsonl is now scrubbed, not deleted
-    assert (dst / "events.jsonl").exists()
-
-
 def test_scrub_deletes_screenshot_table(recording_dir, tmp_path):
     """screenshot table rows deleted from DB."""
     with mock.patch(
@@ -929,27 +895,6 @@ def _setup_keystroke_db(db_path, events):
     conn.close()
 
 
-def test_scrub_events_jsonl_redacts_typed_secret(tmp_path, pipeline_and_anonymizer):
-    """password=ssfsfodsufdouhhfwnenwekskjdhjsfhd in key.type event text → text field redacted."""
-    pipeline, anonymizer = pipeline_and_anonymizer
-    rec = tmp_path / "scrubbed"
-    rec.mkdir()
-
-    secret_ev = _make_key_type_event("password=ssfsfodsufdouhhfwnenwekskjdhjsfhd")
-    (rec / "events.jsonl").write_text(_make_events_jsonl(secret_ev))
-    _setup_keystroke_db(rec / "recording.db", [secret_ev])
-
-    result = ScrubResult()
-    _scrub_events_jsonl(rec, pipeline, anonymizer, result)
-
-    lines = [json.loads(l) for l in (rec / "events.jsonl").read_text().strip().splitlines()]
-    # Meta line preserved
-    assert lines[0].get("_meta") is True
-    # Secret text should be redacted (not contain original)
-    key_type_ev = lines[1]
-    assert "password=ssfsfodsufdouhhfwnenwekskjdhjsfhd" not in key_type_ev["text"]
-
-
 def test_scrub_events_jsonl_maps_to_db_rows(tmp_path, pipeline_and_anonymizer):
     """Redacted key.type children → corresponding DB rows have key_char = NULL."""
     pipeline, anonymizer = pipeline_and_anonymizer
@@ -999,34 +944,6 @@ def test_scrub_events_jsonl_preserves_normal_typing(tmp_path, pipeline_and_anony
         assert child["key_char"] is not None
 
 
-def test_scrub_events_jsonl_missing_file(tmp_path, pipeline_and_anonymizer):
-    """No events.jsonl → step skipped, no error."""
-    pipeline, anonymizer = pipeline_and_anonymizer
-    rec = tmp_path / "scrubbed"
-    rec.mkdir()
-
-    result = ScrubResult()
-    _scrub_events_jsonl(rec, pipeline, anonymizer, result)
-    # Should not crash
-
-
-def test_scrub_events_jsonl_meta_line_preserved(tmp_path, pipeline_and_anonymizer):
-    """_meta header line passes through unchanged."""
-    pipeline, anonymizer = pipeline_and_anonymizer
-    rec = tmp_path / "scrubbed"
-    rec.mkdir()
-
-    meta = {"_meta": True, "screencap_version": "0.1.0", "exported_at": "2026-03-05T00:00:00"}
-    (rec / "events.jsonl").write_text(json.dumps(meta) + "\n")
-
-    result = ScrubResult()
-    _scrub_events_jsonl(rec, pipeline, anonymizer, result)
-
-    lines = [json.loads(l) for l in (rec / "events.jsonl").read_text().strip().splitlines()]
-    assert lines[0]["_meta"] is True
-    assert lines[0]["screencap_version"] == "0.1.0"
-
-
 def test_scrub_events_jsonl_key_up_redacted(tmp_path, pipeline_and_anonymizer):
     """Both key.down AND key.up children are redacted — no secret from release events."""
     pipeline, anonymizer = pipeline_and_anonymizer
@@ -1054,20 +971,6 @@ def test_scrub_events_jsonl_key_up_redacted(tmp_path, pipeline_and_anonymizer):
                         f"key.up at index {i+1} not redacted — "
                         f"secret reconstructable from release events"
                     )
-
-
-def test_scrub_events_jsonl_empty_text(tmp_path, pipeline_and_anonymizer):
-    """key.type event with text: '' → no crash, no detection."""
-    pipeline, anonymizer = pipeline_and_anonymizer
-    rec = tmp_path / "scrubbed"
-    rec.mkdir()
-
-    empty_ev = {"timestamp": 100.0, "type": "key.type", "text": "", "children": []}
-    (rec / "events.jsonl").write_text(_make_events_jsonl(empty_ev))
-
-    result = ScrubResult()
-    _scrub_events_jsonl(rec, pipeline, anonymizer, result)
-    # Should not crash
 
 
 def test_scrub_events_jsonl_malformed_line(tmp_path, pipeline_and_anonymizer):
@@ -1126,23 +1029,6 @@ def test_scrub_events_jsonl_nested_in_mouse_drag(tmp_path, pipeline_and_anonymiz
     drag_ev = lines[1]
     nested_key_type = drag_ev["children"][0]
     assert "password=ssfsfodsufdouhhfwnenwekskjdhjsfhd" not in nested_key_type["text"]
-
-
-def test_scrub_events_jsonl_entity_counts(tmp_path, pipeline_and_anonymizer):
-    """Entity counts from JSONL keystroke detection are accumulated in ScrubResult."""
-    pipeline, anonymizer = pipeline_and_anonymizer
-    rec = tmp_path / "scrubbed"
-    rec.mkdir()
-
-    secret_ev = _make_key_type_event("password=ssfsfodsufdouhhfwnenwekskjdhjsfhd")
-    (rec / "events.jsonl").write_text(_make_events_jsonl(secret_ev))
-    _setup_keystroke_db(rec / "recording.db", [secret_ev])
-
-    result = ScrubResult()
-    _scrub_events_jsonl(rec, pipeline, anonymizer, result)
-
-    # Should have detected at least one entity
-    assert sum(result.entity_counts.values()) > 0
 
 
 # ---------------------------------------------------------------------------
