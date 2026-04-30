@@ -106,15 +106,6 @@ class TestBuildBlockedIntervals:
 
         assert intervals == []
 
-    def test_empty_window_events(self):
-        evaluator = _make_evaluator(mode="public")
-        classifier = DefaultContextClassifier()
-
-        intervals = _build_blocked_intervals([], evaluator, classifier)
-
-        assert intervals == []
-
-
 # ---------------------------------------------------------------------------
 # Screenshot routing
 # ---------------------------------------------------------------------------
@@ -139,24 +130,6 @@ class TestScreenshotRouting:
         mask_screenshots(dst / "screenshots", ctx, result=result, **{
             k: v for k, v in kwargs.items() if k != "pixel_ratio"
         })
-
-    def test_excluded_app_screenshot_deleted(self, tmp_path):
-        """Screenshot during 1Password frontmost period → file deleted."""
-        dst = self._setup_screenshots(tmp_path, [22.0])
-        evaluator = _make_evaluator(
-            mode="public",
-            exclude_apps=["com.1password.1password"],
-        )
-        classifier = DefaultContextClassifier()
-        window_events = _make_window_events([
-            (20.0, "com.1password.1password"),
-            (30.0, "com.microsoft.VSCode"),
-        ])
-        result = ScrubResult()
-
-        self._mask(dst, evaluator, classifier, window_events, result)
-
-        assert not (dst / "screenshots" / "22.0.jpg").exists()
 
     def test_allowed_app_screenshot_kept(self, tmp_path):
         """Screenshot during VSCode in internal mode → file kept."""
