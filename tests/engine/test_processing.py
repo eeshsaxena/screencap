@@ -35,6 +35,7 @@ from screencap.engine.processing import (
     merge_consecutive_mouse_click_events,
     merge_consecutive_mouse_magnify_events,
     merge_consecutive_mouse_move_events,
+    merge_consecutive_mouse_rotate_events,
     merge_consecutive_mouse_scroll_events,
     merge_sequential_key_type_events,
     process_events,
@@ -492,6 +493,27 @@ class TestGestureEvents:
         mags = [e for e in result if isinstance(e, MouseMagnifyEvent)]
         assert [round(m.magnification, 2) for m in mags] == [0.05, 0.01]
 
+    def test_consecutive_rotate_events_sum_deltas(self):
+        events = [
+            MouseRotateEvent(timestamp=1.0, x=100, y=100, rotation=10.0),
+            MouseRotateEvent(timestamp=1.1, x=100, y=100, rotation=15.0),
+            MouseRotateEvent(timestamp=1.2, x=100, y=100, rotation=-5.0),
+        ]
+        result = merge_consecutive_mouse_rotate_events(events)
+        assert len(result) == 1
+        assert abs(result[0].rotation - 20.0) < 1e-9
+
+    def test_move_interrupts_creates_separate_rotate_groups(self):
+        events = [
+            MouseRotateEvent(timestamp=1.0, x=100, y=100, rotation=10.0),
+            MouseRotateEvent(timestamp=1.1, x=100, y=100, rotation=15.0),
+            MouseMoveEvent(timestamp=1.2, x=200, y=200),
+            MouseRotateEvent(timestamp=1.3, x=200, y=200, rotation=5.0),
+        ]
+        result = merge_consecutive_mouse_rotate_events(events)
+        rots = [e for e in result if isinstance(e, MouseRotateEvent)]
+        assert [r.rotation for r in rots] == [25.0, 5.0]
+
     def test_smart_magnify_does_not_merge_with_neighbors(self):
         """SmartMagnify is an instantaneous toggle (two-finger double-tap zoom),
         not a continuous gesture; consecutive events stay distinct."""
@@ -642,7 +664,11 @@ class TestProcessEvents:
 
     def test_blender_style_workflow_classifies_events_correctly(self):
         """End-to-end on a realistic 3D-app session: orbit drag, pan drag with
-        shift, pinch zoom, constrained LMB drag, RMB cancel."""
+        shift, pinch zoom, constrained LMB drag with shift mid-move, RMB cancel.
+
+        Asserts that a KeyTypeEvent fired mid-drag survives as a drag child —
+        regression coverage for keyboard events being preserved through the
+        processing pipeline."""
         dist = DRAG_DISTANCE_THRESHOLD + 20
         ts = 0.0
 
@@ -651,14 +677,16 @@ class TestProcessEvents:
             ts += dt
             return ts
 
-        shift_tap = KeyTypeEvent(
-            timestamp=step(),
-            text="",
-            children=[
-                KeyDownEvent(timestamp=ts - 0.05, key_name="shift"),
-                KeyUpEvent(timestamp=ts, key_name="shift"),
-            ],
-        )
+        def shift_tap() -> KeyTypeEvent:
+            t = step()
+            return KeyTypeEvent(
+                timestamp=t,
+                text="",
+                children=[
+                    KeyDownEvent(timestamp=t, key_name="shift"),
+                    KeyUpEvent(timestamp=t + 0.01, key_name="shift"),
+                ],
+            )
 
         events = [
             # MMB orbit
@@ -667,16 +695,17 @@ class TestProcessEvents:
             MouseUpEvent(timestamp=step(), x=400 + dist, y=400 + dist, button=MouseButton.MIDDLE),
             # Shift+MMB pan
             MouseDownEvent(timestamp=step(), x=400, y=400, button=MouseButton.MIDDLE),
-            shift_tap,
+            shift_tap(),
             MouseMoveEvent(timestamp=step(), x=400, y=400 + dist),
             MouseUpEvent(timestamp=step(), x=400, y=400 + dist, button=MouseButton.MIDDLE),
             # Pinch zoom
             MouseMagnifyEvent(timestamp=step(), x=500, y=500, magnification=0.02),
             MouseMagnifyEvent(timestamp=step(), x=500, y=500, magnification=0.03),
             MouseMagnifyEvent(timestamp=step(), x=500, y=500, magnification=0.05),
-            # LMB drag
+            # LMB constrained drag — shift tapped mid-move, must survive in drag children
             MouseDownEvent(timestamp=step(), x=300, y=300, button=MouseButton.LEFT),
             MouseMoveEvent(timestamp=step(), x=300 + dist, y=300),
+            shift_tap(),
             MouseMoveEvent(timestamp=step(), x=300 + dist * 2, y=300),
             MouseUpEvent(timestamp=step(), x=300 + dist * 2, y=300, button=MouseButton.LEFT),
             # RMB click
@@ -692,3 +721,8 @@ class TestProcessEvents:
         assert len(magnifies) == 1
         assert abs(magnifies[0].magnification - 0.10) < 1e-9
         assert len(clicks) >= 1
+
+        # The constrained LMB drag must keep the shift KeyTypeEvent as a child.
+        lmb_drags = [d for d in drags if d.button == MouseButton.LEFT]
+        assert len(lmb_drags) == 1
+        assert any(isinstance(c, KeyTypeEvent) for c in lmb_drags[0].children)
