@@ -174,6 +174,144 @@ class TestStartedEventOrdering:
 
 
 # ---------------------------------------------------------------------------
+# V1.5 — dek argument plumbing
+# ---------------------------------------------------------------------------
+
+
+def _run_proxy_capture_dek(
+    out_q,
+    recording_id,
+    network_config,
+    privacy_config,
+    port,
+    log_path,
+    started_event,
+    confdir,
+    dek,
+    capture_q,
+):
+    """Spawn-target wrapper that swaps NetworkCapture for a stub which
+    posts the kwargs it received onto ``capture_q`` before raising.
+
+    Lives in a spawn child so the spawn-mode assertion in run_proxy is
+    satisfied. The stub raises so run_proxy short-circuits before
+    actually starting the asyncio loop.
+    """
+    import screencap.network.capture_addon as addon_mod
+
+    class _StubAddon:
+        def __init__(self, *args, **kwargs):
+            try:
+                capture_q.put_nowait(
+                    {"dek": kwargs.get("dek"), "recording_id": kwargs.get("recording_id")}
+                )
+            except Exception:
+                pass
+            raise RuntimeError("stub-addon-stop")
+
+    addon_mod.NetworkCapture = _StubAddon  # type: ignore[misc]
+
+    from screencap.network.proxy_runner import run_proxy
+    run_proxy(
+        out_q,
+        recording_id,
+        network_config,
+        privacy_config,
+        port,
+        log_path,
+        started_event,
+        confdir,
+        dek,
+    )
+
+
+class TestDekForwarding:
+    """run_proxy must forward the V1.5 ``dek`` argument verbatim into
+    NetworkCapture's constructor."""
+
+    @pytest.mark.timeout(30)
+    def test_dek_forwarded_to_network_capture_constructor(self, tmp_path):
+        out_q = SPAWN_CTX.Queue(maxsize=10)
+        started_event = SPAWN_CTX.Event()
+        capture_q = SPAWN_CTX.Queue(maxsize=10)
+        log_path = tmp_path / "proxy.log"
+        log_path.touch()
+        confdir = tmp_path / "confdir"
+        confdir.mkdir()
+
+        sentinel_dek = b"d" * 32
+
+        proc = SPAWN_CTX.Process(
+            target=_run_proxy_capture_dek,
+            args=(
+                out_q,
+                42,
+                NetworkConfig(),
+                _picklable_privacy(),
+                _free_port(),
+                log_path,
+                started_event,
+                confdir,
+                sentinel_dek,
+                capture_q,
+            ),
+        )
+        proc.start()
+        try:
+            captured = capture_q.get(timeout=15.0)
+        finally:
+            proc.join(timeout=5)
+            if proc.is_alive():
+                proc.terminate()
+                proc.join(timeout=3)
+
+        assert captured["dek"] == sentinel_dek, (
+            f"NetworkCapture.dek mismatch: {captured!r}"
+        )
+        assert captured["recording_id"] == 42
+        # started_event should NOT be set — addon ctor raised.
+        assert not started_event.is_set()
+
+    @pytest.mark.timeout(30)
+    def test_dek_default_none_preserves_v1_path(self, tmp_path):
+        """When no ``dek`` is supplied, NetworkCapture sees ``dek=None``
+        — preserves V1 / metadata-only behaviour."""
+        out_q = SPAWN_CTX.Queue(maxsize=10)
+        started_event = SPAWN_CTX.Event()
+        capture_q = SPAWN_CTX.Queue(maxsize=10)
+        log_path = tmp_path / "proxy.log"
+        log_path.touch()
+        confdir = tmp_path / "confdir"
+        confdir.mkdir()
+
+        proc = SPAWN_CTX.Process(
+            target=_run_proxy_capture_dek,
+            args=(
+                out_q,
+                42,
+                NetworkConfig(),
+                _picklable_privacy(),
+                _free_port(),
+                log_path,
+                started_event,
+                confdir,
+                None,  # dek absent — V1 path
+                capture_q,
+            ),
+        )
+        proc.start()
+        try:
+            captured = capture_q.get(timeout=15.0)
+        finally:
+            proc.join(timeout=5)
+            if proc.is_alive():
+                proc.terminate()
+                proc.join(timeout=3)
+
+        assert captured["dek"] is None
+
+
+# ---------------------------------------------------------------------------
 # Smoke nonce check
 # ---------------------------------------------------------------------------
 

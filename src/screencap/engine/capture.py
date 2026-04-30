@@ -29,6 +29,8 @@ from screencap.engine.processing import (
 if TYPE_CHECKING:
     from PIL import Image
 
+    from screencap.network.export_pipeline import NetworkScrubPipeline
+
 
 def _action_event_to_dict(db_event) -> dict:
     """Convert a SQLAlchemy ActionEvent to a row dict.
@@ -401,7 +403,13 @@ class CaptureSession:
                 events.append(pydantic_event)
         return events
 
-    def export_events(self, include_moves: bool = False) -> list[BaseEvent]:
+    def export_events(
+        self,
+        include_moves: bool = False,
+        *,
+        include_network: bool = False,
+        network_scrub_pipeline: "NetworkScrubPipeline | None" = None,
+    ) -> list[BaseEvent]:
         """Produce a combined, time-ordered list of processed action events
         and deduplicated window.switch events for JSONL export.
 
@@ -427,8 +435,33 @@ class CaptureSession:
         its public ``list[BaseEvent]`` return contract — see
         ``tests/test_cross_layer_contracts.py`` lines 35-45.
 
+        V1.5: when ``include_network=True``, fetches ``network_event``
+        rows from the ORM relationship and passes them through
+        ``unified_export_events`` so JSONL output includes ``network.*``
+        lines. The explicit ``screencap export`` CLI sets this flag;
+        ``_auto_export`` (post-recording, feeds cloud upload) and the
+        chunk processor leave it ``False`` so V1's cloud-safety
+        guarantee is preserved until V1.75 wires
+        ``build_cloud_network_filter``.
+
+        When ``network_scrub_pipeline`` is supplied (V1.5 explicit
+        export only), encrypted bodies are decrypted + PII-scrubbed at
+        the row-conversion boundary. Without the pipeline, capture-side
+        events flow through directly — fine for V1-vintage rows
+        (no ciphertext) but DO NOT enable ``include_network=True``
+        without a scrub pipeline on encrypted recordings: the
+        capture-side classes will JSON-dump the raw ciphertext bytes.
+
         Args:
             include_moves: Whether to include mouse.move events.
+            include_network: V1.5 — when True, emit ``network.*`` events
+                into the result. Default False preserves V1's cloud-safe
+                behavior (no network rows in events.jsonl).
+            network_scrub_pipeline: Optional V1.5 ``NetworkScrubPipeline``.
+                Required when ``include_network=True`` AND the recording
+                has encrypted bodies (otherwise ciphertext bytes leak
+                into JSONL). Construct via
+                ``screencap.network.export_pipeline.NetworkScrubPipeline``.
 
         Returns:
             Combined list of action + window.switch events, sorted by timestamp.
@@ -488,7 +521,49 @@ class CaptureSession:
                 "browser_url": getattr(we, "browser_url", None),
             })
 
-        # 3. Run the unified pipeline. ``initial_window_row=None`` per
+        # 4. V1.5: build network_rows from the ORM relationship when
+        #    the caller opts in via ``include_network=True``. Default
+        #    is False because ``_auto_export`` (which feeds cloud
+        #    upload) shares this method — emitting network rows
+        #    unconditionally would leak metadata to cloud regardless
+        #    of the local-only promise. The relationship's
+        #    ``order_by="NetworkEvent.timestamp_ns"`` keeps rows
+        #    time-ordered. ``getattr`` covers older DBs that lack the
+        #    V1.5 ciphertext columns; ``_ensure_network_tables`` plus
+        #    ``_migrate_schema`` already ran at ``Capture.load`` time.
+        network_rows: list[dict] | None = None
+        if include_network:
+            try:
+                network_events_orm = getattr(
+                    self._recording, "network_events", [],
+                )
+            except Exception:
+                network_events_orm = []
+            network_rows = []
+            for ne in network_events_orm:
+                network_rows.append({
+                    "kind": getattr(ne, "kind", None),
+                    "flow_id": getattr(ne, "flow_id", None),
+                    "method": getattr(ne, "method", None),
+                    "url": getattr(ne, "url", None),
+                    "host": getattr(ne, "host", None),
+                    "status": getattr(ne, "status", None),
+                    "headers_json": getattr(ne, "headers_json", None),
+                    "body_size": getattr(ne, "body_size", None),
+                    "body_sha256": getattr(ne, "body_sha256", None),
+                    "body_ciphertext": getattr(ne, "body_ciphertext", None),
+                    "body_nonce": getattr(ne, "body_nonce", None),
+                    "body_aad": getattr(ne, "body_aad", None),
+                    "content_type": getattr(ne, "content_type", None),
+                    "direction": getattr(ne, "direction", None),
+                    "frame_type": getattr(ne, "frame_type", None),
+                    "http_version": getattr(ne, "http_version", None),
+                    "details_json": getattr(ne, "details_json", None),
+                    "timestamp": getattr(ne, "timestamp", 0.0),
+                    "timestamp_ns": getattr(ne, "timestamp_ns", 0),
+                })
+
+        # 5. Run the unified pipeline. ``initial_window_row=None`` per
         #    R15 (full-recording exports do not prepend pre-chunk
         #    context). ``window_filter=None`` because CLI export does
         #    not currently apply a privacy filter at this layer (the
@@ -505,6 +580,8 @@ class CaptureSession:
                 self._recording.double_click_distance_pixels or 5.0
             ),
             window_filter=None,
+            network_rows=network_rows,
+            network_scrub_pipeline=network_scrub_pipeline,
         ))
 
         # 4. Per R7, the unified callable does not drop MouseMoveEvent

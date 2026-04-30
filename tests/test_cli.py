@@ -518,6 +518,401 @@ def test_export_single_by_name_with_downloads_fallback(tmp_path, monkeypatch):
     assert (dl_dir / "my-dl" / "events.jsonl").exists()
 
 
+# --- export with V1.5 NetworkScrubPipeline tests ---
+
+
+def _create_v15_export_db(rec_dir):
+    """Create a recording.db with a V1.5 encrypted body (meta + ciphertext).
+
+    A meta row alone is not enough — after the PR #157 review, the
+    ``recording_has_encrypted_bodies`` predicate queries actual
+    ``body_ciphertext IS NOT NULL`` rows so metadata-only V1.5
+    recordings (where the user only browsed non-allowlisted hosts)
+    don't trigger Keychain prompts. Tests that simulate "encrypted
+    recording" must therefore insert at least one ciphertext row.
+    """
+    from screencap.engine.db import create_db, crud
+    from screencap.network import crypto
+
+    rec_dir.mkdir(parents=True, exist_ok=True)
+    engine, Session = create_db(str(rec_dir / "recording.db"))
+    session = Session()
+    rec = crud.insert_recording(session, {
+        "timestamp": 1000.0, "platform": "darwin",
+        "monitor_width": 1920, "monitor_height": 1080,
+        "pixel_ratio": 2.0, "double_click_interval_seconds": 0.5,
+        "double_click_distance_pixels": 5.0,
+    })
+    crud.insert_action_event(session, rec, 1000.5, {
+        "name": "click", "mouse_x": 100.0, "mouse_y": 200.0,
+        "mouse_button_name": "left", "mouse_pressed": True,
+    })
+    crud.insert_action_event(session, rec, 1000.55, {
+        "name": "click", "mouse_x": 100.0, "mouse_y": 200.0,
+        "mouse_button_name": "left", "mouse_pressed": False,
+    })
+    # V1.5 wrapped DEK — every --network recording gets one of these.
+    kek = crypto._generate_kek()
+    dek = crypto.generate_dek()
+    wrapped, nonce = crypto.wrap_dek(dek, kek)
+    crud.insert_network_event_meta(
+        session,
+        recording_id=rec.id,
+        dek_wrapped=wrapped,
+        dek_nonce=nonce,
+    )
+    # ALSO insert a ciphertext-bearing network_event row so
+    # recording_has_encrypted_bodies returns True. This is what marks
+    # the recording as "actually has encrypted bodies on disk" rather
+    # than just "V1.5 vintage."
+    crud.insert_network_event(session, rec, {
+        "kind": "request",
+        "flow_id": "f1",
+        "method": "POST",
+        "url": "https://api.github.com/x",
+        "host": "api.github.com",
+        "body_ciphertext": b"\xde\xad\xbe\xef" * 4,
+        "body_nonce": b"\x01" * 12,
+        "body_aad": b"some-aad",
+        "timestamp": 1000.7,
+        "timestamp_ns": 1_000_700_000_000,
+    })
+    crud.flush_buffers(session)
+    session.commit()
+    session.close()
+    engine.dispose()
+    return kek
+
+
+def test_export_with_encrypted_recording_constructs_pipeline(
+    tmp_path, monkeypatch,
+):
+    """When the recording has a NetworkEventMeta row, _export_one
+    constructs a NetworkScrubPipeline and forwards it to export_recording."""
+    rec_dir = tmp_path / "recordings"
+    _create_v15_export_db(rec_dir / "v15-rec")
+    monkeypatch.setenv("SCREENCAP_RECORDINGS_DIR", str(rec_dir))
+
+    runner = CliRunner()
+
+    # Stub out the actual NetworkScrubPipeline so we don't need the
+    # real Keychain (and to capture the construction args). Patch the
+    # symbol where it's looked up inside _export_one (re-imported there
+    # from screencap.network.export_pipeline).
+    captured = {}
+
+    class _StubPipeline:
+        def __init__(self, db_path, recording_id):
+            captured["db_path"] = db_path
+            captured["recording_id"] = recording_id
+
+        def decrypt_and_scrub(self, evt):  # pragma: no cover - unused
+            return evt
+
+    with (
+        mock.patch(
+            "screencap.network.export_pipeline.NetworkScrubPipeline",
+            _StubPipeline,
+        ),
+        mock.patch(
+            "screencap.exporter.export_recording",
+            return_value=2,
+        ) as mock_export,
+    ):
+        # Use --stdout to opt into network row emission. Default output
+        # (<recording_dir>/events.jsonl) is cloud-safe by gate per the
+        # round-4 review fix; only explicit -o / --stdout enables the
+        # network rows.
+        result = runner.invoke(cli, ["export", "v15-rec", "--stdout"])
+
+    assert result.exit_code == 0, result.output
+    assert "db_path" in captured, "Pipeline was not constructed"
+    assert captured["db_path"].endswith("recording.db")
+    # Pipeline forwarded as the new kwarg on export_recording.
+    mock_export.assert_called_once()
+    kwargs = mock_export.call_args.kwargs
+    assert "network_scrub_pipeline" in kwargs
+    assert kwargs["network_scrub_pipeline"] is not None
+    # V1.5 P1 #2: explicit-export must opt in to network row emission.
+    # Without this flag, network_scrub_pipeline construction is wasted
+    # because Capture.export_events skips network_rows entirely.
+    assert kwargs.get("include_network") is True
+
+
+def test_export_default_output_skips_network_rows(tmp_path, monkeypatch):
+    """Round-4 P1: ``screencap export <name>`` with no -o writes to
+    ``<recording_dir>/events.jsonl`` — the same file ``screencap upload``
+    later picks up. Network rows must NOT land there, otherwise a
+    later upload leaks them to cloud (bypasses the V1.5 cloud-safety
+    gate that was supposed to keep network metadata local until
+    V1.75 ships build_cloud_network_filter).
+    """
+    rec_dir = tmp_path / "recordings"
+    _create_v15_export_db(rec_dir / "v15-rec")
+    monkeypatch.setenv("SCREENCAP_RECORDINGS_DIR", str(rec_dir))
+
+    runner = CliRunner()
+    pipeline_constructions = []
+
+    class _StubPipeline:
+        def __init__(self, db_path, recording_id):
+            pipeline_constructions.append((db_path, recording_id))
+
+        def decrypt_and_scrub(self, evt):  # pragma: no cover - unused
+            return evt
+
+    with (
+        mock.patch(
+            "screencap.network.export_pipeline.NetworkScrubPipeline",
+            _StubPipeline,
+        ),
+        mock.patch(
+            "screencap.exporter.export_recording",
+            return_value=0,
+        ) as mock_export,
+    ):
+        # No -o, no --stdout → default = recording_dir/events.jsonl.
+        result = runner.invoke(cli, ["export", "v15-rec"])
+
+    assert result.exit_code == 0, result.output
+    assert mock_export.called
+    kwargs = mock_export.call_args.kwargs
+    assert kwargs.get("include_network") is False, (
+        "default output writes to the same file `screencap upload` "
+        "uses; including network rows there leaks them to cloud"
+    )
+    # No pipeline construction either — saves the Keychain prompt.
+    assert pipeline_constructions == [], (
+        "pipeline construction wasted on a path that drops network "
+        "rows; should be gated on include_network"
+    )
+
+
+def test_export_with_custom_output_includes_network(tmp_path, monkeypatch):
+    """``screencap export <name> -o /tmp/out.jsonl`` writes to a
+    user-controlled path — outside the cloud-pickup pipeline. Network
+    rows ARE emitted there because the user opted in by directing
+    output elsewhere.
+    """
+    rec_dir = tmp_path / "recordings"
+    _create_v15_export_db(rec_dir / "v15-rec")
+    monkeypatch.setenv("SCREENCAP_RECORDINGS_DIR", str(rec_dir))
+
+    runner = CliRunner()
+    custom_output = str(tmp_path / "custom-out.jsonl")
+
+    class _StubPipeline:
+        def __init__(self, db_path, recording_id):
+            pass
+
+        def decrypt_and_scrub(self, evt):  # pragma: no cover
+            return evt
+
+    with (
+        mock.patch(
+            "screencap.network.export_pipeline.NetworkScrubPipeline",
+            _StubPipeline,
+        ),
+        mock.patch(
+            "screencap.exporter.export_recording",
+            return_value=2,
+        ) as mock_export,
+    ):
+        result = runner.invoke(cli, ["export", "v15-rec", "-o", custom_output])
+
+    assert result.exit_code == 0, result.output
+    kwargs = mock_export.call_args.kwargs
+    assert kwargs.get("include_network") is True
+
+
+def test_export_all_skips_network_rows(tmp_path, monkeypatch):
+    """``screencap export --all`` writes every recording's events.jsonl
+    to ``<recording_dir>/events.jsonl`` — same cloud-pickup path as
+    the no-arg single-recording export. Must NOT include network rows.
+    """
+    rec_dir = tmp_path / "recordings"
+    _create_v15_export_db(rec_dir / "v15-rec")
+    monkeypatch.setenv("SCREENCAP_RECORDINGS_DIR", str(rec_dir))
+
+    runner = CliRunner()
+
+    class _StubPipeline:
+        def __init__(self, db_path, recording_id):
+            pass
+
+        def decrypt_and_scrub(self, evt):  # pragma: no cover
+            return evt
+
+    with (
+        mock.patch(
+            "screencap.network.export_pipeline.NetworkScrubPipeline",
+            _StubPipeline,
+        ),
+        mock.patch(
+            "screencap.exporter.export_recording",
+            return_value=2,
+        ) as mock_export,
+    ):
+        result = runner.invoke(cli, ["export", "--all"])
+
+    assert result.exit_code == 0, result.output
+    assert mock_export.called
+    # Every call from --all path must have include_network=False.
+    for call in mock_export.call_args_list:
+        assert call.kwargs.get("include_network") is False
+
+
+def test_export_with_v1_recording_no_pipeline(tmp_path, monkeypatch):
+    """V1-vintage recording (no NetworkEventMeta row) → no pipeline
+    construction; export_recording receives ``None``."""
+    rec_dir = tmp_path / "recordings"
+    _create_export_db(rec_dir / "v1-rec")  # No meta row
+    monkeypatch.setenv("SCREENCAP_RECORDINGS_DIR", str(rec_dir))
+
+    runner = CliRunner()
+
+    construction_calls = []
+
+    class _StubPipeline:
+        def __init__(self, db_path, recording_id):
+            construction_calls.append((db_path, recording_id))
+
+        def decrypt_and_scrub(self, evt):  # pragma: no cover - unused
+            return evt
+
+    with (
+        mock.patch(
+            "screencap.network.export_pipeline.NetworkScrubPipeline",
+            _StubPipeline,
+        ),
+        mock.patch(
+            "screencap.exporter.export_recording",
+            return_value=2,
+        ) as mock_export,
+    ):
+        result = runner.invoke(cli, ["export", "v1-rec"])
+
+    assert result.exit_code == 0, result.output
+    assert construction_calls == [], (
+        "NetworkScrubPipeline must NOT be constructed for V1-vintage "
+        "recordings (no NetworkEventMeta row)"
+    )
+    kwargs = mock_export.call_args.kwargs
+    assert kwargs.get("network_scrub_pipeline") is None
+
+
+def test_auto_export_does_not_include_network(tmp_path, monkeypatch):
+    """Cloud-safety guarantee: ``_auto_export`` (post-recording, feeds
+    ``screencap upload``) must NOT pass ``include_network=True``. V1.5
+    keeps network row emission gated to the explicit ``screencap export``
+    CLI path; V1.75 will land the cloud-bound filter factory before any
+    network row reaches a cloud bucket.
+    """
+    from screencap.cli import _auto_export
+
+    rec_dir = tmp_path / "auto-rec"
+    rec_dir.mkdir()
+    # Touch a recording.db file so export_recording's existence check
+    # short-circuits to the mock without actually loading anything.
+
+    with mock.patch(
+        "screencap.exporter.export_recording", return_value=0,
+    ) as mock_export:
+        # _auto_export catches its own exceptions; we just need to
+        # confirm the call shape regardless of the result.
+        _auto_export(rec_dir)
+
+    assert mock_export.called
+    kwargs = mock_export.call_args.kwargs
+    # The flag must be absent OR False — never True from _auto_export.
+    assert not kwargs.get("include_network", False), (
+        "_auto_export must not include_network=True; that flag is "
+        "reserved for the explicit `screencap export` CLI path until "
+        "V1.75 ships build_cloud_network_filter."
+    )
+
+
+def test_export_kek_unavailable_fails_loud(tmp_path, monkeypatch):
+    """When KEK is unavailable (Keychain failure), CLI export exits
+    non-zero with the actionable regenerate message."""
+    from screencap.network.export_pipeline import KekUnavailableError
+
+    rec_dir = tmp_path / "recordings"
+    _create_v15_export_db(rec_dir / "v15-rec")
+    monkeypatch.setenv("SCREENCAP_RECORDINGS_DIR", str(rec_dir))
+
+    runner = CliRunner()
+
+    with mock.patch(
+        "screencap.network.export_pipeline.NetworkScrubPipeline",
+        side_effect=KekUnavailableError("keychain locked"),
+    ):
+        # --stdout opts into network row emission, which is what
+        # triggers the pipeline construction. With the default
+        # output, pipeline construction is skipped (cloud-safe),
+        # so the KEK-unavailable branch wouldn't fire.
+        result = runner.invoke(cli, ["export", "v15-rec", "--stdout"])
+
+    assert result.exit_code == 1, result.output
+    # The actionable error message must mention the regenerate path.
+    # rich's console wraps long lines, so collapse whitespace before matching.
+    flattened = " ".join(result.output.split())
+    assert "Cannot decrypt network bodies" in flattened
+    assert "screencap network uninstall" in flattened
+
+
+def test_export_pipeline_setup_unexpected_error_drops_network_rows(
+    tmp_path, monkeypatch,
+):
+    """When pipeline construction raises something other than
+    KekUnavailableError (defensive fallback path), CLI export must
+    DROP network rows from the output rather than feed unscrubbed
+    capture-side events with body_ciphertext bytes to Pydantic's JSON
+    serializer.
+
+    Regression for PR #157 review P1: previously the broad-Exception
+    branch fell through with include_network=True and pipeline=None,
+    which violated the V1.5 schema invariant 'ciphertext can never
+    reach JSONL by construction.' The fix is to set
+    include_network=False on that branch and warn the user.
+    """
+    rec_dir = tmp_path / "recordings"
+    _create_v15_export_db(rec_dir / "v15-rec")
+    monkeypatch.setenv("SCREENCAP_RECORDINGS_DIR", str(rec_dir))
+
+    runner = CliRunner()
+
+    with (
+        mock.patch(
+            "screencap.network.export_pipeline.NetworkScrubPipeline",
+            side_effect=RuntimeError("simulated unexpected pipeline error"),
+        ),
+        mock.patch(
+            "screencap.exporter.export_recording", return_value=0,
+        ) as mock_export,
+    ):
+        # --stdout opts into network rows, which is what makes the
+        # pipeline construction path run at all.
+        result = runner.invoke(cli, ["export", "v15-rec", "--stdout"])
+
+    # The export still runs (don't crash on unexpected pipeline
+    # errors) — but it MUST NOT include network rows.
+    assert result.exit_code == 0, result.output
+    assert mock_export.called
+    kwargs = mock_export.call_args.kwargs
+    assert kwargs.get("include_network") is False, (
+        "broad-Exception fallback must drop network rows entirely; "
+        "leaving include_network=True with pipeline=None feeds "
+        "ciphertext bytes to the JSONL writer"
+    )
+    assert kwargs.get("network_scrub_pipeline") is None
+    # User sees a yellow warning so they know network events were
+    # silently omitted.
+    flattened = " ".join(result.output.split())
+    assert "Warning" in flattened
+    assert "omit network events" in flattened
+
+
 # --- upload auto-export tests ---
 
 
@@ -1208,3 +1603,220 @@ class TestNetworkCommandGroup:
             result = runner.invoke(cli, ["network", "uninstall"])
         assert result.exit_code == 0
         full_mock.assert_called_once()
+
+
+class TestNetworkRemoveKekCommand:
+    """V1.5 surface: `screencap network remove-kek` + safety check."""
+
+    def _make_recording(
+        self,
+        recordings_dir,
+        name: str,
+        *,
+        with_meta: bool = True,
+        with_ciphertext: bool = True,
+    ) -> None:
+        """Create a recording dir with a recording.db.
+
+        ``with_meta``: insert a network_event_meta row (V1.5 vintage).
+        ``with_ciphertext``: insert a network_event row with non-NULL
+        body_ciphertext (must be True to block remove-kek per the
+        post-PR-#157 ciphertext-presence semantics).
+        """
+        from screencap.engine.db import (
+            create_db,
+            crud,
+            get_session_for_path,
+        )
+
+        rec_dir = recordings_dir / name
+        rec_dir.mkdir(parents=True)
+        db_path = rec_dir / "recording.db"
+        create_db(str(db_path))
+        session = get_session_for_path(str(db_path))
+        try:
+            from screencap.engine.db.models import Recording
+            rec = Recording(
+                task_description=name,
+                timestamp=1.0,
+            )
+            session.add(rec)
+            session.commit()
+            if with_meta:
+                crud.insert_network_event_meta(
+                    session,
+                    recording_id=rec.id,
+                    dek_wrapped=b"\x00" * 32,
+                    dek_nonce=b"\x00" * 12,
+                )
+            if with_ciphertext:
+                crud.insert_network_event(session, rec, {
+                    "kind": "request",
+                    "flow_id": "f1",
+                    "method": "POST",
+                    "url": "https://api.github.com/x",
+                    "host": "api.github.com",
+                    "body_ciphertext": b"\xde\xad\xbe\xef" * 4,
+                    "body_nonce": b"\x01" * 12,
+                    "body_aad": b"some-aad",
+                    "timestamp": 1.0,
+                    "timestamp_ns": 1_000_000_000,
+                })
+                crud.flush_buffers(session)
+                session.commit()
+        finally:
+            session.close()
+
+    def test_remove_kek_no_encrypted_recordings_succeeds(self, tmp_path, monkeypatch):
+        from unittest.mock import patch as _patch
+
+        recordings_dir = tmp_path / "recordings"
+        recordings_dir.mkdir()
+        monkeypatch.setenv("SCREENCAP_RECORDINGS_DIR", str(recordings_dir))
+
+        runner = CliRunner()
+        with _patch("keyring.delete_password") as delete_mock:
+            result = runner.invoke(cli, ["network", "remove-kek"])
+        assert result.exit_code == 0
+        delete_mock.assert_called_once()
+
+    def test_remove_kek_blocked_by_encrypted_recording(self, tmp_path, monkeypatch):
+        from unittest.mock import patch as _patch
+
+        recordings_dir = tmp_path / "recordings"
+        recordings_dir.mkdir()
+        monkeypatch.setenv("SCREENCAP_RECORDINGS_DIR", str(recordings_dir))
+        self._make_recording(recordings_dir, "rec-encrypted")
+
+        runner = CliRunner()
+        with _patch("keyring.delete_password") as delete_mock:
+            result = runner.invoke(cli, ["network", "remove-kek"])
+        assert result.exit_code == 1
+        assert "rec-encrypted" in result.output
+        assert "Refusing to delete KEK" in result.output
+        # Critically: the deletion is NOT performed.
+        delete_mock.assert_not_called()
+
+    def test_remove_kek_force_overrides_safety(self, tmp_path, monkeypatch):
+        from unittest.mock import patch as _patch
+
+        recordings_dir = tmp_path / "recordings"
+        recordings_dir.mkdir()
+        monkeypatch.setenv("SCREENCAP_RECORDINGS_DIR", str(recordings_dir))
+        self._make_recording(recordings_dir, "rec-encrypted")
+
+        runner = CliRunner()
+        with _patch("keyring.delete_password") as delete_mock:
+            result = runner.invoke(cli, ["network", "remove-kek", "--force"])
+        assert result.exit_code == 0
+        assert "--force given" in result.output
+        delete_mock.assert_called_once()
+
+    def test_remove_kek_does_not_block_metadata_only_recording(
+        self, tmp_path, monkeypatch,
+    ):
+        """V1.5 P2 fix: a recording where the user only browsed
+        non-allowlisted hosts has a network_event_meta row (pre-flight
+        always inserts one) but every body_ciphertext is NULL. Such a
+        recording must NOT block ``network remove-kek`` — the wrapped
+        DEK on disk is decryption-irrelevant.
+
+        Before this fix, the safety scan blocked remove-kek for ANY
+        V1.5 --network recording, regardless of whether ciphertext was
+        actually persisted.
+        """
+        from unittest.mock import patch as _patch
+
+        recordings_dir = tmp_path / "recordings"
+        recordings_dir.mkdir()
+        monkeypatch.setenv("SCREENCAP_RECORDINGS_DIR", str(recordings_dir))
+        # V1.5 metadata-only: meta row present, NO ciphertext rows.
+        self._make_recording(
+            recordings_dir,
+            "rec-metadata-only",
+            with_meta=True,
+            with_ciphertext=False,
+        )
+
+        runner = CliRunner()
+        with _patch("keyring.delete_password") as delete_mock:
+            result = runner.invoke(cli, ["network", "remove-kek"])
+        assert result.exit_code == 0, result.output
+        # The deletion DID proceed — no encrypted bodies exist on disk.
+        delete_mock.assert_called_once()
+        assert "Refusing to delete KEK" not in result.output
+
+    def test_remove_kek_blocked_by_unreadable_db_fail_closed(
+        self, tmp_path, monkeypatch,
+    ):
+        """V1.5 round-4 P2: a recording.db that fails to open must
+        block remove-kek (fail closed). KEK deletion is irreversible
+        and silently skipping unreadable recordings could orphan
+        ciphertext we never had a chance to inspect.
+        """
+        from unittest.mock import patch as _patch
+
+        recordings_dir = tmp_path / "recordings"
+        recordings_dir.mkdir()
+        monkeypatch.setenv("SCREENCAP_RECORDINGS_DIR", str(recordings_dir))
+        # Create a recording dir with a corrupted recording.db.
+        bad_dir = recordings_dir / "rec-corrupt"
+        bad_dir.mkdir()
+        (bad_dir / "recording.db").write_text("this is not a valid sqlite db")
+
+        runner = CliRunner()
+        with _patch("keyring.delete_password") as delete_mock:
+            result = runner.invoke(cli, ["network", "remove-kek"])
+        assert result.exit_code == 1
+        # User sees the unreadable recording surfaced — silent skip
+        # is exactly the fail-open mode the round-4 review flagged.
+        flattened = " ".join(result.output.split())
+        assert "rec-corrupt" in flattened
+        assert "could not be scanned" in flattened
+        delete_mock.assert_not_called()
+
+    def test_remove_kek_force_overrides_unreadable_db(
+        self, tmp_path, monkeypatch,
+    ):
+        """--force MUST be required to override the unreadable-DB
+        fail-closed. Same contract as encrypted-recordings: the user
+        explicitly accepts the risk."""
+        from unittest.mock import patch as _patch
+
+        recordings_dir = tmp_path / "recordings"
+        recordings_dir.mkdir()
+        monkeypatch.setenv("SCREENCAP_RECORDINGS_DIR", str(recordings_dir))
+        bad_dir = recordings_dir / "rec-corrupt"
+        bad_dir.mkdir()
+        (bad_dir / "recording.db").write_text("corrupt")
+
+        runner = CliRunner()
+        with _patch("keyring.delete_password") as delete_mock:
+            result = runner.invoke(
+                cli, ["network", "remove-kek", "--force"],
+            )
+        assert result.exit_code == 0
+        flattened = " ".join(result.output.split())
+        assert "could not be scanned" in flattened
+        delete_mock.assert_called_once()
+
+    def test_remove_kek_idempotent_when_kek_absent(self, tmp_path, monkeypatch):
+        """No KEK in keychain → still exits 0 (idempotent)."""
+        from unittest.mock import patch as _patch
+
+        recordings_dir = tmp_path / "recordings"
+        recordings_dir.mkdir()
+        monkeypatch.setenv("SCREENCAP_RECORDINGS_DIR", str(recordings_dir))
+
+        # Simulate keyring's PasswordDeleteError shape with the friendly text.
+        class _FakeNoSuchPassword(Exception):
+            pass
+        _FakeNoSuchPassword.__name__ = "PasswordDeleteError"
+        runner = CliRunner()
+        with _patch(
+            "keyring.delete_password",
+            side_effect=_FakeNoSuchPassword("no such password"),
+        ):
+            result = runner.invoke(cli, ["network", "remove-kek"])
+        assert result.exit_code == 0
+        assert "already removed" in result.output

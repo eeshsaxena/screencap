@@ -62,6 +62,56 @@ DEFAULT_BLOCKLIST: frozenset[str] = frozenset({
 })
 
 
+# Curated default body-capture allowlist (V1.5).
+#
+# Inclusion criteria:
+#   - Knowledge-work productivity, developer tools, or AI tools.
+#   - Provides API responses materially useful for grounding model behavior.
+#   - Does NOT overlap with :data:`DEFAULT_BLOCKLIST` (auth/banking/password-
+#     managers always win regardless of any allowlist match — see
+#     :func:`is_host_in_capture_bodies_for` for the enforcement site).
+#
+# Notes:
+#   - This list is reviewed each major release alongside :data:`DEFAULT_BLOCKLIST`.
+#   - Users can extend via ``[network] capture_bodies_for`` (UNION semantics)
+#     or replace entirely via ``override_default_capture_bodies_for = true``.
+#   - All entries are stored as suffix patterns (bare or ``*.``-prefixed),
+#     matched via :func:`_matches_suffix` — same suffix-only invariant as
+#     :data:`DEFAULT_BLOCKLIST` to prevent substring-bypass attacks.
+#   - Microsoft 365 entry is the conservative subset (``*.office.com`` only,
+#     not the much broader ``*.microsoft.com``) per the V1.5 ticket's
+#     "Pre-V1.5 decisions (locked 2026-04-29)" block.
+#
+# See ``docs/tickets/medium-2026-04-27-feat-network-logging-v1.5-bodies.md``
+# for the locked-decisions block backing the contents below.
+DEFAULT_CAPTURE_BODIES_FOR: frozenset[str] = frozenset({
+    # Developer tools
+    "*.github.com",
+    "api.github.com",
+    "api.linear.app",
+    "*.linear.app",
+    "*.atlassian.net",
+    "*.atlassian.com",
+    # Productivity
+    "*.notion.so",
+    "*.notion.com",
+    "docs.google.com",
+    "sheets.google.com",
+    "slides.google.com",
+    "drive.google.com",
+    "*.slack.com",
+    "*.figma.com",
+    # AI tools
+    "chat.openai.com",
+    "chatgpt.com",
+    "api.openai.com",
+    "claude.ai",
+    "*.anthropic.com",
+    # Microsoft 365 (subset — no broad *.microsoft.com)
+    "*.office.com",
+})
+
+
 def is_ip_literal(host: str) -> bool:
     """Return ``True`` iff ``host`` is an IPv4 or IPv6 literal.
 
@@ -129,6 +179,54 @@ def is_host_blocked(
             if _matches_suffix(host, entry):
                 return True
 
+    return False
+
+
+def effective_capture_bodies_for(
+    network_config: "NetworkConfig",
+) -> frozenset[str]:
+    """Return the effective body-capture allowlist for ``network_config``.
+
+    Pre-flight uses this to detect "empty allowlist" — i.e. metadata-only
+    capture for all hosts — and emit a warning. The capture addon
+    consults the same set at request time via :func:`is_host_in_capture_bodies_for`.
+
+    Semantics:
+        * ``override_default_capture_bodies_for=False`` (default): user's
+          ``capture_bodies_for`` UNIONED with :data:`DEFAULT_CAPTURE_BODIES_FOR`.
+        * ``override_default_capture_bodies_for=True``: user's list ONLY
+          (may be empty — that is an explicit "metadata-only" posture).
+    """
+    if network_config.override_default_capture_bodies_for:
+        return network_config.capture_bodies_for
+    return network_config.capture_bodies_for | DEFAULT_CAPTURE_BODIES_FOR
+
+
+def is_host_in_capture_bodies_for(
+    host: str,
+    privacy_config: "PrivacyConfig",
+    network_config: "NetworkConfig",
+) -> bool:
+    """Return True iff body bytes for ``host`` should be retained (encrypted).
+
+    **Fail-closed semantics:** body capture is OFF unless the host explicitly
+    matches the effective allowlist. The blocklist always wins on overlap —
+    a host covered by :func:`is_host_blocked` returns False here even if
+    the user added it to ``capture_bodies_for`` (auth/banking/password-managers
+    can never be body-captured).
+
+    The effective allowlist is computed by :func:`effective_capture_bodies_for`.
+    Suffix-match semantics mirror :func:`_matches_suffix`: bare or
+    ``*.``-prefixed entries match the apex or any subdomain; never substring
+    containment (the privacy-bypass pattern that suffix-match prevents).
+    """
+    if not host:
+        return False
+    if is_host_blocked(host, privacy_config, network_config):
+        return False
+    for entry in effective_capture_bodies_for(network_config):
+        if _matches_suffix(host, entry):
+            return True
     return False
 
 

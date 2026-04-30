@@ -54,6 +54,7 @@ class EventType(str, Enum):
     NETWORK_WS_UPGRADE = "network.ws_upgrade"
     NETWORK_WS_FRAME = "network.ws_frame"
     NETWORK_DROP_BURST = "network.drop_burst"
+    NETWORK_TUNNELED = "network.tunneled"
 
 
 class MouseButton(str, Enum):
@@ -462,6 +463,14 @@ class NetworkRequestEvent(BaseEvent):
     each body and discards the bytes. body_size is the observed Content-Length
     (or counted streamed bytes); body_sha256_hex is the hex digest if the
     body was hashed; otherwise both are None.
+
+    V1.5: optional body_ciphertext/body_nonce/body_aad for encrypted body
+    capture; metadata-only when None. Capture-side events flow through
+    `multiprocessing.Queue` (pickle, NOT JSON) and SQLAlchemy `LargeBinary`
+    columns - they MUST never reach JSONL because that would leak
+    ciphertext. The export-side `NetworkRequestExportEvent` (with
+    `body_text`, no ciphertext) is the JSON-emitted form, constructed by
+    `NetworkScrubPipeline.decrypt_and_scrub` at export time.
     """
 
     type: Literal[EventType.NETWORK_REQUEST] = EventType.NETWORK_REQUEST
@@ -484,10 +493,31 @@ class NetworkRequestEvent(BaseEvent):
     )
     content_type: str | None = Field(default=None, description="Content-Type header value")
     http_version: str | None = Field(default=None, description="HTTP/1.1 / HTTP/2 / HTTP/3")
+    body_ciphertext: bytes | None = Field(
+        default=None,
+        description="V1.5: AES-256-GCM ciphertext of the body (None for V1 / metadata-only)",
+    )
+    body_nonce: bytes | None = Field(
+        default=None,
+        description="V1.5: 12-byte AES-GCM nonce paired with body_ciphertext",
+    )
+    body_aad: bytes | None = Field(
+        default=None,
+        description="V1.5: AES-GCM associated data bound to the ciphertext "
+                    "(canonical-JSON form of recording_id+flow_id+event_type+ts_ns)",
+    )
 
 
 class NetworkResponseEvent(BaseEvent):
-    """HTTP response observed by the system proxy."""
+    """HTTP response observed by the system proxy.
+
+    V1.5: optional body_ciphertext/body_nonce/body_aad for encrypted body
+    capture; metadata-only when None. Capture-side events flow through
+    `multiprocessing.Queue` (pickle, NOT JSON) and SQLAlchemy `LargeBinary`
+    columns - they MUST never reach JSONL because that would leak
+    ciphertext. The export-side `NetworkResponseExportEvent` (with
+    `body_text`, no ciphertext) is the JSON-emitted form.
+    """
 
     type: Literal[EventType.NETWORK_RESPONSE] = EventType.NETWORK_RESPONSE
     timestamp_ns: int = Field(description="High-precision sort key (time.time_ns())")
@@ -508,6 +538,18 @@ class NetworkResponseEvent(BaseEvent):
     )
     content_type: str | None = Field(default=None, description="Content-Type header value")
     http_version: str | None = Field(default=None, description="HTTP/1.1 / HTTP/2 / HTTP/3")
+    body_ciphertext: bytes | None = Field(
+        default=None,
+        description="V1.5: AES-256-GCM ciphertext of the body (None for V1 / metadata-only)",
+    )
+    body_nonce: bytes | None = Field(
+        default=None,
+        description="V1.5: 12-byte AES-GCM nonce paired with body_ciphertext",
+    )
+    body_aad: bytes | None = Field(
+        default=None,
+        description="V1.5: AES-GCM associated data bound to the ciphertext",
+    )
 
 
 class NetworkWebSocketUpgradeEvent(BaseEvent):
@@ -516,6 +558,12 @@ class NetworkWebSocketUpgradeEvent(BaseEvent):
     `headers` carries the response headers (the 101 response). The request
     headers are stored in `details_json["request_headers"]` because this is
     the only event kind that needs both header sets in a single row.
+
+    V1.5: optional body_ciphertext/body_nonce/body_aad for encrypted body
+    capture; metadata-only when None. Capture-side events flow through
+    `multiprocessing.Queue` (pickle, NOT JSON) and SQLAlchemy `LargeBinary`
+    columns - they MUST never reach JSONL. The export-side
+    `NetworkWebSocketUpgradeExportEvent` is the JSON-emitted form.
     """
 
     type: Literal[EventType.NETWORK_WS_UPGRADE] = EventType.NETWORK_WS_UPGRADE
@@ -534,6 +582,18 @@ class NetworkWebSocketUpgradeEvent(BaseEvent):
         description="Carries request_headers for the upgrade: "
                     "{'request_headers': [[name, value], ...]}",
     )
+    body_ciphertext: bytes | None = Field(
+        default=None,
+        description="V1.5: AES-256-GCM ciphertext of the body (None for V1 / metadata-only)",
+    )
+    body_nonce: bytes | None = Field(
+        default=None,
+        description="V1.5: 12-byte AES-GCM nonce paired with body_ciphertext",
+    )
+    body_aad: bytes | None = Field(
+        default=None,
+        description="V1.5: AES-GCM associated data bound to the ciphertext",
+    )
 
 
 class NetworkWebSocketFrameEvent(BaseEvent):
@@ -542,6 +602,12 @@ class NetworkWebSocketFrameEvent(BaseEvent):
     `direction` is "sent" (client to server) or "received" (server to client).
     `frame_type` is "text" or "binary" (control frames are not emitted as
     events in V1).
+
+    V1.5: optional body_ciphertext/body_nonce/body_aad for encrypted body
+    capture; metadata-only when None. Capture-side events flow through
+    `multiprocessing.Queue` (pickle, NOT JSON) and SQLAlchemy `LargeBinary`
+    columns - they MUST never reach JSONL. The export-side
+    `NetworkWebSocketFrameExportEvent` is the JSON-emitted form.
     """
 
     type: Literal[EventType.NETWORK_WS_FRAME] = EventType.NETWORK_WS_FRAME
@@ -559,6 +625,174 @@ class NetworkWebSocketFrameEvent(BaseEvent):
     body_sha256_hex: str | None = Field(
         default=None,
         description="Lowercase hex of SHA-256(payload), or None if not hashed",
+    )
+    body_ciphertext: bytes | None = Field(
+        default=None,
+        description="V1.5: AES-256-GCM ciphertext of the frame payload (None for V1 / metadata-only)",
+    )
+    body_nonce: bytes | None = Field(
+        default=None,
+        description="V1.5: 12-byte AES-GCM nonce paired with body_ciphertext",
+    )
+    body_aad: bytes | None = Field(
+        default=None,
+        description="V1.5: AES-GCM associated data bound to the ciphertext",
+    )
+
+
+# =============================================================================
+# Network Events (V1.5 - Export-side parallel family)
+# =============================================================================
+#
+# Export-side classes carry plaintext `body_text` (scrubbed) instead of
+# ciphertext. They are constructed by NetworkScrubPipeline.decrypt_and_scrub()
+# at export time; ciphertext is decrypted, scrubbed plaintext is stored in
+# body_text; these classes never carry body_ciphertext, by construction.
+#
+# Inheritance: pydantic.BaseModel (NOT BaseEvent) - same pattern as
+# NetworkPinFailureEvent. Rationale: BaseEvent + Literal[EventType.X] would
+# collide with capture-side classes in EVENT_TYPE_MAP. The TestEventTypeMap
+# test at tests/engine/test_storage.py walks BaseEvent subclasses and would
+# fail on a duplicate type literal. Bare BaseModel sidesteps that test,
+# mirroring the established sideband-event pattern. Each export-side class
+# keeps `type` as a Literal[EventType.X] = EventType.X so the JSONL line
+# still has the expected `type` discriminator for downstream consumers.
+
+
+class NetworkRequestExportEvent(BaseModel):
+    """Export-side HTTP request event with scrubbed plaintext body.
+
+    Constructed by `NetworkScrubPipeline.decrypt_and_scrub()` at export
+    time; the capture-side ciphertext is decrypted and the scrubbed
+    plaintext is stored in `body_text`. This class never carries
+    `body_ciphertext`, by construction - that is the safety contract.
+    Bare `BaseModel` (NOT `BaseEvent`) so it never registers in
+    `EVENT_TYPE_MAP` and never collides with the capture-side class.
+    """
+
+    type: Literal[EventType.NETWORK_REQUEST] = EventType.NETWORK_REQUEST
+    timestamp: float = Field(description="Unix timestamp in seconds (float for sub-ms precision)")
+    timestamp_ns: int = Field(description="High-precision sort key (time.time_ns())")
+    flow_id: str = Field(description="mitmproxy flow id (correlates request/response/ws frames)")
+    method: str = Field(description="HTTP method, e.g. 'GET', 'POST'")
+    url: str = Field(description="Full request URL")
+    host: str = Field(description="Request host (lowercase)")
+    headers: list[tuple[str, str]] = Field(
+        default_factory=list,
+        description="Ordered name/value pairs (preserves multi-value headers)",
+    )
+    body_size: int | None = Field(
+        default=None,
+        description="Observed body size in bytes (None if unknown or no body)",
+    )
+    body_sha256_hex: str | None = Field(
+        default=None,
+        description="Lowercase hex of SHA-256(body), or None if no body / not hashed",
+    )
+    content_type: str | None = Field(default=None, description="Content-Type header value")
+    http_version: str | None = Field(default=None, description="HTTP/1.1 / HTTP/2 / HTTP/3")
+    body_text: str | None = Field(
+        default=None,
+        description="Scrubbed plaintext body (None if no body, not captured, or scrubbed-empty)",
+    )
+
+
+class NetworkResponseExportEvent(BaseModel):
+    """Export-side HTTP response event with scrubbed plaintext body.
+
+    Constructed by `NetworkScrubPipeline.decrypt_and_scrub()` at export
+    time; the capture-side ciphertext is decrypted and the scrubbed
+    plaintext is stored in `body_text`. This class never carries
+    `body_ciphertext`, by construction.
+    """
+
+    type: Literal[EventType.NETWORK_RESPONSE] = EventType.NETWORK_RESPONSE
+    timestamp: float = Field(description="Unix timestamp in seconds (float for sub-ms precision)")
+    timestamp_ns: int = Field(description="High-precision sort key (time.time_ns())")
+    flow_id: str = Field(description="mitmproxy flow id (correlates with request)")
+    host: str = Field(description="Request host (lowercase)")
+    status: int = Field(description="HTTP status code")
+    headers: list[tuple[str, str]] = Field(
+        default_factory=list,
+        description="Ordered name/value pairs (preserves multi-value headers)",
+    )
+    body_size: int | None = Field(
+        default=None,
+        description="Observed body size in bytes (None if unknown or no body)",
+    )
+    body_sha256_hex: str | None = Field(
+        default=None,
+        description="Lowercase hex of SHA-256(body), or None if no body / not hashed",
+    )
+    content_type: str | None = Field(default=None, description="Content-Type header value")
+    http_version: str | None = Field(default=None, description="HTTP/1.1 / HTTP/2 / HTTP/3")
+    body_text: str | None = Field(
+        default=None,
+        description="Scrubbed plaintext body (None if no body, not captured, or scrubbed-empty)",
+    )
+
+
+class NetworkWebSocketUpgradeExportEvent(BaseModel):
+    """Export-side WebSocket upgrade event with scrubbed plaintext body.
+
+    Constructed by `NetworkScrubPipeline.decrypt_and_scrub()` at export
+    time; the capture-side ciphertext is decrypted and the scrubbed
+    plaintext is stored in `body_text`. This class never carries
+    `body_ciphertext`, by construction.
+    """
+
+    type: Literal[EventType.NETWORK_WS_UPGRADE] = EventType.NETWORK_WS_UPGRADE
+    timestamp: float = Field(description="Unix timestamp in seconds (float for sub-ms precision)")
+    timestamp_ns: int = Field(description="High-precision sort key (time.time_ns())")
+    flow_id: str = Field(description="mitmproxy flow id")
+    url: str = Field(description="WebSocket URL (ws:// or wss://)")
+    host: str = Field(description="Host (lowercase)")
+    status: int = Field(default=101, description="Upgrade status code (101)")
+    headers: list[tuple[str, str]] = Field(
+        default_factory=list,
+        description="Response (101) headers",
+    )
+    http_version: str | None = Field(default=None, description="HTTP version of the upgrade")
+    details_json: dict | None = Field(
+        default=None,
+        description="Carries request_headers for the upgrade: "
+                    "{'request_headers': [[name, value], ...]}",
+    )
+    body_text: str | None = Field(
+        default=None,
+        description="Scrubbed plaintext body (None if no body, not captured, or scrubbed-empty)",
+    )
+
+
+class NetworkWebSocketFrameExportEvent(BaseModel):
+    """Export-side WebSocket frame event with scrubbed plaintext body.
+
+    Constructed by `NetworkScrubPipeline.decrypt_and_scrub()` at export
+    time; the capture-side ciphertext is decrypted and the scrubbed
+    plaintext is stored in `body_text`. This class never carries
+    `body_ciphertext`, by construction.
+    """
+
+    type: Literal[EventType.NETWORK_WS_FRAME] = EventType.NETWORK_WS_FRAME
+    timestamp: float = Field(description="Unix timestamp in seconds (float for sub-ms precision)")
+    timestamp_ns: int = Field(description="High-precision sort key (time.time_ns())")
+    flow_id: str = Field(description="mitmproxy flow id (correlates with upgrade)")
+    host: str = Field(description="Host (lowercase)")
+    direction: Literal["sent", "received"] = Field(
+        description="'sent' = client->server, 'received' = server->client",
+    )
+    frame_type: Literal["text", "binary"] = Field(description="WebSocket frame type")
+    body_size: int | None = Field(
+        default=None,
+        description="Observed frame payload size in bytes",
+    )
+    body_sha256_hex: str | None = Field(
+        default=None,
+        description="Lowercase hex of SHA-256(payload), or None if not hashed",
+    )
+    body_text: str | None = Field(
+        default=None,
+        description="Scrubbed plaintext body (None if no body, not captured, or scrubbed-empty)",
     )
 
 
@@ -582,6 +816,30 @@ class NetworkDropBurstEvent(BaseEvent):
     details_json: dict = Field(
         description="{'dropped_count': int, 'hosts_affected': [...], "
                     "'source': 'addon'|'reader'}",
+    )
+
+
+class NetworkTunneledEvent(BaseEvent):
+    """V1.5: time span during which a host was unobservable due to TLS pinning.
+
+    Emitted at recording end (addon ``done()``) — one event per host that
+    was added to the runtime tunnel-set during the recording. Lets the
+    training pipeline mark "API-not-observable" time spans rather than
+    silently treating them as "no traffic happened."
+
+    Distinct from :class:`NetworkPinFailureEvent`, which is a control-only
+    sideband message printed once on first detection. ``NetworkTunneledEvent``
+    is a real persisted DB row and a JSONL line, summarizing the entire span.
+    """
+
+    type: Literal[EventType.NETWORK_TUNNELED] = EventType.NETWORK_TUNNELED
+    timestamp_ns: int = Field(description="High-precision sort key (time.time_ns())")
+    host: str = Field(description="Host that was tunneled (lowercase)")
+    started_at: float = Field(
+        description="Unix seconds — first time the host was added to the runtime tunnel set",
+    )
+    duration_seconds: float = Field(
+        description="Elapsed seconds from started_at to recording end (or now)",
     )
 
 
@@ -646,6 +904,7 @@ NetworkEvent = (
     | NetworkWebSocketUpgradeEvent
     | NetworkWebSocketFrameEvent
     | NetworkDropBurstEvent
+    | NetworkTunneledEvent
 )
 
 Event = ActionEvent | ScreenEvent | AudioEvent | WindowEvent | NetworkEvent
@@ -685,4 +944,5 @@ EVENT_TYPE_MAP: dict[str, type[Event]] = {
     EventType.NETWORK_WS_UPGRADE.value: NetworkWebSocketUpgradeEvent,
     EventType.NETWORK_WS_FRAME.value: NetworkWebSocketFrameEvent,
     EventType.NETWORK_DROP_BURST.value: NetworkDropBurstEvent,
+    EventType.NETWORK_TUNNELED.value: NetworkTunneledEvent,
 }

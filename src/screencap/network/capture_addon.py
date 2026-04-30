@@ -1,4 +1,4 @@
-"""Mitmproxy capture addon (V1 — metadata-only).
+"""Mitmproxy capture addon (V1 — metadata-only; V1.5 — encrypted bodies).
 
 The :class:`NetworkCapture` addon hooks the standard mitmproxy lifecycle
 events and pushes Pydantic-shaped metadata events onto a
@@ -6,6 +6,36 @@ events and pushes Pydantic-shaped metadata events onto a
 body retention and NO encryption**: every body is hashed (over WIRE
 bytes) and the bytes themselves are discarded. Only the size + sha256
 hex digest survive.
+
+V1.5 body capture
+-----------------
+When the addon is constructed with a non-None ``dek`` and the host is
+in the effective body-capture allowlist (see
+:func:`screencap.network.blocklist.is_host_in_capture_bodies_for`),
+``request()`` / ``response()`` / ``websocket_message()`` ALSO encrypt
+the DECODED body (``flow.{request,response}.content`` — the gunzipped
+form) under AES-256-GCM bound to a per-event AAD constructed by
+:func:`screencap.network.crypto.aad_bytes`. The ciphertext, nonce and
+AAD are populated on the emitted Pydantic event (``body_ciphertext`` /
+``body_nonce`` / ``body_aad``).
+
+The V1 wire-bytes hashing path (``_finalize_body_hash``,
+``make_hash_transformer``, ``_should_stream``) is UNCHANGED — body_size
+and body_sha256_hex remain wire-byte values per the V1 schema lock-in.
+
+Decoded vs wire: a server with ``Content-Encoding: gzip`` and
+``Content-Length: 5KB`` could deliver a 200KB decoded body. The wire
+size passed the streaming-decision cap, but the storage cost is the
+decoded size. We therefore re-check ``len(decoded) <= body_size_cap``
+before encrypting; bodies whose decoded form exceeds the cap stay
+metadata-only. Encrypting decoded bytes also lets the export-time
+scrubber operate against plaintext directly without gunzipping.
+
+Streaming bodies (large or chunked) stay metadata-only in V1.5
+regardless of the host allowlist: buffering up to ``body_size_cap``
+bytes inside the chunk-hashing transformer would defeat the point of
+streaming (one of the reasons we stream is precisely to avoid such
+buffering).
 
 Concurrency model
 -----------------
@@ -60,14 +90,20 @@ from typing import TYPE_CHECKING, Any, Callable
 
 from screencap.engine.convert import bytes_to_hex
 from screencap.engine.events import (
+    EventType,
     NetworkDropBurstEvent,
     NetworkPinFailureEvent,
     NetworkRequestEvent,
     NetworkResponseEvent,
+    NetworkTunneledEvent,
     NetworkWebSocketFrameEvent,
     NetworkWebSocketUpgradeEvent,
 )
-from screencap.network.blocklist import is_host_blocked
+from screencap.network import crypto as _crypto
+from screencap.network.blocklist import (
+    is_host_blocked,
+    is_host_in_capture_bodies_for,
+)
 from screencap.network.redaction import redact_headers, redact_url_query
 
 if TYPE_CHECKING:
@@ -199,18 +235,63 @@ class NetworkCapture:
         network_config: "NetworkConfig",
         privacy_config: "PrivacyConfig",
         log_path: Path | None,
+        *,
+        dek: bytes | None = None,
     ) -> None:
+        """Construct a capture addon.
+
+        Args:
+            out_q: ``multiprocessing.Queue`` (or duck-type) the addon
+                pushes events onto.
+            recording_id: integer identifier for the active recording
+                (used as the ``r`` field of every per-event AAD; see
+                :func:`screencap.network.crypto.aad_bytes`).
+            network_config: parsed ``[network]`` config table.
+            privacy_config: parsed ``[privacy]`` config table.
+            log_path: diagnostic log file (best-effort writes; ``None``
+                disables logging).
+            dek: V1.5 per-recording Data Encryption Key (32 bytes).
+                When ``None`` (default — preserves V1 callers and tests
+                that don't supply one), the body-encryption branches
+                are SKIPPED entirely and the addon emits metadata-only
+                events exactly as in V1. When set, bodies for hosts in
+                the effective allowlist (and within the size cap, on
+                non-streamed flows) are encrypted with this key under
+                AES-256-GCM and emitted on the
+                ``body_ciphertext`` / ``body_nonce`` / ``body_aad``
+                fields of the Pydantic event.
+        """
         self._out_q = out_q
         self._recording_id = recording_id
         self._network_config = network_config
         self._privacy_config = privacy_config
         self._log_path = log_path
+        self._dek = dek
 
         self._stream_state: dict[str, dict[str, Any]] = {}
         self._dropped_count: int = 0
         self._dropped_hosts: set[str] = set()
         self._dropped_window_start_ns: int | None = None
-        self._runtime_tunnel_hosts: set[str] = set()
+        # V1.5: seed runtime_tunnel_hosts with previously-detected pinned
+        # hosts so a host that failed in recording N never fails again in
+        # recording N+1. Best-effort load — file IO errors give an empty
+        # set (V1 behavior preserved).
+        from screencap.network import pinned_hosts as _pin  # noqa: PLC0415
+        try:
+            self._runtime_tunnel_hosts: set[str] = _pin.load_known_pinned_hosts()
+        except Exception:  # noqa: BLE001 — pre-loaded cache is best-effort
+            self._runtime_tunnel_hosts = set()
+        # V1.5: hosts ACTUALLY OBSERVED as tunneled during this recording
+        # (subset of ``_runtime_tunnel_hosts``). Populated from
+        # ``tls_clienthello`` (when ``ignore_connection`` fires) and
+        # ``error()`` (mid-recording new pin failure). ``done()`` emits
+        # one ``network.tunneled`` event per host in THIS set, NOT the
+        # cache — otherwise every recording would emit bogus tunneled
+        # events for every host the user has ever encountered.
+        self._observed_tunnel_hosts: set[str] = set()
+        # Track each host's first-observed-this-recording timestamp so
+        # the network.tunneled event has accurate started_at.
+        self._tunnel_started_at: dict[str, float] = {}
         self._pin_failure_emitted: set[str] = set()
         self._loop: asyncio.AbstractEventLoop | None = None
         self._drop_burst_timer_handle: asyncio.TimerHandle | None = None
@@ -242,8 +323,45 @@ class NetworkCapture:
                 pass
             self._drop_burst_timer_handle = None
 
+        # First flush captures everything accumulated DURING the
+        # recording. After this, _dropped_count is reset to 0.
         flushed_count = self._dropped_count
         if flushed_count > 0:
+            self._emit_drop_burst(blocking=True)
+
+        # V1.5 task 11: emit one network.tunneled event per host that was
+        # ACTUALLY OBSERVED as tunneled during this recording. Iterates
+        # ``_observed_tunnel_hosts`` (populated by tls_clienthello and
+        # error()) rather than ``_runtime_tunnel_hosts`` (which would
+        # include every host the user has ever pinned across all past
+        # recordings — a bogus signal). Lets the training pipeline mark
+        # API-not-observable time spans rather than silently treating
+        # them as no-traffic windows.
+        now = time.time()
+        for host in sorted(self._observed_tunnel_hosts):
+            started_at = self._tunnel_started_at.get(host, now)
+            duration = max(0.0, now - started_at)
+            try:
+                tunneled_event = NetworkTunneledEvent(
+                    timestamp=now,
+                    timestamp_ns=time.time_ns(),
+                    host=host,
+                    started_at=started_at,
+                    duration_seconds=duration,
+                )
+                self._enqueue(tunneled_event, host=host)
+            except Exception:  # noqa: BLE001
+                _log(self._log_path, f"failed to emit network.tunneled for {host}")
+
+        # Second flush: tunneled emissions above can themselves hit
+        # queue.Full (every _enqueue routes through _record_drop on
+        # backpressure). Without this second flush, drops attributed to
+        # shutdown emission are silently lost — the consumer would see
+        # network.tunneled events for some hosts but no marker that the
+        # rest got dropped. Flushes are idempotent (zero-count is a
+        # no-op), so an extra flush when no shutdown drops occurred
+        # costs nothing.
+        if self._dropped_count > 0:
             self._emit_drop_burst(blocking=True)
 
         _log(
@@ -292,16 +410,27 @@ class NetworkCapture:
 
         try:
             self._flow_count += 1
+            # Single ts_ns source — the AAD MUST match the event's
+            # timestamp_ns or decrypt will raise InvalidTag at export.
+            ts_ns = time.time_ns()
+            ts = ts_ns / 1e9
 
             headers = redact_headers(_headers_to_list(flow.request.headers))
             url = redact_url_query(flow.request.url)
             body_size, body_sha_hex = self._finalize_body_hash(
                 flow, "req", flow.request
             )
+            body_ciphertext, body_nonce, body_aad = self._maybe_encrypt_body(
+                flow,
+                flow.request,
+                direction="req",
+                event_type=EventType.NETWORK_REQUEST.value,
+                ts_ns=ts_ns,
+            )
 
             event = NetworkRequestEvent(
-                timestamp=time.time(),
-                timestamp_ns=time.time_ns(),
+                timestamp=ts,
+                timestamp_ns=ts_ns,
                 flow_id=flow.id,
                 method=flow.request.method,
                 url=url,
@@ -311,6 +440,9 @@ class NetworkCapture:
                 body_sha256_hex=body_sha_hex,
                 content_type=flow.request.headers.get("content-type"),
                 http_version=getattr(flow.request, "http_version", None),
+                body_ciphertext=body_ciphertext,
+                body_nonce=body_nonce,
+                body_aad=body_aad,
             )
             self._enqueue(event, host=flow.request.host)
         finally:
@@ -351,14 +483,24 @@ class NetworkCapture:
             return
 
         try:
+            ts_ns = time.time_ns()
+            ts = ts_ns / 1e9
+
             headers = redact_headers(_headers_to_list(flow.response.headers))
             body_size, body_sha_hex = self._finalize_body_hash(
                 flow, "resp", flow.response
             )
+            body_ciphertext, body_nonce, body_aad = self._maybe_encrypt_body(
+                flow,
+                flow.response,
+                direction="resp",
+                event_type=EventType.NETWORK_RESPONSE.value,
+                ts_ns=ts_ns,
+            )
 
             event = NetworkResponseEvent(
-                timestamp=time.time(),
-                timestamp_ns=time.time_ns(),
+                timestamp=ts,
+                timestamp_ns=ts_ns,
                 flow_id=flow.id,
                 host=flow.request.host,
                 status=flow.response.status_code,
@@ -367,6 +509,9 @@ class NetworkCapture:
                 body_sha256_hex=body_sha_hex,
                 content_type=flow.response.headers.get("content-type"),
                 http_version=getattr(flow.response, "http_version", None),
+                body_ciphertext=body_ciphertext,
+                body_nonce=body_nonce,
+                body_aad=body_aad,
             )
             self._enqueue(event, host=flow.request.host)
         finally:
@@ -433,21 +578,35 @@ class NetworkCapture:
             except (AttributeError, IndexError):
                 return
 
+            ts_ns = time.time_ns()
+            ts = ts_ns / 1e9
+
             content = msg.content or b""
             body_size = len(content)
             body_sha_hex = bytes_to_hex(hashlib.sha256(content).digest())
             direction = "sent" if msg.from_client else "received"
             frame_type = "text" if msg.is_text else "binary"
+            body_ciphertext, body_nonce, body_aad = self._maybe_encrypt_body(
+                flow,
+                msg,
+                direction="ws",  # ignored for WS
+                event_type=EventType.NETWORK_WS_FRAME.value,
+                ts_ns=ts_ns,
+                is_websocket=True,
+            )
 
             event = NetworkWebSocketFrameEvent(
-                timestamp=time.time(),
-                timestamp_ns=time.time_ns(),
+                timestamp=ts,
+                timestamp_ns=ts_ns,
                 flow_id=flow.id,
                 host=flow.request.host,
                 direction=direction,
                 frame_type=frame_type,
                 body_size=body_size,
                 body_sha256_hex=body_sha_hex,
+                body_ciphertext=body_ciphertext,
+                body_nonce=body_nonce,
+                body_aad=body_aad,
             )
             self._enqueue(event, host=flow.request.host)
         finally:
@@ -462,13 +621,31 @@ class NetworkCapture:
     # ------------------------------------------------------------------
 
     def tls_clienthello(self, data: Any) -> None:
-        """If the SNI is in our runtime-tunnel set, opt-out of MITM."""
+        """If the SNI is in our runtime-tunnel set, opt-out of MITM.
+
+        DNS / SNI hostnames are case-insensitive per RFC 6066, so the
+        membership check MUST lowercase the SNI before comparing —
+        the cache stores lowercased entries (per
+        ``pinned_hosts.load_known_pinned_hosts``). Without this,
+        a client sending ``Pinned.Example.com`` would miss
+        ``pinned.example.com`` in the cache, the addon would attempt
+        MITM, the cert pin would fail, and the persistent cache that
+        Unit 10 added would be defeated for any mixed-case SNI.
+        """
         try:
             sni = data.client_hello.sni
         except AttributeError:
             return
-        if sni and sni in self._runtime_tunnel_hosts:
+        if not sni:
+            return
+        sni_lc = sni.lower()
+        if sni_lc in self._runtime_tunnel_hosts:
             data.ignore_connection = True
+            # Mark observed-this-recording so done() emits a
+            # network.tunneled event covering the actual tunneled span.
+            if sni_lc not in self._observed_tunnel_hosts:
+                self._observed_tunnel_hosts.add(sni_lc)
+                self._tunnel_started_at.setdefault(sni_lc, time.time())
 
     def error(self, flow: Any) -> None:
         """Classify TLS-pinning failures, emit one-time pin notice.
@@ -490,7 +667,28 @@ class NetworkCapture:
             _log(self._log_path, f"flow error host={host} msg={err_msg!r}")
 
             if host and _is_tls_pin_failure(err_msg):
-                self._runtime_tunnel_hosts.add(host)
+                host_lc = host.lower()
+                if host_lc not in self._runtime_tunnel_hosts:
+                    self._runtime_tunnel_hosts.add(host_lc)
+                    # V1.5: persist for the next recording so this host
+                    # never fails its first connection again. Best-effort.
+                    try:
+                        from screencap.network import (  # noqa: PLC0415
+                            pinned_hosts as _pin,
+                        )
+                        _pin.add_known_pinned_host(host_lc)
+                    except Exception:  # noqa: BLE001
+                        _log(
+                            self._log_path,
+                            f"failed to persist pinned host {host_lc}",
+                        )
+                # Mark observed-this-recording (whether the host is
+                # newly-detected or was pre-loaded from cache and just
+                # failed for the first time this recording). done()
+                # uses _observed_tunnel_hosts to emit network.tunneled.
+                if host_lc not in self._observed_tunnel_hosts:
+                    self._observed_tunnel_hosts.add(host_lc)
+                    self._tunnel_started_at.setdefault(host_lc, time.time())
                 if host not in self._pin_failure_emitted:
                     self._pin_failure_emitted.add(host)
                     pin_event = NetworkPinFailureEvent(
@@ -561,6 +759,117 @@ class NetworkCapture:
         body_size = len(wire)
         body_sha = hashlib.sha256(wire).digest()
         return body_size, bytes_to_hex(body_sha)
+
+    def _maybe_encrypt_body(
+        self,
+        flow: Any,
+        msg: Any,
+        *,
+        direction: str,
+        event_type: str,
+        ts_ns: int,
+        is_websocket: bool = False,
+    ) -> tuple[bytes | None, bytes | None, bytes | None]:
+        """Encrypt the decoded body for V1.5 body-capture flows.
+
+        Returns ``(ciphertext, nonce, aad)`` when body capture is
+        engaged for this message, or ``(None, None, None)`` to fall
+        through to V1 metadata-only behavior.
+
+        Skipped (returns triple-None) when:
+            * ``self._dek is None`` -- V1 caller / no encryption
+              configured.
+            * Host not in the effective capture-bodies-for allowlist
+              (this also enforces the blocklist-wins-over-allowlist
+              precedence; see
+              :func:`screencap.network.blocklist.is_host_in_capture_bodies_for`).
+            * Streaming was engaged on this direction -- the chunk-
+              hashing transformer ran over wire bytes, and we don't
+              buffer ``body_size_cap`` worth of chunks just to encrypt
+              them. Detected via the per-flow stream-state entry
+              populated by :func:`make_hash_transformer`.
+            * Decoded body size exceeds ``body_size_cap`` -- the
+              compressed-bypass guard documented in the module
+              docstring.
+            * No decodable content available (``content`` attribute
+              missing or ``None``).
+
+        For WebSocket frames (``is_websocket=True``), there is no
+        decoded/wire distinction (WS frames are not gzipped by the
+        protocol), so the size check uses ``len(msg.content)`` directly
+        and the streaming-state check is skipped (WS messages are not
+        stream-transformed).
+
+        Any unexpected exception raised inside the encryption path is
+        caught and logged; the function returns triple-None so the
+        emitted event falls through to metadata-only. Body encryption
+        must NEVER take down the proxy hot path.
+
+        Args:
+            flow: the mitmproxy flow (used for ``flow.id`` and host).
+            msg: ``flow.request`` / ``flow.response`` / a
+                ``WebSocketMessage``.
+            direction: ``"req"`` / ``"resp"`` for HTTP, ignored for WS.
+            event_type: the ``EventType`` value being emitted (e.g.
+                ``"network.request"``) -- bound into the AAD.
+            ts_ns: the SAME ``timestamp_ns`` value being assigned to
+                the emitted event. Critical: AAD-time and event-time
+                ``ts_ns`` MUST agree or decryption fails at export.
+            is_websocket: True iff ``msg`` is a WS frame message.
+        """
+        if self._dek is None:
+            return None, None, None
+
+        try:
+            host = flow.request.host or ""
+        except AttributeError:
+            return None, None, None
+
+        if not is_host_in_capture_bodies_for(
+            host, self._privacy_config, self._network_config
+        ):
+            return None, None, None
+
+        # Streaming check: HTTP only -- WS messages are never stream-
+        # transformed. The stream-state entry survives until response()
+        # / request() pops it; we read it here BEFORE that pop.
+        if not is_websocket:
+            entry = self._stream_state.get(flow.id, {})
+            if f"{direction}_sha" in entry:
+                # Streaming engaged -- hash done over wire chunks; we
+                # don't buffer to encrypt.
+                return None, None, None
+
+        try:
+            decoded = getattr(msg, "content", None)
+        except Exception:  # noqa: BLE001 -- mitmproxy quirks shouldn't crash
+            decoded = None
+        if decoded is None:
+            return None, None, None
+
+        # Decoded-size cap re-check (compressed-bypass guard).
+        if len(decoded) > self._network_config.body_size_cap:
+            return None, None, None
+
+        try:
+            aad = _crypto.aad_bytes(
+                recording_id=self._recording_id,
+                flow_id=flow.id,
+                event_type=event_type,
+                ts_ns=ts_ns,
+            )
+            ciphertext, nonce = _crypto.encrypt_body(
+                self._dek, decoded, aad
+            )
+        except Exception as exc:  # noqa: BLE001 -- log + fall through
+            _log(
+                self._log_path,
+                f"body-encrypt failed flow={flow.id} type={event_type} "
+                f"err={exc!r}",
+            )
+            return None, None, None
+
+        return ciphertext, nonce, aad
 
     def _enqueue(self, event: Any, *, host: str) -> None:
         """Push to ``out_q`` non-blocking; on full, account a drop burst."""

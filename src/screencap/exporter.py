@@ -15,6 +15,7 @@ from screencap import __version__
 if TYPE_CHECKING:  # pragma: no cover - import-only typing hint
     from screencap.engine.capture import CaptureSession
     from screencap.engine.events import BaseEvent, WindowSwitchEvent
+    from screencap.network.export_pipeline import NetworkScrubPipeline
 
 logger = logging.getLogger(__name__)
 
@@ -43,6 +44,9 @@ def export_recording(
     exclude_moves: bool,
     metadata: dict | None = None,
     privacy_filter: PrivacyFilter | None = None,
+    *,
+    include_network: bool = False,
+    network_scrub_pipeline: "NetworkScrubPipeline | None" = None,
 ) -> int:
     """Export a single recording to JSONL.
 
@@ -55,6 +59,25 @@ def export_recording(
 
     When *privacy_filter* is supplied, it is applied to every
     ``WindowSwitchEvent`` — see ``_write_events`` for the contract.
+
+    Args:
+        recording_dir: Path to recording directory.
+        output_path: Output file path or None for stdout.
+        exclude_moves: When True, ``mouse.move`` events are dropped.
+        metadata: Optional ``_meta`` header dict; built via
+            :func:`build_export_metadata` by callers.
+        privacy_filter: Optional ``WindowSwitchEvent`` filter callable.
+        include_network: V1.5 explicit-export flag. When True, network
+            events are emitted into the JSONL stream. Default False to
+            preserve V1 cloud-safety on shared callers (``_auto_export``
+            feeds cloud upload via the same export pipeline).
+        network_scrub_pipeline: Optional V1.5
+            :class:`NetworkScrubPipeline`. Required when
+            ``include_network=True`` AND the recording has encrypted
+            bodies. Forwarded into :meth:`CaptureSession.export_events`
+            so ciphertext is decrypted + PII-scrubbed at the row-conversion
+            boundary; ``None`` is fine for V1-vintage / metadata-only
+            recordings.
     """
     from screencap.engine import Capture
 
@@ -69,8 +92,13 @@ def export_recording(
         if output_path is None:
             # Write to stdout — no atomic write needed
             count = _write_events(
-                capture, sys.stdout, exclude_moves, metadata,
+                capture,
+                sys.stdout,
+                exclude_moves,
+                metadata,
                 privacy_filter=privacy_filter,
+                include_network=include_network,
+                network_scrub_pipeline=network_scrub_pipeline,
             )
         else:
             # Atomic write: .tmp → rename
@@ -78,8 +106,13 @@ def export_recording(
             try:
                 with open(tmp_path, "w") as f:
                     count = _write_events(
-                        capture, f, exclude_moves, metadata,
+                        capture,
+                        f,
+                        exclude_moves,
+                        metadata,
                         privacy_filter=privacy_filter,
+                        include_network=include_network,
+                        network_scrub_pipeline=network_scrub_pipeline,
                     )
                 os.rename(tmp_path, output_path)
             except BaseException:
@@ -164,6 +197,9 @@ def _write_events(
     exclude_moves: bool,
     metadata: dict | None,
     privacy_filter: PrivacyFilter | None = None,
+    *,
+    include_network: bool = False,
+    network_scrub_pipeline: "NetworkScrubPipeline | None" = None,
 ) -> int:
     """Stream events to an open file handle. Returns event count.
 
@@ -179,6 +215,13 @@ def _write_events(
         metadata: Optional metadata dict for header line.
         privacy_filter: Optional callable(WindowSwitchEvent) -> WindowSwitchEvent | None.
             Returns None to suppress the event, or a modified event (e.g. masked title).
+        network_scrub_pipeline: Optional V1.5 ``NetworkScrubPipeline``.
+            Forwarded into :meth:`CaptureSession.export_events` so
+            encrypted network bodies are decrypted + scrubbed at the
+            row-conversion boundary (no-op while V1's
+            ``Capture.export_events`` keeps ``network_rows=None``;
+            wiring V1.5 -- when row fetching lands -- requires no
+            further changes here).
     """
     import click
 
@@ -188,7 +231,11 @@ def _write_events(
         click.echo(json.dumps(metadata), file=out_file)
 
     count = 0
-    for event in capture.export_events(include_moves=not exclude_moves):
+    for event in capture.export_events(
+        include_moves=not exclude_moves,
+        include_network=include_network,
+        network_scrub_pipeline=network_scrub_pipeline,
+    ):
         if isinstance(event, WindowSwitchEvent) and privacy_filter is not None:
             event = privacy_filter(event)
             if event is None:

@@ -92,6 +92,10 @@ network_packages = [
     'h2',                # HTTP/2 frame parsing
     'h11',               # HTTP/1.1 parsing
     'kaitaistruct',      # binary protocol parser used by mitmproxy
+    # V1.5: keyring backs the Keychain-stored KEK for body encryption.
+    # collect_all picks up the macOS backend submodule (`keyring.backends.macOS`)
+    # which PyInstaller cannot trace through `keyring.get_keyring()` discovery.
+    'keyring',
 ]
 
 for pkg in network_packages:
@@ -116,6 +120,12 @@ hidden_imports = [
     'fast_gliner',
     'detect_secrets',
     'detect_secrets.plugins',
+    # V1.5 keyring macOS backend — collect_all('keyring') above picks up
+    # most of it, but the backend module is loaded by string lookup
+    # in keyring.backend.get_all_keyring() and PyInstaller's static
+    # analysis cannot trace that. Pin it here so frozen builds find
+    # the macOS Keychain backend at runtime.
+    'keyring.backends.macOS',
 ]
 
 all_hiddenimports += hidden_imports

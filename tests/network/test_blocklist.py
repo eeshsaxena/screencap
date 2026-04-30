@@ -1,4 +1,4 @@
-"""Tests for screencap.network.blocklist (V1)."""
+"""Tests for screencap.network.blocklist (V1 + V1.5)."""
 
 from __future__ import annotations
 
@@ -8,8 +8,11 @@ import pytest
 
 from screencap.network.blocklist import (
     DEFAULT_BLOCKLIST,
+    DEFAULT_CAPTURE_BODIES_FOR,
     build_ignore_hosts_regex,
+    effective_capture_bodies_for,
     is_host_blocked,
+    is_host_in_capture_bodies_for,
     is_ip_literal,
 )
 from screencap.network.config import NetworkConfig
@@ -27,12 +30,16 @@ def _network(
     extra: set[str] | None = None,
     override_default: bool = False,
     proxy_port: int = 8080,
+    capture: set[str] | None = None,
+    override_capture: bool = False,
 ) -> NetworkConfig:
     return NetworkConfig(
         extra_blocklist=frozenset(h.lower() for h in (extra or set())),
         proxy_port=proxy_port,
         override_default_blocklist=override_default,
         body_size_cap=100_000,
+        capture_bodies_for=frozenset(h.lower() for h in (capture or set())),
+        override_default_capture_bodies_for=override_capture,
     )
 
 
@@ -216,3 +223,141 @@ class TestBuildIgnoreHostsRegex:
             "login.microsoftonline.com",
         }
         assert critical.issubset(DEFAULT_BLOCKLIST)
+
+
+class TestEffectiveCaptureBodiesFor:
+    def test_default_returns_default_set(self):
+        assert effective_capture_bodies_for(_network()) == DEFAULT_CAPTURE_BODIES_FOR
+
+    def test_user_extends_default(self):
+        net = _network(capture={"mycompany.com"})
+        result = effective_capture_bodies_for(net)
+        assert "mycompany.com" in result
+        assert "*.github.com" in result  # default still present
+
+    def test_override_replaces_default(self):
+        net = _network(capture={"mycompany.com"}, override_capture=True)
+        assert effective_capture_bodies_for(net) == frozenset({"mycompany.com"})
+
+    def test_override_with_empty_user_list_returns_empty(self):
+        # The "metadata-only for all hosts" posture.
+        net = _network(override_capture=True)
+        assert effective_capture_bodies_for(net) == frozenset()
+
+
+class TestIsHostInCaptureBodiesFor:
+    def test_default_list_matches_subdomain(self):
+        assert is_host_in_capture_bodies_for(
+            "api.github.com", _privacy(), _network()
+        ) is True
+
+    def test_default_list_matches_apex(self):
+        assert is_host_in_capture_bodies_for(
+            "github.com", _privacy(), _network()
+        ) is True
+
+    def test_blocklist_always_wins_even_when_user_adds_to_capture(self):
+        # User explicitly added chase.com to capture_bodies_for —
+        # blocklist (mask_domains) still wins. This is the enforcement
+        # test for "auth/banking/password-managers always win."
+        net = _network(capture={"chase.com"})
+        privacy = _privacy({"chase.com"})
+        assert is_host_in_capture_bodies_for("api.chase.com", privacy, net) is False
+
+    def test_blocklist_wins_via_default_blocklist(self):
+        # bitwarden.com is in DEFAULT_BLOCKLIST. Even if user adds it to
+        # capture_bodies_for, the default blocklist still wins.
+        net = _network(capture={"vault.bitwarden.com"})
+        assert is_host_in_capture_bodies_for(
+            "vault.bitwarden.com", _privacy(), net
+        ) is False
+
+    def test_override_with_empty_list_blocks_all_capture(self):
+        net = _network(override_capture=True)
+        # github.com would normally be allowed by default — override
+        # disables that.
+        assert is_host_in_capture_bodies_for(
+            "api.github.com", _privacy(), net
+        ) is False
+
+    def test_override_with_user_list_only(self):
+        net = _network(capture={"mycompany.com"}, override_capture=True)
+        assert is_host_in_capture_bodies_for(
+            "api.mycompany.com", _privacy(), net
+        ) is True
+        # Default-list entry no longer matches under override.
+        assert is_host_in_capture_bodies_for(
+            "api.github.com", _privacy(), net
+        ) is False
+
+    def test_union_when_no_override(self):
+        # Both user list AND default list are honored.
+        net = _network(capture={"mycompany.com"})
+        assert is_host_in_capture_bodies_for(
+            "api.mycompany.com", _privacy(), net
+        ) is True
+        assert is_host_in_capture_bodies_for(
+            "api.github.com", _privacy(), net
+        ) is True
+
+    def test_unrelated_host_not_captured(self):
+        # mycompany.com is NOT in default list and not in user list.
+        net = _network()
+        assert is_host_in_capture_bodies_for(
+            "api.mycompany.com", _privacy(), net
+        ) is False
+
+    def test_empty_host(self):
+        # Don't crash on empty input.
+        assert is_host_in_capture_bodies_for("", _privacy(), _network()) is False
+
+    def test_ip_literal_not_captured(self):
+        # IP literals are blocked (always tunneled), so body capture
+        # is implicitly off.
+        assert is_host_in_capture_bodies_for(
+            "192.168.1.1", _privacy(), _network()
+        ) is False
+
+    # ---------------------------------------------------------------
+    # Adversarial substring-bypass tests (mirror the blocklist guard).
+    # ---------------------------------------------------------------
+
+    @pytest.mark.parametrize("hostile", [
+        "github.com.evil.com",
+        "notgithub.com",
+        "github.com.attacker.example",
+        "something-github.com",
+    ])
+    def test_no_substring_bypass(self, hostile):
+        net = _network()
+        assert is_host_in_capture_bodies_for(hostile, _privacy(), net) is False
+
+    def test_default_capture_bodies_for_contents_cover_expected_categories(self):
+        # Spot-check that the curated default list covers each major
+        # category. Full inventory in blocklist.DEFAULT_CAPTURE_BODIES_FOR.
+        critical = {
+            "*.github.com",
+            "api.linear.app",
+            "*.notion.so",
+            "*.slack.com",
+            "*.figma.com",
+            "claude.ai",
+            "*.anthropic.com",
+            "chat.openai.com",
+        }
+        assert critical.issubset(DEFAULT_CAPTURE_BODIES_FOR)
+
+    def test_default_lists_do_not_overlap(self):
+        # Inclusion criteria #3: DEFAULT_CAPTURE_BODIES_FOR must NOT
+        # overlap with DEFAULT_BLOCKLIST. Bare-form comparison handles
+        # the *. wildcard prefix.
+        capture_bare = {
+            e[2:] if e.startswith("*.") else e for e in DEFAULT_CAPTURE_BODIES_FOR
+        }
+        block_bare = {
+            e[2:] if e.startswith("*.") else e for e in DEFAULT_BLOCKLIST
+        }
+        assert capture_bare.isdisjoint(block_bare), (
+            "Overlap between DEFAULT_BLOCKLIST and DEFAULT_CAPTURE_BODIES_FOR — "
+            "see V1.5 ticket inclusion criteria #3."
+        )

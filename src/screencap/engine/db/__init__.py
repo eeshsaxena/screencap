@@ -174,7 +174,7 @@ def _migrate_schema(db_path: str) -> None:
 
 
 def _ensure_network_tables(engine) -> bool:
-    """Idempotently create the network_event table if missing.
+    """Idempotently create network_event and network_event_meta tables if missing.
 
     `Table.create(engine, checkfirst=True)` is a no-op when the table
     already exists, so this is safe to invoke unconditionally on every
@@ -183,19 +183,26 @@ def _ensure_network_tables(engine) -> bool:
     so old recording.db files that pre-date the network feature would
     otherwise crash on first network query.
 
+    V1.5 extends this to also create `network_event_meta` (per-recording
+    KEK-wrapped DEK metadata for body encryption-at-rest). Old recordings
+    that never had encrypted bodies will simply not have any rows in this
+    table; the export pipeline detects absence and falls back to the
+    metadata-only path.
+
     Readonly DBs (e.g. `chmod 444`) raise `sqlalchemy.exc.OperationalError`
     matching "readonly database" or "attempt to write a readonly database".
     On readonly: skip migration, return False so the caller can mark the
     capture as network-unavailable. Other exceptions propagate.
 
     Returns:
-        True if the table is present (created or already existed),
+        True if both tables are present (created or already existed),
         False if the DB is readonly (creation skipped).
     """
     from screencap.engine.db import models  # noqa: F401 - registers models
 
     try:
         models.NetworkEvent.__table__.create(engine, checkfirst=True)
+        models.NetworkEventMeta.__table__.create(engine, checkfirst=True)
         return True
     except sa.exc.OperationalError as e:
         msg = str(e).lower()

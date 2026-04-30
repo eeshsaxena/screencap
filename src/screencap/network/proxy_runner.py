@@ -30,9 +30,14 @@ the engine for the ``--network`` flag. It:
 9. On clean shutdown (or any exception), logs final stats to
    ``log_path``.
 
-V1 has NO ``dek`` / ``dek_wrapped`` / ``dek_nonce`` arguments — the
-addon does not need a DEK because all bodies are hashed-and-discarded.
-The argument signature was deliberately kept minimal.
+V1.5 adds a ``dek`` positional argument (immediately after ``confdir``):
+the plaintext per-recording Data Encryption Key (32 bytes), pickled
+across the spawn boundary from :func:`screencap.recorder.start_recording`.
+``None`` (the V1 default) preserves V1 behaviour — the addon emits
+metadata-only events without encrypting bodies. ``dek_wrapped`` /
+``dek_nonce`` are persisted to ``network_event_meta`` by the engine's
+:func:`_setup_network_capture` BEFORE this function spawns; they are
+not part of the runner's signature.
 """
 
 from __future__ import annotations
@@ -60,6 +65,7 @@ def run_proxy(
     log_path: Path,
     started_event: "mp.Event",
     confdir: Path,
+    dek: bytes | None = None,
     nonce_check_q: "mp.Queue | None" = None,
 ) -> None:
     """``mp.Process`` target — runs DumpMaster + NetworkCapture addon.
@@ -79,6 +85,16 @@ def run_proxy(
             waits on this before flipping the system proxy.
         confdir: Mitmproxy conf directory. Should contain the
             pre-generated CA cert + key from Unit 2.
+        dek: V1.5 plaintext per-recording Data Encryption Key (32 bytes).
+            ``None`` (default — V1 callers and unit tests that don't
+            supply one) keeps the addon in metadata-only mode. When set,
+            the addon AES-256-GCM-encrypts request/response bodies for
+            hosts in the effective allowlist and emits the ciphertext on
+            ``body_ciphertext`` / ``body_nonce`` / ``body_aad`` fields.
+            The corresponding ``dek_wrapped`` / ``dek_nonce`` were
+            persisted to ``network_event_meta`` by the engine BEFORE
+            this function spawned, so export-time decryption can resolve
+            the DEK without reading the KEK again.
         nonce_check_q: When provided (smoke-test path), 100
             ``os.urandom(12)`` samples are posted to this queue before
             the addon is installed. Production callers pass ``None``.
@@ -169,6 +185,7 @@ def run_proxy(
                 network_config=network_config,
                 privacy_config=privacy_config,
                 log_path=log_path,
+                dek=dek,
             )
             master.addons.add(addon)
             master_holder["addon"] = addon

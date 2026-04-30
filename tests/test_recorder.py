@@ -874,3 +874,239 @@ class TestHeadlessRecorderUnavailable:
         assert any("pynput" in c for c in print_calls), (
             f"pynput dependency hint not found in console output: {print_calls}"
         )
+
+
+# ---------------------------------------------------------------------------
+# V1.5 — KEK + DEK plumbing into Recorder
+# ---------------------------------------------------------------------------
+
+
+class TestNetworkV15Plumbing:
+    """When ``network=True``, ``start_recording`` must:
+
+    - acquire the network lock
+    - run pre-flight to negotiate a port
+    - call ``crypto.get_or_create_kek()`` then ``crypto.generate_dek()``
+      then ``crypto.wrap_dek(dek, kek)``
+    - emit the empty-allowlist warning if the effective list is empty
+    - pass ``dek`` / ``dek_wrapped`` / ``dek_nonce`` into ``Recorder(...)``
+
+    All tests mock heavy callees so no real Recorder, lock, or Keychain
+    is touched.
+    """
+
+    def _enter_common(self, stack):
+        """Push the universally-required mocks onto an ExitStack."""
+        stack.enter_context(mock.patch("screencap.recorder._check_macos_permissions"))
+        stack.enter_context(mock.patch("screencap.recorder.get_audio_default", return_value=False))
+        stack.enter_context(mock.patch("screencap.recorder.get_wifi_metrics", return_value=False))
+        stack.enter_context(mock.patch("screencap.recorder.get_app_versions", return_value=False))
+        stack.enter_context(mock.patch("screencap.recorder.get_disk_warn_mb", return_value=2000))
+        stack.enter_context(mock.patch("screencap.recorder.get_disk_stop_mb", return_value=500))
+        stack.enter_context(mock.patch("shutil.disk_usage", return_value=_PLENTY_OF_DISK))
+        stack.enter_context(mock.patch("screencap.pidfile.find_orphaned_processes", return_value=[]))
+        stack.enter_context(mock.patch("screencap.pidfile.write_pidfile"))
+        stack.enter_context(mock.patch("screencap.pidfile.delete_pidfile"))
+
+    def test_network_true_passes_dek_into_recorder(self, tmp_path):
+        """KEK is generated, DEK is wrapped, and both are forwarded to Recorder()."""
+        import contextlib
+        from multiprocessing import Event as _Event
+
+        from screencap.network.config import NetworkConfig
+        from screencap.recorder import start_recording
+        from tests.conftest import FakeRecorder
+
+        # Mocked crypto outputs — fixed sentinels we can identify in the
+        # Recorder kwargs.
+        SENTINEL_KEK = b"k" * 32
+        SENTINEL_DEK = b"d" * 32
+        SENTINEL_WRAPPED = b"w" * 48
+        SENTINEL_NONCE = b"n" * 12
+
+        # Capture Recorder kwargs without spawning a real engine.
+        captured: dict = {}
+
+        class _SpyRecorder(FakeRecorder):
+            def __init__(self, capture_dir_str, **kwargs):
+                captured["kwargs"] = kwargs
+                super().__init__(capture_dir_str, **kwargs)
+
+        # NetworkConfig with default capture_bodies_for => non-empty effective
+        # allowlist (includes DEFAULT_CAPTURE_BODIES_FOR), so the empty-allowlist
+        # warning is NOT emitted on this path.
+        non_empty_cfg = NetworkConfig()
+
+        # mp.Event for the handoff_ready arg — start_recording forwards it
+        # but since we mock Recorder it never gets touched.
+        handoff_ev = _Event()
+        lock_handle = mock.MagicMock()
+
+        with contextlib.ExitStack() as stack:
+            self._enter_common(stack)
+            stack.enter_context(mock.patch("screencap.engine.recorder.Recorder", _SpyRecorder))
+            stack.enter_context(mock.patch(
+                "screencap.config.get_network_config",
+                return_value=non_empty_cfg,
+            ))
+            stack.enter_context(mock.patch(
+                "screencap.network.lifecycle.acquire_network_lock",
+                return_value=lock_handle,
+            ))
+            stack.enter_context(mock.patch(
+                "screencap.network.lifecycle.preflight_or_raise",
+                return_value=8080,
+            ))
+            mock_get_kek = stack.enter_context(mock.patch(
+                "screencap.network.crypto.get_or_create_kek",
+                return_value=SENTINEL_KEK,
+            ))
+            mock_gen_dek = stack.enter_context(mock.patch(
+                "screencap.network.crypto.generate_dek",
+                return_value=SENTINEL_DEK,
+            ))
+            mock_wrap = stack.enter_context(mock.patch(
+                "screencap.network.crypto.wrap_dek",
+                return_value=(SENTINEL_WRAPPED, SENTINEL_NONCE),
+            ))
+
+            start_recording(
+                "v15-test",
+                output_dir=tmp_path / "v15-rec",
+                network=True,
+                network_handoff_ready=handoff_ev,
+            )
+
+        # Crypto helpers were each called exactly once.
+        mock_get_kek.assert_called_once_with()
+        mock_gen_dek.assert_called_once_with()
+        # wrap_dek was called with (dek, kek) — order matters.
+        mock_wrap.assert_called_once_with(SENTINEL_DEK, SENTINEL_KEK)
+
+        # Recorder received the V1.5 kwargs.
+        kwargs = captured["kwargs"]
+        assert kwargs.get("network") is True, (
+            f"network=True flag missing from Recorder kwargs: {kwargs!r}"
+        )
+        assert kwargs.get("dek") == SENTINEL_DEK, (
+            f"dek not forwarded: {kwargs!r}"
+        )
+        assert kwargs.get("dek_wrapped") == SENTINEL_WRAPPED, (
+            f"dek_wrapped not forwarded: {kwargs!r}"
+        )
+        assert kwargs.get("dek_nonce") == SENTINEL_NONCE, (
+            f"dek_nonce not forwarded: {kwargs!r}"
+        )
+
+    def test_empty_allowlist_emits_warning(self, tmp_path):
+        """An empty effective ``capture_bodies_for`` triggers a one-time
+        rich-console warning before Recorder() is constructed."""
+        import contextlib
+        from multiprocessing import Event as _Event
+
+        from screencap.network.config import NetworkConfig
+        from screencap.recorder import start_recording
+        from tests.conftest import FakeRecorder
+
+        # Override default => allowlist is empty (no DEFAULT union).
+        empty_cfg = NetworkConfig(
+            override_default_capture_bodies_for=True,
+            capture_bodies_for=frozenset(),
+        )
+
+        handoff_ev = _Event()
+        lock_handle = mock.MagicMock()
+
+        with contextlib.ExitStack() as stack:
+            self._enter_common(stack)
+            stack.enter_context(mock.patch("screencap.engine.recorder.Recorder", FakeRecorder))
+            stack.enter_context(mock.patch(
+                "screencap.config.get_network_config",
+                return_value=empty_cfg,
+            ))
+            stack.enter_context(mock.patch(
+                "screencap.network.lifecycle.acquire_network_lock",
+                return_value=lock_handle,
+            ))
+            stack.enter_context(mock.patch(
+                "screencap.network.lifecycle.preflight_or_raise",
+                return_value=8080,
+            ))
+            stack.enter_context(mock.patch(
+                "screencap.network.crypto.get_or_create_kek",
+                return_value=b"k" * 32,
+            ))
+            stack.enter_context(mock.patch(
+                "screencap.network.crypto.generate_dek",
+                return_value=b"d" * 32,
+            ))
+            stack.enter_context(mock.patch(
+                "screencap.network.crypto.wrap_dek",
+                return_value=(b"w" * 48, b"n" * 12),
+            ))
+            mock_console = stack.enter_context(mock.patch("screencap.recorder.console"))
+
+            start_recording(
+                "v15-empty",
+                output_dir=tmp_path / "v15-empty-rec",
+                network=True,
+                network_handoff_ready=handoff_ev,
+            )
+
+        # The warning text appears in at least one console.print call.
+        printed = " ".join(str(c) for c in mock_console.print.call_args_list)
+        assert "effective capture-bodies allowlist is empty" in printed, (
+            f"Empty-allowlist warning not found: {printed}"
+        )
+        assert "metadata-only" in printed, (
+            f"Empty-allowlist warning missing 'metadata-only' phrasing: {printed}"
+        )
+
+    def test_network_false_skips_crypto_and_omits_dek_kwargs(self, tmp_path):
+        """When ``network=False``, no KEK/DEK calls happen and Recorder
+        does not receive any DEK kwargs."""
+        import contextlib
+
+        from screencap.recorder import start_recording
+        from tests.conftest import FakeRecorder
+
+        captured: dict = {}
+
+        class _SpyRecorder(FakeRecorder):
+            def __init__(self, capture_dir_str, **kwargs):
+                captured["kwargs"] = kwargs
+                super().__init__(capture_dir_str, **kwargs)
+
+        with contextlib.ExitStack() as stack:
+            self._enter_common(stack)
+            stack.enter_context(mock.patch("screencap.engine.recorder.Recorder", _SpyRecorder))
+            mock_get_kek = stack.enter_context(mock.patch(
+                "screencap.network.crypto.get_or_create_kek",
+            ))
+            mock_gen_dek = stack.enter_context(mock.patch(
+                "screencap.network.crypto.generate_dek",
+            ))
+            mock_wrap = stack.enter_context(mock.patch(
+                "screencap.network.crypto.wrap_dek",
+            ))
+
+            start_recording(
+                "no-net",
+                output_dir=tmp_path / "no-net-rec",
+                # network defaults to False; pass explicitly for clarity.
+                network=False,
+            )
+
+        # No crypto calls.
+        mock_get_kek.assert_not_called()
+        mock_gen_dek.assert_not_called()
+        mock_wrap.assert_not_called()
+
+        # Recorder did NOT receive dek kwargs (only included when network=True).
+        kwargs = captured["kwargs"]
+        assert "dek" not in kwargs, (
+            f"dek leaked into Recorder kwargs on V1 path: {kwargs!r}"
+        )
+        assert "dek_wrapped" not in kwargs
+        assert "dek_nonce" not in kwargs
+        assert kwargs.get("network", False) is False or "network" not in kwargs

@@ -694,3 +694,423 @@ class TestNetworkEventValidation:
                 timestamp=1.0,
                 timestamp_ns=1,
             )
+
+
+# =============================================================================
+# V1.5 capture-side body-encryption tests
+# =============================================================================
+#
+# Capture-side network events flow proxy -> reader -> writer -> DB via
+# `multiprocessing.Queue` (pickle), NEVER through JSONL. The V1.5 ciphertext
+# fields (`body_ciphertext`/`body_nonce`/`body_aad`) are raw `bytes` and
+# round-trip via pickle. Each test below also covers the metadata-only
+# (`body_ciphertext=None`) path so V1 callers continue to work unchanged.
+
+
+class TestNetworkRequestEventV15:
+    """V1.5 body-encryption fields on the capture-side NetworkRequestEvent."""
+
+    def test_ciphertext_pickle_round_trip(self):
+        import pickle
+
+        from screencap.engine.events import NetworkRequestEvent
+
+        ciphertext = b"\xde\xad\xbe\xef" * 4
+        nonce = b"\x00" * 12
+        aad = b"recording_id=1|flow=abc"
+        event = NetworkRequestEvent(
+            timestamp=1.0,
+            timestamp_ns=1_000_000_000,
+            flow_id="flow-1",
+            method="POST",
+            url="https://example.com/api",
+            host="example.com",
+            body_size=16,
+            body_sha256_hex="a" * 64,
+            body_ciphertext=ciphertext,
+            body_nonce=nonce,
+            body_aad=aad,
+        )
+        restored = pickle.loads(pickle.dumps(event))
+        assert restored == event
+        assert restored.body_ciphertext == ciphertext
+        assert restored.body_nonce == nonce
+        assert restored.body_aad == aad
+
+    def test_metadata_only_pickle_round_trip(self):
+        """Edge: ciphertext=None still round-trips (V1 / metadata-only path)."""
+        import pickle
+
+        from screencap.engine.events import NetworkRequestEvent
+
+        event = NetworkRequestEvent(
+            timestamp=1.0,
+            timestamp_ns=1_000_000_000,
+            flow_id="flow-1",
+            method="GET",
+            url="https://example.com/",
+            host="example.com",
+            body_size=None,
+        )
+        restored = pickle.loads(pickle.dumps(event))
+        assert restored == event
+        assert restored.body_ciphertext is None
+        assert restored.body_nonce is None
+        assert restored.body_aad is None
+
+
+class TestNetworkResponseEventV15:
+    """V1.5 body-encryption fields on the capture-side NetworkResponseEvent."""
+
+    def test_ciphertext_pickle_round_trip(self):
+        import pickle
+
+        from screencap.engine.events import NetworkResponseEvent
+
+        ciphertext = b"\x01\x02\x03\x04" * 8
+        nonce = b"\x11" * 12
+        aad = b"recording_id=2|flow=def"
+        event = NetworkResponseEvent(
+            timestamp=2.0,
+            timestamp_ns=2_000_000_000,
+            flow_id="flow-2",
+            host="api.example.com",
+            status=200,
+            body_size=32,
+            body_ciphertext=ciphertext,
+            body_nonce=nonce,
+            body_aad=aad,
+        )
+        restored = pickle.loads(pickle.dumps(event))
+        assert restored == event
+        assert restored.body_ciphertext == ciphertext
+
+    def test_metadata_only_pickle_round_trip(self):
+        import pickle
+
+        from screencap.engine.events import NetworkResponseEvent
+
+        event = NetworkResponseEvent(
+            timestamp=2.0,
+            timestamp_ns=2_000_000_000,
+            flow_id="flow-2",
+            host="example.com",
+            status=204,
+        )
+        restored = pickle.loads(pickle.dumps(event))
+        assert restored == event
+        assert restored.body_ciphertext is None
+
+
+class TestNetworkWebSocketUpgradeEventV15:
+    """V1.5 body-encryption fields on the capture-side WS upgrade event."""
+
+    def test_ciphertext_pickle_round_trip(self):
+        import pickle
+
+        from screencap.engine.events import NetworkWebSocketUpgradeEvent
+
+        ciphertext = b"\xab\xcd" * 16
+        nonce = b"\x22" * 12
+        aad = b"recording_id=3|flow=ws"
+        event = NetworkWebSocketUpgradeEvent(
+            timestamp=3.0,
+            timestamp_ns=3_000_000_000,
+            flow_id="ws-1",
+            url="wss://chat.example.com/socket",
+            host="chat.example.com",
+            details_json={"request_headers": [["Sec-WebSocket-Key", "abc=="]]},
+            body_ciphertext=ciphertext,
+            body_nonce=nonce,
+            body_aad=aad,
+        )
+        restored = pickle.loads(pickle.dumps(event))
+        assert restored == event
+        assert restored.body_ciphertext == ciphertext
+
+    def test_metadata_only_pickle_round_trip(self):
+        import pickle
+
+        from screencap.engine.events import NetworkWebSocketUpgradeEvent
+
+        event = NetworkWebSocketUpgradeEvent(
+            timestamp=3.0,
+            timestamp_ns=3_000_000_000,
+            flow_id="ws-1",
+            url="wss://example.com/ws",
+            host="example.com",
+        )
+        restored = pickle.loads(pickle.dumps(event))
+        assert restored == event
+        assert restored.body_ciphertext is None
+
+
+class TestNetworkWebSocketFrameEventV15:
+    """V1.5 body-encryption fields on the capture-side WS frame event."""
+
+    def test_ciphertext_pickle_round_trip(self):
+        import pickle
+
+        from screencap.engine.events import NetworkWebSocketFrameEvent
+
+        ciphertext = b"\xff\xee\xdd\xcc" * 4
+        nonce = b"\x33" * 12
+        aad = b"recording_id=4|flow=ws_frame"
+        event = NetworkWebSocketFrameEvent(
+            timestamp=4.0,
+            timestamp_ns=4_000_000_000,
+            flow_id="ws-1",
+            host="chat.example.com",
+            direction="received",
+            frame_type="text",
+            body_size=16,
+            body_ciphertext=ciphertext,
+            body_nonce=nonce,
+            body_aad=aad,
+        )
+        restored = pickle.loads(pickle.dumps(event))
+        assert restored == event
+        assert restored.body_ciphertext == ciphertext
+
+    def test_metadata_only_pickle_round_trip(self):
+        import pickle
+
+        from screencap.engine.events import NetworkWebSocketFrameEvent
+
+        event = NetworkWebSocketFrameEvent(
+            timestamp=4.0,
+            timestamp_ns=4_000_000_000,
+            flow_id="ws-1",
+            host="example.com",
+            direction="sent",
+            frame_type="binary",
+        )
+        restored = pickle.loads(pickle.dumps(event))
+        assert restored == event
+        assert restored.body_ciphertext is None
+
+
+# =============================================================================
+# V1.5 export-side parallel family tests
+# =============================================================================
+#
+# Export-side classes are bare BaseModel (NOT BaseEvent) by design - this
+# keeps them out of EVENT_TYPE_MAP (which the capture-side classes already
+# occupy) and out of the TestEventTypeMap walk. They carry `body_text` (str)
+# instead of ciphertext, are constructed by NetworkScrubPipeline at export
+# time, and round-trip through JSON for events.jsonl emission.
+
+
+class TestNetworkRequestExportEvent:
+    """V1.5 export-side request event (bare BaseModel, body_text plaintext)."""
+
+    def test_not_a_base_event(self):
+        """Guard: must NOT subclass BaseEvent (mirrors NetworkPinFailureEvent)."""
+        from screencap.engine.events import BaseEvent, NetworkRequestExportEvent
+
+        assert not issubclass(NetworkRequestExportEvent, BaseEvent), (
+            "NetworkRequestExportEvent must remain a bare BaseModel - "
+            "subclassing BaseEvent would collide with NetworkRequestEvent "
+            "in EVENT_TYPE_MAP and break TestEventTypeMap."
+        )
+
+    def test_no_body_ciphertext_field(self):
+        """Safety contract: export-side class never carries ciphertext."""
+        from screencap.engine.events import NetworkRequestExportEvent
+
+        assert "body_ciphertext" not in NetworkRequestExportEvent.model_fields
+        assert "body_nonce" not in NetworkRequestExportEvent.model_fields
+        assert "body_aad" not in NetworkRequestExportEvent.model_fields
+        assert "body_text" in NetworkRequestExportEvent.model_fields
+
+    def test_json_round_trip(self):
+        from screencap.engine.events import EventType, NetworkRequestExportEvent
+
+        event = NetworkRequestExportEvent(
+            timestamp=1.0,
+            timestamp_ns=1_000_000_000,
+            flow_id="flow-1",
+            method="POST",
+            url="https://example.com/api",
+            host="example.com",
+            headers=[("Content-Type", "application/json")],
+            body_size=11,
+            body_sha256_hex="a" * 64,
+            content_type="application/json",
+            http_version="HTTP/1.1",
+            body_text="hello world",
+        )
+        restored = NetworkRequestExportEvent.model_validate_json(
+            event.model_dump_json()
+        )
+        assert restored == event
+        assert restored.body_text == "hello world"
+        assert restored.type == EventType.NETWORK_REQUEST
+
+
+class TestNetworkResponseExportEvent:
+    """V1.5 export-side response event."""
+
+    def test_not_a_base_event(self):
+        from screencap.engine.events import BaseEvent, NetworkResponseExportEvent
+
+        assert not issubclass(NetworkResponseExportEvent, BaseEvent)
+
+    def test_no_body_ciphertext_field(self):
+        from screencap.engine.events import NetworkResponseExportEvent
+
+        assert "body_ciphertext" not in NetworkResponseExportEvent.model_fields
+        assert "body_text" in NetworkResponseExportEvent.model_fields
+
+    def test_json_round_trip(self):
+        from screencap.engine.events import EventType, NetworkResponseExportEvent
+
+        event = NetworkResponseExportEvent(
+            timestamp=2.0,
+            timestamp_ns=2_000_000_000,
+            flow_id="flow-2",
+            host="api.example.com",
+            status=200,
+            headers=[("Content-Type", "text/html")],
+            body_text="hello",
+        )
+        restored = NetworkResponseExportEvent.model_validate_json(
+            event.model_dump_json()
+        )
+        assert restored == event
+        assert restored.body_text == "hello"
+        assert restored.type == EventType.NETWORK_RESPONSE
+
+
+class TestNetworkWebSocketUpgradeExportEvent:
+    """V1.5 export-side WS upgrade event."""
+
+    def test_not_a_base_event(self):
+        from screencap.engine.events import (
+            BaseEvent,
+            NetworkWebSocketUpgradeExportEvent,
+        )
+
+        assert not issubclass(NetworkWebSocketUpgradeExportEvent, BaseEvent)
+
+    def test_no_body_ciphertext_field(self):
+        from screencap.engine.events import NetworkWebSocketUpgradeExportEvent
+
+        assert (
+            "body_ciphertext" not in NetworkWebSocketUpgradeExportEvent.model_fields
+        )
+        assert "body_text" in NetworkWebSocketUpgradeExportEvent.model_fields
+
+    def test_json_round_trip(self):
+        from screencap.engine.events import (
+            EventType,
+            NetworkWebSocketUpgradeExportEvent,
+        )
+
+        event = NetworkWebSocketUpgradeExportEvent(
+            timestamp=3.0,
+            timestamp_ns=3_000_000_000,
+            flow_id="ws-1",
+            url="wss://chat.example.com/socket",
+            host="chat.example.com",
+            headers=[("Upgrade", "websocket")],
+            details_json={"request_headers": [["Sec-WebSocket-Key", "x=="]]},
+            body_text="hello",
+        )
+        restored = NetworkWebSocketUpgradeExportEvent.model_validate_json(
+            event.model_dump_json()
+        )
+        assert restored == event
+        assert restored.body_text == "hello"
+        assert restored.type == EventType.NETWORK_WS_UPGRADE
+
+
+class TestNetworkWebSocketFrameExportEvent:
+    """V1.5 export-side WS frame event."""
+
+    def test_not_a_base_event(self):
+        from screencap.engine.events import (
+            BaseEvent,
+            NetworkWebSocketFrameExportEvent,
+        )
+
+        assert not issubclass(NetworkWebSocketFrameExportEvent, BaseEvent)
+
+    def test_no_body_ciphertext_field(self):
+        from screencap.engine.events import NetworkWebSocketFrameExportEvent
+
+        assert (
+            "body_ciphertext" not in NetworkWebSocketFrameExportEvent.model_fields
+        )
+        assert "body_text" in NetworkWebSocketFrameExportEvent.model_fields
+
+    def test_json_round_trip(self):
+        from screencap.engine.events import (
+            EventType,
+            NetworkWebSocketFrameExportEvent,
+        )
+
+        event = NetworkWebSocketFrameExportEvent(
+            timestamp=4.0,
+            timestamp_ns=4_000_000_000,
+            flow_id="ws-1",
+            host="chat.example.com",
+            direction="received",
+            frame_type="text",
+            body_size=11,
+            body_text="hello world",
+        )
+        restored = NetworkWebSocketFrameExportEvent.model_validate_json(
+            event.model_dump_json()
+        )
+        assert restored == event
+        assert restored.body_text == "hello world"
+        assert restored.type == EventType.NETWORK_WS_FRAME
+
+
+class TestNetworkExportEventsNotInRegistry:
+    """Locks export-side classes OUT of EVENT_TYPE_MAP.
+
+    Capture-side classes (NetworkRequestEvent etc.) are the registered
+    `type` discriminators in EVENT_TYPE_MAP. Export-side classes share
+    the same `type` literal value but must NEVER be in the map - they
+    are bare BaseModel so they pickup at construction time only when
+    NetworkScrubPipeline explicitly instantiates them.
+    """
+
+    def test_export_classes_not_in_event_type_map(self):
+        from screencap.engine.events import (
+            EVENT_TYPE_MAP,
+            EventType,
+            NetworkRequestEvent,
+            NetworkRequestExportEvent,
+            NetworkResponseEvent,
+            NetworkResponseExportEvent,
+            NetworkWebSocketFrameEvent,
+            NetworkWebSocketFrameExportEvent,
+            NetworkWebSocketUpgradeEvent,
+            NetworkWebSocketUpgradeExportEvent,
+        )
+
+        # Capture-side classes ARE registered
+        assert EVENT_TYPE_MAP[EventType.NETWORK_REQUEST.value] is NetworkRequestEvent
+        assert EVENT_TYPE_MAP[EventType.NETWORK_RESPONSE.value] is NetworkResponseEvent
+        assert (
+            EVENT_TYPE_MAP[EventType.NETWORK_WS_UPGRADE.value]
+            is NetworkWebSocketUpgradeEvent
+        )
+        assert (
+            EVENT_TYPE_MAP[EventType.NETWORK_WS_FRAME.value]
+            is NetworkWebSocketFrameEvent
+        )
+        # Export-side classes are NOT registered (and must not collide)
+        for export_cls in (
+            NetworkRequestExportEvent,
+            NetworkResponseExportEvent,
+            NetworkWebSocketUpgradeExportEvent,
+            NetworkWebSocketFrameExportEvent,
+        ):
+            assert export_cls not in EVENT_TYPE_MAP.values(), (
+                f"{export_cls.__name__} must NOT be in EVENT_TYPE_MAP - "
+                "would collide with the matching capture-side class."
+            )

@@ -926,6 +926,13 @@ def _network_event_to_db_dict(event: Any, kind: str) -> dict[str, Any]:
     For ``ws_upgrade``: response headers go to ``headers_json``, request
     headers (if present in ``details_json``) stay in ``details_json``.
     For ``drop_burst``: ``flow_id`` is None (no associated flow).
+
+    V1.5 body-encryption fields (``body_ciphertext`` / ``body_nonce`` /
+    ``body_aad``) flow through ``getattr`` like any other column. The
+    addon populates them on encrypted body events; the writer persists
+    them so the export-time scrub pipeline can decrypt at read time.
+    Without this passthrough, encrypted bodies would arrive with all
+    three columns NULL — silently breaking the entire V1.5 contract.
     """
     from screencap.engine.convert import hex_to_bytes
 
@@ -934,6 +941,13 @@ def _network_event_to_db_dict(event: Any, kind: str) -> dict[str, Any]:
     sha_bytes = hex_to_bytes(sha_hex) if sha_hex else None
 
     details = getattr(event, "details_json", None)
+    # V1.5 network.tunneled has its own payload shape; lift to details_json
+    # so the existing storage column carries it forward without a new column.
+    if kind == "tunneled":
+        details = {
+            "started_at": getattr(event, "started_at", 0.0),
+            "duration_seconds": getattr(event, "duration_seconds", 0.0),
+        }
     out: dict[str, Any] = {
         "kind": kind,
         "flow_id": getattr(event, "flow_id", None),
@@ -944,6 +958,9 @@ def _network_event_to_db_dict(event: Any, kind: str) -> dict[str, Any]:
         "headers_json": json.dumps(headers_pairs) if headers_pairs else None,
         "body_size": getattr(event, "body_size", None),
         "body_sha256": sha_bytes,
+        "body_ciphertext": getattr(event, "body_ciphertext", None),
+        "body_nonce": getattr(event, "body_nonce", None),
+        "body_aad": getattr(event, "body_aad", None),
         "content_type": getattr(event, "content_type", None),
         "direction": getattr(event, "direction", None),
         "frame_type": getattr(event, "frame_type", None),
@@ -976,9 +993,21 @@ def write_network_events(
     :func:`write_events` (which would fail on every dotted type name).
 
     Persists each event to ``recording.db.network_event`` via
-    :func:`crud.insert_network_event`. The DB ``kind`` column gets the
+    :func:`crud.insert_network_event``. The DB ``kind`` column gets the
     short form (``request``, ``response``, etc.) -- the dotted form lives
     only on the Pydantic event for events.jsonl emission (V1.75).
+
+    The ``terminate_processing`` parameter here is bound to a DEDICATED
+    network-writer terminate event (set in ``_setup_network_capture``),
+    NOT the global ``terminate_processing`` shared by other writers.
+    The global event fires before ``_teardown_network_capture`` runs,
+    but the addon's ``done()`` hook emits final events (notably
+    ``network.tunneled``) only AFTER the proxy receives SIGTERM —
+    partway through teardown. Those events flow proxy → reader →
+    ``write_q`` and need a live writer to drain them.
+    ``_teardown_network_capture`` sets the dedicated event AFTER the
+    reader thread joins, so the writer drains every event the reader
+    forwarded before exiting.
     """
     from screencap.engine.config import apply_config_overrides
     apply_config_overrides(config_overrides)
@@ -997,6 +1026,7 @@ def write_network_events(
         "network.ws_upgrade": "ws_upgrade",
         "network.ws_frame": "ws_frame",
         "network.drop_burst": "drop_burst",
+        "network.tunneled": "tunneled",
     }
 
     started = False
@@ -2457,15 +2487,24 @@ def _setup_network_capture(
     flush_requested,
     flush_ack_counter,
     handoff_ready_event=None,
+    dek: bytes | None = None,
+    dek_wrapped: bytes | None = None,
+    dek_nonce: bytes | None = None,
 ) -> dict[str, Any]:
     """Set up the V1 network capture pipeline inside :func:`record`.
 
     Order of operations (load-bearing):
         1. Snapshot system proxy state to ``<capture_dir>/.proxy_state.json``
            AND a durable copy under ``~/.screencap/proxy/snapshots/``.
+        0.5. (V1.5 only) Persist the wrapped DEK to ``network_event_meta``
+           BEFORE the proxy spawns so any encrypted body event the addon
+           emits has a meta row to look up at export time. Skipped when
+           ``dek_wrapped`` is None (V1 / metadata-only callers).
         2. Spawn the network writer process consuming ``network_write_q``.
         3. Spawn the proxy ``mp.Process`` (mitmproxy DumpMaster + addon)
-           via ``multiprocessing.get_context("spawn")``.
+           via ``multiprocessing.get_context("spawn")``. The plaintext
+           ``dek`` is forwarded to ``run_proxy`` (V1.5); pickled across
+           the spawn boundary.
         4. Wait up to 10s on ``started_event``; abort + restore on timeout.
         5. Write the global sentinel + per-recording handoff atomically.
         6. Signal ``handoff_ready_event`` so SessionController's daemon
@@ -2541,7 +2580,18 @@ def _setup_network_capture(
                 )
         if network_event_writer is not None:
             try:
+                # The network writer listens to its own dedicated
+                # terminate event (created above), not the global
+                # terminate_processing. Set both — the global one for
+                # other writers in case they're affected, and the
+                # dedicated one to actually stop the network writer.
                 terminate_processing.set()
+                try:
+                    network_writer_terminate.set()  # noqa: F821 — bound above
+                except NameError:
+                    # Cleanup ran before the dedicated event was
+                    # constructed. Fall through to .terminate().
+                    pass
                 if network_event_writer.is_alive():
                     network_event_writer.join(timeout=5)
                     if network_event_writer.is_alive():
@@ -2581,11 +2631,40 @@ def _setup_network_capture(
         _net_proxy.write_snapshot(snapshot, durable_snapshot_path, extra=snapshot_extra)
         snapshots_written = True
 
+        # (0.5) V1.5 — persist the wrapped DEK before the proxy spawns
+        # so any encrypted body event the addon emits has a meta row to
+        # look up at export time. Skipped when dek_wrapped is None
+        # (V1 / metadata-only path; the meta row is irrelevant if no
+        # body bytes are ever encrypted).
+        if dek_wrapped is not None:
+            session = get_session_for_path(db_path)
+            try:
+                crud.insert_network_event_meta(
+                    session,
+                    recording_id=recording.id,
+                    dek_wrapped=dek_wrapped,
+                    dek_nonce=dek_nonce,
+                )
+            finally:
+                session.close()
+
         # (2) Network write queue + writer process.
         network_write_q = sq.SynchronizedQueue(maxsize=100)  # _META_QUEUE_SIZE
         writer_started = task_started_events.setdefault(
             "network_event_writer", multiprocessing.Event()
         )
+        # Dedicated terminate event for the network writer — distinct
+        # from the global ``terminate_processing`` shared by all
+        # writers. The global event fires BEFORE
+        # ``_teardown_network_capture`` runs, but the addon's
+        # ``done()`` hook emits final ``network.tunneled`` events only
+        # AFTER the proxy receives SIGTERM (which happens partway
+        # through teardown). Those events flow proxy → reader →
+        # ``network_write_q`` and need a live writer to drain them.
+        # Keeping the writer alive until ``_teardown_network_capture``
+        # sets this dedicated event (after reader_thread.join())
+        # closes the silent-drop window.
+        network_writer_terminate = multiprocessing.Event()
         network_event_writer = multiprocessing.Process(
             target=utils.WrapStdout(write_network_events),
             args=(
@@ -2594,7 +2673,7 @@ def _setup_network_capture(
                 None,  # perf_q — currently unused for network writer
                 recording,
                 db_path,
-                terminate_processing,
+                network_writer_terminate,
                 writer_started,
             ),
             kwargs={
@@ -2622,6 +2701,7 @@ def _setup_network_capture(
                 proxy_log_path,
                 started_event,
                 confdir,
+                dek,
             ),
             name="network_proxy",
         )
@@ -2684,7 +2764,13 @@ def _setup_network_capture(
     )
     reader_thread = threading.Thread(
         target=_network_event_reader_loop,
-        args=(proxy_out_q, network_write_q, terminate_processing, reader_started),
+        args=(
+            proxy_out_q,
+            network_write_q,
+            terminate_processing,
+            reader_started,
+            proxy_proc,
+        ),
         name="network_event_reader",
         daemon=True,
     )
@@ -2696,6 +2782,8 @@ def _setup_network_capture(
         "proxy_proc": proxy_proc,
         "proxy_out_q": proxy_out_q,
         "reader_thread": reader_thread,
+        "writer_proc": network_event_writer,
+        "writer_terminate_event": network_writer_terminate,
         "snapshot": snapshot,
         "snapshot_path": snapshot_path,
         "durable_snapshot_path": durable_snapshot_path,
@@ -2710,6 +2798,7 @@ def _network_event_reader_loop(
     network_write_q: sq.SynchronizedQueue,
     terminate_event,  # multiprocessing.Event
     started_event: threading.Event,
+    proxy_proc=None,  # multiprocessing.Process | None — for liveness-bound drain
 ) -> None:
     """Drain the proxy mp.Queue into ``network_write_q``.
 
@@ -2791,22 +2880,34 @@ def _network_event_reader_loop(
             continue
         _process_event(event)
 
-    # Drain phase: terminate is set, but the proxy mp.Process may still
-    # be flushing its final events into out_q (the engine teardown
-    # restores system proxy first, THEN terminates the proxy). Without
-    # this, events the addon already pushed but the reader hasn't
-    # consumed get silently dropped — the writer's
-    # `not write_q.empty()` drain guarantee is upstream of the bottleneck.
-    # mp.Queue.empty() is unreliable across processes, so use empty-poll
-    # counting: bail out after `_DRAIN_EMPTY_THRESHOLD` consecutive empty
-    # gets (~250ms of true emptiness).
+    # Drain phase: terminate is set, but the proxy mp.Process is STILL
+    # ALIVE because the engine teardown restores system proxy first
+    # (osascript admin auth, can take seconds) before terminating it.
+    # The addon's done() hook emits final events (notably
+    # NetworkTunneledEvent — one per observed pinned host) AFTER
+    # SIGTERM reaches mitmproxy, which only happens later in
+    # _teardown_network_capture's step (3). A fixed 250ms empty-poll
+    # timeout would exit the reader before those final events land,
+    # silently dropping them.
+    #
+    # Correct loop: keep reading while the proxy is alive. Once the
+    # OS reports the proxy exited, do a tail drain (5 empty polls,
+    # ~250ms) to catch any events still in flight on the cross-process
+    # mp.Queue. ``proxy_proc=None`` (test path / legacy callers) falls
+    # back to the timeout-only behavior.
     _DRAIN_EMPTY_THRESHOLD = 5
     empty_polls = 0
-    while empty_polls < _DRAIN_EMPTY_THRESHOLD:
+    while True:
         try:
             event = out_q.get(timeout=0.05)
         except queue.Empty:
             empty_polls += 1
+            # Exit only when the proxy has actually exited AND we've
+            # observed N consecutive empty polls. The proxy_proc==None
+            # path keeps the legacy timeout-only contract.
+            proxy_dead = proxy_proc is None or not proxy_proc.is_alive()
+            if proxy_dead and empty_polls >= _DRAIN_EMPTY_THRESHOLD:
+                break
             continue
         empty_polls = 0
         _process_event(event)
@@ -2845,6 +2946,8 @@ def _teardown_network_capture(state: dict[str, Any]) -> None:
     services_at_start = state["services_at_start"]
     proxy_proc = state["proxy_proc"]
     reader_thread = state["reader_thread"]
+    writer_proc = state.get("writer_proc")
+    writer_terminate_event = state.get("writer_terminate_event")
 
     # (1) Restore system proxy FIRST.
     try:
@@ -2859,7 +2962,12 @@ def _teardown_network_capture(state: dict[str, Any]) -> None:
     except OSError:
         logger.exception("failed to write .proxy_restored marker")
 
-    # (3) Terminate proxy mp.Process.
+    # (3) Terminate proxy mp.Process. SIGTERM lands inside mitmproxy
+    # which runs the addon's done() hook — that's where final
+    # network.tunneled events are emitted. They flow proxy → reader
+    # → network_write_q. The reader stays alive while proxy_proc.is_alive
+    # (per the round-3 P1 fix); the writer stays alive because we
+    # haven't set writer_terminate_event yet.
     try:
         if proxy_proc.is_alive():
             proxy_proc.terminate()
@@ -2871,9 +2979,29 @@ def _teardown_network_capture(state: dict[str, Any]) -> None:
     except Exception:  # noqa: BLE001
         logger.exception("error terminating proxy mp.Process")
 
-    # Reader thread will exit once the writer is drained and terminate is set.
+    # Reader thread sees proxy_proc dead and finishes its drain phase.
     if reader_thread.is_alive():
         reader_thread.join(timeout=2)
+
+    # (3.5) ONLY NOW signal the network writer to terminate. Until this
+    # point the writer kept draining ``network_write_q`` so the addon's
+    # done()-emitted events (which the reader just forwarded) get
+    # persisted to ``recording.db.network_event``. The writer's loop
+    # exits when the event is set AND the queue is empty.
+    if writer_terminate_event is not None:
+        writer_terminate_event.set()
+    if writer_proc is not None:
+        try:
+            writer_proc.join(timeout=5)
+            if writer_proc.is_alive():
+                logger.warning(
+                    "network writer did not exit in 5s after terminate; "
+                    "force-terminating",
+                )
+                writer_proc.terminate()
+                writer_proc.join(timeout=2)
+        except Exception:  # noqa: BLE001
+            logger.exception("error joining network writer process")
 
     # (4) Coverage-gap diff.
     try:
@@ -2925,6 +3053,10 @@ def record(
     network_config: Any | None = None,
     privacy_config: Any | None = None,
     network_proxy_port: int | None = None,
+    # --- network body capture (V1.5) ---
+    dek: bytes | None = None,
+    dek_wrapped: bytes | None = None,
+    dek_nonce: bytes | None = None,
 ) -> None:
     """Record Screenshots/ActionEvents/WindowEvents.
 
@@ -2943,6 +3075,16 @@ def record(
             by the proxy ignore_hosts regex; other fields not used at proxy layer).
         network_proxy_port: Pre-flight-negotiated port; engine flips system
             proxy to point at this port after the listener is ready.
+        dek: V1.5 plaintext per-recording Data Encryption Key (32 bytes).
+            ``None`` (default) for V1 callers; the addon then emits
+            metadata-only events. When set, body bytes for hosts in the
+            effective allowlist are AES-256-GCM-encrypted with this key.
+        dek_wrapped: V1.5 KEK-wrapped DEK ciphertext (with GCM tag).
+            ``None`` for V1; when set, persisted to ``network_event_meta``
+            before the proxy spawns so export-time decryption can resolve
+            the DEK without re-reading the KEK.
+        dek_nonce: V1.5 12-byte AES-GCM nonce used to wrap ``dek``.
+            ``None`` for V1.
     """
     assert config.RECORD_VIDEO or config.RECORD_IMAGES, (
         config.RECORD_VIDEO,
@@ -3214,6 +3356,9 @@ def record(
                 flush_requested=flush_requested,
                 flush_ack_counter=flush_ack_counter,
                 handoff_ready_event=network_handoff_ready,
+                dek=dek,
+                dek_wrapped=dek_wrapped,
+                dek_nonce=dek_nonce,
             )
             network_write_q = _network_state["write_q"]
         except Exception as exc:  # noqa: BLE001 — abort recording cleanly on setup failure
@@ -3629,6 +3774,10 @@ class Recorder:
         network_config: Any | None = None,
         privacy_config: Any | None = None,
         network_proxy_port: int | None = None,
+        # --- Network body capture (V1.5) ---
+        dek: bytes | None = None,
+        dek_wrapped: bytes | None = None,
+        dek_nonce: bytes | None = None,
     ) -> None:
         from pathlib import Path
 
@@ -3643,6 +3792,14 @@ class Recorder:
         self._network_config = network_config
         self._privacy_config = privacy_config
         self._network_proxy_port = network_proxy_port
+        # V1.5 body-encryption material. None for V1 callers / no-network
+        # recordings; set by top-level start_recording when --network is
+        # active. dek plaintext is forwarded to the proxy mp.Process via
+        # the spawn pickler; dek_wrapped/dek_nonce are persisted into
+        # network_event_meta by _setup_network_capture.
+        self._dek = dek
+        self._dek_wrapped = dek_wrapped
+        self._dek_nonce = dek_nonce
 
         # Build recording config from constructor params
         self._recording_config = RecordingConfig(
@@ -3761,6 +3918,9 @@ class Recorder:
                 network_config=self._network_config,
                 privacy_config=self._privacy_config,
                 network_proxy_port=self._network_proxy_port,
+                dek=self._dek,
+                dek_wrapped=self._dek_wrapped,
+                dek_nonce=self._dek_nonce,
             )
 
     def _forward_fanout_msg(self, msg) -> None:

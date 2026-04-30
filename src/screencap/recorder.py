@@ -961,9 +961,18 @@ def start_recording(
     _network_lock_handle = None
     _network_config = None
     _network_proxy_port: int | None = None
+    # V1.5 KEK/DEK material — generated AFTER pre-flight succeeds and BEFORE
+    # Recorder() is constructed. KEK plaintext lives only in this function's
+    # frame; DEK plaintext is passed by reference (in-process) or by pickle
+    # (to the spawned proxy mp.Process) — see locked V1.5 design doc.
+    _network_dek: bytes | None = None
+    _network_dek_wrapped: bytes | None = None
+    _network_dek_nonce: bytes | None = None
     if network:
         try:
             from screencap.config import get_network_config
+            from screencap.network import crypto as _net_crypto
+            from screencap.network.blocklist import effective_capture_bodies_for
             from screencap.network.lifecycle import (
                 acquire_network_lock,
                 preflight_or_raise,
@@ -982,6 +991,34 @@ def start_recording(
                 privacy_config,
                 recording_dir=capture_dir,
             )
+
+            # V1.5 KEK access + per-recording DEK generation.
+            # get_or_create_kek may prompt the user via the macOS
+            # Keychain dialog the first time the binary asks for it; the
+            # UX is the same as the CA install prompt. Any Keychain
+            # access failure (denied / corrupted / locked) raises and
+            # falls through the existing except block below with an
+            # actionable rich-console message.
+            _kek = _net_crypto.get_or_create_kek()
+            _network_dek = _net_crypto.generate_dek()
+            _network_dek_wrapped, _network_dek_nonce = _net_crypto.wrap_dek(
+                _network_dek, _kek
+            )
+            # Drop KEK plaintext as soon as the DEK is wrapped — KEK only
+            # lives in this function's frame; Python GC reclaims it once
+            # the local goes out of scope at function exit.
+            del _kek
+
+            # Empty-allowlist warning (V1.5): if the effective body-capture
+            # allowlist is empty, the recording will be metadata-only for
+            # all hosts — surface this so the user isn't surprised by a
+            # missing-bodies result later.
+            if not effective_capture_bodies_for(_network_config):
+                console.print(
+                    "[yellow]warning:[/yellow] effective capture-bodies "
+                    "allowlist is empty; recording will be metadata-only "
+                    "for all hosts."
+                )
         except Exception as exc:  # noqa: BLE001
             console.print(f"[red]Error:[/red] {exc}")
             if _network_lock_handle is not None:
@@ -1000,6 +1037,15 @@ def start_recording(
             recorder_kwargs["network_config"] = _network_config
             recorder_kwargs["privacy_config"] = privacy_config
             recorder_kwargs["network_proxy_port"] = _network_proxy_port
+            # V1.5 body-encryption material. dek plaintext crosses the
+            # spawn boundary into the proxy mp.Process via pickle (the
+            # threat model accepts in-memory exposure within the recorder
+            # process tree). dek_wrapped / dek_nonce are persisted to
+            # network_event_meta inside _setup_network_capture so export-
+            # time decryption can resolve the DEK without re-reading KEK.
+            recorder_kwargs["dek"] = _network_dek
+            recorder_kwargs["dek_wrapped"] = _network_dek_wrapped
+            recorder_kwargs["dek_nonce"] = _network_dek_nonce
         if capture_video is not None:
             recorder_kwargs["capture_video"] = capture_video
         else:

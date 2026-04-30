@@ -1320,19 +1320,141 @@ def info(name, as_json):
             console.print(f"\n  [dim]No end snapshot (recording may have been interrupted).[/dim]")
 
 
-def _export_one(recording_dir, output_path, exclude_moves, err_console, privacy_filter=None):
+def _export_one(
+    recording_dir,
+    output_path,
+    exclude_moves,
+    err_console,
+    privacy_filter=None,
+    *,
+    include_network: bool = False,
+):
     """Export a single recording. Returns event count, or -1 on error.
 
     When *privacy_filter* is supplied, it is applied to window.switch events
     during export — used by the ``--privacy-filter`` flag (Unit 4d).
+
+    ``include_network`` defaults to ``False`` for cloud safety. The CLI
+    ``screencap export`` command sets it to True ONLY when the user
+    explicitly directed the output to ``--stdout`` or to a custom path
+    via ``-o``. When the export writes to the default
+    ``<recording_dir>/events.jsonl``, the file is the same one
+    ``screencap upload`` later picks up, so emitting network rows there
+    would leak metadata to the cloud bucket — bypassing the
+    "no network rows reach cloud until V1.75" gate.
+
+    V1.5: when ``include_network=True`` AND the recording has encrypted
+    network bodies (a ``network_event`` row with non-NULL
+    ``body_ciphertext`` exists), construct a
+    :class:`NetworkScrubPipeline` for decrypt+scrub of bodies at the
+    row-conversion boundary. Pipeline construction triggers a Keychain
+    prompt on first call and a silent read thereafter ("Always Allow"
+    trusted-binary extension); failure raises
+    :class:`KekUnavailableError` and we fail-loud per the V1.5 ticket's
+    "KEK-missing semantics" lock.
     """
+    import logging
+    from pathlib import Path
+
     from screencap.exporter import ExportError, build_export_metadata, export_recording
+    from screencap.network.export_pipeline import (
+        KekUnavailableError,
+        NetworkScrubPipeline,
+        recording_has_encrypted_bodies,
+    )
+
+    logger = logging.getLogger(__name__)
 
     meta = build_export_metadata(exclude_moves)
+
+    # V1.5: per-recording pipeline construction. The cheap ciphertext
+    # check skips the Keychain prompt for V1-vintage AND for V1.5
+    # metadata-only recordings (allowlist-miss). When ``include_network``
+    # is False (the cloud-safe default for ``<recording_dir>/events.jsonl``)
+    # we skip pipeline construction entirely — there's no point paying
+    # the Keychain prompt cost only to drop the rows we'd decrypt.
+    network_scrub_pipeline = None
+    # The caller sets include_network only when the user has explicitly
+    # directed output away from the cloud-pickup default. We may still
+    # need to drop it back to False in the broad-Exception fallback
+    # path below: when pipeline construction fails defensively, leaving
+    # include_network=True with a null pipeline would feed capture-side
+    # events with body_ciphertext bytes to Pydantic JSON serialization,
+    # violating the V1.5 invariant that ciphertext can never reach
+    # JSONL by construction. Track the safe-to-emit flag locally so
+    # the fallback can degrade by suppressing network rows entirely.
+    db_path = str(Path(recording_dir) / "recording.db")
+    try:
+        if include_network and Path(db_path).exists():
+            from screencap.engine.db import (
+                _ensure_network_tables,
+                get_engine,
+                get_session_for_path,
+            )
+            from screencap.engine.db.models import Recording
+
+            # Ensure the table exists (legacy DBs predate the feature).
+            try:
+                engine = get_engine(f"sqlite:///{db_path}")
+                _ensure_network_tables(engine)
+                engine.dispose()
+            except Exception:
+                pass
+            # Look up the recording_id from the DB and check for the
+            # meta row. The recording_id is a fixed integer per
+            # recording.db; one Recording row per file.
+            session = get_session_for_path(db_path)
+            try:
+                rec = session.query(Recording).first()
+                recording_id = rec.id if rec is not None else None
+            finally:
+                session.close()
+            if recording_id is not None and recording_has_encrypted_bodies(
+                db_path, recording_id,
+            ):
+                try:
+                    network_scrub_pipeline = NetworkScrubPipeline(
+                        db_path, recording_id,
+                    )
+                except KekUnavailableError as e:
+                    err_console.print(
+                        f"[red]Error:[/red] Cannot decrypt network bodies: {e}. "
+                        "Run `screencap network uninstall && screencap start "
+                        "--network` to regenerate (existing encrypted bodies "
+                        "will be lost).",
+                    )
+                    return -1
+    except KekUnavailableError:
+        # Re-raise wrapped errors -- the inner block already printed
+        # the actionable message. Fall through to return -1.
+        return -1
+    except Exception as e:
+        # Defensive: any unexpected error setting up the pipeline check
+        # should not crash the export. Drop network rows entirely from
+        # this export (include_network=False) — keeping include_network
+        # true with pipeline=None would feed capture-side events with
+        # raw ciphertext bytes to Pydantic's JSON serializer, violating
+        # the V1.5 schema invariant. KekUnavailableError above is the
+        # fail-loud branch; this is the fail-closed branch for
+        # everything else.
+        logger.debug("Skipping network rows in export: %s", e)
+        if include_network:
+            err_console.print(
+                "[yellow]Warning:[/yellow] could not set up network scrub "
+                "pipeline; export will omit network events for this "
+                "recording.",
+            )
+            include_network = False
+
     try:
         return export_recording(
-            recording_dir, output_path, exclude_moves,
-            metadata=meta, privacy_filter=privacy_filter,
+            recording_dir,
+            output_path,
+            exclude_moves,
+            metadata=meta,
+            privacy_filter=privacy_filter,
+            include_network=include_network,
+            network_scrub_pipeline=network_scrub_pipeline,
         )
     except ExportError as e:
         err_console.print(f"[red]Error:[/red] {e}")
@@ -1493,7 +1615,17 @@ def export(name, all_recordings, downloads, output, use_stdout, exclude_moves, p
             err_console.print(f"\n[bold][{i}/{total}][/bold] {rec_dir.name}")
             out = str(rec_dir / "events.jsonl")
             pf = _build_export_privacy_filter(rec_dir) if privacy_filter_enabled else None
-            count = _export_one(rec_dir, out, exclude_moves, err_console, privacy_filter=pf)
+            # --all writes to recording_dir/events.jsonl, the same file
+            # `screencap upload` picks up. Network rows must NOT land
+            # there per the V1.5 cloud-safety gate.
+            count = _export_one(
+                rec_dir,
+                out,
+                exclude_moves,
+                err_console,
+                privacy_filter=pf,
+                include_network=False,
+            )
             if count >= 0:
                 err_console.print(f"Exported {count} events to [bold]{out}[/bold]")
                 if count == 0:
@@ -1522,16 +1654,30 @@ def export(name, all_recordings, downloads, output, use_stdout, exclude_moves, p
         err_console.print(f"[red]Error:[/red] Recording not found: {name}")
         sys.exit(1)
 
-    # Resolve output destination
+    # Resolve output destination. Network rows are emitted ONLY when
+    # the user explicitly directs the output somewhere other than the
+    # default ``<recording_dir>/events.jsonl`` — that file is the same
+    # one ``screencap upload`` picks up, and emitting network metadata
+    # there would bypass the V1.5 cloud-safety gate.
     if use_stdout:
         output_path = None
+        include_network = True
     elif output:
         output_path = output
+        include_network = True
     else:
         output_path = str(recording_dir / "events.jsonl")
+        include_network = False
 
     pf = _build_export_privacy_filter(recording_dir) if privacy_filter_enabled else None
-    count = _export_one(recording_dir, output_path, exclude_moves, err_console, privacy_filter=pf)
+    count = _export_one(
+        recording_dir,
+        output_path,
+        exclude_moves,
+        err_console,
+        privacy_filter=pf,
+        include_network=include_network,
+    )
     if count < 0:
         sys.exit(1)
     if output_path:
@@ -3826,6 +3972,38 @@ def _check_onnxruntime_excluded() -> tuple[str, bool, str]:
         return name, False, _tb.format_exc()
 
 
+def _check_keyring_macos_backend() -> tuple[str, bool, str]:
+    """Verify the macOS Keychain backend is importable + selected.
+
+    V1.5 stores the network-body KEK in the user's login keychain via
+    keyring. PyInstaller cannot trace `keyring.get_keyring()`'s string-
+    based backend lookup, so the spec adds `keyring.backends.macOS` as
+    an explicit hidden import. This check confirms the bundle picked it
+    up — the import is itself the test, plus a sanity check that the
+    runtime backend is not the in-memory fallback (which would silently
+    lose the KEK across recorder runs).
+    """
+    name = "keyring_macos_backend"
+    try:
+        import traceback as _tb
+        import keyring  # noqa: PLC0415
+        import keyring.backends.macOS  # noqa: PLC0415, F401
+        backend = keyring.get_keyring()
+        backend_name = type(backend).__name__
+        # On non-Darwin or in test environments the backend may not be
+        # the macOS one — but in a real frozen binary on macOS we expect
+        # `Keyring` from `keyring.backends.macOS`. Accept any non-fail
+        # backend; surface the name in the message for visibility.
+        if backend_name in ("fail", "Null"):
+            return name, False, (
+                f"keyring backend is {backend_name} (no usable backend); "
+                f"frozen binary failed to bundle keyring.backends.macOS"
+            )
+        return name, True, ""
+    except Exception:
+        return name, False, _tb.format_exc()
+
+
 @cli.group("network")
 def network_group() -> None:
     """Manage the network capture CA + recover from crashes."""
@@ -3847,6 +4025,199 @@ def network_uninstall_cmd() -> None:
     console.print("[bold]Uninstalling screencap network capture...[/bold]")
     full_uninstall()
     console.print("[green]Done.[/green]")
+
+
+@network_group.command("preload-pin")
+@click.argument("host")
+def network_preload_pin_cmd(host: str) -> None:
+    """Add HOST to the persistent known-pinned-hosts cache.
+
+    The capture addon detects cert-pinned hosts at runtime and adds
+    them to ``~/.screencap/known_pinned_hosts.json`` so the next
+    recording skips the MITM attempt and tunnels them directly.
+    Use this command to seed a host manually without having to
+    record once and fail (e.g. an internal banking app you already
+    know is pinned).
+
+    Idempotent: re-adding an existing host is a no-op.
+    """
+    from screencap.network.pinned_hosts import (
+        add_known_pinned_host,
+        load_known_pinned_hosts,
+    )
+
+    host_lc = host.strip().lower()
+    if not host_lc:
+        console.print("[red]Error:[/red] host must be non-empty")
+        sys.exit(1)
+    if add_known_pinned_host(host_lc):
+        console.print(
+            f"[green]Added[/green] {host_lc} to "
+            f"~/.screencap/known_pinned_hosts.json. Next --network "
+            f"recording will tunnel it directly."
+        )
+    else:
+        existing = load_known_pinned_hosts()
+        if host_lc in existing:
+            console.print(f"[dim]{host_lc} already in known-pinned-hosts list.[/dim]")
+        else:
+            console.print(f"[red]Failed to persist[/red] {host_lc}")
+            sys.exit(1)
+
+
+@network_group.command("remove-kek")
+@click.option(
+    "--force",
+    is_flag=True,
+    help="Proceed even if encrypted recordings exist on disk.",
+)
+def network_remove_kek_cmd(force: bool) -> None:
+    """Delete the network-body KEK from your Keychain.
+
+    The KEK is the long-lived key that wraps every recording's per-recording
+    DEK. Without it, the V1.5+ network bodies in past recordings cannot be
+    decrypted — they become permanently inaccessible. This is the right
+    command to run when:
+
+    \b
+    - Rotating the KEK (you are about to start fresh; existing encrypted
+      recordings will become undecryptable).
+    - Selling/disposing the device (combined with `screencap network uninstall`
+      and shredding the recordings directory).
+
+    Safety check (unless --force):
+        Scans the configured recordings directory for any recording with
+        at least one ``network_event`` row carrying non-NULL
+        ``body_ciphertext`` and refuses to proceed if any are found,
+        listing them. V1.5 metadata-only recordings (where the user
+        only browsed non-allowlisted hosts) have no ciphertext rows
+        and do NOT block removal — those have a wrapped DEK on disk
+        but nothing to decrypt with it.
+
+    Limitation: recordings written under `--output <custom-path>` are NOT
+    discovered by this scan because we do not track custom output paths
+    after the recording ends. If you have ever used `--output`, you must
+    audit those locations yourself before passing --force.
+    """
+    from screencap.catalog import list_recordings
+    from screencap.config import get_recordings_dir
+    from screencap.engine.db import get_session_for_path
+    from screencap.engine.db.models import NetworkEvent, Recording
+    from screencap.network import crypto
+
+    # Safety scan policy: KEK deletion is irreversible for every
+    # encrypted body on disk. If we can't determine whether a recording
+    # has ciphertext (DB unreadable, query fails for any reason), the
+    # safe default is fail-CLOSED — treat the recording as if it has
+    # encrypted bodies and require the user to either fix the recording
+    # or pass --force. Failing open here would silently delete the KEK
+    # while a recording the user couldn't even open might still need
+    # decryption.
+    encrypted_recordings: list[str] = []
+    unreadable_recordings: list[str] = []
+    recordings_dir = get_recordings_dir()
+    for rec in list_recordings():
+        db_path = recordings_dir / rec.name / "recording.db"
+        if not db_path.exists():
+            # No DB at all → nothing to lose by deleting KEK for this
+            # recording; skip safely.
+            continue
+        try:
+            session = get_session_for_path(str(db_path))
+        except Exception as exc:
+            unreadable_recordings.append(f"{rec.name} ({type(exc).__name__})")
+            continue
+        try:
+            recording_row = session.query(Recording).first()
+            if recording_row is None:
+                # Unusual: DB opens but has no Recording row. Treat as
+                # unreadable rather than silently safe.
+                unreadable_recordings.append(f"{rec.name} (no Recording row)")
+                has_ciphertext = False
+            else:
+                has_ciphertext = (
+                    session.query(NetworkEvent.id)
+                    .filter(NetworkEvent.recording_id == recording_row.id)
+                    .filter(NetworkEvent.body_ciphertext.isnot(None))
+                    .first()
+                    is not None
+                )
+        except Exception as exc:
+            # Query itself failed (corrupted DB, schema mismatch, etc).
+            # Add to unreadable bucket so the user has to acknowledge
+            # rather than silently treating as safe.
+            unreadable_recordings.append(f"{rec.name} ({type(exc).__name__})")
+            has_ciphertext = False
+        finally:
+            session.close()
+        if has_ciphertext:
+            encrypted_recordings.append(rec.name)
+
+    blocking_recordings = encrypted_recordings + [
+        f"[unreadable] {entry}" for entry in unreadable_recordings
+    ]
+    if blocking_recordings and not force:
+        if encrypted_recordings:
+            console.print(
+                f"[red]Refusing to delete KEK:[/red] "
+                f"{len(encrypted_recordings)} recording(s) on disk have "
+                f"encrypted network bodies that depend on this KEK:"
+            )
+            for name in encrypted_recordings:
+                console.print(f"  • {name}")
+        if unreadable_recordings:
+            console.print(
+                f"[red]Refusing to delete KEK:[/red] "
+                f"{len(unreadable_recordings)} recording(s) could not be "
+                f"scanned for encrypted bodies and may still need this KEK:"
+            )
+            for entry in unreadable_recordings:
+                console.print(f"  • {entry}")
+            console.print(
+                "[dim]Unreadable recordings fail closed — re-run after "
+                "removing the bad recordings, or pass [bold]--force[/bold] "
+                "to delete the KEK anyway.[/dim]"
+            )
+        console.print(
+            "\n[yellow]Deleting the KEK will make these recordings' "
+            "network bodies permanently undecryptable.[/yellow] Either "
+            "export them first (`screencap export <name>`) or pass "
+            "[bold]--force[/bold] to proceed anyway."
+        )
+        console.print(
+            "\n[dim]Note:[/dim] recordings written with --output <custom-path> "
+            "are NOT included in this scan."
+        )
+        sys.exit(1)
+
+    if blocking_recordings and force:
+        if encrypted_recordings:
+            console.print(
+                f"[yellow]--force given;[/yellow] {len(encrypted_recordings)} "
+                f"encrypted recording(s) will become undecryptable."
+            )
+        if unreadable_recordings:
+            console.print(
+                f"[yellow]--force given;[/yellow] "
+                f"{len(unreadable_recordings)} recording(s) could not be "
+                f"scanned and will lose access to this KEK:"
+            )
+            for entry in unreadable_recordings:
+                console.print(f"  • {entry}")
+
+    try:
+        import keyring  # noqa: PLC0415
+        keyring.delete_password(crypto.SERVICE, crypto.KEK_ACCOUNT)
+        console.print("[green]KEK removed from Keychain.[/green]")
+    except Exception as exc:
+        # PasswordDeleteError is the typical "no such password" — treat
+        # as a no-op success so the command is idempotent.
+        msg = str(exc).lower()
+        if "no such password" in msg or "not found" in msg or "passworddeleteerror" in type(exc).__name__.lower():
+            console.print("[dim]No KEK present in Keychain (already removed).[/dim]")
+        else:
+            console.print(f"[red]Failed to delete KEK:[/red] {exc}")
+            sys.exit(1)
 
 
 @network_group.command("restore")
@@ -3882,6 +4253,7 @@ _SMOKE_CHECKS = [
     _check_sounddevice,
     _check_domain_index,
     _check_onnxruntime_excluded,
+    _check_keyring_macos_backend,
 ]
 
 
