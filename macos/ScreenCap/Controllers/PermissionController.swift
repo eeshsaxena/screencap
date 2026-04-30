@@ -140,19 +140,28 @@ final class PermissionController: ObservableObject {
         microphone = Self.checkMicrophone()
     }
 
-    /// Spawns a fresh ScreenCap.app via LaunchServices (preserves TCC bundle
-    /// identity) and quits the current process so the new instance reads the
-    /// latest TCC state at launch. Standard Mac-app pattern after a permission
-    /// grant — Loom, 1Password, etc. all do this.
+    /// Quits the current process and spawns a fresh ScreenCap.app via
+    /// LaunchServices so the new instance reads the latest TCC state at
+    /// launch. Order matters: terminate first, then `open` after a short
+    /// delay. If we did `openApplication` first and `terminate` from its
+    /// callback, an unsigned dev build can stack multiple instances when
+    /// LaunchServices delays the terminate callback.
     func relaunchApplication() {
-        let bundleURL = Bundle.main.bundleURL
-        let configuration = NSWorkspace.OpenConfiguration()
-        configuration.createsNewApplicationInstance = true
-        NSWorkspace.shared.openApplication(at: bundleURL, configuration: configuration) { _, _ in
-            DispatchQueue.main.async {
-                NSApp.terminate(nil)
-            }
-        }
+        let bundlePath = Bundle.main.bundlePath
+        let task = Process()
+        task.executableURL = URL(fileURLWithPath: "/usr/bin/open")
+        task.arguments = ["-n", bundlePath] // -n: open new even if already running
+        // Schedule the relaunch ~600ms after we exit so the kernel has fully
+        // reaped this process before LaunchServices wakes the new one.
+        let script = """
+        sleep 0.6
+        /usr/bin/open "\(bundlePath)"
+        """
+        let detach = Process()
+        detach.executableURL = URL(fileURLWithPath: "/bin/sh")
+        detach.arguments = ["-c", script]
+        try? detach.run()
+        NSApp.terminate(nil)
     }
 
     /// Triggers the system permission prompt for `pane` and then opens the
