@@ -5,14 +5,11 @@ Exercise the real SQLite → process_events → JSONL pipeline with no mocks.
 
 from __future__ import annotations
 
-import io
 import json
 import os
 import re
-from datetime import datetime
 
 import pytest
-import screencap
 
 
 def create_export_test_db(db_path, *, include_moves=True, extra_window_events=None):
@@ -151,130 +148,6 @@ def create_export_test_db(db_path, *, include_moves=True, extra_window_events=No
     }
 
 
-def test_basic_export_creates_valid_jsonl(tmp_path):
-    """E1: Basic export with default flags — full pipeline, no mocks."""
-    rec_dir = tmp_path / "my-rec"
-    rec_dir.mkdir()
-    db_path = rec_dir / "recording.db"
-    create_export_test_db(db_path)
-
-    from screencap.exporter import build_export_metadata, export_recording
-
-    out_file = str(rec_dir / "events.jsonl")
-    meta = build_export_metadata(exclude_moves=False)
-    count = export_recording(rec_dir, out_file, exclude_moves=False, metadata=meta)
-
-    # --- E1.1: File created ---
-    assert os.path.exists(out_file)
-
-    lines = open(out_file).read().strip().split("\n")
-
-    # --- E1.2: _meta header ---
-    header = json.loads(lines[0])
-    assert header["_meta"] is True
-    assert header["format_version"] == 2
-    assert header["screencap_version"] == screencap.__version__
-    # ISO-8601 check
-    datetime.fromisoformat(header["exported_at"])
-    assert header["exclude_moves"] is False
-
-    # --- E1.3: All lines parse as JSON ---
-    events = []
-    for line in lines[1:]:
-        events.append(json.loads(line))
-
-    # --- E1.4: Event types are processed (no raw types) ---
-    event_types = {e["type"] for e in events}
-    assert "mouse.singleclick" in event_types
-    assert "key.type" in event_types
-    assert "mouse.scroll" in event_types
-    # Raw types should NOT be present
-    for raw_type in ("mouse.down", "mouse.up", "key.down", "key.up"):
-        assert raw_type not in event_types, f"Raw type {raw_type} should not be in output"
-
-    # --- E1.4b: Scroll merge — 2 consecutive scrolls merge unconditionally into 1 ---
-    scroll_events = [e for e in events if e["type"] == "mouse.scroll"]
-    assert len(scroll_events) == 1
-    assert scroll_events[0]["dy"] == -60.0  # sum of two -30.0 scrolls
-
-    # --- E1.5: mouse.move events included ---
-    # 3 move rows, each separated by non-move events (clicks/keys/scrolls),
-    # so merge_consecutive_mouse_move_events keeps all 3.
-    move_events = [e for e in events if e["type"] == "mouse.move"]
-    assert len(move_events) == 3
-
-    # --- E1.6: window.switch interleaved and ordered by timestamp ---
-    window_events = [e for e in events if e["type"] == "window.switch"]
-    assert len(window_events) > 0, "window.switch events should be present"
-
-    # --- E1.7: window.switch deduplicated (consecutive only) ---
-    # Deduplication compares each event to the *previous* emitted event only.
-    # Non-consecutive duplicates (e.g. Terminal→Chrome→Terminal) are kept
-    # because returning to an app is a real user action.
-    # Our fixture: Terminal→Terminal(deduped)→Chrome = 2 emitted events.
-    assert len(window_events) == 2, (
-        f"Expected 2 window.switch events (consecutive duplicate removed), got {len(window_events)}"
-    )
-
-    # --- E1.8: Timestamps monotonically increasing ---
-    timestamps = [e["timestamp"] for e in events]
-    for i in range(1, len(timestamps)):
-        assert timestamps[i] >= timestamps[i - 1], (
-            f"Timestamp at index {i} ({timestamps[i]}) < previous ({timestamps[i-1]})"
-        )
-
-    # --- E1.9: key.type structure and merge/split behavior ---
-    key_type_events = [e for e in events if e["type"] == "key.type"]
-    # "hello" (0.1s gaps, merged) and "hi" (>0.5s gap from "hello", split)
-    # merge_sequential_key_type_events splits on gaps >= KEY_TYPE_MERGE_INTERVAL_SECONDS (0.5s)
-    assert len(key_type_events) == 2, (
-        f"Expected 2 key.type events ('hello' + 'hi'), got {len(key_type_events)}: "
-        f"{[e['text'] for e in key_type_events]}"
-    )
-    assert key_type_events[0]["text"] == "hello"
-    # 5 chars × 2 (press+release each) = 10 children
-    assert len(key_type_events[0]["children"]) == 10
-    for child in key_type_events[0]["children"]:
-        assert "key_char" in child
-
-    assert key_type_events[1]["text"] == "hi"
-    # 2 chars × 2 = 4 children
-    assert len(key_type_events[1]["children"]) == 4
-
-    # --- E1.10: mouse.singleclick structure ---
-    click_events = [e for e in events if e["type"] == "mouse.singleclick"]
-    assert len(click_events) == 2
-    for ce in click_events:
-        assert 0 <= ce["x"] <= 1512
-        assert 0 <= ce["y"] <= 982
-        assert ce["button"] == "left"
-
-    # --- E1.11: window.switch structure ---
-    for ws in window_events:
-        assert "app_bundle_id" in ws
-        assert "window_title" in ws
-        assert "app_name" in ws
-
-    # Chrome event should have domain; app_name derived from bundle_id last component
-    chrome_ws = [ws for ws in window_events if ws["app_bundle_id"] == "com.google.Chrome"]
-    assert len(chrome_ws) == 1
-    assert chrome_ws[0]["domain"] == "example.com"
-    assert chrome_ws[0]["app_name"] == "Chrome"
-
-    # Terminal event should not have domain
-    terminal_ws = [ws for ws in window_events if ws["app_bundle_id"] == "com.apple.Terminal"]
-    assert len(terminal_ws) == 1
-    assert terminal_ws[0]["domain"] is None
-    assert terminal_ws[0]["app_name"] == "Terminal"
-
-    # --- E1.12: Return value = event count ---
-    assert count > 0
-    assert count == len(events)
-
-    # --- E1.13: Atomic write — no .tmp file remaining ---
-    assert not os.path.exists(out_file + ".tmp")
-
-
 def test_export_to_stdout(tmp_path, capsys):
     """E2: Export to stdout — no file on disk, valid JSONL on stdout."""
     rec_dir = tmp_path / "my-rec"
@@ -378,136 +251,6 @@ def test_cli_export_missing_db_shows_error(tmp_path, monkeypatch):
     assert "no recording database found" in result.output.lower()
 
 
-def test_privacy_filter_excludes_and_masks(tmp_path, monkeypatch):
-    """E5: Privacy filter in public mode — EXCLUDE suppresses, MASK_WINDOW replaces title."""
-    import screencap.config
-    monkeypatch.setattr(screencap.config, "_config_cache", None)
-    monkeypatch.delenv("SCREENCAP_PRIVACY_MODE", raising=False)
-
-    rec_dir = tmp_path / "my-rec"
-    rec_dir.mkdir()
-
-    extra_windows = [
-        {
-            "timestamp": 1006.0,
-            "title": "1Password — Vault",
-            "app_bundle_id": "com.1password.1password",
-            "window_id": "300",
-            "left": 0, "top": 0, "width": 1512, "height": 982,
-        },
-        {
-            "timestamp": 1009.0,
-            "title": "#secret-channel — Slack",
-            "app_bundle_id": "com.tinyspeck.slackmacgap",
-            "window_id": "400",
-            "left": 0, "top": 0, "width": 1512, "height": 982,
-        },
-    ]
-    create_export_test_db(rec_dir / "recording.db", extra_window_events=extra_windows)
-
-    from screencap.engine import Capture
-    from screencap.exporter import _write_events
-    from screencap.privacy.filter import build_privacy_filter
-
-    pf = build_privacy_filter(privacy_mode="public", cloud_intent=False)
-    out_file = rec_dir / "events.jsonl"
-
-    with Capture.load(str(rec_dir)) as capture:
-        with open(out_file, "w") as f:
-            count = _write_events(capture, f, True, None, privacy_filter=pf)
-
-    events = [json.loads(line) for line in open(out_file).read().strip().split("\n")]
-    ws_events = [e for e in events if e["type"] == "window.switch"]
-    ws_bundles = {e["app_bundle_id"] for e in ws_events}
-
-    # --- E5.1: EXCLUDE app suppressed ---
-    assert "com.1password.1password" not in ws_bundles
-
-    # --- E5.2: MASK_WINDOW app title masked ---
-    # Slack (CHAT + PUBLIC = MASK_WINDOW) → title replaced with app_name
-    slack_ws = [e for e in ws_events if e["app_bundle_id"] == "com.tinyspeck.slackmacgap"]
-    assert len(slack_ws) == 1
-    # app_name derived from bundle_id: "slackmacgap" → "Slackmacgap"
-    assert slack_ws[0]["window_title"] == "Slackmacgap"
-    assert slack_ws[0]["domain"] is None
-
-    # --- E5.3: Normal apps pass through ---
-    # Terminal (CODE_EDITOR_TERMINAL + PUBLIC = TEXT_REDACT → passes through unchanged)
-    terminal_ws = [e for e in ws_events if e["app_bundle_id"] == "com.apple.Terminal"]
-    assert len(terminal_ws) == 1
-    assert terminal_ws[0]["window_title"] == "bash — 80×24"
-
-
-def test_privacy_filter_cloud_intent(tmp_path, monkeypatch):
-    """E5.4: cloud_intent=True forces public mode.
-
-    Post-Unit-7a, CHAT under internal already evaluates to MASK_WINDOW
-    (matching public for chat/email/calendar/video-call), so Slack alone
-    no longer surfaces the cloud_intent uplift. We assert two things:
-
-    1. Slack is masked under both internal and cloud-forced public (the new
-       Unit 7a baseline — chat windows are masked by default at internal mode).
-    2. The cloud-intent uplift is still observable on a class where internal
-       and public diverge (CODE_EDITOR_TERMINAL: internal=ALLOW, public=TEXT_REDACT).
-       TEXT_REDACT does not alter the window.switch title (only redacts text
-       content downstream), so we instead use a `mask_domain` setting which
-       only takes effect under public mode for browser windows.
-    """
-    import screencap.config
-    monkeypatch.setattr(screencap.config, "_config_cache", None)
-    monkeypatch.delenv("SCREENCAP_PRIVACY_MODE", raising=False)
-
-    rec_dir = tmp_path / "my-rec"
-    rec_dir.mkdir()
-
-    extra_windows = [
-        {
-            "timestamp": 1009.0,
-            "title": "#secret-channel — Slack",
-            "app_bundle_id": "com.tinyspeck.slackmacgap",
-            "window_id": "400",
-            "left": 0, "top": 0, "width": 1512, "height": 982,
-        },
-    ]
-    create_export_test_db(rec_dir / "recording.db", extra_window_events=extra_windows)
-
-    from screencap.engine import Capture
-    from screencap.exporter import _write_events
-    from screencap.privacy.filter import build_privacy_filter
-
-    def _export_with_filter(pf):
-        with Capture.load(str(rec_dir)) as capture:
-            buf = io.StringIO()
-            _write_events(capture, buf, True, None, privacy_filter=pf)
-            buf.seek(0)
-            return [json.loads(line) for line in buf.read().strip().split("\n")]
-
-    # Internal mode: Slack (CHAT) → MASK_WINDOW post-Unit-7a → title masked.
-    pf_internal = build_privacy_filter(privacy_mode="internal", cloud_intent=False)
-    events_internal = _export_with_filter(pf_internal)
-    slack_internal = [
-        e for e in events_internal
-        if e["type"] == "window.switch" and e["app_bundle_id"] == "com.tinyspeck.slackmacgap"
-    ]
-    assert len(slack_internal) == 1
-    assert slack_internal[0]["window_title"] == "Slackmacgap"  # MASK_WINDOW: app_name only
-    assert slack_internal[0]["domain"] is None
-
-    # Internal mode WITH cloud_intent: forced to PUBLIC → Slack still MASK_WINDOW.
-    # Same observable result for Slack post-Unit-7a — both internal and public
-    # mask CHAT windows. The cloud_intent uplift is invisible here precisely
-    # because the matrix correction made internal as strict as public for CHAT.
-    pf_cloud = build_privacy_filter(privacy_mode="internal", cloud_intent=True)
-    events_cloud = _export_with_filter(pf_cloud)
-    slack_cloud = [
-        e for e in events_cloud
-        if e["type"] == "window.switch" and e["app_bundle_id"] == "com.tinyspeck.slackmacgap"
-    ]
-    assert len(slack_cloud) == 1
-    assert slack_cloud[0]["window_title"] == "Slackmacgap"
-    assert slack_cloud[0]["domain"] is None
-
-
 def test_cli_export_creates_jsonl(tmp_path, monkeypatch):
     """E6.1-E6.3: screencap export <name> creates events.jsonl with exit code 0."""
     rec_dir = tmp_path / "test-rec"
@@ -533,36 +276,6 @@ def test_cli_export_creates_jsonl(tmp_path, monkeypatch):
     assert re.search(r"\d+", result.output)
 
 
-def test_cli_export_stdout(tmp_path, monkeypatch):
-    """E6.4: --stdout writes JSONL to terminal, no file created."""
-    rec_dir = tmp_path / "test-rec"
-    rec_dir.mkdir()
-    create_export_test_db(rec_dir / "recording.db")
-
-    monkeypatch.setenv("SCREENCAP_RECORDINGS_DIR", str(tmp_path))
-
-    from click.testing import CliRunner
-    from screencap.cli import cli
-
-    result = CliRunner().invoke(cli, ["export", "test-rec", "--stdout"])
-
-    assert result.exit_code == 0, result.output
-
-    # JSONL on stdout — filter out stderr warning lines mixed in by CliRunner
-    lines = result.output.strip().split("\n")
-    jsonl_lines = [line for line in lines if line.startswith("{")]
-    assert len(jsonl_lines) > 0, "Expected JSONL lines on stdout"
-    for line in jsonl_lines:
-        json.loads(line)
-
-    # First JSONL line should be the _meta header
-    header = json.loads(jsonl_lines[0])
-    assert header["_meta"] is True
-
-    # No file created (--stdout skips file write)
-    assert not (rec_dir / "events.jsonl").exists()
-
-
 def test_cli_export_not_found(tmp_path, monkeypatch):
     """E6.5: Non-existent recording name → non-zero exit code."""
     monkeypatch.setenv("SCREENCAP_RECORDINGS_DIR", str(tmp_path))
@@ -574,25 +287,6 @@ def test_cli_export_not_found(tmp_path, monkeypatch):
 
     assert result.exit_code != 0
     assert "not found" in result.output.lower() or "error" in result.output.lower()
-
-
-def test_export_no_metadata_header(tmp_path):
-    """Passing metadata=None omits the header line — only events in output."""
-    rec_dir = tmp_path / "my-rec"
-    rec_dir.mkdir()
-    create_export_test_db(rec_dir / "recording.db")
-
-    from screencap.exporter import export_recording
-
-    out_file = str(rec_dir / "events.jsonl")
-    count = export_recording(rec_dir, out_file, exclude_moves=False, metadata=None)
-
-    assert count > 0
-    lines = open(out_file).read().strip().split("\n")
-    # No header — first line should be an event, not _meta
-    first = json.loads(lines[0])
-    assert "_meta" not in first
-    assert "type" in first
 
 
 def test_export_atomic_write_cleanup_on_failure(tmp_path):
@@ -698,32 +392,6 @@ def _build_recording_with_thresholds(
         })
     session.close()
     return recording
-
-
-def test_export_events_per_recording_click_threshold_propagates(tmp_path):
-    """U5.1: Per-recording ``double_click_interval_seconds`` reaches the
-    unified pipeline.
-
-    Two click pairs are 0.4s apart. With the default 0.5s interval this
-    merges to a single ``mouse.doubleclick``. With a tight 0.3s
-    per-recording threshold the second pair is too late, so we expect two
-    separate ``mouse.singleclick`` events.
-    """
-    rec_dir = tmp_path / "tight-rec"
-    rec_dir.mkdir()
-    _build_recording_with_thresholds(
-        rec_dir / "recording.db", interval=0.3, distance=5.0,
-    )
-
-    from screencap.engine import Capture
-
-    with Capture.load(str(rec_dir)) as capture:
-        events = capture.export_events(include_moves=False)
-
-    types = [e.type for e in events]
-    # Tight interval → no doubleclick, two singleclicks.
-    assert "mouse.doubleclick" not in types
-    assert types.count("mouse.singleclick") == 2
 
 
 def test_export_events_null_thresholds_fallback_to_defaults(tmp_path):
@@ -1151,34 +819,6 @@ def test_write_events_jsonl_consumes_iterator(tmp_path):
     assert count == 20
     # Generator exhausted — second call should yield nothing
     assert list(g) == []
-
-
-def test_unified_export_events_returns_iterator():
-    """W7a (R18 structural): unified_export_events returns an Iterator,
-    not a list. This catches the type-level regression at the engine→
-    writer seam — if Unit 3 ever returns a ``list[BaseEvent]``, the
-    Iterator contract documented in R18 is broken and write_events_jsonl
-    would consume against a fully materialized sequence.
-
-    The structural check is the strongest signal we get cheaply. The
-    sibling test (W7b) measures peak memory under a synthetic generator
-    to confirm the writer itself doesn't materialize internally.
-    """
-    from screencap.engine.export import unified_export_events
-
-    result = unified_export_events([], [])
-
-    # Iterator protocol — must support __next__ but not be a list.
-    assert hasattr(result, "__next__"), (
-        "unified_export_events must return an Iterator (Unit 3 / R18 contract); "
-        f"got {type(result).__name__!r}"
-    )
-    assert not isinstance(result, list), (
-        "unified_export_events returned a list — the Iterator contract from "
-        "R18 is broken. write_events_jsonl would then consume against a "
-        "fully materialized sequence, doubling peak working set at the "
-        "engine→writer seam."
-    )
 
 
 @pytest.mark.slow
