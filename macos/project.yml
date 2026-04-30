@@ -21,7 +21,7 @@ targets:
     sources:
       - path: ScreenCap
         excludes:
-          - "Build/**"
+          - "Scripts/**"
           - "Info.plist"
           - "ScreenCap.entitlements"
     resources:
@@ -50,6 +50,6 @@ targets:
     preBuildScripts:
       - name: Embed screencap CLI
         script: |
-          "${SRCROOT}/ScreenCap/Build/embed-cli.sh"
+          "${SRCROOT}/ScreenCap/Scripts/embed-cli.sh"
         basedOnDependencyAnalysis: false
         showEnvVarsInLog: false

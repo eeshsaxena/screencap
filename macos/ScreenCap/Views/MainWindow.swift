@@ -52,6 +52,7 @@ struct MainWindow: View {
                     .font(.headline)
                 permissionRow("Screen Recording", status: permissions.screenRecording)
                 permissionRow("Accessibility",    status: permissions.accessibility)
+                permissionRow("Input Monitoring", status: permissions.inputMonitoring)
                 permissionRow("Microphone",       status: permissions.microphone)
                 Button("Open permissions walkthrough") {
                     showingPermissionsSheet = true

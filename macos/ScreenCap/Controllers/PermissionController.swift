@@ -4,20 +4,31 @@ import ApplicationServices
 import Combine
 import CoreGraphics
 import Foundation
+import IOKit
+import IOKit.hid
 
 /// macOS Privacy & Security panes targeted by the deep-link helpers.
 /// macOS 13+ uses the `.extension` URL form; older forms hit a generic page on macOS 26.
+///
+/// All four panes the recorder cares about — Screen Recording, Accessibility,
+/// Input Monitoring (`Privacy_ListenEvent`), and Microphone — are modeled here.
+/// Skipping Input Monitoring is a real bug: the spawned `screencap start`
+/// re-checks it via `recorder.py:_check_macos_permissions` and the SwiftUI
+/// shell would otherwise stall in `.starting` waiting on console prompts that
+/// nobody can answer.
 enum PrivacyPane: String, CaseIterable {
     case screenRecording
     case accessibility
+    case inputMonitoring
     case microphone
 
     var deepLinkURL: URL {
         let host = "x-apple.systempreferences:com.apple.settings.PrivacySecurity.extension"
         switch self {
-        case .screenRecording: return URL(string: "\(host)?Privacy_ScreenCapture")!
-        case .accessibility:   return URL(string: "\(host)?Privacy_Accessibility")!
-        case .microphone:      return URL(string: "\(host)?Privacy_Microphone")!
+        case .screenRecording:  return URL(string: "\(host)?Privacy_ScreenCapture")!
+        case .accessibility:    return URL(string: "\(host)?Privacy_Accessibility")!
+        case .inputMonitoring:  return URL(string: "\(host)?Privacy_ListenEvent")!
+        case .microphone:       return URL(string: "\(host)?Privacy_Microphone")!
         }
     }
 
@@ -28,17 +39,19 @@ enum PrivacyPane: String, CaseIterable {
 
     var displayName: String {
         switch self {
-        case .screenRecording: return "Screen Recording"
-        case .accessibility:   return "Accessibility"
-        case .microphone:      return "Microphone"
+        case .screenRecording:  return "Screen Recording"
+        case .accessibility:    return "Accessibility"
+        case .inputMonitoring:  return "Input Monitoring"
+        case .microphone:       return "Microphone"
         }
     }
 
     var rationale: String {
         switch self {
-        case .screenRecording: return "Required to capture your screen."
-        case .accessibility:   return "Required to record keyboard and mouse events."
-        case .microphone:      return "Optional. Enables audio recording alongside the screen."
+        case .screenRecording:  return "Required to capture your screen."
+        case .accessibility:    return "Required to associate keystrokes and clicks with the active window."
+        case .inputMonitoring:  return "Required to record keyboard and mouse events."
+        case .microphone:       return "Optional. Enables audio recording alongside the screen."
         }
     }
 
@@ -59,17 +72,22 @@ enum PermissionStatus: Equatable {
 final class PermissionController: ObservableObject {
     @Published private(set) var screenRecording: PermissionStatus = .notDetermined
     @Published private(set) var accessibility: PermissionStatus = .notDetermined
+    @Published private(set) var inputMonitoring: PermissionStatus = .notDetermined
     @Published private(set) var microphone: PermissionStatus = .notDetermined
 
     private var pollTimer: Timer?
     private var workspaceObserver: NSObjectProtocol?
 
     var allRequiredGranted: Bool {
-        screenRecording == .granted && accessibility == .granted
+        screenRecording == .granted
+            && accessibility == .granted
+            && inputMonitoring == .granted
     }
 
     var anyDenied: Bool {
-        screenRecording == .denied || accessibility == .denied
+        screenRecording == .denied
+            || accessibility == .denied
+            || inputMonitoring == .denied
     }
 
     init() {
@@ -110,10 +128,11 @@ final class PermissionController: ObservableObject {
         }
     }
 
-    /// Recomputes all three permission statuses without prompting.
+    /// Recomputes all four permission statuses without prompting.
     func refresh() {
         screenRecording = Self.checkScreenRecording()
         accessibility = Self.checkAccessibility()
+        inputMonitoring = Self.checkInputMonitoring()
         microphone = Self.checkMicrophone()
     }
 
@@ -135,6 +154,17 @@ final class PermissionController: ObservableObject {
     private static func checkAccessibility() -> PermissionStatus {
         let options: NSDictionary = [kAXTrustedCheckOptionPrompt.takeUnretainedValue() as String: false]
         return AXIsProcessTrustedWithOptions(options) ? .granted : .denied
+    }
+
+    private static func checkInputMonitoring() -> PermissionStatus {
+        // IOHIDCheckAccess is the supported public API for the same TCC bucket
+        // the CLI checks via private CGPreflightListenEventAccess.
+        switch IOHIDCheckAccess(kIOHIDRequestTypeListenEvent) {
+        case kIOHIDAccessTypeGranted: return .granted
+        case kIOHIDAccessTypeDenied:  return .denied
+        case kIOHIDAccessTypeUnknown: return .notDetermined
+        default:                      return .notDetermined
+        }
     }
 
     private static func checkMicrophone() -> PermissionStatus {

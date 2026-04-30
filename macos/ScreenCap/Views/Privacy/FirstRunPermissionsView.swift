@@ -32,6 +32,10 @@ struct FirstRunPermissionsView: View {
                     status: permissions.accessibility
                 )
                 permissionRow(
+                    pane: .inputMonitoring,
+                    status: permissions.inputMonitoring
+                )
+                permissionRow(
                     pane: .microphone,
                     status: permissions.microphone
                 )

@@ -5,6 +5,7 @@ enum CLIError: LocalizedError {
     case nonZeroExit(code: Int32, stderr: String)
     case decode(underlying: Error, raw: String)
     case launchFailed(underlying: Error)
+    case timedOut(seconds: TimeInterval)
 
     var errorDescription: String? {
         switch self {
@@ -16,6 +17,8 @@ enum CLIError: LocalizedError {
             return "Failed to decode JSON from screencap: \(underlying.localizedDescription)"
         case .launchFailed(let underlying):
             return "Failed to launch screencap: \(underlying.localizedDescription)"
+        case .timedOut(let seconds):
+            return "screencap timed out after \(Int(seconds))s and was terminated."
         }
     }
 }
@@ -97,6 +100,11 @@ final class CLIClient {
     }
 
     /// Runs a one-shot CLI command and decodes its stdout as JSON.
+    ///
+    /// Pipes are drained concurrently — `screencap list --json` for power
+    /// users can exceed the default 64KB pipe buffer, which would deadlock
+    /// the child if we waited for exit before reading. A separate timeout
+    /// task SIGTERMs the process if it overruns the deadline.
     static func runJSON<T: Decodable>(_ args: [String], timeout: TimeInterval = 10) async throws -> T {
         let (executable, leading) = try resolveBinary()
         let process = Process()
@@ -115,28 +123,81 @@ final class CLIClient {
             throw CLIError.launchFailed(underlying: error)
         }
 
-        // Wait with timeout. Process.waitUntilExit is blocking; use a Task.
-        let exitCode: Int32 = await withCheckedContinuation { continuation in
-            DispatchQueue.global(qos: .userInitiated).async {
-                process.waitUntilExit()
-                continuation.resume(returning: process.terminationStatus)
-            }
-            _ = timeout // reserved for a future deadline-based fallback
+        // Drain pipes concurrently — without this, >64KB output deadlocks
+        // the child. Each task reads to EOF (which only happens once the
+        // child closes its end, i.e., on exit).
+        async let stdoutData: Data = readAllInBackground(stdout.fileHandleForReading)
+        async let stderrData: Data = readAllInBackground(stderr.fileHandleForReading)
+
+        // Race subprocess exit against the timeout. If the timeout wins,
+        // SIGTERM the process so its FDs close and the drain tasks unblock.
+        let didTimeOut = await raceExitAgainstTimeout(process: process, timeout: timeout)
+
+        let stdoutBytes = await stdoutData
+        let stderrBytes = await stderrData
+
+        if didTimeOut {
+            throw CLIError.timedOut(seconds: timeout)
         }
 
-        let stdoutData = stdout.fileHandleForReading.readDataToEndOfFile()
-        let stderrData = stderr.fileHandleForReading.readDataToEndOfFile()
-
+        let exitCode = process.terminationStatus
         if exitCode != 0 {
-            let errText = String(data: stderrData, encoding: .utf8) ?? "<binary>"
+            let errText = String(data: stderrBytes, encoding: .utf8) ?? "<binary>"
             throw CLIError.nonZeroExit(code: exitCode, stderr: errText)
         }
 
         do {
-            return try JSONDecoder().decode(T.self, from: stdoutData)
+            return try JSONDecoder().decode(T.self, from: stdoutBytes)
         } catch {
-            let raw = String(data: stdoutData, encoding: .utf8) ?? "<binary>"
+            let raw = String(data: stdoutBytes, encoding: .utf8) ?? "<binary>"
             throw CLIError.decode(underlying: error, raw: raw)
+        }
+    }
+
+    /// Reads `handle` to EOF on a background queue. The continuation resumes
+    /// once the child closes its end of the pipe (typically on exit).
+    private static func readAllInBackground(_ handle: FileHandle) async -> Data {
+        await withCheckedContinuation { (continuation: CheckedContinuation<Data, Never>) in
+            DispatchQueue.global(qos: .userInitiated).async {
+                let data = (try? handle.readToEnd()) ?? Data()
+                continuation.resume(returning: data)
+            }
+        }
+    }
+
+    /// Returns `true` if the timeout fired before the process exited. On
+    /// timeout, SIGTERM is sent so pipe drain tasks can complete.
+    private static func raceExitAgainstTimeout(process: Process, timeout: TimeInterval) async -> Bool {
+        await withTaskGroup(of: Bool.self) { group in
+            group.addTask {
+                await withCheckedContinuation { (cont: CheckedContinuation<Void, Never>) in
+                    DispatchQueue.global(qos: .userInitiated).async {
+                        process.waitUntilExit()
+                        cont.resume()
+                    }
+                }
+                return false
+            }
+            group.addTask {
+                let nanos = UInt64(max(0, timeout) * 1_000_000_000)
+                try? await Task.sleep(nanoseconds: nanos)
+                return true
+            }
+            // First task to finish wins; cancel the other.
+            let result = await group.next() ?? false
+            group.cancelAll()
+            if result, process.isRunning {
+                process.terminate()
+                // Wait briefly for the SIGTERM to take effect so the drain
+                // tasks see EOF and don't hang on `readToEnd()`.
+                await withCheckedContinuation { (cont: CheckedContinuation<Void, Never>) in
+                    DispatchQueue.global(qos: .userInitiated).async {
+                        process.waitUntilExit()
+                        cont.resume()
+                    }
+                }
+            }
+            return result
         }
     }
 
