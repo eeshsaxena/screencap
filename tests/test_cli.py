@@ -829,7 +829,11 @@ def test_export_with_encrypted_recording_constructs_pipeline(
             return_value=2,
         ) as mock_export,
     ):
-        result = runner.invoke(cli, ["export", "v15-rec"])
+        # Use --stdout to opt into network row emission. Default output
+        # (<recording_dir>/events.jsonl) is cloud-safe by gate per the
+        # round-4 review fix; only explicit -o / --stdout enables the
+        # network rows.
+        result = runner.invoke(cli, ["export", "v15-rec", "--stdout"])
 
     assert result.exit_code == 0, result.output
     assert "db_path" in captured, "Pipeline was not constructed"
@@ -843,6 +847,129 @@ def test_export_with_encrypted_recording_constructs_pipeline(
     # Without this flag, network_scrub_pipeline construction is wasted
     # because Capture.export_events skips network_rows entirely.
     assert kwargs.get("include_network") is True
+
+
+def test_export_default_output_skips_network_rows(tmp_path, monkeypatch):
+    """Round-4 P1: ``screencap export <name>`` with no -o writes to
+    ``<recording_dir>/events.jsonl`` — the same file ``screencap upload``
+    later picks up. Network rows must NOT land there, otherwise a
+    later upload leaks them to cloud (bypasses the V1.5 cloud-safety
+    gate that was supposed to keep network metadata local until
+    V1.75 ships build_cloud_network_filter).
+    """
+    rec_dir = tmp_path / "recordings"
+    _create_v15_export_db(rec_dir / "v15-rec")
+    monkeypatch.setenv("SCREENCAP_RECORDINGS_DIR", str(rec_dir))
+
+    runner = CliRunner()
+    pipeline_constructions = []
+
+    class _StubPipeline:
+        def __init__(self, db_path, recording_id):
+            pipeline_constructions.append((db_path, recording_id))
+
+        def decrypt_and_scrub(self, evt):  # pragma: no cover - unused
+            return evt
+
+    with (
+        mock.patch(
+            "screencap.network.export_pipeline.NetworkScrubPipeline",
+            _StubPipeline,
+        ),
+        mock.patch(
+            "screencap.exporter.export_recording",
+            return_value=0,
+        ) as mock_export,
+    ):
+        # No -o, no --stdout → default = recording_dir/events.jsonl.
+        result = runner.invoke(cli, ["export", "v15-rec"])
+
+    assert result.exit_code == 0, result.output
+    assert mock_export.called
+    kwargs = mock_export.call_args.kwargs
+    assert kwargs.get("include_network") is False, (
+        "default output writes to the same file `screencap upload` "
+        "uses; including network rows there leaks them to cloud"
+    )
+    # No pipeline construction either — saves the Keychain prompt.
+    assert pipeline_constructions == [], (
+        "pipeline construction wasted on a path that drops network "
+        "rows; should be gated on include_network"
+    )
+
+
+def test_export_with_custom_output_includes_network(tmp_path, monkeypatch):
+    """``screencap export <name> -o /tmp/out.jsonl`` writes to a
+    user-controlled path — outside the cloud-pickup pipeline. Network
+    rows ARE emitted there because the user opted in by directing
+    output elsewhere.
+    """
+    rec_dir = tmp_path / "recordings"
+    _create_v15_export_db(rec_dir / "v15-rec")
+    monkeypatch.setenv("SCREENCAP_RECORDINGS_DIR", str(rec_dir))
+
+    runner = CliRunner()
+    custom_output = str(tmp_path / "custom-out.jsonl")
+
+    class _StubPipeline:
+        def __init__(self, db_path, recording_id):
+            pass
+
+        def decrypt_and_scrub(self, evt):  # pragma: no cover
+            return evt
+
+    with (
+        mock.patch(
+            "screencap.network.export_pipeline.NetworkScrubPipeline",
+            _StubPipeline,
+        ),
+        mock.patch(
+            "screencap.exporter.export_recording",
+            return_value=2,
+        ) as mock_export,
+    ):
+        result = runner.invoke(cli, ["export", "v15-rec", "-o", custom_output])
+
+    assert result.exit_code == 0, result.output
+    kwargs = mock_export.call_args.kwargs
+    assert kwargs.get("include_network") is True
+
+
+def test_export_all_skips_network_rows(tmp_path, monkeypatch):
+    """``screencap export --all`` writes every recording's events.jsonl
+    to ``<recording_dir>/events.jsonl`` — same cloud-pickup path as
+    the no-arg single-recording export. Must NOT include network rows.
+    """
+    rec_dir = tmp_path / "recordings"
+    _create_v15_export_db(rec_dir / "v15-rec")
+    monkeypatch.setenv("SCREENCAP_RECORDINGS_DIR", str(rec_dir))
+
+    runner = CliRunner()
+
+    class _StubPipeline:
+        def __init__(self, db_path, recording_id):
+            pass
+
+        def decrypt_and_scrub(self, evt):  # pragma: no cover
+            return evt
+
+    with (
+        mock.patch(
+            "screencap.network.export_pipeline.NetworkScrubPipeline",
+            _StubPipeline,
+        ),
+        mock.patch(
+            "screencap.exporter.export_recording",
+            return_value=2,
+        ) as mock_export,
+    ):
+        result = runner.invoke(cli, ["export", "--all"])
+
+    assert result.exit_code == 0, result.output
+    assert mock_export.called
+    # Every call from --all path must have include_network=False.
+    for call in mock_export.call_args_list:
+        assert call.kwargs.get("include_network") is False
 
 
 def test_export_with_v1_recording_no_pipeline(tmp_path, monkeypatch):
@@ -930,7 +1057,11 @@ def test_export_kek_unavailable_fails_loud(tmp_path, monkeypatch):
         "screencap.network.export_pipeline.NetworkScrubPipeline",
         side_effect=KekUnavailableError("keychain locked"),
     ):
-        result = runner.invoke(cli, ["export", "v15-rec"])
+        # --stdout opts into network row emission, which is what
+        # triggers the pipeline construction. With the default
+        # output, pipeline construction is skipped (cloud-safe),
+        # so the KEK-unavailable branch wouldn't fire.
+        result = runner.invoke(cli, ["export", "v15-rec", "--stdout"])
 
     assert result.exit_code == 1, result.output
     # The actionable error message must mention the regenerate path.
@@ -970,7 +1101,9 @@ def test_export_pipeline_setup_unexpected_error_drops_network_rows(
             "screencap.exporter.export_recording", return_value=0,
         ) as mock_export,
     ):
-        result = runner.invoke(cli, ["export", "v15-rec"])
+        # --stdout opts into network rows, which is what makes the
+        # pipeline construction path run at all.
+        result = runner.invoke(cli, ["export", "v15-rec", "--stdout"])
 
     # The export still runs (don't crash on unexpected pipeline
     # errors) — but it MUST NOT include network rows.
@@ -1786,6 +1919,60 @@ class TestNetworkRemoveKekCommand:
         # The deletion DID proceed — no encrypted bodies exist on disk.
         delete_mock.assert_called_once()
         assert "Refusing to delete KEK" not in result.output
+
+    def test_remove_kek_blocked_by_unreadable_db_fail_closed(
+        self, tmp_path, monkeypatch,
+    ):
+        """V1.5 round-4 P2: a recording.db that fails to open must
+        block remove-kek (fail closed). KEK deletion is irreversible
+        and silently skipping unreadable recordings could orphan
+        ciphertext we never had a chance to inspect.
+        """
+        from unittest.mock import patch as _patch
+
+        recordings_dir = tmp_path / "recordings"
+        recordings_dir.mkdir()
+        monkeypatch.setenv("SCREENCAP_RECORDINGS_DIR", str(recordings_dir))
+        # Create a recording dir with a corrupted recording.db.
+        bad_dir = recordings_dir / "rec-corrupt"
+        bad_dir.mkdir()
+        (bad_dir / "recording.db").write_text("this is not a valid sqlite db")
+
+        runner = CliRunner()
+        with _patch("keyring.delete_password") as delete_mock:
+            result = runner.invoke(cli, ["network", "remove-kek"])
+        assert result.exit_code == 1
+        # User sees the unreadable recording surfaced — silent skip
+        # is exactly the fail-open mode the round-4 review flagged.
+        flattened = " ".join(result.output.split())
+        assert "rec-corrupt" in flattened
+        assert "could not be scanned" in flattened
+        delete_mock.assert_not_called()
+
+    def test_remove_kek_force_overrides_unreadable_db(
+        self, tmp_path, monkeypatch,
+    ):
+        """--force MUST be required to override the unreadable-DB
+        fail-closed. Same contract as encrypted-recordings: the user
+        explicitly accepts the risk."""
+        from unittest.mock import patch as _patch
+
+        recordings_dir = tmp_path / "recordings"
+        recordings_dir.mkdir()
+        monkeypatch.setenv("SCREENCAP_RECORDINGS_DIR", str(recordings_dir))
+        bad_dir = recordings_dir / "rec-corrupt"
+        bad_dir.mkdir()
+        (bad_dir / "recording.db").write_text("corrupt")
+
+        runner = CliRunner()
+        with _patch("keyring.delete_password") as delete_mock:
+            result = runner.invoke(
+                cli, ["network", "remove-kek", "--force"],
+            )
+        assert result.exit_code == 0
+        flattened = " ".join(result.output.split())
+        assert "could not be scanned" in flattened
+        delete_mock.assert_called_once()
 
     def test_remove_kek_idempotent_when_kek_absent(self, tmp_path, monkeypatch):
         """No KEK in keychain → still exits 0 (idempotent)."""

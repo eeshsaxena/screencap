@@ -993,9 +993,21 @@ def write_network_events(
     :func:`write_events` (which would fail on every dotted type name).
 
     Persists each event to ``recording.db.network_event`` via
-    :func:`crud.insert_network_event`. The DB ``kind`` column gets the
+    :func:`crud.insert_network_event``. The DB ``kind`` column gets the
     short form (``request``, ``response``, etc.) -- the dotted form lives
     only on the Pydantic event for events.jsonl emission (V1.75).
+
+    The ``terminate_processing`` parameter here is bound to a DEDICATED
+    network-writer terminate event (set in ``_setup_network_capture``),
+    NOT the global ``terminate_processing`` shared by other writers.
+    The global event fires before ``_teardown_network_capture`` runs,
+    but the addon's ``done()`` hook emits final events (notably
+    ``network.tunneled``) only AFTER the proxy receives SIGTERM —
+    partway through teardown. Those events flow proxy → reader →
+    ``write_q`` and need a live writer to drain them.
+    ``_teardown_network_capture`` sets the dedicated event AFTER the
+    reader thread joins, so the writer drains every event the reader
+    forwarded before exiting.
     """
     from screencap.engine.config import apply_config_overrides
     apply_config_overrides(config_overrides)
@@ -2568,7 +2580,18 @@ def _setup_network_capture(
                 )
         if network_event_writer is not None:
             try:
+                # The network writer listens to its own dedicated
+                # terminate event (created above), not the global
+                # terminate_processing. Set both — the global one for
+                # other writers in case they're affected, and the
+                # dedicated one to actually stop the network writer.
                 terminate_processing.set()
+                try:
+                    network_writer_terminate.set()  # noqa: F821 — bound above
+                except NameError:
+                    # Cleanup ran before the dedicated event was
+                    # constructed. Fall through to .terminate().
+                    pass
                 if network_event_writer.is_alive():
                     network_event_writer.join(timeout=5)
                     if network_event_writer.is_alive():
@@ -2630,6 +2653,18 @@ def _setup_network_capture(
         writer_started = task_started_events.setdefault(
             "network_event_writer", multiprocessing.Event()
         )
+        # Dedicated terminate event for the network writer — distinct
+        # from the global ``terminate_processing`` shared by all
+        # writers. The global event fires BEFORE
+        # ``_teardown_network_capture`` runs, but the addon's
+        # ``done()`` hook emits final ``network.tunneled`` events only
+        # AFTER the proxy receives SIGTERM (which happens partway
+        # through teardown). Those events flow proxy → reader →
+        # ``network_write_q`` and need a live writer to drain them.
+        # Keeping the writer alive until ``_teardown_network_capture``
+        # sets this dedicated event (after reader_thread.join())
+        # closes the silent-drop window.
+        network_writer_terminate = multiprocessing.Event()
         network_event_writer = multiprocessing.Process(
             target=utils.WrapStdout(write_network_events),
             args=(
@@ -2638,7 +2673,7 @@ def _setup_network_capture(
                 None,  # perf_q — currently unused for network writer
                 recording,
                 db_path,
-                terminate_processing,
+                network_writer_terminate,
                 writer_started,
             ),
             kwargs={
@@ -2747,6 +2782,8 @@ def _setup_network_capture(
         "proxy_proc": proxy_proc,
         "proxy_out_q": proxy_out_q,
         "reader_thread": reader_thread,
+        "writer_proc": network_event_writer,
+        "writer_terminate_event": network_writer_terminate,
         "snapshot": snapshot,
         "snapshot_path": snapshot_path,
         "durable_snapshot_path": durable_snapshot_path,
@@ -2909,6 +2946,8 @@ def _teardown_network_capture(state: dict[str, Any]) -> None:
     services_at_start = state["services_at_start"]
     proxy_proc = state["proxy_proc"]
     reader_thread = state["reader_thread"]
+    writer_proc = state.get("writer_proc")
+    writer_terminate_event = state.get("writer_terminate_event")
 
     # (1) Restore system proxy FIRST.
     try:
@@ -2923,7 +2962,12 @@ def _teardown_network_capture(state: dict[str, Any]) -> None:
     except OSError:
         logger.exception("failed to write .proxy_restored marker")
 
-    # (3) Terminate proxy mp.Process.
+    # (3) Terminate proxy mp.Process. SIGTERM lands inside mitmproxy
+    # which runs the addon's done() hook — that's where final
+    # network.tunneled events are emitted. They flow proxy → reader
+    # → network_write_q. The reader stays alive while proxy_proc.is_alive
+    # (per the round-3 P1 fix); the writer stays alive because we
+    # haven't set writer_terminate_event yet.
     try:
         if proxy_proc.is_alive():
             proxy_proc.terminate()
@@ -2935,9 +2979,29 @@ def _teardown_network_capture(state: dict[str, Any]) -> None:
     except Exception:  # noqa: BLE001
         logger.exception("error terminating proxy mp.Process")
 
-    # Reader thread will exit once the writer is drained and terminate is set.
+    # Reader thread sees proxy_proc dead and finishes its drain phase.
     if reader_thread.is_alive():
         reader_thread.join(timeout=2)
+
+    # (3.5) ONLY NOW signal the network writer to terminate. Until this
+    # point the writer kept draining ``network_write_q`` so the addon's
+    # done()-emitted events (which the reader just forwarded) get
+    # persisted to ``recording.db.network_event``. The writer's loop
+    # exits when the event is set AND the queue is empty.
+    if writer_terminate_event is not None:
+        writer_terminate_event.set()
+    if writer_proc is not None:
+        try:
+            writer_proc.join(timeout=5)
+            if writer_proc.is_alive():
+                logger.warning(
+                    "network writer did not exit in 5s after terminate; "
+                    "force-terminating",
+                )
+                writer_proc.terminate()
+                writer_proc.join(timeout=2)
+        except Exception:  # noqa: BLE001
+            logger.exception("error joining network writer process")
 
     # (4) Coverage-gap diff.
     try:

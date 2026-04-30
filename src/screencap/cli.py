@@ -1320,14 +1320,32 @@ def info(name, as_json):
             console.print(f"\n  [dim]No end snapshot (recording may have been interrupted).[/dim]")
 
 
-def _export_one(recording_dir, output_path, exclude_moves, err_console, privacy_filter=None):
+def _export_one(
+    recording_dir,
+    output_path,
+    exclude_moves,
+    err_console,
+    privacy_filter=None,
+    *,
+    include_network: bool = False,
+):
     """Export a single recording. Returns event count, or -1 on error.
 
     When *privacy_filter* is supplied, it is applied to window.switch events
     during export — used by the ``--privacy-filter`` flag (Unit 4d).
 
-    V1.5: when the recording has encrypted network bodies (a
-    ``network_event_meta`` row exists), construct a
+    ``include_network`` defaults to ``False`` for cloud safety. The CLI
+    ``screencap export`` command sets it to True ONLY when the user
+    explicitly directed the output to ``--stdout`` or to a custom path
+    via ``-o``. When the export writes to the default
+    ``<recording_dir>/events.jsonl``, the file is the same one
+    ``screencap upload`` later picks up, so emitting network rows there
+    would leak metadata to the cloud bucket — bypassing the
+    "no network rows reach cloud until V1.75" gate.
+
+    V1.5: when ``include_network=True`` AND the recording has encrypted
+    network bodies (a ``network_event`` row with non-NULL
+    ``body_ciphertext`` exists), construct a
     :class:`NetworkScrubPipeline` for decrypt+scrub of bodies at the
     row-conversion boundary. Pipeline construction triggers a Keychain
     prompt on first call and a silent read thereafter ("Always Allow"
@@ -1351,19 +1369,23 @@ def _export_one(recording_dir, output_path, exclude_moves, err_console, privacy_
 
     # V1.5: per-recording pipeline construction. The cheap ciphertext
     # check skips the Keychain prompt for V1-vintage AND for V1.5
-    # metadata-only recordings (allowlist-miss).
+    # metadata-only recordings (allowlist-miss). When ``include_network``
+    # is False (the cloud-safe default for ``<recording_dir>/events.jsonl``)
+    # we skip pipeline construction entirely — there's no point paying
+    # the Keychain prompt cost only to drop the rows we'd decrypt.
     network_scrub_pipeline = None
-    # When pipeline construction fails defensively (the broad-Exception
-    # branch below), we MUST NOT also pass include_network=True with a
-    # null pipeline — capture-side events with body_ciphertext bytes
-    # would reach Pydantic JSON serialization, violating the V1.5
-    # invariant that ciphertext can never reach JSONL by construction.
-    # Track the safe-to-emit flag separately so the broad-Exception
-    # path can degrade by suppressing network rows entirely.
-    include_network = True
+    # The caller sets include_network only when the user has explicitly
+    # directed output away from the cloud-pickup default. We may still
+    # need to drop it back to False in the broad-Exception fallback
+    # path below: when pipeline construction fails defensively, leaving
+    # include_network=True with a null pipeline would feed capture-side
+    # events with body_ciphertext bytes to Pydantic JSON serialization,
+    # violating the V1.5 invariant that ciphertext can never reach
+    # JSONL by construction. Track the safe-to-emit flag locally so
+    # the fallback can degrade by suppressing network rows entirely.
     db_path = str(Path(recording_dir) / "recording.db")
     try:
-        if Path(db_path).exists():
+        if include_network and Path(db_path).exists():
             from screencap.engine.db import (
                 _ensure_network_tables,
                 get_engine,
@@ -1416,12 +1438,13 @@ def _export_one(recording_dir, output_path, exclude_moves, err_console, privacy_
         # fail-loud branch; this is the fail-closed branch for
         # everything else.
         logger.debug("Skipping network rows in export: %s", e)
-        err_console.print(
-            "[yellow]Warning:[/yellow] could not set up network scrub "
-            "pipeline; export will omit network events for this "
-            "recording.",
-        )
-        include_network = False
+        if include_network:
+            err_console.print(
+                "[yellow]Warning:[/yellow] could not set up network scrub "
+                "pipeline; export will omit network events for this "
+                "recording.",
+            )
+            include_network = False
 
     try:
         return export_recording(
@@ -1592,7 +1615,17 @@ def export(name, all_recordings, downloads, output, use_stdout, exclude_moves, p
             err_console.print(f"\n[bold][{i}/{total}][/bold] {rec_dir.name}")
             out = str(rec_dir / "events.jsonl")
             pf = _build_export_privacy_filter(rec_dir) if privacy_filter_enabled else None
-            count = _export_one(rec_dir, out, exclude_moves, err_console, privacy_filter=pf)
+            # --all writes to recording_dir/events.jsonl, the same file
+            # `screencap upload` picks up. Network rows must NOT land
+            # there per the V1.5 cloud-safety gate.
+            count = _export_one(
+                rec_dir,
+                out,
+                exclude_moves,
+                err_console,
+                privacy_filter=pf,
+                include_network=False,
+            )
             if count >= 0:
                 err_console.print(f"Exported {count} events to [bold]{out}[/bold]")
                 if count == 0:
@@ -1621,16 +1654,30 @@ def export(name, all_recordings, downloads, output, use_stdout, exclude_moves, p
         err_console.print(f"[red]Error:[/red] Recording not found: {name}")
         sys.exit(1)
 
-    # Resolve output destination
+    # Resolve output destination. Network rows are emitted ONLY when
+    # the user explicitly directs the output somewhere other than the
+    # default ``<recording_dir>/events.jsonl`` — that file is the same
+    # one ``screencap upload`` picks up, and emitting network metadata
+    # there would bypass the V1.5 cloud-safety gate.
     if use_stdout:
         output_path = None
+        include_network = True
     elif output:
         output_path = output
+        include_network = True
     else:
         output_path = str(recording_dir / "events.jsonl")
+        include_network = False
 
     pf = _build_export_privacy_filter(recording_dir) if privacy_filter_enabled else None
-    count = _export_one(recording_dir, output_path, exclude_moves, err_console, privacy_filter=pf)
+    count = _export_one(
+        recording_dir,
+        output_path,
+        exclude_moves,
+        err_console,
+        privacy_filter=pf,
+        include_network=include_network,
+    )
     if count < 0:
         sys.exit(1)
     if output_path:
@@ -4058,19 +4105,34 @@ def network_remove_kek_cmd(force: bool) -> None:
     from screencap.engine.db.models import NetworkEvent, Recording
     from screencap.network import crypto
 
+    # Safety scan policy: KEK deletion is irreversible for every
+    # encrypted body on disk. If we can't determine whether a recording
+    # has ciphertext (DB unreadable, query fails for any reason), the
+    # safe default is fail-CLOSED — treat the recording as if it has
+    # encrypted bodies and require the user to either fix the recording
+    # or pass --force. Failing open here would silently delete the KEK
+    # while a recording the user couldn't even open might still need
+    # decryption.
     encrypted_recordings: list[str] = []
+    unreadable_recordings: list[str] = []
     recordings_dir = get_recordings_dir()
     for rec in list_recordings():
         db_path = recordings_dir / rec.name / "recording.db"
         if not db_path.exists():
+            # No DB at all → nothing to lose by deleting KEK for this
+            # recording; skip safely.
             continue
         try:
             session = get_session_for_path(str(db_path))
-        except Exception:
+        except Exception as exc:
+            unreadable_recordings.append(f"{rec.name} ({type(exc).__name__})")
             continue
         try:
             recording_row = session.query(Recording).first()
             if recording_row is None:
+                # Unusual: DB opens but has no Recording row. Treat as
+                # unreadable rather than silently safe.
+                unreadable_recordings.append(f"{rec.name} (no Recording row)")
                 has_ciphertext = False
             else:
                 has_ciphertext = (
@@ -4080,21 +4142,42 @@ def network_remove_kek_cmd(force: bool) -> None:
                     .first()
                     is not None
                 )
-        except Exception:
+        except Exception as exc:
+            # Query itself failed (corrupted DB, schema mismatch, etc).
+            # Add to unreadable bucket so the user has to acknowledge
+            # rather than silently treating as safe.
+            unreadable_recordings.append(f"{rec.name} ({type(exc).__name__})")
             has_ciphertext = False
         finally:
             session.close()
         if has_ciphertext:
             encrypted_recordings.append(rec.name)
 
-    if encrypted_recordings and not force:
-        console.print(
-            f"[red]Refusing to delete KEK:[/red] {len(encrypted_recordings)} "
-            f"recording(s) on disk have encrypted network bodies that depend "
-            f"on this KEK:"
-        )
-        for name in encrypted_recordings:
-            console.print(f"  • {name}")
+    blocking_recordings = encrypted_recordings + [
+        f"[unreadable] {entry}" for entry in unreadable_recordings
+    ]
+    if blocking_recordings and not force:
+        if encrypted_recordings:
+            console.print(
+                f"[red]Refusing to delete KEK:[/red] "
+                f"{len(encrypted_recordings)} recording(s) on disk have "
+                f"encrypted network bodies that depend on this KEK:"
+            )
+            for name in encrypted_recordings:
+                console.print(f"  • {name}")
+        if unreadable_recordings:
+            console.print(
+                f"[red]Refusing to delete KEK:[/red] "
+                f"{len(unreadable_recordings)} recording(s) could not be "
+                f"scanned for encrypted bodies and may still need this KEK:"
+            )
+            for entry in unreadable_recordings:
+                console.print(f"  • {entry}")
+            console.print(
+                "[dim]Unreadable recordings fail closed — re-run after "
+                "removing the bad recordings, or pass [bold]--force[/bold] "
+                "to delete the KEK anyway.[/dim]"
+            )
         console.print(
             "\n[yellow]Deleting the KEK will make these recordings' "
             "network bodies permanently undecryptable.[/yellow] Either "
@@ -4107,11 +4190,20 @@ def network_remove_kek_cmd(force: bool) -> None:
         )
         sys.exit(1)
 
-    if encrypted_recordings and force:
-        console.print(
-            f"[yellow]--force given;[/yellow] {len(encrypted_recordings)} "
-            f"encrypted recording(s) will become undecryptable."
-        )
+    if blocking_recordings and force:
+        if encrypted_recordings:
+            console.print(
+                f"[yellow]--force given;[/yellow] {len(encrypted_recordings)} "
+                f"encrypted recording(s) will become undecryptable."
+            )
+        if unreadable_recordings:
+            console.print(
+                f"[yellow]--force given;[/yellow] "
+                f"{len(unreadable_recordings)} recording(s) could not be "
+                f"scanned and will lose access to this KEK:"
+            )
+            for entry in unreadable_recordings:
+                console.print(f"  • {entry}")
 
     try:
         import keyring  # noqa: PLC0415
