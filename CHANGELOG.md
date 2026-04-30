@@ -7,6 +7,33 @@ and this project adheres to [Semantic Versioning](https://semver.org/).
 
 ## [Unreleased]
 
+### Added
+- **Network proxy logging V1.5 — body capture + encryption-at-rest.**
+  Optional body-byte capture for an allowlist of common knowledge-work
+  SaaS hosts (`DEFAULT_CAPTURE_BODIES_FOR`: GitHub, Linear, Notion, Slack,
+  Figma, Google Workspace, Atlassian, ChatGPT, Claude, *.office.com).
+  Bodies are AES-256-GCM-encrypted at rest with a per-recording DEK
+  wrapped by a long-lived KEK in the macOS Keychain
+  (`service="com.screencap.network"`, `account="kek"`). Inline decrypt
+  + Presidio PII scrub during `screencap export` produces plaintext
+  `body_text` in events.jsonl with detected entities replaced by
+  `<EMAIL_ADDRESS>` / `<PERSON>` / etc. Local-only — `_auto_export`
+  and the cloud-upload pipeline keep network rows out of events.jsonl
+  until V1.75 wires `build_cloud_network_filter`. New CLI:
+  `screencap network remove-kek` (with safety scan that fails closed
+  on encrypted recordings AND on unreadable DBs unless `--force`),
+  `screencap network preload-pin <host>` (manually seed the persistent
+  pinned-host cache). New persisted event class `network.tunneled`
+  (one per host that was actively tunneled this recording, not every
+  cached pinned host) so the training pipeline can mark
+  API-not-observable time spans. AAD format locked at canonical-JSON
+  `{r,f,t,ts}` with `sort_keys=True, ensure_ascii=True`; a
+  hand-encoded fixture test guards against any future drift breaking
+  prior recordings. Locked decisions: 100 KB body cap (per-user
+  override via `[network] body_size_cap`); default Keychain ACL
+  (V2 will revisit once SwiftUI signing pipeline lands). See
+  `docs/architecture/network-capture.md` for the full V1.5 wiring.
+
 ### Changed
 - **`screencap stop --force` now actively kills the live SessionController.**
   Previous behavior: `--force` skipped the SIGTERM/wait branch and fell

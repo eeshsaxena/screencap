@@ -12,11 +12,11 @@ V1 ships a deliberately narrow surface so the premise (URL + status + sizes + sh
 
 | Phase | Adds | Status |
 |---|---|---|
-| **V1 (today)** | mitmproxy embedded as `mp.Process`, addon hooks `request`/`response`/`websocket_*`, `recording.db.network_event` table, R10 capture-time redaction, system proxy lifecycle, `screencap network restore` / `uninstall`, `screencap _network-dump` debug helper | Shipped |
-| V1.5 | Body capture + AES-256-GCM encryption-at-rest, KEK in Keychain, per-recording DEK, body-allowlist, `NetworkScrubPipeline` for export-time decrypt+scrub | Deferred (gated on V1 trial) |
-| V1.75 | `network.*` lines in `events.jsonl` (CLI export, chunk JSONL, recovery), `build_cloud_network_filter` factory, AST guard, `NetworkExportMode` enum, cloud bucket policy | Deferred (gated on V1.5) |
+| **V1** | mitmproxy embedded as `mp.Process`, addon hooks `request`/`response`/`websocket_*`, `recording.db.network_event` table, R10 capture-time redaction, system proxy lifecycle, `screencap network restore` / `uninstall`, `screencap _network-dump` debug helper | Shipped |
+| **V1.5 (today)** | Body capture + AES-256-GCM encryption-at-rest, KEK in Keychain, per-recording DEK, body-allowlist, `NetworkScrubPipeline` for export-time decrypt+scrub, `screencap network remove-kek` + `preload-pin`, persisted `network.tunneled` event, persistent pinned-host cache. `network.*` lines emitted in `events.jsonl` ONLY when explicit `screencap export` directs output to `--stdout` or `-o /custom/path` (not the cloud-pickup default) | Shipped |
+| V1.75 | `network.*` lines in `events.jsonl` from auto-export + chunk processor + recovery, `build_cloud_network_filter` factory, AST guard, `NetworkExportMode` enum, cloud bucket policy | Deferred |
 
-V1's load-bearing safety property: **zero `network.*` lines in `events.jsonl` from any caller** (CLI export, auto-export, chunk processor, recovery). Three explicit scope-guard tests assert this. The reasoning: `_auto_export` and `screencap upload` cannot distinguish local-vs-cloud intent at runtime, so wiring `network_rows` into `unified_export_events` before V1.75's cloud bucket policy is decided would silently leak metadata to cloud.
+V1's safety property carries forward into V1.5 with a refinement: **zero `network.*` lines in any `events.jsonl` that the upload pipeline picks up** (`<recording_dir>/events.jsonl` written by `_auto_export` or by explicit `screencap export <name>` with no `-o`). The user-directed export paths (`-o /custom/path`, `--stdout`) DO emit network rows because the user has explicitly directed the output away from the cloud-pickup pipeline. `_auto_export` and `screencap upload` continue to write zero `network.*` lines until V1.75 wires the cloud filter factory.
 
 ## How it's wired
 
@@ -135,7 +135,7 @@ Three layers compose at decision time:
 
 1. **Layer 1 — `PrivacyConfig.mask_domains`** (suffix match). Inherited from screen capture's privacy config so the same domains are gated at both layers. **`exclude_apps` is intentionally NOT inherited** — it's a bundle-ID filter; the proxy sees flows, not processes.
 2. **Layer 2 — `[network] extra_blocklist` + curated `DEFAULT_BLOCKLIST`** (banks, password managers, OAuth providers, payment processors). User-extensible; user can override the curated set with `override_default_blocklist = true`.
-3. **Layer 3 — body allowlist** is V1.5 work. V1 hashes-and-discards every body unconditionally.
+3. **Layer 3 — body allowlist** (V1.5). `[network] capture_bodies_for` ∪ curated `DEFAULT_CAPTURE_BODIES_FOR` (GitHub, Linear, Notion, Slack, Figma, Google Workspace, Atlassian, ChatGPT, Claude, *.office.com). User can override entirely with `override_default_capture_bodies_for = true`. The blocklist always wins on overlap — adding `chase.com` to `capture_bodies_for` does NOT enable body capture for it because `is_host_blocked` fires first inside `is_host_in_capture_bodies_for`.
 
 Layers 1 and 2 produce a single regex passed to mitmproxy's `ignore_hosts`, which tunnels matching hosts at CONNECT time so they're never decrypted. Plain HTTP requests to blocked hosts are forwarded to the upstream server unchanged but skip event emission, so blocking never causes user-visible connection failures.
 
@@ -145,7 +145,30 @@ R10 capture-time redaction (single source of truth in `network/redaction.py`):
 - Sensitive non-auth headers — `Referer`, `Origin`, `X-CSRF-Token`, `X-Forwarded-*`, etc. Replaced with `[REDACTED:sensitive-header]`.
 - URL query parameters — `access_token`, `code`, `signature`, `state`, etc. Value replaced with `[REDACTED:query-param]`, name preserved.
 
-URL paths are a documented V1 gap — path-embedded auth tokens (OAuth codes, password-reset tokens, JWT in path segments) are stored as captured. V1.5 will add path-template denylists to `network/redaction.py`.
+URL paths remain a documented gap as of V1.5 — path-embedded auth tokens (OAuth codes, password-reset tokens, JWT in path segments) are stored as captured. Path-template denylists in `network/redaction.py` are deferred to a future round.
+
+## V1.5 body capture + encryption
+
+When body capture is engaged for a flow (host in effective allowlist AND decoded body ≤ `body_size_cap` AND streaming was not engaged):
+
+1. **At capture (`network/capture_addon.py`).** `_maybe_encrypt_body` decodes the response/request body (mitmproxy auto-handles `Content-Encoding`), re-checks `len(decoded) ≤ body_size_cap` (defends against compressed bypass: `Content-Length: 5KB` + `gzip` could decode to 200KB), then `crypto.encrypt_body(dek, decoded, aad)` produces ciphertext + 12-byte nonce. AAD is canonical-JSON `{r, f, t, ts}` derived from the recording_id, flow.id, event_type discriminator, and `time.time_ns()`. The same `ts_ns` value goes into the AAD AND the event's `timestamp_ns` field — drift breaks decryption at export.
+2. **At rest (`network_event` table).** Three new columns: `body_ciphertext` (LargeBinary) + `body_nonce` (LargeBinary(12)) + `body_aad` (LargeBinary). A `CheckConstraint("body_ciphertext IS NULL OR body_aad IS NOT NULL", name="ck_network_event_aad_present")` enforces AAD-non-null-when-ciphertext-present on fresh V1.5 tables (SQLite cannot retrofit constraints onto V1 tables — application-layer invariant in `crud.insert_network_event`).
+3. **At export (`network/export_pipeline.py:NetworkScrubPipeline`).** Construction reads the per-recording `network_event_meta` row, fetches the KEK via `crypto.get_kek()` (read-only — does NOT regenerate; that's what makes `network remove-kek` sticky), unwraps the DEK once. `decrypt_and_scrub(capture_event)` recomputes AAD from event fields, compares to stored AAD (catches drift across versions), `crypto.decrypt_body`, UTF-8 decodes (fallback to `errors="replace"` for binary WS frames), then runs Presidio + the secrets detector to redact PII. Returns an export-side Pydantic class (`NetworkRequestExportEvent` etc.) with `body_text` populated and NO ciphertext fields — by construction, ciphertext cannot reach JSONL.
+
+### Key + DEK lifecycle
+
+- **KEK** lives in macOS Keychain at `service="com.screencap.network"`, `account="kek"`. Default ACL — first-read prompt, "Always Allow" extends silently. V2 will revisit once SwiftUI signing pipeline ships.
+- **DEK** is generated fresh per recording at pre-flight, wrapped with the KEK using AAD `b"screencap-network-dek-v1"`, persisted to `network_event_meta` (one row per recording). Plaintext DEK lives in process memory + crosses the spawn boundary into the proxy mp.Process via pickle. No mlock or zeroing — relies on process death.
+- **`screencap network remove-kek`** deletes the KEK from Keychain. Safety scan walks the recordings dir and refuses without `--force` if any recording has at least one row with `body_ciphertext IS NOT NULL` OR if any DB is unreadable (fail-closed). `--force` overrides with explicit acknowledgment of both buckets.
+- **`screencap network preload-pin <host>`** seeds the persistent pinned-host cache (`~/.screencap/known_pinned_hosts.json`) so a known-pinned app skips the per-recording first-failure on next `--network` start.
+
+### Shutdown ordering
+
+The reader thread keeps draining `proxy_out_q` while `proxy_proc.is_alive()` (the addon's `done()` hook emits final `network.tunneled` events ONLY after SIGTERM lands inside mitmproxy). The network writer process subscribes to a dedicated `network_writer_terminate` event — distinct from the global `terminate_processing` — that `_teardown_network_capture` sets only AFTER `reader_thread.join()` returns. Net effect: writer is the LAST network task to exit, so events the addon emits during shutdown reach `recording.db.network_event`.
+
+### Export-output gating
+
+`screencap export <name>` defaults to writing `<recording_dir>/events.jsonl` — the same file `screencap upload` later picks up. `_export_one` therefore opts INTO network row emission ONLY when the user supplies `-o /custom/path` or `--stdout`; the default-output path keeps `include_network=False`. `_auto_export` (post-recording-stop) and the `--all` batch path also stay False. This is the V1 cloud-safety gate carrying forward into V1.5 — until V1.75 ships `build_cloud_network_filter`, the cloud-pickup path emits zero `network.*` lines.
 
 ## Data on disk
 
@@ -153,7 +176,8 @@ All network-related files in addition to the recording dir's standard contents:
 
 | File | Owner | Notes |
 |---|---|---|
-| `recording.db.network_event` | network writer | Per-flow rows; `kind` enum: `request`/`response`/`ws_upgrade`/`ws_frame`/`drop_burst`. V1 terminus — no JSONL emission anywhere. |
+| `recording.db.network_event` | network writer | Per-flow rows; `kind` enum: `request`/`response`/`ws_upgrade`/`ws_frame`/`drop_burst`/`tunneled` (V1.5+). V1.5 also persists `body_ciphertext`/`body_nonce`/`body_aad` on body-bearing rows. |
+| `recording.db.network_event_meta` | engine pre-flight (V1.5) | One row per V1.5 `--network` recording: `dek_wrapped` + `dek_nonce` (KEK-wrapped DEK) + `created_at`. Inserted before proxy spawn so the addon's encryption path always finds a meta row. |
 | `<recording_dir>/.mitmdump.log` | proxy_runner | Addon's own log: flow count, drop count, runtime tunnel hosts, errors. Diagnostic — read this first when debugging. |
 | `<recording_dir>/.proxy_state.json` | engine | Per-service snapshot (web/secure-web proxy + bypass domains) for restore. Atomic-write, chmod 600. |
 | `<recording_dir>/.network_child.json` | engine | Handoff: `{proxy_pid, worker_pid, started_at}`. Consumed by SessionController to register the proxy in `recording.pid` children. Atomic-write. |

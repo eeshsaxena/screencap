@@ -16,7 +16,10 @@ import time
 from unittest.mock import MagicMock
 
 from screencap.engine.events import NetworkRequestEvent
-from screencap.engine.recorder import _network_event_reader_loop
+from screencap.engine.recorder import (
+    _network_event_reader_loop,
+    _teardown_network_capture,
+)
 
 
 def _make_request_event(host: str = "example.com") -> NetworkRequestEvent:
@@ -205,3 +208,143 @@ class TestReaderDrainBoundedByProxyLiveness:
             "exit behavior for backward compatibility with tests / "
             "callers that don't supply a proxy_proc"
         )
+
+
+class TestTeardownOrdering:
+    """Regression for PR #157 round-4 P1.
+
+    The network writer was using the global ``terminate_processing``
+    event, which fires BEFORE ``_teardown_network_capture`` runs.
+    The writer exited before the proxy was even SIGTERMed, so the
+    addon's ``done()``-emitted final events (notably
+    ``network.tunneled``) ended up in ``network_write_q`` with no
+    consumer. The fix introduced a dedicated ``writer_terminate_event``
+    that ``_teardown_network_capture`` sets ONLY AFTER the reader has
+    joined.
+
+    These tests lock the ordering invariants so a future refactor
+    that flips the steps re-introduces the silent-drop window
+    immediately rather than mysteriously losing events at runtime.
+    """
+
+    def _build_state(self, ordering: list[str]):
+        """Construct a state dict whose mocks record their call order
+        into ``ordering``. Returns the dict for direct use with
+        ``_teardown_network_capture``.
+        """
+        from pathlib import Path
+        from unittest.mock import MagicMock
+
+        # Each mock appends a tag when its method fires. The teardown
+        # must produce a sequence that satisfies the documented
+        # invariant: proxy.terminate -> proxy.join -> reader.join ->
+        # writer_terminate.set -> writer.join.
+        proxy_proc = MagicMock()
+        proxy_proc.is_alive.side_effect = [True, False]  # alive, then dead
+        proxy_proc.terminate.side_effect = lambda: ordering.append("proxy.terminate")
+        proxy_proc.join.side_effect = lambda timeout=None: ordering.append("proxy.join")
+        proxy_proc.kill = MagicMock()
+
+        reader_thread = MagicMock()
+        reader_thread.is_alive.return_value = True
+        reader_thread.join.side_effect = lambda timeout=None: ordering.append("reader.join")
+
+        writer_terminate_event = MagicMock()
+        writer_terminate_event.set.side_effect = lambda: ordering.append(
+            "writer_terminate.set",
+        )
+
+        writer_proc = MagicMock()
+        writer_proc.is_alive.return_value = False  # exits cleanly after event set
+        writer_proc.join.side_effect = lambda timeout=None: ordering.append(
+            "writer.join",
+        )
+
+        # The teardown also touches system-proxy state and writes a
+        # marker file. Stub those to no-ops; this test cares about
+        # the writer/reader/proxy ordering only.
+        recording_dir = MagicMock(spec=Path)
+        recording_dir.__truediv__ = lambda self_inner, other: MagicMock(
+            write_text=MagicMock(),
+        )
+
+        return {
+            "snapshot": {},
+            "durable_snapshot_path": MagicMock(spec=Path),
+            "recording_dir": recording_dir,
+            "services_at_start": [],
+            "proxy_proc": proxy_proc,
+            "reader_thread": reader_thread,
+            "writer_proc": writer_proc,
+            "writer_terminate_event": writer_terminate_event,
+        }
+
+    def test_writer_terminate_set_after_reader_joins(self):
+        """``writer_terminate_event.set()`` MUST happen AFTER
+        ``reader_thread.join()`` returns. Setting it earlier (e.g.
+        before reader exits) would let the writer exit while the
+        reader is still feeding it events from the addon's done()
+        hook — silently dropping final events.
+        """
+        from unittest.mock import patch
+
+        ordering: list[str] = []
+        state = self._build_state(ordering)
+
+        # _teardown_network_capture also calls into the system-proxy
+        # restore path; stub the imports it triggers.
+        with (
+            patch("screencap.network.system_proxy.restore_all"),
+            patch("screencap.network.system_proxy.list_active_services",
+                  return_value=[]),
+            patch("screencap.network.system_proxy.services_changed_marker"),
+            patch("screencap.network.lifecycle.delete_sentinel"),
+            patch("screencap.network.lifecycle.delete_network_child_handoff"),
+        ):
+            _teardown_network_capture(state)
+
+        # Critical invariants: writer_terminate.set comes AFTER
+        # reader.join AND AFTER proxy.terminate.
+        reader_idx = ordering.index("reader.join")
+        writer_set_idx = ordering.index("writer_terminate.set")
+        proxy_terminate_idx = ordering.index("proxy.terminate")
+        writer_join_idx = ordering.index("writer.join")
+
+        assert writer_set_idx > reader_idx, (
+            f"writer_terminate.set fired BEFORE reader.join. Order was: "
+            f"{ordering}. The writer would exit while the reader is "
+            f"still forwarding done()-emitted events, dropping them."
+        )
+        assert writer_set_idx > proxy_terminate_idx, (
+            f"writer_terminate.set fired BEFORE proxy.terminate. Order: "
+            f"{ordering}. The writer must outlive proxy termination so "
+            f"final events from addon done() can land."
+        )
+        assert writer_join_idx > writer_set_idx, (
+            f"writer.join called BEFORE writer_terminate.set. Order: "
+            f"{ordering}. The writer would never see the terminate "
+            f"signal and the join would time out / force-terminate."
+        )
+
+    def test_writer_terminate_event_optional_for_legacy_state(self):
+        """If a state dict has no ``writer_terminate_event`` key (e.g.
+        partially-built during cleanup-on-setup-failure), teardown
+        must not crash.
+        """
+        from unittest.mock import patch
+
+        ordering: list[str] = []
+        state = self._build_state(ordering)
+        del state["writer_terminate_event"]
+        del state["writer_proc"]
+
+        with (
+            patch("screencap.network.system_proxy.restore_all"),
+            patch("screencap.network.system_proxy.list_active_services",
+                  return_value=[]),
+            patch("screencap.network.system_proxy.services_changed_marker"),
+            patch("screencap.network.lifecycle.delete_sentinel"),
+            patch("screencap.network.lifecycle.delete_network_child_handoff"),
+        ):
+            # Should not raise.
+            _teardown_network_capture(state)
