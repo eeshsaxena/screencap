@@ -1,5 +1,7 @@
-"""Tests for screencap.recorder — PID file lifecycle, permission prompting, disk checks."""
+"""Tests for screencap.recorder — force-quit cleanup, PID file lifecycle, permission prompting, disk checks."""
 
+import ast
+import inspect
 import sys
 from collections import namedtuple
 from unittest import mock
@@ -11,6 +13,126 @@ import pytest
 _PLENTY_OF_DISK = namedtuple("DiskUsage", ["total", "used", "free"])(
     total=500e9, used=100e9, free=400e9,
 )
+
+
+class TestForceExitContracts:
+    """AST guards for force-quit + signal-handler contracts that have no
+    runtime-test equivalent today.
+
+    Three contracts pinned here:
+
+    1. ``_force_exit`` calls ``delete_pidfile`` somewhere in its body so a
+       force-quit cleanup path doesn't leak pidfiles.
+    2. ``_force_exit`` guards every ``recorder.stop()`` call with
+       ``if recorder is not None`` — covers the SIGINT-during-setup window.
+    3. ``_sigterm_handler`` applies the same guard.
+
+    These are *structural* tests — they check source code, not runtime
+    behavior. They block legitimate refactors (e.g., extracting a helper)
+    in exchange for being the only guard against silent regressions in
+    code paths no integration test exercises today. If a runtime
+    regression test for "SIGINT during Recorder setup" is ever added,
+    these AST guards become redundant and should be deleted.
+
+    Pure structural lints with no behavior pinning (e.g.,
+    ``os._exit only inside _force_exit``, ``signal.signal call ordering
+    vs Recorder()`` line-number, ``active_children() must be invoked
+    inside _force_exit``) were removed in the same audit pass that
+    introduced this class — they were tripwires for refactor safety
+    without a unique contract worth preserving.
+    """
+
+    @staticmethod
+    def _start_recording_ast():
+        """Parse the AST of ``start_recording`` (where _force_exit /
+        _sigterm_handler live as inner functions)."""
+        from screencap import recorder as mod
+
+        return ast.parse(inspect.getsource(mod.start_recording))
+
+    @staticmethod
+    def _find_function(tree, name):
+        for node in ast.walk(tree):
+            if isinstance(node, ast.FunctionDef) and node.name == name:
+                return node
+        return None
+
+    def test_force_exit_calls_delete_pidfile(self):
+        """``_force_exit`` must call ``delete_pidfile`` somewhere in its
+        body so the force-quit path never leaks a stale pidfile."""
+        tree = self._start_recording_ast()
+        force_exit_fn = self._find_function(tree, "_force_exit")
+        assert force_exit_fn is not None, "_force_exit not found in start_recording"
+
+        delete_calls = [
+            node for node in ast.walk(force_exit_fn)
+            if isinstance(node, ast.Call)
+            and isinstance(node.func, ast.Name)
+            and node.func.id == "delete_pidfile"
+        ]
+        assert delete_calls, (
+            "_force_exit must call delete_pidfile to clean up the pidfile "
+            "before the process exits — otherwise next-start orphan detection "
+            "trips on a stale pid."
+        )
+
+    @staticmethod
+    def _assert_recorder_stop_calls_guarded(fn_node, fn_name):
+        """Assert every ``recorder.stop()`` call inside *fn_node* is
+        nested under an ``if recorder is not None`` guard.
+
+        Covers the SIGINT-during-setup vector where ``recorder`` is bound
+        to None before ``Recorder.__enter__()`` returns; calling
+        ``recorder.stop()`` without the guard raises AttributeError and
+        skips the cleanup path.
+        """
+        stop_calls = [
+            node for node in ast.walk(fn_node)
+            if isinstance(node, ast.Call)
+            and isinstance(node.func, ast.Attribute)
+            and node.func.attr == "stop"
+            and isinstance(node.func.value, ast.Name)
+            and node.func.value.id == "recorder"
+        ]
+        assert stop_calls, f"No recorder.stop() call found in {fn_name}"
+
+        for stop_call in stop_calls:
+            guarded = False
+            for node in ast.walk(fn_node):
+                if not isinstance(node, ast.If):
+                    continue
+                test = node.test
+                if not (
+                    isinstance(test, ast.Compare)
+                    and isinstance(test.left, ast.Name)
+                    and test.left.id == "recorder"
+                    and any(isinstance(op, ast.IsNot) for op in test.ops)
+                ):
+                    continue
+                if any(child is stop_call for child in ast.walk(node)):
+                    guarded = True
+                    break
+            assert guarded, (
+                f"recorder.stop() in {fn_name} is not guarded by "
+                "'if recorder is not None' — a SIGINT during Recorder setup "
+                "would crash with AttributeError."
+            )
+
+    def test_force_exit_guards_recorder_stop(self):
+        """``_force_exit``'s ``recorder.stop()`` must be guarded against
+        recorder=None (signal-during-setup window)."""
+        tree = self._start_recording_ast()
+        force_exit_fn = self._find_function(tree, "_force_exit")
+        assert force_exit_fn is not None, "_force_exit not found"
+        self._assert_recorder_stop_calls_guarded(force_exit_fn, "_force_exit")
+
+    def test_sigterm_handler_guards_recorder_stop(self):
+        """``_sigterm_handler``'s ``recorder.stop()`` must be guarded
+        against recorder=None (signal-during-setup window)."""
+        tree = self._start_recording_ast()
+        sigterm_fn = self._find_function(tree, "_sigterm_handler")
+        assert sigterm_fn is not None, "_sigterm_handler not found"
+        self._assert_recorder_stop_calls_guarded(sigterm_fn, "_sigterm_handler")
 
 
 class TestOrphanDetection:

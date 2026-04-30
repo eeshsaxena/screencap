@@ -617,6 +617,10 @@ def test_upload_export_failure_continues(tmp_path):
         mock.patch("screencap.upload.resolve_recording_dirs", return_value=[rec_dir]),
         mock.patch("screencap.upload.upload_recording") as mock_upload,
         mock.patch("screencap.exporter.export_recording", side_effect=RuntimeError("boom")),
+        mock.patch(
+            "screencap.scrubber.scrub_recording",
+            return_value=mock.MagicMock(output_dir=rec_dir, entity_counts={}),
+        ),
     ):
         mock_upload.return_value = mock.MagicMock(
             uploaded=["recording.db"], skipped=[], failed=[], total_bytes=100, gcs_prefix="gs://bucket/rec-e",
@@ -781,6 +785,10 @@ def test_upload_cloud_intent_proceeds(tmp_path):
     with (
         mock.patch("screencap.upload.resolve_recording_dirs", return_value=[rec_dir]),
         mock.patch("screencap.upload.upload_recording") as mock_upload,
+        mock.patch(
+            "screencap.scrubber.scrub_recording",
+            return_value=mock.MagicMock(output_dir=rec_dir, entity_counts={}),
+        ),
     ):
         mock_upload.return_value = mock.MagicMock(
             uploaded=["recording.db", "events.jsonl"],
@@ -792,8 +800,9 @@ def test_upload_cloud_intent_proceeds(tmp_path):
     assert result.exit_code == 0
     # upload_recording was called (no scrub prompt for cloud intent)
     mock_upload.assert_called_once()
-    # No scrub warning in output
-    assert "scrub" not in result.output.lower()
+    # No "scrub" prompt asking the user; warnings about scrubbing being applied
+    # are fine. Specifically we don't want the interactive confirm.
+    assert "Continue without scrubbing?" not in result.output
 
 
 # --- _smoke-test command tests ---

@@ -1,11 +1,19 @@
 """Tests for event schemas.
 
-Pydantic construction + ``model_dump`` round-trips for mouse / keyboard /
-scroll / screen / audio events live in ``screencap.engine.events`` itself
-(pydantic guarantees those for free). This file pins the *non-trivial*
-contracts: network event validation, required fields, the
-``NetworkPinFailureEvent`` non-BaseEvent regression guard, and JSON
-round-trips for V1 wire format stability.
+Construction + ``model_dump`` round-trips for the simple event classes
+(MouseMoveEvent, KeyDownEvent, ScreenFrameEvent, AudioChunkEvent, etc.)
+are not tested here — pydantic's BaseModel guarantees field assignment,
+type-discriminator inclusion, and JSON round-tripping for free. Tests
+that just constructed an event and checked its fields were removed in
+the test-audit pass; if a future event ever gains a custom serializer,
+validator, or computed field, add a targeted test rather than restoring
+the full round-trip suite.
+
+This file keeps the *non-trivial* contracts that pydantic does not
+guarantee: network event validation rules, required-field constraints,
+multi-value header preservation across JSON round-trips for V1 wire
+format stability, and the ``NetworkPinFailureEvent`` non-BaseEvent
+regression guard.
 """
 
 

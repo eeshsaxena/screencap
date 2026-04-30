@@ -367,6 +367,18 @@ def test_upload_command_dry_run(tmp_path):
     assert "video.mp4" in result.output
 
 
+def _stub_scrub_recording(rec_dir):
+    """Build a stub ScrubResult that points at *rec_dir* with no redactions.
+
+    cli.py:upload calls scrub_recording before uploading (see
+    src/screencap/cli.py:2742). These CLI tests don't exercise scrubber
+    semantics — they pin upload-engine behavior — so we substitute the
+    real scrubber with a MagicMock that returns a ScrubResult-shaped
+    value pointing at the test fixture directory.
+    """
+    return mock.MagicMock(output_dir=rec_dir, entity_counts={})
+
+
 def test_upload_command_success(tmp_path):
     rec = tmp_path / "my-rec"
     rec.mkdir()
@@ -386,6 +398,10 @@ def test_upload_command_success(tmp_path):
     runner = CliRunner()
     with (
         mock.patch("screencap.upload.get_recordings_dir", return_value=tmp_path),
+        mock.patch(
+            "screencap.scrubber.scrub_recording",
+            return_value=_stub_scrub_recording(rec),
+        ),
         mock.patch("screencap.upload.requests.post", return_value=mock_urls_resp),
         mock.patch("screencap.upload.requests.put", return_value=mock_put_resp),
     ):
@@ -404,6 +420,10 @@ def test_upload_command_service_unavailable(tmp_path):
     runner = CliRunner()
     with (
         mock.patch("screencap.upload.get_recordings_dir", return_value=tmp_path),
+        mock.patch(
+            "screencap.scrubber.scrub_recording",
+            return_value=_stub_scrub_recording(rec),
+        ),
         mock.patch("screencap.upload.requests.post", side_effect=req.ConnectionError),
     ):
         result = runner.invoke(cli, ["upload", "my-rec"])
@@ -747,6 +767,10 @@ def test_upload_cli_force_flag(tmp_path):
     runner = CliRunner()
     with (
         mock.patch("screencap.upload.get_recordings_dir", return_value=tmp_path),
+        mock.patch(
+            "screencap.scrubber.scrub_recording",
+            return_value=_stub_scrub_recording(rec),
+        ),
         mock.patch("screencap.upload.requests.post", return_value=mock_urls_resp),
         mock.patch("screencap.upload.requests.put", return_value=mock_put_resp),
     ):
@@ -763,7 +787,13 @@ def test_upload_cli_skips_already_uploaded(tmp_path):
     (rec / UPLOAD_STATUS_FILE).write_text('{"uploaded_at": "2026-01-01"}')
 
     runner = CliRunner()
-    with mock.patch("screencap.upload.get_recordings_dir", return_value=tmp_path):
+    with (
+        mock.patch("screencap.upload.get_recordings_dir", return_value=tmp_path),
+        mock.patch(
+            "screencap.scrubber.scrub_recording",
+            return_value=_stub_scrub_recording(rec),
+        ),
+    ):
         result = runner.invoke(cli, ["upload", "my-rec"])
     assert result.exit_code == 0
     assert "Already uploaded" in result.output
