@@ -7,12 +7,17 @@ struct MenuBarMenu: View {
     @EnvironmentObject private var recorder: RecorderController
 
     var body: some View {
+        // Recording controls are stubbed in PR1 — Unit 13 wires them. Show
+        // them disabled instead of clickable-but-silent so the menu doesn't
+        // present a broken action.
         if recorder.state.isRecording {
             Button("Stop Recording") { recorder.stop() }
                 .keyboardShortcut("s", modifiers: [.command, .shift])
+                .disabled(true)
         } else {
             Button("Start Recording") { recorder.start() }
                 .keyboardShortcut("r", modifiers: [.command, .shift])
+                .disabled(true)
         }
 
         Divider()

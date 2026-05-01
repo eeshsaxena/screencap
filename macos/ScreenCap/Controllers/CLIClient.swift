@@ -1,3 +1,4 @@
+import Darwin
 import Foundation
 
 enum CLIError: LocalizedError {
@@ -165,9 +166,17 @@ final class CLIClient {
         }
     }
 
-    /// Returns `true` if the timeout fired before the process exited. On
-    /// timeout, SIGTERM is sent so pipe drain tasks can complete.
-    private static func raceExitAgainstTimeout(process: Process, timeout: TimeInterval) async -> Bool {
+    /// Returns `true` if the timeout fired before the process exited.
+    ///
+    /// On timeout: SIGTERM the child, wait at most `terminateGrace` for it to
+    /// react, then SIGKILL if it's still alive. Without this bounded grace, a
+    /// CLI that ignores SIGTERM (stuck syscall, blocked signal) leaves
+    /// `runJSON` waiting forever — defeating the timeout entirely.
+    private static func raceExitAgainstTimeout(
+        process: Process,
+        timeout: TimeInterval,
+        terminateGrace: TimeInterval = 2.0
+    ) async -> Bool {
         await withTaskGroup(of: Bool.self) { group in
             group.addTask {
                 await withCheckedContinuation { (cont: CheckedContinuation<Void, Never>) in
@@ -188,17 +197,23 @@ final class CLIClient {
             group.cancelAll()
             if result, process.isRunning {
                 process.terminate()
-                // Wait briefly for the SIGTERM to take effect so the drain
-                // tasks see EOF and don't hang on `readToEnd()`.
-                await withCheckedContinuation { (cont: CheckedContinuation<Void, Never>) in
-                    DispatchQueue.global(qos: .userInitiated).async {
-                        process.waitUntilExit()
-                        cont.resume()
-                    }
+                let exited = await waitForExit(process: process, timeout: terminateGrace)
+                if !exited, process.isRunning, process.processIdentifier > 0 {
+                    kill(process.processIdentifier, SIGKILL)
+                    _ = await waitForExit(process: process, timeout: terminateGrace)
                 }
             }
             return result
         }
+    }
+
+    /// Polls until `process` exits or `timeout` elapses. Returns true if exited.
+    private static func waitForExit(process: Process, timeout: TimeInterval) async -> Bool {
+        let deadline = Date().addingTimeInterval(max(0, timeout))
+        while process.isRunning && Date() < deadline {
+            try? await Task.sleep(nanoseconds: 50_000_000) // 50ms
+        }
+        return !process.isRunning
     }
 
     /// Spawns a long-lived subprocess and streams stderr lines to `onStderrLine`.
@@ -228,19 +243,24 @@ final class CLIClient {
             stderrBuffer.feed(data)
         }
 
-        if let onStdoutLine {
-            let stdoutBuffer = LineBuffer(handler: onStdoutLine)
-            stdoutPipe.fileHandleForReading.readabilityHandler = { handle in
-                let data = handle.availableData
-                if data.isEmpty { return }
-                stdoutBuffer.feed(data)
-            }
+        // Always drain stdout, even when the caller doesn't ask for lines.
+        // Python `screencap start` writes Rich-console banners and progress
+        // to stdout; if no reader is attached the 64KB pipe buffer fills,
+        // the child blocks on write, and stderr events stop flowing.
+        let stdoutBufferOpt: LineBuffer? = onStdoutLine.map { LineBuffer(handler: $0) }
+        stdoutPipe.fileHandleForReading.readabilityHandler = { handle in
+            let data = handle.availableData
+            if data.isEmpty { return }
+            // The read itself drains the pipe; the buffer is only used when a
+            // caller wants the lines. Without a caller we discard.
+            stdoutBufferOpt?.feed(data)
         }
 
         process.terminationHandler = { _ in
             stderrPipe.fileHandleForReading.readabilityHandler = nil
             stdoutPipe.fileHandleForReading.readabilityHandler = nil
             stderrBuffer.flush()
+            stdoutBufferOpt?.flush()
         }
 
         do {
