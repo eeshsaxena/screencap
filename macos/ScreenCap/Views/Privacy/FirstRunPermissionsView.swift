@@ -56,6 +56,13 @@ struct FirstRunPermissionsView: View {
                     }
                     .buttonStyle(.bordered)
 
+                    // Always-available escape hatch. Dismisses the sheet
+                    // even if the cached permission state still reads denied.
+                    // Recording itself will still be gated by the actual TCC
+                    // state at start time — this just unblocks navigation.
+                    Button("Skip for now") { isPresented = false }
+                        .buttonStyle(.bordered)
+
                     Spacer()
 
                     Button("Done") { isPresented = false }
