@@ -1,0 +1,400 @@
+import Darwin
+import Foundation
+
+enum CLIError: LocalizedError {
+    case binaryNotFound(searchedPaths: [String])
+    case nonZeroExit(code: Int32, stderr: String)
+    case decode(underlying: Error, raw: String)
+    case launchFailed(underlying: Error)
+    case timedOut(seconds: TimeInterval)
+
+    var errorDescription: String? {
+        switch self {
+        case .binaryNotFound(let paths):
+            return "screencap CLI not found. Searched: \(paths.joined(separator: ", "))"
+        case .nonZeroExit(let code, let stderr):
+            return "screencap exited with code \(code): \(stderr)"
+        case .decode(let underlying, _):
+            return "Failed to decode JSON from screencap: \(underlying.localizedDescription)"
+        case .launchFailed(let underlying):
+            return "Failed to launch screencap: \(underlying.localizedDescription)"
+        case .timedOut(let seconds):
+            return "screencap timed out after \(Int(seconds))s and was terminated."
+        }
+    }
+}
+
+/// Owns Process spawning, stderr line streaming, and JSON parsing for the bundled
+/// screencap CLI. Resolves the binary from `Contents/Resources/screencap/screencap`
+/// in the bundled app, with `SCREENCAP_CLI_PATH` env-var override for development.
+///
+/// Caseless enum — every member is `static`, there is no instance state, and
+/// `enum` prevents accidental instantiation that a `class` would allow.
+enum CLIClient {
+    /// Long-lived subprocess handle. Caller retains it for the duration of the
+    /// recording lifecycle and calls `terminate()` to send SIGTERM.
+    final class SpawnedProcess {
+        let process: Process
+        let stderrPipe: Pipe
+        let stdoutPipe: Pipe
+
+        init(process: Process, stderrPipe: Pipe, stdoutPipe: Pipe) {
+            self.process = process
+            self.stderrPipe = stderrPipe
+            self.stdoutPipe = stdoutPipe
+        }
+
+        var isRunning: Bool { process.isRunning }
+        var processIdentifier: Int32 { process.processIdentifier }
+
+        func terminate() {
+            if process.isRunning {
+                process.terminate()
+            }
+        }
+
+        func waitUntilExit() async {
+            // Use a blocking waitUntilExit on a background queue rather than
+            // chaining terminationHandler. The handler-chaining variant has a
+            // TOCTOU window: if `isRunning` is true at the check but the child
+            // exits before the handler assignment lands, the new handler is
+            // never invoked and the continuation never resumes.
+            await withCheckedContinuation { (continuation: CheckedContinuation<Void, Never>) in
+                DispatchQueue.global(qos: .userInitiated).async { [process] in
+                    process.waitUntilExit()
+                    continuation.resume()
+                }
+            }
+        }
+    }
+
+    /// Resolves the screencap binary path. Order:
+    /// 1. `SCREENCAP_CLI_PATH` environment variable (dev override).
+    /// 2. `Contents/Resources/screencap/screencap` inside the app bundle.
+    /// 3. `python -m screencap.cli` via `PYTHONPATH=src` if the repo is detectable
+    ///    (dev fallback when running from Xcode without a pyinstaller build).
+    static func resolveBinary() throws -> (executable: URL, leadingArgs: [String]) {
+        var searched: [String] = []
+
+        if let override = ProcessInfo.processInfo.environment["SCREENCAP_CLI_PATH"], !override.isEmpty {
+            let url = URL(fileURLWithPath: override)
+            searched.append(url.path)
+            if FileManager.default.isExecutableFile(atPath: url.path) {
+                return (url, [])
+            }
+        }
+
+        if let resourceURL = Bundle.main.resourceURL {
+            let bundled = resourceURL.appendingPathComponent("screencap/screencap")
+            searched.append(bundled.path)
+            if FileManager.default.isExecutableFile(atPath: bundled.path) {
+                return (bundled, [])
+            }
+        }
+
+        // Dev fallback: shell out to `python -m screencap.cli` with PYTHONPATH
+        // set so the repo's `src/` is importable. Gated to Debug so a Release
+        // build can't be redirected at an arbitrary Python module via env var.
+        #if DEBUG
+        if let repoRoot = ProcessInfo.processInfo.environment["SCREENCAP_DEV_REPO_ROOT"], !repoRoot.isEmpty {
+            searched.append("dev fallback via SCREENCAP_DEV_REPO_ROOT=\(repoRoot)")
+            let python = URL(fileURLWithPath: "/usr/bin/env")
+            return (python, ["python3", "-m", "screencap.cli"])
+        }
+        #endif
+
+        throw CLIError.binaryNotFound(searchedPaths: searched)
+    }
+
+    /// Runs a one-shot CLI command and decodes its stdout as JSON.
+    ///
+    /// Pipes are drained concurrently — `screencap list --json` for power
+    /// users can exceed the default 64KB pipe buffer, which would deadlock
+    /// the child if we waited for exit before reading. A separate timeout
+    /// task SIGTERMs the process if it overruns the deadline.
+    static func runJSON<T: Decodable>(_ args: [String], timeout: TimeInterval = 10) async throws -> T {
+        let (executable, leading) = try resolveBinary()
+        let process = Process()
+        process.executableURL = executable
+        process.arguments = leading + args
+        process.environment = mergedEnv()
+
+        let stdout = Pipe()
+        let stderr = Pipe()
+        process.standardOutput = stdout
+        process.standardError = stderr
+
+        do {
+            try process.run()
+        } catch {
+            throw CLIError.launchFailed(underlying: error)
+        }
+
+        // Drain pipes concurrently — without this, >64KB output deadlocks
+        // the child. Each task reads to EOF (which only happens once the
+        // child closes its end, i.e., on exit).
+        async let stdoutData: Data = readAllInBackground(stdout.fileHandleForReading)
+        async let stderrData: Data = readAllInBackground(stderr.fileHandleForReading)
+
+        // Race subprocess exit against the timeout. If the timeout wins,
+        // SIGTERM the process so its FDs close and the drain tasks unblock.
+        let didTimeOut = await raceExitAgainstTimeout(process: process, timeout: timeout)
+
+        let stdoutBytes = await stdoutData
+        let stderrBytes = await stderrData
+
+        if didTimeOut {
+            throw CLIError.timedOut(seconds: timeout)
+        }
+
+        let exitCode = process.terminationStatus
+        if exitCode != 0 {
+            let errText = String(data: stderrBytes, encoding: .utf8) ?? "<binary>"
+            throw CLIError.nonZeroExit(code: exitCode, stderr: errText)
+        }
+
+        do {
+            return try JSONDecoder().decode(T.self, from: stdoutBytes)
+        } catch {
+            let raw = String(data: stdoutBytes, encoding: .utf8) ?? "<binary>"
+            throw CLIError.decode(underlying: error, raw: raw)
+        }
+    }
+
+    /// Reads `handle` to EOF on a background queue. The continuation resumes
+    /// once the child closes its end of the pipe (typically on exit).
+    private static func readAllInBackground(_ handle: FileHandle) async -> Data {
+        await withCheckedContinuation { (continuation: CheckedContinuation<Data, Never>) in
+            DispatchQueue.global(qos: .userInitiated).async {
+                let data = (try? handle.readToEnd()) ?? Data()
+                continuation.resume(returning: data)
+            }
+        }
+    }
+
+    /// Returns `true` if the timeout fired before the process exited.
+    ///
+    /// On timeout: SIGTERM the child, wait at most `terminateGrace` for it to
+    /// react, then SIGKILL if it's still alive. Without this bounded grace, a
+    /// CLI that ignores SIGTERM (stuck syscall, blocked signal) leaves
+    /// `runJSON` waiting forever — defeating the timeout entirely.
+    private static func raceExitAgainstTimeout(
+        process: Process,
+        timeout: TimeInterval,
+        terminateGrace: TimeInterval = 2.0
+    ) async -> Bool {
+        await withTaskGroup(of: Bool.self) { group in
+            group.addTask {
+                await withCheckedContinuation { (cont: CheckedContinuation<Void, Never>) in
+                    DispatchQueue.global(qos: .userInitiated).async {
+                        process.waitUntilExit()
+                        cont.resume()
+                    }
+                }
+                return false
+            }
+            group.addTask {
+                let nanos = UInt64(max(0, timeout) * 1_000_000_000)
+                try? await Task.sleep(nanoseconds: nanos)
+                return true
+            }
+            // First task to finish wins; cancel the other.
+            let result = await group.next() ?? false
+            group.cancelAll()
+            if result, process.isRunning {
+                process.terminate()
+                let exited = await waitForExit(process: process, timeout: terminateGrace)
+                if !exited, process.isRunning, process.processIdentifier > 0 {
+                    kill(process.processIdentifier, SIGKILL)
+                    _ = await waitForExit(process: process, timeout: terminateGrace)
+                }
+            }
+            return result
+        }
+    }
+
+    /// Polls until `process` exits or `timeout` elapses. Returns true if exited.
+    private static func waitForExit(process: Process, timeout: TimeInterval) async -> Bool {
+        let deadline = Date().addingTimeInterval(max(0, timeout))
+        while process.isRunning && Date() < deadline {
+            try? await Task.sleep(nanoseconds: 50_000_000) // 50ms
+        }
+        return !process.isRunning
+    }
+
+    /// Spawns a long-lived subprocess and streams stderr lines to `onStderrLine`.
+    /// Used by RecorderController for `screencap start` (event contract per Unit 8a).
+    /// The caller retains the returned SpawnedProcess and calls `terminate()` to stop.
+    static func spawn(
+        args: [String],
+        extraEnv: [String: String] = [:],
+        onStderrLine: @escaping @Sendable (String) -> Void,
+        onStdoutLine: (@Sendable (String) -> Void)? = nil
+    ) throws -> SpawnedProcess {
+        let (executable, leading) = try resolveBinary()
+        let process = Process()
+        process.executableURL = executable
+        process.arguments = leading + args
+        process.environment = mergedEnv(extra: extraEnv)
+
+        let stdoutPipe = Pipe()
+        let stderrPipe = Pipe()
+        process.standardOutput = stdoutPipe
+        process.standardError = stderrPipe
+
+        let stderrBuffer = LineBuffer(handler: onStderrLine)
+        stderrPipe.fileHandleForReading.readabilityHandler = { handle in
+            let data = handle.availableData
+            if data.isEmpty { return }
+            stderrBuffer.feed(data)
+        }
+
+        // Always drain stdout, even when the caller doesn't ask for lines.
+        // Python `screencap start` writes Rich-console banners and progress
+        // to stdout; if no reader is attached the 64KB pipe buffer fills,
+        // the child blocks on write, and stderr events stop flowing.
+        let stdoutBufferOpt: LineBuffer? = onStdoutLine.map { LineBuffer(handler: $0) }
+        stdoutPipe.fileHandleForReading.readabilityHandler = { handle in
+            let data = handle.availableData
+            if data.isEmpty { return }
+            // The read itself drains the pipe; the buffer is only used when a
+            // caller wants the lines. Without a caller we discard.
+            stdoutBufferOpt?.feed(data)
+        }
+
+        process.terminationHandler = { _ in
+            // Order matters and so does completeness:
+            // 1. Nil the readabilityHandler so no further chunks dispatch.
+            // 2. Drain anything still in the pipe to EOF — Apple does NOT
+            //    guarantee that the last readabilityHandler callback fires
+            //    before terminationHandler. If the child's final write
+            //    (e.g. `stopped` or `recording_finalized` event) lands in
+            //    the pipe right before exit, the handler may be skipped
+            //    and those bytes would die with the FD. The child already
+            //    closed its end, so readToEnd returns immediately with
+            //    whatever's buffered.
+            // 3. Flush the LineBuffer (any final partial line goes out).
+            stderrPipe.fileHandleForReading.readabilityHandler = nil
+            stdoutPipe.fileHandleForReading.readabilityHandler = nil
+            if let remaining = try? stderrPipe.fileHandleForReading.readToEnd(),
+               !remaining.isEmpty {
+                stderrBuffer.feed(remaining)
+            }
+            if let remaining = try? stdoutPipe.fileHandleForReading.readToEnd(),
+               !remaining.isEmpty {
+                stdoutBufferOpt?.feed(remaining)
+            }
+            stderrBuffer.flush()
+            stdoutBufferOpt?.flush()
+        }
+
+        do {
+            try process.run()
+        } catch {
+            throw CLIError.launchFailed(underlying: error)
+        }
+
+        return SpawnedProcess(process: process, stderrPipe: stderrPipe, stdoutPipe: stdoutPipe)
+    }
+
+    /// Fire-and-forget invocation. Used for `screencap view <name>` (Unit 14a) where
+    /// we don't care about the result — macOS opens the user's default browser.
+    @discardableResult
+    static func runDetached(_ args: [String]) throws -> Process {
+        let (executable, leading) = try resolveBinary()
+        let process = Process()
+        process.executableURL = executable
+        process.arguments = leading + args
+        process.environment = mergedEnv()
+        let stdout = Pipe()
+        let stderr = Pipe()
+        process.standardOutput = stdout
+        process.standardError = stderr
+        // Discard whatever the child writes. Without a reader, >64KB of
+        // output fills the pipe buffer and the child blocks on write.
+        let drain: @Sendable (FileHandle) -> Void = { _ = $0.availableData }
+        stdout.fileHandleForReading.readabilityHandler = drain
+        stderr.fileHandleForReading.readabilityHandler = drain
+        process.terminationHandler = { _ in
+            stdout.fileHandleForReading.readabilityHandler = nil
+            stderr.fileHandleForReading.readabilityHandler = nil
+        }
+        do {
+            try process.run()
+        } catch {
+            throw CLIError.launchFailed(underlying: error)
+        }
+        return process
+    }
+
+    /// Builds the subprocess environment by merging extras into the current
+    /// environment, then forcing SCREENCAP_PARENT and PYTHONUNBUFFERED. We never
+    /// replace the inherited environment — that would break PATH / TMPDIR / etc.
+    /// In Debug, when SCREENCAP_DEV_REPO_ROOT is set, prepends `<repo>/src` to
+    /// PYTHONPATH so `python3 -m screencap.cli` resolves the package without an
+    /// editable install. Release builds skip the PYTHONPATH override so an env
+    /// var can't redirect the bundled CLI to an arbitrary module path.
+    private static func mergedEnv(extra: [String: String] = [:]) -> [String: String] {
+        var env = ProcessInfo.processInfo.environment
+        for (k, v) in extra { env[k] = v }
+        env["SCREENCAP_PARENT"] = "swiftui"
+        env["PYTHONUNBUFFERED"] = "1"
+        #if DEBUG
+        if let repoRoot = env["SCREENCAP_DEV_REPO_ROOT"], !repoRoot.isEmpty {
+            let srcPath = repoRoot + "/src"
+            if let existing = env["PYTHONPATH"], !existing.isEmpty {
+                env["PYTHONPATH"] = "\(srcPath):\(existing)"
+            } else {
+                env["PYTHONPATH"] = srcPath
+            }
+        }
+        #endif
+        return env
+    }
+}
+
+/// Concatenates streamed bytes into UTF-8 lines and dispatches them to a handler.
+/// Pipe `readabilityHandler` callbacks deliver arbitrary chunks, not lines.
+///
+/// Thread safety: `feed()` and `flush()` share an internal `NSLock`, so a
+/// `feed()` call that races a `flush()` (e.g. a final readabilityHandler
+/// callback that fires after we've nil'd the handler) is well-defined — both
+/// see a consistent `pending` buffer.
+///
+/// Callers are responsible for ensuring no further `feed()` will arrive after
+/// `flush()` returns. The spawn termination handler upholds this by nilling
+/// the readabilityHandler before calling `flush()`.
+private final class LineBuffer: @unchecked Sendable {
+    private let handler: @Sendable (String) -> Void
+    private let lock = NSLock()
+    private var pending = Data()
+
+    init(handler: @escaping @Sendable (String) -> Void) {
+        self.handler = handler
+    }
+
+    func feed(_ data: Data) {
+        lock.lock()
+        pending.append(data)
+        var lines: [String] = []
+        while let nl = pending.firstIndex(of: 0x0A) {
+            let line = pending.subdata(in: pending.startIndex..<nl)
+            pending.removeSubrange(pending.startIndex...nl)
+            if let s = String(data: line, encoding: .utf8) {
+                lines.append(s)
+            }
+        }
+        lock.unlock()
+        for line in lines { handler(line) }
+    }
+
+    func flush() {
+        lock.lock()
+        let trailing = pending
+        pending.removeAll()
+        lock.unlock()
+        if !trailing.isEmpty, let s = String(data: trailing, encoding: .utf8) {
+            handler(s)
+        }
+    }
+}

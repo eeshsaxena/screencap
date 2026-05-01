@@ -68,6 +68,7 @@ ScreenCap is a macOS CLI for screen recording with a privacy-aware capture pipel
 | [network-capture.md](./network-capture.md) | V1 network proxy logging: mitmproxy embedded as `mp.Process`, system proxy lifecycle, three-layer privacy, R10 redaction. Phasing: V1 metadata-only DB-only, V1.5 bodies+encryption, V1.75 cloud upload |
 | [segmentation.md](./segmentation.md) | Task segmentation: client v1 idle-gap vs Cloud Run v2 LLM (Gemini), validation + fallback |
 | [session.md](./session.md) | SessionController lifecycle, menubar subprocess (legacy + session modes), IPC topology, post-process worker |
+| [swiftui-shell.md](./swiftui-shell.md) | Native macOS UI at `macos/`: scenes + AppDelegate, CLIClient subprocess bridge, permissions walkthrough, in-process TCC cache workaround, Xcode/xcodegen build pipeline |
 
 ## Cross-cutting conventions
 

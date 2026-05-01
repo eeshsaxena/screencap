@@ -1,0 +1,73 @@
+name: ScreenCap
+
+options:
+  deploymentTarget:
+    macOS: "13.0"
+  developmentLanguage: en
+  createIntermediateGroups: true
+
+settings:
+  base:
+    MACOSX_DEPLOYMENT_TARGET: "13.0"
+    SWIFT_VERSION: "5.9"
+    SWIFT_STRICT_CONCURRENCY: complete
+    DEVELOPMENT_TEAM: ""
+    CODE_SIGN_STYLE: Automatic
+
+targets:
+  ScreenCap:
+    type: application
+    platform: macOS
+    sources:
+      - path: ScreenCap
+        excludes:
+          - "Scripts/**"
+          - "Info.plist"
+          - "ScreenCap.entitlements"
+    resources:
+      - path: ScreenCap/Assets.xcassets
+    info:
+      path: ScreenCap/Info.plist
+      properties:
+        CFBundleDisplayName: ScreenCap
+        CFBundleShortVersionString: "0.1.0"
+        CFBundleVersion: "1"
+        LSMinimumSystemVersion: "13.0"
+        LSApplicationCategoryType: public.app-category.productivity
+        NSMicrophoneUsageDescription: "ScreenCap can record audio alongside your screen capture."
+        NSCameraUsageDescription: "ScreenCap does not use the camera; this entry exists for permission-pane completeness."
+        # NSAppleEventsUsageDescription is intentionally absent — PR1 doesn't send
+        # Apple events. Re-add in PR2/Unit 14a when `screencap view` opens
+        # viewer.html via a real Apple event path.
+        NSHighResolutionCapable: true
+    settings:
+      base:
+        PRODUCT_BUNDLE_IDENTIFIER: com.screencap.macos
+        PRODUCT_NAME: ScreenCap
+        ENABLE_HARDENED_RUNTIME: YES
+        CODE_SIGN_ENTITLEMENTS: ScreenCap/ScreenCap.entitlements
+        ASSETCATALOG_COMPILER_APPICON_NAME: AppIcon
+        ENABLE_PREVIEWS: YES
+        GENERATE_INFOPLIST_FILE: NO
+    preBuildScripts:
+      - name: Embed screencap CLI
+        script: |
+          "${SRCROOT}/ScreenCap/Scripts/embed-cli.sh"
+        basedOnDependencyAnalysis: false
+        showEnvVarsInLog: false
+
+schemes:
+  ScreenCap:
+    build:
+      targets:
+        ScreenCap: all
+    run:
+      config: Debug
+    test:
+      config: Debug
+    profile:
+      config: Release
+    analyze:
+      config: Debug
+    archive:
+      config: Release
