@@ -60,3 +60,26 @@ def test_does_not_raise_on_nonzero_exit() -> None:
         run.return_value = subprocess.CompletedProcess(args=["open"], returncode=1)
         # Must not raise.
         _open_privacy_settings("Privacy_ScreenCapture")
+
+
+@pytest.mark.parametrize(
+    "version,expected_substring",
+    [
+        ("13.0", ".extension?"),         # Ventura — System Settings
+        ("14.5", ".extension?"),         # Sonoma
+        ("26.4", ".extension?"),         # macOS 26
+        ("12.7", "preference.security"), # Monterey — System Preferences
+        ("11.7", "preference.security"), # Big Sur
+    ],
+)
+def test_url_form_matches_macos_version(version: str, expected_substring: str) -> None:
+    """macOS 13+ uses the new System Settings `.extension` URL; macOS 11/12
+    needs the legacy System Preferences URL. Without version detection, CLI
+    users on Big Sur / Monterey hit a broken deep-link."""
+    with patch("screencap.recorder.platform.mac_ver") as mac_ver, \
+         patch("screencap.recorder.subprocess.run") as run:
+        mac_ver.return_value = (version, ("", "", ""), "")
+        _open_privacy_settings("Privacy_ScreenCapture")
+    url = run.call_args.args[0][1]
+    assert expected_substring in url
+    assert url.endswith("?Privacy_ScreenCapture")

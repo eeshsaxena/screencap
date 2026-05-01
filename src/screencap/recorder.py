@@ -13,6 +13,7 @@ import atexit
 import json
 import multiprocessing
 import os
+import platform
 import shutil
 import signal
 import subprocess
@@ -363,20 +364,32 @@ def _open_privacy_settings(pane: str) -> None:
 
     pane: one of 'Privacy_ScreenCapture', 'Privacy_Accessibility', 'Privacy_ListenEvent'
 
-    Uses the macOS 13+ ``.extension`` URL form. The legacy
-    ``com.apple.preference.security`` form lands on a generic page on macOS 26+.
+    URL form is version-detected:
+
+    * macOS 13+ uses the ``com.apple.settings.PrivacySecurity.extension`` URL
+      (System Settings introduced in Ventura). The legacy form lands on a
+      generic page on macOS 26+.
+    * macOS 11/12 still ships System Preferences and only honors the legacy
+      ``com.apple.preference.security`` URL.
+
     The SwiftUI shell follows the same Apple URL contract independently in
     ``PermissionController.openSystemSettings``; both code paths are
     independent implementations of the documented Apple URL form, not
     locked together by tooling.
     """
-    subprocess.run(
-        [
-            "open",
-            f"x-apple.systempreferences:com.apple.settings.PrivacySecurity.extension?{pane}",
-        ],
-        check=False,
-    )
+    macos_major = 0
+    try:
+        version_str = platform.mac_ver()[0]
+        if version_str:
+            macos_major = int(version_str.split(".", 1)[0])
+    except (ValueError, IndexError):
+        pass
+
+    if macos_major >= 13:
+        url = f"x-apple.systempreferences:com.apple.settings.PrivacySecurity.extension?{pane}"
+    else:
+        url = f"x-apple.systempreferences:com.apple.preference.security?{pane}"
+    subprocess.run(["open", url], check=False)
 
 
 # Python snippets to check each permission in a fresh subprocess.

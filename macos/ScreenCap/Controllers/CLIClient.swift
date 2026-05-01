@@ -263,11 +263,27 @@ enum CLIClient {
         }
 
         process.terminationHandler = { _ in
-            // Order: nil the readabilityHandler before flushing. Any in-flight
-            // feed() callback that fires after we nil the handler still
-            // serializes against flush() via LineBuffer's internal lock.
+            // Order matters and so does completeness:
+            // 1. Nil the readabilityHandler so no further chunks dispatch.
+            // 2. Drain anything still in the pipe to EOF — Apple does NOT
+            //    guarantee that the last readabilityHandler callback fires
+            //    before terminationHandler. If the child's final write
+            //    (e.g. `stopped` or `recording_finalized` event) lands in
+            //    the pipe right before exit, the handler may be skipped
+            //    and those bytes would die with the FD. The child already
+            //    closed its end, so readToEnd returns immediately with
+            //    whatever's buffered.
+            // 3. Flush the LineBuffer (any final partial line goes out).
             stderrPipe.fileHandleForReading.readabilityHandler = nil
             stdoutPipe.fileHandleForReading.readabilityHandler = nil
+            if let remaining = try? stderrPipe.fileHandleForReading.readToEnd(),
+               !remaining.isEmpty {
+                stderrBuffer.feed(remaining)
+            }
+            if let remaining = try? stdoutPipe.fileHandleForReading.readToEnd(),
+               !remaining.isEmpty {
+                stdoutBufferOpt?.feed(remaining)
+            }
             stderrBuffer.flush()
             stdoutBufferOpt?.flush()
         }
