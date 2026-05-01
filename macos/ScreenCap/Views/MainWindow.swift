@@ -65,6 +65,7 @@ struct MainWindow: View {
         .sheet(isPresented: $showingPermissionsSheet) {
             FirstRunPermissionsView(isPresented: $showingPermissionsSheet)
                 .environmentObject(permissions)
+                .environmentObject(recorder)
         }
         .onAppear {
             // The sheet owns its own poll lifecycle (see FirstRunPermissionsView)

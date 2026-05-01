@@ -73,6 +73,11 @@ final class PermissionController: ObservableObject {
     @Published private(set) var accessibility: PermissionStatus = .notDetermined
     @Published private(set) var inputMonitoring: PermissionStatus = .notDetermined
     @Published private(set) var microphone: PermissionStatus = .notDetermined
+    /// True between the moment `relaunchApplication()` is invoked and the
+    /// process actually exits. Surfaced to the UI so the Quit & Relaunch
+    /// button can be disabled, preventing a double-click from stacking
+    /// multiple new instances.
+    @Published private(set) var isRelaunching: Bool = false
 
     private var pollTimer: Timer?
     private var workspaceObserver: NSObjectProtocol?
@@ -93,11 +98,18 @@ final class PermissionController: ObservableObject {
         refresh()
     }
 
-    deinit {
-        // Timers and observers must be cleaned up on deinit to avoid leaks.
-        pollTimer?.invalidate()
-        if let workspaceObserver {
-            NSWorkspace.shared.notificationCenter.removeObserver(workspaceObserver)
+    nonisolated deinit {
+        // The class is @MainActor but deinit runs on whichever thread drops
+        // the last reference. `MainActor.assumeIsolated` jumps back to the
+        // actor for the cleanup so accessing the @Published timer / observer
+        // properties stays well-defined under Swift 6's strict concurrency.
+        // (Timer.invalidate and NSWorkspace.removeObserver tolerate cross-
+        // thread calls in practice, but the compiler is strict for a reason.)
+        MainActor.assumeIsolated {
+            pollTimer?.invalidate()
+            if let workspaceObserver {
+                NSWorkspace.shared.notificationCenter.removeObserver(workspaceObserver)
+            }
         }
     }
 
@@ -153,6 +165,8 @@ final class PermissionController: ObservableObject {
     /// short `sleep` chain — but using `Process.run()` with arguments avoids
     /// any shell entirely.
     func relaunchApplication() {
+        guard !isRelaunching else { return }
+        isRelaunching = true
         let bundlePath = Bundle.main.bundlePath
         // Two staged Processes: a `sleep 0.6` to give the kernel time to reap
         // this process, then `open -n <bundle>`. We run them via a single
@@ -171,6 +185,7 @@ final class PermissionController: ObservableObject {
         } catch {
             // If the relaunch helper can't even start, don't terminate —
             // surface the failure so the user isn't left with a vanished app.
+            isRelaunching = false
             let alert = NSAlert()
             alert.messageText = "Couldn't relaunch ScreenCap"
             alert.informativeText = "Quit and reopen the app manually to apply granted permissions.\n\n\(error.localizedDescription)"

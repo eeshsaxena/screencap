@@ -10,6 +10,7 @@ import SwiftUI
 /// dismissed.
 struct FirstRunPermissionsView: View {
     @EnvironmentObject private var permissions: PermissionController
+    @EnvironmentObject private var recorder: RecorderController
     @Binding var isPresented: Bool
 
     var body: some View {
@@ -51,10 +52,15 @@ struct FirstRunPermissionsView: View {
                     .foregroundStyle(.secondary)
 
                 HStack {
+                    // Disable while a relaunch is already in flight (prevents
+                    // double-click stacking new instances) or while a
+                    // recording is active (avoids racing PR3's `.terminateLater`
+                    // NSAlert path against the detached `open -n` shell).
                     Button("Quit & Relaunch") {
                         permissions.relaunchApplication()
                     }
                     .buttonStyle(.bordered)
+                    .disabled(permissions.isRelaunching || recorder.state.isRecording)
 
                     // Always-available escape hatch. Dismisses the sheet
                     // even if the cached permission state still reads denied.

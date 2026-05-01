@@ -92,13 +92,16 @@ enum CLIClient {
             }
         }
 
-        // Dev fallback: shell out to `python -m screencap.cli` with PYTHONPATH set.
-        // The repo root is assumed two levels above the bundle's MacOS directory
-        // when running from Xcode; the env var SCREENCAP_DEV_REPO_ROOT can override.
+        // Dev fallback: shell out to `python -m screencap.cli` with PYTHONPATH
+        // set so the repo's `src/` is importable. Gated to Debug so a Release
+        // build can't be redirected at an arbitrary Python module via env var.
+        #if DEBUG
         if let repoRoot = ProcessInfo.processInfo.environment["SCREENCAP_DEV_REPO_ROOT"], !repoRoot.isEmpty {
+            searched.append("dev fallback via SCREENCAP_DEV_REPO_ROOT=\(repoRoot)")
             let python = URL(fileURLWithPath: "/usr/bin/env")
             return (python, ["python3", "-m", "screencap.cli"])
         }
+        #endif
 
         throw CLIError.binaryNotFound(searchedPaths: searched)
     }
@@ -260,6 +263,9 @@ enum CLIClient {
         }
 
         process.terminationHandler = { _ in
+            // Order: nil the readabilityHandler before flushing. Any in-flight
+            // feed() callback that fires after we nil the handler still
+            // serializes against flush() via LineBuffer's internal lock.
             stderrPipe.fileHandleForReading.readabilityHandler = nil
             stdoutPipe.fileHandleForReading.readabilityHandler = nil
             stderrBuffer.flush()
@@ -308,14 +314,16 @@ enum CLIClient {
     /// Builds the subprocess environment by merging extras into the current
     /// environment, then forcing SCREENCAP_PARENT and PYTHONUNBUFFERED. We never
     /// replace the inherited environment — that would break PATH / TMPDIR / etc.
-    /// When SCREENCAP_DEV_REPO_ROOT is set, prepends `<repo>/src` to PYTHONPATH
-    /// so `python3 -m screencap.cli` resolves the package without an editable
-    /// install. Without this, the dev fallback fails with ModuleNotFoundError.
+    /// In Debug, when SCREENCAP_DEV_REPO_ROOT is set, prepends `<repo>/src` to
+    /// PYTHONPATH so `python3 -m screencap.cli` resolves the package without an
+    /// editable install. Release builds skip the PYTHONPATH override so an env
+    /// var can't redirect the bundled CLI to an arbitrary module path.
     private static func mergedEnv(extra: [String: String] = [:]) -> [String: String] {
         var env = ProcessInfo.processInfo.environment
         for (k, v) in extra { env[k] = v }
         env["SCREENCAP_PARENT"] = "swiftui"
         env["PYTHONUNBUFFERED"] = "1"
+        #if DEBUG
         if let repoRoot = env["SCREENCAP_DEV_REPO_ROOT"], !repoRoot.isEmpty {
             let srcPath = repoRoot + "/src"
             if let existing = env["PYTHONPATH"], !existing.isEmpty {
@@ -324,12 +332,22 @@ enum CLIClient {
                 env["PYTHONPATH"] = srcPath
             }
         }
+        #endif
         return env
     }
 }
 
 /// Concatenates streamed bytes into UTF-8 lines and dispatches them to a handler.
 /// Pipe `readabilityHandler` callbacks deliver arbitrary chunks, not lines.
+///
+/// Thread safety: `feed()` and `flush()` share an internal `NSLock`, so a
+/// `feed()` call that races a `flush()` (e.g. a final readabilityHandler
+/// callback that fires after we've nil'd the handler) is well-defined — both
+/// see a consistent `pending` buffer.
+///
+/// Callers are responsible for ensuring no further `feed()` will arrive after
+/// `flush()` returns. The spawn termination handler upholds this by nilling
+/// the readabilityHandler before calling `flush()`.
 private final class LineBuffer: @unchecked Sendable {
     private let handler: @Sendable (String) -> Void
     private let lock = NSLock()

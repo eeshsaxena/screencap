@@ -365,7 +365,10 @@ def _open_privacy_settings(pane: str) -> None:
 
     Uses the macOS 13+ ``.extension`` URL form. The legacy
     ``com.apple.preference.security`` form lands on a generic page on macOS 26+.
-    Kept in sync with the SwiftUI ``PermissionController.openSystemSettings`` helper.
+    The SwiftUI shell follows the same Apple URL contract independently in
+    ``PermissionController.openSystemSettings``; both code paths are
+    independent implementations of the documented Apple URL form, not
+    locked together by tooling.
     """
     subprocess.run(
         [
