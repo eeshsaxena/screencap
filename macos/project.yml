@@ -36,7 +36,9 @@ targets:
         LSApplicationCategoryType: public.app-category.productivity
         NSMicrophoneUsageDescription: "ScreenCap can record audio alongside your screen capture."
         NSCameraUsageDescription: "ScreenCap does not use the camera; this entry exists for permission-pane completeness."
-        NSAppleEventsUsageDescription: "ScreenCap uses Apple events to open recordings in your default browser."
+        # NSAppleEventsUsageDescription is intentionally absent — PR1 doesn't send
+        # Apple events. Re-add in PR2/Unit 14a when `screencap view` opens
+        # viewer.html via a real Apple event path.
         NSHighResolutionCapable: true
     settings:
       base:

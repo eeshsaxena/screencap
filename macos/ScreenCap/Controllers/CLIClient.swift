@@ -27,7 +27,10 @@ enum CLIError: LocalizedError {
 /// Owns Process spawning, stderr line streaming, and JSON parsing for the bundled
 /// screencap CLI. Resolves the binary from `Contents/Resources/screencap/screencap`
 /// in the bundled app, with `SCREENCAP_CLI_PATH` env-var override for development.
-final class CLIClient {
+///
+/// Caseless enum — every member is `static`, there is no instance state, and
+/// `enum` prevents accidental instantiation that a `class` would allow.
+enum CLIClient {
     /// Long-lived subprocess handle. Caller retains it for the duration of the
     /// recording lifecycle and calls `terminate()` to send SIGTERM.
     final class SpawnedProcess {
@@ -51,14 +54,14 @@ final class CLIClient {
         }
 
         func waitUntilExit() async {
-            await withCheckedContinuation { continuation in
-                if !process.isRunning {
-                    continuation.resume()
-                    return
-                }
-                let oldHandler = process.terminationHandler
-                process.terminationHandler = { proc in
-                    oldHandler?(proc)
+            // Use a blocking waitUntilExit on a background queue rather than
+            // chaining terminationHandler. The handler-chaining variant has a
+            // TOCTOU window: if `isRunning` is true at the check but the child
+            // exits before the handler assignment lands, the new handler is
+            // never invoked and the continuation never resumes.
+            await withCheckedContinuation { (continuation: CheckedContinuation<Void, Never>) in
+                DispatchQueue.global(qos: .userInitiated).async { [process] in
+                    process.waitUntilExit()
                     continuation.resume()
                 }
             }
@@ -281,8 +284,19 @@ final class CLIClient {
         process.executableURL = executable
         process.arguments = leading + args
         process.environment = mergedEnv()
-        process.standardOutput = Pipe()
-        process.standardError = Pipe()
+        let stdout = Pipe()
+        let stderr = Pipe()
+        process.standardOutput = stdout
+        process.standardError = stderr
+        // Discard whatever the child writes. Without a reader, >64KB of
+        // output fills the pipe buffer and the child blocks on write.
+        let drain: @Sendable (FileHandle) -> Void = { _ = $0.availableData }
+        stdout.fileHandleForReading.readabilityHandler = drain
+        stderr.fileHandleForReading.readabilityHandler = drain
+        process.terminationHandler = { _ in
+            stdout.fileHandleForReading.readabilityHandler = nil
+            stderr.fileHandleForReading.readabilityHandler = nil
+        }
         do {
             try process.run()
         } catch {

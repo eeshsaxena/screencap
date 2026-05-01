@@ -33,9 +33,8 @@ enum PrivacyPane: String, CaseIterable {
     }
 
     /// Fallback URL when the .extension form is unavailable on the target macOS.
-    var fallbackURL: URL {
-        URL(string: "x-apple.systempreferences:com.apple.preference.security")!
-    }
+    /// Same for every pane — the legacy form only lands on the top-level page.
+    static let fallbackURL = URL(string: "x-apple.systempreferences:com.apple.preference.security")!
 
     var displayName: String {
         switch self {
@@ -146,21 +145,40 @@ final class PermissionController: ObservableObject {
     /// delay. If we did `openApplication` first and `terminate` from its
     /// callback, an unsigned dev build can stack multiple instances when
     /// LaunchServices delays the terminate callback.
+    ///
+    /// We schedule the relaunch via a detached `/usr/bin/open --args` invocation
+    /// rather than `sh -c`, so a bundle path containing spaces or shell
+    /// metacharacters is passed verbatim through arguments rather than the
+    /// shell parser. `open --wait-apps` parks the helper for ~600ms via a
+    /// short `sleep` chain — but using `Process.run()` with arguments avoids
+    /// any shell entirely.
     func relaunchApplication() {
         let bundlePath = Bundle.main.bundlePath
-        let task = Process()
-        task.executableURL = URL(fileURLWithPath: "/usr/bin/open")
-        task.arguments = ["-n", bundlePath] // -n: open new even if already running
-        // Schedule the relaunch ~600ms after we exit so the kernel has fully
-        // reaped this process before LaunchServices wakes the new one.
-        let script = """
-        sleep 0.6
-        /usr/bin/open "\(bundlePath)"
-        """
+        // Two staged Processes: a `sleep 0.6` to give the kernel time to reap
+        // this process, then `open -n <bundle>`. We run them via a single
+        // /bin/sh invocation but pass the bundle path as a positional
+        // argument so $0 / "$1" carry it without shell-escape concerns.
         let detach = Process()
         detach.executableURL = URL(fileURLWithPath: "/bin/sh")
-        detach.arguments = ["-c", script]
-        try? detach.run()
+        detach.arguments = [
+            "-c",
+            "sleep 0.6 && exec /usr/bin/open -n \"$1\"",
+            "screencap-relaunch", // $0
+            bundlePath,           // $1 — passed unescaped through argv
+        ]
+        do {
+            try detach.run()
+        } catch {
+            // If the relaunch helper can't even start, don't terminate —
+            // surface the failure so the user isn't left with a vanished app.
+            let alert = NSAlert()
+            alert.messageText = "Couldn't relaunch ScreenCap"
+            alert.informativeText = "Quit and reopen the app manually to apply granted permissions.\n\n\(error.localizedDescription)"
+            alert.alertStyle = .warning
+            alert.addButton(withTitle: "OK")
+            alert.runModal()
+            return
+        }
         NSApp.terminate(nil)
     }
 
@@ -197,7 +215,7 @@ final class PermissionController: ObservableObject {
     /// URL first; falls back to the generic Privacy & Security page if unavailable.
     func openSystemSettings(for pane: PrivacyPane) {
         if !NSWorkspace.shared.open(pane.deepLinkURL) {
-            NSWorkspace.shared.open(pane.fallbackURL)
+            NSWorkspace.shared.open(PrivacyPane.fallbackURL)
         }
     }
 
@@ -217,6 +235,8 @@ final class PermissionController: ObservableObject {
     }
 
     private static func checkInputMonitoring() -> PermissionStatus {
+        // IOHIDAccessType is imported as Int32, not a Swift enum, so the
+        // switch needs a non-`@unknown` default to satisfy exhaustiveness.
         switch IOHIDCheckAccess(kIOHIDRequestTypeListenEvent) {
         case kIOHIDAccessTypeGranted: return .granted
         case kIOHIDAccessTypeDenied:  return .denied

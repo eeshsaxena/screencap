@@ -24,8 +24,6 @@
 	<string>public.app-category.productivity</string>
 	<key>LSMinimumSystemVersion</key>
 	<string>13.0</string>
-	<key>NSAppleEventsUsageDescription</key>
-	<string>ScreenCap uses Apple events to open recordings in your default browser.</string>
 	<key>NSCameraUsageDescription</key>
 	<string>ScreenCap does not use the camera; this entry exists for permission-pane completeness.</string>
 	<key>NSHighResolutionCapable</key>

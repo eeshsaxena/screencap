@@ -6,6 +6,8 @@ This file provides guidance to Claude Code (claude.ai/code) when working with co
 
 ScreenCap is a macOS CLI for screen recording. The recording engine lives at `src/screencap/engine/` as an internal sub-package. Python >= 3.10, macOS only.
 
+A native SwiftUI app shell lives at `macos/` and wraps the bundled CLI; see "macOS SwiftUI app shell" below for details.
+
 ## Common Commands
 
 ```bash
@@ -136,6 +138,20 @@ Two-layer privacy enforcement: capture-time filtering + post-recording scrubbing
 - Recording dirs live at `~/.screencap/recordings/<name>/`.
 - Tests use `click.testing.CliRunner`, `unittest.mock.patch`, and `tmp_path` fixtures with inline SQLite setup.
 - `engine/__init__.py` exposes only `Capture`, `CaptureSession`, `create_html`, and `__version__`; all other engine symbols import from their defining submodules.
+
+## macOS SwiftUI app shell (`macos/`)
+
+Native macOS app at `macos/` (Swift 5.9, min macOS 13.0, bundle id `com.screencap.macos`). Wraps the bundled `screencap` CLI; the recording engine stays in Python. See `docs/architecture/swiftui-shell.md` for the architecture and `macos/README.md` for the dev-launch runbook.
+
+**Build pipeline:** The `.xcodeproj` is generated from `macos/project.yml` (xcodegen) and is gitignored. Run `xcodegen generate` from `macos/` to materialize it. Source of truth for project settings is `project.yml`, not the project file. The `macos/ScreenCap/Scripts/embed-cli.sh` build phase copies `dist/screencap/` (PyInstaller output) into `Contents/Resources/screencap/` on every build; the script tolerates a missing `dist/` so the .app still launches in dev.
+
+**Binary resolution (`CLIClient.resolveBinary`):** three modes, in priority order: `SCREENCAP_CLI_PATH` env override → bundled `Contents/Resources/screencap/screencap` → `python3 -m screencap.cli` when `SCREENCAP_DEV_REPO_ROOT` is set (`<repo>/src` is prepended to `PYTHONPATH` automatically). Always merges `SCREENCAP_PARENT=swiftui` and `PYTHONUNBUFFERED=1` into the inherited environment; never replaces it.
+
+**Subprocess pattern:** `runJSON` drains stdout/stderr concurrently to avoid the 64KB pipe deadlock and races subprocess exit against an honored timeout (SIGTERM → 2s grace → SIGKILL). `spawn` line-buffers stderr/stdout for the Unit 8a stderr event contract. `runDetached` drains its pipes via no-op handlers to avoid future-caller deadlocks.
+
+**TCC permissions:** `PermissionController` does silent per-process checks (`CGPreflightScreenCaptureAccess`, `AXIsProcessTrustedWithOptions(prompt:false)`, `IOHIDCheckAccess`, `AVCaptureDevice.authorizationStatus`). TCC results are cached at process launch — a permission granted in System Settings does not flip until the app restarts, which is what the "Quit & Relaunch" button addresses. Deep links use the macOS 13+ `.extension` URL form (`com.apple.settings.PrivacySecurity.extension?Privacy_*`); the legacy `com.apple.preference.security` form lands on a generic page on macOS 26+. The Python helper `src/screencap/recorder.py:_open_privacy_settings` is kept in lockstep — see `tests/test_privacy_settings_deeplink.py`.
+
+**Hardened-runtime entitlements** live at `macos/ScreenCap/ScreenCap.entitlements`. Sandbox is intentionally off (the app shells out and writes `~/.screencap/`). The exact entitlement set is signing-pipeline-driven — re-evaluate before adding new ones.
 
 ## Documented Solutions
 

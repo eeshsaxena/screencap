@@ -7,6 +7,8 @@ from __future__ import annotations
 
 from unittest.mock import patch
 
+import pytest
+
 from screencap.recorder import _open_privacy_settings
 
 
@@ -27,11 +29,13 @@ def test_uses_macos_13_extension_url_form() -> None:
     )
 
 
-def test_each_supported_pane_round_trips() -> None:
-    panes = ["Privacy_ScreenCapture", "Privacy_Accessibility", "Privacy_ListenEvent"]
-    for pane in panes:
-        with patch("screencap.recorder.subprocess.run") as run:
-            _open_privacy_settings(pane)
-        url = run.call_args.args[0][1]
-        assert url.endswith(f"?{pane}")
-        assert ".extension?" in url
+@pytest.mark.parametrize(
+    "pane",
+    ["Privacy_ScreenCapture", "Privacy_Accessibility", "Privacy_ListenEvent"],
+)
+def test_each_supported_pane_round_trips(pane: str) -> None:
+    with patch("screencap.recorder.subprocess.run") as run:
+        _open_privacy_settings(pane)
+    url = run.call_args.args[0][1]
+    assert url.endswith(f"?{pane}")
+    assert ".extension?" in url

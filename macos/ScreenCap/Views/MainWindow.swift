@@ -67,13 +67,11 @@ struct MainWindow: View {
                 .environmentObject(permissions)
         }
         .onAppear {
-            permissions.startWatching()
+            // The sheet owns its own poll lifecycle (see FirstRunPermissionsView)
+            // so MainWindow only triggers the initial visibility check here.
             if !permissions.allRequiredGranted {
                 showingPermissionsSheet = true
             }
-        }
-        .onDisappear {
-            permissions.stopWatching()
         }
     }
 

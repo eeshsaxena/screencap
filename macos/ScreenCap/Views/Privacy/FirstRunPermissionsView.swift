@@ -74,6 +74,7 @@ struct FirstRunPermissionsView: View {
         .padding(28)
         .frame(width: 520)
         .onAppear { permissions.startWatching() }
+        .onDisappear { permissions.stopWatching() }
     }
 
     @ViewBuilder

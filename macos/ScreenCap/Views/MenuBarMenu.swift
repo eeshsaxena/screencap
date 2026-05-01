@@ -7,16 +7,15 @@ struct MenuBarMenu: View {
     @EnvironmentObject private var recorder: RecorderController
 
     var body: some View {
-        // Recording controls are stubbed in PR1 — Unit 13 wires them. Show
-        // them disabled instead of clickable-but-silent so the menu doesn't
-        // present a broken action.
+        // Recording controls are stubbed in PR1 — Unit 13 wires them up
+        // (and re-attaches Cmd+Shift+R / Cmd+Shift+S). We render them
+        // disabled so the menu doesn't present a broken action, but keep
+        // the keyboard shortcuts off until they actually do something.
         if recorder.state.isRecording {
             Button("Stop Recording") { recorder.stop() }
-                .keyboardShortcut("s", modifiers: [.command, .shift])
                 .disabled(true)
         } else {
             Button("Start Recording") { recorder.start() }
-                .keyboardShortcut("r", modifiers: [.command, .shift])
                 .disabled(true)
         }
 
