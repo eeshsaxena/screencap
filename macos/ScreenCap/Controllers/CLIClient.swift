@@ -274,11 +274,22 @@ final class CLIClient {
     /// Builds the subprocess environment by merging extras into the current
     /// environment, then forcing SCREENCAP_PARENT and PYTHONUNBUFFERED. We never
     /// replace the inherited environment — that would break PATH / TMPDIR / etc.
+    /// When SCREENCAP_DEV_REPO_ROOT is set, prepends `<repo>/src` to PYTHONPATH
+    /// so `python3 -m screencap.cli` resolves the package without an editable
+    /// install. Without this, the dev fallback fails with ModuleNotFoundError.
     private static func mergedEnv(extra: [String: String] = [:]) -> [String: String] {
         var env = ProcessInfo.processInfo.environment
         for (k, v) in extra { env[k] = v }
         env["SCREENCAP_PARENT"] = "swiftui"
         env["PYTHONUNBUFFERED"] = "1"
+        if let repoRoot = env["SCREENCAP_DEV_REPO_ROOT"], !repoRoot.isEmpty {
+            let srcPath = repoRoot + "/src"
+            if let existing = env["PYTHONPATH"], !existing.isEmpty {
+                env["PYTHONPATH"] = "\(srcPath):\(existing)"
+            } else {
+                env["PYTHONPATH"] = srcPath
+            }
+        }
         return env
     }
 }

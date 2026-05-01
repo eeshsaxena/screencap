@@ -39,7 +39,7 @@ struct MainWindow: View {
                         if let status = await recorder.smokeStatus() {
                             smokeStatus = "is_recording=\(status.isRecording), schema=\(status.schemaVersion)"
                         } else {
-                            smokeStatus = "(failed — see Console)"
+                            smokeStatus = "FAIL: \(recorder.lastError ?? "unknown")"
                         }
                     }
                 }
