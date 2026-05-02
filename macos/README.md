@@ -69,13 +69,17 @@ Three ways around it:
 
 ### From Xcode (recommended)
 
-**Product → Scheme → Edit Scheme → Run → Arguments → Environment Variables**, then add:
+`SCREENCAP_DEV_REPO_ROOT` is **already baked into the scheme** by `project.yml` — it resolves to `$(SRCROOT)/..` for every developer, no manual setup needed. Cmd+R just works for system-Python users.
+
+**If your `python3` isn't in the default PATH** (pyenv, brew Python, conda), CLIClient can't find it because Xcode-launched processes inherit launchd's minimal PATH (`/usr/bin:/bin:/usr/sbin:/sbin`). Add a PATH entry to the scheme manually:
+
+**Product → Scheme → Edit Scheme → Run → Arguments → Environment Variables → +**
 
 | Name | Value |
 |---|---|
-| `SCREENCAP_DEV_REPO_ROOT` | `$(SRCROOT)/..` |
+| `PATH` | `/Users/<you>/.pyenv/shims:/usr/bin:/bin` (or wherever your `python3` lives) |
 
-Now `Cmd+R` works and CLIClient finds python3 + the screencap package.
+⚠️ **This entry gets wiped on every `xcodegen generate`** — the scheme file is regenerated from `project.yml` and Xcode UI changes don't survive. PATH isn't baked into `project.yml` because it's developer-specific (pyenv vs brew vs conda live in different places) and xcodegen has no way to set a default-when-unset value. If you regenerate the project frequently, prefer the "direct binary launch" path below.
 
 ### From the terminal — direct binary launch
 

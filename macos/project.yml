@@ -67,6 +67,20 @@ schemes:
         ScreenCap: all
     run:
       config: Debug
+      # Baked into the scheme so it survives `xcodegen generate` — Xcode-UI
+      # env vars get wiped on every regen. `$(SRCROOT)/..` is Xcode's source
+      # root, portable across developers, no env var needed.
+      #
+      # PATH is intentionally NOT set here: it's developer-specific (pyenv,
+      # brew, conda all live in different places) and xcodegen has no way
+      # to leave a key out of the scheme conditionally. Users with a
+      # non-default `python3` need to add a PATH entry via Xcode's
+      # Edit Scheme UI (which gets wiped on regen — see README) or
+      # launch via `direct binary launch` from the README.
+      environmentVariables:
+        - variable: SCREENCAP_DEV_REPO_ROOT
+          value: $(SRCROOT)/..
+          isEnabled: true
     test:
       config: Debug
     profile:
