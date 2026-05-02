@@ -174,35 +174,52 @@ final class PermissionController: ObservableObject {
         microphone = Self.checkMicrophone()
     }
 
-    /// Quits the current process and spawns a fresh ScreenCap.app via
-    /// LaunchServices so the new instance reads the latest TCC state at
-    /// launch. Order matters: terminate first, then `open` after the parent
-    /// has actually exited. If we did `openApplication` first and `terminate`
-    /// from its callback, an unsigned dev build can stack multiple instances
-    /// when LaunchServices delays the terminate callback.
+    /// Quits the current process and spawns a fresh ScreenCap process so the
+    /// new instance reads the latest TCC state at launch. Order matters:
+    /// terminate first, then relaunch after the parent has actually exited.
+    /// If we relaunched first and terminated from a callback, an unsigned dev
+    /// build can stack multiple instances when the terminate callback lags.
     ///
-    /// We schedule the relaunch via `/bin/sh` and pass the bundle path as a
-    /// positional argument so spaces / metacharacters in the path bypass the
-    /// shell parser entirely. The helper polls our PID until it's gone (with
-    /// a 10 s safety cap) instead of guessing a fixed sleep — under Xcode's
-    /// LLDB attachment, `NSApp.terminate(nil)` can take noticeably longer
-    /// than 0.6 s to actually exit the process. If that cap fires we abort
-    /// the relaunch instead of forcing `open -n` against a still-live parent,
+    /// We schedule the relaunch via `/bin/sh` and pass the executable path as
+    /// a positional argument so spaces / metacharacters bypass the shell
+    /// parser entirely. The helper polls our PID until it's gone (with a 10 s
+    /// safety cap) instead of guessing a fixed sleep — under Xcode's LLDB
+    /// attachment, `NSApp.terminate(nil)` can take noticeably longer than
+    /// 0.6 s to actually exit the process. If that cap fires we abort the
+    /// relaunch instead of forcing a new instance against a still-live parent,
     /// because stacking a second instance is worse than leaving the current
     /// one up and asking the user to reopen manually.
+    ///
+    /// The relaunch uses the app binary directly, not `open -n`. That keeps
+    /// the current process environment intact for the fresh instance, which is
+    /// critical for dev runs where PATH / SCREENCAP_DEV_REPO_ROOT / pyenv
+    /// shims are only present because the app was launched from Xcode or a
+    /// shell wrapper.
     func relaunchApplication() {
         guard !isRelaunching else { return }
         isRelaunching = true
-        let bundlePath = Bundle.main.bundlePath
+        guard let executablePath = Bundle.main.executableURL?.path else {
+            isRelaunching = false
+            let alert = NSAlert()
+            alert.messageText = "Couldn't relaunch ScreenCap"
+            alert.informativeText = "Couldn't determine the app executable path. Quit and reopen ScreenCap manually to apply granted permissions."
+            alert.alertStyle = .warning
+            alert.addButton(withTitle: "OK")
+            alert.runModal()
+            return
+        }
         let parentPid = ProcessInfo.processInfo.processIdentifier
         let detach = Process()
         detach.executableURL = URL(fileURLWithPath: "/bin/sh")
+        // Preserve the current dev environment so the fresh app instance sees
+        // the same PATH / SCREENCAP_DEV_REPO_ROOT / pyenv shims after relaunch.
+        detach.environment = ProcessInfo.processInfo.environment
         detach.arguments = [
             "-c",
             Self.relaunchHelperShellScript(),
             "screencap-relaunch",     // $0
             String(parentPid),        // $1 — current process's PID
-            bundlePath,               // $2 — passed unescaped through argv
+            executablePath,           // $2 — passed unescaped through argv
         ]
         do {
             try detach.run()
@@ -298,7 +315,7 @@ final class PermissionController: ObservableObject {
         maxPollCount: Int = relaunchMaxPollCount,
         pollIntervalSeconds: Double = relaunchPollIntervalSeconds
     ) -> String {
-        "i=0; while kill -0 \"$1\" 2>/dev/null; do i=$((i+1)); [ $i -ge \(maxPollCount) ] && exit 0; sleep \(pollIntervalSeconds); done; exec /usr/bin/open -n \"$2\""
+        "i=0; while kill -0 \"$1\" 2>/dev/null; do i=$((i+1)); [ $i -ge \(maxPollCount) ] && exit 0; sleep \(pollIntervalSeconds); done; exec \"$2\""
     }
 
     private func armRelaunchWatchdog() {

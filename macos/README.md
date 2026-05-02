@@ -51,6 +51,30 @@ cd macos
 xcodebuild -project ScreenCap.xcodeproj -scheme ScreenCap -configuration Debug build
 ```
 
+## One-command dev run
+
+From the repo root:
+
+```bash
+DEVELOPMENT_TEAM=YOURTEAMID ./script/build_and_run.sh
+```
+
+This script:
+
+1. Regenerates `macos/ScreenCap.xcodeproj` from `macos/project.yml` when needed.
+2. Builds the `ScreenCap` scheme into a deterministic local DerivedData path.
+3. Launches the built app binary directly so your shell `PATH` and `SCREENCAP_DEV_REPO_ROOT` survive.
+
+Useful variants:
+
+```bash
+./script/build_and_run.sh --verify
+./script/build_and_run.sh --logs
+./script/build_and_run.sh --telemetry
+```
+
+`DEVELOPMENT_TEAM` still matters here: if it is unset, the build uses ad-hoc signing and macOS may make you re-grant Screen Recording / Accessibility / Input Monitoring after rebuilds.
+
 ## Resolving the bundled CLI
 
 `CLIClient.resolveBinary()` walks three options in order:
@@ -71,15 +95,20 @@ Three ways around it:
 
 `SCREENCAP_DEV_REPO_ROOT` is **already baked into the scheme** by `project.yml` — it resolves to `$(SRCROOT)/..` for every developer, no manual setup needed. Cmd+R just works for system-Python users.
 
-**If your `python3` isn't in the default PATH** (pyenv, brew Python, conda), CLIClient can't find it because Xcode-launched processes inherit launchd's minimal PATH (`/usr/bin:/bin:/usr/sbin:/sbin`). Add a PATH entry to the scheme manually:
+`project.yml` now bakes a common macOS dev PATH into the generated scheme:
 
-**Product → Scheme → Edit Scheme → Run → Arguments → Environment Variables → +**
+```text
+${HOME}/.pyenv/shims:/opt/homebrew/bin:/usr/local/bin:/usr/bin:/bin:/usr/sbin:/sbin
+```
 
-| Name | Value |
-|---|---|
-| `PATH` | `/Users/<you>/.pyenv/shims:/usr/bin:/bin` (or wherever your `python3` lives) |
+That covers the usual pyenv + Homebrew cases without any Xcode UI edits.
 
-⚠️ **This entry gets wiped on every `xcodegen generate`** — the scheme file is regenerated from `project.yml` and Xcode UI changes don't survive. PATH isn't baked into `project.yml` because it's developer-specific (pyenv vs brew vs conda live in different places) and xcodegen has no way to set a default-when-unset value. If you regenerate the project frequently, prefer the "direct binary launch" path below.
+If your Python still lives somewhere else, either:
+
+1. Edit the scheme PATH manually in **Product → Scheme → Edit Scheme → Run → Arguments → Environment Variables**, or
+2. Use the "direct binary launch" path below.
+
+⚠️ Manual Xcode UI edits still get wiped on every `xcodegen generate`, because the scheme is regenerated from `project.yml`.
 
 ### From the terminal — direct binary launch
 

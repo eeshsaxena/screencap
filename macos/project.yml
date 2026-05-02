@@ -84,15 +84,16 @@ schemes:
       # env vars get wiped on every regen. `$(SRCROOT)/..` is Xcode's source
       # root, portable across developers, no env var needed.
       #
-      # PATH is intentionally NOT set here: it's developer-specific (pyenv,
-      # brew, conda all live in different places) and xcodegen has no way
-      # to leave a key out of the scheme conditionally. Users with a
-      # non-default `python3` need to add a PATH entry via Xcode's
-      # Edit Scheme UI (which gets wiped on regen — see README) or
-      # launch via `direct binary launch` from the README.
+      # PATH is baked in too so Xcode-launched dev builds can resolve a real
+      # Python before falling back to the Xcode-bundled 3.9 interpreter.
+      # The common locations are harmless if absent, and `${HOME}` expands at
+      # xcodegen time per developer.
       environmentVariables:
         - variable: SCREENCAP_DEV_REPO_ROOT
           value: $(SRCROOT)/..
+          isEnabled: true
+        - variable: PATH
+          value: ${HOME}/.pyenv/shims:/opt/homebrew/bin:/usr/local/bin:/usr/bin:/bin:/usr/sbin:/sbin
           isEnabled: true
     test:
       config: Debug
