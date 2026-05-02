@@ -149,6 +149,12 @@ enum CLIClient {
         process.executableURL = executable
         process.arguments = leading + args
         process.environment = mergedEnv()
+        // /dev/null on stdin so the child's `sys.stdin.isatty()` returns false.
+        // SwiftUI is non-interactive, but Xcode's Run launches the app under
+        // LLDB which exposes a pty as stdin — without this, the inherited fd
+        // looks like a real terminal and the recorder's `if isatty(): prompt`
+        // guards bypass, blocking forever on `click.confirm` / `click.prompt`.
+        process.standardInput = FileHandle.nullDevice
 
         let stdout = Pipe()
         let stderr = Pipe()
@@ -264,6 +270,11 @@ enum CLIClient {
         process.executableURL = executable
         process.arguments = leading + args
         process.environment = mergedEnv(extra: extraEnv)
+        // /dev/null on stdin — see runOneShot for the pty-via-LLDB rationale.
+        // Critical for `screencap start` specifically: without this, prompts
+        // in the recorder init path (e.g. NLP-models confirm, scrub confirm)
+        // see isatty()=true under Xcode and block forever on stdin read.
+        process.standardInput = FileHandle.nullDevice
 
         let stdoutPipe = Pipe()
         let stderrPipe = Pipe()
@@ -337,6 +348,8 @@ enum CLIClient {
         process.executableURL = executable
         process.arguments = leading + args
         process.environment = mergedEnv()
+        // /dev/null on stdin — see runOneShot for rationale.
+        process.standardInput = FileHandle.nullDevice
         let stdout = Pipe()
         let stderr = Pipe()
         process.standardOutput = stdout
