@@ -12,9 +12,13 @@ struct MenuBarMenu: View {
         if let remaining = recorder.quitProgressSecondsRemaining {
             Text("Finalizing recording — \(remaining)s remaining")
             Divider()
-        } else if recorder.state.isRecording {
+        } else if case .recording = recorder.state {
             Button("Stop Recording") { recorder.stop() }
                 .keyboardShortcut("s", modifiers: [.command, .shift])
+        } else if recorder.state.isRecording {
+            // .starting or .stopping — surface progress, don't offer an action
+            // that would re-enter the state machine.
+            Text(recorder.state.isStopping ? "Stopping…" : "Starting…")
         } else {
             Button("Start Recording") { recorder.start() }
                 .keyboardShortcut("r", modifiers: [.command, .shift])

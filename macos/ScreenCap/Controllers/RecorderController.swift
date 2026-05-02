@@ -18,6 +18,11 @@ enum RecordingState: Equatable {
         }
     }
 
+    var isStopping: Bool {
+        if case .stopping = self { return true }
+        return false
+    }
+
     var elapsed: TimeInterval {
         if case .recording(let e) = self { return e }
         return 0
@@ -153,8 +158,14 @@ final class RecorderController: ObservableObject {
     /// In-app Stop button path. SIGTERM via `screencap stop`, await
     /// `recording_finalized` with a 30s wall-clock fallback, then transition
     /// UI to `.idle`. Background finalization continues invisibly.
+    ///
+    /// Guard is intentionally narrower than `state.isRecording`: a second
+    /// click while we're already `.stopping` would dispatch a duplicate
+    /// `screencap stop` and a second `runStop` task, and a watchdog tick
+    /// during a Cmd+Q quit would overwrite `.stopping(quitting:true)` with
+    /// `.stopping(quitting:false)` and prematurely flip state to `.idle`.
     func stop() {
-        guard state.isRecording else { return }
+        guard case .recording = state else { return }
         state = .stopping(quitting: false)
         Task { await self.runStop(quitting: false) }
     }
@@ -163,6 +174,14 @@ final class RecorderController: ObservableObject {
     /// and runs the long-wait stop policy (5min for `stopped` event).
     func confirmQuitWhileRecording() -> NSApplication.TerminateReply {
         guard state.isRecording else { return .terminateNow }
+
+        // Re-entry while a Cmd+Q quit is already in flight: do not stack a
+        // second modal or dispatch a second runStop. The in-flight task will
+        // eventually call `NSApp.reply(toApplicationShouldTerminate:)` —
+        // telling AppKit `.terminateLater` again is the correct hold reply.
+        if case .stopping(quitting: true) = state {
+            return .terminateLater
+        }
 
         let alert = NSAlert()
         alert.messageText = "Stop recording before quitting?"
@@ -218,8 +237,12 @@ final class RecorderController: ObservableObject {
 
         if quitting {
             quitProgressSecondsRemaining = nil
-            if !success, let pid = spawn?.processIdentifier, pid > 0 {
-                kill(pid, SIGKILL)
+            // Only SIGKILL if the process is still alive. `processIdentifier`
+            // returns the PID even after exit, and macOS recycles PIDs
+            // quickly — checking `isRunning` first prevents signalling an
+            // unrelated process that took the slot.
+            if !success, let s = spawn, s.isRunning, s.processIdentifier > 0 {
+                kill(s.processIdentifier, SIGKILL)
                 lastError = "Stop timed out after 5 minutes; recorder force-killed."
             }
             state = .idle
@@ -283,6 +306,11 @@ final class RecorderController: ObservableObject {
 
         switch event.type {
         case "started":
+            // Only honour the transition when we're still in `.starting`. A
+            // duplicate or out-of-order `started` arriving while we're already
+            // `.recording` or `.stopping` would otherwise regress the state
+            // machine and re-arm the elapsed timer.
+            guard case .starting = state else { return }
             recordingStartedAt = Date()
             state = .recording(elapsed: 0)
             startElapsedTimer()
@@ -291,7 +319,7 @@ final class RecorderController: ObservableObject {
             break
         case "recording_finalized":
             // Both stop policies care about this; the in-app path resolves on it.
-            resolveAll(awaitingFinalized: \.awaitingFinalized, value: true)
+            resolveAll(pending: \.awaitingFinalized, value: true)
             if event.forceStopped == true {
                 lastError = "Recording stopped, but some data may not have uploaded. Run `screencap upload` to retry."
             }
@@ -301,8 +329,8 @@ final class RecorderController: ObservableObject {
         case "disk_full":
             lastError = "Disk is full — recording stopped."
         case "stopped":
-            resolveAll(awaitingFinalized: \.awaitingFinalized, value: true)
-            resolveAll(awaitingFinalized: \.awaitingStopped, value: true)
+            resolveAll(pending: \.awaitingFinalized, value: true)
+            resolveAll(pending: \.awaitingStopped, value: true)
         default:
             break
         }
@@ -317,10 +345,17 @@ final class RecorderController: ObservableObject {
 
         // If we never saw a `stopped` event and the process is gone, resolve
         // any in-flight awaits so the caller can transition out of stopping.
-        resolveAll(awaitingFinalized: \.awaitingFinalized, value: false)
-        resolveAll(awaitingFinalized: \.awaitingStopped, value: false)
+        resolveAll(pending: \.awaitingFinalized, value: false)
+        resolveAll(pending: \.awaitingStopped, value: false)
 
-        if exitCode != 0 && exitCode != 130 /* SIGINT during shutdown */ {
+        // 0 = clean, 130 = SIGINT, 143 = SIGTERM (the engine's documented
+        // graceful-shutdown signals). Treat all three as "no error to surface."
+        // Clear any non-fatal warning carried from earlier in the session
+        // (e.g., the `forceStopped` upload-retry note) so the next session's
+        // overlay doesn't open with stale text.
+        if exitCode == 0 || exitCode == 130 || exitCode == 143 {
+            lastError = nil
+        } else {
             switch exitCode {
             case 2:
                 lastError = "ScreenCap is already recording."
@@ -340,6 +375,16 @@ final class RecorderController: ObservableObject {
     private func handlePermissionLost(event: RecorderEventLine) {
         let perm = event.permission ?? "a required permission"
         lastError = "Recording stopped: \(perm) was revoked."
+
+        // Initiate the stop BEFORE blocking on the modal, so the engine
+        // teardown proceeds in parallel with the user reading the dialog.
+        // Without this, the in-app 30s timeout in `awaitFinalizedEvent` can
+        // fire while the modal is up and report a false "still finalizing"
+        // message even though the recorder has cleanly shut down.
+        if case .recording = state {
+            stop()
+        }
+
         let alert = NSAlert()
         alert.messageText = "Permission revoked"
         alert.informativeText = "ScreenCap stopped recording because \(perm) was disabled in System Settings."
@@ -361,10 +406,10 @@ final class RecorderController: ObservableObject {
         }
     }
 
-    private func resolveAll(awaitingFinalized keyPath: ReferenceWritableKeyPath<RecorderController, [(Bool) -> Void]>, value: Bool) {
-        let pending = self[keyPath: keyPath]
+    private func resolveAll(pending keyPath: ReferenceWritableKeyPath<RecorderController, [(Bool) -> Void]>, value: Bool) {
+        let resumes = self[keyPath: keyPath]
         self[keyPath: keyPath] = []
-        for resume in pending { resume(value) }
+        for resume in resumes { resume(value) }
     }
 
     // MARK: - Timers
@@ -405,7 +450,11 @@ final class RecorderController: ObservableObject {
     }
 
     private func checkPermissionsDuringRecording() {
-        guard state.isRecording, let permissions else { return }
+        // Only act while actively recording — once we're already `.stopping`,
+        // calling `stop()` again would either be a no-op (covered by the
+        // narrowed guard in `stop()`) or, before that guard existed, would
+        // overwrite a Cmd+Q quit with an in-app stop.
+        guard case .recording = state, let permissions else { return }
         permissions.refresh()
         if !permissions.allRequiredGranted {
             // Engine-side will also detect via the black-frame check (Unit 8).

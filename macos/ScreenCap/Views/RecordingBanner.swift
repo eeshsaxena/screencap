@@ -4,6 +4,11 @@ import SwiftUI
 /// is active. Shows elapsed time + Stop button (Unit 13).
 struct RecordingBanner: View {
     @EnvironmentObject private var recorder: RecorderController
+    /// Drives the red-dot pulse. Toggled on `.onAppear` so SwiftUI sees a
+    /// value change and starts the repeating animation; reading `recorder.state`
+    /// directly produced a constant value while recording, which the animation
+    /// modifier treats as "no change" and never animates.
+    @State private var pulsing = false
 
     var body: some View {
         if recorder.state.isRecording {
@@ -11,8 +16,10 @@ struct RecordingBanner: View {
                 Circle()
                     .fill(Color.red)
                     .frame(width: 10, height: 10)
-                    .opacity(pulseOpacity)
-                    .animation(.easeInOut(duration: 1.0).repeatForever(autoreverses: true), value: pulseOpacity)
+                    .opacity(pulsing ? 1.0 : 0.35)
+                    .animation(.easeInOut(duration: 1.0).repeatForever(autoreverses: true), value: pulsing)
+                    .onAppear { pulsing = true }
+                    .onDisappear { pulsing = false }
 
                 Text(label)
                     .font(.headline)
@@ -58,11 +65,6 @@ struct RecordingBanner: View {
         case .idle:
             return ""
         }
-    }
-
-    private var pulseOpacity: Double {
-        // Toggling the value drives the repeating animation modifier above.
-        recorder.state.isRecording ? 1.0 : 0.4
     }
 
     private func format(_ seconds: TimeInterval) -> String {

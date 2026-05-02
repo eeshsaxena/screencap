@@ -19,8 +19,13 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
             object: nil,
             queue: .main
         ) { _ in
-            Task { @MainActor in
-                // Defer one tick so SwiftUI has updated `NSApp.windows`.
+            // Defer past the current run-loop cycle so AppKit has removed the
+            // closing window from `NSApp.windows`. `DispatchQueue.main.async`
+            // is guaranteed to run after the synchronous notification dispatch
+            // returns to the run loop; an unstructured `Task { @MainActor }` is
+            // not (Apple gives no FIFO guarantee relative to AppKit's internal
+            // bookkeeping).
+            DispatchQueue.main.async {
                 let visible = NSApp.windows.contains { $0.isVisible && $0.contentViewController != nil }
                 if !visible {
                     NSApp.setActivationPolicy(.accessory)
