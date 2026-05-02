@@ -11,7 +11,11 @@ settings:
     MACOSX_DEPLOYMENT_TARGET: "13.0"
     SWIFT_VERSION: "5.9"
     SWIFT_STRICT_CONCURRENCY: complete
-    DEVELOPMENT_TEAM: ""
+    # Read from env var so each developer sets their own without committing
+    # personal team IDs. Empty string falls back to ad-hoc signing — fine for
+    # `xcodebuild` from CI but causes TCC grants to drop on every Cmd+R from
+    # Xcode. See macos/README.md "One-time setup" for the recipe.
+    DEVELOPMENT_TEAM: ${DEVELOPMENT_TEAM}
     CODE_SIGN_STYLE: Automatic
 
 targets:

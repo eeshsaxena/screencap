@@ -12,11 +12,33 @@ Native SwiftUI shell that drives the bundled `screencap` CLI. Targets macOS 13+,
 
 ```bash
 cd macos
-xcodegen generate
+DEVELOPMENT_TEAM=YOURTEAMID xcodegen generate
 open ScreenCap.xcodeproj
 ```
 
 The `.xcodeproj` is generated from `project.yml` and is gitignored. Re-run `xcodegen generate` after editing `project.yml`.
+
+### One-time setup: signing identity for dev builds
+
+`project.yml` reads `DEVELOPMENT_TEAM` from the environment so each developer signs with their own Apple ID without committing personal team IDs. Find yours with:
+
+```bash
+security find-identity -v -p codesigning | grep "Apple Development" | head -1
+# Output looks like:
+#   1) ABCD1234EFGH5678IJKL "Apple Development: you@example.com (XYZ123)"
+# The team ID is the 10-char string in parentheses at the END (e.g. XYZ123).
+# To get just the team ID:
+security find-identity -v -p codesigning | grep -oE '\([A-Z0-9]{10}\)' | head -1 | tr -d '()'
+```
+
+Then either prefix every `xcodegen generate` with `DEVELOPMENT_TEAM=...`, or persist it in your shell rc:
+
+```bash
+# ~/.zshrc or ~/.bashrc
+export DEVELOPMENT_TEAM=YOURTEAMID
+```
+
+Without `DEVELOPMENT_TEAM` set, xcodegen leaves the placeholder in `project.pbxproj` and Xcode falls back to **ad-hoc signing** — fine for one-shot CLI builds, but every Cmd+R from Xcode produces a slightly different ad-hoc signature and TCC drops your Screen Recording / Accessibility / Input Monitoring grants on each rebuild. Setting `DEVELOPMENT_TEAM` keeps the signing identity stable across rebuilds so grants persist.
 
 ## Build
 
