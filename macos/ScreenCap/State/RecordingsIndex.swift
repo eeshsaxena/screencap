@@ -65,12 +65,18 @@ final class RecordingsIndex: ObservableObject {
             lastError = nil
         } catch {
             // Clear the cache even on failure so a delete-everything sweep
-            // doesn't leave stale rows on the calendar / list. Older CLIs
-            // (pre-fix) emitted plain prose for an empty archive instead of
-            // `[]`, producing a decode error here — the right state for the
-            // user is "no recordings", not "no recordings + an error toast".
+            // doesn't leave stale rows on the calendar / list. The MainWindow
+            // detail distinguishes "loading", "error", and "empty" so the
+            // user sees a banner with a Retry button instead of a misleading
+            // welcome state.
             recordings = []
             lastError = error.localizedDescription
         }
+    }
+
+    /// Lets the UI dismiss a stale error banner without triggering another
+    /// refresh. Used by the "Dismiss" button in MainWindow's error state.
+    func clearError() {
+        lastError = nil
     }
 }

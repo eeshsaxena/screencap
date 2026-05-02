@@ -12,11 +12,20 @@ struct RecordingSummary: Decodable, Identifiable, Hashable {
     let transcribed: Bool
     let uploaded: Bool
     let isStub: Bool
-    let chunksTotal: Int?
-    let chunksUploaded: Int?
+    /// Always emitted by the CLI (`RecordingInfo.chunks_total: int = 0`);
+    /// declared non-optional with a custom decode that defaults to 0 if the
+    /// field is missing on older on-disk recordings.
+    let chunksTotal: Int
+    /// Same contract as `chunksTotal`.
+    let chunksUploaded: Int
     let intent: String?
     let startedAt: Double?
     let durationSeconds: Double?
+    /// Per-source dropped-event counts (e.g. `"screen_cadence_skip": 643`).
+    /// Always emitted by the CLI but may be `null` for older recordings.
+    /// Unit 13 uses `drops?.values.reduce(0, +) ?? 0 > 0` for the row's
+    /// drop indicator.
+    let drops: [String: Int]?
 
     var id: String { name }
 
@@ -58,6 +67,25 @@ struct RecordingSummary: Decodable, Identifiable, Hashable {
         case intent
         case startedAt = "started_at"
         case durationSeconds = "duration_seconds"
+        case drops
+    }
+
+    init(from decoder: Decoder) throws {
+        let c = try decoder.container(keyedBy: CodingKeys.self)
+        name = try c.decode(String.self, forKey: .name)
+        date = try c.decode(String.self, forKey: .date)
+        duration = try c.decode(String.self, forKey: .duration)
+        sizeMB = try c.decode(String.self, forKey: .sizeMB)
+        hasAudio = try c.decode(Bool.self, forKey: .hasAudio)
+        transcribed = try c.decode(Bool.self, forKey: .transcribed)
+        uploaded = try c.decode(Bool.self, forKey: .uploaded)
+        isStub = try c.decode(Bool.self, forKey: .isStub)
+        chunksTotal = try c.decodeIfPresent(Int.self, forKey: .chunksTotal) ?? 0
+        chunksUploaded = try c.decodeIfPresent(Int.self, forKey: .chunksUploaded) ?? 0
+        intent = try c.decodeIfPresent(String.self, forKey: .intent)
+        startedAt = try c.decodeIfPresent(Double.self, forKey: .startedAt)
+        durationSeconds = try c.decodeIfPresent(Double.self, forKey: .durationSeconds)
+        drops = try c.decodeIfPresent([String: Int].self, forKey: .drops)
     }
 
     /// Newest-first comparator. Recordings without a `startedAt` sort to the

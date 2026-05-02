@@ -179,14 +179,25 @@ struct RecordingsListView: View {
 
     /// Unit 14a: shell out to `screencap view <name>`. The Python side
     /// regenerates `viewer.html` if needed and `open`s it in the default
-    /// browser. Fire-and-forget — we don't poll for completion. The `--`
-    /// separator forces Click to treat the recording name as a positional
-    /// argument even if it begins with `--`.
+    /// browser. The `--` separator forces Click to treat the recording
+    /// name as a positional argument even if it begins with `--`.
+    ///
+    /// Uses `runAwaitingExit` (not `runDetached`) so a non-zero exit
+    /// surfaces in the row alert instead of looking like a broken click.
+    /// Stub recordings (`is_stub == true`) are pre-checked: their local
+    /// media has been deleted after upload, so `screencap view` would
+    /// fail anyway — surface the friendly explanation instead.
     private func openInBrowser(_ rec: RecordingSummary) {
-        do {
-            _ = try CLIClient.runDetached(["view", "--", rec.name])
-        } catch {
-            rowError = error.localizedDescription
+        if rec.isStub {
+            rowError = "This recording was uploaded and the local copy was deleted. Run `screencap download \(rec.name)` to retrieve it."
+            return
+        }
+        Task {
+            do {
+                try await CLIClient.runAwaitingExit(["view", "--", rec.name], timeout: 15)
+            } catch {
+                await MainActor.run { rowError = error.localizedDescription }
+            }
         }
     }
 }

@@ -37,6 +37,12 @@ struct MainWindow: View {
             }
         }
         .onChange(of: section) { new in
+            // Intentionally one-directional. We only clear the date filter
+            // when leaving the recordings section, not when re-entering it
+            // from the sidebar with a stale `selectedDate`. The "Show all"
+            // breadcrumb in `RecordingsListView` provides the recovery
+            // affordance for that edge case. Revisit if friend-trial
+            // feedback shows users expect sidebar tap to clear filters.
             if new != .recordings { selectedDate = nil }
         }
     }
@@ -71,6 +77,21 @@ struct MainWindow: View {
 
     @ViewBuilder
     private var detail: some View {
+        // Three distinct states the user can be in. Without this gate the
+        // welcome state (CalendarView) would render misleadingly during
+        // first-load and after any CLI failure — both of which look like
+        // "no recordings" but mean something different.
+        if index.isLoading && index.recordings.isEmpty {
+            loadingState
+        } else if let error = index.lastError {
+            errorState(error)
+        } else {
+            sectionContent
+        }
+    }
+
+    @ViewBuilder
+    private var sectionContent: some View {
         switch section {
         case .calendar:
             CalendarView(
@@ -95,6 +116,46 @@ struct MainWindow: View {
             }
             .frame(maxWidth: .infinity, maxHeight: .infinity)
         }
+    }
+
+    private var loadingState: some View {
+        VStack(spacing: 12) {
+            ProgressView()
+                .controlSize(.large)
+            Text("Loading recordings…")
+                .foregroundStyle(.secondary)
+                .font(.callout)
+        }
+        .frame(maxWidth: .infinity, maxHeight: .infinity)
+    }
+
+    private func errorState(_ message: String) -> some View {
+        VStack(spacing: 16) {
+            Image(systemName: "exclamationmark.triangle")
+                .font(.system(size: 36))
+                .foregroundStyle(.orange)
+            Text("Couldn't load recordings")
+                .font(.headline)
+            Text(message)
+                .font(.caption)
+                .foregroundStyle(.secondary)
+                .multilineTextAlignment(.center)
+                .frame(maxWidth: 420)
+            HStack(spacing: 8) {
+                Button("Retry") {
+                    Task { await index.refresh() }
+                }
+                .buttonStyle(.borderedProminent)
+                .disabled(index.isLoading)
+
+                Button("Dismiss") {
+                    index.clearError()
+                }
+                .buttonStyle(.bordered)
+            }
+        }
+        .frame(maxWidth: .infinity, maxHeight: .infinity)
+        .padding(40)
     }
 
     private static func startOfCurrentMonth() -> Date {
