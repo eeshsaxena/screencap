@@ -242,7 +242,21 @@ final class RecorderController: ObservableObject {
         do {
             _ = try CLIClient.runDetached(["stop"])
         } catch {
-            lastError = error.localizedDescription
+            // The stop subprocess never launched — the recorder never
+            // received SIGTERM, so waiting 30s/300s for stderr events would
+            // surface a false "still finalizing" message. Bail out, roll
+            // state back, and (for Cmd+Q) tell AppKit to abort the quit so
+            // the app doesn't hang on `.terminateLater`.
+            lastError = "Failed to send stop signal: \(error.localizedDescription). Try `screencap stop` in a terminal."
+            if quitting {
+                quitProgressSecondsRemaining = nil
+                NSApp.reply(toApplicationShouldTerminate: false)
+            }
+            if state.isStopping {
+                let restoredElapsed = recordingStartedAt.map { Date().timeIntervalSince($0) } ?? 0
+                state = .recording(elapsed: restoredElapsed)
+            }
+            return
         }
 
         let timeout: TimeInterval = quitting ? 300 : 30
