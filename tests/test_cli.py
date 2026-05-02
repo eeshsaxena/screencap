@@ -42,20 +42,32 @@ def test_version():
 
 
 def test_list_empty(tmp_path):
+    """Empty archive in human (prose) mode prints "No recordings" not JSON.
+    `_should_default_to_json` is mocked False because CliRunner pipes are
+    non-TTY and would otherwise auto-flip the command into JSON mode."""
     runner = CliRunner()
-    with mock.patch("screencap.catalog.get_recordings_dir", return_value=tmp_path):
+    with mock.patch("screencap.catalog.get_recordings_dir", return_value=tmp_path), \
+         mock.patch("screencap.cli._should_default_to_json", return_value=False):
         result = runner.invoke(cli, ["list"])
         assert result.exit_code == 0
         assert "No recordings" in result.output
 
 
 def test_list_json_empty(tmp_path):
+    """`list --json` must emit a parseable empty JSON list when the archive
+    is empty. JSON consumers (e.g. the SwiftUI shell) cannot tolerate
+    Rich-styled prose like "No recordings found" — JSONDecoder throws and
+    the consumer can't tell empty-archive from a real CLI failure."""
+    import json as _json
+
     runner = CliRunner()
     with mock.patch("screencap.catalog.get_recordings_dir", return_value=tmp_path):
         result = runner.invoke(cli, ["list", "--json"])
-        assert result.exit_code == 0
-        # Empty list still outputs "No recordings" message
-        assert "No recordings" in result.output
+    assert result.exit_code == 0
+    parsed = _json.loads(result.output)
+    assert parsed == []
+
+
 def test_view_not_found(tmp_path):
     runner = CliRunner()
     with mock.patch("screencap.config.get_recordings_dir", return_value=tmp_path):

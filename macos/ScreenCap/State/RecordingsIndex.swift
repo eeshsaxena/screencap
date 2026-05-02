@@ -57,6 +57,12 @@ final class RecordingsIndex: ObservableObject {
             recordings = rows
             lastError = nil
         } catch {
+            // Clear the cache even on failure so a delete-everything sweep
+            // doesn't leave stale rows on the calendar / list. Older CLIs
+            // (pre-fix) emitted plain prose for an empty archive instead of
+            // `[]`, producing a decode error here — the right state for the
+            // user is "no recordings", not "no recordings + an error toast".
+            recordings = []
             lastError = error.localizedDescription
         }
     }

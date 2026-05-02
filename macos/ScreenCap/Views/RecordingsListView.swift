@@ -125,11 +125,13 @@ struct RecordingsListView: View {
                             Text("·")
                             Image(systemName: "waveform")
                         }
-                        if rec.isStub {
-                            Text("·")
-                            Text("incomplete")
-                                .foregroundStyle(.orange)
-                        }
+                        // `is_stub` means "uploaded; local media files have
+                        // been deleted" (see catalog.py). It is NOT the
+                        // force-stopped / incomplete-recording state that
+                        // DL-005 asks for — that signal will live on a
+                        // separate field once Unit 13 emits it. Until then
+                        // we surface no per-row indicator for incomplete
+                        // recordings rather than mislabel uploaded ones.
                     }
                     .font(.caption)
                     .foregroundStyle(.secondary)
