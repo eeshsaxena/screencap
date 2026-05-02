@@ -2,6 +2,12 @@ import AppKit
 import Combine
 import Darwin
 import Foundation
+import OSLog
+
+/// Drift-detection log for the stderr event contract with `_stderr_events.py`.
+/// Tail with: `log stream --predicate 'subsystem == "com.screencap.macos"'`.
+private let recorderLogger = Logger(subsystem: "com.screencap.macos", category: "recorder")
+private let SUPPORTED_EVENT_SCHEMA_VERSION = 1
 
 /// State machine for the recording lifecycle. Mirrors the stderr event contract
 /// from `src/screencap/_stderr_events.py` (Unit 8a).
@@ -316,6 +322,13 @@ final class RecorderController: ObservableObject {
         guard let data = trimmed.data(using: .utf8) else { return }
         guard let event = try? JSONDecoder().decode(RecorderEventLine.self, from: data) else { return }
 
+        // Schema-drift guard: warn (don't fail) so we keep working under minor
+        // additions while making major-version drift visible in Console.app.
+        // Decision on user-facing behavior for a major bump tracked separately.
+        if let v = event.schemaVersion, v != SUPPORTED_EVENT_SCHEMA_VERSION {
+            recorderLogger.warning("Unexpected schema_version \(v, privacy: .public) on stderr event \(event.type, privacy: .public). Swift parser pinned to v\(SUPPORTED_EVENT_SCHEMA_VERSION, privacy: .public).")
+        }
+
         switch event.type {
         case "started":
             // Only honour the transition when we're still in `.starting`. A
@@ -344,7 +357,11 @@ final class RecorderController: ObservableObject {
             resolveAll(pending: \.awaitingFinalized, value: true)
             resolveAll(pending: \.awaitingStopped, value: true)
         default:
-            break
+            // Active Python events the Swift consumer doesn't model (e.g.
+            // lock_contended, matrix_disclosure_required) — log so drift is
+            // detectable; the engine handles user-facing fallout via exit
+            // codes so we don't surface here.
+            recorderLogger.debug("Unhandled stderr event type: \(event.type, privacy: .public)")
         }
     }
 
