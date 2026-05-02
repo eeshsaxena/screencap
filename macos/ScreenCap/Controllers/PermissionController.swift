@@ -153,32 +153,37 @@ final class PermissionController: ObservableObject {
 
     /// Quits the current process and spawns a fresh ScreenCap.app via
     /// LaunchServices so the new instance reads the latest TCC state at
-    /// launch. Order matters: terminate first, then `open` after a short
-    /// delay. If we did `openApplication` first and `terminate` from its
-    /// callback, an unsigned dev build can stack multiple instances when
-    /// LaunchServices delays the terminate callback.
+    /// launch. Order matters: terminate first, then `open` after the parent
+    /// has actually exited. If we did `openApplication` first and `terminate`
+    /// from its callback, an unsigned dev build can stack multiple instances
+    /// when LaunchServices delays the terminate callback.
     ///
-    /// We schedule the relaunch via a detached `/usr/bin/open --args` invocation
-    /// rather than `sh -c`, so a bundle path containing spaces or shell
-    /// metacharacters is passed verbatim through arguments rather than the
-    /// shell parser. `open --wait-apps` parks the helper for ~600ms via a
-    /// short `sleep` chain — but using `Process.run()` with arguments avoids
-    /// any shell entirely.
+    /// We schedule the relaunch via `/bin/sh` and pass the bundle path as a
+    /// positional argument so spaces / metacharacters in the path bypass the
+    /// shell parser entirely. The helper polls our PID until it's gone (with
+    /// a 10 s safety cap) instead of guessing a fixed sleep — under Xcode's
+    /// LLDB attachment, `NSApp.terminate(nil)` can take noticeably longer
+    /// than 0.6 s to actually exit the process. Without the wait, `open -n`
+    /// races the dying parent and stacks a second instance.
     func relaunchApplication() {
         guard !isRelaunching else { return }
         isRelaunching = true
         let bundlePath = Bundle.main.bundlePath
-        // Two staged Processes: a `sleep 0.6` to give the kernel time to reap
-        // this process, then `open -n <bundle>`. We run them via a single
-        // /bin/sh invocation but pass the bundle path as a positional
-        // argument so $0 / "$1" carry it without shell-escape concerns.
+        let parentPid = ProcessInfo.processInfo.processIdentifier
         let detach = Process()
         detach.executableURL = URL(fileURLWithPath: "/bin/sh")
         detach.arguments = [
             "-c",
-            "sleep 0.6 && exec /usr/bin/open -n \"$1\"",
-            "screencap-relaunch", // $0
-            bundlePath,           // $1 — passed unescaped through argv
+            // Poll for the parent's PID at 100 ms intervals (kill -0 returns
+            // 0 while the process exists, non-zero once gone). Cap at 100
+            // iterations = 10 s so a stuck parent doesn't park the helper
+            // forever — past that we proceed and let LaunchServices sort it
+            // out. `open -n` always opens a new instance even if one is
+            // running, which is the correct fallback if the cap fires.
+            "i=0; while kill -0 \"$1\" 2>/dev/null; do i=$((i+1)); [ $i -ge 100 ] && break; sleep 0.1; done; exec /usr/bin/open -n \"$2\"",
+            "screencap-relaunch",     // $0
+            String(parentPid),        // $1 — current process's PID
+            bundlePath,               // $2 — passed unescaped through argv
         ]
         do {
             try detach.run()
