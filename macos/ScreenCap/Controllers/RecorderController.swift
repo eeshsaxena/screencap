@@ -139,12 +139,24 @@ final class RecorderController: ObservableObject {
         do {
             let proc = try CLIClient.spawn(
                 args: args,
+                // Use DispatchQueue.main.async (not Task { @MainActor }) for both
+                // dispatch sites: GCD's main queue is strictly FIFO, so a final
+                // `recording_finalized` line dispatched from `terminationHandler`'s
+                // drain step is guaranteed to land on MainActor before the
+                // subsequent `onTerminated` block. Mixing `Task { @MainActor }`
+                // for one side and DispatchQueue for the other gives no FIFO
+                // guarantee, allowing handleProcessTerminated to resolve the
+                // awaiting continuation with `false` before the in-flight event
+                // ran. See /rf:review finding #4.
                 onStderrLine: { [weak self] line in
-                    guard let self else { return }
-                    Task { @MainActor in self.handleStderrLine(line) }
+                    DispatchQueue.main.async {
+                        MainActor.assumeIsolated { self?.handleStderrLine(line) }
+                    }
                 },
                 onTerminated: { [weak self] exitCode in
-                    Task { @MainActor in self?.handleProcessTerminated(exitCode: exitCode) }
+                    DispatchQueue.main.async {
+                        MainActor.assumeIsolated { self?.handleProcessTerminated(exitCode: exitCode) }
+                    }
                 }
             )
             self.spawn = proc
