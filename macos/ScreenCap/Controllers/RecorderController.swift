@@ -308,6 +308,13 @@ final class RecorderController: ObservableObject {
                     continuation.resume(returning: value)
                 }
             }
+            // If the timeout path resumes the continuation first, this closure
+            // stays in the array as a no-op (the `resumed` flag prevents
+            // double-resume) until the next `resolveAll` drains it. A stop
+            // cycle that times out without any subsequent successful event
+            // would leak one closure per timeout — vanishingly rare in
+            // practice and self-cleaning on the next event. Tracked as a
+            // residual cleanup; deferred until usage shows it bites.
             self[keyPath: keyPath].append(resume)
             Task { @MainActor in
                 if quitProgressSecondsRemaining != nil {
