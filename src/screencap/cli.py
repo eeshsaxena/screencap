@@ -1067,7 +1067,12 @@ def list_cmd(as_json, sort, remote, filter_tag, filter_category):
             sys.exit(1)
 
         if not sessions:
-            console.print("[dim]No remote sessions found.[/dim]")
+            # Mirror the local empty-archive branch: JSON consumers need
+            # parseable empty list, not Rich-styled prose.
+            if as_json:
+                click.echo("[]")
+            else:
+                console.print("[dim]No remote sessions found.[/dim]")
             return
 
         if as_json:

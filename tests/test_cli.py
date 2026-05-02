@@ -66,6 +66,18 @@ def test_list_json_empty(tmp_path):
     assert parsed == []
 
 
+def test_list_json_empty_remote():
+    """Same JSON contract for the --remote empty branch. Mirrors the local
+    fix so any scripted consumer of `list --json --remote` gets parseable
+    output instead of Rich-styled prose."""
+    runner = CliRunner()
+    with mock.patch("screencap.download.list_remote_sessions", return_value=[]):
+        result = runner.invoke(cli, ["list", "--json", "--remote"])
+    assert result.exit_code == 0
+    parsed = json.loads(result.output)
+    assert parsed == []
+
+
 def test_view_not_found(tmp_path):
     runner = CliRunner()
     with mock.patch("screencap.config.get_recordings_dir", return_value=tmp_path):
