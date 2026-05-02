@@ -37,19 +37,26 @@ final class RecordingsIndex: ObservableObject {
         let target = Calendar.current.startOfDay(for: day)
         return recordings
             .filter { $0.startedDay == target }
-            .sorted { ($0.startedAt ?? 0) > ($1.startedAt ?? 0) }
+            .sorted(by: RecordingSummary.newestFirst)
     }
 
     /// Recordings grouped by calendar-day-start, sorted newest-day-first then
-    /// newest-recording-first within each day.
+    /// newest-recording-first within each day. Recordings with no resolvable
+    /// day (no `startedAt` and no parseable legacy `date` string) are dropped
+    /// — they would otherwise bucket under `Date.distantPast` and a section
+    /// header tap would navigate the calendar to ~4001 BC.
     func groupedByDay() -> [(day: Date, recordings: [RecordingSummary])] {
-        let groups = Dictionary(grouping: recordings) { $0.startedDay ?? .distantPast }
+        let groups = Dictionary(grouping: recordings.compactMap { rec -> (Date, RecordingSummary)? in
+            guard let day = rec.startedDay else { return nil }
+            return (day, rec)
+        }) { $0.0 }
         return groups
-            .map { (day: $0.key, recordings: $0.value.sorted { ($0.startedAt ?? 0) > ($1.startedAt ?? 0) }) }
+            .map { (day: $0.key, recordings: $0.value.map { $0.1 }.sorted(by: RecordingSummary.newestFirst)) }
             .sorted { $0.day > $1.day }
     }
 
     func refresh() async {
+        guard !isLoading else { return }
         isLoading = true
         defer { isLoading = false }
         do {

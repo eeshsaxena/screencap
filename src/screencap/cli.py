@@ -1124,7 +1124,7 @@ def list_cmd(as_json, sort, remote, filter_tag, filter_category):
         # parseable empty list, not Rich-styled prose. Plain-text output
         # stays for human callers.
         if as_json:
-            click.echo("[]")
+            click.echo(json.dumps([]))
         else:
             console.print("[dim]No recordings found.[/dim]")
         return

@@ -159,10 +159,14 @@ struct CalendarView: View {
 
     // MARK: - Month math
 
+    private static let monthTitleFormatter: DateFormatter = {
+        let f = DateFormatter()
+        f.dateFormat = "MMMM yyyy"
+        return f
+    }()
+
     private var monthTitle: String {
-        let formatter = DateFormatter()
-        formatter.dateFormat = "MMMM yyyy"
-        return formatter.string(from: visibleMonth)
+        Self.monthTitleFormatter.string(from: visibleMonth)
     }
 
     private var isCurrentOrFutureMonth: Bool {

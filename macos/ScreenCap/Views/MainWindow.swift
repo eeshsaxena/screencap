@@ -11,9 +11,9 @@ struct MainWindow: View {
     @EnvironmentObject private var permissions: PermissionController
     @EnvironmentObject private var index: RecordingsIndex
 
-    enum Section: Hashable { case calendar, recordings, privacy }
+    enum SidebarSection: Hashable { case calendar, recordings, privacy }
 
-    @State private var section: Section = .calendar
+    @State private var section: SidebarSection = .calendar
     @State private var selectedDate: Date?
     @State private var visibleMonth: Date = startOfCurrentMonth()
     @State private var showingPermissionsSheet = false
@@ -24,7 +24,6 @@ struct MainWindow: View {
         } detail: {
             detail
         }
-        .frame(minWidth: 880, minHeight: 560)
         .sheet(isPresented: $showingPermissionsSheet) {
             FirstRunPermissionsView(isPresented: $showingPermissionsSheet)
                 .environmentObject(permissions)
@@ -44,13 +43,13 @@ struct MainWindow: View {
 
     private var sidebar: some View {
         List(selection: $section) {
-            NavigationLink(value: Section.calendar) {
+            NavigationLink(value: SidebarSection.calendar) {
                 Label("Calendar", systemImage: "calendar")
             }
-            NavigationLink(value: Section.recordings) {
+            NavigationLink(value: SidebarSection.recordings) {
                 Label("Recordings", systemImage: "list.bullet.rectangle")
             }
-            NavigationLink(value: Section.privacy) {
+            NavigationLink(value: SidebarSection.privacy) {
                 Label("Privacy", systemImage: "lock.shield")
             }
             .disabled(true)

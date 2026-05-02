@@ -59,4 +59,10 @@ struct RecordingSummary: Decodable, Identifiable, Hashable {
         case startedAt = "started_at"
         case durationSeconds = "duration_seconds"
     }
+
+    /// Newest-first comparator. Recordings without a `startedAt` sort to the
+    /// end (treated as 0). Used by `RecordingsIndex` and `RecordingsListView`.
+    static func newestFirst(_ a: RecordingSummary, _ b: RecordingSummary) -> Bool {
+        (a.startedAt ?? 0) > (b.startedAt ?? 0)
+    }
 }

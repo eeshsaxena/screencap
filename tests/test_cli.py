@@ -58,13 +58,11 @@ def test_list_json_empty(tmp_path):
     is empty. JSON consumers (e.g. the SwiftUI shell) cannot tolerate
     Rich-styled prose like "No recordings found" — JSONDecoder throws and
     the consumer can't tell empty-archive from a real CLI failure."""
-    import json as _json
-
     runner = CliRunner()
     with mock.patch("screencap.catalog.get_recordings_dir", return_value=tmp_path):
         result = runner.invoke(cli, ["list", "--json"])
     assert result.exit_code == 0
-    parsed = _json.loads(result.output)
+    parsed = json.loads(result.output)
     assert parsed == []
 
 

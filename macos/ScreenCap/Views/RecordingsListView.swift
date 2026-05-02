@@ -22,6 +22,11 @@ struct RecordingsListView: View {
             Divider()
             content
         }
+        .alert("Failed to open recording", isPresented: errorBinding) {
+            Button("OK") { rowError = nil }
+        } message: {
+            Text(rowError ?? "")
+        }
     }
 
     private var header: some View {
@@ -146,11 +151,6 @@ struct RecordingsListView: View {
             .contentShape(Rectangle())
         }
         .buttonStyle(.plain)
-        .alert("Failed to open recording", isPresented: errorBinding) {
-            Button("OK") { rowError = nil }
-        } message: {
-            Text(rowError ?? "")
-        }
     }
 
     private var errorBinding: Binding<Bool> {
@@ -164,21 +164,27 @@ struct RecordingsListView: View {
         if let day = filterDay {
             return index.recordings(on: day)
         }
-        return index.recordings.sorted { ($0.startedAt ?? 0) > ($1.startedAt ?? 0) }
+        return index.recordings.sorted(by: RecordingSummary.newestFirst)
     }
 
+    private static let longDateFormatter: DateFormatter = {
+        let f = DateFormatter()
+        f.dateStyle = .full
+        return f
+    }()
+
     private func longFormat(_ day: Date) -> String {
-        let formatter = DateFormatter()
-        formatter.dateStyle = .full
-        return formatter.string(from: day)
+        Self.longDateFormatter.string(from: day)
     }
 
     /// Unit 14a: shell out to `screencap view <name>`. The Python side
     /// regenerates `viewer.html` if needed and `open`s it in the default
-    /// browser. Fire-and-forget — we don't poll for completion.
+    /// browser. Fire-and-forget — we don't poll for completion. The `--`
+    /// separator forces Click to treat the recording name as a positional
+    /// argument even if it begins with `--`.
     private func openInBrowser(_ rec: RecordingSummary) {
         do {
-            _ = try CLIClient.runDetached(["view", rec.name])
+            _ = try CLIClient.runDetached(["view", "--", rec.name])
         } catch {
             rowError = error.localizedDescription
         }
