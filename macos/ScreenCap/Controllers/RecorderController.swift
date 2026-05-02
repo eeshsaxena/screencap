@@ -323,10 +323,11 @@ final class RecorderController: ObservableObject {
     }
 
     private func tickQuitProgress(totalSeconds: Int) async {
-        for remaining in stride(from: totalSeconds, through: 0, by: -1) {
-            if quitProgressSecondsRemaining == nil { return }
+        await QuitProgressCountdown.run(totalSeconds: totalSeconds) { remaining in
+            guard quitProgressSecondsRemaining != nil else { return }
             quitProgressSecondsRemaining = remaining
-            try? await Task.sleep(nanoseconds: 1_000_000_000)
+        } sleep: {
+            try await Task.sleep(nanoseconds: 1_000_000_000)
         }
     }
 
@@ -394,12 +395,14 @@ final class RecorderController: ObservableObject {
         resolveAll(pending: \.awaitingStopped, value: false)
 
         // 0 = clean, 130 = SIGINT, 143 = SIGTERM (the engine's documented
-        // graceful-shutdown signals). Treat all three as "no error to surface."
-        // Clear any non-fatal warning carried from earlier in the session
-        // (e.g., the `forceStopped` upload-retry note) so the next session's
-        // overlay doesn't open with stale text.
+        // graceful-shutdown signals). Treat all three as "no new terminal
+        // error to surface." Intentionally preserve any warning already set
+        // earlier in this session (for example the `forceStopped`
+        // upload-retry note from `recording_finalized`) so the user can still
+        // see it after the process exits. `start()` clears stale messages when
+        // a new recording begins.
         if exitCode == 0 || exitCode == 130 || exitCode == 143 {
-            lastError = nil
+            // Keep any prior user-facing warning.
         } else {
             switch exitCode {
             case 2:
@@ -510,3 +513,25 @@ final class RecorderController: ObservableObject {
         }
     }
 }
+
+#if DEBUG
+extension RecorderController {
+    func _testSetPresentation(
+        state: RecordingState = .idle,
+        lastError: String? = nil,
+        quitProgressSecondsRemaining: Int? = nil
+    ) {
+        self.state = state
+        self.lastError = lastError
+        self.quitProgressSecondsRemaining = quitProgressSecondsRemaining
+    }
+
+    func _testHandleStderrLine(_ line: String) {
+        handleStderrLine(line)
+    }
+
+    func _testHandleProcessTerminated(exitCode: Int32) {
+        handleProcessTerminated(exitCode: exitCode)
+    }
+}
+#endif

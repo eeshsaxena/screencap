@@ -30,8 +30,7 @@ struct MainWindow: View {
             }
             .overlay(alignment: .top) {
                 if let err = recorder.lastError {
-                    Text(err)
-                        .font(.caption)
+                    RecorderErrorMessage(message: err)
                         .padding(8)
                         .background(.red.opacity(0.15), in: RoundedRectangle(cornerRadius: 6))
                         .padding(.top, 4)

@@ -24,6 +24,11 @@ struct MenuBarMenu: View {
                 .keyboardShortcut("r", modifiers: [.command, .shift])
         }
 
+        if let err = recorder.lastError {
+            Divider()
+            RecorderErrorMessage(message: err)
+        }
+
         Divider()
 
         Button("Open ScreenCap") { openMainWindow() }

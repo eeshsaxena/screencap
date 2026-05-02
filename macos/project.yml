@@ -60,11 +60,24 @@ targets:
         basedOnDependencyAnalysis: false
         showEnvVarsInLog: false
 
+  ScreenCapTests:
+    type: bundle.unit-test
+    platform: macOS
+    sources:
+      - path: ScreenCapTests
+    dependencies:
+      - target: ScreenCap
+    settings:
+      base:
+        PRODUCT_BUNDLE_IDENTIFIER: com.screencap.macos.tests
+        GENERATE_INFOPLIST_FILE: YES
+
 schemes:
   ScreenCap:
     build:
       targets:
         ScreenCap: all
+        ScreenCapTests: [test]
     run:
       config: Debug
       # Baked into the scheme so it survives `xcodegen generate` — Xcode-UI
@@ -83,6 +96,8 @@ schemes:
           isEnabled: true
     test:
       config: Debug
+      targets:
+        - name: ScreenCapTests
     profile:
       config: Release
     analyze:

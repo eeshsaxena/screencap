@@ -94,8 +94,15 @@ final class PermissionController: ObservableObject {
     /// multiple new instances.
     @Published private(set) var isRelaunching: Bool = false
 
+    nonisolated private static let relaunchMaxPollCount = 100
+    nonisolated private static let relaunchPollIntervalSeconds = 0.1
+    // Give the detached helper's 10 s poll budget one extra second to either
+    // open the replacement app or time out before we re-enable the UI.
+    nonisolated private static let relaunchWatchdogDelayNanoseconds: UInt64 = 11_000_000_000
+
     private var pollTimer: Timer?
     private var workspaceObserver: NSObjectProtocol?
+    private var relaunchWatchdog: Task<Void, Never>?
 
     var allRequiredGranted: Bool {
         screenRecording == .granted
@@ -122,6 +129,7 @@ final class PermissionController: ObservableObject {
         // thread calls in practice, but the compiler is strict for a reason.)
         MainActor.assumeIsolated {
             pollTimer?.invalidate()
+            relaunchWatchdog?.cancel()
             if let workspaceObserver {
                 NSWorkspace.shared.notificationCenter.removeObserver(workspaceObserver)
             }
@@ -178,8 +186,10 @@ final class PermissionController: ObservableObject {
     /// shell parser entirely. The helper polls our PID until it's gone (with
     /// a 10 s safety cap) instead of guessing a fixed sleep — under Xcode's
     /// LLDB attachment, `NSApp.terminate(nil)` can take noticeably longer
-    /// than 0.6 s to actually exit the process. Without the wait, `open -n`
-    /// races the dying parent and stacks a second instance.
+    /// than 0.6 s to actually exit the process. If that cap fires we abort
+    /// the relaunch instead of forcing `open -n` against a still-live parent,
+    /// because stacking a second instance is worse than leaving the current
+    /// one up and asking the user to reopen manually.
     func relaunchApplication() {
         guard !isRelaunching else { return }
         isRelaunching = true
@@ -189,13 +199,7 @@ final class PermissionController: ObservableObject {
         detach.executableURL = URL(fileURLWithPath: "/bin/sh")
         detach.arguments = [
             "-c",
-            // Poll for the parent's PID at 100 ms intervals (kill -0 returns
-            // 0 while the process exists, non-zero once gone). Cap at 100
-            // iterations = 10 s so a stuck parent doesn't park the helper
-            // forever — past that we proceed and let LaunchServices sort it
-            // out. `open -n` always opens a new instance even if one is
-            // running, which is the correct fallback if the cap fires.
-            "i=0; while kill -0 \"$1\" 2>/dev/null; do i=$((i+1)); [ $i -ge 100 ] && break; sleep 0.1; done; exec /usr/bin/open -n \"$2\"",
+            Self.relaunchHelperShellScript(),
             "screencap-relaunch",     // $0
             String(parentPid),        // $1 — current process's PID
             bundlePath,               // $2 — passed unescaped through argv
@@ -214,6 +218,7 @@ final class PermissionController: ObservableObject {
             alert.runModal()
             return
         }
+        armRelaunchWatchdog()
         NSApp.terminate(nil)
     }
 
@@ -286,6 +291,32 @@ final class PermissionController: ObservableObject {
         case .denied, .restricted: return .denied
         case .notDetermined:     return .notDetermined
         @unknown default:        return .notDetermined
+        }
+    }
+
+    nonisolated static func relaunchHelperShellScript(
+        maxPollCount: Int = relaunchMaxPollCount,
+        pollIntervalSeconds: Double = relaunchPollIntervalSeconds
+    ) -> String {
+        "i=0; while kill -0 \"$1\" 2>/dev/null; do i=$((i+1)); [ $i -ge \(maxPollCount) ] && exit 0; sleep \(pollIntervalSeconds); done; exec /usr/bin/open -n \"$2\""
+    }
+
+    private func armRelaunchWatchdog() {
+        relaunchWatchdog?.cancel()
+        relaunchWatchdog = Task { @MainActor [weak self] in
+            try? await Task.sleep(nanoseconds: Self.relaunchWatchdogDelayNanoseconds)
+            guard let self, self.isRelaunching else { return }
+
+            isRelaunching = false
+
+            let alert = NSAlert()
+            alert.messageText = "ScreenCap is still running"
+            alert.informativeText =
+                "A new instance was not opened because the current app never finished quitting. Quit and reopen ScreenCap manually to apply granted permissions."
+            alert.alertStyle = .warning
+            alert.addButton(withTitle: "OK")
+            NSApp.activate(ignoringOtherApps: true)
+            alert.runModal()
         }
     }
 }
