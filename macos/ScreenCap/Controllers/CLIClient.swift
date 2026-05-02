@@ -112,7 +112,38 @@ enum CLIClient {
     /// users can exceed the default 64KB pipe buffer, which would deadlock
     /// the child if we waited for exit before reading. A separate timeout
     /// task SIGTERMs the process if it overruns the deadline.
+    ///
+    /// Callers must pass `--json` explicitly. The CLI auto-detects non-TTY
+    /// stdout and flips into JSON mode today, but that's a coincidence of
+    /// the implementation we should not rely on — a future CLI refactor
+    /// (or a Rich-styled debug pane upstream) would silently start sending
+    /// prose and `JSONDecoder` would reject it.
     static func runJSON<T: Decodable>(_ args: [String], timeout: TimeInterval = 10) async throws -> T {
+        assert(args.contains("--json"), "runJSON requires the caller to pass --json explicitly; relying on TTY auto-detect is fragile. args=\(args)")
+        let (stdoutBytes, stderrBytes) = try await runOneShot(args, timeout: timeout)
+        do {
+            return try JSONDecoder().decode(T.self, from: stdoutBytes)
+        } catch {
+            let raw = String(data: stdoutBytes, encoding: .utf8) ?? "<binary>"
+            // stderr may carry a hint even on JSON-decode failure paths.
+            _ = stderrBytes
+            throw CLIError.decode(underlying: error, raw: raw)
+        }
+    }
+
+    /// Runs a one-shot CLI command, awaits exit, and throws on non-zero.
+    /// Used for shell-outs the user expects to "just work" (e.g.
+    /// `screencap view <name>` from a row click) where a silent failure
+    /// would look like a broken click.
+    static func runAwaitingExit(_ args: [String], timeout: TimeInterval = 10) async throws {
+        _ = try await runOneShot(args, timeout: timeout)
+    }
+
+    /// Spawn + drain + race timeout. Returns (stdout, stderr); throws on
+    /// launch failure, timeout, or non-zero exit. Shared backbone for
+    /// `runJSON` and `runAwaitingExit` so the timeout / pipe-drain logic
+    /// only lives in one place.
+    private static func runOneShot(_ args: [String], timeout: TimeInterval) async throws -> (Data, Data) {
         let (executable, leading) = try resolveBinary()
         let process = Process()
         process.executableURL = executable
@@ -153,12 +184,7 @@ enum CLIClient {
             throw CLIError.nonZeroExit(code: exitCode, stderr: errText)
         }
 
-        do {
-            return try JSONDecoder().decode(T.self, from: stdoutBytes)
-        } catch {
-            let raw = String(data: stdoutBytes, encoding: .utf8) ?? "<binary>"
-            throw CLIError.decode(underlying: error, raw: raw)
-        }
+        return (stdoutBytes, stderrBytes)
     }
 
     /// Reads `handle` to EOF on a background queue. The continuation resumes

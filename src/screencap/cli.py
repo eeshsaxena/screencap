@@ -1067,7 +1067,12 @@ def list_cmd(as_json, sort, remote, filter_tag, filter_category):
             sys.exit(1)
 
         if not sessions:
-            console.print("[dim]No remote sessions found.[/dim]")
+            # Mirror the local empty-archive branch: JSON consumers need
+            # parseable empty list, not Rich-styled prose.
+            if as_json:
+                click.echo("[]")
+            else:
+                console.print("[dim]No remote sessions found.[/dim]")
             return
 
         if as_json:
@@ -1120,7 +1125,13 @@ def list_cmd(as_json, sort, remote, filter_tag, filter_category):
     recordings = list_recordings()
 
     if not recordings:
-        console.print("[dim]No recordings found.[/dim]")
+        # JSON consumers (e.g. the SwiftUI shell's RecordingsIndex) need a
+        # parseable empty list, not Rich-styled prose. Plain-text output
+        # stays for human callers.
+        if as_json:
+            click.echo(json.dumps([]))
+        else:
+            console.print("[dim]No recordings found.[/dim]")
         return
 
     # Sort

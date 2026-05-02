@@ -1,67 +1,29 @@
 import SwiftUI
 
-/// Top-level window content. Unit 9 ships a placeholder; Unit 11 swaps in the
-/// calendar view, Unit 12 adds the recordings list, and Unit 13 layers in the
-/// recording banner.
+/// Top-level window content. Sidebar (Calendar / Recordings / Privacy) +
+/// detail area. Calendar is the default. Calendar day click filters the
+/// recordings list to that day; "Show all" clears the filter. Privacy is a
+/// stub until Unit 18.
+///
+/// Unit 13 will overlay a recording banner on the detail area.
 struct MainWindow: View {
     @EnvironmentObject private var recorder: RecorderController
     @EnvironmentObject private var permissions: PermissionController
+    @EnvironmentObject private var index: RecordingsIndex
 
+    enum SidebarSection: Hashable { case calendar, recordings, privacy }
+
+    @State private var section: SidebarSection = .calendar
+    @State private var selectedDate: Date?
+    @State private var visibleMonth: Date = startOfCurrentMonth()
     @State private var showingPermissionsSheet = false
-    @State private var smokeStatus: String = "—"
 
     var body: some View {
-        VStack(spacing: 16) {
-            HStack {
-                Image(systemName: "record.circle")
-                    .font(.system(size: 32))
-                    .foregroundStyle(.secondary)
-                VStack(alignment: .leading) {
-                    Text("ScreenCap")
-                        .font(.title2.bold())
-                    Text("Native macOS UI — Unit 9 scaffolding")
-                        .font(.caption)
-                        .foregroundStyle(.secondary)
-                }
-                Spacer()
-            }
-
-            Divider()
-
-            VStack(alignment: .leading, spacing: 8) {
-                Text("CLI smoke test")
-                    .font(.headline)
-                Text(smokeStatus)
-                    .font(.system(.body, design: .monospaced))
-                    .foregroundStyle(.secondary)
-                Button("Run `screencap status --json`") {
-                    Task {
-                        if let status = await recorder.smokeStatus() {
-                            smokeStatus = "is_recording=\(status.isRecording), schema=\(status.schemaVersion)"
-                        } else {
-                            smokeStatus = "FAIL: \(recorder.lastError ?? "unknown")"
-                        }
-                    }
-                }
-            }
-
-            Divider()
-
-            VStack(alignment: .leading, spacing: 8) {
-                Text("Permissions")
-                    .font(.headline)
-                permissionRow("Screen Recording", status: permissions.screenRecording)
-                permissionRow("Accessibility",    status: permissions.accessibility)
-                permissionRow("Input Monitoring", status: permissions.inputMonitoring)
-                permissionRow("Microphone",       status: permissions.microphone)
-                Button("Open permissions walkthrough") {
-                    showingPermissionsSheet = true
-                }
-            }
-
-            Spacer()
+        NavigationSplitView {
+            sidebar
+        } detail: {
+            detail
         }
-        .padding(24)
         .sheet(isPresented: $showingPermissionsSheet) {
             FirstRunPermissionsView(isPresented: $showingPermissionsSheet)
                 .environmentObject(permissions)
@@ -74,18 +36,130 @@ struct MainWindow: View {
                 showingPermissionsSheet = true
             }
         }
+        .onChange(of: section) { new in
+            // Intentionally one-directional. We only clear the date filter
+            // when leaving the recordings section, not when re-entering it
+            // from the sidebar with a stale `selectedDate`. The "Show all"
+            // breadcrumb in `RecordingsListView` provides the recovery
+            // affordance for that edge case. Revisit if friend-trial
+            // feedback shows users expect sidebar tap to clear filters.
+            if new != .recordings { selectedDate = nil }
+        }
+    }
+
+    private var sidebar: some View {
+        List(selection: $section) {
+            NavigationLink(value: SidebarSection.calendar) {
+                Label("Calendar", systemImage: "calendar")
+            }
+            NavigationLink(value: SidebarSection.recordings) {
+                Label("Recordings", systemImage: "list.bullet.rectangle")
+            }
+            NavigationLink(value: SidebarSection.privacy) {
+                Label("Privacy", systemImage: "lock.shield")
+            }
+            .disabled(true)
+        }
+        .listStyle(.sidebar)
+        .frame(minWidth: 180)
+        .navigationTitle("ScreenCap")
+        .toolbar {
+            ToolbarItem(placement: .primaryAction) {
+                Button {
+                    Task { await index.refresh() }
+                } label: {
+                    Image(systemName: "arrow.clockwise")
+                }
+                .help("Refresh recordings")
+            }
+        }
     }
 
     @ViewBuilder
-    private func permissionRow(_ name: String, status: PermissionStatus) -> some View {
-        HStack {
-            Image(systemName: status.isGranted ? "checkmark.circle.fill" : "xmark.circle.fill")
-                .foregroundStyle(status.isGranted ? .green : .red)
-            Text(name)
-            Spacer()
-            Text(status.isGranted ? "Granted" : "Not granted")
-                .foregroundStyle(.secondary)
-                .font(.caption)
+    private var detail: some View {
+        // Three distinct states the user can be in. Without this gate the
+        // welcome state (CalendarView) would render misleadingly during
+        // first-load and after any CLI failure — both of which look like
+        // "no recordings" but mean something different.
+        if index.isLoading && index.recordings.isEmpty {
+            loadingState
+        } else if let error = index.lastError {
+            errorState(error)
+        } else {
+            sectionContent
         }
+    }
+
+    @ViewBuilder
+    private var sectionContent: some View {
+        switch section {
+        case .calendar:
+            CalendarView(
+                selectedDate: $selectedDate,
+                visibleMonth: $visibleMonth
+            ) { day in
+                selectedDate = day
+                section = .recordings
+            }
+        case .recordings:
+            RecordingsListView(filterDay: $selectedDate) { day in
+                selectedDate = nil
+                visibleMonth = day
+                section = .calendar
+            }
+        case .privacy:
+            VStack {
+                Text("Privacy")
+                    .font(.title2.bold())
+                Text("Coming in Unit 18.")
+                    .foregroundStyle(.secondary)
+            }
+            .frame(maxWidth: .infinity, maxHeight: .infinity)
+        }
+    }
+
+    private var loadingState: some View {
+        VStack(spacing: 12) {
+            ProgressView()
+                .controlSize(.large)
+            Text("Loading recordings…")
+                .foregroundStyle(.secondary)
+                .font(.callout)
+        }
+        .frame(maxWidth: .infinity, maxHeight: .infinity)
+    }
+
+    private func errorState(_ message: String) -> some View {
+        VStack(spacing: 16) {
+            Image(systemName: "exclamationmark.triangle")
+                .font(.system(size: 36))
+                .foregroundStyle(.orange)
+            Text("Couldn't load recordings")
+                .font(.headline)
+            Text(message)
+                .font(.caption)
+                .foregroundStyle(.secondary)
+                .multilineTextAlignment(.center)
+                .frame(maxWidth: 420)
+            HStack(spacing: 8) {
+                Button("Retry") {
+                    Task { await index.refresh() }
+                }
+                .buttonStyle(.borderedProminent)
+                .disabled(index.isLoading)
+
+                Button("Dismiss") {
+                    index.clearError()
+                }
+                .buttonStyle(.bordered)
+            }
+        }
+        .frame(maxWidth: .infinity, maxHeight: .infinity)
+        .padding(40)
+    }
+
+    private static func startOfCurrentMonth() -> Date {
+        let comps = Calendar.current.dateComponents([.year, .month], from: Date())
+        return Calendar.current.date(from: comps) ?? Date()
     }
 }

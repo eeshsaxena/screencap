@@ -58,6 +58,15 @@ final class RecorderController: ObservableObject {
     @Published private(set) var state: RecordingState = .idle
     @Published private(set) var lastError: String?
 
+    private weak var index: RecordingsIndex?
+
+    /// Allows Unit 13's `recording_finalized` handler to refresh the cached
+    /// recordings list without owning a strong reference. Wired up by
+    /// `ScreenCapApp` on first appear.
+    func bindIndex(_ index: RecordingsIndex) {
+        self.index = index
+    }
+
     /// Surface used by MenuBarMenu / MainWindow Start buttons. Wired up in Unit 13.
     func start(name: String? = nil) {
         // Implemented in Unit 13.
