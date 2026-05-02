@@ -37,8 +37,13 @@ struct RecordingBanner: View {
                     .buttonStyle(.borderedProminent)
                     .tint(.red)
                     .disabled({
-                        if case .stopping = recorder.state { return true }
-                        return false
+                        // `stop()` only acts on `.recording`. During `.starting`
+                        // (before the `started` stderr event) and `.stopping`
+                        // (already in flight) the click would silently no-op.
+                        switch recorder.state {
+                        case .starting, .stopping: return true
+                        case .recording, .idle: return false
+                        }
                     }())
             }
             .padding(.horizontal, 16)

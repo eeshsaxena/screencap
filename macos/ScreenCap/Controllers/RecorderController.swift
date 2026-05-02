@@ -67,25 +67,15 @@ struct CLIStatus: Decodable {
 /// brick the SwiftUI parser.
 struct RecorderEventLine: Decodable {
     let type: String
-    let ts: Double?
     let schemaVersion: Int?
-    let captureDir: String?
-    let chunkIndex: Int?
     let forceStopped: Bool?
     let permission: String?
-    let exitCode: Int?
-    let error: String?
 
     enum CodingKeys: String, CodingKey {
         case type
-        case ts
         case schemaVersion = "schema_version"
-        case captureDir = "capture_dir"
-        case chunkIndex = "chunk_index"
         case forceStopped = "force_stopped"
         case permission
-        case exitCode = "exit_code"
-        case error
     }
 }
 
@@ -301,10 +291,14 @@ final class RecorderController: ObservableObject {
     ) async -> Bool {
         await withCheckedContinuation { continuation in
             var resumed = false
+            var timeoutTask: Task<Void, Never>?
             let resume: (Bool) -> Void = { value in
                 Task { @MainActor in
                     if resumed { return }
                     resumed = true
+                    // Cancel the timeout sleep so it doesn't sit for the full
+                    // 30s/300s wall-clock after a successful event.
+                    timeoutTask?.cancel()
                     continuation.resume(returning: value)
                 }
             }
@@ -316,12 +310,13 @@ final class RecorderController: ObservableObject {
             // practice and self-cleaning on the next event. Tracked as a
             // residual cleanup; deferred until usage shows it bites.
             self[keyPath: keyPath].append(resume)
-            Task { @MainActor in
+            timeoutTask = Task { @MainActor in
                 if quitProgressSecondsRemaining != nil {
                     await self.tickQuitProgress(totalSeconds: Int(timeout))
                 } else {
                     try? await Task.sleep(nanoseconds: UInt64(timeout * 1_000_000_000))
                 }
+                if Task.isCancelled { return }
                 resume(false)
             }
         }
@@ -441,18 +436,7 @@ final class RecorderController: ObservableObject {
         alert.addButton(withTitle: "Open System Settings")
         alert.addButton(withTitle: "Dismiss")
         if alert.runModal() == .alertFirstButtonReturn {
-            let pane: PrivacyPane
-            // Maps the `permission` string from `_check_permissions_now`
-            // (recorder.py): one of "screen_recording" / "accessibility" /
-            // "input_monitoring". Microphone is intentionally not polled
-            // (audio loss should not abort a video-only capture).
-            switch perm.lowercased() {
-            case let s where s.contains("screen"): pane = .screenRecording
-            case let s where s.contains("accessibility"): pane = .accessibility
-            case let s where s.contains("input"): pane = .inputMonitoring
-            default: pane = .screenRecording
-            }
-            permissions?.openSystemSettings(for: pane)
+            permissions?.openSystemSettings(for: PrivacyPane.from(permissionString: perm))
         }
     }
 
@@ -466,9 +450,14 @@ final class RecorderController: ObservableObject {
 
     private func startElapsedTimer() {
         elapsedTimer?.invalidate()
-        elapsedTimer = Timer.scheduledTimer(withTimeInterval: 1.0, repeats: true) { [weak self] _ in
-            Task { @MainActor in self?.tickElapsed() }
+        // `.common` mode keeps the elapsed clock ticking while the menu bar
+        // dropdown or any NSAlert is up. `Timer.scheduledTimer` defaults to
+        // `.default` mode, which pauses for those event-tracking modes.
+        let timer = Timer(timeInterval: 1.0, repeats: true) { [weak self] _ in
+            DispatchQueue.main.async { MainActor.assumeIsolated { self?.tickElapsed() } }
         }
+        RunLoop.main.add(timer, forMode: .common)
+        elapsedTimer = timer
     }
 
     private func tickElapsed() {
@@ -478,15 +467,22 @@ final class RecorderController: ObservableObject {
 
     private func startPermissionWatchdog() {
         stopPermissionWatchdog()
-        permissionWatchdog = Timer.scheduledTimer(withTimeInterval: 5.0, repeats: true) { [weak self] _ in
-            Task { @MainActor in self?.checkPermissionsDuringRecording() }
+        // `.common` mode for the same reason as the elapsed timer: a menu bar
+        // dropdown or NSAlert must not pause permission revocation detection.
+        let timer = Timer(timeInterval: 5.0, repeats: true) { [weak self] _ in
+            DispatchQueue.main.async { MainActor.assumeIsolated { self?.checkPermissionsDuringRecording() } }
         }
+        RunLoop.main.add(timer, forMode: .common)
+        permissionWatchdog = timer
+        // `DispatchQueue.main.async` rather than `Task { @MainActor }` to keep
+        // ordering FIFO with the stderr/termination dispatches in CLIClient —
+        // Tasks don't preserve order against GCD blocks.
         permissionObserver = NSWorkspace.shared.notificationCenter.addObserver(
             forName: NSWorkspace.didActivateApplicationNotification,
             object: nil,
             queue: .main
         ) { [weak self] _ in
-            Task { @MainActor in self?.checkPermissionsDuringRecording() }
+            DispatchQueue.main.async { MainActor.assumeIsolated { self?.checkPermissionsDuringRecording() } }
         }
     }
 

@@ -57,6 +57,21 @@ enum PrivacyPane: String, CaseIterable {
     var isRequired: Bool {
         self != .microphone
     }
+
+    /// Maps the `permission` string emitted by `_check_permissions_now`
+    /// (recorder.py) — one of `screen_recording` / `accessibility` /
+    /// `input_monitoring` — to the matching pane. Microphone is intentionally
+    /// not polled (audio loss should not abort a video-only capture). Falls
+    /// back to `.screenRecording` for unknown strings so a future Python
+    /// rename still opens *something* useful.
+    static func from(permissionString perm: String) -> PrivacyPane {
+        switch perm.lowercased() {
+        case let s where s.contains("screen"): return .screenRecording
+        case let s where s.contains("accessibility"): return .accessibility
+        case let s where s.contains("input"): return .inputMonitoring
+        default: return .screenRecording
+        }
+    }
 }
 
 enum PermissionStatus: Equatable {
