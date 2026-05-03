@@ -40,10 +40,20 @@ prepare_launch_env() {
 }
 
 warn_if_ad_hoc_signing() {
-  if [[ -z "${DEVELOPMENT_TEAM:-}" ]]; then
+  local effective_team="${DEVELOPMENT_TEAM:-}"
+  if [[ -z "$effective_team" && -f "$PROJECT_FILE/project.pbxproj" ]]; then
+    effective_team="$(sed -n 's/.*DEVELOPMENT_TEAM = \([^;]*\);.*/\1/p' "$PROJECT_FILE/project.pbxproj" | tr -d ' "' | head -n 1)"
+  fi
+
+  if [[ -z "$effective_team" ]]; then
     echo "warning: DEVELOPMENT_TEAM is not set." >&2
     echo "warning: Xcode will use ad-hoc signing, and macOS TCC permissions may reset on every rebuild." >&2
   fi
+}
+
+publish_launch_env() {
+  /bin/launchctl setenv PATH "$PATH"
+  /bin/launchctl setenv SCREENCAP_DEV_REPO_ROOT "$SCREENCAP_DEV_REPO_ROOT"
 }
 
 generate_project_if_needed() {
@@ -104,17 +114,15 @@ build_app() {
 
 launch_app() {
   prepare_launch_env
+  publish_launch_env
 
   : >"$STDOUT_LOG"
   : >"$STDERR_LOG"
 
-  "$APP_BINARY" >>"$STDOUT_LOG" 2>>"$STDERR_LOG" &
-  local pid=$!
-  disown "$pid" 2>/dev/null || true
+  /usr/bin/open -n "$APP_BUNDLE"
 
-  echo "Launched $APP_NAME (pid $pid)"
-  echo "stdout: $STDOUT_LOG"
-  echo "stderr: $STDERR_LOG"
+  echo "Launched $APP_NAME through LaunchServices."
+  echo "Logs: ./script/build_and_run.sh --logs"
 }
 
 launch_debugger() {
@@ -130,6 +138,11 @@ verify_launch() {
 
   for _ in $(seq 1 20); do
     if pgrep -x "$APP_NAME" >/dev/null 2>&1; then
+      sleep 2
+      if ! pgrep -x "$APP_NAME" >/dev/null 2>&1; then
+        echo "error: $APP_NAME exited shortly after launch." >&2
+        exit 1
+      fi
       echo "$APP_NAME is running."
       return
     fi
@@ -137,7 +150,7 @@ verify_launch() {
   done
 
   echo "error: $APP_NAME did not stay running." >&2
-  echo "error: check $STDERR_LOG for details." >&2
+  echo "error: run ./script/build_and_run.sh --logs for unified logs." >&2
   exit 1
 }
 
@@ -164,8 +177,8 @@ main() {
   # like xcodegen are found even when the script is launched from a minimal
   # GUI environment.
   prepare_launch_env
-  warn_if_ad_hoc_signing
   generate_project_if_needed
+  warn_if_ad_hoc_signing
   kill_existing_app
   build_app
 

@@ -12,13 +12,22 @@ final class PermissionControllerTests: XCTestCase {
         XCTAssertFalse(script.contains("[ $i -ge 3 ] && break"))
     }
 
-    func testRelaunchHelperExecsAppBinaryInsteadOfOpen() {
+    func testRelaunchHelperReopensAppBundleThroughLaunchServices() {
         let script = PermissionController.relaunchHelperShellScript(
             maxPollCount: 3,
             pollIntervalSeconds: 0.1
         )
 
-        XCTAssertTrue(script.contains("exec \"$2\""))
-        XCTAssertFalse(script.contains("/usr/bin/open"))
+        XCTAssertTrue(script.contains("/usr/bin/open -n \"$2\""))
+    }
+
+    func testRelaunchHelperPublishesDevEnvironmentBeforeOpeningBundle() {
+        let script = PermissionController.relaunchHelperShellScript(
+            maxPollCount: 3,
+            pollIntervalSeconds: 0.1
+        )
+
+        XCTAssertTrue(script.contains("/bin/launchctl setenv PATH \"$3\""))
+        XCTAssertTrue(script.contains("/bin/launchctl setenv SCREENCAP_DEV_REPO_ROOT \"$4\""))
     }
 }

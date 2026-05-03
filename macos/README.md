@@ -63,7 +63,7 @@ This script:
 
 1. Regenerates `macos/ScreenCap.xcodeproj` from `macos/project.yml` when needed.
 2. Builds the `ScreenCap` scheme into a deterministic local DerivedData path.
-3. Launches the built app binary directly so your shell `PATH` and `SCREENCAP_DEV_REPO_ROOT` survive.
+3. Publishes `PATH` and `SCREENCAP_DEV_REPO_ROOT` to `launchd`, then opens the signed `.app` bundle through LaunchServices so macOS permission prompts match the app shown in System Settings.
 
 Useful variants:
 
@@ -106,22 +106,19 @@ That covers the usual pyenv + Homebrew cases without any Xcode UI edits.
 If your Python still lives somewhere else, either:
 
 1. Edit the scheme PATH manually in **Product → Scheme → Edit Scheme → Run → Arguments → Environment Variables**, or
-2. Use the "direct binary launch" path below.
+2. Use the `build_and_run.sh` path below.
 
 ⚠️ Manual Xcode UI edits still get wiped on every `xcodegen generate`, because the scheme is regenerated from `project.yml`.
 
-### From the terminal — direct binary launch
+### From the terminal — LaunchServices bundle launch
 
-`open` strips env vars; running the binary directly does not:
+The dev script sets the required launchd environment, then opens the signed app bundle:
 
 ```bash
-APP_BIN=$(find ~/Library/Developer/Xcode/DerivedData -path "*/Build/Products/Debug/ScreenCap.app/Contents/MacOS/ScreenCap" -type f | head -1)
-SCREENCAP_DEV_REPO_ROOT="$(pwd)/.." \
-PATH="$HOME/.pyenv/shims:/usr/bin:/bin" \
-"$APP_BIN" >/tmp/screencap-stdout.log 2>/tmp/screencap-stderr.log &
+DEVELOPMENT_TEAM=YOURTEAMID ./script/build_and_run.sh
 ```
 
-Pipe paths PYTHONPATH for free via `mergedEnv()`.
+This is the preferred terminal path for testing TCC permissions because macOS tracks the app bundle identity shown in Privacy & Security.
 
 ### Globally (not recommended)
 
