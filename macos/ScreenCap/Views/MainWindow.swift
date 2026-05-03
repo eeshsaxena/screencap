@@ -5,7 +5,7 @@ import SwiftUI
 /// recordings list to that day; "Show all" clears the filter. Privacy is a
 /// stub until Unit 18.
 ///
-/// Unit 13 will overlay a recording banner on the detail area.
+/// Unit 13 overlays the recording banner at the top of the detail area.
 struct MainWindow: View {
     @EnvironmentObject private var recorder: RecorderController
     @EnvironmentObject private var permissions: PermissionController
@@ -22,12 +22,32 @@ struct MainWindow: View {
         NavigationSplitView {
             sidebar
         } detail: {
-            detail
+            VStack(spacing: 0) {
+                RecordingBanner()
+                    .padding(.horizontal, 16)
+                    .padding(.top, recorder.state.isRecording ? 12 : 0)
+                detail
+            }
+            .overlay(alignment: .top) {
+                if let err = recorder.lastError {
+                    RecorderErrorMessage(message: err)
+                        .padding(8)
+                        .background(.red.opacity(0.15), in: RoundedRectangle(cornerRadius: 6))
+                        .padding(.top, 4)
+                        .transition(.opacity)
+                }
+            }
         }
         .sheet(isPresented: $showingPermissionsSheet) {
             FirstRunPermissionsView(isPresented: $showingPermissionsSheet)
                 .environmentObject(permissions)
                 .environmentObject(recorder)
+        }
+        .sheet(isPresented: matrixDisclosurePresented) {
+            if let disclosure = recorder.matrixDisclosure {
+                PrivacyMatrixDisclosureView(disclosure: disclosure)
+                    .environmentObject(recorder)
+            }
         }
         .onAppear {
             // The sheet owns its own poll lifecycle (see FirstRunPermissionsView)
@@ -44,6 +64,16 @@ struct MainWindow: View {
             // affordance for that edge case. Revisit if friend-trial
             // feedback shows users expect sidebar tap to clear filters.
             if new != .recordings { selectedDate = nil }
+        }
+    }
+
+    private var matrixDisclosurePresented: Binding<Bool> {
+        Binding {
+            recorder.matrixDisclosure != nil
+        } set: { isPresented in
+            if !isPresented {
+                recorder.dismissMatrixDisclosure()
+            }
         }
     }
 
@@ -65,6 +95,9 @@ struct MainWindow: View {
         .navigationTitle("ScreenCap")
         .toolbar {
             ToolbarItem(placement: .primaryAction) {
+                recordingToolbarControl
+            }
+            ToolbarItem(placement: .primaryAction) {
                 Button {
                     Task { await index.refresh() }
                 } label: {
@@ -72,6 +105,42 @@ struct MainWindow: View {
                 }
                 .help("Refresh recordings")
             }
+        }
+    }
+
+    /// Persistent Start / Stop control in the window toolbar so the user can
+    /// reach it without going to the menu bar once the calendar is populated
+    /// (the empty-state Start button only renders when totalCount == 0).
+    /// State branches mirror MenuBarMenu so the two surfaces stay in lockstep.
+    @ViewBuilder
+    private var recordingToolbarControl: some View {
+        if recorder.quitProgressSecondsRemaining != nil {
+            // Non-actionable during a Cmd+Q-driven shutdown — the menu bar
+            // already shows the countdown line.
+            Label("Finalizing…", systemImage: "hourglass")
+                .labelStyle(.titleAndIcon)
+                .foregroundStyle(.secondary)
+        } else if case .recording = recorder.state {
+            Button {
+                recorder.stop()
+            } label: {
+                Label("Stop", systemImage: "stop.circle.fill")
+            }
+            .help("Stop recording")
+            .tint(.red)
+        } else if recorder.state.isRecording {
+            // .starting or .stopping — surface progress, don't offer an
+            // action that would re-enter the state machine.
+            Label(recorder.state.isStopping ? "Stopping…" : "Starting…", systemImage: "hourglass")
+                .labelStyle(.titleAndIcon)
+                .foregroundStyle(.secondary)
+        } else {
+            Button {
+                recorder.start()
+            } label: {
+                Label("Start", systemImage: "record.circle")
+            }
+            .help("Start a new recording")
         }
     }
 

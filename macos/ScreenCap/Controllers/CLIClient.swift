@@ -149,6 +149,12 @@ enum CLIClient {
         process.executableURL = executable
         process.arguments = leading + args
         process.environment = mergedEnv()
+        // /dev/null on stdin so the child's `sys.stdin.isatty()` returns false.
+        // SwiftUI is non-interactive, but Xcode's Run launches the app under
+        // LLDB which exposes a pty as stdin — without this, the inherited fd
+        // looks like a real terminal and the recorder's `if isatty(): prompt`
+        // guards bypass, blocking forever on `click.confirm` / `click.prompt`.
+        process.standardInput = FileHandle.nullDevice
 
         let stdout = Pipe()
         let stderr = Pipe()
@@ -251,17 +257,24 @@ enum CLIClient {
     /// Spawns a long-lived subprocess and streams stderr lines to `onStderrLine`.
     /// Used by RecorderController for `screencap start` (event contract per Unit 8a).
     /// The caller retains the returned SpawnedProcess and calls `terminate()` to stop.
+    /// `onTerminated` runs after the subprocess exits, after pipe cleanup.
     static func spawn(
         args: [String],
         extraEnv: [String: String] = [:],
         onStderrLine: @escaping @Sendable (String) -> Void,
-        onStdoutLine: (@Sendable (String) -> Void)? = nil
+        onStdoutLine: (@Sendable (String) -> Void)? = nil,
+        onTerminated: (@Sendable (Int32) -> Void)? = nil
     ) throws -> SpawnedProcess {
         let (executable, leading) = try resolveBinary()
         let process = Process()
         process.executableURL = executable
         process.arguments = leading + args
         process.environment = mergedEnv(extra: extraEnv)
+        // /dev/null on stdin — see runOneShot for the pty-via-LLDB rationale.
+        // Critical for `screencap start` specifically: without this, prompts
+        // in the recorder init path (e.g. NLP-models confirm, scrub confirm)
+        // see isatty()=true under Xcode and block forever on stdin read.
+        process.standardInput = FileHandle.nullDevice
 
         let stdoutPipe = Pipe()
         let stderrPipe = Pipe()
@@ -288,7 +301,7 @@ enum CLIClient {
             stdoutBufferOpt?.feed(data)
         }
 
-        process.terminationHandler = { _ in
+        process.terminationHandler = { proc in
             // Order matters and so does completeness:
             // 1. Nil the readabilityHandler so no further chunks dispatch.
             // 2. Drain anything still in the pipe to EOF — Apple does NOT
@@ -300,6 +313,8 @@ enum CLIClient {
             //    closed its end, so readToEnd returns immediately with
             //    whatever's buffered.
             // 3. Flush the LineBuffer (any final partial line goes out).
+            // 4. Notify the optional `onTerminated` callback with the exit
+            //    code so RecorderController can react to process exit.
             stderrPipe.fileHandleForReading.readabilityHandler = nil
             stdoutPipe.fileHandleForReading.readabilityHandler = nil
             if let remaining = try? stderrPipe.fileHandleForReading.readToEnd(),
@@ -312,6 +327,7 @@ enum CLIClient {
             }
             stderrBuffer.flush()
             stdoutBufferOpt?.flush()
+            onTerminated?(proc.terminationStatus)
         }
 
         do {
@@ -332,6 +348,8 @@ enum CLIClient {
         process.executableURL = executable
         process.arguments = leading + args
         process.environment = mergedEnv()
+        // /dev/null on stdin — see runOneShot for rationale.
+        process.standardInput = FileHandle.nullDevice
         let stdout = Pipe()
         let stderr = Pipe()
         process.standardOutput = stdout

@@ -1,22 +1,32 @@
 import AppKit
 import SwiftUI
 
-/// Menu bar dropdown. Unit 9 stubs the actions; Unit 13 wires Start/Stop to
-/// `RecorderController`. The icon swap (idle vs recording) lives in `ScreenCapApp`.
+/// Menu bar dropdown. Start / Stop bind to `RecorderController` (wired in
+/// Unit 13); icon swap (idle vs recording) lives in `ScreenCapApp`. While a
+/// Cmd+Q-driven shutdown is finalizing, the menu surfaces a countdown line
+/// instead of the Stop button so the user sees progress.
 struct MenuBarMenu: View {
     @EnvironmentObject private var recorder: RecorderController
 
     var body: some View {
-        // Recording controls are stubbed in PR1 — Unit 13 wires them up
-        // (and re-attaches Cmd+Shift+R / Cmd+Shift+S). We render them
-        // disabled so the menu doesn't present a broken action, but keep
-        // the keyboard shortcuts off until they actually do something.
-        if recorder.state.isRecording {
+        if let remaining = recorder.quitProgressSecondsRemaining {
+            Text("Finalizing recording — \(remaining)s remaining")
+            Divider()
+        } else if case .recording = recorder.state {
             Button("Stop Recording") { recorder.stop() }
-                .disabled(true)
+                .keyboardShortcut("s", modifiers: [.command, .shift])
+        } else if recorder.state.isRecording {
+            // .starting or .stopping — surface progress, don't offer an action
+            // that would re-enter the state machine.
+            Text(recorder.state.isStopping ? "Stopping…" : "Starting…")
         } else {
             Button("Start Recording") { recorder.start() }
-                .disabled(true)
+                .keyboardShortcut("r", modifiers: [.command, .shift])
+        }
+
+        if let err = recorder.lastError {
+            Divider()
+            RecorderErrorMessage(message: err)
         }
 
         Divider()

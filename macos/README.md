@@ -51,6 +51,30 @@ cd macos
 xcodebuild -project ScreenCap.xcodeproj -scheme ScreenCap -configuration Debug build
 ```
 
+## One-command dev run
+
+From the repo root:
+
+```bash
+DEVELOPMENT_TEAM=YOURTEAMID ./script/build_and_run.sh
+```
+
+This script:
+
+1. Regenerates `macos/ScreenCap.xcodeproj` from `macos/project.yml` when needed.
+2. Builds the `ScreenCap` scheme into a deterministic local DerivedData path.
+3. Publishes `PATH` and `SCREENCAP_DEV_REPO_ROOT` to `launchd`, then opens the signed `.app` bundle through LaunchServices so macOS permission prompts match the app shown in System Settings.
+
+Useful variants:
+
+```bash
+./script/build_and_run.sh --verify
+./script/build_and_run.sh --logs
+./script/build_and_run.sh --telemetry
+```
+
+`DEVELOPMENT_TEAM` still matters here: if it is unset, the build uses ad-hoc signing and macOS may make you re-grant Screen Recording / Accessibility / Input Monitoring after rebuilds.
+
 ## Resolving the bundled CLI
 
 `CLIClient.resolveBinary()` walks three options in order:
@@ -71,28 +95,30 @@ Three ways around it:
 
 `SCREENCAP_DEV_REPO_ROOT` is **already baked into the scheme** by `project.yml` — it resolves to `$(SRCROOT)/..` for every developer, no manual setup needed. Cmd+R just works for system-Python users.
 
-**If your `python3` isn't in the default PATH** (pyenv, brew Python, conda), CLIClient can't find it because Xcode-launched processes inherit launchd's minimal PATH (`/usr/bin:/bin:/usr/sbin:/sbin`). Add a PATH entry to the scheme manually:
+`project.yml` now bakes a common macOS dev PATH into the generated scheme:
 
-**Product → Scheme → Edit Scheme → Run → Arguments → Environment Variables → +**
-
-| Name | Value |
-|---|---|
-| `PATH` | `/Users/<you>/.pyenv/shims:/usr/bin:/bin` (or wherever your `python3` lives) |
-
-⚠️ **This entry gets wiped on every `xcodegen generate`** — the scheme file is regenerated from `project.yml` and Xcode UI changes don't survive. PATH isn't baked into `project.yml` because it's developer-specific (pyenv vs brew vs conda live in different places) and xcodegen has no way to set a default-when-unset value. If you regenerate the project frequently, prefer the "direct binary launch" path below.
-
-### From the terminal — direct binary launch
-
-`open` strips env vars; running the binary directly does not:
-
-```bash
-APP_BIN=$(find ~/Library/Developer/Xcode/DerivedData -path "*/Build/Products/Debug/ScreenCap.app/Contents/MacOS/ScreenCap" -type f | head -1)
-SCREENCAP_DEV_REPO_ROOT="$(pwd)/.." \
-PATH="$HOME/.pyenv/shims:/usr/bin:/bin" \
-"$APP_BIN" >/tmp/screencap-stdout.log 2>/tmp/screencap-stderr.log &
+```text
+${HOME}/.pyenv/shims:/opt/homebrew/bin:/usr/local/bin:/usr/bin:/bin:/usr/sbin:/sbin
 ```
 
-Pipe paths PYTHONPATH for free via `mergedEnv()`.
+That covers the usual pyenv + Homebrew cases without any Xcode UI edits.
+
+If your Python still lives somewhere else, either:
+
+1. Edit the scheme PATH manually in **Product → Scheme → Edit Scheme → Run → Arguments → Environment Variables**, or
+2. Use the `build_and_run.sh` path below.
+
+⚠️ Manual Xcode UI edits still get wiped on every `xcodegen generate`, because the scheme is regenerated from `project.yml`.
+
+### From the terminal — LaunchServices bundle launch
+
+The dev script sets the required launchd environment, then opens the signed app bundle:
+
+```bash
+DEVELOPMENT_TEAM=YOURTEAMID ./script/build_and_run.sh
+```
+
+This is the preferred terminal path for testing TCC permissions because macOS tracks the app bundle identity shown in Privacy & Security.
 
 ### Globally (not recommended)
 
