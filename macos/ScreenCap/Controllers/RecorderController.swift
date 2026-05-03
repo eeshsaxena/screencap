@@ -70,19 +70,33 @@ struct RecorderEventLine: Decodable {
     let schemaVersion: Int?
     let forceStopped: Bool?
     let permission: String?
+    let changes: [String]?
+    let optOutCommandExamples: [String]?
 
     enum CodingKeys: String, CodingKey {
         case type
         case schemaVersion = "schema_version"
         case forceStopped = "force_stopped"
         case permission
+        case changes
+        case optOutCommandExamples = "opt_out_command_examples"
     }
+}
+
+struct PrivacyMatrixDisclosure: Equatable, Identifiable {
+    let id = "privacy-matrix-v2026-04"
+    let changes: [String]
+    let optOutCommandExamples: [String]
 }
 
 @MainActor
 final class RecorderController: ObservableObject {
+    static let requiredPermissionsErrorMessage =
+        "Grant Screen Recording, Accessibility, and Input Monitoring permissions before recording."
+
     @Published private(set) var state: RecordingState = .idle
     @Published private(set) var lastError: String?
+    @Published private(set) var matrixDisclosure: PrivacyMatrixDisclosure?
     /// Surfaced in the menu bar dropdown during a Cmd+Q stop. Counts down
     /// from 300s while we wait for the `stopped` event.
     @Published private(set) var quitProgressSecondsRemaining: Int?
@@ -123,7 +137,7 @@ final class RecorderController: ObservableObject {
     func start(name: String? = nil) {
         guard !state.isRecording else { return }
         if let permissions, !permissions.allRequiredGranted {
-            lastError = "Grant Screen Recording and Accessibility permissions before recording."
+            lastError = Self.requiredPermissionsErrorMessage
             return
         }
         lastError = nil
@@ -219,6 +233,10 @@ final class RecorderController: ObservableObject {
             lastError = error.localizedDescription
             return nil
         }
+    }
+
+    func dismissMatrixDisclosure() {
+        matrixDisclosure = nil
     }
 
     // MARK: - Stop policy
@@ -373,11 +391,15 @@ final class RecorderController: ObservableObject {
         case "stopped":
             resolveAll(pending: \.awaitingFinalized, value: true)
             resolveAll(pending: \.awaitingStopped, value: true)
+        case "matrix_disclosure_required":
+            matrixDisclosure = PrivacyMatrixDisclosure(
+                changes: event.changes ?? [],
+                optOutCommandExamples: event.optOutCommandExamples ?? []
+            )
         default:
             // Active Python events the Swift consumer doesn't model (e.g.
-            // lock_contended, matrix_disclosure_required) — log so drift is
-            // detectable; the engine handles user-facing fallout via exit
-            // codes so we don't surface here.
+            // lock_contended) — log so drift is detectable; the engine handles
+            // user-facing fallout via exit codes so we don't surface here.
             recorderLogger.debug("Unhandled stderr event type: \(event.type, privacy: .public)")
         }
     }
@@ -524,6 +546,7 @@ extension RecorderController {
         self.state = state
         self.lastError = lastError
         self.quitProgressSecondsRemaining = quitProgressSecondsRemaining
+        self.matrixDisclosure = nil
     }
 
     func _testHandleStderrLine(_ line: String) {

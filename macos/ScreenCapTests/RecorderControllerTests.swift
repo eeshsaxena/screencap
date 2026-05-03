@@ -3,6 +3,41 @@ import XCTest
 
 @MainActor
 final class RecorderControllerTests: XCTestCase {
+    func testMatrixDisclosureEventIsCapturedForSwiftUIPresentation() {
+        let recorder = RecorderController()
+
+        recorder._testHandleStderrLine(
+            #"{"type":"matrix_disclosure_required","schema_version":1,"changes":["chat_email_calendar_video_call_mask_window"],"opt_out_command_examples":["screencap settings privacy exclude_apps add com.openai.chat"]}"#
+        )
+
+        XCTAssertEqual(
+            recorder.matrixDisclosure?.changes,
+            ["chat_email_calendar_video_call_mask_window"]
+        )
+        XCTAssertEqual(
+            recorder.matrixDisclosure?.optOutCommandExamples,
+            ["screencap settings privacy exclude_apps add com.openai.chat"]
+        )
+    }
+
+    func testDismissMatrixDisclosureClearsPresentationState() {
+        let recorder = RecorderController()
+
+        recorder._testHandleStderrLine(
+            #"{"type":"matrix_disclosure_required","schema_version":1,"changes":["ai_assistant_browser_unverified"],"opt_out_command_examples":[]}"#
+        )
+        recorder.dismissMatrixDisclosure()
+
+        XCTAssertNil(recorder.matrixDisclosure)
+    }
+
+    func testMissingPermissionsMessageNamesEveryRequiredPermission() {
+        XCTAssertEqual(
+            RecorderController.requiredPermissionsErrorMessage,
+            "Grant Screen Recording, Accessibility, and Input Monitoring permissions before recording."
+        )
+    }
+
     func testForceStoppedWarningSurvivesCleanProcessTermination() {
         let recorder = RecorderController()
 

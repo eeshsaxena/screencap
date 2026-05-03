@@ -43,6 +43,12 @@ struct MainWindow: View {
                 .environmentObject(permissions)
                 .environmentObject(recorder)
         }
+        .sheet(isPresented: matrixDisclosurePresented) {
+            if let disclosure = recorder.matrixDisclosure {
+                PrivacyMatrixDisclosureView(disclosure: disclosure)
+                    .environmentObject(recorder)
+            }
+        }
         .onAppear {
             // The sheet owns its own poll lifecycle (see FirstRunPermissionsView)
             // so MainWindow only triggers the initial visibility check here.
@@ -58,6 +64,16 @@ struct MainWindow: View {
             // affordance for that edge case. Revisit if friend-trial
             // feedback shows users expect sidebar tap to clear filters.
             if new != .recordings { selectedDate = nil }
+        }
+    }
+
+    private var matrixDisclosurePresented: Binding<Bool> {
+        Binding {
+            recorder.matrixDisclosure != nil
+        } set: { isPresented in
+            if !isPresented {
+                recorder.dismissMatrixDisclosure()
+            }
         }
     }
 
