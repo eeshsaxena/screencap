@@ -1,5 +1,22 @@
 import SwiftUI
 
+enum PermissionSheetRelaunchFlow {
+    static let sheetDismissalDelayNanoseconds: UInt64 = 350_000_000
+
+    @MainActor
+    static func dismissThenRelaunch(
+        dismiss: () -> Void,
+        relaunch: () -> Void,
+        sleep: (UInt64) async -> Void = { nanoseconds in
+            try? await Task.sleep(nanoseconds: nanoseconds)
+        }
+    ) async {
+        dismiss()
+        await sleep(sheetDismissalDelayNanoseconds)
+        relaunch()
+    }
+}
+
 /// Loom-style first-run permissions walkthrough. Three rows (Screen Recording,
 /// Accessibility, Microphone) with green/red indicators and "Open System Settings"
 /// deep links. Live polling (1Hz + workspace-activation) is owned by the
@@ -12,6 +29,7 @@ struct FirstRunPermissionsView: View {
     @EnvironmentObject private var permissions: PermissionController
     @EnvironmentObject private var recorder: RecorderController
     @Binding var isPresented: Bool
+    @State private var isPreparingRelaunch = false
 
     var body: some View {
         VStack(alignment: .leading, spacing: 20) {
@@ -57,10 +75,16 @@ struct FirstRunPermissionsView: View {
                     // recording is active (avoids racing PR3's `.terminateLater`
                     // NSAlert path against the detached `open -n` shell).
                     Button("Quit & Relaunch") {
-                        permissions.relaunchApplication()
+                        isPreparingRelaunch = true
+                        Task { @MainActor in
+                            await PermissionSheetRelaunchFlow.dismissThenRelaunch(
+                                dismiss: { isPresented = false },
+                                relaunch: { permissions.relaunchApplication() }
+                            )
+                        }
                     }
                     .buttonStyle(.bordered)
-                    .disabled(permissions.isRelaunching || recorder.state.isRecording)
+                    .disabled(isPreparingRelaunch || permissions.isRelaunching || recorder.state.isRecording)
 
                     // Always-available escape hatch. Dismisses the sheet
                     // even if the cached permission state still reads denied.

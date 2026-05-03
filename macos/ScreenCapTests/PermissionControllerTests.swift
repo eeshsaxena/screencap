@@ -2,6 +2,22 @@ import XCTest
 @testable import ScreenCap
 
 final class PermissionControllerTests: XCTestCase {
+    @MainActor
+    func testPermissionSheetDismissesBeforeRelaunching() async {
+        var events: [String] = []
+
+        await PermissionSheetRelaunchFlow.dismissThenRelaunch(
+            dismiss: { events.append("dismiss") },
+            relaunch: { events.append("relaunch") },
+            sleep: { nanoseconds in
+                XCTAssertEqual(nanoseconds, PermissionSheetRelaunchFlow.sheetDismissalDelayNanoseconds)
+                events.append("delay")
+            }
+        )
+
+        XCTAssertEqual(events, ["dismiss", "delay", "relaunch"])
+    }
+
     func testRelaunchHelperExitsOnTimeoutInsteadOfOpeningNewInstance() {
         let script = PermissionController.relaunchHelperShellScript(
             maxPollCount: 3,
