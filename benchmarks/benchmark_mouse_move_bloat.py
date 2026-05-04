@@ -103,7 +103,7 @@ def generate_synthetic_corpus(
         (action_rows, window_rows, blocked_intervals, stats)
     """
     from screencap.privacy.actions import PrivacyAction
-    from screencap.scrub_pipeline import BlockedInterval
+    from screencap.scrubber import BlockedInterval
 
     rng = random.Random(seed)
     action_rows: list[dict] = []
@@ -320,7 +320,7 @@ def run_pipeline(
     from screencap.engine.export import unified_export_events
     from screencap.exporter import build_export_metadata, write_events_jsonl
     from screencap.privacy.filter import build_cloud_window_filter
-    from screencap.scrub_pipeline import scrub_events_jsonl
+    from screencap.scrubber import scrub_events_jsonl
 
     jsonl_path = out_dir / f"events_{label}.jsonl"
     if jsonl_path.exists():

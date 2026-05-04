@@ -401,7 +401,7 @@ class TestScrubberSelectiveMasking:
         from PIL import Image
 
         from screencap.privacy.context import WindowContext
-        from screencap.scrub_pipeline import ScrubContext, ScrubResult, mask_screenshots
+        from screencap.scrubber import ScrubContext, ScrubResult, mask_screenshots
 
         screenshots_dir = tmp_path / "screenshots"
         screenshots_dir.mkdir()
@@ -450,7 +450,7 @@ class TestScrubberSelectiveMasking:
     def test_fallback_to_full_frame_without_geometry(self, tmp_path):
         """No geometry DB → MASK_WINDOW falls back to full-frame masking (not deletion)."""
         from screencap.privacy.context import WindowContext
-        from screencap.scrub_pipeline import ScrubContext, ScrubResult, mask_screenshots
+        from screencap.scrubber import ScrubContext, ScrubResult, mask_screenshots
 
         screenshots_dir = tmp_path / "screenshots"
         screenshots_dir.mkdir()
@@ -491,7 +491,7 @@ class TestBackgroundWindowMasking:
                      pixel_ratio=1.0, img_w=200, img_h=150):
         """Common setup for background masking tests."""
         from screencap.privacy.context import WindowContext
-        from screencap.scrub_pipeline import ScrubContext, ScrubResult, mask_screenshots
+        from screencap.scrubber import ScrubContext, ScrubResult, mask_screenshots
 
         screenshots_dir = tmp_path / "screenshots"
         screenshots_dir.mkdir()
@@ -603,7 +603,7 @@ class TestBackgroundWindowMasking:
     def test_allow_foreground_no_geometry_unchanged(self, tmp_path):
         """ALLOW foreground + no geometry data: screenshot kept as-is (fail-open)."""
         from screencap.privacy.context import WindowContext
-        from screencap.scrub_pipeline import ScrubContext, ScrubResult, mask_screenshots
+        from screencap.scrubber import ScrubContext, ScrubResult, mask_screenshots
 
         screenshots_dir = tmp_path / "screenshots"
         screenshots_dir.mkdir()

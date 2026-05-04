@@ -11,7 +11,7 @@ from pathlib import Path
 
 import pytest
 
-from screencap.scrub_pipeline import _pad_bbox, ocr_mask_screenshot
+from screencap.scrubber import _pad_bbox, ocr_mask_screenshot
 
 pytestmark = [
     pytest.mark.privacy,

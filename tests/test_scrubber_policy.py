@@ -29,7 +29,7 @@ from screencap.privacy.policy import (
     parse_privacy_config,
 )
 from screencap.privacy.reasons import AuditEntry
-from screencap.scrub_pipeline import (
+from screencap.scrubber import (
     BlockedInterval as _BlockedInterval,
     ScrubContext,
     ScrubResult,
@@ -324,7 +324,7 @@ class TestOcrFallbackIntegration:
         )
         # Patch ocr_mask_screenshot to simulate OCR failure
         with patch(
-            "screencap.scrub_pipeline.ocr_mask_screenshot",
+            "screencap.scrubber.ocr_mask_screenshot",
             side_effect=RuntimeError("OCR engine failed"),
         ):
             mask_screenshots(dst / "screenshots", ctx, result=result)
