@@ -436,8 +436,6 @@ class ChunkProcessor:
         else:
             self._set_status("")
 
-    # _mask_chunk_screenshots removed — replaced by scrub_pipeline.mask_screenshots()
-
     def _trigger_flush(self) -> None:
         """Trigger writer processes to flush DB buffers before event export."""
         wait_for_writer_flush(
@@ -791,103 +789,29 @@ class ChunkProcessor:
         self, idx: int, start_ts: float, end_ts: float,
         transcript_path: Path | None,
     ) -> None:
-        """Scrub text surfaces + mask screenshots using the shared pipeline.
+        """Scrub text surfaces + mask screenshots for a single chunk.
 
-        Builds a full ScrubContext (blocked intervals, secure-field intervals,
-        xref detections) then delegates to pipeline functions. Closes privacy
-        gaps G1-G6 that the old per-method approach missed.
+        Delegates to ``Scrubber.run_chunk()`` so the load-bearing step order
+        lives in one place; the chunk processor only owns lifecycle concerns
+        (which chunks to scrub, when, with what masking config).
         """
-        from screencap.scrub_pipeline import (
-            ScrubResult,
-            build_scrub_context,
-            mask_screenshots,
-            scrub_events_jsonl,
-            scrub_manifest,
-            scrub_transcripts,
-        )
+        from screencap.scrubber import Scrubber
 
-        scrub_result = ScrubResult()
-
-        # Build full scrub context: blocked intervals + xref from DB
-        ctx = build_scrub_context(
-            self._db_path,
-            self._masking_evaluator,
-            self._masking_classifier,
-            time_range=(start_ts, end_ts),
+        scrubber = Scrubber(
+            self._capture_dir,
             pipeline=self._pipeline,
             anonymizer=self._anonymizer,
+            evaluator=self._masking_evaluator,
+            classifier=self._masking_classifier,
             pixel_ratio=self._masking_pixel_ratio,
         )
+        scrub_result = scrubber.run_chunk(
+            idx=idx,
+            start_ts=start_ts,
+            end_ts=end_ts,
+            transcript_path=transcript_path,
+        )
 
-        # --- Events JSONL ---
-        events_path = self._capture_dir / f"events_{idx:04d}.jsonl"
-        if events_path.exists():
-            try:
-                had_errors = scrub_events_jsonl(
-                    events_path,
-                    self._pipeline,
-                    self._anonymizer,
-                    ctx=ctx,
-                    result=scrub_result,
-                )
-                if had_errors:
-                    _rename_scrub_failed(events_path)
-            except Exception as e:
-                logger.error(f"Chunk {idx}: events JSONL scrub failed, skipping file: {e}")
-                _rename_scrub_failed(events_path)
-
-        # --- Transcripts (.txt + .json) ---
-        transcript_paths = []
-        if transcript_path and transcript_path.exists():
-            transcript_paths.append(transcript_path)
-        transcript_json = self._capture_dir / f"transcript_{idx:04d}.json"
-        if transcript_json.exists():
-            transcript_paths.append(transcript_json)
-        if transcript_paths:
-            try:
-                scrub_transcripts(
-                    transcript_paths,
-                    self._pipeline,
-                    self._anonymizer,
-                    result=scrub_result,
-                )
-            except Exception as e:
-                logger.error(f"Chunk {idx}: transcript scrub failed: {e}")
-                for tp in transcript_paths:
-                    if tp.exists():
-                        _rename_scrub_failed(tp)
-
-        # --- Manifest ---
-        manifest_path = self._capture_dir / f"chunk_{idx:04d}_manifest.json"
-        if manifest_path.exists():
-            try:
-                scrub_manifest(
-                    manifest_path,
-                    self._pipeline,
-                    self._anonymizer,
-                    result=scrub_result,
-                )
-            except Exception as e:
-                logger.error(f"Chunk {idx}: manifest scrub failed, skipping file: {e}")
-                _rename_scrub_failed(manifest_path)
-
-        # --- Screenshots (policy-aware masking via shared pipeline) ---
-        chunk_dir = self._capture_dir / f"chunk_{idx}"
-        screenshots_dir = chunk_dir / "screenshots"
-        if screenshots_dir.is_dir() and ctx.evaluator is not None:
-            try:
-                mask_screenshots(
-                    screenshots_dir, ctx,
-                    db_path=self._db_path,
-                    result=scrub_result,
-                )
-            except Exception:
-                logger.warning(f"Screenshot masking failed for chunk {idx}", exc_info=True)
-                # Fail-closed: delete all unmasked screenshots before upload
-                for img in screenshots_dir.glob("*.jpg"):
-                    img.unlink(missing_ok=True)
-
-        # G6: Log audit entries
         if scrub_result.audit_entries:
             logger.info(
                 f"Chunk {idx}: scrubbed with {len(scrub_result.audit_entries)} audit entries"
@@ -965,15 +889,6 @@ class ChunkProcessor:
                     except OSError as e:
                         logger.warning(f"Failed to delete {path.name}: {e}")
         return freed
-
-
-def _rename_scrub_failed(path: Path) -> None:
-    """Rename a file to .scrub_failed so it's excluded from upload."""
-    try:
-        failed_path = path.with_suffix(path.suffix + ".scrub_failed")
-        path.rename(failed_path)
-    except OSError as e:
-        logger.warning(f"Failed to rename {path.name} for scrub failure: {e}")
 
 
 def _save_transcript_quiet(
