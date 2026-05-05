@@ -2498,7 +2498,9 @@ def _recover_chunk_metadata(
     ``scrub_recording`` for cloud-bound recordings before upload. The
     scrub-layer pointer suppression (Unit 2) only protects recovered
     cloud-bound JSONL when this ordering holds. The upload command's
-    ``cli.py:1614 → 1641-1646`` sequencing satisfies this. Reordering or
+    inner per-recording loop satisfies this — see the ``LOAD-BEARING
+    ORDERING`` comment block immediately preceding the
+    ``_recover_chunk_metadata`` call inside ``upload``. Reordering or
     adding a recovery path that bypasses the scrubber MUST replicate the
     in-interval ``mouse.move`` drop at the engine layer or the cloud-bound
     privacy posture silently degrades.
@@ -2862,11 +2864,11 @@ def upload(names, all_recordings, dry_run, force, jobs, no_delete):
             # forgotten argument is a TypeError, not a silent fail-OPEN.
             #
             # LOAD-BEARING ORDERING (do not reorder): this `_recover_chunk_metadata`
-            # call MUST be followed by `scrub_recording` below (lines 1782-1786).
-            # The scrub-layer pointer suppression (Unit 2) only protects recovered
-            # cloud-bound JSONL when this ordering holds. Reordering or adding a
-            # recovery path that bypasses the scrubber must replicate the
-            # in-interval mouse.move drop at the engine layer.
+            # call MUST be followed by `scrub_recording` below in the same loop
+            # iteration. The scrub-layer pointer suppression (Unit 2) only
+            # protects recovered cloud-bound JSONL when this ordering holds.
+            # Reordering or adding a recovery path that bypasses the scrubber
+            # must replicate the in-interval mouse.move drop at the engine layer.
             _recover_chunk_metadata(d, console, force=force, cloud_bound=True)
 
             # Recovery: generate sentinel file if missing (crash/force-quit recovery)

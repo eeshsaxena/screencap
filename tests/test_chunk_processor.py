@@ -283,7 +283,7 @@ class TestInlineScrubbing:
 
     def test_scrub_transcripts_txt_and_json(self, cloud_capture_dir, cloud_processor):
         """Both transcript formats must have PII replaced, including segment text."""
-        from screencap.scrub_pipeline import scrub_transcripts
+        from screencap.scrubber import scrub_transcripts
 
         txt_path = cloud_capture_dir / "transcript_0000.txt"
         txt_path.write_text("Meeting with John Smith about the project")
@@ -312,7 +312,7 @@ class TestInlineScrubbing:
 
     def test_scrub_manifest_dominant_title(self, cloud_capture_dir, cloud_processor):
         """Manifest dominant_title must be scrubbed and derived_name re-derived."""
-        from screencap.scrub_pipeline import scrub_manifest
+        from screencap.scrubber import scrub_manifest
 
         manifest_path = cloud_capture_dir / "chunk_0000_manifest.json"
         manifest_path.write_text(json.dumps({
@@ -338,7 +338,7 @@ class TestInlineScrubbing:
 
     def test_scrub_v2_manifest_skips(self, cloud_capture_dir, cloud_processor):
         """v2 manifests have no text fields — scrub should be a no-op."""
-        from screencap.scrub_pipeline import scrub_manifest
+        from screencap.scrubber import scrub_manifest
 
         manifest_path = cloud_capture_dir / "chunk_0000_manifest.json"
         original = {
@@ -363,7 +363,7 @@ class TestInlineScrubbing:
     ):
         """scrub_text must return '<SCRUB_FAILED>' when all detectors fail."""
         from screencap.privacy import AllDetectorsFailedError
-        from screencap.scrub_pipeline import scrub_text
+        from screencap.scrubber import scrub_text
 
         cloud_processor._pipeline.detect = MagicMock(
             side_effect=AllDetectorsFailedError("all failed"),
@@ -381,7 +381,7 @@ class TestInlineScrubbing:
         events_path.write_text('{"name":"click"}\n')
 
         with patch(
-            "screencap.scrub_pipeline.scrub_events_jsonl",
+            "screencap.scrubber.scrub_events_jsonl",
             side_effect=RuntimeError("simulated scrub failure"),
         ):
             cloud_processor._scrub_chunk_files(0, 1000.0, 2000.0, None)
@@ -392,7 +392,7 @@ class TestInlineScrubbing:
 
     def test_scrub_v2_key_type_anonymizes_pii(self, cloud_capture_dir, cloud_processor):
         """v2 format: key.type text with PII → anonymized, children key_char nulled."""
-        from screencap.scrub_pipeline import scrub_events_jsonl
+        from screencap.scrubber import scrub_events_jsonl
 
         events = [
             {"_meta": True, "format_version": 2},
@@ -427,7 +427,7 @@ class TestInlineScrubbing:
 
     def test_scrub_v2_key_type_leaves_clean(self, cloud_capture_dir, cloud_processor):
         """v2 format: key.type text without PII should be left unchanged."""
-        from screencap.scrub_pipeline import scrub_events_jsonl
+        from screencap.scrubber import scrub_events_jsonl
 
         events = [
             {"_meta": True, "format_version": 2},
@@ -452,7 +452,7 @@ class TestInlineScrubbing:
 
     def test_scrub_v2_key_shortcut_anonymizes_pii(self, cloud_capture_dir, cloud_processor):
         """v2 format: key.shortcut with PII → text anonymized via recursive scrub."""
-        from screencap.scrub_pipeline import scrub_events_jsonl
+        from screencap.scrubber import scrub_events_jsonl
 
         events = [
             {"_meta": True, "format_version": 2},
@@ -482,7 +482,7 @@ class TestInlineScrubbing:
 
     def test_scrub_v2_window_switch_title(self, cloud_capture_dir, cloud_processor):
         """v2 format: window.switch window_title with PII should be scrubbed."""
-        from screencap.scrub_pipeline import scrub_events_jsonl
+        from screencap.scrubber import scrub_events_jsonl
 
         events = [
             {"_meta": True, "format_version": 2},

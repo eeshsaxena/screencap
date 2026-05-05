@@ -30,7 +30,7 @@ from screencap.privacy.policy import (
     PrivacyMode,
     parse_privacy_config,
 )
-from screencap.scrub_pipeline import ScrubContext, ScrubResult, mask_screenshots
+from screencap.scrubber import ScrubContext, ScrubResult, mask_screenshots
 
 pytestmark = pytest.mark.privacy
 

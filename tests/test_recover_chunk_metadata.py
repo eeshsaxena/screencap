@@ -781,7 +781,7 @@ class TestRecoveryScrubberChain:
         """
         from screencap.cli import _recover_chunk_metadata
         from screencap.engine.db import crud
-        from screencap.scrub_pipeline import (
+        from screencap.scrubber import (
             ScrubResult,
             build_scrub_context,
             scrub_events_jsonl,

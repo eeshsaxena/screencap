@@ -7,7 +7,7 @@ import sqlite3
 
 import pytest
 
-from screencap.scrub_pipeline import (
+from screencap.scrubber import (
     ElementStateDetection as _ElementStateDetection,
     ScrubContext,
     ScrubResult,
