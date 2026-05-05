@@ -136,6 +136,7 @@ def scrub_text(
     except AllDetectorsFailedError:
         return "<SCRUB_FAILED>", None
     except Exception:
+        logger.debug("scrub_text: unexpected pipeline error", exc_info=True)
         return "<SCRUB_FAILED>", None
 
     scrubbed = anonymizer.anonymize(
@@ -1281,8 +1282,14 @@ def scrub_events_jsonl(
 
     # Atomic rename on success, clean up .tmp on error
     if had_errors:
-        if os.path.exists(tmp_path):
-            os.unlink(tmp_path)
+        try:
+            if os.path.exists(tmp_path):
+                os.unlink(tmp_path)
+        except OSError:
+            logger.warning(
+                "scrub_events_jsonl: failed to remove tmp file %s", tmp_path,
+                exc_info=True,
+            )
     else:
         os.rename(tmp_path, str(events_jsonl))
 
@@ -2141,7 +2148,11 @@ class Scrubber:
                 _rename_scrub_failed(manifest_path)
 
         screenshots_dir = self.capture_dir / f"chunk_{idx}" / "screenshots"
-        if screenshots_dir.is_dir() and ctx.evaluator is not None:
+        if (
+            screenshots_dir.is_dir()
+            and ctx.evaluator is not None
+            and ctx.classifier is not None
+        ):
             try:
                 mask_screenshots(
                     screenshots_dir, ctx,

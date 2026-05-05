@@ -8,6 +8,7 @@ functions are mocked — assertions look at directory state.
 
 from __future__ import annotations
 
+import contextlib
 import json
 import sqlite3
 from pathlib import Path
@@ -33,26 +34,25 @@ def pipeline_and_anonymizer():
 def _make_recording_with_db_pii(rec: Path, *, secret: str) -> None:
     """Create a minimal recording.db with one PII string in action_event."""
     rec.mkdir(parents=True, exist_ok=True)
-    db = sqlite3.connect(str(rec / "recording.db"))
-    db.execute("CREATE TABLE recording (id INTEGER PRIMARY KEY, task_description TEXT)")
-    db.execute("INSERT INTO recording VALUES (1, ?)", (f"Task: contact {secret}",))
-    db.execute(
-        """CREATE TABLE action_event (
-            id INTEGER PRIMARY KEY,
-            recording_id INTEGER,
-            name TEXT,
-            timestamp REAL,
-            key_char TEXT,
-            canonical_key_char TEXT,
-            key_name TEXT,
-            canonical_key_name TEXT,
-            element_state TEXT,
-            active_segment_description TEXT,
-            available_segment_descriptions TEXT
-        )"""
-    )
-    db.commit()
-    db.close()
+    with contextlib.closing(sqlite3.connect(str(rec / "recording.db"))) as db:
+        db.execute("CREATE TABLE recording (id INTEGER PRIMARY KEY, task_description TEXT)")
+        db.execute("INSERT INTO recording VALUES (1, ?)", (f"Task: contact {secret}",))
+        db.execute(
+            """CREATE TABLE action_event (
+                id INTEGER PRIMARY KEY,
+                recording_id INTEGER,
+                name TEXT,
+                timestamp REAL,
+                key_char TEXT,
+                canonical_key_char TEXT,
+                key_name TEXT,
+                canonical_key_name TEXT,
+                element_state TEXT,
+                active_segment_description TEXT,
+                available_segment_descriptions TEXT
+            )"""
+        )
+        db.commit()
 
 
 def _write_events_jsonl(rec: Path, *, key_type_text: str) -> None:
@@ -78,9 +78,8 @@ def test_run_scrubs_pii_in_recording_db(tmp_path, pipeline_and_anonymizer):
 
     Scrubber(rec, pipeline=pipeline, anonymizer=anonymizer).run()
 
-    db = sqlite3.connect(str(rec / "recording.db"))
-    row = db.execute("SELECT task_description FROM recording").fetchone()
-    db.close()
+    with contextlib.closing(sqlite3.connect(str(rec / "recording.db"))) as db:
+        row = db.execute("SELECT task_description FROM recording").fetchone()
     assert secret not in row[0]
 
 
@@ -158,66 +157,65 @@ def _make_recording_with_blocked_interval(
     interval with a benign editor app on either side.
     """
     rec.mkdir(parents=True, exist_ok=True)
-    db = sqlite3.connect(str(rec / "recording.db"))
-    db.execute(
-        "CREATE TABLE recording (id INTEGER PRIMARY KEY, timestamp REAL, pixel_ratio REAL)"
-    )
-    db.execute("INSERT INTO recording VALUES (1, 0.0, 2.0)")
-    db.execute(
-        """CREATE TABLE action_event (
-            id INTEGER PRIMARY KEY,
-            recording_id INTEGER,
-            name TEXT,
-            timestamp REAL,
-            key_char TEXT,
-            canonical_key_char TEXT,
-            key_name TEXT,
-            canonical_key_name TEXT,
-            element_state TEXT,
-            active_segment_description TEXT,
-            available_segment_descriptions TEXT
-        )"""
-    )
-    for row_id, ts, ch in [
-        (1, blocked_start - 5, "a"),
-        (2, (blocked_start + blocked_end) / 2, "s"),
-        (3, blocked_end + 5, "d"),
-    ]:
+    with contextlib.closing(sqlite3.connect(str(rec / "recording.db"))) as db:
         db.execute(
-            "INSERT INTO action_event VALUES "
-            "(?, 1, 'press', ?, ?, ?, ?, ?, NULL, NULL, NULL)",
-            (row_id, ts, ch, ch, ch, ch),
+            "CREATE TABLE recording (id INTEGER PRIMARY KEY, timestamp REAL, pixel_ratio REAL)"
         )
-    db.execute(
-        """CREATE TABLE window_event (
-            id INTEGER PRIMARY KEY,
-            recording_id INTEGER,
-            timestamp REAL,
-            app_bundle_id TEXT,
-            window_id TEXT,
-            title TEXT,
-            state TEXT,
-            browser_url TEXT,
-            secure_input INTEGER
-        )"""
-    )
-    db.execute(
-        "INSERT INTO window_event VALUES "
-        "(1, 1, ?, 'com.microsoft.VSCode', 'w-vscode', 'Editor', NULL, NULL, 0)",
-        (blocked_start - 10,),
-    )
-    db.execute(
-        "INSERT INTO window_event VALUES "
-        "(2, 1, ?, ?, 'w-blocked', 'Vault', NULL, NULL, 0)",
-        (blocked_start, blocked_bundle_id),
-    )
-    db.execute(
-        "INSERT INTO window_event VALUES "
-        "(3, 1, ?, 'com.microsoft.VSCode', 'w-vscode', 'Editor', NULL, NULL, 0)",
-        (blocked_end,),
-    )
-    db.commit()
-    db.close()
+        db.execute("INSERT INTO recording VALUES (1, 0.0, 2.0)")
+        db.execute(
+            """CREATE TABLE action_event (
+                id INTEGER PRIMARY KEY,
+                recording_id INTEGER,
+                name TEXT,
+                timestamp REAL,
+                key_char TEXT,
+                canonical_key_char TEXT,
+                key_name TEXT,
+                canonical_key_name TEXT,
+                element_state TEXT,
+                active_segment_description TEXT,
+                available_segment_descriptions TEXT
+            )"""
+        )
+        for row_id, ts, ch in [
+            (1, blocked_start - 5, "a"),
+            (2, (blocked_start + blocked_end) / 2, "s"),
+            (3, blocked_end + 5, "d"),
+        ]:
+            db.execute(
+                "INSERT INTO action_event VALUES "
+                "(?, 1, 'press', ?, ?, ?, ?, ?, NULL, NULL, NULL)",
+                (row_id, ts, ch, ch, ch, ch),
+            )
+        db.execute(
+            """CREATE TABLE window_event (
+                id INTEGER PRIMARY KEY,
+                recording_id INTEGER,
+                timestamp REAL,
+                app_bundle_id TEXT,
+                window_id TEXT,
+                title TEXT,
+                state TEXT,
+                browser_url TEXT,
+                secure_input INTEGER
+            )"""
+        )
+        db.execute(
+            "INSERT INTO window_event VALUES "
+            "(1, 1, ?, 'com.microsoft.VSCode', 'w-vscode', 'Editor', NULL, NULL, 0)",
+            (blocked_start - 10,),
+        )
+        db.execute(
+            "INSERT INTO window_event VALUES "
+            "(2, 1, ?, ?, 'w-blocked', 'Vault', NULL, NULL, 0)",
+            (blocked_start, blocked_bundle_id),
+        )
+        db.execute(
+            "INSERT INTO window_event VALUES "
+            "(3, 1, ?, 'com.microsoft.VSCode', 'w-vscode', 'Editor', NULL, NULL, 0)",
+            (blocked_end,),
+        )
+        db.commit()
 
 
 def test_run_nulls_action_rows_inside_blocked_interval(tmp_path, pipeline_and_anonymizer):
@@ -251,12 +249,11 @@ def test_run_nulls_action_rows_inside_blocked_interval(tmp_path, pipeline_and_an
         classifier=classifier,
     ).run()
 
-    db = sqlite3.connect(str(rec / "recording.db"))
-    rows = {
-        row[0]: row[1]
-        for row in db.execute("SELECT id, key_char FROM action_event").fetchall()
-    }
-    db.close()
+    with contextlib.closing(sqlite3.connect(str(rec / "recording.db"))) as db:
+        rows = {
+            row[0]: row[1]
+            for row in db.execute("SELECT id, key_char FROM action_event").fetchall()
+        }
     assert rows[1] == "a", "row before interval should be preserved"
     assert rows[2] is None, "row inside blocked interval should be nulled"
     assert rows[3] == "d", "row after interval should be preserved"
@@ -440,9 +437,8 @@ def test_scrub_recording_copies_and_scrubs_pii(tmp_path):
     dst = tmp_path / f"{name}-scrubbed"
     assert dst.exists()
     assert src.exists(), "source recording must remain untouched"
-    db = sqlite3.connect(str(dst / "recording.db"))
-    row = db.execute("SELECT task_description FROM recording").fetchone()
-    db.close()
+    with contextlib.closing(sqlite3.connect(str(dst / "recording.db"))) as db:
+        row = db.execute("SELECT task_description FROM recording").fetchone()
     assert secret not in row[0]
     assert result.output_dir == dst
 
