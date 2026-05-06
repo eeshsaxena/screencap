@@ -13,6 +13,23 @@ from __future__ import annotations
 __version__ = "0.1.0"
 
 from screencap.engine.capture import Capture, CaptureSession
+from screencap.engine.screen_recorder import (
+    IpcChannels,
+    RecordingPolicies,
+    RecordingRequest,
+    RecordingResult,
+    ScreenRecorder,
+)
 from screencap.engine.visualize import create_html
 
-__all__ = ["Capture", "CaptureSession", "__version__", "create_html"]
+__all__ = [
+    "Capture",
+    "CaptureSession",
+    "IpcChannels",
+    "RecordingPolicies",
+    "RecordingRequest",
+    "RecordingResult",
+    "ScreenRecorder",
+    "__version__",
+    "create_html",
+]
