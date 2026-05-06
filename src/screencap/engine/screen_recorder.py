@@ -14,11 +14,14 @@ deliberately.
 from __future__ import annotations
 
 import multiprocessing as mp
-from dataclasses import dataclass
+from dataclasses import dataclass, field
 from pathlib import Path
-from typing import Protocol
+from typing import TYPE_CHECKING, Any, Protocol
 
 from screencap.engine.config import RecordingConfig
+
+if TYPE_CHECKING:
+    from screencap.privacy.policy import PrivacyMode
 
 
 class RecordingError(Exception):
@@ -149,12 +152,64 @@ class RecordingResult:
     elapsed: float
 
 
+@dataclass(frozen=True, slots=True)
+class LegacyOptions:
+    """Hold-pen for ``start_recording`` kwargs not yet promoted into a policy.
+
+    Slice 2 (SCR-38) moves the body of ``start_recording`` onto
+    ``ScreenRecorder.run()`` without reshaping any policy axis. The args
+    that have not yet found a home in ``RecordingRequest`` /
+    ``RecordingPolicies`` live here, accessed by the body verbatim.
+
+    Each field below is annotated with the slice that absorbs it:
+
+      * ``_external_*`` / ``_skip_*`` → SCR-40 / SCR-41 (lock + IPC).
+      * ``force_clean``               → SCR-40 (LockPolicy / orphan check).
+      * ``network`` / ``force_mode``  → SCR-43 (NetworkPolicy + privacy).
+      * ``audio`` / ``capture_*``     → folded into ``RecordingRequest``
+                                        once ``RecordingConfig`` covers
+                                        every per-recording flag.
+
+    Adding a field here is a temporary expedient. Removing the field
+    is what each downstream slice is for.
+    """
+
+    audio: bool | None = None
+    output_dir: str | Path | None = None
+    wifi_metrics: bool | None = None
+    app_versions: bool | None = None
+    force_clean: bool = False
+    capture_video: bool | None = None
+    capture_images: bool | None = None
+    capture_window_data: bool | None = None
+    verbose: bool = False
+    chunk_duration: float | None = None
+    live_upload: bool = True
+    force_mode: PrivacyMode | None = None
+    network: bool = False
+    # Session-controller worker-mode hooks. Set only by
+    # ``screencap.session.run_recording_worker``. Defaults preserve the
+    # legacy one-shot behaviour.
+    external_window_feed_q: Any | None = None
+    external_override_q: Any | None = None
+    external_disable_q: Any | None = None
+    skip_menubar_spawn: bool = False
+    skip_pidfile: bool = False
+    skip_sigint_handler: bool = False
+    network_handoff_ready: Any | None = None
+
+
 class ScreenRecorder:
-    """Recording seam — skeleton until SCR-38.
+    """Recording seam.
 
     Intended use: ``with ScreenRecorder(...) as rec: rec.run()``. The
     context manager owns setup/teardown; ``.run()`` blocks until stop.
     See the ADR for the full lifecycle contract.
+
+    ``legacy=`` is a temporary slot for kwargs that have not yet been
+    promoted into a policy axis (SCR-38 ports the body verbatim;
+    SCR-39…SCR-43 promote each axis in turn and remove fields from
+    ``LegacyOptions`` as they go).
     """
 
     def __init__(
@@ -163,10 +218,19 @@ class ScreenRecorder:
         request: RecordingRequest,
         channels: IpcChannels,
         policies: RecordingPolicies,
+        legacy: LegacyOptions | None = None,
     ) -> None:
         self._request = request
         self._channels = channels
         self._policies = policies
+        self._legacy = legacy if legacy is not None else LegacyOptions()
+        # Surfaced after ``.run()`` completes for the legacy 4-tuple
+        # ``start_recording`` adapter. Cleared in SCR-41 once the
+        # menubar handle moves onto ``MenubarPolicy``.
+        self.menubar_proc: Any | None = None
+        self.menubar_state_file: Path | None = None
 
     def run(self) -> RecordingResult:
-        raise NotImplementedError("ScreenRecorder.run() lands in SCR-38")
+        from screencap.recorder import _run_screen_recorder
+
+        return _run_screen_recorder(self)

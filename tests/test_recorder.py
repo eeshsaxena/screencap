@@ -44,11 +44,11 @@ class TestForceExitContracts:
 
     @staticmethod
     def _start_recording_ast():
-        """Parse the AST of ``start_recording`` (where _force_exit /
-        _sigterm_handler live as inner functions)."""
+        """Parse the AST of ``_run_screen_recorder`` (where _force_exit /
+        _sigterm_handler live as inner functions after SCR-38)."""
         from screencap import recorder as mod
 
-        return ast.parse(inspect.getsource(mod.start_recording))
+        return ast.parse(inspect.getsource(mod._run_screen_recorder))
 
     @staticmethod
     def _find_function(tree, name):

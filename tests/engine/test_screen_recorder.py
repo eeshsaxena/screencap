@@ -1,26 +1,15 @@
-"""Skeleton-level tests for the ``engine.ScreenRecorder`` seam (SCR-37).
+"""Contract tests for the ``engine.ScreenRecorder`` seam.
 
-Slice 1 of SCR-31: the seam exists, has the agreed shape, and has not yet
-moved any logic. ``run()`` is a placeholder that raises ``NotImplementedError``.
-The functional shim arrives in SCR-38; per-policy logic in SCR-39+.
-
-Tests here verify the contract that downstream slices will rely on, and
-nothing more — no shape-of-dataclass assertions.
+Slice 1 (SCR-37) introduced the seam shape; slice 2 (SCR-38) ported the
+body of ``screencap.recorder.start_recording`` onto ``.run()``. The tests
+here verify the contract that downstream slices will rely on, and
+nothing more — no shape-of-dataclass assertions and no body behaviour
+(parity with the wrapper is exercised by ``test_screen_recorder_parity``).
 """
 
 from __future__ import annotations
 
 import pytest
-
-
-def test_run_raises_not_implemented_error() -> None:
-    """``.run()`` is a placeholder until SCR-38 lands the functional shim."""
-    from screencap.engine.screen_recorder import ScreenRecorder
-
-    rec = ScreenRecorder.__new__(ScreenRecorder)  # bypass __init__ for this slice
-
-    with pytest.raises(NotImplementedError):
-        rec.run()
 
 
 def test_construction_with_three_bundles() -> None:

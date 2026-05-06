@@ -676,24 +676,133 @@ def start_recording(
     show_on_website: bool = True,
     network: bool = False,
     *,
-    # Session-controller worker-mode hooks. These are private and must
-    # only be set by screencap.session.run_recording_worker.
+    # Session-controller worker-mode hooks. Set only by
+    # screencap.session.run_recording_worker; legacy defaults preserve
+    # the standalone one-shot behaviour.
     _external_window_feed_q: "multiprocessing.Queue | None" = None,
     _external_override_q: "multiprocessing.Queue | None" = None,
     _external_disable_q: "multiprocessing.Queue | None" = None,
     _skip_menubar_spawn: bool = False,
     _skip_pidfile: bool = False,
     _skip_sigint_handler: bool = False,
-    network_handoff_ready=None,  # multiprocessing.Event | None — signaled after the proxy PID is registered in the handoff file
+    network_handoff_ready=None,
 ) -> tuple[Path, float, multiprocessing.Process | None, Path | None]:
     """Start a screen capture recording. Blocks until Ctrl+C.
 
-    The ``_external_*`` / ``_skip_*`` keyword-only parameters are used
-    by :class:`screencap.session.SessionController` to run this function
-    as a Recording Worker subprocess inside a longer-lived session. They
-    default to the legacy one-shot behaviour so existing callers and
-    tests continue to work unchanged.
+    SCR-38 thin shim: builds the seam bundles and delegates the body to
+    ``engine.ScreenRecorder.run()``. The 4-tuple return is preserved for
+    backward compat with existing callers and tests; the trailing two
+    elements (``menubar_proc``, ``menubar_state_file``) move out in
+    SCR-41 once ``MenubarPolicy`` owns them.
     """
+    from screencap.engine.config import RecordingConfig
+    from screencap.engine.screen_recorder import (
+        IpcChannels,
+        LegacyOptions,
+        RecordingPolicies,
+        RecordingRequest,
+        ScreenRecorder,
+    )
+
+    request = RecordingRequest(
+        name=name,
+        config=RecordingConfig(),
+        description=description,
+        cloud_intent=cloud_intent,
+        keep_local=keep_local,
+        intent_source=intent_source,
+        segmentation_mode=segmentation_mode,
+        scrub_enabled=scrub_enabled,
+        show_on_website=show_on_website,
+    )
+    channels = IpcChannels.create()
+    # Placeholder policies — body still runs verbatim and does not
+    # consume rec._policies in this slice. SCR-39…SCR-43 replace each
+    # placeholder with the named production implementation in turn.
+    policies = RecordingPolicies(
+        signal=object(),
+        lock=object(),
+        menubar=object(),
+        permission=object(),
+        disk=object(),
+        network=object(),
+    )
+    legacy = LegacyOptions(
+        audio=audio,
+        output_dir=output_dir,
+        wifi_metrics=wifi_metrics,
+        app_versions=app_versions,
+        force_clean=force_clean,
+        capture_video=capture_video,
+        capture_images=capture_images,
+        capture_window_data=capture_window_data,
+        verbose=verbose,
+        chunk_duration=chunk_duration,
+        live_upload=live_upload,
+        force_mode=force_mode,
+        network=network,
+        external_window_feed_q=_external_window_feed_q,
+        external_override_q=_external_override_q,
+        external_disable_q=_external_disable_q,
+        skip_menubar_spawn=_skip_menubar_spawn,
+        skip_pidfile=_skip_pidfile,
+        skip_sigint_handler=_skip_sigint_handler,
+        network_handoff_ready=network_handoff_ready,
+    )
+
+    rec = ScreenRecorder(
+        request=request, channels=channels, policies=policies, legacy=legacy,
+    )
+    result = rec.run()
+    return (
+        result.capture_dir,
+        result.elapsed,
+        rec.menubar_proc,
+        rec.menubar_state_file,
+    )
+
+
+def _run_screen_recorder(rec: "ScreenRecorder") -> "RecordingResult":
+    """Body of the recording lifecycle, driven by ``ScreenRecorder.run()``.
+
+    SCR-38 ports the body of ``start_recording`` here verbatim. The seam
+    constructs ``rec`` with the request / channels / policies / legacy
+    bundles; this function reads them into locals and proceeds exactly
+    as the wrapper used to. The ``_external_*`` / ``_skip_*`` flags live
+    on ``LegacyOptions`` and migrate into ``RecordingPolicies`` axis-by-
+    axis in SCR-39 through SCR-43.
+    """
+    request = rec._request
+    legacy = rec._legacy
+    name = request.name
+    description = request.description
+    audio = legacy.audio
+    output_dir = legacy.output_dir
+    wifi_metrics = legacy.wifi_metrics
+    app_versions = legacy.app_versions
+    force_clean = legacy.force_clean
+    capture_video = legacy.capture_video
+    capture_images = legacy.capture_images
+    capture_window_data = legacy.capture_window_data
+    verbose = legacy.verbose
+    chunk_duration = legacy.chunk_duration
+    live_upload = legacy.live_upload
+    force_mode = legacy.force_mode
+    cloud_intent = request.cloud_intent
+    keep_local = request.keep_local
+    intent_source = request.intent_source
+    segmentation_mode = request.segmentation_mode
+    scrub_enabled = request.scrub_enabled
+    show_on_website = request.show_on_website
+    network = legacy.network
+    _external_window_feed_q = legacy.external_window_feed_q
+    _external_override_q = legacy.external_override_q
+    _external_disable_q = legacy.external_disable_q
+    _skip_menubar_spawn = legacy.skip_menubar_spawn
+    _skip_pidfile = legacy.skip_pidfile
+    _skip_sigint_handler = legacy.skip_sigint_handler
+    network_handoff_ready = legacy.network_handoff_ready
+
     if audio is None:
         audio = get_audio_default()
     if wifi_metrics is None:
@@ -1897,4 +2006,8 @@ def start_recording(
             capture_dir, elapsed, _menubar_proc, _menubar_state_file,
         )
 
-    return capture_dir, elapsed, _menubar_proc, _menubar_state_file
+    rec.menubar_proc = _menubar_proc
+    rec.menubar_state_file = _menubar_state_file
+    from screencap.engine.screen_recorder import RecordingResult
+
+    return RecordingResult(capture_dir=capture_dir, elapsed=elapsed)
