@@ -159,7 +159,8 @@ def run_recording_worker(args: dict) -> None:
     # calls recorder.stop() for a graceful unwind.
 
     from screencap.engine.lock_policy import InheritLock
-    from screencap.engine.screen_recorder import NoopSignalPolicy
+    from screencap.engine.menubar_policy import Noop as MenubarNoop
+    from screencap.engine.screen_recorder import IpcChannels, NoopSignalPolicy
     from screencap.recorder import DiskFullError, start_recording
 
     capture_dir_hint = Path(args.get("capture_dir_hint", ""))
@@ -191,10 +192,12 @@ def run_recording_worker(args: dict) -> None:
             show_on_website=args.get("show_on_website", True),
             network=args.get("network", False),
             # Worker-mode injection points ------------------------------------
-            _external_window_feed_q=args["_window_feed_q"],
-            _external_override_q=args["_override_q"],
-            _external_disable_q=args["_disable_q"],
-            _skip_menubar_spawn=True,
+            _channels=IpcChannels(
+                window_feed=args["_window_feed_q"],
+                override=args["_override_q"],
+                disable=args["_disable_q"],
+            ),
+            _menubar_policy=MenubarNoop(),
             _signal_policy=NoopSignalPolicy(),
             _lock_policy=InheritLock(),
             network_handoff_ready=args.get("_network_handoff_ready"),

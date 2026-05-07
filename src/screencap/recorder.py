@@ -676,13 +676,10 @@ def start_recording(
     show_on_website: bool = True,
     network: bool = False,
     *,
-    # Session-controller worker-mode hooks. Set only by
-    # screencap.session.run_recording_worker; legacy defaults preserve
-    # the standalone one-shot behaviour.
-    _external_window_feed_q: "multiprocessing.Queue | None" = None,
-    _external_override_q: "multiprocessing.Queue | None" = None,
-    _external_disable_q: "multiprocessing.Queue | None" = None,
-    _skip_menubar_spawn: bool = False,
+    # Session-controller worker-mode injection points. Set only by
+    # screencap.session.run_recording_worker.
+    _channels: "IpcChannels | None" = None,
+    _menubar_policy: "MenubarPolicy | None" = None,
     _signal_policy: "SignalPolicy | None" = None,
     _lock_policy: "LockPolicy | None" = None,
     network_handoff_ready=None,
@@ -697,6 +694,7 @@ def start_recording(
     """
     from screencap.engine.config import RecordingConfig
     from screencap.engine.lock_policy import ClaimLock
+    from screencap.engine.menubar_policy import SpawnNewMenubar
     from screencap.engine.screen_recorder import (
         IpcChannels,
         LegacyOptions,
@@ -717,13 +715,12 @@ def start_recording(
         scrub_enabled=scrub_enabled,
         show_on_website=show_on_website,
     )
-    channels = IpcChannels.create()
-    # SCR-39: SignalPolicy is the first axis to land. Other axes still
-    # use placeholder objects pending SCR-40…SCR-43.
+    channels = _channels if _channels is not None else IpcChannels.create()
+    menubar = _menubar_policy if _menubar_policy is not None else SpawnNewMenubar()
     policies = RecordingPolicies(
         signal=_signal_policy if _signal_policy is not None else ThreeTapSigint(),
         lock=_lock_policy if _lock_policy is not None else ClaimLock(),
-        menubar=object(),
+        menubar=menubar,
         permission=object(),
         disk=object(),
         network=object(),
@@ -742,10 +739,6 @@ def start_recording(
         live_upload=live_upload,
         force_mode=force_mode,
         network=network,
-        external_window_feed_q=_external_window_feed_q,
-        external_override_q=_external_override_q,
-        external_disable_q=_external_disable_q,
-        skip_menubar_spawn=_skip_menubar_spawn,
         network_handoff_ready=network_handoff_ready,
     )
 
@@ -756,8 +749,8 @@ def start_recording(
     return (
         result.capture_dir,
         result.elapsed,
-        rec.menubar_proc,
-        rec.menubar_state_file,
+        menubar.proc,
+        menubar.state_file,
     )
 
 
@@ -775,6 +768,8 @@ def _run_screen_recorder(rec: "ScreenRecorder") -> "RecordingResult":
     legacy = rec._legacy
     signal_policy = rec._policies.signal
     lock_policy = rec._policies.lock
+    menubar_policy = rec._policies.menubar
+    channels = rec._channels
     name = request.name
     description = request.description
     audio = legacy.audio
@@ -796,10 +791,6 @@ def _run_screen_recorder(rec: "ScreenRecorder") -> "RecordingResult":
     scrub_enabled = request.scrub_enabled
     show_on_website = request.show_on_website
     network = legacy.network
-    _external_window_feed_q = legacy.external_window_feed_q
-    _external_override_q = legacy.external_override_q
-    _external_disable_q = legacy.external_disable_q
-    _skip_menubar_spawn = legacy.skip_menubar_spawn
     network_handoff_ready = legacy.network_handoff_ready
 
     if audio is None:
@@ -911,25 +902,12 @@ def _run_screen_recorder(rec: "ScreenRecorder") -> "RecordingResult":
         raise SystemExit(1)
 
     # --- Menu bar IPC queues ---
-    # Created early so they can be passed to both the privacy filter
-    # (which feeds window events) and the menu bar subprocess.
-    #
-    # In session-controller worker mode (``_external_*`` queues are not
-    # None), the controller has already created these queues and shares
-    # them with the persistent menubar; reuse them instead of creating
-    # fresh ones so the menubar sees events from this worker.
-    if _external_window_feed_q is not None:
-        _menubar_window_feed_q = _external_window_feed_q
-    else:
-        _menubar_window_feed_q = multiprocessing.Queue()  # unbounded: recorder→menubar
-    if _external_override_q is not None:
-        _menubar_override_q = _external_override_q
-    else:
-        _menubar_override_q = multiprocessing.Queue()      # unbounded: menubar→recorder
-    if _external_disable_q is not None:
-        _menubar_disable_q = _external_disable_q
-    else:
-        _menubar_disable_q = multiprocessing.Queue()       # unbounded: menubar→scrub_worker (retroactive)
+    # SCR-41: queues are first-class args via IpcChannels; no fallback
+    # creation here. SpawnNewMenubar owns new queues (standalone CLI);
+    # Noop reuses the controller's queues (session worker).
+    _menubar_window_feed_q = channels.window_feed
+    _menubar_override_q = channels.override
+    _menubar_disable_q = channels.disable
 
     # --- Privacy: capture-time enforcement ---
     # Cloud-intent recordings always use PUBLIC mode — this is stricter than
@@ -1041,8 +1019,6 @@ def _run_screen_recorder(rec: "ScreenRecorder") -> "RecordingResult":
     recorder = None
     _child_pids = []
     _ctrl_c_count = 0
-    _menubar_proc = None
-    _menubar_state_file = None
     _scrub_worker = None
     # Shared lock that serializes engine-flush handshakes between
     # chunk_processor and scrub_worker — both consume the same
@@ -1179,7 +1155,7 @@ def _run_screen_recorder(rec: "ScreenRecorder") -> "RecordingResult":
         # the entire setup window (wait_for_ready, chunk processor init, etc.).
         # Guards protect against variables not yet bound (recorder, _child_pids).
         def _force_exit(sig, frame):
-            nonlocal _ctrl_c_count, _stop_reason, _menubar_proc
+            nonlocal _ctrl_c_count, _stop_reason
             _ctrl_c_count += 1
 
             if _ctrl_c_count == 1:
@@ -1204,11 +1180,7 @@ def _run_screen_recorder(rec: "ScreenRecorder") -> "RecordingResult":
 
             # 3rd+ Ctrl+C: immediate exit — raw SIGKILL, no escalation
             if _ctrl_c_count > 2:
-                if _menubar_proc is not None and _menubar_proc.pid:
-                    try:
-                        os.kill(_menubar_proc.pid, signal.SIGKILL)
-                    except (ProcessLookupError, PermissionError):
-                        pass
+                menubar_policy.kill()
                 os._exit(1)
 
             # 2nd Ctrl+C: force-quit path
@@ -1263,8 +1235,7 @@ def _run_screen_recorder(rec: "ScreenRecorder") -> "RecordingResult":
             except Exception:
                 pass
 
-            _kill_menubar(_menubar_proc, _menubar_state_file)
-            _menubar_proc = None
+            menubar_policy.kill()
             os._exit(1)
 
         # --- SIGTERM handler (for `screencap stop`) ---
@@ -1390,26 +1361,13 @@ def _run_screen_recorder(rec: "ScreenRecorder") -> "RecordingResult":
             _child_pids = [child.pid for child in multiprocessing.active_children()]
 
             # Spawn menu bar status item (non-blocking, best-effort).
-            # Skipped in worker mode: the controller already has a
-            # persistent menubar talking over the injected queues.
-            if not _skip_menubar_spawn:
-                try:
-                    from screencap.config import get_first_seen_prompt_enabled
-                    _menubar_state_file = capture_dir / ".menubar_state"
-                    _menubar_proc = _spawn_menubar(
-                        name, t0, _menubar_state_file,
-                        window_feed_q=_menubar_window_feed_q,
-                        override_q=_menubar_override_q,
-                        prompt_enabled=get_first_seen_prompt_enabled(),
-                        disable_q=_menubar_disable_q,
-                        audio_enabled=audio,
-                    )
-                    console.print(
-                        "  [#f472b6]●[/#f472b6] [dim]Menu bar active — "
-                        "click the [#f472b6]red dot[/#f472b6] in your menu bar to stop[/dim]"
-                    )
-                except Exception:
-                    _menubar_proc = None  # Menu bar is nice-to-have, not critical
+            # SCR-41: SpawnNewMenubar spawns; Noop skips (worker mode).
+            from screencap.config import get_first_seen_prompt_enabled
+            menubar_policy.spawn(
+                name, t0, capture_dir, channels,
+                audio_enabled=audio,
+                prompt_enabled=get_first_seen_prompt_enabled(),
+            )
 
             # Sidecar thread that retroactively deletes rows from
             # recording.db for any target the user toggles to "exclude".
@@ -1568,12 +1526,7 @@ def _run_screen_recorder(rec: "ScreenRecorder") -> "RecordingResult":
                         except Exception:
                             pass
 
-                    if _menubar_state_file is not None:
-                        try:
-                            from screencap.menubar import STATE_PROCESSING
-                            _menubar_state_file.write_text(STATE_PROCESSING)
-                        except Exception:
-                            pass
+                    menubar_policy.notify_processing()
 
             # Suppress stdout before Recorder.__exit__ runs (profile block),
             # but redirect stderr to a log file so subprocess errors are captured.
@@ -1770,10 +1723,10 @@ def _run_screen_recorder(rec: "ScreenRecorder") -> "RecordingResult":
             console.print("[yellow]Force quit — data is saved on disk.[/yellow]")
             console.print("[dim]Run [bold]screencap upload[/bold] later to upload remaining files.[/dim]")
         finally:
-            # In session-controller worker mode the menubar queues are
-            # owned by the controller and reused across recordings; they
-            # must NOT be closed here.
-            if _external_disable_q is None:
+            # SCR-41: SpawnNewMenubar owns the queues (standalone CLI)
+            # and they must be closed here; Noop reuses the controller's
+            # queues which must NOT be closed by the worker.
+            if menubar_policy.owns_channels:
                 _close_queues_safely(_cpq, _aaq, _menubar_disable_q)
             else:
                 _close_queues_safely(_cpq, _aaq)
@@ -1949,11 +1902,9 @@ def _run_screen_recorder(rec: "ScreenRecorder") -> "RecordingResult":
 
     if _stop_reason == "disk_full":
         raise DiskFullError(
-            capture_dir, elapsed, _menubar_proc, _menubar_state_file,
+            capture_dir, elapsed, menubar_policy.proc, menubar_policy.state_file,
         )
 
-    rec.menubar_proc = _menubar_proc
-    rec.menubar_state_file = _menubar_state_file
     from screencap.engine.screen_recorder import RecordingResult
 
     return RecordingResult(capture_dir=capture_dir, elapsed=elapsed)

@@ -15,7 +15,7 @@ from __future__ import annotations
 
 import multiprocessing as mp
 import signal
-from dataclasses import dataclass, field
+from dataclasses import dataclass
 from pathlib import Path
 from typing import TYPE_CHECKING, Any, Callable, Protocol
 
@@ -241,7 +241,6 @@ class LegacyOptions:
 
     Each field below is annotated with the slice that absorbs it:
 
-      * ``_external_*`` / ``_skip_*`` → SCR-40 / SCR-41 (lock + IPC).
       * ``force_clean``               → SCR-40 (LockPolicy / orphan check).
       * ``network`` / ``force_mode``  → SCR-43 (NetworkPolicy + privacy).
       * ``audio`` / ``capture_*``     → folded into ``RecordingRequest``
@@ -251,7 +250,9 @@ class LegacyOptions:
     Adding a field here is a temporary expedient. Removing the field
     is what each downstream slice is for. SCR-39 retired
     ``skip_sigint_handler`` in favour of ``RecordingPolicies.signal``;
-    SCR-40 retired ``skip_pidfile`` in favour of ``RecordingPolicies.lock``.
+    SCR-40 retired ``skip_pidfile`` in favour of ``RecordingPolicies.lock``;
+    SCR-41 retired ``external_*`` / ``skip_menubar_spawn`` in favour of
+    ``IpcChannels`` + ``RecordingPolicies.menubar``.
     """
 
     audio: bool | None = None
@@ -267,13 +268,6 @@ class LegacyOptions:
     live_upload: bool = True
     force_mode: PrivacyMode | None = None
     network: bool = False
-    # Session-controller worker-mode hooks. Set only by
-    # ``screencap.session.run_recording_worker``. Defaults preserve the
-    # legacy one-shot behaviour.
-    external_window_feed_q: Any | None = None
-    external_override_q: Any | None = None
-    external_disable_q: Any | None = None
-    skip_menubar_spawn: bool = False
     network_handoff_ready: Any | None = None
 
 
@@ -302,11 +296,6 @@ class ScreenRecorder:
         self._channels = channels
         self._policies = policies
         self._legacy = legacy if legacy is not None else LegacyOptions()
-        # Surfaced after ``.run()`` completes for the legacy 4-tuple
-        # ``start_recording`` adapter. Cleared in SCR-41 once the
-        # menubar handle moves onto ``MenubarPolicy``.
-        self.menubar_proc: Any | None = None
-        self.menubar_state_file: Path | None = None
 
     def run(self) -> RecordingResult:
         from screencap.recorder import _run_screen_recorder
