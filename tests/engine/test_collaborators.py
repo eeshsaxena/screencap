@@ -427,3 +427,89 @@ def test_finalize_runs_catchall_scrub_before_stopping_scrub_worker(tmp_path):
     assert max(put_indices) < min(stop_indices), (
         f"catch-all messages must be queued before stop; events={spy_worker.events}"
     )
+
+
+def test_scrub_worker_failure_hard_errors_for_cloud_intent(tmp_path):
+    """ScrubWorker failure must SystemExit when the recording is cloud-bound.
+
+    The user is not running with ``--verbose`` by default; a silent
+    ``self._scrub_worker = None`` would let an upload ship un-scrubbed PII
+    to GCS with no signal to the user.
+    """
+    import pytest
+
+    from screencap.engine.collaborators import RecordingCollaborators
+    from screencap.engine.config import RecordingConfig
+    from screencap.engine.screen_recorder import (
+        IpcChannels,
+        LegacyOptions,
+        RecordingRequest,
+    )
+
+    capture_dir = tmp_path / "rec"
+    capture_dir.mkdir()
+    (capture_dir / "recording.db").touch()
+
+    request = RecordingRequest(
+        name="rec", config=RecordingConfig(),
+        cloud_intent=True, scrub_enabled=True,
+    )
+    helper = RecordingCollaborators(
+        request=request, legacy=LegacyOptions(), channels=IpcChannels.create(),
+    )
+    fake_recorder = _FakeEngineRecorder()
+
+    with (
+        mock.patch(
+            "screencap.privacy.scrub_worker.ScrubWorker",
+            side_effect=RuntimeError("scrub init failed"),
+        ),
+        pytest.raises(SystemExit) as exc_info,
+    ):
+        helper.start(
+            recorder=fake_recorder,
+            capture_dir=capture_dir,
+            screen_filter=None,
+            privacy_config=None,
+            chunking_enabled=False,
+        )
+
+    assert exc_info.value.code == 1
+
+
+def test_scrub_worker_failure_warns_for_local_recording(tmp_path):
+    """Local recording: scrub-worker failure must not block recording but must surface."""
+    from screencap.engine.collaborators import RecordingCollaborators
+    from screencap.engine.config import RecordingConfig
+    from screencap.engine.screen_recorder import (
+        IpcChannels,
+        LegacyOptions,
+        RecordingRequest,
+    )
+
+    capture_dir = tmp_path / "rec"
+    capture_dir.mkdir()
+    (capture_dir / "recording.db").touch()
+
+    request = RecordingRequest(name="rec", config=RecordingConfig())  # cloud_intent=False
+    helper = RecordingCollaborators(
+        request=request, legacy=LegacyOptions(verbose=False), channels=IpcChannels.create(),
+    )
+    fake_recorder = _FakeEngineRecorder()
+    fake_console = mock.MagicMock()
+
+    with mock.patch(
+        "screencap.privacy.scrub_worker.ScrubWorker",
+        side_effect=RuntimeError("scrub init failed"),
+    ):
+        helper.start(
+            recorder=fake_recorder,
+            capture_dir=capture_dir,
+            screen_filter=None,
+            privacy_config=None,
+            chunking_enabled=False,
+            console=fake_console,
+        )
+
+    assert helper.scrub_worker is None
+    assert fake_console.print.called, "warning must be printed even without --verbose"

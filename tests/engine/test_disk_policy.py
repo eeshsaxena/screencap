@@ -395,3 +395,48 @@ def test_monitor_and_stop_poll_skips_before_interval(tmp_path):
         policy.poll(10.0)
 
     usage.assert_not_called()
+
+
+def test_preflight_oserror_fails_closed(tmp_path):
+    """An ``OSError`` from ``shutil.disk_usage`` raises ``DiskTooLowAtStart``.
+
+    A disk we can't measure is the same threat as a full one — fail-closed.
+    """
+    import pytest
+
+    from screencap.engine.disk_policy import MonitorAndStop
+    from screencap.engine.screen_recorder import DiskTooLowAtStart
+
+    policy = MonitorAndStop()
+    policy.bind(tmp_path)
+
+    with (
+        mock.patch("screencap.config.get_disk_warn_mb", return_value=2000),
+        mock.patch("screencap.config.get_disk_stop_mb", return_value=500),
+        mock.patch("shutil.disk_usage", side_effect=PermissionError("EACCES")),
+        pytest.raises(DiskTooLowAtStart),
+    ):
+        policy.preflight()
+
+
+def test_poll_oserror_surfaces_warning(tmp_path):
+    """An ``OSError`` from ``shutil.disk_usage`` mid-recording sets ``warning``.
+
+    Used to silently set ``_warning = ""`` (fail-open + invisible).
+    """
+    from screencap.engine.disk_policy import MonitorAndStop
+
+    policy = MonitorAndStop()
+    policy.bind(tmp_path)
+
+    with (
+        mock.patch("screencap.config.get_disk_warn_mb", return_value=2000),
+        mock.patch("screencap.config.get_disk_stop_mb", return_value=500),
+        mock.patch("shutil.disk_usage", return_value=_PLENTY),
+    ):
+        policy.preflight()
+
+    with mock.patch("shutil.disk_usage", side_effect=OSError("EIO")):
+        policy.poll(100.0)
+
+    assert policy.warning, "warning must surface to the live display"

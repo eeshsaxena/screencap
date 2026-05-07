@@ -1,7 +1,7 @@
-"""``RecordingCollaborators`` helper (SCR-44, slice 7 of SCR-31).
+"""``RecordingCollaborators`` — engine-side collaborator lifecycle.
 
-Owns the engine-side collaborators that previously lived inline inside
-``screencap.recorder._run_screen_recorder``:
+Owns the three collaborators that share the engine flush primitives
+(``flush_requested`` / ``flush_ack_counter`` / ``flush_lock``):
 
 * ``RecorderPrivacyFilter`` — capture-time policy enforcement; constructor
   honours ``cloud_intent`` (forces ``PrivacyMode.PUBLIC``) and the
@@ -10,20 +10,11 @@ Owns the engine-side collaborators that previously lived inline inside
 * ``ScrubWorker``           — sidecar thread that processes menu-bar disable
   jobs against the live ``recording.db``.
 
-These three plus the shared flush primitives
-(``flush_requested`` / ``flush_ack_counter`` / ``flush_lock``) move into
-the seam together because the screencap-layer ChunkProcessor outliving
-``Recorder.__exit__`` is the reason ``_NoCloseProxy`` exists. Once
-chunk_processor and scrub_worker run inside the engine ``with``-block,
-nothing outside the engine holds a reference to engine queues past exit
-and ``_NoCloseProxy`` is deleted.
-
 A single helper class (rather than a Protocol with two implementations)
 is the right shape here: every recording uses these collaborators when
-their gates are enabled (``chunking_enabled``, ``capture_window_data``).
-There is no Noop alternative — the scrub worker always starts, and the
-chunk processor and privacy filter are gated by their own configuration
-inputs rather than by a policy axis.
+their gates are enabled. The chunk processor and privacy filter are
+gated by their own configuration inputs rather than by a policy axis;
+the scrub worker always starts.
 """
 
 from __future__ import annotations
@@ -47,8 +38,7 @@ if TYPE_CHECKING:
 class RecordingCollaborators:
     """Engine-owned privacy filter + chunk processor + scrub worker.
 
-    Lifecycle (called from ``_run_screen_recorder`` until SCR-45 finishes
-    inlining the body):
+    Lifecycle, called from ``_run_screen_recorder``:
 
     1. ``build_recorder_privacy_filter(capture_dir, capture_window_data)`` —
        before ``engine.Recorder.__enter__``; returns the filter to pass
@@ -84,6 +74,14 @@ class RecordingCollaborators:
         self._scrub_worker: Any | None = None
         self._chunk_q: Any | None = None
         self._audio_ack_q: Any | None = None
+        # Resolved by ``build_recorder_privacy_filter`` BEFORE filter
+        # construction so the outer fail-closed gate can read it even if
+        # filter construction raises.
+        self._privacy_config: "PrivacyConfig | None" = None
+
+    @property
+    def privacy_config(self) -> "PrivacyConfig | None":
+        return self._privacy_config
 
     @property
     def chunk_processor(self) -> Any | None:
@@ -131,6 +129,13 @@ class RecordingCollaborators:
         if force_mode is not None:
             if _MODE_STRICTNESS[force_mode] <= _MODE_STRICTNESS[privacy_config.mode]:
                 privacy_config = _dc_replace(privacy_config, mode=force_mode)
+
+        # Publish the resolved config on the helper BEFORE constructing the
+        # filter. If RecorderPrivacyFilter raises, the outer fail-closed
+        # gate in _run_screen_recorder still has the config to gate on
+        # (otherwise it sees ``privacy_config=None`` and a PUBLIC-mode user
+        # silently degrades to the warn-and-proceed path).
+        self._privacy_config = privacy_config
 
         if not capture_window_data:
             return None, privacy_config, override_file
@@ -361,11 +366,9 @@ class RecordingCollaborators:
     def close_engine_queues(self, *, menubar_owns_channels: bool) -> None:
         """Close the engine queues now that consumers have drained.
 
-        Replaces the ``_NoCloseProxy`` workaround. The seam now owns close
-        timing — chunk_processor and scrub_worker have already finished by
-        the time this runs, so closing is safe and the engine's own
-        ``__exit__`` cleanup that follows is a harmless second close on
-        already-closed queues.
+        chunk_processor and scrub_worker have already finished by the
+        time this runs, so closing is safe; the engine's own ``__exit__``
+        cleanup that follows is a harmless second close.
 
         ``menubar_owns_channels=False`` (session-worker mode) means the
         controller owns the disable queue, so the worker must NOT close
@@ -613,7 +616,17 @@ class RecordingCollaborators:
             self._scrub_worker = sw
         except Exception as exc:  # noqa: BLE001
             self._scrub_worker = None
-            if console is not None and self._legacy.verbose:
+            # Cloud-bound recordings cannot ship un-scrubbed PII to GCS just
+            # because the user didn't pass --verbose. Surface unconditionally
+            # and SystemExit when the scrub worker is load-bearing.
+            if self._request.cloud_intent and self._request.scrub_enabled:
+                if console is not None:
+                    console.print(
+                        f"[red]Error:[/red] Scrub worker failed to start: {exc!r}\n"
+                        "Cloud upload disabled because PII scrubbing is unavailable.",
+                    )
+                raise SystemExit(1) from exc
+            if console is not None:
                 console.print(
-                    f"[yellow]Warning:[/yellow] Scrub worker failed to start: {exc}"
+                    f"[yellow]Warning:[/yellow] Scrub worker failed to start: {exc!r}",
                 )

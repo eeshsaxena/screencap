@@ -468,13 +468,9 @@ class TestPreRecordingDiskCheck:
             with pytest.raises(SystemExit):
                 start_recording("test", output_dir=tmp_path / "test-rec")
 
-    def test_oserror_fails_open(self, tmp_path):
-        """Other OSError from disk_usage is logged and recording proceeds."""
+    def test_oserror_fails_closed(self, tmp_path):
+        """OSError from disk_usage now fails closed: an unreadable disk is the same threat as a full one."""
         from screencap.recorder import start_recording
-
-        mock_recorder = mock.MagicMock()
-        mock_recorder.wait_for_ready.return_value = True
-        mock_recorder.is_recording = False
 
         with (
             mock.patch("screencap.recorder._check_macos_permissions"),
@@ -486,14 +482,12 @@ class TestPreRecordingDiskCheck:
             mock.patch("screencap.pidfile.find_orphaned_processes", return_value=[]),
             mock.patch("screencap.pidfile.write_pidfile"),
             mock.patch("screencap.pidfile.delete_pidfile"),
-            mock.patch("screencap.engine.recorder.Recorder") as MockRecorder,
+            mock.patch("screencap.engine.recorder.Recorder"),
+            pytest.raises(SystemExit) as exc_info,
         ):
-            MockRecorder.return_value.__enter__ = mock.MagicMock(return_value=mock_recorder)
-            MockRecorder.return_value.__exit__ = mock.MagicMock(return_value=False)
+            start_recording("test", output_dir=tmp_path / "test-rec", verbose=True)
 
-            # Should not raise — fail-open behavior
-            capture_dir, elapsed, _, _ = start_recording("test", output_dir=tmp_path / "test-rec", verbose=True)
-            assert capture_dir.exists()
+        assert exc_info.value.code == 1
 
     def test_warn_mb_zero_disables_check(self, tmp_path):
         """Setting warn_mb=0 disables the pre-recording disk check."""
@@ -643,6 +637,40 @@ class TestPrivacyFilterInitFailure:
             MockRecorder.return_value.__exit__ = mock.MagicMock(return_value=False)
 
             start_recording("test", output_dir=tmp_path / "test-rec")
+
+        assert exc_info.value.code == 1
+
+    def test_cloud_intent_hard_errors_when_get_privacy_config_raises(self, tmp_path):
+        """``cloud_intent=True`` must SystemExit even if config load itself raises.
+
+        ``privacy_config`` stays ``None`` when ``get_privacy_config`` throws
+        before ``build_recorder_privacy_filter`` can return; the prior guard
+        of ``if privacy_config is not None`` would fall through to the
+        warn-and-proceed branch, leaking un-protected captures to GCS.
+        """
+        from screencap.recorder import start_recording
+
+        with (
+            mock.patch("screencap.recorder._check_macos_permissions"),
+            mock.patch("screencap.recorder.get_audio_default", return_value=False),
+            mock.patch("screencap.recorder.get_wifi_metrics", return_value=False),
+            mock.patch("screencap.config.get_disk_warn_mb", return_value=0),
+            mock.patch("screencap.config.get_disk_stop_mb", return_value=0),
+            mock.patch("screencap.pidfile.find_orphaned_processes", return_value=[]),
+            mock.patch("screencap.pidfile.write_pidfile"),
+            mock.patch("screencap.pidfile.delete_pidfile"),
+            mock.patch(
+                "screencap.config.get_privacy_config",
+                side_effect=RuntimeError("config corrupt"),
+            ),
+            mock.patch("screencap.engine.recorder.Recorder"),
+            pytest.raises(SystemExit) as exc_info,
+        ):
+            start_recording(
+                "cloud-test",
+                output_dir=tmp_path / "cloud-rec",
+                cloud_intent=True,
+            )
 
         assert exc_info.value.code == 1
 

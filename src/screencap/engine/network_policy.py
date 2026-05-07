@@ -71,9 +71,10 @@ class MitmProxyV15:
     ``screencap start --network`` invocations race out at the lock and
     never compete for the same prompts.
 
-    KEK lifetime: the KEK plaintext lives only inside ``_prepare_dek_material``
+    SECURITY: the KEK plaintext lives only inside ``_prepare_dek_material``
     and is deleted (``del _kek``) before that method returns. It is never
-    assigned to instance state.
+    assigned to instance state — extending KEK lifetime weakens the wrapping
+    invariant that downstream decryption depends on.
     """
 
     def __init__(self, console: "_Console | None" = None) -> None:

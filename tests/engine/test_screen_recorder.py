@@ -122,20 +122,19 @@ def test_error_hierarchy_matches_adr() -> None:
     # from their owning policy modules in SCR-40 / SCR-42, not here.
 
 
-def test_curated_surface_exposes_screen_recorder() -> None:
-    """ADR AC: the seam is reachable through ``screencap.engine``.
+def test_curated_engine_surface_stays_tight() -> None:
+    """``screencap.engine`` exposes only the documented 4-name surface.
 
-    Bundle types are also exposed so callers can construct a
-    ``ScreenRecorder`` without reaching past the curated surface.
+    Seam types (``ScreenRecorder``, bundle dataclasses) are reached via
+    ``screencap.engine.screen_recorder`` to keep ``import screencap.engine``
+    cheap. Adding a name here is a contract change — update CLAUDE.md
+    too.
     """
     import screencap.engine as engine
 
-    for name in (
-        "ScreenRecorder",
-        "RecordingRequest",
-        "IpcChannels",
-        "RecordingPolicies",
-        "RecordingResult",
-    ):
-        assert name in engine.__all__, f"{name} missing from engine.__all__"
-        assert hasattr(engine, name), f"{name} not attribute-accessible on engine"
+    assert set(engine.__all__) == {
+        "Capture",
+        "CaptureSession",
+        "__version__",
+        "create_html",
+    }

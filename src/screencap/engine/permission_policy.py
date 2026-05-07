@@ -70,10 +70,12 @@ class MacOSTCC:
 
 
 class Noop:
-    """Session-worker / test permission policy: all hooks are safe no-ops.
+    """Test permission policy: all hooks are safe no-ops.
 
-    Tests and session workers set this policy so they never trigger macOS
-    TCC prompts or fresh-subprocess permission checks during recording.
+    Used by tests that need to bypass TCC entirely. Session workers
+    currently still receive the standalone-CLI ``MacOSTCC`` instance —
+    making session workers actually pass ``Noop`` is tracked separately
+    (see the policy-injection follow-up ticket).
     """
 
     @property

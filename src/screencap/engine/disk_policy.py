@@ -1,4 +1,4 @@
-"""``DiskPolicy`` seam (SCR-42, slice 5 of SCR-31).
+"""``DiskPolicy`` seam.
 
 Promotes the disk-space preflight and adaptive periodic poll from inline
 code in ``_run_screen_recorder`` to a pluggable policy. ``MonitorAndStop``
@@ -14,9 +14,12 @@ options.
 
 from __future__ import annotations
 
+import logging
 import shutil
 from pathlib import Path
 from typing import Protocol
+
+_logger = logging.getLogger(__name__)
 
 _DISK_CHECK_INTERVAL = 30  # seconds between normal-band disk checks
 
@@ -109,8 +112,13 @@ class MonitorAndStop:
             raise
         except FileNotFoundError:
             raise DiskTooLowAtStart(f"Recording path not found: {check_path}")
-        except OSError:
-            pass
+        except OSError as exc:
+            # An unreadable disk is the same threat as a full one: we can't
+            # prove the recording will fit. Fail-closed.
+            _logger.warning("disk preflight failed: %r", exc, exc_info=True)
+            raise DiskTooLowAtStart(
+                f"Cannot read disk free space on {check_path}: {exc!r}",
+            )
 
     def poll(self, now: float) -> None:
         if now < self._next_poll_at or self._capture_dir is None:
@@ -133,8 +141,9 @@ class MonitorAndStop:
                 self._warning = ""
         except DiskSpaceCritical:
             raise
-        except OSError:
-            self._warning = ""
+        except OSError as exc:
+            _logger.warning("disk poll failed: %r", exc, exc_info=True)
+            self._warning = "disk check unavailable"
 
         self._next_poll_at = now + self._disk_check_interval
 
@@ -148,10 +157,12 @@ class MonitorAndStop:
 
 
 class Noop:
-    """Session-worker / test disk policy: all hooks are safe no-ops.
+    """Test disk policy: all hooks are safe no-ops.
 
-    Tests and session workers set this policy so they never call
-    ``shutil.disk_usage`` or read disk-threshold config during recording.
+    Used by tests that need to bypass disk monitoring. Session workers
+    currently still receive ``MonitorAndStop`` — making them actually
+    pass ``Noop`` is tracked separately (see the policy-injection
+    follow-up ticket).
     """
 
     def bind(self, capture_dir: Path) -> None:

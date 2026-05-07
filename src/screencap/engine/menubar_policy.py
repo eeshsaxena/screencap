@@ -14,6 +14,7 @@ concrete policy objects.
 
 from __future__ import annotations
 
+import logging
 import multiprocessing
 import os
 import signal
@@ -21,6 +22,8 @@ from pathlib import Path
 from typing import TYPE_CHECKING, Protocol
 
 from rich.console import Console
+
+_logger = logging.getLogger(__name__)
 
 if TYPE_CHECKING:
     from screencap.engine.screen_recorder import IpcChannels
@@ -181,8 +184,13 @@ class SpawnNewMenubar:
                 "  [#f472b6]●[/#f472b6] [dim]Menu bar active — "
                 "click the [#f472b6]red dot[/#f472b6] in your menu bar to stop[/dim]"
             )
-        except Exception:
+        except Exception as exc:  # noqa: BLE001
             self._proc = None
+            _logger.warning("menubar spawn failed: %r", exc, exc_info=True)
+            _console.print(
+                f"  [yellow]Menu bar unavailable[/yellow] [dim]({exc!r}) — "
+                "stop with [bold]screencap stop[/bold] or Ctrl+C[/dim]",
+            )
 
     def notify_processing(self) -> None:
         if self._state_file is None:

@@ -1,13 +1,11 @@
 """``engine.ScreenRecorder`` seam.
 
-Defines the seam that absorbs the recording-lifecycle responsibilities
-that used to live in the 1,900-line ``screencap/recorder.py`` wrapper.
-``.run()`` dispatches into ``_run_screen_recorder`` (also in this
-module) which orchestrates the full recording lifecycle through the
-six policy axes (signal, lock, menubar, permission, disk, network).
-``screencap/recorder.py`` is now a thin CLI adapter (~700 lines) holding
-banner, ``Live`` display, summary printing, the privacy-settings
-deep-link helper, and the ``start_recording`` shim.
+Owns the recording lifecycle: ``.run()`` dispatches into
+``_run_screen_recorder`` (also in this module) which orchestrates setup,
+the live loop, and teardown through the six policy axes (signal, lock,
+menubar, permission, disk, network). ``screencap/recorder.py`` is a CLI
+adapter holding the banner, ``Live`` display, summary printing, the
+privacy-settings deep-link helper, and the ``start_recording`` shim.
 
 The full design lives in
 ``docs/decisions/0001-engine-screen-recorder-seam.md``. Everything in
@@ -29,7 +27,7 @@ import warnings
 from dataclasses import dataclass
 from datetime import datetime, timezone
 from pathlib import Path
-from typing import TYPE_CHECKING, Any, Callable, Protocol
+from typing import TYPE_CHECKING, Any, Callable, Literal, Protocol
 
 from rich.live import Live
 from rich.text import Text
@@ -38,6 +36,11 @@ from screencap.engine.config import RecordingConfig
 
 if TYPE_CHECKING:
     from screencap.privacy.policy import PrivacyMode
+
+IntentSource = Literal[
+    "flag", "non_interactive_default", "prompt", "config_default", "menubar",
+]
+SegmentationMode = Literal["llm", "idle"]
 
 
 class RecordingError(Exception):
@@ -65,10 +68,7 @@ class DiskTooLowAtStart(PreflightError):
 
 
 class RecordingInterrupted(RecordingError):
-    """Stopped mid-recording. Subclasses carry ``capture_dir`` + ``elapsed``."""
-
-    capture_dir: Path
-    elapsed: float
+    """Stopped mid-recording. Subclasses set ``capture_dir`` + ``elapsed`` in ``__init__``."""
 
 
 class PermissionRevoked(RecordingInterrupted):
@@ -226,8 +226,8 @@ class RecordingRequest:
     description: str | None = None
     cloud_intent: bool = False
     keep_local: bool = True
-    intent_source: str = "flag"
-    segmentation_mode: str = "llm"
+    intent_source: IntentSource = "flag"
+    segmentation_mode: SegmentationMode = "llm"
     scrub_enabled: bool = True
     show_on_website: bool = True
 
@@ -274,25 +274,10 @@ class RecordingResult:
 class LegacyOptions:
     """Hold-pen for ``start_recording`` kwargs not yet promoted into a policy.
 
-    Slice 2 (SCR-38) moves the body of ``start_recording`` onto
-    ``ScreenRecorder.run()`` without reshaping any policy axis. The args
-    that have not yet found a home in ``RecordingRequest`` /
-    ``RecordingPolicies`` live here, accessed by the body verbatim.
-
-    Each field below is annotated with the slice that absorbs it:
-
-      * ``force_clean``               → SCR-40 (LockPolicy / orphan check).
-      * ``force_mode``                → SCR-43 (NetworkPolicy + privacy).
-      * ``audio`` / ``capture_*``     → folded into ``RecordingRequest``
-                                        once ``RecordingConfig`` covers
-                                        every per-recording flag.
-
-    Adding a field here is a temporary expedient. Removing the field
-    is what each downstream slice is for. SCR-39 retired
-    ``skip_sigint_handler`` in favour of ``RecordingPolicies.signal``;
-    SCR-40 retired ``skip_pidfile`` in favour of ``RecordingPolicies.lock``;
-    SCR-41 retired ``external_*`` / ``skip_menubar_spawn`` in favour of
-    ``IpcChannels`` + ``RecordingPolicies.menubar``.
+    Fields here have not found a home in ``RecordingRequest`` /
+    ``RecordingPolicies`` yet; the body reads them verbatim. Adding a
+    field here is a temporary expedient — preferred direction is to
+    promote it into a typed bundle.
     """
 
     audio: bool | None = None
@@ -313,14 +298,17 @@ class LegacyOptions:
 class ScreenRecorder:
     """Recording seam.
 
-    Intended use: ``with ScreenRecorder(...) as rec: rec.run()``. The
-    context manager owns setup/teardown; ``.run()`` blocks until stop.
-    See the ADR for the full lifecycle contract.
+    Intended use::
 
-    ``legacy=`` is a temporary slot for kwargs that have not yet been
-    promoted into a policy axis (SCR-38 ports the body verbatim;
-    SCR-39…SCR-43 promote each axis in turn and remove fields from
-    ``LegacyOptions`` as they go).
+        rec = ScreenRecorder(request=..., channels=..., policies=...)
+        result = rec.run()  # blocks until stop; setup + teardown live in run()
+
+    Setup and teardown are centralized inside ``.run()`` (the body in
+    ``_run_screen_recorder``); the class itself is just a typed bundle
+    holder. See the ADR for the full lifecycle contract.
+
+    ``legacy=`` is a hold-pen for kwargs that have not yet been
+    promoted into a policy axis.
     """
 
     def __init__(
@@ -409,14 +397,14 @@ def _run_screen_recorder(rec: "ScreenRecorder") -> "RecordingResult":
     else:
         capture_dir = get_recordings_dir() / name
 
-    # SCR-42: bind disk policy to the resolved capture_dir before preflight.
+    # bind() needs the resolved capture_dir; capture_dir is computed from
+    # request + legacy options, so policy construction can't pre-bind.
     disk_policy.bind(capture_dir)
 
-    # SCR-40: orphan preflight + process-exclusive lock claim are bundled
-    # into ``LockPolicy.claim``. Standalone CLI passes ``ClaimLock``;
-    # session workers pass ``InheritLock`` (controller already claimed at
-    # ``__init__``). Lock-contention exit-code-2 + stderr event also live
-    # inside ``ClaimLock``.
+    # Standalone CLI passes ClaimLock (orphan preflight + exclusive
+    # claim); session workers pass InheritLock (controller already
+    # claimed). Lock-contention exit-code-2 + stderr event live inside
+    # ClaimLock.
     lock_policy.claim(capture_dir, force_clean=force_clean)
 
     if capture_dir.exists() and any(capture_dir.iterdir()):
@@ -425,7 +413,8 @@ def _run_screen_recorder(rec: "ScreenRecorder") -> "RecordingResult":
         )
         raise SystemExit(1)
 
-    # SCR-42: disk preflight delegated to DiskPolicy.
+    # _DiskSpaceCritical is reserved for the live-loop branch below;
+    # preflight raises DiskTooLowAtStart instead.
     from screencap.engine.disk_policy import DiskSpaceCritical as _DiskSpaceCritical
     try:
         disk_policy.preflight()
@@ -442,12 +431,10 @@ def _run_screen_recorder(rec: "ScreenRecorder") -> "RecordingResult":
     if not verbose:
         _suppress_output()
 
-    # SCR-42: permission preflight delegated to PermissionPolicy.
     permission_policy.preflight()
 
     desc = description or ""
 
-    # --- Banner ---
     _print_banner()
 
     if verbose:
@@ -477,16 +464,15 @@ def _run_screen_recorder(rec: "ScreenRecorder") -> "RecordingResult":
         )
         raise SystemExit(1)
 
-    # --- Menu bar IPC queues ---
-    # SCR-41: queues are first-class args via IpcChannels; no fallback
-    # creation here. SpawnNewMenubar owns new queues (standalone CLI);
-    # Noop reuses the controller's queues (session worker).
+    # SpawnNewMenubar owns new queues (standalone CLI); Noop reuses the
+    # controller's queues (session worker).
     _menubar_disable_q = channels.disable
 
-    # --- Privacy: capture-time enforcement (SCR-44) ---
-    # Construction (cloud_intent → PUBLIC floor, window-data gate, override
-    # file path) is owned by the engine helper. The wrapper still owns the
-    # console UX around configuration failure and the cloud privacy notice.
+    # Capture-time privacy enforcement: cloud_intent forces PUBLIC mode,
+    # the window-data gate makes the filter unconstructable without window
+    # events. The wrapper owns the console UX around config-load failure
+    # and the cloud privacy notice; helper.build_recorder_privacy_filter
+    # owns construction.
     from screencap.engine.collaborators import RecordingCollaborators
 
     _collaborators = RecordingCollaborators(
@@ -517,15 +503,22 @@ def _run_screen_recorder(rec: "ScreenRecorder") -> "RecordingResult":
         elif verbose and privacy_config is not None:
             console.print(f"[dim]Privacy mode: {privacy_config.mode.value}[/dim]")
     except Exception as e:
-        if privacy_config is not None:
+        # Cloud-bound recordings cannot proceed without the recorder filter.
+        # ``build_recorder_privacy_filter`` publishes the resolved config on
+        # the helper before constructing the filter, so a filter-construction
+        # exception still leaves ``_collaborators.privacy_config`` populated
+        # (the user explicitly chose a privacy posture — honour it).
+        # ``cloud_intent`` is the unconditional floor.
+        privacy_config = privacy_config or _collaborators.privacy_config
+        if cloud_intent or privacy_config is not None:
             console.print(
-                f"[red]Error:[/red] Capture-time privacy enforcement failed: {e}\n"
+                f"[red]Error:[/red] Capture-time privacy enforcement failed: {e!r}\n"
                 "Recording cannot proceed without privacy protection. "
                 "Check dependencies and configuration."
             )
             raise SystemExit(1)
         console.print(
-            f"[yellow]Warning:[/yellow] Capture-time privacy enforcement disabled: {e}"
+            f"[yellow]Warning:[/yellow] Capture-time privacy enforcement disabled: {e!r}"
         )
 
     # --- Cloud recording privacy warning ---
@@ -577,10 +570,8 @@ def _run_screen_recorder(rec: "ScreenRecorder") -> "RecordingResult":
     _child_pids = []
     _ctrl_c_count = 0
 
-    # ----- Network proxy capture (V1.5) — policy-based preflight -----------
-    # SCR-43: lock acquisition, preflight_or_raise, KEK/DEK generation, and
-    # empty-allowlist warning are delegated to NetworkPolicy. MitmProxyV15
-    # holds the lock until teardown(); Null is a no-op.
+    # MitmProxyV15.setup acquires the network lock + preflights mitm +
+    # generates KEK/DEK; teardown() releases the lock. Null is a no-op.
     try:
         _network_material = network_policy.setup(capture_dir, privacy_config)
     except NetworkPreflightFailed as exc:
@@ -619,9 +610,9 @@ def _run_screen_recorder(rec: "ScreenRecorder") -> "RecordingResult":
         if chunking_enabled:
             recorder_kwargs["video_chunk_duration"] = chunk_duration
 
-        # SCR-40: identity files are written by ``LockPolicy.write_identity``
-        # for both ``ClaimLock`` and ``InheritLock`` (per-recording identity
-        # is independent of who owns the process lock).
+        # Per-recording identity files are policy-owned: both ClaimLock
+        # and InheritLock write them (identity is independent of who owns
+        # the process lock).
         _privacy_mode_str = (
             privacy_config.mode.value if privacy_config else "internal"
         )
@@ -733,20 +724,20 @@ def _run_screen_recorder(rec: "ScreenRecorder") -> "RecordingResult":
             menubar_policy.kill()
             os._exit(1)
 
-        # --- SIGTERM handler (for `screencap stop`) ---
         def _sigterm_handler(sig, frame):
             nonlocal _stop_reason
             _stop_reason = "sigterm"
             _stop_event.set()
+            # ``recorder is None`` means a signal arrived before Recorder
+            # finished __enter__; the body's finally block still runs.
             if recorder is not None:
                 recorder.stop()
 
-        # SCR-39: SignalPolicy decides whether to register handlers.
-        # Standalone CLI passes ThreeTapSigint; session workers pass
-        # SigtermOnly (controller owns Ctrl+C, forwards as SIGTERM).
         # Installed BEFORE Recorder.__enter__() so SIGINT during the
         # entire setup window is honoured — Tier-3 enforcement in
-        # tests/test_signal_during_setup.py.
+        # tests/test_signal_during_setup.py. Standalone CLI passes
+        # ThreeTapSigint; session workers pass SigtermOnly (controller
+        # owns Ctrl+C, forwards as SIGTERM).
         signal_policy.install(
             sigint_handler=_force_exit, sigterm_handler=_sigterm_handler,
         )
@@ -796,10 +787,9 @@ def _run_screen_recorder(rec: "ScreenRecorder") -> "RecordingResult":
             # within ~100 ms.
             t0 = time.time()
 
-            # SCR-44: ChunkProcessor + ScrubWorker construction + start are
-            # owned by the engine helper. Both consumers share the helper's
-            # internal flush_lock so concurrent flush handshakes don't race
-            # on the engine's flush_ack_counter.
+            # ChunkProcessor + ScrubWorker share the helper's flush_lock
+            # so concurrent flush handshakes don't race on the engine's
+            # flush_ack_counter.
             _collaborators.start(
                 recorder=recorder,
                 capture_dir=capture_dir,
@@ -811,9 +801,8 @@ def _run_screen_recorder(rec: "ScreenRecorder") -> "RecordingResult":
             chunk_processor = _collaborators.chunk_processor
             _scrub_worker = _collaborators.scrub_worker
 
-            # SCR-40: pidfile snapshot of children is delegated to
-            # ``LockPolicy.register_children``. ``ClaimLock`` writes the
-            # pidfile; ``InheritLock`` is a no-op (controller owns it).
+            # ClaimLock writes the pidfile; InheritLock is a no-op
+            # (controller owns it).
             child_pids = [
                 {"pid": child.pid, "name": child.name}
                 for child in mp.active_children()
@@ -824,8 +813,6 @@ def _run_screen_recorder(rec: "ScreenRecorder") -> "RecordingResult":
             # multiprocessing._children_lock which can deadlock in a handler).
             _child_pids = [child.pid for child in mp.active_children()]
 
-            # Spawn menu bar status item (non-blocking, best-effort).
-            # SCR-41: SpawnNewMenubar spawns; Noop skips (worker mode).
             from screencap.config import get_first_seen_prompt_enabled
             menubar_policy.spawn(
                 name, t0, capture_dir, channels,
@@ -833,19 +820,17 @@ def _run_screen_recorder(rec: "ScreenRecorder") -> "RecordingResult":
                 prompt_enabled=get_first_seen_prompt_enabled(),
             )
 
-            # --- Live recording display ---
-            # We use transient=False and handle cleanup ourselves:
-            # on stop we replace the panel with the stop message via
-            # live.update().  Rich's normal render cycle overwrites
-            # every panel line (including borders) with the new content.
-            # transient=True has an off-by-one bug with Panel borders
-            # on signal interrupt, leaving the top border as a remnant.
-            # ``elapsed`` is updated inside the Live loop and then frozen
-            # in the loop's ``finally`` block so the returned value
-            # reflects the user-visible recording duration (the number
-            # shown in the live status bar) and NOT the total wall clock
-            # that includes the multi-minute post-capture cleanup
-            # (ChunkProcessor drain, DB upload, sentinel upload).
+            # transient=False + manual live.update() on stop. Rich's normal
+            # render cycle overwrites every panel line (including borders).
+            # transient=True has an off-by-one bug with Panel borders on
+            # signal interrupt, leaving the top border as a remnant.
+            #
+            # ``elapsed`` is updated inside the Live loop and frozen in the
+            # finally block so the returned value reflects the user-visible
+            # recording duration (the number shown in the live status bar)
+            # and NOT the wall clock that includes the multi-minute
+            # post-capture cleanup (ChunkProcessor drain, DB upload,
+            # sentinel upload).
             elapsed = 0.0
             with Live(
                 _build_live_display(name, 0.0, True),
@@ -857,8 +842,11 @@ def _run_screen_recorder(rec: "ScreenRecorder") -> "RecordingResult":
                         elapsed = time.time() - t0
                         pulse_on = int(elapsed) % 2 == 0
 
-                        # SCR-42: mid-recording permission revocation watcher
-                        # delegated to PermissionPolicy (Unit 8a contract).
+                        # PermissionPolicy.poll: 5 s adaptive cadence; raises
+                        # PermissionRevoked when a TCC permission goes away
+                        # mid-recording. The ``permission_lost`` stderr event
+                        # is the SwiftUI shell's only signal — silent
+                        # regression here would break the macOS shell UX.
                         try:
                             permission_policy.poll(elapsed)
                         except PermissionRevoked as _exc:
@@ -881,7 +869,6 @@ def _run_screen_recorder(rec: "ScreenRecorder") -> "RecordingResult":
                                 _stop_event.set()
                                 recorder.stop()
 
-                        # SCR-42: periodic disk space check delegated to DiskPolicy.
                         try:
                             disk_policy.poll(elapsed)
                         except _DiskSpaceCritical as _exc:
@@ -950,12 +937,10 @@ def _run_screen_recorder(rec: "ScreenRecorder") -> "RecordingResult":
 
                     menubar_policy.notify_processing()
 
-            # SCR-44: end-of-recording finalize runs INSIDE the engine
-            # ``with``-block so chunk_processor and scrub_worker drain
-            # before ``Recorder.__exit__`` closes the engine queues. This
-            # is the load-bearing ordering: no outsider holds engine-queue
-            # references past ``__exit__``, so close-coordination is
-            # purely internal (this is what eliminated ``_NoCloseProxy``).
+            # Finalize runs INSIDE the ``with``-block so chunk_processor
+            # and scrub_worker drain BEFORE Recorder.__exit__ closes the
+            # engine queues. Load-bearing ordering: no outsider holds
+            # engine-queue references past __exit__.
             _recording_name = (
                 (capture_dir / ".recording_id").read_text().strip()
                 if (capture_dir / ".recording_id").exists() else name
@@ -1036,8 +1021,8 @@ def _run_screen_recorder(rec: "ScreenRecorder") -> "RecordingResult":
         atexit.unregister(_cleanup_children)
         lock_policy.release()
 
-        # SCR-43: lock release delegated to NetworkPolicy.teardown().
-        # MitmProxyV15 releases the flock it acquired in setup(); Null is a no-op.
+        # MitmProxyV15.teardown releases the flock acquired in setup();
+        # Null is a no-op.
         network_policy.teardown()
 
         # Restore stderr fd if it wasn't restored earlier (e.g. exception
