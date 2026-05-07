@@ -308,6 +308,7 @@ def test_screen_recorder_calls_disk_policy_bind_and_preflight(tmp_path):
     from screencap.engine.config import RecordingConfig
     from screencap.engine.lock_policy import ClaimLock
     from screencap.engine.menubar_policy import Noop as MenubarNoop
+    from screencap.engine.network_policy import Null as NetworkNull
     from screencap.engine.permission_policy import Noop as PermNoop
     from screencap.engine.screen_recorder import (
         IpcChannels,
@@ -350,7 +351,7 @@ def test_screen_recorder_calls_disk_policy_bind_and_preflight(tmp_path):
         menubar=MenubarNoop(),
         permission=PermNoop(),
         disk=spy,
-        network=object(),
+        network=NetworkNull(),
     )
     legacy = LegacyOptions(output_dir=capture_dir)
 

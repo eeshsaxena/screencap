@@ -235,6 +235,7 @@ def test_screen_recorder_calls_permission_policy_preflight_and_poll(tmp_path):
 
     from screencap.engine.config import RecordingConfig
     from screencap.engine.disk_policy import Noop as DiskNoop
+    from screencap.engine.network_policy import Null as NetworkNull
     from screencap.engine.lock_policy import ClaimLock
     from screencap.engine.menubar_policy import Noop as MenubarNoop
     from screencap.engine.screen_recorder import (
@@ -273,7 +274,7 @@ def test_screen_recorder_calls_permission_policy_preflight_and_poll(tmp_path):
         menubar=MenubarNoop(),
         permission=spy,
         disk=DiskNoop(),
-        network=object(),
+        network=NetworkNull(),
     )
     legacy = LegacyOptions(output_dir=tmp_path / "perm-spy")
 

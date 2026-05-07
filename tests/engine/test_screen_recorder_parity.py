@@ -65,6 +65,7 @@ def test_seam_direct_path_matches_wrapper(tmp_path):
     from screencap.engine.disk_policy import Noop as DiskNoop
     from screencap.engine.lock_policy import ClaimLock
     from screencap.engine.menubar_policy import SpawnNewMenubar
+    from screencap.engine.network_policy import Null as NetworkNull
     from screencap.engine.permission_policy import Noop as PermNoop
     from screencap.engine.screen_recorder import (
         IpcChannels,
@@ -106,7 +107,7 @@ def test_seam_direct_path_matches_wrapper(tmp_path):
     # ``start_recording`` so the artifact comparison is apples-to-apples.
     policies = RecordingPolicies(
         signal=NoopSignalPolicy(), lock=ClaimLock(), menubar=SpawnNewMenubar(),
-        permission=PermNoop(), disk=DiskNoop(), network=object(),
+        permission=PermNoop(), disk=DiskNoop(), network=NetworkNull(),
     )
     legacy = LegacyOptions(output_dir=seam_dir)
     rec = ScreenRecorder(
@@ -131,6 +132,94 @@ def test_seam_direct_path_matches_wrapper(tmp_path):
     # ---- Parity ----------------------------------------------------------
     assert wrapper_artifacts == seam_artifacts, (
         f"Seam diverges from wrapper:\n"
+        f"  wrapper: {wrapper_artifacts}\n"
+        f"  seam:    {seam_artifacts}"
+    )
+
+
+def _network_mocks():
+    """Mocks for the MitmProxyV15 dependency chain."""
+    return [
+        mock.patch("screencap.config.get_network_config", return_value=mock.MagicMock()),
+        mock.patch("screencap.network.lifecycle.acquire_network_lock", return_value=mock.MagicMock()),
+        mock.patch("screencap.network.lifecycle.preflight_or_raise", return_value=8080),
+        mock.patch("screencap.network.crypto.get_or_create_kek", return_value=b"k" * 32),
+        mock.patch("screencap.network.crypto.generate_dek", return_value=b"d" * 32),
+        mock.patch("screencap.network.crypto.wrap_dek", return_value=(b"w" * 48, b"n" * 12)),
+        mock.patch("screencap.network.blocklist.effective_capture_bodies_for", return_value=frozenset(["*"])),
+    ]
+
+
+def test_seam_mitm_proxy_v15_path_matches_wrapper(tmp_path):
+    """``ScreenRecorder().run()`` with ``MitmProxyV15`` produces the same
+    on-disk artifacts as ``start_recording(network=True)``.
+
+    Both paths go through ``_run_screen_recorder``; this pins that the seam
+    correctly wires MitmProxyV15 and populates network recorder_kwargs without
+    diverging from the wrapper's artifact set.
+    """
+    from screencap.engine.config import RecordingConfig
+    from screencap.engine.disk_policy import Noop as DiskNoop
+    from screencap.engine.lock_policy import ClaimLock
+    from screencap.engine.menubar_policy import SpawnNewMenubar
+    from screencap.engine.network_policy import MitmProxyV15
+    from screencap.engine.permission_policy import Noop as PermNoop
+    from screencap.engine.screen_recorder import (
+        IpcChannels,
+        LegacyOptions,
+        NoopSignalPolicy,
+        RecordingPolicies,
+        RecordingRequest,
+        RecordingResult,
+        ScreenRecorder,
+    )
+    from screencap.recorder import start_recording
+
+    wrapper_dir = tmp_path / "wrapper-net"
+    seam_dir = tmp_path / "seam-net"
+
+    # ---- Wrapper path (start_recording with network=True) -------------------
+    all_mocks = _common_mocks() + _network_mocks()
+    for m in all_mocks:
+        m.start()
+    try:
+        capture_dir, elapsed, _mb_proc, _mb_state = start_recording(
+            "parity-net", output_dir=wrapper_dir, network=True,
+        )
+    finally:
+        for m in all_mocks:
+            m.stop()
+
+    assert wrapper_dir.exists()
+    wrapper_artifacts = _record_artifact_set(wrapper_dir)
+
+    # ---- Seam-direct path ---------------------------------------------------
+    request = RecordingRequest(name="parity-net", config=RecordingConfig())
+    channels = IpcChannels.create()
+    policies = RecordingPolicies(
+        signal=NoopSignalPolicy(), lock=ClaimLock(), menubar=SpawnNewMenubar(),
+        permission=PermNoop(), disk=DiskNoop(), network=MitmProxyV15(),
+    )
+    legacy = LegacyOptions(output_dir=seam_dir)
+
+    all_mocks = _common_mocks() + _network_mocks()
+    for m in all_mocks:
+        m.start()
+    try:
+        result = ScreenRecorder(
+            request=request, channels=channels, policies=policies, legacy=legacy,
+        ).run()
+    finally:
+        for m in all_mocks:
+            m.stop()
+
+    assert isinstance(result, RecordingResult)
+    assert seam_dir.exists()
+    seam_artifacts = _record_artifact_set(seam_dir)
+
+    # ---- Parity -------------------------------------------------------------
+    assert wrapper_artifacts == seam_artifacts, (
+        f"Seam (MitmProxyV15) diverges from wrapper (network=True):\n"
         f"  wrapper: {wrapper_artifacts}\n"
         f"  seam:    {seam_artifacts}"
     )

@@ -246,7 +246,7 @@ class LegacyOptions:
     Each field below is annotated with the slice that absorbs it:
 
       * ``force_clean``               → SCR-40 (LockPolicy / orphan check).
-      * ``network`` / ``force_mode``  → SCR-43 (NetworkPolicy + privacy).
+      * ``force_mode``                → SCR-43 (NetworkPolicy + privacy).
       * ``audio`` / ``capture_*``     → folded into ``RecordingRequest``
                                         once ``RecordingConfig`` covers
                                         every per-recording flag.
@@ -271,7 +271,6 @@ class LegacyOptions:
     chunk_duration: float | None = None
     live_upload: bool = True
     force_mode: PrivacyMode | None = None
-    network: bool = False
     network_handoff_ready: Any | None = None
 
 
