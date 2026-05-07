@@ -87,11 +87,13 @@ Subprocess for one recording. Calls:
 
 1. `os.setpgrp()` — detach from controller's process group; tty SIGINT does not reach worker.
 2. `signal.signal(SIGINT, SIG_IGN)` — controller owns Ctrl+C.
-3. `screencap.recorder.start_recording(...)` with worker flags:
-   - `_skip_menubar_spawn=True` (controller owns menubar)
-   - `_skip_pidfile=True` (controller owns pidfile)
-   - `_skip_sigint_handler=True` (controller owns signal handling)
-   - Three injected queues: `_external_window_feed_q`, `_external_override_q`, `_external_disable_q`
+3. `screencap.recorder.start_recording(...)` with worker-mode policy injections (replacing the legacy `_skip_*` flags):
+   - `_menubar_policy=Noop()` — controller owns the persistent menubar.
+   - `_lock_policy=InheritLock()` — controller owns the pidfile.
+   - `_signal_policy=NoopSignalPolicy()` — controller owns Ctrl+C.
+   - `_channels=IpcChannels(window_feed, override, disable)` — three queues injected from the controller.
+
+These keyword-only arguments thread through `start_recording` into the `RecordingPolicies` / `IpcChannels` bundles consumed by `engine.ScreenRecorder`. Standalone CLI uses the defaults (`SpawnNewMenubar` / `ClaimLock` / `ThreeTapSigint`).
 
 Writes `.recording_ready` (JSON: `elapsed`, `completed_at`, `disk_full`) on clean exit. Writes `.recording_error.log` on exception.
 
@@ -216,7 +218,7 @@ Context assembly: up to 5 sample screenshots (resized to 1024px wide, base64 JPE
 ## Before you change it
 
 - Adding a new menubar event type: extend the message format used on `menubar_event_q`. Both menubar emit and controller dispatch need updating.
-- Changing the worker subprocess flags: `_skip_*` flags are how the worker tells `start_recording` to defer specific responsibilities to the controller. Don't hardcode behavior in `start_recording`; respect the flags.
+- Changing the worker subprocess injection: the `_menubar_policy` / `_lock_policy` / `_signal_policy` / `_channels` keyword args on `start_recording` are how the worker tells the engine seam to defer specific responsibilities to the controller. Add new policy axes by extending `RecordingPolicies` and adding a `Noop` implementation; don't hardcode worker-vs-CLI behavior in `start_recording`.
 - Adding a new auto-named field: update `_PROMPT` in `namer.py`, the response parser, the slug regex if format changes, and `_update_task_description` for the DB write.
 - Adding a new post-process step: add it to `_postprocess_pipeline` in `session.py`. Be aware of the 900s SIGALRM watchdog — long-running steps may need their own deadline.
 - Changing the destination prompt in setup_wizard: the 4 destinations (Cloud/Local/Both/Ask) map to specific `(PrivacyMode, upload_default)` pairs. Adding a new destination requires updating both the matrix and downstream config consumers.

@@ -15,6 +15,8 @@ concrete policy objects.
 from __future__ import annotations
 
 import multiprocessing
+import os
+import signal
 from pathlib import Path
 from typing import TYPE_CHECKING, Protocol
 
@@ -24,6 +26,77 @@ if TYPE_CHECKING:
     from screencap.engine.screen_recorder import IpcChannels
 
 _console = Console()
+
+
+# ---------------------------------------------------------------------------
+# Menu bar subprocess helpers
+# ---------------------------------------------------------------------------
+
+
+def _spawn_menubar(
+    recording_name: str,
+    start_time: float,
+    state_file: Path,
+    window_feed_q: multiprocessing.Queue | None = None,
+    override_q: multiprocessing.Queue | None = None,
+    prompt_enabled: bool = True,
+    disable_q: multiprocessing.Queue | None = None,
+    *,
+    audio_enabled: bool = True,
+) -> multiprocessing.Process | None:
+    """Spawn the menu bar status item as a daemon subprocess.
+
+    Returns the Process object on success, or None if spawn fails.
+    The process is daemonic so it is killed when the parent exits.
+
+    Args:
+        prompt_enabled: When True, the menubar shows a non-activating
+            NSPanel the first time a never-seen ``(app, domain)`` pair
+            becomes the frontmost window during the recording.
+        disable_q: Optional queue the menubar writes to when the user
+            toggles a target to ``exclude``. The recorder's scrub worker
+            consumes this queue to retroactively delete already-captured
+            rows for that target.
+        audio_enabled: Initial state of the "Audio (next recording)"
+            toggle shown in the menu.  Legacy / non-session path only —
+            in session mode the :class:`SessionController` passes the
+            value directly to ``_run_menubar``.
+    """
+    from screencap.menubar import _run_menubar
+
+    proc = multiprocessing.Process(
+        target=_run_menubar,
+        args=(os.getpid(), recording_name, start_time, str(state_file),
+              window_feed_q, override_q, prompt_enabled, disable_q),
+        kwargs={"audio_enabled": audio_enabled},
+        daemon=True,
+        name="menubar",
+    )
+    proc.start()
+    return proc
+
+
+def _kill_menubar(
+    proc: multiprocessing.Process | None,
+    state_file: Path | None = None,
+) -> None:
+    """Terminate the menu bar subprocess.  Safe to call multiple times."""
+    if proc is None:
+        return
+    # Signal via state file first (allows clean AppKit shutdown)
+    if state_file is not None:
+        try:
+            from screencap.menubar import STATE_DONE
+            state_file.write_text(STATE_DONE)
+        except Exception:
+            pass
+    # SIGKILL immediately — the menu bar is a UI helper, no data to flush.
+    pid = getattr(proc, "pid", None)
+    if pid:
+        try:
+            os.kill(pid, signal.SIGKILL)
+        except (ProcessLookupError, PermissionError):
+            pass
 
 
 class MenubarPolicy(Protocol):
