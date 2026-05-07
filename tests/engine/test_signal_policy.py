@@ -125,8 +125,10 @@ def test_screen_recorder_invokes_signal_policy_install_then_uninstall(tmp_path):
     from unittest import mock
 
     from screencap.engine.config import RecordingConfig
+    from screencap.engine.disk_policy import Noop as DiskNoop
     from screencap.engine.lock_policy import ClaimLock
     from screencap.engine.menubar_policy import Noop as MenubarNoop
+    from screencap.engine.permission_policy import Noop as PermNoop
     from screencap.engine.screen_recorder import (
         IpcChannels,
         LegacyOptions,
@@ -135,9 +137,6 @@ def test_screen_recorder_invokes_signal_policy_install_then_uninstall(tmp_path):
         ScreenRecorder,
     )
     from tests.conftest import FakeRecorder
-
-    DiskUsage = namedtuple("DiskUsage", ["total", "used", "free"])
-    plenty = DiskUsage(total=500e9, used=100e9, free=400e9)
 
     class SpyPolicy:
         def __init__(self):
@@ -157,8 +156,8 @@ def test_screen_recorder_invokes_signal_policy_install_then_uninstall(tmp_path):
         signal=spy,
         lock=ClaimLock(),
         menubar=MenubarNoop(),
-        permission=object(),
-        disk=object(),
+        permission=PermNoop(),
+        disk=DiskNoop(),
         network=object(),
     )
     legacy = LegacyOptions(output_dir=tmp_path / "spy")
@@ -167,14 +166,11 @@ def test_screen_recorder_invokes_signal_policy_install_then_uninstall(tmp_path):
     )
 
     with (
-        mock.patch("screencap.recorder._check_macos_permissions"),
         mock.patch("screencap.recorder.get_audio_default", return_value=False),
         mock.patch("screencap.recorder.get_wifi_metrics", return_value=False),
         mock.patch("screencap.recorder.get_app_versions", return_value=False),
-        mock.patch("screencap.recorder.get_disk_warn_mb", return_value=2000),
-        mock.patch("screencap.recorder.get_disk_stop_mb", return_value=500),
-        mock.patch("shutil.disk_usage", return_value=plenty),
         mock.patch("screencap.pidfile.find_orphaned_processes", return_value=[]),
+        mock.patch("screencap.pidfile.claim_lock"),
         mock.patch("screencap.pidfile.write_pidfile"),
         mock.patch("screencap.pidfile.delete_pidfile"),
         mock.patch("screencap.engine.recorder.Recorder", FakeRecorder),

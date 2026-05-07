@@ -36,16 +36,23 @@ def _record_artifact_set(capture_dir):
 
 
 def _common_mocks():
-    """Shared external-boundary mocks for both wrapper and seam paths."""
+    """Shared external-boundary mocks for both wrapper and seam paths.
+
+    ``_check_macos_permissions`` is called by ``MacOSTCC.preflight()`` (wrapper
+    path). Disk thresholds are patched at ``screencap.config`` because
+    ``MonitorAndStop.preflight()`` imports them from there via deferred import.
+    The seam path uses ``Noop`` for both policies so those mocks are harmless.
+    """
     return [
         mock.patch("screencap.recorder._check_macos_permissions"),
         mock.patch("screencap.recorder.get_audio_default", return_value=False),
         mock.patch("screencap.recorder.get_wifi_metrics", return_value=False),
         mock.patch("screencap.recorder.get_app_versions", return_value=False),
-        mock.patch("screencap.recorder.get_disk_warn_mb", return_value=2000),
-        mock.patch("screencap.recorder.get_disk_stop_mb", return_value=500),
+        mock.patch("screencap.config.get_disk_warn_mb", return_value=2000),
+        mock.patch("screencap.config.get_disk_stop_mb", return_value=500),
         mock.patch("shutil.disk_usage", return_value=_PLENTY_OF_DISK),
         mock.patch("screencap.pidfile.find_orphaned_processes", return_value=[]),
+        mock.patch("screencap.pidfile.claim_lock"),
         mock.patch("screencap.pidfile.write_pidfile"),
         mock.patch("screencap.pidfile.delete_pidfile"),
         mock.patch("screencap.engine.recorder.Recorder", FakeRecorder),
@@ -55,8 +62,10 @@ def _common_mocks():
 def test_seam_direct_path_matches_wrapper(tmp_path):
     """``ScreenRecorder().run()`` produces the same artifacts as ``start_recording()``."""
     from screencap.engine.config import RecordingConfig
+    from screencap.engine.disk_policy import Noop as DiskNoop
     from screencap.engine.lock_policy import ClaimLock
     from screencap.engine.menubar_policy import SpawnNewMenubar
+    from screencap.engine.permission_policy import Noop as PermNoop
     from screencap.engine.screen_recorder import (
         IpcChannels,
         LegacyOptions,
@@ -97,7 +106,7 @@ def test_seam_direct_path_matches_wrapper(tmp_path):
     # ``start_recording`` so the artifact comparison is apples-to-apples.
     policies = RecordingPolicies(
         signal=NoopSignalPolicy(), lock=ClaimLock(), menubar=SpawnNewMenubar(),
-        permission=object(), disk=object(), network=object(),
+        permission=PermNoop(), disk=DiskNoop(), network=object(),
     )
     legacy = LegacyOptions(output_dir=seam_dir)
     rec = ScreenRecorder(

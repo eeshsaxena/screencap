@@ -59,6 +59,10 @@ class RecordingInterrupted(RecordingError):
 class PermissionRevoked(RecordingInterrupted):
     """A required TCC permission was revoked during recording."""
 
+    def __init__(self, missing: str) -> None:
+        super().__init__(missing)
+        self.missing = missing
+
 
 class Monitor(Protocol):
     """Shared shape for ``PermissionPolicy`` and ``DiskPolicy``.

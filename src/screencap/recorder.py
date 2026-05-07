@@ -693,8 +693,10 @@ def start_recording(
     SCR-41 once ``MenubarPolicy`` owns them.
     """
     from screencap.engine.config import RecordingConfig
+    from screencap.engine.disk_policy import MonitorAndStop
     from screencap.engine.lock_policy import ClaimLock
     from screencap.engine.menubar_policy import SpawnNewMenubar
+    from screencap.engine.permission_policy import MacOSTCC
     from screencap.engine.screen_recorder import (
         IpcChannels,
         LegacyOptions,
@@ -721,8 +723,8 @@ def start_recording(
         signal=_signal_policy if _signal_policy is not None else ThreeTapSigint(),
         lock=_lock_policy if _lock_policy is not None else ClaimLock(),
         menubar=menubar,
-        permission=object(),
-        disk=object(),
+        permission=MacOSTCC(),
+        disk=MonitorAndStop(),
         network=object(),
     )
     legacy = LegacyOptions(
@@ -769,6 +771,8 @@ def _run_screen_recorder(rec: "ScreenRecorder") -> "RecordingResult":
     signal_policy = rec._policies.signal
     lock_policy = rec._policies.lock
     menubar_policy = rec._policies.menubar
+    permission_policy = rec._policies.permission
+    disk_policy = rec._policies.disk
     channels = rec._channels
     name = request.name
     description = request.description
@@ -811,6 +815,9 @@ def _run_screen_recorder(rec: "ScreenRecorder") -> "RecordingResult":
     else:
         capture_dir = get_recordings_dir() / name
 
+    # SCR-42: bind disk policy to the resolved capture_dir before preflight.
+    disk_policy.bind(capture_dir)
+
     # SCR-40: orphan preflight + process-exclusive lock claim are bundled
     # into ``LockPolicy.claim``. Standalone CLI passes ``ClaimLock``;
     # session workers pass ``InheritLock`` (controller already claimed at
@@ -824,38 +831,14 @@ def _run_screen_recorder(rec: "ScreenRecorder") -> "RecordingResult":
         )
         raise SystemExit(1)
 
-    # --- Disk space thresholds ---
-    warn_mb = get_disk_warn_mb()
-    stop_mb = get_disk_stop_mb()
-
-    if warn_mb > 0 and stop_mb > 0 and stop_mb >= warn_mb:
-        console.print(
-            f"[red]Error:[/red] disk_stop_mb ({stop_mb}) must be less than "
-            f"disk_warn_mb ({warn_mb}). Adjust your config or env vars."
-        )
-        raise SystemExit(1)
-
-    # --- Pre-recording disk space check (before mkdir) ---
-    check_path = capture_dir.parent if not capture_dir.exists() else capture_dir
+    # SCR-42: disk preflight delegated to DiskPolicy.
+    from screencap.engine.disk_policy import DiskSpaceCritical as _DiskSpaceCritical
+    from screencap.engine.screen_recorder import DiskTooLowAtStart as _DiskTooLowAtStart
     try:
-        free = shutil.disk_usage(check_path).free
-        warn_bytes = warn_mb * 1_048_576
-        if warn_mb > 0 and free < warn_bytes:
-            console.print(
-                f"[red]Error:[/red] Only {free / 1e9:.1f} GB free on "
-                f"{check_path}. Need at least "
-                f"{warn_bytes / 1e9:.1f} GB to start recording.\n"
-                f"  Set SCREENCAP_DISK_WARN_MB to lower the threshold, or =0 to disable."
-            )
-            raise SystemExit(1)
-    except FileNotFoundError:
-        console.print(
-            f"[red]Error:[/red] Recording path not found: {check_path}"
-        )
+        disk_policy.preflight()
+    except _DiskTooLowAtStart as exc:
+        console.print(f"[red]Error:[/red] {exc}")
         raise SystemExit(1)
-    except OSError as e:
-        if verbose:
-            console.print(f"[yellow]Warning:[/yellow] Disk space check failed: {e}")
 
     capture_dir.mkdir(parents=True, exist_ok=True)
 
@@ -866,8 +849,8 @@ def _run_screen_recorder(rec: "ScreenRecorder") -> "RecordingResult":
     if not verbose:
         _suppress_output()
 
-    # Check macOS permissions (Screen Recording, Accessibility, Input Monitoring)
-    _check_macos_permissions()
+    # SCR-42: permission preflight delegated to PermissionPolicy.
+    permission_policy.preflight()
 
     desc = description or ""
 
@@ -1008,10 +991,8 @@ def _run_screen_recorder(rec: "ScreenRecorder") -> "RecordingResult":
     _saved_stdout = None  # Will hold real stdout when we redirect to devnull
     _saved_stderr = None  # Will hold real stderr when we redirect to devnull
 
-    # Disk check state (local to this function)
-    last_disk_check = 0.0
+    # Disk check state — disk_policy tracks cadence and warning internally.
     disk_warning = ""
-    disk_check_interval = _DISK_CHECK_INTERVAL
     _disk_free_at_stop = 0.0
 
     # Pre-initialize for signal handler closures (handlers installed before
@@ -1410,28 +1391,19 @@ def _run_screen_recorder(rec: "ScreenRecorder") -> "RecordingResult":
                 console=console,
                 refresh_per_second=2,
             ) as live:
-                _last_perm_check = 0.0
-                # 5s interval (todo 002) bounds the subprocess cost from the
-                # fresh-TCC-check path. Combined with SwiftUI's own 5s poll,
-                # detection SLA stays well under 10s.
-                _PERM_CHECK_INTERVAL = 5.0
                 try:
                     while recorder.is_recording and not _stop_event.is_set():
                         elapsed = time.time() - t0
                         pulse_on = int(elapsed) % 2 == 0
 
-                        # Unit 8: mid-recording permission revocation watcher.
-                        # Engine-side defense for the silent-black-frame TCC
-                        # bypass anti-pattern. SwiftUI also polls independently
-                        # (5s + on NSWorkspace activation), but this catches
-                        # the case where the SwiftUI watcher misses a transition.
-                        if elapsed - _last_perm_check >= _PERM_CHECK_INTERVAL:
-                            _last_perm_check = elapsed
-                            _ok, _missing = _check_permissions_now()
-                            if not _ok and not _stop_event.is_set():
-                                _stop_reason = f"permission_revoked_{_missing}"
-                                # Emit the structured stderr event for SwiftUI
-                                # consumption (Unit 8a contract).
+                        # SCR-42: mid-recording permission revocation watcher
+                        # delegated to PermissionPolicy (Unit 8a contract).
+                        from screencap.engine.screen_recorder import PermissionRevoked as _PermissionRevoked
+                        try:
+                            permission_policy.poll(elapsed)
+                        except _PermissionRevoked as _exc:
+                            if not _stop_event.is_set():
+                                _stop_reason = f"permission_revoked_{_exc.missing}"
                                 try:
                                     from screencap._stderr_events import (
                                         EVENT_PERMISSION_LOST,
@@ -1439,7 +1411,7 @@ def _run_screen_recorder(rec: "ScreenRecorder") -> "RecordingResult":
                                     )
                                     _emit_event(
                                         EVENT_PERMISSION_LOST,
-                                        permission=_missing,
+                                        permission=_exc.missing,
                                         elapsed=elapsed,
                                     )
                                 except Exception:
@@ -1447,28 +1419,16 @@ def _run_screen_recorder(rec: "ScreenRecorder") -> "RecordingResult":
                                 _stop_event.set()
                                 recorder.stop()
 
-                        # Periodic disk space check
-                        if elapsed - last_disk_check >= disk_check_interval:
-                            last_disk_check = elapsed
-                            try:
-                                free = shutil.disk_usage(capture_dir).free
-                                free_mb = free / 1_048_576
-
-                                if stop_mb > 0 and free_mb < stop_mb:
-                                    if not _stop_event.is_set():
-                                        _stop_reason = "disk_full"
-                                        _disk_free_at_stop = free_mb
-                                        disk_warning = f"Disk critically low: {free_mb:.0f} MB free. Stopping."
-                                        _stop_event.set()
-                                        recorder.stop()
-                                elif warn_mb > 0 and free_mb < warn_mb:
-                                    disk_warning = f"Low disk: {free / 1e9:.1f} GB free"
-                                    disk_check_interval = 5
-                                else:
-                                    disk_warning = ""
-                                    disk_check_interval = _DISK_CHECK_INTERVAL
-                            except OSError:
-                                disk_warning = ""
+                        # SCR-42: periodic disk space check delegated to DiskPolicy.
+                        try:
+                            disk_policy.poll(elapsed)
+                        except _DiskSpaceCritical as _exc:
+                            if not _stop_event.is_set():
+                                _stop_reason = "disk_full"
+                                _disk_free_at_stop = _exc.free_mb
+                                _stop_event.set()
+                                recorder.stop()
+                        disk_warning = disk_policy.warning
 
                         _chunk_status = chunk_processor.status if chunk_processor else ""
                         _health_warning = recorder.health_warning
