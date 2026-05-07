@@ -5,8 +5,11 @@ Promotes the inline three-tap SIGINT escalation + SIGTERM handler in
 
 * ``ThreeTapSigint``  — installs SIGINT (3-tap escalation) and SIGTERM
   handlers; CLI standalone path uses this.
-* ``NoopSignalPolicy`` — does nothing; session workers use this because
-  the ``SessionController`` parent owns Ctrl+C.
+* ``SigtermOnly`` — installs only the SIGTERM handler; session workers
+  use this because the ``SessionController`` owns Ctrl+C and forwards
+  stop requests as SIGTERM.
+* ``NoopSignalPolicy`` — does nothing; in-process tests use this to
+  avoid mutating the runner's signal handlers.
 
 These are *unit* tests for install/uninstall behaviour. The Tier-3
 integration test that proves SIGINT-during-setup wins lives in
@@ -72,13 +75,50 @@ def test_three_tap_sigint_uninstall_restores_defaults():
         assert signal.getsignal(signal.SIGTERM) == signal.SIG_DFL
 
 
+def test_sigterm_only_install_registers_sigterm_only():
+    """``SigtermOnly.install`` registers SIGTERM but leaves SIGINT alone.
+
+    Session workers SIG_IGN SIGINT at entry (controller forwards Ctrl+C
+    elsewhere) but still need the SIGTERM handler so a stop click runs
+    ``recorder.stop()`` — chunk drain, scrub, sentinel write — instead
+    of taking the default SIGTERM behaviour and killing the worker
+    immediately.
+    """
+    from screencap.engine.screen_recorder import SigtermOnly
+
+    def sigint_handler(sig, frame):  # noqa: ARG001
+        pass
+
+    def sigterm_handler(sig, frame):  # noqa: ARG001
+        pass
+
+    sentinel_int = signal.getsignal(signal.SIGINT)
+    policy = SigtermOnly()
+    with _saved_handlers():
+        policy.install(sigint_handler=sigint_handler, sigterm_handler=sigterm_handler)
+        assert signal.getsignal(signal.SIGINT) is sentinel_int
+        assert signal.getsignal(signal.SIGTERM) is sigterm_handler
+
+
+def test_sigterm_only_uninstall_restores_sigterm_default():
+    """``SigtermOnly.uninstall`` restores SIGTERM to ``SIG_DFL``."""
+    from screencap.engine.screen_recorder import SigtermOnly
+
+    policy = SigtermOnly()
+    with _saved_handlers():
+        policy.install(
+            sigint_handler=lambda sig, frame: None,
+            sigterm_handler=lambda sig, frame: None,
+        )
+        policy.uninstall()
+        assert signal.getsignal(signal.SIGTERM) == signal.SIG_DFL
+
+
 def test_noop_signal_policy_install_does_not_touch_handlers():
     """``NoopSignalPolicy.install`` leaves SIGINT/SIGTERM unchanged.
 
-    Session workers set the policy to ``Noop`` because the parent
-    ``SessionController`` owns Ctrl+C. The previous shape was a
-    ``_skip_sigint_handler=True`` private kwarg on ``start_recording``;
-    SCR-39 retires that flag in favour of this policy.
+    Used by in-process parity tests that must not mutate the runner's
+    signal handlers. Production session workers use ``SigtermOnly``.
     """
     from screencap.engine.screen_recorder import NoopSignalPolicy
 

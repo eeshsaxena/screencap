@@ -27,6 +27,7 @@ import threading
 import time
 import warnings
 from dataclasses import dataclass
+from datetime import datetime, timezone
 from pathlib import Path
 from typing import TYPE_CHECKING, Any, Callable, Protocol
 
@@ -98,7 +99,7 @@ SignalHandler = Callable[[int, Any], None]
 
 
 class SignalPolicy(Protocol):
-    """SIGINT / SIGTERM handler installation. ``ThreeTapSigint`` | ``NoopSignalPolicy``.
+    """SIGINT / SIGTERM handler installation. ``ThreeTapSigint`` | ``SigtermOnly`` | ``NoopSignalPolicy``.
 
     The policy is install/uninstall plumbing only — handler bodies stay
     in ``_run_screen_recorder`` because they close over ``nonlocal``
@@ -146,13 +147,12 @@ class ThreeTapSigint:
 
 
 class NoopSignalPolicy:
-    """Session-worker signal policy: leave SIGINT/SIGTERM untouched.
+    """Test-only signal policy: leave SIGINT/SIGTERM untouched.
 
-    The ``SessionController`` parent owns Ctrl+C; workers must not
-    install SIGINT handlers that would intercept the controller's
-    signal-forwarding. Replaces the ``_skip_sigint_handler=True`` private
-    kwarg that ``run_recording_worker`` used to pass to
-    ``start_recording``.
+    Used by in-process parity / network tests that must not register
+    runtime signal handlers. Production session workers use
+    ``SigtermOnly`` instead — they need the SIGTERM graceful-stop
+    handler.
     """
 
     def install(
@@ -165,6 +165,28 @@ class NoopSignalPolicy:
 
     def uninstall(self) -> None:
         pass
+
+
+class SigtermOnly:
+    """Session-worker signal policy: install SIGTERM, leave SIGINT alone.
+
+    Workers spawned by ``SessionController`` already SIG_IGN SIGINT at
+    entry (the controller owns Ctrl+C and forwards it as SIGTERM via
+    ``Process.terminate()``). The runtime still needs the SIGTERM
+    handler installed so ``recorder.stop()`` runs the chunk/scrub drain
+    + sentinel write before the worker exits.
+    """
+
+    def install(
+        self,
+        *,
+        sigint_handler: SignalHandler,
+        sigterm_handler: SignalHandler,
+    ) -> None:
+        signal.signal(signal.SIGTERM, sigterm_handler)
+
+    def uninstall(self) -> None:
+        signal.signal(signal.SIGTERM, signal.SIG_DFL)
 
 
 class LockPolicy(Protocol):
@@ -691,17 +713,19 @@ def _run_screen_recorder(rec: "ScreenRecorder") -> "RecordingResult":
             # Write sentinel locally for recovery via `screencap upload`
             # (no upload — os._exit is imminent)
             try:
+                import uuid
+
                 _sentinel = {
                     "version": 1,
                     "recording_name": _recording_name,
-                    "completed_at": _dt.now(_tz.utc).isoformat(),
+                    "completed_at": datetime.now(timezone.utc).isoformat(),
                     "stop_reason": "force",
                     "chunks_expected": len(list(capture_dir.glob("chunk_*_manifest.json"))),
-                    "sentinel_id": str(__import__('uuid').uuid4()),
+                    "sentinel_id": str(uuid.uuid4()),
                     "show_on_website": show_on_website,
                 }
                 (capture_dir / "recording_complete.json").write_text(
-                    _json.dumps(_sentinel, indent=2)
+                    json.dumps(_sentinel, indent=2)
                 )
             except Exception:
                 pass
@@ -719,9 +743,9 @@ def _run_screen_recorder(rec: "ScreenRecorder") -> "RecordingResult":
 
         # SCR-39: SignalPolicy decides whether to register handlers.
         # Standalone CLI passes ThreeTapSigint; session workers pass
-        # NoopSignalPolicy (controller owns Ctrl+C). Installed BEFORE
-        # Recorder.__enter__() so SIGINT during the entire setup window
-        # is honoured — Tier-3 enforcement in
+        # SigtermOnly (controller owns Ctrl+C, forwards as SIGTERM).
+        # Installed BEFORE Recorder.__enter__() so SIGINT during the
+        # entire setup window is honoured — Tier-3 enforcement in
         # tests/test_signal_during_setup.py.
         signal_policy.install(
             sigint_handler=_force_exit, sigterm_handler=_sigterm_handler,
@@ -1039,7 +1063,7 @@ def _run_screen_recorder(rec: "ScreenRecorder") -> "RecordingResult":
                     show_on_website=show_on_website,
                 )
                 _sentinel_path = capture_dir / "recording_complete.json"
-                _sentinel_path.write_text(_json.dumps(_sentinel_data, indent=2))
+                _sentinel_path.write_text(json.dumps(_sentinel_data, indent=2))
             except Exception:
                 pass
 

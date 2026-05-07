@@ -160,7 +160,7 @@ def run_recording_worker(args: dict) -> None:
 
     from screencap.engine.lock_policy import InheritLock
     from screencap.engine.menubar_policy import Noop as MenubarNoop
-    from screencap.engine.screen_recorder import IpcChannels, NoopSignalPolicy
+    from screencap.engine.screen_recorder import IpcChannels, SigtermOnly
     from screencap.recorder import DiskFullError, start_recording
 
     capture_dir_hint = Path(args.get("capture_dir_hint", ""))
@@ -198,7 +198,7 @@ def run_recording_worker(args: dict) -> None:
                 disable=args["_disable_q"],
             ),
             _menubar_policy=MenubarNoop(),
-            _signal_policy=NoopSignalPolicy(),
+            _signal_policy=SigtermOnly(),
             _lock_policy=InheritLock(),
             network_handoff_ready=args.get("_network_handoff_ready"),
         )
