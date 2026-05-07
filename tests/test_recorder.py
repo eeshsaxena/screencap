@@ -171,8 +171,8 @@ class TestOrphanDetection:
             mock.patch("screencap.recorder._check_macos_permissions"),
             mock.patch("screencap.recorder.get_audio_default", return_value=False),
             mock.patch("screencap.recorder.get_wifi_metrics", return_value=False),
-            mock.patch("screencap.recorder.get_disk_warn_mb", return_value=2000),
-            mock.patch("screencap.recorder.get_disk_stop_mb", return_value=500),
+            mock.patch("screencap.config.get_disk_warn_mb", return_value=2000),
+            mock.patch("screencap.config.get_disk_stop_mb", return_value=500),
             mock.patch("shutil.disk_usage", return_value=_PLENTY_OF_DISK),
             mock.patch("screencap.pidfile.find_orphaned_processes", return_value=orphans),
             mock.patch("screencap.pidfile.terminate_processes") as mock_term,
@@ -422,8 +422,8 @@ class TestPreRecordingDiskCheck:
             mock.patch("screencap.recorder._check_macos_permissions"),
             mock.patch("screencap.recorder.get_audio_default", return_value=False),
             mock.patch("screencap.recorder.get_wifi_metrics", return_value=False),
-            mock.patch("screencap.recorder.get_disk_warn_mb", return_value=2000),
-            mock.patch("screencap.recorder.get_disk_stop_mb", return_value=500),
+            mock.patch("screencap.config.get_disk_warn_mb", return_value=2000),
+            mock.patch("screencap.config.get_disk_stop_mb", return_value=500),
             mock.patch("shutil.disk_usage", return_value=fake_usage),
             mock.patch("screencap.pidfile.find_orphaned_processes", return_value=[]),
             mock.patch("screencap.pidfile.write_pidfile"),
@@ -444,8 +444,8 @@ class TestPreRecordingDiskCheck:
             mock.patch("screencap.recorder._check_macos_permissions"),
             mock.patch("screencap.recorder.get_audio_default", return_value=False),
             mock.patch("screencap.recorder.get_wifi_metrics", return_value=False),
-            mock.patch("screencap.recorder.get_disk_warn_mb", return_value=2000),
-            mock.patch("screencap.recorder.get_disk_stop_mb", return_value=500),
+            mock.patch("screencap.config.get_disk_warn_mb", return_value=2000),
+            mock.patch("screencap.config.get_disk_stop_mb", return_value=500),
             mock.patch("shutil.disk_usage", return_value=fake_usage),
             mock.patch("screencap.pidfile.find_orphaned_processes", return_value=[]),
         ):
@@ -460,8 +460,8 @@ class TestPreRecordingDiskCheck:
             mock.patch("screencap.recorder._check_macos_permissions"),
             mock.patch("screencap.recorder.get_audio_default", return_value=False),
             mock.patch("screencap.recorder.get_wifi_metrics", return_value=False),
-            mock.patch("screencap.recorder.get_disk_warn_mb", return_value=2000),
-            mock.patch("screencap.recorder.get_disk_stop_mb", return_value=500),
+            mock.patch("screencap.config.get_disk_warn_mb", return_value=2000),
+            mock.patch("screencap.config.get_disk_stop_mb", return_value=500),
             mock.patch("shutil.disk_usage", side_effect=FileNotFoundError("not found")),
             mock.patch("screencap.pidfile.find_orphaned_processes", return_value=[]),
         ):
@@ -480,8 +480,8 @@ class TestPreRecordingDiskCheck:
             mock.patch("screencap.recorder._check_macos_permissions"),
             mock.patch("screencap.recorder.get_audio_default", return_value=False),
             mock.patch("screencap.recorder.get_wifi_metrics", return_value=False),
-            mock.patch("screencap.recorder.get_disk_warn_mb", return_value=2000),
-            mock.patch("screencap.recorder.get_disk_stop_mb", return_value=500),
+            mock.patch("screencap.config.get_disk_warn_mb", return_value=2000),
+            mock.patch("screencap.config.get_disk_stop_mb", return_value=500),
             mock.patch("shutil.disk_usage", side_effect=OSError("FUSE error")),
             mock.patch("screencap.pidfile.find_orphaned_processes", return_value=[]),
             mock.patch("screencap.pidfile.write_pidfile"),
@@ -510,8 +510,8 @@ class TestPreRecordingDiskCheck:
             mock.patch("screencap.recorder._check_macos_permissions"),
             mock.patch("screencap.recorder.get_audio_default", return_value=False),
             mock.patch("screencap.recorder.get_wifi_metrics", return_value=False),
-            mock.patch("screencap.recorder.get_disk_warn_mb", return_value=0),
-            mock.patch("screencap.recorder.get_disk_stop_mb", return_value=0),
+            mock.patch("screencap.config.get_disk_warn_mb", return_value=0),
+            mock.patch("screencap.config.get_disk_stop_mb", return_value=0),
             mock.patch("shutil.disk_usage", return_value=fake_usage),
             mock.patch("screencap.pidfile.find_orphaned_processes", return_value=[]),
             mock.patch("screencap.pidfile.write_pidfile"),
@@ -535,8 +535,8 @@ class TestPreRecordingDiskCheck:
             mock.patch("screencap.recorder._check_macos_permissions"),
             mock.patch("screencap.recorder.get_audio_default", return_value=False),
             mock.patch("screencap.recorder.get_wifi_metrics", return_value=False),
-            mock.patch("screencap.recorder.get_disk_warn_mb", return_value=2000),
-            mock.patch("screencap.recorder.get_disk_stop_mb", return_value=500),
+            mock.patch("screencap.config.get_disk_warn_mb", return_value=2000),
+            mock.patch("screencap.config.get_disk_stop_mb", return_value=500),
             mock.patch("shutil.disk_usage", return_value=fake_usage),
             mock.patch("screencap.pidfile.find_orphaned_processes", return_value=[]),
         ):
@@ -558,8 +558,8 @@ class TestThresholdValidation:
             mock.patch("screencap.recorder._check_macos_permissions"),
             mock.patch("screencap.recorder.get_audio_default", return_value=False),
             mock.patch("screencap.recorder.get_wifi_metrics", return_value=False),
-            mock.patch("screencap.recorder.get_disk_warn_mb", return_value=500),
-            mock.patch("screencap.recorder.get_disk_stop_mb", return_value=500),
+            mock.patch("screencap.config.get_disk_warn_mb", return_value=500),
+            mock.patch("screencap.config.get_disk_stop_mb", return_value=500),
             mock.patch("screencap.pidfile.find_orphaned_processes", return_value=[]),
         ):
             with pytest.raises(SystemExit):
@@ -573,8 +573,8 @@ class TestThresholdValidation:
             mock.patch("screencap.recorder._check_macos_permissions"),
             mock.patch("screencap.recorder.get_audio_default", return_value=False),
             mock.patch("screencap.recorder.get_wifi_metrics", return_value=False),
-            mock.patch("screencap.recorder.get_disk_warn_mb", return_value=500),
-            mock.patch("screencap.recorder.get_disk_stop_mb", return_value=1000),
+            mock.patch("screencap.config.get_disk_warn_mb", return_value=500),
+            mock.patch("screencap.config.get_disk_stop_mb", return_value=1000),
             mock.patch("screencap.pidfile.find_orphaned_processes", return_value=[]),
         ):
             with pytest.raises(SystemExit):
@@ -600,8 +600,8 @@ class TestPrivacyFilterInitFailure:
             mock.patch("screencap.recorder._check_macos_permissions"),
             mock.patch("screencap.recorder.get_audio_default", return_value=False),
             mock.patch("screencap.recorder.get_wifi_metrics", return_value=False),
-            mock.patch("screencap.recorder.get_disk_warn_mb", return_value=0),
-            mock.patch("screencap.recorder.get_disk_stop_mb", return_value=0),
+            mock.patch("screencap.config.get_disk_warn_mb", return_value=0),
+            mock.patch("screencap.config.get_disk_stop_mb", return_value=0),
             mock.patch("screencap.pidfile.find_orphaned_processes", return_value=[]),
             mock.patch("screencap.pidfile.write_pidfile"),
             mock.patch("screencap.pidfile.delete_pidfile"),
@@ -626,8 +626,8 @@ class TestPrivacyFilterInitFailure:
             mock.patch("screencap.recorder._check_macos_permissions"),
             mock.patch("screencap.recorder.get_audio_default", return_value=False),
             mock.patch("screencap.recorder.get_wifi_metrics", return_value=False),
-            mock.patch("screencap.recorder.get_disk_warn_mb", return_value=0),
-            mock.patch("screencap.recorder.get_disk_stop_mb", return_value=0),
+            mock.patch("screencap.config.get_disk_warn_mb", return_value=0),
+            mock.patch("screencap.config.get_disk_stop_mb", return_value=0),
             mock.patch("screencap.pidfile.find_orphaned_processes", return_value=[]),
             mock.patch("screencap.pidfile.write_pidfile"),
             mock.patch("screencap.pidfile.delete_pidfile"),
@@ -745,8 +745,8 @@ class TestHeadlessRecorderUnavailable:
             mock.patch("screencap.recorder._check_macos_permissions"),
             mock.patch("screencap.recorder.get_audio_default", return_value=False),
             mock.patch("screencap.recorder.get_wifi_metrics", return_value=False),
-            mock.patch("screencap.recorder.get_disk_warn_mb", return_value=2000),
-            mock.patch("screencap.recorder.get_disk_stop_mb", return_value=500),
+            mock.patch("screencap.config.get_disk_warn_mb", return_value=2000),
+            mock.patch("screencap.config.get_disk_stop_mb", return_value=500),
             mock.patch("shutil.disk_usage", return_value=_PLENTY_OF_DISK),
             mock.patch("screencap.pidfile.find_orphaned_processes", return_value=[]),
             mock.patch("screencap.pidfile.write_pidfile"),
@@ -792,8 +792,8 @@ class TestNetworkV15Plumbing:
         stack.enter_context(mock.patch("screencap.recorder.get_audio_default", return_value=False))
         stack.enter_context(mock.patch("screencap.recorder.get_wifi_metrics", return_value=False))
         stack.enter_context(mock.patch("screencap.recorder.get_app_versions", return_value=False))
-        stack.enter_context(mock.patch("screencap.recorder.get_disk_warn_mb", return_value=2000))
-        stack.enter_context(mock.patch("screencap.recorder.get_disk_stop_mb", return_value=500))
+        stack.enter_context(mock.patch("screencap.config.get_disk_warn_mb", return_value=2000))
+        stack.enter_context(mock.patch("screencap.config.get_disk_stop_mb", return_value=500))
         stack.enter_context(mock.patch("shutil.disk_usage", return_value=_PLENTY_OF_DISK))
         stack.enter_context(mock.patch("screencap.pidfile.find_orphaned_processes", return_value=[]))
         stack.enter_context(mock.patch("screencap.pidfile.write_pidfile"))

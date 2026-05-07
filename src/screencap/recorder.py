@@ -33,8 +33,6 @@ from screencap import __version__
 from screencap.config import (
     get_app_versions,
     get_audio_default,
-    get_disk_stop_mb,  # noqa: F401  -- re-exported for tests that mock it here
-    get_disk_warn_mb,  # noqa: F401  -- re-exported for tests that mock it here
     get_recordings_dir,
     get_wifi_metrics,
 )
