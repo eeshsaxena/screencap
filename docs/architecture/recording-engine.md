@@ -72,7 +72,7 @@ ScreenRecorder(
 
 `.run()` dispatches into `_run_screen_recorder`, which orchestrates the full recording lifecycle: lock claim → privacy filter setup → permission preflight → banner → engine `Recorder.__enter__` → `RecordingCollaborators.start` → live loop → finalize → `Recorder.__exit__`. The body lives in `engine/screen_recorder.py` so no policy logic remains in the CLI wrapper at `screencap/recorder.py`.
 
-`screencap/recorder.py` is now a thin CLI adapter (~700 lines from 1,900) holding only the `start_recording` shim, banner, `Live`-region rendering, summary printing, the `_open_privacy_settings` deep-link helper, and the stdout/stderr suppression around the engine flush block. It re-exports a few symbols (`_run_screen_recorder`, `_spawn_menubar`, `_kill_menubar`) for backward compatibility with existing test patches; the implementations live in the engine seam.
+`screencap/recorder.py` is a thin CLI adapter holding only the `start_recording` shim, banner, `Live`-region rendering, summary printing, the `_open_privacy_settings` deep-link helper, and the stdout/stderr suppression around the engine flush block. It re-exports a few symbols (`_run_screen_recorder`, `_spawn_menubar`, `_kill_menubar`) for backward compatibility with existing test patches; the implementations live in the engine seam.
 
 The full design is in [`docs/decisions/0001-engine-screen-recorder-seam.md`](../decisions/0001-engine-screen-recorder-seam.md).
 
