@@ -683,8 +683,8 @@ def start_recording(
     _external_override_q: "multiprocessing.Queue | None" = None,
     _external_disable_q: "multiprocessing.Queue | None" = None,
     _skip_menubar_spawn: bool = False,
-    _skip_pidfile: bool = False,
     _signal_policy: "SignalPolicy | None" = None,
+    _lock_policy: "LockPolicy | None" = None,
     network_handoff_ready=None,
 ) -> tuple[Path, float, multiprocessing.Process | None, Path | None]:
     """Start a screen capture recording. Blocks until Ctrl+C.
@@ -696,6 +696,7 @@ def start_recording(
     SCR-41 once ``MenubarPolicy`` owns them.
     """
     from screencap.engine.config import RecordingConfig
+    from screencap.engine.lock_policy import ClaimLock
     from screencap.engine.screen_recorder import (
         IpcChannels,
         LegacyOptions,
@@ -721,7 +722,7 @@ def start_recording(
     # use placeholder objects pending SCR-40…SCR-43.
     policies = RecordingPolicies(
         signal=_signal_policy if _signal_policy is not None else ThreeTapSigint(),
-        lock=object(),
+        lock=_lock_policy if _lock_policy is not None else ClaimLock(),
         menubar=object(),
         permission=object(),
         disk=object(),
@@ -745,7 +746,6 @@ def start_recording(
         external_override_q=_external_override_q,
         external_disable_q=_external_disable_q,
         skip_menubar_spawn=_skip_menubar_spawn,
-        skip_pidfile=_skip_pidfile,
         network_handoff_ready=network_handoff_ready,
     )
 
@@ -774,6 +774,7 @@ def _run_screen_recorder(rec: "ScreenRecorder") -> "RecordingResult":
     request = rec._request
     legacy = rec._legacy
     signal_policy = rec._policies.signal
+    lock_policy = rec._policies.lock
     name = request.name
     description = request.description
     audio = legacy.audio
@@ -799,7 +800,6 @@ def _run_screen_recorder(rec: "ScreenRecorder") -> "RecordingResult":
     _external_override_q = legacy.external_override_q
     _external_disable_q = legacy.external_disable_q
     _skip_menubar_spawn = legacy.skip_menubar_spawn
-    _skip_pidfile = legacy.skip_pidfile
     network_handoff_ready = legacy.network_handoff_ready
 
     if audio is None:
@@ -815,55 +815,17 @@ def _run_screen_recorder(rec: "ScreenRecorder") -> "RecordingResult":
         chunk_duration = get_chunk_duration()
     chunking_enabled = chunk_duration > 0
 
-    # Check for orphaned processes from a previous recording
-    from screencap.pidfile import (
-        delete_pidfile,
-        find_orphaned_processes,
-        terminate_processes,
-        write_pidfile,
-    )
-
-    orphans = find_orphaned_processes()
-    if orphans:
-        if force_clean:
-            console.print(f"[yellow]Cleaning up {len(orphans)} orphaned process(es) from a previous recording...[/yellow]")
-            terminate_processes(orphans, force=True)
-            delete_pidfile()
-        else:
-            console.print(
-                f"[yellow]Warning:[/yellow] Found {len(orphans)} orphaned process(es) from a previous recording.\n"
-                "  Run 'screencap stop' to clean them up, or pass --force to auto-clean."
-            )
-            raise SystemExit(1)
-
     if output_dir:
         capture_dir = Path(output_dir)
     else:
         capture_dir = get_recordings_dir() / name
 
-    # Process-exclusive lock — only the standalone CLI direct path claims
-    # here. In session mode the SessionController parent has already claimed
-    # at __init__, and workers (start_recording invoked with
-    # _skip_pidfile=True) inherit that lock by being children.
-    if not _skip_pidfile:
-        from screencap._stderr_events import emit_event as _emit_event, resolve_claimant, EVENT_LOCK_CONTENDED
-        from screencap.pidfile import LockContended, claim_lock
-
-        claimant = resolve_claimant()
-        try:
-            # Standalone single-recording path: capture_dir is known now, so
-            # claim_lock writes recording_started_at = now and
-            # recording_name = capture_dir.name in one shot. status --json
-            # then reports is_recording=true with a fresh elapsed time.
-            claim_lock(capture_dir, claimant=claimant)
-        except LockContended as exc:
-            # Lifecycle events go on stderr (todo 004): stdout is reserved for
-            # human-readable rich output.
-            try:
-                _emit_event(EVENT_LOCK_CONTENDED, owner=exc.owner)
-            except Exception:
-                pass
-            raise SystemExit(2) from None
+    # SCR-40: orphan preflight + process-exclusive lock claim are bundled
+    # into ``LockPolicy.claim``. Standalone CLI passes ``ClaimLock``;
+    # session workers pass ``InheritLock`` (controller already claimed at
+    # ``__init__``). Lock-contention exit-code-2 + stderr event also live
+    # inside ``ClaimLock``.
+    lock_policy.claim(capture_dir, force_clean=force_clean)
 
     if capture_dir.exists() and any(capture_dir.iterdir()):
         console.print(
@@ -1188,43 +1150,27 @@ def _run_screen_recorder(rec: "ScreenRecorder") -> "RecordingResult":
         if chunking_enabled:
             recorder_kwargs["video_chunk_duration"] = chunk_duration
 
-        # Write immutable recording identity file (Phase 1a)
-        recording_id_path = capture_dir / ".recording_id"
-        recording_id_path.write_text(name)
-
-        # Write immutable recording intent file
-        import json as _json
-        from datetime import datetime as _dt, timezone as _tz
-
-        if cloud_intent and keep_local:
-            _destination = "both"
-        elif cloud_intent:
-            _destination = "cloud"
-        else:
-            _destination = "local"
-        _intent_data = {
-            "version": 1,
-            "destination": _destination,
-            "privacy_mode": privacy_config.mode.value if privacy_config else "internal",
-            "show_on_website": show_on_website,
-            "created_at": _dt.now(_tz.utc).isoformat(),
-            "source": intent_source,
-        }
-        _intent_path = capture_dir / ".recording_intent"
+        # SCR-40: identity files are written by ``LockPolicy.write_identity``
+        # for both ``ClaimLock`` and ``InheritLock`` (per-recording identity
+        # is independent of who owns the process lock).
+        _privacy_mode_str = (
+            privacy_config.mode.value if privacy_config else "internal"
+        )
         try:
-            _intent_path.write_text(_json.dumps(_intent_data, indent=2))
+            lock_policy.write_identity(
+                capture_dir, request=request, privacy_mode=_privacy_mode_str,
+            )
         except OSError as _intent_err:
             if cloud_intent:
                 console.print(
-                    f"[red]Error:[/red] Failed to write recording intent: {_intent_err}\n"
+                    f"[red]Error:[/red] Failed to write recording identity: {_intent_err}\n"
                     "Cloud recordings require intent tracking. Cannot proceed."
                 )
                 raise SystemExit(1)
-            else:
-                if verbose:
-                    console.print(
-                        f"[yellow]Warning:[/yellow] Could not write recording intent: {_intent_err}"
-                    )
+            elif verbose:
+                console.print(
+                    f"[yellow]Warning:[/yellow] Could not write recording identity: {_intent_err}"
+                )
 
         chunk_processor = None
 
@@ -1291,7 +1237,7 @@ def _run_screen_recorder(rec: "ScreenRecorder") -> "RecordingResult":
 
             # Essential cleanup that os._exit would skip
             try:
-                delete_pidfile()
+                lock_policy.release()
             except Exception:
                 pass
             if _saved_stdout is not None:
@@ -1430,15 +1376,14 @@ def _run_screen_recorder(rec: "ScreenRecorder") -> "RecordingResult":
                 except Exception as _chunk_init_err:
                     console.print(f"[yellow]Warning:[/yellow] ChunkProcessor failed to start: {_chunk_init_err}")
 
-            # Write PID file tracking all child processes. Skipped in
-            # session-controller worker mode — the controller owns the
-            # pidfile and writes it once at startup.
-            if not _skip_pidfile:
-                child_pids = [
-                    {"pid": child.pid, "name": child.name}
-                    for child in multiprocessing.active_children()
-                ]
-                write_pidfile(capture_dir, child_pids)
+            # SCR-40: pidfile snapshot of children is delegated to
+            # ``LockPolicy.register_children``. ``ClaimLock`` writes the
+            # pidfile; ``InheritLock`` is a no-op (controller owns it).
+            child_pids = [
+                {"pid": child.pid, "name": child.name}
+                for child in multiprocessing.active_children()
+            ]
+            lock_policy.register_children(capture_dir, child_pids)
 
             # Store raw PIDs for signal-safe force-exit (avoids
             # multiprocessing._children_lock which can deadlock in a handler).
@@ -1686,8 +1631,7 @@ def _run_screen_recorder(rec: "ScreenRecorder") -> "RecordingResult":
         # Restore default handlers via the policy (mirrors install/uninstall).
         signal_policy.uninstall()
         atexit.unregister(_cleanup_children)
-        if not _skip_pidfile:
-            delete_pidfile()
+        lock_policy.release()
 
         # Release the network single-instance flock if we acquired one.
         # The OS would release it on process death anyway, but explicit

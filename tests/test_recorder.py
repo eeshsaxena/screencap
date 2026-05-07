@@ -57,23 +57,29 @@ class TestForceExitContracts:
                 return node
         return None
 
-    def test_force_exit_calls_delete_pidfile(self):
-        """``_force_exit`` must call ``delete_pidfile`` somewhere in its
-        body so the force-quit path never leaks a stale pidfile."""
+    def test_force_exit_releases_lock_policy(self):
+        """``_force_exit`` must call ``lock_policy.release()`` somewhere
+        in its body so the force-quit path never leaks a stale pidfile.
+
+        SCR-40 promoted ``delete_pidfile`` into ``LockPolicy.release``;
+        the contract is the same (must run before ``os._exit``), the call
+        site is now the policy."""
         tree = self._start_recording_ast()
         force_exit_fn = self._find_function(tree, "_force_exit")
         assert force_exit_fn is not None, "_force_exit not found in start_recording"
 
-        delete_calls = [
+        release_calls = [
             node for node in ast.walk(force_exit_fn)
             if isinstance(node, ast.Call)
-            and isinstance(node.func, ast.Name)
-            and node.func.id == "delete_pidfile"
+            and isinstance(node.func, ast.Attribute)
+            and node.func.attr == "release"
+            and isinstance(node.func.value, ast.Name)
+            and node.func.value.id == "lock_policy"
         ]
-        assert delete_calls, (
-            "_force_exit must call delete_pidfile to clean up the pidfile "
-            "before the process exits — otherwise next-start orphan detection "
-            "trips on a stale pid."
+        assert release_calls, (
+            "_force_exit must call lock_policy.release() to clean up the "
+            "pidfile before the process exits — otherwise next-start orphan "
+            "detection trips on a stale pid."
         )
 
     @staticmethod

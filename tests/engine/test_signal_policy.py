@@ -125,10 +125,10 @@ def test_screen_recorder_invokes_signal_policy_install_then_uninstall(tmp_path):
     from unittest import mock
 
     from screencap.engine.config import RecordingConfig
+    from screencap.engine.lock_policy import ClaimLock
     from screencap.engine.screen_recorder import (
         IpcChannels,
         LegacyOptions,
-        NoopSignalPolicy,
         RecordingPolicies,
         RecordingRequest,
         ScreenRecorder,
@@ -154,7 +154,7 @@ def test_screen_recorder_invokes_signal_policy_install_then_uninstall(tmp_path):
     channels = IpcChannels.create()
     policies = RecordingPolicies(
         signal=spy,
-        lock=NoopSignalPolicy(),  # placeholder; lock policy not yet pluggable
+        lock=ClaimLock(),
         menubar=object(),
         permission=object(),
         disk=object(),

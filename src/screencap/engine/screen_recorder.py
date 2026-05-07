@@ -150,7 +150,15 @@ class NoopSignalPolicy:
 
 
 class LockPolicy(Protocol):
-    """Pidfile lifecycle. ``ClaimLock`` | ``InheritLock`` | ``Noop``."""
+    """Pidfile lifecycle + per-recording identity files. ``ClaimLock`` | ``InheritLock``.
+
+    Bundle owned by SCR-40: orphan-process preflight, ``claim_lock`` /
+    ``delete_pidfile`` lifecycle, child-PID snapshot, and writing
+    ``.recording_id`` + ``.recording_intent``. The concrete protocol
+    methods (``claim`` / ``write_identity`` / ``register_children`` /
+    ``release``) live alongside the implementations in
+    ``screencap.engine.lock_policy``.
+    """
 
 
 class MenubarPolicy(Protocol):
@@ -242,7 +250,8 @@ class LegacyOptions:
 
     Adding a field here is a temporary expedient. Removing the field
     is what each downstream slice is for. SCR-39 retired
-    ``skip_sigint_handler`` in favour of ``RecordingPolicies.signal``.
+    ``skip_sigint_handler`` in favour of ``RecordingPolicies.signal``;
+    SCR-40 retired ``skip_pidfile`` in favour of ``RecordingPolicies.lock``.
     """
 
     audio: bool | None = None
@@ -265,7 +274,6 @@ class LegacyOptions:
     external_override_q: Any | None = None
     external_disable_q: Any | None = None
     skip_menubar_spawn: bool = False
-    skip_pidfile: bool = False
     network_handoff_ready: Any | None = None
 
 
