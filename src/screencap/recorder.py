@@ -30,12 +30,11 @@ from rich.panel import Panel
 from rich.text import Text
 
 from screencap import __version__
-from screencap._startup import close_queues_safely as _close_queues_safely
 from screencap.config import (
     get_app_versions,
     get_audio_default,
-    get_disk_stop_mb,
-    get_disk_warn_mb,
+    get_disk_stop_mb,  # noqa: F401  -- re-exported for tests that mock it here
+    get_disk_warn_mb,  # noqa: F401  -- re-exported for tests that mock it here
     get_recordings_dir,
     get_wifi_metrics,
 )
@@ -64,36 +63,6 @@ class DiskFullError(Exception):
 # ---------------------------------------------------------------------------
 # Helpers
 # ---------------------------------------------------------------------------
-
-
-class _NoCloseProxy:
-    """Queue proxy that forwards put/get but ignores close/cancel.
-
-    Used to prevent Recorder.__exit__() from closing queues that the
-    screencap layer (ChunkProcessor) still needs. The fan-out thread
-    reads self._chunk_process_q and calls put() — the proxy forwards
-    that to the real queue. __exit__() calls close() — the proxy no-ops.
-    """
-
-    __slots__ = ("_q",)
-
-    def __init__(self, q: multiprocessing.Queue) -> None:
-        self._q = q
-
-    def put(self, *a, **kw):
-        return self._q.put(*a, **kw)
-
-    def get(self, *a, **kw):
-        return self._q.get(*a, **kw)
-
-    def get_nowait(self):
-        return self._q.get_nowait()
-
-    def cancel_join_thread(self):
-        pass
-
-    def close(self):
-        pass
 
 
 def _fmt_duration(seconds: float) -> str:
@@ -788,13 +757,7 @@ def _run_screen_recorder(rec: "ScreenRecorder") -> "RecordingResult":
     capture_window_data = legacy.capture_window_data
     verbose = legacy.verbose
     chunk_duration = legacy.chunk_duration
-    live_upload = legacy.live_upload
-    force_mode = legacy.force_mode
     cloud_intent = request.cloud_intent
-    keep_local = request.keep_local
-    intent_source = request.intent_source
-    segmentation_mode = request.segmentation_mode
-    scrub_enabled = request.scrub_enabled
     show_on_website = request.show_on_website
     network_handoff_ready = legacy.network_handoff_ready
 
@@ -889,36 +852,21 @@ def _run_screen_recorder(rec: "ScreenRecorder") -> "RecordingResult":
     # SCR-41: queues are first-class args via IpcChannels; no fallback
     # creation here. SpawnNewMenubar owns new queues (standalone CLI);
     # Noop reuses the controller's queues (session worker).
-    _menubar_window_feed_q = channels.window_feed
-    _menubar_override_q = channels.override
     _menubar_disable_q = channels.disable
 
-    # --- Privacy: capture-time enforcement ---
-    # Cloud-intent recordings always use PUBLIC mode — this is stricter than
-    # INTERNAL because PUBLIC triggers MASK_WINDOW for email/chat/calendar
-    # (vs ALLOW in INTERNAL) and TEXT_REDACT for code editors (vs ALLOW).
-    if cloud_intent:
-        from screencap.privacy.policy import PrivacyMode as _PrivacyMode
-        force_mode = _PrivacyMode.PUBLIC
+    # --- Privacy: capture-time enforcement (SCR-44) ---
+    # Construction (cloud_intent → PUBLIC floor, window-data gate, override
+    # file path) is owned by the engine helper. The wrapper still owns the
+    # console UX around configuration failure and the cloud privacy notice.
+    from screencap.engine.collaborators import RecordingCollaborators
 
+    _collaborators = RecordingCollaborators(
+        request=request, legacy=legacy, channels=channels,
+    )
     screen_filter = None
     privacy_config = None
     _override_file = capture_dir / ".menubar_overrides.json"
     try:
-        from screencap.config import get_privacy_config
-        from screencap.privacy.recorder_enforcement import RecorderPrivacyFilter
-
-        privacy_config = get_privacy_config()
-        # --cloud flag: force mode, but never loosen past env var / config floor
-        if force_mode is not None:
-            from dataclasses import replace as _dc_replace
-            from screencap.privacy.policy import _MODE_STRICTNESS
-            if _MODE_STRICTNESS[force_mode] <= _MODE_STRICTNESS[privacy_config.mode]:
-                privacy_config = _dc_replace(privacy_config, mode=force_mode)
-        # capture-time enforcement requires window events to detect which
-        # app is frontmost.  If window data capture is disabled (via CLI
-        # flag or RECORD_WINDOW_DATA env var), the filter would silently
-        # never block anything — warn and skip instead.
         from screencap.engine.config import config as _engine_config
 
         _effective_window_data = (
@@ -926,21 +874,19 @@ def _run_screen_recorder(rec: "ScreenRecorder") -> "RecordingResult":
             if capture_window_data is not None
             else _engine_config.RECORD_WINDOW_DATA
         )
+        screen_filter, privacy_config, _override_file = (
+            _collaborators.build_recorder_privacy_filter(
+                capture_dir=capture_dir,
+                capture_window_data=_effective_window_data,
+            )
+        )
         if not _effective_window_data:
             console.print(
                 "[yellow]Warning:[/yellow] Capture-time privacy enforcement "
                 "requires window data. Disabled because window data capture is off."
             )
-        else:
-            screen_filter = RecorderPrivacyFilter(
-                privacy_config,
-                cloud_intent=cloud_intent,
-                window_feed_q=_menubar_window_feed_q,
-                override_q=_menubar_override_q,
-                override_file=_override_file,
-            )
-            if verbose:
-                console.print(f"[dim]Privacy mode: {privacy_config.mode.value}[/dim]")
+        elif verbose and privacy_config is not None:
+            console.print(f"[dim]Privacy mode: {privacy_config.mode.value}[/dim]")
     except Exception as e:
         if privacy_config is not None:
             console.print(
@@ -1001,12 +947,6 @@ def _run_screen_recorder(rec: "ScreenRecorder") -> "RecordingResult":
     recorder = None
     _child_pids = []
     _ctrl_c_count = 0
-    _scrub_worker = None
-    # Shared lock that serializes engine-flush handshakes between
-    # chunk_processor and scrub_worker — both consume the same
-    # flush_ack_counter on the engine Recorder, so racing them would
-    # zero out each other's in-flight ack counts mid-poll.
-    _engine_flush_lock = threading.Lock()
 
     # ----- Network proxy capture (V1.5) — policy-based preflight -----------
     # SCR-43: lock acquisition, preflight_or_raise, KEK/DEK generation, and
@@ -1226,51 +1166,20 @@ def _run_screen_recorder(rec: "ScreenRecorder") -> "RecordingResult":
             # within ~100 ms.
             t0 = time.time()
 
-            # Start ChunkProcessor if chunking is enabled
-            if chunking_enabled:
-                try:
-                    import multiprocessing as _mp
-                    _cpq = getattr(recorder, '_chunk_process_q', None)
-                    _aaq = getattr(recorder, '_audio_ack_q', None)
-                    # Verify queues are real multiprocessing.Queue objects
-                    if (_cpq is not None and _aaq is not None
-                            and isinstance(_cpq, _mp.queues.Queue)):
-                        # Prevent __exit__() from closing queues while
-                        # ChunkProcessor is still reading. Replace attrs with
-                        # proxies that forward put/get but ignore close().
-                        recorder._chunk_process_q = _NoCloseProxy(_cpq)
-                        recorder._audio_ack_q = _NoCloseProxy(_aaq)
-                        from screencap.chunk_processor import ChunkProcessor
-                        from screencap.config import get_auto_delete_after_upload, get_rest_threshold
-
-                        # Get flush protocol primitives from engine Recorder
-                        _flush_req = getattr(recorder, '_flush_requested', None)
-                        _flush_ctr = getattr(recorder, '_flush_ack_counter', None)
-
-                        # cloud_intent enables uploads; keep_local disables auto-delete
-                        _effective_upload = live_upload if cloud_intent else False
-
-                        chunk_processor = ChunkProcessor(
-                            capture_dir,
-                            _cpq,
-                            _aaq,
-                            recording_name=name,
-                            upload_enabled=_effective_upload,
-                            auto_delete=cloud_intent and not keep_local and get_auto_delete_after_upload(),
-                            rest_threshold=get_rest_threshold(),
-                            flush_requested=_flush_req,
-                            flush_ack_counter=_flush_ctr,
-                            flush_lock=_engine_flush_lock,
-                            cloud_intent=cloud_intent,
-                            privacy_mode=privacy_config.mode.value if privacy_config else "internal",
-                            screen_filter=screen_filter,
-                            segmentation_mode=segmentation_mode,
-                            scrub_enabled=scrub_enabled,
-                            show_on_website=show_on_website,
-                        )
-                        chunk_processor.start()
-                except Exception as _chunk_init_err:
-                    console.print(f"[yellow]Warning:[/yellow] ChunkProcessor failed to start: {_chunk_init_err}")
+            # SCR-44: ChunkProcessor + ScrubWorker construction + start are
+            # owned by the engine helper. Both consumers share the helper's
+            # internal flush_lock so concurrent flush handshakes don't race
+            # on the engine's flush_ack_counter.
+            _collaborators.start(
+                recorder=recorder,
+                capture_dir=capture_dir,
+                screen_filter=screen_filter,
+                privacy_config=privacy_config,
+                chunking_enabled=chunking_enabled,
+                console=console,
+            )
+            chunk_processor = _collaborators.chunk_processor
+            _scrub_worker = _collaborators.scrub_worker
 
             # SCR-40: pidfile snapshot of children is delegated to
             # ``LockPolicy.register_children``. ``ClaimLock`` writes the
@@ -1293,28 +1202,6 @@ def _run_screen_recorder(rec: "ScreenRecorder") -> "RecordingResult":
                 audio_enabled=audio,
                 prompt_enabled=get_first_seen_prompt_enabled(),
             )
-
-            # Sidecar thread that retroactively deletes rows from
-            # recording.db for any target the user toggles to "exclude".
-            # Shares the engine flush primitives + lock with chunk_processor
-            # so buffered writer rows are committed before SELECT.
-            try:
-                from screencap.privacy.scrub_worker import ScrubWorker
-                _scrub_worker = ScrubWorker(
-                    disable_q=_menubar_disable_q,
-                    recording_db_path=capture_dir / "recording.db",
-                    capture_dir=capture_dir,
-                    flush_requested=getattr(recorder, '_flush_requested', None),
-                    flush_ack_counter=getattr(recorder, '_flush_ack_counter', None),
-                    flush_lock=_engine_flush_lock,
-                )
-                _scrub_worker.start()
-            except Exception as _sw_err:
-                _scrub_worker = None
-                if verbose:
-                    console.print(
-                        f"[yellow]Warning:[/yellow] Scrub worker failed to start: {_sw_err}"
-                    )
 
             # --- Live recording display ---
             # We use transient=False and handle cleanup ourselves:
@@ -1432,6 +1319,34 @@ def _run_screen_recorder(rec: "ScreenRecorder") -> "RecordingResult":
 
                     menubar_policy.notify_processing()
 
+            # SCR-44: end-of-recording finalize runs INSIDE the engine
+            # ``with``-block so chunk_processor and scrub_worker drain
+            # before ``Recorder.__exit__`` closes the engine queues. This
+            # is the load-bearing ordering that lets us delete
+            # ``_NoCloseProxy``: no outsider holds engine-queue references
+            # past ``__exit__``, so close-coordination is purely internal.
+            _recording_name = (
+                (capture_dir / ".recording_id").read_text().strip()
+                if (capture_dir / ".recording_id").exists() else name
+            )
+            try:
+                _collaborators.finalize_catchall_scrub(capture_dir=capture_dir)
+                _collaborators.stop_scrub_worker(timeout=30.0)
+                _collaborators.stop_chunk_processor(
+                    deadline_seconds=300, console=console,
+                )
+            finally:
+                _collaborators.close_engine_queues(
+                    menubar_owns_channels=menubar_policy.owns_channels,
+                )
+            _finalize_result = _collaborators.finalize_uploads(
+                capture_dir=capture_dir,
+                stop_reason=_stop_reason,
+                recording_name=_recording_name,
+                console=console,
+            )
+            _sentinel_uploaded = _finalize_result["sentinel_uploaded"]
+
             # Suppress stdout before Recorder.__exit__ runs (profile block),
             # but redirect stderr to a log file so subprocess errors are captured.
             if not verbose:
@@ -1537,214 +1452,6 @@ def _run_screen_recorder(rec: "ScreenRecorder") -> "RecordingResult":
         if verbose:
             console.print(f"[yellow]Warning:[/yellow] Could not collect end metrics: {e}")
 
-    # End-of-recording catch-all scrub: enumerate every "exclude" target
-    # in .menubar_overrides.json and queue one final disable message per
-    # target on disable_q. This catches activity captured AFTER the user
-    # toggled disable but BEFORE the recording stopped — those rows were
-    # buffered in the engine writer and would otherwise leak into the
-    # final recording. Must run BEFORE scrub_worker.stop() so the worker
-    # processes them in the same drain pass.
-    try:
-        import json as _json
-        _override_path = capture_dir / ".menubar_overrides.json"
-        if _override_path.exists() and _scrub_worker is not None:
-            try:
-                _overrides_state = _json.loads(_override_path.read_text())
-            except Exception:
-                _overrides_state = {}
-            from screencap.privacy.actions import EXCLUDED_ACTION_VALUES
-            _now = time.time()
-            for _key, _action in _overrides_state.items():
-                if _action not in EXCLUDED_ACTION_VALUES:
-                    continue
-                # Override key shape: "bundle_id" or "bundle_id::domain"
-                if "::" in _key:
-                    _bundle, _dom = _key.split("::", 1)
-                    _msg = {
-                        "kind": "domain",
-                        "bundle_id": _bundle,
-                        "app_name": None,
-                        "root_domain": _dom,
-                        "ts_unix": _now,
-                        "source": "shutdown_catchall",
-                    }
-                else:
-                    _msg = {
-                        "kind": "app",
-                        "bundle_id": _key,
-                        "app_name": None,
-                        "root_domain": None,
-                        "ts_unix": _now,
-                        "source": "shutdown_catchall",
-                    }
-                try:
-                    _menubar_disable_q.put_nowait(_msg)
-                except Exception:
-                    pass
-    except Exception as _catchall_err:
-        if verbose:
-            console.print(
-                f"[yellow]Warning:[/yellow] Catch-all scrub queue failed: {_catchall_err}"
-            )
-
-    # Drain disable jobs BEFORE chunk_processor finalizes so any in-flight
-    # retroactive deletes land before the WAL checkpoint and DB upload.
-    if _scrub_worker is not None:
-        try:
-            _scrub_worker.stop(timeout=30.0)
-        except Exception:
-            pass
-
-    # --- ChunkProcessor shutdown + DB checkpoint ---
-    if chunk_processor is not None:
-        try:
-            # Send poison pill; the thread will exit once the current chunk
-            # finishes.  Poll its status string so the spinner reflects the
-            # actual step (transcribing, scrubbing, uploading, etc.)
-            try:
-                chunk_processor._q.put({"type": "poison_pill"}, timeout=5)
-            except Exception:
-                pass
-            _cp_thread = chunk_processor._thread
-            _cp_deadline = time.time() + 300
-            with console.status("[dim]Finishing up...[/dim]") as _cp_spinner:
-                while _cp_thread is not None and _cp_thread.is_alive():
-                    if time.time() > _cp_deadline:
-                        break
-                    _step = chunk_processor.status
-                    if _step:
-                        _cp_spinner.update(f"[dim]{_step}[/dim]")
-                    _cp_thread.join(timeout=0.5)
-            # Mark stop complete so .stop() doesn't re-send the poison pill
-            chunk_processor._thread = None
-        except KeyboardInterrupt:
-            console.print("[yellow]Force quit — data is saved on disk.[/yellow]")
-            console.print("[dim]Run [bold]screencap upload[/bold] later to upload remaining files.[/dim]")
-        finally:
-            # SCR-41: SpawnNewMenubar owns the queues (standalone CLI)
-            # and they must be closed here; Noop reuses the controller's
-            # queues which must NOT be closed by the worker.
-            if menubar_policy.owns_channels:
-                _close_queues_safely(_cpq, _aaq, _menubar_disable_q)
-            else:
-                _close_queues_safely(_cpq, _aaq)
-
-        # WAL checkpoint + upload recording.db
-        _db_uploaded = False
-        if live_upload:
-            try:
-                from screencap.chunk_processor import checkpoint_and_upload_db
-
-                _recording_name = (capture_dir / ".recording_id").read_text().strip() if (capture_dir / ".recording_id").exists() else name
-                with console.status("[dim]Uploading recording database...[/dim]"):
-                    _db_uploaded = checkpoint_and_upload_db(capture_dir, _recording_name, cloud_intent=cloud_intent)
-            except Exception as e:
-                if verbose:
-                    console.print(f"[yellow]Warning:[/yellow] DB upload failed: {e}")
-
-        # Reconcile _chunk_results against GCS before reading the counter.
-        # A single failed PUT in upload_chunk_files() marks the whole chunk
-        # as False even when the other core files already landed in the
-        # bucket. Re-request signed URLs — the server returns url=None for
-        # files it already has, so chunks whose core files are all present
-        # flip back to True.
-        if live_upload:
-            try:
-                _flipped = chunk_processor.reconcile_against_gcs()
-                if _flipped > 0 and verbose:
-                    console.print(
-                        f"[dim]Reconciled {_flipped} chunk(s) against GCS[/dim]"
-                    )
-            except Exception as e:
-                if verbose:
-                    console.print(
-                        f"[yellow]Warning:[/yellow] GCS reconcile failed: {e}"
-                    )
-
-        # Sentinel upload for cloud-intent recordings (triggers stitching)
-        # If the processor was force-stopped (timeout), _chunk_results may
-        # be incomplete — a mid-flight chunk won't have an entry.  Don't
-        # trust all_chunks_uploaded() in that case.
-        _all_uploaded = (
-            chunk_processor.all_chunks_uploaded()
-            and not chunk_processor.was_force_stopped
-        )
-        _n_uploaded, _n_total = chunk_processor.upload_summary()
-        _n_chunks = len(list(capture_dir.glob("chunk_*_manifest.json")))
-
-        if cloud_intent and live_upload:
-            if _all_uploaded and _n_chunks > 0:
-                # All chunks uploaded — safe to trigger stitching
-                try:
-                    from screencap.chunk_processor import upload_sentinel
-                    _sentinel_uploaded = upload_sentinel(
-                        capture_dir, _recording_name,
-                        stop_reason=_stop_reason or "graceful",
-                        chunks_expected=_n_chunks,
-                        show_on_website=show_on_website,
-                    )
-                    if _sentinel_uploaded:
-                        _raw_url = f"https://screencap.sh/?source=recordings&recording={_recording_name}#data"
-                        _session_url = f"https://screencap.sh/?source=sessions&recording={_recording_name}#data"
-                        console.print(
-                            f"\n  [dim]View (raw):[/dim] "
-                            f"[link={_raw_url}]{_raw_url}[/link]"
-                        )
-                        console.print(
-                            f"  [dim]View (processed, ~2 min):[/dim] "
-                            f"[link={_session_url}]{_session_url}[/link]"
-                        )
-                    else:
-                        console.print(
-                            "[yellow]Sentinel upload failed — run "
-                            f"'screencap upload {_recording_name}' to trigger stitching.[/yellow]"
-                        )
-                except Exception as e:
-                    if verbose:
-                        console.print(f"[yellow]Warning:[/yellow] Sentinel upload failed: {e}")
-            # else: no local sentinel — screencap upload generates a fresh
-            # one with the correct chunks_expected from manifests on disk.
-
-        # Stub recording: delete raw media only for cloud-only recordings
-        # (not "both" — keep_local means local files must be preserved).
-        _has_chunk_files = any(capture_dir.glob("chunk_*.mp4"))
-        _safe_to_stub = _all_uploaded and live_upload and _has_chunk_files
-        if cloud_intent and not keep_local:
-            _safe_to_stub = _safe_to_stub and _sentinel_uploaded
-        else:
-            # Local or "both": never delete local media files
-            _safe_to_stub = False
-        if _safe_to_stub:
-            try:
-                from screencap.chunk_processor import stub_recording
-                deleted = stub_recording(capture_dir)
-                if deleted and verbose:
-                    console.print(f"[dim]Cleaned up {len(deleted)} local media files[/dim]")
-            except Exception as e:
-                if verbose:
-                    console.print(f"[yellow]Warning:[/yellow] Stub failed: {e}")
-        elif live_upload and (not _all_uploaded or not _has_chunk_files):
-            # Defer the warning print until after the post-recording rename
-            # (menubar / auto-name) so the suggested `screencap upload <name>`
-            # command matches the final on-disk directory. See
-            # print_upload_followup() below.
-            if chunk_processor.was_force_stopped:
-                _followup_kind = FOLLOWUP_FORCE_STOPPED
-            elif _n_total == 0:
-                _followup_kind = FOLLOWUP_NONE_UPLOADED
-            elif chunk_processor.upload_warning:
-                _followup_kind = FOLLOWUP_UPLOAD_DISABLED
-            else:
-                _followup_kind = FOLLOWUP_PARTIAL
-            try:
-                (capture_dir / ".upload_followup.json").write_text(json.dumps({
-                    "kind": _followup_kind,
-                    "n_uploaded": _n_uploaded,
-                    "n_total": _n_total,
-                    "upload_warning": chunk_processor.upload_warning or None,
-                }))
-            except OSError:
-                pass
 
     # NOTE: intentionally NOT recomputing ``elapsed = time.time() - t0``
     # here. The live loop above already froze ``elapsed`` at the moment
