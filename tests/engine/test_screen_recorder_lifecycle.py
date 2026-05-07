@@ -1,0 +1,206 @@
+"""Coverage for the live-loop branches in ``_run_screen_recorder``.
+
+Pins the load-bearing wiring that consumes ``PermissionRevoked`` and
+``DiskSpaceCritical`` mid-recording: ``_stop_reason`` is set, the
+``permission_lost`` stderr event is emitted (the SwiftUI shell's only
+signal), and ``recorder.stop()`` is called so writer processes finalize.
+
+Tests in ``test_permission_policy.py`` / ``test_disk_policy.py`` only
+verify the *policies raise*; this file exercises the consumer branch.
+"""
+
+from __future__ import annotations
+
+import json
+from collections import namedtuple
+from pathlib import Path
+from unittest import mock
+
+import pytest
+
+from tests.conftest import FakeRecorder
+
+DiskUsage = namedtuple("DiskUsage", ["total", "used", "free"])
+_PLENTY_OF_DISK = DiskUsage(total=500e9, used=100e9, free=400e9)
+
+
+class _TickingFakeRecorder(FakeRecorder):
+    """``FakeRecorder`` that runs the live loop for one tick."""
+
+    def __init__(self, capture_dir_str, **kwargs):
+        super().__init__(capture_dir_str, **kwargs)
+        self._is_recording = True
+
+    @property
+    def is_recording(self) -> bool:  # type: ignore[override]
+        return self._is_recording
+
+    @is_recording.setter
+    def is_recording(self, value: bool) -> None:
+        self._is_recording = value
+
+    def stop(self):
+        self._is_recording = False
+        self._stopped = True
+
+
+class _OneShotPermissionPolicy:
+    """Raises ``PermissionRevoked`` on the first ``poll()`` call."""
+
+    def __init__(self, missing: str = "screen_recording") -> None:
+        self._missing = missing
+        self._raised = False
+
+    def preflight(self) -> None:
+        pass
+
+    def poll(self, now: float) -> None:
+        if self._raised:
+            return
+        self._raised = True
+        from screencap.engine.screen_recorder import PermissionRevoked
+
+        raise PermissionRevoked(self._missing)
+
+    @property
+    def next_poll_at(self) -> float:
+        return 0.0
+
+
+class _OneShotDiskPolicy:
+    """Raises ``DiskSpaceCritical`` on the first ``poll()`` call."""
+
+    def __init__(self, free_mb: float = 100.0) -> None:
+        self._free_mb = free_mb
+        self._raised = False
+
+    def bind(self, capture_dir: Path) -> None:
+        pass
+
+    def preflight(self) -> None:
+        pass
+
+    def poll(self, now: float) -> None:
+        if self._raised:
+            return
+        self._raised = True
+        from screencap.engine.disk_policy import DiskSpaceCritical
+
+        raise DiskSpaceCritical(self._free_mb)
+
+    @property
+    def next_poll_at(self) -> float:
+        return 0.0
+
+    @property
+    def warning(self) -> str:
+        return ""
+
+
+def _build_seam(tmp_path, *, permission, disk):
+    from screencap.engine.config import RecordingConfig
+    from screencap.engine.lock_policy import ClaimLock
+    from screencap.engine.menubar_policy import Noop as MenubarNoop
+    from screencap.engine.network_policy import Null as NetworkNull
+    from screencap.engine.screen_recorder import (
+        IpcChannels,
+        LegacyOptions,
+        NoopSignalPolicy,
+        RecordingPolicies,
+        RecordingRequest,
+        ScreenRecorder,
+    )
+
+    request = RecordingRequest(name="lifecycle", config=RecordingConfig())
+    channels = IpcChannels.create()
+    policies = RecordingPolicies(
+        signal=NoopSignalPolicy(),
+        lock=ClaimLock(),
+        menubar=MenubarNoop(),
+        permission=permission,
+        disk=disk,
+        network=NetworkNull(),
+    )
+    legacy = LegacyOptions(output_dir=tmp_path / "rec")
+    return ScreenRecorder(
+        request=request, channels=channels, policies=policies, legacy=legacy,
+    )
+
+
+def _common_mocks():
+    return [
+        mock.patch("screencap.recorder._check_macos_permissions"),
+        mock.patch("screencap.recorder.get_audio_default", return_value=False),
+        mock.patch("screencap.recorder.get_wifi_metrics", return_value=False),
+        mock.patch("screencap.recorder.get_app_versions", return_value=False),
+        mock.patch("screencap.config.get_disk_warn_mb", return_value=2000),
+        mock.patch("screencap.config.get_disk_stop_mb", return_value=500),
+        mock.patch("shutil.disk_usage", return_value=_PLENTY_OF_DISK),
+        mock.patch("screencap.pidfile.find_orphaned_processes", return_value=[]),
+        mock.patch("screencap.pidfile.claim_lock"),
+        mock.patch("screencap.pidfile.write_pidfile"),
+        mock.patch("screencap.pidfile.delete_pidfile"),
+        mock.patch("screencap.engine.recorder.Recorder", _TickingFakeRecorder),
+    ]
+
+
+def test_permission_revoked_mid_loop_emits_stderr_event_and_stops(tmp_path, capfd):
+    """``PermissionRevoked`` mid-loop → ``permission_lost`` stderr event + ``recorder.stop()``."""
+    from screencap.engine.disk_policy import Noop as DiskNoop
+
+    rec = _build_seam(
+        tmp_path,
+        permission=_OneShotPermissionPolicy(missing="screen_recording"),
+        disk=DiskNoop(),
+    )
+
+    mocks = _common_mocks()
+    for m in mocks:
+        m.start()
+    try:
+        rec.run()
+    finally:
+        for m in mocks:
+            m.stop()
+
+    err = capfd.readouterr().err
+    events = [
+        json.loads(line) for line in err.splitlines()
+        if line.strip().startswith("{") and "permission_lost" in line
+    ]
+    assert events, (
+        "the SwiftUI shell relies on the ``permission_lost`` stderr event; "
+        f"got stderr={err!r}"
+    )
+    assert events[0]["permission"] == "screen_recording"
+
+    # ``terminated_reason`` is the post-loop side of the same wiring.
+    capture_dir = tmp_path / "rec"
+    meta = json.loads((capture_dir / ".recording_stop_meta.json").read_text())
+    assert meta["terminated_reason"] == "permission_lost"
+
+
+def test_disk_space_critical_mid_loop_marks_stop_reason(tmp_path):
+    """``DiskSpaceCritical`` mid-loop → ``terminated_reason='disk_full'`` + ``DiskFullError``."""
+    from screencap.engine.permission_policy import Noop as PermNoop
+    from screencap.recorder import DiskFullError
+
+    rec = _build_seam(
+        tmp_path,
+        permission=PermNoop(),
+        disk=_OneShotDiskPolicy(free_mb=42.0),
+    )
+
+    mocks = _common_mocks()
+    for m in mocks:
+        m.start()
+    try:
+        with pytest.raises(DiskFullError):
+            rec.run()
+    finally:
+        for m in mocks:
+            m.stop()
+
+    capture_dir = tmp_path / "rec"
+    meta = json.loads((capture_dir / ".recording_stop_meta.json").read_text())
+    assert meta["terminated_reason"] == "disk_full"

@@ -59,13 +59,33 @@ def _common_mocks():
     ]
 
 
+class _NetworkNullSpy:
+    """``Null`` network policy that records ``setup``/``teardown`` calls.
+
+    Lets the parity test prove the seam was actually traversed (not just
+    the wrapper preludes), without spawning a real menubar subprocess.
+    """
+
+    def __init__(self) -> None:
+        self.setup_calls = 0
+        self.teardown_calls = 0
+
+    def setup(self, capture_dir, privacy_config):
+        from screencap.engine.network_policy import NetworkMaterial
+
+        self.setup_calls += 1
+        return NetworkMaterial()
+
+    def teardown(self) -> None:
+        self.teardown_calls += 1
+
+
 def test_seam_direct_path_matches_wrapper(tmp_path):
     """``ScreenRecorder().run()`` produces the same artifacts as ``start_recording()``."""
     from screencap.engine.config import RecordingConfig
     from screencap.engine.disk_policy import Noop as DiskNoop
     from screencap.engine.lock_policy import ClaimLock
-    from screencap.engine.menubar_policy import SpawnNewMenubar
-    from screencap.engine.network_policy import Null as NetworkNull
+    from screencap.engine.menubar_policy import Noop as MenubarNoop
     from screencap.engine.permission_policy import Noop as PermNoop
     from screencap.engine.screen_recorder import (
         IpcChannels,
@@ -82,12 +102,17 @@ def test_seam_direct_path_matches_wrapper(tmp_path):
     seam_dir = tmp_path / "seam"
 
     # ---- Wrapper path (legacy entry) -------------------------------------
+    # ``MenubarNoop`` keeps the parity assertion apples-to-apples without
+    # spawning a real menubar subprocess (which would race the
+    # FakeRecorder's immediate stop on slow / headless CI runners).
     mocks = _common_mocks()
     for m in mocks:
         m.start()
     try:
         capture_dir, elapsed, _mb_proc, _mb_state = start_recording(
             "parity", output_dir=wrapper_dir,
+            _menubar_policy=MenubarNoop(),
+            _signal_policy=NoopSignalPolicy(),
         )
     finally:
         for m in mocks:
@@ -101,13 +126,10 @@ def test_seam_direct_path_matches_wrapper(tmp_path):
     # ---- Seam-direct path -----------------------------------------------
     request = RecordingRequest(name="parity", config=RecordingConfig())
     channels = IpcChannels.create()
-    # NoopSignalPolicy: parity test runs in-process, must not register
-    # SIGINT/SIGTERM handlers that would outlive the test.
-    # ClaimLock matches the wrapper-path default constructed by
-    # ``start_recording`` so the artifact comparison is apples-to-apples.
+    seam_network = _NetworkNullSpy()
     policies = RecordingPolicies(
-        signal=NoopSignalPolicy(), lock=ClaimLock(), menubar=SpawnNewMenubar(),
-        permission=PermNoop(), disk=DiskNoop(), network=NetworkNull(),
+        signal=NoopSignalPolicy(), lock=ClaimLock(), menubar=MenubarNoop(),
+        permission=PermNoop(), disk=DiskNoop(), network=seam_network,
     )
     legacy = LegacyOptions(output_dir=seam_dir)
     rec = ScreenRecorder(
@@ -128,6 +150,14 @@ def test_seam_direct_path_matches_wrapper(tmp_path):
     assert isinstance(result.elapsed, float)
     assert seam_dir.exists()
     seam_artifacts = _record_artifact_set(seam_dir)
+
+    # ---- Seam was actually traversed -------------------------------------
+    # The bare artifact-equality assertion below is largely tautological
+    # because both legs route through ``_run_screen_recorder`` — the
+    # network policy spy proves a policy method was called, so a future
+    # refactor that bypassed the seam entirely would fail this test.
+    assert seam_network.setup_calls == 1
+    assert seam_network.teardown_calls == 1
 
     # ---- Parity ----------------------------------------------------------
     assert wrapper_artifacts == seam_artifacts, (
@@ -161,7 +191,7 @@ def test_seam_mitm_proxy_v15_path_matches_wrapper(tmp_path):
     from screencap.engine.config import RecordingConfig
     from screencap.engine.disk_policy import Noop as DiskNoop
     from screencap.engine.lock_policy import ClaimLock
-    from screencap.engine.menubar_policy import SpawnNewMenubar
+    from screencap.engine.menubar_policy import Noop as MenubarNoop
     from screencap.engine.network_policy import MitmProxyV15
     from screencap.engine.permission_policy import Noop as PermNoop
     from screencap.engine.screen_recorder import (
@@ -185,6 +215,8 @@ def test_seam_mitm_proxy_v15_path_matches_wrapper(tmp_path):
     try:
         capture_dir, elapsed, _mb_proc, _mb_state = start_recording(
             "parity-net", output_dir=wrapper_dir, network=True,
+            _menubar_policy=MenubarNoop(),
+            _signal_policy=NoopSignalPolicy(),
         )
     finally:
         for m in all_mocks:
@@ -197,7 +229,7 @@ def test_seam_mitm_proxy_v15_path_matches_wrapper(tmp_path):
     request = RecordingRequest(name="parity-net", config=RecordingConfig())
     channels = IpcChannels.create()
     policies = RecordingPolicies(
-        signal=NoopSignalPolicy(), lock=ClaimLock(), menubar=SpawnNewMenubar(),
+        signal=NoopSignalPolicy(), lock=ClaimLock(), menubar=MenubarNoop(),
         permission=PermNoop(), disk=DiskNoop(), network=MitmProxyV15(),
     )
     legacy = LegacyOptions(output_dir=seam_dir)
