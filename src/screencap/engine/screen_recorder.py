@@ -14,9 +14,10 @@ deliberately.
 from __future__ import annotations
 
 import multiprocessing as mp
+import signal
 from dataclasses import dataclass, field
 from pathlib import Path
-from typing import TYPE_CHECKING, Any, Protocol
+from typing import TYPE_CHECKING, Any, Callable, Protocol
 
 from screencap.engine.config import RecordingConfig
 
@@ -75,8 +76,77 @@ class Monitor(Protocol):
     def next_poll_at(self) -> float: ...
 
 
+SignalHandler = Callable[[int, Any], None]
+
+
 class SignalPolicy(Protocol):
-    """SIGINT / SIGTERM handler installation. ``ThreeTapSigint`` | ``Noop``."""
+    """SIGINT / SIGTERM handler installation. ``ThreeTapSigint`` | ``NoopSignalPolicy``.
+
+    The policy is install/uninstall plumbing only — handler bodies stay
+    in ``_run_screen_recorder`` because they close over ``nonlocal``
+    state (``_stop_event``, ``_ctrl_c_count``, ``_child_pids``,
+    ``_menubar_proc``). The seam is "should the runtime register these
+    handlers at all", not "what does the handler do" — the latter is
+    the same for every caller.
+    """
+
+    def install(
+        self,
+        *,
+        sigint_handler: SignalHandler,
+        sigterm_handler: SignalHandler,
+    ) -> None: ...
+
+    def uninstall(self) -> None: ...
+
+
+class ThreeTapSigint:
+    """Standalone-CLI signal policy: register SIGINT + SIGTERM verbatim.
+
+    The 3-tap escalation lives inside the SIGINT handler itself
+    (1 = graceful, 2 = force, 3+ = ``os._exit(1)``). This policy just
+    decides *whether* to install the runtime's handlers — it doesn't
+    own the escalation semantics.
+
+    ``uninstall`` mirrors the restoration that
+    ``_run_screen_recorder``'s ``finally`` block performs today:
+    ``SIGINT`` → ``default_int_handler``, ``SIGTERM`` → ``SIG_DFL``.
+    """
+
+    def install(
+        self,
+        *,
+        sigint_handler: SignalHandler,
+        sigterm_handler: SignalHandler,
+    ) -> None:
+        signal.signal(signal.SIGINT, sigint_handler)
+        signal.signal(signal.SIGTERM, sigterm_handler)
+
+    def uninstall(self) -> None:
+        signal.signal(signal.SIGINT, signal.default_int_handler)
+        signal.signal(signal.SIGTERM, signal.SIG_DFL)
+
+
+class NoopSignalPolicy:
+    """Session-worker signal policy: leave SIGINT/SIGTERM untouched.
+
+    The ``SessionController`` parent owns Ctrl+C; workers must not
+    install SIGINT handlers that would intercept the controller's
+    signal-forwarding. Replaces the ``_skip_sigint_handler=True`` private
+    kwarg that ``run_recording_worker`` used to pass to
+    ``start_recording``.
+    """
+
+    def install(
+        self,
+        *,
+        sigint_handler: SignalHandler,
+        sigterm_handler: SignalHandler,
+    ) -> None:
+        pass
+
+    def uninstall(self) -> None:
+        pass
 
 
 class LockPolicy(Protocol):
@@ -171,7 +241,8 @@ class LegacyOptions:
                                         every per-recording flag.
 
     Adding a field here is a temporary expedient. Removing the field
-    is what each downstream slice is for.
+    is what each downstream slice is for. SCR-39 retired
+    ``skip_sigint_handler`` in favour of ``RecordingPolicies.signal``.
     """
 
     audio: bool | None = None
@@ -195,7 +266,6 @@ class LegacyOptions:
     external_disable_q: Any | None = None
     skip_menubar_spawn: bool = False
     skip_pidfile: bool = False
-    skip_sigint_handler: bool = False
     network_handoff_ready: Any | None = None
 
 

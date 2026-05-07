@@ -684,7 +684,7 @@ def start_recording(
     _external_disable_q: "multiprocessing.Queue | None" = None,
     _skip_menubar_spawn: bool = False,
     _skip_pidfile: bool = False,
-    _skip_sigint_handler: bool = False,
+    _signal_policy: "SignalPolicy | None" = None,
     network_handoff_ready=None,
 ) -> tuple[Path, float, multiprocessing.Process | None, Path | None]:
     """Start a screen capture recording. Blocks until Ctrl+C.
@@ -702,6 +702,7 @@ def start_recording(
         RecordingPolicies,
         RecordingRequest,
         ScreenRecorder,
+        ThreeTapSigint,
     )
 
     request = RecordingRequest(
@@ -716,11 +717,10 @@ def start_recording(
         show_on_website=show_on_website,
     )
     channels = IpcChannels.create()
-    # Placeholder policies — body still runs verbatim and does not
-    # consume rec._policies in this slice. SCR-39…SCR-43 replace each
-    # placeholder with the named production implementation in turn.
+    # SCR-39: SignalPolicy is the first axis to land. Other axes still
+    # use placeholder objects pending SCR-40…SCR-43.
     policies = RecordingPolicies(
-        signal=object(),
+        signal=_signal_policy if _signal_policy is not None else ThreeTapSigint(),
         lock=object(),
         menubar=object(),
         permission=object(),
@@ -746,7 +746,6 @@ def start_recording(
         external_disable_q=_external_disable_q,
         skip_menubar_spawn=_skip_menubar_spawn,
         skip_pidfile=_skip_pidfile,
-        skip_sigint_handler=_skip_sigint_handler,
         network_handoff_ready=network_handoff_ready,
     )
 
@@ -774,6 +773,7 @@ def _run_screen_recorder(rec: "ScreenRecorder") -> "RecordingResult":
     """
     request = rec._request
     legacy = rec._legacy
+    signal_policy = rec._policies.signal
     name = request.name
     description = request.description
     audio = legacy.audio
@@ -800,7 +800,6 @@ def _run_screen_recorder(rec: "ScreenRecorder") -> "RecordingResult":
     _external_disable_q = legacy.external_disable_q
     _skip_menubar_spawn = legacy.skip_menubar_spawn
     _skip_pidfile = legacy.skip_pidfile
-    _skip_sigint_handler = legacy.skip_sigint_handler
     network_handoff_ready = legacy.network_handoff_ready
 
     if audio is None:
@@ -1322,9 +1321,6 @@ def _run_screen_recorder(rec: "ScreenRecorder") -> "RecordingResult":
             _menubar_proc = None
             os._exit(1)
 
-        if not _skip_sigint_handler:
-            signal.signal(signal.SIGINT, _force_exit)
-
         # --- SIGTERM handler (for `screencap stop`) ---
         def _sigterm_handler(sig, frame):
             nonlocal _stop_reason
@@ -1333,7 +1329,15 @@ def _run_screen_recorder(rec: "ScreenRecorder") -> "RecordingResult":
             if recorder is not None:
                 recorder.stop()
 
-        signal.signal(signal.SIGTERM, _sigterm_handler)
+        # SCR-39: SignalPolicy decides whether to register handlers.
+        # Standalone CLI passes ThreeTapSigint; session workers pass
+        # NoopSignalPolicy (controller owns Ctrl+C). Installed BEFORE
+        # Recorder.__enter__() so SIGINT during the entire setup window
+        # is honoured — Tier-3 enforcement in
+        # tests/test_signal_during_setup.py.
+        signal_policy.install(
+            sigint_handler=_force_exit, sigterm_handler=_sigterm_handler,
+        )
 
         # Temporarily redirect stderr to /dev/null while creating the
         # Recorder.  The multiprocessing resource_tracker is lazily spawned
@@ -1679,10 +1683,8 @@ def _run_screen_recorder(rec: "ScreenRecorder") -> "RecordingResult":
             sys.stderr = _saved_stderr
 
         status.stop()
-        # Restore default handlers
-        if not _skip_sigint_handler:
-            signal.signal(signal.SIGINT, signal.default_int_handler)
-        signal.signal(signal.SIGTERM, signal.SIG_DFL)
+        # Restore default handlers via the policy (mirrors install/uninstall).
+        signal_policy.uninstall()
         atexit.unregister(_cleanup_children)
         if not _skip_pidfile:
             delete_pidfile()

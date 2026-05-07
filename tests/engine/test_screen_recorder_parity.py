@@ -55,9 +55,11 @@ def _common_mocks():
 def test_seam_direct_path_matches_wrapper(tmp_path):
     """``ScreenRecorder().run()`` produces the same artifacts as ``start_recording()``."""
     from screencap.engine.config import RecordingConfig
+    from screencap.engine.lock_policy import ClaimLock
     from screencap.engine.screen_recorder import (
         IpcChannels,
         LegacyOptions,
+        NoopSignalPolicy,
         RecordingPolicies,
         RecordingRequest,
         RecordingResult,
@@ -88,8 +90,12 @@ def test_seam_direct_path_matches_wrapper(tmp_path):
     # ---- Seam-direct path -----------------------------------------------
     request = RecordingRequest(name="parity", config=RecordingConfig())
     channels = IpcChannels.create()
+    # NoopSignalPolicy: parity test runs in-process, must not register
+    # SIGINT/SIGTERM handlers that would outlive the test.
+    # ClaimLock matches the wrapper-path default constructed by
+    # ``start_recording`` so the artifact comparison is apples-to-apples.
     policies = RecordingPolicies(
-        signal=object(), lock=object(), menubar=object(),
+        signal=NoopSignalPolicy(), lock=ClaimLock(), menubar=object(),
         permission=object(), disk=object(), network=object(),
     )
     legacy = LegacyOptions(output_dir=seam_dir)

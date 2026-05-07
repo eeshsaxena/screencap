@@ -158,6 +158,8 @@ def run_recording_worker(args: dict) -> None:
     # SIGTERM is handled by start_recording's own _sigterm_handler, which
     # calls recorder.stop() for a graceful unwind.
 
+    from screencap.engine.lock_policy import InheritLock
+    from screencap.engine.screen_recorder import NoopSignalPolicy
     from screencap.recorder import DiskFullError, start_recording
 
     capture_dir_hint = Path(args.get("capture_dir_hint", ""))
@@ -193,8 +195,8 @@ def run_recording_worker(args: dict) -> None:
             _external_override_q=args["_override_q"],
             _external_disable_q=args["_disable_q"],
             _skip_menubar_spawn=True,
-            _skip_pidfile=True,
-            _skip_sigint_handler=True,
+            _signal_policy=NoopSignalPolicy(),
+            _lock_policy=InheritLock(),
             network_handoff_ready=args.get("_network_handoff_ready"),
         )
     except DiskFullError as exc:
@@ -490,9 +492,9 @@ class SessionController:
         # Process-exclusive lock — held for the controller's lifetime so a
         # second `screencap start` during inter-recording idle is rejected.
         # Workers (run_recording_worker → start_recording with
-        # _skip_pidfile=True) do NOT claim; they inherit the controller's lock
-        # by virtue of being children. Lock auto-releases on death even if
-        # explicit cleanup is missed.
+        # _lock_policy=InheritLock()) do NOT claim; they inherit the
+        # controller's lock by virtue of being children. Lock auto-releases
+        # on death even if explicit cleanup is missed.
         from screencap._stderr_events import (
             EVENT_LOCK_CONTENDED,
             EVENT_STARTED,
