@@ -90,7 +90,7 @@ Subprocess for one recording. Calls:
 3. `screencap.recorder.start_recording(...)` with worker-mode policy injections (replacing the legacy `_skip_*` flags):
    - `_menubar_policy=Noop()` — controller owns the persistent menubar.
    - `_lock_policy=InheritLock()` — controller owns the pidfile.
-   - `_signal_policy=NoopSignalPolicy()` — controller owns Ctrl+C.
+   - `_signal_policy=SigtermOnly()` — controller owns Ctrl+C; SIGTERM still triggers a graceful stop.
    - `_channels=IpcChannels(window_feed, override, disable)` — three queues injected from the controller.
 
 These keyword-only arguments thread through `start_recording` into the `RecordingPolicies` / `IpcChannels` bundles consumed by `engine.ScreenRecorder`. Standalone CLI uses the defaults (`SpawnNewMenubar` / `ClaimLock` / `ThreeTapSigint`).

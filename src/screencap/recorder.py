@@ -682,4 +682,3 @@ def start_recording(
 # ---------------------------------------------------------------------------
 
 from screencap.engine.screen_recorder import _run_screen_recorder  # noqa: E402, F401
-
