@@ -78,10 +78,19 @@ class MitmProxyV15:
     """
 
     def __init__(self, console: "_Console | None" = None) -> None:
-        from rich.console import Console
-
         self._lock_handle: Any | None = None
-        self._console = console or Console()
+        # ``console=None`` defers resolution to ``_get_console`` so the
+        # adapter's patchable ``screencap.recorder.console`` wins at the
+        # point of printing (tests mock that attribute, and a fresh
+        # ``Console()`` here would bypass the mock).
+        self._console_override = console
+
+    def _get_console(self) -> "_Console":
+        if self._console_override is not None:
+            return self._console_override
+        from screencap.recorder import console as _adapter_console
+
+        return _adapter_console
 
     def _prepare_dek_material(self) -> tuple[bytes, bytes, bytes]:
         """Fetch KEK, generate DEK, wrap — KEK lives only in this frame."""
@@ -115,7 +124,7 @@ class MitmProxyV15:
             dek, dek_wrapped, dek_nonce = self._prepare_dek_material()
 
             if not effective_capture_bodies_for(network_config):
-                self._console.print(
+                self._get_console().print(
                     "[yellow]warning:[/yellow] effective capture-bodies "
                     "allowlist is empty; recording will be metadata-only "
                     "for all hosts."
