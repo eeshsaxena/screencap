@@ -70,12 +70,10 @@ class MacOSTCC:
 
 
 class Noop:
-    """Test permission policy: all hooks are safe no-ops.
+    """Permission policy that skips all TCC interaction.
 
-    Used by tests that need to bypass TCC entirely. Session workers
-    currently still receive the standalone-CLI ``MacOSTCC`` instance —
-    making session workers actually pass ``Noop`` is tracked separately
-    (see the policy-injection follow-up ticket).
+    Used by session workers (to avoid redundant per-process TCC subprocesses)
+    and by tests that need to bypass macOS permission checks entirely.
     """
 
     @property

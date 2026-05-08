@@ -588,6 +588,9 @@ def start_recording(
     _menubar_policy: "MenubarPolicy | None" = None,
     _signal_policy: "SignalPolicy | None" = None,
     _lock_policy: "LockPolicy | None" = None,
+    _permission_policy: "PermissionPolicy | None" = None,
+    _disk_policy: "DiskPolicy | None" = None,
+    _network_policy: "NetworkPolicy | None" = None,
     network_handoff_ready=None,
 ) -> tuple[Path, float, multiprocessing.Process | None, Path | None]:
     """Start a screen capture recording. Blocks until Ctrl+C.
@@ -629,13 +632,18 @@ def start_recording(
     )
     channels = _channels if _channels is not None else IpcChannels.create()
     menubar = _menubar_policy if _menubar_policy is not None else SpawnNewMenubar()
+    signal = _signal_policy if _signal_policy is not None else ThreeTapSigint()
+    lock = _lock_policy if _lock_policy is not None else ClaimLock()
+    permission = _permission_policy if _permission_policy is not None else MacOSTCC()
+    disk = _disk_policy if _disk_policy is not None else MonitorAndStop()
+    net = _network_policy if _network_policy is not None else (_MitmProxyV15() if network else _NetworkNull())
     policies = RecordingPolicies(
-        signal=_signal_policy if _signal_policy is not None else ThreeTapSigint(),
-        lock=_lock_policy if _lock_policy is not None else ClaimLock(),
+        signal=signal,
+        lock=lock,
         menubar=menubar,
-        permission=MacOSTCC(),
-        disk=MonitorAndStop(),
-        network=_MitmProxyV15() if network else _NetworkNull(),
+        permission=permission,
+        disk=disk,
+        network=net,
     )
     legacy = LegacyOptions(
         audio=audio,
