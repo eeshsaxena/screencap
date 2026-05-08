@@ -21,7 +21,6 @@ from screencap.engine.events import (
     MouseMoveEvent,
     SpecialKeyEvent,
 )
-from screencap.engine.export import unified_export_events
 from screencap.engine.processing import (
     process_events,
 )
@@ -417,32 +416,13 @@ class CaptureSession:
         (no Action wrapper, no screenshots) and includes WindowSwitchEvent
         entries interleaved by timestamp.
 
-        Privacy filtering is NOT applied here — callers (exporter,
-        chunk processor) apply their own privacy policy.
-
-        Delegates to :func:`screencap.engine.export.unified_export_events`
-        — the single source of truth for the row-to-event transform shared
-        by every export caller (CLI ``screencap export``, chunk processor,
-        recovery). ORM-to-dict conversion happens inside this method;
-        click thresholds and the ``include_moves`` filter stay at this
-        layer (R7, R8). ``initial_window_row=None`` because full-recording
-        exports do not prepend pre-chunk window context (R15).
-
-        Materialization boundary: ``unified_export_events`` returns an
-        ``Iterator[BaseEvent]`` for callers that stream directly to the
-        writer (chunk processor, recovery via ``write_events_jsonl``).
-        ``CaptureSession`` wraps the iterator with ``list(...)`` to keep
-        its public ``list[BaseEvent]`` return contract — see
-        ``tests/test_cross_layer_contracts.py`` lines 35-45.
-
-        V1.5: when ``include_network=True``, fetches ``network_event``
-        rows from the ORM relationship and passes them through
-        ``unified_export_events`` so JSONL output includes ``network.*``
-        lines. The explicit ``screencap export`` CLI sets this flag;
-        ``_auto_export`` (post-recording, feeds cloud upload) and the
-        chunk processor leave it ``False`` so V1's cloud-safety
-        guarantee is preserved until V1.75 wires
-        ``build_cloud_network_filter``.
+        Delegates to :func:`screencap.export.export_chunk_events` — the
+        shared seam every export caller (CLI ``screencap export``, chunk
+        processor, recovery) goes through. Network row fetching from
+        the ORM relationship stays at this layer because V1.5's
+        ``include_network`` flag is CLI-only; chunk + recovery never
+        opt in. The ``include_moves`` post-filter (R7) is also applied
+        here.
 
         When ``network_scrub_pipeline`` is supplied (V1.5 explicit
         export only), encrypted bodies are decrypted + PII-scrubbed at
@@ -460,77 +440,18 @@ class CaptureSession:
             network_scrub_pipeline: Optional V1.5 ``NetworkScrubPipeline``.
                 Required when ``include_network=True`` AND the recording
                 has encrypted bodies (otherwise ciphertext bytes leak
-                into JSONL). Construct via
-                ``screencap.network.export_pipeline.NetworkScrubPipeline``.
+                into JSONL).
 
         Returns:
             Combined list of action + window.switch events, sorted by timestamp.
         """
-        # 1. Build action_rows from ORM iteration with the disabled
-        #    filter applied at the row-fetch boundary (mirrors
-        #    raw_events() at line 367 — see R16).
-        action_rows: list[dict] = []
-        for db_event in self._recording.action_events:
-            if getattr(db_event, "disabled", False):
-                continue
-            action_rows.append(_action_event_to_dict(db_event))
-
-        # 2. Forward-looking parity with chunk processor's
-        #    ``_disabled_clause``: when a future migration adds
-        #    ``window_event.disabled``, chunk + recovery + CLI must all
-        #    filter it. The ``WindowEvent`` ORM model doesn't have the
-        #    column today (adding it would break older DBs that lack
-        #    it — same failure mode as the recently-fixed P2 recovery
-        #    bug), so we pre-fetch disabled IDs via raw SQL and skip
-        #    them during ORM iteration. Fail-soft: this is a
-        #    forward-looking concern, not load-bearing for the current
-        #    schema, so any error leaves the set empty (= no rows
-        #    skipped, matching today's behavior).
-        disabled_window_ids: set[int] = set()
-        try:
-            from screencap.recording_db import has_column, open_recording_db
-
-            db_path = self.capture_dir / "recording.db"
-            with open_recording_db(db_path) as conn:
-                if has_column(conn, "window_event", "disabled"):
-                    rows = conn.execute(
-                        "SELECT id FROM window_event "
-                        "WHERE disabled IS NOT NULL AND disabled"
-                    ).fetchall()
-                    disabled_window_ids = {r[0] for r in rows}
-        except Exception:
-            pass
-
-        # 3. Build window_rows from ORM relationship. Already ordered
-        #    by timestamp via the ``order_by`` on the SQLAlchemy
-        #    relationship. Skip rows whose id is in
-        #    ``disabled_window_ids`` (forward-looking parity above).
-        window_rows: list[dict] = []
-        for we in getattr(self._recording, "window_events", []):
-            if we.id in disabled_window_ids:
-                continue
-            window_rows.append({
-                "timestamp": we.timestamp,
-                "app_bundle_id": getattr(we, "app_bundle_id", None),
-                "title": getattr(we, "title", None),
-                "window_id": str(getattr(we, "window_id", "") or ""),
-                "left": getattr(we, "left", 0),
-                "top": getattr(we, "top", 0),
-                "width": getattr(we, "width", 0),
-                "height": getattr(we, "height", 0),
-                "browser_url": getattr(we, "browser_url", None),
-            })
-
-        # 4. V1.5: build network_rows from the ORM relationship when
-        #    the caller opts in via ``include_network=True``. Default
-        #    is False because ``_auto_export`` (which feeds cloud
-        #    upload) shares this method — emitting network rows
-        #    unconditionally would leak metadata to cloud regardless
-        #    of the local-only promise. The relationship's
-        #    ``order_by="NetworkEvent.timestamp_ns"`` keeps rows
-        #    time-ordered. ``getattr`` covers older DBs that lack the
-        #    V1.5 ciphertext columns; ``_ensure_network_tables`` plus
-        #    ``_migrate_schema`` already ran at ``Capture.load`` time.
+        # V1.5 only: build network_rows from the ORM relationship
+        # when the caller opts in. ``_auto_export`` (which feeds cloud
+        # upload) leaves ``include_network=False`` so JSONL stays
+        # cloud-safe. The relationship's
+        # ``order_by="NetworkEvent.timestamp_ns"`` keeps rows
+        # time-ordered. ``getattr`` covers older DBs that lack the
+        # V1.5 ciphertext columns.
         network_rows: list[dict] | None = None
         if include_network:
             try:
@@ -563,30 +484,22 @@ class CaptureSession:
                     "timestamp_ns": getattr(ne, "timestamp_ns", 0),
                 })
 
-        # 5. Run the unified pipeline. ``initial_window_row=None`` per
-        #    R15 (full-recording exports do not prepend pre-chunk
-        #    context). ``window_filter=None`` because CLI export does
-        #    not currently apply a privacy filter at this layer (the
-        #    test-only path goes through ``_write_events`` which wraps
-        #    the events post-hoc).
-        result = list(unified_export_events(
-            action_rows,
-            window_rows,
-            initial_window_row=None,
-            double_click_interval=(
-                self._recording.double_click_interval_seconds or 0.5
-            ),
-            double_click_distance=(
-                self._recording.double_click_distance_pixels or 5.0
-            ),
-            window_filter=None,
+        from screencap.export import export_chunk_events
+
+        # Full recording: no time range, no privacy filter (CLI export
+        # path). The shared seam owns row fetching, threshold loading,
+        # and the disabled-row guard for both action and window
+        # tables.
+        result = export_chunk_events(
+            self.capture_dir,
+            materialized=True,
             network_rows=network_rows,
             network_scrub_pipeline=network_scrub_pipeline,
-        ))
+        )
 
-        # 4. Per R7, the unified callable does not drop MouseMoveEvent
-        #    itself. Apply the caller-side ``--exclude-moves`` filter
-        #    here when the user opts out of moves.
+        # Per R7, the unified callable does not drop MouseMoveEvent
+        # itself. Apply the caller-side ``--exclude-moves`` filter
+        # here when the user opts out of moves.
         if not include_moves:
             result = [e for e in result if not isinstance(e, MouseMoveEvent)]
 
