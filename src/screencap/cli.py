@@ -132,8 +132,44 @@ def _download_nlp_models() -> None:
     hidden=True,
     help="Override socket path (test-only).",
 )
-def serve(socket_path, self_test):
-    """Run the ScreenCap daemon."""
+@click.option("--install", is_flag=True, help="Install LaunchAgent and start daemon.")
+@click.option("--uninstall", is_flag=True, help="Stop daemon and remove LaunchAgent.")
+@click.option("--status", "show_status", is_flag=True, help="Print daemon LaunchAgent status.")
+def serve(socket_path, self_test, install, uninstall, show_status):
+    """Run the ScreenCap daemon, or manage its LaunchAgent."""
+    if sum(bool(flag) for flag in (install, uninstall, show_status)) > 1:
+        raise click.UsageError("--install, --uninstall, and --status are mutually exclusive.")
+
+    if install or uninstall or show_status:
+        from screencap.daemon import launchagent
+
+        if install:
+            result = launchagent.install()
+            if result.state == "installed_and_running":
+                console.print(f"[green]{result.state}[/green]: {result.plist_path}")
+                return
+            console.print(f"[red]{result.state}[/red]: {result.detail}")
+            raise SystemExit(1)
+
+        if uninstall:
+            result = launchagent.uninstall()
+            if result.state == "uninstalled":
+                console.print(f"[green]{result.state}[/green]: {result.plist_path}")
+                return
+            console.print(f"[red]{result.state}[/red]: {result.detail}")
+            raise SystemExit(1)
+
+        result = launchagent.status()
+        if result.state == "loaded":
+            state_detail = result.launchd_state or "unknown"
+            console.print(f"[green]loaded[/green]: {state_detail}")
+            return
+        if result.state == "not_loaded":
+            console.print("[yellow]not_loaded[/yellow]")
+            return
+        console.print(f"[red]{result.state}[/red]: {result.detail}")
+        raise SystemExit(1)
+
     from screencap.daemon.server import serve as _serve
 
     raise SystemExit(_serve(socket_path=socket_path, self_test=self_test))
@@ -3993,6 +4029,34 @@ def _check_keyring_macos_backend() -> tuple[str, bool, str]:
         return name, False, _tb.format_exc()
 
 
+def _check_daemon_load() -> tuple[str, bool, str]:
+    """Construct the daemon ASGI app and verify required routes register."""
+    name = "daemon_load"
+    try:
+        from screencap.daemon.app import build_app
+
+        app = build_app()
+        if not app.routes:
+            return name, False, "app constructed but has no routes"
+        paths = {getattr(route, "path", None) for route in app.routes}
+        required = {
+            "/v0/daemon.info",
+            "/v0/recording.list",
+            "/v0/session.snapshot",
+            "/v0/events",
+            "/v0/recording.start",
+            "/v0/recording.stop",
+        }
+        missing = required - paths
+        if missing:
+            return name, False, f"missing routes: {sorted(missing)}"
+        return name, True, ""
+    except BaseException:
+        import traceback as _tb
+
+        return name, False, _tb.format_exc()
+
+
 @cli.group("network")
 def network_group() -> None:
     """Manage the network capture CA + recover from crashes."""
@@ -4243,6 +4307,7 @@ _SMOKE_CHECKS = [
     _check_domain_index,
     _check_onnxruntime_excluded,
     _check_keyring_macos_backend,
+    _check_daemon_load,
 ]
 
 
