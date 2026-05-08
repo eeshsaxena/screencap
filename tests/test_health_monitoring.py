@@ -170,9 +170,14 @@ class TestForceQuitPidSnapshot:
         """Verify _force_exit iterates _pids_snapshot to prevent PID recycling."""
         import ast
         import inspect
-        import screencap.recorder as mod
 
-        source = inspect.getsource(mod)
+        from screencap.recorder import _run_screen_recorder
+
+        # ``_run_screen_recorder`` is re-exported from
+        # ``screencap.engine.screen_recorder`` (recorder.py is now a CLI
+        # adapter); ``inspect.getsource`` resolves to the engine source,
+        # where the nested ``_force_exit`` lives.
+        source = inspect.getsource(_run_screen_recorder)
         tree = ast.parse(source)
 
         force_exit_fn = None

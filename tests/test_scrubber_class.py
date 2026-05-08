@@ -455,3 +455,157 @@ def test_scrub_recording_raises_when_recording_missing(tmp_path):
         "screencap.scrubber.get_recordings_dir", return_value=tmp_path,
     ), pytest.raises(FileNotFoundError):
         scrub_recording("does-not-exist")
+
+
+# ---------------------------------------------------------------------------
+# Pointer-geometry suppression — load-bearing CLAUDE.md invariant
+# ---------------------------------------------------------------------------
+#
+# CLAUDE.md ("Scrubbing pipeline") states ``scrub_events_jsonl`` MUST drop
+# ``mouse.move`` events whose timestamp falls inside an interval whose
+# privacy action is in ``SCRUB_BLOCK_ACTIONS``. The set is broader than
+# ``BLOCK_ACTIONS`` — TEXT_REDACT covers code editors, OCR_FALLBACK covers
+# unverified browsers — because pointer geometry inside content-sensitive
+# contexts is comparably sensitive (which terminal line was being edited,
+# which credentials field was being hovered).
+#
+# These tests guard the cloud-bound privacy posture: a regression that
+# stopped dropping ``mouse.move`` would silently leak pointer geometry to
+# GCS. Recovery via ``screencap upload`` only protects the recovered
+# JSONL when this drop runs, so the invariant is also tested at the
+# recovery boundary in ``test_recover_chunk_metadata.py``.
+
+
+def _write_events_with_mouse_move(
+    rec: Path, *, before_ts: float, in_interval_ts: float, after_ts: float,
+) -> None:
+    """Write events.jsonl with one mouse.move at each given timestamp."""
+    rec.mkdir(parents=True, exist_ok=True)
+    meta = {"_meta": True, "screencap_version": "0.1.0", "exported_at": "2026-05-04T00:00:00"}
+    events = [
+        {"timestamp": before_ts, "type": "mouse.move", "mouse_x": 10.0, "mouse_y": 10.0},
+        {"timestamp": in_interval_ts, "type": "mouse.move", "mouse_x": 100.0, "mouse_y": 100.0},
+        {"timestamp": after_ts, "type": "mouse.move", "mouse_x": 200.0, "mouse_y": 200.0},
+    ]
+    lines = [json.dumps(meta)] + [json.dumps(e) for e in events]
+    (rec / "events.jsonl").write_text("\n".join(lines) + "\n")
+
+
+def test_run_drops_mouse_move_inside_excluded_app_interval(
+    tmp_path, pipeline_and_anonymizer,
+):
+    """``mouse.move`` events inside an EXCLUDE interval must be dropped.
+
+    Pins the load-bearing CLAUDE.md "Scrubbing pipeline" invariant: when
+    a mouse.move's timestamp lands inside an interval whose privacy
+    action is in ``SCRUB_BLOCK_ACTIONS``, the event is dropped from
+    ``events.jsonl``. Without this drop, pointer geometry inside a
+    password-manager (or code editor / admin console / unverified
+    browser) leaks to GCS even when content is otherwise scrubbed.
+    """
+    from screencap.privacy.context import DefaultContextClassifier
+    from screencap.privacy.policy import DefaultPolicyEvaluator, parse_privacy_config
+
+    pipeline, anonymizer = pipeline_and_anonymizer
+    rec = tmp_path / "rec"
+    blocked_start, blocked_end = 100.0, 200.0
+    _make_recording_with_blocked_interval(
+        rec,
+        blocked_bundle_id="com.1password.1password",
+        blocked_start=blocked_start,
+        blocked_end=blocked_end,
+    )
+    in_interval_ts = (blocked_start + blocked_end) / 2  # 150
+    after_ts = blocked_end + 50  # 250
+    # Mouse moves: one inside the EXCLUDE interval, one after — clearly
+    # in a non-blocked window context.
+    _write_events_with_mouse_move(
+        rec,
+        before_ts=in_interval_ts,  # not used, asserted-on
+        in_interval_ts=in_interval_ts,
+        after_ts=after_ts,
+    )
+
+    cfg = parse_privacy_config({"privacy": {"mode": "internal"}})
+    evaluator = DefaultPolicyEvaluator(cfg)
+    classifier = DefaultContextClassifier()
+
+    from screencap.scrubber import Scrubber
+
+    Scrubber(
+        rec,
+        pipeline=pipeline,
+        anonymizer=anonymizer,
+        evaluator=evaluator,
+        classifier=classifier,
+    ).run()
+
+    out_lines = (rec / "events.jsonl").read_text().splitlines()
+    moves_kept = [
+        json.loads(line)["timestamp"]
+        for line in out_lines
+        if line.strip() and not json.loads(line).get("_meta")
+        and json.loads(line).get("type") == "mouse.move"
+    ]
+    assert in_interval_ts not in moves_kept, (
+        "mouse.move inside an EXCLUDE interval must be dropped (CLAUDE.md "
+        "SCRUB_BLOCK_ACTIONS pointer-suppression invariant)"
+    )
+    assert after_ts in moves_kept, (
+        f"mouse.move outside any blocked interval must be preserved; "
+        f"moves_kept={moves_kept}"
+    )
+
+
+# ---------------------------------------------------------------------------
+# Robustness to malformed inputs
+# ---------------------------------------------------------------------------
+
+
+def test_run_chunk_tolerates_malformed_jsonl_line(tmp_path, pipeline_and_anonymizer):
+    """A corrupt JSONL line must not abort the chunk scrub.
+
+    The file is renamed to ``.scrub_failed`` to mark it ineligible for
+    upload (fail-closed at the file boundary), but the call returns
+    normally so the rest of the chunk still gets scrubbed.
+    """
+    pipeline, anonymizer = pipeline_and_anonymizer
+    rec = tmp_path / "rec"
+    _make_recording_with_db_pii(rec, secret="placeholder@example.com")
+
+    meta = {"_meta": True, "screencap_version": "0.1.0", "exported_at": "2026-05-04T00:00:00"}
+    good = {"timestamp": 100.0, "type": "mouse.move", "mouse_x": 1.0, "mouse_y": 2.0}
+    events_path = rec / "events_0001.jsonl"
+    events_path.write_text(
+        json.dumps(meta) + "\n"
+        + "{this is not valid json at all\n"
+        + json.dumps(good) + "\n",
+    )
+
+    from screencap.scrubber import Scrubber
+
+    # Must not raise; the chunk completes despite the corrupt line.
+    Scrubber(rec, pipeline=pipeline, anonymizer=anonymizer).run_chunk(
+        idx=1, start_ts=0.0, end_ts=200.0, transcript_path=None,
+    )
+
+    failed_path = events_path.with_suffix(events_path.suffix + ".scrub_failed")
+    assert failed_path.exists(), (
+        "fail-closed: the file with the corrupt line must be renamed to "
+        f".scrub_failed so it never gets uploaded; rec contents="
+        f"{[p.name for p in rec.iterdir()]}"
+    )
+
+
+def test_scrub_recording_rejects_path_traversal(tmp_path):
+    """``scrub_recording`` refuses names that escape the recordings dir."""
+    from unittest import mock
+
+    from screencap.scrubber import scrub_recording
+
+    with mock.patch(
+        "screencap.config.get_recordings_dir", return_value=tmp_path,
+    ), mock.patch(
+        "screencap.scrubber.get_recordings_dir", return_value=tmp_path,
+    ), pytest.raises(ValueError):
+        scrub_recording("../etc/passwd")

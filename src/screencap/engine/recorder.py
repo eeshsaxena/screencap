@@ -3855,6 +3855,7 @@ class Recorder:
         self._record_thread: threading.Thread | None = None
         self._status_thread: threading.Thread | None = None
         self._fanout_thread: threading.Thread | None = None
+        self._pipeline_finalized: bool = False
         self._capture = None  # lazy CaptureSession
 
     def _drain_status_pipe(self) -> None:
@@ -3989,7 +3990,20 @@ class Recorder:
         self._record_thread.start()
         return self
 
-    def __exit__(self, exc_type, exc_val, exc_tb) -> None:
+    def finalize_pipeline(self) -> None:
+        """Drain record/fanout/status threads. Idempotent. Does NOT close queues.
+
+        External callers invoke this *before* draining downstream
+        consumers (chunk_processor / scrub_worker) so every chunk
+        message — including the ``final_chunk`` rotation pushed during
+        record-thread shutdown — is forwarded onto ``_chunk_process_q``
+        before a poison pill is enqueued behind it. Closing the queues
+        here would race the consumers; ``__exit__`` does that after
+        consumers have finished.
+        """
+        if self._pipeline_finalized:
+            return
+        self._pipeline_finalized = True
         self._terminate_processing.set()
         if self._record_thread is not None:
             self._record_thread.join(timeout=30)
@@ -4000,6 +4014,9 @@ class Recorder:
             self._fanout_thread.join(timeout=10)
         if self._status_thread is not None:
             self._status_thread.join(timeout=5)
+
+    def __exit__(self, exc_type, exc_val, exc_tb) -> None:
+        self.finalize_pipeline()
 
         # Clean up multiprocessing queues to prevent feeder-thread hangs at exit.
         for q in (self._chunk_rotate_q, self._audio_rotate_q,
