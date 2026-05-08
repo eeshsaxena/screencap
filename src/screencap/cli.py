@@ -2513,7 +2513,7 @@ def _recover_chunk_metadata(
     underlying data is fixed. Recovery's previous "raw dump tolerates
     everything" behaviour is intentionally retired by this refactor.
     """
-    from screencap.recording_db import Row, has_column, has_table, open_recording_db
+    from screencap.recording_db import Row, open_recording_db
 
     chunk_videos = sorted(recording_dir.glob("chunk_*.mp4"))
     if not chunk_videos:
@@ -2551,49 +2551,19 @@ def _recover_chunk_metadata(
     for idx in missing_manifests:
         (recording_dir / f"chunk_{idx:04d}_manifest.json.tmp").unlink(missing_ok=True)
 
-    # Derive chunk time ranges from recording.db
-    # Per-recording click thresholds (P2 fix): the chunk processor and the
-    # CLI export both pass the recording's own ``double_click_*`` values to
-    # the unified callable. Recovery must do the same — otherwise a
-    # recording with non-default thresholds (e.g. interval=0.3s) would have
-    # its recovered JSONL emit different click merges than the original
-    # chunk export, breaking the byte-identical contract for non-default
-    # configurations. Falls back to engine defaults (0.5s / 5px) when the
-    # threshold columns are NULL or the row is absent.
-    double_click_interval = 0.5
-    double_click_distance = 5.0
+    # Derive chunk time ranges from recording.db. Click thresholds and the
+    # disabled-row / schema-drift handling now live inside
+    # ``screencap.export.export_chunk_events`` — recovery only needs the
+    # range arithmetic here.
     try:
         with open_recording_db(db_path, row_factory=Row) as conn:
-            # Build the SELECT column list, gating per-recording click
-            # thresholds on their presence in the schema. Older recording.db
-            # files predate these columns; without the guard, an unconditional
-            # SELECT raises OperationalError which the outer except catches
-            # and silently aborts recovery for the entire recording (P2 bug).
-            # Mirrors chunk_processor._load_click_thresholds' fail-soft
-            # fallback to engine defaults (0.5s / 5px).
-            has_thresholds = (
-                has_column(conn, "recording", "double_click_interval_seconds")
-                and has_column(conn, "recording", "double_click_distance_pixels")
-            )
-            if has_thresholds:
-                rec = conn.execute(
-                    "SELECT timestamp, double_click_interval_seconds, "
-                    "double_click_distance_pixels FROM recording LIMIT 1"
-                ).fetchone()
-                if rec:
-                    if rec["double_click_interval_seconds"] is not None:
-                        double_click_interval = float(rec["double_click_interval_seconds"])
-                    if rec["double_click_distance_pixels"] is not None:
-                        double_click_distance = float(rec["double_click_distance_pixels"])
-            else:
-                rec = conn.execute(
-                    "SELECT timestamp FROM recording LIMIT 1"
-                ).fetchone()
+            rec = conn.execute(
+                "SELECT timestamp FROM recording LIMIT 1"
+            ).fetchone()
             if not rec:
                 return
             rec_start = rec["timestamp"]
 
-            # Get the first and last action event timestamps
             first_evt = conn.execute("SELECT MIN(timestamp) as ts FROM action_event").fetchone()
             last_evt = conn.execute("SELECT MAX(timestamp) as ts FROM action_event").fetchone()
             if not first_evt or first_evt["ts"] is None:
@@ -2603,15 +2573,11 @@ def _recover_chunk_metadata(
             last_ts = last_evt["ts"]
             n_chunks = len(chunk_videos)
 
-            # Determine chunk duration from config
             from screencap.config import get_chunk_duration
             chunk_dur = get_chunk_duration()
             if chunk_dur <= 0:
-                # Estimate from recording span and chunk count
                 chunk_dur = (last_ts - first_ts) / max(n_chunks, 1)
 
-            # Compute chunk boundaries: chunk N covers [start + N*dur, start + (N+1)*dur)
-            # Use recording start (or first event) as the base
             base_ts = min(rec_start, first_ts)
             chunk_ranges = []
             for idx in range(n_chunks):
@@ -2642,10 +2608,10 @@ def _recover_chunk_metadata(
             if generated:
                 console.print(f"  [dim]Generated {generated} chunk manifest(s)[/dim]")
 
-    # Generate missing per-chunk events via the unified export pipeline
+    # Generate missing per-chunk events via the shared export seam.
     if missing_events:
         with console.status("[dim]Exporting per-chunk events...[/dim]"):
-            from screencap.engine.export import unified_export_events
+            from screencap.export import export_chunk_events
             from screencap.exporter import build_export_metadata, write_events_jsonl
             from screencap.privacy.filter import build_cloud_window_filter
 
@@ -2662,106 +2628,42 @@ def _recover_chunk_metadata(
                     privacy_mode = "internal"
 
             exported = 0
-            try:
-                with open_recording_db(db_path, row_factory=Row) as conn:
-                    action_disabled_clause = (
-                        " AND (disabled IS NULL OR NOT disabled)"
-                        if has_column(conn, "action_event", "disabled") else ""
+            for idx, c_start, c_end in chunk_ranges:
+                if idx not in missing_events:
+                    continue
+
+                jsonl_path = recording_dir / f"events_{idx:04d}.jsonl"
+
+                try:
+                    # Per-chunk try so a config-load failure
+                    # (e.g. InvalidPrivacyConfigError) marks one chunk as
+                    # failed instead of aborting the whole recovery.
+                    # Build the cloud filter inline at the call site so
+                    # the privacy posture is visible — and statically
+                    # auditable (see test_privacy_filter_call_graph.py)
+                    # — at every cloud-capable caller.
+                    events_iter = export_chunk_events(
+                        recording_dir,
+                        c_start,
+                        c_end,
+                        window_filter=build_cloud_window_filter(
+                            cloud_bound=cloud_bound,
+                            privacy_mode=privacy_mode,
+                            capture_dir=recording_dir,
+                        ),
                     )
-                    has_window_table = has_table(conn, "window_event")
-                    window_disabled_clause = (
-                        " AND (disabled IS NULL OR NOT disabled)"
-                        if has_window_table and has_column(conn, "window_event", "disabled")
-                        else ""
+
+                    meta = build_export_metadata(exclude_moves=False)
+                    write_events_jsonl(jsonl_path, events_iter, meta)
+                    exported += 1
+                except Exception as e:
+                    # Skip-on-error: a corrupt row that trips process_events
+                    # or interleave invalidates this chunk's export. Other
+                    # chunks proceed normally. write_events_jsonl already
+                    # removed any partial .tmp.
+                    console.print(
+                        f"  [yellow]Warning:[/yellow] Event export failed for chunk {idx}: {e}"
                     )
-
-                    for idx, c_start, c_end in chunk_ranges:
-                        if idx not in missing_events:
-                            continue
-
-                        jsonl_path = recording_dir / f"events_{idx:04d}.jsonl"
-
-                        try:
-                            # Build the cloud window filter inside the
-                            # per-chunk try so a config-load failure
-                            # (e.g. InvalidPrivacyConfigError, which is
-                            # not caught inside build_privacy_filter)
-                            # marks one chunk as failed instead of
-                            # aborting the whole recovery (R5/Unit 1).
-                            window_filter = build_cloud_window_filter(
-                                cloud_bound=cloud_bound,
-                                privacy_mode=privacy_mode,
-                                capture_dir=recording_dir,
-                            )
-
-                            # Action SELECT with R16 disabled filter
-                            action_rows = [
-                                dict(r) for r in conn.execute(
-                                    "SELECT * FROM action_event "
-                                    "WHERE timestamp >= ? AND timestamp < ?"
-                                    + action_disabled_clause
-                                    + " ORDER BY timestamp",
-                                    (c_start, c_end),
-                                ).fetchall()
-                            ]
-
-                            # Window SELECT with R16 disabled filter
-                            window_rows: list[dict] = []
-                            initial_window_row: dict | None = None
-                            if has_window_table:
-                                window_rows = [
-                                    dict(r) for r in conn.execute(
-                                        "SELECT * FROM window_event "
-                                        "WHERE timestamp >= ? AND timestamp < ?"
-                                        + window_disabled_clause
-                                        + " ORDER BY timestamp",
-                                        (c_start, c_end),
-                                    ).fetchall()
-                                ]
-                                # Initial window context: last window event
-                                # before chunk start, with timestamp rewritten
-                                # to fall just before the chunk so it appears
-                                # first after dedup/interleave.
-                                init_row = conn.execute(
-                                    "SELECT * FROM window_event "
-                                    "WHERE timestamp < ?"
-                                    + window_disabled_clause
-                                    + " ORDER BY timestamp DESC LIMIT 1",
-                                    (c_start,),
-                                ).fetchone()
-                                if init_row is not None:
-                                    initial_window_row = dict(init_row)
-                                    initial_window_row["timestamp"] = c_start - 0.001
-
-                            # Run the unified callable. Returns an iterator;
-                            # write_events_jsonl streams it to disk atomically.
-                            # Pass per-recording click thresholds (P2 fix) so
-                            # recovery's merge behaviour matches the live chunk
-                            # processor for recordings with non-default
-                            # double_click_* values.
-                            events_iter = unified_export_events(
-                                action_rows,
-                                window_rows,
-                                initial_window_row=initial_window_row,
-                                double_click_interval=double_click_interval,
-                                double_click_distance=double_click_distance,
-                                window_filter=window_filter,
-                            )
-
-                            meta = build_export_metadata(exclude_moves=False)
-                            write_events_jsonl(jsonl_path, events_iter, meta)
-                            exported += 1
-                        except Exception as e:
-                            # Skip-on-error: a corrupt row that trips
-                            # process_events or interleave invalidates this
-                            # chunk's export. Other chunks proceed normally.
-                            # write_events_jsonl already removed any partial
-                            # .tmp; no events_NNNN.jsonl is written.
-                            console.print(
-                                f"  [yellow]Warning:[/yellow] Event export failed for chunk {idx}: {e}"
-                            )
-            except Exception as e:
-                console.print(f"  [yellow]Warning:[/yellow] Could not export chunk events: {e}")
             if exported:
                 console.print(f"  [dim]Exported events for {exported} chunk(s)[/dim]")
 

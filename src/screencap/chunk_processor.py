@@ -15,14 +15,7 @@ import time
 from pathlib import Path
 
 from screencap._flush import wait_for_writer_flush
-from screencap.recording_db import (
-    Connection,
-    OperationalError,
-    Row,
-    has_column,
-    has_table,
-    open_recording_db,
-)
+from screencap.recording_db import open_recording_db
 
 logger = logging.getLogger(__name__)
 
@@ -135,61 +128,12 @@ class ChunkProcessor:
             self._auto_delete = False
             logger.info("Forced auto_delete=False because uploads are disabled")
 
-        # Cache per-recording click thresholds at construction so per-chunk
-        # exports avoid an extra SELECT under live-writer lock contention.
-        # Recording-level thresholds don't change mid-recording. Falls back
-        # to process_events defaults on missing table/column or NULL values.
-        self._click_interval, self._click_distance = self._load_click_thresholds()
-
         self._chunk_results: dict[int, bool] = {}  # idx → all_uploaded
         self._status_lock = threading.Lock()
         self._status: str = ""
         self._total_freed: int = 0
         self._thread: threading.Thread | None = None
         self._stop_event = threading.Event()
-
-    def _load_click_thresholds(self) -> tuple[float, float]:
-        """Read per-recording click thresholds once at construction.
-
-        Returns (double_click_interval_seconds, double_click_distance_pixels).
-        Falls back to ``process_events`` defaults (0.5s / 5px) when:
-        - The DB file does not yet exist (legacy callers may construct
-          the processor before the engine writes recording.db).
-        - The ``recording`` table or threshold columns are missing
-          (older schemas).
-        - Any OperationalError fires (e.g., busy_timeout expiration
-          while the writer holds a lock).
-        - A row exists but the column is NULL.
-
-        Wrapped fail-soft because per-recording thresholds are an
-        optimization, not a correctness requirement.
-        """
-        default_interval = 0.5
-        default_distance = 5.0
-        try:
-            if not self._db_path.is_file():
-                return default_interval, default_distance
-            with open_recording_db(self._db_path, row_factory=Row) as conn:
-                if not has_table(conn, "recording"):
-                    return default_interval, default_distance
-                row = conn.execute(
-                    "SELECT double_click_interval_seconds, "
-                    "double_click_distance_pixels FROM recording LIMIT 1"
-                ).fetchone()
-        except (OperationalError, FileNotFoundError) as exc:
-            logger.debug("Could not load click thresholds (using defaults): %s", exc)
-            return default_interval, default_distance
-        except Exception as exc:  # pragma: no cover - defensive
-            logger.debug("Unexpected error loading click thresholds: %s", exc)
-            return default_interval, default_distance
-        if row is None:
-            return default_interval, default_distance
-        interval = row["double_click_interval_seconds"]
-        distance = row["double_click_distance_pixels"]
-        return (
-            float(interval) if interval is not None else default_interval,
-            float(distance) if distance is not None else default_distance,
-        )
 
     @property
     def status(self) -> str:
@@ -590,35 +534,26 @@ class ChunkProcessor:
     def _export_events(self, idx: int, start_ts: float, end_ts: float) -> Path:
         """Export events from recording.db as JSONL for this chunk's time range.
 
-        Thin wrapper around the unified row-to-event callable
-        (``screencap.engine.export.unified_export_events``) so the chunk
-        processor and the CLI ``screencap export`` path share one
-        transform pipeline.
-
-        Steps: query action_event + window_event for [start_ts, end_ts)
-        with the ``disabled`` row filter (R16) → call
-        ``unified_export_events`` (process / dedup / window-filter /
-        interleave) → write atomically via ``write_events_jsonl`` (R14).
-        Includes initial window context (last window event before chunk
-        start, timestamp rewritten to ``start_ts - 0.001``) and a
-        ``format_version: 2`` ``_meta`` header.
+        Thin wrapper around :func:`screencap.export.export_chunk_events`
+        — the single seam every export caller (CLI, chunk processor,
+        recovery) goes through. The chunk processor's only concerns
+        here are: build the cloud window filter, run the export,
+        atomically write JSONL with a ``format_version: 2`` ``_meta``
+        header.
 
         Per R11 the chunk processor no longer drops ``mouse.move`` events
         — the scrubber is the sole point at which moves are dropped for
         sensitive intervals (Unit 2).
 
         Cloud privacy posture: the window filter is constructed
-        unconditionally via ``build_cloud_window_filter`` so the call
-        site cannot accidentally regress to a fail-OPEN ``window_filter
-        =None`` when ``cloud_intent`` is True. The factory returns
-        ``None`` when ``cloud_intent`` is False, the cloud-mode filter
-        when True (Unit 1).
+        unconditionally via ``build_cloud_window_filter`` (returns
+        ``None`` for non-cloud, the cloud-mode filter for cloud).
 
         Chunk boundary note: the processing pipeline is stateful (click
         merging, typing aggregation). A mouse.down at chunk end may stay
         unmerged — accepted limitation (orphan events at boundaries).
         """
-        from screencap.engine.export import unified_export_events
+        from screencap.export import export_chunk_events
         from screencap.exporter import build_export_metadata, write_events_jsonl
         from screencap.privacy.filter import build_cloud_window_filter
 
@@ -627,149 +562,32 @@ class ChunkProcessor:
             return jsonl_path
 
         try:
-            with open_recording_db(self._db_path, row_factory=Row) as conn:
-                # 1. Query action events with disabled filter (R16).
-                #    Fail-soft on OperationalError (busy_timeout from
-                #    live-writer contention) is preserved by the outer
-                #    try/except — the cleanup-on-exception path runs and
-                #    the exception propagates to the chunk-processor
-                #    cleanup, where individual chunk failures are caught.
-                action_filter = self._disabled_clause(conn, "action_event")
-                action_rows = [
-                    dict(r)
-                    for r in conn.execute(
-                        f"SELECT * FROM action_event "
-                        f"WHERE timestamp >= ? AND timestamp < ?{action_filter} "
-                        f"ORDER BY timestamp",
-                        (start_ts, end_ts),
-                    ).fetchall()
-                ]
-
-                # 2. Query window events (own fail-soft wrapper).
-                window_rows = self._query_window_events(conn, start_ts, end_ts)
-                initial_row = self._query_initial_window_context(conn, start_ts)
-
-                # 3. Build window_filter unconditionally — the factory
-                #    returns None for non-cloud, the cloud-mode filter
-                #    for cloud. Unconditional call site eliminates the
-                #    "if cloud_intent: build() else None" pattern that
-                #    Unit 8's structural CI guard forbids.
-                window_filter = build_cloud_window_filter(
+            # Build the cloud filter inline at the call site so the
+            # privacy posture is visible — and statically auditable
+            # (see test_privacy_filter_call_graph.py) — at every
+            # cloud-capable export_chunk_events caller.
+            events = export_chunk_events(
+                self._capture_dir,
+                start_ts,
+                end_ts,
+                window_filter=build_cloud_window_filter(
                     self._cloud_intent,
                     privacy_mode=self._privacy_mode,
                     capture_dir=self._capture_dir,
-                )
-
-                # 4. Call the unified callable. Per R11 the chunk
-                #    processor keeps mouse.move events — the scrubber
-                #    drops them inside SCRUB_BLOCK_ACTIONS intervals.
-                events = unified_export_events(
-                    action_rows,
-                    window_rows,
-                    initial_window_row=initial_row,
-                    double_click_interval=self._click_interval,
-                    double_click_distance=self._click_distance,
-                    window_filter=window_filter,
-                )
-
-                # 5. Build meta + write atomically via the shared helper.
-                meta = build_export_metadata(exclude_moves=False)
-                count = write_events_jsonl(jsonl_path, events, meta)
-
-                logger.info(
-                    f"Exported {count} events to {jsonl_path.name}"
-                )
+                ),
+            )
+            meta = build_export_metadata(exclude_moves=False)
+            count = write_events_jsonl(jsonl_path, events, meta)
+            logger.info(f"Exported {count} events to {jsonl_path.name}")
         except Exception:
             # Defense-in-depth: write_events_jsonl already cleans up its
-            # own .tmp on failure, but if the iterator setup raises before
-            # the helper opens its .tmp there is nothing to remove. The
-            # OperationalError fail-soft for action SELECT lands here so
-            # the chunk processor's outer ``except Exception`` in
-            # ``_run`` records the chunk as failed instead of crashing
-            # the thread.
+            # own .tmp; this covers the case where the iterator setup
+            # raises before the helper opens its .tmp.
             tmp_path = jsonl_path.with_suffix(jsonl_path.suffix + ".tmp")
             tmp_path.unlink(missing_ok=True)
             raise
 
         return jsonl_path
-
-    @staticmethod
-    def _disabled_clause(conn: Connection, table: str) -> str:
-        """Return a ``AND (disabled IS NULL OR NOT disabled)`` SQL fragment
-        for the given table, or an empty string if the column is absent.
-
-        Older recordings predate the ``disabled`` column; the schema-drift
-        guard keeps this query compatible with legacy DBs while applying
-        the filter wherever supported (R16).
-        """
-        if has_column(conn, table, "disabled"):
-            return " AND (disabled IS NULL OR NOT disabled)"
-        return ""
-
-    def _query_window_events(
-        self, conn: Connection, start_ts: float, end_ts: float,
-    ) -> list[dict]:
-        """Query window_event table for a time range. Returns list of dicts.
-
-        ``has_table`` covers the missing-table case. The inner SELECT is
-        wrapped because chunk export runs concurrently with the live writer:
-        a 5s busy_timeout that expires must not abort the whole chunk export.
-        Returning an empty list degrades gracefully to "no window context for
-        this chunk" rather than failing the chunk.
-
-        Applies the ``disabled`` row filter when the column exists (R16).
-        Older recordings without the column fall back to no filter.
-        """
-        if not has_table(conn, "window_event"):
-            logger.debug("window_event table not found, skipping window events")
-            return []
-        disabled_clause = self._disabled_clause(conn, "window_event")
-        try:
-            rows = conn.execute(
-                f"SELECT * FROM window_event "
-                f"WHERE timestamp >= ? AND timestamp < ?{disabled_clause} "
-                f"ORDER BY timestamp",
-                (start_ts, end_ts),
-            ).fetchall()
-        except OperationalError as exc:
-            logger.warning("window_event query failed (skipping): %s", exc)
-            return []
-        return [dict(r) for r in rows]
-
-    def _query_initial_window_context(
-        self, conn: Connection, start_ts: float,
-    ) -> dict | None:
-        """Query the last window_event before chunk start for initial context.
-
-        Same fail-soft contract as ``_query_window_events`` — a busy-timeout
-        or transient SQLite error returns None rather than aborting the
-        chunk export.
-
-        Applies the ``disabled`` row filter when the column exists (R16).
-        Rewrites the row's timestamp to ``start_ts - 0.001`` so it sorts
-        before any in-chunk event (load-bearing sort invariant for the
-        unified callable).
-        """
-        if not has_table(conn, "window_event"):
-            return None
-        disabled_clause = self._disabled_clause(conn, "window_event")
-        try:
-            row = conn.execute(
-                f"SELECT * FROM window_event "
-                f"WHERE timestamp < ?{disabled_clause} "
-                f"ORDER BY timestamp DESC LIMIT 1",
-                (start_ts,),
-            ).fetchone()
-        except OperationalError as exc:
-            logger.warning("initial window_event query failed (skipping): %s", exc)
-            return None
-        if row is not None:
-            d = dict(row)
-            # Set timestamp to just before chunk start so it appears first.
-            # The unified callable relies on this rewrite (R3).
-            d["timestamp"] = start_ts - 0.001
-            return d
-        return None
 
     def _generate_manifest(
         self, idx: int, start_ts: float, end_ts: float,

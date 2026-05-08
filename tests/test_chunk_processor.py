@@ -698,88 +698,6 @@ class TestUnifiedEventExport:
 
 
     # ------------------------------------------------------------------
-    # Per-recording click thresholds (R4) propagate via cached __init__
-    # values so the per-chunk SELECT under live-writer lock contention is
-    # avoided.
-    # ------------------------------------------------------------------
-
-    def test_per_recording_click_thresholds_cached_at_init(self, tmp_path):
-        """ChunkProcessor caches click thresholds at __init__ rather than
-        re-querying per chunk. Custom thresholds in the ``recording`` row
-        flow through to ``unified_export_events`` via the cached values.
-        """
-        from screencap.engine.db import create_db, crud
-
-        db_path = tmp_path / "recording.db"
-        engine, Session = create_db(str(db_path))
-        session = Session()
-        crud.insert_recording(session, {
-            "timestamp": 1000.0,
-            "platform": "darwin",
-            "monitor_width": 1920,
-            "monitor_height": 1080,
-            "pixel_ratio": 2.0,
-            # Atypical thresholds — easy to spot in the cached attrs.
-            "double_click_interval_seconds": 1.25,
-            "double_click_distance_pixels": 17.0,
-        })
-        session.close()
-        engine.dispose()
-
-        from screencap.chunk_processor import ChunkProcessor
-
-        q = multiprocessing.Queue()
-        ack_q = multiprocessing.Queue()
-        cp = ChunkProcessor(
-            tmp_path, q, ack_q, recording_name="test",
-            upload_enabled=False, auto_delete=False,
-        )
-        assert cp._click_interval == 1.25
-        assert cp._click_distance == 17.0
-
-    def test_click_thresholds_default_when_db_missing(self, tmp_path):
-        """No recording.db → defaults (0.5s / 5px) without raising."""
-        from screencap.chunk_processor import ChunkProcessor
-
-        q = multiprocessing.Queue()
-        ack_q = multiprocessing.Queue()
-        cp = ChunkProcessor(
-            tmp_path, q, ack_q, recording_name="test",
-            upload_enabled=False, auto_delete=False,
-        )
-        assert cp._click_interval == 0.5
-        assert cp._click_distance == 5.0
-
-    def test_click_thresholds_default_when_recording_row_null(self, tmp_path):
-        """Recording row exists but threshold columns are NULL → defaults."""
-        from screencap.engine.db import create_db, crud
-
-        db_path = tmp_path / "recording.db"
-        engine, Session = create_db(str(db_path))
-        session = Session()
-        crud.insert_recording(session, {
-            "timestamp": 1000.0,
-            "platform": "darwin",
-            "monitor_width": 1920,
-            "monitor_height": 1080,
-            "pixel_ratio": 2.0,
-            # Both NULL.
-        })
-        session.close()
-        engine.dispose()
-
-        from screencap.chunk_processor import ChunkProcessor
-
-        q = multiprocessing.Queue()
-        ack_q = multiprocessing.Queue()
-        cp = ChunkProcessor(
-            tmp_path, q, ack_q, recording_name="test",
-            upload_enabled=False, auto_delete=False,
-        )
-        assert cp._click_interval == 0.5
-        assert cp._click_distance == 5.0
-
-    # ------------------------------------------------------------------
     # Disabled-row filter (R16) at the SELECT layer for both action and
     # window queries.
     # ------------------------------------------------------------------
@@ -949,7 +867,7 @@ class TestUnifiedEventExport:
                 yield _ProxyConn(real)
 
         with mock.patch(
-            "screencap.chunk_processor.open_recording_db", patched_open,
+            "screencap.export.open_recording_db", patched_open,
         ):
             with pytest.raises(_OpErr):
                 cp._export_events(0, 999.0, 1001.0)
