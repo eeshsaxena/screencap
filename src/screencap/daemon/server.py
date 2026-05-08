@@ -79,32 +79,44 @@ def serve(socket_path: str | Path | None = None, *, self_test: bool = False) -> 
             )
             server_ref = uvicorn.Server(config)
             uvicorn_handle_exit = server_ref.handle_exit
+            shutdown_task: asyncio.Task | None = None
+
+            async def shutdown_app_state() -> None:
+                if hasattr(app.state, "supervisor"):
+                    await app.state.supervisor.shutdown()
+                if hasattr(app.state, "event_bus"):
+                    await app.state.event_bus.shutdown()
+                server_ref.should_exit = True
+
+            def request_shutdown() -> None:
+                nonlocal shutdown_task
+                if shutdown_task is None or shutdown_task.done():
+                    shutdown_task = loop.create_task(shutdown_app_state())
 
             def handle_exit(signum: int, frame: FrameType | None) -> None:
-                if hasattr(app.state, "event_bus"):
-                    loop.call_soon_threadsafe(
-                        lambda: asyncio.create_task(app.state.event_bus.shutdown())
-                    )
-                uvicorn_handle_exit(signum, frame)
+                if server_ref.should_exit:
+                    uvicorn_handle_exit(signum, frame)
+                    return
+                loop.call_soon_threadsafe(request_shutdown)
 
             server_ref.handle_exit = handle_exit
 
             def real_handler(signum: int, _frame: FrameType | None) -> None:
                 nonlocal buffered_signal
                 buffered_signal = signum
-                if hasattr(app.state, "event_bus"):
-                    loop.create_task(app.state.event_bus.shutdown())
-                server_ref.should_exit = True
+                request_shutdown()
 
             for sig in _handled_signals():
                 signal.signal(sig, real_handler)
 
             if buffered_signal is not None:
-                server_ref.should_exit = True
+                request_shutdown()
 
             try:
                 await server_ref.serve(sockets=[listener])
             finally:
+                if shutdown_task is not None and not shutdown_task.done():
+                    await shutdown_task
                 listener.close()
                 cleanup_socket(resolved_socket_path)
             return 0

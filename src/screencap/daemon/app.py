@@ -25,9 +25,15 @@ _STARTED_AT = time.time()
 async def lifespan(app: Starlette) -> AsyncIterator[None]:
     if not hasattr(app.state, "event_bus"):
         app.state.event_bus = EventBus()
+    if not hasattr(app.state, "supervisor"):
+        from screencap.daemon.supervisor import Supervisor
+
+        app.state.supervisor = Supervisor(app.state.event_bus)
     try:
         yield
     finally:
+        if hasattr(app.state, "supervisor"):
+            await app.state.supervisor.shutdown()
         await app.state.event_bus.shutdown()
 
 
@@ -59,20 +65,23 @@ async def recording_list(_request: Request) -> JSONResponse:
             status_code=500,
         )
 
-    summaries = []
-    for recording in recordings:
-        data = recording._asdict()
-        model = schema.RecordingSummary
-        expected_fields = set(model.model_fields)
-        actual_fields = set(data)
-        if actual_fields != expected_fields:
-            missing = sorted(expected_fields - actual_fields)
-            extra = sorted(actual_fields - expected_fields)
-            raise RuntimeError(
-                "RecordingInfo and RecordingSummary fields diverged: "
-                f"missing={missing}, extra={extra}"
-            )
-        summaries.append(model(**data).model_dump(mode="json"))
+    try:
+        summaries = []
+        for recording in recordings:
+            data = recording._asdict()
+            model = schema.RecordingSummary
+            expected_fields = set(model.model_fields)
+            actual_fields = set(data)
+            if actual_fields != expected_fields:
+                missing = sorted(expected_fields - actual_fields)
+                extra = sorted(actual_fields - expected_fields)
+                raise RuntimeError(
+                    "RecordingInfo and RecordingSummary fields diverged: "
+                    f"missing={missing}, extra={extra}"
+                )
+            summaries.append(model(**data).model_dump(mode="json"))
+    except Exception as exc:
+        return _internal_error_response(exc, schema_version=schema._LIST_API_VERSION)
 
     return JSONResponse(
         schema.envelope(
@@ -82,7 +91,12 @@ async def recording_list(_request: Request) -> JSONResponse:
     )
 
 
-def _empty_snapshot(*, is_recording: bool | None, cursor: int) -> dict:
+def _empty_snapshot(
+    *,
+    is_recording: bool | None,
+    cursor: int,
+    recovering: bool = False,
+) -> dict:
     return schema.envelope(
         schema_version=schema._SNAPSHOT_API_VERSION,
         is_recording=is_recording,
@@ -90,6 +104,7 @@ def _empty_snapshot(*, is_recording: bool | None, cursor: int) -> dict:
         recording_name=None,
         started_at=None,
         claimant=None,
+        recovering=recovering,
         cursor=cursor,
     )
 
@@ -100,6 +115,8 @@ async def session_snapshot(request: Request) -> JSONResponse:
     # Cursor is the event boundary represented by this snapshot; reads do not
     # advance it.
     cursor = request.app.state.event_bus.current_cursor()
+    supervisor = getattr(request.app.state, "supervisor", None)
+    recovering = bool(supervisor and supervisor.is_recovering())
     active = pidfile.lock_is_active()
     metadata = pidfile.read_lock_metadata()
 
@@ -109,10 +126,14 @@ async def session_snapshot(request: Request) -> JSONResponse:
         metadata = pidfile.read_lock_metadata()
 
     if active and metadata is None:
-        return JSONResponse(_empty_snapshot(is_recording=None, cursor=cursor))
+        return JSONResponse(
+            _empty_snapshot(is_recording=None, cursor=cursor, recovering=recovering)
+        )
 
     if not active or metadata is None:
-        return JSONResponse(_empty_snapshot(is_recording=False, cursor=cursor))
+        return JSONResponse(
+            _empty_snapshot(is_recording=False, cursor=cursor, recovering=recovering)
+        )
 
     claimant = metadata.get("claimant")
     daemon_owned = claimant == "daemon"
@@ -120,17 +141,86 @@ async def session_snapshot(request: Request) -> JSONResponse:
     if recording_started_at is None:
         recording_started_at = metadata.get("started_at")
 
-    return JSONResponse(
-        schema.envelope(
-            schema_version=schema._SNAPSHOT_API_VERSION,
-            is_recording=True,
-            daemon_owned=daemon_owned,
-            recording_name=metadata.get("recording_name"),
-            started_at=recording_started_at,
-            claimant=claimant if daemon_owned else None,
-            cursor=cursor,
-        )
+    payload = schema.envelope(
+        schema_version=schema._SNAPSHOT_API_VERSION,
+        is_recording=True,
+        daemon_owned=daemon_owned,
+        recording_name=metadata.get("recording_name"),
+        started_at=recording_started_at,
+        claimant=claimant if daemon_owned else None,
+        recovering=recovering,
+        cursor=cursor,
     )
+    if daemon_owned and supervisor is not None:
+        current = supervisor.current_session()
+        if current:
+            for key in ("engine_pid", "frames_written"):
+                if current.get(key) is not None:
+                    payload[key] = current[key]
+    elif not daemon_owned:
+        if isinstance(metadata.get("pid"), int):
+            payload["claimant_pid"] = metadata["pid"]
+        if isinstance(metadata.get("started_at"), (int, float)):
+            payload["claimant_started_at"] = float(metadata["started_at"])
+
+    return JSONResponse(payload)
+
+
+def _internal_error_response(
+    exc: BaseException,
+    *,
+    schema_version: int,
+) -> JSONResponse:
+    return JSONResponse(
+        errors.error_envelope(
+            schema_version=schema_version,
+            error="internal_error",
+            reason=exc.__class__.__name__,
+        ),
+        status_code=500,
+    )
+
+
+async def recording_start(request: Request) -> JSONResponse:
+    try:
+        parsed = schema.RecordingStartRequest.model_validate(await request.json())
+        result = await request.app.state.supervisor.spawn(parsed)
+        return JSONResponse(
+            schema.envelope(
+                schema_version=schema._RECORDING_START_API_VERSION,
+                **result,
+            )
+        )
+    except errors.DaemonAPIError as exc:
+        return JSONResponse(exc.envelope(), status_code=exc.http_status)
+    except Exception as exc:
+        return _internal_error_response(
+            exc,
+            schema_version=schema._RECORDING_START_API_VERSION,
+        )
+
+
+async def recording_stop(request: Request) -> JSONResponse:
+    try:
+        parsed = schema.RecordingStopRequest.model_validate(await request.json())
+        result = await request.app.state.supervisor.stop(
+            force=parsed.force,
+            expected_claimant_pid=parsed.expected_claimant_pid,
+            expected_started_at=parsed.expected_started_at,
+        )
+        return JSONResponse(
+            schema.envelope(
+                schema_version=schema._RECORDING_STOP_API_VERSION,
+                **result,
+            )
+        )
+    except errors.DaemonAPIError as exc:
+        return JSONResponse(exc.envelope(), status_code=exc.http_status)
+    except Exception as exc:
+        return _internal_error_response(
+            exc,
+            schema_version=schema._RECORDING_STOP_API_VERSION,
+        )
 
 
 def _ndjson(payload: dict) -> bytes:
@@ -207,6 +297,8 @@ def build_app() -> Starlette:
             Route("/v0/recording.list", recording_list, methods=["GET"]),
             Route("/v0/session.snapshot", session_snapshot, methods=["GET"]),
             Route("/v0/events", events_stream, methods=["GET"]),
+            Route("/v0/recording.start", recording_start, methods=["POST"]),
+            Route("/v0/recording.stop", recording_stop, methods=["POST"]),
         ],
         lifespan=lifespan,
     )

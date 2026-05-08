@@ -97,6 +97,11 @@ def _load_models() -> dict[str, Any]:
         recording_name: str | None
         started_at: float | None
         claimant: str | None
+        recovering: bool = False
+        claimant_pid: int | None = None
+        claimant_started_at: float | None = None
+        engine_pid: int | None = None
+        frames_written: int | None = None
         cursor: int
 
     class RecordingStartRequest(_DaemonModel):
@@ -129,6 +134,8 @@ def _load_models() -> dict[str, Any]:
 
     class RecordingStopRequest(_DaemonModel):
         force: bool = False
+        expected_claimant_pid: int | None = None
+        expected_started_at: float | None = None
 
     class RecordingStopResponse(EnvelopeResponse):
         stopped: bool

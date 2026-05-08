@@ -14,6 +14,8 @@ SLOW_CONSUMER = "slow_consumer"
 CURSOR_UNKNOWN = "cursor_unknown"
 CATALOG_UNREADABLE = "catalog_unreadable"
 ROGUE_FILE = "rogue_file"
+RECONCILING = "reconciling"
+FORCE_MISMATCH = "force_mismatch"
 
 EXCEPTION_TO_ERROR_CODE: dict[type["DaemonAPIError"], str] = {}
 
@@ -39,12 +41,12 @@ def not_owned_by_daemon_envelope(
     *,
     claimant: str | None,
     schema_version: int,
+    hint: str | None = None,
 ) -> dict[str, Any]:
-    return error_envelope(
-        schema_version=schema_version,
-        error=NOT_OWNED_BY_DAEMON,
-        claimant=claimant,
-    )
+    payload: dict[str, Any] = {"claimant": claimant}
+    if hint is not None:
+        payload["hint"] = hint
+    return error_envelope(schema_version=schema_version, error=NOT_OWNED_BY_DAEMON, **payload)
 
 
 def schema_mismatch_envelope(
@@ -101,6 +103,22 @@ def rogue_file_envelope(
     )
 
 
+def reconciling_envelope(*, schema_version: int) -> dict[str, Any]:
+    return error_envelope(
+        schema_version=schema_version,
+        error=RECONCILING,
+        hint="wait for reconciliation to complete",
+    )
+
+
+def force_mismatch_envelope(*, schema_version: int) -> dict[str, Any]:
+    return error_envelope(
+        schema_version=schema_version,
+        error=FORCE_MISMATCH,
+        hint="force=true expected_claimant_pid/expected_started_at did not match current lock owner",
+    )
+
+
 class DaemonAPIError(Exception):
     """Base class for errors route handlers can convert to JSON responses."""
 
@@ -150,15 +168,18 @@ class NotOwnedByDaemonError(DaemonAPIError):
         claimant: str | None,
         *,
         schema_version: int,
+        hint: str | None = None,
         http_status: int | None = None,
     ) -> None:
         self.claimant = claimant
+        self.hint = hint
         super().__init__(schema_version=schema_version, http_status=http_status)
 
     def envelope(self) -> dict[str, Any]:
         return not_owned_by_daemon_envelope(
             claimant=self.claimant,
             schema_version=self.schema_version,
+            hint=self.hint,
         )
 
 
@@ -254,6 +275,22 @@ class RogueFileError(DaemonAPIError):
         return rogue_file_envelope(path=self.path, schema_version=self.schema_version)
 
 
+class ReconcilingError(DaemonAPIError):
+    error_code = RECONCILING
+    http_status = 503
+
+    def envelope(self) -> dict[str, Any]:
+        return reconciling_envelope(schema_version=self.schema_version)
+
+
+class ForceMismatchError(DaemonAPIError):
+    error_code = FORCE_MISMATCH
+    http_status = 409
+
+    def envelope(self) -> dict[str, Any]:
+        return force_mismatch_envelope(schema_version=self.schema_version)
+
+
 __all__ = [
     "LOCK_CONTENDED",
     "NOT_OWNED_BY_DAEMON",
@@ -262,6 +299,8 @@ __all__ = [
     "CURSOR_UNKNOWN",
     "CATALOG_UNREADABLE",
     "ROGUE_FILE",
+    "RECONCILING",
+    "FORCE_MISMATCH",
     "EXCEPTION_TO_ERROR_CODE",
     "error_envelope",
     "lock_contended_envelope",
@@ -271,6 +310,8 @@ __all__ = [
     "cursor_unknown_envelope",
     "catalog_unreadable_envelope",
     "rogue_file_envelope",
+    "reconciling_envelope",
+    "force_mismatch_envelope",
     "DaemonAPIError",
     "LockContendedError",
     "NotOwnedByDaemonError",
@@ -279,4 +320,6 @@ __all__ = [
     "CursorUnknownError",
     "CatalogUnreadableError",
     "RogueFileError",
+    "ReconcilingError",
+    "ForceMismatchError",
 ]

@@ -139,6 +139,64 @@ def serve(socket_path, self_test):
     raise SystemExit(_serve(socket_path=socket_path, self_test=self_test))
 
 
+@cli.command("_engine-worker", hidden=True)
+@click.argument("encoded_args")
+def _engine_worker_cmd(encoded_args):
+    """Hidden subprocess entry point spawned by the daemon supervisor."""
+    import base64
+    import multiprocessing
+    import threading
+    from pathlib import Path
+
+    args = json.loads(base64.b64decode(encoded_args).decode("utf-8"))
+    from screencap._stderr_events import (
+        EVENT_RECORDING_FINALIZED,
+        EVENT_STARTED,
+        emit_event,
+    )
+    from screencap.session import run_recording_worker
+
+    queues = [
+        multiprocessing.Queue(),
+        multiprocessing.Queue(),
+        multiprocessing.Queue(),
+    ]
+    args.setdefault("_window_feed_q", queues[0])
+    args.setdefault("_override_q", queues[1])
+    args.setdefault("_disable_q", queues[2])
+    args.setdefault("_network_handoff_ready", None)
+
+    def drain_queue(q) -> None:
+        while True:
+            try:
+                q.get()
+            except Exception:
+                return
+
+    for q in queues:
+        threading.Thread(target=drain_queue, args=(q,), daemon=True).start()
+
+    emit_event(EVENT_STARTED, claimant="daemon")
+    run_recording_worker(args)
+
+    ready_meta: dict = {}
+    capture_dir = args.get("capture_dir_hint") or args.get("output_dir")
+    if capture_dir:
+        try:
+            ready_path = Path(str(capture_dir)) / ".recording_ready"
+            if ready_path.exists():
+                ready_meta = json.loads(ready_path.read_text() or "{}")
+        except Exception:
+            ready_meta = {}
+    emit_event(
+        EVENT_RECORDING_FINALIZED,
+        name=args.get("name"),
+        duration_seconds=float(ready_meta.get("elapsed", 0.0)),
+        force_stopped=bool(ready_meta.get("force_stopped", False)),
+        disk_full=bool(ready_meta.get("disk_full", False)),
+    )
+
+
 # ---------------------------------------------------------------------------
 # Unit 8a: structured stderr event contract
 # ---------------------------------------------------------------------------

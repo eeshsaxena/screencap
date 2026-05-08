@@ -122,6 +122,7 @@ async def test_session_snapshot_no_recording_keeps_all_keys(isolated_lock) -> No
     assert payload["recording_name"] is None
     assert payload["started_at"] is None
     assert payload["claimant"] is None
+    assert payload["recovering"] is False
     assert isinstance(payload["cursor"], int)
     assert {
         "ok",
@@ -133,12 +134,13 @@ async def test_session_snapshot_no_recording_keeps_all_keys(isolated_lock) -> No
         "recording_name",
         "started_at",
         "claimant",
+        "recovering",
         "cursor",
     } <= set(payload)
 
 
 @pytest.mark.asyncio
-async def test_session_snapshot_cli_claimed_lock_redacts_process_identity(
+async def test_session_snapshot_cli_claimed_lock_exposes_cas_identity(
     tmp_path: Path,
     isolated_lock,
 ) -> None:
@@ -159,10 +161,12 @@ async def test_session_snapshot_cli_claimed_lock_redacts_process_identity(
     assert payload["recording_name"] == "demo"
     assert payload["started_at"] == started_at
     assert payload["claimant"] is None
+    metadata = isolated_lock.read_lock_metadata()
+    assert payload["claimant_pid"] == metadata["pid"]
+    assert payload["claimant_started_at"] == metadata["started_at"]
     assert "pid" not in payload
     assert "proxy_pid" not in payload
     assert "worker_pid" not in payload
-    assert "claimant_pid" not in payload
 
 
 @pytest.mark.asyncio
@@ -207,6 +211,7 @@ async def test_session_snapshot_stale_lock_reports_not_recording(
     assert payload["recording_name"] is None
     assert payload["started_at"] is None
     assert payload["claimant"] is None
+    assert payload["recovering"] is False
 
 
 @pytest.mark.asyncio
@@ -226,6 +231,7 @@ async def test_session_snapshot_consistently_inconsistent_state_is_transient(
     assert payload["recording_name"] is None
     assert payload["started_at"] is None
     assert payload["claimant"] is None
+    assert payload["recovering"] is False
 
 
 @pytest.mark.asyncio
@@ -257,6 +263,7 @@ async def test_session_snapshot_transient_metadata_race_recovers(
     assert payload["recording_name"] == "daemon-demo"
     assert payload["started_at"] == 1778198460.5
     assert payload["claimant"] == "daemon"
+    assert payload["recovering"] is False
     assert "proxy_pid" not in payload
     assert "worker_pid" not in payload
 

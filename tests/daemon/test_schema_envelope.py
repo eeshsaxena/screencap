@@ -41,6 +41,8 @@ def test_api_version_constants_are_pinned(name: str, expected: int) -> None:
         ("CURSOR_UNKNOWN", "cursor_unknown"),
         ("CATALOG_UNREADABLE", "catalog_unreadable"),
         ("ROGUE_FILE", "rogue_file"),
+        ("RECONCILING", "reconciling"),
+        ("FORCE_MISMATCH", "force_mismatch"),
     ],
 )
 def test_error_code_constants_are_named_strings(name: str, expected: str) -> None:
@@ -174,6 +176,41 @@ def test_daemon_api_error_subclass_maps_to_symmetric_error_envelope() -> None:
         errors.EXCEPTION_TO_ERROR_CODE[errors.NotOwnedByDaemonError]
         == errors.NOT_OWNED_BY_DAEMON
     )
+
+
+def test_reconciling_error_envelope_is_retryable_503_shape() -> None:
+    exc = errors.ReconcilingError(schema_version=schema._RECORDING_START_API_VERSION)
+
+    payload = exc.envelope()
+
+    assert exc.http_status == 503
+    assert payload["ok"] is False
+    assert payload["error"] == errors.RECONCILING
+    assert payload["hint"] == "wait for reconciliation to complete"
+    assert payload["schema_version"] == schema._RECORDING_START_API_VERSION
+
+
+def test_force_mismatch_error_omits_actual_owner_values() -> None:
+    payload = errors.force_mismatch_envelope(
+        schema_version=schema._RECORDING_STOP_API_VERSION
+    )
+
+    assert payload["ok"] is False
+    assert payload["error"] == errors.FORCE_MISMATCH
+    assert "claimant_pid" not in payload
+    assert "started_at" not in payload
+
+
+def test_recording_stop_request_carries_force_cas_fields() -> None:
+    parsed = schema.RecordingStopRequest(
+        force=True,
+        expected_claimant_pid=1234,
+        expected_started_at=1778198400.25,
+    )
+
+    assert parsed.force is True
+    assert parsed.expected_claimant_pid == 1234
+    assert parsed.expected_started_at == 1778198400.25
 
 
 def test_pydantic_models_round_trip_through_json_without_information_loss() -> None:
