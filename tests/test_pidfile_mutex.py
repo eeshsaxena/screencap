@@ -137,6 +137,17 @@ class TestClaimLock:
         assert meta["started_at"] == controller_started_at
         assert meta["claimant"] == "swiftui"
 
+    def test_update_lock_metadata_accepts_optional_started_by(self, tmp_path):
+        """started_by is additive provenance for daemon-routed sessions."""
+        pidfile.claim_lock(None, claimant="daemon")
+
+        ok = pidfile.update_lock_metadata(tmp_path / "rec-A", started_by="swiftui-via-daemon")
+
+        assert ok is True
+        meta = pidfile.read_lock_metadata()
+        assert meta["started_by"] == "swiftui-via-daemon"
+        assert meta["claimant"] == "daemon"
+
     def test_update_lock_metadata_back_to_back_recordings_refresh_started_at(self, tmp_path):
         """The bug this fixes: previously update_lock_metadata only mutated
         capture_dir, so back-to-back recordings reported the same elapsed
