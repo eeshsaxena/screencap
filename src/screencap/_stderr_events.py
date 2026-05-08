@@ -49,6 +49,13 @@ EVENT_MENUBAR_NEUTRALIZED_BY_ENV = "menubar_neutralized_by_env"
 EVENT_MATRIX_DISCLOSURE_REQUIRED = "matrix_disclosure_required"
 EVENT_LOCK_METADATA_WRITE_FAILED = "lock_metadata_write_failed"
 EVENT_TERMINATED_REASON_PERSIST_FAILED = "terminated_reason_persist_failed"
+# Daemon bus events — published by the daemon, not the engine subprocess.
+# These ride the same schema version and JSON shape so tolerant clients can
+# handle them on the same taxonomy axis as engine stderr events.
+EVENT_ENGINE_CRASHED = "engine_crashed"
+EVENT_PREVIOUS_SESSION_RECOVERED = "previous_session_recovered"
+EVENT_PREVIOUS_SESSION_FORCE_TERMINATED = "previous_session_force_terminated"
+EVENT_SUBSCRIBED = "subscribed"
 
 
 def resolve_claimant() -> str:
@@ -99,4 +106,8 @@ __all__ = [
     "EVENT_MATRIX_DISCLOSURE_REQUIRED",
     "EVENT_LOCK_METADATA_WRITE_FAILED",
     "EVENT_TERMINATED_REASON_PERSIST_FAILED",
+    "EVENT_ENGINE_CRASHED",
+    "EVENT_PREVIOUS_SESSION_RECOVERED",
+    "EVENT_PREVIOUS_SESSION_FORCE_TERMINATED",
+    "EVENT_SUBSCRIBED",
 ]

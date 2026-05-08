@@ -15,6 +15,25 @@ from io import StringIO
 import pytest
 
 
+@pytest.mark.parametrize(
+    ("name", "expected"),
+    [
+        ("EVENT_ENGINE_CRASHED", "engine_crashed"),
+        ("EVENT_PREVIOUS_SESSION_RECOVERED", "previous_session_recovered"),
+        (
+            "EVENT_PREVIOUS_SESSION_FORCE_TERMINATED",
+            "previous_session_force_terminated",
+        ),
+        ("EVENT_SUBSCRIBED", "subscribed"),
+    ],
+)
+def test_daemon_bus_event_type_constants_are_exported(name: str, expected: str) -> None:
+    import screencap._stderr_events as events
+
+    assert getattr(events, name) == expected
+    assert name in events.__all__
+
+
 def _capture_stderr(callable_):
     """Run callable_ with sys.stderr redirected to a StringIO; return its content."""
     buf = StringIO()

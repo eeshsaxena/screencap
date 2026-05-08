@@ -67,6 +67,7 @@ def serve(socket_path: str | Path | None = None, *, self_test: bool = False) -> 
             import uvicorn
 
             app = build_app()
+            loop = asyncio.get_running_loop()
             config = uvicorn.Config(
                 app,
                 uds=str(resolved_socket_path),
@@ -77,10 +78,22 @@ def serve(socket_path: str | Path | None = None, *, self_test: bool = False) -> 
                 access_log=False,
             )
             server_ref = uvicorn.Server(config)
+            uvicorn_handle_exit = server_ref.handle_exit
+
+            def handle_exit(signum: int, frame: FrameType | None) -> None:
+                if hasattr(app.state, "event_bus"):
+                    loop.call_soon_threadsafe(
+                        lambda: asyncio.create_task(app.state.event_bus.shutdown())
+                    )
+                uvicorn_handle_exit(signum, frame)
+
+            server_ref.handle_exit = handle_exit
 
             def real_handler(signum: int, _frame: FrameType | None) -> None:
                 nonlocal buffered_signal
                 buffered_signal = signum
+                if hasattr(app.state, "event_bus"):
+                    loop.create_task(app.state.event_bus.shutdown())
                 server_ref.should_exit = True
 
             for sig in _handled_signals():

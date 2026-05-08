@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import asyncio
+import json
 import os
 import time
 from contextlib import asynccontextmanager
@@ -10,30 +11,28 @@ from typing import AsyncIterator
 
 from starlette.applications import Starlette
 from starlette.requests import Request
-from starlette.responses import JSONResponse
+from starlette.responses import JSONResponse, StreamingResponse
 from starlette.routing import Route
 
+from screencap import _stderr_events
 from screencap.daemon import errors, schema
+from screencap.daemon.event_bus import EventBus
 
 _STARTED_AT = time.time()
-_CURSOR = 0
 
 
 @asynccontextmanager
 async def lifespan(app: Starlette) -> AsyncIterator[None]:
-    yield
+    if not hasattr(app.state, "event_bus"):
+        app.state.event_bus = EventBus()
+    try:
+        yield
+    finally:
+        await app.state.event_bus.shutdown()
 
 
 def _build_string() -> str | None:
     return os.environ.get("SCREENCAP_BUILD")
-
-
-def _next_snapshot_cursor() -> int:
-    global _CURSOR
-    _CURSOR += 1
-    # U3 advances this placeholder on snapshot reads; U4 replaces it with
-    # the event bus sequence cursor.
-    return _CURSOR
 
 
 async def daemon_info(_request: Request) -> JSONResponse:
@@ -95,10 +94,12 @@ def _empty_snapshot(*, is_recording: bool | None, cursor: int) -> dict:
     )
 
 
-async def session_snapshot(_request: Request) -> JSONResponse:
+async def session_snapshot(request: Request) -> JSONResponse:
     from screencap import pidfile
 
-    cursor = _next_snapshot_cursor()
+    # Cursor is the event boundary represented by this snapshot; reads do not
+    # advance it.
+    cursor = request.app.state.event_bus.current_cursor()
     active = pidfile.lock_is_active()
     metadata = pidfile.read_lock_metadata()
 
@@ -132,12 +133,84 @@ async def session_snapshot(_request: Request) -> JSONResponse:
     )
 
 
+def _ndjson(payload: dict) -> bytes:
+    return (json.dumps(payload, separators=(",", ":")) + "\n").encode("utf-8")
+
+
+async def events_stream(request: Request) -> JSONResponse | StreamingResponse:
+    bus = request.app.state.event_bus
+    since_param = request.query_params.get("since")
+    if since_param is not None:
+        try:
+            since = int(since_param)
+        except ValueError:
+            return JSONResponse(
+                errors.error_envelope(
+                    schema_version=schema._EVENTS_API_VERSION,
+                    error="invalid_cursor",
+                    requested_cursor=since_param,
+                ),
+                status_code=400,
+            )
+        if since != bus.current_cursor():
+            return JSONResponse(
+                errors.cursor_unknown_envelope(
+                    requested_cursor=since,
+                    schema_version=schema._EVENTS_API_VERSION,
+                ),
+                status_code=400,
+            )
+
+    sub = await bus.subscribe()
+
+    # Drain-to-EOF discipline: shutdown closes every subscription; each stream
+    # handler observes that close, yields a final reason frame, then returns so
+    # Starlette closes the HTTP body naturally. Client disconnect/cancellation
+    # removes the subscriber in ``finally``.
+    async def stream() -> AsyncIterator[bytes]:
+        try:
+            yield _ndjson(
+                {
+                    "type": _stderr_events.EVENT_SUBSCRIBED,
+                    "schema_version": _stderr_events.EVENT_SCHEMA_VERSION,
+                    "ts": time.time(),
+                    "cursor": sub.cursor_at_subscribe,
+                }
+            )
+            while True:
+                if await request.is_disconnected():
+                    break
+                if sub.closed.is_set():
+                    yield _ndjson(
+                        {
+                            "type": "_close",
+                            "reason": sub.close_reason or "unknown",
+                            "ts": time.time(),
+                        }
+                    )
+                    break
+                try:
+                    event = await asyncio.wait_for(sub.queue.get(), timeout=0.5)
+                except asyncio.TimeoutError:
+                    continue
+                yield _ndjson(event)
+        finally:
+            await bus.remove(sub)
+
+    return StreamingResponse(stream(), media_type="application/x-ndjson")
+
+
 def build_app() -> Starlette:
-    return Starlette(
+    app = Starlette(
         routes=[
             Route("/v0/daemon.info", daemon_info, methods=["GET"]),
             Route("/v0/recording.list", recording_list, methods=["GET"]),
             Route("/v0/session.snapshot", session_snapshot, methods=["GET"]),
+            Route("/v0/events", events_stream, methods=["GET"]),
         ],
         lifespan=lifespan,
     )
+    # The bus is app-scoped, not module-global, so tests and embedded daemon
+    # instances do not share cursors or subscribers.
+    app.state.event_bus = EventBus()
+    return app
