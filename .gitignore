@@ -28,10 +28,6 @@ benchmark_results/
 *.swp
 *.swo
 
-# Project — ignore docs/ except docs/solutions/
-docs/*
-!docs/solutions/
-
 .claude/*
 !.claude/commands/
 !.claude/skills/
@@ -39,4 +35,4 @@ docs/*
 .DS_Store
 
 # Compound Engineering local config
-.compound-engineering/*.local.yaml
+.compound-engineering/
