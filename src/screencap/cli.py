@@ -123,6 +123,22 @@ def _download_nlp_models() -> None:
     _do_download()
 
 
+@cli.command("serve")
+@click.option("--self-test", is_flag=True, hidden=True)
+@click.option(
+    "--socket",
+    "socket_path",
+    default=None,
+    hidden=True,
+    help="Override socket path (test-only).",
+)
+def serve(socket_path, self_test):
+    """Run the ScreenCap daemon."""
+    from screencap.daemon.server import serve as _serve
+
+    raise SystemExit(_serve(socket_path=socket_path, self_test=self_test))
+
+
 # ---------------------------------------------------------------------------
 # Unit 8a: structured stderr event contract
 # ---------------------------------------------------------------------------
