@@ -33,6 +33,7 @@ dependencies = [
     "keyring>=24",
     "starlette>=0.37",
     "uvicorn>=0.30",
+    "pydantic>=2.0.0",
 ]
 
 [project.optional-dependencies]
