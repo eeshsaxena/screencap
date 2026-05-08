@@ -31,8 +31,7 @@ and this project adheres to [Semantic Versioning](https://semver.org/).
   hand-encoded fixture test guards against any future drift breaking
   prior recordings. Locked decisions: 100 KB body cap (per-user
   override via `[network] body_size_cap`); default Keychain ACL
-  (V2 will revisit once SwiftUI signing pipeline lands). See
-  `docs/architecture/network-capture.md` for the full V1.5 wiring.
+  (V2 will revisit once SwiftUI signing pipeline lands).
 
 ### Changed
 - **`screencap stop --force` now actively kills the live SessionController.**

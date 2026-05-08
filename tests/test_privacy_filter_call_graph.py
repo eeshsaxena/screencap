@@ -81,9 +81,8 @@ NOT follow:
   ``DefaultPolicyEvaluator`` + ``DefaultContextClassifier`` closure
   pattern inline. The Slack-leak prior incident was exactly this shape.
 
-These vectors are mitigated by code review; the architecture doc
-(``docs/architecture/export-pipeline.md``) names ``build_cloud_window_filter``
-as the only sanctioned constructor. A reviewer who sees an alias or a
+These vectors are mitigated by code review; ``build_cloud_window_filter``
+is the only sanctioned constructor. A reviewer who sees an alias or a
 dynamic lookup of either ``unified_export_events`` or
 ``build_privacy_filter`` in a new code path should treat it as a
 warning sign and reject the change unless the call goes through the

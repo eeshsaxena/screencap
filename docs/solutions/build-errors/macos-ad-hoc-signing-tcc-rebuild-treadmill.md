@@ -81,6 +81,5 @@ The pragmatic answer until a real Developer ID lands: accept the `tccutil reset`
 
 ## Related
 
-- `docs/architecture/swiftui-shell.md` — "Build pipeline" + "The in-process TCC cache" sections.
 - `macos/README.md` — "TCC permissions on dev builds" (the user-facing version of this lesson).
 - `docs/solutions/runtime-errors/macos-tcc-per-process-cache-quit-and-relaunch.md` — the in-process cache problem (separate concern, same domain).
