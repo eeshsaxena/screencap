@@ -203,8 +203,7 @@ class TestActionMatrixInvariants:
 
     def test_mask_window_nulls_title_and_domain(self, tmp_path):
         """MASK_WINDOW must replace ``window_title`` with ``app_name`` AND
-        null ``domain``. Both halves are load-bearing per
-        ``docs/architecture/export-pipeline.md:145``."""
+        null ``domain``. Both halves are load-bearing."""
         with _public_config():
             pf = build_privacy_filter(
                 privacy_mode="public", capture_dir=tmp_path,

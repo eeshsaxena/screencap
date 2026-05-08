@@ -79,6 +79,5 @@ This is what Loom, 1Password, and most apps that wall their first-run on TCC per
 
 ## Related
 
-- `docs/architecture/swiftui-shell.md` — "The in-process TCC cache" section.
 - `macos/README.md` — "TCC permissions on dev builds" section (covers the dev-rebuild treadmill, see sibling solution doc).
 - `src/screencap/recorder.py:_check_permission_fresh` — Python's subprocess-per-check workaround.

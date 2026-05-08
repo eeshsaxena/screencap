@@ -31,7 +31,6 @@ benchmark_results/
 # Project — ignore docs/ except docs/solutions/
 docs/*
 !docs/solutions/
-!docs/architecture/
 
 .claude/*
 !.claude/commands/

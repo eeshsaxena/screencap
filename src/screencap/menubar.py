@@ -219,7 +219,7 @@ def _run_menubar(
     # start`` with ``SCREENCAP_PARENT=swiftui``, the SwiftUI shell owns
     # the menu bar. Returning here keeps the rest of the SessionController
     # lifecycle intact — best-effort writes to ``_control_q`` succeed
-    # without a consumer (per docs/architecture/session.md). Standalone
+    # without a consumer. Standalone
     # CLI invocations (no env var) get the rumps menu bar as before.
     # Full deletion of this module + the cross-cutting refactor (IPC
     # cleanup, `.menubar_overrides.json` migration, [menubar] config

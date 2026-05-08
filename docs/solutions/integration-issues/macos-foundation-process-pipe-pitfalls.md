@@ -116,5 +116,4 @@ For every `Foundation.Process` use site on macOS, verify:
 
 - [TCC per-process cache + Quit & Relaunch](../runtime-errors/macos-tcc-per-process-cache-quit-and-relaunch.md) — the related TCC behavior that motivated the failed sub-binary attempt.
 - [Ad-hoc dev signing TCC rebuild treadmill](../build-errors/macos-ad-hoc-signing-tcc-rebuild-treadmill.md) — adjacent dev-time pain.
-- `docs/architecture/swiftui-shell.md` — CLIClient + PermissionController architecture.
 - `macos/README.md` — dev launch instructions.
