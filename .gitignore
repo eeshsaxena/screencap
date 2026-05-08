@@ -37,3 +37,6 @@ docs/*
 !.claude/skills/
 
 .DS_Store
+
+# Compound Engineering local config
+.compound-engineering/*.local.yaml
