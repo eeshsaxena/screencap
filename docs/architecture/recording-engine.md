@@ -53,6 +53,29 @@ Internal helper threads inside `Recorder`: `_status_thread` drains a status pipe
 
 The chunk processor (`screencap/chunk_processor.py`) is a separate `threading.Thread` (not a process) that consumes rotation events from `_chunk_process_q`, queries the live DB per-chunk, writes `events_NNNN.jsonl` and `chunk_NNNN_manifest.json`, and optionally uploads. See [export-pipeline.md](./export-pipeline.md) and [segmentation.md](./segmentation.md).
 
+## ScreenRecorder seam (engine.screen_recorder)
+
+Two classes share the recording lifecycle:
+
+- **`engine.recorder.Recorder`** — the multi-process capture machine described above. Owns reader threads + writer subprocesses + the SQLite DB. Wrapped as a context manager; `__enter__` brings it up, `__exit__` tears it down.
+- **`engine.screen_recorder.ScreenRecorder`** — the *seam* that wraps `Recorder` with the policies the CLI and SessionController need to drive a recording: signal handling, lock claim, menubar, permission probes, disk monitoring, network capture, and the chunk-processor / scrub-worker collaborators.
+
+`ScreenRecorder.__init__` takes three frozen-dataclass bundles:
+
+```python
+ScreenRecorder(
+    request=RecordingRequest(...),    # what to record (name, config, intent, mode)
+    channels=IpcChannels(...),         # window_feed, override, disable queues
+    policies=RecordingPolicies(...),   # signal/lock/menubar/permission/disk/network
+)
+```
+
+`.run()` dispatches into `_run_screen_recorder`, which orchestrates the full recording lifecycle: lock claim → privacy filter setup → permission preflight → banner → engine `Recorder.__enter__` → `RecordingCollaborators.start` → live loop → finalize → `Recorder.__exit__`. The body lives in `engine/screen_recorder.py` so no policy logic remains in the CLI wrapper at `screencap/recorder.py`.
+
+`screencap/recorder.py` is a thin CLI adapter holding only the `start_recording` shim, banner, `Live`-region rendering, summary printing, the `_open_privacy_settings` deep-link helper, and the stdout/stderr suppression around the engine flush block. It re-exports a few symbols (`_run_screen_recorder`, `_spawn_menubar`, `_kill_menubar`) for backward compatibility with existing test patches; the implementations live in the engine seam.
+
+The full design is in [`docs/decisions/0001-engine-screen-recorder-seam.md`](../decisions/0001-engine-screen-recorder-seam.md).
+
 ## Data on disk
 
 All under `~/.screencap/recordings/<name>/`:
@@ -79,7 +102,7 @@ All under `~/.screencap/recordings/<name>/`:
 - **`_child_pids` stores raw PIDs, not Process objects.** Looking up Process objects in a signal handler can deadlock on `multiprocessing._children_lock`. Raw PIDs let `os.kill()` go through directly.
 - **mss is throttled on macOS Sequoia.** Use the `screencapture` CLI for screenshots (~170ms per call). `mss.sct.grab()` can take 30s. `take_screenshot()` in `engine/utils.py` handles the platform branch. Do not call mss from the screen reader thread.
 - **`SynchronizedQueue` is required on macOS.** The standard `multiprocessing.Queue.qsize()` raises `NotImplementedError` on macOS because `sem_getvalue()` is unimplemented. The wrapper in `engine/extensions/synchronized_queue.py` adds a `SharedCounter`.
-- **Heavy imports deferred.** `engine/__init__.py` exposes a curated 4-name surface (`Capture`, `CaptureSession`, `create_html`, `__version__`); `Recorder` is imported function-locally in `screencap.recorder.start_recording` inside a try/except so the package is import-safe in headless environments. CLI commands import their dependencies inside the function body.
+- **Heavy imports deferred.** `engine/__init__.py` exposes a curated 4-name surface (`Capture`, `CaptureSession`, `create_html`, `__version__`); `Recorder` is imported function-locally inside `engine.screen_recorder._run_screen_recorder` (called by `ScreenRecorder.run()`) inside a try/except so the package is import-safe in headless environments. CLI commands import their dependencies inside the function body.
 - **Action-gated video.** When `RECORD_FULL_VIDEO=False` (default), video frames are only saved when an action event fires. Idle-only periods produce no video frames. The `ScreenRetentionFilter` decides per action type.
 - **Fragmented MP4 (`movflags=frag_keyframe+empty_moov+flush_packets=1`).** Means a hard kill in the middle of a chunk still produces a playable file. Removing this flag would break crash-recovery.
 - **Video close runs on a separate thread with 15s max.** PyAV has a known GIL deadlock during `container.close()`. The workaround is mandatory.

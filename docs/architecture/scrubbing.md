@@ -19,21 +19,19 @@ The naming is misleading: "scrubber" sounds like a privacy module, but it lives 
              │ imported by
              ▼
 ┌─────────────────────────────────────────────────────────────┐
-│  scrub_pipeline.py    (SHARED post-capture engine)          │
+│  scrubber.py    (SHARED post-capture engine)                │
 │                                                             │
+│  Scrubber.run() / Scrubber.run_chunk()  — orchestrators     │
 │  scrub_text() · scrub_events_jsonl() · mask_screenshots()   │
 │  build_blocked_intervals() · build_scrub_context()          │
 │  scrub_transcripts() · scrub_manifest()                     │
 └──┬────────────────────────────────────────────┬─────────────┘
-   │ called by                                  │ called by
+   │ Scrubber.run() called by                   │ Scrubber.run_chunk()
+   │                                            │ called by
    ▼                                            ▼
-scrubber.py                          chunk_processor.py
+CLI: screencap scrub / upload        chunk_processor.py
 (post-hoc full-recording             (per-chunk during cloud-intent
-scrub_recording → <name>-scrubbed/)   recording, before upload)
-   │                                            │
-   ▼                                            ▼
-CLI: screencap scrub <name>          recorder.py (auto)
-CLI: screencap upload (auto)         SessionController
+ → <name>-scrubbed/)                  recording, before upload)
 ```
 
 ### Flavor 1 — Post-hoc full scrub (`scrubber.scrub_recording`)
@@ -50,14 +48,14 @@ Triggered by `screencap scrub <name>` or automatically before `screencap upload`
 12. `_null_db_rows_for_intervals`: UPDATE `action_event` keystroke fields and `window_event` title/state/browser_url to NULL for every blocked time range.
 13. `_scrub_db`: deletes `screenshot` BLOB table + `audio_info` table; scrubs text/JSON columns via the detection pipeline.
 14. `build_xref_lookup(raw_detections)` → `ctx.xref_detections` for cross-referencing element_state PII against keystrokes.
-15. `_scrub_events_jsonl`: globs `events*.jsonl`, dispatches each to `scrub_pipeline.scrub_events_jsonl`.
+15. `_scrub_events_jsonl`: globs `events*.jsonl`, dispatches each to `scrubber.scrub_events_jsonl`.
 16. `scrub_transcripts`: globs `transcript*.json/txt`.
 17. `_scrub_metrics`: rule-based `<REDACTED>` for `hostname`, `wifi.ssid`, `wifi.bssid`.
 18. `_write_audit_log` → `privacy_audit.json`.
 
 ### Flavor 2 — Per-chunk scrub during recording (chunk processor)
 
-The chunk processor calls `scrub_pipeline` functions inline at each chunk rotation: `scrub_events_jsonl` over `events_NNNN.jsonl`, `mask_screenshots` over `screenshots/` for that time range, `scrub_transcripts` for `transcript_NNNN.*`. Output is uploaded directly.
+The chunk processor calls `Scrubber.run_chunk()` at each chunk rotation: `scrub_events_jsonl` over `events_NNNN.jsonl`, `mask_screenshots` over `screenshots/` for that time range, `scrub_transcripts` for `transcript_NNNN.*`. Output is uploaded directly.
 
 **Gated by `_scrub_enabled`.** The scrub call (`_scrub_chunk_files`) only runs when `self._scrub_enabled and self._pipeline is not None`. `--no-scrub` on `screencap start` sets `scrub_enabled=False` and skips this entirely.
 
@@ -94,9 +92,9 @@ A `threading.Thread` in the recorder process that listens on `disable_q`. When t
 
 In parallel, `privacy/persistence.py:persist_disable` writes the user's "always disable" decision to `~/.screencap/config.toml` (under `fcntl.LOCK_EX` for cross-process safety). That doesn't affect the current recording — the IPC override already reached `RecorderPrivacyFilter`.
 
-## The shared engine — `scrub_pipeline.py`
+## The shared engine — `scrubber.py`
 
-Everything that's not orchestration. Public functions:
+Holds both the orchestrators (`Scrubber.run` and `Scrubber.run_chunk`) and the granular helpers they reuse. Public functions:
 
 - `scrub_text(text, pipeline, anonymizer, result)` — atomic unit. Detect + anonymize. Returns `<SCRUB_FAILED>` on any exception (fail-closed).
 - `build_blocked_intervals(window_events, evaluator, classifier)` — emits one `BlockedInterval` per span where `decision.action in BLOCK_ACTIONS`.

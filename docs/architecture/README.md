@@ -43,10 +43,10 @@ ScreenCap is a macOS CLI for screen recording with a privacy-aware capture pipel
    └─────────────────────────────────────────┘
               │
               ▼
-   Per-chunk: scrub_pipeline → events_NNNN.jsonl + manifest
+   Per-chunk: Scrubber.run_chunk → events_NNNN.jsonl + manifest
               │
               ▼  (on upload)
-   scrubber.scrub_recording → <name>-scrubbed/
+   Scrubber.run / scrubber.scrub_recording → <name>-scrubbed/
               │
               ▼
    Cloud Function (signed URLs) → GCS

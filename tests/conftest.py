@@ -199,6 +199,10 @@ class FakeRecorder:
         self.is_recording = False
         self._stopped = True
 
+    def finalize_pipeline(self):
+        """Stand-in for the engine's pre-__exit__ thread drain. No-op for fakes."""
+        return None
+
     def _create_db(self):
         """Create a recording.db with minimal realistic data."""
         from screencap.engine.db import create_db, crud

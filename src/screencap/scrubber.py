@@ -489,12 +489,14 @@ def null_text_content(event: dict) -> None:
 
 
 def null_event_content(event: dict) -> None:
-    """Backward-compat: null both pointer geometry and text content.
+    """Null both pointer geometry and text content on ``event``.
 
-    Maintained for any external caller; ``scrub_events_jsonl`` now calls
-    the granular helpers directly so SCRUB_BLOCK_ACTIONS pointer
-    suppression can run independently of SCRUB_CONTENT_NULL_ACTIONS text
-    nulling.
+    Sole surviving caller is ``tests/test_domain_propagation.py``, which uses
+    this to assert window-title nulling on ``window.switch`` events.
+    Production paths call the granular helpers (``null_pointer_geometry`` /
+    ``null_text_content``) directly so the broader SCRUB_BLOCK_ACTIONS
+    pointer suppression runs independently of SCRUB_CONTENT_NULL_ACTIONS
+    text nulling. Delete once those tests migrate to the granular helpers.
     """
     null_pointer_geometry(event)
     null_text_content(event)
