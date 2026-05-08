@@ -716,6 +716,9 @@ def test_start_recording_multi_chunk_produces_all_chunk_files(recording_env):
         def stop(self):
             self.is_recording = False
 
+        def finalize_pipeline(self):
+            return None
+
     with (
         mock.patch("screencap.engine.recorder.Recorder", FakeChunkedRecorder),
         mock.patch("screencap.recorder._check_macos_permissions"),
@@ -911,6 +914,9 @@ def test_stub_recording_not_called_when_uploads_disabled(recording_env):
         def stop(self):
             self.is_recording = False
 
+        def finalize_pipeline(self):
+            return None
+
     with (
         mock.patch("screencap.engine.recorder.Recorder", FakeCloudRecorder),
         mock.patch("screencap.recorder._check_macos_permissions"),
@@ -999,6 +1005,9 @@ def test_upload_warning_surfaced_at_stop(recording_env):
 
         def stop(self):
             self.is_recording = False
+
+        def finalize_pipeline(self):
+            return None
 
     with (
         mock.patch("screencap.engine.recorder.Recorder", FakeCloudRecorder),
@@ -1103,6 +1112,9 @@ def test_sentinel_not_uploaded_without_sentinel_for_cloud(recording_env):
 
         def stop(self):
             self.is_recording = False
+
+        def finalize_pipeline(self):
+            return None
 
     # Build a real PrivacyConfig for the recorder's capture-time enforcement
     from screencap.privacy.policy import PrivacyConfig, PrivacyMode

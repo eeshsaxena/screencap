@@ -937,6 +937,16 @@ def _run_screen_recorder(rec: "ScreenRecorder") -> "RecordingResult":
 
                     menubar_policy.notify_processing()
 
+            # Drain the engine pipeline FIRST so the record/fanout/status
+            # threads finish forwarding every chunk message — including
+            # the ``final_chunk`` rotation pushed during record-thread
+            # shutdown — onto ``_chunk_process_q`` before we enqueue a
+            # poison pill behind it. ``finalize_pipeline`` joins the
+            # threads but preserves the queues so chunk_processor /
+            # scrub_worker can drain. ``Recorder.__exit__`` calls it
+            # again idempotently and then closes the queues.
+            recorder.finalize_pipeline()
+
             # Finalize runs INSIDE the ``with``-block so chunk_processor
             # and scrub_worker drain BEFORE Recorder.__exit__ closes the
             # engine queues. Load-bearing ordering: no outsider holds

@@ -204,3 +204,63 @@ def test_disk_space_critical_mid_loop_marks_stop_reason(tmp_path):
     capture_dir = tmp_path / "rec"
     meta = json.loads((capture_dir / ".recording_stop_meta.json").read_text())
     assert meta["terminated_reason"] == "disk_full"
+
+
+def test_finalize_pipeline_runs_before_chunk_processor_stop(tmp_path):
+    """Engine pipeline drains BEFORE the chunk-processor poison pill.
+
+    Pins the load-bearing ordering: ``recorder.finalize_pipeline()``
+    joins the record/fanout threads (flushing the ``final_chunk`` rotation
+    onto ``_chunk_process_q``) before the collaborators-side
+    ``stop_chunk_processor`` enqueues a poison pill behind it. Reversing
+    the order races the two — a poison pill ahead of ``final_chunk`` would
+    silently drop the trailing chunk on every recording.
+
+    Uses ``_OneShotDiskPolicy`` to force the live loop to exit on the
+    first tick so the lifecycle reaches the post-loop drain block where
+    the ordering invariant lives.
+    """
+    from screencap.engine.permission_policy import Noop as PermNoop
+    from screencap.recorder import DiskFullError
+
+    rec = _build_seam(
+        tmp_path, permission=PermNoop(), disk=_OneShotDiskPolicy(free_mb=42.0),
+    )
+
+    call_order: list[str] = []
+
+    real_finalize = _TickingFakeRecorder.finalize_pipeline
+
+    def _spy_finalize(self):
+        call_order.append("finalize_pipeline")
+        return real_finalize(self)
+
+    with mock.patch.object(
+        _TickingFakeRecorder, "finalize_pipeline", _spy_finalize, create=True,
+    ), mock.patch(
+        "screencap.engine.collaborators.RecordingCollaborators.stop_chunk_processor",
+        autospec=True,
+        side_effect=lambda *a, **kw: call_order.append("stop_chunk_processor"),
+    ):
+        mocks = _common_mocks()
+        for m in mocks:
+            m.start()
+        try:
+            # ``_OneShotDiskPolicy`` triggers the disk-full stop path,
+            # which raises ``DiskFullError`` after the drain block runs.
+            with pytest.raises(DiskFullError):
+                rec.run()
+        finally:
+            for m in mocks:
+                m.stop()
+
+    assert "finalize_pipeline" in call_order, (
+        "engine.Recorder.finalize_pipeline must be invoked from the seam "
+        "before collaborators stop"
+    )
+    assert "stop_chunk_processor" in call_order, (
+        "stop_chunk_processor must be invoked at end-of-recording"
+    )
+    assert call_order.index("finalize_pipeline") < call_order.index("stop_chunk_processor"), (
+        f"finalize_pipeline must run before stop_chunk_processor; got {call_order}"
+    )

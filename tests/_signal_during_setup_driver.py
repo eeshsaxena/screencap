@@ -57,6 +57,9 @@ def _build_slow_recorder(ready_marker: Path, hold_seconds: float):
         def stop(self):
             self.is_recording = False
 
+        def finalize_pipeline(self):
+            return None
+
         def _create_db(self):
             db_path = Path(self.capture_dir) / "recording.db"
             engine, Session = create_db(str(db_path))

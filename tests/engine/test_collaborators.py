@@ -477,6 +477,59 @@ def test_scrub_worker_failure_hard_errors_for_cloud_intent(tmp_path):
     assert exc_info.value.code == 1
 
 
+def test_scrub_worker_failure_tears_down_chunk_processor(tmp_path):
+    """Cloud + chunking: if scrub_worker startup fails, chunk_processor must not leak.
+
+    ``ChunkProcessor.start()`` spawns a non-daemon worker thread; if
+    ``_build_scrub_worker`` later raises ``SystemExit(1)`` for the
+    cloud-bound case, that thread keeps the process alive past the
+    intended hard-fail. ``start()`` must catch the failure, send the
+    poison pill, and join the chunk thread before re-raising.
+    """
+    import pytest
+
+    from screencap.engine.collaborators import RecordingCollaborators
+    from screencap.engine.config import RecordingConfig
+    from screencap.engine.screen_recorder import (
+        IpcChannels,
+        LegacyOptions,
+        RecordingRequest,
+    )
+
+    capture_dir = tmp_path / "rec"
+    capture_dir.mkdir()
+    (capture_dir / "recording.db").touch()
+
+    request = RecordingRequest(
+        name="rec", config=RecordingConfig(),
+        cloud_intent=True, scrub_enabled=True,
+    )
+    helper = RecordingCollaborators(
+        request=request, legacy=LegacyOptions(), channels=IpcChannels.create(),
+    )
+    fake_recorder = _FakeEngineRecorder()
+
+    with (
+        mock.patch(
+            "screencap.privacy.scrub_worker.ScrubWorker",
+            side_effect=RuntimeError("scrub init failed"),
+        ),
+        pytest.raises(SystemExit),
+    ):
+        helper.start(
+            recorder=fake_recorder,
+            capture_dir=capture_dir,
+            screen_filter=None,
+            privacy_config=None,
+            chunking_enabled=True,
+        )
+
+    # Chunk processor handle must be cleared and its worker thread joined.
+    assert helper.chunk_processor is None, (
+        "chunk_processor must be torn down when a later collaborator fails"
+    )
+
+
 def test_scrub_worker_failure_warns_for_local_recording(tmp_path):
     """Local recording: scrub-worker failure must not block recording but must surface."""
     from screencap.engine.collaborators import RecordingCollaborators

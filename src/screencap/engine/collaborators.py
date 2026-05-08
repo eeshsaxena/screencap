@@ -172,6 +172,12 @@ class RecordingCollaborators:
 
         ``console`` is used only for the failure-path warnings; tests
         pass ``None`` to suppress output.
+
+        If ``_build_scrub_worker`` raises (e.g. ``SystemExit`` for
+        cloud-bound recordings), an already-started chunk processor must
+        not be left orphaned — its non-daemon thread would keep the
+        process alive after the SystemExit propagates. Tear down the
+        partial start before re-raising.
         """
         import multiprocessing as _mp
 
@@ -184,9 +190,42 @@ class RecordingCollaborators:
             mp_module=_mp,
             console=console,
         )
-        self._build_scrub_worker(
-            recorder=recorder, capture_dir=capture_dir, console=console,
-        )
+        try:
+            self._build_scrub_worker(
+                recorder=recorder, capture_dir=capture_dir, console=console,
+            )
+        except BaseException:
+            # ``BaseException`` covers ``SystemExit`` raised by the cloud
+            # hard-fail path; without this, the chunk_processor thread
+            # blocks process exit until its 300s deadline.
+            self._teardown_partial_start()
+            raise
+
+    def _teardown_partial_start(self) -> None:
+        """Stop a chunk_processor started before a later collaborator failed.
+
+        Called when ``_build_scrub_worker`` raises after
+        ``_build_chunk_processor`` succeeded. Sends the poison pill,
+        joins the worker thread (best-effort), and closes the engine
+        queues this helper owns so producers don't push into a queue
+        with no consumer.
+        """
+        cp = self._chunk_processor
+        if cp is not None:
+            try:
+                cp.stop(timeout=10.0)
+            except Exception:  # noqa: BLE001
+                pass
+            self._chunk_processor = None
+        if self._chunk_q is not None or self._audio_ack_q is not None:
+            try:
+                from screencap._startup import close_queues_safely
+
+                close_queues_safely(self._chunk_q, self._audio_ack_q)
+            except Exception:  # noqa: BLE001
+                pass
+        self._chunk_q = None
+        self._audio_ack_q = None
 
     def _build_chunk_processor(
         self,
