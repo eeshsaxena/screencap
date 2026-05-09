@@ -68,6 +68,20 @@ def test_render_plist_validates_with_plutil():
     assert result.returncode == 0, result.stderr.decode(errors="replace")
 
 
+def test_bundled_macos_launchagent_plist_matches_renderer():
+    from screencap.daemon import launchagent
+
+    repo_root = Path(__file__).resolve().parents[2]
+    bundled = repo_root / "macos" / "ScreenCap" / "Resources" / "com.screencap.daemon.plist"
+
+    expected = launchagent.render_plist(
+        program="screencap",
+        bundle_program="Contents/Resources/screencap/screencap",
+    )
+
+    assert bundled.read_bytes() == expected
+
+
 def test_install_bootstraps_and_reports_running(monkeypatch: pytest.MonkeyPatch, tmp_path: Path):
     from screencap.daemon import launchagent
 

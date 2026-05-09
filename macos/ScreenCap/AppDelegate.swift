@@ -12,6 +12,7 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
 
     func applicationDidFinishLaunching(_ notification: Notification) {
         NSApp.setActivationPolicy(.regular)
+        DaemonInstallController.registerDaemonOnFirstLaunchIfNeeded()
         // Switch to .accessory whenever the main window closes; keep the menu
         // bar item alive so the user can reopen the app from there.
         windowCloseObserver = NotificationCenter.default.addObserver(

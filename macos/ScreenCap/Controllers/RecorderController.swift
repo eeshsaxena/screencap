@@ -123,6 +123,7 @@ final class RecorderController: ObservableObject {
     private var elapsedTimer: Timer?
     private var permissionWatchdog: Timer?
     private var permissionObserver: NSObjectProtocol?
+    private var daemonInstalledObserver: NSObjectProtocol?
     private var recordingStartedAt: Date?
 
     /// Pending awaits keyed by event type. Resolved when the matching event
@@ -138,12 +139,27 @@ final class RecorderController: ObservableObject {
         self.permissions = permissions
     }
 
+    init() {
+        daemonInstalledObserver = NotificationCenter.default.addObserver(
+            forName: .screenCapDaemonInstalledAndRunning,
+            object: nil,
+            queue: .main
+        ) { [weak self] _ in
+            Task { @MainActor in
+                await self?.probeDaemon()
+            }
+        }
+    }
+
     deinit {
         daemonEventTask?.cancel()
         elapsedTimer?.invalidate()
         permissionWatchdog?.invalidate()
         if let observer = permissionObserver {
             NSWorkspace.shared.notificationCenter.removeObserver(observer)
+        }
+        if let daemonInstalledObserver {
+            NotificationCenter.default.removeObserver(daemonInstalledObserver)
         }
     }
 

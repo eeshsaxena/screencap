@@ -26,6 +26,7 @@ targets:
       - path: ScreenCap
         excludes:
           - "Scripts/**"
+          - "Resources/com.screencap.daemon.plist"
           - "Info.plist"
           - "ScreenCap.entitlements"
     resources:
@@ -57,6 +58,15 @@ targets:
       - name: Embed screencap CLI
         script: |
           "${SRCROOT}/ScreenCap/Scripts/embed-cli.sh"
+        basedOnDependencyAnalysis: false
+        showEnvVarsInLog: false
+    postBuildScripts:
+      - name: Embed daemon LaunchAgent
+        script: |
+          set -euo pipefail
+          DEST_DIR="${TARGET_BUILD_DIR}/${CONTENTS_FOLDER_PATH}/Library/LaunchAgents"
+          mkdir -p "${DEST_DIR}"
+          cp "${SRCROOT}/ScreenCap/Resources/com.screencap.daemon.plist" "${DEST_DIR}/com.screencap.daemon.plist"
         basedOnDependencyAnalysis: false
         showEnvVarsInLog: false
 

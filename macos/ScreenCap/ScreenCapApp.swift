@@ -21,7 +21,9 @@ struct ScreenCapApp: App {
                     recorder.bindPermissions(permissions)
                 }
                 .task {
-                    await recorder.probeDaemon()
+                    if ProcessInfo.processInfo.environment["XCTestConfigurationFilePath"] == nil {
+                        await recorder.probeDaemon()
+                    }
                 }
         }
         .windowResizability(.contentSize)

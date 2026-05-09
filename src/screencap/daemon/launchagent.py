@@ -51,6 +51,7 @@ def render_plist(
     args: Iterable[str] = ("serve",),
     log_dir: str | Path | None = None,
     env_vars: dict[str, str] | None = None,
+    bundle_program: str | None = None,
 ) -> bytes:
     """Build deterministic LaunchAgent plist XML bytes."""
     program_path = str(Path(program).expanduser())
@@ -76,6 +77,8 @@ def render_plist(
         "StandardOutPath": str(resolved_log_dir / "daemon.out.log"),
         "EnvironmentVariables": dict(env_vars),
     }
+    if bundle_program is not None:
+        plist["BundleProgram"] = bundle_program
 
     return plistlib.dumps(plist, fmt=plistlib.FMT_XML)
 

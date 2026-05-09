@@ -82,6 +82,18 @@ enum PermissionStatus: Equatable {
     var isGranted: Bool { self == .granted }
 }
 
+enum PermissionSubject: Equatable {
+    case screenCapApp
+    case daemon
+
+    var bundleIdentifier: String {
+        switch self {
+        case .screenCapApp: return "com.screencap.macos"
+        case .daemon: return "com.screencap.daemon"
+        }
+    }
+}
+
 @MainActor
 final class PermissionController: ObservableObject {
     @Published private(set) var screenRecording: PermissionStatus = .notDetermined
@@ -248,7 +260,12 @@ final class PermissionController: ObservableObject {
     ///
     /// Microphone uses an async callback; we don't block on it because the
     /// pane should open immediately either way.
-    func requestAndOpenSettings(for pane: PrivacyPane) {
+    func requestAndOpenSettings(for pane: PrivacyPane, subject: PermissionSubject = .screenCapApp) {
+        guard subject == .screenCapApp else {
+            openSystemSettings(for: pane, subject: subject)
+            return
+        }
+
         switch pane {
         case .screenRecording:
             // Triggers the "<App> would like to record this computer's screen"
@@ -266,15 +283,21 @@ final class PermissionController: ObservableObject {
                 Task { @MainActor in self.refresh() }
             }
         }
-        openSystemSettings(for: pane)
+        openSystemSettings(for: pane, subject: subject)
     }
 
     /// Opens System Settings to the requested pane. Tries the macOS 13+ .extension
     /// URL first; falls back to the generic Privacy & Security page if unavailable.
-    func openSystemSettings(for pane: PrivacyPane) {
-        if !NSWorkspace.shared.open(pane.deepLinkURL) {
+    func openSystemSettings(for pane: PrivacyPane, subject: PermissionSubject = .screenCapApp) {
+        if !NSWorkspace.shared.open(Self.settingsURL(for: pane, subject: subject)) {
             NSWorkspace.shared.open(PrivacyPane.fallbackURL)
         }
+    }
+
+    nonisolated static func settingsURL(for pane: PrivacyPane, subject: PermissionSubject = .screenCapApp) -> URL {
+        // TCC panes list every registered subject. The daemon subject changes
+        // the UX copy and prompt target, not the System Settings destination.
+        pane.deepLinkURL
     }
 
     // MARK: - Silent in-process checks
