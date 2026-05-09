@@ -53,18 +53,32 @@ def render_plist(
     env_vars: dict[str, str] | None = None,
     bundle_program: str | None = None,
 ) -> bytes:
-    """Build deterministic LaunchAgent plist XML bytes."""
+    """Build deterministic LaunchAgent plist XML bytes.
+
+    Path values default to literal `$HOME/...` strings. launchd expands
+    `$HOME` in `StandardErrorPath` / `StandardOutPath` at LaunchAgent load
+    time in the `gui/$UID` domain, so a single rendered plist works for
+    every user — no per-user `Path.home()` expansion baked in.
+
+    `SCREENCAP_RUN_DIR` is intentionally absent from the default
+    EnvironmentVariables: the daemon's own `default_socket_path()`
+    resolves `~/.screencap/run/api.sock` via `Path.home()` at runtime.
+    Setting it in the plist would require a per-user expansion the daemon
+    can already do for itself.
+
+    Pass `log_dir` or `env_vars` explicitly to override either default.
+    `Path` instances are stringified verbatim — pass `Path("/tmp/x")` if
+    you want literal absolute paths instead of `$HOME`-prefixed ones.
+    """
     program_path = str(Path(program).expanduser())
 
     if log_dir is None:
-        log_dir = Path.home() / "Library" / "Logs" / "ScreenCap"
-    resolved_log_dir = Path(log_dir).expanduser()
+        log_dir_str = "$HOME/Library/Logs/ScreenCap"
+    else:
+        log_dir_str = str(log_dir)
 
     if env_vars is None:
-        env_vars = {
-            "PATH": DEFAULT_PATH,
-            "SCREENCAP_RUN_DIR": str(Path.home() / ".screencap" / "run"),
-        }
+        env_vars = {"PATH": DEFAULT_PATH}
 
     plist = {
         "Label": label,
@@ -73,8 +87,8 @@ def render_plist(
         "KeepAlive": {"SuccessfulExit": False, "Crashed": True},
         "ProcessType": "Adaptive",
         "ExitTimeOut": 30,
-        "StandardErrorPath": str(resolved_log_dir / "daemon.err.log"),
-        "StandardOutPath": str(resolved_log_dir / "daemon.out.log"),
+        "StandardErrorPath": f"{log_dir_str}/daemon.err.log",
+        "StandardOutPath": f"{log_dir_str}/daemon.out.log",
         "EnvironmentVariables": dict(env_vars),
     }
     if bundle_program is not None:

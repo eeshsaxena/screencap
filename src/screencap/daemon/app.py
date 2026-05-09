@@ -137,9 +137,18 @@ async def session_snapshot(request: Request) -> JSONResponse:
 
     claimant = metadata.get("claimant")
     daemon_owned = claimant == "daemon"
+    # `recording_started_at` is the per-recording timestamp (cli.py and the
+    # daemon both set it on session start). Long-lived holders like
+    # SessionController claim the lock between recordings — they hold the
+    # flock with metadata but no `recording_started_at`. Mirror the
+    # `pidfile.py` invariant: gate `is_recording` on the per-recording
+    # timestamp, not flock activity alone, so SwiftUI doesn't show a phantom
+    # "another process is recording" banner during those gaps.
     recording_started_at = metadata.get("recording_started_at")
     if recording_started_at is None:
-        recording_started_at = metadata.get("started_at")
+        return JSONResponse(
+            _empty_snapshot(is_recording=False, cursor=cursor, recovering=recovering)
+        )
 
     payload = schema.envelope(
         schema_version=schema._SNAPSHOT_API_VERSION,
@@ -242,7 +251,11 @@ async def events_stream(request: Request) -> JSONResponse | StreamingResponse:
                 ),
                 status_code=400,
             )
-        if since != bus.current_cursor():
+        # `since` older than current is fine — the snapshot caller is behind by
+        # the events emitted in the gap and will catch up on the next live read
+        # via the bus queue. Only `since > current` is genuinely unknown (the
+        # client is asking about an event the daemon has never published).
+        if since > bus.current_cursor():
             return JSONResponse(
                 errors.cursor_unknown_envelope(
                     requested_cursor=since,
@@ -271,6 +284,18 @@ async def events_stream(request: Request) -> JSONResponse | StreamingResponse:
                 if await request.is_disconnected():
                     break
                 if sub.closed.is_set():
+                    # On `shutdown`, drain any events queued before close —
+                    # otherwise the final recording_finalized is lost on SIGTERM
+                    # during a live recording. On `slow_consumer` the queue
+                    # backlog is exactly what marked them slow; flushing it now
+                    # contradicts the close reason and races the consumer.
+                    if sub.close_reason == "shutdown":
+                        while True:
+                            try:
+                                event = sub.queue.get_nowait()
+                            except asyncio.QueueEmpty:
+                                break
+                            yield _ndjson(event)
                     yield _ndjson(
                         {
                             "type": "_close",

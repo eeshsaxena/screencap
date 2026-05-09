@@ -28,7 +28,7 @@ final class RecorderControllerDaemonTests: XCTestCase {
             case "/v0/daemon.info":
                 return .json(#"{"ok":true,"schema_version":1,"daemon_version":"test","api_schema_version":1,"build":null,"started_at":1.0}"#)
             case "/v0/recording.start":
-                return .json(#"{"ok":true,"schema_version":1,"daemon_version":"test","api_schema_version":1,"session_id":"session-1","started_at":10.0}"#)
+                return .json(#"{"ok":true,"schema_version":1,"daemon_version":"test","api_schema_version":1,"session_id":"session-1","started_at":10.0,"cursor":2}"#)
             case "/v0/session.snapshot":
                 return .json(#"{"ok":true,"schema_version":1,"daemon_version":"test","api_schema_version":1,"is_recording":true,"daemon_owned":true,"recording_name":"demo","started_at":10.0,"claimant":"daemon","recovering":false,"cursor":3}"#)
             case "/v0/events?since=3":
@@ -62,7 +62,7 @@ final class RecorderControllerDaemonTests: XCTestCase {
             case "/v0/daemon.info":
                 return .json(#"{"ok":true,"schema_version":1,"daemon_version":"test","api_schema_version":1,"build":null,"started_at":1.0}"#)
             case "/v0/recording.start":
-                return .json(#"{"ok":true,"schema_version":1,"daemon_version":"test","api_schema_version":1,"session_id":"session-2","started_at":10.0}"#)
+                return .json(#"{"ok":true,"schema_version":1,"daemon_version":"test","api_schema_version":1,"session_id":"session-2","started_at":10.0,"cursor":4}"#)
             case "/v0/session.snapshot":
                 return .json(#"{"ok":true,"schema_version":1,"daemon_version":"test","api_schema_version":1,"is_recording":true,"daemon_owned":true,"recording_name":"demo","started_at":10.0,"claimant":"daemon","recovering":false,"cursor":5}"#)
             case "/v0/events?since=5":

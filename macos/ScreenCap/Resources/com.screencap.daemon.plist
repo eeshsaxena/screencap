@@ -8,8 +8,6 @@
 	<dict>
 		<key>PATH</key>
 		<string>/usr/bin:/bin:/usr/sbin:/sbin:/usr/local/bin:/opt/homebrew/bin</string>
-		<key>SCREENCAP_RUN_DIR</key>
-		<string>/Users/rutefigueiredo/.screencap/run</string>
 	</dict>
 	<key>ExitTimeOut</key>
 	<integer>30</integer>
@@ -32,8 +30,8 @@
 	<key>RunAtLoad</key>
 	<true/>
 	<key>StandardErrorPath</key>
-	<string>/Users/rutefigueiredo/Library/Logs/ScreenCap/daemon.err.log</string>
+	<string>$HOME/Library/Logs/ScreenCap/daemon.err.log</string>
 	<key>StandardOutPath</key>
-	<string>/Users/rutefigueiredo/Library/Logs/ScreenCap/daemon.out.log</string>
+	<string>$HOME/Library/Logs/ScreenCap/daemon.out.log</string>
 </dict>
 </plist>

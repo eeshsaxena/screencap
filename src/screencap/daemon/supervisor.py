@@ -202,6 +202,10 @@ class Supervisor:
             encoded_args = base64.b64encode(
                 json.dumps(args, separators=(",", ":")).encode("utf-8")
             ).decode("ascii")
+            # Capture the cursor BEFORE the engine spawn so the response gives
+            # callers an atomic late-join boundary: every event from this
+            # recording (starting with `started`) carries cursor > start_cursor.
+            start_cursor = self._bus.current_cursor()
             started_sub = await self._bus.subscribe()
             try:
                 command = self._engine_command_factory(encoded_args)
@@ -239,6 +243,7 @@ class Supervisor:
                 "session_id": name,
                 "started_at": started_at,
                 "engine_pid": proc.pid,
+                "cursor": start_cursor,
             }
 
     async def stop(

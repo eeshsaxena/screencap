@@ -215,6 +215,41 @@ async def test_session_snapshot_stale_lock_reports_not_recording(
 
 
 @pytest.mark.asyncio
+async def test_session_snapshot_lock_held_without_recording_started_at_is_idle(
+    tmp_path: Path,
+    isolated_lock,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    # SessionController and other long-lived holders claim the lock with
+    # metadata but no per-recording timestamp between recordings. The
+    # daemon must mirror the pidfile.py:276-279 invariant and report
+    # is_recording=false in that case — otherwise SwiftUI shows a
+    # phantom "another process is recording" banner during those gaps.
+    isolated_lock.LOCK_DIR.mkdir(parents=True)
+    isolated_lock.LOCK_FILE.write_text(
+        json.dumps(
+            {
+                "claimant": "cli",
+                "recording_name": None,
+                # recording_started_at intentionally omitted
+            }
+        ),
+        encoding="utf-8",
+    )
+    monkeypatch.setattr(isolated_lock, "lock_is_active", lambda: True)
+
+    response = await _asgi_get("/v0/session.snapshot")
+
+    assert response.status_code == 200
+    payload = response.json()
+    assert payload["is_recording"] is False
+    assert payload["daemon_owned"] is False
+    assert payload["recording_name"] is None
+    assert payload["started_at"] is None
+    assert payload["claimant"] is None
+
+
+@pytest.mark.asyncio
 async def test_session_snapshot_consistently_inconsistent_state_is_transient(
     isolated_lock,
     monkeypatch: pytest.MonkeyPatch,

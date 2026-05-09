@@ -31,9 +31,15 @@ def test_render_plist_contains_required_stable_keys_and_no_launchd_extras():
     assert parsed["KeepAlive"] == {"SuccessfulExit": False, "Crashed": True}
     assert parsed["ProcessType"] == "Adaptive"
     assert parsed["ExitTimeOut"] == 30
-    assert parsed["StandardErrorPath"].endswith("/Library/Logs/ScreenCap/daemon.err.log")
-    assert parsed["StandardOutPath"].endswith("/Library/Logs/ScreenCap/daemon.out.log")
-    assert parsed["EnvironmentVariables"]["SCREENCAP_RUN_DIR"].endswith("/.screencap/run")
+    # Default paths use literal $HOME so launchd expands per-user at LaunchAgent
+    # load time in the gui/$UID domain — one rendered plist works for every user.
+    assert parsed["StandardErrorPath"] == "$HOME/Library/Logs/ScreenCap/daemon.err.log"
+    assert parsed["StandardOutPath"] == "$HOME/Library/Logs/ScreenCap/daemon.out.log"
+    # SCREENCAP_RUN_DIR is intentionally absent from the default env_vars: the
+    # daemon's own default_socket_path() resolves ~/.screencap/run/api.sock via
+    # Path.home() at runtime, and launchd does not expand $HOME in env values.
+    assert "SCREENCAP_RUN_DIR" not in parsed["EnvironmentVariables"]
+    assert parsed["EnvironmentVariables"]["PATH"]
 
     assert "LimitLoadToSessionType" not in parsed
     assert "WatchPaths" not in parsed

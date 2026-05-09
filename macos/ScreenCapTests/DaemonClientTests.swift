@@ -67,7 +67,7 @@ final class DaemonClientTests: XCTestCase {
             XCTAssertTrue(body.contains(#""name":"demo""#), body)
             XCTAssertTrue(body.contains(#""started_by":"swiftui-via-daemon""#), body)
             return .json(
-                #"{"ok":true,"schema_version":1,"daemon_version":"test","api_schema_version":1,"session_id":"abc","started_at":44.0}"#
+                #"{"ok":true,"schema_version":1,"daemon_version":"test","api_schema_version":1,"session_id":"abc","started_at":44.0,"cursor":7}"#
             )
         }
 
@@ -77,6 +77,7 @@ final class DaemonClientTests: XCTestCase {
 
         XCTAssertEqual(response.sessionID, "abc")
         XCTAssertEqual(response.startedAt, 44.0)
+        XCTAssertEqual(response.cursor, 7)
     }
 
     func testSchemaMismatchThrowsPinnedError() async throws {

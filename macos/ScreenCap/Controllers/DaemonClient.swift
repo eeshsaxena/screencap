@@ -129,6 +129,10 @@ struct RecordingStartResponse: Decodable {
     let apiSchemaVersion: Int
     let sessionID: String
     let startedAt: Double
+    /// Bus cursor captured BEFORE the engine spawn — feed into
+    /// `/v0/events?since=<cursor>` to receive the `started` event without
+    /// an extra `session.snapshot` round-trip.
+    let cursor: Int
 
     enum CodingKeys: String, CodingKey {
         case ok
@@ -137,6 +141,7 @@ struct RecordingStartResponse: Decodable {
         case apiSchemaVersion = "api_schema_version"
         case sessionID = "session_id"
         case startedAt = "started_at"
+        case cursor
     }
 }
 

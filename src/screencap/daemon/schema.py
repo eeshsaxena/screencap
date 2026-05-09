@@ -131,6 +131,10 @@ def _load_models() -> dict[str, Any]:
     class RecordingStartResponse(EnvelopeResponse):
         session_id: str
         started_at: float
+        # `cursor` is the bus cursor captured BEFORE the engine spawn — clients
+        # subscribe to /v0/events?since=<cursor> after start to receive the
+        # `started` event without an extra `session.snapshot` round-trip.
+        cursor: int
 
     class RecordingStopRequest(_DaemonModel):
         force: bool = False

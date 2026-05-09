@@ -232,11 +232,17 @@ struct FirstRunPermissionsView: View {
 
     @ViewBuilder
     private func daemonPermissionRow(pane: PrivacyPane, status: PermissionStatus) -> some View {
+        // TCC does not expose a programmatic status check for arbitrary
+        // binaries (the daemon's `com.screencap.daemon` subject). The only
+        // local signal we have is whether the user clicked Open Settings,
+        // which doesn't actually confirm a grant. Use neutral icons that
+        // don't claim a state we can't verify — gray/blue, not red/green.
         let opened = openedDaemonPanes.contains(pane)
         HStack(alignment: .top, spacing: 12) {
-            Image(systemName: opened ? "checkmark.circle.fill" : "xmark.circle.fill")
+            Image(systemName: opened ? "circle.inset.filled" : "circle")
                 .font(.system(size: 20))
-                .foregroundStyle(opened ? Color.green : Color.red)
+                .foregroundStyle(opened ? Color.accentColor : Color.secondary)
+                .accessibilityLabel(opened ? "Settings visited" : "Settings not yet visited")
                 .padding(.top, 2)
 
             VStack(alignment: .leading, spacing: 4) {

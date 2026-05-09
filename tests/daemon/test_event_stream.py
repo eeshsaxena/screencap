@@ -90,7 +90,11 @@ async def test_events_stream_fans_out_to_two_subscribers() -> None:
 
 
 @pytest.mark.asyncio
-async def test_events_since_current_cursor_attaches_and_old_cursor_is_rejected() -> None:
+async def test_events_since_attaches_live_for_stale_cursor_and_rejects_future_cursor() -> None:
+    # Cursor protocol: `since` older-than-or-equal-to current attaches live —
+    # the snapshot caller is just behind by the events emitted in the gap and
+    # catches up on the next live read. Only `since > current_cursor` is
+    # genuinely unknown (asking about an event the daemon never published).
     app = await _build_app()
     await app.state.event_bus.publish(
         {"type": "existing", "ts": 1.0, "schema_version": 1}
@@ -102,13 +106,20 @@ async def test_events_since_current_cursor_attaches_and_old_cursor_is_rejected()
     assert (await _read_line(lines))["cursor"] == current
     await lines.aclose()
 
-    response, _body = await _open_stream(app, f"/v0/events?since={current - 1}")
+    # Stale cursor (snapshot taken before recent events) — attach live, no error.
+    response, lines = await _open_stream(app, f"/v0/events?since={current - 1}")
+    assert response.status_code == 200
+    assert (await _read_line(lines))["cursor"] == current
+    await lines.aclose()
+
+    # Future cursor (asking about events never emitted) — cursor_unknown.
+    response, _body = await _open_stream(app, f"/v0/events?since={current + 5}")
     assert response.status_code == 400
     assert response.media_type == "application/json"
     payload = json.loads(response.body)
     assert payload["ok"] is False
     assert payload["error"] == errors.CURSOR_UNKNOWN
-    assert payload["requested_cursor"] == current - 1
+    assert payload["requested_cursor"] == current + 5
     assert payload["schema_version"] == schema._EVENTS_API_VERSION
 
 
@@ -136,6 +147,31 @@ async def test_snapshot_cursor_comes_from_event_bus_without_advancing() -> None:
 
     assert first["cursor"] == 1
     assert second["cursor"] == 1
+
+
+@pytest.mark.asyncio
+async def test_shutdown_drains_queued_events_before_close_frame() -> None:
+    # Drain-to-EOF invariant: events queued before shutdown must reach the
+    # subscriber before the synthetic _close frame. Without this, a final
+    # `recording_finalized` is lost on SIGTERM during a live recording.
+    app = await _build_app()
+    _response, lines = await _open_stream(app)
+    await _read_line(lines)  # drain `subscribed` frame
+
+    # Queue events directly on the subscriber's queue, then close the bus.
+    sub = app.state.event_bus._subscribers[0]
+    sub.queue.put_nowait({"type": "queued_one", "ts": 1.0, "schema_version": 1, "cursor": 1})
+    sub.queue.put_nowait({"type": "queued_two", "ts": 2.0, "schema_version": 1, "cursor": 2})
+
+    await app.state.event_bus.shutdown()
+
+    assert (await _read_line(lines))["type"] == "queued_one"
+    assert (await _read_line(lines))["type"] == "queued_two"
+    close = await _read_line(lines)
+    assert close["type"] == "_close"
+    assert close["reason"] == "shutdown"
+    with pytest.raises(StopAsyncIteration):
+        await anext(lines)
 
 
 @pytest.mark.asyncio
