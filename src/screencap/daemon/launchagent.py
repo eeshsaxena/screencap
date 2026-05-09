@@ -14,7 +14,7 @@ import sys
 import time
 from dataclasses import dataclass
 from pathlib import Path
-from typing import Iterable
+from typing import Any, Iterable
 
 DAEMON_LABEL = "com.screencap.daemon"
 DEFAULT_BINARY_NAME = "screencap"
@@ -55,42 +55,47 @@ def render_plist(
 ) -> bytes:
     """Build deterministic LaunchAgent plist XML bytes.
 
-    Path values default to literal `$HOME/...` strings. launchd expands
-    `$HOME` in `StandardErrorPath` / `StandardOutPath` at LaunchAgent load
-    time in the `gui/$UID` domain, so a single rendered plist works for
-    every user — no per-user `Path.home()` expansion baked in.
+    `log_dir` semantics:
+        - `None` (default): omit `StandardErrorPath` and `StandardOutPath`.
+          launchd captures the daemon's stdout/stderr in the unified system
+          log; access via `log show --predicate 'process == "screencap"'`.
+          This is the right shape for the bundled (SMAppService) plist
+          because that file ships with the app and must work for every
+          user — but **launchd in macOS 26+ does NOT expand `$HOME` or `~`
+          in path keys** (verified empirically against `launchd.plist(5)`'s
+          ambiguous tilde-expansion language; literal `~/...` produces
+          `EX_CONFIG` on spawn). So we cannot bake any user-relative path
+          into the bundled plist.
+        - Any path-like value: emit it verbatim into the path keys. Used
+          by `install()` below to pass an absolute path resolved at
+          install time (`str(Path.home() / "Library" / "Logs" / "ScreenCap")`)
+          so file-based logs work on the per-user CLI install path.
 
     `SCREENCAP_RUN_DIR` is intentionally absent from the default
     EnvironmentVariables: the daemon's own `default_socket_path()`
     resolves `~/.screencap/run/api.sock` via `Path.home()` at runtime.
-    Setting it in the plist would require a per-user expansion the daemon
-    can already do for itself.
-
-    Pass `log_dir` or `env_vars` explicitly to override either default.
-    `Path` instances are stringified verbatim — pass `Path("/tmp/x")` if
-    you want literal absolute paths instead of `$HOME`-prefixed ones.
+    launchd does NOT perform tilde or `$HOME` expansion in
+    EnvironmentVariables values either, so any pre-baked value here would
+    be wrong on every machine but the developer's.
     """
     program_path = str(Path(program).expanduser())
-
-    if log_dir is None:
-        log_dir_str = "$HOME/Library/Logs/ScreenCap"
-    else:
-        log_dir_str = str(log_dir)
 
     if env_vars is None:
         env_vars = {"PATH": DEFAULT_PATH}
 
-    plist = {
+    plist: dict[str, Any] = {
         "Label": label,
         "ProgramArguments": [program_path, *list(args)],
         "RunAtLoad": True,
         "KeepAlive": {"SuccessfulExit": False, "Crashed": True},
         "ProcessType": "Adaptive",
         "ExitTimeOut": 30,
-        "StandardErrorPath": f"{log_dir_str}/daemon.err.log",
-        "StandardOutPath": f"{log_dir_str}/daemon.out.log",
         "EnvironmentVariables": dict(env_vars),
     }
+    if log_dir is not None:
+        log_dir_str = str(log_dir)
+        plist["StandardErrorPath"] = f"{log_dir_str}/daemon.err.log"
+        plist["StandardOutPath"] = f"{log_dir_str}/daemon.out.log"
     if bundle_program is not None:
         plist["BundleProgram"] = bundle_program
 
@@ -121,7 +126,22 @@ def install(
     """Install and start the per-user ScreenCap LaunchAgent."""
     resolved_plist_path = (plist_path or default_plist_path()).expanduser()
     resolved_program, args = _resolve_program_arguments(program)
-    content = render_plist(program=resolved_program, args=args)
+    # Per-user CLI install: bake the absolute log dir into the plist (launchd
+    # in macOS 26+ does NOT expand `~` or `$HOME` in path keys, so the
+    # bundled SMAppService plist omits these — but here we know the user
+    # invoking the install, so we resolve their home and create the log
+    # directory before launchctl bootstraps the agent and tries to open()
+    # the path keys (a missing parent directory yields EX_CONFIG on spawn).
+    log_dir = Path.home() / "Library" / "Logs" / "ScreenCap"
+    try:
+        log_dir.mkdir(parents=True, exist_ok=True)
+    except OSError as exc:
+        return InstallResult(
+            state="install_failed_plist_write_failed",
+            plist_path=resolved_plist_path,
+            detail=f"could not create log dir {log_dir}: {exc}",
+        )
+    content = render_plist(program=resolved_program, args=args, log_dir=str(log_dir))
 
     existing_content = _read_existing(resolved_plist_path)
     content_changed = existing_content != content

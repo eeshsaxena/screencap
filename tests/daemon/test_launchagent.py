@@ -36,10 +36,17 @@ def test_render_plist_contains_required_stable_keys_and_no_launchd_extras():
     assert parsed["KeepAlive"] == {"SuccessfulExit": False, "Crashed": True}
     assert parsed["ProcessType"] == "Adaptive"
     assert parsed["ExitTimeOut"] == 30
-    # Default paths use literal $HOME so launchd expands per-user at LaunchAgent
-    # load time in the gui/$UID domain — one rendered plist works for every user.
-    assert parsed["StandardErrorPath"] == "$HOME/Library/Logs/ScreenCap/daemon.err.log"
-    assert parsed["StandardOutPath"] == "$HOME/Library/Logs/ScreenCap/daemon.out.log"
+    # Default `log_dir=None` omits StandardErrorPath/StandardOutPath because
+    # launchd in macOS 26+ does NOT expand `~` or `$HOME` in path keys
+    # (verified empirically: a literal `~/Library/Logs/...` causes launchd to
+    # spawn the daemon with EX_CONFIG when the path is opened). The bundled
+    # SMAppService plist must work for any user, so it ships without these
+    # path keys — daemon stdout/stderr land in the unified system log,
+    # accessible via `log show --predicate 'process == "screencap"'`. The CLI
+    # install path (`screencap serve --install`) bakes an absolute log dir
+    # at install time instead.
+    assert "StandardErrorPath" not in parsed
+    assert "StandardOutPath" not in parsed
     # SCREENCAP_RUN_DIR is intentionally absent from the default env_vars: the
     # daemon's own default_socket_path() resolves ~/.screencap/run/api.sock via
     # Path.home() at runtime, and launchd does not expand $HOME in env values.
@@ -50,6 +57,23 @@ def test_render_plist_contains_required_stable_keys_and_no_launchd_extras():
     assert "WatchPaths" not in parsed
     assert "Sockets" not in parsed
     assert "MachServices" not in parsed
+
+
+def test_render_plist_with_log_dir_sets_absolute_path_keys(tmp_path: Path):
+    # The CLI install path passes an absolute log dir resolved from
+    # Path.home() at install time. Verify those values land verbatim in the
+    # plist's StandardErrorPath / StandardOutPath keys (no further expansion).
+    from screencap.daemon import launchagent
+
+    content = launchagent.render_plist(
+        program="/usr/local/bin/screencap",
+        log_dir=str(tmp_path / "Library/Logs/ScreenCap"),
+    )
+    parsed = _parse_plist(content)
+
+    expected = str(tmp_path / "Library/Logs/ScreenCap")
+    assert parsed["StandardErrorPath"] == f"{expected}/daemon.err.log"
+    assert parsed["StandardOutPath"] == f"{expected}/daemon.out.log"
 
 
 def test_render_plist_is_deterministic_for_same_inputs(tmp_path: Path):
@@ -118,8 +142,16 @@ def test_install_is_idempotent_when_existing_plist_has_same_content(
 ):
     from screencap.daemon import launchagent
 
+    # Match install()'s rendering: it bakes an absolute log dir under the
+    # current user's home, so the idempotency check requires the same
+    # log_dir argument to produce byte-identical content.
+    install_log_dir = str(Path.home() / "Library" / "Logs" / "ScreenCap")
+    expected_content = launchagent.render_plist(
+        program="/bin/screencap", log_dir=install_log_dir
+    )
+
     plist_path = tmp_path / "agent.plist"
-    plist_path.write_bytes(launchagent.render_plist(program="/bin/screencap"))
+    plist_path.write_bytes(expected_content)
     calls: list[list[str]] = []
 
     def fake_run(cmd, **_kwargs):
@@ -132,7 +164,7 @@ def test_install_is_idempotent_when_existing_plist_has_same_content(
     result = launchagent.install(program="/bin/screencap", plist_path=plist_path)
 
     assert result.state == "installed_and_running"
-    assert plist_path.read_bytes() == launchagent.render_plist(program="/bin/screencap")
+    assert plist_path.read_bytes() == expected_content
     assert [cmd[1] for cmd in calls] == ["bootstrap"]
 
 
