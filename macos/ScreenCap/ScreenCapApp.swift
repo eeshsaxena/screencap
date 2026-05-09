@@ -20,6 +20,11 @@ struct ScreenCapApp: App {
                     recorder.bindIndex(index)
                     recorder.bindPermissions(permissions)
                 }
+                .task {
+                    if ProcessInfo.processInfo.environment["XCTestConfigurationFilePath"] == nil {
+                        await recorder.probeDaemon()
+                    }
+                }
         }
         .windowResizability(.contentSize)
         .commands {

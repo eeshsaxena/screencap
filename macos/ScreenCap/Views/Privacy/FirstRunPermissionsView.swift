@@ -29,35 +29,38 @@ struct FirstRunPermissionsView: View {
     @EnvironmentObject private var permissions: PermissionController
     @EnvironmentObject private var recorder: RecorderController
     @Binding var isPresented: Bool
+    @StateObject private var daemonInstaller = DaemonInstallController()
     @State private var isPreparingRelaunch = false
+    @State private var isDaemonInstallComplete = false
+    @State private var openedDaemonPanes: Set<PrivacyPane> = []
 
     var body: some View {
         VStack(alignment: .leading, spacing: 20) {
             VStack(alignment: .leading, spacing: 6) {
                 Text("Set up ScreenCap")
                     .font(.title.bold())
-                Text("Grant the permissions below so ScreenCap can record your screen with privacy built in.")
+                Text("Set up the ScreenCap helper, then grant the permissions it needs to record.")
                     .font(.body)
                     .foregroundStyle(.secondary)
             }
 
-            VStack(spacing: 12) {
-                permissionRow(
-                    pane: .screenRecording,
-                    status: permissions.screenRecording
-                )
-                permissionRow(
-                    pane: .accessibility,
-                    status: permissions.accessibility
-                )
-                permissionRow(
-                    pane: .inputMonitoring,
-                    status: permissions.inputMonitoring
-                )
-                permissionRow(
-                    pane: .microphone,
-                    status: permissions.microphone
-                )
+            if !isDaemonInstallComplete {
+                daemonInstallStep
+            } else {
+                VStack(spacing: 12) {
+                    daemonPermissionRow(
+                        pane: .screenRecording,
+                        status: permissions.screenRecording
+                    )
+                    daemonPermissionRow(
+                        pane: .accessibility,
+                        status: permissions.accessibility
+                    )
+                    daemonPermissionRow(
+                        pane: .inputMonitoring,
+                        status: permissions.inputMonitoring
+                    )
+                }
             }
 
             // macOS caches TCC state per-process — once you grant a
@@ -97,7 +100,7 @@ struct FirstRunPermissionsView: View {
 
                     Button("Done") { isPresented = false }
                         .keyboardShortcut(.defaultAction)
-                        .disabled(!permissions.allRequiredGranted)
+                        .disabled(!isDaemonInstallComplete || !permissions.allRequiredGranted)
                 }
             }
         }
@@ -105,44 +108,57 @@ struct FirstRunPermissionsView: View {
         .frame(width: 520)
         .onAppear { permissions.startWatching() }
         .onDisappear { permissions.stopWatching() }
+        .onChange(of: daemonInstaller.state) { state in
+            if state == .installedAndRunning {
+                isDaemonInstallComplete = true
+            }
+        }
     }
 
     @ViewBuilder
-    private func permissionRow(pane: PrivacyPane, status: PermissionStatus) -> some View {
-        HStack(alignment: .top, spacing: 12) {
-            Image(systemName: status.isGranted ? "checkmark.circle.fill" : "xmark.circle.fill")
-                .font(.system(size: 20))
-                .foregroundStyle(status.isGranted ? Color.green : Color.red)
-                .padding(.top, 2)
+    private var daemonInstallStep: some View {
+        VStack(alignment: .leading, spacing: 14) {
+            HStack(alignment: .top, spacing: 12) {
+                Image(systemName: daemonInstallIconName)
+                    .font(.system(size: 22))
+                    .foregroundStyle(daemonInstallIconColor)
+                    .frame(width: 24)
 
-            VStack(alignment: .leading, spacing: 4) {
-                HStack {
-                    Text(pane.displayName)
+                VStack(alignment: .leading, spacing: 6) {
+                    Text("Approve ScreenCap helper")
                         .font(.headline)
-                    if !pane.isRequired {
-                        Text("Optional")
-                            .font(.caption)
-                            .padding(.horizontal, 6)
-                            .padding(.vertical, 2)
-                            .background(.secondary.opacity(0.15), in: Capsule())
-                    }
+                    Text(daemonInstallStatusText)
+                        .font(.subheadline)
+                        .foregroundStyle(.secondary)
                 }
-                Text(pane.rationale)
-                    .font(.subheadline)
-                    .foregroundStyle(.secondary)
+
+                Spacer()
             }
 
-            Spacer()
-
-            if !status.isGranted {
-                Button("Open System Settings") {
-                    permissions.requestAndOpenSettings(for: pane)
+            HStack {
+                switch daemonInstaller.state {
+                case .idle, .installFailed, .pollingFailed:
+                    Button("Approve helper") {
+                        Task { await daemonInstaller.install() }
+                    }
+                    .buttonStyle(.borderedProminent)
+                case .requiresApproval:
+                    Button("Open Login Items") {
+                        DaemonInstallController.openLoginItemsSettings()
+                    }
+                    .buttonStyle(.borderedProminent)
+                    Button("Retry") {
+                        Task { await daemonInstaller.retry() }
+                    }
+                    .buttonStyle(.bordered)
+                case .registering, .polling:
+                    ProgressView()
+                        .controlSize(.small)
+                case .installedAndRunning:
+                    Text("Helper running")
+                        .font(.caption)
+                        .foregroundStyle(.secondary)
                 }
-                .buttonStyle(.borderedProminent)
-            } else {
-                Text("Granted")
-                    .font(.caption)
-                    .foregroundStyle(.secondary)
             }
         }
         .padding(12)
@@ -150,5 +166,112 @@ struct FirstRunPermissionsView: View {
             RoundedRectangle(cornerRadius: 10)
                 .fill(Color(nsColor: .controlBackgroundColor))
         )
+    }
+
+    private var daemonInstallIconName: String {
+        switch daemonInstaller.state {
+        case .installedAndRunning:
+            return "checkmark.circle.fill"
+        case .installFailed, .pollingFailed:
+            return "exclamationmark.triangle.fill"
+        case .registering, .polling, .requiresApproval:
+            return "clock.fill"
+        case .idle:
+            return "gearshape.fill"
+        }
+    }
+
+    private var daemonInstallIconColor: Color {
+        switch daemonInstaller.state {
+        case .installedAndRunning:
+            return .green
+        case .installFailed, .pollingFailed:
+            return .red
+        case .registering, .polling, .requiresApproval:
+            return .orange
+        case .idle:
+            return .secondary
+        }
+    }
+
+    private var daemonInstallStatusText: String {
+        switch daemonInstaller.state {
+        case .idle:
+            return "ScreenCap uses a background helper for recording. Approve it in System Settings when prompted."
+        case .registering:
+            return "Starting helper..."
+        case .requiresApproval:
+            return "Approve ScreenCap helper in System Settings -> Login Items."
+        case .polling:
+            return "Waiting for helper to start..."
+        case .installedAndRunning:
+            return "ScreenCap helper is running."
+        case .pollingFailed(let reason):
+            return reason
+        case .installFailed(let reason):
+            return installFailureCopy(reason)
+        }
+    }
+
+    private func installFailureCopy(_ reason: DaemonInstallController.InstallFailureReason) -> String {
+        switch reason {
+        case .plistWriteFailed:
+            return "The helper plist was not found in the app bundle."
+        case .launchctlBootstrapFailed:
+            return "macOS did not start the helper. Retry after approving Login Items."
+        case .daemonDidNotStart:
+            return "The helper did not respond after launch."
+        case .daemonSigningInvalid:
+            return "macOS rejected the helper signature."
+        case .diskFull:
+            return "The disk is full, so the helper could not be installed."
+        case .unknown:
+            return "The helper could not be installed."
+        }
+    }
+
+    @ViewBuilder
+    private func daemonPermissionRow(pane: PrivacyPane, status: PermissionStatus) -> some View {
+        // TCC does not expose a programmatic status check for arbitrary
+        // binaries (the daemon's `com.screencap.daemon` subject). The only
+        // local signal we have is whether the user clicked Open Settings,
+        // which doesn't actually confirm a grant. Use neutral icons that
+        // don't claim a state we can't verify — gray/blue, not red/green.
+        let opened = openedDaemonPanes.contains(pane)
+        HStack(alignment: .top, spacing: 12) {
+            Image(systemName: opened ? "circle.inset.filled" : "circle")
+                .font(.system(size: 20))
+                .foregroundStyle(opened ? Color.accentColor : Color.secondary)
+                .accessibilityLabel(opened ? "Settings visited" : "Settings not yet visited")
+                .padding(.top, 2)
+
+            VStack(alignment: .leading, spacing: 4) {
+                HStack {
+                    Text("\(pane.displayName) for ScreenCap helper")
+                        .font(.headline)
+                }
+                Text(daemonRationale(for: pane, appStatus: status))
+                    .font(.subheadline)
+                    .foregroundStyle(.secondary)
+            }
+
+            Spacer()
+
+            Button(opened ? "Open Again" : "Open Settings") {
+                openedDaemonPanes.insert(pane)
+                permissions.requestAndOpenSettings(for: pane, subject: .daemon)
+            }
+            .buttonStyle(.borderedProminent)
+        }
+        .padding(12)
+        .background(
+            RoundedRectangle(cornerRadius: 10)
+                .fill(Color(nsColor: .controlBackgroundColor))
+        )
+    }
+
+    private func daemonRationale(for pane: PrivacyPane, appStatus: PermissionStatus) -> String {
+        let statusText = appStatus.isGranted ? "The app entry is already granted; enable the helper entry too." : "Enable the ScreenCap helper entry in this pane."
+        return "\(pane.rationale) \(statusText)"
     }
 }

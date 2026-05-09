@@ -46,4 +46,15 @@ final class PermissionControllerTests: XCTestCase {
         XCTAssertTrue(script.contains("/bin/launchctl setenv PATH \"$3\""))
         XCTAssertTrue(script.contains("/bin/launchctl setenv SCREENCAP_DEV_REPO_ROOT \"$4\""))
     }
+
+    func testDaemonTCCSubjectUsesSamePrivacyPaneDeepLinks() {
+        for pane in [PrivacyPane.screenRecording, .accessibility, .inputMonitoring] {
+            XCTAssertEqual(
+                PermissionController.settingsURL(for: pane, subject: .daemon),
+                pane.deepLinkURL
+            )
+        }
+
+        XCTAssertEqual(PermissionSubject.daemon.bundleIdentifier, "com.screencap.daemon")
+    }
 }

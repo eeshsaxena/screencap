@@ -60,7 +60,12 @@ final class RecordingsIndex: ObservableObject {
         isLoading = true
         defer { isLoading = false }
         do {
-            let rows: [RecordingSummary] = try await CLIClient.runJSON(["list", "--json"])
+            let rows: [RecordingSummary]
+            do {
+                rows = try await DaemonClient.recordingList().recordings
+            } catch DaemonClientError.socketUnavailable, DaemonClientError.connectionFailed {
+                rows = try await CLIClient.runJSON(["list", "--json"])
+            }
             recordings = rows
             lastError = nil
         } catch {

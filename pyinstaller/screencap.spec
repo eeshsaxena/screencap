@@ -105,6 +105,23 @@ for pkg in network_packages:
     all_hiddenimports += h
 
 # ---------------------------------------------------------------------------
+# Daemon stack — ASGI over AF_UNIX. Keep to pure-Python packages; no
+# uvicorn[standard] extras, so the bundle stays clear of uvloop/httptools.
+# ---------------------------------------------------------------------------
+daemon_packages = [
+    'uvicorn',
+    'starlette',
+    'pydantic',
+    'pydantic_core',
+]
+
+for pkg in daemon_packages:
+    d, b, h = collect_all(pkg)
+    all_datas += d
+    all_binaries += b
+    all_hiddenimports += h
+
+# ---------------------------------------------------------------------------
 # Hidden imports not auto-detected by PyInstaller
 # ---------------------------------------------------------------------------
 hidden_imports = [
@@ -126,6 +143,32 @@ hidden_imports = [
     # analysis cannot trace that. Pin it here so frozen builds find
     # the macOS Keychain backend at runtime.
     'keyring.backends.macOS',
+    # Daemon package + dynamic subprocess entry points.
+    'screencap.__main__',
+    'screencap.cli',
+    'screencap.daemon',
+    'screencap.daemon.app',
+    'screencap.daemon.errors',
+    'screencap.daemon.event_bus',
+    'screencap.daemon.launchagent',
+    'screencap.daemon.schema',
+    'screencap.daemon.server',
+    'screencap.daemon.socket',
+    'screencap.daemon.supervisor',
+    # Uvicorn/Starlette internals selected by string config values.
+    'uvicorn',
+    'uvicorn.protocols',
+    'uvicorn.protocols.http.h11_impl',
+    'uvicorn.lifespan',
+    'uvicorn.lifespan.on',
+    'uvicorn.loops',
+    'uvicorn.loops.asyncio',
+    'starlette',
+    'starlette.applications',
+    'starlette.responses',
+    'starlette.routing',
+    'pydantic',
+    'pydantic_core',
 ]
 
 all_hiddenimports += hidden_imports

@@ -219,7 +219,8 @@ def claim_lock(capture_dir: Path | str | None, claimant: str = "cli") -> int:
             later and plumbed in via :func:`update_lock_metadata` (todo 014).
             Persisted as ``null`` in the JSON when ``None``.
         claimant: "cli" for standalone invocations, "swiftui" when spawned by
-            the SwiftUI app (via ``SCREENCAP_PARENT=swiftui``).
+            the SwiftUI app (via ``SCREENCAP_PARENT=swiftui``), or "daemon"
+            when the daemon owns the session.
 
     Returns:
         The locked file descriptor (kept open; held in module-global state).
@@ -333,6 +334,8 @@ def update_lock_metadata(
     *,
     recording_started_at: float | None = None,
     recording_name: str | None = None,
+    started_by: str | None = None,
+    engine_pid: int | None = None,
 ) -> bool:
     """Plumb per-recording state into the held lock file in place.
 
@@ -347,6 +350,8 @@ def update_lock_metadata(
         on session start — the previous design left this at controller-init
         time so back-to-back recordings reported the wrong elapsed time)
       - ``recording_name`` when supplied
+      - ``started_by`` when supplied
+      - ``engine_pid`` when supplied (daemon-owned subprocess PID)
 
     Returns ``True`` on success, ``False`` if the process doesn't currently
     hold the lock (no-op so callers don't need to track state).
@@ -364,6 +369,10 @@ def update_lock_metadata(
             existing["recording_started_at"] = float(recording_started_at)
         if recording_name is not None:
             existing["recording_name"] = recording_name
+        if started_by is not None:
+            existing["started_by"] = started_by
+        if engine_pid is not None:
+            existing["engine_pid"] = int(engine_pid)
         payload = json.dumps(existing).encode()
         os.ftruncate(_LOCKED_FD, 0)
         os.lseek(_LOCKED_FD, 0, os.SEEK_SET)

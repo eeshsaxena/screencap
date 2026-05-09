@@ -123,6 +123,127 @@ def _download_nlp_models() -> None:
     _do_download()
 
 
+@cli.command("serve")
+@click.option("--self-test", is_flag=True, hidden=True)
+@click.option(
+    "--socket",
+    "socket_path",
+    default=None,
+    hidden=True,
+    help="Override socket path (test-only).",
+)
+@click.option("--install", is_flag=True, help="Install LaunchAgent and start daemon.")
+@click.option("--uninstall", is_flag=True, help="Stop daemon and remove LaunchAgent.")
+@click.option("--status", "show_status", is_flag=True, help="Print daemon LaunchAgent status.")
+def serve(
+    socket_path: str | None,
+    self_test: bool,
+    install: bool,
+    uninstall: bool,
+    show_status: bool,
+) -> None:
+    """Run the ScreenCap daemon, or manage its LaunchAgent."""
+    if sum(bool(flag) for flag in (install, uninstall, show_status)) > 1:
+        raise click.UsageError("--install, --uninstall, and --status are mutually exclusive.")
+
+    if install or uninstall or show_status:
+        from screencap.daemon import launchagent
+
+        if install:
+            result = launchagent.install()
+            if result.state == "installed_and_running":
+                console.print(f"[green]{result.state}[/green]: {result.plist_path}")
+                return
+            console.print(f"[red]{result.state}[/red]: {result.detail}")
+            raise SystemExit(1)
+
+        if uninstall:
+            result = launchagent.uninstall()
+            if result.state == "uninstalled":
+                console.print(f"[green]{result.state}[/green]: {result.plist_path}")
+                return
+            console.print(f"[red]{result.state}[/red]: {result.detail}")
+            raise SystemExit(1)
+
+        result = launchagent.status()
+        if result.state == "loaded":
+            state_detail = result.launchd_state or "unknown"
+            console.print(f"[green]loaded[/green]: {state_detail}")
+            return
+        if result.state == "not_loaded":
+            console.print("[yellow]not_loaded[/yellow]")
+            return
+        console.print(f"[red]{result.state}[/red]: {result.detail}")
+        raise SystemExit(1)
+
+    from screencap.daemon.server import serve as _serve
+
+    raise SystemExit(_serve(socket_path=socket_path, self_test=self_test))
+
+
+@cli.command("_engine-worker", hidden=True)
+@click.argument("encoded_args")
+def _engine_worker_cmd(encoded_args: str) -> None:
+    """Hidden subprocess entry point spawned by the daemon supervisor."""
+    import base64
+    import multiprocessing
+    import threading
+    from pathlib import Path
+    from typing import Any
+
+    args = json.loads(base64.b64decode(encoded_args).decode("utf-8"))
+    from screencap._stderr_events import (
+        EVENT_RECORDING_FINALIZED,
+        EVENT_STARTED,
+        emit_event,
+    )
+    from screencap.daemon.supervisor import CLAIMANT_DAEMON
+    from screencap.session import run_recording_worker
+
+    queues = [
+        multiprocessing.Queue(),
+        multiprocessing.Queue(),
+        multiprocessing.Queue(),
+    ]
+    args.setdefault("_window_feed_q", queues[0])
+    args.setdefault("_override_q", queues[1])
+    args.setdefault("_disable_q", queues[2])
+    args.setdefault("_network_handoff_ready", None)
+
+    def drain_queue(q: multiprocessing.Queue) -> None:
+        while True:
+            try:
+                q.get()
+            # `EOFError` / `OSError` close the underlying pipe; `ValueError`
+            # is raised on get() against a closed queue. Anything else is a
+            # real bug — let it propagate.
+            except (EOFError, OSError, ValueError):
+                return
+
+    for q in queues:
+        threading.Thread(target=drain_queue, args=(q,), daemon=True).start()
+
+    emit_event(EVENT_STARTED, claimant=CLAIMANT_DAEMON)
+    run_recording_worker(args)
+
+    ready_meta: dict[str, Any] = {}
+    capture_dir = args.get("capture_dir_hint") or args.get("output_dir")
+    if capture_dir:
+        try:
+            ready_path = Path(str(capture_dir)) / ".recording_ready"
+            if ready_path.exists():
+                ready_meta = json.loads(ready_path.read_text() or "{}")
+        except Exception:
+            ready_meta = {}
+    emit_event(
+        EVENT_RECORDING_FINALIZED,
+        name=args.get("name"),
+        duration_seconds=float(ready_meta.get("elapsed", 0.0)),
+        force_stopped=bool(ready_meta.get("force_stopped", False)),
+        disk_full=bool(ready_meta.get("disk_full", False)),
+    )
+
+
 # ---------------------------------------------------------------------------
 # Unit 8a: structured stderr event contract
 # ---------------------------------------------------------------------------
@@ -3919,6 +4040,34 @@ def _check_keyring_macos_backend() -> tuple[str, bool, str]:
         return name, False, _tb.format_exc()
 
 
+def _check_daemon_load() -> tuple[str, bool, str]:
+    """Construct the daemon ASGI app and verify required routes register."""
+    name = "daemon_load"
+    try:
+        from screencap.daemon.app import build_app
+
+        app = build_app()
+        if not app.routes:
+            return name, False, "app constructed but has no routes"
+        paths = {getattr(route, "path", None) for route in app.routes}
+        required = {
+            "/v0/daemon.info",
+            "/v0/recording.list",
+            "/v0/session.snapshot",
+            "/v0/events",
+            "/v0/recording.start",
+            "/v0/recording.stop",
+        }
+        missing = required - paths
+        if missing:
+            return name, False, f"missing routes: {sorted(missing)}"
+        return name, True, ""
+    except BaseException:
+        import traceback as _tb
+
+        return name, False, _tb.format_exc()
+
+
 @cli.group("network")
 def network_group() -> None:
     """Manage the network capture CA + recover from crashes."""
@@ -4169,6 +4318,7 @@ _SMOKE_CHECKS = [
     _check_domain_index,
     _check_onnxruntime_excluded,
     _check_keyring_macos_backend,
+    _check_daemon_load,
 ]
 
 

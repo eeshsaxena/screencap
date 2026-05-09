@@ -27,6 +27,8 @@ enum CLIError: LocalizedError {
 /// Owns Process spawning, stderr line streaming, and JSON parsing for the bundled
 /// screencap CLI. Resolves the binary from `Contents/Resources/screencap/screencap`
 /// in the bundled app, with `SCREENCAP_CLI_PATH` env-var override for development.
+/// Daemon-backed app flows should use `DaemonClient`; this client remains as the
+/// Phase 1 reversibility and unavailable-daemon fallback path.
 ///
 /// Caseless enum — every member is `static`, there is no instance state, and
 /// `enum` prevents accidental instantiation that a `class` would allow.
