@@ -8,6 +8,7 @@ import OSLog
 /// Tail with: `log stream --predicate 'subsystem == "com.screencap.macos"'`.
 private let recorderLogger = Logger(subsystem: "com.screencap.macos", category: "recorder")
 private let SUPPORTED_EVENT_SCHEMA_VERSION = 1
+let SUPPORTED_API_SCHEMA_VERSION = 1
 
 /// State machine for the recording lifecycle. Mirrors the stderr event contract
 /// from `src/screencap/_stderr_events.py` (Unit 8a).
@@ -72,6 +73,9 @@ struct RecorderEventLine: Decodable {
     let permission: String?
     let changes: [String]?
     let optOutCommandExamples: [String]?
+    let cursor: Int?
+    let reason: String?
+    let ts: Double?
 
     enum CodingKeys: String, CodingKey {
         case type
@@ -80,7 +84,15 @@ struct RecorderEventLine: Decodable {
         case permission
         case changes
         case optOutCommandExamples = "opt_out_command_examples"
+        case cursor
+        case reason
+        case ts
     }
+}
+
+enum RecorderTransport: Equatable {
+    case daemon
+    case cliFallback
 }
 
 struct PrivacyMatrixDisclosure: Equatable, Identifiable {
@@ -97,6 +109,8 @@ final class RecorderController: ObservableObject {
     @Published private(set) var state: RecordingState = .idle
     @Published private(set) var lastError: String?
     @Published private(set) var matrixDisclosure: PrivacyMatrixDisclosure?
+    @Published private(set) var transport: RecorderTransport = .cliFallback
+    @Published private(set) var schemaMismatchDetected = false
     /// Surfaced in the menu bar dropdown during a Cmd+Q stop. Counts down
     /// from 300s while we wait for the `stopped` event.
     @Published private(set) var quitProgressSecondsRemaining: Int?
@@ -105,6 +119,7 @@ final class RecorderController: ObservableObject {
     private weak var permissions: PermissionController?
 
     private var spawn: CLIClient.SpawnedProcess?
+    private var daemonEventTask: Task<Void, Never>?
     private var elapsedTimer: Timer?
     private var permissionWatchdog: Timer?
     private var permissionObserver: NSObjectProtocol?
@@ -124,6 +139,7 @@ final class RecorderController: ObservableObject {
     }
 
     deinit {
+        daemonEventTask?.cancel()
         elapsedTimer?.invalidate()
         permissionWatchdog?.invalidate()
         if let observer = permissionObserver {
@@ -143,6 +159,55 @@ final class RecorderController: ObservableObject {
         lastError = nil
         state = .starting
 
+        switch transport {
+        case .daemon:
+            Task { await startViaDaemon(name: name) }
+        case .cliFallback:
+            startViaCLI(name: name)
+        }
+    }
+
+    func probeDaemon() async {
+        do {
+            _ = try await DaemonClient.daemonInfo()
+            schemaMismatchDetected = false
+            transport = .daemon
+        } catch DaemonClientError.schemaMismatch {
+            schemaMismatchDetected = true
+            transport = .cliFallback
+        } catch {
+            recorderLogger.info("Daemon not reachable; using CLI fallback. Error: \(String(describing: error), privacy: .public)")
+            transport = .cliFallback
+        }
+    }
+
+    func reloadDaemon() async {
+        let process = Process()
+        process.executableURL = URL(fileURLWithPath: "/bin/launchctl")
+        process.arguments = ["kickstart", "-kp", "gui/\(getuid())/com.screencap.daemon"]
+        process.standardInput = FileHandle.nullDevice
+        process.standardOutput = Pipe()
+        process.standardError = Pipe()
+        do {
+            try process.run()
+            await withCheckedContinuation { (continuation: CheckedContinuation<Void, Never>) in
+                DispatchQueue.global(qos: .userInitiated).async {
+                    process.waitUntilExit()
+                    continuation.resume()
+                }
+            }
+            if process.terminationStatus == 0 {
+                schemaMismatchDetected = false
+                await probeDaemon()
+            } else {
+                lastError = "Failed to reload ScreenCap daemon."
+            }
+        } catch {
+            lastError = "Failed to reload ScreenCap daemon: \(error.localizedDescription)"
+        }
+    }
+
+    private func startViaCLI(name: String? = nil) {
         var args = ["start"]
         if let name { args.append(name) }
 
@@ -174,6 +239,20 @@ final class RecorderController: ObservableObject {
         } catch {
             state = .idle
             lastError = error.localizedDescription
+        }
+    }
+
+    private func startViaDaemon(name: String? = nil) async {
+        do {
+            _ = try await DaemonClient.recordingStart(
+                RecordingStartRequest(name: name, startedBy: "swiftui-via-daemon")
+            )
+            attachDaemonEventStream()
+            startPermissionWatchdog()
+        } catch {
+            handleDaemonOperationFailure(error, fallback: {
+                self.startViaCLI(name: name)
+            })
         }
     }
 
@@ -247,6 +326,11 @@ final class RecorderController: ObservableObject {
     /// we SIGKILL the recorder and let `.upload_followup.json` surface on
     /// next launch.
     private func runStop(quitting: Bool) async {
+        if transport == .daemon {
+            await runStopViaDaemon(quitting: quitting)
+            return
+        }
+
         do {
             _ = try CLIClient.runDetached(["stop"])
         } catch {
@@ -284,6 +368,42 @@ final class RecorderController: ObservableObject {
             if !success, let s = spawn, s.isRunning, s.processIdentifier > 0 {
                 kill(s.processIdentifier, SIGKILL)
                 lastError = "Stop timed out after 5 minutes; recorder force-killed."
+            }
+            state = .idle
+            NSApp.reply(toApplicationShouldTerminate: true)
+        } else {
+            if !success {
+                lastError = "Stop is still finalizing in the background."
+            }
+            state = .idle
+        }
+    }
+
+    private func runStopViaDaemon(quitting: Bool) async {
+        do {
+            _ = try await DaemonClient.recordingStop(RecordingStopRequest(force: false))
+        } catch {
+            handleDaemonOperationFailure(error)
+            if quitting {
+                quitProgressSecondsRemaining = nil
+                NSApp.reply(toApplicationShouldTerminate: false)
+            }
+            if state.isStopping {
+                let restoredElapsed = recordingStartedAt.map { Date().timeIntervalSince($0) } ?? 0
+                state = .recording(elapsed: restoredElapsed)
+            }
+            return
+        }
+
+        let timeout: TimeInterval = quitting ? 300 : 30
+        let success = quitting
+            ? await awaitStoppedEvent(timeout: timeout)
+            : await awaitFinalizedEvent(timeout: timeout)
+
+        if quitting {
+            quitProgressSecondsRemaining = nil
+            if !success {
+                lastError = "Stop timed out after 5 minutes; recorder finalization may still be running."
             }
             state = .idle
             NSApp.reply(toApplicationShouldTerminate: true)
@@ -356,7 +476,10 @@ final class RecorderController: ObservableObject {
         guard !trimmed.isEmpty, trimmed.hasPrefix("{") else { return }
         guard let data = trimmed.data(using: .utf8) else { return }
         guard let event = try? JSONDecoder().decode(RecorderEventLine.self, from: data) else { return }
+        handleRecorderEvent(event)
+    }
 
+    private func handleRecorderEvent(_ event: RecorderEventLine) {
         // Schema-drift guard: warn (don't fail) so we keep working under minor
         // additions while making major-version drift visible in Console.app.
         // Decision on user-facing behavior for a major bump tracked separately.
@@ -396,6 +519,12 @@ final class RecorderController: ObservableObject {
                 changes: event.changes ?? [],
                 optOutCommandExamples: event.optOutCommandExamples ?? []
             )
+        case "_close":
+            if event.reason == "shutdown" {
+                recorderLogger.info("Daemon event stream closed for shutdown.")
+            } else if let reason = event.reason {
+                recorderLogger.info("Daemon event stream closed: \(reason, privacy: .public)")
+            }
         default:
             // Active Python events the Swift consumer doesn't model (e.g.
             // lock_contended) — log so drift is detectable; the engine handles
@@ -404,11 +533,82 @@ final class RecorderController: ObservableObject {
         }
     }
 
+    private func attachDaemonEventStream() {
+        daemonEventTask?.cancel()
+        daemonEventTask = Task { [weak self] in
+            await self?.consumeDaemonEvents()
+        }
+    }
+
+    private func consumeDaemonEvents() async {
+        while !Task.isCancelled, state.isRecording {
+            do {
+                let snapshot = try await DaemonClient.sessionSnapshot()
+                if snapshot.isRecording == true, snapshot.daemonOwned == false {
+                    lastError = "Another process is recording."
+                    state = .idle
+                    return
+                }
+                if snapshot.recovering {
+                    lastError = "ScreenCap daemon is recovering the previous recording session."
+                }
+
+                for try await event in DaemonClient.subscribe(sinceCursor: snapshot.cursor) {
+                    if Task.isCancelled { return }
+                    handleRecorderEvent(event)
+                    if event.type == "_close", event.reason == "shutdown" {
+                        return
+                    }
+                }
+            } catch DaemonClientError.streamClosed(let reason) {
+                if Task.isCancelled { return }
+                recorderLogger.info("Daemon event stream dropped; reconnecting. Reason: \(reason, privacy: .public)")
+            } catch {
+                if Task.isCancelled { return }
+                handleDaemonOperationFailure(error)
+            }
+
+            if state.isRecording {
+                try? await Task.sleep(nanoseconds: 100_000_000)
+            }
+        }
+    }
+
+    private func handleDaemonOperationFailure(_ error: Error, fallback: (() -> Void)? = nil) {
+        switch error {
+        case DaemonClientError.schemaMismatch:
+            schemaMismatchDetected = true
+            transport = .cliFallback
+            state = .idle
+            lastError = "ScreenCap daemon needs to reload."
+        case DaemonClientError.socketUnavailable, DaemonClientError.connectionFailed:
+            recorderLogger.info("Daemon transport failed; falling back to CLI. Error: \(String(describing: error), privacy: .public)")
+            transport = .cliFallback
+            fallback?()
+        case DaemonClientError.envelopeError(let code, _):
+            if code == "lock_contended" || code == "not_owned_by_daemon" {
+                lastError = "ScreenCap is already recording."
+            } else {
+                lastError = error.localizedDescription
+            }
+            if state.isRecording {
+                state = .idle
+            }
+        default:
+            lastError = error.localizedDescription
+            if state.isRecording {
+                state = .idle
+            }
+        }
+    }
+
     private func handleProcessTerminated(exitCode: Int32) {
         elapsedTimer?.invalidate()
         elapsedTimer = nil
         stopPermissionWatchdog()
         spawn = nil
+        daemonEventTask?.cancel()
+        daemonEventTask = nil
         recordingStartedAt = nil
 
         // If we never saw a `stopped` event and the process is gone, resolve

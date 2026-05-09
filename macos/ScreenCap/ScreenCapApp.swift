@@ -20,6 +20,9 @@ struct ScreenCapApp: App {
                     recorder.bindIndex(index)
                     recorder.bindPermissions(permissions)
                 }
+                .task {
+                    await recorder.probeDaemon()
+                }
         }
         .windowResizability(.contentSize)
         .commands {
