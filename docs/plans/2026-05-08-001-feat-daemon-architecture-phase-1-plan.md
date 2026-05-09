@@ -1,7 +1,7 @@
 ---
 title: "feat: Daemon architecture — Phase 1 (API extraction + SwiftUI migration)"
 type: feat
-status: active
+status: completed
 date: 2026-05-08
 origin: docs/brainstorms/2026-05-08-cli-gui-mcp-architecture-requirements.md
 ---
