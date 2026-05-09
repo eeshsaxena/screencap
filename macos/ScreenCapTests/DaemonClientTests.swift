@@ -112,8 +112,13 @@ final class DaemonClientTests: XCTestCase {
                 RecordingStartRequest(name: "blocked", startedBy: "swiftui-via-daemon")
             )
             XCTFail("Expected envelope error")
-        } catch DaemonClientError.envelopeError(let code, let payload) {
+        } catch DaemonClientError.envelopeError(let code, let rawBody) {
             XCTAssertEqual(code, "lock_contended")
+            // Decode off the raw body — the error case carries bytes, not a
+            // [String: Any] payload, to keep the enum Sendable.
+            let payload = try XCTUnwrap(
+                JSONSerialization.jsonObject(with: rawBody) as? [String: Any]
+            )
             XCTAssertNotNil(payload["owner"])
         } catch {
             XCTFail("Unexpected error: \(error)")

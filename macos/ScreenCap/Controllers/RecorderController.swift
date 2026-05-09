@@ -10,6 +10,13 @@ private let recorderLogger = Logger(subsystem: "com.screencap.macos", category: 
 private let SUPPORTED_EVENT_SCHEMA_VERSION = 1
 let SUPPORTED_API_SCHEMA_VERSION = 1
 
+/// Wire-level daemon envelope error codes the controller branches on.
+/// Mirrors `src/screencap/daemon/errors.py`'s string constants.
+enum DaemonErrorCode {
+    static let lockContended = "lock_contended"
+    static let notOwnedByDaemon = "not_owned_by_daemon"
+}
+
 /// State machine for the recording lifecycle. Mirrors the stderr event contract
 /// from `src/screencap/_stderr_events.py` (Unit 8a).
 enum RecordingState: Equatable {
@@ -557,7 +564,17 @@ final class RecorderController: ObservableObject {
     }
 
     private func consumeDaemonEvents() async {
+        // Capped exponential backoff for reconnects: a flat 100ms sleep would
+        // hammer a daemon that is genuinely down, and a successful pass should
+        // reset the dial. After `maxConsecutiveFailures` we give up and
+        // surface the loss to the UI so the user can act.
+        var consecutiveFailures = 0
+        let maxConsecutiveFailures = 10
+        let baseBackoff: TimeInterval = 0.1
+        let cappedBackoff: TimeInterval = 30.0
+
         while !Task.isCancelled, state.isRecording {
+            var sawProgress = false
             do {
                 let snapshot = try await DaemonClient.sessionSnapshot()
                 if snapshot.isRecording == true, snapshot.daemonOwned == false {
@@ -571,6 +588,7 @@ final class RecorderController: ObservableObject {
 
                 for try await event in DaemonClient.subscribe(sinceCursor: snapshot.cursor) {
                     if Task.isCancelled { return }
+                    sawProgress = true
                     handleRecorderEvent(event)
                     if event.type == "_close", event.reason == "shutdown" {
                         return
@@ -584,8 +602,21 @@ final class RecorderController: ObservableObject {
                 handleDaemonOperationFailure(error)
             }
 
+            if sawProgress {
+                consecutiveFailures = 0
+            } else {
+                consecutiveFailures += 1
+                if consecutiveFailures >= maxConsecutiveFailures {
+                    state = .idle
+                    lastError = "Lost contact with daemon"
+                    return
+                }
+            }
+
             if state.isRecording {
-                try? await Task.sleep(nanoseconds: 100_000_000)
+                let attempt = max(0, consecutiveFailures - 1)
+                let backoff = min(baseBackoff * pow(2.0, Double(attempt)), cappedBackoff)
+                try? await Task.sleep(nanoseconds: UInt64(backoff * 1_000_000_000))
             }
         }
     }
@@ -600,9 +631,14 @@ final class RecorderController: ObservableObject {
         case DaemonClientError.socketUnavailable, DaemonClientError.connectionFailed:
             recorderLogger.info("Daemon transport failed; falling back to CLI. Error: \(String(describing: error), privacy: .public)")
             transport = .cliFallback
+            // Without resetting `state`, a failed start leaves the controller
+            // stuck in `.starting`; surface the failure to the user and clear
+            // the in-flight state so a retry (or CLI fallback) can take over.
+            state = .idle
+            lastError = "Daemon socket unavailable"
             fallback?()
         case DaemonClientError.envelopeError(let code, _):
-            if code == "lock_contended" || code == "not_owned_by_daemon" {
+            if code == DaemonErrorCode.lockContended || code == DaemonErrorCode.notOwnedByDaemon {
                 lastError = "ScreenCap is already recording."
             } else {
                 lastError = error.localizedDescription

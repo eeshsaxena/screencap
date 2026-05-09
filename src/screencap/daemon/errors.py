@@ -17,6 +17,12 @@ ROGUE_FILE = "rogue_file"
 RECONCILING = "reconciling"
 FORCE_MISMATCH = "force_mismatch"
 
+# Codes returned by the daemon outside the typed-exception paths (route
+# handler `except Exception`, query-string parse failures). Keeping them
+# as named constants prevents drift between handlers and tests.
+ERROR_CODE_INTERNAL = "internal_error"
+ERROR_CODE_INVALID_CURSOR = "invalid_cursor"
+
 EXCEPTION_TO_ERROR_CODE: dict[type["DaemonAPIError"], str] = {}
 
 
@@ -124,6 +130,7 @@ class DaemonAPIError(Exception):
 
     error_code: ClassVar[str]
     http_status: int = 500
+    http_headers: ClassVar[dict[str, str]] = {}
 
     def __init__(self, *, schema_version: int, http_status: int | None = None) -> None:
         self.schema_version = schema_version
@@ -133,6 +140,10 @@ class DaemonAPIError(Exception):
 
     def envelope(self) -> dict[str, Any]:
         return error_envelope(schema_version=self.schema_version, error=self.error_code)
+
+    def response_headers(self) -> dict[str, str]:
+        """Per-error advisory headers (e.g. ``Retry-After``)."""
+        return dict(self.http_headers)
 
     def __init_subclass__(cls, **kwargs: Any) -> None:
         super().__init_subclass__(**kwargs)
@@ -278,6 +289,10 @@ class RogueFileError(DaemonAPIError):
 class ReconcilingError(DaemonAPIError):
     error_code = RECONCILING
     http_status = 503
+    # 5s sits between the SwiftUI client's 10s request timeout and the
+    # daemon's 30s reconcile grace; long enough that the client doesn't
+    # spin a tight retry, short enough to avoid burning the entire timeout.
+    http_headers: ClassVar[dict[str, str]] = {"Retry-After": "5"}
 
     def envelope(self) -> dict[str, Any]:
         return reconciling_envelope(schema_version=self.schema_version)
@@ -301,6 +316,8 @@ __all__ = [
     "ROGUE_FILE",
     "RECONCILING",
     "FORCE_MISMATCH",
+    "ERROR_CODE_INTERNAL",
+    "ERROR_CODE_INVALID_CURSOR",
     "EXCEPTION_TO_ERROR_CODE",
     "error_envelope",
     "lock_contended_envelope",

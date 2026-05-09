@@ -135,7 +135,13 @@ def _download_nlp_models() -> None:
 @click.option("--install", is_flag=True, help="Install LaunchAgent and start daemon.")
 @click.option("--uninstall", is_flag=True, help="Stop daemon and remove LaunchAgent.")
 @click.option("--status", "show_status", is_flag=True, help="Print daemon LaunchAgent status.")
-def serve(socket_path, self_test, install, uninstall, show_status):
+def serve(
+    socket_path: str | None,
+    self_test: bool,
+    install: bool,
+    uninstall: bool,
+    show_status: bool,
+) -> None:
     """Run the ScreenCap daemon, or manage its LaunchAgent."""
     if sum(bool(flag) for flag in (install, uninstall, show_status)) > 1:
         raise click.UsageError("--install, --uninstall, and --status are mutually exclusive.")
@@ -177,12 +183,13 @@ def serve(socket_path, self_test, install, uninstall, show_status):
 
 @cli.command("_engine-worker", hidden=True)
 @click.argument("encoded_args")
-def _engine_worker_cmd(encoded_args):
+def _engine_worker_cmd(encoded_args: str) -> None:
     """Hidden subprocess entry point spawned by the daemon supervisor."""
     import base64
     import multiprocessing
     import threading
     from pathlib import Path
+    from typing import Any
 
     args = json.loads(base64.b64decode(encoded_args).decode("utf-8"))
     from screencap._stderr_events import (
@@ -190,6 +197,7 @@ def _engine_worker_cmd(encoded_args):
         EVENT_STARTED,
         emit_event,
     )
+    from screencap.daemon.supervisor import CLAIMANT_DAEMON
     from screencap.session import run_recording_worker
 
     queues = [
@@ -202,20 +210,23 @@ def _engine_worker_cmd(encoded_args):
     args.setdefault("_disable_q", queues[2])
     args.setdefault("_network_handoff_ready", None)
 
-    def drain_queue(q) -> None:
+    def drain_queue(q: multiprocessing.Queue) -> None:
         while True:
             try:
                 q.get()
-            except Exception:
+            # `EOFError` / `OSError` close the underlying pipe; `ValueError`
+            # is raised on get() against a closed queue. Anything else is a
+            # real bug — let it propagate.
+            except (EOFError, OSError, ValueError):
                 return
 
     for q in queues:
         threading.Thread(target=drain_queue, args=(q,), daemon=True).start()
 
-    emit_event(EVENT_STARTED, claimant="daemon")
+    emit_event(EVENT_STARTED, claimant=CLAIMANT_DAEMON)
     run_recording_worker(args)
 
-    ready_meta: dict = {}
+    ready_meta: dict[str, Any] = {}
     capture_dir = args.get("capture_dir_hint") or args.get("output_dir")
     if capture_dir:
         try:

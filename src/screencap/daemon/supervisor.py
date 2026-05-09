@@ -6,23 +6,32 @@ import asyncio
 import base64
 import json
 import logging
+import math
 import os
 import subprocess
 import sys
 import time
 from collections.abc import Callable
 from pathlib import Path
-from typing import Any
+from typing import TYPE_CHECKING, Any
 
 import psutil
 
 from screencap import _stderr_events
 from screencap.daemon import errors, schema
-from screencap.daemon.event_bus import EventBus
+from screencap.daemon.event_bus import EventBus, _Subscription
+
+if TYPE_CHECKING:
+    from screencap.daemon.schema import RecordingStartRequest
 
 logger = logging.getLogger(__name__)
 
 EngineCommandFactory = Callable[[str], list[str]]
+
+# Canonical claimant identifier the daemon writes into the pidfile lock
+# metadata. Mirrored at supervisor.py call sites, app.py daemon-owned
+# detection, and cli.py engine-worker started event.
+CLAIMANT_DAEMON = "daemon"
 
 
 class _PopenEngineProcess:
@@ -164,7 +173,7 @@ class Supervisor:
             snapshot["engine_pid"] = self._engine_pid
         return snapshot
 
-    async def spawn(self, request: Any) -> dict[str, Any]:
+    async def spawn(self, request: "RecordingStartRequest") -> dict[str, Any]:
         """Claim the daemon lock, spawn the engine worker, and await started."""
         async with self._operation_lock:
             if self._recovering:
@@ -181,7 +190,7 @@ class Supervisor:
             from screencap import pidfile
 
             try:
-                pidfile.claim_lock(None, claimant="daemon")
+                pidfile.claim_lock(None, claimant=CLAIMANT_DAEMON)
             except pidfile.LockContended as exc:
                 raise errors.LockContendedError(
                     exc.owner,
@@ -190,7 +199,7 @@ class Supervisor:
 
             name, capture_dir = self._allocate_capture_dir(request)
             started_at = time.time()
-            started_by = getattr(request, "started_by", None)
+            started_by = request.started_by
             pidfile.update_lock_metadata(
                 capture_dir,
                 recording_started_at=started_at,
@@ -232,9 +241,16 @@ class Supervisor:
                     timeout=self._startup_timeout,
                 )
             except Exception:
-                await self._terminate_current_process(force=True)
-                self._release_daemon_lock()
-                self._reset_state()
+                # Cancel the background pump/poll tasks before tearing down so
+                # they don't race the lock release with a late `_handle_engine_exit`.
+                for _t in (self._stderr_task, self._poll_task):
+                    if _t is not None and not _t.done():
+                        _t.cancel()
+                try:
+                    await self._terminate_current_process(force=True)
+                finally:
+                    self._release_daemon_lock()
+                    self._reset_state()
                 raise
             finally:
                 await self._bus.remove(started_sub)
@@ -266,7 +282,7 @@ class Supervisor:
                 return {"stopped": False, "final_state": "no_recording"}
 
             claimant = metadata.get("claimant")
-            if claimant != "daemon":
+            if claimant != CLAIMANT_DAEMON:
                 if not force:
                     raise errors.NotOwnedByDaemonError(
                         claimant,
@@ -355,7 +371,12 @@ class Supervisor:
                     rc = await proc.wait(timeout=2.0)
                 except asyncio.TimeoutError:
                     proc.kill()
-                    rc = await proc.wait(timeout=2.0)
+                    try:
+                        rc = await proc.wait(timeout=2.0)
+                    except asyncio.TimeoutError:
+                        # Zombie post-SIGKILL — proceed with teardown so
+                        # `_release_daemon_lock` + `_reset_state` below still run.
+                        rc = -9
                 await self._handle_engine_exit(proc, rc)
             finally:
                 await self._bus.remove(final_sub)
@@ -377,7 +398,7 @@ class Supervisor:
         self._recovering = True
         try:
             metadata = pidfile.read_lock_metadata()
-            if not metadata or metadata.get("claimant") != "daemon":
+            if not metadata or metadata.get("claimant") != CLAIMANT_DAEMON:
                 return
             engine_pid = metadata.get("engine_pid") or metadata.get("pid")
             if not isinstance(engine_pid, int):
@@ -449,11 +470,18 @@ class Supervisor:
                         _stderr_events.EVENT_ENGINE_CRASHED,
                         exit_code=rc,
                     )
+                started_at = (self._session_state or {}).get(
+                    "started_at", time.time()
+                )
                 await self._publish_daemon_event(
                     _stderr_events.EVENT_RECORDING_FINALIZED,
                     name=(self._session_state or {}).get("recording_name"),
-                    duration_seconds=0.0,
-                    force_stopped=(rc != 0 or self._stopping),
+                    duration_seconds=max(0.0, time.time() - started_at),
+                    # Crash path: `force_stopped` reflects whether the engine
+                    # exited non-zero. Operator-initiated stops have already
+                    # delivered the engine's own finalized event, so a
+                    # synthesized event here is purely the crash signal.
+                    force_stopped=(rc != 0),
                     disk_full=False,
                 )
                 self._finalized_seen = True
@@ -474,7 +502,7 @@ class Supervisor:
 
     async def _wait_on_subscription(
         self,
-        sub: Any,
+        sub: _Subscription,
         event_type: str,
         *,
         timeout: float,
@@ -507,16 +535,29 @@ class Supervisor:
             )
         actual_pid = metadata.get("pid")
         actual_started_at = metadata.get("started_at")
-        if actual_pid != expected_claimant_pid or actual_started_at != expected_started_at:
+        # `started_at` round-trips as a JSON float through the wire; use
+        # `math.isclose` instead of `!=` so micro-rounding from the
+        # serialize/deserialize hop doesn't fail an otherwise-valid CAS.
+        started_at_match = (
+            isinstance(actual_started_at, (int, float))
+            and isinstance(expected_started_at, (int, float))
+            and math.isclose(
+                float(actual_started_at),
+                float(expected_started_at),
+                rel_tol=1e-9,
+                abs_tol=1e-6,
+            )
+        )
+        if actual_pid != expected_claimant_pid or not started_at_match:
             raise errors.ForceMismatchError(
                 schema_version=schema._RECORDING_STOP_API_VERSION
             )
 
-    def _allocate_capture_dir(self, request: Any) -> tuple[str, Path]:
+    def _allocate_capture_dir(self, request: "RecordingStartRequest") -> tuple[str, Path]:
         from screencap.config import get_recordings_dir
 
-        requested_name = getattr(request, "name", None)
-        requested_output = getattr(request, "output_dir", None)
+        requested_name = request.name
+        requested_output = request.output_dir
         base_name = requested_name or time.strftime("rec-%Y%m%dT%H%M%S")
         if requested_output:
             capture_dir = Path(requested_output).expanduser()
@@ -532,11 +573,14 @@ class Supervisor:
                 return name, candidate
         raise RuntimeError(f"could not allocate capture dir for {base_name!r}")
 
-    def _worker_args(self, request: Any, *, name: str, capture_dir: Path) -> dict[str, Any]:
-        if hasattr(request, "model_dump"):
-            args = request.model_dump()
-        else:
-            args = dict(request)
+    def _worker_args(
+        self,
+        request: "RecordingStartRequest",
+        *,
+        name: str,
+        capture_dir: Path,
+    ) -> dict[str, Any]:
+        args = request.model_dump()
         args["name"] = name
         args["output_dir"] = str(capture_dir)
         args["capture_dir_hint"] = str(capture_dir)
@@ -547,7 +591,7 @@ class Supervisor:
 
         return pidfile.read_lock_metadata() or {
             "pid": os.getpid(),
-            "claimant": "daemon",
+            "claimant": CLAIMANT_DAEMON,
             "engine_pid": self._engine_pid,
         }
 
@@ -562,7 +606,12 @@ class Supervisor:
             rc = await self._proc.wait(timeout=2.0)
         except asyncio.TimeoutError:
             self._proc.kill()
-            rc = await self._proc.wait(timeout=2.0)
+            try:
+                rc = await self._proc.wait(timeout=2.0)
+            except asyncio.TimeoutError:
+                # Zombie post-SIGKILL — treat as killed so callers (notably
+                # `spawn()`'s failure path) still complete teardown.
+                rc = -9
         await self._handle_engine_exit(self._proc, rc)
 
     async def _terminate_pid(self, pid: int, *, grace: float) -> bool:

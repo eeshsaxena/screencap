@@ -9,8 +9,8 @@ import subprocess
 import sys
 import time
 import uuid
+from collections.abc import Callable, Iterator
 from pathlib import Path
-from typing import Iterator
 
 import httpx
 import pytest
@@ -83,7 +83,7 @@ def serve_process(daemon_env: dict[str, str], daemon_socket_path: Path) -> Itera
 
 
 @pytest.fixture
-def uds_client_factory(daemon_socket_path: Path):
+def uds_client_factory(daemon_socket_path: Path) -> Callable[[], httpx.AsyncClient]:
     def factory() -> httpx.AsyncClient:
         transport = httpx.AsyncHTTPTransport(uds=str(daemon_socket_path))
         return httpx.AsyncClient(transport=transport, base_url="http://screencap")

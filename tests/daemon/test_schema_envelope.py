@@ -135,6 +135,7 @@ def test_all_none_snapshot_fields_keep_symmetric_envelope_shape() -> None:
                 "schema_version": schema._RECORDING_START_API_VERSION,
                 "session_id": "session-1",
                 "started_at": 1778198400.0,
+                "engine_pid": 12345,
                 "cursor": 7,
             },
         ),

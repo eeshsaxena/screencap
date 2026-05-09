@@ -5,11 +5,10 @@ from __future__ import annotations
 import asyncio
 import os
 import signal
-import sys
 import tempfile
+from collections.abc import Callable
 from pathlib import Path
 from types import FrameType
-from typing import Callable
 
 SignalHandler = Callable[[int, FrameType | None], None]
 
@@ -131,9 +130,6 @@ def serve(socket_path: str | Path | None = None, *, self_test: bool = False) -> 
 
 
 def _print_stderr(message: str) -> None:
-    try:
-        from rich.console import Console
+    from rich.console import Console
 
-        Console(stderr=True).print(message)
-    except Exception:
-        print(message, file=sys.stderr)
+    Console(stderr=True).print(message)

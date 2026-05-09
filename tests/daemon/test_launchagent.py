@@ -11,11 +11,16 @@ from pathlib import Path
 import pytest
 
 
-def _completed(cmd: list[str], returncode: int = 0, stderr: str = "", stdout: str = ""):
+def _completed(
+    cmd: list[str],
+    returncode: int = 0,
+    stderr: str = "",
+    stdout: str = "",
+) -> subprocess.CompletedProcess[str]:
     return subprocess.CompletedProcess(cmd, returncode, stdout=stdout, stderr=stderr)
 
 
-def _parse_plist(content: bytes) -> dict:
+def _parse_plist(content: bytes) -> dict[str, object]:
     return plistlib.loads(content)
 
 

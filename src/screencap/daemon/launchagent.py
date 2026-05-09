@@ -205,7 +205,20 @@ def uninstall(*, plist_path: Path | None = None) -> UninstallResult:
         text=True,
     )
     stderr = bootout.stderr or ""
-    if bootout.returncode != 0 and not _is_not_loaded(stderr):
+    bootout_failed = bootout.returncode != 0 and not _is_not_loaded(stderr)
+
+    # Clean the UDS socket regardless of bootout outcome: a stale
+    # `~/.screencap/run/api.sock` after a crashed daemon would otherwise
+    # block the next install's bind. `cleanup_socket` is filesystem-only
+    # and idempotent, so running it on the failure path is safe.
+    from screencap.daemon.socket import cleanup_socket, default_socket_path
+
+    try:
+        cleanup_socket(default_socket_path())
+    except OSError:
+        logger.debug("cleanup_socket failed during uninstall", exc_info=True)
+
+    if bootout_failed:
         return UninstallResult(
             state="uninstall_failed_launchctl_bootout_failed",
             plist_path=resolved_plist_path,

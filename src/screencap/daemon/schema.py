@@ -131,6 +131,7 @@ def _load_models() -> dict[str, Any]:
     class RecordingStartResponse(EnvelopeResponse):
         session_id: str
         started_at: float
+        engine_pid: int
         # `cursor` is the bus cursor captured BEFORE the engine spawn — clients
         # subscribe to /v0/events?since=<cursor> after start to receive the
         # `started` event without an extra `session.snapshot` round-trip.
@@ -156,7 +157,9 @@ def _load_models() -> dict[str, Any]:
         "RecordingStopRequest": RecordingStopRequest,
         "RecordingStopResponse": RecordingStopResponse,
     }
-    globals().update(_MODELS)
+    # `__getattr__` below dispatches every documented model name through
+    # `_MODELS`, so injecting them into `globals()` would just shadow that
+    # path with a stale reference on reload.
     return _MODELS
 
 

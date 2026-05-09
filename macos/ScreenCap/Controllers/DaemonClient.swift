@@ -11,7 +11,12 @@ enum DaemonClientError: LocalizedError {
     case httpError(status: Int, body: String)
     case decode(underlying: Error, raw: String)
     case schemaMismatch(expected: Int, got: Int)
-    case envelopeError(code: String, payload: [String: Any])
+    // `rawBody` is the original response body (after envelope parse confirmed
+    // it was a daemon error). Callers that need fields beyond `code` decode
+    // it themselves — keeping the bytes here means the error case stays
+    // `Sendable` and avoids a `[String: Any]` payload that breaks under
+    // SWIFT_STRICT_CONCURRENCY: complete.
+    case envelopeError(code: String, rawBody: Data)
     case timedOut(seconds: TimeInterval)
     case streamClosed(reason: String)
 
@@ -129,6 +134,7 @@ struct RecordingStartResponse: Decodable {
     let apiSchemaVersion: Int
     let sessionID: String
     let startedAt: Double
+    let enginePID: Int
     /// Bus cursor captured BEFORE the engine spawn — feed into
     /// `/v0/events?since=<cursor>` to receive the `started` event without
     /// an extra `session.snapshot` round-trip.
@@ -141,6 +147,7 @@ struct RecordingStartResponse: Decodable {
         case apiSchemaVersion = "api_schema_version"
         case sessionID = "session_id"
         case startedAt = "started_at"
+        case enginePID = "engine_pid"
         case cursor
     }
 }
@@ -271,7 +278,7 @@ enum DaemonClient {
                         guard crlf == Data("\r\n".utf8) else {
                             throw DaemonClientError.streamClosed(reason: "invalid chunk terminator")
                         }
-                        for line in lines.feed(chunk) {
+                        for line in try lines.feed(chunk) {
                             let trimmed = line.trimmingCharacters(in: .whitespacesAndNewlines)
                             guard !trimmed.isEmpty, let data = trimmed.data(using: .utf8) else { continue }
                             do {
@@ -480,7 +487,9 @@ enum DaemonClient {
             let raw = String(data: body, encoding: .utf8) ?? "<binary>"
             return .httpError(status: fallbackStatus, body: raw)
         }
-        return .envelopeError(code: code, payload: payload)
+        // Carry the raw body forward; callers reach for typed fields by
+        // decoding off `rawBody` when they need them.
+        return .envelopeError(code: code, rawBody: body)
     }
 
     private static func withTimeout<T>(
@@ -572,9 +581,15 @@ extension DaemonClient {
 }
 
 private struct NDJSONLineBuffer {
+    // Cap a single un-terminated line at 1 MiB so a malformed (or hostile)
+    // peer cannot grow `pending` without bound. Daemon NDJSON events are
+    // tens of bytes; 1 MiB is several orders of magnitude above any
+    // legitimate frame.
+    static let maxLineBytes = 1_048_576
+
     private var pending = Data()
 
-    mutating func feed(_ data: Data) -> [String] {
+    mutating func feed(_ data: Data) throws -> [String] {
         pending.append(data)
         var lines: [String] = []
         while let nl = pending.firstIndex(of: 0x0A) {
@@ -583,6 +598,9 @@ private struct NDJSONLineBuffer {
             if let s = String(data: line, encoding: .utf8) {
                 lines.append(s)
             }
+        }
+        if pending.count > Self.maxLineBytes {
+            throw DaemonClientError.streamClosed(reason: "line too long")
         }
         return lines
     }

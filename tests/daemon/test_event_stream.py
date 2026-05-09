@@ -113,8 +113,11 @@ async def test_events_since_attaches_live_for_stale_cursor_and_rejects_future_cu
     await lines.aclose()
 
     # Future cursor (asking about events never emitted) — cursor_unknown.
+    # 410 Gone matches the typed CursorUnknownError exception status; this
+    # path produces the envelope without raising the exception so the wire
+    # contract is asserted explicitly here.
     response, _body = await _open_stream(app, f"/v0/events?since={current + 5}")
-    assert response.status_code == 400
+    assert response.status_code == 410
     assert response.media_type == "application/json"
     payload = json.loads(response.body)
     assert payload["ok"] is False

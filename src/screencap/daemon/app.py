@@ -4,10 +4,11 @@ from __future__ import annotations
 
 import asyncio
 import json
+import logging
 import os
 import time
 from contextlib import asynccontextmanager
-from typing import AsyncIterator
+from typing import Any, AsyncIterator
 
 from starlette.applications import Starlette
 from starlette.requests import Request
@@ -17,6 +18,9 @@ from starlette.routing import Route
 from screencap import _stderr_events
 from screencap.daemon import errors, schema
 from screencap.daemon.event_bus import EventBus
+from screencap.daemon.supervisor import CLAIMANT_DAEMON
+
+logger = logging.getLogger(__name__)
 
 _STARTED_AT = time.time()
 
@@ -51,11 +55,11 @@ async def daemon_info(_request: Request) -> JSONResponse:
     )
 
 
-async def recording_list(_request: Request) -> JSONResponse:
+async def recording_list(request: Request) -> JSONResponse:
     from screencap import catalog
 
     try:
-        recordings = catalog.list_recordings()
+        recordings = await asyncio.to_thread(catalog.list_recordings)
     except Exception as exc:
         return JSONResponse(
             errors.catalog_unreadable_envelope(
@@ -81,7 +85,11 @@ async def recording_list(_request: Request) -> JSONResponse:
                 )
             summaries.append(model(**data).model_dump(mode="json"))
     except Exception as exc:
-        return _internal_error_response(exc, schema_version=schema._LIST_API_VERSION)
+        return _internal_error_response(
+            exc,
+            schema_version=schema._LIST_API_VERSION,
+            request=request,
+        )
 
     return JSONResponse(
         schema.envelope(
@@ -96,7 +104,7 @@ def _empty_snapshot(
     is_recording: bool | None,
     cursor: int,
     recovering: bool = False,
-) -> dict:
+) -> dict[str, Any]:
     return schema.envelope(
         schema_version=schema._SNAPSHOT_API_VERSION,
         is_recording=is_recording,
@@ -117,13 +125,18 @@ async def session_snapshot(request: Request) -> JSONResponse:
     cursor = request.app.state.event_bus.current_cursor()
     supervisor = getattr(request.app.state, "supervisor", None)
     recovering = bool(supervisor and supervisor.is_recovering())
-    active = pidfile.lock_is_active()
-    metadata = pidfile.read_lock_metadata()
+
+    def _read_lock_state() -> tuple[bool, dict[str, Any] | None]:
+        # Pair the active/metadata read in one off-loop call so the event
+        # loop sees a single thread bounce per check, not two — and so the
+        # 50ms retry doesn't multiply into four blocking calls on the loop.
+        return pidfile.lock_is_active(), pidfile.read_lock_metadata()
+
+    active, metadata = await asyncio.to_thread(_read_lock_state)
 
     if active and metadata is None:
         await asyncio.sleep(0.05)
-        active = pidfile.lock_is_active()
-        metadata = pidfile.read_lock_metadata()
+        active, metadata = await asyncio.to_thread(_read_lock_state)
 
     if active and metadata is None:
         return JSONResponse(
@@ -136,7 +149,7 @@ async def session_snapshot(request: Request) -> JSONResponse:
         )
 
     claimant = metadata.get("claimant")
-    daemon_owned = claimant == "daemon"
+    daemon_owned = claimant == CLAIMANT_DAEMON
     # `recording_started_at` is the per-recording timestamp (cli.py and the
     # daemon both set it on session start). Long-lived holders like
     # SessionController claim the lock between recordings — they hold the
@@ -179,14 +192,27 @@ def _internal_error_response(
     exc: BaseException,
     *,
     schema_version: int,
+    request: Request | None = None,
 ) -> JSONResponse:
+    # Surface the traceback via the daemon stderr log; the wire envelope
+    # only carries the exception class name to keep details out of clients.
+    path = request.url.path if request is not None else "<unknown>"
+    logger.exception("internal error in %s", path, exc_info=exc)
     return JSONResponse(
         errors.error_envelope(
             schema_version=schema_version,
-            error="internal_error",
+            error=errors.ERROR_CODE_INTERNAL,
             reason=exc.__class__.__name__,
         ),
         status_code=500,
+    )
+
+
+def _api_error_response(exc: errors.DaemonAPIError) -> JSONResponse:
+    return JSONResponse(
+        exc.envelope(),
+        status_code=exc.http_status,
+        headers=exc.response_headers() or None,
     )
 
 
@@ -201,11 +227,12 @@ async def recording_start(request: Request) -> JSONResponse:
             )
         )
     except errors.DaemonAPIError as exc:
-        return JSONResponse(exc.envelope(), status_code=exc.http_status)
+        return _api_error_response(exc)
     except Exception as exc:
         return _internal_error_response(
             exc,
             schema_version=schema._RECORDING_START_API_VERSION,
+            request=request,
         )
 
 
@@ -224,11 +251,12 @@ async def recording_stop(request: Request) -> JSONResponse:
             )
         )
     except errors.DaemonAPIError as exc:
-        return JSONResponse(exc.envelope(), status_code=exc.http_status)
+        return _api_error_response(exc)
     except Exception as exc:
         return _internal_error_response(
             exc,
             schema_version=schema._RECORDING_STOP_API_VERSION,
+            request=request,
         )
 
 
@@ -246,7 +274,7 @@ async def events_stream(request: Request) -> JSONResponse | StreamingResponse:
             return JSONResponse(
                 errors.error_envelope(
                     schema_version=schema._EVENTS_API_VERSION,
-                    error="invalid_cursor",
+                    error=errors.ERROR_CODE_INVALID_CURSOR,
                     requested_cursor=since_param,
                 ),
                 status_code=400,
@@ -255,13 +283,15 @@ async def events_stream(request: Request) -> JSONResponse | StreamingResponse:
         # the events emitted in the gap and will catch up on the next live read
         # via the bus queue. Only `since > current` is genuinely unknown (the
         # client is asking about an event the daemon has never published).
+        # 410 Gone is the correct wire status: the cursor either was never
+        # produced or was evicted; a retry without remediation cannot succeed.
         if since > bus.current_cursor():
             return JSONResponse(
                 errors.cursor_unknown_envelope(
                     requested_cursor=since,
                     schema_version=schema._EVENTS_API_VERSION,
                 ),
-                status_code=400,
+                status_code=errors.CursorUnknownError.http_status,
             )
 
     sub = await bus.subscribe()
@@ -296,11 +326,16 @@ async def events_stream(request: Request) -> JSONResponse | StreamingResponse:
                             except asyncio.QueueEmpty:
                                 break
                             yield _ndjson(event)
+                    # `_close` mirrors the schema_version + cursor shape of
+                    # the `subscribed` frame and every published event so
+                    # parsers don't special-case the close marker.
                     yield _ndjson(
                         {
                             "type": "_close",
+                            "schema_version": _stderr_events.EVENT_SCHEMA_VERSION,
                             "reason": sub.close_reason or "unknown",
                             "ts": time.time(),
+                            "cursor": bus.current_cursor(),
                         }
                     )
                     break
