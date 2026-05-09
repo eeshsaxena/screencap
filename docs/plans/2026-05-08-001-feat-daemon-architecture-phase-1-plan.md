@@ -519,9 +519,9 @@ NDJSON. One JSON object per `\n`-terminated line. Events carry `{type, ts, schem
   - `ProcessType: Adaptive`
   - **No `LimitLoadToSessionType` key.** Earlier draft set this to `Aqua`; dropped because `gui/$UID` domain bootstrap implicitly requires an Aqua session anyway, and explicit `Aqua` would block legitimate headless-install paths (e.g., `screencap serve --install` over SSH where the user has launched a GUI session previously but isn't actively in one).
   - `ExitTimeOut: 30`
-  - `StandardErrorPath: ~/Library/Logs/ScreenCap/daemon.err.log`
-  - `StandardOutPath: ~/Library/Logs/ScreenCap/daemon.out.log`
-  - `EnvironmentVariables: { PATH: <safe default>, SCREENCAP_RUN_DIR: ~/.screencap/run }`
+  - **Path-valued plist keys** (`StandardErrorPath`, `StandardOutPath`, etc.): launchd does NOT expand `~` or `$HOME` in these keys (verified empirically on macOS 26.3 — see [docs/solutions/runtime-errors/launchd-plist-tilde-expansion-2026-05-09.md](docs/solutions/runtime-errors/launchd-plist-tilde-expansion-2026-05-09.md)). Two-mode `render_plist()`: bundled SMAppService plist omits both path keys (logs route to the unified system log via `log show --predicate 'process == "screencap"'`); CLI install path bakes the absolute log dir resolved via `Path.home()` at install time AND `mkdir -p`s it before `launchctl bootstrap`. Earlier drafts of this bullet recommended `~/Library/Logs/ScreenCap/daemon.{out,err}.log` literal — that recommendation is wrong and produces `EX_CONFIG` on every spawn.
+  - **`SCREENCAP_RUN_DIR` should NOT be set in EnvironmentVariables.** launchd does not expand `$HOME` in env-var values either; the daemon's own `default_socket_path()` resolves `~/.screencap/run/api.sock` via `Path.home()` at runtime. Earlier drafts that included `SCREENCAP_RUN_DIR: ~/.screencap/run` would plant a literal `~` path on every machine but the developer's.
+  - `EnvironmentVariables: { PATH: <safe default> }` — PATH only.
   - No `WatchPaths`, no `Sockets`, no `MachServices`.
 - Smoke-test addition: `screencap _smoke-test` already validates 9 critical subsystems load. Add a 10th: import `daemon.app`, construct ASGI app, register routes, do not bind socket. Exits 0 on success. Catches PyInstaller bundling regressions for the daemon path.
 
