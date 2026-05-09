@@ -153,8 +153,11 @@ def install(
         )
 
     if already_loaded or content_changed:
+        # `-kp` (not `-p`): kill and restart the running service so plist
+        # content changes take effect immediately. Without `-k`, a running
+        # service ignores the new plist until next crash.
         kickstart = subprocess.run(
-            ["launchctl", "kickstart", "-p", service],
+            ["launchctl", "kickstart", "-kp", service],
             capture_output=True,
             text=True,
         )
