@@ -104,6 +104,155 @@ final class RecorderControllerDaemonTests: XCTestCase {
         XCTAssertTrue(recorder.schemaMismatchDetected)
     }
 
+    // MARK: - U4: production ordering — `started` already published before subscribe
+
+    /// Mirrors the production daemon timing where `recording_started` is
+    /// emitted *before* the SwiftUI controller issues its
+    /// `/v0/events?since=N` subscribe. The mock server keeps a preset replay
+    /// of events keyed by cursor; the events route emits every entry with
+    /// `cursor > since` ahead of any live event, exactly as the daemon's
+    /// U1+U2 replay buffer does on the production side.
+    ///
+    /// Before U1+U2 the daemon dropped `recording_started` when the
+    /// SwiftUI subscribe arrived after the event was published; this test
+    /// confirms that the controller transitions through `.starting` →
+    /// `.recording` using only the replay-delivered event.
+    func testProductionOrderingStartedBeforeSubscribe() async throws {
+        // Preset replay ring: events keyed by cursor that the server emits
+        // verbatim when SwiftUI subscribes at `?since=N`. The recording
+        // helper exhausts the ring then keeps the stream open so the
+        // RecorderController stays attached.
+        let presetReplay = PresetReplay(events: [
+            4: #"{"type":"started","schema_version":1,"cursor":4,"ts":12.0,"claimant":"daemon"}"# + "\n",
+        ])
+
+        _ = try startServer { request in
+            switch request.path {
+            case "/v0/daemon.info":
+                return .json(#"{"ok":true,"schema_version":1,"daemon_version":"test","api_schema_version":1,"build":null,"started_at":1.0}"#)
+            case "/v0/recording.start":
+                // Start response carries cursor=3; the engine has already
+                // published `started` at cursor=4 by the time this returns.
+                return .json(#"{"ok":true,"schema_version":1,"daemon_version":"test","api_schema_version":1,"session_id":"session-prod","started_at":10.0,"cursor":3}"#)
+            case "/v0/session.snapshot":
+                return .json(#"{"ok":true,"schema_version":1,"daemon_version":"test","api_schema_version":1,"is_recording":true,"daemon_owned":true,"recording_name":"prod","started_at":10.0,"claimant":"daemon","recovering":false,"cursor":3}"#)
+            case "/v0/events?since=3":
+                // The "subscribed" frame mirrors the production wire shape;
+                // replayed events with cursor > 3 follow before any live
+                // event lands. With the preset cursor=4, the controller
+                // observes `started` purely from replay.
+                var chunks = [
+                    #"{"type":"subscribed","schema_version":1,"cursor":3,"ts":11.0}"# + "\n",
+                ]
+                chunks.append(contentsOf: presetReplay.eventsAfter(cursor: 3))
+                return .chunked(chunks, terminate: false)
+            default:
+                XCTFail("Unexpected request path \(request.path)")
+                return .json(#"{"ok":false,"schema_version":1,"daemon_version":"test","api_schema_version":1,"error":"unexpected"}"#, status: 500)
+            }
+        }
+
+        let recorder = RecorderController()
+        await recorder.probeDaemon()
+        XCTAssertEqual(recorder.transport, .daemon)
+
+        recorder.start(name: "prod")
+
+        await waitUntil {
+            if case .recording = recorder.state { return true }
+            return false
+        }
+        XCTAssertNil(recorder.lastError)
+    }
+
+    /// When the daemon side has aged the requested cursor out of its
+    /// replay window, `/v0/events?since=N` returns HTTP 410 with the
+    /// `cursor_unknown` envelope. The RecorderController must treat
+    /// this as a recoverable stream failure (retry via fresh snapshot)
+    /// rather than crashing or hanging in `.starting`.
+    func testCursorUnknown410FromEventsStreamFallsBackThroughSnapshotRefetch() async throws {
+        let snapshotCount = LockedInt()
+
+        _ = try startServer { request in
+            switch request.path {
+            case "/v0/daemon.info":
+                return .json(#"{"ok":true,"schema_version":1,"daemon_version":"test","api_schema_version":1,"build":null,"started_at":1.0}"#)
+            case "/v0/recording.start":
+                return .json(#"{"ok":true,"schema_version":1,"daemon_version":"test","api_schema_version":1,"session_id":"session-unknown","started_at":10.0,"cursor":2}"#)
+            case "/v0/session.snapshot":
+                // First snapshot returns a stale cursor; second snapshot
+                // (after the controller recovers from the 410) returns a
+                // fresh one that the replay window covers.
+                if snapshotCount.incrementAndGet() == 1 {
+                    return .json(#"{"ok":true,"schema_version":1,"daemon_version":"test","api_schema_version":1,"is_recording":true,"daemon_owned":true,"recording_name":"unknown","started_at":10.0,"claimant":"daemon","recovering":false,"cursor":1}"#)
+                }
+                return .json(#"{"ok":true,"schema_version":1,"daemon_version":"test","api_schema_version":1,"is_recording":true,"daemon_owned":true,"recording_name":"unknown","started_at":10.0,"claimant":"daemon","recovering":false,"cursor":5}"#)
+            case "/v0/events?since=1":
+                return .json(
+                    #"{"ok":false,"schema_version":1,"daemon_version":"test","api_schema_version":1,"error":"cursor_unknown","requested_cursor":1}"#,
+                    status: 410,
+                    reason: "Gone"
+                )
+            case "/v0/events?since=5":
+                return .chunked([
+                    #"{"type":"subscribed","schema_version":1,"cursor":5,"ts":11.0}"# + "\n",
+                    #"{"type":"started","schema_version":1,"cursor":6,"ts":12.0,"claimant":"daemon"}"# + "\n",
+                ], terminate: false)
+            default:
+                XCTFail("Unexpected request path \(request.path)")
+                return .json(#"{"ok":false,"schema_version":1,"daemon_version":"test","api_schema_version":1,"error":"unexpected"}"#, status: 500)
+            }
+        }
+
+        let recorder = RecorderController()
+        await recorder.probeDaemon()
+        recorder.start(name: "unknown")
+
+        await waitUntil {
+            if case .recording = recorder.state { return true }
+            return false
+        }
+        XCTAssertGreaterThanOrEqual(snapshotCount.value, 2)
+    }
+
+    /// A `recording_failed` event delivered via replay must propagate to
+    /// the controller so the UI surfaces the failure to the user instead
+    /// of remaining stuck in `.starting` while the daemon has already
+    /// torn the recording down.
+    func testRecordingFailedDeliveredViaReplaySurfacesError() async throws {
+        _ = try startServer { request in
+            switch request.path {
+            case "/v0/daemon.info":
+                return .json(#"{"ok":true,"schema_version":1,"daemon_version":"test","api_schema_version":1,"build":null,"started_at":1.0}"#)
+            case "/v0/recording.start":
+                return .json(#"{"ok":true,"schema_version":1,"daemon_version":"test","api_schema_version":1,"session_id":"session-fail","started_at":10.0,"cursor":2}"#)
+            case "/v0/session.snapshot":
+                return .json(#"{"ok":true,"schema_version":1,"daemon_version":"test","api_schema_version":1,"is_recording":true,"daemon_owned":true,"recording_name":"fail","started_at":10.0,"claimant":"daemon","recovering":false,"cursor":2}"#)
+            case "/v0/events?since=2":
+                return .chunked([
+                    #"{"type":"subscribed","schema_version":1,"cursor":2,"ts":11.0}"# + "\n",
+                    #"{"type":"recording_failed","schema_version":1,"cursor":3,"ts":12.0,"reason":"engine crashed"}"# + "\n",
+                ])
+            default:
+                XCTFail("Unexpected request path \(request.path)")
+                return .json(#"{"ok":false,"schema_version":1,"daemon_version":"test","api_schema_version":1,"error":"unexpected"}"#, status: 500)
+            }
+        }
+
+        let recorder = RecorderController()
+        await recorder.probeDaemon()
+        recorder.start(name: "fail")
+
+        await waitUntil {
+            // The recorder should drop out of `.starting` (either to
+            // `.idle` with an error, or to a failure-bearing state) once
+            // the `recording_failed` replay event lands.
+            if case .recording = recorder.state { return false }
+            if case .starting = recorder.state { return false }
+            return true
+        }
+    }
+
     @discardableResult
     private func startServer(
         _ handler: @escaping @Sendable (UnixHTTPTestServer.Request) -> UnixHTTPTestServer.Response
@@ -144,5 +293,21 @@ private final class LockedInt: @unchecked Sendable {
         defer { lock.unlock() }
         storage += 1
         return storage
+    }
+}
+
+/// Test-only stand-in for the daemon's replay buffer: events keyed by the
+/// cursor at which they were "published", retrieved in ascending cursor
+/// order by `eventsAfter(cursor:)`. Mirrors the daemon's
+/// `bus.subscribe(since=…)` semantics enough for SwiftUI's
+/// consume-after-start flow without modelling eviction.
+private struct PresetReplay: Sendable {
+    let events: [Int: String]
+
+    func eventsAfter(cursor: Int) -> [String] {
+        events
+            .filter { $0.key > cursor }
+            .sorted(by: { $0.key < $1.key })
+            .map { $0.value }
     }
 }
