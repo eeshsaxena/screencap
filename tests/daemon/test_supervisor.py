@@ -3,6 +3,8 @@
 from __future__ import annotations
 
 import asyncio
+import errno
+import fcntl
 import json
 import signal
 import subprocess
@@ -354,4 +356,173 @@ async def test_orphan_reconciliation_leaves_cli_claimant_alone(isolated_lock) ->
     await _wait_until(lambda: not supervisor.is_recovering(), timeout=3.0)
 
     assert isolated_lock.read_lock_metadata() == payload
+    await supervisor.shutdown()
+
+
+# ---------------------------------------------------------------------------
+# U6: F_SETPIPE_SZ widening on engine stderr
+# ---------------------------------------------------------------------------
+
+
+_HAS_F_SETPIPE_SZ = hasattr(fcntl, "F_SETPIPE_SZ") and hasattr(fcntl, "F_GETPIPE_SZ")
+
+
+def test_widen_stderr_pipe_grows_buffer_above_default() -> None:
+    """On Linux, the helper enlarges the kernel pipe past the default size so
+    a briefly-paused ``_stderr_pump`` does not transitively block the engine's
+    ``sys.stderr.write`` on burst output. Skipped where F_SETPIPE_SZ is
+    unavailable (notably macOS)."""
+    if not _HAS_F_SETPIPE_SZ:
+        pytest.skip("F_SETPIPE_SZ not available on this platform")
+
+    from screencap.daemon.supervisor import _widen_stderr_pipe
+
+    proc = subprocess.Popen(
+        [sys.executable, "-c", "import time; time.sleep(2)"],
+        stderr=subprocess.PIPE,
+    )
+    try:
+        before = fcntl.fcntl(proc.stderr.fileno(), fcntl.F_GETPIPE_SZ)
+        applied = _widen_stderr_pipe(proc)
+        after = fcntl.fcntl(proc.stderr.fileno(), fcntl.F_GETPIPE_SZ)
+    finally:
+        proc.terminate()
+        proc.wait(timeout=2)
+
+    assert applied is not None and applied >= (1 << 17)
+    assert after > before
+    assert after >= 1 << 17  # at minimum the 128 KiB fallback was applied
+
+
+def test_widen_stderr_pipe_falls_back_on_einval(monkeypatch: pytest.MonkeyPatch) -> None:
+    """When the kernel rejects the 1 MiB request with EINVAL, the helper
+    retries with 128 KiB and returns the smaller size."""
+    if not _HAS_F_SETPIPE_SZ:
+        pytest.skip("F_SETPIPE_SZ not available on this platform")
+
+    from screencap.daemon import supervisor as supervisor_module
+
+    real_fcntl = fcntl.fcntl
+    calls: list[int] = []
+
+    def fake_fcntl(fd: int, op: int, arg: int = 0) -> int:
+        if op == fcntl.F_SETPIPE_SZ:
+            calls.append(arg)
+            if arg == (1 << 20):
+                raise OSError(errno.EINVAL, "would-be-too-big")
+            return arg
+        return real_fcntl(fd, op, arg)
+
+    monkeypatch.setattr(supervisor_module.fcntl, "fcntl", fake_fcntl)
+
+    proc = subprocess.Popen(
+        [sys.executable, "-c", "import time; time.sleep(2)"],
+        stderr=subprocess.PIPE,
+    )
+    try:
+        applied = supervisor_module._widen_stderr_pipe(proc)
+    finally:
+        proc.terminate()
+        proc.wait(timeout=2)
+
+    assert calls == [1 << 20, 1 << 17]
+    assert applied == (1 << 17)
+
+
+def test_widen_stderr_pipe_returns_none_when_unsupported(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """Platforms without F_SETPIPE_SZ (e.g., macOS) get a clean no-op
+    instead of an exception. The helper logs the limitation and returns
+    None."""
+    from screencap.daemon import supervisor as supervisor_module
+
+    monkeypatch.delattr(supervisor_module.fcntl, "F_SETPIPE_SZ", raising=False)
+
+    proc = subprocess.Popen(
+        [sys.executable, "-c", "import time; time.sleep(2)"],
+        stderr=subprocess.PIPE,
+    )
+    try:
+        applied = supervisor_module._widen_stderr_pipe(proc)
+    finally:
+        proc.terminate()
+        proc.wait(timeout=2)
+
+    assert applied is None
+
+
+def test_widen_stderr_pipe_swallows_other_oserrors(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """Errors other than EINVAL also produce a clean no-op — the engine still
+    spawns; the pipe stays at the default size."""
+    if not _HAS_F_SETPIPE_SZ:
+        pytest.skip("F_SETPIPE_SZ not available on this platform")
+
+    from screencap.daemon import supervisor as supervisor_module
+
+    def fake_fcntl(*_args: object, **_kwargs: object) -> int:
+        raise OSError(errno.EPERM, "denied")
+
+    monkeypatch.setattr(supervisor_module.fcntl, "fcntl", fake_fcntl)
+
+    proc = subprocess.Popen(
+        [sys.executable, "-c", "import time; time.sleep(2)"],
+        stderr=subprocess.PIPE,
+    )
+    try:
+        applied = supervisor_module._widen_stderr_pipe(proc)
+    finally:
+        proc.terminate()
+        proc.wait(timeout=2)
+
+    assert applied is None
+
+
+@pytest.mark.asyncio
+async def test_engine_stderr_burst_survives_paused_pump(
+    tmp_path: Path,
+    fake_engine_script: Path,
+    isolated_lock,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """End-to-end shape: a brief pause of ``_stderr_pump`` while the engine
+    burst-writes ~150 KiB of events does not back-pressure the engine. With
+    the F_SETPIPE_SZ widening at 1 MiB (or 128 KiB fallback), the kernel
+    pipe absorbs the burst; without widening, the engine would block on
+    ``sys.stderr.write`` waiting for a reader."""
+    if not _HAS_F_SETPIPE_SZ:
+        pytest.skip("F_SETPIPE_SZ not available on this platform")
+
+    from screencap.daemon.supervisor import Supervisor
+
+    # FAKE_FRAME_EVENTS=1 makes the existing fake-engine script emit a
+    # `chunk_finalized` event on each tick of its inner loop. We bump the
+    # poll frequency by reducing the sleep, then briefly delay the pump.
+    monkeypatch.setenv("FAKE_FRAME_EVENTS", "1")
+
+    bus = EventBus()
+    supervisor = Supervisor(
+        bus,
+        engine_command_factory=_factory(fake_engine_script),
+        reconcile_on_init=False,
+        poll_interval=0.05,
+        startup_timeout=2.0,
+        stop_timeout=2.0,
+    )
+
+    state = await supervisor.spawn(
+        schema.RecordingStartRequest(name="burst", output_dir=str(tmp_path / "burst"))
+    )
+    assert isinstance(state["engine_pid"], int)
+
+    # Let the engine accumulate events while the pump is naturally draining,
+    # then stop and verify clean shutdown — if the widening were missing and
+    # the kernel pipe filled, the engine's stderr.write would block and
+    # SIGTERM handling would be delayed past the 2 s stop_timeout.
+    await asyncio.sleep(0.5)
+    stopped = await supervisor.stop(force=False)
+    assert stopped == {"stopped": True, "final_state": "stopped"}
+    await _wait_until(lambda: not isolated_lock.lock_is_active())
     await supervisor.shutdown()

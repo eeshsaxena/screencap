@@ -4,6 +4,8 @@ from __future__ import annotations
 
 import asyncio
 import base64
+import errno
+import fcntl
 import json
 import logging
 import math
@@ -32,6 +34,57 @@ EngineCommandFactory = Callable[[str], list[str]]
 # metadata. Mirrored at supervisor.py call sites, app.py daemon-owned
 # detection, and cli.py engine-worker started event.
 CLAIMANT_DAEMON = "daemon"
+
+# Engine-stderr kernel pipe widening — buys headroom for `_stderr_pump`
+# against engine-side burst writes so a briefly-slow pump drain does not
+# transitively block the engine's `sys.stderr.write`. 1 MiB is ~16× the
+# typical macOS/Linux default; the EINVAL fallback at 128 KiB covers
+# kernels that cap below 1 MiB. Linux-only at the syscall level —
+# `F_SETPIPE_SZ` is absent on macOS, where the helper degrades to no-op
+# and the pipe stays at the kernel default. If production traces ever
+# show pump stalls past this ceiling, that's the trigger for the
+# deferred TKT-D approach (2): asyncio queue + drop policy.
+_STDERR_PIPE_SIZE = 1 << 20  # 1 MiB
+_STDERR_PIPE_FALLBACK = 1 << 17  # 128 KiB
+
+
+def _widen_stderr_pipe(proc: subprocess.Popen[Any] | Any) -> int | None:
+    """Resize the kernel stderr pipe for ``proc`` to ``_STDERR_PIPE_SIZE``.
+
+    Returns the size that was applied, or ``None`` when widening was not
+    available (no ``F_SETPIPE_SZ`` on this platform) or failed in any other
+    way. Never raises — pipe sizing is a diagnostic safety net, not a
+    correctness invariant.
+    """
+    set_pipe_sz = getattr(fcntl, "F_SETPIPE_SZ", None)
+    if set_pipe_sz is None:
+        logger.info(
+            "engine stderr pipe widening unavailable: fcntl.F_SETPIPE_SZ not on this platform"
+        )
+        return None
+
+    stderr = getattr(proc, "stderr", None)
+    if stderr is None:
+        return None
+
+    try:
+        fd = stderr.fileno()
+    except (AttributeError, OSError):
+        return None
+
+    for size in (_STDERR_PIPE_SIZE, _STDERR_PIPE_FALLBACK):
+        try:
+            fcntl.fcntl(fd, set_pipe_sz, size)
+        except OSError as exc:
+            if exc.errno == errno.EINVAL and size == _STDERR_PIPE_SIZE:
+                continue
+            logger.warning(
+                "engine stderr pipe widening failed (size=%d): %s", size, exc
+            )
+            return None
+        logger.info("engine stderr pipe widened to %d bytes", size)
+        return size
+    return None
 
 
 class _PopenEngineProcess:
@@ -219,6 +272,7 @@ class Supervisor:
             try:
                 command = self._engine_command_factory(encoded_args)
                 proc = _PopenEngineProcess(command)
+                _widen_stderr_pipe(proc)
                 self._proc = proc
                 self._engine_pid = proc.pid
                 self._finalized_seen = False
