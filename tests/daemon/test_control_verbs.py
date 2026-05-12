@@ -288,6 +288,65 @@ async def test_recording_start_then_subscribe_after_replays_started_event(
 
 
 @pytest.mark.asyncio
+async def test_recording_stop_returns_fast_when_engine_self_exits_in_toctou_gap(
+    tmp_path: Path,
+) -> None:
+    """U3 wire-level regression: a daemon engine that emits
+    ``recording_finalized`` and exits in the ``Supervisor.stop()`` await gap
+    must yield a stop response within the configured ``stop_timeout``, not
+    block on a missed-event timeout. Uses a fake engine that finalizes and
+    exits 200 ms after spawn — by the time the operator's
+    ``POST /v0/recording.stop`` arrives, the supervisor sees ``is_alive()``
+    flipping and `_exit_poll` racing the late subscribe. Without U1+U3,
+    this test would hang for the full ``stop_timeout``."""
+    script = tmp_path / "self_exit_engine.py"
+    script.write_text(
+        textwrap.dedent(
+            """
+            import json, sys, time
+            sys.stderr.write(json.dumps({
+                "type": "started", "claimant": "daemon",
+                "schema_version": 1, "ts": time.time(),
+            }) + "\\n")
+            sys.stderr.flush()
+            time.sleep(0.2)
+            sys.stderr.write(json.dumps({
+                "type": "recording_finalized",
+                "name": "selfexit",
+                "duration_seconds": 0.2,
+                "force_stopped": False,
+                "disk_full": False,
+                "schema_version": 1,
+                "ts": time.time(),
+            }) + "\\n")
+            sys.stderr.flush()
+            raise SystemExit(0)
+            """
+        ),
+        encoding="utf-8",
+    )
+
+    with _serve(tmp_path, script) as (_proc, socket_path, _env):
+        async with _client(socket_path) as client:
+            await client.post(
+                "/v0/recording.start",
+                json={"name": "selfexit", "output_dir": str(tmp_path / "selfexit")},
+            )
+            # Give the engine a chance to emit finalized and self-exit.
+            await asyncio.sleep(0.3)
+
+            start = time.monotonic()
+            stopped = await client.post("/v0/recording.stop", json={})
+            elapsed = time.monotonic() - start
+
+    assert stopped.status_code == 200
+    assert elapsed < 3.0, (
+        f"recording.stop took {elapsed:.2f}s; replay buffer should have "
+        "covered the engine-exits-during-stop race"
+    )
+
+
+@pytest.mark.asyncio
 async def test_events_since_future_cursor_returns_410_over_wire(
     tmp_path: Path,
     fake_engine_script: Path,

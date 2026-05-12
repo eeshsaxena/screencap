@@ -357,6 +357,15 @@ class Supervisor:
                     "final_state": "stopped" if stopped else "not_terminated",
                 }
 
+            # TOCTOU defense (TKT-A): capture the bus cursor BEFORE the
+            # is_alive() check so the late `final_sub` subscription can
+            # replay any `recording_finalized` published by `_exit_poll`
+            # in the await gap. Without this, the engine can self-exit
+            # between is_alive() returning True and the live-only
+            # subscribe() landing, and stop() blocks for the full
+            # stop_timeout while the event sits unobserved on the bus.
+            pre_check_cursor = self._bus.current_cursor()
+
             if self._proc is None or not self._proc.is_alive():
                 engine_pid = metadata.get("engine_pid")
                 if isinstance(engine_pid, int):
@@ -369,7 +378,7 @@ class Supervisor:
                 self._release_daemon_lock()
                 return {"stopped": False, "final_state": "no_engine"}
 
-            final_sub = await self._bus.subscribe()
+            final_sub = await self._bus.subscribe(since=pre_check_cursor)
             proc = self._proc
             self._stopping = True
             try:
@@ -406,11 +415,16 @@ class Supervisor:
         if self._proc is not None and self._proc.is_alive():
             proc = self._proc
             self._stopping = True
+            # Same TOCTOU defense as Supervisor.stop(): capture the cursor
+            # before `terminate()` so the late subscription replays any
+            # `recording_finalized` the engine's SIGTERM handler publishes
+            # in the await gap.
+            pre_terminate_cursor = self._bus.current_cursor()
             try:
                 proc.terminate()
             except ProcessLookupError:
                 pass
-            final_sub = await self._bus.subscribe()
+            final_sub = await self._bus.subscribe(since=pre_terminate_cursor)
             try:
                 try:
                     await self._wait_on_subscription(

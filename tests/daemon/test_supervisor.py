@@ -480,6 +480,152 @@ def test_widen_stderr_pipe_swallows_other_oserrors(
     assert applied is None
 
 
+# ---------------------------------------------------------------------------
+# U3: Supervisor.stop() TOCTOU regression
+# ---------------------------------------------------------------------------
+
+
+@pytest.mark.asyncio
+async def test_stop_returns_fast_when_finalized_published_during_subscribe_gap(
+    tmp_path: Path,
+    fake_engine_script: Path,
+    isolated_lock,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """TKT-A regression: ``recording_finalized`` published in the await gap
+    between ``is_alive()`` and the stop subscription must NOT cause
+    ``stop()`` to block for the full ``stop_timeout``. With U1's replay
+    buffer plus U3's pre-check cursor capture, the late subscription
+    picks up the event from the ring and returns within 1 second.
+
+    Reproduction: hold the supervisor's late ``subscribe()`` on a test
+    barrier; publish ``recording_finalized`` directly to the bus during
+    that window (mimicking what ``_exit_poll`` would do in production);
+    release the barrier; assert ``stop()`` returns within 1 s.
+    """
+    from screencap.daemon.supervisor import Supervisor
+
+    bus = EventBus()
+    supervisor = Supervisor(
+        bus,
+        engine_command_factory=_factory(fake_engine_script),
+        reconcile_on_init=False,
+        # poll_interval long enough that `_exit_poll` does not interfere
+        # — the test injects the race condition deterministically below.
+        poll_interval=60.0,
+        startup_timeout=2.0,
+        stop_timeout=5.0,
+    )
+
+    await supervisor.spawn(
+        schema.RecordingStartRequest(name="race", output_dir=str(tmp_path / "race"))
+    )
+
+    # Install a barrier on bus.subscribe — only on calls without `since`
+    # (live-only subscriptions). U3's fix calls subscribe(since=N) for the
+    # late stop subscription, so we need to capture that specific call and
+    # delay it until after we publish the finalized event.
+    original_subscribe = bus.subscribe
+    barrier = asyncio.Event()
+    captured_since: list[int | None] = []
+
+    async def slow_subscribe(since: int | None = None):
+        captured_since.append(since)
+        # Only delay the stop's late subscribe — match by `since` being a
+        # non-None int (the pre-check cursor); first calls during spawn
+        # are live (since=None) and must not block.
+        if since is not None:
+            await barrier.wait()
+        return await original_subscribe(since=since)
+
+    monkeypatch.setattr(bus, "subscribe", slow_subscribe)
+
+    # Launch stop() in a task — it will pause at the barrier-decorated
+    # subscribe call.
+    stop_task = asyncio.create_task(supervisor.stop(force=False))
+
+    # Give stop() time to reach the late subscribe (operation_lock,
+    # metadata read, is_alive check, then subscribe).
+    await asyncio.sleep(0.05)
+
+    # Publish the racing event. With U1's replay buffer this lands in
+    # the ring at the next cursor; the late subscribe(since=...) will
+    # pick it up via replay.
+    await bus.publish(
+        {
+            "type": _stderr_events.EVENT_RECORDING_FINALIZED,
+            "schema_version": 1,
+            "ts": time.time(),
+            "name": "race",
+            "duration_seconds": 0.1,
+            "force_stopped": False,
+            "disk_full": False,
+        }
+    )
+
+    # Release the barrier so the stop subscription completes.
+    barrier.set()
+
+    start = time.monotonic()
+    result = await asyncio.wait_for(stop_task, timeout=2.0)
+    elapsed = time.monotonic() - start
+
+    assert elapsed < 1.0, f"stop() took {elapsed:.2f}s; should have observed replay"
+    assert result["final_state"] == "stopped"
+    assert any(since is not None for since in captured_since), (
+        "stop() should call subscribe(since=...) with the pre-check cursor"
+    )
+
+    await supervisor.shutdown()
+
+
+@pytest.mark.asyncio
+async def test_shutdown_subscribes_with_pre_terminate_cursor(
+    tmp_path: Path,
+    fake_engine_script: Path,
+    isolated_lock,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """Same TOCTOU shape on the ``Supervisor.shutdown()`` path: the late
+    subscription must use ``subscribe(since=cursor_before_terminate)`` so a
+    ``recording_finalized`` published in the await gap between
+    ``proc.terminate()`` and the late subscription lands via replay."""
+    from screencap.daemon.supervisor import Supervisor
+
+    bus = EventBus()
+    supervisor = Supervisor(
+        bus,
+        engine_command_factory=_factory(fake_engine_script),
+        reconcile_on_init=False,
+        poll_interval=60.0,
+        startup_timeout=2.0,
+        stop_timeout=2.0,
+    )
+
+    await supervisor.spawn(
+        schema.RecordingStartRequest(name="srace", output_dir=str(tmp_path / "srace"))
+    )
+
+    original_subscribe = bus.subscribe
+    captured_since: list[int | None] = []
+
+    async def recording_subscribe(since: int | None = None):
+        captured_since.append(since)
+        return await original_subscribe(since=since)
+
+    monkeypatch.setattr(bus, "subscribe", recording_subscribe)
+
+    await supervisor.shutdown()
+
+    # The pre-terminate cursor capture is what gives replay a chance to
+    # cover the await gap. shutdown() must call subscribe(since=...) for
+    # its late finalized-await subscription, not the legacy live-only
+    # subscribe() that races with `_stderr_pump.publish`.
+    assert any(since is not None for since in captured_since), (
+        "shutdown() should call subscribe(since=...) with a pre-terminate cursor"
+    )
+
+
 @pytest.mark.asyncio
 async def test_engine_stderr_burst_survives_paused_pump(
     tmp_path: Path,
