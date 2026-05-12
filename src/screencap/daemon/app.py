@@ -265,8 +265,11 @@ def _ndjson(payload: dict) -> bytes:
 
 
 async def events_stream(request: Request) -> JSONResponse | StreamingResponse:
+    from screencap.daemon import event_bus as _event_bus
+
     bus = request.app.state.event_bus
     since_param = request.query_params.get("since")
+    since: int | None = None
     if since_param is not None:
         try:
             since = int(since_param)
@@ -279,22 +282,34 @@ async def events_stream(request: Request) -> JSONResponse | StreamingResponse:
                 ),
                 status_code=400,
             )
-        # `since` older than current is fine — the snapshot caller is behind by
-        # the events emitted in the gap and will catch up on the next live read
-        # via the bus queue. Only `since > current` is genuinely unknown (the
-        # client is asking about an event the daemon has never published).
-        # 410 Gone is the correct wire status: the cursor either was never
-        # produced or was evicted; a retry without remediation cannot succeed.
-        if since > bus.current_cursor():
+        if since < 0:
+            # Negative cursors are syntactically valid integers but cannot
+            # have been produced by the bus's monotonic stamp — reject as
+            # invalid rather than silently coercing to "live from now".
             return JSONResponse(
-                errors.cursor_unknown_envelope(
-                    requested_cursor=since,
+                errors.error_envelope(
                     schema_version=schema._EVENTS_API_VERSION,
+                    error=errors.ERROR_CODE_INVALID_CURSOR,
+                    requested_cursor=since_param,
                 ),
-                status_code=errors.CursorUnknownError.http_status,
+                status_code=400,
             )
 
-    sub = await bus.subscribe()
+    try:
+        sub = await bus.subscribe(since=since)
+    except _event_bus.CursorUnknownError as exc:
+        # Two cases collapse to the same wire shape: the requested cursor is
+        # either ahead of the bus (never produced) or older than the retained
+        # replay window (aged out). 410 Gone signals "the cursor cannot be
+        # served; retrying without remediation will not help" — clients
+        # should refetch a fresh snapshot and resubscribe.
+        return JSONResponse(
+            errors.cursor_unknown_envelope(
+                requested_cursor=exc.cursor,
+                schema_version=schema._EVENTS_API_VERSION,
+            ),
+            status_code=errors.CursorUnknownError.http_status,
+        )
 
     # Drain-to-EOF discipline: shutdown closes every subscription; each stream
     # handler observes that close, yields a final reason frame, then returns so
