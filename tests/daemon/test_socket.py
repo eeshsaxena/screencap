@@ -59,6 +59,53 @@ def test_running_socket_raises_already_running(daemon_socket_path: Path) -> None
         daemon_socket_path.unlink(missing_ok=True)
 
 
+def test_running_socket_attaches_existing_pid_from_lsof(daemon_socket_path: Path) -> None:
+    from screencap.daemon.socket import DaemonAlreadyRunning, bind_unix_socket
+
+    daemon_socket_path.parent.mkdir(parents=True)
+    running = socket.socket(socket.AF_UNIX, socket.SOCK_STREAM)
+    running.bind(str(daemon_socket_path))
+    running.listen(1)
+    try:
+        with pytest.raises(DaemonAlreadyRunning) as exc_info:
+            bind_unix_socket(daemon_socket_path)
+    finally:
+        running.close()
+        daemon_socket_path.unlink(missing_ok=True)
+
+    # lsof may or may not return a PID depending on platform support; the
+    # attribute must always exist and be int-or-None.
+    assert hasattr(exc_info.value, "existing_pid")
+    assert exc_info.value.existing_pid is None or isinstance(exc_info.value.existing_pid, int)
+
+
+def test_running_socket_falls_back_when_lsof_missing(
+    daemon_socket_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """If lsof can't run, DaemonAlreadyRunning still raises with existing_pid=None."""
+    from screencap.daemon import socket as daemon_socket
+
+    def fake_capture(_path: Path) -> int | None:
+        # Simulate FileNotFoundError / TimeoutExpired / any failure path.
+        return None
+
+    monkeypatch.setattr(daemon_socket, "_capture_socket_pid", fake_capture)
+
+    daemon_socket_path.parent.mkdir(parents=True)
+    running = socket.socket(socket.AF_UNIX, socket.SOCK_STREAM)
+    running.bind(str(daemon_socket_path))
+    running.listen(1)
+    try:
+        with pytest.raises(daemon_socket.DaemonAlreadyRunning) as exc_info:
+            daemon_socket.bind_unix_socket(daemon_socket_path)
+    finally:
+        running.close()
+        daemon_socket_path.unlink(missing_ok=True)
+
+    assert exc_info.value.existing_pid is None
+
+
 def test_rogue_regular_file_is_not_overwritten(daemon_socket_path: Path) -> None:
     from screencap.daemon.socket import RogueFileAtSocketPath, bind_unix_socket
 

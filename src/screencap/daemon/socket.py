@@ -9,6 +9,7 @@ import logging
 import os
 import socket
 import stat
+import subprocess
 from pathlib import Path
 
 logger = logging.getLogger(__name__)
@@ -22,7 +23,16 @@ class DaemonSocketError(RuntimeError):
 
 
 class DaemonAlreadyRunning(DaemonSocketError):
-    """Raised when an existing socket accepts connections."""
+    """Raised when an existing socket accepts connections.
+
+    ``existing_pid`` carries the PID of the process holding the socket as
+    reported by ``lsof -tU``, or ``None`` if lsof was unavailable or did
+    not return a parseable PID within the probe timeout.
+    """
+
+    def __init__(self, message: str, *, existing_pid: int | None = None) -> None:
+        super().__init__(message)
+        self.existing_pid = existing_pid
 
 
 class RogueFileAtSocketPath(DaemonSocketError):
@@ -62,6 +72,34 @@ def _ensure_socket_directory(path: Path) -> None:
     os.chmod(path.parent, 0o700)
 
 
+def _capture_socket_pid(path: Path) -> int | None:
+    """Return the PID of the process holding ``path`` via ``lsof -tU``.
+
+    Best-effort: returns ``None`` on missing binary, timeout, non-zero exit,
+    or unparseable output. Never raises. The probe must not block daemon
+    startup further than ~1s — this is a diagnostic, not a control flow.
+    """
+    try:
+        result = subprocess.run(
+            ["lsof", "-tU", str(path)],
+            timeout=1.0,
+            capture_output=True,
+            text=True,
+            check=False,
+        )
+    except (FileNotFoundError, subprocess.TimeoutExpired, OSError):
+        return None
+
+    if result.returncode != 0:
+        return None
+
+    for line in (result.stdout or "").splitlines():
+        candidate = line.strip()
+        if candidate.isdigit():
+            return int(candidate)
+    return None
+
+
 def _probe_existing_socket(path: Path) -> None:
     try:
         mode = path.stat().st_mode
@@ -81,7 +119,11 @@ def _probe_existing_socket(path: Path) -> None:
     finally:
         probe.close()
 
-    raise DaemonAlreadyRunning(f"another daemon is running at {path}")
+    existing_pid = _capture_socket_pid(path)
+    raise DaemonAlreadyRunning(
+        f"another daemon is running at {path}",
+        existing_pid=existing_pid,
+    )
 
 
 def _getpeereid(fd: int) -> tuple[int, int]:

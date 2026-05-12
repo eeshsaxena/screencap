@@ -154,6 +154,13 @@ def serve(
             if result.state == "installed_and_running":
                 console.print(f"[green]{result.state}[/green]: {result.plist_path}")
                 return
+            if result.state == "install_failed_already_running":
+                console.print(f"[red]{result.state}[/red]: {result.detail}")
+                console.print(
+                    "Try [bold]screencap serve --uninstall[/bold] to remove the "
+                    "installed agent, then re-run [bold]screencap serve --install[/bold]."
+                )
+                raise SystemExit(1)
             console.print(f"[red]{result.state}[/red]: {result.detail}")
             raise SystemExit(1)
 

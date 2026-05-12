@@ -20,6 +20,11 @@ DAEMON_LABEL = "com.screencap.daemon"
 DEFAULT_BINARY_NAME = "screencap"
 DEFAULT_PATH = "/usr/bin:/bin:/usr/sbin:/sbin:/usr/local/bin:/opt/homebrew/bin"
 
+# sysexits.h "temporary failure" — daemon raises this when the socket is
+# already held by a same-EUID rogue process. The install verifier reads it
+# back from `launchctl print` to classify failures.
+_EX_TEMPFAIL = 75
+
 logger = logging.getLogger(__name__)
 
 
@@ -209,6 +214,22 @@ def install(
             detail="daemon.info responded",
         )
 
+    # Daemon never reached running state — distinguish "another daemon already
+    # holds the socket and the spawned process exited with EX_TEMPFAIL=75" from
+    # the generic did-not-start case. The 75-classified branch unblocks the
+    # operator-visible CLI install verifier so they see "another daemon is
+    # already bound to the socket" instead of a vague timeout.
+    last_exit = _last_launchd_exit_code()
+    if last_exit == _EX_TEMPFAIL:
+        return InstallResult(
+            state="install_failed_already_running",
+            plist_path=resolved_plist_path,
+            detail=(
+                "launchctl reported last exit code = 75 (EX_TEMPFAIL); "
+                "another daemon is already bound to the socket"
+            ),
+        )
+
     return InstallResult(
         state="install_failed_daemon_did_not_start",
         plist_path=resolved_plist_path,
@@ -354,6 +375,43 @@ def _parse_launchd_state(output: str) -> str | None:
         if stripped.startswith("state ="):
             return stripped.split("=", 1)[1].strip()
     return None
+
+
+def _parse_last_exit_code(output: str) -> int | None:
+    """Extract the integer value of the ``last exit code = N`` line in
+    ``launchctl print`` output. Returns None when the field is absent or
+    not parseable as a signed int."""
+    for line in output.splitlines():
+        stripped = line.strip()
+        if not stripped.startswith("last exit code"):
+            continue
+        _, _, value = stripped.partition("=")
+        candidate = value.strip()
+        try:
+            return int(candidate)
+        except ValueError:
+            return None
+    return None
+
+
+def _last_launchd_exit_code() -> int | None:
+    """Return the daemon's last exit code as reported by ``launchctl print``.
+
+    Returns None when launchctl is unavailable, exits non-zero, or its
+    output omits the ``last exit code`` field. Best-effort; never raises.
+    """
+    try:
+        printed = subprocess.run(
+            ["launchctl", "print", _launchctl_service()],
+            capture_output=True,
+            text=True,
+            timeout=2.0,
+        )
+    except (FileNotFoundError, subprocess.TimeoutExpired, OSError):
+        return None
+    if printed.returncode != 0:
+        return None
+    return _parse_last_exit_code(printed.stdout or "")
 
 
 def _wait_for_daemon(*, timeout_seconds: float) -> bool:
