@@ -59,7 +59,7 @@ class TestClaimLock:
         assert "started_at" in meta
 
     def test_release_clears_module_state(self, tmp_path):
-        pidfile.claim_lock(tmp_path / "cap")
+        pidfile.claim_lock(tmp_path / "cap", claimant="cli")
         assert pidfile._LOCKED_FD is not None
         pidfile.release_lock()
         assert pidfile._LOCKED_FD is None
@@ -357,7 +357,7 @@ class TestStopForceTargetsLockOwner:
         # almost certainly doesn't exist.
         if pidfile._LOCKED_FD is not None:
             pidfile.release_lock()
-        pidfile.claim_lock(tmp_path / "cap")
+        pidfile.claim_lock(tmp_path / "cap", claimant="cli")
         try:
             import psutil
             real_process = psutil.Process
@@ -404,7 +404,7 @@ class TestStopForceTargetsLockOwner:
         monkeypatch.setattr(_fcntl, "flock", _flock_eio)
 
         with pytest.raises(OSError, match="simulated"):
-            pidfile.claim_lock(tmp_path / "cap")
+            pidfile.claim_lock(tmp_path / "cap", claimant="cli")
 
         # No leaked fd: each opened fd was closed by the OSError-handling path.
         for fd in opened_fds:
@@ -424,7 +424,7 @@ class TestLockIsActiveReadOnly:
             pidfile.release_lock()
 
         # Hold the lock from this process so the probe should report active.
-        pidfile.claim_lock(tmp_path / "cap")
+        pidfile.claim_lock(tmp_path / "cap", claimant="cli")
         try:
             # Sanity: probe reports active under normal conditions.
             assert pidfile.lock_is_active() is True
@@ -451,7 +451,7 @@ class TestResetForTests:
     def test_reset_clears_state(self, tmp_path):
         """Todo 029: _reset_for_tests is the documented contract for tests
         that need to claim_lock without inheriting prior state."""
-        pidfile.claim_lock(tmp_path / "cap")
+        pidfile.claim_lock(tmp_path / "cap", claimant="cli")
         assert pidfile._LOCKED_FD is not None
 
         pidfile._reset_for_tests()
@@ -486,11 +486,11 @@ class TestLockIsActive:
         assert pidfile.lock_is_active() is False
 
     def test_held_lock_is_active(self, tmp_path):
-        pidfile.claim_lock(tmp_path / "cap")
+        pidfile.claim_lock(tmp_path / "cap", claimant="cli")
         assert pidfile.lock_is_active() is True
 
     def test_released_lock_is_inactive(self, tmp_path):
-        pidfile.claim_lock(tmp_path / "cap")
+        pidfile.claim_lock(tmp_path / "cap", claimant="cli")
         pidfile.release_lock()
         # File still exists with stale content but flock is free
         assert pidfile.LOCK_FILE.exists()
@@ -547,7 +547,7 @@ class TestCrossProcessMutex:
         try:
             assert started_q.get(timeout=5) == "acquired"
             with pytest.raises(pidfile.LockContended):
-                pidfile.claim_lock(tmp_path / "cap")
+                pidfile.claim_lock(tmp_path / "cap", claimant="cli")
         finally:
             proc.join(timeout=5)
             if proc.is_alive():
@@ -568,7 +568,7 @@ class TestCrossProcessMutex:
             assert started_q.get(timeout=5) == "acquired"
             proc.join(timeout=5)
             # Now the child has exited; we should be able to claim cleanly.
-            fd = pidfile.claim_lock(tmp_path / "cap")
+            fd = pidfile.claim_lock(tmp_path / "cap", claimant="cli")
             assert isinstance(fd, int)
         finally:
             if proc.is_alive():
@@ -587,7 +587,7 @@ def _race_claim_in_child(lock_path, lock_dir, result_q):
     _pf.LOCK_FILE = _Path(str(lock_path))
     _pf._LOCKED_FD = None
     try:
-        _pf.claim_lock(_Path("/tmp/cap"))
+        _pf.claim_lock(_Path("/tmp/cap"), claimant="cli")
         # Hold briefly so the racer gets a stable contended view
         time.sleep(0.3)
         result_q.put("won")
@@ -655,7 +655,7 @@ class TestContendedExceptionPayload:
         try:
             assert started_q.get(timeout=5) == "ready"
             with pytest.raises(pidfile.LockContended) as exc_info:
-                pidfile.claim_lock(tmp_path / "cap")
+                pidfile.claim_lock(tmp_path / "cap", claimant="cli")
             owner = exc_info.value.owner
             assert owner.get("claimant") == "swiftui"
             assert owner.get("pid") == proc.pid

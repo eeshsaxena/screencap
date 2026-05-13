@@ -19,6 +19,15 @@ PID_FILE = _DEFAULT_BASE / "recording.pid"
 LOCK_DIR = _DEFAULT_BASE / "run"
 LOCK_FILE = LOCK_DIR / "recording.lock"
 
+# Canonical claimant identifiers written into the lock metadata's `claimant`
+# field. ``CLAIMANT_DAEMON`` is the only string production code writes after
+# Phase 2; ``CLAIMANT_CLI`` and ``CLAIMANT_SWIFTUI`` survive as readable
+# labels so old `recording.lock` files (written by pre-daemon CLI runs and
+# Phase 1's SwiftUI subprocess path) keep parsing without error.
+CLAIMANT_DAEMON = "daemon"
+CLAIMANT_CLI = "cli"
+CLAIMANT_SWIFTUI = "swiftui"
+
 # Module-global fd holding the active flock. Held for the lifetime of the
 # claiming process; kernel releases on death even if release_lock() is not
 # called. A second claim_lock() in the same process is a no-op.
@@ -209,7 +218,7 @@ def _pid_exists(pid: int) -> bool:
         return False
 
 
-def claim_lock(capture_dir: Path | str | None, claimant: str = "cli") -> int:
+def claim_lock(capture_dir: Path | str | None, *, claimant: str) -> int:
     """Acquire an exclusive flock on LOCK_FILE; write JSON metadata into it.
 
     Args:
@@ -218,9 +227,13 @@ def claim_lock(capture_dir: Path | str | None, claimant: str = "cli") -> int:
             from SessionController init — the per-recording dir is allocated
             later and plumbed in via :func:`update_lock_metadata` (todo 014).
             Persisted as ``null`` in the JSON when ``None``.
-        claimant: "cli" for standalone invocations, "swiftui" when spawned by
-            the SwiftUI app (via ``SCREENCAP_PARENT=swiftui``), or "daemon"
-            when the daemon owns the session.
+        claimant: ``CLAIMANT_DAEMON`` for daemon-owned sessions (the only
+            production writer after Phase 2). ``CLAIMANT_CLI`` /
+            ``CLAIMANT_SWIFTUI`` survive as readable labels for old lock
+            metadata; tests still pass literal "cli"/"swiftui" against the
+            pidfile semantics directly. Required keyword arg — callers must
+            specify so no production write path can silently default to "cli"
+            after the daemon-only consolidation.
 
     Returns:
         The locked file descriptor (kept open; held in module-global state).

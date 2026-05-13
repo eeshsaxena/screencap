@@ -217,7 +217,7 @@ def _engine_worker_cmd(encoded_args: str) -> None:
         EVENT_STARTED,
         emit_event,
     )
-    from screencap.daemon.supervisor import CLAIMANT_DAEMON
+    from screencap.pidfile import CLAIMANT_DAEMON
     from screencap.session import run_recording_worker
 
     queues = [

@@ -23,6 +23,7 @@ import psutil
 from screencap import _stderr_events
 from screencap.daemon import errors, schema
 from screencap.daemon.event_bus import CursorOutOfRangeError, EventBus, _Subscription
+from screencap.pidfile import CLAIMANT_DAEMON
 
 if TYPE_CHECKING:
     from screencap.daemon.schema import RecordingStartRequest
@@ -31,10 +32,11 @@ logger = logging.getLogger(__name__)
 
 EngineCommandFactory = Callable[[str], list[str]]
 
-# Canonical claimant identifier the daemon writes into the pidfile lock
-# metadata. Mirrored at supervisor.py call sites, app.py daemon-owned
-# detection, and cli.py engine-worker started event.
-CLAIMANT_DAEMON = "daemon"
+# ``CLAIMANT_DAEMON`` is re-exported above so existing
+# ``from screencap.daemon.supervisor import CLAIMANT_DAEMON`` importers keep
+# resolving without churn; the canonical home is now ``screencap.pidfile``
+# alongside ``CLAIMANT_CLI`` / ``CLAIMANT_SWIFTUI`` for historical metadata.
+__all__ = ["CLAIMANT_DAEMON", "Supervisor"]
 
 # Engine-stderr kernel pipe widening — buys headroom for `_stderr_pump`
 # against engine-side burst writes so a briefly-slow pump drain does not

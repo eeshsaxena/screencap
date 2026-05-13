@@ -18,7 +18,7 @@ from starlette.routing import Route
 from screencap import _stderr_events
 from screencap.daemon import errors, schema
 from screencap.daemon.event_bus import CursorOutOfRangeError, EventBus
-from screencap.daemon.supervisor import CLAIMANT_DAEMON
+from screencap.pidfile import CLAIMANT_DAEMON
 
 logger = logging.getLogger(__name__)
 

@@ -100,7 +100,7 @@ class TestStatusJson:
         assert payload["claimant"] == "swiftui"
 
     def test_elapsed_within_one_second_of_actual(self, tmp_path):
-        pidfile.claim_lock(tmp_path / "rec")
+        pidfile.claim_lock(tmp_path / "rec", claimant="cli")
         time.sleep(0.5)
         try:
             result = _run_status_json()
