@@ -1,0 +1,288 @@
+"""HTTP-over-AF_UNIX client used by CLI live-state commands.
+
+Phase 2 U1 collapses ``screencap start``/``stop``/``status`` from
+in-process engine spawn and lockfile-based state reads down to thin
+HTTP clients of the Phase 1 daemon API. This module is the Python-side
+analogue of the SwiftUI ``DaemonClient.swift`` brought up in Phase 1 U7
+— both wrap ``httpx`` transports configured against
+``~/.screencap/run/api.sock``.
+
+Kept narrow on purpose: no auto-spawn here (see ``_autospawn``), no
+retry policy beyond what callers explicitly opt into, no JSON envelope
+normalization. The CLI command bodies decide how to format errors
+against the existing rich Console UX.
+"""
+
+from __future__ import annotations
+
+import json
+from collections.abc import Iterator
+from contextlib import contextmanager
+from pathlib import Path
+from typing import Any
+
+import httpx
+
+# Pin the daemon API schema version the CLI was compiled against. A
+# response carrying a different ``api_schema_version`` triggers a clear
+# kickstart-the-daemon message rather than silent shape drift; the
+# daemon owns forward compatibility, the CLI does not negotiate.
+SUPPORTED_API_SCHEMA_VERSION = 1
+
+
+def default_socket_path() -> Path:
+    """Match ``screencap.daemon.socket.default_socket_path`` without import cost.
+
+    Inlined here so importing this module does not drag the daemon
+    package (and its starlette/uvicorn transitive surface) onto the CLI
+    fast path — the live-state command bodies hit this client by
+    construction and ``screencap --help`` must stay sub-second.
+    """
+    return Path.home() / ".screencap" / "run" / "api.sock"
+
+
+class DaemonUnreachableError(RuntimeError):
+    """The daemon socket is missing, refused, or hung up unexpectedly.
+
+    Distinct from ``DaemonAPIError`` because callers may want to
+    auto-spawn or surface a kickstart hint instead of treating it as a
+    contract failure.
+    """
+
+
+class DaemonAPIError(RuntimeError):
+    """The daemon returned an error envelope; ``envelope`` carries the body."""
+
+    def __init__(self, envelope: dict[str, Any], *, status_code: int) -> None:
+        self.envelope = envelope
+        self.status_code = status_code
+        code = envelope.get("error") or envelope.get("error_code") or "unknown"
+        super().__init__(f"daemon error: {code} (status={status_code})")
+
+
+class SchemaMismatchError(RuntimeError):
+    """The daemon advertises an api_schema_version the CLI does not recognize.
+
+    Surfaces to the user with kickstart guidance; the CLI does not
+    attempt to interpret an unknown contract.
+    """
+
+    def __init__(self, daemon_version: int) -> None:
+        self.daemon_version = daemon_version
+        super().__init__(
+            f"daemon advertises api_schema_version={daemon_version}, "
+            f"CLI supports {SUPPORTED_API_SCHEMA_VERSION}"
+        )
+
+
+class DaemonHTTPClient:
+    """Synchronous HTTP-over-AF_UNIX client for the daemon's ``/v0/*`` surface.
+
+    Built per-invocation. The underlying ``httpx.Client`` is opened
+    lazily on first call and reused for the lifetime of the instance.
+    Live-state CLI commands construct one client per invocation, so
+    no shared-pool concerns apply.
+    """
+
+    def __init__(
+        self,
+        socket_path: Path | str | None = None,
+        *,
+        connect_timeout: float = 2.0,
+        read_timeout: float | None = 30.0,
+        transport: httpx.BaseTransport | None = None,
+    ) -> None:
+        self._socket_path = Path(socket_path).expanduser() if socket_path else default_socket_path()
+        self._connect_timeout = connect_timeout
+        self._read_timeout = read_timeout
+        # ``transport`` is injectable so tests can drop in a
+        # ``MockTransport`` or ``ASGITransport`` without binding a real
+        # UNIX socket. Production code never passes it.
+        self._explicit_transport = transport
+        self._client: httpx.Client | None = None
+
+    @property
+    def socket_path(self) -> Path:
+        return self._socket_path
+
+    def _build_client(self) -> httpx.Client:
+        transport = self._explicit_transport
+        if transport is None:
+            transport = httpx.HTTPTransport(uds=str(self._socket_path))
+        return httpx.Client(
+            base_url="http://daemon",
+            transport=transport,
+            timeout=httpx.Timeout(
+                connect=self._connect_timeout,
+                read=self._read_timeout,
+                write=self._read_timeout,
+                pool=self._connect_timeout,
+            ),
+            trust_env=False,
+        )
+
+    def _client_or_open(self) -> httpx.Client:
+        if self._client is None:
+            self._client = self._build_client()
+        return self._client
+
+    def close(self) -> None:
+        if self._client is not None:
+            self._client.close()
+            self._client = None
+
+    def __enter__(self) -> DaemonHTTPClient:
+        return self
+
+    def __exit__(self, *_: Any) -> None:
+        self.close()
+
+    # -- low-level request helpers ------------------------------------
+
+    def _request(
+        self,
+        method: str,
+        path: str,
+        *,
+        json_body: dict[str, Any] | None = None,
+        stream: bool = False,
+        params: dict[str, Any] | None = None,
+        timeout: float | httpx.Timeout | None = None,
+    ) -> httpx.Response:
+        client = self._client_or_open()
+        try:
+            if stream:
+                # Callers using ``stream=True`` must consume + close the
+                # response themselves via ``events()``. Returning the raw
+                # response here keeps the streaming-iter contract single-
+                # sited.
+                req = client.build_request(
+                    method, path, json=json_body, params=params, timeout=timeout
+                )
+                return client.send(req, stream=True)
+            return client.request(
+                method,
+                path,
+                json=json_body,
+                params=params,
+                timeout=timeout,
+            )
+        except httpx.ConnectError as exc:
+            raise DaemonUnreachableError(
+                f"could not connect to daemon at {self._socket_path}: {exc}"
+            ) from exc
+        except httpx.ReadError as exc:
+            raise DaemonUnreachableError(
+                f"daemon disconnected mid-response: {exc}"
+            ) from exc
+
+    @staticmethod
+    def _decode_envelope(response: httpx.Response) -> dict[str, Any]:
+        try:
+            data = response.json()
+        except json.JSONDecodeError as exc:
+            raise DaemonUnreachableError(
+                f"daemon returned non-JSON body (status={response.status_code})"
+            ) from exc
+        if not isinstance(data, dict):
+            raise DaemonUnreachableError(
+                f"daemon returned non-object JSON body (status={response.status_code})"
+            )
+        return data
+
+    def _check_schema_or_raise(self, envelope: dict[str, Any]) -> None:
+        version = envelope.get("api_schema_version")
+        if isinstance(version, int) and version != SUPPORTED_API_SCHEMA_VERSION:
+            raise SchemaMismatchError(version)
+
+    def _parse_ok_envelope(self, response: httpx.Response) -> dict[str, Any]:
+        envelope = self._decode_envelope(response)
+        self._check_schema_or_raise(envelope)
+        if response.status_code >= 400 or envelope.get("ok") is False:
+            raise DaemonAPIError(envelope, status_code=response.status_code)
+        return envelope
+
+    # -- high-level verbs --------------------------------------------
+
+    def info(self) -> dict[str, Any]:
+        """``GET /v0/daemon.info`` — useful for connectivity smoke checks."""
+        return self._parse_ok_envelope(self._request("GET", "/v0/daemon.info"))
+
+    def list_recordings(self) -> dict[str, Any]:
+        return self._parse_ok_envelope(self._request("GET", "/v0/recording.list"))
+
+    def snapshot(self) -> dict[str, Any]:
+        return self._parse_ok_envelope(self._request("GET", "/v0/session.snapshot"))
+
+    def start(self, **payload: Any) -> dict[str, Any]:
+        # The daemon mirrors Phase 1's RecordingStartRequest shape; we
+        # let it validate. Keyword-only args keep call sites readable.
+        return self._parse_ok_envelope(
+            self._request("POST", "/v0/recording.start", json_body=payload)
+        )
+
+    def stop(self, *, force: bool = False, **extra: Any) -> dict[str, Any]:
+        body: dict[str, Any] = {"force": force}
+        body.update(extra)
+        return self._parse_ok_envelope(
+            self._request("POST", "/v0/recording.stop", json_body=body)
+        )
+
+    @contextmanager
+    def events(
+        self,
+        *,
+        since: int | None = None,
+        read_timeout: float | None = None,
+    ) -> Iterator[Iterator[dict[str, Any]]]:
+        """NDJSON event stream context manager.
+
+        Yields an iterator of decoded JSON event dicts. Caller iterates
+        until termination (``recording_finalized``, ``_close`` frame, or
+        upstream EOF). The context manager closes the underlying
+        streaming response on exit so the daemon-side subscription is
+        torn down promptly.
+
+        ``since`` is the bus cursor the caller wants to resume from;
+        omit for "from now". A cursor older than the retained replay
+        window surfaces as a ``DaemonAPIError`` with the daemon's
+        ``cursor_unknown`` envelope.
+        """
+        params = {"since": since} if since is not None else None
+        response = self._request(
+            "GET",
+            "/v0/events",
+            params=params,
+            stream=True,
+            # Use a longer read timeout for events; the call site may
+            # override per-poll. ``None`` disables the read deadline.
+            timeout=httpx.Timeout(
+                connect=self._connect_timeout,
+                read=read_timeout if read_timeout is not None else None,
+                write=self._connect_timeout,
+                pool=self._connect_timeout,
+            ),
+        )
+        try:
+            if response.status_code >= 400:
+                envelope = self._decode_envelope(response)
+                self._check_schema_or_raise(envelope)
+                raise DaemonAPIError(envelope, status_code=response.status_code)
+
+            def _iter() -> Iterator[dict[str, Any]]:
+                for raw_line in response.iter_lines():
+                    if not raw_line:
+                        continue
+                    try:
+                        event = json.loads(raw_line)
+                    except json.JSONDecodeError:
+                        # Skip malformed lines — the daemon owns the
+                        # contract; a bad line is a daemon bug, not a
+                        # client one. Surface via the daemon stderr log.
+                        continue
+                    if isinstance(event, dict):
+                        yield event
+
+            yield _iter()
+        finally:
+            response.close()
