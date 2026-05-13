@@ -10,7 +10,7 @@ origin: docs/brainstorms/2026-05-08-cli-gui-mcp-architecture-requirements.md
 
 ## Summary
 
-Phase 2 consolidates around the daemon contract Phase 1 established. CLI live-state commands (`start`, `stop`, `status`) become thin clients of `/v0/*`; a new `screencap mcp` subcommand runs an MCP stdio server that translates agent tool calls into daemon HTTP/NDJSON; the caller-supplied `started_by` field is replaced with peer-EPID-derived provenance; and SwiftUI's `CLIClient` fallback paths are deleted now that all surfaces speak the daemon API. Engine topology consolidation (origin R1's literal "engine inside the daemon process" reading) is explicitly **deferred to a separate spike** — Phase 2 closes CLI's spawn path so the daemon is the sole engine spawner, but the launchd→daemon→engine subprocess topology persists.
+Phase 2 consolidates around the daemon contract Phase 1 established. CLI live-state commands (`start`, `stop`, `status`) become thin clients of `/v0/*`; a new `screencap mcp` subcommand runs an MCP stdio server that translates agent tool calls into daemon HTTP/NDJSON; the daemon adds peer-EPID-derived `started_by` provenance (additive — caller-supplied field is soft-deprecated, not removed; no schema break); and SwiftUI's `CLIClient` fallback paths are deleted now that all surfaces speak the daemon API. Engine topology consolidation (origin R1's literal "engine inside the daemon process" reading) is explicitly **deferred to a separate spike** — Phase 2 closes CLI's spawn path so the daemon is the sole engine spawner, but the launchd→daemon→engine subprocess topology persists.
 
 ---
 
@@ -59,6 +59,7 @@ R5/R8/R9/R10/R11 are Phase 1 deliverables — Phase 2 inherits them unchanged.
 ### Deferred to Follow-Up Work
 
 - **Engine topology spike** — separate ticket explores in-process vs subprocess engine consolidation with measurement (idle CPU/RSS, GIL contention, crash-recovery latency, upgrade-during-recording semantics) before committing to either path. References Phase 1's "Rejected in-process engine" rationale and origin R1's literal reading. Tracked in `docs/tickets/`.
+- **Pause/resume agent verbs** — origin A3 Success Criteria names pause as a required agent verb, but Phase 1 did not ship `recording.pause` / `recording.resume` daemon endpoints, and adding them requires engine-side pause semantics (codec-state-during-pause, lock-state-during-pause, event taxonomy for `recording_paused` / `recording_resumed`, supervisor state machine extension). Phase 2 ships MCP without pause/resume; A3's pause commitment is weakened in this release. **Recovery path:** a follow-up unit designs engine pause (SIGSTOP/SIGCONT vs engine-internal IPC), extends `pidfile.py` lock-state semantics for paused recordings, adds the daemon verbs and event types, then adds the MCP tools. No Phase 2 contract decisions need revising when pause/resume lands.
 - **MCP HTTP/SSE transport** — when an agent topology emerges that requires non-local transport.
 - **Streaming MCP tools** — pending `mcp` SDK v2 first-class streaming primitives. Until then, batch-fetch with cursor (the `tail_events` shape in U4) is the idiomatic Phase 2 design.
 - **`screencap view` migration to a daemon verb** — Phase 2 keeps `view --` as a catalog-only passthrough via SwiftUI's `runAwaitingExit`. Migrating to a daemon-routed `recording.open` verb is a small follow-up if the SwiftUI subprocess shell-out becomes load-bearing.
@@ -71,6 +72,8 @@ R5/R8/R9/R10/R11 are Phase 1 deliverables — Phase 2 inherits them unchanged.
 ## Context & Research
 
 ### Relevant Code and Patterns
+
+> *Line anchors below were captured 2026-05-08 and have drifted slightly in `cli.py` (commits since Phase 1 ship). Re-grep symbols at implementation time rather than `sed`-by-line-number.*
 
 - [src/screencap/cli.py](src/screencap/cli.py) — Click root group; live-state commands at `start` (@cli.command at 565, body at 607), `status` (@cli.command at 1954, body at 1964), `stop` (@cli.command at 2090, body at 2096), and the `_legacy_start_recording` helper (line 908). The `serve` subcommand (line 126) is the mode-dispatch precedent for `mcp`.
 - [src/screencap/daemon/](src/screencap/daemon/) — Phase 1 deliverable. `app.py`, `server.py`, `socket.py` already in place; `schema.py`, `errors.py`, `event_bus.py`, `supervisor.py`, `launchagent.py` complete Phase 1's surface.
@@ -118,7 +121,7 @@ The seven learnings cited in the [Phase 1 plan](docs/plans/2026-05-08-001-feat-d
 
 - **MCP tool surface: bounded verb set translating to daemon `/v0/*`.** Tools: `list_recordings`, `start_recording`, `stop_recording`, `get_session_snapshot`, `tail_events(since, max=100, timeout_s=5.0)`. The `tail_events` shape is **batch-fetch with cursor**, not streaming — `mcp` SDK v1.x doesn't have first-class streaming tools. Agent calls `tail_events` with the previous response's cursor; tool blocks up to `timeout_s` for new events; returns `{events, cursor, more, terminal}`. Mirrors `kubectl logs --since=...` shape that agents already pattern-match against.
 
-- **Server-derived `started_by` via `LOCAL_PEEREPID + proc_pidpath`.** Replaces caller-supplied `started_by` field on `recording.start`. Daemon resolves peer's effective PID via `getsockopt(SOL_LOCAL, LOCAL_PEEREPID)`, walks to executable path via `proc_pidpath` from `libproc.dylib`, derives a tag (`swiftui` for `*/ScreenCap.app/Contents/MacOS/screencap`, `cli` for direct binary, `mcp` for `screencap mcp` parent, `unknown` otherwise). **Advisory only** — EUID match from Phase 1 stays the auth gate. Caller-supplied `started_by` field is removed from the request schema (breaking change to the Phase 1 contract); SwiftUI's existing `started_by="swiftui-via-daemon"` plumbing in `DaemonClient` becomes obsolete.
+- **Server-derived `started_by` via `LOCAL_PEEREPID + proc_pidpath` (additive — no schema break).** Daemon resolves peer's effective PID via `getsockopt(SOL_LOCAL, LOCAL_PEEREPID)`, walks to executable path via `proc_pidpath` from `libproc.dylib`, derives a tag (`swiftui` for `*/ScreenCap.app/Contents/MacOS/screencap`, `cli` for direct binary, `mcp` for the `screencap mcp` peer, `unknown` otherwise). **Advisory only** — EUID match from Phase 1 stays the auth gate. The request schema **keeps `started_by` as an optional field**; daemon ignores caller-supplied values with a debug log entry. No API version bump. SwiftUI's existing `started_by="swiftui-via-daemon"` plumbing continues to work unchanged (the value is logged but not written to metadata). This honors R14's no-contract-breaks commitment verbatim — server-derived provenance is delivered without forcing client coordination.
 
 - **Stderr events become daemon-internal.** After CLI consolidation, the only consumer of engine stderr is the daemon's supervisor stderr-bridge (Phase 1 U5). `_stderr_events.py` keeps `emit_event` for use by the engine subprocess; the engine still writes line-buffered JSON to stderr. The bus is the only external surface. Tests in `tests/test_stderr_event_contract.py` continue to pin the schema for the daemon-internal contract; they are no longer external-contract tests.
 
@@ -126,9 +129,9 @@ The seven learnings cited in the [Phase 1 plan](docs/plans/2026-05-08-001-feat-d
 
 - **SwiftUI `CLIClient` deletion in full.** `runJSON`, `spawn`, `runDetached`, `runOneShot`, `mergedEnv`, `SpawnedProcess` nested class — all deleted. `runAwaitingExit` for `view --` (catalog-open shell-out) **stays** because it's not engine-related and doesn't depend on stderr events. The `claimant` field on `CLIStatus` typedecl is dropped. U5 includes an audit pass over `RecordingState` to remove any cross-claimant branch — the plan was drafted against an `another_process_recording` enum case that grep no longer finds under that name in the current codebase, so the audit may surface a renamed case or find this is already a no-op. `RecorderController.handleStderrLine` is deleted; events flow only via `DaemonClient.subscribe`.
 
-- **API schema version bump on `recording.start` (1 → 2).** Removed required field forces a bump. Both U2 (server) and U5 (client) ship in Phase 2; no skew window in production. Dev environment skew is handled by Phase 1's "reload daemon" UX.
+- **No API schema version bump.** U2 is additive — `started_by` stays Optional in the request schema and the daemon ignores caller-supplied values. API stays at v1.
 
-- **Sequencing strategy: U1 is foundation, U6 is keystone.** U1 lands first — once CLI is daemon-driven, the cross-claimant state effectively dies and U5 (SwiftUI cleanup) becomes a deletion exercise. U2 (provenance) lands alongside U1 since it changes the `recording.start` contract. U3-U4 (MCP) can parallelize with U1 — they're additive and don't depend on CLI's transport switch. U6 (AE1 acceptance test) requires all five units shipped.
+- **Sequencing strategy: U1 is foundation, U6 is keystone.** U1 lands first — once CLI is daemon-driven, the cross-claimant state effectively dies and U5 (SwiftUI cleanup) becomes a deletion exercise. U2 (provenance) is independent of U1 and can land in parallel; it no longer changes the `recording.start` contract. U3-U4 (MCP) can parallelize with U1 — they're additive and don't depend on CLI's transport switch. U6 (AE1 acceptance test) requires all five units shipped.
 
 ---
 
@@ -208,7 +211,7 @@ The plan introduces a new `src/screencap/mcp/` package, a new `tests/mcp/` tree,
         test_ae1_end_to_end.py         # Multi-client integration: SwiftUI + MCP + CLI
 
     macos/ScreenCap/Controllers/
-        CLIClient.swift                # SHRINK to runAwaitingExit-only (or DELETE if view -- migrates)
+        CLIClient.swift                # SHRINK: delete engine-related methods; keep runAwaitingExit and helpers (per Scope Boundaries — view -- migration deferred)
         RecorderController.swift       # MODIFY: delete handleStderrLine, claimant field, mixed-mode UX state
 
 ---
@@ -330,13 +333,13 @@ peer connection accepted
 
 **Approach:**
 - `_daemon_client.DaemonHTTPClient` — small AF_UNIX HTTP client using `httpx` (added to runtime dependencies in `pyproject.toml` as part of this unit — it is NOT a transitive dep of Phase 1's `starlette`/`uvicorn` stack) configured with `httpx.HTTPTransport(uds=...)`. Methods: `info()`, `list_recordings()`, `snapshot()`, `start(name, …)`, `stop(force=False)`, `events(since=None, timeout_s=None)` returning an iterator over NDJSON lines. Schema-version pin via `SUPPORTED_API_SCHEMA_VERSION` constant; mismatch surfaces a kickstart guidance message.
-- `_autospawn.ensure_daemon_or_spawn()` — connect-probe; if reachable, return. Else check `launchctl print gui/$UID/com.screencap.daemon` exit code: if installed, error with kickstart guidance; if not installed (F3), `os.posix_spawn` with an **absolute path** to the daemon binary (resolve via `sys.executable` when `sys.frozen` is set for PyInstaller, else `Path(sys.argv[0]).resolve()` for dev/pip installs — NEVER pass the bare command name, which would let a hostile PATH execute an arbitrary binary with Screen Recording TCC grants). Pass `start_new_session=True`, redirect stdout/stderr to `~/.screencap/run/auto-serve.log`, set `SCREENCAP_DAEMON_AUTOSPAWN=1` env. Poll socket via exponential backoff up to 5s. On readiness timeout, kill the spawned PID and surface the log tail. Add a test asserting `_autospawn` always invokes `posix_spawn` with an absolute path (security regression guard).
+- `_autospawn.ensure_daemon_or_spawn()` — connect-probe; if reachable, return. Else check `launchctl print gui/$UID/com.screencap.daemon` exit code: if installed, error with kickstart guidance; if not installed (F3), `os.posix_spawn` with an **absolute path** to the daemon binary (resolve via `sys.executable` when `sys.frozen` is set for PyInstaller, else `Path(sys.argv[0]).resolve()` for dev/pip installs — NEVER pass the bare command name, which would let a hostile PATH execute an arbitrary binary with Screen Recording TCC grants). Pass `start_new_session=True`, redirect stdout/stderr to `~/.screencap/run/auto-serve.log` opened with `mode=0o600` (also verify `os.path.realpath(path) == os.path.abspath(path)` for the parent dir before opening, matching U3's log-dir hardening), pass an **explicit private CLI flag** `--idle-shutdown=600` to the spawned daemon (replaces the `SCREENCAP_DAEMON_AUTOSPAWN=1` env-var signal — env vars inherit transitively and a leaky parent could contaminate the LaunchAgent daemon's lifetime; a CLI flag is self-documenting in `ps` and cannot be inherited). Poll socket via exponential backoff up to 5s. On readiness timeout, kill the spawned PID and surface the log tail. Add a test asserting `_autospawn` always invokes `posix_spawn` with an absolute path (security regression guard).
 - `screencap start`: call `ensure_daemon_or_spawn()`, `POST /v0/recording.start`, then iterate `GET /v0/events?since=<cursor>` printing each event to stderr (preserves today's CLI UX where `screencap start -- foo` shows live event echo). Map terminal `recording_finalized` event to exit code per existing taxonomy in `_stderr_events.py` (0/1/2/3/4/5). On Ctrl-C, send `POST /v0/recording.stop` (graceful) and continue draining events until `recording_finalized`.
 - `screencap stop`: call `ensure_daemon_or_spawn()` (don't auto-spawn just to stop — if no daemon, no recording to stop), `POST /v0/recording.stop` with `force` flag from CLI arg.
 - `screencap status`: call `ensure_daemon_or_spawn()`, `GET /v0/session.snapshot`, format output to match today's `screencap status --json` shape (envelope already matches per Phase 1 U3).
-- **Daemon side: `SCREENCAP_DAEMON_AUTOSPAWN=1` enables 10-minute idle-shutdown timer.** Reset on each accepted connection or active recording. Daemon exits cleanly on idle expiry; subsequent CLI invocations re-spawn it. LaunchAgent-managed daemons (no env var set) keep the existing run-all-day behavior.
+- **Daemon side: `screencap serve --idle-shutdown=<secs>` enables an idle-shutdown timer (auto-spawn passes 600).** Reset on each accepted connection or active recording. Daemon exits cleanly on idle expiry; subsequent CLI invocations re-spawn it. LaunchAgent-managed daemons (plist invokes `screencap serve` without the flag) keep the existing run-all-day behavior. Replaces the original `SCREENCAP_DAEMON_AUTOSPAWN=1` env-var signal — env-var inheritance is a known footgun (FYI-4 in the 2026-05-12 review).
 - **Auto-spawn user-visible output (stderr only — stdout reserved for structured JSON on the `status` path):**
-  - On spawn: print `"Starting ScreenCap daemon..."` once; replace with `"Daemon ready."` when the socket becomes connectable.
+  - On spawn: print `"Starting ScreenCap daemon..."` once. When `sys.stderr.isatty()` is true, overwrite the line with `"Daemon ready."` when the socket becomes connectable; when stderr is non-tty (cron, CI, redirected log), emit both as separate sequential lines with no ANSI overwrite sequences so logs stay machine-readable.
   - On readiness timeout: print `"Error: ScreenCap daemon failed to start within 5s. Last log lines from ~/.screencap/run/auto-serve.log:"` followed by the last 20 lines of that file (or `"(log file not found)"` fallback). Kill the spawned PID. Exit non-zero.
   - On LaunchAgent-installed-but-not-running: print exactly `"Error: ScreenCap daemon is registered with launchd but not running. Start it with: launchctl kickstart -kp gui/$UID/com.screencap.daemon\n(Auto-start was suppressed because launchd is managing this daemon. Running it manually would conflict with launchd supervision.)"` and exit non-zero. Do NOT auto-spawn.
 - **Test fixture migration is out of scope** for U1 — `tests/test_pidfile_mutex.py` etc. continue to use literal `"cli"` strings since they test pidfile semantics, not production write paths.
@@ -374,7 +377,7 @@ peer connection accepted
 
 #### U2. Server-derived `started_by` provenance via `LOCAL_PEEREPID` + `proc_pidpath`
 
-**Goal:** Replace the caller-supplied `started_by` field on `recording.start` with a server-derived tag based on the peer's effective PID and executable path. Closes the Phase 1 follow-up "Server-supplied `started_by` provenance validation."
+**Goal:** Add server-derived `started_by` provenance based on the peer's effective PID and executable path. Caller-supplied field is soft-deprecated (still accepted, daemon ignores). Closes the Phase 1 follow-up "Server-supplied `started_by` provenance validation" without breaking the recording.start contract.
 
 **Requirements:** R7 (the second daemon caller is now real, not hypothetical), R14 (contract evolves with discipline).
 
@@ -382,23 +385,20 @@ peer connection accepted
 
 **Files:**
 - Create: `src/screencap/daemon/provenance.py`
-- Modify: `src/screencap/daemon/app.py` (request handler for `recording.start` derives `started_by` from peer; field removed from request schema)
-- Modify: `src/screencap/daemon/schema.py` (remove `started_by` from `RecordingStartRequest`; bump `_RECORDING_START_API_VERSION` from 1 to 2)
-- Modify: `macos/ScreenCap/Controllers/DaemonClient.swift` (remove `started_by` plumbing from request body; pin new schema version)
-- Modify: `src/screencap/cli/_daemon_client.py` (remove `started_by` from `start()` signature) — coordinates with U1's existence
+- Modify: `src/screencap/daemon/app.py` (request handler for `recording.start` derives `started_by` from peer; ignores caller-supplied value with a debug log line)
+- Modify: `src/screencap/daemon/schema.py` (keep `started_by` as Optional; mark `deprecated=True` in the Pydantic field; **no version bump** — API stays at v1)
 - Test: `tests/daemon/test_provenance.py`
 
 **Approach:**
 - `provenance.derive_started_by(sock_fd) -> str` — uses `ctypes` to call `getsockopt(sock_fd, SOL_LOCAL=0, LOCAL_PEEREPID=0x003, …)` returning the peer's effective PID. Falls back to `LOCAL_PEERPID=0x002` if `LOCAL_PEEREPID` is unavailable on the running macOS. Then `libproc.proc_pidpath(pid, …)` returns the executable path.
-- Path classification is a pure function over the resolved path (testable without sockets): `*/ScreenCap.app/Contents/MacOS/screencap` → `swiftui`; parent process matches `screencap mcp` → `mcp`; bare binary path → `cli`; anything else → `unknown`.
-- Bump API schema version from 1 to 2 because the request shape changed (removed required field). The envelope is forward-compatible per Phase 1 discipline (unknown fields don't fail), but a removed required field forces the bump. SwiftUI's `DaemonClient` and the new `cli/_daemon_client.py` both pin to the new version.
+- Path classification is a pure function over the resolved path (testable without sockets): `*/ScreenCap.app/Contents/MacOS/screencap` → `swiftui`; bare binary path → `cli` OR `mcp` depending on the chosen OS API (see Open Questions: classification-API decision for `mcp` vs `cli` distinction — `screencap mcp` and `screencap start` are the same on-disk binary under single-binary mode dispatch); anything else → `unknown`.
+- **Additive request schema:** `RecordingStartRequest.started_by` stays `Optional[str]` with `deprecated=True`. Daemon ignores any caller value with `log.debug("ignoring caller-supplied started_by=%r; using server-derived=%r", request.started_by, peer_class)`. Persisted recording metadata records the server-derived value as authoritative. No API version bump.
 - **TOCTOU window:** between socket `accept()` and `getsockopt(LOCAL_PEEREPID)`, the peer process could `exec()`. Acceptable for advisory provenance — the EUID match (Phase 1) remains the auth gate. Document in module docstring.
-- **Recording-name validation (security-hardening on `recording.start` request handler):** Daemon rejects any `name` value that contains a path-separator character (`/`, `\`), contains `..` as a path component, begins with a leading `.`, or exceeds 255 characters. Returns a 400-class envelope with error code `invalid_name`. Lives in the daemon handler (not only in the MCP tool layer) so it covers SwiftUI, CLI, and MCP callers uniformly. Test: `POST /v0/recording.start` with `name="../../../.ssh"` returns `invalid_name`.
-- **Persisted-metadata advisory marker:** The recording metadata schema (`schema.py`) gains a sibling `started_by_advisory: bool` field that ships as `true` for all values derived from `LOCAL_PEEREPID + proc_pidpath` classification. Future iterations that promote provenance to a validated identity (e.g., per-process capability tokens — see Deferred Follow-Up Work) set `started_by_advisory: false`. MCP tool responses (`list_recordings`, `get_session_snapshot`) include this field; any human-facing display of `started_by` must also surface the advisory flag. This admits the TOCTOU and path-spoof uncertainty in the persisted artifact instead of leaving it only in module docstrings.
+- **Recording-name validation (security-hardening on `recording.start` request handler):** Define a single canonical `validate_recording_name(name) -> None` (raises `InvalidNameError`) that rejects path-separator characters (`/`, `\`), `..` path components, leading `.`, and lengths >255. Apply at every downstream write site — the daemon handler (covers SwiftUI/CLI/MCP entry), `recorder.start_recording()` (engine spawn site, in case future internal callers bypass the handler), the catalog insert path, the on-disk directory creation, and metadata serialization. Document the function as the sole gate; raw name strings from requests must not be used directly downstream. Returns a 400-class envelope with error code `invalid_name`. Tests: `POST /v0/recording.start` with `name="../../../.ssh"` returns `invalid_name`; pre-existing catalog entries with traversal characters cannot escape `~/.screencap/recordings/` via catalog commands (`export`, `view`).
 
 **Patterns to follow:**
 - Phase 1 `daemon/socket.py` `getpeereid` ctypes pattern.
-- `cli.py` per-endpoint schema-version constant pattern for the bump.
+- Pydantic `Field(deprecated=True)` for the soft-deprecation of `started_by` in `RecordingStartRequest`.
 
 **Test scenarios:**
 - Happy path: connection from SwiftUI's bundled binary path → classified as `swiftui`.
@@ -411,9 +411,9 @@ peer connection accepted
 - Integration: `recording.start` request from each surface (SwiftUI, CLI, MCP) results in correct `started_by` in the daemon log + recording metadata.
 
 **Verification:**
-- `recording.start` request schema no longer accepts caller-supplied `started_by`.
-- API schema version pin updated; old clients (theoretical Phase 1 build of SwiftUI without the bump) get a clean schema-mismatch error.
-- Recording metadata reflects the server-derived value.
+- `recording.start` request schema still accepts `started_by` (Optional, deprecated). Daemon ignores caller value with a debug log line.
+- API schema version stays at v1 — no bump, no client coordination required.
+- Recording metadata reflects the server-derived value; caller-supplied `started_by` (if any) appears only in the daemon's debug log, never in persisted metadata.
 
 ---
 
@@ -440,7 +440,7 @@ peer connection accepted
 - `mcp/server.py` constructs a `FastMCP("screencap")` instance and an `httpx.AsyncClient(transport=httpx.AsyncHTTPTransport(uds=...))` configured against `~/.screencap/run/api.sock`. Tools registered in U4. `mcp.run()` starts the stdio loop.
 - **Logs go to stderr exclusively** per MCP convention (stdout is the JSON-RPC channel). Redirect to `~/Library/Logs/ScreenCap/mcp.{out,err}.log` when invoked outside Claude Desktop (which captures stderr to its own log dir at `~/Library/Logs/Claude/mcp-server-screencap.log`).
 - **Log directory hardening:** Before opening any log file, create the directory with `os.makedirs("~/Library/Logs/ScreenCap/", mode=0o700, exist_ok=True)`. After mkdir, verify `os.path.realpath(path) == os.path.abspath(path)` to defend against symlink redirection by a hostile pre-created path. On symlink detection, fall through to stderr-only logging and surface a one-line warning. (Confirm Phase 1 applies the same hardening to `~/.screencap/run/` — if not, file a follow-up to harmonize.)
-- **Daemon connection lazy-init:** `httpx.AsyncClient` is created once on first tool call, not at server import time. Avoids cold-start cost when `--help` or `--self-test` runs.
+- **Daemon connection lazy-init + lifecycle:** `httpx.AsyncClient` is created once on first tool call, not at server import time (avoids cold-start cost when `--help` or `--self-test` runs). The wrapping `DaemonHTTPClient` handles four lifecycle paths explicitly: (1) happy — tool call uses the cached client; (2) idle-disconnect — when an auto-spawned daemon idle-shuts-down, the next tool call catches `httpx.ConnectError` / `httpx.RemoteProtocolError` and surfaces a typed MCP error with "ScreenCap daemon not running; run `screencap status` in a terminal to wake it" guidance (MCP cannot auto-spawn per the U4 unreachable-daemon clause); (3) daemon restart with new boot — paired with `tail_events` cursor reconciliation (see U4); (4) shutdown — register `mcp.add_shutdown_handler(client.aclose)` for clean teardown.
 - PyInstaller spec excludes for the MCP-stdio path: `sse-starlette`, `python-multipart` (only pulled in by HTTP transport, which we don't ship). `starlette` and `uvicorn` ride along because Phase 1's `serve` mode requires them — MCP-stdio gets them at no incremental bundle cost. `pydantic-core` (Rust) and `cryptography` (only via `pyjwt[crypto]`) ship prebuilt wheels for both macOS arches.
 - Smoke-test extension: existing `_smoke-test` validates 9 critical subsystems (Phase 1 U6 added a 10th for daemon-mode). Add an 11th: import `screencap.mcp.server`, construct `FastMCP("test")`, do not start stdio. Catches PyInstaller bundling regressions for the MCP path.
 
@@ -465,13 +465,15 @@ peer connection accepted
 
 ---
 
-#### U4. MCP tool surface: `list_recordings`, `start_recording`, `stop_recording`, `pause_recording`, `resume_recording`, `get_session_snapshot`, `tail_events`
+#### U4. MCP tool surface: `list_recordings`, `start_recording`, `stop_recording`, `get_session_snapshot`, `tail_events`
 
 **Goal:** Implement the MCP tools that translate agent calls into daemon HTTP/NDJSON. Includes cursor-based event polling via `tail_events`.
 
 **Requirements:** R3, R7, R14, AE1.
 
-**Dependencies:** U3. **Also requires Phase 1 to expose `recording.pause` and `recording.resume` daemon verbs.** If Phase 1 did not ship these verbs (they were not listed as Phase 1 deliverables), U4 must either: (a) add them to Phase 1 as a precondition, or (b) drop `pause_recording` / `resume_recording` from this unit and document the deferral explicitly in Scope Boundaries. The origin Success Criteria names `pause` as a required agent verb — confirm before scoping U4. Also requires the replay-buffer changes from [docs/plans/2026-05-09-001-fix-high-priority-daemon-tickets-plan.md](docs/plans/2026-05-09-001-fix-high-priority-daemon-tickets-plan.md) (TKT-A/B/C/D) to ship before U4's `tail_events` test scenarios are authored — the fix plan finalizes `cursor_unknown` 410 semantics for `since=N`-older-than-retained-window.
+**Dependencies:** U3. Requires the replay-buffer changes from [docs/plans/2026-05-09-001-fix-high-priority-daemon-tickets-plan.md](docs/plans/2026-05-09-001-fix-high-priority-daemon-tickets-plan.md) (TKT-A/B/C/D, shipped) for U4's `tail_events` test scenarios — the fix plan finalized `cursor_unknown` 410 semantics for `since=N`-older-than-retained-window.
+
+> **Pause/resume scope decision (2026-05-13 review):** `pause_recording` and `resume_recording` tools were dropped from U4. The daemon verbs `recording.pause` / `recording.resume` do not exist in Phase 1 (verified), and adding them in Phase 2 requires engine-side pause semantics work (codec-state-during-pause, lock-state semantics, event taxonomy) that warrants its own unit. See Scope Boundaries → "Pause/resume agent verbs" for the deferral and recovery path.
 
 **Files:**
 - Create: `src/screencap/mcp/tools.py`, `src/screencap/mcp/errors.py`
@@ -480,15 +482,24 @@ peer connection accepted
 
 **Approach:**
 - Tools registered via `@mcp.tool()` decorator on async functions. Tool docstrings are agent-facing (they go directly into the JSON Schema the agent sees) — write them as agent instructions ("Start a screen recording. Returns the session_id and a cursor for subsequent tail_events calls. Errors with `lock_contended` if a recording is already active.").
-- `list_recordings()` → `GET /v0/recording.list`; returns recording summaries.
+- `list_recordings()` → `GET /v0/recording.list`; returns recording summaries. **Filter the MCP-facing response shape** to exclude absolute filesystem paths (`recording_dir`, log paths) — agents should not learn directory layout via MCP. The daemon-internal `recording.list` response can keep paths for SwiftUI/CLI use; MCP `tools.py` applies the filter at translation time.
 - `start_recording(name, ...)` → `POST /v0/recording.start`; returns `{ok, session_id, started_at, cursor}`. The cursor is the late-join boundary the agent uses for `tail_events`.
 - `stop_recording(force=False)` → `POST /v0/recording.stop`.
-- `pause_recording()` → `POST /v0/recording.pause`; returns `{ok, cursor}`. Required to satisfy origin Success Criteria for A3 (agent can start, query, pause, stop). Gated on Phase 1 exposing the daemon verb — see Dependencies.
-- `resume_recording()` → `POST /v0/recording.resume`; returns `{ok, cursor}`. Pair-of-pause; same gate.
 - `get_session_snapshot()` → `GET /v0/session.snapshot`; returns current state + cursor.
-- `tail_events(since, max=100, timeout_s=5.0)` → `GET /v0/events?since=<cursor>` with a server-side max-wait timeout. Tool consumes NDJSON until `max` events received, `timeout_s` elapses, or the daemon emits a terminal event (`recording_finalized`). Returns `{events, cursor, more, terminal}`.
-- **Error mapping (`mcp/errors.py`):** daemon's `lock_contended`, `not_owned_by_daemon`, `slow_consumer`, `schema_mismatch`, `cursor_unknown` map to MCP tool error responses with the original error code preserved as `error.code` and a human-readable message. Pin shapes with golden tests.
-- **Idempotency (Open Question — settle at impl):** if `start_recording` is retried, the second call sees the active recording and returns `lock_contended`. Agent retries via the `LockContended.owner` shape. Decide at impl whether to add `idempotency_key` server-side dedup.
+- `tail_events(since, max=100, timeout_s=5.0)` → `GET /v0/events?since=<cursor>` with a server-side max-wait timeout. Tool consumes NDJSON until `max` events received, `timeout_s` elapses, or the daemon emits a terminal event (`recording_finalized`). Returns `{events, cursor, more, terminal}`. **The tool docstring (agent-facing) MUST document the cursor-restart reconciliation protocol explicitly: when `tail_events` returns `cursor_unknown` (a 410 mapped from the daemon), the agent calls `get_session_snapshot()` to fetch a fresh cursor and resumes `tail_events(since=<snapshot.cursor>)`.** This is steady-state behavior under the auto-spawn idle-shutdown timer (the daemon recycles every 10 min of inactivity), not an exceptional path. Add a test scenario: cursor established → simulated daemon restart → `tail_events(since=stale)` returns `cursor_unknown` → `get_session_snapshot()` returns fresh cursor → `tail_events(since=fresh)` succeeds.
+- **Error mapping (`mcp/errors.py`) — canonical error vocabulary:** the full set of daemon error codes that surface to agents is enumerated below. Pin the full envelope shape (not just the code) with golden tests in `tests/mcp/test_error_mapping.py`:
+
+  | Code | Surfaces that emit it | MCP `error.code` | Human-readable message |
+  |---|---|---|---|
+  | `lock_contended` | `start_recording` | `lock_contended` | "Another recording is already active; owner: {owner}" |
+  | `not_owned_by_daemon` | `stop_recording` | `not_owned_by_daemon` | "No active recording owned by the daemon" |
+  | `slow_consumer` | `tail_events` (subscriber backpressure) | `slow_consumer` | "Event stream consumer too slow; some events dropped" |
+  | `schema_mismatch` | all tools (handshake) | `schema_mismatch` | "MCP client API version is older than the daemon; please update" |
+  | `cursor_unknown` | `tail_events` | `cursor_unknown` | "Cursor is outside the retained replay window; call get_session_snapshot to reconcile" |
+  | `invalid_name` | `start_recording` | `invalid_name` | "Recording name contains forbidden characters or is too long" |
+
+  Preserve the daemon's `cursor_unknown` envelope fields (`daemon_cursor`, `oldest_retained_cursor`) through the MCP error mapping — agents need them to decide whether to reconcile via snapshot vs. fail.
+- **Idempotency — `idempotency_key` ships day-one** as an optional caller-supplied UUID on `start_recording`. Server dedups within a TTL window (~60s). Treated as a privacy safeguard, not developer convenience: a duplicate recording from an agent-side retry captures sensitive screen content asymmetrically vs. the ~20-line server-side dedup cost. Agent-side retry pattern-matching on `lock_contended` does not undo the first successful capture.
 
 **Execution note:** Land `list_recordings` and `get_session_snapshot` first (read-only, lowest risk for agents). Then `tail_events` (most novel shape). Then `start_recording` / `stop_recording` (state-changing).
 
@@ -540,7 +551,13 @@ peer connection accepted
 - Delete `spawn`, `runDetached`, `runOneShot`, `mergedEnv`, `SpawnedProcess`, `runJSON` from `CLIClient.swift`. Keep `resolveBinary()` (used by `runAwaitingExit`) and `runAwaitingExit` itself (catalog-open shell-out).
 - Delete `RecorderController.handleStderrLine` and the wiring that calls it. Events flow only via `DaemonClient.subscribe`.
 - Delete the `claimant` field on `CLIStatus`, `CodingKeys.claimant`, and the dead `lock_contended` default-case comment at line 401.
-- **`RecordingState` audit:** the plan was drafted against an `another_process_recording` enum case that grep no longer finds in the codebase (likely renamed or removed during Phase 1 U7). The current `RecordingState` cases are `idle`, `starting`, `recording(elapsed:)`, `stopping(quitting:)` per `RecorderController.swift:22-26`. At U5 implementation time, inspect the enum and any 2s-poll-for-lock-release logic; delete any branch predicated on a cross-claimant case (which U1 makes unreachable). If no such branch exists, this bullet is a no-op.
+- **`RecordingState` audit (mandatory grep verification):** the plan was drafted against an `another_process_recording` enum case that grep no longer finds in the codebase (likely renamed or removed during Phase 1 U7). The current `RecordingState` cases are `idle`, `starting`, `recording(elapsed:)`, `stopping(quitting:)` per `RecorderController.swift:22-26`. At U5 implementation time, inspect the enum and any 2s-poll-for-lock-release logic; delete any branch predicated on a cross-claimant case (which U1 makes unreachable). Verification (required, not optional): `grep -rn 'claimant\|another_process\|cross_claimant' macos/ScreenCap/` returns zero hits after U5 lands.
+- **`RecordingState` post-deletion transitions:** after `handleStderrLine` is gone, `RecordingState` is driven exclusively by `DaemonClient.subscribe`. State map:
+  - `idle` ← initial state + on `recording_finalized` event + on daemon connect failure (no separate `daemon_unavailable` state; banner copy distinguishes the cases)
+  - `starting` ← on `POST /v0/recording.start` returning `ok` (before first event arrives)
+  - `recording(elapsed:)` ← on `started` event from subscribe stream
+  - `stopping(quitting:)` ← on user invoking stop or app-quit; transitions to `idle` on `recording_finalized`
+  - **Daemon-loss mid-recording** (subscribe stream returns ECONNREFUSED / EOF while in `recording(elapsed:)`): fall back to `idle` with a banner explaining the daemon is unreachable; existing kickstart UI from Phase 1 U7 fires. Do NOT introduce a new state.
 - Delete `SUPPORTED_EVENT_SCHEMA_VERSION` constant — stderr events are no longer consumed.
 
 **Execution note:** Deletion-heavy unit. Run the SwiftUI build + test lane after each deletion sub-step to catch removed-symbol cascade. Don't batch — incremental deletions surface broken assumptions earlier.
@@ -608,7 +625,7 @@ peer connection accepted
 - **Interaction graph:** Three independent clients of the daemon API (SwiftUI, CLI, MCP). The daemon is the only process that spawns the engine subprocess. CLI no longer spawns the engine; SwiftUI no longer spawns CLI subprocess for engine work. MCP is a brand-new process invoked by external agents (Claude Desktop, etc.) via stdio.
 - **Error propagation:** Daemon API errors propagate via Phase 1's symmetric envelope to all three clients. MCP-specific error mapping (`mcp/errors.py`) translates daemon error codes to MCP tool error responses while preserving the original code as `error.code`. CLI errors are formatted using existing `cli.py` discipline. Agent-facing tool docstrings document expected error codes so the agent can pattern-match.
 - **State lifecycle risks:** Auto-spawn TOCTOU between "daemon not running" check and `posix_spawn` — mitigated by Phase 1 U1's already-running detection (second spawn exits non-zero) plus bounded retry on the CLI side. Auto-spawned daemons accumulating zombies — mitigated by 10-minute idle-shutdown timer keyed on `SCREENCAP_DAEMON_AUTOSPAWN=1`. Stale `~/.screencap/run/auto-serve.log` accumulation — log rotation deferred to operational follow-up. Server-derived `started_by` TOCTOU between accept and getsockopt — accepted as advisory-only; auth gate is EUID match.
-- **API surface parity:** `recording.start` request schema bumps from API version 1 to 2 (removed `started_by` field). All three clients pin the new version. Old Phase 1 SwiftUI builds get a clean schema-mismatch error and the kickstart UI from Phase 1 U7 fires.
+- **API surface parity:** API stays at v1. `recording.start` request schema keeps `started_by` as Optional (soft-deprecated); daemon ignores caller values. All three clients (SwiftUI, CLI, MCP) interoperate without coordination. No schema-mismatch UX is exercised by Phase 2.
 - **Integration coverage:** AE1 end-to-end test (U6) is the keystone integration. AE3 (CLI without GUI) is exercised by U1's auto-spawn test. AE4 (CLI and daemon-driven recordings produce equivalent artifacts) is now tautological since both paths go through the daemon — preserved as a regression check.
 - **Unchanged invariants:** Phase 1's `/v0/*` envelope shape is preserved (only `recording.start` request schema changed). Engine subprocess supervision (Phase 1 U5) is unchanged. Pidfile flock + JSON metadata semantics are unchanged. SwiftUI's `RecorderEventLine` decode shape is preserved. Recording artifacts on disk are byte-equivalent to Phase 1 daemon-driven recordings. Catalog SQLite schema is unchanged. PyInstaller bundle structure is additive only (`screencap.mcp` package collected; nothing removed).
 
@@ -622,7 +639,8 @@ peer connection accepted
 | MCP stdio server has subtle interactions with `multiprocessing.spawn` mode (engine workers re-import) | Medium | High | `screencap mcp` runs as its own process tree; engine workers are spawned by the daemon, not by MCP. No cross-process interaction. Verify with smoke test in U3. |
 | Auto-spawn race produces zombie daemons in CI / test environments | Medium | Medium | Idle-shutdown timer (10 min) on `SCREENCAP_DAEMON_AUTOSPAWN=1` daemons. CI tests explicitly clean up via `screencap serve --uninstall` or `pkill -f 'screencap serve'` in teardown. |
 | Server-derived `started_by` misclassifies developer-build paths | Medium | Low | Classification falls through to `unknown` for unrecognized paths. Advisory only; doesn't gate any behavior. Log unknown paths for diagnosis. |
-| API schema version bump breaks unupgraded Phase 1 SwiftUI builds | Low (Phase 2 ships SwiftUI cleanup in same release) | Low | Both U2 (server) and U5 (client) ship in Phase 2; no version skew window in production. Dev environment skew is handled by Phase 1's "reload daemon" UX. |
+| Caller-supplied `started_by` field becomes unauthoritative | Low | Low | U2 is additive — the field is marked `deprecated=True` in the request schema but still accepted. Daemon logs caller-supplied values at debug level and uses server-derived classification as authoritative. No schema break; no client coordination required. Future contract evolution (e.g., capability-token identity) can revisit removal once external consumers' usage is measurable. |
+| **AE2 (TCC grant stability) does not apply to F3 auto-spawn population** | High (every Homebrew/pip update) | Medium (re-prompts; functional regression) | F3 auto-spawn runs `screencap serve` from whatever binary path the CLI was invoked from (Homebrew bottle, pip wheel, dev venv). These channels have rotating code-signature identities — Homebrew bottles are bot-built and ad-hoc-signed; pip wheels are unsigned. macOS TCC keys on the designated requirement; cdhash rotation on `brew upgrade` / `pip install -U` triggers TCC re-prompts indefinitely. **AE2's "grants persist via stable signing identity" promise applies only to LaunchAgent-managed daemons** installed via `screencap setup` (which uses the Developer ID-signed bundle). F3 users are documented to expect TCC re-prompts on binary upgrades; the workaround is to install the LaunchAgent via the SwiftUI app or `screencap setup`. Tracked in release notes and Operational Notes. Future signed-Homebrew-bundle distribution would close the gap. |
 | `screencap mcp` subcommand cold-start is slow due to `mcp` SDK + `pydantic-core` import cost | Medium | Low | Defer-imports inside Click body keeps `screencap --help` fast. Cold-start cost only paid on actual `screencap mcp` invocation. Measure during U3 development; if >2s, investigate `mcp` SDK lazy-import. |
 | Agents retry `start_recording` on perceived failure, accidentally double-recording | Medium | Medium | `lock_contended` envelope returned on second attempt; agent-side retry should pattern-match. Idempotency token is an Open Question — settle at U4 if real agents misbehave in early testing. |
 | MCP tool docstrings drift from daemon API contract over time | Low (early in MCP life) | Low | Pin tool docstrings via golden-shape tests in `tests/mcp/test_tool_surface.py`. Forces explicit acknowledgment of contract changes. |
@@ -634,7 +652,7 @@ peer connection accepted
 
 - **Phase 1 (U1-U8) shipped.** Phase 2a (U1, U2) requires Phase 1a (U1-U6); Phase 2c (U5) requires Phase 1b (U7-U8).
 - **High-priority daemon fix plan shipped** ([docs/plans/2026-05-09-001-fix-high-priority-daemon-tickets-plan.md](docs/plans/2026-05-09-001-fix-high-priority-daemon-tickets-plan.md)). U4's `tail_events` cursor semantics (the `cursor_unknown` 410 for `since=N`-older-than-retained-window) depend on the 256-event replay buffer that plan introduced.
-- **Phase 1 daemon exposes `recording.pause` and `recording.resume` verbs.** Required for U4's `pause_recording` / `resume_recording` tools. If absent, see U4 Dependencies for resolution path (add to Phase 1, or drop from U4 with explicit Scope Boundary).
+- ~~Phase 1 daemon exposes `recording.pause` and `recording.resume` verbs.~~ Dropped from Phase 2 scope (2026-05-13 review). See Scope Boundaries → "Pause/resume agent verbs".
 - `mcp>=1.27,<2.0` from PyPI — pure-Python on stdio path, includes `pydantic-core` (Rust, prebuilt wheels for both macOS arches). Add to `pyproject.toml` runtime deps.
 - macOS 13+ deployment floor — unchanged from Phase 1.
 - Engine topology spike ticket created at [docs/tickets/2026-05-08-engine-topology-spike.md](docs/tickets/2026-05-08-engine-topology-spike.md) — separate work; doesn't block Phase 2 ship.
@@ -703,7 +721,8 @@ Each doc-modify is assigned to an implementation unit so it lands with the code 
 - Release notes:
   - User-facing: "ScreenCap now supports computer-use agents via MCP. Register the binary in Claude Desktop's config to enable."
   - User-facing: "CLI commands (`screencap start`, `stop`, `status`) now use the background helper. If you don't have the helper installed, the CLI starts one automatically and shuts it down after 10 minutes of inactivity."
-  - Breaking change note: "The `started_by` field on the daemon's `recording.start` API is now server-derived and no longer accepts caller-supplied values. Direct API consumers should drop the field from their requests."
+  - User-facing (F3 caveat): "When the CLI auto-starts the background helper, macOS may re-prompt for Screen Recording permission after `brew upgrade` or `pip install -U screencap`, because the binary's code signature changes between releases. For TCC permission stability across upgrades, install the helper via the SwiftUI app or run `screencap setup` (which uses the Developer ID-signed bundle)."
+  - Deprecation note (non-breaking): "The `started_by` field on the daemon's `recording.start` API is now server-derived. The request field is soft-deprecated but still accepted; direct API consumers can drop the field at their convenience — old clients continue to work."
 
 ---
 
@@ -711,7 +730,10 @@ Each doc-modify is assigned to an implementation unit so it lands with the code 
 
 - **MCP server logs:** `~/Library/Logs/ScreenCap/mcp.{out,err}.log` (when invoked outside Claude Desktop) or `~/Library/Logs/Claude/mcp-server-screencap.log` (when Claude Desktop captures stderr).
 - **Auto-spawn diagnostic:** `~/.screencap/run/auto-serve.log` shows recent CLI-spawned daemon lifecycles. Idle-shutdown is logged.
-- **Claude Desktop config example** for users:
+- **F3 users and TCC re-prompts:** F3 auto-spawned daemons run from whichever binary path the CLI was invoked from (Homebrew bottle, pip wheel, dev install). Because these channels have rotating code-signature identities (Homebrew bottles are bot-built and ad-hoc-signed; pip wheels are unsigned), each `brew upgrade screencap` or `pip install -U screencap` triggers a Screen Recording TCC re-prompt. This is a deliberate scope choice (see Risks): origin AE2's "TCC grants persist" promise applies only to LaunchAgent-managed daemons installed under a stable Developer ID. For TCC-stable behavior, install the LaunchAgent via the SwiftUI app or via `screencap setup` (which uses the signed bundle).
+- **Claude Desktop config example** for users — absolute path required for the `command` field. Use whichever install variant applies; run `which screencap` to confirm the path when in doubt:
+
+  *App Bundle install:*
   ```json
   {
     "mcpServers": {
@@ -722,10 +744,35 @@ Each doc-modify is assigned to an implementation unit so it lands with the code 
     }
   }
   ```
-  Absolute path required; restart Claude Desktop after config changes.
+
+  *Homebrew install:* use `/opt/homebrew/bin/screencap` (Apple Silicon) or `/usr/local/bin/screencap` (Intel).
+
+  *pip / dev install:* use the venv path returned by `which screencap` (e.g., `~/.venv/bin/screencap`).
+
+  Restart Claude Desktop after config changes. If multiple MCP servers are already registered, hand-merge into the existing `mcpServers` object.
 - **Force-restart MCP server:** quit and restart Claude Desktop (no other path; MCP servers are spawned fresh by Claude Desktop on each session).
 - **Rollback plan:** Phase 2a is reversible (CLI returns to in-process). Phase 2b is reversible (MCP package deleted). Phase 2c (SwiftUI cleanup) is forward-only in practice but technically reversible to Phase 1 U7's state.
 - **Monitoring during early life:** surface MCP-tool-call counts, auto-spawn frequency, and `started_by` classification distribution in a `screencap _daemon-stats` debug subcommand (extends the placeholder from Phase 1 operational notes).
+
+---
+
+## Deferred / Open Questions
+
+### From 2026-05-13 review (P2 decisions surfaced for later triage)
+
+- **U2 Approach — MCP-vs-CLI provenance classification API (carry-over from Decision 1 Additive path).** `LOCAL_PEEREPID + proc_pidpath` returns the peer's own executable path; `screencap mcp` and `screencap start` are the same on-disk binary under single-binary mode dispatch (origin R2), so the path alone cannot distinguish them. Pick one of two implementable mechanisms at U2 impl time and update the conceptual-flow diagram to match: (a) `KERN_PROCARGS2` sysctl to read the peer's own `argv[1]` (`'mcp'` → mcp; `'start'/'stop'/'status'` → cli; else unknown), or (b) `proc_pidinfo(PROC_PIDT_SHORTBSDINFO)` to get the peer's ppid then `proc_pidpath(ppid)` to walk to the parent (e.g., Claude Desktop). Option (a) is the natural single-syscall choice; option (b) matches the plan's current "parent process matches `screencap mcp`" wording.
+
+- **U1 Verification — 5-second auto-spawn readiness window.** Asserted without measurement. PyInstaller cold-start on Intel under thermal/battery throttle can exceed 5s. Decide at U1 development time: raise to 15s with adaptive backoff, make configurable via `--readiness-timeout`, or empirically measure on a `purge && reboot` Intel Mac and adopt the measured ceiling. Currently `<2s` is named as a Success Metric for the same binary's MCP mode — extend the same measurement discipline to daemon mode.
+
+- **Phase 2b sequencing — merge U3 and U4 into one unit.** U3 alone ships FastMCP scaffolding with zero tools — no requirement is fully satisfied at merge. Merging with an internal commit boundary (read-only tools first, state-mutating second) delivers a functional surface at merge. Decide before Phase 2b kickoff whether the merge is worth the larger PR review.
+
+- **U4 Approach — MCP `start_recording` / `stop_recording` consent and abuse surface.** Plan currently relies on `lock_contended` for retry collision, no user-visible notification for agent-initiated capture, no audit log distinct from daemon-internal logs, no per-session cap. Prompt-injected agent can silently capture sensitive screen content. Decide whether Phase 2 ships a consent dialog / menubar indicator / audit trail, or defers to a follow-up with explicit known-risk acknowledgment.
+
+- **U1 Approach — Idle-shutdown timer + MCP `tail_events` long-poll interaction.** Reset semantics ("reset on each accepted connection or active recording") interact with the MCP poll loop in two failure modes: timer never expires for the entire Claude Desktop session (zombie-prevention is a no-op for F3+MCP), OR timer fires mid-session when agent is idle and `httpx.AsyncClient` holds a stale socket reference. Decide: suppress idle-shutdown while any subscriber exists, OR bias timer based on whether peer is MCP-classified, OR document the limitation in release notes.
+
+- **Success Metrics — Engine topology spike contract-stability assertion.** Plan asserts "Phase 3 (engine consolidation spike) does not need to re-litigate the API contract." The spike's open questions (idle CPU/RSS, GIL contention, upgrade-during-recording semantics, crash-recovery latency) all have potential API surface. Meanwhile MCP registration in Claude Desktop creates external ecosystem dependencies before the topology decision settles. Either accelerate the spike to before U5, OR enumerate which Phase 2 contract decisions the spike is permitted to revisit, OR version the MCP tool surface separately from the daemon HTTP contract so MCP-to-daemon can be re-broken without breaking MCP-to-agent.
+
+- **Requirements — Capacity allocation drift relative to origin A2 ("primary persona").** Phase 2's six units serve A1 (CLI), A3 (MCP), A4 (engineer); none extend A2-facing value. Phase 2 is structurally a "platform release." Either acknowledge this explicitly in Phase 2's framing and document deferred A2-facing work, OR re-examine whether 6 units is the right Phase 2 scope given A2's stated primary status.
 
 ---
 
