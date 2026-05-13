@@ -82,6 +82,10 @@ class EventBus:
         """Return the current event cursor without advancing it."""
         return self._cursor
 
+    def subscriber_count(self) -> int:
+        """Return the count of live subscribers. Used by idle-shutdown logic."""
+        return len(self._subscribers)
+
     def oldest_retained_cursor(self) -> int | None:
         """Return the oldest cursor still present in the replay ring, or None."""
         if not self._buffer:

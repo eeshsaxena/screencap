@@ -26,8 +26,20 @@ def _handled_signals() -> tuple[signal.Signals, ...]:
     return (signal.SIGTERM, signal.SIGINT)
 
 
-def serve(socket_path: str | Path | None = None, *, self_test: bool = False) -> int:
-    """Run the daemon server or execute its hidden smoke self-test."""
+def serve(
+    socket_path: str | Path | None = None,
+    *,
+    self_test: bool = False,
+    idle_shutdown_seconds: float | None = None,
+) -> int:
+    """Run the daemon server or execute its hidden smoke self-test.
+
+    ``idle_shutdown_seconds`` opts the daemon into the F3 auto-spawn
+    lifecycle: when set, an idle-shutdown watchdog drains and exits the
+    daemon after the configured seconds with no requests, subscribers,
+    or active recordings. LaunchAgent-managed daemons leave this
+    ``None`` and run all day.
+    """
     buffered_signal: int | None = None
     server_ref = None
 
@@ -75,6 +87,10 @@ def serve(socket_path: str | Path | None = None, *, self_test: bool = False) -> 
             import uvicorn
 
             app = build_app()
+            if idle_shutdown_seconds is not None and idle_shutdown_seconds > 0:
+                from screencap.daemon._idle_shutdown import attach as _attach_idle
+
+                _attach_idle(app, idle_shutdown_seconds)
             loop = asyncio.get_running_loop()
             config = uvicorn.Config(
                 app,
@@ -120,9 +136,19 @@ def serve(socket_path: str | Path | None = None, *, self_test: bool = False) -> 
             if buffered_signal is not None:
                 request_shutdown()
 
+            watchdog_task: asyncio.Task | None = None
+            if idle_shutdown_seconds is not None and idle_shutdown_seconds > 0:
+                from screencap.daemon._idle_shutdown import run_watchdog
+
+                watchdog_task = loop.create_task(
+                    run_watchdog(app, request_shutdown=request_shutdown)
+                )
+
             try:
                 await server_ref.serve(sockets=[listener])
             finally:
+                if watchdog_task is not None and not watchdog_task.done():
+                    watchdog_task.cancel()
                 if shutdown_task is not None and not shutdown_task.done():
                     await shutdown_task
                 listener.close()

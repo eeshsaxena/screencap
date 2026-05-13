@@ -135,12 +135,25 @@ def _download_nlp_models() -> None:
 @click.option("--install", is_flag=True, help="Install LaunchAgent and start daemon.")
 @click.option("--uninstall", is_flag=True, help="Stop daemon and remove LaunchAgent.")
 @click.option("--status", "show_status", is_flag=True, help="Print daemon LaunchAgent status.")
+@click.option(
+    "--idle-shutdown",
+    "idle_shutdown",
+    type=int,
+    default=None,
+    hidden=True,
+    help=(
+        "Exit after N idle seconds (no requests / subscribers / active "
+        "recording). CLI auto-spawn uses this; LaunchAgent-managed "
+        "daemons omit it and run all day."
+    ),
+)
 def serve(
     socket_path: str | None,
     self_test: bool,
     install: bool,
     uninstall: bool,
     show_status: bool,
+    idle_shutdown: int | None,
 ) -> None:
     """Run the ScreenCap daemon, or manage its LaunchAgent."""
     if sum(bool(flag) for flag in (install, uninstall, show_status)) > 1:
@@ -198,7 +211,13 @@ def serve(
 
     from screencap.daemon.server import serve as _serve
 
-    raise SystemExit(_serve(socket_path=socket_path, self_test=self_test))
+    raise SystemExit(
+        _serve(
+            socket_path=socket_path,
+            self_test=self_test,
+            idle_shutdown_seconds=idle_shutdown,
+        )
+    )
 
 
 @cli.command("_engine-worker", hidden=True)
