@@ -1,0 +1,232 @@
+"""End-to-end tests for ``screencap start`` as a daemon HTTP client.
+
+Phase 2 U1.6 collapsed the in-process engine spawn into a thin client of
+``POST /v0/recording.start`` plus an NDJSON event stream. These tests
+verify the exit-code translation contract:
+
+- terminal ``recording_finalized`` (clean)   → exit 0
+- daemon ``lock_contended`` envelope          → exit 2
+- streamed ``permission_lost`` event          → exit 3
+- terminal ``recording_finalized(disk_full)`` → exit 4
+
+The auto-spawn fallback is stubbed (``ensure_daemon_or_spawn`` returns
+silently); auto-spawn coverage lives in tests/cli/test_autospawn.py.
+"""
+
+from __future__ import annotations
+
+import json
+import time
+from typing import Any
+
+import httpx
+import pytest
+from click.testing import CliRunner
+
+
+def _envelope(**payload: Any) -> dict[str, Any]:
+    body = {
+        "ok": True,
+        "schema_version": 1,
+        "daemon_version": "test",
+        "api_schema_version": 1,
+    }
+    body.update(payload)
+    return body
+
+
+def _ndjson(events: list[dict[str, Any]]) -> bytes:
+    return ("\n".join(json.dumps(e) for e in events) + "\n").encode()
+
+
+@pytest.fixture
+def stub_daemon(monkeypatch):
+    """Builds a daemon-client harness whose POST/GET behavior is scripted.
+
+    Usage:
+        with stub_daemon(start_response=..., events=[...]) as harness:
+            harness.invoke(["start", "--name", "x"])
+    """
+
+    class _Harness:
+        def __init__(self):
+            self.start_status: int = 200
+            self.start_response: dict[str, Any] = _envelope(
+                session_id="s1", started_at=time.time(), engine_pid=1234, cursor=1
+            )
+            self.events: list[dict[str, Any]] = [
+                {
+                    "type": "recording_finalized",
+                    "schema_version": 1,
+                    "ts": time.time(),
+                    "cursor": 2,
+                    "name": "x",
+                    "duration_seconds": 0.0,
+                    "force_stopped": False,
+                    "disk_full": False,
+                }
+            ]
+            self.stop_status: int = 200
+            self.stop_response: dict[str, Any] = _envelope(
+                stopped=True, final_state="stopped"
+            )
+            self.captured_start: dict[str, Any] = {}
+
+        def _handler(self, request: httpx.Request) -> httpx.Response:
+            path = request.url.path
+            if path == "/v0/recording.start" and request.method == "POST":
+                self.captured_start = json.loads(request.content)
+                return httpx.Response(self.start_status, json=self.start_response)
+            if path == "/v0/events" and request.method == "GET":
+                return httpx.Response(200, content=_ndjson(self.events))
+            if path == "/v0/recording.stop" and request.method == "POST":
+                return httpx.Response(self.stop_status, json=self.stop_response)
+            if path == "/v0/session.snapshot":
+                return httpx.Response(200, json=_envelope(is_recording=False, cursor=0))
+            return httpx.Response(404, json={"ok": False, "error": "not_found"})
+
+        def invoke(self, args, **kwargs):
+            from screencap.cli import cli
+            from screencap.cli._daemon_client import DaemonHTTPClient
+
+            transport = httpx.MockTransport(self._handler)
+
+            class _PatchedClient(DaemonHTTPClient):
+                def __init__(self, *a, **kw):
+                    kw["transport"] = transport
+                    super().__init__(*a, **kw)
+
+            monkeypatch.setattr(
+                "screencap.cli._daemon_client.DaemonHTTPClient", _PatchedClient
+            )
+            monkeypatch.setattr(
+                "screencap.cli._autospawn.ensure_daemon_or_spawn",
+                lambda *a, **k: None,
+            )
+            # The start command surrounds itself with first-run prompts;
+            # neutralize them so CliRunner does not block on stdin.
+            monkeypatch.setattr(
+                "screencap.cli._maybe_prompt_privacy_setup", lambda **kw: None
+            )
+            monkeypatch.setattr(
+                "screencap.cli._maybe_prompt_matrix_acknowledgement", lambda: None
+            )
+            monkeypatch.setattr(
+                "screencap.cli._stdin_is_tty", lambda: False
+            )
+            runner = CliRunner()
+            return runner.invoke(cli, args, catch_exceptions=False, **kwargs)
+
+    return _Harness()
+
+
+def test_start_clean_finalize_exits_zero(stub_daemon):
+    result = stub_daemon.invoke(["start", "--name", "demo", "--no-audio", "--local"])
+    assert result.exit_code == 0, result.output
+    # The CLI proxies daemon events to stderr as line-buffered JSON.
+    assert "recording_finalized" in (result.output or "")
+    # POST payload carries the resolved options.
+    assert stub_daemon.captured_start["name"] == "demo"
+    # ``audio`` is normalized to False via ``--no-audio``; the cloud_intent
+    # flag is False under ``--local``.
+    assert stub_daemon.captured_start["audio"] is False
+    assert stub_daemon.captured_start["cloud_intent"] is False
+
+
+def test_start_lock_contended_returns_exit_2(stub_daemon):
+    stub_daemon.start_status = 409
+    stub_daemon.start_response = {
+        "ok": False,
+        "error": "lock_contended",
+        "schema_version": 1,
+        "api_schema_version": 1,
+        "daemon_version": "test",
+        "owner": {"pid": 9999, "claimant": "swiftui"},
+    }
+    result = stub_daemon.invoke(["start", "--name", "demo", "--local"])
+    assert result.exit_code == 2, result.output
+
+
+def test_start_permission_lost_exits_three(stub_daemon):
+    stub_daemon.events = [
+        {
+            "type": "started",
+            "schema_version": 1,
+            "ts": time.time(),
+            "cursor": 1,
+        },
+        {
+            "type": "permission_lost",
+            "schema_version": 1,
+            "ts": time.time(),
+            "cursor": 2,
+        },
+        {
+            "type": "recording_finalized",
+            "schema_version": 1,
+            "ts": time.time(),
+            "cursor": 3,
+            "name": "demo",
+            "duration_seconds": 1.0,
+            "force_stopped": True,
+            "disk_full": False,
+        },
+    ]
+    result = stub_daemon.invoke(["start", "--name", "demo", "--local"])
+    assert result.exit_code == 3, result.output
+
+
+def test_start_disk_full_exits_four(stub_daemon):
+    stub_daemon.events = [
+        {
+            "type": "started",
+            "schema_version": 1,
+            "ts": time.time(),
+            "cursor": 1,
+        },
+        {
+            "type": "recording_finalized",
+            "schema_version": 1,
+            "ts": time.time(),
+            "cursor": 2,
+            "name": "demo",
+            "duration_seconds": 5.0,
+            "force_stopped": True,
+            "disk_full": True,
+        },
+    ]
+    result = stub_daemon.invoke(["start", "--name", "demo", "--local"])
+    assert result.exit_code == 4, result.output
+
+
+def test_start_payload_carries_flags(stub_daemon):
+    stub_daemon.invoke([
+        "start",
+        "--name", "demo",
+        "--no-video",
+        "--no-images",
+        "--no-window-data",
+        "--no-wifi-metrics",
+        "--no-app-versions",
+        "--local",
+    ])
+    payload = stub_daemon.captured_start
+    assert payload["name"] == "demo"
+    assert payload["capture_video"] is False
+    assert payload["capture_images"] is False
+    assert payload["capture_window_data"] is False
+    assert payload["wifi_metrics"] is False
+    assert payload["app_versions"] is False
+
+
+def test_start_daemon_error_returns_exit_1(stub_daemon):
+    stub_daemon.start_status = 500
+    stub_daemon.start_response = {
+        "ok": False,
+        "error": "internal",
+        "schema_version": 1,
+        "api_schema_version": 1,
+        "daemon_version": "test",
+    }
+    result = stub_daemon.invoke(["start", "--name", "demo", "--local"])
+    assert result.exit_code == 1, result.output

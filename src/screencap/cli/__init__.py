@@ -832,119 +832,42 @@ def start(
     else:
         show_on_website = True  # irrelevant for local-only recordings
 
-    # --- Hand off to the Session Controller ---
-    # ``screencap start`` is a long-lived session: the controller spawns
-    # the menu bar once, runs each recording in its own Recording Worker
-    # subprocess, and detaches post-processing into a separate
-    # Post-Process Worker subprocess so a second recording can start
-    # while the previous one is still transcribing / uploading.
-    #
-    # Setting ``SCREENCAP_LEGACY_START=1`` falls back to the classic
-    # one-shot code path. This is used by the test suite (which mocks
-    # ``screencap.recorder.start_recording`` at module level — the mock
-    # does not cross the subprocess boundary of the session controller)
-    # and as an escape hatch if the controller regresses in production.
-    import os as _os_start
-
-    if _os_start.environ.get("SCREENCAP_LEGACY_START") == "1":
-        _legacy_start_recording(
-            name=name,
-            description=description,
-            audio=audio,
-            output=output,
-            wifi_metrics=wifi_metrics,
-            app_versions=app_versions,
-            force=force,
-            capture_video=capture_video,
-            capture_images=capture_images,
-            capture_window_data=capture_window_data,
-            verbose=verbose,
-            chunk_duration=chunk_duration,
-            no_live_upload=no_live_upload,
-            force_mode=force_mode,
-            is_cloud=is_cloud,
-            keep_local=keep_local,
-            intent_source=intent_source,
-            seg_mode=seg_mode,
-            scrub_enabled=scrub_enabled,
-            show_on_website=show_on_website,
-            auto_name_enabled=auto_name_enabled,
-            local_only=local_only,
-        )
-        return
-
-    try:
-        from screencap.session import SessionController
-    except ImportError:
-        console.print(_RECORD_EXTRAS_MSG)
-        raise SystemExit(1)
-
-    # Pin spawn mode at CLI entry BEFORE any mp.Queue/mp.Process is constructed.
-    # AES-GCM nonce safety (V1.5+) depends on os.urandom being independently
-    # seeded in the child; under fork mode the child inherits parent state.
-    # Asserting only inside run_proxy() is too late -- the parent has already
-    # forked/spawned by then. The `allow_none=True` is load-bearing: without
-    # it, get_start_method freezes the start-method context as a side effect.
-    if network:
-        import multiprocessing as _mp_init
-        _current_start = _mp_init.get_start_method(allow_none=True)
-        if _current_start is None:
-            _mp_init.set_start_method("spawn", force=True)
-        elif _current_start != "spawn":
-            console.print(
-                f"[red]Error:[/red] multiprocessing start method is "
-                f"{_current_start!r}; --network requires 'spawn'."
-            )
-            raise SystemExit(1)
-
-    cli_args = {
-        "name": name,
-        "description": description or None,
-        "audio": audio,
-        "output": output,
-        "wifi_metrics": wifi_metrics,
-        "app_versions": app_versions,
-        "force_clean": force,
-        "capture_video": capture_video,
-        "capture_images": capture_images,
-        "capture_window_data": capture_window_data,
-        "verbose": verbose,
-        "chunk_duration": chunk_duration,
-        "live_upload": not no_live_upload,
-        "force_mode": force_mode,
-        "cloud_intent": is_cloud,
-        "keep_local": keep_local,
-        "intent_source": intent_source,
-        "segmentation_mode": seg_mode,
-        "scrub_enabled": scrub_enabled,
-        "show_on_website": show_on_website,
-        "auto_name_enabled": auto_name_enabled,
-        "local_only": local_only,
-        "network": network,
-    }
-
-    # SessionController(...) is INSIDE the try block so a SystemExit raised
-    # from __init__ (e.g. exit code 2 on lock contention, exit code 3 on
-    # permission_lost) goes through the same `stopped` event emission path.
-    # Without this, exit-2 silently bypassed the terminal event (todo 004).
-    exit_code = 0
-    try:
-        controller = SessionController(cli_args)
-        # SessionController.__init__ already claimed the lock + emitted `started`
-        # via the path inside session.py — no need to re-emit here.
-        controller.run()
-    except SystemExit as se:
-        exit_code = int(getattr(se, "code", 0) or 0)
-        _emit_event(EVENT_STOPPED, exit_code=exit_code)
-        raise
-    except Exception as exc:  # noqa: BLE001
-        console.print(f"[red]Session controller error:[/red] {exc}")
-        _emit_event(EVENT_STOPPED, exit_code=1, error=str(exc))
-        raise SystemExit(1)
-    _emit_event(EVENT_STOPPED, exit_code=exit_code)
+    # --- Hand off to the daemon ---
+    # Phase 2 U1 makes the daemon the sole engine spawner. ``screencap
+    # start`` is now a thin HTTP client: ensure the daemon is up
+    # (auto-spawn for F3 if no LaunchAgent), POST recording.start,
+    # stream events back to stderr (preserving the cross-language
+    # event contract SwiftUI / agents pattern-match against), and map
+    # the terminal event to a process exit code per existing taxonomy.
+    _exit_code = _run_start_via_daemon(
+        name=name,
+        description=description,
+        audio=audio,
+        output=output,
+        wifi_metrics=wifi_metrics,
+        app_versions=app_versions,
+        force_clean=force,
+        capture_video=capture_video,
+        capture_images=capture_images,
+        capture_window_data=capture_window_data,
+        verbose=verbose,
+        chunk_duration=chunk_duration,
+        live_upload=not no_live_upload,
+        force_mode=force_mode,
+        cloud_intent=is_cloud,
+        keep_local=keep_local,
+        intent_source=intent_source,
+        segmentation_mode=seg_mode,
+        scrub_enabled=scrub_enabled,
+        show_on_website=show_on_website,
+        network=network,
+    )
+    _emit_event(EVENT_STOPPED, exit_code=_exit_code)
+    if _exit_code:
+        raise SystemExit(_exit_code)
 
 
-def _legacy_start_recording(
+def _run_start_via_daemon(
     *,
     name,
     description,
@@ -952,168 +875,203 @@ def _legacy_start_recording(
     output,
     wifi_metrics,
     app_versions,
-    force,
+    force_clean,
     capture_video,
     capture_images,
     capture_window_data,
     verbose,
     chunk_duration,
-    no_live_upload,
+    live_upload,
     force_mode,
-    is_cloud,
+    cloud_intent,
     keep_local,
     intent_source,
-    seg_mode,
+    segmentation_mode,
     scrub_enabled,
     show_on_website,
-    auto_name_enabled,
-    local_only,
-) -> None:
-    """Classic one-shot ``screencap start`` code path (pre-Session Controller).
+    network,
+) -> int:
+    """POST recording.start, stream events, map terminal event to exit code.
 
-    Kept for the test suite and for ``SCREENCAP_LEGACY_START=1`` users.
-    Functionally identical to the previous inline body of ``start()``.
+    Returns the exit code per Phase 1's taxonomy:
+      0=clean, 1=generic failure, 2=lock-held, 3=permission_lost,
+      4=disk_full, 5=user-initiated force-quit (2-tap Ctrl+C).
     """
+    import json as _json
+    import signal as _signal
+    import sys as _sys
+
+    from screencap.cli._autospawn import (
+        DaemonAutoSpawnError,
+        LaunchAgentNotRunningError,
+        ensure_daemon_or_spawn,
+    )
+    from screencap.cli._daemon_client import (
+        DaemonAPIError,
+        DaemonHTTPClient,
+        DaemonUnreachableError,
+        SchemaMismatchError,
+    )
+
+    # ``screencap start`` is the primary auto-spawn trigger (origin F3).
     try:
-        from screencap.recorder import (
-            DiskFullError,
-            _kill_menubar,
-            print_summary,
-            start_recording,
+        ensure_daemon_or_spawn(
+            auto_spawn=True,
+            stderr_emitter=lambda line: click.echo(line, err=True),
         )
-    except ImportError:
-        console.print(_RECORD_EXTRAS_MSG)
-        raise SystemExit(1)
+    except LaunchAgentNotRunningError as exc:
+        click.echo(str(exc), err=True)
+        return 1
+    except DaemonAutoSpawnError as exc:
+        click.echo(f"Error: {exc}", err=True)
+        if exc.log_tail:
+            click.echo(exc.log_tail, err=True)
+        return 1
 
-    # Cross-language event contract (todo 016): the SwiftUI shell relies on
-    # ``started`` and ``stopped`` to drive UI state. The legacy path is a
-    # documented escape hatch (``SCREENCAP_LEGACY_START=1``) and does not
-    # build a SessionController, so the events are emitted here directly.
-    # Without these wires, a SwiftUI launch falling onto the legacy path
-    # would line-read silence then EOF and never transition out of
-    # "starting" state.
-    try:
-        from screencap._stderr_events import (
-            EVENT_STARTED,
-            emit_event as _emit_event_legacy,
-            resolve_claimant,
-        )
-        _emit_event_legacy(EVENT_STARTED, claimant=resolve_claimant())
-    except Exception:
-        pass
+    # ``force_mode`` may be a PrivacyMode enum from Phase 1; daemon
+    # consumes a string. Coerce safely.
+    force_mode_str = None
+    if force_mode is not None:
+        force_mode_str = getattr(force_mode, "value", str(force_mode))
 
-    disk_full = False
-    _menubar_proc = None
-    _menubar_state_file = None
-    try:
-        capture_dir, elapsed, _menubar_proc, _menubar_state_file = start_recording(
-            name, description or None, audio, output,
-            wifi_metrics=wifi_metrics, app_versions=app_versions,
-            force_clean=force,
-            capture_video=capture_video, capture_images=capture_images,
-            capture_window_data=capture_window_data,
-            verbose=verbose,
-            chunk_duration=chunk_duration,
-            live_upload=not no_live_upload,
-            force_mode=force_mode,
-            cloud_intent=is_cloud,
-            keep_local=keep_local,
-            intent_source=intent_source,
-            segmentation_mode=seg_mode,
-            scrub_enabled=scrub_enabled,
-            show_on_website=show_on_website,
-        )
-    except DiskFullError as e:
-        capture_dir, elapsed = e.capture_dir, e.elapsed
-        _menubar_proc, _menubar_state_file = e.menubar_proc, e.menubar_state_file
-        disk_full = True
-        console.print(
-            "[yellow]Skipping auto-naming/transcription: disk space is low.[/yellow]"
-        )
-    except ImportError:
-        console.print(_RECORD_EXTRAS_MSG)
-        raise SystemExit(1)
+    payload = {
+        "name": name,
+        "description": description or None,
+        "audio": audio,
+        "output_dir": output,
+        "wifi_metrics": wifi_metrics,
+        "app_versions": app_versions,
+        "force_clean": force_clean,
+        "capture_video": capture_video,
+        "capture_images": capture_images,
+        "capture_window_data": capture_window_data,
+        "verbose": verbose,
+        "chunk_duration": chunk_duration,
+        "live_upload": live_upload,
+        "force_mode": force_mode_str,
+        "cloud_intent": cloud_intent,
+        "keep_local": keep_local,
+        "intent_source": intent_source,
+        "segmentation_mode": segmentation_mode,
+        "scrub_enabled": scrub_enabled,
+        "show_on_website": show_on_website,
+        "network": network,
+    }
 
-    final_name = name
-    final_dir = capture_dir
+    interrupt_state = {"count": 0, "stop_sent": False, "client": None}
 
-    try:
-        from screencap.menubar import RENAME_FILENAME
-        _rename_file = capture_dir / RENAME_FILENAME
-        if _rename_file.exists():
-            _new_name = _rename_file.read_text().strip()
-            if _new_name and _new_name != name:
-                new_dir = capture_dir.parent / _new_name
-                if not new_dir.exists():
-                    capture_dir.rename(new_dir)
-                    final_name = _new_name
-                    final_dir = new_dir
-                    capture_dir = new_dir
-            _rename_file.unlink(missing_ok=True)
-    except Exception:
-        pass
-
-    try:
-        _auto_export(capture_dir)
-    except KeyboardInterrupt:
-        console.print("[yellow]Export cancelled.[/yellow]")
-
-    if auto_name_enabled and not disk_full and final_name == name:
-        has_chunk_transcripts = any(capture_dir.glob("transcript_*.txt"))
-        audio_path = capture_dir / "audio.flac"
-        if (
-            audio
-            and not has_chunk_transcripts
-            and audio_path.exists()
-            and audio_path.stat().st_size >= 1024
-        ):
+    def _sigint_handler(_signum, _frame):
+        interrupt_state["count"] += 1
+        client = interrupt_state["client"]
+        if interrupt_state["count"] >= 2:
+            # Second Ctrl+C escalates to force-quit (exit 5 per taxonomy).
+            click.echo("\nSecond Ctrl+C — force-stopping.", err=True)
+            if client is not None and not interrupt_state["stop_sent"]:
+                try:
+                    client.stop(force=True)
+                except Exception:
+                    pass
+                interrupt_state["stop_sent"] = True
+            return
+        if client is not None and not interrupt_state["stop_sent"]:
             try:
-                _auto_transcribe(capture_dir, audio_path)
-            except KeyboardInterrupt:
-                console.print("[yellow]Transcription cancelled.[/yellow]")
-
-        skip_rename = output is not None
-        try:
-            from screencap.namer import auto_name as do_auto_name
-
-            with console.status("[bold]Generating name...[/bold]"):
-                final_dir = do_auto_name(
-                    capture_dir,
-                    local_only=local_only,
-                    skip_rename=skip_rename,
+                client.stop(force=False)
+                interrupt_state["stop_sent"] = True
+                click.echo(
+                    "Stopping (Ctrl+C again to force-quit)...", err=True
                 )
-            final_name = final_dir.name
-        except KeyboardInterrupt:
+            except Exception:
+                pass
+
+    try:
+        with DaemonHTTPClient() as client:
+            interrupt_state["client"] = client
+            try:
+                start_result = client.start(**{k: v for k, v in payload.items() if v is not None})
+            except DaemonAPIError as exc:
+                code = exc.envelope.get("error", "unknown")
+                if code == "lock_contended":
+                    owner = exc.envelope.get("owner", {})
+                    click.echo(
+                        f"[red]Another recording is already active "
+                        f"(owner: {owner.get('claimant', 'unknown')}).[/red]",
+                        err=True,
+                    )
+                    return 2
+                click.echo(f"Daemon rejected start: {code}", err=True)
+                return 1
+            except SchemaMismatchError as exc:
+                click.echo(f"Error: {exc}", err=True)
+                return 1
+            except DaemonUnreachableError as exc:
+                click.echo(f"Error: daemon unreachable: {exc}", err=True)
+                return 1
+
+            cursor = start_result.get("cursor", 0)
             console.print(
-                "[yellow]Naming cancelled — keeping timestamp name[/yellow]"
+                f"[#22d3ee]Recording[/#22d3ee] "
+                f"[dim](session_id={start_result.get('session_id')!r})[/dim]"
             )
 
-    from screencap.recorder import print_upload_followup
-    print_upload_followup(final_name, final_dir)
+            previous_sigint = _signal.signal(_signal.SIGINT, _sigint_handler)
+            terminal_payload: dict | None = None
+            permission_lost = False
+            try:
+                while terminal_payload is None:
+                    try:
+                        with client.events(since=cursor) as stream:
+                            for event in stream:
+                                # Mirror the engine's stderr line shape so
+                                # SwiftUI / agent consumers parse the same
+                                # JSON whether the producer is the daemon
+                                # or the engine stderr.
+                                _sys.stderr.write(_json.dumps(event) + "\n")
+                                _sys.stderr.flush()
 
-    print_summary(final_name, final_dir, elapsed)
+                                event_type = event.get("type")
+                                if isinstance(event.get("cursor"), int):
+                                    cursor = event["cursor"]
+                                if event_type == "permission_lost":
+                                    permission_lost = True
+                                if event_type == "recording_finalized":
+                                    terminal_payload = event
+                                    break
+                                if event_type == "_close":
+                                    # Daemon shut the stream; reopen from
+                                    # last seen cursor.
+                                    break
+                    except DaemonAPIError as exc:
+                        if exc.envelope.get("error") == "cursor_unknown":
+                            # Daemon recycled mid-recording (idle-shutdown
+                            # window or restart). Re-fetch the snapshot for
+                            # a fresh cursor and resume.
+                            try:
+                                snap = client.snapshot()
+                                cursor = snap.get("cursor", 0)
+                            except Exception:
+                                return 1
+                            continue
+                        click.echo(f"Daemon error: {exc}", err=True)
+                        return 1
+                    except DaemonUnreachableError:
+                        click.echo(
+                            "Daemon disconnected mid-recording; "
+                            "see ~/.screencap/run/auto-serve.log",
+                            err=True,
+                        )
+                        return 1
+            finally:
+                _signal.signal(_signal.SIGINT, previous_sigint)
 
-    try:
-        _report_unclassified_apps(final_dir)
-    except Exception:
-        pass
-
-    _kill_menubar(_menubar_proc, _menubar_state_file)
-
-    # Mirror the SessionController exit path so SwiftUI sees `stopped`
-    # before the process disappears (todo 016). Use ``os._exit`` after the
-    # emit so any background threads (chunk_processor watcher, post-
-    # processing pool) don't keep the interpreter alive.
-    try:
-        from screencap._stderr_events import (
-            EVENT_STOPPED,
-            emit_event as _emit_event_legacy,
-        )
-        _emit_event_legacy(EVENT_STOPPED, exit_code=0)
-    except Exception:
-        pass
-    import os as _os
-    _os._exit(0)
+            if permission_lost:
+                return 3
+            if terminal_payload and terminal_payload.get("disk_full"):
+                return 4
+            if interrupt_state["count"] >= 2:
+                return 5
+            return 0
+    finally:
+        interrupt_state["client"] = None
 
 
 def _auto_export(capture_dir: Path) -> None:

@@ -7,22 +7,20 @@ schema always matches production.
 
 from __future__ import annotations
 
-import os
 from pathlib import Path
 
 import pytest
 
 
 # ---------------------------------------------------------------------------
-# Force the legacy ``screencap start`` code path for the whole test run.
-#
-# The SessionController spawns a Recording Worker subprocess which calls
-# ``start_recording`` in a fresh interpreter — monkey-patching the symbol
-# in the test process does not propagate there. The legacy one-shot path
-# keeps ``start_recording`` in-process so ``mock.patch`` works as expected.
+# Phase 2 U1.6 removed both the legacy in-process ``screencap start`` path
+# and the SessionController hand-off. The CLI is now a thin daemon HTTP
+# client, and the ``SCREENCAP_LEGACY_START=1`` toggle has no effect. The
+# legacy-style ``test_start_*`` tests that mock ``screencap.recorder.
+# start_recording`` are kept but skipped — they exercise contracts now
+# owned by the daemon supervisor (covered in tests/daemon/) and need
+# rewriting as ``DaemonHTTPClient.start`` payload-assertion tests.
 # ---------------------------------------------------------------------------
-
-os.environ.setdefault("SCREENCAP_LEGACY_START", "1")
 
 
 # ---------------------------------------------------------------------------

@@ -1130,6 +1130,15 @@ def test_upload_export_failure_continues(tmp_path):
 # --- start command — cloud NLP model gate ---
 
 
+@pytest.mark.skip(
+    reason=(
+        "Phase 2 U1.6: removed in-process recorder.start_recording from CLI; "
+        "NLP gate logic still runs at CLI option-parse time but the test "
+        "asserted ``recorder`` mock kwargs that no longer get exercised. "
+        "Rewrite as a daemon-payload-assertion test in "
+        "tests/cli/test_start_daemon_client.py."
+    )
+)
 def test_cloud_start_nlp_model_gate(tmp_path):
     """Cloud recordings are gated on NLP model availability.
 
@@ -1428,14 +1437,25 @@ def test_cloud_function_filename_regex_allows_marker():
 
 
 # ---------------------------------------------------------------------------
-# `screencap start` flag/path tests
+# Legacy `screencap start` flag/path tests
 #
-# These exercise `start` with the prompt entry points patched via
-# _safe_start_prompts() so the test can't trigger interactive setup, write
-# the user's privacy config, or block on stdin.
+# These tests exercise the in-process ``recorder.start_recording`` call
+# path that Phase 2 U1.6 removed. The daemon-side equivalents live in
+# ``tests/cli/test_start_daemon_client.py`` (CLI translation) and
+# ``tests/daemon/test_control_verbs.py`` (engine spawn semantics).
+# Kept as skipped scaffolding so future readers see the migration.
 # ---------------------------------------------------------------------------
 
 
+pytestmark_legacy_start = pytest.mark.skip(
+    reason=(
+        "Phase 2 U1.6: in-process ``recorder.start_recording`` path removed "
+        "from screencap start; see tests/cli/test_start_daemon_client.py."
+    )
+)
+
+
+@pytestmark_legacy_start
 @pytest.mark.parametrize("flag,kwarg,expected", [
     ("--no-video", "capture_video", False),
     ("--no-images", "capture_images", False),
@@ -1458,6 +1478,7 @@ def test_start_capture_flag_propagates_to_recorder(tmp_path, flag, kwarg, expect
     assert kwargs[kwarg] is expected
 
 
+@pytestmark_legacy_start
 @pytest.mark.parametrize("args,expected_cloud,expected_source", [
     ([], False, "non_interactive_default"),
     (["--cloud"], True, "flag"),
@@ -1489,6 +1510,7 @@ def test_start_intent_flag_resolves_to_recorder_kwargs(
     assert kwargs["force_mode"] == (PrivacyMode.PUBLIC if expected_cloud else None)
 
 
+@pytestmark_legacy_start
 def test_start_cloud_then_local_resolves_to_local(tmp_path):
     """Click flag_value semantics: when both --cloud and --local are passed,
     the last one on the command line wins. Regression for an earlier bug
@@ -1509,6 +1531,7 @@ def test_start_cloud_then_local_resolves_to_local(tmp_path):
     assert kwargs["force_mode"] is None
 
 
+@pytestmark_legacy_start
 def test_start_force_flag_passes_force_clean_to_recorder(tmp_path):
     """`start --force` triggers orphan cleanup and forwards force_clean=True."""
     runner = CliRunner()
@@ -1532,6 +1555,7 @@ def test_start_force_flag_passes_force_clean_to_recorder(tmp_path):
     assert kwargs["force_clean"] is True
 
 
+@pytestmark_legacy_start
 def test_start_without_force_exits_when_orphans_present():
     """Without --force, start exits non-zero rather than racing the orphans."""
     runner = CliRunner()
@@ -1547,6 +1571,7 @@ def test_start_without_force_exits_when_orphans_present():
     assert result.exit_code == 1
 
 
+@pytestmark_legacy_start
 def test_start_disk_full_skips_auto_naming_but_prints_summary(tmp_path):
     """DiskFullError from start_recording is caught: the post-recording pipeline
     skips auto-naming/transcription, but the summary still prints so the user
@@ -1571,6 +1596,7 @@ def test_start_disk_full_skips_auto_naming_but_prints_summary(tmp_path):
     mock_namer.assert_not_called()
 
 
+@pytestmark_legacy_start
 def test_start_auto_export_called_with_capture_dir(tmp_path):
     """Auto-export runs after recording with the capture dir."""
     runner = CliRunner()
@@ -1591,6 +1617,7 @@ def test_start_auto_export_called_with_capture_dir(tmp_path):
     mock_auto_export.assert_called_once_with(fake_dir)
 
 
+@pytestmark_legacy_start
 def test_start_auto_export_keyboard_interrupt_does_not_abort(tmp_path):
     """Ctrl-C during auto-export prints 'Export cancelled.' and the pipeline
     continues to the summary instead of crashing."""
@@ -1612,6 +1639,7 @@ def test_start_auto_export_keyboard_interrupt_does_not_abort(tmp_path):
     assert "Recording complete" in result.output
 
 
+@pytestmark_legacy_start
 def test_start_auto_export_internal_failure_warns_but_succeeds(tmp_path):
     """When export_recording inside _auto_export raises, the warning path
     inside _auto_export catches it; start still finishes with exit 0 and the
