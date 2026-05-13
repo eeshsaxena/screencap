@@ -2144,39 +2144,35 @@ def status(as_json, no_nlp_check):
               help="Emit machine-readable JSON to stdout instead of prose. "
                    "Auto-detected when stdout is not a TTY (todo 009).")
 def stop(force, as_json):
-    """Stop recording processes.
+    """Stop the active recording via the daemon.
 
-    \b
-    Without --force: send SIGTERM to the lock owner, wait up to 30s for
-    a clean shutdown, then fall through to an orphan-children scan.
+    Thin client of ``POST /v0/recording.stop``. The daemon owns engine
+    supervision after Phase 2 U1, including SIGTERM grace, SIGKILL
+    escalation, and orphan teardown — the CLI is purely a remote that
+    surfaces the result envelope.
 
-    \b
-    With --force: SIGKILL the lock owner directly (so a hung-but-alive
-    SessionController can be taken down — find_orphaned_processes returns
-    nothing while the parent lives), then run the orphan-children scan.
-    Use this only when the graceful path has already failed; previously
-    --force was a no-op against a live parent and is now actively
-    destructive against the recording session.
+    Without ``--force`` the daemon performs a graceful stop. With
+    ``--force`` the daemon SIGKILLs the engine subprocess directly.
 
-    \b
-    --json envelope (todo 009):
-      {ok, schema_version, action, pid, killed,
-       orphans_terminated, error}
-    action ∈ {"sigterm", "sigkill", "none", "no_owner"}.
+    JSON envelope:
+      {ok, schema_version, action, stopped, final_state, error}
+    where ``action`` ∈ {"sigterm", "sigkill", "no_daemon", "no_recording"}.
     """
-    import os as _os
-    import signal as _signal
-    import time as _time
+    from screencap.cli._autospawn import (
+        LaunchAgentNotRunningError,
+        ensure_daemon_or_spawn,
+    )
+    from screencap.cli._daemon_client import (
+        DaemonAPIError,
+        DaemonHTTPClient,
+        DaemonUnreachableError,
+        SchemaMismatchError,
+    )
 
-    # Track outcome across exit points so the JSON envelope describes the
-    # actual lifecycle (todo 009). Updated in place by the SIGTERM /
-    # SIGKILL / orphan-scan branches; emitted from the helper below before
-    # every return / SystemExit.
     _stop_outcome: dict = {
         "action": "none",
-        "pid": None,
-        "killed": False,
-        "orphans_terminated": 0,
+        "stopped": False,
+        "final_state": None,
         "error": None,
     }
 
@@ -2193,190 +2189,68 @@ def stop(force, as_json):
         if exit_code:
             raise SystemExit(exit_code)
 
+    # Stopping a non-existent daemon is a no-op — don't spawn one just
+    # to confirm there's nothing to stop.
     try:
-        from screencap.pidfile import (
-            _is_screencap_process,
-            _pid_exists,
-            delete_pidfile,
-            find_orphaned_processes,
-            read_lock_metadata,
-            read_pidfile,
-            terminate_processes,
-        )
-    except ImportError:
-        if not as_json:
-            console.print(_RECORD_EXTRAS_MSG)
-        _stop_outcome["error"] = "record_extras_not_installed"
+        ensure_daemon_or_spawn(auto_spawn=False)
+    except LaunchAgentNotRunningError as exc:
+        click.echo(str(exc), err=True)
+        _stop_outcome["action"] = "no_daemon"
+        _stop_outcome["error"] = "launchagent_not_running"
         _emit_stop_result(ok=False, exit_code=1)
         return
 
-    # Identify the lock owner. Prefer the flock-protected lock metadata
-    # (Unit 3) — it's the canonical owner and works correctly for
-    # multiprocessing.spawn workers (per
-    # docs/tickets/high-2026-03-10-fix-orphan-detection-spawn-workers.md).
-    # Fall back to legacy recording.pid for back-compat with any holder
-    # that hasn't migrated.
-    #
-    # This identification step runs in BOTH the graceful and --force paths.
-    # Without it, --force would skip straight to find_orphaned_processes(),
-    # which returns [] when the SessionController parent is alive — meaning
-    # `screencap stop --force` against a hung-but-alive controller did
-    # nothing.
-    lock_meta = read_lock_metadata()
-    parent_pid = None
-    lock_started_at = None
-    if lock_meta and lock_meta.get("pid"):
-        parent_pid = lock_meta["pid"]
-        lock_started_at = lock_meta.get("started_at")
-    else:
-        data = read_pidfile()
-        if data and data.get("parent_pid"):
-            parent_pid = data["parent_pid"]
-            lock_started_at = data.get("started_at")
+    _stop_outcome["action"] = "sigkill" if force else "sigterm"
 
-    # PID-recycle guard (todo 007) — verify the live PID's create_time is
-    # within tolerance of the lock metadata's started_at. macOS recycles
-    # PIDs aggressively (~99k space), so a long-dead recorder's PID could
-    # belong to an unrelated process by the time the user runs `stop`.
-    # Applies to both graceful and --force paths — force-killing the wrong
-    # process is even worse than SIGTERM-ing it.
-    if parent_pid is not None and lock_started_at is not None:
-        try:
-            import psutil as _psutil
-            proc_create_time = _psutil.Process(parent_pid).create_time()
-            # 60s tolerance (todo 014): both lock_started_at (time.time at
-            # claim_lock) and psutil.Process.create_time on macOS are wall-
-            # clock — a forward NTP step between claim and stop (common on
-            # laptops resuming from sleep) would otherwise null the legit
-            # parent_pid and silently turn `screencap stop` into a no-op
-            # because find_orphaned_processes() returns [] while the parent
-            # lives. Real PID recycles after process death involve much
-            # larger elapsed times; 60s absorbs routine NTP jumps without
-            # weakening the guard's intent.
-            if proc_create_time > float(lock_started_at) + 60.0:
-                console.print(
-                    f"[yellow]Warning:[/yellow] PID {parent_pid} appears recycled "
-                    f"(process started >60s after the recording's lock metadata). "
-                    f"Skipping direct kill; falling through to orphan scan."
-                )
-                parent_pid = None
-        except (_psutil.NoSuchProcess, _psutil.AccessDenied, _psutil.ZombieProcess):
-            # No process at that PID — nothing to stop directly; fall
-            # through to the orphan scan.
-            parent_pid = None
-        except Exception:
-            # Unexpected psutil failure: stay conservative and skip the
-            # direct kill rather than risk killing an unrelated process.
-            parent_pid = None
-
-    if parent_pid is not None and _pid_exists(parent_pid) and _is_screencap_process(parent_pid):
-        _stop_outcome["pid"] = int(parent_pid)
-        if force:
-            # --force path: SIGKILL the lock owner directly. This is the
-            # only way to take down a hung-but-alive SessionController, since
-            # find_orphaned_processes() returns [] while the parent lives.
-            _stop_outcome["action"] = "sigkill"
-            if not as_json:
-                console.print(f"[yellow]Force-killing recording (PID {parent_pid})...[/yellow]")
-            try:
-                _os.kill(parent_pid, _signal.SIGKILL)
-            except (ProcessLookupError, PermissionError) as exc:
-                # Surface as a non-zero exit (todo 009): an agent that
-                # invokes ``stop --force`` and gets exit 0 will assume the
-                # session is dead. PermissionError most commonly means the
-                # PID belongs to a different uid (recycled across users).
-                _stop_outcome["error"] = f"sigkill_failed:{type(exc).__name__}:{exc}"
-                if not as_json:
-                    console.print(f"[red]Failed to SIGKILL PID {parent_pid}: {exc}[/red]")
-                _emit_stop_result(ok=False, exit_code=1)
-                return
-            else:
-                # Brief wait for the kernel to reap; then confirm.
-                for _ in range(10):
-                    if not _pid_exists(parent_pid):
-                        break
-                    _time.sleep(0.1)
-                if not _pid_exists(parent_pid):
-                    _stop_outcome["killed"] = True
-                    if not as_json:
-                        console.print("[#22d3ee]Recording force-stopped.[/#22d3ee]")
-                else:
-                    _stop_outcome["error"] = "sigkill_uninterruptible"
-                    if not as_json:
-                        console.print(
-                            f"[yellow]Warning:[/yellow] PID {parent_pid} still alive after "
-                            "SIGKILL — process may be uninterruptible (D-state)."
-                        )
-            delete_pidfile()
-            # Fall through to orphan scan in case force-kill left children.
-        else:
-            _stop_outcome["action"] = "sigterm"
-            if not as_json:
-                console.print(f"Sending stop signal to recording (PID {parent_pid})...")
-            try:
-                _os.kill(parent_pid, _signal.SIGTERM)
-            except (ProcessLookupError, PermissionError):
-                pass
-            else:
-                # Wait for graceful shutdown (up to 30s) with progress
-                _timed_out = True
-                try:
-                    with console.status(
-                        "[dim]Waiting for recording to stop "
-                        "(post-processing may take a moment)...[/dim]"
-                    ) as _wait_status:
-                        for _tick in range(60):
-                            if not _pid_exists(parent_pid):
-                                _timed_out = False
-                                break
-                            if _tick == 20:  # 10s elapsed
-                                _wait_status.update(
-                                    "[dim]Still waiting... use [bold]screencap stop --force[/bold] "
-                                    "to kill immediately[/dim]"
-                                )
-                            _time.sleep(0.5)
-                except KeyboardInterrupt:
-                    if not as_json:
-                        console.print(
-                            "\n[yellow]Interrupted — escalating to force kill.[/yellow]\n"
-                            "[dim]Tip: [bold]screencap stop --force[/bold] "
-                            "skips the graceful wait[/dim]"
-                        )
-                if not _timed_out or not _pid_exists(parent_pid):
-                    _stop_outcome["killed"] = True
-                    if not as_json:
-                        console.print("[#22d3ee]Recording stopped.[/#22d3ee]")
-                    delete_pidfile()
-                    _emit_stop_result(ok=True)
-                    return
-                if not as_json:
-                    console.print("[yellow]Graceful stop timed out — falling back to force kill.[/yellow]")
-
-    orphans = find_orphaned_processes()
-    if not orphans:
-        if _stop_outcome["action"] == "none":
-            _stop_outcome["action"] = "no_owner"
+    try:
+        with DaemonHTTPClient() as client:
+            result = client.stop(force=force)
+    except DaemonUnreachableError:
+        _stop_outcome["action"] = "no_daemon"
         if not as_json:
-            console.print("[dim]No orphaned recording processes found.[/dim]")
+            console.print("[dim]No active recording. (Daemon not running.)[/dim]")
         _emit_stop_result(ok=True)
         return
+    except SchemaMismatchError as exc:
+        _stop_outcome["error"] = "schema_mismatch"
+        if not as_json:
+            console.print(f"[red]Error:[/red] {exc}")
+            console.print(
+                "Update the daemon: [bold]launchctl kickstart -kp "
+                "gui/$UID/com.screencap.daemon[/bold]"
+            )
+        _emit_stop_result(ok=False, exit_code=1)
+        return
+    except DaemonAPIError as exc:
+        code = exc.envelope.get("error", "unknown")
+        if code == "not_owned_by_daemon":
+            _stop_outcome["action"] = "no_recording"
+            _stop_outcome["error"] = "not_owned_by_daemon"
+            if not as_json:
+                console.print(
+                    "[dim]No active recording owned by the daemon.[/dim]"
+                )
+            _emit_stop_result(ok=True)
+            return
+        _stop_outcome["error"] = code
+        if not as_json:
+            console.print(f"[red]Daemon error:[/red] {code}")
+        _emit_stop_result(ok=False, exit_code=1)
+        return
 
+    _stop_outcome["stopped"] = bool(result.get("stopped"))
+    _stop_outcome["final_state"] = result.get("final_state")
     if not as_json:
-        console.print(f"Found {len(orphans)} orphaned recording process(es).")
-    terminated = terminate_processes(orphans, force=force)
-    _stop_outcome["orphans_terminated"] = len(terminated)
-    if terminated:
-        _stop_outcome["killed"] = True
-
-    if not as_json:
-        for entry in terminated:
-            console.print(f"  Terminated {entry.get('name', 'unknown')} (PID {entry['pid']})... done")
-        if terminated:
-            console.print(f"Cleaned up {len(terminated)} process(es).")
+        if _stop_outcome["stopped"]:
+            label = (
+                "force-stopped" if _stop_outcome["final_state"] == "force_stopped"
+                else "stopped"
+            )
+            console.print(f"[#22d3ee]Recording {label}.[/#22d3ee]")
         else:
-            console.print("[yellow]Could not terminate any processes.[/yellow]")
-
-    delete_pidfile()
+            console.print(
+                f"[yellow]Daemon reported final_state={_stop_outcome['final_state']!r}.[/yellow]"
+            )
     _emit_stop_result(ok=True)
 
 
