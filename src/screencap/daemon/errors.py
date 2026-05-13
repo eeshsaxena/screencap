@@ -16,6 +16,7 @@ CATALOG_UNREADABLE = "catalog_unreadable"
 ROGUE_FILE = "rogue_file"
 RECONCILING = "reconciling"
 FORCE_MISMATCH = "force_mismatch"
+INVALID_NAME = "invalid_name"
 
 # Codes returned by the daemon outside the typed-exception paths (route
 # handler `except Exception`, query-string parse failures). Keeping them
@@ -71,6 +72,18 @@ def schema_mismatch_envelope(
 
 def slow_consumer_envelope(*, schema_version: int) -> dict[str, Any]:
     return error_envelope(schema_version=schema_version, error=SLOW_CONSUMER)
+
+
+def invalid_name_envelope(
+    *,
+    reason: str,
+    schema_version: int,
+) -> dict[str, Any]:
+    return error_envelope(
+        schema_version=schema_version,
+        error=INVALID_NAME,
+        reason=reason,
+    )
 
 
 def cursor_unknown_envelope(
@@ -235,6 +248,35 @@ class SlowConsumerError(DaemonAPIError):
 
     def envelope(self) -> dict[str, Any]:
         return slow_consumer_envelope(schema_version=self.schema_version)
+
+
+class InvalidNameError(DaemonAPIError):
+    """Recording name rejected by the canonical validator.
+
+    Raised by ``screencap.daemon._name_validation.validate_recording_name``
+    and mapped to HTTP 400 with the ``invalid_name`` envelope. Carries
+    a short human-readable ``reason`` so the caller can surface why
+    the name was rejected.
+    """
+
+    error_code = INVALID_NAME
+    http_status = 400
+
+    def __init__(
+        self,
+        reason: str,
+        *,
+        schema_version: int,
+        http_status: int | None = None,
+    ) -> None:
+        self.reason = reason
+        super().__init__(schema_version=schema_version, http_status=http_status)
+
+    def envelope(self) -> dict[str, Any]:
+        return invalid_name_envelope(
+            reason=self.reason,
+            schema_version=self.schema_version,
+        )
 
 
 class CursorUnknownError(DaemonAPIError):

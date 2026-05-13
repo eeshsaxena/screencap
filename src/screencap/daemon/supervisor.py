@@ -645,9 +645,17 @@ class Supervisor:
 
     def _allocate_capture_dir(self, request: "RecordingStartRequest") -> tuple[str, Path]:
         from screencap.config import get_recordings_dir
+        from screencap.daemon._name_validation import validate_recording_name
 
         requested_name = request.name
         requested_output = request.output_dir
+        # Defense-in-depth: the ``recording.start`` HTTP handler already
+        # validates ``name`` for path traversal at the request boundary,
+        # but the supervisor is the engine-spawn site for any future
+        # internal caller (recovery flows, MCP tools, daemon-internal
+        # cron jobs). Re-validate so the gate is single-sourced.
+        if requested_name is not None:
+            validate_recording_name(requested_name)
         base_name = requested_name or time.strftime("rec-%Y%m%dT%H%M%S")
         if requested_output:
             capture_dir = Path(requested_output).expanduser()

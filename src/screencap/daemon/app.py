@@ -218,6 +218,7 @@ def _api_error_response(exc: errors.DaemonAPIError) -> JSONResponse:
 
 async def recording_start(request: Request) -> JSONResponse:
     from screencap.daemon import provenance
+    from screencap.daemon._name_validation import validate_recording_name
 
     try:
         body = await request.json()
@@ -225,6 +226,14 @@ async def recording_start(request: Request) -> JSONResponse:
             body.get("started_by") if isinstance(body, dict) else None
         )
         parsed = schema.RecordingStartRequest.model_validate(body)
+
+        # Phase 2 U2.3: gate recording names through the canonical
+        # validator so path traversal can't leak from agent / CLI / GUI
+        # callers into ``~/.screencap/recordings/<name>``. Name is
+        # optional (None means daemon auto-generates a timestamp name);
+        # only validate when caller supplied a value.
+        if parsed.name is not None:
+            validate_recording_name(parsed.name)
 
         # Phase 2 U2: derive started_by from the peer socket and
         # override any caller-supplied value. The field stays Optional
