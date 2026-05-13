@@ -84,11 +84,7 @@ class ClaimLock:
 
     def claim(self, capture_dir: Path, *, force_clean: bool) -> None:
         from screencap import pidfile
-        from screencap._stderr_events import (
-            EVENT_LOCK_CONTENDED,
-            emit_event,
-            resolve_claimant,
-        )
+        from screencap._stderr_events import EVENT_LOCK_CONTENDED, emit_event
 
         orphans = pidfile.find_orphaned_processes()
         if orphans:
@@ -108,7 +104,13 @@ class ClaimLock:
                 raise SystemExit(1)
 
         try:
-            pidfile.claim_lock(capture_dir, claimant=resolve_claimant())
+            # Phase 2 U1 made the daemon the sole engine spawner — this
+            # ``ClaimLock`` policy is exercised only via the daemon's
+            # engine subprocess path, which runs with ``InheritLock``
+            # in practice. The fallback claimant if this is ever wired
+            # directly is ``CLAIMANT_DAEMON`` so lock metadata reads
+            # consistently downstream.
+            pidfile.claim_lock(capture_dir, claimant=pidfile.CLAIMANT_DAEMON)
         except pidfile.LockContended as exc:
             try:
                 emit_event(EVENT_LOCK_CONTENDED, owner=exc.owner)

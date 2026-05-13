@@ -58,18 +58,6 @@ EVENT_PREVIOUS_SESSION_FORCE_TERMINATED = "previous_session_force_terminated"
 EVENT_SUBSCRIBED = "subscribed"
 
 
-def resolve_claimant() -> str:
-    """Resolve the lock claimant identity from the SCREENCAP_PARENT env var.
-
-    "swiftui" when spawned by the SwiftUI app (via SCREENCAP_PARENT=swiftui),
-    "cli" otherwise. Centralized here (todo 030) so the two production sites
-    (session.py SessionController and recorder.py legacy start path) cannot
-    drift apart.
-    """
-    import os
-    return "swiftui" if os.environ.get("SCREENCAP_PARENT") == "swiftui" else "cli"
-
-
 def emit_event(event_type: str, **fields: Any) -> None:
     """Write a single JSON line to stderr describing a recorder lifecycle event.
 
@@ -93,7 +81,6 @@ def emit_event(event_type: str, **fields: Any) -> None:
 
 __all__ = [
     "emit_event",
-    "resolve_claimant",
     "EVENT_SCHEMA_VERSION",
     "EVENT_STARTED",
     "EVENT_LOCK_CONTENDED",
