@@ -53,7 +53,7 @@ def _load_models() -> dict[str, Any]:
     if _MODELS is not None:
         return _MODELS
 
-    from pydantic import BaseModel, ConfigDict
+    from pydantic import BaseModel, ConfigDict, Field
 
     class _DaemonModel(BaseModel):
         """Shared Pydantic model settings for documented daemon responses."""
@@ -106,7 +106,20 @@ def _load_models() -> dict[str, Any]:
 
     class RecordingStartRequest(_DaemonModel):
         name: str | None = None
-        started_by: str | None = None
+        # Phase 2 U2: ``started_by`` is now server-derived from the
+        # peer socket (``LOCAL_PEEREPID`` + ``proc_pidpath`` +
+        # ``KERN_PROCARGS2``). The field stays Optional for backwards
+        # compatibility — callers that supply it continue to be
+        # accepted, but the daemon ignores the value and logs the drop
+        # at DEBUG level. No API version bump; existing clients keep
+        # working unchanged.
+        started_by: str | None = Field(
+            default=None,
+            deprecated=(
+                "Server-derived from peer identity since Phase 2 U2. "
+                "Caller-supplied values are accepted but ignored."
+            ),
+        )
         description: str | None = None
         audio: bool | None = None
         output_dir: str | None = None

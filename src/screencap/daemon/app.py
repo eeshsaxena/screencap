@@ -217,8 +217,29 @@ def _api_error_response(exc: errors.DaemonAPIError) -> JSONResponse:
 
 
 async def recording_start(request: Request) -> JSONResponse:
+    from screencap.daemon import provenance
+
     try:
-        parsed = schema.RecordingStartRequest.model_validate(await request.json())
+        body = await request.json()
+        caller_supplied = (
+            body.get("started_by") if isinstance(body, dict) else None
+        )
+        parsed = schema.RecordingStartRequest.model_validate(body)
+
+        # Phase 2 U2: derive started_by from the peer socket and
+        # override any caller-supplied value. The field stays Optional
+        # in the request schema (soft-deprecated) so old clients keep
+        # working; the daemon owns the authoritative classification on
+        # persisted metadata.
+        derived = provenance.derive_started_by_from_asgi_scope(request.scope)
+        if caller_supplied is not None and caller_supplied != derived:
+            logger.debug(
+                "ignoring caller-supplied started_by=%r; using server-derived=%r",
+                caller_supplied,
+                derived,
+            )
+        parsed = parsed.model_copy(update={"started_by": derived})
+
         result = await request.app.state.supervisor.spawn(parsed)
         return JSONResponse(
             schema.envelope(
