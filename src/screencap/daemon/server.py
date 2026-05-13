@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import asyncio
+import logging
 import os
 import signal
 import tempfile
@@ -11,6 +12,14 @@ from pathlib import Path
 from types import FrameType
 
 SignalHandler = Callable[[int, FrameType | None], None]
+
+# `sysexits.h` semantic: "temporary failure, try again". launchd sees this
+# as a recoverable condition and an operator can grep `launchctl print` for
+# the value to distinguish "rogue same-EUID listener" from the generic
+# exit-1 path (e.g., RogueFileAtSocketPath).
+EX_TEMPFAIL = 75
+
+logger = logging.getLogger(__name__)
 
 
 def _handled_signals() -> tuple[signal.Signals, ...]:
@@ -121,7 +130,13 @@ def serve(socket_path: str | Path | None = None, *, self_test: bool = False) -> 
             return 0
 
         return asyncio.run(run())
-    except (DaemonAlreadyRunning, RogueFileAtSocketPath) as exc:
+    except DaemonAlreadyRunning as exc:
+        pid_str = str(exc.existing_pid) if exc.existing_pid is not None else "unknown"
+        logger.warning("daemon socket already bound by pid=%s", pid_str)
+        _print_stderr(str(exc))
+        _print_stderr(f"daemon socket already bound by pid={pid_str}")
+        return EX_TEMPFAIL
+    except RogueFileAtSocketPath as exc:
         _print_stderr(str(exc))
         return 1
     finally:

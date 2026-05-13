@@ -296,6 +296,85 @@ def test_install_times_out_when_daemon_never_responds(
     assert result.state == "install_failed_daemon_did_not_start"
 
 
+def test_install_failed_already_running_when_daemon_exits_75(
+    monkeypatch: pytest.MonkeyPatch,
+    tmp_path: Path,
+):
+    """When the daemon never responds AND launchctl reports the spawned
+    process's last exit code as 75 (EX_TEMPFAIL), the install verifier
+    classifies the failure as `install_failed_already_running`."""
+    from screencap.daemon import launchagent
+
+    launchctl_print_output = (
+        "com.screencap.daemon = {\n"
+        "\tstate = exited\n"
+        "\tlast exit code = 75\n"
+        "}\n"
+    )
+
+    def fake_run(cmd, **_kwargs):
+        if cmd[:2] == ["launchctl", "print"]:
+            return _completed(cmd, returncode=0, stdout=launchctl_print_output)
+        return _completed(cmd)
+
+    monkeypatch.setattr(launchagent.subprocess, "run", fake_run)
+    monkeypatch.setattr(launchagent, "_daemon_info_responds", lambda *_args, **_kwargs: False)
+
+    result = launchagent.install(
+        program="/bin/screencap",
+        plist_path=tmp_path / "agent.plist",
+        timeout_seconds=0,
+    )
+
+    assert result.state == "install_failed_already_running"
+    assert "75" in result.detail or "already" in result.detail.lower()
+
+
+def test_install_failed_did_not_start_when_launchctl_print_unparseable(
+    monkeypatch: pytest.MonkeyPatch,
+    tmp_path: Path,
+):
+    """If `launchctl print` is missing the `last exit code` field, the
+    install verifier falls back to the generic did-not-start state."""
+    from screencap.daemon import launchagent
+
+    def fake_run(cmd, **_kwargs):
+        if cmd[:2] == ["launchctl", "print"]:
+            return _completed(cmd, returncode=0, stdout="com.screencap.daemon = {\n}\n")
+        return _completed(cmd)
+
+    monkeypatch.setattr(launchagent.subprocess, "run", fake_run)
+    monkeypatch.setattr(launchagent, "_daemon_info_responds", lambda *_args, **_kwargs: False)
+
+    result = launchagent.install(
+        program="/bin/screencap",
+        plist_path=tmp_path / "agent.plist",
+        timeout_seconds=0,
+    )
+
+    assert result.state == "install_failed_daemon_did_not_start"
+
+
+def test_parse_last_exit_code_extracts_signed_int():
+    from screencap.daemon.launchagent import _parse_last_exit_code
+
+    assert _parse_last_exit_code("\tlast exit code = 75\n") == 75
+    assert _parse_last_exit_code("last exit code = 0") == 0
+    assert _parse_last_exit_code("last exit code = -9") == -9
+    assert _parse_last_exit_code("state = running\n") is None
+    assert _parse_last_exit_code("") is None
+
+
+def test_parse_last_exit_code_strips_symbolic_suffix():
+    """launchctl on some macOS versions appends ``: EX_TEMPFAIL`` (or
+    other symbolic suffixes) to the exit code line. The parser must
+    return the leading integer in both forms."""
+    from screencap.daemon.launchagent import _parse_last_exit_code
+
+    assert _parse_last_exit_code("\tlast exit code = 75: EX_TEMPFAIL\n") == 75
+    assert _parse_last_exit_code("last exit code = 0: ok") == 0
+
+
 def test_install_write_failure_is_classified(monkeypatch: pytest.MonkeyPatch, tmp_path: Path):
     from screencap.daemon import launchagent
 

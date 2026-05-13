@@ -90,11 +90,10 @@ async def test_events_stream_fans_out_to_two_subscribers() -> None:
 
 
 @pytest.mark.asyncio
-async def test_events_since_attaches_live_for_stale_cursor_and_rejects_future_cursor() -> None:
-    # Cursor protocol: `since` older-than-or-equal-to current attaches live —
-    # the snapshot caller is just behind by the events emitted in the gap and
-    # catches up on the next live read. Only `since > current_cursor` is
-    # genuinely unknown (asking about an event the daemon never published).
+async def test_events_since_current_attaches_live_only() -> None:
+    """``?since=current_cursor`` yields no replay and starts live from the
+    next published event. The `subscribed` frame's cursor reflects the
+    requested cursor since replay begins strictly after that point."""
     app = await _build_app()
     await app.state.event_bus.publish(
         {"type": "existing", "ts": 1.0, "schema_version": 1}
@@ -106,16 +105,76 @@ async def test_events_since_attaches_live_for_stale_cursor_and_rejects_future_cu
     assert (await _read_line(lines))["cursor"] == current
     await lines.aclose()
 
-    # Stale cursor (snapshot taken before recent events) — attach live, no error.
-    response, lines = await _open_stream(app, f"/v0/events?since={current - 1}")
+
+@pytest.mark.asyncio
+async def test_events_since_in_retained_window_replays_then_lives() -> None:
+    """``?since=N`` with N inside the retained replay window yields every
+    event with cursor > N (in ascending order) before live delivery
+    resumes. This is the contract the SwiftUI shell depends on to avoid
+    missing `recording_started` across the recording.start → events
+    subscribe gap."""
+    app = await _build_app()
+    for index in range(5):
+        await app.state.event_bus.publish(
+            {"type": f"e{index}", "ts": float(index), "schema_version": 1}
+        )
+    current = app.state.event_bus.current_cursor()  # == 5
+
+    response, lines = await _open_stream(app, f"/v0/events?since={current - 3}")
     assert response.status_code == 200
-    assert (await _read_line(lines))["cursor"] == current
+
+    subscribed = await _read_line(lines)
+    assert subscribed["type"] == "subscribed"
+    assert subscribed["cursor"] == current - 3
+
+    # Replay yields cursors current-2, current-1, current — exactly the
+    # events published after the requested cursor.
+    replayed = [await _read_line(lines) for _ in range(3)]
+    assert [event["cursor"] for event in replayed] == [
+        current - 2,
+        current - 1,
+        current,
+    ]
+
+    # Live delivery picks up where replay left off.
+    await app.state.event_bus.publish(
+        {"type": "live", "ts": 99.0, "schema_version": 1}
+    )
+    live = await _read_line(lines)
+    assert live["type"] == "live"
+    assert live["cursor"] == current + 1
     await lines.aclose()
 
-    # Future cursor (asking about events never emitted) — cursor_unknown.
-    # 410 Gone matches the typed CursorUnknownError exception status; this
-    # path produces the envelope without raising the exception so the wire
-    # contract is asserted explicitly here.
+
+@pytest.mark.asyncio
+async def test_events_since_zero_replays_full_retained_window() -> None:
+    """``?since=0`` means "from before any event" and replays everything
+    currently retained in the ring."""
+    app = await _build_app()
+    for index in range(3):
+        await app.state.event_bus.publish(
+            {"type": f"e{index}", "ts": float(index), "schema_version": 1}
+        )
+
+    response, lines = await _open_stream(app, "/v0/events?since=0")
+    assert response.status_code == 200
+    await _read_line(lines)  # drain `subscribed`
+    replayed = [await _read_line(lines) for _ in range(3)]
+    assert [event["cursor"] for event in replayed] == [1, 2, 3]
+    await lines.aclose()
+
+
+@pytest.mark.asyncio
+async def test_events_since_future_cursor_returns_410_cursor_unknown() -> None:
+    """``?since=N`` with N strictly greater than the current cursor is
+    a future cursor the daemon has never produced — return 410 with the
+    typed `cursor_unknown` envelope."""
+    app = await _build_app()
+    await app.state.event_bus.publish(
+        {"type": "existing", "ts": 1.0, "schema_version": 1}
+    )
+    current = app.state.event_bus.current_cursor()
+
     response, _body = await _open_stream(app, f"/v0/events?since={current + 5}")
     assert response.status_code == 410
     assert response.media_type == "application/json"
@@ -124,6 +183,42 @@ async def test_events_since_attaches_live_for_stale_cursor_and_rejects_future_cu
     assert payload["error"] == errors.CURSOR_UNKNOWN
     assert payload["requested_cursor"] == current + 5
     assert payload["schema_version"] == schema._EVENTS_API_VERSION
+
+
+@pytest.mark.asyncio
+async def test_events_since_older_than_retained_window_returns_410() -> None:
+    """``?since=N`` with N older than the oldest retained cursor must
+    return 410 `cursor_unknown` — the Phase 1 plan promised this contract
+    but the code previously took the silent "live from now" fallback
+    instead. U2 finally aligns the two."""
+    from screencap.daemon.event_bus import REPLAY_BUFFER_SIZE
+
+    app = await _build_app()
+    overflow = REPLAY_BUFFER_SIZE + 20
+    for index in range(overflow):
+        await app.state.event_bus.publish(
+            {"type": "burst", "i": index, "schema_version": 1}
+        )
+
+    # 10 is well older than the oldest retained cursor (overflow - REPLAY_BUFFER_SIZE + 1).
+    response, _body = await _open_stream(app, "/v0/events?since=10")
+    assert response.status_code == 410
+    payload = json.loads(response.body)
+    assert payload["error"] == errors.CURSOR_UNKNOWN
+    assert payload["requested_cursor"] == 10
+
+
+@pytest.mark.asyncio
+async def test_events_since_negative_returns_400_invalid_cursor() -> None:
+    """Negative cursors are invalid input, not unknown — they map to 400
+    `invalid_cursor`, not 410. Preserved from prior behavior."""
+    app = await _build_app()
+    response, _body = await _open_stream(app, "/v0/events?since=-1")
+    assert response.status_code == 400
+    payload = json.loads(response.body)
+    assert payload["ok"] is False
+    assert payload["error"] == errors.ERROR_CODE_INVALID_CURSOR
+    assert payload["requested_cursor"] == "-1"
 
 
 @pytest.mark.asyncio

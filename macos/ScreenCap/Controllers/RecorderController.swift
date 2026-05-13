@@ -127,6 +127,12 @@ final class RecorderController: ObservableObject {
 
     private var spawn: CLIClient.SpawnedProcess?
     private var daemonEventTask: Task<Void, Never>?
+    /// Cursor returned by `/v0/recording.start`, consumed by the first
+    /// `consumeDaemonEvents` iteration so the initial subscribe is keyed
+    /// to the start-response boundary (which precedes `recording_started`)
+    /// instead of the later `session.snapshot` cursor. Cleared after one use;
+    /// reconnect iterations fall back to `snapshot.cursor` as before.
+    private var pendingStartCursor: Int?
     private var elapsedTimer: Timer?
     private var permissionWatchdog: Timer?
     private var permissionObserver: NSObjectProtocol?
@@ -267,9 +273,10 @@ final class RecorderController: ObservableObject {
 
     private func startViaDaemon(name: String? = nil) async {
         do {
-            _ = try await DaemonClient.recordingStart(
+            let response = try await DaemonClient.recordingStart(
                 RecordingStartRequest(name: name, startedBy: "swiftui-via-daemon")
             )
+            pendingStartCursor = response.cursor
             attachDaemonEventStream()
             startPermissionWatchdog()
         } catch {
@@ -530,6 +537,16 @@ final class RecorderController: ObservableObject {
                 lastError = "Recording stopped, but some data may not have uploaded. Run `screencap upload` to retry."
             }
             Task { await self.index?.refresh() }
+        case "recording_failed":
+            // Engine reported a failure that prevents continuation (e.g. spawn
+            // error, encoder fault). Without this branch the UI stays in
+            // `.starting` / `.recording` until the user notices nothing is
+            // happening. Release any in-flight stop callers, surface the
+            // reason, and drop back to `.idle`.
+            lastError = event.reason ?? "Recording failed."
+            resolveAll(pending: \.awaitingFinalized, value: true)
+            resolveAll(pending: \.awaitingStopped, value: false)
+            state = .idle
         case "permission_lost":
             handlePermissionLost(event: event)
         case "disk_full":
@@ -586,7 +603,20 @@ final class RecorderController: ObservableObject {
                     lastError = "ScreenCap daemon is recovering the previous recording session."
                 }
 
-                for try await event in DaemonClient.subscribe(sinceCursor: snapshot.cursor) {
+                // First iteration consumes `pendingStartCursor` if present so
+                // the initial subscribe lands at the recording.start boundary
+                // (events with cursor > start_cursor include `recording_started`,
+                // which the daemon may publish before this subscribe arrives).
+                // Subsequent iterations (reconnect after drop) fall back to the
+                // snapshot's cursor.
+                let sinceCursor: Int
+                if let startCursor = pendingStartCursor {
+                    sinceCursor = startCursor
+                    pendingStartCursor = nil
+                } else {
+                    sinceCursor = snapshot.cursor
+                }
+                for try await event in DaemonClient.subscribe(sinceCursor: sinceCursor) {
                     if Task.isCancelled { return }
                     sawProgress = true
                     handleRecorderEvent(event)
@@ -597,6 +627,14 @@ final class RecorderController: ObservableObject {
             } catch DaemonClientError.streamClosed(let reason) {
                 if Task.isCancelled { return }
                 recorderLogger.info("Daemon event stream dropped; reconnecting. Reason: \(reason, privacy: .public)")
+            } catch DaemonClientError.envelopeError(let code, _) where code == "cursor_unknown" {
+                if Task.isCancelled { return }
+                // The requested cursor was evicted from the daemon's replay
+                // window between snapshot and subscribe. Refetch the snapshot
+                // and resubscribe with a fresh cursor; leave `state` intact so
+                // the UI does not flicker to `.idle`.
+                recorderLogger.info("Daemon event stream evicted cursor; refetching snapshot.")
+                continue
             } catch {
                 if Task.isCancelled { return }
                 handleDaemonOperationFailure(error)
@@ -807,6 +845,16 @@ extension RecorderController {
 
     func _testHandleProcessTerminated(exitCode: Int32) {
         handleProcessTerminated(exitCode: exitCode)
+    }
+
+    /// Cancel any in-flight daemon event stream Task so tests can tear
+    /// down the underlying NWConnection synchronously before the test
+    /// server stops accepting. Without this hook, a long-poll connection
+    /// can outlive the test's `server.stop()` and leave Network.framework
+    /// retrying against a removed socket, which surfaces as CI hangs.
+    func _testCancelDaemonTask() {
+        daemonEventTask?.cancel()
+        daemonEventTask = nil
     }
 }
 #endif

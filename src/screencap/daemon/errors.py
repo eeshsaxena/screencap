@@ -77,11 +77,22 @@ def cursor_unknown_envelope(
     *,
     requested_cursor: int,
     schema_version: int,
+    daemon_cursor: int | None = None,
+    oldest_retained_cursor: int | None = None,
 ) -> dict[str, Any]:
+    # daemon_cursor + oldest_retained_cursor let the caller resubscribe with a
+    # valid in-window cursor (daemon_cursor) without a separate snapshot
+    # round-trip. Both are optional so the envelope stays stable for callers
+    # that have not yet wired through the bus state at the boundary.
+    payload: dict[str, Any] = {"requested_cursor": requested_cursor}
+    if daemon_cursor is not None:
+        payload["daemon_cursor"] = daemon_cursor
+    if oldest_retained_cursor is not None:
+        payload["oldest_retained_cursor"] = oldest_retained_cursor
     return error_envelope(
         schema_version=schema_version,
         error=CURSOR_UNKNOWN,
-        requested_cursor=requested_cursor,
+        **payload,
     )
 
 

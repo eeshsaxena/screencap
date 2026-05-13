@@ -3,7 +3,9 @@
 from __future__ import annotations
 
 import os
+import re
 import signal
+import socket as stdlib_socket
 import subprocess
 import sys
 import time
@@ -86,3 +88,69 @@ def test_second_serve_against_same_socket_exits_nonzero(
         if first.poll() is None:
             first.send_signal(signal.SIGTERM)
             first.wait(timeout=5)
+
+
+def test_serve_against_pre_bound_socket_exits_75_and_logs_pid(
+    cli_env: dict[str, str],
+    tmp_path: Path,
+) -> None:
+    """A rogue same-EUID listener on the socket → daemon exits with EX_TEMPFAIL=75
+    and logs the offending PID via lsof (TKT-C AE-C items 1 + 2)."""
+    socket_path = short_socket_path(tmp_path)
+    socket_path.parent.mkdir(parents=True, exist_ok=True)
+
+    rogue = stdlib_socket.socket(stdlib_socket.AF_UNIX, stdlib_socket.SOCK_STREAM)
+    rogue.bind(str(socket_path))
+    rogue.listen(1)
+    try:
+        result = subprocess.run(
+            _cli_command("serve", "--socket", str(socket_path)),
+            env=cli_env,
+            stdout=subprocess.PIPE,
+            stderr=subprocess.PIPE,
+            text=True,
+            timeout=10,
+        )
+    finally:
+        rogue.close()
+        socket_path.unlink(missing_ok=True)
+
+    assert result.returncode == 75, (
+        f"expected EX_TEMPFAIL=75; got {result.returncode}\nstderr:\n{result.stderr}"
+    )
+    # The PID line is "daemon socket already bound by pid=<int|unknown>".
+    # On Linux without lsof installed the value falls back to "unknown"; on
+    # macOS lsof should populate a real PID. Accept both shapes.
+    assert re.search(r"daemon socket already bound by pid=(\d+|unknown)", result.stderr), (
+        f"expected rogue-PID log line in stderr:\n{result.stderr}"
+    )
+
+
+def test_serve_against_rogue_file_at_socket_path_exits_1_not_75(
+    cli_env: dict[str, str],
+    tmp_path: Path,
+) -> None:
+    """A non-socket file at the socket path must continue to exit with 1, not
+    collapse into the EX_TEMPFAIL=75 already-running path (TKT-C regression
+    guard: rogue-file and rogue-bind are distinct failure modes)."""
+    socket_path = short_socket_path(tmp_path)
+    socket_path.parent.mkdir(parents=True, exist_ok=True)
+    socket_path.write_text("rogue\n", encoding="utf-8")
+    try:
+        result = subprocess.run(
+            _cli_command("serve", "--socket", str(socket_path)),
+            env=cli_env,
+            stdout=subprocess.PIPE,
+            stderr=subprocess.PIPE,
+            text=True,
+            timeout=5,
+        )
+    finally:
+        # The rogue file must be left in place: bind must not have unlinked it.
+        assert socket_path.exists()
+        assert socket_path.read_text(encoding="utf-8") == "rogue\n"
+        socket_path.unlink(missing_ok=True)
+
+    assert result.returncode == 1, (
+        f"rogue-file path must remain exit 1; got {result.returncode}\nstderr:\n{result.stderr}"
+    )

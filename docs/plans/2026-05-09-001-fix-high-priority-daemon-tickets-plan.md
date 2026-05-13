@@ -1,7 +1,7 @@
 ---
 title: "fix: High-priority daemon tickets — EventBus replay, stop() TOCTOU, rogue-bind exit code, stderr backpressure"
 type: fix
-status: active
+status: completed
 date: 2026-05-09
 ---
 

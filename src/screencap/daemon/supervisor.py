@@ -4,6 +4,9 @@ from __future__ import annotations
 
 import asyncio
 import base64
+import contextlib
+import errno
+import fcntl
 import json
 import logging
 import math
@@ -19,7 +22,7 @@ import psutil
 
 from screencap import _stderr_events
 from screencap.daemon import errors, schema
-from screencap.daemon.event_bus import EventBus, _Subscription
+from screencap.daemon.event_bus import CursorOutOfRangeError, EventBus, _Subscription
 
 if TYPE_CHECKING:
     from screencap.daemon.schema import RecordingStartRequest
@@ -33,9 +36,62 @@ EngineCommandFactory = Callable[[str], list[str]]
 # detection, and cli.py engine-worker started event.
 CLAIMANT_DAEMON = "daemon"
 
+# Engine-stderr kernel pipe widening — buys headroom for `_stderr_pump`
+# against engine-side burst writes so a briefly-slow pump drain does not
+# transitively block the engine's `sys.stderr.write`. 1 MiB is ~16× the
+# typical macOS/Linux default; the EINVAL fallback at 128 KiB covers
+# kernels that cap below 1 MiB. Linux-only at the syscall level —
+# `F_SETPIPE_SZ` is absent on macOS, where the helper degrades to no-op
+# and the pipe stays at the kernel default. If production traces ever
+# show pump stalls past this ceiling, that's the trigger for the
+# deferred TKT-D approach (2): asyncio queue + drop policy.
+_STDERR_PIPE_SIZE = 1 << 20  # 1 MiB
+_STDERR_PIPE_FALLBACK = 1 << 17  # 128 KiB
+
+
+def _widen_stderr_pipe(proc: subprocess.Popen[Any]) -> int | None:
+    """Resize the kernel stderr pipe for ``proc`` to ``_STDERR_PIPE_SIZE``.
+
+    Returns the size that was applied, or ``None`` when widening was not
+    available (no ``F_SETPIPE_SZ`` on this platform) or failed in any other
+    way. Never raises — pipe sizing is a diagnostic safety net, not a
+    correctness invariant. No-op on macOS (``F_SETPIPE_SZ`` absent).
+    """
+    set_pipe_sz = getattr(fcntl, "F_SETPIPE_SZ", None)
+    if set_pipe_sz is None:
+        logger.info(
+            "engine stderr pipe widening unavailable: fcntl.F_SETPIPE_SZ not on this platform"
+        )
+        return None
+
+    stderr = getattr(proc, "stderr", None)
+    if stderr is None:
+        return None
+
+    try:
+        fd = stderr.fileno()
+    except (AttributeError, OSError):
+        return None
+
+    for size in (_STDERR_PIPE_SIZE, _STDERR_PIPE_FALLBACK):
+        try:
+            fcntl.fcntl(fd, set_pipe_sz, size)
+        except OSError as exc:
+            if exc.errno == errno.EINVAL and size == _STDERR_PIPE_SIZE:
+                continue
+            logger.warning(
+                "engine stderr pipe widening failed (size=%d): %s", size, exc
+            )
+            return None
+        logger.info("engine stderr pipe widened to %d bytes", size)
+        return size
+    return None
+
 
 class _PopenEngineProcess:
-    """Small subprocess wrapper exposing the ``is_alive`` API U5 requires."""
+    """Subprocess wrapper exposing a uniform ``is_alive``/``terminate``/``kill``/``stderr``
+    interface so ``Supervisor`` is testable against a protocol rather than directly
+    against ``subprocess.Popen``."""
 
     def __init__(self, argv: list[str]) -> None:
         self._popen = subprocess.Popen(
@@ -46,6 +102,9 @@ class _PopenEngineProcess:
             bufsize=0,
             env={**os.environ, "PYTHONUNBUFFERED": "1"},
         )
+        # Widen the kernel stderr pipe as close to the Popen as possible so
+        # the engine never gets a chance to write into a default-sized pipe.
+        _widen_stderr_pipe(self._popen)
 
     @property
     def pid(self) -> int:
@@ -303,6 +362,22 @@ class Supervisor:
                     "final_state": "stopped" if stopped else "not_terminated",
                 }
 
+            # TOCTOU defense (TKT-A): capture the bus cursor BEFORE the
+            # is_alive() check so the late `final_sub` subscription can
+            # replay any `recording_finalized` published by `_exit_poll`
+            # in the await gap. Without this, the engine can self-exit
+            # between is_alive() returning True and the live-only
+            # subscribe() landing, and stop() blocks for the full
+            # stop_timeout while the event sits unobserved on the bus.
+            pre_check_cursor = self._bus.current_cursor()
+
+            # Cancel _exit_poll before the late subscribe so a concurrent
+            # iteration cannot publish `recording_finalized` *and* run
+            # _handle_engine_exit between the cursor capture and the
+            # subscription — which would double-release the lock and
+            # double-publish the finalized event from stop()'s own teardown.
+            await self._cancel_exit_poll()
+
             if self._proc is None or not self._proc.is_alive():
                 engine_pid = metadata.get("engine_pid")
                 if isinstance(engine_pid, int):
@@ -315,7 +390,9 @@ class Supervisor:
                 self._release_daemon_lock()
                 return {"stopped": False, "final_state": "no_engine"}
 
-            final_sub = await self._bus.subscribe()
+            final_sub = await self._subscribe_with_replay_fallback(
+                pre_check_cursor, label="stop"
+            )
             proc = self._proc
             self._stopping = True
             try:
@@ -352,11 +429,22 @@ class Supervisor:
         if self._proc is not None and self._proc.is_alive():
             proc = self._proc
             self._stopping = True
+            # Same TOCTOU defense as Supervisor.stop(): capture the cursor
+            # before `terminate()` so the late subscription replays any
+            # `recording_finalized` the engine's SIGTERM handler publishes
+            # in the await gap.
+            pre_terminate_cursor = self._bus.current_cursor()
+            # Cancel _exit_poll before the late subscribe so a concurrent
+            # iteration cannot run _handle_engine_exit between the cursor
+            # capture and the subscription (same race as Supervisor.stop()).
+            await self._cancel_exit_poll()
             try:
                 proc.terminate()
             except ProcessLookupError:
                 pass
-            final_sub = await self._bus.subscribe()
+            final_sub = await self._subscribe_with_replay_fallback(
+                pre_terminate_cursor, label="shutdown"
+            )
             try:
                 try:
                     await self._wait_on_subscription(
@@ -725,6 +813,47 @@ class Supervisor:
         except OSError:
             pass
 
+    async def _subscribe_with_replay_fallback(
+        self, cursor: int, *, label: str
+    ) -> _Subscription:
+        """``subscribe(since=cursor)`` with a live-only fallback on eviction.
+
+        Shared by ``stop()`` and ``shutdown()``. Replay coverage of the
+        await gap is the desired path; if a burst of unrelated events
+        evicted ``cursor`` from the ring between capture and this call,
+        log the loss with ``label`` and fall back to a live-only
+        subscription. Worst case the caller's ``_wait_on_subscription``
+        hits its timeout and the force-stop path runs.
+        """
+        try:
+            return await self._bus.subscribe(since=cursor)
+        except CursorOutOfRangeError:
+            logger.warning(
+                "%s(): replay cursor=%d aged out before subscribe; "
+                "falling back to live-only delivery",
+                label,
+                cursor,
+            )
+            return await self._bus.subscribe()
+
+    async def _cancel_exit_poll(self) -> None:
+        """Cancel the engine exit poll task before a late subscribe.
+
+        Same shape as the cancellation block in ``spawn()``'s except arm:
+        check not None and not done, cancel, then await with
+        ``CancelledError`` suppressed so the helper never raises into the
+        caller. No-op if the task is absent or already finished. The
+        attribute is cleared on success so subsequent teardown paths
+        (``_reset_state``) do not re-cancel.
+        """
+        task = self._poll_task
+        if task is None or task.done():
+            return
+        task.cancel()
+        with contextlib.suppress(asyncio.CancelledError):
+            await task
+        self._poll_task = None
+
     def _reset_state(self) -> None:
         self._proc = None
         self._engine_pid = None
@@ -733,6 +862,7 @@ class Supervisor:
         self._poll_task = None
         self._finalized_seen = False
         self._stopping = False
+        self._exit_handled = False
 
 
 __all__ = ["Supervisor"]

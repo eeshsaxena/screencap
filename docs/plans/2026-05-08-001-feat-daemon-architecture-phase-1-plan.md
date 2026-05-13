@@ -63,7 +63,7 @@ R7 and R12 are Phase 2; tracked here only as forward constraints on the API cont
 
 ### Deferred to Follow-Up Work
 
-- Ring-buffer event replay on subscribe — Phase 1 uses atomic snapshot+cursor; deferred to a later plan if real consumers need historical replay.
+- ~~Ring-buffer event replay on subscribe~~ — landed in the high-priority daemon tickets fix (see [`2026-05-09-001-fix-high-priority-daemon-tickets-plan.md`](2026-05-09-001-fix-high-priority-daemon-tickets-plan.md), U1+U2). Real consumers materialized: SwiftUI's `recording.start` → `events?since=cursor` flow and `Supervisor.stop()`'s `recording_finalized` await both depend on a bounded replay window. EventBus retains 256 stamped events and `subscribe(since=N)` replays everything after N or returns `cursor_unknown`.
 - Coalescing strategies for high-frequency events (e.g., `frame_written`) — Phase 1 uses bounded queue + drop-slow-consumer; coalesce-then-batch is a tunable for after first consumers exist.
 - Second PyInstaller spec / separate daemon binary — Phase 1 ships one binary; splitting comes only if the daemon needs entitlements the CLI doesn't.
 - launchd `Sockets`-activation migration — deferred until cold-start is shown to be a problem (it isn't, given `KeepAlive=true` + `RunAtLoad=true`).

@@ -151,27 +151,47 @@ def serve(
 
         if install:
             result = launchagent.install()
-            if result.state == "installed_and_running":
+            if result.state == launchagent.STATE_INSTALLED_AND_RUNNING:
                 console.print(f"[green]{result.state}[/green]: {result.plist_path}")
                 return
+            if result.state == launchagent.STATE_INSTALL_FAILED_ALREADY_RUNNING:
+                console.print(f"[red]{result.state}[/red]: {result.detail}")
+                # Surface the actionable remediation: if `result.detail`
+                # carried a `pid={N}` clause from launchagent.install(),
+                # the operator can `kill {pid}` directly. Otherwise
+                # `screencap serve --uninstall` is the safe fallback.
+                import re
+
+                match = re.search(r"\bpid=(\d+)\b", result.detail)
+                if match is not None:
+                    console.print(
+                        f"Try [bold]kill {match.group(1)}[/bold] to clear the rogue process, "
+                        "or [bold]screencap serve --uninstall[/bold] to remove the installed agent."
+                    )
+                else:
+                    console.print(
+                        "Try [bold]screencap serve --uninstall[/bold] to remove the "
+                        "installed agent, then re-run [bold]screencap serve --install[/bold]."
+                    )
+                raise SystemExit(1)
             console.print(f"[red]{result.state}[/red]: {result.detail}")
             raise SystemExit(1)
 
         if uninstall:
             result = launchagent.uninstall()
-            if result.state == "uninstalled":
+            if result.state == launchagent.STATE_UNINSTALLED:
                 console.print(f"[green]{result.state}[/green]: {result.plist_path}")
                 return
             console.print(f"[red]{result.state}[/red]: {result.detail}")
             raise SystemExit(1)
 
         result = launchagent.status()
-        if result.state == "loaded":
+        if result.state == launchagent.STATE_LOADED:
             state_detail = result.launchd_state or "unknown"
-            console.print(f"[green]loaded[/green]: {state_detail}")
+            console.print(f"[green]{launchagent.STATE_LOADED}[/green]: {state_detail}")
             return
-        if result.state == "not_loaded":
-            console.print("[yellow]not_loaded[/yellow]")
+        if result.state == launchagent.STATE_NOT_LOADED:
+            console.print(f"[yellow]{launchagent.STATE_NOT_LOADED}[/yellow]")
             return
         console.print(f"[red]{result.state}[/red]: {result.detail}")
         raise SystemExit(1)
