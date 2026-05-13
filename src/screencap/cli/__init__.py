@@ -2001,97 +2001,60 @@ def apps(as_json, include_spotlight):
                    "hot path (todo 018). nlp_models_cached field is reported "
                    "as null when skipped.")
 def status(as_json, no_nlp_check):
-    """Report recording state without IPC.
+    """Report recording state by querying the daemon.
 
-    Reads the flock-protected ``recording.lock`` content (Unit 3) and the
-    config flags. Designed for SwiftUI's 1Hz poll loop — light dependencies,
-    no SessionController spawn, no AppKit. Always exits 0.
+    Thin client of ``GET /v0/session.snapshot``. When the daemon isn't
+    reachable (no LaunchAgent installed and no auto-spawned daemon —
+    common on a fresh CLI-only install), report ``is_recording=false``
+    rather than surfacing a daemon error, because "no daemon" and "not
+    recording" are equivalent observed states for the user.
     """
     import json as _json
     import time as _time
     from typing import TypedDict
 
-    from screencap.pidfile import LOCK_FILE, lock_is_active, read_lock_metadata
+    from screencap.cli._autospawn import (
+        LaunchAgentNotRunningError,
+        ensure_daemon_or_spawn,
+    )
+    from screencap.cli._daemon_client import (
+        DaemonAPIError,
+        DaemonHTTPClient,
+        DaemonUnreachableError,
+        SchemaMismatchError,
+    )
 
     class StatusPayload(TypedDict):
-        """Schema for `screencap status --json` output.
-
-        Symmetric: every key is always present so SwiftUI's parser doesn't
-        need conditional unwraps. Unknown values are ``None`` / ``False``.
-        Uniform envelope (todo 020): `ok` + `schema_version` lead the payload.
-        """
         ok: bool
         schema_version: int
         is_recording: bool
         started_at: float | None
         elapsed: float | None
+        recording_name: str | None
         capture_dir: str | None
         claimant: str | None
-        warning: str | None
+        daemon_reachable: bool
         privacy_configured: bool
-        nlp_models_cached: bool | None  # None when --no-nlp-check is set
-
-    # Two distinct facts about the lock:
-    #   1. lock_is_active() — flock probe. True iff a process holds the lock.
-    #      In session mode this is the controller's lifetime, NOT a single
-    #      recording's lifetime.
-    #   2. recording_started_at in metadata — set by SessionController on
-    #      _on_start_click, cleared on _on_stop_click. The canonical
-    #      "is a recording capture in progress?" signal.
-    #
-    # SwiftUI's elapsed-time UI must read recording_started_at, not the
-    # controller-init started_at. Without this distinction, the previous
-    # design left status reporting is_recording=true and a stale elapsed
-    # time after the user clicked Stop in the menubar (the controller
-    # was still alive between recordings).
-    flock_held = lock_is_active()
-    metadata = read_lock_metadata()
-    recording_started_at = None
-    if metadata is not None:
-        rec_ts = metadata.get("recording_started_at")
-        if isinstance(rec_ts, (int, float)):
-            recording_started_at = float(rec_ts)
-    is_recording = flock_held and recording_started_at is not None
+        nlp_models_cached: bool | None
 
     payload: StatusPayload = {
         "ok": True,
-        # Independent from stderr-event schema version (todo 009) — status
-        # payload evolves separately.
         "schema_version": _STATUS_SCHEMA_VERSION,
-        "is_recording": is_recording,
+        "is_recording": False,
         "started_at": None,
         "elapsed": None,
+        "recording_name": None,
         "capture_dir": None,
         "claimant": None,
-        "warning": None,
+        "daemon_reachable": False,
         "privacy_configured": False,
         "nlp_models_cached": False,
     }
     if no_nlp_check:
-        # Caller opted out of the cache probe (todo 018). Report null so
-        # consumers can distinguish "skipped by request" from "checked,
-        # not cached" (False).
         payload["nlp_models_cached"] = None
 
-    if is_recording and metadata is not None:
-        # started_at + elapsed track THE recording, not the controller —
-        # so back-to-back recordings each report a fresh elapsed time.
-        payload["started_at"] = recording_started_at
-        payload["elapsed"] = max(0.0, _time.time() - recording_started_at)
-        if metadata.get("capture_dir"):
-            payload["capture_dir"] = metadata["capture_dir"]
-        if metadata.get("claimant"):
-            payload["claimant"] = metadata["claimant"]
-    elif not flock_held and LOCK_FILE.exists():
-        # Lock file exists but flock probe says no holder. Distinguish:
-        #   - file unparseable (corrupt JSON) → metadata is None
-        #   - file present + parseable + no holder → metadata is dict
-        if metadata is None:
-            payload["warning"] = "lock_unparseable"
-        else:
-            payload["warning"] = "lock_stale"
-
-    # Config readiness flags — cheap and useful for first-run UI.
+    # Config readiness flags — cheap and useful for first-run UI. These
+    # do not require the daemon.
     try:
         from screencap.config import _load_toml
         privacy_section = (_load_toml().get("privacy") or {})
@@ -2106,6 +2069,52 @@ def status(as_json, no_nlp_check):
         except Exception:
             pass
 
+    # ``auto_spawn=False``: status of a missing daemon is "not recording";
+    # spawning one just to confirm "no, nothing's happening" is wasteful.
+    try:
+        ensure_daemon_or_spawn(auto_spawn=False)
+    except LaunchAgentNotRunningError as exc:
+        # Surface the kickstart guidance to stderr even on the --json
+        # path so an operator running ``screencap status`` notices the
+        # mismatch between launchd's installed state and the daemon's
+        # live state.
+        click.echo(str(exc), err=True)
+
+    snapshot: dict | None = None
+    try:
+        with DaemonHTTPClient() as client:
+            snapshot = client.snapshot()
+            payload["daemon_reachable"] = True
+    except DaemonUnreachableError:
+        snapshot = None
+    except SchemaMismatchError as exc:
+        click.echo(
+            f"Error: {exc}. Update the daemon: launchctl kickstart -kp "
+            f"gui/$UID/com.screencap.daemon",
+            err=True,
+        )
+        snapshot = None
+    except DaemonAPIError as exc:
+        click.echo(f"Daemon error: {exc.envelope.get('error', 'unknown')}", err=True)
+        snapshot = None
+
+    if snapshot and snapshot.get("is_recording"):
+        started_at = snapshot.get("started_at")
+        if isinstance(started_at, (int, float)):
+            payload["is_recording"] = True
+            payload["started_at"] = float(started_at)
+            payload["elapsed"] = max(0.0, _time.time() - float(started_at))
+        payload["recording_name"] = snapshot.get("recording_name")
+        # Reconstruct capture_dir from recording_name for backwards
+        # compatibility with consumers that grep it. The daemon snapshot
+        # itself does not carry the path; ``~/.screencap/recordings/`` is
+        # the canonical root.
+        name = payload["recording_name"]
+        if isinstance(name, str) and name:
+            from pathlib import Path as _Path
+            payload["capture_dir"] = str(_Path.home() / ".screencap" / "recordings" / name)
+        payload["claimant"] = snapshot.get("claimant")
+
     if as_json:
         sys.stdout.write(_json.dumps(payload) + "\n")
         sys.stdout.flush()
@@ -2118,10 +2127,12 @@ def status(as_json, no_nlp_check):
             console.print(f"[#22d3ee]Recording[/#22d3ee] — {int(elapsed)}s elapsed")
         else:
             console.print("[#22d3ee]Recording[/#22d3ee] — (start time unknown)")
-        if payload.get("capture_dir"):
-            console.print(f"  Capture dir: {payload['capture_dir']}")
+        if payload.get("recording_name"):
+            console.print(f"  Recording: {payload['recording_name']}")
         if payload.get("claimant"):
             console.print(f"  Claimant: {payload['claimant']}")
+    elif not payload["daemon_reachable"]:
+        console.print("[dim]Not recording. (Daemon not running.)[/dim]")
     else:
         console.print("[dim]Not recording.[/dim]")
 
