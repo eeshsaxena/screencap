@@ -527,6 +527,7 @@ async def test_stop_returns_fast_when_finalized_published_during_subscribe_gap(
     # delay it until after we publish the finalized event.
     original_subscribe = bus.subscribe
     barrier = asyncio.Event()
+    subscribe_entered = asyncio.Event()
     captured_since: list[int | None] = []
 
     async def slow_subscribe(since: int | None = None):
@@ -535,6 +536,11 @@ async def test_stop_returns_fast_when_finalized_published_during_subscribe_gap(
         # non-None int (the pre-check cursor); first calls during spawn
         # are live (since=None) and must not block.
         if since is not None:
+            # Pin the moment stop() has entered subscribe() and is now
+            # suspended at the barrier; the test body waits on this
+            # event so the racing publish can never land before stop()'s
+            # late subscription has captured its cursor.
+            subscribe_entered.set()
             await barrier.wait()
         return await original_subscribe(since=since)
 
@@ -544,9 +550,10 @@ async def test_stop_returns_fast_when_finalized_published_during_subscribe_gap(
     # subscribe call.
     stop_task = asyncio.create_task(supervisor.stop(force=False))
 
-    # Give stop() time to reach the late subscribe (operation_lock,
-    # metadata read, is_alive check, then subscribe).
-    await asyncio.sleep(0.05)
+    # Wait deterministically until stop() has entered the late subscribe
+    # and is suspended at the barrier. Replaces a fragile asyncio.sleep
+    # that would otherwise depend on scheduler timing.
+    await asyncio.wait_for(subscribe_entered.wait(), timeout=2.0)
 
     # Publish the racing event. With U1's replay buffer this lands in
     # the ring at the next cursor; the late subscribe(since=...) will
@@ -672,3 +679,54 @@ async def test_engine_stderr_burst_survives_paused_pump(
     assert stopped == {"stopped": True, "final_state": "stopped"}
     await _wait_until(lambda: not isolated_lock.lock_is_active())
     await supervisor.shutdown()
+
+
+@pytest.mark.asyncio
+async def test_shutdown_cancels_exit_poll_before_subscribe_no_double_release(
+    tmp_path: Path,
+    fake_engine_script: Path,
+    isolated_lock,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """F4 regression: shutdown() must cancel `_exit_poll` before the
+    late `subscribe(since=)` so a concurrent poll iteration cannot run
+    `_handle_engine_exit` (which calls `_release_daemon_lock`) at the
+    same time shutdown()'s teardown does. The exit_lock serializes the
+    two callers, but the second arrival should observe `exit_handled`
+    and bail — and the lock release should happen exactly once."""
+    from screencap import pidfile
+    from screencap.daemon.supervisor import Supervisor
+
+    bus = EventBus()
+    supervisor = Supervisor(
+        bus,
+        engine_command_factory=_factory(fake_engine_script),
+        reconcile_on_init=False,
+        poll_interval=0.01,
+        startup_timeout=2.0,
+        stop_timeout=2.0,
+    )
+
+    await supervisor.spawn(
+        schema.RecordingStartRequest(name="cancel", output_dir=str(tmp_path / "cancel"))
+    )
+
+    release_calls = 0
+    original_release = pidfile.release_lock
+
+    def counting_release() -> None:
+        nonlocal release_calls
+        release_calls += 1
+        return original_release()
+
+    monkeypatch.setattr(pidfile, "release_lock", counting_release)
+
+    await supervisor.shutdown()
+
+    # release_lock may run twice in the legitimate teardown (Supervisor's
+    # `_release_daemon_lock` is called by `_handle_engine_exit` AND from
+    # the `shutdown()` outer block after `_reset_state`). What we're
+    # asserting is that the lock is *not* re-released by a phantom
+    # `_exit_poll` iteration racing with shutdown's late subscribe.
+    # Without F4's cancellation a third call appears.
+    assert release_calls <= 2, f"release_lock called {release_calls} times; expected <= 2"

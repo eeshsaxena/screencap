@@ -7,7 +7,7 @@ import asyncio
 import pytest
 
 from screencap.daemon.event_bus import (
-    CursorUnknownError,
+    CursorOutOfRangeError,
     EventBus,
     QUEUE_MAXSIZE,
     REPLAY_BUFFER_SIZE,
@@ -168,11 +168,34 @@ async def test_subscribe_since_future_cursor_raises_cursor_unknown() -> None:
     bus = EventBus()
     await bus.publish({"type": "only", "ts": 1.0, "schema_version": 1})
 
-    with pytest.raises(CursorUnknownError) as exc_info:
+    with pytest.raises(CursorOutOfRangeError) as exc_info:
         await bus.subscribe(since=99)
 
     assert exc_info.value.cursor == 99
     assert exc_info.value.current == 1
+
+
+@pytest.mark.asyncio
+async def test_subscribe_since_at_oldest_minus_one_boundary_replays_full_window() -> None:
+    """``since == oldest_retained - 1`` is the inclusive lower bound — the
+    new subscriber receives every retained event. ``since == oldest - 2``
+    is past the boundary and raises ``CursorOutOfRangeError``."""
+    bus = EventBus()
+    overflow = REPLAY_BUFFER_SIZE + 10
+    for index in range(1, overflow + 1):
+        await bus.publish({"type": f"e{index}", "ts": float(index), "schema_version": 1})
+
+    oldest = bus.oldest_retained_cursor()
+    assert oldest is not None
+
+    sub = await bus.subscribe(since=oldest - 1)
+    assert sub.cursor_at_subscribe == oldest - 1
+    first = await _next_event(sub)
+    assert first["cursor"] == oldest
+
+    with pytest.raises(CursorOutOfRangeError) as exc_info:
+        await bus.subscribe(since=oldest - 2)
+    assert exc_info.value.cursor == oldest - 2
 
 
 @pytest.mark.asyncio
@@ -182,7 +205,7 @@ async def test_subscribe_since_evicted_cursor_raises_cursor_unknown() -> None:
     for index in range(1, overflow + 1):
         await bus.publish({"type": f"e{index}", "ts": float(index), "schema_version": 1})
 
-    with pytest.raises(CursorUnknownError) as exc_info:
+    with pytest.raises(CursorOutOfRangeError) as exc_info:
         await bus.subscribe(since=10)
 
     assert exc_info.value.cursor == 10

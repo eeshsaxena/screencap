@@ -17,7 +17,7 @@ from starlette.routing import Route
 
 from screencap import _stderr_events
 from screencap.daemon import errors, schema
-from screencap.daemon.event_bus import EventBus
+from screencap.daemon.event_bus import CursorOutOfRangeError, EventBus
 from screencap.daemon.supervisor import CLAIMANT_DAEMON
 
 logger = logging.getLogger(__name__)
@@ -265,8 +265,6 @@ def _ndjson(payload: dict) -> bytes:
 
 
 async def events_stream(request: Request) -> JSONResponse | StreamingResponse:
-    from screencap.daemon import event_bus as _event_bus
-
     bus = request.app.state.event_bus
     since_param = request.query_params.get("since")
     since: int | None = None
@@ -286,6 +284,8 @@ async def events_stream(request: Request) -> JSONResponse | StreamingResponse:
             # Negative cursors are syntactically valid integers but cannot
             # have been produced by the bus's monotonic stamp — reject as
             # invalid rather than silently coercing to "live from now".
+            # Echo the raw query-string form so both invalid_cursor
+            # envelopes carry `requested_cursor` as a string.
             return JSONResponse(
                 errors.error_envelope(
                     schema_version=schema._EVENTS_API_VERSION,
@@ -297,16 +297,19 @@ async def events_stream(request: Request) -> JSONResponse | StreamingResponse:
 
     try:
         sub = await bus.subscribe(since=since)
-    except _event_bus.CursorUnknownError as exc:
+    except CursorOutOfRangeError as exc:
         # Two cases collapse to the same wire shape: the requested cursor is
         # either ahead of the bus (never produced) or older than the retained
         # replay window (aged out). 410 Gone signals "the cursor cannot be
-        # served; retrying without remediation will not help" — clients
-        # should refetch a fresh snapshot and resubscribe.
+        # served; retrying without remediation will not help"; daemon_cursor
+        # and oldest_retained_cursor let clients resubscribe with a valid
+        # in-window cursor without a separate snapshot round-trip.
         return JSONResponse(
             errors.cursor_unknown_envelope(
                 requested_cursor=exc.cursor,
                 schema_version=schema._EVENTS_API_VERSION,
+                daemon_cursor=exc.current,
+                oldest_retained_cursor=exc.oldest_retained,
             ),
             status_code=errors.CursorUnknownError.http_status,
         )

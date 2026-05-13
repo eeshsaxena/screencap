@@ -95,8 +95,12 @@ def _capture_socket_pid(path: Path) -> int | None:
 
     for line in (result.stdout or "").splitlines():
         candidate = line.strip()
-        if candidate.isdigit():
-            return int(candidate)
+        try:
+            value = int(candidate)
+        except ValueError:
+            continue
+        if value > 0:
+            return value
     return None
 
 

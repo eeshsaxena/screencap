@@ -365,6 +365,16 @@ def test_parse_last_exit_code_extracts_signed_int():
     assert _parse_last_exit_code("") is None
 
 
+def test_parse_last_exit_code_strips_symbolic_suffix():
+    """launchctl on some macOS versions appends ``: EX_TEMPFAIL`` (or
+    other symbolic suffixes) to the exit code line. The parser must
+    return the leading integer in both forms."""
+    from screencap.daemon.launchagent import _parse_last_exit_code
+
+    assert _parse_last_exit_code("\tlast exit code = 75: EX_TEMPFAIL\n") == 75
+    assert _parse_last_exit_code("last exit code = 0: ok") == 0
+
+
 def test_install_write_failure_is_classified(monkeypatch: pytest.MonkeyPatch, tmp_path: Path):
     from screencap.daemon import launchagent
 

@@ -7,14 +7,26 @@ from collections import deque
 from dataclasses import dataclass, field
 from typing import Any
 
+# Per-subscriber bounded queue. A fast publisher pinning a slow consumer
+# will fill this cap and close the subscriber with `slow_consumer` — chosen
+# wide enough to absorb a full replay flush plus an expected live burst
+# without tripping the slow-consumer signal on a healthy stream.
 QUEUE_MAXSIZE = 1024
+# Replay ring depth. Must stay strictly smaller than `QUEUE_MAXSIZE` so a
+# fresh subscriber doing a worst-case full-window replay (`since=oldest-1`)
+# still leaves headroom in its queue for concurrent live events without
+# tripping `slow_consumer` before it has drained a single frame.
 REPLAY_BUFFER_SIZE = 256
+
+assert REPLAY_BUFFER_SIZE < QUEUE_MAXSIZE, (
+    "replay must leave queue headroom for live events"
+)
 
 SLOW_CONSUMER = "slow_consumer"
 SHUTDOWN = "shutdown"
 
 
-class CursorUnknownError(Exception):
+class CursorOutOfRangeError(Exception):
     """Raised when ``subscribe(since=…)`` cannot honor the requested cursor.
 
     A cursor is unknown when it is either ahead of the bus (the caller has a
@@ -56,7 +68,7 @@ class EventBus:
     pick up anything published in the await gap between cursor capture and
     subscription. The ring is bounded by event count, not time — subscribers
     request a cursor and receive whatever is still retained or
-    :class:`CursorUnknownError` otherwise.
+    :class:`CursorOutOfRangeError` otherwise.
     """
 
     def __init__(self) -> None:
@@ -84,22 +96,26 @@ class EventBus:
         first receives every retained event whose cursor is greater than
         ``since`` (in ascending order) before the live stream begins.
 
-        Raises :class:`CursorUnknownError` when ``since`` is ahead of the
-        bus's current cursor or behind the oldest retained event in the ring.
-        ``since=0`` is always valid: it means "from before any event" and
-        replays whatever is currently in the ring.
+        Accepts ``since == oldest_retained_cursor - 1`` as the inclusive
+        lower bound (replay starts at the oldest retained event); anything
+        further back is :class:`CursorOutOfRangeError`. Raises
+        :class:`CursorOutOfRangeError` when ``since`` is ahead of the bus's
+        current cursor or further behind than that lower bound.
+        ``since=0`` is valid only while the bus has not yet evicted past
+        ``cursor=1`` from the ring; once eviction begins, the lower bound
+        moves forward with the ring.
         """
         async with self._lock:
             if since is not None:
                 if since > self._cursor:
-                    raise CursorUnknownError(
+                    raise CursorOutOfRangeError(
                         cursor=since,
                         current=self._cursor,
                         oldest_retained=self.oldest_retained_cursor(),
                     )
                 oldest = self.oldest_retained_cursor()
                 if oldest is not None and since < oldest - 1:
-                    raise CursorUnknownError(
+                    raise CursorOutOfRangeError(
                         cursor=since,
                         current=self._cursor,
                         oldest_retained=oldest,
@@ -161,7 +177,7 @@ class EventBus:
 
 __all__ = [
     "EventBus",
-    "CursorUnknownError",
+    "CursorOutOfRangeError",
     "QUEUE_MAXSIZE",
     "REPLAY_BUFFER_SIZE",
     "SLOW_CONSUMER",

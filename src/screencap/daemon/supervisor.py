@@ -4,6 +4,7 @@ from __future__ import annotations
 
 import asyncio
 import base64
+import contextlib
 import errno
 import fcntl
 import json
@@ -21,7 +22,7 @@ import psutil
 
 from screencap import _stderr_events
 from screencap.daemon import errors, schema
-from screencap.daemon.event_bus import EventBus, _Subscription
+from screencap.daemon.event_bus import CursorOutOfRangeError, EventBus, _Subscription
 
 if TYPE_CHECKING:
     from screencap.daemon.schema import RecordingStartRequest
@@ -48,13 +49,13 @@ _STDERR_PIPE_SIZE = 1 << 20  # 1 MiB
 _STDERR_PIPE_FALLBACK = 1 << 17  # 128 KiB
 
 
-def _widen_stderr_pipe(proc: subprocess.Popen[Any] | Any) -> int | None:
+def _widen_stderr_pipe(proc: subprocess.Popen[Any]) -> int | None:
     """Resize the kernel stderr pipe for ``proc`` to ``_STDERR_PIPE_SIZE``.
 
     Returns the size that was applied, or ``None`` when widening was not
     available (no ``F_SETPIPE_SZ`` on this platform) or failed in any other
     way. Never raises — pipe sizing is a diagnostic safety net, not a
-    correctness invariant.
+    correctness invariant. No-op on macOS (``F_SETPIPE_SZ`` absent).
     """
     set_pipe_sz = getattr(fcntl, "F_SETPIPE_SZ", None)
     if set_pipe_sz is None:
@@ -88,7 +89,9 @@ def _widen_stderr_pipe(proc: subprocess.Popen[Any] | Any) -> int | None:
 
 
 class _PopenEngineProcess:
-    """Small subprocess wrapper exposing the ``is_alive`` API U5 requires."""
+    """Subprocess wrapper exposing a uniform ``is_alive``/``terminate``/``kill``/``stderr``
+    interface so ``Supervisor`` is testable against a protocol rather than directly
+    against ``subprocess.Popen``."""
 
     def __init__(self, argv: list[str]) -> None:
         self._popen = subprocess.Popen(
@@ -99,6 +102,9 @@ class _PopenEngineProcess:
             bufsize=0,
             env={**os.environ, "PYTHONUNBUFFERED": "1"},
         )
+        # Widen the kernel stderr pipe as close to the Popen as possible so
+        # the engine never gets a chance to write into a default-sized pipe.
+        _widen_stderr_pipe(self._popen)
 
     @property
     def pid(self) -> int:
@@ -272,7 +278,6 @@ class Supervisor:
             try:
                 command = self._engine_command_factory(encoded_args)
                 proc = _PopenEngineProcess(command)
-                _widen_stderr_pipe(proc)
                 self._proc = proc
                 self._engine_pid = proc.pid
                 self._finalized_seen = False
@@ -366,6 +371,13 @@ class Supervisor:
             # stop_timeout while the event sits unobserved on the bus.
             pre_check_cursor = self._bus.current_cursor()
 
+            # Cancel _exit_poll before the late subscribe so a concurrent
+            # iteration cannot publish `recording_finalized` *and* run
+            # _handle_engine_exit between the cursor capture and the
+            # subscription — which would double-release the lock and
+            # double-publish the finalized event from stop()'s own teardown.
+            await self._cancel_exit_poll()
+
             if self._proc is None or not self._proc.is_alive():
                 engine_pid = metadata.get("engine_pid")
                 if isinstance(engine_pid, int):
@@ -378,7 +390,9 @@ class Supervisor:
                 self._release_daemon_lock()
                 return {"stopped": False, "final_state": "no_engine"}
 
-            final_sub = await self._bus.subscribe(since=pre_check_cursor)
+            final_sub = await self._subscribe_with_replay_fallback(
+                pre_check_cursor, label="stop"
+            )
             proc = self._proc
             self._stopping = True
             try:
@@ -420,11 +434,17 @@ class Supervisor:
             # `recording_finalized` the engine's SIGTERM handler publishes
             # in the await gap.
             pre_terminate_cursor = self._bus.current_cursor()
+            # Cancel _exit_poll before the late subscribe so a concurrent
+            # iteration cannot run _handle_engine_exit between the cursor
+            # capture and the subscription (same race as Supervisor.stop()).
+            await self._cancel_exit_poll()
             try:
                 proc.terminate()
             except ProcessLookupError:
                 pass
-            final_sub = await self._bus.subscribe(since=pre_terminate_cursor)
+            final_sub = await self._subscribe_with_replay_fallback(
+                pre_terminate_cursor, label="shutdown"
+            )
             try:
                 try:
                     await self._wait_on_subscription(
@@ -793,6 +813,47 @@ class Supervisor:
         except OSError:
             pass
 
+    async def _subscribe_with_replay_fallback(
+        self, cursor: int, *, label: str
+    ) -> _Subscription:
+        """``subscribe(since=cursor)`` with a live-only fallback on eviction.
+
+        Shared by ``stop()`` and ``shutdown()``. Replay coverage of the
+        await gap is the desired path; if a burst of unrelated events
+        evicted ``cursor`` from the ring between capture and this call,
+        log the loss with ``label`` and fall back to a live-only
+        subscription. Worst case the caller's ``_wait_on_subscription``
+        hits its timeout and the force-stop path runs.
+        """
+        try:
+            return await self._bus.subscribe(since=cursor)
+        except CursorOutOfRangeError:
+            logger.warning(
+                "%s(): replay cursor=%d aged out before subscribe; "
+                "falling back to live-only delivery",
+                label,
+                cursor,
+            )
+            return await self._bus.subscribe()
+
+    async def _cancel_exit_poll(self) -> None:
+        """Cancel the engine exit poll task before a late subscribe.
+
+        Same shape as the cancellation block in ``spawn()``'s except arm:
+        check not None and not done, cancel, then await with
+        ``CancelledError`` suppressed so the helper never raises into the
+        caller. No-op if the task is absent or already finished. The
+        attribute is cleared on success so subsequent teardown paths
+        (``_reset_state``) do not re-cancel.
+        """
+        task = self._poll_task
+        if task is None or task.done():
+            return
+        task.cancel()
+        with contextlib.suppress(asyncio.CancelledError):
+            await task
+        self._poll_task = None
+
     def _reset_state(self) -> None:
         self._proc = None
         self._engine_pid = None
@@ -801,6 +862,7 @@ class Supervisor:
         self._poll_task = None
         self._finalized_seen = False
         self._stopping = False
+        self._exit_handled = False
 
 
 __all__ = ["Supervisor"]

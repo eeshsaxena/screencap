@@ -64,16 +64,18 @@ a `collections.deque`. `subscribe(since: int | None = None)` extends the
 prior live-only API:
 
 - `since=None` → live-only (prior behavior).
-- `since` strictly between the oldest retained cursor minus 1 and
-  `current_cursor` → enqueue every retained event with `cursor > since`
+- `since` between `oldest_retained_cursor - 1` (inclusive, treated as
+  "from before the oldest retained event") and `current_cursor`
+  (inclusive) → enqueue every retained event with `cursor > since`
   onto the new subscriber's queue before live delivery begins. The
   enqueue happens under the same `_lock` as `publish`, so a concurrent
   publish either lands in the ring before subscribe sees it (and gets
   replayed) or lands after subscribe registers (and gets delivered
   live) — never lost.
 - `since > current_cursor` or `since < oldest_retained - 1` →
-  `CursorUnknownError`, mapped at the HTTP boundary to the existing
-  `cursor_unknown` 410 envelope.
+  `CursorOutOfRangeError` (HTTP 410). `since=0` is valid only while
+  the bus has not evicted past `cursor=1`; once eviction begins, the
+  lower bound moves forward with the ring.
 
 `Supervisor.stop()` and `Supervisor.shutdown()` now capture
 `pre_check_cursor = self._bus.current_cursor()` *before* their gate

@@ -214,12 +214,11 @@ async def test_events_since_negative_returns_400_invalid_cursor() -> None:
     `invalid_cursor`, not 410. Preserved from prior behavior."""
     app = await _build_app()
     response, _body = await _open_stream(app, "/v0/events?since=-1")
-    assert response.status_code in {400, 410}
+    assert response.status_code == 400
     payload = json.loads(response.body)
-    # Either invalid_cursor (preferred — semantically a malformed cursor)
-    # or cursor_unknown (acceptable — also a never-published cursor).
-    # The wire surface stays the same: it is not silently treated as 0.
     assert payload["ok"] is False
+    assert payload["error"] == errors.ERROR_CODE_INVALID_CURSOR
+    assert payload["requested_cursor"] == "-1"
 
 
 @pytest.mark.asyncio

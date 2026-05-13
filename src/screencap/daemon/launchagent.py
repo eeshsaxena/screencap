@@ -16,14 +16,30 @@ from dataclasses import dataclass
 from pathlib import Path
 from typing import Any, Iterable
 
+from screencap.daemon.server import EX_TEMPFAIL
+
 DAEMON_LABEL = "com.screencap.daemon"
 DEFAULT_BINARY_NAME = "screencap"
 DEFAULT_PATH = "/usr/bin:/bin:/usr/sbin:/sbin:/usr/local/bin:/opt/homebrew/bin"
 
-# sysexits.h "temporary failure" — daemon raises this when the socket is
-# already held by a same-EUID rogue process. The install verifier reads it
-# back from `launchctl print` to classify failures.
-_EX_TEMPFAIL = 75
+# InstallResult / UninstallResult / StatusResult state literals. Kept as
+# bare strings (not StrEnum) so JSON serialization and tests that compare
+# against the wire form continue to work; the constants only deduplicate
+# the inline literals so a typo in one site cannot drift from another.
+STATE_INSTALLED_AND_RUNNING = "installed_and_running"
+STATE_INSTALL_FAILED_ALREADY_RUNNING = "install_failed_already_running"
+STATE_INSTALL_FAILED_DAEMON_DID_NOT_START = "install_failed_daemon_did_not_start"
+STATE_INSTALL_FAILED_DAEMON_SIGNING_INVALID = "install_failed_daemon_signing_invalid"
+STATE_INSTALL_FAILED_LAUNCHCTL_BOOTSTRAP_FAILED = "install_failed_launchctl_bootstrap_failed"
+STATE_INSTALL_FAILED_PLIST_WRITE_FAILED = "install_failed_plist_write_failed"
+STATE_INSTALL_FAILED_DISK_FULL = "install_failed_disk_full"
+STATE_PERMISSION_REQUIRED = "permission_required"
+STATE_UNINSTALLED = "uninstalled"
+STATE_UNINSTALL_FAILED_LAUNCHCTL_BOOTOUT_FAILED = "uninstall_failed_launchctl_bootout_failed"
+STATE_UNINSTALL_FAILED_PLIST_REMOVE_FAILED = "uninstall_failed_plist_remove_failed"
+STATE_LOADED = "loaded"
+STATE_NOT_LOADED = "not_loaded"
+STATE_STATUS_FAILED = "status_failed"
 
 logger = logging.getLogger(__name__)
 
@@ -142,7 +158,7 @@ def install(
         log_dir.mkdir(parents=True, exist_ok=True)
     except OSError as exc:
         return InstallResult(
-            state="install_failed_plist_write_failed",
+            state=STATE_INSTALL_FAILED_PLIST_WRITE_FAILED,
             plist_path=resolved_plist_path,
             detail=f"could not create log dir {log_dir}: {exc}",
         )
@@ -153,9 +169,13 @@ def install(
     try:
         write_plist_atomic(resolved_plist_path, content)
     except OSError as exc:
-        reason = "disk_full" if exc.errno == errno.ENOSPC else "plist_write_failed"
+        state = (
+            STATE_INSTALL_FAILED_DISK_FULL
+            if exc.errno == errno.ENOSPC
+            else STATE_INSTALL_FAILED_PLIST_WRITE_FAILED
+        )
         return InstallResult(
-            state=f"install_failed_{reason}",
+            state=state,
             plist_path=resolved_plist_path,
             detail=str(exc),
         )
@@ -175,18 +195,18 @@ def install(
         _unlink_best_effort(resolved_plist_path)
         if _looks_like_signing_error(lower):
             return InstallResult(
-                state="install_failed_daemon_signing_invalid",
+                state=STATE_INSTALL_FAILED_DAEMON_SIGNING_INVALID,
                 plist_path=resolved_plist_path,
                 detail=bootstrap_stderr,
             )
         if "operation not permitted" in lower:
             return InstallResult(
-                state="permission_required",
+                state=STATE_PERMISSION_REQUIRED,
                 plist_path=resolved_plist_path,
                 detail=bootstrap_stderr,
             )
         return InstallResult(
-            state="install_failed_launchctl_bootstrap_failed",
+            state=STATE_INSTALL_FAILED_LAUNCHCTL_BOOTSTRAP_FAILED,
             plist_path=resolved_plist_path,
             detail=bootstrap_stderr or f"launchctl exited {bootstrap.returncode}",
         )
@@ -202,14 +222,14 @@ def install(
         )
         if kickstart.returncode != 0:
             return InstallResult(
-                state="install_failed_launchctl_bootstrap_failed",
+                state=STATE_INSTALL_FAILED_LAUNCHCTL_BOOTSTRAP_FAILED,
                 plist_path=resolved_plist_path,
                 detail=kickstart.stderr or f"launchctl kickstart exited {kickstart.returncode}",
             )
 
     if _wait_for_daemon(timeout_seconds=timeout_seconds):
         return InstallResult(
-            state="installed_and_running",
+            state=STATE_INSTALLED_AND_RUNNING,
             plist_path=resolved_plist_path,
             detail="daemon.info responded",
         )
@@ -220,18 +240,25 @@ def install(
     # operator-visible CLI install verifier so they see "another daemon is
     # already bound to the socket" instead of a vague timeout.
     last_exit = _last_launchd_exit_code()
-    if last_exit == _EX_TEMPFAIL:
+    if last_exit == EX_TEMPFAIL:
+        # Best-effort probe (same 1s timeout shape as the daemon's startup
+        # probe in socket.py) so the operator sees the rogue PID inline
+        # instead of having to chase it themselves.
+        from screencap.daemon.socket import _capture_socket_pid, default_socket_path
+
+        existing_pid = _capture_socket_pid(default_socket_path())
+        pid_clause = f" pid={existing_pid}" if existing_pid is not None else ""
         return InstallResult(
-            state="install_failed_already_running",
+            state=STATE_INSTALL_FAILED_ALREADY_RUNNING,
             plist_path=resolved_plist_path,
             detail=(
-                "launchctl reported last exit code = 75 (EX_TEMPFAIL); "
-                "another daemon is already bound to the socket"
+                f"launchctl reported last exit code = {EX_TEMPFAIL} (EX_TEMPFAIL); "
+                f"another daemon is already bound to the socket{pid_clause}"
             ),
         )
 
     return InstallResult(
-        state="install_failed_daemon_did_not_start",
+        state=STATE_INSTALL_FAILED_DAEMON_DID_NOT_START,
         plist_path=resolved_plist_path,
         detail=f"daemon.info did not respond within {timeout_seconds:g}s",
     )
@@ -261,7 +288,7 @@ def uninstall(*, plist_path: Path | None = None) -> UninstallResult:
 
     if bootout_failed:
         return UninstallResult(
-            state="uninstall_failed_launchctl_bootout_failed",
+            state=STATE_UNINSTALL_FAILED_LAUNCHCTL_BOOTOUT_FAILED,
             plist_path=resolved_plist_path,
             detail=stderr or f"launchctl exited {bootout.returncode}",
         )
@@ -270,13 +297,13 @@ def uninstall(*, plist_path: Path | None = None) -> UninstallResult:
         resolved_plist_path.unlink(missing_ok=True)
     except OSError as exc:
         return UninstallResult(
-            state="uninstall_failed_plist_remove_failed",
+            state=STATE_UNINSTALL_FAILED_PLIST_REMOVE_FAILED,
             plist_path=resolved_plist_path,
             detail=str(exc),
         )
 
     return UninstallResult(
-        state="uninstalled",
+        state=STATE_UNINSTALLED,
         plist_path=resolved_plist_path,
         detail="LaunchAgent removed",
     )
@@ -292,16 +319,16 @@ def status() -> StatusResult:
     stderr = printed.stderr or ""
     if printed.returncode != 0:
         if _is_not_loaded(stderr):
-            return StatusResult(state="not_loaded", launchd_state=None, detail=stderr)
+            return StatusResult(state=STATE_NOT_LOADED, launchd_state=None, detail=stderr)
         return StatusResult(
-            state="status_failed",
+            state=STATE_STATUS_FAILED,
             launchd_state=None,
             detail=stderr or f"launchctl exited {printed.returncode}",
         )
 
     launchd_state = _parse_launchd_state(printed.stdout or "")
     return StatusResult(
-        state="loaded",
+        state=STATE_LOADED,
         launchd_state=launchd_state,
         detail=printed.stdout or "",
     )
@@ -380,13 +407,18 @@ def _parse_launchd_state(output: str) -> str | None:
 def _parse_last_exit_code(output: str) -> int | None:
     """Extract the integer value of the ``last exit code = N`` line in
     ``launchctl print`` output. Returns None when the field is absent or
-    not parseable as a signed int."""
+    not parseable as a signed int.
+
+    launchctl on some macOS versions appends a symbolic suffix to the
+    exit code (e.g. ``75: EX_TEMPFAIL``); split on ``:`` and parse the
+    leading integer so both forms are honored.
+    """
     for line in output.splitlines():
         stripped = line.strip()
         if not stripped.startswith("last exit code"):
             continue
         _, _, value = stripped.partition("=")
-        candidate = value.strip()
+        candidate = value.strip().split(":")[0].strip()
         try:
             return int(candidate)
         except ValueError:
