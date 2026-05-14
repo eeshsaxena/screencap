@@ -135,12 +135,25 @@ def _download_nlp_models() -> None:
 @click.option("--install", is_flag=True, help="Install LaunchAgent and start daemon.")
 @click.option("--uninstall", is_flag=True, help="Stop daemon and remove LaunchAgent.")
 @click.option("--status", "show_status", is_flag=True, help="Print daemon LaunchAgent status.")
+@click.option(
+    "--idle-shutdown",
+    "idle_shutdown",
+    type=int,
+    default=None,
+    hidden=True,
+    help=(
+        "Exit after N idle seconds (no requests / subscribers / active "
+        "recording). CLI auto-spawn uses this; LaunchAgent-managed "
+        "daemons omit it and run all day."
+    ),
+)
 def serve(
     socket_path: str | None,
     self_test: bool,
     install: bool,
     uninstall: bool,
     show_status: bool,
+    idle_shutdown: int | None,
 ) -> None:
     """Run the ScreenCap daemon, or manage its LaunchAgent."""
     if sum(bool(flag) for flag in (install, uninstall, show_status)) > 1:
@@ -198,7 +211,13 @@ def serve(
 
     from screencap.daemon.server import serve as _serve
 
-    raise SystemExit(_serve(socket_path=socket_path, self_test=self_test))
+    raise SystemExit(
+        _serve(
+            socket_path=socket_path,
+            self_test=self_test,
+            idle_shutdown_seconds=idle_shutdown,
+        )
+    )
 
 
 @cli.command("_engine-worker", hidden=True)
@@ -217,7 +236,7 @@ def _engine_worker_cmd(encoded_args: str) -> None:
         EVENT_STARTED,
         emit_event,
     )
-    from screencap.daemon.supervisor import CLAIMANT_DAEMON
+    from screencap.pidfile import CLAIMANT_DAEMON
     from screencap.session import run_recording_worker
 
     queues = [
@@ -654,18 +673,13 @@ def start(
 
     from screencap.config import (
         get_audio_default,
-        get_auto_name,
-        get_auto_name_local_only,
         get_segmentation_mode,
     )
 
     # Resolve segmentation mode: CLI flag > config.toml > default
     seg_mode = segmentation_mode or get_segmentation_mode()
 
-    # Determine if auto-naming is enabled
     user_provided_name = name is not None
-    auto_name_enabled = get_auto_name() and not no_auto_name and not user_provided_name
-    local_only = local_only or get_auto_name_local_only()
 
     if not name:
         if no_auto_name:
@@ -813,288 +827,272 @@ def start(
     else:
         show_on_website = True  # irrelevant for local-only recordings
 
-    # --- Hand off to the Session Controller ---
-    # ``screencap start`` is a long-lived session: the controller spawns
-    # the menu bar once, runs each recording in its own Recording Worker
-    # subprocess, and detaches post-processing into a separate
-    # Post-Process Worker subprocess so a second recording can start
-    # while the previous one is still transcribing / uploading.
-    #
-    # Setting ``SCREENCAP_LEGACY_START=1`` falls back to the classic
-    # one-shot code path. This is used by the test suite (which mocks
-    # ``screencap.recorder.start_recording`` at module level — the mock
-    # does not cross the subprocess boundary of the session controller)
-    # and as an escape hatch if the controller regresses in production.
-    import os as _os_start
+    # --- Hand off to the daemon ---
+    # Phase 2 U1 makes the daemon the sole engine spawner. ``screencap
+    # start`` is now a thin HTTP client: ensure the daemon is up
+    # (auto-spawn for F3 if no LaunchAgent), POST recording.start,
+    # stream events back to stderr (preserving the cross-language
+    # event contract SwiftUI / agents pattern-match against), and map
+    # the terminal event to a process exit code per existing taxonomy.
+    _exit_code = _run_start_via_daemon(
+        name=name,
+        description=description,
+        audio=audio,
+        output=output,
+        wifi_metrics=wifi_metrics,
+        app_versions=app_versions,
+        force_clean=force,
+        capture_video=capture_video,
+        capture_images=capture_images,
+        capture_window_data=capture_window_data,
+        verbose=verbose,
+        chunk_duration=chunk_duration,
+        live_upload=not no_live_upload,
+        force_mode=force_mode,
+        cloud_intent=is_cloud,
+        keep_local=keep_local,
+        intent_source=intent_source,
+        segmentation_mode=seg_mode,
+        scrub_enabled=scrub_enabled,
+        show_on_website=show_on_website,
+        network=network,
+    )
+    _emit_event(EVENT_STOPPED, exit_code=_exit_code)
+    if _exit_code:
+        raise SystemExit(_exit_code)
 
-    if _os_start.environ.get("SCREENCAP_LEGACY_START") == "1":
-        _legacy_start_recording(
-            name=name,
-            description=description,
-            audio=audio,
-            output=output,
-            wifi_metrics=wifi_metrics,
-            app_versions=app_versions,
-            force=force,
-            capture_video=capture_video,
-            capture_images=capture_images,
-            capture_window_data=capture_window_data,
-            verbose=verbose,
-            chunk_duration=chunk_duration,
-            no_live_upload=no_live_upload,
-            force_mode=force_mode,
-            is_cloud=is_cloud,
-            keep_local=keep_local,
-            intent_source=intent_source,
-            seg_mode=seg_mode,
-            scrub_enabled=scrub_enabled,
-            show_on_website=show_on_website,
-            auto_name_enabled=auto_name_enabled,
-            local_only=local_only,
-        )
-        return
 
+def _run_start_via_daemon(
+    *,
+    name: str | None,
+    description: str | None,
+    audio: bool | None,
+    output: str | None,
+    wifi_metrics: bool | None,
+    app_versions: bool | None,
+    force_clean: bool,
+    capture_video: bool | None,
+    capture_images: bool | None,
+    capture_window_data: bool | None,
+    verbose: bool,
+    chunk_duration: float | None,
+    live_upload: bool,
+    force_mode: str | None,
+    cloud_intent: bool,
+    keep_local: bool,
+    intent_source: str,
+    segmentation_mode: str | None,
+    scrub_enabled: bool,
+    show_on_website: bool,
+    network: bool,
+) -> int:
+    """POST recording.start, stream events, map terminal event to exit code.
+
+    Returns the exit code per Phase 1's taxonomy:
+      0=clean, 1=generic failure, 2=lock-held, 3=permission_lost,
+      4=disk_full, 5=user-initiated force-quit (2-tap Ctrl+C).
+    """
+    import json as _json
+    import signal as _signal
+    import sys as _sys
+
+    from screencap.cli._autospawn import (
+        DaemonAutoSpawnError,
+        LaunchAgentNotRunningError,
+        ensure_daemon_or_spawn,
+    )
+    from screencap.cli._daemon_client import (
+        DaemonAPIError,
+        DaemonHTTPClient,
+        DaemonUnreachableError,
+        SchemaMismatchError,
+    )
+
+    # ``screencap start`` is the primary auto-spawn trigger (origin F3).
     try:
-        from screencap.session import SessionController
-    except ImportError:
-        console.print(_RECORD_EXTRAS_MSG)
-        raise SystemExit(1)
+        ensure_daemon_or_spawn(
+            auto_spawn=True,
+            stderr_emitter=lambda line: click.echo(line, err=True),
+        )
+    except LaunchAgentNotRunningError as exc:
+        click.echo(str(exc), err=True)
+        return 1
+    except DaemonAutoSpawnError as exc:
+        click.echo(f"Error: {exc}", err=True)
+        if exc.log_tail:
+            click.echo(exc.log_tail, err=True)
+        return 1
 
-    # Pin spawn mode at CLI entry BEFORE any mp.Queue/mp.Process is constructed.
-    # AES-GCM nonce safety (V1.5+) depends on os.urandom being independently
-    # seeded in the child; under fork mode the child inherits parent state.
-    # Asserting only inside run_proxy() is too late -- the parent has already
-    # forked/spawned by then. The `allow_none=True` is load-bearing: without
-    # it, get_start_method freezes the start-method context as a side effect.
-    if network:
-        import multiprocessing as _mp_init
-        _current_start = _mp_init.get_start_method(allow_none=True)
-        if _current_start is None:
-            _mp_init.set_start_method("spawn", force=True)
-        elif _current_start != "spawn":
-            console.print(
-                f"[red]Error:[/red] multiprocessing start method is "
-                f"{_current_start!r}; --network requires 'spawn'."
-            )
-            raise SystemExit(1)
+    # ``force_mode`` may be a PrivacyMode enum from Phase 1; daemon
+    # consumes a string. Coerce safely.
+    force_mode_str = None
+    if force_mode is not None:
+        force_mode_str = getattr(force_mode, "value", str(force_mode))
 
-    cli_args = {
+    payload = {
         "name": name,
         "description": description or None,
         "audio": audio,
-        "output": output,
+        "output_dir": output,
         "wifi_metrics": wifi_metrics,
         "app_versions": app_versions,
-        "force_clean": force,
+        "force_clean": force_clean,
         "capture_video": capture_video,
         "capture_images": capture_images,
         "capture_window_data": capture_window_data,
         "verbose": verbose,
         "chunk_duration": chunk_duration,
-        "live_upload": not no_live_upload,
-        "force_mode": force_mode,
-        "cloud_intent": is_cloud,
+        "live_upload": live_upload,
+        "force_mode": force_mode_str,
+        "cloud_intent": cloud_intent,
         "keep_local": keep_local,
         "intent_source": intent_source,
-        "segmentation_mode": seg_mode,
+        "segmentation_mode": segmentation_mode,
         "scrub_enabled": scrub_enabled,
         "show_on_website": show_on_website,
-        "auto_name_enabled": auto_name_enabled,
-        "local_only": local_only,
         "network": network,
     }
 
-    # SessionController(...) is INSIDE the try block so a SystemExit raised
-    # from __init__ (e.g. exit code 2 on lock contention, exit code 3 on
-    # permission_lost) goes through the same `stopped` event emission path.
-    # Without this, exit-2 silently bypassed the terminal event (todo 004).
-    exit_code = 0
-    try:
-        controller = SessionController(cli_args)
-        # SessionController.__init__ already claimed the lock + emitted `started`
-        # via the path inside session.py — no need to re-emit here.
-        controller.run()
-    except SystemExit as se:
-        exit_code = int(getattr(se, "code", 0) or 0)
-        _emit_event(EVENT_STOPPED, exit_code=exit_code)
-        raise
-    except Exception as exc:  # noqa: BLE001
-        console.print(f"[red]Session controller error:[/red] {exc}")
-        _emit_event(EVENT_STOPPED, exit_code=1, error=str(exc))
-        raise SystemExit(1)
-    _emit_event(EVENT_STOPPED, exit_code=exit_code)
+    interrupt_state = {"count": 0, "stop_sent": False, "client": None}
 
-
-def _legacy_start_recording(
-    *,
-    name,
-    description,
-    audio,
-    output,
-    wifi_metrics,
-    app_versions,
-    force,
-    capture_video,
-    capture_images,
-    capture_window_data,
-    verbose,
-    chunk_duration,
-    no_live_upload,
-    force_mode,
-    is_cloud,
-    keep_local,
-    intent_source,
-    seg_mode,
-    scrub_enabled,
-    show_on_website,
-    auto_name_enabled,
-    local_only,
-) -> None:
-    """Classic one-shot ``screencap start`` code path (pre-Session Controller).
-
-    Kept for the test suite and for ``SCREENCAP_LEGACY_START=1`` users.
-    Functionally identical to the previous inline body of ``start()``.
-    """
-    try:
-        from screencap.recorder import (
-            DiskFullError,
-            _kill_menubar,
-            print_summary,
-            start_recording,
-        )
-    except ImportError:
-        console.print(_RECORD_EXTRAS_MSG)
-        raise SystemExit(1)
-
-    # Cross-language event contract (todo 016): the SwiftUI shell relies on
-    # ``started`` and ``stopped`` to drive UI state. The legacy path is a
-    # documented escape hatch (``SCREENCAP_LEGACY_START=1``) and does not
-    # build a SessionController, so the events are emitted here directly.
-    # Without these wires, a SwiftUI launch falling onto the legacy path
-    # would line-read silence then EOF and never transition out of
-    # "starting" state.
-    try:
-        from screencap._stderr_events import (
-            EVENT_STARTED,
-            emit_event as _emit_event_legacy,
-            resolve_claimant,
-        )
-        _emit_event_legacy(EVENT_STARTED, claimant=resolve_claimant())
-    except Exception:
-        pass
-
-    disk_full = False
-    _menubar_proc = None
-    _menubar_state_file = None
-    try:
-        capture_dir, elapsed, _menubar_proc, _menubar_state_file = start_recording(
-            name, description or None, audio, output,
-            wifi_metrics=wifi_metrics, app_versions=app_versions,
-            force_clean=force,
-            capture_video=capture_video, capture_images=capture_images,
-            capture_window_data=capture_window_data,
-            verbose=verbose,
-            chunk_duration=chunk_duration,
-            live_upload=not no_live_upload,
-            force_mode=force_mode,
-            cloud_intent=is_cloud,
-            keep_local=keep_local,
-            intent_source=intent_source,
-            segmentation_mode=seg_mode,
-            scrub_enabled=scrub_enabled,
-            show_on_website=show_on_website,
-        )
-    except DiskFullError as e:
-        capture_dir, elapsed = e.capture_dir, e.elapsed
-        _menubar_proc, _menubar_state_file = e.menubar_proc, e.menubar_state_file
-        disk_full = True
-        console.print(
-            "[yellow]Skipping auto-naming/transcription: disk space is low.[/yellow]"
-        )
-    except ImportError:
-        console.print(_RECORD_EXTRAS_MSG)
-        raise SystemExit(1)
-
-    final_name = name
-    final_dir = capture_dir
-
-    try:
-        from screencap.menubar import RENAME_FILENAME
-        _rename_file = capture_dir / RENAME_FILENAME
-        if _rename_file.exists():
-            _new_name = _rename_file.read_text().strip()
-            if _new_name and _new_name != name:
-                new_dir = capture_dir.parent / _new_name
-                if not new_dir.exists():
-                    capture_dir.rename(new_dir)
-                    final_name = _new_name
-                    final_dir = new_dir
-                    capture_dir = new_dir
-            _rename_file.unlink(missing_ok=True)
-    except Exception:
-        pass
-
-    try:
-        _auto_export(capture_dir)
-    except KeyboardInterrupt:
-        console.print("[yellow]Export cancelled.[/yellow]")
-
-    if auto_name_enabled and not disk_full and final_name == name:
-        has_chunk_transcripts = any(capture_dir.glob("transcript_*.txt"))
-        audio_path = capture_dir / "audio.flac"
-        if (
-            audio
-            and not has_chunk_transcripts
-            and audio_path.exists()
-            and audio_path.stat().st_size >= 1024
-        ):
+    def _sigint_handler(_signum, _frame):
+        interrupt_state["count"] += 1
+        client = interrupt_state["client"]
+        if interrupt_state["count"] >= 2:
+            # Second Ctrl+C always escalates to force-quit regardless of
+            # whether a graceful stop was already sent — the graceful stop
+            # may be in-flight and the user wants an immediate exit.
+            click.echo("\nSecond Ctrl+C — force-stopping.", err=True)
+            if client is not None:
+                try:
+                    # Short 3s timeout: the user wants an immediate exit;
+                    # don't block the signal handler for the full 30s default.
+                    client.stop(force=True, timeout=3.0)
+                except Exception:
+                    pass
+            return
+        if client is not None and not interrupt_state["stop_sent"]:
             try:
-                _auto_transcribe(capture_dir, audio_path)
-            except KeyboardInterrupt:
-                console.print("[yellow]Transcription cancelled.[/yellow]")
-
-        skip_rename = output is not None
-        try:
-            from screencap.namer import auto_name as do_auto_name
-
-            with console.status("[bold]Generating name...[/bold]"):
-                final_dir = do_auto_name(
-                    capture_dir,
-                    local_only=local_only,
-                    skip_rename=skip_rename,
+                # Short 3s timeout: signal handlers should not block
+                # indefinitely.
+                client.stop(force=False, timeout=3.0)
+                interrupt_state["stop_sent"] = True
+                click.echo(
+                    "Stopping (Ctrl+C again to force-quit)...", err=True
                 )
-            final_name = final_dir.name
-        except KeyboardInterrupt:
+            except DaemonAPIError as e:
+                logger.debug("stop(force=False) returned daemon error: %s", e)
+            except Exception as e:
+                logger.debug("stop(force=False) failed: %s", e)
+
+    try:
+        with DaemonHTTPClient() as client:
+            interrupt_state["client"] = client
+            try:
+                start_result = client.start(**{k: v for k, v in payload.items() if v is not None})
+            except DaemonAPIError as exc:
+                code = exc.envelope.get("error", "unknown")
+                if code == "lock_contended":
+                    owner = exc.envelope.get("owner", {})
+                    click.echo(
+                        f"[red]Another recording is already active "
+                        f"(owner: {owner.get('claimant', 'unknown')}).[/red]",
+                        err=True,
+                    )
+                    return 2
+                click.echo(f"Daemon rejected start: {code}", err=True)
+                return 1
+            except SchemaMismatchError as exc:
+                click.echo(f"Error: {exc}", err=True)
+                return 1
+            except DaemonUnreachableError as exc:
+                click.echo(f"Error: daemon unreachable: {exc}", err=True)
+                return 1
+
+            cursor = start_result.get("cursor", 0)
             console.print(
-                "[yellow]Naming cancelled — keeping timestamp name[/yellow]"
+                f"[#22d3ee]Recording[/#22d3ee] "
+                f"[dim](session_id={start_result.get('session_id')!r})[/dim]"
             )
 
-    from screencap.recorder import print_upload_followup
-    print_upload_followup(final_name, final_dir)
+            previous_sigint = _signal.signal(_signal.SIGINT, _sigint_handler)
+            terminal_payload: dict | None = None
+            permission_lost = False
+            try:
+                while terminal_payload is None:
+                    try:
+                        with client.events(since=cursor) as stream:
+                            for event in stream:
+                                # Mirror the engine's stderr line shape so
+                                # SwiftUI / agent consumers parse the same
+                                # JSON whether the producer is the daemon
+                                # or the engine stderr.
+                                _sys.stderr.write(_json.dumps(event) + "\n")
+                                _sys.stderr.flush()
 
-    print_summary(final_name, final_dir, elapsed)
+                                event_type = event.get("type")
+                                if isinstance(event.get("cursor"), int):
+                                    cursor = event["cursor"]
+                                if event_type == "permission_lost":
+                                    permission_lost = True
+                                if event_type == "recording_finalized":
+                                    terminal_payload = event
+                                    break
+                                if event_type == "_close":
+                                    # Daemon shut the stream; reopen from
+                                    # last seen cursor.
+                                    break
+                    except DaemonAPIError as exc:
+                        if exc.envelope.get("error") == "cursor_unknown":
+                            # Daemon recycled mid-recording (idle-shutdown
+                            # window or restart). Re-fetch the snapshot for
+                            # a fresh cursor and resume.
+                            try:
+                                snap = client.snapshot()
+                            except Exception:
+                                return 1
+                            # If the recording is already gone (daemon
+                            # force-terminated on restart), exit cleanly
+                            # rather than blocking forever.
+                            if snap.get("is_recording") is False:
+                                click.echo(
+                                    "Recording ended (daemon restarted mid-session).",
+                                    err=True,
+                                )
+                                return 1
+                            cursor = snap.get("cursor", 0)
+                            continue
+                        click.echo(f"Daemon error: {exc}", err=True)
+                        return 1
+                    except DaemonUnreachableError:
+                        click.echo(
+                            "Daemon disconnected mid-recording; "
+                            "see ~/.screencap/run/auto-serve.log",
+                            err=True,
+                        )
+                        return 1
+            finally:
+                _signal.signal(_signal.SIGINT, previous_sigint)
 
-    try:
-        _report_unclassified_apps(final_dir)
-    except Exception:
-        pass
-
-    _kill_menubar(_menubar_proc, _menubar_state_file)
-
-    # Mirror the SessionController exit path so SwiftUI sees `stopped`
-    # before the process disappears (todo 016). Use ``os._exit`` after the
-    # emit so any background threads (chunk_processor watcher, post-
-    # processing pool) don't keep the interpreter alive.
-    try:
-        from screencap._stderr_events import (
-            EVENT_STOPPED,
-            emit_event as _emit_event_legacy,
-        )
-        _emit_event_legacy(EVENT_STOPPED, exit_code=0)
-    except Exception:
-        pass
-    import os as _os
-    _os._exit(0)
+            if permission_lost:
+                return 3
+            if terminal_payload and terminal_payload.get("disk_full"):
+                return 4
+            if interrupt_state["count"] >= 2:
+                return 5
+            # Engine crash / OOM / SIGKILL: daemon synthesizes
+            # recording_finalized with force_stopped=True but without
+            # disk_full or permission_lost.
+            if (
+                terminal_payload
+                and terminal_payload.get("force_stopped")
+                and not terminal_payload.get("disk_full")
+                and not permission_lost
+            ):
+                return 1
+            return 0
+    finally:
+        interrupt_state["client"] = None
 
 
 def _auto_export(capture_dir: Path) -> None:
@@ -1982,97 +1980,60 @@ def apps(as_json, include_spotlight):
                    "hot path (todo 018). nlp_models_cached field is reported "
                    "as null when skipped.")
 def status(as_json, no_nlp_check):
-    """Report recording state without IPC.
+    """Report recording state by querying the daemon.
 
-    Reads the flock-protected ``recording.lock`` content (Unit 3) and the
-    config flags. Designed for SwiftUI's 1Hz poll loop — light dependencies,
-    no SessionController spawn, no AppKit. Always exits 0.
+    Thin client of ``GET /v0/session.snapshot``. When the daemon isn't
+    reachable (no LaunchAgent installed and no auto-spawned daemon —
+    common on a fresh CLI-only install), report ``is_recording=false``
+    rather than surfacing a daemon error, because "no daemon" and "not
+    recording" are equivalent observed states for the user.
     """
     import json as _json
     import time as _time
     from typing import TypedDict
 
-    from screencap.pidfile import LOCK_FILE, lock_is_active, read_lock_metadata
+    from screencap.cli._autospawn import (
+        LaunchAgentNotRunningError,
+        ensure_daemon_or_spawn,
+    )
+    from screencap.cli._daemon_client import (
+        DaemonAPIError,
+        DaemonHTTPClient,
+        DaemonUnreachableError,
+        SchemaMismatchError,
+    )
 
     class StatusPayload(TypedDict):
-        """Schema for `screencap status --json` output.
-
-        Symmetric: every key is always present so SwiftUI's parser doesn't
-        need conditional unwraps. Unknown values are ``None`` / ``False``.
-        Uniform envelope (todo 020): `ok` + `schema_version` lead the payload.
-        """
         ok: bool
         schema_version: int
         is_recording: bool
         started_at: float | None
         elapsed: float | None
+        recording_name: str | None
         capture_dir: str | None
         claimant: str | None
-        warning: str | None
+        daemon_reachable: bool
         privacy_configured: bool
-        nlp_models_cached: bool | None  # None when --no-nlp-check is set
-
-    # Two distinct facts about the lock:
-    #   1. lock_is_active() — flock probe. True iff a process holds the lock.
-    #      In session mode this is the controller's lifetime, NOT a single
-    #      recording's lifetime.
-    #   2. recording_started_at in metadata — set by SessionController on
-    #      _on_start_click, cleared on _on_stop_click. The canonical
-    #      "is a recording capture in progress?" signal.
-    #
-    # SwiftUI's elapsed-time UI must read recording_started_at, not the
-    # controller-init started_at. Without this distinction, the previous
-    # design left status reporting is_recording=true and a stale elapsed
-    # time after the user clicked Stop in the menubar (the controller
-    # was still alive between recordings).
-    flock_held = lock_is_active()
-    metadata = read_lock_metadata()
-    recording_started_at = None
-    if metadata is not None:
-        rec_ts = metadata.get("recording_started_at")
-        if isinstance(rec_ts, (int, float)):
-            recording_started_at = float(rec_ts)
-    is_recording = flock_held and recording_started_at is not None
+        nlp_models_cached: bool | None
 
     payload: StatusPayload = {
         "ok": True,
-        # Independent from stderr-event schema version (todo 009) — status
-        # payload evolves separately.
         "schema_version": _STATUS_SCHEMA_VERSION,
-        "is_recording": is_recording,
+        "is_recording": False,
         "started_at": None,
         "elapsed": None,
+        "recording_name": None,
         "capture_dir": None,
         "claimant": None,
-        "warning": None,
+        "daemon_reachable": False,
         "privacy_configured": False,
         "nlp_models_cached": False,
     }
     if no_nlp_check:
-        # Caller opted out of the cache probe (todo 018). Report null so
-        # consumers can distinguish "skipped by request" from "checked,
-        # not cached" (False).
         payload["nlp_models_cached"] = None
 
-    if is_recording and metadata is not None:
-        # started_at + elapsed track THE recording, not the controller —
-        # so back-to-back recordings each report a fresh elapsed time.
-        payload["started_at"] = recording_started_at
-        payload["elapsed"] = max(0.0, _time.time() - recording_started_at)
-        if metadata.get("capture_dir"):
-            payload["capture_dir"] = metadata["capture_dir"]
-        if metadata.get("claimant"):
-            payload["claimant"] = metadata["claimant"]
-    elif not flock_held and LOCK_FILE.exists():
-        # Lock file exists but flock probe says no holder. Distinguish:
-        #   - file unparseable (corrupt JSON) → metadata is None
-        #   - file present + parseable + no holder → metadata is dict
-        if metadata is None:
-            payload["warning"] = "lock_unparseable"
-        else:
-            payload["warning"] = "lock_stale"
-
-    # Config readiness flags — cheap and useful for first-run UI.
+    # Config readiness flags — cheap and useful for first-run UI. These
+    # do not require the daemon.
     try:
         from screencap.config import _load_toml
         privacy_section = (_load_toml().get("privacy") or {})
@@ -2087,6 +2048,52 @@ def status(as_json, no_nlp_check):
         except Exception:
             pass
 
+    # ``auto_spawn=False``: status of a missing daemon is "not recording";
+    # spawning one just to confirm "no, nothing's happening" is wasteful.
+    try:
+        ensure_daemon_or_spawn(auto_spawn=False)
+    except LaunchAgentNotRunningError as exc:
+        # Surface the kickstart guidance to stderr even on the --json
+        # path so an operator running ``screencap status`` notices the
+        # mismatch between launchd's installed state and the daemon's
+        # live state.
+        click.echo(str(exc), err=True)
+
+    snapshot: dict | None = None
+    try:
+        with DaemonHTTPClient() as client:
+            snapshot = client.snapshot()
+            payload["daemon_reachable"] = True
+    except DaemonUnreachableError:
+        snapshot = None
+    except SchemaMismatchError as exc:
+        click.echo(
+            f"Error: {exc}. Update the daemon: launchctl kickstart -kp "
+            f"gui/$UID/com.screencap.daemon",
+            err=True,
+        )
+        snapshot = None
+    except DaemonAPIError as exc:
+        click.echo(f"Daemon error: {exc.envelope.get('error', 'unknown')}", err=True)
+        snapshot = None
+
+    if snapshot and snapshot.get("is_recording"):
+        started_at = snapshot.get("started_at")
+        if isinstance(started_at, (int, float)):
+            payload["is_recording"] = True
+            payload["started_at"] = float(started_at)
+            payload["elapsed"] = max(0.0, _time.time() - float(started_at))
+        payload["recording_name"] = snapshot.get("recording_name")
+        # Reconstruct capture_dir from recording_name for backwards
+        # compatibility with consumers that grep it. The daemon snapshot
+        # itself does not carry the path; ``~/.screencap/recordings/`` is
+        # the canonical root.
+        name = payload["recording_name"]
+        if isinstance(name, str) and name:
+            from pathlib import Path as _Path
+            payload["capture_dir"] = str(_Path.home() / ".screencap" / "recordings" / name)
+        payload["claimant"] = snapshot.get("claimant")
+
     if as_json:
         sys.stdout.write(_json.dumps(payload) + "\n")
         sys.stdout.flush()
@@ -2099,10 +2106,12 @@ def status(as_json, no_nlp_check):
             console.print(f"[#22d3ee]Recording[/#22d3ee] — {int(elapsed)}s elapsed")
         else:
             console.print("[#22d3ee]Recording[/#22d3ee] — (start time unknown)")
-        if payload.get("capture_dir"):
-            console.print(f"  Capture dir: {payload['capture_dir']}")
+        if payload.get("recording_name"):
+            console.print(f"  Recording: {payload['recording_name']}")
         if payload.get("claimant"):
             console.print(f"  Claimant: {payload['claimant']}")
+    elif not payload["daemon_reachable"]:
+        console.print("[dim]Not recording. (Daemon not running.)[/dim]")
     else:
         console.print("[dim]Not recording.[/dim]")
 
@@ -2114,39 +2123,35 @@ def status(as_json, no_nlp_check):
               help="Emit machine-readable JSON to stdout instead of prose. "
                    "Auto-detected when stdout is not a TTY (todo 009).")
 def stop(force, as_json):
-    """Stop recording processes.
+    """Stop the active recording via the daemon.
 
-    \b
-    Without --force: send SIGTERM to the lock owner, wait up to 30s for
-    a clean shutdown, then fall through to an orphan-children scan.
+    Thin client of ``POST /v0/recording.stop``. The daemon owns engine
+    supervision after Phase 2 U1, including SIGTERM grace, SIGKILL
+    escalation, and orphan teardown — the CLI is purely a remote that
+    surfaces the result envelope.
 
-    \b
-    With --force: SIGKILL the lock owner directly (so a hung-but-alive
-    SessionController can be taken down — find_orphaned_processes returns
-    nothing while the parent lives), then run the orphan-children scan.
-    Use this only when the graceful path has already failed; previously
-    --force was a no-op against a live parent and is now actively
-    destructive against the recording session.
+    Without ``--force`` the daemon performs a graceful stop. With
+    ``--force`` the daemon SIGKILLs the engine subprocess directly.
 
-    \b
-    --json envelope (todo 009):
-      {ok, schema_version, action, pid, killed,
-       orphans_terminated, error}
-    action ∈ {"sigterm", "sigkill", "none", "no_owner"}.
+    JSON envelope:
+      {ok, schema_version, action, stopped, final_state, error}
+    where ``action`` ∈ {"sigterm", "sigkill", "no_daemon", "no_recording"}.
     """
-    import os as _os
-    import signal as _signal
-    import time as _time
+    from screencap.cli._autospawn import (
+        LaunchAgentNotRunningError,
+        ensure_daemon_or_spawn,
+    )
+    from screencap.cli._daemon_client import (
+        DaemonAPIError,
+        DaemonHTTPClient,
+        DaemonUnreachableError,
+        SchemaMismatchError,
+    )
 
-    # Track outcome across exit points so the JSON envelope describes the
-    # actual lifecycle (todo 009). Updated in place by the SIGTERM /
-    # SIGKILL / orphan-scan branches; emitted from the helper below before
-    # every return / SystemExit.
     _stop_outcome: dict = {
         "action": "none",
-        "pid": None,
-        "killed": False,
-        "orphans_terminated": 0,
+        "stopped": False,
+        "final_state": None,
         "error": None,
     }
 
@@ -2163,190 +2168,68 @@ def stop(force, as_json):
         if exit_code:
             raise SystemExit(exit_code)
 
+    # Stopping a non-existent daemon is a no-op — don't spawn one just
+    # to confirm there's nothing to stop.
     try:
-        from screencap.pidfile import (
-            _is_screencap_process,
-            _pid_exists,
-            delete_pidfile,
-            find_orphaned_processes,
-            read_lock_metadata,
-            read_pidfile,
-            terminate_processes,
-        )
-    except ImportError:
-        if not as_json:
-            console.print(_RECORD_EXTRAS_MSG)
-        _stop_outcome["error"] = "record_extras_not_installed"
+        ensure_daemon_or_spawn(auto_spawn=False)
+    except LaunchAgentNotRunningError as exc:
+        click.echo(str(exc), err=True)
+        _stop_outcome["action"] = "no_daemon"
+        _stop_outcome["error"] = "launchagent_not_running"
         _emit_stop_result(ok=False, exit_code=1)
         return
 
-    # Identify the lock owner. Prefer the flock-protected lock metadata
-    # (Unit 3) — it's the canonical owner and works correctly for
-    # multiprocessing.spawn workers (per
-    # docs/tickets/high-2026-03-10-fix-orphan-detection-spawn-workers.md).
-    # Fall back to legacy recording.pid for back-compat with any holder
-    # that hasn't migrated.
-    #
-    # This identification step runs in BOTH the graceful and --force paths.
-    # Without it, --force would skip straight to find_orphaned_processes(),
-    # which returns [] when the SessionController parent is alive — meaning
-    # `screencap stop --force` against a hung-but-alive controller did
-    # nothing.
-    lock_meta = read_lock_metadata()
-    parent_pid = None
-    lock_started_at = None
-    if lock_meta and lock_meta.get("pid"):
-        parent_pid = lock_meta["pid"]
-        lock_started_at = lock_meta.get("started_at")
-    else:
-        data = read_pidfile()
-        if data and data.get("parent_pid"):
-            parent_pid = data["parent_pid"]
-            lock_started_at = data.get("started_at")
+    _stop_outcome["action"] = "sigkill" if force else "sigterm"
 
-    # PID-recycle guard (todo 007) — verify the live PID's create_time is
-    # within tolerance of the lock metadata's started_at. macOS recycles
-    # PIDs aggressively (~99k space), so a long-dead recorder's PID could
-    # belong to an unrelated process by the time the user runs `stop`.
-    # Applies to both graceful and --force paths — force-killing the wrong
-    # process is even worse than SIGTERM-ing it.
-    if parent_pid is not None and lock_started_at is not None:
-        try:
-            import psutil as _psutil
-            proc_create_time = _psutil.Process(parent_pid).create_time()
-            # 60s tolerance (todo 014): both lock_started_at (time.time at
-            # claim_lock) and psutil.Process.create_time on macOS are wall-
-            # clock — a forward NTP step between claim and stop (common on
-            # laptops resuming from sleep) would otherwise null the legit
-            # parent_pid and silently turn `screencap stop` into a no-op
-            # because find_orphaned_processes() returns [] while the parent
-            # lives. Real PID recycles after process death involve much
-            # larger elapsed times; 60s absorbs routine NTP jumps without
-            # weakening the guard's intent.
-            if proc_create_time > float(lock_started_at) + 60.0:
-                console.print(
-                    f"[yellow]Warning:[/yellow] PID {parent_pid} appears recycled "
-                    f"(process started >60s after the recording's lock metadata). "
-                    f"Skipping direct kill; falling through to orphan scan."
-                )
-                parent_pid = None
-        except (_psutil.NoSuchProcess, _psutil.AccessDenied, _psutil.ZombieProcess):
-            # No process at that PID — nothing to stop directly; fall
-            # through to the orphan scan.
-            parent_pid = None
-        except Exception:
-            # Unexpected psutil failure: stay conservative and skip the
-            # direct kill rather than risk killing an unrelated process.
-            parent_pid = None
-
-    if parent_pid is not None and _pid_exists(parent_pid) and _is_screencap_process(parent_pid):
-        _stop_outcome["pid"] = int(parent_pid)
-        if force:
-            # --force path: SIGKILL the lock owner directly. This is the
-            # only way to take down a hung-but-alive SessionController, since
-            # find_orphaned_processes() returns [] while the parent lives.
-            _stop_outcome["action"] = "sigkill"
-            if not as_json:
-                console.print(f"[yellow]Force-killing recording (PID {parent_pid})...[/yellow]")
-            try:
-                _os.kill(parent_pid, _signal.SIGKILL)
-            except (ProcessLookupError, PermissionError) as exc:
-                # Surface as a non-zero exit (todo 009): an agent that
-                # invokes ``stop --force`` and gets exit 0 will assume the
-                # session is dead. PermissionError most commonly means the
-                # PID belongs to a different uid (recycled across users).
-                _stop_outcome["error"] = f"sigkill_failed:{type(exc).__name__}:{exc}"
-                if not as_json:
-                    console.print(f"[red]Failed to SIGKILL PID {parent_pid}: {exc}[/red]")
-                _emit_stop_result(ok=False, exit_code=1)
-                return
-            else:
-                # Brief wait for the kernel to reap; then confirm.
-                for _ in range(10):
-                    if not _pid_exists(parent_pid):
-                        break
-                    _time.sleep(0.1)
-                if not _pid_exists(parent_pid):
-                    _stop_outcome["killed"] = True
-                    if not as_json:
-                        console.print("[#22d3ee]Recording force-stopped.[/#22d3ee]")
-                else:
-                    _stop_outcome["error"] = "sigkill_uninterruptible"
-                    if not as_json:
-                        console.print(
-                            f"[yellow]Warning:[/yellow] PID {parent_pid} still alive after "
-                            "SIGKILL — process may be uninterruptible (D-state)."
-                        )
-            delete_pidfile()
-            # Fall through to orphan scan in case force-kill left children.
-        else:
-            _stop_outcome["action"] = "sigterm"
-            if not as_json:
-                console.print(f"Sending stop signal to recording (PID {parent_pid})...")
-            try:
-                _os.kill(parent_pid, _signal.SIGTERM)
-            except (ProcessLookupError, PermissionError):
-                pass
-            else:
-                # Wait for graceful shutdown (up to 30s) with progress
-                _timed_out = True
-                try:
-                    with console.status(
-                        "[dim]Waiting for recording to stop "
-                        "(post-processing may take a moment)...[/dim]"
-                    ) as _wait_status:
-                        for _tick in range(60):
-                            if not _pid_exists(parent_pid):
-                                _timed_out = False
-                                break
-                            if _tick == 20:  # 10s elapsed
-                                _wait_status.update(
-                                    "[dim]Still waiting... use [bold]screencap stop --force[/bold] "
-                                    "to kill immediately[/dim]"
-                                )
-                            _time.sleep(0.5)
-                except KeyboardInterrupt:
-                    if not as_json:
-                        console.print(
-                            "\n[yellow]Interrupted — escalating to force kill.[/yellow]\n"
-                            "[dim]Tip: [bold]screencap stop --force[/bold] "
-                            "skips the graceful wait[/dim]"
-                        )
-                if not _timed_out or not _pid_exists(parent_pid):
-                    _stop_outcome["killed"] = True
-                    if not as_json:
-                        console.print("[#22d3ee]Recording stopped.[/#22d3ee]")
-                    delete_pidfile()
-                    _emit_stop_result(ok=True)
-                    return
-                if not as_json:
-                    console.print("[yellow]Graceful stop timed out — falling back to force kill.[/yellow]")
-
-    orphans = find_orphaned_processes()
-    if not orphans:
-        if _stop_outcome["action"] == "none":
-            _stop_outcome["action"] = "no_owner"
+    try:
+        with DaemonHTTPClient() as client:
+            result = client.stop(force=force)
+    except DaemonUnreachableError:
+        _stop_outcome["action"] = "no_daemon"
         if not as_json:
-            console.print("[dim]No orphaned recording processes found.[/dim]")
+            console.print("[dim]No active recording. (Daemon not running.)[/dim]")
         _emit_stop_result(ok=True)
         return
+    except SchemaMismatchError as exc:
+        _stop_outcome["error"] = "schema_mismatch"
+        if not as_json:
+            console.print(f"[red]Error:[/red] {exc}")
+            console.print(
+                "Update the daemon: [bold]launchctl kickstart -kp "
+                "gui/$UID/com.screencap.daemon[/bold]"
+            )
+        _emit_stop_result(ok=False, exit_code=1)
+        return
+    except DaemonAPIError as exc:
+        code = exc.envelope.get("error", "unknown")
+        if code == "not_owned_by_daemon":
+            _stop_outcome["action"] = "no_recording"
+            _stop_outcome["error"] = "not_owned_by_daemon"
+            if not as_json:
+                console.print(
+                    "[dim]No active recording owned by the daemon.[/dim]"
+                )
+            _emit_stop_result(ok=True)
+            return
+        _stop_outcome["error"] = code
+        if not as_json:
+            console.print(f"[red]Daemon error:[/red] {code}")
+        _emit_stop_result(ok=False, exit_code=1)
+        return
 
+    _stop_outcome["stopped"] = bool(result.get("stopped"))
+    _stop_outcome["final_state"] = result.get("final_state")
     if not as_json:
-        console.print(f"Found {len(orphans)} orphaned recording process(es).")
-    terminated = terminate_processes(orphans, force=force)
-    _stop_outcome["orphans_terminated"] = len(terminated)
-    if terminated:
-        _stop_outcome["killed"] = True
-
-    if not as_json:
-        for entry in terminated:
-            console.print(f"  Terminated {entry.get('name', 'unknown')} (PID {entry['pid']})... done")
-        if terminated:
-            console.print(f"Cleaned up {len(terminated)} process(es).")
+        if _stop_outcome["stopped"]:
+            label = (
+                "force-stopped" if _stop_outcome["final_state"] == "force_stopped"
+                else "stopped"
+            )
+            console.print(f"[#22d3ee]Recording {label}.[/#22d3ee]")
         else:
-            console.print("[yellow]Could not terminate any processes.[/yellow]")
-
-    delete_pidfile()
+            console.print(
+                f"[yellow]Daemon reported final_state={_stop_outcome['final_state']!r}.[/yellow]"
+            )
     _emit_stop_result(ok=True)
 
 

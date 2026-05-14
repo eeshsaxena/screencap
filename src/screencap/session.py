@@ -502,11 +502,15 @@ class SessionController:
             EVENT_LOCK_CONTENDED,
             EVENT_STARTED,
             emit_event as _emit_event,
-            resolve_claimant,
         )
-        from screencap.pidfile import LockContended, claim_lock
+        from screencap.pidfile import CLAIMANT_DAEMON, LockContended, claim_lock
 
-        claimant = resolve_claimant()
+        # SessionController is no longer reached from the CLI's ``start``
+        # command after Phase 2 U1 (the daemon owns engine supervision).
+        # The class survives for any in-tree callers that still construct
+        # it directly; if one does, it now writes ``daemon`` as the
+        # claimant so the lock metadata reads cleanly downstream.
+        claimant = CLAIMANT_DAEMON
         try:
             # capture_dir=None: at controller-init time the per-recording dir
             # isn't allocated yet. Lock metadata's ``capture_dir`` stays null

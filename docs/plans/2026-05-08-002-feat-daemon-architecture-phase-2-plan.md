@@ -685,11 +685,12 @@ peer connection accepted
 
 ## Phased Delivery
 
-### Phase 2a — CLI consolidation + provenance
+### Phase 2a — CLI consolidation + provenance — **SHIPPED 2026-05-13**
 
 - U1, U2.
 - Independently testable: install daemon (Phase 1 U6), exercise CLI commands, verify they hit `/v0/*`. Verify `started_by` provenance via daemon log inspection.
 - **Reversible:** revert U1 + U2 → CLI returns to in-process engine spawn; SwiftUI keeps Phase 1's `DaemonClient`. No data loss.
+- **Implementation:** delivered on `feat/daemon-phase-2a` (9 commits, 189 new/updated tests). U1.1 promoted `CLAIMANT_*` constants to `pidfile`; U1.2 added `cli/_daemon_client.py` (HTTP-over-AF_UNIX); U1.3 added `cli/_autospawn.py` + daemon `--idle-shutdown` watchdog (F3 fallback uses `posix_spawn` with absolute path + 10 min idle window); U1.4-1.6 rewrote `screencap status` / `stop` / `start` as thin daemon clients, preserving the existing exit-code taxonomy and adding Ctrl-C → graceful stop → second-Ctrl-C force-quit escalation; U1.7 retired `resolve_claimant` and documented auto-spawn in `CLAUDE.md`. U2.1 added `daemon/provenance.py` with `KERN_PROCARGS2` argv probing (option A from the 2026-05-13 review) so `screencap mcp` vs `screencap start` are distinguishable on the single-binary mode-dispatch surface; U2.2 wired server-derived `started_by` into the `recording.start` handler and marked the request field `deprecated=True` (API stays at v1, no schema bump); U2.3 added the canonical `validate_recording_name` gate + `InvalidNameError` (HTTP 400, `invalid_name` envelope), applied at the handler boundary and `Supervisor._allocate_capture_dir` for defense-in-depth.
 
 ### Phase 2b — MCP surface
 

@@ -222,55 +222,132 @@ def test_info_command_nonexistent_recording(tmp_path):
     assert "Error" in result.output
 
 
-# --- stop command tests ---
+# --- stop command tests (Phase 2 U1.5: thin daemon client) ---
 
 
-def test_stop_with_orphans():
+def _stop_daemon_envelope(**payload):
+    body = {
+        "ok": True,
+        "schema_version": 1,
+        "daemon_version": "test",
+        "api_schema_version": 1,
+    }
+    body.update(payload)
+    return body
+
+
+def _patch_stop_daemon_client(handler):
+    """Returns (start_patcher, autospawn_patcher) context managers."""
+    import httpx
+
+    from screencap.cli._daemon_client import DaemonHTTPClient
+
+    transport = httpx.MockTransport(handler)
+
+    class _PatchedClient(DaemonHTTPClient):
+        def __init__(self, *args, **kwargs):
+            kwargs["transport"] = transport
+            super().__init__(*args, **kwargs)
+
+    return (
+        mock.patch("screencap.cli._daemon_client.DaemonHTTPClient", _PatchedClient),
+        mock.patch("screencap.cli._autospawn.ensure_daemon_or_spawn", lambda *a, **k: None),
+    )
+
+
+def test_stop_graceful_against_active_recording():
+    import httpx
+
+    captured = {}
+
+    def handler(request):
+        captured["method"] = request.method
+        captured["path"] = request.url.path
+        captured["body"] = json.loads(request.content)
+        return httpx.Response(
+            200,
+            json=_stop_daemon_envelope(stopped=True, final_state="stopped"),
+        )
+
+    client_p, autospawn_p = _patch_stop_daemon_client(handler)
     runner = CliRunner()
-    orphans = [{"pid": 111, "name": "screen_writer"}, {"pid": 222, "name": "video_writer"}]
-    with (
-        mock.patch("screencap.pidfile.find_orphaned_processes", return_value=orphans),
-        mock.patch("screencap.pidfile.terminate_processes", return_value=orphans),
-        mock.patch("screencap.pidfile.delete_pidfile"),
-    ):
-        result = runner.invoke(cli, ["stop"])
+    with client_p, autospawn_p:
+        result = runner.invoke(cli, ["stop", "--json"])
     assert result.exit_code == 0
-    assert "2 orphaned" in result.output
-    assert "Cleaned up 2" in result.output
+    payload = json.loads(result.output.strip().splitlines()[-1])
+    assert payload["stopped"] is True
+    assert payload["action"] == "sigterm"
+    assert payload["final_state"] == "stopped"
+    assert captured["path"] == "/v0/recording.stop"
+    assert captured["body"] == {"force": False}
 
 
-def test_stop_with_force_flag():
+def test_stop_force_passes_through_to_daemon():
+    import httpx
+
+    captured = {}
+
+    def handler(request):
+        captured["body"] = json.loads(request.content)
+        return httpx.Response(
+            200,
+            json=_stop_daemon_envelope(stopped=True, final_state="force_stopped"),
+        )
+
+    client_p, autospawn_p = _patch_stop_daemon_client(handler)
     runner = CliRunner()
-    orphans = [{"pid": 333, "name": "writer"}]
-    with (
-        mock.patch("screencap.pidfile.find_orphaned_processes", return_value=orphans),
-        mock.patch("screencap.pidfile.terminate_processes", return_value=orphans) as mock_term,
-        mock.patch("screencap.pidfile.delete_pidfile"),
-    ):
-        result = runner.invoke(cli, ["stop", "--force"])
+    with client_p, autospawn_p:
+        result = runner.invoke(cli, ["stop", "--force", "--json"])
     assert result.exit_code == 0
-    mock_term.assert_called_once_with(orphans, force=True)
+    payload = json.loads(result.output.strip().splitlines()[-1])
+    assert payload["action"] == "sigkill"
+    assert payload["final_state"] == "force_stopped"
+    assert captured["body"] == {"force": True}
+
+
+def test_stop_no_daemon_reports_clean_no_op():
+    import httpx
+
+    def handler(request):
+        raise httpx.ConnectError("socket missing")
+
+    client_p, autospawn_p = _patch_stop_daemon_client(handler)
+    runner = CliRunner()
+    with client_p, autospawn_p:
+        result = runner.invoke(cli, ["stop", "--json"])
+    assert result.exit_code == 0
+    payload = json.loads(result.output.strip().splitlines()[-1])
+    assert payload["action"] == "no_daemon"
+    assert payload["stopped"] is False
+
+
+def test_stop_not_owned_by_daemon_is_zero_exit():
+    """`stop` returns 0 when the daemon reports no recording to stop."""
+    import httpx
+
+    def handler(request):
+        return httpx.Response(
+            409,
+            json={
+                "ok": False,
+                "error": "not_owned_by_daemon",
+                "schema_version": 1,
+                "api_schema_version": 1,
+                "daemon_version": "test",
+            },
+        )
+
+    client_p, autospawn_p = _patch_stop_daemon_client(handler)
+    runner = CliRunner()
+    with client_p, autospawn_p:
+        result = runner.invoke(cli, ["stop", "--json"])
+    assert result.exit_code == 0
+    payload = json.loads(result.output.strip().splitlines()[-1])
+    assert payload["action"] == "no_recording"
+    assert payload["error"] == "not_owned_by_daemon"
 
 
 # --- missing [record] extras tests ---
-
-
-def test_stop_missing_record_deps():
-    """stop should show helpful message when recording deps are missing."""
-    runner = CliRunner()
-    import builtins
-    original_import = builtins.__import__
-
-    def fake_import(name, *args, **kwargs):
-        if name == "screencap.pidfile":
-            raise ImportError("No module named 'psutil'")
-        return original_import(name, *args, **kwargs)
-
-    with mock.patch("builtins.__import__", side_effect=fake_import):
-        result = runner.invoke(cli, ["stop"])
-    assert result.exit_code == 1
-    assert "recording dependencies" in result.output
-    assert "pip install screencap[record]" in result.output
 
 
 def test_info_missing_record_deps(tmp_path):
@@ -1053,6 +1130,15 @@ def test_upload_export_failure_continues(tmp_path):
 # --- start command — cloud NLP model gate ---
 
 
+@pytest.mark.skip(
+    reason=(
+        "Phase 2 U1.6: removed in-process recorder.start_recording from CLI; "
+        "NLP gate logic still runs at CLI option-parse time but the test "
+        "asserted ``recorder`` mock kwargs that no longer get exercised. "
+        "Rewrite as a daemon-payload-assertion test in "
+        "tests/cli/test_start_daemon_client.py."
+    )
+)
 def test_cloud_start_nlp_model_gate(tmp_path):
     """Cloud recordings are gated on NLP model availability.
 
@@ -1351,14 +1437,25 @@ def test_cloud_function_filename_regex_allows_marker():
 
 
 # ---------------------------------------------------------------------------
-# `screencap start` flag/path tests
+# Legacy `screencap start` flag/path tests
 #
-# These exercise `start` with the prompt entry points patched via
-# _safe_start_prompts() so the test can't trigger interactive setup, write
-# the user's privacy config, or block on stdin.
+# These tests exercise the in-process ``recorder.start_recording`` call
+# path that Phase 2 U1.6 removed. The daemon-side equivalents live in
+# ``tests/cli/test_start_daemon_client.py`` (CLI translation) and
+# ``tests/daemon/test_control_verbs.py`` (engine spawn semantics).
+# Kept as skipped scaffolding so future readers see the migration.
 # ---------------------------------------------------------------------------
 
 
+pytestmark_legacy_start = pytest.mark.skip(
+    reason=(
+        "Phase 2 U1.6: in-process ``recorder.start_recording`` path removed "
+        "from screencap start; see tests/cli/test_start_daemon_client.py."
+    )
+)
+
+
+@pytestmark_legacy_start
 @pytest.mark.parametrize("flag,kwarg,expected", [
     ("--no-video", "capture_video", False),
     ("--no-images", "capture_images", False),
@@ -1381,6 +1478,7 @@ def test_start_capture_flag_propagates_to_recorder(tmp_path, flag, kwarg, expect
     assert kwargs[kwarg] is expected
 
 
+@pytestmark_legacy_start
 @pytest.mark.parametrize("args,expected_cloud,expected_source", [
     ([], False, "non_interactive_default"),
     (["--cloud"], True, "flag"),
@@ -1412,6 +1510,7 @@ def test_start_intent_flag_resolves_to_recorder_kwargs(
     assert kwargs["force_mode"] == (PrivacyMode.PUBLIC if expected_cloud else None)
 
 
+@pytestmark_legacy_start
 def test_start_cloud_then_local_resolves_to_local(tmp_path):
     """Click flag_value semantics: when both --cloud and --local are passed,
     the last one on the command line wins. Regression for an earlier bug
@@ -1432,6 +1531,7 @@ def test_start_cloud_then_local_resolves_to_local(tmp_path):
     assert kwargs["force_mode"] is None
 
 
+@pytestmark_legacy_start
 def test_start_force_flag_passes_force_clean_to_recorder(tmp_path):
     """`start --force` triggers orphan cleanup and forwards force_clean=True."""
     runner = CliRunner()
@@ -1455,6 +1555,7 @@ def test_start_force_flag_passes_force_clean_to_recorder(tmp_path):
     assert kwargs["force_clean"] is True
 
 
+@pytestmark_legacy_start
 def test_start_without_force_exits_when_orphans_present():
     """Without --force, start exits non-zero rather than racing the orphans."""
     runner = CliRunner()
@@ -1470,6 +1571,7 @@ def test_start_without_force_exits_when_orphans_present():
     assert result.exit_code == 1
 
 
+@pytestmark_legacy_start
 def test_start_disk_full_skips_auto_naming_but_prints_summary(tmp_path):
     """DiskFullError from start_recording is caught: the post-recording pipeline
     skips auto-naming/transcription, but the summary still prints so the user
@@ -1494,6 +1596,7 @@ def test_start_disk_full_skips_auto_naming_but_prints_summary(tmp_path):
     mock_namer.assert_not_called()
 
 
+@pytestmark_legacy_start
 def test_start_auto_export_called_with_capture_dir(tmp_path):
     """Auto-export runs after recording with the capture dir."""
     runner = CliRunner()
@@ -1514,6 +1617,7 @@ def test_start_auto_export_called_with_capture_dir(tmp_path):
     mock_auto_export.assert_called_once_with(fake_dir)
 
 
+@pytestmark_legacy_start
 def test_start_auto_export_keyboard_interrupt_does_not_abort(tmp_path):
     """Ctrl-C during auto-export prints 'Export cancelled.' and the pipeline
     continues to the summary instead of crashing."""
@@ -1535,6 +1639,7 @@ def test_start_auto_export_keyboard_interrupt_does_not_abort(tmp_path):
     assert "Recording complete" in result.output
 
 
+@pytestmark_legacy_start
 def test_start_auto_export_internal_failure_warns_but_succeeds(tmp_path):
     """When export_recording inside _auto_export raises, the warning path
     inside _auto_export catches it; start still finishes with exit 0 and the

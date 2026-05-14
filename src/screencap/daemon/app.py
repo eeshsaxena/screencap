@@ -18,7 +18,7 @@ from starlette.routing import Route
 from screencap import _stderr_events
 from screencap.daemon import errors, schema
 from screencap.daemon.event_bus import CursorOutOfRangeError, EventBus
-from screencap.daemon.supervisor import CLAIMANT_DAEMON
+from screencap.pidfile import CLAIMANT_DAEMON
 
 logger = logging.getLogger(__name__)
 
@@ -176,7 +176,7 @@ async def session_snapshot(request: Request) -> JSONResponse:
     if daemon_owned and supervisor is not None:
         current = supervisor.current_session()
         if current:
-            for key in ("engine_pid", "frames_written"):
+            for key in ("engine_pid", "frames_written", "started_by"):
                 if current.get(key) is not None:
                     payload[key] = current[key]
     elif not daemon_owned:
@@ -217,8 +217,38 @@ def _api_error_response(exc: errors.DaemonAPIError) -> JSONResponse:
 
 
 async def recording_start(request: Request) -> JSONResponse:
+    from screencap.daemon import provenance
+    from screencap.daemon._name_validation import validate_recording_name
+
     try:
-        parsed = schema.RecordingStartRequest.model_validate(await request.json())
+        body = await request.json()
+        caller_supplied = (
+            body.get("started_by") if isinstance(body, dict) else None
+        )
+        parsed = schema.RecordingStartRequest.model_validate(body)
+
+        # Phase 2 U2.3: gate recording names through the canonical
+        # validator so path traversal can't leak from agent / CLI / GUI
+        # callers into ``~/.screencap/recordings/<name>``. Name is
+        # optional (None means daemon auto-generates a timestamp name);
+        # only validate when caller supplied a value.
+        if parsed.name is not None:
+            validate_recording_name(parsed.name)
+
+        # Phase 2 U2: derive started_by from the peer socket and
+        # override any caller-supplied value. The field stays Optional
+        # in the request schema (soft-deprecated) so old clients keep
+        # working; the daemon owns the authoritative classification on
+        # persisted metadata.
+        derived = provenance.derive_started_by_from_asgi_scope(request.scope)
+        if caller_supplied is not None and caller_supplied != derived:
+            logger.debug(
+                "ignoring caller-supplied started_by=%r; using server-derived=%r",
+                caller_supplied,
+                derived,
+            )
+        parsed = parsed.model_copy(update={"started_by": derived})
+
         result = await request.app.state.supervisor.spawn(parsed)
         return JSONResponse(
             schema.envelope(

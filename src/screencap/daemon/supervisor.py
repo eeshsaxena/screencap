@@ -23,6 +23,7 @@ import psutil
 from screencap import _stderr_events
 from screencap.daemon import errors, schema
 from screencap.daemon.event_bus import CursorOutOfRangeError, EventBus, _Subscription
+from screencap.pidfile import CLAIMANT_DAEMON
 
 if TYPE_CHECKING:
     from screencap.daemon.schema import RecordingStartRequest
@@ -31,10 +32,14 @@ logger = logging.getLogger(__name__)
 
 EngineCommandFactory = Callable[[str], list[str]]
 
-# Canonical claimant identifier the daemon writes into the pidfile lock
-# metadata. Mirrored at supervisor.py call sites, app.py daemon-owned
-# detection, and cli.py engine-worker started event.
-CLAIMANT_DAEMON = "daemon"
+__all__ = ["Supervisor", "_extra_output_dir_allowlist"]
+
+# Extra output-dir allowlist entries — populated by test fixtures or callers
+# that legitimately need a path outside the default recordings root.
+# The canonical allowlist is ``[get_recordings_dir().resolve()]``; entries
+# here are checked *in addition to* that default. Tests should monkeypatch
+# this list rather than hard-coding a path assumption in production code.
+_extra_output_dir_allowlist: list[Path] = []
 
 # Engine-stderr kernel pipe widening — buys headroom for `_stderr_pump`
 # against engine-side burst writes so a briefly-slow pump drain does not
@@ -643,12 +648,30 @@ class Supervisor:
 
     def _allocate_capture_dir(self, request: "RecordingStartRequest") -> tuple[str, Path]:
         from screencap.config import get_recordings_dir
+        from screencap.daemon._name_validation import validate_recording_name
 
         requested_name = request.name
         requested_output = request.output_dir
+        # Defense-in-depth: the ``recording.start`` HTTP handler already
+        # validates ``name`` for path traversal at the request boundary,
+        # but the supervisor is the engine-spawn site for any future
+        # internal caller (recovery flows, MCP tools, daemon-internal
+        # cron jobs). Re-validate so the gate is single-sourced.
+        if requested_name is not None:
+            validate_recording_name(requested_name)
         base_name = requested_name or time.strftime("rec-%Y%m%dT%H%M%S")
         if requested_output:
-            capture_dir = Path(requested_output).expanduser()
+            capture_dir = Path(requested_output).expanduser().resolve()
+            recordings_dir = get_recordings_dir().resolve()
+            allowed_roots: list[Path] = [recordings_dir, *_extra_output_dir_allowlist]
+            if not any(
+                capture_dir == root or capture_dir.is_relative_to(root)
+                for root in allowed_roots
+            ):
+                raise errors.InvalidOutputDirError(
+                    "output_dir must be inside the recordings root",
+                    schema_version=schema._RECORDING_START_API_VERSION,
+                )
             return base_name, capture_dir
         recordings_dir = get_recordings_dir()
         candidate = recordings_dir / base_name

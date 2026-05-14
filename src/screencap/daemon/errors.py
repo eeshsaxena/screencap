@@ -16,6 +16,8 @@ CATALOG_UNREADABLE = "catalog_unreadable"
 ROGUE_FILE = "rogue_file"
 RECONCILING = "reconciling"
 FORCE_MISMATCH = "force_mismatch"
+INVALID_NAME = "invalid_name"
+INVALID_OUTPUT_DIR = "invalid_output_dir"
 
 # Codes returned by the daemon outside the typed-exception paths (route
 # handler `except Exception`, query-string parse failures). Keeping them
@@ -71,6 +73,30 @@ def schema_mismatch_envelope(
 
 def slow_consumer_envelope(*, schema_version: int) -> dict[str, Any]:
     return error_envelope(schema_version=schema_version, error=SLOW_CONSUMER)
+
+
+def invalid_name_envelope(
+    *,
+    reason: str,
+    schema_version: int,
+) -> dict[str, Any]:
+    return error_envelope(
+        schema_version=schema_version,
+        error=INVALID_NAME,
+        reason=reason,
+    )
+
+
+def invalid_output_dir_envelope(
+    *,
+    reason: str,
+    schema_version: int,
+) -> dict[str, Any]:
+    return error_envelope(
+        schema_version=schema_version,
+        error=INVALID_OUTPUT_DIR,
+        reason=reason,
+    )
 
 
 def cursor_unknown_envelope(
@@ -237,6 +263,35 @@ class SlowConsumerError(DaemonAPIError):
         return slow_consumer_envelope(schema_version=self.schema_version)
 
 
+class InvalidNameError(DaemonAPIError):
+    """Recording name rejected by the canonical validator.
+
+    Raised by ``screencap.daemon._name_validation.validate_recording_name``
+    and mapped to HTTP 400 with the ``invalid_name`` envelope. Carries
+    a short human-readable ``reason`` so the caller can surface why
+    the name was rejected.
+    """
+
+    error_code = INVALID_NAME
+    http_status = 400
+
+    def __init__(
+        self,
+        reason: str,
+        *,
+        schema_version: int,
+        http_status: int | None = None,
+    ) -> None:
+        self.reason = reason
+        super().__init__(schema_version=schema_version, http_status=http_status)
+
+    def envelope(self) -> dict[str, Any]:
+        return invalid_name_envelope(
+            reason=self.reason,
+            schema_version=self.schema_version,
+        )
+
+
 class CursorUnknownError(DaemonAPIError):
     error_code = CURSOR_UNKNOWN
     http_status = 410
@@ -317,6 +372,35 @@ class ForceMismatchError(DaemonAPIError):
         return force_mismatch_envelope(schema_version=self.schema_version)
 
 
+class InvalidOutputDirError(DaemonAPIError):
+    """Requested output_dir is outside the allowed recordings root(s).
+
+    Raised by ``Supervisor._allocate_capture_dir`` when the caller
+    supplies an ``output_dir`` that resolves outside every path in the
+    daemon's output-dir allowlist. Maps to HTTP 400 with the
+    ``invalid_output_dir`` envelope.
+    """
+
+    error_code = INVALID_OUTPUT_DIR
+    http_status = 400
+
+    def __init__(
+        self,
+        reason: str,
+        *,
+        schema_version: int,
+        http_status: int | None = None,
+    ) -> None:
+        self.reason = reason
+        super().__init__(schema_version=schema_version, http_status=http_status)
+
+    def envelope(self) -> dict[str, Any]:
+        return invalid_output_dir_envelope(
+            reason=self.reason,
+            schema_version=self.schema_version,
+        )
+
+
 __all__ = [
     "LOCK_CONTENDED",
     "NOT_OWNED_BY_DAEMON",
@@ -327,6 +411,8 @@ __all__ = [
     "ROGUE_FILE",
     "RECONCILING",
     "FORCE_MISMATCH",
+    "INVALID_NAME",
+    "INVALID_OUTPUT_DIR",
     "ERROR_CODE_INTERNAL",
     "ERROR_CODE_INVALID_CURSOR",
     "EXCEPTION_TO_ERROR_CODE",
@@ -340,6 +426,8 @@ __all__ = [
     "rogue_file_envelope",
     "reconciling_envelope",
     "force_mismatch_envelope",
+    "invalid_name_envelope",
+    "invalid_output_dir_envelope",
     "DaemonAPIError",
     "LockContendedError",
     "NotOwnedByDaemonError",
@@ -350,4 +438,6 @@ __all__ = [
     "RogueFileError",
     "ReconcilingError",
     "ForceMismatchError",
+    "InvalidNameError",
+    "InvalidOutputDirError",
 ]

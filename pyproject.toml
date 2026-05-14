@@ -34,6 +34,11 @@ dependencies = [
     "starlette>=0.37",
     "uvicorn>=0.30",
     "pydantic>=2.0.0",
+    # CLI live-state commands talk to the daemon via AF_UNIX HTTP through
+    # ``httpx.HTTPTransport(uds=...)`` (Phase 2 U1). Promoted from the dev
+    # extras because runtime CLI flows now depend on it; not a transitive
+    # dep of starlette/uvicorn on the install path we ship.
+    "httpx>=0.27",
 ]
 
 [project.optional-dependencies]
@@ -81,7 +86,6 @@ dev = [
     "pytest-cov",
     "pytest-asyncio>=0.23.0",
     "pytest-timeout>=2.0.0",
-    "httpx>=0.27",
     "ruff>=0.1.0",
 ]
 

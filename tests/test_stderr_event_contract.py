@@ -128,11 +128,14 @@ class TestEventSchemas:
         emitting any path here would mislead SwiftUI consumers into
         building wrong viewer URLs. Consumers learn the per-recording path
         from `recording_finalized.name` + `screencap status --json`."""
-        from screencap._stderr_events import emit_event, resolve_claimant
+        # Phase 2 U1.7 removed ``resolve_claimant``; the daemon is the sole
+        # production writer of the claimant after Phase 2. Pin an explicit
+        # value so this contract test still exercises the field shape.
+        from screencap._stderr_events import emit_event
 
         out = _capture_stderr(lambda: emit_event(
             "started",
-            claimant=resolve_claimant(),
+            claimant="daemon",
         ))
         evt = _parse_lines(out)[0]
         assert evt["type"] == "started"
@@ -140,7 +143,9 @@ class TestEventSchemas:
             f"`started` event must not carry capture_dir (todo 010), got {evt!r}"
         )
         # claimant remains the canonical identity field on this event.
-        assert evt["claimant"] in ("cli", "swiftui")
+        # After Phase 2, the daemon is the sole production writer; "cli"
+        # and "swiftui" survive as historical-metadata labels only.
+        assert evt["claimant"] in ("cli", "swiftui", "daemon")
 
     def test_recording_finalized_schema(self):
         from screencap._stderr_events import EVENT_SCHEMA_VERSION

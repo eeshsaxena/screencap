@@ -26,8 +26,20 @@ def _handled_signals() -> tuple[signal.Signals, ...]:
     return (signal.SIGTERM, signal.SIGINT)
 
 
-def serve(socket_path: str | Path | None = None, *, self_test: bool = False) -> int:
-    """Run the daemon server or execute its hidden smoke self-test."""
+def serve(
+    socket_path: str | Path | None = None,
+    *,
+    self_test: bool = False,
+    idle_shutdown_seconds: float | None = None,
+) -> int:
+    """Run the daemon server or execute its hidden smoke self-test.
+
+    ``idle_shutdown_seconds`` opts the daemon into the F3 auto-spawn
+    lifecycle: when set, an idle-shutdown watchdog drains and exits the
+    daemon after the configured seconds with no requests, subscribers,
+    or active recordings. LaunchAgent-managed daemons leave this
+    ``None`` and run all day.
+    """
     buffered_signal: int | None = None
     server_ref = None
 
@@ -75,6 +87,10 @@ def serve(socket_path: str | Path | None = None, *, self_test: bool = False) -> 
             import uvicorn
 
             app = build_app()
+            if idle_shutdown_seconds is not None and idle_shutdown_seconds > 0:
+                from screencap.daemon._idle_shutdown import attach as _attach_idle
+
+                _attach_idle(app, idle_shutdown_seconds)
             loop = asyncio.get_running_loop()
             config = uvicorn.Config(
                 app,
@@ -120,9 +136,41 @@ def serve(socket_path: str | Path | None = None, *, self_test: bool = False) -> 
             if buffered_signal is not None:
                 request_shutdown()
 
+            watchdog_task: asyncio.Task | None = None
+            if idle_shutdown_seconds is not None and idle_shutdown_seconds > 0:
+                from screencap.daemon._idle_shutdown import run_watchdog
+
+                async def _safe_watchdog() -> None:
+                    try:
+                        await run_watchdog(app, request_shutdown=request_shutdown)
+                    except asyncio.CancelledError:
+                        raise
+                    except Exception:
+                        logger.exception(
+                            "idle-shutdown watchdog raised unexpectedly; "
+                            "requesting daemon shutdown (fail-safe)"
+                        )
+                        request_shutdown()
+
+                watchdog_task = loop.create_task(_safe_watchdog())
+
+                def _watchdog_done(task: asyncio.Task) -> None:
+                    if task.cancelled():
+                        return
+                    exc = task.exception()
+                    if exc is not None:
+                        # Exception already logged inside _safe_watchdog.
+                        logger.warning(
+                            "idle-shutdown watchdog task finished with exception: %r", exc
+                        )
+
+                watchdog_task.add_done_callback(_watchdog_done)
+
             try:
                 await server_ref.serve(sockets=[listener])
             finally:
+                if watchdog_task is not None and not watchdog_task.done():
+                    watchdog_task.cancel()
                 if shutdown_task is not None and not shutdown_task.done():
                     await shutdown_task
                 listener.close()
