@@ -157,12 +157,11 @@ class MonitorAndStop:
 
 
 class Noop:
-    """Test disk policy: all hooks are safe no-ops.
+    """Disk policy that skips all space monitoring.
 
-    Used by tests that need to bypass disk monitoring. Session workers
-    currently still receive ``MonitorAndStop`` — making them actually
-    pass ``Noop`` is tracked separately (see the policy-injection
-    follow-up ticket).
+    Used by session workers (to avoid redundant ``shutil.disk_usage`` polls
+    on top of what the controller already runs) and by tests that need to
+    bypass disk preflight entirely.
     """
 
     def bind(self, capture_dir: Path) -> None:

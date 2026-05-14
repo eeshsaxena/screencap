@@ -158,8 +158,11 @@ def run_recording_worker(args: dict) -> None:
     # SIGTERM is handled by start_recording's own _sigterm_handler, which
     # calls recorder.stop() for a graceful unwind.
 
+    from screencap.engine.disk_policy import Noop as DiskNoop
     from screencap.engine.lock_policy import InheritLock
     from screencap.engine.menubar_policy import Noop as MenubarNoop
+    from screencap.engine.network_policy import Null as NetworkNull
+    from screencap.engine.permission_policy import Noop as PermNoop
     from screencap.engine.screen_recorder import IpcChannels, SigtermOnly
     from screencap.recorder import DiskFullError, start_recording
 
@@ -200,6 +203,9 @@ def run_recording_worker(args: dict) -> None:
             _menubar_policy=MenubarNoop(),
             _signal_policy=SigtermOnly(),
             _lock_policy=InheritLock(),
+            _permission_policy=PermNoop(),
+            _disk_policy=DiskNoop(),
+            _network_policy=NetworkNull(),
             network_handoff_ready=args.get("_network_handoff_ready"),
         )
     except DiskFullError as exc:
