@@ -263,12 +263,12 @@ def insert_network_event_meta(
 
 def insert_network_health(
     session: SaSession,
-    recording: Recording,
+    recording_id: int,
     event: str,
     timestamp_ns: int,
     details: str | None = None,
 ) -> None:
-    """Insert a NetworkHealth row (V1.75 proxy lifecycle observability).
+    """Insert a NetworkHealth row (proxy lifecycle observability).
 
     Failure-only, low-frequency writes. Unbuffered + immediate commit so
     the row is durable before any subsequent crash (mirrors
@@ -276,9 +276,14 @@ def insert_network_health(
     allowed event strings; the CheckConstraint on ``network_health``
     rejects anything else.
 
+    Takes ``recording_id: int`` directly (rather than a ``Recording``
+    ORM object) so cross-process writers — which open their own
+    sessions and typically hold only the integer id — can call this
+    without re-querying the Recording row.
+
     Args:
         session: The database session.
-        recording: The Recording this health row belongs to.
+        recording_id: The ID of the Recording this health row belongs to.
         event: One of ``proxy_started``, ``proxy_crashed``,
             ``kek_unavailable``, ``network_writer_failed``.
         timestamp_ns: Absolute monotonic-or-wall ns timestamp at the
@@ -290,7 +295,7 @@ def insert_network_health(
             ``proxy_started``.
     """
     row = NetworkHealth(
-        recording_id=recording.id,
+        recording_id=recording_id,
         event=event,
         timestamp_ns=timestamp_ns,
         details=details,

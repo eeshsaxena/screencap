@@ -425,24 +425,24 @@ class TestInsertNetworkHealth:
         session, recording, _ = fresh_recording
 
         crud.insert_network_health(
-            session, recording,
+            session, recording.id,
             event="proxy_started",
             timestamp_ns=1_000_000_000,
         )
         crud.insert_network_health(
-            session, recording,
+            session, recording.id,
             event="proxy_crashed",
             timestamp_ns=2_000_000_000,
             details='{"exit_code": 9, "log_tail": "..."}',
         )
         crud.insert_network_health(
-            session, recording,
+            session, recording.id,
             event="kek_unavailable",
             timestamp_ns=3_000_000_000,
             details="KekUnavailableError: Keychain entry missing",
         )
         crud.insert_network_health(
-            session, recording,
+            session, recording.id,
             event="network_writer_failed",
             timestamp_ns=4_000_000_000,
             details="OperationalError: database is locked",
@@ -475,7 +475,7 @@ class TestInsertNetworkHealth:
         recording_id = recording.id
 
         crud.insert_network_health(
-            session, recording,
+            session, recording.id,
             event="proxy_started",
             timestamp_ns=42,
         )
@@ -529,7 +529,7 @@ class TestInsertNetworkHealth:
 
         big_payload = "x" * 4096
         crud.insert_network_health(
-            session, recording,
+            session, recording.id,
             event="proxy_crashed",
             timestamp_ns=1,
             details=big_payload,
@@ -555,12 +555,12 @@ class TestInsertNetworkHealth:
         session.execute(sa.text("PRAGMA foreign_keys=ON"))
 
         crud.insert_network_health(
-            session, recording,
+            session, recording.id,
             event="proxy_started",
             timestamp_ns=1,
         )
         crud.insert_network_health(
-            session, recording,
+            session, recording.id,
             event="proxy_crashed",
             timestamp_ns=2,
         )

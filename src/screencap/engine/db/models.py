@@ -478,8 +478,9 @@ class NetworkHealth(Base):
     __tablename__ = "network_health"
     __table_args__ = (
         sa.CheckConstraint(
-            "event IN ('proxy_started', 'proxy_crashed', "
-            "'kek_unavailable', 'network_writer_failed')",
+            "event IN ({})".format(
+                ", ".join(f"'{e}'" for e in NETWORK_HEALTH_EVENTS)
+            ),
             name="ck_network_health_event",
         ),
         sa.Index(
@@ -493,13 +494,10 @@ class NetworkHealth(Base):
         sa.ForeignKey("recording.id", ondelete="CASCADE"),
         nullable=False,
     )
-    # SQLite has no native enum; native_enum=False renders as VARCHAR
-    # with a CheckConstraint (declared above).
-    event = sa.Column(
-        sa.Enum(*NETWORK_HEALTH_EVENTS, name="network_health_event",
-                native_enum=False),
-        nullable=False,
-    )
+    # Plain TEXT + CheckConstraint mirrors the NetworkEvent.kind pattern
+    # above; the constraint is the single source of truth for allowed
+    # values and stays in sync with NETWORK_HEALTH_EVENTS by construction.
+    event = sa.Column(sa.Text, nullable=False)
     timestamp_ns = sa.Column(sa.BigInteger, nullable=False)
     details = sa.Column(sa.Text, nullable=True)
 

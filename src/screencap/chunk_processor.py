@@ -174,35 +174,31 @@ class ChunkProcessor:
             self._auto_delete = False
             logger.info("Forced auto_delete=False because uploads are disabled")
 
-        # V1.75: idx → ChunkStatus. Replaces dict[int, bool] -- see
-        # ChunkStatus docstring + chunk-upload-sentinel-gating-and-data-loss.md
-        # for the four prior incidents the enum closes off.
+        # See the ChunkStatus docstring +
+        # chunk-upload-sentinel-gating-and-data-loss.md for the four
+        # prior incidents the enum closes off.
         self._chunk_results: dict[int, ChunkStatus] = {}
 
-        # V1.75 staging seam (declared here so U4/U5 have load-bearing
-        # fields to write into without re-touching __init__). U4 stages
-        # NETWORK_SKIPPED via ``setdefault``; U5 stages
-        # NETWORK_INCOMPLETE via unconditional ``=`` (precedence rule:
-        # NETWORK_INCOMPLETE > NETWORK_SKIPPED, enforced in code rather
-        # than implicitly by call order). The dict is consumed by
-        # ``_process_chunk``'s try/finally final-assignment.
+        # Staging seam: the network-decrypt path stages NETWORK_SKIPPED
+        # via ``setdefault`` and the proxy-health overlap path stages
+        # NETWORK_INCOMPLETE via unconditional ``=`` (NETWORK_INCOMPLETE
+        # > NETWORK_SKIPPED, enforced in code rather than by call
+        # order). Consumed by ``_process_chunk``'s try/finally
+        # final-assignment.
         self._pending_network_status: dict[int, ChunkStatus] = {}
 
-        # V1.75 cached network-decrypt + scrub pipeline (lazily
-        # constructed by U4 on the first body-bearing chunk).
-        # ``_network_scrub_attempted`` is a one-shot latch: a single
-        # failed construction does not retry, and a single failed
-        # construction does not poison subsequent chunks (their
-        # ``_export_events`` falls through to metadata-only).
+        # Cached network-decrypt + scrub pipeline, constructed lazily
+        # on the first body-bearing chunk. ``_network_scrub_attempted``
+        # is a one-shot latch: a single failed construction does not
+        # retry, and does not poison subsequent chunks (those fall
+        # through to the metadata-only path).
         self._network_scrub_pipeline: NetworkScrubPipeline | None = None
         self._network_scrub_attempted: bool = False
 
-        # V1.75 recording_id, used by U4/U5 to scope network_event and
-        # network_health queries to this recording. Best-effort lookup
-        # at construction time -- production callers (collaborators.py)
-        # construct the ChunkProcessor AFTER crud.insert_recording has
-        # run, so the row is present. Tests with no real recording.db
-        # fall through to None and U4 fail-softs.
+        # Recording id, used to scope network_event and network_health
+        # queries. Best-effort at construction — production callers
+        # construct the ChunkProcessor AFTER crud.insert_recording, but
+        # tests may pass a capture_dir without a real recording.db.
         self._recording_id: int | None = self._lookup_recording_id()
 
         self._status_lock = threading.Lock()
@@ -421,13 +417,18 @@ class ChunkProcessor:
             try:
                 self._process_chunk(msg)
             except Exception:
-                idx = msg.get("completed_index", -1)
                 logger.exception(f"Chunk {idx} processing failed")
                 # Defense in depth: if _process_chunk's finally block
                 # already settled the status, respect it. Only fall
                 # back to FAILED (or staged status) when the entry is
                 # still PENDING — i.e., the exception fired before the
-                # finally could write.
+                # finally could write. ``idx`` here is the same value
+                # set just above; a missing-key message produces idx is
+                # None and the setdefault was a no-op, so the early
+                # ``if idx is None`` guard below keeps phantom entries
+                # out of _chunk_results.
+                if idx is None:
+                    continue
                 current = self._chunk_results.get(idx, ChunkStatus.PENDING)
                 if current == ChunkStatus.PENDING:
                     pending = self._pending_network_status.pop(idx, None)
@@ -447,13 +448,13 @@ class ChunkProcessor:
         end_ts = msg["rotation_time"]
         is_final = msg.get("type") == "final_chunk"
 
-        # V1.75 final-assignment seam. The try/finally guarantees every
-        # exit path lands on a coherent status: success → EMITTED,
-        # upload failure → FAILED, staged network status from U4/U5 →
-        # NETWORK_SKIPPED / NETWORK_INCOMPLETE, early return from a
-        # _stop_event check → leaves the eagerly-set PENDING entry
-        # alone (Bug 2 survivorship-bias fix — PENDING in the map
-        # blocks the gate even when the chunk never reached upload).
+        # Final-assignment seam. The try/finally guarantees every exit
+        # path lands on a coherent status: success → EMITTED, upload
+        # failure → FAILED, staged network status → NETWORK_SKIPPED /
+        # NETWORK_INCOMPLETE, early return from a _stop_event check →
+        # leaves the eagerly-set PENDING entry alone (Bug 2
+        # survivorship-bias fix — PENDING in the map blocks the gate
+        # even when the chunk never reached upload).
         success = False
         reached_upload = False
         try:
@@ -547,11 +548,11 @@ class ChunkProcessor:
             freed = self._delete_old_chunks(idx, keep_recent=2)
             self._total_freed += freed
 
-        n_done = sum(
-            1 for s in self._chunk_results.values()
-            if s == ChunkStatus.EMITTED
-        )
         if self._total_freed > 0:
+            n_done = sum(
+                1 for s in self._chunk_results.values()
+                if s == ChunkStatus.EMITTED
+            )
             freed_str = _fmt_bytes(self._total_freed)
             self._set_status(f"{n_done} chunks done, {freed_str} freed")
         else:

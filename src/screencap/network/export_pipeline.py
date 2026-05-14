@@ -89,7 +89,6 @@ class NetworkExportMode(str, Enum):
 
     Plan: ``docs/plans/2026-05-14-001-feat-network-proxy-logging-v175-cloud-upload-plan.md``
         (Pre-Implementation Gate 1 + Gate 2).
-    Linear: SCR-12.
     """
 
     REQUIRE_DECRYPT = "require_decrypt"
