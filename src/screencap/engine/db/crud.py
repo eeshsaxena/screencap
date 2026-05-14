@@ -14,6 +14,7 @@ from screencap.engine.db.models import (
     MemoryStat,
     NetworkEvent,
     NetworkEventMeta,
+    NetworkHealth,
     PerformanceStat,
     Recording,
     Screenshot,
@@ -257,6 +258,44 @@ def insert_network_event_meta(
         created_at=created_at,
     )
     session.add(meta)
+    session.commit()
+
+
+def insert_network_health(
+    session: SaSession,
+    recording: Recording,
+    event: str,
+    timestamp_ns: int,
+    details: str | None = None,
+) -> None:
+    """Insert a NetworkHealth row (V1.75 proxy lifecycle observability).
+
+    Failure-only, low-frequency writes. Unbuffered + immediate commit so
+    the row is durable before any subsequent crash (mirrors
+    ``insert_network_event_meta``). Callers MUST pass one of the four
+    allowed event strings; the CheckConstraint on ``network_health``
+    rejects anything else.
+
+    Args:
+        session: The database session.
+        recording: The Recording this health row belongs to.
+        event: One of ``proxy_started``, ``proxy_crashed``,
+            ``kek_unavailable``, ``network_writer_failed``.
+        timestamp_ns: Absolute monotonic-or-wall ns timestamp at the
+            moment of the lifecycle event. Use ``time.time_ns()`` at
+            the emission site.
+        details: Optional free-text payload — typically a JSON dict
+            (exit_code + log_tail for proxy_crashed; exception type +
+            message for network_writer_failed). ``None`` for
+            ``proxy_started``.
+    """
+    row = NetworkHealth(
+        recording_id=recording.id,
+        event=event,
+        timestamp_ns=timestamp_ns,
+        details=details,
+    )
+    session.add(row)
     session.commit()
 
 

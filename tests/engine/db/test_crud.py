@@ -408,3 +408,166 @@ class TestNetworkEventAadInvariant:
             )
         # No row landed somehow - treat as pass
 
+
+# =============================================================================
+# V1.75 NetworkHealth lifecycle observability tests
+# =============================================================================
+
+
+class TestInsertNetworkHealth:
+    """V1.75: insert_network_health writes proxy lifecycle rows."""
+
+    def test_round_trip(self, fresh_recording):
+        """Insert each allowed event kind, query back, verify columns."""
+        from screencap.engine.db import crud
+        from screencap.engine.db.models import NetworkHealth
+
+        session, recording, _ = fresh_recording
+
+        crud.insert_network_health(
+            session, recording,
+            event="proxy_started",
+            timestamp_ns=1_000_000_000,
+        )
+        crud.insert_network_health(
+            session, recording,
+            event="proxy_crashed",
+            timestamp_ns=2_000_000_000,
+            details='{"exit_code": 9, "log_tail": "..."}',
+        )
+        crud.insert_network_health(
+            session, recording,
+            event="kek_unavailable",
+            timestamp_ns=3_000_000_000,
+            details="KekUnavailableError: Keychain entry missing",
+        )
+        crud.insert_network_health(
+            session, recording,
+            event="network_writer_failed",
+            timestamp_ns=4_000_000_000,
+            details="OperationalError: database is locked",
+        )
+
+        rows = (
+            session.query(NetworkHealth)
+            .order_by(NetworkHealth.timestamp_ns)
+            .all()
+        )
+        assert len(rows) == 4
+        assert [r.event for r in rows] == [
+            "proxy_started", "proxy_crashed",
+            "kek_unavailable", "network_writer_failed",
+        ]
+        assert rows[0].details is None
+        assert rows[1].details and "exit_code" in rows[1].details
+        assert rows[2].details and "Keychain" in rows[2].details
+        assert all(r.recording_id == recording.id for r in rows)
+
+    def test_commits_immediately(self, fresh_recording):
+        """insert_network_health commits per-call so failure events
+        survive a subsequent crash. Verified via a second session
+        seeing the row without an explicit commit on the first.
+        """
+        from screencap.engine.db import crud, get_session_for_path
+        from screencap.engine.db.models import NetworkHealth
+
+        session, recording, db_path = fresh_recording
+        recording_id = recording.id
+
+        crud.insert_network_health(
+            session, recording,
+            event="proxy_started",
+            timestamp_ns=42,
+        )
+
+        # Open a brand-new session against the same DB; the row must be
+        # visible without any further commit from the first session.
+        other = get_session_for_path(db_path)
+        try:
+            rows = (
+                other.query(NetworkHealth)
+                .filter(NetworkHealth.recording_id == recording_id)
+                .all()
+            )
+            assert len(rows) == 1
+            assert rows[0].event == "proxy_started"
+            assert rows[0].timestamp_ns == 42
+        finally:
+            other.close()
+
+    def test_invalid_event_rejected(self, fresh_recording):
+        """CheckConstraint rejects events outside the four allowed values."""
+        import sqlalchemy as sa
+
+        from screencap.engine.db import crud
+
+        session, recording, _ = fresh_recording
+
+        # SQLAlchemy's non-native Enum coerces unknown strings to a
+        # client-side ValueError before the SQL ever runs; the test
+        # accepts either that or the underlying CheckConstraint surface.
+        raised = False
+        try:
+            crud.insert_network_health(
+                session, recording,
+                event="totally-not-allowed",
+                timestamp_ns=1,
+            )
+        except (sa.exc.IntegrityError, sa.exc.StatementError, ValueError, LookupError):
+            raised = True
+        assert raised, (
+            "Either the SQL CHECK constraint or the SQLAlchemy Enum coercion "
+            "must reject an event string outside NETWORK_HEALTH_EVENTS."
+        )
+
+    def test_details_accepts_large_payload(self, fresh_recording):
+        """``details`` is TEXT and must accept >1 KB stack traces without truncation."""
+        from screencap.engine.db import crud
+        from screencap.engine.db.models import NetworkHealth
+
+        session, recording, _ = fresh_recording
+
+        big_payload = "x" * 4096
+        crud.insert_network_health(
+            session, recording,
+            event="proxy_crashed",
+            timestamp_ns=1,
+            details=big_payload,
+        )
+
+        row = session.query(NetworkHealth).one()
+        assert row.details == big_payload
+        assert len(row.details) == 4096
+
+    def test_cascade_on_recording_delete(self, fresh_recording):
+        """Deleting the parent Recording cascades and removes NetworkHealth rows.
+
+        Requires ``PRAGMA foreign_keys=ON`` (SQLite default is OFF). The
+        ``ondelete="CASCADE"`` clause on the FK column is the load-bearing
+        contract; this test verifies it actually fires.
+        """
+        import sqlalchemy as sa
+
+        from screencap.engine.db import crud
+        from screencap.engine.db.models import NetworkHealth, Recording
+
+        session, recording, _ = fresh_recording
+        session.execute(sa.text("PRAGMA foreign_keys=ON"))
+
+        crud.insert_network_health(
+            session, recording,
+            event="proxy_started",
+            timestamp_ns=1,
+        )
+        crud.insert_network_health(
+            session, recording,
+            event="proxy_crashed",
+            timestamp_ns=2,
+        )
+        assert session.query(NetworkHealth).count() == 2
+
+        # Deleting the recording must cascade-delete the health rows.
+        session.delete(session.query(Recording).filter_by(id=recording.id).one())
+        session.commit()
+
+        assert session.query(NetworkHealth).count() == 0

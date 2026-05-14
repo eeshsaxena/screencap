@@ -174,7 +174,7 @@ def _migrate_schema(db_path: str) -> None:
 
 
 def _ensure_network_tables(engine) -> bool:
-    """Idempotently create network_event and network_event_meta tables if missing.
+    """Idempotently create network_event, network_event_meta, and network_health.
 
     `Table.create(engine, checkfirst=True)` is a no-op when the table
     already exists, so this is safe to invoke unconditionally on every
@@ -189,13 +189,18 @@ def _ensure_network_tables(engine) -> bool:
     table; the export pipeline detects absence and falls back to the
     metadata-only path.
 
+    V1.75 extends this further to also create `network_health` (proxy
+    lifecycle and failure observability). The chunk processor reads this
+    table at export time to mark chunks overlapping a proxy crash as
+    NETWORK_INCOMPLETE.
+
     Readonly DBs (e.g. `chmod 444`) raise `sqlalchemy.exc.OperationalError`
     matching "readonly database" or "attempt to write a readonly database".
     On readonly: skip migration, return False so the caller can mark the
     capture as network-unavailable. Other exceptions propagate.
 
     Returns:
-        True if both tables are present (created or already existed),
+        True if all three tables are present (created or already existed),
         False if the DB is readonly (creation skipped).
     """
     from screencap.engine.db import models  # noqa: F401 - registers models
@@ -203,6 +208,7 @@ def _ensure_network_tables(engine) -> bool:
     try:
         models.NetworkEvent.__table__.create(engine, checkfirst=True)
         models.NetworkEventMeta.__table__.create(engine, checkfirst=True)
+        models.NetworkHealth.__table__.create(engine, checkfirst=True)
         return True
     except sa.exc.OperationalError as e:
         msg = str(e).lower()

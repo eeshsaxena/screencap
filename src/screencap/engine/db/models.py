@@ -87,6 +87,12 @@ class Recording(Base):
         uselist=False,
         cascade="all, delete-orphan",
     )
+    network_health = sa.orm.relationship(
+        "NetworkHealth",
+        back_populates="recording",
+        order_by="NetworkHealth.timestamp_ns",
+        cascade="all, delete-orphan",
+    )
 
 
 class ActionEvent(Base):
@@ -431,3 +437,70 @@ class NetworkEventMeta(Base):
     created_at = sa.Column(ForceFloat, nullable=False)
 
     recording = sa.orm.relationship("Recording", back_populates="network_event_meta")
+
+
+# Allowed values for NetworkHealth.event. Failure-only, low-frequency
+# proxy lifecycle observability. Readers in chunk_processor mark chunks
+# whose time window overlaps a proxy_crashed or network_writer_failed
+# row as NETWORK_INCOMPLETE; proxy_started is informational only;
+# kek_unavailable is the chunk-processor fail-soft signal that bodies
+# could not be decrypted at export time.
+NETWORK_HEALTH_EVENTS = (
+    "proxy_started",
+    "proxy_crashed",
+    "kek_unavailable",
+    "network_writer_failed",
+)
+
+
+class NetworkHealth(Base):
+    """Proxy / network-writer lifecycle and failure events (V1.75).
+
+    Failure-only, low-frequency writes. The chunk processor reads this
+    table at export time to mark chunks whose time window overlaps a
+    ``proxy_crashed`` or ``network_writer_failed`` row as
+    ``NETWORK_INCOMPLETE``. ``proxy_started`` is informational and does
+    NOT trigger NETWORK_INCOMPLETE; ``kek_unavailable`` is the
+    chunk-processor fail-soft signal when bodies could not be decrypted
+    at export time.
+
+    Writes use direct DB inserts (raw sqlite3 or unbuffered SQLAlchemy
+    commit). The daemon EventBus is intentionally NOT used — see
+    ``docs/solutions/runtime-errors/eventbus-late-listener-replay-2026-05-12.md``
+    for the late-listener race the DB-only approach side-steps.
+
+    ``details`` is an optional free-text payload (typically a serialised
+    JSON dict — exit_code + log_tail for proxy_crashed; exception type +
+    message for network_writer_failed). Stored as TEXT so a >1KB stack
+    trace fits without truncation.
+    """
+
+    __tablename__ = "network_health"
+    __table_args__ = (
+        sa.CheckConstraint(
+            "event IN ('proxy_started', 'proxy_crashed', "
+            "'kek_unavailable', 'network_writer_failed')",
+            name="ck_network_health_event",
+        ),
+        sa.Index(
+            "ix_network_health_recording_ts",
+            "recording_id", "timestamp_ns",
+        ),
+    )
+
+    id = sa.Column(sa.Integer, primary_key=True)
+    recording_id = sa.Column(
+        sa.ForeignKey("recording.id", ondelete="CASCADE"),
+        nullable=False,
+    )
+    # SQLite has no native enum; native_enum=False renders as VARCHAR
+    # with a CheckConstraint (declared above).
+    event = sa.Column(
+        sa.Enum(*NETWORK_HEALTH_EVENTS, name="network_health_event",
+                native_enum=False),
+        nullable=False,
+    )
+    timestamp_ns = sa.Column(sa.BigInteger, nullable=False)
+    details = sa.Column(sa.Text, nullable=True)
+
+    recording = sa.orm.relationship("Recording", back_populates="network_health")
