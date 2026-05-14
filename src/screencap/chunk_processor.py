@@ -10,6 +10,7 @@ from __future__ import annotations
 import json
 import logging
 import os
+import sqlite3
 import threading
 import time
 from enum import Enum
@@ -17,7 +18,7 @@ from pathlib import Path
 from typing import TYPE_CHECKING
 
 from screencap._flush import wait_for_writer_flush
-from screencap.recording_db import OperationalError, open_recording_db
+from screencap.recording_db import open_recording_db
 
 if TYPE_CHECKING:
     from screencap.network.export_pipeline import NetworkScrubPipeline
@@ -184,7 +185,7 @@ class ChunkProcessor:
         # NETWORK_INCOMPLETE via unconditional ``=`` (NETWORK_INCOMPLETE
         # > NETWORK_SKIPPED, enforced in code rather than by call
         # order). Consumed by ``_process_chunk``'s try/finally
-        # final-assignment.
+        # final-assignment. Populated by U4/U5; always empty in this branch.
         self._pending_network_status: dict[int, ChunkStatus] = {}
 
         # Cached network-decrypt + scrub pipeline, constructed lazily
@@ -221,7 +222,9 @@ class ChunkProcessor:
                     "SELECT id FROM recording LIMIT 1"
                 ).fetchone()
                 return int(row[0]) if row is not None else None
-        except (FileNotFoundError, OperationalError):
+        except (FileNotFoundError, sqlite3.DatabaseError):
+            # DatabaseError is the parent of OperationalError; also covers
+            # corrupt / zero-byte recording.db (raises DatabaseError directly).
             return None
 
     @property
@@ -296,6 +299,12 @@ class ChunkProcessor:
         ``docs/solutions/runtime-errors/chunk-upload-sentinel-gating-and-data-loss.md``
         Bug 4 routed through reconcile.
 
+        ``PENDING`` entries are also excluded: a force-stopped chunk
+        mid-upload may have partially landed in GCS, but signed-URL
+        probes alone cannot distinguish a partial upload from a
+        never-attempted one, so reconcile leaves PENDING as-is rather
+        than risk a false EMITTED promotion.
+
         Must only be called after stop(). Returns the number of
         entries flipped from FAILED to EMITTED.
         """
@@ -351,8 +360,10 @@ class ChunkProcessor:
     def was_force_stopped(self) -> bool:
         """True if stop() timed out and had to force-stop the thread.
 
-        When True, _chunk_results may be incomplete — a chunk that was
-        mid-processing when _stop_event fired will have no entry.
+        When True, _chunk_results may contain ChunkStatus.PENDING entries for
+        chunks that were mid-processing when _stop_event fired. The sentinel
+        gate predicate rejects PENDING explicitly, so those chunks are never
+        counted as successfully uploaded.
         """
         return self._stop_event.is_set()
 
@@ -423,14 +434,13 @@ class ChunkProcessor:
                 # back to FAILED (or staged status) when the entry is
                 # still PENDING — i.e., the exception fired before the
                 # finally could write. ``idx`` here is the same value
-                # set just above; a missing-key message produces idx is
-                # None and the setdefault was a no-op, so the early
-                # ``if idx is None`` guard below keeps phantom entries
-                # out of _chunk_results.
+                # set just above; idx is None means no PENDING entry was
+                # created above; skip status settlement.
                 if idx is None:
                     continue
                 current = self._chunk_results.get(idx, ChunkStatus.PENDING)
                 if current == ChunkStatus.PENDING:
+                    # Written by U4 (network row export) / U5 (NetworkHealth overlap); always None in this branch.
                     pending = self._pending_network_status.pop(idx, None)
                     self._chunk_results[idx] = (
                         pending if pending is not None else ChunkStatus.FAILED
@@ -443,7 +453,7 @@ class ChunkProcessor:
                 "this would cause silent data loss"
             )
 
-        idx = msg["completed_index"]
+        idx = msg.get("completed_index")
         start_ts = msg["chunk_start_time"]
         end_ts = msg["rotation_time"]
         is_final = msg.get("type") == "final_chunk"
@@ -525,17 +535,19 @@ class ChunkProcessor:
             # U4 (NETWORK_SKIPPED) and U5 (NETWORK_INCOMPLETE) takes
             # precedence over EMITTED so the network signal stays
             # visible at the sentinel gate.
-            pending = self._pending_network_status.pop(idx, None)
-            if pending is not None:
-                self._chunk_results[idx] = pending
-            elif reached_upload:
-                self._chunk_results[idx] = (
-                    ChunkStatus.EMITTED if success else ChunkStatus.FAILED
-                )
-            # else: leave PENDING (eagerly set on rotation receipt).
-            # This is the survivorship-bias fix — force-stop early
-            # return now leaves a non-missing entry that the
-            # EMITTED-only gate explicitly rejects.
+            if idx is not None:
+                # Written by U4 (network row export) / U5 (NetworkHealth overlap); always None in this branch.
+                pending = self._pending_network_status.pop(idx, None)
+                if pending is not None:
+                    self._chunk_results[idx] = pending
+                elif reached_upload:
+                    self._chunk_results[idx] = (
+                        ChunkStatus.EMITTED if success else ChunkStatus.FAILED
+                    )
+                # else: leave PENDING (eagerly set on rotation receipt).
+                # This is the survivorship-bias fix — force-stop early
+                # return now leaves a non-missing entry that the
+                # EMITTED-only gate explicitly rejects.
 
         # 7. Delete old chunks (keep 2 most recent). Only EMITTED chunks
         # are safe to delete locally — NETWORK_SKIPPED and

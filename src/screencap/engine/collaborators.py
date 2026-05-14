@@ -514,10 +514,10 @@ class RecordingCollaborators:
         all_uploaded = (
             cp.all_chunks_uploaded() and not cp.was_force_stopped
         )
-        n_uploaded, n_total = cp.upload_summary()
+        n_emitted, n_total = cp.upload_summary()
         n_chunks = len(list(capture_dir.glob("chunk_*_manifest.json")))
         result["all_chunks_uploaded"] = all_uploaded
-        result["n_uploaded"] = n_uploaded
+        result["n_uploaded"] = n_emitted
         result["n_total"] = n_total
         result["n_chunks"] = n_chunks
         result["upload_warning"] = cp.upload_warning

@@ -12,6 +12,7 @@ from screencap.engine.db.models import (
     ActionEvent,
     AudioInfo,
     MemoryStat,
+    NETWORK_HEALTH_EVENTS,
     NetworkEvent,
     NetworkEventMeta,
     NetworkHealth,
@@ -286,6 +287,11 @@ def insert_network_health(
         recording_id: The ID of the Recording this health row belongs to.
         event: One of ``proxy_started``, ``proxy_crashed``,
             ``kek_unavailable``, ``network_writer_failed``.
+            Raises ``ValueError`` if an unknown event string is passed;
+            this makes the Python layer authoritative on the allowlist so
+            future event additions in ``NETWORK_HEALTH_EVENTS`` work on
+            legacy DBs where the CHECK constraint cannot be retroactively
+            added.
         timestamp_ns: Absolute monotonic-or-wall ns timestamp at the
             moment of the lifecycle event. Use ``time.time_ns()`` at
             the emission site.
@@ -293,7 +299,15 @@ def insert_network_health(
             (exit_code + log_tail for proxy_crashed; exception type +
             message for network_writer_failed). ``None`` for
             ``proxy_started``.
+
+    Raises:
+        ValueError: if ``event`` is not in ``NETWORK_HEALTH_EVENTS``.
     """
+    if event not in NETWORK_HEALTH_EVENTS:
+        raise ValueError(
+            f"insert_network_health: unknown event {event!r}; "
+            f"must be one of {NETWORK_HEALTH_EVENTS}"
+        )
     row = NetworkHealth(
         recording_id=recording_id,
         event=event,

@@ -2098,6 +2098,65 @@ class TestRunLoopEagerPending:
 
         assert cp._chunk_results.get(3) == ChunkStatus.FAILED
 
+    def test_outer_handler_uses_staged_status_before_falling_back_to_failed(
+        self, capture_dir,
+    ):
+        """If ``_pending_network_status[idx]`` is set when ``_process_chunk``
+        raises before its own finally block, the outer ``_run`` handler must
+        consume the staged value instead of falling back to ``FAILED``.
+
+        This exercises the branch at lines 441-445 of chunk_processor.py:
+
+            current = self._chunk_results.get(idx, ChunkStatus.PENDING)
+            if current == ChunkStatus.PENDING:
+                pending = self._pending_network_status.pop(idx, None)
+                self._chunk_results[idx] = (
+                    pending if pending is not None else ChunkStatus.FAILED
+                )
+
+        A future refactor that moves staging out of ``_process_chunk`` into
+        ``_run`` would silently regress without this test.
+        """
+        from screencap.chunk_processor import ChunkProcessor, ChunkStatus
+
+        chunk_q = multiprocessing.Queue()
+        audio_q = multiprocessing.Queue()
+        cp = ChunkProcessor(
+            capture_dir, chunk_q, audio_q,
+            recording_name="rec",
+            upload_enabled=False, auto_delete=False,
+        )
+
+        # Pre-stage NETWORK_INCOMPLETE so the outer handler picks it up.
+        cp._pending_network_status[3] = ChunkStatus.NETWORK_INCOMPLETE
+
+        # Replace _process_chunk with one that raises before any try/finally
+        # can write to _chunk_results.  The outer _run handler must then
+        # consult _pending_network_status.
+        def boom_before_finally(msg):
+            raise RuntimeError("boom — pre-try crash")
+
+        cp._process_chunk = boom_before_finally
+        cp.start()
+        chunk_q.put({
+            "type": "chunk_rotated",
+            "completed_index": 3,
+            "chunk_start_time": 0.0,
+            "rotation_time": 1.0,
+        })
+        chunk_q.put({"type": "poison_pill"})
+        cp._thread.join(timeout=10)
+
+        # Outer handler must have used the staged NETWORK_INCOMPLETE rather
+        # than defaulting to FAILED.
+        assert cp._chunk_results.get(3) == ChunkStatus.NETWORK_INCOMPLETE, (
+            "_run outer handler must consult _pending_network_status before "
+            "falling back to FAILED. Observed: "
+            + str(cp._chunk_results.get(3))
+        )
+        # Staging dict must be consumed so it does not grow unbounded.
+        assert 3 not in cp._pending_network_status
+
 
 class TestForceStopDominatesStatusMap:
     """V1.75: ``was_force_stopped`` still dominates the sentinel gate.

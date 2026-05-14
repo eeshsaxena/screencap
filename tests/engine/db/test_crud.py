@@ -509,7 +509,7 @@ class TestInsertNetworkHealth:
         raised = False
         try:
             crud.insert_network_health(
-                session, recording,
+                session, recording.id,
                 event="totally-not-allowed",
                 timestamp_ns=1,
             )

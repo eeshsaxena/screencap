@@ -60,6 +60,7 @@ def _set_sqlite_pragmas(dbapi_conn, connection_record):
     cursor.execute("PRAGMA synchronous=NORMAL")
     cursor.execute("PRAGMA cache_size=-64000")
     cursor.execute("PRAGMA busy_timeout=5000")
+    cursor.execute("PRAGMA foreign_keys=ON")
     cursor.close()
 
 
@@ -173,7 +174,7 @@ def _migrate_schema(db_path: str) -> None:
     conn.close()
 
 
-def _ensure_network_tables(engine) -> bool:
+def _ensure_network_tables(engine: sa.engine.Engine) -> bool:
     """Idempotently create network_event, network_event_meta, and network_health.
 
     `Table.create(engine, checkfirst=True)` is a no-op when the table
