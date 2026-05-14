@@ -634,3 +634,69 @@ def _make_ws_frame_event(
         body_nonce=nonce,
         body_aad=aad,
     )
+
+
+# =============================================================================
+# V1.75 NetworkExportMode enum tests
+# =============================================================================
+
+
+class TestNetworkExportMode:
+    """V1.75: declarative fail-loud vs fail-soft contract for callers."""
+
+    def test_members_exist_with_expected_values(self):
+        """Both REQUIRE_DECRYPT and METADATA_ONLY exist with stable string values.
+
+        The string values are the on-wire / config form and must not
+        change without coordinated migration of any caller that reads
+        them from config; lock them with this test.
+        """
+        from screencap.network.export_pipeline import NetworkExportMode
+
+        assert NetworkExportMode.REQUIRE_DECRYPT.value == "require_decrypt"
+        assert NetworkExportMode.METADATA_ONLY.value == "metadata_only"
+        # Exactly two members — U4/U8 callers branch on these.
+        assert set(NetworkExportMode) == {
+            NetworkExportMode.REQUIRE_DECRYPT,
+            NetworkExportMode.METADATA_ONLY,
+        }
+
+    def test_is_str_enum(self):
+        """str-enum mixin lets value-based comparison work with raw strings.
+
+        Useful for legacy config flows where the value might survive as
+        a plain string through JSON/CLI roundtrips.
+        """
+        from screencap.network.export_pipeline import NetworkExportMode
+
+        assert NetworkExportMode.REQUIRE_DECRYPT == "require_decrypt"
+        assert NetworkExportMode.METADATA_ONLY == "metadata_only"
+        # And the inverse — string lookup yields the enum.
+        assert NetworkExportMode("require_decrypt") is NetworkExportMode.REQUIRE_DECRYPT
+        assert NetworkExportMode("metadata_only") is NetworkExportMode.METADATA_ONLY
+
+    def test_unknown_value_rejected(self):
+        """Constructing from an unknown string raises ValueError.
+
+        Guards against silent acceptance of typo'd or stale config values.
+        """
+        from screencap.network.export_pipeline import NetworkExportMode
+
+        with pytest.raises(ValueError):
+            NetworkExportMode("require-decrypt")  # hyphen, not underscore
+
+    def test_docstring_references_plan_rationale(self):
+        """Pin the rationale at the enum so callers can follow the
+        contract back to its origin without grepping.
+
+        Pattern from
+        ``docs/solutions/integration-issues/mitmproxy-ignore-hosts-tunneling-all-flows-2026-04-29.md``.
+        """
+        from screencap.network.export_pipeline import NetworkExportMode
+
+        assert NetworkExportMode.__doc__ is not None
+        # The docstring must mention both fail-modes and reference the plan.
+        for needle in ("REQUIRE_DECRYPT", "METADATA_ONLY", "fail-loud", "fail-soft"):
+            assert needle in NetworkExportMode.__doc__, (
+                f"NetworkExportMode docstring missing rationale anchor: {needle!r}"
+            )

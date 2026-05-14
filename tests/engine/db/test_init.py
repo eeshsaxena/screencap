@@ -224,6 +224,75 @@ class TestEnsureNetworkTables:
         finally:
             conn.close()
 
+    def test_v1_75_creates_network_health(self, legacy_capture_dir):
+        """V1.75: _ensure_network_tables also creates network_health.
+
+        Old recordings that never had proxy-lifecycle observability will
+        simply not have any rows in this table; the chunk processor
+        treats absence-of-row as "no incident" at export time.
+        """
+        from screencap.engine.capture import Capture
+
+        capture = Capture.load(legacy_capture_dir)
+        capture.close()
+
+        db_path = legacy_capture_dir / "recording.db"
+        conn = sqlite3.connect(str(db_path))
+        try:
+            cur = conn.execute(
+                "SELECT name FROM sqlite_master WHERE type='table' "
+                "AND name='network_health'"
+            )
+            assert cur.fetchone() is not None, (
+                "V1.75: network_health should be created by "
+                "_ensure_network_tables."
+            )
+            cur = conn.execute("PRAGMA table_info(network_health)")
+            cols = {row[1] for row in cur.fetchall()}
+            for required in ("recording_id", "event", "timestamp_ns", "details"):
+                assert required in cols, (
+                    f"network_health is missing required column {required}"
+                )
+
+            # The (recording_id, timestamp_ns) compound index backs the
+            # chunk-overlap query in U5; verify it landed.
+            cur = conn.execute("PRAGMA index_list(network_health)")
+            index_names = {row[1] for row in cur.fetchall()}
+            assert "ix_network_health_recording_ts" in index_names, (
+                "V1.75: ix_network_health_recording_ts must back the "
+                "chunk overlap query."
+            )
+        finally:
+            conn.close()
+
+    def test_ensure_network_tables_idempotent_on_health(self, legacy_capture_dir):
+        """V1.75: second call to _ensure_network_tables must be a no-op for health."""
+        from screencap.engine.capture import Capture
+
+        capture1 = Capture.load(legacy_capture_dir)
+        capture1.close()
+
+        capture2 = Capture.load(legacy_capture_dir)
+        try:
+            assert capture2._recording is not None
+        finally:
+            capture2.close()
+
+        db_path = legacy_capture_dir / "recording.db"
+        conn = sqlite3.connect(str(db_path))
+        try:
+            for table_name in (
+                "network_event", "network_event_meta", "network_health",
+            ):
+                cur = conn.execute(
+                    "SELECT name FROM sqlite_master WHERE type='table' "
+                    "AND name=?",
+                    (table_name,),
+                )
+                assert cur.fetchone() is not None, f"{table_name} should still exist"
+        finally:
+            conn.close()
+
 
 class TestReadonlyDatabase:
     """V1: readonly recording.db must not crash; flag is set on Capture."""

@@ -44,6 +44,7 @@ Unit 6 (V1.5 portion).
 from __future__ import annotations
 
 import logging
+from enum import Enum
 from typing import Any
 
 logger = logging.getLogger(__name__)
@@ -58,6 +59,40 @@ class KekUnavailableError(Exception):
     fail-loud vs fail-soft. Explicit ``screencap export`` is fail-loud
     per the locked decision in the V1.5 ticket.
     """
+
+
+class NetworkExportMode(str, Enum):
+    """How an export caller wants the network-body path to behave on
+    KEK unavailability (V1.75).
+
+    ``REQUIRE_DECRYPT`` -- fail-loud. The caller has asked to see body
+    plaintext; if the KEK cannot be retrieved (Keychain entry missing,
+    locked, or backend unavailable), surface
+    :class:`KekUnavailableError` to the user so they can remediate. This
+    is the contract for explicit ``screencap export <recording>``: the
+    user invoked the command to see bodies, so silent absence is the
+    wrong default.
+
+    ``METADATA_ONLY`` -- fail-soft. The caller prefers recording
+    survival over body fidelity. On KEK unavailability the pipeline
+    constructor is skipped, ``body_text`` is emitted as ``None``, and a
+    ``NetworkHealth(event="kek_unavailable")`` row is recorded once per
+    recording. This is the contract for the chunk processor's
+    live-upload path: aborting the recording mid-flight to demand a
+    KEK is worse than shipping metadata-only chunks.
+
+    The mode is declarative metadata for V1.75 -- the actual fail-loud
+    vs fail-soft branch lives at the
+    :class:`NetworkScrubPipeline`-construction call site. See the plan's
+    Pre-Implementation Gates for the cloud-bucket-policy + V1.5
+    false-negative analysis upstream of this contract.
+
+    Plan: ``docs/plans/2026-05-14-001-feat-network-proxy-logging-v175-cloud-upload-plan.md``
+        (Pre-Implementation Gate 1 + Gate 2).
+    """
+
+    REQUIRE_DECRYPT = "require_decrypt"
+    METADATA_ONLY = "metadata_only"
 
 
 class NetworkScrubPipeline:
