@@ -1437,10 +1437,11 @@ class TestUnlistedMarker:
 
 
 class TestReconcileAgainstGcs:
-    """After stop(), flip _chunk_results[idx] to True for chunks whose core
-    files are all present in GCS. _upload_chunk() returns False on any
-    single per-file PUT exception, but the other files stay in the
-    bucket — the counter must reflect that."""
+    """After stop(), flip ``_chunk_results[idx]`` from ``FAILED`` to ``EMITTED``
+    for chunks whose core files are all present in GCS. ``_upload_chunk()``
+    returns False on any single per-file PUT exception, but the other files
+    stay in the bucket — the counter must reflect that.
+    """
 
     def _make_chunk_files(self, capture_dir: Path, idx: int) -> None:
         """Write non-empty core files for chunk `idx` on disk."""
@@ -1464,10 +1465,12 @@ class TestReconcileAgainstGcs:
             auto_delete=False,
         )
 
-    def test_flips_false_to_true_when_all_files_already_uploaded(self, capture_dir):
-        """Server says url=None for every core file → flip to True."""
+    def test_flips_failed_to_emitted_when_all_files_already_uploaded(self, capture_dir):
+        """Server says url=None for every core file → flip FAILED to EMITTED."""
+        from screencap.chunk_processor import ChunkStatus
+
         cp = self._make_cp(capture_dir)
-        cp._chunk_results[1] = False
+        cp._chunk_results[1] = ChunkStatus.FAILED
         self._make_chunk_files(capture_dir, 1)
 
         all_already_uploaded = {
@@ -1483,12 +1486,14 @@ class TestReconcileAgainstGcs:
             flipped = cp.reconcile_against_gcs()
 
         assert flipped == 1
-        assert cp._chunk_results[1] is True
+        assert cp._chunk_results[1] == ChunkStatus.EMITTED
 
-    def test_keeps_false_when_one_file_missing_from_gcs(self, capture_dir):
-        """Server returns a fresh URL for one file → chunk stays False."""
+    def test_keeps_failed_when_one_file_missing_from_gcs(self, capture_dir):
+        """Server returns a fresh URL for one file → chunk stays FAILED."""
+        from screencap.chunk_processor import ChunkStatus
+
         cp = self._make_cp(capture_dir)
-        cp._chunk_results[1] = False
+        cp._chunk_results[1] = ChunkStatus.FAILED
         self._make_chunk_files(capture_dir, 1)
 
         partial = {
@@ -1504,13 +1509,15 @@ class TestReconcileAgainstGcs:
             flipped = cp.reconcile_against_gcs()
 
         assert flipped == 0
-        assert cp._chunk_results[1] is False
+        assert cp._chunk_results[1] == ChunkStatus.FAILED
 
-    def test_skips_already_successful_chunks(self, capture_dir):
-        """Chunks already True are not re-checked."""
+    def test_skips_already_emitted_chunks(self, capture_dir):
+        """Chunks already EMITTED are not re-checked."""
+        from screencap.chunk_processor import ChunkStatus
+
         cp = self._make_cp(capture_dir)
-        cp._chunk_results[0] = True
-        cp._chunk_results[1] = False
+        cp._chunk_results[0] = ChunkStatus.EMITTED
+        cp._chunk_results[1] = ChunkStatus.FAILED
         self._make_chunk_files(capture_dir, 1)
 
         calls: list[str] = []
@@ -1527,10 +1534,55 @@ class TestReconcileAgainstGcs:
 
         assert len(calls) == 1  # only chunk 1 queried, not chunk 0
 
+    def test_does_not_flip_network_skipped(self, capture_dir):
+        """``NETWORK_SKIPPED`` is terminal-non-EMITTED. Even though the core
+        files may all be in GCS, reconcile MUST NOT relabel them as EMITTED
+        — that would silently erase the network-skip signal at the gate.
+
+        Regression guard for the prior-incident pattern routed through
+        reconcile: ``s != EMITTED`` iteration would call request_signed_urls,
+        every core file would come back ``url=None``, the all() check would
+        pass, and the chunk would relabel ``EMITTED`` — Bug 4 shape.
+        """
+        from screencap.chunk_processor import ChunkStatus
+
+        cp = self._make_cp(capture_dir)
+        cp._chunk_results[1] = ChunkStatus.NETWORK_SKIPPED
+        self._make_chunk_files(capture_dir, 1)
+
+        with mock.patch(
+            "screencap.upload.request_signed_urls",
+            side_effect=AssertionError("reconcile must not query NETWORK_SKIPPED"),
+        ):
+            flipped = cp.reconcile_against_gcs()
+
+        assert flipped == 0
+        assert cp._chunk_results[1] == ChunkStatus.NETWORK_SKIPPED
+
+    def test_does_not_flip_network_incomplete(self, capture_dir):
+        """``NETWORK_INCOMPLETE`` mirrors ``NETWORK_SKIPPED``: terminal-non-
+        EMITTED, must survive reconcile unchanged."""
+        from screencap.chunk_processor import ChunkStatus
+
+        cp = self._make_cp(capture_dir)
+        cp._chunk_results[1] = ChunkStatus.NETWORK_INCOMPLETE
+        self._make_chunk_files(capture_dir, 1)
+
+        with mock.patch(
+            "screencap.upload.request_signed_urls",
+            side_effect=AssertionError("reconcile must not query NETWORK_INCOMPLETE"),
+        ):
+            flipped = cp.reconcile_against_gcs()
+
+        assert flipped == 0
+        assert cp._chunk_results[1] == ChunkStatus.NETWORK_INCOMPLETE
+
     def test_returns_zero_when_uploads_disabled(self, capture_dir):
         """Don't hit the network when uploads are disabled."""
+        from screencap.chunk_processor import ChunkStatus
+
         cp = self._make_cp(capture_dir, upload_enabled=False)
-        cp._chunk_results[1] = False
+        cp._chunk_results[1] = ChunkStatus.FAILED
         self._make_chunk_files(capture_dir, 1)
 
         with mock.patch(
@@ -1540,12 +1592,14 @@ class TestReconcileAgainstGcs:
             flipped = cp.reconcile_against_gcs()
 
         assert flipped == 0
-        assert cp._chunk_results[1] is False
+        assert cp._chunk_results[1] == ChunkStatus.FAILED
 
     def test_skips_chunks_with_no_files_on_disk(self, capture_dir):
         """If the chunk's local files are gone, no reconciliation is possible."""
+        from screencap.chunk_processor import ChunkStatus
+
         cp = self._make_cp(capture_dir)
-        cp._chunk_results[1] = False
+        cp._chunk_results[1] = ChunkStatus.FAILED
         # No files on disk for chunk 1.
 
         with mock.patch(
@@ -1555,13 +1609,15 @@ class TestReconcileAgainstGcs:
             flipped = cp.reconcile_against_gcs()
 
         assert flipped == 0
-        assert cp._chunk_results[1] is False
+        assert cp._chunk_results[1] == ChunkStatus.FAILED
 
     def test_swallows_request_signed_urls_errors(self, capture_dir):
         """A transient failure during reconcile must not raise — we still
         want to print the counter with the best info we have."""
+        from screencap.chunk_processor import ChunkStatus
+
         cp = self._make_cp(capture_dir)
-        cp._chunk_results[1] = False
+        cp._chunk_results[1] = ChunkStatus.FAILED
         self._make_chunk_files(capture_dir, 1)
 
         with mock.patch(
@@ -1571,4 +1627,504 @@ class TestReconcileAgainstGcs:
             flipped = cp.reconcile_against_gcs()
 
         assert flipped == 0
-        assert cp._chunk_results[1] is False
+        assert cp._chunk_results[1] == ChunkStatus.FAILED
+
+
+# ---------------------------------------------------------------------------
+# V1.75 ChunkStatus migration tests
+# ---------------------------------------------------------------------------
+
+
+class TestChunkStatusGate:
+    """V1.75: ``all_chunks_uploaded()`` must compare against EMITTED only.
+
+    Regression coverage for the four prior incidents documented in
+    ``docs/solutions/runtime-errors/chunk-upload-sentinel-gating-and-data-loss.md``.
+    Every non-EMITTED status must block the sentinel gate.
+    """
+
+    def _make_cp(self, capture_dir):
+        from screencap.chunk_processor import ChunkProcessor
+
+        q = multiprocessing.Queue()
+        ack_q = multiprocessing.Queue()
+        return ChunkProcessor(
+            capture_dir, q, ack_q,
+            recording_name="rec",
+            upload_enabled=True,
+            auto_delete=False,
+        )
+
+    def test_pending_blocks_sentinel(self, capture_dir):
+        """``PENDING`` blocks the gate — survivorship-bias fix.
+
+        Force-stop leaves a ``PENDING`` entry (eagerly set on rotation
+        message receipt). Without this regression test, a future
+        refactor could re-introduce Bug 2: incomplete state treated as
+        complete because the entry is "truthy".
+        """
+        from screencap.chunk_processor import ChunkStatus
+
+        cp = self._make_cp(capture_dir)
+        cp._chunk_results[0] = ChunkStatus.PENDING
+        cp._chunk_results[1] = ChunkStatus.EMITTED
+        assert cp.all_chunks_uploaded() is False
+
+    def test_failed_blocks_sentinel(self, capture_dir):
+        """Regression for prior-incident Bug 1: failed chunks must block."""
+        from screencap.chunk_processor import ChunkStatus
+
+        cp = self._make_cp(capture_dir)
+        cp._chunk_results[0] = ChunkStatus.FAILED
+        assert cp.all_chunks_uploaded() is False
+
+    def test_network_skipped_blocks_sentinel(self, capture_dir):
+        """V1.75: ``NETWORK_SKIPPED`` is terminal-non-EMITTED.
+
+        Per ``chunk-upload-sentinel-gating-and-data-loss.md`` fix #4:
+        "disabled ≠ succeeded". A chunk whose body-encryption was
+        unavailable at export time must not be conflated with an
+        uploaded chunk.
+        """
+        from screencap.chunk_processor import ChunkStatus
+
+        cp = self._make_cp(capture_dir)
+        cp._chunk_results[0] = ChunkStatus.EMITTED
+        cp._chunk_results[1] = ChunkStatus.NETWORK_SKIPPED
+        assert cp.all_chunks_uploaded() is False
+
+    def test_network_incomplete_blocks_sentinel(self, capture_dir):
+        """V1.75: ``NETWORK_INCOMPLETE`` is terminal-non-EMITTED."""
+        from screencap.chunk_processor import ChunkStatus
+
+        cp = self._make_cp(capture_dir)
+        cp._chunk_results[0] = ChunkStatus.EMITTED
+        cp._chunk_results[1] = ChunkStatus.NETWORK_INCOMPLETE
+        assert cp.all_chunks_uploaded() is False
+
+    def test_all_emitted_passes_gate(self, capture_dir):
+        """Sanity: when every chunk is ``EMITTED`` the gate passes."""
+        from screencap.chunk_processor import ChunkStatus
+
+        cp = self._make_cp(capture_dir)
+        cp._chunk_results[0] = ChunkStatus.EMITTED
+        cp._chunk_results[1] = ChunkStatus.EMITTED
+        cp._chunk_results[2] = ChunkStatus.EMITTED
+        assert cp.all_chunks_uploaded() is True
+
+
+class TestUploadSummaryCountsEmittedOnly:
+    """V1.75: ``upload_summary()`` returns (n_emitted, n_total).
+
+    Network-leg failures must NOT count toward the "uploaded" tally —
+    they reach the bucket as scrub-incomplete data and the summary
+    needs to reflect that for user messaging.
+    """
+
+    def test_counts_only_emitted(self, capture_dir):
+        from screencap.chunk_processor import ChunkProcessor, ChunkStatus
+
+        q = multiprocessing.Queue()
+        ack_q = multiprocessing.Queue()
+        cp = ChunkProcessor(
+            capture_dir, q, ack_q,
+            recording_name="rec",
+            upload_enabled=True, auto_delete=False,
+        )
+        cp._chunk_results[0] = ChunkStatus.EMITTED
+        cp._chunk_results[1] = ChunkStatus.NETWORK_SKIPPED
+        cp._chunk_results[2] = ChunkStatus.FAILED
+        cp._chunk_results[3] = ChunkStatus.NETWORK_INCOMPLETE
+
+        n_emitted, n_total = cp.upload_summary()
+        assert n_emitted == 1, (
+            "Only EMITTED counts; NETWORK_SKIPPED, FAILED, "
+            "NETWORK_INCOMPLETE all excluded from the uploaded tally."
+        )
+        assert n_total == 4
+
+    def test_pending_counted_in_total_not_emitted(self, capture_dir):
+        """``PENDING`` entries count toward the total (visibility) but
+        never toward the uploaded count."""
+        from screencap.chunk_processor import ChunkProcessor, ChunkStatus
+
+        q = multiprocessing.Queue()
+        ack_q = multiprocessing.Queue()
+        cp = ChunkProcessor(
+            capture_dir, q, ack_q,
+            recording_name="rec",
+            upload_enabled=True, auto_delete=False,
+        )
+        cp._chunk_results[0] = ChunkStatus.EMITTED
+        cp._chunk_results[1] = ChunkStatus.PENDING
+
+        n_emitted, n_total = cp.upload_summary()
+        assert n_emitted == 1
+        assert n_total == 2
+
+
+class TestDeleteOldChunksRespectsTerminalStates:
+    """V1.75: ``_delete_old_chunks`` must only delete EMITTED chunks.
+
+    ``NETWORK_SKIPPED`` and ``NETWORK_INCOMPLETE`` chunks are
+    intentionally local-only — a future re-export path may need their
+    .mp4 / .flac / .jsonl files. Deleting them would be silent
+    permanent data loss for the non-network legs of an otherwise
+    recoverable chunk.
+    """
+
+    def _populate(self, capture_dir: Path, idx: int) -> None:
+        for ext in ("mp4", "flac", "jsonl"):
+            target = capture_dir / (
+                f"events_{idx:04d}.jsonl"
+                if ext == "jsonl"
+                else f"{'chunk' if ext == 'mp4' else 'audio'}_{idx:04d}.{ext}"
+            )
+            target.write_bytes(b"x" * 16)
+
+    def _make_cp(self, capture_dir):
+        from screencap.chunk_processor import ChunkProcessor
+
+        q = multiprocessing.Queue()
+        ack_q = multiprocessing.Queue()
+        return ChunkProcessor(
+            capture_dir, q, ack_q,
+            recording_name="rec",
+            upload_enabled=True,
+            auto_delete=False,
+        )
+
+    def test_skips_network_skipped(self, capture_dir):
+        """``NETWORK_SKIPPED`` chunk files must survive _delete_old_chunks."""
+        from screencap.chunk_processor import ChunkStatus
+
+        cp = self._make_cp(capture_dir)
+        cp._chunk_results[0] = ChunkStatus.NETWORK_SKIPPED
+        cp._chunk_results[1] = ChunkStatus.EMITTED
+        cp._chunk_results[2] = ChunkStatus.EMITTED
+        for i in (0, 1, 2):
+            self._populate(capture_dir, i)
+
+        freed = cp._delete_old_chunks(current_idx=2, keep_recent=2)
+
+        # Chunk 0 files MUST still exist (NETWORK_SKIPPED).
+        assert (capture_dir / "chunk_0000.mp4").exists()
+        assert (capture_dir / "audio_0000.flac").exists()
+        assert (capture_dir / "events_0000.jsonl").exists()
+        # No files freed because only chunk 0 was in the keep_recent
+        # window and chunk 0 is NETWORK_SKIPPED.
+        assert freed == 0
+
+    def test_skips_network_incomplete(self, capture_dir):
+        """``NETWORK_INCOMPLETE`` chunk files must survive _delete_old_chunks."""
+        from screencap.chunk_processor import ChunkStatus
+
+        cp = self._make_cp(capture_dir)
+        cp._chunk_results[0] = ChunkStatus.NETWORK_INCOMPLETE
+        cp._chunk_results[1] = ChunkStatus.EMITTED
+        cp._chunk_results[2] = ChunkStatus.EMITTED
+        for i in (0, 1, 2):
+            self._populate(capture_dir, i)
+
+        cp._delete_old_chunks(current_idx=2, keep_recent=2)
+        assert (capture_dir / "chunk_0000.mp4").exists()
+        assert (capture_dir / "audio_0000.flac").exists()
+        assert (capture_dir / "events_0000.jsonl").exists()
+
+    def test_skips_failed(self, capture_dir):
+        """``FAILED`` chunks survive deletion so reconcile_against_gcs
+        can re-attempt the upload."""
+        from screencap.chunk_processor import ChunkStatus
+
+        cp = self._make_cp(capture_dir)
+        cp._chunk_results[0] = ChunkStatus.FAILED
+        cp._chunk_results[1] = ChunkStatus.EMITTED
+        cp._chunk_results[2] = ChunkStatus.EMITTED
+        for i in (0, 1, 2):
+            self._populate(capture_dir, i)
+
+        cp._delete_old_chunks(current_idx=2, keep_recent=2)
+        assert (capture_dir / "chunk_0000.mp4").exists()
+
+    def test_skips_pending(self, capture_dir):
+        """``PENDING`` chunks survive deletion. Force-stop survivorship."""
+        from screencap.chunk_processor import ChunkStatus
+
+        cp = self._make_cp(capture_dir)
+        cp._chunk_results[0] = ChunkStatus.PENDING
+        cp._chunk_results[1] = ChunkStatus.EMITTED
+        cp._chunk_results[2] = ChunkStatus.EMITTED
+        for i in (0, 1, 2):
+            self._populate(capture_dir, i)
+
+        cp._delete_old_chunks(current_idx=2, keep_recent=2)
+        assert (capture_dir / "chunk_0000.mp4").exists()
+
+
+class TestProcessChunkFinalAssignment:
+    """V1.75: ``_process_chunk``'s try/finally seam routes through
+    ``_pending_network_status`` and the eagerly-set ``PENDING`` entry.
+
+    These tests stage values directly into ``_pending_network_status``
+    and exercise ``_process_chunk`` without spinning up the real thread,
+    so the try/finally final-assignment contract is verified in
+    isolation from the queue + audio-ack plumbing.
+    """
+
+    def _make_cp(self, capture_dir):
+        from screencap.chunk_processor import ChunkProcessor
+
+        q = multiprocessing.Queue()
+        ack_q = multiprocessing.Queue()
+        cp = ChunkProcessor(
+            capture_dir, q, ack_q,
+            recording_name="rec",
+            upload_enabled=True,
+            auto_delete=False,
+            cloud_intent=False,
+        )
+        # Replace side-effecting steps with no-ops so _process_chunk
+        # reaches the final-assignment block without doing real work.
+        cp._wait_for_audio = lambda *a, **kw: None
+        cp._transcribe = lambda *a, **kw: None
+        cp._trigger_flush = lambda *a, **kw: None
+        cp._export_events = lambda *a, **kw: None
+        cp._generate_manifest = lambda *a, **kw: None
+        cp._scrub_chunk_files = lambda *a, **kw: None
+        cp._collect_chunk_files = lambda *a, **kw: [
+            {"name": "events_0000.jsonl", "path": capture_dir / "events_0000.jsonl"},
+        ]
+        return cp
+
+    def _msg(self, idx: int = 0) -> dict:
+        return {
+            "type": "chunk_rotated",
+            "completed_index": idx,
+            "chunk_start_time": 0.0,
+            "rotation_time": 1.0,
+        }
+
+    def test_success_path_writes_emitted(self, capture_dir):
+        """Happy path: no staging + upload succeeds → ``EMITTED``."""
+        from screencap.chunk_processor import ChunkStatus
+
+        cp = self._make_cp(capture_dir)
+        cp._upload_chunk = lambda *a, **kw: True
+        cp._process_chunk(self._msg(0))
+        assert cp._chunk_results[0] == ChunkStatus.EMITTED
+
+    def test_upload_failure_writes_failed(self, capture_dir):
+        """No staging + upload fails → ``FAILED``."""
+        from screencap.chunk_processor import ChunkStatus
+
+        cp = self._make_cp(capture_dir)
+        cp._upload_chunk = lambda *a, **kw: False
+        cp._process_chunk(self._msg(0))
+        assert cp._chunk_results[0] == ChunkStatus.FAILED
+
+    def test_staged_network_skipped_wins_over_emitted(self, capture_dir):
+        """U4's staged ``NETWORK_SKIPPED`` survives a successful upload —
+        the network signal must remain visible at the sentinel gate
+        even though the core files reached GCS.
+        """
+        from screencap.chunk_processor import ChunkStatus
+
+        cp = self._make_cp(capture_dir)
+        cp._upload_chunk = lambda *a, **kw: True
+        cp._pending_network_status[0] = ChunkStatus.NETWORK_SKIPPED
+
+        cp._process_chunk(self._msg(0))
+
+        assert cp._chunk_results[0] == ChunkStatus.NETWORK_SKIPPED
+        # Staging dict is consumed on assignment so it does not grow
+        # unbounded across a long recording.
+        assert 0 not in cp._pending_network_status
+
+    def test_staged_network_incomplete_wins_over_emitted(self, capture_dir):
+        """U5's staged ``NETWORK_INCOMPLETE`` survives a successful upload."""
+        from screencap.chunk_processor import ChunkStatus
+
+        cp = self._make_cp(capture_dir)
+        cp._upload_chunk = lambda *a, **kw: True
+        cp._pending_network_status[0] = ChunkStatus.NETWORK_INCOMPLETE
+
+        cp._process_chunk(self._msg(0))
+        assert cp._chunk_results[0] == ChunkStatus.NETWORK_INCOMPLETE
+
+    def test_staged_status_survives_manifest_failure(self, capture_dir):
+        """``_generate_manifest`` re-raise must not downgrade a staged
+        NETWORK_INCOMPLETE to FAILED.
+
+        Without the consult in the outer _run handler, the staged
+        status would be lost the moment _process_chunk raised — that's
+        the regression the plan's outer-handler staging consult fixes.
+        Here we verify it via _process_chunk directly: the finally
+        block consumes staging, writes NETWORK_INCOMPLETE, then the
+        exception propagates.
+        """
+        from screencap.chunk_processor import ChunkStatus
+
+        cp = self._make_cp(capture_dir)
+        cp._pending_network_status[0] = ChunkStatus.NETWORK_INCOMPLETE
+
+        def boom(*a, **kw):
+            raise RuntimeError("manifest write blew up")
+
+        cp._generate_manifest = boom
+
+        # _process_chunk re-raises the manifest failure (after the
+        # finally block writes the final status).
+        with pytest.raises(RuntimeError):
+            cp._process_chunk(self._msg(0))
+
+        assert cp._chunk_results[0] == ChunkStatus.NETWORK_INCOMPLETE
+        assert 0 not in cp._pending_network_status
+
+    def test_early_return_on_stop_event_leaves_pending(self, capture_dir):
+        """``_stop_event.set()`` mid-processing → finally block leaves
+        the eagerly-set ``PENDING`` entry alone (reached_upload=False
+        AND no staging). This is the Bug 2 survivorship-bias fix:
+        force-stop yields a non-missing entry that the gate rejects.
+        """
+        from screencap.chunk_processor import ChunkStatus
+
+        cp = self._make_cp(capture_dir)
+
+        def trip_stop(*a, **kw):
+            cp._stop_event.set()
+
+        cp._wait_for_audio = trip_stop  # _process_chunk early-returns
+        # Simulate _run's eager PENDING write that happens before
+        # _process_chunk is called.
+        cp._chunk_results[0] = ChunkStatus.PENDING
+
+        cp._process_chunk(self._msg(0))
+
+        assert cp._chunk_results[0] == ChunkStatus.PENDING
+
+    def test_early_return_consumes_staged_network_status(self, capture_dir):
+        """If U4 staged NETWORK_SKIPPED before the stop, the early-return
+        path still promotes the staged value (the gate sees the network
+        signal rather than a bare PENDING).
+        """
+        from screencap.chunk_processor import ChunkStatus
+
+        cp = self._make_cp(capture_dir)
+        cp._pending_network_status[0] = ChunkStatus.NETWORK_SKIPPED
+        cp._chunk_results[0] = ChunkStatus.PENDING
+
+        def trip_stop(*a, **kw):
+            cp._stop_event.set()
+
+        cp._wait_for_audio = trip_stop
+        cp._process_chunk(self._msg(0))
+
+        assert cp._chunk_results[0] == ChunkStatus.NETWORK_SKIPPED
+        assert 0 not in cp._pending_network_status
+
+
+class TestRunLoopEagerPending:
+    """V1.75: ``_run`` writes ``PENDING`` on rotation receipt, BEFORE
+    ``_process_chunk`` runs. This is the load-bearing seam for Bug 2.
+    """
+
+    def test_pending_set_before_process_chunk(self, capture_dir):
+        """Send a rotation, intercept _process_chunk to assert the
+        entry is already PENDING when processing starts.
+        """
+        from screencap.chunk_processor import ChunkProcessor, ChunkStatus
+
+        chunk_q = multiprocessing.Queue()
+        audio_q = multiprocessing.Queue()
+        cp = ChunkProcessor(
+            capture_dir, chunk_q, audio_q,
+            recording_name="rec",
+            upload_enabled=False, auto_delete=False,
+        )
+
+        seen_state: dict[int, ChunkStatus] = {}
+
+        def capture_state(msg):
+            idx = msg["completed_index"]
+            seen_state[idx] = cp._chunk_results.get(idx)
+            # Settle the entry so the loop drains cleanly.
+            cp._chunk_results[idx] = ChunkStatus.EMITTED
+
+        cp._process_chunk = capture_state
+        cp.start()
+        chunk_q.put({
+            "type": "chunk_rotated",
+            "completed_index": 7,
+            "chunk_start_time": 0.0,
+            "rotation_time": 1.0,
+        })
+        chunk_q.put({"type": "poison_pill"})
+        cp._thread.join(timeout=10)
+
+        assert seen_state.get(7) == ChunkStatus.PENDING, (
+            "_run must eagerly set PENDING before _process_chunk runs "
+            "(survivorship-bias fix). Observed: " + str(seen_state)
+        )
+
+    def test_outer_handler_writes_failed_when_finally_left_pending(self, capture_dir):
+        """If ``_process_chunk`` raises BEFORE its own finally block can
+        write (rare — e.g. msg["completed_index"] KeyError at the top),
+        the outer ``_run`` handler must fall back to FAILED so the gate
+        never sees PENDING for an idx that was processed.
+        """
+        from screencap.chunk_processor import ChunkProcessor, ChunkStatus
+
+        chunk_q = multiprocessing.Queue()
+        audio_q = multiprocessing.Queue()
+        cp = ChunkProcessor(
+            capture_dir, chunk_q, audio_q,
+            recording_name="rec",
+            upload_enabled=False, auto_delete=False,
+        )
+
+        def boom_before_finally(msg):
+            raise RuntimeError("pre-try crash")
+
+        cp._process_chunk = boom_before_finally
+        cp.start()
+        chunk_q.put({
+            "type": "chunk_rotated",
+            "completed_index": 3,
+            "chunk_start_time": 0.0,
+            "rotation_time": 1.0,
+        })
+        chunk_q.put({"type": "poison_pill"})
+        cp._thread.join(timeout=10)
+
+        assert cp._chunk_results.get(3) == ChunkStatus.FAILED
+
+
+class TestForceStopDominatesStatusMap:
+    """V1.75: ``was_force_stopped`` still dominates the sentinel gate.
+
+    The upstream gate predicate at engine/collaborators.py is:
+        ``cp.all_chunks_uploaded() and not cp.was_force_stopped``
+    Even when every entry is ``EMITTED``, ``was_force_stopped=True``
+    must block sentinel upload. Restated for the enum to lock the
+    contract.
+    """
+
+    def test_force_stopped_blocks_sentinel_even_when_all_emitted(self, capture_dir):
+        from screencap.chunk_processor import ChunkProcessor, ChunkStatus
+
+        q = multiprocessing.Queue()
+        ack_q = multiprocessing.Queue()
+        cp = ChunkProcessor(
+            capture_dir, q, ack_q,
+            recording_name="rec",
+            upload_enabled=True, auto_delete=False,
+        )
+        cp._chunk_results[0] = ChunkStatus.EMITTED
+        cp._chunk_results[1] = ChunkStatus.EMITTED
+
+        # all_chunks_uploaded is True...
+        assert cp.all_chunks_uploaded() is True
+        # ...but was_force_stopped flips the upstream composite predicate.
+        cp._stop_event.set()
+        assert cp.was_force_stopped is True
+        assert (cp.all_chunks_uploaded() and not cp.was_force_stopped) is False

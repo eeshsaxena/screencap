@@ -12,12 +12,58 @@ import logging
 import os
 import threading
 import time
+from enum import Enum
 from pathlib import Path
+from typing import TYPE_CHECKING
 
 from screencap._flush import wait_for_writer_flush
-from screencap.recording_db import open_recording_db
+from screencap.recording_db import OperationalError, open_recording_db
+
+if TYPE_CHECKING:
+    from screencap.network.export_pipeline import NetworkScrubPipeline
 
 logger = logging.getLogger(__name__)
+
+
+class ChunkStatus(str, Enum):
+    """Per-chunk terminal status (V1.75).
+
+    Replaces the V1 ``dict[int, bool]`` map. The boolean form conflated
+    "uploaded" with "intentionally skipped (no encryption available)"
+    and "incompletely captured (proxy died)" -- exactly the
+    survivorship-bias and "disabled-treated-as-success" patterns
+    documented in
+    ``docs/solutions/runtime-errors/chunk-upload-sentinel-gating-and-data-loss.md``
+    (four prior production incidents).
+
+    All sentinel-upload, stub_recording, reconcile, and delete_old_chunks
+    decisions key off ``EMITTED`` explicitly. Every other state blocks
+    the sentinel gate -- "disabled ≠ succeeded" per the prior-incident
+    fix #4. Iterating over ``s != EMITTED`` is intentionally NOT the
+    contract: reconcile/delete each have their own specific status set
+    they act on, never "everything that isn't EMITTED".
+
+    State transitions:
+
+    - ``PENDING`` is set at rotation-message receipt, BEFORE
+      ``_process_chunk`` runs. Force-stop now leaves a ``PENDING``
+      entry that the gate explicitly rejects (Bug 2 in the prior-
+      incident doc -- survivorship-bias fix).
+    - ``EMITTED`` on successful upload (or on intentionally-disabled
+      upload with no ``_upload_disabled_reason``).
+    - ``FAILED`` on upload failure or exception in ``_process_chunk``.
+    - ``NETWORK_SKIPPED`` when the chunk had network rows but the KEK
+      was unavailable at first body-bearing chunk (U4 fail-soft).
+    - ``NETWORK_INCOMPLETE`` when the chunk window overlaps a
+      ``NetworkHealth(event="proxy_crashed" | "network_writer_failed")``
+      row (U5 overlap).
+    """
+
+    PENDING = "pending"
+    EMITTED = "emitted"
+    FAILED = "failed"
+    NETWORK_SKIPPED = "network_skipped"
+    NETWORK_INCOMPLETE = "network_incomplete"
 
 
 class ChunkProcessor:
@@ -128,12 +174,59 @@ class ChunkProcessor:
             self._auto_delete = False
             logger.info("Forced auto_delete=False because uploads are disabled")
 
-        self._chunk_results: dict[int, bool] = {}  # idx → all_uploaded
+        # V1.75: idx → ChunkStatus. Replaces dict[int, bool] -- see
+        # ChunkStatus docstring + chunk-upload-sentinel-gating-and-data-loss.md
+        # for the four prior incidents the enum closes off.
+        self._chunk_results: dict[int, ChunkStatus] = {}
+
+        # V1.75 staging seam (declared here so U4/U5 have load-bearing
+        # fields to write into without re-touching __init__). U4 stages
+        # NETWORK_SKIPPED via ``setdefault``; U5 stages
+        # NETWORK_INCOMPLETE via unconditional ``=`` (precedence rule:
+        # NETWORK_INCOMPLETE > NETWORK_SKIPPED, enforced in code rather
+        # than implicitly by call order). The dict is consumed by
+        # ``_process_chunk``'s try/finally final-assignment.
+        self._pending_network_status: dict[int, ChunkStatus] = {}
+
+        # V1.75 cached network-decrypt + scrub pipeline (lazily
+        # constructed by U4 on the first body-bearing chunk).
+        # ``_network_scrub_attempted`` is a one-shot latch: a single
+        # failed construction does not retry, and a single failed
+        # construction does not poison subsequent chunks (their
+        # ``_export_events`` falls through to metadata-only).
+        self._network_scrub_pipeline: NetworkScrubPipeline | None = None
+        self._network_scrub_attempted: bool = False
+
+        # V1.75 recording_id, used by U4/U5 to scope network_event and
+        # network_health queries to this recording. Best-effort lookup
+        # at construction time -- production callers (collaborators.py)
+        # construct the ChunkProcessor AFTER crud.insert_recording has
+        # run, so the row is present. Tests with no real recording.db
+        # fall through to None and U4 fail-softs.
+        self._recording_id: int | None = self._lookup_recording_id()
+
         self._status_lock = threading.Lock()
         self._status: str = ""
         self._total_freed: int = 0
         self._thread: threading.Thread | None = None
         self._stop_event = threading.Event()
+
+    def _lookup_recording_id(self) -> int | None:
+        """One-shot query for the recording.id at construction time.
+
+        Returns ``None`` when the recording.db is absent (test fixtures
+        with no real recording) or when the ``recording`` table is
+        missing/empty. U4/U5 treat ``None`` as "skip network queries"
+        rather than raising — recording survival > network signal.
+        """
+        try:
+            with open_recording_db(self._db_path) as conn:
+                row = conn.execute(
+                    "SELECT id FROM recording LIMIT 1"
+                ).fetchone()
+                return int(row[0]) if row is not None else None
+        except (FileNotFoundError, OperationalError):
+            return None
 
     @property
     def status(self) -> str:
@@ -151,37 +244,64 @@ class ChunkProcessor:
             self._status = s
 
     def all_chunks_uploaded(self) -> bool:
-        """True if every processed chunk was uploaded successfully.
+        """True if every processed chunk has terminal status ``EMITTED``.
 
         Returns False if no chunks were processed at all — that means
         the video writer likely failed and no rotation events arrived.
+
+        Explicit EMITTED-only — ``NETWORK_SKIPPED``,
+        ``NETWORK_INCOMPLETE``, ``FAILED``, ``PENDING`` all block the
+        gate. Per
+        ``docs/solutions/runtime-errors/chunk-upload-sentinel-gating-and-data-loss.md``
+        fix #4: disabled ≠ succeeded.
         """
         if not self._chunk_results:
             return False
-        return all(self._chunk_results.values())
+        return all(s == ChunkStatus.EMITTED for s in self._chunk_results.values())
 
     def upload_summary(self) -> tuple[int, int]:
-        """Return (n_uploaded, n_total) from chunk results.
+        """Return (n_emitted, n_total) from chunk results.
 
         Must only be called after stop() — _chunk_results is not
         thread-safe for concurrent reads.
+
+        ``n_emitted`` counts ``EMITTED`` only — chunks that intentionally
+        skipped network bodies (``NETWORK_SKIPPED``) or carried an
+        incomplete window (``NETWORK_INCOMPLETE``) are NOT counted as
+        uploaded. ``n_total`` counts every chunk regardless of status,
+        including ``PENDING`` entries left by force-stop (Bug 2 fix).
         """
         n_total = len(self._chunk_results)
-        n_uploaded = sum(1 for v in self._chunk_results.values() if v)
-        return n_uploaded, n_total
+        n_emitted = sum(
+            1 for s in self._chunk_results.values()
+            if s == ChunkStatus.EMITTED
+        )
+        return n_emitted, n_total
 
     def reconcile_against_gcs(self) -> int:
-        """Re-check GCS for chunks currently marked as failed.
+        """Re-check GCS for chunks currently marked as ``FAILED``.
 
         _upload_chunk() returns False whenever any core file's PUT raises
         — but files that PUT before the failure remain in GCS. We
         re-request signed URLs for every failed chunk in a single batch;
         the server returns ``url=None`` for files it already has. When
         every core file on disk comes back ``None``, we flip
-        ``_chunk_results[idx] = True``.
+        ``_chunk_results[idx]`` from ``FAILED`` to ``EMITTED``.
+
+        Iterates over ``FAILED`` chunks ONLY. ``NETWORK_SKIPPED`` and
+        ``NETWORK_INCOMPLETE`` are terminal-non-EMITTED states that
+        reconcile MUST NOT touch: their core files (video, audio,
+        events.jsonl, manifest) DID upload successfully, so a
+        ``!= EMITTED`` iteration would call ``request_signed_urls``,
+        every core file would come back ``url=None``, the all() check
+        would pass, and the chunk would silently relabel ``EMITTED`` —
+        erasing the network-skip / network-incomplete signal. Same
+        shape as
+        ``docs/solutions/runtime-errors/chunk-upload-sentinel-gating-and-data-loss.md``
+        Bug 4 routed through reconcile.
 
         Must only be called after stop(). Returns the number of
-        entries flipped from False to True.
+        entries flipped from FAILED to EMITTED.
         """
         if not self._upload_enabled:
             return 0
@@ -190,8 +310,10 @@ class ChunkProcessor:
 
         all_file_infos: list[FileInfo] = []
         per_chunk_names: dict[int, list[str]] = {}
-        for idx, ok in self._chunk_results.items():
-            if ok:
+        for idx, status in self._chunk_results.items():
+            # FAILED-only iteration — see docstring for why
+            # NETWORK_SKIPPED / NETWORK_INCOMPLETE / PENDING are excluded.
+            if status != ChunkStatus.FAILED:
                 continue
             names: list[str] = []
             for f in self._collect_chunk_files(idx, None):
@@ -224,7 +346,7 @@ class ChunkProcessor:
             # Server returns url=None for already-uploaded files; a missing
             # key means the server didn't confirm, so we stay conservative.
             if all(name in urls and urls[name] is None for name in names):
-                self._chunk_results[idx] = True
+                self._chunk_results[idx] = ChunkStatus.EMITTED
                 flipped += 1
                 logger.info(f"Reconciled chunk {idx}: all core files already in GCS")
         return flipped
@@ -288,12 +410,30 @@ class ChunkProcessor:
                 continue
             if msg.get("type") == "poison_pill":
                 break
+            # PENDING initialization contract: write the entry BEFORE
+            # _process_chunk runs. Force-stop and exception paths now
+            # both leave a non-missing entry that the EMITTED-only
+            # gate predicate explicitly rejects — Bug 2 survivorship-
+            # bias fix from chunk-upload-sentinel-gating-and-data-loss.md.
+            idx = msg.get("completed_index")
+            if idx is not None:
+                self._chunk_results.setdefault(idx, ChunkStatus.PENDING)
             try:
                 self._process_chunk(msg)
             except Exception:
                 idx = msg.get("completed_index", -1)
                 logger.exception(f"Chunk {idx} processing failed")
-                self._chunk_results[idx] = False
+                # Defense in depth: if _process_chunk's finally block
+                # already settled the status, respect it. Only fall
+                # back to FAILED (or staged status) when the entry is
+                # still PENDING — i.e., the exception fired before the
+                # finally could write.
+                current = self._chunk_results.get(idx, ChunkStatus.PENDING)
+                if current == ChunkStatus.PENDING:
+                    pending = self._pending_network_status.pop(idx, None)
+                    self._chunk_results[idx] = (
+                        pending if pending is not None else ChunkStatus.FAILED
+                    )
 
     def _process_chunk(self, msg: dict) -> None:
         if self._auto_delete and not self._upload_enabled:
@@ -307,73 +447,110 @@ class ChunkProcessor:
         end_ts = msg["rotation_time"]
         is_final = msg.get("type") == "final_chunk"
 
-        self._set_status("Waiting for audio...")
-
-        # 1. Wait for audio ack
-        self._wait_for_audio(idx, is_final=is_final)
-        if self._stop_event.is_set():
-            return
-
-        # 2. Transcribe audio
-        self._set_status("Transcribing audio...")
-        transcript_path = self._transcribe(idx)
-        if self._stop_event.is_set():
-            return
-
-        # 3. Flush writer buffers → export events from DB
-        self._set_status("Flushing buffers...")
-        self._trigger_flush()
-        if self._stop_event.is_set():
-            return
-        self._set_status("Exporting events...")
-        self._export_events(idx, start_ts, end_ts)
-        if self._stop_event.is_set():
-            return
-
-        # 4. Generate task manifest (with blocked intervals if available)
-        self._set_status("Generating manifest...")
-        blocked_intervals = None
-        if self._screen_filter is not None and hasattr(self._screen_filter, 'get_blocked_intervals'):
-            try:
-                blocked_intervals = self._screen_filter.get_blocked_intervals(start_ts, end_ts) or None
-            except Exception:
-                logger.warning(f"Failed to get blocked_intervals for chunk {idx}", exc_info=True)
+        # V1.75 final-assignment seam. The try/finally guarantees every
+        # exit path lands on a coherent status: success → EMITTED,
+        # upload failure → FAILED, staged network status from U4/U5 →
+        # NETWORK_SKIPPED / NETWORK_INCOMPLETE, early return from a
+        # _stop_event check → leaves the eagerly-set PENDING entry
+        # alone (Bug 2 survivorship-bias fix — PENDING in the map
+        # blocks the gate even when the chunk never reached upload).
+        success = False
+        reached_upload = False
         try:
-            self._generate_manifest(idx, start_ts, end_ts, blocked_intervals=blocked_intervals)
-        except Exception:
-            logger.exception(f"Chunk {idx}: manifest generation failed")
-            # Remove any partially-written manifest so a later retry
-            # (or screencap upload) doesn't ship a truncated file.
-            (self._capture_dir / f"chunk_{idx:04d}_manifest.json").unlink(missing_ok=True)
-            raise
+            self._set_status("Waiting for audio...")
 
-        # 5. Scrub text surfaces + mask screenshots when user opted in.
-        if self._scrub_enabled and self._pipeline is not None:
-            self._set_status("Redacting sensitive data...")
-            self._scrub_chunk_files(idx, start_ts, end_ts, transcript_path)
+            # 1. Wait for audio ack
+            self._wait_for_audio(idx, is_final=is_final)
             if self._stop_event.is_set():
                 return
 
-        # 6. Upload
-        success = False
-        if self._upload_enabled:
-            self._set_status("Uploading...")
-            files = self._collect_chunk_files(idx, transcript_path)
-            if files:
-                success = self._upload_chunk(idx, files)
+            # 2. Transcribe audio
+            self._set_status("Transcribing audio...")
+            transcript_path = self._transcribe(idx)
+            if self._stop_event.is_set():
+                return
+
+            # 3. Flush writer buffers → export events from DB
+            self._set_status("Flushing buffers...")
+            self._trigger_flush()
+            if self._stop_event.is_set():
+                return
+            self._set_status("Exporting events...")
+            self._export_events(idx, start_ts, end_ts)
+            if self._stop_event.is_set():
+                return
+
+            # 4. Generate task manifest (with blocked intervals if available)
+            self._set_status("Generating manifest...")
+            blocked_intervals = None
+            if self._screen_filter is not None and hasattr(self._screen_filter, 'get_blocked_intervals'):
+                try:
+                    blocked_intervals = self._screen_filter.get_blocked_intervals(start_ts, end_ts) or None
+                except Exception:
+                    logger.warning(f"Failed to get blocked_intervals for chunk {idx}", exc_info=True)
+            try:
+                self._generate_manifest(idx, start_ts, end_ts, blocked_intervals=blocked_intervals)
+            except Exception:
+                logger.exception(f"Chunk {idx}: manifest generation failed")
+                # Remove any partially-written manifest so a later retry
+                # (or screencap upload) doesn't ship a truncated file.
+                (self._capture_dir / f"chunk_{idx:04d}_manifest.json").unlink(missing_ok=True)
+                raise
+
+            # 5. Scrub text surfaces + mask screenshots when user opted in.
+            if self._scrub_enabled and self._pipeline is not None:
+                self._set_status("Redacting sensitive data...")
+                self._scrub_chunk_files(idx, start_ts, end_ts, transcript_path)
+                if self._stop_event.is_set():
+                    return
+
+            # 6. Upload
+            reached_upload = True
+            if self._upload_enabled:
+                self._set_status("Uploading...")
+                files = self._collect_chunk_files(idx, transcript_path)
+                if files:
+                    success = self._upload_chunk(idx, files)
+                else:
+                    logger.warning(f"No files found for chunk {idx}")
             else:
-                logger.warning(f"No files found for chunk {idx}")
-        else:
-            success = self._upload_disabled_reason is None
+                # "Disabled" must not be conflated with "succeeded": when
+                # privacy init failed _upload_disabled_reason is set, so
+                # success stays False → FAILED → gate blocks → no stub.
+                # Per chunk-upload-sentinel-gating-and-data-loss.md fix #4.
+                success = self._upload_disabled_reason is None
+        finally:
+            # Settle the final status on every exit path. Staging from
+            # U4 (NETWORK_SKIPPED) and U5 (NETWORK_INCOMPLETE) takes
+            # precedence over EMITTED so the network signal stays
+            # visible at the sentinel gate.
+            pending = self._pending_network_status.pop(idx, None)
+            if pending is not None:
+                self._chunk_results[idx] = pending
+            elif reached_upload:
+                self._chunk_results[idx] = (
+                    ChunkStatus.EMITTED if success else ChunkStatus.FAILED
+                )
+            # else: leave PENDING (eagerly set on rotation receipt).
+            # This is the survivorship-bias fix — force-stop early
+            # return now leaves a non-missing entry that the
+            # EMITTED-only gate explicitly rejects.
 
-        self._chunk_results[idx] = success
-
-        # 7. Delete old chunks (keep 2 most recent)
-        if success and self._auto_delete:
+        # 7. Delete old chunks (keep 2 most recent). Only EMITTED chunks
+        # are safe to delete locally — NETWORK_SKIPPED and
+        # NETWORK_INCOMPLETE chunks must survive on disk for any future
+        # re-export path that surfaces.
+        if (
+            self._chunk_results.get(idx) == ChunkStatus.EMITTED
+            and self._auto_delete
+        ):
             freed = self._delete_old_chunks(idx, keep_recent=2)
             self._total_freed += freed
 
-        n_done = sum(1 for v in self._chunk_results.values() if v)
+        n_done = sum(
+            1 for s in self._chunk_results.values()
+            if s == ChunkStatus.EMITTED
+        )
         if self._total_freed > 0:
             freed_str = _fmt_bytes(self._total_freed)
             self._set_status(f"{n_done} chunks done, {freed_str} freed")
@@ -688,11 +865,20 @@ class ChunkProcessor:
         return False
 
     def _delete_old_chunks(self, current_idx: int, keep_recent: int = 2) -> int:
-        """Delete media files for old uploaded chunks. Returns bytes freed."""
+        """Delete media files for old EMITTED chunks. Returns bytes freed.
+
+        EMITTED-only — ``NETWORK_SKIPPED`` and ``NETWORK_INCOMPLETE``
+        chunks are intentionally local-only (bodies were either not
+        decryptable or the proxy crashed mid-window). A future
+        re-export path may need their .mp4 / .flac / .jsonl files;
+        deleting them would be silent permanent data loss for the
+        non-network legs of an otherwise-recoverable chunk.
+        """
         freed = 0
         for old_idx in range(0, current_idx - keep_recent + 1):
-            if not self._chunk_results.get(old_idx, False):
-                continue  # not uploaded — keep
+            # EMITTED-only deletion — see docstring.
+            if self._chunk_results.get(old_idx) != ChunkStatus.EMITTED:
+                continue
             for ext_pattern in [
                 f"chunk_{old_idx:04d}.mp4",
                 f"audio_{old_idx:04d}.flac",
