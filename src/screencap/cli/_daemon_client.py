@@ -30,34 +30,33 @@ import httpx
 SUPPORTED_API_SCHEMA_VERSION = 1
 
 
-def default_socket_path() -> Path:
-    """Match ``screencap.daemon.socket.default_socket_path`` without import cost.
-
-    Inlined here so importing this module does not drag the daemon
-    package (and its starlette/uvicorn transitive surface) onto the CLI
-    fast path — the live-state command bodies hit this client by
-    construction and ``screencap --help`` must stay sub-second.
-    """
-    return Path.home() / ".screencap" / "run" / "api.sock"
-
-
 class DaemonUnreachableError(RuntimeError):
     """The daemon socket is missing, refused, or hung up unexpectedly.
 
-    Distinct from ``DaemonAPIError`` because callers may want to
+    Distinct from ``DaemonClientError`` because callers may want to
     auto-spawn or surface a kickstart hint instead of treating it as a
     contract failure.
     """
 
 
-class DaemonAPIError(RuntimeError):
-    """The daemon returned an error envelope; ``envelope`` carries the body."""
+class DaemonClientError(RuntimeError):
+    """The daemon returned an error envelope; ``envelope`` carries the body.
+
+    Named ``DaemonClientError`` (not ``DaemonAPIError``) to avoid a
+    collision with ``screencap.daemon.errors.DaemonAPIError``, which is
+    the server-side base exception class.
+    """
 
     def __init__(self, envelope: dict[str, Any], *, status_code: int) -> None:
         self.envelope = envelope
         self.status_code = status_code
         code = envelope.get("error") or envelope.get("error_code") or "unknown"
         super().__init__(f"daemon error: {code} (status={status_code})")
+
+
+# Backward-compatible alias so existing callers importing ``DaemonAPIError``
+# from this module continue to work without immediate churn.
+DaemonAPIError = DaemonClientError
 
 
 class SchemaMismatchError(RuntimeError):
@@ -69,10 +68,16 @@ class SchemaMismatchError(RuntimeError):
 
     def __init__(self, daemon_version: int) -> None:
         self.daemon_version = daemon_version
-        super().__init__(
-            f"daemon advertises api_schema_version={daemon_version}, "
-            f"CLI supports {SUPPORTED_API_SCHEMA_VERSION}"
-        )
+        if daemon_version < 0:
+            super().__init__(
+                f"daemon did not advertise api_schema_version (old daemon?); "
+                f"CLI supports {SUPPORTED_API_SCHEMA_VERSION}"
+            )
+        else:
+            super().__init__(
+                f"daemon advertises api_schema_version={daemon_version}, "
+                f"CLI supports {SUPPORTED_API_SCHEMA_VERSION}"
+            )
 
 
 class DaemonHTTPClient:
@@ -92,7 +97,11 @@ class DaemonHTTPClient:
         read_timeout: float | None = 30.0,
         transport: httpx.BaseTransport | None = None,
     ) -> None:
-        self._socket_path = Path(socket_path).expanduser() if socket_path else default_socket_path()
+        if socket_path:
+            self._socket_path = Path(socket_path).expanduser()
+        else:
+            from screencap.daemon.socket import default_socket_path
+            self._socket_path = default_socket_path()
         self._connect_timeout = connect_timeout
         self._read_timeout = read_timeout
         # ``transport`` is injectable so tests can drop in a
@@ -175,6 +184,14 @@ class DaemonHTTPClient:
             raise DaemonUnreachableError(
                 f"daemon disconnected mid-response: {exc}"
             ) from exc
+        except httpx.TimeoutException as exc:
+            raise DaemonUnreachableError(
+                f"daemon timed out: {exc}"
+            ) from exc
+        except httpx.RemoteProtocolError as exc:
+            raise DaemonUnreachableError(
+                f"daemon returned invalid HTTP response: {exc}"
+            ) from exc
 
     @staticmethod
     def _decode_envelope(response: httpx.Response) -> dict[str, Any]:
@@ -192,7 +209,13 @@ class DaemonHTTPClient:
 
     def _check_schema_or_raise(self, envelope: dict[str, Any]) -> None:
         version = envelope.get("api_schema_version")
-        if isinstance(version, int) and version != SUPPORTED_API_SCHEMA_VERSION:
+        if version is None:
+            # Missing field — old daemon that predates api_schema_version.
+            raise SchemaMismatchError(-1)
+        if not isinstance(version, int):
+            # String-typed or unexpected shape; treat as incompatible.
+            raise SchemaMismatchError(-1)
+        if version != SUPPORTED_API_SCHEMA_VERSION:
             raise SchemaMismatchError(version)
 
     def _parse_ok_envelope(self, response: httpx.Response) -> dict[str, Any]:
@@ -221,11 +244,17 @@ class DaemonHTTPClient:
             self._request("POST", "/v0/recording.start", json_body=payload)
         )
 
-    def stop(self, *, force: bool = False, **extra: Any) -> dict[str, Any]:
+    def stop(
+        self,
+        *,
+        force: bool = False,
+        timeout: "httpx.Timeout | float | None" = None,
+        **extra: Any,
+    ) -> dict[str, Any]:
         body: dict[str, Any] = {"force": force}
         body.update(extra)
         return self._parse_ok_envelope(
-            self._request("POST", "/v0/recording.stop", json_body=body)
+            self._request("POST", "/v0/recording.stop", json_body=body, timeout=timeout)
         )
 
     @contextmanager
@@ -265,6 +294,10 @@ class DaemonHTTPClient:
         )
         try:
             if response.status_code >= 400:
+                # Must read the body before decoding JSON — httpx raises
+                # ResponseNotRead if you call response.json() on a
+                # streaming response that has not been consumed yet.
+                response.read()
                 envelope = self._decode_envelope(response)
                 self._check_schema_or_raise(envelope)
                 raise DaemonAPIError(envelope, status_code=response.status_code)

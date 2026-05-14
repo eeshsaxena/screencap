@@ -673,18 +673,13 @@ def start(
 
     from screencap.config import (
         get_audio_default,
-        get_auto_name,
-        get_auto_name_local_only,
         get_segmentation_mode,
     )
 
     # Resolve segmentation mode: CLI flag > config.toml > default
     seg_mode = segmentation_mode or get_segmentation_mode()
 
-    # Determine if auto-naming is enabled
     user_provided_name = name is not None
-    auto_name_enabled = get_auto_name() and not no_auto_name and not user_provided_name
-    local_only = local_only or get_auto_name_local_only()
 
     if not name:
         if no_auto_name:
@@ -869,27 +864,27 @@ def start(
 
 def _run_start_via_daemon(
     *,
-    name,
-    description,
-    audio,
-    output,
-    wifi_metrics,
-    app_versions,
-    force_clean,
-    capture_video,
-    capture_images,
-    capture_window_data,
-    verbose,
-    chunk_duration,
-    live_upload,
-    force_mode,
-    cloud_intent,
-    keep_local,
-    intent_source,
-    segmentation_mode,
-    scrub_enabled,
-    show_on_website,
-    network,
+    name: str | None,
+    description: str | None,
+    audio: bool | None,
+    output: str | None,
+    wifi_metrics: bool | None,
+    app_versions: bool | None,
+    force_clean: bool,
+    capture_video: bool | None,
+    capture_images: bool | None,
+    capture_window_data: bool | None,
+    verbose: bool,
+    chunk_duration: float | None,
+    live_upload: bool,
+    force_mode: str | None,
+    cloud_intent: bool,
+    keep_local: bool,
+    intent_source: str,
+    segmentation_mode: str | None,
+    scrub_enabled: bool,
+    show_on_website: bool,
+    network: bool,
 ) -> int:
     """POST recording.start, stream events, map terminal event to exit code.
 
@@ -964,24 +959,31 @@ def _run_start_via_daemon(
         interrupt_state["count"] += 1
         client = interrupt_state["client"]
         if interrupt_state["count"] >= 2:
-            # Second Ctrl+C escalates to force-quit (exit 5 per taxonomy).
+            # Second Ctrl+C always escalates to force-quit regardless of
+            # whether a graceful stop was already sent — the graceful stop
+            # may be in-flight and the user wants an immediate exit.
             click.echo("\nSecond Ctrl+C — force-stopping.", err=True)
-            if client is not None and not interrupt_state["stop_sent"]:
+            if client is not None:
                 try:
-                    client.stop(force=True)
+                    # Short 3s timeout: the user wants an immediate exit;
+                    # don't block the signal handler for the full 30s default.
+                    client.stop(force=True, timeout=3.0)
                 except Exception:
                     pass
-                interrupt_state["stop_sent"] = True
             return
         if client is not None and not interrupt_state["stop_sent"]:
             try:
-                client.stop(force=False)
+                # Short 3s timeout: signal handlers should not block
+                # indefinitely.
+                client.stop(force=False, timeout=3.0)
                 interrupt_state["stop_sent"] = True
                 click.echo(
                     "Stopping (Ctrl+C again to force-quit)...", err=True
                 )
-            except Exception:
-                pass
+            except DaemonAPIError as e:
+                logger.debug("stop(force=False) returned daemon error: %s", e)
+            except Exception as e:
+                logger.debug("stop(force=False) failed: %s", e)
 
     try:
         with DaemonHTTPClient() as client:
@@ -1047,9 +1049,18 @@ def _run_start_via_daemon(
                             # a fresh cursor and resume.
                             try:
                                 snap = client.snapshot()
-                                cursor = snap.get("cursor", 0)
                             except Exception:
                                 return 1
+                            # If the recording is already gone (daemon
+                            # force-terminated on restart), exit cleanly
+                            # rather than blocking forever.
+                            if snap.get("is_recording") is False:
+                                click.echo(
+                                    "Recording ended (daemon restarted mid-session).",
+                                    err=True,
+                                )
+                                return 1
+                            cursor = snap.get("cursor", 0)
                             continue
                         click.echo(f"Daemon error: {exc}", err=True)
                         return 1
@@ -1069,6 +1080,16 @@ def _run_start_via_daemon(
                 return 4
             if interrupt_state["count"] >= 2:
                 return 5
+            # Engine crash / OOM / SIGKILL: daemon synthesizes
+            # recording_finalized with force_stopped=True but without
+            # disk_full or permission_lost.
+            if (
+                terminal_payload
+                and terminal_payload.get("force_stopped")
+                and not terminal_payload.get("disk_full")
+                and not permission_lost
+            ):
+                return 1
             return 0
     finally:
         interrupt_state["client"] = None

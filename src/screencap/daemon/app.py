@@ -176,7 +176,7 @@ async def session_snapshot(request: Request) -> JSONResponse:
     if daemon_owned and supervisor is not None:
         current = supervisor.current_session()
         if current:
-            for key in ("engine_pid", "frames_written"):
+            for key in ("engine_pid", "frames_written", "started_by"):
                 if current.get(key) is not None:
                     payload[key] = current[key]
     elif not daemon_owned:

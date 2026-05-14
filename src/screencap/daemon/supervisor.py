@@ -32,11 +32,14 @@ logger = logging.getLogger(__name__)
 
 EngineCommandFactory = Callable[[str], list[str]]
 
-# ``CLAIMANT_DAEMON`` is re-exported above so existing
-# ``from screencap.daemon.supervisor import CLAIMANT_DAEMON`` importers keep
-# resolving without churn; the canonical home is now ``screencap.pidfile``
-# alongside ``CLAIMANT_CLI`` / ``CLAIMANT_SWIFTUI`` for historical metadata.
-__all__ = ["CLAIMANT_DAEMON", "Supervisor"]
+__all__ = ["Supervisor", "_extra_output_dir_allowlist"]
+
+# Extra output-dir allowlist entries — populated by test fixtures or callers
+# that legitimately need a path outside the default recordings root.
+# The canonical allowlist is ``[get_recordings_dir().resolve()]``; entries
+# here are checked *in addition to* that default. Tests should monkeypatch
+# this list rather than hard-coding a path assumption in production code.
+_extra_output_dir_allowlist: list[Path] = []
 
 # Engine-stderr kernel pipe widening — buys headroom for `_stderr_pump`
 # against engine-side burst writes so a briefly-slow pump drain does not
@@ -658,7 +661,17 @@ class Supervisor:
             validate_recording_name(requested_name)
         base_name = requested_name or time.strftime("rec-%Y%m%dT%H%M%S")
         if requested_output:
-            capture_dir = Path(requested_output).expanduser()
+            capture_dir = Path(requested_output).expanduser().resolve()
+            recordings_dir = get_recordings_dir().resolve()
+            allowed_roots: list[Path] = [recordings_dir, *_extra_output_dir_allowlist]
+            if not any(
+                capture_dir == root or capture_dir.is_relative_to(root)
+                for root in allowed_roots
+            ):
+                raise errors.InvalidOutputDirError(
+                    "output_dir must be inside the recordings root",
+                    schema_version=schema._RECORDING_START_API_VERSION,
+                )
             return base_name, capture_dir
         recordings_dir = get_recordings_dir()
         candidate = recordings_dir / base_name

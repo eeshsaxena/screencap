@@ -32,14 +32,13 @@ from __future__ import annotations
 
 import logging
 import os
+import signal
 import socket
 import subprocess
 import sys
 import time
 from dataclasses import dataclass
 from pathlib import Path
-
-from screencap.cli._daemon_client import DaemonHTTPClient
 
 logger = logging.getLogger(__name__)
 
@@ -149,8 +148,8 @@ def _build_spawn_plan(idle_shutdown_s: int, socket_path: Path | None) -> _SpawnP
         # Entry script (pip install gives ``…/bin/screencap``).
         args = [str(binary), "serve", f"--idle-shutdown={idle_shutdown_s}"]
     else:
-        # Dev fallback: ``python -m screencap.cli serve``.
-        args = [str(binary), "-m", "screencap.cli", "serve", f"--idle-shutdown={idle_shutdown_s}"]
+        # Dev fallback: ``python -m screencap serve``.
+        args = [str(binary), "-m", "screencap", "serve", f"--idle-shutdown={idle_shutdown_s}"]
     if socket_path is not None:
         args.extend(["--socket", str(socket_path)])
     return _SpawnPlan(binary=binary, args=args)
@@ -174,11 +173,18 @@ def _open_auto_log() -> int:
         # elsewhere — drop log capture and let the spawn proceed with
         # DEVNULL output rather than write to a hostile target.
         return os.open(os.devnull, os.O_WRONLY)
-    return os.open(
-        str(log_path),
-        os.O_WRONLY | os.O_CREAT | os.O_APPEND,
-        0o600,
-    )
+    # O_NOFOLLOW prevents a symlink at the log path from redirecting
+    # writes to an attacker-controlled target.
+    try:
+        return os.open(
+            str(log_path),
+            os.O_WRONLY | os.O_CREAT | os.O_APPEND | os.O_NOFOLLOW,
+            0o600,
+        )
+    except OSError:
+        # ELOOP: log_path is a symlink. Fall through to /dev/null so the
+        # spawn still proceeds without writing through the symlink.
+        return os.open(os.devnull, os.O_WRONLY)
 
 
 def _read_log_tail(path: Path, lines: int = 20) -> str:
@@ -205,10 +211,21 @@ def _spawn_daemon(plan: _SpawnPlan) -> int:
             # ``setsid=True`` detaches the spawned process group so the
             # parent CLI can exit without its session signals reaching
             # the daemon.
+            # Strip SCREENCAP_DAEMON_* env vars from the spawned daemon's
+            # environment.  These could carry a hostile
+            # SCREENCAP_DAEMON_ENGINE_COMMAND that would execute an
+            # attacker-controlled binary with the user's Screen Recording
+            # TCC grants. The supported configuration channel for the auto-
+            # spawn case is the explicit --idle-shutdown CLI flag.
+            filtered_env = {
+                k: v
+                for k, v in os.environ.items()
+                if not k.startswith("SCREENCAP_DAEMON_")
+            }
             pid = os.posix_spawn(
                 str(plan.binary),
                 plan.args,
-                os.environ,
+                filtered_env,
                 file_actions=file_actions,
                 setsid=True,
             )
@@ -248,7 +265,7 @@ def _kill_pid_if_alive(pid: int) -> None:
     if pid <= 0:
         return
     try:
-        os.kill(pid, 15)  # SIGTERM
+        os.kill(pid, signal.SIGTERM)
     except (PermissionError, ProcessLookupError):
         pass
 
@@ -337,29 +354,9 @@ def ensure_daemon_or_spawn(
     )
 
 
-def open_client(
-    *,
-    socket_path: Path | None = None,
-    auto_spawn: bool = True,
-    stderr_emitter=None,
-) -> DaemonHTTPClient:
-    """Convenience helper: ensure daemon up, return a ``DaemonHTTPClient``.
-
-    Lifts the recurring sequence in ``screencap start``/``stop``/``status``
-    into one call so the command bodies stay narrow.
-    """
-    ensure_daemon_or_spawn(
-        socket_path=socket_path,
-        auto_spawn=auto_spawn,
-        stderr_emitter=stderr_emitter,
-    )
-    return DaemonHTTPClient(socket_path=socket_path)
-
-
 __all__ = [
     "DEFAULT_IDLE_SHUTDOWN_S",
     "DaemonAutoSpawnError",
     "LaunchAgentNotRunningError",
     "ensure_daemon_or_spawn",
-    "open_client",
 ]

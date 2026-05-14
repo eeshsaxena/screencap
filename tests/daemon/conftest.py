@@ -17,6 +17,25 @@ import pytest
 
 
 @pytest.fixture
+def allow_tmp_output_dir(tmp_path: Path):
+    """Add ``tmp_path`` to the supervisor's output-dir allowlist for this test.
+
+    Tests that pass a custom ``output_dir`` outside ``~/.screencap/recordings/``
+    (e.g. ``tmp_path / "demo"``) need this fixture to bypass the allowlist
+    check without touching production configuration. The entry is cleaned up
+    after the test.
+    """
+    from screencap.daemon import supervisor as sv
+
+    sv._extra_output_dir_allowlist.append(tmp_path.resolve())
+    yield tmp_path
+    try:
+        sv._extra_output_dir_allowlist.remove(tmp_path.resolve())
+    except ValueError:
+        pass
+
+
+@pytest.fixture
 def daemon_socket_path(tmp_path: Path) -> Path:
     return short_socket_path(tmp_path)
 

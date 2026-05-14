@@ -148,6 +148,7 @@ async def test_spawn_stop_fake_worker_reports_current_session(
     tmp_path: Path,
     fake_engine_script: Path,
     isolated_lock,
+    allow_tmp_output_dir,
 ) -> None:
     from screencap.daemon.supervisor import Supervisor
 
@@ -190,6 +191,7 @@ async def test_worker_nonzero_exit_publishes_crash_and_finalized(
     fake_engine_script: Path,
     isolated_lock,
     monkeypatch: pytest.MonkeyPatch,
+    allow_tmp_output_dir,
 ) -> None:
     from screencap.daemon.supervisor import Supervisor
 
@@ -226,6 +228,7 @@ async def test_worker_sigsegv_publishes_crash_and_finalized(
     fake_engine_script: Path,
     isolated_lock,
     monkeypatch: pytest.MonkeyPatch,
+    allow_tmp_output_dir,
 ) -> None:
     from screencap.daemon.supervisor import Supervisor
 
@@ -491,6 +494,7 @@ async def test_stop_returns_fast_when_finalized_published_during_subscribe_gap(
     fake_engine_script: Path,
     isolated_lock,
     monkeypatch: pytest.MonkeyPatch,
+    allow_tmp_output_dir,
 ) -> None:
     """TKT-A regression: ``recording_finalized`` published in the await gap
     between ``is_alive()`` and the stop subscription must NOT cause
@@ -592,6 +596,7 @@ async def test_shutdown_subscribes_with_pre_terminate_cursor(
     fake_engine_script: Path,
     isolated_lock,
     monkeypatch: pytest.MonkeyPatch,
+    allow_tmp_output_dir,
 ) -> None:
     """Same TOCTOU shape on the ``Supervisor.shutdown()`` path: the late
     subscription must use ``subscribe(since=cursor_before_terminate)`` so a
@@ -639,6 +644,7 @@ async def test_engine_stderr_burst_survives_paused_pump(
     fake_engine_script: Path,
     isolated_lock,
     monkeypatch: pytest.MonkeyPatch,
+    allow_tmp_output_dir,
 ) -> None:
     """End-to-end shape: a brief pause of ``_stderr_pump`` while the engine
     burst-writes ~150 KiB of events does not back-pressure the engine. With
@@ -687,6 +693,7 @@ async def test_shutdown_cancels_exit_poll_before_subscribe_no_double_release(
     fake_engine_script: Path,
     isolated_lock,
     monkeypatch: pytest.MonkeyPatch,
+    allow_tmp_output_dir,
 ) -> None:
     """F4 regression: shutdown() must cancel `_exit_poll` before the
     late `subscribe(since=)` so a concurrent poll iteration cannot run

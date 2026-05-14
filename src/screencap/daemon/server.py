@@ -140,9 +140,31 @@ def serve(
             if idle_shutdown_seconds is not None and idle_shutdown_seconds > 0:
                 from screencap.daemon._idle_shutdown import run_watchdog
 
-                watchdog_task = loop.create_task(
-                    run_watchdog(app, request_shutdown=request_shutdown)
-                )
+                async def _safe_watchdog() -> None:
+                    try:
+                        await run_watchdog(app, request_shutdown=request_shutdown)
+                    except asyncio.CancelledError:
+                        raise
+                    except Exception:
+                        logger.exception(
+                            "idle-shutdown watchdog raised unexpectedly; "
+                            "requesting daemon shutdown (fail-safe)"
+                        )
+                        request_shutdown()
+
+                watchdog_task = loop.create_task(_safe_watchdog())
+
+                def _watchdog_done(task: asyncio.Task) -> None:
+                    if task.cancelled():
+                        return
+                    exc = task.exception()
+                    if exc is not None:
+                        # Exception already logged inside _safe_watchdog.
+                        logger.warning(
+                            "idle-shutdown watchdog task finished with exception: %r", exc
+                        )
+
+                watchdog_task.add_done_callback(_watchdog_done)
 
             try:
                 await server_ref.serve(sockets=[listener])

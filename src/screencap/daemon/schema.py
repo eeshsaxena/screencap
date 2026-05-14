@@ -11,6 +11,7 @@ _LIST_API_VERSION = 1
 _SNAPSHOT_API_VERSION = 1
 _EVENTS_API_VERSION = 1
 _RECORDING_START_API_VERSION = 1
+RECORDING_START_API_VERSION = _RECORDING_START_API_VERSION  # public alias
 _RECORDING_STOP_API_VERSION = 1
 
 
@@ -53,7 +54,7 @@ def _load_models() -> dict[str, Any]:
     if _MODELS is not None:
         return _MODELS
 
-    from pydantic import BaseModel, ConfigDict, Field
+    from pydantic import BaseModel, ConfigDict
 
     class _DaemonModel(BaseModel):
         """Shared Pydantic model settings for documented daemon responses."""
@@ -102,6 +103,9 @@ def _load_models() -> dict[str, Any]:
         claimant_started_at: float | None = None
         engine_pid: int | None = None
         frames_written: int | None = None
+        # Phase 2 U2: server-derived provenance classification.
+        # Populated for daemon-owned sessions; None otherwise.
+        started_by: str | None = None
         cursor: int
 
     class RecordingStartRequest(_DaemonModel):
@@ -113,13 +117,10 @@ def _load_models() -> dict[str, Any]:
         # accepted, but the daemon ignores the value and logs the drop
         # at DEBUG level. No API version bump; existing clients keep
         # working unchanged.
-        started_by: str | None = Field(
-            default=None,
-            deprecated=(
-                "Server-derived from peer identity since Phase 2 U2. "
-                "Caller-supplied values are accepted but ignored."
-            ),
-        )
+        # NOTE: Do not use Pydantic ``Field(deprecated=...)`` here —
+        # that triggers a DeprecationWarning on *every* model_validate
+        # call when the field is present, flooding the daemon logs.
+        started_by: str | None = None
         description: str | None = None
         audio: bool | None = None
         output_dir: str | None = None
@@ -188,6 +189,7 @@ def __dir__() -> list[str]:
 
 __all__ = [
     "API_SCHEMA_VERSION",
+    "RECORDING_START_API_VERSION",
     "_DAEMON_INFO_API_VERSION",
     "_LIST_API_VERSION",
     "_SNAPSHOT_API_VERSION",

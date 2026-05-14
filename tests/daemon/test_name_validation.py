@@ -51,9 +51,16 @@ def test_name_with_hyphens_and_digits_accepted():
     assert validate_recording_name("rec-2026-05-13T093000-abc") is not None
 
 
-def test_unicode_letters_accepted():
-    """Non-ASCII letters are fine — only path-dangerous chars are rejected."""
-    assert validate_recording_name("récap-café") is not None
+def test_unicode_letters_rejected_under_ascii_safelist():
+    """Non-ASCII characters are rejected by the strict ASCII safelist."""
+    with pytest.raises(errors.InvalidNameError):
+        validate_recording_name("récap-café")
+
+
+def test_ascii_safelist_accepted():
+    """Characters in the ASCII safelist pass validation."""
+    assert validate_recording_name("My_Recording 2026-05-14") is not None
+    assert validate_recording_name("rec.final-v2") is not None
 
 
 @pytest.mark.parametrize(
@@ -69,6 +76,11 @@ def test_unicode_letters_accepted():
         "\\abs",
         "name\x00with-nul",
         "\x01start-with-control",
+        "trailing.",
+        "   ",
+        "rec\x1b[1mname",  # ANSI escape
+        "line\nnewline",   # embedded newline
+        "récap-café",      # non-ASCII letters
     ],
 )
 def test_rejected_paths_raise_invalid_name(name):
@@ -100,18 +112,29 @@ def test_non_string_raises():
 
 def test_reason_does_not_echo_unsafe_bytes():
     """An InvalidNameError ``reason`` should describe the violation
-    without echoing crafted bytes from the input."""
-    crafted = "evil\x07name"
-    try:
+    without echoing crafted bytes from the input.
+
+    Under the strict ASCII safelist, control characters and path separators
+    are both caught by the same ``_SAFE_CHARS_RE`` check, so both craft
+    inputs land in the same rejection branch.
+    """
+    crafted = "\x07evil"
+    with pytest.raises(errors.InvalidNameError) as exc_info:
         validate_recording_name(crafted)
-    except errors.InvalidNameError as exc:
-        # Reason mentions the violation type, not the crafted bytes.
-        # (The crafted bytes start with a printable char so the
-        # control-char branch above doesn't fire; this one trips the
-        # length-echo check.)
-        assert "name must not contain NUL" in exc.reason or "control" in exc.reason or "length" in exc.reason
-        # Crafted control bytes never appear in the reason.
-        assert "\x07" not in exc.reason
+    reason = exc_info.value.reason
+    # Reason describes the safelist constraint, not the crafted bytes.
+    assert "ASCII" in reason
+    # Crafted control bytes must not appear verbatim in the reason.
+    assert "\x07" not in reason
+
+    # Also verify a path-separator is caught by the same branch.
+    crafted_slash = "evil/name"
+    with pytest.raises(errors.InvalidNameError) as exc_info2:
+        validate_recording_name(crafted_slash)
+    reason2 = exc_info2.value.reason
+    assert "ASCII" in reason2
+    # The crafted name must not appear verbatim in the reason.
+    assert "evil/name" not in reason2
 
 
 # ----- handler-level gate -----

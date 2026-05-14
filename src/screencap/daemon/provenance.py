@@ -27,7 +27,6 @@ from __future__ import annotations
 import ctypes
 import logging
 from ctypes import c_int, c_size_t, c_uint, c_void_p
-from typing import Optional
 
 logger = logging.getLogger(__name__)
 
@@ -52,7 +51,7 @@ KERN_PROCARGS2 = 49
 _PROC_PIDPATHINFO_MAXSIZE = 4 * 1024
 
 
-def _libc() -> Optional[ctypes.CDLL]:
+def _libc() -> ctypes.CDLL | None:
     """Return libc on macOS; ``None`` on Linux (this module is no-op there).
 
     The daemon ships macOS-only, but importing this module on a Linux
@@ -65,7 +64,7 @@ def _libc() -> Optional[ctypes.CDLL]:
         return None
 
 
-def _libproc() -> Optional[ctypes.CDLL]:
+def _libproc() -> ctypes.CDLL | None:
     try:
         # Empty string opens the executable's own symbol space; macOS
         # exposes libproc.dylib here. Linux has no equivalent and will
@@ -75,7 +74,7 @@ def _libproc() -> Optional[ctypes.CDLL]:
         return None
 
 
-def _get_peer_pid(sock_fd: int) -> Optional[int]:
+def _get_peer_pid(sock_fd: int) -> int | None:
     """Return the peer's effective PID for the accepted UNIX socket.
 
     Tries ``LOCAL_PEEREPID`` first (responsible / harder-to-spoof PID),
@@ -104,7 +103,7 @@ def _get_peer_pid(sock_fd: int) -> Optional[int]:
     return None
 
 
-def _get_proc_path(pid: int) -> Optional[str]:
+def _get_proc_path(pid: int) -> str | None:
     libproc = _libproc()
     if libproc is None:
         return None
@@ -200,7 +199,7 @@ def _get_proc_argv(pid: int) -> list[str]:
     return args
 
 
-def classify_path_and_argv(path: Optional[str], argv: list[str]) -> str:
+def classify_path_and_argv(path: str | None, argv: list[str]) -> str:
     """Pure classifier (testable without sockets).
 
     Decision rules:
@@ -267,7 +266,7 @@ def derive_started_by(sock_fd: int) -> str:
     return classify_path_and_argv(path, argv)
 
 
-def _peer_fd_from_asgi_scope(scope: dict) -> Optional[int]:
+def _peer_fd_from_asgi_scope(scope: dict) -> int | None:
     """Best-effort peer-fd extraction from an ASGI request scope.
 
     Uvicorn stashes the underlying ``asyncio.Transport`` (or its socket)

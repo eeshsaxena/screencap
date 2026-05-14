@@ -12,8 +12,11 @@ This module supplies the watchdog. LaunchAgent-managed daemons keep
 is invoked with ``--idle-shutdown=<secs>`` (auto-spawn passes 600).
 
 Activity sources counted against the idle window:
-- Any HTTP request handled by the app (middleware bumps the
-  timestamp on the request START so long-poll subscriptions count).
+- Mutating HTTP requests: ``recording.start`` and ``recording.stop``
+  (middleware bumps the timestamp on the request START).
+  Read-only poll routes like ``session.snapshot`` are excluded so
+  that cron-driven ``screencap status`` calls do not keep the daemon
+  alive permanently.
 - ``event_bus.subscriber_count() > 0`` — a held subscription is a
   live conversation even between request boundaries.
 - ``supervisor.has_active_session()`` — an in-flight recording must
@@ -39,15 +42,36 @@ logger = logging.getLogger(__name__)
 _POLL_INTERVAL_S = 5.0
 
 
+# Paths that count as "activity" for idle-shutdown purposes.
+# Read-only polling routes (``session.snapshot``, ``recording.list``,
+# ``daemon.info``) do NOT count — a cron-driven ``screencap status``
+# should not prevent the auto-spawned daemon from shutting down.
+# The events subscription stream keeps the daemon busy via the
+# ``subscriber_count() > 0`` check in ``_daemon_is_busy``, so it does
+# not need to be listed here.
+_ACTIVITY_PATHS = frozenset(
+    {
+        "/v0/recording.start",
+        "/v0/recording.stop",
+    }
+)
+
+
 class _ActivityMiddleware(BaseHTTPMiddleware):
-    """Bump ``app.state.idle_last_activity`` on every request entry."""
+    """Bump ``app.state.idle_last_activity`` on mutating requests only.
+
+    Read-only polling routes such as ``GET /v0/session.snapshot`` are
+    explicitly excluded so that cron-driven ``screencap status`` calls do
+    not keep an auto-spawned daemon alive indefinitely.
+    """
 
     async def dispatch(
         self,
         request: Request,
         call_next: Callable[[Request], Awaitable[Response]],
     ) -> Response:
-        request.app.state.idle_last_activity = time.monotonic()
+        if request.url.path in _ACTIVITY_PATHS:
+            request.app.state.idle_last_activity = time.monotonic()
         return await call_next(request)
 
 
