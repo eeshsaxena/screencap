@@ -121,7 +121,7 @@ def test_macos_embed_script_writes_dev_aware_daemon_launcher():
     repo_root = Path(__file__).resolve().parents[2]
     embed_script = repo_root / "macos" / "ScreenCap" / "Scripts" / "embed-cli.sh"
 
-    text = embed_script.read_text()
+    text = embed_script.read_text(encoding="utf-8")
 
     assert "screencap-daemon-launcher" in text
     assert "SCREENCAP_DAEMON_USE_DEV_SOURCE" in text
@@ -129,16 +129,22 @@ def test_macos_embed_script_writes_dev_aware_daemon_launcher():
     assert "SCREENCAP_DEV_PYTHON" in text
     assert "PYTHONPATH" in text
     assert "sys.executable" in text
-    assert "exec \"${PYTHON}\" -m screencap" in text
+    assert "exec \"${RESOLVED}\" -m screencap" in text
     assert "exec \"${SCRIPT_DIR}/screencap/screencap\" \"$@\"" in text
     assert ".pyenv/shims" not in text
+    # Dev-source branch must be gated on CONFIGURATION=Debug so release
+    # builds get a launcher with only the bundled-binary exec.
+    assert '[ "${CONFIGURATION:-}" = "Debug" ]' in text
+    # python3 lookup must tolerate `command -v` returning empty under set -u
+    # (otherwise launchd respawns us in a tight loop on missing python3).
+    assert 'command -v python3 || true' in text
 
 
 def test_macos_build_script_publishes_resolved_dev_python_for_helper():
     repo_root = Path(__file__).resolve().parents[2]
     build_script = repo_root / "script" / "build_and_run.sh"
 
-    text = build_script.read_text()
+    text = build_script.read_text(encoding="utf-8")
 
     assert "SCREENCAP_DEV_PYTHON" in text
     assert '"$HOME/.pyenv/shims/python3"' in text

@@ -19,6 +19,7 @@ struct ScreenCapApp: App {
                     appDelegate.bind(recorder: recorder)
                     recorder.bindIndex(index)
                     recorder.bindPermissions(permissions)
+                    permissions.refresh()
                 }
                 .task {
                     if ProcessInfo.processInfo.environment["XCTestConfigurationFilePath"] == nil {

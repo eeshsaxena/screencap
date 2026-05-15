@@ -60,7 +60,10 @@ final class RecorderControllerTests: XCTestCase {
 
         XCTAssertEqual(recorder.state, .starting)
         XCTAssertNil(recorder.lastError)
-        try? await Task.sleep(nanoseconds: 100_000_000)
+        // Tear down the in-flight daemon event Task so it doesn't leak past
+        // the assertion frame. Sleeping a fixed 100ms here lets the Task
+        // run unsupervised — cancel + await the cancellation instead.
+        await recorder._testCancelDaemonTask()
     }
 
     func testCLIFallbackStillBlocksStartOnAppProcessPermissions() {

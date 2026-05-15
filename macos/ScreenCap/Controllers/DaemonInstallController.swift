@@ -293,6 +293,15 @@ final class SMAppServiceRegistration: DaemonRegistrationService {
         return service.status
     }
 
+    /// Destructive: unregisters the LaunchAgent, then re-registers. If the
+    /// `register()` step fails after `unregister()` succeeded, the user is
+    /// left WITHOUT a registered helper — any pre-existing TCC approval for
+    /// the daemon's bundle identifier may need to be re-granted (the user
+    /// will be prompted again on next install). Callers must handle the
+    /// thrown error by surfacing a concrete failure reason via
+    /// `state = .installFailed(...)` so the UI can guide a manual retry.
+    /// Prefer non-destructive recovery (e.g. `launchctl kickstart`) when
+    /// the daemon socket already exists and only its process is wedged.
     func refresh(plistName: String) async throws -> SMAppService.Status {
         let service = SMAppService.agent(plistName: plistName)
         if service.status == .enabled || service.status == .requiresApproval {

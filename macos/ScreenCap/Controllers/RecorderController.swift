@@ -224,7 +224,13 @@ final class RecorderController: ObservableObject {
                 state = .recording(elapsed: Date().timeIntervalSince(start))
                 attachDaemonEventStream()
                 startElapsedTimer()
-                startPermissionWatchdog()
+                // The watchdog only re-checks TCC for the app process during
+                // CLI-fallback recordings (see checkPermissionsDuringRecording).
+                // Skip arming it on the daemon transport so we don't wake the
+                // Timer and NSWorkspace observer to immediately no-op.
+                if transport == .cliFallback {
+                    startPermissionWatchdog()
+                }
             } else {
                 lastError = "Another process is recording."
                 state = .idle
@@ -261,6 +267,11 @@ final class RecorderController: ObservableObject {
     }
 
     private func startViaCLI(name: String? = nil) {
+        // Same shape as the outer guard in start(name:), but it covers the
+        // case where `handleDaemonOperationFailure` flips transport to
+        // .cliFallback and invokes us as a fallback — at that point the
+        // outer guard has already passed (it gated on the prior .daemon
+        // transport) so we must re-check before spawning the CLI.
         if let permissions, !permissions.allRequiredGranted {
             state = .idle
             lastError = Self.requiredPermissionsErrorMessage
@@ -308,7 +319,11 @@ final class RecorderController: ObservableObject {
             )
             pendingStartCursor = response.cursor
             attachDaemonEventStream()
-            startPermissionWatchdog()
+            // Same rationale as syncDaemonSnapshot: on the daemon transport
+            // the watchdog's check is a guarded no-op, so don't arm it.
+            if transport == .cliFallback {
+                startPermissionWatchdog()
+            }
         } catch {
             handleDaemonOperationFailure(error, fallback: {
                 self.startViaCLI(name: name)
@@ -633,6 +648,18 @@ final class RecorderController: ObservableObject {
                 }
                 if snapshot.recovering {
                     lastError = "ScreenCap daemon is recovering the previous recording session."
+                }
+                // If the daemon snapshot says recording stopped while our local
+                // state still says recording, the previous run terminated
+                // outside this controller's awareness (engine crash, external
+                // `screencap stop`, daemon restart that lost session). Without
+                // this branch the `subscribe` below would wait forever on a
+                // dead session and the UI would stay stuck in `.recording`
+                // until the 10×backoff cap fires.
+                if snapshot.isRecording == false, state.isRecording {
+                    state = .idle
+                    lastError = "Recording ended."
+                    return
                 }
 
                 // Until we receive `started` or `recording_failed`, keep using

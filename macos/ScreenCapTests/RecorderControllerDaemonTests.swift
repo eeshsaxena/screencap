@@ -152,6 +152,36 @@ final class RecorderControllerDaemonTests: XCTestCase {
         XCTAssertGreaterThanOrEqual(eventConnectionCount.value, 2)
     }
 
+    /// When `/v0/session.snapshot` reports another claimant owns the active
+    /// recording (`is_recording=true`, `daemon_owned=false`), the SwiftUI
+    /// controller must surface the conflict via `lastError` and leave its
+    /// own state at `.idle` rather than blindly attaching to a session
+    /// it doesn't own.
+    func testProbeDaemonSurfacesForeignRecordingAsLastError() async throws {
+        _ = try startServer { request in
+            switch request.path {
+            case "/v0/daemon.info":
+                return .json(#"{"ok":true,"schema_version":1,"daemon_version":"test","api_schema_version":1,"build":null,"started_at":1.0}"#)
+            case "/v0/session.snapshot":
+                // Active recording, but daemon does not own it — another
+                // process (e.g. a bare `screencap start` invocation) is the
+                // claimant. The controller should not attach.
+                return .json(#"{"ok":true,"schema_version":1,"daemon_version":"test","api_schema_version":1,"is_recording":true,"daemon_owned":false,"recording_name":"foreign","started_at":10.0,"claimant":"cli","recovering":false,"cursor":1}"#)
+            default:
+                XCTFail("Unexpected request path \(request.path)")
+                return .json(#"{"ok":false,"schema_version":1,"daemon_version":"test","api_schema_version":1,"error":"unexpected"}"#, status: 500)
+            }
+        }
+
+        let recorder = RecorderController()
+        self.recorder = recorder
+        await recorder.probeDaemon()
+
+        XCTAssertEqual(recorder.transport, .daemon)
+        XCTAssertEqual(recorder.lastError, "Another process is recording.")
+        XCTAssertEqual(recorder.state, .idle)
+    }
+
     func testSchemaMismatchFromProbeSetsPublishedFlagAndFallsBackToCLI() async throws {
         _ = try startServer { _ in
             .json(#"{"ok":true,"schema_version":1,"daemon_version":"test","api_schema_version":99,"build":null,"started_at":1.0}"#)

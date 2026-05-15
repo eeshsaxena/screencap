@@ -64,7 +64,14 @@ struct MainWindow: View {
         .onChange(of: recorder.daemonProbeCompleted) { _ in
             updateFirstRunSheetPresentation()
         }
-        .onChange(of: recorder.transport) { _ in
+        .onChange(of: recorder.transport) { newTransport in
+            // Probe later succeeded after an earlier .cliFallback bounce
+            // (e.g. cold-boot helper socket race): close the sheet so the
+            // user isn't asked to re-grant permissions the daemon now
+            // satisfies.
+            if newTransport == .daemon {
+                showingPermissionsSheet = false
+            }
             updateFirstRunSheetPresentation()
         }
         .onChange(of: section) { new in
@@ -79,6 +86,13 @@ struct MainWindow: View {
     }
 
     private func updateFirstRunSheetPresentation() {
+        // Don't pop the first-run sheet over an active recording. The transport
+        // can flip to .cliFallback mid-recording (schemaMismatch /
+        // socketUnavailable / connectionFailed) and we don't want to interrupt
+        // the in-flight capture with a permissions walkthrough.
+        if recorder.state.isRecording {
+            return
+        }
         if FirstRunSetupPresentationPolicy.shouldPresentOnLaunch(
             daemonProbeCompleted: recorder.daemonProbeCompleted,
             transport: recorder.transport

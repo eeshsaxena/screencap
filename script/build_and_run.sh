@@ -25,16 +25,40 @@ usage() {
 }
 
 load_local_env() {
-  # Source repo-root .env if present so local-only config (e.g. DEVELOPMENT_TEAM)
+  # Parse repo-root .env if present so local-only config (e.g. DEVELOPMENT_TEAM)
   # reaches xcodegen and xcodebuild without a manual `source` step.
   # The file is gitignored; see macos/README.md for what belongs in it.
+  #
+  # We deliberately don't `source` it: `source` would evaluate backticks,
+  # $(…), and trailing `;` payloads as shell, turning a misplaced .env
+  # into arbitrary code execution. Parse KEY=VALUE lines literally instead.
   local env_file="$ROOT_DIR/.env"
-  if [[ -f "$env_file" ]]; then
-    set -a
-    # shellcheck disable=SC1090
-    source "$env_file"
-    set +a
+  if [[ ! -f "$env_file" ]]; then
+    return
   fi
+
+  local key value
+  while IFS='=' read -r key value || [[ -n "$key" ]]; do
+    # Skip blank lines and comments.
+    if [[ -z "$key" || "$key" =~ ^[[:space:]]*# ]]; then
+      continue
+    fi
+    # Trim whitespace around the key; reject anything that isn't a
+    # plausible identifier so malformed lines don't smuggle in syntax.
+    key="${key#"${key%%[![:space:]]*}"}"
+    key="${key%"${key##*[![:space:]]}"}"
+    if [[ ! "$key" =~ ^[A-Za-z_][A-Za-z0-9_]*$ ]]; then
+      continue
+    fi
+    # Strip optional surrounding single or double quotes from the value.
+    value="${value%$'\r'}"
+    if [[ "$value" =~ ^\".*\"$ ]]; then
+      value="${value:1:${#value}-2}"
+    elif [[ "$value" =~ ^\'.*\'$ ]]; then
+      value="${value:1:${#value}-2}"
+    fi
+    export "$key=$value"
+  done < "$env_file"
 }
 
 prepend_path_if_dir() {
@@ -99,6 +123,12 @@ warn_if_ad_hoc_signing() {
 }
 
 publish_launch_env() {
+  # NOTE: `launchctl setenv` here publishes vars to the entire GUI session,
+  # so every LaunchAgent-spawned process (not just our daemon) inherits
+  # SCREENCAP_DAEMON_USE_DEV_SOURCE, SCREENCAP_DEV_REPO_ROOT, etc. That's
+  # the trade-off that lets the daemon helper see them without per-process
+  # plumbing. If you ever care about scoping these to just the daemon,
+  # switch to `launchctl bootout` + a custom plist with EnvironmentVariables.
   /bin/launchctl setenv PATH "$PATH"
   /bin/launchctl setenv SCREENCAP_DEV_REPO_ROOT "$SCREENCAP_DEV_REPO_ROOT"
   if [[ -n "${SCREENCAP_DEV_PYTHON:-}" ]]; then
@@ -153,7 +183,13 @@ build_cli_if_needed() {
   fi
 
   echo "Building screencap CLI bundle for helper..."
-  "$SCREENCAP_DEV_PYTHON" -m PyInstaller --noconfirm "$ROOT_DIR/pyinstaller/screencap.spec"
+  # Subshell-cd so PyInstaller writes dist/ and build/ relative to the repo
+  # root regardless of where this script was invoked from. The outer cwd
+  # stays unchanged.
+  (
+    cd "$ROOT_DIR"
+    "$SCREENCAP_DEV_PYTHON" -m PyInstaller --noconfirm "$ROOT_DIR/pyinstaller/screencap.spec"
+  )
 }
 
 kill_existing_app() {

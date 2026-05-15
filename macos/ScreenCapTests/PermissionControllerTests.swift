@@ -58,9 +58,12 @@ final class PermissionControllerTests: XCTestCase {
     }
 
     func testDaemonTCCSubjectUsesSamePrivacyPaneDeepLinks() {
+        // settingsURL returns the same destination regardless of subject,
+        // because TCC panes list every subject in one list. Subject-specific
+        // behavior lives in `requestAndOpenSettings` (request flow gate).
         for pane in [PrivacyPane.screenRecording, .accessibility, .inputMonitoring] {
             XCTAssertEqual(
-                PermissionController.settingsURL(for: pane, subject: .daemon),
+                PermissionController.settingsURL(for: pane),
                 pane.deepLinkURL
             )
         }
