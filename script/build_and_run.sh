@@ -22,6 +22,19 @@ usage() {
   exit 2
 }
 
+load_local_env() {
+  # Source repo-root .env if present so local-only config (e.g. DEVELOPMENT_TEAM)
+  # reaches xcodegen and xcodebuild without a manual `source` step.
+  # The file is gitignored; see macos/README.md for what belongs in it.
+  local env_file="$ROOT_DIR/.env"
+  if [[ -f "$env_file" ]]; then
+    set -a
+    # shellcheck disable=SC1090
+    source "$env_file"
+    set +a
+  fi
+}
+
 prepend_path_if_dir() {
   local dir="$1"
   if [[ -d "$dir" && ":$PATH:" != *":$dir:"* ]]; then
@@ -172,6 +185,10 @@ main() {
       usage
       ;;
   esac
+
+  # Pick up local-only config (DEVELOPMENT_TEAM etc.) before tool discovery so
+  # xcodegen and xcodebuild see the right signing identity.
+  load_local_env
 
   # Normalize PATH before any tool discovery so Homebrew-installed helpers
   # like xcodegen are found even when the script is launched from a minimal
