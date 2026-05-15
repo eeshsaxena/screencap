@@ -3,7 +3,7 @@
 <plist version="1.0">
 <dict>
 	<key>BundleProgram</key>
-	<string>Contents/Resources/screencap/screencap</string>
+	<string>Contents/Resources/screencap-daemon-launcher</string>
 	<key>EnvironmentVariables</key>
 	<dict>
 		<key>PATH</key>
@@ -24,7 +24,7 @@
 	<string>Adaptive</string>
 	<key>ProgramArguments</key>
 	<array>
-		<string>screencap</string>
+		<string>screencap-daemon-launcher</string>
 		<string>serve</string>
 	</array>
 	<key>RunAtLoad</key>

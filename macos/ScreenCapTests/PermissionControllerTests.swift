@@ -3,6 +3,16 @@ import XCTest
 
 final class PermissionControllerTests: XCTestCase {
     @MainActor
+    func testPermissionControllerStartsWithoutAppTCCChecks() {
+        let permissions = PermissionController()
+
+        XCTAssertEqual(permissions.screenRecording, .notDetermined)
+        XCTAssertEqual(permissions.accessibility, .notDetermined)
+        XCTAssertEqual(permissions.inputMonitoring, .notDetermined)
+        XCTAssertEqual(permissions.microphone, .notDetermined)
+    }
+
+    @MainActor
     func testPermissionSheetDismissesBeforeRelaunching() async {
         var events: [String] = []
 
@@ -48,13 +58,43 @@ final class PermissionControllerTests: XCTestCase {
     }
 
     func testDaemonTCCSubjectUsesSamePrivacyPaneDeepLinks() {
+        // settingsURL returns the same destination regardless of subject,
+        // because TCC panes list every subject in one list. Subject-specific
+        // behavior lives in `requestAndOpenSettings` (request flow gate).
         for pane in [PrivacyPane.screenRecording, .accessibility, .inputMonitoring] {
             XCTAssertEqual(
-                PermissionController.settingsURL(for: pane, subject: .daemon),
+                PermissionController.settingsURL(for: pane),
                 pane.deepLinkURL
             )
         }
 
         XCTAssertEqual(PermissionSubject.daemon.bundleIdentifier, "com.screencap.daemon")
+    }
+
+    func testFirstRunSetupWaitsForDaemonProbeBeforePresenting() {
+        XCTAssertFalse(
+            FirstRunSetupPresentationPolicy.shouldPresentOnLaunch(
+                daemonProbeCompleted: false,
+                transport: .cliFallback
+            )
+        )
+    }
+
+    func testFirstRunSetupDoesNotPresentForDaemonTransport() {
+        XCTAssertFalse(
+            FirstRunSetupPresentationPolicy.shouldPresentOnLaunch(
+                daemonProbeCompleted: true,
+                transport: .daemon
+            )
+        )
+    }
+
+    func testFirstRunSetupPresentsWhenDaemonProbeFallsBackToCLI() {
+        XCTAssertTrue(
+            FirstRunSetupPresentationPolicy.shouldPresentOnLaunch(
+                daemonProbeCompleted: true,
+                transport: .cliFallback
+            )
+        )
     }
 }

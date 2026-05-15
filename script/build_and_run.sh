@@ -13,6 +13,8 @@ BUNDLE_ID="com.screencap.macos"
 DERIVED_DATA="$ROOT_DIR/.build/ScreenCapDerivedData"
 APP_BUNDLE="$DERIVED_DATA/Build/Products/$CONFIGURATION/$APP_NAME.app"
 APP_BINARY="$APP_BUNDLE/Contents/MacOS/$APP_NAME"
+CLI_BUNDLE="$ROOT_DIR/dist/screencap"
+CLI_BINARY="$CLI_BUNDLE/screencap"
 RUN_LOG_DIR="$ROOT_DIR/.build/run"
 STDOUT_LOG="$RUN_LOG_DIR/$APP_NAME.stdout.log"
 STDERR_LOG="$RUN_LOG_DIR/$APP_NAME.stderr.log"
@@ -23,23 +25,59 @@ usage() {
 }
 
 load_local_env() {
-  # Source repo-root .env if present so local-only config (e.g. DEVELOPMENT_TEAM)
+  # Parse repo-root .env if present so local-only config (e.g. DEVELOPMENT_TEAM)
   # reaches xcodegen and xcodebuild without a manual `source` step.
   # The file is gitignored; see macos/README.md for what belongs in it.
+  #
+  # We deliberately don't `source` it: `source` would evaluate backticks,
+  # $(…), and trailing `;` payloads as shell, turning a misplaced .env
+  # into arbitrary code execution. Parse KEY=VALUE lines literally instead.
   local env_file="$ROOT_DIR/.env"
-  if [[ -f "$env_file" ]]; then
-    set -a
-    # shellcheck disable=SC1090
-    source "$env_file"
-    set +a
+  if [[ ! -f "$env_file" ]]; then
+    return
   fi
+
+  local key value
+  while IFS='=' read -r key value || [[ -n "$key" ]]; do
+    # Skip blank lines and comments.
+    if [[ -z "$key" || "$key" =~ ^[[:space:]]*# ]]; then
+      continue
+    fi
+    # Trim whitespace around the key; reject anything that isn't a
+    # plausible identifier so malformed lines don't smuggle in syntax.
+    key="${key#"${key%%[![:space:]]*}"}"
+    key="${key%"${key##*[![:space:]]}"}"
+    if [[ ! "$key" =~ ^[A-Za-z_][A-Za-z0-9_]*$ ]]; then
+      continue
+    fi
+    # Strip optional surrounding single or double quotes from the value.
+    value="${value%$'\r'}"
+    if [[ "$value" =~ ^\".*\"$ ]]; then
+      value="${value:1:${#value}-2}"
+    elif [[ "$value" =~ ^\'.*\'$ ]]; then
+      value="${value:1:${#value}-2}"
+    fi
+    export "$key=$value"
+  done < "$env_file"
 }
 
 prepend_path_if_dir() {
   local dir="$1"
-  if [[ -d "$dir" && ":$PATH:" != *":$dir:"* ]]; then
-    PATH="$dir:$PATH"
+  local entry
+  local new_path="$dir"
+  local path_entries=()
+
+  if [[ ! -d "$dir" ]]; then
+    return
   fi
+
+  IFS=":" read -r -a path_entries <<<"${PATH:-}"
+  for entry in "${path_entries[@]}"; do
+    [[ -z "$entry" || "$entry" == "$dir" ]] && continue
+    new_path="$new_path:$entry"
+  done
+
+  PATH="$new_path"
 }
 
 prepare_launch_env() {
@@ -50,6 +88,26 @@ prepare_launch_env() {
 
   export PATH
   export SCREENCAP_DEV_REPO_ROOT="${SCREENCAP_DEV_REPO_ROOT:-$ROOT_DIR}"
+  resolve_dev_python
+}
+
+resolve_dev_python() {
+  local python_cmd="${SCREENCAP_DEV_PYTHON:-}"
+  local resolved_python
+
+  if [[ -z "$python_cmd" && -x "$HOME/.pyenv/shims/python3" ]]; then
+    python_cmd="$HOME/.pyenv/shims/python3"
+  fi
+  if [[ -z "$python_cmd" ]]; then
+    python_cmd="$(command -v python3 || true)"
+  fi
+  if [[ -z "$python_cmd" ]]; then
+    return
+  fi
+
+  if resolved_python="$("$python_cmd" -c 'import sys; print(sys.executable)' 2>/dev/null)" && [[ -x "$resolved_python" ]]; then
+    export SCREENCAP_DEV_PYTHON="$resolved_python"
+  fi
 }
 
 warn_if_ad_hoc_signing() {
@@ -65,8 +123,24 @@ warn_if_ad_hoc_signing() {
 }
 
 publish_launch_env() {
+  # NOTE: `launchctl setenv` here publishes vars to the entire GUI session,
+  # so every LaunchAgent-spawned process (not just our daemon) inherits
+  # SCREENCAP_DAEMON_USE_DEV_SOURCE, SCREENCAP_DEV_REPO_ROOT, etc. That's
+  # the trade-off that lets the daemon helper see them without per-process
+  # plumbing. If you ever care about scoping these to just the daemon,
+  # switch to `launchctl bootout` + a custom plist with EnvironmentVariables.
   /bin/launchctl setenv PATH "$PATH"
   /bin/launchctl setenv SCREENCAP_DEV_REPO_ROOT "$SCREENCAP_DEV_REPO_ROOT"
+  if [[ -n "${SCREENCAP_DEV_PYTHON:-}" ]]; then
+    /bin/launchctl setenv SCREENCAP_DEV_PYTHON "$SCREENCAP_DEV_PYTHON"
+  else
+    /bin/launchctl unsetenv SCREENCAP_DEV_PYTHON
+  fi
+  if [[ "${SCREENCAP_DAEMON_USE_DEV_SOURCE:-0}" == "1" ]]; then
+    /bin/launchctl setenv SCREENCAP_DAEMON_USE_DEV_SOURCE "1"
+  else
+    /bin/launchctl unsetenv SCREENCAP_DAEMON_USE_DEV_SOURCE
+  fi
 }
 
 generate_project_if_needed() {
@@ -95,6 +169,26 @@ generate_project_if_needed() {
   (
     cd "$MACOS_DIR"
     xcodegen generate
+  )
+}
+
+build_cli_if_needed() {
+  if [[ -x "$CLI_BINARY" ]] && "$CLI_BINARY" serve --help >/dev/null 2>&1; then
+    return
+  fi
+
+  if [[ -z "${SCREENCAP_DEV_PYTHON:-}" ]]; then
+    echo "error: unable to resolve python3 for PyInstaller CLI build." >&2
+    exit 1
+  fi
+
+  echo "Building screencap CLI bundle for helper..."
+  # Subshell-cd so PyInstaller writes dist/ and build/ relative to the repo
+  # root regardless of where this script was invoked from. The outer cwd
+  # stays unchanged.
+  (
+    cd "$ROOT_DIR"
+    "$SCREENCAP_DEV_PYTHON" -m PyInstaller --noconfirm "$ROOT_DIR/pyinstaller/screencap.spec"
   )
 }
 
@@ -143,6 +237,7 @@ launch_debugger() {
   env \
     PATH="$PATH" \
     SCREENCAP_DEV_REPO_ROOT="$SCREENCAP_DEV_REPO_ROOT" \
+    SCREENCAP_DEV_PYTHON="${SCREENCAP_DEV_PYTHON:-}" \
     lldb -- "$APP_BINARY"
 }
 
@@ -197,6 +292,7 @@ main() {
   generate_project_if_needed
   warn_if_ad_hoc_signing
   kill_existing_app
+  build_cli_if_needed
   build_app
 
   case "$MODE" in

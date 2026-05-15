@@ -120,7 +120,7 @@ def _daemon_env(tmp_path: Path, fake_engine_script: Path) -> dict[str, str]:
         **os.environ,
         "PYTHONPATH": str(Path(__file__).resolve().parents[2] / "src"),
         "HOME": str(tmp_path / "home"),
-        "SCREENCAP_RECORDINGS_DIR": str(tmp_path / "recordings"),
+        "SCREENCAP_RECORDINGS_DIR": str(tmp_path),
         "SCREENCAP_DAEMON_ENGINE_COMMAND": json.dumps(
             [sys.executable, str(fake_engine_script), "{encoded_args}"]
         ),

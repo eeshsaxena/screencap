@@ -110,11 +110,53 @@ def test_bundled_macos_launchagent_plist_matches_renderer():
     bundled = repo_root / "macos" / "ScreenCap" / "Resources" / "com.screencap.daemon.plist"
 
     expected = launchagent.render_plist(
-        program="screencap",
-        bundle_program="Contents/Resources/screencap/screencap",
+        program="screencap-daemon-launcher",
+        bundle_program="Contents/Resources/screencap-daemon-launcher",
     )
 
     assert bundled.read_bytes() == expected
+
+
+def test_macos_embed_script_writes_dev_aware_daemon_launcher():
+    repo_root = Path(__file__).resolve().parents[2]
+    embed_script = repo_root / "macos" / "ScreenCap" / "Scripts" / "embed-cli.sh"
+
+    text = embed_script.read_text(encoding="utf-8")
+
+    assert "screencap-daemon-launcher" in text
+    assert "SCREENCAP_DAEMON_USE_DEV_SOURCE" in text
+    assert "SCREENCAP_DEV_REPO_ROOT" in text
+    assert "SCREENCAP_DEV_PYTHON" in text
+    assert "PYTHONPATH" in text
+    assert "sys.executable" in text
+    assert "exec \"${RESOLVED}\" -m screencap" in text
+    assert "exec \"${SCRIPT_DIR}/screencap/screencap\" \"$@\"" in text
+    assert ".pyenv/shims" not in text
+    # Dev-source branch must be gated on CONFIGURATION=Debug so release
+    # builds get a launcher with only the bundled-binary exec.
+    assert '[ "${CONFIGURATION:-}" = "Debug" ]' in text
+    # python3 lookup must tolerate `command -v` returning empty under set -u
+    # (otherwise launchd respawns us in a tight loop on missing python3).
+    assert 'command -v python3 || true' in text
+
+
+def test_macos_build_script_publishes_resolved_dev_python_for_helper():
+    repo_root = Path(__file__).resolve().parents[2]
+    build_script = repo_root / "script" / "build_and_run.sh"
+
+    text = build_script.read_text(encoding="utf-8")
+
+    assert "SCREENCAP_DEV_PYTHON" in text
+    assert '"$HOME/.pyenv/shims/python3"' in text
+    assert "import sys; print(sys.executable)" in text
+    assert "/bin/launchctl setenv SCREENCAP_DEV_PYTHON" in text
+    assert "/bin/launchctl unsetenv SCREENCAP_DAEMON_USE_DEV_SOURCE" in text
+    assert "serve --help" in text
+    assert "-m PyInstaller" in text
+    assert 'read -r -a path_entries' in text
+    assert '[[ -z "$entry" || "$entry" == "$dir" ]] && continue' in text
+    assert 'PATH="$new_path"' in text
+    assert '":$PATH:" != *":$dir:"*' not in text
 
 
 def test_install_bootstraps_and_reports_running(monkeypatch: pytest.MonkeyPatch, tmp_path: Path):

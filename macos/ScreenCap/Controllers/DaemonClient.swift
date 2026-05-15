@@ -5,6 +5,25 @@ import os
 
 private let daemonLogger = Logger(subsystem: "com.screencap.macos", category: "daemon-client")
 
+private final class DaemonStreamConnectionBox: @unchecked Sendable {
+    private let lock = NSLock()
+    private var connection: NWConnection?
+
+    func set(_ connection: NWConnection?) {
+        lock.lock()
+        self.connection = connection
+        lock.unlock()
+    }
+
+    func cancel() {
+        lock.lock()
+        let connection = self.connection
+        self.connection = nil
+        lock.unlock()
+        connection?.cancel()
+    }
+}
+
 enum DaemonClientError: LocalizedError {
     case socketUnavailable(path: String)
     case connectionFailed(underlying: Error)
@@ -223,9 +242,12 @@ enum DaemonClient {
 
     static func subscribe(
         path: String = "/v0/events",
-        sinceCursor: Int? = nil
+        sinceCursor: Int? = nil,
+        socketPathOverride: String? = nil
     ) -> AsyncThrowingStream<RecorderEventLine, Error> {
         AsyncThrowingStream { continuation in
+            let connectionBox = DaemonStreamConnectionBox()
+
             let task = Task {
                 let queryPath: String
                 if let sinceCursor {
@@ -234,13 +256,14 @@ enum DaemonClient {
                     queryPath = path
                 }
 
-                let socket = socketPath()
+                let socket = socketPathOverride ?? socketPath()
                 guard FileManager.default.fileExists(atPath: socket) else {
                     continuation.finish(throwing: DaemonClientError.socketUnavailable(path: socket))
                     return
                 }
 
                 let connection = NWConnection(to: .unix(path: socket), using: .tcp)
+                connectionBox.set(connection)
                 do {
                     try await connect(connection)
                     try await sendRequest(connection: connection, method: "GET", path: queryPath, body: nil)
@@ -289,15 +312,18 @@ enum DaemonClient {
                             }
                         }
                     }
-                    connection.cancel()
+                    connectionBox.cancel()
                     continuation.finish()
                 } catch {
-                    connection.cancel()
+                    connectionBox.cancel()
                     continuation.finish(throwing: error)
                 }
             }
 
-            continuation.onTermination = { _ in task.cancel() }
+            continuation.onTermination = { _ in
+                task.cancel()
+                connectionBox.cancel()
+            }
         }
     }
 

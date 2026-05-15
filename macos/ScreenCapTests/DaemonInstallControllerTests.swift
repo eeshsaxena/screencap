@@ -76,6 +76,26 @@ final class DaemonInstallControllerTests: XCTestCase {
         XCTAssertEqual(controller.state, .pollingFailed(reason: "Daemon did not respond within 0s"))
     }
 
+    func testEnabledDaemonThatDoesNotRespondRefreshesRegistrationOnce() async {
+        let registration = FakeDaemonRegistrationService(
+            registerStatuses: [.enabled],
+            refreshStatuses: [.enabled]
+        )
+        let probe = FakeDaemonProbe(results: [false, true])
+        let controller = DaemonInstallController(
+            registrationService: registration,
+            probe: probe,
+            sleep: { _ in }
+        )
+
+        await controller.install(timeoutSeconds: 0, probeIntervalSeconds: 0.01)
+
+        XCTAssertEqual(registration.registeredPlistNames, [DaemonInstallController.plistName])
+        XCTAssertEqual(registration.refreshedPlistNames, [DaemonInstallController.plistName])
+        XCTAssertEqual(probe.callCount, 2)
+        XCTAssertEqual(controller.state, .installedAndRunning)
+    }
+
     func testProbeFailureKeepsPollingUntilTimeout() async {
         let probe = FakeDaemonProbe(results: [false, false, true])
         let controller = DaemonInstallController(
@@ -132,21 +152,30 @@ final class DaemonInstallControllerTests: XCTestCase {
 @MainActor
 private final class FakeDaemonRegistrationService: DaemonRegistrationService {
     private var registerStatuses: [SMAppService.Status]
+    private var refreshStatuses: [SMAppService.Status]
     private var currentStatuses: [SMAppService.Status]
     private(set) var registeredPlistNames: [String] = []
+    private(set) var refreshedPlistNames: [String] = []
     private(set) var currentStatusCallCount = 0
 
     init(
         registerStatuses: [SMAppService.Status],
+        refreshStatuses: [SMAppService.Status] = [],
         currentStatuses: [SMAppService.Status] = []
     ) {
         self.registerStatuses = registerStatuses
+        self.refreshStatuses = refreshStatuses
         self.currentStatuses = currentStatuses
     }
 
     func register(plistName: String) async throws -> SMAppService.Status {
         registeredPlistNames.append(plistName)
         return registerStatuses.isEmpty ? .enabled : registerStatuses.removeFirst()
+    }
+
+    func refresh(plistName: String) async throws -> SMAppService.Status {
+        refreshedPlistNames.append(plistName)
+        return refreshStatuses.isEmpty ? .enabled : refreshStatuses.removeFirst()
     }
 
     func currentStatus(plistName: String) -> SMAppService.Status {

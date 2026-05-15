@@ -38,6 +38,63 @@ final class RecorderControllerTests: XCTestCase {
         )
     }
 
+    func testDaemonTransportDoesNotBlockStartOnAppProcessPermissions() async {
+        let previousSocket = getenv("SCREENCAP_DAEMON_SOCKET").map { String(cString: $0) }
+        setenv("SCREENCAP_DAEMON_SOCKET", "/tmp/sc-missing-\(UUID().uuidString).sock", 1)
+        defer {
+            if let previousSocket {
+                setenv("SCREENCAP_DAEMON_SOCKET", previousSocket, 1)
+            } else {
+                unsetenv("SCREENCAP_DAEMON_SOCKET")
+            }
+        }
+
+        let permissions = PermissionController()
+        permissions._testSetRequiredPermissionsGranted(false)
+
+        let recorder = RecorderController()
+        recorder.bindPermissions(permissions)
+        recorder._testSetTransport(.daemon)
+
+        recorder.start(name: "daemon-owned")
+
+        XCTAssertEqual(recorder.state, .starting)
+        XCTAssertNil(recorder.lastError)
+        // Tear down the in-flight daemon event Task so it doesn't leak past
+        // the assertion frame. Sleeping a fixed 100ms here lets the Task
+        // run unsupervised — cancel + await the cancellation instead.
+        await recorder._testCancelDaemonTask()
+    }
+
+    func testCLIFallbackStillBlocksStartOnAppProcessPermissions() {
+        let permissions = PermissionController()
+        permissions._testSetRequiredPermissionsGranted(false)
+
+        let recorder = RecorderController()
+        recorder.bindPermissions(permissions)
+        recorder._testSetTransport(.cliFallback)
+
+        recorder.start(name: "cli-owned")
+
+        XCTAssertEqual(recorder.state, .idle)
+        XCTAssertEqual(recorder.lastError, RecorderController.requiredPermissionsErrorMessage)
+    }
+
+    func testDaemonTransportPermissionWatchdogIgnoresAppProcessPermissions() {
+        let permissions = PermissionController()
+        permissions._testSetRequiredPermissionsGranted(false)
+
+        let recorder = RecorderController()
+        recorder.bindPermissions(permissions)
+        recorder._testSetTransport(.daemon)
+        recorder._testSetPresentation(state: .recording(elapsed: 3))
+
+        recorder._testCheckPermissionsDuringRecording()
+
+        XCTAssertEqual(recorder.state, .recording(elapsed: 3))
+        XCTAssertNil(recorder.lastError)
+    }
+
     func testForceStoppedWarningSurvivesCleanProcessTermination() {
         let recorder = RecorderController()
 

@@ -67,7 +67,7 @@ final class DaemonClientTests: XCTestCase {
             XCTAssertTrue(body.contains(#""name":"demo""#), body)
             XCTAssertTrue(body.contains(#""started_by":"swiftui-via-daemon""#), body)
             return .json(
-                #"{"ok":true,"schema_version":1,"daemon_version":"test","api_schema_version":1,"session_id":"abc","started_at":44.0,"cursor":7}"#
+                #"{"ok":true,"schema_version":1,"daemon_version":"test","api_schema_version":1,"session_id":"abc","started_at":44.0,"engine_pid":999,"cursor":7}"#
             )
         }
 
@@ -77,6 +77,7 @@ final class DaemonClientTests: XCTestCase {
 
         XCTAssertEqual(response.sessionID, "abc")
         XCTAssertEqual(response.startedAt, 44.0)
+        XCTAssertEqual(response.enginePID, 999)
         XCTAssertEqual(response.cursor, 7)
     }
 
@@ -139,7 +140,10 @@ final class DaemonClientTests: XCTestCase {
 
         var types: [String] = []
         var closeReason: String?
-        for try await event in DaemonClient.subscribe(sinceCursor: 7) {
+        for try await event in DaemonClient.subscribe(
+            sinceCursor: 7,
+            socketPathOverride: socketPath
+        ) {
             types.append(event.type)
             if event.type == "_close" {
                 closeReason = event.reason
@@ -158,7 +162,10 @@ final class DaemonClientTests: XCTestCase {
             )
         }
 
-        var iterator = DaemonClient.subscribe(sinceCursor: nil).makeAsyncIterator()
+        var iterator = DaemonClient.subscribe(
+            sinceCursor: nil,
+            socketPathOverride: socketPath
+        ).makeAsyncIterator()
         let first = try await iterator.next()
         XCTAssertEqual(first?.type, "subscribed")
 

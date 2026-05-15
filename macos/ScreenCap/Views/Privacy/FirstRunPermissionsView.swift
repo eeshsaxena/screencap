@@ -17,14 +17,12 @@ enum PermissionSheetRelaunchFlow {
     }
 }
 
-/// Loom-style first-run permissions walkthrough. Three rows (Screen Recording,
-/// Accessibility, Microphone) with green/red indicators and "Open System Settings"
-/// deep links. Live polling (1Hz + workspace-activation) is owned by the
-/// `PermissionController` injected via the environment.
+/// Loom-style first-run helper walkthrough. The rows open the relevant Privacy
+/// & Security panes for the helper-owned permissions, but do not poll the
+/// ScreenCap app process's TCC state.
 ///
-/// Dismissible only when both required permissions are granted; microphone is
-/// independently togglable. Per DL-004 the sheet sits over `MainWindow` until
-/// dismissed.
+/// Dismissible once the helper is installed. Daemon-backed recording reports
+/// helper-side permission failures at start time.
 struct FirstRunPermissionsView: View {
     @EnvironmentObject private var permissions: PermissionController
     @EnvironmentObject private var recorder: RecorderController
@@ -48,27 +46,14 @@ struct FirstRunPermissionsView: View {
                 daemonInstallStep
             } else {
                 VStack(spacing: 12) {
-                    daemonPermissionRow(
-                        pane: .screenRecording,
-                        status: permissions.screenRecording
-                    )
-                    daemonPermissionRow(
-                        pane: .accessibility,
-                        status: permissions.accessibility
-                    )
-                    daemonPermissionRow(
-                        pane: .inputMonitoring,
-                        status: permissions.inputMonitoring
-                    )
+                    daemonPermissionRow(pane: .screenRecording)
+                    daemonPermissionRow(pane: .accessibility)
+                    daemonPermissionRow(pane: .inputMonitoring)
                 }
             }
 
-            // macOS caches TCC state per-process — once you grant a
-            // permission in System Settings, this app doesn't see the change
-            // until it relaunches. Standard Mac-app pattern (Loom, 1Password,
-            // …) is an explicit Quit & Relaunch.
             VStack(alignment: .leading, spacing: 8) {
-                Text("After granting permissions in System Settings, quit and relaunch ScreenCap to apply.")
+                Text("After enabling ScreenCap in System Settings, return here to continue. If macOS shows a separate ScreenCap helper entry, enable that entry too.")
                     .font(.caption)
                     .foregroundStyle(.secondary)
 
@@ -89,10 +74,10 @@ struct FirstRunPermissionsView: View {
                     .buttonStyle(.bordered)
                     .disabled(isPreparingRelaunch || permissions.isRelaunching || recorder.state.isRecording)
 
-                    // Always-available escape hatch. Dismisses the sheet
-                    // even if the cached permission state still reads denied.
-                    // Recording itself will still be gated by the actual TCC
-                    // state at start time — this just unblocks navigation.
+                    // Always-available escape hatch. Dismisses the sheet even
+                    // if app-process permission hints still read denied.
+                    // Daemon-backed recording is enforced by the helper at
+                    // start time; CLI fallback still uses app/CLI permissions.
                     Button("Skip for now") { isPresented = false }
                         .buttonStyle(.bordered)
 
@@ -100,14 +85,12 @@ struct FirstRunPermissionsView: View {
 
                     Button("Done") { isPresented = false }
                         .keyboardShortcut(.defaultAction)
-                        .disabled(!isDaemonInstallComplete || !permissions.allRequiredGranted)
+                        .disabled(!isDaemonInstallComplete)
                 }
             }
         }
         .padding(28)
         .frame(width: 520)
-        .onAppear { permissions.startWatching() }
-        .onDisappear { permissions.stopWatching() }
         .onChange(of: daemonInstaller.state) { state in
             if state == .installedAndRunning {
                 isDaemonInstallComplete = true
@@ -231,7 +214,7 @@ struct FirstRunPermissionsView: View {
     }
 
     @ViewBuilder
-    private func daemonPermissionRow(pane: PrivacyPane, status: PermissionStatus) -> some View {
+    private func daemonPermissionRow(pane: PrivacyPane) -> some View {
         // TCC does not expose a programmatic status check for arbitrary
         // binaries (the daemon's `com.screencap.daemon` subject). The only
         // local signal we have is whether the user clicked Open Settings,
@@ -250,7 +233,7 @@ struct FirstRunPermissionsView: View {
                     Text("\(pane.displayName) for ScreenCap helper")
                         .font(.headline)
                 }
-                Text(daemonRationale(for: pane, appStatus: status))
+                Text(daemonRationale(for: pane))
                     .font(.subheadline)
                     .foregroundStyle(.secondary)
             }
@@ -270,8 +253,7 @@ struct FirstRunPermissionsView: View {
         )
     }
 
-    private func daemonRationale(for pane: PrivacyPane, appStatus: PermissionStatus) -> String {
-        let statusText = appStatus.isGranted ? "The app entry is already granted; enable the helper entry too." : "Enable the ScreenCap helper entry in this pane."
-        return "\(pane.rationale) \(statusText)"
+    private func daemonRationale(for pane: PrivacyPane) -> String {
+        "\(pane.rationale) Enable the ScreenCap helper entry in this pane."
     }
 }

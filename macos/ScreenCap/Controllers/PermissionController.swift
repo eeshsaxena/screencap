@@ -74,6 +74,17 @@ enum PrivacyPane: String, CaseIterable {
     }
 }
 
+#if DEBUG
+extension PermissionController {
+    func _testSetRequiredPermissionsGranted(_ granted: Bool) {
+        let status: PermissionStatus = granted ? .granted : .denied
+        screenRecording = status
+        accessibility = status
+        inputMonitoring = status
+    }
+}
+#endif
+
 enum PermissionStatus: Equatable {
     case granted
     case denied
@@ -128,9 +139,7 @@ final class PermissionController: ObservableObject {
             || inputMonitoring == .denied
     }
 
-    init() {
-        refresh()
-    }
+    init() {}
 
     nonisolated deinit {
         // The class is @MainActor but deinit runs on whichever thread drops
@@ -262,7 +271,7 @@ final class PermissionController: ObservableObject {
     /// pane should open immediately either way.
     func requestAndOpenSettings(for pane: PrivacyPane, subject: PermissionSubject = .screenCapApp) {
         guard subject == .screenCapApp else {
-            openSystemSettings(for: pane, subject: subject)
+            openSystemSettings(for: pane)
             return
         }
 
@@ -283,20 +292,22 @@ final class PermissionController: ObservableObject {
                 Task { @MainActor in self.refresh() }
             }
         }
-        openSystemSettings(for: pane, subject: subject)
+        openSystemSettings(for: pane)
     }
 
     /// Opens System Settings to the requested pane. Tries the macOS 13+ .extension
     /// URL first; falls back to the generic Privacy & Security page if unavailable.
-    func openSystemSettings(for pane: PrivacyPane, subject: PermissionSubject = .screenCapApp) {
-        if !NSWorkspace.shared.open(Self.settingsURL(for: pane, subject: subject)) {
+    ///
+    /// The destination URL is the same regardless of subject (TCC panes list
+    /// every registered subject in a single list), so no `subject` param here —
+    /// `requestAndOpenSettings` is where subject-specific branching lives.
+    func openSystemSettings(for pane: PrivacyPane) {
+        if !NSWorkspace.shared.open(Self.settingsURL(for: pane)) {
             NSWorkspace.shared.open(PrivacyPane.fallbackURL)
         }
     }
 
-    nonisolated static func settingsURL(for pane: PrivacyPane, subject: PermissionSubject = .screenCapApp) -> URL {
-        // TCC panes list every registered subject. The daemon subject changes
-        // the UX copy and prompt target, not the System Settings destination.
+    nonisolated static func settingsURL(for pane: PrivacyPane) -> URL {
         pane.deepLinkURL
     }
 

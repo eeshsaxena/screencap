@@ -1,5 +1,14 @@
 import SwiftUI
 
+enum FirstRunSetupPresentationPolicy {
+    static func shouldPresentOnLaunch(
+        daemonProbeCompleted: Bool,
+        transport: RecorderTransport
+    ) -> Bool {
+        daemonProbeCompleted && transport == .cliFallback
+    }
+}
+
 /// Top-level window content. Sidebar (Calendar / Recordings / Privacy) +
 /// detail area. Calendar is the default. Calendar day click filters the
 /// recordings list to that day; "Show all" clears the filter. Privacy is a
@@ -50,11 +59,20 @@ struct MainWindow: View {
             }
         }
         .onAppear {
-            // The sheet owns its own poll lifecycle (see FirstRunPermissionsView)
-            // so MainWindow only triggers the initial visibility check here.
-            if !permissions.allRequiredGranted {
-                showingPermissionsSheet = true
+            updateFirstRunSheetPresentation()
+        }
+        .onChange(of: recorder.daemonProbeCompleted) { _ in
+            updateFirstRunSheetPresentation()
+        }
+        .onChange(of: recorder.transport) { newTransport in
+            // Probe later succeeded after an earlier .cliFallback bounce
+            // (e.g. cold-boot helper socket race): close the sheet so the
+            // user isn't asked to re-grant permissions the daemon now
+            // satisfies.
+            if newTransport == .daemon {
+                showingPermissionsSheet = false
             }
+            updateFirstRunSheetPresentation()
         }
         .onChange(of: section) { new in
             // Intentionally one-directional. We only clear the date filter
@@ -64,6 +82,22 @@ struct MainWindow: View {
             // affordance for that edge case. Revisit if friend-trial
             // feedback shows users expect sidebar tap to clear filters.
             if new != .recordings { selectedDate = nil }
+        }
+    }
+
+    private func updateFirstRunSheetPresentation() {
+        // Don't pop the first-run sheet over an active recording. The transport
+        // can flip to .cliFallback mid-recording (schemaMismatch /
+        // socketUnavailable / connectionFailed) and we don't want to interrupt
+        // the in-flight capture with a permissions walkthrough.
+        if recorder.state.isRecording {
+            return
+        }
+        if FirstRunSetupPresentationPolicy.shouldPresentOnLaunch(
+            daemonProbeCompleted: recorder.daemonProbeCompleted,
+            transport: recorder.transport
+        ) {
+            showingPermissionsSheet = true
         }
     }
 
