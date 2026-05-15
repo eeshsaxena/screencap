@@ -3,6 +3,16 @@ import XCTest
 
 final class PermissionControllerTests: XCTestCase {
     @MainActor
+    func testPermissionControllerStartsWithoutAppTCCChecks() {
+        let permissions = PermissionController()
+
+        XCTAssertEqual(permissions.screenRecording, .notDetermined)
+        XCTAssertEqual(permissions.accessibility, .notDetermined)
+        XCTAssertEqual(permissions.inputMonitoring, .notDetermined)
+        XCTAssertEqual(permissions.microphone, .notDetermined)
+    }
+
+    @MainActor
     func testPermissionSheetDismissesBeforeRelaunching() async {
         var events: [String] = []
 
@@ -56,5 +66,32 @@ final class PermissionControllerTests: XCTestCase {
         }
 
         XCTAssertEqual(PermissionSubject.daemon.bundleIdentifier, "com.screencap.daemon")
+    }
+
+    func testFirstRunSetupWaitsForDaemonProbeBeforePresenting() {
+        XCTAssertFalse(
+            FirstRunSetupPresentationPolicy.shouldPresentOnLaunch(
+                daemonProbeCompleted: false,
+                transport: .cliFallback
+            )
+        )
+    }
+
+    func testFirstRunSetupDoesNotPresentForDaemonTransport() {
+        XCTAssertFalse(
+            FirstRunSetupPresentationPolicy.shouldPresentOnLaunch(
+                daemonProbeCompleted: true,
+                transport: .daemon
+            )
+        )
+    }
+
+    func testFirstRunSetupPresentsWhenDaemonProbeFallsBackToCLI() {
+        XCTAssertTrue(
+            FirstRunSetupPresentationPolicy.shouldPresentOnLaunch(
+                daemonProbeCompleted: true,
+                transport: .cliFallback
+            )
+        )
     }
 }

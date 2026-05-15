@@ -27,6 +27,7 @@ extension Notification.Name {
 @MainActor
 protocol DaemonRegistrationService {
     func register(plistName: String) async throws -> SMAppService.Status
+    func refresh(plistName: String) async throws -> SMAppService.Status
     func currentStatus(plistName: String) -> SMAppService.Status
 }
 
@@ -98,7 +99,8 @@ final class DaemonInstallController: ObservableObject {
             timeoutSeconds: timeoutSeconds,
             probeIntervalSeconds: probeIntervalSeconds,
             approvalTimeoutSeconds: approvalTimeoutSeconds,
-            approvalPollIntervalSeconds: approvalPollIntervalSeconds
+            approvalPollIntervalSeconds: approvalPollIntervalSeconds,
+            allowRegistrationRefresh: true
         )
     }
 
@@ -150,11 +152,20 @@ final class DaemonInstallController: ObservableObject {
         timeoutSeconds: TimeInterval,
         probeIntervalSeconds: TimeInterval,
         approvalTimeoutSeconds: TimeInterval,
-        approvalPollIntervalSeconds: TimeInterval
+        approvalPollIntervalSeconds: TimeInterval,
+        allowRegistrationRefresh: Bool
     ) async {
         switch status {
         case .enabled:
-            await pollDaemon(timeoutSeconds: timeoutSeconds, probeIntervalSeconds: probeIntervalSeconds)
+            let didStart = await pollDaemon(timeoutSeconds: timeoutSeconds, probeIntervalSeconds: probeIntervalSeconds)
+            if !didStart && allowRegistrationRefresh {
+                await refreshRegistrationAfterFailedPoll(
+                    timeoutSeconds: timeoutSeconds,
+                    probeIntervalSeconds: probeIntervalSeconds,
+                    approvalTimeoutSeconds: approvalTimeoutSeconds,
+                    approvalPollIntervalSeconds: approvalPollIntervalSeconds
+                )
+            }
         case .requiresApproval:
             state = .requiresApproval
             let approved = await waitForApproval(
@@ -162,7 +173,14 @@ final class DaemonInstallController: ObservableObject {
                 intervalSeconds: approvalPollIntervalSeconds
             )
             if approved {
-                await pollDaemon(timeoutSeconds: timeoutSeconds, probeIntervalSeconds: probeIntervalSeconds)
+                await handleRegisteredStatus(
+                    .enabled,
+                    timeoutSeconds: timeoutSeconds,
+                    probeIntervalSeconds: probeIntervalSeconds,
+                    approvalTimeoutSeconds: approvalTimeoutSeconds,
+                    approvalPollIntervalSeconds: approvalPollIntervalSeconds,
+                    allowRegistrationRefresh: allowRegistrationRefresh
+                )
             } else {
                 state = .installFailed(.unknown)
             }
@@ -173,6 +191,32 @@ final class DaemonInstallController: ObservableObject {
         @unknown default:
             state = .installFailed(.unknown)
         }
+    }
+
+    private func refreshRegistrationAfterFailedPoll(
+        timeoutSeconds: TimeInterval,
+        probeIntervalSeconds: TimeInterval,
+        approvalTimeoutSeconds: TimeInterval,
+        approvalPollIntervalSeconds: TimeInterval
+    ) async {
+        state = .registering
+        let refreshedStatus: SMAppService.Status
+        do {
+            refreshedStatus = try await registrationService.refresh(plistName: Self.plistName)
+        } catch {
+            daemonInstallLogger.error("Daemon registration refresh failed: \(String(describing: error), privacy: .public)")
+            state = .installFailed(Self.failureReason(from: error))
+            return
+        }
+
+        await handleRegisteredStatus(
+            refreshedStatus,
+            timeoutSeconds: timeoutSeconds,
+            probeIntervalSeconds: probeIntervalSeconds,
+            approvalTimeoutSeconds: approvalTimeoutSeconds,
+            approvalPollIntervalSeconds: approvalPollIntervalSeconds,
+            allowRegistrationRefresh: false
+        )
     }
 
     private func waitForApproval(timeoutSeconds: TimeInterval, intervalSeconds: TimeInterval) async -> Bool {
@@ -186,19 +230,19 @@ final class DaemonInstallController: ObservableObject {
         }
     }
 
-    private func pollDaemon(timeoutSeconds: TimeInterval, probeIntervalSeconds: TimeInterval) async {
+    private func pollDaemon(timeoutSeconds: TimeInterval, probeIntervalSeconds: TimeInterval) async -> Bool {
         state = .polling
         let deadline = Date().addingTimeInterval(timeoutSeconds)
         while true {
             if await probe.probe(timeout: min(1, max(0.1, probeIntervalSeconds))) {
                 state = .installedAndRunning
                 NotificationCenter.default.post(name: .screenCapDaemonInstalledAndRunning, object: nil)
-                return
+                return true
             }
             if Date() >= deadline {
                 let seconds = Int(timeoutSeconds)
                 state = .pollingFailed(reason: "Daemon did not respond within \(seconds)s")
-                return
+                return false
             }
             await sleep(Self.nanoseconds(for: probeIntervalSeconds))
         }
@@ -237,6 +281,22 @@ final class SMAppServiceRegistration: DaemonRegistrationService {
         let service = SMAppService.agent(plistName: plistName)
         if service.status == .enabled || service.status == .requiresApproval {
             return service.status
+        }
+        do {
+            try service.register()
+        } catch {
+            let nsError = error as NSError
+            if nsError.code != kSMErrorAlreadyRegistered {
+                throw error
+            }
+        }
+        return service.status
+    }
+
+    func refresh(plistName: String) async throws -> SMAppService.Status {
+        let service = SMAppService.agent(plistName: plistName)
+        if service.status == .enabled || service.status == .requiresApproval {
+            try await service.unregister()
         }
         do {
             try service.register()

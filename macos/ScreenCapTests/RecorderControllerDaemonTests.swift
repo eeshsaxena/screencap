@@ -17,8 +17,8 @@ final class RecorderControllerDaemonTests: XCTestCase {
         setenv("SCREENCAP_DAEMON_SOCKET", socketPath, 1)
     }
 
-    override func tearDown() {
-        recorder?._testCancelDaemonTask()
+    override func tearDown() async throws {
+        await recorder?._testCancelDaemonTask()
         recorder = nil
         server?.stop()
         server = nil
@@ -26,17 +26,22 @@ final class RecorderControllerDaemonTests: XCTestCase {
             unlink(socketPath)
         }
         unsetenv("SCREENCAP_DAEMON_SOCKET")
-        super.tearDown()
+        try await super.tearDown()
     }
 
     func testDaemonTransportHappyPathUsesEventStreamForStateTransitions() async throws {
+        let startCount = LockedInt()
         _ = try startServer { request in
             switch request.path {
             case "/v0/daemon.info":
                 return .json(#"{"ok":true,"schema_version":1,"daemon_version":"test","api_schema_version":1,"build":null,"started_at":1.0}"#)
             case "/v0/recording.start":
+                _ = startCount.incrementAndGet()
                 return .json(#"{"ok":true,"schema_version":1,"daemon_version":"test","api_schema_version":1,"session_id":"session-1","started_at":10.0,"engine_pid":9991,"cursor":2}"#)
             case "/v0/session.snapshot":
+                guard startCount.value > 0 else {
+                    return .json(#"{"ok":true,"schema_version":1,"daemon_version":"test","api_schema_version":1,"is_recording":false,"daemon_owned":false,"recording_name":null,"started_at":null,"claimant":null,"recovering":false,"cursor":0}"#)
+                }
                 return .json(#"{"ok":true,"schema_version":1,"daemon_version":"test","api_schema_version":1,"is_recording":true,"daemon_owned":true,"recording_name":"demo","started_at":10.0,"claimant":"daemon","recovering":false,"cursor":3}"#)
             // First subscribe keys off recording.start.cursor (2), not the
             // snapshot's cursor (3); replay-buffered `started` at cursor 3
@@ -45,7 +50,7 @@ final class RecorderControllerDaemonTests: XCTestCase {
                 return .chunked([
                     #"{"type":"subscribed","schema_version":1,"cursor":2,"ts":11.0}"# + "\n",
                     #"{"type":"started","schema_version":1,"cursor":3,"ts":12.0}"# + "\n",
-                ])
+                ], terminate: false)
             default:
                 XCTFail("Unexpected request path \(request.path)")
                 return .json(#"{"ok":false,"schema_version":1,"daemon_version":"test","api_schema_version":1,"error":"unexpected"}"#, status: 500)
@@ -66,30 +71,69 @@ final class RecorderControllerDaemonTests: XCTestCase {
         XCTAssertNil(recorder.lastError)
     }
 
+    func testProbeDaemonRestoresActiveDaemonRecording() async throws {
+        let startedAt = Date().addingTimeInterval(-12).timeIntervalSince1970
+        _ = try startServer { request in
+            switch request.path {
+            case "/v0/daemon.info":
+                return .json(#"{"ok":true,"schema_version":1,"daemon_version":"test","api_schema_version":1,"build":null,"started_at":1.0}"#)
+            case "/v0/session.snapshot":
+                return .json(
+                    #"{"ok":true,"schema_version":1,"daemon_version":"test","api_schema_version":1,"is_recording":true,"daemon_owned":true,"recording_name":"existing","started_at":"# +
+                    "\(startedAt)" +
+                    #","claimant":"daemon","recovering":false,"cursor":9}"#
+                )
+            case "/v0/events?since=9":
+                return .chunked([
+                    #"{"type":"subscribed","schema_version":1,"cursor":9,"ts":13.0}"# + "\n",
+                ], terminate: false)
+            default:
+                XCTFail("Unexpected request path \(request.path)")
+                return .json(#"{"ok":false,"schema_version":1,"daemon_version":"test","api_schema_version":1,"error":"unexpected"}"#, status: 500)
+            }
+        }
+
+        let recorder = RecorderController()
+        self.recorder = recorder
+        await recorder.probeDaemon()
+
+        XCTAssertEqual(recorder.transport, .daemon)
+        guard case .recording(let elapsed) = recorder.state else {
+            return XCTFail("Expected active daemon recording, got \(recorder.state)")
+        }
+        XCTAssertGreaterThan(elapsed, 5)
+        XCTAssertNil(recorder.lastError)
+    }
+
     func testDaemonTransportReconnectsAfterDroppedEventStream() async throws {
         let eventConnectionCount = LockedInt()
+        let startCount = LockedInt()
         _ = try startServer { request in
             switch request.path {
             case "/v0/daemon.info":
                 return .json(#"{"ok":true,"schema_version":1,"daemon_version":"test","api_schema_version":1,"build":null,"started_at":1.0}"#)
             case "/v0/recording.start":
+                _ = startCount.incrementAndGet()
                 return .json(#"{"ok":true,"schema_version":1,"daemon_version":"test","api_schema_version":1,"session_id":"session-2","started_at":10.0,"engine_pid":9992,"cursor":4}"#)
             case "/v0/session.snapshot":
+                guard startCount.value > 0 else {
+                    return .json(#"{"ok":true,"schema_version":1,"daemon_version":"test","api_schema_version":1,"is_recording":false,"daemon_owned":false,"recording_name":null,"started_at":null,"claimant":null,"recovering":false,"cursor":0}"#)
+                }
                 return .json(#"{"ok":true,"schema_version":1,"daemon_version":"test","api_schema_version":1,"is_recording":true,"daemon_owned":true,"recording_name":"demo","started_at":10.0,"claimant":"daemon","recovering":false,"cursor":5}"#)
-            // First subscribe uses the recording.start cursor (4); the
-            // reconnect after the dropped stream falls back to the
-            // snapshot cursor (5).
+            // Keep using the recording.start cursor until a start outcome
+            // arrives. A stream that drops after `subscribed` but before
+            // `started` must not make the next attempt jump to snapshot cursor.
             case "/v0/events?since=4":
-                _ = eventConnectionCount.incrementAndGet()
+                let count = eventConnectionCount.incrementAndGet()
+                if count == 1 {
+                    return .chunked([
+                        #"{"type":"subscribed","schema_version":1,"cursor":4,"ts":11.0}"# + "\n",
+                    ], terminate: false)
+                }
                 return .chunked([
-                    #"{"type":"subscribed","schema_version":1,"cursor":4,"ts":11.0}"# + "\n",
-                ], terminate: false)
-            case "/v0/events?since=5":
-                _ = eventConnectionCount.incrementAndGet()
-                return .chunked([
-                    #"{"type":"subscribed","schema_version":1,"cursor":5,"ts":12.0}"# + "\n",
+                    #"{"type":"subscribed","schema_version":1,"cursor":4,"ts":12.0}"# + "\n",
                     #"{"type":"started","schema_version":1,"cursor":6,"ts":13.0}"# + "\n",
-                ])
+                ], terminate: false)
             default:
                 XCTFail("Unexpected request path \(request.path)")
                 return .json(#"{"ok":false,"schema_version":1,"daemon_version":"test","api_schema_version":1,"error":"unexpected"}"#, status: 500)
@@ -139,6 +183,7 @@ final class RecorderControllerDaemonTests: XCTestCase {
         // verbatim when SwiftUI subscribes at `?since=N`. The recording
         // helper exhausts the ring then keeps the stream open so the
         // RecorderController stays attached.
+        let startCount = LockedInt()
         let presetReplay = PresetReplay(events: [
             4: #"{"type":"started","schema_version":1,"cursor":4,"ts":12.0,"claimant":"daemon"}"# + "\n",
         ])
@@ -150,8 +195,12 @@ final class RecorderControllerDaemonTests: XCTestCase {
             case "/v0/recording.start":
                 // Start response carries cursor=3; the engine has already
                 // published `started` at cursor=4 by the time this returns.
+                _ = startCount.incrementAndGet()
                 return .json(#"{"ok":true,"schema_version":1,"daemon_version":"test","api_schema_version":1,"session_id":"session-prod","started_at":10.0,"engine_pid":9993,"cursor":3}"#)
             case "/v0/session.snapshot":
+                guard startCount.value > 0 else {
+                    return .json(#"{"ok":true,"schema_version":1,"daemon_version":"test","api_schema_version":1,"is_recording":false,"daemon_owned":false,"recording_name":null,"started_at":null,"claimant":null,"recovering":false,"cursor":0}"#)
+                }
                 // Snapshot cursor (5) is strictly greater than the start
                 // cursor (3); subscribing at snapshot would miss the
                 // `recording_started` event published at cursor=4. The
@@ -195,6 +244,7 @@ final class RecorderControllerDaemonTests: XCTestCase {
     /// rather than crashing or hanging in `.starting`.
     func testCursorUnknown410FromEventsStreamFallsBackThroughSnapshotRefetch() async throws {
         let snapshotCount = LockedInt()
+        let startCount = LockedInt()
 
         _ = try startServer { request in
             switch request.path {
@@ -204,8 +254,12 @@ final class RecorderControllerDaemonTests: XCTestCase {
             // out of the daemon's replay window, surfaced as 410
             // cursor_unknown below.
             case "/v0/recording.start":
+                _ = startCount.incrementAndGet()
                 return .json(#"{"ok":true,"schema_version":1,"daemon_version":"test","api_schema_version":1,"session_id":"session-unknown","started_at":10.0,"engine_pid":9994,"cursor":2}"#)
             case "/v0/session.snapshot":
+                guard startCount.value > 0 else {
+                    return .json(#"{"ok":true,"schema_version":1,"daemon_version":"test","api_schema_version":1,"is_recording":false,"daemon_owned":false,"recording_name":null,"started_at":null,"claimant":null,"recovering":false,"cursor":0}"#)
+                }
                 // First snapshot returns a stale cursor; second snapshot
                 // (after the controller recovers from the 410) returns a
                 // fresh one that the replay window covers.
@@ -248,13 +302,18 @@ final class RecorderControllerDaemonTests: XCTestCase {
     /// of remaining stuck in `.starting` while the daemon has already
     /// torn the recording down.
     func testRecordingFailedDeliveredViaReplaySurfacesError() async throws {
+        let startCount = LockedInt()
         _ = try startServer { request in
             switch request.path {
             case "/v0/daemon.info":
                 return .json(#"{"ok":true,"schema_version":1,"daemon_version":"test","api_schema_version":1,"build":null,"started_at":1.0}"#)
             case "/v0/recording.start":
+                _ = startCount.incrementAndGet()
                 return .json(#"{"ok":true,"schema_version":1,"daemon_version":"test","api_schema_version":1,"session_id":"session-fail","started_at":10.0,"engine_pid":9995,"cursor":2}"#)
             case "/v0/session.snapshot":
+                guard startCount.value > 0 else {
+                    return .json(#"{"ok":true,"schema_version":1,"daemon_version":"test","api_schema_version":1,"is_recording":false,"daemon_owned":false,"recording_name":null,"started_at":null,"claimant":null,"recovering":false,"cursor":0}"#)
+                }
                 return .json(#"{"ok":true,"schema_version":1,"daemon_version":"test","api_schema_version":1,"is_recording":true,"daemon_owned":true,"recording_name":"fail","started_at":10.0,"claimant":"daemon","recovering":false,"cursor":2}"#)
             case "/v0/events?since=2":
                 return .chunked([

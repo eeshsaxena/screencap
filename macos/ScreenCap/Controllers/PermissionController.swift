@@ -74,6 +74,17 @@ enum PrivacyPane: String, CaseIterable {
     }
 }
 
+#if DEBUG
+extension PermissionController {
+    func _testSetRequiredPermissionsGranted(_ granted: Bool) {
+        let status: PermissionStatus = granted ? .granted : .denied
+        screenRecording = status
+        accessibility = status
+        inputMonitoring = status
+    }
+}
+#endif
+
 enum PermissionStatus: Equatable {
     case granted
     case denied
@@ -128,9 +139,7 @@ final class PermissionController: ObservableObject {
             || inputMonitoring == .denied
     }
 
-    init() {
-        refresh()
-    }
+    init() {}
 
     nonisolated deinit {
         // The class is @MainActor but deinit runs on whichever thread drops

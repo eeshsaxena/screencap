@@ -62,8 +62,9 @@ DEVELOPMENT_TEAM=YOURTEAMID ./script/build_and_run.sh
 This script:
 
 1. Regenerates `macos/ScreenCap.xcodeproj` from `macos/project.yml` when needed.
-2. Builds the `ScreenCap` scheme into a deterministic local DerivedData path.
-3. Publishes `PATH` and `SCREENCAP_DEV_REPO_ROOT` to `launchd`, then opens the signed `.app` bundle through LaunchServices so macOS permission prompts match the app shown in System Settings.
+2. Rebuilds `dist/screencap/` with PyInstaller when the bundled CLI is missing or too old to expose `screencap serve`.
+3. Builds the `ScreenCap` scheme into a deterministic local DerivedData path.
+4. Publishes the local launch environment to `launchd`, then opens the signed `.app` bundle through LaunchServices so macOS permission prompts match the app shown in System Settings.
 
 Useful variants:
 
@@ -83,7 +84,9 @@ Useful variants:
 2. `Contents/Resources/screencap/screencap` inside the .app bundle (populated by `Scripts/embed-cli.sh` from `dist/screencap/` if PyInstaller has been run).
 3. `python3 -m screencap.cli` when `SCREENCAP_DEV_REPO_ROOT` is set. The repo's `src/` is prepended to `PYTHONPATH` automatically.
 
-For day-to-day SwiftUI development, option 3 is the path of least resistance. PyInstaller is needed when validating the embed pipeline or producing a signed release.
+For the LaunchAgent helper, the app uses the bundled `Contents/Resources/screencap/screencap` binary by default. This keeps macOS permission ownership on the app/helper bundle instead of a shell or Python interpreter. Source-mode helper debugging is opt-in with `SCREENCAP_DAEMON_USE_DEV_SOURCE=1`.
+
+For day-to-day SwiftUI development, use `./script/build_and_run.sh`; it refreshes the PyInstaller bundle when needed before launching the app.
 
 ## Launching with env vars (the part that bites everyone)
 
@@ -142,7 +145,7 @@ Then re-grant via the walkthrough sheet at next launch.
 
 To avoid the loop entirely, sign with a stable Developer ID. The release pipeline in `Unit 1` / `Unit 22` of the v1 plan handles this.
 
-If a rebuild leaves you blocked behind the walkthrough's "Done" button (red dots persist due to the in-process TCC cache), click **Skip for now** to dismiss the sheet and keep testing the rest of the UI. Recording itself is still gated by the engine-side check at start time.
+If a rebuild leaves the walkthrough's app-process indicators stale, click **Skip for now** or **Done** after the helper is installed to dismiss the sheet and keep testing the rest of the UI. Daemon-backed recording is enforced by the helper/engine at start time; CLI fallback still uses the app/CLI permission path.
 
 ## Killing stuck instances
 

@@ -117,6 +117,7 @@ final class RecorderController: ObservableObject {
     @Published private(set) var lastError: String?
     @Published private(set) var matrixDisclosure: PrivacyMatrixDisclosure?
     @Published private(set) var transport: RecorderTransport = .cliFallback
+    @Published private(set) var daemonProbeCompleted = false
     @Published private(set) var schemaMismatchDetected = false
     /// Surfaced in the menu bar dropdown during a Cmd+Q stop. Counts down
     /// from 300s while we wait for the `stopped` event.
@@ -127,11 +128,10 @@ final class RecorderController: ObservableObject {
 
     private var spawn: CLIClient.SpawnedProcess?
     private var daemonEventTask: Task<Void, Never>?
-    /// Cursor returned by `/v0/recording.start`, consumed by the first
-    /// `consumeDaemonEvents` iteration so the initial subscribe is keyed
-    /// to the start-response boundary (which precedes `recording_started`)
-    /// instead of the later `session.snapshot` cursor. Cleared after one use;
-    /// reconnect iterations fall back to `snapshot.cursor` as before.
+    /// Cursor returned by `/v0/recording.start`, used so initial subscribes
+    /// are keyed to the start-response boundary (which precedes `started`)
+    /// instead of the later `session.snapshot` cursor. Kept until we observe a
+    /// start outcome, so a dropped initial stream cannot skip the boundary.
     private var pendingStartCursor: Int?
     private var elapsedTimer: Timer?
     private var permissionWatchdog: Timer?
@@ -181,7 +181,7 @@ final class RecorderController: ObservableObject {
     /// Spawn `screencap start [<name>]` and start consuming stderr events.
     func start(name: String? = nil) {
         guard !state.isRecording else { return }
-        if let permissions, !permissions.allRequiredGranted {
+        if transport == .cliFallback, let permissions, !permissions.allRequiredGranted {
             lastError = Self.requiredPermissionsErrorMessage
             return
         }
@@ -197,16 +197,40 @@ final class RecorderController: ObservableObject {
     }
 
     func probeDaemon() async {
+        defer { daemonProbeCompleted = true }
         do {
             _ = try await DaemonClient.daemonInfo()
             schemaMismatchDetected = false
             transport = .daemon
+            await syncDaemonSnapshot()
         } catch DaemonClientError.schemaMismatch {
             schemaMismatchDetected = true
             transport = .cliFallback
         } catch {
             recorderLogger.info("Daemon not reachable; using CLI fallback. Error: \(String(describing: error), privacy: .public)")
             transport = .cliFallback
+        }
+    }
+
+    private func syncDaemonSnapshot() async {
+        do {
+            let snapshot = try await DaemonClient.sessionSnapshot()
+            guard snapshot.isRecording == true else { return }
+
+            if snapshot.daemonOwned {
+                let start = snapshot.startedAt.map(Date.init(timeIntervalSince1970:)) ?? Date()
+                pendingStartCursor = nil
+                recordingStartedAt = start
+                state = .recording(elapsed: Date().timeIntervalSince(start))
+                attachDaemonEventStream()
+                startElapsedTimer()
+                startPermissionWatchdog()
+            } else {
+                lastError = "Another process is recording."
+                state = .idle
+            }
+        } catch {
+            recorderLogger.info("Could not sync daemon session snapshot: \(String(describing: error), privacy: .public)")
         }
     }
 
@@ -237,6 +261,12 @@ final class RecorderController: ObservableObject {
     }
 
     private func startViaCLI(name: String? = nil) {
+        if let permissions, !permissions.allRequiredGranted {
+            state = .idle
+            lastError = Self.requiredPermissionsErrorMessage
+            return
+        }
+
         var args = ["start"]
         if let name { args.append(name) }
 
@@ -524,6 +554,7 @@ final class RecorderController: ObservableObject {
             // `.recording` or `.stopping` would otherwise regress the state
             // machine and re-arm the elapsed timer.
             guard case .starting = state else { return }
+            pendingStartCursor = nil
             recordingStartedAt = Date()
             state = .recording(elapsed: 0)
             startElapsedTimer()
@@ -543,6 +574,7 @@ final class RecorderController: ObservableObject {
             // `.starting` / `.recording` until the user notices nothing is
             // happening. Release any in-flight stop callers, surface the
             // reason, and drop back to `.idle`.
+            pendingStartCursor = nil
             lastError = event.reason ?? "Recording failed."
             resolveAll(pending: \.awaitingFinalized, value: true)
             resolveAll(pending: \.awaitingStopped, value: false)
@@ -603,19 +635,11 @@ final class RecorderController: ObservableObject {
                     lastError = "ScreenCap daemon is recovering the previous recording session."
                 }
 
-                // First iteration consumes `pendingStartCursor` if present so
-                // the initial subscribe lands at the recording.start boundary
-                // (events with cursor > start_cursor include `recording_started`,
-                // which the daemon may publish before this subscribe arrives).
-                // Subsequent iterations (reconnect after drop) fall back to the
-                // snapshot's cursor.
-                let sinceCursor: Int
-                if let startCursor = pendingStartCursor {
-                    sinceCursor = startCursor
-                    pendingStartCursor = nil
-                } else {
-                    sinceCursor = snapshot.cursor
-                }
+                // Until we receive `started` or `recording_failed`, keep using
+                // the start boundary. If the first stream drops before the
+                // boundary event is delivered, a reconnect from snapshot.cursor
+                // could skip the event that moves the UI out of `.starting`.
+                let sinceCursor = pendingStartCursor ?? snapshot.cursor
                 for try await event in DaemonClient.subscribe(sinceCursor: sinceCursor) {
                     if Task.isCancelled { return }
                     sawProgress = true
@@ -633,6 +657,7 @@ final class RecorderController: ObservableObject {
                 // window between snapshot and subscribe. Refetch the snapshot
                 // and resubscribe with a fresh cursor; leave `state` intact so
                 // the UI does not flicker to `.idle`.
+                pendingStartCursor = nil
                 recorderLogger.info("Daemon event stream evicted cursor; refetching snapshot.")
                 continue
             } catch {
@@ -811,6 +836,11 @@ final class RecorderController: ObservableObject {
     }
 
     private func checkPermissionsDuringRecording() {
+        // Daemon-backed recordings are owned by the helper process, so the
+        // Swift app's cached TCC state is not authoritative. The daemon event
+        // stream reports helper-side permission failures via `permission_lost`.
+        guard transport == .cliFallback else { return }
+
         // Only act while actively recording — once we're already `.stopping`,
         // calling `stop()` again would either be a no-op (covered by the
         // narrowed guard in `stop()`) or, before that guard existed, would
@@ -847,14 +877,23 @@ extension RecorderController {
         handleProcessTerminated(exitCode: exitCode)
     }
 
+    func _testSetTransport(_ transport: RecorderTransport) {
+        self.transport = transport
+    }
+
+    func _testCheckPermissionsDuringRecording() {
+        checkPermissionsDuringRecording()
+    }
+
     /// Cancel any in-flight daemon event stream Task so tests can tear
-    /// down the underlying NWConnection synchronously before the test
-    /// server stops accepting. Without this hook, a long-poll connection
-    /// can outlive the test's `server.stop()` and leave Network.framework
-    /// retrying against a removed socket, which surfaces as CI hangs.
-    func _testCancelDaemonTask() {
-        daemonEventTask?.cancel()
+    /// down their fake server without waiting on a long-poll read that may
+    /// currently be parked inside Network.framework.
+    func _testCancelDaemonTask() async {
+        let task = daemonEventTask
         daemonEventTask = nil
+        state = .idle
+        task?.cancel()
+        try? await Task.sleep(nanoseconds: 50_000_000)
     }
 }
 #endif

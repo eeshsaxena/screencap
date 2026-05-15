@@ -1,5 +1,14 @@
 import SwiftUI
 
+enum FirstRunSetupPresentationPolicy {
+    static func shouldPresentOnLaunch(
+        daemonProbeCompleted: Bool,
+        transport: RecorderTransport
+    ) -> Bool {
+        daemonProbeCompleted && transport == .cliFallback
+    }
+}
+
 /// Top-level window content. Sidebar (Calendar / Recordings / Privacy) +
 /// detail area. Calendar is the default. Calendar day click filters the
 /// recordings list to that day; "Show all" clears the filter. Privacy is a
@@ -50,11 +59,13 @@ struct MainWindow: View {
             }
         }
         .onAppear {
-            // The sheet owns its own poll lifecycle (see FirstRunPermissionsView)
-            // so MainWindow only triggers the initial visibility check here.
-            if !permissions.allRequiredGranted {
-                showingPermissionsSheet = true
-            }
+            updateFirstRunSheetPresentation()
+        }
+        .onChange(of: recorder.daemonProbeCompleted) { _ in
+            updateFirstRunSheetPresentation()
+        }
+        .onChange(of: recorder.transport) { _ in
+            updateFirstRunSheetPresentation()
         }
         .onChange(of: section) { new in
             // Intentionally one-directional. We only clear the date filter
@@ -64,6 +75,15 @@ struct MainWindow: View {
             // affordance for that edge case. Revisit if friend-trial
             // feedback shows users expect sidebar tap to clear filters.
             if new != .recordings { selectedDate = nil }
+        }
+    }
+
+    private func updateFirstRunSheetPresentation() {
+        if FirstRunSetupPresentationPolicy.shouldPresentOnLaunch(
+            daemonProbeCompleted: recorder.daemonProbeCompleted,
+            transport: recorder.transport
+        ) {
+            showingPermissionsSheet = true
         }
     }
 

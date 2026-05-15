@@ -13,6 +13,8 @@ BUNDLE_ID="com.screencap.macos"
 DERIVED_DATA="$ROOT_DIR/.build/ScreenCapDerivedData"
 APP_BUNDLE="$DERIVED_DATA/Build/Products/$CONFIGURATION/$APP_NAME.app"
 APP_BINARY="$APP_BUNDLE/Contents/MacOS/$APP_NAME"
+CLI_BUNDLE="$ROOT_DIR/dist/screencap"
+CLI_BINARY="$CLI_BUNDLE/screencap"
 RUN_LOG_DIR="$ROOT_DIR/.build/run"
 STDOUT_LOG="$RUN_LOG_DIR/$APP_NAME.stdout.log"
 STDERR_LOG="$RUN_LOG_DIR/$APP_NAME.stderr.log"
@@ -37,9 +39,21 @@ load_local_env() {
 
 prepend_path_if_dir() {
   local dir="$1"
-  if [[ -d "$dir" && ":$PATH:" != *":$dir:"* ]]; then
-    PATH="$dir:$PATH"
+  local entry
+  local new_path="$dir"
+  local path_entries=()
+
+  if [[ ! -d "$dir" ]]; then
+    return
   fi
+
+  IFS=":" read -r -a path_entries <<<"${PATH:-}"
+  for entry in "${path_entries[@]}"; do
+    [[ -z "$entry" || "$entry" == "$dir" ]] && continue
+    new_path="$new_path:$entry"
+  done
+
+  PATH="$new_path"
 }
 
 prepare_launch_env() {
@@ -50,6 +64,26 @@ prepare_launch_env() {
 
   export PATH
   export SCREENCAP_DEV_REPO_ROOT="${SCREENCAP_DEV_REPO_ROOT:-$ROOT_DIR}"
+  resolve_dev_python
+}
+
+resolve_dev_python() {
+  local python_cmd="${SCREENCAP_DEV_PYTHON:-}"
+  local resolved_python
+
+  if [[ -z "$python_cmd" && -x "$HOME/.pyenv/shims/python3" ]]; then
+    python_cmd="$HOME/.pyenv/shims/python3"
+  fi
+  if [[ -z "$python_cmd" ]]; then
+    python_cmd="$(command -v python3 || true)"
+  fi
+  if [[ -z "$python_cmd" ]]; then
+    return
+  fi
+
+  if resolved_python="$("$python_cmd" -c 'import sys; print(sys.executable)' 2>/dev/null)" && [[ -x "$resolved_python" ]]; then
+    export SCREENCAP_DEV_PYTHON="$resolved_python"
+  fi
 }
 
 warn_if_ad_hoc_signing() {
@@ -67,6 +101,16 @@ warn_if_ad_hoc_signing() {
 publish_launch_env() {
   /bin/launchctl setenv PATH "$PATH"
   /bin/launchctl setenv SCREENCAP_DEV_REPO_ROOT "$SCREENCAP_DEV_REPO_ROOT"
+  if [[ -n "${SCREENCAP_DEV_PYTHON:-}" ]]; then
+    /bin/launchctl setenv SCREENCAP_DEV_PYTHON "$SCREENCAP_DEV_PYTHON"
+  else
+    /bin/launchctl unsetenv SCREENCAP_DEV_PYTHON
+  fi
+  if [[ "${SCREENCAP_DAEMON_USE_DEV_SOURCE:-0}" == "1" ]]; then
+    /bin/launchctl setenv SCREENCAP_DAEMON_USE_DEV_SOURCE "1"
+  else
+    /bin/launchctl unsetenv SCREENCAP_DAEMON_USE_DEV_SOURCE
+  fi
 }
 
 generate_project_if_needed() {
@@ -96,6 +140,20 @@ generate_project_if_needed() {
     cd "$MACOS_DIR"
     xcodegen generate
   )
+}
+
+build_cli_if_needed() {
+  if [[ -x "$CLI_BINARY" ]] && "$CLI_BINARY" serve --help >/dev/null 2>&1; then
+    return
+  fi
+
+  if [[ -z "${SCREENCAP_DEV_PYTHON:-}" ]]; then
+    echo "error: unable to resolve python3 for PyInstaller CLI build." >&2
+    exit 1
+  fi
+
+  echo "Building screencap CLI bundle for helper..."
+  "$SCREENCAP_DEV_PYTHON" -m PyInstaller --noconfirm "$ROOT_DIR/pyinstaller/screencap.spec"
 }
 
 kill_existing_app() {
@@ -143,6 +201,7 @@ launch_debugger() {
   env \
     PATH="$PATH" \
     SCREENCAP_DEV_REPO_ROOT="$SCREENCAP_DEV_REPO_ROOT" \
+    SCREENCAP_DEV_PYTHON="${SCREENCAP_DEV_PYTHON:-}" \
     lldb -- "$APP_BINARY"
 }
 
@@ -197,6 +256,7 @@ main() {
   generate_project_if_needed
   warn_if_ad_hoc_signing
   kill_existing_app
+  build_cli_if_needed
   build_app
 
   case "$MODE" in
