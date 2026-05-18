@@ -37,6 +37,13 @@ final class PrivacyController: ObservableObject {
     /// advisory flock).
     private var firstLaunchWriteAttempted: Bool = false
 
+    /// Serializes overlapping `markSetupComplete` invocations. Both banner
+    /// CTAs plus the pane's `.onAppear` plus a rapid double-tap on the same
+    /// CTA can all reach the controller concurrently — the underlying CLI
+    /// write is idempotent, but firing it 4× per dismiss wastes a flock
+    /// acquisition and emits noise into the telemetry stream.
+    private var setupCompleteInFlight: Bool = false
+
     /// True when the first-run banner should be shown. Driven by `status`:
     /// hidden until status loads (UI fail-closed — the banner is the
     /// disclosure surface, not a security boundary) and again once the user
@@ -114,9 +121,12 @@ final class PrivacyController: ObservableObject {
     }
 
     /// Mark first-run setup complete (`setup_skipped = true`). Both banner
-    /// CTAs and the pane's `.onAppear` call this; the underlying CLI write
-    /// is idempotent so duplicate invocations are safe.
+    /// CTAs and the pane's `.onAppear` call this — overlapping invocations
+    /// short-circuit so the CLI write fires exactly once per dismiss.
     func markSetupComplete() async {
+        if setupCompleteInFlight { return }
+        setupCompleteInFlight = true
+        defer { setupCompleteInFlight = false }
         do {
             _ = try await invoke(["settings", "privacy", "setup_skipped", "set", "true", "--json"])
             await refreshStatus()

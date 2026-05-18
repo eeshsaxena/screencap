@@ -177,11 +177,10 @@ final class FirstRunPrivacyBannerTests: XCTestCase {
         let writes = scripted.calls.filter {
             $0 == ["settings", "privacy", "setup_skipped", "set", "true", "--json"]
         }
-        // markSetupComplete is idempotent — duplicate writes are tolerated
-        // by the CLI (setup_skipped=true a second time is a no-op exit 0).
-        // We accept either 1 or 2 writes here; the security-critical
-        // invariant is that bannerActive is false afterward.
-        XCTAssertLessThanOrEqual(writes.count, 2)
+        // Controller serializes overlapping markSetupComplete calls — the CLI
+        // write is idempotent, but firing it twice would acquire the advisory
+        // flock twice and emit duplicate telemetry.
+        XCTAssertEqual(writes.count, 1)
         XCTAssertFalse(controller.bannerActive)
     }
 
