@@ -61,10 +61,19 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
         NSApp.setActivationPolicy(.regular)
         NSApp.activate(ignoringOtherApps: true)
         if !hasVisibleWindows {
-            for window in NSApp.windows where window.contentViewController != nil {
+            // Fast path: a real titled main window survived. Bring it forward
+            // instead of asking SwiftUI to instantiate a new one.
+            for window in NSApp.windows
+            where window.contentViewController != nil
+                && !(window is NSPanel)
+                && window.styleMask.contains(.titled) {
                 window.makeKeyAndOrderFront(nil)
                 return true
             }
+            // WindowGroup has torn down its window — ask SwiftUI to materialize
+            // a fresh one via the OpenWindowBridge captured during the last
+            // window's lifecycle. Safe no-op if the bridge has never armed.
+            WindowOpener.shared.openMain?()
         }
         return true
     }

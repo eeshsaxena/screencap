@@ -7,6 +7,7 @@ import SwiftUI
 /// instead of the Stop button so the user sees progress.
 struct MenuBarMenu: View {
     @EnvironmentObject private var recorder: RecorderController
+    @Environment(\.openWindow) private var openWindow
 
     var body: some View {
         if let remaining = recorder.quitProgressSecondsRemaining {
@@ -40,15 +41,27 @@ struct MenuBarMenu: View {
     }
 
     private func openMainWindow() {
+        // Activation policy must flip back to .regular before activating —
+        // the close observer in AppDelegate sets .accessory when the last
+        // titled window goes away, and openWindow(id:) alone won't bring
+        // the app to the foreground.
         NSApp.setActivationPolicy(.regular)
         NSApp.activate(ignoringOtherApps: true)
-        for window in NSApp.windows where window.title == "ScreenCap" {
+        // Fast path: a titled main window already exists. Bring it forward
+        // instead of asking SwiftUI to instantiate a duplicate — calling
+        // openWindow(id:) from MenuBarExtra creates a second WindowGroup
+        // instance even when one is already visible (see SCR-55 QA). The
+        // filter mirrors AppDelegate.applicationShouldHandleReopen and adds
+        // sheetParent == nil so we focus the parent, not an attached sheet
+        // (e.g. the first-run permissions sheet).
+        for window in NSApp.windows
+        where window.contentViewController != nil
+            && !(window is NSPanel)
+            && window.styleMask.contains(.titled)
+            && window.sheetParent == nil {
             window.makeKeyAndOrderFront(nil)
             return
         }
-        // No matching window — bring whatever exists to the front.
-        if let window = NSApp.windows.first {
-            window.makeKeyAndOrderFront(nil)
-        }
+        openWindow(id: MainWindowID)
     }
 }
