@@ -16,6 +16,15 @@ struct PrivacyPaneView: View {
             content
         }
         .task { await initialLoad() }
+        .onAppear {
+            // Pane visit alone clears the banner — this fires for users who
+            // navigate via the sidebar directly instead of via the banner's
+            // "Review what's captured" CTA. markSetupComplete is idempotent
+            // so the dual-path is safe.
+            if privacy.bannerActive {
+                Task { await privacy.markSetupComplete() }
+            }
+        }
     }
 
     private var header: some View {

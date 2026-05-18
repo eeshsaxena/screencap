@@ -38,6 +38,15 @@ struct ScreenCapApp: App {
                 .task {
                     if ProcessInfo.processInfo.environment["XCTestConfigurationFilePath"] == nil {
                         await recorder.probeDaemon()
+                        // First-launch sequencing: write fail-closed mode →
+                        // refresh status → load apps. Runs after the daemon
+                        // probe so it doesn't contend with daemon socket
+                        // setup. ensureFirstLaunchModeWritten() probes
+                        // on-disk and short-circuits when [privacy] already
+                        // exists, so this is a one-time cost on first launch.
+                        await privacy.ensureFirstLaunchModeWritten()
+                        await privacy.refreshStatus()
+                        await privacy.refreshApps()
                     }
                 }
         }
@@ -50,11 +59,40 @@ struct ScreenCapApp: App {
             MenuBarMenu()
                 .environmentObject(recorder)
         } label: {
-            Image(systemName: recorder.state.isRecording ? "record.circle.fill" : "record.circle")
-                .symbolRenderingMode(.palette)
-                .foregroundStyle(recorder.state.isRecording ? Color.red : Color.primary)
+            MenuBarLabel(
+                isRecording: recorder.state.isRecording,
+                privacyAttention: privacy.bannerActive
+            )
         }
         .menuBarExtraStyle(.menu)
+    }
+}
+
+/// MenuBarExtra label composition. `record.circle` base layer is always
+/// rendered; the recording state drives the fill, and the privacy-attention
+/// badge is overlaid in the upper-right corner when the first-run banner is
+/// active. Color and corner position keep the attention dot visually
+/// distinct from the recording red dot — co-existing while recording is the
+/// expected case during the first-launch window.
+private struct MenuBarLabel: View {
+    let isRecording: Bool
+    let privacyAttention: Bool
+
+    var body: some View {
+        ZStack(alignment: .topTrailing) {
+            Image(systemName: isRecording ? "record.circle.fill" : "record.circle")
+                .symbolRenderingMode(.palette)
+                .foregroundStyle(isRecording ? Color.red : Color.primary)
+            if privacyAttention {
+                Circle()
+                    .fill(Color.orange)
+                    .frame(width: 5, height: 5)
+                    .overlay(
+                        Circle().stroke(Color.black.opacity(0.4), lineWidth: 0.5)
+                    )
+                    .offset(x: 2, y: -2)
+            }
+        }
     }
 }
 

@@ -33,6 +33,20 @@ struct MainWindow: View {
             sidebar
         } detail: {
             VStack(spacing: 0) {
+                if privacy.bannerActive {
+                    FirstRunPrivacyBanner(
+                        onReview: {
+                            section = .privacy
+                            Task { await privacy.markSetupComplete() }
+                        },
+                        onDismiss: {
+                            Task { await privacy.markSetupComplete() }
+                        }
+                    )
+                    .padding(.horizontal, 16)
+                    .padding(.top, 12)
+                    .transition(.opacity)
+                }
                 RecordingBanner()
                     .padding(.horizontal, 16)
                     .padding(.top, recorder.state.isRecording ? 12 : 0)
