@@ -12,6 +12,7 @@ struct ScreenCapApp: App {
     @StateObject private var recorder = RecorderController()
     @StateObject private var permissions = PermissionController()
     @StateObject private var index = RecordingsIndex()
+    @StateObject private var privacy = PrivacyController()
 
     var body: some Scene {
         // Use `Window` (macOS 13+) rather than `WindowGroup` so the scene is
@@ -25,6 +26,7 @@ struct ScreenCapApp: App {
                 .environmentObject(recorder)
                 .environmentObject(permissions)
                 .environmentObject(index)
+                .environmentObject(privacy)
                 .frame(minWidth: 880, minHeight: 560)
                 .background(OpenWindowBridge())
                 .onAppear {

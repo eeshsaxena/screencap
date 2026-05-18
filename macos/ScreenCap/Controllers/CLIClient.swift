@@ -141,6 +141,18 @@ enum CLIClient {
         _ = try await runOneShot(args, timeout: timeout)
     }
 
+    /// Like `runJSON` but returns the raw stdout bytes instead of a decoded
+    /// model. Callers decode themselves — useful when the same controller
+    /// invokes several distinct JSON endpoints and wants one chokepoint for
+    /// process spawning + test injection, or when the caller needs to inspect
+    /// the `ok` / `error` envelope fields before deciding what to decode into
+    /// a typed model.
+    static func runJSONRaw(_ args: [String], timeout: TimeInterval = 10) async throws -> Data {
+        assert(args.contains("--json"), "runJSONRaw requires the caller to pass --json explicitly. args=\(args)")
+        let (stdoutBytes, _) = try await runOneShot(args, timeout: timeout)
+        return stdoutBytes
+    }
+
     /// Spawn + drain + race timeout. Returns (stdout, stderr); throws on
     /// launch failure, timeout, or non-zero exit. Shared backbone for
     /// `runJSON` and `runAwaitingExit` so the timeout / pipe-drain logic
