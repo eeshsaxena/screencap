@@ -47,7 +47,11 @@ def _stdin_is_tty() -> bool:
 _STATUS_SCHEMA_VERSION = 1
 _APPS_SCHEMA_VERSION = 2
 _SETTINGS_PRIVACY_SCHEMA_VERSION = 2
-_SETTINGS_SCHEMA_VERSION = 1
+# v2 (todo 012 follow-up, SCR-17): adds the `privacy` block to the payload so
+# the SwiftUI first-run banner can read `mode`, `setup_skipped`, and
+# `has_privacy_section` in a single round-trip without touching config.toml.
+# Additive: every v1 field is unchanged.
+_SETTINGS_SCHEMA_VERSION = 2
 _STOP_SCHEMA_VERSION = 1
 
 
@@ -3247,6 +3251,7 @@ def settings(ctx, set_pair, as_json):
         "auto_delete_after_upload": bool(get_auto_delete_after_upload()),
         "rest_threshold_seconds": float(rest),
         "recordings_dir": str(get_recordings_dir()),
+        "privacy": _build_privacy_settings_block(),
     }
 
     if as_json:
@@ -3291,6 +3296,43 @@ _PRIVACY_MAP_FIELDS = ("app_classes",)
 # `shared` is reserved for MASK_REGION (not yet implemented); accepting it
 # would write an unenforceable value that crashes the next start (todo 011).
 _PRIVACY_MODE_VALUES = ("public", "internal")
+
+
+def _build_privacy_settings_block() -> dict:
+    """Return the `privacy` block for `settings --json` (SCR-17).
+
+    Reads the raw `[privacy]` section from config.toml directly so the
+    `has_privacy_section` flag can distinguish "never written" from
+    "present with default values". The SwiftUI first-run banner gates its
+    first-launch ``mode = internal`` write on this flag — using the parsed
+    ``PrivacyConfig`` would conflate the two cases (defaults fill in for
+    missing sections) and the banner would never write the fail-closed mode.
+
+    Permissive on bad values: an invalid ``mode`` falls back to ``"internal"``
+    rather than raising, mirroring ``PrivacyConfig``'s tolerance. The pane's
+    job is to surface state, not to reject malformed configs at read time.
+    """
+    from screencap.config import _load_toml
+
+    cfg = _load_toml()
+    has_section = isinstance(cfg, dict) and "privacy" in cfg
+    section = cfg.get("privacy") if has_section else None
+    if not isinstance(section, dict):
+        section = {}
+
+    raw_mode = section.get("mode", "internal")
+    mode = raw_mode.lower() if isinstance(raw_mode, str) else "internal"
+    if mode not in _PRIVACY_MODE_VALUES:
+        mode = "internal"
+
+    raw_skipped = section.get("setup_skipped", False)
+    setup_skipped = raw_skipped if isinstance(raw_skipped, bool) else False
+
+    return {
+        "mode": mode,
+        "setup_skipped": setup_skipped,
+        "has_privacy_section": has_section,
+    }
 
 
 def _privacy_list_field_value(value: str) -> str:
