@@ -7,6 +7,7 @@ import SwiftUI
 /// instead of the Stop button so the user sees progress.
 struct MenuBarMenu: View {
     @EnvironmentObject private var recorder: RecorderController
+    @Environment(\.openWindow) private var openWindow
 
     var body: some View {
         if let remaining = recorder.quitProgressSecondsRemaining {
@@ -40,15 +41,12 @@ struct MenuBarMenu: View {
     }
 
     private func openMainWindow() {
+        // Activation policy must flip back to .regular before activating —
+        // the close observer in AppDelegate sets .accessory when the last
+        // titled window goes away, and openWindow(id:) alone won't bring
+        // the app to the foreground.
         NSApp.setActivationPolicy(.regular)
         NSApp.activate(ignoringOtherApps: true)
-        for window in NSApp.windows where window.title == "ScreenCap" {
-            window.makeKeyAndOrderFront(nil)
-            return
-        }
-        // No matching window — bring whatever exists to the front.
-        if let window = NSApp.windows.first {
-            window.makeKeyAndOrderFront(nil)
-        }
+        openWindow(id: MainWindowID)
     }
 }
