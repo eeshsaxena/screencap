@@ -88,10 +88,25 @@ private struct MenuBarLabel: View {
                     .fill(Color.orange)
                     .frame(width: 5, height: 5)
                     .overlay(
-                        Circle().stroke(Color.black.opacity(0.4), lineWidth: 0.5)
+                        // `Color.primary` adapts to the menu bar appearance so
+                        // the hairline shows up against both light and dark
+                        // menu bar wallpapers — a hardcoded black/white stroke
+                        // disappears in one of the two modes.
+                        Circle().stroke(Color.primary.opacity(0.4), lineWidth: 0.5)
                     )
                     .offset(x: 2, y: -2)
+                    .accessibilityHidden(true)
             }
+        }
+        .accessibilityLabel(accessibilityDescription)
+    }
+
+    private var accessibilityDescription: String {
+        switch (isRecording, privacyAttention) {
+        case (true, true):   return "ScreenCap, recording — privacy setup needed"
+        case (true, false):  return "ScreenCap, recording"
+        case (false, true):  return "ScreenCap — privacy setup needed"
+        case (false, false): return "ScreenCap"
         }
     }
 }

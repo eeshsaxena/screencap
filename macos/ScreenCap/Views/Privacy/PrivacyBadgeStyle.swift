@@ -56,8 +56,25 @@ struct PrivacyBadgeStyle: Equatable {
             )
         }
 
+        // A `resolved_action == "exclude"` without `is_matrix_exclude` and
+        // without `in_exclude_apps` means the matrix at the configured mode
+        // produces EXCLUDE for this class but the user has somehow tried to
+        // allow it. The CLI's `_matrix_blocks_allow_for_class` guard prevents
+        // this from being writable, but a hand-edited config could still
+        // produce it — render defensively as "Blocked" so the row never
+        // silently misrepresents capture state.
+        if app.resolvedAction == "exclude" {
+            return PrivacyBadgeStyle(
+                text: "Blocked",
+                toggleDisabled: false,
+                toggleOn: false,
+                tooltip: nil,
+                kind: .blockedBySecurity
+            )
+        }
+
         let baseText: String
-        if app.inAllowApps && app.resolvedAction != "exclude" {
+        if app.inAllowApps {
             baseText = "Captured (allowed by you)"
         } else {
             switch app.resolvedAction {

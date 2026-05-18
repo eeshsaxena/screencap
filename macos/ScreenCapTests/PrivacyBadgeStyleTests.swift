@@ -106,6 +106,21 @@ final class PrivacyBadgeStyleTests: XCTestCase {
         XCTAssertNotNil(style.tooltip)
     }
 
+    /// Defensive case: `resolved_action == "exclude"` without `is_matrix_exclude`
+    /// or `in_exclude_apps` means the matrix at the configured mode forces
+    /// EXCLUDE. The CLI's allow-bypass guard prevents this from being writable,
+    /// but a hand-edited config could produce it — render "Blocked" rather
+    /// than silently fall through to "Captured" and misrepresent the row.
+    func testExcludeResolvedActionRendersBlockedDefensively() {
+        let style = PrivacyBadgeStyle.derive(for: app(
+            resolvedAction: "exclude",
+            inAllowApps: true
+        ))
+        XCTAssertEqual(style.text, "Blocked")
+        XCTAssertEqual(style.kind, .blockedBySecurity)
+        XCTAssertFalse(style.toggleOn)
+    }
+
     func testMaskedRowWithPerFrameOverridesIsNotDecorated() {
         // Mask-resolved rows already disclose the masking; per-frame override
         // overlap is not informative there.

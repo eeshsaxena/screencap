@@ -31,11 +31,12 @@ final class PrivacyController: ObservableObject {
     /// same bundle and leave the UI optimistic state out of sync with disk.
     private var pendingToggles: Set<String> = []
 
-    /// Latches once `ensureFirstLaunchModeWritten()` has run, so a transient
-    /// retry path can't write `mode = internal` twice (the second write would
-    /// be a no-op, but it would emit a needless event and contend with the
-    /// advisory flock).
-    private var firstLaunchWriteAttempted: Bool = false
+    /// Latches once `ensureFirstLaunchModeWritten()` has finished its work
+    /// (either confirmed the section exists, or succeeded in writing it).
+    /// Crucially, set only after the work succeeds — a CLI failure mid-launch
+    /// must leave the latch open so the next .task fire can retry instead of
+    /// stranding the user in a half-initialized state for the session.
+    private var firstLaunchWriteCompleted: Bool = false
 
     /// Serializes overlapping `markSetupComplete` invocations. Both banner
     /// CTAs plus the pane's `.onAppear` plus a rapid double-tap on the same
@@ -105,7 +106,10 @@ final class PrivacyController: ObservableObject {
 
     /// Toggle `exclude_apps` membership for `bundleId`. Idempotent at the CLI
     /// layer — `add` of an already-present value is a no-op exit 0, ditto for
-    /// `remove` of an absent value.
+    /// `remove` of an absent value. On success the app list is refreshed so
+    /// the row's optimistic state converges with disk truth; on failure the
+    /// error is surfaced and the caller's optimistic toggle gets reseeded
+    /// when the next `refreshApps` overwrites the row.
     func toggleExclude(bundleId: String, excluded: Bool) async {
         guard !pendingToggles.contains(bundleId) else { return }
         pendingToggles.insert(bundleId)
@@ -118,17 +122,35 @@ final class PrivacyController: ObservableObject {
         } catch {
             lastError = error.localizedDescription
         }
+        // Refresh after both success and failure paths: success ensures
+        // `in_exclude_apps` reflects the write; failure reseeds the row's
+        // optimistic toggle from disk so the user doesn't see a toggle
+        // position that contradicts the configured state.
+        await refreshApps()
     }
 
     /// Mark first-run setup complete (`setup_skipped = true`). Both banner
     /// CTAs and the pane's `.onAppear` call this — overlapping invocations
     /// short-circuit so the CLI write fires exactly once per dismiss.
+    ///
+    /// Optimistically flips `status.setupSkipped` to true after the CLI
+    /// write succeeds, before the follow-up `refreshStatus()`. Without that,
+    /// a failure on the status refresh would resurrect the banner the user
+    /// just dismissed, even though the underlying CLI write succeeded.
     func markSetupComplete() async {
         if setupCompleteInFlight { return }
         setupCompleteInFlight = true
         defer { setupCompleteInFlight = false }
         do {
             _ = try await invoke(["settings", "privacy", "setup_skipped", "set", "true", "--json"])
+            if var current = status {
+                current = PrivacyStatus(
+                    mode: current.mode,
+                    setupSkipped: true,
+                    hasPrivacySection: current.hasPrivacySection
+                )
+                status = current
+            }
             await refreshStatus()
         } catch {
             lastError = error.localizedDescription
@@ -140,21 +162,30 @@ final class PrivacyController: ObservableObject {
     /// touches the dismiss CTAs still gets the stricter default. Probes the
     /// on-disk state itself (does not rely on `self.status`) because the
     /// caller invokes this before the first explicit `refreshStatus()`.
+    ///
+    /// The latch is set ONLY after the work completes — a transient CLI
+    /// failure mid-launch must leave it open so the next `.task` fire (e.g.
+    /// after the user reopens the window from the menu bar) can retry.
     func ensureFirstLaunchModeWritten() async {
-        if firstLaunchWriteAttempted { return }
-        firstLaunchWriteAttempted = true
+        if firstLaunchWriteCompleted { return }
         do {
             let data = try await invoke(["settings", "--json"])
             let envelope = try JSONDecoder().decode(SettingsEnvelope.self, from: data)
             guard let p = envelope.settings.privacy, !p.hasPrivacySection else {
                 // Either the CLI is too old to return the v2 privacy block, or
                 // the [privacy] section already exists — both are no-write
-                // states.
+                // states. Latch only on the present-section case; an old CLI
+                // is a transient state that may resolve on the next refresh.
+                if let p = envelope.settings.privacy, p.hasPrivacySection {
+                    firstLaunchWriteCompleted = true
+                }
                 return
             }
             _ = try await invoke(["settings", "privacy", "mode", "set", "internal", "--json"])
+            firstLaunchWriteCompleted = true
         } catch {
             lastError = error.localizedDescription
+            // Do NOT latch on failure — the next .task fire should retry.
         }
     }
 }

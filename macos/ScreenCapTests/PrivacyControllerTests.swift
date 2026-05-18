@@ -153,18 +153,20 @@ final class PrivacyControllerTests: XCTestCase {
 
     // MARK: - toggleExclude
 
-    func testToggleExcludeAddsBundle() async {
+    func testToggleExcludeAddsBundleAndRefreshes() async {
         let fake = FakeInvoker()
         let controller = PrivacyController(invoke: fake.invoker())
 
         await controller.toggleExclude(bundleId: "com.foo", excluded: true)
 
+        // Write followed by refresh — converges optimistic UI to disk truth.
         XCTAssertEqual(fake.calls, [
             ["settings", "privacy", "exclude_apps", "add", "com.foo", "--json"],
+            ["apps", "--json"],
         ])
     }
 
-    func testToggleExcludeRemovesBundle() async {
+    func testToggleExcludeRemovesBundleAndRefreshes() async {
         let fake = FakeInvoker()
         let controller = PrivacyController(invoke: fake.invoker())
 
@@ -172,32 +174,111 @@ final class PrivacyControllerTests: XCTestCase {
 
         XCTAssertEqual(fake.calls, [
             ["settings", "privacy", "exclude_apps", "remove", "com.foo", "--json"],
+            ["apps", "--json"],
         ])
+    }
+
+    func testToggleExcludeRefreshesEvenOnWriteFailure() async {
+        var firstWriteFailed = false
+        let fake = FakeInvoker()
+        fake.respond = { [weak self] args in
+            guard let self else { return nil }
+            if args.contains("exclude_apps") {
+                firstWriteFailed = true
+                throw NSError(domain: "test", code: 1, userInfo: [NSLocalizedDescriptionKey: "boom"])
+            }
+            if args == ["apps", "--json"] {
+                // Make the refresh fail too so the user can see the error.
+                if firstWriteFailed {
+                    throw NSError(domain: "test", code: 2,
+                                  userInfo: [NSLocalizedDescriptionKey: "refresh after failed write"])
+                }
+                return self.appsEnvelope([])
+            }
+            return nil
+        }
+        let controller = PrivacyController(invoke: fake.invoker())
+
+        await controller.toggleExclude(bundleId: "com.foo", excluded: true)
+
+        // Refresh must fire even after a failed write — otherwise the row's
+        // optimistic toggle drifts from disk truth.
+        XCTAssertTrue(fake.calls.contains(["apps", "--json"]))
+    }
+
+    /// Pins the argv-array (no-shell) contract: a malicious `bundle_id`
+    /// containing shell metacharacters must land as a single argv element,
+    /// not as separate shell tokens. A regression to `/bin/sh -c` wrapping
+    /// would silently introduce command injection — this test is the canary.
+    func testToggleExcludePreservesBundleIdAsSingleArgvElement() async {
+        let fake = FakeInvoker()
+        let controller = PrivacyController(invoke: fake.invoker())
+        let hostile = "com.foo; rm -rf $HOME `id`"
+
+        await controller.toggleExclude(bundleId: hostile, excluded: true)
+
+        // First call is the write; the bundle_id stays as a single argv
+        // element regardless of the metacharacters.
+        XCTAssertEqual(
+            fake.calls.first,
+            ["settings", "privacy", "exclude_apps", "add", hostile, "--json"]
+        )
     }
 
     func testToggleExcludeSerializesConcurrentCallsForSameBundle() async {
         let fake = FakeInvoker()
-        // Hold the invocation open with a continuation so two parallel calls
-        // overlap on the wire — without serialization both would record.
-        var continuation: CheckedContinuation<Data, Never>?
         fake.respond = { _ in
-            // The fake invoker can't easily suspend, so we use a sleep + the
-            // pendingToggles serialization to validate. Two concurrent toggles
-            // for the same bundle should produce exactly one CLI call.
             Thread.sleep(forTimeInterval: 0.05)
             return Data(#"{"ok":true,"settings":{}}"#.utf8)
         }
-        _ = continuation
         let controller = PrivacyController(invoke: fake.invoker())
 
         async let a: Void = controller.toggleExclude(bundleId: "com.foo", excluded: true)
         async let b: Void = controller.toggleExclude(bundleId: "com.foo", excluded: true)
         _ = await (a, b)
 
-        XCTAssertEqual(fake.calls.count, 1, "expected serialization to drop the duplicate; got \(fake.calls)")
+        // Both calls share `pendingToggles`, so only one CLI write fires.
+        // Filter to just the exclude_apps writes so the apps refresh that
+        // follows doesn't mask the serialization signal.
+        let writes = fake.calls.filter { $0.contains("exclude_apps") }
+        XCTAssertEqual(writes.count, 1, "expected serialization to drop duplicate writes; got \(writes)")
     }
 
     // MARK: - markSetupComplete
+
+    /// Optimistic local flip of `setupSkipped` keeps the banner dismissed
+    /// even if the post-write `refreshStatus()` fails. Without this, a CLI
+    /// hiccup right after a successful `setup_skipped = true` write would
+    /// resurrect the dismissed banner — confusing the user.
+    func testMarkSetupCompleteHidesBannerEvenIfRefreshFails() async {
+        var refreshShouldFail = false
+        let fake = FakeInvoker()
+        fake.respond = { [weak self] args in
+            guard let self else { return nil }
+            if args == ["settings", "--json"] {
+                if refreshShouldFail {
+                    throw NSError(domain: "test", code: 1,
+                                  userInfo: [NSLocalizedDescriptionKey: "post-write refresh failed"])
+                }
+                return self.settingsEnvelope(privacy: [
+                    "mode": "internal",
+                    "setup_skipped": false,
+                    "has_privacy_section": true,
+                ])
+            }
+            return nil
+        }
+        let controller = PrivacyController(invoke: fake.invoker())
+        await controller.refreshStatus()
+        XCTAssertTrue(controller.bannerActive)
+
+        refreshShouldFail = true
+        await controller.markSetupComplete()
+
+        XCTAssertEqual(controller.status?.setupSkipped, true,
+                       "optimistic update must survive refresh failure")
+        XCTAssertFalse(controller.bannerActive)
+    }
 
     func testMarkSetupCompleteWritesAndRefreshes() async {
         let fake = FakeInvoker()
@@ -268,10 +349,47 @@ final class PrivacyControllerTests: XCTestCase {
         XCTAssertEqual(fake.calls, [["settings", "--json"]])
     }
 
-    func testEnsureFirstLaunchModeWriteLatchesOnRepeatCalls() async {
+    func testEnsureFirstLaunchModeWriteLatchesAfterSuccessfulWrite() async {
+        var sectionExists = false
         let fake = FakeInvoker()
         fake.respond = { [weak self] args in
             guard let self else { return nil }
+            if args == ["settings", "--json"] {
+                return self.settingsEnvelope(privacy: [
+                    "mode": "internal",
+                    "setup_skipped": false,
+                    "has_privacy_section": sectionExists,
+                ])
+            }
+            if args.contains("mode") && args.contains("internal") {
+                sectionExists = true
+            }
+            return nil
+        }
+        let controller = PrivacyController(invoke: fake.invoker())
+
+        await controller.ensureFirstLaunchModeWritten()
+        let countAfterFirst = fake.calls.count
+        await controller.ensureFirstLaunchModeWritten()
+
+        XCTAssertEqual(fake.calls.count, countAfterFirst,
+                       "latched after success — second call must short-circuit")
+    }
+
+    /// The latch MUST NOT engage on failure. A transient CLI error mid-launch
+    /// otherwise strands the user without the fail-closed mode write for the
+    /// rest of the app session — the @StateObject controller survives window
+    /// close, so any retry path (next .task fire) would silently no-op.
+    func testEnsureFirstLaunchModeWriteRetriesAfterFailure() async {
+        var failNext = true
+        let fake = FakeInvoker()
+        fake.respond = { [weak self] args in
+            guard let self else { return nil }
+            if failNext {
+                failNext = false
+                throw NSError(domain: "test", code: 1,
+                              userInfo: [NSLocalizedDescriptionKey: "transient CLI failure"])
+            }
             if args == ["settings", "--json"] {
                 return self.settingsEnvelope(privacy: [
                     "mode": "internal",
@@ -284,9 +402,14 @@ final class PrivacyControllerTests: XCTestCase {
         let controller = PrivacyController(invoke: fake.invoker())
 
         await controller.ensureFirstLaunchModeWritten()
-        await controller.ensureFirstLaunchModeWritten()
+        // First attempt fails — error surfaces, latch stays open.
+        XCTAssertEqual(controller.lastError, "transient CLI failure")
 
-        XCTAssertEqual(fake.calls.count, 2, "second invocation must short-circuit")
+        await controller.ensureFirstLaunchModeWritten()
+        // Second attempt succeeds and actually issues the fail-closed write.
+        XCTAssertTrue(fake.calls.contains(
+            ["settings", "privacy", "mode", "set", "internal", "--json"]
+        ))
     }
 
     // MARK: - bannerActive derivation
