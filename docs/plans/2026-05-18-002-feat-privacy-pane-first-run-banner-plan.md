@@ -1,7 +1,7 @@
 ---
 title: "feat: SwiftUI v1 Phase 4 — Privacy pane + first-run banner"
 type: feat
-status: active
+status: completed
 date: 2026-05-18
 origin: https://linear.app/zk-email/issue/SCR-17/swiftui-v1-phase-4-privacy-pane-first-run-banner
 ---
