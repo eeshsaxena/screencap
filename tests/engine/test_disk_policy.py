@@ -306,7 +306,7 @@ def test_screen_recorder_calls_disk_policy_bind_and_preflight(tmp_path):
     from unittest import mock
 
     from screencap.engine.config import RecordingConfig
-    from screencap.engine.lock_policy import ClaimLock
+    from screencap.engine.lock_policy import InheritLock
     from screencap.engine.menubar_policy import Noop as MenubarNoop
     from screencap.engine.network_policy import Null as NetworkNull
     from screencap.engine.permission_policy import Noop as PermNoop
@@ -347,7 +347,7 @@ def test_screen_recorder_calls_disk_policy_bind_and_preflight(tmp_path):
     channels = IpcChannels.create()
     policies = RecordingPolicies(
         signal=mock.MagicMock(spec=["install", "uninstall"]),
-        lock=ClaimLock(),
+        lock=InheritLock(),
         menubar=MenubarNoop(),
         permission=PermNoop(),
         disk=spy,

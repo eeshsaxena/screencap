@@ -99,7 +99,7 @@ class _OneShotDiskPolicy:
 
 def _build_seam(tmp_path, *, permission, disk):
     from screencap.engine.config import RecordingConfig
-    from screencap.engine.lock_policy import ClaimLock
+    from screencap.engine.lock_policy import InheritLock
     from screencap.engine.menubar_policy import Noop as MenubarNoop
     from screencap.engine.network_policy import Null as NetworkNull
     from screencap.engine.screen_recorder import (
@@ -115,7 +115,7 @@ def _build_seam(tmp_path, *, permission, disk):
     channels = IpcChannels.create()
     policies = RecordingPolicies(
         signal=NoopSignalPolicy(),
-        lock=ClaimLock(),
+        lock=InheritLock(),
         menubar=MenubarNoop(),
         permission=permission,
         disk=disk,

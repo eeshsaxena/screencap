@@ -167,7 +167,7 @@ def test_screen_recorder_invokes_signal_policy_install_then_uninstall(tmp_path):
     from screencap.engine.config import RecordingConfig
     from screencap.engine.disk_policy import Noop as DiskNoop
     from screencap.engine.network_policy import Null as NetworkNull
-    from screencap.engine.lock_policy import ClaimLock
+    from screencap.engine.lock_policy import InheritLock
     from screencap.engine.menubar_policy import Noop as MenubarNoop
     from screencap.engine.permission_policy import Noop as PermNoop
     from screencap.engine.screen_recorder import (
@@ -195,7 +195,7 @@ def test_screen_recorder_invokes_signal_policy_install_then_uninstall(tmp_path):
     channels = IpcChannels.create()
     policies = RecordingPolicies(
         signal=spy,
-        lock=ClaimLock(),
+        lock=InheritLock(),
         menubar=MenubarNoop(),
         permission=PermNoop(),
         disk=DiskNoop(),

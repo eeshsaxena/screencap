@@ -190,13 +190,15 @@ class SigtermOnly:
 
 
 class LockPolicy(Protocol):
-    """Pidfile lifecycle + per-recording identity files. ``ClaimLock`` | ``InheritLock``.
+    """Pidfile lifecycle + per-recording identity files. ``InheritLock``.
 
-    Bundle owned by SCR-40: orphan-process preflight, ``claim_lock`` /
-    ``delete_pidfile`` lifecycle, child-PID snapshot, and writing
-    ``.recording_id`` + ``.recording_intent``. The concrete protocol
-    methods (``claim`` / ``write_identity`` / ``register_children`` /
-    ``release``) live alongside the implementations in
+    Bundle owned by SCR-40. Post-Phase-2 the daemon supervisor owns the
+    process-exclusive pidfile claim itself, so the engine subprocess
+    runs with ``InheritLock`` — ``claim`` / ``register_children`` /
+    ``release`` are no-ops; ``write_identity`` still emits
+    ``.recording_id`` + ``.recording_intent`` for downstream catalog /
+    upload / scrubber / recovery consumers. The concrete protocol
+    methods live alongside the implementation in
     ``screencap.engine.lock_policy``.
     """
 
@@ -401,10 +403,10 @@ def _run_screen_recorder(rec: "ScreenRecorder") -> "RecordingResult":
     # request + legacy options, so policy construction can't pre-bind.
     disk_policy.bind(capture_dir)
 
-    # Standalone CLI passes ClaimLock (orphan preflight + exclusive
-    # claim); session workers pass InheritLock (controller already
-    # claimed). Lock-contention exit-code-2 + stderr event live inside
-    # ClaimLock.
+    # Post-Phase-2: the daemon supervisor already owns the pidfile claim
+    # (see ``daemon/supervisor.py``), so ``InheritLock.claim`` is a no-op.
+    # The call is preserved for the seam — a future ``LockPolicy`` variant
+    # from the engine-topology spike may need to do real work here.
     lock_policy.claim(capture_dir, force_clean=force_clean)
 
     if capture_dir.exists() and any(capture_dir.iterdir()):
@@ -610,9 +612,11 @@ def _run_screen_recorder(rec: "ScreenRecorder") -> "RecordingResult":
         if chunking_enabled:
             recorder_kwargs["video_chunk_duration"] = chunk_duration
 
-        # Per-recording identity files are policy-owned: both ClaimLock
-        # and InheritLock write them (identity is independent of who owns
-        # the process lock).
+        # Per-recording identity files are policy-owned. ``InheritLock``
+        # writes them because identity is independent of who owns the
+        # process lock — the daemon-spawned engine subprocess still needs
+        # ``.recording_id`` / ``.recording_intent`` for downstream catalog,
+        # upload, scrubber, and recovery consumers.
         _privacy_mode_str = (
             privacy_config.mode.value if privacy_config else "internal"
         )
@@ -801,8 +805,8 @@ def _run_screen_recorder(rec: "ScreenRecorder") -> "RecordingResult":
             chunk_processor = _collaborators.chunk_processor
             _scrub_worker = _collaborators.scrub_worker
 
-            # ClaimLock writes the pidfile; InheritLock is a no-op
-            # (controller owns it).
+            # ``InheritLock.register_children`` is a no-op — the daemon
+            # supervisor owns the pidfile lifecycle. Kept for the seam.
             child_pids = [
                 {"pid": child.pid, "name": child.name}
                 for child in mp.active_children()

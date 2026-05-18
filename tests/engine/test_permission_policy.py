@@ -236,7 +236,7 @@ def test_screen_recorder_calls_permission_policy_preflight_and_poll(tmp_path):
     from screencap.engine.config import RecordingConfig
     from screencap.engine.disk_policy import Noop as DiskNoop
     from screencap.engine.network_policy import Null as NetworkNull
-    from screencap.engine.lock_policy import ClaimLock
+    from screencap.engine.lock_policy import InheritLock
     from screencap.engine.menubar_policy import Noop as MenubarNoop
     from screencap.engine.screen_recorder import (
         IpcChannels,
@@ -270,7 +270,7 @@ def test_screen_recorder_calls_permission_policy_preflight_and_poll(tmp_path):
     channels = IpcChannels.create()
     policies = RecordingPolicies(
         signal=mock.MagicMock(spec=["install", "uninstall"]),
-        lock=ClaimLock(),
+        lock=InheritLock(),
         menubar=MenubarNoop(),
         permission=spy,
         disk=DiskNoop(),
