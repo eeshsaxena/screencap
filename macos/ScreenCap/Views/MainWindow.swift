@@ -19,6 +19,7 @@ struct MainWindow: View {
     @EnvironmentObject private var recorder: RecorderController
     @EnvironmentObject private var permissions: PermissionController
     @EnvironmentObject private var index: RecordingsIndex
+    @EnvironmentObject private var privacy: PrivacyController
 
     enum SidebarSection: Hashable { case calendar, recordings, privacy }
 
@@ -32,6 +33,20 @@ struct MainWindow: View {
             sidebar
         } detail: {
             VStack(spacing: 0) {
+                if privacy.bannerActive {
+                    FirstRunPrivacyBanner(
+                        onReview: {
+                            section = .privacy
+                            Task { await privacy.markSetupComplete() }
+                        },
+                        onDismiss: {
+                            Task { await privacy.markSetupComplete() }
+                        }
+                    )
+                    .padding(.horizontal, 16)
+                    .padding(.top, 12)
+                    .transition(.opacity)
+                }
                 RecordingBanner()
                     .padding(.horizontal, 16)
                     .padding(.top, recorder.state.isRecording ? 12 : 0)
@@ -122,7 +137,6 @@ struct MainWindow: View {
             NavigationLink(value: SidebarSection.privacy) {
                 Label("Privacy", systemImage: "lock.shield")
             }
-            .disabled(true)
         }
         .listStyle(.sidebar)
         .frame(minWidth: 180)
@@ -211,13 +225,7 @@ struct MainWindow: View {
                 section = .calendar
             }
         case .privacy:
-            VStack {
-                Text("Privacy")
-                    .font(.title2.bold())
-                Text("Coming in Unit 18.")
-                    .foregroundStyle(.secondary)
-            }
-            .frame(maxWidth: .infinity, maxHeight: .infinity)
+            PrivacyPaneView()
         }
     }
 
