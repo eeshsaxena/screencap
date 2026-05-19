@@ -7,41 +7,7 @@ import OSLog
 /// Drift-detection log for the stderr event contract with `_stderr_events.py`.
 /// Tail with: `log stream --predicate 'subsystem == "com.screencap.macos"'`.
 private let recorderLogger = Logger(subsystem: "com.screencap.macos", category: "recorder")
-private let SUPPORTED_EVENT_SCHEMA_VERSION = 1
 let SUPPORTED_API_SCHEMA_VERSION = 1
-
-/// Wire-level daemon envelope error codes the controller branches on.
-/// Mirrors `src/screencap/daemon/errors.py`'s string constants.
-enum DaemonErrorCode {
-    static let lockContended = "lock_contended"
-    static let notOwnedByDaemon = "not_owned_by_daemon"
-}
-
-/// State machine for the recording lifecycle. Mirrors the stderr event contract
-/// from `src/screencap/_stderr_events.py` (Unit 8a).
-enum RecordingState: Equatable {
-    case idle
-    case starting
-    case recording(elapsed: TimeInterval)
-    case stopping(quitting: Bool)
-
-    var isRecording: Bool {
-        switch self {
-        case .recording, .stopping, .starting: return true
-        case .idle: return false
-        }
-    }
-
-    var isStopping: Bool {
-        if case .stopping = self { return true }
-        return false
-    }
-
-    var elapsed: TimeInterval {
-        if case .recording(let e) = self { return e }
-        return 0
-    }
-}
 
 /// Status payload from `screencap status --json` (Unit 4 schema v1).
 struct CLIStatus: Decodable {
@@ -126,18 +92,18 @@ final class RecorderController: ObservableObject {
     private weak var index: RecordingsIndex?
     private weak var permissions: PermissionController?
 
+    /// Pure value-type state machine owning `state`, `pendingStartCursor`,
+    /// and `recordingStartedAt`. All state transitions route through it; the
+    /// orchestrator mirrors `machine.state` into the `@Published` surface and
+    /// applies returned effects.
+    private var machine = RecordingStateMachine()
+
     private var spawn: CLIClient.SpawnedProcess?
     private var daemonEventTask: Task<Void, Never>?
-    /// Cursor returned by `/v0/recording.start`, used so initial subscribes
-    /// are keyed to the start-response boundary (which precedes `started`)
-    /// instead of the later `session.snapshot` cursor. Kept until we observe a
-    /// start outcome, so a dropped initial stream cannot skip the boundary.
-    private var pendingStartCursor: Int?
     private var elapsedTimer: Timer?
     private var permissionWatchdog: Timer?
     private var permissionObserver: NSObjectProtocol?
     private var daemonInstalledObserver: NSObjectProtocol?
-    private var recordingStartedAt: Date?
 
     /// Pending awaits keyed by event type. Resolved when the matching event
     /// arrives or when the timeout fires.
@@ -185,8 +151,7 @@ final class RecorderController: ObservableObject {
             lastError = Self.requiredPermissionsErrorMessage
             return
         }
-        lastError = nil
-        state = .starting
+        apply(machine.enterStarting())
 
         switch transport {
         case .daemon:
@@ -219,11 +184,8 @@ final class RecorderController: ObservableObject {
 
             if snapshot.daemonOwned {
                 let start = snapshot.startedAt.map(Date.init(timeIntervalSince1970:)) ?? Date()
-                pendingStartCursor = nil
-                recordingStartedAt = start
-                state = .recording(elapsed: Date().timeIntervalSince(start))
+                apply(machine.observeActiveDaemonSession(startedAt: start))
                 attachDaemonEventStream()
-                startElapsedTimer()
                 // The watchdog only re-checks TCC for the app process during
                 // CLI-fallback recordings (see checkPermissionsDuringRecording).
                 // Skip arming it on the daemon transport so we don't wake the
@@ -233,7 +195,8 @@ final class RecorderController: ObservableObject {
                 }
             } else {
                 lastError = "Another process is recording."
-                state = .idle
+                machine.forceState(.idle)
+                state = machine.state
             }
         } catch {
             recorderLogger.info("Could not sync daemon session snapshot: \(String(describing: error), privacy: .public)")
@@ -273,7 +236,8 @@ final class RecorderController: ObservableObject {
         // outer guard has already passed (it gated on the prior .daemon
         // transport) so we must re-check before spawning the CLI.
         if let permissions, !permissions.allRequiredGranted {
-            state = .idle
+            machine.forceState(.idle)
+            state = machine.state
             lastError = Self.requiredPermissionsErrorMessage
             return
         }
@@ -307,7 +271,8 @@ final class RecorderController: ObservableObject {
             self.spawn = proc
             startPermissionWatchdog()
         } catch {
-            state = .idle
+            machine.forceState(.idle)
+            state = machine.state
             lastError = error.localizedDescription
         }
     }
@@ -317,7 +282,7 @@ final class RecorderController: ObservableObject {
             let response = try await DaemonClient.recordingStart(
                 RecordingStartRequest(name: name, startedBy: "swiftui-via-daemon")
             )
-            pendingStartCursor = response.cursor
+            machine.pendingStartCursor = response.cursor
             attachDaemonEventStream()
             // Same rationale as syncDaemonSnapshot: on the daemon transport
             // the watchdog's check is a guarded no-op, so don't arm it.
@@ -342,7 +307,7 @@ final class RecorderController: ObservableObject {
     /// `.stopping(quitting:false)` and prematurely flip state to `.idle`.
     func stop() {
         guard case .recording = state else { return }
-        state = .stopping(quitting: false)
+        apply(machine.enterStopping(quitting: false))
         Task { await self.runStop(quitting: false) }
     }
 
@@ -371,7 +336,7 @@ final class RecorderController: ObservableObject {
         let response = alert.runModal()
         switch response {
         case .alertFirstButtonReturn:
-            state = .stopping(quitting: true)
+            apply(machine.enterStopping(quitting: true))
             quitProgressSecondsRemaining = 300
             Task { await self.runStop(quitting: true) }
             return .terminateLater
@@ -419,10 +384,8 @@ final class RecorderController: ObservableObject {
                 quitProgressSecondsRemaining = nil
                 NSApp.reply(toApplicationShouldTerminate: false)
             }
-            if state.isStopping {
-                let restoredElapsed = recordingStartedAt.map { Date().timeIntervalSince($0) } ?? 0
-                state = .recording(elapsed: restoredElapsed)
-            }
+            machine.restoreRecordingAfterStopFailure()
+            state = machine.state
             return
         }
 
@@ -444,13 +407,15 @@ final class RecorderController: ObservableObject {
                 kill(s.processIdentifier, SIGKILL)
                 lastError = "Stop timed out after 5 minutes; recorder force-killed."
             }
-            state = .idle
+            machine.enterIdle()
+            state = machine.state
             NSApp.reply(toApplicationShouldTerminate: true)
         } else {
             if !success {
                 lastError = "Stop is still finalizing in the background."
             }
-            state = .idle
+            machine.enterIdle()
+            state = machine.state
         }
     }
 
@@ -463,10 +428,8 @@ final class RecorderController: ObservableObject {
                 quitProgressSecondsRemaining = nil
                 NSApp.reply(toApplicationShouldTerminate: false)
             }
-            if state.isStopping {
-                let restoredElapsed = recordingStartedAt.map { Date().timeIntervalSince($0) } ?? 0
-                state = .recording(elapsed: restoredElapsed)
-            }
+            machine.restoreRecordingAfterStopFailure()
+            state = machine.state
             return
         }
 
@@ -480,13 +443,15 @@ final class RecorderController: ObservableObject {
             if !success {
                 lastError = "Stop timed out after 5 minutes; recorder finalization may still be running."
             }
-            state = .idle
+            machine.enterIdle()
+            state = machine.state
             NSApp.reply(toApplicationShouldTerminate: true)
         } else {
             if !success {
                 lastError = "Stop is still finalizing in the background."
             }
-            state = .idle
+            machine.enterIdle()
+            state = machine.state
         }
     }
 
@@ -555,69 +520,41 @@ final class RecorderController: ObservableObject {
     }
 
     private func handleRecorderEvent(_ event: RecorderEventLine) {
-        // Schema-drift guard: warn (don't fail) so we keep working under minor
-        // additions while making major-version drift visible in Console.app.
-        // Decision on user-facing behavior for a major bump tracked separately.
-        if let v = event.schemaVersion, v != SUPPORTED_EVENT_SCHEMA_VERSION {
-            recorderLogger.warning("Unexpected schema_version \(v, privacy: .public) on stderr event \(event.type, privacy: .public). Swift parser pinned to v\(SUPPORTED_EVENT_SCHEMA_VERSION, privacy: .public).")
-        }
+        apply(machine.handle(event: event))
+    }
 
-        switch event.type {
-        case "started":
-            // Only honour the transition when we're still in `.starting`. A
-            // duplicate or out-of-order `started` arriving while we're already
-            // `.recording` or `.stopping` would otherwise regress the state
-            // machine and re-arm the elapsed timer.
-            guard case .starting = state else { return }
-            pendingStartCursor = nil
-            recordingStartedAt = Date()
-            state = .recording(elapsed: 0)
-            startElapsedTimer()
-        case "chunk_finalized":
-            // Informational — no UI change needed.
-            break
-        case "recording_finalized":
-            // Both stop policies care about this; the in-app path resolves on it.
-            resolveAll(pending: \.awaitingFinalized, value: true)
-            if event.forceStopped == true {
-                lastError = "Recording stopped, but some data may not have uploaded. Run `screencap upload` to retry."
+    /// Drains the state machine's effect list against `RecorderController`'s
+    /// `@Published` surface and side-effecting collaborators. Mirrors
+    /// `machine.state` into `state` so SwiftUI observers see the transition.
+    private func apply(_ effects: [RecordingStateMachine.Effect]) {
+        for effect in effects {
+            switch effect {
+            case .startElapsedTimer:
+                startElapsedTimer()
+            case .stopElapsedTimer:
+                elapsedTimer?.invalidate()
+                elapsedTimer = nil
+            case .startPermissionWatchdog:
+                startPermissionWatchdog()
+            case .stopPermissionWatchdog:
+                stopPermissionWatchdog()
+            case .resolveAwaiting(.finalized, let success):
+                resolveAll(pending: \.awaitingFinalized, value: success)
+            case .resolveAwaiting(.stopped, let success):
+                resolveAll(pending: \.awaitingStopped, value: success)
+            case .surfaceError(let message):
+                lastError = message
+            case .clearError:
+                lastError = nil
+            case .setMatrixDisclosure(let disclosure):
+                matrixDisclosure = disclosure
+            case .refreshIndex:
+                Task { await self.index?.refresh() }
+            case .handlePermissionLost(let permission):
+                handlePermissionLost(permission: permission)
             }
-            Task { await self.index?.refresh() }
-        case "recording_failed":
-            // Engine reported a failure that prevents continuation (e.g. spawn
-            // error, encoder fault). Without this branch the UI stays in
-            // `.starting` / `.recording` until the user notices nothing is
-            // happening. Release any in-flight stop callers, surface the
-            // reason, and drop back to `.idle`.
-            pendingStartCursor = nil
-            lastError = event.reason ?? "Recording failed."
-            resolveAll(pending: \.awaitingFinalized, value: true)
-            resolveAll(pending: \.awaitingStopped, value: false)
-            state = .idle
-        case "permission_lost":
-            handlePermissionLost(event: event)
-        case "disk_full":
-            lastError = "Disk is full — recording stopped."
-        case "stopped":
-            resolveAll(pending: \.awaitingFinalized, value: true)
-            resolveAll(pending: \.awaitingStopped, value: true)
-        case "matrix_disclosure_required":
-            matrixDisclosure = PrivacyMatrixDisclosure(
-                changes: event.changes ?? [],
-                optOutCommandExamples: event.optOutCommandExamples ?? []
-            )
-        case "_close":
-            if event.reason == "shutdown" {
-                recorderLogger.info("Daemon event stream closed for shutdown.")
-            } else if let reason = event.reason {
-                recorderLogger.info("Daemon event stream closed: \(reason, privacy: .public)")
-            }
-        default:
-            // Active Python events the Swift consumer doesn't model (e.g.
-            // lock_contended) — log so drift is detectable; the engine handles
-            // user-facing fallout via exit codes so we don't surface here.
-            recorderLogger.debug("Unhandled stderr event type: \(event.type, privacy: .public)")
         }
+        state = machine.state
     }
 
     private func attachDaemonEventStream() {
@@ -643,7 +580,8 @@ final class RecorderController: ObservableObject {
                 let snapshot = try await DaemonClient.sessionSnapshot()
                 if snapshot.isRecording == true, snapshot.daemonOwned == false {
                     lastError = "Another process is recording."
-                    state = .idle
+                    machine.forceState(.idle)
+                    state = machine.state
                     return
                 }
                 if snapshot.recovering {
@@ -657,7 +595,8 @@ final class RecorderController: ObservableObject {
                 // dead session and the UI would stay stuck in `.recording`
                 // until the 10×backoff cap fires.
                 if snapshot.isRecording == false, state.isRecording {
-                    state = .idle
+                    machine.forceState(.idle)
+                    state = machine.state
                     lastError = "Recording ended."
                     return
                 }
@@ -666,7 +605,7 @@ final class RecorderController: ObservableObject {
                 // the start boundary. If the first stream drops before the
                 // boundary event is delivered, a reconnect from snapshot.cursor
                 // could skip the event that moves the UI out of `.starting`.
-                let sinceCursor = pendingStartCursor ?? snapshot.cursor
+                let sinceCursor = machine.pendingStartCursor ?? snapshot.cursor
                 for try await event in DaemonClient.subscribe(sinceCursor: sinceCursor) {
                     if Task.isCancelled { return }
                     sawProgress = true
@@ -684,7 +623,7 @@ final class RecorderController: ObservableObject {
                 // window between snapshot and subscribe. Refetch the snapshot
                 // and resubscribe with a fresh cursor; leave `state` intact so
                 // the UI does not flicker to `.idle`.
-                pendingStartCursor = nil
+                machine.pendingStartCursor = nil
                 recorderLogger.info("Daemon event stream evicted cursor; refetching snapshot.")
                 continue
             } catch {
@@ -697,7 +636,8 @@ final class RecorderController: ObservableObject {
             } else {
                 consecutiveFailures += 1
                 if consecutiveFailures >= maxConsecutiveFailures {
-                    state = .idle
+                    machine.forceState(.idle)
+                    state = machine.state
                     lastError = "Lost contact with daemon"
                     return
                 }
@@ -716,7 +656,8 @@ final class RecorderController: ObservableObject {
         case DaemonClientError.schemaMismatch:
             schemaMismatchDetected = true
             transport = .cliFallback
-            state = .idle
+            machine.forceState(.idle)
+            state = machine.state
             lastError = "ScreenCap daemon needs to reload."
         case DaemonClientError.socketUnavailable, DaemonClientError.connectionFailed:
             recorderLogger.info("Daemon transport failed; falling back to CLI. Error: \(String(describing: error), privacy: .public)")
@@ -724,7 +665,8 @@ final class RecorderController: ObservableObject {
             // Without resetting `state`, a failed start leaves the controller
             // stuck in `.starting`; surface the failure to the user and clear
             // the in-flight state so a retry (or CLI fallback) can take over.
-            state = .idle
+            machine.forceState(.idle)
+            state = machine.state
             lastError = "Daemon socket unavailable"
             fallback?()
         case DaemonClientError.envelopeError(let code, _):
@@ -734,58 +676,27 @@ final class RecorderController: ObservableObject {
                 lastError = error.localizedDescription
             }
             if state.isRecording {
-                state = .idle
+                machine.forceState(.idle)
+                state = machine.state
             }
         default:
             lastError = error.localizedDescription
             if state.isRecording {
-                state = .idle
+                machine.forceState(.idle)
+                state = machine.state
             }
         }
     }
 
     private func handleProcessTerminated(exitCode: Int32) {
-        elapsedTimer?.invalidate()
-        elapsedTimer = nil
-        stopPermissionWatchdog()
         spawn = nil
         daemonEventTask?.cancel()
         daemonEventTask = nil
-        recordingStartedAt = nil
-
-        // If we never saw a `stopped` event and the process is gone, resolve
-        // any in-flight awaits so the caller can transition out of stopping.
-        resolveAll(pending: \.awaitingFinalized, value: false)
-        resolveAll(pending: \.awaitingStopped, value: false)
-
-        // 0 = clean, 130 = SIGINT, 143 = SIGTERM (the engine's documented
-        // graceful-shutdown signals). Treat all three as "no new terminal
-        // error to surface." Intentionally preserve any warning already set
-        // earlier in this session (for example the `forceStopped`
-        // upload-retry note from `recording_finalized`) so the user can still
-        // see it after the process exits. `start()` clears stale messages when
-        // a new recording begins.
-        if exitCode == 0 || exitCode == 130 || exitCode == 143 {
-            // Keep any prior user-facing warning.
-        } else {
-            switch exitCode {
-            case 2:
-                lastError = "ScreenCap is already recording."
-            case 3:
-                lastError = "Recording stopped because a required permission was revoked."
-            case 4:
-                lastError = "Disk is full — recording stopped."
-            default:
-                lastError = "Recorder exited with code \(exitCode)."
-            }
-        }
-        if state.isRecording {
-            state = .idle
-        }
+        apply(machine.processTerminated(exitCode: exitCode))
     }
 
-    private func handlePermissionLost(event: RecorderEventLine) {
-        let perm = event.permission ?? "a required permission"
+    private func handlePermissionLost(permission: String?) {
+        let perm = permission ?? "a required permission"
         lastError = "Recording stopped: \(perm) was revoked."
 
         // Initiate the stop BEFORE blocking on the modal, so the engine
@@ -828,8 +739,8 @@ final class RecorderController: ObservableObject {
     }
 
     private func tickElapsed() {
-        guard case .recording = state, let start = recordingStartedAt else { return }
-        state = .recording(elapsed: Date().timeIntervalSince(start))
+        machine.tickElapsed()
+        state = machine.state
     }
 
     private func startPermissionWatchdog() {
@@ -890,6 +801,12 @@ extension RecorderController {
         lastError: String? = nil,
         quitProgressSecondsRemaining: Int? = nil
     ) {
+        // Drive the state machine into the requested state so subsequent
+        // event processing observes a coherent view. Without this the
+        // machine stays at `.idle` while the controller publishes a
+        // different value, and the first `apply(...)` would clobber the
+        // published state with the machine's stale `.idle`.
+        machine.forceState(state)
         self.state = state
         self.lastError = lastError
         self.quitProgressSecondsRemaining = quitProgressSecondsRemaining
@@ -918,6 +835,7 @@ extension RecorderController {
     func _testCancelDaemonTask() async {
         let task = daemonEventTask
         daemonEventTask = nil
+        machine.forceState(.idle)
         state = .idle
         task?.cancel()
         try? await Task.sleep(nanoseconds: 50_000_000)
