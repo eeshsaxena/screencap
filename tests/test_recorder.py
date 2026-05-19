@@ -141,50 +141,6 @@ class TestForceExitContracts:
         self._assert_recorder_stop_calls_guarded(sigterm_fn, "_sigterm_handler")
 
 
-class TestOrphanDetection:
-    """Tests for startup orphan detection."""
-
-    def test_start_exits_when_orphans_found(self, tmp_path):
-        """start_recording should raise SystemExit if orphans found without force_clean."""
-        from screencap.recorder import start_recording
-
-        with (
-            mock.patch("screencap.recorder.get_audio_default", return_value=False),
-            mock.patch("screencap.recorder.get_wifi_metrics", return_value=False),
-            mock.patch(
-                "screencap.pidfile.find_orphaned_processes",
-                return_value=[{"pid": 123, "name": "writer"}],
-            ),
-        ):
-            with pytest.raises(SystemExit):
-                start_recording("test", output_dir=tmp_path / "test-rec")
-
-    def test_start_force_clean_removes_orphans(self, tmp_path):
-        """start_recording with force_clean=True should clean orphans and continue."""
-        from tests.conftest import FakeRecorder
-
-        from screencap.recorder import start_recording
-
-        orphans = [{"pid": 123, "name": "writer"}]
-
-        with (
-            mock.patch("screencap.recorder._check_macos_permissions"),
-            mock.patch("screencap.recorder.get_audio_default", return_value=False),
-            mock.patch("screencap.recorder.get_wifi_metrics", return_value=False),
-            mock.patch("screencap.config.get_disk_warn_mb", return_value=2000),
-            mock.patch("screencap.config.get_disk_stop_mb", return_value=500),
-            mock.patch("shutil.disk_usage", return_value=_PLENTY_OF_DISK),
-            mock.patch("screencap.pidfile.find_orphaned_processes", return_value=orphans),
-            mock.patch("screencap.pidfile.terminate_processes") as mock_term,
-            mock.patch("screencap.pidfile.delete_pidfile"),
-            mock.patch("screencap.pidfile.write_pidfile"),
-            mock.patch("screencap.engine.recorder.Recorder", FakeRecorder),
-        ):
-            start_recording("test", output_dir=tmp_path / "test-rec", force_clean=True)
-
-        mock_term.assert_called_once_with(orphans, force=True)
-
-
 class TestPermissionPrompting:
     """Tests for the macOS permission checking and prompting flow."""
 

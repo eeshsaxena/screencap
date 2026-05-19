@@ -400,10 +400,6 @@ def test_screen_recorder_calls_network_policy_setup_and_teardown(tmp_path):
     legacy = LegacyOptions(output_dir=capture_dir)
 
     with (
-        mock.patch("screencap.pidfile.find_orphaned_processes", return_value=[]),
-        mock.patch("screencap.pidfile.claim_lock"),
-        mock.patch("screencap.pidfile.write_pidfile"),
-        mock.patch("screencap.pidfile.delete_pidfile"),
         mock.patch("screencap.recorder.get_audio_default", return_value=False),
         mock.patch("screencap.recorder.get_wifi_metrics", return_value=False),
         mock.patch("screencap.recorder.get_app_versions", return_value=False),

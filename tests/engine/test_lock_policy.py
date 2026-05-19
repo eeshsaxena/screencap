@@ -134,3 +134,14 @@ def test_write_identity_destination_cloud_only_when_keep_local_false(tmp_path):
 
     intent = json.loads((tmp_path / ".recording_intent").read_text())
     assert intent["destination"] == "cloud"
+
+
+def test_write_identity_destination_local_when_no_cloud_intent(tmp_path):
+    """``cloud_intent=False`` → ``destination == "local"`` (the default path)."""
+    from screencap.engine.lock_policy import InheritLock
+
+    request = _make_request(name="local-only", cloud_intent=False)
+    InheritLock().write_identity(tmp_path, request=request, privacy_mode="internal")
+
+    intent = json.loads((tmp_path / ".recording_intent").read_text())
+    assert intent["destination"] == "local"

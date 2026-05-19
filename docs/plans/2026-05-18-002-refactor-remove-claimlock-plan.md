@@ -25,7 +25,7 @@ Delete the `ClaimLock` policy class — unreachable in production after Phase 2 
 - R2. `recorder.py`'s default for `_lock_policy` becomes `InheritLock()`; all production paths continue to work unchanged (no behavior change in daemon-driven recordings).
 - R3. `tests/engine/` files that constructed `ClaimLock()` for parity / lifecycle / per-policy tests are updated to `InheritLock()` and continue to pass.
 - R4. The `LockPolicy` Protocol and the `_write_identity_files` helper survive (Protocol kept for the seam; helper still shared with `InheritLock`).
-- R5. `pidfile.*` primitives (`claim_lock`, `find_orphaned_processes`, `terminate_processes`, `write_pidfile`, `delete_pidfile`) remain untouched — they have non-`ClaimLock` callers in `session.py`, `daemon/supervisor.py`, `daemon/app.py`, `cli/__init__.py`.
+- R5. `pidfile.*` primitives remain untouched. `claim_lock`, `write_pidfile`, and `delete_pidfile` have non-`ClaimLock` production callers in `session.py`, `daemon/supervisor.py`, `daemon/app.py`, `cli/__init__.py`. `find_orphaned_processes` and `terminate_processes` have no production callers post-deletion (the daemon supervisor uses its own `_terminate_pid` and `_clear_stale_lock_if_unheld`) — they are kept because (a) tests still exercise them and (b) the engine-topology spike may reintroduce a non-daemon caller. Cleanup is a follow-up candidate if the spike confirms they are dead.
 - R6. Stale `ClaimLock` references in comments / docstrings inside `screen_recorder.py` and `lock_policy.py` are cleaned up so the module reads coherently with one impl.
 - R7. The full `pytest tests/` suite passes after the change.
 
@@ -76,7 +76,7 @@ Delete the `ClaimLock` policy class — unreachable in production after Phase 2 
 
 ### Resolved During Planning
 
-- *Are `pidfile.find_orphaned_processes` and friends orphaned by this deletion?* No — `session.py`, `daemon/supervisor.py`, `daemon/app.py`, `cli/__init__.py` all consume them.
+- *Are `pidfile.find_orphaned_processes` and `terminate_processes` orphaned by this deletion?* Production callers: zero (the daemon supervisor uses its own `_terminate_pid` / `_clear_stale_lock_if_unheld`). Test callers: present in `tests/test_recorder.py` (via signal-during-setup driver) and indirectly via the engine seam test mocks. The other primitives (`claim_lock`, `write_pidfile`, `delete_pidfile`) remain in production use by `session.py`, `daemon/{supervisor,app}.py`, and `cli/__init__.py`. The two orphan-detection helpers are kept against the engine-topology spike; cleanup is a follow-up candidate.
 - *Do any docs or scripts reference `ClaimLock`?* No — grep across `docs/`, `scripts/`, `macos/` returns zero hits.
 - *Should `tests/test_recorder.py::test_force_exit_releases_lock_policy` change?* No — it AST-checks for a `lock_policy.release()` call, agnostic of the policy class.
 

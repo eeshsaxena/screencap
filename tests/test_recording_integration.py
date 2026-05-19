@@ -166,8 +166,12 @@ def test_normal_recording_lifecycle(recording_env):
             verbose=True,
         )
 
-    # A1 + B5: PID file cleaned up after recording
-    assert not pid_file.exists(), "PID file should be deleted after recording"
+    # A1 + B5: PID file lifecycle is the daemon supervisor's responsibility
+    # post-Phase-2 (see daemon/supervisor.py). InheritLock.register_children /
+    # release are no-ops, so this engine-level test cannot meaningfully
+    # assert pid_file.exists() either way — coverage moved to
+    # ``test_pidfile_write_read_delete_real_filesystem`` (primitive-level)
+    # and the daemon supervisor integration suite.
 
     # A2: .recording_id written with correct name
     assert (capture_dir / ".recording_id").read_text().strip() == "test-rec"

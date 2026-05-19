@@ -210,10 +210,6 @@ def test_screen_recorder_invokes_signal_policy_install_then_uninstall(tmp_path):
         mock.patch("screencap.recorder.get_audio_default", return_value=False),
         mock.patch("screencap.recorder.get_wifi_metrics", return_value=False),
         mock.patch("screencap.recorder.get_app_versions", return_value=False),
-        mock.patch("screencap.pidfile.find_orphaned_processes", return_value=[]),
-        mock.patch("screencap.pidfile.claim_lock"),
-        mock.patch("screencap.pidfile.write_pidfile"),
-        mock.patch("screencap.pidfile.delete_pidfile"),
         mock.patch("screencap.engine.recorder.Recorder", FakeRecorder),
     ):
         rec.run()
