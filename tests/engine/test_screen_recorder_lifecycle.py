@@ -99,7 +99,7 @@ class _OneShotDiskPolicy:
 
 def _build_seam(tmp_path, *, permission, disk):
     from screencap.engine.config import RecordingConfig
-    from screencap.engine.lock_policy import ClaimLock
+    from screencap.engine.lock_policy import InheritLock
     from screencap.engine.menubar_policy import Noop as MenubarNoop
     from screencap.engine.network_policy import Null as NetworkNull
     from screencap.engine.screen_recorder import (
@@ -115,7 +115,7 @@ def _build_seam(tmp_path, *, permission, disk):
     channels = IpcChannels.create()
     policies = RecordingPolicies(
         signal=NoopSignalPolicy(),
-        lock=ClaimLock(),
+        lock=InheritLock(),
         menubar=MenubarNoop(),
         permission=permission,
         disk=disk,
@@ -136,10 +136,6 @@ def _common_mocks():
         mock.patch("screencap.config.get_disk_warn_mb", return_value=2000),
         mock.patch("screencap.config.get_disk_stop_mb", return_value=500),
         mock.patch("shutil.disk_usage", return_value=_PLENTY_OF_DISK),
-        mock.patch("screencap.pidfile.find_orphaned_processes", return_value=[]),
-        mock.patch("screencap.pidfile.claim_lock"),
-        mock.patch("screencap.pidfile.write_pidfile"),
-        mock.patch("screencap.pidfile.delete_pidfile"),
         mock.patch("screencap.engine.recorder.Recorder", _TickingFakeRecorder),
     ]
 

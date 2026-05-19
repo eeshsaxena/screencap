@@ -1,5 +1,10 @@
 """PID file tracking for recording sessions."""
 
+# NOTE: find_orphaned_processes / terminate_processes / write_pidfile /
+# delete_pidfile have no production callers post-SCR-53 (ClaimLock removal).
+# Kept for docs/tickets/2026-05-08-engine-topology-spike.md and the
+# primitive-level tests in tests/test_pidfile.py / test_pidfile_mutex.py.
+
 from __future__ import annotations
 
 import fcntl

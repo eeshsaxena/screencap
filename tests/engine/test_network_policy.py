@@ -359,7 +359,7 @@ def test_screen_recorder_calls_network_policy_setup_and_teardown(tmp_path):
     """
     from screencap.engine.config import RecordingConfig
     from screencap.engine.disk_policy import Noop as DiskNoop
-    from screencap.engine.lock_policy import ClaimLock
+    from screencap.engine.lock_policy import InheritLock
     from screencap.engine.menubar_policy import Noop as MenubarNoop
     from screencap.engine.network_policy import NetworkMaterial
     from screencap.engine.permission_policy import Noop as PermNoop
@@ -391,7 +391,7 @@ def test_screen_recorder_calls_network_policy_setup_and_teardown(tmp_path):
     channels = IpcChannels.create()
     policies = RecordingPolicies(
         signal=NoopSignalPolicy(),
-        lock=ClaimLock(),
+        lock=InheritLock(),
         menubar=MenubarNoop(),
         permission=PermNoop(),
         disk=DiskNoop(),
@@ -400,10 +400,6 @@ def test_screen_recorder_calls_network_policy_setup_and_teardown(tmp_path):
     legacy = LegacyOptions(output_dir=capture_dir)
 
     with (
-        mock.patch("screencap.pidfile.find_orphaned_processes", return_value=[]),
-        mock.patch("screencap.pidfile.claim_lock"),
-        mock.patch("screencap.pidfile.write_pidfile"),
-        mock.patch("screencap.pidfile.delete_pidfile"),
         mock.patch("screencap.recorder.get_audio_default", return_value=False),
         mock.patch("screencap.recorder.get_wifi_metrics", return_value=False),
         mock.patch("screencap.recorder.get_app_versions", return_value=False),

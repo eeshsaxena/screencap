@@ -1,14 +1,13 @@
 """``LockPolicy`` seam (SCR-40, slice 4 of SCR-31).
 
 Promotes the ``_skip_pidfile``-gated lock + identity bundle in
-``_run_screen_recorder`` to a pluggable policy. ``ClaimLock`` is the
-standalone CLI's exclusive-process owner; ``InheritLock`` is what
-``SessionController`` workers use because the parent already claimed.
-
-The interface decomposes "this recording's identity and exclusivity"
-into four lifecycle hooks because the existing setup window has two
-natural anchor points (before and after ``capture_dir.mkdir`` /
-privacy_config) — fewer methods would force re-ordering.
+``_run_screen_recorder`` to a pluggable policy. Post-Phase-2 the
+daemon is the sole engine spawner and owns the process-exclusive
+pidfile claim itself (see ``daemon/supervisor.py``); the engine
+subprocess therefore runs with ``InheritLock`` — claim/register/
+release are no-ops, but per-recording identity files are still
+written so downstream catalog / upload / scrubber / recovery
+consumers find them.
 """
 
 from __future__ import annotations
@@ -18,12 +17,8 @@ from datetime import datetime, timezone
 from pathlib import Path
 from typing import TYPE_CHECKING, Protocol
 
-from rich.console import Console
-
 if TYPE_CHECKING:
     from screencap.engine.screen_recorder import RecordingRequest
-
-_console = Console()
 
 
 def _write_identity_files(
@@ -32,11 +27,12 @@ def _write_identity_files(
     request: RecordingRequest,
     privacy_mode: str,
 ) -> None:
-    """Shared identity-file writer for ``ClaimLock`` and ``InheritLock``.
+    """Identity-file writer used by ``InheritLock``.
 
-    Per-recording identity is independent of who owns the process lock,
-    so both policies emit the same files. Schema matches the wrapper-era
-    payload at ``recorder.py`` so downstream consumers (catalog, upload,
+    Kept module-level so future ``LockPolicy`` implementations
+    (e.g., from the engine-topology spike) can reuse the same
+    payload writer. Schema matches the wrapper-era payload at
+    ``recorder.py`` so downstream consumers (catalog, upload,
     scrubber, recovery) need no changes.
     """
     (capture_dir / ".recording_id").write_text(request.name)
@@ -79,71 +75,15 @@ class LockPolicy(Protocol):
     def release(self) -> None: ...
 
 
-class ClaimLock:
-    """Standalone-CLI lock policy: orphan check + claim + write identity + register + release."""
-
-    def claim(self, capture_dir: Path, *, force_clean: bool) -> None:
-        from screencap import pidfile
-        from screencap._stderr_events import EVENT_LOCK_CONTENDED, emit_event
-
-        orphans = pidfile.find_orphaned_processes()
-        if orphans:
-            if force_clean:
-                _console.print(
-                    f"[yellow]Cleaning up {len(orphans)} orphaned process(es) "
-                    "from a previous recording...[/yellow]"
-                )
-                pidfile.terminate_processes(orphans, force=True)
-                pidfile.delete_pidfile()
-            else:
-                _console.print(
-                    f"[yellow]Warning:[/yellow] Found {len(orphans)} orphaned "
-                    "process(es) from a previous recording.\n"
-                    "  Run 'screencap stop' to clean them up, or pass --force to auto-clean."
-                )
-                raise SystemExit(1)
-
-        try:
-            # Phase 2 U1 made the daemon the sole engine spawner — this
-            # ``ClaimLock`` policy is exercised only via the daemon's
-            # engine subprocess path, which runs with ``InheritLock``
-            # in practice. The fallback claimant if this is ever wired
-            # directly is ``CLAIMANT_DAEMON`` so lock metadata reads
-            # consistently downstream.
-            pidfile.claim_lock(capture_dir, claimant=pidfile.CLAIMANT_DAEMON)
-        except pidfile.LockContended as exc:
-            try:
-                emit_event(EVENT_LOCK_CONTENDED, owner=exc.owner)
-            except Exception:
-                pass
-            raise SystemExit(2) from None
-
-    def write_identity(
-        self,
-        capture_dir: Path,
-        *,
-        request: RecordingRequest,
-        privacy_mode: str,
-    ) -> None:
-        _write_identity_files(
-            capture_dir, request=request, privacy_mode=privacy_mode,
-        )
-
-    def register_children(
-        self, capture_dir: Path, child_pids: list[dict],
-    ) -> None:
-        from screencap import pidfile
-
-        pidfile.write_pidfile(capture_dir, child_pids)
-
-    def release(self) -> None:
-        from screencap import pidfile
-
-        pidfile.delete_pidfile()
-
-
 class InheritLock:
-    """Session-worker lock policy: parent owns the lock, worker writes its own identity."""
+    """Engine-subprocess lock policy: daemon supervisor owns the pidfile claim.
+
+    ``claim``, ``register_children``, and ``release`` are no-ops because
+    the daemon supervisor already claimed the process-exclusive pidfile
+    (``daemon/supervisor.py`` → ``pidfile.claim_lock``). The engine
+    subprocess still writes per-recording identity files so downstream
+    consumers (catalog, upload, scrubber, recovery) find them.
+    """
 
     def claim(self, capture_dir: Path, *, force_clean: bool) -> None:
         pass

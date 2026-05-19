@@ -99,10 +99,6 @@ def main() -> int:
         mock.patch("screencap.config.get_disk_warn_mb", return_value=2000),
         mock.patch("screencap.config.get_disk_stop_mb", return_value=500),
         mock.patch("shutil.disk_usage", return_value=_PLENTY_OF_DISK),
-        mock.patch("screencap.pidfile.find_orphaned_processes", return_value=[]),
-        mock.patch("screencap.pidfile.write_pidfile"),
-        mock.patch("screencap.pidfile.delete_pidfile"),
-        mock.patch("screencap.pidfile.claim_lock"),
         mock.patch("screencap.engine.recorder.Recorder", SlowFakeRecorder),
     ):
         start_recording("sigint-setup-test", output_dir=args.output_dir)

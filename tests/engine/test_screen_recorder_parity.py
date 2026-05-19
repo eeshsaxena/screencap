@@ -51,10 +51,6 @@ def _common_mocks():
         mock.patch("screencap.config.get_disk_warn_mb", return_value=2000),
         mock.patch("screencap.config.get_disk_stop_mb", return_value=500),
         mock.patch("shutil.disk_usage", return_value=_PLENTY_OF_DISK),
-        mock.patch("screencap.pidfile.find_orphaned_processes", return_value=[]),
-        mock.patch("screencap.pidfile.claim_lock"),
-        mock.patch("screencap.pidfile.write_pidfile"),
-        mock.patch("screencap.pidfile.delete_pidfile"),
         mock.patch("screencap.engine.recorder.Recorder", FakeRecorder),
     ]
 
@@ -84,7 +80,7 @@ def test_seam_direct_path_matches_wrapper(tmp_path):
     """``ScreenRecorder().run()`` produces the same artifacts as ``start_recording()``."""
     from screencap.engine.config import RecordingConfig
     from screencap.engine.disk_policy import Noop as DiskNoop
-    from screencap.engine.lock_policy import ClaimLock
+    from screencap.engine.lock_policy import InheritLock
     from screencap.engine.menubar_policy import Noop as MenubarNoop
     from screencap.engine.permission_policy import Noop as PermNoop
     from screencap.engine.screen_recorder import (
@@ -128,7 +124,7 @@ def test_seam_direct_path_matches_wrapper(tmp_path):
     channels = IpcChannels.create()
     seam_network = _NetworkNullSpy()
     policies = RecordingPolicies(
-        signal=NoopSignalPolicy(), lock=ClaimLock(), menubar=MenubarNoop(),
+        signal=NoopSignalPolicy(), lock=InheritLock(), menubar=MenubarNoop(),
         permission=PermNoop(), disk=DiskNoop(), network=seam_network,
     )
     legacy = LegacyOptions(output_dir=seam_dir)
@@ -190,7 +186,7 @@ def test_seam_mitm_proxy_v15_path_matches_wrapper(tmp_path):
     """
     from screencap.engine.config import RecordingConfig
     from screencap.engine.disk_policy import Noop as DiskNoop
-    from screencap.engine.lock_policy import ClaimLock
+    from screencap.engine.lock_policy import InheritLock
     from screencap.engine.menubar_policy import Noop as MenubarNoop
     from screencap.engine.network_policy import MitmProxyV15
     from screencap.engine.permission_policy import Noop as PermNoop
@@ -229,7 +225,7 @@ def test_seam_mitm_proxy_v15_path_matches_wrapper(tmp_path):
     request = RecordingRequest(name="parity-net", config=RecordingConfig())
     channels = IpcChannels.create()
     policies = RecordingPolicies(
-        signal=NoopSignalPolicy(), lock=ClaimLock(), menubar=MenubarNoop(),
+        signal=NoopSignalPolicy(), lock=InheritLock(), menubar=MenubarNoop(),
         permission=PermNoop(), disk=DiskNoop(), network=MitmProxyV15(),
     )
     legacy = LegacyOptions(output_dir=seam_dir)
