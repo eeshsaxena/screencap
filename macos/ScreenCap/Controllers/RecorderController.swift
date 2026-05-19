@@ -97,12 +97,12 @@ final class RecorderController: ObservableObject {
     /// orchestrator mirrors `machine.state` into the `@Published` surface and
     /// applies returned effects.
     private var machine = RecordingStateMachine()
+    private let watchdog: PermissionWatchdog
+    private let alertPresenter: RecorderAlertPresenter
 
     private var spawn: CLIClient.SpawnedProcess?
     private var daemonEventTask: Task<Void, Never>?
     private var elapsedTimer: Timer?
-    private var permissionWatchdog: Timer?
-    private var permissionObserver: NSObjectProtocol?
     private var daemonInstalledObserver: NSObjectProtocol?
 
     /// Pending awaits keyed by event type. Resolved when the matching event
@@ -118,7 +118,12 @@ final class RecorderController: ObservableObject {
         self.permissions = permissions
     }
 
-    init() {
+    init(
+        watchdog: PermissionWatchdog = LivePermissionWatchdog(),
+        alertPresenter: RecorderAlertPresenter = LiveRecorderAlertPresenter()
+    ) {
+        self.watchdog = watchdog
+        self.alertPresenter = alertPresenter
         daemonInstalledObserver = NotificationCenter.default.addObserver(
             forName: .screenCapDaemonInstalledAndRunning,
             object: nil,
@@ -133,10 +138,6 @@ final class RecorderController: ObservableObject {
     deinit {
         daemonEventTask?.cancel()
         elapsedTimer?.invalidate()
-        permissionWatchdog?.invalidate()
-        if let observer = permissionObserver {
-            NSWorkspace.shared.notificationCenter.removeObserver(observer)
-        }
         if let daemonInstalledObserver {
             NotificationCenter.default.removeObserver(daemonInstalledObserver)
         }
@@ -311,8 +312,9 @@ final class RecorderController: ObservableObject {
         Task { await self.runStop(quitting: false) }
     }
 
-    /// Cmd+Q path. Shows NSAlert; on "Stop & Quit", returns `.terminateLater`
-    /// and runs the long-wait stop policy (5min for `stopped` event).
+    /// Cmd+Q path. Shows the stop-and-quit alert; on "Stop & Quit", returns
+    /// `.terminateLater` and runs the long-wait stop policy (5min for
+    /// `stopped` event).
     func confirmQuitWhileRecording() -> NSApplication.TerminateReply {
         guard state.isRecording else { return .terminateNow }
 
@@ -324,18 +326,8 @@ final class RecorderController: ObservableObject {
             return .terminateLater
         }
 
-        let alert = NSAlert()
-        alert.messageText = "Stop recording before quitting?"
-        alert.informativeText =
-            "ScreenCap is still recording. Stop & Quit saves the recording — finalization can take up to 5 minutes."
-        alert.alertStyle = .warning
-        alert.addButton(withTitle: "Stop & Quit")
-        alert.addButton(withTitle: "Keep Recording")
-        alert.addButton(withTitle: "Cancel")
-
-        let response = alert.runModal()
-        switch response {
-        case .alertFirstButtonReturn:
+        switch alertPresenter.confirmStopAndQuit() {
+        case .terminateLater:
             apply(machine.enterStopping(quitting: true))
             quitProgressSecondsRemaining = 300
             Task { await self.runStop(quitting: true) }
@@ -708,13 +700,8 @@ final class RecorderController: ObservableObject {
             stop()
         }
 
-        let alert = NSAlert()
-        alert.messageText = "Permission revoked"
-        alert.informativeText = "ScreenCap stopped recording because \(perm) was disabled in System Settings."
-        alert.addButton(withTitle: "Open System Settings")
-        alert.addButton(withTitle: "Dismiss")
-        if alert.runModal() == .alertFirstButtonReturn {
-            permissions?.openSystemSettings(for: PrivacyPane.from(permissionString: perm))
+        alertPresenter.presentPermissionLost(permission: perm) { [weak self] in
+            self?.permissions?.openSystemSettings(for: PrivacyPane.from(permissionString: perm))
         }
     }
 
@@ -744,33 +731,13 @@ final class RecorderController: ObservableObject {
     }
 
     private func startPermissionWatchdog() {
-        stopPermissionWatchdog()
-        // `.common` mode for the same reason as the elapsed timer: a menu bar
-        // dropdown or NSAlert must not pause permission revocation detection.
-        let timer = Timer(timeInterval: 5.0, repeats: true) { [weak self] _ in
-            DispatchQueue.main.async { MainActor.assumeIsolated { self?.checkPermissionsDuringRecording() } }
-        }
-        RunLoop.main.add(timer, forMode: .common)
-        permissionWatchdog = timer
-        // `DispatchQueue.main.async` rather than `Task { @MainActor }` to keep
-        // ordering FIFO with the stderr/termination dispatches in CLIClient —
-        // Tasks don't preserve order against GCD blocks.
-        permissionObserver = NSWorkspace.shared.notificationCenter.addObserver(
-            forName: NSWorkspace.didActivateApplicationNotification,
-            object: nil,
-            queue: .main
-        ) { [weak self] _ in
-            DispatchQueue.main.async { MainActor.assumeIsolated { self?.checkPermissionsDuringRecording() } }
+        watchdog.start { [weak self] in
+            self?.checkPermissionsDuringRecording()
         }
     }
 
     private func stopPermissionWatchdog() {
-        permissionWatchdog?.invalidate()
-        permissionWatchdog = nil
-        if let observer = permissionObserver {
-            NSWorkspace.shared.notificationCenter.removeObserver(observer)
-            permissionObserver = nil
-        }
+        watchdog.stop()
     }
 
     private func checkPermissionsDuringRecording() {
