@@ -99,16 +99,12 @@ final class RecorderController: ObservableObject {
     private var machine = RecordingStateMachine()
     private let watchdog: PermissionWatchdog
     private let alertPresenter: RecorderAlertPresenter
+    private let stopPolicy = StopPolicyCoordinator()
 
     private var spawn: CLIClient.SpawnedProcess?
     private var daemonEventTask: Task<Void, Never>?
     private var elapsedTimer: Timer?
     private var daemonInstalledObserver: NSObjectProtocol?
-
-    /// Pending awaits keyed by event type. Resolved when the matching event
-    /// arrives or when the timeout fires.
-    private var awaitingFinalized: [(Bool) -> Void] = []
-    private var awaitingStopped: [(Bool) -> Void] = []
 
     func bindIndex(_ index: RecordingsIndex) {
         self.index = index
@@ -355,149 +351,77 @@ final class RecorderController: ObservableObject {
     /// `quitting=false`: in-app Stop, 30s wait, transition UI to .idle and
     /// continue background finalization invisibly.
     /// `quitting=true`:  Cmd+Q, 300s wait, then NSApp.reply(...). On timeout
-    /// we SIGKILL the recorder and let `.upload_followup.json` surface on
-    /// next launch.
+    /// we SIGKILL the CLI recorder (daemon transport surfaces the
+    /// "may still be running" message instead) and let
+    /// `.upload_followup.json` surface on next launch.
     private func runStop(quitting: Bool) async {
-        if transport == .daemon {
-            await runStopViaDaemon(quitting: quitting)
-            return
-        }
-
-        do {
-            _ = try CLIClient.runDetached(["stop"])
-        } catch {
-            // The stop subprocess never launched — the recorder never
-            // received SIGTERM, so waiting 30s/300s for stderr events would
-            // surface a false "still finalizing" message. Bail out, roll
-            // state back, and (for Cmd+Q) tell AppKit to abort the quit so
-            // the app doesn't hang on `.terminateLater`.
-            lastError = "Failed to send stop signal: \(error.localizedDescription). Try `screencap stop` in a terminal."
-            if quitting {
-                quitProgressSecondsRemaining = nil
-                NSApp.reply(toApplicationShouldTerminate: false)
-            }
-            machine.restoreRecordingAfterStopFailure()
-            state = machine.state
-            return
-        }
-
-        let timeout: TimeInterval = quitting ? 300 : 30
-        let success: Bool
-        if quitting {
-            success = await awaitStoppedEvent(timeout: timeout)
-        } else {
-            success = await awaitFinalizedEvent(timeout: timeout)
-        }
-
-        if quitting {
-            quitProgressSecondsRemaining = nil
-            // Only SIGKILL if the process is still alive. `processIdentifier`
-            // returns the PID even after exit, and macOS recycles PIDs
-            // quickly — checking `isRunning` first prevents signalling an
-            // unrelated process that took the slot.
-            if !success, let s = spawn, s.isRunning, s.processIdentifier > 0 {
-                kill(s.processIdentifier, SIGKILL)
-                lastError = "Stop timed out after 5 minutes; recorder force-killed."
-            }
-            machine.enterIdle()
-            state = machine.state
-            NSApp.reply(toApplicationShouldTerminate: true)
-        } else {
-            if !success {
-                lastError = "Stop is still finalizing in the background."
-            }
-            machine.enterIdle()
-            state = machine.state
-        }
-    }
-
-    private func runStopViaDaemon(quitting: Bool) async {
-        do {
-            _ = try await DaemonClient.recordingStop(RecordingStopRequest(force: false))
-        } catch {
-            handleDaemonOperationFailure(error)
-            if quitting {
-                quitProgressSecondsRemaining = nil
-                NSApp.reply(toApplicationShouldTerminate: false)
-            }
-            machine.restoreRecordingAfterStopFailure()
-            state = machine.state
-            return
-        }
-
-        let timeout: TimeInterval = quitting ? 300 : 30
-        let success = quitting
-            ? await awaitStoppedEvent(timeout: timeout)
-            : await awaitFinalizedEvent(timeout: timeout)
-
-        if quitting {
-            quitProgressSecondsRemaining = nil
-            if !success {
-                lastError = "Stop timed out after 5 minutes; recorder finalization may still be running."
-            }
-            machine.enterIdle()
-            state = machine.state
-            NSApp.reply(toApplicationShouldTerminate: true)
-        } else {
-            if !success {
-                lastError = "Stop is still finalizing in the background."
-            }
-            machine.enterIdle()
-            state = machine.state
-        }
-    }
-
-    private func awaitFinalizedEvent(timeout: TimeInterval) async -> Bool {
-        await waitForOneShot(into: \.awaitingFinalized, timeout: timeout)
-    }
-
-    private func awaitStoppedEvent(timeout: TimeInterval) async -> Bool {
-        await waitForOneShot(into: \.awaitingStopped, timeout: timeout)
-    }
-
-    private func waitForOneShot(
-        into keyPath: ReferenceWritableKeyPath<RecorderController, [(Bool) -> Void]>,
-        timeout: TimeInterval
-    ) async -> Bool {
-        await withCheckedContinuation { continuation in
-            var resumed = false
-            var timeoutTask: Task<Void, Never>?
-            let resume: (Bool) -> Void = { value in
-                Task { @MainActor in
-                    if resumed { return }
-                    resumed = true
-                    // Cancel the timeout sleep so it doesn't sit for the full
-                    // 30s/300s wall-clock after a successful event.
-                    timeoutTask?.cancel()
-                    continuation.resume(returning: value)
-                }
-            }
-            // If the timeout path resumes the continuation first, this closure
-            // stays in the array as a no-op (the `resumed` flag prevents
-            // double-resume) until the next `resolveAll` drains it. A stop
-            // cycle that times out without any subsequent successful event
-            // would leak one closure per timeout — vanishingly rare in
-            // practice and self-cleaning on the next event. Tracked as a
-            // residual cleanup; deferred until usage shows it bites.
-            self[keyPath: keyPath].append(resume)
-            timeoutTask = Task { @MainActor in
-                if quitProgressSecondsRemaining != nil {
-                    await self.tickQuitProgress(totalSeconds: Int(timeout))
+        let isDaemon = transport == .daemon
+        let outcome = await stopPolicy.runStop(
+            quitting: quitting,
+            sendStopSignal: {
+                if isDaemon {
+                    _ = try await DaemonClient.recordingStop(RecordingStopRequest(force: false))
                 } else {
-                    try? await Task.sleep(nanoseconds: UInt64(timeout * 1_000_000_000))
+                    _ = try CLIClient.runDetached(["stop"])
                 }
-                if Task.isCancelled { return }
-                resume(false)
+            },
+            onTickQuitProgress: { [weak self] remaining in
+                guard let self, self.quitProgressSecondsRemaining != nil else { return }
+                self.quitProgressSecondsRemaining = remaining
             }
-        }
-    }
+        )
 
-    private func tickQuitProgress(totalSeconds: Int) async {
-        await QuitProgressCountdown.run(totalSeconds: totalSeconds) { remaining in
-            guard quitProgressSecondsRemaining != nil else { return }
-            quitProgressSecondsRemaining = remaining
-        } sleep: {
-            try await Task.sleep(nanoseconds: 1_000_000_000)
+        switch outcome {
+        case .sendSignalFailed(let error):
+            // Daemon and CLI failure paths diverge: the daemon path needs the
+            // typed-error policy from `handleDaemonOperationFailure`
+            // (schemaMismatch, socketUnavailable, envelopeError) while the CLI
+            // path surfaces the generic SIGTERM-dispatch message.
+            if isDaemon {
+                handleDaemonOperationFailure(error)
+            } else {
+                lastError = "Failed to send stop signal: \(error.localizedDescription). Try `screencap stop` in a terminal."
+            }
+            if quitting {
+                quitProgressSecondsRemaining = nil
+                NSApp.reply(toApplicationShouldTerminate: false)
+            }
+            // No-op for the daemon path when `handleDaemonOperationFailure`
+            // already forced state to `.idle`; only the CLI path lands in
+            // `.stopping` and gets rolled back to `.recording(elapsed:)`.
+            machine.restoreRecordingAfterStopFailure()
+            state = machine.state
+        case .completed:
+            if quitting {
+                quitProgressSecondsRemaining = nil
+                machine.enterIdle()
+                state = machine.state
+                NSApp.reply(toApplicationShouldTerminate: true)
+            } else {
+                machine.enterIdle()
+                state = machine.state
+            }
+        case .timedOut:
+            if quitting {
+                quitProgressSecondsRemaining = nil
+                if isDaemon {
+                    lastError = "Stop timed out after 5 minutes; recorder finalization may still be running."
+                } else if let s = spawn, s.isRunning, s.processIdentifier > 0 {
+                    // Only SIGKILL if the process is still alive. `processIdentifier`
+                    // returns the PID even after exit, and macOS recycles PIDs
+                    // quickly — checking `isRunning` first prevents signalling an
+                    // unrelated process that took the slot.
+                    kill(s.processIdentifier, SIGKILL)
+                    lastError = "Stop timed out after 5 minutes; recorder force-killed."
+                }
+                machine.enterIdle()
+                state = machine.state
+                NSApp.reply(toApplicationShouldTerminate: true)
+            } else {
+                lastError = "Stop is still finalizing in the background."
+                machine.enterIdle()
+                state = machine.state
+            }
         }
     }
 
@@ -531,9 +455,9 @@ final class RecorderController: ObservableObject {
             case .stopPermissionWatchdog:
                 stopPermissionWatchdog()
             case .resolveAwaiting(.finalized, let success):
-                resolveAll(pending: \.awaitingFinalized, value: success)
+                stopPolicy.resolveFinalized(success)
             case .resolveAwaiting(.stopped, let success):
-                resolveAll(pending: \.awaitingStopped, value: success)
+                stopPolicy.resolveStopped(success)
             case .surfaceError(let message):
                 lastError = message
             case .clearError:
@@ -703,12 +627,6 @@ final class RecorderController: ObservableObject {
         alertPresenter.presentPermissionLost(permission: perm) { [weak self] in
             self?.permissions?.openSystemSettings(for: PrivacyPane.from(permissionString: perm))
         }
-    }
-
-    private func resolveAll(pending keyPath: ReferenceWritableKeyPath<RecorderController, [(Bool) -> Void]>, value: Bool) {
-        let resumes = self[keyPath: keyPath]
-        self[keyPath: keyPath] = []
-        for resume in resumes { resume(value) }
     }
 
     // MARK: - Timers
