@@ -194,8 +194,7 @@ final class RecorderController: ObservableObject {
             }
         case .foreignClaimant:
             lastError = "Another process is recording."
-            machine.forceState(.idle)
-            state = machine.state
+            transitionToIdle()
         }
     }
 
@@ -215,8 +214,7 @@ final class RecorderController: ObservableObject {
         // outer guard has already passed (it gated on the prior .daemon
         // transport) so we must re-check before spawning the CLI.
         if let permissions, !permissions.allRequiredGranted {
-            machine.forceState(.idle)
-            state = machine.state
+            transitionToIdle()
             lastError = Self.requiredPermissionsErrorMessage
             return
         }
@@ -236,8 +234,7 @@ final class RecorderController: ObservableObject {
             )
             startPermissionWatchdog()
         } catch {
-            machine.forceState(.idle)
-            state = machine.state
+            transitionToIdle()
             lastError = error.localizedDescription
         }
     }
@@ -358,18 +355,9 @@ final class RecorderController: ObservableObject {
             machine.restoreRecordingAfterStopFailure()
             state = machine.state
         case .completed:
-            if quitting {
-                quitProgressSecondsRemaining = nil
-                machine.enterIdle()
-                state = machine.state
-                NSApp.reply(toApplicationShouldTerminate: true)
-            } else {
-                machine.enterIdle()
-                state = machine.state
-            }
+            finalizeStop(quitting: quitting)
         case .timedOut:
             if quitting {
-                quitProgressSecondsRemaining = nil
                 if isDaemon {
                     lastError = "Stop timed out after 5 minutes; recorder finalization may still be running."
                 } else if let s = cliService.currentProcess, s.isRunning, s.processIdentifier > 0 {
@@ -380,15 +368,20 @@ final class RecorderController: ObservableObject {
                     kill(s.processIdentifier, SIGKILL)
                     lastError = "Stop timed out after 5 minutes; recorder force-killed."
                 }
-                machine.enterIdle()
-                state = machine.state
-                NSApp.reply(toApplicationShouldTerminate: true)
             } else {
                 lastError = "Stop is still finalizing in the background."
-                machine.enterIdle()
-                state = machine.state
             }
+            finalizeStop(quitting: quitting)
         }
+    }
+
+    /// Shared stop-completion sequence: clear the Cmd+Q countdown, transition
+    /// the machine to `.idle`, and (for Cmd+Q) tell AppKit it may terminate.
+    private func finalizeStop(quitting: Bool) {
+        if quitting { quitProgressSecondsRemaining = nil }
+        machine.enterIdle()
+        state = machine.state
+        if quitting { NSApp.reply(toApplicationShouldTerminate: true) }
     }
 
     // MARK: - Event / process callbacks
@@ -444,29 +437,34 @@ final class RecorderController: ObservableObject {
                     isRecording: { [weak self] in self?.state.isRecording ?? false }
                 )
             )
-            await self.applyDaemonStreamOutcome(outcome)
+            self.applyDaemonStreamOutcome(outcome)
         }
     }
 
-    private func applyDaemonStreamOutcome(_ outcome: DaemonSessionService.AttachOutcome) async {
+    private func applyDaemonStreamOutcome(_ outcome: DaemonSessionService.AttachOutcome) {
         switch outcome {
         case .shutdown:
             return
         case .foreignClaimant:
             lastError = "Another process is recording."
-            machine.forceState(.idle)
-            state = machine.state
+            transitionToIdle()
         case .sessionEnded:
-            machine.forceState(.idle)
-            state = machine.state
+            transitionToIdle()
             lastError = "Recording ended."
         case .lostContact:
-            machine.forceState(.idle)
-            state = machine.state
+            transitionToIdle()
             lastError = "Lost contact with daemon"
         case .fatalError(let failure):
             applyDaemonFailureOutcome(failure)
         }
+    }
+
+    /// Force the state machine to `.idle` and mirror to `@Published state`.
+    /// Use after transport-level rollbacks (foreign claimant, daemon failure,
+    /// stream loss) that don't flow through the effect channel.
+    private func transitionToIdle() {
+        machine.forceState(.idle)
+        state = machine.state
     }
 
     private func handleDaemonOperationFailure(_ error: Error, fallback: (() -> Void)? = nil) {
@@ -481,8 +479,7 @@ final class RecorderController: ObservableObject {
         case .schemaMismatch:
             schemaMismatchDetected = true
             transport = .cliFallback
-            machine.forceState(.idle)
-            state = machine.state
+            transitionToIdle()
             lastError = "ScreenCap daemon needs to reload."
         case .socketUnavailable:
             recorderLogger.info("Daemon transport failed; falling back to CLI.")
@@ -490,22 +487,15 @@ final class RecorderController: ObservableObject {
             // Without resetting `state`, a failed start leaves the controller
             // stuck in `.starting`; surface the failure to the user and clear
             // the in-flight state so a retry (or CLI fallback) can take over.
-            machine.forceState(.idle)
-            state = machine.state
+            transitionToIdle()
             lastError = "Daemon socket unavailable"
             fallback?()
         case .lockContended:
             lastError = "ScreenCap is already recording."
-            if state.isRecording {
-                machine.forceState(.idle)
-                state = machine.state
-            }
+            if state.isRecording { transitionToIdle() }
         case .other(let description):
             lastError = description
-            if state.isRecording {
-                machine.forceState(.idle)
-                state = machine.state
-            }
+            if state.isRecording { transitionToIdle() }
         }
     }
 
@@ -630,8 +620,7 @@ extension RecorderController {
     func _testCancelDaemonTask() async {
         let task = daemonEventTask
         daemonEventTask = nil
-        machine.forceState(.idle)
-        state = .idle
+        transitionToIdle()
         task?.cancel()
         try? await Task.sleep(nanoseconds: 50_000_000)
     }
