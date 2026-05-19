@@ -99,9 +99,9 @@ final class RecorderController: ObservableObject {
     private var machine = RecordingStateMachine()
     private let watchdog: PermissionWatchdog
     private let alertPresenter: RecorderAlertPresenter
+    private let cliService: CLIRecorderService
     private let stopPolicy = StopPolicyCoordinator()
 
-    private var spawn: CLIClient.SpawnedProcess?
     private var daemonEventTask: Task<Void, Never>?
     private var elapsedTimer: Timer?
     private var daemonInstalledObserver: NSObjectProtocol?
@@ -116,10 +116,12 @@ final class RecorderController: ObservableObject {
 
     init(
         watchdog: PermissionWatchdog = LivePermissionWatchdog(),
-        alertPresenter: RecorderAlertPresenter = LiveRecorderAlertPresenter()
+        alertPresenter: RecorderAlertPresenter = LiveRecorderAlertPresenter(),
+        cliService: CLIRecorderService = LiveCLIRecorderService()
     ) {
         self.watchdog = watchdog
         self.alertPresenter = alertPresenter
+        self.cliService = cliService
         daemonInstalledObserver = NotificationCenter.default.addObserver(
             forName: .screenCapDaemonInstalledAndRunning,
             object: nil,
@@ -243,29 +245,15 @@ final class RecorderController: ObservableObject {
         if let name { args.append(name) }
 
         do {
-            let proc = try CLIClient.spawn(
+            try cliService.start(
                 args: args,
-                // Use DispatchQueue.main.async (not Task { @MainActor }) for both
-                // dispatch sites: GCD's main queue is strictly FIFO, so a final
-                // `recording_finalized` line dispatched from `terminationHandler`'s
-                // drain step is guaranteed to land on MainActor before the
-                // subsequent `onTerminated` block. Mixing `Task { @MainActor }`
-                // for one side and DispatchQueue for the other gives no FIFO
-                // guarantee, allowing handleProcessTerminated to resolve the
-                // awaiting continuation with `false` before the in-flight event
-                // ran. See /rf:review finding #4.
-                onStderrLine: { [weak self] line in
-                    DispatchQueue.main.async {
-                        MainActor.assumeIsolated { self?.handleStderrLine(line) }
-                    }
+                onEvent: { [weak self] event in
+                    self?.handleRecorderEvent(event)
                 },
                 onTerminated: { [weak self] exitCode in
-                    DispatchQueue.main.async {
-                        MainActor.assumeIsolated { self?.handleProcessTerminated(exitCode: exitCode) }
-                    }
+                    self?.handleProcessTerminated(exitCode: exitCode)
                 }
             )
-            self.spawn = proc
             startPermissionWatchdog()
         } catch {
             machine.forceState(.idle)
@@ -406,7 +394,7 @@ final class RecorderController: ObservableObject {
                 quitProgressSecondsRemaining = nil
                 if isDaemon {
                     lastError = "Stop timed out after 5 minutes; recorder finalization may still be running."
-                } else if let s = spawn, s.isRunning, s.processIdentifier > 0 {
+                } else if let s = cliService.currentProcess, s.isRunning, s.processIdentifier > 0 {
                     // Only SIGKILL if the process is still alive. `processIdentifier`
                     // returns the PID even after exit, and macOS recycles PIDs
                     // quickly — checking `isRunning` first prevents signalling an
@@ -425,15 +413,7 @@ final class RecorderController: ObservableObject {
         }
     }
 
-    // MARK: - Stderr / process callbacks
-
-    private func handleStderrLine(_ line: String) {
-        let trimmed = line.trimmingCharacters(in: .whitespacesAndNewlines)
-        guard !trimmed.isEmpty, trimmed.hasPrefix("{") else { return }
-        guard let data = trimmed.data(using: .utf8) else { return }
-        guard let event = try? JSONDecoder().decode(RecorderEventLine.self, from: data) else { return }
-        handleRecorderEvent(event)
-    }
+    // MARK: - Event / process callbacks
 
     private func handleRecorderEvent(_ event: RecorderEventLine) {
         apply(machine.handle(event: event))
@@ -605,7 +585,8 @@ final class RecorderController: ObservableObject {
     }
 
     private func handleProcessTerminated(exitCode: Int32) {
-        spawn = nil
+        // `cliService` clears `currentProcess` from inside its own onTerminated
+        // hook before invoking this callback, so no nil-out needed here.
         daemonEventTask?.cancel()
         daemonEventTask = nil
         apply(machine.processTerminated(exitCode: exitCode))
@@ -699,7 +680,11 @@ extension RecorderController {
     }
 
     func _testHandleStderrLine(_ line: String) {
-        handleStderrLine(line)
+        // Route through the same parser the CLI service uses in production
+        // so this shim stays representative of the live stderr → event path.
+        if let event = RecorderEventLine.parse(stderrLine: line) {
+            handleRecorderEvent(event)
+        }
     }
 
     func _testHandleProcessTerminated(exitCode: Int32) {
