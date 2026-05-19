@@ -147,12 +147,10 @@ def test_normal_recording_lifecycle(recording_env):
     from screencap.recorder import start_recording
 
     rec_dir = recording_env["recordings_dir"] / "test-rec"
-    pid_file = recording_env["pid_file"]
 
     with (
         mock.patch("screencap.engine.recorder.Recorder", FakeRecorder),
         mock.patch("screencap.recorder._check_macos_permissions"),
-        mock.patch("screencap.pidfile.find_orphaned_processes", return_value=[]),
         mock.patch("shutil.disk_usage", return_value=_PLENTY_OF_DISK),
         mock.patch("screencap.metrics.save_metrics"),
     ):
@@ -726,7 +724,6 @@ def test_start_recording_multi_chunk_produces_all_chunk_files(recording_env):
     with (
         mock.patch("screencap.engine.recorder.Recorder", FakeChunkedRecorder),
         mock.patch("screencap.recorder._check_macos_permissions"),
-        mock.patch("screencap.pidfile.find_orphaned_processes", return_value=[]),
         mock.patch("shutil.disk_usage", return_value=_PLENTY_OF_DISK),
         mock.patch("screencap.metrics.save_metrics"),
         # Mock transcription/upload inside ChunkProcessor
@@ -831,7 +828,6 @@ def test_non_chunked_recording_no_chunk_processor(recording_env):
     with (
         mock.patch("screencap.engine.recorder.Recorder", FakeRecorder),
         mock.patch("screencap.recorder._check_macos_permissions"),
-        mock.patch("screencap.pidfile.find_orphaned_processes", return_value=[]),
         mock.patch("shutil.disk_usage", return_value=_PLENTY_OF_DISK),
         mock.patch("screencap.metrics.save_metrics"),
         mock.patch("screencap.chunk_processor.ChunkProcessor") as MockCP,
@@ -924,7 +920,6 @@ def test_stub_recording_not_called_when_uploads_disabled(recording_env):
     with (
         mock.patch("screencap.engine.recorder.Recorder", FakeCloudRecorder),
         mock.patch("screencap.recorder._check_macos_permissions"),
-        mock.patch("screencap.pidfile.find_orphaned_processes", return_value=[]),
         mock.patch("shutil.disk_usage", return_value=_PLENTY_OF_DISK),
         mock.patch("screencap.metrics.save_metrics"),
         # Privacy pipeline fails → uploads disabled
@@ -1016,7 +1011,6 @@ def test_upload_warning_surfaced_at_stop(recording_env):
     with (
         mock.patch("screencap.engine.recorder.Recorder", FakeCloudRecorder),
         mock.patch("screencap.recorder._check_macos_permissions"),
-        mock.patch("screencap.pidfile.find_orphaned_processes", return_value=[]),
         mock.patch("shutil.disk_usage", return_value=_PLENTY_OF_DISK),
         mock.patch("screencap.metrics.save_metrics"),
         mock.patch(
@@ -1127,7 +1121,6 @@ def test_sentinel_not_uploaded_without_sentinel_for_cloud(recording_env):
     with (
         mock.patch("screencap.engine.recorder.Recorder", FakeCloudRecorderWithUpload),
         mock.patch("screencap.recorder._check_macos_permissions"),
-        mock.patch("screencap.pidfile.find_orphaned_processes", return_value=[]),
         mock.patch("shutil.disk_usage", return_value=_PLENTY_OF_DISK),
         mock.patch("screencap.metrics.save_metrics"),
         # All chunks upload successfully

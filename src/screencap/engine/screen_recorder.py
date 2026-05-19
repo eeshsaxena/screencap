@@ -807,11 +807,7 @@ def _run_screen_recorder(rec: "ScreenRecorder") -> "RecordingResult":
 
             # ``InheritLock.register_children`` is a no-op — the daemon
             # supervisor owns the pidfile lifecycle. Kept for the seam.
-            child_pids = [
-                {"pid": child.pid, "name": child.name}
-                for child in mp.active_children()
-            ]
-            lock_policy.register_children(capture_dir, child_pids)
+            lock_policy.register_children(capture_dir, [])
 
             # Store raw PIDs for signal-safe force-exit (avoids
             # multiprocessing._children_lock which can deadlock in a handler).

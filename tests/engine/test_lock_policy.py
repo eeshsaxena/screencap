@@ -59,6 +59,39 @@ def test_inherit_lock_claim_and_release_are_noops(tmp_path):
     delete.assert_not_called()
 
 
+def test_inherit_lock_methods_touch_no_files_outside_identity(tmp_path):
+    """``InheritLock.claim`` / ``register_children`` / ``release`` write
+    zero files into ``capture_dir``.
+
+    Identity-file writes are covered by the dedicated ``write_identity``
+    tests above. This test pins the contract that the no-op methods stay
+    no-ops: a future regression that adds a sidecar file or "keep-alive"
+    write would silently violate the engine-subprocess invariant
+    (daemon owns the lock; engine touches only identity).
+    """
+    from screencap.engine.lock_policy import InheritLock
+
+    policy = InheritLock()
+
+    # Pre-state: empty capture_dir.
+    assert list(tmp_path.iterdir()) == []
+
+    policy.claim(tmp_path, force_clean=False)
+    assert list(tmp_path.iterdir()) == [], (
+        "InheritLock.claim must not create any files"
+    )
+
+    policy.register_children(tmp_path, [{"pid": 1, "name": "x"}])
+    assert list(tmp_path.iterdir()) == [], (
+        "InheritLock.register_children must not create any files"
+    )
+
+    policy.release()
+    assert list(tmp_path.iterdir()) == [], (
+        "InheritLock.release must not create any files"
+    )
+
+
 def _make_request(
     *,
     name: str = "rec-1",

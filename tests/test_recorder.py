@@ -381,9 +381,6 @@ class TestPreRecordingDiskCheck:
             mock.patch("screencap.config.get_disk_warn_mb", return_value=2000),
             mock.patch("screencap.config.get_disk_stop_mb", return_value=500),
             mock.patch("shutil.disk_usage", return_value=fake_usage),
-            mock.patch("screencap.pidfile.find_orphaned_processes", return_value=[]),
-            mock.patch("screencap.pidfile.write_pidfile"),
-            mock.patch("screencap.pidfile.delete_pidfile"),
             mock.patch("screencap.engine.recorder.Recorder", FakeRecorder),
         ):
             capture_dir, elapsed, _, _ = start_recording("test", output_dir=tmp_path / "test-rec")
@@ -403,7 +400,6 @@ class TestPreRecordingDiskCheck:
             mock.patch("screencap.config.get_disk_warn_mb", return_value=2000),
             mock.patch("screencap.config.get_disk_stop_mb", return_value=500),
             mock.patch("shutil.disk_usage", return_value=fake_usage),
-            mock.patch("screencap.pidfile.find_orphaned_processes", return_value=[]),
         ):
             with pytest.raises(SystemExit):
                 start_recording("test", output_dir=tmp_path / "test-rec")
@@ -419,7 +415,6 @@ class TestPreRecordingDiskCheck:
             mock.patch("screencap.config.get_disk_warn_mb", return_value=2000),
             mock.patch("screencap.config.get_disk_stop_mb", return_value=500),
             mock.patch("shutil.disk_usage", side_effect=FileNotFoundError("not found")),
-            mock.patch("screencap.pidfile.find_orphaned_processes", return_value=[]),
         ):
             with pytest.raises(SystemExit):
                 start_recording("test", output_dir=tmp_path / "test-rec")
@@ -435,9 +430,6 @@ class TestPreRecordingDiskCheck:
             mock.patch("screencap.config.get_disk_warn_mb", return_value=2000),
             mock.patch("screencap.config.get_disk_stop_mb", return_value=500),
             mock.patch("shutil.disk_usage", side_effect=OSError("FUSE error")),
-            mock.patch("screencap.pidfile.find_orphaned_processes", return_value=[]),
-            mock.patch("screencap.pidfile.write_pidfile"),
-            mock.patch("screencap.pidfile.delete_pidfile"),
             mock.patch("screencap.engine.recorder.Recorder"),
             pytest.raises(SystemExit) as exc_info,
         ):
@@ -463,9 +455,6 @@ class TestPreRecordingDiskCheck:
             mock.patch("screencap.config.get_disk_warn_mb", return_value=0),
             mock.patch("screencap.config.get_disk_stop_mb", return_value=0),
             mock.patch("shutil.disk_usage", return_value=fake_usage),
-            mock.patch("screencap.pidfile.find_orphaned_processes", return_value=[]),
-            mock.patch("screencap.pidfile.write_pidfile"),
-            mock.patch("screencap.pidfile.delete_pidfile"),
             mock.patch("screencap.engine.recorder.Recorder") as MockRecorder,
         ):
             MockRecorder.return_value.__enter__ = mock.MagicMock(return_value=mock_recorder)
@@ -488,7 +477,6 @@ class TestPreRecordingDiskCheck:
             mock.patch("screencap.config.get_disk_warn_mb", return_value=2000),
             mock.patch("screencap.config.get_disk_stop_mb", return_value=500),
             mock.patch("shutil.disk_usage", return_value=fake_usage),
-            mock.patch("screencap.pidfile.find_orphaned_processes", return_value=[]),
         ):
             with pytest.raises(SystemExit):
                 start_recording("test", output_dir=capture_dir)
@@ -510,7 +498,6 @@ class TestThresholdValidation:
             mock.patch("screencap.recorder.get_wifi_metrics", return_value=False),
             mock.patch("screencap.config.get_disk_warn_mb", return_value=500),
             mock.patch("screencap.config.get_disk_stop_mb", return_value=500),
-            mock.patch("screencap.pidfile.find_orphaned_processes", return_value=[]),
         ):
             with pytest.raises(SystemExit):
                 start_recording("test", output_dir=tmp_path / "test-rec")
@@ -525,7 +512,6 @@ class TestThresholdValidation:
             mock.patch("screencap.recorder.get_wifi_metrics", return_value=False),
             mock.patch("screencap.config.get_disk_warn_mb", return_value=500),
             mock.patch("screencap.config.get_disk_stop_mb", return_value=1000),
-            mock.patch("screencap.pidfile.find_orphaned_processes", return_value=[]),
         ):
             with pytest.raises(SystemExit):
                 start_recording("test", output_dir=tmp_path / "test-rec")
@@ -552,9 +538,6 @@ class TestPrivacyFilterInitFailure:
             mock.patch("screencap.recorder.get_wifi_metrics", return_value=False),
             mock.patch("screencap.config.get_disk_warn_mb", return_value=0),
             mock.patch("screencap.config.get_disk_stop_mb", return_value=0),
-            mock.patch("screencap.pidfile.find_orphaned_processes", return_value=[]),
-            mock.patch("screencap.pidfile.write_pidfile"),
-            mock.patch("screencap.pidfile.delete_pidfile"),
             mock.patch("screencap.config.get_privacy_config", return_value=public_config),
             mock.patch(
                 "screencap.privacy.recorder_enforcement.RecorderPrivacyFilter",
@@ -578,9 +561,6 @@ class TestPrivacyFilterInitFailure:
             mock.patch("screencap.recorder.get_wifi_metrics", return_value=False),
             mock.patch("screencap.config.get_disk_warn_mb", return_value=0),
             mock.patch("screencap.config.get_disk_stop_mb", return_value=0),
-            mock.patch("screencap.pidfile.find_orphaned_processes", return_value=[]),
-            mock.patch("screencap.pidfile.write_pidfile"),
-            mock.patch("screencap.pidfile.delete_pidfile"),
             mock.patch("screencap.config.get_privacy_config", return_value=internal_config),
             mock.patch(
                 "screencap.privacy.recorder_enforcement.RecorderPrivacyFilter",
@@ -612,9 +592,6 @@ class TestPrivacyFilterInitFailure:
             mock.patch("screencap.recorder.get_wifi_metrics", return_value=False),
             mock.patch("screencap.config.get_disk_warn_mb", return_value=0),
             mock.patch("screencap.config.get_disk_stop_mb", return_value=0),
-            mock.patch("screencap.pidfile.find_orphaned_processes", return_value=[]),
-            mock.patch("screencap.pidfile.write_pidfile"),
-            mock.patch("screencap.pidfile.delete_pidfile"),
             mock.patch(
                 "screencap.config.get_privacy_config",
                 side_effect=RuntimeError("config corrupt"),
@@ -732,9 +709,6 @@ class TestHeadlessRecorderUnavailable:
             mock.patch("screencap.config.get_disk_warn_mb", return_value=2000),
             mock.patch("screencap.config.get_disk_stop_mb", return_value=500),
             mock.patch("shutil.disk_usage", return_value=_PLENTY_OF_DISK),
-            mock.patch("screencap.pidfile.find_orphaned_processes", return_value=[]),
-            mock.patch("screencap.pidfile.write_pidfile"),
-            mock.patch("screencap.pidfile.delete_pidfile"),
             mock.patch.dict(sys.modules, {"screencap.engine.recorder": None}),
             mock.patch("screencap.recorder.console") as mock_console,
         ):
@@ -779,9 +753,6 @@ class TestNetworkV15Plumbing:
         stack.enter_context(mock.patch("screencap.config.get_disk_warn_mb", return_value=2000))
         stack.enter_context(mock.patch("screencap.config.get_disk_stop_mb", return_value=500))
         stack.enter_context(mock.patch("shutil.disk_usage", return_value=_PLENTY_OF_DISK))
-        stack.enter_context(mock.patch("screencap.pidfile.find_orphaned_processes", return_value=[]))
-        stack.enter_context(mock.patch("screencap.pidfile.write_pidfile"))
-        stack.enter_context(mock.patch("screencap.pidfile.delete_pidfile"))
 
     def test_network_true_passes_dek_into_recorder(self, tmp_path):
         """KEK is generated, DEK is wrapped, and both are forwarded to Recorder()."""

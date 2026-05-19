@@ -8,10 +8,6 @@ subprocess therefore runs with ``InheritLock`` — claim/register/
 release are no-ops, but per-recording identity files are still
 written so downstream catalog / upload / scrubber / recovery
 consumers find them.
-
-The ``LockPolicy`` Protocol is kept as the seam in case the
-engine-topology spike (docs/tickets/2026-05-08-engine-topology-spike.md)
-re-introduces a different policy variant.
 """
 
 from __future__ import annotations

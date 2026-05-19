@@ -633,6 +633,13 @@ def start_recording(
     channels = _channels if _channels is not None else IpcChannels.create()
     menubar = _menubar_policy if _menubar_policy is not None else SpawnNewMenubar()
     signal = _signal_policy if _signal_policy is not None else ThreeTapSigint()
+    # NOTE: ``InheritLock`` is only correct when this function is invoked
+    # inside a daemon-spawned worker process — the supervisor owns the
+    # pidfile lifecycle there, so the policy intentionally no-ops. Direct
+    # callers (tests, ad-hoc scripts, future engine-topology callers) get
+    # no process-exclusion guarantee; two concurrent ``start_recording``
+    # calls for the same name will race on ``recording.db`` and friends.
+    # If you add a non-daemon caller, pass an explicit ``_lock_policy``.
     lock = _lock_policy if _lock_policy is not None else InheritLock()
     permission = _permission_policy if _permission_policy is not None else MacOSTCC()
     disk = _disk_policy if _disk_policy is not None else MonitorAndStop()
