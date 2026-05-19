@@ -100,6 +100,7 @@ final class RecorderController: ObservableObject {
     private let watchdog: PermissionWatchdog
     private let alertPresenter: RecorderAlertPresenter
     private let cliService: CLIRecorderService
+    private let daemonService: DaemonSessionService
     private let stopPolicy = StopPolicyCoordinator()
 
     private var daemonEventTask: Task<Void, Never>?
@@ -117,11 +118,13 @@ final class RecorderController: ObservableObject {
     init(
         watchdog: PermissionWatchdog = LivePermissionWatchdog(),
         alertPresenter: RecorderAlertPresenter = LiveRecorderAlertPresenter(),
-        cliService: CLIRecorderService = LiveCLIRecorderService()
+        cliService: CLIRecorderService = LiveCLIRecorderService(),
+        daemonService: DaemonSessionService = DaemonSessionService()
     ) {
         self.watchdog = watchdog
         self.alertPresenter = alertPresenter
         self.cliService = cliService
+        self.daemonService = daemonService
         daemonInstalledObserver = NotificationCenter.default.addObserver(
             forName: .screenCapDaemonInstalledAndRunning,
             object: nil,
@@ -162,69 +165,46 @@ final class RecorderController: ObservableObject {
 
     func probeDaemon() async {
         defer { daemonProbeCompleted = true }
-        do {
-            _ = try await DaemonClient.daemonInfo()
+        switch await daemonService.probe() {
+        case .daemon:
             schemaMismatchDetected = false
             transport = .daemon
             await syncDaemonSnapshot()
-        } catch DaemonClientError.schemaMismatch {
+        case .schemaMismatch:
             schemaMismatchDetected = true
             transport = .cliFallback
-        } catch {
-            recorderLogger.info("Daemon not reachable; using CLI fallback. Error: \(String(describing: error), privacy: .public)")
+        case .unavailable:
             transport = .cliFallback
         }
     }
 
     private func syncDaemonSnapshot() async {
-        do {
-            let snapshot = try await DaemonClient.sessionSnapshot()
-            guard snapshot.isRecording == true else { return }
-
-            if snapshot.daemonOwned {
-                let start = snapshot.startedAt.map(Date.init(timeIntervalSince1970:)) ?? Date()
-                apply(machine.observeActiveDaemonSession(startedAt: start))
-                attachDaemonEventStream()
-                // The watchdog only re-checks TCC for the app process during
-                // CLI-fallback recordings (see checkPermissionsDuringRecording).
-                // Skip arming it on the daemon transport so we don't wake the
-                // Timer and NSWorkspace observer to immediately no-op.
-                if transport == .cliFallback {
-                    startPermissionWatchdog()
-                }
-            } else {
-                lastError = "Another process is recording."
-                machine.forceState(.idle)
-                state = machine.state
+        switch await daemonService.snapshot() {
+        case .noActiveSession, .unreachable:
+            return
+        case .daemonOwnedSession(let startedAt):
+            apply(machine.observeActiveDaemonSession(startedAt: startedAt))
+            attachDaemonEventStream()
+            // The watchdog only re-checks TCC for the app process during
+            // CLI-fallback recordings (see checkPermissionsDuringRecording).
+            // Skip arming it on the daemon transport so we don't wake the
+            // Timer and NSWorkspace observer to immediately no-op.
+            if transport == .cliFallback {
+                startPermissionWatchdog()
             }
-        } catch {
-            recorderLogger.info("Could not sync daemon session snapshot: \(String(describing: error), privacy: .public)")
+        case .foreignClaimant:
+            lastError = "Another process is recording."
+            machine.forceState(.idle)
+            state = machine.state
         }
     }
 
     func reloadDaemon() async {
-        let process = Process()
-        process.executableURL = URL(fileURLWithPath: "/bin/launchctl")
-        process.arguments = ["kickstart", "-kp", "gui/\(getuid())/com.screencap.daemon"]
-        process.standardInput = FileHandle.nullDevice
-        process.standardOutput = Pipe()
-        process.standardError = Pipe()
-        do {
-            try process.run()
-            await withCheckedContinuation { (continuation: CheckedContinuation<Void, Never>) in
-                DispatchQueue.global(qos: .userInitiated).async {
-                    process.waitUntilExit()
-                    continuation.resume()
-                }
-            }
-            if process.terminationStatus == 0 {
-                schemaMismatchDetected = false
-                await probeDaemon()
-            } else {
-                lastError = "Failed to reload ScreenCap daemon."
-            }
-        } catch {
-            lastError = "Failed to reload ScreenCap daemon: \(error.localizedDescription)"
+        if await daemonService.reload() {
+            schemaMismatchDetected = false
+            await probeDaemon()
+        } else {
+            lastError = "Failed to reload ScreenCap daemon."
         }
     }
 
@@ -264,10 +244,8 @@ final class RecorderController: ObservableObject {
 
     private func startViaDaemon(name: String? = nil) async {
         do {
-            let response = try await DaemonClient.recordingStart(
-                RecordingStartRequest(name: name, startedBy: "swiftui-via-daemon")
-            )
-            machine.pendingStartCursor = response.cursor
+            let cursor = try await daemonService.startRecording(name: name)
+            machine.pendingStartCursor = cursor
             attachDaemonEventStream()
             // Same rationale as syncDaemonSnapshot: on the daemon transport
             // the watchdog's check is a guarded no-op, so don't arm it.
@@ -346,9 +324,9 @@ final class RecorderController: ObservableObject {
         let isDaemon = transport == .daemon
         let outcome = await stopPolicy.runStop(
             quitting: quitting,
-            sendStopSignal: {
+            sendStopSignal: { [daemonService] in
                 if isDaemon {
-                    _ = try await DaemonClient.recordingStop(RecordingStopRequest(force: false))
+                    try await daemonService.stopRecording(force: false)
                 } else {
                     _ = try CLIClient.runDetached(["stop"])
                 }
@@ -456,107 +434,58 @@ final class RecorderController: ObservableObject {
     private func attachDaemonEventStream() {
         daemonEventTask?.cancel()
         daemonEventTask = Task { [weak self] in
-            await self?.consumeDaemonEvents()
+            guard let self else { return }
+            let outcome = await self.daemonService.consumeEventStream(
+                callbacks: .init(
+                    onEvent: { [weak self] event in self?.handleRecorderEvent(event) },
+                    onTransientWarning: { [weak self] message in self?.lastError = message },
+                    getPendingStartCursor: { [weak self] in self?.machine.pendingStartCursor },
+                    clearPendingStartCursor: { [weak self] in self?.machine.pendingStartCursor = nil },
+                    isRecording: { [weak self] in self?.state.isRecording ?? false }
+                )
+            )
+            await self.applyDaemonStreamOutcome(outcome)
         }
     }
 
-    private func consumeDaemonEvents() async {
-        // Capped exponential backoff for reconnects: a flat 100ms sleep would
-        // hammer a daemon that is genuinely down, and a successful pass should
-        // reset the dial. After `maxConsecutiveFailures` we give up and
-        // surface the loss to the UI so the user can act.
-        var consecutiveFailures = 0
-        let maxConsecutiveFailures = 10
-        let baseBackoff: TimeInterval = 0.1
-        let cappedBackoff: TimeInterval = 30.0
-
-        while !Task.isCancelled, state.isRecording {
-            var sawProgress = false
-            do {
-                let snapshot = try await DaemonClient.sessionSnapshot()
-                if snapshot.isRecording == true, snapshot.daemonOwned == false {
-                    lastError = "Another process is recording."
-                    machine.forceState(.idle)
-                    state = machine.state
-                    return
-                }
-                if snapshot.recovering {
-                    lastError = "ScreenCap daemon is recovering the previous recording session."
-                }
-                // If the daemon snapshot says recording stopped while our local
-                // state still says recording, the previous run terminated
-                // outside this controller's awareness (engine crash, external
-                // `screencap stop`, daemon restart that lost session). Without
-                // this branch the `subscribe` below would wait forever on a
-                // dead session and the UI would stay stuck in `.recording`
-                // until the 10×backoff cap fires.
-                if snapshot.isRecording == false, state.isRecording {
-                    machine.forceState(.idle)
-                    state = machine.state
-                    lastError = "Recording ended."
-                    return
-                }
-
-                // Until we receive `started` or `recording_failed`, keep using
-                // the start boundary. If the first stream drops before the
-                // boundary event is delivered, a reconnect from snapshot.cursor
-                // could skip the event that moves the UI out of `.starting`.
-                let sinceCursor = machine.pendingStartCursor ?? snapshot.cursor
-                for try await event in DaemonClient.subscribe(sinceCursor: sinceCursor) {
-                    if Task.isCancelled { return }
-                    sawProgress = true
-                    handleRecorderEvent(event)
-                    if event.type == "_close", event.reason == "shutdown" {
-                        return
-                    }
-                }
-            } catch DaemonClientError.streamClosed(let reason) {
-                if Task.isCancelled { return }
-                recorderLogger.info("Daemon event stream dropped; reconnecting. Reason: \(reason, privacy: .public)")
-            } catch DaemonClientError.envelopeError(let code, _) where code == "cursor_unknown" {
-                if Task.isCancelled { return }
-                // The requested cursor was evicted from the daemon's replay
-                // window between snapshot and subscribe. Refetch the snapshot
-                // and resubscribe with a fresh cursor; leave `state` intact so
-                // the UI does not flicker to `.idle`.
-                machine.pendingStartCursor = nil
-                recorderLogger.info("Daemon event stream evicted cursor; refetching snapshot.")
-                continue
-            } catch {
-                if Task.isCancelled { return }
-                handleDaemonOperationFailure(error)
-            }
-
-            if sawProgress {
-                consecutiveFailures = 0
-            } else {
-                consecutiveFailures += 1
-                if consecutiveFailures >= maxConsecutiveFailures {
-                    machine.forceState(.idle)
-                    state = machine.state
-                    lastError = "Lost contact with daemon"
-                    return
-                }
-            }
-
-            if state.isRecording {
-                let attempt = max(0, consecutiveFailures - 1)
-                let backoff = min(baseBackoff * pow(2.0, Double(attempt)), cappedBackoff)
-                try? await Task.sleep(nanoseconds: UInt64(backoff * 1_000_000_000))
-            }
+    private func applyDaemonStreamOutcome(_ outcome: DaemonSessionService.AttachOutcome) async {
+        switch outcome {
+        case .shutdown:
+            return
+        case .foreignClaimant:
+            lastError = "Another process is recording."
+            machine.forceState(.idle)
+            state = machine.state
+        case .sessionEnded:
+            machine.forceState(.idle)
+            state = machine.state
+            lastError = "Recording ended."
+        case .lostContact:
+            machine.forceState(.idle)
+            state = machine.state
+            lastError = "Lost contact with daemon"
+        case .fatalError(let failure):
+            applyDaemonFailureOutcome(failure)
         }
     }
 
     private func handleDaemonOperationFailure(_ error: Error, fallback: (() -> Void)? = nil) {
-        switch error {
-        case DaemonClientError.schemaMismatch:
+        applyDaemonFailureOutcome(daemonService.translateFailure(error), fallback: fallback)
+    }
+
+    private func applyDaemonFailureOutcome(
+        _ outcome: DaemonSessionService.FailureOutcome,
+        fallback: (() -> Void)? = nil
+    ) {
+        switch outcome {
+        case .schemaMismatch:
             schemaMismatchDetected = true
             transport = .cliFallback
             machine.forceState(.idle)
             state = machine.state
             lastError = "ScreenCap daemon needs to reload."
-        case DaemonClientError.socketUnavailable, DaemonClientError.connectionFailed:
-            recorderLogger.info("Daemon transport failed; falling back to CLI. Error: \(String(describing: error), privacy: .public)")
+        case .socketUnavailable:
+            recorderLogger.info("Daemon transport failed; falling back to CLI.")
             transport = .cliFallback
             // Without resetting `state`, a failed start leaves the controller
             // stuck in `.starting`; surface the failure to the user and clear
@@ -565,18 +494,14 @@ final class RecorderController: ObservableObject {
             state = machine.state
             lastError = "Daemon socket unavailable"
             fallback?()
-        case DaemonClientError.envelopeError(let code, _):
-            if code == DaemonErrorCode.lockContended || code == DaemonErrorCode.notOwnedByDaemon {
-                lastError = "ScreenCap is already recording."
-            } else {
-                lastError = error.localizedDescription
-            }
+        case .lockContended:
+            lastError = "ScreenCap is already recording."
             if state.isRecording {
                 machine.forceState(.idle)
                 state = machine.state
             }
-        default:
-            lastError = error.localizedDescription
+        case .other(let description):
+            lastError = description
             if state.isRecording {
                 machine.forceState(.idle)
                 state = machine.state
