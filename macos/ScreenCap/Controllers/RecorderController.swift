@@ -1,6 +1,5 @@
 import AppKit
 import Combine
-import Darwin
 import Foundation
 import OSLog
 
@@ -391,12 +390,12 @@ final class RecorderController: ObservableObject {
             if quitting {
                 if isDaemon {
                     lastError = "Stop timed out after 5 minutes; recorder finalization may still be running."
-                } else if let s = cliService.currentProcess, s.isRunning, s.processIdentifier > 0 {
-                    // Only SIGKILL if the process is still alive. `processIdentifier`
-                    // returns the PID even after exit, and macOS recycles PIDs
-                    // quickly — checking `isRunning` first prevents signalling an
-                    // unrelated process that took the slot.
-                    kill(s.processIdentifier, SIGKILL)
+                } else if cliService.currentProcess?.forceKill() == true {
+                    // `forceKill()` returns true only when the process was
+                    // running with a valid PID — the same `isRunning` + `pid > 0`
+                    // guard the inline `kill(...)` used to apply, now scoped
+                    // to the SpawnedProcessHandle so a recycled PID from an
+                    // unrelated process cannot be signalled.
                     lastError = "Stop timed out after 5 minutes; recorder force-killed."
                 }
             } else {

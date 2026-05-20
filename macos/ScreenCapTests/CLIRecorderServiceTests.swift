@@ -96,7 +96,7 @@ final class CLIRecorderServiceTests: XCTestCase {
 final class ThrowingFakeCLIRecorderService: CLIRecorderService {
     enum SpawnError: Error, Equatable { case spawnRefused }
 
-    var currentProcess: CLIClient.SpawnedProcess? { nil }
+    var currentProcess: SpawnedProcessHandle? { nil }
 
     func start(
         args: [String],

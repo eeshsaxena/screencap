@@ -6,8 +6,10 @@ import Foundation
 @MainActor
 protocol CLIRecorderService {
     /// Currently-spawned process (`nil` if not running). Read by the stop
-    /// policy / orchestrator for the SIGKILL-on-Cmd+Q-timeout guard.
-    var currentProcess: CLIClient.SpawnedProcess? { get }
+    /// policy / orchestrator for the SIGKILL-on-Cmd+Q-timeout guard. Exposed
+    /// as the `SpawnedProcessHandle` protocol so tests can substitute a fake
+    /// without spawning a real subprocess.
+    var currentProcess: SpawnedProcessHandle? { get }
 
     /// Spawn `screencap` with the given args, decode stderr lines as
     /// `RecorderEventLine`, and dispatch them via `onEvent`. `onTerminated`
@@ -35,7 +37,7 @@ extension RecorderEventLine {
 /// `SpawnedProcess` handle and the stderr → JSON decode step.
 @MainActor
 final class LiveCLIRecorderService: CLIRecorderService {
-    private(set) var currentProcess: CLIClient.SpawnedProcess?
+    private(set) var currentProcess: SpawnedProcessHandle?
 
     func start(
         args: [String],
