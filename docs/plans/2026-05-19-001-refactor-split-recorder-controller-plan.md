@@ -1,8 +1,9 @@
 ---
 title: "refactor: Split RecorderController into state machine and transport/services (SCR-58)"
 type: refactor
-status: active
+status: completed
 date: 2026-05-19
+completed: 2026-05-20
 ---
 
 # refactor: Split RecorderController into state machine and transport/services (SCR-58)
