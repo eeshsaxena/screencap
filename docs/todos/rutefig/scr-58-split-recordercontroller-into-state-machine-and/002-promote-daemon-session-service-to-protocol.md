@@ -1,8 +1,10 @@
 ---
 title: "Promote DaemonSessionService to a protocol seam (match DaemonInstallController pattern)"
-status: open
+status: completed
 priority: medium
 created: 2026-05-20
+completed: 2026-05-20
+resolved_in: f8ccda35
 source: code-review PR #185 (finding #18)
 related_plans:
   - docs/plans/2026-05-19-001-refactor-split-recorder-controller-plan.md

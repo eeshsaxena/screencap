@@ -1,8 +1,10 @@
 ---
 title: "Add focused test for Cmd+Q SIGKILL branch in RecorderController.runStop"
-status: open
+status: completed
 priority: medium
 created: 2026-05-20
+completed: 2026-05-20
+resolved_in: c802bdb0
 source: code-review PR #185 (finding #6)
 related_plans:
   - docs/plans/2026-05-19-001-refactor-split-recorder-controller-plan.md
