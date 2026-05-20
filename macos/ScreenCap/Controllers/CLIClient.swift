@@ -1,6 +1,18 @@
 import Darwin
 import Foundation
 
+/// Abstract surface over `CLIClient.SpawnedProcess` so the orchestrator's
+/// Cmd+Q-timeout SIGKILL path can be exercised with a fake that doesn't
+/// actually signal a real PID. The two getter properties expose the existing
+/// `Process` accessors; `forceKill()` returns true when the SIGKILL was
+/// dispatched so callers can gate user-facing "force-killed" messaging on it.
+protocol SpawnedProcessHandle: AnyObject {
+    var isRunning: Bool { get }
+    var processIdentifier: Int32 { get }
+    @discardableResult
+    func forceKill() -> Bool
+}
+
 enum CLIError: LocalizedError {
     case binaryNotFound(searchedPaths: [String])
     case nonZeroExit(code: Int32, stderr: String)
@@ -35,7 +47,7 @@ enum CLIError: LocalizedError {
 enum CLIClient {
     /// Long-lived subprocess handle. Caller retains it for the duration of the
     /// recording lifecycle and calls `terminate()` to send SIGTERM.
-    final class SpawnedProcess {
+    final class SpawnedProcess: SpawnedProcessHandle {
         let process: Process
         let stderrPipe: Pipe
         let stdoutPipe: Pipe
@@ -53,6 +65,19 @@ enum CLIClient {
             if process.isRunning {
                 process.terminate()
             }
+        }
+
+        /// Send SIGKILL to the subprocess if it's still alive. Returns true if
+        /// the signal was actually dispatched (process was running and had a
+        /// valid PID). Guarded so a recycled PID from an unrelated process
+        /// cannot be signalled — macOS reuses PIDs quickly after exit, and
+        /// `processIdentifier` keeps returning the original PID even after
+        /// the child is gone.
+        @discardableResult
+        func forceKill() -> Bool {
+            guard process.isRunning, process.processIdentifier > 0 else { return false }
+            kill(process.processIdentifier, SIGKILL)
+            return true
         }
 
         func waitUntilExit() async {
