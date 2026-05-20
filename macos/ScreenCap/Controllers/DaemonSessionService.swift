@@ -10,12 +10,10 @@ enum DaemonErrorCode {
     static let notOwnedByDaemon = "not_owned_by_daemon"
 }
 
-/// Daemon-backed recording lifecycle: probe, snapshot, start, stop, event
-/// stream, and the typed-failure translation that drives the orchestrator's
-/// transport fallback. Wraps `DaemonClient` so the orchestrator deals in
-/// typed outcomes rather than raw error switches.
-@MainActor
-final class DaemonSessionService {
+/// Typed outcomes returned by the daemon session service. Hoisted out of the
+/// concrete class so the protocol can declare them in its surface without a
+/// nested-type cycle.
+enum DaemonSession {
     enum ProbeOutcome: Equatable {
         case daemon
         case schemaMismatch
@@ -44,6 +42,18 @@ final class DaemonSessionService {
         case fatalError(FailureOutcome)
     }
 
+    /// Error returned by `reload()` so the orchestrator can build the
+    /// pre-refactor two-message split:
+    ///   - `spawnFailed(Error)`     → "Failed to reload ScreenCap daemon: <desc>"
+    ///   - `nonZeroExit(Int32, String?)` → "Failed to reload ScreenCap daemon."
+    /// The `String?` carries the captured launchctl stderr so callers
+    /// (or Console.app via OSLog) can surface "Could not find service" distinctly
+    /// from a generic non-zero exit.
+    enum ReloadError: Error {
+        case spawnFailed(Error)
+        case nonZeroExit(code: Int32, stderr: String?)
+    }
+
     /// Callbacks the event-stream consumer needs from the orchestrator. The
     /// service does not own `pendingStartCursor` or the recording state; it
     /// reads/clears them via these hooks so behavior matches the pre-extraction
@@ -55,10 +65,38 @@ final class DaemonSessionService {
         let clearPendingStartCursor: @MainActor () -> Void
         let isRecording: @MainActor () -> Bool
     }
+}
 
+/// Daemon-backed recording lifecycle: probe, snapshot, start, stop, event
+/// stream, and the typed-failure translation that drives the orchestrator's
+/// transport fallback. Protocol seam so the orchestrator can inject a fake
+/// in tests without spinning up `UnixHTTPTestServer`.
+@MainActor
+protocol DaemonSessionService {
+    func probe() async -> DaemonSession.ProbeOutcome
+    func snapshot() async -> DaemonSession.SnapshotOutcome
+    func startRecording(name: String?) async throws -> Int
+    func stopRecording(force: Bool) async throws
+    func translateFailure(_ error: Error) -> DaemonSession.FailureOutcome
+    func reload() async -> Result<Void, DaemonSession.ReloadError>
+    func consumeEventStream(callbacks: DaemonSession.EventStreamCallbacks) async -> DaemonSession.AttachOutcome
+}
+
+extension DaemonSessionService {
+    /// Convenience overload mirroring the pre-protocol `stopRecording(force:)`
+    /// default — production callers do not pass `force`.
+    func stopRecording() async throws {
+        try await stopRecording(force: false)
+    }
+}
+
+/// Live implementation backed by `DaemonClient`. Wraps the raw client so the
+/// orchestrator deals in typed outcomes rather than raw error switches.
+@MainActor
+final class LiveDaemonSessionService: DaemonSessionService {
     // MARK: - Probe / snapshot / lifecycle calls
 
-    func probe() async -> ProbeOutcome {
+    func probe() async -> DaemonSession.ProbeOutcome {
         do {
             _ = try await DaemonClient.daemonInfo()
             return .daemon
@@ -70,7 +108,7 @@ final class DaemonSessionService {
         }
     }
 
-    func snapshot() async -> SnapshotOutcome {
+    func snapshot() async -> DaemonSession.SnapshotOutcome {
         do {
             let snap = try await DaemonClient.sessionSnapshot()
             guard snap.isRecording == true else { return .noActiveSession }
@@ -93,11 +131,11 @@ final class DaemonSessionService {
         return response.cursor
     }
 
-    func stopRecording(force: Bool = false) async throws {
+    func stopRecording(force: Bool) async throws {
         _ = try await DaemonClient.recordingStop(RecordingStopRequest(force: force))
     }
 
-    func translateFailure(_ error: Error) -> FailureOutcome {
+    func translateFailure(_ error: Error) -> DaemonSession.FailureOutcome {
         switch error {
         case DaemonClientError.schemaMismatch:
             return .schemaMismatch
@@ -116,24 +154,12 @@ final class DaemonSessionService {
         }
     }
 
-    /// Error returned by `reload()` so the orchestrator can build the
-    /// pre-refactor two-message split:
-    ///   - `spawnFailed(Error)`     → "Failed to reload ScreenCap daemon: <desc>"
-    ///   - `nonZeroExit(Int32, String?)` → "Failed to reload ScreenCap daemon."
-    /// The `String?` carries the captured launchctl stderr so callers
-    /// (or Console.app via OSLog) can surface "Could not find service" distinctly
-    /// from a generic non-zero exit.
-    enum ReloadError: Error {
-        case spawnFailed(Error)
-        case nonZeroExit(code: Int32, stderr: String?)
-    }
-
     /// Reload the daemon via `launchctl kickstart -kp`. Returns `.success`
     /// on a clean kickstart, `.failure(.spawnFailed)` if the subprocess
     /// could not launch, and `.failure(.nonZeroExit)` if launchctl returned
     /// a non-zero status (carries stderr for actionable diagnostics — the
     /// headless / no-LaunchAgent case prints "Could not find service…" here).
-    func reload() async -> Result<Void, ReloadError> {
+    func reload() async -> Result<Void, DaemonSession.ReloadError> {
         let process = Process()
         process.executableURL = URL(fileURLWithPath: "/bin/launchctl")
         process.arguments = ["kickstart", "-kp", "gui/\(getuid())/com.screencap.daemon"]
@@ -173,7 +199,7 @@ final class DaemonSessionService {
     /// reconnects. Loops while `callbacks.isRecording()` returns true; exits
     /// via an `AttachOutcome` value the orchestrator translates into state
     /// transitions.
-    func consumeEventStream(callbacks: EventStreamCallbacks) async -> AttachOutcome {
+    func consumeEventStream(callbacks: DaemonSession.EventStreamCallbacks) async -> DaemonSession.AttachOutcome {
         // Capped exponential backoff for reconnects: a flat 100ms sleep would
         // hammer a daemon that is genuinely down, and a successful pass should
         // reset the dial. After `maxConsecutiveFailures` we give up and

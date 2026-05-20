@@ -8,7 +8,7 @@ import XCTest
 @MainActor
 final class DaemonSessionServiceTests: XCTestCase {
     func testTranslateSchemaMismatch() {
-        let service = DaemonSessionService()
+        let service = LiveDaemonSessionService()
 
         let outcome = service.translateFailure(DaemonClientError.schemaMismatch(expected: 1, got: 99))
 
@@ -16,7 +16,7 @@ final class DaemonSessionServiceTests: XCTestCase {
     }
 
     func testTranslateSocketUnavailable() {
-        let service = DaemonSessionService()
+        let service = LiveDaemonSessionService()
 
         let outcome = service.translateFailure(DaemonClientError.socketUnavailable(path: "/tmp/x"))
 
@@ -24,7 +24,7 @@ final class DaemonSessionServiceTests: XCTestCase {
     }
 
     func testTranslateConnectionFailed() {
-        let service = DaemonSessionService()
+        let service = LiveDaemonSessionService()
         struct Boom: Error {}
 
         let outcome = service.translateFailure(DaemonClientError.connectionFailed(underlying: Boom()))
@@ -33,21 +33,21 @@ final class DaemonSessionServiceTests: XCTestCase {
     }
 
     func testTranslateLockContendedEnvelopeError() {
-        let service = DaemonSessionService()
+        let service = LiveDaemonSessionService()
         let error = DaemonClientError.envelopeError(code: DaemonErrorCode.lockContended, rawBody: Data())
 
         XCTAssertEqual(service.translateFailure(error), .lockContended)
     }
 
     func testTranslateNotOwnedByDaemonEnvelopeError() {
-        let service = DaemonSessionService()
+        let service = LiveDaemonSessionService()
         let error = DaemonClientError.envelopeError(code: DaemonErrorCode.notOwnedByDaemon, rawBody: Data())
 
         XCTAssertEqual(service.translateFailure(error), .lockContended)
     }
 
     func testTranslateOtherEnvelopeErrorCarriesLocalizedDescription() {
-        let service = DaemonSessionService()
+        let service = LiveDaemonSessionService()
         let error = DaemonClientError.envelopeError(code: "unexpected_code", rawBody: Data())
 
         guard case .other(let description) = service.translateFailure(error) else {
@@ -57,7 +57,7 @@ final class DaemonSessionServiceTests: XCTestCase {
     }
 
     func testTranslateUnknownErrorFallsThroughToOther() {
-        let service = DaemonSessionService()
+        let service = LiveDaemonSessionService()
         struct CustomError: Error, LocalizedError {
             var errorDescription: String? { "custom failure" }
         }

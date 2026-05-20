@@ -1,44 +1,32 @@
 import Foundation
 
+/// Result of a stop attempt. Returned by `StopPolicyCoordinator.runStop` and
+/// translated by the orchestrator into state transitions, `NSApp.reply`, and
+/// any SIGKILL / `lastError` updates.
+enum StopPolicyOutcome {
+    case sendSignalFailed(Error)
+    case completed
+    case timedOut
+}
+
 /// Orchestrates the stop policy: dispatch the stop signal, await the matching
-/// stderr/daemon event (`recording_finalized` for in-app Stop,
-/// `stopped` for Cmd+Q), and report the outcome. The orchestrator
-/// translates the outcome into state transitions, `NSApp.reply`, and any
-/// SIGKILL / `lastError` updates.
-///
-/// Owns the awaiting-continuation arrays and the timeout race; this is the
-/// single client of `waitForOneShot`, so the abstraction lives with it.
+/// stderr / daemon event (`recording_finalized` for in-app Stop, `stopped` for
+/// Cmd+Q), and report the outcome. Protocol seam so the orchestrator can
+/// inject a fast-resolving fake in tests without paying the real 30s / 300s
+/// timeout.
 @MainActor
-final class StopPolicyCoordinator {
-    enum Outcome {
-        case sendSignalFailed(Error)
-        case completed
-        case timedOut
-    }
+protocol StopPolicyCoordinator {
+    /// Flush any pending `recording_finalized` continuations. Called from the
+    /// state-machine `.resolveAwaiting(.finalized, success:)` effect.
+    func resolveFinalized(_ success: Bool)
 
-    /// Pending awaits keyed by event type. Resolved when the matching event
-    /// arrives or when the timeout fires.
-    private var awaitingFinalized: [(Bool) -> Void] = []
-    private var awaitingStopped: [(Bool) -> Void] = []
-
-    /// Called from the state-machine `.resolveAwaiting(.finalized, success:)`
-    /// effect. Flushes any pending finalized-await continuations.
-    func resolveFinalized(_ success: Bool) {
-        drainResumes(into: \.awaitingFinalized, value: success)
-    }
-
-    /// Called from the state-machine `.resolveAwaiting(.stopped, success:)`
-    /// effect. Flushes any pending stopped-await continuations.
-    func resolveStopped(_ success: Bool) {
-        drainResumes(into: \.awaitingStopped, value: success)
-    }
+    /// Flush any pending `stopped` continuations. Called from the state-machine
+    /// `.resolveAwaiting(.stopped, success:)` effect.
+    func resolveStopped(_ success: Bool)
 
     /// Resolve every pending continuation with `false`. Use on tear-down so
     /// callers cannot deadlock.
-    func cancelAll() {
-        drainResumes(into: \.awaitingFinalized, value: false)
-        drainResumes(into: \.awaitingStopped, value: false)
-    }
+    func cancelAll()
 
     /// Runs the stop policy. The orchestrator picks `sendStopSignal` per
     /// transport (`CLIClient.runDetached(["stop"])` vs
@@ -55,10 +43,58 @@ final class StopPolicyCoordinator {
     ///     orchestrator can update `quitProgressSecondsRemaining`.
     func runStop(
         quitting: Bool,
+        timeout: TimeInterval?,
+        sendStopSignal: () async throws -> Void,
+        onTickQuitProgress: @escaping @MainActor (Int) async -> Void
+    ) async -> StopPolicyOutcome
+}
+
+extension StopPolicyCoordinator {
+    /// Convenience overload: defaults `timeout` to nil (production values) and
+    /// `onTickQuitProgress` to a no-op. Lets production callers (and tests
+    /// that don't care about the countdown) call `runStop(quitting:sendStopSignal:)`.
+    func runStop(
+        quitting: Bool,
+        sendStopSignal: () async throws -> Void
+    ) async -> StopPolicyOutcome {
+        await runStop(
+            quitting: quitting,
+            timeout: nil,
+            sendStopSignal: sendStopSignal,
+            onTickQuitProgress: { _ in }
+        )
+    }
+}
+
+/// Live implementation backed by `withCheckedContinuation` + `Task.sleep`.
+/// Owns the awaiting-continuation arrays and the timeout race; this is the
+/// single client of `waitForOneShot`, so the abstraction lives with it.
+@MainActor
+final class LiveStopPolicyCoordinator: StopPolicyCoordinator {
+    /// Pending awaits keyed by event type. Resolved when the matching event
+    /// arrives or when the timeout fires.
+    private var awaitingFinalized: [(Bool) -> Void] = []
+    private var awaitingStopped: [(Bool) -> Void] = []
+
+    func resolveFinalized(_ success: Bool) {
+        drainResumes(into: \.awaitingFinalized, value: success)
+    }
+
+    func resolveStopped(_ success: Bool) {
+        drainResumes(into: \.awaitingStopped, value: success)
+    }
+
+    func cancelAll() {
+        drainResumes(into: \.awaitingFinalized, value: false)
+        drainResumes(into: \.awaitingStopped, value: false)
+    }
+
+    func runStop(
+        quitting: Bool,
         timeout: TimeInterval? = nil,
         sendStopSignal: () async throws -> Void,
         onTickQuitProgress: @escaping @MainActor (Int) async -> Void = { _ in }
-    ) async -> Outcome {
+    ) async -> StopPolicyOutcome {
         do {
             try await sendStopSignal()
         } catch {
@@ -89,7 +125,7 @@ final class StopPolicyCoordinator {
     }
 
     private func drainResumes(
-        into keyPath: ReferenceWritableKeyPath<StopPolicyCoordinator, [(Bool) -> Void]>,
+        into keyPath: ReferenceWritableKeyPath<LiveStopPolicyCoordinator, [(Bool) -> Void]>,
         value: Bool
     ) {
         let resumes = self[keyPath: keyPath]
@@ -98,7 +134,7 @@ final class StopPolicyCoordinator {
     }
 
     private func waitForOneShot(
-        into keyPath: ReferenceWritableKeyPath<StopPolicyCoordinator, [(Bool) -> Void]>,
+        into keyPath: ReferenceWritableKeyPath<LiveStopPolicyCoordinator, [(Bool) -> Void]>,
         timeout: TimeInterval,
         tickQuitProgress: (@MainActor (Int) async -> Void)?
     ) async -> Bool {
@@ -141,9 +177,10 @@ final class StopPolicyCoordinator {
 }
 
 #if DEBUG
-extension StopPolicyCoordinator.Outcome {
-    /// Test-only conveniences. Production code switches on `Outcome` exhaustively;
-    /// these computed helpers exist for terser assertions in XCTest cases.
+extension StopPolicyOutcome {
+    /// Test-only conveniences. Production code switches on `StopPolicyOutcome`
+    /// exhaustively; these computed helpers exist for terser assertions in
+    /// XCTest cases.
     var isCompleted: Bool { if case .completed = self { return true }; return false }
     var isTimedOut: Bool { if case .timedOut = self { return true }; return false }
     var sendSignalError: Error? {

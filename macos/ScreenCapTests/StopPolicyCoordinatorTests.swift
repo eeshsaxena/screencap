@@ -10,7 +10,7 @@ final class StopPolicyCoordinatorTests: XCTestCase {
     // MARK: - Happy paths
 
     func testInAppStopResolvesWhenFinalizedFires() async {
-        let coordinator = StopPolicyCoordinator()
+        let coordinator = LiveStopPolicyCoordinator()
 
         Task { @MainActor in
             // Give runStop a moment to register its continuation.
@@ -28,7 +28,7 @@ final class StopPolicyCoordinatorTests: XCTestCase {
     }
 
     func testCmdQStopResolvesWhenStoppedFires() async {
-        let coordinator = StopPolicyCoordinator()
+        let coordinator = LiveStopPolicyCoordinator()
 
         Task { @MainActor in
             try? await Task.sleep(nanoseconds: 20_000_000)
@@ -47,7 +47,7 @@ final class StopPolicyCoordinatorTests: XCTestCase {
     // MARK: - Timeouts
 
     func testInAppStopTimesOutWhenFinalizedNeverFires() async {
-        let coordinator = StopPolicyCoordinator()
+        let coordinator = LiveStopPolicyCoordinator()
 
         let outcome = await coordinator.runStop(
             quitting: false,
@@ -59,7 +59,7 @@ final class StopPolicyCoordinatorTests: XCTestCase {
     }
 
     func testCmdQStopTimesOutWhenStoppedNeverFires() async {
-        let coordinator = StopPolicyCoordinator()
+        let coordinator = LiveStopPolicyCoordinator()
 
         let outcome = await coordinator.runStop(
             quitting: true,
@@ -73,7 +73,7 @@ final class StopPolicyCoordinatorTests: XCTestCase {
     // MARK: - Stop signal dispatch errors
 
     func testStopSignalFailurePreventsAwaitAndReportsError() async {
-        let coordinator = StopPolicyCoordinator()
+        let coordinator = LiveStopPolicyCoordinator()
 
         let outcome = await coordinator.runStop(
             quitting: false,
@@ -88,7 +88,7 @@ final class StopPolicyCoordinatorTests: XCTestCase {
     }
 
     func testStopSignalFailureReturnsBeforeTimeoutDuration() async {
-        let coordinator = StopPolicyCoordinator()
+        let coordinator = LiveStopPolicyCoordinator()
         let start = Date()
 
         _ = await coordinator.runStop(
@@ -104,7 +104,7 @@ final class StopPolicyCoordinatorTests: XCTestCase {
     // MARK: - Resolve cancels timeout sleep
 
     func testResolveBeforeTimeoutCancelsTheTimeoutSleep() async {
-        let coordinator = StopPolicyCoordinator()
+        let coordinator = LiveStopPolicyCoordinator()
         let start = Date()
 
         Task { @MainActor in
@@ -126,7 +126,7 @@ final class StopPolicyCoordinatorTests: XCTestCase {
     // MARK: - Cmd+Q countdown observer
 
     func testCmdQOnTickQuitProgressFiresWhileWaiting() async {
-        let coordinator = StopPolicyCoordinator()
+        let coordinator = LiveStopPolicyCoordinator()
         var ticks: [Int] = []
 
         Task { @MainActor in
@@ -151,7 +151,7 @@ final class StopPolicyCoordinatorTests: XCTestCase {
     // MARK: - cancelAll drains pending continuations
 
     func testCancelAllDrainsPendingContinuationsAsFailure() async {
-        let coordinator = StopPolicyCoordinator()
+        let coordinator = LiveStopPolicyCoordinator()
 
         Task { @MainActor in
             try? await Task.sleep(nanoseconds: 30_000_000)
@@ -174,7 +174,7 @@ final class StopPolicyCoordinatorTests: XCTestCase {
     /// `awaitingStopped`). `cancelAll` must drain both queues — neither
     /// caller should hang on a continuation the coordinator dropped.
     func testCancelAllDrainsFinalizedAndStoppedQueuesSimultaneously() async {
-        let coordinator = StopPolicyCoordinator()
+        let coordinator = LiveStopPolicyCoordinator()
 
         // Launch two concurrent stops on the two different queues.
         async let inAppOutcome = coordinator.runStop(

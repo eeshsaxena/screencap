@@ -101,7 +101,7 @@ final class RecorderController: ObservableObject {
     private let alertPresenter: RecorderAlertPresenter
     private let cliService: CLIRecorderService
     private let daemonService: DaemonSessionService
-    private let stopPolicy = StopPolicyCoordinator()
+    private let stopPolicy: StopPolicyCoordinator
 
     private var daemonEventTask: Task<Void, Never>?
     private var elapsedTimer: Timer?
@@ -119,12 +119,14 @@ final class RecorderController: ObservableObject {
         watchdog: PermissionWatchdog = LivePermissionWatchdog(),
         alertPresenter: RecorderAlertPresenter = LiveRecorderAlertPresenter(),
         cliService: CLIRecorderService = LiveCLIRecorderService(),
-        daemonService: DaemonSessionService = DaemonSessionService()
+        daemonService: DaemonSessionService = LiveDaemonSessionService(),
+        stopPolicy: StopPolicyCoordinator = LiveStopPolicyCoordinator()
     ) {
         self.watchdog = watchdog
         self.alertPresenter = alertPresenter
         self.cliService = cliService
         self.daemonService = daemonService
+        self.stopPolicy = stopPolicy
         daemonInstalledObserver = NotificationCenter.default.addObserver(
             forName: .screenCapDaemonInstalledAndRunning,
             object: nil,
@@ -349,6 +351,7 @@ final class RecorderController: ObservableObject {
         let isDaemon = transport == .daemon
         let outcome = await stopPolicy.runStop(
             quitting: quitting,
+            timeout: nil,
             sendStopSignal: { [daemonService, isDaemon] in
                 if isDaemon {
                     try await daemonService.stopRecording(force: false)
@@ -467,7 +470,7 @@ final class RecorderController: ObservableObject {
         }
     }
 
-    private func applyDaemonStreamOutcome(_ outcome: DaemonSessionService.AttachOutcome) {
+    private func applyDaemonStreamOutcome(_ outcome: DaemonSession.AttachOutcome) {
         switch outcome {
         case .shutdown:
             return
@@ -498,7 +501,7 @@ final class RecorderController: ObservableObject {
     }
 
     private func applyDaemonFailureOutcome(
-        _ outcome: DaemonSessionService.FailureOutcome,
+        _ outcome: DaemonSession.FailureOutcome,
         fallback: (() -> Void)? = nil
     ) {
         switch outcome {
