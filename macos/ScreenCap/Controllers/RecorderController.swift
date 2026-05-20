@@ -139,10 +139,14 @@ final class RecorderController: ObservableObject {
     deinit {
         daemonEventTask?.cancel()
         elapsedTimer?.invalidate()
-        // Drain any in-flight stop-policy continuations so callers awaiting
-        // `runStop(...)` can't deadlock on a coordinator whose owner is
-        // being deallocated. `cancelAll` is idempotent on an empty queue.
-        stopPolicy.cancelAll()
+        // No `stopPolicy.cancelAll()` here: `cancelAll` is `@MainActor` and
+        // `deinit` is nonisolated, so the synchronous call won't compile under
+        // strict concurrency. The drain is also unnecessary — every in-flight
+        // `runStop` is launched via `Task { await self.runStop(...) }` which
+        // captures `self` strongly, so `deinit` cannot fire while a stop is
+        // suspended on the coordinator. The 30s / 300s timeout in
+        // `StopPolicyCoordinator.waitForOneShot` is the cancellation backstop
+        // for any other corner case.
         if let daemonInstalledObserver {
             NotificationCenter.default.removeObserver(daemonInstalledObserver)
         }
