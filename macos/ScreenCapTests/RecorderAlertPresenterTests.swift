@@ -22,6 +22,7 @@ final class RecorderAlertPresenterTests: XCTestCase {
         presenter.presentPermissionLost(permission: "Screen Recording") { opened = true }
 
         XCTAssertTrue(opened)
+        XCTAssertEqual(presenter.lastPermissionPresented, "Screen Recording")
     }
 
     func testFakePresenterSkipsOpenSettingsWhenDismissed() {
@@ -31,6 +32,7 @@ final class RecorderAlertPresenterTests: XCTestCase {
         presenter.presentPermissionLost(permission: "Screen Recording") { opened = true }
 
         XCTAssertFalse(opened)
+        XCTAssertEqual(presenter.lastPermissionPresented, "Screen Recording")
     }
 }
 

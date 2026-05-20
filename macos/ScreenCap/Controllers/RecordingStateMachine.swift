@@ -7,13 +7,6 @@ private let stateMachineLogger = Logger(subsystem: "com.screencap.macos", catego
 /// constant published by `src/screencap/_stderr_events.py`.
 let SUPPORTED_EVENT_SCHEMA_VERSION = 1
 
-/// Wire-level daemon envelope error codes the controller branches on.
-/// Mirrors `src/screencap/daemon/errors.py`'s string constants.
-enum DaemonErrorCode {
-    static let lockContended = "lock_contended"
-    static let notOwnedByDaemon = "not_owned_by_daemon"
-}
-
 /// State machine for the recording lifecycle. Mirrors the stderr event contract
 /// from `src/screencap/_stderr_events.py` (Unit 8a).
 enum RecordingState: Equatable {
@@ -51,10 +44,16 @@ struct RecordingStateMachine {
 
     /// Side-effects emitted by state transitions. The controller drains the
     /// effect list and routes each value to the appropriate collaborator.
+    ///
+    /// Note: starting the permission watchdog is intentionally not modelled as
+    /// an effect because the orchestrator must gate on `transport == .cliFallback`
+    /// before arming — a check the pure state machine has no visibility into.
+    /// The orchestrator therefore arms the watchdog imperatively at each
+    /// transport-aware callsite (start/CLI fallback paths). Stopping the
+    /// watchdog *is* an effect because it is unconditional on transport.
     enum Effect: Equatable {
         case startElapsedTimer
         case stopElapsedTimer
-        case startPermissionWatchdog
         case stopPermissionWatchdog
         case resolveAwaiting(AwaitKind, success: Bool)
         case surfaceError(String)
@@ -69,8 +68,21 @@ struct RecordingStateMachine {
     /// are keyed to the start-response boundary (which precedes `started`)
     /// instead of the later `session.snapshot` cursor. Kept until we observe a
     /// start outcome, so a dropped initial stream cannot skip the boundary.
-    var pendingStartCursor: Int?
+    private(set) var pendingStartCursor: Int?
     private(set) var recordingStartedAt: Date?
+
+    /// Set the start-response cursor from the orchestrator after a successful
+    /// `/v0/recording.start`. Kept as a named mutating method so the field
+    /// stays `private(set)` and writes are localised.
+    mutating func setPendingStartCursor(_ cursor: Int?) {
+        pendingStartCursor = cursor
+    }
+
+    /// Clear the start-response cursor when the daemon has evicted it from
+    /// the replay window (orchestrator must refetch from snapshot).
+    mutating func clearPendingStartCursor() {
+        pendingStartCursor = nil
+    }
 
     /// Transition `.idle → .starting`. No-op if already recording.
     mutating func enterStarting() -> [Effect] {
@@ -89,10 +101,28 @@ struct RecordingStateMachine {
     }
 
     /// Transition into a stopping state (in-app Stop or Cmd+Q).
+    ///
+    /// In-app stop (`quitting == false`) only fires from `.recording` —
+    /// pre-`.recording` states have no active engine to stop. Cmd+Q
+    /// (`quitting == true`) is broader: it must also work from `.starting`
+    /// (user hit Cmd+Q before the first `started` event arrived) and from
+    /// `.stopping(quitting: false)` (an in-app Stop was already in flight
+    /// when the user pressed Cmd+Q — the upgrade-to-quit path). Pre-refactor
+    /// this was a single unconditional assignment that didn't gate on the
+    /// source state at all; widening the guard restores that behavior for
+    /// the quit path while keeping in-app Stop narrow.
     mutating func enterStopping(quitting: Bool) -> [Effect] {
-        guard case .recording = state else { return [] }
-        state = .stopping(quitting: quitting)
-        return []
+        switch state {
+        case .recording:
+            state = .stopping(quitting: quitting)
+            return []
+        case .starting where quitting,
+             .stopping(quitting: false) where quitting:
+            state = .stopping(quitting: quitting)
+            return []
+        default:
+            return []
+        }
     }
 
     /// Stop was requested but the stop signal failed to dispatch. Restore the

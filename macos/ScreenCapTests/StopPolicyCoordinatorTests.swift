@@ -168,4 +168,35 @@ final class StopPolicyCoordinatorTests: XCTestCase {
         // coordinator translates into `.timedOut`.
         XCTAssertTrue(outcome.isTimedOut)
     }
+
+    /// Concurrent two-queue scenario: an in-app Stop and a Cmd+Q-style Stop
+    /// are both in flight (one on `awaitingFinalized`, the other on
+    /// `awaitingStopped`). `cancelAll` must drain both queues — neither
+    /// caller should hang on a continuation the coordinator dropped.
+    func testCancelAllDrainsFinalizedAndStoppedQueuesSimultaneously() async {
+        let coordinator = StopPolicyCoordinator()
+
+        // Launch two concurrent stops on the two different queues.
+        async let inAppOutcome = coordinator.runStop(
+            quitting: false,
+            timeout: 60.0,
+            sendStopSignal: { }
+        )
+        async let quitOutcome = coordinator.runStop(
+            quitting: true,
+            timeout: 60.0,
+            sendStopSignal: { }
+        )
+
+        Task { @MainActor in
+            // Give both runStop tasks a moment to register their continuations
+            // on the respective queues, then cancel both.
+            try? await Task.sleep(nanoseconds: 40_000_000)
+            coordinator.cancelAll()
+        }
+
+        let outcomes = await (inAppOutcome, quitOutcome)
+        XCTAssertTrue(outcomes.0.isTimedOut, "awaitingFinalized continuation must be drained")
+        XCTAssertTrue(outcomes.1.isTimedOut, "awaitingStopped continuation must be drained")
+    }
 }

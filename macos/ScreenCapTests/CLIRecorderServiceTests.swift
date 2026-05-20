@@ -66,4 +66,43 @@ final class CLIRecorderServiceTests: XCTestCase {
 
         XCTAssertEqual(event?.type, "newly_added_event")
     }
+
+    // MARK: - Spawn-failure surfacing (U4 contract)
+
+    /// Spawn-failure scenario: the service must rethrow so the orchestrator
+    /// can route to `transitionToIdle()` + surface the error, and the fake
+    /// must not retain a `currentProcess` reference (no recording is running).
+    @MainActor
+    func testSpawnFailureRethrowsAndLeavesCurrentProcessNil() {
+        let service = ThrowingFakeCLIRecorderService()
+
+        XCTAssertNil(service.currentProcess)
+        XCTAssertThrowsError(
+            try service.start(
+                args: ["start"],
+                onEvent: { _ in },
+                onTerminated: { _ in }
+            )
+        ) { error in
+            XCTAssertEqual((error as? ThrowingFakeCLIRecorderService.SpawnError), .spawnRefused)
+        }
+        XCTAssertNil(service.currentProcess, "spawn failure must not retain a currentProcess handle")
+    }
+}
+
+/// Test-only fake that throws on `start(...)` so the spawn-failure contract
+/// can be exercised without launching a real subprocess.
+@MainActor
+final class ThrowingFakeCLIRecorderService: CLIRecorderService {
+    enum SpawnError: Error, Equatable { case spawnRefused }
+
+    var currentProcess: CLIClient.SpawnedProcess? { nil }
+
+    func start(
+        args: [String],
+        onEvent: @escaping @MainActor @Sendable (RecorderEventLine) -> Void,
+        onTerminated: @escaping @MainActor @Sendable (Int32) -> Void
+    ) throws {
+        throw SpawnError.spawnRefused
+    }
 }

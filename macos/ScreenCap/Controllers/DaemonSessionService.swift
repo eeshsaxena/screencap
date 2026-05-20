@@ -3,6 +3,13 @@ import OSLog
 
 private let daemonSessionLogger = Logger(subsystem: "com.screencap.macos", category: "daemon-session")
 
+/// Wire-level daemon envelope error codes the controller branches on.
+/// Mirrors `src/screencap/daemon/errors.py`'s string constants.
+enum DaemonErrorCode {
+    static let lockContended = "lock_contended"
+    static let notOwnedByDaemon = "not_owned_by_daemon"
+}
+
 /// Daemon-backed recording lifecycle: probe, snapshot, start, stop, event
 /// stream, and the typed-failure translation that drives the orchestrator's
 /// transport fallback. Wraps `DaemonClient` so the orchestrator deals in
@@ -41,7 +48,7 @@ final class DaemonSessionService {
     /// service does not own `pendingStartCursor` or the recording state; it
     /// reads/clears them via these hooks so behavior matches the pre-extraction
     /// `consumeDaemonEvents`.
-    struct EventStreamCallbacks {
+    struct EventStreamCallbacks: Sendable {
         let onEvent: @MainActor (RecorderEventLine) -> Void
         let onTransientWarning: @MainActor (String) -> Void
         let getPendingStartCursor: @MainActor () -> Int?
@@ -95,6 +102,11 @@ final class DaemonSessionService {
         case DaemonClientError.schemaMismatch:
             return .schemaMismatch
         case DaemonClientError.socketUnavailable, DaemonClientError.connectionFailed:
+            // Log the underlying error description here because `FailureOutcome`
+            // collapses both transport-level failures into the same case and
+            // the orchestrator's CLI-fallback log line would otherwise drop
+            // the diagnostic detail (regressed log-content from pre-refactor).
+            daemonSessionLogger.info("Daemon transport failed; falling back to CLI. Error: \(String(describing: error), privacy: .public)")
             return .socketUnavailable
         case DaemonClientError.envelopeError(let code, _)
             where code == DaemonErrorCode.lockContended || code == DaemonErrorCode.notOwnedByDaemon:
@@ -104,15 +116,31 @@ final class DaemonSessionService {
         }
     }
 
-    /// Reload the daemon via `launchctl kickstart -kp`. Returns true on
-    /// successful kickstart.
-    func reload() async -> Bool {
+    /// Error returned by `reload()` so the orchestrator can build the
+    /// pre-refactor two-message split:
+    ///   - `spawnFailed(Error)`     → "Failed to reload ScreenCap daemon: <desc>"
+    ///   - `nonZeroExit(Int32, String?)` → "Failed to reload ScreenCap daemon."
+    /// The `String?` carries the captured launchctl stderr so callers
+    /// (or Console.app via OSLog) can surface "Could not find service" distinctly
+    /// from a generic non-zero exit.
+    enum ReloadError: Error {
+        case spawnFailed(Error)
+        case nonZeroExit(code: Int32, stderr: String?)
+    }
+
+    /// Reload the daemon via `launchctl kickstart -kp`. Returns `.success`
+    /// on a clean kickstart, `.failure(.spawnFailed)` if the subprocess
+    /// could not launch, and `.failure(.nonZeroExit)` if launchctl returned
+    /// a non-zero status (carries stderr for actionable diagnostics — the
+    /// headless / no-LaunchAgent case prints "Could not find service…" here).
+    func reload() async -> Result<Void, ReloadError> {
         let process = Process()
         process.executableURL = URL(fileURLWithPath: "/bin/launchctl")
         process.arguments = ["kickstart", "-kp", "gui/\(getuid())/com.screencap.daemon"]
         process.standardInput = FileHandle.nullDevice
         process.standardOutput = Pipe()
-        process.standardError = Pipe()
+        let stderrPipe = Pipe()
+        process.standardError = stderrPipe
         do {
             try process.run()
             await withCheckedContinuation { (continuation: CheckedContinuation<Void, Never>) in
@@ -121,9 +149,21 @@ final class DaemonSessionService {
                     continuation.resume()
                 }
             }
-            return process.terminationStatus == 0
+            if process.terminationStatus == 0 {
+                return .success(())
+            }
+            let stderrData = try? stderrPipe.fileHandleForReading.readToEnd()
+            let stderrString = stderrData.flatMap { String(data: $0, encoding: .utf8) }?
+                .trimmingCharacters(in: .whitespacesAndNewlines)
+            if let stderrString, !stderrString.isEmpty {
+                daemonSessionLogger.info("launchctl kickstart failed (exit \(process.terminationStatus, privacy: .public)): \(stderrString, privacy: .public)")
+            }
+            return .failure(.nonZeroExit(
+                code: process.terminationStatus,
+                stderr: stderrString?.isEmpty == false ? stderrString : nil
+            ))
         } catch {
-            return false
+            return .failure(.spawnFailed(error))
         }
     }
 
@@ -137,7 +177,10 @@ final class DaemonSessionService {
         // Capped exponential backoff for reconnects: a flat 100ms sleep would
         // hammer a daemon that is genuinely down, and a successful pass should
         // reset the dial. After `maxConsecutiveFailures` we give up and
-        // surface the loss to the UI so the user can act.
+        // surface the loss to the UI so the user can act. The 10-failure
+        // budget covers transient transport errors *and* snapshot-fetch
+        // errors — both can recover across a daemon restart, so a single
+        // failure should not tear down the recording.
         var consecutiveFailures = 0
         let maxConsecutiveFailures = 10
         let baseBackoff: TimeInterval = 0.1
@@ -145,8 +188,32 @@ final class DaemonSessionService {
 
         while !Task.isCancelled, callbacks.isRecording() {
             var sawProgress = false
+
+            // Snapshot fetch is in its own do/catch so a transient snapshot
+            // failure doesn't fall through to the catch-all `.fatalError`
+            // branch on the subscribe block. Pre-refactor `consumeDaemonEvents`
+            // tolerated 10 consecutive snapshot errors before giving up; we
+            // restore that here by counting them against the same budget as
+            // stream drops.
+            let snapshot: SessionSnapshotResponse
             do {
-                let snapshot = try await DaemonClient.sessionSnapshot()
+                snapshot = try await DaemonClient.sessionSnapshot()
+            } catch {
+                if Task.isCancelled { return .shutdown }
+                daemonSessionLogger.info("Daemon snapshot failed; will retry. Error: \(String(describing: error), privacy: .public)")
+                consecutiveFailures += 1
+                if consecutiveFailures >= maxConsecutiveFailures {
+                    return .lostContact
+                }
+                if callbacks.isRecording() {
+                    let attempt = max(0, consecutiveFailures - 1)
+                    let backoff = min(baseBackoff * pow(2.0, Double(attempt)), cappedBackoff)
+                    try? await Task.sleep(nanoseconds: UInt64(backoff * 1_000_000_000))
+                }
+                continue
+            }
+
+            do {
                 if snapshot.isRecording == true, snapshot.daemonOwned == false {
                     return .foreignClaimant
                 }
@@ -185,9 +252,20 @@ final class DaemonSessionService {
                 // The requested cursor was evicted from the daemon's replay
                 // window between snapshot and subscribe. Refetch the snapshot
                 // and resubscribe with a fresh cursor; leave state intact so
-                // the UI does not flicker to `.idle`.
+                // the UI does not flicker to `.idle`. Count this against the
+                // failure budget and apply backoff so a persistently mismatched
+                // replay window cannot become an infinite hot loop.
                 callbacks.clearPendingStartCursor()
                 daemonSessionLogger.info("Daemon event stream evicted cursor; refetching snapshot.")
+                consecutiveFailures += 1
+                if consecutiveFailures >= maxConsecutiveFailures {
+                    return .lostContact
+                }
+                if callbacks.isRecording() {
+                    let attempt = max(0, consecutiveFailures - 1)
+                    let backoff = min(baseBackoff * pow(2.0, Double(attempt)), cappedBackoff)
+                    try? await Task.sleep(nanoseconds: UInt64(backoff * 1_000_000_000))
+                }
                 continue
             } catch {
                 if Task.isCancelled { return .shutdown }

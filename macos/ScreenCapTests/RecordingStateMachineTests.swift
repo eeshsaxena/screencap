@@ -88,7 +88,7 @@ final class RecordingStateMachineTests: XCTestCase {
 
     func testForceStateToIdleClearsLedgerFields() {
         var machine = RecordingStateMachine()
-        machine.pendingStartCursor = 42
+        machine.setPendingStartCursor(42)
         _ = machine.observeActiveDaemonSession(startedAt: Date(), now: Date())
 
         machine.forceState(.idle)
@@ -102,7 +102,7 @@ final class RecordingStateMachineTests: XCTestCase {
 
     func testStartedEventFromStartingTransitionsToRecording() {
         var machine = RecordingStateMachine()
-        machine.pendingStartCursor = 7
+        machine.setPendingStartCursor(7)
         _ = machine.enterStarting()
 
         let now = Date(timeIntervalSince1970: 200)
@@ -158,7 +158,7 @@ final class RecordingStateMachineTests: XCTestCase {
 
     func testRecordingFailedTransitionsToIdleAndResolvesAwaits() {
         var machine = RecordingStateMachine()
-        machine.pendingStartCursor = 9
+        machine.setPendingStartCursor(9)
         _ = machine.enterStarting()
 
         let effects = machine.handle(event: event(type: "recording_failed", reason: "engine crashed"))
@@ -295,10 +295,12 @@ final class RecordingStateMachineTests: XCTestCase {
             let effects = machine.processTerminated(exitCode: exitCode)
 
             XCTAssertEqual(machine.state, .idle, "exit code \(exitCode) should idle")
-            XCTAssertFalse(
-                effects.contains(where: { if case .surfaceError = $0 { return true }; return false }),
-                "exit code \(exitCode) should not surface error"
-            )
+            XCTAssertEqual(effects, [
+                .stopElapsedTimer,
+                .stopPermissionWatchdog,
+                .resolveAwaiting(.finalized, success: false),
+                .resolveAwaiting(.stopped, success: false),
+            ], "exit code \(exitCode) should match graceful-exit effect list")
         }
     }
 

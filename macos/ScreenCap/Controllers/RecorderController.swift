@@ -139,6 +139,10 @@ final class RecorderController: ObservableObject {
     deinit {
         daemonEventTask?.cancel()
         elapsedTimer?.invalidate()
+        // Drain any in-flight stop-policy continuations so callers awaiting
+        // `runStop(...)` can't deadlock on a coordinator whose owner is
+        // being deallocated. `cancelAll` is idempotent on an empty queue.
+        stopPolicy.cancelAll()
         if let daemonInstalledObserver {
             NotificationCenter.default.removeObserver(daemonInstalledObserver)
         }
@@ -199,10 +203,18 @@ final class RecorderController: ObservableObject {
     }
 
     func reloadDaemon() async {
-        if await daemonService.reload() {
+        switch await daemonService.reload() {
+        case .success:
             schemaMismatchDetected = false
             await probeDaemon()
-        } else {
+        case .failure(.spawnFailed(let error)):
+            // Pre-refactor: launchctl process never launched — include the
+            // localized description so the user sees an actionable message.
+            lastError = "Failed to reload ScreenCap daemon: \(error.localizedDescription)"
+        case .failure(.nonZeroExit):
+            // Pre-refactor: launchctl ran but returned non-zero. The stderr
+            // detail is logged inside `reload()`; surface the same terse
+            // user-facing string.
             lastError = "Failed to reload ScreenCap daemon."
         }
     }
@@ -232,6 +244,9 @@ final class RecorderController: ObservableObject {
                     self?.handleProcessTerminated(exitCode: exitCode)
                 }
             )
+            // Watchdog is armed imperatively (not via the effect channel)
+            // because it must be gated on transport == .cliFallback; the pure
+            // state machine has no visibility into transport.
             startPermissionWatchdog()
         } catch {
             transitionToIdle()
@@ -242,7 +257,7 @@ final class RecorderController: ObservableObject {
     private func startViaDaemon(name: String? = nil) async {
         do {
             let cursor = try await daemonService.startRecording(name: name)
-            machine.pendingStartCursor = cursor
+            machine.setPendingStartCursor(cursor)
             attachDaemonEventStream()
             // Same rationale as syncDaemonSnapshot: on the daemon transport
             // the watchdog's check is a guarded no-op, so don't arm it.
@@ -277,11 +292,15 @@ final class RecorderController: ObservableObject {
     func confirmQuitWhileRecording() -> NSApplication.TerminateReply {
         guard state.isRecording else { return .terminateNow }
 
-        // Re-entry while a Cmd+Q quit is already in flight: do not stack a
-        // second modal or dispatch a second runStop. The in-flight task will
-        // eventually call `NSApp.reply(toApplicationShouldTerminate:)` —
-        // telling AppKit `.terminateLater` again is the correct hold reply.
-        if case .stopping(quitting: true) = state {
+        // Re-entry while any stop is already in flight: do not stack a second
+        // modal or dispatch a second runStop. This covers both `.stopping(quitting: true)`
+        // (a prior Cmd+Q in flight) and `.stopping(quitting: false)` (in-app
+        // Stop already running when the user pressed Cmd+Q — the upgrade
+        // path is owned by enterStopping(quitting: true) below if reached
+        // via a different code path; here we hold AppKit so the in-flight
+        // task can drive the eventual `NSApp.reply(toApplicationShouldTerminate:)`).
+        // Telling AppKit `.terminateLater` is the correct hold reply.
+        if case .stopping = state {
             return .terminateLater
         }
 
@@ -318,10 +337,15 @@ final class RecorderController: ObservableObject {
     /// "may still be running" message instead) and let
     /// `.upload_followup.json` surface on next launch.
     private func runStop(quitting: Bool) async {
+        // Snapshot the transport at task entry. The send-signal closure must
+        // also dispatch against the same transport even if `transport` flips
+        // mid-await (e.g. the daemon event stream tore down to .cliFallback
+        // while the user's stop was in flight) — otherwise we'd send the
+        // stop signal to a transport that doesn't own the recording.
         let isDaemon = transport == .daemon
         let outcome = await stopPolicy.runStop(
             quitting: quitting,
-            sendStopSignal: { [daemonService] in
+            sendStopSignal: { [daemonService, isDaemon] in
                 if isDaemon {
                     try await daemonService.stopRecording(force: false)
                 } else {
@@ -401,8 +425,6 @@ final class RecorderController: ObservableObject {
             case .stopElapsedTimer:
                 elapsedTimer?.invalidate()
                 elapsedTimer = nil
-            case .startPermissionWatchdog:
-                startPermissionWatchdog()
             case .stopPermissionWatchdog:
                 stopPermissionWatchdog()
             case .resolveAwaiting(.finalized, let success):
@@ -433,7 +455,7 @@ final class RecorderController: ObservableObject {
                     onEvent: { [weak self] event in self?.handleRecorderEvent(event) },
                     onTransientWarning: { [weak self] message in self?.lastError = message },
                     getPendingStartCursor: { [weak self] in self?.machine.pendingStartCursor },
-                    clearPendingStartCursor: { [weak self] in self?.machine.pendingStartCursor = nil },
+                    clearPendingStartCursor: { [weak self] in self?.machine.clearPendingStartCursor() },
                     isRecording: { [weak self] in self?.state.isRecording ?? false }
                 )
             )
@@ -482,7 +504,9 @@ final class RecorderController: ObservableObject {
             transitionToIdle()
             lastError = "ScreenCap daemon needs to reload."
         case .socketUnavailable:
-            recorderLogger.info("Daemon transport failed; falling back to CLI.")
+            // The underlying error description is logged inside
+            // `DaemonSessionService.translateFailure` before the typed
+            // outcome strips it; we only emit the typed transition here.
             transport = .cliFallback
             // Without resetting `state`, a failed start leaves the controller
             // stuck in `.starting`; surface the failure to the user and clear

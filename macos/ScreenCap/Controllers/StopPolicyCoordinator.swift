@@ -14,13 +14,6 @@ final class StopPolicyCoordinator {
         case sendSignalFailed(Error)
         case completed
         case timedOut
-
-        var isCompleted: Bool { if case .completed = self { return true }; return false }
-        var isTimedOut: Bool { if case .timedOut = self { return true }; return false }
-        var sendSignalError: Error? {
-            if case .sendSignalFailed(let error) = self { return error }
-            return nil
-        }
     }
 
     /// Pending awaits keyed by event type. Resolved when the matching event
@@ -146,3 +139,16 @@ final class StopPolicyCoordinator {
         }
     }
 }
+
+#if DEBUG
+extension StopPolicyCoordinator.Outcome {
+    /// Test-only conveniences. Production code switches on `Outcome` exhaustively;
+    /// these computed helpers exist for terser assertions in XCTest cases.
+    var isCompleted: Bool { if case .completed = self { return true }; return false }
+    var isTimedOut: Bool { if case .timedOut = self { return true }; return false }
+    var sendSignalError: Error? {
+        if case .sendSignalFailed(let error) = self { return error }
+        return nil
+    }
+}
+#endif
