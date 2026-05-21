@@ -39,7 +39,7 @@ curl -sSfL https://get.screencap.sh | SCREENCAP_VERSION=0.2.0 sh
 ### From source
 
 ```bash
-git clone https://github.com/Divide-By-0/screencap.git
+git clone https://github.com/proteus-computer-use/screencap.git
 cd screencap
 pip install .
 
@@ -476,4 +476,7 @@ pytest tests/ -v --cov
 
 ## License
 
-MIT
+ScreenCap is dual-licensed:
+
+- **Open source:** GNU Affero General Public License v3.0 or later (AGPL-3.0-or-later). See [`LICENSE`](LICENSE). If you use, modify, or offer ScreenCap as a network service, you must release your modifications under the same license.
+- **Commercial:** If the AGPL terms don't fit your use case (e.g. embedding ScreenCap in a closed-source product or offering it as a hosted service without source disclosure), a commercial license is available. Email aayushgupta5000@gmail.com.

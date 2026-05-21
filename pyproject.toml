@@ -7,7 +7,7 @@ name = "screencap"
 version = "0.19.0"
 description = "macOS CLI for screen capture"
 requires-python = ">=3.10"
-license = "MIT"
+license = "AGPL-3.0-or-later"
 dependencies = [
     "click>=8.0",
     "rich>=13.0",
