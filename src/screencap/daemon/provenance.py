@@ -27,6 +27,7 @@ from __future__ import annotations
 import ctypes
 import logging
 from ctypes import c_int, c_size_t, c_uint, c_void_p
+from dataclasses import dataclass
 
 logger = logging.getLogger(__name__)
 
@@ -234,24 +235,37 @@ def classify_path_and_argv(path: str | None, argv: list[str]) -> str:
     return STARTED_BY_UNKNOWN
 
 
-def derive_started_by(sock_fd: int) -> str:
-    """Resolve ``started_by`` from the peer socket.
+@dataclass(frozen=True)
+class PeerDescriptor:
+    """Snapshot of a peer's identity at request time.
 
-    Returns one of ``swiftui`` / ``cli`` / ``mcp`` / ``unknown``. Never
-    raises — diagnostic failures collapse to ``unknown``.
+    All three fields collapse to ``None`` / ``unknown`` when probing
+    fails — callers must treat partial population as the norm, not the
+    exception. The descriptor stays advisory: the EUID match in
+    ``socket.PeerCheckingUnixSocket`` remains the authentication gate.
+    """
 
-    Caller passes the file descriptor of the accepted UNIX socket. The
-    function does not assume any particular ASGI/Starlette shape; it
-    just needs an ``int`` fd.
+    pid: int | None
+    path: str | None
+    classification: str
+
+
+_UNKNOWN_PEER = PeerDescriptor(pid=None, path=None, classification=STARTED_BY_UNKNOWN)
+
+
+def derive_peer_descriptor(sock_fd: int) -> PeerDescriptor:
+    """Resolve a full peer descriptor (pid, path, classification) from a
+    socket fd. Never raises — diagnostic failures collapse to the
+    ``unknown`` descriptor.
     """
     try:
         pid = _get_peer_pid(sock_fd)
     except Exception:  # noqa: BLE001
-        logger.debug("derive_started_by: getsockopt failed", exc_info=True)
-        return STARTED_BY_UNKNOWN
+        logger.debug("derive_peer_descriptor: getsockopt failed", exc_info=True)
+        return _UNKNOWN_PEER
 
     if pid is None or pid <= 0:
-        return STARTED_BY_UNKNOWN
+        return _UNKNOWN_PEER
 
     try:
         path = _get_proc_path(pid)
@@ -263,7 +277,24 @@ def derive_started_by(sock_fd: int) -> str:
     except Exception:  # noqa: BLE001
         argv = []
 
-    return classify_path_and_argv(path, argv)
+    return PeerDescriptor(
+        pid=pid,
+        path=path,
+        classification=classify_path_and_argv(path, argv),
+    )
+
+
+def derive_started_by(sock_fd: int) -> str:
+    """Resolve ``started_by`` from the peer socket.
+
+    Returns one of ``swiftui`` / ``cli`` / ``mcp`` / ``unknown``. Never
+    raises — diagnostic failures collapse to ``unknown``.
+
+    Caller passes the file descriptor of the accepted UNIX socket. The
+    function does not assume any particular ASGI/Starlette shape; it
+    just needs an ``int`` fd.
+    """
+    return derive_peer_descriptor(sock_fd).classification
 
 
 def _peer_fd_from_asgi_scope(scope: dict) -> int | None:
@@ -298,6 +329,17 @@ def _peer_fd_from_asgi_scope(scope: dict) -> int | None:
         return None
 
 
+def derive_peer_descriptor_from_asgi_scope(scope: dict) -> PeerDescriptor:
+    """Resolve the full peer descriptor from a Starlette/uvicorn ASGI
+    request scope. Returns the ``unknown`` descriptor when the underlying
+    socket is not reachable through the scope on this uvicorn version.
+    """
+    fd = _peer_fd_from_asgi_scope(scope)
+    if fd is None:
+        return _UNKNOWN_PEER
+    return derive_peer_descriptor(fd)
+
+
 def derive_started_by_from_asgi_scope(scope: dict) -> str:
     """Resolve ``started_by`` from a Starlette/uvicorn ASGI request scope.
 
@@ -305,10 +347,7 @@ def derive_started_by_from_asgi_scope(scope: dict) -> str:
     through the scope on this uvicorn version — the API surface is
     advisory and the EUID match from Phase 1 remains the auth gate.
     """
-    fd = _peer_fd_from_asgi_scope(scope)
-    if fd is None:
-        return STARTED_BY_UNKNOWN
-    return derive_started_by(fd)
+    return derive_peer_descriptor_from_asgi_scope(scope).classification
 
 
 __all__ = [
@@ -316,7 +355,10 @@ __all__ = [
     "STARTED_BY_CLI",
     "STARTED_BY_MCP",
     "STARTED_BY_UNKNOWN",
+    "PeerDescriptor",
     "classify_path_and_argv",
+    "derive_peer_descriptor",
+    "derive_peer_descriptor_from_asgi_scope",
     "derive_started_by",
     "derive_started_by_from_asgi_scope",
 ]
