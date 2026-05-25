@@ -39,6 +39,14 @@ class RogueFileAtSocketPath(DaemonSocketError):
     """Raised when a non-socket occupies the configured socket path."""
 
 
+class SocketPermsDrift(DaemonSocketError):
+    """Raised when the socket or its parent directory deviates from the
+    expected mode at bind time. Defends against umask races, accidental
+    ``chmod`` post-install, and tampered run-dirs by refusing to listen
+    over a leaky socket.
+    """
+
+
 def default_socket_path() -> Path:
     return Path.home() / ".screencap" / "run" / "api.sock"
 
@@ -70,6 +78,44 @@ def cleanup_socket(path: str | Path) -> None:
 def _ensure_socket_directory(path: Path) -> None:
     path.parent.mkdir(parents=True, exist_ok=True)
     os.chmod(path.parent, 0o700)
+
+
+_EXPECTED_PARENT_MODE = 0o700
+_EXPECTED_SOCKET_MODE = 0o600
+
+
+def _verify_socket_perms(socket_path: Path) -> None:
+    """Re-stat the socket and its parent directory and refuse to listen if
+    either deviates from the expected mode. Catches umask drift, accidental
+    ``chmod`` between bind and listen, and parent-dir tampering.
+
+    Raises :class:`SocketPermsDrift` (a :class:`DaemonSocketError`) on any
+    mismatch or missing path. Mode bits only — UID/GID checks are deferred.
+    """
+    parent = socket_path.parent
+    try:
+        parent_mode = stat.S_IMODE(parent.stat().st_mode)
+    except FileNotFoundError as exc:
+        raise SocketPermsDrift(
+            f"socket parent dir missing at verify time: {parent}"
+        ) from exc
+    if parent_mode != _EXPECTED_PARENT_MODE:
+        raise SocketPermsDrift(
+            f"socket parent dir perms drifted: {parent} is "
+            f"0o{parent_mode:03o}, expected 0o{_EXPECTED_PARENT_MODE:03o}"
+        )
+
+    try:
+        socket_mode = stat.S_IMODE(socket_path.stat().st_mode)
+    except FileNotFoundError as exc:
+        raise SocketPermsDrift(
+            f"socket file missing at verify time: {socket_path}"
+        ) from exc
+    if socket_mode != _EXPECTED_SOCKET_MODE:
+        raise SocketPermsDrift(
+            f"socket file perms drifted: {socket_path} is "
+            f"0o{socket_mode:03o}, expected 0o{_EXPECTED_SOCKET_MODE:03o}"
+        )
 
 
 def _capture_socket_pid(path: Path) -> int | None:
@@ -188,6 +234,13 @@ def bind_unix_socket(path: str | Path | None = None) -> PeerCheckingUnixSocket:
         os.umask(old_umask)
 
     os.chmod(socket_path, 0o600)
+    try:
+        _verify_socket_perms(socket_path)
+    except SocketPermsDrift:
+        listener.close()
+        cleanup_socket(socket_path)
+        raise
+
     listener.listen(socket.SOMAXCONN)
     _BOUND_PATHS.add(socket_path)
     _register_atexit_once()

@@ -118,6 +118,85 @@ def test_rogue_regular_file_is_not_overwritten(daemon_socket_path: Path) -> None
     assert daemon_socket_path.read_text(encoding="utf-8") == "keep me"
 
 
+def test_bind_succeeds_when_perm_verification_matches(daemon_socket_path: Path) -> None:
+    """Happy path: bind_unix_socket leaves both perms at expected modes and
+    the new verify step accepts them."""
+    from screencap.daemon.socket import bind_unix_socket
+
+    listener = bind_unix_socket(daemon_socket_path)
+    try:
+        assert stat.S_IMODE(daemon_socket_path.parent.stat().st_mode) == 0o700
+        assert stat.S_IMODE(daemon_socket_path.stat().st_mode) == 0o600
+    finally:
+        listener.close()
+        daemon_socket_path.unlink(missing_ok=True)
+
+
+def test_parent_dir_perm_drift_raises_and_cleans_up(
+    daemon_socket_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """If the parent directory's mode drifts from 0o700 before bind verifies
+    it, bind aborts with SocketPermsDrift and removes the half-bound socket.
+    """
+    from screencap.daemon import socket as daemon_socket
+
+    original_ensure = daemon_socket._ensure_socket_directory
+
+    def ensure_then_drift(path: Path) -> None:
+        original_ensure(path)
+        # Simulate umask drift / external chmod between _ensure_socket_directory
+        # and the verify step.
+        os.chmod(path.parent, 0o755)
+
+    monkeypatch.setattr(daemon_socket, "_ensure_socket_directory", ensure_then_drift)
+
+    with pytest.raises(daemon_socket.SocketPermsDrift, match=r"0o755"):
+        daemon_socket.bind_unix_socket(daemon_socket_path)
+
+    # The half-bound socket file must not survive a failed verify.
+    assert not daemon_socket_path.exists()
+
+
+def test_socket_file_perm_drift_raises_and_cleans_up(
+    daemon_socket_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """If the socket-file mode lands at something other than 0o600 (e.g.,
+    umask race against chmod), bind aborts with SocketPermsDrift."""
+    import os as os_module
+
+    from screencap.daemon import socket as daemon_socket
+
+    original_chmod = os_module.chmod
+    target = str(daemon_socket_path)
+
+    def drift_socket_chmod(path, mode, *args, **kwargs):  # type: ignore[no-untyped-def]
+        if str(path) == target and mode == 0o600:
+            return original_chmod(path, 0o644, *args, **kwargs)
+        return original_chmod(path, mode, *args, **kwargs)
+
+    monkeypatch.setattr(os_module, "chmod", drift_socket_chmod)
+
+    with pytest.raises(daemon_socket.SocketPermsDrift, match=r"0o644"):
+        daemon_socket.bind_unix_socket(daemon_socket_path)
+
+    assert not daemon_socket_path.exists()
+
+
+def test_verify_socket_perms_translates_missing_paths_to_drift_error(
+    tmp_path: Path,
+) -> None:
+    """The verify helper must surface a SocketPermsDrift (not bare
+    FileNotFoundError) when stat fails — defends against the parent dir
+    being cleaned out between bind and verify."""
+    from screencap.daemon.socket import SocketPermsDrift, _verify_socket_perms
+
+    nonexistent_socket = tmp_path / "missing-parent" / "api.sock"
+    with pytest.raises(SocketPermsDrift):
+        _verify_socket_perms(nonexistent_socket)
+
+
 def test_peer_euid_check_is_invoked_and_rejects_mismatch(
     daemon_socket_path: Path,
     monkeypatch: pytest.MonkeyPatch,
