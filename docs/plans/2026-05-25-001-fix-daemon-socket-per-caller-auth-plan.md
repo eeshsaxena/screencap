@@ -1,7 +1,7 @@
 ---
 title: "fix: Document daemon socket trust boundary (SCR-64)"
 type: fix
-status: active
+status: completed
 date: 2026-05-25
 linear: https://linear.app/zk-email/issue/SCR-64/daemon-socket-has-no-per-caller-auth-pr-180-made-daemon-side-the-sole
 ---
