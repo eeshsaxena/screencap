@@ -144,8 +144,10 @@ def test_reason_does_not_echo_unsafe_bytes():
 async def test_handler_rejects_traversal_name_with_invalid_name_envelope(monkeypatch):
     monkeypatch.setattr(
         provenance,
-        "derive_started_by_from_asgi_scope",
-        lambda _scope: provenance.STARTED_BY_CLI,
+        "derive_peer_descriptor_from_asgi_scope",
+        lambda _scope: provenance.PeerDescriptor(
+            pid=None, path=None, classification=provenance.STARTED_BY_CLI
+        ),
     )
 
     app = build_app()
@@ -167,8 +169,10 @@ async def test_handler_rejects_traversal_name_with_invalid_name_envelope(monkeyp
 async def test_handler_accepts_well_formed_name(monkeypatch):
     monkeypatch.setattr(
         provenance,
-        "derive_started_by_from_asgi_scope",
-        lambda _scope: provenance.STARTED_BY_CLI,
+        "derive_peer_descriptor_from_asgi_scope",
+        lambda _scope: provenance.PeerDescriptor(
+            pid=None, path=None, classification=provenance.STARTED_BY_CLI
+        ),
     )
 
     app = build_app()
@@ -187,8 +191,10 @@ async def test_handler_with_no_name_is_accepted(monkeypatch):
     """``name`` is optional; the daemon synthesizes a timestamp when missing."""
     monkeypatch.setattr(
         provenance,
-        "derive_started_by_from_asgi_scope",
-        lambda _scope: provenance.STARTED_BY_CLI,
+        "derive_peer_descriptor_from_asgi_scope",
+        lambda _scope: provenance.PeerDescriptor(
+            pid=None, path=None, classification=provenance.STARTED_BY_CLI
+        ),
     )
 
     app = build_app()

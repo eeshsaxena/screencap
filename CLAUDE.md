@@ -47,3 +47,7 @@ Linting uses `ruff` for the engine sub-package: `ruff check src/screencap/engine
 ## Documented Solutions
 
 `docs/solutions/` — documented solutions to past problems (bugs, best practices, workflow patterns), organized by category with YAML frontmatter (`module`, `tags`, `problem_type`). Relevant when implementing or debugging in documented areas.
+
+## Security
+
+`SECURITY.md` at the repo root documents the daemon socket's trust boundary (same-EUID + filesystem permissions), in-scope and out-of-scope threats, and the SCR-64 decision rationale. It is the source of truth for threat-model questions.

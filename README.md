@@ -474,6 +474,10 @@ pytest tests/
 pytest tests/ -v --cov
 ```
 
+## Security
+
+ScreenCap's recording daemon trusts any process running as the same macOS user. The trust boundary is your user account; processes from other accounts cannot reach the daemon socket or read recordings. See [`SECURITY.md`](SECURITY.md) for the full threat model, alternatives considered, and instructions for reporting a vulnerability.
+
 ## License
 
 ScreenCap is dual-licensed:

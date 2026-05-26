@@ -217,8 +217,24 @@ def _api_error_response(exc: errors.DaemonAPIError) -> JSONResponse:
 
 
 async def recording_start(request: Request) -> JSONResponse:
-    from screencap.daemon import provenance
+    from screencap.daemon import audit_log, provenance
     from screencap.daemon._name_validation import validate_recording_name
+
+    # Capture peer identity up front so every exit path (success,
+    # typed API error, unhandled exception) can record the audit line
+    # with the same descriptor.
+    peer = provenance.derive_peer_descriptor_from_asgi_scope(request.scope)
+    recording_name: str | None = None
+
+    def _audit(outcome: str) -> None:
+        audit_log.record_verb(
+            "recording.start",
+            peer_pid=peer.pid,
+            peer_path=peer.path,
+            classification=peer.classification,
+            outcome=outcome,
+            recording_name=recording_name,
+        )
 
     try:
         body = await request.json()
@@ -226,6 +242,10 @@ async def recording_start(request: Request) -> JSONResponse:
             body.get("started_by") if isinstance(body, dict) else None
         )
         parsed = schema.RecordingStartRequest.model_validate(body)
+        # Capture the caller-supplied name immediately so an audit line on a
+        # later validation failure (e.g., InvalidNameError from path traversal)
+        # still records *what was rejected*, not None.
+        recording_name = parsed.name
 
         # Phase 2 U2.3: gate recording names through the canonical
         # validator so path traversal can't leak from agent / CLI / GUI
@@ -235,21 +255,21 @@ async def recording_start(request: Request) -> JSONResponse:
         if parsed.name is not None:
             validate_recording_name(parsed.name)
 
-        # Phase 2 U2: derive started_by from the peer socket and
-        # override any caller-supplied value. The field stays Optional
-        # in the request schema (soft-deprecated) so old clients keep
-        # working; the daemon owns the authoritative classification on
-        # persisted metadata.
-        derived = provenance.derive_started_by_from_asgi_scope(request.scope)
-        if caller_supplied is not None and caller_supplied != derived:
+        # Phase 2 U2: override any caller-supplied ``started_by`` with the
+        # server-derived classification from the peer descriptor. The field
+        # stays Optional in the request schema (soft-deprecated) so old
+        # clients keep working; the daemon owns the authoritative
+        # classification on persisted metadata.
+        if caller_supplied is not None and caller_supplied != peer.classification:
             logger.debug(
                 "ignoring caller-supplied started_by=%r; using server-derived=%r",
                 caller_supplied,
-                derived,
+                peer.classification,
             )
-        parsed = parsed.model_copy(update={"started_by": derived})
+        parsed = parsed.model_copy(update={"started_by": peer.classification})
 
         result = await request.app.state.supervisor.spawn(parsed)
+        _audit("ok")
         return JSONResponse(
             schema.envelope(
                 schema_version=schema._RECORDING_START_API_VERSION,
@@ -257,8 +277,10 @@ async def recording_start(request: Request) -> JSONResponse:
             )
         )
     except errors.DaemonAPIError as exc:
+        _audit(exc.error_code)
         return _api_error_response(exc)
     except Exception as exc:
+        _audit(errors.ERROR_CODE_INTERNAL)
         return _internal_error_response(
             exc,
             schema_version=schema._RECORDING_START_API_VERSION,
@@ -267,6 +289,19 @@ async def recording_start(request: Request) -> JSONResponse:
 
 
 async def recording_stop(request: Request) -> JSONResponse:
+    from screencap.daemon import audit_log, provenance
+
+    peer = provenance.derive_peer_descriptor_from_asgi_scope(request.scope)
+
+    def _audit(outcome: str) -> None:
+        audit_log.record_verb(
+            "recording.stop",
+            peer_pid=peer.pid,
+            peer_path=peer.path,
+            classification=peer.classification,
+            outcome=outcome,
+        )
+
     try:
         parsed = schema.RecordingStopRequest.model_validate(await request.json())
         result = await request.app.state.supervisor.stop(
@@ -274,6 +309,7 @@ async def recording_stop(request: Request) -> JSONResponse:
             expected_claimant_pid=parsed.expected_claimant_pid,
             expected_started_at=parsed.expected_started_at,
         )
+        _audit("ok")
         return JSONResponse(
             schema.envelope(
                 schema_version=schema._RECORDING_STOP_API_VERSION,
@@ -281,8 +317,10 @@ async def recording_stop(request: Request) -> JSONResponse:
             )
         )
     except errors.DaemonAPIError as exc:
+        _audit(exc.error_code)
         return _api_error_response(exc)
     except Exception as exc:
+        _audit(errors.ERROR_CODE_INTERNAL)
         return _internal_error_response(
             exc,
             schema_version=schema._RECORDING_STOP_API_VERSION,

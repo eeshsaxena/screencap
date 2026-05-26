@@ -43,12 +43,16 @@ class _FakeSupervisor:
         return None
 
 
+def _fake_peer_descriptor(classification: str) -> provenance.PeerDescriptor:
+    return provenance.PeerDescriptor(pid=None, path=None, classification=classification)
+
+
 @pytest.mark.asyncio
 async def test_caller_supplied_started_by_is_overridden_by_server_derived(monkeypatch):
     monkeypatch.setattr(
         provenance,
-        "derive_started_by_from_asgi_scope",
-        lambda _scope: provenance.STARTED_BY_CLI,
+        "derive_peer_descriptor_from_asgi_scope",
+        lambda _scope: _fake_peer_descriptor(provenance.STARTED_BY_CLI),
     )
 
     app = build_app()
@@ -72,8 +76,8 @@ async def test_caller_supplied_started_by_is_overridden_by_server_derived(monkey
 async def test_no_started_by_supplied_still_uses_server_derived(monkeypatch):
     monkeypatch.setattr(
         provenance,
-        "derive_started_by_from_asgi_scope",
-        lambda _scope: provenance.STARTED_BY_SWIFTUI,
+        "derive_peer_descriptor_from_asgi_scope",
+        lambda _scope: _fake_peer_descriptor(provenance.STARTED_BY_SWIFTUI),
     )
 
     app = build_app()
@@ -90,8 +94,8 @@ async def test_no_started_by_supplied_still_uses_server_derived(monkeypatch):
 async def test_unknown_classifier_result_lands_on_metadata(monkeypatch):
     monkeypatch.setattr(
         provenance,
-        "derive_started_by_from_asgi_scope",
-        lambda _scope: provenance.STARTED_BY_UNKNOWN,
+        "derive_peer_descriptor_from_asgi_scope",
+        lambda _scope: _fake_peer_descriptor(provenance.STARTED_BY_UNKNOWN),
     )
     app = build_app()
     fake = _FakeSupervisor()

@@ -81,8 +81,10 @@ async def test_phase1_swiftui_payload_returns_200(monkeypatch):
     """Full Phase 1 SwiftUI payload accepted without API version bump."""
     monkeypatch.setattr(
         provenance,
-        "derive_started_by_from_asgi_scope",
-        lambda _scope: provenance.STARTED_BY_SWIFTUI,
+        "derive_peer_descriptor_from_asgi_scope",
+        lambda _scope: provenance.PeerDescriptor(
+            pid=None, path=None, classification=provenance.STARTED_BY_SWIFTUI
+        ),
     )
 
     app = build_app()
@@ -109,8 +111,10 @@ async def test_phase1_swiftui_started_by_overridden_by_server(monkeypatch, caplo
     """Daemon overrides caller-supplied started_by with server-derived value."""
     monkeypatch.setattr(
         provenance,
-        "derive_started_by_from_asgi_scope",
-        lambda _scope: provenance.STARTED_BY_SWIFTUI,
+        "derive_peer_descriptor_from_asgi_scope",
+        lambda _scope: provenance.PeerDescriptor(
+            pid=None, path=None, classification=provenance.STARTED_BY_SWIFTUI
+        ),
     )
 
     app = build_app()
