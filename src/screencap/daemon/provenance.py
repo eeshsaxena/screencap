@@ -28,6 +28,7 @@ import ctypes
 import logging
 from ctypes import c_int, c_size_t, c_uint, c_void_p
 from dataclasses import dataclass
+from typing import Any
 
 logger = logging.getLogger(__name__)
 
@@ -297,7 +298,7 @@ def derive_started_by(sock_fd: int) -> str:
     return derive_peer_descriptor(sock_fd).classification
 
 
-def _peer_fd_from_asgi_scope(scope: dict) -> int | None:
+def _peer_fd_from_asgi_scope(scope: dict[str, Any]) -> int | None:
     """Best-effort peer-fd extraction from an ASGI request scope.
 
     Uvicorn stashes the underlying ``asyncio.Transport`` (or its socket)
@@ -329,7 +330,7 @@ def _peer_fd_from_asgi_scope(scope: dict) -> int | None:
         return None
 
 
-def derive_peer_descriptor_from_asgi_scope(scope: dict) -> PeerDescriptor:
+def derive_peer_descriptor_from_asgi_scope(scope: dict[str, Any]) -> PeerDescriptor:
     """Resolve the full peer descriptor from a Starlette/uvicorn ASGI
     request scope. Returns the ``unknown`` descriptor when the underlying
     socket is not reachable through the scope on this uvicorn version.
@@ -340,7 +341,7 @@ def derive_peer_descriptor_from_asgi_scope(scope: dict) -> PeerDescriptor:
     return derive_peer_descriptor(fd)
 
 
-def derive_started_by_from_asgi_scope(scope: dict) -> str:
+def derive_started_by_from_asgi_scope(scope: dict[str, Any]) -> str:
     """Resolve ``started_by`` from a Starlette/uvicorn ASGI request scope.
 
     Returns ``unknown`` when the underlying socket is not reachable

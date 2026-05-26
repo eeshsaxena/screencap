@@ -45,7 +45,7 @@ SCR-64 (the ticket that motivated this document) asked whether same-user trust i
 
 **Bearer token co-installed via SMAppService.** The daemon could generate a random secret on first launch, write it to `~/.screencap/run/api.token` at mode `0o600`, and require clients to send it as an `Authorization: Bearer` header. This was rejected because any process that can connect to the socket can also read the token file (same UID, same directory, same mode), so the token adds no defense against the threat that motivates it. It also introduces worse-than-no-token failure modes: tokens leak into shell history, `ps` output, crash reports, and support bundles, and developers relaxing token-file permissions to debug ("just chmod 644 for a sec") is a documented anti-pattern. This matches Apple's DTS guidance on AF_UNIX IPC and the `ssh-agent` design rationale.
 
-A future option — per-call code-signing verification via `SecCodeCopyGuestWithAttributes` against a Team-ID requirement string — would genuinely raise the bar against a same-user attacker by forcing a Developer ID forgery. It is blocked today by ScreenCap's mixed distribution model and would require its own design pass. The full rationale lives in `docs/plans/2026-05-25-001-fix-daemon-socket-per-caller-auth-plan.md`.
+A future option — per-call code-signing verification via `SecCodeCopyGuestWithAttributes` against a Team-ID requirement string — would genuinely raise the bar against a same-user attacker by forcing a Developer ID forgery. It is blocked today by ScreenCap's mixed distribution model and would require its own design pass. The full rationale lives in the [SCR-64 plan](docs/plans/2026-05-25-001-fix-daemon-socket-per-caller-auth-plan.md).
 
 ## Reporting a vulnerability
 

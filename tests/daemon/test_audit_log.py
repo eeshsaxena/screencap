@@ -14,8 +14,13 @@ import logging
 import os
 import stat
 from pathlib import Path
+from typing import Any
 
 import pytest
+from httpx import ASGITransport, AsyncClient
+
+from screencap.daemon import errors, provenance
+from screencap.daemon.app import build_app
 
 
 @pytest.fixture
@@ -24,7 +29,7 @@ def audit_log_at(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> Path:
     from screencap.daemon import audit_log
 
     target = tmp_path / "audit.log"
-    monkeypatch.setattr(audit_log, "audit_log_path", lambda: target)
+    monkeypatch.setattr(audit_log, "_AUDIT_LOG_PATH", target)
     return target
 
 
@@ -120,7 +125,7 @@ def test_record_verb_swallows_open_errors_via_warning(
     sealed_dir = tmp_path / "sealed"
     sealed_dir.mkdir()
     target = sealed_dir / "audit.log"
-    monkeypatch.setattr(audit_log, "audit_log_path", lambda: target)
+    monkeypatch.setattr(audit_log, "_AUDIT_LOG_PATH", target)
     os.chmod(sealed_dir, 0o500)
     try:
         with caplog.at_level(logging.WARNING, logger="screencap.daemon.audit_log"):
@@ -170,15 +175,6 @@ def test_record_verb_tightens_loose_file_mode_on_write(
 # descriptor (no real UNIX socket) and the supervisor (no real recording).
 
 
-from typing import Any  # noqa: E402
-
-import pytest_asyncio  # noqa: E402,F401 (importing to confirm marker is available)
-from httpx import ASGITransport, AsyncClient  # noqa: E402
-
-from screencap.daemon import errors, provenance  # noqa: E402
-from screencap.daemon.app import build_app  # noqa: E402
-
-
 class _RecordingSupervisor:
     """Supervisor stand-in whose spawn/stop behavior is parameterised."""
 
@@ -194,7 +190,7 @@ class _RecordingSupervisor:
     def is_recovering(self) -> bool:
         return False
 
-    async def spawn(self, parsed: Any) -> dict[str, Any]:
+    async def spawn(self, parsed: object) -> dict[str, Any]:
         if self.spawn_raises is not None:
             raise self.spawn_raises
         return {"session_id": "s", "started_at": 1.0, "engine_pid": 1, "cursor": 0}
@@ -362,29 +358,80 @@ async def test_read_only_verbs_do_not_emit_audit_lines(
 
 
 @pytest.mark.asyncio
+async def test_recording_stop_audit_line_carries_typed_error_code(
+    audit_log_at: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """recording.stop's typed-error audit branch is symmetric to start's
+    and must also surface the lowercase error_code as the outcome."""
+    _patch_peer(monkeypatch, provenance.PeerDescriptor(pid=1, path=None, classification="cli"))
+    not_owned = errors.NotOwnedByDaemonError(claimant="other-cli", schema_version=1)
+    app = build_app()
+    async with app.router.lifespan_context(app):
+        app.state.supervisor = _RecordingSupervisor(stop_raises=not_owned)
+        async with AsyncClient(transport=ASGITransport(app=app), base_url="http://t") as client:
+            response = await client.post("/v0/recording.stop", json={})
+
+    assert response.status_code == 409
+    record = json.loads(audit_log_at.read_text(encoding="utf-8"))
+    assert record["verb"] == "recording.stop"
+    assert record["outcome"] == errors.NOT_OWNED_BY_DAEMON
+
+
+@pytest.mark.asyncio
+async def test_invalid_name_audit_line_captures_rejected_name(
+    audit_log_at: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """Forensic value: when path-traversal validation rejects a caller name,
+    the audit line must still record what was rejected — recording_name
+    is captured before the validator runs."""
+    _patch_peer(monkeypatch, provenance.PeerDescriptor(pid=1, path=None, classification="cli"))
+    app = build_app()
+    async with app.router.lifespan_context(app):
+        app.state.supervisor = _RecordingSupervisor()
+        async with AsyncClient(transport=ASGITransport(app=app), base_url="http://t") as client:
+            response = await client.post(
+                "/v0/recording.start", json={"name": "../escape"}
+            )
+
+    assert response.status_code == 400
+    record = json.loads(audit_log_at.read_text(encoding="utf-8"))
+    assert record["outcome"] == errors.INVALID_NAME
+    assert record["recording_name"] == "../escape"
+
+
+@pytest.mark.asyncio
 async def test_audit_write_failure_does_not_fail_recording_start(
     tmp_path: Path,
     monkeypatch: pytest.MonkeyPatch,
+    caplog: pytest.LogCaptureFixture,
 ) -> None:
     """If the audit log is unwritable, recording.start must still return
-    success — the audit log is best-effort, never a control-plane gate."""
+    success — the audit log is best-effort, never a control-plane gate.
+    A warning must fire so operators can notice the regression end-to-end."""
     from screencap.daemon import audit_log
 
     sealed_dir = tmp_path / "sealed"
     sealed_dir.mkdir()
     target = sealed_dir / "audit.log"
-    monkeypatch.setattr(audit_log, "audit_log_path", lambda: target)
+    monkeypatch.setattr(audit_log, "_AUDIT_LOG_PATH", target)
     os.chmod(sealed_dir, 0o500)
 
     _patch_peer(monkeypatch, provenance.PeerDescriptor(pid=1, path=None, classification="cli"))
     app = build_app()
     try:
-        async with app.router.lifespan_context(app):
-            app.state.supervisor = _RecordingSupervisor()
-            async with AsyncClient(transport=ASGITransport(app=app), base_url="http://t") as client:
-                response = await client.post("/v0/recording.start", json={"name": "demo"})
+        with caplog.at_level(logging.WARNING, logger="screencap.daemon.audit_log"):
+            async with app.router.lifespan_context(app):
+                app.state.supervisor = _RecordingSupervisor()
+                async with AsyncClient(transport=ASGITransport(app=app), base_url="http://t") as client:
+                    response = await client.post("/v0/recording.start", json={"name": "demo"})
     finally:
         os.chmod(sealed_dir, 0o700)
 
     assert response.status_code == 200, response.text
     assert not target.exists()
+    assert any(
+        "audit_log" in rec.name and rec.levelno >= logging.WARNING
+        for rec in caplog.records
+    )

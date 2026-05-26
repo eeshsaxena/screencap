@@ -189,12 +189,21 @@ def test_verify_socket_perms_translates_missing_paths_to_drift_error(
 ) -> None:
     """The verify helper must surface a SocketPermsDrift (not bare
     FileNotFoundError) when stat fails — defends against the parent dir
-    being cleaned out between bind and verify."""
+    OR the socket file being cleaned out between bind and verify."""
     from screencap.daemon.socket import SocketPermsDrift, _verify_socket_perms
 
+    # Parent-dir missing branch.
     nonexistent_socket = tmp_path / "missing-parent" / "api.sock"
     with pytest.raises(SocketPermsDrift):
         _verify_socket_perms(nonexistent_socket)
+
+    # Parent dir exists at the correct mode, but the socket file itself
+    # is gone — a distinct code path through the verifier.
+    run_dir = tmp_path / "run"
+    run_dir.mkdir(mode=0o700)
+    socket_path = run_dir / "api.sock"
+    with pytest.raises(SocketPermsDrift):
+        _verify_socket_perms(socket_path)
 
 
 def test_peer_euid_check_is_invoked_and_rejects_mismatch(

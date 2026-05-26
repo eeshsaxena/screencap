@@ -242,6 +242,10 @@ async def recording_start(request: Request) -> JSONResponse:
             body.get("started_by") if isinstance(body, dict) else None
         )
         parsed = schema.RecordingStartRequest.model_validate(body)
+        # Capture the caller-supplied name immediately so an audit line on a
+        # later validation failure (e.g., InvalidNameError from path traversal)
+        # still records *what was rejected*, not None.
+        recording_name = parsed.name
 
         # Phase 2 U2.3: gate recording names through the canonical
         # validator so path traversal can't leak from agent / CLI / GUI
@@ -263,7 +267,6 @@ async def recording_start(request: Request) -> JSONResponse:
                 peer.classification,
             )
         parsed = parsed.model_copy(update={"started_by": peer.classification})
-        recording_name = parsed.name
 
         result = await request.app.state.supervisor.spawn(parsed)
         _audit("ok")
