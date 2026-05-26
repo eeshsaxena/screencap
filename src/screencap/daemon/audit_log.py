@@ -11,9 +11,13 @@ NOT propagate to the caller of the underlying verb. Audit-write errors
 log a warning so operators can notice the regression.
 
 Append-only contract: writes use ``O_APPEND | O_CREAT | O_WRONLY |
-O_NOFOLLOW`` to prevent truncation races and to refuse a same-UID
-attacker's symlink redirection. Rotation is intentionally deferred to
-a follow-up ticket.
+O_NOFOLLOW`` to prevent truncation races. ``O_NOFOLLOW`` blocks symlinks
+at the leaf (``audit.log`` itself) only; it does NOT defend against
+hardlinks or against a symlinked parent directory. Both of those —
+together with any same-UID write to the log — remain inside the
+accepted-out-of-scope same-UID trust boundary documented in
+``SECURITY.md``. Rotation is intentionally deferred to a follow-up
+ticket.
 
 Single-writer invariant: the daemon serializes all audit writes through
 its asyncio event loop, and the LaunchAgent + auto-spawn coordination
@@ -24,6 +28,10 @@ hypothetical multi-writer case.
 Read-only verbs (``recording.list``, ``session.snapshot``,
 ``daemon.info``, ``events``) are intentionally not audited — they leak
 no capability and auditing them would 10x log volume.
+
+Audit fields preserve caller-supplied bytes inside JSON strings; analysts
+using ``jq -r`` or ``cat`` on ``audit.log`` should account for raw
+control characters in fields like ``recording_name``.
 """
 
 from __future__ import annotations
@@ -38,7 +46,14 @@ from typing import Any
 logger = logging.getLogger(__name__)
 
 _AUDIT_FILE_MODE = 0o600
-_AUDIT_LOG_PATH: Path = Path.home() / ".screencap" / "run" / "audit.log"
+
+
+def _audit_log_path() -> Path:
+    """Resolve the audit log path lazily so tests / runtime can monkeypatch
+    ``HOME`` after this module is imported. Mirrors the lazy shape used by
+    ``default_socket_path`` in ``screencap.daemon.socket``.
+    """
+    return Path.home() / ".screencap" / "run" / "audit.log"
 
 
 def record_verb(
@@ -88,33 +103,40 @@ def record_verb(
     as a deferred risk; profile before wrapping in
     ``asyncio.to_thread``.
     """
-    canonical: dict[str, Any] = {
-        "ts": _dt.datetime.now(_dt.timezone.utc).isoformat(),
-        "verb": verb,
-        "peer_pid": peer_pid,
-        "peer_path": peer_path,
-        "classification": classification,
-        "outcome": outcome,
-    }
-    # Build extras first so canonical fields override on key collision —
-    # callers cannot forge a verb or outcome via a kwarg name clash.
-    record = {**extra, **canonical}
-    line = (json.dumps(record, separators=(",", ":")) + "\n").encode("utf-8")
+    try:
+        canonical: dict[str, Any] = {
+            "ts": _dt.datetime.now(_dt.timezone.utc).isoformat(),
+            "verb": verb,
+            "peer_pid": peer_pid,
+            "peer_path": peer_path,
+            "classification": classification,
+            "outcome": outcome,
+        }
+        # Build extras first so canonical fields override on key collision —
+        # callers cannot forge a verb or outcome via a kwarg name clash.
+        record = {**extra, **canonical}
+        line = (json.dumps(record, separators=(",", ":")) + "\n").encode("utf-8")
+    except Exception:
+        # A non-serializable value in ``extra`` (e.g., a ``Path``) raises
+        # ``TypeError`` from ``json.dumps``. Best-effort contract: never
+        # propagate; never open the file; log so operators can spot it.
+        logger.warning("audit_log: failed to serialize record", exc_info=True)
+        return
 
     # Wrap the create-then-chmod in a tight umask to close the brief
     # window where a freshly-created file would otherwise pick up the
     # process umask before fchmod tightens it (matches the pattern used
     # by ``socket.bind_unix_socket``).
+    path = _audit_log_path()
     old_umask = os.umask(0o077)
     try:
         fd = os.open(
-            _AUDIT_LOG_PATH,
+            path,
             os.O_APPEND | os.O_CREAT | os.O_WRONLY | os.O_NOFOLLOW,
             _AUDIT_FILE_MODE,
         )
     except OSError:
-        logger.warning("audit_log: could not open %s", _AUDIT_LOG_PATH, exc_info=True)
-        os.umask(old_umask)
+        logger.warning("audit_log: could not open %s", path, exc_info=True)
         return
     finally:
         os.umask(old_umask)
@@ -130,7 +152,7 @@ def record_verb(
         try:
             os.write(fd, line)
         except OSError:
-            logger.warning("audit_log: write failed for %s", _AUDIT_LOG_PATH, exc_info=True)
+            logger.warning("audit_log: write failed for %s", path, exc_info=True)
     finally:
         try:
             os.close(fd)

@@ -19,23 +19,19 @@ from typing import Any
 import pytest
 from httpx import ASGITransport, AsyncClient
 
-from screencap.daemon import errors, provenance
+from screencap.daemon import audit_log, errors, provenance
 from screencap.daemon.app import build_app
 
 
 @pytest.fixture
 def audit_log_at(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> Path:
     """Redirect the audit log to a tmp path so tests don't write to ~/.screencap."""
-    from screencap.daemon import audit_log
-
     target = tmp_path / "audit.log"
-    monkeypatch.setattr(audit_log, "_AUDIT_LOG_PATH", target)
+    monkeypatch.setattr(audit_log, "_audit_log_path", lambda: target)
     return target
 
 
 def test_record_verb_writes_json_line_with_expected_fields(audit_log_at: Path) -> None:
-    from screencap.daemon import audit_log
-
     audit_log.record_verb(
         "recording.start",
         peer_pid=12345,
@@ -60,8 +56,6 @@ def test_record_verb_writes_json_line_with_expected_fields(audit_log_at: Path) -
 
 
 def test_record_verb_creates_file_at_0600_on_first_write(audit_log_at: Path) -> None:
-    from screencap.daemon import audit_log
-
     assert not audit_log_at.exists()
     audit_log.record_verb(
         "recording.start",
@@ -76,8 +70,6 @@ def test_record_verb_creates_file_at_0600_on_first_write(audit_log_at: Path) -> 
 
 def test_record_verb_appends_across_calls(audit_log_at: Path) -> None:
     """Two invocations produce two lines — no truncation race."""
-    from screencap.daemon import audit_log
-
     for outcome in ("ok", "lock_contended"):
         audit_log.record_verb(
             "recording.start",
@@ -96,8 +88,6 @@ def test_record_verb_appends_across_calls(audit_log_at: Path) -> None:
 def test_record_verb_handles_none_peer_info(audit_log_at: Path) -> None:
     """When provenance can't classify, the line is still written with
     ``classification=unknown`` and ``peer_pid=null``."""
-    from screencap.daemon import audit_log
-
     audit_log.record_verb(
         "recording.start",
         peer_pid=None,
@@ -119,13 +109,11 @@ def test_record_verb_swallows_open_errors_via_warning(
 ) -> None:
     """If the audit log parent dir is unwritable, the verb must not raise.
     A warning is logged so operators can spot the regression."""
-    from screencap.daemon import audit_log
-
     # Point the audit-log path at a dir we make read-only.
     sealed_dir = tmp_path / "sealed"
     sealed_dir.mkdir()
     target = sealed_dir / "audit.log"
-    monkeypatch.setattr(audit_log, "_AUDIT_LOG_PATH", target)
+    monkeypatch.setattr(audit_log, "_audit_log_path", lambda: target)
     os.chmod(sealed_dir, 0o500)
     try:
         with caplog.at_level(logging.WARNING, logger="screencap.daemon.audit_log"):
@@ -146,14 +134,37 @@ def test_record_verb_swallows_open_errors_via_warning(
     )
 
 
+def test_record_verb_swallows_serialization_error(
+    audit_log_at: Path,
+    caplog: pytest.LogCaptureFixture,
+) -> None:
+    """A non-serializable value in ``extra`` (e.g., ``Path``) must not
+    propagate out of ``record_verb``. The write is skipped and a warning
+    is logged so operators can spot the regression."""
+    with caplog.at_level(logging.WARNING, logger="screencap.daemon.audit_log"):
+        audit_log.record_verb(
+            "recording.start",
+            peer_pid=1,
+            peer_path=None,
+            classification="cli",
+            outcome="ok",
+            bad=Path("/x"),
+        )
+
+    # The audit file must not have been opened: nothing wrote to it.
+    assert not audit_log_at.exists()
+    assert any(
+        "audit_log" in rec.name and rec.levelno >= logging.WARNING
+        for rec in caplog.records
+    )
+
+
 def test_record_verb_tightens_loose_file_mode_on_write(
     audit_log_at: Path,
 ) -> None:
     """Defense in depth: if an audit file already exists at a relaxed mode
     (same-UID could create it that way), record_verb tightens it to 0o600
     on the next write."""
-    from screencap.daemon import audit_log
-
     audit_log_at.write_text("{}\n", encoding="utf-8")
     os.chmod(audit_log_at, 0o644)
 
@@ -312,6 +323,27 @@ async def test_recording_start_audit_line_marks_unhandled_internal_error(
 
 
 @pytest.mark.asyncio
+async def test_recording_stop_audit_line_marks_unhandled_internal_error(
+    audit_log_at: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """Symmetric to recording.start: an unhandled exception from the
+    supervisor's ``stop()`` must still emit a single audit line with
+    ``outcome == internal_error``."""
+    _patch_peer(monkeypatch, provenance.PeerDescriptor(pid=1, path=None, classification="cli"))
+    app = build_app()
+    async with app.router.lifespan_context(app):
+        app.state.supervisor = _RecordingSupervisor(stop_raises=RuntimeError("boom"))
+        async with AsyncClient(transport=ASGITransport(app=app), base_url="http://t") as client:
+            response = await client.post("/v0/recording.stop", json={})
+
+    assert response.status_code == 500
+    record = json.loads(audit_log_at.read_text(encoding="utf-8"))
+    assert record["verb"] == "recording.stop"
+    assert record["outcome"] == errors.ERROR_CODE_INTERNAL
+
+
+@pytest.mark.asyncio
 async def test_recording_start_audit_line_when_peer_info_unavailable(
     audit_log_at: Path,
     monkeypatch: pytest.MonkeyPatch,
@@ -341,7 +373,19 @@ async def test_read_only_verbs_do_not_emit_audit_lines(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
     """Audit coverage is scoped to privileged verbs. recording.list,
-    session.snapshot, and daemon.info must not leak entries into the log."""
+    session.snapshot, daemon.info, and events must not leak entries into
+    the log."""
+    from screencap.daemon.app import events_stream
+    from starlette.datastructures import QueryParams
+
+    class _StreamRequest:
+        def __init__(self, app) -> None:
+            self.app = app
+            self.query_params = QueryParams("")
+
+        async def is_disconnected(self) -> bool:
+            return False
+
     _patch_peer(monkeypatch, provenance.PeerDescriptor(pid=1, path=None, classification="cli"))
     app = build_app()
     async with app.router.lifespan_context(app):
@@ -350,6 +394,16 @@ async def test_read_only_verbs_do_not_emit_audit_lines(
             r1 = await client.get("/v0/daemon.info")
             r2 = await client.get("/v0/recording.list")
             r3 = await client.get("/v0/session.snapshot")
+            # ``/v0/events`` is an SSE stream that runs indefinitely — invoke
+            # the handler directly with a minimal request stub (same pattern
+            # used by ``tests/daemon/test_event_stream.py``) and immediately
+            # close its iterator. We only care that hitting the route did not
+            # emit an audit line.
+            events_response = await events_stream(_StreamRequest(app))
+            body_iter = getattr(events_response, "body_iterator", None)
+            if body_iter is not None:
+                await body_iter.aclose()
+            assert events_response.status_code == 200
 
     assert r1.status_code == 200
     assert r2.status_code == 200
@@ -410,12 +464,10 @@ async def test_audit_write_failure_does_not_fail_recording_start(
     """If the audit log is unwritable, recording.start must still return
     success — the audit log is best-effort, never a control-plane gate.
     A warning must fire so operators can notice the regression end-to-end."""
-    from screencap.daemon import audit_log
-
     sealed_dir = tmp_path / "sealed"
     sealed_dir.mkdir()
     target = sealed_dir / "audit.log"
-    monkeypatch.setattr(audit_log, "_AUDIT_LOG_PATH", target)
+    monkeypatch.setattr(audit_log, "_audit_log_path", lambda: target)
     os.chmod(sealed_dir, 0o500)
 
     _patch_peer(monkeypatch, provenance.PeerDescriptor(pid=1, path=None, classification="cli"))
@@ -426,6 +478,40 @@ async def test_audit_write_failure_does_not_fail_recording_start(
                 app.state.supervisor = _RecordingSupervisor()
                 async with AsyncClient(transport=ASGITransport(app=app), base_url="http://t") as client:
                     response = await client.post("/v0/recording.start", json={"name": "demo"})
+    finally:
+        os.chmod(sealed_dir, 0o700)
+
+    assert response.status_code == 200, response.text
+    assert not target.exists()
+    assert any(
+        "audit_log" in rec.name and rec.levelno >= logging.WARNING
+        for rec in caplog.records
+    )
+
+
+@pytest.mark.asyncio
+async def test_audit_write_failure_does_not_fail_recording_stop(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+    caplog: pytest.LogCaptureFixture,
+) -> None:
+    """Symmetric to start: if the audit log is unwritable, recording.stop
+    must still return success and emit a warning. The audit log is
+    best-effort, never a control-plane gate."""
+    sealed_dir = tmp_path / "sealed"
+    sealed_dir.mkdir()
+    target = sealed_dir / "audit.log"
+    monkeypatch.setattr(audit_log, "_audit_log_path", lambda: target)
+    os.chmod(sealed_dir, 0o500)
+
+    _patch_peer(monkeypatch, provenance.PeerDescriptor(pid=1, path=None, classification="cli"))
+    app = build_app()
+    try:
+        with caplog.at_level(logging.WARNING, logger="screencap.daemon.audit_log"):
+            async with app.router.lifespan_context(app):
+                app.state.supervisor = _RecordingSupervisor()
+                async with AsyncClient(transport=ASGITransport(app=app), base_url="http://t") as client:
+                    response = await client.post("/v0/recording.stop", json={})
     finally:
         os.chmod(sealed_dir, 0o700)
 

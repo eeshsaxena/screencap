@@ -28,7 +28,12 @@ import ctypes
 import logging
 from ctypes import c_int, c_size_t, c_uint, c_void_p
 from dataclasses import dataclass
-from typing import Any
+from typing import Any, Literal
+
+# Narrow alias for the four classification labels emitted by
+# ``classify_path_and_argv`` and stored on ``PeerDescriptor``. Keep this
+# in sync with the ``STARTED_BY_*`` constants below.
+Classification = Literal["swiftui", "cli", "mcp", "unknown"]
 
 logger = logging.getLogger(__name__)
 
@@ -201,7 +206,7 @@ def _get_proc_argv(pid: int) -> list[str]:
     return args
 
 
-def classify_path_and_argv(path: str | None, argv: list[str]) -> str:
+def classify_path_and_argv(path: str | None, argv: list[str]) -> Classification:
     """Pure classifier (testable without sockets).
 
     Decision rules:
@@ -248,7 +253,7 @@ class PeerDescriptor:
 
     pid: int | None
     path: str | None
-    classification: str
+    classification: Classification
 
 
 _UNKNOWN_PEER = PeerDescriptor(pid=None, path=None, classification=STARTED_BY_UNKNOWN)
@@ -341,6 +346,9 @@ def derive_peer_descriptor_from_asgi_scope(scope: dict[str, Any]) -> PeerDescrip
     return derive_peer_descriptor(fd)
 
 
+# Retained for source compatibility only; no longer in ``__all__``. Safe
+# to delete in a future cleanup once the SwiftUI / MCP shells confirm they
+# never imported it.
 def derive_started_by_from_asgi_scope(scope: dict[str, Any]) -> str:
     """Resolve ``started_by`` from a Starlette/uvicorn ASGI request scope.
 
@@ -361,5 +369,4 @@ __all__ = [
     "derive_peer_descriptor",
     "derive_peer_descriptor_from_asgi_scope",
     "derive_started_by",
-    "derive_started_by_from_asgi_scope",
 ]

@@ -164,11 +164,9 @@ def test_socket_file_perm_drift_raises_and_cleans_up(
 ) -> None:
     """If the socket-file mode lands at something other than 0o600 (e.g.,
     umask race against chmod), bind aborts with SocketPermsDrift."""
-    import os as os_module
-
     from screencap.daemon import socket as daemon_socket
 
-    original_chmod = os_module.chmod
+    original_chmod = os.chmod
     target = str(daemon_socket_path)
 
     def drift_socket_chmod(path, mode, *args, **kwargs):  # type: ignore[no-untyped-def]
@@ -176,7 +174,7 @@ def test_socket_file_perm_drift_raises_and_cleans_up(
             return original_chmod(path, 0o644, *args, **kwargs)
         return original_chmod(path, mode, *args, **kwargs)
 
-    monkeypatch.setattr(os_module, "chmod", drift_socket_chmod)
+    monkeypatch.setattr(os, "chmod", drift_socket_chmod)
 
     with pytest.raises(daemon_socket.SocketPermsDrift, match=r"0o644"):
         daemon_socket.bind_unix_socket(daemon_socket_path)

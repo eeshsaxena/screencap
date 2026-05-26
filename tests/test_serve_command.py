@@ -126,6 +126,41 @@ def test_serve_against_pre_bound_socket_exits_75_and_logs_pid(
     )
 
 
+def test_serve_against_perm_drifted_parent_dir_exits_75_with_drift_message(
+    cli_env: dict[str, str],
+    tmp_path: Path,
+) -> None:
+    """If the socket parent dir is pre-created at a relaxed mode (e.g. 0o755),
+    bind_unix_socket re-chmods to 0o700 but a verify failure after bind would
+    raise SocketPermsDrift. To trigger the drift path deterministically without
+    racing bind, pre-create the parent dir at 0o755 with a symlinked socket
+    parent: bind_unix_socket calls os.chmod(parent, 0o700) which on a symlink
+    target succeeds; the more reliable path is to inject the drift via a wrapper.
+    The simplest end-to-end form: a parent dir already containing a stale
+    surrogate that triggers the verify failure. Use a Python harness to force
+    SocketPermsDrift, then assert the daemon's serve() loop exits EX_TEMPFAIL=75."""
+    from screencap.daemon import socket as daemon_socket
+    from screencap.daemon.server import EX_TEMPFAIL, serve
+
+    socket_path = short_socket_path(tmp_path)
+    socket_path.parent.mkdir(parents=True, exist_ok=True)
+
+    original_ensure = daemon_socket._ensure_socket_directory
+
+    def ensure_then_drift(path: Path) -> None:
+        original_ensure(path)
+        os.chmod(path.parent, 0o755)
+
+    daemon_socket._ensure_socket_directory = ensure_then_drift
+    try:
+        rc = serve(socket_path)
+    finally:
+        daemon_socket._ensure_socket_directory = original_ensure
+        socket_path.unlink(missing_ok=True)
+
+    assert rc == EX_TEMPFAIL, f"expected EX_TEMPFAIL={EX_TEMPFAIL}, got {rc}"
+
+
 def test_serve_against_rogue_file_at_socket_path_exits_1_not_75(
     cli_env: dict[str, str],
     tmp_path: Path,

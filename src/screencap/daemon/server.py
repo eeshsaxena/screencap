@@ -59,6 +59,7 @@ def serve(
     from screencap.daemon.socket import (
         DaemonAlreadyRunning,
         RogueFileAtSocketPath,
+        SocketPermsDrift,
         bind_unix_socket,
         cleanup_socket,
         default_socket_path,
@@ -187,6 +188,9 @@ def serve(
     except RogueFileAtSocketPath as exc:
         _print_stderr(str(exc))
         return 1
+    except SocketPermsDrift as exc:
+        _print_stderr(str(exc))
+        return EX_TEMPFAIL
     finally:
         for sig, handler in previous_handlers.items():
             signal.signal(sig, handler)
