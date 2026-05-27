@@ -462,7 +462,16 @@ final class RecorderController: ObservableObject {
                     onTransientWarning: { [weak self] message in self?.lastError = message },
                     getPendingStartCursor: { [weak self] in self?.machine.pendingStartCursor },
                     clearPendingStartCursor: { [weak self] in self?.machine.clearPendingStartCursor() },
-                    isRecording: { [weak self] in self?.state.isRecording ?? false }
+                    isRecording: { [weak self] in self?.state.isRecording ?? false },
+                    onSnapshotConfirmedActiveRecording: { [weak self] startedAt in
+                        // `.starting`-only — mirrors syncDaemonSnapshot's
+                        // recovery path; no-op past `.starting` so it can't
+                        // regress `.recording` (clobbering elapsed) or `.stopping`.
+                        guard let self else { return }
+                        if case .starting = self.state {
+                            self.apply(self.machine.observeActiveDaemonSession(startedAt: startedAt))
+                        }
+                    }
                 )
             )
             self.applyDaemonStreamOutcome(outcome)
