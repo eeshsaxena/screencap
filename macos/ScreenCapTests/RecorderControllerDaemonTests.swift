@@ -472,23 +472,131 @@ final class RecorderControllerDaemonTests: XCTestCase {
         await recorder.probeDaemon()
         recorder.start(name: "repeated")
 
-        // 1.5s is well past the 100ms baseBackoff repeated ~10-15 times;
-        // also past the cumulative ~1.5s where exponential backoff would
-        // only have allowed ~4 attempts. The threshold below distinguishes
-        // the two regimes without making the test slow.
-        try await Task.sleep(nanoseconds: 1_500_000_000)
+        // The recovery streak uses exponential backoff capped at 5s
+        // (`recoveryCappedBackoff`) starting from 100ms (`baseBackoff`).
+        // Cumulative backoff after N subscribes: 0.1+0.2+0.4+0.8+1.6+3.2+5.0+5.0...
+        // In 3s of wall time we expect 4-6 subscribes; pre-fix flat-100ms
+        // looping produced 25+ in the same window.
+        try await Task.sleep(nanoseconds: 3_000_000_000)
 
-        XCTAssertGreaterThanOrEqual(
-            subscribeCount.value,
-            8,
-            "Budget-skip on cursor_unknown-paired-with-healthy-snapshot should keep backoff at baseline (~100ms). Saw \(subscribeCount.value) subscribes in 1.5s; expected ≥8. A low count indicates the failure budget is still being incremented and backoff is escalating exponentially."
-        )
-
-        // Recording must survive the repeated evictions.
+        // Recording must survive the repeated evictions (SCR-59 invariant:
+        // healthy snapshot keeps the session alive even through repeated
+        // `cursor_unknown`).
         guard case .recording = recorder.state else {
             return XCTFail("Repeated cursor_unknown tore down a healthy recording; state=\(recorder.state). The orchestrator should stay `.recording` indefinitely while the daemon snapshot keeps reporting an active session.")
         }
         XCTAssertNil(recorder.lastError, "Expected no error after repeated cursor_unknown with healthy snapshot; got: \(recorder.lastError ?? "nil")")
+
+        // Bound the recovery loop: a hot loop at 100ms would produce ≥20
+        // subscribes in 3s. Exponential backoff with the cap allows at
+        // most ~12 even on a fast scheduler. The ≥2 floor confirms recovery
+        // actually engaged rather than the test exiting before any retry.
+        XCTAssertGreaterThanOrEqual(
+            subscribeCount.value, 2,
+            "Recovery loop never engaged; expected at least the initial subscribe and one cursor_unknown retry."
+        )
+        XCTAssertLessThanOrEqual(
+            subscribeCount.value, 12,
+            "Recovery loop appears to be hot-looping (\(subscribeCount.value) subscribes in 3s). Exponential backoff capped at 5s should bound retries; a high count suggests the backoff escalation regressed."
+        )
+    }
+
+    /// SCR-59 follow-on regression test. The orchestrator's
+    /// `onSnapshotConfirmedActiveRecording` handler is `.starting`-only — it
+    /// must never invoke `observeActiveDaemonSession` from `.recording`
+    /// (which would clobber `recordingStartedAt` and reset elapsed) or
+    /// `.stopping` (which would regress the lifecycle). This test drives
+    /// the controller to `.recording` via a normal `started` event, then
+    /// forces repeated `cursor_unknown` recoveries with a snapshot whose
+    /// `started_at` differs from the original — if the guard fails,
+    /// elapsed would jump to match the snapshot's `started_at` and we'd
+    /// detect the regression.
+    func testCursorUnknownRecoveryFromRecordingDoesNotRegressState() async throws {
+        let startCount = LockedInt()
+        let firstSubscribeCount = LockedInt()
+        let recoverySubscribeCount = LockedInt()
+
+        // Use two distinct, post-epoch `started_at` values so elapsed
+        // computations produce meaningfully different numbers:
+        //   - original (50.0): elapsed at state-set ≈ now - 50
+        //   - snapshot (5_000_000.0): if guard fails, elapsed jumps
+        //     to ≈ now - 5_000_000 (much smaller — regression detectable).
+        let originalStartedAt: Double = 50.0
+        let snapshotStartedAt: Double = 5_000_000.0
+
+        _ = try startServer { request in
+            switch request.path {
+            case "/v0/daemon.info":
+                return .json(#"{"ok":true,"schema_version":1,"daemon_version":"test","api_schema_version":1,"build":null,"started_at":1.0}"#)
+            case "/v0/recording.start":
+                _ = startCount.incrementAndGet()
+                return .json(#"{"ok":true,"schema_version":1,"daemon_version":"test","api_schema_version":1,"session_id":"session-guard","started_at":\#(originalStartedAt),"engine_pid":9995,"cursor":2}"#)
+            case "/v0/session.snapshot":
+                guard startCount.value > 0 else {
+                    return .json(#"{"ok":true,"schema_version":1,"daemon_version":"test","api_schema_version":1,"is_recording":false,"daemon_owned":false,"recording_name":null,"started_at":null,"claimant":null,"recovering":false,"cursor":0}"#)
+                }
+                return .json(#"{"ok":true,"schema_version":1,"daemon_version":"test","api_schema_version":1,"is_recording":true,"daemon_owned":true,"recording_name":"guard","started_at":\#(snapshotStartedAt),"claimant":"daemon","recovering":false,"cursor":5}"#)
+            case "/v0/events?since=2":
+                // First subscribe: deliver `subscribed` + `started`, then
+                // close cleanly so the loop retries and lands on the 410.
+                _ = firstSubscribeCount.incrementAndGet()
+                return .chunked([
+                    #"{"type":"subscribed","schema_version":1,"cursor":2,"ts":11.0}"# + "\n",
+                    #"{"type":"started","schema_version":1,"cursor":3,"ts":11.0,"recording_name":"guard","engine_pid":9995}"# + "\n",
+                ], terminate: true)
+            case let path where path.hasPrefix("/v0/events?since="):
+                // Subsequent subscribes always 410. Drives the recovery
+                // path while state is already `.recording`.
+                _ = recoverySubscribeCount.incrementAndGet()
+                return .json(
+                    #"{"ok":false,"schema_version":1,"daemon_version":"test","api_schema_version":1,"error":"cursor_unknown","requested_cursor":5}"#,
+                    status: 410,
+                    reason: "Gone"
+                )
+            default:
+                XCTFail("Unexpected request path \(request.path)")
+                return .json(#"{"ok":false,"schema_version":1,"daemon_version":"test","api_schema_version":1,"error":"unexpected"}"#, status: 500)
+            }
+        }
+
+        let recorder = RecorderController()
+        self.recorder = recorder
+        await recorder.probeDaemon()
+        recorder.start(name: "guard")
+
+        // Wait until the `started` event lifts state to `.recording`.
+        await waitUntil {
+            if case .recording = recorder.state { return true }
+            return false
+        }
+
+        guard case .recording(let elapsedBeforeRecovery) = recorder.state else {
+            return XCTFail("Expected `.recording` before triggering recovery; got \(recorder.state)")
+        }
+
+        // Give the recovery loop time to fire at least one 410 cycle.
+        try await Task.sleep(nanoseconds: 600_000_000)
+
+        XCTAssertGreaterThanOrEqual(
+            recoverySubscribeCount.value, 1,
+            "Recovery path never engaged; expected at least one cursor_unknown retry after `.recording`"
+        )
+
+        guard case .recording(let elapsedAfterRecovery) = recorder.state else {
+            return XCTFail("State regressed from `.recording` after cursor_unknown recovery; got \(recorder.state). The `.starting`-only guard in `onSnapshotConfirmedActiveRecording` failed.")
+        }
+
+        // If the guard had failed, `observeActiveDaemonSession(startedAt:)`
+        // would have set `recordingStartedAt` to a 1970-era Date and
+        // `elapsed` would jump to ~1.7 billion seconds. The guard suppresses
+        // the call, so elapsed stays near `elapsedBeforeRecovery` plus at
+        // most one timer tick (1s). A 60s ceiling gives generous slack for
+        // CI scheduling without missing the clobber signal.
+        XCTAssertLessThan(
+            elapsedAfterRecovery, elapsedBeforeRecovery + 60.0,
+            "`recordingStartedAt` was clobbered by cursor_unknown recovery — elapsed went from \(elapsedBeforeRecovery)s to \(elapsedAfterRecovery)s. The `.starting`-only guard must prevent `observeActiveDaemonSession` from running while state is `.recording`."
+        )
+        XCTAssertNil(recorder.lastError)
     }
 
     /// A `recording_failed` event delivered via replay must propagate to

@@ -64,14 +64,12 @@ enum DaemonSession {
         let getPendingStartCursor: @MainActor () -> Int?
         let clearPendingStartCursor: @MainActor () -> Void
         let isRecording: @MainActor () -> Bool
-        /// Invoked from the `cursor_unknown` recovery path when the in-scope
-        /// snapshot confirms an active daemon-owned recording. The orchestrator
-        /// gates on `.starting` before applying the snapshot's `startedAt` —
-        /// this lets the UI recover when `started` has aged past the new
-        /// subscribe cursor and won't be replayed. Safe to invoke on every
-        /// cursor_unknown with a healthy snapshot: the orchestrator handler is
-        /// a no-op once state is past `.starting`.
-        let onPromoteFromSnapshot: @MainActor (Date) -> Void
+        /// Signal that the in-scope snapshot reports an active daemon-owned
+        /// recording during `cursor_unknown` recovery. The orchestrator
+        /// decides what to do — today it promotes `.starting → .recording`
+        /// and ignores the call past `.starting`. Safe to invoke on every
+        /// matching iteration.
+        let onSnapshotConfirmedActiveRecording: @MainActor (Date) -> Void
     }
 }
 
@@ -216,9 +214,19 @@ final class LiveDaemonSessionService: DaemonSessionService {
         // errors — both can recover across a daemon restart, so a single
         // failure should not tear down the recording.
         var consecutiveFailures = 0
+        // Separate streak for `cursor_unknown` recoveries where the snapshot
+        // confirms the recording is alive (SCR-59). Does NOT arm `.lostContact`
+        // — repeated evictions against a healthy recording are recovery-success,
+        // not transport failure — but escalates backoff so a pathological
+        // 410-only daemon cannot hot-loop at `baseBackoff` indefinitely.
+        var consecutiveSnapshotRecoveries = 0
         let maxConsecutiveFailures = 10
         let baseBackoff: TimeInterval = 0.1
         let cappedBackoff: TimeInterval = 30.0
+        // Lower cap for the recovery streak — at 5s a wedged daemon polls
+        // ~once every 5s, low enough to be near-invisible but high enough
+        // that recovery resumes promptly when the daemon comes back.
+        let recoveryCappedBackoff: TimeInterval = 5.0
 
         while !Task.isCancelled, callbacks.isRecording() {
             var sawProgress = false
@@ -283,50 +291,34 @@ final class LiveDaemonSessionService: DaemonSessionService {
                 daemonSessionLogger.info("Daemon event stream dropped; reconnecting. Reason: \(reason, privacy: .public)")
             } catch DaemonClientError.envelopeError(let code, _) where code == "cursor_unknown" {
                 if Task.isCancelled { return .shutdown }
-                // The requested cursor was evicted from the daemon's replay
-                // window between snapshot and subscribe. Two recovery moves:
-                //
-                // 1) Treat the in-scope snapshot as authoritative. If it
-                //    reports an active daemon-owned recording, invoke the
-                //    promotion callback so the orchestrator can lift any UI
-                //    still stuck in `.starting` to `.recording` — without
-                //    this, a `started` event aged past the new subscribe
-                //    cursor leaves the UI hung indefinitely (SCR-59). The
-                //    handler is a no-op once state is past `.starting`, so
-                //    the call is safe on every cursor_unknown with a
-                //    healthy snapshot, including the second-and-later
-                //    iterations after the first promotion lands.
-                //
-                // 2) When (1) applies, the cursor_unknown is a transport
-                //    hiccup on a recording the snapshot confirms is alive
-                //    — not a failure. Skip the `consecutiveFailures`
-                //    increment so repeated evictions cannot tear down a
-                //    recording we just successfully re-attached to. Still
-                //    apply backoff so a pathological replay-window
-                //    mismatch cannot become a hot loop, but keep the
-                //    counter at zero so the cap-driven `.lostContact`
-                //    exit fires only for real transport loss.
-                //
-                // The streamClosed path above does NOT clear
-                // pendingStartCursor — a connection drop before `started`
-                // arrives retries the same start cursor. That retry will
-                // 410 here if the cursor has aged, cascading into the
-                // same recovery branch.
+                // Daemon replay window aged past the requested cursor (410).
+                // If the snapshot confirms the recording is alive, signal
+                // the orchestrator to promote `.starting → .recording`
+                // (SCR-59) and skip the `consecutiveFailures` increment —
+                // recovery-success must not drive `.lostContact`. Backoff
+                // on a separate streak (`consecutiveSnapshotRecoveries`,
+                // capped at 5s) prevents a 410-only daemon from hot-looping.
+                // The `streamClosed` branch above keeps `pendingStartCursor`,
+                // so a pre-`started` stream drop cascades into this branch.
                 callbacks.clearPendingStartCursor()
                 daemonSessionLogger.info("Daemon event stream evicted cursor; refetching snapshot.")
+                let recoveryBackoff: TimeInterval
                 if snapshot.isRecording == true, snapshot.daemonOwned {
                     let startedAt = snapshot.startedAt.map(Date.init(timeIntervalSince1970:)) ?? Date()
-                    callbacks.onPromoteFromSnapshot(startedAt)
+                    callbacks.onSnapshotConfirmedActiveRecording(startedAt)
+                    consecutiveSnapshotRecoveries += 1
+                    let attempt = max(0, consecutiveSnapshotRecoveries - 1)
+                    recoveryBackoff = min(baseBackoff * pow(2.0, Double(attempt)), recoveryCappedBackoff)
                 } else {
                     consecutiveFailures += 1
                     if consecutiveFailures >= maxConsecutiveFailures {
                         return .lostContact
                     }
+                    let attempt = max(0, consecutiveFailures - 1)
+                    recoveryBackoff = min(baseBackoff * pow(2.0, Double(attempt)), cappedBackoff)
                 }
                 if callbacks.isRecording() {
-                    let attempt = max(0, consecutiveFailures - 1)
-                    let backoff = min(baseBackoff * pow(2.0, Double(attempt)), cappedBackoff)
-                    try? await Task.sleep(nanoseconds: UInt64(backoff * 1_000_000_000))
+                    try? await Task.sleep(nanoseconds: UInt64(recoveryBackoff * 1_000_000_000))
                 }
                 continue
             } catch {
@@ -336,6 +328,7 @@ final class LiveDaemonSessionService: DaemonSessionService {
 
             if sawProgress {
                 consecutiveFailures = 0
+                consecutiveSnapshotRecoveries = 0
             } else {
                 consecutiveFailures += 1
                 if consecutiveFailures >= maxConsecutiveFailures {

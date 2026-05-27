@@ -463,13 +463,10 @@ final class RecorderController: ObservableObject {
                     getPendingStartCursor: { [weak self] in self?.machine.pendingStartCursor },
                     clearPendingStartCursor: { [weak self] in self?.machine.clearPendingStartCursor() },
                     isRecording: { [weak self] in self?.state.isRecording ?? false },
-                    onPromoteFromSnapshot: { [weak self] startedAt in
-                        // `.starting`-only guard: promotion lifts a stuck
-                        // initial-attach out of `.starting`, but must never
-                        // regress `.recording` (clobbering elapsed) or
-                        // `.stopping` (regressing to .recording).
-                        // `observeActiveDaemonSession` mirrors the
-                        // `syncDaemonSnapshot()` recovery path.
+                    onSnapshotConfirmedActiveRecording: { [weak self] startedAt in
+                        // `.starting`-only — mirrors syncDaemonSnapshot's
+                        // recovery path; no-op past `.starting` so it can't
+                        // regress `.recording` (clobbering elapsed) or `.stopping`.
                         guard let self else { return }
                         if case .starting = self.state {
                             self.apply(self.machine.observeActiveDaemonSession(startedAt: startedAt))
