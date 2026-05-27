@@ -42,6 +42,8 @@ Without `DEVELOPMENT_TEAM` set, xcodegen leaves the placeholder in `project.pbxp
 
 ## Build
 
+> **Note:** On a fresh clone, run `xcodegen generate` from `macos/` before any `xcodebuild` command — the `.xcodeproj` is gitignored and only exists locally. Install xcodegen first if you haven't: `brew install xcodegen`. See [Generate the Xcode project](#generate-the-xcode-project) above.
+
 From Xcode: select the `ScreenCap` scheme and **Product → Build** (`Cmd+B`).
 
 From the command line:
@@ -50,6 +52,18 @@ From the command line:
 cd macos
 xcodebuild -project ScreenCap.xcodeproj -scheme ScreenCap -configuration Debug build
 ```
+
+### Run tests
+
+The Swift test target lives at `macos/ScreenCapTests/`. To run it from the command line:
+
+```bash
+cd macos
+xcodebuild test -only-testing:ScreenCapTests \
+  -project ScreenCap.xcodeproj -scheme ScreenCap
+```
+
+If the build fails with errors like `cannot find type 'RecordingState' in scope`, the `.xcodeproj` is missing files that were added since the last `xcodegen generate`. Re-run `xcodegen generate` from `macos/` (after `brew install xcodegen` if needed) and try again.
 
 ## One-command dev run
 
