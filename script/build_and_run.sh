@@ -179,7 +179,31 @@ build_cli_if_needed() {
   # `click.confirm()`. The prompt goes to the redirected stdout, but stdin
   # is still the user's terminal, so the binary blocks on input() forever
   # and the script appears stuck at this phase.
-  if [[ -x "$CLI_BINARY" ]] && "$CLI_BINARY" --no-update-check serve --help >/dev/null 2>&1; then
+
+  # Dev-source mode bypasses the bundled binary entirely (the launcher
+  # execs the in-repo source via $SCREENCAP_DEV_PYTHON). Skip the
+  # staleness check + rebuild so iteration stays fast in that mode.
+  if [[ "${SCREENCAP_DAEMON_USE_DEV_SOURCE:-0}" == "1" ]]; then
+    return
+  fi
+
+  local needs_rebuild=0
+  local rebuild_reason=""
+
+  if [[ ! -x "$CLI_BINARY" ]] || ! "$CLI_BINARY" --no-update-check serve --help >/dev/null 2>&1; then
+    needs_rebuild=1
+    rebuild_reason="bundle missing or broken"
+  elif [[ -n "$(find "$ROOT_DIR/src/screencap" -name '*.py' -newer "$CLI_BINARY" -print -quit 2>/dev/null)" ]]; then
+    # Any .py file in src/screencap is newer than the bundled binary —
+    # without this check the daemon would silently run stale code, and
+    # the developer would think their fix didn't work when it just
+    # wasn't running. PyInstaller rebuild is slow (minutes); use
+    # SCREENCAP_DAEMON_USE_DEV_SOURCE=1 to bypass it for fast iteration.
+    needs_rebuild=1
+    rebuild_reason="src/screencap/*.py is newer than the bundled binary"
+  fi
+
+  if [[ "$needs_rebuild" -eq 0 ]]; then
     return
   fi
 
@@ -188,7 +212,7 @@ build_cli_if_needed() {
     exit 1
   fi
 
-  echo "Building screencap CLI bundle for helper..."
+  echo "Building screencap CLI bundle for helper ($rebuild_reason)..."
   # Subshell-cd so PyInstaller writes dist/ and build/ relative to the repo
   # root regardless of where this script was invoked from. The outer cwd
   # stays unchanged.
@@ -196,6 +220,24 @@ build_cli_if_needed() {
     cd "$ROOT_DIR"
     "$SCREENCAP_DEV_PYTHON" -m PyInstaller --noconfirm "$ROOT_DIR/pyinstaller/screencap.spec"
   )
+}
+
+restart_daemon_if_loaded() {
+  # launchd's KeepAlive keeps the daemon process alive across app and CLI
+  # rebuilds. Without an explicit kickstart, a freshly-built CLI bundle or
+  # an updated launchctl setenv (e.g. SCREENCAP_DAEMON_USE_DEV_SOURCE)
+  # never reaches the running daemon — the developer tests fresh source
+  # against stale execution. Kickstart -k forces the LaunchAgent to
+  # terminate and respawn from the current plist / env / binary.
+  local uid
+  uid="$(id -u)"
+  if ! /bin/launchctl print "gui/$uid/com.screencap.daemon" >/dev/null 2>&1; then
+    # Daemon not loaded yet (e.g. first run, or after `screencap serve
+    # --uninstall`). Nothing to restart — the SwiftUI app will install it
+    # on launch via SMAppService.
+    return
+  fi
+  /bin/launchctl kickstart -k "gui/$uid/com.screencap.daemon" >/dev/null 2>&1 || true
 }
 
 kill_existing_app() {
@@ -228,6 +270,12 @@ build_app() {
 launch_app() {
   prepare_launch_env
   publish_launch_env
+  # Kickstart the daemon AFTER publish_launch_env so the respawned helper
+  # inherits the freshly-set launchctl env (PATH, SCREENCAP_DEV_PYTHON,
+  # SCREENCAP_DAEMON_USE_DEV_SOURCE). Without this, env changes published
+  # by this script never reach the long-lived daemon process.
+  echo "==> Restarting daemon helper (if loaded)"
+  restart_daemon_if_loaded
 
   : >"$STDOUT_LOG"
   : >"$STDERR_LOG"
