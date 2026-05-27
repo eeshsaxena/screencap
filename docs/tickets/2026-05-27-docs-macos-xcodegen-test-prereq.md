@@ -12,8 +12,9 @@ created: 2026-05-27
 On a fresh clone of `proteus-computer-use/screencap`, running
 
 ```bash
+cd macos
 xcodebuild test -only-testing:ScreenCapTests \
-  -project macos/ScreenCap.xcodeproj -scheme ScreenCap
+  -project ScreenCap.xcodeproj -scheme ScreenCap
 ```
 
 fails Swift compilation with errors like `cannot find type 'RecordingState' in scope`. The cause is environmental, not a code bug: [macos/.gitignore:2](../../macos/.gitignore) intentionally excludes `ScreenCap.xcodeproj/` (including `project.pbxproj`), and the source-of-truth `macos/project.yml` is processed by XcodeGen. New source files added since the last local `xcodegen generate` (e.g. [RecordingStateMachine.swift](../../macos/ScreenCap/Controllers/RecordingStateMachine.swift), [DaemonSessionService.swift](../../macos/ScreenCap/Controllers/DaemonSessionService.swift)) are missing from any stale or absent pbxproj, so Xcode can't see them and dependent symbols (`RecordingState`, etc.) fail to resolve.
@@ -30,22 +31,22 @@ Hit during SCR-59 verification (PR #188). Fix is to run `xcodegen generate` from
 
 ## What's needed
 
-Pick option 1 first; escalate only if the problem recurs.
+Pick option 1 first. Escalate to option 2 if two or more contributors report this failure within one month of merge.
 
 1. **Document the prerequisite in `macos/README.md`** (cheapest, low risk).
    - Add an explicit "Run tests" subsection under "Build" with the `xcodebuild test -only-testing:ScreenCapTests` invocation.
    - Add a one-line "before running any `xcodebuild` command from a fresh clone, run `xcodegen generate` first — the `.xcodeproj` is gitignored" callout near the start of "Build" (or as a `> Note:` block right before the first `xcodebuild` snippet).
    - Ensure the `brew install xcodegen` install command is referenced (or repeated) in the new section so a contributor who skipped the Requirements list still sees it.
 
-2. **Add a pre-build wrapper / Makefile target** that runs `xcodegen generate` if `ScreenCap.xcodeproj/project.pbxproj` is missing or older than `project.yml`'s mtime. Reuse the gating logic from [script/build_and_run.sh:162](../../script/build_and_run.sh). Reserve for the case where contributors keep hitting the failure despite the doc fix.
+2. **Add a pre-build wrapper / Makefile target** that runs `xcodegen generate` if `ScreenCap.xcodeproj/project.pbxproj` is missing or older than `project.yml`'s mtime. Reuse the gating logic from [script/build_and_run.sh:162](../../script/build_and_run.sh). Reserve for the case where the escalation trigger above fires (≥2 reports within one month of merging option 1).
 
 3. **Check `project.pbxproj` into git and drop it from `.gitignore`.** Explicitly out of scope here — the file is gitignored deliberately (probably to avoid merge conflicts on a generated artifact), and reversing that decision deserves its own discussion. Do not pursue without first investigating why the .gitignore entry was added.
 
 ## Acceptance
 
-- A new contributor can `git clone`, follow [macos/README.md](../../macos/README.md) top-to-bottom, and run `xcodebuild test -only-testing:ScreenCapTests` successfully on first try.
-- The README does not assume `xcodegen` is already installed — the install command (`brew install xcodegen`) is reachable from the test-invocation section, either inline or via a clearly-named link to the existing Requirements bullet.
-- The exact `xcodebuild test ...` invocation used during SCR-59 verification is documented verbatim so contributors can copy-paste.
+- A new contributor can `git clone` and follow [macos/README.md](../../macos/README.md) from Requirements through the "Run tests" section and run `xcodebuild test -only-testing:ScreenCapTests` successfully on first try.
+- The new "Run tests" subsection contains either an inline `brew install xcodegen` command or a link that resolves directly to the Requirements bullet (not just the top of the README).
+- The `xcodebuild test ...` invocation used during SCR-59 verification is documented in copy-pasteable form (the `cd macos` variant is acceptable as an equivalent).
 
 ## Out of scope
 
