@@ -166,6 +166,22 @@ def run_recording_worker(args: dict) -> None:
     from screencap.engine.screen_recorder import IpcChannels, SigtermOnly
     from screencap.recorder import DiskFullError, start_recording
 
+    # Fail-fast Screen Recording preflight (daemon-spawn path only).
+    # The engine policy is PermNoop, so without this check the recording
+    # loop would enter `screen_event_reader` (20 fps) and trigger a fresh
+    # TCC prompt on every `screencapture` / Quartz call when the daemon
+    # binary's code identity is not authorized. Using a fresh subprocess
+    # bypasses the macOS per-process TCC cache. A `None` (probe failed)
+    # result is fail-open: defer to the engine's existing handling rather
+    # than killing recordings on a transient subprocess hiccup.
+    if sys.platform == "darwin":
+        from screencap._stderr_events import EVENT_PERMISSION_LOST, emit_event
+        from screencap.recorder import _check_permission_fresh
+
+        if _check_permission_fresh("Screen Recording") is False:
+            emit_event(EVENT_PERMISSION_LOST, permission="screen_recording", elapsed=0.0)
+            raise SystemExit(3)
+
     capture_dir_hint = Path(args.get("capture_dir_hint", ""))
     disk_full = False
     capture_dir: Path | None = None
