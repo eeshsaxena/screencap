@@ -173,7 +173,13 @@ generate_project_if_needed() {
 }
 
 build_cli_if_needed() {
-  if [[ -x "$CLI_BINARY" ]] && "$CLI_BINARY" serve --help >/dev/null 2>&1; then
+  # `--no-update-check` is critical: the `cli` group callback runs
+  # `maybe_check_for_update()` even on subcommand `--help`, and when the
+  # bundled CLI is older than the GCS-published version it calls
+  # `click.confirm()`. The prompt goes to the redirected stdout, but stdin
+  # is still the user's terminal, so the binary blocks on input() forever
+  # and the script appears stuck at this phase.
+  if [[ -x "$CLI_BINARY" ]] && "$CLI_BINARY" --no-update-check serve --help >/dev/null 2>&1; then
     return
   fi
 
