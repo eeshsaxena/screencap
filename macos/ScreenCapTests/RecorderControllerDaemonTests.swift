@@ -323,8 +323,172 @@ final class RecorderControllerDaemonTests: XCTestCase {
             if case .recording = recorder.state { return true }
             return false
         }
-        XCTAssertGreaterThanOrEqual(snapshotCount.value, 2)
+        // Pre-SCR-59 this asserted `>= 2` because the second snapshot was a
+        // *prerequisite* for reaching `.recording` (the `started` event arrived
+        // only via the iter-2 resubscribe). After SCR-59, iter 1 promotes
+        // state to `.recording` directly from the in-scope snapshot, so the
+        // iter-2 snapshot fetch is racy with the waitUntil. The `>= 1`
+        // assertion still proves the cursor_unknown catch ran; the recovery
+        // path itself is asserted by `state == .recording` above.
+        XCTAssertGreaterThanOrEqual(snapshotCount.value, 1)
         XCTAssertNil(recorder.lastError)
+    }
+
+    /// SCR-59 red test. When `cursor_unknown` (HTTP 410) evicts the start
+    /// cursor *and* the `started` event has already aged past the fresh
+    /// snapshot cursor, the controller's only path out of `.starting` —
+    /// the `started` event delivered via replay — never arrives. The
+    /// existing `testCursorUnknown410FromEventsStreamFallsBackThroughSnapshotRefetch`
+    /// papers over this branch by keeping `started` in the second-subscribe
+    /// replay; here the second subscribe yields only `subscribed`, mirroring
+    /// the production race where the daemon's replay buffer has fully aged
+    /// past the start boundary.
+    ///
+    /// Expected behavior after fix: controller treats the daemon snapshot
+    /// as authoritative (mirroring `syncDaemonSnapshot`) and promotes
+    /// `.starting → .recording` from `snapshot.startedAt` instead of
+    /// hanging on the never-arriving event.
+    func testCursorUnknownEvictsStartedThenStuckInStartingWhenReplayHasAgedPast() async throws {
+        let startCount = LockedInt()
+        let snapshotCount = LockedInt()
+        let secondSubscribeCount = LockedInt()
+
+        _ = try startServer { request in
+            switch request.path {
+            case "/v0/daemon.info":
+                return .json(#"{"ok":true,"schema_version":1,"daemon_version":"test","api_schema_version":1,"build":null,"started_at":1.0}"#)
+            case "/v0/recording.start":
+                _ = startCount.incrementAndGet()
+                return .json(#"{"ok":true,"schema_version":1,"daemon_version":"test","api_schema_version":1,"session_id":"session-stuck","started_at":10.0,"engine_pid":9996,"cursor":2}"#)
+            case "/v0/session.snapshot":
+                guard startCount.value > 0 else {
+                    return .json(#"{"ok":true,"schema_version":1,"daemon_version":"test","api_schema_version":1,"is_recording":false,"daemon_owned":false,"recording_name":null,"started_at":null,"claimant":null,"recovering":false,"cursor":0}"#)
+                }
+                // First snapshot returns cursor=2 to set up the 410. Second
+                // and later snapshots return cursor=5 — the daemon has
+                // advanced past `started` (at cursor 3) and the event has
+                // been evicted from the replay window.
+                if snapshotCount.incrementAndGet() == 1 {
+                    return .json(#"{"ok":true,"schema_version":1,"daemon_version":"test","api_schema_version":1,"is_recording":true,"daemon_owned":true,"recording_name":"stuck","started_at":10.0,"claimant":"daemon","recovering":false,"cursor":2}"#)
+                }
+                return .json(#"{"ok":true,"schema_version":1,"daemon_version":"test","api_schema_version":1,"is_recording":true,"daemon_owned":true,"recording_name":"stuck","started_at":10.0,"claimant":"daemon","recovering":false,"cursor":5}"#)
+            case "/v0/events?since=2":
+                // 410 cursor_unknown — the bug trigger.
+                return .json(
+                    #"{"ok":false,"schema_version":1,"daemon_version":"test","api_schema_version":1,"error":"cursor_unknown","requested_cursor":2}"#,
+                    status: 410,
+                    reason: "Gone"
+                )
+            case "/v0/events?since=5":
+                // Critical contrast with the sibling test: only `subscribed`,
+                // never `started`. The daemon's replay buffer has aged past
+                // the start boundary, so the event will never be delivered.
+                _ = secondSubscribeCount.incrementAndGet()
+                return .chunked([
+                    #"{"type":"subscribed","schema_version":1,"cursor":5,"ts":11.0}"# + "\n",
+                ], terminate: false)
+            default:
+                XCTFail("Unexpected request path \(request.path)")
+                return .json(#"{"ok":false,"schema_version":1,"daemon_version":"test","api_schema_version":1,"error":"unexpected"}"#, status: 500)
+            }
+        }
+
+        let recorder = RecorderController()
+        self.recorder = recorder
+        await recorder.probeDaemon()
+        recorder.start(name: "stuck")
+
+        // Give the controller time to: (1) handle the 410 with backoff
+        // (~100ms), (2) re-fetch the snapshot, (3) issue the second
+        // subscribe, (4) receive `subscribed`, and (5) park inside the
+        // for-await waiting for events that won't arrive. 800ms is well
+        // beyond the 100ms baseBackoff and leaves slack for CI scheduling.
+        try await Task.sleep(nanoseconds: 800_000_000)
+
+        // Confirm the second subscribe was reached so the assertion below
+        // isn't passing for the wrong reason (e.g., test timed out before
+        // the recovery path ran).
+        XCTAssertGreaterThanOrEqual(secondSubscribeCount.value, 1, "Second subscribe at since=5 should have been issued after cursor_unknown recovery")
+
+        // Expected post-fix behavior: snapshot promotion lifts the state to
+        // `.recording` even though `started` never arrives. On `main` this
+        // assertion fails because the controller has no snapshot-promotion
+        // path inside `consumeEventStream`.
+        guard case .recording = recorder.state else {
+            return XCTFail("Expected .recording (via snapshot promotion); got \(recorder.state) — controller is stuck after cursor_unknown evicted `started` past the new snapshot cursor")
+        }
+        XCTAssertNil(recorder.lastError)
+    }
+
+    /// SCR-59 follow-on regression test. Post-fix, the `cursor_unknown` catch
+    /// path is a *recovery-success* when the in-scope snapshot confirms an
+    /// active daemon-owned recording — the orchestrator has either just
+    /// promoted out of `.starting` (first iteration) or is already
+    /// `.recording` (subsequent iterations where the orchestrator handler
+    /// no-ops). Either way it must not consume the failure budget; otherwise
+    /// repeated evictions against a healthy recording would hit
+    /// `.lostContact` after `maxConsecutiveFailures` iterations and tear down
+    /// a recording the snapshot has confirmed is alive.
+    ///
+    /// Discrimination is timing-based: with the budget skip, `consecutiveFailures`
+    /// stays at 0 and backoff stays at `baseBackoff` (~100ms) → many subscribe
+    /// attempts fit in a short window. Without the skip, backoff doubles
+    /// (0.1, 0.2, 0.4, 0.8, 1.6 s…) and only ~4-5 attempts fit in 1.5s. The
+    /// `≥8` threshold leaves CI variance headroom while preserving the signal.
+    func testRepeatedCursorUnknownWithActiveSnapshotDoesNotTearDownRecording() async throws {
+        let startCount = LockedInt()
+        let subscribeCount = LockedInt()
+
+        _ = try startServer { request in
+            switch request.path {
+            case "/v0/daemon.info":
+                return .json(#"{"ok":true,"schema_version":1,"daemon_version":"test","api_schema_version":1,"build":null,"started_at":1.0}"#)
+            case "/v0/recording.start":
+                _ = startCount.incrementAndGet()
+                return .json(#"{"ok":true,"schema_version":1,"daemon_version":"test","api_schema_version":1,"session_id":"session-repeated","started_at":10.0,"engine_pid":9997,"cursor":2}"#)
+            case "/v0/session.snapshot":
+                guard startCount.value > 0 else {
+                    return .json(#"{"ok":true,"schema_version":1,"daemon_version":"test","api_schema_version":1,"is_recording":false,"daemon_owned":false,"recording_name":null,"started_at":null,"claimant":null,"recovering":false,"cursor":0}"#)
+                }
+                // Steady cursor=5 every snapshot post-start — every subscribe
+                // beyond the first (since=2 from pendingStartCursor) is at
+                // since=5, and the events handler 410s both.
+                return .json(#"{"ok":true,"schema_version":1,"daemon_version":"test","api_schema_version":1,"is_recording":true,"daemon_owned":true,"recording_name":"repeated","started_at":10.0,"claimant":"daemon","recovering":false,"cursor":5}"#)
+            case let path where path.hasPrefix("/v0/events?since="):
+                _ = subscribeCount.incrementAndGet()
+                return .json(
+                    #"{"ok":false,"schema_version":1,"daemon_version":"test","api_schema_version":1,"error":"cursor_unknown","requested_cursor":5}"#,
+                    status: 410,
+                    reason: "Gone"
+                )
+            default:
+                XCTFail("Unexpected request path \(request.path)")
+                return .json(#"{"ok":false,"schema_version":1,"daemon_version":"test","api_schema_version":1,"error":"unexpected"}"#, status: 500)
+            }
+        }
+
+        let recorder = RecorderController()
+        self.recorder = recorder
+        await recorder.probeDaemon()
+        recorder.start(name: "repeated")
+
+        // 1.5s is well past the 100ms baseBackoff repeated ~10-15 times;
+        // also past the cumulative ~1.5s where exponential backoff would
+        // only have allowed ~4 attempts. The threshold below distinguishes
+        // the two regimes without making the test slow.
+        try await Task.sleep(nanoseconds: 1_500_000_000)
+
+        XCTAssertGreaterThanOrEqual(
+            subscribeCount.value,
+            8,
+            "Budget-skip on cursor_unknown-paired-with-healthy-snapshot should keep backoff at baseline (~100ms). Saw \(subscribeCount.value) subscribes in 1.5s; expected ≥8. A low count indicates the failure budget is still being incremented and backoff is escalating exponentially."
+        )
+
+        // Recording must survive the repeated evictions.
+        guard case .recording = recorder.state else {
+            return XCTFail("Repeated cursor_unknown tore down a healthy recording; state=\(recorder.state). The orchestrator should stay `.recording` indefinitely while the daemon snapshot keeps reporting an active session.")
+        }
+        XCTAssertNil(recorder.lastError, "Expected no error after repeated cursor_unknown with healthy snapshot; got: \(recorder.lastError ?? "nil")")
     }
 
     /// A `recording_failed` event delivered via replay must propagate to

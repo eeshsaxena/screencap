@@ -64,6 +64,14 @@ enum DaemonSession {
         let getPendingStartCursor: @MainActor () -> Int?
         let clearPendingStartCursor: @MainActor () -> Void
         let isRecording: @MainActor () -> Bool
+        /// Invoked from the `cursor_unknown` recovery path when the in-scope
+        /// snapshot confirms an active daemon-owned recording. The orchestrator
+        /// gates on `.starting` before applying the snapshot's `startedAt` —
+        /// this lets the UI recover when `started` has aged past the new
+        /// subscribe cursor and won't be replayed. Safe to invoke on every
+        /// cursor_unknown with a healthy snapshot: the orchestrator handler is
+        /// a no-op once state is past `.starting`.
+        let onPromoteFromSnapshot: @MainActor (Date) -> Void
     }
 }
 
@@ -276,16 +284,44 @@ final class LiveDaemonSessionService: DaemonSessionService {
             } catch DaemonClientError.envelopeError(let code, _) where code == "cursor_unknown" {
                 if Task.isCancelled { return .shutdown }
                 // The requested cursor was evicted from the daemon's replay
-                // window between snapshot and subscribe. Refetch the snapshot
-                // and resubscribe with a fresh cursor; leave state intact so
-                // the UI does not flicker to `.idle`. Count this against the
-                // failure budget and apply backoff so a persistently mismatched
-                // replay window cannot become an infinite hot loop.
+                // window between snapshot and subscribe. Two recovery moves:
+                //
+                // 1) Treat the in-scope snapshot as authoritative. If it
+                //    reports an active daemon-owned recording, invoke the
+                //    promotion callback so the orchestrator can lift any UI
+                //    still stuck in `.starting` to `.recording` — without
+                //    this, a `started` event aged past the new subscribe
+                //    cursor leaves the UI hung indefinitely (SCR-59). The
+                //    handler is a no-op once state is past `.starting`, so
+                //    the call is safe on every cursor_unknown with a
+                //    healthy snapshot, including the second-and-later
+                //    iterations after the first promotion lands.
+                //
+                // 2) When (1) applies, the cursor_unknown is a transport
+                //    hiccup on a recording the snapshot confirms is alive
+                //    — not a failure. Skip the `consecutiveFailures`
+                //    increment so repeated evictions cannot tear down a
+                //    recording we just successfully re-attached to. Still
+                //    apply backoff so a pathological replay-window
+                //    mismatch cannot become a hot loop, but keep the
+                //    counter at zero so the cap-driven `.lostContact`
+                //    exit fires only for real transport loss.
+                //
+                // The streamClosed path above does NOT clear
+                // pendingStartCursor — a connection drop before `started`
+                // arrives retries the same start cursor. That retry will
+                // 410 here if the cursor has aged, cascading into the
+                // same recovery branch.
                 callbacks.clearPendingStartCursor()
                 daemonSessionLogger.info("Daemon event stream evicted cursor; refetching snapshot.")
-                consecutiveFailures += 1
-                if consecutiveFailures >= maxConsecutiveFailures {
-                    return .lostContact
+                if snapshot.isRecording == true, snapshot.daemonOwned {
+                    let startedAt = snapshot.startedAt.map(Date.init(timeIntervalSince1970:)) ?? Date()
+                    callbacks.onPromoteFromSnapshot(startedAt)
+                } else {
+                    consecutiveFailures += 1
+                    if consecutiveFailures >= maxConsecutiveFailures {
+                        return .lostContact
+                    }
                 }
                 if callbacks.isRecording() {
                     let attempt = max(0, consecutiveFailures - 1)
