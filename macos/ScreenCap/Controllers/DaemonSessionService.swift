@@ -306,6 +306,12 @@ final class LiveDaemonSessionService: DaemonSessionService {
                 if snapshot.isRecording == true, snapshot.daemonOwned {
                     let startedAt = snapshot.startedAt.map(Date.init(timeIntervalSince1970:)) ?? Date()
                     callbacks.onSnapshotConfirmedActiveRecording(startedAt)
+                    // Healthy snapshot is positive evidence the recording is
+                    // alive — equivalent recovery signal to `sawProgress` at
+                    // the bottom of the loop. Reset `consecutiveFailures` so
+                    // accumulated drops from before this confirmation can't
+                    // push us toward `.lostContact` on the next transient.
+                    consecutiveFailures = 0
                     consecutiveSnapshotRecoveries += 1
                     let attempt = max(0, consecutiveSnapshotRecoveries - 1)
                     recoveryBackoff = min(baseBackoff * pow(2.0, Double(attempt)), recoveryCappedBackoff)
