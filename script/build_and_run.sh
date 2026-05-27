@@ -173,7 +173,13 @@ generate_project_if_needed() {
 }
 
 build_cli_if_needed() {
-  if [[ -x "$CLI_BINARY" ]] && "$CLI_BINARY" serve --help >/dev/null 2>&1; then
+  # `--no-update-check` is critical: the `cli` group callback runs
+  # `maybe_check_for_update()` even on subcommand `--help`, and when the
+  # bundled CLI is older than the GCS-published version it calls
+  # `click.confirm()`. The prompt goes to the redirected stdout, but stdin
+  # is still the user's terminal, so the binary blocks on input() forever
+  # and the script appears stuck at this phase.
+  if [[ -x "$CLI_BINARY" ]] && "$CLI_BINARY" --no-update-check serve --help >/dev/null 2>&1; then
     return
   fi
 
@@ -281,18 +287,29 @@ main() {
       ;;
   esac
 
+  # Progress echoes for each phase: without them the script is silent for
+  # ~5-15s before xcodebuild produces its first line of output (env parse +
+  # PATH munging + pkill/pgrep wait + CLI cache check + xcodebuild's own
+  # dependency-graph prelude), which reads as a hang.
+
   # Pick up local-only config (DEVELOPMENT_TEAM etc.) before tool discovery so
   # xcodegen and xcodebuild see the right signing identity.
+  echo "==> Loading .env"
   load_local_env
 
   # Normalize PATH before any tool discovery so Homebrew-installed helpers
   # like xcodegen are found even when the script is launched from a minimal
   # GUI environment.
+  echo "==> Preparing launch environment"
   prepare_launch_env
+  echo "==> Checking Xcode project"
   generate_project_if_needed
   warn_if_ad_hoc_signing
+  echo "==> Stopping any running $APP_NAME"
   kill_existing_app
+  echo "==> Checking CLI bundle"
   build_cli_if_needed
+  echo "==> Building app (xcodebuild)"
   build_app
 
   case "$MODE" in
