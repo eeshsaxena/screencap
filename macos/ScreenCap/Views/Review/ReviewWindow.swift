@@ -30,18 +30,11 @@ struct ReviewWindow: View {
 
     init(recordingName: String) {
         self.recordingName = recordingName
-        let dismissTracker = DismissActionForwarder()
         _model = StateObject(wrappedValue: ReviewWindowViewModel(
             recordingName: recordingName,
-            effects: LiveReviewWindowEffects(dismissTracker: dismissTracker)
+            effects: LiveReviewWindowEffects()
         ))
-        self.dismissTracker = dismissTracker
     }
-
-    /// Threaded through `init` so the SwiftUI `@Environment(\.dismiss)`
-    /// action — only resolvable inside `body` — can be forwarded to the
-    /// viewmodel's effects channel without retaining the view.
-    private let dismissTracker: DismissActionForwarder
 
     var body: some View {
         VStack(spacing: 0) {
@@ -53,7 +46,10 @@ struct ReviewWindow: View {
         .navigationTitle(recordingName)
         .onAppear {
             // Forward the dismiss action so the auto-close timer can fire it.
-            dismissTracker.dismiss = { dismiss() }
+            // Set on the StateObject-preserved viewmodel rather than a
+            // separate forwarder struct so SwiftUI's View-struct churn
+            // doesn't replace the closure the viewmodel actually holds.
+            model.dismissHandler = { dismiss() }
         }
         .task {
             await model.loadReviewData()
@@ -230,24 +226,13 @@ struct ReviewWindow: View {
     }
 }
 
-/// Captures the `@Environment(\.dismiss)` action so the viewmodel's
-/// auto-close timer can fire it without holding a reference to the View.
-@MainActor
-final class DismissActionForwarder {
-    var dismiss: (() -> Void)?
-    func callAsFunction() { dismiss?() }
-}
-
 /// Production-side `ReviewWindowEffects` — bridges the viewmodel's
-/// dismiss / refresh / scheduling needs to live SwiftUI / index APIs.
+/// refresh / scheduling needs to live AppKit / NotificationCenter APIs.
+/// Dismiss is handled directly by the viewmodel's `dismissHandler`
+/// (set in `ReviewWindow.onAppear`) so this effects type stays free of
+/// SwiftUI environment dependencies.
 @MainActor
 struct LiveReviewWindowEffects: ReviewWindowEffects {
-    let dismissTracker: DismissActionForwarder
-
-    func dismiss() {
-        dismissTracker.callAsFunction()
-    }
-
     func refreshIndex() async {
         // The index instance lives in the SwiftUI environment of the main
         // window. The review window receives it via `.environmentObject`

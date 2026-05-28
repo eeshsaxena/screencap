@@ -60,10 +60,6 @@ final class LiveReviewDataLoader: ReviewDataLoader {
 /// viewmodel's wall-clock dependencies can be controlled deterministically.
 @MainActor
 protocol ReviewWindowEffects {
-    /// Asks the host window to dismiss. The viewmodel calls this on the
-    /// auto-close timer firing in `.succeeded` and on explicit cancel
-    /// from the bottom-action row.
-    func dismiss()
     /// Refreshes the shared `RecordingsIndex` after a successful upload so
     /// the source row's eligibility predicate flips. U9 wires this through.
     func refreshIndex() async
@@ -104,6 +100,14 @@ final class ReviewWindowViewModel: ObservableObject {
 
     let recordingName: String
     let uploadController: UploadController
+
+    /// Set by the view's `.onAppear` so the auto-close timer can dismiss
+    /// the window without the viewmodel depending on a SwiftUI
+    /// `@Environment(\.dismiss)` reference. Lives on the viewmodel rather
+    /// than a separate forwarder so it shares the StateObject's preserved
+    /// identity (a separate forwarder would be reinstantiated on every
+    /// View struct re-init, diverging from the one the viewmodel holds).
+    var dismissHandler: (() -> Void)?
 
     private let loader: ReviewDataLoader
     private let effects: ReviewWindowEffects
@@ -227,7 +231,7 @@ final class ReviewWindowViewModel: ObservableObject {
             // lets a window-close-during-confirmation cancel the dismiss
             // dispatch so it doesn't fire against an already-gone window.
             autoCloseHandle = effects.scheduleAutoClose(after: autoCloseSeconds) { [weak self] in
-                self?.effects.dismiss()
+                self?.dismissHandler?()
             }
         case .failed(let message):
             // Carry the last-known ReviewData forward so the Retry button

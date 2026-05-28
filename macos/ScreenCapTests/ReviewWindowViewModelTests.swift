@@ -29,13 +29,11 @@ final class FakeReviewDataLoader: ReviewDataLoader {
 
 @MainActor
 final class FakeReviewWindowEffects: ReviewWindowEffects {
-    private(set) var dismissCalls = 0
     private(set) var refreshCalls = 0
     private(set) var scheduledAutoCloses: [Double] = []
     var pendingAutoClose: (() -> Void)?
     var autoCloseHandle: AutoCloseHandle?
 
-    func dismiss() { dismissCalls += 1 }
     func refreshIndex() async { refreshCalls += 1 }
 
     func scheduleAutoClose(after seconds: Double, _ action: @escaping @MainActor () -> Void) -> AutoCloseHandle {
@@ -168,6 +166,8 @@ final class ReviewWindowViewModelTests: XCTestCase {
         let controller = UploadController(service: service)
         let effects = FakeReviewWindowEffects()
         let model = makeModel(controller: controller, effects: effects)
+        var dismissCalls = 0
+        model.dismissHandler = { dismissCalls += 1 }
 
         await model.loadReviewData()
         model.startUpload()
@@ -177,7 +177,7 @@ final class ReviewWindowViewModelTests: XCTestCase {
 
         effects.fireAutoClose()
 
-        XCTAssertEqual(effects.dismissCalls, 1)
+        XCTAssertEqual(dismissCalls, 1)
     }
 
     /// Covers AE5: failure mid-upload keeps the window open with a Retry
