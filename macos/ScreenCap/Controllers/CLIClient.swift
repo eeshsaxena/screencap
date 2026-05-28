@@ -9,6 +9,11 @@ import Foundation
 protocol SpawnedProcessHandle: AnyObject {
     var isRunning: Bool { get }
     var processIdentifier: Int32 { get }
+    /// SIGTERM equivalent — graceful shutdown request. Plan U7's UploadController
+    /// invokes this on window-close-as-cancel; the Python side's SIGTERM
+    /// handler (U1) converts it to a KeyboardInterrupt-equivalent path that
+    /// emits `upload_failed(error: "interrupted")` before exiting.
+    func terminate()
     @discardableResult
     func forceKill() -> Bool
 }
