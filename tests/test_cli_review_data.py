@@ -165,6 +165,47 @@ def test_ensure_review_video_raises_when_video_missing(fake_recording):
         ensure_review_video(fake_recording)
 
 
+def test_reencode_command_forces_mp4_container():
+    """Regression pin: the atomic-write pattern writes to ``video_review.mp4.tmp``,
+    and ffmpeg infers container format from the file extension. ``.tmp`` is
+    not a registered muxer, so the encode fails immediately ("use a standard
+    extension for the filename or specify the format manually") unless ``-f
+    mp4`` is passed explicitly.
+
+    This test fakes ``subprocess.run`` and asserts the command list contains
+    ``-f mp4`` adjacent and before the output path.
+    """
+    from screencap.review import _reencode_for_avkit
+
+    captured: dict = {}
+
+    def fake_run(cmd, **kwargs):
+        captured["cmd"] = cmd
+        # Create the tmp file so os.replace doesn't ENOENT.
+        from pathlib import Path
+
+        Path(cmd[-1]).write_bytes(b"\x00")
+        return mock.MagicMock(returncode=0, stderr="")
+
+    with mock.patch("screencap.review.subprocess.run", side_effect=fake_run):
+        import tempfile
+        from pathlib import Path
+
+        with tempfile.TemporaryDirectory() as td:
+            src = Path(td) / "video.mp4"
+            src.write_bytes(b"\x00")
+            dst = Path(td) / "video_review.mp4"
+            _reencode_for_avkit(src, dst)
+
+    cmd = captured["cmd"]
+    # Output path is the last arg; -f mp4 must appear before it.
+    output_idx = len(cmd) - 1
+    f_idx = cmd.index("-f")
+    assert cmd[f_idx + 1] == "mp4", f"expected -f mp4, got -f {cmd[f_idx + 1]}"
+    assert f_idx < output_idx, "format flag must precede output path"
+    assert cmd[output_idx].endswith(".mp4.tmp"), "atomic-write tmp path is the regression context"
+
+
 # ---------------------------------------------------------------------------
 # prepare_review_data — orchestration
 # ---------------------------------------------------------------------------

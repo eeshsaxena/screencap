@@ -108,6 +108,12 @@ def _reencode_for_avkit(source: Path, destination: Path) -> None:
         # alongside, and re-encoding audio here would just add cost
         # for no benefit. AVKit gates audio playback on the video file.
         "-an",
+        # Force mp4 container — ffmpeg infers the format from the file
+        # extension, and `.mp4.tmp` from the atomic-write pattern below
+        # gives it `.tmp`, which is not a registered muxer. Without `-f
+        # mp4` the encode fails immediately with "use a standard extension
+        # for the filename or specify the format manually".
+        "-f", "mp4",
         str(tmp_destination),
     ]
     try:
