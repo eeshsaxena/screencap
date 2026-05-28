@@ -5,6 +5,7 @@ from __future__ import annotations
 import json
 import mimetypes
 import os
+import signal
 from concurrent.futures import ThreadPoolExecutor, as_completed
 from dataclasses import dataclass, field
 from datetime import datetime
@@ -20,7 +21,28 @@ from rich.progress import (
     TransferSpeedColumn,
 )
 
+from screencap._stderr_events import (
+    EVENT_UPLOAD_FAILED,
+    EVENT_UPLOAD_FILE_DONE,
+    EVENT_UPLOAD_FINISHED,
+    EVENT_UPLOAD_STARTED,
+    emit_event,
+)
 from screencap.config import get_recordings_dir
+
+
+def _raise_keyboard_interrupt(signum, frame):
+    """SIGTERM handler installed during upload_recording.
+
+    SIGTERM does not raise KeyboardInterrupt by default in CPython (only
+    SIGINT does), so the SwiftUI shell's window-close-as-cancel path
+    (which terminate()s the subprocess) would otherwise kill the process
+    silently with no chance to emit upload_failed or run cleanup. This
+    handler converts SIGTERM into the same KeyboardInterrupt the existing
+    Ctrl+C path already handles, giving us one cancel codepath. Must be
+    installed on the main thread (signal.signal restriction).
+    """
+    raise KeyboardInterrupt
 
 console = Console()
 
@@ -85,7 +107,7 @@ def _fmt_size(nbytes: int) -> str:
 
 
 def _write_upload_status(recording_dir: Path, result: UploadResult) -> None:
-    """Write upload status marker to recording directory."""
+    """Write upload status marker to recording directory atomically."""
     status = {
         "uploaded_at": datetime.now().isoformat(),
         "gcs_prefix": result.gcs_prefix,
@@ -93,9 +115,10 @@ def _write_upload_status(recording_dir: Path, result: UploadResult) -> None:
         "files_skipped": len(result.skipped),
         "total_bytes": result.total_bytes,
     }
-    (recording_dir / UPLOAD_STATUS_FILE).write_text(
-        json.dumps(status, indent=2)
-    )
+    final_path = recording_dir / UPLOAD_STATUS_FILE
+    tmp_path = final_path.with_suffix(final_path.suffix + ".tmp")
+    tmp_path.write_text(json.dumps(status, indent=2))
+    os.replace(tmp_path, final_path)
 
 
 def is_uploaded(recording_dir: Path) -> bool:
@@ -120,6 +143,9 @@ def _wal_checkpoint(recording_dir: Path) -> None:
 # Files that should never be uploaded (SQLite WAL artifacts, temp files)
 _UPLOAD_EXCLUDE = {".db-shm", ".db-wal"}
 
+# Files that should never be uploaded by name (review-only artifacts, etc.)
+_UPLOAD_EXCLUDE_NAMES = {"video_review.mp4"}
+
 
 def list_recording_files(recording_dir: Path) -> list[FileInfo]:
     """Return files in a recording dir, sorted largest-first.
@@ -132,6 +158,8 @@ def list_recording_files(recording_dir: Path) -> list[FileInfo]:
     files = []
     for p in sorted(recording_dir.iterdir()):
         if p.is_symlink() or not p.is_file() or p.name.startswith("."):
+            continue
+        if p.name in _UPLOAD_EXCLUDE_NAMES:
             continue
         if any(p.name.endswith(ext) for ext in _UPLOAD_EXCLUDE):
             continue
@@ -148,6 +176,8 @@ def list_recording_files(recording_dir: Path) -> list[FileInfo]:
     # Also include files in subdirectories (e.g., screenshots/)
     for p in sorted(recording_dir.rglob("*")):
         if p.is_symlink() or not p.is_file() or p.parent == recording_dir or p.name.startswith("."):
+            continue
+        if p.name in _UPLOAD_EXCLUDE_NAMES:
             continue
         try:
             size = p.stat().st_size
@@ -230,6 +260,13 @@ def upload_recording(
     2. Request signed URLs (server tells us which are new vs existing)
     3. Upload new files with progress bars (parallel via ThreadPoolExecutor)
     4. Return summary
+
+    Emits structured stderr lifecycle events (upload_started,
+    upload_file_done, upload_finished, upload_failed) consumed by the
+    SwiftUI review window's UploadController. See _stderr_events.py.
+
+    Installs a SIGTERM handler so the SwiftUI shell can cancel an
+    in-progress upload via subprocess.terminate(); restored on exit.
     """
     # Read immutable recording_id if available, fallback to dir name
     _id_file = recording_dir / ".recording_id"
@@ -258,96 +295,260 @@ def upload_recording(
         console.print(f"\n[dim]Dry run — nothing uploaded.[/dim]")
         return UploadResult(recording=recording_name, total_bytes=total_size)
 
-    # Request signed URLs
-    urls, gcs_prefix = request_signed_urls(recording_name, files)
+    # Install SIGTERM→KeyboardInterrupt so window-close-as-cancel from the
+    # SwiftUI shell surfaces through the same path Ctrl+C already uses.
+    # signal.signal requires the main thread; ValueError is raised on
+    # background threads. Skip silently in that case — the CLI invocation
+    # path is always main-thread, so cancel still works in practice.
+    #
+    # _UNSET sentinel disambiguates "install succeeded with None as the
+    # previous handler" (legitimate per stdlib — C-set handlers report as
+    # None) from "install never ran" (off-main-thread ValueError). Without
+    # the sentinel, the finally restore would silently skip the C-set case
+    # and leak our handler past the function. Installing INSIDE the outer
+    # try ensures a signal arriving between install and try-entry still
+    # routes through the finally restore.
+    _UNSET: object = object()
+    _previous_sigterm: object = _UNSET
+    _failed_emitted = False
+    try:
+        try:
+            _previous_sigterm = signal.signal(signal.SIGTERM, _raise_keyboard_interrupt)
+        except ValueError:
+            pass  # off-main-thread — restore guard below will no-op.
 
-    result = UploadResult(recording=recording_name, gcs_prefix=gcs_prefix)
-    to_upload = []
-    rejected = []
-    for f in files:
-        if f.name not in urls:
-            # Server didn't return this filename at all (rejected by validation)
-            rejected.append(f.name)
-        elif urls[f.name] is None:
-            result.skipped.append(f.name)
+        emit_event(
+            EVENT_UPLOAD_STARTED,
+            recording=recording_name,
+            file_count=len(files),
+            total_bytes=total_size,
+        )
+
+        # Request signed URLs
+        urls, gcs_prefix = request_signed_urls(recording_name, files)
+
+        result = UploadResult(recording=recording_name, gcs_prefix=gcs_prefix)
+        to_upload = []
+        rejected = []
+        for f in files:
+            if f.name not in urls:
+                # Server didn't return this filename at all (rejected by validation)
+                rejected.append(f.name)
+            elif urls[f.name] is None:
+                result.skipped.append(f.name)
+            else:
+                to_upload.append((f, urls[f.name]))
+
+        if rejected:
+            console.print(
+                f"  [yellow]Warning: {len(rejected)} file(s) rejected by server "
+                f"(invalid filename)[/yellow]"
+            )
+            for name in rejected:
+                console.print(f"    [dim]{name}[/dim]")
+            result.failed.extend(rejected)
+
+        if result.skipped:
+            console.print(
+                f"  [dim]Skipped {len(result.skipped)} file(s) (already uploaded)[/dim]"
+            )
+
+        if not to_upload:
+            if result.failed:
+                # Server rejected every file we offered (filename validation).
+                # Emit upload_failed — emitting upload_finished with failed>0
+                # is contradictory and would confuse the consumer state machine.
+                # Do not write the upload_status.json sentinel: nothing landed.
+                console.print(
+                    f"  [yellow]No files uploaded — {len(result.failed)} rejected by server.[/yellow]"
+                )
+                emit_event(
+                    EVENT_UPLOAD_FAILED,
+                    recording=recording_name,
+                    error=f"server rejected {len(result.failed)} file(s)",
+                    uploaded=len(result.uploaded),
+                    failed=len(result.failed),
+                    total_bytes=result.total_bytes,
+                )
+                return result
+
+            console.print(f"  [dim]All files already uploaded.[/dim]")
+            # Emit upload_finished BEFORE _write_upload_status so an OSError
+            # on the local sentinel write (disk full, RO recording dir)
+            # doesn't flip a genuinely-successful run to upload_failed via
+            # the catch-all below. Sentinel write is best-effort; the
+            # cloud-side state is what matters for the consumer.
+            emit_event(
+                EVENT_UPLOAD_FINISHED,
+                recording=recording_name,
+                uploaded=len(result.uploaded),
+                skipped=len(result.skipped),
+                failed=len(result.failed),
+                total_bytes=result.total_bytes,
+                gcs_prefix=result.gcs_prefix,
+            )
+            try:
+                _write_upload_status(recording_dir, result)
+            except OSError as e:
+                console.print(
+                    f"  [yellow]warning: failed to write upload status sentinel: {e}[/yellow]"
+                )
+            return result
+
+        # Build a lookup for file sizes (used when collecting results)
+        file_sizes = {f.name: f.size for f, _ in to_upload}
+        errors: list[tuple[str, str]] = []
+        files_total = len(to_upload)
+
+        # Upload with progress bars
+        with Progress(
+            TextColumn("  {task.description}"),
+            BarColumn(),
+            DownloadColumn(),
+            TransferSpeedColumn(),
+            console=console,
+        ) as progress:
+            # 1. Create all progress tasks upfront
+            task_ids = {}
+            for f, _ in to_upload:
+                task_ids[f.name] = progress.add_task(f.name, total=f.size)
+
+            # 2. Submit all uploads
+            with ThreadPoolExecutor(max_workers=jobs) as executor:
+                futures = {}
+                for f, signed_url in to_upload:
+                    future = executor.submit(
+                        _upload_with_progress,
+                        f, signed_url, progress, task_ids[f.name],
+                        recording_name, max_retries,
+                    )
+                    futures[future] = f.name
+
+                # 3. Collect results as they complete
+                try:
+                    for future in as_completed(futures):
+                        fname = futures[future]
+                        try:
+                            future.result()
+                            result.uploaded.append(fname)
+                            result.total_bytes += file_sizes[fname]
+                            emit_event(
+                                EVENT_UPLOAD_FILE_DONE,
+                                recording=recording_name,
+                                name=fname,
+                                bytes_uploaded_so_far=result.total_bytes,
+                                files_done=len(result.uploaded),
+                                files_total=files_total,
+                            )
+                        except Exception as e:
+                            progress.update(
+                                task_ids[fname],
+                                description=f"[red]{fname} (failed)[/red]",
+                            )
+                            result.failed.append(fname)
+                            errors.append((fname, str(e)))
+                except KeyboardInterrupt:
+                    executor.shutdown(wait=False, cancel_futures=True)
+                    console.print("\n[yellow]Upload interrupted.[/yellow]")
+                    emit_event(
+                        EVENT_UPLOAD_FAILED,
+                        recording=recording_name,
+                        error="interrupted",
+                        uploaded=len(result.uploaded),
+                        failed=len(result.failed),
+                        total_bytes=result.total_bytes,
+                    )
+                    _failed_emitted = True
+                    raise
+
+        # 4. Print errors after progress block exits
+        for filename, err in errors:
+            console.print(f"  [red]Error uploading {filename}:[/red] {err}")
+
+        if not result.failed:
+            # Emit before write — see rationale on the early-return branch above.
+            emit_event(
+                EVENT_UPLOAD_FINISHED,
+                recording=recording_name,
+                uploaded=len(result.uploaded),
+                skipped=len(result.skipped),
+                failed=len(result.failed),
+                total_bytes=result.total_bytes,
+                gcs_prefix=result.gcs_prefix,
+            )
+            try:
+                _write_upload_status(recording_dir, result)
+            except OSError as e:
+                console.print(
+                    f"  [yellow]warning: failed to write upload status sentinel: {e}[/yellow]"
+                )
         else:
-            to_upload.append((f, urls[f.name]))
+            # Per-file failures landed in result.failed (errors list above).
+            # The `error` field carries a compact summary; per-file detail
+            # is in the preceding console output. KeyboardInterrupt has its
+            # own emit site inside the executor block above.
+            failure_summary = "; ".join(f"{n}: {e}" for n, e in errors[:3])
+            if len(errors) > 3:
+                failure_summary += f"; (+{len(errors) - 3} more)"
+            emit_event(
+                EVENT_UPLOAD_FAILED,
+                recording=recording_name,
+                error=failure_summary or "one or more files failed to upload",
+                uploaded=len(result.uploaded),
+                failed=len(result.failed),
+                total_bytes=result.total_bytes,
+            )
 
-    if rejected:
-        console.print(
-            f"  [yellow]Warning: {len(rejected)} file(s) rejected by server "
-            f"(invalid filename)[/yellow]"
-        )
-        for name in rejected:
-            console.print(f"    [dim]{name}[/dim]")
-        result.failed.extend(rejected)
-
-    if result.skipped:
-        console.print(
-            f"  [dim]Skipped {len(result.skipped)} file(s) (already uploaded)[/dim]"
-        )
-
-    if not to_upload:
-        console.print(f"  [dim]All files already uploaded.[/dim]")
-        _write_upload_status(recording_dir, result)
         return result
 
-    # Build a lookup for file sizes (used when collecting results)
-    file_sizes = {f.name: f.size for f, _ in to_upload}
-    errors: list[tuple[str, str]] = []
-
-    # Upload with progress bars
-    with Progress(
-        TextColumn("  {task.description}"),
-        BarColumn(),
-        DownloadColumn(),
-        TransferSpeedColumn(),
-        console=console,
-    ) as progress:
-        # 1. Create all progress tasks upfront
-        task_ids = {}
-        for f, _ in to_upload:
-            task_ids[f.name] = progress.add_task(f.name, total=f.size)
-
-        # 2. Submit all uploads
-        with ThreadPoolExecutor(max_workers=jobs) as executor:
-            futures = {}
-            for f, signed_url in to_upload:
-                future = executor.submit(
-                    _upload_with_progress,
-                    f, signed_url, progress, task_ids[f.name],
-                    recording_name, max_retries,
-                )
-                futures[future] = f.name
-
-            # 3. Collect results as they complete
+    except KeyboardInterrupt:
+        # Guarantee exactly one terminal event on every cancel path.
+        # The inner handler at the as_completed loop emits upload_failed
+        # when cancel lands inside the executor block; this branch covers
+        # cancel arriving before the executor (during emit_started,
+        # request_signed_urls, the all-skipped early-return, or
+        # _write_upload_status) so the SwiftUI consumer always observes
+        # a terminal event.
+        if not _failed_emitted:
+            # `result` may not exist if cancel arrived before the
+            # `result = UploadResult(...)` assignment at line 312.
+            uploaded = len(result.uploaded) if "result" in locals() else 0
+            failed = len(result.failed) if "result" in locals() else 0
+            total_bytes = result.total_bytes if "result" in locals() else 0
+            emit_event(
+                EVENT_UPLOAD_FAILED,
+                recording=recording_name,
+                error="interrupted",
+                uploaded=uploaded,
+                failed=failed,
+                total_bytes=total_bytes,
+            )
+        raise
+    except Exception as e:
+        # Catch-all for unexpected exceptions (RuntimeError from
+        # request_signed_urls, FileNotFoundError edge cases, etc.) so the
+        # SwiftUI shell always sees a terminal event before the process
+        # exits. Re-raise so the existing CLI error-handling path
+        # (cli/__init__.py upload command) still surfaces the error.
+        emit_event(
+            EVENT_UPLOAD_FAILED,
+            recording=recording_name,
+            error=str(e),
+        )
+        raise
+    finally:
+        # Restore only if install actually succeeded. _UNSET means we
+        # never made it past the install attempt (off-main-thread). A
+        # genuine None from signal.signal (C-set previous handler) still
+        # triggers the restore — SIG_DFL is the safe default in that case.
+        if _previous_sigterm is not _UNSET:
             try:
-                for future in as_completed(futures):
-                    fname = futures[future]
-                    try:
-                        future.result()
-                        result.uploaded.append(fname)
-                        result.total_bytes += file_sizes[fname]
-                    except Exception as e:
-                        progress.update(
-                            task_ids[fname],
-                            description=f"[red]{fname} (failed)[/red]",
-                        )
-                        result.failed.append(fname)
-                        errors.append((fname, str(e)))
-            except KeyboardInterrupt:
-                executor.shutdown(wait=False, cancel_futures=True)
-                console.print("\n[yellow]Upload interrupted.[/yellow]")
-                raise
-
-    # 4. Print errors after progress block exits
-    for filename, err in errors:
-        console.print(f"  [red]Error uploading {filename}:[/red] {err}")
-
-    if not result.failed:
-        _write_upload_status(recording_dir, result)
-
-    return result
+                signal.signal(
+                    signal.SIGTERM,
+                    _previous_sigterm if _previous_sigterm is not None else signal.SIG_DFL,
+                )
+            except ValueError:
+                pass
 
 
 def _upload_with_progress(

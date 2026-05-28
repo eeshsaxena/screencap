@@ -1703,6 +1703,50 @@ def _find_exportable_dirs(base_dir):
     )
 
 
+@cli.command("review-data")
+@click.argument("name")
+@click.option("--json", "as_json", is_flag=True,
+              default=lambda: _should_default_to_json(),
+              help="Output as JSON. Auto-detected when stdout is not a TTY.")
+def review_data_cmd(name, as_json):
+    """Prepare a recording for native review and emit a JSON envelope.
+
+    Called by the SwiftUI shell's review window when the operator clicks
+    Upload on a row. Runs ffmpeg concat for chunked recordings,
+    re-encodes the video for AVKit compatibility if needed, and ensures
+    an events.jsonl exists. Returns paths the Swift side feeds into the
+    AVKit player and the timeline pane.
+
+    The envelope shape matches `screencap list --json` and
+    `screencap info --json`: ok + schema_version + payload, or
+    ok=false + error on failure.
+    """
+    from screencap.review import REVIEW_SCHEMA_VERSION, ReviewPrepareError, prepare_review_data
+
+    try:
+        envelope = prepare_review_data(name)
+    except ReviewPrepareError as e:
+        err_payload = {"ok": False, "schema_version": REVIEW_SCHEMA_VERSION, "error": str(e)}
+        if as_json:
+            click.echo(json.dumps(err_payload))
+        else:
+            console.print(f"[red]Error:[/red] {e}")
+        sys.exit(1)
+
+    if as_json:
+        click.echo(json.dumps(envelope))
+        return
+
+    # Human-readable fallback for the rare CLI-direct user. The
+    # SwiftUI shell always passes --json (auto-detected via non-TTY
+    # stdout when spawned as a subprocess).
+    console.print(f"[bold]{name}[/bold]")
+    console.print(f"  video:  [dim]{envelope['video_path']}[/dim]")
+    console.print(f"  events: [dim]{envelope['events_path']}[/dim]")
+    if envelope.get("video_pixfmt_remediated"):
+        console.print("  [dim](video remediated for AVKit compatibility)[/dim]")
+
+
 @cli.command()
 @click.argument("name", required=False, default=None)
 @click.option("--all", "all_recordings", is_flag=True, help="Export all recordings.")
