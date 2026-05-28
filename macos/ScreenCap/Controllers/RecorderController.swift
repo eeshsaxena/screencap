@@ -145,7 +145,7 @@ final class RecorderController: ObservableObject {
         // strict concurrency. The drain is also unnecessary — every in-flight
         // `runStop` is launched via `Task { await self.runStop(...) }` which
         // captures `self` strongly, so `deinit` cannot fire while a stop is
-        // suspended on the coordinator. The 30s / 300s timeout in
+        // suspended on the coordinator. The 60s / 300s timeout in
         // `StopPolicyCoordinator.waitForOneShot` is the cancellation backstop
         // for any other corner case.
         if let daemonInstalledObserver {
@@ -277,8 +277,10 @@ final class RecorderController: ObservableObject {
     }
 
     /// In-app Stop button path. SIGTERM via `screencap stop`, await
-    /// `recording_finalized` with a 30s wall-clock fallback, then transition
-    /// UI to `.idle`. Background finalization continues invisibly.
+    /// `recording_finalized` with a 60s wall-clock fallback (headroom over the
+    /// daemon's own 30s `SCREENCAP_DAEMON_STOP_TIMEOUT` + SIGKILL fallback;
+    /// see `StopPolicyCoordinator.runStop`), then transition UI to `.idle`.
+    /// Background finalization continues invisibly.
     ///
     /// Guard is intentionally narrower than `state.isRecording`: a second
     /// click while we're already `.stopping` would dispatch a duplicate
@@ -335,7 +337,7 @@ final class RecorderController: ObservableObject {
 
     // MARK: - Stop policy
 
-    /// `quitting=false`: in-app Stop, 30s wait, transition UI to .idle and
+    /// `quitting=false`: in-app Stop, 60s wait, transition UI to .idle and
     /// continue background finalization invisibly.
     /// `quitting=true`:  Cmd+Q, 300s wait, then NSApp.reply(...). On timeout
     /// we SIGKILL the CLI recorder (daemon transport surfaces the
@@ -552,7 +554,7 @@ final class RecorderController: ObservableObject {
 
         // Initiate the stop BEFORE blocking on the modal, so the engine
         // teardown proceeds in parallel with the user reading the dialog.
-        // Without this, the in-app 30s timeout in `awaitFinalizedEvent` can
+        // Without this, the in-app 60s timeout in `awaitFinalizedEvent` can
         // fire while the modal is up and report a false "still finalizing"
         // message even though the recorder has cleanly shut down.
         if case .recording = state {
