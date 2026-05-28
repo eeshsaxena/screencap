@@ -566,3 +566,91 @@ def test_scrub_worker_failure_warns_for_local_recording(tmp_path):
 
     assert helper.scrub_worker is None
     assert fake_console.print.called, "warning must be printed even without --verbose"
+
+
+# ---------------------------------------------------------------------------
+# finalize_uploads — partial-upload path must not NameError on missing chunks
+# ---------------------------------------------------------------------------
+
+
+class _StubChunkProcessor:
+    """Minimal ``ChunkProcessor`` stand-in for the finalize_uploads contract.
+
+    Exposes only the attributes / methods ``finalize_uploads`` actually
+    reads. The partial-upload branch is the one that historically
+    referenced an unbound ``n_uploaded`` local — keeping the stub
+    deliberately thin makes that path easy to exercise.
+    """
+
+    def __init__(
+        self,
+        *,
+        all_uploaded: bool = False,
+        force_stopped: bool = False,
+        summary: tuple[int, int] = (0, 0),
+        upload_warning: str | None = None,
+    ) -> None:
+        self._all_uploaded = all_uploaded
+        self.was_force_stopped = force_stopped
+        self._summary = summary
+        self.upload_warning = upload_warning
+
+    def all_chunks_uploaded(self) -> bool:
+        return self._all_uploaded
+
+    def upload_summary(self) -> tuple[int, int]:
+        return self._summary
+
+    def reconcile_against_gcs(self) -> int:
+        return 0
+
+
+def test_finalize_uploads_partial_path_does_not_nameerror(tmp_path):
+    """Short recording with no chunk files must finalize without NameError.
+
+    Regression: a rename of the local from ``n_uploaded`` to ``n_emitted``
+    missed the ``.upload_followup.json`` write site, so the partial-upload
+    branch raised ``NameError`` mid-finalize. The worker then exited
+    before writing ``.recording_ready``, the daemon never emitted the
+    "finalized" event, and the SwiftUI stop timed out with
+    "Stop is still finalizing in the background." This test pins the
+    contract: the partial-upload branch must complete and write the
+    follow-up JSON with the documented ``n_uploaded`` key.
+    """
+    import json
+
+    from screencap.engine.collaborators import RecordingCollaborators
+    from screencap.engine.config import RecordingConfig
+    from screencap.engine.screen_recorder import (
+        IpcChannels,
+        LegacyOptions,
+        RecordingRequest,
+    )
+
+    capture_dir = tmp_path / "rec"
+    capture_dir.mkdir()
+
+    request = RecordingRequest(name="short", config=RecordingConfig())
+    helper = RecordingCollaborators(
+        request=request,
+        legacy=LegacyOptions(live_upload=True),
+        channels=IpcChannels.create(),
+    )
+    helper._chunk_processor = _StubChunkProcessor(summary=(0, 0))
+
+    result = helper.finalize_uploads(
+        capture_dir=capture_dir,
+        stop_reason="graceful",
+        recording_name="short",
+    )
+
+    assert result["n_uploaded"] == 0
+    assert result["n_total"] == 0
+    followup_path = capture_dir / ".upload_followup.json"
+    assert followup_path.exists(), (
+        "partial-upload branch must persist .upload_followup.json for "
+        "print_upload_followup to surface the deferred warning"
+    )
+    payload = json.loads(followup_path.read_text())
+    assert payload["n_uploaded"] == 0
+    assert payload["n_total"] == 0

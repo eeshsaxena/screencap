@@ -346,7 +346,17 @@ enum DaemonClient {
 
     static func recordingStop(_ req: RecordingStopRequest) async throws -> RecordingStopResponse {
         let body = try JSONEncoder().encode(req)
-        return try await request(method: "POST", path: "/v0/recording.stop", body: body)
+        // The daemon's `supervisor.stop()` awaits `recording_finalized` for up
+        // to `SCREENCAP_DAEMON_STOP_TIMEOUT` (default 30 s) before responding.
+        // Use a budget that exceeds that ceiling so the HTTP client doesn't
+        // surface "request timed out" while the daemon is still finalizing
+        // cleanly. 35 s gives 5 s of headroom for the response round-trip.
+        return try await request(
+            method: "POST",
+            path: "/v0/recording.stop",
+            body: body,
+            timeout: 35
+        )
     }
 
     private static func connect(_ connection: NWConnection) async throws {
