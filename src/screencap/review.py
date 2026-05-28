@@ -26,6 +26,7 @@ Returns a JSON-serializable dict with the envelope downstream consumers
 from __future__ import annotations
 
 import json
+import os
 import subprocess
 import sys
 from pathlib import Path
@@ -33,10 +34,9 @@ from pathlib import Path
 REVIEW_SCHEMA_VERSION = 1
 
 # Filename used for the AVKit-compatible re-encoded video. Sibling to the
-# original `video.mp4` so the upload pipeline (which uploads everything
-# in the recording dir) does not accidentally ship two videos: the
-# remediated file is excluded from upload via the leading-dot sentinel
-# pattern below.
+# original `video.mp4`. The upload pipeline excludes this file by name
+# via `upload._UPLOAD_EXCLUDE_NAMES` — the lossless `video.mp4` is the
+# canonical training-corpus artifact; `video_review.mp4` is review-only.
 REVIEW_VIDEO_FILENAME = "video_review.mp4"
 
 # Sentinel that records "this recording's review video has already been
@@ -95,6 +95,7 @@ def _reencode_for_avkit(source: Path, destination: Path) -> None:
     training corpus (the original ``video.mp4`` retains full quality)
     and a fast preset keeps the preparation state brief.
     """
+    tmp_destination = destination.with_suffix(destination.suffix + ".tmp")
     cmd = [
         "ffmpeg",
         "-y",
@@ -107,7 +108,7 @@ def _reencode_for_avkit(source: Path, destination: Path) -> None:
         # alongside, and re-encoding audio here would just add cost
         # for no benefit. AVKit gates audio playback on the video file.
         "-an",
-        str(destination),
+        str(tmp_destination),
     ]
     try:
         result = subprocess.run(cmd, capture_output=True, text=True, timeout=600)
@@ -117,16 +118,17 @@ def _reencode_for_avkit(source: Path, destination: Path) -> None:
         ) from e
     except subprocess.TimeoutExpired as e:
         # Clean up the partial output so a retry doesn't see a half-file.
-        destination.unlink(missing_ok=True)
+        tmp_destination.unlink(missing_ok=True)
         raise ReviewPrepareError(
             f"ffmpeg re-encode timed out after 10 minutes for {source.name}"
         ) from e
     if result.returncode != 0:
-        destination.unlink(missing_ok=True)
+        tmp_destination.unlink(missing_ok=True)
         # Tail the ffmpeg stderr so the error message is actionable
         # without dumping multi-MB of progress logs into the JSON envelope.
         tail = (result.stderr or "")[-400:]
         raise ReviewPrepareError(f"ffmpeg re-encode failed: {tail}")
+    os.replace(tmp_destination, destination)
 
 
 def ensure_review_video(rec_dir: Path) -> tuple[Path, bool]:

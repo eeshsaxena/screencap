@@ -1721,12 +1721,12 @@ def review_data_cmd(name, as_json):
     `screencap info --json`: ok + schema_version + payload, or
     ok=false + error on failure.
     """
-    from screencap.review import ReviewPrepareError, prepare_review_data
+    from screencap.review import REVIEW_SCHEMA_VERSION, ReviewPrepareError, prepare_review_data
 
     try:
         envelope = prepare_review_data(name)
     except ReviewPrepareError as e:
-        err_payload = {"ok": False, "error": str(e)}
+        err_payload = {"ok": False, "schema_version": REVIEW_SCHEMA_VERSION, "error": str(e)}
         if as_json:
             click.echo(json.dumps(err_payload))
         else:

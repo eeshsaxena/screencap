@@ -12,8 +12,14 @@ future revision might extend.
 from __future__ import annotations
 
 import json
+import os
 import signal
+import subprocess
+import sys
+import textwrap
 import threading
+import time
+from pathlib import Path
 from unittest import mock
 
 import pytest
@@ -357,3 +363,228 @@ def test_upload_handler_installation_skipped_off_main_thread(tmp_path):
     t.join(timeout=10)
     assert "error" not in result_box, f"unexpected error: {result_box.get('error')}"
     assert result_box["result"].uploaded == ["video.mp4"]
+
+
+# ---------------------------------------------------------------------------
+# Inner KeyboardInterrupt branch (the SIGTERM-converted cancel inside the
+# as_completed loop). The outer-except path is covered by the
+# request_signed_urls ConnectionError test; this one drives cancel mid-PUT.
+# Plan U1 test scenario, todo 004.
+# ---------------------------------------------------------------------------
+
+
+def test_inner_keyboard_interrupt_emits_upload_failed_interrupted(tmp_path, capfd):
+    """KeyboardInterrupt raised from inside the executor block (mocked via
+    requests.put) drives the inner except path: emits upload_failed with
+    error="interrupted", shuts down the executor, and re-raises."""
+    from screencap.upload import upload_recording
+
+    rec = tmp_path / "rec-kbi"
+    rec.mkdir()
+    (rec / "video.mp4").write_bytes(b"x" * 100)
+
+    with (
+        mock.patch(
+            "screencap.upload.requests.post",
+            return_value=_mock_urls_response({"video.mp4": "https://v"}),
+        ),
+        mock.patch(
+            "screencap.upload.requests.put", side_effect=KeyboardInterrupt
+        ),
+        pytest.raises(KeyboardInterrupt),
+    ):
+        upload_recording(rec)
+
+    events = _parse_events(capfd.readouterr().err)
+    types = [e["type"] for e in events]
+    # upload_started must precede the cancel; upload_failed must be terminal.
+    assert types[0] == "upload_started"
+    assert types[-1] == "upload_failed"
+    # The plan pins error="interrupted" as the cancel signal the Swift
+    # consumer dispatches on. A future refactor that changes this string
+    # silently breaks the cross-language contract.
+    failed = next(e for e in events if e["type"] == "upload_failed")
+    assert failed["error"] == "interrupted"
+    # upload_finished MUST NOT appear — interrupted is not success.
+    assert "upload_finished" not in types
+
+
+# ---------------------------------------------------------------------------
+# Server-rejected-all path (TODO 012): when every offered file is rejected
+# by server-side validation, terminal event is upload_failed (not
+# upload_finished). The upload_status.json sentinel must NOT be written —
+# nothing actually landed.
+# ---------------------------------------------------------------------------
+
+
+def test_all_files_server_rejected_emits_upload_failed(tmp_path, capfd):
+    from screencap.upload import UPLOAD_STATUS_FILE, upload_recording
+
+    rec = tmp_path / "rec-rejected"
+    rec.mkdir()
+    (rec / "video.mp4").write_bytes(b"x" * 100)
+
+    # Server response includes no urls for our files → rejected branch.
+    with mock.patch(
+        "screencap.upload.requests.post",
+        return_value=_mock_urls_response({}),
+    ):
+        upload_recording(rec)
+
+    events = _parse_events(capfd.readouterr().err)
+    types = [e["type"] for e in events]
+    assert types[0] == "upload_started"
+    assert types[-1] == "upload_failed"
+    assert "upload_finished" not in types
+    failed = next(e for e in events if e["type"] == "upload_failed")
+    assert failed["failed"] >= 1
+    assert "rejected" in failed["error"].lower()
+    # No local success sentinel on failure path — re-running upload would
+    # have to retry, not skip-via-is_uploaded.
+    assert not (rec / UPLOAD_STATUS_FILE).exists()
+
+
+# ---------------------------------------------------------------------------
+# Decouple upload_finished from _write_upload_status success (TODO 013):
+# an OSError on the sentinel write must NOT flip a successful upload to
+# upload_failed via the catch-all. The cloud-side state is what counts.
+# ---------------------------------------------------------------------------
+
+
+# ---------------------------------------------------------------------------
+# SIGTERM subprocess test (plan U1, todo 003): a real signal delivered to
+# a real child process must convert to KeyboardInterrupt and emit
+# upload_failed(error="interrupted") before the process exits. The
+# in-process tests above can't prove signal.signal install + delivery in
+# the actual entry path — only a subprocess can.
+# ---------------------------------------------------------------------------
+
+
+# Helper script executed via `python -c`. Mocks requests.post/put so the
+# upload stays in-flight (PUT sleeps for 30s) long enough for SIGTERM to
+# arrive. Prints a sentinel line to stdout once upload_started has been
+# emitted so the parent knows it's safe to signal.
+_SIGTERM_TEST_HARNESS = textwrap.dedent("""
+    import sys
+    import time
+    import json
+    from pathlib import Path
+    from unittest import mock
+
+    # Stay-in-flight PUT — sleeps long enough for the parent to SIGTERM
+    # us, but short enough that the ThreadPoolExecutor's `with` block
+    # exit (which calls shutdown(wait=True)) doesn't dominate runtime.
+    # 1s is well above the parent's 200ms-after-READY signal window.
+    def _slow_put(*a, **kw):
+        time.sleep(1)
+        raise RuntimeError("PUT was not interrupted — test setup broken")
+
+    def _post_returning_urls(*a, **kw):
+        resp = mock.MagicMock()
+        resp.status_code = 200
+        resp.json.return_value = {
+            "urls": {"video.mp4": "https://signed/v"},
+            "gcs_prefix": "gs://bucket/",
+        }
+        return resp
+
+    rec = Path(sys.argv[1])
+
+    # Print the ready sentinel BEFORE entering upload_recording so the
+    # parent doesn't race with the upload_started emit. We rely on
+    # PYTHONUNBUFFERED=1 to flush immediately.
+    print("READY", flush=True)
+
+    with (
+        mock.patch("screencap.upload.requests.post", side_effect=_post_returning_urls),
+        mock.patch("screencap.upload.requests.put", side_effect=_slow_put),
+    ):
+        from screencap.upload import upload_recording
+        try:
+            upload_recording(rec)
+        except KeyboardInterrupt:
+            sys.exit(130)  # conventional Ctrl+C exit code
+""")
+
+
+@pytest.mark.timeout(30)  # safety net — should complete in <2s
+def test_sigterm_delivered_to_real_subprocess_emits_interrupted(tmp_path):
+    rec = tmp_path / "rec-sigterm"
+    rec.mkdir()
+    (rec / "video.mp4").write_bytes(b"x" * 100)
+
+    src_root = Path(__file__).resolve().parent.parent / "src"
+    env = os.environ.copy()
+    env["PYTHONPATH"] = f"{src_root}{os.pathsep}{env.get('PYTHONPATH', '')}"
+    env["PYTHONUNBUFFERED"] = "1"
+
+    proc = subprocess.Popen(
+        [sys.executable, "-c", _SIGTERM_TEST_HARNESS, str(rec)],
+        stdout=subprocess.PIPE,
+        stderr=subprocess.PIPE,
+        env=env,
+        text=True,
+    )
+
+    try:
+        # Wait for the READY sentinel — proves the harness reached the
+        # upload_recording call and signal.signal install succeeded.
+        ready_line = proc.stdout.readline()
+        assert ready_line.strip() == "READY", f"unexpected harness output: {ready_line!r}"
+
+        # Give the child a moment to install the handler and emit
+        # upload_started + start the slow PUT. 200ms is enough on macOS;
+        # the SIGTERM handler must be installed before this elapses.
+        time.sleep(0.2)
+
+        os.kill(proc.pid, signal.SIGTERM)
+        stdout, stderr = proc.communicate(timeout=5)
+    except Exception:
+        proc.kill()
+        raise
+
+    # KeyboardInterrupt was re-raised; harness exits 130. If SIGTERM
+    # killed the process before the handler installed, exit code would
+    # be -SIGTERM (negative). Either path that's not 130 is a regression.
+    assert proc.returncode == 130, (
+        f"unexpected exit code {proc.returncode}; stderr:\n{stderr}"
+    )
+
+    events = _parse_events(stderr)
+    types = [e["type"] for e in events]
+    assert "upload_started" in types, f"upload_started missing; stderr:\n{stderr}"
+    assert types[-1] == "upload_failed", f"terminal event wrong; types: {types}"
+    failed = next(e for e in events if e["type"] == "upload_failed")
+    assert failed["error"] == "interrupted"
+
+
+def test_upload_finished_emitted_even_when_status_write_fails(tmp_path, capfd):
+    from screencap.upload import upload_recording
+
+    rec = tmp_path / "rec-sentinel-fail"
+    rec.mkdir()
+    (rec / "video.mp4").write_bytes(b"x" * 100)
+
+    with (
+        mock.patch(
+            "screencap.upload.requests.post",
+            return_value=_mock_urls_response({"video.mp4": "https://v"}),
+        ),
+        mock.patch("screencap.upload.requests.put", return_value=_mock_put_response()),
+        # Simulate disk-full / RO recording dir during sentinel write.
+        mock.patch(
+            "screencap.upload._write_upload_status",
+            side_effect=OSError("disk full"),
+        ),
+    ):
+        result = upload_recording(rec)
+
+    events = _parse_events(capfd.readouterr().err)
+    types = [e["type"] for e in events]
+    # Successful upload reaches upload_finished; the sentinel write happens
+    # AFTER the emit, so an OSError there cannot demote the terminal event.
+    assert "upload_finished" in types
+    # upload_failed must NOT appear — sentinel write failure is not an
+    # upload failure (the cloud already has the file).
+    assert "upload_failed" not in types
+    assert result.uploaded == ["video.mp4"]

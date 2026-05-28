@@ -107,7 +107,7 @@ def _fmt_size(nbytes: int) -> str:
 
 
 def _write_upload_status(recording_dir: Path, result: UploadResult) -> None:
-    """Write upload status marker to recording directory."""
+    """Write upload status marker to recording directory atomically."""
     status = {
         "uploaded_at": datetime.now().isoformat(),
         "gcs_prefix": result.gcs_prefix,
@@ -115,9 +115,10 @@ def _write_upload_status(recording_dir: Path, result: UploadResult) -> None:
         "files_skipped": len(result.skipped),
         "total_bytes": result.total_bytes,
     }
-    (recording_dir / UPLOAD_STATUS_FILE).write_text(
-        json.dumps(status, indent=2)
-    )
+    final_path = recording_dir / UPLOAD_STATUS_FILE
+    tmp_path = final_path.with_suffix(final_path.suffix + ".tmp")
+    tmp_path.write_text(json.dumps(status, indent=2))
+    os.replace(tmp_path, final_path)
 
 
 def is_uploaded(recording_dir: Path) -> bool:
@@ -142,6 +143,9 @@ def _wal_checkpoint(recording_dir: Path) -> None:
 # Files that should never be uploaded (SQLite WAL artifacts, temp files)
 _UPLOAD_EXCLUDE = {".db-shm", ".db-wal"}
 
+# Files that should never be uploaded by name (review-only artifacts, etc.)
+_UPLOAD_EXCLUDE_NAMES = {"video_review.mp4"}
+
 
 def list_recording_files(recording_dir: Path) -> list[FileInfo]:
     """Return files in a recording dir, sorted largest-first.
@@ -154,6 +158,8 @@ def list_recording_files(recording_dir: Path) -> list[FileInfo]:
     files = []
     for p in sorted(recording_dir.iterdir()):
         if p.is_symlink() or not p.is_file() or p.name.startswith("."):
+            continue
+        if p.name in _UPLOAD_EXCLUDE_NAMES:
             continue
         if any(p.name.endswith(ext) for ext in _UPLOAD_EXCLUDE):
             continue
@@ -170,6 +176,8 @@ def list_recording_files(recording_dir: Path) -> list[FileInfo]:
     # Also include files in subdirectories (e.g., screenshots/)
     for p in sorted(recording_dir.rglob("*")):
         if p.is_symlink() or not p.is_file() or p.parent == recording_dir or p.name.startswith("."):
+            continue
+        if p.name in _UPLOAD_EXCLUDE_NAMES:
             continue
         try:
             size = p.stat().st_size
@@ -292,13 +300,23 @@ def upload_recording(
     # signal.signal requires the main thread; ValueError is raised on
     # background threads. Skip silently in that case — the CLI invocation
     # path is always main-thread, so cancel still works in practice.
-    _previous_sigterm = None
+    #
+    # _UNSET sentinel disambiguates "install succeeded with None as the
+    # previous handler" (legitimate per stdlib — C-set handlers report as
+    # None) from "install never ran" (off-main-thread ValueError). Without
+    # the sentinel, the finally restore would silently skip the C-set case
+    # and leak our handler past the function. Installing INSIDE the outer
+    # try ensures a signal arriving between install and try-entry still
+    # routes through the finally restore.
+    _UNSET: object = object()
+    _previous_sigterm: object = _UNSET
+    _failed_emitted = False
     try:
-        _previous_sigterm = signal.signal(signal.SIGTERM, _raise_keyboard_interrupt)
-    except ValueError:
-        pass
+        try:
+            _previous_sigterm = signal.signal(signal.SIGTERM, _raise_keyboard_interrupt)
+        except ValueError:
+            pass  # off-main-thread — restore guard below will no-op.
 
-    try:
         emit_event(
             EVENT_UPLOAD_STARTED,
             recording=recording_name,
@@ -336,8 +354,30 @@ def upload_recording(
             )
 
         if not to_upload:
+            if result.failed:
+                # Server rejected every file we offered (filename validation).
+                # Emit upload_failed — emitting upload_finished with failed>0
+                # is contradictory and would confuse the consumer state machine.
+                # Do not write the upload_status.json sentinel: nothing landed.
+                console.print(
+                    f"  [yellow]No files uploaded — {len(result.failed)} rejected by server.[/yellow]"
+                )
+                emit_event(
+                    EVENT_UPLOAD_FAILED,
+                    recording=recording_name,
+                    error=f"server rejected {len(result.failed)} file(s)",
+                    uploaded=len(result.uploaded),
+                    failed=len(result.failed),
+                    total_bytes=result.total_bytes,
+                )
+                return result
+
             console.print(f"  [dim]All files already uploaded.[/dim]")
-            _write_upload_status(recording_dir, result)
+            # Emit upload_finished BEFORE _write_upload_status so an OSError
+            # on the local sentinel write (disk full, RO recording dir)
+            # doesn't flip a genuinely-successful run to upload_failed via
+            # the catch-all below. Sentinel write is best-effort; the
+            # cloud-side state is what matters for the consumer.
             emit_event(
                 EVENT_UPLOAD_FINISHED,
                 recording=recording_name,
@@ -347,6 +387,12 @@ def upload_recording(
                 total_bytes=result.total_bytes,
                 gcs_prefix=result.gcs_prefix,
             )
+            try:
+                _write_upload_status(recording_dir, result)
+            except OSError as e:
+                console.print(
+                    f"  [yellow]warning: failed to write upload status sentinel: {e}[/yellow]"
+                )
             return result
 
         # Build a lookup for file sizes (used when collecting results)
@@ -390,7 +436,7 @@ def upload_recording(
                                 EVENT_UPLOAD_FILE_DONE,
                                 recording=recording_name,
                                 name=fname,
-                                bytes_uploaded=result.total_bytes,
+                                bytes_uploaded_so_far=result.total_bytes,
                                 files_done=len(result.uploaded),
                                 files_total=files_total,
                             )
@@ -412,6 +458,7 @@ def upload_recording(
                         failed=len(result.failed),
                         total_bytes=result.total_bytes,
                     )
+                    _failed_emitted = True
                     raise
 
         # 4. Print errors after progress block exits
@@ -419,7 +466,7 @@ def upload_recording(
             console.print(f"  [red]Error uploading {filename}:[/red] {err}")
 
         if not result.failed:
-            _write_upload_status(recording_dir, result)
+            # Emit before write — see rationale on the early-return branch above.
             emit_event(
                 EVENT_UPLOAD_FINISHED,
                 recording=recording_name,
@@ -429,6 +476,12 @@ def upload_recording(
                 total_bytes=result.total_bytes,
                 gcs_prefix=result.gcs_prefix,
             )
+            try:
+                _write_upload_status(recording_dir, result)
+            except OSError as e:
+                console.print(
+                    f"  [yellow]warning: failed to write upload status sentinel: {e}[/yellow]"
+                )
         else:
             # Per-file failures landed in result.failed (errors list above).
             # The `error` field carries a compact summary; per-file detail
@@ -449,8 +502,27 @@ def upload_recording(
         return result
 
     except KeyboardInterrupt:
-        # Re-raise so the CLI command's caller sees the interrupt. The
-        # upload_failed event was already emitted at the inner catch site.
+        # Guarantee exactly one terminal event on every cancel path.
+        # The inner handler at the as_completed loop emits upload_failed
+        # when cancel lands inside the executor block; this branch covers
+        # cancel arriving before the executor (during emit_started,
+        # request_signed_urls, the all-skipped early-return, or
+        # _write_upload_status) so the SwiftUI consumer always observes
+        # a terminal event.
+        if not _failed_emitted:
+            # `result` may not exist if cancel arrived before the
+            # `result = UploadResult(...)` assignment at line 312.
+            uploaded = len(result.uploaded) if "result" in locals() else 0
+            failed = len(result.failed) if "result" in locals() else 0
+            total_bytes = result.total_bytes if "result" in locals() else 0
+            emit_event(
+                EVENT_UPLOAD_FAILED,
+                recording=recording_name,
+                error="interrupted",
+                uploaded=uploaded,
+                failed=failed,
+                total_bytes=total_bytes,
+            )
         raise
     except Exception as e:
         # Catch-all for unexpected exceptions (RuntimeError from
@@ -465,9 +537,16 @@ def upload_recording(
         )
         raise
     finally:
-        if _previous_sigterm is not None:
+        # Restore only if install actually succeeded. _UNSET means we
+        # never made it past the install attempt (off-main-thread). A
+        # genuine None from signal.signal (C-set previous handler) still
+        # triggers the restore — SIG_DFL is the safe default in that case.
+        if _previous_sigterm is not _UNSET:
             try:
-                signal.signal(signal.SIGTERM, _previous_sigterm)
+                signal.signal(
+                    signal.SIGTERM,
+                    _previous_sigterm if _previous_sigterm is not None else signal.SIG_DFL,
+                )
             except ValueError:
                 pass
 
