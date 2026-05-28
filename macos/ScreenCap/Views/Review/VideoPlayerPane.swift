@@ -1,3 +1,4 @@
+import AppKit
 import AVFoundation
 import AVKit
 import Combine
@@ -188,12 +189,20 @@ struct VideoPlayerPane: View {
                 }
             case .ready:
                 // Cast is safe: production composition always builds the model
-                // with a LiveVideoPlaybackEngine (the SwiftUI VideoPlayer
-                // requires a real AVPlayer). Tests drive the model with a
-                // fake engine and don't render this view.
+                // with a LiveVideoPlaybackEngine (AVPlayerNSView requires a
+                // real AVPlayer). Tests drive the model with a fake engine
+                // and don't render this view.
+                //
+                // We deliberately use AVKit's AVPlayerView (wrapped via
+                // NSViewRepresentable) instead of SwiftUI's `VideoPlayer`
+                // primitive: on macOS 26 / SwiftUI 7.5.3 the latter aborts
+                // in `getSuperclassMetadata` inside `_AVKit_SwiftUI` when
+                // it's composed under a layout modifier and a transition
+                // (see crash dump in PR #194 thread). AVPlayerView handles
+                // its own aspect-correct sizing inside whatever frame the
+                // parent gives it, so no .aspectRatio modifier is needed.
                 if let live = model.engine as? LiveVideoPlaybackEngine {
-                    VideoPlayer(player: live.player)
-                        .aspectRatio(16.0/9.0, contentMode: .fit)
+                    AVPlayerNSView(player: live.player)
                 } else {
                     Color.black
                 }
@@ -214,5 +223,44 @@ struct VideoPlayerPane: View {
         .frame(maxWidth: .infinity, maxHeight: .infinity)
         .background(Color.black.opacity(0.05))
         .onDisappear { model.tearDown() }
+    }
+}
+
+/// AVKit's `AVPlayerView` wrapped as an `NSViewRepresentable` (plan U5).
+///
+/// Direct replacement for SwiftUI's `VideoPlayer` primitive. The latter
+/// crashes on macOS 26 / SwiftUI 7.5.3 with a Swift runtime metadata
+/// fatal error (`getSuperclassMetadata + 828` → `swift::fatalError` in
+/// `_AVKit_SwiftUI`) when its view body gets composed under a layout
+/// modifier (e.g. `.aspectRatio`) and a transition. AVPlayerView is the
+/// AppKit-native control AVKit recommends for macOS playback anyway —
+/// it gives full control over the chrome and sizes itself aspect-
+/// correctly inside its parent frame.
+struct AVPlayerNSView: NSViewRepresentable {
+    let player: AVPlayer
+
+    func makeNSView(context: Context) -> AVPlayerView {
+        let view = AVPlayerView()
+        view.player = player
+        // `.inline` mounts standard playback controls (play/pause, scrub,
+        // volume) at the bottom of the view. Operators expect them for
+        // pre-upload review; `.none` would force them to rely entirely on
+        // the timeline pane for transport.
+        view.controlsStyle = .inline
+        view.showsFullScreenToggleButton = false
+        // Default behavior is aspect-fit inside the frame, which is what we
+        // want — no explicit aspect ratio modifier needed on the SwiftUI
+        // side.
+        return view
+    }
+
+    func updateNSView(_ view: AVPlayerView, context: Context) {
+        // Reassign only on identity change. AVPlayer is a reference type, so
+        // pointer equality is the right check; assigning the same player
+        // unconditionally would still work but triggers an unnecessary
+        // AVPlayerView teardown/setup cycle.
+        if view.player !== player {
+            view.player = player
+        }
     }
 }
