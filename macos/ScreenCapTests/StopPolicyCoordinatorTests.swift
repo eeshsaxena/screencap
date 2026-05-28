@@ -148,6 +148,24 @@ final class StopPolicyCoordinatorTests: XCTestCase {
         XCTAssertFalse(ticks.isEmpty, "expected at least one countdown tick before resolve")
     }
 
+    // MARK: - Production default timeouts (SCR-69)
+
+    /// In-app Stop's default wait MUST exceed the daemon's 30s stop budget
+    /// (SCREENCAP_DAEMON_STOP_TIMEOUT) plus its ~3s SIGKILL fallback. Lowering
+    /// `inAppStopTimeout` back below ~35s re-introduces the SCR-69 race where
+    /// a clean stop surfaces "Stop is still finalizing in the background."
+    /// even though the worker exits seconds later.
+    func testInAppStopDefaultExceedsDaemonStopBudget() {
+        XCTAssertGreaterThanOrEqual(LiveStopPolicyCoordinator.inAppStopTimeout, 60)
+    }
+
+    /// Cmd+Q's wait stays at the long-running drain budget. Dropping this
+    /// would risk surfacing the "may still be running" message on perfectly
+    /// healthy quit-and-stop flows of chunked cloud recordings.
+    func testQuittingStopDefaultCoversChunkedCloudDrain() {
+        XCTAssertGreaterThanOrEqual(LiveStopPolicyCoordinator.quittingStopTimeout, 300)
+    }
+
     // MARK: - cancelAll drains pending continuations
 
     func testCancelAllDrainsPendingContinuationsAsFailure() async {

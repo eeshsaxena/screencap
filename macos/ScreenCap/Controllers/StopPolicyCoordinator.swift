@@ -12,7 +12,7 @@ enum StopPolicyOutcome {
 /// Orchestrates the stop policy: dispatch the stop signal, await the matching
 /// stderr / daemon event (`recording_finalized` for in-app Stop, `stopped` for
 /// Cmd+Q), and report the outcome. Protocol seam so the orchestrator can
-/// inject a fast-resolving fake in tests without paying the real 30s / 300s
+/// inject a fast-resolving fake in tests without paying the real 60s / 300s
 /// timeout.
 @MainActor
 protocol StopPolicyCoordinator {
@@ -32,11 +32,11 @@ protocol StopPolicyCoordinator {
     /// transport (`CLIClient.runDetached(["stop"])` vs
     /// `DaemonClient.recordingStop(...)`).
     /// - Parameters:
-    ///   - quitting: `false` uses the 30s in-app wait against
+    ///   - quitting: `false` uses the 60s in-app wait against
     ///     `recording_finalized`; `true` uses the 300s Cmd+Q wait against
     ///     `stopped` and drives the quit-progress countdown via `onTickQuitProgress`.
     ///   - timeout: optional override (used by tests). When `nil`, uses the
-    ///     production defaults (30s / 300s).
+    ///     production defaults (60s / 300s).
     ///   - sendStopSignal: async closure dispatching the platform-specific
     ///     stop request.
     ///   - onTickQuitProgress: called once per second of the Cmd+Q wait so the
@@ -71,6 +71,16 @@ extension StopPolicyCoordinator {
 /// single client of `waitForOneShot`, so the abstraction lives with it.
 @MainActor
 final class LiveStopPolicyCoordinator: StopPolicyCoordinator {
+    /// Default wait for the in-app Stop button's `recording_finalized` event.
+    /// MUST exceed the daemon's `SCREENCAP_DAEMON_STOP_TIMEOUT` (30s) plus its
+    /// ~3s SIGKILL fallback so the daemon's synthesized `recording_finalized`
+    /// from `_handle_engine_exit` reaches us before this wait gives up.
+    /// Lowering this back to 30s re-introduces SCR-69.
+    static let inAppStopTimeout: TimeInterval = 60
+    /// Default wait for Cmd+Q's `stopped` event. Long enough to cover a fully
+    /// drained chunk processor + scrub worker on a chunked cloud recording.
+    static let quittingStopTimeout: TimeInterval = 300
+
     /// Pending awaits keyed by event type. Resolved when the matching event
     /// arrives or when the timeout fires.
     private var awaitingFinalized: [(Bool) -> Void] = []
@@ -99,14 +109,20 @@ final class LiveStopPolicyCoordinator: StopPolicyCoordinator {
             try await sendStopSignal()
         } catch {
             // The stop subprocess never launched — the recorder never
-            // received SIGTERM, so waiting 30s/300s for stderr events would
+            // received SIGTERM, so waiting 60s/300s for stderr events would
             // surface a false "still finalizing" message. Bail out so the
             // orchestrator can roll state back and (for Cmd+Q) tell AppKit
             // to abort the quit so the app doesn't hang on `.terminateLater`.
             return .sendSignalFailed(error)
         }
 
-        let effective = timeout ?? (quitting ? 300 : 30)
+        // See `inAppStopTimeout` / `quittingStopTimeout` for why the in-app
+        // default is 60s (not 30s) — matching the daemon's 30s budget races
+        // its own timeout and surfaces a false "still finalizing" toast on
+        // clean stops whose cleanup happens to exceed 30s (SCR-69).
+        let effective = timeout ?? (quitting
+            ? Self.quittingStopTimeout
+            : Self.inAppStopTimeout)
         let success: Bool
         if quitting {
             success = await waitForOneShot(
@@ -146,7 +162,7 @@ final class LiveStopPolicyCoordinator: StopPolicyCoordinator {
                     if resumed { return }
                     resumed = true
                     // Cancel the timeout sleep so it doesn't sit for the full
-                    // 30s/300s wall-clock after a successful event.
+                    // 60s/300s wall-clock after a successful event.
                     timeoutTask?.cancel()
                     continuation.resume(returning: value)
                 }

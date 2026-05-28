@@ -27,6 +27,19 @@ set -eu
 
 SCRIPT_DIR="$(CDPATH= cd -- "$(dirname -- "$0")" && pwd)"
 
+# Debug-only stderr capture: the LaunchAgent plist has no StandardErrorPath,
+# so without this redirect daemon stderr (engine events forwarded by
+# _stderr_pump, supervisor logger output, fatal tracebacks) goes to
+# /dev/null and a daemon-side bug is effectively unobservable. The file
+# is append-only and grows unbounded — Release launchers do NOT do this.
+# Mirrors `auto-serve.log` for the CLI auto-spawn path. SCR-69.
+SCREENCAP_LOG_DIR="${HOME}/.screencap/run"
+umask 077
+mkdir -p "${SCREENCAP_LOG_DIR}" 2>/dev/null || true
+if [ -d "${SCREENCAP_LOG_DIR}" ]; then
+    exec 2>>"${SCREENCAP_LOG_DIR}/serve.log"
+fi
+
 if [ "${SCREENCAP_DAEMON_USE_DEV_SOURCE:-0}" = "1" ] && [ -n "${SCREENCAP_DEV_REPO_ROOT:-}" ] && [ -d "${SCREENCAP_DEV_REPO_ROOT}/src/screencap" ]; then
     PATH="/opt/homebrew/bin:/usr/local/bin:${PATH}"
     export PATH
