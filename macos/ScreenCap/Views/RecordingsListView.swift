@@ -8,6 +8,7 @@ import SwiftUI
 /// default browser) — replaced by the native viewer in v1.1.
 struct RecordingsListView: View {
     @EnvironmentObject private var index: RecordingsIndex
+    @Environment(\.openWindow) private var openWindow
 
     @Binding var filterDay: Date?
     /// Lets the parent navigate back to the calendar when the user clicks a
@@ -145,12 +146,34 @@ struct RecordingsListView: View {
                 Text(rec.sizeMB)
                     .font(.caption)
                     .foregroundStyle(.tertiary)
+                if rec.isUploadEligible {
+                    uploadButton(for: rec)
+                }
                 Image(systemName: "play.circle")
                     .foregroundStyle(.secondary)
             }
             .contentShape(Rectangle())
         }
         .buttonStyle(.plain)
+    }
+
+    /// Plan U4: per-row Upload affordance. Visible only for eligible rows
+    /// (`uploaded == false && isStub == false`, per R2). Opens the review
+    /// `WindowGroup` (plan U3) scoped to this recording — the review-then-
+    /// upload pipeline lives in U7/U8. The button has its own `.buttonStyle`
+    /// scope so its tap area doesn't fight the outer row button (which still
+    /// owns the browser link-out path on row body click).
+    @ViewBuilder
+    private func uploadButton(for rec: RecordingSummary) -> some View {
+        Button {
+            openWindow(id: ReviewWindowID, value: rec.name)
+        } label: {
+            Label("Upload", systemImage: "icloud.and.arrow.up")
+                .labelStyle(.titleAndIcon)
+                .font(.caption)
+        }
+        .buttonStyle(.borderless)
+        .help("Review this recording before uploading")
     }
 
     private var errorBinding: Binding<Bool> {
