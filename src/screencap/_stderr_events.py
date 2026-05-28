@@ -12,7 +12,8 @@ Active events (emitted in v1):
   started, lock_contended, recording_finalized, disk_full,
   permission_lost, stopped, menubar_neutralized_by_env,
   matrix_disclosure_required, lock_metadata_write_failed,
-  terminated_reason_persist_failed
+  terminated_reason_persist_failed,
+  upload_started, upload_file_done, upload_finished, upload_failed
 
 Reserved events (schema documented, NOT emitted in v1 — todo 004):
   chunk_finalized — wiring deferred to a follow-up that touches
@@ -56,6 +57,14 @@ EVENT_ENGINE_CRASHED = "engine_crashed"
 EVENT_PREVIOUS_SESSION_RECOVERED = "previous_session_recovered"
 EVENT_PREVIOUS_SESSION_FORCE_TERMINATED = "previous_session_force_terminated"
 EVENT_SUBSCRIBED = "subscribed"
+# Upload pipeline events (plan U1) — consumed by the SwiftUI review window's
+# UploadController to drive progress UI. Emitted from upload.py via the same
+# tolerant-reader contract as recorder events: tolerant Swift parsers ignore
+# unknown event types, so adding new ones never breaks existing consumers.
+EVENT_UPLOAD_STARTED = "upload_started"
+EVENT_UPLOAD_FILE_DONE = "upload_file_done"
+EVENT_UPLOAD_FINISHED = "upload_finished"
+EVENT_UPLOAD_FAILED = "upload_failed"
 
 
 def emit_event(event_type: str, **fields: Any) -> None:
@@ -97,4 +106,8 @@ __all__ = [
     "EVENT_PREVIOUS_SESSION_RECOVERED",
     "EVENT_PREVIOUS_SESSION_FORCE_TERMINATED",
     "EVENT_SUBSCRIBED",
+    "EVENT_UPLOAD_STARTED",
+    "EVENT_UPLOAD_FILE_DONE",
+    "EVENT_UPLOAD_FINISHED",
+    "EVENT_UPLOAD_FAILED",
 ]
