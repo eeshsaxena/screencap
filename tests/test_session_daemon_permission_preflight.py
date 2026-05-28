@@ -9,19 +9,44 @@ on every ``screencapture`` / ``CGWindowListCopyWindowInfo`` call — the
 infinite-prompt-loop symptom users see.
 
 These tests pin the contract: on macOS, ``run_recording_worker`` MUST
-fail-fast with ``permission_lost`` + exit code 3 when the live TCC state
-(``_check_permission_fresh``) reports Screen Recording is denied, without
-ever entering the recording loop. Probe failures (None) fail-open — a
-transient subprocess hiccup must not kill an otherwise-authorized run.
+fail-fast with ``permission_lost`` + exit code 3 when ``Quartz``'s live
+TCC state reports Screen Recording is denied, without ever entering the
+recording loop. PyObjC import or call failures fail-open — a transient
+Quartz hiccup must not kill an otherwise-authorized run.
+
+The preflight uses an in-process ``Quartz.CGPreflightScreenCaptureAccess``
+call rather than the subprocess probe ``_check_permission_fresh`` because
+the bundled daemon binary's Click entry point rejects the probe's ``-c``
+flag with a UsageError, making the subprocess probe return ``None`` (which
+fail-opens) and the preflight a no-op in the frozen binary path.
 """
 
 from __future__ import annotations
 
 import json
 import sys
+import types
 from io import StringIO
 
 import pytest
+
+
+def _install_fake_quartz(monkeypatch, *, granted):
+    """Inject a fake ``Quartz`` module so the worker's in-process preflight
+    check returns a known answer without needing PyObjC on the test host.
+
+    ``granted`` is ``True`` (allowed), ``False`` (denied), or an exception
+    instance to raise from ``CGPreflightScreenCaptureAccess`` to simulate a
+    PyObjC failure (the fail-open path).
+    """
+    fake = types.ModuleType("Quartz")
+    if isinstance(granted, BaseException):
+        def _raise():  # noqa: D401
+            raise granted
+        fake.CGPreflightScreenCaptureAccess = _raise
+    else:
+        fake.CGPreflightScreenCaptureAccess = lambda: 1 if granted else 0
+    monkeypatch.setitem(sys.modules, "Quartz", fake)
 
 
 @pytest.fixture
@@ -70,7 +95,7 @@ class TestDaemonPreflight:
         from screencap import recorder, session
 
         monkeypatch.setattr(sys, "platform", "darwin")
-        monkeypatch.setattr(recorder, "_check_permission_fresh", lambda name: False)
+        _install_fake_quartz(monkeypatch, granted=False)
 
         # start_recording MUST NOT be called when preflight denies — that
         # would re-introduce the 20 fps prompt loop the gate exists to
@@ -116,14 +141,12 @@ class TestDaemonPreflight:
         from screencap import recorder, session
 
         monkeypatch.setattr(sys, "platform", "linux")
-        # If the preflight is reached on Linux it would explode (the
-        # darwin-only import path), so this also guards against a future
-        # refactor that drops the platform guard.
-
-        def _should_not_check(name):
-            raise AssertionError("preflight ran on non-darwin platform")
-
-        monkeypatch.setattr(recorder, "_check_permission_fresh", _should_not_check)
+        # If the preflight is reached on Linux it would attempt the
+        # Quartz import and explode, so a Quartz that raises on call is
+        # the canary: it must never be touched on this code path.
+        _install_fake_quartz(
+            monkeypatch, granted=AssertionError("Quartz called on non-darwin")
+        )
 
         called = {"count": 0}
 
@@ -139,16 +162,16 @@ class TestDaemonPreflight:
         assert exc_info.value.code == 0
         assert called["count"] == 1
 
-    def test_darwin_probe_failure_fails_open(self, monkeypatch, minimal_worker_args):
-        """``_check_permission_fresh`` returns None on subprocess timeout /
-        unparseable stdout. The preflight must treat that as 'couldn't
-        determine' and continue into start_recording — otherwise a Quartz
-        hiccup during a Sequoia overlay would kill every recording on
-        machines where TCC is actually granted."""
+    def test_darwin_quartz_failure_fails_open(self, monkeypatch, minimal_worker_args):
+        """``Quartz.CGPreflightScreenCaptureAccess`` can raise on a
+        PyObjC hiccup. The preflight must treat that as 'couldn't
+        determine' and continue into start_recording — otherwise a
+        transient Quartz failure during a Sequoia overlay would kill
+        every recording on machines where TCC is actually granted."""
         from screencap import recorder, session
 
         monkeypatch.setattr(sys, "platform", "darwin")
-        monkeypatch.setattr(recorder, "_check_permission_fresh", lambda name: None)
+        _install_fake_quartz(monkeypatch, granted=RuntimeError("PyObjC blew up"))
 
         called = {"count": 0}
 
@@ -164,6 +187,33 @@ class TestDaemonPreflight:
         assert exc_info.value.code == 0
         assert called["count"] == 1
 
+    def test_darwin_denial_via_inprocess_check_when_subprocess_probe_broken(
+        self, monkeypatch, minimal_worker_args
+    ):
+        """Frozen-daemon regression: the bundled CLI's Click entry point
+        rejects ``screencap -c "<code>"`` with a UsageError, so the
+        subprocess-based ``_check_permission_fresh`` always returns
+        ``None`` in production. The preflight must still deny based on
+        the in-process ``Quartz`` check, not on the broken probe.
+        """
+        from screencap import recorder, session
+
+        monkeypatch.setattr(sys, "platform", "darwin")
+        _install_fake_quartz(monkeypatch, granted=False)
+        # Pin the subprocess-probe regression: even if some refactor
+        # accidentally re-introduces the call, returning None must NOT
+        # let the worker fall through into the recording loop.
+        monkeypatch.setattr(recorder, "_check_permission_fresh", lambda name: None)
+
+        def _should_not_run(*args, **kwargs):
+            raise AssertionError("start_recording invoked on denied preflight")
+
+        monkeypatch.setattr(recorder, "start_recording", _should_not_run)
+
+        with pytest.raises(SystemExit) as exc_info:
+            session.run_recording_worker(minimal_worker_args)
+        assert exc_info.value.code == 3
+
     def test_darwin_granted_proceeds_to_start_recording(
         self, monkeypatch, minimal_worker_args
     ):
@@ -172,7 +222,7 @@ class TestDaemonPreflight:
         from screencap import recorder, session
 
         monkeypatch.setattr(sys, "platform", "darwin")
-        monkeypatch.setattr(recorder, "_check_permission_fresh", lambda name: True)
+        _install_fake_quartz(monkeypatch, granted=True)
 
         called = {"count": 0}
 

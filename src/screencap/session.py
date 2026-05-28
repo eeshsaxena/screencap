@@ -170,15 +170,30 @@ def run_recording_worker(args: dict) -> None:
     # The engine policy is PermNoop, so without this check the recording
     # loop would enter `screen_event_reader` (20 fps) and trigger a fresh
     # TCC prompt on every `screencapture` / Quartz call when the daemon
-    # binary's code identity is not authorized. Using a fresh subprocess
-    # bypasses the macOS per-process TCC cache. A `None` (probe failed)
-    # result is fail-open: defer to the engine's existing handling rather
-    # than killing recordings on a transient subprocess hiccup.
+    # binary's code identity is not authorized.
+    #
+    # In-process `Quartz.CGPreflightScreenCaptureAccess` is correct here
+    # despite the per-process TCC cache: this worker is freshly spawned
+    # and has not yet made any TCC-touching call, so the first preflight
+    # reads live state. The previous subprocess-based `_check_permission_fresh`
+    # path returned `None` in the bundled daemon because the bundled
+    # CLI's Click entry point rejects `sys.executable -c "<code>"` with
+    # a UsageError — making the gate a no-op in the frozen-binary path
+    # and reproducing the infinite-prompt symptom (SCR-69 smoke test).
+    # A PyObjC import / call failure is fail-open: better to let the
+    # engine's existing handling deal with it than kill a recording on
+    # a transient Quartz hiccup.
     if sys.platform == "darwin":
         from screencap._stderr_events import EVENT_PERMISSION_LOST, emit_event
-        from screencap.recorder import _check_permission_fresh
 
-        if _check_permission_fresh("Screen Recording") is False:
+        granted: bool | None
+        try:
+            import Quartz
+            granted = bool(Quartz.CGPreflightScreenCaptureAccess())
+        except Exception:
+            granted = None
+
+        if granted is False:
             emit_event(EVENT_PERMISSION_LOST, permission="screen_recording", elapsed=0.0)
             raise SystemExit(3)
 
