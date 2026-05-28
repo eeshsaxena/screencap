@@ -608,7 +608,7 @@ class RecordingCollaborators:
                 (capture_dir / ".upload_followup.json").write_text(
                     _json.dumps({
                         "kind": followup_kind,
-                        "n_uploaded": n_uploaded,
+                        "n_uploaded": n_emitted,
                         "n_total": n_total,
                         "upload_warning": cp.upload_warning or None,
                     })
