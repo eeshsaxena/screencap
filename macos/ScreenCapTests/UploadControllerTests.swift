@@ -258,4 +258,106 @@ final class UploadControllerTests: XCTestCase {
             XCTFail("expected uploading state on retry, got \(controller.state)")
         }
     }
+
+    /// Todo #004 — `upload_file_done` without an explicit `files_done`
+    /// falls through to `filesDone += 1`. Every other test supplies
+    /// `files_done`; this one exercises the increment fallback so a
+    /// regression there ships visible.
+    func testUploadFileDoneWithoutFilesDoneIncrementsCounter() {
+        let service = FakeUploadService()
+        let controller = UploadController(service: service)
+
+        controller.start(name: "rec-001")
+        service.emit(#"{"type": "upload_started", "schema_version": 1, "file_count": 3}"#)
+        // No `files_done` field — exercise the fallback branch.
+        service.emit(#"{"type": "upload_file_done", "schema_version": 1, "name": "video.mp4"}"#)
+        service.emit(#"{"type": "upload_file_done", "schema_version": 1, "name": "events.jsonl"}"#)
+
+        guard case .uploading(let progress) = controller.state else {
+            return XCTFail("expected uploading, got \(controller.state)")
+        }
+        XCTAssertEqual(progress.filesDone, 2)
+        XCTAssertEqual(progress.filesTotal, 3)
+    }
+
+    /// Todo #005 — `upload_failed` without an explicit `error` lands on
+    /// `.failed("upload failed")` (the default-message fallback).
+    func testUploadFailedWithoutErrorUsesDefaultMessage() {
+        let service = FakeUploadService()
+        let controller = UploadController(service: service)
+
+        controller.start(name: "rec-001")
+        service.emit(#"{"type": "upload_started", "schema_version": 1, "file_count": 1}"#)
+        // No `error` field — exercise the default-message fallback.
+        service.emit(#"{"type": "upload_failed", "schema_version": 1}"#)
+
+        if case .failed(let msg) = controller.state {
+            XCTAssertEqual(msg, "upload failed")
+        } else {
+            XCTFail("expected failed state, got \(controller.state)")
+        }
+    }
+
+    /// Todo #010 — first-write-wins on terminal events. A second
+    /// `upload_finished` after the first must not re-fire the state
+    /// transition (which would re-trigger auto-close + index refresh in
+    /// the viewmodel). Same for contradictory `upload_failed` after a
+    /// successful terminal.
+    func testSecondTerminalEventIsIgnored() {
+        let service = FakeUploadService()
+        let controller = UploadController(service: service)
+
+        controller.start(name: "rec-001")
+        service.emit(#"{"type": "upload_started", "schema_version": 1, "file_count": 1}"#)
+        service.emit(#"{"type": "upload_finished", "schema_version": 1, "uploaded": 1, "skipped": 0, "failed": 0}"#)
+        // Contradictory follow-up that must not flip the terminal state.
+        service.emit(#"{"type": "upload_failed", "schema_version": 1, "error": "spurious"}"#)
+
+        if case .succeeded(let summary) = controller.state {
+            XCTAssertEqual(summary.uploaded, 1)
+        } else {
+            XCTFail("first terminal must win, got \(controller.state)")
+        }
+    }
+
+    /// Todo #001 — inactivity timeout. With a short test bound, no events
+    /// after start → controller transitions to `.failed("upload timed out")`
+    /// and SIGTERMs the child.
+    func testInactivityTimeoutTransitionsToFailed() async {
+        let service = FakeUploadService()
+        let controller = UploadController(service: service, inactivityTimeoutSeconds: 0.05)
+
+        controller.start(name: "rec-001")
+        // No events for longer than the bound.
+        try? await Task.sleep(nanoseconds: 200_000_000)
+
+        if case .failed(let msg) = controller.state {
+            XCTAssertEqual(msg, "upload timed out")
+        } else {
+            XCTFail("expected timeout failure, got \(controller.state)")
+        }
+        XCTAssertGreaterThanOrEqual(service.fakeProcess.terminateInvocations, 1, "child must receive SIGTERM on timeout")
+    }
+
+    /// Todo #001 — the watchdog must reset on every parsed event, so a
+    /// slow-but-progressing upload doesn't trip the timeout.
+    func testWatchdogResetsOnEachEvent() async {
+        let service = FakeUploadService()
+        // Bound = 100ms. Events arrive every 30ms for ~200ms. The watchdog
+        // should reset on each and never fire.
+        let controller = UploadController(service: service, inactivityTimeoutSeconds: 0.1)
+
+        controller.start(name: "rec-001")
+        for _ in 0..<6 {
+            try? await Task.sleep(nanoseconds: 30_000_000)
+            service.emit(#"{"type": "upload_file_done", "schema_version": 1, "files_done": 1, "files_total": 3}"#)
+        }
+
+        // Still uploading after the steady stream of events.
+        if case .uploading = controller.state {
+            // pass
+        } else {
+            XCTFail("watchdog must reset; got \(controller.state)")
+        }
+    }
 }
