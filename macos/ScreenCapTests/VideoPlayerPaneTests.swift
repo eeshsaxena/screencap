@@ -18,10 +18,46 @@ final class FakeVideoPlaybackEngine: VideoPlaybackEngine {
 
     private var timeHandler: (@MainActor (Double) -> Void)?
     private var statusHandler: (@MainActor (VideoLoadStatus) -> Void)?
+    /// Pending seek completion handlers, in dispatch order. Tests fire
+    /// them via `completeAllSeeks` / `completeLastSeek` to drive the
+    /// scrub-completion path deterministically.
+    private var pendingSeekCompletions: [(Bool) -> Void] = []
 
-    func seek(toSeconds seconds: Double) {
+    func seek(toSeconds seconds: Double, completion: @escaping @MainActor (Bool) -> Void) {
         seekRequests.append(seconds)
         currentSeconds = seconds
+        pendingSeekCompletions.append(completion)
+    }
+
+    /// Test helper: fire every pending seek completion (in FIFO order)
+    /// with `finished: true`, simulating AVPlayer reporting clean
+    /// completion of every queued seek.
+    func completeAllSeeks(finished: Bool = true) {
+        let pending = pendingSeekCompletions
+        pendingSeekCompletions.removeAll()
+        for completion in pending {
+            completion(finished)
+        }
+    }
+
+    /// Test helper: fire just the most recently dispatched seek's
+    /// completion, leaving earlier ones pending — useful for asserting
+    /// the generation-counter guard behavior.
+    func completeLastSeek(finished: Bool = true) {
+        guard let last = pendingSeekCompletions.popLast() else { return }
+        last(finished)
+    }
+
+    /// Test helper: count pending seek completions.
+    var pendingSeekCount: Int { pendingSeekCompletions.count }
+
+    /// Test helper: fire the OLDEST queued seek completion (FIFO),
+    /// leaving any later ones pending. Useful for the stacked-seek race
+    /// regression test.
+    func completeFirstSeek(finished: Bool = true) {
+        guard !pendingSeekCompletions.isEmpty else { return }
+        let oldest = pendingSeekCompletions.removeFirst()
+        oldest(finished)
     }
 
     func play() { playCalls += 1 }
@@ -113,8 +149,7 @@ final class VideoPlayerPaneTests: XCTestCase {
 
     /// Risk-table guard: a periodic-observer tick that arrives mid-scrub must
     /// not snap the cursor backward to a stale frame timestamp. The model
-    /// flags itself as "seeking from scrub" between `seek()` and the next
-    /// runloop turn — the test exercises that window.
+    /// flags itself as "seeking from scrub" until the seek completion fires.
     func testTickArrivingMidScrubDoesNotClobberSeekTarget() {
         let engine = FakeVideoPlaybackEngine()
         let model = VideoPlayerPaneModel(engine: engine)
@@ -126,6 +161,44 @@ final class VideoPlayerPaneTests: XCTestCase {
         engine.tick(at: 5.0)
 
         XCTAssertEqual(model.currentTime, 20.0)
+        XCTAssertTrue(model.isSeekingFromScrub, "flag stays armed until completion fires")
+
+        engine.completeAllSeeks()
+        XCTAssertFalse(model.isSeekingFromScrub, "completion clears the flag")
+    }
+
+    /// Todo #003 — stacked-seek race regression test. When a rapid drag
+    /// dispatches multiple seeks, the completion handler from an earlier
+    /// seek must not flip the flag back while a later seek is still in
+    /// flight. The model's generation counter is the guard; this test
+    /// drives the exact interleaving.
+    func testStackedSeeksHonorGenerationCounter() {
+        let engine = FakeVideoPlaybackEngine()
+        let model = VideoPlayerPaneModel(engine: engine)
+
+        // First seek — completion goes into the queue.
+        model.seek(toSeconds: 5.0)
+        XCTAssertTrue(model.isSeekingFromScrub)
+        XCTAssertEqual(engine.pendingSeekCount, 1)
+
+        // Second seek before the first completes (rapid drag).
+        model.seek(toSeconds: 10.0)
+        XCTAssertTrue(model.isSeekingFromScrub)
+        XCTAssertEqual(engine.pendingSeekCount, 2)
+
+        // Fire the FIRST seek's completion. The generation counter no
+        // longer matches, so the flag must stay armed.
+        engine.completeFirstSeek()
+        XCTAssertTrue(model.isSeekingFromScrub, "stale completion must not clear flag")
+
+        // A periodic-observer tick during this window must still not
+        // overwrite currentTime.
+        engine.tick(at: 5.0)
+        XCTAssertEqual(model.currentTime, 10.0)
+
+        // Fire the LATEST seek's completion — now the flag clears.
+        engine.completeLastSeek()
+        XCTAssertFalse(model.isSeekingFromScrub)
     }
 
     func testTearDownStopsTimeObserver() {

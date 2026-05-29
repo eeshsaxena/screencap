@@ -23,7 +23,12 @@ protocol VideoPlaybackEngine: AnyObject {
     var currentSeconds: Double { get }
     var loadStatus: VideoLoadStatus { get }
 
-    func seek(toSeconds seconds: Double)
+    /// Async-completing seek. The completion handler fires on the main actor
+    /// after AVPlayer reports the seek finished (or was superseded by a
+    /// newer seek). Plan U6's scrub feedback loop relies on this to clear
+    /// the in-flight flag at the right moment instead of guessing with a
+    /// next-runloop dispatch.
+    func seek(toSeconds seconds: Double, completion: @escaping @MainActor (Bool) -> Void)
     func play()
     func pause()
     func startObservingTime(interval: Double, onTick: @escaping @MainActor (Double) -> Void)
@@ -64,9 +69,17 @@ final class LiveVideoPlaybackEngine: VideoPlaybackEngine {
         }
     }
 
-    func seek(toSeconds seconds: Double) {
+    func seek(toSeconds seconds: Double, completion: @escaping @MainActor (Bool) -> Void) {
         let time = CMTime(seconds: max(0, seconds), preferredTimescale: 600)
-        player.seek(to: time, toleranceBefore: .zero, toleranceAfter: .zero)
+        // AVPlayer invokes the completion handler on an internal queue,
+        // and passes `finished: false` if a newer seek superseded this
+        // one. Hop to the main actor before calling the user's completion
+        // so its closure body can touch MainActor state directly.
+        player.seek(to: time, toleranceBefore: .zero, toleranceAfter: .zero) { finished in
+            DispatchQueue.main.async {
+                MainActor.assumeIsolated { completion(finished) }
+            }
+        }
     }
 
     func play() { player.play() }
@@ -128,11 +141,18 @@ final class VideoPlayerPaneModel: ObservableObject {
 
     let engine: VideoPlaybackEngine
 
-    /// True while `seek(toSeconds:)` is in flight from a user-driven scrub.
-    /// The timeline (U6) writes through this flag to suppress the
-    /// playback-cursor → timeline feedback loop the plan calls out under
-    /// its risks table.
+    /// True while a user-driven scrub seek is in flight. The timeline (U6)
+    /// writes through this flag to suppress the playback-cursor → timeline
+    /// feedback loop the plan calls out under its risks table.
     private(set) var isSeekingFromScrub = false
+
+    /// Monotonic sequence number bumped on every `seek(toSeconds:)` call.
+    /// The completion handler only clears `isSeekingFromScrub` if its
+    /// captured generation matches the current one — so a stale completion
+    /// from an earlier seek (superseded by a fresher one during a rapid
+    /// drag) can't flip the flag back while the newer seek is still in
+    /// flight (todo #003 race fix).
+    private var seekGeneration: UInt64 = 0
 
     init(engine: VideoPlaybackEngine, observeIntervalSeconds: Double = 0.1) {
         self.engine = engine
@@ -152,13 +172,18 @@ final class VideoPlayerPaneModel: ObservableObject {
 
     func seek(toSeconds seconds: Double) {
         isSeekingFromScrub = true
-        engine.seek(toSeconds: seconds)
         currentTime = seconds
-        // The seek lands quickly; clear the flag on the next runloop turn so
-        // the periodic observer's first post-seek tick can resume cursor
-        // updates without clobbering the user's drag endpoint.
-        DispatchQueue.main.async { [weak self] in
-            self?.isSeekingFromScrub = false
+        seekGeneration &+= 1
+        let myGeneration = seekGeneration
+        engine.seek(toSeconds: seconds) { [weak self] _ in
+            guard let self else { return }
+            // Defense against the stacked-seek race: a completion handler
+            // from seek N firing after seek N+1 has been dispatched would
+            // otherwise clear the flag while the newer seek is still in
+            // flight, briefly opening the window for a periodic-observer
+            // tick to overwrite currentTime with a stale value.
+            guard myGeneration == self.seekGeneration else { return }
+            self.isSeekingFromScrub = false
         }
     }
 
