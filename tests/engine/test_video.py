@@ -714,3 +714,74 @@ class TestRemediatePixfmtForReview:
         assert "video.mp4" in names
         # R6: the upload artifact's bytes are unchanged by remediation.
         assert (tmp_path / "video.mp4").read_bytes() == original_bytes
+
+
+class TestReviewPipelineHardening:
+    """Regression guards from code review of the PyAV review pipeline (SCR-97)."""
+
+    def test_remediate_preserves_vfr_idle_gap(self, tmp_path):
+        """A yuv444p recording with an idle gap keeps that gap after re-encode.
+
+        This is the load-bearing guard for the deliberate deviation from the
+        plan's `frame.pts=None`: that idiom collapses a variable-frame-rate
+        (action-gated) recording's timeline. The PTS-preserving transcode must
+        keep the ~5s gap so review-window event overlay stays aligned.
+        """
+        video = tmp_path / "video.mp4"
+        base = time.time()
+        writer = VideoWriter(str(video), width=64, height=64, fps=24)
+        # Two activity bursts separated by a 5s idle gap.
+        for ts, color in [
+            (0.0, (200, 0, 0)), (0.1, (200, 0, 0)),
+            (5.0, (0, 0, 200)), (5.1, (0, 0, 200)),
+        ]:
+            writer.write_frame(Image.new("RGB", (64, 64), color=color), base + ts)
+        writer.close()
+        assert read_pixel_format(video) == "yuv444p"
+
+        path, remediated = remediate_pixfmt_for_review(tmp_path)
+        assert remediated is True
+
+        container = av.open(str(path))
+        stream = container.streams.video[0]
+        pts = [float(f.pts * stream.time_base) for f in container.decode(stream)]
+        container.close()
+        # The idle gap survives: the span between first and last frame is ~5s,
+        # NOT collapsed to a fraction of a second (which frame.pts=None produces).
+        assert (pts[-1] - pts[0]) > 4.5, (
+            f"VFR idle gap collapsed: span {pts[-1] - pts[0]:.3f}s (expected ~5s)"
+        )
+
+    def test_concat_raises_on_mismatched_chunk_params(self, tmp_path):
+        """Chunks with differing dimensions fail loud rather than corrupt silently."""
+        _write_chunk(tmp_path / "chunk_0000.mp4", (200, 0, 0), size=64)
+        _write_chunk(tmp_path / "chunk_0001.mp4", (0, 0, 200), size=48)
+        with pytest.raises(RuntimeError, match="differ from the first"):
+            concat_video_chunks(tmp_path)
+        assert not (tmp_path / "video.mp4").exists()
+        assert not list(tmp_path.glob(".video.mp4.*.tmp"))
+
+    def test_concat_does_not_promote_temp_on_close_timeout(self, tmp_path, monkeypatch):
+        """A timed-out container close must not publish a possibly-truncated video.mp4."""
+        import screencap.engine.video as video_mod
+
+        _write_chunk(tmp_path / "chunk_0000.mp4", (200, 0, 0))
+        _write_chunk(tmp_path / "chunk_0001.mp4", (0, 0, 200))
+        monkeypatch.setattr(video_mod, "_close_container_in_thread", lambda c: False)
+
+        with pytest.raises(RuntimeError, match="Timed out finalizing"):
+            concat_video_chunks(tmp_path)
+        assert not (tmp_path / "video.mp4").exists()
+        assert not list(tmp_path.glob(".video.mp4.*.tmp"))
+
+    def test_remediate_does_not_promote_temp_on_close_timeout(self, tmp_path, monkeypatch):
+        """A timed-out close must not publish a possibly-truncated .video_review.mp4."""
+        import screencap.engine.video as video_mod
+
+        _write_chunk(tmp_path / "video.mp4", (200, 0, 0))  # yuv444p → needs remediation
+        monkeypatch.setattr(video_mod, "_close_container_in_thread", lambda c: False)
+
+        with pytest.raises(RuntimeError, match="Timed out finalizing"):
+            remediate_pixfmt_for_review(tmp_path)
+        assert not (tmp_path / ".video_review.mp4").exists()
+        assert not list(tmp_path.glob(".video_review.mp4.*.tmp"))

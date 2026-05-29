@@ -830,12 +830,18 @@ class ChunkedVideoWriter:
 # =============================================================================
 
 
-def _close_container_in_thread(container: av.container.Container) -> None:
+def _close_container_in_thread(container: av.container.Container) -> bool:
     """Close a PyAV container off the main thread to dodge a GIL deadlock.
 
     Mirrors ``VideoWriter.close`` / ``finalize_video_writer``: closing in the
     calling thread can hang indefinitely (PyAV issue #1053), so close in a
     worker and join with a 15s budget.
+
+    Returns ``True`` if the close finished within the budget, ``False`` if it
+    timed out (the worker is left running and still owns the file descriptor).
+    A caller performing an atomic write must treat ``False`` as a failed
+    finalize and must NOT promote the temp file — the moov atom may be unwritten,
+    so the output could be truncated/unplayable.
     """
     def _close() -> None:
         container.close()
@@ -844,11 +850,13 @@ def _close_container_in_thread(container: av.container.Container) -> None:
     close_thread.start()
     close_thread.join(timeout=15)
     if close_thread.is_alive():
-        logger.warning("container close thread did not finish in 15s, continuing")
+        logger.warning("container close thread did not finish in 15s")
+        return False
+    return True
 
 
 def _discard_failed_output(
-    output: "av.container.OutputContainer | None", tmp_path: Path
+    output: av.container.OutputContainer | None, tmp_path: Path
 ) -> None:
     """Best-effort teardown when an atomic write fails: close container, drop temp.
 
@@ -872,12 +880,15 @@ def concat_video_chunks(rec_dir: str | Path) -> Path:
 
     The chunks are written by ``ChunkedVideoWriter`` with ``bf=0`` (no
     B-frames), so within each chunk ``PTS == DTS`` and timestamps are monotonic
-    from ~0. To stitch them, each subsequent chunk's packet timestamps are
-    offset by the cumulative duration of all preceding chunks, preserving a
-    single monotonic timeline that starts at ~0. That timeline is load-bearing:
-    ``engine/capture.py:get_frame_at`` maps a wall-clock timestamp to a
-    video-relative frame, so an accumulated offset error would extract the
-    wrong screenshot.
+    from ~0. They are stitched back-to-back: each subsequent chunk's packet
+    timestamps are offset by the cumulative duration of all preceding chunks,
+    producing a single monotonic timeline starting at ~0. This matches the
+    semantics of the ``ffmpeg -f concat`` it replaces. NOTE: like that prior
+    behavior, the *wall-clock* idle gap between one chunk's last frame and the
+    next chunk's first frame is not represented (each chunk's PTS restarts at
+    ~0), so for multi-chunk action-gated recordings the merged timeline tracks
+    summed intra-chunk spans, not absolute recording time — a pre-existing
+    limitation that ``engine/capture.py:get_frame_at`` inherits unchanged.
 
     The output is a plain (non-fragmented) MP4 with the moov atom at the end —
     **not** faststart. ``extract_frames``/``extract_frame`` consume this file
@@ -913,6 +924,7 @@ def concat_video_chunks(rec_dir: str | Path) -> Path:
     output = av.open(str(tmp_path), mode="w", format="mp4")
     try:
         out_stream = None
+        template_params: tuple | None = None
         # Cumulative offset in the (shared) input stream time_base. All chunks
         # come from the same recorder config, so their time_bases match and
         # ``add_stream_from_template`` gives the output that same time_base.
@@ -925,11 +937,24 @@ def concat_video_chunks(rec_dir: str | Path) -> Path:
                     f"Cannot open video chunk for concat: {chunk.name}: {exc}"
                 ) from exc
             try:
+                if not inp.streams.video:
+                    raise RuntimeError(f"Chunk has no video stream: {chunk.name}")
                 in_stream = inp.streams.video[0]
+                params = (in_stream.width, in_stream.height, in_stream.codec_context.pix_fmt)
                 if out_stream is None:
                     # add_stream_from_template replaces the removed
                     # add_stream(template=...) API (PyAV 14+).
                     out_stream = output.add_stream_from_template(in_stream)
+                    template_params = params
+                elif params != template_params:
+                    # Stream-copying a mismatched chunk against the first chunk's
+                    # template silently corrupts the segment (no decode error),
+                    # so fail loud instead. Recorder chunks are homogeneous; a
+                    # mismatch means a tampered/foreign file.
+                    raise RuntimeError(
+                        f"Chunk {chunk.name} params {params} differ from the first "
+                        f"chunk {template_params}; cannot stream-copy concat"
+                    )
                 # Estimate a fallback frame duration (in time_base ticks) for
                 # packets missing one, so the next chunk's offset never overlaps
                 # the last frame. average_rate/time_base are Fractions, so this
@@ -955,8 +980,14 @@ def concat_video_chunks(rec_dir: str | Path) -> Path:
                 offset += chunk_end
             finally:
                 inp.close()
-        _close_container_in_thread(output)
+        # If the close times out the moov atom may be unwritten — do not promote
+        # a possibly-truncated temp. Hand off to the worker (output=None so the
+        # rollback won't re-close), drop the temp, and fail loud.
+        closed = _close_container_in_thread(output)
         output = None
+        if not closed:
+            tmp_path.unlink(missing_ok=True)
+            raise RuntimeError(f"Timed out finalizing merged video for {rec_dir}")
         os.replace(tmp_path, out_path)
     except BaseException:
         _discard_failed_output(output, tmp_path)
@@ -1089,9 +1120,15 @@ def remediate_pixfmt_for_review(rec_dir: str | Path) -> tuple[Path, bool]:
         for packet in out_stream.encode():  # flush
             output.mux(packet)
 
-        _close_container_in_thread(output)
+        # If the close times out the moov atom may be unwritten — do not promote
+        # a possibly-truncated temp as the review copy. Hand off to the worker
+        # (output=None so rollback won't re-close), drop the temp, and fail loud.
+        closed = _close_container_in_thread(output)
         output = None
         inp.close()
+        if not closed:
+            tmp_path.unlink(missing_ok=True)
+            raise RuntimeError(f"Timed out finalizing review video for {video_path}")
         os.replace(tmp_path, review_path)
     except BaseException as exc:
         _discard_failed_output(output, tmp_path)

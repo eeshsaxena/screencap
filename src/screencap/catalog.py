@@ -193,11 +193,11 @@ def list_recordings(recordings_dir: Path | None = None) -> list[RecordingInfo]:
 
         # Stub detection: DB exists but no media files on disk. Hidden mp4/flac
         # are ignored — pathlib glob matches dotfiles, and a lingering review
-        # artifact (.video_review.mp4) must never mask a stub (R6).
+        # artifact (.video_review.mp4) must never mask a stub (R6). A real
+        # video.mp4 is non-hidden, so the *.mp4 glob already covers it.
         has_media = (
             any(not p.name.startswith(".") for p in d.glob("*.mp4"))
             or any(not p.name.startswith(".") for p in d.glob("*.flac"))
-            or (d / "video.mp4").exists()
         )
         is_stub = uploaded and not has_media and db is not None
 

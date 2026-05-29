@@ -3946,13 +3946,14 @@ def _check_av_review_pipeline() -> tuple[str, bool, str]:
             review_path, remediated = remediate_pixfmt_for_review(tmp)
             if not remediated:
                 return name, False, "expected yuv444p source to be remediated"
-            if read_pixel_format(review_path) != "yuv420p":
-                return name, False, (
-                    f"review pix_fmt not yuv420p: {read_pixel_format(review_path)}"
-                )
+            review_pix_fmt = read_pixel_format(review_path)
+            if review_pix_fmt != "yuv420p":
+                return name, False, f"review pix_fmt not yuv420p: {review_pix_fmt}"
             container = av.open(str(review_path))
-            frames = sum(1 for _ in container.decode(video=0))
-            container.close()
+            try:
+                frames = sum(1 for _ in container.decode(video=0))
+            finally:
+                container.close()
             if frames <= 0:
                 return name, False, "remediated review video has no decodable frames"
             return name, True, ""
