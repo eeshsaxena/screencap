@@ -17,13 +17,33 @@ The SCR-76 window-reader health verdict treats a falsy `get_active_window_data()
 poll as "attempting but producing no useful output" (unhealthy). But a falsy poll
 also occurs for entirely legitimate states where there simply is no focused
 window — sitting on the Finder desktop, certain fullscreen apps, or a Space /
-Mission Control transition.
+Mission Control / Spotlight transition.
 
-If the user stays in such a state for longer than the warmup window plus the
-debounce (~13s by default) during an otherwise-healthy recording, the engine
-emits `capture_unhealthy(reader=window)` and the shell shows a yellow
-"Window capture may not be recording correctly" advisory. This is a false
-positive.
+**Verified root cause (code review follow-up):** `get_active_window_data()`
+(`engine/window/__init__.py:39-41`) returns `{}` (falsy) whenever the macOS impl's
+`get_active_window_state` returns `None`. That happens for benign no-window states:
+
+- A bare desktop: `get_active_window_metadata` (`engine/window/_macos.py:215-222`)
+  filters to layer-0 non-`Window Server` windows and then does
+  `active_windows_info[0]` **with no empty-list guard** — an empty desktop raises
+  `IndexError`, which is caught upstream (`window/__init__.py:74-78`) → `None` → `{}`.
+- Space / Mission Control / Spotlight / menu-bar focus: `AXFocusedWindow` is
+  unavailable, so `get_active_window` returns `None` (`_macos.py:244-247`).
+
+`read_window_events` increments `window.attempt`, gets the falsy result, and
+`continue`s **without** `window.output`, so `_capture_health_step`'s
+`attempt > 0 and output == 0` predicate marks the window reader unhealthy.
+
+The engine then emits `capture_unhealthy(reader=window)` and the shell shows a
+yellow "Window capture may not be recording correctly" advisory — a false
+positive on a healthy recording.
+
+**Timing:** if the no-window state begins *mid-recording* (the common case —
+the user clicks to the desktop after recording is underway), it fires in
+~`CAPTURE_HEALTH_DEBOUNCE_TICKS` seconds (~3s by default), not 13s. The ~13s
+figure only applies when the state is present continuously from recording start
+(warmup ~10s + debounce ~3s). So the false-positive is more likely / faster than
+first assumed.
 
 It is **non-terminal** (advisory only — the recording continues and nothing is
 torn down), so the impact is a misleading hint, not data loss.

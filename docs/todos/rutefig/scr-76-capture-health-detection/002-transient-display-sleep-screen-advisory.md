@@ -14,10 +14,11 @@ related_review_run: /tmp/compound-engineering/ce-code-review/20260529-143307-scr
 ## Problem
 
 When the display sleeps, the screen locks, or the display configuration changes,
-`utils.take_screenshot()` can return `None` quickly. In `read_screen_events` the
-`None` branch increments `screen.attempt` and `continue`s **without a throttle
-sleep**, so attempts keep climbing while `screen.output` stays flat. After the
-warmup + debounce window this trips the screen stall verdict.
+`utils.take_screenshot()` can return `None`. In `read_screen_events` the `None`
+branch increments `screen.attempt` and `continue`s **without a throttle sleep**
+(the throttle runs only after a successful enqueue), so attempts keep climbing
+while `screen.output` stays flat. Once past warmup, `attempt > 0 and output == 0`
+trips the screen stall verdict after the debounce.
 
 Because the in-process labeller reads **live** TCC state, Screen Recording is
 still granted during a display-sleep, so `_probe_tcc_denied("screen")` returns
@@ -26,10 +27,24 @@ still granted during a display-sleep, so `_probe_tcc_denied("screen")` returns
 mis-reported as a (now self-clearing-on-idle) advisory rather than stopping the
 recording.
 
-Note: a *fully blocked* (multi-second) `screencapture` call does NOT trip this —
-when the call blocks, `screen.attempt` also stops advancing, so the
-`attempt > 0 and output == 0` predicate does not fire. Only the fast-`None`-spin
-case does.
+**Whether it actually trips depends on the failure mode's speed** (verified
+against `_take_screenshot_macos`, `engine/utils.py:126-154`, which runs
+`screencapture -x ... -t jpg` with `timeout=10` and returns `None` on any
+exception):
+
+- **Fast failure** (e.g. `screencapture` exits non-zero → invalid/empty jpg →
+  `Image.open(...).load()` raises → `None` returned in <1s): the `None` branch
+  spins with no throttle, so `screen.attempt` advances every loop iteration →
+  the gap opens → **trips** after the debounce.
+- **Hang to the `timeout=10`**: `subprocess.run` blocks ~10s before raising
+  `TimeoutExpired` → `None`. During the block `screen.attempt` does **not**
+  advance, so most 1s supervisor ticks see `attempt_delta == 0`, the predicate
+  doesn't fire, and the debounce resets → does **not** trip. (Same reason a
+  fully-blocked `screencapture` is safe.)
+
+So the open question is empirical: under real display-sleep/lock on the target
+macOS, does `screencapture -x` fail fast (trips) or hang/return a lock frame
+(safe)? Confirm before relying on either behavior.
 
 ## Suggested direction
 
