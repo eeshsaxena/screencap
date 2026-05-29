@@ -30,6 +30,13 @@ struct MenuBarMenu: View {
             RecorderErrorMessage(message: err)
         }
 
+        // Advisory, non-terminal capture-health hint (SCR-76). Distinct from
+        // lastError: the recording is still running.
+        if let advisory = recorder.captureAdvisory {
+            Divider()
+            RecorderErrorMessage(message: advisory)
+        }
+
         Divider()
 
         Button("Open ScreenCap") { openMainWindow() }

@@ -31,6 +31,53 @@ final class RecorderControllerTests: XCTestCase {
         XCTAssertNil(recorder.matrixDisclosure)
     }
 
+    // MARK: - capture_unhealthy advisory (SCR-76)
+
+    func testCaptureUnhealthyWhileRecordingSetsAdvisoryAndKeepsRecording() {
+        let recorder = RecorderController()
+        recorder._testSetPresentation(state: .recording(elapsed: 5))
+
+        recorder._testHandleStderrLine(
+            #"{"type":"capture_unhealthy","reason":"reader_stalled","reader":"screen","elapsed":12.0,"schema_version":1}"#
+        )
+
+        XCTAssertNotNil(recorder.captureAdvisory)
+        XCTAssertTrue(recorder.captureAdvisory?.contains("Screen capture") ?? false)
+        // Advisory is NON-terminal: still recording, and no terminal error set.
+        XCTAssertTrue(recorder.state.isRecording)
+        XCTAssertNil(recorder.lastError)
+    }
+
+    func testCaptureUnhealthyWhileIdleIsSuppressedByRecordingGuard() {
+        let recorder = RecorderController()  // default .idle
+
+        recorder._testHandleStderrLine(
+            #"{"type":"capture_unhealthy","reason":"listener_dead","reader":"action","elapsed":3.0,"schema_version":1}"#
+        )
+
+        XCTAssertNil(recorder.captureAdvisory)
+    }
+
+    func testRepeatedCaptureUnhealthyUpdatesAdvisoryInPlace() {
+        let recorder = RecorderController()
+        recorder._testSetPresentation(state: .recording(elapsed: 5))
+
+        recorder._testHandleStderrLine(
+            #"{"type":"capture_unhealthy","reason":"reader_stalled","reader":"screen","schema_version":1}"#
+        )
+        let first = recorder.captureAdvisory
+        recorder._testHandleStderrLine(
+            #"{"type":"capture_unhealthy","reason":"listener_dead","reader":"action","schema_version":1}"#
+        )
+        let second = recorder.captureAdvisory
+
+        XCTAssertNotNil(first)
+        XCTAssertNotNil(second)
+        // Updated in place to reflect the latest affected reader (no re-pop).
+        XCTAssertTrue(second?.contains("Input capture") ?? false)
+        XCTAssertTrue(recorder.state.isRecording)
+    }
+
     func testMissingPermissionsMessageNamesEveryRequiredPermission() {
         XCTAssertEqual(
             RecorderController.requiredPermissionsErrorMessage,

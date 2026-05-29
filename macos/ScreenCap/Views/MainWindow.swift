@@ -59,6 +59,14 @@ struct MainWindow: View {
                         .background(.red.opacity(0.15), in: RoundedRectangle(cornerRadius: 6))
                         .padding(.top, 4)
                         .transition(.opacity)
+                } else if let advisory = recorder.captureAdvisory {
+                    // Advisory, non-terminal (SCR-76) — distinct yellow tint so
+                    // it doesn't read as a terminal error. Errors take priority.
+                    RecorderErrorMessage(message: advisory)
+                        .padding(8)
+                        .background(.yellow.opacity(0.18), in: RoundedRectangle(cornerRadius: 6))
+                        .padding(.top, 4)
+                        .transition(.opacity)
                 }
             }
         }
