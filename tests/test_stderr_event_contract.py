@@ -42,12 +42,11 @@ def test_capture_unhealthy_reason_closed_set_is_exported() -> None:
     import screencap._stderr_events as events
 
     assert events.CAPTURE_UNHEALTHY_REASONS == frozenset(
-        {"reader_stalled", "listener_dead", "inconclusive"}
+        {"reader_stalled", "listener_dead"}
     )
     for name in (
         "CAPTURE_UNHEALTHY_REASON_READER_STALLED",
         "CAPTURE_UNHEALTHY_REASON_LISTENER_DEAD",
-        "CAPTURE_UNHEALTHY_REASON_INCONCLUSIVE",
         "CAPTURE_UNHEALTHY_REASONS",
     ):
         assert name in events.__all__
