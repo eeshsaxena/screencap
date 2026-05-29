@@ -82,11 +82,22 @@ final class RecorderController: ObservableObject {
     static let requiredPermissionsErrorMessage =
         "Grant Screen Recording, Accessibility, and Input Monitoring permissions before recording."
 
-    @Published private(set) var state: RecordingState = .idle
+    @Published private(set) var state: RecordingState = .idle {
+        didSet {
+            // The capture-health advisory is scoped to an active recording.
+            // Drop it on the return to .idle so a stale "may not be recording
+            // correctly" hint never lingers on the idle menu/window (SCR-76).
+            // handleCaptureUnhealthy's `.recording` guard prevents it from
+            // being re-set outside a recording, so this single chokepoint
+            // covers every idle-transition path (stop, Cmd+Q, termination).
+            if case .idle = state { captureAdvisory = nil }
+        }
+    }
     @Published private(set) var lastError: String?
     /// Advisory, NON-terminal capture-health notice (SCR-76 `capture_unhealthy`).
     /// Kept distinct from `lastError` (terminal failures) so the UI can present
     /// it as a non-blocking hint that does not imply the recording has stopped.
+    /// Cleared automatically on the return to `.idle` (see `state.didSet`).
     @Published private(set) var captureAdvisory: String?
     @Published private(set) var matrixDisclosure: PrivacyMatrixDisclosure?
     @Published private(set) var transport: RecorderTransport = .cliFallback

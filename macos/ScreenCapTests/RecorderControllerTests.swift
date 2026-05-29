@@ -58,6 +58,22 @@ final class RecorderControllerTests: XCTestCase {
         XCTAssertNil(recorder.captureAdvisory)
     }
 
+    func testCaptureAdvisoryClearedWhenRecordingReturnsToIdle() {
+        let recorder = RecorderController()
+        recorder._testSetPresentation(state: .recording(elapsed: 5))
+        recorder._testHandleStderrLine(
+            #"{"type":"capture_unhealthy","reason":"reader_stalled","reader":"screen","schema_version":1}"#
+        )
+        XCTAssertNotNil(recorder.captureAdvisory)
+
+        // A clean process termination returns the controller to .idle; the
+        // advisory must not linger on the idle UI.
+        recorder._testHandleProcessTerminated(exitCode: 0)
+
+        XCTAssertEqual(recorder.state, .idle)
+        XCTAssertNil(recorder.captureAdvisory)
+    }
+
     func testRepeatedCaptureUnhealthyUpdatesAdvisoryInPlace() {
         let recorder = RecorderController()
         recorder._testSetPresentation(state: .recording(elapsed: 5))
