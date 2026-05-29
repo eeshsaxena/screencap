@@ -1,7 +1,7 @@
 ---
 title: "feat: SCR-76 Mid-Recording Capture Health Detection"
 type: feat
-status: active
+status: completed
 date: 2026-05-29
 deepened: 2026-05-29
 origin: docs/brainstorms/2026-05-28-scr-76-mid-recording-capture-health-requirements.md
