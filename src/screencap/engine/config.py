@@ -60,6 +60,16 @@ class Settings(BaseSettings):
     # Maximum screenshots per second (0 = unlimited / legacy behavior)
     SCREEN_CAPTURE_FPS: float = 20.0
 
+    # Capture-health detection (SCR-76). The engine supervisor loop flags a
+    # reader as unhealthy when it is demonstrably attempting but producing no
+    # useful output. CAPTURE_HEALTH_WINDOW_SECS is a warmup grace period after
+    # recording start before ANY health verdict is emitted (lets readers warm
+    # up; avoids startup-transient false positives). CAPTURE_HEALTH_DEBOUNCE_TICKS
+    # is the number of consecutive unhealthy ~1s supervisor ticks (after the
+    # warmup) required before emitting — a single transient gap never fires.
+    CAPTURE_HEALTH_WINDOW_SECS: float = 10.0
+    CAPTURE_HEALTH_DEBOUNCE_TICKS: int = 3
+
     # Auto-cut video into chunks at this interval (seconds). 0 = legacy single-file.
     VIDEO_CHUNK_DURATION: float = 900.0
 
