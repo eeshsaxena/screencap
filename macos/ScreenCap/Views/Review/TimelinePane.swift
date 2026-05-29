@@ -41,21 +41,27 @@ struct TimelinePane: View {
     }
 
     private func drawBackground(context: GraphicsContext, size: CGSize) {
-        let bg = Path(CGRect(origin: .zero, size: size))
-        context.fill(bg, with: .color(.gray.opacity(0.08)))
+        context.fill(Path(CGRect(origin: .zero, size: size)), with: .color(.gray.opacity(0.08)))
     }
 
     private func drawMarkers(context: GraphicsContext, size: CGSize) {
         guard durationSeconds > 0 else { return }
         let baseline = size.height / 2
         let halfTickHeight = max(8, size.height / 3)
+        // Batch markers into one Path per category so we issue at most one
+        // `context.stroke` per category bucket instead of one per event.
+        // With 10k events × the ~10Hz periodic-time-observer redraw cadence
+        // the per-event allocation pattern would burn ~100k Path() allocs
+        // and strokes per second; this drops it to 5.
+        var pathsByCategory: [TimelineEvent.Category: Path] = [:]
         for event in events {
             let ratio = min(1, max(0, event.relativeSeconds / durationSeconds))
             let x = CGFloat(ratio) * size.width
-            var path = Path()
-            path.move(to: CGPoint(x: x, y: baseline - halfTickHeight))
-            path.addLine(to: CGPoint(x: x, y: baseline + halfTickHeight))
-            context.stroke(path, with: .color(color(for: event.category)), lineWidth: 1.5)
+            pathsByCategory[event.category, default: Path()].move(to: CGPoint(x: x, y: baseline - halfTickHeight))
+            pathsByCategory[event.category]?.addLine(to: CGPoint(x: x, y: baseline + halfTickHeight))
+        }
+        for (category, path) in pathsByCategory {
+            context.stroke(path, with: .color(color(for: category)), lineWidth: 1.5)
         }
     }
 
