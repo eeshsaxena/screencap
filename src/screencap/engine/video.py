@@ -847,6 +847,21 @@ def _close_container_in_thread(container: av.container.Container) -> None:
         logger.warning("container close thread did not finish in 15s, continuing")
 
 
+def _discard_failed_output(
+    output: "av.container.OutputContainer | None", tmp_path: Path
+) -> None:
+    """Best-effort teardown when an atomic write fails: close container, drop temp.
+
+    Shared by the concat and remediation rollback paths so they cannot drift.
+    """
+    if output is not None:
+        try:
+            _close_container_in_thread(output)
+        except Exception:
+            pass
+    tmp_path.unlink(missing_ok=True)
+
+
 def concat_video_chunks(rec_dir: str | Path) -> Path:
     """Concatenate ``chunk_*.mp4`` into a single ``rec_dir/video.mp4`` via PyAV.
 
@@ -915,14 +930,12 @@ def concat_video_chunks(rec_dir: str | Path) -> Path:
                     # add_stream_from_template replaces the removed
                     # add_stream(template=...) API (PyAV 14+).
                     out_stream = output.add_stream_from_template(in_stream)
-                # Estimate a fallback frame duration for packets missing one,
-                # so the next chunk's offset never overlaps the last frame.
+                # Estimate a fallback frame duration (in time_base ticks) for
+                # packets missing one, so the next chunk's offset never overlaps
+                # the last frame. average_rate/time_base are Fractions, so this
+                # stays exact with no float round-trip.
                 rate = in_stream.average_rate
-                fallback_dur = (
-                    int(round(1 / (float(rate) * float(in_stream.time_base))))
-                    if rate
-                    else 1
-                )
+                fallback_dur = round(1 / (rate * in_stream.time_base)) if rate else 1
                 chunk_end = 0
                 for packet in inp.demux(in_stream):
                     # Flush packets carry no timestamps — skip them.
@@ -946,12 +959,7 @@ def concat_video_chunks(rec_dir: str | Path) -> Path:
         output = None
         os.replace(tmp_path, out_path)
     except BaseException:
-        if output is not None:
-            try:
-                _close_container_in_thread(output)
-            except Exception:
-                pass
-        tmp_path.unlink(missing_ok=True)
+        _discard_failed_output(output, tmp_path)
         raise
 
     return out_path
@@ -1086,16 +1094,16 @@ def remediate_pixfmt_for_review(rec_dir: str | Path) -> tuple[Path, bool]:
         inp.close()
         os.replace(tmp_path, review_path)
     except BaseException as exc:
-        if output is not None:
-            try:
-                _close_container_in_thread(output)
-            except Exception:
-                pass
+        _discard_failed_output(output, tmp_path)
         try:
             inp.close()
         except Exception:
             pass
-        tmp_path.unlink(missing_ok=True)
+        # Wrap only genuine errors into the structured R9 signal. The
+        # `isinstance(exc, Exception)` clause is load-bearing: it lets control-flow
+        # BaseExceptions (KeyboardInterrupt/SystemExit) and already-structured
+        # RuntimeErrors propagate unchanged instead of being masked as a re-encode
+        # failure.
         if isinstance(exc, Exception) and not isinstance(exc, RuntimeError):
             raise RuntimeError(
                 f"Cannot re-encode video for review: {video_path}: {exc}"
