@@ -143,8 +143,8 @@ def _wal_checkpoint(recording_dir: Path) -> None:
 # Files that should never be uploaded (SQLite WAL artifacts, temp files)
 _UPLOAD_EXCLUDE = {".db-shm", ".db-wal"}
 
-# Files that should never be uploaded by name (review-only artifacts, etc.)
-_UPLOAD_EXCLUDE_NAMES = {"video_review.mp4"}
+# Review-only artifacts (`.video_review.mp4`) are dot-prefixed, so the dotfile
+# filter below already skips them — no by-name exclusion needed.
 
 
 def list_recording_files(recording_dir: Path) -> list[FileInfo]:
@@ -158,8 +158,6 @@ def list_recording_files(recording_dir: Path) -> list[FileInfo]:
     files = []
     for p in sorted(recording_dir.iterdir()):
         if p.is_symlink() or not p.is_file() or p.name.startswith("."):
-            continue
-        if p.name in _UPLOAD_EXCLUDE_NAMES:
             continue
         if any(p.name.endswith(ext) for ext in _UPLOAD_EXCLUDE):
             continue
@@ -176,8 +174,6 @@ def list_recording_files(recording_dir: Path) -> list[FileInfo]:
     # Also include files in subdirectories (e.g., screenshots/)
     for p in sorted(recording_dir.rglob("*")):
         if p.is_symlink() or not p.is_file() or p.parent == recording_dir or p.name.startswith("."):
-            continue
-        if p.name in _UPLOAD_EXCLUDE_NAMES:
             continue
         try:
             size = p.stat().st_size

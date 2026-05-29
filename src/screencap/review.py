@@ -1,193 +1,48 @@
-"""Prepare a recording for native (SwiftUI) review (plan U2).
+"""Prepare a recording for native (SwiftUI) review.
 
 The SwiftUI review window's preparation step calls
 ``screencap review-data --json <name>`` and consumes the returned paths
 to a single playable video and an ``events.jsonl`` file. This module
-owns the orchestration:
+owns the orchestration; all video processing runs in-process via PyAV
+(``screencap.engine.video``), so native review works on a machine with
+no ``ffmpeg``/``ffprobe`` on PATH — the Finder/Launchpad-launched
+``.app`` gets the minimal GUI PATH and cannot reach a brew-installed
+binary anyway (plan SCR-97, U4).
 
-1. ``_ensure_single_video`` (from viewer.py) — idempotent ffmpeg concat
-   of ``chunk_*.mp4`` files into ``video.mp4`` when needed.
-2. Pixel-format remediation — the recorder writes H.264 with
-   ``yuv444p`` (``src/screencap/engine/config.py``), which AVKit's
-   hardware decoder rejects on most Macs. When the source is yuv444p,
-   we re-encode once into a sibling ``video_review.mp4`` (sentinel-
-   gated so the work runs at most once per recording). The original
-   ``video.mp4`` is unchanged — the upload pipeline continues to ship
-   it as-is to preserve the lossless training corpus.
+1. ``_ensure_single_video`` (from viewer.py) — idempotent in-process
+   PyAV concat of ``chunk_*.mp4`` into ``video.mp4`` when needed. Here
+   it runs ``fail_loud=True`` so a genuine merge failure surfaces as the
+   structural failure state rather than being swallowed.
+2. ``remediate_pixfmt_for_review`` (from engine/video.py) — the recorder
+   writes H.264 with ``yuv444p``, which AVKit's hardware decoder rejects
+   on most Macs. When the source is not an AVKit-safe 4:2:0 format, the
+   engine re-encodes once (libx264, yuv420p) into a sibling
+   ``.video_review.mp4``. The leading dot keeps it out of ``screencap
+   upload`` (dotfile filter) and its existence is the idempotency gate,
+   so the re-encode runs at most once per recording. The original
+   ``video.mp4`` is unchanged — upload still ships it as-is to preserve
+   the lossless training corpus.
 3. ``events.jsonl`` — auto-export via ``exporter.export_recording`` if
    absent, with ``exclude_moves=True`` so the timeline pane only sees
    discrete events (mouse.click, key.type, window.switch, …) rather
    than the noisy mouse-move trail.
 
 Returns a JSON-serializable dict with the envelope downstream consumers
-(the SwiftUI shell, tests) decode.
+(the SwiftUI shell, tests) decode. A genuine PyAV decode/process failure
+raises ``ReviewPrepareError`` with a "can't process this video" message —
+structurally distinct from a missing-recording or path-traversal error,
+and never a missing-binary ("install ffmpeg") message (R9).
 """
 
 from __future__ import annotations
 
-import json
-import os
-import subprocess
-import sys
 from pathlib import Path
 
 REVIEW_SCHEMA_VERSION = 1
 
-# Filename used for the AVKit-compatible re-encoded video. Sibling to the
-# original `video.mp4`. The upload pipeline excludes this file by name
-# via `upload._UPLOAD_EXCLUDE_NAMES` — the lossless `video.mp4` is the
-# canonical training-corpus artifact; `video_review.mp4` is review-only.
-REVIEW_VIDEO_FILENAME = "video_review.mp4"
-
-# Sentinel that records "this recording's review video has already been
-# remediated". A second `screencap review-data` invocation short-circuits
-# the re-encode. The leading dot also keeps the sentinel out of
-# `list_recording_files` (uploader skips dotfiles).
-REVIEW_VIDEO_SENTINEL = ".review_video_pixfmt"
-
-# AVKit / AVFoundation's hardware H.264 decoder is documented to support
-# yuv420p and yuv422p. yuv444p (High 4:4:4 Predictive profile) is
-# rejected on most Macs (black frames or load failure). Keep this list
-# tight — the recorder's default is yuv444p so this gate fires often
-# enough to matter.
-_AVKIT_COMPATIBLE_PIXFMTS = frozenset({"yuv420p", "yuv422p"})
-
 
 class ReviewPrepareError(RuntimeError):
     """A non-recoverable failure during review-data preparation."""
-
-
-def _probe_video_pixfmt(video_path: Path) -> str | None:
-    """Return the video stream's pixel format, or None if ffprobe is
-    unavailable or the probe fails.
-
-    The fallback (returning None) is treated by ``ensure_review_video``
-    as "we cannot prove the source is AVKit-compatible" — so we
-    remediate anyway. That's safer than gambling on playability.
-    """
-    try:
-        result = subprocess.run(
-            [
-                "ffprobe",
-                "-v", "error",
-                "-select_streams", "v:0",
-                "-show_entries", "stream=pix_fmt",
-                "-of", "csv=p=0",
-                str(video_path),
-            ],
-            capture_output=True,
-            text=True,
-            timeout=10,
-        )
-    except (FileNotFoundError, subprocess.TimeoutExpired):
-        return None
-    if result.returncode != 0:
-        return None
-    pix_fmt = result.stdout.strip()
-    return pix_fmt or None
-
-
-def _reencode_for_avkit(source: Path, destination: Path) -> None:
-    """Re-encode ``source`` to ``destination`` with yuv420p so AVKit can
-    play it. H.264 + yuv420p is the universal-compatibility combination.
-
-    Uses ``-preset veryfast`` because review playback quality is not the
-    training corpus (the original ``video.mp4`` retains full quality)
-    and a fast preset keeps the preparation state brief.
-    """
-    tmp_destination = destination.with_suffix(destination.suffix + ".tmp")
-    cmd = [
-        "ffmpeg",
-        "-y",
-        "-i", str(source),
-        "-c:v", "libx264",
-        "-pix_fmt", "yuv420p",
-        "-preset", "veryfast",
-        "-crf", "23",
-        # Drop audio: the recorder writes audio as a separate .flac
-        # alongside, and re-encoding audio here would just add cost
-        # for no benefit. AVKit gates audio playback on the video file.
-        "-an",
-        # Force mp4 container — ffmpeg infers the format from the file
-        # extension, and `.mp4.tmp` from the atomic-write pattern below
-        # gives it `.tmp`, which is not a registered muxer. Without `-f
-        # mp4` the encode fails immediately with "use a standard extension
-        # for the filename or specify the format manually".
-        "-f", "mp4",
-        str(tmp_destination),
-    ]
-    try:
-        result = subprocess.run(cmd, capture_output=True, text=True, timeout=600)
-    except FileNotFoundError as e:
-        raise ReviewPrepareError(
-            "ffmpeg not found — install ffmpeg to enable native review playback."
-        ) from e
-    except subprocess.TimeoutExpired as e:
-        # Clean up the partial output so a retry doesn't see a half-file.
-        tmp_destination.unlink(missing_ok=True)
-        raise ReviewPrepareError(
-            f"ffmpeg re-encode timed out after 10 minutes for {source.name}"
-        ) from e
-    if result.returncode != 0:
-        tmp_destination.unlink(missing_ok=True)
-        # Tail the ffmpeg stderr so the error message is actionable
-        # without dumping multi-MB of progress logs into the JSON envelope.
-        tail = (result.stderr or "")[-400:]
-        raise ReviewPrepareError(f"ffmpeg re-encode failed: {tail}")
-    os.replace(tmp_destination, destination)
-
-
-def ensure_review_video(rec_dir: Path) -> tuple[Path, bool]:
-    """Return ``(playable_video_path, remediated)``.
-
-    Assumes ``_ensure_single_video`` has already produced ``video.mp4``
-    (or symlinked the single chunk). When the source is AVKit-
-    incompatible (yuv444p, or ffprobe-not-available-treated-as-suspect),
-    produces ``video_review.mp4`` once per recording and returns that
-    path instead. Idempotent: the sentinel file prevents re-encoding on
-    repeat invocations.
-    """
-    source_video = rec_dir / "video.mp4"
-    if not source_video.exists():
-        raise ReviewPrepareError(
-            f"video.mp4 not found in {rec_dir.name} — recording may be empty or corrupted"
-        )
-
-    sentinel = rec_dir / REVIEW_VIDEO_SENTINEL
-    review_video = rec_dir / REVIEW_VIDEO_FILENAME
-
-    # Sentinel exists and the remediated file is on disk → skip the
-    # whole probe-and-reencode cost.
-    if sentinel.exists() and review_video.exists():
-        return review_video, True
-
-    pix_fmt = _probe_video_pixfmt(source_video)
-    if pix_fmt in _AVKIT_COMPATIBLE_PIXFMTS:
-        # Source is already playable. Write a sentinel that records the
-        # decision so future invocations skip even the ffprobe call.
-        try:
-            sentinel.write_text(json.dumps({"pix_fmt": pix_fmt, "remediated": False}))
-        except OSError:
-            # Best-effort — losing the sentinel just means we probe again
-            # next time, which is cheap. Do not fail the whole prepare.
-            pass
-        return source_video, False
-
-    # pix_fmt is yuv444p, unknown (probe failed), or any other format we
-    # haven't proven compatible. Remediate.
-    if pix_fmt is None:
-        sys.stderr.write(
-            "warning: ffprobe unavailable or probe failed; "
-            "remediating video for AVKit compatibility as a precaution\n"
-        )
-    _reencode_for_avkit(source_video, review_video)
-    try:
-        sentinel.write_text(
-            json.dumps({"pix_fmt": pix_fmt or "unknown", "remediated": True})
-        )
-    except OSError:
-        pass
-    return review_video, True
 
 
 def _ensure_events_jsonl(rec_dir: Path) -> Path:
@@ -219,32 +74,73 @@ def prepare_review_data(name: str) -> dict:
     """Run the full review-data preparation pipeline for ``name``.
 
     Returns a JSON-serializable envelope. Raises ``ReviewPrepareError``
-    for non-recoverable failures (missing recording, missing video,
-    ffmpeg failure). The CLI wrapper translates these into the standard
-    ``{"ok": false, "error": ...}`` envelope with a non-zero exit code.
+    for non-recoverable failures, in structurally distinct flavors so the
+    SwiftUI shell can tell them apart: a missing recording / invalid name
+    (resolved before any video work), a recording that carries no video to
+    review, a genuine "can't process this video" PyAV decode/process
+    failure, and a failure to prepare the events timeline. The CLI wrapper
+    translates any of these into the standard ``{"ok": false, "error":
+    ...}`` envelope with a non-zero exit code — never a raw traceback.
+
+    ``started_at`` and ``duration_seconds`` come from
+    ``catalog._read_recording_meta``, which returns ``None`` on a DB read
+    failure, a missing timestamp, or a recording with no action events.
+    They are serialized as JSON ``null`` in that case — a perfectly
+    playable recording can still carry null metadata, so the Swift side
+    decodes them as ``Double?`` (upstream plan U6/U8).
     """
     from screencap.catalog import _read_recording_meta, find_db
     from screencap.config import resolve_recording_dir
+    from screencap.engine.video import remediate_pixfmt_for_review
+    from screencap.exporter import ExportError
     from screencap.viewer import _ensure_single_video
 
     try:
         rec_dir = resolve_recording_dir(name)
     except ValueError as e:
+        # Invalid / path-traversal name — distinct from a decode failure
+        # (no "can't process this video" prefix, no missing-binary text).
         raise ReviewPrepareError(str(e)) from e
 
     if not rec_dir.exists():
         raise ReviewPrepareError(f"Recording not found: {name}")
 
-    # Step 1: concat chunked videos into a single playable file (idempotent).
-    _ensure_single_video(rec_dir)
+    # Video pipeline (R1, R4, R5): concat chunks → remediate pixel format, all
+    # in-process via PyAV. A genuine PyAV decode/process failure becomes the
+    # structural "can't process this video" state (R9) — never a missing-binary
+    # error, and distinct from the resolve/missing/no-video errors. The caught
+    # set spans RuntimeError/ValueError (the engine's documented failures) plus
+    # OSError (PyAV's av.error.OSError family and os.replace/mux write errors),
+    # so no failure mode escapes as a raw traceback past the envelope.
+    try:
+        # fail_loud=True: a chunk-concat failure must propagate here (the
+        # HTML viewer swallows it; review-data needs correctness).
+        _ensure_single_video(rec_dir, fail_loud=True)
+    except (RuntimeError, ValueError, OSError) as e:
+        raise ReviewPrepareError(f"can't process this video: {e}") from e
 
-    # Step 2: pixel-format remediation for AVKit.
-    video_path, remediated = ensure_review_video(rec_dir)
+    if not (rec_dir / "video.mp4").exists():
+        # No chunks and no merged/symlinked video.mp4 — the recording carries
+        # no video to review (video disabled, or an action-gated recording
+        # where no action fired). Structurally distinct from both a missing
+        # recording and a decode failure.
+        raise ReviewPrepareError(f"Recording has no video to review: {name}")
 
-    # Step 3: events.jsonl (auto-export if missing, filtered).
-    events_path = _ensure_events_jsonl(rec_dir)
+    try:
+        video_path, remediated = remediate_pixfmt_for_review(rec_dir)
+    except (RuntimeError, ValueError, OSError) as e:
+        raise ReviewPrepareError(f"can't process this video: {e}") from e
 
-    # Step 4: timing metadata for the timeline pane's coordinate space.
+    # events.jsonl (auto-export if missing, filtered to discrete events). A
+    # failed export (e.g. a missing/corrupt recording.db) becomes a clean error
+    # envelope rather than a raw traceback, upholding the command's contract.
+    try:
+        events_path = _ensure_events_jsonl(rec_dir)
+    except (ExportError, OSError) as e:
+        raise ReviewPrepareError(f"could not prepare review events: {e}") from e
+
+    # Timing metadata for the timeline pane's coordinate space. Nullable —
+    # see the docstring; a playable recording may have no action events.
     db_path = find_db(rec_dir)
     started_at: float | None = None
     duration_seconds: float | None = None
