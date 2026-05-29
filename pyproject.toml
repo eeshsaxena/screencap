@@ -46,7 +46,7 @@ record = [
     # engine dependencies (formerly screencap-engine)
     "pydantic>=2.0.0",
     "pynput>=1.7.0",
-    "av>=10.0.0",
+    "av>=14.0.0",
     "Pillow>=9.0.0",
     "fire>=0.7.1",
     "mss>=6.0.0",

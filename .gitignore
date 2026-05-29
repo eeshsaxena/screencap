@@ -36,3 +36,4 @@ benchmark_results/
 
 # Compound Engineering local config
 .compound-engineering/
+.worktrees

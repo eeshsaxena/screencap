@@ -1,6 +1,7 @@
 """Tests for video module."""
 
 import time
+from pathlib import Path
 
 import av
 import pytest
@@ -10,9 +11,47 @@ from screencap.engine import utils
 from screencap.engine.video import (
     ChunkedVideoWriter,
     VideoWriter,
+    concat_video_chunks,
+    extract_frame,
     initialize_video_writer,
+    needs_pixfmt_remediation,
+    read_pixel_format,
+    remediate_pixfmt_for_review,
     write_video_frame,
 )
+
+
+def _write_chunk(
+    path: Path,
+    color: tuple[int, int, int],
+    n_frames: int = 5,
+    fps: int = 24,
+    size: int = 64,
+    pix_fmt: str | None = None,
+) -> int:
+    """Write a solid-color video via VideoWriter (yuv444p/bf=0, like the recorder).
+
+    Returns the number of frames actually decodable from the written file
+    (VideoWriter.close adds a trailing key frame, so this is >= n_frames).
+    """
+    base = time.time()
+    writer = VideoWriter(str(path), width=size, height=size, fps=fps, pix_fmt=pix_fmt)
+    for i in range(n_frames):
+        writer.write_frame(Image.new("RGB", (size, size), color=color), base + i / fps)
+    writer.close()
+
+    container = av.open(str(path))
+    try:
+        count = sum(1 for _ in container.decode(video=0))
+    finally:
+        container.close()
+    return count
+
+
+def _dominant_channel(img: "Image.Image") -> str:
+    """Return 'R', 'G', or 'B' for the largest channel at the image center."""
+    r, g, b = img.convert("RGB").getpixel((img.width // 2, img.height // 2))[:3]
+    return "RGB"[max(range(3), key=[r, g, b].__getitem__)]
 
 
 @pytest.fixture(autouse=True)
@@ -422,3 +461,420 @@ class TestChunkedVideoWriterRotation:
         frames = list(container.decode(video=0))
         container.close()
         assert len(frames) > 0, "Chunk 1 has no frames after rotation recovery"
+
+
+class TestConcatVideoChunks:
+    """Tests for the in-process PyAV chunk concat (U1, R1/R2/R5)."""
+
+    def test_concat_frame_count_and_monotonic_pts(self, tmp_path):
+        """2 chunks → one video.mp4; frame count is the sum, PTS monotonic from ~0."""
+        n0 = _write_chunk(tmp_path / "chunk_0000.mp4", (220, 0, 0))
+        n1 = _write_chunk(tmp_path / "chunk_0001.mp4", (0, 0, 220))
+
+        out = concat_video_chunks(tmp_path)
+        assert out == tmp_path / "video.mp4"
+        assert out.exists()
+
+        container = av.open(str(out))
+        stream = container.streams.video[0]
+        pts_sec = [float(f.pts * stream.time_base) for f in container.decode(stream)]
+        container.close()
+
+        assert len(pts_sec) == n0 + n1, (
+            f"merged has {len(pts_sec)} frames, expected {n0 + n1}"
+        )
+        assert pts_sec[0] < 0.5, f"first PTS {pts_sec[0]:.3f}s should start near 0"
+        for i in range(1, len(pts_sec)):
+            assert pts_sec[i] > pts_sec[i - 1], (
+                f"PTS not monotonic at {i}: {pts_sec[i-1]} >= {pts_sec[i]}"
+            )
+
+    def test_concat_is_seekable_past_boundary(self, tmp_path):
+        """Decoding past the first chunk boundary returns a frame (continuity holds)."""
+        _write_chunk(tmp_path / "chunk_0000.mp4", (220, 0, 0))
+        _write_chunk(tmp_path / "chunk_0001.mp4", (0, 0, 220))
+        boundary = float(get_chunk_duration(tmp_path / "chunk_0000.mp4"))
+
+        out = concat_video_chunks(tmp_path)
+        # A frame must exist strictly past the first chunk's span.
+        container = av.open(str(out))
+        stream = container.streams.video[0]
+        past = [
+            f for f in container.decode(stream)
+            if float(f.pts * stream.time_base) > boundary
+        ]
+        container.close()
+        assert past, "no frame decoded past the first-chunk boundary"
+
+    def test_concat_timestamp_to_frame_mapping(self, tmp_path):
+        """extract_frame just after the boundary returns content from the 2nd chunk.
+
+        Guards capture.py:get_frame_at — the merged timeline must match the
+        summed chunk durations so a wall-clock timestamp maps to the right frame.
+        """
+        _write_chunk(tmp_path / "chunk_0000.mp4", (220, 0, 0))  # red
+        _write_chunk(tmp_path / "chunk_0001.mp4", (0, 0, 220))  # blue
+        boundary = float(get_chunk_duration(tmp_path / "chunk_0000.mp4"))
+
+        out = concat_video_chunks(tmp_path)
+
+        # Before the boundary → red (first chunk); after → blue (second chunk).
+        before = extract_frame(out, max(boundary - 0.05, 0.0), tolerance=0.2)
+        after = extract_frame(out, boundary + 0.05, tolerance=0.2)
+        assert _dominant_channel(before) == "R", "pre-boundary frame should be red"
+        assert _dominant_channel(after) == "B", "post-boundary frame should be blue"
+
+    def test_concat_raises_without_chunks(self, tmp_path):
+        """No chunk_*.mp4 → ValueError (caller is expected to pre-check)."""
+        with pytest.raises(ValueError, match="No chunk"):
+            concat_video_chunks(tmp_path)
+
+    def test_concat_raises_on_corrupt_chunk(self, tmp_path):
+        """A chunk PyAV cannot open → RuntimeError, not a silent truncated output."""
+        _write_chunk(tmp_path / "chunk_0000.mp4", (220, 0, 0))
+        (tmp_path / "chunk_0001.mp4").write_bytes(b"not a valid mp4 file")
+
+        with pytest.raises(RuntimeError, match="chunk_0001"):
+            concat_video_chunks(tmp_path)
+        # Fail-loud: no partial video.mp4 and no temp residue left behind.
+        assert not (tmp_path / "video.mp4").exists()
+        assert not list(tmp_path.glob(".video.mp4.*.tmp"))
+
+    def test_concat_no_temp_residue_on_success(self, tmp_path):
+        """A successful concat leaves no .tmp sibling behind."""
+        _write_chunk(tmp_path / "chunk_0000.mp4", (220, 0, 0))
+        _write_chunk(tmp_path / "chunk_0001.mp4", (0, 0, 220))
+        concat_video_chunks(tmp_path)
+        assert not list(tmp_path.glob(".video.mp4.*.tmp"))
+
+    def test_concat_does_not_spawn_subprocess(self, tmp_path, monkeypatch):
+        """Concat is fully in-process — it must not shell out (R1/R5)."""
+        import subprocess
+
+        def _fail(*a, **k):  # pragma: no cover - only runs on regression
+            raise AssertionError("concat must not spawn a subprocess")
+
+        monkeypatch.setattr(subprocess, "run", _fail)
+        monkeypatch.setattr(subprocess, "Popen", _fail)
+
+        _write_chunk(tmp_path / "chunk_0000.mp4", (220, 0, 0))
+        _write_chunk(tmp_path / "chunk_0001.mp4", (0, 0, 220))
+        out = concat_video_chunks(tmp_path)
+        assert out.exists()
+
+
+def get_chunk_duration(path: Path) -> float:
+    """Max decoded PTS (seconds) in a chunk — its on-screen span."""
+    container = av.open(str(path))
+    stream = container.streams.video[0]
+    last = 0.0
+    for frame in container.decode(stream):
+        last = max(last, float(frame.pts * stream.time_base))
+    container.close()
+    return last
+
+
+class TestPixelFormatProbe:
+    """Tests for read_pixel_format / needs_pixfmt_remediation (U2, R3)."""
+
+    def test_reads_yuv444p_and_flags_for_remediation(self, tmp_path):
+        path = tmp_path / "v444.mp4"
+        _write_chunk(path, (200, 0, 0))  # VideoWriter default pix_fmt = yuv444p
+        assert read_pixel_format(path) == "yuv444p"
+        assert needs_pixfmt_remediation("yuv444p") is True
+
+    def test_reads_yuv420p_and_is_avkit_safe(self, tmp_path):
+        """Covers AE2: an already-420 recording needs no remediation."""
+        path = tmp_path / "v420.mp4"
+        base = time.time()
+        writer = VideoWriter(str(path), width=64, height=64, fps=24, pix_fmt="yuv420p")
+        for i in range(4):
+            writer.write_frame(Image.new("RGB", (64, 64), color=(0, 0, 200)), base + i / 24)
+        writer.close()
+        assert read_pixel_format(path) == "yuv420p"
+        assert needs_pixfmt_remediation("yuv420p") is False
+
+    @pytest.mark.parametrize("pix_fmt", ["yuv420p", "yuvj420p", "nv12"])
+    def test_avkit_safe_formats_skip_remediation(self, pix_fmt):
+        assert needs_pixfmt_remediation(pix_fmt) is False
+
+    @pytest.mark.parametrize("pix_fmt", ["yuv444p", "yuv422p", "rgb24"])
+    def test_non_420_formats_need_remediation(self, pix_fmt):
+        assert needs_pixfmt_remediation(pix_fmt) is True
+
+    def test_corrupt_file_raises(self, tmp_path):
+        path = tmp_path / "garbage.mp4"
+        path.write_bytes(b"definitely not an mp4")
+        with pytest.raises(RuntimeError):
+            read_pixel_format(path)
+
+    def test_no_video_stream_raises(self, tmp_path):
+        """A valid container with no video stream raises the distinct error (plan U2).
+
+        Uses an audio-only FLAC — opens cleanly but has no video stream, so the
+        `if not streams` branch fires (distinct from the av.open-failure path).
+        """
+        import numpy as np
+        import soundfile as sf
+
+        audio = tmp_path / "audio.flac"
+        sf.write(str(audio), np.zeros(2000, dtype="float32"), 16000)
+        with pytest.raises(RuntimeError, match="No video stream"):
+            read_pixel_format(audio)
+
+    def test_probe_does_not_decode_frames(self, tmp_path, monkeypatch):
+        """The probe reads codec_context.pix_fmt only — never iterates frames."""
+        path = tmp_path / "v444.mp4"
+        _write_chunk(path, (200, 0, 0))
+
+        # Guard against a future regression that adds a decode loop: if the
+        # probe decoded, this patched decode would raise.
+        import screencap.engine.video as video_mod
+        real_open = video_mod.av.open
+
+        class _NoDecodeContainer:
+            def __init__(self, inner):
+                self._inner = inner
+
+            def __getattr__(self, name):
+                if name == "decode":
+                    raise AssertionError("read_pixel_format must not decode frames")
+                return getattr(self._inner, name)
+
+        monkeypatch.setattr(
+            video_mod.av, "open", lambda *a, **k: _NoDecodeContainer(real_open(*a, **k))
+        )
+        assert read_pixel_format(path) == "yuv444p"
+
+
+class TestRemediatePixfmtForReview:
+    """Tests for remediate_pixfmt_for_review (U3, R4/R6/R7)."""
+
+    def test_yuv444p_source_is_remediated(self, tmp_path):
+        """Covers AE1 (remediation half): yuv444p → yuv420p .video_review.mp4."""
+        _write_chunk(tmp_path / "video.mp4", (200, 0, 0))  # yuv444p default
+        path, remediated = remediate_pixfmt_for_review(tmp_path)
+        assert remediated is True
+        assert path == tmp_path / ".video_review.mp4"
+        assert path.exists() and not path.is_symlink()
+        assert read_pixel_format(path) == "yuv420p"
+
+    def test_yuv420p_source_is_left_untouched(self, tmp_path):
+        """Covers AE2: an already-420 recording produces no artifact."""
+        _write_chunk(tmp_path / "video.mp4", (0, 0, 200), pix_fmt="yuv420p")
+        path, remediated = remediate_pixfmt_for_review(tmp_path)
+        assert remediated is False
+        assert path == tmp_path / "video.mp4"
+        assert not (tmp_path / ".video_review.mp4").exists()
+
+    def test_idempotent_skip_reuses_existing_artifact(self, tmp_path):
+        """Covers AE3: a second call performs no re-encode."""
+        _write_chunk(tmp_path / "video.mp4", (200, 0, 0))
+        path1, _ = remediate_pixfmt_for_review(tmp_path)
+        # Tamper with the artifact; a re-encode would overwrite the sentinel.
+        path1.write_bytes(b"SENTINEL")
+        path2, remediated2 = remediate_pixfmt_for_review(tmp_path)
+        assert remediated2 is True
+        assert path2 == path1
+        assert path2.read_bytes() == b"SENTINEL", "re-encode ran on idempotent call"
+
+    def test_remediated_pts_monotonic_from_zero(self, tmp_path):
+        """Regression guard: re-encode yields yuv420p with monotonic PTS from ~0."""
+        _write_chunk(tmp_path / "video.mp4", (200, 0, 0), n_frames=6)
+        path, _ = remediate_pixfmt_for_review(tmp_path)
+
+        container = av.open(str(path))
+        stream = container.streams.video[0]
+        assert stream.codec_context.pix_fmt == "yuv420p"
+        pts = [float(f.pts * stream.time_base) for f in container.decode(stream)]
+        container.close()
+        assert pts[0] < 0.5, f"first PTS {pts[0]:.3f}s should start near 0"
+        for i in range(1, len(pts)):
+            assert pts[i] > pts[i - 1], f"PTS not monotonic at {i}"
+
+    def test_no_temp_residue_on_success(self, tmp_path):
+        _write_chunk(tmp_path / "video.mp4", (200, 0, 0))
+        remediate_pixfmt_for_review(tmp_path)
+        assert not list(tmp_path.glob(".video_review.mp4.*.tmp"))
+
+    def test_corrupt_source_raises_and_leaves_no_artifact(self, tmp_path):
+        """A video.mp4 PyAV cannot open → RuntimeError, no partial review file."""
+        (tmp_path / "video.mp4").write_bytes(b"not a real mp4")
+        with pytest.raises(RuntimeError):
+            remediate_pixfmt_for_review(tmp_path)
+        assert not (tmp_path / ".video_review.mp4").exists()
+        assert not list(tmp_path.glob(".video_review.mp4.*.tmp"))
+
+    def test_reads_through_single_chunk_symlink(self, tmp_path):
+        """Edge: video.mp4 is a symlink to a yuv444p chunk → real .video_review.mp4."""
+        _write_chunk(tmp_path / "chunk_0000.mp4", (200, 0, 0))
+        (tmp_path / "video.mp4").symlink_to(tmp_path / "chunk_0000.mp4")
+        path, remediated = remediate_pixfmt_for_review(tmp_path)
+        assert remediated is True
+        assert path == tmp_path / ".video_review.mp4"
+        assert path.is_file() and not path.is_symlink()
+        assert read_pixel_format(path) == "yuv420p"
+
+    def test_review_artifact_excluded_from_upload(self, tmp_path):
+        """Covers AE4 / R6: the artifact is never enumerated for upload."""
+        from screencap import upload
+
+        _write_chunk(tmp_path / "video.mp4", (200, 0, 0))
+        original_bytes = (tmp_path / "video.mp4").read_bytes()
+        remediate_pixfmt_for_review(tmp_path)
+
+        names = [f.name for f in upload.list_recording_files(tmp_path)]
+        assert ".video_review.mp4" not in names
+        assert "video.mp4" in names
+        # R6: the upload artifact's bytes are unchanged by remediation.
+        assert (tmp_path / "video.mp4").read_bytes() == original_bytes
+
+
+class TestReviewPipelineHardening:
+    """Regression guards from code review of the PyAV review pipeline (SCR-97)."""
+
+    def test_remediate_preserves_vfr_idle_gap(self, tmp_path):
+        """A yuv444p recording with an idle gap keeps that gap after re-encode.
+
+        This is the load-bearing guard for the deliberate deviation from the
+        plan's `frame.pts=None`: that idiom collapses a variable-frame-rate
+        (action-gated) recording's timeline. The PTS-preserving transcode must
+        keep the ~5s gap so review-window event overlay stays aligned.
+        """
+        video = tmp_path / "video.mp4"
+        base = time.time()
+        writer = VideoWriter(str(video), width=64, height=64, fps=24)
+        # Two activity bursts separated by a 5s idle gap.
+        for ts, color in [
+            (0.0, (200, 0, 0)), (0.1, (200, 0, 0)),
+            (5.0, (0, 0, 200)), (5.1, (0, 0, 200)),
+        ]:
+            writer.write_frame(Image.new("RGB", (64, 64), color=color), base + ts)
+        writer.close()
+        assert read_pixel_format(video) == "yuv444p"
+
+        path, remediated = remediate_pixfmt_for_review(tmp_path)
+        assert remediated is True
+
+        container = av.open(str(path))
+        stream = container.streams.video[0]
+        pts = [float(f.pts * stream.time_base) for f in container.decode(stream)]
+        container.close()
+        # The idle gap survives: the span between first and last frame is ~5s,
+        # NOT collapsed to a fraction of a second (which frame.pts=None produces).
+        assert (pts[-1] - pts[0]) > 4.5, (
+            f"VFR idle gap collapsed: span {pts[-1] - pts[0]:.3f}s (expected ~5s)"
+        )
+
+    def test_concat_raises_on_mismatched_chunk_params(self, tmp_path):
+        """Chunks with differing dimensions fail loud rather than corrupt silently."""
+        _write_chunk(tmp_path / "chunk_0000.mp4", (200, 0, 0), size=64)
+        _write_chunk(tmp_path / "chunk_0001.mp4", (0, 0, 200), size=48)
+        with pytest.raises(RuntimeError, match="differ from the first"):
+            concat_video_chunks(tmp_path)
+        assert not (tmp_path / "video.mp4").exists()
+        assert not list(tmp_path.glob(".video.mp4.*.tmp"))
+
+    def test_concat_does_not_promote_temp_on_close_timeout(self, tmp_path, monkeypatch):
+        """A timed-out container close must not publish a possibly-truncated video.mp4."""
+        import screencap.engine.video as video_mod
+
+        _write_chunk(tmp_path / "chunk_0000.mp4", (200, 0, 0))
+        _write_chunk(tmp_path / "chunk_0001.mp4", (0, 0, 200))
+        monkeypatch.setattr(video_mod, "_close_container_in_thread", lambda c: False)
+
+        with pytest.raises(RuntimeError, match="Timed out finalizing"):
+            concat_video_chunks(tmp_path)
+        assert not (tmp_path / "video.mp4").exists()
+        assert not list(tmp_path.glob(".video.mp4.*.tmp"))
+
+    def test_remediate_does_not_promote_temp_on_close_timeout(self, tmp_path, monkeypatch):
+        """A timed-out close must not publish a possibly-truncated .video_review.mp4."""
+        import screencap.engine.video as video_mod
+
+        _write_chunk(tmp_path / "video.mp4", (200, 0, 0))  # yuv444p → needs remediation
+        monkeypatch.setattr(video_mod, "_close_container_in_thread", lambda c: False)
+
+        with pytest.raises(RuntimeError, match="Timed out finalizing"):
+            remediate_pixfmt_for_review(tmp_path)
+        assert not (tmp_path / ".video_review.mp4").exists()
+        assert not list(tmp_path.glob(".video_review.mp4.*.tmp"))
+
+    def test_remediate_promotes_output_even_if_input_close_raises(self, tmp_path, monkeypatch):
+        """A failing inp.close() after a successful encode must NOT discard the review copy.
+
+        Guards todo 001: previously inp.close() ran inside the success path before
+        os.replace, so a close error jumped to except and unlinked the complete temp.
+        """
+        import screencap.engine.video as vm
+
+        video = tmp_path / "video.mp4"
+        _write_chunk(video, (200, 0, 0))  # yuv444p → remediated
+        real_open = vm.av.open
+        state = {"source_reads": 0}
+
+        class _RaiseOnClose:
+            def __init__(self, inner):
+                self._inner = inner
+
+            def __getattr__(self, name):
+                return getattr(self._inner, name)
+
+            def close(self):
+                raise OSError("simulated input close failure")
+
+        def fake_open(*a, **k):
+            container = real_open(*a, **k)
+            # Only the SOURCE video, opened for read. read #1 is
+            # read_pixel_format's probe; read #2 is remediate's `inp` — wrap that
+            # one so its close() raises after a successful encode.
+            if k.get("mode") != "w" and str(a[0]) == str(video):
+                state["source_reads"] += 1
+                if state["source_reads"] >= 2:
+                    return _RaiseOnClose(container)
+            return container
+
+        monkeypatch.setattr(vm.av, "open", fake_open)
+
+        path, remediated = remediate_pixfmt_for_review(tmp_path)
+        assert remediated is True
+        assert path == tmp_path / ".video_review.mp4"
+        assert path.exists()
+        # Verify with the unpatched opener (monkeypatch is still active here).
+        container = real_open(str(path))
+        try:
+            assert container.streams.video[0].codec_context.pix_fmt == "yuv420p"
+        finally:
+            container.close()
+
+    def test_concat_raises_on_zero_packet_chunk(self, tmp_path, monkeypatch):
+        """A chunk that matches the template but demuxes no timestamped packets fails loud.
+
+        Guards todo 002: a zero-packet chunk would leave offset unadvanced and
+        overlap the next chunk's PTS silently.
+        """
+        import screencap.engine.video as vm
+
+        _write_chunk(tmp_path / "chunk_0000.mp4", (200, 0, 0))
+        real_open = vm.av.open
+
+        class _EmptyDemux:
+            def __init__(self, inner):
+                self._inner = inner
+
+            def __getattr__(self, name):
+                return getattr(self._inner, name)
+
+            def demux(self, *a, **k):
+                return iter([vm.av.Packet()])  # bare packet: pts/dts are None → skipped
+
+        def fake_open(*a, **k):
+            if k.get("mode") == "w":
+                return real_open(*a, **k)
+            return _EmptyDemux(real_open(*a, **k))
+
+        monkeypatch.setattr(vm.av, "open", fake_open)
+
+        with pytest.raises(RuntimeError, match="no timestamped packets"):
+            concat_video_chunks(tmp_path)
+        assert not (tmp_path / "video.mp4").exists()

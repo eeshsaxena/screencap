@@ -15,6 +15,7 @@ import threading
 from fractions import Fraction
 from pathlib import Path
 from typing import TYPE_CHECKING
+from uuid import uuid4
 
 import av
 from loguru import logger
@@ -818,3 +819,387 @@ class ChunkedVideoWriter:
     def __exit__(self, exc_type, exc_val, exc_tb) -> None:
         """Context manager exit."""
         self.close()
+
+
+# =============================================================================
+# Review-Data Video Pipeline (in-process PyAV: concat / probe / remediate)
+#
+# These primitives back the native-review path so it never shells out to the
+# ffmpeg/ffprobe CLI binaries (which are not bundled and are unreachable from
+# the minimal GUI PATH a Finder-launched .app inherits). PyAV is already a hard
+# dependency and the same library the recorder writes video with.
+# =============================================================================
+
+
+def _close_container_in_thread(container: av.container.Container) -> bool:
+    """Close a PyAV container off the main thread to dodge a GIL deadlock.
+
+    Mirrors ``VideoWriter.close`` / ``finalize_video_writer``: closing in the
+    calling thread can hang indefinitely (PyAV issue #1053), so close in a
+    worker and join with a 15s budget.
+
+    Returns ``True`` if the close finished within the budget, ``False`` if it
+    timed out (the worker is left running and still owns the file descriptor).
+    A caller performing an atomic write must treat ``False`` as a failed
+    finalize and must NOT promote the temp file — the moov atom may be unwritten,
+    so the output could be truncated/unplayable.
+
+    The worker is a daemon thread: if the close genuinely deadlocks on the GIL,
+    a non-daemon thread would keep the interpreter alive and stall clean CLI /
+    daemon exit, defeating the 15s budget.
+
+    NOTE: ``VideoWriter.close`` and ``finalize_video_writer`` still inline an
+    equivalent close-in-thread block; consolidating them onto this helper is a
+    deferred follow-up (out of scope for the review-pipeline change).
+    """
+    def _close() -> None:
+        container.close()
+
+    close_thread = threading.Thread(target=_close, daemon=True)
+    close_thread.start()
+    close_thread.join(timeout=15)
+    if close_thread.is_alive():
+        logger.warning("container close thread did not finish in 15s")
+        return False
+    return True
+
+
+def _sweep_stale_temps(rec_dir: Path, pattern: str) -> None:
+    """Remove orphaned atomic-write temps left by a crashed/killed prior run.
+
+    Per-call temp names are unique (pid + uuid), so the deterministic
+    ``unlink`` that used to clear a same-pid orphan no longer applies — without
+    a sweep, interrupted runs accumulate full-size ``.tmp`` files in the
+    recording dir. Safe under concurrency: a temp whose embedded PID is still
+    alive (an in-flight writer in another process) is left untouched.
+    """
+    for stale in rec_dir.glob(pattern):
+        fields = stale.name.split(".")
+        try:
+            # name shape: .<base>.mp4.<pid>.<uuid>.tmp → pid follows "mp4"
+            pid = int(fields[fields.index("mp4") + 1])
+        except (ValueError, IndexError):
+            continue
+        try:
+            os.kill(pid, 0)  # process alive → an in-flight writer; skip
+        except ProcessLookupError:
+            stale.unlink(missing_ok=True)  # dead pid → orphan; reclaim
+        except OSError:
+            pass  # e.g. EPERM: alive but not ours — skip
+
+
+def _discard_failed_output(
+    output: av.container.OutputContainer | None, tmp_path: Path
+) -> None:
+    """Best-effort teardown when an atomic write fails: close container, drop temp.
+
+    Shared by the concat and remediation rollback paths so they cannot drift.
+    """
+    if output is not None:
+        try:
+            _close_container_in_thread(output)
+        except Exception:
+            pass
+    tmp_path.unlink(missing_ok=True)
+
+
+def concat_video_chunks(rec_dir: str | Path) -> Path:
+    """Concatenate ``chunk_*.mp4`` into a single ``rec_dir/video.mp4`` via PyAV.
+
+    In-process stream-copy remux (no re-encode) — fast, lossless, and pixel
+    format preserving (the gated yuv420p conversion is a separate step in
+    :func:`remediate_pixfmt_for_review`). Replaces the old ``ffmpeg -f concat``
+    subprocess so the merge works with nothing installed on PATH.
+
+    The chunks are written by ``ChunkedVideoWriter`` with ``bf=0`` (no
+    B-frames), so within each chunk ``PTS == DTS`` and timestamps are monotonic
+    from ~0. They are stitched back-to-back: each subsequent chunk's packet
+    timestamps are offset by the cumulative duration of all preceding chunks,
+    producing a single monotonic timeline starting at ~0. This matches the
+    semantics of the ``ffmpeg -f concat`` it replaces. NOTE: like that prior
+    behavior, the *wall-clock* idle gap between one chunk's last frame and the
+    next chunk's first frame is not represented (each chunk's PTS restarts at
+    ~0), so for multi-chunk action-gated recordings the merged timeline tracks
+    summed intra-chunk spans, not absolute recording time — a pre-existing
+    limitation that ``engine/capture.py:get_frame_at`` inherits unchanged.
+
+    The output is a plain (non-fragmented) MP4 with the moov atom at the end —
+    **not** faststart. ``extract_frames``/``extract_frame`` consume this file
+    and moov relocation is documented to break them (see ``finalize_video_writer``).
+
+    The write is atomic: packets are muxed into a temp sibling that is
+    ``os.replace``\\d onto ``video.mp4`` only on success, so a present
+    ``video.mp4`` is always complete (closes the truncated-read window when a
+    ``view`` + ``review-data`` race has two callers concat the same recording).
+
+    Args:
+        rec_dir: Recording directory containing the ``chunk_*.mp4`` files.
+
+    Returns:
+        Path to the merged ``rec_dir/video.mp4``.
+
+    Raises:
+        ValueError: If no ``chunk_*.mp4`` files are present.
+        RuntimeError: If a chunk cannot be opened/decoded by PyAV — fail loud
+            rather than silently emit a truncated video.
+    """
+    rec_dir = Path(rec_dir)
+    chunks = sorted(rec_dir.glob("chunk_*.mp4"))
+    if not chunks:
+        raise ValueError(f"No chunk_*.mp4 files to concatenate in {rec_dir}")
+
+    out_path = rec_dir / "video.mp4"
+    # Dot-prefixed temp sibling: excluded from upload (dotfile filter) and from
+    # catalog's ``*.mp4`` glob, so a lingering temp can never pollute either.
+    # pid + uuid keeps the name unique per call so two threads in one process
+    # (the future daemon path) never clobber each other's temp.
+    _sweep_stale_temps(rec_dir, ".video.mp4.*.tmp")
+    tmp_path = rec_dir / f".video.mp4.{os.getpid()}.{uuid4().hex}.tmp"
+
+    output = av.open(str(tmp_path), mode="w", format="mp4")
+    try:
+        out_stream = None
+        template_params: tuple[int, int, str] | None = None
+        # Cumulative offset in the (shared) input stream time_base. All chunks
+        # come from the same recorder config, so their time_bases match and
+        # ``add_stream_from_template`` gives the output that same time_base.
+        offset = 0
+        for chunk in chunks:
+            try:
+                inp = av.open(str(chunk))
+            except Exception as exc:  # corrupt/undecodable chunk — fail loud
+                raise RuntimeError(
+                    f"Cannot open video chunk for concat: {chunk.name}: {exc}"
+                ) from exc
+            try:
+                if not inp.streams.video:
+                    raise RuntimeError(f"Chunk has no video stream: {chunk.name}")
+                in_stream = inp.streams.video[0]
+                params = (in_stream.width, in_stream.height, in_stream.codec_context.pix_fmt)
+                if out_stream is None:
+                    # add_stream_from_template replaces the removed
+                    # add_stream(template=...) API (PyAV 14+).
+                    out_stream = output.add_stream_from_template(in_stream)
+                    template_params = params
+                elif params != template_params:
+                    # Stream-copying a mismatched chunk against the first chunk's
+                    # template silently corrupts the segment (no decode error),
+                    # so fail loud instead. Recorder chunks are homogeneous; a
+                    # mismatch means a tampered/foreign file.
+                    raise RuntimeError(
+                        f"Chunk {chunk.name} params {params} differ from the first "
+                        f"chunk {template_params}; cannot stream-copy concat"
+                    )
+                # Estimate a fallback frame duration (in time_base ticks) for
+                # packets missing one, so the next chunk's offset never overlaps
+                # the last frame. average_rate/time_base are Fractions, so this
+                # stays exact with no float round-trip.
+                rate = in_stream.average_rate
+                fallback_dur = round(1 / (rate * in_stream.time_base)) if rate else 1
+                chunk_end = 0
+                for packet in inp.demux(in_stream):
+                    # Flush packets carry no timestamps — skip them.
+                    if packet.dts is None or packet.pts is None:
+                        continue
+                    orig_pts = packet.pts
+                    dur = packet.duration or fallback_dur
+                    packet.pts = orig_pts + offset
+                    packet.dts = packet.dts + offset
+                    # Reassigning the stream rescales timestamps into the
+                    # output time_base (a no-op here, since they match).
+                    packet.stream = out_stream
+                    output.mux(packet)
+                    end = orig_pts + dur
+                    if end > chunk_end:
+                        chunk_end = end
+                if chunk_end == 0:
+                    # A chunk that matched the template but muxed no timestamped
+                    # packets would leave offset unadvanced, overlapping the next
+                    # chunk's PTS. Recorder chunks always carry packets, so this
+                    # means a foreign/corrupt chunk — fail loud, like the other
+                    # concat guards.
+                    raise RuntimeError(
+                        f"Chunk {chunk.name} produced no timestamped packets; "
+                        f"cannot stream-copy concat without corrupting the timeline"
+                    )
+                offset += chunk_end
+            finally:
+                inp.close()
+        # If the close times out the moov atom may be unwritten — do not promote
+        # a possibly-truncated temp. Hand off to the worker (output=None so the
+        # rollback won't re-close), drop the temp, and fail loud.
+        closed = _close_container_in_thread(output)
+        output = None
+        if not closed:
+            tmp_path.unlink(missing_ok=True)
+            raise RuntimeError(f"Timed out finalizing merged video for {rec_dir}")
+        os.replace(tmp_path, out_path)
+    except BaseException:
+        _discard_failed_output(output, tmp_path)
+        raise
+
+    return out_path
+
+
+# Pixel formats AVKit's hardware H.264 decoder plays directly. The recorder
+# only ever writes yuv444p or yuv420p, so the practical rule is "remediate
+# unless already 4:2:0"; the broader set guards against legacy/imported files.
+AVKIT_SAFE_PIX_FMTS: frozenset[str] = frozenset({"yuv420p", "yuvj420p", "nv12"})
+
+
+def read_pixel_format(video_path: str | Path) -> str:
+    """Return a video's pixel format read straight from the stream (no decode).
+
+    Replaces the old ``ffprobe`` shell-out: ``codec_context.pix_fmt`` is
+    available immediately after ``av.open`` without decoding a single frame.
+
+    Args:
+        video_path: Path to the video file.
+
+    Returns:
+        The pixel format name (e.g. ``"yuv444p"``, ``"yuv420p"``).
+
+    Raises:
+        RuntimeError: If the container cannot be opened, has no video stream,
+            or exposes no pixel format — all genuine "can't process" signals
+            (feeds the R9 failure state at the command boundary).
+    """
+    try:
+        container = av.open(str(video_path))
+    except Exception as exc:
+        raise RuntimeError(
+            f"Cannot open video to read pixel format: {video_path}: {exc}"
+        ) from exc
+    try:
+        streams = container.streams.video
+        if not streams:
+            raise RuntimeError(f"No video stream in {video_path}")
+        pix_fmt = streams[0].codec_context.pix_fmt
+        if not pix_fmt:
+            raise RuntimeError(f"Could not determine pixel format for {video_path}")
+        return pix_fmt
+    finally:
+        container.close()
+
+
+def needs_pixfmt_remediation(pix_fmt: str) -> bool:
+    """True when ``pix_fmt`` is not AVKit-safe and needs a yuv420p re-encode."""
+    return pix_fmt not in AVKIT_SAFE_PIX_FMTS
+
+
+def remediate_pixfmt_for_review(rec_dir: str | Path) -> tuple[Path, bool]:
+    """Ensure an AVKit-playable copy of ``rec_dir/video.mp4`` exists for review.
+
+    If ``video.mp4`` is already an AVKit-safe 4:2:0 format, returns it unchanged.
+    Otherwise produces a yuv420p re-encode at ``rec_dir/.video_review.mp4`` (a
+    leading-dot sibling) and returns that. The dot prefix does double duty: the
+    upload enumerator's dotfile filter never ships it (R6) and its existence is
+    the idempotency gate (R7) — a second call performs no re-encode.
+
+    The re-encode uses ``libx264`` (deterministic cross-machine output,
+    guaranteed present in the bundle via ``_check_av_codecs``; videotoolbox is
+    deferred) and preserves the source's presentation timeline. That last point
+    is load-bearing: recordings are action-gated (variable frame rate with idle
+    gaps), so the source frame PTS — not the stream's misleading ``average_rate``
+    — define the timeline the review window overlays events on. Each decoded
+    frame's PTS flows through ``reformat`` and the encoder untouched; we never
+    set ``frame.pts = None`` (which collapses a VFR recording to a few seconds)
+    and never override ``packet.pts`` after encode (the documented PTS-corruption
+    bug — see docs/solutions/bug-fixes/video-pts-offset-bframe-corruption-20260322.md).
+    ``bf=0`` keeps ``PTS == DTS``.
+
+    Args:
+        rec_dir: Recording directory containing ``video.mp4``.
+
+    Returns:
+        ``(path, remediated)`` — the playable path and whether a re-encode was
+        performed (or a prior one is being reused).
+
+    Raises:
+        RuntimeError: If PyAV cannot open/decode the source — a genuine
+            "can't process this video" signal (feeds R9 at the command boundary).
+    """
+    rec_dir = Path(rec_dir)
+    video_path = rec_dir / "video.mp4"
+    review_path = rec_dir / ".video_review.mp4"
+
+    if not needs_pixfmt_remediation(read_pixel_format(video_path)):
+        return video_path, False
+    if review_path.exists():
+        return review_path, True  # idempotent: a prior re-encode is reused
+
+    # pid + uuid keeps the temp unique per call (no same-process clobber when
+    # this runs in a threaded/daemon context); sweep reclaims orphans from
+    # crashed prior runs.
+    _sweep_stale_temps(rec_dir, ".video_review.mp4.*.tmp")
+    tmp_path = rec_dir / f".video_review.mp4.{os.getpid()}.{uuid4().hex}.tmp"
+
+    try:
+        inp = av.open(str(video_path))
+    except Exception as exc:
+        raise RuntimeError(
+            f"Cannot open video for review remediation: {video_path}: {exc}"
+        ) from exc
+
+    output = None
+    try:
+        in_stream = inp.streams.video[0]
+        output = av.open(str(tmp_path), mode="w", format="mp4")
+        # libx264 explicitly (not config.VIDEO_ENCODING) — the review copy must
+        # be deterministic across machines regardless of the recorder's encoder.
+        out_stream = output.add_stream("libx264")
+        out_stream.width = in_stream.width
+        out_stream.height = in_stream.height
+        out_stream.pix_fmt = "yuv420p"
+        # Preserve the source stream timebase so frame PTS map straight through.
+        out_stream.codec_context.time_base = in_stream.time_base
+        out_stream.options = {
+            "crf": str(config.VIDEO_CRF),
+            "preset": config.VIDEO_PRESET,
+            "g": str(config.VIDEO_GOP_SIZE),
+            "bf": "0",
+        }
+
+        for frame in inp.decode(in_stream):
+            # reformat carries the frame's pts + time_base through unchanged.
+            reformatted = frame.reformat(format="yuv420p")
+            for packet in out_stream.encode(reformatted):
+                output.mux(packet)
+        for packet in out_stream.encode():  # flush
+            output.mux(packet)
+
+        # If the close times out the moov atom may be unwritten — do not promote
+        # a possibly-truncated temp as the review copy. Hand off to the worker
+        # (output=None so rollback won't re-close), drop the temp, and fail loud.
+        closed = _close_container_in_thread(output)
+        output = None
+        if not closed:
+            tmp_path.unlink(missing_ok=True)
+            raise RuntimeError(f"Timed out finalizing review video for {video_path}")
+        os.replace(tmp_path, review_path)
+    except RuntimeError:
+        # Already-structured failure (timeout, decode error we raised) — drop the
+        # temp and re-raise unchanged.
+        _discard_failed_output(output, tmp_path)
+        raise
+    except BaseException as exc:
+        # Genuine Exception → wrap as the R9 "can't process" signal. Control-flow
+        # BaseExceptions (KeyboardInterrupt/SystemExit, not Exception) re-raise
+        # unwrapped so they aren't masked as a re-encode failure.
+        _discard_failed_output(output, tmp_path)
+        if isinstance(exc, Exception):
+            raise RuntimeError(
+                f"Cannot re-encode video for review: {video_path}: {exc}"
+            ) from exc
+        raise
+    finally:
+        # Close the input exactly once, regardless of outcome. Kept out of the
+        # success/except flow so an inp.close() error can never discard an
+        # already-promoted review copy (errors here are swallowed — the input is
+        # read-only and a late close failure must not undo os.replace).
+        try:
+            inp.close()
+        except Exception:
+            pass
+
+    return review_path, True
