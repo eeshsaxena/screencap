@@ -2193,7 +2193,9 @@ def _capture_health_step(
     return edges
 
 
-def _emit_capture_health_event(reader: str, label: str | None, elapsed: float, emit) -> str:
+def _emit_capture_health_event(
+    reader: str, label: str | None, elapsed: float, emit: Callable[..., None]
+) -> str:
     """Emit the right stderr event for a capture-health edge (SCR-76).
 
     A TCC ``label`` reuses the existing terminal-capable ``permission_lost``
@@ -2231,8 +2233,8 @@ def _capture_health_tick(
     emitted: dict,
     alive: dict,
     action_alive: bool,
-    emit,
-    probe=_probe_tcc_denied,
+    emit: Callable[..., None],
+    probe: Callable[[str | None], str | None] = _probe_tcc_denied,
 ) -> list[tuple[str, str]]:
     """Run one capture-health supervisor tick (SCR-76).
 

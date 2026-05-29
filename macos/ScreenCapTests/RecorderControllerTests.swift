@@ -58,6 +58,20 @@ final class RecorderControllerTests: XCTestCase {
         XCTAssertNil(recorder.captureAdvisory)
     }
 
+    func testCaptureUnhealthyWhileStoppingIsSuppressedByRecordingGuard() {
+        let recorder = RecorderController()
+        recorder._testSetPresentation(state: .stopping(quitting: false))
+
+        recorder._testHandleStderrLine(
+            #"{"type":"capture_unhealthy","reason":"reader_stalled","reader":"screen","elapsed":12.0,"schema_version":1}"#
+        )
+
+        // handleCaptureUnhealthy's `if case .recording` guard suppresses a late
+        // advisory arriving during teardown, so no stale hint shows while the
+        // controller is .stopping (mirrors the .idle suppression above).
+        XCTAssertNil(recorder.captureAdvisory)
+    }
+
     func testCaptureAdvisoryClearedWhenRecordingReturnsToIdle() {
         let recorder = RecorderController()
         recorder._testSetPresentation(state: .recording(elapsed: 5))

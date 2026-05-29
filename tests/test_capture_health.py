@@ -308,9 +308,14 @@ def test_window_broken_poll_fires():
         cur["window.attempt"] += 2          # polling
         cur["screen.attempt"] += 20         # screen healthy
         cur["screen.output"] += 20
-        edges = recorder._capture_health_step(prev, cur, _ALIVE, True, 3, runs, emitted)
+        edges.append(recorder._capture_health_step(prev, cur, _ALIVE, True, 3, runs, emitted))
         prev = dict(cur)
-    assert edges == ["window"]
+    # debounce=3: the first two stalled ticks must NOT fire; only the third
+    # (the edge) does. Pinning each tick guards the window-reader debounce
+    # boundary, not just the terminal value.
+    assert edges[0] == []
+    assert edges[1] == []
+    assert edges[2] == ["window"]
 
 
 # ---------------------------------------------------------------------------
