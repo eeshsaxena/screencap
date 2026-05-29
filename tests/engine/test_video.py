@@ -14,6 +14,8 @@ from screencap.engine.video import (
     concat_video_chunks,
     extract_frame,
     initialize_video_writer,
+    needs_pixfmt_remediation,
+    read_pixel_format,
     write_video_frame,
 )
 
@@ -568,3 +570,62 @@ def get_chunk_duration(path: Path) -> float:
         last = max(last, float(frame.pts * stream.time_base))
     container.close()
     return last
+
+
+class TestPixelFormatProbe:
+    """Tests for read_pixel_format / needs_pixfmt_remediation (U2, R3)."""
+
+    def test_reads_yuv444p_and_flags_for_remediation(self, tmp_path):
+        path = tmp_path / "v444.mp4"
+        _write_chunk(path, (200, 0, 0))  # VideoWriter default pix_fmt = yuv444p
+        assert read_pixel_format(path) == "yuv444p"
+        assert needs_pixfmt_remediation("yuv444p") is True
+
+    def test_reads_yuv420p_and_is_avkit_safe(self, tmp_path):
+        """Covers AE2: an already-420 recording needs no remediation."""
+        path = tmp_path / "v420.mp4"
+        base = time.time()
+        writer = VideoWriter(str(path), width=64, height=64, fps=24, pix_fmt="yuv420p")
+        for i in range(4):
+            writer.write_frame(Image.new("RGB", (64, 64), color=(0, 0, 200)), base + i / 24)
+        writer.close()
+        assert read_pixel_format(path) == "yuv420p"
+        assert needs_pixfmt_remediation("yuv420p") is False
+
+    @pytest.mark.parametrize("pix_fmt", ["yuv420p", "yuvj420p", "nv12"])
+    def test_avkit_safe_formats_skip_remediation(self, pix_fmt):
+        assert needs_pixfmt_remediation(pix_fmt) is False
+
+    @pytest.mark.parametrize("pix_fmt", ["yuv444p", "yuv422p", "rgb24"])
+    def test_non_420_formats_need_remediation(self, pix_fmt):
+        assert needs_pixfmt_remediation(pix_fmt) is True
+
+    def test_corrupt_file_raises(self, tmp_path):
+        path = tmp_path / "garbage.mp4"
+        path.write_bytes(b"definitely not an mp4")
+        with pytest.raises(RuntimeError):
+            read_pixel_format(path)
+
+    def test_probe_does_not_decode_frames(self, tmp_path, monkeypatch):
+        """The probe reads codec_context.pix_fmt only — never iterates frames."""
+        path = tmp_path / "v444.mp4"
+        _write_chunk(path, (200, 0, 0))
+
+        # Guard against a future regression that adds a decode loop: if the
+        # probe decoded, this patched decode would raise.
+        import screencap.engine.video as video_mod
+        real_open = video_mod.av.open
+
+        class _NoDecodeContainer:
+            def __init__(self, inner):
+                self._inner = inner
+
+            def __getattr__(self, name):
+                if name == "decode":
+                    raise AssertionError("read_pixel_format must not decode frames")
+                return getattr(self._inner, name)
+
+        monkeypatch.setattr(
+            video_mod.av, "open", lambda *a, **k: _NoDecodeContainer(real_open(*a, **k))
+        )
+        assert read_pixel_format(path) == "yuv444p"

@@ -955,3 +955,49 @@ def concat_video_chunks(rec_dir: str | Path) -> Path:
         raise
 
     return out_path
+
+
+# Pixel formats AVKit's hardware H.264 decoder plays directly. The recorder
+# only ever writes yuv444p or yuv420p, so the practical rule is "remediate
+# unless already 4:2:0"; the broader set guards against legacy/imported files.
+AVKIT_SAFE_PIX_FMTS: frozenset[str] = frozenset({"yuv420p", "yuvj420p", "nv12"})
+
+
+def read_pixel_format(video_path: str | Path) -> str:
+    """Return a video's pixel format read straight from the stream (no decode).
+
+    Replaces the old ``ffprobe`` shell-out: ``codec_context.pix_fmt`` is
+    available immediately after ``av.open`` without decoding a single frame.
+
+    Args:
+        video_path: Path to the video file.
+
+    Returns:
+        The pixel format name (e.g. ``"yuv444p"``, ``"yuv420p"``).
+
+    Raises:
+        RuntimeError: If the container cannot be opened, has no video stream,
+            or exposes no pixel format — all genuine "can't process" signals
+            (feeds the R9 failure state at the command boundary).
+    """
+    try:
+        container = av.open(str(video_path))
+    except Exception as exc:
+        raise RuntimeError(
+            f"Cannot open video to read pixel format: {video_path}: {exc}"
+        ) from exc
+    try:
+        streams = container.streams.video
+        if not streams:
+            raise RuntimeError(f"No video stream in {video_path}")
+        pix_fmt = streams[0].codec_context.pix_fmt
+        if not pix_fmt:
+            raise RuntimeError(f"Could not determine pixel format for {video_path}")
+        return pix_fmt
+    finally:
+        container.close()
+
+
+def needs_pixfmt_remediation(pix_fmt: str) -> bool:
+    """True when ``pix_fmt`` is not AVKit-safe and needs a yuv420p re-encode."""
+    return pix_fmt not in AVKIT_SAFE_PIX_FMTS
