@@ -13,7 +13,9 @@ related_review_run: /tmp/compound-engineering/ce-code-review/20260529-150208-deb
 
 ## Problem
 
-The SCR-76 plan's U5 lists, as a deliverable, *"Modify `docs/research/2026-04-28-stderr-event-schema.md` (document the new event: fields, advisory semantics, no exit code)."* That file does not exist in the worktree — the `docs/research/` directory is absent. The new `capture_unhealthy` event (and the closed `reason` set) is documented only in the plan, the engine constants in `src/screencap/_stderr_events.py`, and the contract test. The cross-language engine↔Swift event protocol therefore has no authoritative spec for the new event.
+The SCR-76 plan's U5 lists, as a deliverable, *"Modify `docs/research/2026-04-28-stderr-event-schema.md` (document the new event: fields, advisory semantics, no exit code)."* That file does not exist (verified: the path was never tracked on any ref — it is a dangling reference also cited by `_stderr_events.py`'s own module docstring).
+
+**Validation note (code review follow-up):** the new `capture_unhealthy` event *is* documented in the `src/screencap/_stderr_events.py` module docstring — a thorough section was added covering the field set, the closed `reason` set, the `reader` enum, advisory (no-exit-code, never-terminal) semantics, and the no-runtime-text invariant — plus the plan, the engine constants, and the contract test. So the in-code contract exists; what's missing is specifically the dedicated `docs/research/...schema.md` spec file the plan named. Scope this todo accordingly (create the file and have it reference / not duplicate the docstring), and decide whether the dangling `docs/research/...` reference in `_stderr_events.py` should be repointed at the real schema-doc location.
 
 ## Why it matters
 

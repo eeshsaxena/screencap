@@ -21,7 +21,14 @@ Two copies drift independently — a fix or extension to the helper (e.g. tighte
 
 ## Suggested direction
 
-Extract the shared helpers into a `conftest.py` fixture or a `tests/helpers/capture_health.py` module and import from both files. Note the two `_capture_stderr` variants differ (one returns parsed dicts, the other parses lines) — if the signatures must stay distinct, rename the divergent one locally (e.g. `_raw_stderr`) rather than copying the whole body.
+Extract the shared helpers into a `conftest.py` fixture or a `tests/helpers/capture_health.py` module and import from both files.
+
+> **Validation note (code review follow-up):** an earlier draft claimed the two
+> `_capture_stderr` variants differ ("one returns parsed dicts, the other parses
+> lines"). They do **not** — both bodies are byte-identical and return
+> `[json.loads(line) for line in ...]`. `_referenced_names` and `_ALIVE` are
+> likewise identical across the two files. So a straight extraction works with no
+> signature reconciliation needed.
 
 ## Verification
 
