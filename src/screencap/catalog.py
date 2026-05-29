@@ -191,9 +191,12 @@ def list_recordings(recordings_dir: Path | None = None) -> list[RecordingInfo]:
                 except Exception:
                     pass
 
-        # Stub detection: DB exists but no media files on disk
+        # Stub detection: DB exists but no media files on disk. Hidden mp4/flac
+        # are ignored — pathlib glob matches dotfiles, and a lingering review
+        # artifact (.video_review.mp4) must never mask a stub (R6).
         has_media = (
-            any(d.glob("*.mp4")) or any(d.glob("*.flac"))
+            any(not p.name.startswith(".") for p in d.glob("*.mp4"))
+            or any(not p.name.startswith(".") for p in d.glob("*.flac"))
             or (d / "video.mp4").exists()
         )
         is_stub = uploaded and not has_media and db is not None

@@ -16,6 +16,7 @@ from screencap.engine.video import (
     initialize_video_writer,
     needs_pixfmt_remediation,
     read_pixel_format,
+    remediate_pixfmt_for_review,
     write_video_frame,
 )
 
@@ -26,14 +27,15 @@ def _write_chunk(
     n_frames: int = 5,
     fps: int = 24,
     size: int = 64,
+    pix_fmt: str | None = None,
 ) -> int:
-    """Write a solid-color chunk via VideoWriter (yuv444p, bf=0, like the recorder).
+    """Write a solid-color video via VideoWriter (yuv444p/bf=0, like the recorder).
 
     Returns the number of frames actually decodable from the written file
     (VideoWriter.close adds a trailing key frame, so this is >= n_frames).
     """
     base = time.time()
-    writer = VideoWriter(str(path), width=size, height=size, fps=fps)
+    writer = VideoWriter(str(path), width=size, height=size, fps=fps, pix_fmt=pix_fmt)
     for i in range(n_frames):
         writer.write_frame(Image.new("RGB", (size, size), color=color), base + i / fps)
     writer.close()
@@ -629,3 +631,86 @@ class TestPixelFormatProbe:
             video_mod.av, "open", lambda *a, **k: _NoDecodeContainer(real_open(*a, **k))
         )
         assert read_pixel_format(path) == "yuv444p"
+
+
+class TestRemediatePixfmtForReview:
+    """Tests for remediate_pixfmt_for_review (U3, R4/R6/R7)."""
+
+    def test_yuv444p_source_is_remediated(self, tmp_path):
+        """Covers AE1 (remediation half): yuv444p → yuv420p .video_review.mp4."""
+        _write_chunk(tmp_path / "video.mp4", (200, 0, 0))  # yuv444p default
+        path, remediated = remediate_pixfmt_for_review(tmp_path)
+        assert remediated is True
+        assert path == tmp_path / ".video_review.mp4"
+        assert path.exists() and not path.is_symlink()
+        assert read_pixel_format(path) == "yuv420p"
+
+    def test_yuv420p_source_is_left_untouched(self, tmp_path):
+        """Covers AE2: an already-420 recording produces no artifact."""
+        _write_chunk(tmp_path / "video.mp4", (0, 0, 200), pix_fmt="yuv420p")
+        path, remediated = remediate_pixfmt_for_review(tmp_path)
+        assert remediated is False
+        assert path == tmp_path / "video.mp4"
+        assert not (tmp_path / ".video_review.mp4").exists()
+
+    def test_idempotent_skip_reuses_existing_artifact(self, tmp_path):
+        """Covers AE3: a second call performs no re-encode."""
+        _write_chunk(tmp_path / "video.mp4", (200, 0, 0))
+        path1, _ = remediate_pixfmt_for_review(tmp_path)
+        # Tamper with the artifact; a re-encode would overwrite the sentinel.
+        path1.write_bytes(b"SENTINEL")
+        path2, remediated2 = remediate_pixfmt_for_review(tmp_path)
+        assert remediated2 is True
+        assert path2 == path1
+        assert path2.read_bytes() == b"SENTINEL", "re-encode ran on idempotent call"
+
+    def test_remediated_pts_monotonic_from_zero(self, tmp_path):
+        """Regression guard: re-encode yields yuv420p with monotonic PTS from ~0."""
+        _write_chunk(tmp_path / "video.mp4", (200, 0, 0), n_frames=6)
+        path, _ = remediate_pixfmt_for_review(tmp_path)
+
+        container = av.open(str(path))
+        stream = container.streams.video[0]
+        assert stream.codec_context.pix_fmt == "yuv420p"
+        pts = [float(f.pts * stream.time_base) for f in container.decode(stream)]
+        container.close()
+        assert pts[0] < 0.5, f"first PTS {pts[0]:.3f}s should start near 0"
+        for i in range(1, len(pts)):
+            assert pts[i] > pts[i - 1], f"PTS not monotonic at {i}"
+
+    def test_no_temp_residue_on_success(self, tmp_path):
+        _write_chunk(tmp_path / "video.mp4", (200, 0, 0))
+        remediate_pixfmt_for_review(tmp_path)
+        assert not list(tmp_path.glob(".video_review.mp4.*.tmp"))
+
+    def test_corrupt_source_raises_and_leaves_no_artifact(self, tmp_path):
+        """A video.mp4 PyAV cannot open → RuntimeError, no partial review file."""
+        (tmp_path / "video.mp4").write_bytes(b"not a real mp4")
+        with pytest.raises(RuntimeError):
+            remediate_pixfmt_for_review(tmp_path)
+        assert not (tmp_path / ".video_review.mp4").exists()
+        assert not list(tmp_path.glob(".video_review.mp4.*.tmp"))
+
+    def test_reads_through_single_chunk_symlink(self, tmp_path):
+        """Edge: video.mp4 is a symlink to a yuv444p chunk → real .video_review.mp4."""
+        _write_chunk(tmp_path / "chunk_0000.mp4", (200, 0, 0))
+        (tmp_path / "video.mp4").symlink_to(tmp_path / "chunk_0000.mp4")
+        path, remediated = remediate_pixfmt_for_review(tmp_path)
+        assert remediated is True
+        assert path == tmp_path / ".video_review.mp4"
+        assert path.is_file() and not path.is_symlink()
+        assert read_pixel_format(path) == "yuv420p"
+
+    def test_review_artifact_excluded_from_upload(self, tmp_path):
+        """Covers AE4 / R6: the artifact is never enumerated for upload."""
+        from screencap import upload
+
+        _write_chunk(tmp_path / "video.mp4", (200, 0, 0))
+        original_bytes = (tmp_path / "video.mp4").read_bytes()
+        remediate_pixfmt_for_review(tmp_path)
+
+        names = [f.name for f in upload.list_recording_files(tmp_path)]
+        assert ".video_review.mp4" not in names
+        assert "video.mp4" in names
+        # R6: the upload artifact's bytes are unchanged by remediation.
+        assert (tmp_path / "video.mp4").read_bytes() == original_bytes

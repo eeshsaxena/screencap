@@ -3905,6 +3905,63 @@ def _check_av_codecs() -> tuple[str, bool, str]:
         return name, False, _tb.format_exc()
 
 
+def _check_av_review_pipeline() -> tuple[str, bool, str]:
+    """Run the review concat + yuv420p remediation on a tiny in-memory fixture.
+
+    Goes beyond ``_check_av_codecs`` (which only loads libx264): proves the
+    bundled wheel can actually *run* the native-review video pipeline end to
+    end — chunk concat (remux) and the yuv444p→yuv420p re-encode — so a frozen
+    binary that loads but cannot mux/encode is caught at smoke time.
+    "Test what you bundle."
+    """
+    import traceback as _tb
+    name = "av_review_pipeline"
+    try:
+        import shutil
+        import tempfile
+        from pathlib import Path
+
+        import av
+        from PIL import Image
+
+        from screencap.engine.video import (
+            VideoWriter,
+            concat_video_chunks,
+            read_pixel_format,
+            remediate_pixfmt_for_review,
+        )
+
+        tmp = Path(tempfile.mkdtemp(prefix="screencap_smoke_review_"))
+        try:
+            # Two tiny yuv444p chunks, mirroring a chunked recording.
+            for idx, color in enumerate([(200, 0, 0), (0, 0, 200)]):
+                writer = VideoWriter(
+                    str(tmp / f"chunk_{idx:04d}.mp4"), width=64, height=64, fps=24
+                )
+                for i in range(4):
+                    writer.write_frame(Image.new("RGB", (64, 64), color=color), i / 24)
+                writer.close()
+
+            concat_video_chunks(tmp)  # chunks → video.mp4 (side effect)
+            review_path, remediated = remediate_pixfmt_for_review(tmp)
+            if not remediated:
+                return name, False, "expected yuv444p source to be remediated"
+            if read_pixel_format(review_path) != "yuv420p":
+                return name, False, (
+                    f"review pix_fmt not yuv420p: {read_pixel_format(review_path)}"
+                )
+            container = av.open(str(review_path))
+            frames = sum(1 for _ in container.decode(video=0))
+            container.close()
+            if frames <= 0:
+                return name, False, "remediated review video has no decodable frames"
+            return name, True, ""
+        finally:
+            shutil.rmtree(tmp, ignore_errors=True)
+    except Exception:
+        return name, False, _tb.format_exc()
+
+
 def _check_pynput() -> tuple[str, bool, str]:
     """Import pynput keyboard and mouse listeners (import only)."""
     import traceback as _tb
@@ -4258,6 +4315,7 @@ _SMOKE_CHECKS = [
     _check_detect_secrets_plugins,
     _check_spacy_model,
     _check_av_codecs,
+    _check_av_review_pipeline,
     _check_pynput,
     _check_sounddevice,
     _check_domain_index,

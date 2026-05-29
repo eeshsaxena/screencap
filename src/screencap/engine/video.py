@@ -1001,3 +1001,105 @@ def read_pixel_format(video_path: str | Path) -> str:
 def needs_pixfmt_remediation(pix_fmt: str) -> bool:
     """True when ``pix_fmt`` is not AVKit-safe and needs a yuv420p re-encode."""
     return pix_fmt not in AVKIT_SAFE_PIX_FMTS
+
+
+def remediate_pixfmt_for_review(rec_dir: str | Path) -> tuple[Path, bool]:
+    """Ensure an AVKit-playable copy of ``rec_dir/video.mp4`` exists for review.
+
+    If ``video.mp4`` is already an AVKit-safe 4:2:0 format, returns it unchanged.
+    Otherwise produces a yuv420p re-encode at ``rec_dir/.video_review.mp4`` (a
+    leading-dot sibling) and returns that. The dot prefix does double duty: the
+    upload enumerator's dotfile filter never ships it (R6) and its existence is
+    the idempotency gate (R7) — a second call performs no re-encode.
+
+    The re-encode uses ``libx264`` (deterministic cross-machine output,
+    guaranteed present in the bundle via ``_check_av_codecs``; videotoolbox is
+    deferred) and preserves the source's presentation timeline. That last point
+    is load-bearing: recordings are action-gated (variable frame rate with idle
+    gaps), so the source frame PTS — not the stream's misleading ``average_rate``
+    — define the timeline the review window overlays events on. Each decoded
+    frame's PTS flows through ``reformat`` and the encoder untouched; we never
+    set ``frame.pts = None`` (which collapses a VFR recording to a few seconds)
+    and never override ``packet.pts`` after encode (the documented PTS-corruption
+    bug — see docs/solutions/bug-fixes/video-pts-offset-bframe-corruption-20260322.md).
+    ``bf=0`` keeps ``PTS == DTS``.
+
+    Args:
+        rec_dir: Recording directory containing ``video.mp4``.
+
+    Returns:
+        ``(path, remediated)`` — the playable path and whether a re-encode was
+        performed (or a prior one is being reused).
+
+    Raises:
+        RuntimeError: If PyAV cannot open/decode the source — a genuine
+            "can't process this video" signal (feeds R9 at the command boundary).
+    """
+    rec_dir = Path(rec_dir)
+    video_path = rec_dir / "video.mp4"
+    review_path = rec_dir / ".video_review.mp4"
+
+    if not needs_pixfmt_remediation(read_pixel_format(video_path)):
+        return video_path, False
+    if review_path.exists():
+        return review_path, True  # idempotent: a prior re-encode is reused
+
+    tmp_path = rec_dir / f".video_review.mp4.{os.getpid()}.tmp"
+    tmp_path.unlink(missing_ok=True)
+
+    try:
+        inp = av.open(str(video_path))
+    except Exception as exc:
+        raise RuntimeError(
+            f"Cannot open video for review remediation: {video_path}: {exc}"
+        ) from exc
+
+    output = None
+    try:
+        in_stream = inp.streams.video[0]
+        output = av.open(str(tmp_path), mode="w", format="mp4")
+        # libx264 explicitly (not config.VIDEO_ENCODING) — the review copy must
+        # be deterministic across machines regardless of the recorder's encoder.
+        out_stream = output.add_stream("libx264")
+        out_stream.width = in_stream.width
+        out_stream.height = in_stream.height
+        out_stream.pix_fmt = "yuv420p"
+        # Preserve the source stream timebase so frame PTS map straight through.
+        out_stream.codec_context.time_base = in_stream.time_base
+        out_stream.options = {
+            "crf": str(config.VIDEO_CRF),
+            "preset": config.VIDEO_PRESET,
+            "g": str(config.VIDEO_GOP_SIZE),
+            "bf": "0",
+        }
+
+        for frame in inp.decode(in_stream):
+            # reformat carries the frame's pts + time_base through unchanged.
+            reformatted = frame.reformat(format="yuv420p")
+            for packet in out_stream.encode(reformatted):
+                output.mux(packet)
+        for packet in out_stream.encode():  # flush
+            output.mux(packet)
+
+        _close_container_in_thread(output)
+        output = None
+        inp.close()
+        os.replace(tmp_path, review_path)
+    except BaseException as exc:
+        if output is not None:
+            try:
+                _close_container_in_thread(output)
+            except Exception:
+                pass
+        try:
+            inp.close()
+        except Exception:
+            pass
+        tmp_path.unlink(missing_ok=True)
+        if isinstance(exc, Exception) and not isinstance(exc, RuntimeError):
+            raise RuntimeError(
+                f"Cannot re-encode video for review: {video_path}: {exc}"
+            ) from exc
+        raise
+
+    return review_path, True

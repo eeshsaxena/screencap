@@ -235,6 +235,35 @@ def test_recording_info_namedtuple_asdict_includes_new_fields(recordings_dir):
     assert d["duration_seconds"] is not None
 
 
+# --- U3 catalog guard: hidden review artifact must not mask stub detection ---
+
+
+def test_lingering_review_artifact_does_not_mask_stub(recordings_dir):
+    """An uploaded recording with only a hidden .video_review.mp4 is still a stub.
+
+    pathlib glob("*.mp4") matches dotfiles, so without the guard the review
+    artifact would count as media and hide a post-upload stub (R6).
+    """
+    d = _make_recording(recordings_dir, "stub-rec", duration=30)
+    (d / ".upload_status.json").write_text("{}")  # mark uploaded
+    (d / ".video_review.mp4").write_bytes(b"fake review video")  # lingering artifact
+
+    info = list_recordings(recordings_dir)[0]
+    assert info.uploaded is True
+    assert info.is_stub is True
+
+
+def test_real_video_is_not_a_stub(recordings_dir):
+    """Control: a real (non-hidden) video.mp4 counts as media even when uploaded."""
+    d = _make_recording(recordings_dir, "live-rec", duration=30)
+    (d / ".upload_status.json").write_text("{}")
+    (d / "video.mp4").write_bytes(b"real video bytes")
+
+    info = list_recordings(recordings_dir)[0]
+    assert info.uploaded is True
+    assert info.is_stub is False
+
+
 # --- get_seen_bundle_ids tests ---
 
 
