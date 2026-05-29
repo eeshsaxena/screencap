@@ -238,6 +238,62 @@ final class ReviewWindowViewModelTests: XCTestCase {
         XCTAssertEqual(service.fakeProcess.terminateInvocations, 0)
     }
 
+    /// Todo #008 — `loadReviewData()` re-entry after a prep failure. The
+    /// retry path resets `.failed → .preparing` and re-runs the loader;
+    /// a successful second call must land on `.ready`. Without this
+    /// regression coverage, breaking the `if case .failed = state` guard
+    /// would silently leave the window stuck in `.failed` on the user's
+    /// retry attempt.
+    func testLoadReviewDataReentersFromFailedAndSucceeds() async {
+        let loader = FakeReviewDataLoader()
+        loader.nextError = FakeReviewLoadError.boom
+        let model = makeModel(loader: loader)
+
+        await model.loadReviewData()
+        if case .failed = model.state {
+            // pass
+        } else {
+            XCTFail("expected failed after first call, got \(model.state)")
+        }
+
+        // Second call: loader configured to succeed (default envelope).
+        await model.loadReviewData()
+        if case .ready = model.state {
+            // pass
+        } else {
+            XCTFail("expected ready after retry, got \(model.state)")
+        }
+        XCTAssertEqual(loader.loadCallCount, 2)
+    }
+
+    /// Todo #020 — envelope reports `ok: true` but a required field is
+    /// nil. Falls through the guard to `.failed("Failed to prepare
+    /// recording.")` because `envelope.error` is also nil. Distinct path
+    /// from the existing `ok: false` test.
+    func testOkTrueWithNilVideoPathLandsOnGenericFailure() async {
+        let loader = FakeReviewDataLoader()
+        loader.nextEnvelope = .init(
+            ok: true,
+            schemaVersion: 1,
+            videoPath: nil,
+            eventsPath: "/tmp/events.jsonl",
+            startedAt: 1700000000,
+            durationSeconds: 30,
+            videoPixfmtRemediated: false,
+            error: nil
+        )
+        let model = makeModel(loader: loader)
+
+        await model.loadReviewData()
+
+        if case .failed(let message, let retry) = model.state {
+            XCTAssertEqual(message, "Failed to prepare recording.")
+            XCTAssertNil(retry)
+        } else {
+            XCTFail("expected failed, got \(model.state)")
+        }
+    }
+
     /// Auto-close handle cancellation prevents the dismiss callback from
     /// firing after the user manually closed the window.
     func testWindowCloseBeforeAutoCloseFiresCancelsTheTimer() async {

@@ -189,8 +189,17 @@ struct ReviewWindow: View {
                         .controlSize(.small)
                 }
                 Spacer()
-                Button("Cancel") { dismiss() }
-                    .keyboardShortcut(.cancelAction)
+                Button("Cancel") {
+                    // Dispatch SIGTERM synchronously on the explicit Cancel
+                    // intent rather than deferring to onDisappear — the
+                    // teardown path still fires cancel() as a backstop, but
+                    // hitting it here means the kill goes out while the
+                    // window is still on screen and any kernel queueing for
+                    // the dismiss animation can't delay it.
+                    model.cancel()
+                    dismiss()
+                }
+                .keyboardShortcut(.cancelAction)
             }
             .padding(12)
         case .succeeded(let summary):

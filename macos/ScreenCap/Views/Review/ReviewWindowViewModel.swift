@@ -32,12 +32,15 @@ struct ReviewDataEnvelope: Decodable, Equatable {
 /// Resolved review-data fields the panes consume. Built from a successful
 /// envelope; absent fields fall back to safe defaults so the panes can
 /// still render something usable.
+///
+/// `videoPixfmtRemediated` lives on `ReviewDataEnvelope` only — it's part
+/// of the U2 JSON contract — and is not promoted onto this struct until a
+/// consumer (e.g. a visible "remediated for playback" indicator) needs it.
 struct ReviewData: Equatable {
     let videoURL: URL
     let eventsURL: URL
     let startedAt: Double
     let durationSeconds: Double
-    let videoPixfmtRemediated: Bool
 }
 
 /// Test seam over `CLIClient.runJSONRaw` so the review-data fetch can be
@@ -164,8 +167,7 @@ final class ReviewWindowViewModel: ObservableObject {
                 videoURL: URL(fileURLWithPath: videoPath),
                 eventsURL: URL(fileURLWithPath: eventsPath),
                 startedAt: startedAt,
-                durationSeconds: duration,
-                videoPixfmtRemediated: envelope.videoPixfmtRemediated ?? false
+                durationSeconds: duration
             )
             state = .ready(data)
         } catch {

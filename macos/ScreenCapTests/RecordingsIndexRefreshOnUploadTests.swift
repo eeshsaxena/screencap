@@ -59,38 +59,51 @@ final class RecordingsIndexRefreshOnUploadTests: XCTestCase {
     /// Repeated successes (multiple windows uploading distinct recordings)
     /// each post their own notification; the index handles each refresh
     /// independently. No coalescing required.
+    ///
+    /// Todo #016 — uses `XCTestExpectation` driven by `$isLoading`
+    /// transitions instead of the previous busy-wait. The earlier
+    /// 40×50ms sleep loop could exhaust its budget under CI load while
+    /// the first refresh was still finishing, fire the second
+    /// notification into the index's `!isLoading` guard, and flake.
+    /// Event-driven waits do not have that failure mode.
     func testMultipleSuccessNotificationsTriggerMultipleRefreshes() async {
         let index = RecordingsIndex(autoload: false)
-        var observedLoadingStarts = 0
+
+        // First refresh: start expectation fires the moment isLoading
+        // transitions to true; finish expectation fires when it
+        // transitions back to false.
+        let firstStarted = expectation(description: "first refresh started")
+        let firstFinished = expectation(description: "first refresh finished")
+        let secondStarted = expectation(description: "second refresh started")
+
+        // State machine: track which loading-edge to fulfill next so each
+        // expectation fires exactly once. `dropFirst` skips the initial
+        // false on the published property.
+        nonisolated(unsafe) var phase = 0
         let cancellable = index.$isLoading
             .dropFirst()
             .sink { isLoading in
-                if isLoading { observedLoadingStarts += 1 }
+                switch (phase, isLoading) {
+                case (0, true):
+                    phase = 1
+                    firstStarted.fulfill()
+                case (1, false):
+                    phase = 2
+                    firstFinished.fulfill()
+                case (2, true):
+                    phase = 3
+                    secondStarted.fulfill()
+                default:
+                    break
+                }
             }
 
         NotificationCenter.default.post(name: .reviewWindowUploadSucceeded, object: nil)
-        // Wait for the first refresh to begin and complete before posting
-        // again — the index's own `guard !isLoading else { return }` guard
-        // would coalesce overlapping calls, which is the right production
-        // behavior; this test just exercises sequential notifications.
-        for _ in 0..<20 {
-            if observedLoadingStarts >= 1 { break }
-            await Task.yield()
-        }
-        // Let the refresh complete (it'll fail-soft to empty since no CLI
-        // / daemon is reachable in test, but it'll still finish).
-        for _ in 0..<40 {
-            if index.isLoading == false { break }
-            try? await Task.sleep(nanoseconds: 50_000_000)
-        }
+        await fulfillment(of: [firstStarted, firstFinished], timeout: 2.0)
 
         NotificationCenter.default.post(name: .reviewWindowUploadSucceeded, object: nil)
-        for _ in 0..<20 {
-            if observedLoadingStarts >= 2 { break }
-            await Task.yield()
-        }
+        await fulfillment(of: [secondStarted], timeout: 2.0)
 
-        XCTAssertGreaterThanOrEqual(observedLoadingStarts, 2)
         cancellable.cancel()
     }
 }
