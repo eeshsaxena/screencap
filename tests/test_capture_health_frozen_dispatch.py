@@ -23,42 +23,10 @@ Origin plan: docs/plans/2026-05-29-002-feat-scr-76-capture-health-detection-plan
 
 from __future__ import annotations
 
-import ast
-import inspect
-import json
 import sys
-import textwrap
-from io import StringIO
 
 from screencap.engine import recorder
-
-_ALIVE = {"screen": True, "window": True, "action": True}
-
-
-def _capture_stderr(callable_):
-    buf = StringIO()
-    saved = sys.stderr
-    sys.stderr = buf
-    try:
-        callable_()
-    finally:
-        sys.stderr = saved
-    return [json.loads(line) for line in buf.getvalue().strip().splitlines() if line.strip()]
-
-
-def _referenced_names(fn) -> set[str]:
-    tree = ast.parse(textwrap.dedent(inspect.getsource(fn)))
-    names: set[str] = set()
-    for node in ast.walk(tree):
-        if isinstance(node, ast.Import):
-            names.update(a.name.split(".")[0] for a in node.names)
-        elif isinstance(node, ast.ImportFrom):
-            names.add((node.module or "").split(".")[0])
-        elif isinstance(node, ast.Name):
-            names.add(node.id)
-        elif isinstance(node, ast.Attribute):
-            names.add(node.attr)
-    return names
+from tests._capture_health_helpers import _ALIVE, _capture_stderr, _referenced_names
 
 
 def _run_ticks(tick_inputs, *, window_secs=10.0, debounce=3, probe=lambda r: None):

@@ -462,7 +462,10 @@ final class RecorderController: ObservableObject {
                 lastError = message
             case .clearError:
                 lastError = nil
-                captureAdvisory = nil
+                // captureAdvisory clearing is owned by the `state.didSet` idle
+                // chokepoint: it's only set during `.recording` and `.clearError`
+                // is only emitted by enterStarting() (from `.idle`, where the
+                // advisory was already cleared), so no clear is needed here.
             case .setMatrixDisclosure(let disclosure):
                 matrixDisclosure = disclosure
             case .refreshIndex:

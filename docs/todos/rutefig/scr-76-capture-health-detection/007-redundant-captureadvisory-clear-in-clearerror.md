@@ -1,8 +1,10 @@
 ---
 title: "Redundant captureAdvisory clear in .clearError — drop it or add a test seam"
-status: pending
+status: completed
 priority: low
 created: 2026-05-29
+completed: 2026-05-29
+resolution: "Chose option 1 — dropped the redundant clear at RecorderController.swift; advisory clearing is now solely owned by the state.didSet idle chokepoint (documented inline). Verified by testCaptureAdvisoryClearedWhenRecordingReturnsToIdle."
 source: code-review SCR-76 (testing + correctness + learnings; reclassified from safe_auto — untestable without a new seam)
 related_plans:
   - docs/plans/2026-05-29-002-feat-scr-76-capture-health-detection-plan.md

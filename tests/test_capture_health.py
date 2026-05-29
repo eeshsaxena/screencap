@@ -19,37 +19,15 @@ Origin plan: docs/plans/2026-05-29-002-feat-scr-76-capture-health-detection-plan
 
 from __future__ import annotations
 
-import ast
-import inspect
-import json
 import queue
 import sys
-import textwrap
 import threading
 import types
-from io import StringIO
 
 import pytest
 
 from screencap.engine import recorder
-
-
-def _referenced_names(fn) -> set[str]:
-    """Names a function's CODE references (imports, attributes, identifiers),
-    excluding string/docstring content — so structural guards check what the
-    code does, not what its prose mentions."""
-    tree = ast.parse(textwrap.dedent(inspect.getsource(fn)))
-    names: set[str] = set()
-    for node in ast.walk(tree):
-        if isinstance(node, ast.Import):
-            names.update(a.name.split(".")[0] for a in node.names)
-        elif isinstance(node, ast.ImportFrom):
-            names.add((node.module or "").split(".")[0])
-        elif isinstance(node, ast.Name):
-            names.add(node.id)
-        elif isinstance(node, ast.Attribute):
-            names.add(node.attr)
-    return names
+from tests._capture_health_helpers import _ALIVE, _capture_stderr, _referenced_names
 
 
 @pytest.fixture(autouse=True)
@@ -61,17 +39,6 @@ def _reset_health_state():
     yield
     recorder._capture_health_counts.clear()
     recorder._listener_handles.clear()
-
-
-def _capture_stderr(callable_):
-    buf = StringIO()
-    saved = sys.stderr
-    sys.stderr = buf
-    try:
-        callable_()
-    finally:
-        sys.stderr = saved
-    return [json.loads(line) for line in buf.getvalue().strip().splitlines() if line.strip()]
 
 
 # ---------------------------------------------------------------------------
@@ -218,9 +185,6 @@ class TestActionListenerAlive:
 # ---------------------------------------------------------------------------
 # U3 — pure per-tick verdict/debounce step (the primary behavioral assertion)
 # ---------------------------------------------------------------------------
-
-
-_ALIVE = {"screen": True, "window": True, "action": True}
 
 
 def _drive(ticks, *, action_alive=True, debounce=3, alive=None):

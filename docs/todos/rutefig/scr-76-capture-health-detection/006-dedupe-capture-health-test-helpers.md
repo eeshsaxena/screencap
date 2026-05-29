@@ -1,8 +1,9 @@
 ---
 title: "Dedupe capture-health test helpers across the two new test files"
-status: pending
+status: completed
 priority: low
 created: 2026-05-29
+completed: 2026-05-29
 source: code-review SCR-76 (maintainability finding, confidence 75)
 related_plans:
   - docs/plans/2026-05-29-002-feat-scr-76-capture-health-detection-plan.md
