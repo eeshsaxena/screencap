@@ -818,3 +818,140 @@ class ChunkedVideoWriter:
     def __exit__(self, exc_type, exc_val, exc_tb) -> None:
         """Context manager exit."""
         self.close()
+
+
+# =============================================================================
+# Review-Data Video Pipeline (in-process PyAV: concat / probe / remediate)
+#
+# These primitives back the native-review path so it never shells out to the
+# ffmpeg/ffprobe CLI binaries (which are not bundled and are unreachable from
+# the minimal GUI PATH a Finder-launched .app inherits). PyAV is already a hard
+# dependency and the same library the recorder writes video with.
+# =============================================================================
+
+
+def _close_container_in_thread(container: av.container.Container) -> None:
+    """Close a PyAV container off the main thread to dodge a GIL deadlock.
+
+    Mirrors ``VideoWriter.close`` / ``finalize_video_writer``: closing in the
+    calling thread can hang indefinitely (PyAV issue #1053), so close in a
+    worker and join with a 15s budget.
+    """
+    def _close() -> None:
+        container.close()
+
+    close_thread = threading.Thread(target=_close)
+    close_thread.start()
+    close_thread.join(timeout=15)
+    if close_thread.is_alive():
+        logger.warning("container close thread did not finish in 15s, continuing")
+
+
+def concat_video_chunks(rec_dir: str | Path) -> Path:
+    """Concatenate ``chunk_*.mp4`` into a single ``rec_dir/video.mp4`` via PyAV.
+
+    In-process stream-copy remux (no re-encode) — fast, lossless, and pixel
+    format preserving (the gated yuv420p conversion is a separate step in
+    :func:`remediate_pixfmt_for_review`). Replaces the old ``ffmpeg -f concat``
+    subprocess so the merge works with nothing installed on PATH.
+
+    The chunks are written by ``ChunkedVideoWriter`` with ``bf=0`` (no
+    B-frames), so within each chunk ``PTS == DTS`` and timestamps are monotonic
+    from ~0. To stitch them, each subsequent chunk's packet timestamps are
+    offset by the cumulative duration of all preceding chunks, preserving a
+    single monotonic timeline that starts at ~0. That timeline is load-bearing:
+    ``engine/capture.py:get_frame_at`` maps a wall-clock timestamp to a
+    video-relative frame, so an accumulated offset error would extract the
+    wrong screenshot.
+
+    The output is a plain (non-fragmented) MP4 with the moov atom at the end —
+    **not** faststart. ``extract_frames``/``extract_frame`` consume this file
+    and moov relocation is documented to break them (see ``finalize_video_writer``).
+
+    The write is atomic: packets are muxed into a temp sibling that is
+    ``os.replace``\\d onto ``video.mp4`` only on success, so a present
+    ``video.mp4`` is always complete (closes the truncated-read window when a
+    ``view`` + ``review-data`` race has two callers concat the same recording).
+
+    Args:
+        rec_dir: Recording directory containing the ``chunk_*.mp4`` files.
+
+    Returns:
+        Path to the merged ``rec_dir/video.mp4``.
+
+    Raises:
+        ValueError: If no ``chunk_*.mp4`` files are present.
+        RuntimeError: If a chunk cannot be opened/decoded by PyAV — fail loud
+            rather than silently emit a truncated video.
+    """
+    rec_dir = Path(rec_dir)
+    chunks = sorted(rec_dir.glob("chunk_*.mp4"))
+    if not chunks:
+        raise ValueError(f"No chunk_*.mp4 files to concatenate in {rec_dir}")
+
+    out_path = rec_dir / "video.mp4"
+    # Dot-prefixed temp sibling: excluded from upload (dotfile filter) and from
+    # catalog's ``*.mp4`` glob, so a lingering temp can never pollute either.
+    tmp_path = rec_dir / f".video.mp4.{os.getpid()}.tmp"
+    tmp_path.unlink(missing_ok=True)
+
+    output = av.open(str(tmp_path), mode="w", format="mp4")
+    try:
+        out_stream = None
+        # Cumulative offset in the (shared) input stream time_base. All chunks
+        # come from the same recorder config, so their time_bases match and
+        # ``add_stream_from_template`` gives the output that same time_base.
+        offset = 0
+        for chunk in chunks:
+            try:
+                inp = av.open(str(chunk))
+            except Exception as exc:  # corrupt/undecodable chunk — fail loud
+                raise RuntimeError(
+                    f"Cannot open video chunk for concat: {chunk.name}: {exc}"
+                ) from exc
+            try:
+                in_stream = inp.streams.video[0]
+                if out_stream is None:
+                    # add_stream_from_template replaces the removed
+                    # add_stream(template=...) API (PyAV 14+).
+                    out_stream = output.add_stream_from_template(in_stream)
+                # Estimate a fallback frame duration for packets missing one,
+                # so the next chunk's offset never overlaps the last frame.
+                rate = in_stream.average_rate
+                fallback_dur = (
+                    int(round(1 / (float(rate) * float(in_stream.time_base))))
+                    if rate
+                    else 1
+                )
+                chunk_end = 0
+                for packet in inp.demux(in_stream):
+                    # Flush packets carry no timestamps — skip them.
+                    if packet.dts is None or packet.pts is None:
+                        continue
+                    orig_pts = packet.pts
+                    dur = packet.duration or fallback_dur
+                    packet.pts = orig_pts + offset
+                    packet.dts = packet.dts + offset
+                    # Reassigning the stream rescales timestamps into the
+                    # output time_base (a no-op here, since they match).
+                    packet.stream = out_stream
+                    output.mux(packet)
+                    end = orig_pts + dur
+                    if end > chunk_end:
+                        chunk_end = end
+                offset += chunk_end
+            finally:
+                inp.close()
+        _close_container_in_thread(output)
+        output = None
+        os.replace(tmp_path, out_path)
+    except BaseException:
+        if output is not None:
+            try:
+                _close_container_in_thread(output)
+            except Exception:
+                pass
+        tmp_path.unlink(missing_ok=True)
+        raise
+
+    return out_path

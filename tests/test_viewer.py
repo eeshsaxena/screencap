@@ -2,11 +2,66 @@
 
 from __future__ import annotations
 
+import time
+from pathlib import Path
 from unittest import mock
 
+import av
 import pytest
+from PIL import Image
 
-from screencap.viewer import _needs_regeneration
+from screencap.engine.video import VideoWriter
+from screencap.viewer import _ensure_single_video, _needs_regeneration
+
+
+def _write_chunk(path: Path, color: tuple[int, int, int], n_frames: int = 4) -> None:
+    """Write a tiny solid-color chunk via VideoWriter (mirrors the recorder)."""
+    base = time.time()
+    writer = VideoWriter(str(path), width=48, height=48, fps=24)
+    for i in range(n_frames):
+        writer.write_frame(Image.new("RGB", (48, 48), color=color), base + i / 24)
+    writer.close()
+
+
+class TestEnsureSingleVideo:
+    """Tests for _ensure_single_video orchestration (U1)."""
+
+    def test_no_chunks_is_noop(self, tmp_path):
+        _ensure_single_video(tmp_path)
+        assert not (tmp_path / "video.mp4").exists()
+
+    def test_existing_video_is_noop(self, tmp_path):
+        """Idempotent: a present video.mp4 is never overwritten."""
+        _write_chunk(tmp_path / "chunk_0000.mp4", (200, 0, 0))
+        _write_chunk(tmp_path / "chunk_0001.mp4", (0, 0, 200))
+        sentinel = tmp_path / "video.mp4"
+        sentinel.write_bytes(b"already here")
+
+        _ensure_single_video(tmp_path)
+        assert sentinel.read_bytes() == b"already here"
+
+    def test_single_chunk_symlinks(self, tmp_path):
+        """A lone chunk is symlinked, not re-muxed."""
+        _write_chunk(tmp_path / "chunk_0000.mp4", (200, 0, 0))
+        _ensure_single_video(tmp_path)
+        video = tmp_path / "video.mp4"
+        assert video.is_symlink()
+        assert video.resolve() == (tmp_path / "chunk_0000.mp4").resolve()
+
+    def test_multi_chunk_concats_without_ffmpeg(self, tmp_path, monkeypatch):
+        """2+ chunks merge in-process even with no ffmpeg/ffprobe on PATH (R5)."""
+        monkeypatch.setenv("PATH", "")
+        _write_chunk(tmp_path / "chunk_0000.mp4", (200, 0, 0))
+        _write_chunk(tmp_path / "chunk_0001.mp4", (0, 0, 200))
+
+        _ensure_single_video(tmp_path)
+
+        video = tmp_path / "video.mp4"
+        assert video.is_file() and not video.is_symlink()
+        container = av.open(str(video))
+        frames = sum(1 for _ in container.decode(video=0))
+        container.close()
+        assert frames > 0
 
 
 class TestNeedsRegeneration:

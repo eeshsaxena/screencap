@@ -3,13 +3,12 @@
 from __future__ import annotations
 
 import subprocess
-import tempfile
 from pathlib import Path
 
 from rich.console import Console
 
 from screencap.catalog import find_db
-from screencap.config import get_recordings_dir, resolve_recording_dir
+from screencap.config import resolve_recording_dir
 
 console = Console()
 
@@ -19,11 +18,17 @@ _MAX_VIEWER_SIZE_BYTES = 200_000_000  # 200 MB
 
 
 def _ensure_single_video(rec_dir: Path) -> None:
-    """If only chunked videos exist, concatenate them into a temp video.mp4.
+    """If only chunked videos exist, concatenate them into ``rec_dir/video.mp4``.
 
-    Uses ffmpeg concat demuxer (stream copy, no re-encode). The merged
-    file is placed in a temp directory (not in recording dir) to avoid
-    polluting uploads.
+    Uses the in-process PyAV concat (stream copy, no re-encode) so the merge
+    works with nothing installed on PATH — a Finder/Launchpad-launched ``.app``
+    gets the minimal GUI PATH and cannot reach a ``brew``-installed ffmpeg.
+    The merged file lives at ``rec_dir/video.mp4`` because many consumers depend
+    on that location (``screencap upload`` ships it, the HTML viewer renders it,
+    ``catalog`` uses it for stub detection, ``capture``/``recorder`` read it).
+
+    Idempotent: early-returns if ``video.mp4`` already exists. A single chunk is
+    symlinked rather than re-muxed.
     """
     chunks = sorted(rec_dir.glob("chunk_*.mp4"))
     if not chunks:
@@ -42,37 +47,12 @@ def _ensure_single_video(rec_dir: Path) -> None:
 
     console.print(f"[dim]Concatenating {len(chunks)} video chunks for viewer...[/dim]")
     try:
-        # Write concat file list
-        concat_list = tempfile.NamedTemporaryFile(
-            mode="w", suffix=".txt", delete=False, prefix="screencap_concat_",
-        )
-        for chunk in chunks:
-            concat_list.write(f"file '{chunk}'\n")
-        concat_list.close()
+        from screencap.engine.video import concat_video_chunks
 
-        # Use ffmpeg concat demuxer (stream copy)
-        out_path = rec_dir / "video.mp4"
-        result = subprocess.run(
-            [
-                "ffmpeg", "-y", "-f", "concat", "-safe", "0",
-                "-i", concat_list.name,
-                "-c", "copy", str(out_path),
-            ],
-            capture_output=True, text=True, timeout=300,
-        )
-        if result.returncode != 0:
-            console.print(f"[yellow]Warning:[/yellow] ffmpeg concat failed: {result.stderr[:200]}")
-        else:
-            console.print(f"[dim]Created merged video ({len(chunks)} chunks)[/dim]")
-    except FileNotFoundError:
-        console.print("[yellow]Warning:[/yellow] ffmpeg not found — cannot merge video chunks for viewer")
+        concat_video_chunks(rec_dir)
+        console.print(f"[dim]Created merged video ({len(chunks)} chunks)[/dim]")
     except Exception as e:
         console.print(f"[yellow]Warning:[/yellow] Video merge failed: {e}")
-    finally:
-        try:
-            Path(concat_list.name).unlink(missing_ok=True)
-        except Exception:
-            pass
 
 
 def _needs_regeneration(viewer: Path, regenerate: bool) -> bool:

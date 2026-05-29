@@ -1,6 +1,7 @@
 """Tests for video module."""
 
 import time
+from pathlib import Path
 
 import av
 import pytest
@@ -10,9 +11,43 @@ from screencap.engine import utils
 from screencap.engine.video import (
     ChunkedVideoWriter,
     VideoWriter,
+    concat_video_chunks,
+    extract_frame,
     initialize_video_writer,
     write_video_frame,
 )
+
+
+def _write_chunk(
+    path: Path,
+    color: tuple[int, int, int],
+    n_frames: int = 5,
+    fps: int = 24,
+    size: int = 64,
+) -> int:
+    """Write a solid-color chunk via VideoWriter (yuv444p, bf=0, like the recorder).
+
+    Returns the number of frames actually decodable from the written file
+    (VideoWriter.close adds a trailing key frame, so this is >= n_frames).
+    """
+    base = time.time()
+    writer = VideoWriter(str(path), width=size, height=size, fps=fps)
+    for i in range(n_frames):
+        writer.write_frame(Image.new("RGB", (size, size), color=color), base + i / fps)
+    writer.close()
+
+    container = av.open(str(path))
+    try:
+        count = sum(1 for _ in container.decode(video=0))
+    finally:
+        container.close()
+    return count
+
+
+def _dominant_channel(img: "Image.Image") -> str:
+    """Return 'R', 'G', or 'B' for the largest channel at the image center."""
+    r, g, b = img.convert("RGB").getpixel((img.width // 2, img.height // 2))[:3]
+    return "RGB"[max(range(3), key=[r, g, b].__getitem__)]
 
 
 @pytest.fixture(autouse=True)
@@ -422,3 +457,114 @@ class TestChunkedVideoWriterRotation:
         frames = list(container.decode(video=0))
         container.close()
         assert len(frames) > 0, "Chunk 1 has no frames after rotation recovery"
+
+
+class TestConcatVideoChunks:
+    """Tests for the in-process PyAV chunk concat (U1, R1/R2/R5)."""
+
+    def test_concat_frame_count_and_monotonic_pts(self, tmp_path):
+        """2 chunks → one video.mp4; frame count is the sum, PTS monotonic from ~0."""
+        n0 = _write_chunk(tmp_path / "chunk_0000.mp4", (220, 0, 0))
+        n1 = _write_chunk(tmp_path / "chunk_0001.mp4", (0, 0, 220))
+
+        out = concat_video_chunks(tmp_path)
+        assert out == tmp_path / "video.mp4"
+        assert out.exists()
+
+        container = av.open(str(out))
+        stream = container.streams.video[0]
+        pts_sec = [float(f.pts * stream.time_base) for f in container.decode(stream)]
+        container.close()
+
+        assert len(pts_sec) == n0 + n1, (
+            f"merged has {len(pts_sec)} frames, expected {n0 + n1}"
+        )
+        assert pts_sec[0] < 0.5, f"first PTS {pts_sec[0]:.3f}s should start near 0"
+        for i in range(1, len(pts_sec)):
+            assert pts_sec[i] > pts_sec[i - 1], (
+                f"PTS not monotonic at {i}: {pts_sec[i-1]} >= {pts_sec[i]}"
+            )
+
+    def test_concat_is_seekable_past_boundary(self, tmp_path):
+        """Decoding past the first chunk boundary returns a frame (continuity holds)."""
+        _write_chunk(tmp_path / "chunk_0000.mp4", (220, 0, 0))
+        _write_chunk(tmp_path / "chunk_0001.mp4", (0, 0, 220))
+        boundary = float(get_chunk_duration(tmp_path / "chunk_0000.mp4"))
+
+        out = concat_video_chunks(tmp_path)
+        # A frame must exist strictly past the first chunk's span.
+        container = av.open(str(out))
+        stream = container.streams.video[0]
+        past = [
+            f for f in container.decode(stream)
+            if float(f.pts * stream.time_base) > boundary
+        ]
+        container.close()
+        assert past, "no frame decoded past the first-chunk boundary"
+
+    def test_concat_timestamp_to_frame_mapping(self, tmp_path):
+        """extract_frame just after the boundary returns content from the 2nd chunk.
+
+        Guards capture.py:get_frame_at — the merged timeline must match the
+        summed chunk durations so a wall-clock timestamp maps to the right frame.
+        """
+        _write_chunk(tmp_path / "chunk_0000.mp4", (220, 0, 0))  # red
+        _write_chunk(tmp_path / "chunk_0001.mp4", (0, 0, 220))  # blue
+        boundary = float(get_chunk_duration(tmp_path / "chunk_0000.mp4"))
+
+        out = concat_video_chunks(tmp_path)
+
+        # Before the boundary → red (first chunk); after → blue (second chunk).
+        before = extract_frame(out, max(boundary - 0.05, 0.0), tolerance=0.2)
+        after = extract_frame(out, boundary + 0.05, tolerance=0.2)
+        assert _dominant_channel(before) == "R", "pre-boundary frame should be red"
+        assert _dominant_channel(after) == "B", "post-boundary frame should be blue"
+
+    def test_concat_raises_without_chunks(self, tmp_path):
+        """No chunk_*.mp4 → ValueError (caller is expected to pre-check)."""
+        with pytest.raises(ValueError, match="No chunk"):
+            concat_video_chunks(tmp_path)
+
+    def test_concat_raises_on_corrupt_chunk(self, tmp_path):
+        """A chunk PyAV cannot open → RuntimeError, not a silent truncated output."""
+        _write_chunk(tmp_path / "chunk_0000.mp4", (220, 0, 0))
+        (tmp_path / "chunk_0001.mp4").write_bytes(b"not a valid mp4 file")
+
+        with pytest.raises(RuntimeError, match="chunk_0001"):
+            concat_video_chunks(tmp_path)
+        # Fail-loud: no partial video.mp4 and no temp residue left behind.
+        assert not (tmp_path / "video.mp4").exists()
+        assert not list(tmp_path.glob(".video.mp4.*.tmp"))
+
+    def test_concat_no_temp_residue_on_success(self, tmp_path):
+        """A successful concat leaves no .tmp sibling behind."""
+        _write_chunk(tmp_path / "chunk_0000.mp4", (220, 0, 0))
+        _write_chunk(tmp_path / "chunk_0001.mp4", (0, 0, 220))
+        concat_video_chunks(tmp_path)
+        assert not list(tmp_path.glob(".video.mp4.*.tmp"))
+
+    def test_concat_does_not_spawn_subprocess(self, tmp_path, monkeypatch):
+        """Concat is fully in-process — it must not shell out (R1/R5)."""
+        import subprocess
+
+        def _fail(*a, **k):  # pragma: no cover - only runs on regression
+            raise AssertionError("concat must not spawn a subprocess")
+
+        monkeypatch.setattr(subprocess, "run", _fail)
+        monkeypatch.setattr(subprocess, "Popen", _fail)
+
+        _write_chunk(tmp_path / "chunk_0000.mp4", (220, 0, 0))
+        _write_chunk(tmp_path / "chunk_0001.mp4", (0, 0, 220))
+        out = concat_video_chunks(tmp_path)
+        assert out.exists()
+
+
+def get_chunk_duration(path: Path) -> float:
+    """Max decoded PTS (seconds) in a chunk — its on-screen span."""
+    container = av.open(str(path))
+    stream = container.streams.video[0]
+    last = 0.0
+    for frame in container.decode(stream):
+        last = max(last, float(frame.pts * stream.time_base))
+    container.close()
+    return last
