@@ -208,11 +208,16 @@ final class FakeSpawnedProcessHandle: SpawnedProcessHandle {
     var processIdentifier: Int32
     private let forceKillReturnValue: Bool
     private(set) var forceKillInvocations = 0
+    private(set) var terminateInvocations = 0
 
     init(isRunning: Bool, pid: Int32, forceKillReturnValue: Bool) {
         self.isRunning = isRunning
         self.processIdentifier = pid
         self.forceKillReturnValue = forceKillReturnValue
+    }
+
+    func terminate() {
+        terminateInvocations += 1
     }
 
     func forceKill() -> Bool {

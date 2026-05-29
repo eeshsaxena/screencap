@@ -55,6 +55,27 @@ struct ScreenCapApp: App {
             CommandGroup(replacing: .newItem) {}
         }
 
+        // Per-recording review window scene (plan U3). `WindowGroup` —
+        // multi-window by contract — gives R3's "multiple concurrent windows"
+        // behavior, distinct from the main scene's singleton `Window`. The
+        // payload type pins the scene's value to the recording name so
+        // `openWindow(id: ReviewWindowID, value: name)` materializes a fresh
+        // window scoped to that recording. SCR-55 documents the
+        // WindowGroup-vs-Window distinction.
+        WindowGroup("Review", id: ReviewWindowID, for: String.self) { $recordingName in
+            // The optional unwrap defends against the system rehydrating a
+            // window with a missing/corrupt value; surface a benign placeholder
+            // rather than crashing.
+            if let name = recordingName {
+                ReviewWindow(recordingName: name)
+                    .environmentObject(index)
+            } else {
+                Text("Review window not available.")
+                    .padding()
+            }
+        }
+        .windowResizability(.contentSize)
+
         MenuBarExtra {
             MenuBarMenu()
                 .environmentObject(recorder)
@@ -114,6 +135,9 @@ private struct MenuBarLabel: View {
 /// Captures `openWindow` for `AppDelegate.applicationShouldHandleReopen`; see
 /// `WindowOpener` / SCR-55. Lives inside the main `Window` body so it runs
 /// whenever the window is materialized (including after teardown).
+/// Also registers the `ReviewWindowOpener` seam (plan U3) so non-SwiftUI
+/// contexts (and unit tests) can dispatch into the per-recording review
+/// `WindowGroup` without an `@Environment(\.openWindow)` reference.
 private struct OpenWindowBridge: View {
     @Environment(\.openWindow) private var openWindow
 
@@ -122,6 +146,9 @@ private struct OpenWindowBridge: View {
             .frame(width: 0, height: 0)
             .onAppear {
                 WindowOpener.shared.openMain = { openWindow(id: MainWindowID) }
+                ReviewWindowOpener.shared.openReview = { name in
+                    openWindow(id: ReviewWindowID, value: name)
+                }
             }
     }
 }

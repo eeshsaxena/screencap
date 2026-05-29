@@ -93,4 +93,13 @@ struct RecordingSummary: Decodable, Identifiable, Hashable {
     static func newestFirst(_ a: RecordingSummary, _ b: RecordingSummary) -> Bool {
         (a.startedAt ?? 0) > (b.startedAt ?? 0)
     }
+
+    /// Plan R2 eligibility predicate (U4): a recording can be uploaded from
+    /// the review window only when it has not already been uploaded and is
+    /// not a stub (uploaded + locally-deleted). Keeps the rule colocated with
+    /// the model so the row view and any other future consumer share one
+    /// source of truth.
+    var isUploadEligible: Bool {
+        !uploaded && !isStub
+    }
 }

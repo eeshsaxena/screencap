@@ -13,9 +13,30 @@ final class RecordingsIndex: ObservableObject {
     @Published private(set) var isLoading: Bool = false
     @Published private(set) var lastError: String?
 
+    private var uploadSucceededObserver: NSObjectProtocol?
+
     init(autoload: Bool = true) {
         if autoload {
             Task { await refresh() }
+        }
+        // Plan U9: refresh after a successful upload from any review window
+        // so the source row's `isUploadEligible` predicate flips off
+        // `uploaded` and the Upload button disappears on the next render.
+        // ReviewWindow posts this notification via LiveReviewWindowEffects.
+        uploadSucceededObserver = NotificationCenter.default.addObserver(
+            forName: .reviewWindowUploadSucceeded,
+            object: nil,
+            queue: .main
+        ) { [weak self] _ in
+            Task { @MainActor [weak self] in
+                await self?.refresh()
+            }
+        }
+    }
+
+    deinit {
+        if let uploadSucceededObserver {
+            NotificationCenter.default.removeObserver(uploadSucceededObserver)
         }
     }
 
