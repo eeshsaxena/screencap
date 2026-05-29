@@ -1712,14 +1712,17 @@ def review_data_cmd(name, as_json):
     """Prepare a recording for native review and emit a JSON envelope.
 
     Called by the SwiftUI shell's review window when the operator clicks
-    Upload on a row. Runs ffmpeg concat for chunked recordings,
-    re-encodes the video for AVKit compatibility if needed, and ensures
-    an events.jsonl exists. Returns paths the Swift side feeds into the
-    AVKit player and the timeline pane.
+    Upload on a row. Concatenates chunked recordings and re-encodes the
+    video for AVKit compatibility if needed — all in-process via PyAV, so
+    it works with no ffmpeg/ffprobe on PATH — and ensures an events.jsonl
+    exists. Returns paths the Swift side feeds into the AVKit player and
+    the timeline pane.
 
     The envelope shape matches `screencap list --json` and
     `screencap info --json`: ok + schema_version + payload, or
-    ok=false + error on failure.
+    ok=false + error on failure. A genuine undecodable source yields a
+    structural "can't process this video" error, never an "install
+    ffmpeg" message.
     """
     from screencap.review import REVIEW_SCHEMA_VERSION, ReviewPrepareError, prepare_review_data
 

@@ -12,12 +12,18 @@ from screencap.config import resolve_recording_dir
 
 console = Console()
 
+# Progress/diagnostic messages go to stderr so they never corrupt a JSON
+# payload on stdout. `_ensure_single_video` is shared with `screencap
+# review-data --json`, whose only stdout output is the JSON envelope the
+# SwiftUI shell parses; concat progress on stdout would make that unparseable.
+err_console = Console(stderr=True)
+
 # Viewer files above this size are assumed to be pre-fix cached files
 # that should be auto-regenerated with caps.
 _MAX_VIEWER_SIZE_BYTES = 200_000_000  # 200 MB
 
 
-def _ensure_single_video(rec_dir: Path) -> None:
+def _ensure_single_video(rec_dir: Path, *, fail_loud: bool = False) -> None:
     """If only chunked videos exist, concatenate them into ``rec_dir/video.mp4``.
 
     Uses the in-process PyAV concat (stream copy, no re-encode) so the merge
@@ -29,6 +35,13 @@ def _ensure_single_video(rec_dir: Path) -> None:
 
     Idempotent: early-returns if ``video.mp4`` already exists. A single chunk is
     symlinked rather than re-muxed.
+
+    ``fail_loud`` selects the concat-failure posture. The default (``False``) is
+    the HTML viewer's best-effort path: a merge failure warns and continues so
+    ``screencap view`` still opens. The ``review-data`` command (U4) passes
+    ``True`` to propagate ``concat_video_chunks``'s error, which it translates
+    into the R9 "can't process this video" envelope — it needs correctness, not
+    graceful degradation.
     """
     chunks = sorted(rec_dir.glob("chunk_*.mp4"))
     if not chunks:
@@ -45,20 +58,16 @@ def _ensure_single_video(rec_dir: Path) -> None:
             pass
         return
 
-    console.print(f"[dim]Concatenating {len(chunks)} video chunks for viewer...[/dim]")
+    err_console.print(f"[dim]Concatenating {len(chunks)} video chunks for viewer...[/dim]")
     try:
         from screencap.engine.video import concat_video_chunks
 
         concat_video_chunks(rec_dir)
-        console.print(f"[dim]Created merged video ({len(chunks)} chunks)[/dim]")
+        err_console.print(f"[dim]Created merged video ({len(chunks)} chunks)[/dim]")
     except Exception as e:
-        # Deliberate: `screencap view` (the HTML viewer) is best-effort, so a
-        # merge failure warns and continues rather than aborting. The fail-loud
-        # "can't process this video" guarantee (R9) lives in concat_video_chunks
-        # for callers that need correctness — the review-data command (U4). Do
-        # not turn this into a raise without preserving the viewer's graceful
-        # degradation.
-        console.print(f"[yellow]Warning:[/yellow] Video merge failed: {e}")
+        if fail_loud:
+            raise
+        err_console.print(f"[yellow]Warning:[/yellow] Video merge failed: {e}")
 
 
 def _needs_regeneration(viewer: Path, regenerate: bool) -> bool:

@@ -1123,10 +1123,15 @@ def remediate_pixfmt_for_review(rec_dir: str | Path) -> tuple[Path, bool]:
     video_path = rec_dir / "video.mp4"
     review_path = rec_dir / ".video_review.mp4"
 
+    # Idempotency fast path first: a prior re-encode short-circuits before we
+    # re-open the source to probe it. A present `.video_review.mp4` only exists
+    # because the source was already found to need remediation, and a finished
+    # recording's `video.mp4` never changes — so reusing it is exact, and skips
+    # a wasted `av.open` on every repeat `review-data` call for the recording.
+    if review_path.exists():
+        return review_path, True
     if not needs_pixfmt_remediation(read_pixel_format(video_path)):
         return video_path, False
-    if review_path.exists():
-        return review_path, True  # idempotent: a prior re-encode is reused
 
     # pid + uuid keeps the temp unique per call (no same-process clobber when
     # this runs in a threaded/daemon context); sweep reclaims orphans from
