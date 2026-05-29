@@ -61,6 +61,7 @@ struct RecordingStateMachine {
         case setMatrixDisclosure(PrivacyMatrixDisclosure)
         case refreshIndex
         case handlePermissionLost(permission: String?)
+        case handleCaptureUnhealthy(reason: String?, reader: String?)
     }
 
     private(set) var state: RecordingState = .idle
@@ -207,6 +208,13 @@ struct RecordingStateMachine {
 
         case "permission_lost":
             return [.handlePermissionLost(permission: event.permission)]
+
+        case "capture_unhealthy":
+            // Advisory, NON-terminal (SCR-76). The controller surfaces a
+            // distinct, non-blocking hint and does NOT stop the recording —
+            // the cause is non-TCC or could not be attributed. (A TCC denial
+            // the engine could attribute arrives as `permission_lost` instead.)
+            return [.handleCaptureUnhealthy(reason: event.reason, reader: event.reader)]
 
         case "disk_full":
             return [.surfaceError("Disk is full — recording stopped.")]

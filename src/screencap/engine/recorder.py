@@ -1304,6 +1304,11 @@ def trigger_action_event(
     event = Event(utils.get_timestamp(), "action", action_event_args)
     action_name = action_event_args.get("name", "")
 
+    # Capture-health (SCR-76): the action reader produced an event. Count it
+    # before the enqueue branch — a queue.Full drop still counts as output
+    # (the reader IS alive and producing; the drop is downstream backpressure).
+    _health_incr("action.output")
+
     if action_name == "move":
         try:
             event_q.put_nowait(event)
@@ -1495,12 +1500,19 @@ def read_screen_events(
     started = False
     _geom_slow_count = 0
     while not terminate_processing.is_set():
+        # Capture-health (SCR-76): count every attempt before the capture
+        # call; count output only for a non-None frame. A None/exception is
+        # the only robust "screen reader is broken" content signal — denial
+        # may yield a changing wallpaper frame, so frame content is NOT relied
+        # on (see _capture_health_step + plan Key Technical Decisions).
+        _health_incr("screen.attempt")
         t_start = time.perf_counter()
         screenshot = utils.take_screenshot()
         t_screenshot = time.perf_counter()
         if screenshot is None:
             logger.warning("Screenshot was None")
             continue
+        _health_incr("screen.output")
 
         # Capture window geometry immediately after screenshot for accurate bounds
         window_geometries = None
@@ -1573,10 +1585,16 @@ def read_window_events(
     prev_window_data = {}
     started = False
     while not terminate_processing.is_set():
+        # Capture-health (SCR-76): count every poll attempt; count output when
+        # the poll returns queryable data, BEFORE the change gate below — so a
+        # user sitting on one unchanged window stays healthy while an
+        # Accessibility-denied poll (falsy → continue) opens the gap.
+        _health_incr("window.attempt")
         window_data = window.get_active_window_data()
         if not window_data:
             time.sleep(poll_interval)
             continue
+        _health_incr("window.output")
 
         if not started:
             started_event.set()
@@ -1946,6 +1964,10 @@ def read_keyboard_events(
         on_release=partial(on_release, event_q),
     )
     keyboard_listener.start()
+    # Capture-health (SCR-76): publish the listener handle so record()'s
+    # supervisor can sample its liveness (_action_listener_alive). A missing
+    # handle is treated as alive (fail-open), so the start race is harmless.
+    _listener_handles["keyboard"] = keyboard_listener
 
     # NOTE: listener may not have actually started by now
     # TODO: handle race condition, e.g. by sending synthetic events from main thread
@@ -1980,6 +2002,9 @@ def read_mouse_events(
         on_scroll=partial(on_scroll, event_q),
     )
     mouse_listener.start()
+    # Capture-health (SCR-76): publish the listener handle for liveness
+    # sampling by record()'s supervisor (fail-open if absent).
+    _listener_handles["mouse"] = mouse_listener
 
     # NOTE: listener may not have actually started by now
     # TODO: handle race condition, e.g. by sending synthetic events from main thread
@@ -1993,6 +2018,247 @@ def read_mouse_events(
 # Python's GIL makes dict operations safe enough for counters (minor undercount
 # possible on truly concurrent increments, acceptable for observability data).
 _drop_counts: dict = {}
+
+# Capture-health detection (SCR-76) -----------------------------------------
+# Raw per-reader attempt/output counters, DISTINCT from the post-filter
+# num_*_events (which count action-gated DB commits, not raw reader output).
+# Written by the reader threads + the action trigger; snapshotted by record()'s
+# supervisor loop. Plain ints, GIL-safe (mirrors _drop_counts). Keys:
+#   screen.attempt / screen.output, window.attempt / window.output, action.output
+# Reset per recording in record().
+_capture_health_counts: dict = {}
+
+# Action-reader listener handles, published by the keyboard/mouse/gesture
+# readers after .start() so record()'s supervisor can sample their liveness.
+# A missing/None handle is treated as alive (fail-open), so the start race
+# never produces a false unhealthy verdict. Reset per recording in record().
+_listener_handles: dict = {}
+
+
+def _health_incr(key: str) -> None:
+    """Increment an in-process capture-health counter (SCR-76).
+
+    GIL-safe plain-dict increment, mirroring the ``_drop_counts`` pattern. A
+    minor undercount on truly concurrent increments is acceptable for this
+    observability signal.
+    """
+    _capture_health_counts[key] = _capture_health_counts.get(key, 0) + 1
+
+
+def _action_listener_alive() -> bool:
+    """Best-effort liveness for the callback-driven action readers (SCR-76).
+
+    Returns ``True`` (alive) unless EVERY published, sampleable listener handle
+    positively reports not-running. No handles yet, a ``None`` handle, or any
+    sampling error is treated as alive (fail-open), so the start race and
+    transient PyObjC hiccups never produce a false unhealthy verdict.
+
+    KNOWN LIMITATION (documented coverage gap, SCR-76 plan): a pynput
+    ``Listener.running`` stays ``True`` under TCC callback starvation (Input
+    Monitoring / Accessibility denied → zero callbacks delivered). This
+    heartbeat therefore catches a crashed/stopped listener on a live thread,
+    NOT a silently-starved one.
+    """
+    handles = list(_listener_handles.items())
+    if not handles:
+        return True  # nothing published yet — fail-open (start race)
+    saw_sample = False
+    for name, handle in handles:
+        if handle is None:
+            continue
+        try:
+            if name == "gesture":
+                import Quartz
+                running = bool(Quartz.CGEventTapIsEnabled(handle))
+            else:
+                running = bool(getattr(handle, "running"))
+        except Exception:
+            return True  # sampling error — fail-open
+        saw_sample = True
+        if running:
+            return True  # at least one action listener is alive
+    # Reached only when every sampled handle reported not-running.
+    return not saw_sample
+
+
+def _probe_tcc_denied(reader: str | None = None) -> str | None:
+    """In-process TCC attribution for an observed capture-health symptom (SCR-76).
+
+    Returns the ``permission`` label of the first permission that reports
+    DENIED — ``"screen_recording"`` / ``"input_monitoring"`` / ``"accessibility"``
+    — or ``None`` when attribution is inconclusive (Quartz/AX import or call
+    fails, or every permission reports granted, including a stale "granted"
+    from the per-process TCC cache).
+
+    Calls the Quartz / ApplicationServices primitives DIRECTLY rather than
+    ``DarwinPlatform.is_accessibility_enabled()``, whose ``osascript`` subprocess
+    fallback would block the 1s supervisor loop for up to 5s and reintroduce a
+    subprocess into the path this design keeps subprocess-free. Fail-open: any
+    error → ``None``; never raises.
+
+    The check ORDER is biased by which reader is unhealthy so the returned
+    label is the most likely cause when more than one permission is denied;
+    the unhealth verdict itself comes from the counter gap, not this labeller.
+    """
+    if sys.platform != "darwin":
+        return None
+    try:
+        import Quartz
+    except Exception:
+        return None
+
+    def _screen() -> str | None:
+        try:
+            return "screen_recording" if Quartz.CGPreflightScreenCaptureAccess() is False else None
+        except Exception:
+            return None
+
+    def _input() -> str | None:
+        try:
+            return "input_monitoring" if Quartz.CGPreflightListenEventAccess() is False else None
+        except Exception:
+            return None
+
+    def _ax() -> str | None:
+        try:
+            from ApplicationServices import (
+                AXIsProcessTrustedWithOptions,
+                kAXTrustedCheckOptionPrompt,
+            )
+            trusted = AXIsProcessTrustedWithOptions({kAXTrustedCheckOptionPrompt: False})
+            return "accessibility" if trusted is False else None
+        except Exception:
+            return None
+
+    order = {
+        "screen": (_screen, _input, _ax),
+        "window": (_ax, _screen, _input),
+        "action": (_input, _ax, _screen),
+    }.get(reader, (_screen, _input, _ax))
+    for check in order:
+        label = check()
+        if label is not None:
+            return label
+    return None
+
+
+def _capture_health_step(
+    prev: dict,
+    cur: dict,
+    alive: dict,
+    action_alive: bool,
+    debounce: int,
+    runs: dict,
+    emitted: dict,
+) -> list[str]:
+    """Advance per-reader capture-health debounce state by one supervisor tick.
+
+    Pure decision step (no I/O), unit-testable in isolation from the engine.
+    Verdict per reader:
+      - **screen / window**: unhealthy when the attempt delta > 0 and the
+        useful-output delta == 0 over the tick (attempting but producing
+        nothing useful).
+      - **action**: unhealthy when ``action_alive`` is ``False`` (callback
+        readers have no attempt site, so liveness comes from the heartbeat).
+
+    A reader that is not alive (``alive[reader]`` falsy or absent) is left to
+    the existing ``record.child_died`` path and its debounce state is reset, so
+    there is no double-emit. Mutates ``runs`` / ``emitted`` in place.
+
+    Returns the readers that crossed the unhealthy edge THIS tick (run length
+    reached ``debounce`` and not already emitted); the caller labels + emits
+    once per edge. ``emitted`` is cleared when a reader returns healthy, so a
+    recover-then-rebreak re-emits.
+    """
+    edges: list[str] = []
+    for reader in ("screen", "window", "action"):
+        if not alive.get(reader):
+            runs[reader] = 0
+            emitted[reader] = False
+            continue
+        if reader == "action":
+            unhealthy = not action_alive
+        else:
+            attempt = cur.get(f"{reader}.attempt", 0) - prev.get(f"{reader}.attempt", 0)
+            output = cur.get(f"{reader}.output", 0) - prev.get(f"{reader}.output", 0)
+            unhealthy = attempt > 0 and output == 0
+        if unhealthy:
+            runs[reader] = runs.get(reader, 0) + 1
+            if runs[reader] >= debounce and not emitted.get(reader):
+                emitted[reader] = True
+                edges.append(reader)
+        else:
+            runs[reader] = 0
+            emitted[reader] = False
+    return edges
+
+
+def _emit_capture_health_event(
+    reader: str, label: str | None, elapsed: float, emit: Callable[..., None]
+) -> str:
+    """Emit the right stderr event for a capture-health edge (SCR-76).
+
+    A TCC ``label`` reuses the existing terminal-capable ``permission_lost``
+    (so the shell's deny path is preserved unchanged); ``None`` (non-TCC /
+    inconclusive) emits the advisory, non-terminal ``capture_unhealthy`` with a
+    closed-set ``reason``. ``emit`` is the ``emit_event`` callable, injected so
+    this mapping is unit-testable. Returns the emitted event ``type`` string.
+    """
+    from screencap._stderr_events import (
+        CAPTURE_UNHEALTHY_REASON_LISTENER_DEAD,
+        CAPTURE_UNHEALTHY_REASON_READER_STALLED,
+        EVENT_CAPTURE_UNHEALTHY,
+        EVENT_PERMISSION_LOST,
+    )
+    if label is not None:
+        emit(EVENT_PERMISSION_LOST, permission=label, elapsed=elapsed)
+        return EVENT_PERMISSION_LOST
+    reason = (
+        CAPTURE_UNHEALTHY_REASON_LISTENER_DEAD
+        if reader == "action"
+        else CAPTURE_UNHEALTHY_REASON_READER_STALLED
+    )
+    emit(EVENT_CAPTURE_UNHEALTHY, reason=reason, reader=reader, elapsed=elapsed)
+    return EVENT_CAPTURE_UNHEALTHY
+
+
+def _capture_health_tick(
+    *,
+    prev_counts: dict | None,
+    cur_counts: dict,
+    elapsed: float,
+    window_secs: float,
+    debounce: int,
+    runs: dict,
+    emitted: dict,
+    alive: dict,
+    action_alive: bool,
+    emit: Callable[..., None],
+    probe: Callable[[str | None], str | None] = _probe_tcc_denied,
+) -> list[tuple[str, str]]:
+    """Run one capture-health supervisor tick (SCR-76).
+
+    Warmup-gates (no verdict until ``prev_counts`` exists and ``elapsed`` has
+    reached one full ``window_secs``), evaluates per-reader deltas via
+    ``_capture_health_step``, attributes each fresh edge with ``probe`` and
+    emits once per edge via ``_emit_capture_health_event``. Returns the list of
+    ``(reader, event_type)`` emitted this tick.
+
+    The detection → attribution → emission WIRING lives here (not inline in
+    ``record()``) so it is exercisable in tests with stubbed ``emit`` / ``probe``
+    without spawning the full engine — closing the "green-in-tests,
+    broken-in-frozen" gap (R12) without a subprocess. ``emit`` (stderr) and the
+    in-process ``probe`` are both frozen-safe by construction.
+    """
+    if prev_counts is None or elapsed < window_secs:
+        return []  # start-barrier / warmup — establish baseline, no verdict yet
+    events: list[tuple[str, str]] = []
+    for reader in _capture_health_step(
+        prev_counts, cur_counts, alive, action_alive, debounce, runs, emitted,
+    ):
+        label = probe(reader)
+        events.append((reader, _emit_capture_health_event(reader, label, elapsed, emit)))
+    return events
 
 # Shared pressure state: written by gesture tap, read by pynput callbacks.
 # Python's GIL makes float reads/writes atomic; no lock needed.
@@ -2193,6 +2459,12 @@ def read_gesture_events(
     run_loop_ref[0] = loop
     CFRunLoopAddSource(loop, source, kCFRunLoopDefaultMode)
     Quartz.CGEventTapEnable(tap, True)
+    # Capture-health (SCR-76): publish the tap handle so the supervisor can
+    # sample CGEventTapIsEnabled(tap) for action liveness. The tap is local to
+    # this run-loop thread; a stale handle after teardown is harmless because
+    # record() resets the handle map per recording and the heartbeat is
+    # fail-open (alive unless EVERY published handle reports not-running).
+    _listener_handles["gesture"] = tap
 
     # Periodic timer to check for termination and re-enable the tap
     # (macOS can silently disable taps when SecureInput is active).
@@ -3129,6 +3401,16 @@ def record(
                  _q.kCGEventTapDisabledByTimeout,
                  _q.kCGEventTapDisabledByUserInput)
             _ = _ns.eventWithCGEvent_
+            # Pre-resolve capture-health labeller symbols (SCR-76). The
+            # supervisor's _probe_tcc_denied / _action_listener_alive may run
+            # off the main thread, where pyobjc's lazy bridge resolution is
+            # not thread-safe — resolve them here on the main thread first.
+            _ = (_q.CGPreflightScreenCaptureAccess, _q.CGPreflightListenEventAccess)
+            from ApplicationServices import (
+                AXIsProcessTrustedWithOptions,
+                kAXTrustedCheckOptionPrompt,
+            )
+            _ = (AXIsProcessTrustedWithOptions, kAXTrustedCheckOptionPrompt)
         except (ImportError, AttributeError):
             pass  # pyobjc not available; gesture capture will be skipped
 
@@ -3148,6 +3430,10 @@ def record(
     # Reset module-level drop counters for this recording session
     global _drop_counts
     _drop_counts = {}
+    # Reset capture-health state (SCR-76) for this recording session.
+    global _capture_health_counts, _listener_handles
+    _capture_health_counts = {}
+    _listener_handles = {}
     perf_q = sq.SynchronizedQueue()
     if terminate_processing is None:
         terminate_processing = multiprocessing.Event()
@@ -3495,6 +3781,21 @@ def record(
         "screen_event_writer", "event_processor",
     })
 
+    # --- Capture-health detection state (SCR-76) ---------------------------
+    # macOS-only: the TCC labeller and the daemon revocation UX are macOS
+    # concepts, and gating here keeps non-macOS recording behavior unchanged.
+    _health_enabled = sys.platform == "darwin"
+    _health_window_secs = config.CAPTURE_HEALTH_WINDOW_SECS
+    _health_debounce = config.CAPTURE_HEALTH_DEBOUNCE_TICKS
+    _health_prev_counts: dict | None = None
+    _health_runs: dict = {}
+    _health_emitted: dict = {}
+    from screencap._stderr_events import emit_event as _emit_health_event
+
+    def _task_alive(task_name: str) -> bool:
+        _t = task_by_name.get(task_name)
+        return bool(_t is not None and _t.is_alive())
+
     try:
         while not (stop_sequence_detected or terminate_processing.is_set()):
             # Health check: detect crashed child processes/threads
@@ -3523,6 +3824,47 @@ def record(
                         )
                         terminate_processing.set()
                         break
+
+            # Capture-health detection (SCR-76). Per-reader attempt-vs-output
+            # over this 1s tick, debounced, attributed in-process. Detection +
+            # emission ONLY — it NEVER stops the recording (fail-open). Skipped
+            # during teardown to avoid the stderr pipe-drain race, and wrapped
+            # so a watcher bug can't kill a healthy capture.
+            if _health_enabled and not terminate_processing.is_set():
+                try:
+                    _hc_cur = dict(_capture_health_counts)
+                    _hc_alive = {
+                        "screen": _task_alive("screen_event_reader"),
+                        "window": _task_alive("window_event_reader"),
+                        "action": any(
+                            _task_alive(_n) for _n in (
+                                "keyboard_event_reader",
+                                "mouse_event_reader",
+                                "gesture_event_reader",
+                            )
+                        ),
+                    }
+                    for _reader, _etype in _capture_health_tick(
+                        prev_counts=_health_prev_counts,
+                        cur_counts=_hc_cur,
+                        elapsed=time.perf_counter() - _profile_start,
+                        window_secs=_health_window_secs,
+                        debounce=_health_debounce,
+                        runs=_health_runs,
+                        emitted=_health_emitted,
+                        alive=_hc_alive,
+                        action_alive=_action_listener_alive(),
+                        emit=_emit_health_event,
+                    ):
+                        logger.warning(
+                            f"capture-health: '{_reader}' reader unhealthy → {_etype}"
+                        )
+                    _health_prev_counts = _hc_cur
+                except Exception:
+                    logger.warning(
+                        "capture-health check error (continuing)", exc_info=True
+                    )
+
             time.sleep(1)
         terminate_processing.set()
     except KeyboardInterrupt:

@@ -214,6 +214,60 @@ final class RecordingStateMachineTests: XCTestCase {
         ])
     }
 
+    // MARK: - Event: capture_unhealthy (SCR-76 advisory)
+
+    func testCaptureUnhealthyEmitsAdvisoryEffectWithReasonAndReader() {
+        var machine = RecordingStateMachine()
+        machine.forceState(.recording(elapsed: 7))
+
+        let effects = machine.handle(event: event(
+            type: "capture_unhealthy", reason: "reader_stalled", reader: "screen",
+        ))
+
+        XCTAssertEqual(effects, [.handleCaptureUnhealthy(reason: "reader_stalled", reader: "screen")])
+        // Advisory & non-terminal: the state machine does NOT change state.
+        XCTAssertEqual(machine.state, .recording(elapsed: 7))
+    }
+
+    func testPermissionLostStillRoutesToHandlePermissionLost() {
+        // Regression guard: capture_unhealthy must not perturb the existing
+        // permission_lost routing (TCC denials still take the terminal path).
+        var machine = RecordingStateMachine()
+
+        let effects = machine.handle(event: event(type: "permission_lost", permission: "screen_recording"))
+
+        XCTAssertEqual(effects, [.handlePermissionLost(permission: "screen_recording")])
+    }
+
+    func testUnknownEventTypeStillNoOps() {
+        var machine = RecordingStateMachine()
+
+        let effects = machine.handle(event: event(type: "some_future_event"))
+
+        XCTAssertEqual(effects, [])
+    }
+
+    // MARK: - RecorderEventLine decoding (the `reader` field)
+
+    func testCaptureUnhealthyLineDecodesReaderField() throws {
+        let json = #"{"type":"capture_unhealthy","reason":"reader_stalled","reader":"screen","elapsed":12.5,"schema_version":1}"#
+        let line = try JSONDecoder().decode(RecorderEventLine.self, from: Data(json.utf8))
+
+        XCTAssertEqual(line.type, "capture_unhealthy")
+        XCTAssertEqual(line.reason, "reader_stalled")
+        XCTAssertEqual(line.reader, "screen")
+    }
+
+    func testExistingEventDecodingUnaffectedByReaderField() throws {
+        // A permission_lost line carries no `reader` — decoding must still
+        // succeed with reader == nil (no breaking change to existing events).
+        let json = #"{"type":"permission_lost","permission":"screen_recording","elapsed":1.0,"schema_version":1}"#
+        let line = try JSONDecoder().decode(RecorderEventLine.self, from: Data(json.utf8))
+
+        XCTAssertEqual(line.permission, "screen_recording")
+        XCTAssertNil(line.reader)
+    }
+
     // MARK: - Event: matrix_disclosure_required
 
     func testMatrixDisclosureEventEmitsSetMatrixDisclosureWithChanges() {
@@ -349,6 +403,7 @@ final class RecordingStateMachineTests: XCTestCase {
         optOutCommandExamples: [String]? = nil,
         cursor: Int? = nil,
         reason: String? = nil,
+        reader: String? = nil,
         ts: Double? = nil
     ) -> RecorderEventLine {
         RecorderEventLine(
@@ -360,6 +415,7 @@ final class RecordingStateMachineTests: XCTestCase {
             optOutCommandExamples: optOutCommandExamples,
             cursor: cursor,
             reason: reason,
+            reader: reader,
             ts: ts
         )
     }

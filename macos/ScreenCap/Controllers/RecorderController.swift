@@ -47,6 +47,9 @@ struct RecorderEventLine: Decodable {
     let optOutCommandExamples: [String]?
     let cursor: Int?
     let reason: String?
+    /// Which capture is affected on a `capture_unhealthy` event (SCR-76):
+    /// "screen" / "window" / "action". Absent on every other event type.
+    let reader: String?
     let ts: Double?
 
     enum CodingKeys: String, CodingKey {
@@ -58,6 +61,7 @@ struct RecorderEventLine: Decodable {
         case optOutCommandExamples = "opt_out_command_examples"
         case cursor
         case reason
+        case reader
         case ts
     }
 }
@@ -78,8 +82,23 @@ final class RecorderController: ObservableObject {
     static let requiredPermissionsErrorMessage =
         "Grant Screen Recording, Accessibility, and Input Monitoring permissions before recording."
 
-    @Published private(set) var state: RecordingState = .idle
+    @Published private(set) var state: RecordingState = .idle {
+        didSet {
+            // The capture-health advisory is scoped to an active recording.
+            // Drop it on the return to .idle so a stale "may not be recording
+            // correctly" hint never lingers on the idle menu/window (SCR-76).
+            // handleCaptureUnhealthy's `.recording` guard prevents it from
+            // being re-set outside a recording, so this single chokepoint
+            // covers every idle-transition path (stop, Cmd+Q, termination).
+            if case .idle = state { captureAdvisory = nil }
+        }
+    }
     @Published private(set) var lastError: String?
+    /// Advisory, NON-terminal capture-health notice (SCR-76 `capture_unhealthy`).
+    /// Kept distinct from `lastError` (terminal failures) so the UI can present
+    /// it as a non-blocking hint that does not imply the recording has stopped.
+    /// Cleared automatically on the return to `.idle` (see `state.didSet`).
+    @Published private(set) var captureAdvisory: String?
     @Published private(set) var matrixDisclosure: PrivacyMatrixDisclosure?
     @Published private(set) var transport: RecorderTransport = .cliFallback
     @Published private(set) var daemonProbeCompleted = false
@@ -443,12 +462,18 @@ final class RecorderController: ObservableObject {
                 lastError = message
             case .clearError:
                 lastError = nil
+                // captureAdvisory clearing is owned by the `state.didSet` idle
+                // chokepoint: it's only set during `.recording` and `.clearError`
+                // is only emitted by enterStarting() (from `.idle`, where the
+                // advisory was already cleared), so no clear is needed here.
             case .setMatrixDisclosure(let disclosure):
                 matrixDisclosure = disclosure
             case .refreshIndex:
                 Task { await self.index?.refresh() }
             case .handlePermissionLost(let permission):
                 handlePermissionLost(permission: permission)
+            case .handleCaptureUnhealthy(let reason, let reader):
+                handleCaptureUnhealthy(reason: reason, reader: reader)
             }
         }
         state = machine.state
@@ -564,6 +589,29 @@ final class RecorderController: ObservableObject {
         alertPresenter.presentPermissionLost(permission: perm) { [weak self] in
             self?.permissions?.openSystemSettings(for: PrivacyPane.from(permissionString: perm))
         }
+    }
+
+    /// Surface the advisory, NON-terminal capture-health notice (SCR-76).
+    ///
+    /// Unlike `handlePermissionLost`, this never calls `stop()` — the engine
+    /// keeps recording and the signal is purely advisory (the cause is non-TCC
+    /// or could not be attributed). It is presented via the distinct
+    /// `captureAdvisory` channel (no blocking modal), updated in place to match
+    /// the engine's once-per-edge emission. Guarded to `.recording` so a late
+    /// event during teardown (`.stopping` / `.idle`) does not present — mirrors
+    /// `handlePermissionLost`'s `if case .recording = state` guard.
+    private func handleCaptureUnhealthy(reason: String?, reader: String?) {
+        guard case .recording = state else { return }
+        let what: String
+        switch reader {
+        case "screen": what = "Screen capture"
+        case "window": what = "Window capture"
+        case "action": what = "Input capture"
+        default: what = "Capture"
+        }
+        captureAdvisory =
+            "\(what) may not be recording correctly. If this persists, check "
+            + "Privacy & Security settings, or stop and restart the recording."
     }
 
     // MARK: - Timers

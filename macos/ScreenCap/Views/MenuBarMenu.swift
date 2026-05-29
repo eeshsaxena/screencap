@@ -28,6 +28,11 @@ struct MenuBarMenu: View {
         if let err = recorder.lastError {
             Divider()
             RecorderErrorMessage(message: err)
+        } else if let advisory = recorder.captureAdvisory {
+            // Advisory, non-terminal capture-health hint (SCR-76). Errors take
+            // priority (else-if, matching MainWindow); the recording continues.
+            Divider()
+            RecorderErrorMessage(message: advisory)
         }
 
         Divider()
