@@ -25,6 +25,7 @@ import pytest
             "previous_session_force_terminated",
         ),
         ("EVENT_SUBSCRIBED", "subscribed"),
+        ("EVENT_CAPTURE_UNHEALTHY", "capture_unhealthy"),
     ],
 )
 def test_daemon_bus_event_type_constants_are_exported(name: str, expected: str) -> None:
@@ -32,6 +33,24 @@ def test_daemon_bus_event_type_constants_are_exported(name: str, expected: str) 
 
     assert getattr(events, name) == expected
     assert name in events.__all__
+
+
+def test_capture_unhealthy_reason_closed_set_is_exported() -> None:
+    """SCR-76: the `reason` field is a CLOSED set of constants — runtime text
+    must never be interpolated into it (it rides the EventBus to any same-EUID
+    subscriber). Pin the set + that each member is exported."""
+    import screencap._stderr_events as events
+
+    assert events.CAPTURE_UNHEALTHY_REASONS == frozenset(
+        {"reader_stalled", "listener_dead", "inconclusive"}
+    )
+    for name in (
+        "CAPTURE_UNHEALTHY_REASON_READER_STALLED",
+        "CAPTURE_UNHEALTHY_REASON_LISTENER_DEAD",
+        "CAPTURE_UNHEALTHY_REASON_INCONCLUSIVE",
+        "CAPTURE_UNHEALTHY_REASONS",
+    ):
+        assert name in events.__all__
 
 
 def _capture_stderr(callable_):
@@ -207,6 +226,29 @@ class TestEventSchemas:
         assert isinstance(evt["elapsed"], float)
         # `since_frame` is reserved (schema-doc) but not currently emitted —
         # do not assert on it.
+
+    def test_capture_unhealthy_schema(self):
+        """SCR-76 advisory event. Carries reason (closed set) + reader + elapsed,
+        and — unlike permission_lost — has NO exit_code (it never terminates)."""
+        from screencap._stderr_events import (
+            CAPTURE_UNHEALTHY_REASONS,
+            EVENT_SCHEMA_VERSION,
+        )
+        from screencap.cli import _emit_event
+
+        out = _capture_stderr(lambda: _emit_event(
+            "capture_unhealthy",
+            reason="reader_stalled",
+            reader="screen",
+            elapsed=12.5,
+        ))
+        evt = _parse_lines(out)[0]
+        assert evt["type"] == "capture_unhealthy"
+        assert evt["schema_version"] == EVENT_SCHEMA_VERSION
+        assert evt["reason"] in CAPTURE_UNHEALTHY_REASONS
+        assert evt["reader"] in ("screen", "window", "action")
+        assert isinstance(evt["elapsed"], float)
+        assert "exit_code" not in evt  # advisory — never terminal
 
     def test_stopped_schema(self):
         from screencap._stderr_events import EVENT_SCHEMA_VERSION
