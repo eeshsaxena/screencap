@@ -52,6 +52,12 @@ def _ensure_single_video(rec_dir: Path) -> None:
         concat_video_chunks(rec_dir)
         console.print(f"[dim]Created merged video ({len(chunks)} chunks)[/dim]")
     except Exception as e:
+        # Deliberate: `screencap view` (the HTML viewer) is best-effort, so a
+        # merge failure warns and continues rather than aborting. The fail-loud
+        # "can't process this video" guarantee (R9) lives in concat_video_chunks
+        # for callers that need correctness — the review-data command (U4). Do
+        # not turn this into a raise without preserving the viewer's graceful
+        # degradation.
         console.print(f"[yellow]Warning:[/yellow] Video merge failed: {e}")
 
 

@@ -608,6 +608,20 @@ class TestPixelFormatProbe:
         with pytest.raises(RuntimeError):
             read_pixel_format(path)
 
+    def test_no_video_stream_raises(self, tmp_path):
+        """A valid container with no video stream raises the distinct error (plan U2).
+
+        Uses an audio-only FLAC — opens cleanly but has no video stream, so the
+        `if not streams` branch fires (distinct from the av.open-failure path).
+        """
+        import numpy as np
+        import soundfile as sf
+
+        audio = tmp_path / "audio.flac"
+        sf.write(str(audio), np.zeros(2000, dtype="float32"), 16000)
+        with pytest.raises(RuntimeError, match="No video stream"):
+            read_pixel_format(audio)
+
     def test_probe_does_not_decode_frames(self, tmp_path, monkeypatch):
         """The probe reads codec_context.pix_fmt only — never iterates frames."""
         path = tmp_path / "v444.mp4"
@@ -785,3 +799,82 @@ class TestReviewPipelineHardening:
             remediate_pixfmt_for_review(tmp_path)
         assert not (tmp_path / ".video_review.mp4").exists()
         assert not list(tmp_path.glob(".video_review.mp4.*.tmp"))
+
+    def test_remediate_promotes_output_even_if_input_close_raises(self, tmp_path, monkeypatch):
+        """A failing inp.close() after a successful encode must NOT discard the review copy.
+
+        Guards todo 001: previously inp.close() ran inside the success path before
+        os.replace, so a close error jumped to except and unlinked the complete temp.
+        """
+        import screencap.engine.video as vm
+
+        video = tmp_path / "video.mp4"
+        _write_chunk(video, (200, 0, 0))  # yuv444p → remediated
+        real_open = vm.av.open
+        state = {"source_reads": 0}
+
+        class _RaiseOnClose:
+            def __init__(self, inner):
+                self._inner = inner
+
+            def __getattr__(self, name):
+                return getattr(self._inner, name)
+
+            def close(self):
+                raise OSError("simulated input close failure")
+
+        def fake_open(*a, **k):
+            container = real_open(*a, **k)
+            # Only the SOURCE video, opened for read. read #1 is
+            # read_pixel_format's probe; read #2 is remediate's `inp` — wrap that
+            # one so its close() raises after a successful encode.
+            if k.get("mode") != "w" and str(a[0]) == str(video):
+                state["source_reads"] += 1
+                if state["source_reads"] >= 2:
+                    return _RaiseOnClose(container)
+            return container
+
+        monkeypatch.setattr(vm.av, "open", fake_open)
+
+        path, remediated = remediate_pixfmt_for_review(tmp_path)
+        assert remediated is True
+        assert path == tmp_path / ".video_review.mp4"
+        assert path.exists()
+        # Verify with the unpatched opener (monkeypatch is still active here).
+        container = real_open(str(path))
+        try:
+            assert container.streams.video[0].codec_context.pix_fmt == "yuv420p"
+        finally:
+            container.close()
+
+    def test_concat_raises_on_zero_packet_chunk(self, tmp_path, monkeypatch):
+        """A chunk that matches the template but demuxes no timestamped packets fails loud.
+
+        Guards todo 002: a zero-packet chunk would leave offset unadvanced and
+        overlap the next chunk's PTS silently.
+        """
+        import screencap.engine.video as vm
+
+        _write_chunk(tmp_path / "chunk_0000.mp4", (200, 0, 0))
+        real_open = vm.av.open
+
+        class _EmptyDemux:
+            def __init__(self, inner):
+                self._inner = inner
+
+            def __getattr__(self, name):
+                return getattr(self._inner, name)
+
+            def demux(self, *a, **k):
+                return iter([vm.av.Packet()])  # bare packet: pts/dts are None → skipped
+
+        def fake_open(*a, **k):
+            if k.get("mode") == "w":
+                return real_open(*a, **k)
+            return _EmptyDemux(real_open(*a, **k))
+
+        monkeypatch.setattr(vm.av, "open", fake_open)
+
+        with pytest.raises(RuntimeError, match="no timestamped packets"):
+            concat_video_chunks(tmp_path)
+        assert not (tmp_path / "video.mp4").exists()

@@ -15,6 +15,7 @@ import threading
 from fractions import Fraction
 from pathlib import Path
 from typing import TYPE_CHECKING
+from uuid import uuid4
 
 import av
 from loguru import logger
@@ -842,17 +843,49 @@ def _close_container_in_thread(container: av.container.Container) -> bool:
     A caller performing an atomic write must treat ``False`` as a failed
     finalize and must NOT promote the temp file — the moov atom may be unwritten,
     so the output could be truncated/unplayable.
+
+    The worker is a daemon thread: if the close genuinely deadlocks on the GIL,
+    a non-daemon thread would keep the interpreter alive and stall clean CLI /
+    daemon exit, defeating the 15s budget.
+
+    NOTE: ``VideoWriter.close`` and ``finalize_video_writer`` still inline an
+    equivalent close-in-thread block; consolidating them onto this helper is a
+    deferred follow-up (out of scope for the review-pipeline change).
     """
     def _close() -> None:
         container.close()
 
-    close_thread = threading.Thread(target=_close)
+    close_thread = threading.Thread(target=_close, daemon=True)
     close_thread.start()
     close_thread.join(timeout=15)
     if close_thread.is_alive():
         logger.warning("container close thread did not finish in 15s")
         return False
     return True
+
+
+def _sweep_stale_temps(rec_dir: Path, pattern: str) -> None:
+    """Remove orphaned atomic-write temps left by a crashed/killed prior run.
+
+    Per-call temp names are unique (pid + uuid), so the deterministic
+    ``unlink`` that used to clear a same-pid orphan no longer applies — without
+    a sweep, interrupted runs accumulate full-size ``.tmp`` files in the
+    recording dir. Safe under concurrency: a temp whose embedded PID is still
+    alive (an in-flight writer in another process) is left untouched.
+    """
+    for stale in rec_dir.glob(pattern):
+        fields = stale.name.split(".")
+        try:
+            # name shape: .<base>.mp4.<pid>.<uuid>.tmp → pid follows "mp4"
+            pid = int(fields[fields.index("mp4") + 1])
+        except (ValueError, IndexError):
+            continue
+        try:
+            os.kill(pid, 0)  # process alive → an in-flight writer; skip
+        except ProcessLookupError:
+            stale.unlink(missing_ok=True)  # dead pid → orphan; reclaim
+        except OSError:
+            pass  # e.g. EPERM: alive but not ours — skip
 
 
 def _discard_failed_output(
@@ -918,13 +951,15 @@ def concat_video_chunks(rec_dir: str | Path) -> Path:
     out_path = rec_dir / "video.mp4"
     # Dot-prefixed temp sibling: excluded from upload (dotfile filter) and from
     # catalog's ``*.mp4`` glob, so a lingering temp can never pollute either.
-    tmp_path = rec_dir / f".video.mp4.{os.getpid()}.tmp"
-    tmp_path.unlink(missing_ok=True)
+    # pid + uuid keeps the name unique per call so two threads in one process
+    # (the future daemon path) never clobber each other's temp.
+    _sweep_stale_temps(rec_dir, ".video.mp4.*.tmp")
+    tmp_path = rec_dir / f".video.mp4.{os.getpid()}.{uuid4().hex}.tmp"
 
     output = av.open(str(tmp_path), mode="w", format="mp4")
     try:
         out_stream = None
-        template_params: tuple | None = None
+        template_params: tuple[int, int, str] | None = None
         # Cumulative offset in the (shared) input stream time_base. All chunks
         # come from the same recorder config, so their time_bases match and
         # ``add_stream_from_template`` gives the output that same time_base.
@@ -977,6 +1012,16 @@ def concat_video_chunks(rec_dir: str | Path) -> Path:
                     end = orig_pts + dur
                     if end > chunk_end:
                         chunk_end = end
+                if chunk_end == 0:
+                    # A chunk that matched the template but muxed no timestamped
+                    # packets would leave offset unadvanced, overlapping the next
+                    # chunk's PTS. Recorder chunks always carry packets, so this
+                    # means a foreign/corrupt chunk — fail loud, like the other
+                    # concat guards.
+                    raise RuntimeError(
+                        f"Chunk {chunk.name} produced no timestamped packets; "
+                        f"cannot stream-copy concat without corrupting the timeline"
+                    )
                 offset += chunk_end
             finally:
                 inp.close()
@@ -1083,8 +1128,11 @@ def remediate_pixfmt_for_review(rec_dir: str | Path) -> tuple[Path, bool]:
     if review_path.exists():
         return review_path, True  # idempotent: a prior re-encode is reused
 
-    tmp_path = rec_dir / f".video_review.mp4.{os.getpid()}.tmp"
-    tmp_path.unlink(missing_ok=True)
+    # pid + uuid keeps the temp unique per call (no same-process clobber when
+    # this runs in a threaded/daemon context); sweep reclaims orphans from
+    # crashed prior runs.
+    _sweep_stale_temps(rec_dir, ".video_review.mp4.*.tmp")
+    tmp_path = rec_dir / f".video_review.mp4.{os.getpid()}.{uuid4().hex}.tmp"
 
     try:
         inp = av.open(str(video_path))
@@ -1125,26 +1173,33 @@ def remediate_pixfmt_for_review(rec_dir: str | Path) -> tuple[Path, bool]:
         # (output=None so rollback won't re-close), drop the temp, and fail loud.
         closed = _close_container_in_thread(output)
         output = None
-        inp.close()
         if not closed:
             tmp_path.unlink(missing_ok=True)
             raise RuntimeError(f"Timed out finalizing review video for {video_path}")
         os.replace(tmp_path, review_path)
-    except BaseException as exc:
+    except RuntimeError:
+        # Already-structured failure (timeout, decode error we raised) — drop the
+        # temp and re-raise unchanged.
         _discard_failed_output(output, tmp_path)
-        try:
-            inp.close()
-        except Exception:
-            pass
-        # Wrap only genuine errors into the structured R9 signal. The
-        # `isinstance(exc, Exception)` clause is load-bearing: it lets control-flow
-        # BaseExceptions (KeyboardInterrupt/SystemExit) and already-structured
-        # RuntimeErrors propagate unchanged instead of being masked as a re-encode
-        # failure.
-        if isinstance(exc, Exception) and not isinstance(exc, RuntimeError):
+        raise
+    except BaseException as exc:
+        # Genuine Exception → wrap as the R9 "can't process" signal. Control-flow
+        # BaseExceptions (KeyboardInterrupt/SystemExit, not Exception) re-raise
+        # unwrapped so they aren't masked as a re-encode failure.
+        _discard_failed_output(output, tmp_path)
+        if isinstance(exc, Exception):
             raise RuntimeError(
                 f"Cannot re-encode video for review: {video_path}: {exc}"
             ) from exc
         raise
+    finally:
+        # Close the input exactly once, regardless of outcome. Kept out of the
+        # success/except flow so an inp.close() error can never discard an
+        # already-promoted review copy (errors here are swallowed — the input is
+        # read-only and a late close failure must not undo os.replace).
+        try:
+            inp.close()
+        except Exception:
+            pass
 
     return review_path, True
