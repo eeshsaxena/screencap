@@ -63,6 +63,52 @@ class TestEnsureSingleVideo:
         container.close()
         assert frames > 0
 
+    def test_multi_chunk_preserves_idle_gap_with_metadata(self, tmp_path):
+        """recording.db + manifests → absolute offsets keep the inter-chunk idle
+        gap, so a 2nd-chunk wall-clock lookup resolves (SCR-98, full caller path).
+
+        This is the production fix path: _ensure_single_video reads
+        video_start_time (DB) and each chunk_start (manifest), builds per-chunk
+        offsets, and the merged timeline tracks wall-clock. Without it, the
+        2nd-chunk lookup raised "no frame within tolerance".
+        """
+        import json
+        import sqlite3
+
+        from screencap.engine.video import ChunkedVideoWriter, extract_frame
+
+        base = time.time()
+        writer = ChunkedVideoWriter(
+            output_dir=tmp_path, width=48, height=48, chunk_duration=1.0, fps=24
+        )
+        for dt in (0.0, 0.5):  # chunk 0: red
+            writer.write_frame(Image.new("RGB", (48, 48), (220, 0, 0)), base + dt)
+        for dt in (3.0, 3.5):  # ~2.5s gap → chunk 1: blue
+            writer.write_frame(Image.new("RGB", (48, 48), (0, 0, 220)), base + dt)
+        writer.close()
+        assert len(sorted(tmp_path.glob("chunk_*.mp4"))) == 2
+
+        # Minimal recording row carrying the anchor get_frame_at subtracts.
+        conn = sqlite3.connect(str(tmp_path / "recording.db"))
+        conn.execute("CREATE TABLE recording (video_start_time REAL, timestamp REAL)")
+        conn.execute("INSERT INTO recording VALUES (?, ?)", (base, base))
+        conn.commit()
+        conn.close()
+        # Per-chunk manifests carrying each chunk's wall-clock start.
+        for idx, chunk_start in ((0, base + 0.0), (1, base + 3.0)):
+            (tmp_path / f"chunk_{idx:04d}_manifest.json").write_text(
+                json.dumps({"chunk_start": chunk_start, "chunk_end": chunk_start + 0.5})
+            )
+
+        _ensure_single_video(tmp_path)
+
+        out = tmp_path / "video.mp4"
+        assert out.is_file() and not out.is_symlink()
+        # 2nd-chunk event at wall-relative t=3.0 resolves (pre-fix: raised) to blue.
+        frame = extract_frame(out, 3.0, tolerance=0.5).convert("RGB")
+        r, _, b = frame.getpixel((24, 24))[:3]
+        assert b > r, f"2nd-chunk lookup should be blue, got rgb r={r} b={b}"
+
 
 class TestNeedsRegeneration:
     """Tests for the _needs_regeneration helper."""
