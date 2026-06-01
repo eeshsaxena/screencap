@@ -1608,13 +1608,21 @@ def read_window_events(
         window_data = window.get_active_window_data()
         if not window_data:
             # SCR-103: a falsy poll is a benign no-active-window state (bare
-            # desktop, Mission Control, Spotlight, menu-bar/Space focus), NOT a
-            # blind reader. The window event rides CGWindowList, which needs no
-            # permission, so a falsy poll is "nothing to capture this tick," not
-            # an Accessibility stall — count it as a completed (idle) poll so it
-            # does not widen the attempt-vs-output gap that fires
-            # capture_unhealthy(reader=window). A genuinely dead reader thread is
-            # still caught by the record.child_died liveness path.
+            # desktop, Mission Control, Spotlight, menu-bar/Space focus), not an
+            # Accessibility stall — the window meta rides CGWindowList, which
+            # needs no *Accessibility* permission (it is Screen-Recording-gated,
+            # NOT permission-free; see SCR-101). Count it as a completed (idle)
+            # poll so it does not widen the attempt-vs-output gap that fires
+            # capture_unhealthy(reader=window).
+            #
+            # SCR-108 tradeoff: because every poll — falsy or truthy — increments
+            # window.output, the stall verdict (attempt > 0 and output == 0) can
+            # never fire for the window reader. A benign idle poll and an
+            # alive-but-blind reader (sustained falsy polls from a real
+            # degradation) are indistinguishable at this layer, so detection is
+            # consciously left to record.child_died — which catches a DEAD reader
+            # thread but NOT an alive-but-blind one. Accepted because
+            # capture_unhealthy is advisory / fail-open (it never self-stops).
             _health_incr("window.output")
             time.sleep(poll_interval)
             continue

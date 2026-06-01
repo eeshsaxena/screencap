@@ -219,6 +219,11 @@ def get_active_window_meta() -> dict:
         ),
         Quartz.kCGNullWindowID,
     )
+    if windows is None:
+        # API failure (SCR-108) — parallels the guard in get_all_window_geometries.
+        # Return a falsy meta rather than raising TypeError on the `for win in
+        # windows` below; the caller treats this as a benign no-window state.
+        return {}
     active_windows_info = [
         win
         for win in windows

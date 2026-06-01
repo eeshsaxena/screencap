@@ -523,6 +523,20 @@ def test_get_active_window_meta_empty_desktop_returns_falsy(monkeypatch):
     assert not _macos.get_active_window_meta()
 
 
+def test_get_active_window_meta_none_window_list_returns_falsy(monkeypatch):
+    # SCR-108: CGWindowListCopyWindowInfo can return None on API failure. Without
+    # the `if windows is None` guard (which its sibling get_all_window_geometries
+    # already has at _macos.py:144), `for win in windows` raised TypeError on
+    # every poll — caught upstream → {} → falsy poll, plus per-poll warning spam.
+    # The guard returns a falsy meta explicitly, matching the documented
+    # bare-desktop contract rather than riding the broad upstream except.
+    _macos = pytest.importorskip("screencap.engine.window._macos")
+    monkeypatch.setattr(
+        _macos.Quartz, "CGWindowListCopyWindowInfo", lambda *_a, **_k: None
+    )
+    assert not _macos.get_active_window_meta()
+
+
 def test_get_active_window_state_empty_meta_returns_none(monkeypatch):
     # SCR-103: when get_active_window_meta() returns {} (bare desktop, Mission
     # Control, etc.), get_active_window_state must return None without raising a
