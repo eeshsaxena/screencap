@@ -975,7 +975,8 @@ def test_list_remote_sessions_cli_json():
 def test_list_remote_empty():
     runner = CliRunner()
 
-    with mock.patch("screencap.download.list_remote_sessions", return_value=[]):
+    with mock.patch("screencap.download.list_remote_sessions", return_value=[]), \
+         mock.patch("screencap.cli._should_default_to_json", return_value=False):
         result = runner.invoke(cli, ["list", "--remote"])
 
     assert result.exit_code == 0

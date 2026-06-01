@@ -727,9 +727,17 @@ class TestNestedEventNulling:
     def test_key_type_inside_mouse_drag_is_nulled(
         self, tmp_path, pipeline_and_anonymizer
     ):
-        """key.type nested inside mouse.drag children must also be nulled."""
+        """key.type nested inside a blocked mouse.drag must not leak content.
+
+        SCR-30 drag-aware handling (R6/R12): a child whose own timestamp
+        lands inside the blocked interval is dropped entirely; a child
+        outside the interval survives but has its keystroke content nulled
+        via ``null_text_content``'s recursion, because the overlapping drag
+        content-suppresses the whole gesture.
+        """
         pipeline, anonymizer = pipeline_and_anonymizer
-        nested_key_type = {
+        # ts 25.0 is inside the [20, 30] EXCLUDE interval -> child dropped.
+        inside_key_type = {
             "timestamp": 25.0,
             "type": "key.type",
             "text": "secret-password",
@@ -738,10 +746,19 @@ class TestNestedEventNulling:
                 {"type": "key.up", "key_char": "s", "canonical_key_char": "s"},
             ],
         }
+        # ts 18.0 is outside the interval -> child survives, content nulled.
+        outside_key_type = {
+            "timestamp": 18.0,
+            "type": "key.type",
+            "text": "also-secret",
+            "children": [
+                {"type": "key.down", "key_char": "a", "canonical_key_char": "a"},
+            ],
+        }
         drag_event = {
-            "timestamp": 25.0,
+            "timestamp": 18.0,
             "type": "mouse.drag",
-            "children": [nested_key_type],
+            "children": [outside_key_type, inside_key_type],
         }
         rec = tmp_path / "scrubbed"
         rec.mkdir()
@@ -767,9 +784,13 @@ class TestNestedEventNulling:
             for l in (rec / "events.jsonl").read_text().strip().splitlines()
         ]
         drag = output[1]
-        nested = drag["children"][0]
-        assert nested["text"] is None
-        assert nested["children"][0]["key_char"] is None
+        # The in-interval child is dropped; only the outside child survives.
+        assert len(drag["children"]) == 1
+        survived = drag["children"][0]
+        assert survived["timestamp"] == 18.0
+        # Surviving nested key.type still has its content nulled (recursion).
+        assert survived["text"] is None
+        assert survived["children"][0]["key_char"] is None
 
 
 # ---------------------------------------------------------------------------

@@ -165,7 +165,8 @@ def _make_recording_dir(base, name, *, duration=60.0, with_metrics=False):
 def test_info_command_with_metrics(tmp_path):
     _make_recording_dir(tmp_path, "demo", with_metrics=True)
     runner = CliRunner()
-    with mock.patch("screencap.config.get_recordings_dir", return_value=tmp_path):
+    with mock.patch("screencap.config.get_recordings_dir", return_value=tmp_path), \
+         mock.patch("screencap.cli._should_default_to_json", return_value=False):
         result = runner.invoke(cli, ["info", "demo"])
     assert result.exit_code == 0
     assert "demo" in result.output
@@ -196,7 +197,8 @@ def test_info_command_json_output(tmp_path):
 def test_info_command_no_metrics(tmp_path):
     _make_recording_dir(tmp_path, "old-rec", with_metrics=False)
     runner = CliRunner()
-    with mock.patch("screencap.config.get_recordings_dir", return_value=tmp_path):
+    with mock.patch("screencap.config.get_recordings_dir", return_value=tmp_path), \
+         mock.patch("screencap.cli._should_default_to_json", return_value=False):
         result = runner.invoke(cli, ["info", "old-rec"])
     assert result.exit_code == 0
     assert "No system metrics" in result.output
@@ -205,7 +207,8 @@ def test_info_command_no_metrics(tmp_path):
 def test_info_command_with_running_applications(tmp_path):
     _make_recording_dir(tmp_path, "demo", with_metrics=True)
     runner = CliRunner()
-    with mock.patch("screencap.config.get_recordings_dir", return_value=tmp_path):
+    with mock.patch("screencap.config.get_recordings_dir", return_value=tmp_path), \
+         mock.patch("screencap.cli._should_default_to_json", return_value=False):
         result = runner.invoke(cli, ["info", "demo"])
     assert result.exit_code == 0
     assert "running apps:" in result.output
@@ -383,7 +386,8 @@ def test_download_works_without_record_deps(tmp_path):
 def test_list_works_without_record_deps(tmp_path):
     """list should work even without [record] extras installed."""
     runner = CliRunner()
-    with mock.patch("screencap.catalog.get_recordings_dir", return_value=tmp_path):
+    with mock.patch("screencap.catalog.get_recordings_dir", return_value=tmp_path), \
+         mock.patch("screencap.cli._should_default_to_json", return_value=False):
         result = runner.invoke(cli, ["list"])
     assert result.exit_code == 0
     assert "No recordings" in result.output
@@ -1248,11 +1252,17 @@ def test_cloud_start_nlp_model_gate(tmp_path):
         assert kwargs["cloud_intent"] is False
 
 
-def test_upload_skips_local_intent_in_all_mode(tmp_path):
-    """upload --all skips recordings with local intent."""
+def test_upload_warns_but_proceeds_for_local_intent_in_all_mode(tmp_path):
+    """`upload --all` no longer skips local-intent recordings.
+
+    An explicit upload overrides the recorded intent (the data becomes
+    cloud-bound by user choice at upload time), so a local-intent recording
+    surfaces a weaker-guarantees warning and then proceeds to scrub + upload.
+    """
     rec_dir = tmp_path / "local-rec"
     rec_dir.mkdir(parents=True)
     (rec_dir / "recording.db").touch()
+    (rec_dir / "events.jsonl").write_text('{"_meta":true}\n')
     # Write a local-intent file
     intent = {"destination": "local", "source": "flag"}
     (rec_dir / ".recording_intent").write_text(json.dumps(intent))
@@ -1261,17 +1271,28 @@ def test_upload_skips_local_intent_in_all_mode(tmp_path):
     with (
         mock.patch("screencap.upload.resolve_recording_dirs", return_value=[rec_dir]),
         mock.patch("screencap.upload.upload_recording") as mock_upload,
+        mock.patch(
+            "screencap.scrubber.scrub_recording",
+            return_value=mock.MagicMock(output_dir=rec_dir, entity_counts={}),
+        ) as mock_scrub,
     ):
         mock_upload.return_value = mock.MagicMock(
-            uploaded=[], skipped=[], failed=[], total_bytes=0, gcs_prefix=None,
+            uploaded=["recording.db", "events.jsonl"],
+            skipped=[], failed=[], total_bytes=200,
+            gcs_prefix="gs://bucket/local-rec",
         )
         result = runner.invoke(cli, ["upload", "--all"])
 
     assert result.exit_code == 0
-    assert "Skipping" in result.output
-    assert "local intent" in result.output
-    # upload_recording should NOT have been called for the skipped recording
-    mock_upload.assert_not_called()
+    # Local intent surfaces a weaker-guarantees warning...
+    assert "local-intent" in result.output
+    assert "post-hoc scrubbing" in result.output
+    # ...but the upload still proceeds (explicit upload overrides intent).
+    mock_upload.assert_called_once()
+    mock_scrub.assert_called_once()
+    # The upload receives the scrubbed dir (scrub_result.output_dir).
+    uploaded_dir = mock_upload.call_args[0][0]
+    assert uploaded_dir == rec_dir
 
 
 def test_upload_cloud_intent_proceeds(tmp_path):

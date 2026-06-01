@@ -417,72 +417,14 @@ def test_catalog_reads_recording_with_schema2(tmp_path):
 # ---------------------------------------------------------------------------
 # Scenario 2: Stop from another terminal
 # ---------------------------------------------------------------------------
-
-
-def test_stop_sends_sigterm_and_waits(tmp_path, monkeypatch):
-    """screencap stop reads PID file, sends SIGTERM, waits for process exit.
-
-    Mocked: _pid_exists (controls when process "exits"), _is_screencap_process,
-    os.kill, time.sleep. Real: PID file I/O (via monkeypatched PID_FILE path).
-
-    Covers: S1, S2, S3.
-    """
-    from click.testing import CliRunner
-
-    from screencap.cli import cli
-
-    # Redirect PID file to tmp_path
-    monkeypatch.setattr("screencap.pidfile.PID_FILE", tmp_path / "recording.pid")
-
-    # Write a real PID file with a fake parent PID
-    fake_pid = 99999
-    pidfile_data = {
-        "parent_pid": fake_pid,
-        "children": [],
-        "capture_dir": str(tmp_path / "rec"),
-        "started_at": time.time(),
-    }
-    (tmp_path / "recording.pid").write_text(json.dumps(pidfile_data))
-
-    # _pid_exists: True (alive check), False (loop exit), False (final check)
-    pid_exists_returns = iter([True, False, False])
-
-    with (
-        mock.patch(
-            "screencap.pidfile._pid_exists",
-            side_effect=lambda pid: next(pid_exists_returns),
-        ),
-        mock.patch("screencap.pidfile._is_screencap_process", return_value=True),
-        mock.patch("os.kill") as mock_kill,
-        mock.patch("time.sleep"),
-    ):
-        runner = CliRunner()
-        result = runner.invoke(cli, ["stop"])
-
-    # S1: SIGTERM sent to parent process
-    mock_kill.assert_called_once_with(fake_pid, signal.SIGTERM)
-
-    # S3: Success message printed
-    assert "stopped gracefully" in result.output.lower(), f"Output: {result.output}"
-
-
-def test_stop_no_recording_running(tmp_path, monkeypatch):
-    """screencap stop with no PID file and no orphans = no-op message.
-
-    Covers: S4.
-    """
-    from click.testing import CliRunner
-
-    from screencap.cli import cli
-
-    # No PID file exists
-    monkeypatch.setattr("screencap.pidfile.PID_FILE", tmp_path / "recording.pid")
-
-    with mock.patch("screencap.pidfile.find_orphaned_processes", return_value=[]):
-        runner = CliRunner()
-        result = runner.invoke(cli, ["stop"])
-
-    assert "no orphaned" in result.output.lower(), f"Output: {result.output}"
+#
+# `screencap stop` became a thin daemon HTTP client in Phase 2 U1.5 — the
+# daemon owns SIGTERM grace, SIGKILL escalation, and orphan teardown, so the
+# CLI no longer reads the PID file or signals processes itself. The previous
+# PID-file/os.kill tests here asserted that removed mechanism. The current
+# daemon-client behavior (graceful stop, --force passthrough, no-daemon no-op,
+# not-owned-by-daemon) is covered by the daemon-client stop tests in
+# tests/test_cli.py.
 
 
 # ---------------------------------------------------------------------------

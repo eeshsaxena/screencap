@@ -162,50 +162,50 @@ class TestCheckPermissionsNow:
         import subprocess as _subprocess
         from screencap import recorder
 
-        class _FakeResult:
-            stdout = "ImportError: traceback...\n"
-
-        monkeypatch.setattr(_subprocess, "run", lambda *a, **k: _FakeResult())
+        monkeypatch.setattr(
+            _subprocess,
+            "run",
+            lambda *a, **k: _subprocess.CompletedProcess(
+                args=[], returncode=0, stdout="ImportError: traceback...\n", stderr=""
+            ),
+        )
         result = recorder._check_permission_fresh("Screen Recording")
         assert result is None
 
     def test_missing_darwin_module_returns_ok(self, monkeypatch):
-        """If the darwin module isn't importable, fail-open (don't kill the
-        recorder for an unrelated import error)."""
+        """If the probe subprocess can't import the darwin module, fail-open
+        (don't kill the recorder for an unrelated import error).
+
+        The probe runs in a fresh subprocess (``_check_permission_fresh``), so
+        a missing/broken darwin import surfaces as an ImportError traceback on
+        the subprocess's stdout rather than the expected "True"/"False". That
+        unparseable output is treated as "couldn't determine" (None), and
+        ``_check_permissions_now`` fails open with (True, None) — the
+        ``builtins.__import__`` layer in the parent process is irrelevant here.
+        """
+        import subprocess as _subprocess
         from screencap import recorder
 
         monkeypatch.setattr(sys, "platform", "darwin")
 
-        # Force the import to fail
-        original_module = sys.modules.pop("screencap.engine.platform.darwin", None)
-        try:
-            class _BrokenLoader:
-                @classmethod
-                def __getitem__(cls, key):
-                    if key == "screencap.engine.platform.darwin":
-                        raise ImportError("simulated")
-                    raise KeyError(key)
+        monkeypatch.setattr(
+            _subprocess,
+            "run",
+            lambda *a, **k: _subprocess.CompletedProcess(
+                args=[],
+                returncode=0,
+                stdout=(
+                    "Traceback (most recent call last):\n"
+                    "ModuleNotFoundError: No module named "
+                    "'screencap.engine.platform.darwin'\n"
+                ),
+                stderr="",
+            ),
+        )
 
-            with mock.patch.dict(
-                sys.modules,
-                {"screencap.engine.platform.darwin": None},
-                clear=False,
-            ):
-                # Force ImportError when the function tries to import
-                with mock.patch(
-                    "builtins.__import__",
-                    side_effect=lambda name, *a, **kw: (
-                        (_ for _ in ()).throw(ImportError("simulated"))
-                        if "darwin" in name
-                        else __import__(name, *a, **kw)
-                    ),
-                ):
-                    ok, missing = recorder._check_permissions_now()
-            assert ok is True
-            assert missing is None
-        finally:
-            if original_module is not None:
-                sys.modules["screencap.engine.platform.darwin"] = original_module
+        ok, missing = recorder._check_permissions_now()
+        assert ok is True
+        assert missing is None
 
 
 class TestPermissionLostEventEmission:

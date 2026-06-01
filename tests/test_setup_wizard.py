@@ -280,7 +280,8 @@ class TestRunSetupWizard:
     @pytest.mark.parametrize("choice, expected_mode, expected_upload", [
         (1, "public", "cloud"),    # Cloud
         (2, "internal", "local"),  # Local
-        (3, "internal", "ask"),    # Ask every time
+        (3, "public", "both"),     # Both
+        (4, "internal", "ask"),    # Ask every time
     ])
     def test_destination_choice_sets_mode_and_upload(self, tmp_path, choice, expected_mode, expected_upload):
         """Each destination choice writes the correct mode + upload_default pair."""
@@ -439,7 +440,8 @@ class TestRunSetupWizard:
     @pytest.mark.parametrize("choice, expected_mode, expected_upload", [
         (1, "public", "cloud"),
         (2, "internal", "local"),
-        (3, "internal", "ask"),
+        (3, "public", "both"),
+        (4, "internal", "ask"),
     ])
     def test_wizard_cancel_saves_destination(self, tmp_path, choice, expected_mode, expected_upload):
         """User cancels TUI — destination preference still saved, no app keys written."""
