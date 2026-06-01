@@ -2198,11 +2198,20 @@ def _emit_capture_health_event(
 ) -> str:
     """Emit the right stderr event for a capture-health edge (SCR-76).
 
-    A TCC ``label`` reuses the existing terminal-capable ``permission_lost``
-    (so the shell's deny path is preserved unchanged); ``None`` (non-TCC /
-    inconclusive) emits the advisory, non-terminal ``capture_unhealthy`` with a
-    closed-set ``reason``. ``emit`` is the ``emit_event`` callable, injected so
-    this mapping is unit-testable. Returns the emitted event ``type`` string.
+    Only a ``screen_recording`` denial is terminal: it reuses the existing
+    terminal-capable ``permission_lost`` (so the shell's deny path is preserved
+    unchanged), because losing Screen Recording means the core screen capture is
+    genuinely dead. Every other outcome is the advisory, non-terminal
+    ``capture_unhealthy`` with a closed-set ``reason``: a ``None`` label (non-TCC
+    / inconclusive), AND an ``accessibility`` / ``input_monitoring`` label
+    (SCR-101). The latter two are best-guess attributions for a window / action
+    stall whose true cause is NOT those permissions — the window reader's output
+    rides ``CGWindowListCopyWindowInfo`` and the action reader rides the input
+    listener, both independent of Accessibility — so acting terminally on that
+    guess would self-stop an otherwise-healthy screen+audio recording (the
+    capture-health detector is emit-only / fail-open by design). ``emit`` is the
+    ``emit_event`` callable, injected so this mapping is unit-testable. Returns
+    the emitted event ``type`` string.
     """
     from screencap._stderr_events import (
         CAPTURE_UNHEALTHY_REASON_LISTENER_DEAD,
@@ -2210,7 +2219,7 @@ def _emit_capture_health_event(
         EVENT_CAPTURE_UNHEALTHY,
         EVENT_PERMISSION_LOST,
     )
-    if label is not None:
+    if label == "screen_recording":
         emit(EVENT_PERMISSION_LOST, permission=label, elapsed=elapsed)
         return EVENT_PERMISSION_LOST
     reason = (

@@ -99,6 +99,25 @@ def test_tcc_attribution_routes_to_permission_lost():
     assert isinstance(captured[0]["elapsed"], float)
 
 
+def test_nonscreen_attribution_stays_advisory_not_terminal():
+    # SCR-101: a window-reader stall attributed to Accessibility must surface as
+    # the advisory capture_unhealthy through the real wiring — NOT the terminal
+    # permission_lost the shell turns into stop(). The window reader's output
+    # rides CGWindowList (Screen-Recording-gated), so it is independent of
+    # Accessibility; if it stalls for any other reason while AX is denied (a very
+    # common config), the labeller guesses "accessibility", and that guess must
+    # never self-stop an otherwise-healthy screen+audio recording.
+    ticks = []
+    for i in range(1, 5):
+        ticks.append(({"window.attempt": 20 * i, "window.output": 0}, 100.0 + i, True))
+    captured = _run_ticks(ticks, window_secs=0.0, debounce=3,
+                          probe=lambda r: "accessibility")
+    assert len(captured) == 1
+    assert captured[0]["type"] == "capture_unhealthy"
+    assert captured[0]["reader"] == "window"
+    assert captured[0]["reason"] == "reader_stalled"
+
+
 def test_action_listener_dead_routes_to_capture_unhealthy_listener_dead():
     # AE2: action listener dead (heartbeat False), no TCC attribution → advisory.
     ticks = [({}, 100.0 + i, False) for i in range(1, 5)]

@@ -373,6 +373,43 @@ class TestEmitCaptureHealthEvent:
         assert t == "permission_lost"
         assert captured == [("permission_lost", {"permission": "screen_recording", "elapsed": 12.0})]
 
+    def test_only_screen_recording_label_is_terminal(self):
+        # SCR-101: screen_recording denial is genuinely fatal (the screen capture
+        # is dead) → terminal permission_lost. accessibility / input_monitoring
+        # are best-guess attributions for a window/action stall whose true cause
+        # is NOT those permissions (window output rides CGWindowList, action
+        # rides the input listener), so they must stay advisory and never
+        # self-stop an otherwise-healthy screen+audio recording.
+        def _sink(et, **f):
+            return None
+        assert recorder._emit_capture_health_event("screen", "screen_recording", 1.0, _sink) == "permission_lost"
+        assert recorder._emit_capture_health_event("window", "accessibility", 1.0, _sink) == "capture_unhealthy"
+        assert recorder._emit_capture_health_event("action", "input_monitoring", 1.0, _sink) == "capture_unhealthy"
+
+    def test_accessibility_label_emits_advisory_not_terminal(self):
+        # SCR-101 regression: a window-reader stall mislabelled "accessibility"
+        # (the labeller checks _ax first for the window reader) must NOT emit the
+        # terminal permission_lost the shell turns into stop(). It surfaces as
+        # the advisory capture_unhealthy, and the reason reflects the symptom.
+        captured = []
+        t = recorder._emit_capture_health_event(
+            "window", "accessibility", 7.0, lambda et, **f: captured.append((et, f)),
+        )
+        assert t == "capture_unhealthy"
+        assert captured == [
+            ("capture_unhealthy", {"reason": "reader_stalled", "reader": "window", "elapsed": 7.0})
+        ]
+
+    def test_input_monitoring_label_emits_advisory_listener_dead(self):
+        # SCR-101: an action-listener stall mislabelled "input_monitoring" stays
+        # advisory; the reason still reflects the symptom (listener_dead).
+        captured = []
+        t = recorder._emit_capture_health_event(
+            "action", "input_monitoring", 7.0, lambda et, **f: captured.append((et, f)),
+        )
+        assert t == "capture_unhealthy"
+        assert captured[0][1]["reason"] == "listener_dead"
+
     def test_inconclusive_reader_emits_capture_unhealthy_reader_stalled(self):
         captured = []
         t = recorder._emit_capture_health_event(
