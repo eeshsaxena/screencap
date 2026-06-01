@@ -21,7 +21,7 @@ import time
 import tracemalloc
 from collections import defaultdict, namedtuple
 from functools import partial
-from typing import Any, Callable, Optional
+from typing import TYPE_CHECKING, Any, Callable, Optional
 
 import av
 import fire
@@ -52,6 +52,9 @@ try:
     import soundfile
 except ImportError:
     soundfile = None
+
+if TYPE_CHECKING:
+    from screencap._stderr_events import PermissionLabel
 
 
 def _send_profiling_via_wormhole(profile_path: str) -> None:
@@ -2081,7 +2084,7 @@ def _action_listener_alive() -> bool:
     return not saw_sample
 
 
-def _probe_tcc_denied(reader: str | None = None) -> str | None:
+def _probe_tcc_denied(reader: str | None = None) -> "PermissionLabel | None":
     """In-process TCC attribution for an observed capture-health symptom (SCR-76).
 
     Returns the ``permission`` label of the first permission that reports
@@ -2102,31 +2105,36 @@ def _probe_tcc_denied(reader: str | None = None) -> str | None:
     """
     if sys.platform != "darwin":
         return None
+    from screencap._stderr_events import (
+        PERMISSION_ACCESSIBILITY,
+        PERMISSION_INPUT_MONITORING,
+        PERMISSION_SCREEN_RECORDING,
+    )
     try:
         import Quartz
     except Exception:
         return None
 
-    def _screen() -> str | None:
+    def _screen() -> "PermissionLabel | None":
         try:
-            return "screen_recording" if Quartz.CGPreflightScreenCaptureAccess() is False else None
+            return PERMISSION_SCREEN_RECORDING if Quartz.CGPreflightScreenCaptureAccess() is False else None
         except Exception:
             return None
 
-    def _input() -> str | None:
+    def _input() -> "PermissionLabel | None":
         try:
-            return "input_monitoring" if Quartz.CGPreflightListenEventAccess() is False else None
+            return PERMISSION_INPUT_MONITORING if Quartz.CGPreflightListenEventAccess() is False else None
         except Exception:
             return None
 
-    def _ax() -> str | None:
+    def _ax() -> "PermissionLabel | None":
         try:
             from ApplicationServices import (
                 AXIsProcessTrustedWithOptions,
                 kAXTrustedCheckOptionPrompt,
             )
             trusted = AXIsProcessTrustedWithOptions({kAXTrustedCheckOptionPrompt: False})
-            return "accessibility" if trusted is False else None
+            return PERMISSION_ACCESSIBILITY if trusted is False else None
         except Exception:
             return None
 
@@ -2194,23 +2202,33 @@ def _capture_health_step(
 
 
 def _emit_capture_health_event(
-    reader: str, label: str | None, elapsed: float, emit: Callable[..., None]
+    reader: str, label: "PermissionLabel | None", elapsed: float, emit: Callable[..., None]
 ) -> str:
     """Emit the right stderr event for a capture-health edge (SCR-76).
 
-    A TCC ``label`` reuses the existing terminal-capable ``permission_lost``
-    (so the shell's deny path is preserved unchanged); ``None`` (non-TCC /
-    inconclusive) emits the advisory, non-terminal ``capture_unhealthy`` with a
-    closed-set ``reason``. ``emit`` is the ``emit_event`` callable, injected so
-    this mapping is unit-testable. Returns the emitted event ``type`` string.
+    Only a ``screen_recording`` denial is terminal: it reuses the existing
+    terminal-capable ``permission_lost`` (so the shell's deny path is preserved
+    unchanged), because losing Screen Recording means the core screen capture is
+    genuinely dead. Every other outcome is the advisory, non-terminal
+    ``capture_unhealthy`` with a closed-set ``reason``: a ``None`` label (non-TCC
+    / inconclusive), AND an ``accessibility`` / ``input_monitoring`` label
+    (SCR-101). The latter two are best-guess attributions for a window / action
+    stall whose true cause is NOT those permissions — the window reader's output
+    rides ``CGWindowListCopyWindowInfo`` and the action reader rides the input
+    listener, both independent of Accessibility — so acting terminally on that
+    guess would self-stop an otherwise-healthy screen+audio recording (the
+    capture-health detector is emit-only / fail-open by design). ``emit`` is the
+    ``emit_event`` callable, injected so this mapping is unit-testable. Returns
+    the emitted event ``type`` string.
     """
     from screencap._stderr_events import (
         CAPTURE_UNHEALTHY_REASON_LISTENER_DEAD,
         CAPTURE_UNHEALTHY_REASON_READER_STALLED,
         EVENT_CAPTURE_UNHEALTHY,
         EVENT_PERMISSION_LOST,
+        PERMISSION_SCREEN_RECORDING,
     )
-    if label is not None:
+    if label == PERMISSION_SCREEN_RECORDING:
         emit(EVENT_PERMISSION_LOST, permission=label, elapsed=elapsed)
         return EVENT_PERMISSION_LOST
     reason = (

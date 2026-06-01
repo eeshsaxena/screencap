@@ -27,8 +27,12 @@ process exit code): 0=clean, 2=lock-held, 3=permission_lost, 4=disk_full,
 ``capture_unhealthy`` (SCR-76) is ADVISORY: it has NO exit code and never
 terminates a recording. The engine's mid-recording supervisor emits it once
 per detection edge when a reader is demonstrably attempting but producing no
-useful output AND the cause is not an identifiable TCC denial (those reuse
-the terminal-capable ``permission_lost`` instead). Fields:
+useful output AND the cause is not a ``screen_recording`` denial. Only a
+``screen_recording`` denial reuses the terminal-capable ``permission_lost``
+(the core screen capture is genuinely dead); an ``accessibility`` /
+``input_monitoring`` attribution is a best-guess for a window / action stall
+whose true cause is independent of those permissions (SCR-101), so it stays
+advisory rather than self-stopping a healthy screen+audio recording. Fields:
   - ``reason``: one of ``CAPTURE_UNHEALTHY_REASONS`` (closed set — never
     runtime-derived text, since it rides the daemon EventBus to any
     same-EUID subscriber).
@@ -44,7 +48,7 @@ from __future__ import annotations
 import json
 import sys
 import time
-from typing import Any
+from typing import Any, Literal
 
 EVENT_SCHEMA_VERSION = 1
 
@@ -60,8 +64,9 @@ EVENT_DISK_FULL = "disk_full"
 EVENT_PERMISSION_LOST = "permission_lost"
 # Advisory mid-recording capture-health signal (SCR-76). Emitted by the
 # engine's supervisor loop when a reader is demonstrably attempting but
-# producing no useful output AND the cause is NOT an identifiable TCC denial
-# (those reuse permission_lost). ADVISORY: no exit code, never terminal.
+# producing no useful output AND the cause is NOT a screen_recording denial
+# (only that reuses permission_lost; accessibility / input_monitoring stay
+# advisory per SCR-101). ADVISORY: no exit code, never terminal.
 EVENT_CAPTURE_UNHEALTHY = "capture_unhealthy"
 EVENT_STOPPED = "stopped"
 EVENT_MENUBAR_NEUTRALIZED_BY_ENV = "menubar_neutralized_by_env"
@@ -95,6 +100,21 @@ CAPTURE_UNHEALTHY_REASONS = frozenset({
     CAPTURE_UNHEALTHY_REASON_READER_STALLED,
     CAPTURE_UNHEALTHY_REASON_LISTENER_DEAD,
 })
+
+# TCC permission labels (SCR-76 / SCR-101). Closed set: used as the
+# ``permission`` field on permission_lost and as the capture-health
+# attribution label. Named so a typo fails at import, renames are
+# single-site, and tests share the names with production.
+PERMISSION_SCREEN_RECORDING = "screen_recording"
+PERMISSION_INPUT_MONITORING = "input_monitoring"
+PERMISSION_ACCESSIBILITY = "accessibility"
+PERMISSION_LABELS = frozenset({
+    PERMISSION_SCREEN_RECORDING,
+    PERMISSION_INPUT_MONITORING,
+    PERMISSION_ACCESSIBILITY,
+})
+# Type alias mirroring PERMISSION_LABELS for use in type hints.
+PermissionLabel = Literal["screen_recording", "input_monitoring", "accessibility"]
 
 
 def emit_event(event_type: str, **fields: Any) -> None:
@@ -131,6 +151,11 @@ __all__ = [
     "CAPTURE_UNHEALTHY_REASON_READER_STALLED",
     "CAPTURE_UNHEALTHY_REASON_LISTENER_DEAD",
     "CAPTURE_UNHEALTHY_REASONS",
+    "PERMISSION_SCREEN_RECORDING",
+    "PERMISSION_INPUT_MONITORING",
+    "PERMISSION_ACCESSIBILITY",
+    "PERMISSION_LABELS",
+    "PermissionLabel",
     "EVENT_STOPPED",
     "EVENT_MENUBAR_NEUTRALIZED_BY_ENV",
     "EVENT_MATRIX_DISCLOSURE_REQUIRED",
