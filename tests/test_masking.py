@@ -66,7 +66,7 @@ def _avg_brightness(path: Path) -> float:
     from PIL import Image
 
     img = Image.open(path).convert("L")  # grayscale
-    pixels = list(img.get_flattened_data())
+    pixels = list(img.getdata())
     return sum(pixels) / len(pixels)
 
 
