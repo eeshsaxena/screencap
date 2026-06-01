@@ -1274,7 +1274,7 @@ def test_upload_warns_but_proceeds_for_local_intent_in_all_mode(tmp_path):
         mock.patch(
             "screencap.scrubber.scrub_recording",
             return_value=mock.MagicMock(output_dir=rec_dir, entity_counts={}),
-        ),
+        ) as mock_scrub,
     ):
         mock_upload.return_value = mock.MagicMock(
             uploaded=["recording.db", "events.jsonl"],
@@ -1289,6 +1289,10 @@ def test_upload_warns_but_proceeds_for_local_intent_in_all_mode(tmp_path):
     assert "post-hoc scrubbing" in result.output
     # ...but the upload still proceeds (explicit upload overrides intent).
     mock_upload.assert_called_once()
+    mock_scrub.assert_called_once()
+    # The upload receives the scrubbed dir (scrub_result.output_dir).
+    uploaded_dir = mock_upload.call_args[0][0]
+    assert uploaded_dir == rec_dir
 
 
 def test_upload_cloud_intent_proceeds(tmp_path):

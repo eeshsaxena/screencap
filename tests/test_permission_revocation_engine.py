@@ -162,10 +162,13 @@ class TestCheckPermissionsNow:
         import subprocess as _subprocess
         from screencap import recorder
 
-        class _FakeResult:
-            stdout = "ImportError: traceback...\n"
-
-        monkeypatch.setattr(_subprocess, "run", lambda *a, **k: _FakeResult())
+        monkeypatch.setattr(
+            _subprocess,
+            "run",
+            lambda *a, **k: _subprocess.CompletedProcess(
+                args=[], returncode=0, stdout="ImportError: traceback...\n", stderr=""
+            ),
+        )
         result = recorder._check_permission_fresh("Screen Recording")
         assert result is None
 
@@ -185,14 +188,20 @@ class TestCheckPermissionsNow:
 
         monkeypatch.setattr(sys, "platform", "darwin")
 
-        class _FakeResult:
-            stdout = (
-                "Traceback (most recent call last):\n"
-                "ModuleNotFoundError: No module named "
-                "'screencap.engine.platform.darwin'\n"
-            )
-
-        monkeypatch.setattr(_subprocess, "run", lambda *a, **k: _FakeResult())
+        monkeypatch.setattr(
+            _subprocess,
+            "run",
+            lambda *a, **k: _subprocess.CompletedProcess(
+                args=[],
+                returncode=0,
+                stdout=(
+                    "Traceback (most recent call last):\n"
+                    "ModuleNotFoundError: No module named "
+                    "'screencap.engine.platform.darwin'\n"
+                ),
+                stderr="",
+            ),
+        )
 
         ok, missing = recorder._check_permissions_now()
         assert ok is True

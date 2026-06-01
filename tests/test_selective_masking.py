@@ -36,6 +36,8 @@ from screencap.privacy.recorder_enforcement import (
     RecorderPrivacyFilter,
 )
 
+from tests._image_helpers import _avg_brightness
+
 pytestmark = pytest.mark.privacy
 
 
@@ -61,14 +63,6 @@ def _make_config(**kwargs) -> PrivacyConfig:
 def _make_evaluator(**kwargs) -> DefaultPolicyEvaluator:
     cfg = parse_privacy_config({"privacy": kwargs})
     return DefaultPolicyEvaluator(cfg)
-
-
-def _avg_brightness(path: Path) -> float:
-    from PIL import Image
-
-    img = Image.open(path).convert("L")
-    pixels = list(img.getdata())
-    return sum(pixels) / len(pixels)
 
 
 def _create_geometry_db(db_path: Path, rows: list[tuple[float, str]]) -> None:

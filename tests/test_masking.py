@@ -15,6 +15,8 @@ from pathlib import Path
 
 import pytest
 
+from tests._image_helpers import _avg_brightness
+
 from screencap.privacy.actions import PrivacyAction
 from screencap.privacy.context import DefaultContextClassifier, WindowContext
 from screencap.privacy.masking import (
@@ -59,15 +61,6 @@ def _make_window_events(specs: list[tuple[float, str]]) -> list[WindowContext]:
         WindowContext(timestamp=ts, app_bundle_id=bid, title="")
         for ts, bid in specs
     ]
-
-
-def _avg_brightness(path: Path) -> float:
-    """Return average pixel brightness (0-255) of a JPEG."""
-    from PIL import Image
-
-    img = Image.open(path).convert("L")  # grayscale
-    pixels = list(img.getdata())
-    return sum(pixels) / len(pixels)
 
 
 # ---------------------------------------------------------------------------
