@@ -524,6 +524,104 @@ class TestConcatVideoChunks:
         assert _dominant_channel(before) == "R", "pre-boundary frame should be red"
         assert _dominant_channel(after) == "B", "post-boundary frame should be blue"
 
+    def test_concat_absolute_offsets_preserve_interchunk_gap(self, tmp_path):
+        """chunk_offsets keep an inter-chunk idle gap so a wall-clock timestamp
+        in the 2nd chunk maps to the right frame (SCR-98 regression).
+
+        Mirrors capture.py:get_frame_at, which looks up ``event_ts - video_start``
+        in the merged timeline. The legacy summed-span concat collapses the idle
+        gap between chunks, so a 2nd-chunk event overshoots the shortened
+        timeline and raises "no frame within tolerance". Absolute offsets keep
+        the gap, so the lookup resolves to the correct chunk.
+        """
+        base = time.time()
+        writer = ChunkedVideoWriter(
+            output_dir=tmp_path, width=64, height=64, chunk_duration=1.0, fps=24
+        )
+        # chunk 0: red at +0.0, +0.5
+        for dt in (0.0, 0.5):
+            writer.write_frame(Image.new("RGB", (64, 64), (220, 0, 0)), base + dt)
+        # ~2.5s idle gap crosses the 1s boundary → chunk 1: blue at +3.0, +3.5
+        for dt in (3.0, 3.5):
+            writer.write_frame(Image.new("RGB", (64, 64), (0, 0, 220)), base + dt)
+        writer.close()
+
+        chunks = sorted(tmp_path.glob("chunk_*.mp4"))
+        assert len(chunks) == 2, f"expected 2 chunks, got {[c.name for c in chunks]}"
+
+        # video_start == first frame, so offsets = chunk_start - video_start —
+        # the same value capture.py subtracts and _chunk_offsets_for_concat builds.
+        out = concat_video_chunks(tmp_path, chunk_offsets={0: 0.0, 1: 3.0})
+
+        # Merged span tracks wall-clock (~3.5s), not the ~1.1s summed-span.
+        container = av.open(str(out))
+        stream = container.streams.video[0]
+        max_pts_sec = max(
+            float(f.pts * stream.time_base) for f in container.decode(stream)
+        )
+        container.close()
+        assert max_pts_sec > 3.0, (
+            f"merged span {max_pts_sec:.3f}s collapsed the inter-chunk gap"
+        )
+
+        # The 2nd-chunk event (wall-relative t=3.0) resolves — and to blue.
+        assert _dominant_channel(extract_frame(out, 3.0, tolerance=0.5)) == "B"
+        # The 1st-chunk event still resolves to red.
+        assert _dominant_channel(extract_frame(out, 0.0, tolerance=0.5)) == "R"
+
+    def test_concat_without_offsets_collapses_gap(self, tmp_path):
+        """Without chunk_offsets, the legacy summed-span behavior is preserved:
+        the inter-chunk gap collapses and a 2nd-chunk wall-clock lookup misses.
+
+        Locks the documented fallback (smoke test / missing-manifest callers)
+        and proves the regression test above guards the gap, not test setup.
+        """
+        base = time.time()
+        writer = ChunkedVideoWriter(
+            output_dir=tmp_path, width=64, height=64, chunk_duration=1.0, fps=24
+        )
+        for dt in (0.0, 0.5):
+            writer.write_frame(Image.new("RGB", (64, 64), (220, 0, 0)), base + dt)
+        for dt in (3.0, 3.5):
+            writer.write_frame(Image.new("RGB", (64, 64), (0, 0, 220)), base + dt)
+        writer.close()
+
+        out = concat_video_chunks(tmp_path)  # no offsets → summed-span
+
+        container = av.open(str(out))
+        stream = container.streams.video[0]
+        max_pts_sec = max(
+            float(f.pts * stream.time_base) for f in container.decode(stream)
+        )
+        container.close()
+        assert max_pts_sec < 2.0, "summed-span timeline should stay short"
+        with pytest.raises(ValueError, match="No frame within tolerance"):
+            extract_frame(out, 3.0, tolerance=0.5)
+
+    def test_concat_raises_on_partial_offsets_map(self, tmp_path):
+        """A chunk_offsets map missing a chunk's index → ValueError (SCR-98).
+
+        The engine is a public API; a partial map would silently place the
+        uncovered chunk back-to-back while its peers are absolute — an unsound
+        hybrid timeline. Reject it loudly and leave no partial output/temp.
+        """
+        base = time.time()
+        writer = ChunkedVideoWriter(
+            output_dir=tmp_path, width=64, height=64, chunk_duration=1.0, fps=24
+        )
+        for dt in (0.0, 0.5):
+            writer.write_frame(Image.new("RGB", (64, 64), (220, 0, 0)), base + dt)
+        for dt in (3.0, 3.5):
+            writer.write_frame(Image.new("RGB", (64, 64), (0, 0, 220)), base + dt)
+        writer.close()
+        assert len(sorted(tmp_path.glob("chunk_*.mp4"))) == 2
+
+        # Map covers chunk 0 but omits chunk 1 → reject.
+        with pytest.raises(ValueError, match="missing an entry for chunk_0001"):
+            concat_video_chunks(tmp_path, chunk_offsets={0: 0.0})
+        assert not (tmp_path / "video.mp4").exists()
+        assert not list(tmp_path.glob(".video.mp4.*.tmp"))
+
     def test_concat_raises_without_chunks(self, tmp_path):
         """No chunk_*.mp4 → ValueError (caller is expected to pre-check)."""
         with pytest.raises(ValueError, match="No chunk"):

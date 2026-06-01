@@ -23,6 +23,80 @@ err_console = Console(stderr=True)
 _MAX_VIEWER_SIZE_BYTES = 200_000_000  # 200 MB
 
 
+def _chunk_offsets_for_concat(rec_dir: Path) -> dict[int, float] | None:
+    """Map ``chunk_index -> seconds from recording start`` for absolute concat.
+
+    Lets ``concat_video_chunks`` place each chunk at its real wall-clock offset
+    so multi-chunk action-gated recordings keep the inter-chunk idle gaps that
+    ``capture.py:get_frame_at`` relies on (SCR-98). Each value is
+    ``chunk_start - video_start``, where:
+
+    * ``chunk_start`` is the chunk's first-frame wall-clock, read from the
+      ``chunk_NNNN_manifest.json`` ``chunk_start`` field (the durable on-disk
+      carrier of ``ChunkedVideoWriter``'s rotation ``chunk_start_time``); and
+    * ``video_start`` is the recording's ``video_start_time`` (falling back to
+      ``timestamp``) — the exact anchor ``get_frame_at`` subtracts.
+
+    Returns ``None`` (→ engine falls back to legacy summed-span stitching) when
+    the data needed to place chunks absolutely is incomplete: fewer than two
+    chunks, no/unreadable ``recording.db``, no recording row, or any chunk
+    missing a parseable manifest ``chunk_start``. The all-or-nothing contract
+    keeps a partial manifest set from producing a half-absolute timeline.
+    """
+    import json
+
+    from screencap.engine.video import parse_chunk_index
+    from screencap.recording_db import has_table, open_recording_db
+
+    chunks = sorted(rec_dir.glob("chunk_*.mp4"))
+    if len(chunks) < 2:
+        return None
+
+    db_path = find_db(rec_dir)
+    if db_path is None:
+        return None
+    try:
+        with open_recording_db(db_path) as conn:
+            if not has_table(conn, "recording"):
+                return None
+            row = conn.execute(
+                "SELECT video_start_time, timestamp FROM recording LIMIT 1"
+            ).fetchone()
+    except Exception as exc:
+        err_console.print(
+            f"[dim]Could not read chunk offsets from {db_path}: {exc}; "
+            f"falling back to summed-span concat[/dim]"
+        )
+        return None
+    if not row:
+        return None
+    # Mirror get_frame_at's anchor exactly (``video_start_time or timestamp``)
+    # so concat places chunks against the same origin the consumer subtracts.
+    video_start = row[0] or row[1]
+    if video_start is None:
+        return None
+    video_start = float(video_start)
+
+    offsets: dict[int, float] = {}
+    for vf in chunks:
+        idx = parse_chunk_index(vf.stem)
+        if idx is None:
+            return None
+        manifest = rec_dir / f"chunk_{idx:04d}_manifest.json"
+        if not manifest.exists():
+            return None
+        try:
+            chunk_start = float(json.loads(manifest.read_text())["chunk_start"])
+        except (OSError, ValueError, KeyError, TypeError) as exc:
+            err_console.print(
+                f"[dim]Cannot read chunk_start from {manifest.name}: {exc}; "
+                f"falling back to summed-span concat[/dim]"
+            )
+            return None
+        offsets[idx] = chunk_start - video_start
+    return offsets
+
+
 def _ensure_single_video(rec_dir: Path, *, fail_loud: bool = False) -> None:
     """If only chunked videos exist, concatenate them into ``rec_dir/video.mp4``.
 
@@ -62,7 +136,10 @@ def _ensure_single_video(rec_dir: Path, *, fail_loud: bool = False) -> None:
     try:
         from screencap.engine.video import concat_video_chunks
 
-        concat_video_chunks(rec_dir)
+        # Absolute per-chunk offsets keep inter-chunk idle gaps so the merged
+        # timeline tracks wall-clock recording time (SCR-98); None → engine
+        # falls back to legacy summed-span stitching.
+        concat_video_chunks(rec_dir, chunk_offsets=_chunk_offsets_for_concat(rec_dir))
         err_console.print(f"[dim]Created merged video ({len(chunks)} chunks)[/dim]")
     except Exception as e:
         if fail_loud:

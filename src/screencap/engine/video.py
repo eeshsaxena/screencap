@@ -34,6 +34,14 @@ _FRAG_MP4_OPTIONS: dict[str, str] = {
 }
 
 
+def parse_chunk_index(stem: str) -> int | None:
+    """Parse the chunk index from a chunk file stem like 'chunk_0003' → 3. None if unparseable."""
+    try:
+        return int(stem.split("_")[1])
+    except (IndexError, ValueError):
+        return None
+
+
 # =============================================================================
 # Video Writer
 # =============================================================================
@@ -903,7 +911,11 @@ def _discard_failed_output(
     tmp_path.unlink(missing_ok=True)
 
 
-def concat_video_chunks(rec_dir: str | Path) -> Path:
+def concat_video_chunks(
+    rec_dir: str | Path,
+    *,
+    chunk_offsets: dict[int, float] | None = None,
+) -> Path:
     """Concatenate ``chunk_*.mp4`` into a single ``rec_dir/video.mp4`` via PyAV.
 
     In-process stream-copy remux (no re-encode) — fast, lossless, and pixel
@@ -913,15 +925,27 @@ def concat_video_chunks(rec_dir: str | Path) -> Path:
 
     The chunks are written by ``ChunkedVideoWriter`` with ``bf=0`` (no
     B-frames), so within each chunk ``PTS == DTS`` and timestamps are monotonic
-    from ~0. They are stitched back-to-back: each subsequent chunk's packet
-    timestamps are offset by the cumulative duration of all preceding chunks,
-    producing a single monotonic timeline starting at ~0. This matches the
-    semantics of the ``ffmpeg -f concat`` it replaces. NOTE: like that prior
-    behavior, the *wall-clock* idle gap between one chunk's last frame and the
-    next chunk's first frame is not represented (each chunk's PTS restarts at
-    ~0), so for multi-chunk action-gated recordings the merged timeline tracks
-    summed intra-chunk spans, not absolute recording time — a pre-existing
-    limitation that ``engine/capture.py:get_frame_at`` inherits unchanged.
+    from ~0.
+
+    Two offset modes (SCR-98). ``chunk_offsets`` must be either a **complete**
+    map covering every chunk or ``None`` — a partial map is rejected with
+    ``ValueError`` (a missing index would otherwise place that chunk
+    back-to-back while its peers are absolute, an unsound hybrid timeline):
+
+    * ``chunk_offsets`` provided (complete) — each chunk ``idx`` is shifted to
+      its **absolute** start ``chunk_offsets[idx]`` (seconds from recording
+      start, computed by the caller as ``chunk_start - video_start_time``). This
+      preserves the *wall-clock* idle gap between one chunk's last frame and the
+      next chunk's first, so the merged timeline tracks absolute recording time
+      — exactly what ``engine/capture.py:get_frame_at`` assumes when it looks up
+      ``event_ts - video_start``. The placement is floored at the previous
+      chunk's end, so a pathological non-monotonic start can never break the mux.
+    * ``chunk_offsets`` is ``None`` — every chunk is stitched back-to-back:
+      offset by the cumulative duration of all preceding chunks, a monotonic
+      timeline starting at ~0. This matches the prior ``ffmpeg -f concat``
+      semantics and collapses inter-chunk idle gaps. It is the fallback for
+      callers without per-chunk start metadata (e.g. the smoke test) and for
+      recordings whose chunk manifests are unavailable.
 
     The output is a plain (non-fragmented) MP4 with the moov atom at the end —
     **not** faststart. ``extract_frames``/``extract_frame`` consume this file
@@ -934,12 +958,18 @@ def concat_video_chunks(rec_dir: str | Path) -> Path:
 
     Args:
         rec_dir: Recording directory containing the ``chunk_*.mp4`` files.
+        chunk_offsets: Optional ``{chunk_index: seconds_from_recording_start}``
+            map. When given it must be **complete** — covering every chunk —
+            and each chunk is placed at its absolute offset (preserving
+            inter-chunk idle gaps). Pass ``None`` for legacy back-to-back
+            summed-span stitching of all chunks.
 
     Returns:
         Path to the merged ``rec_dir/video.mp4``.
 
     Raises:
-        ValueError: If no ``chunk_*.mp4`` files are present.
+        ValueError: If no ``chunk_*.mp4`` files are present, or if
+            ``chunk_offsets`` is a partial map missing an entry for some chunk.
         RuntimeError: If a chunk cannot be opened/decoded by PyAV — fail loud
             rather than silently emit a truncated video.
     """
@@ -947,6 +977,19 @@ def concat_video_chunks(rec_dir: str | Path) -> Path:
     chunks = sorted(rec_dir.glob("chunk_*.mp4"))
     if not chunks:
         raise ValueError(f"No chunk_*.mp4 files to concatenate in {rec_dir}")
+
+    # A chunk_offsets map must be complete: every chunk needs an entry, or a
+    # missing index would silently fall back to summed-span placement and
+    # produce an unsound hybrid (part-absolute, part-back-to-back) timeline.
+    # Callers pass either a full map (absolute placement) or None (legacy).
+    if chunk_offsets is not None:
+        for chunk in chunks:
+            idx = parse_chunk_index(chunk.stem)
+            if idx is None or idx not in chunk_offsets:
+                raise ValueError(
+                    f"chunk_offsets is missing an entry for {chunk.name}; pass a "
+                    f"complete map covering every chunk, or None for legacy stitching"
+                )
 
     out_path = rec_dir / "video.mp4"
     # Dot-prefixed temp sibling: excluded from upload (dotfile filter) and from
@@ -960,11 +1003,15 @@ def concat_video_chunks(rec_dir: str | Path) -> Path:
     try:
         out_stream = None
         template_params: tuple[int, int, str] | None = None
-        # Cumulative offset in the (shared) input stream time_base. All chunks
-        # come from the same recorder config, so their time_bases match and
-        # ``add_stream_from_template`` gives the output that same time_base.
+        # Running offset in the (shared) input stream time_base, expressed as an
+        # absolute output PTS. All chunks come from the same recorder config, so
+        # their time_bases match and ``add_stream_from_template`` gives the
+        # output that same time_base. ``offset`` doubles as the monotonicity
+        # floor (the previous chunk's end), so an absolute placement can never
+        # put a chunk before its predecessor.
         offset = 0
         for chunk in chunks:
+            idx = parse_chunk_index(chunk.stem)
             try:
                 inp = av.open(str(chunk))
             except Exception as exc:  # corrupt/undecodable chunk — fail loud
@@ -990,29 +1037,39 @@ def concat_video_chunks(rec_dir: str | Path) -> Path:
                         f"Chunk {chunk.name} params {params} differ from the first "
                         f"chunk {template_params}; cannot stream-copy concat"
                     )
+                # Place this chunk at its absolute recording offset when the
+                # caller supplied one (SCR-98 — preserves the inter-chunk idle
+                # gap); otherwise stitch back-to-back from the running offset.
+                # Either way floor at ``offset`` (the previous chunk's end) so
+                # the muxed timeline stays monotonic.
+                if chunk_offsets is not None and idx is not None and idx in chunk_offsets:
+                    abs_offset = round(chunk_offsets[idx] / float(in_stream.time_base))
+                    base_offset = max(abs_offset, offset)
+                else:
+                    base_offset = offset
                 # Estimate a fallback frame duration (in time_base ticks) for
                 # packets missing one, so the next chunk's offset never overlaps
                 # the last frame. average_rate/time_base are Fractions, so this
                 # stays exact with no float round-trip.
                 rate = in_stream.average_rate
                 fallback_dur = round(1 / (rate * in_stream.time_base)) if rate else 1
-                chunk_end = 0
+                chunk_end = base_offset
                 for packet in inp.demux(in_stream):
                     # Flush packets carry no timestamps — skip them.
                     if packet.dts is None or packet.pts is None:
                         continue
                     orig_pts = packet.pts
                     dur = packet.duration or fallback_dur
-                    packet.pts = orig_pts + offset
-                    packet.dts = packet.dts + offset
+                    packet.pts = orig_pts + base_offset
+                    packet.dts = packet.dts + base_offset
                     # Reassigning the stream rescales timestamps into the
                     # output time_base (a no-op here, since they match).
                     packet.stream = out_stream
                     output.mux(packet)
-                    end = orig_pts + dur
+                    end = base_offset + orig_pts + dur
                     if end > chunk_end:
                         chunk_end = end
-                if chunk_end == 0:
+                if chunk_end == base_offset:
                     # A chunk that matched the template but muxed no timestamped
                     # packets would leave offset unadvanced, overlapping the next
                     # chunk's PTS. Recorder chunks always carry packets, so this
@@ -1022,7 +1079,7 @@ def concat_video_chunks(rec_dir: str | Path) -> Path:
                         f"Chunk {chunk.name} produced no timestamped packets; "
                         f"cannot stream-copy concat without corrupting the timeline"
                     )
-                offset += chunk_end
+                offset = chunk_end
             finally:
                 inp.close()
         # If the close times out the moov atom may be unwritten — do not promote
