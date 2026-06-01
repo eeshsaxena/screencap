@@ -48,7 +48,7 @@ from __future__ import annotations
 import json
 import sys
 import time
-from typing import Any
+from typing import Any, Literal
 
 EVENT_SCHEMA_VERSION = 1
 
@@ -101,6 +101,21 @@ CAPTURE_UNHEALTHY_REASONS = frozenset({
     CAPTURE_UNHEALTHY_REASON_LISTENER_DEAD,
 })
 
+# TCC permission labels (SCR-76 / SCR-101). Closed set: used as the
+# ``permission`` field on permission_lost and as the capture-health
+# attribution label. Named so a typo fails at import, renames are
+# single-site, and tests share the names with production.
+PERMISSION_SCREEN_RECORDING = "screen_recording"
+PERMISSION_INPUT_MONITORING = "input_monitoring"
+PERMISSION_ACCESSIBILITY = "accessibility"
+PERMISSION_LABELS = frozenset({
+    PERMISSION_SCREEN_RECORDING,
+    PERMISSION_INPUT_MONITORING,
+    PERMISSION_ACCESSIBILITY,
+})
+# Type alias mirroring PERMISSION_LABELS for use in type hints.
+PermissionLabel = Literal["screen_recording", "input_monitoring", "accessibility"]
+
 
 def emit_event(event_type: str, **fields: Any) -> None:
     """Write a single JSON line to stderr describing a recorder lifecycle event.
@@ -136,6 +151,11 @@ __all__ = [
     "CAPTURE_UNHEALTHY_REASON_READER_STALLED",
     "CAPTURE_UNHEALTHY_REASON_LISTENER_DEAD",
     "CAPTURE_UNHEALTHY_REASONS",
+    "PERMISSION_SCREEN_RECORDING",
+    "PERMISSION_INPUT_MONITORING",
+    "PERMISSION_ACCESSIBILITY",
+    "PERMISSION_LABELS",
+    "PermissionLabel",
     "EVENT_STOPPED",
     "EVENT_MENUBAR_NEUTRALIZED_BY_ENV",
     "EVENT_MATRIX_DISCLOSURE_REQUIRED",

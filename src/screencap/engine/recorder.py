@@ -21,7 +21,7 @@ import time
 import tracemalloc
 from collections import defaultdict, namedtuple
 from functools import partial
-from typing import Any, Callable, Optional
+from typing import TYPE_CHECKING, Any, Callable, Optional
 
 import av
 import fire
@@ -52,6 +52,9 @@ try:
     import soundfile
 except ImportError:
     soundfile = None
+
+if TYPE_CHECKING:
+    from screencap._stderr_events import PermissionLabel
 
 
 def _send_profiling_via_wormhole(profile_path: str) -> None:
@@ -2081,7 +2084,7 @@ def _action_listener_alive() -> bool:
     return not saw_sample
 
 
-def _probe_tcc_denied(reader: str | None = None) -> str | None:
+def _probe_tcc_denied(reader: str | None = None) -> "PermissionLabel | None":
     """In-process TCC attribution for an observed capture-health symptom (SCR-76).
 
     Returns the ``permission`` label of the first permission that reports
@@ -2102,31 +2105,36 @@ def _probe_tcc_denied(reader: str | None = None) -> str | None:
     """
     if sys.platform != "darwin":
         return None
+    from screencap._stderr_events import (
+        PERMISSION_ACCESSIBILITY,
+        PERMISSION_INPUT_MONITORING,
+        PERMISSION_SCREEN_RECORDING,
+    )
     try:
         import Quartz
     except Exception:
         return None
 
-    def _screen() -> str | None:
+    def _screen() -> "PermissionLabel | None":
         try:
-            return "screen_recording" if Quartz.CGPreflightScreenCaptureAccess() is False else None
+            return PERMISSION_SCREEN_RECORDING if Quartz.CGPreflightScreenCaptureAccess() is False else None
         except Exception:
             return None
 
-    def _input() -> str | None:
+    def _input() -> "PermissionLabel | None":
         try:
-            return "input_monitoring" if Quartz.CGPreflightListenEventAccess() is False else None
+            return PERMISSION_INPUT_MONITORING if Quartz.CGPreflightListenEventAccess() is False else None
         except Exception:
             return None
 
-    def _ax() -> str | None:
+    def _ax() -> "PermissionLabel | None":
         try:
             from ApplicationServices import (
                 AXIsProcessTrustedWithOptions,
                 kAXTrustedCheckOptionPrompt,
             )
             trusted = AXIsProcessTrustedWithOptions({kAXTrustedCheckOptionPrompt: False})
-            return "accessibility" if trusted is False else None
+            return PERMISSION_ACCESSIBILITY if trusted is False else None
         except Exception:
             return None
 
@@ -2194,7 +2202,7 @@ def _capture_health_step(
 
 
 def _emit_capture_health_event(
-    reader: str, label: str | None, elapsed: float, emit: Callable[..., None]
+    reader: str, label: "PermissionLabel | None", elapsed: float, emit: Callable[..., None]
 ) -> str:
     """Emit the right stderr event for a capture-health edge (SCR-76).
 
@@ -2218,8 +2226,9 @@ def _emit_capture_health_event(
         CAPTURE_UNHEALTHY_REASON_READER_STALLED,
         EVENT_CAPTURE_UNHEALTHY,
         EVENT_PERMISSION_LOST,
+        PERMISSION_SCREEN_RECORDING,
     )
-    if label == "screen_recording":
+    if label == PERMISSION_SCREEN_RECORDING:
         emit(EVENT_PERMISSION_LOST, permission=label, elapsed=elapsed)
         return EVENT_PERMISSION_LOST
     reason = (

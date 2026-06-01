@@ -408,7 +408,9 @@ class TestEmitCaptureHealthEvent:
             "action", "input_monitoring", 7.0, lambda et, **f: captured.append((et, f)),
         )
         assert t == "capture_unhealthy"
-        assert captured[0][1]["reason"] == "listener_dead"
+        assert captured == [
+            ("capture_unhealthy", {"reason": "listener_dead", "reader": "action", "elapsed": 7.0})
+        ]
 
     def test_inconclusive_reader_emits_capture_unhealthy_reader_stalled(self):
         captured = []
