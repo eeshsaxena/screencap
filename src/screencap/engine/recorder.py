@@ -4063,7 +4063,12 @@ def record(
 
     # TODO: consolidate terminate_recording and status_pipe
     if status_pipe:
-        status_pipe.send({"type": "record.stopped"})
+        # ``duration_seconds`` mirrors profiling.json so the CLI worker can
+        # recover ``elapsed`` when its live loop never ran (SCR-71).
+        status_pipe.send({
+            "type": "record.stopped",
+            "duration_seconds": round(_profile_duration, 2),
+        })
 
 
 class Recorder:
@@ -4178,6 +4183,10 @@ class Recorder:
         self._status_recv, self._status_send = multiprocessing.Pipe(duplex=False)
         self._ready_event = threading.Event()
         self._stopped_event = threading.Event()
+        # Engine's own recording duration (seconds), carried on the terminal
+        # ``record.stopped`` status message. Used as the ``elapsed`` fallback
+        # when the CLI live loop never ran a single iteration (SCR-71).
+        self._recording_duration: float | None = None
 
         # Chunked recording queues and sync primitives
         self._chunk_rotate_q = None
@@ -4200,36 +4209,51 @@ class Recorder:
         self._pipeline_finalized: bool = False
         self._capture = None  # lazy CaptureSession
 
+    def _handle_status_msg(self, msg: object) -> None:
+        """Apply one status message from record() to recorder state."""
+        if not isinstance(msg, dict):
+            return
+        msg_type = msg.get("type")
+        if msg_type == "record.started":
+            self._ready_event.set()
+        elif msg_type == "record.stopped":
+            # Capture the engine's recording duration BEFORE flipping
+            # ``_stopped_event`` so the value is never lost (SCR-71).
+            self._recording_duration = msg.get("duration_seconds")
+            self._stopped_event.set()
+        elif msg_type == "record.child_died":
+            self._child_crashes.append(msg)
+            name = msg["task_name"]
+            code = msg.get("exitcode")
+            if msg.get("is_critical"):
+                self._health_warning = (
+                    f"\u26a0 {name} crashed (exit {code}) "
+                    f"\u2014 stopping"
+                )
+            else:
+                degraded = [
+                    c["task_name"]
+                    for c in self._child_crashes
+                    if not c.get("is_critical")
+                ]
+                self._health_warning = (
+                    f"\u26a0 {', '.join(degraded)} crashed "
+                    f"\u2014 recording degraded"
+                )
+
     def _drain_status_pipe(self) -> None:
         """Background thread that reads status messages from record()."""
         try:
             while not self._stopped_event.is_set():
                 if self._status_recv.poll(timeout=0.5):
-                    msg = self._status_recv.recv()
-                    if isinstance(msg, dict):
-                        if msg.get("type") == "record.started":
-                            self._ready_event.set()
-                        elif msg.get("type") == "record.stopped":
-                            self._stopped_event.set()
-                        elif msg.get("type") == "record.child_died":
-                            self._child_crashes.append(msg)
-                            name = msg["task_name"]
-                            code = msg.get("exitcode")
-                            if msg.get("is_critical"):
-                                self._health_warning = (
-                                    f"\u26a0 {name} crashed (exit {code}) "
-                                    f"\u2014 stopping"
-                                )
-                            else:
-                                degraded = [
-                                    c["task_name"]
-                                    for c in self._child_crashes
-                                    if not c.get("is_critical")
-                                ]
-                                self._health_warning = (
-                                    f"\u26a0 {', '.join(degraded)} crashed "
-                                    f"\u2014 recording degraded"
-                                )
+                    self._handle_status_msg(self._status_recv.recv())
+            # ``finalize_pipeline`` joins the record thread (which sends the
+            # terminal ``record.stopped``) and then sets ``_stopped_event``
+            # directly as a backstop. That can race the loop's exit check
+            # before ``record.stopped`` \u2014 carrying ``duration_seconds`` \u2014 is
+            # read. Drain whatever is buffered so the duration is never lost.
+            while self._status_recv.poll(timeout=0):
+                self._handle_status_msg(self._status_recv.recv())
         except (EOFError, OSError):
             pass
 
@@ -4385,9 +4409,20 @@ class Recorder:
     def wait_for_ready(self, timeout: float = 60) -> bool:
         """Block until all recording threads/processes have started.
 
-        Returns True if ready, False if timeout expired.
+        Returns ``True`` once the engine reports ready, or ``False`` if the
+        timeout expires **or** a stop is requested first. Honouring the stop
+        signal matters when SIGTERM arrives during startup: ``stop()`` fires
+        before ``record.started`` is emitted, so a bare ``_ready_event.wait``
+        would park the caller until the engine finally readies (or the full
+        timeout elapses) instead of proceeding to teardown (SCR-71).
         """
-        return self._ready_event.wait(timeout=timeout)
+        deadline = time.monotonic() + timeout
+        while not self._ready_event.wait(timeout=0.1):
+            if self._terminate_processing.is_set():
+                return False
+            if time.monotonic() >= deadline:
+                return False
+        return True
 
     @property
     def is_recording(self) -> bool:
@@ -4397,6 +4432,16 @@ class Recorder:
             and self._record_thread.is_alive()
             and not self._terminate_processing.is_set()
         )
+
+    @property
+    def recording_duration(self) -> float | None:
+        """Engine-measured recording duration in seconds, or ``None``.
+
+        Populated from the terminal ``record.stopped`` status message once
+        the record thread has been drained (after ``finalize_pipeline`` /
+        ``__exit__``). Mirrors profiling.json's ``duration_seconds``.
+        """
+        return self._recording_duration
 
     @property
     def health_warning(self) -> str:

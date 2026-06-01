@@ -1087,6 +1087,20 @@ def _run_screen_recorder(rec: "ScreenRecorder") -> "RecordingResult":
     # (ChunkProcessor drain, DB upload, sentinel upload), which can be
     # minutes for chunked cloud recordings.
 
+    # SCR-71: when SIGTERM arrives during engine startup, ``recorder.stop()``
+    # sets ``_terminate_processing`` before the live loop is entered, so its
+    # guard (``recorder.is_recording``) is false on the first check and the
+    # body — the only place ``elapsed`` is assigned — never runs, leaving
+    # ``elapsed`` at 0.0 even though the engine captured real data. ``t0`` was
+    # reset to ready-time, so ``time.time() - t0`` here would also read ~0;
+    # recover the engine's own recording duration (carried on the terminal
+    # ``record.stopped`` message, available now that ``__exit__`` joined the
+    # record thread) so ``.recording_ready.elapsed`` reflects the real run.
+    if elapsed == 0.0:
+        _engine_duration = getattr(recorder, "recording_duration", None)
+        if _engine_duration:
+            elapsed = _engine_duration
+
     # Restore output if we suppressed it
     if not verbose:
         _restore_output()
