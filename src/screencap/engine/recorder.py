@@ -1523,8 +1523,10 @@ def read_screen_events(
             # Recording denial) and still trips the stall verdict + labeller.
             if utils.display_is_asleep():
                 _health_incr("screen.output")
-                if min_interval > 0:
-                    time.sleep(min_interval)
+                # Review (#205): back off to an idle cadence independent of
+                # min_interval so a fps<=0 (uncapped) recording cannot busy-spin
+                # screencapture while the display sleeps.
+                time.sleep(max(min_interval, 1.0))
             continue
         _health_incr("screen.output")
 

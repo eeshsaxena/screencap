@@ -56,7 +56,11 @@ class TestCounters:
         """Drive read_screen_events with a take_screenshot stub yielding `frames`
         (one per iteration); terminate once the list is exhausted. `display_asleep`
         stubs utils.display_is_asleep() so the None-frame branch is exercised
-        against a known display state (SCR-103)."""
+        against a known display state (SCR-103).
+
+        Returns the list of recorded recorder.time.sleep() call durations so a
+        test can assert on the asleep-display backoff (Fix A / review #205)
+        without incurring real multi-second sleeps."""
         from screencap.engine import utils
 
         seq = iter(frames)
@@ -70,13 +74,20 @@ class TestCounters:
                 if seq.__length_hint__() == 0:
                     term.set()
 
+        sleep_durations: list = []
+
+        def fake_sleep(duration=0, *_a, **_k):
+            sleep_durations.append(duration)
+
         monkeypatch.setattr(utils, "take_screenshot", fake_shot)
         monkeypatch.setattr(utils, "display_is_asleep", lambda: display_asleep)
+        monkeypatch.setattr(recorder.time, "sleep", fake_sleep)  # keep tests fast
         monkeypatch.setattr(recorder.config, "SCREEN_CAPTURE_FPS", 0)  # no throttle sleep
         rec = types.SimpleNamespace(timestamp=0.0)
         recorder.read_screen_events(
             queue.Queue(maxsize=100), term, rec, threading.Event(),
         )
+        return sleep_durations
 
     def test_screen_attempt_and_output_advance_on_good_frames(self, monkeypatch):
         self._run_screen_reader(monkeypatch, [_FakeFrame() for _ in range(5)])
@@ -99,6 +110,17 @@ class TestCounters:
         self._run_screen_reader(monkeypatch, [None for _ in range(5)], display_asleep=True)
         assert recorder._capture_health_counts["screen.attempt"] == 5
         assert recorder._capture_health_counts["screen.output"] == 5
+
+    def test_screen_asleep_branch_backs_off(self, monkeypatch):
+        # Fix A (review #205): the asleep-display None branch must back off to an
+        # idle floor (>= 1.0s) independent of min_interval so an uncapped (fps<=0)
+        # recording cannot busy-spin screencapture while the display sleeps. Each
+        # None frame triggers exactly one such sleep; assert the floor is applied.
+        sleeps = self._run_screen_reader(
+            monkeypatch, [None for _ in range(5)], display_asleep=True
+        )
+        assert len(sleeps) == 5
+        assert all(d >= 1.0 for d in sleeps)
 
     def _run_window_reader(self, monkeypatch, results):
         from screencap.engine import window
@@ -499,3 +521,58 @@ def test_get_active_window_meta_empty_desktop_returns_falsy(monkeypatch):
         _macos.Quartz, "CGWindowListCopyWindowInfo", lambda *_a, **_k: fake_windows
     )
     assert not _macos.get_active_window_meta()
+
+
+def test_get_active_window_state_empty_meta_returns_none(monkeypatch):
+    # SCR-103: when get_active_window_meta() returns {} (bare desktop, Mission
+    # Control, etc.), get_active_window_state must return None without raising a
+    # KeyError on the meta dict — mirroring the empty-meta guard.
+    _macos = pytest.importorskip("screencap.engine.window._macos")
+    monkeypatch.setattr(_macos, "get_active_window_meta", lambda: {})
+    assert _macos.get_active_window_state(read_window_data=False) is None
+
+
+# ---------------------------------------------------------------------------
+# utils.display_is_asleep — direct unit coverage (SCR-103 idle-vs-stall input)
+# ---------------------------------------------------------------------------
+
+
+class TestDisplayIsAsleep:
+    def test_non_darwin_returns_false(self, monkeypatch):
+        # Off macOS there is no Quartz display-sleep concept → fail-toward-awake.
+        from screencap.engine import utils
+
+        monkeypatch.setattr(utils.sys, "platform", "linux")
+        assert utils.display_is_asleep() is False
+
+    def test_exception_path_returns_false(self, monkeypatch):
+        # A Quartz import/call error must be swallowed (logged at debug) and
+        # err toward "awake" so a genuine capture failure still surfaces.
+        from screencap.engine import utils
+
+        monkeypatch.setattr(utils.sys, "platform", "darwin")
+
+        class _BoomQuartz:
+            def CGMainDisplayID(self):
+                raise RuntimeError("quartz hiccup")
+
+            def CGDisplayIsAsleep(self, _id):
+                raise RuntimeError("quartz hiccup")
+
+        monkeypatch.setitem(sys.modules, "Quartz", _BoomQuartz())
+        assert utils.display_is_asleep() is False
+
+    def test_darwin_true_and_false(self, monkeypatch):
+        # With a fake Quartz, CGDisplayIsAsleep returning 1 → True, 0 → False.
+        from screencap.engine import utils
+
+        monkeypatch.setattr(utils.sys, "platform", "darwin")
+
+        asleep_values = iter([1, 0])
+        fake_q = types.SimpleNamespace(
+            CGMainDisplayID=lambda: 0,
+            CGDisplayIsAsleep=lambda _id: next(asleep_values),
+        )
+        monkeypatch.setitem(sys.modules, "Quartz", fake_q)
+        assert utils.display_is_asleep() is True
+        assert utils.display_is_asleep() is False

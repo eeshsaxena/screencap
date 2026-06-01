@@ -118,7 +118,8 @@ def display_is_asleep() -> bool:
         import Quartz
 
         return bool(Quartz.CGDisplayIsAsleep(Quartz.CGMainDisplayID()))
-    except Exception:
+    except Exception as exc:
+        logger.debug(f"display_is_asleep check failed: {exc!r}")
         return False
 
 

@@ -208,7 +208,9 @@ def get_active_window_meta() -> dict:
     excluded windows are masked by ``mask_frame()`` instead.
 
     Returns:
-        dict: A dictionary containing the metadata of the active window.
+        dict: A dictionary containing the metadata of the active window, or an
+        empty dict ``{}`` when there is no foreground window (bare desktop,
+        Mission Control, etc.).
     """
     windows = Quartz.CGWindowListCopyWindowInfo(
         (
@@ -497,6 +499,12 @@ def get_active_element_state(
     if max_depth is None:
         max_depth = config.AX_MAX_DEPTH
     window_meta = get_active_window_meta()
+    if not window_meta:
+        # No foreground window (bare desktop, Mission Control, etc.) — benign
+        # no-window state (SCR-103), mirroring get_active_window_state. Avoids a
+        # KeyError + per-poll warning spam now that get_active_window_meta()
+        # returns {} instead of raising on a bare desktop.
+        return {}
     pid = window_meta["kCGWindowOwnerPID"]
     app = oa_atomacos._a11y.AXUIElement.from_pid(pid)
     app.set_timeout(config.AX_ELEMENT_TIMEOUT)
