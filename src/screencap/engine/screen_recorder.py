@@ -832,6 +832,7 @@ def _run_screen_recorder(rec: "ScreenRecorder") -> "RecordingResult":
             # post-capture cleanup (ChunkProcessor drain, DB upload,
             # sentinel upload).
             elapsed = 0.0
+            _live_loop_ran = False
             with Live(
                 _build_live_display(name, 0.0, True),
                 console=console,
@@ -839,6 +840,7 @@ def _run_screen_recorder(rec: "ScreenRecorder") -> "RecordingResult":
             ) as live:
                 try:
                     while recorder.is_recording and not _stop_event.is_set():
+                        _live_loop_ran = True
                         elapsed = time.time() - t0
                         pulse_on = int(elapsed) % 2 == 0
 
@@ -1086,6 +1088,24 @@ def _run_screen_recorder(rec: "ScreenRecorder") -> "RecordingResult":
     # field by the wall-clock cost of the post-capture cleanup
     # (ChunkProcessor drain, DB upload, sentinel upload), which can be
     # minutes for chunked cloud recordings.
+
+    # SCR-71: when SIGTERM arrives during engine startup, ``recorder.stop()``
+    # sets ``_terminate_processing`` before the live loop is entered, so its
+    # guard (``recorder.is_recording``) is false on the first check and the
+    # body — the only place ``elapsed`` is assigned — never runs, leaving
+    # ``elapsed`` at 0.0 even though the engine captured real data. ``t0`` was
+    # reset to ready-time, so ``time.time() - t0`` here would also read ~0;
+    # recover the engine's own ``recording_duration`` (carried on the
+    # terminal ``record.stopped`` message, available now that ``__exit__``
+    # joined the record thread) so ``.recording_ready.elapsed`` is non-zero.
+    # NOTE: ``recording_duration`` is the FULL ``record()`` wall-clock
+    # (startup + capture + teardown), not the user-perceived capture time —
+    # for chunked cloud recordings it can be much larger. It is acceptable
+    # here only as a non-zero fallback when the live loop never ran.
+    if not _live_loop_ran:
+        _engine_duration = getattr(recorder, "recording_duration", None)
+        if _engine_duration is not None:
+            elapsed = _engine_duration
 
     # Restore output if we suppressed it
     if not verbose:

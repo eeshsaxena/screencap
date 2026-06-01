@@ -29,6 +29,7 @@ def _make_recorder_for_drain_test():
     r = Recorder.__new__(Recorder)
     r._child_crashes = []
     r._health_warning = ""
+    r._recording_duration = None
     r._stopped_event = threading.Event()
     r._ready_event = threading.Event()
     r._status_recv, r._status_send = multiprocessing.Pipe(duplex=False)

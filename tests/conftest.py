@@ -177,6 +177,7 @@ class FakeRecorder:
         self.is_recording = False
         self.health_warning = ""
         self.child_crashes = []
+        self.recording_duration = None
         self._stopped = False
         self._chunk_process_q = None
         self._audio_ack_q = None
