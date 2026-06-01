@@ -23,11 +23,13 @@ This file pins both halves of the fix:
 
 from __future__ import annotations
 
+import threading
 import time
 from collections import namedtuple
 from unittest import mock
 
 from tests.conftest import FakeRecorder
+from tests.test_health_monitoring import _make_recorder_for_drain_test
 
 DiskUsage = namedtuple("DiskUsage", ["total", "used", "free"])
 _PLENTY_OF_DISK = DiskUsage(total=500e9, used=100e9, free=400e9)
@@ -145,3 +147,47 @@ def test_wait_for_ready_returns_when_stop_requested(tmp_path):
 
     assert ready is False
     assert elapsed < 2.0, f"wait_for_ready blocked {elapsed:.1f}s despite stop signal"
+
+
+class TestFinalDrainRecoversDuration:
+    """Real ``_drain_status_pipe`` over a real Pipe, recovering the terminal
+    ``record.stopped`` that arrives AFTER ``_stopped_event`` is set.
+
+    This is the exact race the post-loop final drain handles: when
+    ``finalize_pipeline`` joins the record thread and then sets
+    ``_stopped_event`` as a backstop, the terminal ``record.stopped`` —
+    carrying ``duration_seconds`` — can still be sitting in the pipe when the
+    main poll loop exits. The final drain must read it so
+    ``recording_duration`` is populated and the SCR-71 ``elapsed`` fallback
+    has a real value.
+    """
+
+    def _drain_with_buffered_stop(self, duration_seconds):
+        """Set ``_stopped_event`` BEFORE sending ``record.stopped``, run the
+        real drain to completion, and return the recovered recorder."""
+        r = _make_recorder_for_drain_test()
+        # Stop is signalled first (the backstop), so the main poll loop exits
+        # without ever observing the message — only the final drain can.
+        r._stopped_event.set()
+        r._status_send.send({
+            "type": "record.stopped",
+            "duration_seconds": duration_seconds,
+        })
+        t = threading.Thread(target=r._drain_status_pipe, daemon=True)
+        t.start()
+        t.join(timeout=2)
+        assert not t.is_alive(), "drain thread did not finish"
+        return r
+
+    def test_final_drain_recovers_buffered_duration(self):
+        """A buffered ``record.stopped`` is read by the final drain even
+        though ``_stopped_event`` was already set when the loop exited."""
+        r = self._drain_with_buffered_stop(_ENGINE_DURATION)
+        assert r.recording_duration == _ENGINE_DURATION
+
+    def test_final_drain_recovers_zero_duration(self):
+        """A ``duration_seconds`` of 0.0 is recovered as 0.0 — the boundary
+        the ``is not None`` safe-fix now handles (0.0 is a valid duration,
+        not 'missing')."""
+        r = self._drain_with_buffered_stop(0.0)
+        assert r.recording_duration == 0.0

@@ -4063,8 +4063,13 @@ def record(
 
     # TODO: consolidate terminate_recording and status_pipe
     if status_pipe:
-        # ``duration_seconds`` mirrors profiling.json so the CLI worker can
-        # recover ``elapsed`` when its live loop never ran (SCR-71).
+        # ``duration_seconds`` is the total ``record()`` wall-clock
+        # (``_profile_start`` at the top of record() → here), i.e. startup +
+        # capture + teardown overhead — NOT the user-perceived capture time.
+        # For chunked cloud recordings the teardown can dominate, so this can
+        # be much larger than the captured span. The CLI worker uses it only
+        # as a non-zero ``elapsed`` fallback when its live loop never ran
+        # (SCR-71).
         status_pipe.send({
             "type": "record.stopped",
             "duration_seconds": round(_profile_duration, 2),
@@ -4243,19 +4248,35 @@ class Recorder:
 
     def _drain_status_pipe(self) -> None:
         """Background thread that reads status messages from record()."""
+        # Main poll loop and the post-loop final-drain are guarded
+        # SEPARATELY: a transient error in the main loop must not skip the
+        # final drain, or the terminal ``record.stopped`` (carrying
+        # ``duration_seconds``) is lost and ``elapsed`` silently reverts to
+        # 0.0 (SCR-71).
         try:
             while not self._stopped_event.is_set():
                 if self._status_recv.poll(timeout=0.5):
                     self._handle_status_msg(self._status_recv.recv())
-            # ``finalize_pipeline`` joins the record thread (which sends the
-            # terminal ``record.stopped``) and then sets ``_stopped_event``
-            # directly as a backstop. That can race the loop's exit check
-            # before ``record.stopped`` \u2014 carrying ``duration_seconds`` \u2014 is
-            # read. Drain whatever is buffered so the duration is never lost.
+        except (EOFError, OSError):
+            logger.debug("Status pipe closed during main drain loop")
+
+        # ``finalize_pipeline`` joins the record thread (which sends the
+        # terminal ``record.stopped``) and then sets ``_stopped_event``
+        # directly as a backstop. That can race the loop's exit check
+        # before ``record.stopped`` — carrying ``duration_seconds`` — is
+        # read. Drain whatever is buffered so the duration is never lost.
+        # This runs regardless of how the main loop exited.
+        try:
             while self._status_recv.poll(timeout=0):
                 self._handle_status_msg(self._status_recv.recv())
         except (EOFError, OSError):
-            pass
+            logger.debug("Status pipe closed during final drain")
+
+        if getattr(self, "_recording_duration", None) is None:
+            logger.warning(
+                "Status drain finished without a terminal record.stopped; "
+                "recording_duration unavailable (elapsed fallback disabled)"
+            )
 
     def _run_record(self) -> None:
         """Thread target: apply config overrides, then call record()."""
@@ -4435,11 +4456,16 @@ class Recorder:
 
     @property
     def recording_duration(self) -> float | None:
-        """Engine-measured recording duration in seconds, or ``None``.
+        """Total ``record()`` wall-clock in seconds, or ``None``.
 
         Populated from the terminal ``record.stopped`` status message once
         the record thread has been drained (after ``finalize_pipeline`` /
-        ``__exit__``). Mirrors profiling.json's ``duration_seconds``.
+        ``__exit__``). This is the FULL ``record()`` wall-clock — startup +
+        capture + teardown — not the user-perceived capture time. For
+        chunked cloud recordings the teardown overhead (ChunkProcessor
+        drain, DB upload) can make it much larger than the captured span.
+        Used only as a non-zero ``elapsed`` fallback when the live loop
+        never ran (SCR-71).
         """
         return self._recording_duration
 
