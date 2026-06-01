@@ -1514,6 +1514,17 @@ def read_screen_events(
         t_screenshot = time.perf_counter()
         if screenshot is None:
             logger.warning("Screenshot was None")
+            # SCR-103: a sleeping/locked display legitimately yields no frame —
+            # benign idle, not a stalled reader. Count it as a completed (idle)
+            # capture so it does not widen the attempt-vs-output gap that fires
+            # capture_unhealthy(reader=screen), and back off so a fast-failing
+            # screencapture does not spin the attempt counter. A None while the
+            # display is ACTIVE is a genuine capture failure (incl. Screen-
+            # Recording denial) and still trips the stall verdict + labeller.
+            if utils.display_is_asleep():
+                _health_incr("screen.output")
+                if min_interval > 0:
+                    time.sleep(min_interval)
             continue
         _health_incr("screen.output")
 
@@ -1589,12 +1600,20 @@ def read_window_events(
     started = False
     while not terminate_processing.is_set():
         # Capture-health (SCR-76): count every poll attempt; count output when
-        # the poll returns queryable data, BEFORE the change gate below — so a
-        # user sitting on one unchanged window stays healthy while an
-        # Accessibility-denied poll (falsy → continue) opens the gap.
+        # the poll completes, BEFORE the change gate below — so a user sitting on
+        # one unchanged window stays healthy.
         _health_incr("window.attempt")
         window_data = window.get_active_window_data()
         if not window_data:
+            # SCR-103: a falsy poll is a benign no-active-window state (bare
+            # desktop, Mission Control, Spotlight, menu-bar/Space focus), NOT a
+            # blind reader. The window event rides CGWindowList, which needs no
+            # permission, so a falsy poll is "nothing to capture this tick," not
+            # an Accessibility stall — count it as a completed (idle) poll so it
+            # does not widen the attempt-vs-output gap that fires
+            # capture_unhealthy(reader=window). A genuinely dead reader thread is
+            # still caught by the record.child_died liveness path.
+            _health_incr("window.output")
             time.sleep(poll_interval)
             continue
         _health_incr("window.output")

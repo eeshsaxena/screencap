@@ -52,9 +52,11 @@ class _FakeFrame:
 
 
 class TestCounters:
-    def _run_screen_reader(self, monkeypatch, frames):
+    def _run_screen_reader(self, monkeypatch, frames, *, display_asleep=False):
         """Drive read_screen_events with a take_screenshot stub yielding `frames`
-        (one per iteration); terminate once the list is exhausted."""
+        (one per iteration); terminate once the list is exhausted. `display_asleep`
+        stubs utils.display_is_asleep() so the None-frame branch is exercised
+        against a known display state (SCR-103)."""
         from screencap.engine import utils
 
         seq = iter(frames)
@@ -69,6 +71,7 @@ class TestCounters:
                     term.set()
 
         monkeypatch.setattr(utils, "take_screenshot", fake_shot)
+        monkeypatch.setattr(utils, "display_is_asleep", lambda: display_asleep)
         monkeypatch.setattr(recorder.config, "SCREEN_CAPTURE_FPS", 0)  # no throttle sleep
         rec = types.SimpleNamespace(timestamp=0.0)
         recorder.read_screen_events(
@@ -80,11 +83,22 @@ class TestCounters:
         assert recorder._capture_health_counts["screen.attempt"] == 5
         assert recorder._capture_health_counts["screen.output"] == 5
 
-    def test_screen_none_frames_increment_attempt_not_output(self, monkeypatch):
-        # A None frame is the only robust "broken screen reader" content signal.
-        self._run_screen_reader(monkeypatch, [None for _ in range(5)])
+    def test_screen_none_frames_while_display_awake_increment_attempt_not_output(self, monkeypatch):
+        # Display AWAKE + None frame = genuine screen-capture failure (incl.
+        # Screen-Recording denial): the attempt/output gap must open so the stall
+        # verdict + labeller still fire. A None frame is the only robust "broken
+        # screen reader" content signal while the display is on.
+        self._run_screen_reader(monkeypatch, [None for _ in range(5)], display_asleep=False)
         assert recorder._capture_health_counts["screen.attempt"] == 5
         assert recorder._capture_health_counts.get("screen.output", 0) == 0
+
+    def test_screen_none_frames_while_display_asleep_are_idle_not_stall(self, monkeypatch):
+        # SCR-103: a sleeping/locked display legitimately yields None — benign
+        # idle, not a stall. attempt and output advance together so the gap never
+        # opens and capture_unhealthy(reader=screen) does not fire.
+        self._run_screen_reader(monkeypatch, [None for _ in range(5)], display_asleep=True)
+        assert recorder._capture_health_counts["screen.attempt"] == 5
+        assert recorder._capture_health_counts["screen.output"] == 5
 
     def _run_window_reader(self, monkeypatch, results):
         from screencap.engine import window
@@ -114,10 +128,15 @@ class TestCounters:
         assert recorder._capture_health_counts["window.attempt"] == 4
         assert recorder._capture_health_counts["window.output"] == 4
 
-    def test_window_falsy_poll_increments_attempt_not_output(self, monkeypatch):
+    def test_window_no_active_window_is_idle_not_stall(self, monkeypatch):
+        # SCR-103: a falsy poll is a benign no-active-window state (bare desktop,
+        # Mission Control, Spotlight, menu-bar/Space focus), NOT a blind reader —
+        # the window event rides CGWindowList, which needs no permission. It must
+        # count as a completed (idle) poll so the attempt/output gap never opens
+        # and capture_unhealthy(reader=window) does not fire.
         self._run_window_reader(monkeypatch, [{} for _ in range(4)])
         assert recorder._capture_health_counts["window.attempt"] == 4
-        assert recorder._capture_health_counts.get("window.output", 0) == 0
+        assert recorder._capture_health_counts["window.output"] == 4
 
     def test_action_output_counts_when_event_produced(self):
         recorder.trigger_action_event(
@@ -457,3 +476,26 @@ class TestEmitCaptureHealthEvent:
         assert evts[0]["reader"] == "window"
         # advisory: no exit_code field
         assert "exit_code" not in evts[0]
+
+
+# ---------------------------------------------------------------------------
+# Window meta: empty-desktop guard (SCR-103 root mechanism for Case 1)
+# ---------------------------------------------------------------------------
+
+
+def test_get_active_window_meta_empty_desktop_returns_falsy(monkeypatch):
+    # SCR-103: on a bare desktop the layer-0 / non-Window-Server filter yields an
+    # empty list. The old code did `active_windows_info[0]` → IndexError on every
+    # poll (caught upstream → {} → falsy poll, plus per-poll warning spam). The
+    # guard returns a falsy meta explicitly instead of raising, so the no-window
+    # state is an ordinary benign result rather than an exception.
+    _macos = pytest.importorskip("screencap.engine.window._macos")
+    # Only a Window Server window + a non-layer-0 window → filtered list empty.
+    fake_windows = [
+        {"kCGWindowLayer": 0, "kCGWindowOwnerName": "Window Server"},
+        {"kCGWindowLayer": 25, "kCGWindowOwnerName": "Dock"},
+    ]
+    monkeypatch.setattr(
+        _macos.Quartz, "CGWindowListCopyWindowInfo", lambda *_a, **_k: fake_windows
+    )
+    assert not _macos.get_active_window_meta()

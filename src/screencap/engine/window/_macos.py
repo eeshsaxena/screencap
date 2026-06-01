@@ -73,6 +73,11 @@ def get_active_window_state(read_window_data: bool) -> dict | None:
     # pywinctl performance on macOS is unusable, see:
     # https://github.com/Kalmat/PyWinCtl/issues/29
     meta = get_active_window_meta()
+    if not meta:
+        # No foreground window (bare desktop, Mission Control, etc.) — a benign
+        # no-window state, not an error (SCR-103). Returning None here keeps it
+        # off the exception path so it does not spam warnings every poll.
+        return None
     if read_window_data:
         data = get_window_data(meta)
     else:
@@ -218,6 +223,11 @@ def get_active_window_meta() -> dict:
         if win["kCGWindowLayer"] == 0 and win["kCGWindowOwnerName"] != "Window Server"
     ]
 
+    if not active_windows_info:
+        # No layer-0 non-Window-Server window on screen — a bare desktop / no
+        # foreground window. Return a falsy meta rather than raising IndexError
+        # (SCR-103); the caller treats this as a benign no-window state.
+        return {}
     active_window_info = active_windows_info[0]
     return active_window_info
 
