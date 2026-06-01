@@ -165,6 +165,27 @@ def _default_engine_command(encoded_args: str) -> list[str]:
     return [sys.executable, "-m", "screencap", "_engine-worker", encoded_args]
 
 
+def build_engine_worker_args(
+    request: "RecordingStartRequest",
+    *,
+    name: str,
+    capture_dir: Path,
+) -> dict[str, Any]:
+    """Build the arg dict the engine worker is dispatched with.
+
+    A ``RecordingStartRequest`` model dump plus the ``name`` / ``output_dir`` /
+    ``capture_dir_hint`` the supervisor injects. The ``_*_q`` queue keys are
+    created downstream by the engine worker command itself, so they are
+    intentionally absent here. Shared with the dispatch integration test so the
+    arg shape stays in lockstep with production.
+    """
+    args = request.model_dump()
+    args["name"] = name
+    args["output_dir"] = str(capture_dir)
+    args["capture_dir_hint"] = str(capture_dir)
+    return args
+
+
 class Supervisor:
     """Own daemon recording lifecycle, crash recovery, and stderr bridging."""
 
@@ -691,11 +712,7 @@ class Supervisor:
         name: str,
         capture_dir: Path,
     ) -> dict[str, Any]:
-        args = request.model_dump()
-        args["name"] = name
-        args["output_dir"] = str(capture_dir)
-        args["capture_dir_hint"] = str(capture_dir)
-        return args
+        return build_engine_worker_args(request, name=name, capture_dir=capture_dir)
 
     def _owner_payload(self) -> dict[str, Any]:
         from screencap import pidfile
