@@ -154,11 +154,16 @@ final class ReviewWindowViewModel: ObservableObject {
         if case .failed = state { state = .preparing }
         do {
             let envelope = try await loader.load(name: recordingName)
+            // `started_at` / `duration_seconds` are legitimately null for a
+            // playable recording with no action events (review.py →
+            // `_read_recording_meta` returns None). They must NOT gate the
+            // guard — null timing is not a preparation failure. Fall back to
+            // origin 0 / unknown-duration 0, which the panes already handle
+            // (TimelinePane guards `durationSeconds > 0`). `.failed` stays
+            // reserved for `ok: false` / missing-path envelopes. (SCR-102)
             guard envelope.ok,
                   let videoPath = envelope.videoPath,
-                  let eventsPath = envelope.eventsPath,
-                  let startedAt = envelope.startedAt,
-                  let duration = envelope.durationSeconds
+                  let eventsPath = envelope.eventsPath
             else {
                 state = .failed(message: envelope.error ?? "Failed to prepare recording.", retryData: nil)
                 return
@@ -166,8 +171,8 @@ final class ReviewWindowViewModel: ObservableObject {
             let data = ReviewData(
                 videoURL: URL(fileURLWithPath: videoPath),
                 eventsURL: URL(fileURLWithPath: eventsPath),
-                startedAt: startedAt,
-                durationSeconds: duration
+                startedAt: envelope.startedAt ?? 0,
+                durationSeconds: envelope.durationSeconds ?? 0
             )
             state = .ready(data)
         } catch {

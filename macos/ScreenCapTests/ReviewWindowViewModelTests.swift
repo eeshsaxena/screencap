@@ -294,6 +294,39 @@ final class ReviewWindowViewModelTests: XCTestCase {
         }
     }
 
+    /// SCR-102 — `ok: true` with valid paths but null timing metadata
+    /// (`started_at` / `duration_seconds` serialized as JSON `null`) is a
+    /// legitimate, *playable* recording with no action events (Python
+    /// `review.py` → `_read_recording_meta` returns `None`). It must land
+    /// on `.ready` with a fallback origin/duration of 0 — null timing on a
+    /// playable video is not a preparation failure. `.failed` stays
+    /// reserved for `ok: false` / missing-path envelopes (see
+    /// `testOkTrueWithNilVideoPathLandsOnGenericFailure`).
+    func testOkTrueWithNullTimingMetadataLandsOnReady() async {
+        let loader = FakeReviewDataLoader()
+        loader.nextEnvelope = .init(
+            ok: true,
+            schemaVersion: 1,
+            videoPath: "/tmp/video.mp4",
+            eventsPath: "/tmp/events.jsonl",
+            startedAt: nil,
+            durationSeconds: nil,
+            videoPixfmtRemediated: false,
+            error: nil
+        )
+        let model = makeModel(loader: loader)
+
+        await model.loadReviewData()
+
+        if case .ready(let data) = model.state {
+            XCTAssertEqual(data.videoURL.path, "/tmp/video.mp4")
+            XCTAssertEqual(data.startedAt, 0, "null started_at falls back to origin 0")
+            XCTAssertEqual(data.durationSeconds, 0, "null duration_seconds falls back to unknown (0)")
+        } else {
+            XCTFail("expected ready for playable recording with null timing, got \(model.state)")
+        }
+    }
+
     /// Auto-close handle cancellation prevents the dismiss callback from
     /// firing after the user manually closed the window.
     func testWindowCloseBeforeAutoCloseFiresCancelsTheTimer() async {
