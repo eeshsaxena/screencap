@@ -197,6 +197,14 @@ def get_main_display_bounds() -> tuple[float, float, float, float]:
     )
 
 
+# SCR-108: rate-limit the CGWindowListCopyWindowInfo-failure warning so a
+# sustained API failure (e.g. Screen Recording revoked mid-session) emits one
+# operator signal per interval rather than per-poll. Module-level so the throttle
+# persists across the window reader's repeated polls.
+_WINDOW_LIST_FAIL_WARN_INTERVAL_S = 60.0
+_last_window_list_fail_warn_s = 0.0
+
+
 def get_active_window_meta() -> dict:
     """Get the metadata of the active window.
 
@@ -223,6 +231,21 @@ def get_active_window_meta() -> dict:
         # API failure (SCR-108) — parallels the guard in get_all_window_geometries.
         # Return a falsy meta rather than raising TypeError on the `for win in
         # windows` below; the caller treats this as a benign no-window state.
+        #
+        # Unlike the bare-desktop branch below (a valid but empty filtered list),
+        # a None return is a genuine CGWindowListCopyWindowInfo failure. Emit a
+        # rate-limited warning so a sustained failure (e.g. revoked Screen
+        # Recording permission mid-session) leaves an operator signal, without
+        # reintroducing the per-poll spam the old TypeError path produced.
+        global _last_window_list_fail_warn_s
+        now = time.monotonic()
+        if now - _last_window_list_fail_warn_s >= _WINDOW_LIST_FAIL_WARN_INTERVAL_S:
+            _last_window_list_fail_warn_s = now
+            logger.warning(
+                "CGWindowListCopyWindowInfo returned None (API failure); treating "
+                "as a no-window poll. Persistent failures may indicate revoked "
+                "Screen Recording permission."
+            )
         return {}
     active_windows_info = [
         win
