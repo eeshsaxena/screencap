@@ -598,6 +598,30 @@ class TestConcatVideoChunks:
         with pytest.raises(ValueError, match="No frame within tolerance"):
             extract_frame(out, 3.0, tolerance=0.5)
 
+    def test_concat_raises_on_partial_offsets_map(self, tmp_path):
+        """A chunk_offsets map missing a chunk's index → ValueError (SCR-98).
+
+        The engine is a public API; a partial map would silently place the
+        uncovered chunk back-to-back while its peers are absolute — an unsound
+        hybrid timeline. Reject it loudly and leave no partial output/temp.
+        """
+        base = time.time()
+        writer = ChunkedVideoWriter(
+            output_dir=tmp_path, width=64, height=64, chunk_duration=1.0, fps=24
+        )
+        for dt in (0.0, 0.5):
+            writer.write_frame(Image.new("RGB", (64, 64), (220, 0, 0)), base + dt)
+        for dt in (3.0, 3.5):
+            writer.write_frame(Image.new("RGB", (64, 64), (0, 0, 220)), base + dt)
+        writer.close()
+        assert len(sorted(tmp_path.glob("chunk_*.mp4"))) == 2
+
+        # Map covers chunk 0 but omits chunk 1 → reject.
+        with pytest.raises(ValueError, match="missing an entry for chunk_0001"):
+            concat_video_chunks(tmp_path, chunk_offsets={0: 0.0})
+        assert not (tmp_path / "video.mp4").exists()
+        assert not list(tmp_path.glob(".video.mp4.*.tmp"))
+
     def test_concat_raises_without_chunks(self, tmp_path):
         """No chunk_*.mp4 → ValueError (caller is expected to pre-check)."""
         with pytest.raises(ValueError, match="No chunk"):

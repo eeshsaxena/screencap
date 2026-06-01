@@ -45,6 +45,7 @@ def _chunk_offsets_for_concat(rec_dir: Path) -> dict[int, float] | None:
     """
     import json
 
+    from screencap.engine.video import parse_chunk_index
     from screencap.recording_db import has_table, open_recording_db
 
     chunks = sorted(rec_dir.glob("chunk_*.mp4"))
@@ -61,7 +62,11 @@ def _chunk_offsets_for_concat(rec_dir: Path) -> dict[int, float] | None:
             row = conn.execute(
                 "SELECT video_start_time, timestamp FROM recording LIMIT 1"
             ).fetchone()
-    except Exception:
+    except Exception as exc:
+        err_console.print(
+            f"[dim]Could not read chunk offsets from {db_path}: {exc}; "
+            f"falling back to summed-span concat[/dim]"
+        )
         return None
     if not row:
         return None
@@ -74,16 +79,19 @@ def _chunk_offsets_for_concat(rec_dir: Path) -> dict[int, float] | None:
 
     offsets: dict[int, float] = {}
     for vf in chunks:
-        try:
-            idx = int(vf.stem.split("_")[1])
-        except (IndexError, ValueError):
+        idx = parse_chunk_index(vf.stem)
+        if idx is None:
             return None
         manifest = rec_dir / f"chunk_{idx:04d}_manifest.json"
         if not manifest.exists():
             return None
         try:
             chunk_start = float(json.loads(manifest.read_text())["chunk_start"])
-        except (OSError, ValueError, KeyError, TypeError):
+        except (OSError, ValueError, KeyError, TypeError) as exc:
+            err_console.print(
+                f"[dim]Cannot read chunk_start from {manifest.name}: {exc}; "
+                f"falling back to summed-span concat[/dim]"
+            )
             return None
         offsets[idx] = chunk_start - video_start
     return offsets
