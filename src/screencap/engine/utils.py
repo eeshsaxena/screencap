@@ -100,6 +100,29 @@ def get_timestamp() -> float:
     return _start_time + perf_duration
 
 
+def display_is_asleep() -> bool:
+    """Whether the main display is currently asleep (macOS only).
+
+    Used by the screen reader's capture-health path (SCR-103): a ``None``
+    screenshot while the display sleeps/locks is a benign no-output state, not
+    a stalled reader, so it must not trip the screen stall verdict.
+
+    Fail-toward-awake: non-darwin, a Quartz import/call error, or any exception
+    returns ``False`` (treated as awake). Erring toward "awake" keeps a genuine
+    screen-capture failure (incl. Screen-Recording denial) surfacing rather than
+    silently suppressing it on an uncertain check.
+    """
+    if sys.platform != "darwin":
+        return False
+    try:
+        import Quartz
+
+        return bool(Quartz.CGDisplayIsAsleep(Quartz.CGMainDisplayID()))
+    except Exception as exc:
+        logger.debug(f"display_is_asleep check failed: {exc!r}")
+        return False
+
+
 def take_screenshot() -> Image.Image:
     """Take a screenshot.
 

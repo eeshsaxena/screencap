@@ -73,6 +73,11 @@ def get_active_window_state(read_window_data: bool) -> dict | None:
     # pywinctl performance on macOS is unusable, see:
     # https://github.com/Kalmat/PyWinCtl/issues/29
     meta = get_active_window_meta()
+    if not meta:
+        # No foreground window (bare desktop, Mission Control, etc.) — a benign
+        # no-window state, not an error (SCR-103). Returning None here keeps it
+        # off the exception path so it does not spam warnings every poll.
+        return None
     if read_window_data:
         data = get_window_data(meta)
     else:
@@ -203,7 +208,9 @@ def get_active_window_meta() -> dict:
     excluded windows are masked by ``mask_frame()`` instead.
 
     Returns:
-        dict: A dictionary containing the metadata of the active window.
+        dict: A dictionary containing the metadata of the active window, or an
+        empty dict ``{}`` when there is no foreground window (bare desktop,
+        Mission Control, etc.).
     """
     windows = Quartz.CGWindowListCopyWindowInfo(
         (
@@ -218,6 +225,11 @@ def get_active_window_meta() -> dict:
         if win["kCGWindowLayer"] == 0 and win["kCGWindowOwnerName"] != "Window Server"
     ]
 
+    if not active_windows_info:
+        # No layer-0 non-Window-Server window on screen — a bare desktop / no
+        # foreground window. Return a falsy meta rather than raising IndexError
+        # (SCR-103); the caller treats this as a benign no-window state.
+        return {}
     active_window_info = active_windows_info[0]
     return active_window_info
 
@@ -487,6 +499,12 @@ def get_active_element_state(
     if max_depth is None:
         max_depth = config.AX_MAX_DEPTH
     window_meta = get_active_window_meta()
+    if not window_meta:
+        # No foreground window (bare desktop, Mission Control, etc.) — benign
+        # no-window state (SCR-103), mirroring get_active_window_state. Avoids a
+        # KeyError + per-poll warning spam now that get_active_window_meta()
+        # returns {} instead of raising on a bare desktop.
+        return {}
     pid = window_meta["kCGWindowOwnerPID"]
     app = oa_atomacos._a11y.AXUIElement.from_pid(pid)
     app.set_timeout(config.AX_ELEMENT_TIMEOUT)
