@@ -3,6 +3,41 @@
 Triggered by Eventarc when recording.db lands on GCS. Reads per-chunk manifests,
 merges cross-chunk tasks, combines video/audio per task via ffmpeg, slices events
 & transcripts, and writes everything to sessions/{name}/.
+
+Deploy (project: proteus-photos, region: southamerica-east1):
+    PROJ=proteus-photos; R=southamerica-east1
+    PROC=screencap-processor@$PROJ.iam.gserviceaccount.com
+    TRIG=screencap-eventarc@$PROJ.iam.gserviceaccount.com
+
+    # 1. GENAI key as a Secret (do NOT inline the value); grant the processor SA access:
+    gcloud secrets create screencap-genai-key --project $PROJ --data-file=-   # paste/pipe the AI Studio key
+    gcloud secrets add-iam-policy-binding screencap-genai-key --project $PROJ \
+        --member "serviceAccount:$PROC" --role roles/secretmanager.secretAccessor
+
+    # 2. Deploy from source (Dockerfile builds ffmpeg); SCREENCAP_BUCKET = staging pre-cutover:
+    gcloud run deploy process-recording --project $PROJ --region $R \
+        --source scripts/process-recording/ \
+        --service-account "$PROC" --no-allow-unauthenticated --cpu 1 --memory 1Gi \
+        --set-env-vars SCREENCAP_BUCKET=screencap-recordings-staging,GOOGLE_CLOUD_PROJECT=$PROJ \
+        --set-secrets GOOGLE_GENAI_API_KEY=screencap-genai-key:latest
+
+    # 3. Eventarc object-finalize trigger. The trigger LOCATION must match the bucket
+    #    location: the recordings bucket is US multi-region, so the trigger lives in `us`
+    #    (NOT southamerica-east1). The GCS service agent needs roles/pubsub.publisher and
+    #    the Eventarc SA needs roles/run.invoker on the service + roles/eventarc.eventReceiver.
+    gcloud run services add-iam-policy-binding process-recording --project $PROJ --region $R \
+        --member "serviceAccount:$TRIG" --role roles/run.invoker
+    gcloud eventarc triggers create process-recording-trigger --project $PROJ --location us \
+        --destination-run-service process-recording --destination-run-region $R \
+        --event-filters "type=google.cloud.storage.object.v1.finalized" \
+        --event-filters "bucket=screencap-recordings-staging" \
+        --service-account "$TRIG"
+    # dev: process-recording-dev + process-recording-dev-trigger on screencap-recordings-dev-staging.
+
+The handler guard processes only objects matching exactly
+``recordings/<name>/{recording.db, recording_complete.json}`` (3-segment path); all
+other finalized objects are ignored. This object-path contract is load-bearing — see
+docs/solutions/runtime-errors/chunk-upload-sentinel-gating-and-data-loss.md.
 """
 
 from __future__ import annotations

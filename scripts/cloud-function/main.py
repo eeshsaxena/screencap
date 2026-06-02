@@ -5,23 +5,31 @@ Supports three actions (dispatched via ``action`` field in JSON body):
 - ``list`` — list available recordings in the bucket
 - ``sign-download`` — generate signed download URLs for a recording
 
-Deploy:
-    # 1. Grant signing permission to the Cloud Function's service account:
-    gcloud functions describe get-upload-urls --region southamerica-east1 \
-        --format='value(serviceConfig.serviceAccountEmail)'
-    # Then grant it signBlob:
-    gcloud projects add-iam-policy-binding PROJECT_ID \
-        --member='serviceAccount:SA_EMAIL' \
-        --role='roles/iam.serviceAccountTokenCreator'
+Deploy (project: proteus-photos, region: southamerica-east1):
+    # The function runs as a dedicated SA and signs v4 URLs via the IAM
+    # signBlob API, which requires roles/iam.serviceAccountTokenCreator as a
+    # RESOURCE-LEVEL self-binding on that SA (not a project-level grant):
+    SIGNER=screencap-signer@proteus-photos.iam.gserviceaccount.com
+    gcloud iam service-accounts add-iam-policy-binding "$SIGNER" \
+        --project proteus-photos \
+        --member "serviceAccount:$SIGNER" \
+        --role roles/iam.serviceAccountTokenCreator
+    # The SA also needs roles/storage.objectAdmin on the target recordings bucket.
 
-    # 2. Deploy:
+    # Deploy (set SCREENCAP_BUCKET to the staging bucket pre-cutover; the prod
+    # default is the unset 'screencap-recordings'):
     gcloud functions deploy get-upload-urls \
+        --project proteus-photos --gen2 \
         --runtime python312 \
         --trigger-http \
         --allow-unauthenticated \
         --region southamerica-east1 \
         --source scripts/cloud-function/ \
-        --entry-point get_upload_urls
+        --entry-point get_upload_urls \
+        --service-account "$SIGNER" \
+        --set-env-vars SCREENCAP_BUCKET=screencap-recordings-staging
+    # The dev function (get-upload-urls-dev) is identical with
+    # SCREENCAP_BUCKET=screencap-recordings-dev-staging.
 """
 
 from __future__ import annotations
