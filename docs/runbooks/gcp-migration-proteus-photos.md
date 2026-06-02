@@ -571,3 +571,15 @@ load-bearing and the move requires a same-name delete-recreate (the plan's U8, u
   Windows CI if/when Windows resumes.
 
 **U8 verdict: DONE.** Releases fully served from proteus under the canonical name; CI publishes to proteus.
+
+### U9 — CLI repoint to the new function host — CODE DONE (2026-06-02), ship pending
+
+- `src/screencap/download.py` `DEFAULT_DOWNLOAD_URL` and `src/screencap/upload.py` `DEFAULT_UPLOAD_URL`
+  → `https://get-upload-urls-ld7izzjvga-rj.a.run.app` (new proteus prod host; amended from `api.screencap.sh`).
+  `SCREENCAP_*_URL` overrides unchanged. CHANGELOG `[Unreleased]` entry added. Committed `aa7e52a3`.
+- Tests: download/upload/upload_events suites pass (118 passed). One **pre-existing** failure
+  `test_list_remote_empty` (verified by stashing the edits — fails identically on the clean tree;
+  unrelated to the host change — `list --remote` empty-output formatting). Filed as a separate follow-up.
+- **Ship pending:** version bump + tag → release through the (now proteus) pipeline — this is the first
+  real exercise of the U8 CI rebind + the U9 code, and it's what moves installed clients onto the new host.
+  Not urgent for function (old clients already work via the U7 repoint) but required before U10 teardown.
