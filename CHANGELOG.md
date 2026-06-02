@@ -7,13 +7,7 @@ and this project adheres to [Semantic Versioning](https://semver.org/).
 
 ## [Unreleased]
 
-### Changed
-- **Cloud backend migrated to the `proteus-photos` GCP project.** The default
-  upload/download signing host moved from the old `zkairdrop` Cloud Function to
-  the new one (`get-upload-urls-ld7izzjvga-rj.a.run.app`). No user action needed —
-  installed clients pick this up on auto-update. Override still available via
-  `SCREENCAP_UPLOAD_URL` / `SCREENCAP_DOWNLOAD_URL`. Recordings and releases are
-  unchanged in behavior (releases keep the `screencap-releases` bucket name).
+## [0.20.0] - 2026-06-02
 
 ### Added
 - **Network proxy logging V1.5 — body capture + encryption-at-rest.**
@@ -42,6 +36,20 @@ and this project adheres to [Semantic Versioning](https://semver.org/).
   (V2 will revisit once SwiftUI signing pipeline lands).
 
 ### Changed
+- **Recording engine now supervised by a background daemon.** `screencap start` /
+  `stop` / `status` are now thin HTTP clients of a daemon's `/v0/*` API over a UNIX
+  socket at `~/.screencap/run/api.sock`. The daemon runs via `screencap serve` and is
+  normally managed by a LaunchAgent installed by `screencap setup`. On machines with no
+  LaunchAgent (the headless install case), the CLI auto-spawns the daemon in the
+  background; it exits cleanly after 10 minutes idle (`--idle-shutdown=600`) so
+  cron-driven `screencap status` doesn't leave permanent background processes.
+  Auto-spawn diagnostic log: `~/.screencap/run/auto-serve.log`.
+- **Cloud backend migrated to the `proteus-photos` GCP project.** The default
+  upload/download signing host moved from the old `zkairdrop` Cloud Function to
+  the new one (`get-upload-urls-ld7izzjvga-rj.a.run.app`). No user action needed —
+  installed clients pick this up on auto-update. Override still available via
+  `SCREENCAP_UPLOAD_URL` / `SCREENCAP_DOWNLOAD_URL`. Recordings and releases are
+  unchanged in behavior (releases keep the `screencap-releases` bucket name).
 - **`screencap stop --force` now actively kills the live SessionController.**
   Previous behavior: `--force` skipped the SIGTERM/wait branch and fell
   through to `find_orphaned_processes()`, which returns `[]` whenever the
@@ -57,6 +65,7 @@ and this project adheres to [Semantic Versioning](https://semver.org/).
   it. Migration: any wrapper that defensively passed `--force` expecting
   a no-op against a live recording will now terminate the session — drop
   the flag for the graceful path or drop the call entirely.
+- **Relicensed as AGPL-3.0-or-later**, with a separate commercial-use option.
 
 ### Fixed
 - **Privacy matrix-floor bypass closed for unknown bundles.** The
