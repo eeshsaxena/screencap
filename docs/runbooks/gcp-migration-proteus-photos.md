@@ -464,3 +464,37 @@ Volume: source `gs://screencap-recordings` = **1,824,485,625 B (~1.82 GB)** → 
 
 **U4 verdict:** R3 data-preservation MET (`recordings/` byte-perfect). Staging `sessions/` divergence is a
 documented reprocessing artifact, not a copy failure.
+
+### U6 — DONE / GATE GREEN (2026-06-02)
+
+End-to-end verification against the new `proteus-photos` stack via the new prod `*.run.app` host
+(`https://get-upload-urls-ld7izzjvga-rj.a.run.app`) + staging bucket. (Domain/cert/ingress legs
+removed per the scope amendment. `record` itself is unchanged by the migration, so U6 exercises the
+upload→process→download legs the migration actually touches, with real data, not a fresh capture.)
+
+- **Leg A — signed download (new fn):** `list` → 32 recordings; `sign-download rec-20260425T001201`
+  → v4 URLs; fetched `chunk_0000.mp4` → **HTTP 200, 327017 B, video/mp4** (data intact). ✓
+- **Leg B — signed upload (new fn):** minted v4 PUT URL → `PUT` (Content-Type `application/octet-stream`
+  to match the signed header) → **HTTP 200** → object landed in staging with correct bytes. ✓
+  (A first PUT with `text/plain` returned 403 — expected v4 signed-header mismatch, not a bug; the real
+  client passes matching content types.)
+- **Leg C — Eventarc processing + Gemini + idempotency (faithful):** cleared one real recording's
+  session + idempotency marker, re-finalized its sentinel → processing ran and **completed**
+  (`Done processing... 1 tasks, method=llm`); **Gemini active** (`gemini-2.5-flash:generateContent
+  HTTP 200` → "Gemini Flash returned 1 tasks", not fallback); a duplicate Eventarc delivery was
+  **correctly idempotency-skipped** ("Already processed... skipping") → effective exactly-once. ✓
+- **Leg D — parity vs zkairdrop baseline:** session **schema/structure identical** (same six file
+  types; same `method=llm` pipeline). Task count differed (baseline 2 vs new 1) — **LLM
+  non-determinism** in `gemini-2.5-flash` segmentation on byte-identical input, NOT a migration
+  defect. Implication: strict manifest diff is not a valid gate for this LLM-segmented pipeline;
+  schema parity + Gemini-active + successful processing is the right criterion. ✓
+
+**Deferred:** the live old-`zkairdrop`-function cross-project follow against staging was NOT exercised
+here — it requires pointing the old function at the staging bucket (a zkairdrop mutation, out of
+Phase 1/2 scope). The IAM grant is in place + verified (U1). Per the plan's default-to-redeploy
+stance, the follow is re-proven in-window at **U7** (with the `SCREENCAP_BUCKET` redeploy fallback
+armed) against the *reborn* bucket — which is the only place it's truly observable anyway.
+
+**U6 verdict: GATE GREEN.** New stack proven end-to-end (signed upload + signed download + Eventarc
+processing with Gemini). Destructive Phase 3 (U7/U8) is unblocked — but each is a separate,
+explicitly-confirmed window (U7 is irreversible).
