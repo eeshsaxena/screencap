@@ -539,3 +539,35 @@ point-of-no-return; no promotion reprocess-storm.**
 
 **Remaining:** U8 (releases bucket → proteus + CI rebind; needs a proteus CI SA/key), U9 (CLI release
 repoint to the new function host — one-liner), U10 (grace + teardown of the dormant zkairdrop footprint).
+
+### U8 — Releases cutover + CI rebind — DONE (2026-06-02)
+
+Releases is client-facing by **direct bucket URL** (`storage.googleapis.com/screencap-releases/...` in
+`updater.py`, `install.sh`, and the website's installer links) — no function indirection — so the name is
+load-bearing and the move requires a same-name delete-recreate (the plan's U8, unlike the reversible U7).
+
+- **Phase A (additive):** created CI SA `screencap-ci-releases@proteus-photos`; created
+  `screencap-releases-staging` and snapshot-copied the bucket into it — **byte-perfect** (11,627,807,407 B
+  / 120 objects; mac `latest.txt`=0.17.1, win=1.4.0). This staging bucket is the **rollback snapshot**,
+  retained through U10.
+- **Pre-flight:** confirmed `proteus-photos` permits public-read storage (anonymous read of the snapshot
+  bucket → 200) before the destructive step.
+- **Phase B (cutover, client-visible):** deleted `zkairdrop:screencap-releases` → recreated
+  `screencap-releases` in proteus (name freed + created on first attempt) → granted `allUsers:objectViewer`
+  + CI `objectAdmin` → re-uploaded snapshot→final in strict order (`rsync` excluding `latest.txt`, then
+  both `latest.txt` files **last**). 404 window = a few seconds.
+  - **Verified:** bucket now in proteus; byte-perfect parity vs snapshot (120 objs / 11,627,807,407 B);
+    anonymous client paths all 200 — `releases/latest.txt` (0.17.1), `releases/install.sh` (13,814 B),
+    `releases-windows/latest.txt` (1.4.0), and `releases/v0.17.1/screencap-0.17.1-arm64.tar.gz` (105,222,858 B).
+  - `releases-windows/` data preserved (downloads work); **Windows CI write-rebind intentionally skipped**
+    (Windows impl is parked — no new Windows releases being pushed).
+- **Phase C (CI rebind):** generated a key for the proteus CI SA, **proved it** (activated in an isolated
+  config; write+read+delete to `gs://screencap-releases` all succeeded), then set the `GCP_SA_KEY` secret on
+  `proteus-computer-use/screencap` via `gh` (updated `2026-06-02T17:30:51Z`) and deleted the local key copy.
+  No `release.yml` edits (paths are bucket-name-only).
+- **Rollback:** re-upload the retained `screencap-releases-staging` snapshot to either project.
+- **U10 follow-ups:** delete `screencap-releases-staging` (snapshot) after grace; **revoke the old
+  `screencap-ci-releases@zkairdrop` SA key** (now inert — no longer in the secret; P3 finding); rebind the
+  Windows CI if/when Windows resumes.
+
+**U8 verdict: DONE.** Releases fully served from proteus under the canonical name; CI publishes to proteus.
