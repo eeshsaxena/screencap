@@ -13,8 +13,14 @@
 # cp312 x86_64 wheel — pip has no choice and the resulting bundle passes.
 numpy>=1.20.0,<2.0
 
-# av 14+ has no cp312 x86_64 wheel; 13.x ships macosx_10_13_x86_64.
-av>=13.0,<14
+# pyproject's `record` extra floors av>=14.0.0, so the old `<14` cap here made
+# resolution impossible. On x86_64 av's macOS wheel minos varies by release:
+# 14.0-14.1 = macosx_11_0, 14.2 = macosx_12_0, 14.3-14.4 = no x86_64 wheel,
+# 15.x = macosx_13_0, 16.x-17.x = macosx_11_0. Pin to 16.0-17.x so pip lands on
+# av 17.0.1's cp311-abi3 macosx_11_0_x86_64 wheel (minos 11.0, same av the arm64
+# build resolves) and the minos<=11.0 gate passes. Bumping the upper bound
+# requires re-checking the new release's x86_64 wheel minos.
+av>=16.0.0,<18
 
 # Matches the pyproject.toml <0.2 cap; hard-pin for deterministic resolution.
 fast-gliner==0.1.12
