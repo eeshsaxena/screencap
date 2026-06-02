@@ -498,3 +498,44 @@ armed) against the *reborn* bucket — which is the only place it's truly observ
 **U6 verdict: GATE GREEN.** New stack proven end-to-end (signed upload + signed download + Eventarc
 processing with Gemini). Destructive Phase 3 (U7/U8) is unblocked — but each is a separate,
 explicitly-confirmed window (U7 is irreversible).
+
+### A5 (screencap-website) — ALREADY MIGRATED (verified 2026-06-02)
+
+Inspected the sibling repo `screencap-website` (`src/app/_lib/gcs-proxy.ts`). The website reads
+recordings **entirely through the signing function** (`list` / `sign-download` / `get-index` →
+`callCloudFunction`), with **no direct bucket access and no GCP credential**. Its `CLOUD_FUNCTION_URL`
+already defaults to the **new proteus host** `https://get-upload-urls-ld7izzjvga-rj.a.run.app` (committed
+today, `3103581` "repoint recordings to proteus-photos signing function"), and its `/api/proxy`
+whitelists **both** `screencap-recordings` and `screencap-recordings-staging`. So A5 is **done** — the
+website is bucket-name-agnostic, already on the new function, and cannot be broken by the bucket moving
+projects. No website-SA cross-project grant is needed (the plan's assumption that it reads the bucket
+directly was wrong).
+
+### U7 — Recordings cutover via REVERSIBLE REPOINT (Option A, 2026-06-02) — replaces the plan's irreversible U7
+
+Decided with the owner: since **every** recordings reader goes through a function we control (website +
+both CLIs), there is no need to reclaim the canonical bucket name, so the plan's irreversible
+delete-recreate (U7 as written) is replaced by a reversible repoint. **No bucket deleted; no
+point-of-no-return; no promotion reprocess-storm.**
+
+- **Final sync: no-op.** Delta `zkairdrop:screencap-recordings` → staging since U4 = **0 `recordings/`
+  objects**; the only diff was 4 `sessions/` objects from the U6 reprocess (stale 2-task vs new 1-task
+  version of `rec-20260425T001201`) — deliberately NOT synced (would Frankenstein the session). No real
+  client writes hit the zkairdrop bucket since U4.
+- **Repoint (reversible):** `gcloud run services update` on the gen2 functions' backing services:
+  - `zkairdrop:get-upload-urls` (prod) → `SCREENCAP_BUCKET=screencap-recordings-staging` (rev `00006-cwh`)
+  - `zkairdrop:get-upload-urls-dev` → `SCREENCAP_BUCKET=screencap-recordings-dev-staging` (rev `00005-82s`;
+    also routed `--to-latest` — dev traffic had a pre-existing pin to an old revision `00002-veh`).
+  - **Rollback:** `gcloud run services update <fn> --remove-env-vars=SCREENCAP_BUCKET` (back to the
+    zkairdrop bucket default).
+- **Cross-project follow PROVEN LIVE** (closes the item deferred from U6): the old prod function at its
+  canonical client host `https://get-upload-urls-wyldgq6aqa-rj.a.run.app` now `list`s 32 staging
+  recordings and `sign-download` returns `gcs_prefix: gs://screencap-recordings-staging/...` whose URL
+  fetched **HTTP 200, 327017 B**. The old `zkairdrop` SA (`397234807794-compute`) reads + signs against
+  the proteus bucket cross-project (IAM pre-staged in U1).
+- **Result:** old CLIs, new CLIs (post-U9), website, and Eventarc processing all converge on
+  `proteus:screencap-recordings-staging`. `zkairdrop:screencap-recordings` is **dormant** (no reader/writer)
+  — deleted in U10. The permanent recordings bucket keeps the cosmetic `-staging` name (server-side only).
+
+**Remaining:** U8 (releases bucket → proteus + CI rebind; needs a proteus CI SA/key), U9 (CLI release
+repoint to the new function host — one-liner), U10 (grace + teardown of the dormant zkairdrop footprint).
