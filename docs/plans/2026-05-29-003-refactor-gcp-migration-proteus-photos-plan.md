@@ -4,10 +4,28 @@ type: refactor
 status: active
 date: 2026-05-29
 deepened: 2026-05-29
+amended: 2026-06-02
 origin: docs/brainstorms/2026-05-29-gcp-migration-zkairdrop-to-proteus-photos-requirements.md
 ---
 
 # refactor: Migrate screencap GCP footprint from zkairdrop to proteus-photos
+
+> **⚠️ SCOPE AMENDMENT — 2026-06-02 (supersedes parts of this plan).**
+> **R6 (stable `api.screencap.sh` domain) and U5 (Global External ALB + serverless NEG + managed
+> cert + DNS) are DROPPED.** Decided with the product owner: the backend host is expected to be
+> stable after this one-time `zkairdrop→proteus-photos` cleanup, so the domain's only value
+> (decoupling clients from the project-specific `*.run.app` host against a *future* move) is
+> insurance against an event that isn't expected — at a ~$22/mo standing cost (forwarding rule +
+> static IPv4) and a Porkbun DNS dependency.
+> Consequences: **U5 removed**; **U6** verifies against the new prod `*.run.app` host directly
+> (`https://get-upload-urls-ld7izzjvga-rj.a.run.app`); **U9** repoints `download.py`/`upload.py`
+> defaults to that `*.run.app` host instead of the domain (one-line change), and now depends only
+> on U6 + U8 (not U5). Accepted trade: the signing function stays publicly reachable + unauthenticated
+> at its `*.run.app` host (CORS `*`) — identical to today's `zkairdrop` posture, so no regression;
+> no ingress lockdown. Re-coupling is accepted (a future move = one more client release; the
+> `SCREENCAP_*_URL` env override remains the escape hatch). Sections below that describe R6/U5/the
+> domain are retained for history but are **superseded by this banner**. Phase 1 (U1–U4) executed
+> 2026-06-02 — see `docs/runbooks/gcp-migration-proteus-photos.md` for the live record.
 
 ## Summary
 
@@ -28,8 +46,8 @@ screencap's cloud infrastructure lives in `zkairdrop`, a GCP project owned by th
 - R3. Existing recordings data is preserved by copying it from the `zkairdrop` recordings bucket into `proteus-photos` before the old bucket is removed.
 - R4. The recordings bucket keeps the name `screencap-recordings` (server-side reference only).
 - R5. The releases bucket retains the exact name `screencap-releases` via a planned delete-then-recreate cutover, accepting a brief distribution outage.
-- R6. The signing function is reachable via a stable custom domain `api.screencap.sh`; the client targets that domain, not the `*.run.app` host.
-- R7. A single client release updates the signing-endpoint reference ([src/screencap/download.py](src/screencap/download.py), [src/screencap/upload.py](src/screencap/upload.py), [.env](.env)) to the stable domain and is published through the preserved releases bucket.
+- ~~R6. The signing function is reachable via a stable custom domain `api.screencap.sh`~~ **— DROPPED (2026-06-02, see amendment banner).** The client targets the new project's `*.run.app` signing host directly.
+- R7. A single client release updates the signing-endpoint reference ([src/screencap/download.py](src/screencap/download.py), [src/screencap/upload.py](src/screencap/upload.py), [.env](.env)) to **the new `proteus-photos` `*.run.app` host** (amended from "the stable domain") and is published through the preserved releases bucket.
 - R8. A 7-day grace period keeps the `zkairdrop` client-facing resources live until installed clients have had a window to auto-update.
 - R9. The GitHub Actions release workflow's authentication is rebound from `zkairdrop` to `proteus-photos`.
 - R10. The end-to-end pipeline (record → upload → process via Eventarc → download) is verified against `proteus-photos` before any `zkairdrop` screencap resource is deleted.
@@ -130,13 +148,12 @@ flowchart TD
     U1["U1 · Foundational SAs/IAM<br/>+ staging recordings bucket"] --> U2["U2 · Signing function<br/>(prod + dev)"]
     U1 --> U3["U3 · Processing service<br/>+ Eventarc (on staging)"]
     U1 --> U4["U4 · Bulk-copy recordings<br/>→ staging bucket"]
-    U2 --> U5["U5 · api.screencap.sh<br/>ALB + NEG + managed cert"]
-    U5 --> U6{{"U6 · End-to-end verify<br/>vs proteus-photos · R10 GATE"}}
+    U2 --> U6{{"U6 · End-to-end verify<br/>vs proteus-photos · R10 GATE"}}
     U3 --> U6
     U4 --> U6
     U6 --> U7["U7 · Recordings name cutover<br/>(server-side, invisible)"]
     U7 --> U8["U8 · Releases name cutover<br/>+ CI auth rebind"]
-    U5 --> U9["U9 · Client release<br/>repoint host → api.screencap.sh"]
+    U6 --> U9["U9 · Client release<br/>repoint host → new *.run.app (U5/domain dropped)"]
     U8 --> U9
     U7 --> U10["U10 · 7-day grace<br/>+ decommission zkairdrop"]
     U9 --> U10
@@ -266,9 +283,14 @@ flowchart LR
 
 ---
 
-### U5. Stand up api.screencap.sh (Global External ALB + serverless NEG + managed cert)
+### U5. ~~Stand up api.screencap.sh~~ — DROPPED (2026-06-02)
 
-**Goal:** Make the new prod signing function reachable at `https://api.screencap.sh` via a Global External Application Load Balancer, with a pre-provisioned Certificate Manager managed cert, then lock the function ingress to internal + LB only.
+> **DROPPED per the scope amendment.** No load balancer, serverless NEG, static IP, managed cert,
+> or DNS record. The client targets the new prod `*.run.app` host directly (U9). The unit detail
+> below is retained for history only. Rationale + accepted trades: see the amendment banner at the
+> top of this plan and `docs/runbooks/gcp-migration-proteus-photos.md`.
+
+**Goal (superseded):** Make the new prod signing function reachable at `https://api.screencap.sh` via a Global External Application Load Balancer, with a pre-provisioned Certificate Manager managed cert, then lock the function ingress to internal + LB only.
 
 **Requirements:** R6
 
@@ -408,8 +430,8 @@ flowchart LR
 **Dependencies:** U5 (domain live + verified), U8 (release pipeline functional on the new bucket)
 
 **Files:**
-- Modify: `src/screencap/download.py` (`DEFAULT_DOWNLOAD_URL` `:28-30` → `https://api.screencap.sh`)
-- Modify: `src/screencap/upload.py` (`DEFAULT_UPLOAD_URL` `:29-31` → `https://api.screencap.sh`)
+- Modify: `src/screencap/download.py` (`DEFAULT_DOWNLOAD_URL` `:28-30` → `https://get-upload-urls-ld7izzjvga-rj.a.run.app` — the new prod `*.run.app` host; amended from `api.screencap.sh`)
+- Modify: `src/screencap/upload.py` (`DEFAULT_UPLOAD_URL` `:29-31` → `https://get-upload-urls-ld7izzjvga-rj.a.run.app` — amended from `api.screencap.sh`)
 - Modify: `CHANGELOG.md` (release entry — the release workflow extracts notes from it, [.github/workflows/release.yml:163](.github/workflows/release.yml))
 - Modify: `docs/runbooks/gcp-migration-proteus-photos.md` (operator-local `.env` dev repoint — `.env` is gitignored, not committed)
 - Test: `tests/test_download.py`, `tests/test_upload.py`
