@@ -28,13 +28,38 @@ of **what was provisioned, where, with which IAM, and how to roll back**. Update
 
 | Phase | Units | Destructive? | Status |
 |-------|-------|--------------|--------|
-| 1 — additive build-up | U1, U2, U3, U4 | No | **in progress** |
-| 2 — domain + verify gate | U5, U6 | No (gate) | not started |
+| 1 — additive build-up | U1, U2, U3, U4 | No | **DONE (2026-06-02)** |
+| 2 — verify gate | ~~U5~~ (dropped), U6 | No (gate) | not started |
 | 3 — cutovers + client release | U7, U8, U9 | **Yes (U7 irreversible)** | not started |
 | 4 — grace + teardown | U10 | **Yes** | not started |
 
-**This session executes Phase 1 only** (U1–U4), then pauses before U5 (load-balancer cost
-floor + `screencap.sh` DNS change) and all destructive work.
+## SCOPE AMENDMENT (2026-06-02): R6 / stable `api.screencap.sh` domain — DROPPED
+
+Decided with the product owner via brainstorm. **R6 (stable signing domain) and U5
+(load balancer + cert + DNS) are removed from this migration.** Driver: the backend host is
+expected to be stable after this one-time `zkairdrop→proteus-photos` cleanup, so the domain's
+only value — decoupling clients from the project-specific `*.run.app` host against a *future*
+move — is insurance against an event that isn't expected. It carries a ~$22/mo standing cost
+(external ALB forwarding rule + static IPv4) and a Porkbun DNS dependency for no expected payoff.
+
+Consequences:
+- **U5 — REMOVED.** No load balancer, serverless NEG, static IP, managed cert, or DNS record.
+- **U6 — simplified.** End-to-end verification runs against the new prod `*.run.app` host
+  directly via `SCREENCAP_*` overrides (no cert/ingress-lockdown checks).
+- **U9 — simplified.** Repoint `download.py`/`upload.py` defaults to the new prod host
+  `https://get-upload-urls-ld7izzjvga-rj.a.run.app` (NOT `api.screencap.sh`). One-line default
+  change + tests + CHANGELOG. **Now depends only on U8** (release pipeline), not U5.
+- **Accepted trade:** the signing function stays publicly reachable + unauthenticated at its
+  `*.run.app` host (CORS `*`) — identical to today's `zkairdrop` posture, not a regression.
+  Ingress lockdown is dropped with the domain. If hardening is ever wanted, it's a standalone task.
+- **Re-coupling accepted:** if the backend ever moves again, a single client release repoints it
+  (same mechanism as the unavoidable U9 release). The `SCREENCAP_*_URL` env override remains the
+  existing escape hatch.
+- The plan doc (`docs/plans/2026-05-29-003-...`) and Linear SCR-99 still describe R6/U5 — update
+  them to reflect this amendment.
+
+**This session executed Phase 1 (U1–U4).** Remaining: U6 (verify on `*.run.app`), U7/U8 cutovers,
+U9 (client repoint to new `*.run.app`), U10 teardown.
 
 ---
 
@@ -294,15 +319,12 @@ writes, reconciled at U7 final sync); spot-checked recording downloads intact.
 
 ## U5–U10 (out of this session — summary; expand at execution)
 
-- **U5** `api.screencap.sh`: enable `certificatemanager`; global static IP → serverless NEG
-  (region `southamerica-east1`, target the **Cloud Run service name from U2**) → backend
-  (`EXTERNAL_MANAGED`, global) → URL map → Certificate Manager DNS-authorized cert → HTTPS proxy →
-  global forwarding rule :443; A record `api.screencap.sh` → IP; then lock fn ingress to
-  internal+LB. ~$18/mo forwarding-rule floor.
-- **U6 (R10 GATE)** end-to-end record→upload→process→download via `api.screencap.sh` + staging
-  using `SCREENCAP_*` overrides; assert **parity** vs a captured zkairdrop baseline; prove the
-  old-function cross-project follow against **staging**; confirm cert ACTIVE, ingress lockdown,
-  Gemini active. No destructive step until this passes.
+- **U5 — DROPPED** (see Scope Amendment above). No `api.screencap.sh`, no load balancer, no DNS.
+- **U6 (R10 GATE)** end-to-end record→upload→process→download against the new prod **`*.run.app`**
+  host (`https://get-upload-urls-ld7izzjvga-rj.a.run.app`) + staging using `SCREENCAP_*` overrides;
+  assert **parity** vs a captured zkairdrop baseline; prove the old-function cross-project follow
+  against **staging**; confirm Gemini active; run the deferred faithful sentinel→`sessions/` check.
+  No destructive step until this passes. (No cert/ingress checks — domain dropped.)
 - **U7** recordings name cutover (IRREVERSIBLE): two clean final syncs + name+md5 manifest diff →
   delete `zkairdrop:screencap-recordings` → create final in proteus-photos → promote staged data →
   parity-assert → repoint `SCREENCAP_BUCKET` → create trigger **after** promotion → grant old-SA
@@ -311,9 +333,9 @@ writes, reconciled at U7 final sync); spot-checked recording downloads intact.
 - **U8** releases name cutover + CI rebind (reversible): full checksum snapshot → delete+recreate →
   re-upload `v*/...` + checksums, then `install.sh`, then `latest.txt` **last** → grant new CI SA
   bucket-scoped role → swap `GCP_SA_KEY` → manifest parity diff. Re-grant `allUsers:objectViewer`.
-- **U9** client release: flip `download.py`/`upload.py` defaults → `https://api.screencap.sh`;
-  tests + CHANGELOG + version bump; ship via the (now proteus) pipeline. Only after U5 cert ACTIVE,
-  U6 verified, U8 produced one verified artifact.
+- **U9** client release: flip `download.py`/`upload.py` defaults → the new prod `*.run.app`
+  `https://get-upload-urls-ld7izzjvga-rj.a.run.app` (domain dropped); tests + CHANGELOG + version
+  bump; ship via the (now proteus) pipeline. Depends only on U6 verified + U8 (one verified artifact).
 - **U10** 7-day grace + teardown: gate on (clock + old-host traffic floor vs day-1-post-U9 baseline,
   day-over-day, ≥2 sustained days + A5 written confirmation + new-stack 5xx/cert green) — not the
   clock alone. Then delete zkairdrop screencap resources (incl. legacy `screencap-recording-signed-url`),
