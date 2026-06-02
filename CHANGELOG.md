@@ -7,6 +7,14 @@ and this project adheres to [Semantic Versioning](https://semver.org/).
 
 ## [Unreleased]
 
+### Changed
+- **Cloud backend migrated to the `proteus-photos` GCP project.** The default
+  upload/download signing host moved from the old `zkairdrop` Cloud Function to
+  the new one (`get-upload-urls-ld7izzjvga-rj.a.run.app`). No user action needed —
+  installed clients pick this up on auto-update. Override still available via
+  `SCREENCAP_UPLOAD_URL` / `SCREENCAP_DOWNLOAD_URL`. Recordings and releases are
+  unchanged in behavior (releases keep the `screencap-releases` bucket name).
+
 ### Added
 - **Network proxy logging V1.5 — body capture + encryption-at-rest.**
   Optional body-byte capture for an allowlist of common knowledge-work
