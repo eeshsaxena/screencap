@@ -26,7 +26,7 @@ console = Console()
 DOWNLOAD_STATUS_FILE = ".download_status.json"
 
 DEFAULT_DOWNLOAD_URL = (
-    "https://get-upload-urls-wyldgq6aqa-rj.a.run.app"
+    "https://get-upload-urls-ld7izzjvga-rj.a.run.app"
 )
 
 
