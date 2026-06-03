@@ -22,6 +22,14 @@ venv/
 htmlcov/
 benchmark_results/
 
+# SCR-28 spike: the Tier-2 testbed is extracted from real recordings and contains
+# genuine PII — never commit the raw extracts or PII-derived results. Commit only
+# extract.py, ANNOTATION_GUIDELINES.md, and *.example.jsonl synthetic exemplars.
+# (.venv-pf is already covered by .venv-*/ above.) See benchmarks/scr28/README.md.
+benchmarks/scr28/tier2_testbed/inputs.jsonl
+benchmarks/scr28/tier2_testbed/gold.jsonl
+benchmarks/scr28/results/tier2-*
+
 # IDE
 .idea/
 .vscode/
