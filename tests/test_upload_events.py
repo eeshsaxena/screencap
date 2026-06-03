@@ -25,6 +25,16 @@ from unittest import mock
 import pytest
 
 
+@pytest.fixture(autouse=True)
+def _signed_in(monkeypatch):
+    """In-process upload_recording calls now require a token via
+    request_signed_urls; default to "signed in" so these event-shape tests run
+    without a Keychain. The real-subprocess test sets the token via env instead."""
+    monkeypatch.setattr(
+        "screencap.auth.get_id_token", lambda force_refresh=False: "test-id-token"
+    )
+
+
 # ---------------------------------------------------------------------------
 # Helpers
 # ---------------------------------------------------------------------------
@@ -517,6 +527,12 @@ def test_sigterm_delivered_to_real_subprocess_emits_interrupted(tmp_path):
     env = os.environ.copy()
     env["PYTHONPATH"] = f"{src_root}{os.pathsep}{env.get('PYTHONPATH', '')}"
     env["PYTHONUNBUFFERED"] = "1"
+    # The child can't see the parent's monkeypatch, so deliver a token via the
+    # out-of-band engine channel: auth.get_id_token reads this 0600 file instead
+    # of the Keychain, so request_signed_urls attaches a bearer and proceeds.
+    token_file = tmp_path / "engine-token.jwt"
+    token_file.write_text("test-id-token")
+    env["SCREENCAP_ENGINE_TOKEN_FILE"] = str(token_file)
 
     proc = subprocess.Popen(
         [sys.executable, "-c", _SIGTERM_TEST_HARNESS, str(rec)],
