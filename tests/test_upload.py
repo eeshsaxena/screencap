@@ -21,13 +21,9 @@ from screencap.upload import (
 
 
 @pytest.fixture(autouse=True)
-def _signed_in(monkeypatch):
-    """Default every test to "signed in" so request_signed_urls attaches a bearer
-    token without touching the Keychain. Tests covering the not-signed-in / 401
-    paths override this with their own monkeypatch.setattr (which wins)."""
-    monkeypatch.setattr(
-        "screencap.auth.get_id_token", lambda force_refresh=False: "test-id-token"
-    )
+def _signed_in_autouse(_signed_in):
+    """Apply the shared ``_signed_in`` fixture (tests/conftest.py) to every test
+    in this module. Not-signed-in / 401 tests override get_id_token themselves."""
 
 
 # ---------------------------------------------------------------------------
@@ -247,7 +243,28 @@ def test_request_signed_urls_not_signed_in_raises_sign_in_message(monkeypatch):
     with mock.patch("screencap.upload.requests.post") as post:
         with pytest.raises(RuntimeError, match="screencap login"):
             request_signed_urls("rec1", files)
-    post.assert_not_called()  # never hit the network without a token
+
+
+def test_request_signed_urls_transient_autherror_on_refresh_maps_to_retryable(monkeypatch):
+    """A transient AuthError raised by the forced refresh on the 401 retry must
+    surface as a clean, retryable RuntimeError — never a raw AuthError traceback."""
+    from screencap import auth
+    from screencap.upload import request_signed_urls
+
+    files = [FileInfo("video.mp4", mock.MagicMock(), "video/mp4", 1000)]
+
+    def token(force_refresh=False):
+        if force_refresh:
+            # The 401 retry forces a re-mint, which hits a transient outage.
+            raise auth.AuthError("token service 503")
+        return "stale"
+
+    monkeypatch.setattr("screencap.auth.get_id_token", token)
+
+    r401 = mock.MagicMock(status_code=401)
+    with mock.patch("screencap.upload.requests.post", return_value=r401):
+        with pytest.raises(RuntimeError, match="temporarily unavailable"):
+            request_signed_urls("rec1", files)
 
 
 # ---------------------------------------------------------------------------

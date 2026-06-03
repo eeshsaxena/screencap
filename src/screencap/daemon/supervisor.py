@@ -552,7 +552,35 @@ class Supervisor:
                 )
             self._clear_stale_lock_if_unheld()
         finally:
+            self._prune_stale_engine_token_files()
             self._recovering = False
+
+    @staticmethod
+    def _prune_stale_engine_token_files() -> None:
+        """Delete any leftover ``engine-token-*.jwt`` files at daemon startup.
+
+        On a clean stop ``_cleanup_engine_token_file`` removes the live token, but
+        a hard crash / SIGKILL runs no Python teardown, so a 0600 file holding a
+        short-lived ID token can survive in the run dir until expiry. At daemon
+        startup no live recording can legitimately own one (the engine that read it
+        is gone), so unlink every survivor. Best-effort: a failure is logged and
+        never blocks reconciliation, mirroring ``_cleanup_engine_token_file``.
+        """
+        from screencap.config import get_base_dir
+
+        run_dir = get_base_dir() / "run"
+        try:
+            stale = list(run_dir.glob("engine-token-*.jwt"))
+        except OSError as exc:
+            logger.warning("daemon: could not scan for stale engine token files: %s", exc)
+            return
+        for path in stale:
+            try:
+                path.unlink(missing_ok=True)
+            except OSError as exc:
+                logger.warning(
+                    "daemon: could not remove stale engine token file %s: %s", path, exc
+                )
 
     async def _stderr_pump(self, proc: _PopenEngineProcess) -> None:
         stderr = proc.stderr
@@ -964,8 +992,18 @@ class Supervisor:
             os.write(fd, token.encode("ascii"))
         finally:
             os.close(fd)
-        os.replace(str(tmp), str(path))
-        os.chmod(path, 0o600)  # re-assert in case the file pre-existed wider
+        try:
+            os.replace(str(tmp), str(path))
+            os.chmod(path, 0o600)  # re-assert in case the file pre-existed wider
+        except OSError:
+            # The .tmp holds a live ID token; _cleanup_engine_token_file only
+            # removes the canonical .jwt, so unlink the residue before re-raising
+            # rather than leaking a same-EUID-readable token in the run dir.
+            try:
+                os.unlink(str(tmp))
+            except OSError:
+                pass
+            raise
 
     def _cleanup_engine_token_file(self) -> None:
         path = self._engine_token_file

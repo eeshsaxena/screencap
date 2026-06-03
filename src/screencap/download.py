@@ -110,6 +110,9 @@ def list_remote_recordings() -> list[RemoteRecording]:
         )
     except auth.NotSignedIn:
         raise RuntimeError("Sign in to access your cloud recordings: run `screencap login`.")
+    except auth.AuthError as e:
+        # Transient refresh failure on the 401 retry — credential still valid.
+        raise RuntimeError(f"Cloud auth temporarily unavailable; try again: {e}")
     except requests.ConnectionError:
         raise RuntimeError(
             "Download service unavailable. Check your internet connection."
@@ -158,6 +161,9 @@ def request_signed_urls(recording_name: str) -> tuple[dict[str, str], str]:
         )
     except auth.NotSignedIn:
         raise RuntimeError("Sign in to download your cloud recordings: run `screencap login`.")
+    except auth.AuthError as e:
+        # Transient refresh failure on the 401 retry — credential still valid.
+        raise RuntimeError(f"Cloud auth temporarily unavailable; try again: {e}")
     except requests.ConnectionError:
         raise RuntimeError(
             "Download service unavailable. Check your internet connection."

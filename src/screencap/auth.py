@@ -32,6 +32,7 @@ import os
 import secrets
 import threading
 import time
+from collections.abc import Callable
 from contextlib import contextmanager
 from dataclasses import dataclass
 from http.server import BaseHTTPRequestHandler, HTTPServer
@@ -536,7 +537,13 @@ def get_id_token(force_refresh: bool = False) -> str:
     return _ensure_fresh(force=force_refresh).id_token
 
 
-def authed_post(post, url, *, json=None, timeout=30):
+def authed_post(
+    post: Callable[..., requests.Response],
+    url: str,
+    *,
+    json: object = None,
+    timeout: float = 30,
+) -> requests.Response:
     """POST ``url`` with an ``Authorization: Bearer`` header, retrying once on 401.
 
     ``post`` is the CALLER's own ``requests.post`` reference (e.g.
@@ -550,7 +557,8 @@ def authed_post(post, url, *, json=None, timeout=30):
     to a "run ``screencap login``" message) and any exception ``post`` raises
     (``ConnectionError`` / ``Timeout``). Returns the final response.
     """
-    resp = None
+    # range(2) always assigns resp on the first iteration, so the return is
+    # provably non-Optional — callers can dereference .status_code without a guard.
     for attempt in range(2):
         token = get_id_token(force_refresh=attempt > 0)
         resp = post(url, json=json, headers={"Authorization": f"Bearer {token}"}, timeout=timeout)

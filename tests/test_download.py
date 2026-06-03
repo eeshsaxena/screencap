@@ -20,12 +20,9 @@ from screencap.download import (
 
 
 @pytest.fixture(autouse=True)
-def _signed_in(monkeypatch):
-    """Default every test to "signed in" so the download paths attach a bearer
-    token without touching the Keychain. Auth-failure tests override this."""
-    monkeypatch.setattr(
-        "screencap.auth.get_id_token", lambda force_refresh=False: "test-id-token"
-    )
+def _signed_in_autouse(_signed_in):
+    """Apply the shared ``_signed_in`` fixture (tests/conftest.py) to every test
+    in this module. Auth-failure tests override get_id_token themselves."""
 
 
 # ---------------------------------------------------------------------------

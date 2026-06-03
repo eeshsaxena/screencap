@@ -12,13 +12,11 @@ from screencap.cli import cli
 
 
 @pytest.fixture(autouse=True)
-def _signed_in(monkeypatch):
-    """Default to "signed in" so the upload command's pre-flight auth check
-    passes without touching the Keychain. Upload's not-signed-in refusal is
-    covered explicitly in test_upload.py."""
-    monkeypatch.setattr(
-        "screencap.auth.get_id_token", lambda force_refresh=False: "test-id-token"
-    )
+def _signed_in_autouse(_signed_in):
+    """Apply the shared ``_signed_in`` fixture (tests/conftest.py) to every test
+    in this module so the upload command's pre-flight auth check passes without
+    touching the Keychain. Upload's not-signed-in refusal is covered in
+    test_upload.py."""
 
 
 @contextmanager

@@ -915,3 +915,194 @@ def test_token_has_no_field_in_argv_encoded_worker_args(tmp_path: Path) -> None:
     assert not any("token" in key.lower() for key in args), (
         f"worker args must carry no token-bearing field; keys: {list(args)}"
     )
+
+
+@pytest.fixture
+def isolated_base_dir(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> Path:
+    """Point ``config.get_base_dir()`` at a per-test tmp dir.
+
+    The engine-token-file helpers resolve their run dir via ``get_base_dir() / run``
+    (``Path.home() / .screencap`` in production). Redirect it so token-file tests
+    never touch the developer's real ``~/.screencap/run``.
+    """
+    import screencap.config as cfg
+
+    base = tmp_path / "base" / ".screencap"
+    monkeypatch.setattr(cfg, "_DEFAULT_BASE", base)
+    return base
+
+
+@pytest.mark.asyncio
+async def test_reconcile_prunes_stale_engine_token_file(
+    isolated_lock, isolated_base_dir: Path,
+) -> None:
+    """A hard crash / SIGKILL runs no Python teardown, so an ``engine-token-*.jwt``
+    0600 file can survive in the run dir. The reconcile path at daemon startup must
+    unlink any survivor — no live recording can own one at startup."""
+    from screencap.daemon.supervisor import Supervisor
+
+    run_dir = isolated_base_dir / "run"
+    run_dir.mkdir(parents=True, exist_ok=True)
+    stale = run_dir / "engine-token-x.jwt"
+    stale.write_text("leaked.id.token", encoding="utf-8")
+
+    # A dead daemon-claimant engine drives the standard recovery reconcile path.
+    _write_lock(
+        isolated_lock.LOCK_FILE,
+        {
+            "claimant": "daemon",
+            "pid": 999999,
+            "engine_pid": 999999,
+            "started_at": 1778198400.0,
+            "recording_started_at": 1778198401.0,
+            "recording_name": "dead",
+        },
+    )
+    supervisor = Supervisor(EventBus(), reconcile_on_init=True, reconcile_grace=0.1)
+    await _wait_until(lambda: not supervisor.is_recovering(), timeout=3.0)
+
+    assert not stale.exists(), "stale engine token file should be pruned at startup"
+    await supervisor.shutdown()
+
+
+# ---------------------------------------------------------------------------
+# U5: token re-mint timer loop (_token_refresh_loop)
+# ---------------------------------------------------------------------------
+
+
+class _FakeAliveProc:
+    """Minimal stand-in for _PopenEngineProcess: alive until flipped."""
+
+    def __init__(self) -> None:
+        self._alive = True
+        self.pid = 4242
+
+    def is_alive(self) -> bool:
+        return self._alive
+
+
+async def _run_loop_briefly(supervisor, proc) -> asyncio.Task:
+    """Start _token_refresh_loop as a task. Caller asserts then cancels/joins."""
+    task = asyncio.create_task(supervisor._token_refresh_loop(proc))
+    return task
+
+
+async def _stop_loop(proc: "_FakeAliveProc", task: asyncio.Task) -> None:
+    """Tear down a running _token_refresh_loop task.
+
+    Flipping the proc dead lets the loop's ``while`` guard return on its next
+    iteration; the cancel covers the case where it is mid-``asyncio.sleep``. Either
+    a normal return or a CancelledError is an acceptable, non-erroring exit."""
+    proc._alive = False
+    task.cancel()
+    try:
+        await task
+    except asyncio.CancelledError:
+        pass
+
+
+@pytest.mark.asyncio
+async def test_token_refresh_loop_rewrites_file_in_place_without_restart(
+    isolated_base_dir: Path, monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """A successful re-mint rewrites the token file in place — same path, new
+    contents — and never touches the engine process (no restart)."""
+    from screencap.daemon.supervisor import Supervisor
+
+    monkeypatch.setenv("SCREENCAP_DAEMON_TOKEN_REFRESH_INTERVAL", "0.01")
+    tokens = iter(["second-token", "second-token", "third-token"])
+    monkeypatch.setattr(
+        "screencap.auth.get_id_token", lambda force_refresh=False: next(tokens)
+    )
+
+    path = isolated_base_dir / "run" / "engine-token-live.jwt"
+    path.parent.mkdir(parents=True, exist_ok=True)
+    Supervisor._write_engine_token_file(path, "first-token")
+
+    supervisor = Supervisor(EventBus(), reconcile_on_init=False)
+    proc = _FakeAliveProc()
+    supervisor._proc = proc
+    supervisor._engine_token_file = path
+
+    task = await _run_loop_briefly(supervisor, proc)
+    try:
+        await _wait_until(
+            lambda: path.read_text() == "second-token", timeout=2.0
+        )
+        # Same file path (rewritten in place), and the engine proc is untouched.
+        assert supervisor._proc is proc
+        assert proc.is_alive() is True
+    finally:
+        await _stop_loop(proc, task)
+
+
+@pytest.mark.asyncio
+async def test_token_refresh_loop_autherror_leaves_file_unchanged_no_crash(
+    isolated_base_dir: Path, monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """A transient AuthError mid-loop is logged and the loop continues — the
+    recording proceeds and the token file is left unchanged."""
+    from screencap import auth
+    from screencap.daemon.supervisor import Supervisor
+
+    monkeypatch.setenv("SCREENCAP_DAEMON_TOKEN_REFRESH_INTERVAL", "0.01")
+
+    def boom(force_refresh=False):
+        raise auth.AuthError("token service hiccup")
+
+    monkeypatch.setattr("screencap.auth.get_id_token", boom)
+
+    path = isolated_base_dir / "run" / "engine-token-live.jwt"
+    path.parent.mkdir(parents=True, exist_ok=True)
+    Supervisor._write_engine_token_file(path, "stable-token")
+
+    supervisor = Supervisor(EventBus(), reconcile_on_init=False)
+    proc = _FakeAliveProc()
+    supervisor._proc = proc
+    supervisor._engine_token_file = path
+
+    task = await _run_loop_briefly(supervisor, proc)
+    try:
+        # Let the loop spin a few intervals; it must not crash or rewrite.
+        await asyncio.sleep(0.1)
+        assert not task.done(), "loop must keep running after AuthError"
+        assert path.read_text() == "stable-token"
+    finally:
+        await _stop_loop(proc, task)
+
+
+@pytest.mark.asyncio
+async def test_token_refresh_loop_write_oserror_does_not_crash_loop(
+    isolated_base_dir: Path, monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """An OSError from the in-place rewrite is logged and the loop continues —
+    the engine just keeps the prior token and fails closed on the next 401."""
+    from screencap.daemon import supervisor as sv
+    from screencap.daemon.supervisor import Supervisor
+
+    monkeypatch.setenv("SCREENCAP_DAEMON_TOKEN_REFRESH_INTERVAL", "0.01")
+    monkeypatch.setattr(
+        "screencap.auth.get_id_token", lambda force_refresh=False: "fresh-token"
+    )
+
+    path = isolated_base_dir / "run" / "engine-token-live.jwt"
+    path.parent.mkdir(parents=True, exist_ok=True)
+    Supervisor._write_engine_token_file(path, "prior-token")
+
+    def write_boom(_path, _token):
+        raise OSError("disk full")
+
+    monkeypatch.setattr(sv.Supervisor, "_write_engine_token_file", staticmethod(write_boom))
+
+    supervisor = Supervisor(EventBus(), reconcile_on_init=False)
+    proc = _FakeAliveProc()
+    supervisor._proc = proc
+    supervisor._engine_token_file = path
+
+    task = await _run_loop_briefly(supervisor, proc)
+    try:
+        await asyncio.sleep(0.1)
+        assert not task.done(), "loop must keep running after a write OSError"
+        assert path.read_text() == "prior-token"  # untouched
+    finally:
+        await _stop_loop(proc, task)

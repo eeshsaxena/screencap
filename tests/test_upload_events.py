@@ -26,13 +26,10 @@ import pytest
 
 
 @pytest.fixture(autouse=True)
-def _signed_in(monkeypatch):
-    """In-process upload_recording calls now require a token via
-    request_signed_urls; default to "signed in" so these event-shape tests run
-    without a Keychain. The real-subprocess test sets the token via env instead."""
-    monkeypatch.setattr(
-        "screencap.auth.get_id_token", lambda force_refresh=False: "test-id-token"
-    )
+def _signed_in_autouse(_signed_in):
+    """Apply the shared ``_signed_in`` fixture (tests/conftest.py) to every test
+    in this module so in-process upload_recording calls get a token via
+    request_signed_urls. The real-subprocess test sets the token via env instead."""
 
 
 # ---------------------------------------------------------------------------

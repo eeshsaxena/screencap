@@ -2792,6 +2792,8 @@ def upload(names, all_recordings, dry_run, force, jobs, no_delete):
     # delete), rather than failing mid-upload — R3/AE3. Dry-run is local-only and
     # never needs auth.
     if not dry_run:
+        import keyring.errors
+
         from screencap import auth
 
         try:
@@ -2800,6 +2802,15 @@ def upload(names, all_recordings, dry_run, force, jobs, no_delete):
             console.print(
                 "[red]Not signed in.[/red] Run [bold]screencap login[/bold] to "
                 "upload to the cloud. Your recordings stay local — nothing was changed."
+            )
+            sys.exit(1)
+        except keyring.errors.KeyringError:
+            # The Keychain itself is unreadable (locked, backend error) — distinct
+            # from "not signed in". Refuse cleanly and touch nothing on disk.
+            console.print(
+                "[red]Couldn't read your saved credentials (Keychain locked?).[/red] "
+                "Unlock the Keychain and try again — your recordings stay local, "
+                "nothing was changed."
             )
             sys.exit(1)
         except auth.AuthError:

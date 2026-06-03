@@ -221,6 +221,11 @@ def request_signed_urls(
         resp = auth.authed_post(requests.post, url, json=payload, timeout=30)
     except auth.NotSignedIn:
         raise RuntimeError("Sign in to upload to the cloud: run `screencap login`.")
+    except auth.AuthError as e:
+        # The forced-refresh on the 401 retry hit a transient failure (refresh
+        # network error / token-service outage). The credential is still valid —
+        # surface a retryable message, not a forced re-login.
+        raise RuntimeError(f"Cloud auth temporarily unavailable; try again: {e}")
     except requests.ConnectionError:
         raise RuntimeError("Upload service unavailable. Check your internet connection.")
     except requests.Timeout:

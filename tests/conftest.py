@@ -28,6 +28,21 @@ import pytest
 # ---------------------------------------------------------------------------
 
 
+@pytest.fixture
+def _signed_in(monkeypatch):
+    """Default a test to "signed in" so the cloud paths attach a bearer token
+    without touching the Keychain.
+
+    Shared by the upload / download / CLI / upload-events suites (each opts in via
+    a thin per-module autouse wrapper). It is deliberately NOT globally autouse:
+    ``tests/test_auth.py`` exercises the real ``get_id_token`` refresh/rotation
+    logic and must not have it stubbed out. Tests covering the not-signed-in / 401
+    paths override this with their own ``monkeypatch.setattr`` (which wins)."""
+    monkeypatch.setattr(
+        "screencap.auth.get_id_token", lambda force_refresh=False: "test-id-token"
+    )
+
+
 @pytest.fixture(autouse=True)
 def _reset_config_cache():
     """Reset screencap.config._config_cache between tests.
