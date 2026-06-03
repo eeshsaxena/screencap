@@ -580,6 +580,23 @@ load-bearing and the move requires a same-name delete-recreate (the plan's U8, u
 - Tests: download/upload/upload_events suites pass (118 passed). One **pre-existing** failure
   `test_list_remote_empty` (verified by stashing the edits — fails identically on the clean tree;
   unrelated to the host change — `list --remote` empty-output formatting). Filed as a separate follow-up.
-- **Ship pending:** version bump + tag → release through the (now proteus) pipeline — this is the first
-  real exercise of the U8 CI rebind + the U9 code, and it's what moves installed clients onto the new host.
-  Not urgent for function (old clients already work via the U7 repoint) but required before U10 teardown.
+- **SHIPPED in v0.20.0 (2026-06-02):** PR #208 merged; `v0.20.0` built locally (includes the U9 host
+  repoint — verified `download.py` points at `…ld7izzjvga…`), published to
+  `gs://screencap-releases/releases/v0.20.0/` (arm64 + x86_64; arm64 checksum verified against
+  `checksums.sha256`), and **`latest.txt` promoted to `0.20.0`**. Installed clients now auto-update onto
+  the new proteus host. The U10 grace clock starts here (teardown tracked in SCR-112, due 2026-06-09).
+
+### Release process — how screencap actually ships (IMPORTANT for the next person)
+
+**Releases are cut with `/local-release` (local build + direct `gcloud storage` upload), NOT GitHub
+Actions.** The macOS CI runners are paid/expensive, so the `release.yml` workflow that a tag push
+triggers is **expected to show as failed/unused — it is NOT the publish path.** Don't chase a red CI
+release run; check the bucket (`latest.txt` + `releases/v<version>/`) for the real state.
+
+- The x86_64 Big Sur `av` constraint that broke *CI* builds since ~0.18.0 (`pyproject av>=14` vs
+  `pyinstaller/constraints-x86_64.txt av<14`) was fixed separately in `55e6f40b`. `/local-release` was
+  unaffected (it builds on a capable host).
+- `latest.txt` is the auto-update pointer; promote it (`printf '<ver>\n' | gcloud storage cp -
+  gs://screencap-releases/releases/latest.txt`) only after the version's artifacts + checksums are
+  uploaded and verified. It does not always advance automatically — confirm it matches the intended
+  released version.
