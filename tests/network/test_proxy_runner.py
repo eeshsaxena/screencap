@@ -490,3 +490,81 @@ class TestProcessLifecycle:
 
         # Process exited.
         assert not proc.is_alive()
+
+
+# ---------------------------------------------------------------------------
+# Fail-closed gate — auth/token hosts must be in ignore_hosts (PR #210 #7)
+# ---------------------------------------------------------------------------
+
+
+def _run_proxy_with_dropped_auth_host(
+    out_q,
+    recording_id,
+    network_config,
+    privacy_config,
+    port,
+    log_path,
+    started_event,
+    confdir,
+):
+    """Patch build_ignore_hosts_regex to omit a required auth host, then run the
+    proxy. The fail-closed gate must refuse to start (started_event never set).
+    Patched before run_proxy's own `from ... import build_ignore_hosts_regex`, so
+    the import binds the patched callable; missing_required_auth_hosts is left
+    real and detects the dropped host."""
+    import screencap.network.blocklist as bl
+
+    _real = bl.build_ignore_hosts_regex
+
+    def _drop_securetoken(privacy_config, network_config):
+        return [p for p in _real(privacy_config, network_config) if "securetoken" not in p]
+
+    bl.build_ignore_hosts_regex = _drop_securetoken  # type: ignore[assignment]
+
+    from screencap.network.proxy_runner import run_proxy
+    run_proxy(
+        out_q,
+        recording_id,
+        network_config,
+        privacy_config,
+        port,
+        log_path,
+        started_event,
+        confdir,
+    )
+
+
+class TestAuthHostFailClosedGate:
+    def test_dropped_auth_host_refuses_to_start(self, tmp_path):
+        """If a required auth host is missing from ignore_hosts, run_proxy MUST
+        refuse to start (started_event never set) rather than risk TLS-
+        intercepting and capturing the user's own credentials."""
+        out_q = SPAWN_CTX.Queue(maxsize=10)
+        started_event = SPAWN_CTX.Event()
+        log_path = tmp_path / "proxy.log"
+        log_path.touch()
+
+        proc = SPAWN_CTX.Process(
+            target=_run_proxy_with_dropped_auth_host,
+            args=(
+                out_q,
+                42,
+                NetworkConfig(),
+                _picklable_privacy(),
+                _free_port(),
+                log_path,
+                started_event,
+                tmp_path / "confdir",
+            ),
+        )
+        proc.start()
+        # Assertion fires fast — the gate returns before any socket bind.
+        ready = started_event.wait(timeout=8.0)
+        assert ready is False, "proxy must NOT start when a required auth host is missing"
+
+        proc.join(timeout=5)
+        if proc.is_alive():
+            proc.terminate()
+            proc.join(timeout=3)
+
+        assert "required auth hosts missing" in log_path.read_text()
