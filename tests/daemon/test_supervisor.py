@@ -737,3 +737,181 @@ async def test_shutdown_cancels_exit_poll_before_subscribe_no_double_release(
     # `_exit_poll` iteration racing with shutdown's late subscribe.
     # Without F4's cancellation a third call appears.
     assert release_calls <= 2, f"release_lock called {release_calls} times; expected <= 2"
+
+
+# ---------------------------------------------------------------------------
+# U5: out-of-band engine ID-token seam
+# ---------------------------------------------------------------------------
+
+
+def _cloud_engine_script(tmp_path: Path) -> Path:
+    """A fake engine that reports what it received via the out-of-band token
+    channel: the token it read from SCREENCAP_ENGINE_TOKEN_FILE, whether the env
+    var was set, and whether the token string leaked into its argv."""
+    script = tmp_path / "cloud_engine.py"
+    script.write_text(
+        textwrap.dedent(
+            '''
+            import json, os, signal, sys, time
+
+            def emit(t, **p):
+                sys.stderr.write(json.dumps({"type": t, "schema_version": 1, "ts": time.time(), **p}) + "\\n")
+                sys.stderr.flush()
+
+            def handle_term(_s, _f):
+                emit("recording_finalized", name="cloud", duration_seconds=0.1, force_stopped=False, disk_full=False)
+                raise SystemExit(0)
+
+            signal.signal(signal.SIGTERM, handle_term)
+            token_file = os.environ.get("SCREENCAP_ENGINE_TOKEN_FILE")
+            token_seen = ""
+            if token_file:
+                try:
+                    token_seen = open(token_file).read().strip()
+                except OSError:
+                    token_seen = ""
+            argv_has_token = bool(token_seen) and any(token_seen in a for a in sys.argv)
+            emit("started", claimant="daemon", token_env_set=bool(token_file),
+                 token_seen=token_seen, argv_has_token=argv_has_token)
+            while True:
+                time.sleep(0.05)
+            '''
+        ),
+        encoding="utf-8",
+    )
+    return script
+
+
+@pytest.mark.asyncio
+async def test_cloud_engine_receives_token_out_of_band_not_in_argv(
+    tmp_path: Path, isolated_lock, allow_tmp_output_dir, monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    from screencap.daemon.supervisor import Supervisor
+
+    monkeypatch.setattr("screencap.auth.get_id_token", lambda force_refresh=False: "secret-id-token")
+
+    bus = EventBus()
+    supervisor = Supervisor(
+        bus,
+        engine_command_factory=_factory(_cloud_engine_script(tmp_path)),
+        reconcile_on_init=False, poll_interval=0.05, startup_timeout=2.0, stop_timeout=2.0,
+    )
+    sub = await bus.subscribe()
+    await supervisor.spawn(
+        schema.RecordingStartRequest(
+            name="cloud", output_dir=str(tmp_path / "cloud"), cloud_intent=True,
+        )
+    )
+
+    started = await asyncio.wait_for(sub.queue.get(), timeout=2.0)
+    assert started["type"] == _stderr_events.EVENT_STARTED
+    # The engine got the token via the out-of-band file (env-delivered path)...
+    assert started["token_env_set"] is True
+    assert started["token_seen"] == "secret-id-token"
+    # ...and the token NEVER appeared on its command line (ps-visibility guard).
+    assert started["argv_has_token"] is False
+
+    # The staged file is mode 0600 and holds exactly the token.
+    token_path = supervisor._engine_token_file
+    assert token_path is not None and token_path.exists()
+    assert (token_path.stat().st_mode & 0o777) == 0o600
+    assert token_path.read_text().strip() == "secret-id-token"
+
+    await supervisor.stop(force=False)
+    await _wait_until(lambda: not isolated_lock.lock_is_active())
+    # Torn down on engine exit.
+    assert supervisor._engine_token_file is None
+    assert not token_path.exists()
+    await supervisor.shutdown()
+
+
+@pytest.mark.asyncio
+async def test_cloud_engine_not_signed_in_fails_closed_no_token(
+    tmp_path: Path, isolated_lock, allow_tmp_output_dir, monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    from screencap import auth
+    from screencap.daemon.supervisor import Supervisor
+
+    def not_signed_in(force_refresh=False):
+        raise auth.NotSignedIn("no creds")
+
+    monkeypatch.setattr("screencap.auth.get_id_token", not_signed_in)
+
+    bus = EventBus()
+    supervisor = Supervisor(
+        bus,
+        engine_command_factory=_factory(_cloud_engine_script(tmp_path)),
+        reconcile_on_init=False, poll_interval=0.05, startup_timeout=2.0, stop_timeout=2.0,
+    )
+    sub = await bus.subscribe()
+    await supervisor.spawn(
+        schema.RecordingStartRequest(
+            name="nc", output_dir=str(tmp_path / "nc"), cloud_intent=True,
+        )
+    )
+
+    started = await asyncio.wait_for(sub.queue.get(), timeout=2.0)
+    # Fail-closed, not fail-stop: the recording still starts (stays local); the
+    # engine just gets no token, so live upload fails closed (no deletion).
+    assert started["type"] == _stderr_events.EVENT_STARTED
+    assert started["token_env_set"] is False
+    assert supervisor._engine_token_file is None
+
+    await supervisor.stop(force=False)
+    await _wait_until(lambda: not isolated_lock.lock_is_active())
+    await supervisor.shutdown()
+
+
+@pytest.mark.asyncio
+async def test_local_recording_stages_no_token_even_when_signed_in(
+    tmp_path: Path, isolated_lock, allow_tmp_output_dir, monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    from screencap.daemon.supervisor import Supervisor
+
+    monkeypatch.setattr("screencap.auth.get_id_token", lambda force_refresh=False: "tok")
+
+    bus = EventBus()
+    supervisor = Supervisor(
+        bus,
+        engine_command_factory=_factory(_cloud_engine_script(tmp_path)),
+        reconcile_on_init=False, poll_interval=0.05, startup_timeout=2.0, stop_timeout=2.0,
+    )
+    sub = await bus.subscribe()
+    await supervisor.spawn(
+        schema.RecordingStartRequest(name="local", output_dir=str(tmp_path / "local"))
+    )
+
+    started = await asyncio.wait_for(sub.queue.get(), timeout=2.0)
+    assert started["token_env_set"] is False  # cloud_intent defaults False → no token
+    assert supervisor._engine_token_file is None
+
+    await supervisor.stop(force=False)
+    await _wait_until(lambda: not isolated_lock.lock_is_active())
+    await supervisor.shutdown()
+
+
+def test_write_engine_token_file_is_0600(tmp_path: Path) -> None:
+    from screencap.daemon.supervisor import Supervisor
+
+    p = tmp_path / "engine-token.jwt"
+    Supervisor._write_engine_token_file(p, "abc.def.ghi")
+    assert p.read_text() == "abc.def.ghi"
+    assert (p.stat().st_mode & 0o777) == 0o600
+    # Overwrites in place, mode re-asserted.
+    Supervisor._write_engine_token_file(p, "new")
+    assert p.read_text() == "new"
+    assert (p.stat().st_mode & 0o777) == 0o600
+
+
+def test_token_has_no_field_in_argv_encoded_worker_args(tmp_path: Path) -> None:
+    # Structural guard: the worker args (base64'd into argv) carry no token field,
+    # so a token can never leak into ps/argv via the start handoff.
+    from screencap.daemon.supervisor import build_engine_worker_args
+
+    req = schema.RecordingStartRequest(
+        name="x", output_dir=str(tmp_path), cloud_intent=True,
+    )
+    args = build_engine_worker_args(req, name="x", capture_dir=tmp_path)
+    assert not any("token" in key.lower() for key in args), (
+        f"worker args must carry no token-bearing field; keys: {list(args)}"
+    )
