@@ -53,6 +53,9 @@ _SETTINGS_PRIVACY_SCHEMA_VERSION = 2
 # Additive: every v1 field is unchanged.
 _SETTINGS_SCHEMA_VERSION = 2
 _STOP_SCHEMA_VERSION = 1
+# `whoami --json` envelope (ok + schema_version + signed_in/uid/email), read by
+# the SwiftUI shell to gate the Upload affordance on auth state.
+_AUTH_SCHEMA_VERSION = 1
 
 
 def _should_default_to_json() -> bool:
@@ -1748,6 +1751,56 @@ def review_data_cmd(name, as_json):
     console.print(f"  events: [dim]{envelope['events_path']}[/dim]")
     if envelope.get("video_pixfmt_remediated"):
         console.print("  [dim](video remediated for AVKit compatibility)[/dim]")
+
+
+@cli.command("login")
+def login_cmd():
+    """Sign in to your ScreenCap cloud account (opens your browser).
+
+    Local recording, scrubbing, and playback never require sign-in — this is
+    only needed to upload to the cloud. The long-lived refresh token is stored
+    in your macOS Keychain; the short-lived ID token stays in memory.
+    """
+    from screencap import auth
+
+    try:
+        state = auth.login()
+    except auth.AuthError as e:
+        console.print(f"[red]Sign-in failed:[/red] {e}")
+        sys.exit(1)
+    console.print(f"[green]Signed in[/green] as [bold]{state.email or state.uid}[/bold].")
+
+
+@cli.command("logout")
+def logout_cmd():
+    """Sign out and remove your stored cloud credentials."""
+    from screencap import auth
+
+    if auth.logout():
+        console.print("[green]Signed out.[/green]")
+    else:
+        console.print("[yellow]No stored credentials (already signed out).[/yellow]")
+
+
+@cli.command("whoami")
+@click.option("--json", "as_json", is_flag=True,
+              default=lambda: _should_default_to_json(),
+              help="Output as JSON. Auto-detected when stdout is not a TTY.")
+def whoami_cmd(as_json):
+    """Show the signed-in cloud account (or 'not signed in')."""
+    from screencap import auth
+
+    info = auth.whoami()
+    if as_json:
+        envelope = {"ok": True, "schema_version": _AUTH_SCHEMA_VERSION, **info}
+        click.echo(json.dumps(envelope))
+        return
+    if info.get("signed_in"):
+        who = info.get("email") or info.get("uid") or "(unknown account)"
+        suffix = " [dim](offline — could not refresh)[/dim]" if info.get("stale") else ""
+        console.print(f"Signed in as [bold]{who}[/bold]{suffix}")
+    else:
+        console.print("Not signed in. Run [bold]screencap login[/bold] to upload to the cloud.")
 
 
 @cli.command()
