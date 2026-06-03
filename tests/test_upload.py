@@ -20,6 +20,16 @@ from screencap.upload import (
 )
 
 
+@pytest.fixture(autouse=True)
+def _signed_in(monkeypatch):
+    """Default every test to "signed in" so request_signed_urls attaches a bearer
+    token without touching the Keychain. Tests covering the not-signed-in / 401
+    paths override this with their own monkeypatch.setattr (which wins)."""
+    monkeypatch.setattr(
+        "screencap.auth.get_id_token", lambda force_refresh=False: "test-id-token"
+    )
+
+
 # ---------------------------------------------------------------------------
 # Unit tests: upload module helpers
 # ---------------------------------------------------------------------------
@@ -160,6 +170,84 @@ def test_request_signed_urls_timeout():
     with mock.patch("screencap.upload.requests.post", side_effect=req.Timeout):
         with pytest.raises(RuntimeError, match="timed out"):
             request_signed_urls("rec1", files)
+
+
+# ---------------------------------------------------------------------------
+# Unit tests: request_signed_urls auth threading (U5)
+# ---------------------------------------------------------------------------
+
+
+def test_request_signed_urls_attaches_bearer_token():
+    from screencap.upload import request_signed_urls
+
+    files = [FileInfo("video.mp4", mock.MagicMock(), "video/mp4", 1000)]
+    mock_resp = mock.MagicMock()
+    mock_resp.status_code = 200
+    mock_resp.json.return_value = {"urls": {}, "gcs_prefix": ""}
+
+    with mock.patch("screencap.upload.requests.post", return_value=mock_resp) as post:
+        request_signed_urls("rec1", files)
+
+    _, kwargs = post.call_args
+    assert kwargs["headers"]["Authorization"] == "Bearer test-id-token"
+
+
+def test_request_signed_urls_refreshes_and_retries_once_on_401(monkeypatch):
+    from screencap.upload import request_signed_urls
+
+    files = [FileInfo("video.mp4", mock.MagicMock(), "video/mp4", 1000)]
+
+    token_calls: list[bool] = []
+
+    def fake_token(force_refresh=False):
+        token_calls.append(force_refresh)
+        return "fresh" if force_refresh else "stale"
+
+    monkeypatch.setattr("screencap.auth.get_id_token", fake_token)
+
+    r401 = mock.MagicMock(status_code=401)
+    r200 = mock.MagicMock(status_code=200)
+    r200.json.return_value = {"urls": {"video.mp4": "u"}, "gcs_prefix": "p"}
+
+    with mock.patch("screencap.upload.requests.post", side_effect=[r401, r200]) as post:
+        urls, _ = request_signed_urls("rec1", files)
+
+    assert urls == {"video.mp4": "u"}
+    assert token_calls == [False, True]  # second attempt forced a refresh
+    assert post.call_count == 2
+    assert post.call_args_list[1].kwargs["headers"]["Authorization"] == "Bearer fresh"
+
+
+def test_request_signed_urls_401_persists_after_refresh_raises(monkeypatch):
+    from screencap.upload import request_signed_urls
+
+    files = [FileInfo("video.mp4", mock.MagicMock(), "video/mp4", 1000)]
+    monkeypatch.setattr("screencap.auth.get_id_token", lambda force_refresh=False: "tok")
+
+    r401 = mock.MagicMock(status_code=401)
+    r401.json.return_value = {"error": "unauthorized"}
+    r401.text = "unauthorized"
+
+    with mock.patch("screencap.upload.requests.post", return_value=r401):
+        with pytest.raises(RuntimeError, match="Upload service error"):
+            request_signed_urls("rec1", files)
+
+
+def test_request_signed_urls_not_signed_in_raises_sign_in_message(monkeypatch):
+    from screencap import auth
+    from screencap.upload import request_signed_urls
+
+    files = [FileInfo("video.mp4", mock.MagicMock(), "video/mp4", 1000)]
+
+    def not_signed_in(force_refresh=False):
+        raise auth.NotSignedIn("no creds")
+
+    monkeypatch.setattr("screencap.auth.get_id_token", not_signed_in)
+
+    with mock.patch("screencap.upload.requests.post") as post:
+        with pytest.raises(RuntimeError, match="screencap login"):
+            request_signed_urls("rec1", files)
+    post.assert_not_called()  # never hit the network without a token
 
 
 # ---------------------------------------------------------------------------

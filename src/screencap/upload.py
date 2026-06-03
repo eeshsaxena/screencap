@@ -196,18 +196,49 @@ def request_signed_urls(
     """POST to Cloud Function, return (urls_dict, gcs_prefix).
 
     urls_dict maps filename -> signed_url or None (already uploaded).
+
+    Attaches a Firebase ``Authorization: Bearer`` token (the function is now the
+    per-user security boundary). On a 401 — the server rejecting a token we still
+    believe is valid (clock skew, rotation, revocation) — forces a refresh and
+    retries the single call once. ``NotSignedIn`` is surfaced as a clear "sign in"
+    message; a transient ``AuthError`` (refresh network failure / Firebase outage)
+    propagates loudly. The live-upload path turns either into a failed chunk
+    (``ChunkStatus.FAILED``) and never deletes local media — see
+    ``docs/solutions/runtime-errors/chunk-upload-sentinel-gating-and-data-loss.md``.
+
+    The bearer header is built here in-module (not via a separate posting helper)
+    so test mocks at ``screencap.upload.requests.post`` keep working.
     """
+    from screencap import auth
+
     url = _get_upload_url()
     payload = {
         "recording": recording_name,
         "files": [{"name": f.name, "content_type": f.content_type} for f in files],
     }
-    try:
-        resp = requests.post(url, json=payload, timeout=30)
-    except requests.ConnectionError:
-        raise RuntimeError("Upload service unavailable. Check your internet connection.")
-    except requests.Timeout:
-        raise RuntimeError("Upload service timed out. Try again later.")
+    resp = None
+    for attempt in range(2):
+        try:
+            token = auth.get_id_token(force_refresh=attempt > 0)
+        except auth.NotSignedIn:
+            raise RuntimeError(
+                "Sign in to upload to the cloud: run `screencap login`."
+            )
+        try:
+            resp = requests.post(
+                url,
+                json=payload,
+                headers={"Authorization": f"Bearer {token}"},
+                timeout=30,
+            )
+        except requests.ConnectionError:
+            raise RuntimeError("Upload service unavailable. Check your internet connection.")
+        except requests.Timeout:
+            raise RuntimeError("Upload service timed out. Try again later.")
+
+        if resp.status_code == 401 and attempt == 0:
+            continue  # token rejected — refresh + retry the single call once
+        break
 
     if resp.status_code != 200:
         detail = ""
