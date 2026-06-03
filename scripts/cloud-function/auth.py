@@ -27,7 +27,18 @@ mocked.
 
 from __future__ import annotations
 
+from typing import Mapping, Protocol
+
 from firebase_admin import auth as fb_auth
+
+
+class _HasHeaders(Protocol):
+    """The minimal request contract verify_bearer needs: a ``headers`` mapping
+    with ``.get``. Documents the duck-typed boundary (a Flask request satisfies
+    it) without importing flask into this module."""
+
+    headers: Mapping[str, str]
+
 
 # Small skew tolerance so a token minted moments ago does not 401 on a cold
 # start with a slightly-behind clock ("token used too early"). Kept well under
@@ -51,7 +62,7 @@ class AuthUnavailable(AuthError):
     """
 
 
-def _extract_bearer(request) -> str:
+def _extract_bearer(request: _HasHeaders) -> str:
     header = request.headers.get("Authorization", "") if request is not None else ""
     if not header:
         raise AuthInvalid("Missing Authorization header")
@@ -61,7 +72,7 @@ def _extract_bearer(request) -> str:
     return parts[1].strip()
 
 
-def verify_bearer(request, project_id: str | None = None) -> str:
+def verify_bearer(request: _HasHeaders, project_id: str | None = None) -> str:
     """Verify the request's bearer token and return the Firebase uid.
 
     Args:
@@ -90,8 +101,12 @@ def verify_bearer(request, project_id: str | None = None) -> str:
     except fb_auth.CertificateFetchError as exc:
         # Verification could not complete — distinct from "token is invalid".
         raise AuthUnavailable(f"Token verification unavailable: {exc}") from exc
-    except (fb_auth.InvalidIdTokenError, ValueError) as exc:
+    except (fb_auth.InvalidIdTokenError, fb_auth.UserDisabledError, ValueError) as exc:
         # ExpiredIdTokenError / RevokedIdTokenError subclass InvalidIdTokenError;
+        # UserDisabledError does NOT (it subclasses InvalidArgumentError), so it
+        # is listed explicitly — it can't fire while check_revoked=False, but
+        # adding it now closes the gap before the deferred abuse-control change
+        # enables revocation (otherwise it would surface as an unhandled 500).
         # ValueError covers a non-JWT / non-string token argument.
         raise AuthInvalid(f"Invalid token: {exc}") from exc
 

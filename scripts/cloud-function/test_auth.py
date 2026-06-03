@@ -131,3 +131,14 @@ def test_cert_fetch_failure_is_unavailable_not_invalid():
     ):
         with pytest.raises(AuthUnavailable):
             verify_bearer(_req("Bearer good"), PROJECT)
+
+
+def test_user_disabled_token_is_invalid():
+    # #15: UserDisabledError does NOT subclass InvalidIdTokenError, so it is
+    # caught explicitly -> AuthInvalid (401), not an unhandled 500. Latent while
+    # check_revoked=False, but the handling is in place for when revocation lands.
+    with mock.patch.object(
+        fb_auth, "verify_id_token", side_effect=fb_auth.UserDisabledError("disabled")
+    ):
+        with pytest.raises(AuthInvalid):
+            verify_bearer(_req("Bearer disabled"), PROJECT)

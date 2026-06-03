@@ -9,7 +9,29 @@ under demo/, an authenticated request ONLY under users/{uid}/, else it raises.
 import itertools
 
 import pytest
-from paths import DEMO_NAMESPACE, PrefixResolutionError, owner_segment, resolve_prefix
+from paths import (
+    DEMO_NAMESPACE,
+    PrefixResolutionError,
+    is_valid_name,
+    owner_segment,
+    resolve_prefix,
+)
+
+
+@pytest.mark.parametrize(
+    "name,ok",
+    [
+        ("good_name-1.mp4", True),
+        ("a", True),
+        ("a..b", False),   # parent climb
+        ("a/b", False),    # slash
+        (".hidden", False),  # leading dot
+        ("", False),
+        (None, False),
+    ],
+)
+def test_is_valid_name(name, ok):
+    assert is_valid_name(name) is ok
 
 # --------------------------------------------------------------------------
 # owner_segment

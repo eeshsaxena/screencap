@@ -26,7 +26,10 @@ Deploy (project: proteus-photos, region: southamerica-east1):
     # The SA also needs roles/storage.objectAdmin on the target recordings bucket.
 
     # Deploy (set SCREENCAP_BUCKET to the staging bucket pre-cutover; the prod
-    # default is the unset 'screencap-recordings'):
+    # default is the unset 'screencap-recordings'). ALWAYS set
+    # SCREENCAP_PROJECT_ID explicitly — it is the only thing that pins the
+    # trusted Firebase project; there is NO ambient fallback (see
+    # _resolve_project_id):
     gcloud functions deploy get-upload-urls \
         --project proteus-photos --gen2 \
         --runtime python312 \
@@ -36,9 +39,17 @@ Deploy (project: proteus-photos, region: southamerica-east1):
         --source scripts/cloud-function/ \
         --entry-point get_upload_urls \
         --service-account "$SIGNER" \
-        --set-env-vars SCREENCAP_BUCKET=screencap-recordings-staging
+        --set-env-vars SCREENCAP_BUCKET=screencap-recordings-staging,SCREENCAP_PROJECT_ID=proteus-photos
     # The dev function (get-upload-urls-dev) is identical with
-    # SCREENCAP_BUCKET=screencap-recordings-dev-staging.
+    # SCREENCAP_BUCKET=screencap-recordings-dev-staging,SCREENCAP_PROJECT_ID=proteus-photos
+    # (the dev function still verifies proteus-photos tokens — set the project
+    # explicitly even if the dev function is deployed in another GCP project).
+
+    # PRE-DEPLOY GATE: this code REQUIRES a Firebase bearer token on
+    # upload/list/sign-download and removes get-index. Do NOT deploy it over the
+    # live get-upload-urls until the token-carrying clients (U5) and the website
+    # demo-repoint (U7) have shipped, or deploy under a new function name and cut
+    # clients over once they send tokens. See docs/runbooks/cloud-auth-setup.md.
 """
 
 from __future__ import annotations
@@ -46,16 +57,18 @@ from __future__ import annotations
 import logging
 import os
 import re
+from collections import defaultdict
 from datetime import timedelta
 
 import firebase_admin
 import functions_framework
 import google.auth
+import google.auth.exceptions
 import google.auth.transport.requests
 from auth import AuthInvalid, AuthUnavailable, verify_bearer
 from flask import jsonify
 from google.cloud import storage
-from paths import PrefixResolutionError, resolve_prefix
+from paths import PrefixResolutionError, is_valid_name, resolve_prefix
 
 logger = logging.getLogger(__name__)
 
@@ -69,15 +82,24 @@ USER_DOWNLOAD_EXPIRY_MINUTES = 30
 DEMO_DOWNLOAD_EXPIRY_HOURS = 4
 MAX_FILES = 500
 
+def _resolve_project_id() -> str:
+    """The Firebase project the function trusts.
+
+    ``SCREENCAP_PROJECT_ID`` is the ONLY override. We deliberately do NOT fall
+    back to the ambient ``GOOGLE_CLOUD_PROJECT`` (the Cloud Run *hosting* project)
+    — an off-default deploy that forgets the override would otherwise silently
+    pin the hosting project, and ``verify_bearer`` would then reject every
+    legitimate proteus-photos token (fail-closed lockout). Set
+    ``SCREENCAP_PROJECT_ID`` explicitly on every deploy.
+    """
+    return os.environ.get("SCREENCAP_PROJECT_ID", "proteus-photos")
+
+
 # Firebase project the signing function trusts. PINNED explicitly so the
 # function can never verify-but-misattribute a token from a foreign Firebase
 # project: verify_bearer (auth.py) re-asserts the decoded token's aud/iss
 # against this value, over and above the SDK's own check.
-PROJECT_ID = (
-    os.environ.get("SCREENCAP_PROJECT_ID")
-    or os.environ.get("GOOGLE_CLOUD_PROJECT")
-    or "proteus-photos"
-)
+PROJECT_ID = _resolve_project_id()
 
 # File-name guard for per-file upload validation. Slashes allowed (subdirs like
 # screenshots/0.png). Recording-NAME validation now lives in
@@ -164,14 +186,16 @@ def get_upload_urls(request):
     return _cors((jsonify({"error": f"Unknown action: {action!r}"}), 400))
 
 
-def _authenticate(request):
+def _authenticate(request) -> "tuple[str, None] | tuple[None, tuple]":
     """Verify the request's bearer token — the FIRST thing every gated handler does.
 
     Returns ``(uid, None)`` on success, or ``(None, response)`` where the
-    response maps AuthInvalid -> 401 and AuthUnavailable -> 503. The 503 keeps a
-    Firebase outage distinct from a hard deny so the client can fail closed. A CI
-    contract test asserts no tokenless request ever reaches a GCS call, so this
-    must run before any list/blob access.
+    response maps AuthInvalid -> 401 and AuthUnavailable -> 503. The annotated
+    union makes the contract type-checkable: a handler that forgets
+    ``if err: return err`` and passes ``uid=None`` into ``resolve_prefix`` is a
+    type error. The 503 keeps a Firebase outage distinct from a hard deny so the
+    client can fail closed. A CI contract test asserts no tokenless request ever
+    reaches a GCS call, so this must run before any list/blob access.
     """
     try:
         return verify_bearer(request, PROJECT_ID), None
@@ -183,38 +207,86 @@ def _authenticate(request):
         return None, _cors((jsonify({"error": "Authentication required"}), 401))
 
 
-def _handle_demo_list(data):
-    """List the public demo gallery — unauthenticated, demo/ only.
+def _collect_recordings(prefix, *, honor_unlisted, skip_invalid_names=False):
+    """Tally per-recording file_count / total_size for blobs under an
+    already-resolved prefix.
 
-    A physically separate code path from the token-gated handlers (a bug in one
-    cannot cross into the other) and reachable without a token. Marker-BLIND:
-    a migrated recording may carry a vestigial _unlisted blob, but the marker is
-    superseded by namespace isolation and must NOT hide a curated demo recording.
+    Shared by the owner listing (``_handle_list``) and the demo gallery
+    (``_handle_demo_list``). The demo/users NAMESPACE boundary lives in the
+    ``resolve_prefix`` call at each call site; this helper only walks an
+    already-validated prefix.
+
+    ``honor_unlisted`` toggles a DELIBERATE divergence (plan: Key Technical
+    Decisions). The owner's listing (``honor_unlisted=True``) hides a recording
+    carrying a vestigial ``_unlisted`` marker; the demo gallery
+    (``honor_unlisted=False``) is marker-BLIND so the superseded marker can never
+    hide a curated recording. ``skip_invalid_names`` (demo only) drops a blob
+    whose name would fail sign-download validation, so it is never
+    listable-but-unplayable.
     """
-    from collections import defaultdict
-
-    prefix = resolve_prefix(authenticated=False, uid=None, source=None, name=None)  # "demo/"
     recordings = defaultdict(lambda: {"file_count": 0, "total_size": 0})
-
     plen = len(prefix)
-    blobs = _storage_client.list_blobs(BUCKET, prefix=prefix, timeout=60)
-    for blob in blobs:
-        # blob.name = "demo/{name}/{filename...}"
-        rel = blob.name[plen:]
+    for blob in _storage_client.list_blobs(BUCKET, prefix=prefix, timeout=60):
+        rel = blob.name[plen:]  # strip the known prefix -> {name}/{file...}
         parts = rel.split("/", 1)
         if len(parts) < 2 or not parts[1]:
             continue
         rec_name = parts[0]
+        if skip_invalid_names and not is_valid_name(rec_name):
+            continue
         if parts[1] == "_unlisted":
-            # Skip the marker file itself, but do NOT hide the recording.
+            if honor_unlisted:
+                recordings[rec_name]["unlisted"] = True
             continue
         recordings[rec_name]["file_count"] += 1
         recordings[rec_name]["total_size"] += blob.size or 0
-
-    result = [
+    return [
         {"name": name, "file_count": info["file_count"], "total_size": info["total_size"]}
         for name, info in sorted(recordings.items())
+        if not info.get("unlisted")
     ]
+
+
+def _sign_recording(prefix, expiration):
+    """List + sign GET URLs for every file under an already-resolved prefix.
+
+    Returns the urls dict, or ``None`` if the prefix matched no blobs (the caller
+    maps that to 404). The namespace boundary is enforced by ``resolve_prefix`` at
+    the call site; this signs whatever the validated prefix matched, refreshing
+    the signing credential ONCE before the per-blob signBlob loop. Propagates
+    ``google.auth.exceptions.GoogleAuthError`` on a transient signing failure so
+    callers can map it to 503.
+    """
+    blobs = list(_storage_client.list_blobs(BUCKET, prefix=prefix, timeout=60))
+    if not blobs:
+        return None
+    _credentials.refresh(_auth_request)
+    urls = {}
+    for blob in blobs:
+        rel_name = blob.name[len(prefix):]
+        if not rel_name:
+            continue
+        urls[rel_name] = blob.generate_signed_url(
+            version="v4",
+            expiration=expiration,
+            method="GET",
+            service_account_email=_credentials.service_account_email,
+            access_token=_credentials.token,
+        )
+    return urls
+
+
+def _handle_demo_list(data):
+    """List the public demo gallery — unauthenticated, demo/ only.
+
+    A physically separate code path from the token-gated handlers; the demo/users
+    boundary is the ``resolve_prefix`` call below. Marker-BLIND
+    (``honor_unlisted=False``) and name-guarded (``skip_invalid_names=True``). See
+    ``_handle_list`` for the owner-side counterpart, which DOES honor ``_unlisted``
+    — the divergence is deliberate (plan Key Technical Decisions).
+    """
+    prefix = resolve_prefix(authenticated=False, uid=None, source=None, name=None)  # "demo/"
+    result = _collect_recordings(prefix, honor_unlisted=False, skip_invalid_names=True)
     return _cors(jsonify({"recordings": result}))
 
 
@@ -230,32 +302,23 @@ def _handle_demo_sign_download(data):
     except PrefixResolutionError:
         return _cors((jsonify({"error": "Invalid recording name"}), 400))
 
-    blobs = list(_storage_client.list_blobs(BUCKET, prefix=prefix, timeout=60))
-    if not blobs:
+    try:
+        urls = _sign_recording(prefix, timedelta(hours=DEMO_DOWNLOAD_EXPIRY_HOURS))
+    except google.auth.exceptions.GoogleAuthError as exc:
+        logger.warning("signing credential refresh/sign failed: %s", exc)
+        return _cors((jsonify({"error": "Signing temporarily unavailable"}), 503))
+    if urls is None:
         return _cors((jsonify({"error": f"Recording not found: {recording}"}), 404))
-
-    _credentials.refresh(_auth_request)
-
-    urls = {}
-    for blob in blobs:
-        rel_name = blob.name[len(prefix):]
-        if not rel_name:
-            continue
-        urls[rel_name] = blob.generate_signed_url(
-            version="v4",
-            expiration=timedelta(hours=DEMO_DOWNLOAD_EXPIRY_HOURS),
-            method="GET",
-            service_account_email=_credentials.service_account_email,
-            access_token=_credentials.token,
-        )
-
     return _cors(jsonify({"urls": urls, "gcs_prefix": f"gs://{BUCKET}/{prefix}"}))
 
 
 def _handle_list(request, data):
-    """List the caller's own recordings (or sessions), scoped to their namespace."""
-    from collections import defaultdict
+    """List the caller's own recordings (or sessions), scoped to their namespace.
 
+    Owner-side counterpart to ``_handle_demo_list``: this DOES honor the vestigial
+    ``_unlisted`` marker (hides the recording), whereas the demo gallery is
+    marker-blind. The divergence is deliberate (plan Key Technical Decisions).
+    """
     uid, err = _authenticate(request)
     if err:
         return err
@@ -267,32 +330,7 @@ def _handle_list(request, data):
     except PrefixResolutionError:
         return _cors((jsonify({"error": "Invalid source"}), 400))
 
-    recordings = defaultdict(lambda: {"file_count": 0, "total_size": 0})
-
-    plen = len(prefix)
-    blobs = _storage_client.list_blobs(BUCKET, prefix=prefix, timeout=60)
-    for blob in blobs:
-        # blob.name = "users/{uid}/{source}/{name}/{filename...}". Strip the
-        # already-known prefix so the FIRST remaining segment is the recording
-        # name (not the uid) — the re-based parsing the global layout didn't need.
-        rel = blob.name[plen:]
-        parts = rel.split("/", 1)
-        if len(parts) < 2 or not parts[1]:
-            continue
-        rec_name = parts[0]
-        # _unlisted is vestigial (superseded by namespace isolation) but still
-        # honored here for the owner's own listing.
-        if parts[1] == "_unlisted":
-            recordings[rec_name]["unlisted"] = True
-            continue
-        recordings[rec_name]["file_count"] += 1
-        recordings[rec_name]["total_size"] += blob.size or 0
-
-    result = [
-        {"name": name, "file_count": info["file_count"], "total_size": info["total_size"]}
-        for name, info in sorted(recordings.items())
-        if not info.get("unlisted")
-    ]
+    result = _collect_recordings(prefix, honor_unlisted=True)
     return _cors(jsonify({"recordings": result}))
 
 
@@ -312,28 +350,16 @@ def _handle_sign_download(request, data):
     except PrefixResolutionError:
         return _cors((jsonify({"error": "Invalid request parameters"}), 400))
 
-    blobs = list(_storage_client.list_blobs(BUCKET, prefix=prefix, timeout=60))
-    if not blobs:
+    try:
+        urls = _sign_recording(prefix, timedelta(minutes=USER_DOWNLOAD_EXPIRY_MINUTES))
+    except google.auth.exceptions.GoogleAuthError as exc:
+        logger.warning("signing credential refresh/sign failed: %s", exc)
+        return _cors((jsonify({"error": "Signing temporarily unavailable"}), 503))
+    if urls is None:
         # Another user's name does not exist under THIS caller's prefix -> 404.
         # AE2: a cross-user download is indistinguishable from "not found", and
         # no URL is ever signed for it.
         return _cors((jsonify({"error": f"Recording not found: {recording}"}), 404))
-
-    _credentials.refresh(_auth_request)
-
-    urls = {}
-    for blob in blobs:
-        rel_name = blob.name[len(prefix):]
-        if not rel_name:
-            continue
-        urls[rel_name] = blob.generate_signed_url(
-            version="v4",
-            expiration=timedelta(minutes=USER_DOWNLOAD_EXPIRY_MINUTES),
-            method="GET",
-            service_account_email=_credentials.service_account_email,
-            access_token=_credentials.token,
-        )
-
     return _cors(jsonify({"urls": urls, "gcs_prefix": f"gs://{BUCKET}/{prefix}"}))
 
 
@@ -357,7 +383,12 @@ def _handle_upload(request, data):
     except PrefixResolutionError:
         return _cors((jsonify({"error": "Invalid request parameters"}), 400))
 
+    # First pass: validate names and find which files actually need a signed PUT
+    # (an object that already exists is skipped). The signing credential is then
+    # refreshed ONCE before signing — not once per file as before — so a
+    # MAX_FILES upload no longer does up to 500 token refreshes.
     urls = {}
+    to_sign = []
     for f in files:
         name = f.get("name")
         if not name:
@@ -368,14 +399,24 @@ def _handle_upload(request, data):
         if blob.exists():
             urls[name] = None
         else:
+            to_sign.append((name, blob, f.get("content_type", "application/octet-stream")))
+
+    if to_sign:
+        try:
             _credentials.refresh(_auth_request)
-            urls[name] = blob.generate_signed_url(
-                version="v4",
-                expiration=timedelta(minutes=UPLOAD_EXPIRY_MINUTES),
-                method="PUT",
-                content_type=f.get("content_type", "application/octet-stream"),
-                service_account_email=_credentials.service_account_email,
-                access_token=_credentials.token,
-            )
+            for name, blob, content_type in to_sign:
+                urls[name] = blob.generate_signed_url(
+                    version="v4",
+                    expiration=timedelta(minutes=UPLOAD_EXPIRY_MINUTES),
+                    method="PUT",
+                    content_type=content_type,
+                    service_account_email=_credentials.service_account_email,
+                    access_token=_credentials.token,
+                )
+        except google.auth.exceptions.GoogleAuthError as exc:
+            # A transient signing failure -> 503 with a JSON body, not a bare 500
+            # with a partial URL batch, so the client can tell it apart and retry.
+            logger.warning("signing credential refresh/sign failed: %s", exc)
+            return _cors((jsonify({"error": "Signing temporarily unavailable"}), 503))
 
     return _cors(jsonify({"urls": urls, "gcs_prefix": f"gs://{BUCKET}/{prefix}"}))

@@ -11,6 +11,7 @@ from datetime import timedelta
 from unittest import mock
 
 import flask
+import google.auth.exceptions
 import main
 import pytest
 from auth import AuthInvalid, AuthUnavailable
@@ -383,3 +384,76 @@ def test_demo_uses_long_expiry(gcs):
         _invoke(_req_noauth({"action": "demo-sign-download", "recording": "cooldemo"}))
     exp = gcs.store["demo/cooldemo/video.mp4"].signed_kwargs["expiration"]
     assert exp == timedelta(hours=main.DEMO_DOWNLOAD_EXPIRY_HOURS)
+
+
+# ==========================================================================
+# Review fixes (PR #210)
+# ==========================================================================
+
+
+def test_user_list_hides_unlisted_recording(gcs):
+    # #4: the OWNER's listing honors the vestigial _unlisted marker (opposite of
+    # the marker-blind demo gallery). This anchors the deliberate divergence on
+    # the user side too, so a future "unify the handlers" refactor can't silently
+    # change it.
+    gcs.add("users/userA/recordings/shown/video.mp4")
+    gcs.add("users/userA/recordings/hidden/video.mp4")
+    gcs.add("users/userA/recordings/hidden/_unlisted")
+    with _auth(uid="userA"):
+        status, payload = _invoke(_req({"action": "list"}))
+    assert status == 200
+    assert {r["name"] for r in payload["recordings"]} == {"shown"}
+
+
+def test_demo_list_skips_invalid_named_recording(gcs):
+    # #19: a curated-but-badly-named demo blob must not be listable-but-unplayable
+    # (it would list fine, then 400 on sign-download). demo-list skips it.
+    gcs.add("demo/good/video.mp4")
+    gcs.add("demo/a..b/video.mp4")  # name fails the sign-download guard
+    with mock.patch.object(main, "verify_bearer"):
+        status, payload = _invoke(_req_noauth({"action": "demo-list"}))
+    assert status == 200
+    assert {r["name"] for r in payload["recordings"]} == {"good"}
+
+
+def test_upload_signing_credential_failure_returns_503(gcs):
+    # #5: a transient signing-credential failure mid-upload -> 503 with a JSON
+    # body (not a bare 500 with a partial URL batch).
+    body = {"recording": "rec1", "files": [{"name": "video.mp4"}]}
+    with _auth(uid="userA"), mock.patch.object(
+        main._credentials, "refresh",
+        side_effect=google.auth.exceptions.GoogleAuthError("signBlob token refresh failed"),
+    ):
+        status, payload = _invoke(_req(body))
+    assert status == 503
+    assert "error" in payload
+
+
+def test_sign_download_signing_credential_failure_returns_503(gcs):
+    gcs.add("users/userA/recordings/r/video.mp4")
+    with _auth(uid="userA"), mock.patch.object(
+        main._credentials, "refresh",
+        side_effect=google.auth.exceptions.GoogleAuthError("outage"),
+    ):
+        status, payload = _invoke(_req({"action": "sign-download", "recording": "r"}))
+    assert status == 503
+    assert "error" in payload
+
+
+def test_upload_refreshes_signing_credential_once_not_per_file(gcs):
+    # #5: a multi-file upload refreshes the signing credential exactly once.
+    body = {"recording": "rec1", "files": [{"name": f"f{i}.mp4"} for i in range(5)]}
+    with _auth(uid="userA"), mock.patch.object(main._credentials, "refresh") as refresh:
+        status, _ = _invoke(_req(body))
+    assert status == 200
+    assert refresh.call_count == 1
+
+
+def test_resolve_project_id_ignores_ambient_google_cloud_project(monkeypatch):
+    # #9: SCREENCAP_PROJECT_ID is the ONLY override — no ambient
+    # GOOGLE_CLOUD_PROJECT fallback that could pin the wrong project.
+    monkeypatch.delenv("SCREENCAP_PROJECT_ID", raising=False)
+    monkeypatch.setenv("GOOGLE_CLOUD_PROJECT", "some-other-hosting-project")
+    assert main._resolve_project_id() == "proteus-photos"
+    monkeypatch.setenv("SCREENCAP_PROJECT_ID", "explicit-project")
+    assert main._resolve_project_id() == "explicit-project"

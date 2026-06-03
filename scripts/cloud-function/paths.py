@@ -65,8 +65,17 @@ def owner_segment(uid: str) -> str:
     return uid
 
 
+def is_valid_name(name: str) -> bool:
+    """True iff ``name`` is a safe recording-name segment (no slash, no ``..``).
+
+    Exposed so list handlers can skip an unsafe name before it becomes
+    listable-but-unplayable (it would list fine, then 400 on sign-download).
+    """
+    return isinstance(name, str) and ".." not in name and bool(_NAME_RE.match(name))
+
+
 def _validate_name(name: str) -> str:
-    if not isinstance(name, str) or ".." in name or not _NAME_RE.match(name):
+    if not is_valid_name(name):
         raise PrefixResolutionError(f"Invalid recording name: {name!r}")
     return name
 
