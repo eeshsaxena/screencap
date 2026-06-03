@@ -1320,6 +1320,79 @@ class TestPrivacyFailureDataLoss:
 
 
 
+def _auth_failure_exc(kind: str) -> Exception:
+    """Construct an auth-class failure the upload path may hit once the bearer
+    token is threaded through ``request_signed_urls`` (U5c)."""
+    import keyring.errors
+
+    from screencap.auth import AuthError, NotSignedIn
+
+    return {
+        "not_signed_in": NotSignedIn("not signed in"),
+        "transient_auth": AuthError("token refresh temporarily failed"),
+        "keyring_error": keyring.errors.KeyringError("keychain locked"),
+        "service_error": RuntimeError("Upload service unavailable"),
+    }[kind]
+
+
+class TestAuthFailureFailClosed:
+    """U5 characterization: an auth failure on the live-upload path fails closed.
+
+    Locks the invariant from
+    ``docs/solutions/runtime-errors/chunk-upload-sentinel-gating-and-data-loss.md``
+    BEFORE the bearer token is threaded through ``request_signed_urls`` (U5c).
+    When requesting signed URLs raises any auth-class exception — NotSignedIn,
+    a transient AuthError (the 503/Firebase-outage shape), a Keychain error, or
+    a generic service RuntimeError — ``upload_chunk_files`` catches it and
+    returns ``core_ok=False``, so the chunk lands on ``ChunkStatus.FAILED``, the
+    sentinel gate (``all_chunks_uploaded``) stays False, and no local media is
+    deleted. Threading auth in (U5c) must preserve this exact behavior: the auth
+    failure becomes an exception *inside* ``request_signed_urls``, which this
+    same machinery already routes to FAILED.
+    """
+
+    @pytest.mark.parametrize(
+        "kind", ["not_signed_in", "transient_auth", "keyring_error", "service_error"]
+    )
+    @mock.patch("screencap.chunk_processor.time.sleep")
+    def test_auth_failure_marks_failed_and_preserves_media(self, _mock_sleep, tmp_path, kind):
+        from screencap.chunk_processor import ChunkStatus
+
+        t0 = time.time()
+        _create_seven_chunk_db(tmp_path / "recording.db", t0)
+        _create_chunk_media_files(tmp_path, 7)
+        cp, chunk_q = _build_chunk_processor(tmp_path)
+
+        # Mock at the request_signed_urls seam — the real upload_chunk_files runs,
+        # so we exercise the real exception → core_ok=False → FAILED path.
+        with patch(
+            "screencap.upload.request_signed_urls",
+            side_effect=lambda *a, **k: (_ for _ in ()).throw(_auth_failure_exc(kind)),
+        ):
+            cp.start()
+            _enqueue_chunks(chunk_q, t0, 7)
+            cp.stop(timeout=30)
+
+        # Sentinel gate stays closed — recorder.py never uploads the sentinel or
+        # calls stub_recording() while this is False.
+        assert cp.all_chunks_uploaded() is False
+        assert cp._chunk_results, "chunks must have been processed (PENDING→FAILED)"
+        assert all(s == ChunkStatus.FAILED for s in cp._chunk_results.values()), (
+            f"every chunk must be FAILED on auth failure, got {cp._chunk_results}"
+        )
+        n_uploaded, n_total = cp.upload_summary()
+        assert n_uploaded == 0
+        assert n_total == 7
+
+        # Point of no recovery never reached: every chunk's media preserved on
+        # disk for `screencap upload` recovery.
+        for i in range(7):
+            assert (tmp_path / f"chunk_{i:04d}.mp4").exists(), \
+                f"chunk_{i:04d}.mp4 was deleted on auth failure — data loss!"
+            assert (tmp_path / f"audio_{i:04d}.flac").exists(), \
+                f"audio_{i:04d}.flac was deleted on auth failure — data loss!"
+
+
 # ---------------------------------------------------------------------------
 # _unlisted marker behaviour
 # ---------------------------------------------------------------------------
