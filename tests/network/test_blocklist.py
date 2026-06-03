@@ -9,11 +9,13 @@ import pytest
 from screencap.network.blocklist import (
     DEFAULT_BLOCKLIST,
     DEFAULT_CAPTURE_BODIES_FOR,
+    REQUIRED_AUTH_IGNORE_HOSTS,
     build_ignore_hosts_regex,
     effective_capture_bodies_for,
     is_host_blocked,
     is_host_in_capture_bodies_for,
     is_ip_literal,
+    missing_required_auth_hosts,
 )
 from screencap.network.config import NetworkConfig
 from screencap.privacy.policy import PrivacyConfig
@@ -361,3 +363,48 @@ class TestIsHostInCaptureBodiesFor:
             "Overlap between DEFAULT_BLOCKLIST and DEFAULT_CAPTURE_BODIES_FOR — "
             "see V1.5 ticket inclusion criteria #3."
         )
+
+
+class TestRequiredAuthHosts:
+    """The client's own auth/token hosts must NEVER be capturable, even when the
+    user overrides the default blocklist (U5 self-capture hardening)."""
+
+    _NEW_AUTH_HOSTS = [
+        "oauth2.googleapis.com",
+        "identitytoolkit.googleapis.com",
+        "securetoken.googleapis.com",
+    ]
+
+    def test_accounts_google_already_present(self):
+        assert "accounts.google.com" in REQUIRED_AUTH_IGNORE_HOSTS
+        assert "accounts.google.com" in DEFAULT_BLOCKLIST
+
+    @pytest.mark.parametrize("host", _NEW_AUTH_HOSTS)
+    def test_auth_hosts_blocked_even_when_default_overridden(self, host):
+        # override_default_blocklist drops DEFAULT_BLOCKLIST but must NOT drop the
+        # auth hosts — capturing your own credentials is never permitted.
+        net = _network(override_default=True)
+        assert is_host_blocked(host, _privacy(), net) is True
+        # subdomains too (suffix match)
+        assert is_host_blocked(f"foo.{host}", _privacy(), net) is True
+
+    def test_auth_hosts_in_ignore_regex_under_override(self):
+        net = _network(override_default=True)
+        patterns = build_ignore_hosts_regex(_privacy(), net)
+        assert missing_required_auth_hosts(patterns) == set()
+        # Each required host's :443 form matches some pattern.
+        compiled = [re.compile(p, re.IGNORECASE) for p in patterns]
+        for host in REQUIRED_AUTH_IGNORE_HOSTS:
+            assert any(c.match(f"{host}:443") for c in compiled), host
+
+    def test_missing_required_auth_hosts_detects_a_dropped_host(self):
+        net = _network()
+        patterns = build_ignore_hosts_regex(_privacy(), net)
+        # Drop the securetoken pattern -> the fail-closed check must flag it.
+        survivors = [p for p in patterns if "securetoken" not in p]
+        missing = missing_required_auth_hosts(survivors)
+        assert "securetoken.googleapis.com" in missing
+
+    def test_normal_build_has_no_missing_auth_hosts(self):
+        patterns = build_ignore_hosts_regex(_privacy(), _network())
+        assert missing_required_auth_hosts(patterns) == set()

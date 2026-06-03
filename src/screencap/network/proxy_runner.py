@@ -147,6 +147,21 @@ def run_proxy(
         _emit_log(log_path, traceback.format_exc())
         return
 
+    # 4b. FAIL CLOSED on the auth/token hosts. build_ignore_hosts_regex always
+    # includes them, but if a regression ever dropped one, starting the proxy
+    # would TLS-intercept — and capture — the user's own OAuth/refresh/ID-token
+    # traffic. Refuse to start rather than tunnel auth traffic.
+    from screencap.network.blocklist import missing_required_auth_hosts
+
+    missing = missing_required_auth_hosts(ignore_hosts)
+    if missing:
+        _emit_log(
+            log_path,
+            f"FATAL: required auth hosts missing from ignore_hosts: {sorted(missing)}; "
+            f"refusing to start proxy (would risk capturing the user's own credentials)",
+        )
+        return
+
     # 5. Construct mitmproxy Options. We do NOT set stream_large_bodies —
     # the addon controls streaming explicitly per-flow.
     try:

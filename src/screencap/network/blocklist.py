@@ -62,6 +62,27 @@ DEFAULT_BLOCKLIST: frozenset[str] = frozenset({
 })
 
 
+# Auth / token-minting hosts the client itself talks to during sign-in and
+# refresh (screencap login / get_id_token). These MUST always be excluded from
+# network capture so that `screencap start --network` — which intercepts the
+# client's OWN HTTPS — can never record the user's own OAuth code, Firebase
+# refresh token, or ID token.
+#
+# Unlike :data:`DEFAULT_BLOCKLIST`, this set is **NOT user-overridable**:
+# ``override_default_blocklist`` does not drop it, because capturing your own
+# credentials is never a valid posture. (``accounts.google.com`` is also in
+# DEFAULT_BLOCKLIST; it is repeated here so the guarantee holds even when the
+# default blocklist is overridden.) The Cloud Function host carries only the
+# short-lived ID token and is the user-configurable upload URL, so it is not
+# part of this fixed set.
+REQUIRED_AUTH_IGNORE_HOSTS: frozenset[str] = frozenset({
+    "accounts.google.com",            # OAuth authorize
+    "oauth2.googleapis.com",          # OAuth token exchange (bears the auth code)
+    "identitytoolkit.googleapis.com",  # signInWithIdp (returns the refresh token)
+    "securetoken.googleapis.com",     # token refresh (bears the refresh token)
+})
+
+
 # Curated default body-capture allowlist (V1.5).
 #
 # Inclusion criteria:
@@ -167,6 +188,13 @@ def is_host_blocked(
     if is_ip_literal(host):
         return True
 
+    # Auth/token hosts are ALWAYS blocked — never user-overridable. Checked
+    # before the override-able sources so a user's own credentials can never be
+    # self-captured.
+    for entry in REQUIRED_AUTH_IGNORE_HOSTS:
+        if _matches_suffix(host, entry):
+            return True
+
     if privacy_config.is_masked_domain(host):
         return True
 
@@ -260,6 +288,9 @@ def build_ignore_hosts_regex(
     entries.update(network_config.extra_blocklist)
     if not network_config.override_default_blocklist:
         entries.update(DEFAULT_BLOCKLIST)
+    # ALWAYS include the auth/token hosts, even under override_default_blocklist
+    # — self-capturing the user's own credentials is never permitted.
+    entries.update(REQUIRED_AUTH_IGNORE_HOSTS)
 
     patterns: list[str] = []
     for entry in sorted(entries):
@@ -275,3 +306,21 @@ def build_ignore_hosts_regex(
         patterns.append(rf"^(.+\.)?{escaped}:\d+$")
 
     return patterns
+
+
+def missing_required_auth_hosts(ignore_hosts_patterns: list[str]) -> set[str]:
+    """Return any :data:`REQUIRED_AUTH_IGNORE_HOSTS` not matched by the patterns.
+
+    The proxy runner calls this to **fail closed**: if the built ``ignore_hosts``
+    somehow omits an auth host (a regression, a bad override), the proxy refuses
+    to start rather than risk TLS-intercepting — and capturing — the user's own
+    credentials. :func:`build_ignore_hosts_regex` always includes these hosts, so
+    a non-empty result here means something is wrong.
+    """
+    compiled = [re.compile(p, re.IGNORECASE) for p in ignore_hosts_patterns]
+    missing: set[str] = set()
+    for host in REQUIRED_AUTH_IGNORE_HOSTS:
+        probe = f"{host}:443"
+        if not any(c.match(probe) for c in compiled):
+            missing.add(host)
+    return missing
