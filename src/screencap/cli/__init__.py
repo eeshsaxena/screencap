@@ -1191,81 +1191,8 @@ def _auto_transcribe(capture_dir, audio_path):
     default="date",
     help="Sort column.",
 )
-@click.option("--remote", is_flag=True, help="List remote processed sessions.")
-@click.option("--tag", "filter_tag", default=None, help="Filter remote sessions by tag.")
-@click.option("--category", "filter_category", default=None,
-              type=click.Choice(["development", "communication", "research",
-                                 "admin", "creative", "other"], case_sensitive=False),
-              help="Filter remote sessions by category.")
-def list_cmd(as_json, sort, remote, filter_tag, filter_category):
+def list_cmd(as_json, sort):
     """List all recordings."""
-    if not remote and (filter_tag or filter_category):
-        console.print("[yellow]--tag and --category require --remote[/yellow]")
-        return
-
-    if remote:
-        from screencap.download import list_remote_sessions
-
-        try:
-            sessions = list_remote_sessions(tag=filter_tag, category=filter_category)
-        except Exception as e:
-            console.print(f"[red]Error:[/red] {e}")
-            sys.exit(1)
-
-        if not sessions:
-            # Mirror the local empty-archive branch: JSON consumers need
-            # parseable empty list, not Rich-styled prose.
-            if as_json:
-                click.echo("[]")
-            else:
-                console.print("[dim]No remote sessions found.[/dim]")
-            return
-
-        if as_json:
-            import dataclasses
-            click.echo(json.dumps(
-                [dataclasses.asdict(s) for s in sessions], indent=2,
-            ))
-            return
-
-        def _duration_human(secs: float) -> str:
-            h, rem = divmod(int(secs), 3600)
-            m, s = divmod(rem, 60)
-            parts = []
-            if h:
-                parts.append(f"{h}h")
-            if m:
-                parts.append(f"{m}m")
-            parts.append(f"{s}s")
-            return " ".join(parts)
-
-        table = Table(show_header=True, header_style="bold #60a5fa")
-        table.add_column("#", justify="right")
-        table.add_column("Name")
-        table.add_column("Date")
-        table.add_column("Duration")
-        table.add_column("Focus")
-        table.add_column("Tags")
-        table.add_column("Tasks", justify="right")
-
-        for i, s in enumerate(sessions, 1):
-            date_display = s.processed_at[:10] if s.processed_at else "-"
-            tags_display = ", ".join(s.tags[:5]) if s.tags else "-"
-            if len(s.tags) > 5:
-                tags_display += ", ..."
-            table.add_row(
-                str(i),
-                s.name,
-                date_display,
-                _duration_human(s.total_duration_s),
-                s.primary_focus,
-                tags_display,
-                str(s.total_tasks),
-            )
-
-        console.print(table)
-        return
-
     from screencap.catalog import list_recordings
 
     recordings = list_recordings()
@@ -3023,16 +2950,11 @@ def upload(names, all_recordings, dry_run, force, jobs, no_delete):
 @click.option("--force", is_flag=True, help="Re-download all recordings, ignoring markers.")
 @click.option("--jobs", "-j", type=click.IntRange(min=1), default=4,
               help="Parallel file transfers per recording (default: 4).")
-@click.option("--sessions", is_flag=True, help="Download processed sessions instead of raw recordings.")
-@click.option("--category", "filter_category", default=None,
-              type=click.Choice(["development", "communication", "research",
-                                 "admin", "creative", "other"], case_sensitive=False),
-              help="Only download task folders matching this category (requires --sessions).")
-def download(names, dest, dry_run, force, jobs, sessions, filter_category):
+def download(names, dest, dry_run, force, jobs):
     """Download recordings from cloud storage.
 
     Optionally pass one or more recording NAMES to download only those.
-    With no names, all remote recordings are listed and downloaded.
+    With no names, all of your remote recordings are listed and downloaded.
     """
     from screencap.download import (
         _fmt_size,
@@ -3041,44 +2963,28 @@ def download(names, dest, dry_run, force, jobs, sessions, filter_category):
         list_remote_recordings,
     )
 
-    if filter_category and not sessions:
-        console.print("[red]Error:[/red] --category requires --sessions")
+    try:
+        dest_dir = _resolve_dest_dir(dest)
+    except RuntimeError as e:
+        console.print(f"[red]Error:[/red] {e}")
         sys.exit(1)
-
-    source = "sessions" if sessions else "recordings"
-
-    if sessions and not dest:
-        from screencap.config import get_sessions_dir
-        try:
-            dest_dir = get_sessions_dir()
-        except OSError as e:
-            console.print(f"[red]Error:[/red] Cannot create sessions directory: {e}")
-            sys.exit(1)
-    else:
-        try:
-            dest_dir = _resolve_dest_dir(dest)
-        except RuntimeError as e:
-            console.print(f"[red]Error:[/red] {e}")
-            sys.exit(1)
 
     if names:
         from types import SimpleNamespace
         remote = [SimpleNamespace(name=n, total_size=0, file_count=0) for n in names]
     else:
         try:
-            remote = list_remote_recordings(source=source)
+            remote = list_remote_recordings()
         except RuntimeError as e:
             console.print(f"[red]Error:[/red] {e}")
             sys.exit(1)
 
         if not remote:
-            label = "sessions" if sessions else "recordings"
-            console.print(f"No {label} available for download.")
+            console.print("No recordings available for download.")
             return
 
-    label = "session" if sessions else "recording"
     console.print(
-        f"Found [bold]{len(remote)}[/bold] {label}(s) to download."
+        f"Found [bold]{len(remote)}[/bold] recording(s) to download."
     )
 
     all_downloaded = 0
@@ -3095,7 +3001,6 @@ def download(names, dest, dry_run, force, jobs, sessions, filter_category):
         try:
             result = download_recording(
                 rec.name, dest_dir, dry_run=dry_run, force=force, jobs=jobs,
-                source=source, category_filter=filter_category,
             )
             all_downloaded += len(result.downloaded)
             all_skipped += len(result.skipped)
