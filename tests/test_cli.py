@@ -11,6 +11,16 @@ from click.testing import CliRunner
 from screencap.cli import cli
 
 
+@pytest.fixture(autouse=True)
+def _signed_in(monkeypatch):
+    """Default to "signed in" so the upload command's pre-flight auth check
+    passes without touching the Keychain. Upload's not-signed-in refusal is
+    covered explicitly in test_upload.py."""
+    monkeypatch.setattr(
+        "screencap.auth.get_id_token", lambda force_refresh=False: "test-id-token"
+    )
+
+
 @contextmanager
 def _safe_start_prompts():
     """Patch the four entry points that interact with stdin or hard-exit during

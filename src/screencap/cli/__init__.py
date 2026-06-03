@@ -2787,6 +2787,27 @@ def upload(names, all_recordings, dry_run, force, jobs, no_delete):
         console.print(f"[red]Error:[/red] {e}")
         sys.exit(1)
 
+    # Cloud upload requires a signed-in account (R2). Check once up-front so we
+    # refuse with a clear prompt and touch NOTHING on disk (no auto-export, no
+    # delete), rather than failing mid-upload — R3/AE3. Dry-run is local-only and
+    # never needs auth.
+    if not dry_run:
+        from screencap import auth
+
+        try:
+            auth.get_id_token()
+        except auth.NotSignedIn:
+            console.print(
+                "[red]Not signed in.[/red] Run [bold]screencap login[/bold] to "
+                "upload to the cloud. Your recordings stay local — nothing was changed."
+            )
+            sys.exit(1)
+        except auth.AuthError:
+            # Transient (offline / token-service hiccup) — don't block on a blip.
+            # request_signed_urls refreshes-and-retries, and a real failure
+            # surfaces there without deleting anything (fail-closed).
+            pass
+
     # --- Intent warnings ---
     from screencap.catalog import read_intent
 
@@ -2918,16 +2939,10 @@ def upload(names, all_recordings, dry_run, force, jobs, no_delete):
                     )
                 else:
                     console.print(f"\n[green]Uploaded {d.name}[/green] ({summary})")
-                # Print viewer URLs
-                _rec_name = result.recording or d.name
-                _raw_url = f"https://screencap.sh/?source=recordings&recording={_rec_name}#data"
-                _session_url = f"https://screencap.sh/?source=sessions&recording={_rec_name}#data"
-                console.print(
-                    f"  [dim]View (raw):[/dim] [link={_raw_url}]{_raw_url}[/link]"
-                )
-                console.print(
-                    f"  [dim]View (processed, ~2 min):[/dim] [link={_session_url}]{_session_url}[/link]"
-                )
+                # No public screencap.sh viewer URL: user recordings now live
+                # under the private, account-scoped users/{uid}/ namespace, which
+                # the public site cannot render. Web viewing of your own cloud
+                # recordings is deferred; the macOS app/CLI is the interim surface.
         except FileNotFoundError as e:
             console.print(f"[red]Error:[/red] {e}")
             all_failed += 1

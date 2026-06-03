@@ -535,24 +535,10 @@ class RecordingCollaborators:
                     chunks_expected=n_chunks,
                     show_on_website=show_on_website,
                 )
-                if sentinel_uploaded and console is not None:
-                    raw_url = (
-                        f"https://screencap.sh/?source=recordings"
-                        f"&recording={recording_name}#data"
-                    )
-                    session_url = (
-                        f"https://screencap.sh/?source=sessions"
-                        f"&recording={recording_name}#data"
-                    )
-                    console.print(
-                        f"\n  [dim]View (raw):[/dim] "
-                        f"[link={raw_url}]{raw_url}[/link]"
-                    )
-                    console.print(
-                        f"  [dim]View (processed, ~2 min):[/dim] "
-                        f"[link={session_url}]{session_url}[/link]"
-                    )
-                elif not sentinel_uploaded and console is not None:
+                # No public screencap.sh viewer URL: user recordings are now
+                # private (users/{uid}/), which the public site cannot render.
+                # Web viewing of your own cloud recordings is deferred.
+                if not sentinel_uploaded and console is not None:
                     console.print(
                         f"[yellow]Sentinel upload failed — run "
                         f"'screencap upload {recording_name}' to trigger stitching.[/yellow]"

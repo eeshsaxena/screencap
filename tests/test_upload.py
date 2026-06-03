@@ -496,6 +496,55 @@ def test_upload_command_success(tmp_path):
         result = runner.invoke(cli, ["upload", "my-rec"])
     assert result.exit_code == 0
     assert "Uploaded" in result.output
+    # User recordings are private (users/{uid}/) — no public viewer URL is emitted.
+    assert "screencap.sh" not in result.output
+
+
+def test_upload_command_not_signed_in_refuses_and_touches_nothing(tmp_path, monkeypatch):
+    from screencap import auth
+
+    rec = tmp_path / "my-rec"
+    rec.mkdir()
+    (rec / "video.mp4").write_bytes(b"x" * 100)
+
+    def not_signed_in(force_refresh=False):
+        raise auth.NotSignedIn("no creds")
+
+    monkeypatch.setattr("screencap.auth.get_id_token", not_signed_in)
+
+    runner = CliRunner()
+    with (
+        mock.patch("screencap.upload.get_recordings_dir", return_value=tmp_path),
+        mock.patch("screencap.upload.requests.post") as post,
+    ):
+        result = runner.invoke(cli, ["upload", "my-rec"])
+
+    assert result.exit_code == 1
+    assert "screencap login" in result.output
+    post.assert_not_called()  # never reached the network
+    # Pre-flight refused before the upload loop: no auto-export, no status sentinel.
+    assert not (rec / "events.jsonl").exists()
+    assert not (rec / UPLOAD_STATUS_FILE).exists()
+
+
+def test_upload_command_dry_run_does_not_require_auth(tmp_path, monkeypatch):
+    from screencap import auth
+
+    rec = tmp_path / "my-rec"
+    rec.mkdir()
+    (rec / "video.mp4").write_bytes(b"x" * 1000)
+
+    def not_signed_in(force_refresh=False):
+        raise auth.NotSignedIn("no creds")
+
+    monkeypatch.setattr("screencap.auth.get_id_token", not_signed_in)
+
+    runner = CliRunner()
+    with mock.patch("screencap.upload.get_recordings_dir", return_value=tmp_path):
+        result = runner.invoke(cli, ["upload", "my-rec", "--dry-run"])
+
+    assert result.exit_code == 0  # dry-run is local-only; no sign-in needed
+    assert "Dry run" in result.output
 
 
 def test_upload_command_service_unavailable(tmp_path):
