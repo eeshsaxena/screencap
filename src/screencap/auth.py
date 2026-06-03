@@ -536,6 +536,30 @@ def get_id_token(force_refresh: bool = False) -> str:
     return _ensure_fresh(force=force_refresh).id_token
 
 
+def authed_post(post, url, *, json=None, timeout=30):
+    """POST ``url`` with an ``Authorization: Bearer`` header, retrying once on 401.
+
+    ``post`` is the CALLER's own ``requests.post`` reference (e.g.
+    ``screencap.upload.requests.post``) — passing it in keeps the network call
+    in the caller's module so existing test mocks on that attribute keep working,
+    while the bearer/refresh/retry policy lives in one place for every cloud path.
+
+    On a 401 (the server rejecting a token we still believe is valid: clock skew,
+    rotation, revocation) it forces a token refresh via :func:`get_id_token` and
+    retries the single call once. Propagates :class:`NotSignedIn` (callers map it
+    to a "run ``screencap login``" message) and any exception ``post`` raises
+    (``ConnectionError`` / ``Timeout``). Returns the final response.
+    """
+    resp = None
+    for attempt in range(2):
+        token = get_id_token(force_refresh=attempt > 0)
+        resp = post(url, json=json, headers={"Authorization": f"Bearer {token}"}, timeout=timeout)
+        if resp.status_code == 401 and attempt == 0:
+            continue  # token rejected — refresh + retry the single call once
+        break
+    return resp
+
+
 def login(open_browser: bool = True, timeout: float = LOGIN_TIMEOUT_SECONDS) -> AuthState:
     """Run the interactive sign-in flow and persist the refresh token.
 

@@ -206,8 +206,9 @@ def request_signed_urls(
     (``ChunkStatus.FAILED``) and never deletes local media — see
     ``docs/solutions/runtime-errors/chunk-upload-sentinel-gating-and-data-loss.md``.
 
-    The bearer header is built here in-module (not via a separate posting helper)
-    so test mocks at ``screencap.upload.requests.post`` keep working.
+    The bearer/refresh/retry policy lives in :func:`screencap.auth.authed_post`;
+    the ``requests.post`` reference is passed in so it stays this module's own call
+    (test mocks at ``screencap.upload.requests.post`` keep working).
     """
     from screencap import auth
 
@@ -216,29 +217,14 @@ def request_signed_urls(
         "recording": recording_name,
         "files": [{"name": f.name, "content_type": f.content_type} for f in files],
     }
-    resp = None
-    for attempt in range(2):
-        try:
-            token = auth.get_id_token(force_refresh=attempt > 0)
-        except auth.NotSignedIn:
-            raise RuntimeError(
-                "Sign in to upload to the cloud: run `screencap login`."
-            )
-        try:
-            resp = requests.post(
-                url,
-                json=payload,
-                headers={"Authorization": f"Bearer {token}"},
-                timeout=30,
-            )
-        except requests.ConnectionError:
-            raise RuntimeError("Upload service unavailable. Check your internet connection.")
-        except requests.Timeout:
-            raise RuntimeError("Upload service timed out. Try again later.")
-
-        if resp.status_code == 401 and attempt == 0:
-            continue  # token rejected — refresh + retry the single call once
-        break
+    try:
+        resp = auth.authed_post(requests.post, url, json=payload, timeout=30)
+    except auth.NotSignedIn:
+        raise RuntimeError("Sign in to upload to the cloud: run `screencap login`.")
+    except requests.ConnectionError:
+        raise RuntimeError("Upload service unavailable. Check your internet connection.")
+    except requests.Timeout:
+        raise RuntimeError("Upload service timed out. Try again later.")
 
     if resp.status_code != 200:
         detail = ""

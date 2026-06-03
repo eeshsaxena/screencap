@@ -492,3 +492,44 @@ def test_force_refresh_remints_even_when_cached_is_fresh(fake_keyring, monkeypat
     assert calls == []
     assert a.get_id_token(force_refresh=True) == "reminted"  # forced re-mint
     assert calls == ["rt"]
+
+
+def test_authed_post_attaches_bearer_and_returns_response(monkeypatch):
+    monkeypatch.setattr(a, "get_id_token", lambda force_refresh=False: "tok")
+    seen = {}
+
+    def post(url, json=None, headers=None, timeout=None):
+        seen["url"], seen["headers"], seen["timeout"] = url, headers, timeout
+        return _FakeResp(200, {"ok": True})
+
+    resp = a.authed_post(post, "https://fn", json={"a": 1}, timeout=30)
+    assert resp.status_code == 200
+    assert seen["headers"]["Authorization"] == "Bearer tok"
+    assert seen["url"] == "https://fn" and seen["timeout"] == 30
+
+
+def test_authed_post_refreshes_and_retries_once_on_401(monkeypatch):
+    forces = []
+    monkeypatch.setattr(a, "get_id_token", lambda force_refresh=False: forces.append(force_refresh) or ("fresh" if force_refresh else "stale"))
+    responses = [_FakeResp(401, {}), _FakeResp(200, {"ok": True})]
+    headers_seen = []
+
+    def post(url, json=None, headers=None, timeout=None):
+        headers_seen.append(headers["Authorization"])
+        return responses.pop(0)
+
+    resp = a.authed_post(post, "https://fn")
+    assert resp.status_code == 200
+    assert forces == [False, True]  # second attempt forced a refresh
+    assert headers_seen == ["Bearer stale", "Bearer fresh"]
+
+
+def test_authed_post_propagates_not_signed_in_before_any_post(monkeypatch):
+    def not_signed_in(force_refresh=False):
+        raise a.NotSignedIn("no creds")
+
+    monkeypatch.setattr(a, "get_id_token", not_signed_in)
+    called = []
+    with pytest.raises(a.NotSignedIn):
+        a.authed_post(lambda *x, **k: called.append(1), "https://fn")
+    assert called == []  # never posts without a token
