@@ -27,6 +27,38 @@ cross-project sequencing.
 
 ---
 
+## Pre-deploy gate (CRITICAL — read before deploying the function)
+
+The U2 function code **requires a Firebase bearer token** on `upload` / `list` /
+`sign-download`, **removes** the `get-index` action, and reshapes `gcs_prefix` to
+`users/{uid}/…`. The matching token-carrying clients (U5 remainder) and the website
+demo-repoint (U7) are deferred to follow-ups. So deploying this code **over the live
+`get-upload-urls`** would break every currently-shipped client:
+
+- The current CLI (`upload.py` / `download.py`) and website send **no** bearer token →
+  every real-user action returns **401**.
+- `download.py`'s `fetch_session_index()` / `list_remote_sessions()` still POST
+  `{"action": "get-index"}`; the dispatcher now 400s it. (`fetch_session_index`
+  degrades to an empty index, so `list --remote` shows "no sessions" rather than
+  erroring — but `download --sessions` and all token-gated actions hard-fail.)
+
+The code is correct; this is a **deploy-sequencing hazard**, not a code defect. Pick
+ONE and do not deploy to the live function until it holds:
+
+1. **Sequence (default):** do not deploy over the live `get-upload-urls` until U5 (token
+   threading in `upload.py` / `download.py`) and U7 (website → `demo-*`) have shipped
+   and a token-carrying client is released.
+2. **New function name:** deploy as a *separate* function (e.g. `get-upload-urls-v2`)
+   and cut clients over only once they send tokens; retire the old function afterward.
+3. **Feature flag:** add a `SCREENCAP_AUTH_ENABLED` env so the deployed code falls
+   through to the legacy unauthenticated path until clients are ready.
+
+Also: when U5 removes the `--remote` / `--sessions` surface, remove
+`fetch_session_index` / `list_remote_sessions` from `download.py` so no shipped client
+calls the retired `get-index` action.
+
+---
+
 ## Preconditions
 
 - [ ] `gcloud` authenticated as an owner/editor of `proteus-photos`
