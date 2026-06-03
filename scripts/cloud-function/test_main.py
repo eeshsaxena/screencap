@@ -289,3 +289,97 @@ def test_user_download_uses_short_expiry(gcs):
     exp = gcs.store["users/userA/recordings/r/video.mp4"].signed_kwargs["expiration"]
     assert exp == timedelta(minutes=main.USER_DOWNLOAD_EXPIRY_MINUTES)
     assert exp < timedelta(hours=1)  # materially shorter than the old 4h window
+
+
+# ==========================================================================
+# U3 — public demo namespace (unauthenticated, demo/ only)
+# ==========================================================================
+
+
+def _req_noauth(body):
+    """A demo request: no Authorization header at all."""
+    return mock.Mock(method="POST", headers={}, get_json=mock.Mock(return_value=body))
+
+
+def test_demo_list_no_token(gcs):
+    # AE4/R10: the demo gallery lists without any token.
+    gcs.add("demo/cooldemo/video.mp4")
+    gcs.add("demo/cooldemo/meta.json")
+    gcs.add("demo/another/video.mp4")
+    with mock.patch.object(main, "verify_bearer") as vb:
+        status, payload = _invoke(_req_noauth({"action": "demo-list"}))
+    assert status == 200
+    assert {r["name"] for r in payload["recordings"]} == {"cooldemo", "another"}
+    # The demo path NEVER calls the auth gate.
+    vb.assert_not_called()
+    assert gcs.list_calls == ["demo/"]
+
+
+def test_demo_sign_download_happy(gcs):
+    gcs.add("demo/cooldemo/video.mp4")
+    gcs.add("demo/cooldemo/screenshots/0.png")
+    with mock.patch.object(main, "verify_bearer") as vb:
+        status, payload = _invoke(_req_noauth({"action": "demo-sign-download", "recording": "cooldemo"}))
+    assert status == 200
+    assert set(payload["urls"]) == {"video.mp4", "screenshots/0.png"}
+    assert all("demo/cooldemo/" in u for u in payload["urls"].values())
+    vb.assert_not_called()
+
+
+def test_demo_sign_download_not_found(gcs):
+    with mock.patch.object(main, "verify_bearer"):
+        status, _ = _invoke(_req_noauth({"action": "demo-sign-download", "recording": "ghost"}))
+    assert status == 404
+
+
+def test_demo_actions_only_ever_read_demo(gcs):
+    # R9: a crafted name cannot make a demo action reach users/ or the flat
+    # namespace. Either it 400s (bad name) or it lists strictly under demo/.
+    gcs.add("users/userA/recordings/secret/video.mp4")
+    for bad in ["../users/userA/recordings/secret", "a/b", ".."]:
+        with mock.patch.object(main, "verify_bearer"):
+            status, _ = _invoke(_req_noauth({"action": "demo-sign-download", "recording": bad}))
+        assert status == 400
+    # Every list prefix the demo path ever used stayed under demo/.
+    assert all(p.startswith("demo/") for p in gcs.list_calls)
+    assert not any("users/" in p for p in gcs.list_calls)
+
+
+def test_demo_ignores_source_field(gcs):
+    # A client-supplied source on a demo action is ignored — demo is flat.
+    gcs.add("demo/cooldemo/video.mp4")
+    gcs.add("users/userA/sessions/cooldemo/video.mp4")
+    with mock.patch.object(main, "verify_bearer"):
+        status, payload = _invoke(
+            _req_noauth({"action": "demo-list", "source": "sessions"})
+        )
+    assert status == 200
+    assert {r["name"] for r in payload["recordings"]} == {"cooldemo"}
+    assert gcs.list_calls == ["demo/"]
+
+
+def test_demo_list_is_marker_blind(gcs):
+    # A migrated demo recording may carry a vestigial _unlisted marker; demo-list
+    # must NOT honor it (the marker is superseded by namespace isolation).
+    gcs.add("demo/curated/video.mp4")
+    gcs.add("demo/curated/_unlisted")
+    with mock.patch.object(main, "verify_bearer"):
+        status, payload = _invoke(_req_noauth({"action": "demo-list"}))
+    assert status == 200
+    assert "curated" in {r["name"] for r in payload["recordings"]}
+
+
+def test_demo_does_not_loosen_authenticated_gate(gcs):
+    # Adding the demo path must not have loosened the token-gated path: a gated
+    # action without a token still 401s.
+    with _auth(exc=AuthInvalid("no token")):
+        status, _ = _invoke(_req({"action": "list"}))
+    assert status == 401
+
+
+def test_demo_uses_long_expiry(gcs):
+    gcs.add("demo/cooldemo/video.mp4")
+    with mock.patch.object(main, "verify_bearer"):
+        _invoke(_req_noauth({"action": "demo-sign-download", "recording": "cooldemo"}))
+    exp = gcs.store["demo/cooldemo/video.mp4"].signed_kwargs["expiration"]
+    assert exp == timedelta(hours=main.DEMO_DOWNLOAD_EXPIRY_HOURS)

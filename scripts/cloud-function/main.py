@@ -141,8 +141,16 @@ def get_upload_urls(request):
 
     action = data.get("action")
 
-    # Token-gated, users/{uid}/-scoped actions. (Public demo-* actions are
-    # dispatched ahead of this gate in U3.)
+    # Public demo actions — dispatched BEFORE any token-gated branch so a demo
+    # request never touches verify_bearer-gated code. They hard-code the demo/
+    # prefix via resolve_prefix(authenticated=False, ...) and honor no
+    # client-supplied source/owner (defeats source=demo overloading).
+    if action == "demo-list":
+        return _handle_demo_list(data)
+    if action == "demo-sign-download":
+        return _handle_demo_sign_download(data)
+
+    # Token-gated, users/{uid}/-scoped actions.
     if action in (None, "upload"):
         return _handle_upload(request, data)
     if action == "list":
@@ -173,6 +181,75 @@ def _authenticate(request):
         )
     except AuthInvalid:
         return None, _cors((jsonify({"error": "Authentication required"}), 401))
+
+
+def _handle_demo_list(data):
+    """List the public demo gallery — unauthenticated, demo/ only.
+
+    A physically separate code path from the token-gated handlers (a bug in one
+    cannot cross into the other) and reachable without a token. Marker-BLIND:
+    a migrated recording may carry a vestigial _unlisted blob, but the marker is
+    superseded by namespace isolation and must NOT hide a curated demo recording.
+    """
+    from collections import defaultdict
+
+    prefix = resolve_prefix(authenticated=False, uid=None, source=None, name=None)  # "demo/"
+    recordings = defaultdict(lambda: {"file_count": 0, "total_size": 0})
+
+    plen = len(prefix)
+    blobs = _storage_client.list_blobs(BUCKET, prefix=prefix, timeout=60)
+    for blob in blobs:
+        # blob.name = "demo/{name}/{filename...}"
+        rel = blob.name[plen:]
+        parts = rel.split("/", 1)
+        if len(parts) < 2 or not parts[1]:
+            continue
+        rec_name = parts[0]
+        if parts[1] == "_unlisted":
+            # Skip the marker file itself, but do NOT hide the recording.
+            continue
+        recordings[rec_name]["file_count"] += 1
+        recordings[rec_name]["total_size"] += blob.size or 0
+
+    result = [
+        {"name": name, "file_count": info["file_count"], "total_size": info["total_size"]}
+        for name, info in sorted(recordings.items())
+    ]
+    return _cors(jsonify({"recordings": result}))
+
+
+def _handle_demo_sign_download(data):
+    """Signed GET URLs for a public demo recording — unauthenticated, demo/ only."""
+    recording = data.get("recording")
+    if not recording:
+        return _cors((jsonify({"error": "'recording' field required"}), 400))
+
+    try:
+        # Hard-coded demo/ namespace; resolve_prefix raises on any climbing name.
+        prefix = resolve_prefix(authenticated=False, uid=None, source=None, name=recording)
+    except PrefixResolutionError:
+        return _cors((jsonify({"error": "Invalid recording name"}), 400))
+
+    blobs = list(_storage_client.list_blobs(BUCKET, prefix=prefix, timeout=60))
+    if not blobs:
+        return _cors((jsonify({"error": f"Recording not found: {recording}"}), 404))
+
+    _credentials.refresh(_auth_request)
+
+    urls = {}
+    for blob in blobs:
+        rel_name = blob.name[len(prefix):]
+        if not rel_name:
+            continue
+        urls[rel_name] = blob.generate_signed_url(
+            version="v4",
+            expiration=timedelta(hours=DEMO_DOWNLOAD_EXPIRY_HOURS),
+            method="GET",
+            service_account_email=_credentials.service_account_email,
+            access_token=_credentials.token,
+        )
+
+    return _cors(jsonify({"urls": urls, "gcs_prefix": f"gs://{BUCKET}/{prefix}"}))
 
 
 def _handle_list(request, data):
