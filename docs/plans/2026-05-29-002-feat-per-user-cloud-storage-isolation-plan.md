@@ -15,6 +15,27 @@ Make the signing Cloud Function the security boundary: it verifies a Firebase ID
 
 ---
 
+## Execution Status
+
+> Tracks what has shipped so the plan reflects reality. Updated 2026-06-03 (ce-work). Status stays `active` until the remaining units land.
+
+**Shipped on `feat/per-user-cloud-storage-isolation`** (the backend security boundary + client auth foundation — deploys and tests in isolation; nothing user-facing breaks):
+
+- **U1 — done** (`c5c206f3`): `verify_bearer` (typed 401-invalid vs 503-unavailable, project-pinned) + `resolve_prefix` (the single key builder, demo/users invariant); Firebase init; `firebase-admin` + forced `google-cloud-storage>=3.1.1`; provisioning runbook.
+- **U2 — done** (`79c7f4f3`): per-user namespace isolation + in-code auth gate; global list-all / sign-any removed; `get-index` removed; AE2 cross-user denial + the CI contract test.
+- **U3 — done** (`5db38343`): public `demo/` namespace dispatched before the auth gate; marker-blind; physically separate code path.
+- **U4 — done** (`5276c3b8`): CLI `login`/`logout`/`whoami` + `get_id_token` (loopback OAuth+PKCE → `signInWithIdp`, Keychain refresh token, transparent refresh/rotation; `NotSignedIn` vs transient `AuthError`).
+- **U5 — partial** (`4e545c68`): the independent self-capture sub-scope landed — auth/token hosts blocked from `--network` (override-proof `REQUIRED_AUTH_IGNORE_HOSTS`) + `proxy_runner` fail-closed gate. **Remaining: shared `authed_post`/`force_refresh`, token threading through `upload.py`/`download.py`, removal of the `--remote`/`--sessions` session surfaces + public `screencap.sh` viewer URLs, the fail-closed `chunk_processor` (characterization-test-first), and the daemon out-of-band ID-token seam.**
+
+**Open Questions resolved during execution (confirmed with the operator):**
+
+- **Auth boundary (was: split deployments?)** → keep a single `--allow-unauthenticated` function; the in-code `resolve_prefix` gate is the boundary, backed by a CI contract test asserting no tokenless request reaches any `users/` code path. (Implemented in U2.)
+- **Public-exposure consent (blocks U8 promotion)** → **promote the real friend-trial recordings after a content/title review gate**; U8 builds the staging + promotion scripts and the live promotion is an operator step.
+
+**Not yet started:** U5 remainder, U6 (macOS sign-in surface), U7 (website demo repoint — separate `screencap-website` repo), U8/U9 (migration + decommission scripts/runbooks), U10 (legacy `zkairdrop` decommission runbook).
+
+---
+
 ## Problem Frame
 
 See origin (`docs/brainstorms/2026-05-29-per-user-cloud-storage-isolation-requirements.md`) for the full pain narrative. In one line: today the signing function is deployed `--allow-unauthenticated`, lists *every* recording, and signs a download URL for *any* recording name — onboarding a second real user would expose the first user's recordings to anyone who can guess a name. v1 closes that boundary so the product can be handed to a stranger.
@@ -31,8 +52,8 @@ See origin (`docs/brainstorms/2026-05-29-per-user-cloud-storage-isolation-requir
 - R6. The signing layer verifies the token and scopes upload-signing, download-signing, and list to that account's namespace.
 - R7. A user cannot list, download, or enumerate another user's recordings; the "list all" and "sign-download any name" behaviors are removed for real user data.
 - R8. Recording names are unique only within an account's namespace; two accounts may hold a same-named recording without collision or cross-visibility.
-- R9. The public website no longer lists or serves real user recordings.
-- R10. A curated demo gallery remains publicly viewable — an explicitly-curated set, separate from real user data.
+- R9. The public website no longer lists or serves real user recordings. *(Plan interpretation — the guarantee is that no **private, account-scoped** `users/{uid}/…` recording is ever publicly listable or fetchable. It does NOT mean "no real-origin recording is ever public": the demo gallery may serve **real recordings that were explicitly consented and promoted into `demo/`** — see R10/R11. The boundary is consent + explicit curation + the separate `demo/` namespace, not synthetic-vs-real origin.)*
+- R10. A curated demo gallery remains publicly viewable — an explicitly-curated set, separate from real user data. *(Plan refinement — "separate from real user data" means separate from **private, account-scoped** data and gated by consent. In v1 the curated set is populated from consented friend-trial recordings promoted into `demo/` (R11); the synthetic-only alternative — recordings made specifically for the gallery — is the lower-exposure option weighed in Open Questions → public-exposure consent.)*
 - R11. Existing friend-trial recordings are not publicly listable after v1 — **resolved (with a security-review refinement): migrate all out of the public flat namespace; user intent is to make them public via `demo/`, but each recording passes a content/title/consent review gate before public exposure** (see Open Questions — public-exposure consent).
 
 **Origin actors:** A1 (account owner / operator), A2 (public / demo visitor), A3 (authenticated client — macOS app / CLI).
@@ -45,7 +66,7 @@ See origin (`docs/brainstorms/2026-05-29-per-user-cloud-storage-isolation-requir
 
 - Billing, paid storage tiers, quotas, payment-provider integration — later milestone (origin: *Deferred for later*).
 - Training-consent opt-in flow — later milestone.
-- Per-user authenticated **web dashboard** (logging in on the website to view your own recordings) — later milestone; the macOS app/CLI is the interim surface for your own cloud data.
+- **Any way to view your own cloud recordings beyond the macOS app/CLI** — later milestone and an unresolved product question, NOT assumed to be a website login. The "auth is never on the website" invariant holds: if an authenticated web surface is ever built, whether it even exists and (if so) whether it is authenticated by an app/CLI-issued token rather than a website login form is a `ce-brainstorm` question, not decided here. For v1 the macOS app/CLI is the only surface for your own cloud data; the website is public/demo-only.
 - Physical per-user isolation (per-user buckets / IAM — Approach B) — reserved for a future compliance driver.
 - Client-side encryption / privacy-vault model — rejected (incompatible with the training-corpus bet).
 - Changes to the recording engine, capture pipeline, or the macOS review/upload UX specced in `docs/plans/2026-05-27-002-feat-upload-review-screen-plan.md` — this plan is the storage/identity layer beneath that work; it only adds an auth-state check to the Upload affordance.
@@ -54,7 +75,7 @@ See origin (`docs/brainstorms/2026-05-29-per-user-cloud-storage-isolation-requir
 
 ### Deferred to Follow-Up Work
 
-- **GCP project move (`zkairdrop` → `proteus-photos`)** is a separate effort (`docs/brainstorms/2026-05-29-gcp-migration-zkairdrop-to-proteus-photos-requirements.md`), not part of this plan. It is a **per-resource migration (buckets + Cloud Functions/Cloud Run + auth)**, not a whole-project relocation. The three resource types move with different difficulty: **buckets** copy mechanically (object keys, incl. `users/{uid}/…` and `demo/…`, carry over verbatim); **functions/Cloud Run** redeploy from the same source and clients reach them via `api.screencap.sh` (migration plan's Approach C); **auth** (the new Firebase/Identity Platform tenant) is the only one with a data coupling — there is no one-click tenant move, so it requires re-enabling Identity Platform in the target, re-creating the Google OAuth provider config, and **importing users preserving `localId` (the uid)**. **Sequencing — recommended: provision auth in the final project (`proteus-photos`) now, even while buckets/functions stay in `zkairdrop`.** Firebase ID-token verification is cryptographic against Google's global certs + the `aud`/`iss` project claim, so the `zkairdrop`-hosted signing function can verify `proteus-photos`-issued tokens by initializing `firebase-admin` with `projectId="proteus-photos"` (no cross-project IAM needed while `check_revoked=False`; the CLI sign-in uses the `proteus-photos` Web API key + OAuth client). Because uids are then `proteus-photos` uids from day one, the later bucket/function lift-and-shift lands `users/{uid}/…` in the project that already owns those uids — **zero auth-tenant migration, zero uid preservation, zero orphan risk.** This is why U1's "pin the project explicitly" decision is load-bearing here. The two weaker orders both work but cost more: *move-everything-first* (stand up auth in `proteus-photos` after the bucket/function move) is fine but blocks isolation on the move; *isolation-with-auth-in-`zkairdrop`-first* forces the later move to preserve uids and coordinate the auth import with the bucket copy. The isolation design is otherwise project-agnostic and does not change with any order.
+- **GCP project topology (resolved): everything is now on `proteus-photos`.** The active `screencap-recordings` bucket, the signing Cloud Function, and the new Firebase/Identity Platform tenant all live in `proteus-photos` — this is a single-project build. The earlier `zkairdrop`→`proteus-photos` cross-project sequencing concern is moot (the move already happened). **One live loose end this plan must close:** the legacy `zkairdrop` `get-upload-urls` function is still deployed `--allow-unauthenticated` and still fronts the `zkairdrop` "safety" buckets (which retain the old flat, public, identity-free layout = real user data). That is a second public door to the exact data this plan locks down, so closing it is **in scope for R7/R9** — see U10. The `zkairdrop` buckets themselves are a retained frozen backup (out of the active path); U10 revokes their public access rather than deleting them.
 - **Remove vestigial `_unlisted` / `show_on_website` machinery**: superseded by namespace isolation (see Key Technical Decisions); left as harmless no-ops in v1, cleaned up in a separate PR.
 - **`check_revoked=True` / account-disable + abuse controls** on the signing path: out of the hot path for v1 (short token lifetime is the mitigation); add when abuse controls land.
 - **Token-verification consolidation into the brokered backend (Approach C)**: the moment billing/consent/audit are built.
@@ -91,14 +112,14 @@ See origin (`docs/brainstorms/2026-05-29-per-user-cloud-storage-isolation-requir
 ## Key Technical Decisions
 
 - **Authentication is opt-in — required only on the cloud-upload path, never for local use (R2/R3).** Recording, scrubbing, local playback, and all local use stay account-free; a user who never uploads never signs in. Sign-in is triggered only by a cloud action: explicit `screencap upload`, the app's Upload affordance, or a cloud-intent live recording (when the upload begins). When not signed in, the cloud path refuses with a sign-in prompt and the recording stays local (fail-closed, U5) — it never blocks recording.
-- **Authentication surface = macOS app + CLI only. The website is public/demo-only and has NO login in v1 (A1/A3 authenticate; A2 is always anonymous).** Sign-in happens exclusively in the app/CLI (`screencap login`); the only authenticated callers of the signing function are the **non-browser** macOS app / CLI / daemon. The website's browser talks only to its own same-origin Next.js routes, which proxy to the function **server-side** (`gcs-proxy.ts` is `server-only`) and read only the unauthenticated `demo/` namespace. Consequence: **no browser ever sends a bearer token to the function in v1.** The existing `CLOUD_FUNCTION_TOKEN` hook in `gcs-proxy.ts` stays inert/unused — it is not user auth. A per-user authenticated web dashboard is the deferred web-dashboard milestone, and only *then* would a browser become a direct authenticated caller. This invariant is why the CORS treatment below does not need an `Authorization` request header in v1.
+- **Authentication surface = macOS app + CLI only. The website is public/demo-only and has NO login in v1 (A1/A3 authenticate; A2 is always anonymous).** Sign-in happens exclusively in the app/CLI (`screencap login`); the only authenticated callers of the signing function are the **non-browser** macOS app / CLI / daemon. The website's browser talks only to its own same-origin Next.js routes, which proxy to the function **server-side** (`gcs-proxy.ts` is `server-only`) and read only the unauthenticated `demo/` namespace. Consequence: **no browser ever sends a bearer token to the function in v1.** The existing `CLOUD_FUNCTION_TOKEN` hook in `gcs-proxy.ts` stays inert/unused — it is not user auth. Whether there is *ever* an authenticated web surface — and if so, whether it is authenticated by an app/CLI-issued token rather than a website login form — is an unresolved product question (a `ce-brainstorm` topic), not an assumed roadmap item; this plan does not presuppose a future website login. This invariant is why the CORS treatment below does not need an `Authorization` request header in v1.
 - **Firebase / Identity Platform as the auth provider (R1).** GCP-native (same Google project as the bucket + function → lowest ops burden), offline low-latency token verification via `firebase-admin`, a clean path-safe `uid` for both the storage prefix and a future Stripe customer, free to 50k MAU. Accepts a one-time two-step client sign-in implementation (loopback OAuth → `signInWithIdp`). Runner-up Auth0 rejected on cost-at-consumer-scale and second-vendor ops burden. *(Confirmed with user; see origin R1.)*
 - **Keep the standalone Cloud Function for v1; make it token-verifying (R5, R6).** Smallest delta from today (behavior change inside an existing function, not a relocation), keeps the `signBlob`/`serviceAccountTokenCreator` permission on one small surface, and the client already calls it. Folding into the website backend is the Approach-C move, deferred until billing/consent/audit are built.
 - **Owner id = the verified Firebase `uid`, used as the path segment `users/{uid}/…` — never the email.** Emails are mutable and leak PII into cloud paths (directly relevant to the STRATEGY.md "leaked titles in cloud-bound paths" metric). The `uid` is immutable, opaque, and path-safe. Defense-in-depth: validate the owner segment against a strict regex before interpolation even though the verified `uid` is already safe. **Note this regex (`^[A-Za-z0-9]{1,128}$`) is deliberately Firebase-uid-shaped — it is a provider-coupled choice. A future provider whose subject id contains other characters (e.g. Auth0's `google-oauth2|123`) would change the storage-path alphabet and therefore require a data migration, not a drop-in seam swap. "Provider-agnostic" is scoped to the verification *interface* (`bearer → opaque owner id`), not the path encoding.**
 - **The demo/users boundary is an enforced runtime invariant, not a convention.** Every GCS access in the function routes through one central prefix resolver — `resolve_prefix(authenticated, uid_or_none, source, name)` — that is the *only* code that turns a request into an object key. It raises if an unauthenticated request resolves to anything outside `demo/`, and if an authenticated request resolves to anything outside `users/{uid}/`. After assembling the full key it re-asserts `key.startswith("users/{uid}/")` (or `demo/`) before any sign/list call. This replaces the weaker "lexically separate handlers" framing and is enforced by a test that iterates every dispatcher action.
 - **Reject the `source=demo` overloading; the demo path uses dedicated actions dispatched *before* any auth gate.** A single client-controlled `source` selector steering between authenticated and unauthenticated behavior is the most likely way to accidentally expose `users/` data. The public path is `demo-list` / `demo-sign-download` with a hard-coded `demo/` prefix that accepts no client-supplied `source`/`owner`. `source` on authenticated handlers is a strict server-side allow-list (`{"recordings","sessions"}`), never interpolated raw.
 - **Migration stages into a private `import-review/` namespace, then promotes to public `demo/` after review (R10, R11).** The user's intent is to make the existing recordings public, but these are real screen recordings that may contain PII/credentials and whose *names* become public path segments. So U8 copies the flat namespace into a **private** `import-review/` staging namespace (no public handler), the founder reviews/scrubs and clears recordings, cleared recordings are promoted into `demo/`, and only then (U9) is the flat namespace decommissioned. This keeps the sources as the rollback source of truth until the website cutover is verified live, and prevents an un-reviewed public dump. **Bucket-IAM precondition:** "private" only holds if the shared bucket has no `allUsers`/`allAuthenticatedUsers` read binding — the legacy public-gallery posture may have one; U8's first pre-check verifies and removes it, else `import-review/` is publicly readable by direct URL. *(The blanket "migrate all to public" intent is preserved but gated — see Open Questions: public-exposure consent, which also weighs purpose-built/synthetic demo content as the lower-risk alternative to publishing real trial captures.)*
-- **Private-data signed URLs and CORS are re-justified under the new model.** GET expiry for `users/` is shortened to the minimum the playback/download flow needs (a per-namespace constant; `demo/` may keep the longer window since it is public anyway), because a 4-hour signed GET URL for private data is an unrevokable bearer capability. CORS: because the only authenticated callers are non-browser (app/CLI/daemon → no preflight) and the website reaches the function server-side, **no browser sends a bearer token to the function in v1** — so `Access-Control-Allow-Headers` does NOT need `Authorization` now (adding it is deferred to the future web dashboard, when a browser becomes a direct authenticated caller). `Access-Control-Allow-Origin: *` can be left as-is for the public demo reads or tightened to the demo-site origin; it is not load-bearing for auth.
+- **Private-data signed URLs and CORS are re-justified under the new model.** GET expiry for `users/` is shortened to the minimum the playback/download flow needs (a per-namespace constant; `demo/` may keep the longer window since it is public anyway), because a 4-hour signed GET URL for private data is an unrevokable bearer capability. CORS: because the only authenticated callers are non-browser (app/CLI/daemon → no preflight) and the website reaches the function server-side, **no browser sends a bearer token to the function in v1** — so `Access-Control-Allow-Headers` does NOT need `Authorization` now (it would only matter *if* an authenticated browser surface is ever introduced — an unresolved product question, not assumed here). `Access-Control-Allow-Origin: *` can be left as-is for the public demo reads or tightened to the demo-site origin; it is not load-bearing for auth.
 - **Demo gallery = a separate, unauthenticated `demo/` namespace (R10), populated by migrating all existing flat recordings (R11).** The demo handlers are physically separate code paths from the `users/` handlers (a bug in one cannot cross into the other) and require no token. Curation = the contents of `demo/`; the founder prunes unwanted recordings after migration. An optional `demo/_manifest.json` can carry titles/ordering later.
 - **`_unlisted` marker and `show_on_website` are superseded by namespace isolation.** Real user data never appears on the public site, so these no longer gate anything. Left as harmless no-ops in v1; removal deferred to follow-up. **Migration handling (committed, single approach):** the U8 promotion step strips `_unlisted`/`show_on_website` markers when copying into `demo/`, and `demo-list` is marker-blind (does not honor `_unlisted` at all). Markers are handled in exactly one place (promotion) so a curated recording can never silently vanish from the gallery.
 - **Public viewer URLs (`https://screencap.sh/?...&recording={name}`) are no longer valid for isolated user data.** The upload path stops emitting them for user recordings (the public site cannot render a `users/{uid}/` recording, and web viewing is deferred). The macOS app/CLI is the interim viewing surface.
@@ -183,6 +204,7 @@ flowchart TD
     U8 --> U7
     U7 --> U9[U9 Decommission flat namespace after U7 verified live]
     U8 --> U9
+    U10[U10 Close legacy zkairdrop public surface — independent, gated on client cutover]
 ```
 
 The central security invariant: a single `resolve_prefix(authenticated, uid, source, name)` is the only code that builds an object key; unauthenticated → must be under `demo/`, authenticated → must be under `users/{uid}/`, else it raises. Every dispatcher action is tested against this.
@@ -210,7 +232,7 @@ The central security invariant: a single `resolve_prefix(authenticated, uid, sou
 **Approach:**
 - Provisioning is an ops step captured in the runbook; the OAuth client id + Web API key produced here are inputs to U4.
 - `verify_bearer` extracts the `Authorization: Bearer` header, calls `auth.verify_id_token(token, clock_skew_seconds=<small>)`, returns the `uid`; raises typed errors: an *auth-invalid* error (missing/expired/bad-signature/wrong-project) → caller maps to **401**, and an *auth-unavailable* error (`CertificateFetchError` / Firebase outage) → caller maps to a distinct **503-class** so the client can treat it as fail-closed rather than a hard rejection. `check_revoked=False` (hot path).
-- **Pin the project explicitly to the auth-hosting project (recommended: `proteus-photos`), which need NOT be the project hosting the bucket/function.** `initialize_app(options={"projectId": <auth-project>})` and `verify_bearer` asserts the decoded token's `aud`/`iss` match that project (belt-and-suspenders over the SDK's own check), logging the project on init so a misconfig is loud. This prevents verify-but-misattribute against a foreign Firebase project, and it is what lets the `zkairdrop`-hosted function verify `proteus-photos`-issued tokens (see Scope Boundaries → GCP project move). Do NOT let the SDK infer the project from the function's ADC (that would expect `zkairdrop` tokens and reject the real ones). Verification needs no `proteus-photos` credentials while `check_revoked=False` — it is pure JWT + public-cert checking; provisioning the OAuth client + Web API key happens in the auth-hosting project.
+- **Provision the Firebase/Identity Platform tenant in `proteus-photos`** (where the function + bucket now live — single project) and **pin the project explicitly:** `initialize_app(options={"projectId": "proteus-photos"})`, and `verify_bearer` asserts the decoded token's `aud`/`iss` match it (belt-and-suspenders over the SDK's own check), logging the project on init so a misconfig is loud. This prevents verify-but-misattribute against a foreign Firebase project. `check_revoked=False` on the hot path needs no Admin-API credentials — pure JWT + public-cert checking. The OAuth client + Web API key are provisioned in `proteus-photos`.
 - `owner_segment` validates the uid against `^[A-Za-z0-9]{1,128}$` and rejects `/`, `.`, `..`, and empty (defense-in-depth even though Firebase uids are safe). See Key Technical Decisions for why this alphabet is provider-coupled.
 - `resolve_prefix` is the security heart: given `authenticated`, the (verified) `uid`, an allow-listed `source` (`{"recordings","sessions"}`), and a validated `name`, it returns the object-key prefix and **raises** if an unauthenticated call would resolve outside `demo/` or an authenticated call outside `users/{uid}/`. It performs a final `startswith` re-assertion on the assembled key.
 - Reconcile the `google-cloud-storage` bump; flag the upload-checksum re-test for U2.
@@ -275,7 +297,7 @@ The central security invariant: a single `resolve_prefix(authenticated, uid, sou
 - Invariant: the dispatcher accepts exactly the enumerated action set; an unknown action → 400; `get-index` either 404s for non-`demo/` content or is gone.
 - Integration: a v4 download URL signed for `users/{A}/…` cannot be path-edited to fetch `users/{B}/…` (assert the signed object path is exact — the cryptographic boundary).
 - Boundary contract: a token-gated action without a token → 401 (paired with U3's "demo action without a token → 200" to pin the in-code auth posture).
-- (No CORS/`Authorization` test in v1 — no browser is an authenticated caller; revisit only when the web dashboard ships.)
+- (No CORS/`Authorization` test in v1 — no browser is an authenticated caller; revisit only if an authenticated web surface is ever introduced.)
 
 **Verification:** With a valid token a user can upload/list/download only their own namespace; another user's name or no token is denied; the global list-all/sign-any paths are gone; every accepted action is enumerated and bounded; `users/` GET URLs use the shortened expiry.
 
@@ -436,9 +458,9 @@ The central security invariant: a single `resolve_prefix(authenticated, uid, sou
 
 ---
 
-### U7. Website reads the demo namespace only (no real user data)
+### U7. Website reads the demo namespace only (no private account-scoped data)
 
-**Goal:** Repoint the public website's gallery at the `demo/` namespace so it never lists or serves real user recordings.
+**Goal:** Repoint the public website's gallery at the `demo/` namespace so it serves only the curated demo set (consented promoted recordings and/or synthetic content) and never lists or serves any private, account-scoped `users/{uid}/…` recording.
 
 **Requirements:** R9, R10
 
@@ -468,7 +490,7 @@ The central security invariant: a single `resolve_prefix(authenticated, uid, sou
 - Happy path: a demo recording plays end-to-end (list → detail → signed URL → `/api/proxy` stream).
 - Test expectation: no unit framework exists in `screencap-website` — verify via local `pnpm dev` against the deployed function and a manual checklist; add a lightweight route test only if a framework is introduced.
 
-**Verification:** The public site shows only curated `demo/` recordings (or a clean placeholder when none are promoted) and can play them; no real user data and no session routes are reachable from the website.
+**Verification:** The public site shows only curated `demo/` recordings (or a clean placeholder when none are promoted) and can play them; no private, account-scoped `users/{uid}/…` data and no session routes are reachable from the website.
 
 ---
 
@@ -547,6 +569,35 @@ The central security invariant: a single `resolve_prefix(authenticated, uid, sou
 
 ---
 
+### U10. Close the legacy `zkairdrop` public surface
+
+**Goal:** Decommission the old `zkairdrop` `get-upload-urls` function and revoke public access to the retained `zkairdrop` "safety" buckets, so real user data is not publicly listable/downloadable through the legacy project after `proteus-photos` is locked down. Without this, R7/R9 hold only on the active project while a second public door stays open.
+
+**Requirements:** R7, R9
+
+**Dependencies:** None on the proteus-photos isolation units — **but gated on a verification that no active client still calls the `zkairdrop` `*.run.app` endpoint** (clients must be confirmed on the `proteus-photos` function / `api.screencap.sh`). Can land early since the exposure is live today.
+
+**Files:**
+- Create: `docs/cloud-legacy-decommission-runbook.md` (steps: confirm client cutover, take down the legacy function, revoke `allUsers`/`allAuthenticatedUsers` IAM on the `zkairdrop` buckets, verify)
+- (No application code — this is `gcloud`/IAM ops captured in the runbook.)
+
+**Approach:**
+- **First confirm client cutover:** check the shipped client default (`DEFAULT_UPLOAD_URL`/`DEFAULT_DOWNLOAD_URL` in `upload.py`/`download.py` — currently the `zkairdrop` hash `wyldgq6aqa`) and the website's `CLOUD_FUNCTION_URL` now resolve to the `proteus-photos` function (directly or via `api.screencap.sh`). Do not take down the legacy endpoint while a released client still depends on it.
+- **Take down the legacy function** (delete or set to deny-all / remove `--allow-unauthenticated`), so the `zkairdrop` flat buckets can no longer be listed or signed by an anonymous caller.
+- **Revoke public IAM** on the `zkairdrop` buckets (remove any `allUsers`/`allAuthenticatedUsers` Storage Object Viewer binding) so direct-URL access is closed too — they remain a private frozen backup, not deleted.
+- Sequence relative to the rest: this can run **early** (the exposure is live now and is independent of the proteus-photos isolation), as soon as client cutover is confirmed; it does not need to wait for U8/U9.
+
+**Execution note:** Verify client cutover before takedown; this is the one step whose premature execution could break a released client still pointed at `zkairdrop`.
+
+**Test scenarios:**
+- Verification: after takedown, an anonymous `list`/`sign-download` request to the legacy `zkairdrop` endpoint fails (404/again unreachable), not a 200 with data.
+- Verification: a direct GCS URL to a `zkairdrop` bucket object returns 403 (public IAM revoked), confirming the safety backup is private.
+- Verification: the active `proteus-photos` clients (CLI upload/download, website demo) are unaffected — they were already pointed at `proteus-photos`/`api.screencap.sh`.
+
+**Verification:** The legacy `zkairdrop` signing endpoint no longer serves recording data to anonymous callers and the `zkairdrop` buckets are private; active clients continue to work against `proteus-photos`; R7/R9 hold globally, not just on the active project.
+
+---
+
 ## System-Wide Impact
 
 - **Interaction graph:** Three client call sites converge on the signing function — explicit upload (`upload.py`), live-recording upload (`chunk_processor.py`), and download/remote-list (`download.py`). All three must attach the token and all must agree on the `users/{uid}/…` layout. The website is a fourth caller, restricted to the `demo/` path.
@@ -578,7 +629,7 @@ The central security invariant: a single `resolve_prefix(authenticated, uid, sou
 | "Private" `import-review/` staging is actually public (legacy bucket `allUsers` read binding) | U8 first pre-check verifies and removes any `allUsers`/`allAuthenticatedUsers` binding before staging; staging refuses to run otherwise. |
 | Long recording outlasts the ~1h ID token; engine holds no refresh token | Daemon re-mints a fresh ID token on a timer and re-pushes it out-of-band; mid-recording 401 routes to fail-closed (no delete), not an aborted recording. |
 | Shipped OAuth client secret / Firebase Web API key abused (impersonation, credential-stuffing, enumeration) | Native/public OAuth client (no embedded secret); Web API key application-restricted; unused Firebase auth methods disabled (U1 runbook). |
-| Later GCP project move (`zkairdrop`→`proteus-photos`) orphans user data if uids aren't preserved | uid is a load-bearing path segment; prefer project-move-*before* isolation. If isolation lands first, the migration plan must migrate the Identity Platform tenant + preserve uids (uid-preserving import) or re-path `users/{uid}/…`. Bucket keys + function code are otherwise project-agnostic. |
+| Legacy `zkairdrop` `get-upload-urls` function still `--allow-unauthenticated`, fronting the flat public `zkairdrop` safety buckets → real user data stays publicly listable/downloadable there even after `proteus-photos` is locked down | U10 decommissions the legacy function and revokes public IAM on the `zkairdrop` buckets, *after* verifying no active client still calls the `zkairdrop` `*.run.app` endpoint; R7/R9 are only globally satisfied once this lands. |
 | `firebase-admin` ↔ `google-cloud-storage` 3.x version conflict breaks upload checksums | Bump the pin in U1, re-test the upload-checksum path in U2; signing/listing APIs are unaffected by the 3.x bump. |
 | Owner segment / recording name path-injection escaping the user prefix | Strict regex on the uid (`owner_segment`) and existing `_RECORDING_RE`/`_FILENAME_RE` + `..` guard before interpolation; v4 signed URLs are single-object boundaries. |
 | Demo (unauthenticated) path accidentally reaching `users/` data | The central `resolve_prefix` raises if an unauthenticated request resolves outside `demo/`; demo actions are dispatched before any auth gate and hard-code the prefix; a per-action test asserts no unauthenticated action yields a non-`demo/` key. |
@@ -607,6 +658,9 @@ Sign-in works from the CLI; all client cloud paths carry the token and fail clos
 ### Phase 3 — Surfaces + staged cutover (U6; U8 → U7 → U9)
 App sign-in surface (U6). Stage the flat namespace privately and promote cleared recordings to `demo/` (U8, no deletes), repoint the website (U7), verify the gallery live, then decommission the flat namespace (U9). Deletes happen last so the sources are the rollback path until the cutover is proven; R11 is fully satisfied only at U9.
 
+### Independent — Close the legacy exposure (U10)
+**U10 can and should run early**, in parallel with Phase 1 — the legacy `zkairdrop` public function is exposing real user data *today*, and closing it is independent of the proteus-photos isolation work. Its only gate is confirming no released client still points at the `zkairdrop` endpoint. Until U10 lands, R7/R9 hold only on the active project.
+
 ---
 
 ## Documentation / Operational Notes
@@ -615,7 +669,7 @@ App sign-in surface (U6). Stage the flat namespace privately and promote cleared
 - The Cloud Function deploy header in `main.py` is updated (in U2): the function stays `--allow-unauthenticated` at the Cloud Run layer, but the auth gate is in code; `users/`+upload actions require a bearer token, `demo-*` do not. Prevents an operator from "tightening" away the demo path or assuming the whole function is public.
 - `SECURITY.md` gains a cloud-trust-boundary section alongside the existing daemon-socket one: where the refresh token lives (foreground/login Keychain context, **default "Always Allow" ACL — readable by any same-user trusted binary, NOT code-signing-pinned**), that the daemon receives only a short-lived ID token out-of-band, the in-code-gate-is-the-only-boundary posture, and the signed-URL expiry windows. Describe the actual ACL posture honestly rather than claiming pinning that does not exist.
 - `get-index` is removed from the function (U2); its CLI callers (`list_remote_sessions`/`fetch_session_index`, `screencap list --remote` sessions) and website callers (`listSessions`/`fetchSessionIndex`) are removed in U5/U7 so no shipped surface calls a dead endpoint after cutover.
-- Operational re-justification under the private-data model: shorten `users/` GET URL expiry. CORS needs no change for v1 — the website reads `demo/` server-side and the only authenticated callers are non-browser (app/CLI/daemon), so no browser preflight carries a bearer token; an `Authorization` allow-header is a future-web-dashboard concern only.
+- Operational re-justification under the private-data model: shorten `users/` GET URL expiry. CORS needs no change for v1 — the website reads `demo/` server-side and the only authenticated callers are non-browser (app/CLI/daemon), so no browser preflight carries a bearer token; an `Authorization` allow-header would only matter if an authenticated web surface is ever introduced (an unresolved product question, not assumed here).
 - Consider `/ce-compound` after this lands — per the learnings researcher there is no institutional knowledge yet on bucket layout, the auth model, the migration, or the new cloud/network trust boundary; future cloud work will have nothing to lean on.
 - New env/config knobs (with provisioned defaults): Firebase Web API key + OAuth client id (client), mirroring the existing `SCREENCAP_UPLOAD_URL` override convention.
 

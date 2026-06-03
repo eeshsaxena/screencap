@@ -131,7 +131,10 @@ def run_proxy(
         from mitmproxy import options as mp_options
         from mitmproxy.tools.dump import DumpMaster
 
-        from screencap.network.blocklist import build_ignore_hosts_regex
+        from screencap.network.blocklist import (
+            build_ignore_hosts_regex,
+            missing_required_auth_hosts,
+        )
         from screencap.network.capture_addon import NetworkCapture
     except Exception as exc:  # noqa: BLE001
         _emit_log(log_path, f"FATAL: import failure during run_proxy: {exc!r}")
@@ -145,6 +148,19 @@ def run_proxy(
     except Exception as exc:  # noqa: BLE001
         _emit_log(log_path, f"FATAL: ignore_hosts build failed: {exc!r}")
         _emit_log(log_path, traceback.format_exc())
+        return
+
+    # 4b. FAIL CLOSED on the auth/token hosts. build_ignore_hosts_regex always
+    # includes them, but if a regression ever dropped one, starting the proxy
+    # would TLS-intercept — and capture — the user's own OAuth/refresh/ID-token
+    # traffic. Refuse to start rather than tunnel auth traffic.
+    missing = missing_required_auth_hosts(ignore_hosts)
+    if missing:
+        _emit_log(
+            log_path,
+            f"FATAL: required auth hosts missing from ignore_hosts: {sorted(missing)}; "
+            f"refusing to start proxy (would risk capturing the user's own credentials)",
+        )
         return
 
     # 5. Construct mitmproxy Options. We do NOT set stream_large_bodies —

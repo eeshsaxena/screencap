@@ -1,2 +1,11 @@
 functions-framework==3.*
-google-cloud-storage>=2.14.0
+# firebase-admin 7.4.0 requires google-cloud-storage>=3.1.1 — this is a forced
+# major bump from the previous >=2.14.0 pin. The 3.x line is API-compatible for
+# generate_signed_url/list_blobs but changes checksum defaults (crc32c), enables
+# retries by default, and relocates resumable-media exceptions; the upload-
+# checksum path is re-tested in U2 and the migration's per-object crc32c verify
+# (U8) runs on this library.
+google-cloud-storage>=3.1.1
+# Offline Firebase ID-token verification (bearer -> uid). Uses ADC on Cloud Run;
+# check_revoked=False keeps verification on the hot path (no Admin-API call).
+firebase-admin>=7.4.0
