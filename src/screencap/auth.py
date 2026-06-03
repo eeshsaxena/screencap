@@ -27,6 +27,7 @@ from __future__ import annotations
 import base64
 import hashlib
 import json
+import logging
 import os
 import secrets
 import threading
@@ -34,9 +35,12 @@ import time
 from contextlib import contextmanager
 from dataclasses import dataclass
 from http.server import BaseHTTPRequestHandler, HTTPServer
+from typing import TypedDict
 from urllib.parse import parse_qs, urlencode, urlparse
 
 import requests
+
+logger = logging.getLogger(__name__)
 
 # --------------------------------------------------------------------------
 # Config (env-overridable; provisioned values from docs/runbooks/cloud-auth-setup.md)
@@ -108,6 +112,18 @@ class AuthState:
     expires_at: float  # epoch seconds
     uid: str
     email: str | None = None
+
+
+class WhoAmI(TypedDict, total=False):
+    """The shape ``whoami()`` returns and the CLI wraps in the
+    ``_AUTH_SCHEMA_VERSION`` envelope read by the SwiftUI shell. A versioned
+    cross-layer contract, so it is machine-checkable here (``total=False`` —
+    the signed-out case carries only ``signed_in``)."""
+
+    signed_in: bool
+    uid: str | None
+    email: str | None
+    stale: bool
 
 
 # In-memory cache of the current session. The ID token is NEVER persisted; only
@@ -214,9 +230,21 @@ def _decode_id_token_claims(id_token: str) -> dict:
 class _CallbackHandler(BaseHTTPRequestHandler):
     def do_GET(self):  # noqa: N802 (BaseHTTPRequestHandler API)
         params = parse_qs(urlparse(self.path).query)
-        self.server.callback_code = params.get("code", [None])[0]
+        code = params.get("code", [None])[0]
+        error = params.get("error", [None])[0]
+        # Only a real OAuth redirect carries `code` or `error`. A browser may hit
+        # 127.0.0.1:<port> first with a non-OAuth GET (favicon, connection
+        # pre-warm, a speculative prefetch); such a probe must NOT record a result
+        # or it would consume the wait and fail the genuine callback. Answer it
+        # with a 404 and record nothing — the server keeps waiting.
+        if code is None and error is None:
+            self.send_response(404)
+            self.end_headers()
+            return
+        self.server.callback_code = code
         self.server.callback_state = params.get("state", [None])[0]
-        self.server.callback_error = params.get("error", [None])[0]
+        self.server.callback_error = error
+        self.server.callback_received = True
         self.send_response(200)
         self.send_header("Content-Type", "text/html; charset=utf-8")
         self.end_headers()
@@ -270,14 +298,22 @@ def _login_via_browser(timeout: float, open_browser: bool) -> tuple[str, str, st
     # loopback/port CSRF protection — see the plan's implementation note).
     server = HTTPServer(("127.0.0.1", 0), _CallbackHandler)
     server.callback_code = server.callback_state = server.callback_error = None
+    server.callback_received = False
     try:
         port = server.server_address[1]
         redirect_uri = f"http://127.0.0.1:{port}"
         authorize_url = _authorize_url(redirect_uri, challenge, state)
         if open_browser:
             webbrowser.open(authorize_url)
-        server.timeout = timeout
-        server.handle_request()  # blocks until one callback or `timeout` elapses
+        # Service requests until one actually carries the OAuth callback (or the
+        # deadline passes). handle_request() honors server.timeout per call, so a
+        # non-OAuth probe (favicon/preconnect) that gets a 404 doesn't end the
+        # wait — we loop until callback_received or the overall deadline.
+        per_call_timeout = min(timeout, 5.0)
+        deadline = time.monotonic() + timeout
+        while not server.callback_received and time.monotonic() < deadline:
+            server.timeout = per_call_timeout
+            server.handle_request()  # returns on a request OR after per_call_timeout
         code = _validate_callback(
             server.callback_code, server.callback_state, server.callback_error, state
         )
@@ -367,8 +403,15 @@ def _refresh(refresh_token: str) -> AuthState:
         )
     except (requests.ConnectionError, requests.Timeout) as e:
         raise AuthError(f"Token refresh failed (network): {e}")
-    if resp.status_code != 200:
+    if resp.status_code in (400, 401):
+        # The refresh token itself is bad/expired/revoked -> the user must sign in
+        # again. Only these statuses mean "dead credential".
         raise NotSignedIn("Your session has expired. Run `screencap login` again.")
+    if resp.status_code != 200:
+        # 429 / 5xx are transient (rate limit, secure-token outage); the refresh
+        # token is still valid. Surface a retryable AuthError, NOT a forced
+        # re-login (matters for the U5 fail-closed live-upload state machine).
+        raise AuthError(f"Token refresh temporarily failed (HTTP {resp.status_code}).")
     d = resp.json()
     new_refresh = d.get("refresh_token", refresh_token)
     id_token = d["id_token"]
@@ -401,10 +444,24 @@ def _ensure_fresh() -> AuthState:
         now = time.time()
         if _cached and _cached.expires_at - now > _REFRESH_BUFFER_SECONDS:
             return _cached
-        refresh_token = (_cached.refresh_token if _cached else None) or _load_refresh_token()
+        # The Keychain is the rotation source of truth. A long-lived process can
+        # hold a STALE in-memory refresh token after another process rotated it;
+        # sending the stale one would get rejected and force a needless logout
+        # while a valid token sits in the Keychain. So reload and prefer it.
+        refresh_token = _load_refresh_token() or (_cached.refresh_token if _cached else None)
         if not refresh_token:
             raise NotSignedIn("Not signed in. Run `screencap login` to upload to the cloud.")
-        _cached = _refresh(refresh_token)
+        try:
+            _cached = _refresh(refresh_token)
+        except NotSignedIn:
+            # Another process may have rotated the token during our refresh.
+            # Reload once; retry only if it actually changed, before forcing a
+            # logout on what could be a freshly-rotated (valid) token.
+            latest = _load_refresh_token()
+            if latest and latest != refresh_token:
+                _cached = _refresh(latest)
+            else:
+                raise
         return _cached
 
 
@@ -456,11 +513,16 @@ def logout() -> bool:
     try:
         _delete_refresh_token()
     except Exception:
-        return False
+        # _delete_refresh_token already swallows "nothing stored"
+        # (PasswordDeleteError); reaching here means deletion FAILED for another
+        # reason (locked Keychain, backend error) and the credential may persist.
+        # Report had_token regardless — never claim "nothing was stored" when the
+        # token is still there.
+        logger.warning("Keychain refresh-token deletion failed; the credential may persist")
     return had_token
 
 
-def whoami() -> dict:
+def whoami() -> WhoAmI:
     """Report sign-in state without forcing a refresh failure to crash.
 
     Returns {"signed_in": False} when no credential is stored. When signed in,

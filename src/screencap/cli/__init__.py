@@ -1754,7 +1754,10 @@ def review_data_cmd(name, as_json):
 
 
 @cli.command("login")
-def login_cmd():
+@click.option("--json", "as_json", is_flag=True,
+              default=lambda: _should_default_to_json(),
+              help="Output as JSON. Auto-detected when stdout is not a TTY.")
+def login_cmd(as_json):
     """Sign in to your ScreenCap cloud account (opens your browser).
 
     Local recording, scrubbing, and playback never require sign-in — this is
@@ -1766,8 +1769,19 @@ def login_cmd():
     try:
         state = auth.login()
     except auth.AuthError as e:
-        console.print(f"[red]Sign-in failed:[/red] {e}")
+        if as_json:
+            click.echo(json.dumps(
+                {"ok": False, "schema_version": _AUTH_SCHEMA_VERSION, "error": str(e)}
+            ))
+        else:
+            console.print(f"[red]Sign-in failed:[/red] {e}")
         sys.exit(1)
+    if as_json:
+        click.echo(json.dumps({
+            "ok": True, "schema_version": _AUTH_SCHEMA_VERSION,
+            "signed_in": True, "uid": state.uid, "email": state.email,
+        }))
+        return
     console.print(f"[green]Signed in[/green] as [bold]{state.email or state.uid}[/bold].")
 
 
@@ -1790,7 +1804,18 @@ def whoami_cmd(as_json):
     """Show the signed-in cloud account (or 'not signed in')."""
     from screencap import auth
 
-    info = auth.whoami()
+    try:
+        info = auth.whoami()
+    except Exception as e:
+        # whoami() is built not to raise, but an envelope contract needs an
+        # ok:false path so an agent/CI consumer never has to parse a crash.
+        if as_json:
+            click.echo(json.dumps(
+                {"ok": False, "schema_version": _AUTH_SCHEMA_VERSION, "error": str(e)}
+            ))
+            sys.exit(1)
+        console.print(f"[red]Error checking sign-in state:[/red] {e}")
+        sys.exit(1)
     if as_json:
         envelope = {"ok": True, "schema_version": _AUTH_SCHEMA_VERSION, **info}
         click.echo(json.dumps(envelope))
