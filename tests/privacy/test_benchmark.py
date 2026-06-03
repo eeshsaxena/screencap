@@ -13,7 +13,7 @@ from pathlib import Path
 
 import pytest
 
-from screencap.privacy import Anonymizer, Detection, DetectionPipeline
+from screencap.privacy import Anonymizer, Detection, DetectionPipeline, DetectionResult
 from tests.privacy.fixtures.test_corpus import (
     FALSE_POSITIVE_CASES,
     TRUE_POSITIVE_CASES,
@@ -252,14 +252,41 @@ def _detection_matches_expected(
     return False
 
 
-def run_benchmark(pipeline: DetectionPipeline) -> AggregateResult:
-    """Run the full benchmark and return aggregate results."""
+def score_predictions(
+    true_positive_cases: list[CorpusCase],
+    false_positive_cases: list[CorpusCase],
+    predictions_by_case: dict[str, DetectionResult],
+    *,
+    anonymizer: Anonymizer | None = None,
+) -> AggregateResult:
+    """Grade pre-computed detections against gold cases.
+
+    This is the scoring core of :func:`run_benchmark`, decoupled from the model
+    that produced the detections. Any source of predicted spans — a live
+    ``DetectionPipeline``, a JSON file emitted by an out-of-process model runner,
+    etc. — can be scored identically by handing it ``predictions_by_case``.
+
+    ``predictions_by_case`` maps a ``CorpusCase.id`` to the ``DetectionResult``
+    (normalized text + detections) for that case. A case absent from the mapping
+    is treated as having produced no detections over its own (un-normalized) text,
+    so every gold entity in it becomes a false negative rather than crashing.
+
+    Behavior is identical to the original inline scoring in ``run_benchmark``:
+    span-overlap matching with exact/partial distinction and coverage ratios,
+    extra detections on TP cases counted as FPs, redaction-survival check, and
+    document-leak counting; FP cases contribute frequency-weighted FP impact.
+    """
     agg = AggregateResult()
-    anonymizer = Anonymizer()
+    anonymizer = anonymizer or Anonymizer()
+
+    def _result_for(tc: CorpusCase) -> DetectionResult:
+        return predictions_by_case.get(
+            tc.id, DetectionResult(normalized_text=tc.text, detections=[]),
+        )
 
     # --- True positive evaluation ---
-    for tc in TRUE_POSITIVE_CASES:
-        result = pipeline.detect(tc.text)
+    for tc in true_positive_cases:
+        result = _result_for(tc)
         normalized = result.normalized_text
         any_missed = False
 
@@ -304,8 +331,8 @@ def run_benchmark(pipeline: DetectionPipeline) -> AggregateResult:
         agg.document_total += 1
 
     # --- False positive evaluation ---
-    for tc in FALSE_POSITIVE_CASES:
-        result = pipeline.detect(tc.text)
+    for tc in false_positive_cases:
+        result = _result_for(tc)
         freq_weight = _FREQ_WEIGHT.get(tc.frequency, 1) if tc.frequency else 1
 
         for det in result.detections:
@@ -317,6 +344,22 @@ def run_benchmark(pipeline: DetectionPipeline) -> AggregateResult:
             agg.weighted_fp_impact += freq_weight
 
     return agg
+
+
+def run_benchmark(pipeline: DetectionPipeline) -> AggregateResult:
+    """Run the full benchmark and return aggregate results.
+
+    Thin wrapper: run ``pipeline`` over the corpus to produce detections, then
+    grade them via :func:`score_predictions`. Kept behavior-identical so existing
+    callers (``benchmark_pii.py``, the privacy test suite) see unchanged numbers.
+    """
+    predictions_by_case = {
+        tc.id: pipeline.detect(tc.text)
+        for tc in (*TRUE_POSITIVE_CASES, *FALSE_POSITIVE_CASES)
+    }
+    return score_predictions(
+        TRUE_POSITIVE_CASES, FALSE_POSITIVE_CASES, predictions_by_case,
+    )
 
 
 def print_benchmark_table(agg: AggregateResult) -> None:
