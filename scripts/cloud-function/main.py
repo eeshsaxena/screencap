@@ -34,20 +34,34 @@ Deploy (project: proteus-photos, region: southamerica-east1):
 
 from __future__ import annotations
 
+import logging
 import os
 import re
 from datetime import timedelta
 
+import firebase_admin
 import functions_framework
 import google.auth
 import google.auth.transport.requests
-from flask import jsonify, request
+from flask import jsonify
 from google.cloud import storage
+
+logger = logging.getLogger(__name__)
 
 BUCKET = os.environ.get("SCREENCAP_BUCKET", "screencap-recordings")
 UPLOAD_EXPIRY_MINUTES = 15
 DOWNLOAD_EXPIRY_HOURS = 4
 MAX_FILES = 500
+
+# Firebase project the signing function trusts. PINNED explicitly so the
+# function can never verify-but-misattribute a token from a foreign Firebase
+# project: verify_bearer (auth.py) re-asserts the decoded token's aud/iss
+# against this value, over and above the SDK's own check.
+PROJECT_ID = (
+    os.environ.get("SCREENCAP_PROJECT_ID")
+    or os.environ.get("GOOGLE_CLOUD_PROJECT")
+    or "proteus-photos"
+)
 
 # Only allow safe characters in recording and file names.
 # Slashes allowed in file names (for subdirectories like screenshots/0.png).
@@ -68,6 +82,14 @@ _storage_client = storage.Client()
 _bucket = _storage_client.bucket(BUCKET)
 _credentials, _project = google.auth.default()
 _auth_request = google.auth.transport.requests.Request()
+
+# Initialize the Firebase Admin app once at module scope (reused across warm
+# invocations, mirroring the storage-client pattern). The project is pinned so
+# token verification is bound to OUR Firebase tenant; logging it on init makes a
+# project misconfiguration loud rather than a silent verify-against-wrong-tenant.
+# Uses ADC on Cloud Run — no key file. Not yet wired into the handlers (U2).
+firebase_admin.initialize_app(options={"projectId": PROJECT_ID})
+logger.info("firebase_admin initialized for project %s", PROJECT_ID)
 
 
 def _cors(response, status=200):

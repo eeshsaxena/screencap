@@ -1,0 +1,165 @@
+---
+title: "Runbook: Firebase / Identity Platform provisioning for per-user cloud storage isolation"
+date: 2026-05-29
+type: runbook
+plan: docs/plans/2026-05-29-002-feat-per-user-cloud-storage-isolation-plan.md
+origin: docs/brainstorms/2026-05-29-per-user-cloud-storage-isolation-requirements.md
+status: not-started
+project: proteus-photos
+region_compute: southamerica-east1
+unit: U1
+---
+
+# Runbook: auth provider provisioning (U1)
+
+Operational source of truth for **provisioning the Firebase / Identity Platform
+tenant** that backs per-user cloud storage isolation. The repo has no IaC, so this
+file is the durable record of *what was provisioned, where, and which values the
+client (U4) and the signing function (U1/U2) consume*.
+
+Everything lives in **`proteus-photos`** — the single project that already holds the
+`screencap-recordings` bucket and the `get-upload-urls` signing function (see
+`docs/runbooks/gcp-migration-proteus-photos.md`). This is a single-project build; no
+cross-project sequencing.
+
+> **Captured values go in the "Live execution log" at the bottom.** The OAuth client
+> id and Firebase Web API key produced here are the inputs to U4's client config.
+
+---
+
+## Preconditions
+
+- [ ] `gcloud` authenticated as an owner/editor of `proteus-photos`
+      (`gcloud config set project proteus-photos`).
+- [ ] Billing is **enabled** on the project. Enabling Identity Platform requires the
+      **Blaze (pay-as-you-go)** plan. Auth is *not charged* at small scale (free to
+      ~50k MAU) — billing-enabled ≠ billed. Phone/SMS auth costs money and is **not
+      used**; leave it disabled.
+- [ ] The signing function's service account is known:
+      `screencap-signer@proteus-photos.iam.gserviceaccount.com`.
+
+---
+
+## Steps
+
+### 1. Enable Identity Platform + Firebase Authentication
+
+1. Console → **Identity Platform** → *Enable* (or `gcloud services enable
+   identitytoolkit.googleapis.com --project proteus-photos`).
+2. This upgrades the project's auth to Identity Platform while keeping the Firebase
+   Auth REST surface (`identitytoolkit.googleapis.com`, `securetoken.googleapis.com`)
+   the client uses.
+
+### 2. Configure the Google sign-in provider
+
+1. Identity Platform → **Providers** → *Add provider* → **Google** → enable.
+2. Google is the only v1 provider (the seam is provider-agnostic but only one provider
+   is wired). Do **not** enable Apple/email-password/phone here.
+
+### 3. Disable unused auth methods (credential-stuffing / enumeration surface)
+
+The Web API key ships in every client binary, so close the methods we don't use:
+
+- [ ] **Email/Password** — disabled.
+- [ ] **Phone** — disabled (also avoids SMS cost).
+- [ ] **Anonymous** — disabled.
+- [ ] Email enumeration protection — leave Identity Platform's default
+      ("protect against account enumeration") **on**.
+
+### 4. Create a Desktop/native (public) OAuth client
+
+The CLI uses system-browser loopback OAuth (RFC 8252) + PKCE — a **public** client with
+**no client secret**.
+
+1. Console → **APIs & Services → Credentials → Create credentials → OAuth client ID**.
+2. Application type: **Desktop app** (native/public client).
+3. Name it e.g. `screencap-cli-desktop`.
+4. **Capture the client id.** A Desktop client may show a "client secret" in the console,
+   but for a public native client per RFC 8252 we treat it as **non-secret and do NOT
+   embed it as a secret**: PKCE (`code_challenge`) is the protection, not the secret.
+   - [ ] **Confirm no `client_secret` is committed to source or shipped in a binary.**
+         Only the client id (and the Web API key) ship in the client.
+
+### 5. Capture the Firebase Web API key
+
+1. Console → **Project settings → General → Web API Key** (a.k.a. the
+   `apiKey` / "browser key").
+2. This key authorizes calls to `identitytoolkit.googleapis.com`
+   (`accounts:signInWithIdp`) and `securetoken.googleapis.com` (token refresh).
+   - [ ] **Capture the Web API key.**
+
+### 6. Restrict the Web API key
+
+The key ships in every binary, so scope it down:
+
+1. Console → **Credentials →** the Web API key → *Edit*.
+2. **API restrictions** → restrict to **Identity Toolkit API** and **Token Service API**
+   (`securetoken`) only — nothing else.
+3. **Application restrictions** — apply the tightest restriction the desktop flow tolerates
+   (referrer/app restriction where applicable). Record what was chosen.
+
+### 7. Confirm the signer can sign v4 URLs
+
+The signing function already self-binds `roles/iam.serviceAccountTokenCreator` (see the
+deploy header in `scripts/cloud-function/main.py`). Re-confirm it is present:
+
+```bash
+SIGNER=screencap-signer@proteus-photos.iam.gserviceaccount.com
+gcloud iam service-accounts get-iam-policy "$SIGNER" --project proteus-photos \
+  --format='table(bindings.role, bindings.members)' | grep serviceAccountTokenCreator || \
+  gcloud iam service-accounts add-iam-policy-binding "$SIGNER" \
+    --project proteus-photos --member "serviceAccount:$SIGNER" \
+    --role roles/iam.serviceAccountTokenCreator
+```
+
+No Admin-API credentials are needed for token verification — `check_revoked=False` is a
+pure JWT + public-cert check.
+
+### 8. Deploy the function with `firebase-admin`
+
+The function's `requirements.txt` now pins `firebase-admin>=7.4.0` and
+`google-cloud-storage>=3.1.1` (a forced major bump). Re-deploy per the header in
+`main.py`. On init the function logs `firebase_admin initialized for project
+proteus-photos` — grep the logs to confirm the pinned project is correct.
+
+```bash
+gcloud functions logs read get-upload-urls --project proteus-photos \
+  --region southamerica-east1 --limit 20 | grep "firebase_admin initialized"
+```
+
+---
+
+## Verification
+
+- [ ] `firebase_admin initialized for project proteus-photos` appears in the function logs.
+- [ ] A valid same-project ID token → `verify_bearer` returns a uid (proven by the U2
+      handler tests / a manual signed call once U2 lands).
+- [ ] A token minted for any other project → 401 (aud/iss mismatch).
+- [ ] The OAuth client is **Desktop/native**; no `client_secret` is in source or binaries.
+- [ ] The Web API key is restricted to Identity Toolkit + Token Service only.
+- [ ] Email/password, phone, and anonymous sign-in are disabled.
+
+---
+
+## Live execution log
+
+> Fill in as resources are actually provisioned. These values are the inputs to U4.
+
+| Item | Value | Notes |
+|------|-------|-------|
+| Identity Platform enabled | _pending_ | |
+| Google provider enabled | _pending_ | |
+| OAuth client id (desktop) | _pending_ | ships in client; not a secret |
+| Firebase Web API key | _pending_ | restricted to Identity Toolkit + Token Service |
+| Web API key restrictions | _pending_ | record application + API restrictions |
+| Disabled methods | _pending_ | email/pw, phone, anonymous |
+| `serviceAccountTokenCreator` confirmed | _pending_ | self-binding on the signer SA |
+
+---
+
+## Rollback
+
+Provisioning is additive and non-destructive to existing storage. To back out:
+disable the Google provider, delete the OAuth client, and revert the function to a
+`requirements.txt` without `firebase-admin` (the pre-U2 handlers ignore tokens). No
+recording data is touched by anything in this runbook.
