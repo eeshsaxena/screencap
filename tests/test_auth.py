@@ -426,3 +426,110 @@ def test_cli_whoami_json_error_envelope(monkeypatch):
     assert res.exit_code == 1
     p = json.loads(res.output)
     assert p["ok"] is False and "error" in p
+
+
+# --------------------------------------------------------------------------
+# U5: out-of-band engine token + force_refresh
+# --------------------------------------------------------------------------
+
+
+def test_engine_token_file_used_and_keyring_never_read(monkeypatch, tmp_path):
+    # In the engine context (env var set) the daemon-supplied file is the ONLY
+    # source — get_id_token must never touch keyring or _ensure_fresh.
+    token_file = tmp_path / "engine.jwt"
+    token_file.write_text("engine-id-token\n")
+    monkeypatch.setenv(a.ENGINE_TOKEN_FILE_ENV, str(token_file))
+
+    def explode(*_a, **_k):
+        raise AssertionError("engine context must not read keyring / refresh")
+
+    monkeypatch.setattr(a, "_ensure_fresh", explode)
+    monkeypatch.setattr(a, "_load_refresh_token", explode)
+    assert a.get_id_token() == "engine-id-token"
+
+
+def test_engine_token_missing_file_raises_not_signed_in_no_keyring_fallback(monkeypatch, tmp_path):
+    # env var set but the file is absent → fail closed (NotSignedIn), never fall
+    # back to the Keychain path (wrong ACL identity in the engine subprocess).
+    monkeypatch.setenv(a.ENGINE_TOKEN_FILE_ENV, str(tmp_path / "absent.jwt"))
+    monkeypatch.setattr(a, "_ensure_fresh", lambda *a, **k: (_ for _ in ()).throw(AssertionError("no fallback")))
+    with pytest.raises(a.NotSignedIn):
+        a.get_id_token()
+
+
+def test_engine_token_empty_file_raises_not_signed_in(monkeypatch, tmp_path):
+    token_file = tmp_path / "engine.jwt"
+    token_file.write_text("   \n")
+    monkeypatch.setenv(a.ENGINE_TOKEN_FILE_ENV, str(token_file))
+    with pytest.raises(a.NotSignedIn):
+        a.get_id_token()
+
+
+def test_engine_token_read_fresh_each_call_picks_up_remint(monkeypatch, tmp_path):
+    # The daemon re-mints + rewrites the file on a timer; the engine must read it
+    # fresh so a long recording picks up the new token without a restart.
+    token_file = tmp_path / "engine.jwt"
+    token_file.write_text("token-A")
+    monkeypatch.setenv(a.ENGINE_TOKEN_FILE_ENV, str(token_file))
+    assert a.get_id_token() == "token-A"
+    token_file.write_text("token-B")  # daemon re-mint
+    assert a.get_id_token() == "token-B"
+
+
+def test_force_refresh_remints_even_when_cached_is_fresh(fake_keyring, monkeypatch):
+    # The cloud paths' 401-retry forces a re-mint even though the cached ID token
+    # still looks fresh (server rejected it: skew / rotation / revocation).
+    fake_keyring[_KEY] = "rt"
+    a._cached = a.AuthState(id_token="stale-but-unexpired", refresh_token="rt", expires_at=time.time() + 3600, uid="u")
+    calls = []
+
+    def fake_refresh(rt):
+        calls.append(rt)
+        return a.AuthState(id_token="reminted", refresh_token=rt, expires_at=time.time() + 3600, uid="u")
+
+    monkeypatch.setattr(a, "_refresh", fake_refresh)
+    assert a.get_id_token() == "stale-but-unexpired"  # default: cache honored
+    assert calls == []
+    assert a.get_id_token(force_refresh=True) == "reminted"  # forced re-mint
+    assert calls == ["rt"]
+
+
+def test_authed_post_attaches_bearer_and_returns_response(monkeypatch):
+    monkeypatch.setattr(a, "get_id_token", lambda force_refresh=False: "tok")
+    seen = {}
+
+    def post(url, json=None, headers=None, timeout=None):
+        seen["url"], seen["headers"], seen["timeout"] = url, headers, timeout
+        return _FakeResp(200, {"ok": True})
+
+    resp = a.authed_post(post, "https://fn", json={"a": 1}, timeout=30)
+    assert resp.status_code == 200
+    assert seen["headers"]["Authorization"] == "Bearer tok"
+    assert seen["url"] == "https://fn" and seen["timeout"] == 30
+
+
+def test_authed_post_refreshes_and_retries_once_on_401(monkeypatch):
+    forces = []
+    monkeypatch.setattr(a, "get_id_token", lambda force_refresh=False: forces.append(force_refresh) or ("fresh" if force_refresh else "stale"))
+    responses = [_FakeResp(401, {}), _FakeResp(200, {"ok": True})]
+    headers_seen = []
+
+    def post(url, json=None, headers=None, timeout=None):
+        headers_seen.append(headers["Authorization"])
+        return responses.pop(0)
+
+    resp = a.authed_post(post, "https://fn")
+    assert resp.status_code == 200
+    assert forces == [False, True]  # second attempt forced a refresh
+    assert headers_seen == ["Bearer stale", "Bearer fresh"]
+
+
+def test_authed_post_propagates_not_signed_in_before_any_post(monkeypatch):
+    def not_signed_in(force_refresh=False):
+        raise a.NotSignedIn("no creds")
+
+    monkeypatch.setattr(a, "get_id_token", not_signed_in)
+    called = []
+    with pytest.raises(a.NotSignedIn):
+        a.authed_post(lambda *x, **k: called.append(1), "https://fn")
+    assert called == []  # never posts without a token

@@ -737,3 +737,372 @@ async def test_shutdown_cancels_exit_poll_before_subscribe_no_double_release(
     # `_exit_poll` iteration racing with shutdown's late subscribe.
     # Without F4's cancellation a third call appears.
     assert release_calls <= 2, f"release_lock called {release_calls} times; expected <= 2"
+
+
+# ---------------------------------------------------------------------------
+# U5: out-of-band engine ID-token seam
+# ---------------------------------------------------------------------------
+
+
+def _cloud_engine_script(tmp_path: Path) -> Path:
+    """A fake engine that reports what it received via the out-of-band token
+    channel: the token it read from SCREENCAP_ENGINE_TOKEN_FILE, whether the env
+    var was set, and whether the token string leaked into its argv."""
+    script = tmp_path / "cloud_engine.py"
+    script.write_text(
+        textwrap.dedent(
+            '''
+            import json, os, signal, sys, time
+
+            def emit(t, **p):
+                sys.stderr.write(json.dumps({"type": t, "schema_version": 1, "ts": time.time(), **p}) + "\\n")
+                sys.stderr.flush()
+
+            def handle_term(_s, _f):
+                emit("recording_finalized", name="cloud", duration_seconds=0.1, force_stopped=False, disk_full=False)
+                raise SystemExit(0)
+
+            signal.signal(signal.SIGTERM, handle_term)
+            token_file = os.environ.get("SCREENCAP_ENGINE_TOKEN_FILE")
+            token_seen = ""
+            if token_file:
+                try:
+                    token_seen = open(token_file).read().strip()
+                except OSError:
+                    token_seen = ""
+            argv_has_token = bool(token_seen) and any(token_seen in a for a in sys.argv)
+            emit("started", claimant="daemon", token_env_set=bool(token_file),
+                 token_seen=token_seen, argv_has_token=argv_has_token)
+            while True:
+                time.sleep(0.05)
+            '''
+        ),
+        encoding="utf-8",
+    )
+    return script
+
+
+@pytest.mark.asyncio
+async def test_cloud_engine_receives_token_out_of_band_not_in_argv(
+    tmp_path: Path, isolated_lock, allow_tmp_output_dir, monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    from screencap.daemon.supervisor import Supervisor
+
+    monkeypatch.setattr("screencap.auth.get_id_token", lambda force_refresh=False: "secret-id-token")
+
+    bus = EventBus()
+    supervisor = Supervisor(
+        bus,
+        engine_command_factory=_factory(_cloud_engine_script(tmp_path)),
+        reconcile_on_init=False, poll_interval=0.05, startup_timeout=2.0, stop_timeout=2.0,
+    )
+    sub = await bus.subscribe()
+    await supervisor.spawn(
+        schema.RecordingStartRequest(
+            name="cloud", output_dir=str(tmp_path / "cloud"), cloud_intent=True,
+        )
+    )
+
+    started = await asyncio.wait_for(sub.queue.get(), timeout=2.0)
+    assert started["type"] == _stderr_events.EVENT_STARTED
+    # The engine got the token via the out-of-band file (env-delivered path)...
+    assert started["token_env_set"] is True
+    assert started["token_seen"] == "secret-id-token"
+    # ...and the token NEVER appeared on its command line (ps-visibility guard).
+    assert started["argv_has_token"] is False
+
+    # The staged file is mode 0600 and holds exactly the token.
+    token_path = supervisor._engine_token_file
+    assert token_path is not None and token_path.exists()
+    assert (token_path.stat().st_mode & 0o777) == 0o600
+    assert token_path.read_text().strip() == "secret-id-token"
+
+    await supervisor.stop(force=False)
+    await _wait_until(lambda: not isolated_lock.lock_is_active())
+    # Torn down on engine exit.
+    assert supervisor._engine_token_file is None
+    assert not token_path.exists()
+    await supervisor.shutdown()
+
+
+@pytest.mark.asyncio
+async def test_cloud_engine_not_signed_in_fails_closed_no_token(
+    tmp_path: Path, isolated_lock, allow_tmp_output_dir, monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    from screencap import auth
+    from screencap.daemon.supervisor import Supervisor
+
+    def not_signed_in(force_refresh=False):
+        raise auth.NotSignedIn("no creds")
+
+    monkeypatch.setattr("screencap.auth.get_id_token", not_signed_in)
+
+    bus = EventBus()
+    supervisor = Supervisor(
+        bus,
+        engine_command_factory=_factory(_cloud_engine_script(tmp_path)),
+        reconcile_on_init=False, poll_interval=0.05, startup_timeout=2.0, stop_timeout=2.0,
+    )
+    sub = await bus.subscribe()
+    await supervisor.spawn(
+        schema.RecordingStartRequest(
+            name="nc", output_dir=str(tmp_path / "nc"), cloud_intent=True,
+        )
+    )
+
+    started = await asyncio.wait_for(sub.queue.get(), timeout=2.0)
+    # Fail-closed, not fail-stop: the recording still starts (stays local); the
+    # engine just gets no token, so live upload fails closed (no deletion).
+    assert started["type"] == _stderr_events.EVENT_STARTED
+    assert started["token_env_set"] is False
+    assert supervisor._engine_token_file is None
+
+    await supervisor.stop(force=False)
+    await _wait_until(lambda: not isolated_lock.lock_is_active())
+    await supervisor.shutdown()
+
+
+@pytest.mark.asyncio
+async def test_local_recording_stages_no_token_even_when_signed_in(
+    tmp_path: Path, isolated_lock, allow_tmp_output_dir, monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    from screencap.daemon.supervisor import Supervisor
+
+    monkeypatch.setattr("screencap.auth.get_id_token", lambda force_refresh=False: "tok")
+
+    bus = EventBus()
+    supervisor = Supervisor(
+        bus,
+        engine_command_factory=_factory(_cloud_engine_script(tmp_path)),
+        reconcile_on_init=False, poll_interval=0.05, startup_timeout=2.0, stop_timeout=2.0,
+    )
+    sub = await bus.subscribe()
+    await supervisor.spawn(
+        schema.RecordingStartRequest(name="local", output_dir=str(tmp_path / "local"))
+    )
+
+    started = await asyncio.wait_for(sub.queue.get(), timeout=2.0)
+    assert started["token_env_set"] is False  # cloud_intent defaults False → no token
+    assert supervisor._engine_token_file is None
+
+    await supervisor.stop(force=False)
+    await _wait_until(lambda: not isolated_lock.lock_is_active())
+    await supervisor.shutdown()
+
+
+def test_write_engine_token_file_is_0600(tmp_path: Path) -> None:
+    from screencap.daemon.supervisor import Supervisor
+
+    p = tmp_path / "engine-token.jwt"
+    Supervisor._write_engine_token_file(p, "abc.def.ghi")
+    assert p.read_text() == "abc.def.ghi"
+    assert (p.stat().st_mode & 0o777) == 0o600
+    # Overwrites in place, mode re-asserted.
+    Supervisor._write_engine_token_file(p, "new")
+    assert p.read_text() == "new"
+    assert (p.stat().st_mode & 0o777) == 0o600
+
+
+def test_token_has_no_field_in_argv_encoded_worker_args(tmp_path: Path) -> None:
+    # Structural guard: the worker args (base64'd into argv) carry no token field,
+    # so a token can never leak into ps/argv via the start handoff.
+    from screencap.daemon.supervisor import build_engine_worker_args
+
+    req = schema.RecordingStartRequest(
+        name="x", output_dir=str(tmp_path), cloud_intent=True,
+    )
+    args = build_engine_worker_args(req, name="x", capture_dir=tmp_path)
+    assert not any("token" in key.lower() for key in args), (
+        f"worker args must carry no token-bearing field; keys: {list(args)}"
+    )
+
+
+@pytest.fixture
+def isolated_base_dir(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> Path:
+    """Point ``config.get_base_dir()`` at a per-test tmp dir.
+
+    The engine-token-file helpers resolve their run dir via ``get_base_dir() / run``
+    (``Path.home() / .screencap`` in production). Redirect it so token-file tests
+    never touch the developer's real ``~/.screencap/run``.
+    """
+    import screencap.config as cfg
+
+    base = tmp_path / "base" / ".screencap"
+    monkeypatch.setattr(cfg, "_DEFAULT_BASE", base)
+    return base
+
+
+@pytest.mark.asyncio
+async def test_reconcile_prunes_stale_engine_token_file(
+    isolated_lock, isolated_base_dir: Path,
+) -> None:
+    """A hard crash / SIGKILL runs no Python teardown, so an ``engine-token-*.jwt``
+    0600 file can survive in the run dir. The reconcile path at daemon startup must
+    unlink any survivor — no live recording can own one at startup."""
+    from screencap.daemon.supervisor import Supervisor
+
+    run_dir = isolated_base_dir / "run"
+    run_dir.mkdir(parents=True, exist_ok=True)
+    stale = run_dir / "engine-token-x.jwt"
+    stale.write_text("leaked.id.token", encoding="utf-8")
+
+    # A dead daemon-claimant engine drives the standard recovery reconcile path.
+    _write_lock(
+        isolated_lock.LOCK_FILE,
+        {
+            "claimant": "daemon",
+            "pid": 999999,
+            "engine_pid": 999999,
+            "started_at": 1778198400.0,
+            "recording_started_at": 1778198401.0,
+            "recording_name": "dead",
+        },
+    )
+    supervisor = Supervisor(EventBus(), reconcile_on_init=True, reconcile_grace=0.1)
+    await _wait_until(lambda: not supervisor.is_recovering(), timeout=3.0)
+
+    assert not stale.exists(), "stale engine token file should be pruned at startup"
+    await supervisor.shutdown()
+
+
+# ---------------------------------------------------------------------------
+# U5: token re-mint timer loop (_token_refresh_loop)
+# ---------------------------------------------------------------------------
+
+
+class _FakeAliveProc:
+    """Minimal stand-in for _PopenEngineProcess: alive until flipped."""
+
+    def __init__(self) -> None:
+        self._alive = True
+        self.pid = 4242
+
+    def is_alive(self) -> bool:
+        return self._alive
+
+
+async def _run_loop_briefly(supervisor, proc) -> asyncio.Task:
+    """Start _token_refresh_loop as a task. Caller asserts then cancels/joins."""
+    task = asyncio.create_task(supervisor._token_refresh_loop(proc))
+    return task
+
+
+async def _stop_loop(proc: "_FakeAliveProc", task: asyncio.Task) -> None:
+    """Tear down a running _token_refresh_loop task.
+
+    Flipping the proc dead lets the loop's ``while`` guard return on its next
+    iteration; the cancel covers the case where it is mid-``asyncio.sleep``. Either
+    a normal return or a CancelledError is an acceptable, non-erroring exit."""
+    proc._alive = False
+    task.cancel()
+    try:
+        await task
+    except asyncio.CancelledError:
+        pass
+
+
+@pytest.mark.asyncio
+async def test_token_refresh_loop_rewrites_file_in_place_without_restart(
+    isolated_base_dir: Path, monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """A successful re-mint rewrites the token file in place — same path, new
+    contents — and never touches the engine process (no restart)."""
+    from screencap.daemon.supervisor import Supervisor
+
+    monkeypatch.setenv("SCREENCAP_DAEMON_TOKEN_REFRESH_INTERVAL", "0.01")
+    tokens = iter(["second-token", "second-token", "third-token"])
+    monkeypatch.setattr(
+        "screencap.auth.get_id_token", lambda force_refresh=False: next(tokens)
+    )
+
+    path = isolated_base_dir / "run" / "engine-token-live.jwt"
+    path.parent.mkdir(parents=True, exist_ok=True)
+    Supervisor._write_engine_token_file(path, "first-token")
+
+    supervisor = Supervisor(EventBus(), reconcile_on_init=False)
+    proc = _FakeAliveProc()
+    supervisor._proc = proc
+    supervisor._engine_token_file = path
+
+    task = await _run_loop_briefly(supervisor, proc)
+    try:
+        await _wait_until(
+            lambda: path.read_text() == "second-token", timeout=2.0
+        )
+        # Same file path (rewritten in place), and the engine proc is untouched.
+        assert supervisor._proc is proc
+        assert proc.is_alive() is True
+    finally:
+        await _stop_loop(proc, task)
+
+
+@pytest.mark.asyncio
+async def test_token_refresh_loop_autherror_leaves_file_unchanged_no_crash(
+    isolated_base_dir: Path, monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """A transient AuthError mid-loop is logged and the loop continues — the
+    recording proceeds and the token file is left unchanged."""
+    from screencap import auth
+    from screencap.daemon.supervisor import Supervisor
+
+    monkeypatch.setenv("SCREENCAP_DAEMON_TOKEN_REFRESH_INTERVAL", "0.01")
+
+    def boom(force_refresh=False):
+        raise auth.AuthError("token service hiccup")
+
+    monkeypatch.setattr("screencap.auth.get_id_token", boom)
+
+    path = isolated_base_dir / "run" / "engine-token-live.jwt"
+    path.parent.mkdir(parents=True, exist_ok=True)
+    Supervisor._write_engine_token_file(path, "stable-token")
+
+    supervisor = Supervisor(EventBus(), reconcile_on_init=False)
+    proc = _FakeAliveProc()
+    supervisor._proc = proc
+    supervisor._engine_token_file = path
+
+    task = await _run_loop_briefly(supervisor, proc)
+    try:
+        # Let the loop spin a few intervals; it must not crash or rewrite.
+        await asyncio.sleep(0.1)
+        assert not task.done(), "loop must keep running after AuthError"
+        assert path.read_text() == "stable-token"
+    finally:
+        await _stop_loop(proc, task)
+
+
+@pytest.mark.asyncio
+async def test_token_refresh_loop_write_oserror_does_not_crash_loop(
+    isolated_base_dir: Path, monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """An OSError from the in-place rewrite is logged and the loop continues —
+    the engine just keeps the prior token and fails closed on the next 401."""
+    from screencap.daemon import supervisor as sv
+    from screencap.daemon.supervisor import Supervisor
+
+    monkeypatch.setenv("SCREENCAP_DAEMON_TOKEN_REFRESH_INTERVAL", "0.01")
+    monkeypatch.setattr(
+        "screencap.auth.get_id_token", lambda force_refresh=False: "fresh-token"
+    )
+
+    path = isolated_base_dir / "run" / "engine-token-live.jwt"
+    path.parent.mkdir(parents=True, exist_ok=True)
+    Supervisor._write_engine_token_file(path, "prior-token")
+
+    def write_boom(_path, _token):
+        raise OSError("disk full")
+
+    monkeypatch.setattr(sv.Supervisor, "_write_engine_token_file", staticmethod(write_boom))
+
+    supervisor = Supervisor(EventBus(), reconcile_on_init=False)
+    proc = _FakeAliveProc()
+    supervisor._proc = proc
+    supervisor._engine_token_file = path
+
+    task = await _run_loop_briefly(supervisor, proc)
+    try:
+        await asyncio.sleep(0.1)
+        assert not task.done(), "loop must keep running after a write OSError"
+        assert path.read_text() == "prior-token"  # untouched
+    finally:
+        await _stop_loop(proc, task)

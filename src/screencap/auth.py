@@ -32,9 +32,11 @@ import os
 import secrets
 import threading
 import time
+from collections.abc import Callable
 from contextlib import contextmanager
 from dataclasses import dataclass
 from http.server import BaseHTTPRequestHandler, HTTPServer
+from pathlib import Path
 from typing import TypedDict
 from urllib.parse import parse_qs, urlencode, urlparse
 
@@ -63,6 +65,18 @@ SECURE_TOKEN_URL = "https://securetoken.googleapis.com/v1/token"
 # network KEK).
 KEYCHAIN_SERVICE = "screencap-auth"
 KEYCHAIN_ACCOUNT = "default"
+
+# Out-of-band engine token channel. The live-upload ``ChunkProcessor`` runs inside
+# the daemon-spawned engine subprocess, whose Keychain ACL identity differs from the
+# interactive ``login`` binary — so the engine must NOT read keyring. Instead the
+# daemon reads the ID token in its own ACL context and writes a short-lived token to
+# a 0600 file, passing the file *path* (not the secret) to the engine via this env
+# var. The token in the file is same-EUID-protected, consistent with the daemon
+# socket trust boundary (see SECURITY.md). The daemon re-mints + rewrites the file on
+# a timer for recordings that outlast the ~1h ID token, so the engine reads it fresh
+# on every cloud call. Never delivered via ``_worker_args``/argv (base64'd into the
+# command line, ``ps``-visible).
+ENGINE_TOKEN_FILE_ENV = "SCREENCAP_ENGINE_TOKEN_FILE"
 
 # Refresh the ID token when it is within this window of expiry, so a call never
 # races the ~1h boundary.
@@ -156,6 +170,27 @@ def _delete_refresh_token() -> None:
         keyring.delete_password(KEYCHAIN_SERVICE, KEYCHAIN_ACCOUNT)
     except keyring.errors.PasswordDeleteError:
         pass  # nothing stored — already signed out
+
+
+def _read_engine_token() -> str | None:
+    """Return the daemon-supplied engine ID token, or ``None`` if not in the engine.
+
+    Reads the 0600 token file pointed at by :data:`ENGINE_TOKEN_FILE_ENV`. Returns
+    ``None`` when the env var is unset (the normal interactive/login context, which
+    falls through to the Keychain path). Returns ``None`` when the env var IS set but
+    the file is missing/unreadable/empty — the caller treats that as "no token" and
+    fails closed, so a vanished daemon token never silently advances the live-upload
+    deletion gates. Reads fresh on every call so a daemon re-mint is picked up
+    transparently.
+    """
+    path = os.environ.get(ENGINE_TOKEN_FILE_ENV)
+    if not path:
+        return None
+    try:
+        token = Path(path).read_text().strip()
+    except OSError:
+        return None
+    return token or None
 
 
 def _lock_path():
@@ -428,21 +463,25 @@ def _refresh(refresh_token: str) -> AuthState:
     return state
 
 
-def _ensure_fresh() -> AuthState:
+def _ensure_fresh(force: bool = False) -> AuthState:
     """Return a valid AuthState, refreshing if the cached ID token is near expiry.
+
+    ``force=True`` re-mints from the stored refresh token even when the cached ID
+    token is still fresh — used by the cloud paths' 401-retry, where the server
+    rejected a token we still believe is valid (clock skew, rotation, revocation).
 
     Raises NotSignedIn if there is no stored refresh token.
     """
     global _cached
     now = time.time()
-    if _cached and _cached.expires_at - now > _REFRESH_BUFFER_SECONDS:
+    if not force and _cached and _cached.expires_at - now > _REFRESH_BUFFER_SECONDS:
         return _cached
 
     with _refresh_lock():
         # Re-check inside the lock: another thread/process may have just
         # refreshed (and rotated) while we waited.
         now = time.time()
-        if _cached and _cached.expires_at - now > _REFRESH_BUFFER_SECONDS:
+        if not force and _cached and _cached.expires_at - now > _REFRESH_BUFFER_SECONDS:
             return _cached
         # The Keychain is the rotation source of truth. A long-lived process can
         # hold a STALE in-memory refresh token after another process rotated it;
@@ -470,14 +509,65 @@ def _ensure_fresh() -> AuthState:
 # --------------------------------------------------------------------------
 
 
-def get_id_token() -> str:
+def get_id_token(force_refresh: bool = False) -> str:
     """Return a valid Firebase ID token, refreshing transparently if needed.
 
-    Raises NotSignedIn if there is no stored credential, or AuthError on a
-    transient refresh failure (network). Callers attach the result as
-    ``Authorization: Bearer <token>``.
+    The single token entry point for every cloud call. In the daemon-spawned engine
+    subprocess (``ENGINE_TOKEN_FILE_ENV`` set) it returns ONLY the daemon-supplied
+    out-of-band token — never reading keyring (wrong ACL identity), never falling back
+    to the Keychain path — and raises NotSignedIn if the daemon supplied none, so the
+    live-upload path fails closed. In the interactive/login context it reads the
+    Keychain refresh token. ``force_refresh=True`` re-mints from the refresh token even
+    when the cached ID token still looks fresh (used by the cloud paths' 401-retry); it
+    has NO effect in the engine context (only the daemon can re-mint — the engine just
+    re-reads the file, picking up a daemon re-mint if one has landed).
+
+    Raises NotSignedIn if there is no usable credential, or AuthError on a transient
+    refresh failure (network). Callers attach the result as ``Authorization: Bearer``.
     """
-    return _ensure_fresh().id_token
+    if os.environ.get(ENGINE_TOKEN_FILE_ENV):
+        # Engine context: the daemon-supplied file is the ONLY valid source. A
+        # missing/empty file → NotSignedIn → the live-upload chunk fails closed
+        # (ChunkStatus.FAILED), never advancing the sentinel/stub/delete gates.
+        token = _read_engine_token()
+        if not token:
+            raise NotSignedIn(
+                "No engine auth token available (the daemon supplied none)."
+            )
+        return token
+    return _ensure_fresh(force=force_refresh).id_token
+
+
+def authed_post(
+    post: Callable[..., requests.Response],
+    url: str,
+    *,
+    json: object = None,
+    timeout: float = 30,
+) -> requests.Response:
+    """POST ``url`` with an ``Authorization: Bearer`` header, retrying once on 401.
+
+    ``post`` is the CALLER's own ``requests.post`` reference (e.g.
+    ``screencap.upload.requests.post``) — passing it in keeps the network call
+    in the caller's module so existing test mocks on that attribute keep working,
+    while the bearer/refresh/retry policy lives in one place for every cloud path.
+
+    On a 401 (the server rejecting a token we still believe is valid: clock skew,
+    rotation, revocation) it forces a token refresh via :func:`get_id_token` and
+    retries the single call once. Propagates :class:`NotSignedIn` (callers map it
+    to a "run ``screencap login``" message) and any exception ``post`` raises
+    (``ConnectionError`` / ``Timeout``). Returns the final response.
+    """
+    token = get_id_token()
+    resp = post(url, json=json, headers={"Authorization": f"Bearer {token}"}, timeout=timeout)
+    if resp.status_code == 401:
+        # Token rejected (clock skew / rotation / revocation) — force a refresh and
+        # retry the single call once. In the engine context get_id_token re-reads
+        # the daemon-supplied file (force_refresh is a no-op there); a still-stale
+        # file yields another 401 the caller fails closed on.
+        token = get_id_token(force_refresh=True)
+        resp = post(url, json=json, headers={"Authorization": f"Bearer {token}"}, timeout=timeout)
+    return resp
 
 
 def login(open_browser: bool = True, timeout: float = LOGIN_TIMEOUT_SECONDS) -> AuthState:

@@ -98,14 +98,19 @@ class _PopenEngineProcess:
     interface so ``Supervisor`` is testable against a protocol rather than directly
     against ``subprocess.Popen``."""
 
-    def __init__(self, argv: list[str]) -> None:
+    def __init__(self, argv: list[str], *, extra_env: dict[str, str] | None = None) -> None:
         self._popen = subprocess.Popen(
             argv,
             stdin=subprocess.DEVNULL,
             stdout=subprocess.DEVNULL,
             stderr=subprocess.PIPE,
             bufsize=0,
-            env={**os.environ, "PYTHONUNBUFFERED": "1"},
+            # extra_env carries the out-of-band engine ID-token *file path* (never
+            # the token itself, never argv) for cloud recordings — see
+            # Supervisor._stage_engine_token. It is set ONLY on the engine
+            # subprocess, never on the daemon's own os.environ, so the daemon's
+            # auth.get_id_token() keeps reading the Keychain.
+            env={**os.environ, "PYTHONUNBUFFERED": "1", **(extra_env or {})},
         )
         # Widen the kernel stderr pipe as close to the Popen as possible so
         # the engine never gets a chance to write into a default-sized pipe.
@@ -229,6 +234,11 @@ class Supervisor:
         self._stderr_task: asyncio.Task[None] | None = None
         self._poll_task: asyncio.Task[None] | None = None
         self._reconcile_task: asyncio.Task[None] | None = None
+        # Out-of-band engine ID-token seam (cloud recordings only). The file holds
+        # the short-lived token; the refresh task re-mints it for recordings that
+        # outlast the ~1h token. Both are torn down in _reset_state.
+        self._engine_token_file: Path | None = None
+        self._token_refresh_task: asyncio.Task[None] | None = None
         self._recovering = False
         self._finalized_seen = False
         self._stopping = False
@@ -302,8 +312,9 @@ class Supervisor:
             start_cursor = self._bus.current_cursor()
             started_sub = await self._bus.subscribe()
             try:
+                extra_env = await self._stage_engine_token(request, capture_dir)
                 command = self._engine_command_factory(encoded_args)
-                proc = _PopenEngineProcess(command)
+                proc = _PopenEngineProcess(command, extra_env=extra_env)
                 self._proc = proc
                 self._engine_pid = proc.pid
                 self._finalized_seen = False
@@ -320,6 +331,12 @@ class Supervisor:
                 pidfile.update_lock_metadata(capture_dir, engine_pid=proc.pid)
                 self._stderr_task = asyncio.create_task(self._stderr_pump(proc))
                 self._poll_task = asyncio.create_task(self._exit_poll(proc))
+                if extra_env is not None:
+                    # Long-recording re-mint: rewrite the token file before the
+                    # ~1h ID token expires. Self-terminates when the engine exits.
+                    self._token_refresh_task = asyncio.create_task(
+                        self._token_refresh_loop(proc)
+                    )
                 await self._wait_on_subscription(
                     started_sub,
                     _stderr_events.EVENT_STARTED,
@@ -328,7 +345,7 @@ class Supervisor:
             except Exception:
                 # Cancel the background pump/poll tasks before tearing down so
                 # they don't race the lock release with a late `_handle_engine_exit`.
-                for _t in (self._stderr_task, self._poll_task):
+                for _t in (self._stderr_task, self._poll_task, self._token_refresh_task):
                     if _t is not None and not _t.done():
                         _t.cancel()
                 try:
@@ -535,7 +552,37 @@ class Supervisor:
                 )
             self._clear_stale_lock_if_unheld()
         finally:
+            self._prune_stale_engine_token_files()
             self._recovering = False
+
+    @staticmethod
+    def _prune_stale_engine_token_files() -> None:
+        """Delete any leftover ``engine-token-*`` files at daemon startup.
+
+        On a clean stop ``_cleanup_engine_token_file`` removes the live token, but
+        a hard crash / SIGKILL runs no Python teardown, so a 0600 file holding a
+        short-lived ID token can survive in the run dir until expiry. At daemon
+        startup no live recording can legitimately own one (the engine that read it
+        is gone), so unlink every survivor. The glob covers both the canonical
+        ``.jwt`` and a ``.jwt.tmp`` residue from a crash between write and rename
+        (which also holds a live token). Best-effort: a failure is logged and never
+        blocks reconciliation, mirroring ``_cleanup_engine_token_file``.
+        """
+        from screencap.config import get_base_dir
+
+        run_dir = get_base_dir() / "run"
+        try:
+            stale = list(run_dir.glob("engine-token-*"))
+        except OSError as exc:
+            logger.warning("daemon: could not scan for stale engine token files: %s", exc)
+            return
+        for path in stale:
+            try:
+                path.unlink(missing_ok=True)
+            except OSError as exc:
+                logger.warning(
+                    "daemon: could not remove stale engine token file %s: %s", path, exc
+                )
 
     async def _stderr_pump(self, proc: _PopenEngineProcess) -> None:
         stderr = proc.stderr
@@ -894,12 +941,135 @@ class Supervisor:
             await task
         self._poll_task = None
 
+    async def _stage_engine_token(
+        self, request: "RecordingStartRequest", capture_dir: Path
+    ) -> dict[str, str] | None:
+        """Stage the out-of-band ID token for a cloud recording's engine.
+
+        Reads the ID token in the daemon's OWN ACL context (the engine subprocess
+        cannot — different Keychain ACL identity), writes it to a 0600 file, and
+        returns the env overlay pointing the engine at it (via
+        ``auth.ENGINE_TOKEN_FILE_ENV``). Returns ``None`` — no token, no env var —
+        for local recordings and, fail-closed, whenever no token is available (not
+        signed in / Keychain error / transient auth failure): the engine then gets
+        no token, the live upload fails closed (chunks FAILED, nothing deleted),
+        and the recording still proceeds locally. Never raises.
+        """
+        if not request.cloud_intent:
+            return None
+        from screencap import auth
+
+        try:
+            token = await asyncio.to_thread(auth.get_id_token)
+        except Exception as exc:  # noqa: BLE001 — NotSignedIn/AuthError/KeyringError: fail closed
+            logger.warning(
+                "daemon: no cloud auth token at recording start (%s); live upload "
+                "will fail closed (recording stays local)",
+                type(exc).__name__,
+            )
+            return None
+        path = self._engine_token_path(capture_dir)
+        try:
+            self._write_engine_token_file(path, token)
+        except OSError as exc:
+            logger.warning("daemon: could not stage engine token file: %s", exc)
+            return None
+        self._engine_token_file = path
+        return {auth.ENGINE_TOKEN_FILE_ENV: str(path)}
+
+    @staticmethod
+    def _engine_token_path(capture_dir: Path) -> Path:
+        from screencap.config import get_base_dir
+
+        run_dir = get_base_dir() / "run"
+        run_dir.mkdir(parents=True, exist_ok=True)
+        return run_dir / f"engine-token-{capture_dir.name}.jwt"
+
+    @staticmethod
+    def _write_engine_token_file(path: Path, token: str) -> None:
+        """Atomically write *token* to *path* with mode 0600 (same-EUID only)."""
+        tmp = path.with_suffix(path.suffix + ".tmp")
+        # O_NOFOLLOW: reject a pre-planted symlink at the tmp path so a same-EUID
+        # actor can't redirect the live token write — matches the run-dir 0600
+        # hardening convention in audit_log.py / socket.py.
+        fd = os.open(
+            str(tmp), os.O_WRONLY | os.O_CREAT | os.O_TRUNC | os.O_NOFOLLOW, 0o600
+        )
+        try:
+            os.write(fd, token.encode("ascii"))
+        finally:
+            os.close(fd)
+        try:
+            os.replace(str(tmp), str(path))
+            os.chmod(path, 0o600)  # re-assert in case the file pre-existed wider
+        except OSError:
+            # The .tmp holds a live ID token; _cleanup_engine_token_file only
+            # removes the canonical .jwt, so unlink the residue before re-raising
+            # rather than leaking a same-EUID-readable token in the run dir.
+            try:
+                os.unlink(str(tmp))
+            except OSError:
+                pass
+            raise
+
+    def _cleanup_engine_token_file(self) -> None:
+        path = self._engine_token_file
+        self._engine_token_file = None
+        if path is None:
+            return
+        try:
+            path.unlink(missing_ok=True)
+        except OSError as exc:
+            logger.warning("daemon: could not remove engine token file %s: %s", path, exc)
+
+    async def _token_refresh_loop(self, proc: "_PopenEngineProcess") -> None:
+        """Re-mint + rewrite the engine token file while *proc* is alive.
+
+        A live recording can outlast the ~1h ID token, and the engine holds no
+        refresh token. The daemon (which does) re-mints on a timer and rewrites the
+        0600 file in place; the engine reads it fresh on each cloud call. A re-mint
+        failure is logged but never aborts the recording — a stale token just makes
+        the engine fail closed (no delete) on the next 401. Self-terminates when the
+        engine exits.
+        """
+        interval = _float_env("SCREENCAP_DAEMON_TOKEN_REFRESH_INTERVAL", 240.0)
+        from screencap import auth
+
+        last: str | None = None
+        while self._proc is proc and proc.is_alive():
+            try:
+                await asyncio.sleep(interval)
+            except asyncio.CancelledError:
+                return
+            path = self._engine_token_file
+            if self._proc is not proc or not proc.is_alive() or path is None:
+                return
+            try:
+                token = await asyncio.to_thread(auth.get_id_token)
+            except Exception as exc:  # noqa: BLE001 — never abort the recording
+                logger.warning(
+                    "daemon: token re-mint failed (%s); engine will fail closed on expiry",
+                    type(exc).__name__,
+                )
+                continue
+            if token == last:
+                continue  # unchanged — not yet within the refresh buffer
+            try:
+                self._write_engine_token_file(path, token)
+                last = token
+            except OSError as exc:
+                logger.warning("daemon: token re-mint rewrite failed: %s", exc)
+
     def _reset_state(self) -> None:
         self._proc = None
         self._engine_pid = None
         self._session_state = None
         self._stderr_task = None
         self._poll_task = None
+        if self._token_refresh_task is not None and not self._token_refresh_task.done():
+            self._token_refresh_task.cancel()
+        self._token_refresh_task = None
+        self._cleanup_engine_token_file()
         self._finalized_seen = False
         self._stopping = False
         self._exit_handled = False

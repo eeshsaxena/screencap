@@ -11,6 +11,14 @@ from click.testing import CliRunner
 from screencap.cli import cli
 
 
+@pytest.fixture(autouse=True)
+def _signed_in_autouse(_signed_in):
+    """Apply the shared ``_signed_in`` fixture (tests/conftest.py) to every test
+    in this module so the upload command's pre-flight auth check passes without
+    touching the Keychain. Upload's not-signed-in refusal is covered in
+    test_upload.py."""
+
+
 @contextmanager
 def _safe_start_prompts():
     """Patch the four entry points that interact with stdin or hard-exit during
@@ -61,18 +69,6 @@ def test_list_json_empty(tmp_path):
     runner = CliRunner()
     with mock.patch("screencap.catalog.get_recordings_dir", return_value=tmp_path):
         result = runner.invoke(cli, ["list", "--json"])
-    assert result.exit_code == 0
-    parsed = json.loads(result.output)
-    assert parsed == []
-
-
-def test_list_json_empty_remote():
-    """Same JSON contract for the --remote empty branch. Mirrors the local
-    fix so any scripted consumer of `list --json --remote` gets parseable
-    output instead of Rich-styled prose."""
-    runner = CliRunner()
-    with mock.patch("screencap.download.list_remote_sessions", return_value=[]):
-        result = runner.invoke(cli, ["list", "--json", "--remote"])
     assert result.exit_code == 0
     parsed = json.loads(result.output)
     assert parsed == []

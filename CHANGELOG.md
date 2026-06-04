@@ -7,6 +7,15 @@ and this project adheres to [Semantic Versioning](https://semver.org/).
 
 ## [Unreleased]
 
+### Removed
+
+- **Remote *session* browsing CLI surface** (per-user cloud storage isolation, U5).
+  `screencap list --remote` / `--tag` / `--category` and `screencap download
+  --sessions` / `--category` are gone — they were backed by the global, now-removed
+  `get-index` action and the retired `sessions/` namespace. `screencap list` is
+  local-only; `screencap download` fetches your own authenticated `recordings`
+  namespace. Per-user session browsing may return later under `users/{uid}/sessions/`.
+
 ## [0.20.0] - 2026-06-02
 
 ### Added

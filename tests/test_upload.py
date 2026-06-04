@@ -20,6 +20,12 @@ from screencap.upload import (
 )
 
 
+@pytest.fixture(autouse=True)
+def _signed_in_autouse(_signed_in):
+    """Apply the shared ``_signed_in`` fixture (tests/conftest.py) to every test
+    in this module. Not-signed-in / 401 tests override get_id_token themselves."""
+
+
 # ---------------------------------------------------------------------------
 # Unit tests: upload module helpers
 # ---------------------------------------------------------------------------
@@ -159,6 +165,105 @@ def test_request_signed_urls_timeout():
 
     with mock.patch("screencap.upload.requests.post", side_effect=req.Timeout):
         with pytest.raises(RuntimeError, match="timed out"):
+            request_signed_urls("rec1", files)
+
+
+# ---------------------------------------------------------------------------
+# Unit tests: request_signed_urls auth threading (U5)
+# ---------------------------------------------------------------------------
+
+
+def test_request_signed_urls_attaches_bearer_token():
+    from screencap.upload import request_signed_urls
+
+    files = [FileInfo("video.mp4", mock.MagicMock(), "video/mp4", 1000)]
+    mock_resp = mock.MagicMock()
+    mock_resp.status_code = 200
+    mock_resp.json.return_value = {"urls": {}, "gcs_prefix": ""}
+
+    with mock.patch("screencap.upload.requests.post", return_value=mock_resp) as post:
+        request_signed_urls("rec1", files)
+
+    _, kwargs = post.call_args
+    assert kwargs["headers"]["Authorization"] == "Bearer test-id-token"
+
+
+def test_request_signed_urls_refreshes_and_retries_once_on_401(monkeypatch):
+    from screencap.upload import request_signed_urls
+
+    files = [FileInfo("video.mp4", mock.MagicMock(), "video/mp4", 1000)]
+
+    token_calls: list[bool] = []
+
+    def fake_token(force_refresh=False):
+        token_calls.append(force_refresh)
+        return "fresh" if force_refresh else "stale"
+
+    monkeypatch.setattr("screencap.auth.get_id_token", fake_token)
+
+    r401 = mock.MagicMock(status_code=401)
+    r200 = mock.MagicMock(status_code=200)
+    r200.json.return_value = {"urls": {"video.mp4": "u"}, "gcs_prefix": "p"}
+
+    with mock.patch("screencap.upload.requests.post", side_effect=[r401, r200]) as post:
+        urls, _ = request_signed_urls("rec1", files)
+
+    assert urls == {"video.mp4": "u"}
+    assert token_calls == [False, True]  # second attempt forced a refresh
+    assert post.call_count == 2
+    assert post.call_args_list[1].kwargs["headers"]["Authorization"] == "Bearer fresh"
+
+
+def test_request_signed_urls_401_persists_after_refresh_raises(monkeypatch):
+    from screencap.upload import request_signed_urls
+
+    files = [FileInfo("video.mp4", mock.MagicMock(), "video/mp4", 1000)]
+    monkeypatch.setattr("screencap.auth.get_id_token", lambda force_refresh=False: "tok")
+
+    r401 = mock.MagicMock(status_code=401)
+    r401.json.return_value = {"error": "unauthorized"}
+    r401.text = "unauthorized"
+
+    with mock.patch("screencap.upload.requests.post", return_value=r401):
+        with pytest.raises(RuntimeError, match="Upload service error"):
+            request_signed_urls("rec1", files)
+
+
+def test_request_signed_urls_not_signed_in_raises_sign_in_message(monkeypatch):
+    from screencap import auth
+    from screencap.upload import request_signed_urls
+
+    files = [FileInfo("video.mp4", mock.MagicMock(), "video/mp4", 1000)]
+
+    def not_signed_in(force_refresh=False):
+        raise auth.NotSignedIn("no creds")
+
+    monkeypatch.setattr("screencap.auth.get_id_token", not_signed_in)
+
+    with mock.patch("screencap.upload.requests.post") as post:
+        with pytest.raises(RuntimeError, match="screencap login"):
+            request_signed_urls("rec1", files)
+
+
+def test_request_signed_urls_transient_autherror_on_refresh_maps_to_retryable(monkeypatch):
+    """A transient AuthError raised by the forced refresh on the 401 retry must
+    surface as a clean, retryable RuntimeError — never a raw AuthError traceback."""
+    from screencap import auth
+    from screencap.upload import request_signed_urls
+
+    files = [FileInfo("video.mp4", mock.MagicMock(), "video/mp4", 1000)]
+
+    def token(force_refresh=False):
+        if force_refresh:
+            # The 401 retry forces a re-mint, which hits a transient outage.
+            raise auth.AuthError("token service 503")
+        return "stale"
+
+    monkeypatch.setattr("screencap.auth.get_id_token", token)
+
+    r401 = mock.MagicMock(status_code=401)
+    with mock.patch("screencap.upload.requests.post", return_value=r401):
+        with pytest.raises(RuntimeError, match="temporarily unavailable"):
             request_signed_urls("rec1", files)
 
 
@@ -408,6 +513,81 @@ def test_upload_command_success(tmp_path):
         result = runner.invoke(cli, ["upload", "my-rec"])
     assert result.exit_code == 0
     assert "Uploaded" in result.output
+    # User recordings are private (users/{uid}/) — no public viewer URL is emitted.
+    assert "screencap.sh" not in result.output
+
+
+def test_upload_command_not_signed_in_refuses_and_touches_nothing(tmp_path, monkeypatch):
+    from screencap import auth
+
+    rec = tmp_path / "my-rec"
+    rec.mkdir()
+    (rec / "video.mp4").write_bytes(b"x" * 100)
+
+    def not_signed_in(force_refresh=False):
+        raise auth.NotSignedIn("no creds")
+
+    monkeypatch.setattr("screencap.auth.get_id_token", not_signed_in)
+
+    runner = CliRunner()
+    with (
+        mock.patch("screencap.upload.get_recordings_dir", return_value=tmp_path),
+        mock.patch("screencap.upload.requests.post") as post,
+    ):
+        result = runner.invoke(cli, ["upload", "my-rec"])
+
+    assert result.exit_code == 1
+    assert "screencap login" in result.output
+    post.assert_not_called()  # never reached the network
+    # Pre-flight refused before the upload loop: no auto-export, no status sentinel.
+    assert not (rec / "events.jsonl").exists()
+    assert not (rec / UPLOAD_STATUS_FILE).exists()
+
+
+def test_upload_command_keychain_locked_refuses_and_touches_nothing(tmp_path, monkeypatch):
+    import keyring.errors
+
+    rec = tmp_path / "my-rec"
+    rec.mkdir()
+    (rec / "video.mp4").write_bytes(b"x" * 100)
+
+    def keychain_locked(force_refresh=False):
+        raise keyring.errors.KeyringError("Keychain locked")
+
+    monkeypatch.setattr("screencap.auth.get_id_token", keychain_locked)
+
+    runner = CliRunner()
+    with (
+        mock.patch("screencap.upload.get_recordings_dir", return_value=tmp_path),
+        mock.patch("screencap.upload.requests.post") as post,
+    ):
+        result = runner.invoke(cli, ["upload", "my-rec"])
+
+    assert result.exit_code == 1
+    assert "Keychain locked" in result.output  # distinct from "not signed in"
+    post.assert_not_called()
+    assert not (rec / "events.jsonl").exists()
+    assert not (rec / UPLOAD_STATUS_FILE).exists()
+
+
+def test_upload_command_dry_run_does_not_require_auth(tmp_path, monkeypatch):
+    from screencap import auth
+
+    rec = tmp_path / "my-rec"
+    rec.mkdir()
+    (rec / "video.mp4").write_bytes(b"x" * 1000)
+
+    def not_signed_in(force_refresh=False):
+        raise auth.NotSignedIn("no creds")
+
+    monkeypatch.setattr("screencap.auth.get_id_token", not_signed_in)
+
+    runner = CliRunner()
+    with mock.patch("screencap.upload.get_recordings_dir", return_value=tmp_path):
+        result = runner.invoke(cli, ["upload", "my-rec", "--dry-run"])
+
+    assert result.exit_code == 0  # dry-run is local-only; no sign-in needed
+    assert "Dry run" in result.output
 
 
 def test_upload_command_service_unavailable(tmp_path):

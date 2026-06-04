@@ -17,7 +17,7 @@ Make the signing Cloud Function the security boundary: it verifies a Firebase ID
 
 ## Execution Status
 
-> Tracks what has shipped so the plan reflects reality. Updated 2026-06-03 (ce-work). Status stays `active` until the remaining units land.
+> Tracks what has shipped so the plan reflects reality. Updated 2026-06-03 (ce-work): the U5 remainder shipped on `feat/per-user-cloud-storage-isolation-u5`. Status stays `active` until the remaining units (U6–U10) land.
 
 **Shipped on `feat/per-user-cloud-storage-isolation`** (the backend security boundary + client auth foundation — deploys and tests in isolation; nothing user-facing breaks):
 
@@ -25,14 +25,14 @@ Make the signing Cloud Function the security boundary: it verifies a Firebase ID
 - **U2 — done** (`79c7f4f3`): per-user namespace isolation + in-code auth gate; global list-all / sign-any removed; `get-index` removed; AE2 cross-user denial + the CI contract test.
 - **U3 — done** (`5db38343`): public `demo/` namespace dispatched before the auth gate; marker-blind; physically separate code path.
 - **U4 — done** (`5276c3b8`): CLI `login`/`logout`/`whoami` + `get_id_token` (loopback OAuth+PKCE → `signInWithIdp`, Keychain refresh token, transparent refresh/rotation; `NotSignedIn` vs transient `AuthError`).
-- **U5 — partial** (`4e545c68`): the independent self-capture sub-scope landed — auth/token hosts blocked from `--network` (override-proof `REQUIRED_AUTH_IGNORE_HOSTS`) + `proxy_runner` fail-closed gate. **Remaining: shared `authed_post`/`force_refresh`, token threading through `upload.py`/`download.py`, removal of the `--remote`/`--sessions` session surfaces + public `screencap.sh` viewer URLs, the fail-closed `chunk_processor` (characterization-test-first), and the daemon out-of-band ID-token seam.**
+- **U5 — done**: the self-capture sub-scope (`4e545c68`) blocked auth/token hosts from `--network` (override-proof `REQUIRED_AUTH_IGNORE_HOSTS`) + the `proxy_runner` fail-closed gate. The remainder shipped on `feat/per-user-cloud-storage-isolation-u5`: out-of-band engine token seam + `force_refresh` (`7abb773d`); fail-closed characterization test (`69087b81`); bearer-token threading through `upload.py` (`9e5d090e`) and `download.py` (`a0aca91a`) via the shared `auth.authed_post` (`9215d6c4`, 401-refresh-retry-once); removal of the retired `--remote`/`--sessions` session surfaces (`a0aca91a`) and the public `screencap.sh` viewer URLs (`066e0265`); the `screencap upload` pre-flight sign-in refusal that touches nothing on disk (`066e0265`); and the daemon out-of-band ID-token seam + re-mint timer (`6786e261`). The live-upload fail-closed invariant (auth failure → `ChunkStatus.FAILED`, never sentinel/stub/delete) is preserved and characterized. **Carry-forwards (not blocking U5): the end-to-end mitmdump EFFECT test for `REQUIRED_AUTH_IGNORE_HOSTS`, and the cloud-function upload-checksum re-test after the `google-cloud-storage` 3.x bump.**
 
 **Open Questions resolved during execution (confirmed with the operator):**
 
 - **Auth boundary (was: split deployments?)** → keep a single `--allow-unauthenticated` function; the in-code `resolve_prefix` gate is the boundary, backed by a CI contract test asserting no tokenless request reaches any `users/` code path. (Implemented in U2.)
 - **Public-exposure consent (blocks U8 promotion)** → **promote the real friend-trial recordings after a content/title review gate**; U8 builds the staging + promotion scripts and the live promotion is an operator step.
 
-**Not yet started:** U5 remainder, U6 (macOS sign-in surface), U7 (website demo repoint — separate `screencap-website` repo), U8/U9 (migration + decommission scripts/runbooks), U10 (legacy `zkairdrop` decommission runbook).
+**Not yet started:** U6 (macOS sign-in surface), U7 (website demo repoint — separate `screencap-website` repo), U8/U9 (migration + decommission scripts/runbooks), U10 (legacy `zkairdrop` decommission runbook).
 
 ---
 
