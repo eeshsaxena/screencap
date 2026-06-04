@@ -407,7 +407,7 @@ def _sign_in_with_idp(google_id_token: str, redirect_uri: str) -> AuthState:
     )
 
 
-def _describe_error(resp) -> str:
+def _describe_error(resp: requests.Response) -> str:
     try:
         body = resp.json()
         err = body.get("error")
