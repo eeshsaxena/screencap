@@ -4,7 +4,7 @@ date: 2026-05-29
 type: runbook
 plan: docs/plans/2026-05-29-002-feat-per-user-cloud-storage-isolation-plan.md
 origin: docs/brainstorms/2026-05-29-per-user-cloud-storage-isolation-requirements.md
-status: not-started
+status: done
 project: proteus-photos
 region_compute: southamerica-east1
 unit: U1
@@ -175,17 +175,29 @@ gcloud functions logs read get-upload-urls --project proteus-photos \
 
 ## Live execution log
 
-> Fill in as resources are actually provisioned. These values are the inputs to U4.
+> Provisioned 2026-06-04 in `proteus-photos`. The OAuth client id + Web API key are
+> **not committed** here — they live in the project-local `.env` (gitignored,
+> auto-loaded by `load_dotenv()` in `screencap/cli/__init__.py`) as
+> `SCREENCAP_OAUTH_CLIENT_ID` / `SCREENCAP_FIREBASE_API_KEY`. They are not secrets
+> (they ship in release binaries); for a shipped client they move into `auth.py`'s
+> defaults. Function deploy remains **gated** — see the Pre-deploy gate above.
 
 | Item | Value | Notes |
 |------|-------|-------|
-| Identity Platform enabled | _pending_ | |
-| Google provider enabled | _pending_ | |
-| OAuth client id (desktop) | _pending_ | ships in client; not a secret |
-| Firebase Web API key | _pending_ | restricted to Identity Toolkit + Token Service |
-| Web API key restrictions | _pending_ | record application + API restrictions |
-| Disabled methods | _pending_ | email/pw, phone, anonymous |
-| `serviceAccountTokenCreator` confirmed | _pending_ | self-binding on the signer SA |
+| Identity Platform enabled | ✅ done (2026-06-04) | console shows "Authentication with Identity Platform" |
+| Google provider enabled | ✅ done (2026-06-04) | the only v1 provider |
+| OAuth client id (desktop) | ✅ `screencap-cli-desktop` (Desktop type, 2026-06-04) | value in project-local `.env`; not committed; not a secret |
+| Firebase Web API key | ✅ created (2026-06-04) | value in project-local `.env`; not committed |
+| Web API key restrictions | ✅ done (2026-06-04) | restricted to Identity Toolkit API + Token Service API (step 6) |
+| Disabled methods | ✅ email/pw, phone, anonymous left disabled | only Google was enabled |
+| `serviceAccountTokenCreator` confirmed | ✅ done (2026-06-04) | self-binding on the signer SA present (step 7 `gcloud` check) |
+
+**Provisioning (steps 1–7) is complete.** The only remaining item is the
+deliberately-**gated function deploy** (step 8 / Pre-deploy gate above) — deploying
+the token-verifying code over the live `get-upload-urls` would 401 current clients,
+so it waits on a token-carrying client release / a new function name / an auth flag.
+Client sign-in (`screencap login` / `whoami`) works today without the deploy once the
+two `.env` values are set.
 
 ---
 
