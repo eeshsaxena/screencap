@@ -22,6 +22,17 @@ venv/
 htmlcov/
 benchmark_results/
 
+# SCR-28 spike: the Tier-2 testbed is extracted from real recordings and contains
+# genuine PII — never commit the raw extracts or PII-derived results. These guards
+# ignore *every* real-PII extract regardless of filename (inputs.jsonl, gold.jsonl,
+# inputs-v2.jsonl, per-recording subdirs, etc.), while keeping the committable
+# synthetic *.example.jsonl exemplars and the results/.gitkeep placeholder.
+# (.venv-pf is already covered by .venv-*/ above.) See benchmarks/scr28/README.md.
+benchmarks/scr28/tier2_testbed/**/*.jsonl
+!benchmarks/scr28/tier2_testbed/**/*.example.jsonl
+benchmarks/scr28/results/*
+!benchmarks/scr28/results/.gitkeep
+
 # IDE
 .idea/
 .vscode/

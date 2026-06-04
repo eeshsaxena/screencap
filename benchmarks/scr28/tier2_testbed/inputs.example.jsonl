@@ -1,0 +1,4 @@
+{"id": "example-ocr-0000", "text": "Email John Doe at john.doe@example.com", "modality": "ocr", "source": "example#screenshot:1:screenshots/a.jpg#block0"}
+{"id": "example-ocr-0001", "text": "Call +1 415 555 1212 to confirm", "modality": "ocr", "source": "example#screenshot:1:screenshots/a.jpg#block1"}
+{"id": "example-ax-0000", "text": "Shipping to 1600 Amphitheatre Pkwy", "modality": "ax", "source": "example#action_event:42"}
+{"id": "example-ocr-0002", "text": "Compiling module foo (3 warnings)", "modality": "ocr", "source": "example#screenshot:2:screenshots/b.jpg#block0"}
