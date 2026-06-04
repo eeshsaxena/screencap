@@ -187,6 +187,25 @@ def test_sign_in_with_idp_parses_firebase_tokens(monkeypatch):
     assert st.refresh_token == "rt"
 
 
+def test_describe_error_surfaces_oauth_error_description():
+    # Google's token endpoint returns a *string* `error` plus an `error_description`
+    # carrying the actionable reason. Dropping the description is what turned
+    # "client_secret is missing." into a bare, undiagnosable "invalid_request".
+    resp = _FakeResp(
+        400, {"error": "invalid_request", "error_description": "client_secret is missing."}
+    )
+    msg = a._describe_error(resp)
+    assert "client_secret is missing." in msg
+    assert "invalid_request" in msg
+
+
+def test_describe_error_handles_identitytoolkit_dict_shape():
+    # Firebase Identity Toolkit nests the reason under error.message; the dict
+    # branch must keep returning it, unaffected by the OAuth-shape fix.
+    resp = _FakeResp(400, {"error": {"code": 400, "message": "INVALID_IDP_RESPONSE"}})
+    assert a._describe_error(resp) == "INVALID_IDP_RESPONSE"
+
+
 # --------------------------------------------------------------------------
 # logout + whoami
 # --------------------------------------------------------------------------
