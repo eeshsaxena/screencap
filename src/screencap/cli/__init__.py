@@ -27,6 +27,7 @@ from dotenv import load_dotenv
 
 load_dotenv()  # auto-load .env if present
 from rich.console import Console
+from rich.markup import escape
 from rich.table import Table
 
 from screencap import __version__
@@ -1701,7 +1702,7 @@ def login_cmd(as_json):
                 {"ok": False, "schema_version": _AUTH_SCHEMA_VERSION, "error": str(e)}
             ))
         else:
-            console.print(f"[red]Sign-in failed:[/red] {e}")
+            console.print(f"[red]Sign-in failed:[/red] {escape(str(e))}")
         sys.exit(1)
     if as_json:
         click.echo(json.dumps({

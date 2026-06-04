@@ -407,12 +407,20 @@ def _sign_in_with_idp(google_id_token: str, redirect_uri: str) -> AuthState:
     )
 
 
-def _describe_error(resp) -> str:
+def _describe_error(resp: requests.Response) -> str:
     try:
-        err = resp.json().get("error")
+        body = resp.json()
+        err = body.get("error")
         if isinstance(err, dict):
+            # Firebase Identity Toolkit: {"error": {"code", "message", ...}}.
             return err.get("message", resp.text)
-        return str(err or resp.text)
+        # Google OAuth token endpoint: {"error": "invalid_request",
+        # "error_description": "client_secret is missing."}. Keep the description —
+        # it carries the actionable reason; the bare code alone is undiagnosable.
+        desc = body.get("error_description")
+        if err and desc:
+            return f"{err}: {desc}"
+        return str(err or desc or resp.text)
     except Exception:
         return resp.text
 
