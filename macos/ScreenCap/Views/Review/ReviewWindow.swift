@@ -21,6 +21,7 @@ struct ReviewWindow: View {
     let recordingName: String
     @EnvironmentObject private var index: RecordingsIndex
     @EnvironmentObject private var auth: CloudAuthController
+    @EnvironmentObject private var uploads: UploadCoordinator
     @Environment(\.dismiss) private var dismiss
     @StateObject private var model: ReviewWindowViewModel
 
@@ -31,10 +32,15 @@ struct ReviewWindow: View {
     /// Drives the "Sign in to upload" sheet (plan U6). Shown when Upload is
     /// tapped while signed out, instead of letting the CLI refuse opaquely.
     @State private var showSignInSheet = false
-    /// Tracks whether this window has incremented the auth controller's
+    /// Tracks whether this window has incremented the upload coordinator's
     /// active-upload count, so Sign Out stays disabled for exactly the span of
     /// this window's upload and the count is balanced on close.
     @State private var countedUpload = false
+    /// Tracks whether THIS window initiated the in-flight sign-in flow. The auth
+    /// controller is app-wide, so only the window that started the flow may
+    /// cancel it on close/dismiss — otherwise closing window B would abort a
+    /// login that window A started.
+    @State private var startedSignIn = false
 
     init(recordingName: String) {
         self.recordingName = recordingName
@@ -79,7 +85,12 @@ struct ReviewWindow: View {
             }
             syncUploadCount(for: newState)
         }
-        .sheet(isPresented: $showSignInSheet) {
+        .sheet(isPresented: $showSignInSheet, onDismiss: {
+            // Esc / system / external (menu) dismissal bypasses the Cancel
+            // button's onDismiss closure, so run the same ownership-aware
+            // teardown here. Converges every dismissal route on one place.
+            teardownSignInIfOwned()
+        }) {
             SignInPromptView(
                 auth: auth,
                 onSignedIn: {
@@ -87,10 +98,21 @@ struct ReviewWindow: View {
                     model.startUpload()
                 },
                 onDismiss: {
-                    auth.cancelSignIn()
+                    // Closing the sheet via its own Cancel sets isPresented
+                    // false, which fires the .sheet(onDismiss:) teardown above —
+                    // so this only needs to dismiss; cancel happens there.
                     showSignInSheet = false
+                },
+                onStartSignIn: {
+                    // This window launched the login, so it owns the in-flight
+                    // flow and is the one allowed to cancel it on close/dismiss.
+                    startedSignIn = true
                 }
             )
+            // Block interactive dismissal while the browser round-trip is live
+            // so a stray Esc/drag can't silently strand the login subprocess;
+            // the in-progress sheet still offers an explicit Cancel.
+            .interactiveDismissDisabled(isSignInInProgress)
         }
         .onDisappear {
             model.windowDidClose()
@@ -98,8 +120,32 @@ struct ReviewWindow: View {
             // (onChange won't fire after the view is gone).
             if countedUpload {
                 countedUpload = false
-                auth.uploadDidFinish()
+                uploads.uploadDidFinish()
             }
+            // Closing the window mid-sign-in should cancel the login this window
+            // started — otherwise the subprocess orphans until the 180s timeout
+            // and its captured completion could fire startUpload() on a
+            // torn-down window. Ownership-guarded so we don't abort a flow
+            // another window started on the shared controller.
+            teardownSignInIfOwned()
+        }
+    }
+
+    /// True while this window's sign-in sheet has a `login` round-trip running.
+    private var isSignInInProgress: Bool {
+        if case .inProgress = auth.signInFlow { return true }
+        return false
+    }
+
+    /// Cancels the in-flight sign-in only if THIS window started it and a flow
+    /// is still in progress. Safe to call from any dismissal route (sheet
+    /// onDismiss, window onDisappear); clears the ownership flag so it's a no-op
+    /// on a second call.
+    private func teardownSignInIfOwned() {
+        guard startedSignIn else { return }
+        startedSignIn = false
+        if isSignInInProgress {
+            auth.cancelSignIn()
         }
     }
 
@@ -122,10 +168,10 @@ struct ReviewWindow: View {
         if case .uploading = state { uploading = true } else { uploading = false }
         if uploading && !countedUpload {
             countedUpload = true
-            auth.uploadDidStart()
+            uploads.uploadDidStart()
         } else if !uploading && countedUpload {
             countedUpload = false
-            auth.uploadDidFinish()
+            uploads.uploadDidFinish()
         }
     }
 

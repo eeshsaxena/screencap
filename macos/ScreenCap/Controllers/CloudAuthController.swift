@@ -79,9 +79,11 @@ final class LiveCloudAuthService: CloudAuthService {
 /// Owns cloud sign-in state for the app shell (plan U6). Surfaces:
 ///   - `status`: the persistent signed-in/out fact (from `whoami`/`login`).
 ///   - `signInFlow`: the transient login-in-progress / failed flow state.
-///   - `activeUploadCount`: how many review windows are mid-upload, so Sign Out
-///     can be disabled while an `request_signed_urls` is in flight (design
-///     review state c — avoids a `NotSignedIn` mid-upload).
+///
+/// Upload bookkeeping (the active-upload count that gates Sign Out) lives in a
+/// separate `UploadCoordinator`; this controller reads it through
+/// `isUploadInFlight` so `canSignOut` can still derive from it without owning
+/// the count.
 ///
 /// Token handling lives entirely in the Python layer; this controller only
 /// triggers `login`/`logout`/`whoami` and reads their JSON. Local recording is
@@ -90,11 +92,20 @@ final class LiveCloudAuthService: CloudAuthService {
 final class CloudAuthController: ObservableObject {
     @Published private(set) var status: AuthStatus = .unknown
     @Published private(set) var signInFlow: SignInFlowState = .idle
-    @Published private(set) var activeUploadCount: Int = 0
 
     private let service: CloudAuthService
+    /// Read-only window onto the upload count that gates Sign Out. Owned by the
+    /// app-wide `UploadCoordinator` (a separate observable) so the auth
+    /// controller stays focused on sign-in flow + status.
+    private let isUploadInFlight: () -> Bool
     private var loginHandle: SpawnedProcessHandle?
     private var loginStdout: [String] = []
+    /// Swift-side watchdog for an in-flight `login`. `CLIClient.spawn` has no
+    /// timeout, so a `login` that hangs before the CLI's own 180s timer
+    /// (U4 `LOGIN_TIMEOUT_SECONDS`) would otherwise leave `signInFlow` stuck
+    /// `.inProgress`. Fires just past 180s and is generation-guarded so a stale
+    /// watchdog can't touch a live attempt. Cancelled when the flow settles.
+    private var loginWatchdog: Task<Void, Never>?
     /// Monotonic per-attempt token. Each `startSignIn` bumps it and the spawn
     /// callbacks capture the value; a cancelled or superseded flow bumps it
     /// again, so a stale `onTerminated`/`onStdoutLine` from the old process is
@@ -106,14 +117,27 @@ final class CloudAuthController: ObservableObject {
     /// cancel — then cleared.
     private var pendingResult: ((Bool) -> Void)?
 
-    init(service: CloudAuthService = LiveCloudAuthService()) {
+    /// Watchdog deadline: just past the CLI's own 180s `login` self-timeout so
+    /// the Swift side only fires when the subprocess has genuinely hung before
+    /// its own timer (rather than racing it).
+    private static let loginWatchdogSeconds: TimeInterval = 210
+
+    /// - Parameter isUploadInFlight: reads the app-wide `UploadCoordinator`'s
+    ///   in-flight flag so `canSignOut` can gate on uploads without this
+    ///   controller owning the count. Defaults to "no upload" for tests /
+    ///   surfaces that don't wire a coordinator.
+    init(
+        service: CloudAuthService = LiveCloudAuthService(),
+        isUploadInFlight: @escaping () -> Bool = { false }
+    ) {
         self.service = service
+        self.isUploadInFlight = isUploadInFlight
     }
 
     var isSignedIn: Bool { status.isSignedIn }
 
     /// Sign Out is offered only when signed in AND no upload is in flight.
-    var canSignOut: Bool { status.isSignedIn && activeUploadCount == 0 }
+    var canSignOut: Bool { status.isSignedIn && !isUploadInFlight() }
 
     // MARK: - whoami refresh
 
@@ -141,6 +165,13 @@ final class CloudAuthController: ObservableObject {
     /// (the Upload gate) can proceed afterward. A second call while one is
     /// already in flight does not launch a second browser flow.
     func startSignIn(onResult: ((Bool) -> Void)? = nil) {
+        if status.isSignedIn {
+            // Already signed in — possibly on another surface that completed the
+            // OAuth round-trip first. Don't open a redundant browser flow; this
+            // caller's gate is already satisfied, so report success immediately.
+            onResult?(true)
+            return
+        }
         if case .inProgress = signInFlow {
             // A sign-in is already running (possibly from another surface). Don't
             // open a second browser flow; tell this caller "not now" rather than
@@ -158,6 +189,7 @@ final class CloudAuthController: ObservableObject {
                 onStdoutLine: { [weak self] line in self?.appendLoginStdout(line, generation: generation) },
                 onTerminated: { [weak self] code in self?.handleLoginTerminated(exitCode: code, generation: generation) }
             )
+            startLoginWatchdog(generation: generation)
         } catch {
             // Spawn failure (binary not found, launch error) — terminal failure,
             // no process to clean up.
@@ -165,6 +197,40 @@ final class CloudAuthController: ObservableObject {
             signInFlow = .failed(error.localizedDescription)
             finishResult(false)
         }
+    }
+
+    /// Arms the Swift-side login watchdog for `generation`. On fire (the CLI's
+    /// own 180s timer didn't), terminates the handle and surfaces a timeout —
+    /// guarded by the generation token so a stale watchdog from a cancelled or
+    /// superseded attempt cannot touch a live flow.
+    private func startLoginWatchdog(generation: Int) {
+        loginWatchdog?.cancel()
+        loginWatchdog = Task { [weak self] in
+            try? await Task.sleep(nanoseconds: UInt64(Self.loginWatchdogSeconds * 1_000_000_000))
+            guard !Task.isCancelled else { return }
+            self?.handleLoginTimedOut(generation: generation)
+        }
+    }
+
+    /// Cancels the active watchdog (the flow has settled, or is being torn down).
+    private func cancelLoginWatchdog() {
+        loginWatchdog?.cancel()
+        loginWatchdog = nil
+    }
+
+    private func handleLoginTimedOut(generation: Int) {
+        // A stale watchdog (cancelled/superseded attempt) must not touch the
+        // live flow — mirror the generation guard the spawn callbacks use.
+        guard generation == loginGeneration else { return }
+        guard case .inProgress = signInFlow else { return }
+        // Bump the generation so the SIGTERM-driven exit that follows is treated
+        // as stale and can't flip us off the `.failed` state we set here.
+        loginGeneration &+= 1
+        loginWatchdog = nil
+        loginHandle?.terminate()
+        loginHandle = nil
+        signInFlow = .failed("Sign-in timed out.")
+        finishResult(false)
     }
 
     /// Dismiss the sign-in flow: cancel an in-flight `login` (SIGTERM) or clear a
@@ -176,6 +242,7 @@ final class CloudAuthController: ObservableObject {
         switch signInFlow {
         case .inProgress:
             loginGeneration &+= 1
+            cancelLoginWatchdog()
             loginHandle?.terminate()
             loginHandle = nil
             signInFlow = .idle
@@ -192,6 +259,7 @@ final class CloudAuthController: ObservableObject {
         // Ignore a stale termination from a cancelled or superseded attempt —
         // its callbacks must not touch the live flow's handle or state.
         guard generation == loginGeneration else { return }
+        cancelLoginWatchdog()
         loginHandle = nil
         // `login --json` success carries the same envelope shape as `whoami`
         // (`{ok, signed_in: true, uid, email}`), so the signed-in discriminator
@@ -246,7 +314,7 @@ final class CloudAuthController: ObservableObject {
     /// Signs out via `screencap logout` and clears local state. No-op while an
     /// upload is in flight (defensive — the menu also disables the control).
     func signOut() async {
-        guard activeUploadCount == 0 else { return }
+        guard !isUploadInFlight() else { return }
         do {
             try await service.signOut()
         } catch {
@@ -258,11 +326,4 @@ final class CloudAuthController: ObservableObject {
         }
         status = .signedOut
     }
-
-    // MARK: - Upload coordination
-
-    /// Called by a review window when its upload enters flight, so Sign Out is
-    /// disabled until it finishes. Balanced by `uploadDidFinish()`.
-    func uploadDidStart() { activeUploadCount += 1 }
-    func uploadDidFinish() { activeUploadCount = max(0, activeUploadCount - 1) }
 }

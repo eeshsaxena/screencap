@@ -48,6 +48,11 @@ final class FakeCloudAuthService: CloudAuthService {
     /// only remembers the latest flow's callbacks.
     func captureTermination() -> ((Int32) -> Void)? { onTerminated }
 
+    /// Capture the currently-registered stdout callback so a test can fire a
+    /// *stale* stdout line after a newer flow has started — mirrors
+    /// `captureTermination()` for the generation guard on `appendLoginStdout`.
+    func captureStdoutLine() -> ((String) -> Void)? { onStdoutLine }
+
     // logout
     var logoutThrows: Error?
     private(set) var signOutCount = 0
@@ -159,6 +164,19 @@ final class CloudAuthControllerTests: XCTestCase {
         XCTAssertTrue(controller.isSignedIn)
         XCTAssertEqual(controller.status, .signedIn(email: nil, uid: nil, stale: true))
         XCTAssertNil(controller.status.accountLabel)
+    }
+
+    /// Signed in with a uid but no email → the account label falls back to the
+    /// uid (email is preferred when present, uid otherwise).
+    func testRefreshUidOnlyAccountLabelFallsBackToUid() async {
+        let service = FakeCloudAuthService()
+        service.whoamiData = Data(#"{"ok":true,"schema_version":1,"signed_in":true,"uid":"abc123","email":null}"#.utf8)
+        let controller = CloudAuthController(service: service)
+
+        await controller.refresh()
+
+        XCTAssertTrue(controller.isSignedIn)
+        XCTAssertEqual(controller.status.accountLabel, "abc123")
     }
 
     // MARK: - sign in
@@ -284,6 +302,59 @@ final class CloudAuthControllerTests: XCTestCase {
         XCTAssertTrue(controller.isSignedIn)
     }
 
+    /// A clean (exit 0) `login` whose final envelope reports signed-out is a
+    /// failure, not a success: the user closed the browser / declined, so the
+    /// flow surfaces a reason, stays signed out, and reports false — never a
+    /// false-positive "signed in".
+    func testSignInCleanExitButNotSignedInIsFailure() {
+        let service = FakeCloudAuthService()
+        let controller = CloudAuthController(service: service)
+        var reported: Bool?
+
+        controller.startSignIn { reported = $0 }
+        service.emitLogin(line: signedOutEnvelope, exitCode: 0)
+
+        if case .failed(let reason) = controller.signInFlow {
+            XCTAssertFalse(reason.isEmpty)
+        } else {
+            XCTFail("expected failed flow, got \(controller.signInFlow)")
+        }
+        XCTAssertFalse(controller.isSignedIn)
+        XCTAssertEqual(reported, false)
+    }
+
+    /// Regression: a stale stdout line from a cancelled flow must not feed the
+    /// live flow's accumulated login output (generation guard on
+    /// `appendLoginStdout`). Flow A's leftover signed-in envelope, fired after
+    /// Flow B starts, must not drive Flow B's result.
+    func testStaleStdoutDoesNotAffectLiveFlow() {
+        let service = FakeCloudAuthService()
+        let controller = CloudAuthController(service: service)
+        var firstResult: Bool?
+        var secondResult: Bool?
+
+        // Flow A: start, capture its stdout callback, then cancel.
+        controller.startSignIn { firstResult = $0 }
+        let staleStdout = service.captureStdoutLine()
+        controller.cancelSignIn()
+        XCTAssertEqual(firstResult, false)
+
+        // Flow B: a fresh attempt (new process handle).
+        service.fakeProcess = FakeSpawnedProcessHandle(isRunning: true, pid: 888, forceKillReturnValue: true)
+        controller.startSignIn { secondResult = $0 }
+        XCTAssertEqual(controller.signInFlow, .inProgress)
+
+        // Flow A's delayed signed-in stdout lands now — the generation guard
+        // must drop it so it never enters Flow B's accumulated output.
+        staleStdout?(signedInEnvelope)
+
+        // Flow B exits non-zero with no envelope of its own: if the stale line
+        // had leaked in, the controller would resolve signed-in; it must not.
+        service.emitLogin(line: nil, exitCode: 1)
+        XCTAssertEqual(secondResult, false, "stale envelope must not drive the live flow's result")
+        XCTAssertFalse(controller.isSignedIn)
+    }
+
     /// Dismissing a lingering `.failed` flow (sheet Cancel/Close from the failed
     /// state) resets it to `.idle` so the failure doesn't stick on the shared
     /// menu-bar surface.
@@ -300,46 +371,59 @@ final class CloudAuthControllerTests: XCTestCase {
     }
 
     /// A second `startSignIn` while one is in flight is a no-op (one browser
-    /// round-trip at a time).
+    /// round-trip at a time): no second spawn, and the second caller's
+    /// completion reports false rather than hijacking the live attempt's gate.
     func testSecondSignInWhileInProgressIsNoOp() {
         let service = FakeCloudAuthService()
         let controller = CloudAuthController(service: service)
+        var secondResult: Bool?
 
         controller.startSignIn()
-        controller.startSignIn()
+        controller.startSignIn { secondResult = $0 }
 
         XCTAssertEqual(service.startLoginCount, 1)
+        XCTAssertEqual(secondResult, false, "the spurned second caller must be told not-now")
     }
 
     // MARK: - sign out + upload coordination
 
     /// Plan scenario: Sign Out is disabled while an upload is in flight, and
-    /// re-enabled once it finishes.
+    /// re-enabled once it finishes. The active-upload count now lives in
+    /// `UploadCoordinator`; the controller reads it through the injected
+    /// in-flight closure for `canSignOut`.
     func testCanSignOutGatesOnActiveUploads() async {
         let service = FakeCloudAuthService()
         service.whoamiData = Data(signedInEnvelope.utf8)
-        let controller = CloudAuthController(service: service)
+        let coordinator = UploadCoordinator()
+        let controller = CloudAuthController(
+            service: service,
+            isUploadInFlight: { coordinator.isUploadInFlight }
+        )
         await controller.refresh()
 
         XCTAssertTrue(controller.canSignOut)
 
-        controller.uploadDidStart()
+        coordinator.uploadDidStart()
         XCTAssertFalse(controller.canSignOut, "sign out must be disabled mid-upload")
 
-        controller.uploadDidFinish()
+        coordinator.uploadDidFinish()
         XCTAssertTrue(controller.canSignOut)
     }
 
-    /// `uploadDidFinish` never drives the count below zero (an unbalanced
-    /// finish must not silently re-enable while another upload runs).
+    /// `UploadCoordinator.uploadDidFinish` never drives the count below zero (an
+    /// unbalanced finish must not silently re-enable while another upload runs).
     func testUploadCountClampsAtZero() async {
         let service = FakeCloudAuthService()
         service.whoamiData = Data(signedInEnvelope.utf8)
-        let controller = CloudAuthController(service: service)
+        let coordinator = UploadCoordinator()
+        let controller = CloudAuthController(
+            service: service,
+            isUploadInFlight: { coordinator.isUploadInFlight }
+        )
         await controller.refresh()
 
-        controller.uploadDidFinish() // unbalanced
-        controller.uploadDidStart()
+        coordinator.uploadDidFinish() // unbalanced
+        coordinator.uploadDidStart()
         XCTAssertFalse(controller.canSignOut, "a stray finish must not mask a real start")
     }
 
@@ -363,9 +447,13 @@ final class CloudAuthControllerTests: XCTestCase {
     func testSignOutNoOpsDuringUpload() async {
         let service = FakeCloudAuthService()
         service.whoamiData = Data(signedInEnvelope.utf8)
-        let controller = CloudAuthController(service: service)
+        let coordinator = UploadCoordinator()
+        let controller = CloudAuthController(
+            service: service,
+            isUploadInFlight: { coordinator.isUploadInFlight }
+        )
         await controller.refresh()
-        controller.uploadDidStart()
+        coordinator.uploadDidStart()
 
         await controller.signOut()
 

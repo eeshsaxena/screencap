@@ -13,7 +13,29 @@ struct ScreenCapApp: App {
     @StateObject private var permissions = PermissionController()
     @StateObject private var index = RecordingsIndex()
     @StateObject private var privacy = PrivacyController()
-    @StateObject private var auth = CloudAuthController()
+    @StateObject private var uploads: UploadCoordinator
+    @StateObject private var auth: CloudAuthController
+
+    init() {
+        // Upload bookkeeping lives in its own app-wide observable; the auth
+        // controller reads its in-flight flag (for `canSignOut`) without owning
+        // the count. Build the coordinator first, then hand the auth controller
+        // a closure onto it — `@StateObject` property initializers can't
+        // cross-reference, so the wiring happens here in `init`.
+        let uploads = UploadCoordinator()
+        _uploads = StateObject(wrappedValue: uploads)
+        _auth = StateObject(wrappedValue: CloudAuthController(
+            isUploadInFlight: { [weak uploads] in uploads?.isUploadInFlight ?? false }
+        ))
+    }
+
+    /// True when the process is running inside the XCTest host, so launch-time
+    /// `.task` side effects (auth refresh, daemon probe) don't fire and race the
+    /// unit tests. Mirrors the guard the SwiftUI test host needs in every
+    /// scene-level `.task`.
+    private var isRunningUnderTests: Bool {
+        ProcessInfo.processInfo.environment["XCTestConfigurationFilePath"] != nil
+    }
 
     var body: some Scene {
         // Use `Window` (macOS 13+) rather than `WindowGroup` so the scene is
@@ -29,6 +51,7 @@ struct ScreenCapApp: App {
                 .environmentObject(index)
                 .environmentObject(privacy)
                 .environmentObject(auth)
+                .environmentObject(uploads)
                 .frame(minWidth: 880, minHeight: 560)
                 .background(OpenWindowBridge())
                 .onAppear {
@@ -42,12 +65,12 @@ struct ScreenCapApp: App {
                     // probe below (separate `.task`) so a slow `whoami` refresh
                     // never delays recording-engine startup. Local recording is
                     // never gated on auth (R3).
-                    if ProcessInfo.processInfo.environment["XCTestConfigurationFilePath"] == nil {
+                    if !isRunningUnderTests {
                         await auth.refresh()
                     }
                 }
                 .task {
-                    if ProcessInfo.processInfo.environment["XCTestConfigurationFilePath"] == nil {
+                    if !isRunningUnderTests {
                         await recorder.probeDaemon()
                         // First-launch sequencing: write fail-closed mode →
                         // refresh status → load apps. Runs after the daemon
@@ -81,6 +104,7 @@ struct ScreenCapApp: App {
                 ReviewWindow(recordingName: name)
                     .environmentObject(index)
                     .environmentObject(auth)
+                    .environmentObject(uploads)
             } else {
                 Text("Review window not available.")
                     .padding()
@@ -92,6 +116,7 @@ struct ScreenCapApp: App {
             MenuBarMenu()
                 .environmentObject(recorder)
                 .environmentObject(auth)
+                .environmentObject(uploads)
         } label: {
             MenuBarLabel(
                 isRecording: recorder.state.isRecording,
