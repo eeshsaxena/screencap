@@ -41,10 +41,13 @@ inputs (cases) ──┤                                        ├─→ predic
 | `tier2_testbed/ANNOTATION_GUIDELINES.md` | How to hand-label `gold.jsonl`. | — |
 | `results/` | Per-model, per-tier JSON + Markdown outputs. | — |
 
-Reusable scoring core: `score_predictions(tp_cases, fp_cases, predictions_by_case)` in
-[`tests/privacy/test_benchmark.py`](../../tests/privacy/test_benchmark.py). `run_benchmark(pipeline)`
-is now a thin wrapper over it (behavior byte-identical — verified against a frozen
-golden snapshot and the existing privacy suite).
+Reusable scoring core: `score_predictions(tp_cases, fp_cases, predictions_by_case)` lives in
+[`scoring_core.py`](scoring_core.py) and is re-exported from
+[`tests/privacy/test_benchmark.py`](../../tests/privacy/test_benchmark.py) for the existing
+tests. `run_benchmark(pipeline)` is now a thin wrapper over it. Behavior equivalence is
+verified by the model-free `score_predictions` ⇄ `run_benchmark` equivalence tests in
+[`tests/privacy/test_benchmark_scoring.py`](../../tests/privacy/test_benchmark_scoring.py)
+plus the unchanged existing privacy suite — no golden artifact is committed.
 
 ## Two environments
 
@@ -85,6 +88,11 @@ PYTHONPATH=src benchmarks/scr28/.venv-pf/bin/python \
 
 `.venv-pf` is gitignored (`.venv-*/`). The privacy-filter weights (~0.8–2.8 GB depending
 on variant) download to the HF cache, not the repo.
+
+> **`--decoder opf` scale ceiling:** `opf` spawns one subprocess per input, so it is
+> intended for Tier-2 block scale (tens–hundreds of inputs). Above ~1000 inputs the
+> per-process startup cost dominates and the runner warns; use `--decoder pipeline`
+> (in-process, single model load) for Tier-1 sweeps.
 
 ## Run order
 

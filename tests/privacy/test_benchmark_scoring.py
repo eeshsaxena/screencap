@@ -175,6 +175,10 @@ class TestScorePredictionsCore:
         agg = score_predictions([case], [], {})  # missing case -> empty detections
         assert agg.per_type["PERSON"].false_negatives == 1
         assert agg.total_tp == 0
+        # Missing-case fallback: no detections -> nothing redacted, so every gold
+        # PII substring survives anonymization (the empty-detections invariant).
+        assert agg.redaction_total == 1
+        assert agg.redaction_survivals == agg.redaction_total
 
     def test_predictions_on_fp_case_are_all_fp(self) -> None:
         text = "build output: compiling module foo"
@@ -311,6 +315,32 @@ class TestSpikeScorer:
         agg = scorer.score_prediction_file(pf, [case])
         assert agg.per_type["PERSON"].false_negatives == 1
         assert agg.per_type.get("EMAIL") is None or agg.per_type["EMAIL"].false_positives == 0
+
+    def test_same_type_spans_split_by_punctuation_not_merged(self) -> None:
+        # Two PERSON spans separated by a comma+space are NOT whitespace-only
+        # adjacent, so the scorer must keep them as two distinct detections.
+        text = "John Doe, Jane Roe"
+        js, je = _span(text, "John Doe")
+        ks, ke = _span(text, "Jane Roe")
+        dets = [
+            Detection("PERSON", js, je, 0.9, "pii-x"),
+            Detection("PERSON", ks, ke, 0.9, "pii-x"),
+        ]
+        merged = scorer._merge_adjacent_same_type(dets, text)
+        assert len(merged) == 2
+
+    def test_adjacent_different_type_spans_not_merged(self) -> None:
+        # Two back-to-back spans of DIFFERENT types must never merge, even when
+        # separated only by whitespace.
+        text = "John john@x.com"
+        ps, pe = _span(text, "John")
+        es, ee = _span(text, "john@x.com")
+        dets = [
+            Detection("PERSON", ps, pe, 0.9, "pii-x"),
+            Detection("EMAIL", es, ee, 0.9, "pii-x"),
+        ]
+        merged = scorer._merge_adjacent_same_type(dets, text)
+        assert len(merged) == 2
 
     def test_shared_labels_map_to_correct_entity_types(self) -> None:
         text = "John Doe, john@x.com, +1 415 555 1212, 1 Main St"

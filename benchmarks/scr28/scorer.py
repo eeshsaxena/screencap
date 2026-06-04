@@ -4,8 +4,8 @@
 The scorer never imports a model. It loads a :class:`PredictionFile` (emitted by
 ``run_gliner.py`` or ``run_privacy_filter.py``), maps each native label to an
 ``EntityType`` via :mod:`label_maps`, merges adjacent same-type spans (Presidio
-``SpanEvaluator`` semantics), and grades them through the reused in-repo core
-``score_predictions`` from ``tests/privacy/test_benchmark.py``. This gives both
+``SpanEvaluator`` semantics), and grades them through the reused core
+``score_predictions`` from ``scoring_core.py``. This gives both
 models identical matching + per-type aggregation + Markdown/JSON output.
 
 Usage::
@@ -27,19 +27,20 @@ import json
 import sys
 from pathlib import Path
 
-# Make the repo importable (mirrors benchmarks/benchmark_pii.py).
-_PROJECT_ROOT = Path(__file__).resolve().parents[2]
-for _p in (_PROJECT_ROOT / "src", _PROJECT_ROOT):
-    if str(_p) not in sys.path:
-        sys.path.insert(0, str(_p))
+# Put this script's own dir on sys.path so the sibling flat modules (`_path_setup`
+# et al.) import whether this runs as a script or as `benchmarks.scr28.scorer`.
+# `_path_setup` then adds src/ + the project root.
+sys.path.insert(0, str(Path(__file__).resolve().parent))
 
-# Make sibling spike modules importable whether run as a script or imported.
-_SCR28_DIR = Path(__file__).resolve().parent
-if str(_SCR28_DIR) not in sys.path:
-    sys.path.insert(0, str(_SCR28_DIR))
-
+import _path_setup  # noqa: F401,E402  (import for side effect: bootstraps sys.path)
 from label_maps import OUT_OF_SCOPE, map_label  # noqa: E402
 from schema import CasePrediction, PredictionFile  # noqa: E402
+from scoring_core import (  # noqa: E402
+    AggregateResult,
+    print_benchmark_table,
+    save_benchmark_json,
+    score_predictions,
+)
 
 from screencap.privacy import Detection, DetectionResult, normalize_text  # noqa: E402
 from tests.privacy.fixtures.test_corpus import (  # noqa: E402
@@ -47,12 +48,6 @@ from tests.privacy.fixtures.test_corpus import (  # noqa: E402
     TRUE_POSITIVE_CASES,
     CorpusCase,
     ExpectedEntity,
-)
-from tests.privacy.test_benchmark import (  # noqa: E402
-    AggregateResult,
-    print_benchmark_table,
-    save_benchmark_json,
-    score_predictions,
 )
 
 
@@ -77,18 +72,38 @@ def _merge_adjacent_same_type(
     Handles a name emitted as ``first name`` + ``last name`` (two PERSON spans)
     matching a single gold PERSON span. Different types, or spans separated by
     non-whitespace text, are never merged.
+
+    Offsets are validated before merging: a pair is only considered mergeable
+    when both spans lie within ``text`` and are ordered
+    (``0 <= last.end <= det.start <= len(text)`` for the gap case, with
+    ``det.end <= len(text)``). Out-of-range or negative offsets are rejected
+    (left unmerged) rather than relying on Python's clamping slice semantics,
+    which would otherwise let a bogus span swallow its neighbour.
     """
     if not detections:
         return []
+    n = len(text)
     ordered = sorted(detections, key=lambda d: (d.start, d.end))
     merged: list[Detection] = [ordered[0]]
     for det in ordered[1:]:
         last = merged[-1]
-        gap = text[last.end : det.start] if det.start > last.end else ""
         same_type = det.entity_type == last.entity_type
-        touching_or_overlap = det.start <= last.end
-        sep_only = gap == "" or gap.isspace()
-        if same_type and (touching_or_overlap or sep_only):
+        # Both spans must be in-range for the gap/overlap reasoning below to be
+        # meaningful; reject anything negative or past end-of-text.
+        in_range = (
+            0 <= last.start <= last.end <= n
+            and 0 <= det.start <= det.end <= n
+        )
+        mergeable = False
+        if same_type and in_range:
+            if det.start <= last.end:
+                # Touching or overlapping (offsets already validated in-range).
+                mergeable = True
+            else:
+                # Separated: merge only when the gap is whitespace-only.
+                gap = text[last.end : det.start]
+                mergeable = gap == "" or gap.isspace()
+        if mergeable:
             merged[-1] = Detection(
                 entity_type=last.entity_type,
                 start=last.start,
@@ -144,6 +159,13 @@ def build_predictions_by_case(
             # Prediction for a case not in the gold set — skip; the gold set is
             # authoritative for what gets scored.
             continue
+        if case_pred.case_id in out:
+            # Two prediction entries for the same case would silently overwrite
+            # each other (losing the first model's spans). The prediction file
+            # is malformed — fail loudly rather than score a partial result.
+            raise ValueError(
+                f"duplicate case_id {case_pred.case_id!r} in prediction file"
+            )
         out[case_pred.case_id] = DetectionResult(
             normalized_text=normalized,
             detections=case_prediction_to_detections(
@@ -178,21 +200,21 @@ def load_cases_jsonl(path: Path) -> list[CorpusCase]:
          "is_false_positive": false, "frequency": null}
     """
     cases: list[CorpusCase] = []
-    for line in Path(path).read_text().splitlines():
-        line = line.strip()
-        if not line:
-            continue
-        d = json.loads(line)
-        expected = [
-            ExpectedEntity(
-                entity_type=e["entity_type"],
-                substring=e["substring"],
-                source=e.get("source"),
-            )
-            for e in d.get("expected", [])
-        ]
-        cases.append(
-            CorpusCase(
+    with Path(path).open() as fh:
+        for line in fh:
+            line = line.strip()
+            if not line:
+                continue
+            d = json.loads(line)
+            expected = [
+                ExpectedEntity(
+                    entity_type=e["entity_type"],
+                    substring=e["substring"],
+                    source=e.get("source"),
+                )
+                for e in d.get("expected", [])
+            ]
+            case = CorpusCase(
                 id=d["id"],
                 description=d.get("description", ""),
                 text=d["text"],
@@ -200,7 +222,21 @@ def load_cases_jsonl(path: Path) -> list[CorpusCase]:
                 is_false_positive=d.get("is_false_positive", False),
                 frequency=d.get("frequency"),
             )
-        )
+            # The scorer reconstructs each case's normalized text via
+            # normalize_text (the same transform the extractor/runner applied).
+            # If a gold substring isn't found there, the offsets are misaligned —
+            # warn loudly so the misalignment surfaces instead of silently
+            # scoring it as a miss.
+            normalized = normalize_text(case.text)
+            for exp in expected:
+                if exp.substring and exp.substring not in normalized:
+                    print(
+                        f"[warn] gold case {case.id!r}: expected substring "
+                        f"{exp.substring!r} ({exp.entity_type}) not found in "
+                        f"normalize_text(text) — gold/text misalignment.",
+                        file=sys.stderr,
+                    )
+            cases.append(case)
     return cases
 
 

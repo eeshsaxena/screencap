@@ -68,6 +68,10 @@ _VALID_ENTITY_TYPES: frozenset[str] = frozenset(
     if not k.startswith("_") and isinstance(v, str)
 )
 
+# The OUT_OF_SCOPE sentinel must not collide with a real EntityType, or a
+# legitimately-mapped label would be silently treated as unscored.
+assert OUT_OF_SCOPE not in _VALID_ENTITY_TYPES, "OUT_OF_SCOPE sentinel collides with a real EntityType"
+
 
 def map_privacy_filter_label(native: str) -> str | None:
     """privacy-filter native label -> EntityType / OUT_OF_SCOPE / None."""

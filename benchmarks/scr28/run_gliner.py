@@ -25,23 +25,26 @@ from __future__ import annotations
 
 import argparse
 import sys
+from collections.abc import Callable
 from pathlib import Path
+from typing import TYPE_CHECKING
 
-_PROJECT_ROOT = Path(__file__).resolve().parents[2]
-for _p in (_PROJECT_ROOT / "src", _PROJECT_ROOT):
-    if str(_p) not in sys.path:
-        sys.path.insert(0, str(_p))
-_SCR28_DIR = Path(__file__).resolve().parent
-if str(_SCR28_DIR) not in sys.path:
-    sys.path.insert(0, str(_SCR28_DIR))
+# Put this script's own dir on sys.path so the sibling flat modules (`_path_setup`
+# et al.) import whether this runs as a script or as `benchmarks.scr28.run_gliner`.
+# `_path_setup` then adds src/ + the project root.
+sys.path.insert(0, str(Path(__file__).resolve().parent))
 
+import _path_setup  # noqa: F401,E402  (import for side effect: bootstraps sys.path)
 from io_utils import load_input_texts  # noqa: E402
 from schema import CasePrediction, PredictedSpan, PredictionFile  # noqa: E402
+
+if TYPE_CHECKING:
+    from screencap.privacy import Detection
 
 MODES = ("full", "ner", "regex-secrets")
 
 
-def _build_detect(mode: str):
+def _build_detect(mode: str) -> Callable[[str], tuple[str, list["Detection"]]]:
     """Return a ``detect(text) -> (normalized_text, list[Detection])`` callable.
 
     Heavy imports are deferred here so importing this module (e.g. for unit
@@ -89,7 +92,7 @@ def _build_detect(mode: str):
     raise ValueError(f"unknown mode {mode!r}; expected one of {MODES}")
 
 
-def detections_to_spans(detections) -> list[PredictedSpan]:
+def detections_to_spans(detections: list["Detection"]) -> list[PredictedSpan]:
     """Convert ``screencap.privacy.Detection``s to schema ``PredictedSpan``s.
 
     GLiNER's production path already emits ``EntityType`` constants as the

@@ -34,19 +34,22 @@ import argparse
 import subprocess
 import sys
 from pathlib import Path
+from typing import Any
 
-_PROJECT_ROOT = Path(__file__).resolve().parents[2]
-for _p in (_PROJECT_ROOT / "src", _PROJECT_ROOT):
-    if str(_p) not in sys.path:
-        sys.path.insert(0, str(_p))
-_SCR28_DIR = Path(__file__).resolve().parent
-if str(_SCR28_DIR) not in sys.path:
-    sys.path.insert(0, str(_SCR28_DIR))
+# Put this script's own dir on sys.path so the sibling flat modules (`_path_setup`
+# et al.) import whether this runs as a script or as
+# `benchmarks.scr28.run_privacy_filter`. `_path_setup` then adds src/ + project root.
+sys.path.insert(0, str(Path(__file__).resolve().parent))
 
+import _path_setup  # noqa: F401,E402  (import for side effect: bootstraps sys.path)
 from io_utils import load_input_texts  # noqa: E402
 from schema import CasePrediction, PredictedSpan, PredictionFile  # noqa: E402
 
 DEFAULT_MODEL = "openai/privacy-filter"
+
+# opf forks one process per input; above this many inputs the per-process startup
+# cost dominates and the `pipeline` decoder should be used instead.
+OPF_INPUT_CEILING = 1000
 
 
 # ---------------------------------------------------------------------------
@@ -112,7 +115,7 @@ def opf_spans_to_spans(opf_spans: list[dict]) -> list[PredictedSpan]:
 # ---------------------------------------------------------------------------
 
 
-def _build_pipeline(model_id: str, device: str):
+def _build_pipeline(model_id: str, device: str) -> Any:
     """Build the HF token-classification pipeline. Deferred transformers import."""
     from transformers import pipeline  # heavy — imported lazily
 
@@ -156,14 +159,29 @@ def run_via_opf(
         if not normalized:
             predictions.append(CasePrediction(case_id, []))
             continue
-        proc = subprocess.run(
-            ["opf", "--format", "json", "--output-mode", "typed", "--device", device],
-            input=normalized,
-            capture_output=True,
-            text=True,
-            check=True,
-        )
-        payload = json.loads(proc.stdout)
+        try:
+            proc = subprocess.run(
+                ["opf", "--format", "json", "--output-mode", "typed", "--device", device],
+                input=normalized,
+                capture_output=True,
+                text=True,
+                check=True,
+                timeout=120,
+            )
+            payload = json.loads(proc.stdout)
+        except FileNotFoundError:
+            # opf binary missing — fatal: the whole run can't proceed.
+            raise SystemExit("opf not found; is .venv-pf set up?") from None
+        except (subprocess.CalledProcessError, subprocess.TimeoutExpired, json.JSONDecodeError) as exc:
+            # Per-input failure: skip this case (no detections) and keep going so
+            # one bad block doesn't abort the whole tier.
+            print(
+                f"[warn] opf decode failed for case {case_id!r}: "
+                f"{type(exc).__name__}; recording no detections.",
+                file=sys.stderr,
+            )
+            predictions.append(CasePrediction(case_id, []))
+            continue
         opf_spans = payload.get("detected_spans") or payload.get("spans") or []
         predictions.append(CasePrediction(case_id, opf_spans_to_spans(opf_spans)))
     return PredictionFile(model="privacy-filter", tier=tier, predictions=predictions)
@@ -186,6 +204,15 @@ def main() -> None:
     inputs = load_input_texts(args.inputs_jsonl)
     print(f"Running privacy-filter decoder={args.decoder} over {len(inputs)} inputs...")
     if args.decoder == "opf":
+        # opf spawns one subprocess per input — fine at Tier-2 block scale, but
+        # a Tier-1 sweep (thousands of inputs) would fork thousands of processes.
+        if len(inputs) > OPF_INPUT_CEILING:
+            print(
+                f"[warn] opf decoder spawns one process per input and you passed "
+                f"{len(inputs)} (> {OPF_INPUT_CEILING}); this will be very slow. "
+                f"Use --decoder pipeline at Tier-1 scale.",
+                file=sys.stderr,
+            )
         prediction_file = run_via_opf(inputs, args.tier, args.device)
     else:
         prediction_file = run_via_pipeline(inputs, args.model, args.tier, args.device)

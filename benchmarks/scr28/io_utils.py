@@ -18,13 +18,14 @@ def load_input_texts(path: Path | str) -> list[tuple[str, str]]:
     text are read, so a runner can score against either without the gold labels.
     """
     pairs: list[tuple[str, str]] = []
-    for line in Path(path).read_text().splitlines():
-        line = line.strip()
-        if not line:
-            continue
-        d = json.loads(line)
-        case_id = d.get("case_id") or d.get("id")
-        if case_id is None:
-            raise ValueError(f"input record missing 'id'/'case_id': {line[:80]!r}")
-        pairs.append((str(case_id), str(d["text"])))
+    with Path(path).open() as fh:
+        for line in fh:
+            line = line.strip()
+            if not line:
+                continue
+            d = json.loads(line)
+            case_id = d.get("case_id") or d.get("id")
+            if case_id is None:
+                raise ValueError(f"input record missing 'id'/'case_id': {line[:80]!r}")
+            pairs.append((str(case_id), str(d["text"])))
     return pairs

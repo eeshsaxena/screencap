@@ -33,6 +33,7 @@ from __future__ import annotations
 
 import argparse
 import json
+import os
 import sqlite3
 import sys
 import tempfile
@@ -54,8 +55,15 @@ RECORDINGS_DIR = Path.home() / ".screencap" / "recordings"
 def _connect_ro(db_path: Path) -> sqlite3.Connection:
     try:
         return sqlite3.connect(f"file:{db_path}?mode=ro", uri=True)
-    except sqlite3.OperationalError:
-        return sqlite3.connect(str(db_path))
+    except sqlite3.OperationalError as exc:
+        # Only fall back to a plain (read-write) connection when URI mode itself
+        # is unsupported by this sqlite build. Permission-denied / corrupt-DB /
+        # other operational errors must propagate so they fail loudly rather
+        # than silently opening (and possibly creating) a writable DB.
+        msg = str(exc).lower()
+        if "uri" in msg or "unable to open database" in msg:
+            return sqlite3.connect(str(db_path))
+        raise
 
 
 def _has_table(conn: sqlite3.Connection, table: str) -> bool:
@@ -134,11 +142,14 @@ def _screenshot_files(
         return []
     has_path = _has_column(conn, "screenshot", "image_path")
     has_blob = _has_column(conn, "screenshot", "png_data")
+
+    # Select only lightweight metadata (id + image_path) ordered by timestamp;
+    # the potentially large png_data blob is fetched per-row only when a row
+    # actually needs the temp-file fallback — so we never pull every blob into
+    # memory just to take the first ``max_screenshots`` shots.
     cols = ["id"]
     if has_path:
         cols.append("image_path")
-    if has_blob:
-        cols.append("png_data")
     rows = conn.execute(
         f"SELECT {', '.join(cols)} FROM screenshot ORDER BY timestamp"
     ).fetchall()
@@ -147,19 +158,25 @@ def _screenshot_files(
     for row in rows:
         if len(out) >= max_screenshots:
             break
-        row_id = row[0]
         rec = dict(zip(cols, row))
+        row_id = rec["id"]
         rel = rec.get("image_path")
         if rel:
             candidate = rec_dir / rel
             if candidate.exists():
                 out.append((f"screenshot:{row_id}:{rel}", candidate))
                 continue
-        blob = rec.get("png_data")
-        if blob:
-            tmp = Path(tempfile.mkstemp(suffix=".png", prefix="scr28-ocr-")[1])
-            tmp.write_bytes(blob)
-            out.append((f"screenshot:{row_id}:blob", tmp))
+        if has_blob:
+            blob_row = conn.execute(
+                "SELECT png_data FROM screenshot WHERE id=?", (row_id,)
+            ).fetchone()
+            blob = blob_row[0] if blob_row else None
+            if blob:
+                fd, tmp_str = tempfile.mkstemp(suffix=".png", prefix="scr28-ocr-")
+                os.close(fd)
+                tmp = Path(tmp_str)
+                tmp.write_bytes(blob)
+                out.append((f"screenshot:{row_id}:blob", tmp))
     return out
 
 
@@ -216,6 +233,13 @@ def extract_recording(
         raise SystemExit(f"no recording.db in {rec_dir}")
     rec_name = rec_dir.name
 
+    # NFKC-style normalization applied at extraction so the written text is
+    # already what the scorer (which re-normalizes gold) sees — makes the
+    # "already normalize_text-d at extraction" annotation contract true and
+    # keeps offsets aligned. normalize_text is idempotent, so re-normalizing
+    # downstream is a no-op.
+    from screencap.privacy import normalize_text
+
     conn = _connect_ro(db_path)
     try:
         ax = extract_ax_blocks(conn, limit=max_ax)
@@ -228,7 +252,7 @@ def extract_recording(
     counters = {"ocr": 0, "ax": 0}
     for modality, blocks in (("ocr", ocr), ("ax", ax)):
         for source_ref, text in blocks:
-            text = text.strip()
+            text = normalize_text(text.strip())
             if len(text) < min_len:
                 continue
             if dedup:
@@ -274,7 +298,20 @@ def main() -> None:
         dedup=not args.no_dedup,
     )
 
+    # Defense-in-depth: the output is trackable real PII and the .gitignore
+    # guards only cover paths under tier2_testbed/. Refuse to write anywhere
+    # else so a mistyped --out fails loudly instead of silently emitting PII to
+    # an un-gitignored location.
+    testbed_dir = Path(__file__).resolve().parent
     out_path = Path(args.out)
+    resolved_out = out_path.expanduser().resolve()
+    if not resolved_out.is_relative_to(testbed_dir):
+        raise SystemExit(
+            f"refusing to write extract to {resolved_out} — output must be inside "
+            f"{testbed_dir} (the only path the .gitignore PII guards cover). "
+            f"Pass an --out under tier2_testbed/."
+        )
+
     out_path.parent.mkdir(parents=True, exist_ok=True)
     with out_path.open("w") as fh:
         for rec in records:
