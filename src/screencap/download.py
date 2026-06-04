@@ -100,6 +100,8 @@ def list_remote_recordings() -> list[RemoteRecording]:
     retired ``sessions`` namespace and its ``get-index`` are gone, so this is
     recordings-only.
     """
+    import keyring.errors
+
     from screencap import auth
 
     url = _get_download_url()
@@ -113,6 +115,13 @@ def list_remote_recordings() -> list[RemoteRecording]:
     except auth.AuthError as e:
         # Transient refresh failure on the 401 retry — credential still valid.
         raise RuntimeError(f"Cloud auth temporarily unavailable; try again: {e}")
+    except keyring.errors.KeyringError:
+        # The Keychain itself is unreadable (locked, backend error) — distinct from
+        # "not signed in". Surface a clean message instead of a raw traceback.
+        raise RuntimeError(
+            "Couldn't read your saved credentials (Keychain locked?). "
+            "Unlock the Keychain and try again."
+        )
     except requests.ConnectionError:
         raise RuntimeError(
             "Download service unavailable. Check your internet connection."
@@ -146,6 +155,8 @@ def request_signed_urls(recording_name: str) -> tuple[dict[str, str], str]:
     Attaches a Firebase bearer token (the function signs only under the caller's
     ``users/{uid}/recordings/`` namespace) with a 401 refresh-retry-once.
     """
+    import keyring.errors
+
     from screencap import auth
 
     url = _get_download_url()
@@ -164,6 +175,13 @@ def request_signed_urls(recording_name: str) -> tuple[dict[str, str], str]:
     except auth.AuthError as e:
         # Transient refresh failure on the 401 retry — credential still valid.
         raise RuntimeError(f"Cloud auth temporarily unavailable; try again: {e}")
+    except keyring.errors.KeyringError:
+        # The Keychain itself is unreadable (locked, backend error) — distinct from
+        # "not signed in". Surface a clean message instead of a raw traceback.
+        raise RuntimeError(
+            "Couldn't read your saved credentials (Keychain locked?). "
+            "Unlock the Keychain and try again."
+        )
     except requests.ConnectionError:
         raise RuntimeError(
             "Download service unavailable. Check your internet connection."

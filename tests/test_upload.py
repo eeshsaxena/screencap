@@ -544,6 +544,32 @@ def test_upload_command_not_signed_in_refuses_and_touches_nothing(tmp_path, monk
     assert not (rec / UPLOAD_STATUS_FILE).exists()
 
 
+def test_upload_command_keychain_locked_refuses_and_touches_nothing(tmp_path, monkeypatch):
+    import keyring.errors
+
+    rec = tmp_path / "my-rec"
+    rec.mkdir()
+    (rec / "video.mp4").write_bytes(b"x" * 100)
+
+    def keychain_locked(force_refresh=False):
+        raise keyring.errors.KeyringError("Keychain locked")
+
+    monkeypatch.setattr("screencap.auth.get_id_token", keychain_locked)
+
+    runner = CliRunner()
+    with (
+        mock.patch("screencap.upload.get_recordings_dir", return_value=tmp_path),
+        mock.patch("screencap.upload.requests.post") as post,
+    ):
+        result = runner.invoke(cli, ["upload", "my-rec"])
+
+    assert result.exit_code == 1
+    assert "Keychain locked" in result.output  # distinct from "not signed in"
+    post.assert_not_called()
+    assert not (rec / "events.jsonl").exists()
+    assert not (rec / UPLOAD_STATUS_FILE).exists()
+
+
 def test_upload_command_dry_run_does_not_require_auth(tmp_path, monkeypatch):
     from screencap import auth
 

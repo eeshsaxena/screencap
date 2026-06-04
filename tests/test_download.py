@@ -784,3 +784,21 @@ def test_download_paths_not_signed_in_message(monkeypatch):
         with pytest.raises(RuntimeError, match="screencap login"):
             request_signed_urls("rec-001")
     post.assert_not_called()
+
+
+def test_download_paths_keychain_locked_message(monkeypatch):
+    import keyring.errors
+
+    from screencap.download import list_remote_recordings, request_signed_urls
+
+    def keychain_locked(force_refresh=False):
+        raise keyring.errors.KeyringError("Keychain locked")
+
+    monkeypatch.setattr("screencap.auth.get_id_token", keychain_locked)
+
+    with mock.patch("screencap.download.requests.post") as post:
+        with pytest.raises(RuntimeError, match="Keychain locked"):
+            list_remote_recordings()
+        with pytest.raises(RuntimeError, match="Keychain locked"):
+            request_signed_urls("rec-001")
+    post.assert_not_called()  # no network call without a readable credential

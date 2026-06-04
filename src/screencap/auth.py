@@ -36,6 +36,7 @@ from collections.abc import Callable
 from contextlib import contextmanager
 from dataclasses import dataclass
 from http.server import BaseHTTPRequestHandler, HTTPServer
+from pathlib import Path
 from typing import TypedDict
 from urllib.parse import parse_qs, urlencode, urlparse
 
@@ -185,8 +186,6 @@ def _read_engine_token() -> str | None:
     path = os.environ.get(ENGINE_TOKEN_FILE_ENV)
     if not path:
         return None
-    from pathlib import Path
-
     try:
         token = Path(path).read_text().strip()
     except OSError:
@@ -519,7 +518,9 @@ def get_id_token(force_refresh: bool = False) -> str:
     to the Keychain path — and raises NotSignedIn if the daemon supplied none, so the
     live-upload path fails closed. In the interactive/login context it reads the
     Keychain refresh token. ``force_refresh=True`` re-mints from the refresh token even
-    when the cached ID token still looks fresh (used by the cloud paths' 401-retry).
+    when the cached ID token still looks fresh (used by the cloud paths' 401-retry); it
+    has NO effect in the engine context (only the daemon can re-mint — the engine just
+    re-reads the file, picking up a daemon re-mint if one has landed).
 
     Raises NotSignedIn if there is no usable credential, or AuthError on a transient
     refresh failure (network). Callers attach the result as ``Authorization: Bearer``.
@@ -557,14 +558,15 @@ def authed_post(
     to a "run ``screencap login``" message) and any exception ``post`` raises
     (``ConnectionError`` / ``Timeout``). Returns the final response.
     """
-    # range(2) always assigns resp on the first iteration, so the return is
-    # provably non-Optional — callers can dereference .status_code without a guard.
-    for attempt in range(2):
-        token = get_id_token(force_refresh=attempt > 0)
+    token = get_id_token()
+    resp = post(url, json=json, headers={"Authorization": f"Bearer {token}"}, timeout=timeout)
+    if resp.status_code == 401:
+        # Token rejected (clock skew / rotation / revocation) — force a refresh and
+        # retry the single call once. In the engine context get_id_token re-reads
+        # the daemon-supplied file (force_refresh is a no-op there); a still-stale
+        # file yields another 401 the caller fails closed on.
+        token = get_id_token(force_refresh=True)
         resp = post(url, json=json, headers={"Authorization": f"Bearer {token}"}, timeout=timeout)
-        if resp.status_code == 401 and attempt == 0:
-            continue  # token rejected — refresh + retry the single call once
-        break
     return resp
 
 

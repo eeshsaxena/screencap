@@ -557,20 +557,22 @@ class Supervisor:
 
     @staticmethod
     def _prune_stale_engine_token_files() -> None:
-        """Delete any leftover ``engine-token-*.jwt`` files at daemon startup.
+        """Delete any leftover ``engine-token-*`` files at daemon startup.
 
         On a clean stop ``_cleanup_engine_token_file`` removes the live token, but
         a hard crash / SIGKILL runs no Python teardown, so a 0600 file holding a
         short-lived ID token can survive in the run dir until expiry. At daemon
         startup no live recording can legitimately own one (the engine that read it
-        is gone), so unlink every survivor. Best-effort: a failure is logged and
-        never blocks reconciliation, mirroring ``_cleanup_engine_token_file``.
+        is gone), so unlink every survivor. The glob covers both the canonical
+        ``.jwt`` and a ``.jwt.tmp`` residue from a crash between write and rename
+        (which also holds a live token). Best-effort: a failure is logged and never
+        blocks reconciliation, mirroring ``_cleanup_engine_token_file``.
         """
         from screencap.config import get_base_dir
 
         run_dir = get_base_dir() / "run"
         try:
-            stale = list(run_dir.glob("engine-token-*.jwt"))
+            stale = list(run_dir.glob("engine-token-*"))
         except OSError as exc:
             logger.warning("daemon: could not scan for stale engine token files: %s", exc)
             return
@@ -953,7 +955,7 @@ class Supervisor:
         no token, the live upload fails closed (chunks FAILED, nothing deleted),
         and the recording still proceeds locally. Never raises.
         """
-        if not getattr(request, "cloud_intent", False):
+        if not request.cloud_intent:
             return None
         from screencap import auth
 
@@ -987,7 +989,12 @@ class Supervisor:
     def _write_engine_token_file(path: Path, token: str) -> None:
         """Atomically write *token* to *path* with mode 0600 (same-EUID only)."""
         tmp = path.with_suffix(path.suffix + ".tmp")
-        fd = os.open(str(tmp), os.O_WRONLY | os.O_CREAT | os.O_TRUNC, 0o600)
+        # O_NOFOLLOW: reject a pre-planted symlink at the tmp path so a same-EUID
+        # actor can't redirect the live token write — matches the run-dir 0600
+        # hardening convention in audit_log.py / socket.py.
+        fd = os.open(
+            str(tmp), os.O_WRONLY | os.O_CREAT | os.O_TRUNC | os.O_NOFOLLOW, 0o600
+        )
         try:
             os.write(fd, token.encode("ascii"))
         finally:
