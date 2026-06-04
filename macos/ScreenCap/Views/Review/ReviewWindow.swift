@@ -20,6 +20,7 @@ let ReviewWindowID = "review"
 struct ReviewWindow: View {
     let recordingName: String
     @EnvironmentObject private var index: RecordingsIndex
+    @EnvironmentObject private var auth: CloudAuthController
     @Environment(\.dismiss) private var dismiss
     @StateObject private var model: ReviewWindowViewModel
 
@@ -27,6 +28,13 @@ struct ReviewWindow: View {
     @State private var timelineEvents: [TimelineEvent] = []
     @State private var currentTime: Double = 0
     @State private var timelineLoaded = false
+    /// Drives the "Sign in to upload" sheet (plan U6). Shown when Upload is
+    /// tapped while signed out, instead of letting the CLI refuse opaquely.
+    @State private var showSignInSheet = false
+    /// Tracks whether this window has incremented the auth controller's
+    /// active-upload count, so Sign Out stays disabled for exactly the span of
+    /// this window's upload and the count is balanced on close.
+    @State private var countedUpload = false
 
     init(recordingName: String) {
         self.recordingName = recordingName
@@ -69,9 +77,55 @@ struct ReviewWindow: View {
                     }
                 }
             }
+            syncUploadCount(for: newState)
+        }
+        .sheet(isPresented: $showSignInSheet) {
+            SignInPromptView(
+                auth: auth,
+                onSignedIn: {
+                    showSignInSheet = false
+                    model.startUpload()
+                },
+                onDismiss: {
+                    auth.cancelSignIn()
+                    showSignInSheet = false
+                }
+            )
         }
         .onDisappear {
             model.windowDidClose()
+            // Balance the active-upload count if the window closes mid-upload
+            // (onChange won't fire after the view is gone).
+            if countedUpload {
+                countedUpload = false
+                auth.uploadDidFinish()
+            }
+        }
+    }
+
+    /// Upload tapped (the `.ready` and `.failed`-with-retry action). Signed in
+    /// → start the upload; signed out → present the sign-in prompt rather than
+    /// letting `screencap upload` refuse opaquely (plan U6).
+    private func attemptUpload() {
+        if auth.isSignedIn {
+            model.startUpload()
+        } else {
+            showSignInSheet = true
+        }
+    }
+
+    /// Keeps the auth controller's active-upload count in lockstep with this
+    /// window's upload lifecycle so Sign Out is disabled only while an upload
+    /// is actually in flight (design-review state c).
+    private func syncUploadCount(for state: ReviewState) {
+        let uploading: Bool
+        if case .uploading = state { uploading = true } else { uploading = false }
+        if uploading && !countedUpload {
+            countedUpload = true
+            auth.uploadDidStart()
+        } else if !uploading && countedUpload {
+            countedUpload = false
+            auth.uploadDidFinish()
         }
     }
 
@@ -171,7 +225,7 @@ struct ReviewWindow: View {
                 Spacer()
                 Button("Cancel") { dismiss() }
                     .keyboardShortcut(.cancelAction)
-                Button("Upload") { model.startUpload() }
+                Button("Upload") { attemptUpload() }
                     .keyboardShortcut(.defaultAction)
                     .buttonStyle(.borderedProminent)
             }
@@ -225,7 +279,7 @@ struct ReviewWindow: View {
                 Spacer()
                 Button("Close") { dismiss() }
                 if retryData != nil {
-                    Button("Retry") { model.startUpload() }
+                    Button("Retry") { attemptUpload() }
                         .keyboardShortcut(.defaultAction)
                         .buttonStyle(.borderedProminent)
                 }

@@ -13,6 +13,7 @@ struct ScreenCapApp: App {
     @StateObject private var permissions = PermissionController()
     @StateObject private var index = RecordingsIndex()
     @StateObject private var privacy = PrivacyController()
+    @StateObject private var auth = CloudAuthController()
 
     var body: some Scene {
         // Use `Window` (macOS 13+) rather than `WindowGroup` so the scene is
@@ -27,6 +28,7 @@ struct ScreenCapApp: App {
                 .environmentObject(permissions)
                 .environmentObject(index)
                 .environmentObject(privacy)
+                .environmentObject(auth)
                 .frame(minWidth: 880, minHeight: 560)
                 .background(OpenWindowBridge())
                 .onAppear {
@@ -34,6 +36,15 @@ struct ScreenCapApp: App {
                     recorder.bindIndex(index)
                     recorder.bindPermissions(permissions)
                     permissions.refresh()
+                }
+                .task {
+                    // Cloud sign-in state. Runs concurrently with the daemon
+                    // probe below (separate `.task`) so a slow `whoami` refresh
+                    // never delays recording-engine startup. Local recording is
+                    // never gated on auth (R3).
+                    if ProcessInfo.processInfo.environment["XCTestConfigurationFilePath"] == nil {
+                        await auth.refresh()
+                    }
                 }
                 .task {
                     if ProcessInfo.processInfo.environment["XCTestConfigurationFilePath"] == nil {
@@ -69,6 +80,7 @@ struct ScreenCapApp: App {
             if let name = recordingName {
                 ReviewWindow(recordingName: name)
                     .environmentObject(index)
+                    .environmentObject(auth)
             } else {
                 Text("Review window not available.")
                     .padding()
@@ -79,6 +91,7 @@ struct ScreenCapApp: App {
         MenuBarExtra {
             MenuBarMenu()
                 .environmentObject(recorder)
+                .environmentObject(auth)
         } label: {
             MenuBarLabel(
                 isRecording: recorder.state.isRecording,
