@@ -17,7 +17,7 @@ Make the signing Cloud Function the security boundary: it verifies a Firebase ID
 
 ## Execution Status
 
-> Tracks what has shipped so the plan reflects reality. Updated 2026-06-03 (ce-work): the U5 remainder shipped on `feat/per-user-cloud-storage-isolation-u5`. Status stays `active` until the remaining units (U6–U10) land.
+> Tracks what has shipped so the plan reflects reality. Updated 2026-06-04 (ce-work): U6 (macOS sign-in surface) shipped on `feat/per-user-cloud-storage-isolation-u6`; the U5 remainder merged via PR #212. Status stays `active` until the remaining units (U7–U10) land.
 
 **Shipped on `feat/per-user-cloud-storage-isolation`** (the backend security boundary + client auth foundation — deploys and tests in isolation; nothing user-facing breaks):
 
@@ -27,12 +27,16 @@ Make the signing Cloud Function the security boundary: it verifies a Firebase ID
 - **U4 — done** (`5276c3b8`): CLI `login`/`logout`/`whoami` + `get_id_token` (loopback OAuth+PKCE → `signInWithIdp`, Keychain refresh token, transparent refresh/rotation; `NotSignedIn` vs transient `AuthError`).
 - **U5 — done**: the self-capture sub-scope (`4e545c68`) blocked auth/token hosts from `--network` (override-proof `REQUIRED_AUTH_IGNORE_HOSTS`) + the `proxy_runner` fail-closed gate. The remainder shipped on `feat/per-user-cloud-storage-isolation-u5`: out-of-band engine token seam + `force_refresh` (`7abb773d`); fail-closed characterization test (`69087b81`); bearer-token threading through `upload.py` (`9e5d090e`) and `download.py` (`a0aca91a`) via the shared `auth.authed_post` (`9215d6c4`, 401-refresh-retry-once); removal of the retired `--remote`/`--sessions` session surfaces (`a0aca91a`) and the public `screencap.sh` viewer URLs (`066e0265`); the `screencap upload` pre-flight sign-in refusal that touches nothing on disk (`066e0265`); and the daemon out-of-band ID-token seam + re-mint timer (`6786e261`). The live-upload fail-closed invariant (auth failure → `ChunkStatus.FAILED`, never sentinel/stub/delete) is preserved and characterized. **Carry-forwards (not blocking U5): the end-to-end mitmdump EFFECT test for `REQUIRED_AUTH_IGNORE_HOSTS`, and the cloud-function upload-checksum re-test after the `google-cloud-storage` 3.x bump.**
 
+**Shipped on `feat/per-user-cloud-storage-isolation-u6`** (the macOS app sign-in surface — depends on U4/U5, both done):
+
+- **U6 — done**: `macos/ScreenCap/` gains a `CloudAuthController` + `CloudAuthService` seam that shells out to `screencap login`/`logout`/`whoami --json` (all token handling stays in Python). A drift-resilient `AuthWhoAmIEnvelope`/`AuthStatus` model decodes `whoami` (malformed/empty → safe signed-out). The menu bar shows the signed-in account + Sign In / Sign Out (Sign Out disabled while `activeUploadCount > 0`); the review-window Upload affordance gates on auth and presents an async, cancellable "Sign in to upload" sheet (`SignInPromptView`) when signed out, proceeding to the upload on success. Sign-in uses the cancellable `CLIClient.spawn` seam with a per-attempt generation token so a cancelled login's late exit can't corrupt a restart. Local recording is never gated (R3). Covered by `macos/ScreenCapTests/CloudAuthControllerTests.swift`. **Known residuals (deferred, non-blocking — see the handoff): concurrent sign-in across two review windows, window-closed-mid-sign-in (self-heals at the 180s loopback timeout), and menu-only stale status.**
+
 **Open Questions resolved during execution (confirmed with the operator):**
 
 - **Auth boundary (was: split deployments?)** → keep a single `--allow-unauthenticated` function; the in-code `resolve_prefix` gate is the boundary, backed by a CI contract test asserting no tokenless request reaches any `users/` code path. (Implemented in U2.)
 - **Public-exposure consent (blocks U8 promotion)** → **promote the real friend-trial recordings after a content/title review gate**; U8 builds the staging + promotion scripts and the live promotion is an operator step.
 
-**Not yet started:** U6 (macOS sign-in surface), U7 (website demo repoint — separate `screencap-website` repo), U8/U9 (migration + decommission scripts/runbooks), U10 (legacy `zkairdrop` decommission runbook).
+**Not yet started:** U7 (website demo repoint — separate `screencap-website` repo), U8/U9 (migration + decommission scripts/runbooks), U10 (legacy `zkairdrop` decommission runbook).
 
 ---
 

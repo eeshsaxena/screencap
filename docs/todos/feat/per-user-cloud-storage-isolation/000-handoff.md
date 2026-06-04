@@ -1,9 +1,9 @@
 ---
-title: "Handoff: continuing per-user cloud storage isolation after U5"
+title: "Handoff: continuing per-user cloud storage isolation after U6"
 type: handoff
 status: open
 created: 2026-06-03
-updated: 2026-06-03
+updated: 2026-06-04
 related_plans:
   - docs/plans/2026-05-29-002-feat-per-user-cloud-storage-isolation-plan.md
 related_runbooks:
@@ -12,19 +12,21 @@ related_runbooks:
 
 # Handoff: per-user cloud storage isolation
 
-The **backend security boundary + the full client auth path** are now done. Units
-U1–U5 have shipped:
+The **backend security boundary + the full client auth path + the macOS sign-in
+surface** are now done. Units U1–U6 have shipped:
 
 - **U1–U4 + the U5 self-capture sub-scope** merged into `main` via PR #210.
-- **The U5 remainder** shipped on branch `feat/per-user-cloud-storage-isolation-u5`
-  (8 commits, pending merge). Read the plan's **`## Execution Status`** first
+- **The U5 remainder** merged into `main` via PR #212.
+- **U6** (macOS sign-in surface, `macos/`) shipped on branch
+  `feat/per-user-cloud-storage-isolation-u6`. Read the plan's
+  **`## Execution Status`** first
   (`docs/plans/2026-05-29-002-feat-per-user-cloud-storage-isolation-plan.md`) — it
   lists every unit's state and the commit SHAs.
 
-The remaining work is **U6 onward** (client + website + migration). Nothing below
-blocks on more client auth plumbing.
+The remaining work is **U7 onward** (website + migration + legacy decommission).
+Nothing below blocks on more client/app work.
 
-## Already shipped (U1–U5)
+## Already shipped (U1–U6)
 
 - **U1–U3** `scripts/cloud-function/` — `verify_bearer` + `resolve_prefix` (the
   demo/users key-builder invariant), per-user `users/{uid}/` isolation + in-code
@@ -39,6 +41,13 @@ blocks on more client auth plumbing.
   argv) with a re-mint timer; `screencap upload` refuses with a sign-in prompt when
   not signed in and touches nothing on disk; the retired `--remote`/`--sessions`
   session surfaces and the public `screencap.sh` viewer URLs are gone.
+- **U6** `macos/ScreenCap/` — a `CloudAuthController` shells out to `screencap
+  login`/`logout`/`whoami --json` (all token handling stays in Python). The menu
+  bar shows the signed-in account + Sign In / Sign Out (Sign Out disabled while an
+  upload is in flight); the review-window Upload affordance gates on auth state and
+  presents an async, cancellable "Sign in to upload" sheet when signed out instead
+  of an opaque CLI refusal. `whoami` decode is drift-resilient; local recording is
+  never gated (R3). Tested in `macos/ScreenCapTests/CloudAuthControllerTests.swift`.
 
 ## Decisions already resolved (do not re-litigate)
 
@@ -64,20 +73,35 @@ every current client.
 
 ## Remaining work (dependency order)
 
-1. **U6** — macOS Swift sign-in surface (`macos/`): shell out to `screencap login`
-   (async, cancellable) + `whoami --json`; gate the Upload affordance on auth state;
-   needs an Xcode build to verify. Depends on U4/U5 (both done).
-2. **U7** — repoint the **`screencap-website`** repo (sibling path) at the `demo-*`
+1. **U7** — repoint the **`screencap-website`** repo (sibling path) at the `demo-*`
    actions; remove the `sessions/` routes; add an empty-gallery placeholder (U8
-   promotion may legitimately yield zero recordings).
-3. **U8 / U9** — migration scripts (`migrate_flat_to_staging.py`,
+   promotion may legitimately yield zero recordings). Separate repo → its own branch
+   + PR.
+2. **U8 / U9** — migration scripts (`migrate_flat_to_staging.py`,
    `promote_staging_to_demo.py`, `decommission_flat_namespace.py`) +
    `docs/runbooks/cloud-migration-runbook.md`. Live runs are operator steps; U8's
    first pre-check removes any `allUsers`/`allAuthenticatedUsers` bucket-IAM binding.
-4. **U10** — legacy `zkairdrop` decommission runbook (revoke public access on the
+3. **U10** — legacy `zkairdrop` decommission runbook (revoke public access on the
    frozen backup buckets; it is a second public door to the same data — R7/R9).
 
-### U5 carry-forwards (not blocking U6+, do before the function deploys)
+### U6 known residuals (rare multi-window / lifecycle, deferred from the U6 PR)
+
+These are non-blocking edge cases in the macOS sign-in flow, surfaced by code
+review and deliberately deferred (the security boundary is unaffected — the upload
+path fail-closes in Python regardless):
+
+- **Concurrent sign-in from two open review windows.** `signInFlow` is a single
+  app-wide `CloudAuthController`; a second review window's sheet shows the shared
+  in-progress spinner but its `onSignedIn` does not fire on completion (only the
+  first attempt's completion is retained), so it won't auto-dismiss/upload.
+- **Window closed mid-sign-in.** Closing a review window while its sheet's login is
+  in flight does not cancel it; the login subprocess self-heals at the U4 180s
+  loopback timeout and the flow lands on `.failed`.
+- **Menu-only stale status.** `auth.refresh()` runs on the main window's `.task`; if
+  the user operates only via the menu bar after closing the main window, the account
+  line can go stale until the main window reopens (no menu-open re-check).
+
+### U5 carry-forwards (not blocking U7+, do before the function deploys)
 
 - **mitmdump EFFECT test** for `REQUIRED_AUTH_IGNORE_HOSTS` — prove `--network`
   self-recording cannot capture the bearer/refresh-token exchange end-to-end (the
@@ -101,6 +125,12 @@ every current client.
   silently land work in the wrong checkout).
 - The 11 resolved review todos in this directory record each #210 finding's fix
   commit + test.
+- **U6 verify note:** the macOS app/CLI sign-in path is wired, but `screencap login`
+  cannot complete end-to-end until the OAuth client id + Web API key placeholders in
+  `src/screencap/auth.py` are provisioned (`docs/runbooks/cloud-auth-setup.md`). The
+  U6 Swift side is unit-tested against a faked CLI seam; a live browser round-trip
+  needs provisioning first.
 
-Start by reading the plan's Execution Status, then tackle U6 (macOS sign-in) and U7
-(website demo repoint) — they unblock the migration units and the eventual deploy.
+Start by reading the plan's Execution Status, then tackle U7 (website demo repoint,
+in the sibling `screencap-website` repo) — it unblocks the migration units and the
+eventual deploy. U8/U9 (migration) and U10 (legacy decommission) follow.

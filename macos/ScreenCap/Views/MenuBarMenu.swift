@@ -7,6 +7,8 @@ import SwiftUI
 /// instead of the Stop button so the user sees progress.
 struct MenuBarMenu: View {
     @EnvironmentObject private var recorder: RecorderController
+    @EnvironmentObject private var auth: CloudAuthController
+    @EnvironmentObject private var uploads: UploadCoordinator
     @Environment(\.openWindow) private var openWindow
 
     var body: some View {
@@ -37,12 +39,55 @@ struct MenuBarMenu: View {
 
         Divider()
 
+        // Cloud account (plan U6). The one consistent place to see sign-in
+        // state and sign in / out. Local recording is never gated on this.
+        accountSection
+
+        Divider()
+
         Button("Open ScreenCap") { openMainWindow() }
 
         Divider()
 
         Button("Quit ScreenCap") { NSApp.terminate(nil) }
             .keyboardShortcut("q")
+    }
+
+    /// Account status + Sign In / Sign Out. The in-progress and failed sign-in
+    /// flow states take priority over the persistent status so the user always
+    /// sees what the browser round-trip is doing (design-review states a/b).
+    ///
+    /// This switch over `SignInFlowState` parallels `SignInPromptView.actions`,
+    /// but renders genuinely different controls (menu items vs. a sheet with a
+    /// ProgressView and keyboard-shortcut buttons), so the two intentionally
+    /// stay separate rather than sharing a forced `@ViewBuilder`. Keep the case
+    /// coverage here and there in sync when `SignInFlowState` changes.
+    @ViewBuilder
+    private var accountSection: some View {
+        switch auth.signInFlow {
+        case .inProgress:
+            Text("Signing in… check your browser")
+            Button("Cancel Sign-In") { auth.cancelSignIn() }
+        case .failed(let reason):
+            Text("Sign-in failed: \(reason)")
+            Button("Sign In…") { auth.startSignIn() }
+        case .idle:
+            switch auth.status {
+            case .signedIn:
+                Text(auth.status.accountLabel.map { "Signed in: \($0)" } ?? "Signed in (offline)")
+                Button("Sign Out") { Task { await auth.signOut() } }
+                    // Disabled mid-upload so an in-flight signed-URL request
+                    // can't hit NotSignedIn (design-review state c). Gates on
+                    // both the persistent status and the app-wide upload count
+                    // (owned by `UploadCoordinator`); observing `uploads` here
+                    // is what re-renders the menu when an upload starts/finishes.
+                    .disabled(!(auth.isSignedIn && !uploads.isUploadInFlight))
+            case .signedOut:
+                Button("Sign In…") { auth.startSignIn() }
+            case .unknown:
+                Text("Checking sign-in…")
+            }
+        }
     }
 
     private func openMainWindow() {
