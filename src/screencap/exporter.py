@@ -24,6 +24,23 @@ class ExportError(Exception):
     """Export failed — wraps the underlying cause."""
 
 
+def _unique_tmp_path(final_path: Path | str) -> Path:
+    """A process-unique sibling ``.tmp`` path for an atomic write.
+
+    Two actors on the same crash-recovered recording — two review windows, or
+    review + upload — can run recovery/export against the same source dir
+    concurrently. A fixed ``<name>.tmp`` would let one writer clobber the
+    other's partial temp; a per-process (pid + random) name guarantees they
+    never collide (todo 006). The final ``os.rename`` onto the real path stays
+    atomic, so the destination is always one writer's complete, content-
+    equivalent output (last writer wins).
+    """
+    import uuid
+
+    final = Path(final_path)
+    return final.with_name(f"{final.name}.{os.getpid()}.{uuid.uuid4().hex[:8]}.tmp")
+
+
 def build_export_metadata(exclude_moves: bool) -> dict:
     """Build metadata dict for the JSONL header line."""
     return {
@@ -33,6 +50,34 @@ def build_export_metadata(exclude_moves: bool) -> dict:
         "exported_at": datetime.now(timezone.utc).isoformat(),
         "exclude_moves": exclude_moves,
     }
+
+
+def ensure_canonical_events(recording_dir: Path, *, force: bool = False) -> int | None:
+    """Export the canonical combined ``events.jsonl`` into *recording_dir*.
+
+    The single export config the upload AND native-review paths must agree on
+    so the bytes reviewed are the bytes uploaded (reviewed == uploaded):
+    ``exclude_moves=False`` and ``include_network`` left at its cloud-safe
+    ``False`` default. Chunked recordings ship their per-chunk
+    ``events_*.jsonl`` set (written at record time or by chunk recovery), so the
+    combined export is skipped there.
+
+    Returns the exported event count, or ``None`` when no export was needed —
+    the recording is chunked, or ``events.jsonl`` already exists and ``force``
+    is false (mirrors the upload loop's gate; review has no ``--force``, so it
+    always calls with the default). Raises on export failure; callers decide how
+    to surface it (the review path wraps it as ``ReviewPrepareError``; the upload
+    loop warns and proceeds).
+    """
+    if any(recording_dir.glob("events_*.jsonl")):
+        return None
+    events_path = recording_dir / "events.jsonl"
+    if events_path.exists() and not force:
+        return None
+    meta = build_export_metadata(exclude_moves=False)
+    return export_recording(
+        recording_dir, str(events_path), exclude_moves=False, metadata=meta,
+    )
 
 
 PrivacyFilter = Callable[["WindowSwitchEvent"], "WindowSwitchEvent | None"]
@@ -101,8 +146,8 @@ def export_recording(
                 network_scrub_pipeline=network_scrub_pipeline,
             )
         else:
-            # Atomic write: .tmp → rename
-            tmp_path = output_path + ".tmp"
+            # Atomic write: process-unique .tmp → rename (concurrent-safe, todo 006)
+            tmp_path = _unique_tmp_path(output_path)
             try:
                 with open(tmp_path, "w") as f:
                     count = _write_events(
@@ -144,14 +189,16 @@ def write_events_jsonl(
     recording can produce tens of MB of events. Iterating one event at a
     time bounds peak writer-side memory regardless of the input size.
 
-    Stale-.tmp cleanup: any pre-existing .tmp at the target path is
-    removed before opening the new one. This is defense-in-depth for the
-    SIGKILL/OOM case where a previous run left a partial file behind.
+    The write goes through a **process-unique** ``.tmp`` sibling (pid + random
+    suffix) so two actors recovering/exporting the same recording concurrently
+    never collide on a shared temp path (todo 006); the final rename stays
+    atomic (last writer wins, content-equivalent). A SIGKILL/OOM mid-write
+    leaves that unique tmp orphaned rather than corrupting a fixed-name tmp a
+    later run would adopt.
 
     Args:
-        out_path: Final destination path for the JSONL file. The .tmp
-            sibling is derived by appending ``.tmp`` to the suffix
-            (e.g. ``events.jsonl`` → ``events.jsonl.tmp``).
+        out_path: Final destination path for the JSONL file. The ``.tmp``
+            sibling is process-unique (e.g. ``events.jsonl.<pid>.<rand>.tmp``).
         events: Iterable of Pydantic events. Consumed lazily; supports
             iterators from ``unified_export_events``.
         meta: Header dict written as line 1 via ``json.dumps(meta)``.
@@ -168,10 +215,14 @@ def write_events_jsonl(
         ``model_dump_json``, or by the underlying file I/O is propagated
         after the .tmp file is unlinked.
     """
-    tmp_path = out_path.with_suffix(out_path.suffix + ".tmp")
+    tmp_path = _unique_tmp_path(out_path)
 
-    # Stale .tmp cleanup: a previous SIGKILL/OOM may have left a partial
-    # file at this path. Drop it before we start writing.
+    # Stale .tmp cleanup: drop any leftover at our (unique) path, plus the
+    # legacy fixed-name ``<name>.tmp`` a pre-unique-tmp SIGKILL/OOM may have
+    # left, so old partials don't accumulate. Cleaning the deterministic legacy
+    # name is concurrency-safe — a live concurrent writer uses a unique name and
+    # never touches this one.
+    out_path.with_suffix(out_path.suffix + ".tmp").unlink(missing_ok=True)
     tmp_path.unlink(missing_ok=True)
 
     count = 0

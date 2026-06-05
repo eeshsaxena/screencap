@@ -627,10 +627,11 @@ class TestAuditOutput:
         audit_path = tmp_path / "privacy_audit.json"
         assert audit_path.exists()
         data = json.loads(audit_path.read_text())
-        assert len(data) == 2
+        entries = data["entries"]
+        assert len(entries) == 2
 
         # Verify structure: only safe fields present
-        for entry in data:
+        for entry in entries:
             assert set(entry.keys()) == {
                 "timestamp",
                 "surface",

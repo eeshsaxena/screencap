@@ -2558,217 +2558,6 @@ def _run_api_transcription(api_key, audio_path, transcript_path, transcript_json
                 sys.exit(0)
 
 
-def _recover_chunk_metadata(
-    recording_dir: Path, console: "Console", *, force: bool = False,
-    cloud_bound: bool,
-) -> None:
-    """Generate per-chunk manifests + events JSONL when chunks exist but metadata doesn't.
-
-    This is a recovery path for when ChunkProcessor failed during recording
-    but chunk video files were created. Uses recording.db to derive chunk
-    time ranges and generate the metadata files the Cloud Run processor needs.
-
-    The ``cloud_bound`` keyword argument is REQUIRED (no default) — omitting
-    it raises ``TypeError`` at the call site rather than silently falling
-    open. ``screencap upload`` always passes ``cloud_bound=True`` regardless
-    of ``.recording_intent`` content, because at upload time the data IS
-    becoming cloud-bound by user choice. This closes the local-then-uploaded
-    threat case (recording captured as ``destination=local``, later uploaded).
-
-    LOAD-BEARING ORDERING: ``_recover_chunk_metadata`` MUST be followed by
-    ``scrub_recording`` for cloud-bound recordings before upload. The
-    scrub-layer pointer suppression (Unit 2) only protects recovered
-    cloud-bound JSONL when this ordering holds. The upload command's
-    inner per-recording loop satisfies this — see the ``LOAD-BEARING
-    ORDERING`` comment block immediately preceding the
-    ``_recover_chunk_metadata`` call inside ``upload``. Reordering or
-    adding a recovery path that bypasses the scrubber MUST replicate the
-    in-interval ``mouse.move`` drop at the engine layer or the cloud-bound
-    privacy posture silently degrades.
-
-    Skip-on-error policy: if ``unified_export_events`` raises mid-chunk on
-    a corrupt action_event row that trips ``process_events`` aggregate-state
-    or ``interleave_window_events``, we log a warning and skip writing
-    that chunk's ``events_NNNN.jsonl`` (no file written). Other chunks
-    proceed normally. ``screencap upload --force`` re-runs recovery once
-    underlying data is fixed. Recovery's previous "raw dump tolerates
-    everything" behaviour is intentionally retired by this refactor.
-    """
-    from screencap.recording_db import Row, open_recording_db
-
-    chunk_videos = sorted(recording_dir.glob("chunk_*.mp4"))
-    if not chunk_videos:
-        return  # not a chunked recording
-
-    db_path = recording_dir / "recording.db"
-    if not db_path.exists():
-        return
-
-    # Check which chunks are missing manifests and/or events
-    missing_manifests = []
-    missing_events = []
-    for vf in chunk_videos:
-        # Extract index from filename: chunk_0000.mp4 → 0
-        idx_str = vf.stem.split("_")[1]
-        try:
-            idx = int(idx_str)
-        except ValueError:
-            continue
-        if not (recording_dir / f"chunk_{idx:04d}_manifest.json").exists() or force:
-            missing_manifests.append(idx)
-        if not (recording_dir / f"events_{idx:04d}.jsonl").exists() or force:
-            missing_events.append(idx)
-
-    if not missing_manifests and not missing_events:
-        return
-
-    # Stale .tmp cleanup sweep: a previous SIGKILL/OOM may have left
-    # .tmp files for chunks we're about to re-recover.
-    # write_events_jsonl / generate_manifest also clean their own .tmp,
-    # but this defense-in-depth sweep covers chunks we plan to skip
-    # (e.g. corrupt-row failures) where the writer is never reached.
-    for idx in missing_events:
-        (recording_dir / f"events_{idx:04d}.jsonl.tmp").unlink(missing_ok=True)
-    for idx in missing_manifests:
-        (recording_dir / f"chunk_{idx:04d}_manifest.json.tmp").unlink(missing_ok=True)
-
-    # Derive chunk time ranges from recording.db. Click thresholds and the
-    # disabled-row / schema-drift handling now live inside
-    # ``screencap.export.export_chunk_events`` — recovery only needs the
-    # range arithmetic here.
-    try:
-        with open_recording_db(db_path, row_factory=Row) as conn:
-            rec = conn.execute(
-                "SELECT timestamp FROM recording LIMIT 1"
-            ).fetchone()
-            if not rec:
-                return
-            rec_start = rec["timestamp"]
-
-            first_evt = conn.execute("SELECT MIN(timestamp) as ts FROM action_event").fetchone()
-            last_evt = conn.execute("SELECT MAX(timestamp) as ts FROM action_event").fetchone()
-            if not first_evt or first_evt["ts"] is None:
-                return
-
-            first_ts = first_evt["ts"]
-            last_ts = last_evt["ts"]
-            n_chunks = len(chunk_videos)
-
-            from screencap.config import get_chunk_duration
-            chunk_dur = get_chunk_duration()
-            if chunk_dur <= 0:
-                chunk_dur = (last_ts - first_ts) / max(n_chunks, 1)
-
-            base_ts = min(rec_start, first_ts)
-            chunk_ranges = []
-            for idx in range(n_chunks):
-                c_start = base_ts + idx * chunk_dur
-                c_end = base_ts + (idx + 1) * chunk_dur
-                if idx == n_chunks - 1:
-                    c_end = max(c_end, last_ts + 1.0)  # last chunk extends to cover all events
-                chunk_ranges.append((idx, c_start, c_end))
-    except Exception as e:
-        console.print(f"  [yellow]Warning:[/yellow] Could not derive chunk ranges: {e}")
-        return
-
-    # Generate missing manifests
-    if missing_manifests:
-        with console.status("[dim]Generating chunk manifests...[/dim]"):
-            from screencap.config import get_segmentation_mode
-            from screencap.task_manifest import generate_manifest
-
-            generated = 0
-            seg_mode = get_segmentation_mode()
-            for idx, c_start, c_end in chunk_ranges:
-                if idx in missing_manifests:
-                    try:
-                        generate_manifest(recording_dir, idx, c_start, c_end, segmentation_mode=seg_mode)
-                        generated += 1
-                    except Exception as e:
-                        console.print(f"  [yellow]Warning:[/yellow] Manifest generation failed for chunk {idx}: {e}")
-            if generated:
-                console.print(f"  [dim]Generated {generated} chunk manifest(s)[/dim]")
-
-    # Generate missing per-chunk events via the shared export seam.
-    if missing_events:
-        with console.status("[dim]Exporting per-chunk events...[/dim]"):
-            from screencap.export import export_chunk_events
-            from screencap.exporter import build_export_metadata, write_events_jsonl
-            from screencap.privacy.filter import build_cloud_window_filter
-
-            # Resolve privacy_mode: prefer the locked-at-record-time value
-            # in .recording_intent (matches what the live chunk processor
-            # used) and fall back to current config when the intent file
-            # is missing/corrupt.
-            privacy_mode = _read_intent_privacy_mode(recording_dir)
-            if privacy_mode is None:
-                try:
-                    from screencap.config import get_privacy_config
-                    privacy_mode = get_privacy_config().mode.value
-                except Exception:
-                    privacy_mode = "internal"
-
-            exported = 0
-            for idx, c_start, c_end in chunk_ranges:
-                if idx not in missing_events:
-                    continue
-
-                jsonl_path = recording_dir / f"events_{idx:04d}.jsonl"
-
-                try:
-                    # Per-chunk try so a config-load failure
-                    # (e.g. InvalidPrivacyConfigError) marks one chunk as
-                    # failed instead of aborting the whole recovery.
-                    # Build the cloud filter inline at the call site so
-                    # the privacy posture is visible — and statically
-                    # auditable (see test_privacy_filter_call_graph.py)
-                    # — at every cloud-capable caller.
-                    events_iter = export_chunk_events(
-                        recording_dir,
-                        c_start,
-                        c_end,
-                        window_filter=build_cloud_window_filter(
-                            cloud_bound=cloud_bound,
-                            privacy_mode=privacy_mode,
-                            capture_dir=recording_dir,
-                        ),
-                    )
-
-                    meta = build_export_metadata(exclude_moves=False)
-                    write_events_jsonl(jsonl_path, events_iter, meta)
-                    exported += 1
-                except Exception as e:
-                    # Skip-on-error: a corrupt row that trips process_events
-                    # or interleave invalidates this chunk's export. Other
-                    # chunks proceed normally. write_events_jsonl already
-                    # removed any partial .tmp.
-                    console.print(
-                        f"  [yellow]Warning:[/yellow] Event export failed for chunk {idx}: {e}"
-                    )
-            if exported:
-                console.print(f"  [dim]Exported events for {exported} chunk(s)[/dim]")
-
-
-def _read_intent_privacy_mode(recording_dir: Path) -> str | None:
-    """Read ``privacy_mode`` from ``.recording_intent``, or ``None`` if absent.
-
-    Mirrors :func:`screencap.catalog.read_intent`'s fail-safe behaviour:
-    parse errors, missing keys, and missing files all return ``None`` so
-    the caller falls back to whatever default it considers safe.
-    """
-    intent_path = recording_dir / ".recording_intent"
-    if not intent_path.exists():
-        return None
-    try:
-        data = json.loads(intent_path.read_text())
-    except Exception:
-        return None
-    mode = data.get("privacy_mode")
-    if isinstance(mode, str):
-        return mode
-    return None
-
-
 @cli.command()
 @click.argument("names", nargs=-1)
 @click.option("--all", "all_recordings", is_flag=True, help="Upload all recordings.")
@@ -2856,19 +2645,20 @@ def upload(names, all_recordings, dry_run, force, jobs, no_delete):
         # Auto-export events.jsonl if missing (or --force)
         # Skip if per-chunk JSONL already exists (chunked mode)
         if not dry_run:
-            has_chunk_events = any(d.glob("events_*.jsonl"))
-            jsonl_path = d / "events.jsonl"
-            if not has_chunk_events and (not jsonl_path.exists() or force):
+            # Canonical events export — the shared gate + config (skip when
+            # chunked, exclude_moves=False, include_network off) that keeps the
+            # uploaded event set byte-identical to what the native review
+            # prepares. Returns None when no export was needed.
+            try:
+                from screencap.exporter import ensure_canonical_events
                 with console.status("[dim]Exporting events...[/dim]"):
-                    try:
-                        from screencap.exporter import export_recording, build_export_metadata
-                        meta = build_export_metadata(exclude_moves=False)
-                        count = export_recording(d, str(jsonl_path), exclude_moves=False, metadata=meta)
-                        console.print(f"  [dim]Exported {count} events to events.jsonl[/dim]")
-                        if count == 0:
-                            console.print("[yellow]Warning:[/yellow] Recording contains no events.")
-                    except Exception as e:
-                        console.print(f"  [yellow]Warning:[/yellow] Export failed ({e}), uploading without events.jsonl")
+                    count = ensure_canonical_events(d, force=force)
+                if count is not None:
+                    console.print(f"  [dim]Exported {count} events to events.jsonl[/dim]")
+                    if count == 0:
+                        console.print("[yellow]Warning:[/yellow] Recording contains no events.")
+            except Exception as e:
+                console.print(f"  [yellow]Warning:[/yellow] Export failed ({e}), uploading without events.jsonl")
 
             # Recovery: generate per-chunk manifests + events if chunks exist but metadata doesn't.
             # cloud_bound=True UNCONDITIONALLY: at upload time, the data IS becoming
@@ -2884,6 +2674,8 @@ def upload(names, all_recordings, dry_run, force, jobs, no_delete):
             # protects recovered cloud-bound JSONL when this ordering holds.
             # Reordering or adding a recovery path that bypasses the scrubber
             # must replicate the in-interval mouse.move drop at the engine layer.
+            from screencap.recovery import _recover_chunk_metadata
+
             _recover_chunk_metadata(d, console, force=force, cloud_bound=True)
 
             # Recovery: generate sentinel file if missing (crash/force-quit recovery)
@@ -2911,56 +2703,94 @@ def upload(names, all_recordings, dry_run, force, jobs, no_delete):
                 except Exception:
                     pass
 
-            # Always scrub before upload
-            try:
-                from screencap.scrubber import scrub_recording
+        # Hold a per-recording scrub lock across BOTH the scrubbed-dir decision
+        # and the upload's file enumeration, so a concurrent re-scrub (a second
+        # review window, or --force in another process) can't rmtree the
+        # <name>-scrubbed dir between the reuse verdict and the upload read and
+        # ship a half-rebuilt copy. The lock is released by the context manager
+        # on continue/exception/sys.exit. Dry-run does no scrub → no lock.
+        from screencap.scrubber import recording_scrub_lock
 
-                with console.status(f"[bold]Scrubbing {d.name} for upload...[/bold]"):
-                    scrub_result = scrub_recording(d.name)
-                entity_total = sum(scrub_result.entity_counts.values())
-                console.print(
-                    f"  Scrubbed copy at [dim]{scrub_result.output_dir.name}/[/dim] "
-                    f"({entity_total} redaction(s) applied)."
-                )
-                d = scrub_result.output_dir
-            except Exception as e:
-                console.print(
-                    f"[red]Error:[/red] Scrubbing failed: {e}\n"
-                    "Upload skipped — cannot upload without scrubbing."
-                )
-                all_failed += 1
-                continue
-
-        try:
-            result = upload_recording(d, dry_run=dry_run, force=force, jobs=jobs)
-            all_uploaded += len(result.uploaded)
-            all_skipped += len(result.skipped)
-            all_failed += len(result.failed)
-            all_bytes += result.total_bytes
-
-            if not dry_run and not result.failed:
-                parts = []
-                if result.uploaded:
-                    parts.append(f"{len(result.uploaded)} new")
-                if result.skipped:
-                    parts.append(f"{len(result.skipped)} skipped")
-                summary = ", ".join(parts) if parts else "0 files"
-                if result.gcs_prefix:
-                    console.print(
-                        f"\n[green]Uploaded {d.name}[/green] -> {result.gcs_prefix} ({summary})"
+        _scrub_lock = (
+            recording_scrub_lock(d.name) if not dry_run else contextlib.nullcontext()
+        )
+        with _scrub_lock:
+            # Always scrub before upload — but reuse the review-prepared
+            # scrubbed copy when a completion sentinel + provenance prove it is
+            # complete, current, and built the way upload would build it
+            # (reviewed == uploaded, R3/U4). This avoids a redundant second
+            # scrub on the review→upload path while never shipping a
+            # partial/stale/mutated dir. --force always rebuilds; a scrub
+            # failure still blocks upload (fail-closed preserved).
+            if not dry_run:
+                try:
+                    from screencap.scrubber import (
+                        is_scrubbed_copy_reusable,
+                        scrub_recording,
                     )
-                else:
-                    console.print(f"\n[green]Uploaded {d.name}[/green] ({summary})")
-                # No public screencap.sh viewer URL: user recordings now live
-                # under the private, account-scoped users/{uid}/ namespace, which
-                # the public site cannot render. Web viewing of your own cloud
-                # recordings is deferred; the macOS app/CLI is the interim surface.
-        except FileNotFoundError as e:
-            console.print(f"[red]Error:[/red] {e}")
-            all_failed += 1
-        except RuntimeError as e:
-            console.print(f"[red]Error:[/red] {e}")
-            sys.exit(1)
+
+                    scrubbed_dir = d.parent / f"{d.name}-scrubbed"
+                    if not force and is_scrubbed_copy_reusable(d, scrubbed_dir):
+                        console.print(
+                            f"  Reusing reviewed scrubbed copy at "
+                            f"[dim]{scrubbed_dir.name}/[/dim] (reviewed == uploaded)."
+                        )
+                        d = scrubbed_dir
+                    else:
+                        # cloud_bound_recovery=True: _recover_chunk_metadata(
+                        # cloud_bound=True) ran above in this same iteration (the
+                        # load-bearing ordering), so the sentinel records it and a
+                        # later reuse is valid. _already_locked=True: we hold the
+                        # per-recording lock, so scrub_recording must not re-acquire
+                        # it (same-process flock would deadlock).
+                        with console.status(f"[bold]Scrubbing {d.name} for upload...[/bold]"):
+                            scrub_result = scrub_recording(
+                                d.name, cloud_bound_recovery=True, _already_locked=True,
+                            )
+                        entity_total = sum(scrub_result.entity_counts.values())
+                        console.print(
+                            f"  Scrubbed copy at [dim]{scrub_result.output_dir.name}/[/dim] "
+                            f"({entity_total} redaction(s) applied)."
+                        )
+                        d = scrub_result.output_dir
+                except Exception as e:
+                    console.print(
+                        f"[red]Error:[/red] Scrubbing failed: {e}\n"
+                        "Upload skipped — cannot upload without scrubbing."
+                    )
+                    all_failed += 1
+                    continue
+
+            try:
+                result = upload_recording(d, dry_run=dry_run, force=force, jobs=jobs)
+                all_uploaded += len(result.uploaded)
+                all_skipped += len(result.skipped)
+                all_failed += len(result.failed)
+                all_bytes += result.total_bytes
+
+                if not dry_run and not result.failed:
+                    parts = []
+                    if result.uploaded:
+                        parts.append(f"{len(result.uploaded)} new")
+                    if result.skipped:
+                        parts.append(f"{len(result.skipped)} skipped")
+                    summary = ", ".join(parts) if parts else "0 files"
+                    if result.gcs_prefix:
+                        console.print(
+                            f"\n[green]Uploaded {d.name}[/green] -> {result.gcs_prefix} ({summary})"
+                        )
+                    else:
+                        console.print(f"\n[green]Uploaded {d.name}[/green] ({summary})")
+                    # No public screencap.sh viewer URL: user recordings now live
+                    # under the private, account-scoped users/{uid}/ namespace, which
+                    # the public site cannot render. Web viewing of your own cloud
+                    # recordings is deferred; the macOS app/CLI is the interim surface.
+            except FileNotFoundError as e:
+                console.print(f"[red]Error:[/red] {e}")
+                all_failed += 1
+            except RuntimeError as e:
+                console.print(f"[red]Error:[/red] {e}")
+                sys.exit(1)
 
     if total_count > 1 and not dry_run:
         console.print(

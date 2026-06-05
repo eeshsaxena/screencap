@@ -4,9 +4,71 @@ import OSLog
 
 private let reviewLogger = Logger(subsystem: "com.screencap.macos", category: "review-window")
 
-/// Decoded shape of the U2 `screencap review-data --json <name>` envelope.
-/// Success and error variants share the `ok` discriminator; tolerant
-/// decoding mirrors the CLI's `info --json` consumer pattern.
+/// Per-moment redaction marker (R8) — export-safe: a timestamp + the reason
+/// category that fired, never the redacted value.
+struct ReviewMarker: Decodable, Equatable {
+    let t: Double
+    let category: String
+}
+
+/// A risky-moment interval (R13) the scrubber acted on. `end` is nil for an
+/// open-ended interval (Python serialized `inf` as JSON null).
+struct ReviewBlockedInterval: Decodable, Equatable {
+    let start: Double
+    let end: Double?
+    let action: String
+    let reason: String
+}
+
+/// A fail-closed marker (R14) — content the scrubber couldn't analyze and
+/// removed to be safe. Timestamp + surface only.
+struct ReviewFailClosed: Decodable, Equatable {
+    let t: Double
+    let surface: String?
+}
+
+/// Two-level redaction evidence (R8/R13/R14). All fields optional so a
+/// recording with no redactions still decodes; the panes treat absence as
+/// "nothing required redaction".
+struct ReviewRedaction: Decodable, Equatable {
+    let summary: [String: Int]?
+    let markers: [ReviewMarker]?
+    let blockedIntervals: [ReviewBlockedInterval]?
+    let failClosed: [ReviewFailClosed]?
+
+    enum CodingKeys: String, CodingKey {
+        case summary, markers
+        case blockedIntervals = "blocked_intervals"
+        case failClosed = "fail_closed"
+    }
+}
+
+/// Structured R9 coverage facts the transparency UI renders honest copy from
+/// (rather than hardcoding strings). All optional → "unknown" when absent.
+struct ReviewCoverage: Decodable, Equatable {
+    let videoLocalOnly: Bool?
+    let audioLocalOnly: Bool?
+    let transcriptUploadedScrubbed: Bool?
+    let screenshotsUploaded: Bool?
+    let allowedAppScreenshotPiiManualReview: Bool?
+
+    enum CodingKeys: String, CodingKey {
+        case videoLocalOnly = "video_local_only"
+        case audioLocalOnly = "audio_local_only"
+        case transcriptUploadedScrubbed = "transcript_uploaded_scrubbed"
+        case screenshotsUploaded = "screenshots_uploaded"
+        case allowedAppScreenshotPiiManualReview = "allowed_app_screenshot_pii_manual_review"
+    }
+}
+
+/// Decoded shape of the `screencap review-data --json <name>` envelope
+/// (schema v2). Success and error variants share the `ok` discriminator;
+/// tolerant decoding mirrors the CLI's `info --json` consumer pattern.
+///
+/// The U3 enrichment fields (`eventsPaths`, `screenshots`, `redaction`,
+/// `coverage`) are all Optional with safe defaults so an older/minimal
+/// envelope still decodes and reaches `.ready` — readiness is never gated on
+/// them (see the nullable-timing learning).
 struct ReviewDataEnvelope: Decodable, Equatable {
     let ok: Bool
     let schemaVersion: Int?
@@ -16,6 +78,12 @@ struct ReviewDataEnvelope: Decodable, Equatable {
     let durationSeconds: Double?
     let videoPixfmtRemediated: Bool?
     let error: String?
+    // Defaulted so existing call sites (and minimal/older envelopes) need not
+    // supply them; Optional → a missing JSON key decodes to nil.
+    var eventsPaths: [String]? = nil
+    var screenshots: [String]? = nil
+    var redaction: ReviewRedaction? = nil
+    var coverage: ReviewCoverage? = nil
 
     enum CodingKeys: String, CodingKey {
         case ok
@@ -26,6 +94,10 @@ struct ReviewDataEnvelope: Decodable, Equatable {
         case durationSeconds = "duration_seconds"
         case videoPixfmtRemediated = "video_pixfmt_remediated"
         case error
+        case eventsPaths = "events_paths"
+        case screenshots
+        case redaction
+        case coverage
     }
 }
 
@@ -33,14 +105,20 @@ struct ReviewDataEnvelope: Decodable, Equatable {
 /// envelope; absent fields fall back to safe defaults so the panes can
 /// still render something usable.
 ///
-/// `videoPixfmtRemediated` lives on `ReviewDataEnvelope` only — it's part
-/// of the U2 JSON contract — and is not promoted onto this struct until a
-/// consumer (e.g. a visible "remediated for playback" indicator) needs it.
+/// `videoURL` is the LOCAL navigation video (never uploaded); `eventsURLs`
+/// and `screenshotURLs` point at the scrubbed copy — the bytes that actually
+/// upload (R15). `redaction`/`coverage` drive the transparency UI (U8).
 struct ReviewData: Equatable {
     let videoURL: URL
-    let eventsURL: URL
+    /// The full scrubbed event file set (per-chunk when chunked) — what
+    /// upload ships and U7 parses. Always at least one path.
+    let eventsURLs: [URL]
+    /// Scrubbed (masked) screenshots — the "what actually uploads" visual (U6).
+    let screenshotURLs: [URL]
     let startedAt: Double
     let durationSeconds: Double
+    let redaction: ReviewRedaction?
+    let coverage: ReviewCoverage?
 }
 
 /// Test seam over `CLIClient.runJSONRaw` so the review-data fetch can be
@@ -53,8 +131,18 @@ protocol ReviewDataLoader {
 
 @MainActor
 final class LiveReviewDataLoader: ReviewDataLoader {
+    /// `review-data` now runs the NER scrub before returning (U2), which on a
+    /// long recording can take minutes. The old 60s ceiling would SIGTERM the
+    /// scrub mid-pass — R4's preparing state cannot rescue a hard kill — so it
+    /// is raised to a generous fixed ceiling. A genuinely hung scrub still
+    /// surfaces the failed state via this timeout rather than hanging forever.
+    static let reviewDataTimeout: TimeInterval = 600
+
     func load(name: String) async throws -> ReviewDataEnvelope {
-        let raw = try await CLIClient.runJSONRaw(["review-data", "--json", "--", name], timeout: 60)
+        let raw = try await CLIClient.runJSONRaw(
+            ["review-data", "--json", "--", name],
+            timeout: Self.reviewDataTimeout
+        )
         return try JSONDecoder().decode(ReviewDataEnvelope.self, from: raw)
     }
 }
@@ -168,11 +256,20 @@ final class ReviewWindowViewModel: ObservableObject {
                 state = .failed(message: envelope.error ?? "Failed to prepare recording.", retryData: nil)
                 return
             }
+            // The full scrubbed event set drives U7; fall back to the single
+            // primary path when an older envelope omits `events_paths`.
+            let eventsURLs = (envelope.eventsPaths?.map { URL(fileURLWithPath: $0) })
+                .flatMap { $0.isEmpty ? nil : $0 }
+                ?? [URL(fileURLWithPath: eventsPath)]
+            let screenshotURLs = (envelope.screenshots ?? []).map { URL(fileURLWithPath: $0) }
             let data = ReviewData(
                 videoURL: URL(fileURLWithPath: videoPath),
-                eventsURL: URL(fileURLWithPath: eventsPath),
+                eventsURLs: eventsURLs,
+                screenshotURLs: screenshotURLs,
                 startedAt: envelope.startedAt ?? 0,
-                durationSeconds: envelope.durationSeconds ?? 0
+                durationSeconds: envelope.durationSeconds ?? 0,
+                redaction: envelope.redaction,
+                coverage: envelope.coverage
             )
             state = .ready(data)
         } catch {

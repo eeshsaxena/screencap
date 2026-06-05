@@ -27,6 +27,12 @@ struct ReviewWindow: View {
 
     @State private var videoModel: VideoPlayerPaneModel?
     @State private var timelineEvents: [TimelineEvent] = []
+    @State private var screenshots: [ReviewScreenshot] = []
+    // Derived once on `.ready` — these depend only on the (fixed) redaction
+    // evidence, not on currentTime, so recomputing them on every 10Hz playback
+    // tick would re-sort identical data.
+    @State private var redactionMarkers: [Double] = []
+    @State private var riskyIntervals: [TimelineInterval] = []
     @State private var currentTime: Double = 0
     @State private var timelineLoaded = false
     /// Drives the "Sign in to upload" sheet (plan U6). Shown when Upload is
@@ -72,11 +78,30 @@ struct ReviewWindow: View {
             if case .ready(let data) = newState, videoModel == nil {
                 let engine = LiveVideoPlaybackEngine(url: data.videoURL)
                 videoModel = VideoPlayerPaneModel(engine: engine)
+                // The masked screenshots that actually upload — the primary
+                // truth view (U6). Parsed once on first ready.
+                screenshots = ScreenshotTruth.screenshots(
+                    from: data.screenshotURLs,
+                    startedAt: data.startedAt
+                )
+                // Redaction markers + risky-moment bands depend only on the
+                // fixed redaction evidence, so derive them once here rather
+                // than on every playback tick.
+                redactionMarkers = RedactionTimeline.relativeMarkers(
+                    data.redaction, startedAt: data.startedAt
+                )
+                riskyIntervals = RedactionTimeline.riskyIntervals(
+                    data.redaction, startedAt: data.startedAt,
+                    duration: data.durationSeconds
+                )
                 if !timelineLoaded {
                     timelineLoaded = true
                     Task.detached(priority: .userInitiated) {
+                        // Parse the FULL scrubbed event set (all per-chunk files),
+                        // not just events_paths[0], so the timeline + content view
+                        // reflect every event that uploads (reviewed == uploaded).
                         let parsed = TimelineEventParser.parse(
-                            url: data.eventsURL,
+                            urls: data.eventsURLs,
                             recordingStartedAt: data.startedAt
                         )
                         await MainActor.run { timelineEvents = parsed }
@@ -192,8 +217,12 @@ struct ReviewWindow: View {
 
     private var preparingState: some View {
         VStack(spacing: 12) {
+            // Indeterminate spinner — the scrubber exposes no progress callback,
+            // so the copy sets the expectation instead (R4). The honest framing
+            // ("what will upload") tells the operator the wait is the scrub that
+            // produces exactly the bytes they're about to review.
             ProgressView()
-            Text("Preparing recording…")
+            Text("Preparing what will upload…")
                 .font(.body)
                 .foregroundStyle(.secondary)
         }
@@ -205,8 +234,9 @@ struct ReviewWindow: View {
             Image(systemName: "exclamationmark.triangle.fill")
                 .font(.title)
                 .foregroundStyle(.orange)
-            Text("Couldn't prepare this recording.")
+            Text("Couldn't prepare a safe version for review. Nothing was uploaded.")
                 .font(.headline)
+                .multilineTextAlignment(.center)
             Text(message)
                 .font(.caption)
                 .foregroundStyle(.secondary)
@@ -222,18 +252,51 @@ struct ReviewWindow: View {
 
     @ViewBuilder
     private var panesIfAvailable: some View {
-        if let videoModel {
+        if let videoModel, let data = currentData() {
             VStack(spacing: 0) {
-                VideoPlayerPane(model: videoModel)
-                    .frame(maxWidth: .infinity, maxHeight: .infinity)
-                    .onReceive(videoModel.$currentTime) { t in
-                        currentTime = t
+                // Per-recording redaction summary, framed as protection (R8),
+                // with the distinct fail-closed callout (R14) separate beneath.
+                RedactionEvidenceView(redaction: data.redaction)
+                FailClosedCallout(redaction: data.redaction)
+                Divider()
+                // The masked-screenshot truth view is the PRIMARY surface — it
+                // shows what actually uploads (R15). The local video beside it
+                // is a secondary navigation aid that never uploads, labeled as
+                // such so the operator can't mistake it for the payload.
+                HStack(spacing: 0) {
+                    VStack(spacing: 0) {
+                        ScreenshotTruthPane(
+                            screenshots: screenshots,
+                            currentTime: currentTime
+                        )
+                        .frame(maxWidth: .infinity, maxHeight: .infinity)
+                        // Persistent coverage disclosure beneath the truth view
+                        // (R9): the allowed-app on-screen-PII blind spot is the
+                        // one fact requiring operator action.
+                        CoverageStrip(coverage: data.coverage)
                     }
+                    Divider()
+                    localVideoPane(videoModel)
+                        .frame(width: 280)
+                }
+                .frame(maxWidth: .infinity, maxHeight: .infinity)
+                Divider()
+                // Moment-anchored captured content from the scrubbed copy (U7);
+                // selecting a row seeks the visual to that moment.
+                EventContentPane(
+                    events: timelineEvents,
+                    currentTime: currentTime
+                ) { seconds in
+                    videoModel.seek(toSeconds: seconds)
+                }
+                .frame(height: 132)
                 Divider()
                 TimelinePane(
                     events: timelineEvents,
-                    durationSeconds: currentReviewDataDuration(),
-                    currentTime: currentTime
+                    durationSeconds: data.durationSeconds,
+                    currentTime: currentTime,
+                    riskyIntervals: riskyIntervals,
+                    redactionMarkers: redactionMarkers
                 ) { seconds in
                     videoModel.seek(toSeconds: seconds)
                 }
@@ -244,15 +307,42 @@ struct ReviewWindow: View {
         }
     }
 
-    private func currentReviewDataDuration() -> Double {
+    /// The local navigation video with a persistent "not uploaded" label, so
+    /// the operator never mistakes it for the payload (R15).
+    private func localVideoPane(_ videoModel: VideoPlayerPaneModel) -> some View {
+        VStack(spacing: 0) {
+            HStack(spacing: 6) {
+                Image(systemName: "play.rectangle")
+                    .foregroundStyle(.secondary)
+                Text("Local preview — not uploaded")
+                    .font(.caption.weight(.semibold))
+                    .foregroundStyle(.secondary)
+                Spacer()
+            }
+            .padding(.horizontal, 10)
+            .padding(.vertical, 6)
+            .background(Color.secondary.opacity(0.08))
+            Divider()
+            VideoPlayerPane(model: videoModel)
+                .frame(maxWidth: .infinity, maxHeight: .infinity)
+                .onReceive(videoModel.$currentTime) { t in
+                    currentTime = t
+                }
+        }
+    }
+
+    /// The resolved review data for the current state, if any — drives the
+    /// panes, the redaction summary, the coverage strip, and the timeline
+    /// markers. Available in ready / uploading / failed-with-retry.
+    private func currentData() -> ReviewData? {
         switch model.state {
         case .ready(let data),
              .uploading(_, let data):
-            return data.durationSeconds
+            return data
         case .failed(_, .some(let data)):
-            return data.durationSeconds
+            return data
         default:
-            return 0
+            return nil
         }
     }
 

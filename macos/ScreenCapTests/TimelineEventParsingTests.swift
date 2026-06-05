@@ -115,4 +115,128 @@ final class TimelineEventParsingTests: XCTestCase {
         let events = TimelineEventParser.parse(url: url, recordingStartedAt: startedAt)
         XCTAssertEqual(events, [])
     }
+
+    /// Chunked recordings ship a per-chunk events_*.jsonl set; the timeline must
+    /// merge ALL of them (not just chunk 0) so the reviewed events == uploaded.
+    func testParseUrlsMergesAndSortsAcrossFiles() throws {
+        let dir = FileManager.default.temporaryDirectory
+            .appendingPathComponent(UUID().uuidString)
+        try FileManager.default.createDirectory(at: dir, withIntermediateDirectories: true)
+        defer { try? FileManager.default.removeItem(at: dir) }
+
+        let f0 = dir.appendingPathComponent("events_0000.jsonl")
+        let f1 = dir.appendingPathComponent("events_0001.jsonl")
+        try ("{\"_meta\": true}\n"
+            + "{\"type\": \"key.type\", \"timestamp\": 1700000005.0, \"text\": \"b\"}\n")
+            .write(to: f0, atomically: true, encoding: .utf8)
+        try ("{\"_meta\": true}\n"
+            + "{\"type\": \"mouse.click\", \"timestamp\": 1700000002.0}\n")
+            .write(to: f1, atomically: true, encoding: .utf8)
+
+        let events = TimelineEventParser.parse(urls: [f0, f1], recordingStartedAt: startedAt)
+
+        XCTAssertEqual(events.map(\.relativeSeconds), [2.0, 5.0], "merged + sorted across files")
+        XCTAssertEqual(events.map(\.type), ["mouse.click", "key.type"])
+    }
+
+    func testParseUrlsSkipsUnreadableFilesWithoutFailing() {
+        let missing = URL(fileURLWithPath: "/tmp/screencap-nope-\(UUID().uuidString).jsonl")
+        XCTAssertEqual(TimelineEventParser.parse(urls: [missing], recordingStartedAt: startedAt), [])
+    }
+
+    // MARK: - U7: moment-anchored content parsing (R5/R7/R14)
+
+    func testKeyTypeSurfacesScrubbedText() {
+        let jsonl = """
+        {"_meta": true}
+        {"type": "key.type", "timestamp": 1700000001.0, "text": "hello world"}
+        """
+        let events = TimelineEventParser.parse(jsonl: jsonl, recordingStartedAt: startedAt)
+        XCTAssertEqual(events.first?.content.typedText, .value("hello world"))
+    }
+
+    func testWindowSwitchSurfacesAppTitleDomain() {
+        let jsonl = """
+        {"_meta": true}
+        {"type": "window.switch", "timestamp": 1700000001.0, "app_name": "Safari", "window_title": "Docs", "domain": "example.com"}
+        """
+        let events = TimelineEventParser.parse(jsonl: jsonl, recordingStartedAt: startedAt)
+        let c = events.first?.content
+        XCTAssertEqual(c?.appName, .value("Safari"))
+        XCTAssertEqual(c?.windowTitle, .value("Docs"))
+        XCTAssertEqual(c?.domain, .value("example.com"))
+    }
+
+    /// Covers AE3: a wholesale-removed (null) field renders as redacted — the
+    /// row is retained (presence is informative) but the value is never shown.
+    func testNulledFieldClassifiesAsRedactedNotAbsent() {
+        let jsonl = """
+        {"_meta": true}
+        {"type": "window.switch", "timestamp": 1700000001.0, "app_name": "Editor", "window_title": null, "domain": null}
+        """
+        let events = TimelineEventParser.parse(jsonl: jsonl, recordingStartedAt: startedAt)
+        let c = events.first?.content
+        XCTAssertEqual(c?.appName, .value("Editor"))
+        XCTAssertEqual(c?.windowTitle, .redacted)
+        XCTAssertEqual(c?.domain, .redacted)
+    }
+
+    /// A `<SCRUB_FAILED>` field routes to the fail-closed indicator, never a
+    /// displayable text field.
+    func testScrubFailedSentinelRoutesToFailClosed() {
+        let jsonl = """
+        {"_meta": true}
+        {"type": "key.type", "timestamp": 1700000001.0, "text": "<SCRUB_FAILED>"}
+        """
+        let events = TimelineEventParser.parse(jsonl: jsonl, recordingStartedAt: startedAt)
+        XCTAssertEqual(events.first?.content.typedText, .failClosed)
+        XCTAssertTrue(events.first?.content.hasFailClosed ?? false)
+    }
+
+    func testEventWithoutContentFieldsHasEmptyContent() {
+        let jsonl = """
+        {"_meta": true}
+        {"type": "mouse.click", "timestamp": 1700000001.0, "x": 10, "y": 20}
+        """
+        let events = TimelineEventParser.parse(jsonl: jsonl, recordingStartedAt: startedAt)
+        XCTAssertTrue(events.first?.content.isEmpty ?? false)
+    }
+
+    func testNetworkContentSurfacesOnlyWhenPresent() {
+        let jsonl = """
+        {"_meta": true}
+        {"type": "network.request", "timestamp": 1700000001.0, "host": "api.example.com", "url": "https://api.example.com/v1"}
+        """
+        let events = TimelineEventParser.parse(jsonl: jsonl, recordingStartedAt: startedAt)
+        XCTAssertEqual(events.first?.content.networkHost, .value("api.example.com"))
+        XCTAssertEqual(events.first?.content.networkURL, .value("https://api.example.com/v1"))
+    }
+
+    func testAudioChunkSurfacesTranscription() {
+        let jsonl = """
+        {"_meta": true}
+        {"type": "audio.chunk", "timestamp": 1700000001.0, "transcription": "let's ship it"}
+        """
+        let events = TimelineEventParser.parse(jsonl: jsonl, recordingStartedAt: startedAt)
+        XCTAssertEqual(events.first?.content.transcription, .value("let's ship it"))
+    }
+
+    /// Covers AE6: the content view surfaces the events at a given moment —
+    /// content-bearing events within the window, excluding pointer noise.
+    func testMomentSelectionFiltersToContentBearingEventsNearTime() {
+        let content = TimelineEventContent(typedText: .value("hi"))
+        let events = [
+            TimelineEvent(relativeSeconds: 1, absoluteTimestamp: startedAt + 1,
+                          type: "key.type", category: .key, content: content),
+            TimelineEvent(relativeSeconds: 5, absoluteTimestamp: startedAt + 5,
+                          type: "key.type", category: .key, content: content),
+            // Pure mouse event at the same moment — excluded (no content).
+            TimelineEvent(relativeSeconds: 5, absoluteTimestamp: startedAt + 5,
+                          type: "mouse.click", category: .mouse),
+            TimelineEvent(relativeSeconds: 10, absoluteTimestamp: startedAt + 10,
+                          type: "key.type", category: .key, content: content),
+        ]
+        let moment = EventContent.moment(at: 5, in: events, window: 2.0)
+        XCTAssertEqual(moment.map(\.relativeSeconds), [5], "only the in-window content event")
+    }
 }

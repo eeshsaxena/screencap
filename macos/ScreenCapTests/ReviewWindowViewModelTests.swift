@@ -348,6 +348,158 @@ final class ReviewWindowViewModelTests: XCTestCase {
         XCTAssertNil(effects.pendingAutoClose, "auto-close handle should have been cancelled")
     }
 
+    /// Covers AE5 (U6): Cancel on the ready review screen uploads nothing and
+    /// is inert — no upload is started, no process is terminated, and the state
+    /// stays ready (the original on-disk recording is never touched because no
+    /// upload subprocess ran).
+    func testCancelFromReadyUploadsNothing() async {
+        let service = FakeUploadService()
+        let controller = UploadController(service: service)
+        let model = makeModel(controller: controller)
+
+        await model.loadReviewData()
+        guard case .ready = model.state else {
+            return XCTFail("expected ready, got \(model.state)")
+        }
+
+        model.cancel()
+
+        XCTAssertEqual(service.fakeProcess.terminateInvocations, 0, "no upload to terminate")
+        if case .ready = model.state {} else {
+            XCTFail("Cancel before upload must be inert, got \(model.state)")
+        }
+    }
+
+    /// Covers AE7 (U8): advisory risky-moment flags + redaction evidence never
+    /// gate Upload. A ready envelope carrying a secure-field interval, redaction
+    /// counts, and a fail-closed marker still uploads on intent.
+    func testUploadStaysEnabledRegardlessOfRedactionFlags() async {
+        let controller = UploadController(service: FakeUploadService())
+        let loader = FakeReviewDataLoader()
+        loader.nextEnvelope = .init(
+            ok: true, schemaVersion: 2,
+            videoPath: "/tmp/video.mp4", eventsPath: "/tmp/events.jsonl",
+            startedAt: 0, durationSeconds: 10, videoPixfmtRemediated: false, error: nil,
+            eventsPaths: nil, screenshots: nil,
+            redaction: ReviewRedaction(
+                summary: ["EMAIL_ADDRESS": 2],
+                markers: [ReviewMarker(t: 1, category: "secure_field_detected")],
+                blockedIntervals: [ReviewBlockedInterval(
+                    start: 1, end: 3, action: "exclude", reason: "secure_field_detected")],
+                failClosed: [ReviewFailClosed(t: 2, surface: "event")]
+            ),
+            coverage: nil
+        )
+        let model = makeModel(loader: loader, controller: controller)
+
+        await model.loadReviewData()
+        model.startUpload()
+
+        if case .uploading = model.state {} else {
+            XCTFail("advisory flags must not gate Upload, got \(model.state)")
+        }
+    }
+
+    // MARK: - U5: enriched envelope decode + raised timeout
+
+    /// Happy path: a full v2 envelope carries the enriched fields onto
+    /// ReviewData (events set, masked screenshots, redaction evidence, coverage).
+    func testEnrichedEnvelopeCarriesAllFieldsToReady() async {
+        let loader = FakeReviewDataLoader()
+        loader.nextEnvelope = .init(
+            ok: true,
+            schemaVersion: 2,
+            videoPath: "/tmp/video.mp4",
+            eventsPath: "/tmp/rec-scrubbed/events_0000.jsonl",
+            startedAt: 1700000000,
+            durationSeconds: 30,
+            videoPixfmtRemediated: false,
+            error: nil,
+            eventsPaths: [
+                "/tmp/rec-scrubbed/events_0000.jsonl",
+                "/tmp/rec-scrubbed/events_0001.jsonl",
+            ],
+            screenshots: ["/tmp/rec-scrubbed/screenshots/1.0.jpg"],
+            redaction: ReviewRedaction(
+                summary: ["EMAIL_ADDRESS": 2],
+                markers: [ReviewMarker(t: 5, category: "secure_field_detected")],
+                blockedIntervals: [ReviewBlockedInterval(
+                    start: 1, end: 3, action: "exclude", reason: "blocked_app_exclude")],
+                failClosed: [ReviewFailClosed(t: 9, surface: "event")]
+            ),
+            coverage: ReviewCoverage(
+                videoLocalOnly: true, audioLocalOnly: true,
+                transcriptUploadedScrubbed: false, screenshotsUploaded: true,
+                allowedAppScreenshotPiiManualReview: true
+            )
+        )
+        let model = makeModel(loader: loader)
+
+        await model.loadReviewData()
+
+        guard case .ready(let data) = model.state else {
+            return XCTFail("expected ready, got \(model.state)")
+        }
+        XCTAssertEqual(data.eventsURLs.count, 2)
+        XCTAssertEqual(data.screenshotURLs.map(\.path), ["/tmp/rec-scrubbed/screenshots/1.0.jpg"])
+        XCTAssertEqual(data.redaction?.summary?["EMAIL_ADDRESS"], 2)
+        XCTAssertEqual(data.redaction?.markers?.first?.category, "secure_field_detected")
+        XCTAssertEqual(data.redaction?.blockedIntervals?.first?.end, 3)
+        XCTAssertEqual(data.redaction?.failClosed?.first?.t, 9)
+        XCTAssertEqual(data.coverage?.allowedAppScreenshotPiiManualReview, true)
+    }
+
+    /// A minimal envelope (the enriched fields absent) still reaches `.ready` —
+    /// readiness is never gated on the new fields. eventsURLs falls back to the
+    /// single primary path; screenshots/redaction/coverage default to empty/nil.
+    func testMinimalEnvelopeWithoutEnrichedFieldsReachesReady() async {
+        let model = makeModel()  // default fake omits the new fields
+
+        await model.loadReviewData()
+
+        guard case .ready(let data) = model.state else {
+            return XCTFail("expected ready, got \(model.state)")
+        }
+        XCTAssertEqual(data.eventsURLs, [URL(fileURLWithPath: "/tmp/events.jsonl")])
+        XCTAssertTrue(data.screenshotURLs.isEmpty)
+        XCTAssertNil(data.redaction)
+        XCTAssertNil(data.coverage)
+    }
+
+    /// The review-data shell-out timeout is raised well above the legacy 60s so
+    /// the in-command NER scrub isn't SIGTERM'd mid-pass.
+    func testReviewDataTimeoutIsRaisedAboveLegacy60s() {
+        XCTAssertGreaterThanOrEqual(
+            LiveReviewDataLoader.reviewDataTimeout, 600,
+            "timeout must accommodate the in-command NER scrub on large recordings")
+    }
+
+    /// Pins the U3↔U5 JSON contract: snake_case keys decode, and an open-ended
+    /// blocked interval (`end: null`) decodes to a nil `end`.
+    func testDecodesEnrichedEnvelopeFromRawJSON() throws {
+        let json = """
+        {"ok": true, "schema_version": 2, "video_path": "/v.mp4",
+         "events_path": "/s/events_0000.jsonl",
+         "events_paths": ["/s/events_0000.jsonl"],
+         "screenshots": ["/s/screenshots/1.0.jpg"],
+         "redaction": {"summary": {"PERSON": 1},
+                        "markers": [{"t": 2.5, "category": "policy_excluded_app"}],
+                        "blocked_intervals": [{"start": 1.0, "end": null, "action": "exclude", "reason": "blocked_app_exclude"}],
+                        "fail_closed": [{"t": 4.0, "surface": "event"}]},
+         "coverage": {"video_local_only": true, "audio_local_only": true,
+                       "transcript_uploaded_scrubbed": false, "screenshots_uploaded": true,
+                       "allowed_app_screenshot_pii_manual_review": true},
+         "started_at": null, "duration_seconds": null, "video_pixfmt_remediated": false}
+        """
+        let env = try JSONDecoder().decode(ReviewDataEnvelope.self, from: Data(json.utf8))
+        XCTAssertEqual(env.schemaVersion, 2)
+        XCTAssertEqual(env.eventsPaths?.count, 1)
+        XCTAssertEqual(env.redaction?.summary?["PERSON"], 1)
+        XCTAssertEqual(env.redaction?.markers?.first?.category, "policy_excluded_app")
+        XCTAssertNil(env.redaction?.blockedIntervals?.first?.end, "null end → nil")
+        XCTAssertEqual(env.coverage?.transcriptUploadedScrubbed, false)
+    }
+
     // MARK: - Helpers
 
     private func makeModel(

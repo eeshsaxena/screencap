@@ -1,5 +1,49 @@
 import Foundation
 
+/// A single content field parsed from the *scrubbed* event set, classified for
+/// honest rendering (U7). The distinction is load-bearing: a fail-closed token
+/// must never be shown as if it were real content, and a wholesale-removed
+/// field should read as protection, not as missing data.
+enum RedactableField: Equatable, Hashable {
+    /// The key was not present on this event.
+    case absent
+    /// A scrubbed-safe value to display as-is (may already contain inline
+    /// anonymizer placeholders like `<EMAIL_ADDRESS>`).
+    case value(String)
+    /// The key was present but null — the scrubber removed the value wholesale
+    /// (e.g. an excluded/masked app interval). Render as `[redacted]` (R7).
+    case redacted
+    /// The value was the `<SCRUB_FAILED>` sentinel — content the scrubber
+    /// couldn't analyze and removed to be safe. Routes to the R14 fail-closed
+    /// indicator, never displayed as content.
+    case failClosed
+}
+
+/// The moment-anchored content fields the review surfaces (R5), mirroring the
+/// canonical `create_html` event set (`events.py`: KeyTypeEvent.text,
+/// WindowSwitchEvent.app_name/window_title/domain, AudioChunkEvent.transcription,
+/// NetworkRequestEvent.host/url). Network fields are present only when the
+/// uploaded event set includes them (off by default — see R5).
+struct TimelineEventContent: Equatable, Hashable {
+    var typedText: RedactableField = .absent
+    var appName: RedactableField = .absent
+    var windowTitle: RedactableField = .absent
+    var domain: RedactableField = .absent
+    var transcription: RedactableField = .absent
+    var networkHost: RedactableField = .absent
+    var networkURL: RedactableField = .absent
+
+    private var allFields: [RedactableField] {
+        [typedText, appName, windowTitle, domain, transcription, networkHost, networkURL]
+    }
+
+    /// No content field is present at all (a pure mouse/screen event).
+    var isEmpty: Bool { allFields.allSatisfy { $0 == .absent } }
+
+    /// Any field tripped the fail-closed sentinel.
+    var hasFailClosed: Bool { allFields.contains(.failClosed) }
+}
+
 /// One marker on the action timeline (plan U6). Timestamps are stored as
 /// seconds-from-recording-start so the timeline math works in the same space
 /// as the video player's `currentTime`. The original absolute Unix timestamp
@@ -9,6 +53,9 @@ struct TimelineEvent: Equatable, Hashable {
     let absoluteTimestamp: Double
     let type: String
     let category: Category
+    /// Moment-anchored captured content from the scrubbed event (U7). Empty for
+    /// pure mouse/screen events.
+    var content: TimelineEventContent = TimelineEventContent()
 
     /// Coarse bucket the timeline uses to colorize markers. Unknown event
     /// types fall into `.other` rather than being dropped — mirrors the
@@ -37,6 +84,12 @@ struct TimelineEvent: Equatable, Hashable {
 /// unknown event types fall into the `.other` bucket. Parsing happens on a
 /// background task at call sites that care about main-thread responsiveness.
 enum TimelineEventParser {
+    /// The fail-closed sentinel the Python scrubber writes into a field whose
+    /// content it couldn't analyze (`scrubber.SCRUB_FAILED_SENTINEL`). This is a
+    /// cross-language serialization contract — keep it in sync with the Python
+    /// constant.
+    static let scrubFailedSentinel = "<SCRUB_FAILED>"
+
     /// Reads `url` line-by-line and returns parsed events sorted by their
     /// recording-relative timestamp. `recordingStartedAt` is the absolute
     /// epoch seconds reported by `review-data` and is subtracted from each
@@ -51,6 +104,18 @@ enum TimelineEventParser {
             return []
         }
         return parse(jsonl: text, recordingStartedAt: recordingStartedAt)
+    }
+
+    /// Parse and merge the full scrubbed event file set — the per-chunk
+    /// `events_*.jsonl` set for a chunked recording, which is what upload ships.
+    /// Parsing only the first file (events_paths[0]) would show only chunk 0's
+    /// events while every chunk uploads, breaking reviewed == uploaded for the
+    /// events surface. Read failures on individual files are skipped; the merged
+    /// result is sorted once on the shared relative axis.
+    static func parse(urls: [URL], recordingStartedAt: Double) -> [TimelineEvent] {
+        urls
+            .flatMap { parse(url: $0, recordingStartedAt: recordingStartedAt) }
+            .sorted { $0.relativeSeconds < $1.relativeSeconds }
     }
 
     /// String-input variant — exposed for tests and any future call site
@@ -93,7 +158,43 @@ enum TimelineEventParser {
             relativeSeconds: max(0, relative),
             absoluteTimestamp: timestamp,
             type: type,
-            category: TimelineEvent.Category.from(eventType: type)
+            category: TimelineEvent.Category.from(eventType: type),
+            content: content(forType: type, obj: obj)
         )
+    }
+
+    /// Extract the displayable content fields for `type` from the parsed event.
+    /// Only content-bearing types populate anything; everything else stays
+    /// empty so pure mouse/screen events don't clutter the content view.
+    private static func content(forType type: String, obj: [String: Any]) -> TimelineEventContent {
+        var c = TimelineEventContent()
+        switch type {
+        case "key.type":
+            c.typedText = field(obj, "text")
+        case "window.switch", "window.state":
+            c.appName = field(obj, "app_name")
+            c.windowTitle = field(obj, "window_title")
+            c.domain = field(obj, "domain")
+        case "audio.chunk":
+            c.transcription = field(obj, "transcription")
+        case let t where t.hasPrefix("network."):
+            // Present only when the uploaded set includes network destinations
+            // (include_network is off by default — R5).
+            c.networkHost = field(obj, "host")
+            c.networkURL = field(obj, "url")
+        default:
+            break
+        }
+        return c
+    }
+
+    /// Classify a JSON field for honest rendering: absent key vs. a displayable
+    /// value vs. a wholesale-removed (null) field vs. the fail-closed sentinel.
+    private static func field(_ obj: [String: Any], _ key: String) -> RedactableField {
+        guard let raw = obj[key] else { return .absent }
+        if raw is NSNull { return .redacted }
+        guard let s = raw as? String else { return .absent }
+        if s == scrubFailedSentinel { return .failClosed }
+        return .value(s)
     }
 }

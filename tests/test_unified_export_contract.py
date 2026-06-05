@@ -219,7 +219,7 @@ def _run_recovery_path(
     """
     from rich.console import Console
 
-    from screencap.cli import _recover_chunk_metadata
+    from screencap.recovery import _recover_chunk_metadata
 
     out_path = rec_dir / "events_0000.jsonl"
     out_path.unlink(missing_ok=True)

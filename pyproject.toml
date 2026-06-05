@@ -105,6 +105,7 @@ markers = [
     "privacy: tests for privacy detection pipeline",
     "slow: marks tests as slow / integration (deselect with '-m \"not slow\"')",
     "macos_hw: tests that mock macOS-specific APIs (accessibility, CoreWLAN, AppKit, permissions)",
+    "real_scrub: review-data tests that run the genuine NER scrub + chunk recovery instead of the fast fake",
 ]
 
 [tool.ruff]

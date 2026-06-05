@@ -78,12 +78,57 @@ def _make_recording(root: Path, name: str, *, with_db: bool = True) -> Path:
     return rec_dir
 
 
+def _make_fake_scrub(root: Path):
+    """A fast stand-in for ``scrub_recording``.
+
+    Mirrors the real entry point's observable contract — copies the source to
+    ``<name>-scrubbed`` with media/derived files filtered out (so events*.jsonl
+    and screenshots/ survive), returns a ``ScrubResult`` pointing at it — without
+    loading the heavy NER pipeline. Tests that need genuine redaction mark
+    themselves ``real_scrub`` to bypass this stub.
+    """
+    import shutil as _sh
+
+    def _fake(name, pii_engine=None, *, cloud_bound_recovery=False, _already_locked=False):
+        from screencap.scrubber import _SKIP_EXTENSIONS, _SKIP_FILES, ScrubResult
+
+        src = root / name
+        dst = root / f"{name}-scrubbed"
+        if dst.exists():
+            _sh.rmtree(dst)
+
+        def _ignore(_d, entries):
+            return {
+                e for e in entries
+                if e in _SKIP_FILES or Path(e).suffix in _SKIP_EXTENSIONS
+            }
+
+        _sh.copytree(src, dst, ignore=_ignore)
+        return ScrubResult(output_dir=dst)
+
+    return _fake
+
+
 @pytest.fixture
-def recordings_root(tmp_path, monkeypatch):
-    """A recordings root wired so ``resolve_recording_dir`` finds it."""
+def recordings_root(tmp_path, monkeypatch, request):
+    """A recordings root wired so ``resolve_recording_dir`` finds it.
+
+    Also points the scrubber's ``get_recordings_dir`` at the test root (it binds
+    its own reference, so the config patch alone would let real scrubs escape to
+    ``~/.screencap``) and, unless the test is marked ``real_scrub``, swaps in the
+    fast fake scrub + a no-op chunk recovery so the video/envelope tests don't
+    pay the NER cost.
+    """
     root = tmp_path / "recordings"
     root.mkdir()
     monkeypatch.setattr("screencap.config.get_recordings_dir", lambda: root)
+    monkeypatch.setattr("screencap.scrubber.get_recordings_dir", lambda: root)
+    if not request.node.get_closest_marker("real_scrub"):
+        monkeypatch.setattr("screencap.scrubber.scrub_recording", _make_fake_scrub(root))
+        monkeypatch.setattr(
+            "screencap.recovery._recover_chunk_metadata",
+            lambda *a, **k: None,
+        )
     return root
 
 
@@ -208,9 +253,11 @@ def test_missing_recording_is_distinct_error(recordings_root):
 # ---------------------------------------------------------------------------
 
 
-def test_auto_exports_missing_events_filtered(recordings_root):
-    """Missing events.jsonl is auto-exported with exclude_moves=True so the
-    timeline pane only sees discrete events."""
+def test_auto_exports_missing_events_with_upload_config(recordings_root):
+    """Missing events.jsonl is auto-exported into the source dir with the
+    canonical *upload* config (``exclude_moves=False``) — not the old
+    discrete-only config — so the scrubbed copy the review reads is the exact
+    event set ``screencap upload`` would ship (reviewed == uploaded, R3)."""
     rec_dir = _make_recording(recordings_root, "rec-noev")
     _write_video(rec_dir / "video.mp4", (0, 0, 200), pix_fmt="yuv420p")
     assert not (rec_dir / "events.jsonl").exists()
@@ -224,10 +271,12 @@ def test_auto_exports_missing_events_filtered(recordings_root):
     ) as ex:
         envelope = prepare_review_data("rec-noev")
 
-    assert (rec_dir / "events.jsonl").exists()
+    assert (rec_dir / "events.jsonl").exists(), "canonical export lands in the source dir"
+    # The envelope points at the scrubbed copy's events file, not the source.
     assert envelope["events_path"].endswith("/events.jsonl")
+    assert "-scrubbed/" in envelope["events_path"]
     ex.assert_called_once()
-    assert ex.call_args.kwargs["exclude_moves"] is True
+    assert ex.call_args.kwargs["exclude_moves"] is False
 
 
 def test_nullable_metadata_serialized_as_json_null(recordings_root):
@@ -368,3 +417,367 @@ def test_concat_oserror_becomes_cant_process(recordings_root, monkeypatch):
     monkeypatch.setattr("screencap.engine.video.concat_video_chunks", boom)
     with pytest.raises(ReviewPrepareError, match="can't process this video"):
         prepare_review_data("rec-oserr")
+
+
+# ---------------------------------------------------------------------------
+# U2: scrub-before-review orchestration (R1/R2/R5/R7/R9/R11)
+# ---------------------------------------------------------------------------
+
+
+def _write_screenshot(rec_dir: Path, ts: float) -> Path:
+    shot_dir = rec_dir / "screenshots"
+    shot_dir.mkdir(exist_ok=True)
+    p = shot_dir / f"{ts}.jpg"
+    Image.new("RGB", (8, 8), color=(10, 20, 30)).save(p)
+    return p
+
+
+def test_event_and_screenshot_paths_resolve_under_scrubbed_dir(recordings_root):
+    """Happy path: the envelope's event + screenshot paths live under
+    ``<name>-scrubbed`` (what uploads), while the video stays at the local
+    original (navigation aid, never uploaded)."""
+    rec_dir = _make_recording(recordings_root, "rec-paths")
+    _write_video(rec_dir / "video.mp4", (0, 0, 200), pix_fmt="yuv420p")
+    (rec_dir / "events.jsonl").write_text(
+        json.dumps({"_meta": True}) + "\n"
+        + json.dumps({"timestamp": 1.0, "type": "key.type", "text": "hi"}) + "\n"
+    )
+    _write_screenshot(rec_dir, 1.0)
+
+    envelope = prepare_review_data("rec-paths")
+
+    assert envelope["ok"] is True
+    assert "/rec-paths-scrubbed/" in envelope["events_path"]
+    assert envelope["events_paths"], "the scrubbed event file set must be exposed"
+    assert all("/rec-paths-scrubbed/" in p for p in envelope["events_paths"])
+    assert envelope["screenshots"], "scrubbed screenshots must be exposed"
+    assert all("/rec-paths-scrubbed/screenshots/" in p for p in envelope["screenshots"])
+    # The video is the LOCAL original, not under the scrubbed dir.
+    assert envelope["video_path"].endswith("/rec-paths/video.mp4")
+    assert "-scrubbed" not in envelope["video_path"]
+
+
+def test_traversal_name_rejected_before_any_scrub(recordings_root):
+    """A ``../`` name is rejected before the envelope is built — scrub never
+    runs, so no path is emitted from an out-of-tree location."""
+    with mock.patch("screencap.scrubber.scrub_recording") as scrub_spy:
+        with pytest.raises(ReviewPrepareError):
+            prepare_review_data("../escape")
+    scrub_spy.assert_not_called()
+
+
+def test_total_scrub_failure_raises_and_leaves_no_sentinel(recordings_root):
+    """A total scrub failure is a structural preparation failure
+    (``ReviewPrepareError``) and leaves no reusable scrubbed dir — no
+    ``.scrub_complete`` sentinel that a later upload could trust."""
+    rec_dir = _make_recording(recordings_root, "rec-scrubfail")
+    _write_video(rec_dir / "video.mp4", (0, 0, 200), pix_fmt="yuv420p")
+    (rec_dir / "events.jsonl").write_text(json.dumps({"_meta": True}) + "\n")
+
+    with mock.patch(
+        "screencap.scrubber.scrub_recording",
+        side_effect=RuntimeError("scrub blew up"),
+    ):
+        with pytest.raises(ReviewPrepareError):
+            prepare_review_data("rec-scrubfail")
+
+    sentinels = list(recordings_root.glob("**/.scrub_complete"))
+    assert sentinels == [], "a failed scrub must not leave a completion sentinel"
+
+
+def test_recovery_runs_cloud_bound_before_scrub(recordings_root):
+    """``review-data`` replicates the upload loop's load-bearing ordering:
+    ``_recover_chunk_metadata(cloud_bound=True)`` runs *before* scrub, so the
+    prepared dir is upload-equivalent (pointer suppression applies)."""
+    rec_dir = _make_recording(recordings_root, "rec-order")
+    _write_video(rec_dir / "video.mp4", (0, 0, 200), pix_fmt="yuv420p")
+    (rec_dir / "events.jsonl").write_text(json.dumps({"_meta": True}) + "\n")
+
+    calls: list = []
+    fake_scrub = _make_fake_scrub(recordings_root)
+
+    def spy_recover(*_a, **k):
+        calls.append(("recover", k.get("cloud_bound")))
+
+    def spy_scrub(name, pii_engine=None, *, cloud_bound_recovery=False, _already_locked=False):
+        calls.append(("scrub", cloud_bound_recovery))
+        return fake_scrub(name)
+
+    with mock.patch(
+        "screencap.recovery._recover_chunk_metadata", side_effect=spy_recover
+    ), mock.patch(
+        "screencap.scrubber.scrub_recording", side_effect=spy_scrub
+    ):
+        prepare_review_data("rec-order")
+
+    # Recovery runs first with cloud_bound=True; the scrub is then told recovery
+    # ran (cloud_bound_recovery=True) so the sentinel marks the dir reusable.
+    assert calls == [("recover", True), ("scrub", True)], calls
+
+
+def test_chunked_review_uses_per_chunk_event_set(recordings_root):
+    """For a chunked recording the reviewed event source is the per-chunk
+    ``events_*.jsonl`` set (what upload ships), not a freshly combined file."""
+    rec_dir = _make_recording(recordings_root, "rec-chunked")
+    _write_video(rec_dir / "video.mp4", (0, 0, 200), pix_fmt="yuv420p")
+    for idx in (0, 1):
+        (rec_dir / f"events_{idx:04d}.jsonl").write_text(
+            json.dumps({"_meta": True}) + "\n"
+        )
+
+    envelope = prepare_review_data("rec-chunked")
+
+    names = sorted(Path(p).name for p in envelope["events_paths"])
+    assert names == ["events_0000.jsonl", "events_0001.jsonl"]
+    assert all("/rec-chunked-scrubbed/" in p for p in envelope["events_paths"])
+    # No combined events.jsonl is conjured — the set matches what ships.
+    assert "events.jsonl" not in names
+
+
+def test_empty_screenshots_returns_empty_set(recordings_root):
+    """A recording with an empty ``screenshots/`` returns an explicit empty
+    screenshot set, not an error."""
+    rec_dir = _make_recording(recordings_root, "rec-noshots")
+    _write_video(rec_dir / "video.mp4", (0, 0, 200), pix_fmt="yuv420p")
+    (rec_dir / "events.jsonl").write_text(json.dumps({"_meta": True}) + "\n")
+    (rec_dir / "screenshots").mkdir()
+
+    envelope = prepare_review_data("rec-noshots")
+
+    assert envelope["ok"] is True
+    assert envelope["screenshots"] == []
+
+
+@pytest.mark.privacy
+@pytest.mark.real_scrub
+def test_raw_event_value_absent_from_reviewed_events(recordings_root):
+    """Covers AE1: a value present in the raw events is absent from the events
+    the envelope points to (the review reads the scrubbed copy)."""
+    rec_dir = _make_recording(recordings_root, "rec-redact")
+    _write_video(rec_dir / "video.mp4", (0, 0, 200), pix_fmt="yuv420p")
+    secret = "alice@contoso.example"
+    (rec_dir / "events.jsonl").write_text(
+        json.dumps({"_meta": True, "screencap_version": "0.1.0"}) + "\n"
+        + json.dumps({"timestamp": 1.0, "type": "key.type",
+                      "text": f"email {secret}", "children": []}) + "\n"
+    )
+
+    envelope = prepare_review_data("rec-redact")
+
+    reviewed = Path(envelope["events_path"]).read_text()
+    assert secret not in reviewed, "the reviewed events must be the scrubbed copy"
+    # And the raw original is untouched (R11 — Cancel/decline leaves it intact).
+    assert secret in (rec_dir / "events.jsonl").read_text()
+
+
+@pytest.mark.privacy
+@pytest.mark.real_scrub
+def test_cli_real_scrub_stdout_stays_clean_json(recordings_root):
+    """The genuine scrubber prints its summary to a stdout-bound Rich console;
+    review-data must redirect that to stderr so the SwiftUI shell still reads a
+    single parseable JSON envelope from stdout (the whole point of the command)."""
+    rec_dir = _make_recording(recordings_root, "rec-cli-scrub")
+    _write_video(rec_dir / "video.mp4", (0, 0, 200), pix_fmt="yuv420p")
+    (rec_dir / "events.jsonl").write_text(
+        json.dumps({"_meta": True, "screencap_version": "0.1.0"}) + "\n"
+        + json.dumps({"timestamp": 1.0, "type": "key.type",
+                      "text": "email bob@contoso.example", "children": []}) + "\n"
+    )
+
+    result = CliRunner().invoke(cli, ["review-data", "--json", "rec-cli-scrub"])
+
+    assert result.exit_code == 0, result.output
+    # If the scrub summary leaked onto stdout, this parse would fail.
+    payload = json.loads(result.stdout)
+    assert payload["ok"] is True
+    assert "Scrub complete" not in result.stdout
+
+
+# ---------------------------------------------------------------------------
+# U3: enriched, versioned envelope (R5/R8/R9/R13/R14/R15)
+# ---------------------------------------------------------------------------
+
+
+def test_envelope_schema_version_is_bumped(recordings_root):
+    rec_dir = _make_recording(recordings_root, "rec-ver")
+    _write_video(rec_dir / "video.mp4", (0, 0, 200), pix_fmt="yuv420p")
+    (rec_dir / "events.jsonl").write_text(json.dumps({"_meta": True}) + "\n")
+
+    envelope = prepare_review_data("rec-ver")
+
+    assert envelope["schema_version"] == REVIEW_SCHEMA_VERSION
+    assert REVIEW_SCHEMA_VERSION >= 2, "the U3 enrichment must bump the version"
+
+
+def test_zero_redactions_serialize_empty_collections_not_null(recordings_root):
+    """Pinning (mirrors test_nullable_metadata_serialized_as_json_null): a
+    recording with no redactions still yields ok:true with empty — not missing
+    — redaction collections, JSON-round-trippable."""
+    rec_dir = _make_recording(recordings_root, "rec-noredact")
+    _write_video(rec_dir / "video.mp4", (0, 0, 200), pix_fmt="yuv420p")
+    (rec_dir / "events.jsonl").write_text(json.dumps({"_meta": True}) + "\n")
+
+    envelope = prepare_review_data("rec-noredact")
+
+    assert envelope["ok"] is True
+    red = envelope["redaction"]
+    assert red["summary"] == {}
+    assert red["markers"] == []
+    assert red["blocked_intervals"] == []
+    assert red["fail_closed"] == []
+    # Round-trips as JSON (no inf, no non-serializable Counter leaking).
+    serialized = json.loads(json.dumps(envelope))
+    assert serialized["redaction"]["summary"] == {}
+
+
+def test_coverage_facts_present_and_structured(recordings_root):
+    """Covers AE4: coverage carries the R9 facts as structured booleans the UI
+    renders copy from (video/audio local-only, transcript scrubbed, screenshots
+    uploaded, allowed-app on-screen PII the operator's to verify)."""
+    rec_dir = _make_recording(recordings_root, "rec-cov")
+    _write_video(rec_dir / "video.mp4", (0, 0, 200), pix_fmt="yuv420p")
+    (rec_dir / "events.jsonl").write_text(json.dumps({"_meta": True}) + "\n")
+
+    envelope = prepare_review_data("rec-cov")
+
+    cov = envelope["coverage"]
+    assert cov["video_local_only"] is True
+    assert cov["audio_local_only"] is True
+    assert cov["allowed_app_screenshot_pii_manual_review"] is True
+    assert set(cov) == {
+        "video_local_only",
+        "audio_local_only",
+        "transcript_uploaded_scrubbed",
+        "screenshots_uploaded",
+        "allowed_app_screenshot_pii_manual_review",
+    }
+
+
+def test_coverage_reflects_transcript_presence(recordings_root):
+    rec_dir = _make_recording(recordings_root, "rec-trans")
+    _write_video(rec_dir / "video.mp4", (0, 0, 200), pix_fmt="yuv420p")
+    (rec_dir / "events.jsonl").write_text(json.dumps({"_meta": True}) + "\n")
+    (rec_dir / "transcript.txt").write_text("hello world")
+
+    envelope = prepare_review_data("rec-trans")
+
+    assert envelope["coverage"]["transcript_uploaded_scrubbed"] is True
+
+
+@pytest.mark.privacy
+@pytest.mark.real_scrub
+def test_redaction_summary_populated_for_pii_recording(recordings_root):
+    """Happy path: a recording with PII yields a non-empty redaction.summary
+    (entity → count), with markers/blocked_intervals/fail_closed present as
+    lists and the screenshot set exposed."""
+    rec_dir = _make_recording(recordings_root, "rec-evidence")
+    _write_video(rec_dir / "video.mp4", (0, 0, 200), pix_fmt="yuv420p")
+    (rec_dir / "events.jsonl").write_text(
+        json.dumps({"_meta": True, "screencap_version": "0.1.0"}) + "\n"
+        + json.dumps({"timestamp": 1.0, "type": "key.type",
+                      "text": "reach me at carol@contoso.example", "children": []}) + "\n"
+    )
+
+    envelope = prepare_review_data("rec-evidence")
+
+    red = envelope["redaction"]
+    assert red["summary"], "PII must surface as an entity → count summary"
+    assert sum(red["summary"].values()) >= 1
+    # The email entity is what we planted; assert it surfaced (not just a tally).
+    assert any("EMAIL" in entity for entity in red["summary"]), red["summary"]
+    assert isinstance(red["markers"], list)
+    assert isinstance(red["blocked_intervals"], list)
+    assert isinstance(red["fail_closed"], list)
+    # Markers, when present, carry export-safe shape (timestamp + category only).
+    assert all(set(m) == {"t", "category"} for m in red["markers"]), red["markers"]
+    assert "screenshots" in envelope
+
+
+def test_event_set_outside_recordings_root_is_rejected(recordings_root):
+    """Defense-in-depth: a scrubbed dir that resolves outside the recordings
+    root (e.g. via a symlink escape after name validation) is refused before any
+    path is emitted."""
+    rec_dir = _make_recording(recordings_root, "rec-escape")
+    _write_video(rec_dir / "video.mp4", (0, 0, 200), pix_fmt="yuv420p")
+    (rec_dir / "events.jsonl").write_text(json.dumps({"_meta": True}) + "\n")
+
+    from screencap.scrubber import ScrubResult
+
+    escaped = recordings_root.parent / "rec-escape-scrubbed"  # outside the root
+    escaped.mkdir()
+
+    with mock.patch(
+        "screencap.scrubber.scrub_recording",
+        return_value=ScrubResult(output_dir=escaped),
+    ):
+        with pytest.raises(ReviewPrepareError, match="outside the recordings root"):
+            prepare_review_data("rec-escape")
+
+
+# ---------------------------------------------------------------------------
+# Shared canonical-events export helper (review + upload must not drift)
+# ---------------------------------------------------------------------------
+
+
+def test_ensure_canonical_events_gating(tmp_path):
+    """The single shared export gate: skip when chunked or already present
+    (unless force); export with the upload config (exclude_moves=False)
+    otherwise. Both review and `screencap upload` go through this so they
+    cannot drift."""
+    from screencap.exporter import ensure_canonical_events
+
+    rec = tmp_path / "rec"
+    rec.mkdir()
+
+    # Chunked → skip (per-chunk events_*.jsonl are the canonical source).
+    (rec / "events_0000.jsonl").write_text("{}\n")
+    with mock.patch("screencap.exporter.export_recording") as ex:
+        assert ensure_canonical_events(rec) is None
+        ex.assert_not_called()
+    (rec / "events_0000.jsonl").unlink()
+
+    # Existing events.jsonl, no force → trust it, skip.
+    (rec / "events.jsonl").write_text("{}\n")
+    with mock.patch("screencap.exporter.export_recording") as ex:
+        assert ensure_canonical_events(rec) is None
+        ex.assert_not_called()
+
+    # force=True → re-export with the canonical config.
+    with mock.patch("screencap.exporter.export_recording", return_value=7) as ex:
+        assert ensure_canonical_events(rec, force=True) == 7
+        ex.assert_called_once()
+        assert ex.call_args.kwargs["exclude_moves"] is False
+
+    # Missing → export.
+    (rec / "events.jsonl").unlink()
+    with mock.patch("screencap.exporter.export_recording", return_value=3) as ex:
+        assert ensure_canonical_events(rec) == 3
+        ex.assert_called_once()
+        assert ex.call_args.kwargs["exclude_moves"] is False
+
+
+def test_redaction_markers_exclude_allow_screenshots():
+    """mask_screenshots emits an AuditEntry for EVERY frame it processes,
+    including clean ALLOW ones; the per-moment markers channel must exclude them
+    so the review timeline doesn't draw a 'redaction' tick on un-redacted frames
+    (todo 007). The summary tally is separate (entity_counts, text detections)
+    and is unaffected."""
+    from screencap.privacy.reasons import AuditEntry
+    from screencap.review import _build_redaction_evidence
+    from screencap.scrubber import ScrubResult
+
+    result = ScrubResult()
+    result.audit_entries = [
+        AuditEntry(timestamp=1.0, surface="screenshot", action="allow",
+                   reason="policy_allowed_app"),
+        AuditEntry(timestamp=2.0, surface="screenshot", action="exclude",
+                   reason="policy_excluded_app"),
+        AuditEntry(timestamp=3.0, surface="event", action="mask_window",
+                   reason="context_email_surface"),
+    ]
+
+    red = _build_redaction_evidence(result)
+
+    marker_times = [m["t"] for m in red["markers"]]
+    assert 1.0 not in marker_times, "clean ALLOW frame must not be a redaction marker"
+    assert marker_times == [2.0, 3.0], "only genuinely redacted/masked moments mark"

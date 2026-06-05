@@ -1,4 +1,4 @@
-"""Tests for screencap.cli._recover_chunk_metadata.
+"""Tests for screencap.recovery._recover_chunk_metadata.
 
 Recovery rebuilds per-chunk events JSONL when ChunkProcessor crashed but
 chunk video files exist. Post-Unit 7 it routes through the unified export
@@ -78,7 +78,7 @@ class TestRequiredKeywordContract:
         """
         import inspect
 
-        from screencap.cli import _recover_chunk_metadata
+        from screencap.recovery import _recover_chunk_metadata
 
         params = inspect.signature(_recover_chunk_metadata).parameters
         assert "cloud_bound" in params, (
@@ -93,7 +93,7 @@ class TestRequiredKeywordContract:
 
     def test_omitting_cloud_bound_raises_type_error(self, recording_db):
         """Calling without cloud_bound= must raise TypeError, not silently fail-OPEN."""
-        from screencap.cli import _recover_chunk_metadata
+        from screencap.recovery import _recover_chunk_metadata
 
         capture_dir = _capture_dir(recording_db)
         _stub_chunk_video(capture_dir, 0)
@@ -103,7 +103,7 @@ class TestRequiredKeywordContract:
 
     def test_passing_cloud_bound_keyword_works(self, recording_db):
         """Sanity: calling WITH cloud_bound= succeeds (no TypeError)."""
-        from screencap.cli import _recover_chunk_metadata
+        from screencap.recovery import _recover_chunk_metadata
 
         capture_dir = _capture_dir(recording_db)
         _stub_chunk_video(capture_dir, 0)
@@ -132,7 +132,7 @@ class TestHappyPath:
 
     def test_produces_processed_pydantic_events(self, recording_db):
         """Click pair gets merged into mouse.singleclick (not raw rows)."""
-        from screencap.cli import _recover_chunk_metadata
+        from screencap.recovery import _recover_chunk_metadata
 
         capture_dir = _capture_dir(recording_db)
         _stub_chunk_video(capture_dir, 0)
@@ -170,7 +170,7 @@ class TestSlackLeakRegression:
 
     def test_local_intent_recording_uploaded_masks_slack_titles(self, recording_db):
         """Intent file says local; recovery from upload context masks titles."""
-        from screencap.cli import _recover_chunk_metadata
+        from screencap.recovery import _recover_chunk_metadata
 
         capture_dir = _capture_dir(recording_db)
         _stub_chunk_video(capture_dir, 0)
@@ -215,7 +215,7 @@ class TestSlackLeakRegression:
 
     def test_missing_intent_file_recovery_from_upload_filters(self, recording_db):
         """No .recording_intent file present — upload context still applies filter."""
-        from screencap.cli import _recover_chunk_metadata
+        from screencap.recovery import _recover_chunk_metadata
 
         capture_dir = _capture_dir(recording_db)
         _stub_chunk_video(capture_dir, 0)
@@ -253,7 +253,7 @@ class TestSkipOnErrorForCorruptRows:
 
     def test_corrupt_row_skips_chunk_and_continues(self, recording_db):
         """If unified_export_events raises mid-chunk, skip that chunk's JSONL."""
-        from screencap.cli import _recover_chunk_metadata
+        from screencap.recovery import _recover_chunk_metadata
 
         capture_dir = _capture_dir(recording_db)
         _stub_chunk_video(capture_dir, 0)
@@ -305,7 +305,7 @@ class TestAtomicWrite:
 
     def test_mid_write_exception_removes_tmp(self, recording_db):
         """Simulated mid-write failure: .tmp removed, real path not created."""
-        from screencap.cli import _recover_chunk_metadata
+        from screencap.recovery import _recover_chunk_metadata
 
         capture_dir = _capture_dir(recording_db)
         _stub_chunk_video(capture_dir, 0)
@@ -342,7 +342,7 @@ class TestDisabledRowFilter:
 
     def test_disabled_action_rows_excluded(self, recording_db):
         """An action_event with disabled=True does not appear in recovered JSONL."""
-        from screencap.cli import _recover_chunk_metadata
+        from screencap.recovery import _recover_chunk_metadata
         from screencap.engine.db import crud
 
         capture_dir = _capture_dir(recording_db)
@@ -400,7 +400,7 @@ class TestEmptyChunk:
 
     def test_empty_chunk_writes_meta_only(self, recording_db):
         """No events → JSONL has the meta header line and nothing else."""
-        from screencap.cli import _recover_chunk_metadata
+        from screencap.recovery import _recover_chunk_metadata
 
         capture_dir = _capture_dir(recording_db)
         # Two chunk videos: chunk 0 (empty) and chunk 1 (extended to cover events).
@@ -433,7 +433,7 @@ class TestStaleTmpCleanup:
 
     def test_stale_tmp_removed_before_re_recovery(self, recording_db):
         """A pre-existing events_NNNN.jsonl.tmp is unlinked at recovery start."""
-        from screencap.cli import _recover_chunk_metadata
+        from screencap.recovery import _recover_chunk_metadata
 
         capture_dir = _capture_dir(recording_db)
         _stub_chunk_video(capture_dir, 0)
@@ -479,7 +479,7 @@ class TestOlderSchemaWithoutWindowEventTable:
         """
         from sqlalchemy import text
 
-        from screencap.cli import _recover_chunk_metadata
+        from screencap.recovery import _recover_chunk_metadata
 
         capture_dir = _capture_dir(recording_db)
         _stub_chunk_video(capture_dir, 0)
@@ -546,7 +546,7 @@ class TestPerRecordingClickThresholds:
         """
         from sqlalchemy import text
 
-        from screencap.cli import _recover_chunk_metadata
+        from screencap.recovery import _recover_chunk_metadata
         from screencap.engine.db import crud
 
         capture_dir = _capture_dir(recording_db)
@@ -632,7 +632,7 @@ class TestOlderSchemaMissingClickThresholds:
         """
         from sqlalchemy import text
 
-        from screencap.cli import _recover_chunk_metadata
+        from screencap.recovery import _recover_chunk_metadata
         from screencap.engine.db import crud
 
         capture_dir = _capture_dir(recording_db)
@@ -707,7 +707,7 @@ class TestOlderSchemaMissingClickThresholds:
         """
         from sqlalchemy import text
 
-        from screencap.cli import _recover_chunk_metadata
+        from screencap.recovery import _recover_chunk_metadata
         from screencap.engine.db import crud
 
         capture_dir = _capture_dir(recording_db)
@@ -779,7 +779,7 @@ class TestRecoveryScrubberChain:
         intervals contain neither the original title (engine-layer) nor any
         in-interval mouse.move events (scrub-layer).
         """
-        from screencap.cli import _recover_chunk_metadata
+        from screencap.recovery import _recover_chunk_metadata
         from screencap.engine.db import crud
         from screencap.scrubber import (
             ScrubResult,
@@ -907,7 +907,7 @@ class TestV1NetworkScopeGuard:
 
     def test_no_network_lines_in_recovered_jsonl(self, recording_db):
         """Seeded network_event row in DB → zero network.* in JSONL."""
-        from screencap.cli import _recover_chunk_metadata
+        from screencap.recovery import _recover_chunk_metadata
         from screencap.engine.db import crud
 
         capture_dir = _capture_dir(recording_db)

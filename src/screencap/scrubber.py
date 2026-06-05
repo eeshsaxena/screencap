@@ -10,13 +10,16 @@ outside this module should go through :class:`Scrubber`.
 from __future__ import annotations
 
 import bisect
+import contextlib
 import dataclasses
 import json
 import logging
 import os
 import re
 import shutil
+import stat
 from collections import Counter
+from collections.abc import Iterator
 from contextlib import ExitStack
 from dataclasses import dataclass, field
 from pathlib import Path
@@ -40,6 +43,50 @@ from screencap.recording_db import Connection, has_column, has_table, open_recor
 logger = logging.getLogger(__name__)
 console = Console()
 
+# Sentinel written into a field when every detector failed on it — the
+# fail-closed posture (see ``scrub_text``). Surfaced as review evidence
+# (R14) rather than treated as displayable content.
+SCRUB_FAILED_SENTINEL = "<SCRUB_FAILED>"
+
+# Schema version for ``privacy_audit.json``. Bumped when the on-disk audit
+# shape changes so downstream readers (review-data) can branch defensively.
+AUDIT_SCHEMA_VERSION = 1
+
+# Completion sentinel + provenance for the "reviewed == uploaded" reuse guard
+# (U4). Written as the FINAL step of a fully-successful scrub; its presence
+# gates reuse and its contents prove the scrubbed copy is current and was built
+# the way upload would build it. The leading dot keeps it out of the upload
+# file set (dotfile filter), like ``.video_review.mp4``.
+SCRUB_SENTINEL_NAME = ".scrub_complete"
+
+# Bump when scrub *behavior* changes so dirs scrubbed by an older scrubber are
+# rebuilt rather than reused (a stale-redaction guard). This is the scrubber's
+# own logic version, independent of the package release version.
+SCRUB_PROVENANCE_VERSION = 1
+
+# Source files whose content determines the scrubbed output — hashed into the
+# provenance so an upload-path mutation of the original (events re-export, WAL
+# checkpoint, chunk recovery) or any other change invalidates reuse. Media and
+# screenshots are excluded: they are large and the upload path never mutates
+# them (screenshot masking is driven by these DB/event inputs).
+#
+# ``recording.db-wal`` IS hashed: a committed-but-uncheckpointed change lives in
+# the WAL while ``recording.db`` bytes stay identical, so a db-only hash would
+# read such a source as "unchanged" and reuse a stale scrubbed copy. The volatile
+# ``-shm`` sidecar is deliberately NOT hashed — it is regenerated and churns on
+# read-only access, which would force spurious rebuilds without detecting any
+# real content change.
+_SOURCE_HASH_GLOBS = (
+    "recording.db",
+    "recording.db-wal",
+    "events*.jsonl",
+    "transcript*.json",
+    "transcript*.txt",
+    "system_metrics.json",
+    "chunk_*_manifest.json",
+    ".recording_intent",
+)
+
 # Actions that trigger masking for background windows.
 _BG_MASK_ACTIONS = frozenset({
     PrivacyAction.EXCLUDE,
@@ -57,13 +104,25 @@ _BG_MASK_ACTIONS = frozenset({
 
 @dataclass
 class ScrubResult:
-    """Summary of a scrub operation."""
+    """Summary of a scrub operation.
+
+    ``blocked_intervals`` and ``fail_closed_redactions`` are first-class,
+    review-consumable evidence (R8/R13/R14): the former drives risky-moment
+    flags and the redaction summary, the latter the distinct "couldn't
+    analyze — removed to be safe" signal. Both are export-safe — timestamps
+    and categories only, never the redacted value.
+    """
 
     output_dir: Path = field(default_factory=Path)
     entity_counts: Counter = field(default_factory=Counter)
     deleted_files: list[str] = field(default_factory=list)
     audit_entries: list[AuditEntry] = field(default_factory=list)
     rule_based_redactions: list[str] = field(default_factory=list)
+    blocked_intervals: list[BlockedInterval] = field(default_factory=list)
+    # Export-safe markers of fields the scrubber could not analyze and
+    # therefore removed (the ``<SCRUB_FAILED>`` sentinel). Each entry is
+    # ``{"timestamp": float, "surface": str}`` — never the raw value.
+    fail_closed_redactions: list[dict] = field(default_factory=list)
 
 
 @dataclass(frozen=True)
@@ -134,10 +193,10 @@ def scrub_text(
     try:
         detection_result = pipeline.detect(text)
     except AllDetectorsFailedError:
-        return "<SCRUB_FAILED>", None
+        return SCRUB_FAILED_SENTINEL, None
     except Exception:
         logger.debug("scrub_text: unexpected pipeline error", exc_info=True)
-        return "<SCRUB_FAILED>", None
+        return SCRUB_FAILED_SENTINEL, None
 
     scrubbed = anonymizer.anonymize(
         detection_result.normalized_text,
@@ -1046,6 +1105,26 @@ def _cross_reference_key_type(
         )
 
 
+def _write_event_recording_fail_closed(
+    event: dict, event_ts: float, outfile, result: ScrubResult
+) -> None:
+    """Serialize *event*, record a fail-closed marker if it carries the
+    sentinel, then write it.
+
+    A field that tripped ``<SCRUB_FAILED>`` (every detector failed, so the
+    scrubber removed it to be safe) is export-safe evidence the review UI
+    surfaces distinctly (R14). The marker carries the event timestamp and
+    surface only — never the field's raw value (which is now the sentinel
+    anyway). One marker per event, regardless of how many fields tripped.
+    """
+    serialized = json.dumps(event, ensure_ascii=False)
+    if SCRUB_FAILED_SENTINEL in serialized:
+        result.fail_closed_redactions.append(
+            {"timestamp": event_ts, "surface": "event"}
+        )
+    outfile.write(serialized + "\n")
+
+
 def scrub_events_jsonl(
     events_jsonl: Path,
     pipeline,
@@ -1219,7 +1298,9 @@ def scrub_events_jsonl(
                             reason=drag_overlap.reason,
                         )
                     )
-                    outfile.write(json.dumps(event, ensure_ascii=False) + "\n")
+                    _write_event_recording_fail_closed(
+                        event, event_ts, outfile, _result
+                    )
                     continue
 
             # Check blocked-app intervals (non-drag events: regular
@@ -1276,7 +1357,7 @@ def scrub_events_jsonl(
             # Comprehensive scrub: run recursive walker on ALL events
             _scrub_json_recursive(event, pipeline, anonymizer, _result)
 
-            outfile.write(json.dumps(event, ensure_ascii=False) + "\n")
+            _write_event_recording_fail_closed(event, event_ts, outfile, _result)
 
     # Batch DB redaction (single connection, single commit)
     if db_redactions and db_dir is not None:
@@ -2043,6 +2124,13 @@ class Scrubber:
         if self.pixel_ratio is not None:
             ctx.pixel_ratio = self.pixel_ratio
 
+        # Surface the computed blocked intervals as review evidence (R13).
+        # Already built by build_scrub_context (excluded/masked-app +
+        # secure-field intervals); thread them onto the result so the
+        # review-data layer can render risky-moment markers without
+        # recomputing.
+        result.blocked_intervals = list(ctx.blocked_intervals)
+
         if self.evaluator is not None and self.classifier is not None:
             mask_screenshots(
                 self.capture_dir / "screenshots", ctx,
@@ -2300,7 +2388,7 @@ def _scrub_text(
 ):
     """Scrubber-local wrapper that adds Rich console warnings on failure."""
     scrubbed, det_result = scrub_text(text, pipeline, anonymizer, result=result)
-    if scrubbed == "<SCRUB_FAILED>":
+    if scrubbed == SCRUB_FAILED_SENTINEL:
         console.print("  [yellow]Warning: all detectors failed on a field[/]")
     return scrubbed, det_result
 
@@ -2593,14 +2681,78 @@ def _scrub_events_jsonl(
 # ---------------------------------------------------------------------------
 
 
+def _blocked_interval_to_dict(iv: BlockedInterval) -> dict:
+    """Export-safe serialization of a blocked interval.
+
+    Open-ended intervals (``end == inf``) serialize ``end`` as JSON null —
+    ``json.dumps`` would otherwise emit invalid ``Infinity``. The consumer
+    reads null as "to the end of the recording".
+    """
+    return {
+        "start": iv.start,
+        "end": None if iv.end == float("inf") else iv.end,
+        "action": iv.action.value,
+        "reason": iv.reason,
+    }
+
+
 def _write_audit_log(dst: Path, result: ScrubResult) -> None:
-    """Write export-safe audit log to the scrubbed recording directory."""
-    if not result.audit_entries:
+    """Write the export-safe audit log to the scrubbed recording directory.
+
+    The payload is an object (not a bare list) carrying three export-safe
+    collections: per-decision ``entries`` (the original audit trail),
+    ``blocked_intervals`` (risky-moment evidence, R13), and ``fail_closed``
+    markers (R14). Guarding on *all three* being empty — not just
+    ``entries`` — is load-bearing: a blocked-app recording with zero NER
+    entities still has intervals to surface, and the old ``entries``-only
+    guard silently dropped them.
+
+    Written at mode 0600 (recording metadata is the same sensitivity class
+    as recordings — SECURITY.md), mirroring the daemon audit-log posture: a
+    tight umask closes the create-then-chmod window, and ``fchmod`` tightens
+    a pre-existing file.
+    """
+    if not (
+        result.audit_entries
+        or result.blocked_intervals
+        or result.fail_closed_redactions
+    ):
         return
-    entries = [dataclasses.asdict(e) for e in result.audit_entries]
-    (dst / "privacy_audit.json").write_text(
-        json.dumps(entries, indent=2), encoding="utf-8"
-    )
+
+    payload = {
+        "schema_version": AUDIT_SCHEMA_VERSION,
+        "entries": [dataclasses.asdict(e) for e in result.audit_entries],
+        "blocked_intervals": [
+            _blocked_interval_to_dict(iv) for iv in result.blocked_intervals
+        ],
+        "fail_closed": list(result.fail_closed_redactions),
+    }
+    body = json.dumps(payload, indent=2).encode("utf-8")
+
+    path = dst / "privacy_audit.json"
+    tmp = dst / "privacy_audit.json.tmp"
+    old_umask = os.umask(0o077)
+    try:
+        fd = os.open(
+            str(tmp),
+            os.O_WRONLY | os.O_CREAT | os.O_TRUNC | os.O_NOFOLLOW,
+            0o600,
+        )
+    finally:
+        os.umask(old_umask)
+    try:
+        # Re-assert the mode in case the tmp pre-existed at a wider mode
+        # (only a same-UID process could have created it, but belt-and-braces).
+        try:
+            os.fchmod(fd, 0o600)
+        except OSError:
+            logger.debug("_write_audit_log: fchmod failed", exc_info=True)
+        os.write(fd, body)
+    finally:
+        os.close(fd)
+    # Atomic publish: a reader sees either the previous complete audit log or
+    # the new one, never a truncated/partial file after a crash mid-write.
+    os.replace(tmp, path)
 
 
 def _print_summary(result: ScrubResult) -> None:
@@ -2700,9 +2852,163 @@ def _safety_delete_unscrubbable_files(src: Path, dst: Path) -> list[str]:
     return sorted(all_skipped)
 
 
+@contextlib.contextmanager
+def recording_scrub_lock(name: str) -> Iterator[None]:
+    """Per-recording advisory lock serializing scrub/reuse on one recording.
+
+    The review window is a ``WindowGroup`` (multiple concurrent windows by
+    design), and ``screencap upload`` can run alongside it. Without a lock, one
+    actor's ``scrub_recording`` (``rmtree`` → ``copytree`` → scrub → sentinel)
+    can rmtree the ``<name>-scrubbed`` dir while another's reuse-guard verdict +
+    ``upload_recording`` file enumeration is in flight — shipping a half-rebuilt
+    or unscrubbed copy. Holding this exclusive ``flock`` across the whole
+    rebuild, and across the upload's decide-then-ship critical section, makes
+    those mutually exclusive (the plan's "serialize on a scrub lock" option).
+
+    The lock file is a dotfile under the recordings root, so it is never
+    uploaded (dotfile filter) and is shared by all same-EUID actors on the
+    recording. Best-effort on platforms without ``fcntl`` (a ``nullcontext``).
+    """
+    try:
+        import fcntl
+    except ImportError:  # pragma: no cover - non-POSIX
+        yield
+        return
+
+    # Best-effort: if the lock file can't be created or locked (read-only or
+    # sandboxed recordings root, an FS without flock), degrade to unlocked
+    # rather than blocking the operation. This is strictly no worse than the
+    # pre-lock behavior; log loudly so the lost serialization is visible.
+    fd = None
+    try:
+        recordings = get_recordings_dir()
+        recordings.mkdir(parents=True, exist_ok=True)
+        lock_path = recordings / f".{name}.scrublock"
+        old_umask = os.umask(0o077)
+        try:
+            fd = os.open(str(lock_path), os.O_RDWR | os.O_CREAT, 0o600)
+        finally:
+            os.umask(old_umask)
+        fcntl.flock(fd, fcntl.LOCK_EX)
+    except OSError:
+        logger.warning(
+            "could not acquire scrub lock for %s; proceeding unlocked", name,
+            exc_info=True,
+        )
+        if fd is not None:
+            with contextlib.suppress(OSError):
+                os.close(fd)
+        yield
+        return
+
+    try:
+        yield
+    finally:
+        try:
+            fcntl.flock(fd, fcntl.LOCK_UN)
+        finally:
+            os.close(fd)
+
+
+def _compute_source_hash(src_dir: Path) -> str:
+    """Content hash of the scrub-relevant source files (see ``_SOURCE_HASH_GLOBS``).
+
+    Deterministic over file name + size + bytes, sorted by name. Used by the
+    reuse guard to detect that the original changed since it was scrubbed —
+    presence/mtime are unsafe (a killed-mid-scrub dir looks "fresh", and the
+    upload path itself mutates the original before scrub).
+    """
+    import hashlib
+
+    h = hashlib.sha256()
+    files: list[Path] = []
+    for pattern in _SOURCE_HASH_GLOBS:
+        files.extend(src_dir.glob(pattern))
+    for f in sorted(set(files), key=lambda p: p.name):
+        if not f.is_file():
+            continue
+        h.update(f.name.encode("utf-8"))
+        h.update(b"\0")
+        h.update(str(f.stat().st_size).encode("utf-8"))
+        h.update(b"\0")
+        with open(f, "rb") as fh:
+            for chunk in iter(lambda fh=fh: fh.read(65536), b""):
+                h.update(chunk)
+        h.update(b"\0")
+    return h.hexdigest()
+
+
+def _write_scrub_sentinel(
+    scrubbed_dir: Path, src_dir: Path, *, cloud_bound_recovery: bool
+) -> None:
+    """Write the completion sentinel + provenance as the final step of a
+    successful scrub. Atomic (temp + replace) so a concurrent reader never sees
+    a half-written sentinel; mode 0600 (provenance is recording-class metadata).
+
+    Best-effort: a write failure is logged, not raised — the scrub still
+    succeeded, the dir just won't be eligible for reuse (upload rebuilds, which
+    is safe).
+    """
+    payload = {
+        "scrubber_version": SCRUB_PROVENANCE_VERSION,
+        "source_hash": _compute_source_hash(src_dir),
+        "cloud_bound_recovery": bool(cloud_bound_recovery),
+    }
+    body = json.dumps(payload, indent=2).encode("utf-8")
+    final = scrubbed_dir / SCRUB_SENTINEL_NAME
+    tmp = scrubbed_dir / (SCRUB_SENTINEL_NAME + ".tmp")
+    old_umask = os.umask(0o077)
+    try:
+        fd = os.open(
+            str(tmp), os.O_WRONLY | os.O_CREAT | os.O_TRUNC | os.O_NOFOLLOW, 0o600
+        )
+        try:
+            os.write(fd, body)
+        finally:
+            os.close(fd)
+        os.replace(tmp, final)
+    except OSError:
+        logger.warning("could not write scrub sentinel %s", final, exc_info=True)
+        with contextlib.suppress(OSError):
+            tmp.unlink(missing_ok=True)
+    finally:
+        os.umask(old_umask)
+
+
+def is_scrubbed_copy_reusable(
+    src_dir: Path, scrubbed_dir: Path, *, require_cloud_bound: bool = True
+) -> bool:
+    """True only if ``scrubbed_dir`` is a complete, current scrub of ``src_dir``
+    built the way upload would build it — safe to ship as-is (reviewed ==
+    uploaded).
+
+    Requires: the completion sentinel exists; the scrubber version matches; the
+    source content hash matches (detecting mutation of the original); and, when
+    ``require_cloud_bound``, the cloud-bound recovery flag is set (so a dir
+    scrubbed without the load-bearing recovery — e.g. by ``screencap scrub`` —
+    is never shipped, which could leak in-interval pointer geometry). Any miss
+    → rebuild.
+    """
+    sentinel = scrubbed_dir / SCRUB_SENTINEL_NAME
+    if not scrubbed_dir.is_dir() or not sentinel.exists():
+        return False
+    try:
+        prov = json.loads(sentinel.read_text(encoding="utf-8"))
+    except (OSError, json.JSONDecodeError):
+        return False
+    if prov.get("scrubber_version") != SCRUB_PROVENANCE_VERSION:
+        return False
+    if require_cloud_bound and not prov.get("cloud_bound_recovery"):
+        return False
+    return prov.get("source_hash") == _compute_source_hash(src_dir)
+
+
 def scrub_recording(
     name: str,
     pii_engine: str | None = None,
+    *,
+    cloud_bound_recovery: bool = False,
+    _already_locked: bool = False,
 ) -> ScrubResult:
     """Copy a recording and scrub PII from the copy.
 
@@ -2713,6 +3019,18 @@ def scrub_recording(
     Args:
         name: Recording name (directory name under recordings/).
         pii_engine: "presidio", "presidio-gliner", or None (auto-detect).
+        cloud_bound_recovery: Whether the caller ran
+            ``_recover_chunk_metadata(cloud_bound=True)`` before this scrub.
+            Recorded in the completion sentinel's provenance; the upload reuse
+            guard refuses to ship a dir scrubbed without it (it could leak
+            in-interval pointer geometry). ``screencap upload`` and the native
+            review path pass ``True``; standalone ``screencap scrub`` leaves it
+            ``False``.
+        _already_locked: Internal — set ``True`` only when the caller already
+            holds ``recording_scrub_lock(name)`` (the upload loop, which keeps
+            the lock across reuse-check → scrub → upload). Avoids a same-process
+            re-entrant ``flock`` deadlock. Other callers leave it ``False`` so
+            the rebuild self-serializes against concurrent scrubs.
 
     Returns:
         ScrubResult with entity counts and deleted files.
@@ -2742,36 +3060,60 @@ def scrub_recording(
         )
     anonymizer = Anonymizer()
 
-    dst = get_recordings_dir() / f"{name}-scrubbed"
-    if dst.exists():
-        console.print(
-            f"  [yellow]Warning: {dst.name}/ already exists — replacing[/]"
-        )
-        shutil.rmtree(dst)
+    # Serialize the whole rebuild (rmtree → copytree → scrub → sentinel) against
+    # any concurrent scrub/upload of the same recording. The pipeline load above
+    # is read-only and stays outside the lock. ``_already_locked`` skips
+    # re-acquiring when the upload loop already holds the lock (avoids a
+    # same-process re-entrant flock deadlock).
+    lock_cm = contextlib.nullcontext() if _already_locked else recording_scrub_lock(src.name)
+    with lock_cm:
+        dst = get_recordings_dir() / f"{name}-scrubbed"
+        if dst.exists():
+            console.print(
+                f"  [yellow]Warning: {dst.name}/ already exists — replacing[/]"
+            )
+            shutil.rmtree(dst)
 
-    with console.status(f"Copying {name} → {name}-scrubbed ..."):
-        shutil.copytree(src, dst, symlinks=False, ignore=_copytree_ignore)
+        with console.status(f"Copying {name} → {name}-scrubbed ..."):
+            shutil.copytree(src, dst, symlinks=False, ignore=_copytree_ignore)
 
-    pre_deleted = _safety_delete_unscrubbable_files(src, dst)
+        # The scrubbed copy holds the same sensitivity class as the recording
+        # (and is the exact payload an operator is about to upload), so lock it
+        # to owner-only before writing any scrubbed bytes — and assert the mode
+        # held, since a wider dir would expose the about-to-be-prepared copy.
+        os.chmod(dst, 0o700)
+        dir_mode = stat.S_IMODE(dst.stat().st_mode)
+        if dir_mode != 0o700:
+            raise RuntimeError(
+                f"scrubbed dir {dst.name} has mode {oct(dir_mode)}, expected 0o700"
+            )
 
-    with console.status("Loading privacy policy and context..."):
-        privacy_config = _resolve_privacy_config_for_dir(dst)
-        evaluator = DefaultPolicyEvaluator(privacy_config)
-        classifier = DefaultContextClassifier(
-            app_classes=privacy_config.app_classes,
-        )
+        pre_deleted = _safety_delete_unscrubbable_files(src, dst)
 
-    result = Scrubber(
-        dst,
-        pipeline=pipeline,
-        anonymizer=anonymizer,
-        evaluator=evaluator,
-        classifier=classifier,
-    ).run()
+        with console.status("Loading privacy policy and context..."):
+            privacy_config = _resolve_privacy_config_for_dir(dst)
+            evaluator = DefaultPolicyEvaluator(privacy_config)
+            classifier = DefaultContextClassifier(
+                app_classes=privacy_config.app_classes,
+            )
 
-    # Merge file-deletion tracking from the copy stage with anything the
-    # scrubber added (DB table deletions, etc.) so the summary lists both.
-    result.deleted_files = sorted(set(result.deleted_files) | set(pre_deleted))
+        result = Scrubber(
+            dst,
+            pipeline=pipeline,
+            anonymizer=anonymizer,
+            evaluator=evaluator,
+            classifier=classifier,
+        ).run()
 
-    _print_summary(result)
+        # Merge file-deletion tracking from the copy stage with anything the
+        # scrubber added (DB table deletions, etc.) so the summary lists both.
+        result.deleted_files = sorted(set(result.deleted_files) | set(pre_deleted))
+
+        _print_summary(result)
+
+        # FINAL step (reached only on a fully-successful scrub — run() raises on
+        # a structural failure): mark the dir reusable. Mirrors the chunk-upload
+        # sentinel-gating posture — the last write, gated on all prior writes.
+        _write_scrub_sentinel(dst, src, cloud_bound_recovery=cloud_bound_recovery)
+
     return result
