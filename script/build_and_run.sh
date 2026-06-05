@@ -47,6 +47,16 @@ load_local_env() {
     # plausible identifier so malformed lines don't smuggle in syntax.
     key="${key#"${key%%[![:space:]]*}"}"
     key="${key%"${key##*[![:space:]]}"}"
+    # Tolerate an optional leading `export ` — the conventional way to write a
+    # shell-style .env. Without this, `export DEVELOPMENT_TEAM=...` parses as
+    # the key "export DEVELOPMENT_TEAM" (embedded space), fails the identifier
+    # check below, and is silently dropped — leaving the app ad-hoc-signed so
+    # macOS TCC drops Screen Recording grants on every rebuild. We strip the
+    # keyword literally and re-trim; we still never `source`/eval the line.
+    if [[ "$key" == export[[:space:]]* ]]; then
+      key="${key#export}"
+      key="${key#"${key%%[![:space:]]*}"}"
+    fi
     if [[ ! "$key" =~ ^[A-Za-z_][A-Za-z0-9_]*$ ]]; then
       continue
     fi
