@@ -1,8 +1,9 @@
 ---
 title: "P3: 600s review-data scrub wait has no progress signal or cancel button"
-status: open
+status: resolved
 priority: low
 created: 2026-06-05
+resolved: 2026-06-05
 source: code-review (ce-code-review autofix, reliability RR-1 / swift-ios residual / learnings)
 related_plans:
   - docs/plans/2026-06-03-002-feat-native-redaction-review-upload-plan.md
@@ -28,4 +29,9 @@ A scrub that fails at 598s shows the spinner the whole time, then the failed sta
 ## Why deferred
 
 UX refinement, not a correctness/safety issue. The plan explicitly accepted the indeterminate spinner ("absent a progress callback, U8 uses an indeterminate spinner with copy"). Worth a follow-up once real operators report waits on large recordings.
-</content>
+
+## Resolution
+
+Fixed the actionable part (item 1): `CLIClient.runOneShot` (behind `runJSONRaw`, used by `review-data`) now wraps its exit/timeout race in `withTaskCancellationHandler` and SIGTERMs the child on Task cancellation (Sendable-safe via the captured pid). The preparing-state Cancel button calls `dismiss()`, which tears down the window and cancels the `.task { await loadReviewData() }` → the in-flight scrub is now terminated immediately instead of running orphaned up to the 600s ceiling.
+
+Items 2 (determinate progress bar) and 3 (size-scaled timeout) remain genuine future enhancements but are **blocked on a scrubber progress callback that does not exist** — the plan already chose the indeterminate spinner deliberately. With cancel-terminates-the-scrub in place, the orphaned-wait risk that motivated this todo is gone; the determinate-progress polish can wait for the scrubber to expose progress. Full macOS suite green after the change.

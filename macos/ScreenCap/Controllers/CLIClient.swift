@@ -211,30 +211,42 @@ enum CLIClient {
             throw CLIError.launchFailed(underlying: error)
         }
 
-        // Drain pipes concurrently — without this, >64KB output deadlocks
-        // the child. Each task reads to EOF (which only happens once the
-        // child closes its end, i.e., on exit).
-        async let stdoutData: Data = readAllInBackground(stdout.fileHandleForReading)
-        async let stderrData: Data = readAllInBackground(stderr.fileHandleForReading)
+        // SIGTERM the child if the awaiting Task is cancelled — e.g. the review
+        // window is dismissed while `review-data` is mid-scrub. Without this the
+        // scrub (a full NER pass, up to the timeout) keeps running orphaned.
+        // Capture the pid (Sendable) rather than the Process so the @Sendable
+        // onCancel closure stays concurrency-clean.
+        let pid = process.processIdentifier
+        return try await withTaskCancellationHandler {
+            // Drain pipes concurrently — without this, >64KB output deadlocks
+            // the child. Each task reads to EOF (which only happens once the
+            // child closes its end, i.e., on exit).
+            async let stdoutData: Data = readAllInBackground(stdout.fileHandleForReading)
+            async let stderrData: Data = readAllInBackground(stderr.fileHandleForReading)
 
-        // Race subprocess exit against the timeout. If the timeout wins,
-        // SIGTERM the process so its FDs close and the drain tasks unblock.
-        let didTimeOut = await raceExitAgainstTimeout(process: process, timeout: timeout)
+            // Race subprocess exit against the timeout. If the timeout wins,
+            // SIGTERM the process so its FDs close and the drain tasks unblock.
+            let didTimeOut = await raceExitAgainstTimeout(process: process, timeout: timeout)
 
-        let stdoutBytes = await stdoutData
-        let stderrBytes = await stderrData
+            let stdoutBytes = await stdoutData
+            let stderrBytes = await stderrData
 
-        if didTimeOut {
-            throw CLIError.timedOut(seconds: timeout)
+            if didTimeOut {
+                throw CLIError.timedOut(seconds: timeout)
+            }
+
+            let exitCode = process.terminationStatus
+            if exitCode != 0 {
+                let errText = String(data: stderrBytes, encoding: .utf8) ?? "<binary>"
+                throw CLIError.nonZeroExit(code: exitCode, stderr: errText)
+            }
+
+            return (stdoutBytes, stderrBytes)
+        } onCancel: {
+            if pid > 0 {
+                kill(pid, SIGTERM)
+            }
         }
-
-        let exitCode = process.terminationStatus
-        if exitCode != 0 {
-            let errText = String(data: stderrBytes, encoding: .utf8) ?? "<binary>"
-            throw CLIError.nonZeroExit(code: exitCode, stderr: errText)
-        }
-
-        return (stdoutBytes, stderrBytes)
     }
 
     /// Reads `handle` to EOF on a background queue. The continuation resumes
