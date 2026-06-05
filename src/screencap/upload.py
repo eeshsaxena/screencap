@@ -140,8 +140,12 @@ def _wal_checkpoint(recording_dir: Path) -> None:
         pass  # best-effort — upload proceeds even if checkpoint fails
 
 
-# Files that should never be uploaded (SQLite WAL artifacts, temp files)
-_UPLOAD_EXCLUDE = {".db-shm", ".db-wal"}
+# Files that should never be uploaded: SQLite WAL artifacts, and fail-closed
+# scrub artifacts (`*.scrub_failed`). The scrubber renames a file it could not
+# redact to `<name>.scrub_failed` (retaining raw content) and documents it as
+# "ineligible for upload"; the review path already excludes them, so the upload
+# sink must too — otherwise raw, unredacted bytes ship while review hid them.
+_UPLOAD_EXCLUDE = {".db-shm", ".db-wal", ".scrub_failed"}
 
 # Review-only artifacts (`.video_review.mp4`) are dot-prefixed, so the dotfile
 # filter below already skips them — no by-name exclusion needed.
@@ -151,7 +155,8 @@ def list_recording_files(recording_dir: Path) -> list[FileInfo]:
     """Return files in a recording dir, sorted largest-first.
 
     Runs a WAL checkpoint on recording.db first to ensure a clean DB,
-    and excludes SQLite WAL artifacts (.db-shm, .db-wal).
+    and excludes SQLite WAL artifacts (.db-shm, .db-wal) and fail-closed
+    scrub artifacts (*.scrub_failed), which retain raw, unredacted content.
     """
     _wal_checkpoint(recording_dir)
 
@@ -174,6 +179,8 @@ def list_recording_files(recording_dir: Path) -> list[FileInfo]:
     # Also include files in subdirectories (e.g., screenshots/)
     for p in sorted(recording_dir.rglob("*")):
         if p.is_symlink() or not p.is_file() or p.parent == recording_dir or p.name.startswith("."):
+            continue
+        if any(p.name.endswith(ext) for ext in _UPLOAD_EXCLUDE):
             continue
         try:
             size = p.stat().st_size

@@ -106,6 +106,24 @@ def test_list_recording_files_empty(tmp_path):
     assert files == []
 
 
+def test_list_recording_files_excludes_scrub_failed(tmp_path):
+    """Fail-closed scrub artifacts retain raw, unredacted content; the scrubber
+    renames them `*.scrub_failed` to mark them ineligible for upload. The upload
+    sink must exclude them (top-level and in subdirs) so reviewed == uploaded and
+    raw bytes never ship."""
+    rec = tmp_path / "my-rec"
+    rec.mkdir()
+    (rec / "events_0000.jsonl").write_text("scrubbed")
+    (rec / "events_0001.jsonl.scrub_failed").write_text("RAW UNREDACTED")
+    sub = rec / "screenshots"
+    sub.mkdir()
+    (sub / "frame.jsonl.scrub_failed").write_text("RAW UNREDACTED")
+
+    names = [f.name for f in list_recording_files(rec)]
+    assert "events_0000.jsonl" in names
+    assert not any(n.endswith(".scrub_failed") for n in names)
+
+
 # ---------------------------------------------------------------------------
 # Unit tests: request_signed_urls
 # ---------------------------------------------------------------------------

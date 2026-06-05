@@ -27,7 +27,10 @@ struct EventContentPane: View {
     }
 
     var body: some View {
-        VStack(alignment: .leading, spacing: 0) {
+        // Compute once per render: `moment` is an O(N) scan over events and the
+        // body reads it twice (empty check + ForEach) at ~10 Hz playback.
+        let moment = self.moment
+        return VStack(alignment: .leading, spacing: 0) {
             header
             Divider()
             if moment.isEmpty {

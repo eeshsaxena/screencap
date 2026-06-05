@@ -110,9 +110,8 @@ struct ReviewDataEnvelope: Decodable, Equatable {
 /// upload (R15). `redaction`/`coverage` drive the transparency UI (U8).
 struct ReviewData: Equatable {
     let videoURL: URL
-    let eventsURL: URL
     /// The full scrubbed event file set (per-chunk when chunked) — what
-    /// upload ships and U7 parses. At least `[eventsURL]`.
+    /// upload ships and U7 parses. Always at least one path.
     let eventsURLs: [URL]
     /// Scrubbed (masked) screenshots — the "what actually uploads" visual (U6).
     let screenshotURLs: [URL]
@@ -265,7 +264,6 @@ final class ReviewWindowViewModel: ObservableObject {
             let screenshotURLs = (envelope.screenshots ?? []).map { URL(fileURLWithPath: $0) }
             let data = ReviewData(
                 videoURL: URL(fileURLWithPath: videoPath),
-                eventsURL: URL(fileURLWithPath: eventsPath),
                 eventsURLs: eventsURLs,
                 screenshotURLs: screenshotURLs,
                 startedAt: envelope.startedAt ?? 0,

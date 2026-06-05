@@ -19,6 +19,7 @@ import re
 import shutil
 import stat
 from collections import Counter
+from collections.abc import Iterator
 from contextlib import ExitStack
 from dataclasses import dataclass, field
 from pathlib import Path
@@ -2721,17 +2722,18 @@ def _write_audit_log(dst: Path, result: ScrubResult) -> None:
     body = json.dumps(payload, indent=2).encode("utf-8")
 
     path = dst / "privacy_audit.json"
+    tmp = dst / "privacy_audit.json.tmp"
     old_umask = os.umask(0o077)
     try:
         fd = os.open(
-            str(path),
+            str(tmp),
             os.O_WRONLY | os.O_CREAT | os.O_TRUNC | os.O_NOFOLLOW,
             0o600,
         )
     finally:
         os.umask(old_umask)
     try:
-        # Re-assert the mode in case the file pre-existed at a wider mode
+        # Re-assert the mode in case the tmp pre-existed at a wider mode
         # (only a same-UID process could have created it, but belt-and-braces).
         try:
             os.fchmod(fd, 0o600)
@@ -2740,6 +2742,9 @@ def _write_audit_log(dst: Path, result: ScrubResult) -> None:
         os.write(fd, body)
     finally:
         os.close(fd)
+    # Atomic publish: a reader sees either the previous complete audit log or
+    # the new one, never a truncated/partial file after a crash mid-write.
+    os.replace(tmp, path)
 
 
 def _print_summary(result: ScrubResult) -> None:
@@ -2840,7 +2845,7 @@ def _safety_delete_unscrubbable_files(src: Path, dst: Path) -> list[str]:
 
 
 @contextlib.contextmanager
-def recording_scrub_lock(name: str):
+def recording_scrub_lock(name: str) -> Iterator[None]:
     """Per-recording advisory lock serializing scrub/reuse on one recording.
 
     The review window is a ``WindowGroup`` (multiple concurrent windows by
@@ -2946,7 +2951,9 @@ def _write_scrub_sentinel(
     tmp = scrubbed_dir / (SCRUB_SENTINEL_NAME + ".tmp")
     old_umask = os.umask(0o077)
     try:
-        fd = os.open(str(tmp), os.O_WRONLY | os.O_CREAT | os.O_TRUNC, 0o600)
+        fd = os.open(
+            str(tmp), os.O_WRONLY | os.O_CREAT | os.O_TRUNC | os.O_NOFOLLOW, 0o600
+        )
         try:
             os.write(fd, body)
         finally:

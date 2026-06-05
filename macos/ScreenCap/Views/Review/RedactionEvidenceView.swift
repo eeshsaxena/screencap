@@ -39,7 +39,14 @@ enum RedactionSummary {
     }
 
     static func pluralize(_ noun: String, _ count: Int) -> String {
-        count == 1 ? noun : "\(noun)s"
+        guard count != 1 else { return noun }
+        // Suffix-aware: words ending in s/x/z/ch/sh take "es" (so "IP address"
+        // → "IP addresses", not "IP addresss").
+        let lower = noun.lowercased()
+        for suffix in ["s", "x", "z", "ch", "sh"] where lower.hasSuffix(suffix) {
+            return "\(noun)es"
+        }
+        return "\(noun)s"
     }
 
     /// One-line protection headline framed as protection ("removed"/"hid"), or

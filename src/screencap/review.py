@@ -310,7 +310,7 @@ def prepare_review_data(name: str) -> dict:
     }
 
 
-def _prepare_scrubbed_copy(name: str, rec_dir: Path):
+def _prepare_scrubbed_copy(name: str, rec_dir: Path) -> "ScrubResult":
     """Run canonical export → cloud-bound recovery → scrub, returning the
     ``ScrubResult`` (its ``output_dir`` is the scrubbed dir; the rest is the
     redaction-evidence source). A total scrub failure is a structural

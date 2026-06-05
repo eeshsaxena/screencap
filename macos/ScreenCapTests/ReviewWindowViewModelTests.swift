@@ -469,7 +469,9 @@ final class ReviewWindowViewModelTests: XCTestCase {
     /// The review-data shell-out timeout is raised well above the legacy 60s so
     /// the in-command NER scrub isn't SIGTERM'd mid-pass.
     func testReviewDataTimeoutIsRaisedAboveLegacy60s() {
-        XCTAssertGreaterThan(LiveReviewDataLoader.reviewDataTimeout, 60)
+        XCTAssertGreaterThanOrEqual(
+            LiveReviewDataLoader.reviewDataTimeout, 600,
+            "timeout must accommodate the in-command NER scrub on large recordings")
     }
 
     /// Pins the U3↔U5 JSON contract: snake_case keys decode, and an open-ended
