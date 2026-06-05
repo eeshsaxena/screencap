@@ -49,7 +49,11 @@ from rich.console import Console
 # ``redirect_stdout(sys.stderr)`` to keep stdout clean.
 console = Console(stderr=True)
 
-REVIEW_SCHEMA_VERSION = 1
+# Bumped to 2 in U3: the envelope gained additive, optional redaction-evidence
+# and coverage fields plus the scrubbed screenshot set. All new fields are
+# nullable/empty-representable; Swift decodes them with safe defaults and never
+# gates readiness on them (see the nullable-timing learning).
+REVIEW_SCHEMA_VERSION = 2
 
 
 class ReviewPrepareError(RuntimeError):
@@ -102,6 +106,65 @@ def _resolve_scrubbed_event_files(scrubbed_dir: Path) -> list[Path]:
         return chunk_files
     combined = scrubbed_dir / "events.jsonl"
     return [combined] if combined.exists() else []
+
+
+def _build_redaction_evidence(scrub_result) -> dict:
+    """Build the export-safe redaction-evidence payload from a ``ScrubResult``.
+
+    Two levels of evidence (R8) plus risky-moment + fail-closed data (R13/R14),
+    all category/timestamp only — never a redacted value:
+
+    - ``summary``: entity type → count (the per-recording "removed/protected"
+      tally).
+    - ``markers``: per-moment redaction markers ``{t, category}`` at audit
+      timestamps.
+    - ``blocked_intervals``: risky-moment intervals ``{start, end, action,
+      reason}`` (``end`` null when open-ended).
+    - ``fail_closed``: ``{t, surface}`` markers for content the scrubber could
+      not analyze and removed to be safe.
+    """
+    # Reuse the scrubber's serializer so the envelope's intervals match the
+    # on-disk privacy_audit.json byte-for-byte (inf end → null).
+    from screencap.scrubber import _blocked_interval_to_dict
+
+    return {
+        "summary": dict(scrub_result.entity_counts),
+        "markers": [
+            {"t": e.timestamp, "category": e.reason}
+            for e in scrub_result.audit_entries
+        ],
+        "blocked_intervals": [
+            _blocked_interval_to_dict(iv) for iv in scrub_result.blocked_intervals
+        ],
+        "fail_closed": [
+            {"t": m["timestamp"], "surface": m.get("surface", "")}
+            for m in scrub_result.fail_closed_redactions
+        ],
+    }
+
+
+def _build_coverage(scrubbed_dir: Path, screenshots: list[str]) -> dict:
+    """Structured R9 coverage facts the UI renders honest copy from.
+
+    Not hardcoded UI strings — booleans the transparency layer maps to copy,
+    so the disclosure can emphasize the one fact requiring operator action
+    (allowed-app on-screen PII in screenshots is not auto-redacted) over the
+    benign ones (video/audio never upload; transcript uploads scrubbed).
+    """
+    has_transcript = bool(
+        list(scrubbed_dir.glob("transcript*.json"))
+        or list(scrubbed_dir.glob("transcript*.txt"))
+    )
+    return {
+        "video_local_only": True,
+        "audio_local_only": True,
+        "transcript_uploaded_scrubbed": has_transcript,
+        "screenshots_uploaded": bool(screenshots),
+        # The blind spot: on-screen PII inside allowed apps is the operator's
+        # to verify — the scrubber masks blocked apps, not content within
+        # allowed ones.
+        "allowed_app_screenshot_pii_manual_review": True,
+    }
 
 
 def _assert_within_recordings_root(path: Path, recordings_root: Path) -> None:
@@ -184,8 +247,9 @@ def prepare_review_data(name: str) -> dict:
     # — masked screenshots + scrubbed events/DB/transcript — so the bytes
     # reviewed are the bytes uploaded. All status/progress is forced to stderr
     # (the scrubber prints to its own stdout-bound console); stdout stays the
-    # JSON envelope only.
-    scrubbed_dir = _prepare_scrubbed_copy(name, rec_dir)
+    # JSON envelope only. The ScrubResult is the redaction-evidence source.
+    scrub_result = _prepare_scrubbed_copy(name, rec_dir)
+    scrubbed_dir = scrub_result.output_dir
 
     # Defense-in-depth path containment before emitting any scrubbed path.
     recordings_root = get_recordings_dir()
@@ -224,16 +288,22 @@ def prepare_review_data(name: str) -> dict:
         "events_path": events_paths[0] if events_paths else None,
         "events_paths": events_paths,
         "screenshots": screenshots,
+        # Additive, optional evidence (U3) — empty-representable so a recording
+        # with no redactions still yields a valid ok:true envelope.
+        "redaction": _build_redaction_evidence(scrub_result),
+        "coverage": _build_coverage(scrubbed_dir, screenshots),
         "started_at": started_at,
         "duration_seconds": duration_seconds,
         "video_pixfmt_remediated": remediated,
     }
 
 
-def _prepare_scrubbed_copy(name: str, rec_dir: Path) -> Path:
+def _prepare_scrubbed_copy(name: str, rec_dir: Path):
     """Run canonical export → cloud-bound recovery → scrub, returning the
-    scrubbed dir. A total scrub failure is a structural preparation failure
-    (``ReviewPrepareError``) leaving no reusable (sentinel'd) dir behind.
+    ``ScrubResult`` (its ``output_dir`` is the scrubbed dir; the rest is the
+    redaction-evidence source). A total scrub failure is a structural
+    preparation failure (``ReviewPrepareError``) leaving no reusable
+    (sentinel'd) dir behind.
 
     The recovery → scrub ordering mirrors the upload loop's load-bearing
     sequence so the prepared dir is upload-equivalent (the scrub-layer pointer
@@ -272,4 +342,4 @@ def _prepare_scrubbed_copy(name: str, rec_dir: Path) -> Path:
                 f"could not prepare a safe version for review: {e}"
             ) from e
 
-    return scrub_result.output_dir
+    return scrub_result

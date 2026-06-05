@@ -589,3 +589,99 @@ def test_cli_real_scrub_stdout_stays_clean_json(recordings_root):
     payload = json.loads(result.stdout)
     assert payload["ok"] is True
     assert "Scrub complete" not in result.stdout
+
+
+# ---------------------------------------------------------------------------
+# U3: enriched, versioned envelope (R5/R8/R9/R13/R14/R15)
+# ---------------------------------------------------------------------------
+
+
+def test_envelope_schema_version_is_bumped(recordings_root):
+    rec_dir = _make_recording(recordings_root, "rec-ver")
+    _write_video(rec_dir / "video.mp4", (0, 0, 200), pix_fmt="yuv420p")
+    (rec_dir / "events.jsonl").write_text(json.dumps({"_meta": True}) + "\n")
+
+    envelope = prepare_review_data("rec-ver")
+
+    assert envelope["schema_version"] == REVIEW_SCHEMA_VERSION
+    assert REVIEW_SCHEMA_VERSION >= 2, "the U3 enrichment must bump the version"
+
+
+def test_zero_redactions_serialize_empty_collections_not_null(recordings_root):
+    """Pinning (mirrors test_nullable_metadata_serialized_as_json_null): a
+    recording with no redactions still yields ok:true with empty — not missing
+    — redaction collections, JSON-round-trippable."""
+    rec_dir = _make_recording(recordings_root, "rec-noredact")
+    _write_video(rec_dir / "video.mp4", (0, 0, 200), pix_fmt="yuv420p")
+    (rec_dir / "events.jsonl").write_text(json.dumps({"_meta": True}) + "\n")
+
+    envelope = prepare_review_data("rec-noredact")
+
+    assert envelope["ok"] is True
+    red = envelope["redaction"]
+    assert red["summary"] == {}
+    assert red["markers"] == []
+    assert red["blocked_intervals"] == []
+    assert red["fail_closed"] == []
+    # Round-trips as JSON (no inf, no non-serializable Counter leaking).
+    serialized = json.loads(json.dumps(envelope))
+    assert serialized["redaction"]["summary"] == {}
+
+
+def test_coverage_facts_present_and_structured(recordings_root):
+    """Covers AE4: coverage carries the R9 facts as structured booleans the UI
+    renders copy from (video/audio local-only, transcript scrubbed, screenshots
+    uploaded, allowed-app on-screen PII the operator's to verify)."""
+    rec_dir = _make_recording(recordings_root, "rec-cov")
+    _write_video(rec_dir / "video.mp4", (0, 0, 200), pix_fmt="yuv420p")
+    (rec_dir / "events.jsonl").write_text(json.dumps({"_meta": True}) + "\n")
+
+    envelope = prepare_review_data("rec-cov")
+
+    cov = envelope["coverage"]
+    assert cov["video_local_only"] is True
+    assert cov["audio_local_only"] is True
+    assert cov["allowed_app_screenshot_pii_manual_review"] is True
+    assert set(cov) == {
+        "video_local_only",
+        "audio_local_only",
+        "transcript_uploaded_scrubbed",
+        "screenshots_uploaded",
+        "allowed_app_screenshot_pii_manual_review",
+    }
+
+
+def test_coverage_reflects_transcript_presence(recordings_root):
+    rec_dir = _make_recording(recordings_root, "rec-trans")
+    _write_video(rec_dir / "video.mp4", (0, 0, 200), pix_fmt="yuv420p")
+    (rec_dir / "events.jsonl").write_text(json.dumps({"_meta": True}) + "\n")
+    (rec_dir / "transcript.txt").write_text("hello world")
+
+    envelope = prepare_review_data("rec-trans")
+
+    assert envelope["coverage"]["transcript_uploaded_scrubbed"] is True
+
+
+@pytest.mark.privacy
+@pytest.mark.real_scrub
+def test_redaction_summary_populated_for_pii_recording(recordings_root):
+    """Happy path: a recording with PII yields a non-empty redaction.summary
+    (entity → count), with markers/blocked_intervals/fail_closed present as
+    lists and the screenshot set exposed."""
+    rec_dir = _make_recording(recordings_root, "rec-evidence")
+    _write_video(rec_dir / "video.mp4", (0, 0, 200), pix_fmt="yuv420p")
+    (rec_dir / "events.jsonl").write_text(
+        json.dumps({"_meta": True, "screencap_version": "0.1.0"}) + "\n"
+        + json.dumps({"timestamp": 1.0, "type": "key.type",
+                      "text": "reach me at carol@contoso.example", "children": []}) + "\n"
+    )
+
+    envelope = prepare_review_data("rec-evidence")
+
+    red = envelope["redaction"]
+    assert red["summary"], "PII must surface as an entity → count summary"
+    assert sum(red["summary"].values()) >= 1
+    assert isinstance(red["markers"], list)
+    assert isinstance(red["blocked_intervals"], list)
+    assert isinstance(red["fail_closed"], list)
+    assert "screenshots" in envelope
