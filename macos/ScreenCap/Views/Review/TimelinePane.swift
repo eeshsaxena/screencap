@@ -10,10 +10,24 @@ import SwiftUI
 /// Visual encoding (single-row colored markers) is the defensible default
 /// the plan calls out under Open Questions; iterate from real-recording
 /// feedback rather than over-designing up front.
+/// A recording-relative time interval (risky-moment band), end clamped to the
+/// recording duration so an open-ended interval renders to the timeline's edge.
+struct TimelineInterval: Equatable {
+    let start: Double
+    let end: Double
+}
+
 struct TimelinePane: View {
     let events: [TimelineEvent]
     let durationSeconds: Double
     let currentTime: Double
+    /// Advisory risky-moment intervals (R13) — drawn as translucent bands, a
+    /// distinct encoding from the per-category event ticks. Advisory only;
+    /// never gates Upload.
+    var riskyIntervals: [TimelineInterval] = []
+    /// Per-moment redaction markers (R8) — drawn as ticks along the top edge in
+    /// a distinct color, separate from the event ticks below.
+    var redactionMarkers: [Double] = []
     let onScrub: (Double) -> Void
 
     var body: some View {
@@ -21,7 +35,9 @@ struct TimelinePane: View {
             ZStack(alignment: .topLeading) {
                 Canvas { context, size in
                     drawBackground(context: context, size: size)
+                    drawRiskyBands(context: context, size: size)
                     drawMarkers(context: context, size: size)
+                    drawRedactionMarkers(context: context, size: size)
                     drawCursor(context: context, size: size)
                 }
                 .gesture(
@@ -65,6 +81,37 @@ struct TimelinePane: View {
         }
     }
 
+    /// R13: translucent amber bands spanning each risky interval — a distinct
+    /// encoding from the event ticks (a span, not a point) so the operator can
+    /// tell "the scrubber acted over this stretch" apart from discrete events.
+    private func drawRiskyBands(context: GraphicsContext, size: CGSize) {
+        guard durationSeconds > 0 else { return }
+        for interval in riskyIntervals {
+            let x0 = TimelinePaneScrub.cursorX(
+                forSeconds: interval.start, width: size.width, durationSeconds: durationSeconds)
+            let x1 = TimelinePaneScrub.cursorX(
+                forSeconds: interval.end, width: size.width, durationSeconds: durationSeconds)
+            let rect = CGRect(x: x0, y: 0, width: max(2, x1 - x0), height: size.height)
+            context.fill(Path(rect), with: .color(.orange.opacity(0.18)))
+        }
+    }
+
+    /// R8: short ticks along the TOP edge marking moments where content was
+    /// redacted — distinct color and position from the mid-height event ticks.
+    private func drawRedactionMarkers(context: GraphicsContext, size: CGSize) {
+        guard durationSeconds > 0, !redactionMarkers.isEmpty else { return }
+        var path = Path()
+        let topInset: CGFloat = 0
+        let tickHeight: CGFloat = max(6, size.height / 4)
+        for t in redactionMarkers {
+            let x = TimelinePaneScrub.cursorX(
+                forSeconds: t, width: size.width, durationSeconds: durationSeconds)
+            path.move(to: CGPoint(x: x, y: topInset))
+            path.addLine(to: CGPoint(x: x, y: topInset + tickHeight))
+        }
+        context.stroke(path, with: .color(.pink), lineWidth: 2)
+    }
+
     private func drawCursor(context: GraphicsContext, size: CGSize) {
         guard durationSeconds > 0 else { return }
         let ratio = min(1, max(0, currentTime / durationSeconds))
@@ -105,5 +152,33 @@ enum TimelinePaneScrub {
         guard width > 0, durationSeconds > 0 else { return 0 }
         let ratio = min(1, max(0, seconds / durationSeconds))
         return CGFloat(ratio) * width
+    }
+}
+
+/// Converts the envelope's redaction evidence (absolute-epoch timestamps, the
+/// same space the events use) into the recording-relative markers/intervals the
+/// timeline draws. Extracted so the conversion + clamping is unit-tested.
+enum RedactionTimeline {
+    /// Per-moment redaction marker times, relative to recording start, sorted
+    /// and clamped to >= 0.
+    static func relativeMarkers(_ redaction: ReviewRedaction?, startedAt: Double) -> [Double] {
+        (redaction?.markers ?? [])
+            .map { max(0, $0.t - startedAt) }
+            .sorted()
+    }
+
+    /// Risky-moment intervals relative to recording start. An open-ended
+    /// interval (`end == nil`) clamps to `duration` so it renders to the
+    /// timeline's edge; zero/unknown duration yields no intervals (nothing to
+    /// place them against).
+    static func riskyIntervals(
+        _ redaction: ReviewRedaction?, startedAt: Double, duration: Double
+    ) -> [TimelineInterval] {
+        guard duration > 0 else { return [] }
+        return (redaction?.blockedIntervals ?? []).map { iv in
+            let start = max(0, iv.start - startedAt)
+            let end = iv.end.map { max(start, $0 - startedAt) } ?? duration
+            return TimelineInterval(start: min(start, duration), end: min(end, duration))
+        }
     }
 }

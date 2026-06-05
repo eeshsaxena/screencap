@@ -115,4 +115,50 @@ final class TimelinePaneScrubTests: XCTestCase {
             XCTAssertEqual(backToX, x, accuracy: 0.001)
         }
     }
+
+    // MARK: - U8: redaction-evidence → timeline geometry (R8/R13)
+
+    private let startedAt: Double = 1_700_000_000.0
+
+    func testRedactionMarkersConvertToRelativeSorted() {
+        let r = ReviewRedaction(
+            summary: nil,
+            markers: [
+                ReviewMarker(t: startedAt + 10, category: "policy_excluded_app"),
+                ReviewMarker(t: startedAt + 2, category: "secure_field_detected"),
+            ],
+            blockedIntervals: nil, failClosed: nil
+        )
+        XCTAssertEqual(RedactionTimeline.relativeMarkers(r, startedAt: startedAt), [2, 10])
+    }
+
+    func testRedactionMarkersNilRedactionIsEmpty() {
+        XCTAssertEqual(RedactionTimeline.relativeMarkers(nil, startedAt: startedAt), [])
+    }
+
+    func testRiskyIntervalsConvertAndClampOpenEndedToDuration() {
+        let r = ReviewRedaction(
+            summary: nil, markers: nil,
+            blockedIntervals: [
+                ReviewBlockedInterval(start: startedAt + 5, end: startedAt + 15, action: "exclude", reason: "r"),
+                // Open-ended (Python serialized inf as null) → clamps to duration.
+                ReviewBlockedInterval(start: startedAt + 50, end: nil, action: "mask_window", reason: "r2"),
+            ],
+            failClosed: nil
+        )
+        let intervals = RedactionTimeline.riskyIntervals(r, startedAt: startedAt, duration: 60)
+        XCTAssertEqual(intervals, [
+            TimelineInterval(start: 5, end: 15),
+            TimelineInterval(start: 50, end: 60),
+        ])
+    }
+
+    func testRiskyIntervalsEmptyWhenDurationUnknown() {
+        let r = ReviewRedaction(
+            summary: nil, markers: nil,
+            blockedIntervals: [ReviewBlockedInterval(start: startedAt, end: startedAt + 5, action: "x", reason: "r")],
+            failClosed: nil
+        )
+        XCTAssertEqual(RedactionTimeline.riskyIntervals(r, startedAt: startedAt, duration: 0), [])
+    }
 }

@@ -370,6 +370,36 @@ final class ReviewWindowViewModelTests: XCTestCase {
         }
     }
 
+    /// Covers AE7 (U8): advisory risky-moment flags + redaction evidence never
+    /// gate Upload. A ready envelope carrying a secure-field interval, redaction
+    /// counts, and a fail-closed marker still uploads on intent.
+    func testUploadStaysEnabledRegardlessOfRedactionFlags() async {
+        let controller = UploadController(service: FakeUploadService())
+        let loader = FakeReviewDataLoader()
+        loader.nextEnvelope = .init(
+            ok: true, schemaVersion: 2,
+            videoPath: "/tmp/video.mp4", eventsPath: "/tmp/events.jsonl",
+            startedAt: 0, durationSeconds: 10, videoPixfmtRemediated: false, error: nil,
+            eventsPaths: nil, screenshots: nil,
+            redaction: ReviewRedaction(
+                summary: ["EMAIL_ADDRESS": 2],
+                markers: [ReviewMarker(t: 1, category: "secure_field_detected")],
+                blockedIntervals: [ReviewBlockedInterval(
+                    start: 1, end: 3, action: "exclude", reason: "secure_field_detected")],
+                failClosed: [ReviewFailClosed(t: 2, surface: "event")]
+            ),
+            coverage: nil
+        )
+        let model = makeModel(loader: loader, controller: controller)
+
+        await model.loadReviewData()
+        model.startUpload()
+
+        if case .uploading = model.state {} else {
+            XCTFail("advisory flags must not gate Upload, got \(model.state)")
+        }
+    }
+
     // MARK: - U5: enriched envelope decode + raised timeout
 
     /// Happy path: a full v2 envelope carries the enriched fields onto
