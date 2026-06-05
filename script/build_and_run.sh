@@ -150,6 +150,15 @@ generate_project_if_needed() {
     should_generate=1
   elif [[ "$PROJECT_YML" -nt "$PROJECT_FILE/project.pbxproj" ]]; then
     should_generate=1
+  elif [[ -n "$(find "$MACOS_DIR/ScreenCap" "$MACOS_DIR/ScreenCapTests" -type d -newer "$PROJECT_FILE/project.pbxproj" -print -quit 2>/dev/null)" ]]; then
+    # xcodegen globs sources at generation time, so adding/removing/renaming a
+    # source file changes the project's file list without touching project.yml.
+    # Those operations bump the containing directory's mtime (plain content
+    # edits do not), so a source dir newer than the generated project means the
+    # baked-in file list is stale. Without this, a newly added .swift file is
+    # silently left out of the build and every reference to it fails with
+    # "cannot find ... in scope" against the stale .pbxproj.
+    should_generate=1
   elif [[ -n "${DEVELOPMENT_TEAM:-}" ]]; then
     # `project.yml` reads DEVELOPMENT_TEAM at xcodegen time, not build time.
     should_generate=1
