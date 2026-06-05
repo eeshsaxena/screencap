@@ -69,8 +69,16 @@ SCRUB_PROVENANCE_VERSION = 1
 # checkpoint, chunk recovery) or any other change invalidates reuse. Media and
 # screenshots are excluded: they are large and the upload path never mutates
 # them (screenshot masking is driven by these DB/event inputs).
+#
+# ``recording.db-wal`` IS hashed: a committed-but-uncheckpointed change lives in
+# the WAL while ``recording.db`` bytes stay identical, so a db-only hash would
+# read such a source as "unchanged" and reuse a stale scrubbed copy. The volatile
+# ``-shm`` sidecar is deliberately NOT hashed — it is regenerated and churns on
+# read-only access, which would force spurious rebuilds without detecting any
+# real content change.
 _SOURCE_HASH_GLOBS = (
     "recording.db",
+    "recording.db-wal",
     "events*.jsonl",
     "transcript*.json",
     "transcript*.txt",

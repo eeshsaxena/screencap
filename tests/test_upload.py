@@ -1306,6 +1306,44 @@ def test_is_reusable_false_when_recovery_flag_absent(tmp_path):
     assert is_scrubbed_copy_reusable(rec, scrubbed) is False
 
 
+def test_is_reusable_false_on_wal_only_source_change(tmp_path):
+    """A committed-but-uncheckpointed change lives in recording.db-wal while
+    recording.db stays byte-identical; the reuse guard must still detect it,
+    else it ships a stale scrubbed copy built from the pre-WAL state."""
+    from screencap.scrubber import _write_scrub_sentinel, is_scrubbed_copy_reusable
+
+    rec = tmp_path / "rec"
+    rec.mkdir()
+    (rec / "recording.db").write_bytes(b"db-committed")
+    (rec / "recording.db-wal").write_bytes(b"wal-v1")
+    scrubbed = tmp_path / "rec-scrubbed"
+    scrubbed.mkdir()
+    _write_scrub_sentinel(scrubbed, rec, cloud_bound_recovery=True)
+    assert is_scrubbed_copy_reusable(rec, scrubbed) is True
+
+    # WAL changes, recording.db unchanged → reuse must be rejected (rebuild).
+    (rec / "recording.db-wal").write_bytes(b"wal-v2-longer")
+    assert is_scrubbed_copy_reusable(rec, scrubbed) is False
+
+
+def test_is_reusable_ignores_shm_churn(tmp_path):
+    """The volatile -shm sidecar (regenerated, churns on read) must NOT affect
+    reuse — hashing it would force spurious rebuilds with no real change."""
+    from screencap.scrubber import _write_scrub_sentinel, is_scrubbed_copy_reusable
+
+    rec = tmp_path / "rec"
+    rec.mkdir()
+    (rec / "recording.db").write_bytes(b"db")
+    (rec / "recording.db-shm").write_bytes(b"shm-v1")
+    scrubbed = tmp_path / "rec-scrubbed"
+    scrubbed.mkdir()
+    _write_scrub_sentinel(scrubbed, rec, cloud_bound_recovery=True)
+    assert is_scrubbed_copy_reusable(rec, scrubbed) is True
+
+    (rec / "recording.db-shm").write_bytes(b"shm-v2-changed-and-longer")
+    assert is_scrubbed_copy_reusable(rec, scrubbed) is True
+
+
 def test_upload_reuses_valid_sentineled_scrubbed_copy(tmp_path):
     """Covers AE1: after review-data prepares the scrubbed copy, upload ships
     that exact dir without re-scrubbing."""
