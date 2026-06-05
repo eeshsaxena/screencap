@@ -1,8 +1,9 @@
 ---
 title: "P1: review-data resolves scrubbed paths after the scrub lock is released (concurrent-rebuild race)"
-status: open
+status: resolved
 priority: high
 created: 2026-06-05
+resolved: 2026-06-05
 source: code-review (ce-code-review, finding adversarial #1 / F2)
 related_plans:
   - docs/plans/2026-06-03-002-feat-native-redaction-review-upload-plan.md
@@ -44,3 +45,16 @@ raises a spurious `ReviewPrepareError` or resolves a half-rebuilt file set.
 Behavior-changing (lock-scope widening) and needs a concurrency test harness;
 the same-EUID window is narrow. Out of the P0 fix scope (F1) already shipped in
 this PR.
+
+## Resolution
+
+`prepare_review_data` now wraps the ENTIRE prepare critical section —
+`_prepare_scrubbed_copy` (export → recovery → scrub) **and** the read-back
+(containment assert, `_resolve_scrubbed_event_files`, the `screenshots/` glob,
+and `_build_coverage`, which also globs the scrubbed dir) — in
+`recording_scrub_lock(name)`. `_prepare_scrubbed_copy` gained `_already_locked`
+and threads it to `scrub_recording`, so the inner scrub doesn't re-acquire the
+lock (same-process flock would deadlock). The in-memory redaction evidence and
+the captured path lists are assembled into the envelope after the lock releases.
+A concurrent re-scrub can no longer mutate `<name>-scrubbed` between the scrub
+and the path resolution.

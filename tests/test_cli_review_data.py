@@ -89,7 +89,7 @@ def _make_fake_scrub(root: Path):
     """
     import shutil as _sh
 
-    def _fake(name, pii_engine=None, *, cloud_bound_recovery=False):
+    def _fake(name, pii_engine=None, *, cloud_bound_recovery=False, _already_locked=False):
         from screencap.scrubber import _SKIP_EXTENSIONS, _SKIP_FILES, ScrubResult
 
         src = root / name
@@ -499,7 +499,7 @@ def test_recovery_runs_cloud_bound_before_scrub(recordings_root):
     def spy_recover(*_a, **k):
         calls.append(("recover", k.get("cloud_bound")))
 
-    def spy_scrub(name, pii_engine=None, *, cloud_bound_recovery=False):
+    def spy_scrub(name, pii_engine=None, *, cloud_bound_recovery=False, _already_locked=False):
         calls.append(("scrub", cloud_bound_recovery))
         return fake_scrub(name)
 
@@ -754,3 +754,30 @@ def test_ensure_canonical_events_gating(tmp_path):
         assert ensure_canonical_events(rec) == 3
         ex.assert_called_once()
         assert ex.call_args.kwargs["exclude_moves"] is False
+
+
+def test_redaction_markers_exclude_allow_screenshots():
+    """mask_screenshots emits an AuditEntry for EVERY frame it processes,
+    including clean ALLOW ones; the per-moment markers channel must exclude them
+    so the review timeline doesn't draw a 'redaction' tick on un-redacted frames
+    (todo 007). The summary tally is separate (entity_counts, text detections)
+    and is unaffected."""
+    from screencap.privacy.reasons import AuditEntry
+    from screencap.review import _build_redaction_evidence
+    from screencap.scrubber import ScrubResult
+
+    result = ScrubResult()
+    result.audit_entries = [
+        AuditEntry(timestamp=1.0, surface="screenshot", action="allow",
+                   reason="policy_allowed_app"),
+        AuditEntry(timestamp=2.0, surface="screenshot", action="exclude",
+                   reason="policy_excluded_app"),
+        AuditEntry(timestamp=3.0, surface="event", action="mask_window",
+                   reason="context_email_surface"),
+    ]
+
+    red = _build_redaction_evidence(result)
+
+    marker_times = [m["t"] for m in red["markers"]]
+    assert 1.0 not in marker_times, "clean ALLOW frame must not be a redaction marker"
+    assert marker_times == [2.0, 3.0], "only genuinely redacted/masked moments mark"

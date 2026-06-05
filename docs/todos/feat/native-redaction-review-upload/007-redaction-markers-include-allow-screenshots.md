@@ -1,8 +1,9 @@
 ---
 title: "P2: redaction timeline markers include clean/ALLOW screenshots (over-reports protection)"
-status: open
+status: resolved
 priority: medium
 created: 2026-06-05
+resolved: 2026-06-05
 source: code-review (ce-code-review, finding correctness #1 / F4)
 related_plans:
   - docs/plans/2026-06-03-002-feat-native-redaction-review-upload-plan.md
@@ -50,3 +51,14 @@ Existing tests don't catch it: their fixtures have no `screenshots/` dir, so
 
 Behavior-changing to the evidence payload (and wants a `real_scrub` fixture that
 exercises `mask_screenshots`); left for a deliberate fix rather than auto-applied.
+
+## Resolution
+
+`_build_redaction_evidence` (`src/screencap/review.py`) now filters the markers
+channel to `e.action != PrivacyAction.ALLOW.value`, so clean ALLOW frames no
+longer draw per-moment redaction ticks. Confirmed the `summary` tally is
+unaffected — it is built from `entity_counts` (text PII detections), which
+`mask_screenshots` does not touch via ALLOW frames. Tested directly against
+`_build_redaction_evidence` with mixed ALLOW / EXCLUDE / MASK_WINDOW audit
+entries (`test_redaction_markers_exclude_allow_screenshots`) rather than a
+`real_scrub` screenshot fixture — the unit test targets the filter precisely.

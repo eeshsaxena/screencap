@@ -113,13 +113,21 @@ def _build_redaction_evidence(scrub_result: ScrubResult) -> dict:
     """
     # Reuse the scrubber's serializer so the envelope's intervals match the
     # on-disk privacy_audit.json byte-for-byte (inf end → null).
+    from screencap.privacy.actions import PrivacyAction
     from screencap.scrubber import _blocked_interval_to_dict
 
+    # Per-moment markers fire only where something was actually redacted/masked.
+    # mask_screenshots emits an AuditEntry for EVERY frame it processes —
+    # including clean ALLOW frames — so mapping all entries would draw a
+    # "redaction" tick at essentially every screenshot, over-reporting the R8
+    # evidence. Exclude the non-redacting ALLOW action from the marker channel.
+    _ALLOW = PrivacyAction.ALLOW.value
     return {
         "summary": dict(scrub_result.entity_counts),
         "markers": [
             {"t": e.timestamp, "category": e.reason}
             for e in scrub_result.audit_entries
+            if e.action != _ALLOW
         ],
         "blocked_intervals": [
             _blocked_interval_to_dict(iv) for iv in scrub_result.blocked_intervals
@@ -236,34 +244,52 @@ def prepare_review_data(name: str) -> dict:
     # reviewed are the bytes uploaded. All status/progress is forced to stderr
     # (the scrubber prints to its own stdout-bound console); stdout stays the
     # JSON envelope only. The ScrubResult is the redaction-evidence source.
-    scrub_result = _prepare_scrubbed_copy(name, rec_dir)
-    scrubbed_dir = scrub_result.output_dir
+    from screencap.scrubber import recording_scrub_lock
 
-    # Defense-in-depth path containment before emitting any scrubbed path.
     recordings_root = get_recordings_dir()
-    _assert_within_recordings_root(scrubbed_dir, recordings_root)
 
-    # Resolve the event source to the scrubbed dir's ACTUAL file set (per-chunk
-    # when chunked — what ships). Faithfulness by construction: the review
-    # reads the same files the scrubbed dir contains, never a re-combined file.
-    event_files = _resolve_scrubbed_event_files(scrubbed_dir)
-    if not event_files:
-        # No event files survived (e.g. all were fail-closed deleted during
-        # scrub). Surface a clean, honest failure rather than an ok:true
-        # envelope with a null events_path — the latter would trip the Swift
-        # readiness guard into a generic "Failed to prepare recording." state.
-        raise ReviewPrepareError(
-            f"could not prepare review events: no reviewable events for {name}"
+    # Hold the per-recording scrub lock across the ENTIRE prepare critical
+    # section — export → recovery → scrub AND the scrubbed-dir read-back — so a
+    # concurrent re-scrub (a second review window, or `screencap upload`) can't
+    # mutate/delete the <name>-scrubbed dir between the scrub and the path
+    # resolution, yielding a torn read or a spurious failure (todo 005/006).
+    # _prepare_scrubbed_copy scrubs with _already_locked=True (we hold the lock;
+    # scrub_recording must not re-acquire it — a same-process flock would
+    # deadlock). The in-memory redaction evidence + the captured path lists are
+    # then assembled into the envelope after the lock is released.
+    with recording_scrub_lock(name):
+        scrub_result = _prepare_scrubbed_copy(name, rec_dir, _already_locked=True)
+        scrubbed_dir = scrub_result.output_dir
+
+        # Defense-in-depth path containment before emitting any scrubbed path.
+        _assert_within_recordings_root(scrubbed_dir, recordings_root)
+
+        # Resolve the event source to the scrubbed dir's ACTUAL file set
+        # (per-chunk when chunked — what ships). Faithfulness by construction:
+        # the review reads the same files the scrubbed dir contains.
+        event_files = _resolve_scrubbed_event_files(scrubbed_dir)
+        if not event_files:
+            # No event files survived (e.g. all were fail-closed deleted during
+            # scrub). Surface a clean, honest failure rather than an ok:true
+            # envelope with a null events_path — the latter would trip the Swift
+            # readiness guard into a generic "Failed to prepare recording."
+            raise ReviewPrepareError(
+                f"could not prepare review events: no reviewable events for {name}"
+            )
+        events_paths = [str(p.resolve()) for p in event_files]
+
+        # Scrubbed (masked) screenshots — the "what actually uploads" visual (R15).
+        scrubbed_shots_dir = scrubbed_dir / "screenshots"
+        screenshots = (
+            [str(p.resolve()) for p in sorted(scrubbed_shots_dir.glob("*.jpg"))]
+            if scrubbed_shots_dir.is_dir()
+            else []
         )
-    events_paths = [str(p.resolve()) for p in event_files]
 
-    # Scrubbed (masked) screenshots — the "what actually uploads" visual (R15).
-    scrubbed_shots_dir = scrubbed_dir / "screenshots"
-    screenshots = (
-        [str(p.resolve()) for p in sorted(scrubbed_shots_dir.glob("*.jpg"))]
-        if scrubbed_shots_dir.is_dir()
-        else []
-    )
+        # Evidence built while still holding the lock — _build_coverage globs the
+        # scrubbed dir for transcripts; _build_redaction_evidence is in-memory.
+        redaction = _build_redaction_evidence(scrub_result)
+        coverage = _build_coverage(scrubbed_dir, screenshots)
 
     # Timing metadata for the timeline pane's coordinate space, read from the
     # original DB (scrubbing nulls content, not timestamps). Nullable — see the
@@ -286,15 +312,17 @@ def prepare_review_data(name: str) -> dict:
         "screenshots": screenshots,
         # Additive, optional evidence (U3) — empty-representable so a recording
         # with no redactions still yields a valid ok:true envelope.
-        "redaction": _build_redaction_evidence(scrub_result),
-        "coverage": _build_coverage(scrubbed_dir, screenshots),
+        "redaction": redaction,
+        "coverage": coverage,
         "started_at": started_at,
         "duration_seconds": duration_seconds,
         "video_pixfmt_remediated": remediated,
     }
 
 
-def _prepare_scrubbed_copy(name: str, rec_dir: Path) -> "ScrubResult":
+def _prepare_scrubbed_copy(
+    name: str, rec_dir: Path, *, _already_locked: bool = False,
+) -> "ScrubResult":
     """Run canonical export → cloud-bound recovery → scrub, returning the
     ``ScrubResult`` (its ``output_dir`` is the scrubbed dir; the rest is the
     redaction-evidence source). A total scrub failure is a structural
@@ -304,6 +332,10 @@ def _prepare_scrubbed_copy(name: str, rec_dir: Path) -> "ScrubResult":
     The recovery → scrub ordering mirrors the upload loop's load-bearing
     sequence so the prepared dir is upload-equivalent (the scrub-layer pointer
     suppression only protects recovered cloud-bound JSONL when this holds).
+
+    ``_already_locked`` is threaded to ``scrub_recording`` — the caller
+    (``prepare_review_data``) holds ``recording_scrub_lock`` across this whole
+    call plus the read-back, so the scrub must not re-acquire it.
     """
     from screencap.scrubber import scrub_recording
 
@@ -338,7 +370,9 @@ def _prepare_scrubbed_copy(name: str, rec_dir: Path) -> "ScrubResult":
             # cloud_bound_recovery=True: recovery ran just above, so the
             # completion sentinel records it and `screencap upload` can reuse
             # this exact dir (reviewed == uploaded) instead of re-scrubbing.
-            scrub_result = scrub_recording(name, cloud_bound_recovery=True)
+            scrub_result = scrub_recording(
+                name, cloud_bound_recovery=True, _already_locked=_already_locked,
+            )
         except Exception as e:
             raise ReviewPrepareError(
                 f"could not prepare a safe version for review: {e}"
