@@ -97,6 +97,19 @@ if [ ! -x "${SOURCE_DIR}/screencap" ]; then
     exit 0
 fi
 
+# Refuse to embed a binary that doesn't actually launch. The executable-bit
+# check above passes even for a broken PyInstaller bundle (e.g. a bootloader/
+# loader version mix that dies with "Bootloader did not set sys._pyinstaller_pyz!"),
+# which would otherwise ship a .app whose every CLI call exits 1. `--version`
+# is offline and exits immediately, but still exercises the full PyInstaller
+# bootstrap that was broken.
+if ! "${SOURCE_DIR}/screencap" --version >/dev/null 2>&1; then
+    echo "error: ${SOURCE_DIR}/screencap does not launch — refusing to embed a broken bundle." >&2
+    echo "error: likely a PyInstaller bootloader/loader version mismatch; rebuild with a clean cache (rm -rf build dist)." >&2
+    "${SOURCE_DIR}/screencap" --version || true
+    exit 1
+fi
+
 mkdir -p "$(dirname "${DEST_DIR}")"
 rm -rf "${DEST_DIR}"
 ditto "${SOURCE_DIR}" "${DEST_DIR}"
