@@ -247,6 +247,16 @@ struct ReviewWindow: View {
                 }
                 .frame(maxWidth: .infinity, maxHeight: .infinity)
                 Divider()
+                // Moment-anchored captured content from the scrubbed copy (U7);
+                // selecting a row seeks the visual to that moment.
+                EventContentPane(
+                    events: timelineEvents,
+                    currentTime: currentTime
+                ) { seconds in
+                    videoModel.seek(toSeconds: seconds)
+                }
+                .frame(height: 132)
+                Divider()
                 TimelinePane(
                     events: timelineEvents,
                     durationSeconds: currentReviewDataDuration(),
