@@ -2839,6 +2839,64 @@ def _safety_delete_unscrubbable_files(src: Path, dst: Path) -> list[str]:
     return sorted(all_skipped)
 
 
+@contextlib.contextmanager
+def recording_scrub_lock(name: str):
+    """Per-recording advisory lock serializing scrub/reuse on one recording.
+
+    The review window is a ``WindowGroup`` (multiple concurrent windows by
+    design), and ``screencap upload`` can run alongside it. Without a lock, one
+    actor's ``scrub_recording`` (``rmtree`` → ``copytree`` → scrub → sentinel)
+    can rmtree the ``<name>-scrubbed`` dir while another's reuse-guard verdict +
+    ``upload_recording`` file enumeration is in flight — shipping a half-rebuilt
+    or unscrubbed copy. Holding this exclusive ``flock`` across the whole
+    rebuild, and across the upload's decide-then-ship critical section, makes
+    those mutually exclusive (the plan's "serialize on a scrub lock" option).
+
+    The lock file is a dotfile under the recordings root, so it is never
+    uploaded (dotfile filter) and is shared by all same-EUID actors on the
+    recording. Best-effort on platforms without ``fcntl`` (a ``nullcontext``).
+    """
+    try:
+        import fcntl
+    except ImportError:  # pragma: no cover - non-POSIX
+        yield
+        return
+
+    # Best-effort: if the lock file can't be created or locked (read-only or
+    # sandboxed recordings root, an FS without flock), degrade to unlocked
+    # rather than blocking the operation. This is strictly no worse than the
+    # pre-lock behavior; log loudly so the lost serialization is visible.
+    fd = None
+    try:
+        recordings = get_recordings_dir()
+        recordings.mkdir(parents=True, exist_ok=True)
+        lock_path = recordings / f".{name}.scrublock"
+        old_umask = os.umask(0o077)
+        try:
+            fd = os.open(str(lock_path), os.O_RDWR | os.O_CREAT, 0o600)
+        finally:
+            os.umask(old_umask)
+        fcntl.flock(fd, fcntl.LOCK_EX)
+    except OSError:
+        logger.warning(
+            "could not acquire scrub lock for %s; proceeding unlocked", name,
+            exc_info=True,
+        )
+        if fd is not None:
+            with contextlib.suppress(OSError):
+                os.close(fd)
+        yield
+        return
+
+    try:
+        yield
+    finally:
+        try:
+            fcntl.flock(fd, fcntl.LOCK_UN)
+        finally:
+            os.close(fd)
+
+
 def _compute_source_hash(src_dir: Path) -> str:
     """Content hash of the scrub-relevant source files (see ``_SOURCE_HASH_GLOBS``).
 
@@ -2935,6 +2993,7 @@ def scrub_recording(
     pii_engine: str | None = None,
     *,
     cloud_bound_recovery: bool = False,
+    _already_locked: bool = False,
 ) -> ScrubResult:
     """Copy a recording and scrub PII from the copy.
 
@@ -2952,6 +3011,11 @@ def scrub_recording(
             in-interval pointer geometry). ``screencap upload`` and the native
             review path pass ``True``; standalone ``screencap scrub`` leaves it
             ``False``.
+        _already_locked: Internal — set ``True`` only when the caller already
+            holds ``recording_scrub_lock(name)`` (the upload loop, which keeps
+            the lock across reuse-check → scrub → upload). Avoids a same-process
+            re-entrant ``flock`` deadlock. Other callers leave it ``False`` so
+            the rebuild self-serializes against concurrent scrubs.
 
     Returns:
         ScrubResult with entity counts and deleted files.
@@ -2981,53 +3045,60 @@ def scrub_recording(
         )
     anonymizer = Anonymizer()
 
-    dst = get_recordings_dir() / f"{name}-scrubbed"
-    if dst.exists():
-        console.print(
-            f"  [yellow]Warning: {dst.name}/ already exists — replacing[/]"
-        )
-        shutil.rmtree(dst)
+    # Serialize the whole rebuild (rmtree → copytree → scrub → sentinel) against
+    # any concurrent scrub/upload of the same recording. The pipeline load above
+    # is read-only and stays outside the lock. ``_already_locked`` skips
+    # re-acquiring when the upload loop already holds the lock (avoids a
+    # same-process re-entrant flock deadlock).
+    lock_cm = contextlib.nullcontext() if _already_locked else recording_scrub_lock(src.name)
+    with lock_cm:
+        dst = get_recordings_dir() / f"{name}-scrubbed"
+        if dst.exists():
+            console.print(
+                f"  [yellow]Warning: {dst.name}/ already exists — replacing[/]"
+            )
+            shutil.rmtree(dst)
 
-    with console.status(f"Copying {name} → {name}-scrubbed ..."):
-        shutil.copytree(src, dst, symlinks=False, ignore=_copytree_ignore)
+        with console.status(f"Copying {name} → {name}-scrubbed ..."):
+            shutil.copytree(src, dst, symlinks=False, ignore=_copytree_ignore)
 
-    # The scrubbed copy holds the same sensitivity class as the recording
-    # (and is the exact payload an operator is about to upload), so lock it
-    # to owner-only before writing any scrubbed bytes — and assert the mode
-    # held, since a wider dir would expose the about-to-be-prepared copy.
-    os.chmod(dst, 0o700)
-    dir_mode = stat.S_IMODE(dst.stat().st_mode)
-    if dir_mode != 0o700:
-        raise RuntimeError(
-            f"scrubbed dir {dst.name} has mode {oct(dir_mode)}, expected 0o700"
-        )
+        # The scrubbed copy holds the same sensitivity class as the recording
+        # (and is the exact payload an operator is about to upload), so lock it
+        # to owner-only before writing any scrubbed bytes — and assert the mode
+        # held, since a wider dir would expose the about-to-be-prepared copy.
+        os.chmod(dst, 0o700)
+        dir_mode = stat.S_IMODE(dst.stat().st_mode)
+        if dir_mode != 0o700:
+            raise RuntimeError(
+                f"scrubbed dir {dst.name} has mode {oct(dir_mode)}, expected 0o700"
+            )
 
-    pre_deleted = _safety_delete_unscrubbable_files(src, dst)
+        pre_deleted = _safety_delete_unscrubbable_files(src, dst)
 
-    with console.status("Loading privacy policy and context..."):
-        privacy_config = _resolve_privacy_config_for_dir(dst)
-        evaluator = DefaultPolicyEvaluator(privacy_config)
-        classifier = DefaultContextClassifier(
-            app_classes=privacy_config.app_classes,
-        )
+        with console.status("Loading privacy policy and context..."):
+            privacy_config = _resolve_privacy_config_for_dir(dst)
+            evaluator = DefaultPolicyEvaluator(privacy_config)
+            classifier = DefaultContextClassifier(
+                app_classes=privacy_config.app_classes,
+            )
 
-    result = Scrubber(
-        dst,
-        pipeline=pipeline,
-        anonymizer=anonymizer,
-        evaluator=evaluator,
-        classifier=classifier,
-    ).run()
+        result = Scrubber(
+            dst,
+            pipeline=pipeline,
+            anonymizer=anonymizer,
+            evaluator=evaluator,
+            classifier=classifier,
+        ).run()
 
-    # Merge file-deletion tracking from the copy stage with anything the
-    # scrubber added (DB table deletions, etc.) so the summary lists both.
-    result.deleted_files = sorted(set(result.deleted_files) | set(pre_deleted))
+        # Merge file-deletion tracking from the copy stage with anything the
+        # scrubber added (DB table deletions, etc.) so the summary lists both.
+        result.deleted_files = sorted(set(result.deleted_files) | set(pre_deleted))
 
-    _print_summary(result)
+        _print_summary(result)
 
-    # FINAL step (reached only on a fully-successful scrub — run() raises on a
-    # structural failure): mark the dir reusable. Mirrors the chunk-upload
-    # sentinel-gating posture — the last write, gated on all prior writes.
-    _write_scrub_sentinel(dst, src, cloud_bound_recovery=cloud_bound_recovery)
+        # FINAL step (reached only on a fully-successful scrub — run() raises on
+        # a structural failure): mark the dir reusable. Mirrors the chunk-upload
+        # sentinel-gating posture — the last write, gated on all prior writes.
+        _write_scrub_sentinel(dst, src, cloud_bound_recovery=cloud_bound_recovery)
 
     return result

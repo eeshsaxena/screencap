@@ -2911,6 +2911,18 @@ def upload(names, all_recordings, dry_run, force, jobs, no_delete):
                 except Exception:
                     pass
 
+        # Hold a per-recording scrub lock across BOTH the scrubbed-dir decision
+        # and the upload's file enumeration, so a concurrent re-scrub (a second
+        # review window, or --force in another process) can't rmtree the
+        # <name>-scrubbed dir between the reuse verdict and the upload read and
+        # ship a half-rebuilt copy. The lock is released by the context manager
+        # on continue/exception/sys.exit. Dry-run does no scrub → no lock.
+        from screencap.scrubber import recording_scrub_lock
+
+        _scrub_lock = (
+            recording_scrub_lock(d.name) if not dry_run else contextlib.nullcontext()
+        )
+        with _scrub_lock:
             # Always scrub before upload — but reuse the review-prepared
             # scrubbed copy when a completion sentinel + provenance prove it is
             # complete, current, and built the way upload would build it
@@ -2918,70 +2930,75 @@ def upload(names, all_recordings, dry_run, force, jobs, no_delete):
             # scrub on the review→upload path while never shipping a
             # partial/stale/mutated dir. --force always rebuilds; a scrub
             # failure still blocks upload (fail-closed preserved).
+            if not dry_run:
+                try:
+                    from screencap.scrubber import (
+                        is_scrubbed_copy_reusable,
+                        scrub_recording,
+                    )
+
+                    scrubbed_dir = d.parent / f"{d.name}-scrubbed"
+                    if not force and is_scrubbed_copy_reusable(d, scrubbed_dir):
+                        console.print(
+                            f"  Reusing reviewed scrubbed copy at "
+                            f"[dim]{scrubbed_dir.name}/[/dim] (reviewed == uploaded)."
+                        )
+                        d = scrubbed_dir
+                    else:
+                        # cloud_bound_recovery=True: _recover_chunk_metadata(
+                        # cloud_bound=True) ran above in this same iteration (the
+                        # load-bearing ordering), so the sentinel records it and a
+                        # later reuse is valid. _already_locked=True: we hold the
+                        # per-recording lock, so scrub_recording must not re-acquire
+                        # it (same-process flock would deadlock).
+                        with console.status(f"[bold]Scrubbing {d.name} for upload...[/bold]"):
+                            scrub_result = scrub_recording(
+                                d.name, cloud_bound_recovery=True, _already_locked=True,
+                            )
+                        entity_total = sum(scrub_result.entity_counts.values())
+                        console.print(
+                            f"  Scrubbed copy at [dim]{scrub_result.output_dir.name}/[/dim] "
+                            f"({entity_total} redaction(s) applied)."
+                        )
+                        d = scrub_result.output_dir
+                except Exception as e:
+                    console.print(
+                        f"[red]Error:[/red] Scrubbing failed: {e}\n"
+                        "Upload skipped — cannot upload without scrubbing."
+                    )
+                    all_failed += 1
+                    continue
+
             try:
-                from screencap.scrubber import (
-                    is_scrubbed_copy_reusable,
-                    scrub_recording,
-                )
+                result = upload_recording(d, dry_run=dry_run, force=force, jobs=jobs)
+                all_uploaded += len(result.uploaded)
+                all_skipped += len(result.skipped)
+                all_failed += len(result.failed)
+                all_bytes += result.total_bytes
 
-                scrubbed_dir = d.parent / f"{d.name}-scrubbed"
-                if not force and is_scrubbed_copy_reusable(d, scrubbed_dir):
-                    console.print(
-                        f"  Reusing reviewed scrubbed copy at "
-                        f"[dim]{scrubbed_dir.name}/[/dim] (reviewed == uploaded)."
-                    )
-                    d = scrubbed_dir
-                else:
-                    # cloud_bound_recovery=True: _recover_chunk_metadata(
-                    # cloud_bound=True) ran above in this same iteration (the
-                    # load-bearing ordering), so the sentinel records it and a
-                    # later reuse is valid.
-                    with console.status(f"[bold]Scrubbing {d.name} for upload...[/bold]"):
-                        scrub_result = scrub_recording(d.name, cloud_bound_recovery=True)
-                    entity_total = sum(scrub_result.entity_counts.values())
-                    console.print(
-                        f"  Scrubbed copy at [dim]{scrub_result.output_dir.name}/[/dim] "
-                        f"({entity_total} redaction(s) applied)."
-                    )
-                    d = scrub_result.output_dir
-            except Exception as e:
-                console.print(
-                    f"[red]Error:[/red] Scrubbing failed: {e}\n"
-                    "Upload skipped — cannot upload without scrubbing."
-                )
+                if not dry_run and not result.failed:
+                    parts = []
+                    if result.uploaded:
+                        parts.append(f"{len(result.uploaded)} new")
+                    if result.skipped:
+                        parts.append(f"{len(result.skipped)} skipped")
+                    summary = ", ".join(parts) if parts else "0 files"
+                    if result.gcs_prefix:
+                        console.print(
+                            f"\n[green]Uploaded {d.name}[/green] -> {result.gcs_prefix} ({summary})"
+                        )
+                    else:
+                        console.print(f"\n[green]Uploaded {d.name}[/green] ({summary})")
+                    # No public screencap.sh viewer URL: user recordings now live
+                    # under the private, account-scoped users/{uid}/ namespace, which
+                    # the public site cannot render. Web viewing of your own cloud
+                    # recordings is deferred; the macOS app/CLI is the interim surface.
+            except FileNotFoundError as e:
+                console.print(f"[red]Error:[/red] {e}")
                 all_failed += 1
-                continue
-
-        try:
-            result = upload_recording(d, dry_run=dry_run, force=force, jobs=jobs)
-            all_uploaded += len(result.uploaded)
-            all_skipped += len(result.skipped)
-            all_failed += len(result.failed)
-            all_bytes += result.total_bytes
-
-            if not dry_run and not result.failed:
-                parts = []
-                if result.uploaded:
-                    parts.append(f"{len(result.uploaded)} new")
-                if result.skipped:
-                    parts.append(f"{len(result.skipped)} skipped")
-                summary = ", ".join(parts) if parts else "0 files"
-                if result.gcs_prefix:
-                    console.print(
-                        f"\n[green]Uploaded {d.name}[/green] -> {result.gcs_prefix} ({summary})"
-                    )
-                else:
-                    console.print(f"\n[green]Uploaded {d.name}[/green] ({summary})")
-                # No public screencap.sh viewer URL: user recordings now live
-                # under the private, account-scoped users/{uid}/ namespace, which
-                # the public site cannot render. Web viewing of your own cloud
-                # recordings is deferred; the macOS app/CLI is the interim surface.
-        except FileNotFoundError as e:
-            console.print(f"[red]Error:[/red] {e}")
-            all_failed += 1
-        except RuntimeError as e:
-            console.print(f"[red]Error:[/red] {e}")
-            sys.exit(1)
+            except RuntimeError as e:
+                console.print(f"[red]Error:[/red] {e}")
+                sys.exit(1)
 
     if total_count > 1 and not dry_run:
         console.print(

@@ -26,6 +26,14 @@ def _signed_in_autouse(_signed_in):
     in this module. Not-signed-in / 401 tests override get_id_token themselves."""
 
 
+@pytest.fixture(autouse=True)
+def _isolate_scrub_lock(tmp_path, monkeypatch):
+    """Point the per-recording scrub lock (recording_scrub_lock →
+    scrubber.get_recordings_dir) at the test's tmp dir, so the upload command's
+    lock files land in tmp instead of the real ~/.screencap/recordings."""
+    monkeypatch.setattr("screencap.scrubber.get_recordings_dir", lambda: tmp_path)
+
+
 # ---------------------------------------------------------------------------
 # Unit tests: upload module helpers
 # ---------------------------------------------------------------------------
@@ -1375,6 +1383,23 @@ def test_upload_scrubs_when_no_scrubbed_copy(tmp_path):
     # records cloud_bound_recovery=False and is_scrubbed_copy_reusable refuses to
     # reuse it, defeating reviewed == uploaded.
     assert scrub_spy.call_args.kwargs.get("cloud_bound_recovery") is True
+    # _already_locked=True: the upload holds the per-recording scrub lock across
+    # reuse-check → scrub → upload, so scrub_recording must not re-acquire it
+    # (a same-process flock would deadlock).
+    assert scrub_spy.call_args.kwargs.get("_already_locked") is True
+
+
+def test_recording_scrub_lock_acquires_and_releases(tmp_path, monkeypatch):
+    """recording_scrub_lock is a working exclusive lock keyed per recording; the
+    dot-prefixed lock file lives under the recordings root (never uploaded)."""
+    from screencap.scrubber import recording_scrub_lock
+
+    monkeypatch.setattr("screencap.scrubber.get_recordings_dir", lambda: tmp_path)
+    with recording_scrub_lock("my-rec"):
+        assert (tmp_path / ".my-rec.scrublock").exists()
+    # Re-acquirable after release (no leaked fd / held lock).
+    with recording_scrub_lock("my-rec"):
+        pass
 
 
 def test_upload_force_rebuilds_even_with_valid_sentinel(tmp_path):
