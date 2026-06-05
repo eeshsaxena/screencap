@@ -26,13 +26,23 @@ enum ScreenshotTruth {
     /// Parse the envelope's screenshot paths into timestamped frames, sorted by
     /// time. A filename whose stem isn't a number is skipped (drift-resilient).
     static func screenshots(from urls: [URL], startedAt: Double) -> [ReviewScreenshot] {
-        urls.compactMap { url -> ReviewScreenshot? in
+        let stamped = urls.compactMap { url -> (URL, Double)? in
             guard let ts = Double(url.deletingPathExtension().lastPathComponent) else {
                 return nil
             }
-            return ReviewScreenshot(url: url, relativeSeconds: max(0, ts - startedAt))
+            return (url, ts)
         }
-        .sorted { $0.relativeSeconds < $1.relativeSeconds }
+        guard !stamped.isEmpty else { return [] }
+        // When started_at is unknown (review.py emits null → the ViewModel falls
+        // back to 0), anchor frames to the earliest captured frame so they still
+        // land on the 0-based playback axis. Without this, every frame's
+        // relativeSeconds would be its raw epoch (~1.7e9), so `selection(at:)`
+        // returns .beforeFirst for the whole timeline and the "what uploads"
+        // surface wrongly reads as empty.
+        let origin = startedAt > 0 ? startedAt : (stamped.map(\.1).min() ?? 0)
+        return stamped
+            .map { ReviewScreenshot(url: $0.0, relativeSeconds: max(0, $0.1 - origin)) }
+            .sorted { $0.relativeSeconds < $1.relativeSeconds }
     }
 
     /// Map a recording-relative time to the nearest-prior masked frame. Sparse
@@ -97,11 +107,18 @@ struct ScreenshotTruthPane: View {
             frameArea
                 .frame(maxWidth: .infinity, maxHeight: .infinity)
         }
-        // Runs once per distinct frame URL (not per render), so the JPEG is
-        // decoded only when playback crosses a screenshot boundary.
+        // Runs once per distinct frame URL (not per render), so the frame is
+        // loaded only when playback crosses a screenshot boundary. The disk read
+        // runs off the main actor via Task.detached (Data is Sendable); NSImage
+        // builds on return and decodes lazily at draw time.
         .task(id: currentFrameURL) {
             guard let url = currentFrameURL, loaded?.url != url else { return }
-            loaded = LoadedFrame(url: url, image: NSImage(contentsOf: url))
+            let data = await Task.detached(priority: .userInitiated) {
+                try? Data(contentsOf: url)
+            }.value
+            if !Task.isCancelled {
+                loaded = LoadedFrame(url: url, image: data.flatMap { NSImage(data: $0) })
+            }
         }
     }
 

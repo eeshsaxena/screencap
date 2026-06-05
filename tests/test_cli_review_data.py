@@ -683,7 +683,32 @@ def test_redaction_summary_populated_for_pii_recording(recordings_root):
     red = envelope["redaction"]
     assert red["summary"], "PII must surface as an entity → count summary"
     assert sum(red["summary"].values()) >= 1
+    # The email entity is what we planted; assert it surfaced (not just a tally).
+    assert any("EMAIL" in entity for entity in red["summary"]), red["summary"]
     assert isinstance(red["markers"], list)
     assert isinstance(red["blocked_intervals"], list)
     assert isinstance(red["fail_closed"], list)
+    # Markers, when present, carry export-safe shape (timestamp + category only).
+    assert all(set(m) == {"t", "category"} for m in red["markers"]), red["markers"]
     assert "screenshots" in envelope
+
+
+def test_event_set_outside_recordings_root_is_rejected(recordings_root):
+    """Defense-in-depth: a scrubbed dir that resolves outside the recordings
+    root (e.g. via a symlink escape after name validation) is refused before any
+    path is emitted."""
+    rec_dir = _make_recording(recordings_root, "rec-escape")
+    _write_video(rec_dir / "video.mp4", (0, 0, 200), pix_fmt="yuv420p")
+    (rec_dir / "events.jsonl").write_text(json.dumps({"_meta": True}) + "\n")
+
+    from screencap.scrubber import ScrubResult
+
+    escaped = recordings_root.parent / "rec-escape-scrubbed"  # outside the root
+    escaped.mkdir()
+
+    with mock.patch(
+        "screencap.scrubber.scrub_recording",
+        return_value=ScrubResult(output_dir=escaped),
+    ):
+        with pytest.raises(ReviewPrepareError, match="outside the recordings root"):
+            prepare_review_data("rec-escape")

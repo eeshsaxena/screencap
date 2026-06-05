@@ -65,6 +65,21 @@ final class ScreenshotTruthPaneTests: XCTestCase {
         XCTAssertEqual(ScreenshotTruth.selection(at: 5, screenshots: []), .empty)
     }
 
+    /// When started_at is unknown (review.py null → ViewModel falls back to 0),
+    /// frames anchor to the earliest captured frame so they map onto the 0-based
+    /// playback axis instead of all reading as .beforeFirst (which would make the
+    /// "what uploads" surface wrongly appear empty).
+    func testUnknownStartedAtAnchorsToEarliestFrame() {
+        let shots = ScreenshotTruth.screenshots(
+            from: [url(startedAt + 12), url(startedAt + 4)], startedAt: 0)
+        XCTAssertEqual(shots.map(\.relativeSeconds), [0, 8], "anchored to the earliest frame")
+
+        // Selecting at the later frame's time finds it — not .beforeFirst.
+        if case .frame = ScreenshotTruth.selection(at: 8, screenshots: shots) {} else {
+            XCTFail("expected a frame at t=8, not a boundary state")
+        }
+    }
+
     func testClockLabelFormatsMinutesSeconds() {
         XCTAssertEqual(ScreenshotTruth.clockLabel(0), "0:00")
         XCTAssertEqual(ScreenshotTruth.clockLabel(14), "0:14")

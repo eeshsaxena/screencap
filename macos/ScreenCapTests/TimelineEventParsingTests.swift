@@ -116,6 +116,34 @@ final class TimelineEventParsingTests: XCTestCase {
         XCTAssertEqual(events, [])
     }
 
+    /// Chunked recordings ship a per-chunk events_*.jsonl set; the timeline must
+    /// merge ALL of them (not just chunk 0) so the reviewed events == uploaded.
+    func testParseUrlsMergesAndSortsAcrossFiles() throws {
+        let dir = FileManager.default.temporaryDirectory
+            .appendingPathComponent(UUID().uuidString)
+        try FileManager.default.createDirectory(at: dir, withIntermediateDirectories: true)
+        defer { try? FileManager.default.removeItem(at: dir) }
+
+        let f0 = dir.appendingPathComponent("events_0000.jsonl")
+        let f1 = dir.appendingPathComponent("events_0001.jsonl")
+        try ("{\"_meta\": true}\n"
+            + "{\"type\": \"key.type\", \"timestamp\": 1700000005.0, \"text\": \"b\"}\n")
+            .write(to: f0, atomically: true, encoding: .utf8)
+        try ("{\"_meta\": true}\n"
+            + "{\"type\": \"mouse.click\", \"timestamp\": 1700000002.0}\n")
+            .write(to: f1, atomically: true, encoding: .utf8)
+
+        let events = TimelineEventParser.parse(urls: [f0, f1], recordingStartedAt: startedAt)
+
+        XCTAssertEqual(events.map(\.relativeSeconds), [2.0, 5.0], "merged + sorted across files")
+        XCTAssertEqual(events.map(\.type), ["mouse.click", "key.type"])
+    }
+
+    func testParseUrlsSkipsUnreadableFilesWithoutFailing() {
+        let missing = URL(fileURLWithPath: "/tmp/screencap-nope-\(UUID().uuidString).jsonl")
+        XCTAssertEqual(TimelineEventParser.parse(urls: [missing], recordingStartedAt: startedAt), [])
+    }
+
     // MARK: - U7: moment-anchored content parsing (R5/R7/R14)
 
     func testKeyTypeSurfacesScrubbedText() {

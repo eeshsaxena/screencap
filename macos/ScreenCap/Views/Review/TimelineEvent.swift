@@ -106,6 +106,18 @@ enum TimelineEventParser {
         return parse(jsonl: text, recordingStartedAt: recordingStartedAt)
     }
 
+    /// Parse and merge the full scrubbed event file set — the per-chunk
+    /// `events_*.jsonl` set for a chunked recording, which is what upload ships.
+    /// Parsing only the first file (events_paths[0]) would show only chunk 0's
+    /// events while every chunk uploads, breaking reviewed == uploaded for the
+    /// events surface. Read failures on individual files are skipped; the merged
+    /// result is sorted once on the shared relative axis.
+    static func parse(urls: [URL], recordingStartedAt: Double) -> [TimelineEvent] {
+        urls
+            .flatMap { parse(url: $0, recordingStartedAt: recordingStartedAt) }
+            .sorted { $0.relativeSeconds < $1.relativeSeconds }
+    }
+
     /// String-input variant — exposed for tests and any future call site
     /// that already has the JSONL in memory.
     static func parse(jsonl: String, recordingStartedAt: Double) -> [TimelineEvent] {

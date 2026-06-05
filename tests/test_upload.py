@@ -1371,6 +1371,10 @@ def test_upload_scrubs_when_no_scrubbed_copy(tmp_path):
 
     assert result.exit_code == 0, result.output
     scrub_spy.assert_called_once()
+    # cloud_bound_recovery=True is load-bearing: without it the written sentinel
+    # records cloud_bound_recovery=False and is_scrubbed_copy_reusable refuses to
+    # reuse it, defeating reviewed == uploaded.
+    assert scrub_spy.call_args.kwargs.get("cloud_bound_recovery") is True
 
 
 def test_upload_force_rebuilds_even_with_valid_sentinel(tmp_path):

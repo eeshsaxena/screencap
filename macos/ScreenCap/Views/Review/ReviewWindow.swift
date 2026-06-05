@@ -97,8 +97,11 @@ struct ReviewWindow: View {
                 if !timelineLoaded {
                     timelineLoaded = true
                     Task.detached(priority: .userInitiated) {
+                        // Parse the FULL scrubbed event set (all per-chunk files),
+                        // not just events_paths[0], so the timeline + content view
+                        // reflect every event that uploads (reviewed == uploaded).
                         let parsed = TimelineEventParser.parse(
-                            url: data.eventsURL,
+                            urls: data.eventsURLs,
                             recordingStartedAt: data.startedAt
                         )
                         await MainActor.run { timelineEvents = parsed }

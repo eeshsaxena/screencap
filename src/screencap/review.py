@@ -40,8 +40,12 @@ from __future__ import annotations
 import contextlib
 import sys
 from pathlib import Path
+from typing import TYPE_CHECKING
 
 from rich.console import Console
+
+if TYPE_CHECKING:
+    from screencap.scrubber import ScrubResult
 
 # Progress/status goes to STDERR; stdout is reserved for the JSON envelope the
 # SwiftUI shell parses. The scrubber's own module console resolves ``sys.stdout``
@@ -108,7 +112,7 @@ def _resolve_scrubbed_event_files(scrubbed_dir: Path) -> list[Path]:
     return [combined] if combined.exists() else []
 
 
-def _build_redaction_evidence(scrub_result) -> dict:
+def _build_redaction_evidence(scrub_result: ScrubResult) -> dict:
     """Build the export-safe redaction-evidence payload from a ``ScrubResult``.
 
     Two levels of evidence (R8) plus risky-moment + fail-closed data (R13/R14),
@@ -151,9 +155,9 @@ def _build_coverage(scrubbed_dir: Path, screenshots: list[str]) -> dict:
     (allowed-app on-screen PII in screenshots is not auto-redacted) over the
     benign ones (video/audio never upload; transcript uploads scrubbed).
     """
-    has_transcript = bool(
-        list(scrubbed_dir.glob("transcript*.json"))
-        or list(scrubbed_dir.glob("transcript*.txt"))
+    has_transcript = (
+        any(scrubbed_dir.glob("transcript*.json"))
+        or any(scrubbed_dir.glob("transcript*.txt"))
     )
     return {
         "video_local_only": True,
@@ -259,6 +263,14 @@ def prepare_review_data(name: str) -> dict:
     # when chunked — what ships). Faithfulness by construction: the review
     # reads the same files the scrubbed dir contains, never a re-combined file.
     event_files = _resolve_scrubbed_event_files(scrubbed_dir)
+    if not event_files:
+        # No event files survived (e.g. all were fail-closed deleted during
+        # scrub). Surface a clean, honest failure rather than an ok:true
+        # envelope with a null events_path — the latter would trip the Swift
+        # readiness guard into a generic "Failed to prepare recording." state.
+        raise ReviewPrepareError(
+            f"could not prepare review events: no reviewable events for {name}"
+        )
     events_paths = [str(p.resolve()) for p in event_files]
 
     # Scrubbed (masked) screenshots — the "what actually uploads" visual (R15).
@@ -309,13 +321,17 @@ def _prepare_scrubbed_copy(name: str, rec_dir: Path):
     sequence so the prepared dir is upload-equivalent (the scrub-layer pointer
     suppression only protects recovered cloud-bound JSONL when this holds).
     """
-    from screencap.exporter import ExportError
     from screencap.scrubber import scrub_recording
 
     # Canonical pre-scrub export into the source dir (config-matched to upload).
+    # Catch broadly: export_recording can raise sqlite3.Error / ValueError from
+    # a corrupt recording.db in addition to ExportError / OSError. Any of these
+    # must become a clean ReviewPrepareError — an uncaught traceback on stdout
+    # would corrupt the JSON channel the SwiftUI shell parses. (Mirrors the
+    # broad catch on the recovery + scrub sub-steps below.)
     try:
         _export_canonical_events(rec_dir)
-    except (ExportError, OSError) as e:
+    except Exception as e:
         raise ReviewPrepareError(f"could not prepare review events: {e}") from e
 
     # All sub-steps print progress; force stdout → stderr so the envelope on
