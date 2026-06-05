@@ -27,6 +27,7 @@ struct ReviewWindow: View {
 
     @State private var videoModel: VideoPlayerPaneModel?
     @State private var timelineEvents: [TimelineEvent] = []
+    @State private var screenshots: [ReviewScreenshot] = []
     @State private var currentTime: Double = 0
     @State private var timelineLoaded = false
     /// Drives the "Sign in to upload" sheet (plan U6). Shown when Upload is
@@ -72,6 +73,12 @@ struct ReviewWindow: View {
             if case .ready(let data) = newState, videoModel == nil {
                 let engine = LiveVideoPlaybackEngine(url: data.videoURL)
                 videoModel = VideoPlayerPaneModel(engine: engine)
+                // The masked screenshots that actually upload — the primary
+                // truth view (U6). Parsed once on first ready.
+                screenshots = ScreenshotTruth.screenshots(
+                    from: data.screenshotURLs,
+                    startedAt: data.startedAt
+                )
                 if !timelineLoaded {
                     timelineLoaded = true
                     Task.detached(priority: .userInitiated) {
@@ -224,11 +231,21 @@ struct ReviewWindow: View {
     private var panesIfAvailable: some View {
         if let videoModel {
             VStack(spacing: 0) {
-                VideoPlayerPane(model: videoModel)
+                // The masked-screenshot truth view is the PRIMARY surface — it
+                // shows what actually uploads (R15). The local video beside it
+                // is a secondary navigation aid that never uploads, labeled as
+                // such so the operator can't mistake it for the payload.
+                HStack(spacing: 0) {
+                    ScreenshotTruthPane(
+                        screenshots: screenshots,
+                        currentTime: currentTime
+                    )
                     .frame(maxWidth: .infinity, maxHeight: .infinity)
-                    .onReceive(videoModel.$currentTime) { t in
-                        currentTime = t
-                    }
+                    Divider()
+                    localVideoPane(videoModel)
+                        .frame(width: 280)
+                }
+                .frame(maxWidth: .infinity, maxHeight: .infinity)
                 Divider()
                 TimelinePane(
                     events: timelineEvents,
@@ -241,6 +258,30 @@ struct ReviewWindow: View {
             }
         } else {
             preparingState
+        }
+    }
+
+    /// The local navigation video with a persistent "not uploaded" label, so
+    /// the operator never mistakes it for the payload (R15).
+    private func localVideoPane(_ videoModel: VideoPlayerPaneModel) -> some View {
+        VStack(spacing: 0) {
+            HStack(spacing: 6) {
+                Image(systemName: "play.rectangle")
+                    .foregroundStyle(.secondary)
+                Text("Local preview — not uploaded")
+                    .font(.caption.weight(.semibold))
+                    .foregroundStyle(.secondary)
+                Spacer()
+            }
+            .padding(.horizontal, 10)
+            .padding(.vertical, 6)
+            .background(Color.secondary.opacity(0.08))
+            Divider()
+            VideoPlayerPane(model: videoModel)
+                .frame(maxWidth: .infinity, maxHeight: .infinity)
+                .onReceive(videoModel.$currentTime) { t in
+                    currentTime = t
+                }
         }
     }
 

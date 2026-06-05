@@ -348,6 +348,28 @@ final class ReviewWindowViewModelTests: XCTestCase {
         XCTAssertNil(effects.pendingAutoClose, "auto-close handle should have been cancelled")
     }
 
+    /// Covers AE5 (U6): Cancel on the ready review screen uploads nothing and
+    /// is inert — no upload is started, no process is terminated, and the state
+    /// stays ready (the original on-disk recording is never touched because no
+    /// upload subprocess ran).
+    func testCancelFromReadyUploadsNothing() async {
+        let service = FakeUploadService()
+        let controller = UploadController(service: service)
+        let model = makeModel(controller: controller)
+
+        await model.loadReviewData()
+        guard case .ready = model.state else {
+            return XCTFail("expected ready, got \(model.state)")
+        }
+
+        model.cancel()
+
+        XCTAssertEqual(service.fakeProcess.terminateInvocations, 0, "no upload to terminate")
+        if case .ready = model.state {} else {
+            XCTFail("Cancel before upload must be inert, got \(model.state)")
+        }
+    }
+
     // MARK: - U5: enriched envelope decode + raised timeout
 
     /// Happy path: a full v2 envelope carries the enriched fields onto
