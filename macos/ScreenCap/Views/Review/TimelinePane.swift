@@ -101,13 +101,12 @@ struct TimelinePane: View {
     private func drawRedactionMarkers(context: GraphicsContext, size: CGSize) {
         guard durationSeconds > 0, !redactionMarkers.isEmpty else { return }
         var path = Path()
-        let topInset: CGFloat = 0
         let tickHeight: CGFloat = max(6, size.height / 4)
         for t in redactionMarkers {
             let x = TimelinePaneScrub.cursorX(
                 forSeconds: t, width: size.width, durationSeconds: durationSeconds)
-            path.move(to: CGPoint(x: x, y: topInset))
-            path.addLine(to: CGPoint(x: x, y: topInset + tickHeight))
+            path.move(to: CGPoint(x: x, y: 0))
+            path.addLine(to: CGPoint(x: x, y: tickHeight))
         }
         context.stroke(path, with: .color(.pink), lineWidth: 2)
     }

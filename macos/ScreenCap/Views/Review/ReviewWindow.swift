@@ -28,6 +28,11 @@ struct ReviewWindow: View {
     @State private var videoModel: VideoPlayerPaneModel?
     @State private var timelineEvents: [TimelineEvent] = []
     @State private var screenshots: [ReviewScreenshot] = []
+    // Derived once on `.ready` — these depend only on the (fixed) redaction
+    // evidence, not on currentTime, so recomputing them on every 10Hz playback
+    // tick would re-sort identical data.
+    @State private var redactionMarkers: [Double] = []
+    @State private var riskyIntervals: [TimelineInterval] = []
     @State private var currentTime: Double = 0
     @State private var timelineLoaded = false
     /// Drives the "Sign in to upload" sheet (plan U6). Shown when Upload is
@@ -78,6 +83,16 @@ struct ReviewWindow: View {
                 screenshots = ScreenshotTruth.screenshots(
                     from: data.screenshotURLs,
                     startedAt: data.startedAt
+                )
+                // Redaction markers + risky-moment bands depend only on the
+                // fixed redaction evidence, so derive them once here rather
+                // than on every playback tick.
+                redactionMarkers = RedactionTimeline.relativeMarkers(
+                    data.redaction, startedAt: data.startedAt
+                )
+                riskyIntervals = RedactionTimeline.riskyIntervals(
+                    data.redaction, startedAt: data.startedAt,
+                    duration: data.durationSeconds
                 )
                 if !timelineLoaded {
                     timelineLoaded = true
@@ -277,13 +292,8 @@ struct ReviewWindow: View {
                     events: timelineEvents,
                     durationSeconds: data.durationSeconds,
                     currentTime: currentTime,
-                    riskyIntervals: RedactionTimeline.riskyIntervals(
-                        data.redaction, startedAt: data.startedAt,
-                        duration: data.durationSeconds
-                    ),
-                    redactionMarkers: RedactionTimeline.relativeMarkers(
-                        data.redaction, startedAt: data.startedAt
-                    )
+                    riskyIntervals: riskyIntervals,
+                    redactionMarkers: redactionMarkers
                 ) { seconds in
                     videoModel.seek(toSeconds: seconds)
                 }

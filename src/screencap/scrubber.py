@@ -2379,7 +2379,7 @@ def _scrub_text(
 ):
     """Scrubber-local wrapper that adds Rich console warnings on failure."""
     scrubbed, det_result = scrub_text(text, pipeline, anonymizer, result=result)
-    if scrubbed == "<SCRUB_FAILED>":
+    if scrubbed == SCRUB_FAILED_SENTINEL:
         console.print("  [yellow]Warning: all detectors failed on a field[/]")
     return scrubbed, det_result
 

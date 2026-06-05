@@ -69,8 +69,25 @@ struct ScreenshotTruthPane: View {
     let screenshots: [ReviewScreenshot]
     let currentTime: Double
 
+    /// Decoded-frame cache. The selected frame changes only when playback
+    /// crosses a screenshot boundary (capture is sparse), so loading it lazily
+    /// via `.task(id:)` avoids re-reading + re-decoding the JPEG from disk on
+    /// every ~10Hz playback tick — and moves the decode off the main thread.
+    /// `image == nil` records a load that was attempted and failed.
+    @State private var loaded: LoadedFrame?
+
+    private struct LoadedFrame {
+        let url: URL
+        let image: NSImage?
+    }
+
     private var selection: ScreenshotSelection {
         ScreenshotTruth.selection(at: currentTime, screenshots: screenshots)
+    }
+
+    private var currentFrameURL: URL? {
+        if case .frame(let url, _) = selection { return url }
+        return nil
     }
 
     var body: some View {
@@ -79,6 +96,12 @@ struct ScreenshotTruthPane: View {
             Divider()
             frameArea
                 .frame(maxWidth: .infinity, maxHeight: .infinity)
+        }
+        // Runs once per distinct frame URL (not per render), so the JPEG is
+        // decoded only when playback crosses a screenshot boundary.
+        .task(id: currentFrameURL) {
+            guard let url = currentFrameURL, loaded?.url != url else { return }
+            loaded = LoadedFrame(url: url, image: NSImage(contentsOf: url))
         }
     }
 
@@ -118,20 +141,27 @@ struct ScreenshotTruthPane: View {
     @ViewBuilder
     private func maskedFrame(url: URL, offsetSeconds: Double) -> some View {
         VStack(spacing: 0) {
-            if let image = NSImage(contentsOf: url) {
-                Image(nsImage: image)
-                    .resizable()
-                    .scaledToFit()
-                    .frame(maxWidth: .infinity, maxHeight: .infinity)
-                    .background(Color.black)
+            if loaded?.url == url {
+                if let image = loaded?.image {
+                    Image(nsImage: image)
+                        .resizable()
+                        .scaledToFit()
+                        .frame(maxWidth: .infinity, maxHeight: .infinity)
+                        .background(Color.black)
+                } else {
+                    // The frame is in the uploaded set but unreadable on disk —
+                    // be honest rather than silently showing nothing.
+                    placeholder(
+                        icon: "exclamationmark.triangle",
+                        title: "Couldn't load this frame",
+                        detail: url.lastPathComponent
+                    )
+                }
             } else {
-                // The frame is in the uploaded set but unreadable on disk — be
-                // honest rather than silently showing nothing.
-                placeholder(
-                    icon: "exclamationmark.triangle",
-                    title: "Couldn't load this frame",
-                    detail: url.lastPathComponent
-                )
+                // Selected but not yet decoded (the `.task` is loading it).
+                Color.black
+                    .frame(maxWidth: .infinity, maxHeight: .infinity)
+                    .overlay(ProgressView().controlSize(.small))
             }
             staleness(offsetSeconds: offsetSeconds, at: url)
         }

@@ -33,17 +33,15 @@ struct TimelineEventContent: Equatable, Hashable {
     var networkHost: RedactableField = .absent
     var networkURL: RedactableField = .absent
 
-    /// No content field is present at all (a pure mouse/screen event).
-    var isEmpty: Bool {
+    private var allFields: [RedactableField] {
         [typedText, appName, windowTitle, domain, transcription, networkHost, networkURL]
-            .allSatisfy { $0 == .absent }
     }
 
+    /// No content field is present at all (a pure mouse/screen event).
+    var isEmpty: Bool { allFields.allSatisfy { $0 == .absent } }
+
     /// Any field tripped the fail-closed sentinel.
-    var hasFailClosed: Bool {
-        [typedText, appName, windowTitle, domain, transcription, networkHost, networkURL]
-            .contains(.failClosed)
-    }
+    var hasFailClosed: Bool { allFields.contains(.failClosed) }
 }
 
 /// One marker on the action timeline (plan U6). Timestamps are stored as
@@ -86,6 +84,12 @@ struct TimelineEvent: Equatable, Hashable {
 /// unknown event types fall into the `.other` bucket. Parsing happens on a
 /// background task at call sites that care about main-thread responsiveness.
 enum TimelineEventParser {
+    /// The fail-closed sentinel the Python scrubber writes into a field whose
+    /// content it couldn't analyze (`scrubber.SCRUB_FAILED_SENTINEL`). This is a
+    /// cross-language serialization contract — keep it in sync with the Python
+    /// constant.
+    static let scrubFailedSentinel = "<SCRUB_FAILED>"
+
     /// Reads `url` line-by-line and returns parsed events sorted by their
     /// recording-relative timestamp. `recordingStartedAt` is the absolute
     /// epoch seconds reported by `review-data` and is subtracted from each
@@ -178,7 +182,7 @@ enum TimelineEventParser {
         guard let raw = obj[key] else { return .absent }
         if raw is NSNull { return .redacted }
         guard let s = raw as? String else { return .absent }
-        if s == "<SCRUB_FAILED>" { return .failClosed }
+        if s == scrubFailedSentinel { return .failClosed }
         return .value(s)
     }
 }
