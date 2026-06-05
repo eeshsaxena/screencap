@@ -128,6 +128,69 @@ resolve_dev_python() {
   fi
 }
 
+codesign_team_ids() {
+  # Print the Apple Developer Team ID of every signing certificate in the
+  # keychain, one per line. The Team ID is the certificate's Organizational
+  # Unit (OU) — NOT the parenthetical in the cert's common name, which is a
+  # per-certificate identifier. CA/intermediate certs share this keychain, so
+  # we keep only OUs shaped like a Team ID (10 uppercase alphanumerics) to
+  # drop that noise.
+  security find-certificate -a -p 2>/dev/null | awk '
+    /-----BEGIN CERTIFICATE-----/ { block=""; inblock=1 }
+    inblock { block = block $0 ORS }
+    /-----END CERTIFICATE-----/ {
+      inblock=0
+      cmd="openssl x509 -noout -subject -nameopt sep_multiline 2>/dev/null"
+      printf "%s", block | cmd
+      close(cmd)
+    }
+  ' | sed -n 's/^[[:space:]]*OU=//p' | grep -E '^[A-Z0-9]{10}$' | sort -u
+}
+
+verify_development_team() {
+  # Catch the most common signing-setup mistake before xcodebuild does: putting
+  # the certificate-name parenthetical (a per-cert identifier) into
+  # DEVELOPMENT_TEAM instead of the cert's OU (the real Team ID). Without this,
+  # the build fails late with a cryptic `No "Mac Development" signing
+  # certificate matching team ID ...` error that names the wrong value and
+  # gives no hint why. See macos/README.md "One-time setup".
+  local team="${DEVELOPMENT_TEAM:-}"
+  if [[ -z "$team" ]]; then
+    return  # empty team falls back to ad-hoc; warn_if_ad_hoc_signing covers it
+  fi
+
+  # `|| true`: under `set -euo pipefail`, codesign_team_ids' trailing
+  # `grep | sort` pipeline returns non-zero when no Team-ID-shaped OU is found
+  # (e.g. a developer with no Apple Development cert). Without this guard that
+  # non-zero status would abort the whole script here instead of reaching the
+  # empty-list safety return just below.
+  local installed_teams
+  installed_teams="$(codesign_team_ids)" || true
+
+  # No installed signing certs to compare against (e.g. CI with only ad-hoc
+  # signing, or no keychain access): stay silent and let the build proceed
+  # rather than risk a false block.
+  if [[ -z "$installed_teams" ]]; then
+    return
+  fi
+
+  if grep -qx "$team" <<<"$installed_teams"; then
+    return
+  fi
+
+  echo "error: DEVELOPMENT_TEAM=$team matches no installed signing certificate." >&2
+  if security find-identity -v -p codesigning 2>/dev/null \
+       | grep -oE '\([A-Z0-9]{10}\)' | tr -d '()' | grep -qx "$team"; then
+    echo "error: '$team' is the identifier in a certificate's name, not your Team ID." >&2
+    echo "error: The Team ID is the certificate's Organizational Unit (OU), a different code." >&2
+  fi
+  echo "error: Installed Team IDs (certificate OUs):" >&2
+  sed 's/^/error:   /' <<<"$installed_teams" >&2
+  echo "error: Set the matching value in .env (DEVELOPMENT_TEAM=<team>) and re-run." >&2
+  echo "error: See macos/README.md \"One-time setup\" for how to read it from the cert." >&2
+  exit 1
+}
+
 warn_if_ad_hoc_signing() {
   local effective_team="${DEVELOPMENT_TEAM:-}"
   if [[ -z "$effective_team" && -f "$PROJECT_FILE/project.pbxproj" ]]; then
@@ -394,6 +457,10 @@ main() {
   # GUI environment.
   echo "==> Preparing launch environment"
   prepare_launch_env
+  # Fail fast on a wrong DEVELOPMENT_TEAM before regenerating the project, so
+  # the developer gets an actionable message instead of a cryptic xcodebuild
+  # signing error after a slow regen.
+  verify_development_team
   echo "==> Checking Xcode project"
   generate_project_if_needed
   warn_if_ad_hoc_signing

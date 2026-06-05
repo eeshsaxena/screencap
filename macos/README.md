@@ -23,12 +23,17 @@ The `.xcodeproj` is generated from `project.yml` and is gitignored. Re-run `xcod
 `project.yml` reads `DEVELOPMENT_TEAM` from the environment so each developer signs with their own Apple ID without committing personal team IDs. Find yours with:
 
 ```bash
+# Show your signing certificate:
 security find-identity -v -p codesigning | grep "Apple Development" | head -1
 # Output looks like:
 #   1) ABCD1234EFGH5678IJKL "Apple Development: you@example.com (XYZ123)"
-# The team ID is the 10-char string in parentheses at the END (e.g. XYZ123).
-# To get just the team ID:
-security find-identity -v -p codesigning | grep -oE '\([A-Z0-9]{10}\)' | head -1 | tr -d '()'
+#
+# IMPORTANT: the 10-char string in parentheses (XYZ123) is a per-certificate
+# identifier, NOT your Team ID. The Team ID is the certificate's Organizational
+# Unit (OU) — a different 10-char code. Read it straight from the cert:
+security find-certificate -c "Apple Development" -p \
+  | openssl x509 -noout -subject -nameopt sep_multiline \
+  | sed -n 's/^[[:space:]]*OU=//p' | head -1
 ```
 
 Then either prefix every `xcodegen generate` with `DEVELOPMENT_TEAM=...`, or persist it in your shell rc:
