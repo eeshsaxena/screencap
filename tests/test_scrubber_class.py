@@ -291,8 +291,8 @@ def test_run_writes_audit_log_when_blocked_intervals_present(
 
     audit_path = rec / "privacy_audit.json"
     assert audit_path.exists()
-    entries = json.loads(audit_path.read_text())
-    assert any(e.get("surface") == "db_field" for e in entries)
+    data = json.loads(audit_path.read_text())
+    assert any(e.get("surface") == "db_field" for e in data["entries"])
 
 
 # ---------------------------------------------------------------------------
@@ -609,3 +609,211 @@ def test_scrub_recording_rejects_path_traversal(tmp_path):
         "screencap.scrubber.get_recordings_dir", return_value=tmp_path,
     ), pytest.raises(ValueError):
         scrub_recording("../etc/passwd")
+
+
+# ---------------------------------------------------------------------------
+# U1: redaction evidence on ScrubResult + audit JSON (R8/R13/R14)
+# ---------------------------------------------------------------------------
+
+
+def test_run_threads_blocked_intervals_onto_result_and_audit(
+    tmp_path, pipeline_and_anonymizer,
+):
+    """A blocked-app interval surfaces on ``result.blocked_intervals`` and in
+    ``privacy_audit.json`` with start/end/reason (R13 evidence)."""
+    from screencap.privacy.context import DefaultContextClassifier
+    from screencap.privacy.policy import DefaultPolicyEvaluator, parse_privacy_config
+
+    pipeline, anonymizer = pipeline_and_anonymizer
+    rec = tmp_path / "rec"
+    _make_recording_with_blocked_interval(
+        rec,
+        blocked_bundle_id="com.1password.1password",
+        blocked_start=100.0,
+        blocked_end=200.0,
+    )
+
+    cfg = parse_privacy_config({"privacy": {"mode": "internal"}})
+    evaluator = DefaultPolicyEvaluator(cfg)
+    classifier = DefaultContextClassifier()
+
+    from screencap.scrubber import Scrubber
+
+    result = Scrubber(
+        rec,
+        pipeline=pipeline,
+        anonymizer=anonymizer,
+        evaluator=evaluator,
+        classifier=classifier,
+    ).run()
+
+    assert result.blocked_intervals, "blocked interval must be threaded onto the result"
+    iv = result.blocked_intervals[0]
+    assert iv.start == 100.0
+    assert iv.end == 200.0
+
+    data = json.loads((rec / "privacy_audit.json").read_text())
+    assert data["blocked_intervals"], "audit JSON must carry the blocked-interval list"
+    entry = data["blocked_intervals"][0]
+    assert set(entry) == {"start", "end", "action", "reason"}
+    assert entry["start"] == 100.0
+    assert entry["end"] == 200.0
+    assert entry["reason"], "reason code must be present"
+
+
+def test_write_audit_log_persists_blocked_intervals_without_audit_entries(tmp_path):
+    """Guard-fix regression: blocked intervals are written even with zero
+    per-decision audit entries.
+
+    The old ``if not result.audit_entries: return`` guard dropped the
+    blocked-interval list whenever NER found nothing. Tested at the writer
+    because the full ``run()`` path co-produces a ``db_field`` entry per
+    interval — the writer is where the dropped-evidence bug actually lived.
+    """
+    from screencap.privacy.actions import PrivacyAction
+    from screencap.scrubber import BlockedInterval, ScrubResult, _write_audit_log
+
+    result = ScrubResult()
+    result.blocked_intervals = [
+        BlockedInterval(
+            start=10.0, end=20.0,
+            action=PrivacyAction.EXCLUDE, reason="blocked_app_exclude",
+        )
+    ]
+
+    _write_audit_log(tmp_path, result)
+
+    data = json.loads((tmp_path / "privacy_audit.json").read_text())
+    assert data["entries"] == []
+    assert len(data["blocked_intervals"]) == 1
+    assert data["blocked_intervals"][0]["start"] == 10.0
+    assert data["blocked_intervals"][0]["end"] == 20.0
+
+
+def test_write_audit_log_emits_empty_collections_not_missing_keys(tmp_path):
+    """No blocked intervals / no fail-closed → keys present as empty lists."""
+    from screencap.privacy.reasons import AuditEntry
+    from screencap.scrubber import ScrubResult, _write_audit_log
+
+    result = ScrubResult()
+    result.audit_entries = [
+        AuditEntry(
+            timestamp=1.0, surface="screenshot",
+            action="exclude", reason="policy_excluded_app",
+        )
+    ]
+
+    _write_audit_log(tmp_path, result)
+
+    data = json.loads((tmp_path / "privacy_audit.json").read_text())
+    assert data["blocked_intervals"] == [], "empty collection, not a missing key"
+    assert data["fail_closed"] == [], "empty collection, not a missing key"
+    assert data["schema_version"] == 1
+
+
+def test_write_audit_log_serializes_open_interval_end_as_null(tmp_path):
+    """An open-ended (``inf``) interval serializes ``end`` as JSON null.
+
+    ``json.dumps`` would otherwise emit invalid ``Infinity``, which the
+    Swift consumer's ``JSONDecoder`` rejects.
+    """
+    from screencap.privacy.actions import PrivacyAction
+    from screencap.scrubber import BlockedInterval, ScrubResult, _write_audit_log
+
+    result = ScrubResult()
+    result.blocked_intervals = [
+        BlockedInterval(
+            start=5.0, end=float("inf"),
+            action=PrivacyAction.MASK_WINDOW, reason="blocked_app_mask",
+        )
+    ]
+
+    _write_audit_log(tmp_path, result)
+
+    raw = (tmp_path / "privacy_audit.json").read_text()
+    assert "Infinity" not in raw, "inf must not leak as invalid JSON"
+    data = json.loads(raw)
+    assert data["blocked_intervals"][0]["end"] is None
+
+
+def test_run_records_fail_closed_when_detectors_fail(tmp_path):
+    """A field the scrubber can't analyze trips ``<SCRUB_FAILED>`` and is
+    recorded in ``fail_closed_redactions`` with a timestamp (Covers AE8).
+
+    The raw value never appears in the result or the audit JSON.
+    """
+    from screencap.privacy import AllDetectorsFailedError
+    from screencap.scrubber import SCRUB_FAILED_SENTINEL, Scrubber
+
+    rec = tmp_path / "rec"
+    secret = "topsecret-passphrase-9000"
+    _make_recording_with_db_pii(rec, secret="placeholder@example.com")
+    _write_events_jsonl(rec, key_type_text=secret)  # timestamp 100.0
+
+    class _AllFailPipeline:
+        def detect(self, text):
+            raise AllDetectorsFailedError("forced detector failure for test")
+
+    class _StubAnonymizer:
+        def anonymize(self, text, detections):  # never reached on failure
+            return text
+
+    result = Scrubber(
+        rec, pipeline=_AllFailPipeline(), anonymizer=_StubAnonymizer(),
+    ).run()
+
+    assert result.fail_closed_redactions, "fail-closed field must be recorded"
+    marker = result.fail_closed_redactions[0]
+    assert marker["timestamp"] == 100.0
+    assert marker["surface"] == "event"
+
+    body = (rec / "events.jsonl").read_text()
+    assert secret not in body, "raw value must never survive a fail-closed scrub"
+    assert SCRUB_FAILED_SENTINEL in body, "the field was removed to be safe"
+
+    data = json.loads((rec / "privacy_audit.json").read_text())
+    assert any(m["timestamp"] == 100.0 for m in data["fail_closed"])
+    assert secret not in json.dumps(data), "raw value must never reach the audit JSON"
+
+
+def test_scrub_recording_creates_scrubbed_dir_mode_0700(tmp_path):
+    """``scrub_recording`` locks the scrubbed copy to owner-only (0700)."""
+    import stat as _stat
+    from unittest import mock
+
+    name = "modes-rec"
+    src = tmp_path / name
+    _make_recording_with_db_pii(src, secret="grace@contoso.example")
+
+    from screencap.scrubber import scrub_recording
+
+    with mock.patch(
+        "screencap.config.get_recordings_dir", return_value=tmp_path,
+    ), mock.patch(
+        "screencap.scrubber.get_recordings_dir", return_value=tmp_path,
+    ):
+        scrub_recording(name)
+
+    dst = tmp_path / f"{name}-scrubbed"
+    assert _stat.S_IMODE(dst.stat().st_mode) == 0o700
+
+
+def test_write_audit_log_writes_file_mode_0600(tmp_path):
+    """``privacy_audit.json`` is written owner-read/write only (0600)."""
+    import stat as _stat
+
+    from screencap.privacy.reasons import AuditEntry
+    from screencap.scrubber import ScrubResult, _write_audit_log
+
+    result = ScrubResult()
+    result.audit_entries = [
+        AuditEntry(
+            timestamp=1.0, surface="screenshot",
+            action="exclude", reason="policy_excluded_app",
+        )
+    ]
+
+    _write_audit_log(tmp_path, result)
+
+    audit = tmp_path / "privacy_audit.json"
+    assert _stat.S_IMODE(audit.stat().st_mode) == 0o600
