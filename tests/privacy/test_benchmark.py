@@ -4,17 +4,14 @@ Measures: exact-span recall, partial-overlap recall, span coverage ratio,
 document-level leak rate, FP count by entity type and detector source,
 precision/recall/F1, and end-to-end redaction survival.
 
-The scoring logic itself lives in the non-test module
-``benchmarks/scr28/scoring_core.py`` so the SCR-28 spike scorer and runners can
-reuse it without importing this pytest-collected module. The names below are
-re-exported here so ``run_benchmark`` and the existing tests keep working
-unchanged.
+The scoring logic itself lives in the sibling module
+``tests/privacy/scoring_core.py`` and is re-exported here so ``run_benchmark``
+and the existing tests keep working unchanged.
 """
 
 from __future__ import annotations
 
 import json
-import sys
 from pathlib import Path
 
 import pytest
@@ -24,15 +21,7 @@ from tests.privacy.fixtures.test_corpus import (
     FALSE_POSITIVE_CASES,
     TRUE_POSITIVE_CASES,
 )
-
-# The scoring core is a flat module under benchmarks/scr28/ (not a package on
-# sys.path), so make that directory importable — same bootstrap the SCR-28 test
-# modules use.
-_SCR28_DIR = Path(__file__).resolve().parents[2] / "benchmarks" / "scr28"
-if str(_SCR28_DIR) not in sys.path:
-    sys.path.insert(0, str(_SCR28_DIR))
-
-from scoring_core import (  # noqa: E402  (re-exported for existing callers/tests)
+from tests.privacy.scoring_core import (
     _FREQ_WEIGHT,
     AggregateResult,
     BenchmarkResult,

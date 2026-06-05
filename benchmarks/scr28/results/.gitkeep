@@ -1,2 +1,0 @@
-# Per-model, per-tier scored outputs land here.
-# results/tier2-* are gitignored (PII-derived); Tier-1/footprint results are committable.
