@@ -1,8 +1,9 @@
 ---
 title: "P3: Extract a shared ensure_canonical_events helper (review.py + upload loop)"
-status: open
+status: resolved
 priority: low
 created: 2026-06-05
+resolved: 2026-06-05
 source: code-review (ce-code-review autofix, finding reuse #1)
 related_plans:
   - docs/plans/2026-06-03-002-feat-native-redaction-review-upload-plan.md
@@ -26,4 +27,7 @@ The two **must** stay byte-for-byte equivalent for "reviewed == uploaded" to hol
 ## Why deferred
 
 The upload block has extra `--force`/warning behavior the helper must absorb; refactoring the upload loop is adjacent to already-shipped U2/U4 work. Low risk, low urgency — the configs match today.
-</content>
+
+## Resolution
+
+Added `exporter.ensure_canonical_events(recording_dir, *, force=False)` — the single shared gate + config (skip when chunked, skip when `events.jsonl` present unless `force`, `exclude_moves=False`, `include_network` off), returning the export count or `None` when no export was needed. `review._export_canonical_events` now delegates to it; the upload loop calls it (keeping its console messaging + warn-on-failure). Tests: `test_ensure_canonical_events_gating` (all branches), plus the existing review/upload paths. Configs can no longer drift between the two paths.

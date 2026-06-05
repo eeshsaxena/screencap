@@ -1,8 +1,9 @@
 ---
 title: "P2: Relocate _recover_chunk_metadata out of cli to break the cli↔review import cycle"
-status: open
+status: resolved
 priority: medium
 created: 2026-06-05
+resolved: 2026-06-05
 source: code-review (ce-code-review autofix, finding altitude #1)
 related_plans:
   - docs/plans/2026-06-03-002-feat-native-redaction-review-upload-plan.md
@@ -26,4 +27,7 @@ related_review_run: /tmp/compound-engineering/ce-code-review/20260605-103121-cr/
 ## Why deferred
 
 Pure structural refactor touching three modules + a test module; the deferred-import works correctly today, so it was out of scope for the feature PR. Worth landing deliberately to make the layering a structural guarantee rather than tribal knowledge.
-</content>
+
+## Resolution
+
+Moved `_recover_chunk_metadata` + its only cli-private helper `_read_intent_privacy_mode` (verbatim) into a new dependency-free leaf module `src/screencap/recovery.py`. `cli/__init__.py` and `review.py` now both import *down* into it (deferred), eliminating the cycle and the deferred-import workaround. Updated all imports/mock targets in `tests/test_recover_chunk_metadata.py`, `tests/test_unified_export_contract.py`, and `tests/test_cli_review_data.py`. The `cloud_bound` REQUIRED-kwarg contract and LOAD-BEARING ORDERING docstring moved intact. Validated: `import screencap.recovery, screencap.review, screencap.cli` cycle-free; the privacy-filter call-graph audit (rglob over all .py) still passes; broad sweep 703 passing.

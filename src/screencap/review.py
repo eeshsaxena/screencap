@@ -69,32 +69,16 @@ def _export_canonical_events(rec_dir: Path) -> None:
     before scrub, so the scrubbed copy contains the exact event set
     ``screencap upload`` ships (reviewed == uploaded).
 
-    Mirrors the upload loop's gate (``cli/__init__.py``): only export a
-    combined file when the recording is **not** chunked — chunked recordings
-    ship per-chunk ``events_*.jsonl`` (written at record time or by
-    ``_recover_chunk_metadata``), which are their canonical source. The config
-    is pinned to ``exclude_moves=False`` (and ``include_network`` left at its
-    cloud-safe ``False`` default) to match upload exactly; an existing
-    ``events.jsonl`` is trusted as-is (upload re-exports only on ``--force``,
-    which review has no equivalent of).
+    Delegates to ``exporter.ensure_canonical_events`` — the single shared gate +
+    config (skip when chunked, ``exclude_moves=False``, ``include_network`` off)
+    so the review and upload export paths cannot drift. Review has no
+    ``--force``, so an existing ``events.jsonl`` is trusted as-is.
     """
-    if any(rec_dir.glob("events_*.jsonl")):
-        return
-    events_path = rec_dir / "events.jsonl"
-    if events_path.exists():
-        return
-
     # Deferred import — exporter.py pulls engine modules that are heavier
     # than the `screencap --help` path tolerates.
-    from screencap.exporter import build_export_metadata, export_recording
+    from screencap.exporter import ensure_canonical_events
 
-    meta = build_export_metadata(exclude_moves=False)
-    export_recording(
-        rec_dir,
-        str(events_path),
-        exclude_moves=False,
-        metadata=meta,
-    )
+    ensure_canonical_events(rec_dir)
 
 
 def _resolve_scrubbed_event_files(scrubbed_dir: Path) -> list[Path]:
@@ -339,10 +323,9 @@ def _prepare_scrubbed_copy(name: str, rec_dir: Path) -> "ScrubResult":
     with contextlib.redirect_stdout(sys.stderr):
         # Cloud-bound recovery, mirroring the upload loop (cloud_bound=True is
         # REQUIRED on the call — a forgotten arg is a TypeError, not fail-open).
-        # Deferred import: _recover_chunk_metadata lives in the CLI module,
-        # already imported by the time this command runs (and importable
-        # standalone in tests).
-        from screencap.cli import _recover_chunk_metadata
+        # Deferred import of the shared recovery leaf module (no longer reaching
+        # into cli, which imports this module — the old cycle is gone).
+        from screencap.recovery import _recover_chunk_metadata
 
         try:
             _recover_chunk_metadata(rec_dir, console, force=False, cloud_bound=True)

@@ -35,6 +35,34 @@ def build_export_metadata(exclude_moves: bool) -> dict:
     }
 
 
+def ensure_canonical_events(recording_dir: Path, *, force: bool = False) -> int | None:
+    """Export the canonical combined ``events.jsonl`` into *recording_dir*.
+
+    The single export config the upload AND native-review paths must agree on
+    so the bytes reviewed are the bytes uploaded (reviewed == uploaded):
+    ``exclude_moves=False`` and ``include_network`` left at its cloud-safe
+    ``False`` default. Chunked recordings ship their per-chunk
+    ``events_*.jsonl`` set (written at record time or by chunk recovery), so the
+    combined export is skipped there.
+
+    Returns the exported event count, or ``None`` when no export was needed —
+    the recording is chunked, or ``events.jsonl`` already exists and ``force``
+    is false (mirrors the upload loop's gate; review has no ``--force``, so it
+    always calls with the default). Raises on export failure; callers decide how
+    to surface it (the review path wraps it as ``ReviewPrepareError``; the upload
+    loop warns and proceeds).
+    """
+    if any(recording_dir.glob("events_*.jsonl")):
+        return None
+    events_path = recording_dir / "events.jsonl"
+    if events_path.exists() and not force:
+        return None
+    meta = build_export_metadata(exclude_moves=False)
+    return export_recording(
+        recording_dir, str(events_path), exclude_moves=False, metadata=meta,
+    )
+
+
 PrivacyFilter = Callable[["WindowSwitchEvent"], "WindowSwitchEvent | None"]
 
 

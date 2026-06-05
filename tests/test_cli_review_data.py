@@ -126,7 +126,7 @@ def recordings_root(tmp_path, monkeypatch, request):
     if not request.node.get_closest_marker("real_scrub"):
         monkeypatch.setattr("screencap.scrubber.scrub_recording", _make_fake_scrub(root))
         monkeypatch.setattr(
-            "screencap.cli._recover_chunk_metadata",
+            "screencap.recovery._recover_chunk_metadata",
             lambda *a, **k: None,
         )
     return root
@@ -504,7 +504,7 @@ def test_recovery_runs_cloud_bound_before_scrub(recordings_root):
         return fake_scrub(name)
 
     with mock.patch(
-        "screencap.cli._recover_chunk_metadata", side_effect=spy_recover
+        "screencap.recovery._recover_chunk_metadata", side_effect=spy_recover
     ), mock.patch(
         "screencap.scrubber.scrub_recording", side_effect=spy_scrub
     ):
@@ -712,3 +712,45 @@ def test_event_set_outside_recordings_root_is_rejected(recordings_root):
     ):
         with pytest.raises(ReviewPrepareError, match="outside the recordings root"):
             prepare_review_data("rec-escape")
+
+
+# ---------------------------------------------------------------------------
+# Shared canonical-events export helper (review + upload must not drift)
+# ---------------------------------------------------------------------------
+
+
+def test_ensure_canonical_events_gating(tmp_path):
+    """The single shared export gate: skip when chunked or already present
+    (unless force); export with the upload config (exclude_moves=False)
+    otherwise. Both review and `screencap upload` go through this so they
+    cannot drift."""
+    from screencap.exporter import ensure_canonical_events
+
+    rec = tmp_path / "rec"
+    rec.mkdir()
+
+    # Chunked → skip (per-chunk events_*.jsonl are the canonical source).
+    (rec / "events_0000.jsonl").write_text("{}\n")
+    with mock.patch("screencap.exporter.export_recording") as ex:
+        assert ensure_canonical_events(rec) is None
+        ex.assert_not_called()
+    (rec / "events_0000.jsonl").unlink()
+
+    # Existing events.jsonl, no force → trust it, skip.
+    (rec / "events.jsonl").write_text("{}\n")
+    with mock.patch("screencap.exporter.export_recording") as ex:
+        assert ensure_canonical_events(rec) is None
+        ex.assert_not_called()
+
+    # force=True → re-export with the canonical config.
+    with mock.patch("screencap.exporter.export_recording", return_value=7) as ex:
+        assert ensure_canonical_events(rec, force=True) == 7
+        ex.assert_called_once()
+        assert ex.call_args.kwargs["exclude_moves"] is False
+
+    # Missing → export.
+    (rec / "events.jsonl").unlink()
+    with mock.patch("screencap.exporter.export_recording", return_value=3) as ex:
+        assert ensure_canonical_events(rec) == 3
+        ex.assert_called_once()
+        assert ex.call_args.kwargs["exclude_moves"] is False
