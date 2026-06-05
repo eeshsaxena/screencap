@@ -32,6 +32,8 @@ benchmarks/scr28/tier2_testbed/**/*.jsonl
 !benchmarks/scr28/tier2_testbed/**/*.example.jsonl
 benchmarks/scr28/results/*
 !benchmarks/scr28/results/.gitkeep
+# Transient run logs (venv build, U1 validation, dataset emit) — not artifacts.
+benchmarks/scr28/.*.log
 
 # IDE
 .idea/

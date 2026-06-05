@@ -1,7 +1,7 @@
 ---
 title: "SCR-28 Spike: openai/privacy-filter vs GLiNER as default text-PII backend"
 type: feat
-status: active
+status: completed
 date: 2026-05-29
 origin: docs/brainstorms/2026-05-29-scr-28-openai-privacy-filter-spike-requirements.md
 ---

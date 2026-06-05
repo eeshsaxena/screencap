@@ -185,6 +185,62 @@ def score_prediction_file(
 
 
 # ---------------------------------------------------------------------------
+# Full-pipeline union (U6): privacy-filter NER ∪ GLiNER regex/secrets
+# ---------------------------------------------------------------------------
+
+
+def remap_file_to_entitytype(prediction_file: PredictionFile) -> PredictionFile:
+    """Pre-map a file's native labels to ``EntityType``, dropping OUT_OF_SCOPE/None.
+
+    Returns a new ``PredictionFile`` whose spans carry ``EntityType`` constants as
+    labels and ``model="gliner"`` — so a later union of files from *different* label
+    vocabularies (privacy-filter native vs GLiNER's already-``EntityType`` regex/
+    secrets) can be scored uniformly via the identity-validating GLiNER mapping.
+    Without this, scoring a mixed-vocabulary union under one ``model`` would drop
+    the other vocabulary's spans (e.g. a regex ``SSN`` span dropped as an unknown
+    privacy-filter label).
+    """
+    from schema import CasePrediction, PredictedSpan
+
+    out: list[CasePrediction] = []
+    for cp in prediction_file.predictions:
+        spans = []
+        for s in cp.spans:
+            mapped = map_label(prediction_file.model, s.label)
+            if mapped is None or mapped == OUT_OF_SCOPE:
+                continue
+            spans.append(PredictedSpan(s.start, s.end, mapped, s.score, s.source))
+        out.append(CasePrediction(cp.case_id, spans))
+    return PredictionFile(model="gliner", tier=prediction_file.tier, predictions=out)
+
+
+def union_prediction_files(files: list[PredictionFile]) -> PredictionFile:
+    """Union spans per ``case_id`` across files (each already ``EntityType``-mapped).
+
+    Pass files through :func:`remap_file_to_entitytype` first so every span speaks
+    the ``EntityType`` vocabulary. The result is ``model="gliner"`` (identity
+    validation). The scorer's adjacent-same-type merge runs at scoring time, so
+    overlapping NER/regex spans for the same type collapse there.
+    """
+    from schema import CasePrediction
+
+    by_case: dict[str, list] = {}
+    order: list[str] = []
+    tier = files[0].tier if files else "smoke"
+    for pf in files:
+        for cp in pf.predictions:
+            if cp.case_id not in by_case:
+                by_case[cp.case_id] = []
+                order.append(cp.case_id)
+            by_case[cp.case_id].extend(cp.spans)
+    return PredictionFile(
+        model="gliner",
+        tier=tier,
+        predictions=[CasePrediction(cid, by_case[cid]) for cid in order],
+    )
+
+
+# ---------------------------------------------------------------------------
 # Case loading
 # ---------------------------------------------------------------------------
 

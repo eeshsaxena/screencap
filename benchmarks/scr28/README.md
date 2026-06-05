@@ -63,22 +63,24 @@ PYTHONPATH=src python benchmarks/scr28/run_gliner.py \
     --tier tier2 --out benchmarks/scr28/results/tier2-gliner-ner.json
 ```
 
-### 2. `.venv-pf` (privacy-filter runner) — DEFERRED setup
+### 2. `.venv-pf` (privacy-filter runner) — pinned by U1
 
 privacy-filter requires `transformers` 5.6.x, which conflicts with the repo pin — hence
-the separate venv. **The exact working `transformers` version is pinned empirically in
-U1** (the model's `config.json` stamps `5.6.0.dev0`; the "≥4.50" claim is unreliable).
-Record it here once U1 confirms it.
+the separate venv. **U1 pinned the working stack: `transformers==5.6.2`, `torch 2.12.0`,
+`datasets 4.8.5`** (the model's `config.json` stamps `5.6.0.dev0`; 5.6.2 loads it cleanly
+on CPU).
 
 ```bash
 python3.12 -m venv benchmarks/scr28/.venv-pf
 benchmarks/scr28/.venv-pf/bin/pip install \
-    "transformers==<PINNED-IN-U1>" torch datasets
-# the official decoder CLI (authoritative fallback if HF pipeline offsets diverge):
-benchmarks/scr28/.venv-pf/bin/pip install opf   # privacy-filter CLI
+    "transformers==5.6.2" torch datasets
+# Register screencap's package METADATA in the venv (no deps -> does NOT pull the
+# conflicting transformers 4.57.6). Without this, `from screencap.privacy import
+# normalize_text` raises PackageNotFoundError: src/screencap/__init__.py does
+# `version("screencap")` at import, which needs the dist metadata present.
+benchmarks/scr28/.venv-pf/bin/pip install -e . --no-deps
 
-# run (the runner adds repo src/ to sys.path for normalize_text only — no torch
-# conflict, since screencap.privacy is pure-Python):
+# run:
 PYTHONPATH=src benchmarks/scr28/.venv-pf/bin/python \
     benchmarks/scr28/run_privacy_filter.py \
     --decoder pipeline --device cpu \
@@ -86,13 +88,21 @@ PYTHONPATH=src benchmarks/scr28/.venv-pf/bin/python \
     --tier tier2 --out benchmarks/scr28/results/tier2-pf-ner.json
 ```
 
-`.venv-pf` is gitignored (`.venv-*/`). The privacy-filter weights (~0.8–2.8 GB depending
-on variant) download to the HF cache, not the repo.
+`.venv-pf` is gitignored (`.venv-*/`). The privacy-filter weights download to the HF
+cache, not the repo — the HF `pipeline` path fetches **`model.safetensors` (~2.6 GB)**
+(it cannot use the smaller ONNX variants without `optimum`+`onnxruntime`).
 
-> **`--decoder opf` scale ceiling:** `opf` spawns one subprocess per input, so it is
-> intended for Tier-2 block scale (tens–hundreds of inputs). Above ~1000 inputs the
-> per-process startup cost dominates and the runner warns; use `--decoder pipeline`
-> (in-process, single model load) for Tier-1 sweeps.
+> **There is no `opf` CLI.** The plan assumed an official `opf --format json` decoder as
+> the authoritative cross-check; **no such PyPI package exists** and the model card ships
+> only the `pipeline` API. U1 therefore validated the `pipeline` decoder directly (offsets
+> were byte-correct, 0/14 mismatches — see `U1_DECODING_VALIDATION.md`). The runner's
+> `--decoder opf` path is retained but **non-functional**; use `--decoder pipeline`.
+>
+> **Decoding caveat:** HF `pipeline(aggregation_strategy="first")` does generic BIOES
+> grouping over argmax, **not** the model's constrained Viterbi decoder, and emits spans
+> that include a leading word-boundary space. Exact-span metrics are unreliable for
+> privacy-filter; **partial/leak-relevant recall is the fair metric**. `"first"` is
+> correct (`"simple"` fragments emails/phones — confirmed in U1).
 
 ## Run order
 
@@ -114,11 +124,17 @@ on variant) download to the HF cache, not the repo.
    entity-coverage delta table.
 6. **U8** — write `docs/spikes/<date>-scr-28-privacy-filter-verdict.md` applying AE1/AE2/AE3.
 
-> **Status (this session):** harness foundation only — `schema.py`, `io_utils.py`,
-> `label_maps.py`, `scorer.py`, both runners, the `score_predictions` extraction, and
-> `tier2_testbed/extract.py` + guidelines are built and tested. Steps 1, 2, 4, 5, 6 and the
-> `gold.jsonl` labeling are deferred (need the `.venv-pf` + model/dataset downloads and human
-> annotation).
+> **Status:** spike COMPLETE. All units (U1–U8) executed; verdict at
+> [`docs/spikes/2026-06-05-scr-28-privacy-filter-verdict.md`](../../docs/spikes/2026-06-05-scr-28-privacy-filter-verdict.md)
+> → **NO-SWAP** (keep GLiNER). Tier-1 (`tier1_pii_masking.py`), footprint/latency
+> (`measure_footprint.py`), the scoring driver (`score_all.py`), the U1 decode validation
+> (`_validate_decoding.py` + `U1_DECODING_VALIDATION.md`), and the Tier-2 gold draft
+> (`tier2_testbed/_draft_gold.py`) are all in place. Raw results are gitignored under
+> `results/` (`SCORES.md`, `FOOTPRINT.md`) — regenerate via the run order above.
+>
+> The Tier-2 gold is **agent-drafted** (per the plan); a human should reconcile it before
+> treating any single Tier-2 number as authoritative. The verdict's direction is robust
+> across four independent axes regardless.
 
 ## Data & PII handling
 
