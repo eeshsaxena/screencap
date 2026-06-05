@@ -1,8 +1,9 @@
 ---
 title: "P1: concurrent cloud-bound recovery/export collides on a shared events*.jsonl.tmp"
-status: open
+status: resolved
 priority: high
 created: 2026-06-05
+resolved: 2026-06-05
 source: code-review (ce-code-review, finding adversarial #2 / F3; corroborated by correctness residual)
 related_plans:
   - docs/plans/2026-06-03-002-feat-native-redaction-review-upload-plan.md
@@ -42,3 +43,29 @@ tmp).
 Touches the upload lock span and the exporter's temp-write contract; needs a
 concurrency fixture. Confidence was moderate (race window, not yet reproduced),
 so it was left for a deliberate fix rather than auto-applied.
+
+## Resolution
+
+Two-pronged:
+
+1. **Process-unique export tmp** (`exporter._unique_tmp_path`): both
+   `export_recording` and `write_events_jsonl` now write through a
+   `<name>.<pid>.<rand>.tmp` sibling and `os.rename` atomically onto the final
+   path. Two actors exporting/recovering the same source dir concurrently can no
+   longer collide on a shared temp; the destination is always one writer's
+   complete, content-equivalent output (last writer wins). Legacy fixed-name tmp
+   cleanup is retained (concurrency-safe — live writers use unique names). Tests:
+   `_unique_tmp_path` per-call uniqueness + a threaded `write_events_jsonl`
+   no-corruption test.
+
+2. **Review-path lock** (see todo 005): the review path's export + recovery now
+   run under `recording_scrub_lock`, serializing review-vs-review.
+
+The upload path's export/recovery still run before its scrub lock, but the
+process-unique tmp (1) makes that corruption-safe without widening the upload
+lock — both paths produce deterministic, content-equivalent `events*.jsonl` from
+the same source, and the atomic rename prevents any torn write. (Adjacent, out
+of scope: `task_manifest.generate_manifest` does a direct non-atomic
+`write_text`; its content is deterministic per chunk range, so concurrent
+recoveries self-heal on the next `--force`. A future micro-fix could make that
+write atomic too.)

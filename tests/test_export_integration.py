@@ -776,6 +776,52 @@ def test_write_events_jsonl_empty_events(tmp_path):
     assert header["_meta"] is True
 
 
+def test_unique_tmp_path_is_per_call_unique_sibling(tmp_path):
+    """todo 006: each call yields a distinct tmp sibling so concurrent writers
+    never collide on a shared temp path."""
+    from screencap.exporter import _unique_tmp_path
+
+    out = tmp_path / "events.jsonl"
+    a = _unique_tmp_path(out)
+    b = _unique_tmp_path(out)
+    assert a != b, "each call yields a distinct tmp path"
+    assert a.parent == out.parent, "tmp is a sibling of the final file"
+    assert a.name.startswith("events.jsonl."), a.name
+    assert a.suffix == ".tmp"
+
+
+def test_concurrent_write_events_jsonl_no_corruption(tmp_path):
+    """todo 006: two writers to the same out_path use distinct tmps, so the
+    final file is one writer's complete, parseable output (atomic
+    last-writer-wins) — never an interleaved/corrupt mix — with no orphaned
+    tmp left behind."""
+    import threading
+
+    from screencap.exporter import build_export_metadata, write_events_jsonl
+
+    out_path = tmp_path / "events.jsonl"
+    meta = build_export_metadata(exclude_moves=False)
+    barrier = threading.Barrier(2)
+
+    def writer(n):
+        barrier.wait()  # maximize overlap
+        write_events_jsonl(out_path, _make_move_events(n), meta)
+
+    threads = [threading.Thread(target=writer, args=(n,)) for n in (10, 20)]
+    for t in threads:
+        t.start()
+    for t in threads:
+        t.join()
+
+    # Every line parses (no interleaving) and the file is exactly one writer's
+    # complete output.
+    lines = out_path.read_text().strip().split("\n")
+    for line in lines:
+        json.loads(line)
+    assert (len(lines) - 1) in (10, 20), "final must be one writer's complete output"
+    assert not list(tmp_path.glob("events.jsonl.*.tmp")), "no orphaned unique tmp"
+
+
 def test_write_events_jsonl_stale_tmp_cleanup(tmp_path):
     """W5: a stale .tmp file from a prior crashed run is cleaned at start."""
     from screencap.exporter import build_export_metadata, write_events_jsonl
