@@ -1,19 +1,16 @@
-"""Model-free PII benchmark scoring core (non-test module).
+"""Model-free PII benchmark scoring core.
 
-Extracted from ``tests/privacy/test_benchmark.py`` so non-test callers
-(``benchmarks/scr28/scorer.py``, the spike runners) can reuse the scoring logic
-without importing a pytest-collected module. ``test_benchmark.py`` re-exports
-these names, so its ``run_benchmark`` wrapper and existing tests keep working;
-the corpus fixtures (``CorpusCase``, ``ExpectedEntity``, ``TRUE_POSITIVE_CASES``,
-``FALSE_POSITIVE_CASES``) stay in ``tests/privacy/fixtures/test_corpus.py`` —
-they are test data, only the scoring logic moved here.
+The scoring logic for ``tests/privacy/test_benchmark.py``, kept in a separate
+module (not pytest-collected) so it can be imported and unit-tested directly.
+``test_benchmark.py`` re-exports these names, so its ``run_benchmark`` wrapper
+and existing callers keep working; the corpus fixtures (``CorpusCase``,
+``ExpectedEntity``, ``TRUE_POSITIVE_CASES``, ``FALSE_POSITIVE_CASES``) stay in
+``tests/privacy/fixtures/test_corpus.py`` — they are test data; only the scoring
+logic lives here.
 
 Measures: exact-span recall, partial-overlap recall, span coverage ratio,
 document-level leak rate, FP count by entity type and detector source,
 precision/recall/F1, and end-to-end redaction survival.
-
-This module is pure-Python (``screencap.privacy`` + the corpus dataclasses) with
-no pytest dependency, so it imports cleanly in the repo env where the scorer runs.
 """
 
 from __future__ import annotations

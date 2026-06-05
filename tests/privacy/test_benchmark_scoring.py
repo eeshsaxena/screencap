@@ -1,22 +1,12 @@
-"""Tests for the decoupled scoring core (``score_predictions``) and the SCR-28
-spike scorer built on top of it.
+"""Tests for the decoupled scoring core (``score_predictions``).
 
-Two layers under test:
-
-* ``score_predictions`` — extracted from ``run_benchmark``; grades pre-computed
-  detections against gold cases. Tested directly with synthetic ``Detection``s
-  and via a model-free equivalence check that pins ``run_benchmark`` to it.
-* ``benchmarks/scr28/scorer.py`` — maps native model labels to ``EntityType``,
-  merges adjacent same-type spans, then calls ``score_predictions``. Tested
-  end-to-end from a ``PredictionFile`` of native labels.
-
-All tests are model-free and fast.
+``score_predictions`` — extracted from ``run_benchmark`` — grades pre-computed
+detections against gold cases. Tested directly with synthetic ``Detection``s and
+via a model-free equivalence check that pins ``run_benchmark`` to it. All tests
+are model-free and fast.
 """
 
 from __future__ import annotations
-
-import sys
-from pathlib import Path
 
 import pytest
 
@@ -28,14 +18,6 @@ from tests.privacy.fixtures.test_corpus import (
     ExpectedEntity,
 )
 from tests.privacy.test_benchmark import AggregateResult, run_benchmark, score_predictions
-
-# Make the spike modules importable (flat scripts under benchmarks/scr28/).
-_SCR28_DIR = Path(__file__).resolve().parents[2] / "benchmarks" / "scr28"
-if str(_SCR28_DIR) not in sys.path:
-    sys.path.insert(0, str(_SCR28_DIR))
-
-import scorer  # noqa: E402
-from schema import CasePrediction, PredictedSpan, PredictionFile  # noqa: E402
 
 pytestmark = pytest.mark.privacy
 
@@ -60,23 +42,6 @@ def _case(
         expected=expected,
         is_false_positive=is_fp,
         frequency=freq,
-    )
-
-
-def _pred_file(
-    model: str,
-    cid: str,
-    spans: list[tuple[int, int, str]],
-) -> PredictionFile:
-    """One-case PredictionFile from ``(start, end, native_label)`` tuples."""
-    return PredictionFile(
-        model=model,
-        tier="smoke",
-        predictions=[
-            CasePrediction(
-                cid, [PredictedSpan(s, e, label) for s, e, label in spans]
-            )
-        ],
     )
 
 
@@ -254,113 +219,3 @@ class TestRunBenchmarkEquivalence:
 
         self._assert_equivalent(fn)
 
-
-# ---------------------------------------------------------------------------
-# Spike scorer — native-label mapping + adjacent-span merge
-# ---------------------------------------------------------------------------
-
-
-class TestSpikeScorer:
-    def test_adjacent_same_type_spans_merge_to_one(self) -> None:
-        # "first name" + "last name" emitted as two PERSON-ish spans separated by
-        # a space must merge into one and match a single gold PERSON span — not
-        # score as one TP + one FP.
-        text = "Contact John Doe today"
-        case = _case("c1", text, [ExpectedEntity("PERSON", "John Doe")])
-        js, je = _span(text, "John")
-        ds, de = _span(text, "Doe")
-        pf = _pred_file(
-            "privacy-filter", "c1", [(js, je, "private_person"), (ds, de, "private_person")]
-        )
-        agg = scorer.score_prediction_file(pf, [case])
-        r = agg.per_type["PERSON"]
-        assert (r.true_positives, r.false_positives) == (1, 0)
-        assert r.exact_span_hits == 1
-
-    def test_out_of_scope_labels_are_dropped_not_errors(self) -> None:
-        # private_url maps to OUT_OF_SCOPE -> excluded from scoring entirely.
-        text = "see https://example.com/path for details"
-        case = _case("fp1", text, [], is_fp=True)
-        us, ue = _span(text, "https://example.com/path")
-        pf = _pred_file("privacy-filter", "fp1", [(us, ue, "private_url")])
-        agg = scorer.score_prediction_file(pf, [case])
-        assert agg.total_fp == 0
-        assert agg.total_tp == 0
-        assert agg.total_fn == 0
-
-    def test_wrong_type_overlap_is_fp_for_predicted_and_fn_for_gold(self) -> None:
-        # A wrong-type prediction that overlaps but is NOT fully contained in the
-        # gold span counts as an FP for the predicted type and an FN for the gold
-        # type. (Fully-contained wrong-type spans are absorbed as nested
-        # components by the reused core — see the dedicated test below.)
-        text = "Name John Doe here"
-        case = _case("c1", text, [ExpectedEntity("PERSON", "John")])
-        js, _ = _span(text, "John")
-        _, de = _span(text, "Doe")
-        # EMAIL span covering "John Doe" — wider than the gold "John" span.
-        pf = _pred_file("privacy-filter", "c1", [(js, de, "private_email")])
-        agg = scorer.score_prediction_file(pf, [case])
-        assert agg.per_type["PERSON"].false_negatives == 1
-        assert agg.per_type["EMAIL"].false_positives == 1
-
-    def test_fully_contained_wrong_type_is_absorbed_as_nested(self) -> None:
-        # Documented property of the reused core: a wrong-type detection fully
-        # contained within a gold span is treated as a nested component (e.g.
-        # PASSWORD inside CONNECTION_STRING), not an FP. The gold PERSON still
-        # registers as an FN because no PERSON span was detected.
-        text = "Contact John Doe today"
-        case = _case("c1", text, [ExpectedEntity("PERSON", "John Doe")])
-        s, e = _span(text, "John Doe")
-        pf = _pred_file("privacy-filter", "c1", [(s, e, "private_email")])
-        agg = scorer.score_prediction_file(pf, [case])
-        assert agg.per_type["PERSON"].false_negatives == 1
-        assert agg.per_type.get("EMAIL") is None or agg.per_type["EMAIL"].false_positives == 0
-
-    def test_same_type_spans_split_by_punctuation_not_merged(self) -> None:
-        # Two PERSON spans separated by a comma+space are NOT whitespace-only
-        # adjacent, so the scorer must keep them as two distinct detections.
-        text = "John Doe, Jane Roe"
-        js, je = _span(text, "John Doe")
-        ks, ke = _span(text, "Jane Roe")
-        dets = [
-            Detection("PERSON", js, je, 0.9, "pii-x"),
-            Detection("PERSON", ks, ke, 0.9, "pii-x"),
-        ]
-        merged = scorer._merge_adjacent_same_type(dets, text)
-        assert len(merged) == 2
-
-    def test_adjacent_different_type_spans_not_merged(self) -> None:
-        # Two back-to-back spans of DIFFERENT types must never merge, even when
-        # separated only by whitespace.
-        text = "John john@x.com"
-        ps, pe = _span(text, "John")
-        es, ee = _span(text, "john@x.com")
-        dets = [
-            Detection("PERSON", ps, pe, 0.9, "pii-x"),
-            Detection("EMAIL", es, ee, 0.9, "pii-x"),
-        ]
-        merged = scorer._merge_adjacent_same_type(dets, text)
-        assert len(merged) == 2
-
-    def test_shared_labels_map_to_correct_entity_types(self) -> None:
-        text = "John Doe, john@x.com, +1 415 555 1212, 1 Main St"
-        case = _case(
-            "c1",
-            text,
-            [
-                ExpectedEntity("PERSON", "John Doe"),
-                ExpectedEntity("EMAIL", "john@x.com"),
-                ExpectedEntity("PHONE", "+1 415 555 1212"),
-                ExpectedEntity("ADDRESS", "1 Main St"),
-            ],
-        )
-        spans = [
-            (*_span(text, "John Doe"), "private_person"),
-            (*_span(text, "john@x.com"), "private_email"),
-            (*_span(text, "+1 415 555 1212"), "private_phone"),
-            (*_span(text, "1 Main St"), "private_address"),
-        ]
-        pf = _pred_file("privacy-filter", "c1", spans)
-        agg = scorer.score_prediction_file(pf, [case])
-        for etype in ("PERSON", "EMAIL", "PHONE", "ADDRESS"):
-            assert agg.per_type[etype].true_positives == 1, etype
