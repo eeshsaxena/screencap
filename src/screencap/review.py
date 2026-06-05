@@ -336,7 +336,10 @@ def _prepare_scrubbed_copy(name: str, rec_dir: Path):
         # Lazy scrub. Any failure here is structural: no reusable scrubbed dir
         # (no completion sentinel) — distinct from per-field fail-closed (data).
         try:
-            scrub_result = scrub_recording(name)
+            # cloud_bound_recovery=True: recovery ran just above, so the
+            # completion sentinel records it and `screencap upload` can reuse
+            # this exact dir (reviewed == uploaded) instead of re-scrubbing.
+            scrub_result = scrub_recording(name, cloud_bound_recovery=True)
         except Exception as e:
             raise ReviewPrepareError(
                 f"could not prepare a safe version for review: {e}"

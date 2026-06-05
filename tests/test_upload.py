@@ -1151,3 +1151,268 @@ def test_upload_cli_short_flag(tmp_path):
     ):
         result = runner.invoke(cli, ["upload", "my-rec", "-j", "1"])
     assert result.exit_code == 0
+
+
+# ---------------------------------------------------------------------------
+# U4: upload-side reuse guard — reviewed == uploaded (R3/R14)
+# ---------------------------------------------------------------------------
+
+
+def _make_uploadable_recording(tmp_path):
+    """A non-chunked recording the upload loop won't mutate before the guard
+    (events.jsonl present → no export; no chunks → no recovery)."""
+    rec = tmp_path / "my-rec"
+    rec.mkdir()
+    (rec / "video.mp4").write_bytes(b"x" * 100)
+    (rec / "events.jsonl").write_text(json.dumps({"_meta": True}) + "\n")
+    conn = sqlite3.connect(rec / "recording.db")
+    conn.execute("CREATE TABLE recording (timestamp REAL)")
+    conn.execute("INSERT INTO recording VALUES (1716800000.0)")
+    conn.commit()
+    conn.close()
+    return rec
+
+
+def _upload_result_stub():
+    return mock.MagicMock(
+        uploaded=["video.mp4"], skipped=[], failed=[],
+        total_bytes=100, gcs_prefix="gs://bucket/recordings/my-rec/",
+    )
+
+
+@pytest.mark.privacy
+def test_scrub_recording_writes_reusable_sentinel(tmp_path):
+    """scrub_recording writes the completion sentinel + provenance as its final
+    step, and the result is reusable (Covers the sentinel-gating posture)."""
+    from screencap.scrubber import (
+        SCRUB_SENTINEL_NAME,
+        is_scrubbed_copy_reusable,
+        scrub_recording,
+    )
+
+    rec = tmp_path / "rec"
+    rec.mkdir()
+    conn = sqlite3.connect(rec / "recording.db")
+    conn.execute("CREATE TABLE recording (id INTEGER PRIMARY KEY, task_description TEXT)")
+    conn.execute("INSERT INTO recording VALUES (1, 'hello')")
+    conn.commit()
+    conn.close()
+
+    with mock.patch(
+        "screencap.config.get_recordings_dir", return_value=tmp_path,
+    ), mock.patch(
+        "screencap.scrubber.get_recordings_dir", return_value=tmp_path,
+    ):
+        scrub_recording("rec", cloud_bound_recovery=True)
+
+        scrubbed = tmp_path / "rec-scrubbed"
+        sentinel = scrubbed / SCRUB_SENTINEL_NAME
+        assert sentinel.exists(), "the completion sentinel must be written"
+        prov = json.loads(sentinel.read_text())
+        assert prov["cloud_bound_recovery"] is True
+        assert prov["scrubber_version"] >= 1
+        assert prov["source_hash"]
+        assert is_scrubbed_copy_reusable(rec, scrubbed) is True
+
+
+def test_is_reusable_false_without_sentinel(tmp_path):
+    from screencap.scrubber import is_scrubbed_copy_reusable
+
+    rec = tmp_path / "rec"
+    rec.mkdir()
+    (rec / "recording.db").write_bytes(b"db")
+    scrubbed = tmp_path / "rec-scrubbed"
+    scrubbed.mkdir()  # partial: no .scrub_complete
+
+    assert is_scrubbed_copy_reusable(rec, scrubbed) is False
+
+
+def test_is_reusable_false_on_version_mismatch(tmp_path):
+    from screencap.scrubber import (
+        SCRUB_SENTINEL_NAME,
+        _write_scrub_sentinel,
+        is_scrubbed_copy_reusable,
+    )
+
+    rec = tmp_path / "rec"
+    rec.mkdir()
+    (rec / "recording.db").write_bytes(b"db")
+    scrubbed = tmp_path / "rec-scrubbed"
+    scrubbed.mkdir()
+    _write_scrub_sentinel(scrubbed, rec, cloud_bound_recovery=True)
+
+    sentinel = scrubbed / SCRUB_SENTINEL_NAME
+    prov = json.loads(sentinel.read_text())
+    prov["scrubber_version"] = prov["scrubber_version"] + 999
+    sentinel.write_text(json.dumps(prov))
+
+    assert is_scrubbed_copy_reusable(rec, scrubbed) is False
+
+
+def test_is_reusable_false_on_source_mutation(tmp_path):
+    from screencap.scrubber import _write_scrub_sentinel, is_scrubbed_copy_reusable
+
+    rec = tmp_path / "rec"
+    rec.mkdir()
+    (rec / "recording.db").write_bytes(b"original")
+    scrubbed = tmp_path / "rec-scrubbed"
+    scrubbed.mkdir()
+    _write_scrub_sentinel(scrubbed, rec, cloud_bound_recovery=True)
+    assert is_scrubbed_copy_reusable(rec, scrubbed) is True
+
+    # Mutate the source (e.g. a fresh events export / WAL checkpoint).
+    (rec / "recording.db").write_bytes(b"mutated-and-longer")
+    assert is_scrubbed_copy_reusable(rec, scrubbed) is False
+
+
+def test_is_reusable_false_when_recovery_flag_absent(tmp_path):
+    """A dir scrubbed WITHOUT cloud-bound recovery (e.g. `screencap scrub`) is
+    not reusable by upload — it could leak in-interval pointer geometry."""
+    from screencap.scrubber import _write_scrub_sentinel, is_scrubbed_copy_reusable
+
+    rec = tmp_path / "rec"
+    rec.mkdir()
+    (rec / "recording.db").write_bytes(b"db")
+    scrubbed = tmp_path / "rec-scrubbed"
+    scrubbed.mkdir()
+    _write_scrub_sentinel(scrubbed, rec, cloud_bound_recovery=False)
+
+    assert is_scrubbed_copy_reusable(rec, scrubbed) is False
+
+
+def test_upload_reuses_valid_sentineled_scrubbed_copy(tmp_path):
+    """Covers AE1: after review-data prepares the scrubbed copy, upload ships
+    that exact dir without re-scrubbing."""
+    from screencap.scrubber import _write_scrub_sentinel
+
+    rec = _make_uploadable_recording(tmp_path)
+    scrubbed = tmp_path / "my-rec-scrubbed"
+    scrubbed.mkdir()
+    (scrubbed / "video.mp4").write_bytes(b"x" * 100)
+    _write_scrub_sentinel(scrubbed, rec, cloud_bound_recovery=True)
+
+    runner = CliRunner()
+    with (
+        mock.patch("screencap.upload.get_recordings_dir", return_value=tmp_path),
+        mock.patch("screencap.scrubber.scrub_recording") as scrub_spy,
+        mock.patch("screencap.upload.upload_recording", return_value=_upload_result_stub()) as up_spy,
+    ):
+        result = runner.invoke(cli, ["upload", "my-rec"])
+
+    assert result.exit_code == 0, result.output
+    scrub_spy.assert_not_called()  # reused — no second scrub
+    assert up_spy.call_args[0][0] == scrubbed  # shipped the reviewed copy
+    assert "Reusing" in result.output
+
+
+def test_upload_rebuilds_partial_scrubbed_copy(tmp_path):
+    """A partial scrubbed dir (no completion sentinel) is rebuilt, not shipped."""
+    rec = _make_uploadable_recording(tmp_path)
+    scrubbed = tmp_path / "my-rec-scrubbed"
+    scrubbed.mkdir()  # partial — no sentinel
+
+    runner = CliRunner()
+    with (
+        mock.patch("screencap.upload.get_recordings_dir", return_value=tmp_path),
+        mock.patch(
+            "screencap.scrubber.scrub_recording",
+            return_value=_stub_scrub_recording(scrubbed),
+        ) as scrub_spy,
+        mock.patch("screencap.upload.upload_recording", return_value=_upload_result_stub()),
+    ):
+        result = runner.invoke(cli, ["upload", "my-rec"])
+
+    assert result.exit_code == 0, result.output
+    scrub_spy.assert_called_once()  # rebuilt
+    assert "Reusing" not in result.output
+
+
+def test_upload_rebuilds_stale_scrubbed_copy(tmp_path):
+    """A stale scrubbed copy (source-hash mismatch) is rebuilt."""
+    from screencap.scrubber import _write_scrub_sentinel
+
+    rec = _make_uploadable_recording(tmp_path)
+    scrubbed = tmp_path / "my-rec-scrubbed"
+    scrubbed.mkdir()
+    _write_scrub_sentinel(scrubbed, rec, cloud_bound_recovery=True)
+    # Mutate the source AFTER sentinel write so the recorded hash is stale.
+    (rec / "events.jsonl").write_text(json.dumps({"_meta": True, "changed": 1}) + "\n")
+
+    runner = CliRunner()
+    with (
+        mock.patch("screencap.upload.get_recordings_dir", return_value=tmp_path),
+        mock.patch(
+            "screencap.scrubber.scrub_recording",
+            return_value=_stub_scrub_recording(scrubbed),
+        ) as scrub_spy,
+        mock.patch("screencap.upload.upload_recording", return_value=_upload_result_stub()),
+    ):
+        result = runner.invoke(cli, ["upload", "my-rec"])
+
+    assert result.exit_code == 0, result.output
+    scrub_spy.assert_called_once()  # rebuilt on stale provenance
+
+
+def test_upload_scrubs_when_no_scrubbed_copy(tmp_path):
+    """Unchanged behavior: with no pre-existing scrubbed copy, upload scrubs."""
+    rec = _make_uploadable_recording(tmp_path)
+    scrubbed = tmp_path / "my-rec-scrubbed"
+
+    runner = CliRunner()
+    with (
+        mock.patch("screencap.upload.get_recordings_dir", return_value=tmp_path),
+        mock.patch(
+            "screencap.scrubber.scrub_recording",
+            return_value=_stub_scrub_recording(scrubbed),
+        ) as scrub_spy,
+        mock.patch("screencap.upload.upload_recording", return_value=_upload_result_stub()),
+    ):
+        result = runner.invoke(cli, ["upload", "my-rec"])
+
+    assert result.exit_code == 0, result.output
+    scrub_spy.assert_called_once()
+
+
+def test_upload_force_rebuilds_even_with_valid_sentinel(tmp_path):
+    """--force always rebuilds, even when a valid sentinel'd dir exists."""
+    from screencap.scrubber import _write_scrub_sentinel
+
+    rec = _make_uploadable_recording(tmp_path)
+    scrubbed = tmp_path / "my-rec-scrubbed"
+    scrubbed.mkdir()
+    _write_scrub_sentinel(scrubbed, rec, cloud_bound_recovery=True)
+
+    runner = CliRunner()
+    with (
+        mock.patch("screencap.upload.get_recordings_dir", return_value=tmp_path),
+        mock.patch(
+            "screencap.scrubber.scrub_recording",
+            return_value=_stub_scrub_recording(scrubbed),
+        ) as scrub_spy,
+        mock.patch("screencap.upload.upload_recording", return_value=_upload_result_stub()),
+    ):
+        result = runner.invoke(cli, ["upload", "my-rec", "--force"])
+
+    assert result.exit_code == 0, result.output
+    scrub_spy.assert_called_once()  # force bypasses reuse
+    assert "Reusing" not in result.output
+
+
+def test_upload_scrub_failure_blocks_upload(tmp_path):
+    """Fail-closed preserved: a scrub failure blocks the upload (never ships
+    unscrubbed)."""
+    _make_uploadable_recording(tmp_path)
+
+    runner = CliRunner()
+    with (
+        mock.patch("screencap.upload.get_recordings_dir", return_value=tmp_path),
+        mock.patch(
+            "screencap.scrubber.scrub_recording",
+            side_effect=RuntimeError("scrub exploded"),
+        ),
+        mock.patch("screencap.upload.upload_recording") as up_spy,
+    ):
+        result = runner.invoke(cli, ["upload", "my-rec"])
+
+    up_spy.assert_not_called()  # never uploaded without a scrub
+    assert "cannot upload without scrubbing" in result.output

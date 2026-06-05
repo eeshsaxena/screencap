@@ -2911,18 +2911,39 @@ def upload(names, all_recordings, dry_run, force, jobs, no_delete):
                 except Exception:
                     pass
 
-            # Always scrub before upload
+            # Always scrub before upload — but reuse the review-prepared
+            # scrubbed copy when a completion sentinel + provenance prove it is
+            # complete, current, and built the way upload would build it
+            # (reviewed == uploaded, R3/U4). This avoids a redundant second
+            # scrub on the review→upload path while never shipping a
+            # partial/stale/mutated dir. --force always rebuilds; a scrub
+            # failure still blocks upload (fail-closed preserved).
             try:
-                from screencap.scrubber import scrub_recording
-
-                with console.status(f"[bold]Scrubbing {d.name} for upload...[/bold]"):
-                    scrub_result = scrub_recording(d.name)
-                entity_total = sum(scrub_result.entity_counts.values())
-                console.print(
-                    f"  Scrubbed copy at [dim]{scrub_result.output_dir.name}/[/dim] "
-                    f"({entity_total} redaction(s) applied)."
+                from screencap.scrubber import (
+                    is_scrubbed_copy_reusable,
+                    scrub_recording,
                 )
-                d = scrub_result.output_dir
+
+                scrubbed_dir = d.parent / f"{d.name}-scrubbed"
+                if not force and is_scrubbed_copy_reusable(d, scrubbed_dir):
+                    console.print(
+                        f"  Reusing reviewed scrubbed copy at "
+                        f"[dim]{scrubbed_dir.name}/[/dim] (reviewed == uploaded)."
+                    )
+                    d = scrubbed_dir
+                else:
+                    # cloud_bound_recovery=True: _recover_chunk_metadata(
+                    # cloud_bound=True) ran above in this same iteration (the
+                    # load-bearing ordering), so the sentinel records it and a
+                    # later reuse is valid.
+                    with console.status(f"[bold]Scrubbing {d.name} for upload...[/bold]"):
+                        scrub_result = scrub_recording(d.name, cloud_bound_recovery=True)
+                    entity_total = sum(scrub_result.entity_counts.values())
+                    console.print(
+                        f"  Scrubbed copy at [dim]{scrub_result.output_dir.name}/[/dim] "
+                        f"({entity_total} redaction(s) applied)."
+                    )
+                    d = scrub_result.output_dir
             except Exception as e:
                 console.print(
                     f"[red]Error:[/red] Scrubbing failed: {e}\n"

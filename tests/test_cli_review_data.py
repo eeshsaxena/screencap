@@ -89,7 +89,7 @@ def _make_fake_scrub(root: Path):
     """
     import shutil as _sh
 
-    def _fake(name, pii_engine=None):
+    def _fake(name, pii_engine=None, *, cloud_bound_recovery=False):
         from screencap.scrubber import _SKIP_EXTENSIONS, _SKIP_FILES, ScrubResult
 
         src = root / name
@@ -499,8 +499,8 @@ def test_recovery_runs_cloud_bound_before_scrub(recordings_root):
     def spy_recover(*_a, **k):
         calls.append(("recover", k.get("cloud_bound")))
 
-    def spy_scrub(name, pii_engine=None):
-        calls.append(("scrub", None))
+    def spy_scrub(name, pii_engine=None, *, cloud_bound_recovery=False):
+        calls.append(("scrub", cloud_bound_recovery))
         return fake_scrub(name)
 
     with mock.patch(
@@ -510,7 +510,9 @@ def test_recovery_runs_cloud_bound_before_scrub(recordings_root):
     ):
         prepare_review_data("rec-order")
 
-    assert calls == [("recover", True), ("scrub", None)], calls
+    # Recovery runs first with cloud_bound=True; the scrub is then told recovery
+    # ran (cloud_bound_recovery=True) so the sentinel marks the dir reusable.
+    assert calls == [("recover", True), ("scrub", True)], calls
 
 
 def test_chunked_review_uses_per_chunk_event_set(recordings_root):
