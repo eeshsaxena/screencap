@@ -108,17 +108,26 @@ def measure_disk(repo_id: str, *, variant_file: str | None = None) -> dict:
     if variant_file:
         # Find the variant within snapshots (resolve through the symlink to blob).
         matches = list(cache_dir.glob(f"snapshots/*/{variant_file}"))
+        seen: set[Path] = set()
         size = 0
         for m in matches:
             try:
-                size += m.resolve().stat().st_size
+                real = m.resolve()
+                if real in seen:
+                    continue
+                seen.add(real)
+                size += real.stat().st_size
             except OSError:
                 pass
         # Variant ONNX often ships external .onnx_data sidecars — include them.
         sidecars = list(cache_dir.glob(f"snapshots/*/{variant_file}_data*"))
         for s in sidecars:
             try:
-                size += s.resolve().stat().st_size
+                real = s.resolve()
+                if real in seen:
+                    continue
+                seen.add(real)
+                size += real.stat().st_size
             except OSError:
                 pass
         return {

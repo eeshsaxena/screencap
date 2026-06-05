@@ -312,18 +312,24 @@ def binary_pii_f1(
             e.substring for e in c.expected if e.entity_type in _REAL_ENTITY_TYPES
         ]
 
+    predictions_by_case: dict[str, list] = {}
+    for case_pred in prediction_file.predictions:
+        if case_pred.case_id in predictions_by_case:
+            raise ValueError(
+                f"duplicate case_id {case_pred.case_id!r} in prediction file"
+            )
+        predictions_by_case[case_pred.case_id] = case_pred.spans
+
     tp = fp = fn = 0
     model = prediction_file.model
-    for case_pred in prediction_file.predictions:
-        normalized = text_by_id.get(case_pred.case_id)
-        if normalized is None:
-            continue
+    for case in cases:
+        normalized = text_by_id[case.id]
         gold_chars = _char_mask_from_substrings(
-            normalized, gold_subs_by_id.get(case_pred.case_id, [])
+            normalized, gold_subs_by_id.get(case.id, [])
         )
         pred_ranges = [
             (s.start, s.end)
-            for s in case_pred.spans
+            for s in predictions_by_case.get(case.id, [])
             if (m := map_label(model, s.label)) is not None and m != OUT_OF_SCOPE
         ]
         pred_chars = _char_mask_from_spans(pred_ranges, len(normalized))

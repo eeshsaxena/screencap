@@ -170,6 +170,26 @@ class TestBinaryPiiF1:
         assert m["fp_chars"] == 0
         assert m["f1"] == 1.0
 
+    def test_missing_prediction_counts_gold_as_false_negative(self):
+        case = self._case()
+        pf = PredictionFile("gliner", "tier1", [])
+        m = t1.binary_pii_f1(pf, [case])
+        assert m["tp_chars"] == 0
+        assert m["fp_chars"] == 0
+        assert m["fn_chars"] > 0
+        assert m["recall"] == 0.0
+
+    def test_duplicate_case_id_fails_loudly(self):
+        case = self._case()
+        norm = normalize_text(case.text)
+        span = self._span(norm, "Jane Roe", "PERSON")
+        pf = PredictionFile(
+            "gliner", "tier1",
+            [CasePrediction("c1", [span]), CasePrediction("c1", [span])],
+        )
+        with pytest.raises(ValueError, match="duplicate case_id"):
+            t1.binary_pii_f1(pf, [case])
+
 
 class TestFootprintHelpers:
     @pytest.mark.parametrize(
@@ -201,6 +221,22 @@ class TestFootprintHelpers:
     def test_disk_uncached_repo_reports_not_cached(self):
         out = mf.measure_disk("openai/definitely-not-a-real-repo-xyz")
         assert out["cached"] is False and out["bytes"] == 0
+
+    def test_variant_disk_dedupes_shared_snapshot_blobs(self, tmp_path, monkeypatch):
+        cache = tmp_path / "hub" / "models--org--model"
+        blob = cache / "blobs" / "abc"
+        snap1 = cache / "snapshots" / "rev1" / "onnx"
+        snap2 = cache / "snapshots" / "rev2" / "onnx"
+        blob.parent.mkdir(parents=True)
+        blob.write_bytes(b"x" * 123)
+        snap1.mkdir(parents=True)
+        snap2.mkdir(parents=True)
+        (snap1 / "model_q4f16.onnx").symlink_to(blob)
+        (snap2 / "model_q4f16.onnx").symlink_to(blob)
+
+        monkeypatch.setenv("HF_HOME", str(tmp_path))
+        out = mf.measure_disk("org/model", variant_file="onnx/model_q4f16.onnx")
+        assert out["bytes"] == 123
 
 
 class TestFullPipelineUnion:
