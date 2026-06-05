@@ -21,31 +21,42 @@ ScreenCap's real input — noisy, fragmentary OCR / accessibility text.
 
 ## Verdict (R1): **NO-SWAP**
 
-Keep GLiNER as the default backend. The recommendation rests on **four independent
-axes that all point the same way** — no single axis is load-bearing:
+Keep GLiNER as the default backend. **The confidence comes primarily from three
+testbed-independent structural axes** — these hold regardless of how thin or
+synthetic the accuracy testbed is. The accuracy evidence then points the same way,
+but is treated as **directional** (small / partly-synthetic sets — see Caveats).
 
-1. **Accuracy on the decisive distribution.** On the Tier-2 OCR-noise testbed,
-   GLiNER reaches **100% partial (leak-relevant) recall on every high-harm type
-   with 0% document-leak**; privacy-filter's NER reaches **69% partial recall with
-   a 32% document-leak rate**, and on clean Tier-1 prose GLiNER **matches or beats**
-   privacy-filter on person and email recall. privacy-filter never clears the swap
-   bar (AE1).
-2. **Native coverage gap (AE3).** privacy-filter's NER has **no SSN and no
-   credit-card class** — it scored **0% recall on SSN (Tier-1 and Tier-2) and 0% on
-   credit-card (Tier-2)**. ScreenCap's regex/secrets layer only **partially**
-   compensates (67% partial recall in full-pipeline mode vs GLiNER's 100%).
-3. **Footprint (R8).** privacy-filter is **2.6 GB on disk vs GLiNER's 196 MB
+**Structural axes (do not depend on the testbed):**
+
+1. **Footprint (R8).** privacy-filter is **2.6 GB on disk vs GLiNER's 196 MB
    (~14×)**, and ~**3.8× slower** per OCR block (32 ms vs 8.5 ms; 29 vs 107
    blocks/sec). A `transformers`+`torch` backend also reopens the
    minos/PyInstaller bundling matrix that the shipped binary deliberately avoids.
-4. **Decoding integration cost.** The only pip-installable way to run the model
+   For a distributed CLI/app, this is close to decisive on its own.
+2. **Native NER coverage gap (AE3).** privacy-filter's NER has **no SSN and no
+   credit-card class** by construction (its taxonomy is fixed; confirmed by the
+   coverage delta and by 0% NER recall on both). Swapping the NER backend means
+   leaning entirely on the regex/secrets layer for two of the highest-harm types.
+3. **Decoding integration cost.** The only pip-installable way to run the model
    (HF `pipeline`) applies **generic BIOES grouping, not the model's constrained
-   Viterbi decoder**, and does **not reproduce the published accuracy** in our
-   harness. A faithful integration would have to port the Viterbi decoder.
+   Viterbi decoder** (no `opf` package exists), and does **not reproduce the
+   published accuracy** in our harness. A faithful integration would have to port
+   the Viterbi decoder — non-trivial.
 
-privacy-filter is a capable model with genuine strengths (below) — this is a
-**fit** decision for ScreenCap's current 6-type `EntityType` set, distribution, and
-distribution-as-a-bundled-binary constraint, not a quality judgment on the model.
+**Accuracy axis (directional, points the same way):**
+
+4. On clean Tier-1 prose (n=400) GLiNER **matches or beats** privacy-filter on
+   person and email recall, and on a small synthetic OCR-noise set (n=25) GLiNER
+   leads on partial recall and document-leak. privacy-filter never clears the AE1
+   swap bar. The **real** ScreenCap Tier-2 set is too PII-sparse (2 in-scope
+   instances) to settle recall on its own — hence "directional," and hence the
+   weight on the structural axes above.
+
+privacy-filter is a capable model with genuine strengths (better Tier-1 ADDRESS
+recall; fewer false positives on noisy dev-screen OCR; broader native categories;
+a `secret` class that *complements* — see Secrets below). This is a **fit**
+decision for ScreenCap's current 6-type `EntityType` set, distribution, and
+bundled-binary constraint, **not** a quality judgment on the model.
 
 ---
 
@@ -157,6 +168,35 @@ the per-type recall-under-noise read:
   and the frozen-binary smoke-test gauntlet in
   [`docs/solutions/build-errors/pyinstaller-frozen-binary-ci-failures.md`](../solutions/build-errors/pyinstaller-frozen-binary-ci-failures.md).
 
+### Secrets / API-keys — privacy-filter's `secret` class vs ScreenCap's detect-secrets layer
+
+privacy-filter's one capability GLiNER's NER lacks is a native `secret` class. The
+PII head-to-head leaves it out of scope; this axis scores it directly. A synthetic,
+code-OCR-styled set of **14 secrets** (AWS keys, GitHub PAT, Stripe/Slack/Google/
+OpenAI keys, JWT, RSA private-key header, connection string, npm token, base64
+basic-auth, password) + **6 entropy-trap distractors** (git SHAs, UUIDs, hashes),
+collapsed to a binary `SECRET` bucket:
+
+| Backend | Partial recall | Precision | Doc leak |
+|---|---|---|---|
+| **ScreenCap regex + detect-secrets (current)** | **79%** (11/14) | 100% | 21% |
+| privacy-filter `secret` NER | 50% (7/14) | 100% | 50% |
+| GLiNER NER (baseline) | 0% (0/14) | — | 100% |
+
+- **ScreenCap's existing secrets layer beats privacy-filter's native `secret` class**
+  (79% vs 50%). privacy-filter's one NER edge over GLiNER does **not** improve on what
+  ScreenCap already has — it is worse. This *reinforces* no-swap.
+- Neither over-flags the entropy-trap distractors (both **100% precision** — no FPs on
+  git SHAs / UUIDs / hashes).
+- They are **complementary**, not redundant: privacy-filter caught 2 secrets
+  detect-secrets missed (an unprefixed hex `api_key` and a base64 basic-auth token —
+  via context), while detect-secrets caught the prefixed-token secrets (AWS `AKIA`,
+  Slack `xoxb`, Google `AIza`, OpenAI `sk-proj`, connection strings) privacy-filter
+  missed. Their **union recall is 93% (13/14)** vs 79% for detect-secrets alone.
+- **Bearing on the verdict:** none on the NER-swap decision (no-swap holds). But it
+  reframes the "privacy-filter adds a `secret` class" angle from a swap argument into
+  an **augment** opportunity — see "When privacy-filter would be worth revisiting."
+
 ---
 
 ## Decision rules (origin acceptance examples)
@@ -166,9 +206,12 @@ the per-type recall-under-noise read:
   on person and email recall (Tier-1 and Tier-2), and privacy-filter is 14× the disk
   and ~3.8× the latency. → **no-swap.**
 - **AE2** (a Tier-1 win that does not survive Tier 2 → no-swap, stated as such):
-  privacy-filter **does not even win Tier 1** on the high-harm types, and clearly
-  loses Tier-2 OCR-noise (69% vs 100% partial recall, 32% vs 0% leak). The verdict
-  does **not** lean on a public-benchmark result — there is no clean win to lean on.
+  privacy-filter **does not even win Tier 1** on the high-harm types, and on the
+  synthetic OCR-noise set (n=25) loses on partial recall and document-leak
+  (69% vs 100%, 32% vs 0%). The verdict does **not** lean on a public-benchmark
+  result (there is no clean Tier-1 win to lean on), and treats the Tier-2 accuracy
+  numbers as directional given the small/synthetic sets — the no-swap call is
+  carried by the structural axes, not by the recall deltas.
 - **AE3** (a currently-redacted type privacy-filter does not natively label →
   surface the regression): **SSN and credit-card** are exactly this. Surfaced
   explicitly, not hidden under aggregate F1: privacy-filter NER scores **0%** on
@@ -180,7 +223,8 @@ the per-type recall-under-noise read:
 
 ## When privacy-filter *would* be worth revisiting
 
-This verdict is scoped to today's ScreenCap. Re-open the question if:
+This verdict is scoped to today's ScreenCap, and to **swapping the NER backend**.
+Re-open the question if:
 - ScreenCap wants **date / url / account-number** as first-class redaction types —
   privacy-filter detects these natively; GLiNER does not.
 - The **bundled-binary constraint** changes (e.g., a server-side redaction tier
@@ -188,6 +232,13 @@ This verdict is scoped to today's ScreenCap. Re-open the question if:
 - Someone ports the model's **Viterbi decoder** (or an official `opf`-equivalent
   ships) so its published accuracy is actually reachable, **and** the SSN/credit-card
   gap is closed (native classes or a validated regex/secrets equivalence).
+
+Separately, **as an augment rather than a swap**: privacy-filter's `secret` class
+caught 2 secrets ScreenCap's detect-secrets layer missed (lifting union secret
+recall 79% → 93%). If secrets coverage becomes a priority, adding privacy-filter's
+`secret` head *alongside* (not replacing) the existing secrets layer is a separate,
+independently-evaluable enhancement — but it carries the same 2.6 GB / decoder cost,
+so the bundled-binary math has to clear first.
 
 ## Privacy posture
 

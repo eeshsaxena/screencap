@@ -263,3 +263,52 @@ class TestFullPipelineUnion:
         union = scorer.union_prediction_files([pf_ner, scorer.remap_file_to_entitytype(regex)])
         labels = sorted(s.label for s in union.predictions[0].spans)
         assert labels == [EntityType.PERSON, EntityType.SSN]
+
+
+class TestSecretBucket:
+    """Secrets axis: privacy-filter `secret` vs ScreenCap detect-secrets, binary bucket."""
+
+    def test_privacy_filter_only_secret_label_maps(self):
+        from label_maps import map_label_secret_bucket
+
+        assert map_label_secret_bucket("privacy-filter", "secret") == EntityType.SECRET
+        # PII labels are not secrets — dropped (None), not bucketed.
+        assert map_label_secret_bucket("privacy-filter", "private_person") is None
+        assert map_label_secret_bucket("privacy-filter", "private_email") is None
+
+    @pytest.mark.parametrize(
+        "native,expected",
+        [
+            (EntityType.API_KEY, EntityType.SECRET),
+            (EntityType.PRIVATE_KEY, EntityType.SECRET),
+            (EntityType.JWT, EntityType.SECRET),
+            (EntityType.PASSWORD, EntityType.SECRET),
+            (EntityType.CONNECTION_STRING, EntityType.SECRET),
+            (EntityType.SECRET, EntityType.SECRET),
+            (EntityType.PERSON, None),  # PII is not a secret
+            (EntityType.SSN, None),
+        ],
+    )
+    def test_gliner_secret_family_collapses(self, native, expected):
+        from label_maps import map_label_secret_bucket
+
+        assert map_label_secret_bucket("gliner", native) == expected
+
+    def test_remap_to_secret_bucket_keeps_only_secrets(self):
+        # privacy-filter file: one secret + one person; only the secret survives.
+        pf = PredictionFile("privacy-filter", "tier2", [CasePrediction("c1", [
+            PredictedSpan(0, 10, "secret"),
+            PredictedSpan(11, 16, "private_person"),
+        ])])
+        out = scorer.remap_file_to_secret_bucket(pf)
+        assert out.model == "gliner"
+        assert [s.label for s in out.predictions[0].spans] == [EntityType.SECRET]
+
+    def test_remap_secret_bucket_collapses_detect_secrets_types(self):
+        gl = PredictionFile("gliner", "tier2", [CasePrediction("c1", [
+            PredictedSpan(0, 5, EntityType.API_KEY, source="secrets"),
+            PredictedSpan(6, 9, EntityType.JWT, source="secrets"),
+            PredictedSpan(10, 15, EntityType.PERSON),  # PII dropped
+        ])])
+        out = scorer.remap_file_to_secret_bucket(gl)
+        assert [s.label for s in out.predictions[0].spans] == [EntityType.SECRET, EntityType.SECRET]

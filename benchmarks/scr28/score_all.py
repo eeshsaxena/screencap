@@ -23,6 +23,7 @@ from schema import PredictionFile  # noqa: E402
 from scorer import (  # noqa: E402
     load_cases_jsonl,
     remap_file_to_entitytype,
+    remap_file_to_secret_bucket,
     score_prediction_file,
     union_prediction_files,
 )
@@ -122,10 +123,29 @@ def main() -> None:
                    syn_cases, "Tier2-syn · privacy-filter ∪ regex/secrets (full pipeline)", report)
     score(R / "tier2-syn-gliner-full.json", syn_cases, "Tier2-syn · GLiNER full pipeline", report)
 
+    # ---- Secrets / API-keys (binary SECRET bucket) ----
+    sec_cases = load_cases_jsonl(_require(T2 / "gold.secrets.jsonl"))
+    report.append("## Secrets / API-keys (binary SECRET bucket; "
+                  f"{sum(1 for c in sec_cases if c.expected)} secrets / "
+                  f"{sum(1 for c in sec_cases if c.is_false_positive)} entropy-trap distractors)\n")
+    report.append("_privacy-filter's native `secret` NER vs ScreenCap's dedicated "
+                  "regex+detect-secrets layer. Synthetic, code-OCR styled, tokens intact._\n")
+    _secrets(R / "secrets-pf-ner.json", sec_cases, "Secrets · privacy-filter `secret` NER", report)
+    _secrets(R / "secrets-gliner-regexsecrets.json", sec_cases,
+             "Secrets · ScreenCap regex+detect-secrets layer", report)
+    _secrets(R / "secrets-gliner-ner.json", sec_cases,
+             "Secrets · GLiNER NER (baseline — no secret class)", report)
+
     out_path = R / "SCORES.md"
     out_path.write_text("\n".join(report) + "\n")
     print(f"Wrote {out_path}")
     print("\n".join(report))
+
+
+def _secrets(pred_path: Path, cases, title: str, out: list[str]) -> None:
+    bucketed = remap_file_to_secret_bucket(PredictionFile.load(_require(pred_path)))
+    agg = score_prediction_file(bucketed, cases)
+    out.append(md_table(agg, title))
 
 
 def _full_pipeline(pf_ner: Path, gliner_rs: Path, cases, title: str, out: list[str]) -> None:

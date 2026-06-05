@@ -111,3 +111,43 @@ def map_label(model: str, native: str) -> str | None:
     if model == "gliner":
         return map_gliner_label(native)
     raise ValueError(f"unknown model {model!r}; expected 'gliner' or 'privacy-filter'")
+
+
+# ---------------------------------------------------------------------------
+# Secrets / API-key axis (binary SECRET bucket)
+# ---------------------------------------------------------------------------
+#
+# privacy-filter has a single native ``secret`` class — its one capability the
+# GLiNER NER backend lacks entirely. ScreenCap detects secrets via a *separate*
+# layer (RegexDetector + detect-secrets), which emits the fine-grained secret
+# EntityTypes below, not via NER. To compare the two fairly we collapse both
+# vocabularies to one binary ``SECRET`` bucket and ask: does privacy-filter's
+# native ``secret`` class rival ScreenCap's dedicated detect-secrets layer? The
+# main PII head-to-head leaves ``secret`` OUT_OF_SCOPE (above); this is a
+# deliberately separate axis.
+
+# ScreenCap's secret-family EntityTypes (produced by the regex/secrets layer).
+SECRET_ENTITY_TYPES: frozenset[str] = frozenset({
+    EntityType.API_KEY,
+    EntityType.PRIVATE_KEY,
+    EntityType.JWT,
+    EntityType.PASSWORD,
+    EntityType.CONNECTION_STRING,
+    EntityType.SECRET,
+})
+
+
+def map_label_secret_bucket(model: str, native: str) -> str | None:
+    """Collapse any secret-family label to the unified ``"SECRET"`` bucket.
+
+    * ``privacy-filter`` — only its native ``secret`` span maps to SECRET.
+    * ``gliner`` — the detect-secrets/regex layer emits EntityType constants
+      directly; any secret-family one maps to SECRET.
+    Everything else (real PII types, OUT_OF_SCOPE, unknown) -> ``None`` so the
+    secrets scorer counts only secret detections.
+    """
+    if model == "privacy-filter":
+        return EntityType.SECRET if native == "secret" else None
+    if model == "gliner":
+        return EntityType.SECRET if native in SECRET_ENTITY_TYPES else None
+    raise ValueError(f"unknown model {model!r}; expected 'gliner' or 'privacy-filter'")

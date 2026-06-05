@@ -214,6 +214,30 @@ def remap_file_to_entitytype(prediction_file: PredictionFile) -> PredictionFile:
     return PredictionFile(model="gliner", tier=prediction_file.tier, predictions=out)
 
 
+def remap_file_to_secret_bucket(prediction_file: PredictionFile) -> PredictionFile:
+    """Pre-map a file's labels to the binary ``SECRET`` bucket, dropping the rest.
+
+    Mirrors :func:`remap_file_to_entitytype` but uses
+    :func:`label_maps.map_label_secret_bucket`: privacy-filter's native ``secret``
+    span and ScreenCap's secret-family EntityTypes both collapse to ``"SECRET"``;
+    everything else is dropped. Returns ``model="gliner"`` so a later score routes
+    through identity validation. This is the secrets/API-key axis (separate from
+    the main PII head-to-head, which leaves ``secret`` OUT_OF_SCOPE).
+    """
+    from label_maps import map_label_secret_bucket
+    from schema import CasePrediction, PredictedSpan
+
+    out: list[CasePrediction] = []
+    for cp in prediction_file.predictions:
+        spans = [
+            PredictedSpan(s.start, s.end, mapped, s.score, s.source)
+            for s in cp.spans
+            if (mapped := map_label_secret_bucket(prediction_file.model, s.label)) is not None
+        ]
+        out.append(CasePrediction(cp.case_id, spans))
+    return PredictionFile(model="gliner", tier=prediction_file.tier, predictions=out)
+
+
 def union_prediction_files(files: list[PredictionFile]) -> PredictionFile:
     """Union spans per ``case_id`` across files (each already ``EntityType``-mapped).
 

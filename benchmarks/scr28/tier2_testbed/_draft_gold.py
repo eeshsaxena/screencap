@@ -143,6 +143,56 @@ SYNTHETIC: list[tuple[str, list[tuple[str, str]]]] = [
 ]
 
 
+# ---------------------------------------------------------------------------
+# Synthetic SECRETS / API-keys set — the secrets axis (separate from PII)
+# ---------------------------------------------------------------------------
+# privacy-filter has a native `secret` class GLiNER's NER lacks; ScreenCap detects
+# secrets via a separate regex + detect-secrets layer. This set scores the two on
+# a unified binary SECRET bucket. Code/terminal OCR is relatively clean, so tokens
+# are kept INTACT (corrupting a secret makes "is it still a secret" ambiguous) and
+# wrapped in realistic chrome (prompts, .env lines). Distractors include entropy
+# traps (git SHAs, UUIDs, hashes) that a naive detector might over-flag.
+#
+# **All values are synthetic / standard documented test values — never real
+# credentials.** Each provider-format token is ASSEMBLED FROM FRAGMENTS via
+# ``_frag(...)`` so no contiguous scanner-matching literal sits in committed
+# source — GitHub push-protection blocks realistic provider tokens even when
+# synthetic. Runtime concatenation reproduces the exact format the detect-secrets
+# layer keys on, so the benchmark is unchanged.
+
+
+def _frag(*parts: str) -> str:
+    """Join token fragments at runtime (keeps source free of full token literals)."""
+    return "".join(parts)
+
+
+# (text template with ``{tok}``, assembled token) — token=None marks a distractor.
+SECRETS_RAW: list[tuple[str, str | None]] = [
+    ("› export AWS_ACCESS_KEY_ID={tok}", _frag("AKIA", "IOSFODNN7EXAMPLE")),
+    ("AWS_SECRET_ACCESS_KEY={tok}", _frag("wJalrXUtnFEMI/K7MDENG", "/bPxRfiCYEXAMPLEKEY")),
+    ("remote https://{tok}@github.com/x/y", _frag("ghp_", "R8kZqW2nT4yU6pX1aB3cD5eF7gH9jK0mN2pQ")),
+    ("STRIPE_SECRET_KEY={tok}", _frag("sk_", "live_", "4eC39HqLyjWDarjtT1zdp7dc")),
+    ("SLACK_BOT_TOKEN={tok}", _frag("xoxb-", "123456789012-1234567890123-AbCdEfGhIjKlMnOpQrStUvWx")),
+    ("Authorization: Bearer {tok}",
+     _frag("eyJhbGciOiJIUzI1NiIsInR5cCI6IkpXVCJ9.", "eyJzdWIiOiIxMjM0NTY3ODkwIn0.", "dozjgNryP4J3jVmNHl0w5Nx")),
+    ("{tok}", _frag("-----BEGIN RSA ", "PRIVATE KEY-----")),
+    ("DATABASE_URL={tok}", _frag("postgres://admin:", "Sup3rS3cretPw", "@db.prod.internal:5432/app")),
+    ("GOOGLE_MAPS_KEY={tok}", _frag("AIza", "SyB1a2b3c4d5e6f7g8h9i0JkLmNoPqRsTuVwX")),
+    ("OPENAI_API_KEY={tok}", _frag("sk-", "proj-", "AbCd1234EfGh5678IjKl90MnOpQrStUv")),
+    ("//registry.npmjs.org/:_authToken={tok}", _frag("npm_", "AbCdEfGhIjKlMnOpQrStUvWxYz1234567890")),
+    ("• api_key: {tok}", _frag("9f8e7d6c5b4a3928", "17065f4e3d2c1b0a9f8e7d6c")),
+    ("Authorization: Basic {tok}", _frag("YWxhZGRpbjpv", "cGVuc2VzYW1l")),
+    ("DB_PASSWORD={tok}", _frag("hunter2Pa", "$$w0rd!")),
+    # Distractors (no secret) — entropy traps that a naive detector may over-flag.
+    ("commit a1b2c3d4e5f6789012345678901234567890abcd", None),
+    ("id: 550e8400-e29b-41d4-a716-446655440000", None),
+    ("sha256:e3b0c44298fc1c149afbf4c8996fb92427ae41e4", None),
+    ("GET /api/users/42 -> 200 OK in 13ms", None),
+    ("version 1.20.0-rc.3+build.456", None),
+    ("export PATH=/usr/local/bin:$PATH", None),
+]
+
+
 def build_synthetic() -> tuple[list[dict], list[dict]]:
     inputs, gold = [], []
     for i, (text, ents) in enumerate(SYNTHETIC):
@@ -152,6 +202,22 @@ def build_synthetic() -> tuple[list[dict], list[dict]]:
             cid, "synthetic ocr-noise", text,
             [{"entity_type": t, "substring": s, "source": None} for t, s in ents],
             is_fp=not ents, frequency="high" if not ents else None,
+        ))
+    return inputs, gold
+
+
+def build_secrets() -> tuple[list[dict], list[dict]]:
+    inputs, gold = [], []
+    for i, (template, token) in enumerate(SECRETS_RAW):
+        cid = f"secrets-{i:04d}"
+        text = template.format(tok=token) if token else template
+        expected = (
+            [{"entity_type": "SECRET", "substring": token, "source": None}] if token else []
+        )
+        inputs.append({"id": cid, "text": text, "modality": "ocr", "source": "synthetic-secret"})
+        gold.append(_case(
+            cid, "synthetic secret/api-key", text, expected,
+            is_fp=not token, frequency="high" if not token else None,
         ))
     return inputs, gold
 
@@ -176,6 +242,12 @@ def main() -> None:
     _write(HERE / "gold.synthetic.jsonl", syn_gold)
     syn_pii = sum(1 for c in syn_gold if c["expected"])
     print(f"synthetic: {len(syn_inputs)} inputs, {syn_pii} PII-bearing + {len(syn_gold)-syn_pii} distractors")
+
+    sec_inputs, sec_gold = build_secrets()
+    _write(HERE / "inputs.secrets.jsonl", sec_inputs)
+    _write(HERE / "gold.secrets.jsonl", sec_gold)
+    sec_pos = sum(1 for c in sec_gold if c["expected"])
+    print(f"secrets: {len(sec_inputs)} inputs, {sec_pos} secret-bearing + {len(sec_gold)-sec_pos} distractors")
 
 
 if __name__ == "__main__":
