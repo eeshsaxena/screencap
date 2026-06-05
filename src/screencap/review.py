@@ -1,42 +1,53 @@
 """Prepare a recording for native (SwiftUI) review.
 
 The SwiftUI review window's preparation step calls
-``screencap review-data --json <name>`` and consumes the returned paths
-to a single playable video and an ``events.jsonl`` file. This module
-owns the orchestration; all video processing runs in-process via PyAV
-(``screencap.engine.video``), so native review works on a machine with
-no ``ffmpeg``/``ffprobe`` on PATH — the Finder/Launchpad-launched
+``screencap review-data --json <name>`` and consumes the returned paths.
+This module owns the orchestration; all video processing runs in-process
+via PyAV (``screencap.engine.video``), so native review works on a machine
+with no ``ffmpeg``/``ffprobe`` on PATH — the Finder/Launchpad-launched
 ``.app`` gets the minimal GUI PATH and cannot reach a brew-installed
-binary anyway (plan SCR-97, U4).
+binary anyway (plan SCR-97).
 
-1. ``_ensure_single_video`` (from viewer.py) — idempotent in-process
-   PyAV concat of ``chunk_*.mp4`` into ``video.mp4`` when needed. Here
-   it runs ``fail_loud=True`` so a genuine merge failure surfaces as the
-   structural failure state rather than being swallowed.
-2. ``remediate_pixfmt_for_review`` (from engine/video.py) — the recorder
-   writes H.264 with ``yuv444p``, which AVKit's hardware decoder rejects
-   on most Macs. When the source is not an AVKit-safe 4:2:0 format, the
-   engine re-encodes once (libx264, yuv420p) into a sibling
-   ``.video_review.mp4``. The leading dot keeps it out of ``screencap
-   upload`` (dotfile filter) and its existence is the idempotency gate,
-   so the re-encode runs at most once per recording. The original
-   ``video.mp4`` is unchanged — upload still ships it as-is to preserve
-   the lossless training corpus.
-3. ``events.jsonl`` — auto-export via ``exporter.export_recording`` if
-   absent, with ``exclude_moves=True`` so the timeline pane only sees
-   discrete events (mouse.click, key.type, window.switch, …) rather
-   than the noisy mouse-move trail.
+The window must review *exactly what ``screencap upload`` ships*, so this
+runs the scrub ahead of the consent decision and points the review at the
+scrubbed copy's own files (reviewed == uploaded):
 
-Returns a JSON-serializable dict with the envelope downstream consumers
-(the SwiftUI shell, tests) decode. A genuine PyAV decode/process failure
-raises ``ReviewPrepareError`` with a "can't process this video" message —
-structurally distinct from a missing-recording or path-traversal error,
-and never a missing-binary ("install ffmpeg") message (R9).
+1. Local video (R15) — ``_ensure_single_video`` (idempotent in-process PyAV
+   concat of ``chunk_*.mp4`` into ``video.mp4``, ``fail_loud=True``) then
+   ``remediate_pixfmt_for_review`` (the recorder writes ``yuv444p`` which
+   AVKit rejects; re-encode once into a sibling ``.video_review.mp4``). The
+   video is a *local* navigation aid that never uploads, so it is prepared
+   from and left at the ORIGINAL recording dir.
+2. Canonical events export (``_export_canonical_events``) into the source
+   dir with the upload config (``exclude_moves=False``), so the scrubbed
+   copy carries the exact event set upload ships.
+3. Cloud-bound recovery → scrub (``_prepare_scrubbed_copy``), mirroring the
+   upload loop's load-bearing ``_recover_chunk_metadata(cloud_bound=True)``
+   → ``scrub_recording`` ordering. The envelope's event + screenshot paths
+   then resolve to the scrubbed copy's actual file set.
+
+Returns a JSON-serializable dict the downstream consumers (the SwiftUI
+shell, tests) decode. Failures raise ``ReviewPrepareError`` in structurally
+distinct flavors — invalid name, missing recording, "can't process this
+video" (PyAV decode), "could not prepare review events" (export/recovery),
+and "could not prepare a safe version for review" (total scrub failure) —
+never a missing-binary ("install ffmpeg") message (R9). A total scrub
+failure leaves no reusable scrubbed dir.
 """
 
 from __future__ import annotations
 
+import contextlib
+import sys
 from pathlib import Path
+
+from rich.console import Console
+
+# Progress/status goes to STDERR; stdout is reserved for the JSON envelope the
+# SwiftUI shell parses. The scrubber's own module console resolves ``sys.stdout``
+# dynamically, so the scrub call below is additionally wrapped in
+# ``redirect_stdout(sys.stderr)`` to keep stdout clean.
+console = Console(stderr=True)
 
 REVIEW_SCHEMA_VERSION = 1
 
@@ -45,29 +56,63 @@ class ReviewPrepareError(RuntimeError):
     """A non-recoverable failure during review-data preparation."""
 
 
-def _ensure_events_jsonl(rec_dir: Path) -> Path:
-    """Return path to a usable ``events.jsonl``.
+def _export_canonical_events(rec_dir: Path) -> None:
+    """Export the canonical combined ``events.jsonl`` into the *source* dir
+    before scrub, so the scrubbed copy contains the exact event set
+    ``screencap upload`` ships (reviewed == uploaded).
 
-    If absent, exports one with ``exclude_moves=True`` so the timeline
-    pane only sees discrete events. Mirrors the auto-export pattern
-    used by the upload command (``cli/__init__.py`` upload block).
+    Mirrors the upload loop's gate (``cli/__init__.py``): only export a
+    combined file when the recording is **not** chunked — chunked recordings
+    ship per-chunk ``events_*.jsonl`` (written at record time or by
+    ``_recover_chunk_metadata``), which are their canonical source. The config
+    is pinned to ``exclude_moves=False`` (and ``include_network`` left at its
+    cloud-safe ``False`` default) to match upload exactly; an existing
+    ``events.jsonl`` is trusted as-is (upload re-exports only on ``--force``,
+    which review has no equivalent of).
     """
+    if any(rec_dir.glob("events_*.jsonl")):
+        return
     events_path = rec_dir / "events.jsonl"
     if events_path.exists():
-        return events_path
+        return
 
     # Deferred import — exporter.py pulls engine modules that are heavier
     # than the `screencap --help` path tolerates.
     from screencap.exporter import build_export_metadata, export_recording
 
-    meta = build_export_metadata(exclude_moves=True)
+    meta = build_export_metadata(exclude_moves=False)
     export_recording(
         rec_dir,
         str(events_path),
-        exclude_moves=True,
+        exclude_moves=False,
         metadata=meta,
     )
-    return events_path
+
+
+def _resolve_scrubbed_event_files(scrubbed_dir: Path) -> list[Path]:
+    """Resolve the scrubbed dir's actual event file set — the bytes that ship.
+
+    Per-chunk ``events_*.jsonl`` when present (what a chunked recording
+    uploads), otherwise the combined ``events.jsonl``. Files renamed
+    ``*.scrub_failed`` are intentionally excluded — they are ineligible for
+    upload, so the review must not point at them either.
+    """
+    chunk_files = sorted(scrubbed_dir.glob("events_*.jsonl"))
+    if chunk_files:
+        return chunk_files
+    combined = scrubbed_dir / "events.jsonl"
+    return [combined] if combined.exists() else []
+
+
+def _assert_within_recordings_root(path: Path, recordings_root: Path) -> None:
+    """Defense-in-depth: refuse to emit a path that is not a strict descendant
+    of the recordings root, even after ``resolve_recording_dir`` validated the
+    name (guards a scrubbed-dir path that somehow escaped via a symlink)."""
+    resolved = path.resolve()
+    if recordings_root.resolve() not in resolved.parents:
+        raise ReviewPrepareError(
+            "prepared review directory is outside the recordings root"
+        )
 
 
 def prepare_review_data(name: str) -> dict:
@@ -90,9 +135,8 @@ def prepare_review_data(name: str) -> dict:
     decodes them as ``Double?`` (upstream plan U6/U8).
     """
     from screencap.catalog import _read_recording_meta, find_db
-    from screencap.config import resolve_recording_dir
+    from screencap.config import get_recordings_dir, resolve_recording_dir
     from screencap.engine.video import remediate_pixfmt_for_review
-    from screencap.exporter import ExportError
     from screencap.viewer import _ensure_single_video
 
     try:
@@ -100,18 +144,23 @@ def prepare_review_data(name: str) -> dict:
     except ValueError as e:
         # Invalid / path-traversal name — distinct from a decode failure
         # (no "can't process this video" prefix, no missing-binary text).
+        # Raised before any scrub or path emission (R11 — a bad request
+        # touches nothing).
         raise ReviewPrepareError(str(e)) from e
 
     if not rec_dir.exists():
         raise ReviewPrepareError(f"Recording not found: {name}")
 
-    # Video pipeline (R1, R4, R5): concat chunks → remediate pixel format, all
-    # in-process via PyAV. A genuine PyAV decode/process failure becomes the
-    # structural "can't process this video" state (R9) — never a missing-binary
-    # error, and distinct from the resolve/missing/no-video errors. The caught
-    # set spans RuntimeError/ValueError (the engine's documented failures) plus
-    # OSError (PyAV's av.error.OSError family and os.replace/mux write errors),
-    # so no failure mode escapes as a raw traceback past the envelope.
+    # Video pipeline (R15): concat chunks → remediate pixel format, all
+    # in-process via PyAV, operating on the ORIGINAL recording dir. The video
+    # is a local navigation aid that never uploads, so it is prepared from and
+    # left at the original — not the scrubbed copy. A genuine PyAV
+    # decode/process failure becomes the structural "can't process this video"
+    # state (R9) — never a missing-binary error, and distinct from the
+    # resolve/missing/no-video errors. The caught set spans
+    # RuntimeError/ValueError (the engine's documented failures) plus OSError
+    # (PyAV's av.error.OSError family and os.replace/mux write errors), so no
+    # failure mode escapes as a raw traceback past the envelope.
     try:
         # fail_loud=True: a chunk-concat failure must propagate here (the
         # HTML viewer swallows it; review-data needs correctness).
@@ -131,16 +180,34 @@ def prepare_review_data(name: str) -> dict:
     except (RuntimeError, ValueError, OSError) as e:
         raise ReviewPrepareError(f"can't process this video: {e}") from e
 
-    # events.jsonl (auto-export if missing, filtered to discrete events). A
-    # failed export (e.g. a missing/corrupt recording.db) becomes a clean error
-    # envelope rather than a raw traceback, upholding the command's contract.
-    try:
-        events_path = _ensure_events_jsonl(rec_dir)
-    except (ExportError, OSError) as e:
-        raise ReviewPrepareError(f"could not prepare review events: {e}") from e
+    # Scrub-before-review (R1/R2/R7): prepare the exact post-hoc upload payload
+    # — masked screenshots + scrubbed events/DB/transcript — so the bytes
+    # reviewed are the bytes uploaded. All status/progress is forced to stderr
+    # (the scrubber prints to its own stdout-bound console); stdout stays the
+    # JSON envelope only.
+    scrubbed_dir = _prepare_scrubbed_copy(name, rec_dir)
 
-    # Timing metadata for the timeline pane's coordinate space. Nullable —
-    # see the docstring; a playable recording may have no action events.
+    # Defense-in-depth path containment before emitting any scrubbed path.
+    recordings_root = get_recordings_dir()
+    _assert_within_recordings_root(scrubbed_dir, recordings_root)
+
+    # Resolve the event source to the scrubbed dir's ACTUAL file set (per-chunk
+    # when chunked — what ships). Faithfulness by construction: the review
+    # reads the same files the scrubbed dir contains, never a re-combined file.
+    event_files = _resolve_scrubbed_event_files(scrubbed_dir)
+    events_paths = [str(p.resolve()) for p in event_files]
+
+    # Scrubbed (masked) screenshots — the "what actually uploads" visual (R15).
+    scrubbed_shots_dir = scrubbed_dir / "screenshots"
+    screenshots = (
+        [str(p.resolve()) for p in sorted(scrubbed_shots_dir.glob("*.jpg"))]
+        if scrubbed_shots_dir.is_dir()
+        else []
+    )
+
+    # Timing metadata for the timeline pane's coordinate space, read from the
+    # original DB (scrubbing nulls content, not timestamps). Nullable — see the
+    # docstring; a playable recording may have no action events.
     db_path = find_db(rec_dir)
     started_at: float | None = None
     duration_seconds: float | None = None
@@ -151,8 +218,58 @@ def prepare_review_data(name: str) -> dict:
         "ok": True,
         "schema_version": REVIEW_SCHEMA_VERSION,
         "video_path": str(video_path.resolve()),
-        "events_path": str(events_path.resolve()),
+        # `events_path` is the primary scrubbed events file (events_paths[0]),
+        # kept for single-file consumers; `events_paths` is the authoritative
+        # set the review parses.
+        "events_path": events_paths[0] if events_paths else None,
+        "events_paths": events_paths,
+        "screenshots": screenshots,
         "started_at": started_at,
         "duration_seconds": duration_seconds,
         "video_pixfmt_remediated": remediated,
     }
+
+
+def _prepare_scrubbed_copy(name: str, rec_dir: Path) -> Path:
+    """Run canonical export → cloud-bound recovery → scrub, returning the
+    scrubbed dir. A total scrub failure is a structural preparation failure
+    (``ReviewPrepareError``) leaving no reusable (sentinel'd) dir behind.
+
+    The recovery → scrub ordering mirrors the upload loop's load-bearing
+    sequence so the prepared dir is upload-equivalent (the scrub-layer pointer
+    suppression only protects recovered cloud-bound JSONL when this holds).
+    """
+    from screencap.exporter import ExportError
+    from screencap.scrubber import scrub_recording
+
+    # Canonical pre-scrub export into the source dir (config-matched to upload).
+    try:
+        _export_canonical_events(rec_dir)
+    except (ExportError, OSError) as e:
+        raise ReviewPrepareError(f"could not prepare review events: {e}") from e
+
+    # All sub-steps print progress; force stdout → stderr so the envelope on
+    # real stdout stays clean even though the scrubber's console is stdout-bound.
+    with contextlib.redirect_stdout(sys.stderr):
+        # Cloud-bound recovery, mirroring the upload loop (cloud_bound=True is
+        # REQUIRED on the call — a forgotten arg is a TypeError, not fail-open).
+        # Deferred import: _recover_chunk_metadata lives in the CLI module,
+        # already imported by the time this command runs (and importable
+        # standalone in tests).
+        from screencap.cli import _recover_chunk_metadata
+
+        try:
+            _recover_chunk_metadata(rec_dir, console, force=False, cloud_bound=True)
+        except Exception as e:
+            raise ReviewPrepareError(f"could not prepare review events: {e}") from e
+
+        # Lazy scrub. Any failure here is structural: no reusable scrubbed dir
+        # (no completion sentinel) — distinct from per-field fail-closed (data).
+        try:
+            scrub_result = scrub_recording(name)
+        except Exception as e:
+            raise ReviewPrepareError(
+                f"could not prepare a safe version for review: {e}"
+            ) from e
+
+    return scrub_result.output_dir
