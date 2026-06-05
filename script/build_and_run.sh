@@ -95,6 +95,14 @@ resolve_dev_python() {
   local python_cmd="${SCREENCAP_DEV_PYTHON:-}"
   local resolved_python
 
+  # Prefer the repo's own virtualenv: it carries the project-pinned PyInstaller.
+  # Building with a *different* PyInstaller than the one that seeded build/'s
+  # cached bootstrap loaders produces a bootloader/loader version mix that fails
+  # at runtime ("Bootloader did not set sys._pyinstaller_pyz!"). The pyenv shim
+  # below is an unpinned global and is only a fallback when no .venv exists.
+  if [[ -z "$python_cmd" && -x "$ROOT_DIR/.venv/bin/python3" ]]; then
+    python_cmd="$ROOT_DIR/.venv/bin/python3"
+  fi
   if [[ -z "$python_cmd" && -x "$HOME/.pyenv/shims/python3" ]]; then
     python_cmd="$HOME/.pyenv/shims/python3"
   fi
@@ -227,8 +235,25 @@ build_cli_if_needed() {
   # stays unchanged.
   (
     cd "$ROOT_DIR"
+    # Drop the cached bootstrap loaders before rebuilding. PyInstaller validates
+    # this cache by source mtime, not by PyInstaller version, so a cache left by
+    # a different PyInstaller than the one now providing the bootloader gets
+    # silently reused — yielding a bootloader/loader version mix that crashes at
+    # runtime with "Bootloader did not set sys._pyinstaller_pyz!". Wiping it
+    # forces the active PyInstaller to recompile loaders matching its bootloader.
+    rm -rf "$ROOT_DIR/build/screencap/localpycs"
     "$SCREENCAP_DEV_PYTHON" -m PyInstaller --noconfirm "$ROOT_DIR/pyinstaller/screencap.spec"
   )
+
+  # Fail loud if the freshly built bundle can't even start. embed-cli.sh only
+  # checks the executable bit, so without this a broken binary is embedded and
+  # the app surfaces a confusing "screencap exited with code 1" at runtime.
+  if ! "$CLI_BINARY" --version >/dev/null 2>&1; then
+    echo "error: freshly built screencap bundle fails to launch ($CLI_BINARY --version)." >&2
+    echo "error: typically a PyInstaller bootloader/loader version mismatch — try a clean rebuild (rm -rf build dist)." >&2
+    "$CLI_BINARY" --version || true
+    exit 1
+  fi
 }
 
 restart_daemon_if_loaded() {
