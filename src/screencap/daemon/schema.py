@@ -37,6 +37,7 @@ def envelope(*, schema_version: int, ok: bool = True, **payload: Any) -> dict[st
 _MODEL_NAMES = {
     "EnvelopeResponse",
     "DaemonInfoResponse",
+    "PermissionGrants",
     "RecordingSummary",
     "ListResponse",
     "SessionSnapshotResponse",
@@ -67,9 +68,27 @@ def _load_models() -> dict[str, Any]:
         daemon_version: str
         api_schema_version: int
 
+    class PermissionGrants(_DaemonModel):
+        """Tri-state TCC grant block (U2, additive on ``daemon.info``).
+
+        Each value is one of ``"granted"`` / ``"denied"`` / ``"indeterminate"``
+        (see ``screencap.daemon.permission_probe``). Typed as ``str`` rather
+        than a ``Literal`` so an unexpected token from a future probe decodes
+        tolerantly instead of failing envelope validation; the app maps any
+        unknown value (and an absent block from an older daemon) to
+        indeterminate.
+        """
+
+        screen_recording: str
+        accessibility: str
+        input_monitoring: str
+
     class DaemonInfoResponse(EnvelopeResponse):
         build: str | None
         started_at: float
+        # Additive (U2): older daemons omit this; the app decodes an absent
+        # block as all-indeterminate, so no API version bump is required.
+        permissions: PermissionGrants | None = None
 
     class RecordingSummary(_DaemonModel):
         """Recording summary shape returned by ``catalog.list_recordings()``."""
@@ -163,6 +182,7 @@ def _load_models() -> dict[str, Any]:
     _MODELS = {
         "EnvelopeResponse": EnvelopeResponse,
         "DaemonInfoResponse": DaemonInfoResponse,
+        "PermissionGrants": PermissionGrants,
         "RecordingSummary": RecordingSummary,
         "ListResponse": ListResponse,
         "SessionSnapshotResponse": SessionSnapshotResponse,

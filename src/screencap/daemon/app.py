@@ -33,6 +33,15 @@ async def lifespan(app: Starlette) -> AsyncIterator[None]:
         from screencap.daemon.supervisor import Supervisor
 
         app.state.supervisor = Supervisor(app.state.event_bus)
+    # Warm the TCC grant cache before serving so the very first daemon.info
+    # (e.g. the install-time readiness probe in launchagent._wait_for_daemon,
+    # which has a 0.5s budget) hits the warm path and never blocks on the
+    # ~0.3s fresh-subprocess probe. Fail-open: a probe error must not abort
+    # daemon startup.
+    try:
+        await _current_grants(app)
+    except Exception:  # noqa: BLE001 - never let cache warming break startup
+        logger.debug("grant cache warm-up failed", exc_info=True)
     try:
         yield
     finally:
@@ -45,12 +54,68 @@ def _build_string() -> str | None:
     return os.environ.get("SCREENCAP_BUILD")
 
 
-async def daemon_info(_request: Request) -> JSONResponse:
+# How long a probed grant snapshot is served before the next daemon.info call
+# triggers a fresh subprocess probe. Short enough that a post-grant toggle
+# surfaces within the app's ~5s refresh cadence, long enough that an activation
+# refresh + sheet timer firing together collapse to a single spawn.
+_GRANT_CACHE_TTL_SECONDS = 2.0
+
+
+def _grant_holder(app: Starlette):
+    """Lazily attach the grant cache + in-flight lock to ``app.state``.
+
+    Scoped per app instance (not module-global) so tests that build fresh apps
+    don't leak cached grants into each other. Lazy init is safe under asyncio:
+    the attribute checks and assignments below never await, so two concurrent
+    requests can't interleave between the ``hasattr`` and the assignment.
+    """
+    state = app.state
+    if not hasattr(state, "_grant_lock"):
+        state._grant_lock = asyncio.Lock()
+        state._grant_cache = None
+        state._grant_cache_at = 0.0
+    return state
+
+
+async def _current_grants(app: Starlette) -> dict[str, str]:
+    """Return the daemon's live TCC grant tri-state, served from a short cache.
+
+    The fresh-subprocess probe (U1) runs off the event loop via
+    ``asyncio.to_thread``. An ``asyncio.Lock`` plus a TTL re-check coalesces
+    concurrent daemon.info calls into a single probe spawn (fork-bomb guard,
+    per macos-foundation-process-pipe-pitfalls.md). Fails open to
+    indeterminate — never blocks or mislabels on a probe error (R9 / tri-state
+    rule: indeterminate is never "missing").
+    """
+    from screencap.daemon import permission_probe
+
+    state = _grant_holder(app)
+    now = time.time()
+    if state._grant_cache is not None and (now - state._grant_cache_at) < _GRANT_CACHE_TTL_SECONDS:
+        return state._grant_cache
+
+    async with state._grant_lock:
+        # A concurrent caller may have refreshed while we waited on the lock.
+        now = time.time()
+        if (
+            state._grant_cache is not None
+            and (now - state._grant_cache_at) < _GRANT_CACHE_TTL_SECONDS
+        ):
+            return state._grant_cache
+        grants = await asyncio.to_thread(permission_probe.probe_permissions)
+        state._grant_cache = grants
+        state._grant_cache_at = time.time()
+        return grants
+
+
+async def daemon_info(request: Request) -> JSONResponse:
+    grants = await _current_grants(request.app)
     return JSONResponse(
         schema.envelope(
             schema_version=schema._DAEMON_INFO_API_VERSION,
             build=_build_string(),
             started_at=_STARTED_AT,
+            permissions=grants,
         )
     )
 

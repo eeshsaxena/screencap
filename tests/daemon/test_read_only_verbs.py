@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import asyncio
 import json
 import time
 from pathlib import Path
@@ -181,6 +182,104 @@ async def test_daemon_info_has_version_build_and_started_at() -> None:
     assert payload["build"] is None or isinstance(payload["build"], str)
     assert isinstance(payload["started_at"], float)
     assert payload["started_at"] <= time.time()
+    # U2: the additive grant block rides the real fresh-subprocess probe through
+    # daemon.info (no mock here — integration coverage of the live path).
+    assert set(payload["permissions"]) == {
+        "screen_recording",
+        "accessibility",
+        "input_monitoring",
+    }
+    for value in payload["permissions"].values():
+        assert value in {"granted", "denied", "indeterminate"}
+    # Envelope still validates against the additive model.
+    schema.DaemonInfoResponse(**payload)
+
+
+def _stub_probe(monkeypatch: pytest.MonkeyPatch, grants: dict[str, str]) -> None:
+    from screencap.daemon import permission_probe
+
+    monkeypatch.setattr(permission_probe, "probe_permissions", lambda: dict(grants))
+
+
+@pytest.mark.asyncio
+async def test_daemon_info_reports_all_granted(monkeypatch: pytest.MonkeyPatch) -> None:
+    _stub_probe(
+        monkeypatch,
+        {"screen_recording": "granted", "accessibility": "granted", "input_monitoring": "granted"},
+    )
+    payload = (await _asgi_get("/v0/daemon.info")).json()
+    assert payload["permissions"] == {
+        "screen_recording": "granted",
+        "accessibility": "granted",
+        "input_monitoring": "granted",
+    }
+
+
+@pytest.mark.asyncio
+async def test_daemon_info_reports_one_denied(monkeypatch: pytest.MonkeyPatch) -> None:
+    _stub_probe(
+        monkeypatch,
+        {"screen_recording": "denied", "accessibility": "granted", "input_monitoring": "granted"},
+    )
+    payload = (await _asgi_get("/v0/daemon.info")).json()
+    assert payload["permissions"]["screen_recording"] == "denied"
+    assert payload["permissions"]["accessibility"] == "granted"
+    assert payload["permissions"]["input_monitoring"] == "granted"
+
+
+@pytest.mark.asyncio
+async def test_daemon_info_reports_indeterminate_not_omitted(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """An indeterminate probe is reported as indeterminate — present, not
+    omitted, and never coerced to a falsy/denied value."""
+    _stub_probe(
+        monkeypatch,
+        {
+            "screen_recording": "indeterminate",
+            "accessibility": "indeterminate",
+            "input_monitoring": "indeterminate",
+        },
+    )
+    payload = (await _asgi_get("/v0/daemon.info")).json()
+    assert payload["permissions"] == {
+        "screen_recording": "indeterminate",
+        "accessibility": "indeterminate",
+        "input_monitoring": "indeterminate",
+    }
+
+
+@pytest.mark.asyncio
+async def test_daemon_info_concurrent_calls_trigger_single_probe(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """The in-flight guard coalesces concurrent daemon.info probes into a single
+    subprocess spawn (fork-bomb guard)."""
+    from screencap.daemon import permission_probe
+    from screencap.daemon.app import build_app
+
+    calls: list[int] = []
+
+    def _counting_probe() -> dict[str, str]:
+        calls.append(1)
+        return {
+            "screen_recording": "granted",
+            "accessibility": "granted",
+            "input_monitoring": "granted",
+        }
+
+    monkeypatch.setattr(permission_probe, "probe_permissions", _counting_probe)
+
+    transport = httpx.ASGITransport(app=build_app())
+    async with httpx.AsyncClient(transport=transport, base_url="http://test") as client:
+        r1, r2 = await asyncio.gather(
+            client.get("/v0/daemon.info"),
+            client.get("/v0/daemon.info"),
+        )
+
+    assert r1.status_code == 200 and r2.status_code == 200
+    assert len(calls) == 1, "concurrent daemon.info must not fan out probe spawns"
+    assert r1.json()["permissions"] == r2.json()["permissions"]
 
 
 @pytest.mark.asyncio
