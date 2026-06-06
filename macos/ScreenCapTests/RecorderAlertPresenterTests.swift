@@ -43,6 +43,7 @@ final class FakeRecorderAlertPresenter: RecorderAlertPresenter {
     let stopAndQuitReply: NSApplication.TerminateReply
     let permissionLostOpensSettings: Bool
     private(set) var lastPermissionPresented: String?
+    private(set) var lastPermissionRequiredPresented: [String]?
 
     init(stopAndQuitReply: NSApplication.TerminateReply, permissionLostOpensSettings: Bool = false) {
         self.stopAndQuitReply = stopAndQuitReply
@@ -55,6 +56,13 @@ final class FakeRecorderAlertPresenter: RecorderAlertPresenter {
 
     func presentPermissionLost(permission: String, openSettings: @MainActor () -> Void) {
         lastPermissionPresented = permission
+        if permissionLostOpensSettings {
+            openSettings()
+        }
+    }
+
+    func presentPermissionRequired(permissions: [String], openSettings: @MainActor () -> Void) {
+        lastPermissionRequiredPresented = permissions
         if permissionLostOpensSettings {
             openSettings()
         }

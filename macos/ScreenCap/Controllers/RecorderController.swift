@@ -181,6 +181,18 @@ final class RecorderController: ObservableObject {
             lastError = Self.requiredPermissionsErrorMessage
             return
         }
+        // Daemon path: hard-block start ONLY on a denied Screen Recording grant
+        // — the one permission fatal to capture (U4 decision). Accessibility /
+        // Input Monitoring denials are advisory (engine backstop + capture
+        // health), so they warn-and-proceed rather than gate start.
+        // Indeterminate never blocks. Keyed on daemon-reported state — this
+        // reintroduces a daemon-path pre-block that SCR-54 removed, but
+        // legitimately: SCR-54 removed the *app-process* pre-block; this keys on
+        // the *daemon's* state. Independent of the dismissed flag (R4).
+        if transport == .daemon, let permissions, permissions.daemonGrants.screenRecordingDenied {
+            routeToPermissionGrant(missing: [.screenRecording])
+            return
+        }
         apply(machine.enterStarting())
 
         switch transport {
@@ -196,11 +208,13 @@ final class RecorderController: ObservableObject {
         switch await daemonService.probe() {
         case .daemon(let grants):
             schemaMismatchDetected = false
-            transport = .daemon
             // probeDaemon is the single writer of the daemon-grant snapshot
             // (U3). The walkthrough rows, the launch gate (U4), and the
-            // start-block all read it from PermissionController.
+            // start-block all read it from PermissionController. Push grants
+            // BEFORE flipping transport so MainWindow's transport onChange
+            // re-evaluates the gate against fresh daemon grant state.
             permissions?.updateDaemonGrants(grants)
+            transport = .daemon
             await syncDaemonSnapshot()
         case .schemaMismatch:
             schemaMismatchDetected = true
@@ -579,6 +593,29 @@ final class RecorderController: ObservableObject {
         daemonEventTask?.cancel()
         daemonEventTask = nil
         apply(machine.processTerminated(exitCode: exitCode))
+    }
+
+    /// Build the actionable "permission required before recording" message.
+    static func permissionRequiredErrorMessage(for panes: [PrivacyPane]) -> String {
+        let names = panes.isEmpty
+            ? "a required permission"
+            : panes.map(\.displayName).joined(separator: ", ")
+        return "Grant \(names) to ScreenCap before recording."
+    }
+
+    /// Surface an actionable message and route the user into the grant flow
+    /// (System Settings for the missing pane) WITHOUT dispatching a
+    /// recording.start. Shared by the client-side daemon start-block (U4) and
+    /// the server-side typed `permission_required` failure (U6) so both
+    /// start-time permission failures present one consistent surface.
+    private func routeToPermissionGrant(missing panes: [PrivacyPane]) {
+        let primary = panes.first ?? .screenRecording
+        lastError = Self.permissionRequiredErrorMessage(for: panes)
+        alertPresenter.presentPermissionRequired(
+            permissions: panes.map(\.displayName)
+        ) { [weak self] in
+            self?.permissions?.openSystemSettings(for: primary)
+        }
     }
 
     private func handlePermissionLost(permission: String?) {

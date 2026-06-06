@@ -1,11 +1,36 @@
 import SwiftUI
 
 enum FirstRunSetupPresentationPolicy {
+    /// Decide whether to present the first-run permission walkthrough (R3, U4).
+    ///
+    /// This now keys on *daemon-reported* grant state, not on the daemon being
+    /// unreachable. It **supersedes SCR-54's "do not pre-block on the daemon
+    /// transport"** — but legitimately so: SCR-54 removed pre-blocking on the
+    /// *app process's* (irrelevant) TCC state; this gate keys on the *daemon's*
+    /// (the TCC subject's) state.
+    ///
+    /// - `.cliFallback` (daemon unreachable): preserve the existing CLI-path
+    ///   walkthrough — the recording would run under the app's own TCC identity.
+    /// - `.daemon` (reachable): present only when the daemon reports a missing
+    ///   required grant. Indeterminate / absent-block is never "missing" (the
+    ///   engine preflight is the backstop), so it never presents.
+    ///
+    /// A persisted `setupDismissed` ("Skip for now") suppresses the gate so it
+    /// stops re-popping every launch. The start-block (R4) is independent of
+    /// `setupDismissed`, so a dismissed sheet never lets a broken recording start.
     static func shouldPresentOnLaunch(
         daemonProbeCompleted: Bool,
-        transport: RecorderTransport
+        transport: RecorderTransport,
+        daemonGrants: DaemonPermissionGrants,
+        setupDismissed: Bool
     ) -> Bool {
-        daemonProbeCompleted && transport == .cliFallback
+        guard daemonProbeCompleted, !setupDismissed else { return false }
+        switch transport {
+        case .cliFallback:
+            return true
+        case .daemon:
+            return daemonGrants.anyRequiredDenied
+        }
     }
 }
 
@@ -87,14 +112,14 @@ struct MainWindow: View {
         .onChange(of: recorder.daemonProbeCompleted) { _ in
             updateFirstRunSheetPresentation()
         }
-        .onChange(of: recorder.transport) { newTransport in
-            // Probe later succeeded after an earlier .cliFallback bounce
-            // (e.g. cold-boot helper socket race): close the sheet so the
-            // user isn't asked to re-grant permissions the daemon now
-            // satisfies.
-            if newTransport == .daemon {
-                showingPermissionsSheet = false
-            }
+        .onChange(of: recorder.transport) { _ in
+            updateFirstRunSheetPresentation()
+        }
+        .onChange(of: permissions.daemonGrants) { _ in
+            // The gate keys on daemon-reported grants now (U4), and a refresh
+            // (U5) can flip them while the window is open — re-evaluate so the
+            // sheet appears on a newly-detected denial and closes once the
+            // daemon path is satisfied.
             updateFirstRunSheetPresentation()
         }
         .onChange(of: section) { new in
@@ -109,16 +134,25 @@ struct MainWindow: View {
     }
 
     private func updateFirstRunSheetPresentation() {
-        // Don't pop the first-run sheet over an active recording. The transport
-        // can flip to .cliFallback mid-recording (schemaMismatch /
+        // Don't pop (or churn) the first-run sheet over an active recording. The
+        // transport can flip to .cliFallback mid-recording (schemaMismatch /
         // socketUnavailable / connectionFailed) and we don't want to interrupt
         // the in-flight capture with a permissions walkthrough.
         if recorder.state.isRecording {
             return
         }
+        // Close once the daemon path is satisfied — reachable and NOT reporting
+        // a required denial (all granted, or indeterminate). Covers the cold-boot
+        // cliFallback→daemon bounce and the post-grant refresh (U5). A reachable
+        // daemon that still reports a denial keeps the walkthrough up.
+        if recorder.transport == .daemon, !permissions.daemonGrants.anyRequiredDenied {
+            showingPermissionsSheet = false
+        }
         if FirstRunSetupPresentationPolicy.shouldPresentOnLaunch(
             daemonProbeCompleted: recorder.daemonProbeCompleted,
-            transport: recorder.transport
+            transport: recorder.transport,
+            daemonGrants: permissions.daemonGrants,
+            setupDismissed: permissions.setupDismissed
         ) {
             showingPermissionsSheet = true
         }

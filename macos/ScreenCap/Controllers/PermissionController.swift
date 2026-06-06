@@ -124,6 +124,16 @@ final class PermissionController: ObservableObject {
     /// button can be disabled, preventing a double-click from stacking
     /// multiple new instances.
     @Published private(set) var isRelaunching: Bool = false
+    /// Persisted "permission setup dismissed" flag (U4). Once the user taps
+    /// "Skip for now" with a grant still missing, the state-driven walkthrough
+    /// gate stops re-popping on every launch. The **start-block is independent**
+    /// of this flag (R4) — a dismissed sheet never lets a broken recording
+    /// start silently. Auto-cleared when all required daemon grants land (see
+    /// `updateDaemonGrants`) so a later loss (recovery / F2) re-arms the sheet.
+    @Published private(set) var setupDismissed: Bool
+
+    private let defaults: UserDefaults
+    private static let setupDismissedDefaultsKey = "com.screencap.macos.permissionSetupDismissed"
 
     nonisolated private static let relaunchMaxPollCount = 100
     nonisolated private static let relaunchPollIntervalSeconds = 0.1
@@ -158,6 +168,27 @@ final class PermissionController: ObservableObject {
     /// when the daemon is unreachable — indeterminate never blocks or nags.
     func updateDaemonGrants(_ grants: DaemonPermissionGrants) {
         daemonGrants = grants
+        // Re-arm the walkthrough once everything is granted, so a later loss
+        // (recovery / F2, including a reinstall that re-grants then re-orphans)
+        // surfaces the sheet again instead of staying suppressed by a stale
+        // "Skip for now".
+        if grants.allRequiredGranted {
+            clearSetupDismissed()
+        }
+    }
+
+    /// Persist that the user dismissed the permission walkthrough ("Skip for
+    /// now"). Suppresses the launch gate; does NOT affect the start-block.
+    func markSetupDismissed() {
+        guard !setupDismissed else { return }
+        setupDismissed = true
+        defaults.set(true, forKey: Self.setupDismissedDefaultsKey)
+    }
+
+    private func clearSetupDismissed() {
+        guard setupDismissed else { return }
+        setupDismissed = false
+        defaults.set(false, forKey: Self.setupDismissedDefaultsKey)
     }
 
     /// The daemon's grant state for a given Privacy pane. Microphone is not a
@@ -172,7 +203,12 @@ final class PermissionController: ObservableObject {
         }
     }
 
-    init() {}
+    /// `defaults` is injectable so tests exercise the dismissal flag against an
+    /// isolated suite instead of polluting `UserDefaults.standard`.
+    init(defaults: UserDefaults = .standard) {
+        self.defaults = defaults
+        self.setupDismissed = defaults.bool(forKey: Self.setupDismissedDefaultsKey)
+    }
 
     nonisolated deinit {
         // The class is @MainActor but deinit runs on whichever thread drops
