@@ -194,15 +194,23 @@ final class RecorderController: ObservableObject {
     func probeDaemon() async {
         defer { daemonProbeCompleted = true }
         switch await daemonService.probe() {
-        case .daemon:
+        case .daemon(let grants):
             schemaMismatchDetected = false
             transport = .daemon
+            // probeDaemon is the single writer of the daemon-grant snapshot
+            // (U3). The walkthrough rows, the launch gate (U4), and the
+            // start-block all read it from PermissionController.
+            permissions?.updateDaemonGrants(grants)
             await syncDaemonSnapshot()
         case .schemaMismatch:
             schemaMismatchDetected = true
             transport = .cliFallback
+            // Daemon grant state is unknowable when we can't speak its schema —
+            // fall back to indeterminate so nothing blocks on a stale snapshot.
+            permissions?.updateDaemonGrants(.allIndeterminate)
         case .unavailable:
             transport = .cliFallback
+            permissions?.updateDaemonGrants(.allIndeterminate)
         }
     }
 

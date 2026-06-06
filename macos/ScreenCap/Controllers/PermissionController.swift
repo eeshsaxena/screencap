@@ -111,6 +111,14 @@ final class PermissionController: ObservableObject {
     @Published private(set) var accessibility: PermissionStatus = .notDetermined
     @Published private(set) var inputMonitoring: PermissionStatus = .notDetermined
     @Published private(set) var microphone: PermissionStatus = .notDetermined
+    /// The *daemon's* live TCC grant state (the TCC subject), as reported over
+    /// `daemon.info` (U2/U3). Kept distinct from the four app-process statuses
+    /// above because they answer a different question — app identity vs. daemon
+    /// identity. Onboarding (U4/U5) and the daemon start-block gate on this, not
+    /// on the app-process state. Written only by `RecorderController.probeDaemon`
+    /// (the single wire reader); defaults to all-indeterminate until the first
+    /// probe lands or when the daemon is unreachable.
+    @Published private(set) var daemonGrants: DaemonPermissionGrants = .allIndeterminate
     /// True between the moment `relaunchApplication()` is invoked and the
     /// process actually exits. Surfaced to the UI so the Quit & Relaunch
     /// button can be disabled, preventing a double-click from stacking
@@ -137,6 +145,31 @@ final class PermissionController: ObservableObject {
         screenRecording == .denied
             || accessibility == .denied
             || inputMonitoring == .denied
+    }
+
+    /// All three required *daemon* grants are confirmed granted (microphone
+    /// excluded). Drives the walkthrough's "all done" / auto-close path (U5).
+    var allRequiredDaemonGrantsGranted: Bool {
+        daemonGrants.allRequiredGranted
+    }
+
+    /// Replace the daemon grant snapshot. Called by `RecorderController` after a
+    /// `daemon.info` probe (the daemon's grants) or with `.allIndeterminate`
+    /// when the daemon is unreachable — indeterminate never blocks or nags.
+    func updateDaemonGrants(_ grants: DaemonPermissionGrants) {
+        daemonGrants = grants
+    }
+
+    /// The daemon's grant state for a given Privacy pane. Microphone is not a
+    /// daemon-tracked permission, so it reports `.indeterminate` (never shown in
+    /// the required daemon rows).
+    func daemonGrant(for pane: PrivacyPane) -> DaemonGrantState {
+        switch pane {
+        case .screenRecording: return daemonGrants.screenRecording
+        case .accessibility:   return daemonGrants.accessibility
+        case .inputMonitoring: return daemonGrants.inputMonitoring
+        case .microphone:      return .indeterminate
+        }
     }
 
     init() {}

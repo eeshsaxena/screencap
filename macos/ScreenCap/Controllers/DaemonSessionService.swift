@@ -15,7 +15,11 @@ enum DaemonErrorCode {
 /// nested-type cycle.
 enum DaemonSession {
     enum ProbeOutcome: Equatable {
-        case daemon
+        /// Daemon reachable. Carries its live TCC grant state (U3) so the
+        /// orchestrator can gate the walkthrough / start-block on the daemon's
+        /// own grants rather than on transport reachability alone. An older
+        /// daemon that omits the block surfaces as `.allIndeterminate`.
+        case daemon(grants: DaemonPermissionGrants)
         case schemaMismatch
         case unavailable
     }
@@ -104,8 +108,8 @@ final class LiveDaemonSessionService: DaemonSessionService {
 
     func probe() async -> DaemonSession.ProbeOutcome {
         do {
-            _ = try await DaemonClient.daemonInfo()
-            return .daemon
+            let info = try await DaemonClient.daemonInfo()
+            return .daemon(grants: info.permissions ?? .allIndeterminate)
         } catch DaemonClientError.schemaMismatch {
             return .schemaMismatch
         } catch {
