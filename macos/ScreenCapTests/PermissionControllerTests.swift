@@ -1,6 +1,11 @@
 import XCTest
 @testable import ScreenCap
 
+private actor RefreshCounter {
+    private(set) var count = 0
+    func bump() { count += 1 }
+}
+
 final class PermissionControllerTests: XCTestCase {
     @MainActor
     func testPermissionControllerStartsWithoutAppTCCChecks() {
@@ -204,5 +209,42 @@ final class PermissionControllerTests: XCTestCase {
         // Microphone is not a daemon-tracked permission.
         XCTAssertEqual(permissions.daemonGrant(for: .microphone), .indeterminate)
         XCTAssertFalse(permissions.allRequiredDaemonGrantsGranted)
+    }
+
+    // MARK: - U5: daemon-grant refresh lifecycle + row icons
+
+    @MainActor
+    func testDaemonGrantWatchingStartsStopsAndKicksImmediateRefresh() async {
+        let (permissions, _) = makeController()
+        let counter = RefreshCounter()
+        XCTAssertFalse(permissions.isDaemonGrantWatching)
+
+        permissions.startDaemonGrantWatching { await counter.bump() }
+        XCTAssertTrue(permissions.isDaemonGrantWatching)
+
+        // An immediate refresh runs on open so the rows reflect current state
+        // without waiting a full 5s timer tick.
+        try? await Task.sleep(nanoseconds: 100_000_000)
+        let kicks = await counter.count
+        XCTAssertGreaterThanOrEqual(kicks, 1)
+
+        permissions.stopDaemonGrantWatching()
+        XCTAssertFalse(permissions.isDaemonGrantWatching)
+    }
+
+    func testGrantRowIconsAreThreeDistinctStates() {
+        // Indeterminate must read as "couldn't verify" — never a granted check
+        // or a denied needs-action. All three labels must be distinct.
+        XCTAssertEqual(FirstRunPermissionsView.grantRowIcon(for: .granted).accessibilityLabel, "Granted")
+        XCTAssertEqual(FirstRunPermissionsView.grantRowIcon(for: .denied).accessibilityLabel, "Needs action")
+        XCTAssertEqual(
+            FirstRunPermissionsView.grantRowIcon(for: .indeterminate).accessibilityLabel,
+            "Couldn't verify"
+        )
+        let labels = Set(
+            [DaemonGrantState.granted, .denied, .indeterminate]
+                .map { FirstRunPermissionsView.grantRowIcon(for: $0).accessibilityLabel }
+        )
+        XCTAssertEqual(labels.count, 3)
     }
 }

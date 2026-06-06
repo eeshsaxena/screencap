@@ -228,6 +228,17 @@ final class RecorderController: ObservableObject {
         }
     }
 
+    /// Re-read just the daemon's grant snapshot (U5 refresh while the
+    /// walkthrough is visible). Lighter than `probeDaemon` — it does not touch
+    /// transport or sync the session snapshot, so it won't disturb an in-flight
+    /// recording. A transient `.unavailable` / `.schemaMismatch` keeps the
+    /// last-known grants rather than thrashing them to indeterminate.
+    func refreshDaemonGrants() async {
+        if case .daemon(let grants) = await daemonService.probe() {
+            permissions?.updateDaemonGrants(grants)
+        }
+    }
+
     private func syncDaemonSnapshot() async {
         switch await daemonService.snapshot() {
         case .noActiveSession, .unreachable:

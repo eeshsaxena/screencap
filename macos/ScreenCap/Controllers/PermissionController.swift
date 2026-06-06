@@ -144,6 +144,16 @@ final class PermissionController: ObservableObject {
     private var pollTimer: Timer?
     private var workspaceObserver: NSObjectProtocol?
     private var relaunchWatchdog: Task<Void, Never>?
+    // U5: separate, slower (~5s) daemon-grant refresh lifecycle. Distinct from
+    // the 1Hz app-process `startWatching` poll because each daemon refresh costs
+    // a daemon-side subprocess probe (macos-foundation-process-pipe-pitfalls.md).
+    private var daemonGrantTimer: Timer?
+    private var daemonGrantWorkspaceObserver: NSObjectProtocol?
+    private var daemonGrantRefreshInFlight = false
+    private static let daemonGrantRefreshInterval: TimeInterval = 5.0
+
+    /// True while the daemon-grant refresh lifecycle is active (sheet visible).
+    var isDaemonGrantWatching: Bool { daemonGrantTimer != nil }
 
     var allRequiredGranted: Bool {
         screenRecording == .granted
@@ -219,9 +229,13 @@ final class PermissionController: ObservableObject {
         // thread calls in practice, but the compiler is strict for a reason.)
         MainActor.assumeIsolated {
             pollTimer?.invalidate()
+            daemonGrantTimer?.invalidate()
             relaunchWatchdog?.cancel()
             if let workspaceObserver {
                 NSWorkspace.shared.notificationCenter.removeObserver(workspaceObserver)
+            }
+            if let daemonGrantWorkspaceObserver {
+                NSWorkspace.shared.notificationCenter.removeObserver(daemonGrantWorkspaceObserver)
             }
         }
     }
@@ -249,6 +263,48 @@ final class PermissionController: ObservableObject {
         if let workspaceObserver {
             NSWorkspace.shared.notificationCenter.removeObserver(workspaceObserver)
             self.workspaceObserver = nil
+        }
+    }
+
+    /// Begin refreshing the *daemon* grant snapshot while the walkthrough sheet
+    /// is visible (U5): on app re-activation and on a slow ~5s timer. `refresh`
+    /// performs the actual `daemon.info` round-trip (owned by RecorderController);
+    /// an in-flight guard collapses overlapping ticks so a re-activation landing
+    /// on a timer tick can't double-spawn the daemon probe. An immediate refresh
+    /// runs so the rows reflect current state the moment the sheet opens.
+    func startDaemonGrantWatching(refresh: @escaping @MainActor () async -> Void) {
+        stopDaemonGrantWatching()
+        let timer = Timer.scheduledTimer(
+            withTimeInterval: Self.daemonGrantRefreshInterval, repeats: true
+        ) { [weak self] _ in
+            Task { @MainActor in self?.runDaemonGrantRefresh(refresh) }
+        }
+        daemonGrantTimer = timer
+        daemonGrantWorkspaceObserver = NSWorkspace.shared.notificationCenter.addObserver(
+            forName: NSWorkspace.didActivateApplicationNotification,
+            object: nil,
+            queue: .main
+        ) { [weak self] _ in
+            Task { @MainActor in self?.runDaemonGrantRefresh(refresh) }
+        }
+        runDaemonGrantRefresh(refresh)
+    }
+
+    func stopDaemonGrantWatching() {
+        daemonGrantTimer?.invalidate()
+        daemonGrantTimer = nil
+        if let daemonGrantWorkspaceObserver {
+            NSWorkspace.shared.notificationCenter.removeObserver(daemonGrantWorkspaceObserver)
+            self.daemonGrantWorkspaceObserver = nil
+        }
+    }
+
+    private func runDaemonGrantRefresh(_ refresh: @escaping @MainActor () async -> Void) {
+        guard !daemonGrantRefreshInFlight else { return }
+        daemonGrantRefreshInFlight = true
+        Task { @MainActor in
+            await refresh()
+            daemonGrantRefreshInFlight = false
         }
     }
 
