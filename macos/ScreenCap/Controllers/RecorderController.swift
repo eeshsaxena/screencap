@@ -592,6 +592,16 @@ final class RecorderController: ObservableObject {
         case .lockContended:
             lastError = "ScreenCap is already recording."
             if state.isRecording { transitionToIdle() }
+        case .permissionRequired(let missing):
+            // The daemon rejected the start before spawn (U6). Do NOT fall back
+            // to the CLI path — route into the grant flow instead, mirroring the
+            // client-side start-block (U4). No engine spawned, so no duplicate
+            // permission_lost for this attempt.
+            transitionToIdle()
+            let panes = missing.isEmpty
+                ? [PrivacyPane.screenRecording]
+                : missing.map { PrivacyPane.from(permissionString: $0) }
+            routeToPermissionGrant(missing: panes)
         case .other(let description):
             lastError = description
             if state.isRecording { transitionToIdle() }

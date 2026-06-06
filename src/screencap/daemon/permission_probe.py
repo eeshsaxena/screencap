@@ -28,6 +28,7 @@ user or be mistaken for a real revocation. This mirrors
 from __future__ import annotations
 
 import json
+import os
 import subprocess
 import sys
 from typing import Literal
@@ -55,6 +56,14 @@ PROBE_SUBCOMMAND = "_permission-probe"
 
 # Bounded like the engine probe (``_check_permission_fresh`` uses 5s).
 _PROBE_TIMEOUT_SECONDS = 5.0
+
+# Test/CI seam: a real daemon *subprocess* reads real TCC state, which cannot be
+# granted in CI, so this env var lets the harness force the probe's reported
+# state. It only changes what the probe REPORTS — the OS still enforces real TCC
+# at capture time, so this cannot bypass an actual permission. Value is either a
+# single tri-state ("granted" / "denied" / "indeterminate", applied to all three)
+# or a comma list like "screen_recording=denied,accessibility=granted".
+_PROBE_FAKE_ENV = "SCREENCAP_PERMISSION_PROBE_FAKE"
 
 
 def indeterminate_result() -> dict[str, GrantState]:
@@ -126,6 +135,19 @@ def _parse_probe_output(stdout: str) -> dict[str, GrantState]:
     return out
 
 
+def _parse_fake_grants(value: str) -> dict[str, GrantState]:
+    """Parse the ``SCREENCAP_PERMISSION_PROBE_FAKE`` test seam (see above)."""
+    value = value.strip()
+    if value in _VALID_STATES:
+        return {key: value for key in PERMISSION_KEYS}  # type: ignore[misc]
+    out = indeterminate_result()
+    for part in value.split(","):
+        key, sep, state = part.partition("=")
+        if sep and key.strip() in PERMISSION_KEYS and state.strip() in _VALID_STATES:
+            out[key.strip()] = state.strip()  # type: ignore[assignment]
+    return out
+
+
 def run_probe_checks() -> dict[str, GrantState]:
     """In-process check of all three permissions — the subcommand body.
 
@@ -141,6 +163,10 @@ def run_probe_checks() -> dict[str, GrantState]:
     wrapped so an unexpected raise yields ``indeterminate`` for that one
     permission only, never a false ``denied``. Non-darwin → all indeterminate.
     """
+    fake = os.environ.get(_PROBE_FAKE_ENV)
+    if fake:
+        return _parse_fake_grants(fake)
+
     if sys.platform != "darwin":
         return indeterminate_result()
 

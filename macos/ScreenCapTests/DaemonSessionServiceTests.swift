@@ -46,6 +46,30 @@ final class DaemonSessionServiceTests: XCTestCase {
         XCTAssertEqual(service.translateFailure(error), .lockContended)
     }
 
+    func testTranslatePermissionRequiredDecodesMissingList() {
+        let service = LiveDaemonSessionService()
+        let body = #"{"ok":false,"error":"permission_required","missing":["screen_recording","accessibility"]}"#
+        let error = DaemonClientError.envelopeError(
+            code: DaemonErrorCode.permissionRequired,
+            rawBody: Data(body.utf8)
+        )
+
+        XCTAssertEqual(
+            service.translateFailure(error),
+            .permissionRequired(missing: ["screen_recording", "accessibility"])
+        )
+    }
+
+    func testTranslatePermissionRequiredWithUndecodableBodyIsEmptyMissing() {
+        let service = LiveDaemonSessionService()
+        let error = DaemonClientError.envelopeError(
+            code: DaemonErrorCode.permissionRequired,
+            rawBody: Data()
+        )
+
+        XCTAssertEqual(service.translateFailure(error), .permissionRequired(missing: []))
+    }
+
     func testTranslateOtherEnvelopeErrorCarriesLocalizedDescription() {
         let service = LiveDaemonSessionService()
         let error = DaemonClientError.envelopeError(code: "unexpected_code", rawBody: Data())

@@ -333,6 +333,30 @@ async def recording_start(request: Request) -> JSONResponse:
             )
         parsed = parsed.model_copy(update={"started_by": peer.classification})
 
+        # Pre-spawn permission gate (U6). Reuse U2's cached grant snapshot (no
+        # second fresh spawn) and block BEFORE supervisor.spawn claims the
+        # pidfile lock — a fresh spawn inside the lock would widen the
+        # lock-contended window and risk the app's 10s recording.start timeout.
+        # This replaces the old daemon-path behavior (200 OK, then the worker
+        # emits permission_lost and crashes): the worker never spawns, so there
+        # is no EVENT_STARTED and no duplicate permission_lost for this attempt.
+        # Hard-block on a denied Screen Recording grant ONLY (the one permission
+        # fatal to capture); indeterminate defers to the engine preflight
+        # backstop, and Accessibility / Input Monitoring denials warn-and-proceed.
+        from screencap.daemon import permission_probe
+
+        grants = await _current_grants(request.app)
+        if grants.get(permission_probe.PERMISSION_SCREEN_RECORDING) == "denied":
+            missing = [
+                perm
+                for perm in permission_probe.PERMISSION_KEYS
+                if grants.get(perm) == "denied"
+            ]
+            raise errors.PermissionRequiredError(
+                missing,
+                schema_version=schema._RECORDING_START_API_VERSION,
+            )
+
         result = await request.app.state.supervisor.spawn(parsed)
         _audit("ok")
         return JSONResponse(

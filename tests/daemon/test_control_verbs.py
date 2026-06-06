@@ -121,6 +121,10 @@ def _daemon_env(tmp_path: Path, fake_engine_script: Path) -> dict[str, str]:
         "PYTHONPATH": str(Path(__file__).resolve().parents[2] / "src"),
         "HOME": str(tmp_path / "home"),
         "SCREENCAP_RECORDINGS_DIR": str(tmp_path),
+        # The U6 pre-spawn gate would otherwise 403 on a host whose interpreter
+        # lacks Screen Recording (CI). Force the probe granted for this real
+        # daemon subprocess (test seam; OS still enforces real TCC at capture).
+        "SCREENCAP_PERMISSION_PROBE_FAKE": "granted",
         "SCREENCAP_DAEMON_ENGINE_COMMAND": json.dumps(
             [sys.executable, str(fake_engine_script), "{encoded_args}"]
         ),

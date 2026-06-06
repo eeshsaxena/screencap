@@ -14,6 +14,10 @@ import pytest
 
 from screencap.daemon import permission_probe as pp
 
+# This module tests the probe itself — opt out of the conftest granted-by-default
+# stub so probe_permissions / run_probe_checks exercise their real logic.
+pytestmark = pytest.mark.real_permission_probe
+
 # --- probe_command(): argv shape + SCR-69 guard -----------------------------
 
 
@@ -97,6 +101,27 @@ def test_run_probe_checks_non_darwin_all_indeterminate(
     assert pp.run_probe_checks() == pp.indeterminate_result()
     # Fail-open invariant: never reports denied on a non-darwin host.
     assert "denied" not in pp.run_probe_checks().values()
+
+
+def test_run_probe_checks_fake_env_single_state(monkeypatch: pytest.MonkeyPatch) -> None:
+    # Test/CI seam: a single tri-state applies to all three.
+    monkeypatch.setenv("SCREENCAP_PERMISSION_PROBE_FAKE", "granted")
+    assert pp.run_probe_checks() == {
+        "screen_recording": "granted",
+        "accessibility": "granted",
+        "input_monitoring": "granted",
+    }
+
+
+def test_run_probe_checks_fake_env_per_permission(monkeypatch: pytest.MonkeyPatch) -> None:
+    monkeypatch.setenv(
+        "SCREENCAP_PERMISSION_PROBE_FAKE", "screen_recording=denied,accessibility=granted"
+    )
+    result = pp.run_probe_checks()
+    assert result["screen_recording"] == "denied"
+    assert result["accessibility"] == "granted"
+    # Unspecified perms fall back to indeterminate (never silently granted).
+    assert result["input_monitoring"] == "indeterminate"
 
 
 # --- probe_permissions(): the invoker (subprocess mocked) -------------------

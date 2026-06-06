@@ -170,6 +170,7 @@ async def test_session_snapshot_cli_claimed_lock_exposes_cas_identity(
     assert "worker_pid" not in payload
 
 
+@pytest.mark.real_permission_probe
 @pytest.mark.asyncio
 async def test_daemon_info_has_version_build_and_started_at() -> None:
     response = await _asgi_get("/v0/daemon.info")

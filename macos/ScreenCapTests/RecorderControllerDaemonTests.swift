@@ -173,6 +173,45 @@ final class RecorderControllerDaemonTests: XCTestCase {
         XCTAssertTrue(recorder.state.isRecording, "start should be in-flight, not blocked")
     }
 
+    func testDaemonStartPermissionRequiredRoutesToGrantFlowWithoutCLIFallback() async throws {
+        // Stale-client scenario (U6): daemon.info reports granted so the U4
+        // client-side start-block passes, but the daemon's fresh pre-spawn
+        // preflight rejects the start with a typed permission_required. The app
+        // must route into the grant flow, NOT fall back to the CLI path.
+        _ = try startServer { request in
+            switch request.path {
+            case "/v0/daemon.info":
+                return .json(#"{"ok":true,"schema_version":1,"daemon_version":"test","api_schema_version":1,"build":null,"started_at":1.0,"permissions":{"screen_recording":"granted","accessibility":"granted","input_monitoring":"granted"}}"#)
+            case "/v0/session.snapshot":
+                return .json(#"{"ok":true,"schema_version":1,"daemon_version":"test","api_schema_version":1,"is_recording":false,"daemon_owned":false,"recording_name":null,"started_at":null,"claimant":null,"recovering":false,"cursor":0}"#)
+            case "/v0/recording.start":
+                return .json(
+                    #"{"ok":false,"schema_version":1,"daemon_version":"test","api_schema_version":1,"error":"permission_required","missing":["screen_recording"]}"#,
+                    status: 403
+                )
+            default:
+                XCTFail("Unexpected request path \(request.path)")
+                return .json(#"{"ok":false,"schema_version":1,"daemon_version":"test","api_schema_version":1,"error":"unexpected"}"#, status: 500)
+            }
+        }
+
+        let permissions = PermissionController()
+        let alerts = FakeRecorderAlertPresenter(stopAndQuitReply: .terminateCancel)
+        let recorder = RecorderController(alertPresenter: alerts)
+        self.recorder = recorder
+        recorder.bindPermissions(permissions)
+        await recorder.probeDaemon()
+        XCTAssertEqual(recorder.transport, .daemon)
+
+        recorder.start(name: "demo")
+
+        await waitUntil { !recorder.state.isRecording && recorder.lastError != nil }
+        // Routed into the grant flow naming the missing permission; idle, not
+        // bounced into a CLI-fallback recording.
+        XCTAssertEqual(alerts.lastPermissionRequiredPresented, ["Screen Recording"])
+        XCTAssertFalse(recorder.state.isRecording)
+    }
+
     func testDaemonTransportReconnectsAfterDroppedEventStream() async throws {
         let eventConnectionCount = LockedInt()
         let startCount = LockedInt()
