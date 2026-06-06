@@ -150,6 +150,10 @@ final class PermissionController: ObservableObject {
     private var daemonGrantTimer: Timer?
     private var daemonGrantWorkspaceObserver: NSObjectProtocol?
     private var daemonGrantRefreshInFlight = false
+    // Bumped on stop so an in-flight refresh that completes after the watch was
+    // torn down (or restarted) cannot clear the in-flight guard belonging to a
+    // newer watch session.
+    private var daemonGrantRefreshGeneration = 0
     private static let daemonGrantRefreshInterval: TimeInterval = 5.0
 
     /// True while the daemon-grant refresh lifecycle is active (sheet visible).
@@ -297,13 +301,24 @@ final class PermissionController: ObservableObject {
             NSWorkspace.shared.notificationCenter.removeObserver(daemonGrantWorkspaceObserver)
             self.daemonGrantWorkspaceObserver = nil
         }
+        // Clear the in-flight guard on stop so a re-open always kicks a fresh
+        // immediate refresh. Bump the generation so a refresh still awaiting
+        // when we stopped doesn't clear a *newer* session's guard on completion
+        // (see runDaemonGrantRefresh).
+        daemonGrantRefreshInFlight = false
+        daemonGrantRefreshGeneration &+= 1
     }
 
     private func runDaemonGrantRefresh(_ refresh: @escaping @MainActor () async -> Void) {
         guard !daemonGrantRefreshInFlight else { return }
         daemonGrantRefreshInFlight = true
+        let generation = daemonGrantRefreshGeneration
         Task { @MainActor in
             await refresh()
+            // Only clear if no stop()/restart superseded this refresh; otherwise
+            // a stale completion would reopen the guard mid-flight for the new
+            // session.
+            guard generation == daemonGrantRefreshGeneration else { return }
             daemonGrantRefreshInFlight = false
         }
     }

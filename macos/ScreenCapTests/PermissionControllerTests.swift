@@ -232,6 +232,34 @@ final class PermissionControllerTests: XCTestCase {
         XCTAssertFalse(permissions.isDaemonGrantWatching)
     }
 
+    @MainActor
+    func testDaemonGrantWatchingReopenAfterStopMidRefreshStillKicks() async {
+        let (permissions, _) = makeController()
+
+        // First session: a slow refresh we deliberately leave in-flight.
+        let slow = RefreshCounter()
+        permissions.startDaemonGrantWatching {
+            try? await Task.sleep(nanoseconds: 300_000_000)
+            await slow.bump()
+        }
+        // Close the sheet while that refresh is still awaiting.
+        permissions.stopDaemonGrantWatching()
+
+        // Reopen immediately: the immediate on-open refresh MUST still fire even
+        // though the prior refresh hasn't completed (the in-flight guard must
+        // not be stuck true across the stop).
+        let reopened = RefreshCounter()
+        permissions.startDaemonGrantWatching { await reopened.bump() }
+        try? await Task.sleep(nanoseconds: 100_000_000)
+        let reopenedCount = await reopened.count
+        XCTAssertGreaterThanOrEqual(
+            reopenedCount, 1,
+            "re-open must kick a fresh refresh even after a stop during an in-flight refresh"
+        )
+
+        permissions.stopDaemonGrantWatching()
+    }
+
     func testGrantRowIconsAreThreeDistinctStates() {
         // Indeterminate must read as "couldn't verify" — never a granted check
         // or a denied needs-action. All three labels must be distinct.

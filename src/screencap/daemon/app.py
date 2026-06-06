@@ -11,6 +11,7 @@ from contextlib import asynccontextmanager
 from typing import Any, AsyncIterator
 
 from starlette.applications import Starlette
+from starlette.datastructures import State
 from starlette.requests import Request
 from starlette.responses import JSONResponse, StreamingResponse
 from starlette.routing import Route
@@ -33,18 +34,21 @@ async def lifespan(app: Starlette) -> AsyncIterator[None]:
         from screencap.daemon.supervisor import Supervisor
 
         app.state.supervisor = Supervisor(app.state.event_bus)
-    # Warm the TCC grant cache before serving so the very first daemon.info
-    # (e.g. the install-time readiness probe in launchagent._wait_for_daemon,
-    # which has a 0.5s budget) hits the warm path and never blocks on the
-    # ~0.3s fresh-subprocess probe. Fail-open: a probe error must not abort
-    # daemon startup.
-    try:
-        await _current_grants(app)
-    except Exception:  # noqa: BLE001 - never let cache warming break startup
-        logger.debug("grant cache warm-up failed", exc_info=True)
+    # Warm the TCC grant cache in the BACKGROUND so the daemon starts serving
+    # immediately. A fresh probe can take up to ~5s; awaiting it before `yield`
+    # would delay the daemon answering its first request — including the
+    # install-time readiness probe in launchagent._wait_for_daemon. A daemon.info
+    # that arrives before the warm completes falls back to its own cold probe
+    # (lock-coalesced via _current_grants), so correctness never depends on the
+    # warm finishing first; it only makes the common case fast. Fail-open inside
+    # _warm_grant_cache: a probe error must never break the daemon.
+    app.state._grant_warm_task = asyncio.create_task(_warm_grant_cache(app))
     try:
         yield
     finally:
+        warm_task = getattr(app.state, "_grant_warm_task", None)
+        if warm_task is not None and not warm_task.done():
+            warm_task.cancel()
         if hasattr(app.state, "supervisor"):
             await app.state.supervisor.shutdown()
         await app.state.event_bus.shutdown()
@@ -61,7 +65,7 @@ def _build_string() -> str | None:
 _GRANT_CACHE_TTL_SECONDS = 2.0
 
 
-def _grant_holder(app: Starlette):
+def _grant_holder(app: Starlette) -> State:
     """Lazily attach the grant cache + in-flight lock to ``app.state``.
 
     Scoped per app instance (not module-global) so tests that build fresh apps
@@ -77,26 +81,35 @@ def _grant_holder(app: Starlette):
     return state
 
 
+async def _warm_grant_cache(app: Starlette) -> None:
+    """Populate the grant cache once at startup (run as a background task)."""
+    try:
+        await _current_grants(app)
+    except Exception:  # noqa: BLE001 - never let cache warming break the daemon
+        logger.debug("grant cache warm-up failed", exc_info=True)
+
+
 async def _current_grants(app: Starlette) -> dict[str, str]:
     """Return the daemon's live TCC grant tri-state, served from a short cache.
 
     The fresh-subprocess probe (U1) runs off the event loop via
     ``asyncio.to_thread``. An ``asyncio.Lock`` plus a TTL re-check coalesces
     concurrent daemon.info calls into a single probe spawn (fork-bomb guard,
-    per macos-foundation-process-pipe-pitfalls.md). Fails open to
+    per macos-foundation-process-pipe-pitfalls.md). Freshness uses a monotonic
+    clock so a wall-clock step can't distort the TTL window. Fails open to
     indeterminate — never blocks or mislabels on a probe error (R9 / tri-state
     rule: indeterminate is never "missing").
     """
     from screencap.daemon import permission_probe
 
     state = _grant_holder(app)
-    now = time.time()
+    now = time.monotonic()
     if state._grant_cache is not None and (now - state._grant_cache_at) < _GRANT_CACHE_TTL_SECONDS:
         return state._grant_cache
 
     async with state._grant_lock:
         # A concurrent caller may have refreshed while we waited on the lock.
-        now = time.time()
+        now = time.monotonic()
         if (
             state._grant_cache is not None
             and (now - state._grant_cache_at) < _GRANT_CACHE_TTL_SECONDS
@@ -104,7 +117,7 @@ async def _current_grants(app: Starlette) -> dict[str, str]:
             return state._grant_cache
         grants = await asyncio.to_thread(permission_probe.probe_permissions)
         state._grant_cache = grants
-        state._grant_cache_at = time.time()
+        state._grant_cache_at = time.monotonic()
         return grants
 
 
@@ -340,9 +353,14 @@ async def recording_start(request: Request) -> JSONResponse:
         # This replaces the old daemon-path behavior (200 OK, then the worker
         # emits permission_lost and crashes): the worker never spawns, so there
         # is no EVENT_STARTED and no duplicate permission_lost for this attempt.
-        # Hard-block on a denied Screen Recording grant ONLY (the one permission
-        # fatal to capture); indeterminate defers to the engine preflight
-        # backstop, and Accessibility / Input Monitoring denials warn-and-proceed.
+        # The block is TRIGGERED by a denied Screen Recording grant ONLY (the one
+        # permission fatal to capture); indeterminate defers to the engine
+        # preflight backstop, and Accessibility / Input Monitoring denials
+        # warn-and-proceed (they never trigger the block). Once triggered, the
+        # reported `missing` list includes every denied required permission — not
+        # just Screen Recording — so the app can surface the full picture to the
+        # user (the client-side U4 block, which only knows to gate on Screen
+        # Recording, names just that one).
         from screencap.daemon import permission_probe
 
         grants = await _current_grants(request.app)

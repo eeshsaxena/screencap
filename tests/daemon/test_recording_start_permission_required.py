@@ -27,14 +27,14 @@ class _FakeSupervisor:
     def is_recovering(self) -> bool:
         return False
 
-    async def spawn(self, parsed) -> dict[str, Any]:
+    async def spawn(self, parsed: Any) -> dict[str, Any]:
         self.spawn_calls += 1
         return {"session_id": "s", "started_at": 1.0, "engine_pid": 123, "cursor": 0}
 
     async def shutdown(self) -> None:
         return None
 
-    def current_session(self):
+    def current_session(self) -> None:
         return None
 
 

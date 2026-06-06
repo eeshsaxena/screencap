@@ -31,7 +31,7 @@ import json
 import os
 import subprocess
 import sys
-from typing import Literal
+from typing import Literal, cast
 
 GrantState = Literal["granted", "denied", "indeterminate"]
 
@@ -114,8 +114,8 @@ def _parse_probe_output(stdout: str) -> dict[str, GrantState]:
     permission decode to ``indeterminate``.
     """
     raw: dict | None = None
-    for line in reversed(stdout.splitlines()):
-        line = line.strip()
+    for raw_line in reversed(stdout.splitlines()):
+        line = raw_line.strip()
         if not line:
             continue
         try:
@@ -139,12 +139,13 @@ def _parse_fake_grants(value: str) -> dict[str, GrantState]:
     """Parse the ``SCREENCAP_PERMISSION_PROBE_FAKE`` test seam (see above)."""
     value = value.strip()
     if value in _VALID_STATES:
-        return {key: value for key in PERMISSION_KEYS}  # type: ignore[misc]
+        return {key: cast(GrantState, value) for key in PERMISSION_KEYS}
     out = indeterminate_result()
     for part in value.split(","):
         key, sep, state = part.partition("=")
-        if sep and key.strip() in PERMISSION_KEYS and state.strip() in _VALID_STATES:
-            out[key.strip()] = state.strip()  # type: ignore[assignment]
+        key, state = key.strip(), state.strip()
+        if sep and key in PERMISSION_KEYS and state in _VALID_STATES:
+            out[key] = cast(GrantState, state)
     return out
 
 
