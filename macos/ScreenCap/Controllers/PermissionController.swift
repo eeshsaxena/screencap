@@ -6,6 +6,9 @@ import CoreGraphics
 import Foundation
 import IOKit
 import IOKit.hid
+import os
+
+private let permissionLogger = Logger(subsystem: "com.screencap.macos", category: "permission")
 
 /// macOS Privacy & Security panes targeted by the deep-link helpers.
 /// macOS 13+ uses the `.extension` URL form; older forms hit a generic page on macOS 26.
@@ -72,6 +75,20 @@ enum PrivacyPane: String, CaseIterable {
         default: return .screenRecording
         }
     }
+
+    /// The canonical permission string the daemon's `permission.request` verb
+    /// (and `daemon.info` grant block) use — the inverse of
+    /// `from(permissionString:)`. Microphone is not a daemon-registered
+    /// permission and has no canonical string; it returns `nil` so the daemon
+    /// registration path never fires for it.
+    var permissionString: String? {
+        switch self {
+        case .screenRecording: return "screen_recording"
+        case .accessibility:   return "accessibility"
+        case .inputMonitoring: return "input_monitoring"
+        case .microphone:      return nil
+        }
+    }
 }
 
 #if DEBUG
@@ -111,11 +128,45 @@ final class PermissionController: ObservableObject {
     @Published private(set) var accessibility: PermissionStatus = .notDetermined
     @Published private(set) var inputMonitoring: PermissionStatus = .notDetermined
     @Published private(set) var microphone: PermissionStatus = .notDetermined
+    /// The *daemon's* live TCC grant state (the TCC subject), as reported over
+    /// `daemon.info` (U2/U3). Kept distinct from the four app-process statuses
+    /// above because they answer a different question — app identity vs. daemon
+    /// identity. Onboarding (U4/U5) and the daemon start-block gate on this, not
+    /// on the app-process state. Written only by `RecorderController.probeDaemon`
+    /// (the single wire reader); defaults to all-indeterminate until the first
+    /// probe lands or when the daemon is unreachable.
+    @Published private(set) var daemonGrants: DaemonPermissionGrants = .allIndeterminate
     /// True between the moment `relaunchApplication()` is invoked and the
     /// process actually exits. Surfaced to the UI so the Quit & Relaunch
     /// button can be disabled, preventing a double-click from stacking
     /// multiple new instances.
     @Published private(set) var isRelaunching: Bool = false
+    /// Persisted "permission setup dismissed" flag (U4). Once the user taps
+    /// "Skip for now" with a grant still missing, the state-driven walkthrough
+    /// gate stops re-popping on every launch. The **start-block is independent**
+    /// of this flag (R4) — a dismissed sheet never lets a broken recording
+    /// start silently. Auto-cleared when all required daemon grants land (see
+    /// `updateDaemonGrants`) so a later loss (recovery / F2) re-arms the sheet.
+    @Published private(set) var setupDismissed: Bool
+    /// Panes with an outstanding daemon registration round-trip (U8). While a
+    /// pane is in this set the Grant button shows a disabled/spinner state and
+    /// a repeat tap is a no-op — one in-flight registration per pane. Published
+    /// so the walkthrough view reacts without owning the guard itself.
+    @Published private(set) var daemonRegistrationInFlight: Set<PrivacyPane> = []
+
+    private let defaults: UserDefaults
+    private static let setupDismissedDefaultsKey = "com.screencap.macos.permissionSetupDismissed"
+
+    /// Issues the daemon `permission.request` round-trip for a canonical
+    /// permission string. Injected (nil → the live `DaemonClient` call) so tests
+    /// exercise the Grant flow (ordering, the per-pane in-flight guard) without a
+    /// `UnixHTTPTestServer`.
+    typealias DaemonPermissionRegistrar = @MainActor (String) async throws -> Void
+    private let injectedDaemonRegistrar: DaemonPermissionRegistrar?
+    /// Opens the System Settings pane after the daemon ack. Injected (nil → the
+    /// real `openSystemSettings`) so tests assert ack-before-open ordering
+    /// without launching System Settings.
+    private let injectedDaemonSettingsOpener: (@MainActor (PrivacyPane) -> Void)?
 
     nonisolated private static let relaunchMaxPollCount = 100
     nonisolated private static let relaunchPollIntervalSeconds = 0.1
@@ -126,6 +177,20 @@ final class PermissionController: ObservableObject {
     private var pollTimer: Timer?
     private var workspaceObserver: NSObjectProtocol?
     private var relaunchWatchdog: Task<Void, Never>?
+    // U5: separate, slower (~5s) daemon-grant refresh lifecycle. Distinct from
+    // the 1Hz app-process `startWatching` poll because each daemon refresh costs
+    // a daemon-side subprocess probe (macos-foundation-process-pipe-pitfalls.md).
+    private var daemonGrantTimer: Timer?
+    private var daemonGrantWorkspaceObserver: NSObjectProtocol?
+    private var daemonGrantRefreshInFlight = false
+    // Bumped on stop so an in-flight refresh that completes after the watch was
+    // torn down (or restarted) cannot clear the in-flight guard belonging to a
+    // newer watch session.
+    private var daemonGrantRefreshGeneration = 0
+    private static let daemonGrantRefreshInterval: TimeInterval = 5.0
+
+    /// True while the daemon-grant refresh lifecycle is active (sheet visible).
+    var isDaemonGrantWatching: Bool { daemonGrantTimer != nil }
 
     var allRequiredGranted: Bool {
         screenRecording == .granted
@@ -139,7 +204,66 @@ final class PermissionController: ObservableObject {
             || inputMonitoring == .denied
     }
 
-    init() {}
+    /// All three required *daemon* grants are confirmed granted (microphone
+    /// excluded). Drives the walkthrough's "all done" / auto-close path (U5).
+    var allRequiredDaemonGrantsGranted: Bool {
+        daemonGrants.allRequiredGranted
+    }
+
+    /// Replace the daemon grant snapshot. Called by `RecorderController` after a
+    /// `daemon.info` probe (the daemon's grants) or with `.allIndeterminate`
+    /// when the daemon is unreachable — indeterminate never blocks or nags.
+    func updateDaemonGrants(_ grants: DaemonPermissionGrants) {
+        daemonGrants = grants
+        // Re-arm the walkthrough once everything is granted, so a later loss
+        // (recovery / F2, including a reinstall that re-grants then re-orphans)
+        // surfaces the sheet again instead of staying suppressed by a stale
+        // "Skip for now".
+        if grants.allRequiredGranted {
+            clearSetupDismissed()
+        }
+    }
+
+    /// Persist that the user dismissed the permission walkthrough ("Skip for
+    /// now"). Suppresses the launch gate; does NOT affect the start-block.
+    func markSetupDismissed() {
+        guard !setupDismissed else { return }
+        setupDismissed = true
+        defaults.set(true, forKey: Self.setupDismissedDefaultsKey)
+    }
+
+    private func clearSetupDismissed() {
+        guard setupDismissed else { return }
+        setupDismissed = false
+        defaults.set(false, forKey: Self.setupDismissedDefaultsKey)
+    }
+
+    /// The daemon's grant state for a given Privacy pane. Microphone is not a
+    /// daemon-tracked permission, so it reports `.indeterminate` (never shown in
+    /// the required daemon rows).
+    func daemonGrant(for pane: PrivacyPane) -> DaemonGrantState {
+        switch pane {
+        case .screenRecording: return daemonGrants.screenRecording
+        case .accessibility:   return daemonGrants.accessibility
+        case .inputMonitoring: return daemonGrants.inputMonitoring
+        case .microphone:      return .indeterminate
+        }
+    }
+
+    /// `defaults` is injectable so tests exercise the dismissal flag against an
+    /// isolated suite instead of polluting `UserDefaults.standard`. The daemon
+    /// registrar / settings-opener seams default to the live implementations and
+    /// are overridden in tests.
+    init(
+        defaults: UserDefaults = .standard,
+        daemonRegistrar: DaemonPermissionRegistrar? = nil,
+        daemonSettingsOpener: (@MainActor (PrivacyPane) -> Void)? = nil
+    ) {
+        self.defaults = defaults
+        self.setupDismissed = defaults.bool(forKey: Self.setupDismissedDefaultsKey)
+        self.injectedDaemonRegistrar = daemonRegistrar
+        self.injectedDaemonSettingsOpener = daemonSettingsOpener
+    }
 
     nonisolated deinit {
         // The class is @MainActor but deinit runs on whichever thread drops
@@ -150,9 +274,13 @@ final class PermissionController: ObservableObject {
         // thread calls in practice, but the compiler is strict for a reason.)
         MainActor.assumeIsolated {
             pollTimer?.invalidate()
+            daemonGrantTimer?.invalidate()
             relaunchWatchdog?.cancel()
             if let workspaceObserver {
                 NSWorkspace.shared.notificationCenter.removeObserver(workspaceObserver)
+            }
+            if let daemonGrantWorkspaceObserver {
+                NSWorkspace.shared.notificationCenter.removeObserver(daemonGrantWorkspaceObserver)
             }
         }
     }
@@ -180,6 +308,59 @@ final class PermissionController: ObservableObject {
         if let workspaceObserver {
             NSWorkspace.shared.notificationCenter.removeObserver(workspaceObserver)
             self.workspaceObserver = nil
+        }
+    }
+
+    /// Begin refreshing the *daemon* grant snapshot while the walkthrough sheet
+    /// is visible (U5): on app re-activation and on a slow ~5s timer. `refresh`
+    /// performs the actual `daemon.info` round-trip (owned by RecorderController);
+    /// an in-flight guard collapses overlapping ticks so a re-activation landing
+    /// on a timer tick can't double-spawn the daemon probe. An immediate refresh
+    /// runs so the rows reflect current state the moment the sheet opens.
+    func startDaemonGrantWatching(refresh: @escaping @MainActor () async -> Void) {
+        stopDaemonGrantWatching()
+        let timer = Timer.scheduledTimer(
+            withTimeInterval: Self.daemonGrantRefreshInterval, repeats: true
+        ) { [weak self] _ in
+            Task { @MainActor in self?.runDaemonGrantRefresh(refresh) }
+        }
+        daemonGrantTimer = timer
+        daemonGrantWorkspaceObserver = NSWorkspace.shared.notificationCenter.addObserver(
+            forName: NSWorkspace.didActivateApplicationNotification,
+            object: nil,
+            queue: .main
+        ) { [weak self] _ in
+            Task { @MainActor in self?.runDaemonGrantRefresh(refresh) }
+        }
+        runDaemonGrantRefresh(refresh)
+    }
+
+    func stopDaemonGrantWatching() {
+        daemonGrantTimer?.invalidate()
+        daemonGrantTimer = nil
+        if let daemonGrantWorkspaceObserver {
+            NSWorkspace.shared.notificationCenter.removeObserver(daemonGrantWorkspaceObserver)
+            self.daemonGrantWorkspaceObserver = nil
+        }
+        // Clear the in-flight guard on stop so a re-open always kicks a fresh
+        // immediate refresh. Bump the generation so a refresh still awaiting
+        // when we stopped doesn't clear a *newer* session's guard on completion
+        // (see runDaemonGrantRefresh).
+        daemonGrantRefreshInFlight = false
+        daemonGrantRefreshGeneration += 1
+    }
+
+    private func runDaemonGrantRefresh(_ refresh: @escaping @MainActor () async -> Void) {
+        guard !daemonGrantRefreshInFlight else { return }
+        daemonGrantRefreshInFlight = true
+        let generation = daemonGrantRefreshGeneration
+        Task { @MainActor in
+            await refresh()
+            // Only clear if no stop()/restart superseded this refresh; otherwise
+            // a stale completion would reopen the guard mid-flight for the new
+            // session.
+            guard generation == daemonGrantRefreshGeneration else { return }
+            daemonGrantRefreshInFlight = false
         }
     }
 
@@ -271,7 +452,14 @@ final class PermissionController: ObservableObject {
     /// pane should open immediately either way.
     func requestAndOpenSettings(for pane: PrivacyPane, subject: PermissionSubject = .screenCapApp) {
         guard subject == .screenCapApp else {
-            openSystemSettings(for: pane)
+            // Daemon subject (U8): the daemon must perform the registration in
+            // *its own* process so the Settings entry is attributed to the
+            // daemon's TCC identity, not the app's (R5; U7 responsible-process
+            // caveat). Kick the async round-trip — the published in-flight set
+            // drives the Grant button, and the pane opens only after the daemon
+            // acks. Replaces the old no-op (which just opened the pane with no
+            // helper row, the AE2 failure mode).
+            Task { await requestDaemonPermission(for: pane) }
             return
         }
 
@@ -293,6 +481,71 @@ final class PermissionController: ObservableObject {
             }
         }
         openSystemSettings(for: pane)
+    }
+
+    /// True while a daemon registration round-trip for `pane` is outstanding
+    /// (U8). The Grant button reads this to show a disabled/spinner state.
+    func isDaemonRegistering(_ pane: PrivacyPane) -> Bool {
+        daemonRegistrationInFlight.contains(pane)
+    }
+
+    /// Drive the daemon-side registration for `pane` (U8): ask the daemon to
+    /// register itself for the permission in its own process, await the ack,
+    /// then open the matching Settings pane. Ordering matters — the pane opens
+    /// only *after* the daemon has registered, so the user doesn't land on a
+    /// pane with no helper row (AE2). A per-pane in-flight guard collapses
+    /// repeat taps to a single round-trip. The pane is opened even when the
+    /// daemon call fails: registration is best-effort, and the user must always
+    /// be able to reach Settings to enable the helper manually.
+    func requestDaemonPermission(for pane: PrivacyPane) async {
+        guard let permission = pane.permissionString else {
+            // Not a daemon-registered permission (microphone) — just open.
+            resolvedDaemonSettingsOpener()(pane)
+            return
+        }
+        guard !daemonRegistrationInFlight.contains(pane) else { return }
+        daemonRegistrationInFlight.insert(pane)
+        defer { daemonRegistrationInFlight.remove(pane) }
+
+        // Capture whether this request originated from the visible walkthrough.
+        // The daemon-grant watch is started in the sheet's onAppear and stopped
+        // in onDisappear, so it is the walkthrough's visibility signal — and the
+        // walkthrough is this path's only caller today.
+        let gatedOnWalkthrough = isDaemonGrantWatching
+
+        do {
+            try await resolvedDaemonRegistrar()(permission)
+        } catch {
+            permissionLogger.info(
+                "Daemon permission registration for \(permission, privacy: .public) failed: \(String(describing: error), privacy: .public)"
+            )
+        }
+
+        // The registrar round-trip can take up to the client timeout (~10s). If
+        // the user dismissed the walkthrough while it was in flight, opening
+        // System Settings now would pop a pane out of nowhere long after they
+        // moved on. Suppress the open when a walkthrough-originated request finds
+        // the walkthrough already gone. A non-walkthrough caller (not watching at
+        // start) always opens, preserving prior behavior.
+        if gatedOnWalkthrough, !isDaemonGrantWatching {
+            permissionLogger.info(
+                "Walkthrough dismissed during daemon registration for \(permission, privacy: .public); skipping Settings open"
+            )
+            return
+        }
+        resolvedDaemonSettingsOpener()(pane)
+    }
+
+    private func resolvedDaemonRegistrar() -> DaemonPermissionRegistrar {
+        injectedDaemonRegistrar ?? { permission in
+            _ = try await DaemonClient.permissionRequest(permission)
+        }
+    }
+
+    private func resolvedDaemonSettingsOpener() -> @MainActor (PrivacyPane) -> Void {
+        injectedDaemonSettingsOpener ?? { [weak self] pane in
+            self?.openSystemSettings(for: pane)
+        }
     }
 
     /// Opens System Settings to the requested pane. Tries the macOS 13+ .extension

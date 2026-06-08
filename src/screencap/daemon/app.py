@@ -8,9 +8,10 @@ import logging
 import os
 import time
 from contextlib import asynccontextmanager
-from typing import Any, AsyncIterator
+from typing import TYPE_CHECKING, Any, AsyncIterator
 
 from starlette.applications import Starlette
+from starlette.datastructures import State
 from starlette.requests import Request
 from starlette.responses import JSONResponse, StreamingResponse
 from starlette.routing import Route
@@ -19,6 +20,9 @@ from screencap import _stderr_events
 from screencap.daemon import errors, schema
 from screencap.daemon.event_bus import CursorOutOfRangeError, EventBus
 from screencap.pidfile import CLAIMANT_DAEMON
+
+if TYPE_CHECKING:
+    from screencap.daemon.permission_probe import GrantState
 
 logger = logging.getLogger(__name__)
 
@@ -33,9 +37,21 @@ async def lifespan(app: Starlette) -> AsyncIterator[None]:
         from screencap.daemon.supervisor import Supervisor
 
         app.state.supervisor = Supervisor(app.state.event_bus)
+    # Warm the TCC grant cache in the BACKGROUND so the daemon starts serving
+    # immediately. A fresh probe can take up to ~5s; awaiting it before `yield`
+    # would delay the daemon answering its first request — including the
+    # install-time readiness probe in launchagent._wait_for_daemon. A daemon.info
+    # that arrives before the warm completes falls back to its own cold probe
+    # (lock-coalesced via _current_grants), so correctness never depends on the
+    # warm finishing first; it only makes the common case fast. Fail-open inside
+    # _warm_grant_cache: a probe error must never break the daemon.
+    app.state._grant_warm_task = asyncio.create_task(_warm_grant_cache(app))
     try:
         yield
     finally:
+        warm_task = getattr(app.state, "_grant_warm_task", None)
+        if warm_task is not None and not warm_task.done():
+            warm_task.cancel()
         if hasattr(app.state, "supervisor"):
             await app.state.supervisor.shutdown()
         await app.state.event_bus.shutdown()
@@ -45,12 +61,86 @@ def _build_string() -> str | None:
     return os.environ.get("SCREENCAP_BUILD")
 
 
-async def daemon_info(_request: Request) -> JSONResponse:
+# How long a probed grant snapshot is served before the next daemon.info call
+# triggers a fresh subprocess probe. Short enough that a post-grant toggle
+# surfaces within the app's ~5s refresh cadence, long enough that an activation
+# refresh + sheet timer firing together collapse to a single spawn.
+_GRANT_CACHE_TTL_SECONDS = 2.0
+
+
+def _grant_holder(app: Starlette) -> State:
+    """Lazily attach the grant cache + in-flight lock to ``app.state``.
+
+    Scoped per app instance (not module-global) so tests that build fresh apps
+    don't leak cached grants into each other. Lazy init is safe under asyncio:
+    the attribute checks and assignments below never await, so two concurrent
+    requests can't interleave between the ``hasattr`` and the assignment.
+    """
+    state = app.state
+    if not hasattr(state, "_grant_lock"):
+        state._grant_lock = asyncio.Lock()
+        state._grant_cache: dict[str, GrantState] | None = None
+        state._grant_cache_at = 0.0
+    return state
+
+
+async def _warm_grant_cache(app: Starlette) -> None:
+    """Populate the grant cache once at startup (run as a background task)."""
+    try:
+        await _current_grants(app)
+    except Exception:  # noqa: BLE001 - never let cache warming break the daemon
+        logger.debug("grant cache warm-up failed", exc_info=True)
+
+
+async def _current_grants(app: Starlette) -> dict[str, GrantState]:
+    """Return the daemon's live TCC grant tri-state, served from a short cache.
+
+    The fresh-subprocess probe (U1) runs off the event loop via
+    ``asyncio.to_thread``. An ``asyncio.Lock`` plus a TTL re-check coalesces
+    concurrent daemon.info calls into a single probe spawn (fork-bomb guard,
+    per macos-foundation-process-pipe-pitfalls.md). Freshness uses a monotonic
+    clock so a wall-clock step can't distort the TTL window. Fails open to
+    indeterminate — never blocks or mislabels on a probe error (R9 / tri-state
+    rule: indeterminate is never "missing").
+    """
+    from screencap.daemon import permission_probe
+
+    state = _grant_holder(app)
+    now = time.monotonic()
+    if state._grant_cache is not None and (now - state._grant_cache_at) < _GRANT_CACHE_TTL_SECONDS:
+        return state._grant_cache
+
+    async with state._grant_lock:
+        # A concurrent caller may have refreshed while we waited on the lock.
+        now = time.monotonic()
+        if (
+            state._grant_cache is not None
+            and (now - state._grant_cache_at) < _GRANT_CACHE_TTL_SECONDS
+        ):
+            return state._grant_cache
+        grants = await asyncio.to_thread(permission_probe.probe_permissions)
+        state._grant_cache = grants
+        state._grant_cache_at = time.monotonic()
+        return grants
+
+
+async def daemon_info(request: Request) -> JSONResponse:
+    from screencap.daemon import permission_probe
+
+    # Mirror every other read-only verb's defensive try/except: a raise on the
+    # grants probe path must never turn the readiness probe into a 500 (which
+    # drops the app to its CLI fallback). Fail open to all-indeterminate.
+    try:
+        grants = await _current_grants(request.app)
+    except Exception:  # noqa: BLE001 - readiness probe must never 500
+        logger.debug("daemon.info grant probe failed", exc_info=True)
+        grants = permission_probe.indeterminate_result()
     return JSONResponse(
         schema.envelope(
             schema_version=schema._DAEMON_INFO_API_VERSION,
             build=_build_string(),
             started_at=_STARTED_AT,
+            permissions=grants,
         )
     )
 
@@ -268,6 +358,35 @@ async def recording_start(request: Request) -> JSONResponse:
             )
         parsed = parsed.model_copy(update={"started_by": peer.classification})
 
+        # Pre-spawn permission gate (U6). Reuse U2's cached grant snapshot (no
+        # second fresh spawn) and block BEFORE supervisor.spawn claims the
+        # pidfile lock — a fresh spawn inside the lock would widen the
+        # lock-contended window and risk the app's 10s recording.start timeout.
+        # This replaces the old daemon-path behavior (200 OK, then the worker
+        # emits permission_lost and crashes): the worker never spawns, so there
+        # is no EVENT_STARTED and no duplicate permission_lost for this attempt.
+        # The block is TRIGGERED by a denied Screen Recording grant ONLY (the one
+        # permission fatal to capture); indeterminate defers to the engine
+        # preflight backstop, and Accessibility / Input Monitoring denials
+        # warn-and-proceed (they never trigger the block). Once triggered, the
+        # reported `missing` list includes every denied required permission — not
+        # just Screen Recording — so the app can surface the full picture to the
+        # user (the client-side U4 block, which only knows to gate on Screen
+        # Recording, names just that one).
+        from screencap.daemon import permission_probe
+
+        grants = await _current_grants(request.app)
+        if grants.get(permission_probe.PERMISSION_SCREEN_RECORDING) == "denied":
+            missing = [
+                perm
+                for perm in permission_probe.PERMISSION_KEYS
+                if grants.get(perm) == "denied"
+            ]
+            raise errors.PermissionRequiredError(
+                missing,
+                schema_version=schema._RECORDING_START_API_VERSION,
+            )
+
         result = await request.app.state.supervisor.spawn(parsed)
         _audit("ok")
         return JSONResponse(
@@ -324,6 +443,105 @@ async def recording_stop(request: Request) -> JSONResponse:
         return _internal_error_response(
             exc,
             schema_version=schema._RECORDING_STOP_API_VERSION,
+            request=request,
+        )
+
+
+async def permission_request(request: Request) -> JSONResponse:
+    """On-demand daemon-driven TCC registration (U8).
+
+    Runs the registration mechanism for the requested permission *in the
+    daemon's own process* (off the event loop via ``asyncio.to_thread``) so the
+    Settings entry is attributed to the daemon's TCC identity, not the app's
+    (R5; U7 responsible-process caveat). The app calls this, awaits the ack,
+    then opens the matching Settings pane.
+
+    A mutating verb on the same trust boundary as ``recording.start`` /
+    ``recording.stop`` (``SECURITY.md``): the peer descriptor is derived for the
+    audit line, and every exit path (ok, typed error, unhandled) is audited.
+    The ``permission`` is validated against the canonical allowlist up front so
+    an unexpected value returns a typed ``invalid_permission`` 4xx and never
+    reaches the registration dispatch.
+    """
+    from screencap.daemon import (
+        audit_log,
+        permission_probe,
+        permission_register,
+        provenance,
+    )
+
+    peer = provenance.derive_peer_descriptor_from_asgi_scope(request.scope)
+    requested_permission: str | None = None
+
+    def _audit(outcome: str) -> None:
+        audit_log.record_verb(
+            "permission.request",
+            peer_pid=peer.pid,
+            peer_path=peer.path,
+            classification=peer.classification,
+            outcome=outcome,
+            permission=requested_permission,
+        )
+
+    try:
+        parsed = schema.PermissionRequestRequest.model_validate(await request.json())
+        requested_permission = parsed.permission
+        if parsed.permission not in permission_probe.PERMISSION_KEYS:
+            raise errors.InvalidPermissionError(
+                "permission must be one of screen_recording, accessibility, input_monitoring",
+                schema_version=schema._PERMISSION_REQUEST_API_VERSION,
+            )
+
+        # Bound the *HTTP response* on the TCC registration. The underlying
+        # `register_permission` (which can block on `CGEventTapCreate` /
+        # `CGRequestScreenCaptureAccess` TCC syscalls) keeps running to
+        # completion in the thread pool — `wait_for` only abandons the await,
+        # it cannot cancel the off-loop work — but the client gets a prompt,
+        # bounded ack instead of an indefinitely hung request. On timeout we
+        # report `already_granted=False`; the app re-probes for the
+        # authoritative post-grant state regardless.
+        try:
+            already_granted = await asyncio.wait_for(
+                asyncio.to_thread(
+                    permission_register.register_permission, parsed.permission
+                ),
+                timeout=8.0,
+            )
+        except asyncio.TimeoutError:
+            _audit("ok")
+            return JSONResponse(
+                schema.envelope(
+                    schema_version=schema._PERMISSION_REQUEST_API_VERSION,
+                    permission=parsed.permission,
+                    already_granted=False,
+                )
+            )
+
+        # A successful registration may have produced a fresh grant; invalidate
+        # the short grant cache under the grant lock so the next daemon.info /
+        # pre-spawn start gate re-probes instead of serving the pre-grant
+        # snapshot for the remainder of its TTL.
+        grant_state = _grant_holder(request.app)
+        async with grant_state._grant_lock:
+            grant_state._grant_cache = None
+            grant_state._grant_cache_at = 0.0
+
+        _audit("ok")
+        return JSONResponse(
+            schema.envelope(
+                schema_version=schema._PERMISSION_REQUEST_API_VERSION,
+                permission=parsed.permission,
+                already_granted=already_granted,
+            )
+        )
+    except errors.DaemonAPIError as exc:
+        _audit(exc.error_code)
+        return _api_error_response(exc)
+    except Exception as exc:
+        _audit(errors.ERROR_CODE_INTERNAL)
+        return _internal_error_response(
+            exc,
+            schema_version=schema._PERMISSION_REQUEST_API_VERSION,
             request=request,
         )
 
@@ -445,6 +663,7 @@ def build_app() -> Starlette:
             Route("/v0/events", events_stream, methods=["GET"]),
             Route("/v0/recording.start", recording_start, methods=["POST"]),
             Route("/v0/recording.stop", recording_stop, methods=["POST"]),
+            Route("/v0/permission.request", permission_request, methods=["POST"]),
         ],
         lifespan=lifespan,
     )

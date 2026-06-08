@@ -61,6 +61,92 @@ enum DaemonClientError: LocalizedError {
     }
 }
 
+/// Tri-state daemon TCC grant, mirrored from the Python probe
+/// (`screencap.daemon.permission_probe`). Decoding is deliberately tolerant:
+/// any unknown or missing token maps to `.indeterminate` — never `.denied` — so
+/// a grant block we can't interpret (an older daemon, a future token) never
+/// blocks recording or nags the user. Mirrors the engine's fail-open-on-None
+/// revocation rule (review-data-nullable-timing learning).
+enum DaemonGrantState: String, Sendable, Equatable {
+    case granted
+    case denied
+    case indeterminate
+
+    init(wire: String?) {
+        switch wire {
+        case "granted": self = .granted
+        case "denied": self = .denied
+        default: self = .indeterminate
+        }
+    }
+}
+
+/// The additive `permissions` block on `daemon.info` (U2). Reports the daemon's
+/// *live* TCC grant state for the three required permissions. This answers a
+/// different question than `PermissionController`'s app-process statuses — it is
+/// the daemon's (TCC subject's) state, not the app's.
+struct DaemonPermissionGrants: Decodable, Equatable, Sendable {
+    let screenRecording: DaemonGrantState
+    let accessibility: DaemonGrantState
+    let inputMonitoring: DaemonGrantState
+
+    enum CodingKeys: String, CodingKey {
+        case screenRecording = "screen_recording"
+        case accessibility = "accessibility"
+        case inputMonitoring = "input_monitoring"
+    }
+
+    init(
+        screenRecording: DaemonGrantState,
+        accessibility: DaemonGrantState,
+        inputMonitoring: DaemonGrantState
+    ) {
+        self.screenRecording = screenRecording
+        self.accessibility = accessibility
+        self.inputMonitoring = inputMonitoring
+    }
+
+    init(from decoder: Decoder) throws {
+        let c = try decoder.container(keyedBy: CodingKeys.self)
+        screenRecording = DaemonGrantState(wire: try c.decodeIfPresent(String.self, forKey: .screenRecording))
+        accessibility = DaemonGrantState(wire: try c.decodeIfPresent(String.self, forKey: .accessibility))
+        inputMonitoring = DaemonGrantState(wire: try c.decodeIfPresent(String.self, forKey: .inputMonitoring))
+    }
+
+    /// Used when the daemon omits the block entirely (older daemon) or the
+    /// payload can't be read. Indeterminate never blocks or nags.
+    static let allIndeterminate = DaemonPermissionGrants(
+        screenRecording: .indeterminate,
+        accessibility: .indeterminate,
+        inputMonitoring: .indeterminate
+    )
+
+    /// All three required daemon grants are confirmed granted (microphone is
+    /// not a daemon-required permission and is excluded). Indeterminate is NOT
+    /// granted — this is the positive "everything's good" predicate that drives
+    /// auto-close of the walkthrough.
+    var allRequiredGranted: Bool {
+        screenRecording == .granted
+            && accessibility == .granted
+            && inputMonitoring == .granted
+    }
+
+    /// Screen Recording specifically reports denied — the one permission fatal
+    /// to capture, so the recording-start block keys on it (U4/U6 decision:
+    /// hard-block start on Screen Recording only; advisory for the other two).
+    var screenRecordingDenied: Bool {
+        screenRecording == .denied
+    }
+
+    /// Any required grant reports denied — drives whether the walkthrough is
+    /// surfaced (R3).
+    var anyRequiredDenied: Bool {
+        screenRecording == .denied
+            || accessibility == .denied
+            || inputMonitoring == .denied
+    }
+}
+
 struct DaemonInfoResponse: Decodable {
     let ok: Bool
     let schemaVersion: Int
@@ -68,6 +154,9 @@ struct DaemonInfoResponse: Decodable {
     let apiSchemaVersion: Int
     let build: String?
     let startedAt: Double
+    /// Additive (U2). Absent on older daemons; callers map nil to
+    /// `.allIndeterminate`.
+    let permissions: DaemonPermissionGrants?
 
     enum CodingKeys: String, CodingKey {
         case ok
@@ -76,6 +165,7 @@ struct DaemonInfoResponse: Decodable {
         case apiSchemaVersion = "api_schema_version"
         case build
         case startedAt = "started_at"
+        case permissions
     }
 }
 
@@ -194,6 +284,40 @@ struct RecordingStopResponse: Decodable {
         case apiSchemaVersion = "api_schema_version"
         case stopped
         case finalState = "final_state"
+    }
+}
+
+/// Body for the on-demand daemon-driven registration verb (U8). `permission`
+/// is one of the canonical strings (`screen_recording` / `accessibility` /
+/// `input_monitoring`); the daemon validates it against the allowlist and
+/// returns a typed `invalid_permission` error for anything else.
+struct PermissionRequestRequest: Encodable {
+    let permission: String
+
+    init(permission: String) {
+        self.permission = permission
+    }
+}
+
+struct PermissionRequestResponse: Decodable {
+    let ok: Bool
+    let schemaVersion: Int
+    let daemonVersion: String
+    let apiSchemaVersion: Int
+    let permission: String
+    /// The daemon's request-API immediate grant bool. Advisory only — the
+    /// daemon's in-process TCC state can be stale, so the app re-probes
+    /// `daemon.info` for authoritative post-grant state rather than gating on
+    /// this. Decoded for completeness/diagnostics.
+    let alreadyGranted: Bool
+
+    enum CodingKeys: String, CodingKey {
+        case ok
+        case schemaVersion = "schema_version"
+        case daemonVersion = "daemon_version"
+        case apiSchemaVersion = "api_schema_version"
+        case permission
+        case alreadyGranted = "already_granted"
     }
 }
 
@@ -356,6 +480,27 @@ enum DaemonClient {
             path: "/v0/recording.stop",
             body: body,
             timeout: 35
+        )
+    }
+
+    /// On-demand daemon-driven TCC registration (U8). The daemon runs the
+    /// matching request mechanism in *its own* process so the Settings entry is
+    /// attributed to the daemon identity, not the app. The app awaits this ack
+    /// before opening the matching pane (so the user never lands on a pane with
+    /// no helper row — the AE2 failure mode).
+    static func permissionRequest(_ permission: String) async throws -> PermissionRequestResponse {
+        let body = try JSONEncoder().encode(PermissionRequestRequest(permission: permission))
+        // Daemon-side registration runs the TCC request mechanism in its own
+        // process (`CGEventTapCreate` / `CGRequestScreenCaptureAccess`), which
+        // can block on TCC syscalls. Pass the timeout explicitly — matching
+        // `recordingStart`'s 10 s budget — rather than relying on the implicit
+        // default, so the budget for this blocking call is visible at the call
+        // site. (The daemon also bounds its own response at 8 s.)
+        return try await request(
+            method: "POST",
+            path: "/v0/permission.request",
+            body: body,
+            timeout: 10
         )
     }
 

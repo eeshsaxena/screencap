@@ -8,10 +8,13 @@ This module provides macOS-specific functionality for:
 
 from __future__ import annotations
 
+import logging
 import sys
 
 if sys.platform != "darwin":
     raise ImportError("This module is only available on macOS")
+
+logger = logging.getLogger(__name__)
 
 
 class DarwinPlatform:
@@ -190,6 +193,73 @@ class DarwinPlatform:
 
             return AXIsProcessTrustedWithOptions({kAXTrustedCheckOptionPrompt: True})
         except (ImportError, AttributeError):
+            return True
+
+    @staticmethod
+    def register_input_monitoring_access() -> bool:
+        """Register the daemon as an Input Monitoring TCC subject (U8).
+
+        The bare ``CGRequestListenEventAccess()`` request API did **not**
+        register a toggleable Input Monitoring entry from the daemon's
+        launchd context on the spike machine (U7 finding — see
+        ``docs/research/2026-06-05-daemon-tcc-registration-spike.md``). The
+        path that forces the row to appear is a *real* listen-only event-tap
+        touch — the same ``CGEventTapCreate(..., kCGEventTapOptionListenOnly,
+        ...)`` primitive the engine's gesture capture uses
+        (``screencap.engine.recorder``). Creating such a tap on the session
+        tap triggers the Input Monitoring TCC check; the mere creation is the
+        registration touch, so we create the tap and immediately tear it down
+        without ever wiring it into a run loop.
+
+        Returns the request API's immediate grant bool (advisory only — the
+        authoritative post-grant state comes from a fresh-subprocess probe).
+        Fail-open: any error returns ``True`` so a Quartz/PyObjC hiccup never
+        surfaces as a hard failure to the caller (registration is best-effort;
+        the app re-probes for real state and the user can still enable the
+        entry manually).
+        """
+        granted = True
+        try:
+            import Quartz
+
+            # Fire the request API first (registers on some macOS versions and
+            # is a no-op once answered); capture its advisory grant bool.
+            try:
+                granted = bool(Quartz.CGRequestListenEventAccess())
+            except (AttributeError, TypeError):
+                granted = True
+
+            # The load-bearing step: a listen-only session tap. Its creation is
+            # the TCC touch that makes the Input Monitoring entry appear. We
+            # never enable it or add it to a run loop — create, then release.
+            def _noop_tap_callback(_proxy, _type, event, _refcon):  # pragma: no cover - never invoked (tap not enabled)
+                return event
+
+            mask = Quartz.CGEventMaskBit(Quartz.kCGEventKeyDown)
+            tap = Quartz.CGEventTapCreate(
+                Quartz.kCGSessionEventTap,
+                Quartz.kCGHeadInsertEventTap,
+                Quartz.kCGEventTapOptionListenOnly,
+                mask,
+                _noop_tap_callback,
+                None,
+            )
+            # `tap is None` means the touch ran but the grant is absent — that
+            # is the expected denied-state result, not an error. Invalidate any
+            # port we did get so we don't leak a Mach port from the daemon.
+            if tap is not None:
+                try:
+                    from CoreFoundation import CFMachPortInvalidate
+
+                    CFMachPortInvalidate(tap)
+                except Exception:
+                    # A teardown failure here leaks the Mach port; log it
+                    # rather than swallowing silently so the leak is diagnosable.
+                    logger.debug("CFMachPortInvalidate failed", exc_info=True)
+            return granted
+        except (ImportError, AttributeError):
+            return True
+        except Exception:
             return True
 
     @staticmethod

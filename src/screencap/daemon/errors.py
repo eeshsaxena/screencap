@@ -18,6 +18,8 @@ RECONCILING = "reconciling"
 FORCE_MISMATCH = "force_mismatch"
 INVALID_NAME = "invalid_name"
 INVALID_OUTPUT_DIR = "invalid_output_dir"
+PERMISSION_REQUIRED = "permission_required"
+INVALID_PERMISSION = "invalid_permission"
 
 # Codes returned by the daemon outside the typed-exception paths (route
 # handler `except Exception`, query-string parse failures). Keeping them
@@ -143,6 +145,30 @@ def rogue_file_envelope(
         schema_version=schema_version,
         error=ROGUE_FILE,
         path=str(path),
+    )
+
+
+def permission_required_envelope(
+    *,
+    missing: list[str],
+    schema_version: int,
+) -> dict[str, Any]:
+    return error_envelope(
+        schema_version=schema_version,
+        error=PERMISSION_REQUIRED,
+        missing=list(missing),
+    )
+
+
+def invalid_permission_envelope(
+    *,
+    reason: str,
+    schema_version: int,
+) -> dict[str, Any]:
+    return error_envelope(
+        schema_version=schema_version,
+        error=INVALID_PERMISSION,
+        reason=reason,
     )
 
 
@@ -372,6 +398,71 @@ class ForceMismatchError(DaemonAPIError):
         return force_mismatch_envelope(schema_version=self.schema_version)
 
 
+class PermissionRequiredError(DaemonAPIError):
+    """A daemon-backed recording start lacks a required TCC grant (U6).
+
+    Raised by the ``recording.start`` handler *before* the engine spawns, so
+    the failure is a synchronous, typed result on the call rather than a
+    200-OK-then-crash (the old behavior, where the worker emitted
+    ``EVENT_STARTED`` before its own preflight, then exited via
+    ``permission_lost``). ``missing`` lists the canonical permission strings
+    the app maps via ``PrivacyPane.from(permissionString:)``. Maps to HTTP 403
+    so it routes through ``_api_error_response`` (a typed 4xx), never the
+    ``except Exception`` 500.
+    """
+
+    error_code = PERMISSION_REQUIRED
+    http_status = 403
+
+    def __init__(
+        self,
+        missing: list[str],
+        *,
+        schema_version: int,
+        http_status: int | None = None,
+    ) -> None:
+        self.missing = list(missing)
+        super().__init__(schema_version=schema_version, http_status=http_status)
+
+    def envelope(self) -> dict[str, Any]:
+        return permission_required_envelope(
+            missing=self.missing,
+            schema_version=self.schema_version,
+        )
+
+
+class InvalidPermissionError(DaemonAPIError):
+    """The ``permission.request`` verb (U8) received an unknown permission.
+
+    Raised by the ``permission.request`` handler when the requested
+    ``permission`` is not one of the canonical three
+    (``screen_recording`` / ``accessibility`` / ``input_monitoring``).
+    Mirrors the ``validate_recording_name`` allowlist gate so an
+    unexpected value never reaches the daemon-side registration / real-
+    capture dispatch. Maps to HTTP 400 with the ``invalid_permission``
+    envelope; carries a static ``reason`` (never echoes the raw value).
+    """
+
+    error_code = INVALID_PERMISSION
+    http_status = 400
+
+    def __init__(
+        self,
+        reason: str,
+        *,
+        schema_version: int,
+        http_status: int | None = None,
+    ) -> None:
+        self.reason = reason
+        super().__init__(schema_version=schema_version, http_status=http_status)
+
+    def envelope(self) -> dict[str, Any]:
+        return invalid_permission_envelope(
+            reason=self.reason,
+            schema_version=self.schema_version,
+        )
+
+
 class InvalidOutputDirError(DaemonAPIError):
     """Requested output_dir is outside the allowed recordings root(s).
 
@@ -413,6 +504,8 @@ __all__ = [
     "FORCE_MISMATCH",
     "INVALID_NAME",
     "INVALID_OUTPUT_DIR",
+    "PERMISSION_REQUIRED",
+    "INVALID_PERMISSION",
     "ERROR_CODE_INTERNAL",
     "ERROR_CODE_INVALID_CURSOR",
     "EXCEPTION_TO_ERROR_CODE",
@@ -428,6 +521,8 @@ __all__ = [
     "force_mismatch_envelope",
     "invalid_name_envelope",
     "invalid_output_dir_envelope",
+    "permission_required_envelope",
+    "invalid_permission_envelope",
     "DaemonAPIError",
     "LockContendedError",
     "NotOwnedByDaemonError",
@@ -440,4 +535,6 @@ __all__ = [
     "ForceMismatchError",
     "InvalidNameError",
     "InvalidOutputDirError",
+    "PermissionRequiredError",
+    "InvalidPermissionError",
 ]

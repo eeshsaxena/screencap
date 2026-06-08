@@ -115,3 +115,47 @@ rm -rf "${DEST_DIR}"
 ditto "${SOURCE_DIR}" "${DEST_DIR}"
 
 echo "Embedded screencap CLI from ${SOURCE_DIR} -> ${DEST_DIR}"
+
+sign_embedded_cli() {
+    # PyInstaller emits an ad-hoc signature, so the embedded daemon binary has no
+    # stable code identity. macOS TCC then keys the daemon's Screen Recording /
+    # Accessibility / Input Monitoring grants on the binary's cdhash, which changes
+    # on every rebuild — the "TCC treadmill" that forces the user to re-grant after
+    # each build. Xcode signs the .app wrapper + main executable but does NOT
+    # recurse into Contents/Resources/, so without this step the embedded binary
+    # keeps its ad-hoc signature. Re-signing every nested Mach-O + the `screencap`
+    # exe with the app's team identity gives the daemon a stable Designated
+    # Requirement (Team ID + identifier), so grants persist across rebuilds.
+    # Hardened runtime + screencap-cli.entitlements keep it notarization-ready.
+    # See docs/research/2026-06-05-daemon-tcc-registration-spike.md.
+    local identity="${EXPANDED_CODE_SIGN_IDENTITY:-}"
+    if [ -z "${identity}" ] || [ "${identity}" = "-" ]; then
+        echo "note: no team signing identity (EXPANDED_CODE_SIGN_IDENTITY unset/ad-hoc);"
+        echo "note: leaving the embedded CLI ad-hoc — TCC grants will reset on rebuild."
+        echo "note: set DEVELOPMENT_TEAM (see macos/README.md) to make grants persist."
+        return
+    fi
+
+    local entitlements="${SRCROOT}/ScreenCap/Scripts/screencap-cli.entitlements"
+    # --timestamp needs the network and is required for notarized release builds;
+    # skip it for Debug so local rebuilds stay fast and work offline.
+    local timestamp_flag="--timestamp"
+    [ "${CONFIGURATION:-}" = "Debug" ] && timestamp_flag="--timestamp=none"
+
+    echo "Signing embedded screencap CLI (${EXPANDED_CODE_SIGN_IDENTITY_NAME:-${identity}}, hardened runtime)..."
+    # Sign nested Mach-O first, then the exe last (inner-to-outer).
+    find "${DEST_DIR}" -type f \( -name "*.dylib" -o -name "*.so" \) -print0 \
+        | xargs -0 codesign --force --options runtime "${timestamp_flag}" --sign "${identity}"
+    codesign --force --options runtime "${timestamp_flag}" \
+        --entitlements "${entitlements}" --sign "${identity}" "${DEST_DIR}/screencap"
+
+    # Fail loud if signing broke the bundle (entitlements/hardened-runtime mismatch).
+    if ! "${DEST_DIR}/screencap" --version >/dev/null 2>&1; then
+        echo "error: embedded screencap CLI fails to launch after signing." >&2
+        echo "error: check screencap-cli.entitlements against hardened-runtime needs." >&2
+        exit 1
+    fi
+    echo "Signed embedded screencap CLI with team identity (TCC grants now persist across rebuilds)."
+}
+
+sign_embedded_cli

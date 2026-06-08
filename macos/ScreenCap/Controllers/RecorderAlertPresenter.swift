@@ -15,6 +15,12 @@ protocol RecorderAlertPresenter {
     /// Shows the "Permission revoked" alert. Invokes `openSettings` when the
     /// user clicks **Open System Settings**.
     func presentPermissionLost(permission: String, openSettings: @MainActor () -> Void)
+
+    /// Shows the "permission required *before* recording" alert (U4/U6). Distinct
+    /// from `presentPermissionLost` because nothing was recording — the copy must
+    /// not say a recording "stopped". Invokes `openSettings` on **Open System
+    /// Settings**. `permissions` lists the missing permission display names.
+    func presentPermissionRequired(permissions: [String], openSettings: @MainActor () -> Void)
 }
 
 /// Live implementation. Produces the same wording and button order as the
@@ -43,6 +49,19 @@ final class LiveRecorderAlertPresenter: RecorderAlertPresenter {
         let alert = NSAlert()
         alert.messageText = "Permission revoked"
         alert.informativeText = "ScreenCap stopped recording because \(permission) was disabled in System Settings."
+        alert.addButton(withTitle: "Open System Settings")
+        alert.addButton(withTitle: "Dismiss")
+        if alert.runModal() == .alertFirstButtonReturn {
+            openSettings()
+        }
+    }
+
+    func presentPermissionRequired(permissions: [String], openSettings: @MainActor () -> Void) {
+        let names = permissions.isEmpty ? "a required permission" : permissions.joined(separator: ", ")
+        let alert = NSAlert()
+        alert.messageText = "Permission required"
+        alert.informativeText =
+            "ScreenCap can't start recording until \(names) is granted in System Settings."
         alert.addButton(withTitle: "Open System Settings")
         alert.addButton(withTitle: "Dismiss")
         if alert.runModal() == .alertFirstButtonReturn {

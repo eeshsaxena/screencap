@@ -8,6 +8,12 @@ private let daemonSessionLogger = Logger(subsystem: "com.screencap.macos", categ
 enum DaemonErrorCode {
     static let lockContended = "lock_contended"
     static let notOwnedByDaemon = "not_owned_by_daemon"
+    static let permissionRequired = "permission_required"
+}
+
+/// Decodes the `missing` list off a `permission_required` error envelope (U6).
+private struct PermissionRequiredPayload: Decodable {
+    let missing: [String]
 }
 
 /// Typed outcomes returned by the daemon session service. Hoisted out of the
@@ -15,7 +21,11 @@ enum DaemonErrorCode {
 /// nested-type cycle.
 enum DaemonSession {
     enum ProbeOutcome: Equatable {
-        case daemon
+        /// Daemon reachable. Carries its live TCC grant state (U3) so the
+        /// orchestrator can gate the walkthrough / start-block on the daemon's
+        /// own grants rather than on transport reachability alone. An older
+        /// daemon that omits the block surfaces as `.allIndeterminate`.
+        case daemon(grants: DaemonPermissionGrants)
         case schemaMismatch
         case unavailable
     }
@@ -31,6 +41,11 @@ enum DaemonSession {
         case schemaMismatch
         case socketUnavailable
         case lockContended
+        /// A daemon-backed start was rejected before spawn because a required
+        /// TCC grant is missing (U6). Carries the canonical permission strings
+        /// the app maps to panes. Routed into the grant flow, never the CLI
+        /// fallback.
+        case permissionRequired(missing: [String])
         case other(localizedDescription: String)
     }
 
@@ -104,8 +119,8 @@ final class LiveDaemonSessionService: DaemonSessionService {
 
     func probe() async -> DaemonSession.ProbeOutcome {
         do {
-            _ = try await DaemonClient.daemonInfo()
-            return .daemon
+            let info = try await DaemonClient.daemonInfo()
+            return .daemon(grants: info.permissions ?? .allIndeterminate)
         } catch DaemonClientError.schemaMismatch {
             return .schemaMismatch
         } catch {
@@ -155,6 +170,11 @@ final class LiveDaemonSessionService: DaemonSessionService {
         case DaemonClientError.envelopeError(let code, _)
             where code == DaemonErrorCode.lockContended || code == DaemonErrorCode.notOwnedByDaemon:
             return .lockContended
+        case DaemonClientError.envelopeError(let code, let rawBody)
+            where code == DaemonErrorCode.permissionRequired:
+            let missing = (try? JSONDecoder().decode(PermissionRequiredPayload.self, from: rawBody))?
+                .missing ?? []
+            return .permissionRequired(missing: missing)
         default:
             return .other(localizedDescription: error.localizedDescription)
         }

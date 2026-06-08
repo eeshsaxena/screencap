@@ -16,6 +16,43 @@ import httpx
 import pytest
 
 
+def pytest_configure(config: pytest.Config) -> None:
+    config.addinivalue_line(
+        "markers",
+        "real_permission_probe: run the real TCC probe instead of the "
+        "granted-by-default stub (probe-internals + live-integration tests).",
+    )
+
+
+@pytest.fixture(autouse=True)
+def _granted_permissions_by_default(
+    request: pytest.FixtureRequest, monkeypatch: pytest.MonkeyPatch
+):
+    """Default the daemon permission probe to all-granted (U6).
+
+    The pre-spawn permission gate (recording.start) now blocks on a denied
+    Screen Recording grant, so without this stub every recording.start test
+    would 403 on a host whose interpreter lacks the grant (CI, dev). Defaulting
+    to granted keeps those tests deterministic and host-independent. Tests that
+    exercise the probe itself or the live gate opt out via
+    ``@pytest.mark.real_permission_probe``; tests of the gate override
+    ``probe_permissions`` themselves (a later monkeypatch wins).
+    """
+    if request.node.get_closest_marker("real_permission_probe"):
+        return
+    from screencap.daemon import permission_probe
+
+    monkeypatch.setattr(
+        permission_probe,
+        "probe_permissions",
+        lambda *a, **k: {
+            "screen_recording": "granted",
+            "accessibility": "granted",
+            "input_monitoring": "granted",
+        },
+    )
+
+
 @pytest.fixture
 def allow_tmp_output_dir(tmp_path: Path):
     """Add ``tmp_path`` to the supervisor's output-dir allowlist for this test.
@@ -53,6 +90,11 @@ def daemon_env() -> dict[str, str]:
     return {
         **os.environ,
         "PYTHONPATH": str(Path(__file__).resolve().parents[2] / "src"),
+        # The real daemon subprocess reads real TCC state (denied in CI), which
+        # the in-process probe stub can't reach. Force granted so recording.start
+        # isn't blocked by the U6 permission gate. Tests of the gate against a
+        # real daemon can override this.
+        "SCREENCAP_PERMISSION_PROBE_FAKE": "granted",
     }
 
 

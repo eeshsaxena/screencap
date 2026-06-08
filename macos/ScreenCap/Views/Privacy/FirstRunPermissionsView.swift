@@ -58,34 +58,43 @@ struct FirstRunPermissionsView: View {
                     .foregroundStyle(.secondary)
 
                 HStack {
-                    // Disable while a relaunch is already in flight (prevents
-                    // double-click stacking new instances) or while a
-                    // recording is active (avoids racing PR3's `.terminateLater`
-                    // NSAlert path against the detached `open -n` shell).
-                    Button("Quit & Relaunch") {
-                        isPreparingRelaunch = true
-                        Task { @MainActor in
-                            await PermissionSheetRelaunchFlow.dismissThenRelaunch(
-                                dismiss: { isPresented = false },
-                                relaunch: { permissions.relaunchApplication() }
-                            )
+                    // "Quit & Relaunch" only helps the *app process's* TCC cache
+                    // (CLI-fallback path). On the daemon path the daemon is the
+                    // TCC subject and needs no app restart, so don't present the
+                    // relaunch as a required step there (U5). Full removal /
+                    // relabel is a deferred follow-up.
+                    if recorder.transport == .cliFallback {
+                        Button("Quit & Relaunch") {
+                            isPreparingRelaunch = true
+                            Task { @MainActor in
+                                await PermissionSheetRelaunchFlow.dismissThenRelaunch(
+                                    dismiss: { isPresented = false },
+                                    relaunch: { permissions.relaunchApplication() }
+                                )
+                            }
                         }
+                        .buttonStyle(.bordered)
+                        .disabled(isPreparingRelaunch || permissions.isRelaunching || recorder.state.isRecording)
+                    }
+
+                    // Always-available escape hatch. Persists the dismissal so
+                    // the state-driven gate stops re-popping (U4). The start-block
+                    // stays independent, so a skipped sheet can't let a broken
+                    // daemon recording start silently.
+                    Button("Skip for now") {
+                        permissions.markSetupDismissed()
+                        isPresented = false
                     }
                     .buttonStyle(.bordered)
-                    .disabled(isPreparingRelaunch || permissions.isRelaunching || recorder.state.isRecording)
-
-                    // Always-available escape hatch. Dismisses the sheet even
-                    // if app-process permission hints still read denied.
-                    // Daemon-backed recording is enforced by the helper at
-                    // start time; CLI fallback still uses app/CLI permissions.
-                    Button("Skip for now") { isPresented = false }
-                        .buttonStyle(.bordered)
 
                     Spacer()
 
+                    // Enabled once the daemon reports all three required grants
+                    // granted (the happy-path exit). A partial/indeterminate
+                    // state exits via "Skip for now" instead.
                     Button("Done") { isPresented = false }
                         .keyboardShortcut(.defaultAction)
-                        .disabled(!isDaemonInstallComplete)
+                        .disabled(!permissions.allRequiredDaemonGrantsGranted)
                 }
             }
         }
@@ -95,6 +104,17 @@ struct FirstRunPermissionsView: View {
             if state == .installedAndRunning {
                 isDaemonInstallComplete = true
             }
+        }
+        .onAppear {
+            // Refresh the daemon's grant snapshot while the sheet is visible so
+            // the rows reflect grants the user toggles in System Settings —
+            // re-activation + a slow 5s timer (not the 1Hz app-process poll).
+            permissions.startDaemonGrantWatching {
+                await recorder.refreshDaemonGrants()
+            }
+        }
+        .onDisappear {
+            permissions.stopDaemonGrantWatching()
         }
     }
 
@@ -215,17 +235,19 @@ struct FirstRunPermissionsView: View {
 
     @ViewBuilder
     private func daemonPermissionRow(pane: PrivacyPane) -> some View {
-        // TCC does not expose a programmatic status check for arbitrary
-        // binaries (the daemon's `com.screencap.daemon` subject). The only
-        // local signal we have is whether the user clicked Open Settings,
-        // which doesn't actually confirm a grant. Use neutral icons that
-        // don't claim a state we can't verify — gray/blue, not red/green.
+        // The icon now reflects the daemon's *real* reported grant state (U3/U5)
+        // rather than the old "did the user click Open Settings" proxy. The
+        // tri-state is honest: granted (green), denied (needs-action orange),
+        // and indeterminate ("couldn't verify" — a muted icon with a distinct
+        // accessibility label, never a green check or red needs-action).
+        let state = permissions.daemonGrant(for: pane)
+        let icon = Self.grantRowIcon(for: state)
         let opened = openedDaemonPanes.contains(pane)
         HStack(alignment: .top, spacing: 12) {
-            Image(systemName: opened ? "circle.inset.filled" : "circle")
+            Image(systemName: icon.systemName)
                 .font(.system(size: 20))
-                .foregroundStyle(opened ? Color.accentColor : Color.secondary)
-                .accessibilityLabel(opened ? "Settings visited" : "Settings not yet visited")
+                .foregroundStyle(icon.color)
+                .accessibilityLabel(icon.accessibilityLabel)
                 .padding(.top, 2)
 
             VStack(alignment: .leading, spacing: 4) {
@@ -240,17 +262,45 @@ struct FirstRunPermissionsView: View {
 
             Spacer()
 
-            Button(opened ? "Open Again" : "Open Settings") {
-                openedDaemonPanes.insert(pane)
-                permissions.requestAndOpenSettings(for: pane, subject: .daemon)
+            if state == .granted {
+                Text("Granted")
+                    .font(.subheadline)
+                    .foregroundStyle(.green)
+            } else if permissions.isDaemonRegistering(pane) {
+                // U8: a daemon registration round-trip is in flight for this
+                // pane. Mirror the helper-install step's spinner so the user
+                // sees the Grant action is working and a repeat tap is a no-op.
+                ProgressView()
+                    .controlSize(.small)
+            } else {
+                Button(opened ? "Open Again" : "Grant") {
+                    openedDaemonPanes.insert(pane)
+                    permissions.requestAndOpenSettings(for: pane, subject: .daemon)
+                }
+                .buttonStyle(.borderedProminent)
             }
-            .buttonStyle(.borderedProminent)
         }
         .padding(12)
         .background(
             RoundedRectangle(cornerRadius: 10)
                 .fill(Color(nsColor: .controlBackgroundColor))
         )
+    }
+
+    /// Map the tri-state daemon grant to a row icon. Indeterminate is "couldn't
+    /// verify" — a muted dashed circle with its own accessibility label, never
+    /// confused with granted (check) or denied (needs-action).
+    static func grantRowIcon(
+        for state: DaemonGrantState
+    ) -> (systemName: String, color: Color, accessibilityLabel: String) {
+        switch state {
+        case .granted:
+            return ("checkmark.circle.fill", .green, "Granted")
+        case .denied:
+            return ("exclamationmark.circle.fill", .orange, "Needs action")
+        case .indeterminate:
+            return ("circle.dashed", .secondary, "Couldn't verify")
+        }
     }
 
     private func daemonRationale(for pane: PrivacyPane) -> String {

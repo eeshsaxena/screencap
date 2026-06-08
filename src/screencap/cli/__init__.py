@@ -291,6 +291,22 @@ def _engine_worker_cmd(encoded_args: str) -> None:
     )
 
 
+@cli.command("_permission-probe", hidden=True)
+def _permission_probe_cmd() -> None:
+    """Hidden entry point: print live TCC grant state as one JSON line.
+
+    Spawned by ``screencap.daemon.permission_probe`` so the long-lived daemon
+    can read *live* TCC state (R9). Because this runs in a freshly spawned
+    process that has made no prior TCC call, each in-process ``CGPreflight*``
+    reads live state — the same property ``session.run_recording_worker``
+    relies on. The probe invoker passes ``--no-update-check`` so the only line
+    on stdout is the result JSON: ``{permission: granted|denied|indeterminate}``.
+    """
+    from screencap.daemon.permission_probe import run_probe_checks
+
+    click.echo(json.dumps(run_probe_checks()))
+
+
 # ---------------------------------------------------------------------------
 # Unit 8a: structured stderr event contract
 # ---------------------------------------------------------------------------

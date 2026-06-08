@@ -56,6 +56,125 @@ final class DaemonClientTests: XCTestCase {
         XCTAssertEqual(response.daemonVersion, "test")
         XCTAssertEqual(response.apiSchemaVersion, 1)
         XCTAssertEqual(response.startedAt, 123.5)
+        // Older daemon (no permissions block) decodes to nil — no decode failure.
+        XCTAssertNil(response.permissions)
+    }
+
+    // MARK: - U3: daemon grant-state decode
+
+    func testDaemonInfoDecodesAllGrantedPermissions() async throws {
+        _ = try startServer { _ in
+            .json(
+                #"{"ok":true,"schema_version":1,"daemon_version":"test","api_schema_version":1,"build":null,"started_at":1.0,"permissions":{"screen_recording":"granted","accessibility":"granted","input_monitoring":"granted"}}"#
+            )
+        }
+
+        let response = try await DaemonClient.daemonInfo()
+        let grants = try XCTUnwrap(response.permissions)
+        XCTAssertEqual(grants.screenRecording, .granted)
+        XCTAssertEqual(grants.accessibility, .granted)
+        XCTAssertEqual(grants.inputMonitoring, .granted)
+        XCTAssertTrue(grants.allRequiredGranted)
+        XCTAssertFalse(grants.anyRequiredDenied)
+    }
+
+    func testDaemonInfoDecodesMixedPermissionGrants() async throws {
+        _ = try startServer { _ in
+            .json(
+                #"{"ok":true,"schema_version":1,"daemon_version":"test","api_schema_version":1,"build":null,"started_at":1.0,"permissions":{"screen_recording":"denied","accessibility":"granted","input_monitoring":"indeterminate"}}"#
+            )
+        }
+
+        let response = try await DaemonClient.daemonInfo()
+        let grants = try XCTUnwrap(response.permissions)
+        XCTAssertEqual(grants.screenRecording, .denied)
+        XCTAssertEqual(grants.accessibility, .granted)
+        XCTAssertEqual(grants.inputMonitoring, .indeterminate)
+        XCTAssertFalse(grants.allRequiredGranted)
+        XCTAssertTrue(grants.anyRequiredDenied)
+        XCTAssertTrue(grants.screenRecordingDenied)
+    }
+
+    func testDaemonInfoPartialBlockDecodesMissingKeysToIndeterminate() async throws {
+        // A block with only screen_recording present — absent sub-keys must
+        // decode to indeterminate, never silently granted/denied.
+        _ = try startServer { _ in
+            .json(
+                #"{"ok":true,"schema_version":1,"daemon_version":"test","api_schema_version":1,"build":null,"started_at":1.0,"permissions":{"screen_recording":"granted"}}"#
+            )
+        }
+
+        let response = try await DaemonClient.daemonInfo()
+        let grants = try XCTUnwrap(response.permissions)
+        XCTAssertEqual(grants.screenRecording, .granted)
+        XCTAssertEqual(grants.accessibility, .indeterminate)
+        XCTAssertEqual(grants.inputMonitoring, .indeterminate)
+    }
+
+    func testDaemonInfoUnknownGrantTokenAndExtraKeyAreTolerant() async throws {
+        // An unrecognized token maps to indeterminate (never denied); an unknown
+        // extra grant key is ignored (forward-compat).
+        _ = try startServer { _ in
+            .json(
+                #"{"ok":true,"schema_version":1,"daemon_version":"test","api_schema_version":1,"build":null,"started_at":1.0,"permissions":{"screen_recording":"sometimes","accessibility":"granted","input_monitoring":"denied","future_perm":"granted"}}"#
+            )
+        }
+
+        let response = try await DaemonClient.daemonInfo()
+        let grants = try XCTUnwrap(response.permissions)
+        XCTAssertEqual(grants.screenRecording, .indeterminate)
+        XCTAssertEqual(grants.accessibility, .granted)
+        XCTAssertEqual(grants.inputMonitoring, .denied)
+    }
+
+    func testProbeSurfacesGrantStateOnDaemonOutcome() async throws {
+        _ = try startServer { _ in
+            .json(
+                #"{"ok":true,"schema_version":1,"daemon_version":"test","api_schema_version":1,"build":null,"started_at":1.0,"permissions":{"screen_recording":"denied","accessibility":"granted","input_monitoring":"granted"}}"#
+            )
+        }
+
+        let outcome = await LiveDaemonSessionService().probe()
+        guard case .daemon(let grants) = outcome else {
+            return XCTFail("Expected .daemon outcome, got \(outcome)")
+        }
+        XCTAssertEqual(grants.screenRecording, .denied)
+        XCTAssertEqual(grants.accessibility, .granted)
+        XCTAssertEqual(grants.inputMonitoring, .granted)
+    }
+
+    func testProbeMapsMissingPermissionsBlockToAllIndeterminate() async throws {
+        // Older daemon: no permissions block → probe surfaces all-indeterminate
+        // so nothing blocks or nags.
+        _ = try startServer { _ in
+            .json(
+                #"{"ok":true,"schema_version":1,"daemon_version":"test","api_schema_version":1,"build":null,"started_at":1.0}"#
+            )
+        }
+
+        let outcome = await LiveDaemonSessionService().probe()
+        XCTAssertEqual(outcome, .daemon(grants: .allIndeterminate))
+    }
+
+    func testProbeMapsPartialPermissionsBlockToIndeterminateAtOutcomeLevel() async throws {
+        // A partial block (only screen_recording present) surfaced through
+        // probe(): absent sub-keys must reach the .daemon grants as indeterminate,
+        // never silently granted/denied. testDaemonInfoPartialBlock... pins the
+        // raw decode; this pins the DaemonSessionService.probe() outcome a
+        // partial block produces.
+        _ = try startServer { _ in
+            .json(
+                #"{"ok":true,"schema_version":1,"daemon_version":"test","api_schema_version":1,"build":null,"started_at":1.0,"permissions":{"screen_recording":"denied"}}"#
+            )
+        }
+
+        let outcome = await LiveDaemonSessionService().probe()
+        guard case .daemon(let grants) = outcome else {
+            return XCTFail("Expected .daemon outcome, got \(outcome)")
+        }
+        XCTAssertEqual(grants.screenRecording, .denied)
+        XCTAssertEqual(grants.accessibility, .indeterminate)
+        XCTAssertEqual(grants.inputMonitoring, .indeterminate)
     }
 
     func testRequestFramesPOSTBodyAndDecodesResponse() async throws {
@@ -79,6 +198,47 @@ final class DaemonClientTests: XCTestCase {
         XCTAssertEqual(response.startedAt, 44.0)
         XCTAssertEqual(response.enginePID, 999)
         XCTAssertEqual(response.cursor, 7)
+    }
+
+    // MARK: - U8: permission.request registration verb
+
+    func testPermissionRequestFramesPOSTBodyAndDecodesResponse() async throws {
+        _ = try startServer { request in
+            XCTAssertEqual(request.method, "POST")
+            XCTAssertEqual(request.path, "/v0/permission.request")
+            XCTAssertEqual(request.headers["content-type"], "application/json")
+            let body = String(data: request.body, encoding: .utf8) ?? ""
+            XCTAssertTrue(body.contains(#""permission":"input_monitoring""#), body)
+            return .json(
+                #"{"ok":true,"schema_version":1,"daemon_version":"test","api_schema_version":1,"permission":"input_monitoring","already_granted":false}"#
+            )
+        }
+
+        let response = try await DaemonClient.permissionRequest("input_monitoring")
+
+        XCTAssertEqual(response.permission, "input_monitoring")
+        XCTAssertFalse(response.alreadyGranted)
+    }
+
+    func testPermissionRequestInvalidPermissionPropagatesEnvelopeError() async throws {
+        // An out-of-allowlist permission returns a typed invalid_permission 4xx;
+        // the client surfaces it as an envelopeError carrying the code.
+        _ = try startServer { _ in
+            .json(
+                #"{"ok":false,"schema_version":1,"daemon_version":"test","api_schema_version":1,"error":"invalid_permission","reason":"bad permission"}"#,
+                status: 400,
+                reason: "Bad Request"
+            )
+        }
+
+        do {
+            _ = try await DaemonClient.permissionRequest("microphone")
+            XCTFail("Expected envelope error")
+        } catch DaemonClientError.envelopeError(let code, _) {
+            XCTAssertEqual(code, "invalid_permission")
+        } catch {
+            XCTFail("Unexpected error: \(error)")
+        }
     }
 
     func testSchemaMismatchThrowsPinnedError() async throws {
