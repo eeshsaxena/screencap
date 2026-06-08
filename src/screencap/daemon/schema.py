@@ -107,6 +107,10 @@ def _load_models() -> dict[str, Any]:
         is_stub: bool = False
         chunks_total: int = 0
         chunks_uploaded: int = 0
+        # U9: True for chunked recordings (vs legacy single-file). Kept in
+        # sync with catalog.RecordingInfo.is_chunked — the recording.list verb
+        # asserts the two field sets match (app.py).
+        is_chunked: bool = False
         intent: str | None = None
         started_at: float | None = None
         duration_seconds: float | None = None
