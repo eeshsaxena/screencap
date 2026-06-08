@@ -328,7 +328,12 @@ class ChunkProcessor:
         if not self._upload_enabled:
             return 0
 
-        from screencap.upload import FileInfo, _content_type, request_signed_urls
+        from screencap.upload import (
+            FileInfo,
+            _content_type,
+            assert_uploadable,
+            request_signed_urls,
+        )
 
         all_file_infos: list[FileInfo] = []
         per_chunk_names: dict[int, list[str]] = {}
@@ -346,10 +351,10 @@ class ChunkProcessor:
                     size = path.stat().st_size
                 except FileNotFoundError:
                     continue
-                all_file_infos.append(FileInfo(
+                all_file_infos.append(assert_uploadable(FileInfo(
                     name=f["name"], path=path,
                     content_type=_content_type(path), size=size,
-                ))
+                )))
                 names.append(f["name"])
             if names:
                 per_chunk_names[idx] = names
@@ -1121,18 +1126,23 @@ def upload_chunk_files(
     from screencap.upload import (
         FileInfo,
         _content_type,
+        assert_uploadable,
         request_signed_urls,
     )
 
     file_infos = []
     for f in files:
         p = Path(f["path"])
-        file_infos.append(FileInfo(
+        # Defense-in-depth (R8): run the live chunk seam through the same hard
+        # gate the single upload seam uses, so a raw local-only artifact
+        # (recording.db &c.) reaching this enqueue fails loud instead of
+        # shipping silently. No-op for the chunk files this path actually sends.
+        file_infos.append(assert_uploadable(FileInfo(
             name=f["name"],
             path=p,
             content_type=_content_type(p),
             size=p.stat().st_size,
-        ))
+        )))
 
     if not file_infos:
         return True

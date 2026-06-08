@@ -196,9 +196,19 @@ def _migrate_schema(db_path: str) -> None:
         for col in table.columns:
             if col.name not in existing_cols:
                 sqlite_type = _sa_type_to_sqlite(col)
-                cur.execute(
-                    f"ALTER TABLE {table.name} ADD COLUMN {col.name} {sqlite_type}"
-                )
+                try:
+                    cur.execute(
+                        f"ALTER TABLE {table.name} ADD COLUMN {col.name} {sqlite_type}"
+                    )
+                except sqlite3.OperationalError as e:
+                    # A concurrent first-open of the same recording.db (daemon
+                    # engine writer + a CLI command) can add this column between
+                    # our PRAGMA read above and this ALTER — a TOCTOU window.
+                    # The duplicate-column error is idempotent (the column now
+                    # exists, which is the desired end state), so treat it as a
+                    # no-op rather than crashing the second opener.
+                    if "duplicate column name" not in str(e).lower():
+                        raise
 
     conn.commit()
     conn.close()
