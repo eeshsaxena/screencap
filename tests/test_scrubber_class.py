@@ -817,3 +817,156 @@ def test_write_audit_log_writes_file_mode_0600(tmp_path):
 
     audit = tmp_path / "privacy_audit.json"
     assert _stat.S_IMODE(audit.stat().st_mode) == 0o600
+
+
+# ---------------------------------------------------------------------------
+# U6 — video masking integrated into cloud-copy production, GATED behind
+# config.get_masked_video_upload_enabled() (default OFF).
+# ---------------------------------------------------------------------------
+
+
+def _make_tiny_chunk_mp4(path: Path) -> None:
+    """Write a 4-frame solid-color mp4 (mirrors test_video_mask fixtures)."""
+    from fractions import Fraction
+
+    import av
+    from PIL import Image
+
+    container = av.open(str(path), mode="w", format="mp4")
+    stream = container.add_stream("libx264", rate=10)
+    stream.width = 64
+    stream.height = 48
+    stream.pix_fmt = "yuv420p"
+    stream.codec_context.time_base = Fraction(1, 10)
+    stream.options = {"crf": "23", "preset": "ultrafast", "g": "1", "bf": "0"}
+    for i in range(4):
+        frame = av.VideoFrame.from_image(Image.new("RGB", (64, 48), (200, 30, 30)))
+        frame.pts = i
+        frame.time_base = Fraction(1, 10)
+        for packet in stream.encode(frame):
+            container.mux(packet)
+    for packet in stream.encode():
+        container.mux(packet)
+    container.close()
+
+
+def _make_geometry_db(path: Path, *, windows: list[dict]) -> None:
+    """Minimal recording.db with dense window_geometry over [0, 0.4]."""
+    with contextlib.closing(sqlite3.connect(str(path))) as db:
+        db.execute("CREATE TABLE recording (id INTEGER PRIMARY KEY, pixel_ratio REAL)")
+        db.execute("INSERT INTO recording (id, pixel_ratio) VALUES (1, 1.0)")
+        db.execute(
+            "CREATE TABLE window_geometry ("
+            "id INTEGER PRIMARY KEY, recording_id INTEGER, "
+            "recording_timestamp REAL, screenshot_timestamp REAL, "
+            "window_list_json TEXT)"
+        )
+        for ts in (0.0, 0.2, 0.4):
+            payload = json.dumps({"windows": windows, "display_bounds": [0, 0, 64, 48]})
+            db.execute(
+                "INSERT INTO window_geometry "
+                "(recording_id, screenshot_timestamp, window_list_json) "
+                "VALUES (1, ?, ?)",
+                (ts, payload),
+            )
+        db.commit()
+
+
+def test_mask_video_chunk_for_cloud_flag_off_does_not_invoke(tmp_path, monkeypatch):
+    """Flag OFF (default): the masker is NOT invoked; returns None, no copy."""
+    from screencap.scrubber import mask_video_chunk_for_cloud, masked_video_dir
+
+    monkeypatch.delenv("SCREENCAP_MASKED_VIDEO_UPLOAD", raising=False)
+    monkeypatch.setattr(
+        "screencap.config.get_masked_video_upload_enabled", lambda: False,
+    )
+
+    chunk = tmp_path / "chunk_0000.mp4"
+    _make_tiny_chunk_mp4(chunk)
+    db = tmp_path / "recording.db"
+    _make_geometry_db(db, windows=[{"bundle_id": "com.1password.1password",
+                                    "app_name": "1Password",
+                                    "x": 8, "y": 8, "width": 32, "height": 24}])
+    scrubbed = tmp_path / "rec-scrubbed"
+
+    result = mask_video_chunk_for_cloud(
+        chunk, db, scrubbed, chunk_index=0,
+        start_ts=0.0, end_ts=0.4, chunk_start_abs=0.0, pixel_ratio=1.0,
+    )
+
+    assert result is None, "masker must NOT run when the flag is OFF"
+    assert not masked_video_dir(scrubbed).exists(), "no masked copy when flag OFF"
+
+
+def test_mask_video_chunk_for_cloud_flag_on_masks_into_scrubbed_dir(tmp_path, monkeypatch):
+    """Flag ON: masker runs; masked copy lands in the scrubbed sibling dir,
+    NOT in the source dir list_recording_files enumerates."""
+    from screencap.scrubber import mask_video_chunk_for_cloud, masked_video_dir
+    from screencap.upload import list_recording_files
+    from screencap.video_mask import MaskOutcomeStatus
+
+    monkeypatch.setattr(
+        "screencap.config.get_masked_video_upload_enabled", lambda: True,
+    )
+
+    source = tmp_path / "rec"
+    source.mkdir()
+    chunk = source / "chunk_0000.mp4"
+    _make_tiny_chunk_mp4(chunk)
+    db = source / "recording.db"
+    _make_geometry_db(db, windows=[{"bundle_id": "com.1password.1password",
+                                    "app_name": "1Password",
+                                    "x": 8, "y": 8, "width": 32, "height": 24}])
+    scrubbed = tmp_path / "rec-scrubbed"
+
+    result = mask_video_chunk_for_cloud(
+        chunk, db, scrubbed, chunk_index=0,
+        start_ts=0.0, end_ts=0.4, chunk_start_abs=0.0, pixel_ratio=1.0,
+    )
+
+    assert result is not None
+    assert result.status is MaskOutcomeStatus.MASKED
+    assert result.regions_masked > 0
+    masked_copy = masked_video_dir(scrubbed) / "chunk_0000.mp4"
+    assert masked_copy.exists()
+
+    # The masked copy is OUTSIDE the source dir's upload enumeration: the
+    # scrubbed dir is a sibling, never walked by list_recording_files(source).
+    enumerated_paths = {f.path.resolve() for f in list_recording_files(source)}
+    enumerated_names = {f.name for f in list_recording_files(source)}
+    assert "chunk_0000.mp4" in enumerated_names  # the RICH local chunk (untouched)
+    # The masked copy is never enumerated by the source-dir walk — so a later
+    # `screencap upload` of the source could never pick it up unscrubbed.
+    assert masked_copy.resolve() not in enumerated_paths
+    # Belt-and-suspenders: it does not live under the source dir at all.
+    assert source.resolve() not in masked_copy.resolve().parents
+
+
+def test_mask_video_chunk_for_cloud_flag_on_failclosed(tmp_path, monkeypatch):
+    """Flag ON + unprovable coverage → FAILED, no masked copy produced."""
+    from screencap.scrubber import mask_video_chunk_for_cloud, masked_video_dir
+    from screencap.video_mask import MaskOutcomeStatus
+
+    monkeypatch.setattr(
+        "screencap.config.get_masked_video_upload_enabled", lambda: True,
+    )
+
+    chunk = tmp_path / "chunk_0000.mp4"
+    _make_tiny_chunk_mp4(chunk)
+    db = tmp_path / "recording.db"
+    # Geometry table exists but has NO samples in the span → unprovable (case b).
+    _make_geometry_db(db, windows=[])
+    with contextlib.closing(sqlite3.connect(str(db))) as conn:
+        conn.execute("DELETE FROM window_geometry")
+        conn.commit()
+    scrubbed = tmp_path / "rec-scrubbed"
+
+    result = mask_video_chunk_for_cloud(
+        chunk, db, scrubbed, chunk_index=0,
+        start_ts=0.0, end_ts=0.4, chunk_start_abs=0.0, pixel_ratio=1.0,
+    )
+
+    assert result is not None
+    assert result.status is MaskOutcomeStatus.FAILED
+    masked_copy = masked_video_dir(scrubbed) / "chunk_0000.mp4"
+    assert not masked_copy.exists(), "FAILED must leave no masked copy"
