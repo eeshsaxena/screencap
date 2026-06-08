@@ -144,10 +144,35 @@ def _migrate_schema(db_path: str) -> None:
     Compares every table that exists in the DB against the SQLAlchemy model
     definitions and issues ALTER TABLE ADD COLUMN for anything missing.
     Called before opening a session so that queries don't fail on old databases.
+
+    Also creates the U1 ``pipeline_chunk_state`` ledger table on existing
+    recording.db files that pre-date it. ``_migrate_schema`` historically
+    only ALTER-added columns to tables that already existed (and never
+    created missing tables — that was ``_ensure_network_tables``' job).
+    The ledger must exist on EVERY open through ``get_session_for_path``
+    (engine writer, terminal stage, CLI), so we create it here too,
+    idempotently via ``checkfirst=True``. The ``recording.chunks_expected``
+    column is picked up by the ALTER pass below because the ``recording``
+    table always exists.
     """
     import sqlite3
 
     from screencap.engine.db import models  # noqa: F401 - registers models
+
+    # Create the ledger table on legacy DBs before the column ALTER pass.
+    # checkfirst=True makes this a no-op when it already exists. Readonly
+    # DBs (chmod 444) raise OperationalError; degrade gracefully so a
+    # read-only open of an old recording.db doesn't crash.
+    try:
+        engine = get_engine(f"sqlite:///{db_path}")
+        try:
+            models.PipelineChunkState.__table__.create(engine, checkfirst=True)
+        finally:
+            engine.dispose()
+    except sa.exc.OperationalError as e:
+        msg = str(e).lower()
+        if "readonly database" not in msg and "attempt to write a readonly database" not in msg:
+            raise
 
     conn = sqlite3.connect(db_path)
     cur = conn.cursor()
