@@ -5,7 +5,11 @@ Owns the three collaborators that share the engine flush primitives
 
 * ``RecorderPrivacyFilter`` — capture-time policy enforcement; constructor
   honours ``cloud_intent`` (forces ``PrivacyMode.PUBLIC``) and the
-  window-data gate.
+  window-data gate. Capture-time VIDEO blocking is gated behind
+  ``config.get_masked_video_upload_enabled()`` (U4b): OFF (default) blocks
+  sensitive-app video at capture as today; ON captures rich video for all
+  destinations (the input U6 masks post-hoc). See
+  ``build_recorder_privacy_filter`` for the loud flag-ON safety caveat.
 * ``ChunkProcessor``        — per-chunk transcribe / export / upload thread.
 * ``ScrubWorker``           — sidecar thread that processes menu-bar disable
   jobs against the live ``recording.db``.
@@ -140,12 +144,40 @@ class RecordingCollaborators:
         if not capture_window_data:
             return None, privacy_config, override_file
 
+        # U4b — the SINGLE switch that makes capture-time VIDEO blocking
+        # conditional. ``get_masked_video_upload_enabled()`` defaults to
+        # False, so ``block_video`` defaults to True and the filter blocks
+        # sensitive-app video frames at capture EXACTLY as it does today
+        # (flag-OFF is byte-for-byte the prior behavior). When the flag is
+        # ON, ``block_video`` is False: the filter no longer drops video
+        # frames (capture goes rich for every destination, the input U6's
+        # post-hoc masker consumes), while PUBLIC-forcing above and the
+        # filter's screenshot/keystroke/background-mask roles stay active —
+        # those are separate mechanisms U6 does NOT replace.
+        #
+        # ⚠️ SAFETY — DO NOT FLIP THIS FLAG ON YET. The flag-ON path is NOT
+        # end-to-end safe. With the flag ON, a cloud recording captures rich
+        # (unblocked) video, but the LIVE in-process upload (chunk_processor
+        # during recording / the existing finalize_uploads) is NOT yet routed
+        # through U6's post-hoc masker — only U7's terminal stage is, and U7
+        # was integrated conservatively (it did not take over the live
+        # finalize). So flipping this ON today could ship UNMASKED video to
+        # the cloud via the live upload path. The flag must stay OFF until the
+        # live-upload → terminal-stage cutover lands AND the native-redaction-
+        # review "what uploads" surface is reconciled (it still labels video
+        # "local-only, not uploaded"). U4b only makes capture-time blocking
+        # flag-conditional; it does NOT enable a safe flag-ON cloud upload.
+        from screencap.config import get_masked_video_upload_enabled
+
+        block_video = not get_masked_video_upload_enabled()
+
         screen_filter = RecorderPrivacyFilter(
             privacy_config,
             cloud_intent=self._request.cloud_intent,
             window_feed_q=self._channels.window_feed,
             override_q=self._channels.override,
             override_file=override_file,
+            block_video=block_video,
         )
         return screen_filter, privacy_config, override_file
 

@@ -664,6 +664,78 @@ class TestCloudIntent:
         assert f.is_screen_allowed() is False
 
 
+class TestBlockVideoGate:
+    """U4b: capture-time VIDEO blocking is gated behind ``block_video``.
+
+    ``block_video=True`` (the default) preserves today's behavior exactly —
+    an EXCLUDE/MASK_WINDOW app drops video frames at capture. ``block_video=
+    False`` (flag ON) captures rich video for all destinations while leaving
+    screenshot gating and keystroke nulling untouched (those are separate
+    mechanisms U6's post-hoc video masker does NOT replace).
+    """
+
+    def test_block_video_defaults_to_true(self):
+        """Default constructor blocks video for an excluded app (today's behavior)."""
+        config = _make_config(
+            exclude_apps=frozenset({"com.1password.1password"}),
+        )
+        f = RecorderPrivacyFilter(
+            config, transition_hold_seconds=0.0, secure_input_fn=None,
+        )
+
+        f.on_window_event({
+            "app_bundle_id": "com.1password.1password",
+            "title": "1Password",
+        })
+
+        disp = f.get_capture_disposition()
+        # Byte-for-byte today: excluded app blocks screen AND video.
+        assert disp.screen_allowed is False
+        assert disp.video_allowed is False
+
+    def test_block_video_false_allows_video_for_excluded_app(self):
+        """Flag ON: an excluded app no longer drops video frames (rich capture)."""
+        config = _make_config(
+            exclude_apps=frozenset({"com.1password.1password"}),
+        )
+        f = RecorderPrivacyFilter(
+            config, transition_hold_seconds=0.0, secure_input_fn=None,
+            block_video=False,
+        )
+
+        f.on_window_event({
+            "app_bundle_id": "com.1password.1password",
+            "title": "1Password",
+        })
+
+        disp = f.get_capture_disposition()
+        # Video is captured rich even for the excluded app...
+        assert disp.video_allowed is True
+        # ...but screenshot gating and keystroke nulling are UNAFFECTED.
+        assert disp.screen_allowed is False
+        assert disp.keystrokes_allowed is False
+
+    def test_block_video_false_does_not_change_allowed_app(self):
+        """Flag ON for a non-blocked app: everything still allowed (no regression)."""
+        config = _make_config(
+            exclude_apps=frozenset({"com.1password.1password"}),
+        )
+        f = RecorderPrivacyFilter(
+            config, transition_hold_seconds=0.0, secure_input_fn=None,
+            block_video=False,
+        )
+
+        f.on_window_event({
+            "app_bundle_id": "com.microsoft.VSCode",
+            "title": "main.py — project",
+        })
+
+        disp = f.get_capture_disposition()
+        assert disp.screen_allowed is True
+        assert disp.video_allowed is True
+        assert disp.keystrokes_allowed is True
+
+
 class TestBlockedIntervalTracking:
     """Tests for Phase 6: blocked interval recording."""
 
