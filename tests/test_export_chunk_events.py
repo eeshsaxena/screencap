@@ -259,6 +259,60 @@ class TestWindowFilter:
         assert ws[0].title == "MASKED"
 
 
+class TestAgnosticRunnerExportAppliesNoCloudFilter:
+    """U5: the destination-agnostic ``PipelineStageRunner`` applies NO cloud
+    window filter in its own code (R4). Driving the runner with a plain
+    ``export_chunk_events`` (``window_filter=None``, the local-only seam)
+    yields unfiltered window titles — the runner never re-homes the cloud
+    filter into the agnostic export. The cloud filter stays in the caller's
+    injected step (chunk_processor), audited by
+    ``test_privacy_filter_call_graph.py``.
+    """
+
+    def test_runner_export_does_not_filter_window_titles(self, recording_db):
+        from screencap.engine.events import WindowSwitchEvent
+        from screencap.export import export_chunk_events
+        from screencap.exporter import build_export_metadata, write_events_jsonl
+        from screencap.pipeline_stages import PipelineStageRunner
+
+        # A window title that a cloud filter WOULD redact, plus an in-chunk
+        # action so the slice isn't empty.
+        _insert_window(
+            recording_db, 0.05,
+            title="Secret Customer PII", bundle_id="com.app", window_id="w-1",
+        )
+        _insert_action(
+            recording_db, 0.10, "click",
+            mouse_x=1, mouse_y=1, mouse_button_name="left", mouse_pressed=1,
+        )
+        recording_db.session.commit()
+
+        capture_dir = recording_db.db_path.parent
+        events_path = capture_dir / "events_0000.jsonl"
+
+        # The injected export step the runner gets is the AGNOSTIC one: a
+        # plain export with window_filter=None (NOT build_cloud_window_filter).
+        def agnostic_export(idx, s, e):
+            events_iter = export_chunk_events(capture_dir, s, e, window_filter=None)
+            meta = build_export_metadata(exclude_moves=False)
+            write_events_jsonl(events_path, events_iter, meta)
+            return events_path
+
+        runner = PipelineStageRunner(
+            capture_dir,
+            transcribe=lambda idx: None,
+            export_events=agnostic_export,
+            manifest=lambda idx, s, e: (capture_dir / "m.json"),
+            ledger=None,
+        )
+        artifacts = runner.run_chunk(0, recording_db._base_ts, recording_db._base_ts + 1.0)
+
+        # The window title reached the export VERBATIM — no cloud masking
+        # was applied by the runner.
+        text = artifacts.events.read_text()
+        assert "Secret Customer PII" in text
+
+
 class TestDisabledRows:
     """Rows with ``disabled=1`` are excluded (R16)."""
 
