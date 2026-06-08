@@ -193,6 +193,50 @@ class TestAE12DecisionTimeRace:
         release_winner.set()
         holder.join(timeout=5)
 
+    def test_in_process_lock_serializes_when_flock_unsupported(self, monkeypatch):
+        """SCR-124: on a flock-unsupported filesystem (NFS/SMB/sandbox) the
+        cross-process flock degrades to unlocked, but the in-process lock must
+        still serialize THREADS in one process — the most likely race (a daemon
+        finalize vs. a manual upload vs. the viewer concat).
+        """
+        import errno as _errno
+
+        from screencap import terminal_stage as ts
+
+        # Simulate a filesystem where flock is unsupported: terminal_lock then
+        # degrades to "in-process lock only".
+        def _flock_unsupported(fd, op):
+            raise OSError(_errno.EOPNOTSUPP, "flock unsupported")
+
+        monkeypatch.setattr(ts.fcntl, "flock", _flock_unsupported)
+
+        name = "scr124-inproc-test"
+        holder_in = threading.Event()
+        release = threading.Event()
+
+        def _holder():
+            with ts.terminal_lock(name):
+                holder_in.set()
+                release.wait(timeout=5)
+
+        holder = threading.Thread(target=_holder)
+        holder.start()
+        assert holder_in.wait(timeout=5)
+
+        # A second concurrent acquire (non-blocking) must be refused by the
+        # in-process lock even though flock is a no-op on this filesystem —
+        # without the fix both would proceed unserialized.
+        with pytest.raises(ts.TerminalStageBusy):
+            with ts.terminal_lock(name, non_blocking=True):
+                pass
+
+        release.set()
+        holder.join(timeout=5)
+
+        # And once released, the lock is reusable (no leak).
+        with ts.terminal_lock(name, non_blocking=True):
+            pass
+
 
 # ---------------------------------------------------------------------------
 # Routing — local vs cloud (AE1, AE4, AE7).

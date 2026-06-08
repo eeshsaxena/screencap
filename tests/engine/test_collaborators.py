@@ -723,6 +723,11 @@ class _StubChunkProcessor:
     def reconcile_against_gcs(self) -> int:
         return 0
 
+    def freeze_expected_chunks(self, count: int) -> None:
+        # finalize freezes the ledger's chunks_expected at the closed set;
+        # the stub records it so tests can assert the call without a real DB.
+        self.frozen_expected = count
+
 
 def test_finalize_uploads_partial_path_does_not_nameerror(tmp_path):
     """Short recording with no chunk files must finalize without NameError.
@@ -773,3 +778,43 @@ def test_finalize_uploads_partial_path_does_not_nameerror(tmp_path):
     payload = json.loads(followup_path.read_text())
     assert payload["n_uploaded"] == 0
     assert payload["n_total"] == 0
+
+
+def test_finalize_uploads_freezes_chunks_expected_at_closed_set(tmp_path):
+    """SCR-123: finalize MUST freeze the ledger's chunks_expected at the closed
+    set, otherwise the AE8 promotion guard + finalize gate are inert in
+    production (chunks_expected stays None — nothing else freezes it). Pins the
+    wiring: finalize calls cp.freeze_expected_chunks with the manifest count.
+    """
+    from screencap.engine.collaborators import RecordingCollaborators
+    from screencap.engine.config import RecordingConfig
+    from screencap.engine.screen_recorder import (
+        IpcChannels,
+        LegacyOptions,
+        RecordingRequest,
+    )
+
+    capture_dir = tmp_path / "rec"
+    capture_dir.mkdir()
+    # A closed set of 3 chunks (the manifest count is the frozen "expected").
+    for i in range(3):
+        (capture_dir / f"chunk_{i:04d}_manifest.json").write_text("{}")
+
+    request = RecordingRequest(name="rec3", config=RecordingConfig())
+    helper = RecordingCollaborators(
+        request=request,
+        legacy=LegacyOptions(live_upload=True),
+        channels=IpcChannels.create(),
+    )
+    helper._chunk_processor = _StubChunkProcessor(all_uploaded=True, summary=(3, 3))
+
+    helper.finalize_uploads(
+        capture_dir=capture_dir,
+        stop_reason="graceful",
+        recording_name="rec3",
+    )
+
+    assert getattr(helper._chunk_processor, "frozen_expected", None) == 3, (
+        "finalize must freeze chunks_expected to the closed-set manifest count "
+        "(3) — without it the AE8 guard never fires"
+    )

@@ -528,6 +528,32 @@ class ChunkProcessor:
         except Exception as e:  # noqa: BLE001
             logger.debug(f"Chunk {idx}: ledger status mirror failed (non-fatal): {e}")
 
+    def freeze_expected_chunks(self, count: int) -> None:
+        """Freeze the ledger's ``chunks_expected`` to ``count`` at finalize.
+
+        Called once at recording finalize (``collaborators.finalize_uploads``),
+        when the chunk set is closed, so the U1 ledger's
+        ``finalize_gate_satisfied`` and the U9 AE8 promotion guard
+        (``detect_promotion_holes``) have a real frozen count to gate on.
+        WITHOUT this, ``chunks_expected`` is never frozen on any production path
+        and both gates become inert (the promotion guard silently passes every
+        recording — the exact partial-upload data loss AE8 exists to refuse).
+
+        Best-effort and non-fatal (mirrors ``_mirror_status_to_ledger``): a
+        no-ledger fixture or a transient failure must never break finalize.
+        ``freeze_chunks_expected`` is idempotent on the same count and refuses a
+        conflicting refreeze (``LedgerError``) — both are swallowed here.
+        """
+        if count <= 0:
+            return  # nothing to gate on (0-chunk / legacy single-file).
+        ledger = self._get_ledger()
+        if ledger is None:
+            return
+        try:
+            ledger.freeze_chunks_expected(count)
+        except Exception as e:  # noqa: BLE001
+            logger.debug(f"freeze_chunks_expected({count}) failed (non-fatal): {e}")
+
     def _run_agnostic_stages(self, idx, start_ts, end_ts):
         """Run the destination-agnostic stages (transcribe/export/manifest).
 

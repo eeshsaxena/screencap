@@ -577,6 +577,13 @@ class RecordingCollaborators:
         )
         n_emitted, n_total = cp.upload_summary()
         n_chunks = len(list(capture_dir.glob("chunk_*_manifest.json")))
+        # Freeze the U1 ledger's chunks_expected NOW that the chunk set is closed
+        # (recording stopped, before any retention/eviction). This is the only
+        # production path that freezes it; without it the AE8 promotion guard and
+        # the finalize gate are inert (chunks_expected stays None). Runs for ALL
+        # destinations so a later local->cloud promotion can refuse on holes.
+        # Best-effort: never breaks finalize.
+        cp.freeze_expected_chunks(n_chunks)
         result["all_chunks_uploaded"] = all_uploaded
         result["n_uploaded"] = n_emitted
         result["n_total"] = n_total

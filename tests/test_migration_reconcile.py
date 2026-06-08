@@ -511,3 +511,60 @@ def test_promote_recording_to_cloud_ok_when_no_holes(tmp_path):
         ledger.mark_local_done(i)
     # No eviction — all media present.
     assert_promotable_to_cloud(d, remote_exists=_remote_set(set()))  # no raise
+
+
+def test_promotion_guard_production_shaped_no_prefreeze_no_injected_remote(
+    tmp_path, monkeypatch,
+):
+    """SCR-123 production-shaped AE8 guard: NO pre-frozen chunks_expected helper
+    and NO injected remote_exists predicate (the two fakes that let the inert
+    guard pass CI). chunks_expected is frozen via the real reconciler, and the
+    GCS confirm goes through the real ``_chunk_confirmed_remote`` path with only
+    ``request_signed_urls`` mocked at the network boundary. A chunk whose media
+    is evicted and is not in GCS must be refused.
+    """
+    from screencap.terminal_stage import (
+        PromotionRefused,
+        assert_promotable_to_cloud,
+    )
+
+    d = _make_old_path_recording(tmp_path, "rec", n_chunks=3, destination="cloud")
+
+    # Nothing is in GCS: request_signed_urls returns a (non-None) signed URL for
+    # every requested file -> "needs upload", i.e. NOT already present.
+    def _none_present(name, infos):
+        return ({fi.name: f"https://signed/{fi.name}" for fi in infos}, "prefix")
+
+    monkeypatch.setattr("screencap.upload.request_signed_urls", _none_present)
+
+    # Freeze chunks_expected via the REAL reconciler (remote_exists=None -> real
+    # confirm path), not a direct ledger.freeze_chunks_expected in the test.
+    ps.reconcile_ledger_from_disk(d)
+    assert ps.PipelineLedger(d / "recording.db").chunks_expected() == 3
+
+    # Evict chunk 1's media locally: gone from disk AND not in GCS -> a hole.
+    for nm in (
+        "chunk_0001.mp4", "audio_0001.flac",
+        "events_0001.jsonl", "chunk_0001_manifest.json",
+    ):
+        (d / nm).unlink()
+
+    with pytest.raises(PromotionRefused) as exc:
+        assert_promotable_to_cloud(d)  # remote_exists=None -> real GCS confirm
+    assert "1" in str(exc.value)
+
+
+def test_chunk_processor_freeze_expected_chunks_freezes_real_ledger(tmp_path):
+    """SCR-123: the production freeze method (called at finalize) actually
+    freezes the ledger's chunks_expected on a real recording.db."""
+    import queue
+
+    from screencap.chunk_processor import ChunkProcessor
+
+    d = _make_old_path_recording(
+        tmp_path, "rec", n_chunks=3, destination="cloud", seed_ledger=True,
+    )
+    cp = ChunkProcessor(d, queue.Queue(), queue.Queue(), recording_name="rec")
+    assert ps.PipelineLedger(d / "recording.db").chunks_expected() is None
+    cp.freeze_expected_chunks(3)
+    assert ps.PipelineLedger(d / "recording.db").chunks_expected() == 3

@@ -66,6 +66,7 @@ import errno
 import fcntl
 import logging
 import os
+import threading
 import time
 from dataclasses import dataclass, field
 from pathlib import Path
@@ -168,6 +169,25 @@ def _lock_path_for(name: str) -> Path:
     return _RUN_DIR / f"terminal-{name}.lock"
 
 
+# In-process per-recording locks. flock (below) serializes across PROCESSES but
+# degrades to unlocked on flock-unsupported filesystems (SCR-124); these locks
+# serialize THREADS within one process regardless of the filesystem, closing the
+# most likely race (a daemon finalize vs. a manual upload vs. the viewer concat,
+# all in one process) even when flock no-ops.
+_INPROC_LOCKS_GUARD = threading.Lock()
+_INPROC_LOCKS: dict[str, threading.Lock] = {}
+
+
+def _inproc_lock_for(name: str) -> threading.Lock:
+    """Return the process-wide lock for recording ``name`` (created on demand)."""
+    with _INPROC_LOCKS_GUARD:
+        lk = _INPROC_LOCKS.get(name)
+        if lk is None:
+            lk = threading.Lock()
+            _INPROC_LOCKS[name] = lk
+        return lk
+
+
 @contextlib.contextmanager
 def terminal_lock(
     name: str,
@@ -198,67 +218,91 @@ def terminal_lock(
     flock is advisory: it only excludes other holders of THIS lock. The kernel
     releases it on process death even if this contextmanager's ``finally`` is
     skipped (crash), so a crashed run never wedges the lock.
-    """
-    try:
-        _RUN_DIR.mkdir(parents=True, exist_ok=True)
-        with contextlib.suppress(OSError):
-            os.chmod(_RUN_DIR, 0o700)
-    except OSError:
-        # Sandboxed / read-only run dir — degrade to unlocked rather than
-        # blocking the operation, mirroring scrubber.recording_scrub_lock's
-        # best-effort posture. Strictly no worse than pre-lock behavior; log
-        # loudly so the lost serialization is visible.
-        logger.warning(
-            "terminal_lock: could not create run dir %s; proceeding UNLOCKED "
-            "for %s — concurrent runs are NOT serialized",
-            _RUN_DIR, name, exc_info=True,
-        )
-        yield
-        return
 
-    lock_path = _lock_path_for(name)
-    fd = os.open(str(lock_path), os.O_RDWR | os.O_CREAT, 0o600)
-    acquired = False
+    **In-process serialization (SCR-124).** flock serializes across PROCESSES
+    but degrades to unlocked on flock-unsupported filesystems (NFS/SMB/some
+    sandbox mounts). To keep the most likely race — two THREADS in one process
+    racing the destructive rmtree+copytree+upload — serialized even on those
+    mounts, a per-name in-process lock is acquired FIRST and held across the
+    whole critical section. Cross-process serialization on a no-flock mount
+    remains a documented gap.
+    """
+    # In-process lock FIRST (covers same-process threads even when flock no-ops).
+    inproc = _inproc_lock_for(name)
+    if non_blocking:
+        if not inproc.acquire(blocking=False):
+            raise TerminalStageBusy(
+                f"terminal stage for {name!r} is already running in this "
+                "process (non-blocking)"
+            )
+    elif not inproc.acquire(blocking=True, timeout=max(0.0, timeout)):
+        raise TerminalStageBusy(
+            f"terminal stage for {name!r} still busy after {timeout:.0f}s "
+            "(in-process lock)"
+        )
     try:
-        deadline = time.monotonic() + max(0.0, timeout)
-        while True:
-            try:
-                fcntl.flock(fd, fcntl.LOCK_EX | fcntl.LOCK_NB)
-                acquired = True
-                break
-            except BlockingIOError:
-                if non_blocking:
-                    raise TerminalStageBusy(
-                        f"terminal stage for {name!r} is already running "
-                        "(non-blocking)"
-                    ) from None
-                if time.monotonic() >= deadline:
-                    raise TerminalStageBusy(
-                        f"terminal stage for {name!r} still busy after "
-                        f"{timeout:.0f}s — another run holds the lock"
-                    ) from None
-                time.sleep(_LOCK_POLL_INTERVAL)
-            except OSError as exc:
-                # NFS / virtual-FS flock unsupported (EOPNOTSUPP/EINVAL): the
-                # pidfile precedent closes the fd and propagates, but here a
-                # terminal run must not be permanently un-runnable on such a
-                # mount. Degrade to unlocked (loud warning), same as the
-                # run-dir failure above.
-                if exc.errno in (errno.EOPNOTSUPP, errno.EINVAL, errno.ENOLCK):
-                    logger.warning(
-                        "terminal_lock: flock unsupported on this filesystem "
-                        "(%s); proceeding UNLOCKED for %s",
-                        exc.strerror, name,
-                    )
-                    break
-                raise
-        yield
-    finally:
-        if acquired:
+        try:
+            _RUN_DIR.mkdir(parents=True, exist_ok=True)
             with contextlib.suppress(OSError):
-                fcntl.flock(fd, fcntl.LOCK_UN)
-        with contextlib.suppress(OSError):
-            os.close(fd)
+                os.chmod(_RUN_DIR, 0o700)
+        except OSError:
+            # Sandboxed / read-only run dir — degrade to no cross-process flock
+            # (the in-process lock is still held), mirroring
+            # scrubber.recording_scrub_lock's best-effort posture. Log loudly so
+            # the lost cross-process serialization is visible.
+            logger.warning(
+                "terminal_lock: could not create run dir %s; proceeding without "
+                "the cross-process flock for %s (in-process lock still held; "
+                "cross-process runs are NOT serialized)",
+                _RUN_DIR, name, exc_info=True,
+            )
+            yield
+            return
+
+        lock_path = _lock_path_for(name)
+        fd = os.open(str(lock_path), os.O_RDWR | os.O_CREAT, 0o600)
+        acquired = False
+        try:
+            deadline = time.monotonic() + max(0.0, timeout)
+            while True:
+                try:
+                    fcntl.flock(fd, fcntl.LOCK_EX | fcntl.LOCK_NB)
+                    acquired = True
+                    break
+                except BlockingIOError:
+                    if non_blocking:
+                        raise TerminalStageBusy(
+                            f"terminal stage for {name!r} is already running "
+                            "(non-blocking)"
+                        ) from None
+                    if time.monotonic() >= deadline:
+                        raise TerminalStageBusy(
+                            f"terminal stage for {name!r} still busy after "
+                            f"{timeout:.0f}s — another run holds the lock"
+                        ) from None
+                    time.sleep(_LOCK_POLL_INTERVAL)
+                except OSError as exc:
+                    # NFS / virtual-FS flock unsupported (EOPNOTSUPP/EINVAL): a
+                    # terminal run must not be permanently un-runnable on such a
+                    # mount. Degrade to the in-process lock only (loud warning).
+                    if exc.errno in (errno.EOPNOTSUPP, errno.EINVAL, errno.ENOLCK):
+                        logger.warning(
+                            "terminal_lock: flock unsupported on this filesystem "
+                            "(%s); proceeding with the in-process lock only for "
+                            "%s (cross-process runs NOT serialized)",
+                            exc.strerror, name,
+                        )
+                        break
+                    raise
+            yield
+        finally:
+            if acquired:
+                with contextlib.suppress(OSError):
+                    fcntl.flock(fd, fcntl.LOCK_UN)
+            with contextlib.suppress(OSError):
+                os.close(fd)
+    finally:
+        inproc.release()
 
 
 # ---------------------------------------------------------------------------
@@ -893,31 +937,46 @@ def _chunk_confirmed_remote(
 
     from screencap.upload import FileInfo, _content_type, request_signed_urls
 
-    # The cloud copy's scrubbed artifacts live in <name>-scrubbed; that is what
-    # was uploaded, so we re-stat those. Probe the chunk's core files only.
+    # Probe the chunk's core files across ALL the dirs they can live in. The
+    # scrubbed copy STRIPS media (scrubber._SKIP_EXTENSIONS skips .mp4/.flac),
+    # so the chunk's VIDEO/AUDIO live in the SOURCE dir (the live path uploads
+    # them from there) while the scrubbed events/manifest live in <name>-scrubbed
+    # (and the masked cloud video, when the flag is on, lives in masked_video/).
+    # Probing only the scrubbed dir would judge "confirmed" on events+manifest
+    # alone and miss the video — a media-blind false positive (SCR-123). Search
+    # source -> masked_video -> scrubbed for each name, and REQUIRE the video.
     scrubbed_dir = recording_dir.parent / f"{recording_dir.name}-scrubbed"
-    base = scrubbed_dir if scrubbed_dir.exists() else recording_dir
+    masked_dir = scrubbed_dir / "masked_video"
+    search_dirs = [d for d in (recording_dir, masked_dir, scrubbed_dir) if d.exists()]
+    video_name = f"chunk_{idx:04d}.mp4"
     core_names = [
-        f"chunk_{idx:04d}.mp4",
+        video_name,
         f"audio_{idx:04d}.flac",
         f"events_{idx:04d}.jsonl",
         f"chunk_{idx:04d}_manifest.json",
     ]
     infos: list[FileInfo] = []
+    seen: set[str] = set()
     for nm in core_names:
-        p = base / nm
-        if p.exists() and p.stat().st_size > 0:
-            infos.append(FileInfo(nm, p, _content_type(p), p.stat().st_size))
-    if not infos:
+        for d in search_dirs:
+            p = d / nm
+            if p.exists() and p.stat().st_size > 0:
+                infos.append(FileInfo(nm, p, _content_type(p), p.stat().st_size))
+                seen.add(nm)
+                break
+    # The VIDEO must be present locally to probe — events+manifest alone is the
+    # media-blind confirm. If the video is gone everywhere locally we cannot
+    # prove it is in GCS, so fail closed (conservative False): a reconcile leaves
+    # the chunk PENDING, a promotion refuses the hole, an eviction is refused.
+    if video_name not in seen or not infos:
         return False
     # Derive the GCS recording key EXACTLY as ``upload_recording`` does — from
-    # ``base/.recording_id`` (the original id, copied into <name>-scrubbed),
-    # NOT ``base.name`` (which would be "<name>-scrubbed" and probe the wrong
-    # prefix, so a confirmed chunk would never be recognized and a cloud
-    # recording would never finalize). Tests inject ``remote_exists`` so this
-    # mismatch is only reachable on the real-GCS path.
-    id_file = base / ".recording_id"
-    recording_name = id_file.read_text().strip() if id_file.exists() else base.name
+    # the SOURCE ``recording.db`` sibling ``.recording_id`` (the original id,
+    # also copied into <name>-scrubbed), NOT a dir basename (which would be
+    # "<name>-scrubbed" and probe the wrong prefix). Tests inject
+    # ``remote_exists`` so this is only reachable on the real-GCS path.
+    id_file = recording_dir / ".recording_id"
+    recording_name = id_file.read_text().strip() if id_file.exists() else recording_dir.name
     try:
         urls, _ = request_signed_urls(recording_name, infos)
     except Exception:  # noqa: BLE001
@@ -1100,9 +1159,15 @@ def detect_promotion_holes(
     if not expected:  # None or 0 — no closed chunk set to gate on.
         return []
 
+    # Iterate the actual SEEDED ledger rows (the closed set), not range(expected):
+    # the U9 reconciler / a sparse on-disk index set can leave non-contiguous
+    # chunk_index values, and an evicted chunk keeps its ledger row, so the seeded
+    # rows are the authoritative set to gate on (mirrors finalize_gate_satisfied).
+    rows = ledger.all_chunks()
     confirm = _make_promotion_confirm(recording_dir, remote_exists)
     holes: list[int] = []
-    for idx in range(expected):
+    for row in rows:
+        idx = row.chunk_index
         if _chunk_local_media_present(recording_dir, idx):
             continue  # rich local copy survives — upload can re-scrub it.
         if confirm(idx):
