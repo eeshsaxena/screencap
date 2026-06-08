@@ -385,6 +385,57 @@ class WindowGeometry(Base):
     window_list_json = sa.Column(sa.Text)
 
 
+class WindowGeometryCaptureFailure(Base):
+    """U4a durable, timestamped marker that a ``window_geometry`` insert failed.
+
+    The capture path samples ``window_geometry`` at roughly screenshot
+    cadence (~1 fps while typing, faster on drag/scroll), and the insert
+    in ``recorder.write_screen_event`` is best-effort. Video frames are
+    continuous, so a span between two geometry samples — or a span where
+    the insert silently failed — has NO recorded window bounds. The
+    post-hoc video masker (U6) must distinguish "geometry proves no
+    sensitive window" (case a, faithful unmasked copy) from "geometry
+    capture failed / was sparse" (case b, fail closed): a silent gap is
+    otherwise indistinguishable from "no sensitive window," which would
+    let an effectively-unmasked cloud video upload look fine.
+
+    This table is that durable, crash-surviving signal. One row is written
+    (best-effort, but LOUDLY — ``logger.warning``) each time an
+    ``insert_window_geometry`` call raises, keyed by ``recording_id`` +
+    the failed screenshot's ``screenshot_timestamp`` (== ``event.timestamp``).
+    U6 queries it per chunk ``[start_ts, end_ts]`` span: any overlapping row
+    means coverage for that span is unprovable → case (b), fail closed.
+
+    Local-only by rule (R8 / U2): it lives in ``recording.db``, which is
+    never uploaded, so the marker never leaves the machine.
+
+    Writes are unbuffered + immediate-commit (mirroring
+    ``insert_network_health`` / ``insert_network_event_meta``) so the marker
+    is durable before any subsequent crash — it must NOT ride the buffered
+    ``window_geometries`` insert path, whose whole point is throughput.
+    """
+
+    __tablename__ = "window_geometry_capture_failure"
+    __table_args__ = (
+        sa.Index(
+            "ix_window_geometry_capture_failure_recording_ts",
+            "recording_id", "screenshot_timestamp",
+        ),
+    )
+
+    id = sa.Column(sa.Integer, primary_key=True)
+    recording_id = sa.Column(
+        sa.ForeignKey("recording.id", ondelete="CASCADE"),
+        nullable=False,
+    )
+    recording_timestamp = sa.Column(ForceFloat)
+    # The timestamp of the screenshot whose geometry insert failed
+    # (== the screen ``event.timestamp``). U6 gates per-chunk on this.
+    screenshot_timestamp = sa.Column(ForceFloat, index=True)
+    # Optional free-text diagnostic (exception type/message). Local-only.
+    detail = sa.Column(sa.Text, nullable=True)
+
+
 class MemoryStat(Base):
     """Class representing a memory usage statistic in the database."""
 
