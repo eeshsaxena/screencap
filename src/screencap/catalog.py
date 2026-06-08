@@ -120,6 +120,47 @@ def find_db(directory: Path) -> Path | None:
     return None
 
 
+def _ledger_has_uploaded_chunk(db_path: Path) -> bool | None:
+    """True iff the U1 pipeline ledger records ≥1 confirmed-uploaded chunk.
+
+    READ-ONLY probe of the ``pipeline_chunk_state`` table: ``upload_state ==
+    'uploaded'`` (an ``EVICTED`` chunk keeps its ``UPLOADED`` upload_state per
+    the U1 contract, so an uploaded-then-evicted recording still reads True).
+
+    Returns ``None`` when there is no ledger to consult — the table does not
+    exist (legacy / not-yet-seeded recording) or the DB is unreadable — so the
+    caller falls back to the file-presence heuristics (R14). Deliberately does
+    NOT migrate the schema: catalog listing is read-only and must never ALTER a
+    recording.db (that would change its content hash and defeat the
+    scrubbed-copy reuse check on the upload path, mirroring
+    ``terminal_stage._open_ledger_readonly``).
+    """
+    import sqlite3
+
+    try:
+        conn = sqlite3.connect(f"file:{db_path}?mode=ro", uri=True)
+    except sqlite3.Error:
+        return None
+    try:
+        has_ledger = conn.execute(
+            "SELECT name FROM sqlite_master WHERE type='table' "
+            "AND name='pipeline_chunk_state'"
+        ).fetchone()
+        if has_ledger is None:
+            return None  # no ledger — fall back to file-presence heuristics.
+        return (
+            conn.execute(
+                "SELECT 1 FROM pipeline_chunk_state "
+                "WHERE upload_state='uploaded' LIMIT 1"
+            ).fetchone()
+            is not None
+        )
+    except sqlite3.Error:
+        return None
+    finally:
+        conn.close()
+
+
 def _read_recording_meta(db_path: Path) -> tuple[float | None, float | None]:
     """Read (started_timestamp, duration_seconds) from a recording.db."""
     try:
@@ -214,7 +255,17 @@ def list_recordings(recordings_dir: Path | None = None) -> list[RecordingInfo]:
         # these -> is_chunked False and stays listable/readable via video.mp4.
         is_chunked = chunks_total > 0
 
-        uploaded = uploaded_legacy or chunks_uploaded > 0
+        # Consult the U1 ledger (read-only) when present: the unified pipeline
+        # uploads from the source dir and records confirmed uploads in
+        # `pipeline_chunk_state`, so a chunked recording can be genuinely
+        # uploaded (and later evicted) WITHOUT the legacy `.chunk_*_status.json`
+        # markers the file heuristics key off. `None` = no ledger (legacy / not
+        # seeded) -> fall back to file-presence only (R14).
+        ledger_uploaded = bool(
+            db is not None and _ledger_has_uploaded_chunk(db)
+        )
+
+        uploaded = uploaded_legacy or chunks_uploaded > 0 or ledger_uploaded
 
         # For stubbed recordings, check chunk status files for audio evidence
         if not has_audio and chunks_uploaded > 0:
@@ -231,6 +282,22 @@ def list_recordings(recordings_dir: Path | None = None) -> list[RecordingInfo]:
         # are ignored — pathlib glob matches dotfiles, and a lingering review
         # artifact (.video_review.mp4) must never mask a stub (R6). A real
         # video.mp4 is non-hidden, so the *.mp4 glob already covers it.
+        #
+        # Derived from CHUNKS (R2), never from a single `video.mp4` being the
+        # record: the `*.mp4` glob counts surviving `chunk_*.mp4` as media, so a
+        # chunked recording with chunks still on disk is correctly NOT a stub
+        # even though it has no merged `video.mp4` (that is a derived on-demand
+        # artifact — see `viewer._ensure_single_video`).
+        #
+        # Ledger-aware (U10): an uploaded chunked recording whose media was
+        # evicted post-upload-confirm is a LEGITIMATE stub. Folding
+        # `ledger_uploaded` into `uploaded` above makes the unified pipeline's
+        # uploaded-then-evicted recording read as uploaded even without legacy
+        # `.chunk_*_status.json` markers, so the `uploaded and not has_media`
+        # rule below classifies it correctly. The ledger NEVER manufactures a
+        # FALSE stub: a FAILED chunk (fail-closed) is never UPLOADED so it cannot
+        # set `ledger_uploaded`, and a locally-evicted recording (LOCAL_DONE ->
+        # EVICTED, never uploaded) keeps `uploaded == False` — neither is a stub.
         has_media = (
             any(not p.name.startswith(".") for p in d.glob("*.mp4"))
             or any(not p.name.startswith(".") for p in d.glob("*.flac"))

@@ -198,7 +198,7 @@ def test_list_recordings_legacy_no_intent(recordings_dir):
 
 def test_list_recordings_populates_raw_started_at(recordings_dir):
     """RecordingInfo.started_at carries the Unix timestamp from the recording row."""
-    d = _make_recording(recordings_dir, "raw-fields-rec", duration=42.5)
+    _make_recording(recordings_dir, "raw-fields-rec", duration=42.5)
     result = list_recordings(recordings_dir)
     assert len(result) == 1
     info = result[0]
@@ -306,6 +306,153 @@ def test_stub_chunked_recording_flagged_is_chunked(recordings_dir):
         (d / f".chunk_chunk_{i:04d}_status.json").write_text("{}")
     info = list_recordings(recordings_dir)[0]
     assert info.is_chunked is True
+
+
+# --- U10: chunks-are-the-record stub detection (R2), ledger-aware ---
+
+
+def _seed_ledger(d: Path, n: int, *, uploaded: bool, evicted: bool = False):
+    """Seed a U1 ledger for ``d`` with ``n`` chunks in the given upload state.
+
+    ``uploaded`` marks every chunk UPLOADED; ``evicted`` additionally walks each
+    through the begin/commit eviction transitions (UPLOADED -> EVICTED) so the
+    ledger reflects a post-upload-confirm reclaim.
+    """
+    from screencap.pipeline_state import PipelineLedger, ensure_pipeline_state_schema
+
+    db_path = d / "recording.db"
+    ensure_pipeline_state_schema(db_path)
+    led = PipelineLedger(db_path)
+    for i in range(n):
+        led.seed_chunk(i)
+    led.freeze_chunks_expected(n)
+    if uploaded:
+        for i in range(n):
+            led.mark_uploaded(i)
+    if evicted:
+        for i in range(n):
+            led.begin_eviction(i, remote_exists=lambda: True)
+            led.commit_eviction(i, unlink=lambda: None)
+    return led
+
+
+def test_chunked_recording_with_chunks_is_not_a_false_stub(recordings_dir):
+    """R2: the chunk set is the record. A chunked recording whose chunks are
+    still on disk is NOT a stub even though it has no single ``video.mp4`` (the
+    merged file is a derived on-demand artifact, not the record). Detection must
+    not rely on a single ``video.mp4`` being present."""
+    d = _make_recording(recordings_dir, "chunked-live", duration=30)
+    _add_chunks(d, 3)
+    # Uploaded, but the rich chunk media is still present (not yet evicted).
+    _seed_ledger(d, 3, uploaded=True)
+    assert not (d / "video.mp4").exists(), "no merged video.mp4 — chunks are the record"
+
+    info = list_recordings(recordings_dir)[0]
+    assert info.is_chunked is True
+    assert info.uploaded is True
+    assert info.is_stub is False, "chunks present on disk -> not a stub"
+
+
+def test_uploaded_then_evicted_chunked_recording_is_a_legitimate_stub(recordings_dir):
+    """An uploaded chunked recording whose media was evicted post-upload-confirm
+    is a LEGITIMATE stub — derived from the ledger's UPLOADED state, with no
+    legacy ``.chunk_*_status.json`` markers and no merged ``video.mp4``."""
+    d = _make_recording(recordings_dir, "evicted-stub", duration=30)
+    # Manifests survive eviction; the chunk_*.mp4 media is gone (evicted).
+    for i in range(2):
+        (d / f"chunk_{i:04d}_manifest.json").write_text("{}")
+    _seed_ledger(d, 2, uploaded=True, evicted=True)
+    assert not any(d.glob("chunk_*.mp4")), "media evicted"
+    assert not any(d.glob(".chunk_*_status.json")), "no legacy upload markers"
+
+    info = list_recordings(recordings_dir)[0]
+    assert info.is_chunked is True
+    assert info.uploaded is True, "ledger UPLOADED state makes it uploaded"
+    assert info.is_stub is True, "uploaded + media evicted = legitimate stub"
+
+
+def test_ledger_failed_chunk_is_not_a_false_stub(recordings_dir):
+    """The ledger never manufactures a FALSE stub: a chunked recording whose
+    chunks FAILED cloud masking (fail-closed, never UPLOADED) with its local
+    media preserved is NOT uploaded and NOT a stub."""
+    from screencap.pipeline_state import PipelineLedger, ensure_pipeline_state_schema
+
+    d = _make_recording(recordings_dir, "failed-rec", duration=30)
+    _add_chunks(d, 2)
+    db_path = d / "recording.db"
+    ensure_pipeline_state_schema(db_path)
+    led = PipelineLedger(db_path)
+    for i in range(2):
+        led.seed_chunk(i)
+    led.freeze_chunks_expected(2)
+    for i in range(2):
+        led.mark_failed(i, detail="video_mask FAILED")
+
+    info = list_recordings(recordings_dir)[0]
+    assert info.uploaded is False, "FAILED chunks are never UPLOADED"
+    assert info.is_stub is False, "fail-closed local media preserved -> not a stub"
+
+
+def test_locally_evicted_recording_is_not_a_stub(recordings_dir):
+    """A local recording (never uploaded) whose chunks were evicted under a
+    size/time cap (LOCAL_DONE -> EVICTED) is NOT a stub — `uploaded` stays
+    False, so the ledger never flips it to a stub."""
+    from screencap.pipeline_state import PipelineLedger, ensure_pipeline_state_schema
+
+    d = _make_recording(recordings_dir, "local-evicted", duration=30)
+    (d / f"chunk_{0:04d}_manifest.json").write_text("{}")
+    db_path = d / "recording.db"
+    ensure_pipeline_state_schema(db_path)
+    led = PipelineLedger(db_path)
+    led.seed_chunk(0)
+    led.freeze_chunks_expected(1)
+    led.mark_local_done(0)
+    led.begin_local_eviction(0)
+    led.commit_eviction(0, unlink=lambda: None)
+
+    info = list_recordings(recordings_dir)[0]
+    assert info.uploaded is False, "local recording was never uploaded"
+    assert info.is_stub is False, "local eviction is not a stub (R11)"
+
+
+def test_pre_u1_recording_without_ledger_table_classifies_via_files(recordings_dir):
+    """Backward-compat (R14): a genuinely pre-U1 recording.db (no
+    ``pipeline_chunk_state`` table at all) falls back to the file-presence
+    heuristics unchanged — the read-only ledger probe returns None and must not
+    migrate the schema or alter classification."""
+    import sqlite3
+
+    d = _make_recording(recordings_dir, "pre-u1-uploaded", duration=30)
+    # Simulate a pre-U1 DB by dropping the ledger table the current engine adds.
+    conn = sqlite3.connect(d / "recording.db")
+    try:
+        conn.execute("DROP TABLE IF EXISTS pipeline_chunk_state")
+        conn.commit()
+        assert (
+            conn.execute(
+                "SELECT name FROM sqlite_master WHERE type='table' "
+                "AND name='pipeline_chunk_state'"
+            ).fetchone()
+            is None
+        )
+    finally:
+        conn.close()
+    (d / ".upload_status.json").write_text("{}")  # legacy upload marker, no media
+
+    info = list_recordings(recordings_dir)[0]
+    assert info.uploaded is True
+    assert info.is_stub is True, "legacy uploaded + no media still classifies as a stub"
+
+
+def test_empty_ledger_table_falls_back_to_file_heuristics(recordings_dir):
+    """A current-engine recording.db has an (empty) ``pipeline_chunk_state``
+    table; with no UPLOADED rows the ledger probe contributes nothing and
+    classification is identical to the pre-ledger file-presence path."""
+    d = _make_recording(recordings_dir, "empty-ledger-uploaded", duration=30)
+    (d / ".upload_status.json").write_text("{}")  # legacy upload marker, no media
+    info = list_recordings(recordings_dir)[0]
+    assert info.uploaded is True
+    assert info.is_stub is True
 
 
 # --- get_seen_bundle_ids tests ---
