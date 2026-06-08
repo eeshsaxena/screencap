@@ -660,6 +660,28 @@ class PipelineLedger:
         finally:
             conn.close()
 
+    def updated_at_map(self, indices: list[int]) -> dict[int, float]:
+        """Return ``{chunk_index: updated_at}`` for the given chunk indices.
+
+        Used by retention's age-based eviction (``delete_after_days``) to read
+        each candidate's last-modified epoch through the ledger's own
+        connection/locking discipline, rather than callers reaching into private
+        attributes. Rows with a NULL ``updated_at`` are omitted.
+        """
+        if not indices:
+            return {}
+        placeholders = ",".join("?" for _ in indices)
+        conn = self._connect()
+        try:
+            rows = conn.execute(
+                "SELECT chunk_index, updated_at FROM pipeline_chunk_state "
+                f"WHERE recording_id=? AND chunk_index IN ({placeholders})",
+                [self._recording_id, *indices],
+            ).fetchall()
+            return {int(r[0]): float(r[1]) for r in rows if r[1] is not None}
+        finally:
+            conn.close()
+
     def chunks_in_state(
         self,
         *,

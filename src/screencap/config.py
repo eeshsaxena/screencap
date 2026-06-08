@@ -211,7 +211,12 @@ def get_chunk_duration() -> float:
 
 
 def get_auto_delete_after_upload() -> bool:
-    """Return whether to auto-delete chunks after confirmed upload. Default True.
+    """Return whether to auto-delete chunks after confirmed upload. Default False.
+
+    The retention default is now ``keep_forever`` (R11), so with no ``[retention]``
+    block, no legacy ``auto_delete_after_upload``, and no env override this returns
+    False; it is True only when the resolved policy is ``delete_after_upload``
+    (legacy ``auto_delete_after_upload = true`` still maps to that).
 
     .. deprecated::
         Backward-compat shim. The retention policy is now expressed as a

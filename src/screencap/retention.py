@@ -619,24 +619,10 @@ def _ledger_age_reader(
     """Build a reader returning {chunk_index: updated_at} for the candidates."""
 
     def _reader(candidates: list["ChunkRow"]) -> dict[int, float]:
-        import sqlite3
-
         if not candidates:
             return {}
-        idxs = [c.chunk_index for c in candidates]
-        placeholders = ",".join("?" for _ in idxs)
         try:
-            conn = sqlite3.connect(str(ledger._db_path))
-            conn.execute("PRAGMA busy_timeout=10000")
-            try:
-                rows = conn.execute(
-                    "SELECT chunk_index, updated_at FROM pipeline_chunk_state "
-                    f"WHERE recording_id=? AND chunk_index IN ({placeholders})",
-                    [ledger._recording_id, *idxs],
-                ).fetchall()
-            finally:
-                conn.close()
-            return {int(r[0]): float(r[1]) for r in rows if r[1] is not None}
+            return ledger.updated_at_map([c.chunk_index for c in candidates])
         except Exception as exc:  # noqa: BLE001
             logger.debug("retention: age read failed (%s); treating as fresh", exc)
             return {}

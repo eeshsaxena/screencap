@@ -445,6 +445,24 @@ class TestRetentionPolicy:
         with mock.patch.dict(os.environ, {"SCREENCAP_RETENTION_POLICY": "delete_after_upload"}):
             assert get_retention_policy() == ("delete_after_upload", {})
 
+    def test_auto_delete_shim_defaults_false(self):
+        """The deprecated bool shim returns False with no config (keep_forever default)."""
+        import screencap.config as cfg
+        from screencap.config import get_auto_delete_after_upload
+
+        with mock.patch.dict(os.environ, _clear_retention_env(), clear=True):
+            cfg._config_cache = {}
+            assert get_auto_delete_after_upload() is False
+
+    def test_auto_delete_shim_true_on_legacy_flag(self):
+        """Legacy top-level auto_delete_after_upload=true still maps to True."""
+        import screencap.config as cfg
+        from screencap.config import get_auto_delete_after_upload
+
+        with mock.patch.dict(os.environ, _clear_retention_env(), clear=True):
+            cfg._config_cache = {"auto_delete_after_upload": True}
+            assert get_auto_delete_after_upload() is True
+
     def test_env_invalid_policy(self):
         from screencap.config import get_retention_policy
 
