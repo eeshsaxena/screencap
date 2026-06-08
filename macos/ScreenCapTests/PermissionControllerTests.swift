@@ -260,6 +260,130 @@ final class PermissionControllerTests: XCTestCase {
         permissions.stopDaemonGrantWatching()
     }
 
+    // MARK: - U8: daemon-driven registration Grant flow
+
+    @MainActor
+    private func makeRegisteringController(
+        registrar: @escaping PermissionController.DaemonPermissionRegistrar,
+        opener: @escaping @MainActor (PrivacyPane) -> Void
+    ) -> PermissionController {
+        let suite = "test-\(UUID().uuidString)"
+        let defaults = UserDefaults(suiteName: suite)!
+        defaults.removePersistentDomain(forName: suite)
+        return PermissionController(
+            defaults: defaults,
+            daemonRegistrar: registrar,
+            daemonSettingsOpener: opener
+        )
+    }
+
+    func testPrivacyPanePermissionStringMatchesDaemonContract() {
+        XCTAssertEqual(PrivacyPane.screenRecording.permissionString, "screen_recording")
+        XCTAssertEqual(PrivacyPane.accessibility.permissionString, "accessibility")
+        XCTAssertEqual(PrivacyPane.inputMonitoring.permissionString, "input_monitoring")
+        // Microphone is not a daemon-registered permission.
+        XCTAssertNil(PrivacyPane.microphone.permissionString)
+        // Round-trips back through from(permissionString:).
+        for pane in [PrivacyPane.screenRecording, .accessibility, .inputMonitoring] {
+            XCTAssertEqual(PrivacyPane.from(permissionString: pane.permissionString!), pane)
+        }
+    }
+
+    @MainActor
+    func testDaemonRegistrationCallsRegistrarThenOpensSettings() async {
+        // AE2: the daemon registers for the permission, then the app opens the
+        // matching pane — ack BEFORE pane-open, with the correct permission.
+        var events: [String] = []
+        let permissions = makeRegisteringController(
+            registrar: { permission in events.append("register:\(permission)") },
+            opener: { pane in events.append("open:\(pane.rawValue)") }
+        )
+
+        await permissions.requestDaemonPermission(for: .accessibility)
+
+        XCTAssertEqual(events, ["register:accessibility", "open:accessibility"])
+    }
+
+    @MainActor
+    func testDaemonRegistrationRoutesEachPaneToItsPermission() async {
+        // R6: not screen-recording-only — each required pane forwards its own
+        // canonical permission string to the daemon verb.
+        for (pane, expected) in [
+            (PrivacyPane.screenRecording, "screen_recording"),
+            (.accessibility, "accessibility"),
+            (.inputMonitoring, "input_monitoring"),
+        ] {
+            var registered: [String] = []
+            let permissions = makeRegisteringController(
+                registrar: { permission in registered.append(permission) },
+                opener: { _ in }
+            )
+            await permissions.requestDaemonPermission(for: pane)
+            XCTAssertEqual(registered, [expected])
+        }
+    }
+
+    @MainActor
+    func testDaemonRegistrationOpensSettingsEvenWhenRegistrarThrows() async {
+        // Best-effort: a failed registration must still open the pane so the
+        // user can enable the helper manually (never a dead end), and the
+        // in-flight guard must be cleared on the error path.
+        var openedPanes: [PrivacyPane] = []
+        let permissions = makeRegisteringController(
+            registrar: { _ in throw DaemonClientError.timedOut(seconds: 1) },
+            opener: { pane in openedPanes.append(pane) }
+        )
+
+        await permissions.requestDaemonPermission(for: .inputMonitoring)
+
+        XCTAssertEqual(openedPanes, [.inputMonitoring])
+        XCTAssertFalse(permissions.isDaemonRegistering(.inputMonitoring))
+    }
+
+    @MainActor
+    func testDaemonRegistrationPerPaneInFlightGuardCollapsesConcurrentTaps() async {
+        // Concurrency (U5 guard, realized in U8): a second tap while a round-trip
+        // is outstanding is a no-op — exactly one registration in flight per pane.
+        var registrarCallCount = 0
+        let permissions = makeRegisteringController(
+            registrar: { _ in
+                registrarCallCount += 1
+                try? await Task.sleep(nanoseconds: 200_000_000)
+            },
+            opener: { _ in }
+        )
+
+        async let first: Void = permissions.requestDaemonPermission(for: .screenRecording)
+        // Let the first call enter the in-flight state before the second tap.
+        try? await Task.sleep(nanoseconds: 60_000_000)
+        XCTAssertTrue(permissions.isDaemonRegistering(.screenRecording))
+        await permissions.requestDaemonPermission(for: .screenRecording)  // no-op
+        await first
+
+        XCTAssertEqual(registrarCallCount, 1)
+        XCTAssertFalse(permissions.isDaemonRegistering(.screenRecording))
+    }
+
+    @MainActor
+    func testRequestAndOpenSettingsDaemonSubjectInvokesRegistrar() async {
+        // The synchronous public entrypoint (used by the Grant button) routes
+        // the .daemon subject into the async registration round-trip — no longer
+        // the old no-op that just opened the pane.
+        var registered: [String] = []
+        let permissions = makeRegisteringController(
+            registrar: { permission in registered.append(permission) },
+            opener: { _ in }
+        )
+
+        permissions.requestAndOpenSettings(for: .screenRecording, subject: .daemon)
+
+        // The Task is fire-and-forget; poll briefly until it runs.
+        for _ in 0..<100 where registered.isEmpty {
+            try? await Task.sleep(nanoseconds: 10_000_000)
+        }
+        XCTAssertEqual(registered, ["screen_recording"])
+    }
+
     func testGrantRowIconsAreThreeDistinctStates() {
         // Indeterminate must read as "couldn't verify" — never a granted check
         // or a denied needs-action. All three labels must be distinct.

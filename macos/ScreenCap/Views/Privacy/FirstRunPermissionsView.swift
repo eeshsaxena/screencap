@@ -266,8 +266,14 @@ struct FirstRunPermissionsView: View {
                 Text("Granted")
                     .font(.subheadline)
                     .foregroundStyle(.green)
+            } else if permissions.isDaemonRegistering(pane) {
+                // U8: a daemon registration round-trip is in flight for this
+                // pane. Mirror the helper-install step's spinner so the user
+                // sees the Grant action is working and a repeat tap is a no-op.
+                ProgressView()
+                    .controlSize(.small)
             } else {
-                Button(opened ? "Open Again" : "Open Settings") {
+                Button(opened ? "Open Again" : "Grant") {
                     openedDaemonPanes.insert(pane)
                     permissions.requestAndOpenSettings(for: pane, subject: .daemon)
                 }

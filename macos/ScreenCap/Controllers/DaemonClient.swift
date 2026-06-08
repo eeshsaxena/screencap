@@ -287,6 +287,40 @@ struct RecordingStopResponse: Decodable {
     }
 }
 
+/// Body for the on-demand daemon-driven registration verb (U8). `permission`
+/// is one of the canonical strings (`screen_recording` / `accessibility` /
+/// `input_monitoring`); the daemon validates it against the allowlist and
+/// returns a typed `invalid_permission` error for anything else.
+struct PermissionRequestRequest: Encodable {
+    let permission: String
+
+    init(permission: String) {
+        self.permission = permission
+    }
+}
+
+struct PermissionRequestResponse: Decodable {
+    let ok: Bool
+    let schemaVersion: Int
+    let daemonVersion: String
+    let apiSchemaVersion: Int
+    let permission: String
+    /// The daemon's request-API immediate grant bool. Advisory only — the
+    /// daemon's in-process TCC state can be stale, so the app re-probes
+    /// `daemon.info` for authoritative post-grant state rather than gating on
+    /// this. Decoded for completeness/diagnostics.
+    let alreadyGranted: Bool
+
+    enum CodingKeys: String, CodingKey {
+        case ok
+        case schemaVersion = "schema_version"
+        case daemonVersion = "daemon_version"
+        case apiSchemaVersion = "api_schema_version"
+        case permission
+        case alreadyGranted = "already_granted"
+    }
+}
+
 private struct APIEnvelopeProbe: Decodable {
     let ok: Bool?
     let apiSchemaVersion: Int?
@@ -447,6 +481,16 @@ enum DaemonClient {
             body: body,
             timeout: 35
         )
+    }
+
+    /// On-demand daemon-driven TCC registration (U8). The daemon runs the
+    /// matching request mechanism in *its own* process so the Settings entry is
+    /// attributed to the daemon identity, not the app. The app awaits this ack
+    /// before opening the matching pane (so the user never lands on a pane with
+    /// no helper row — the AE2 failure mode).
+    static func permissionRequest(_ permission: String) async throws -> PermissionRequestResponse {
+        let body = try JSONEncoder().encode(PermissionRequestRequest(permission: permission))
+        return try await request(method: "POST", path: "/v0/permission.request", body: body)
     }
 
     private static func connect(_ connection: NWConnection) async throws {

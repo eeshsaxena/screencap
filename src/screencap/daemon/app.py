@@ -435,6 +435,74 @@ async def recording_stop(request: Request) -> JSONResponse:
         )
 
 
+async def permission_request(request: Request) -> JSONResponse:
+    """On-demand daemon-driven TCC registration (U8).
+
+    Runs the registration mechanism for the requested permission *in the
+    daemon's own process* (off the event loop via ``asyncio.to_thread``) so the
+    Settings entry is attributed to the daemon's TCC identity, not the app's
+    (R5; U7 responsible-process caveat). The app calls this, awaits the ack,
+    then opens the matching Settings pane.
+
+    A mutating verb on the same trust boundary as ``recording.start`` /
+    ``recording.stop`` (``SECURITY.md``): the peer descriptor is derived for the
+    audit line, and every exit path (ok, typed error, unhandled) is audited.
+    The ``permission`` is validated against the canonical allowlist up front so
+    an unexpected value returns a typed ``invalid_permission`` 4xx and never
+    reaches the registration dispatch.
+    """
+    from screencap.daemon import (
+        audit_log,
+        permission_probe,
+        permission_register,
+        provenance,
+    )
+
+    peer = provenance.derive_peer_descriptor_from_asgi_scope(request.scope)
+    requested_permission: str | None = None
+
+    def _audit(outcome: str) -> None:
+        audit_log.record_verb(
+            "permission.request",
+            peer_pid=peer.pid,
+            peer_path=peer.path,
+            classification=peer.classification,
+            outcome=outcome,
+            permission=requested_permission,
+        )
+
+    try:
+        parsed = schema.PermissionRequestRequest.model_validate(await request.json())
+        requested_permission = parsed.permission
+        if parsed.permission not in permission_probe.PERMISSION_KEYS:
+            raise errors.InvalidPermissionError(
+                "permission must be one of screen_recording, accessibility, input_monitoring",
+                schema_version=schema._PERMISSION_REQUEST_API_VERSION,
+            )
+
+        already_granted = await asyncio.to_thread(
+            permission_register.register_permission, parsed.permission
+        )
+        _audit("ok")
+        return JSONResponse(
+            schema.envelope(
+                schema_version=schema._PERMISSION_REQUEST_API_VERSION,
+                permission=parsed.permission,
+                already_granted=already_granted,
+            )
+        )
+    except errors.DaemonAPIError as exc:
+        _audit(exc.error_code)
+        return _api_error_response(exc)
+    except Exception as exc:
+        _audit(errors.ERROR_CODE_INTERNAL)
+        return _internal_error_response(
+            exc,
+            schema_version=schema._PERMISSION_REQUEST_API_VERSION,
+            request=request,
+        )
+
+
 def _ndjson(payload: dict) -> bytes:
     return (json.dumps(payload, separators=(",", ":")) + "\n").encode("utf-8")
 
@@ -552,6 +620,7 @@ def build_app() -> Starlette:
             Route("/v0/events", events_stream, methods=["GET"]),
             Route("/v0/recording.start", recording_start, methods=["POST"]),
             Route("/v0/recording.stop", recording_stop, methods=["POST"]),
+            Route("/v0/permission.request", permission_request, methods=["POST"]),
         ],
         lifespan=lifespan,
     )

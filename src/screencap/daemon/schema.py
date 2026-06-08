@@ -13,6 +13,7 @@ _EVENTS_API_VERSION = 1
 _RECORDING_START_API_VERSION = 1
 RECORDING_START_API_VERSION = _RECORDING_START_API_VERSION  # public alias
 _RECORDING_STOP_API_VERSION = 1
+_PERMISSION_REQUEST_API_VERSION = 1
 
 
 @cache
@@ -45,6 +46,8 @@ _MODEL_NAMES = {
     "RecordingStartResponse",
     "RecordingStopRequest",
     "RecordingStopResponse",
+    "PermissionRequestRequest",
+    "PermissionRequestResponse",
 }
 _MODELS: dict[str, Any] | None = None
 
@@ -179,6 +182,29 @@ def _load_models() -> dict[str, Any]:
         stopped: bool
         final_state: str
 
+    class PermissionRequestRequest(_DaemonModel):
+        """On-demand daemon-driven registration request (U8).
+
+        ``permission`` is one of the canonical three
+        (``screen_recording`` / ``accessibility`` / ``input_monitoring``).
+        It is validated against the allowlist in the route handler (not via a
+        ``Literal`` here) so an out-of-allowlist value returns a typed
+        ``invalid_permission`` 4xx rather than a pydantic validation 422 — the
+        same gate shape ``recording.start`` uses for recording names.
+        """
+
+        permission: str
+
+    class PermissionRequestResponse(EnvelopeResponse):
+        # Echo of the permission the daemon ran the registration mechanism for.
+        permission: str
+        # The request API's immediate return (True == already granted in the
+        # daemon's process at call time). ADVISORY ONLY: the daemon's
+        # in-process TCC state can be stale, so the app re-probes daemon.info
+        # (a fresh subprocess) for the authoritative post-grant state rather
+        # than gating on this value.
+        already_granted: bool
+
     _MODELS = {
         "EnvelopeResponse": EnvelopeResponse,
         "DaemonInfoResponse": DaemonInfoResponse,
@@ -190,6 +216,8 @@ def _load_models() -> dict[str, Any]:
         "RecordingStartResponse": RecordingStartResponse,
         "RecordingStopRequest": RecordingStopRequest,
         "RecordingStopResponse": RecordingStopResponse,
+        "PermissionRequestRequest": PermissionRequestRequest,
+        "PermissionRequestResponse": PermissionRequestResponse,
     }
     # `__getattr__` below dispatches every documented model name through
     # `_MODELS`, so injecting them into `globals()` would just shadow that
@@ -216,6 +244,7 @@ __all__ = [
     "_EVENTS_API_VERSION",
     "_RECORDING_START_API_VERSION",
     "_RECORDING_STOP_API_VERSION",
+    "_PERMISSION_REQUEST_API_VERSION",
     "daemon_version",
     "envelope",
 ] + sorted(_MODEL_NAMES)

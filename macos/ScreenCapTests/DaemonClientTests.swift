@@ -179,6 +179,47 @@ final class DaemonClientTests: XCTestCase {
         XCTAssertEqual(response.cursor, 7)
     }
 
+    // MARK: - U8: permission.request registration verb
+
+    func testPermissionRequestFramesPOSTBodyAndDecodesResponse() async throws {
+        _ = try startServer { request in
+            XCTAssertEqual(request.method, "POST")
+            XCTAssertEqual(request.path, "/v0/permission.request")
+            XCTAssertEqual(request.headers["content-type"], "application/json")
+            let body = String(data: request.body, encoding: .utf8) ?? ""
+            XCTAssertTrue(body.contains(#""permission":"input_monitoring""#), body)
+            return .json(
+                #"{"ok":true,"schema_version":1,"daemon_version":"test","api_schema_version":1,"permission":"input_monitoring","already_granted":false}"#
+            )
+        }
+
+        let response = try await DaemonClient.permissionRequest("input_monitoring")
+
+        XCTAssertEqual(response.permission, "input_monitoring")
+        XCTAssertFalse(response.alreadyGranted)
+    }
+
+    func testPermissionRequestInvalidPermissionPropagatesEnvelopeError() async throws {
+        // An out-of-allowlist permission returns a typed invalid_permission 4xx;
+        // the client surfaces it as an envelopeError carrying the code.
+        _ = try startServer { _ in
+            .json(
+                #"{"ok":false,"schema_version":1,"daemon_version":"test","api_schema_version":1,"error":"invalid_permission","reason":"bad permission"}"#,
+                status: 400,
+                reason: "Bad Request"
+            )
+        }
+
+        do {
+            _ = try await DaemonClient.permissionRequest("microphone")
+            XCTFail("Expected envelope error")
+        } catch DaemonClientError.envelopeError(let code, _) {
+            XCTAssertEqual(code, "invalid_permission")
+        } catch {
+            XCTFail("Unexpected error: \(error)")
+        }
+    }
+
     func testSchemaMismatchThrowsPinnedError() async throws {
         _ = try startServer { _ in
             .json(
