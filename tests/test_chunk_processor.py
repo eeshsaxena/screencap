@@ -180,14 +180,35 @@ class TestCloudIntentGating:
         assert "chunk_0000.mp4" in local_names
         assert "audio_0000.flac" in local_names
 
-    def test_checkpoint_and_upload_db_skips_for_cloud_intent(self, cloud_capture_dir):
-        """checkpoint_and_upload_db must skip upload for cloud-intent."""
+    def test_checkpoint_and_upload_db_never_uploads_raw_db(self, cloud_capture_dir):
+        """U2: checkpoint_and_upload_db NEVER uploads the raw recording.db — for
+        any destination — because the DB is local-only by rule (R8). It only
+        WAL-checkpoints; the R8 exclusion lives at the single upload seam now.
+        Asserts no network call is made (the upload was retired) for both
+        cloud_intent=True and cloud_intent=False, and the DB stays on disk."""
+        from unittest.mock import patch as _patch
+
         from screencap.chunk_processor import checkpoint_and_upload_db
 
-        result = checkpoint_and_upload_db(
-            cloud_capture_dir, "test", cloud_intent=True,
-        )
-        assert result is True  # returns True (success) without uploading
+        for cloud_intent in (True, False):
+            with _patch("screencap.upload.request_signed_urls") as signed, \
+                 _patch("screencap.chunk_processor._upload_single") as up:
+                result = checkpoint_and_upload_db(
+                    cloud_capture_dir, "test", cloud_intent=cloud_intent,
+                )
+            assert result is True
+            signed.assert_not_called()  # the raw DB upload was retired
+            up.assert_not_called()
+            assert (cloud_capture_dir / "recording.db").exists()  # kept local
+
+    def test_checkpoint_and_upload_db_missing_db_is_noop(self, tmp_path):
+        """Legacy/migrated recording with no recording.db → clean no-op, no
+        crash (the WAL-checkpoint precondition must tolerate an absent DB)."""
+        from screencap.chunk_processor import checkpoint_and_upload_db
+
+        rec = tmp_path / "legacy"
+        rec.mkdir()
+        assert checkpoint_and_upload_db(rec, "test", cloud_intent=False) is True
 
     def test_pipeline_init_failure_disables_uploads(self, cloud_capture_dir):
         """If privacy deps fail to import, uploads must be disabled (fail-closed)."""

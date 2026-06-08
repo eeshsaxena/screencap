@@ -1021,19 +1021,33 @@ def _upload_single(fi, signed_url: str) -> None:
 def checkpoint_and_upload_db(
     capture_dir: Path, recording_name: str, *, cloud_intent: bool = False,
 ) -> bool:
-    """WAL checkpoint recording.db then upload it.
+    """WAL-checkpoint ``recording.db``. Never uploads it — it is local-only (R8).
 
-    For cloud_intent=True, skips upload — raw DB contains unscrubbed PII.
-    The DB stays local for post-hoc scrubbed upload via ``screencap upload``.
+    U2 retired the upload of the raw DB. ``recording.db`` is the local-only
+    artifact by rule: it carries unscrubbed PII *and* (per U1) the
+    ``pipeline_chunk_state`` ledger, so it must never leave the machine for ANY
+    destination. The R8 exclusion now lives at the single upload seam
+    (``upload.list_recording_files`` / ``upload.assert_uploadable``), retiring the
+    old ``if cloud_intent: return True`` structural skip that was one of three
+    scattered enforcement sites.
+
+    The WAL checkpoint itself is still performed: ``finalize_uploads`` (the sole
+    caller) and other code rely on a clean, checkpointed ``recording.db`` on disk
+    — only the *upload* of the DB is removed. ``recording_name`` is kept in the
+    signature for call-site stability (and the not-yet-rewritten U7 terminal
+    stage); it is unused now that nothing is uploaded.
+
+    Returns True (the checkpoint is best-effort and never blocks finalize); a
+    missing DB (legacy/migrated recording) is a clean no-op, not an error.
     """
-    if cloud_intent:
-        logger.info("Skipping recording.db upload for cloud-intent recording (unscrubbed)")
-        return True
     db_path = capture_dir / "recording.db"
     if not db_path.exists():
-        return False
+        # Legacy / migrated recording with no recording.db — nothing to
+        # checkpoint, and there is by definition no raw DB to keep local.
+        return True
 
-    # Checkpoint — fold WAL into main DB
+    # Checkpoint — fold WAL into main DB so the on-disk DB is clean for any
+    # local consumer (review, catalog, post-hoc scrubbed-copy upload).
     try:
         with open_recording_db(db_path, read_only=False) as conn:
             result = conn.execute("PRAGMA wal_checkpoint(TRUNCATE)").fetchone()
@@ -1042,27 +1056,12 @@ def checkpoint_and_upload_db(
     except Exception as e:
         logger.warning(f"WAL checkpoint failed: {e}")
 
-    # Upload recording.db
-    from screencap.upload import FileInfo, _content_type, request_signed_urls
-
-    fi = FileInfo(
-        name="recording.db",
-        path=db_path,
-        content_type=_content_type(db_path),
-        size=db_path.stat().st_size,
-    )
-    try:
-        urls, _ = request_signed_urls(recording_name, [fi])
-        if "recording.db" not in urls:
-            logger.error("Server returned no URL for recording.db")
-            return False
-        url = urls["recording.db"]
-        if url:
-            _upload_single(fi, url)
-        return True
-    except Exception as e:
-        logger.error(f"Failed to upload recording.db: {e}")
-        return False
+    # The raw recording.db is NEVER uploaded (R8) — it stays local for the
+    # post-hoc scrubbed-copy upload path (`screencap upload` scrubs a sibling
+    # `<name>-scrubbed` dir). Structured cloud data derives only from scrubbed
+    # exports (events JSONL, transcript, manifest), never the raw DB.
+    logger.debug("recording.db checkpointed and kept local-only (never uploaded; R8)")
+    return True
 
 
 def _build_sentinel_data(
