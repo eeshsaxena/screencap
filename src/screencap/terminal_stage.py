@@ -134,6 +134,13 @@ class TerminalResult:
     stubbed: bool = False
     upload_warning: str | None = None
     failed_indices: list[int] = field(default_factory=list)
+    # U8 retention/eviction outcome for this run (informational; the ledger is
+    # the source of truth). ``evicted`` = chunk indices whose local rich copy
+    # was reclaimed; ``masked_copies_evicted`` = chunk indices whose masked
+    # cloud copy (<name>-scrubbed/masked_video/) was reclaimed post-upload.
+    evicted: list[int] = field(default_factory=list)
+    masked_copies_evicted: list[int] = field(default_factory=list)
+    bytes_freed: int = 0
 
 
 # ---------------------------------------------------------------------------
@@ -519,6 +526,10 @@ def _run_locked(
         # we never produce a scrubbed copy for a local recording.
         _route_local(ledger, result)
         result.routed = True
+        # Retention is UNIVERSAL (R11): a local recording with a size/time cap
+        # also evicts its LOCAL_DONE chunks. keep_forever (the default) is a
+        # no-op. No remote precondition for local eviction.
+        _apply_retention(recording_dir, policy, ledger, result, remote_exists=remote_exists)
         return result
 
     # --- cloud / both routing ---
@@ -533,6 +544,7 @@ def _run_locked(
         force=force,
         result=result,
         remote_exists=remote_exists,
+        policy=policy,
     )
 
 
@@ -605,6 +617,7 @@ def _route_cloud(
     force: bool,
     result: TerminalResult,
     remote_exists: Callable[[int], bool] | None,
+    policy: "ResolvedPolicy | None" = None,
 ) -> TerminalResult:
     """Produce the cloud copy, reconcile, upload, gate the sentinel.
 
@@ -690,7 +703,56 @@ def _route_cloud(
             recording_dir, ledger, result,
         )
 
+    # 6. Retention/eviction (U8) — AFTER upload-confirm, per the FROZEN policy.
+    # The eviction floor (UPLOADED + fresh remote re-confirm) is enforced inside
+    # the executor via the ledger; for `both` the masked cloud copy is evicted
+    # immediately post-upload-confirm. Safe to run during recording (only
+    # UPLOADED chunks are candidates) — the per-chunk pass that bounds disk on a
+    # long cloud session (R12) and the finalize pass are the SAME call. Eviction
+    # of a local copy before finalize is safe: the sentinel/finalize gate keys
+    # off the frozen ledger count, not on-disk presence.
+    _apply_retention(recording_dir, policy, ledger, result, remote_exists=remote_exists)
+
     return result
+
+
+def _apply_retention(
+    recording_dir: Path,
+    policy: "ResolvedPolicy | None",
+    ledger: "PipelineLedger | None",
+    result: TerminalResult,
+    *,
+    remote_exists: Callable[[int], bool] | None,
+) -> None:
+    """Invoke the U8 eviction executor for this recording, behind our flock.
+
+    A thin seam onto :func:`screencap.retention.evict_recording`. We are already
+    inside the per-recording terminal flock, so eviction cannot race a
+    concurrent terminal run reading the same chunk (AE12 / the U10 read-vs-evict
+    serialization). The executor enforces the never-delete-un-uploaded /
+    fresh-remote-confirm floor; we only surface its report onto ``result``. Any
+    error is non-fatal — a failed eviction never compromises an already-uploaded
+    recording (it just leaves more local files than retention wanted).
+    """
+    if ledger is None:
+        return
+    try:
+        from screencap.retention import evict_recording
+
+        report = evict_recording(
+            recording_dir,
+            policy=policy,
+            ledger=ledger,
+            remote_exists=remote_exists,
+            during_recording=True,
+        )
+    except Exception as exc:  # noqa: BLE001
+        logger.warning("terminal_stage: retention pass failed for %s: %s",
+                       recording_dir.name, exc)
+        return
+    result.evicted = sorted(set(report.evicted_indices) | set(report.evict_pending_resumed))
+    result.masked_copies_evicted = list(report.masked_copies_evicted)
+    result.bytes_freed = report.bytes_freed
 
 
 # ---------------------------------------------------------------------------

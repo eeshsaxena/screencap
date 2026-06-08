@@ -25,7 +25,11 @@ The five prevention rules, ported to ledger invariants
    ``begin_eviction`` takes a ``remote_exists`` callback and re-confirms
    remote presence at eviction time — a historical ``UPLOADED`` is not
    trusted (we do NOT port ``_delete_old_chunks``' delete-on-EMITTED-alone
-   shortcut).
+   shortcut). ``begin_local_eviction`` is the sibling for ``local``-only
+   chunks (``LOCAL_DONE``, never uploaded): a local size/time cap evicts the
+   rich copy with no remote precondition (R11) — but it accepts ONLY
+   ``LOCAL_DONE``, so it can never be used to bypass the cloud floor for an
+   un-uploaded cloud chunk.
 4. **Test degraded paths.** Crash-mid-transition, refused-eviction, and
    resume-from-``EVICT_PENDING`` are all first-class API states with tests.
 5. **The completeness signal is derived from completeness evidence.**
@@ -548,6 +552,38 @@ class PipelineLedger:
             raise EvictionRefused(
                 f"chunk {chunk_index} remote re-confirmation failed — "
                 "refusing to delete local copy"
+            )
+        self._transition(chunk_index, evict_state=EvictState.EVICT_PENDING)
+
+    def begin_local_eviction(self, chunk_index: int) -> None:
+        """Step 1+2 of eviction for a LOCAL-only chunk (no remote precondition).
+
+        The sibling of :meth:`begin_eviction` for ``local`` recordings whose
+        chunks are ``LOCAL_DONE`` (never uploaded, so there is no remote copy
+        to re-confirm — and demanding one would make a local-only size/time cap
+        un-evictable, defeating R11). Refuses (``EvictionRefused``) unless the
+        chunk is ``LOCAL_DONE``; in particular a ``FAILED`` / in-flight / cloud
+        (``UPLOADED``) chunk is NOT evictable via this path.
+
+        Like the cloud path it commits ``EVICT_PENDING`` BEFORE any unlink, so
+        the SAME :meth:`commit_eviction` finishes it and the SAME
+        ``EVICT_PENDING -> EVICTED`` crash-resumability holds: a crash before
+        commit leaves the rich local file present + ``LOCAL_DONE`` (safe), a
+        crash after commit resumes the unlink from ``EVICT_PENDING``.
+
+        The cloud :meth:`begin_eviction` (``UPLOADED`` + fresh remote re-stat)
+        is deliberately left UNCHANGED — this is an additive, distinct entry so
+        the never-delete-un-uploaded floor for cloud chunks cannot be bypassed
+        through the local path (only ``LOCAL_DONE`` is accepted here, never
+        ``PENDING``/``STAGED``/``SCRUBBED``/``UPLOADED``/``FAILED``).
+        """
+        row = self.get_chunk(chunk_index)
+        if row is None:
+            raise EvictionRefused(f"no ledger row for chunk {chunk_index}")
+        if row.lifecycle != Lifecycle.LOCAL_DONE:
+            raise EvictionRefused(
+                f"chunk {chunk_index} is {row.lifecycle.value}, not local_done "
+                "— begin_local_eviction only evicts LOCAL_DONE chunks"
             )
         self._transition(chunk_index, evict_state=EvictState.EVICT_PENDING)
 
