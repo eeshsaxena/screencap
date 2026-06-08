@@ -2,12 +2,15 @@
 title: "Ad-hoc-signed dev builds appear as a new app to TCC on every rebuild — orphaning prior grants"
 slug: macos-ad-hoc-signing-tcc-rebuild-treadmill
 date: 2026-05-01
+updated: 2026-06-08
 category: build-errors
 severity: medium
 problem_type: dev-environment-friction
 modules:
   - macos/ScreenCap/ScreenCap.entitlements
   - macos/project.yml
+  - macos/ScreenCap/Scripts/embed-cli.sh
+  - macos/ScreenCap/Scripts/screencap-cli.entitlements
 tags:
   - macos
   - tcc
@@ -15,11 +18,15 @@ tags:
   - xcode
   - dev-environment
   - macos-app-shell
+  - daemon
+  - pyinstaller
 symptoms:
   - "Granted Screen Recording / Accessibility / Input Monitoring to ScreenCap once; rebuilt the app; permissions all show red again"
   - "Quit & Relaunch button doesn't help — the new process is treated as a different app entirely"
   - "Multiple ScreenCap entries appear in Privacy & Security after several rebuilds"
   - "`tccutil reset` is the only way to recover a clean grant flow"
+  - "App is team-signed but TCC grants STILL churn on rebuild — because the nested daemon binary is ad-hoc"
+  - "Two separate `screencap` rows appear in a Privacy pane (one per rebuild's cdhash)"
 root_cause: >
   Xcode signs Debug builds with an ad-hoc signature (`Signature=adhoc,
   TeamIdentifier=not set`). TCC uses the code-signing identity to track
@@ -57,6 +64,54 @@ TeamIdentifier=not set
 
 This is not specific to Xcodegen, xcodebuild, or our project structure. It's how macOS hardened-runtime + TCC work. Every dev workflow that doesn't sign with a Developer ID hits this.
 
+## Update (2026-06-08): signing the *app* isn't enough — the embedded daemon binary is the TCC subject
+
+A later spike sharpened the root cause. Screen capture is performed not by the
+app but by the **nested PyInstaller `screencap` binary** the daemon runs
+(`Contents/Resources/screencap/screencap`). *That binary*, not the app, is the
+TCC subject for the daemon's Screen Recording / Accessibility / Input Monitoring
+grants — and it stays **ad-hoc even when the app is team-signed**, because:
+
+- `embed-cli.sh` (the "Embed screencap CLI" build phase) `ditto`s the PyInstaller
+  output into `Contents/Resources/` but never signs it; and
+- Xcode's automatic signing signs the app wrapper + main executable but does
+  **not recurse into `Contents/Resources/`** (no `--deep`).
+
+So `codesign -dvv …/Contents/Resources/screencap/screencap` shows
+`Signature=adhoc, TeamIdentifier=not set` while the app shows your team. The
+daemon's grants churn on every rebuild even though the app's own grants persist.
+Tell-tale: **two separate `screencap` rows** appear in a pane after two rebuilds —
+one per cdhash.
+
+### Fix (implemented)
+
+`embed-cli.sh` now re-signs the embedded bundle after `ditto`, inner-to-outer
+(every nested `.dylib`/`.so`, then the exe), with the resolved team identity
+(`EXPANDED_CODE_SIGN_IDENTITY` — confirmed available in the preBuild phase) +
+hardened runtime + `Scripts/screencap-cli.entitlements` (allow-jit /
+allow-unsigned-executable-memory / disable-library-validation, which
+CPython + PyInstaller need under hardened runtime). It skips signing and leaves
+the bundle ad-hoc when no team identity is set, preserving the CI fallback.
+
+Validated on macOS 26.5.1 (full `xcodebuild`): the nested binary becomes
+`TeamIdentifier=2A8S6MV8DZ` with hardened runtime, and its **Designated
+Requirement is identity-anchored, not cdhash-anchored**:
+
+```
+designated => identifier screencap and anchor apple generic
+              and certificate leaf[subject.CN] = "Apple Development: …"
+```
+
+A rebuild with the same identifier + same cert satisfies that same requirement,
+so TCC keeps the grant — the per-build treadmill stops. An **Apple Development**
+cert is enough to end the build-to-build churn; because the DR pins the leaf cert
+CN, a cert rotation (≈yearly) or a move to **Developer ID** re-grants once.
+Developer ID remains the stable, distribution-grade anchor (team-anchored DR, no
+per-build or per-cert churn). Full investigation, including that TCC attributes a
+request to the *responsible process* (so the daemon must issue its own
+registration request, not the app):
+`docs/research/2026-06-05-daemon-tcc-registration-spike.md`.
+
 ## Recovery
 
 ```bash
@@ -68,6 +123,11 @@ Wipes every TCC grant for the bundle id. Next launch shows fresh prompts; granti
 If you're going to do a smoke-test cycle, **don't rebuild between attempts**. Grant once, click Quit & Relaunch (which handles the in-process cache), test what you need to test, only then rebuild.
 
 ## Long-term fix
+
+> **Update (2026-06-08):** the per-build treadmill is now fixed for dev — `embed-cli.sh`
+> team-signs the embedded daemon binary (see the 2026-06-08 section above), so a stable
+> Apple Development cert keeps grants across rebuilds. This section is the
+> distribution-grade story, which a Developer ID identity completes.
 
 Sign with a stable Developer ID Application identity. The release pipeline (Unit 1 / Unit 22 of the v1 plan) handles this. Once we sign with a real team identifier, TCC tracks `(bundle id, team id)` across rebuilds and the treadmill stops.
 
