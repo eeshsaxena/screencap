@@ -395,3 +395,199 @@ class TestSegmentationMode:
         cfg._config_cache = {"segmentation_mode": "bogus"}
         with pytest.raises(SystemExit):
             get_segmentation_mode()
+
+
+# --- retention policy config tests (U3) ---
+
+
+def _clear_retention_env():
+    drop = {
+        "SCREENCAP_RETENTION_POLICY",
+        "SCREENCAP_RETENTION_DAYS",
+        "SCREENCAP_RETENTION_SIZE_CAP_MB",
+        "SCREENCAP_AUTO_DELETE",
+    }
+    return {k: v for k, v in os.environ.items() if k not in drop}
+
+
+class TestRetentionPolicy:
+    """Tests for get_retention_policy() and the legacy auto_delete shim."""
+
+    def test_default_is_keep_forever(self):
+        import screencap.config as cfg
+        from screencap.config import get_retention_policy
+
+        with mock.patch.dict(os.environ, _clear_retention_env(), clear=True):
+            cfg._config_cache = {}
+            assert get_retention_policy() == ("keep_forever", {})
+
+    def test_toml_retention_block(self):
+        import screencap.config as cfg
+        from screencap.config import get_retention_policy
+
+        with mock.patch.dict(os.environ, _clear_retention_env(), clear=True):
+            cfg._config_cache = {"retention": {"policy": "delete_after_days", "days": 30}}
+            assert get_retention_policy() == ("delete_after_days", {"days": 30})
+
+    def test_toml_size_cap(self):
+        import screencap.config as cfg
+        from screencap.config import get_retention_policy
+
+        with mock.patch.dict(os.environ, _clear_retention_env(), clear=True):
+            cfg._config_cache = {"retention": {"policy": "size_cap", "size_cap_mb": 4096}}
+            assert get_retention_policy() == ("size_cap", {"size_cap_mb": 4096})
+
+    def test_env_overrides_toml(self):
+        import screencap.config as cfg
+        from screencap.config import get_retention_policy
+
+        cfg._config_cache = {"retention": {"policy": "keep_forever"}}
+        with mock.patch.dict(os.environ, {"SCREENCAP_RETENTION_POLICY": "delete_after_upload"}):
+            assert get_retention_policy() == ("delete_after_upload", {})
+
+    def test_env_invalid_policy(self):
+        from screencap.config import get_retention_policy
+
+        with mock.patch.dict(os.environ, {"SCREENCAP_RETENTION_POLICY": "bogus"}):
+            with pytest.raises(SystemExit):
+                get_retention_policy()
+
+    def test_toml_invalid_policy(self):
+        import screencap.config as cfg
+        from screencap.config import get_retention_policy
+
+        with mock.patch.dict(os.environ, _clear_retention_env(), clear=True):
+            cfg._config_cache = {"retention": {"policy": "bogus"}}
+            with pytest.raises(SystemExit):
+                get_retention_policy()
+
+    def test_days_must_be_positive_int(self):
+        import screencap.config as cfg
+        from screencap.config import get_retention_policy
+
+        with mock.patch.dict(os.environ, _clear_retention_env(), clear=True):
+            cfg._config_cache = {"retention": {"policy": "delete_after_days", "days": 0}}
+            with pytest.raises(SystemExit):
+                get_retention_policy()
+
+    # --- backward compatibility with the legacy auto_delete_after_upload bool ---
+
+    def test_legacy_auto_delete_true_maps_to_delete_after_upload(self):
+        import screencap.config as cfg
+        from screencap.config import get_retention_policy
+
+        with mock.patch.dict(os.environ, _clear_retention_env(), clear=True):
+            cfg._config_cache = {"auto_delete_after_upload": True}
+            assert get_retention_policy() == ("delete_after_upload", {})
+
+    def test_legacy_auto_delete_false_maps_to_keep_forever(self):
+        import screencap.config as cfg
+        from screencap.config import get_retention_policy
+
+        with mock.patch.dict(os.environ, _clear_retention_env(), clear=True):
+            cfg._config_cache = {"auto_delete_after_upload": False}
+            assert get_retention_policy() == ("keep_forever", {})
+
+    def test_legacy_auto_delete_absent_maps_to_keep_forever(self):
+        import screencap.config as cfg
+        from screencap.config import get_retention_policy
+
+        with mock.patch.dict(os.environ, _clear_retention_env(), clear=True):
+            cfg._config_cache = {}
+            assert get_retention_policy() == ("keep_forever", {})
+
+    def test_retention_block_wins_over_legacy_bool(self):
+        import screencap.config as cfg
+        from screencap.config import get_retention_policy
+
+        with mock.patch.dict(os.environ, _clear_retention_env(), clear=True):
+            cfg._config_cache = {
+                "auto_delete_after_upload": True,
+                "retention": {"policy": "keep_forever"},
+            }
+            assert get_retention_policy() == ("keep_forever", {})
+
+
+class TestGetAutoDeleteAfterUploadShim:
+    """The legacy bool shim must keep existing callers working."""
+
+    def test_legacy_true_reads_true(self):
+        import screencap.config as cfg
+        from screencap.config import get_auto_delete_after_upload
+
+        with mock.patch.dict(os.environ, _clear_retention_env(), clear=True):
+            cfg._config_cache = {"auto_delete_after_upload": True}
+            assert get_auto_delete_after_upload() is True
+
+    def test_default_false(self):
+        import screencap.config as cfg
+        from screencap.config import get_auto_delete_after_upload
+
+        with mock.patch.dict(os.environ, _clear_retention_env(), clear=True):
+            cfg._config_cache = {}
+            assert get_auto_delete_after_upload() is False
+
+    def test_new_retention_block_drives_shim(self):
+        import screencap.config as cfg
+        from screencap.config import get_auto_delete_after_upload
+
+        with mock.patch.dict(os.environ, _clear_retention_env(), clear=True):
+            cfg._config_cache = {"retention": {"policy": "delete_after_upload"}}
+            assert get_auto_delete_after_upload() is True
+            cfg._config_cache = {"retention": {"policy": "keep_forever"}}
+            assert get_auto_delete_after_upload() is False
+
+    def test_env_auto_delete_true(self):
+        import screencap.config as cfg
+        from screencap.config import get_auto_delete_after_upload
+
+        cfg._config_cache = {}
+        with mock.patch.dict(os.environ, {"SCREENCAP_AUTO_DELETE": "1"}):
+            assert get_auto_delete_after_upload() is True
+
+
+# --- masked-video-upload feature flag tests (Part B) ---
+
+
+class TestMaskedVideoUploadFlag:
+    """Tests for get_masked_video_upload_enabled() — default OFF carrier."""
+
+    def test_default_false(self):
+        import screencap.config as cfg
+        from screencap.config import get_masked_video_upload_enabled
+
+        env = {k: v for k, v in os.environ.items() if k != "SCREENCAP_MASKED_VIDEO_UPLOAD"}
+        with mock.patch.dict(os.environ, env, clear=True):
+            cfg._config_cache = {}
+            assert get_masked_video_upload_enabled() is False
+
+    def test_env_var_true(self):
+        from screencap.config import get_masked_video_upload_enabled
+
+        with mock.patch.dict(os.environ, {"SCREENCAP_MASKED_VIDEO_UPLOAD": "1"}):
+            assert get_masked_video_upload_enabled() is True
+        with mock.patch.dict(os.environ, {"SCREENCAP_MASKED_VIDEO_UPLOAD": "true"}):
+            assert get_masked_video_upload_enabled() is True
+
+    def test_env_var_false(self):
+        from screencap.config import get_masked_video_upload_enabled
+
+        with mock.patch.dict(os.environ, {"SCREENCAP_MASKED_VIDEO_UPLOAD": "false"}):
+            assert get_masked_video_upload_enabled() is False
+
+    def test_toml_value(self):
+        import screencap.config as cfg
+        from screencap.config import get_masked_video_upload_enabled
+
+        env = {k: v for k, v in os.environ.items() if k != "SCREENCAP_MASKED_VIDEO_UPLOAD"}
+        with mock.patch.dict(os.environ, env, clear=True):
+            cfg._config_cache = {"masked_video_upload": True}
+            assert get_masked_video_upload_enabled() is True
+
+    def test_env_overrides_toml(self):
+        import screencap.config as cfg
+        from screencap.config import get_masked_video_upload_enabled
+
+        cfg._config_cache = {"masked_video_upload": False}
+        with mock.patch.dict(os.environ, {"SCREENCAP_MASKED_VIDEO_UPLOAD": "yes"}):
+            assert get_masked_video_upload_enabled() is True

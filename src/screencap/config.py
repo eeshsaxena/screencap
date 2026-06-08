@@ -211,10 +211,132 @@ def get_chunk_duration() -> float:
 
 
 def get_auto_delete_after_upload() -> bool:
-    """Return whether to auto-delete chunks after confirmed upload. Default True."""
-    return _parse_bool_env(
-        "SCREENCAP_AUTO_DELETE", "auto_delete_after_upload", True,
+    """Return whether to auto-delete chunks after confirmed upload. Default True.
+
+    .. deprecated::
+        Backward-compat shim. The retention policy is now expressed as a
+        first-class ``{retention_policy, params}`` block via
+        :func:`get_retention_policy` (the U3 monetization seam). This lone
+        bool only answers "is the configured retention policy
+        ``delete_after_upload``?" so existing callers
+        (``cli`` settings display, ``engine/collaborators``) keep working
+        unchanged. New code should resolve a frozen
+        :class:`screencap.pipeline_policy.ResolvedPolicy` instead.
+    """
+    # Read through the retention block so the legacy bool stays consistent
+    # with the new config surface: a config that sets
+    # ``retention_policy = "delete_after_upload"`` (or the legacy
+    # ``auto_delete_after_upload = true``) both answer True here.
+    policy, _params = get_retention_policy()
+    return policy == "delete_after_upload"
+
+
+# Valid retention policy names (mirror screencap.pipeline_policy.RetentionPolicy
+# values — kept as bare strings here to avoid importing the heavier module on
+# every ``screencap --help``).
+_RETENTION_POLICIES = (
+    "keep_forever",
+    "delete_after_upload",
+    "delete_after_days",
+    "size_cap",
+)
+
+
+def get_retention_policy() -> tuple[str, dict]:
+    """Return the configured default ``(retention_policy, params)``.
+
+    This is the retention config block that replaces the lone
+    ``auto_delete_after_upload`` bool. It is the *default* the U3 resolver
+    (:func:`screencap.pipeline_policy.resolve_policy`) reads when no
+    per-account / plan-tier override applies; the resolved value is then
+    frozen per recording.
+
+    Precedence: env var > ``[retention]`` config block > legacy
+    ``auto_delete_after_upload`` bool > default ``keep_forever``.
+
+    - ``SCREENCAP_RETENTION_POLICY`` (env) names the policy directly; its
+      params come from the env params vars below.
+    - ``[retention]`` config block: ``policy`` plus optional ``days`` /
+      ``size_cap_mb``.
+    - **Backward-compat:** a legacy top-level ``auto_delete_after_upload =
+      true`` (or ``SCREENCAP_AUTO_DELETE`` truthy) with no explicit
+      ``[retention]`` block maps to ``delete_after_upload``; ``false`` /
+      absent maps to ``keep_forever`` (the default — existing local
+      behavior unchanged unless a cap is set, per R11).
+
+    Params carried: ``delete_after_days`` -> ``{"days": int}``;
+    ``size_cap`` -> ``{"size_cap_mb": int}``; others -> ``{}``.
+    """
+    # 1) Explicit env override of the policy name wins outright.
+    env_policy = os.environ.get("SCREENCAP_RETENTION_POLICY")
+    if env_policy is not None:
+        policy = env_policy.strip().lower()
+        if policy not in _RETENTION_POLICIES:
+            raise SystemExit(
+                f"Error: SCREENCAP_RETENTION_POLICY must be one of "
+                f"{_RETENTION_POLICIES}, got: {env_policy!r}"
+            )
+        return policy, _retention_params(policy)
+
+    cfg = _load_toml()
+    section = cfg.get("retention", {})
+    if isinstance(section, dict) and "policy" in section:
+        policy = section.get("policy")
+        if not isinstance(policy, str) or policy.lower() not in _RETENTION_POLICIES:
+            raise SystemExit(
+                f"Error: [retention].policy must be one of "
+                f"{_RETENTION_POLICIES}, got: {policy!r}"
+            )
+        return policy.lower(), _retention_params(policy.lower(), section)
+
+    # 2) No explicit [retention] block — fall back to the legacy bool so old
+    #    configs keep meaning the same thing.
+    legacy = _parse_bool_env(
+        "SCREENCAP_AUTO_DELETE", "auto_delete_after_upload", False,
     )
+    if legacy:
+        return "delete_after_upload", {}
+    return "keep_forever", {}
+
+
+def _retention_params(policy: str, section: dict | None = None) -> dict:
+    """Resolve params for ``policy`` from env vars then the config section."""
+    if policy == "delete_after_days":
+        env = os.environ.get("SCREENCAP_RETENTION_DAYS")
+        if env is not None:
+            return {"days": _coerce_pos_int("SCREENCAP_RETENTION_DAYS", env)}
+        if section is not None and "days" in section:
+            days = section["days"]
+            if not isinstance(days, int) or isinstance(days, bool) or days <= 0:
+                raise SystemExit(
+                    f"Error: [retention].days must be a positive integer, got: {days!r}"
+                )
+            return {"days": days}
+        return {}
+    if policy == "size_cap":
+        env = os.environ.get("SCREENCAP_RETENTION_SIZE_CAP_MB")
+        if env is not None:
+            return {"size_cap_mb": _coerce_pos_int("SCREENCAP_RETENTION_SIZE_CAP_MB", env)}
+        if section is not None and "size_cap_mb" in section:
+            cap = section["size_cap_mb"]
+            if not isinstance(cap, int) or isinstance(cap, bool) or cap <= 0:
+                raise SystemExit(
+                    f"Error: [retention].size_cap_mb must be a positive integer, got: {cap!r}"
+                )
+            return {"size_cap_mb": cap}
+        return {}
+    return {}
+
+
+def _coerce_pos_int(env_name: str, raw: str) -> int:
+    raw = raw.strip()
+    try:
+        val = int(raw)
+    except ValueError:
+        raise SystemExit(f"Error: {env_name} must be an integer, got: {raw!r}")
+    if val <= 0:
+        raise SystemExit(f"Error: {env_name} must be positive, got: {val}")
+    return val
 
 
 def get_rest_threshold() -> float:
@@ -249,6 +371,32 @@ def get_segmentation_mode() -> str:
 def get_show_on_website() -> bool:
     """Return whether recordings should be visible on the website. Default True."""
     return _parse_bool_env("SCREENCAP_SHOW_ON_WEBSITE", "show_on_website", True)
+
+
+def get_masked_video_upload_enabled() -> bool:
+    """Return whether masked video is uploaded to the cloud. Default **False**.
+
+    The single switch enforcing the project's conservative privacy posture
+    (U6 gated OFF; U4 lands only after U6+U7 are proven). Env var
+    ``SCREENCAP_MASKED_VIDEO_UPLOAD`` > config ``masked_video_upload`` >
+    default ``False``. Precedence matches the neighboring booleans
+    (e.g. :func:`get_show_on_website`): a truthy env var (``1`` / ``true`` /
+    ``yes``) overrides the TOML value.
+
+    **OFF (default)** — the current behavior holds: capture-time blocking +
+    PUBLIC-forcing for cloud-intent recordings stays active, the cloud video
+    copy is the capture-blocked chunks as today, and U6's post-hoc video
+    masker (built later) is NOT in the upload path.
+
+    **ON (future)** — capture goes rich for all destinations, U6 masks the
+    video post-hoc, and the terminal stage uploads the masked video copy.
+    This flag MUST NOT flip to ON until U6+U7 fail-closed masking is proven
+    AND the native-redaction-review "what uploads" surface is reconciled
+    (it currently labels video "local-only, not uploaded").
+    """
+    return _parse_bool_env(
+        "SCREENCAP_MASKED_VIDEO_UPLOAD", "masked_video_upload", False,
+    )
 
 
 def get_upload_default() -> str:

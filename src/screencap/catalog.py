@@ -28,6 +28,29 @@ def read_intent(directory: Path) -> str | None:
         return None
 
 
+def read_intent_policy(directory: Path):
+    """Read the frozen :class:`~screencap.pipeline_policy.ResolvedPolicy`.
+
+    Returns the policy frozen into ``.recording_intent`` at routing time
+    (U3), or ``None`` when the file is missing/corrupt OR is a legacy
+    ``version: 1`` intent written before the retention fields existed
+    (sparse-but-valid — the caller should fall back to a config default or
+    treat retention as keep-forever). The frozen value is authoritative: it
+    is NOT re-resolved against current config, so a config change after the
+    recording was routed does not change this recording's policy.
+    """
+    intent_path = directory / INTENT_FILE
+    if not intent_path.exists():
+        return None
+    try:
+        data = json.loads(intent_path.read_text())
+    except Exception:
+        return None
+    from screencap.pipeline_policy import ResolvedPolicy
+
+    return ResolvedPolicy.from_dict(data)
+
+
 class RecordingInfo(NamedTuple):
     name: str
     date: str  # YYYY-MM-DD

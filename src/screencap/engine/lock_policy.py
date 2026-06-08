@@ -44,9 +44,23 @@ def _write_identity_files(
     else:
         destination = "local"
 
+    # Resolve the destination + retention policy ONCE and freeze it into
+    # per-recording state (U3). This is the monetization seam's freeze point:
+    # a later config/plan-tier change cannot retroactively re-route this
+    # recording because the resolved policy is now durable on disk. Imported
+    # locally to keep the engine-subprocess import surface small.
+    from screencap.pipeline_policy import resolve_policy
+
+    resolved = resolve_policy(destination=destination)
+
     intent = {
-        "version": 1,
+        # Bumped 1 -> 2: adds the frozen resolved-policy fields
+        # (retention_policy, retention_params). Readers tolerate v1 (absent
+        # fields) as sparse-but-valid — see catalog.read_intent_policy.
+        "version": 2,
         "destination": destination,
+        "retention_policy": resolved.retention_policy.value,
+        "retention_params": dict(resolved.params),
         "privacy_mode": privacy_mode,
         "show_on_website": request.show_on_website,
         "created_at": datetime.now(timezone.utc).isoformat(),
