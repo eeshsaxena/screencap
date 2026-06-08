@@ -1163,11 +1163,23 @@ def detect_promotion_holes(
     # the U9 reconciler / a sparse on-disk index set can leave non-contiguous
     # chunk_index values, and an evicted chunk keeps its ledger row, so the seeded
     # rows are the authoritative set to gate on (mirrors finalize_gate_satisfied).
+    from screencap.pipeline_state import UploadState
+
     rows = ledger.all_chunks()
     confirm = _make_promotion_confirm(recording_dir, remote_exists)
     holes: list[int] = []
     for row in rows:
         idx = row.chunk_index
+        if row.upload_state == UploadState.UPLOADED:
+            # Already in GCS per the ledger (an EVICTED chunk keeps
+            # upload_state == UPLOADED). Eviction only reclaims a chunk's local
+            # media AFTER a fresh remote re-confirm (the retention floor), so an
+            # UPLOADED-then-evicted chunk is exactly the "evicted but in GCS is
+            # fine" case this guard explicitly allows — its video is gone locally
+            # and cannot be freshly re-probed, so trust the ledger here, just as
+            # _reconcile_ledger_against_gcs does (it never re-stats an UPLOADED
+            # chunk). The fresh re-confirm below still gates PENDING/FAILED rows.
+            continue
         if _chunk_local_media_present(recording_dir, idx):
             continue  # rich local copy survives — upload can re-scrub it.
         if confirm(idx):
@@ -1197,11 +1209,13 @@ def assert_promotable_to_cloud(
     name = recording_dir.name
     missing = ", ".join(str(i) for i in holes)
     raise PromotionRefused(
-        f"Cannot promote {name!r} to the cloud: chunk(s) {missing} were evicted "
-        "locally and are not present in the cloud, so a complete upload is "
-        "impossible. Refusing to upload a recording with missing chunks "
-        "(it would be a partial copy with silent gaps). If you have a local "
-        "backup of the missing chunk media, restore it before promoting."
+        f"Cannot promote {name!r} to the cloud: chunk(s) {missing} are missing "
+        "locally and could not be confirmed in the cloud (not marked UPLOADED in "
+        "the ledger, and a fresh remote check did not find them), so a complete "
+        "upload cannot be guaranteed. Refusing to upload a recording with "
+        "unconfirmable chunks (it would risk a partial copy with silent gaps). "
+        "If you have a local backup of the missing chunk media, restore it "
+        "before promoting."
     )
 
 

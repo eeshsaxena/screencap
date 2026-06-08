@@ -568,3 +568,40 @@ def test_chunk_processor_freeze_expected_chunks_freezes_real_ledger(tmp_path):
     assert ps.PipelineLedger(d / "recording.db").chunks_expected() is None
     cp.freeze_expected_chunks(3)
     assert ps.PipelineLedger(d / "recording.db").chunks_expected() == 3
+
+
+def test_promotion_allows_uploaded_then_evicted_chunk(tmp_path, monkeypatch):
+    """SCR-123 regression: a chunk marked UPLOADED in the ledger then evicted
+    locally must NOT be flagged a hole — even though its media is gone everywhere
+    locally and a fresh GCS probe cannot re-confirm it. Eviction only reclaims a
+    chunk's local media AFTER a remote re-confirm (the retention floor), so an
+    UPLOADED-then-evicted chunk is the documented 'evicted but in GCS is fine'
+    case the guard allows. Without the ledger-trust skip, _chunk_confirmed_remote
+    returns False (no local video to probe) and the promotion is wrongly refused.
+    """
+    from screencap.terminal_stage import assert_promotable_to_cloud
+
+    d = _make_old_path_recording(
+        tmp_path, "rec", n_chunks=3, destination="cloud", seed_ledger=True,
+    )
+    ledger = ps.PipelineLedger(d / "recording.db")
+    ledger.freeze_chunks_expected(3)
+    ledger.mark_uploaded(1)  # chunk 1 is confirmed in GCS per the ledger.
+
+    # Evict chunk 1's media locally — gone from disk entirely.
+    for nm in (
+        "chunk_0001.mp4", "audio_0001.flac",
+        "events_0001.jsonl", "chunk_0001_manifest.json",
+    ):
+        (d / nm).unlink()
+
+    # A fresh GCS probe would say "not present" (a signed URL is returned for
+    # every requested file), proving the pass comes from the ledger UPLOADED
+    # state and NOT from a remote confirm.
+    def _none_present(name, infos):
+        return ({fi.name: f"https://signed/{fi.name}" for fi in infos}, "prefix")
+
+    monkeypatch.setattr("screencap.upload.request_signed_urls", _none_present)
+
+    # No raise: chunks 0/2 keep local media, chunk 1 is ledger-UPLOADED.
+    assert_promotable_to_cloud(d)  # remote_exists=None -> real confirm path
