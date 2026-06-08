@@ -453,7 +453,36 @@ class RecordingCollaborators:
         ``.recording_id`` if present); ``stop_reason`` is the ``_stop_reason``
         string the live loop produced. The caller uses the returned dict
         to decide what to print after the live display teardown.
+
+        Concurrency (U7): the WHOLE finalize critical section runs behind the
+        per-recording terminal-stage flock (``terminal_stage.terminal_lock``),
+        acquired FIRST. This serializes the live finalize against the other
+        terminal-stage entry points — a manual ``screencap upload`` or a daemon
+        resume scan — so two runs can never both reconcile/upload/sentinel the
+        same recording (AE12). The flock is advisory; this is one of the
+        entry points that MUST take it. flock acquisition is best-effort: if
+        the run dir/flock is unavailable the lock degrades to a no-op (logged),
+        never blocking finalize.
         """
+        from screencap.terminal_stage import terminal_lock
+
+        with terminal_lock(recording_name):
+            return self._finalize_uploads_locked(
+                capture_dir=capture_dir,
+                stop_reason=stop_reason,
+                recording_name=recording_name,
+                console=console,
+            )
+
+    def _finalize_uploads_locked(
+        self,
+        *,
+        capture_dir: Path,
+        stop_reason: str,
+        recording_name: str,
+        console: Any | None = None,
+    ) -> dict[str, Any]:
+        """The finalize critical section — runs only while the terminal flock is held."""
         cp = self._chunk_processor
         cloud_intent = self._request.cloud_intent
         keep_local = self._request.keep_local

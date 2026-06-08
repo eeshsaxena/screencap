@@ -2281,3 +2281,71 @@ class TestForceStopDominatesStatusMap:
         cp._stop_event.set()
         assert cp.was_force_stopped is True
         assert (cp.all_chunks_uploaded() and not cp.was_force_stopped) is False
+
+
+class TestLedgerIsCrossProcessSourceOfTruth:
+    """U7 characterization: chunk_processor mirrors settled status onto the U1
+    ledger so the terminal stage (a SEPARATE process) reconstructs correct
+    upload state after a crash — WITHOUT changing the in-memory gating.
+
+    The in-memory ``_chunk_results`` stays the live gate (the existing tests
+    above pin it); these pin that the on-disk ledger becomes the faithful
+    cross-process replica (EMITTED -> UPLOADED, FAILED -> FAILED).
+    """
+
+    @mock.patch("screencap.chunk_processor.time.sleep")
+    @mock.patch("screencap.chunk_processor.upload_chunk_files", return_value=True)
+    def test_emitted_chunks_mirror_to_ledger_uploaded(self, mock_upload, mock_sleep, tmp_path):
+        from screencap.pipeline_state import PipelineLedger, UploadState
+
+        t0 = time.time()
+        _create_seven_chunk_db(tmp_path / "recording.db", t0)
+        _create_chunk_media_files(tmp_path, 7)
+        cp, chunk_q = _build_chunk_processor(tmp_path)
+        cp.start()
+        _enqueue_chunks(chunk_q, t0, 3)
+        cp.stop(timeout=30)
+
+        # In-memory gating unchanged.
+        assert cp.all_chunks_uploaded() is True
+
+        # On-disk ledger reflects the same UPLOADED state (cross-process truth).
+        ledger = PipelineLedger(tmp_path / "recording.db")
+        states = {r.chunk_index: r.upload_state for r in ledger.all_chunks()}
+        for i in range(3):
+            assert states.get(i) == UploadState.UPLOADED, (
+                f"chunk {i} not mirrored UPLOADED onto the ledger: {states}"
+            )
+
+    @mock.patch("screencap.chunk_processor.time.sleep")
+    @mock.patch("screencap.chunk_processor.upload_chunk_files")
+    def test_failed_chunk_mirrors_to_ledger_failed(self, mock_upload, mock_sleep, tmp_path):
+        from screencap.pipeline_state import PipelineLedger, UploadState
+
+        # Chunk 1 fails permanently; 0 and 2 succeed.
+        def _upload(recording_name, files, capture_dir):
+            idx = int(files[0]["name"].split("_")[1].split(".")[0])
+            return idx != 1
+
+        mock_upload.side_effect = _upload
+
+        t0 = time.time()
+        _create_seven_chunk_db(tmp_path / "recording.db", t0)
+        _create_chunk_media_files(tmp_path, 7)
+        cp, chunk_q = _build_chunk_processor(tmp_path)
+        cp.start()
+        _enqueue_chunks(chunk_q, t0, 3)
+        cp.stop(timeout=30)
+
+        # In-memory gate blocked by the failure (unchanged behavior).
+        assert cp.all_chunks_uploaded() is False
+
+        # The ledger records chunk 1 FAILED, not UPLOADED — "disabled/failed
+        # != success" survives to disk for the terminal stage.
+        ledger = PipelineLedger(tmp_path / "recording.db")
+        states = {r.chunk_index: r.upload_state for r in ledger.all_chunks()}
+        assert states.get(0) == UploadState.UPLOADED
+        assert states.get(1) == UploadState.FAILED
+        assert states.get(2) == UploadState.UPLOADED
+        # Closed-set ledger gate also blocks (mirrors the in-memory gate).
+        assert ledger.all_uploaded() is False

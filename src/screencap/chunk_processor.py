@@ -369,6 +369,10 @@ class ChunkProcessor:
             # key means the server didn't confirm, so we stay conservative.
             if all(name in urls and urls[name] is None for name in names):
                 self._chunk_results[idx] = ChunkStatus.EMITTED
+                # U7: mirror the reconcile flip onto the on-disk ledger so the
+                # confirmed-in-GCS state survives a crash and is visible to the
+                # terminal-stage process. Best-effort (see _mirror_status_to_ledger).
+                self._mirror_status_to_ledger(idx, ChunkStatus.EMITTED)
                 flipped += 1
                 logger.info(f"Reconciled chunk {idx}: all core files already in GCS")
         return flipped
@@ -490,6 +494,34 @@ class ChunkProcessor:
             self._ledger_unavailable = True
             return None
         return self._ledger
+
+    def _mirror_status_to_ledger(self, idx: int, status: "ChunkStatus") -> None:
+        """Project a settled ``ChunkStatus`` onto the U1 ledger upload-state.
+
+        Maps via :func:`pipeline_state.from_chunk_status`:
+        ``EMITTED -> mark_uploaded``, ``NETWORK_SKIPPED -> mark_skipped``,
+        ``FAILED``/``NETWORK_INCOMPLETE -> mark_failed``. Best-effort and
+        non-fatal: a ledger write failure (no recording.db in a test fixture,
+        a transient lock) must never crash chunk processing — the in-memory
+        ``_chunk_results`` remains the live gate, and a missed ledger mirror is
+        re-derived by the terminal stage's reconcile-from-GCS on (re)entry.
+        """
+        ledger = self._get_ledger()
+        if ledger is None:
+            return
+        from screencap.pipeline_state import UploadState, from_chunk_status
+
+        try:
+            upload_state = from_chunk_status(status)
+            if upload_state == UploadState.UPLOADED:
+                ledger.mark_uploaded(idx)
+            elif upload_state == UploadState.SKIPPED:
+                ledger.mark_skipped(idx)
+            elif upload_state == UploadState.FAILED:
+                ledger.mark_failed(idx, detail=status.value)
+            # UploadState.PENDING is never reached (caller filters PENDING).
+        except Exception as e:  # noqa: BLE001
+            logger.debug(f"Chunk {idx}: ledger status mirror failed (non-fatal): {e}")
 
     def _run_agnostic_stages(self, idx, start_ts, end_ts):
         """Run the destination-agnostic stages (transcribe/export/manifest).
@@ -686,6 +718,18 @@ class ChunkProcessor:
                 # This is the survivorship-bias fix — force-stop early
                 # return now leaves a non-missing entry that the
                 # EMITTED-only gate explicitly rejects.
+
+                # U7: mirror the settled terminal status onto the on-disk U1
+                # ledger so the terminal stage (a SEPARATE process) can
+                # reconstruct correct upload state after a crash. The ledger is
+                # the cross-process SOURCE OF TRUTH; ``_chunk_results`` remains
+                # the in-process cache the live gating reads. Only settled
+                # statuses are mirrored — a chunk left PENDING (force-stop)
+                # stays PENDING in the ledger too (the closed-set gate rejects
+                # it identically on disk and in RAM).
+                settled = self._chunk_results.get(idx)
+                if settled is not None and settled != ChunkStatus.PENDING:
+                    self._mirror_status_to_ledger(idx, settled)
 
         # 7. Delete old chunks (keep 2 most recent). Only EMITTED chunks
         # are safe to delete locally — NETWORK_SKIPPED and

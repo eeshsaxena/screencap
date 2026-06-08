@@ -467,6 +467,50 @@ class Supervisor:
         """Public hook for tests and explicit startup reconciliation."""
         await self._reconcile()
 
+    async def resume_terminal_stage(self, recording_dir: "Path | str") -> Any:
+        """Resume incomplete terminal-stage work for one recording (U7).
+
+        The daemon-restart / crash resume entry point. A daemon that restarts
+        while a cloud recording's terminal-stage work (scrub → upload →
+        sentinel) was incomplete drives the SINGLE disk-driven terminal stage
+        from disk, behind the per-recording flock — converging without
+        duplicating or re-uploading already-confirmed chunks (R9/AE2).
+
+        Run in a worker thread (the terminal stage is blocking PyAV/network
+        work that must not stall the asyncio loop) and in ``non_blocking`` mode:
+        if a live engine's own ``finalize_uploads`` (or a manual ``screencap
+        upload``) currently holds the terminal flock, this resume SKIPS rather
+        than racing — the holder owns the critical section (AE12). flock is
+        advisory; this is one of the entry points that MUST take it.
+
+        SCHEDULING NOTE (deferred): this method is the wired resume SEAM, but it
+        is NOT auto-invoked from ``_handle_engine_exit`` in this milestone.
+        Auto-triggering a heavy scrub/upload on every engine exit needs the
+        scheduling + retention lifecycle that lands with U8/U9 (when to sweep,
+        how often, how to surface progress). Until then, the resume is
+        available to an explicit caller / test and to the manual ``screencap
+        upload`` path — there is NO half-wired auto-trigger that could
+        double-upload.
+        """
+        import asyncio as _asyncio
+
+        from screencap.terminal_stage import (
+            TerminalStageBusy,
+            run_terminal_stage,
+        )
+
+        def _run() -> Any:
+            try:
+                return run_terminal_stage(Path(recording_dir), non_blocking=True)
+            except TerminalStageBusy:
+                logger.debug(
+                    "resume_terminal_stage: %s busy (held by live finalize "
+                    "or manual upload); skipping", recording_dir,
+                )
+                return None
+
+        return await _asyncio.to_thread(_run)
+
     async def shutdown(self) -> None:
         """Stop any owned engine and release the daemon lock."""
         if self._proc is not None and self._proc.is_alive():
