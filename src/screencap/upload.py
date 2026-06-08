@@ -371,6 +371,15 @@ def upload_recording(
     if not files:
         raise FileNotFoundError(f"No files found in {recording_name}")
 
+    # R8 defense-in-depth: re-assert at the upload seam that no raw local-only
+    # artifact (recording.db + sidecars, *.scrub_failed) is in the set. The
+    # list_recording_files denylist already excludes them, but routing the set
+    # through assert_uploadable makes the "enforced two ways" guarantee real —
+    # a future enqueue path that bypasses list_recording_files still hits this
+    # gate, and it fails loud rather than silently shipping raw PII.
+    for f in files:
+        assert_uploadable(f)
+
     total_size = sum(f.size for f in files)
     console.print(
         f"\nUploading [bold]{recording_name}[/bold] "

@@ -735,27 +735,40 @@ class PipelineLedger:
         return all(r.lifecycle in terminal for r in rows)
 
     def finalize_gate_satisfied(self) -> bool:
-        """True iff the frozen ``chunks_expected`` are all terminal-uploaded.
+        """True iff the frozen ``chunks_expected`` closed set is all uploaded.
 
         The completeness signal derived from completeness evidence
         (prevention rule #5): gates on the FROZEN count, never a live glob.
         Returns False if ``chunks_expected`` is not yet frozen, if fewer
-        rows are seeded than expected, or if any expected chunk is not in a
-        ``UPLOADED``/``EVICTED`` lifecycle (both of which had a confirmed
-        upload). Eviction does not shrink ``chunks_expected``, so evicting
-        local files never relaxes this gate.
+        rows are seeded than expected (the closed set is incomplete), or if
+        ANY seeded chunk is not in a ``UPLOADED``/``EVICTED`` lifecycle with a
+        confirmed ``UPLOADED`` upload state. Eviction does not shrink
+        ``chunks_expected`` (and an ``EVICTED`` row keeps ``upload_state ==
+        UPLOADED``), so evicting local files never relaxes this gate.
+
+        Gates on the actual seeded closed set rather than assuming chunk
+        indices are contiguous ``0..expected-1``: the U9 migration reconciler
+        freezes ``chunks_expected = len(closed_set)`` over a possibly-SPARSE
+        on-disk index set, so a ``range(expected)`` superset check would be
+        permanently unsatisfiable (e.g. on-disk indices ``{2,3,4}`` →
+        ``expected=3`` → ``range(3)={0,1,2}`` never covered) even when every
+        real chunk is uploaded. The closed set IS the seeded rows.
         """
         expected = self.chunks_expected()
         if expected is None:
             return False
         rows = self.all_chunks()
-        uploaded_indices = {
-            r.chunk_index for r in rows
-            if r.lifecycle in (Lifecycle.UPLOADED, Lifecycle.EVICTED)
+        # The closed set must be fully seeded: at least ``expected`` rows.
+        if len(rows) < expected:
+            return False
+        # Every seeded chunk must have a confirmed upload (UPLOADED, or
+        # EVICTED which kept its UPLOADED upload_state). A single PENDING /
+        # FAILED / SKIPPED row blocks the gate (closed-set, no survivorship).
+        return all(
+            r.lifecycle in (Lifecycle.UPLOADED, Lifecycle.EVICTED)
             and r.upload_state == UploadState.UPLOADED
-        }
-        # Every expected index 0..expected-1 must be confirmed-uploaded.
-        return uploaded_indices.issuperset(range(expected))
+            for r in rows
+        )
 
 
 # ---------------------------------------------------------------------------

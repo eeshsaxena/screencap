@@ -269,6 +269,33 @@ class TestFrozenCount:
         # All 5 terminal-uploaded -> gate satisfied even before any eviction.
         assert ledger.finalize_gate_satisfied()
 
+    def test_finalize_gate_handles_sparse_noncontiguous_indices(
+        self, ledger: ps.PipelineLedger,
+    ) -> None:
+        # U9 migration freezes chunks_expected = len(closed_set) over a possibly
+        # SPARSE on-disk index set (e.g. chunk 0/1 deleted, {2,3,4} survive).
+        # The gate must finalize when every REAL chunk is uploaded, not assume
+        # contiguous 0..N-1 (a range() superset check would be unsatisfiable).
+        for i in (2, 3, 4):
+            ledger.seed_chunk(i)
+            ledger.mark_staged(i)
+            ledger.mark_uploaded(i)
+        ledger.freeze_chunks_expected(3)
+        assert ledger.finalize_gate_satisfied()
+
+    def test_finalize_gate_blocks_on_pending_member_of_sparse_set(
+        self, ledger: ps.PipelineLedger,
+    ) -> None:
+        # Sparse set {2,3,4}, but chunk 4 never uploads -> gate must block
+        # (closed-set, no survivorship: a PENDING member is not "done").
+        for i in (2, 3):
+            ledger.seed_chunk(i)
+            ledger.mark_staged(i)
+            ledger.mark_uploaded(i)
+        ledger.seed_chunk(4)  # rotated but never processed -> PENDING
+        ledger.freeze_chunks_expected(3)
+        assert not ledger.finalize_gate_satisfied()
+
 
 # ---------------------------------------------------------------------------
 # Disabled != success: uploads-off marks SKIPPED; eviction refused.

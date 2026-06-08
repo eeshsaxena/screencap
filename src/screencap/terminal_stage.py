@@ -397,7 +397,12 @@ class CloudCopyProducer:
                 mask_outcome = mask_video_chunk_for_cloud(
                     vf, db_path, scrubbed_dir,
                     chunk_index=idx, start_ts=start_ts, end_ts=end_ts,
-                    chunk_start_abs=chunk_start_abs,
+                    # The chunk's OWN first-frame absolute time is start_ts, not
+                    # the recording base: each chunk mp4's PTS restarts near 0,
+                    # so video_mask maps frames as start_ts + frame_pts. Passing
+                    # the recording base would shift every chunk idx>=1's frames
+                    # outside the coverage span (mis-aligned masking).
+                    chunk_start_abs=start_ts,
                 )
             except Exception as exc:  # noqa: BLE001 — fail closed on any error
                 logger.error("video mask raised for chunk %d: %s", idx, exc)
@@ -414,7 +419,18 @@ class CloudCopyProducer:
                 outcome.masked_chunks.append(idx)
                 if ledger is not None:
                     with contextlib.suppress(Exception):
-                        ledger.mark_scrubbed(idx)
+                        # Do NOT downgrade a chunk a prior reconcile already
+                        # advanced to UPLOADED/EVICTED — mark_scrubbed sets
+                        # lifecycle=SCRUBBED, and the later _mark_uploaded_chunks
+                        # pass skips an already-UPLOADED upload_state, so the
+                        # row would be stuck SCRUBBED and never satisfy the
+                        # finalize gate.
+                        from screencap.pipeline_state import Lifecycle as _LC
+                        _row = ledger.get_chunk(idx)
+                        if _row is None or _row.lifecycle not in (
+                            _LC.UPLOADED, _LC.EVICTED,
+                        ):
+                            ledger.mark_scrubbed(idx)
             else:
                 outcome.failed_chunks.append(idx)
                 if ledger is not None:

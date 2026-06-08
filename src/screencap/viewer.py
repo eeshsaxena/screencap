@@ -152,16 +152,14 @@ def _ensure_single_video(rec_dir: Path, *, fail_loud: bool = False) -> None:
     if (rec_dir / "video.mp4").exists():
         return  # already has the derived single video
 
-    # Only concat if we have 2+ chunks
-    if len(chunks) == 1:
-        # Symlink single chunk for compatibility
-        try:
-            (rec_dir / "video.mp4").symlink_to(chunks[0])
-        except OSError:
-            pass
-        return
+    # Both the single-chunk symlink and the multi-chunk concat mutate video.mp4
+    # from chunk_*.mp4 the terminal stage can evict, so BOTH go through the
+    # per-recording flock (the lock-FIRST contract). A single chunk that gets
+    # evicted between this glob and the symlink would otherwise leave a dangling
+    # video.mp4 symlink — _concat_under_lock re-globs under the lock and handles
+    # the 1-chunk / 0-chunk / 2+-chunk cases atomically w.r.t. eviction.
 
-    # Serialize the multi-chunk concat against U8 eviction via the per-recording
+    # Serialize the concat against U8 eviction via the per-recording
     # terminal flock (the same lock eviction runs under). Import is deferred —
     # terminal_stage pulls heavier modules than the `screencap --help` path
     # tolerates, and the viewer's single-chunk/legacy fast paths above must not
