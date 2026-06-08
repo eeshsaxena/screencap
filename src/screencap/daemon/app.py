@@ -8,7 +8,7 @@ import logging
 import os
 import time
 from contextlib import asynccontextmanager
-from typing import Any, AsyncIterator
+from typing import TYPE_CHECKING, Any, AsyncIterator
 
 from starlette.applications import Starlette
 from starlette.datastructures import State
@@ -20,6 +20,9 @@ from screencap import _stderr_events
 from screencap.daemon import errors, schema
 from screencap.daemon.event_bus import CursorOutOfRangeError, EventBus
 from screencap.pidfile import CLAIMANT_DAEMON
+
+if TYPE_CHECKING:
+    from screencap.daemon.permission_probe import GrantState
 
 logger = logging.getLogger(__name__)
 
@@ -76,7 +79,7 @@ def _grant_holder(app: Starlette) -> State:
     state = app.state
     if not hasattr(state, "_grant_lock"):
         state._grant_lock = asyncio.Lock()
-        state._grant_cache = None
+        state._grant_cache: dict[str, GrantState] | None = None
         state._grant_cache_at = 0.0
     return state
 
@@ -89,7 +92,7 @@ async def _warm_grant_cache(app: Starlette) -> None:
         logger.debug("grant cache warm-up failed", exc_info=True)
 
 
-async def _current_grants(app: Starlette) -> dict[str, str]:
+async def _current_grants(app: Starlette) -> dict[str, GrantState]:
     """Return the daemon's live TCC grant tri-state, served from a short cache.
 
     The fresh-subprocess probe (U1) runs off the event loop via
@@ -122,7 +125,16 @@ async def _current_grants(app: Starlette) -> dict[str, str]:
 
 
 async def daemon_info(request: Request) -> JSONResponse:
-    grants = await _current_grants(request.app)
+    from screencap.daemon import permission_probe
+
+    # Mirror every other read-only verb's defensive try/except: a raise on the
+    # grants probe path must never turn the readiness probe into a 500 (which
+    # drops the app to its CLI fallback). Fail open to all-indeterminate.
+    try:
+        grants = await _current_grants(request.app)
+    except Exception:  # noqa: BLE001 - readiness probe must never 500
+        logger.debug("daemon.info grant probe failed", exc_info=True)
+        grants = permission_probe.indeterminate_result()
     return JSONResponse(
         schema.envelope(
             schema_version=schema._DAEMON_INFO_API_VERSION,
@@ -480,9 +492,40 @@ async def permission_request(request: Request) -> JSONResponse:
                 schema_version=schema._PERMISSION_REQUEST_API_VERSION,
             )
 
-        already_granted = await asyncio.to_thread(
-            permission_register.register_permission, parsed.permission
-        )
+        # Bound the *HTTP response* on the TCC registration. The underlying
+        # `register_permission` (which can block on `CGEventTapCreate` /
+        # `CGRequestScreenCaptureAccess` TCC syscalls) keeps running to
+        # completion in the thread pool — `wait_for` only abandons the await,
+        # it cannot cancel the off-loop work — but the client gets a prompt,
+        # bounded ack instead of an indefinitely hung request. On timeout we
+        # report `already_granted=False`; the app re-probes for the
+        # authoritative post-grant state regardless.
+        try:
+            already_granted = await asyncio.wait_for(
+                asyncio.to_thread(
+                    permission_register.register_permission, parsed.permission
+                ),
+                timeout=8.0,
+            )
+        except asyncio.TimeoutError:
+            _audit("ok")
+            return JSONResponse(
+                schema.envelope(
+                    schema_version=schema._PERMISSION_REQUEST_API_VERSION,
+                    permission=parsed.permission,
+                    already_granted=False,
+                )
+            )
+
+        # A successful registration may have produced a fresh grant; invalidate
+        # the short grant cache under the grant lock so the next daemon.info /
+        # pre-spawn start gate re-probes instead of serving the pre-grant
+        # snapshot for the remainder of its TTL.
+        grant_state = _grant_holder(request.app)
+        async with grant_state._grant_lock:
+            grant_state._grant_cache = None
+            grant_state._grant_cache_at = 0.0
+
         _audit("ok")
         return JSONResponse(
             schema.envelope(

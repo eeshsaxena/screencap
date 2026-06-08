@@ -173,6 +173,51 @@ final class RecorderControllerDaemonTests: XCTestCase {
         XCTAssertTrue(recorder.state.isRecording, "start should be in-flight, not blocked")
     }
 
+    func testDaemonStartProceedsWhenOnlyInputMonitoringDenied() async throws {
+        // Decision: hard-block on Screen Recording only. An Input Monitoring
+        // denial is advisory — start must proceed (warn-and-proceed), not block.
+        // We assert the start dispatched (recording.start hit) without depending
+        // on the chunked event stream delivering `started`.
+        let startCount = LockedInt()
+        _ = try startServer { request in
+            switch request.path {
+            case "/v0/daemon.info":
+                return .json(#"{"ok":true,"schema_version":1,"daemon_version":"test","api_schema_version":1,"build":null,"started_at":1.0,"permissions":{"screen_recording":"granted","accessibility":"granted","input_monitoring":"denied"}}"#)
+            case "/v0/recording.start":
+                _ = startCount.incrementAndGet()
+                return .json(#"{"ok":true,"schema_version":1,"daemon_version":"test","api_schema_version":1,"session_id":"s","started_at":10.0,"engine_pid":1,"cursor":2}"#)
+            case "/v0/session.snapshot":
+                // Not recording until start fires, then daemon-owned recording —
+                // keeps the event consumer from treating the session as ended.
+                guard startCount.value > 0 else {
+                    return .json(#"{"ok":true,"schema_version":1,"daemon_version":"test","api_schema_version":1,"is_recording":false,"daemon_owned":false,"recording_name":null,"started_at":null,"claimant":null,"recovering":false,"cursor":0}"#)
+                }
+                return .json(#"{"ok":true,"schema_version":1,"daemon_version":"test","api_schema_version":1,"is_recording":true,"daemon_owned":true,"recording_name":"demo","started_at":10.0,"claimant":"daemon","recovering":false,"cursor":3}"#)
+            case "/v0/events?since=2":
+                return .chunked([
+                    #"{"type":"subscribed","schema_version":1,"cursor":2,"ts":11.0}"# + "\n",
+                ], terminate: false)
+            default:
+                XCTFail("Unexpected request path \(request.path)")
+                return .json(#"{"ok":false,"schema_version":1,"daemon_version":"test","api_schema_version":1,"error":"unexpected"}"#, status: 500)
+            }
+        }
+
+        let permissions = PermissionController()
+        let recorder = RecorderController()
+        self.recorder = recorder
+        recorder.bindPermissions(permissions)
+        await recorder.probeDaemon()
+        XCTAssertEqual(permissions.daemonGrants.inputMonitoring, .denied)
+
+        recorder.start(name: "demo")
+
+        // Proceeded past the start-block: the daemon recording.start was sent.
+        await waitUntil { startCount.value > 0 }
+        XCTAssertNil(recorder.lastError)
+        XCTAssertTrue(recorder.state.isRecording, "start should be in-flight, not blocked")
+    }
+
     func testDaemonStartPermissionRequiredRoutesToGrantFlowWithoutCLIFallback() async throws {
         // Stale-client scenario (U6): daemon.info reports granted so the U4
         // client-side start-block passes, but the daemon's fresh pre-spawn

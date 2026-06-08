@@ -25,7 +25,9 @@ def pytest_configure(config: pytest.Config) -> None:
 
 
 @pytest.fixture(autouse=True)
-def _granted_permissions_by_default(request: pytest.FixtureRequest, monkeypatch):
+def _granted_permissions_by_default(
+    request: pytest.FixtureRequest, monkeypatch: pytest.MonkeyPatch
+):
     """Default the daemon permission probe to all-granted (U6).
 
     The pre-spawn permission gate (recording.start) now blocks on a denied

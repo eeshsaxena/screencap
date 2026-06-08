@@ -347,7 +347,7 @@ final class PermissionController: ObservableObject {
         // when we stopped doesn't clear a *newer* session's guard on completion
         // (see runDaemonGrantRefresh).
         daemonGrantRefreshInFlight = false
-        daemonGrantRefreshGeneration &+= 1
+        daemonGrantRefreshGeneration += 1
     }
 
     private func runDaemonGrantRefresh(_ refresh: @escaping @MainActor () async -> Void) {

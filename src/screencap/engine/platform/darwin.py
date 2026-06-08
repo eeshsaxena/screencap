@@ -8,10 +8,13 @@ This module provides macOS-specific functionality for:
 
 from __future__ import annotations
 
+import logging
 import sys
 
 if sys.platform != "darwin":
     raise ImportError("This module is only available on macOS")
+
+logger = logging.getLogger(__name__)
 
 
 class DarwinPlatform:
@@ -250,7 +253,9 @@ class DarwinPlatform:
 
                     CFMachPortInvalidate(tap)
                 except Exception:
-                    pass
+                    # A teardown failure here leaks the Mach port; log it
+                    # rather than swallowing silently so the leak is diagnosable.
+                    logger.debug("CFMachPortInvalidate failed", exc_info=True)
             return granted
         except (ImportError, AttributeError):
             return True

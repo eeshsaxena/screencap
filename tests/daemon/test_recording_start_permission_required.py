@@ -127,6 +127,23 @@ async def test_accessibility_only_denied_proceeds_to_spawn(
 
 
 @pytest.mark.asyncio
+async def test_input_monitoring_only_denied_proceeds_to_spawn(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    # Decision: hard-block on Screen Recording only. Input Monitoring denial is
+    # advisory — start must proceed.
+    _stub_peer(monkeypatch)
+    _stub_probe(monkeypatch, {**_ALL_GRANTED, "input_monitoring": "denied"})
+    app = build_app()
+    fake = _FakeSupervisor()
+
+    response = await _post_start(app, fake)
+
+    assert response.status_code == 200, response.text
+    assert fake.spawn_calls == 1
+
+
+@pytest.mark.asyncio
 async def test_indeterminate_screen_recording_proceeds(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
@@ -186,9 +203,11 @@ async def test_denied_to_granted_observed_without_daemon_restart(
             assert fake.spawn_calls == 0
 
             # User grants Screen Recording. Expire the short grant cache to force
-            # a fresh probe (the same daemon process — no restart).
+            # a fresh probe (the same daemon process — no restart). Push the
+            # cache timestamp into the past so the real TTL-expiry path fires,
+            # rather than reaching in to null the cache value directly.
             state["granted"] = True
-            app.state._grant_cache = None
+            app.state._grant_cache_at = 0.0
 
             second = await client.post("/v0/recording.start", json={"name": "demo"})
             assert second.status_code == 200, second.text

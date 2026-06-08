@@ -92,7 +92,7 @@ struct DaemonPermissionGrants: Decodable, Equatable, Sendable {
 
     enum CodingKeys: String, CodingKey {
         case screenRecording = "screen_recording"
-        case accessibility
+        case accessibility = "accessibility"
         case inputMonitoring = "input_monitoring"
     }
 
@@ -490,7 +490,18 @@ enum DaemonClient {
     /// no helper row — the AE2 failure mode).
     static func permissionRequest(_ permission: String) async throws -> PermissionRequestResponse {
         let body = try JSONEncoder().encode(PermissionRequestRequest(permission: permission))
-        return try await request(method: "POST", path: "/v0/permission.request", body: body)
+        // Daemon-side registration runs the TCC request mechanism in its own
+        // process (`CGEventTapCreate` / `CGRequestScreenCaptureAccess`), which
+        // can block on TCC syscalls. Pass the timeout explicitly — matching
+        // `recordingStart`'s 10 s budget — rather than relying on the implicit
+        // default, so the budget for this blocking call is visible at the call
+        // site. (The daemon also bounds its own response at 8 s.)
+        return try await request(
+            method: "POST",
+            path: "/v0/permission.request",
+            body: body,
+            timeout: 10
+        )
     }
 
     private static func connect(_ connection: NWConnection) async throws {

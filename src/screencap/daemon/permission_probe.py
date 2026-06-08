@@ -113,7 +113,7 @@ def _parse_probe_output(stdout: str) -> dict[str, GrantState]:
     result line can't break parsing. Missing or out-of-range values for any
     permission decode to ``indeterminate``.
     """
-    raw: dict | None = None
+    raw: dict[str, object] | None = None
     for raw_line in reversed(stdout.splitlines()):
         line = raw_line.strip()
         if not line:
