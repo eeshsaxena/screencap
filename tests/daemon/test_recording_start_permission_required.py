@@ -212,3 +212,91 @@ async def test_denied_to_granted_observed_without_daemon_restart(
             second = await client.post("/v0/recording.start", json={"name": "demo"})
             assert second.status_code == 200, second.text
             assert fake.spawn_calls == 1
+
+
+@pytest.mark.asyncio
+async def test_recording_start_reuses_daemon_info_grant_cache(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """The pre-spawn gate reuses U2's cached probe: a daemon.info immediately
+    followed by recording.start within the TTL must NOT trigger a second fresh
+    subprocess spawn. A fresh ~5s spawn inside the start path would widen the
+    lock-contended window and risk the app's 10s recording.start timeout — the
+    cache is deliberately shared across both verbs.
+
+    No lifespan context is entered, so the background warm task never runs and
+    the spawn counter reflects exactly the request-path probes.
+    """
+    _stub_peer(monkeypatch)
+
+    calls: list[int] = []
+
+    def _counting_probe() -> dict[str, str]:
+        calls.append(1)
+        return dict(_ALL_GRANTED)
+
+    monkeypatch.setattr(permission_probe, "probe_permissions", _counting_probe)
+
+    app = build_app()
+    fake = _FakeSupervisor()
+    app.state.supervisor = fake
+
+    async with AsyncClient(
+        transport=ASGITransport(app=app), base_url="http://test"
+    ) as client:
+        info = await client.get("/v0/daemon.info")
+        assert info.status_code == 200
+        start = await client.post("/v0/recording.start", json={"name": "demo"})
+
+    assert start.status_code == 200, start.text
+    assert fake.spawn_calls == 1
+    # daemon.info spawned + cached the probe; recording.start reused it within
+    # the TTL — one spawn total across both verbs, not two.
+    assert len(calls) == 1
+
+    # Non-vacuous guard: once the cache expires, the gate DOES re-probe, proving
+    # the count above reflects genuine reuse rather than a probe that never ran.
+    app.state._grant_cache_at = 0.0
+    async with AsyncClient(
+        transport=ASGITransport(app=app), base_url="http://test"
+    ) as client:
+        again = await client.post("/v0/recording.start", json={"name": "demo"})
+    assert again.status_code == 200, again.text
+    assert len(calls) == 2
+
+
+@pytest.mark.asyncio
+async def test_blocked_start_emits_no_events_so_no_double_permission_lost(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """U6 is the single source of truth for start-time permission failures on the
+    daemon transport. A blocked start (Screen Recording denied) is delivered ONLY
+    as the synchronous typed 403: the worker never spawns, so there is no
+    EVENT_STARTED, no permission_lost, and no engine_crashed published for the
+    attempt — i.e. no '200 OK then async permission_lost crash', and the worker's
+    own permission_lost can't also fire for the same blocked attempt.
+
+    The worker's in-process preflight remains the backstop for the standalone-CLI
+    transport only (asserted in the session/worker tests, not here). At the daemon
+    layer the invariant is: a blocked attempt publishes zero events, so the event
+    bus cursor does not advance.
+    """
+    _stub_peer(monkeypatch)
+    _stub_probe(monkeypatch, {**_ALL_GRANTED, "screen_recording": "denied"})
+    app = build_app()
+    fake = _FakeSupervisor()
+    app.state.supervisor = fake
+
+    cursor_before = app.state.event_bus.current_cursor()
+
+    async with AsyncClient(
+        transport=ASGITransport(app=app), base_url="http://test"
+    ) as client:
+        response = await client.post("/v0/recording.start", json={"name": "demo"})
+
+    assert response.status_code == 403
+    assert response.json()["error"] == errors.PERMISSION_REQUIRED
+    # No worker spawned for the blocked attempt → nothing published the worker's
+    # permission_lost (or any other event), so the cursor is unchanged.
+    assert fake.spawn_calls == 0
+    assert app.state.event_bus.current_cursor() == cursor_before

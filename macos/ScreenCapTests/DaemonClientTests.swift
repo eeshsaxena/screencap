@@ -156,6 +156,27 @@ final class DaemonClientTests: XCTestCase {
         XCTAssertEqual(outcome, .daemon(grants: .allIndeterminate))
     }
 
+    func testProbeMapsPartialPermissionsBlockToIndeterminateAtOutcomeLevel() async throws {
+        // A partial block (only screen_recording present) surfaced through
+        // probe(): absent sub-keys must reach the .daemon grants as indeterminate,
+        // never silently granted/denied. testDaemonInfoPartialBlock... pins the
+        // raw decode; this pins the DaemonSessionService.probe() outcome a
+        // partial block produces.
+        _ = try startServer { _ in
+            .json(
+                #"{"ok":true,"schema_version":1,"daemon_version":"test","api_schema_version":1,"build":null,"started_at":1.0,"permissions":{"screen_recording":"denied"}}"#
+            )
+        }
+
+        let outcome = await LiveDaemonSessionService().probe()
+        guard case .daemon(let grants) = outcome else {
+            return XCTFail("Expected .daemon outcome, got \(outcome)")
+        }
+        XCTAssertEqual(grants.screenRecording, .denied)
+        XCTAssertEqual(grants.accessibility, .indeterminate)
+        XCTAssertEqual(grants.inputMonitoring, .indeterminate)
+    }
+
     func testRequestFramesPOSTBodyAndDecodesResponse() async throws {
         _ = try startServer { request in
             XCTAssertEqual(request.method, "POST")

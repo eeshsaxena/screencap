@@ -507,12 +507,31 @@ final class PermissionController: ObservableObject {
         daemonRegistrationInFlight.insert(pane)
         defer { daemonRegistrationInFlight.remove(pane) }
 
+        // Capture whether this request originated from the visible walkthrough.
+        // The daemon-grant watch is started in the sheet's onAppear and stopped
+        // in onDisappear, so it is the walkthrough's visibility signal — and the
+        // walkthrough is this path's only caller today.
+        let gatedOnWalkthrough = isDaemonGrantWatching
+
         do {
             try await resolvedDaemonRegistrar()(permission)
         } catch {
             permissionLogger.info(
                 "Daemon permission registration for \(permission, privacy: .public) failed: \(String(describing: error), privacy: .public)"
             )
+        }
+
+        // The registrar round-trip can take up to the client timeout (~10s). If
+        // the user dismissed the walkthrough while it was in flight, opening
+        // System Settings now would pop a pane out of nowhere long after they
+        // moved on. Suppress the open when a walkthrough-originated request finds
+        // the walkthrough already gone. A non-walkthrough caller (not watching at
+        // start) always opens, preserving prior behavior.
+        if gatedOnWalkthrough, !isDaemonGrantWatching {
+            permissionLogger.info(
+                "Walkthrough dismissed during daemon registration for \(permission, privacy: .public); skipping Settings open"
+            )
+            return
         }
         resolvedDaemonSettingsOpener()(pane)
     }

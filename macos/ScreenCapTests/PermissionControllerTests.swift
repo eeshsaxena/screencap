@@ -365,6 +365,50 @@ final class PermissionControllerTests: XCTestCase {
     }
 
     @MainActor
+    func testDaemonRegistrationSkipsSettingsOpenWhenWalkthroughDismissedMidRequest() async {
+        // Review #2: the registrar round-trip can take up to the client timeout.
+        // If the user dismisses the walkthrough while it is in flight, opening
+        // System Settings afterward pops a pane out of nowhere. A walkthrough-
+        // originated request (watch active at start) must suppress the open when
+        // the walkthrough has since been dismissed (watch stopped in onDisappear).
+        var openedPanes: [PrivacyPane] = []
+        let permissions = makeRegisteringController(
+            registrar: { _ in try? await Task.sleep(nanoseconds: 200_000_000) },
+            opener: { pane in openedPanes.append(pane) }
+        )
+        permissions.startDaemonGrantWatching {}
+        XCTAssertTrue(permissions.isDaemonGrantWatching)
+
+        async let request: Void = permissions.requestDaemonPermission(for: .accessibility)
+        // Let the request reach its in-flight await, then dismiss the walkthrough.
+        try? await Task.sleep(nanoseconds: 60_000_000)
+        permissions.stopDaemonGrantWatching()
+        await request
+
+        XCTAssertEqual(
+            openedPanes, [],
+            "Settings must not open after the walkthrough was dismissed mid-request"
+        )
+    }
+
+    @MainActor
+    func testDaemonRegistrationOpensSettingsWhenWalkthroughStaysVisible() async {
+        // The gate must not over-block: while the walkthrough is still visible,
+        // a completed registration opens the matching pane as before.
+        var openedPanes: [PrivacyPane] = []
+        let permissions = makeRegisteringController(
+            registrar: { _ in },
+            opener: { pane in openedPanes.append(pane) }
+        )
+        permissions.startDaemonGrantWatching {}
+        defer { permissions.stopDaemonGrantWatching() }
+
+        await permissions.requestDaemonPermission(for: .accessibility)
+
+        XCTAssertEqual(openedPanes, [.accessibility])
+    }
+
+    @MainActor
     func testRequestAndOpenSettingsDaemonSubjectInvokesRegistrar() async {
         // The synchronous public entrypoint (used by the Grant button) routes
         // the .daemon subject into the async registration round-trip — no longer
