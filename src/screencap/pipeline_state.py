@@ -106,6 +106,7 @@ __all__ = [
     "EvictionRefused",
     "ensure_pipeline_state_schema",
     "from_chunk_status",
+    "reconcile_ledger_from_disk",
 ]
 
 # Match the engine writer's busy_timeout (privacy/scrub_worker.py:471) so a
@@ -755,3 +756,180 @@ class PipelineLedger:
         }
         # Every expected index 0..expected-1 must be confirmed-uploaded.
         return uploaded_indices.issuperset(range(expected))
+
+
+# ---------------------------------------------------------------------------
+# U9 migration reconciler — seed the ledger from on-disk evidence,
+# CONSERVATIVELY. Legacy status is a HINT, a fresh GCS re-stat is the only
+# proof, GCS-unreachable -> PENDING (never UPLOADED), stale sentinel ignored.
+# ---------------------------------------------------------------------------
+
+
+def _legacy_uploaded_indices(recording_dir: Path) -> set[int]:
+    """Parse the legacy ``.chunk_*_status.json`` markers into chunk indices.
+
+    The OLD live path (``chunk_processor.upload_chunk_files``) wrote one marker
+    per chunk whose CORE files uploaded, named
+    ``.chunk_<basename-without-ext>_status.json`` — i.e.
+    ``.chunk_chunk_0000_status.json`` for ``chunk_0000.mp4``. These prove the
+    core files were uploaded UNDER THE OLD PATH; they say NOTHING about
+    new-model scrub completeness or current remote presence, so this is used
+    only as a HINT (which chunks to *re-stat first* / prioritise), NEVER as
+    proof of an ``UPLOADED`` state. The fresh GCS re-confirm is the only proof.
+
+    Best-effort: an unparseable / oddly-named marker is skipped, never fatal.
+    """
+    out: set[int] = set()
+    for marker in recording_dir.glob(".chunk_*_status.json"):
+        # ".chunk_chunk_0000_status.json" -> stem "chunk_chunk_0000_status".
+        stem = marker.name
+        # Strip the ".chunk_" prefix and "_status.json" suffix, leaving the
+        # inner basename (e.g. "chunk_0000").
+        if not stem.startswith(".chunk_") or not stem.endswith("_status.json"):
+            continue
+        inner = stem[len(".chunk_"):-len("_status.json")]
+        parts = inner.split("_")
+        # inner is like "chunk_0000"; take the trailing numeric component.
+        for tok in reversed(parts):
+            if tok.isdigit():
+                out.add(int(tok))
+                break
+    return out
+
+
+def _on_disk_chunk_indices(recording_dir: Path) -> set[int]:
+    """Chunk indices for which a ``chunk_NNNN.mp4`` exists on disk.
+
+    The closed set is seeded from these (the chunks the recording PRODUCED).
+    A legacy status marker for a chunk whose media was already evicted is still
+    counted so the closed set does not develop survivorship holes.
+    """
+    out: set[int] = set()
+    for vf in recording_dir.glob("chunk_*.mp4"):
+        try:
+            out.add(int(vf.stem.split("_")[1]))
+        except (IndexError, ValueError):
+            continue
+    return out
+
+
+def reconcile_ledger_from_disk(
+    recording_dir: Path | str,
+    *,
+    remote_exists: Callable[[int], bool] | None = None,
+) -> "PipelineLedger":
+    """Seed/reconcile the U1 ledger from on-disk evidence, CONSERVATIVELY (U9).
+
+    Run on the first pass of the new code over an OLD-PATH recording (legacy
+    ``.chunk_*_status.json`` markers, a possibly-stale ``recording_complete.json``,
+    a partially-uploaded chunk set), and idempotently on every later pass. It
+    re-establishes the closed-set, no-survivorship invariant on the ledger and
+    NEVER over-optimistically marks a chunk done:
+
+    1. **Closed set from disk.** One ``PENDING`` row per chunk found on disk
+       (``chunk_NNNN.mp4``) OR named by a legacy status marker — so an evicted
+       chunk that still has its marker is not silently dropped. Seeding is
+       ``INSERT OR IGNORE`` (``seed_chunk``), so a row the engine writer or a
+       prior reconcile already advanced is NEVER reset to PENDING.
+    2. **Legacy status is a HINT, not proof.** ``_legacy_uploaded_indices``
+       only tells us which chunks the OLD path *claimed* to upload. We do NOT
+       trust it: we re-stat.
+    3. **Fresh GCS re-confirm is the only proof of UPLOADED.** For every chunk
+       not already ``UPLOADED``, we call ``remote_exists(idx)`` (the U7
+       ``_chunk_confirmed_remote`` seam by default) and ``mark_uploaded`` ONLY
+       on a fresh True. A False, or a raise (GCS unreachable: offline, expired
+       token, signing function down), leaves the chunk ``PENDING`` —
+       needs-verification, never ``UPLOADED``. This mirrors
+       ``chunk_processor.reconcile_against_gcs``'s fail-conservative posture
+       (on stat failure, stay needs-work). A migration seed therefore never
+       authorises a later eviction (U8 re-stats at delete time regardless).
+    4. **Stale sentinel ignored (Bug 3).** Any legacy ``recording_complete.json``
+       is NEVER read for ``chunks_expected``; the frozen count is regenerated
+       from the reconciled closed set (the chunks actually on disk / claimed).
+    5. **Frozen count respected.** If the engine writer already froze
+       ``chunks_expected`` (final rotation), we do NOT refreeze a conflicting
+       value — ``freeze_chunks_expected`` no-ops on the same count and we never
+       pass a different one.
+
+    Legacy single-file recordings (no ``chunk_*.mp4``, no markers) seed zero
+    chunk rows and a frozen count of 0 — they are NOT forced into the per-chunk
+    model (R14); the caller routes them through the whole-dir scrub branch.
+
+    Args:
+        recording_dir: the recording's source dir (``recording.db`` + chunks).
+        remote_exists: ``(idx) -> bool`` fresh remote re-confirmation. When
+            ``None``, the real U7 ``terminal_stage._chunk_confirmed_remote``
+            seam is used (probes ``request_signed_urls``; any error -> False).
+            A callback that RAISES is treated as GCS-unreachable -> the chunk
+            stays ``PENDING`` (conservative).
+
+    Returns:
+        The reconciled :class:`PipelineLedger`.
+    """
+    recording_dir = Path(recording_dir)
+    db_path = recording_dir / "recording.db"
+    ensure_pipeline_state_schema(db_path)
+    ledger = PipelineLedger(db_path)
+
+    # 1. Closed set: chunks on disk ∪ chunks named by a surviving legacy marker.
+    on_disk = _on_disk_chunk_indices(recording_dir)
+    legacy = _legacy_uploaded_indices(recording_dir)
+    closed_set = sorted(on_disk | legacy)
+    for idx in closed_set:
+        ledger.seed_chunk(idx)  # INSERT OR IGNORE — never resets an advanced row.
+
+    # 4 + 5. Freeze chunks_expected from the RECONCILED count (NOT the stale
+    # sentinel — Bug 3). Respect an existing frozen count: only freeze when the
+    # ledger has not frozen a conflicting value yet.
+    existing = ledger.chunks_expected()
+    if existing is None:
+        ledger.freeze_chunks_expected(len(closed_set))
+    # If a count is already frozen we leave it — the engine writer's frozen
+    # count is authoritative and `freeze_chunks_expected` would raise on a
+    # conflict. (A same-value refreeze would be a no-op but is unnecessary.)
+
+    # 2 + 3. Re-stat every not-yet-UPLOADED chunk; mark UPLOADED ONLY on a
+    # fresh remote confirm. Legacy markers are not consulted as proof here —
+    # the confirm is the gate.
+    confirm = _make_reconcile_confirm(recording_dir, remote_exists)
+    for row in ledger.all_chunks():
+        if row.upload_state == UploadState.UPLOADED:
+            continue  # idempotent: never downgrade a confirmed chunk.
+        if confirm(row.chunk_index):
+            try:
+                ledger.mark_uploaded(row.chunk_index)
+            except LedgerError:
+                # Row vanished between read and write (concurrent process) —
+                # conservative: leave it for the next pass.
+                pass
+
+    return ledger
+
+
+def _make_reconcile_confirm(
+    recording_dir: Path,
+    remote_exists: Callable[[int], bool] | None,
+) -> Callable[[int], bool]:
+    """Build the fresh-remote-confirm callback for the reconciler (fail-closed).
+
+    When ``remote_exists`` is injected (tests / a caller with its own re-stat),
+    use it but SWALLOW any exception as a conservative ``False`` (GCS
+    unreachable must never flip a chunk to UPLOADED — it stays PENDING). When
+    ``None``, reuse U7's :func:`terminal_stage._chunk_confirmed_remote`, the
+    SAME seam the terminal stage and eviction use (probes ``request_signed_urls``
+    over the chunk's core files; any error -> False).
+    """
+    if remote_exists is not None:
+        def _confirm_injected(idx: int) -> bool:
+            try:
+                return bool(remote_exists(idx))
+            except Exception:  # noqa: BLE001 — GCS unreachable -> conservative False
+                return False
+        return _confirm_injected
+
+    def _confirm_real(idx: int) -> bool:
+        from screencap.terminal_stage import _chunk_confirmed_remote
+
+        return _chunk_confirmed_remote(recording_dir, idx, remote_exists=None)
+
+    return _confirm_real

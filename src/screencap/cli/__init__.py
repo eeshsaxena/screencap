@@ -2741,6 +2741,30 @@ def upload(names, all_recordings, dry_run, force, jobs, no_delete):
             recording_scrub_lock(d.name) if not dry_run else contextlib.nullcontext()
         )
         with _terminal_lock, _scrub_lock:
+            # U9/AE8 — local->cloud promotion hole check, FIRST inside the lock
+            # (reconcile-before-anything). If retention already evicted a chunk
+            # required for a complete upload and that chunk is NOT confirmed in
+            # GCS, refuse with a clear, actionable error rather than uploading a
+            # recording with silent holes (a partial cloud copy). The real GCS
+            # re-stat seam is used (remote_exists=None); a legacy single-file /
+            # no-ledger recording has no closed chunk set, so this is a no-op
+            # for it (it routes through the whole-dir scrub branch below, R14).
+            if not dry_run:
+                try:
+                    from screencap.terminal_stage import (
+                        PromotionRefused,
+                        assert_promotable_to_cloud,
+                    )
+
+                    assert_promotable_to_cloud(d)
+                except PromotionRefused as e:
+                    console.print(
+                        f"[red]Error:[/red] {e}\n"
+                        "Upload skipped — nothing was changed."
+                    )
+                    all_failed += 1
+                    continue
+
             # Always scrub before upload — but reuse the review-prepared
             # scrubbed copy when a completion sentinel + provenance prove it is
             # complete, current, and built the way upload would build it

@@ -83,8 +83,11 @@ __all__ = [
     "TerminalStageBusy",
     "TerminalResult",
     "CloudCopyProducer",
+    "PromotionRefused",
     "terminal_lock",
     "run_terminal_stage",
+    "detect_promotion_holes",
+    "assert_promotable_to_cloud",
 ]
 
 # Per-recording terminal-stage lock lives under the daemon run dir (mode 0700,
@@ -109,6 +112,19 @@ class TerminalStageBusy(RuntimeError):
     contended, or when the blocking-with-timeout wait elapses. The loser's
     safe behavior is to NOT proceed (no ledger read, no reconcile, no
     upload) — the holder owns the critical section.
+    """
+
+
+class PromotionRefused(RuntimeError):
+    """A local->cloud promotion was refused because of HOLES (AE8).
+
+    Raised by :func:`assert_promotable_to_cloud` when a chunk required for a
+    COMPLETE upload has its local media evicted AND is not confirmed present in
+    GCS. Refusing — rather than uploading the surviving chunks — is the safe
+    outcome: it never produces a partial cloud copy with silent holes (the
+    survivorship-bias data loss reproduced across the local/cloud boundary).
+    The message names the missing chunk indices and the recording so the user
+    can act.
     """
 
 
@@ -594,6 +610,46 @@ def _open_ledger(recording_dir: Path) -> "PipelineLedger | None":
         return None
 
 
+def _open_ledger_readonly(recording_dir: Path) -> "PipelineLedger | None":
+    """Open the U1 ledger WITHOUT migrating the schema (read-only detection).
+
+    Used by promotion hole detection: unlike :func:`_open_ledger` it does NOT
+    call ``ensure_pipeline_state_schema`` (which would ALTER ``recording.db`` —
+    adding the ``pipeline_chunk_state`` table + ``chunks_expected`` column —
+    and so change the source dir's content hash, defeating the scrubbed-copy
+    reuse check on the upload path). Returns ``None`` when ``recording.db`` is
+    absent, the ledger table does not yet exist, or the recording row is
+    unreadable — all of which mean "no closed chunk set to gate a promotion on"
+    (legacy / not-yet-seeded), so detection correctly treats it as no-holes
+    and lets the whole-dir scrub branch handle it (R14).
+    """
+    db_path = recording_dir / "recording.db"
+    if not db_path.exists():
+        return None
+    try:
+        import sqlite3
+
+        conn = sqlite3.connect(str(db_path))
+        try:
+            row = conn.execute(
+                "SELECT name FROM sqlite_master WHERE type='table' "
+                "AND name='pipeline_chunk_state'"
+            ).fetchone()
+        finally:
+            conn.close()
+        if row is None:
+            return None  # ledger never seeded — not a per-chunk recording yet.
+        from screencap.pipeline_state import PipelineLedger
+
+        return PipelineLedger(db_path)
+    except Exception as exc:  # noqa: BLE001
+        logger.debug(
+            "terminal_stage: read-only ledger unavailable (%s); treating as no-ledger",
+            exc,
+        )
+        return None
+
+
 def _route_local(ledger: "PipelineLedger | None", result: TerminalResult) -> None:
     """Mark every seeded chunk LOCAL_DONE (no scrub, no upload)."""
     if ledger is None:
@@ -954,3 +1010,140 @@ def _read_recording_name(recording_dir: Path) -> str:
         with contextlib.suppress(OSError):
             return rid.read_text().strip() or recording_dir.name
     return recording_dir.name
+
+
+# ---------------------------------------------------------------------------
+# U9 — local->cloud promotion hole detection (AE8).
+#
+# Promoting a recording whose terminal stage already ran (and may have evicted
+# chunks under a local retention policy) must NEVER upload a recording with
+# silent holes. A "hole" is a chunk REQUIRED for a complete upload whose local
+# media is gone AND that is not confirmed present in GCS. Detect holes via the
+# ledger's frozen `chunks_expected` (the closed set, never shrunk by eviction);
+# refuse on any hole rather than reproducing survivorship-bias data loss across
+# the local/cloud boundary.
+# ---------------------------------------------------------------------------
+
+
+_PROMOTION_CORE_GLOBS = ("chunk_{idx:04d}.mp4",)
+
+
+def _chunk_local_media_present(recording_dir: Path, idx: int) -> bool:
+    """True iff chunk ``idx``'s primary local media (the video) is on disk.
+
+    The video chunk is the irreplaceable artifact eviction reclaims; a missing
+    ``chunk_NNNN.mp4`` means the rich local copy is gone. Manifests/events can
+    be regenerated from ``recording.db``, but the source media cannot — so the
+    video's presence is the load-bearing signal for "can we still upload this
+    chunk locally?".
+    """
+    return (recording_dir / f"chunk_{idx:04d}.mp4").exists()
+
+
+def detect_promotion_holes(
+    recording_dir: Path | str,
+    *,
+    remote_exists: Callable[[int], bool] | None = None,
+) -> list[int]:
+    """Return the chunk indices that are HOLES for a local->cloud promotion (AE8).
+
+    A chunk is a hole iff BOTH:
+
+    * its local media (``chunk_NNNN.mp4``) is NOT on disk (evicted, or otherwise
+      missing), AND
+    * a FRESH remote re-confirm says it is NOT present in GCS.
+
+    The required set is the ledger's frozen ``chunks_expected`` (``0..N-1``) —
+    the closed set that eviction never shrinks (so an evicted chunk still
+    counts as required). A chunk whose media is present locally is fine
+    (upload re-scrubs it); an evicted chunk that IS in GCS is fine (the cloud
+    copy survives, the normal delete-after-upload case). Only a chunk that is
+    BOTH gone locally AND absent remotely is an unrecoverable hole.
+
+    Detection keys off on-disk presence + a fresh remote re-stat, NOT only the
+    ledger's ``EVICTED`` state — so a chunk whose media vanished WITHOUT a
+    ledger eviction record (manual delete, partial copy) is still caught
+    (defense-in-depth). Conservative on the remote side: ``remote_exists`` that
+    raises (GCS unreachable) is treated as "not present", so an unverifiable
+    evicted chunk is a hole and the promotion is refused — never optimistically
+    promoted.
+
+    Returns an empty list when there are no holes (the recording is promotable;
+    re-run the terminal stage on the surviving chunks). A legacy single-file /
+    no-ledger recording has no frozen chunk set, so it returns ``[]`` (it is
+    handled by the whole-dir scrub branch, R14 — not a per-chunk promotion).
+    """
+    recording_dir = Path(recording_dir)
+    # Read-only: detection must NOT mutate the source recording.db schema (that
+    # would change its content hash and defeat the scrubbed-copy reuse check on
+    # the upload path). Only open the ledger when its table already exists.
+    ledger = _open_ledger_readonly(recording_dir)
+    if ledger is None:
+        return []  # legacy / no ledger — not a per-chunk promotion (R14).
+    expected = ledger.chunks_expected()
+    if not expected:  # None or 0 — no closed chunk set to gate on.
+        return []
+
+    confirm = _make_promotion_confirm(recording_dir, remote_exists)
+    holes: list[int] = []
+    for idx in range(expected):
+        if _chunk_local_media_present(recording_dir, idx):
+            continue  # rich local copy survives — upload can re-scrub it.
+        if confirm(idx):
+            continue  # cloud copy survives — no hole.
+        holes.append(idx)
+    return holes
+
+
+def assert_promotable_to_cloud(
+    recording_dir: Path | str,
+    *,
+    remote_exists: Callable[[int], bool] | None = None,
+) -> None:
+    """Raise :class:`PromotionRefused` if promoting this recording has holes (AE8).
+
+    The guard for the ``screencap upload`` promotion path: it reconciles holes
+    via :func:`detect_promotion_holes` and refuses with a clear, actionable
+    message naming the missing chunks and the recording — never producing a
+    partial cloud copy. A no-op (clean return) means every required chunk is
+    present locally or confirmed in GCS, so the caller may re-run the terminal
+    stage on the surviving chunks.
+    """
+    recording_dir = Path(recording_dir)
+    holes = detect_promotion_holes(recording_dir, remote_exists=remote_exists)
+    if not holes:
+        return
+    name = recording_dir.name
+    missing = ", ".join(str(i) for i in holes)
+    raise PromotionRefused(
+        f"Cannot promote {name!r} to the cloud: chunk(s) {missing} were evicted "
+        "locally and are not present in the cloud, so a complete upload is "
+        "impossible. Refusing to upload a recording with missing chunks "
+        "(it would be a partial copy with silent gaps). If you have a local "
+        "backup of the missing chunk media, restore it before promoting."
+    )
+
+
+def _make_promotion_confirm(
+    recording_dir: Path,
+    remote_exists: Callable[[int], bool] | None,
+) -> Callable[[int], bool]:
+    """Fresh-remote-confirm callback for promotion hole detection (fail-closed).
+
+    Injected ``remote_exists`` is used but any exception is swallowed to a
+    conservative ``False`` (GCS unreachable -> treat the evicted chunk as a
+    hole, refuse the promotion). ``None`` reuses :func:`_chunk_confirmed_remote`
+    (the same seam reconcile/eviction use).
+    """
+    if remote_exists is not None:
+        def _confirm_injected(idx: int) -> bool:
+            try:
+                return bool(remote_exists(idx))
+            except Exception:  # noqa: BLE001 — unreachable -> conservative hole
+                return False
+        return _confirm_injected
+
+    def _confirm_real(idx: int) -> bool:
+        return _chunk_confirmed_remote(recording_dir, idx, remote_exists=None)
+
+    return _confirm_real

@@ -64,6 +64,13 @@ class RecordingInfo(NamedTuple):
     chunks_total: int = 0  # number of video chunks (0 = legacy single-file)
     chunks_uploaded: int = 0  # number of chunks with upload status files
     intent: str | None = None  # "cloud", "local", or None (legacy)
+    # R14 (U9): True for a chunked recording (the unified pipeline's canonical
+    # on-disk shape going forward), False for a legacy single-file recording.
+    # Survives stubbing — derived from chunk videos, manifests, AND legacy
+    # status files, so an uploaded-and-evicted chunked recording (no local
+    # chunk_*.mp4 left) is still flagged chunked. Consumers (review/viewer,
+    # SwiftUI) read this to choose the chunked vs. legacy single-file path.
+    is_chunked: bool = False
     # Raw values for SwiftUI consumers (Unit 4c). The pre-formatted ``date``
     # / ``duration`` strings remain for backward compatibility with anything
     # that reads the existing JSON; SwiftUI uses these unformatted fields
@@ -200,6 +207,12 @@ def list_recordings(recordings_dir: Path | None = None) -> list[RecordingInfo]:
         # chunks_total: use max of local videos, manifests, and uploaded count
         # (local files may be deleted after upload)
         chunks_total = max(len(chunk_videos), len(chunk_manifests), chunks_uploaded)
+        # R14 (U9): chunked vs. legacy single-file. Derived from the same
+        # eviction-surviving evidence as chunks_total, so a stubbed chunked
+        # recording (no chunk_*.mp4 left, but manifests/status files remain)
+        # is still flagged chunked. A legacy single-file recording has none of
+        # these -> is_chunked False and stays listable/readable via video.mp4.
+        is_chunked = chunks_total > 0
 
         uploaded = uploaded_legacy or chunks_uploaded > 0
 
@@ -241,6 +254,7 @@ def list_recordings(recordings_dir: Path | None = None) -> list[RecordingInfo]:
                 chunks_total=chunks_total,
                 chunks_uploaded=chunks_uploaded,
                 intent=intent,
+                is_chunked=is_chunked,
                 started_at=started,
                 duration_seconds=duration,
             )

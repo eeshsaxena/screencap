@@ -264,6 +264,50 @@ def test_real_video_is_not_a_stub(recordings_dir):
     assert info.is_stub is False
 
 
+# --- U9: chunked vs. legacy single-file flag (R14) ---
+
+
+def _add_chunks(d: Path, n: int):
+    """Add n chunk_*.mp4 + manifests to a recording dir (chunked recording)."""
+    for i in range(n):
+        (d / f"chunk_{i:04d}.mp4").write_bytes(b"\x00" * 64)
+        (d / f"chunk_{i:04d}_manifest.json").write_text("{}")
+
+
+def test_chunked_recording_flagged_is_chunked(recordings_dir):
+    """A recording with chunk_*.mp4 files is flagged is_chunked=True."""
+    d = _make_recording(recordings_dir, "chunked-rec", duration=30)
+    _add_chunks(d, 3)
+    info = list_recordings(recordings_dir)[0]
+    assert info.is_chunked is True
+    assert info.chunks_total == 3
+
+
+def test_legacy_single_file_flagged_not_chunked(recordings_dir):
+    """A legacy single-file recording (video.mp4, no chunks) is is_chunked=False
+    but remains listable and readable (R14)."""
+    d = _make_recording(recordings_dir, "legacy-single", duration=30)
+    (d / "video.mp4").write_bytes(b"single-file video")
+    info = list_recordings(recordings_dir)[0]
+    assert info.is_chunked is False
+    assert info.chunks_total == 0
+    # Still fully listable/readable: name + duration + raw fields populated.
+    assert info.name == "legacy-single"
+    assert info.started_at is not None
+
+
+def test_stub_chunked_recording_flagged_is_chunked(recordings_dir):
+    """A stubbed (uploaded, media-evicted) chunked recording is still flagged
+    chunked via its surviving manifests / status files, not only local media."""
+    d = _make_recording(recordings_dir, "stub-chunked", duration=30)
+    # Manifests + status files survive eviction even when chunk_*.mp4 are gone.
+    for i in range(2):
+        (d / f"chunk_{i:04d}_manifest.json").write_text("{}")
+        (d / f".chunk_chunk_{i:04d}_status.json").write_text("{}")
+    info = list_recordings(recordings_dir)[0]
+    assert info.is_chunked is True
+
+
 # --- get_seen_bundle_ids tests ---
 
 
