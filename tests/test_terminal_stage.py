@@ -616,6 +616,56 @@ def _stub_cloud_seam(monkeypatch, scrubbed):
     monkeypatch.setattr("screencap.chunk_processor.upload_sentinel", lambda *a, **kw: True)
 
 
+class TestDryRunReadOnly:
+    """SCR-125 U5: dry-run is a read-only preview — no flock, no disk mutation."""
+
+    def test_dry_run_does_not_block_on_held_lock(self, tmp_path):
+        """A dry-run never takes the flock, so it completes even while another
+        surface holds it (a read-only preview must not block on a live run)."""
+        import threading
+
+        from screencap import terminal_stage as ts
+
+        rec_dir = _make_recording(tmp_path, destination="cloud", n_chunks=2)
+        held = threading.Event()
+        release = threading.Event()
+
+        def _hold():
+            with ts.terminal_lock(rec_dir.name):
+                held.set()
+                release.wait(timeout=5)
+
+        holder = threading.Thread(target=_hold)
+        holder.start()
+        assert held.wait(timeout=5)
+        try:
+            # Would block (up to lock_timeout) if dry-run took the flock.
+            result = ts.run_terminal_stage(rec_dir, dry_run=True, lock_timeout=2.0)
+            assert result.routed is True
+            assert result.n_expected == 2  # reported from the read-only ledger
+            assert result.sentinel_uploaded is False
+        finally:
+            release.set()
+            holder.join(timeout=5)
+
+    def test_dry_run_does_not_migrate_or_mutate(self, tmp_path, monkeypatch):
+        """Dry-run never produces a scrubbed copy, marks LOCAL_DONE, or writes a
+        sentinel — and uses the read-only ledger opener (no schema migration)."""
+        from screencap import terminal_stage as ts
+        from screencap.pipeline_state import Lifecycle, PipelineLedger
+
+        rec_dir = _make_recording(tmp_path, destination="local", n_chunks=2)
+        monkeypatch.setattr(
+            ts.CloudCopyProducer, "produce",
+            lambda *a, **kw: (_ for _ in ()).throw(AssertionError("dry-run must not produce")),
+        )
+        ts.run_terminal_stage(rec_dir, dry_run=True)
+        # No LOCAL_DONE marks written (chunks stay STAGED).
+        ledger = PipelineLedger(rec_dir / "recording.db")
+        assert all(r.lifecycle == Lifecycle.STAGED for r in ledger.all_chunks())
+        assert not (rec_dir / "recording_complete.json").exists()
+
+
 class TestAlreadyConvergedFastPath:
     """SCR-125 U4: when reconcile shows the closed set is already all UPLOADED,
     the terminal stage skips the expensive produce/re-scrub + no-op upload and
