@@ -1,7 +1,7 @@
 ---
 title: "refactor: SCR-125 — unify the per-chunk upload pipeline on the terminal-stage seam"
 type: refactor
-status: active
+status: completed
 date: 2026-06-09
 origin: docs/brainstorms/2026-06-05-unified-recording-processing-pipeline-requirements.md
 ---
