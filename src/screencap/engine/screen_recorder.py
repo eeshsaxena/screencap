@@ -483,6 +483,14 @@ def _run_screen_recorder(rec: "ScreenRecorder") -> "RecordingResult":
     screen_filter = None
     privacy_config = None
     _override_file = capture_dir / ".menubar_overrides.json"
+    # SCR-125 R-SCR125-A: resolve the masked-video-upload decision ONCE at start
+    # and thread the SAME value into capture-time block_video AND the frozen
+    # .recording_intent (write_identity below). A single read means capture-time
+    # blocking and upload-time masking can never disagree for this recording —
+    # a mid-recording global flip is inert because both already read this value.
+    from screencap.config import get_masked_video_upload_enabled
+
+    _masked_video_upload = get_masked_video_upload_enabled()
     try:
         from screencap.engine.config import config as _engine_config
 
@@ -495,6 +503,7 @@ def _run_screen_recorder(rec: "ScreenRecorder") -> "RecordingResult":
             _collaborators.build_recorder_privacy_filter(
                 capture_dir=capture_dir,
                 capture_window_data=_effective_window_data,
+                masked_video_upload=_masked_video_upload,
             )
         )
         if not _effective_window_data:
@@ -623,6 +632,7 @@ def _run_screen_recorder(rec: "ScreenRecorder") -> "RecordingResult":
         try:
             lock_policy.write_identity(
                 capture_dir, request=request, privacy_mode=_privacy_mode_str,
+                masked_video_upload=_masked_video_upload,
             )
         except OSError as _intent_err:
             if cloud_intent:

@@ -505,3 +505,87 @@ class TestStaleSentinel:
         # The regenerated sentinel uses the FROZEN ledger count (2), NOT the
         # stale 0 (Bug 3 fixed).
         assert captured["chunks_expected"] == 2
+
+
+# ---------------------------------------------------------------------------
+# SCR-125 U1 — the terminal stage routes its per-chunk video mask through the
+# SAME shared seam the live chunk_processor uses, gated on the FROZEN value.
+# ---------------------------------------------------------------------------
+
+
+class TestSharedMaskSeamU1:
+    def _write_intent(self, rec_dir: Path, *, masked: bool) -> None:
+        (rec_dir / ".recording_intent").write_text(json.dumps({
+            "version": 2, "destination": "cloud",
+            "retention_policy": "keep_forever", "retention_params": {},
+            "masked_video_upload": masked, "show_on_website": True,
+        }))
+
+    def test_mask_videos_routes_through_shared_seam_frozen_on(self, tmp_path, monkeypatch):
+        """Flag frozen ON → the terminal stage's _mask_videos drives the SHARED
+        pipeline_chunk_ops.mask_chunk_for_cloud (same body the live path uses)
+        and marks the ledger SCRUBBED. The GLOBAL is mocked OFF to prove the
+        frozen .recording_intent value is the gate, not the global."""
+        import screencap.pipeline_chunk_ops as pco
+        from screencap import terminal_stage as ts
+        from screencap.pipeline_state import Lifecycle, PipelineLedger
+        from screencap.terminal_stage import CloudCopyOutcome, CloudCopyProducer
+
+        rec_dir = _make_recording(tmp_path, destination="cloud", n_chunks=2)
+        self._write_intent(rec_dir, masked=True)
+        scrubbed = rec_dir.parent / f"{rec_dir.name}-scrubbed"
+
+        seen: list[int] = []
+        real = pco.mask_chunk_for_cloud
+
+        def _spy(recording_dir, scrubbed_dir, idx, **kw):
+            seen.append(idx)
+            return real(recording_dir, scrubbed_dir, idx, **kw)
+
+        monkeypatch.setattr(pco, "mask_chunk_for_cloud", _spy)
+        monkeypatch.setattr(
+            "screencap.scrubber.mask_video_chunk_for_cloud",
+            lambda *a, **kw: _MASKED_OK(),
+        )
+        # Global OFF — the frozen ON value must still drive masking.
+        monkeypatch.setattr(
+            "screencap.config.get_masked_video_upload_enabled", lambda: False,
+        )
+
+        ledger = PipelineLedger(rec_dir / "recording.db")
+        outcome = CloudCopyOutcome(scrubbed_dir=scrubbed)
+        CloudCopyProducer(rec_dir)._mask_videos(scrubbed, ledger, outcome)
+
+        assert sorted(seen) == [0, 1], "both chunks routed through the shared seam"
+        assert sorted(outcome.masked_chunks) == [0, 1]
+        for i in (0, 1):
+            assert ledger.get_chunk(i).lifecycle is Lifecycle.SCRUBBED
+
+    def test_mask_videos_noop_when_frozen_off(self, tmp_path, monkeypatch):
+        """Flag frozen OFF → no masker invoked even if the GLOBAL is ON
+        (frozen value is authoritative — R-SCR125-A)."""
+        from screencap import terminal_stage as ts
+        from screencap.terminal_stage import CloudCopyOutcome, CloudCopyProducer
+
+        rec_dir = _make_recording(tmp_path, destination="cloud", n_chunks=2)
+        self._write_intent(rec_dir, masked=False)
+        scrubbed = rec_dir.parent / f"{rec_dir.name}-scrubbed"
+
+        called = []
+        monkeypatch.setattr(
+            "screencap.scrubber.mask_video_chunk_for_cloud",
+            lambda *a, **kw: called.append(True),
+        )
+        monkeypatch.setattr(
+            "screencap.config.get_masked_video_upload_enabled", lambda: True,
+        )
+        outcome = CloudCopyOutcome(scrubbed_dir=scrubbed)
+        CloudCopyProducer(rec_dir)._mask_videos(scrubbed, None, outcome)
+        assert not called, "frozen OFF must not invoke the masker even if global ON"
+        assert not outcome.masked_chunks and not outcome.failed_chunks
+
+
+def _MASKED_OK():
+    from screencap.video_mask import MaskOutcome, MaskOutcomeStatus
+
+    return MaskOutcome(status=MaskOutcomeStatus.MASKED, reason="test", regions_masked=1)

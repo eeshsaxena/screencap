@@ -104,6 +104,7 @@ class RecordingCollaborators:
         *,
         capture_dir: Path,
         capture_window_data: bool,
+        masked_video_upload: bool | None = None,
     ) -> tuple[Any | None, "PrivacyConfig | None", Path]:
         """Construct ``RecorderPrivacyFilter`` with cloud_intent floor + window-data gate.
 
@@ -155,21 +156,23 @@ class RecordingCollaborators:
         # filter's screenshot/keystroke/background-mask roles stay active —
         # those are separate mechanisms U6 does NOT replace.
         #
-        # ⚠️ SAFETY — DO NOT FLIP THIS FLAG ON YET. The flag-ON path is NOT
-        # end-to-end safe. With the flag ON, a cloud recording captures rich
-        # (unblocked) video, but the LIVE in-process upload (chunk_processor
-        # during recording / the existing finalize_uploads) is NOT yet routed
-        # through U6's post-hoc masker — only U7's terminal stage is, and U7
-        # was integrated conservatively (it did not take over the live
-        # finalize). So flipping this ON today could ship UNMASKED video to
-        # the cloud via the live upload path. The flag must stay OFF until the
-        # live-upload → terminal-stage cutover lands AND the native-redaction-
-        # review "what uploads" surface is reconciled (it still labels video
-        # "local-only, not uploaded"). U4b only makes capture-time blocking
-        # flag-conditional; it does NOT enable a safe flag-ON cloud upload.
-        from screencap.config import get_masked_video_upload_enabled
+        # SCR-125: ``masked_video_upload`` is the FROZEN per-recording decision,
+        # resolved ONCE at start by the caller and threaded here so capture-time
+        # ``block_video`` and the live/terminal upload-time masking read the
+        # SAME value (R-SCR125-A: a mid-recording global flip can never make
+        # capture-blocking and upload-masking disagree). ``None`` falls back to
+        # the global at start (a start-time read — back-compat for call sites /
+        # tests that don't thread the value).
+        #
+        # ⚠️ SAFETY — DO NOT FLIP THE GLOBAL ON YET. Enabling it is SCR-126;
+        # SCR-125 makes flipping it safe by routing the LIVE upload through the
+        # shared mask seam, but the flag itself stays OFF until SCR-126.
+        if masked_video_upload is None:
+            from screencap.config import get_masked_video_upload_enabled
 
-        block_video = not get_masked_video_upload_enabled()
+            masked_video_upload = get_masked_video_upload_enabled()
+
+        block_video = not masked_video_upload
 
         screen_filter = RecorderPrivacyFilter(
             privacy_config,

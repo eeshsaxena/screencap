@@ -408,24 +408,25 @@ class CloudCopyProducer:
         ledger: "PipelineLedger | None",
         outcome: CloudCopyOutcome,
     ) -> None:
-        """Apply U6 video masking per chunk and map results onto the ledger.
+        """Apply U6 video masking per chunk via the SHARED seam (SCR-125 U1).
 
-        Flag OFF (today's default): ``mask_video_chunk_for_cloud`` returns
-        ``None`` for every chunk → no masked copy, the capture-blocked source
-        chunk IS the cloud copy. Flag ON: a ``MaskOutcome.ok`` chunk →
-        ``mark_scrubbed``; a ``FAILED`` chunk → ``mark_failed`` (blocking the
-        sentinel + eviction) and recorded in ``outcome.failed_chunks``.
+        Gated on the FROZEN per-recording masked-video-upload decision (not the
+        mutable global), so the terminal stage and the live ``chunk_processor``
+        mask identically for a given recording. Flag OFF (today's default): no
+        masked copy — the capture-blocked source chunk IS the cloud copy, no
+        ledger scrub-state change (the agnostic STAGED state + the upload
+        confirmation drives the gate). Flag ON: each chunk goes through the same
+        :func:`pipeline_chunk_ops.mask_chunk_for_cloud` body the live path uses
+        — ok -> ``mark_scrubbed`` (recorded in ``masked_chunks``), FAILED ->
+        ``mark_failed`` (recorded in ``failed_chunks``, blocking the sentinel).
         """
-        from screencap.config import get_masked_video_upload_enabled
+        from screencap.pipeline_chunk_ops import (
+            get_frozen_masked_video_upload,
+            mask_chunk_for_cloud,
+        )
 
-        if not get_masked_video_upload_enabled():
-            # Conservative posture: masker not invoked. The source chunk media
-            # (capture-blocked for cloud today) is the cloud copy. No ledger
-            # scrub-state change here — the agnostic STAGED state plus the
-            # upload confirmation drives the gate.
+        if not get_frozen_masked_video_upload(self._recording_dir):
             return
-
-        from screencap.scrubber import mask_video_chunk_for_cloud
 
         db_path = self._recording_dir / "recording.db"
         chunk_videos = sorted(self._recording_dir.glob("chunk_*.mp4"))
@@ -437,49 +438,16 @@ class CloudCopyProducer:
                 continue
             start_ts = chunk_start_abs + idx * chunk_dur
             end_ts = start_ts + chunk_dur
-            try:
-                mask_outcome = mask_video_chunk_for_cloud(
-                    vf, db_path, scrubbed_dir,
-                    chunk_index=idx, start_ts=start_ts, end_ts=end_ts,
-                    # The chunk's OWN first-frame absolute time is start_ts, not
-                    # the recording base: each chunk mp4's PTS restarts near 0,
-                    # so video_mask maps frames as start_ts + frame_pts. Passing
-                    # the recording base would shift every chunk idx>=1's frames
-                    # outside the coverage span (mis-aligned masking).
-                    chunk_start_abs=start_ts,
-                )
-            except Exception as exc:  # noqa: BLE001 — fail closed on any error
-                logger.error("video mask raised for chunk %d: %s", idx, exc)
-                outcome.failed_chunks.append(idx)
-                if ledger is not None:
-                    with contextlib.suppress(Exception):
-                        ledger.mark_failed(idx, detail=f"video_mask error: {exc}")
-                continue
-            if mask_outcome is None:
-                # Flag flipped off mid-loop, or this chunk produced no copy by
-                # design — treat as no-op (handled by the flag short-circuit).
-                continue
-            if mask_outcome.ok:
+            cls = mask_chunk_for_cloud(
+                self._recording_dir, scrubbed_dir, idx,
+                start_ts=start_ts, end_ts=end_ts,
+                enabled=True,  # already gated on the frozen value above
+                ledger=ledger, db_path=db_path,
+            )
+            if cls.masked:
                 outcome.masked_chunks.append(idx)
-                if ledger is not None:
-                    with contextlib.suppress(Exception):
-                        # Do NOT downgrade a chunk a prior reconcile already
-                        # advanced to UPLOADED/EVICTED — mark_scrubbed sets
-                        # lifecycle=SCRUBBED, and the later _mark_uploaded_chunks
-                        # pass skips an already-UPLOADED upload_state, so the
-                        # row would be stuck SCRUBBED and never satisfy the
-                        # finalize gate.
-                        from screencap.pipeline_state import Lifecycle as _LC
-                        _row = ledger.get_chunk(idx)
-                        if _row is None or _row.lifecycle not in (
-                            _LC.UPLOADED, _LC.EVICTED,
-                        ):
-                            ledger.mark_scrubbed(idx)
-            else:
+            elif cls.failed:
                 outcome.failed_chunks.append(idx)
-                if ledger is not None:
-                    with contextlib.suppress(Exception):
-                        ledger.mark_failed(idx, detail=mask_outcome.reason or "video_mask FAILED")
 
 
 def _chunk_timing(db_path: Path, n_chunks: int) -> tuple[float, float]:
