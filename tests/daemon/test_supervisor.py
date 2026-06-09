@@ -1167,3 +1167,239 @@ async def test_resume_terminal_stage_skips_when_busy(tmp_path, monkeypatch):
     # Busy → returns None (skips), does NOT raise (the holder owns the section).
     out = await sup.resume_terminal_stage(rec_dir)
     assert out is None
+
+
+# ---------------------------------------------------------------------------
+# SCR-125 U6 — daemon auto-resume + startup sweep + idle-busy + fail-closed.
+# ---------------------------------------------------------------------------
+
+
+def _make_incomplete_cloud_recording(parent: Path, name: str, *, n_chunks: int,
+                                     uploaded: tuple[int, ...] = ()) -> Path:
+    """A cloud recording with an ENGINE-frozen chunks_expected and an unsatisfied
+    finalize gate (some chunks not UPLOADED) — a sweep/resume candidate."""
+    import json as _json
+
+    from screencap.engine.db import create_db, crud
+    from screencap.pipeline_state import PipelineLedger, ensure_pipeline_state_schema
+
+    rec_dir = parent / name
+    rec_dir.mkdir(parents=True, exist_ok=True)
+    db_path = rec_dir / "recording.db"
+    engine, Session = create_db(str(db_path))
+    session = Session()
+    crud.insert_recording(session, {
+        "timestamp": 1000.0, "platform": "darwin",
+        "monitor_width": 1920, "monitor_height": 1080, "pixel_ratio": 2.0,
+        "double_click_interval_seconds": 0.5, "double_click_distance_pixels": 5.0,
+    })
+    session.close()
+    engine.dispose()
+    for i in range(n_chunks):
+        (rec_dir / f"chunk_{i:04d}.mp4").write_bytes(b"\x00" * 64)
+    ensure_pipeline_state_schema(db_path)
+    ledger = PipelineLedger(db_path)
+    for i in range(n_chunks):
+        ledger.seed_chunk(i)
+        ledger.mark_staged(i)
+    for i in uploaded:
+        ledger.mark_uploaded(i)
+    ledger.freeze_chunks_expected(n_chunks)  # ENGINE-origin freeze
+    (rec_dir / ".recording_intent").write_text(_json.dumps({
+        "version": 2, "destination": "cloud",
+        "retention_policy": "keep_forever", "retention_params": {},
+    }))
+    (rec_dir / ".recording_id").write_text(name)
+    return rec_dir
+
+
+@pytest.mark.asyncio
+async def test_resume_fails_closed_on_not_signed_in(tmp_path, monkeypatch):
+    """Research H4: a not-signed-in / promotion error in the resume returns None
+    and never propagates into the asyncio loop (nothing evicted)."""
+    from screencap import auth
+    from screencap.daemon.supervisor import Supervisor
+
+    sup = Supervisor(EventBus(), reconcile_on_init=False)
+
+    def _not_signed_in(recording_dir, *, non_blocking):
+        raise auth.NotSignedIn("no creds")
+
+    monkeypatch.setattr("screencap.terminal_stage.run_terminal_stage", _not_signed_in)
+    rec_dir = tmp_path / "rec"
+    rec_dir.mkdir()
+    assert await sup.resume_terminal_stage(rec_dir) is None
+
+
+@pytest.mark.asyncio
+async def test_handle_engine_exit_fires_resume_for_cloud_once(tmp_path, monkeypatch):
+    """The single exit funnel enqueues the resume exactly once for a cloud
+    recording (graceful/crash/SystemExit all converge here)."""
+    from screencap.daemon.supervisor import Supervisor
+
+    sup = Supervisor(EventBus(), reconcile_on_init=False)
+    rec_dir = tmp_path / "rec"
+    rec_dir.mkdir()
+    (rec_dir / ".recording_intent").write_text(json.dumps({"destination": "cloud"}))
+
+    resumed: list[Path] = []
+
+    async def _spy(d):
+        resumed.append(Path(d))
+
+    monkeypatch.setattr(sup, "resume_terminal_stage", _spy)
+
+    proc = _FakeAliveProc()
+    proc._alive = False
+    sup._proc = proc
+    sup._session_state = {
+        "capture_dir": str(rec_dir), "recording_name": "rec", "started_at": time.time(),
+    }
+    await sup._handle_engine_exit(proc, 0)
+    # A resume task was tracked; drain it.
+    await asyncio.gather(*list(sup._resume_tasks))
+    assert resumed == [rec_dir]
+    # Re-entry is a no-op (single trigger): _exit_handled / _proc reset.
+    await sup._handle_engine_exit(proc, 0)
+    assert resumed == [rec_dir]
+
+
+@pytest.mark.asyncio
+async def test_handle_engine_exit_skips_resume_for_local(tmp_path, monkeypatch):
+    """A LOCAL recording has nothing to upload → no resume is scheduled."""
+    from screencap.daemon.supervisor import Supervisor
+
+    sup = Supervisor(EventBus(), reconcile_on_init=False)
+    rec_dir = tmp_path / "rec"
+    rec_dir.mkdir()
+    (rec_dir / ".recording_intent").write_text(json.dumps({"destination": "local"}))
+
+    resumed: list[Path] = []
+    monkeypatch.setattr(sup, "resume_terminal_stage",
+                        lambda d: resumed.append(Path(d)))
+
+    proc = _FakeAliveProc()
+    proc._alive = False
+    sup._proc = proc
+    sup._session_state = {
+        "capture_dir": str(rec_dir), "recording_name": "rec", "started_at": time.time(),
+    }
+    await sup._handle_engine_exit(proc, 0)
+    assert not sup._resume_tasks
+    assert resumed == []
+
+
+@pytest.mark.asyncio
+async def test_has_inflight_resume_gates_idle_shutdown(tmp_path):
+    """An in-flight resume keeps the idle-shutdown watchdog 'busy' so an
+    auto-spawned daemon never idle-exits mid-upload."""
+    from types import SimpleNamespace
+
+    from screencap.daemon import _idle_shutdown
+    from screencap.daemon.supervisor import Supervisor
+
+    sup = Supervisor(EventBus(), reconcile_on_init=False)
+    assert sup.has_inflight_resume() is False
+
+    gate = asyncio.Event()
+
+    async def _slow_resume():
+        await gate.wait()
+
+    sup._track_resume(_slow_resume())
+    assert sup.has_inflight_resume() is True
+
+    app = SimpleNamespace(state=SimpleNamespace(
+        event_bus=SimpleNamespace(subscriber_count=lambda: 0),
+        supervisor=sup,
+    ))
+    assert _idle_shutdown._daemon_is_busy(app) is True
+
+    gate.set()
+    await asyncio.gather(*list(sup._resume_tasks))
+    assert sup.has_inflight_resume() is False
+    assert _idle_shutdown._daemon_is_busy(app) is False
+
+
+@pytest.mark.asyncio
+async def test_startup_sweep_resumes_incomplete_cloud(tmp_path, monkeypatch):
+    """F3: the startup sweep resumes a cloud recording that is engine-frozen but
+    not finalize-complete."""
+    from screencap.config import get_recordings_dir
+    from screencap.daemon.supervisor import Supervisor
+
+    rec_dir = _make_incomplete_cloud_recording(
+        get_recordings_dir(), "incomplete-cloud", n_chunks=2, uploaded=(0,),
+    )
+    monkeypatch.setattr("screencap.auth.get_id_token", lambda force_refresh=False: "tok")
+
+    sup = Supervisor(EventBus(), reconcile_on_init=False)
+    resumed: list[Path] = []
+
+    async def _spy(d):
+        resumed.append(Path(d))
+
+    monkeypatch.setattr(sup, "resume_terminal_stage", _spy)
+    await sup._run_startup_sweep()
+    assert rec_dir in resumed
+
+
+@pytest.mark.asyncio
+async def test_startup_sweep_skips_when_not_signed_in(tmp_path, monkeypatch):
+    """Not signed in → the sweep skips entirely (recordings preserved, never a
+    partial convergence without auth)."""
+    from screencap import auth
+    from screencap.config import get_recordings_dir
+    from screencap.daemon.supervisor import Supervisor
+
+    _make_incomplete_cloud_recording(
+        get_recordings_dir(), "incomplete-cloud", n_chunks=2, uploaded=(0,),
+    )
+
+    def _not_signed_in(force_refresh=False):
+        raise auth.NotSignedIn("no creds")
+
+    monkeypatch.setattr("screencap.auth.get_id_token", _not_signed_in)
+
+    sup = Supervisor(EventBus(), reconcile_on_init=False)
+    resumed: list[Path] = []
+
+    async def _spy(d):
+        resumed.append(Path(d))
+
+    monkeypatch.setattr(sup, "resume_terminal_stage", _spy)
+    await sup._run_startup_sweep()
+    assert resumed == []
+
+
+def test_recording_needs_resume_crash_before_freeze_is_false(tmp_path):
+    """Prevention rules #1/#4: a recording whose chunks_expected was never frozen
+    (crash before finalize) is NOT a sweep candidate — it is never auto-converted
+    to 'complete' (no false sentinel); full recovery is via manual upload."""
+    import json as _json
+
+    from screencap.daemon.supervisor import Supervisor
+    from screencap.engine.db import create_db, crud
+    from screencap.pipeline_state import PipelineLedger, ensure_pipeline_state_schema
+
+    rec_dir = tmp_path / "crash-orphan"
+    rec_dir.mkdir()
+    db_path = rec_dir / "recording.db"
+    engine, Session = create_db(str(db_path))
+    session = Session()
+    crud.insert_recording(session, {
+        "timestamp": 1000.0, "platform": "darwin",
+        "monitor_width": 1920, "monitor_height": 1080, "pixel_ratio": 2.0,
+        "double_click_interval_seconds": 0.5, "double_click_distance_pixels": 5.0,
+    })
+    session.close()
+    engine.dispose()
+    ensure_pipeline_state_schema(db_path)
+    ledger = PipelineLedger(db_path)
+    ledger.seed_chunk(0)
+    ledger.mark_staged(0)
+    # NOTE: chunks_expected is deliberately NOT frozen (crash before finalize).
+    (rec_dir / ".recording_intent").write_text(_json.dumps({"destination": "cloud"}))
+
+    # No engine-origin frozen count → not a sweep candidate (never auto-completed).
+    assert Supervisor._recording_needs_resume(rec_dir) is False

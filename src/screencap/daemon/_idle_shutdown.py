@@ -137,7 +137,22 @@ def _daemon_is_busy(app: Starlette) -> bool:
     supervisor = getattr(app.state, "supervisor", None)
     if supervisor is not None and _has_active_session(supervisor):
         return True
+    # SCR-125 U6: a crash/restart terminal-stage resume is in flight. After the
+    # engine exits, ``current_session()`` is None, so without this the
+    # auto-spawned daemon could idle-exit mid-upload.
+    if supervisor is not None and _has_inflight_resume(supervisor):
+        return True
     return False
+
+
+def _has_inflight_resume(supervisor: object) -> bool:
+    getter = getattr(supervisor, "has_inflight_resume", None)
+    if getter is None:
+        return False
+    try:
+        return bool(getter())
+    except Exception:  # noqa: BLE001 — watchdog stays robust against test doubles
+        return False
 
 
 def _has_active_session(supervisor: object) -> bool:

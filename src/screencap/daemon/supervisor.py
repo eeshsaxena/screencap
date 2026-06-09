@@ -147,6 +147,21 @@ class _PopenEngineProcess:
             raise
 
 
+def _is_cloud_recording(recording_dir: Path) -> bool:
+    """True iff ``recording_dir``'s frozen intent routes to the cloud (U6).
+
+    Used to skip the post-exit terminal-stage resume for ``local`` / legacy
+    recordings (they have nothing to upload). Best-effort: a missing/unreadable
+    intent reads as non-cloud (conservative — no spurious resume).
+    """
+    try:
+        from screencap.catalog import read_intent
+
+        return read_intent(recording_dir) in ("cloud", "both")
+    except Exception:  # noqa: BLE001
+        return False
+
+
 def _float_env(name: str, default: float) -> float:
     try:
         return float(os.environ.get(name, default))
@@ -239,6 +254,12 @@ class Supervisor:
         # outlast the ~1h token. Both are torn down in _reset_state.
         self._engine_token_file: Path | None = None
         self._token_refresh_task: asyncio.Task[None] | None = None
+        # SCR-125 U6: in-flight crash/restart terminal-stage resume tasks (the
+        # engine-exit safety net + the startup sweep). Tracked as a set so the
+        # idle-shutdown watchdog (``has_inflight_resume``) never tears the daemon
+        # down mid-upload, and ``shutdown`` can await/cancel them. Resumes outlive
+        # a single recording session, so ``_reset_state`` does NOT clear this.
+        self._resume_tasks: set[asyncio.Task[Any]] = set()
         self._recovering = False
         self._finalized_seen = False
         self._stopping = False
@@ -468,33 +489,35 @@ class Supervisor:
         await self._reconcile()
 
     async def resume_terminal_stage(self, recording_dir: "Path | str") -> Any:
-        """Resume incomplete terminal-stage work for one recording (U7).
+        """Resume incomplete terminal-stage work for one recording (SCR-125 U6).
 
         The daemon-restart / crash resume entry point. A daemon that restarts
         while a cloud recording's terminal-stage work (scrub → upload →
-        sentinel) was incomplete drives the SINGLE disk-driven terminal stage
-        from disk, behind the per-recording flock — converging without
-        duplicating or re-uploading already-confirmed chunks (R9/AE2).
+        sentinel) was incomplete — OR that funnels an engine exit through
+        ``_handle_engine_exit`` — drives the SINGLE disk-driven terminal stage
+        from disk, behind the per-recording flock, converging without
+        duplicating or re-uploading already-confirmed chunks (R9/AE2). It is the
+        PRIMARY uploader for the degraded path where the live upload failed all
+        session and finalize deferred the backlog (U4).
 
         Run in a worker thread (the terminal stage is blocking PyAV/network
         work that must not stall the asyncio loop) and in ``non_blocking`` mode:
         if a live engine's own ``finalize_uploads`` (or a manual ``screencap
         upload``) currently holds the terminal flock, this resume SKIPS rather
-        than racing — the holder owns the critical section (AE12). flock is
-        advisory; this is one of the entry points that MUST take it.
+        than racing — the holder owns the critical section (AE12).
 
-        SCHEDULING NOTE (deferred): this method is the wired resume SEAM, but it
-        is NOT auto-invoked from ``_handle_engine_exit`` in this milestone.
-        Auto-triggering a heavy scrub/upload on every engine exit needs the
-        scheduling + retention lifecycle that lands with U8/U9 (when to sweep,
-        how often, how to surface progress). Until then, the resume is
-        available to an explicit caller / test and to the manual ``screencap
-        upload`` path — there is NO half-wired auto-trigger that could
-        double-upload.
+        **Fails closed (research H4).** Auth (``NotSignedIn`` / ``AuthError``),
+        upload, and promotion (``PromotionRefused``) errors are swallowed and
+        return ``None`` — never propagating into the asyncio loop, never evicting,
+        never writing a sentinel. ``run_terminal_stage`` already catches its own
+        upload failures (a result with ``upload_warning``); this is the outer
+        belt for anything that escapes (e.g. AE8 ``PromotionRefused``).
         """
         import asyncio as _asyncio
 
+        from screencap import auth
         from screencap.terminal_stage import (
+            PromotionRefused,
             TerminalStageBusy,
             run_terminal_stage,
         )
@@ -508,8 +531,126 @@ class Supervisor:
                     "or manual upload); skipping", recording_dir,
                 )
                 return None
+            except PromotionRefused as exc:
+                logger.warning(
+                    "resume_terminal_stage: %s has holes (%s); fail-closed, "
+                    "nothing evicted", recording_dir, exc,
+                )
+                return None
+            except (auth.NotSignedIn, auth.AuthError) as exc:
+                logger.warning(
+                    "resume_terminal_stage: cloud auth unavailable for %s (%s); "
+                    "fail-closed (recording preserved on disk)",
+                    recording_dir, type(exc).__name__,
+                )
+                return None
+            except Exception as exc:  # noqa: BLE001 — never propagate into the loop
+                logger.warning(
+                    "resume_terminal_stage: convergence failed for %s (%s); "
+                    "fail-closed, nothing evicted", recording_dir, exc,
+                )
+                return None
 
         return await _asyncio.to_thread(_run)
+
+    def has_inflight_resume(self) -> bool:
+        """True while any crash/restart resume worker is in flight (U6).
+
+        Consulted by the idle-shutdown watchdog so an auto-spawned daemon never
+        tears itself down mid-upload: ``current_session()`` is ``None`` after the
+        engine exits, so without this the resume would be invisible.
+        """
+        return any(not t.done() for t in self._resume_tasks)
+
+    def _track_resume(self, coro: Any) -> "asyncio.Task[Any]":
+        """Schedule a resume coroutine as a tracked, self-pruning background task."""
+        task = asyncio.create_task(coro)
+        self._resume_tasks.add(task)
+        task.add_done_callback(self._resume_tasks.discard)
+        return task
+
+    async def _run_resume_safely(self, recording_dir: Path) -> None:
+        """Await one resume, swallowing anything that escapes (belt-and-braces)."""
+        try:
+            await self.resume_terminal_stage(recording_dir)
+        except Exception:  # noqa: BLE001 — a resume must never crash the daemon
+            logger.exception(
+                "daemon resume task crashed for %s (fail-closed)", recording_dir
+            )
+
+    async def _run_startup_sweep(self) -> None:
+        """Resume every cloud recording left incomplete at daemon startup (F3).
+
+        Scans the recordings dir for recordings with an ENGINE-ORIGIN frozen
+        ``chunks_expected`` and an UNSATISFIED finalize gate, and resumes each.
+        It NEVER freezes-from-disk (no ``reconcile_ledger_from_disk``): a
+        crash-before-finalize recording has no authoritative count, so it is not
+        auto-converted to "complete" — its chunks may upload but it never gets a
+        false sentinel; full recovery is via manual ``screencap upload``.
+
+        Auth pre-flight: if not signed in, the sweep is SKIPPED entirely (the
+        recordings stay on disk for a later daemon start / sign-in) — it never
+        evicts or partially-converges without auth.
+        """
+        from screencap import auth
+        from screencap.config import get_recordings_dir
+
+        try:
+            await asyncio.to_thread(auth.get_id_token)
+        except Exception as exc:  # noqa: BLE001 — NotSignedIn / AuthError / Keychain
+            logger.info(
+                "daemon startup sweep: not signed in (%s); skipping "
+                "(incomplete recordings preserved for a later attempt)",
+                type(exc).__name__,
+            )
+            return
+
+        try:
+            recordings_dir = get_recordings_dir()
+            candidates = sorted(d for d in recordings_dir.iterdir() if d.is_dir())
+        except OSError as exc:
+            logger.warning("daemon startup sweep: could not scan recordings dir: %s", exc)
+            return
+
+        swept: list[str] = []
+        for d in candidates:
+            try:
+                if await asyncio.to_thread(self._recording_needs_resume, d):
+                    swept.append(d.name)
+                    await self.resume_terminal_stage(d)
+            except Exception:  # noqa: BLE001 — one bad recording never aborts the sweep
+                logger.exception("daemon startup sweep: resume failed for %s", d)
+        if swept:
+            logger.info(
+                "daemon startup sweep resumed %d incomplete recording(s): %s",
+                len(swept), swept,
+            )
+
+    @staticmethod
+    def _recording_needs_resume(recording_dir: Path) -> bool:
+        """True iff a cloud recording is ENGINE-frozen but not finalize-complete.
+
+        Read-only: must NOT migrate the ledger schema (that would mutate
+        recording.db and defeat scrubbed-copy reuse) and must NOT freeze-from-disk
+        (a crash-before-finalize recording has no authoritative count — it is left
+        for manual recovery, never auto-completed).
+        """
+        from screencap.catalog import read_intent
+        from screencap.terminal_stage import _open_ledger_readonly
+
+        intent = read_intent(recording_dir)
+        if intent not in ("cloud", "both"):
+            return False  # local / legacy / no-intent → not a cloud resume.
+        ledger = _open_ledger_readonly(recording_dir)
+        if ledger is None:
+            return False  # no engine-origin ledger (legacy / not seeded).
+        try:
+            expected = ledger.chunks_expected()
+            if not expected:
+                return False  # crash-before-freeze → no authoritative count.
+            return not ledger.finalize_gate_satisfied()
+        except Exception:  # noqa: BLE001 — unreadable ledger → conservative skip
+            return False
 
     async def shutdown(self) -> None:
         """Stop any owned engine and release the daemon lock."""
@@ -561,6 +702,19 @@ class Supervisor:
                 await asyncio.wait_for(self._reconcile_task, timeout=self._reconcile_grace + 1.0)
             except asyncio.TimeoutError:
                 self._reconcile_task.cancel()
+        # SCR-125 U6: in-flight resume workers — give them a brief grace to
+        # finish (a converged recording's resume is a cheap no-op), then cancel.
+        # A cancelled mid-upload resume is safe: the terminal stage is idempotent
+        # and the recording stays on disk for the next daemon start / manual upload.
+        inflight = [t for t in self._resume_tasks if not t.done()]
+        if inflight:
+            try:
+                await asyncio.wait_for(
+                    asyncio.gather(*inflight, return_exceptions=True), timeout=5.0,
+                )
+            except asyncio.TimeoutError:
+                for t in inflight:
+                    t.cancel()
         for task in (self._stderr_task, self._poll_task):
             if task is not None and not task.done():
                 task.cancel()
@@ -598,6 +752,11 @@ class Supervisor:
         finally:
             self._prune_stale_engine_token_files()
             self._recovering = False
+            # SCR-125 U6 F3 startup sweep — resume cloud recordings left
+            # incomplete by a prior daemon/engine crash. Detached (tracked) so it
+            # never blocks request handling: _recovering is already cleared, and a
+            # long backlog upload must not make `spawn`/`stop` raise Reconciling.
+            self._track_resume(self._run_startup_sweep())
 
     @staticmethod
     def _prune_stale_engine_token_files() -> None:
@@ -666,6 +825,11 @@ class Supervisor:
                 except Exception:
                     logger.exception("engine stderr pump failed")
 
+            # SCR-125 U6: snapshot capture_dir HERE, inside _exit_lock and BEFORE
+            # _reset_state clears _session_state, so the post-exit resume always
+            # has the recording dir even if a concurrent stop/shutdown raced.
+            capture_dir = (self._session_state or {}).get("capture_dir")
+
             if not self._finalized_seen:
                 if rc != 0 and not self._stopping:
                     self._mark_catalog_terminated_unexpectedly(
@@ -693,6 +857,23 @@ class Supervisor:
 
             self._release_daemon_lock()
             self._reset_state()
+
+            # SCR-125 U6: fire the crash/restart safety-net resume EXACTLY ONCE
+            # from this single exit funnel (graceful stop, crash, SystemExit) —
+            # not from a recording_finalized subscription (which would race the
+            # late listener). On a graceful stop the engine's own finalize already
+            # converged, so this is a cheap reconcile/no-op (or a non_blocking skip
+            # if the engine still holds the flock); on the degraded/crash path it
+            # is the PRIMARY uploader. It runs detached so it never blocks the exit
+            # funnel, and is tracked so idle-shutdown waits for it. Only CLOUD
+            # recordings need cloud convergence — a local recording has nothing to
+            # upload, so we skip the resume for it entirely.
+            if (
+                isinstance(capture_dir, str)
+                and capture_dir
+                and _is_cloud_recording(Path(capture_dir))
+            ):
+                self._track_resume(self._run_resume_safely(Path(capture_dir)))
 
     def _observe_event(self, event: dict[str, Any]) -> None:
         event_type = event.get("type")
