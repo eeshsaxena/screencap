@@ -17,6 +17,17 @@ from __future__ import annotations
 
 from unittest import mock
 
+import pytest
+
+
+@pytest.fixture(autouse=True)
+def _isolate_terminal_run_dir(tmp_path, monkeypatch):
+    """Isolate the terminal-stage flock dir — SCR-125 U4 finalize delegates to
+    run_terminal_stage, which acquires the real ~/.screencap/run flock."""
+    import screencap.terminal_stage as ts
+
+    monkeypatch.setattr(ts, "_RUN_DIR", tmp_path / "ts-run")
+
 
 def _make_helper(legacy=None):
     from screencap.engine.collaborators import RecordingCollaborators
@@ -729,17 +740,15 @@ class _StubChunkProcessor:
         self.frozen_expected = count
 
 
-def test_finalize_uploads_partial_path_does_not_nameerror(tmp_path):
-    """Short recording with no chunk files must finalize without NameError.
+def test_finalize_uploads_partial_path_writes_followup(tmp_path):
+    """SCR-125 U4 (migrated): a CLOUD recording whose live upload did not fully
+    converge must finalize cleanly and write ``.upload_followup.json`` for the
+    deferred-upload messaging (the daemon resume is the uploader for that path).
 
-    Regression: a rename of the local from ``n_uploaded`` to ``n_emitted``
-    missed the ``.upload_followup.json`` write site, so the partial-upload
-    branch raised ``NameError`` mid-finalize. The worker then exited
-    before writing ``.recording_ready``, the daemon never emitted the
-    "finalized" event, and the SwiftUI stop timed out with
-    "Stop is still finalizing in the background." This test pins the
-    contract: the partial-upload branch must complete and write the
-    follow-up JSON with the documented ``n_uploaded`` key.
+    Originally a NameError regression on the ``n_uploaded`` local; the contract
+    it pins — the degraded branch completes and persists the follow-up with the
+    documented ``n_uploaded`` key — survives the cutover. No outer terminal_lock
+    wrap (H1) and no synchronous backlog upload at stop.
     """
     import json
 
@@ -754,7 +763,7 @@ def test_finalize_uploads_partial_path_does_not_nameerror(tmp_path):
     capture_dir = tmp_path / "rec"
     capture_dir.mkdir()
 
-    request = RecordingRequest(name="short", config=RecordingConfig())
+    request = RecordingRequest(name="short", config=RecordingConfig(), cloud_intent=True)
     helper = RecordingCollaborators(
         request=request,
         legacy=LegacyOptions(live_upload=True),
@@ -772,12 +781,146 @@ def test_finalize_uploads_partial_path_does_not_nameerror(tmp_path):
     assert result["n_total"] == 0
     followup_path = capture_dir / ".upload_followup.json"
     assert followup_path.exists(), (
-        "partial-upload branch must persist .upload_followup.json for "
+        "the degraded cloud path must persist .upload_followup.json for "
         "print_upload_followup to surface the deferred warning"
     )
     payload = json.loads(followup_path.read_text())
     assert payload["n_uploaded"] == 0
     assert payload["n_total"] == 0
+
+
+def _make_cloud_helper(*, all_uploaded, force_stopped=False, upload_warning=None,
+                       summary=(0, 0)):
+    from screencap.engine.collaborators import RecordingCollaborators
+    from screencap.engine.config import RecordingConfig
+    from screencap.engine.screen_recorder import (
+        IpcChannels,
+        LegacyOptions,
+        RecordingRequest,
+    )
+
+    request = RecordingRequest(name="rec", config=RecordingConfig(), cloud_intent=True)
+    helper = RecordingCollaborators(
+        request=request,
+        legacy=LegacyOptions(live_upload=True),
+        channels=IpcChannels.create(),
+    )
+    helper._chunk_processor = _StubChunkProcessor(
+        all_uploaded=all_uploaded, force_stopped=force_stopped,
+        summary=summary, upload_warning=upload_warning,
+    )
+    return helper
+
+
+class TestU4FinalizeConvergence:
+    """SCR-125 U4 — finalize freezes + delegates to the terminal stage."""
+
+    def test_happy_converges_via_terminal_stage_maps_result(self, tmp_path):
+        """Cloud + live already uploaded → finalize calls run_terminal_stage and
+        maps its sentinel/eviction onto the result dict; no follow-up warning."""
+        from screencap.terminal_stage import TerminalResult
+
+        capture_dir = tmp_path / "rec"
+        capture_dir.mkdir()
+        for i in range(3):
+            (capture_dir / f"chunk_{i:04d}_manifest.json").write_text("{}")
+
+        tr = TerminalResult(
+            destination="cloud", routed=True, sentinel_uploaded=True, evicted=[0, 1],
+        )
+        with mock.patch(
+            "screencap.terminal_stage.run_terminal_stage", return_value=tr,
+        ) as rts:
+            helper = _make_cloud_helper(all_uploaded=True, summary=(3, 3))
+            result = helper.finalize_uploads(
+                capture_dir=capture_dir, stop_reason="graceful", recording_name="rec",
+            )
+
+        rts.assert_called_once()
+        assert result["sentinel_uploaded"] is True
+        assert result["stubbed"] is True  # the retention floor reclaimed media
+        assert result["followup_kind"] is None
+        assert not (capture_dir / ".upload_followup.json").exists()
+
+    def test_degraded_backlog_defers_no_synchronous_upload(self, tmp_path):
+        """A4 bound: live upload failed all session (nothing confirmed) → finalize
+        does NOT call run_terminal_stage (no synchronous backlog upload that would
+        blow the 30s stop budget); it freezes + writes the follow-up and defers to
+        the daemon resume."""
+        capture_dir = tmp_path / "rec"
+        capture_dir.mkdir()
+        for i in range(5):
+            (capture_dir / f"chunk_{i:04d}_manifest.json").write_text("{}")
+
+        with mock.patch("screencap.terminal_stage.run_terminal_stage") as rts:
+            helper = _make_cloud_helper(all_uploaded=False, summary=(0, 5))
+            result = helper.finalize_uploads(
+                capture_dir=capture_dir, stop_reason="graceful", recording_name="rec",
+            )
+
+        rts.assert_not_called()  # bounded — the daemon resume uploads the backlog
+        assert result["sentinel_uploaded"] is False
+        assert result["followup_kind"] == "partial"
+        assert (capture_dir / ".upload_followup.json").exists()
+        # chunks_expected still frozen (the only production freeze).
+        assert getattr(helper._chunk_processor, "frozen_expected", None) == 5
+
+    def test_force_stop_blocks_sentinel(self, tmp_path):
+        """Force-stop forces the gate False (prevention rule #4): no convergence,
+        a force_stopped follow-up, no sentinel."""
+        capture_dir = tmp_path / "rec"
+        capture_dir.mkdir()
+        (capture_dir / "chunk_0000_manifest.json").write_text("{}")
+
+        with mock.patch("screencap.terminal_stage.run_terminal_stage") as rts:
+            helper = _make_cloud_helper(
+                all_uploaded=True, force_stopped=True, summary=(1, 2),
+            )
+            result = helper.finalize_uploads(
+                capture_dir=capture_dir, stop_reason="force", recording_name="rec",
+            )
+
+        rts.assert_not_called()
+        assert result["force_stopped"] is True
+        assert result["sentinel_uploaded"] is False
+        assert result["followup_kind"] == "force_stopped"
+
+    def test_h1_finalize_does_not_wrap_terminal_lock(self, tmp_path, monkeypatch):
+        """H1 regression: finalize must NOT acquire terminal_lock itself — it
+        delegates ALL locking to run_terminal_stage. Wrapping it here would
+        re-acquire the NON-reentrant in-process lock on the same thread →
+        deadlock."""
+        import screencap.terminal_stage as ts
+        from screencap.terminal_stage import TerminalResult
+
+        acquisitions: list[str] = []
+        real_lock = ts.terminal_lock
+
+        import contextlib as _contextlib
+
+        @_contextlib.contextmanager
+        def _spy_lock(name, **kw):
+            acquisitions.append(name)
+            with real_lock(name, **kw):
+                yield
+
+        monkeypatch.setattr(ts, "terminal_lock", _spy_lock)
+        monkeypatch.setattr(
+            ts, "run_terminal_stage",
+            lambda *a, **kw: TerminalResult(destination="cloud", sentinel_uploaded=True),
+        )
+
+        capture_dir = tmp_path / "rec"
+        capture_dir.mkdir()
+        (capture_dir / "chunk_0000_manifest.json").write_text("{}")
+        helper = _make_cloud_helper(all_uploaded=True, summary=(1, 1))
+        helper.finalize_uploads(
+            capture_dir=capture_dir, stop_reason="graceful", recording_name="rec",
+        )
+        assert acquisitions == [], (
+            "finalize must not acquire terminal_lock itself — run_terminal_stage "
+            "owns the per-recording flock (H1 deadlock guard)"
+        )
 
 
 def test_finalize_uploads_freezes_chunks_expected_at_closed_set(tmp_path):

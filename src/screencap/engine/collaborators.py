@@ -468,7 +468,7 @@ class RecordingCollaborators:
         recording_name: str,
         console: Any | None = None,
     ) -> dict[str, Any]:
-        """Run WAL checkpoint, GCS reconcile, sentinel upload, stub decision.
+        """Freeze ``chunks_expected``, then converge via the terminal stage (U4).
 
         Returns a status dict::
 
@@ -484,46 +484,31 @@ class RecordingCollaborators:
               "followup_kind": str | None,
             }
 
-        ``recording_name`` is the post-rename name (read from
-        ``.recording_id`` if present); ``stop_reason`` is the ``_stop_reason``
-        string the live loop produced. The caller uses the returned dict
-        to decide what to print after the live display teardown.
+        ``recording_name`` is the post-rename name; ``stop_reason`` is the
+        live loop's ``_stop_reason`` string. The caller uses the returned dict
+        for post-stop messaging (only ``sentinel_uploaded`` is read directly;
+        the follow-up is surfaced via ``.upload_followup.json``).
 
-        Concurrency (U7): the WHOLE finalize critical section runs behind the
-        per-recording terminal-stage flock (``terminal_stage.terminal_lock``),
-        acquired FIRST. This serializes the live finalize against the other
-        terminal-stage entry points — a manual ``screencap upload`` or a daemon
-        resume scan — so two runs can never both reconcile/upload/sentinel the
-        same recording (AE12). The flock is advisory; this is one of the
-        entry points that MUST take it. flock acquisition is best-effort: if
-        the run dir/flock is unavailable the lock degrades to a no-op (logged),
-        never blocking finalize.
+        SCR-125 U4 — the unified cutover:
+
+        * **No outer ``terminal_lock`` wrap (H1).** ``run_terminal_stage``
+          acquires the per-recording flock itself; wrapping it here would
+          re-acquire the NON-reentrant in-process lock on the same thread →
+          deadlock. Finalize delegates locking entirely to the terminal stage.
+        * **Freeze ``chunks_expected`` here (the ONLY production freeze).**
+          Without it the AE8 promotion guard and the finalize gate are inert.
+        * **Fast because cheap, bounded for the degraded path.** Because the
+          live ``chunk_processor`` already uploaded the chunks, convergence is a
+          no-op upload + sentinel + retention. If the live path FAILED all
+          session (a large unconfirmed backlog), finalize does NOT synchronously
+          upload it (that would blow the daemon's 30s stop timeout) — it freezes,
+          surfaces the follow-up, and hands the backlog to the daemon resume
+          safety net (U6), returning within the stop budget.
         """
-        from screencap.terminal_stage import terminal_lock
-
-        with terminal_lock(recording_name):
-            return self._finalize_uploads_locked(
-                capture_dir=capture_dir,
-                stop_reason=stop_reason,
-                recording_name=recording_name,
-                console=console,
-            )
-
-    def _finalize_uploads_locked(
-        self,
-        *,
-        capture_dir: Path,
-        stop_reason: str,
-        recording_name: str,
-        console: Any | None = None,
-    ) -> dict[str, Any]:
-        """The finalize critical section — runs only while the terminal flock is held."""
         cp = self._chunk_processor
         cloud_intent = self._request.cloud_intent
-        keep_local = self._request.keep_local
         live_upload = bool(self._legacy.live_upload)
         verbose = bool(self._legacy.verbose)
-        show_on_website = self._request.show_on_website
 
         result: dict[str, Any] = {
             "sentinel_uploaded": False,
@@ -539,54 +524,39 @@ class RecordingCollaborators:
         if cp is None:
             return result
 
-        # WAL checkpoint + DB upload
+        # 1. WAL checkpoint — fold the WAL into the main DB so local consumers
+        #    (review, catalog, the scrubbed-copy upload) see a clean recording.db.
+        #    NEVER uploads it (R8). Best-effort.
         if live_upload:
             try:
                 from screencap.chunk_processor import checkpoint_and_upload_db
 
-                if console is not None:
-                    with console.status("[dim]Uploading recording database...[/dim]"):
-                        checkpoint_and_upload_db(
-                            capture_dir, recording_name,
-                            cloud_intent=cloud_intent,
-                        )
-                else:
-                    checkpoint_and_upload_db(
-                        capture_dir, recording_name,
-                        cloud_intent=cloud_intent,
-                    )
+                checkpoint_and_upload_db(
+                    capture_dir, recording_name, cloud_intent=cloud_intent,
+                )
             except Exception as exc:  # noqa: BLE001
                 if verbose and console is not None:
-                    console.print(
-                        f"[yellow]Warning:[/yellow] DB upload failed: {exc}"
-                    )
+                    console.print(f"[yellow]Warning:[/yellow] DB checkpoint failed: {exc}")
 
-        # GCS reconcile
-        if live_upload:
+        # 2. Reconcile the live path's in-memory results vs GCS (re-stat FAILED
+        #    chunks; mirror confirmed ones to the ledger) so a chunk that LANDED
+        #    but was mis-marked is recognized before the cheap-vs-defer decision.
+        if cloud_intent and live_upload:
             try:
                 flipped = cp.reconcile_against_gcs()
                 if flipped > 0 and verbose and console is not None:
-                    console.print(
-                        f"[dim]Reconciled {flipped} chunk(s) against GCS[/dim]"
-                    )
+                    console.print(f"[dim]Reconciled {flipped} chunk(s) against GCS[/dim]")
             except Exception as exc:  # noqa: BLE001
                 if verbose and console is not None:
-                    console.print(
-                        f"[yellow]Warning:[/yellow] GCS reconcile failed: {exc}"
-                    )
+                    console.print(f"[yellow]Warning:[/yellow] GCS reconcile failed: {exc}")
 
-        all_uploaded = (
-            cp.all_chunks_uploaded() and not cp.was_force_stopped
-        )
-        n_emitted, n_total = cp.upload_summary()
+        # 3. Freeze chunks_expected NOW that the chunk set is closed (the ONLY
+        #    production freeze; without it AE8 + the finalize gate are inert).
         n_chunks = len(list(capture_dir.glob("chunk_*_manifest.json")))
-        # Freeze the U1 ledger's chunks_expected NOW that the chunk set is closed
-        # (recording stopped, before any retention/eviction). This is the only
-        # production path that freezes it; without it the AE8 promotion guard and
-        # the finalize gate are inert (chunks_expected stays None). Runs for ALL
-        # destinations so a later local->cloud promotion can refuse on holes.
-        # Best-effort: never breaks finalize.
         cp.freeze_expected_chunks(n_chunks)
+
+        all_uploaded = cp.all_chunks_uploaded() and not cp.was_force_stopped
+        n_emitted, n_total = cp.upload_summary()
         result["all_chunks_uploaded"] = all_uploaded
         result["n_uploaded"] = n_emitted
         result["n_total"] = n_total
@@ -594,87 +564,111 @@ class RecordingCollaborators:
         result["upload_warning"] = cp.upload_warning
         result["force_stopped"] = cp.was_force_stopped
 
-        # Sentinel upload — only when everything's in
-        sentinel_uploaded = False
-        if cloud_intent and live_upload and all_uploaded and n_chunks > 0:
-            try:
-                from screencap.chunk_processor import upload_sentinel
-
-                sentinel_uploaded = upload_sentinel(
-                    capture_dir, recording_name,
-                    stop_reason=stop_reason or "graceful",
-                    chunks_expected=n_chunks,
-                    show_on_website=show_on_website,
-                )
-                # No public screencap.sh viewer URL: user recordings are now
-                # private (users/{uid}/), which the public site cannot render.
-                # Web viewing of your own cloud recordings is deferred.
-                if not sentinel_uploaded and console is not None:
-                    console.print(
-                        f"[yellow]Sentinel upload failed — run "
-                        f"'screencap upload {recording_name}' to trigger stitching.[/yellow]"
-                    )
-            except Exception as exc:  # noqa: BLE001
-                if verbose and console is not None:
-                    console.print(
-                        f"[yellow]Warning:[/yellow] Sentinel upload failed: {exc}"
-                    )
-        result["sentinel_uploaded"] = sentinel_uploaded
-
-        # Stub recording decision
-        has_chunk_files = any(capture_dir.glob("chunk_*.mp4"))
-        safe_to_stub = all_uploaded and live_upload and has_chunk_files
-        if cloud_intent and not keep_local:
-            safe_to_stub = safe_to_stub and sentinel_uploaded
-        else:
-            safe_to_stub = False
-        if safe_to_stub:
-            try:
-                from screencap.chunk_processor import stub_recording
-
-                deleted = stub_recording(capture_dir)
-                result["stubbed"] = bool(deleted)
-                if deleted and verbose and console is not None:
-                    console.print(
-                        f"[dim]Cleaned up {len(deleted)} local media files[/dim]"
-                    )
-            except Exception as exc:  # noqa: BLE001
-                if verbose and console is not None:
-                    console.print(
-                        f"[yellow]Warning:[/yellow] Stub failed: {exc}"
-                    )
-        elif live_upload and (not all_uploaded or not has_chunk_files):
-            from screencap.recorder import (
-                FOLLOWUP_FORCE_STOPPED,
-                FOLLOWUP_NONE_UPLOADED,
-                FOLLOWUP_PARTIAL,
-                FOLLOWUP_UPLOAD_DISABLED,
+        # 4. Converge.
+        #    - LOCAL recording → cheap LOCAL convergence (mark LOCAL_DONE +
+        #      retention; no scrub, no upload, no sentinel).
+        #    - CLOUD + the live path already uploaded everything → cheap
+        #      convergence (reconcile finds all present, sentinel, retention).
+        #    - CLOUD + a real backlog (live failed / force-stopped / --no-live-
+        #      upload) → do NOT synchronously upload (bound the stop budget);
+        #      surface the follow-up and defer to the daemon resume (U6).
+        cheap_to_converge = (not cloud_intent) or (live_upload and all_uploaded)
+        if cheap_to_converge:
+            self._converge_via_terminal_stage(
+                capture_dir, result, console if verbose else None,
             )
-
-            if cp.was_force_stopped:
-                followup_kind = FOLLOWUP_FORCE_STOPPED
-            elif n_total == 0:
-                followup_kind = FOLLOWUP_NONE_UPLOADED
-            elif cp.upload_warning:
-                followup_kind = FOLLOWUP_UPLOAD_DISABLED
-            else:
-                followup_kind = FOLLOWUP_PARTIAL
-            try:
-                import json as _json
-
-                (capture_dir / ".upload_followup.json").write_text(
-                    _json.dumps({
-                        "kind": followup_kind,
-                        "n_uploaded": n_emitted,
-                        "n_total": n_total,
-                        "upload_warning": cp.upload_warning or None,
-                    })
-                )
-                result["followup_kind"] = followup_kind
-            except OSError:
-                pass
+        if cloud_intent and not (live_upload and all_uploaded):
+            self._write_upload_followup(capture_dir, cp, n_emitted, n_total, result)
 
         return result
+
+    def _converge_via_terminal_stage(
+        self,
+        capture_dir: Path,
+        result: dict[str, Any],
+        console: Any | None,
+    ) -> None:
+        """Drive the single disk-driven terminal stage; map its result onto ``result``.
+
+        Cheap by contract (the caller only invokes this when the live path
+        already uploaded, or for a no-network LOCAL recording). The terminal
+        stage acquires its own flock, reconciles, writes the sentinel iff the
+        frozen closed set is all UPLOADED, and applies the frozen retention.
+        Never raises into finalize — a convergence failure leaves the recording
+        on disk for the daemon resume / manual ``screencap upload``.
+        """
+        from screencap.terminal_stage import (
+            PromotionRefused,
+            TerminalStageBusy,
+            run_terminal_stage,
+        )
+
+        try:
+            tr = run_terminal_stage(capture_dir, console=console)
+        except TerminalStageBusy:
+            # Another terminal-stage entry point holds the flock (e.g. a
+            # concurrent manual upload) — it owns convergence; the daemon resume
+            # is the backstop. Leave result as-is.
+            return
+        except PromotionRefused as exc:
+            # A hole (an evicted-unconfirmable chunk) — should not occur at a
+            # normal finalize (nothing evicted yet), but never crash finalize.
+            result["upload_warning"] = str(exc)
+            return
+        except Exception as exc:  # noqa: BLE001 — never break finalize
+            result["upload_warning"] = f"terminal stage convergence failed: {exc}"
+            return
+
+        result["sentinel_uploaded"] = bool(tr.sentinel_uploaded)
+        # The new "stubbed" signal: the retention floor reclaimed local media
+        # post-upload (replaces the old stub_recording delete).
+        result["stubbed"] = bool(tr.evicted)
+
+    def _write_upload_followup(
+        self,
+        capture_dir: Path,
+        cp: Any,
+        n_emitted: int,
+        n_total: int,
+        result: dict[str, Any],
+    ) -> None:
+        """Persist ``.upload_followup.json`` for the deferred-upload messaging.
+
+        Written when a CLOUD recording did not fully upload at finalize (live
+        upload failed/incomplete, force-stop, or ``--no-live-upload``). The
+        daemon resume (U6) / manual ``screencap upload`` is the uploader for this
+        path; this file lets ``recorder.print_upload_followup`` surface the
+        right message after any post-recording rename.
+        """
+        from screencap.recorder import (
+            FOLLOWUP_FORCE_STOPPED,
+            FOLLOWUP_NONE_UPLOADED,
+            FOLLOWUP_PARTIAL,
+            FOLLOWUP_UPLOAD_DISABLED,
+        )
+
+        if cp.was_force_stopped:
+            followup_kind = FOLLOWUP_FORCE_STOPPED
+        elif n_total == 0:
+            followup_kind = FOLLOWUP_NONE_UPLOADED
+        elif cp.upload_warning:
+            followup_kind = FOLLOWUP_UPLOAD_DISABLED
+        else:
+            followup_kind = FOLLOWUP_PARTIAL
+        try:
+            import json as _json
+
+            (capture_dir / ".upload_followup.json").write_text(
+                _json.dumps({
+                    "kind": followup_kind,
+                    "n_uploaded": n_emitted,
+                    "n_total": n_total,
+                    "upload_warning": cp.upload_warning or None,
+                })
+            )
+            result["followup_kind"] = followup_kind
+        except OSError:
+            pass
 
     def stop_scrub_worker(self, *, timeout: float = 30.0) -> None:
         """Send poison pill, wait for the worker thread to drain.

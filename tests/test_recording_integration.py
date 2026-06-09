@@ -1002,15 +1002,29 @@ def test_upload_warning_surfaced_at_stop(recording_env):
     assert any("screencap upload test-warning" in line for line in captured_output)
 
 
-def test_sentinel_not_uploaded_without_sentinel_for_cloud(recording_env):
-    """T6: Cloud-intent: stub_recording() requires _sentinel_uploaded=True.
+def test_sentinel_not_uploaded_without_sentinel_for_cloud(recording_env, monkeypatch):
+    """T6 (SCR-125 U4, migrated): finalize delegates convergence to the terminal
+    stage and NEVER deletes local media itself.
 
-    When all chunks upload successfully but sentinel upload fails,
-    stub_recording() must NOT be called — even if _db_uploaded is True.
-    Without the sentinel, Cloud Run stitching never triggers, so deleting
-    local files would make the recording unrecoverable.
+    The old model called ``stub_recording`` at finalize, gated on a successful
+    sentinel. The cutover removes that path: eviction is the retention floor's
+    job INSIDE ``run_terminal_stage`` (default ``keep_forever`` → no deletion;
+    ``delete_after_upload`` → only per-chunk-UPLOADED + fresh-remote-confirm).
+    Here the terminal stage reports a NON-converged result (no sentinel, nothing
+    evicted), and finalize must leave every local chunk intact (no data loss).
     """
     from screencap.recorder import start_recording
+    from screencap.terminal_stage import TerminalResult
+
+    # The cutover routes finalize through run_terminal_stage; stub the
+    # convergence to a "could not write sentinel, evicted nothing" outcome so the
+    # integration asserts finalize's own data-loss safety (it never deletes media
+    # — the floor inside the terminal stage owns eviction, unit-tested in
+    # test_retention / test_terminal_stage).
+    def _non_converged(capture_dir, **kw):
+        return TerminalResult(destination="cloud", routed=True, sentinel_uploaded=False)
+
+    monkeypatch.setattr("screencap.terminal_stage.run_terminal_stage", _non_converged)
 
     rec_dir = recording_env["recordings_dir"] / "test-sentinel-gate"
     t0 = 1000.0
@@ -1080,9 +1094,7 @@ def test_sentinel_not_uploaded_without_sentinel_for_cloud(recording_env):
         mock.patch("screencap.chunk_processor.ChunkProcessor._transcribe", return_value=None),
         mock.patch("screencap.chunk_processor.ChunkProcessor._generate_manifest"),
         mock.patch("screencap.chunk_processor.time.sleep"),
-        # Sentinel upload FAILS
-        mock.patch("screencap.chunk_processor.upload_sentinel", return_value=False) as mock_sentinel,
-        # stub_recording must NOT be called
+        # stub_recording is gone in the new model — guard that it is never called.
         mock.patch("screencap.chunk_processor.stub_recording") as mock_stub,
     ):
         mock_pipeline.return_value = mock.MagicMock()
@@ -1098,13 +1110,11 @@ def test_sentinel_not_uploaded_without_sentinel_for_cloud(recording_env):
             cloud_intent=True,
         )
 
-    # Sentinel upload was attempted (all chunks succeeded)
-    mock_sentinel.assert_called_once()
-
-    # stub_recording must NOT have been called — sentinel failed
+    # The old stub_recording path is retired — finalize never deletes media.
     mock_stub.assert_not_called()
 
-    # Media files must still exist
+    # Media files must still exist — finalize delegated convergence and the
+    # terminal stage reported a non-converged result, so NOTHING was reclaimed.
     for i in range(2):
         assert (capture_dir / f"chunk_{i:04d}.mp4").exists(), \
-            f"chunk_{i:04d}.mp4 was deleted — data loss! stub_recording ran without sentinel"
+            f"chunk_{i:04d}.mp4 was deleted — finalize must never delete media itself"
