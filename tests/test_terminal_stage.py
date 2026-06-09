@@ -418,7 +418,11 @@ class TestFailClosed:
             lambda *a, **kw: sentinel_called.append(True) or True,
         )
 
-        result = ts.run_terminal_stage(rec_dir, _remote_exists=lambda i: True)
+        # The failing chunk 1 is NOT already in GCS (a realistic fail-closed
+        # scenario — only an un-uploaded chunk reaches produce/masking). So the
+        # gate is unsatisfied and the converged fast path does not fire; produce
+        # runs and reports the FAILED chunk.
+        result = ts.run_terminal_stage(rec_dir, _remote_exists=lambda i: i != 1)
 
         assert result.sentinel_uploaded is False
         assert not sentinel_called, "sentinel must NOT be written when a chunk FAILED"
@@ -610,6 +614,66 @@ def _stub_cloud_seam(monkeypatch, scrubbed):
     import screencap.upload as up
     monkeypatch.setattr(up, "upload_recording", lambda d, **kw: UploadResult(recording=d.name))
     monkeypatch.setattr("screencap.chunk_processor.upload_sentinel", lambda *a, **kw: True)
+
+
+class TestAlreadyConvergedFastPath:
+    """SCR-125 U4: when reconcile shows the closed set is already all UPLOADED,
+    the terminal stage skips the expensive produce/re-scrub + no-op upload and
+    goes straight to the sentinel — so engine finalize stays within the stop
+    budget and a daemon resume / CLI re-upload of a converged recording is cheap."""
+
+    def test_already_converged_skips_produce(self, tmp_path, monkeypatch):
+        from screencap import terminal_stage as ts
+        from screencap.pipeline_state import PipelineLedger
+
+        rec_dir = _make_recording(tmp_path, destination="cloud", n_chunks=2)
+        # Everything already uploaded + confirmed remote (the happy live path).
+        ledger = PipelineLedger(rec_dir / "recording.db")
+        for i in range(2):
+            ledger.mark_uploaded(i)
+
+        # produce() MUST NOT run on the converged fast path.
+        monkeypatch.setattr(
+            ts.CloudCopyProducer, "produce",
+            lambda *a, **kw: (_ for _ in ()).throw(
+                AssertionError("produce must be skipped when already converged")
+            ),
+        )
+        sentinels = []
+        monkeypatch.setattr(
+            "screencap.chunk_processor.upload_sentinel",
+            lambda *a, **kw: sentinels.append(True) or True,
+        )
+
+        result = ts.run_terminal_stage(rec_dir, _remote_exists=lambda i: True)
+        assert result.finalize_gate_satisfied is True
+        assert result.sentinel_uploaded is True
+        assert sentinels == [True]
+
+    def test_force_still_rebuilds_even_when_converged(self, tmp_path, monkeypatch):
+        """--force re-scrubs + re-uploads even on a converged recording."""
+        from screencap import terminal_stage as ts
+        from screencap.pipeline_state import PipelineLedger
+        from screencap.terminal_stage import CloudCopyOutcome
+
+        rec_dir = _make_recording(tmp_path, destination="cloud", n_chunks=1)
+        ledger = PipelineLedger(rec_dir / "recording.db")
+        ledger.mark_uploaded(0)
+
+        produced = []
+        scrubbed = rec_dir.parent / f"{rec_dir.name}-scrubbed"
+        scrubbed.mkdir()
+        monkeypatch.setattr(
+            ts.CloudCopyProducer, "produce",
+            lambda self, **kw: produced.append(True) or CloudCopyOutcome(scrubbed_dir=scrubbed),
+        )
+        from screencap.upload import UploadResult
+        import screencap.upload as up
+        monkeypatch.setattr(up, "upload_recording", lambda d, **kw: UploadResult(recording=d.name))
+        monkeypatch.setattr("screencap.chunk_processor.upload_sentinel", lambda *a, **kw: True)
+
+        ts.run_terminal_stage(rec_dir, force=True, _remote_exists=lambda i: True)
+        assert produced == [True], "force must rebuild even when already converged"
 
 
 class TestU3PromotionAndRetention:

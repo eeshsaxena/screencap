@@ -607,7 +607,18 @@ class Supervisor:
 
         try:
             recordings_dir = get_recordings_dir()
-            candidates = sorted(d for d in recordings_dir.iterdir() if d.is_dir())
+            # Skip ``<name>-scrubbed`` cloud-copy siblings: scrub_recording
+            # copies recording.db (hence the ledger + a cloud .recording_intent +
+            # the source's .recording_id) into them, so a scrubbed sibling looks
+            # like an incomplete cloud recording (frozen chunks_expected, gate
+            # unsatisfied — UPLOADED marks land on the SOURCE ledger). Resuming
+            # one would upload under the source's GCS key behind a DIFFERENT flock
+            # (defeating AE12) and nest a ``<name>-scrubbed-scrubbed``. Only true
+            # source recordings are resume candidates.
+            candidates = sorted(
+                d for d in recordings_dir.iterdir()
+                if d.is_dir() and not d.name.endswith("-scrubbed")
+            )
         except OSError as exc:
             logger.warning("daemon startup sweep: could not scan recordings dir: %s", exc)
             return

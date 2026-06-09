@@ -1345,6 +1345,36 @@ async def test_startup_sweep_resumes_incomplete_cloud(tmp_path, monkeypatch):
 
 
 @pytest.mark.asyncio
+async def test_startup_sweep_skips_scrubbed_sibling(tmp_path, monkeypatch):
+    """The sweep must NEVER resume a ``<name>-scrubbed`` cloud-copy sibling — it
+    carries a copied ledger + cloud intent so it looks like an incomplete cloud
+    recording, but resuming it would upload under the source's GCS key behind a
+    different flock and nest a ``-scrubbed-scrubbed`` (defeating AE12)."""
+    from screencap.config import get_recordings_dir
+    from screencap.daemon.supervisor import Supervisor
+
+    recs = get_recordings_dir()
+    # A real source recording (legitimate candidate) ...
+    src = _make_incomplete_cloud_recording(recs, "rec", n_chunks=2, uploaded=(0,))
+    # ... and its scrubbed sibling, which carries a copy of the same ledger.
+    import shutil
+
+    shutil.copytree(src, recs / "rec-scrubbed")
+    monkeypatch.setattr("screencap.auth.get_id_token", lambda force_refresh=False: "tok")
+
+    sup = Supervisor(EventBus(), reconcile_on_init=False)
+    resumed: list[Path] = []
+
+    async def _spy(d):
+        resumed.append(Path(d))
+
+    monkeypatch.setattr(sup, "resume_terminal_stage", _spy)
+    await sup._run_startup_sweep()
+    assert src in resumed
+    assert (recs / "rec-scrubbed") not in resumed, "scrubbed sibling must be skipped"
+
+
+@pytest.mark.asyncio
 async def test_startup_sweep_skips_when_not_signed_in(tmp_path, monkeypatch):
     """Not signed in → the sweep skips entirely (recordings preserved, never a
     partial convergence without auth)."""

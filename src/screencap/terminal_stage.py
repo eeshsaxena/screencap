@@ -798,6 +798,27 @@ def _route_cloud(
             recording_dir, ledger, remote_exists=remote_exists,
         )
 
+    # 1b. ALREADY-CONVERGED FAST PATH (SCR-125 U4 "finalize is cheap"). If the
+    # reconcile shows the FROZEN closed set is all UPLOADED in GCS, the recording
+    # is already complete — its scrubbed events/manifest were uploaded by the
+    # live path (a chunk is only UPLOADED once its core files are confirmed
+    # remote). Skip the expensive ``produce`` re-scrub + the no-op upload and go
+    # straight to the sentinel + retention. This keeps the engine finalize within
+    # the stop budget (the live path already did the work) and makes the daemon
+    # resume / CLI re-upload of a converged recording a near-no-op. ``force``
+    # always rebuilds (re-scrub + re-upload).
+    if not force and ledger is not None and ledger.finalize_gate_satisfied():
+        result.routed = True
+        _refresh_counts(ledger, result)
+        result.all_uploaded = True
+        result.finalize_gate_satisfied = True
+        result.sentinel_uploaded = _write_sentinel(recording_dir, ledger, result)
+        _apply_retention(
+            recording_dir, policy, ledger, result,
+            remote_exists=remote_exists, retention_override=retention_override,
+        )
+        return result
+
     # 2. Produce the cloud copy via the scrub seam adapter.
     producer = CloudCopyProducer(recording_dir, console=console)
     try:

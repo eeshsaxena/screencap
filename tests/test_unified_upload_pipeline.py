@@ -111,23 +111,29 @@ def test_ae12_shared_flock_serializes_live_op_under_contention(tmp_path):
     from screencap.chunk_processor import ChunkProcessor, _UploadOutcome
 
     rec_dir = _make_recording(tmp_path, destination="cloud", n_chunks=1, name="ae12")
+    # Construct the processor BEFORE the holder takes the lock — the cloud
+    # privacy-pipeline init can take several seconds, and doing it inside the
+    # holder's lock-hold window would let the lock release before the live op
+    # runs (the contention would never actually happen).
+    cp = ChunkProcessor(
+        rec_dir, multiprocessing.Queue(), multiprocessing.Queue(),
+        recording_name="ae12", upload_enabled=True, auto_delete=False,
+        cloud_intent=True, masked_video_upload=False,
+    )
     holder_in = threading.Event()
     release = threading.Event()
 
     def _hold():
         with ts.terminal_lock("ae12"):
             holder_in.set()
-            release.wait(timeout=5)
+            release.wait(timeout=10)
 
     holder = threading.Thread(target=_hold)
     holder.start()
     assert holder_in.wait(timeout=5)
     try:
-        cp = ChunkProcessor(
-            rec_dir, multiprocessing.Queue(), multiprocessing.Queue(),
-            recording_name="ae12", upload_enabled=True, auto_delete=False,
-            cloud_intent=True, masked_video_upload=False,
-        )
+        # The holder owns the flock → the live per-chunk op cannot acquire it
+        # (non_blocking) → it DEFERS rather than racing a second upload pass.
         assert cp._cloud_upload_chunk(0, 0.0, 5.0, None) is _UploadOutcome.DEFERRED
     finally:
         release.set()
@@ -289,7 +295,9 @@ def test_failed_chunk_no_sentinel_preserves_media(tmp_path, monkeypatch):
     scrubbed = rec_dir.parent / f"{rec_dir.name}-scrubbed"
     sentinels = _stub_cloud_seam(monkeypatch, scrubbed, failed_chunks=[1])
 
-    result = ts.run_terminal_stage(rec_dir, _remote_exists=lambda i: True)
+    # The failing chunk 1 is not yet in GCS (only an un-uploaded chunk reaches
+    # masking), so the converged fast path does not fire and produce runs.
+    result = ts.run_terminal_stage(rec_dir, _remote_exists=lambda i: i != 1)
 
     assert result.sentinel_uploaded is False
     assert sentinels == []
