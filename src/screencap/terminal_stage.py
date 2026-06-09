@@ -388,7 +388,10 @@ class CloudCopyProducer:
 
         # 2. Scrub → <name>-scrubbed (or reuse a current review-prepared copy).
         if not force and is_scrubbed_copy_reusable(self._recording_dir, scrubbed_dir):
-            logger.debug("Reusing reviewed scrubbed copy at %s", scrubbed_dir.name)
+            console.print(
+                f"  Reusing reviewed scrubbed copy at "
+                f"[dim]{scrubbed_dir.name}/[/dim] (reviewed == uploaded)."
+            )
         else:
             # cloud_bound_recovery=True records the recovery provenance so a
             # later reuse is valid. We do NOT pass _already_locked — the
@@ -546,6 +549,20 @@ def run_terminal_stage(
     recording_dir = Path(recording_dir)
     name = recording_dir.name
 
+    # Dry-run is a READ-ONLY preview (route + report; no scrub / upload / sentinel
+    # / eviction), so it does NOT take the flock — it must never block on, or be
+    # blocked by, a concurrent real run.
+    if dry_run:
+        return _run_locked(
+            recording_dir,
+            console=console,
+            force=force,
+            dry_run=True,
+            force_destination=force_destination,
+            retention_override=retention_override,
+            remote_exists=_remote_exists,
+        )
+
     # === STEP 0: flock FIRST. Nothing below runs until we hold it. ===
     with terminal_lock(name, non_blocking=non_blocking, timeout=lock_timeout):
         if _on_locked is not None:
@@ -594,6 +611,13 @@ def _run_locked(
     if ledger is not None:
         result.n_expected = ledger.chunks_expected()
 
+    # Dry-run preview: report the routing decision, write NOTHING (no LOCAL_DONE
+    # mark, no scrub/upload/sentinel, no eviction). Universal so a dry-run never
+    # mutates the ledger or disk regardless of destination.
+    if dry_run:
+        result.routed = True
+        return result
+
     if destination is Destination.LOCAL:
         # local → no scrub, no upload. Mark each chunk LOCAL_DONE so the
         # ledger reads "complete" without being "uploaded" (R7: local
@@ -611,10 +635,6 @@ def _run_locked(
         return result
 
     # --- cloud / both routing ---
-    if dry_run:
-        result.routed = True
-        return result
-
     return _route_cloud(
         recording_dir,
         ledger=ledger,

@@ -1025,106 +1025,118 @@ def _make_upload_recording(base, name, *, with_jsonl=False):
     return rec_dir
 
 
-def test_upload_auto_exports_missing_jsonl(tmp_path):
-    """Upload auto-generates events.jsonl when it doesn't exist."""
+def _terminal_result(**kw):
+    """A TerminalResult with cloud-converged defaults for the upload tests."""
+    from screencap.terminal_stage import TerminalResult
+
+    defaults = dict(
+        destination="cloud", routed=True, n_uploaded=2, n_skipped=0,
+        sentinel_uploaded=True,
+    )
+    defaults.update(kw)
+    return TerminalResult(**defaults)
+
+
+def test_upload_routes_through_terminal_stage(tmp_path):
+    """SCR-125 U5: upload drives the SINGLE terminal stage with an explicit
+    cloud promotion — no direct scrub_recording / upload_recording call."""
     rec_dir = _make_upload_recording(tmp_path, "rec-a")
     runner = CliRunner()
+    fake = mock.MagicMock(return_value=_terminal_result(n_uploaded=3))
 
     with (
         mock.patch("screencap.upload.resolve_recording_dirs", return_value=[rec_dir]),
-        mock.patch("screencap.upload.upload_recording") as mock_upload,
-        mock.patch("screencap.exporter.export_recording", return_value=5) as mock_export,
+        mock.patch("screencap.terminal_stage.run_terminal_stage", fake),
     ):
-        mock_upload.return_value = mock.MagicMock(
-            uploaded=["recording.db"], skipped=[], failed=[], total_bytes=100, gcs_prefix="gs://bucket/rec-a",
-        )
         result = runner.invoke(cli, ["upload", "rec-a"])
 
+    from screencap.pipeline_policy import Destination
+
     assert result.exit_code == 0
-    mock_export.assert_called_once()
-    assert "Exported 5 events" in result.output
+    fake.assert_called_once()
+    _, kwargs = fake.call_args
+    assert kwargs["force_destination"] == Destination.CLOUD
+    assert kwargs["dry_run"] is False
+    assert kwargs["retention_override"] is None
+    assert "Uploaded rec-a" in result.output
 
 
-def test_upload_skips_export_when_exists(tmp_path):
-    """Upload does NOT export when events.jsonl already exists."""
-    rec_dir = _make_upload_recording(tmp_path, "rec-b", with_jsonl=True)
+def test_upload_promotion_refused_is_nonfatal(tmp_path):
+    """AE8: a recording with holes → PromotionRefused surfaced as an error, the
+    batch is non-fatal (exit 0 for a single rec is acceptable), nothing uploaded."""
+    rec_dir = _make_upload_recording(tmp_path, "rec-holes")
     runner = CliRunner()
+    from screencap.terminal_stage import PromotionRefused
+
+    def _raise(d, **kw):
+        raise PromotionRefused("chunk(s) 1 are missing locally and unconfirmable")
 
     with (
         mock.patch("screencap.upload.resolve_recording_dirs", return_value=[rec_dir]),
-        mock.patch("screencap.upload.upload_recording") as mock_upload,
-        mock.patch("screencap.exporter.export_recording") as mock_export,
+        mock.patch("screencap.terminal_stage.run_terminal_stage", _raise),
     ):
-        mock_upload.return_value = mock.MagicMock(
-            uploaded=[], skipped=["events.jsonl"], failed=[], total_bytes=0, gcs_prefix=None,
-        )
-        result = runner.invoke(cli, ["upload", "rec-b"])
+        result = runner.invoke(cli, ["upload", "rec-holes"])
 
-    assert result.exit_code == 0
-    mock_export.assert_not_called()
+    assert "missing locally" in result.output
+    assert "skipped" in result.output.lower()
 
 
-def test_upload_force_reexports(tmp_path):
-    """--force triggers export even when events.jsonl exists."""
-    rec_dir = _make_upload_recording(tmp_path, "rec-c", with_jsonl=True)
-    runner = CliRunner()
-
-    with (
-        mock.patch("screencap.upload.resolve_recording_dirs", return_value=[rec_dir]),
-        mock.patch("screencap.upload.upload_recording") as mock_upload,
-        mock.patch("screencap.exporter.export_recording", return_value=3) as mock_export,
-    ):
-        mock_upload.return_value = mock.MagicMock(
-            uploaded=["events.jsonl"], skipped=[], failed=[], total_bytes=50, gcs_prefix="gs://bucket/rec-c",
-        )
-        result = runner.invoke(cli, ["upload", "rec-c", "--force"])
-
-    assert result.exit_code == 0
-    mock_export.assert_called_once()
-
-
-def test_upload_dry_run_skips_export(tmp_path):
-    """Dry run does NOT trigger export."""
+def test_upload_dry_run_passes_dry_run(tmp_path):
+    """--dry-run threads dry_run into run_terminal_stage (a read-only preview)."""
     rec_dir = _make_upload_recording(tmp_path, "rec-d")
     runner = CliRunner()
+    fake = mock.MagicMock(return_value=_terminal_result(routed=True))
 
     with (
         mock.patch("screencap.upload.resolve_recording_dirs", return_value=[rec_dir]),
-        mock.patch("screencap.upload.upload_recording") as mock_upload,
-        mock.patch("screencap.exporter.export_recording") as mock_export,
+        mock.patch("screencap.terminal_stage.run_terminal_stage", fake),
     ):
-        mock_upload.return_value = mock.MagicMock(
-            uploaded=[], skipped=[], failed=[], total_bytes=0, gcs_prefix=None,
-        )
         result = runner.invoke(cli, ["upload", "rec-d", "--dry-run"])
 
     assert result.exit_code == 0
-    mock_export.assert_not_called()
+    _, kwargs = fake.call_args
+    assert kwargs["dry_run"] is True
+    assert "Would upload rec-d" in result.output
 
 
-def test_upload_export_failure_continues(tmp_path):
-    """Export failure warns but upload still proceeds."""
-    rec_dir = _make_upload_recording(tmp_path, "rec-e")
+def test_upload_no_delete_passes_keep_forever_override(tmp_path):
+    """--no-delete wires a keep_forever retention override into the run."""
+    rec_dir = _make_upload_recording(tmp_path, "rec-keep")
     runner = CliRunner()
+    fake = mock.MagicMock(return_value=_terminal_result())
 
     with (
         mock.patch("screencap.upload.resolve_recording_dirs", return_value=[rec_dir]),
-        mock.patch("screencap.upload.upload_recording") as mock_upload,
-        mock.patch("screencap.exporter.export_recording", side_effect=RuntimeError("boom")),
-        mock.patch(
-            "screencap.scrubber.scrub_recording",
-            return_value=mock.MagicMock(output_dir=rec_dir, entity_counts={}),
-        ),
+        mock.patch("screencap.terminal_stage.run_terminal_stage", fake),
     ):
-        mock_upload.return_value = mock.MagicMock(
-            uploaded=["recording.db"], skipped=[], failed=[], total_bytes=100, gcs_prefix="gs://bucket/rec-e",
-        )
-        result = runner.invoke(cli, ["upload", "rec-e"])
+        result = runner.invoke(cli, ["upload", "rec-keep", "--no-delete"])
+
+    from screencap.pipeline_policy import RetentionPolicy
 
     assert result.exit_code == 0
-    mock_upload.assert_called_once()
-    assert "Warning" in result.output
-    assert "boom" in result.output
+    _, kwargs = fake.call_args
+    assert kwargs["retention_override"] == RetentionPolicy.KEEP_FOREVER
+
+
+def test_upload_busy_shows_friendly_message(tmp_path):
+    """TerminalStageBusy (a live finalize / daemon resume holds the lock) → a
+    friendly 'in progress' message, not a traceback."""
+    rec_dir = _make_upload_recording(tmp_path, "rec-busy")
+    runner = CliRunner()
+    from screencap.terminal_stage import TerminalStageBusy
+
+    def _busy(d, **kw):
+        raise TerminalStageBusy("held")
+
+    with (
+        mock.patch("screencap.upload.resolve_recording_dirs", return_value=[rec_dir]),
+        mock.patch("screencap.terminal_stage.run_terminal_stage", _busy),
+    ):
+        result = runner.invoke(cli, ["upload", "rec-busy"])
+
+    assert result.exit_code == 0
+    assert "in progress" in result.output
+    assert "Traceback" not in result.output
 
 
 # --- start command — cloud NLP model gate ---
@@ -1264,35 +1276,28 @@ def test_upload_warns_but_proceeds_for_local_intent_in_all_mode(tmp_path):
     (rec_dir / ".recording_intent").write_text(json.dumps(intent))
 
     runner = CliRunner()
+    fake = mock.MagicMock(return_value=_terminal_result())
     with (
         mock.patch("screencap.upload.resolve_recording_dirs", return_value=[rec_dir]),
-        mock.patch("screencap.upload.upload_recording") as mock_upload,
-        mock.patch(
-            "screencap.scrubber.scrub_recording",
-            return_value=mock.MagicMock(output_dir=rec_dir, entity_counts={}),
-        ) as mock_scrub,
+        mock.patch("screencap.terminal_stage.run_terminal_stage", fake),
     ):
-        mock_upload.return_value = mock.MagicMock(
-            uploaded=["recording.db", "events.jsonl"],
-            skipped=[], failed=[], total_bytes=200,
-            gcs_prefix="gs://bucket/local-rec",
-        )
         result = runner.invoke(cli, ["upload", "--all"])
+
+    from screencap.pipeline_policy import Destination
 
     assert result.exit_code == 0
     # Local intent surfaces a weaker-guarantees warning...
     assert "local-intent" in result.output
     assert "post-hoc scrubbing" in result.output
-    # ...but the upload still proceeds (explicit upload overrides intent).
-    mock_upload.assert_called_once()
-    mock_scrub.assert_called_once()
-    # The upload receives the scrubbed dir (scrub_result.output_dir).
-    uploaded_dir = mock_upload.call_args[0][0]
-    assert uploaded_dir == rec_dir
+    # ...but the upload still proceeds as an EXPLICIT cloud promotion (U5).
+    fake.assert_called_once()
+    promoted_dir, kwargs = fake.call_args
+    assert promoted_dir[0] == rec_dir
+    assert kwargs["force_destination"] == Destination.CLOUD
 
 
 def test_upload_cloud_intent_proceeds(tmp_path):
-    """upload with cloud intent proceeds without scrub prompt."""
+    """upload with cloud intent converges through the terminal stage (no prompt)."""
     rec_dir = tmp_path / "cloud-rec"
     rec_dir.mkdir(parents=True)
     (rec_dir / "recording.db").touch()
@@ -1302,26 +1307,17 @@ def test_upload_cloud_intent_proceeds(tmp_path):
     (rec_dir / ".recording_intent").write_text(json.dumps(intent))
 
     runner = CliRunner()
+    fake = mock.MagicMock(return_value=_terminal_result())
     with (
         mock.patch("screencap.upload.resolve_recording_dirs", return_value=[rec_dir]),
-        mock.patch("screencap.upload.upload_recording") as mock_upload,
-        mock.patch(
-            "screencap.scrubber.scrub_recording",
-            return_value=mock.MagicMock(output_dir=rec_dir, entity_counts={}),
-        ),
+        mock.patch("screencap.terminal_stage.run_terminal_stage", fake),
     ):
-        mock_upload.return_value = mock.MagicMock(
-            uploaded=["recording.db", "events.jsonl"],
-            skipped=[], failed=[], total_bytes=200,
-            gcs_prefix="gs://bucket/cloud-rec",
-        )
         result = runner.invoke(cli, ["upload", "cloud-rec"])
 
     assert result.exit_code == 0
-    # upload_recording was called (no scrub prompt for cloud intent)
-    mock_upload.assert_called_once()
-    # No "scrub" prompt asking the user; warnings about scrubbing being applied
-    # are fine. Specifically we don't want the interactive confirm.
+    # The terminal stage was driven (no direct upload_recording / scrub call).
+    fake.assert_called_once()
+    # No interactive scrub prompt.
     assert "Continue without scrubbing?" not in result.output
 
 

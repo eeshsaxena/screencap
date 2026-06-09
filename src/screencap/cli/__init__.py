@@ -2585,7 +2585,7 @@ def _run_api_transcription(api_key, audio_path, transcript_path, transcript_json
               help="Keep local recording files after upload instead of auto-deleting.")
 def upload(names, all_recordings, dry_run, force, jobs, no_delete):
     """Upload recordings to cloud storage."""
-    from screencap.upload import resolve_recording_dirs, upload_recording, _fmt_size
+    from screencap.upload import resolve_recording_dirs
 
     try:
         dirs = resolve_recording_dirs(names, all_recordings=all_recordings)
@@ -2636,218 +2636,96 @@ def upload(names, all_recordings, dry_run, force, jobs, no_delete):
                 "scrubbing provides weaker guarantees than capture-time enforcement."
             )
 
-    total_count = len(dirs)
-    all_uploaded = 0
-    all_skipped = 0
-    all_failed = 0
-    all_bytes = 0
-
-    # Warn if any recordings will need export
     if not dry_run:
-        needs_export = any(
-            not (d / "events.jsonl").exists() or force for d in dirs
+        console.print(
+            "[yellow]Warning:[/yellow] Uploads include all captured keystrokes. "
+            "Review recordings for sensitive data before sharing.",
+            highlight=False,
         )
-        if needs_export:
-            console.print(
-                "[yellow]Warning:[/yellow] Auto-export includes all captured keystrokes. "
-                "Review recordings for sensitive data before sharing.",
-                highlight=False,
-            )
 
+    # SCR-125 U5: every recording converges through the SINGLE terminal stage.
+    # The CLI no longer calls scrub_recording / upload_recording /
+    # assert_promotable_to_cloud / recovery directly — run_terminal_stage owns
+    # recovery, scrub-reuse, the AE8 hole-refusal, upload (never recording.db),
+    # the sentinel, and retention, behind the per-recording flock. ``screencap
+    # upload`` is an EXPLICIT promotion: force_destination=cloud uploads a
+    # local/legacy/no-intent recording that would otherwise route LOCAL → no-op.
+    from screencap.pipeline_policy import Destination, RetentionPolicy
+    from screencap.terminal_stage import (
+        PromotionRefused,
+        TerminalStageBusy,
+        run_terminal_stage,
+    )
+
+    total_count = len(dirs)
+    n_ok = 0
+    n_failed = 0
     for i, d in enumerate(dirs, 1):
         if total_count > 1:
             console.print(f"\n[bold][{i}/{total_count}][/bold] {d.name}")
+        try:
+            result = run_terminal_stage(
+                d,
+                console=console,
+                force=force,
+                dry_run=dry_run,
+                force_destination=Destination.CLOUD,
+                # --no-delete keeps local media after upload (a per-run override).
+                retention_override=(
+                    RetentionPolicy.KEEP_FOREVER if no_delete else None
+                ),
+            )
+        except PromotionRefused as e:
+            console.print(
+                f"[red]Error:[/red] {e}\n"
+                "[dim]Upload skipped — nothing was changed.[/dim]"
+            )
+            n_failed += 1
+            continue
+        except TerminalStageBusy:
+            console.print(
+                f"  [yellow]{d.name}: upload already in progress[/yellow] — a "
+                "recording is finalizing, or another upload / daemon resume holds "
+                "the lock. Try again shortly."
+            )
+            n_failed += 1
+            continue
+        except FileNotFoundError as e:
+            console.print(f"[red]Error:[/red] {e}")
+            n_failed += 1
+            continue
+        except RuntimeError as e:
+            console.print(f"[red]Error:[/red] {e}")
+            sys.exit(1)
 
-        # Auto-export events.jsonl if missing (or --force)
-        # Skip if per-chunk JSONL already exists (chunked mode)
-        if not dry_run:
-            # Canonical events export — the shared gate + config (skip when
-            # chunked, exclude_moves=False, include_network off) that keeps the
-            # uploaded event set byte-identical to what the native review
-            # prepares. Returns None when no export was needed.
-            try:
-                from screencap.exporter import ensure_canonical_events
-                with console.status("[dim]Exporting events...[/dim]"):
-                    count = ensure_canonical_events(d, force=force)
-                if count is not None:
-                    console.print(f"  [dim]Exported {count} events to events.jsonl[/dim]")
-                    if count == 0:
-                        console.print("[yellow]Warning:[/yellow] Recording contains no events.")
-            except Exception as e:
-                console.print(f"  [yellow]Warning:[/yellow] Export failed ({e}), uploading without events.jsonl")
+        if dry_run:
+            console.print(
+                f"  [dim]Would upload {d.name} → cloud (dry run; nothing changed).[/dim]"
+            )
+            continue
 
-            # Recovery: generate per-chunk manifests + events if chunks exist but metadata doesn't.
-            # cloud_bound=True UNCONDITIONALLY: at upload time, the data IS becoming
-            # cloud-bound by user choice — regardless of what `.recording_intent`
-            # records. This closes the local-then-uploaded threat case (a recording
-            # captured as destination=local, later uploaded by the user). The
-            # `cloud_bound` keyword is REQUIRED on _recover_chunk_metadata so a
-            # forgotten argument is a TypeError, not a silent fail-OPEN.
-            #
-            # LOAD-BEARING ORDERING (do not reorder): this `_recover_chunk_metadata`
-            # call MUST be followed by `scrub_recording` below in the same loop
-            # iteration. The scrub-layer pointer suppression (Unit 2) only
-            # protects recovered cloud-bound JSONL when this ordering holds.
-            # Reordering or adding a recovery path that bypasses the scrubber
-            # must replicate the in-interval mouse.move drop at the engine layer.
-            from screencap.recovery import _recover_chunk_metadata
+        # A FAILED chunk (scrub/mask fail-closed) or an upload warning means the
+        # recording did not fully converge — local media is preserved.
+        if result.failed_indices or result.upload_warning:
+            if result.upload_warning:
+                console.print(f"  [yellow]Warning:[/yellow] {result.upload_warning}")
+            if result.failed_indices:
+                console.print(
+                    f"  [yellow]{d.name}: {len(result.failed_indices)} chunk(s) could "
+                    "not be prepared — local media preserved, sentinel withheld.[/yellow]"
+                )
+            n_failed += 1
+            continue
 
-            _recover_chunk_metadata(d, console, force=force, cloud_bound=True)
-
-            # Recovery: generate sentinel file if missing (crash/force-quit recovery)
-            _sentinel_path = d / "recording_complete.json"
-            if not _sentinel_path.exists() and any(d.glob("chunk_*_manifest.json")):
-                try:
-                    from screencap.chunk_processor import _build_sentinel_data
-                    _rec_id_path = d / ".recording_id"
-                    _rec_name = _rec_id_path.read_text().strip() if _rec_id_path.exists() else d.name
-                    _chunk_count = len(list(d.glob("chunk_*_manifest.json")))
-                    show_on_website = True
-                    _intent_path = d / ".recording_intent"
-                    if _intent_path.exists():
-                        try:
-                            show_on_website = json.loads(_intent_path.read_text()).get("show_on_website", True)
-                        except Exception:
-                            pass
-                    _sentinel_data = _build_sentinel_data(
-                        recording_name=_rec_name,
-                        stop_reason="manual_upload",
-                        chunks_expected=_chunk_count,
-                        show_on_website=show_on_website,
-                    )
-                    _sentinel_path.write_text(json.dumps(_sentinel_data, indent=2))
-                except Exception:
-                    pass
-
-        # U7: acquire the per-recording TERMINAL-STAGE flock FIRST (before the
-        # finer scrub lock and before any reconcile/scrub/upload), so a manual
-        # `screencap upload` is serialized against the live finalize and the
-        # daemon resume scan — two runs can never both reconcile+upload the same
-        # recording (AE12). flock is advisory: this is one of the entry points
-        # that MUST take it. Blocking-with-timeout: if a live finalize holds it,
-        # we wait, then converge over its committed ledger (idempotent). Dry-run
-        # touches nothing, so it skips the lock.
-        #
-        # The inner recording_scrub_lock still guards the scrubbed-dir decision
-        # vs. the upload enumeration against a concurrent re-scrub (a second
-        # review window). The two locks are different files and nest cleanly.
-        from screencap.scrubber import recording_scrub_lock
-        from screencap.terminal_stage import terminal_lock
-
-        _terminal_lock = (
-            terminal_lock(d.name) if not dry_run else contextlib.nullcontext()
+        n_ok += 1
+        note = " (stitching triggered)" if result.sentinel_uploaded else ""
+        console.print(
+            f"\n[green]Uploaded {d.name}[/green] "
+            f"({result.n_uploaded} chunk(s) uploaded, {result.n_skipped} skipped){note}"
         )
-        _scrub_lock = (
-            recording_scrub_lock(d.name) if not dry_run else contextlib.nullcontext()
-        )
-        with _terminal_lock, _scrub_lock:
-            # U9/AE8 — local->cloud promotion hole check, FIRST inside the lock
-            # (reconcile-before-anything). If retention already evicted a chunk
-            # required for a complete upload and that chunk is NOT confirmed in
-            # GCS, refuse with a clear, actionable error rather than uploading a
-            # recording with silent holes (a partial cloud copy). The real GCS
-            # re-stat seam is used (remote_exists=None); a legacy single-file /
-            # no-ledger recording has no closed chunk set, so this is a no-op
-            # for it (it routes through the whole-dir scrub branch below, R14).
-            if not dry_run:
-                try:
-                    from screencap.terminal_stage import (
-                        PromotionRefused,
-                        assert_promotable_to_cloud,
-                    )
-
-                    assert_promotable_to_cloud(d)
-                except PromotionRefused as e:
-                    console.print(
-                        f"[red]Error:[/red] {e}\n"
-                        "Upload skipped — nothing was changed."
-                    )
-                    all_failed += 1
-                    continue
-
-            # Always scrub before upload — but reuse the review-prepared
-            # scrubbed copy when a completion sentinel + provenance prove it is
-            # complete, current, and built the way upload would build it
-            # (reviewed == uploaded, R3/U4). This avoids a redundant second
-            # scrub on the review→upload path while never shipping a
-            # partial/stale/mutated dir. --force always rebuilds; a scrub
-            # failure still blocks upload (fail-closed preserved).
-            if not dry_run:
-                try:
-                    from screencap.scrubber import (
-                        is_scrubbed_copy_reusable,
-                        scrub_recording,
-                    )
-
-                    scrubbed_dir = d.parent / f"{d.name}-scrubbed"
-                    if not force and is_scrubbed_copy_reusable(d, scrubbed_dir):
-                        console.print(
-                            f"  Reusing reviewed scrubbed copy at "
-                            f"[dim]{scrubbed_dir.name}/[/dim] (reviewed == uploaded)."
-                        )
-                        d = scrubbed_dir
-                    else:
-                        # cloud_bound_recovery=True: _recover_chunk_metadata(
-                        # cloud_bound=True) ran above in this same iteration (the
-                        # load-bearing ordering), so the sentinel records it and a
-                        # later reuse is valid. _already_locked=True: we hold the
-                        # per-recording lock, so scrub_recording must not re-acquire
-                        # it (same-process flock would deadlock).
-                        with console.status(f"[bold]Scrubbing {d.name} for upload...[/bold]"):
-                            scrub_result = scrub_recording(
-                                d.name, cloud_bound_recovery=True, _already_locked=True,
-                            )
-                        entity_total = sum(scrub_result.entity_counts.values())
-                        console.print(
-                            f"  Scrubbed copy at [dim]{scrub_result.output_dir.name}/[/dim] "
-                            f"({entity_total} redaction(s) applied)."
-                        )
-                        d = scrub_result.output_dir
-                except Exception as e:
-                    console.print(
-                        f"[red]Error:[/red] Scrubbing failed: {e}\n"
-                        "Upload skipped — cannot upload without scrubbing."
-                    )
-                    all_failed += 1
-                    continue
-
-            try:
-                result = upload_recording(d, dry_run=dry_run, force=force, jobs=jobs)
-                all_uploaded += len(result.uploaded)
-                all_skipped += len(result.skipped)
-                all_failed += len(result.failed)
-                all_bytes += result.total_bytes
-
-                if not dry_run and not result.failed:
-                    parts = []
-                    if result.uploaded:
-                        parts.append(f"{len(result.uploaded)} new")
-                    if result.skipped:
-                        parts.append(f"{len(result.skipped)} skipped")
-                    summary = ", ".join(parts) if parts else "0 files"
-                    if result.gcs_prefix:
-                        console.print(
-                            f"\n[green]Uploaded {d.name}[/green] -> {result.gcs_prefix} ({summary})"
-                        )
-                    else:
-                        console.print(f"\n[green]Uploaded {d.name}[/green] ({summary})")
-                    # No public screencap.sh viewer URL: user recordings now live
-                    # under the private, account-scoped users/{uid}/ namespace, which
-                    # the public site cannot render. Web viewing of your own cloud
-                    # recordings is deferred; the macOS app/CLI is the interim surface.
-            except FileNotFoundError as e:
-                console.print(f"[red]Error:[/red] {e}")
-                all_failed += 1
-            except RuntimeError as e:
-                console.print(f"[red]Error:[/red] {e}")
-                sys.exit(1)
 
     if total_count > 1 and not dry_run:
-        console.print(
-            f"\n[bold]Done.[/bold] {all_uploaded} uploaded, "
-            f"{all_skipped} skipped, {all_failed} failed "
-            f"({_fmt_size(all_bytes)} total)"
-        )
+        console.print(f"\n[bold]Done.[/bold] {n_ok} uploaded, {n_failed} failed")
 
 
 @cli.command()
