@@ -144,10 +144,40 @@ def _migrate_schema(db_path: str) -> None:
     Compares every table that exists in the DB against the SQLAlchemy model
     definitions and issues ALTER TABLE ADD COLUMN for anything missing.
     Called before opening a session so that queries don't fail on old databases.
+
+    Also creates the U1 ``pipeline_chunk_state`` ledger table and the U4a
+    ``window_geometry_capture_failure`` marker table on existing
+    recording.db files that pre-date them. ``_migrate_schema`` historically
+    only ALTER-added columns to tables that already existed (and never
+    created missing tables — that was ``_ensure_network_tables``' job).
+    Both tables must exist on EVERY open through ``get_session_for_path``
+    (engine writer, terminal stage, CLI), so we create them here too,
+    idempotently via ``checkfirst=True``. The ``recording.chunks_expected``
+    column is picked up by the ALTER pass below because the ``recording``
+    table always exists.
     """
     import sqlite3
 
     from screencap.engine.db import models  # noqa: F401 - registers models
+
+    # Create the ledger + geometry-capture-failure tables on legacy DBs
+    # before the column ALTER pass. checkfirst=True makes each a no-op when
+    # it already exists. Readonly DBs (chmod 444) raise OperationalError;
+    # degrade gracefully so a read-only open of an old recording.db doesn't
+    # crash.
+    try:
+        engine = get_engine(f"sqlite:///{db_path}")
+        try:
+            models.PipelineChunkState.__table__.create(engine, checkfirst=True)
+            models.WindowGeometryCaptureFailure.__table__.create(
+                engine, checkfirst=True
+            )
+        finally:
+            engine.dispose()
+    except sa.exc.OperationalError as e:
+        msg = str(e).lower()
+        if "readonly database" not in msg and "attempt to write a readonly database" not in msg:
+            raise
 
     conn = sqlite3.connect(db_path)
     cur = conn.cursor()
@@ -166,9 +196,19 @@ def _migrate_schema(db_path: str) -> None:
         for col in table.columns:
             if col.name not in existing_cols:
                 sqlite_type = _sa_type_to_sqlite(col)
-                cur.execute(
-                    f"ALTER TABLE {table.name} ADD COLUMN {col.name} {sqlite_type}"
-                )
+                try:
+                    cur.execute(
+                        f"ALTER TABLE {table.name} ADD COLUMN {col.name} {sqlite_type}"
+                    )
+                except sqlite3.OperationalError as e:
+                    # A concurrent first-open of the same recording.db (daemon
+                    # engine writer + a CLI command) can add this column between
+                    # our PRAGMA read above and this ALTER — a TOCTOU window.
+                    # The duplicate-column error is idempotent (the column now
+                    # exists, which is the desired end state), so treat it as a
+                    # no-op rather than crashing the second opener.
+                    if "duplicate column name" not in str(e).lower():
+                        raise
 
     conn.commit()
     conn.close()

@@ -420,6 +420,166 @@ def test_concat_oserror_becomes_cant_process(recordings_root, monkeypatch):
 
 
 # ---------------------------------------------------------------------------
+# U10: chunks-are-the-record; derived video.mp4 + eviction-race hardening (R2)
+# ---------------------------------------------------------------------------
+
+
+def test_chunked_review_derives_video_and_chunks_remain_the_record(recordings_root):
+    """R2 happy path: a chunked recording's review DERIVES ``video.mp4`` on
+    demand from the chunk set; the chunk set itself remains the record (every
+    ``chunk_*.mp4`` survives the concat — the merged file is additive)."""
+    rec_dir = _make_recording(recordings_root, "rec-derive")
+    _write_video(rec_dir / "chunk_0001.mp4", (200, 0, 0))
+    _write_video(rec_dir / "chunk_0002.mp4", (0, 200, 0))
+    (rec_dir / "events.jsonl").write_text(json.dumps({"_meta": True}) + "\n")
+    assert not (rec_dir / "video.mp4").exists()
+
+    envelope = prepare_review_data("rec-derive")
+
+    assert envelope["ok"] is True
+    # video.mp4 was derived on demand...
+    assert (rec_dir / "video.mp4").exists()
+    # ...and the chunk set (the record) is intact.
+    assert sorted(p.name for p in rec_dir.glob("chunk_*.mp4")) == [
+        "chunk_0001.mp4", "chunk_0002.mp4",
+    ]
+
+
+def test_ensure_single_video_takes_terminal_lock_for_multichunk(recordings_root):
+    """The multi-chunk concat is serialized against U8 eviction by taking the
+    per-recording ``terminal_lock`` (plan: "serialize via the ledger/flock").
+    Spy on the lock to prove it is acquired around the concat."""
+    from screencap.viewer import _ensure_single_video
+
+    rec_dir = _make_recording(recordings_root, "rec-lock")
+    _write_video(rec_dir / "chunk_0001.mp4", (200, 0, 0))
+    _write_video(rec_dir / "chunk_0002.mp4", (0, 200, 0))
+
+    taken: list[str] = []
+    import contextlib
+
+    import screencap.terminal_stage as ts
+
+    real_lock = ts.terminal_lock
+
+    @contextlib.contextmanager
+    def spy_lock(name, **kwargs):
+        taken.append(name)
+        with real_lock(name, **kwargs):
+            yield
+
+    with mock.patch("screencap.terminal_stage.terminal_lock", spy_lock):
+        _ensure_single_video(rec_dir)
+
+    assert taken == ["rec-lock"], "the per-recording terminal lock must be taken"
+    assert (rec_dir / "video.mp4").exists()
+
+
+def test_concat_tolerates_chunk_evicted_while_waiting_for_lock(recordings_root):
+    """Race/regression: if eviction removes chunks before the concat acquires
+    the lock, the post-lock re-glob sees the surviving set and NEVER leaves a
+    half-written ``video.mp4`` masquerading as complete. Here all-but-one chunk
+    is evicted while we 'hold' the lock; the survivor is symlinked, no partial
+    mux is produced."""
+    from screencap.viewer import _ensure_single_video
+
+    rec_dir = _make_recording(recordings_root, "rec-evicted-mid")
+    _write_video(rec_dir / "chunk_0001.mp4", (200, 0, 0))
+    _write_video(rec_dir / "chunk_0002.mp4", (0, 200, 0))
+
+    import contextlib
+
+    @contextlib.contextmanager
+    def evicting_lock(name, **kwargs):
+        # Simulate U8 eviction having run just before/while we hold the lock:
+        # one chunk's local media is reclaimed. The concat re-globs INSIDE the
+        # lock, so it must act on the survivor set, not the stale pre-lock list.
+        (rec_dir / "chunk_0001.mp4").unlink()
+        yield
+
+    with mock.patch("screencap.terminal_stage.terminal_lock", evicting_lock):
+        _ensure_single_video(rec_dir, fail_loud=True)
+
+    # The lone survivor is symlinked — never a partial multi-chunk mux.
+    vid = rec_dir / "video.mp4"
+    assert vid.exists()
+    assert vid.is_symlink(), "single survivor is symlinked, not concatenated"
+    assert vid.resolve().name == "chunk_0002.mp4"
+    # No stale concat temp left behind.
+    assert not list(rec_dir.glob(".video.mp4.*.tmp"))
+
+
+def test_concat_busy_lock_warns_in_viewer_path(recordings_root):
+    """A contended lock (terminal stage mid-eviction) makes the best-effort
+    viewer path warn-and-continue rather than hang or leave a partial file —
+    no ``video.mp4`` is produced and no exception escapes."""
+    from screencap.terminal_stage import TerminalStageBusy
+    from screencap.viewer import _ensure_single_video
+
+    rec_dir = _make_recording(recordings_root, "rec-busy")
+    _write_video(rec_dir / "chunk_0001.mp4", (200, 0, 0))
+    _write_video(rec_dir / "chunk_0002.mp4", (0, 200, 0))
+
+    import contextlib
+
+    @contextlib.contextmanager
+    def busy_lock(name, **kwargs):
+        raise TerminalStageBusy("held by terminal stage")
+        yield  # pragma: no cover
+
+    with mock.patch("screencap.terminal_stage.terminal_lock", busy_lock):
+        # Best-effort path: no raise.
+        _ensure_single_video(rec_dir, fail_loud=False)
+    assert not (rec_dir / "video.mp4").exists(), "no partial video on a busy lock"
+
+
+def test_concat_busy_lock_propagates_in_review_path(recordings_root):
+    """The ``review-data`` path (``fail_loud=True``) propagates a contended lock
+    as a clean failure (TerminalStageBusy is a RuntimeError, caught by
+    prepare_review_data into the R9 'can't process this video' envelope) — never
+    a partial ``video.mp4`` treated as complete."""
+    from screencap.terminal_stage import TerminalStageBusy
+    from screencap.viewer import _ensure_single_video
+
+    rec_dir = _make_recording(recordings_root, "rec-busy-loud")
+    _write_video(rec_dir / "chunk_0001.mp4", (200, 0, 0))
+    _write_video(rec_dir / "chunk_0002.mp4", (0, 200, 0))
+
+    import contextlib
+
+    @contextlib.contextmanager
+    def busy_lock(name, **kwargs):
+        raise TerminalStageBusy("held by terminal stage")
+        yield  # pragma: no cover
+
+    with mock.patch("screencap.terminal_stage.terminal_lock", busy_lock):
+        with pytest.raises(TerminalStageBusy):
+            _ensure_single_video(rec_dir, fail_loud=True)
+    assert not (rec_dir / "video.mp4").exists()
+
+
+def test_legacy_single_file_renders_without_concat_or_lock(recordings_root):
+    """R14 regression: a legacy single-file recording (real ``video.mp4``, no
+    chunks) renders through the existing path untouched — the no-chunks early
+    return never reaches the concat or the terminal lock."""
+    from screencap.viewer import _ensure_single_video
+
+    rec_dir = _make_recording(recordings_root, "rec-legacy")
+    _write_video(rec_dir / "video.mp4", (0, 0, 200), pix_fmt="yuv420p")
+    original = (rec_dir / "video.mp4").read_bytes()
+
+    # The lock must NOT be taken for a legacy recording (no chunks).
+    def fail_if_locked(*a, **k):  # pragma: no cover
+        raise AssertionError("terminal_lock must not be taken for a legacy recording")
+
+    with mock.patch("screencap.terminal_stage.terminal_lock", fail_if_locked):
+        _ensure_single_video(rec_dir)
+
+    assert (rec_dir / "video.mp4").read_bytes() == original, "legacy video untouched"
+    assert not (rec_dir / "video.mp4").is_symlink()
+
+
+# ---------------------------------------------------------------------------
 # U2: scrub-before-review orchestration (R1/R2/R5/R7/R9/R11)
 # ---------------------------------------------------------------------------
 

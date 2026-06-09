@@ -18,12 +18,21 @@ from pathlib import Path
 from typing import TYPE_CHECKING
 
 from screencap._flush import wait_for_writer_flush
+from screencap.pipeline_stages import StageArtifacts as _StageArtifacts
 from screencap.recording_db import open_recording_db
 
 if TYPE_CHECKING:
     from screencap.network.export_pipeline import NetworkScrubPipeline
 
 logger = logging.getLogger(__name__)
+
+
+class _StageAbort(Exception):
+    """Internal signal: a ``_stop_event`` abort fired inside an agnostic
+    stage step. Caught in ``_run_agnostic_stages`` so the runner never
+    reaches ``mark_staged`` — the chunk stays PENDING (force-stop
+    survivorship-bias fix).
+    """
 
 
 class ChunkStatus(str, Enum):
@@ -208,6 +217,14 @@ class ChunkProcessor:
         self._thread: threading.Thread | None = None
         self._stop_event = threading.Event()
 
+        # U5 ledger handle for the destination-agnostic stage runner, built
+        # lazily on first use. ``None`` (no recording.db / no recording row,
+        # e.g. test fixtures) disables ledger bookkeeping — the agnostic
+        # stages still run and produce artifacts, they just aren't recorded
+        # as STAGED. The on-disk artifact-existence idempotency still holds.
+        self._ledger = None
+        self._ledger_unavailable = False
+
     def _lookup_recording_id(self) -> int | None:
         """One-shot query for the recording.id at construction time.
 
@@ -311,7 +328,12 @@ class ChunkProcessor:
         if not self._upload_enabled:
             return 0
 
-        from screencap.upload import FileInfo, _content_type, request_signed_urls
+        from screencap.upload import (
+            FileInfo,
+            _content_type,
+            assert_uploadable,
+            request_signed_urls,
+        )
 
         all_file_infos: list[FileInfo] = []
         per_chunk_names: dict[int, list[str]] = {}
@@ -329,10 +351,10 @@ class ChunkProcessor:
                     size = path.stat().st_size
                 except FileNotFoundError:
                     continue
-                all_file_infos.append(FileInfo(
+                all_file_infos.append(assert_uploadable(FileInfo(
                     name=f["name"], path=path,
                     content_type=_content_type(path), size=size,
-                ))
+                )))
                 names.append(f["name"])
             if names:
                 per_chunk_names[idx] = names
@@ -352,6 +374,10 @@ class ChunkProcessor:
             # key means the server didn't confirm, so we stay conservative.
             if all(name in urls and urls[name] is None for name in names):
                 self._chunk_results[idx] = ChunkStatus.EMITTED
+                # U7: mirror the reconcile flip onto the on-disk ledger so the
+                # confirmed-in-GCS state survives a crash and is visible to the
+                # terminal-stage process. Best-effort (see _mirror_status_to_ledger).
+                self._mirror_status_to_ledger(idx, ChunkStatus.EMITTED)
                 flipped += 1
                 logger.info(f"Reconciled chunk {idx}: all core files already in GCS")
         return flipped
@@ -446,6 +472,199 @@ class ChunkProcessor:
                         pending if pending is not None else ChunkStatus.FAILED
                     )
 
+    def _get_ledger(self):
+        """Lazily resolve the U5 ledger for this recording.db, or ``None``.
+
+        Returns ``None`` (and latches ``_ledger_unavailable``) when the
+        recording.db is absent or has no recording row — the same fixtures
+        for which ``_lookup_recording_id`` returns ``None``. The agnostic
+        stages run regardless; only the STAGED bookkeeping is skipped.
+        """
+        if self._ledger is not None:
+            return self._ledger
+        if self._ledger_unavailable:
+            return None
+        try:
+            from screencap.pipeline_state import (
+                PipelineLedger,
+                ensure_pipeline_state_schema,
+            )
+
+            ensure_pipeline_state_schema(self._db_path)
+            self._ledger = PipelineLedger(self._db_path)
+        except Exception as e:
+            # No recording.db / no recording row / schema failure — record
+            # the absence once and fall back to artifact-only idempotency.
+            logger.debug(f"Pipeline ledger unavailable, skipping STAGED bookkeeping: {e}")
+            self._ledger_unavailable = True
+            return None
+        return self._ledger
+
+    def _mirror_status_to_ledger(self, idx: int, status: "ChunkStatus") -> None:
+        """Project a settled ``ChunkStatus`` onto the U1 ledger upload-state.
+
+        Maps via :func:`pipeline_state.from_chunk_status`:
+        ``EMITTED -> mark_uploaded``, ``NETWORK_SKIPPED -> mark_skipped``,
+        ``FAILED``/``NETWORK_INCOMPLETE -> mark_failed``. Best-effort and
+        non-fatal: a ledger write failure (no recording.db in a test fixture,
+        a transient lock) must never crash chunk processing — the in-memory
+        ``_chunk_results`` remains the live gate, and a missed ledger mirror is
+        re-derived by the terminal stage's reconcile-from-GCS on (re)entry.
+        """
+        ledger = self._get_ledger()
+        if ledger is None:
+            return
+        from screencap.pipeline_state import UploadState, from_chunk_status
+
+        try:
+            upload_state = from_chunk_status(status)
+            if upload_state == UploadState.UPLOADED:
+                ledger.mark_uploaded(idx)
+            elif upload_state == UploadState.SKIPPED:
+                ledger.mark_skipped(idx)
+            elif upload_state == UploadState.FAILED:
+                ledger.mark_failed(idx, detail=status.value)
+            # UploadState.PENDING is never reached (caller filters PENDING).
+        except Exception as e:  # noqa: BLE001
+            logger.debug(f"Chunk {idx}: ledger status mirror failed (non-fatal): {e}")
+
+    def freeze_expected_chunks(self, count: int) -> None:
+        """Freeze the ledger's ``chunks_expected`` to ``count`` at finalize.
+
+        Called once at recording finalize (``collaborators.finalize_uploads``),
+        when the chunk set is closed, so the U1 ledger's
+        ``finalize_gate_satisfied`` and the U9 AE8 promotion guard
+        (``detect_promotion_holes``) have a real frozen count to gate on.
+        WITHOUT this, ``chunks_expected`` is never frozen on any production path
+        and both gates become inert (the promotion guard silently passes every
+        recording — the exact partial-upload data loss AE8 exists to refuse).
+
+        Best-effort and non-fatal (mirrors ``_mirror_status_to_ledger``): a
+        no-ledger fixture or a transient failure must never break finalize.
+        ``freeze_chunks_expected`` is idempotent on the same count and refuses a
+        conflicting refreeze (``LedgerError``) — both are swallowed here.
+        """
+        if count <= 0:
+            return  # nothing to gate on (0-chunk / legacy single-file).
+        ledger = self._get_ledger()
+        if ledger is None:
+            return
+        try:
+            ledger.freeze_chunks_expected(count)
+        except Exception as e:  # noqa: BLE001
+            logger.debug(f"freeze_chunks_expected({count}) failed (non-fatal): {e}")
+
+    def _run_agnostic_stages(self, idx, start_ts, end_ts):
+        """Run the destination-agnostic stages (transcribe/export/manifest).
+
+        Delegates ordering + ledger idempotency to the U5
+        :class:`~screencap.pipeline_stages.PipelineStageRunner`. The injected
+        steps wrap this processor's existing methods so the cloud-window-
+        filtered ``_export_events`` (statically audited by
+        ``test_privacy_filter_call_graph.py``) is unchanged — the runner's
+        own code never sees the cloud filter (R4).
+
+        Returns the produced ``StageArtifacts`` (re-derived on an already-
+        STAGED chunk, so the caller always has the transcript path), or
+        ``None`` if a ``_stop_event`` abort fired mid-stage (force-stop:
+        leave the chunk PENDING). Stop-aborts surface as a private
+        ``_StageAbort`` raised inside a step so the runner does not reach
+        ``mark_staged`` — the chunk stays PENDING, never falsely STAGED.
+        """
+        from screencap.pipeline_stages import PipelineStageRunner
+
+        # Seed a closed-set PENDING row before staging so the ledger reflects
+        # this chunk even if a later stage fails (survivorship-bias fix).
+        ledger = self._get_ledger()
+        if ledger is not None:
+            try:
+                ledger.seed_chunk(idx)
+            except Exception as e:
+                logger.debug(f"Chunk {idx}: ledger seed failed (non-fatal): {e}")
+
+        def _abort_if_stopping():
+            if self._stop_event.is_set():
+                raise _StageAbort()
+
+        def _transcribe_step(i):
+            self._set_status("Transcribing audio...")
+            result = self._transcribe(i)
+            _abort_if_stopping()
+            return result
+
+        def _export_step(i, s, e):
+            # Flush writer buffers before reading events from the DB — the
+            # export must see all rows the writers have produced for this
+            # chunk window.
+            self._set_status("Flushing buffers...")
+            self._trigger_flush()
+            _abort_if_stopping()
+            self._set_status("Exporting events...")
+            # Cloud-window-filter posture lives inside _export_events
+            # (unchanged); the runner never sees it (R4).
+            result = self._export_events(i, s, e)
+            _abort_if_stopping()
+            return result
+
+        def _manifest_step(i, s, e):
+            self._set_status("Generating manifest...")
+            blocked_intervals = None
+            if self._screen_filter is not None and hasattr(
+                self._screen_filter, "get_blocked_intervals"
+            ):
+                try:
+                    blocked_intervals = (
+                        self._screen_filter.get_blocked_intervals(s, e) or None
+                    )
+                except Exception:
+                    logger.warning(
+                        f"Failed to get blocked_intervals for chunk {i}",
+                        exc_info=True,
+                    )
+            try:
+                return self._generate_manifest(
+                    i, s, e, blocked_intervals=blocked_intervals
+                )
+            except Exception:
+                logger.exception(f"Chunk {i}: manifest generation failed")
+                # Remove any partially-written manifest so a later retry
+                # (or screencap upload) doesn't ship a truncated file.
+                (self._capture_dir / f"chunk_{i:04d}_manifest.json").unlink(
+                    missing_ok=True
+                )
+                raise
+
+        runner = PipelineStageRunner(
+            self._capture_dir,
+            transcribe=_transcribe_step,
+            export_events=_export_step,
+            manifest=_manifest_step,
+            ledger=ledger,
+        )
+
+        # Already-STAGED short-circuit happens inside run_chunk (returns
+        # None); re-derive the transcript path so the caller still has it.
+        already_staged = runner.is_staged(idx)
+        try:
+            artifacts = runner.run_chunk(idx, start_ts, end_ts)
+        except _StageAbort:
+            # Force-stop mid-stage: leave the chunk PENDING (the runner did
+            # not reach mark_staged).
+            return None
+
+        if artifacts is not None:
+            return artifacts
+        # run_chunk returned None → chunk was already STAGED. Re-derive the
+        # transcript path (no stage re-run) so scrub/upload can proceed.
+        if already_staged:
+            transcript = self._capture_dir / f"transcript_{idx:04d}.txt"
+            return _StageArtifacts(
+                transcript=transcript if transcript.exists() else None,
+                events=self._capture_dir / f"events_{idx:04d}.jsonl",
+                manifest=self._capture_dir / f"chunk_{idx:04d}_manifest.json",
+            )
+        return None
+
     def _process_chunk(self, msg: dict) -> None:
         if self._auto_delete and not self._upload_enabled:
             raise RuntimeError(
@@ -475,38 +694,20 @@ class ChunkProcessor:
             if self._stop_event.is_set():
                 return
 
-            # 2. Transcribe audio
-            self._set_status("Transcribing audio...")
-            transcript_path = self._transcribe(idx)
-            if self._stop_event.is_set():
+            # 2-4. Destination-agnostic stages (transcribe → export events →
+            # manifest), delegated to the U5 ``PipelineStageRunner``. The
+            # runner owns ordering + ledger idempotency (skip-if-STAGED);
+            # this caller injects the concrete steps so the cloud-window-
+            # filtered ``_export_events`` (and its inline
+            # ``build_cloud_window_filter`` — the privacy posture the static
+            # guard audits) stays exactly where it is. The runner's own code
+            # carries no cloud knowledge (R4).
+            artifacts = self._run_agnostic_stages(idx, start_ts, end_ts)
+            if artifacts is None:
+                # _run_agnostic_stages returns None only on a _stop_event
+                # abort mid-stage — leave the eagerly-set PENDING entry.
                 return
-
-            # 3. Flush writer buffers → export events from DB
-            self._set_status("Flushing buffers...")
-            self._trigger_flush()
-            if self._stop_event.is_set():
-                return
-            self._set_status("Exporting events...")
-            self._export_events(idx, start_ts, end_ts)
-            if self._stop_event.is_set():
-                return
-
-            # 4. Generate task manifest (with blocked intervals if available)
-            self._set_status("Generating manifest...")
-            blocked_intervals = None
-            if self._screen_filter is not None and hasattr(self._screen_filter, 'get_blocked_intervals'):
-                try:
-                    blocked_intervals = self._screen_filter.get_blocked_intervals(start_ts, end_ts) or None
-                except Exception:
-                    logger.warning(f"Failed to get blocked_intervals for chunk {idx}", exc_info=True)
-            try:
-                self._generate_manifest(idx, start_ts, end_ts, blocked_intervals=blocked_intervals)
-            except Exception:
-                logger.exception(f"Chunk {idx}: manifest generation failed")
-                # Remove any partially-written manifest so a later retry
-                # (or screencap upload) doesn't ship a truncated file.
-                (self._capture_dir / f"chunk_{idx:04d}_manifest.json").unlink(missing_ok=True)
-                raise
+            transcript_path = artifacts.transcript
 
             # 5. Scrub text surfaces + mask screenshots when user opted in.
             if self._scrub_enabled and self._pipeline is not None:
@@ -548,6 +749,18 @@ class ChunkProcessor:
                 # This is the survivorship-bias fix — force-stop early
                 # return now leaves a non-missing entry that the
                 # EMITTED-only gate explicitly rejects.
+
+                # U7: mirror the settled terminal status onto the on-disk U1
+                # ledger so the terminal stage (a SEPARATE process) can
+                # reconstruct correct upload state after a crash. The ledger is
+                # the cross-process SOURCE OF TRUTH; ``_chunk_results`` remains
+                # the in-process cache the live gating reads. Only settled
+                # statuses are mirrored — a chunk left PENDING (force-stop)
+                # stays PENDING in the ledger too (the closed-set gate rejects
+                # it identically on disk and in RAM).
+                settled = self._chunk_results.get(idx)
+                if settled is not None and settled != ChunkStatus.PENDING:
+                    self._mirror_status_to_ledger(idx, settled)
 
         # 7. Delete old chunks (keep 2 most recent). Only EMITTED chunks
         # are safe to delete locally — NETWORK_SKIPPED and
@@ -939,18 +1152,23 @@ def upload_chunk_files(
     from screencap.upload import (
         FileInfo,
         _content_type,
+        assert_uploadable,
         request_signed_urls,
     )
 
     file_infos = []
     for f in files:
         p = Path(f["path"])
-        file_infos.append(FileInfo(
+        # Defense-in-depth (R8): run the live chunk seam through the same hard
+        # gate the single upload seam uses, so a raw local-only artifact
+        # (recording.db &c.) reaching this enqueue fails loud instead of
+        # shipping silently. No-op for the chunk files this path actually sends.
+        file_infos.append(assert_uploadable(FileInfo(
             name=f["name"],
             path=p,
             content_type=_content_type(p),
             size=p.stat().st_size,
-        ))
+        )))
 
     if not file_infos:
         return True
@@ -1021,19 +1239,33 @@ def _upload_single(fi, signed_url: str) -> None:
 def checkpoint_and_upload_db(
     capture_dir: Path, recording_name: str, *, cloud_intent: bool = False,
 ) -> bool:
-    """WAL checkpoint recording.db then upload it.
+    """WAL-checkpoint ``recording.db``. Never uploads it — it is local-only (R8).
 
-    For cloud_intent=True, skips upload — raw DB contains unscrubbed PII.
-    The DB stays local for post-hoc scrubbed upload via ``screencap upload``.
+    U2 retired the upload of the raw DB. ``recording.db`` is the local-only
+    artifact by rule: it carries unscrubbed PII *and* (per U1) the
+    ``pipeline_chunk_state`` ledger, so it must never leave the machine for ANY
+    destination. The R8 exclusion now lives at the single upload seam
+    (``upload.list_recording_files`` / ``upload.assert_uploadable``), retiring the
+    old ``if cloud_intent: return True`` structural skip that was one of three
+    scattered enforcement sites.
+
+    The WAL checkpoint itself is still performed: ``finalize_uploads`` (the sole
+    caller) and other code rely on a clean, checkpointed ``recording.db`` on disk
+    — only the *upload* of the DB is removed. ``recording_name`` is kept in the
+    signature for call-site stability (and the not-yet-rewritten U7 terminal
+    stage); it is unused now that nothing is uploaded.
+
+    Returns True (the checkpoint is best-effort and never blocks finalize); a
+    missing DB (legacy/migrated recording) is a clean no-op, not an error.
     """
-    if cloud_intent:
-        logger.info("Skipping recording.db upload for cloud-intent recording (unscrubbed)")
-        return True
     db_path = capture_dir / "recording.db"
     if not db_path.exists():
-        return False
+        # Legacy / migrated recording with no recording.db — nothing to
+        # checkpoint, and there is by definition no raw DB to keep local.
+        return True
 
-    # Checkpoint — fold WAL into main DB
+    # Checkpoint — fold WAL into main DB so the on-disk DB is clean for any
+    # local consumer (review, catalog, post-hoc scrubbed-copy upload).
     try:
         with open_recording_db(db_path, read_only=False) as conn:
             result = conn.execute("PRAGMA wal_checkpoint(TRUNCATE)").fetchone()
@@ -1042,27 +1274,12 @@ def checkpoint_and_upload_db(
     except Exception as e:
         logger.warning(f"WAL checkpoint failed: {e}")
 
-    # Upload recording.db
-    from screencap.upload import FileInfo, _content_type, request_signed_urls
-
-    fi = FileInfo(
-        name="recording.db",
-        path=db_path,
-        content_type=_content_type(db_path),
-        size=db_path.stat().st_size,
-    )
-    try:
-        urls, _ = request_signed_urls(recording_name, [fi])
-        if "recording.db" not in urls:
-            logger.error("Server returned no URL for recording.db")
-            return False
-        url = urls["recording.db"]
-        if url:
-            _upload_single(fi, url)
-        return True
-    except Exception as e:
-        logger.error(f"Failed to upload recording.db: {e}")
-        return False
+    # The raw recording.db is NEVER uploaded (R8) — it stays local for the
+    # post-hoc scrubbed-copy upload path (`screencap upload` scrubs a sibling
+    # `<name>-scrubbed` dir). Structured cloud data derives only from scrubbed
+    # exports (events JSONL, transcript, manifest), never the raw DB.
+    logger.debug("recording.db checkpointed and kept local-only (never uploaded; R8)")
+    return True
 
 
 def _build_sentinel_data(

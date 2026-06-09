@@ -122,13 +122,18 @@ def _assert_identity_files(capture_dir, *, expected_name, expected_destination,
 
     intent_raw = (capture_dir / ".recording_intent").read_text()
     intent = json.loads(intent_raw)
-    assert intent["version"] == 1
+    # Bumped to 2 when U3 added the frozen resolved-policy fields.
+    assert intent["version"] == 2
     assert intent["destination"] == expected_destination
     assert intent["privacy_mode"] == expected_privacy_mode
     assert intent["show_on_website"] is expected_show_on_website
     assert intent["source"] == expected_source
     # ``created_at`` is timestamp-laden; assert presence + non-empty only.
     assert intent.get("created_at")
+    # U3: the resolved retention policy is frozen into per-recording state.
+    # With no retention config the default is keep_forever / no params.
+    assert intent["retention_policy"] == "keep_forever"
+    assert intent["retention_params"] == {}
 
 
 def test_inherit_lock_write_identity_writes_recording_id_and_intent(tmp_path):

@@ -96,7 +96,138 @@ def test_list_recording_files_with_subdir(tmp_path):
     # Forward slashes (as_posix) regardless of platform
     assert "screenshots/0.png" in names
     assert "screenshots/1.png" in names
-    assert "recording.db" in names
+    # U2: recording.db is the raw, unscrubbed-PII local-only artifact (R8). The
+    # unified pipeline uploads from the source dir, so this exclusion is the only
+    # thing standing between raw PII and GCS — it must NEVER appear in the set.
+    # (Inverted from the pre-U2 assertion that validated the old unsafe behavior.)
+    assert "recording.db" not in names
+
+
+# ---------------------------------------------------------------------------
+# U2: recording.db local-only invariant at the single upload seam (R8 / AE11)
+# ---------------------------------------------------------------------------
+
+
+def test_list_recording_files_never_includes_recording_db(tmp_path):
+    """Covers AE11: a source dir with recording.db + chunks → the uploaded set
+    never contains recording.db (the raw, unscrubbed-PII local-only artifact)."""
+    rec = tmp_path / "my-rec"
+    rec.mkdir()
+    (rec / "recording.db").write_bytes(b"x" * 100)
+    (rec / "chunk_0000.mp4").write_bytes(b"x" * 500)
+    (rec / "events_0000.jsonl").write_text("scrubbed")
+
+    names = [f.name for f in list_recording_files(rec)]
+    assert "recording.db" not in names
+    # legitimate artifacts still upload
+    assert "chunk_0000.mp4" in names
+    assert "events_0000.jsonl" in names
+
+
+def test_list_recording_files_excludes_all_raw_db_artifacts_incl_nested(tmp_path):
+    """recording.db, its WAL/SHM sidecars, and *.scrub_failed are all absent
+    from the uploaded set — including when nested in a subdirectory (the
+    function rglobs subdirs, so a nested recording.db must also be excluded,
+    matched by full relative path, not just a top-level basename)."""
+    rec = tmp_path / "my-rec"
+    rec.mkdir()
+    (rec / "recording.db").write_bytes(b"x" * 100)
+    (rec / "recording.db-wal").write_bytes(b"x" * 100)
+    (rec / "recording.db-shm").write_bytes(b"x" * 100)
+    (rec / "events_0000.jsonl.scrub_failed").write_text("RAW")
+    # Same raw artifacts nested under a subdir — must also be excluded.
+    sub = rec / "nested"
+    sub.mkdir()
+    (sub / "recording.db").write_bytes(b"x" * 100)
+    (sub / "recording.db-wal").write_bytes(b"x" * 100)
+    (sub / "recording.db-shm").write_bytes(b"x" * 100)
+    (sub / "frame.jsonl.scrub_failed").write_text("RAW")
+    # A legitimate artifact so the set is not trivially empty.
+    (rec / "chunk_0000.mp4").write_bytes(b"x" * 500)
+
+    names = [f.name for f in list_recording_files(rec)]
+    assert "chunk_0000.mp4" in names
+    assert "recording.db" not in names
+    assert "nested/recording.db" not in names
+    assert not any(n.endswith(".db-wal") for n in names)
+    assert not any(n.endswith(".db-shm") for n in names)
+    assert not any(n.endswith(".scrub_failed") for n in names)
+
+
+def test_list_recording_files_only_db_no_chunks_is_empty(tmp_path):
+    """A recording with only recording.db and no chunks → empty uploaded set,
+    no error (the raw DB is the one excluded artifact)."""
+    rec = tmp_path / "my-rec"
+    rec.mkdir()
+    conn = sqlite3.connect(rec / "recording.db")
+    conn.execute("CREATE TABLE recording (id INTEGER)")
+    conn.commit()
+    conn.close()
+
+    files = list_recording_files(rec)
+    assert files == []
+
+
+def test_enqueue_recording_db_is_rejected_not_silently_dropped(tmp_path):
+    """An explicit attempt to enqueue recording.db (or a sidecar / scrub_failed
+    artifact) for upload is REJECTED with a raise — never silently dropped, so a
+    caller that bypasses list_recording_files still hits the hard safety gate."""
+    from screencap.upload import FileInfo, assert_uploadable, _content_type
+
+    db = tmp_path / "recording.db"
+    db.write_bytes(b"x" * 10)
+    fi = FileInfo("recording.db", db, _content_type(db), 10)
+    with pytest.raises(ValueError, match="recording.db"):
+        assert_uploadable(fi)
+
+    # Nested by full relative path is also rejected.
+    nested = FileInfo("nested/recording.db", db, _content_type(db), 10)
+    with pytest.raises(ValueError, match="recording.db"):
+        assert_uploadable(nested)
+
+    # Sidecars + fail-closed scrub artifacts are rejected too.
+    for name in ("recording.db-wal", "recording.db-shm", "events.jsonl.scrub_failed"):
+        with pytest.raises(ValueError):
+            assert_uploadable(FileInfo(name, db, _content_type(db), 10))
+
+    # A legitimate artifact passes through untouched.
+    ok = FileInfo("chunk_0000.mp4", db, "video/mp4", 10)
+    assert assert_uploadable(ok) is ok
+
+
+def test_list_recording_files_legacy_no_db_does_not_crash(tmp_path):
+    """Legacy/migrated recordings have no recording.db; the WAL-checkpoint side
+    effect must not crash the upload, and legitimate files still upload."""
+    rec = tmp_path / "my-rec"
+    rec.mkdir()
+    # No recording.db at all.
+    (rec / "video.mp4").write_bytes(b"x" * 100)
+    (rec / "events.jsonl").write_text("scrubbed")
+
+    files = list_recording_files(rec)
+    names = [f.name for f in files]
+    assert "video.mp4" in names
+    assert "events.jsonl" in names
+
+
+def test_list_recording_files_scrubbed_exports_still_upload(tmp_path):
+    """Regression: the DB exclusion must not block the legitimate scrubbed
+    structured exports (events JSONL, transcript, manifest) that ARE the cloud
+    payload — structured cloud data derives only from these."""
+    rec = tmp_path / "my-rec"
+    rec.mkdir()
+    (rec / "recording.db").write_bytes(b"x" * 100)
+    (rec / "events_0000.jsonl").write_text("scrubbed events")
+    (rec / "transcript_0000.txt").write_text("scrubbed transcript")
+    (rec / "transcript_0000.json").write_text("{}")
+    (rec / "chunk_0000_manifest.json").write_text("{}")
+
+    names = [f.name for f in list_recording_files(rec)]
+    assert "recording.db" not in names
+    assert "events_0000.jsonl" in names
+    assert "transcript_0000.txt" in names
+    assert "transcript_0000.json" in names
+    assert "chunk_0000_manifest.json" in names
 
 
 def test_list_recording_files_empty(tmp_path):

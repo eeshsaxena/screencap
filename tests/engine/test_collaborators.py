@@ -199,6 +199,125 @@ def test_build_recorder_privacy_filter_skips_when_window_data_disabled(tmp_path)
 
 
 # ---------------------------------------------------------------------------
+# U4b — capture-time video blocking is gated behind the masked-video flag
+# ---------------------------------------------------------------------------
+
+
+def test_build_recorder_privacy_filter_blocks_video_by_default(tmp_path):
+    """Flag OFF (default): the screen_filter blocks video at capture.
+
+    This is the byte-for-byte-today proof: with
+    ``get_masked_video_upload_enabled()`` returning its default False, the
+    constructed filter has ``block_video=True`` and drops video frames for a
+    sensitive app exactly as it does today. A cloud-intent recording is used
+    because that is the path the prior capture-time blocking guarded.
+    """
+    from screencap.engine.collaborators import RecordingCollaborators
+    from screencap.engine.config import RecordingConfig
+    from screencap.engine.screen_recorder import (
+        IpcChannels,
+        LegacyOptions,
+        RecordingRequest,
+    )
+    from screencap.privacy.policy import PrivacyConfig, PrivacyMode
+
+    request = RecordingRequest(
+        name="cloud", config=RecordingConfig(), cloud_intent=True,
+    )
+    helper = RecordingCollaborators(
+        request=request, legacy=LegacyOptions(), channels=IpcChannels.create(),
+    )
+
+    capture_dir = tmp_path / "rec"
+    capture_dir.mkdir()
+    base_cfg = PrivacyConfig(
+        mode=PrivacyMode.PUBLIC,
+        exclude_apps=frozenset({"com.1password.1password"}),
+    )
+    with (
+        mock.patch(
+            "screencap.config.get_privacy_config", return_value=base_cfg,
+        ),
+        # Default (False) — do not rely on ambient config/env.
+        mock.patch(
+            "screencap.config.get_masked_video_upload_enabled",
+            return_value=False,
+        ),
+    ):
+        screen_filter, _, _ = helper.build_recorder_privacy_filter(
+            capture_dir=capture_dir, capture_window_data=True,
+        )
+
+    assert screen_filter is not None
+    # An excluded app must drop video frames at capture (today's behavior).
+    screen_filter.on_window_event({
+        "app_bundle_id": "com.1password.1password", "title": "1Password",
+    })
+    disp = screen_filter.get_capture_disposition()
+    assert disp.video_allowed is False
+    assert disp.screen_allowed is False
+
+
+def test_build_recorder_privacy_filter_rich_video_when_flag_on(tmp_path):
+    """Flag ON: the screen_filter no longer blocks video (rich capture).
+
+    With ``get_masked_video_upload_enabled()`` True, capture-time VIDEO
+    blocking is disabled — even a sensitive app's video frames are captured
+    (the rich input U6 masks post-hoc) — while PUBLIC-forcing and the
+    filter's screenshot/keystroke gating remain active.
+    """
+    from screencap.engine.collaborators import RecordingCollaborators
+    from screencap.engine.config import RecordingConfig
+    from screencap.engine.screen_recorder import (
+        IpcChannels,
+        LegacyOptions,
+        RecordingRequest,
+    )
+    from screencap.privacy.policy import PrivacyConfig, PrivacyMode
+
+    request = RecordingRequest(
+        name="cloud", config=RecordingConfig(), cloud_intent=True,
+    )
+    helper = RecordingCollaborators(
+        request=request, legacy=LegacyOptions(), channels=IpcChannels.create(),
+    )
+
+    capture_dir = tmp_path / "rec"
+    capture_dir.mkdir()
+    base_cfg = PrivacyConfig(
+        mode=PrivacyMode.PUBLIC,
+        exclude_apps=frozenset({"com.1password.1password"}),
+    )
+    with (
+        mock.patch(
+            "screencap.config.get_privacy_config", return_value=base_cfg,
+        ),
+        mock.patch(
+            "screencap.config.get_masked_video_upload_enabled",
+            return_value=True,
+        ),
+    ):
+        screen_filter, privacy_config, _ = helper.build_recorder_privacy_filter(
+            capture_dir=capture_dir, capture_window_data=True,
+        )
+
+    assert screen_filter is not None
+    # PUBLIC-forcing for cloud is UNCHANGED — events/screenshot scrubbing is
+    # a separate mechanism U6 does not replace.
+    assert privacy_config.mode is PrivacyMode.PUBLIC
+
+    screen_filter.on_window_event({
+        "app_bundle_id": "com.1password.1password", "title": "1Password",
+    })
+    disp = screen_filter.get_capture_disposition()
+    # Video captured rich (flag ON) ...
+    assert disp.video_allowed is True
+    # ... but screenshot gating + keystroke nulling still fire.
+    assert disp.screen_allowed is False
+    assert disp.keystrokes_allowed is False
+
+
+# ---------------------------------------------------------------------------
 # Cycle 6 — start() builds collaborators with the shared flush_lock
 # ---------------------------------------------------------------------------
 
@@ -604,6 +723,11 @@ class _StubChunkProcessor:
     def reconcile_against_gcs(self) -> int:
         return 0
 
+    def freeze_expected_chunks(self, count: int) -> None:
+        # finalize freezes the ledger's chunks_expected at the closed set;
+        # the stub records it so tests can assert the call without a real DB.
+        self.frozen_expected = count
+
 
 def test_finalize_uploads_partial_path_does_not_nameerror(tmp_path):
     """Short recording with no chunk files must finalize without NameError.
@@ -654,3 +778,43 @@ def test_finalize_uploads_partial_path_does_not_nameerror(tmp_path):
     payload = json.loads(followup_path.read_text())
     assert payload["n_uploaded"] == 0
     assert payload["n_total"] == 0
+
+
+def test_finalize_uploads_freezes_chunks_expected_at_closed_set(tmp_path):
+    """SCR-123: finalize MUST freeze the ledger's chunks_expected at the closed
+    set, otherwise the AE8 promotion guard + finalize gate are inert in
+    production (chunks_expected stays None — nothing else freezes it). Pins the
+    wiring: finalize calls cp.freeze_expected_chunks with the manifest count.
+    """
+    from screencap.engine.collaborators import RecordingCollaborators
+    from screencap.engine.config import RecordingConfig
+    from screencap.engine.screen_recorder import (
+        IpcChannels,
+        LegacyOptions,
+        RecordingRequest,
+    )
+
+    capture_dir = tmp_path / "rec"
+    capture_dir.mkdir()
+    # A closed set of 3 chunks (the manifest count is the frozen "expected").
+    for i in range(3):
+        (capture_dir / f"chunk_{i:04d}_manifest.json").write_text("{}")
+
+    request = RecordingRequest(name="rec3", config=RecordingConfig())
+    helper = RecordingCollaborators(
+        request=request,
+        legacy=LegacyOptions(live_upload=True),
+        channels=IpcChannels.create(),
+    )
+    helper._chunk_processor = _StubChunkProcessor(all_uploaded=True, summary=(3, 3))
+
+    helper.finalize_uploads(
+        capture_dir=capture_dir,
+        stop_reason="graceful",
+        recording_name="rec3",
+    )
+
+    assert getattr(helper._chunk_processor, "frozen_expected", None) == 3, (
+        "finalize must freeze chunks_expected to the closed-set manifest count "
+        "(3) — without it the AE8 guard never fires"
+    )

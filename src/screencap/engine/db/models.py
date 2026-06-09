@@ -43,6 +43,15 @@ class Recording(Base):
     video_start_time = sa.Column(ForceFloat)
     config = sa.Column(sa.JSON)
 
+    # U1 unified-pipeline ledger: the number of chunks this recording is
+    # EXPECTED to produce, frozen once at the final rotation. The terminal
+    # finalize/sentinel gate keys off THIS frozen count, never a live glob
+    # of files on disk — eviction shrinks the on-disk file set but must not
+    # shrink the completeness target. NULL on recordings that pre-date U1
+    # (and on recordings whose final rotation hasn't happened yet); callers
+    # treat NULL as "not yet frozen". See ``screencap.pipeline_state``.
+    chunks_expected = sa.Column(sa.Integer, nullable=True)
+
     original_recording_id = sa.Column(sa.ForeignKey("recording.id"))
     original_recording = sa.orm.relationship(
         "Recording",
@@ -93,6 +102,90 @@ class Recording(Base):
         order_by="NetworkHealth.timestamp_ns",
         cascade="all, delete-orphan",
     )
+
+
+class PipelineChunkState(Base):
+    """U1 durable per-chunk state ledger (one row per EXPECTED chunk).
+
+    On-disk replacement for ``ChunkProcessor._chunk_results`` — the
+    in-memory ``dict[int, ChunkStatus]`` that the four prior incidents in
+    ``docs/solutions/runtime-errors/chunk-upload-sentinel-gating-and-data-loss.md``
+    showed could not be trusted across a crash. The ledger re-establishes
+    those five prevention rules ON DISK so the terminal stage can
+    reconstruct correct state after an interruption.
+
+    **Closed set, never appended on completion.** One row per expected
+    chunk index is seeded ``PENDING`` at chunk rotation, BEFORE any
+    processing. A query over this closed set cannot exhibit survivorship
+    bias — a chunk that rotated but never finished shows up as ``PENDING``,
+    not as a missing entry (Bug 2 fix).
+
+    **Per-concern tri-state columns.** ``lifecycle`` is the coarse state
+    machine; the four ``*_state`` columns track each concern independently
+    so "disabled" can never be conflated with "succeeded" (Bug 4 fix):
+
+      - ``stages_state``  -- destination-agnostic stages (transcribe /
+        export / manifest): PENDING | DONE | FAILED.
+      - ``scrub_state``   -- cloud-bound privacy transform:
+        PENDING | DONE | SKIPPED | FAILED.
+      - ``upload_state``  -- UPLOADED | SKIPPED | FAILED | PENDING. Only
+        ``UPLOADED`` permits eviction; ``SKIPPED`` is "uploads
+        intentionally off" and is NEVER eviction-eligible.
+      - ``evict_state``   -- NONE | EVICT_PENDING | EVICTED. The explicit
+        ``EVICT_PENDING`` lets an interrupted eviction resume: a crash
+        before it is committed leaves the file present + ``UPLOADED``
+        (safe); a crash after resumes from ``EVICT_PENDING``.
+
+    Lifecycle: PENDING -> STAGED -> (SCRUBBED -> UPLOADED | LOCAL_DONE |
+    SKIPPED); UPLOADED -> (eviction) -> EVICTED. FAILED is reachable from
+    STAGED/SCRUBBED and is never evicted / never counted complete.
+
+    Cross-process: this table lives in the local-only ``recording.db``
+    (R8 — never uploaded). The engine writer seeds ``PENDING`` rows during
+    recording (alongside screenshots/events); a separate terminal-stage
+    process advances states. Writes go through
+    ``screencap.pipeline_state.PipelineLedger`` with ``busy_timeout=10000``
+    and one ``BEGIN IMMEDIATE`` transaction per state change, mirroring
+    ``privacy/scrub_worker.py`` so a concurrent WAL checkpoint cannot tear
+    a transition.
+    """
+
+    __tablename__ = "pipeline_chunk_state"
+    __table_args__ = (
+        sa.UniqueConstraint(
+            "recording_id", "chunk_index",
+            name="recording_chunk",
+        ),
+        sa.Index(
+            "ix_pipeline_chunk_state_recording_chunk",
+            "recording_id", "chunk_index",
+        ),
+    )
+
+    id = sa.Column(sa.Integer, primary_key=True)
+    recording_id = sa.Column(
+        sa.ForeignKey("recording.id", ondelete="CASCADE"),
+        nullable=False,
+    )
+    chunk_index = sa.Column(sa.Integer, nullable=False)
+
+    # Coarse lifecycle state (see class docstring state diagram). Plain
+    # TEXT mirroring the NetworkEvent.kind / NetworkHealth.event pattern;
+    # the application layer (``pipeline_state``) is the single source of
+    # truth for allowed values and legal transitions.
+    lifecycle = sa.Column(sa.Text, nullable=False, default="pending")
+
+    # Per-concern tri-state columns — each settled independently so the
+    # gate cannot mistake "disabled" for "succeeded".
+    stages_state = sa.Column(sa.Text, nullable=False, default="pending")
+    scrub_state = sa.Column(sa.Text, nullable=False, default="pending")
+    upload_state = sa.Column(sa.Text, nullable=False, default="pending")
+    evict_state = sa.Column(sa.Text, nullable=False, default="none")
+
+    # Optional free-text diagnostic for the last FAILED transition
+    # (exception type/message). Local-only; never uploaded.
+    detail = sa.Column(sa.Text, nullable=True)
+    updated_at = sa.Column(ForceFloat, nullable=True)
 
 
 class ActionEvent(Base):
@@ -290,6 +383,57 @@ class WindowGeometry(Base):
     recording_timestamp = sa.Column(ForceFloat)
     screenshot_timestamp = sa.Column(ForceFloat, index=True)
     window_list_json = sa.Column(sa.Text)
+
+
+class WindowGeometryCaptureFailure(Base):
+    """U4a durable, timestamped marker that a ``window_geometry`` insert failed.
+
+    The capture path samples ``window_geometry`` at roughly screenshot
+    cadence (~1 fps while typing, faster on drag/scroll), and the insert
+    in ``recorder.write_screen_event`` is best-effort. Video frames are
+    continuous, so a span between two geometry samples — or a span where
+    the insert silently failed — has NO recorded window bounds. The
+    post-hoc video masker (U6) must distinguish "geometry proves no
+    sensitive window" (case a, faithful unmasked copy) from "geometry
+    capture failed / was sparse" (case b, fail closed): a silent gap is
+    otherwise indistinguishable from "no sensitive window," which would
+    let an effectively-unmasked cloud video upload look fine.
+
+    This table is that durable, crash-surviving signal. One row is written
+    (best-effort, but LOUDLY — ``logger.warning``) each time an
+    ``insert_window_geometry`` call raises, keyed by ``recording_id`` +
+    the failed screenshot's ``screenshot_timestamp`` (== ``event.timestamp``).
+    U6 queries it per chunk ``[start_ts, end_ts]`` span: any overlapping row
+    means coverage for that span is unprovable → case (b), fail closed.
+
+    Local-only by rule (R8 / U2): it lives in ``recording.db``, which is
+    never uploaded, so the marker never leaves the machine.
+
+    Writes are unbuffered + immediate-commit (mirroring
+    ``insert_network_health`` / ``insert_network_event_meta``) so the marker
+    is durable before any subsequent crash — it must NOT ride the buffered
+    ``window_geometries`` insert path, whose whole point is throughput.
+    """
+
+    __tablename__ = "window_geometry_capture_failure"
+    __table_args__ = (
+        sa.Index(
+            "ix_window_geometry_capture_failure_recording_ts",
+            "recording_id", "screenshot_timestamp",
+        ),
+    )
+
+    id = sa.Column(sa.Integer, primary_key=True)
+    recording_id = sa.Column(
+        sa.ForeignKey("recording.id", ondelete="CASCADE"),
+        nullable=False,
+    )
+    recording_timestamp = sa.Column(ForceFloat)
+    # The timestamp of the screenshot whose geometry insert failed
+    # (== the screen ``event.timestamp``). U6 gates per-chunk on this.
+    screenshot_timestamp = sa.Column(ForceFloat, index=True)
+    # Optional free-text diagnostic (exception type/message). Local-only.
+    detail = sa.Column(sa.Text, nullable=True)
 
 
 class MemoryStat(Base):

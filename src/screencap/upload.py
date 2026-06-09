@@ -140,23 +140,84 @@ def _wal_checkpoint(recording_dir: Path) -> None:
         pass  # best-effort — upload proceeds even if checkpoint fails
 
 
-# Files that should never be uploaded: SQLite WAL artifacts, and fail-closed
-# scrub artifacts (`*.scrub_failed`). The scrubber renames a file it could not
-# redact to `<name>.scrub_failed` (retaining raw content) and documents it as
-# "ineligible for upload"; the review path already excludes them, so the upload
-# sink must too — otherwise raw, unredacted bytes ship while review hid them.
-_UPLOAD_EXCLUDE = {".db-shm", ".db-wal", ".scrub_failed"}
-
+# ---------------------------------------------------------------------------
+# R8 / U2: the single upload-seam exclusion rule.
+#
+# The unified pipeline uploads from the SOURCE dir, where the raw `recording.db`
+# (unscrubbed PII — and, per U1, the home of the local-only `pipeline_chunk_state`
+# ledger) is present. Previously the raw DB stayed out of the cloud only by
+# *architecture* (the live path's `checkpoint_and_upload_db` skip + the post-hoc
+# path uploading a separate scrubbed sibling dir). The unified pipeline removes
+# both structural guards, so THIS exclusion is the only thing standing between
+# raw PII and GCS. It is a hard safety gate, enforced two ways:
+#
+#   1. `list_recording_files` never enumerates a raw artifact (matched by FULL
+#      relative path, since it rglobs subdirs — a nested `recording.db` is
+#      excluded too, not just a top-level basename).
+#   2. `assert_uploadable` REJECTS (raises) any explicit attempt to enqueue a
+#      raw artifact, so a caller bypassing `list_recording_files` still hits the
+#      gate — a raw artifact is never *silently* dropped.
+#
+# Denylist (not allowlist), deliberately: the eligible-artifact set is open-ended
+# (chunk media, audio, scrubbed events/transcript/manifest, screenshots, the
+# completion sentinel, session_summary/profiling/system_metrics, the `_unlisted`
+# marker, `viewer.html`, legacy non-chunked `video.mp4`/`events.jsonl`, and future
+# masked-chunk copies). An incomplete allowlist would silently stop legitimate
+# artifacts from uploading — the one failure mode the task forbids. The denylist
+# is narrow and exhaustive over RAW artifacts, and adding a new raw artifact is a
+# one-line change here. Raw artifacts are:
+#   - `recording.db`               — unscrubbed PII + local-only ledger (R8)
+#   - `recording.db-wal` / `-shm`  — SQLite sidecars of the same DB
+#   - `*.scrub_failed`             — fail-closed scrub artifacts retaining raw,
+#                                    unredacted content (review already hides
+#                                    them, so upload must too)
+#
 # Review-only artifacts (`.video_review.mp4`) are dot-prefixed, so the dotfile
-# filter below already skips them — no by-name exclusion needed.
+# filter in `list_recording_files` already skips them — no entry needed here.
+_RAW_DB_NAMES = frozenset({"recording.db", "recording.db-wal", "recording.db-shm"})
+_RAW_SUFFIXES = (".scrub_failed",)
+
+
+def _is_raw_artifact(rel_name: str) -> bool:
+    """True if *rel_name* (a FULL relative path, forward-slashed) is a raw,
+    never-upload artifact under the R8 local-only rule.
+
+    Matched by basename of the full relative path, so a nested
+    `nested/recording.db` is excluded just like a top-level one.
+    """
+    base = rel_name.rsplit("/", 1)[-1]
+    if base in _RAW_DB_NAMES:
+        return True
+    return any(base.endswith(suffix) for suffix in _RAW_SUFFIXES)
+
+
+def assert_uploadable(file_info: FileInfo) -> FileInfo:
+    """Hard safety gate: raise if *file_info* names a raw, never-upload artifact.
+
+    The R8 invariant ("the raw `recording.db` with unscrubbed PII is local-only
+    and is NEVER uploaded") must FAIL LOUDLY when violated, not silently drop the
+    file — a silent drop hides a programming error that could later regress into
+    an actual leak. Returns *file_info* unchanged when it is uploadable, so call
+    sites can wrap an enqueue inline.
+    """
+    if _is_raw_artifact(file_info.name):
+        raise ValueError(
+            f"refusing to upload raw local-only artifact {file_info.name!r}: "
+            "recording.db (and its WAL/SHM sidecars and *.scrub_failed files) "
+            "contain unscrubbed content and must never leave the machine (R8)."
+        )
+    return file_info
 
 
 def list_recording_files(recording_dir: Path) -> list[FileInfo]:
     """Return files in a recording dir, sorted largest-first.
 
-    Runs a WAL checkpoint on recording.db first to ensure a clean DB,
-    and excludes SQLite WAL artifacts (.db-shm, .db-wal) and fail-closed
-    scrub artifacts (*.scrub_failed), which retain raw, unredacted content.
+    Runs a WAL checkpoint on recording.db first to ensure a clean DB
+    (a no-op when the DB is absent, e.g. legacy/migrated recordings — the
+    checkpoint must not crash the upload), then enumerates every file EXCEPT
+    the raw, never-upload artifacts defined by the R8 exclusion rule
+    (`recording.db` + its `-wal`/`-shm` sidecars + `*.scrub_failed`), matched
+    by full relative path so nested copies are excluded too.
     """
     _wal_checkpoint(recording_dir)
 
@@ -164,7 +225,7 @@ def list_recording_files(recording_dir: Path) -> list[FileInfo]:
     for p in sorted(recording_dir.iterdir()):
         if p.is_symlink() or not p.is_file() or p.name.startswith("."):
             continue
-        if any(p.name.endswith(ext) for ext in _UPLOAD_EXCLUDE):
+        if _is_raw_artifact(p.name):
             continue
         try:
             size = p.stat().st_size
@@ -180,13 +241,15 @@ def list_recording_files(recording_dir: Path) -> list[FileInfo]:
     for p in sorted(recording_dir.rglob("*")):
         if p.is_symlink() or not p.is_file() or p.parent == recording_dir or p.name.startswith("."):
             continue
-        if any(p.name.endswith(ext) for ext in _UPLOAD_EXCLUDE):
+        rel = p.relative_to(recording_dir)
+        # Match the exclusion against the FULL relative path so a nested
+        # `recording.db` / sidecar / `*.scrub_failed` is excluded too.
+        if _is_raw_artifact(rel.as_posix()):
             continue
         try:
             size = p.stat().st_size
         except OSError:
             continue
-        rel = p.relative_to(recording_dir)
         files.append(FileInfo(
             name=rel.as_posix(),  # forward slashes on all platforms
             path=p,
@@ -307,6 +370,15 @@ def upload_recording(
 
     if not files:
         raise FileNotFoundError(f"No files found in {recording_name}")
+
+    # R8 defense-in-depth: re-assert at the upload seam that no raw local-only
+    # artifact (recording.db + sidecars, *.scrub_failed) is in the set. The
+    # list_recording_files denylist already excludes them, but routing the set
+    # through assert_uploadable makes the "enforced two ways" guarantee real —
+    # a future enqueue path that bypasses list_recording_files still hits this
+    # gate, and it fails loud rather than silently shipping raw PII.
+    for f in files:
+        assert_uploadable(f)
 
     total_size = sum(f.size for f in files)
     console.print(

@@ -2719,18 +2719,52 @@ def upload(names, all_recordings, dry_run, force, jobs, no_delete):
                 except Exception:
                     pass
 
-        # Hold a per-recording scrub lock across BOTH the scrubbed-dir decision
-        # and the upload's file enumeration, so a concurrent re-scrub (a second
-        # review window, or --force in another process) can't rmtree the
-        # <name>-scrubbed dir between the reuse verdict and the upload read and
-        # ship a half-rebuilt copy. The lock is released by the context manager
-        # on continue/exception/sys.exit. Dry-run does no scrub → no lock.
+        # U7: acquire the per-recording TERMINAL-STAGE flock FIRST (before the
+        # finer scrub lock and before any reconcile/scrub/upload), so a manual
+        # `screencap upload` is serialized against the live finalize and the
+        # daemon resume scan — two runs can never both reconcile+upload the same
+        # recording (AE12). flock is advisory: this is one of the entry points
+        # that MUST take it. Blocking-with-timeout: if a live finalize holds it,
+        # we wait, then converge over its committed ledger (idempotent). Dry-run
+        # touches nothing, so it skips the lock.
+        #
+        # The inner recording_scrub_lock still guards the scrubbed-dir decision
+        # vs. the upload enumeration against a concurrent re-scrub (a second
+        # review window). The two locks are different files and nest cleanly.
         from screencap.scrubber import recording_scrub_lock
+        from screencap.terminal_stage import terminal_lock
 
+        _terminal_lock = (
+            terminal_lock(d.name) if not dry_run else contextlib.nullcontext()
+        )
         _scrub_lock = (
             recording_scrub_lock(d.name) if not dry_run else contextlib.nullcontext()
         )
-        with _scrub_lock:
+        with _terminal_lock, _scrub_lock:
+            # U9/AE8 — local->cloud promotion hole check, FIRST inside the lock
+            # (reconcile-before-anything). If retention already evicted a chunk
+            # required for a complete upload and that chunk is NOT confirmed in
+            # GCS, refuse with a clear, actionable error rather than uploading a
+            # recording with silent holes (a partial cloud copy). The real GCS
+            # re-stat seam is used (remote_exists=None); a legacy single-file /
+            # no-ledger recording has no closed chunk set, so this is a no-op
+            # for it (it routes through the whole-dir scrub branch below, R14).
+            if not dry_run:
+                try:
+                    from screencap.terminal_stage import (
+                        PromotionRefused,
+                        assert_promotable_to_cloud,
+                    )
+
+                    assert_promotable_to_cloud(d)
+                except PromotionRefused as e:
+                    console.print(
+                        f"[red]Error:[/red] {e}\n"
+                        "Upload skipped — nothing was changed."
+                    )
+                    all_failed += 1
+                    continue
+
             # Always scrub before upload — but reuse the review-prepared
             # scrubbed copy when a completion sentinel + provenance prove it is
             # complete, current, and built the way upload would build it

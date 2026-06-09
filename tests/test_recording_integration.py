@@ -174,10 +174,14 @@ def test_normal_recording_lifecycle(recording_env):
     # A2: .recording_id written with correct name
     assert (capture_dir / ".recording_id").read_text().strip() == "test-rec"
 
-    # A3: .recording_intent written with local destination
+    # A3: .recording_intent written with local destination + frozen policy (U3)
     intent = json.loads((capture_dir / ".recording_intent").read_text())
     assert intent["destination"] == "local"
-    assert intent["version"] == 1
+    assert intent["version"] == 2
+    # U3 freezes the resolved retention policy into the intent at start time;
+    # a local recording defaults to keep_forever (R11 — local behavior
+    # unchanged unless a cap is set).
+    assert intent["retention_policy"] == "keep_forever"
 
     # A6: Signal handlers restored to defaults
     assert signal.getsignal(signal.SIGINT) == signal.default_int_handler

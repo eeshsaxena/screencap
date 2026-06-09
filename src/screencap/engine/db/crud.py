@@ -21,6 +21,7 @@ from screencap.engine.db.models import (
     Screenshot,
     WindowEvent,
     WindowGeometry,
+    WindowGeometryCaptureFailure,
 )
 
 BATCH_SIZE = 1  # default; recorder overrides to 50 for throughput
@@ -167,6 +168,43 @@ def insert_window_geometry(
         "window_list_json": window_list_json,
     }
     _insert(session, data, WindowGeometry, window_geometries)
+
+
+def insert_window_geometry_capture_failure(
+    session: SaSession,
+    recording: Recording,
+    screenshot_timestamp: float,
+    detail: str | None = None,
+) -> None:
+    """Record a durable marker that a window-geometry insert failed (U4a).
+
+    Unbuffered + immediate commit (mirrors ``insert_network_health`` /
+    ``insert_network_event_meta``): this is a rare, failure-only write that
+    MUST be durable before any subsequent crash, so it deliberately does
+    NOT ride the buffered ``insert_window_geometry`` throughput path.
+
+    The marker lets the post-hoc video masker (U6) tell "geometry proves
+    no sensitive window" apart from "geometry capture failed / was sparse"
+    for a chunk's ``[start_ts, end_ts]`` span — without it, a silent gap is
+    indistinguishable from "no sensitive window" and U6 could emit an
+    effectively-unmasked cloud video. Local-only (lives in ``recording.db``,
+    R8 — never uploaded).
+
+    Args:
+        session: The database session.
+        recording: The recording object.
+        screenshot_timestamp: Timestamp of the screenshot whose geometry
+            insert failed (== the screen ``event.timestamp``).
+        detail: Optional free-text diagnostic (exception type/message).
+    """
+    row = WindowGeometryCaptureFailure(
+        recording_id=recording.id,
+        recording_timestamp=recording.timestamp,
+        screenshot_timestamp=screenshot_timestamp,
+        detail=detail,
+    )
+    session.add(row)
+    session.commit()
 
 
 def insert_window_event(

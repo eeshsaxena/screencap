@@ -2268,6 +2268,94 @@ def _rename_scrub_failed(path: Path) -> None:
         logger.warning(f"Failed to rename {path.name} for scrub failure: {e}")
 
 
+# ---------------------------------------------------------------------------
+# U6 — post-hoc video masking integrated into cloud-copy production.
+#
+# GATED behind config.get_masked_video_upload_enabled() (default OFF). The flag
+# check is the SINGLE gate: when OFF, the masker is NOT invoked and the cloud
+# video copy is today's capture-blocked chunk (no scrubber-side masking); when
+# ON, each cloud chunk's video is masked post-hoc via video_mask and the masked
+# copy is materialized in the <name>-scrubbed/ sibling dir, which is NOT the
+# source dir list_recording_files enumerates — so a partial/abandoned masked
+# copy can never be picked up unscrubbed.
+# ---------------------------------------------------------------------------
+
+
+def masked_video_dir(scrubbed_dir: Path) -> Path:
+    """Return the dir that holds masked cloud video copies.
+
+    A subdir of the ``<name>-scrubbed`` dir. The scrubbed dir is a SIBLING of
+    the source recording dir, so it is never walked by
+    ``upload.list_recording_files(source_dir)`` — the source-dir enumeration
+    cannot pick up a masked (or partial) copy unscrubbed. The terminal stage
+    (U7) is the only thing that enumerates the scrubbed dir for upload, and it
+    ships a masked copy only when the chunk is ledger-``SCRUBBED``.
+    """
+    return scrubbed_dir / "masked_video"
+
+
+def mask_video_chunk_for_cloud(
+    chunk_path: Path,
+    db_path: Path,
+    scrubbed_dir: Path,
+    *,
+    chunk_index: int,
+    start_ts: float,
+    end_ts: float,
+    chunk_start_abs: float,
+    pixel_ratio: float = 2.0,
+    classifier: object | None = None,
+    evaluator: object | None = None,
+):
+    """Produce the cloud-bound video copy for one chunk, gated on the flag.
+
+    THE SINGLE GATE is ``config.get_masked_video_upload_enabled()``:
+
+    * **OFF (this milestone's default)** — the masker is NOT invoked. Returns
+      ``None`` to signal "no scrubber-side video masking happened; the cloud
+      video copy is today's capture-blocked chunk." Distinguishing this
+      "deliberately did nothing (flag off)" from U6's "did nothing because
+      provably safe" and "did nothing because it failed" is exactly the
+      no-op-vs-success discipline this unit enforces.
+
+    * **ON (future)** — invokes :func:`video_mask.mask_video_chunk` over the
+      chunk's absolute frame span and materializes the result (MASKED or a
+      faithful UNMASKED_PROVABLY_SAFE copy) into ``masked_video_dir`` ATOMICALLY
+      (temp + rename, whole-chunk gate). On FAILED, no copy is produced and the
+      caller marks the chunk FAILED (blocking upload + eviction). Returns the
+      :class:`video_mask.MaskOutcome`.
+
+    Args mirror :func:`video_mask.mask_video_chunk`; ``chunk_index`` names the
+    output (``chunk_{index:04d}.mp4`` inside the masked-video dir, so the cloud
+    set keeps the same chunk filenames).
+    """
+    from screencap.config import get_masked_video_upload_enabled
+
+    if not get_masked_video_upload_enabled():
+        # Flag OFF: the conservative posture. The masker MUST NOT be in the
+        # cloud-upload path; the capture-blocked chunk is the cloud copy.
+        return None
+
+    from screencap.video_mask import mask_video_chunk
+
+    out_dir = masked_video_dir(scrubbed_dir)
+    out_dir.mkdir(parents=True, exist_ok=True)
+    output_path = out_dir / f"chunk_{chunk_index:04d}.mp4"
+
+    outcome = mask_video_chunk(
+        chunk_path,
+        db_path,
+        start_ts=start_ts,
+        end_ts=end_ts,
+        chunk_start_abs=chunk_start_abs,
+        output_path=output_path,
+        pixel_ratio=pixel_ratio,
+        classifier=classifier,
+        evaluator=evaluator,
+    )
+    return outcome
+
+
 def _build_app_allowlist(metrics_path: Path) -> frozenset[str]:
     """Build a set of app names from system_metrics.json running_applications.
 

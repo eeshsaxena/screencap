@@ -165,6 +165,7 @@ class RecorderPrivacyFilter:
         window_feed_q=None,
         override_q=None,
         override_file=None,
+        block_video: bool = True,
     ) -> None:
         self._evaluator = DefaultPolicyEvaluator(config)
         self._classifier = DefaultContextClassifier(
@@ -175,6 +176,19 @@ class RecorderPrivacyFilter:
 
         self._cloud_intent = cloud_intent
         self._block_actions = BLOCK_ACTIONS
+        # U4b: when ``block_video`` is False, capture-time VIDEO blocking is
+        # disabled and ``video_allowed`` is always True (rich video for all
+        # destinations). Screenshot gating (``screen_allowed``), keystroke
+        # nulling (``keystrokes_allowed``), blocked-interval metadata, and
+        # background-window screenshot masking (``mask_frame``) are
+        # UNAFFECTED — those are separate mechanisms U6's post-hoc video
+        # masker does not replace. The default (True) preserves today's
+        # capture-time video blocking byte-for-byte. This flag is driven by
+        # ``config.get_masked_video_upload_enabled()`` at the single gating
+        # site in ``collaborators.build_recorder_privacy_filter``; it is
+        # NOT safe to flip ON until U6+U7's live-upload cutover lands (see
+        # that gating site for the full rationale).
+        self._block_video = block_video
 
         # Keystroke/video block sets — wider than _block_actions since
         # MASK_WINDOW no longer blocks screenshots but still blocks
@@ -487,10 +501,16 @@ class RecorderPrivacyFilter:
                 self._blocked_reasons.keys() & keystroke_block_reasons
             )
 
-            video_block_reasons = screen_block_reasons | {"app_video"}
-            video_blocked = bool(
-                self._blocked_reasons.keys() & video_block_reasons
-            )
+            # U4b: when capture-time video blocking is disabled (flag ON),
+            # video is always allowed (rich capture). Screenshot/keystroke
+            # gating above is unchanged.
+            if self._block_video:
+                video_block_reasons = screen_block_reasons | {"app_video"}
+                video_blocked = bool(
+                    self._blocked_reasons.keys() & video_block_reasons
+                )
+            else:
+                video_blocked = False
 
             return CaptureDisposition(
                 screen_allowed=not screen_blocked,

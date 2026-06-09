@@ -28,6 +28,29 @@ def read_intent(directory: Path) -> str | None:
         return None
 
 
+def read_intent_policy(directory: Path):
+    """Read the frozen :class:`~screencap.pipeline_policy.ResolvedPolicy`.
+
+    Returns the policy frozen into ``.recording_intent`` at routing time
+    (U3), or ``None`` when the file is missing/corrupt OR is a legacy
+    ``version: 1`` intent written before the retention fields existed
+    (sparse-but-valid — the caller should fall back to a config default or
+    treat retention as keep-forever). The frozen value is authoritative: it
+    is NOT re-resolved against current config, so a config change after the
+    recording was routed does not change this recording's policy.
+    """
+    intent_path = directory / INTENT_FILE
+    if not intent_path.exists():
+        return None
+    try:
+        data = json.loads(intent_path.read_text())
+    except Exception:
+        return None
+    from screencap.pipeline_policy import ResolvedPolicy
+
+    return ResolvedPolicy.from_dict(data)
+
+
 class RecordingInfo(NamedTuple):
     name: str
     date: str  # YYYY-MM-DD
@@ -41,6 +64,13 @@ class RecordingInfo(NamedTuple):
     chunks_total: int = 0  # number of video chunks (0 = legacy single-file)
     chunks_uploaded: int = 0  # number of chunks with upload status files
     intent: str | None = None  # "cloud", "local", or None (legacy)
+    # R14 (U9): True for a chunked recording (the unified pipeline's canonical
+    # on-disk shape going forward), False for a legacy single-file recording.
+    # Survives stubbing — derived from chunk videos, manifests, AND legacy
+    # status files, so an uploaded-and-evicted chunked recording (no local
+    # chunk_*.mp4 left) is still flagged chunked. Consumers (review/viewer,
+    # SwiftUI) read this to choose the chunked vs. legacy single-file path.
+    is_chunked: bool = False
     # Raw values for SwiftUI consumers (Unit 4c). The pre-formatted ``date``
     # / ``duration`` strings remain for backward compatibility with anything
     # that reads the existing JSON; SwiftUI uses these unformatted fields
@@ -88,6 +118,47 @@ def find_db(directory: Path) -> Path | None:
     if p.exists():
         return p
     return None
+
+
+def _ledger_has_uploaded_chunk(db_path: Path) -> bool | None:
+    """True iff the U1 pipeline ledger records ≥1 confirmed-uploaded chunk.
+
+    READ-ONLY probe of the ``pipeline_chunk_state`` table: ``upload_state ==
+    'uploaded'`` (an ``EVICTED`` chunk keeps its ``UPLOADED`` upload_state per
+    the U1 contract, so an uploaded-then-evicted recording still reads True).
+
+    Returns ``None`` when there is no ledger to consult — the table does not
+    exist (legacy / not-yet-seeded recording) or the DB is unreadable — so the
+    caller falls back to the file-presence heuristics (R14). Deliberately does
+    NOT migrate the schema: catalog listing is read-only and must never ALTER a
+    recording.db (that would change its content hash and defeat the
+    scrubbed-copy reuse check on the upload path, mirroring
+    ``terminal_stage._open_ledger_readonly``).
+    """
+    import sqlite3
+
+    try:
+        conn = sqlite3.connect(f"file:{db_path}?mode=ro", uri=True)
+    except sqlite3.Error:
+        return None
+    try:
+        has_ledger = conn.execute(
+            "SELECT name FROM sqlite_master WHERE type='table' "
+            "AND name='pipeline_chunk_state'"
+        ).fetchone()
+        if has_ledger is None:
+            return None  # no ledger — fall back to file-presence heuristics.
+        return (
+            conn.execute(
+                "SELECT 1 FROM pipeline_chunk_state "
+                "WHERE upload_state='uploaded' LIMIT 1"
+            ).fetchone()
+            is not None
+        )
+    except sqlite3.Error:
+        return None
+    finally:
+        conn.close()
 
 
 def _read_recording_meta(db_path: Path) -> tuple[float | None, float | None]:
@@ -177,8 +248,24 @@ def list_recordings(recordings_dir: Path | None = None) -> list[RecordingInfo]:
         # chunks_total: use max of local videos, manifests, and uploaded count
         # (local files may be deleted after upload)
         chunks_total = max(len(chunk_videos), len(chunk_manifests), chunks_uploaded)
+        # R14 (U9): chunked vs. legacy single-file. Derived from the same
+        # eviction-surviving evidence as chunks_total, so a stubbed chunked
+        # recording (no chunk_*.mp4 left, but manifests/status files remain)
+        # is still flagged chunked. A legacy single-file recording has none of
+        # these -> is_chunked False and stays listable/readable via video.mp4.
+        is_chunked = chunks_total > 0
 
-        uploaded = uploaded_legacy or chunks_uploaded > 0
+        # Consult the U1 ledger (read-only) when present: the unified pipeline
+        # uploads from the source dir and records confirmed uploads in
+        # `pipeline_chunk_state`, so a chunked recording can be genuinely
+        # uploaded (and later evicted) WITHOUT the legacy `.chunk_*_status.json`
+        # markers the file heuristics key off. `None` = no ledger (legacy / not
+        # seeded) -> fall back to file-presence only (R14).
+        ledger_uploaded = bool(
+            db is not None and _ledger_has_uploaded_chunk(db)
+        )
+
+        uploaded = uploaded_legacy or chunks_uploaded > 0 or ledger_uploaded
 
         # For stubbed recordings, check chunk status files for audio evidence
         if not has_audio and chunks_uploaded > 0:
@@ -195,6 +282,22 @@ def list_recordings(recordings_dir: Path | None = None) -> list[RecordingInfo]:
         # are ignored — pathlib glob matches dotfiles, and a lingering review
         # artifact (.video_review.mp4) must never mask a stub (R6). A real
         # video.mp4 is non-hidden, so the *.mp4 glob already covers it.
+        #
+        # Derived from CHUNKS (R2), never from a single `video.mp4` being the
+        # record: the `*.mp4` glob counts surviving `chunk_*.mp4` as media, so a
+        # chunked recording with chunks still on disk is correctly NOT a stub
+        # even though it has no merged `video.mp4` (that is a derived on-demand
+        # artifact — see `viewer._ensure_single_video`).
+        #
+        # Ledger-aware (U10): an uploaded chunked recording whose media was
+        # evicted post-upload-confirm is a LEGITIMATE stub. Folding
+        # `ledger_uploaded` into `uploaded` above makes the unified pipeline's
+        # uploaded-then-evicted recording read as uploaded even without legacy
+        # `.chunk_*_status.json` markers, so the `uploaded and not has_media`
+        # rule below classifies it correctly. The ledger NEVER manufactures a
+        # FALSE stub: a FAILED chunk (fail-closed) is never UPLOADED so it cannot
+        # set `ledger_uploaded`, and a locally-evicted recording (LOCAL_DONE ->
+        # EVICTED, never uploaded) keeps `uploaded == False` — neither is a stub.
         has_media = (
             any(not p.name.startswith(".") for p in d.glob("*.mp4"))
             or any(not p.name.startswith(".") for p in d.glob("*.flac"))
@@ -218,6 +321,7 @@ def list_recordings(recordings_dir: Path | None = None) -> list[RecordingInfo]:
                 chunks_total=chunks_total,
                 chunks_uploaded=chunks_uploaded,
                 intent=intent,
+                is_chunked=is_chunked,
                 started_at=started,
                 duration_seconds=duration,
             )

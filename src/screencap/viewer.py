@@ -22,6 +22,15 @@ err_console = Console(stderr=True)
 # that should be auto-regenerated with caps.
 _MAX_VIEWER_SIZE_BYTES = 200_000_000  # 200 MB
 
+# Bound how long the on-demand concat waits for the per-recording terminal
+# flock (U10). An eviction pass is fast (a few unlinks), so a short wait covers
+# the real contention; we do NOT use terminal_lock's 600s default because a
+# `screencap view` must not hang for minutes behind a long scrub/upload — it
+# warns-and-continues (best-effort) or surfaces a clean failure (review-data)
+# instead. Generous enough to ride out a normal eviction, short enough to stay
+# interactive.
+_CONCAT_LOCK_TIMEOUT = 30.0
+
 
 def _chunk_offsets_for_concat(rec_dir: Path) -> dict[int, float] | None:
     """Map ``chunk_index -> seconds from recording start`` for absolute concat.
@@ -100,51 +109,110 @@ def _chunk_offsets_for_concat(rec_dir: Path) -> dict[int, float] | None:
 def _ensure_single_video(rec_dir: Path, *, fail_loud: bool = False) -> None:
     """If only chunked videos exist, concatenate them into ``rec_dir/video.mp4``.
 
+    ``video.mp4`` is a **derived, on-demand artifact** — never the canonical
+    record. The chunk set (``chunk_*.mp4``) plus the U1 ledger is the record
+    (R2); this function materializes a single-file view of it for the consumers
+    that still want one (the HTML viewer renders it, ``review-data`` reads it as
+    a local navigation aid). It is idempotent and safe to delete: a later call
+    re-derives it from the surviving chunks.
+
     Uses the in-process PyAV concat (stream copy, no re-encode) so the merge
     works with nothing installed on PATH — a Finder/Launchpad-launched ``.app``
     gets the minimal GUI PATH and cannot reach a ``brew``-installed ffmpeg.
     The merged file lives at ``rec_dir/video.mp4`` because many consumers depend
-    on that location (``screencap upload`` ships it, the HTML viewer renders it,
-    ``catalog`` uses it for stub detection, ``capture``/``recorder`` read it).
+    on that location (the HTML viewer renders it, ``catalog`` uses it as one of
+    several media-presence signals, ``capture``/``recorder`` read it). Legacy
+    single-file recordings (R14) already HAVE a real ``video.mp4`` and no
+    chunks, so the no-chunks early return leaves them untouched.
 
     Idempotent: early-returns if ``video.mp4`` already exists. A single chunk is
     symlinked rather than re-muxed.
 
+    **Eviction-race serialization (U10).** A multi-chunk concat enumerates then
+    reads ``chunk_*.mp4`` from the SOURCE dir — the same files U8 eviction
+    (``retention.evict_recording``, always run inside the terminal stage's
+    per-recording flock) can unlink mid-read. We take the SAME
+    ``terminal_stage.terminal_lock`` (blocking-with-timeout) around the concat
+    so eviction and concat are serialized on one recording: while we hold it the
+    terminal stage cannot be evicting, and vice-versa. Combined with
+    ``concat_video_chunks``'s atomic temp+``os.replace`` (a present ``video.mp4``
+    is always complete), a partial concat can never leave a ``video.mp4`` that
+    looks complete, and a chunk can never vanish mid-read during eviction.
+
     ``fail_loud`` selects the concat-failure posture. The default (``False``) is
-    the HTML viewer's best-effort path: a merge failure warns and continues so
-    ``screencap view`` still opens. The ``review-data`` command (U4) passes
-    ``True`` to propagate ``concat_video_chunks``'s error, which it translates
-    into the R9 "can't process this video" envelope — it needs correctness, not
-    graceful degradation.
+    the HTML viewer's best-effort path: a merge failure (or a contended lock)
+    warns and continues so ``screencap view`` still opens. The ``review-data``
+    command (U4) passes ``True`` to propagate ``concat_video_chunks``'s error,
+    which it translates into the R9 "can't process this video" envelope — it
+    needs correctness, not graceful degradation.
     """
     chunks = sorted(rec_dir.glob("chunk_*.mp4"))
     if not chunks:
-        return  # nothing to concat
+        return  # nothing to concat (incl. legacy single-file: real video.mp4)
     if (rec_dir / "video.mp4").exists():
-        return  # already has single video
+        return  # already has the derived single video
 
-    # Only concat if we have 2+ chunks
-    if len(chunks) == 1:
-        # Symlink single chunk for compatibility
-        try:
-            (rec_dir / "video.mp4").symlink_to(chunks[0])
-        except OSError:
-            pass
+    # Both the single-chunk symlink and the multi-chunk concat mutate video.mp4
+    # from chunk_*.mp4 the terminal stage can evict, so BOTH go through the
+    # per-recording flock (the lock-FIRST contract). A single chunk that gets
+    # evicted between this glob and the symlink would otherwise leave a dangling
+    # video.mp4 symlink — _concat_under_lock re-globs under the lock and handles
+    # the 1-chunk / 0-chunk / 2+-chunk cases atomically w.r.t. eviction.
+
+    # Serialize the concat against U8 eviction via the per-recording
+    # terminal flock (the same lock eviction runs under). Import is deferred —
+    # terminal_stage pulls heavier modules than the `screencap --help` path
+    # tolerates, and the viewer's single-chunk/legacy fast paths above must not
+    # pay for it.
+    from screencap.terminal_stage import TerminalStageBusy, terminal_lock
+
+    try:
+        with terminal_lock(rec_dir.name, timeout=_CONCAT_LOCK_TIMEOUT):
+            # Re-check under the lock: a concurrent concat (another `view`, or
+            # the terminal stage's own derive) may have completed while we
+            # waited, and the chunk set may have shifted under eviction.
+            if (rec_dir / "video.mp4").exists():
+                return
+            _concat_under_lock(rec_dir)
+    except TerminalStageBusy as e:
+        # The terminal stage (likely mid-eviction) holds the lock past the
+        # timeout. Refusing to read mid-eviction is the safe outcome — never a
+        # torn read. Best-effort viewer warns and continues; review-data
+        # propagates it as a clean "can't process this video" failure.
+        if fail_loud:
+            raise
+        err_console.print(
+            f"[yellow]Warning:[/yellow] Video merge skipped (recording busy): {e}"
+        )
+
+
+def _concat_under_lock(rec_dir: Path) -> None:
+    """Run the PyAV concat for ``rec_dir`` (caller holds ``terminal_lock``).
+
+    Re-globs the chunk set INSIDE the held lock so the enumeration the engine
+    concats is the post-lock-acquisition snapshot, not a stale pre-wait one.
+    """
+    chunks = sorted(rec_dir.glob("chunk_*.mp4"))
+    if len(chunks) < 2:
+        # The set shrank to <2 while we waited for the lock (eviction ran first).
+        # A single survivor is symlinked; zero is a no-op — never a partial mux.
+        if len(chunks) == 1:
+            try:
+                (rec_dir / "video.mp4").symlink_to(chunks[0])
+            except OSError:
+                pass
         return
 
     err_console.print(f"[dim]Concatenating {len(chunks)} video chunks for viewer...[/dim]")
-    try:
-        from screencap.engine.video import concat_video_chunks
+    from screencap.engine.video import concat_video_chunks
 
-        # Absolute per-chunk offsets keep inter-chunk idle gaps so the merged
-        # timeline tracks wall-clock recording time (SCR-98); None → engine
-        # falls back to legacy summed-span stitching.
-        concat_video_chunks(rec_dir, chunk_offsets=_chunk_offsets_for_concat(rec_dir))
-        err_console.print(f"[dim]Created merged video ({len(chunks)} chunks)[/dim]")
-    except Exception as e:
-        if fail_loud:
-            raise
-        err_console.print(f"[yellow]Warning:[/yellow] Video merge failed: {e}")
+    # Absolute per-chunk offsets keep inter-chunk idle gaps so the merged
+    # timeline tracks wall-clock recording time (SCR-98); None → engine
+    # falls back to legacy summed-span stitching. concat_video_chunks writes
+    # to a temp sibling and os.replace()s onto video.mp4 only on success, so a
+    # raised failure here never leaves a half-written video.mp4.
+    concat_video_chunks(rec_dir, chunk_offsets=_chunk_offsets_for_concat(rec_dir))
+    err_console.print(f"[dim]Created merged video ({len(chunks)} chunks)[/dim]")
 
 
 def _needs_regeneration(viewer: Path, regenerate: bool) -> bool:

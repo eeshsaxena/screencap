@@ -207,6 +207,123 @@ def load_window_geometry(
         return None
 
 
+# ---------------------------------------------------------------------------
+# U4a coverage signal — read API for the post-hoc video masker (U6)
+# ---------------------------------------------------------------------------
+#
+# U6 implements a three-way per-chunk coverage gate over a chunk's frame span
+# [start_ts, end_ts]:
+#   (a) geometry proves no sensitive window across the full span -> unmasked
+#       copy valid;
+#   (b) geometry is absent / sparse for some interval (inter-sample gap exceeds
+#       a bounded max, OR a capture insert failed) -> UNPROVABLE, fail closed;
+#   (c) geometry shows sensitive windows -> mask conservatively.
+#
+# U4a supplies the two raw inputs that gate distinguishes (b) on; U6 owns the
+# gate logic (the bounded max-gap, the over-mask policy, the fail-closed
+# decision). These read directly from the local-only ``recording.db``, so the
+# signal never leaves the machine (R8 / U2).
+
+
+def list_geometry_sample_timestamps(
+    db_path: Path,
+    start_ts: float,
+    end_ts: float,
+    conn: Connection | None = None,
+) -> list[float]:
+    """List ``window_geometry`` sample timestamps within ``[start_ts, end_ts]``.
+
+    Returns the ``screenshot_timestamp`` of every geometry sample whose
+    timestamp falls inside the (inclusive) span, sorted ascending. U6
+    computes inter-sample gaps from these to detect sparse coverage (its
+    case-b bounded-max-gap check); an empty list means no geometry at all
+    was sampled across the span.
+
+    Returns ``[]`` (without raising) for recordings that pre-date the
+    ``window_geometry`` table or on any read error — U6 treats absence as
+    unprovable coverage (fail closed), so a degraded read is conservatively
+    safe.
+
+    Args:
+        db_path: Path to the recording database.
+        start_ts: Inclusive start of the chunk frame span.
+        end_ts: Inclusive end of the chunk frame span.
+        conn: Optional open connection to reuse across many chunk spans.
+    """
+
+    def _query(c: Connection) -> list[float]:
+        if not has_table(c, "window_geometry"):
+            return []
+        rows = c.execute(
+            "SELECT screenshot_timestamp FROM window_geometry "
+            "WHERE screenshot_timestamp IS NOT NULL "
+            "AND screenshot_timestamp >= ? AND screenshot_timestamp <= ? "
+            "ORDER BY screenshot_timestamp",
+            (start_ts, end_ts),
+        ).fetchall()
+        return [float(r[0]) for r in rows]
+
+    if conn is not None:
+        return _query(conn)
+    try:
+        with open_recording_db(db_path) as own_conn:
+            return _query(own_conn)
+    except Exception:
+        return []
+
+
+def geometry_capture_failures_in_span(
+    db_path: Path,
+    start_ts: float,
+    end_ts: float,
+    conn: Connection | None = None,
+) -> list[float]:
+    """List geometry-capture-failure timestamps within ``[start_ts, end_ts]``.
+
+    Returns the ``screenshot_timestamp`` of every durable
+    ``window_geometry_capture_failure`` marker (written by
+    ``recorder.write_screen_event`` when an ``insert_window_geometry`` call
+    raised) whose timestamp falls inside the (inclusive) span, sorted
+    ascending. A NON-EMPTY result means a geometry insert is known to have
+    failed during the span, so coverage there is unprovable — U6 must treat
+    the chunk as case (b) and fail closed (mark it ``FAILED``, produce NO
+    masked copy), never emitting an effectively-unmasked cloud video.
+
+    Returns ``[]`` (without raising) for recordings that pre-date the
+    ``window_geometry_capture_failure`` table or on any read error. Note the
+    asymmetry vs. ``list_geometry_sample_timestamps``: an empty result here
+    means "no KNOWN failure", which is necessary-but-not-sufficient for case
+    (a) — U6 must ALSO confirm dense sample coverage via the sample
+    timestamps before treating a span as provably covered.
+
+    Args:
+        db_path: Path to the recording database.
+        start_ts: Inclusive start of the chunk frame span.
+        end_ts: Inclusive end of the chunk frame span.
+        conn: Optional open connection to reuse across many chunk spans.
+    """
+
+    def _query(c: Connection) -> list[float]:
+        if not has_table(c, "window_geometry_capture_failure"):
+            return []
+        rows = c.execute(
+            "SELECT screenshot_timestamp FROM window_geometry_capture_failure "
+            "WHERE screenshot_timestamp IS NOT NULL "
+            "AND screenshot_timestamp >= ? AND screenshot_timestamp <= ? "
+            "ORDER BY screenshot_timestamp",
+            (start_ts, end_ts),
+        ).fetchall()
+        return [float(r[0]) for r in rows]
+
+    if conn is not None:
+        return _query(conn)
+    try:
+        with open_recording_db(db_path) as own_conn:
+            return _query(own_conn)
+    except Exception:
+        return []
+
+
 def load_window_events(db_path: Path) -> list[WindowContext]:
     """Load window_event rows sorted by timestamp."""
     with open_recording_db(db_path) as conn:

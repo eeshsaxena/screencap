@@ -775,15 +775,54 @@ def write_screen_event(
             event_data["png_data"] = png_data
     crud.insert_screenshot(db, recording, event.timestamp, event_data)
 
-    # Persist window geometry alongside the screenshot (if captured)
+    # Persist window geometry alongside the screenshot (if captured).
+    #
+    # This is the input the post-hoc video masker (U6) uses to mask
+    # sensitive windows out of the cloud-bound video copy. It is recorded
+    # for EVERY destination — the capture path is destination-agnostic; the
+    # bounds + ``event.timestamp`` are queryable for U6's per-frame gap
+    # analysis. Capture cadence/mechanics are unchanged.
+    #
+    # The insert is best-effort (a geometry-write hiccup must never abort a
+    # recording), but a silent failure is dangerous: video frames are
+    # continuous while geometry is sampled sparsely, so a swallowed insert
+    # leaves a span of frames with NO recorded bounds, which U6 cannot
+    # distinguish from "no sensitive window" — it would emit an
+    # effectively-unmasked cloud video that looks fine. So on failure we now
+    # (1) log LOUDLY (warning, not debug) and (2) write a durable, timestamped
+    # marker so U6 can fail closed on the affected chunk span (case b).
     window_geometries = event.extra
     if window_geometries is not None:
         try:
             crud.insert_window_geometry(
                 db, recording, event.timestamp, json.dumps(window_geometries),
             )
-        except Exception:
-            logger.debug("Failed to insert window geometry", exc_info=True)
+        except Exception as geom_exc:
+            logger.warning(
+                "Failed to insert window geometry at ts={} ({}); recording "
+                "a durable capture-failure marker so post-hoc video masking "
+                "(U6) fails closed on this span",
+                event.timestamp,
+                type(geom_exc).__name__,
+                exc_info=True,
+            )
+            # Durable, crash-surviving signal — but still best-effort: a
+            # marker-write failure must not abort the recording either. Log
+            # it loudly rather than swallowing silently.
+            try:
+                crud.insert_window_geometry_capture_failure(
+                    db,
+                    recording,
+                    event.timestamp,
+                    detail=f"{type(geom_exc).__name__}: {geom_exc}",
+                )
+            except Exception:
+                logger.warning(
+                    "Failed to record window-geometry capture-failure marker "
+                    "at ts={}; U6 cannot see this gap",
+                    event.timestamp,
+                    exc_info=True,
+                )
 
     # disabled to increase perf
     # perf_q.put((event.type, event.timestamp, utils.get_timestamp()))

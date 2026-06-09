@@ -1106,3 +1106,64 @@ async def test_token_refresh_loop_write_oserror_does_not_crash_loop(
         assert path.read_text() == "prior-token"  # untouched
     finally:
         await _stop_loop(proc, task)
+
+
+# ---------------------------------------------------------------------------
+# U7 — resume_terminal_stage: the daemon-restart resume entry point runs the
+# disk-driven terminal stage behind the per-recording flock, in a worker
+# thread, in non_blocking mode (skips when a live finalize / manual upload
+# holds the lock — never double-uploads, AE12).
+# ---------------------------------------------------------------------------
+
+
+@pytest.mark.asyncio
+async def test_resume_terminal_stage_runs_in_thread(tmp_path, monkeypatch):
+    from screencap.daemon.supervisor import Supervisor
+
+    bus = EventBus()
+    sup = Supervisor(bus, reconcile_on_init=False)
+
+    called = {}
+
+    def _fake_run(recording_dir, *, non_blocking):
+        import threading
+        called["non_blocking"] = non_blocking
+        called["thread"] = threading.current_thread().name
+        return "ran"
+
+    monkeypatch.setattr(
+        "screencap.terminal_stage.run_terminal_stage", _fake_run,
+    )
+
+    rec_dir = tmp_path / "rec"
+    rec_dir.mkdir()
+    out = await sup.resume_terminal_stage(rec_dir)
+
+    assert out == "ran"
+    # Resume always uses the non-blocking lock so it can't stall the loop or
+    # race a live finalize.
+    assert called["non_blocking"] is True
+    # Ran off the asyncio loop (a worker thread), not the main thread.
+    assert called["thread"] != "MainThread"
+
+
+@pytest.mark.asyncio
+async def test_resume_terminal_stage_skips_when_busy(tmp_path, monkeypatch):
+    from screencap.daemon.supervisor import Supervisor
+    from screencap.terminal_stage import TerminalStageBusy
+
+    bus = EventBus()
+    sup = Supervisor(bus, reconcile_on_init=False)
+
+    def _busy(recording_dir, *, non_blocking):
+        raise TerminalStageBusy("held by live finalize")
+
+    monkeypatch.setattr(
+        "screencap.terminal_stage.run_terminal_stage", _busy,
+    )
+
+    rec_dir = tmp_path / "rec"
+    rec_dir.mkdir()
+    # Busy → returns None (skips), does NOT raise (the holder owns the section).
+    out = await sup.resume_terminal_stage(rec_dir)
+    assert out is None

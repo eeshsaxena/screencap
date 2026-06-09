@@ -951,3 +951,83 @@ class TestV1NetworkScopeGuard:
         assert all(not (t or "").startswith("network.") for t in types), (
             f"V1 recovery must emit zero network.* lines; got types: {types}"
         )
+
+
+# ---------------------------------------------------------------------------
+# U7 — the terminal stage's CloudCopyProducer adapter consumes recovery in the
+# LOAD-BEARING order: _recover_chunk_metadata(cloud_bound=True) BEFORE
+# scrub_recording. The scrub-layer pointer suppression only protects recovered
+# cloud-bound JSONL when this ordering holds, so pin it at the adapter seam.
+# ---------------------------------------------------------------------------
+
+
+class TestTerminalStageCloudCopyProducerOrdering:
+    def test_recovery_runs_cloud_bound_true_before_scrub(self, recording_db, monkeypatch):
+        """CloudCopyProducer.produce calls recovery(cloud_bound=True) then scrub."""
+        from screencap.terminal_stage import CloudCopyProducer
+
+        capture_dir = _capture_dir(recording_db)
+        _stub_chunk_video(capture_dir, 0)
+
+        order: list[str] = []
+        recovery_kwargs: dict = {}
+
+        def _fake_recover(recording_dir, console, *, force, cloud_bound):
+            order.append("recover")
+            recovery_kwargs["cloud_bound"] = cloud_bound
+
+        def _fake_scrub(name, *, cloud_bound_recovery=False, _already_locked=False):
+            order.append("scrub")
+
+        # Reuse-guard says "not reusable" so scrub runs.
+        monkeypatch.setattr(
+            "screencap.recovery._recover_chunk_metadata", _fake_recover,
+        )
+        monkeypatch.setattr(
+            "screencap.scrubber.is_scrubbed_copy_reusable", lambda *a, **kw: False,
+        )
+        monkeypatch.setattr(
+            "screencap.scrubber.scrub_recording", _fake_scrub,
+        )
+        # Masked-video flag OFF (default) → no video-mask invocation.
+        monkeypatch.setattr(
+            "screencap.config.get_masked_video_upload_enabled", lambda: False,
+        )
+
+        producer = CloudCopyProducer(capture_dir)
+        producer.produce(ledger=None, force=False)
+
+        assert order == ["recover", "scrub"], (
+            f"recovery MUST precede scrub (load-bearing ordering); got {order}"
+        )
+        assert recovery_kwargs["cloud_bound"] is True, (
+            "terminal cloud routing must recover with cloud_bound=True so the "
+            "cloud window filter applies (closes the local-then-uploaded case)"
+        )
+
+    def test_reusable_scrubbed_copy_skips_rebuild(self, recording_db, monkeypatch):
+        """When the reuse guard passes, scrub_recording is NOT re-run."""
+        from screencap.terminal_stage import CloudCopyProducer
+
+        capture_dir = _capture_dir(recording_db)
+        _stub_chunk_video(capture_dir, 0)
+
+        scrub_called = []
+        monkeypatch.setattr(
+            "screencap.recovery._recover_chunk_metadata",
+            lambda *a, **kw: None,
+        )
+        monkeypatch.setattr(
+            "screencap.scrubber.is_scrubbed_copy_reusable", lambda *a, **kw: True,
+        )
+        monkeypatch.setattr(
+            "screencap.scrubber.scrub_recording",
+            lambda *a, **kw: scrub_called.append(True),
+        )
+        monkeypatch.setattr(
+            "screencap.config.get_masked_video_upload_enabled", lambda: False,
+        )
+
+        producer = CloudCopyProducer(capture_dir)
+        producer.produce(ledger=None, force=False)
+        assert not scrub_called, "reusable scrubbed copy must not be rebuilt"
