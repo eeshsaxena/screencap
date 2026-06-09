@@ -217,6 +217,7 @@ def _select_for_policy(
     *,
     now: float,
     age_reader: Callable[[list["ChunkRow"]], dict[int, float]],
+    keep_recent: int = 0,
 ) -> list[int]:
     """Return the chunk indices to evict, drawn ONLY from ``candidates``.
 
@@ -224,6 +225,13 @@ def _select_for_policy(
     here is choosing among already-evictable chunks — it can never widen the
     set to an un-uploaded / in-flight / FAILED chunk. ``age_reader`` maps the
     candidate set to ledger ``updated_at`` for ``delete_after_days``.
+
+    ``keep_recent`` (``delete_after_upload`` only) keeps the N most-recent
+    (highest-index) UPLOADED candidates on disk — the during-recording window
+    the live ``chunk_processor`` reclaim uses (it kept the 2 most recent), so
+    routing the live path through this floor never deletes the freshest
+    confirmed chunks mid-recording. ``0`` (the finalize default) evicts every
+    candidate.
     """
     from screencap.pipeline_policy import RetentionPolicy
 
@@ -232,8 +240,12 @@ def _select_for_policy(
         return []
     if rp == RetentionPolicy.DELETE_AFTER_UPLOAD:
         # Every candidate is evictable (cloud candidates are UPLOADED; local
-        # candidates do not reach delete_after_upload meaningfully).
-        return [c.chunk_index for c in candidates]
+        # candidates do not reach delete_after_upload meaningfully). Candidates
+        # are oldest-first by chunk_index, so the keep_recent window is the tail.
+        selected = [c.chunk_index for c in candidates]
+        if keep_recent > 0:
+            selected = selected[:-keep_recent]
+        return selected
     if rp == RetentionPolicy.DELETE_AFTER_DAYS:
         return _select_past_days(candidates, policy.params, now=now, age_reader=age_reader)
     if rp == RetentionPolicy.SIZE_CAP:
@@ -310,14 +322,20 @@ def evict_recording(
     remote_exists: Callable[[int], bool] | None = None,
     now: float | None = None,
     during_recording: bool = False,
+    keep_recent: int = 0,
     console: "Console | None" = None,
 ) -> EvictionReport:
     """Evaluate the frozen retention policy and evict per the hard floor.
 
     This is the single eviction entry point, invoked by the terminal stage both
-    during recording (per-chunk pass, R12) and at finalize. It is idempotent and
-    resumable: an interrupted ``EVICT_PENDING`` is finished first, then the
-    policy selects further candidates.
+    during recording (per-chunk pass, R12) and at finalize, AND by the live
+    ``chunk_processor`` reclaim. It is idempotent and resumable: an interrupted
+    ``EVICT_PENDING`` is finished first, then the policy selects further
+    candidates.
+
+    ``keep_recent`` (``delete_after_upload`` only) keeps the N most-recent
+    UPLOADED chunks on disk — the live path passes 2 to preserve its
+    during-recording window; the finalize/terminal pass leaves it 0 (evict all).
 
     Args:
         recording_dir: the recording's *source* directory (chunks + recording.db).
@@ -387,6 +405,7 @@ def evict_recording(
     selected = _select_for_policy(
         recording_dir, candidates, policy,
         now=now, age_reader=_ledger_age_reader(ledger),
+        keep_recent=keep_recent,
     )
 
     for idx in selected:
