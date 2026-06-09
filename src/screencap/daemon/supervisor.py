@@ -635,11 +635,9 @@ class Supervisor:
         (a crash-before-finalize recording has no authoritative count — it is left
         for manual recovery, never auto-completed).
         """
-        from screencap.catalog import read_intent
         from screencap.terminal_stage import _open_ledger_readonly
 
-        intent = read_intent(recording_dir)
-        if intent not in ("cloud", "both"):
+        if not _is_cloud_recording(recording_dir):
             return False  # local / legacy / no-intent → not a cloud resume.
         ledger = _open_ledger_readonly(recording_dir)
         if ledger is None:

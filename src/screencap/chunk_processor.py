@@ -755,11 +755,10 @@ class ChunkProcessor:
                 outcome = self._cloud_upload_chunk(
                     idx, start_ts, end_ts, transcript_path,
                 )
-                if outcome is _UploadOutcome.DEFERRED:
-                    # reached_upload stays False → the chunk is left PENDING
-                    # (the eagerly-set value) for the convergence pass.
-                    pass
-                else:
+                # DEFERRED (lock contended) leaves reached_upload False → the
+                # chunk stays PENDING (the eagerly-set value) for the convergence
+                # pass. Only a settled UPLOADED/FAILED outcome settles the status.
+                if outcome is not _UploadOutcome.DEFERRED:
                     reached_upload = True
                     success = outcome is _UploadOutcome.UPLOADED
             else:

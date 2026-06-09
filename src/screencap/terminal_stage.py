@@ -607,16 +607,21 @@ def _run_locked(
         destination = _resolve_destination(recording_dir, policy)
     result = TerminalResult(destination=destination.value)
 
+    # Dry-run preview: report the routing decision, write NOTHING (no schema
+    # migration, no LOCAL_DONE mark, no scrub/upload/sentinel, no eviction). Use
+    # the READ-ONLY ledger opener — ``_open_ledger`` migrates the schema (ALTER
+    # recording.db), which would mutate the source dir's content hash and defeat
+    # the scrubbed-copy reuse check. Universal so a dry-run never touches disk.
+    if dry_run:
+        ro_ledger = _open_ledger_readonly(recording_dir)
+        if ro_ledger is not None:
+            result.n_expected = ro_ledger.chunks_expected()
+        result.routed = True
+        return result
+
     ledger = _open_ledger(recording_dir)
     if ledger is not None:
         result.n_expected = ledger.chunks_expected()
-
-    # Dry-run preview: report the routing decision, write NOTHING (no LOCAL_DONE
-    # mark, no scrub/upload/sentinel, no eviction). Universal so a dry-run never
-    # mutates the ledger or disk regardless of destination.
-    if dry_run:
-        result.routed = True
-        return result
 
     if destination is Destination.LOCAL:
         # local → no scrub, no upload. Mark each chunk LOCAL_DONE so the
