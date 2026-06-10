@@ -582,6 +582,45 @@ class ScrubWorker:
             # doesn't extend our write lock window.
             counts["screenshot_files"] = self._unlink_screenshot_files(image_paths)
 
+            # SCR-118: purge the same intervals from the content index so
+            # retroactively-disabled on-screen text can no longer be found via
+            # search (the R7 lifecycle hole reached through the async path).
+            self._purge_content_index_intervals(intervals)
+
             return counts
         finally:
             conn.close()
+
+    def _purge_content_index_intervals(
+        self, intervals: list[tuple[float, float]],
+    ) -> None:
+        """Purge content-index rows for ``intervals`` (fail-open).
+
+        ``intervals`` are float unix SECONDS with a possible ``float('inf')``
+        trailing upper bound; the content index keys on ms, so convert (and map
+        ``inf`` → open-ended). Never opens/creates the store if indexing was
+        never used, and never raises into the disable job.
+        """
+        if not intervals:
+            return
+        try:
+            from screencap.content_index import default_index_path
+
+            path = default_index_path()
+            if not path.exists():
+                return  # never indexed → nothing to purge, don't create the store
+
+            from screencap.content_index import ContentIndex
+
+            recording = self._capture_dir.name
+            with ContentIndex(path) as store:
+                if not store.available:
+                    return
+                for start, end in intervals:
+                    start_ms = int(start * 1000)
+                    end_ms = None if end == float("inf") else int(end * 1000)
+                    store.delete_recording_interval(recording, start_ms, end_ms)
+        except Exception:
+            logger.warning(
+                "content-index interval purge failed (non-fatal)", exc_info=True
+            )

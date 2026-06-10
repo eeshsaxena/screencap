@@ -27,6 +27,15 @@ if TYPE_CHECKING:
 
 logger = logging.getLogger(__name__)
 
+# SCR-118 content-index OCR pass tuning.
+# dHash threshold matching mask_screenshots' OCR-dedup (a false cache hit only
+# costs reused recognised text, so the tight value is intentional).
+_INDEX_DHASH_THRESHOLD = 5
+# Hard cap on OCR calls per chunk so a pathological action-burst can never
+# stall the capture-adjacent thread / upload. Excess frames are dropped with a
+# log line (no silent truncation).
+_INDEX_MAX_OCR_FRAMES = 240
+
 
 class _StageAbort(Exception):
     """Internal signal: a ``_stop_event`` abort fired inside an agnostic
@@ -150,6 +159,15 @@ class ChunkProcessor:
         self._segmentation_mode = segmentation_mode
         self._scrub_enabled = scrub_enabled
         self._show_on_website = show_on_website
+
+        # SCR-118: opt-in on-screen content index (local-only sidecar, never
+        # uploaded). Read once here like the other flags. The index pass only
+        # runs inside the scrub branch (it needs the scrub context's
+        # blocked_intervals to skip secure-field / EXCLUDE frames), so a
+        # content_index_enabled recording with scrubbing off indexes nothing.
+        from screencap.config import get_content_index_enabled
+
+        self._content_index_enabled = get_content_index_enabled()
 
         # Initialize scrubbing pipeline when scrubbing is enabled
         # (cloud-intent always scrubs; local recordings scrub when user opts in)
@@ -748,7 +766,13 @@ class ChunkProcessor:
             # 5. Scrub text surfaces + mask screenshots when user opted in.
             if self._scrub_enabled and self._pipeline is not None:
                 self._set_status("Redacting sensitive data...")
-                self._scrub_chunk_files(idx, start_ts, end_ts, transcript_path)
+                scrub_result = self._scrub_chunk_files(
+                    idx, start_ts, end_ts, transcript_path,
+                )
+                # 5b. SCR-118 content index — fail-open, must never affect the
+                # chunk's status, upload, or deletion (AE1). Runs here (pre-
+                # upload, post-scrub) so force-stopped/final chunks still index.
+                self._index_chunk_content(idx, start_ts, end_ts, scrub_result)
                 if self._stop_event.is_set():
                     return
 
@@ -1090,6 +1114,138 @@ class ChunkProcessor:
                 f"Chunk {idx}: scrubbed with {len(scrub_result.audit_entries)} audit entries"
             )
         return scrub_result
+
+    def _index_chunk_content(
+        self, idx: int, start_ts: float, end_ts: float,
+        scrub_result: "ScrubResult",
+    ) -> None:
+        """OCR this chunk's local screenshots into the content index (fail-open).
+
+        SCR-118: a read-only consumer of the recording's local screenshots that
+        persists post-OCR on-screen text (recording name + frame timestamp_ms)
+        to the global ``content_index.db`` so an MCP agent can search it.
+
+        STRICTLY fail-open: any error logs and continues. It must never flip
+        ``success``, change ``ChunkStatus``, raise into ``_process_chunk``, or
+        alter upload/deletion — indexing on vs. off is byte-identical for the
+        chunk lifecycle (AE1).
+
+        Privacy (narrowed R7): the live recorder never masks screenshots in
+        place, so these pixels are unmasked — but the index is local-only (never
+        uploaded, like ``recording.db``) and purged on retroactive disable. Both
+        EXCLUDE-app and secure-field intervals carry ``action=EXCLUDE`` on
+        ``scrub_result.blocked_intervals``; frames inside them are skipped so
+        focused password fields and excluded apps are never indexed.
+        """
+        if not self._content_index_enabled:
+            return
+        try:
+            self._do_index_chunk_content(idx, start_ts, end_ts, scrub_result)
+        except Exception:
+            logger.warning(
+                f"Chunk {idx}: content indexing failed (non-fatal)", exc_info=True
+            )
+
+    def _do_index_chunk_content(
+        self, idx: int, start_ts: float, end_ts: float,
+        scrub_result: "ScrubResult",
+    ) -> None:
+        # Apple Vision unavailable → clean no-op (chunk proceeds unindexed).
+        try:
+            from screencap.privacy.ocr import VisionOcr
+
+            ocr = VisionOcr()
+        except Exception:
+            logger.info(f"Chunk {idx}: Vision OCR unavailable; skipping content index")
+            return
+
+        screenshots_dir = self._capture_dir / "screenshots"
+        if not screenshots_dir.is_dir():
+            return
+
+        from PIL import Image
+
+        from screencap.content_index import (
+            ContentIndex,
+            IndexFrame,
+            default_index_path,
+        )
+        from screencap.engine.dedup import dhash, hamming_distance
+        from screencap.privacy.context import parse_screenshot_timestamp
+        from screencap.privacy.policy import PrivacyAction
+
+        # EXCLUDE / secure-field intervals to skip (both carry action=EXCLUDE).
+        exclude_intervals = [
+            (iv.start, iv.end)
+            for iv in scrub_result.blocked_intervals
+            if iv.action is PrivacyAction.EXCLUDE
+        ]
+
+        def _excluded(ts: float) -> bool:
+            return any(s <= ts < e for s, e in exclude_intervals)
+
+        # Time-scope to [start_ts, end_ts); drop excluded frames.
+        candidates: list[tuple[float, Path]] = []
+        for img_path in sorted(screenshots_dir.glob("*.jpg")):
+            ts = parse_screenshot_timestamp(img_path.name)
+            if ts is None or not (start_ts <= ts < end_ts):
+                continue
+            if _excluded(ts):
+                continue
+            candidates.append((ts, img_path))
+
+        if not candidates:
+            return
+        if len(candidates) > _INDEX_MAX_OCR_FRAMES:
+            logger.info(
+                f"Chunk {idx}: capping content-index OCR at {_INDEX_MAX_OCR_FRAMES} "
+                f"of {len(candidates)} frames"
+            )
+            candidates = candidates[:_INDEX_MAX_OCR_FRAMES]
+
+        started = time.perf_counter()
+        prev_hash: int | None = None
+        frames: list[IndexFrame] = []
+        for ts, img_path in candidates:
+            # Dedup near-identical consecutive frames (same primitive + tight
+            # threshold mask_screenshots uses); keep prev_hash on a dup so we
+            # compare against the last distinct frame.
+            cur_hash: int | None = None
+            try:
+                with Image.open(img_path) as im:
+                    cur_hash = dhash(im)
+            except Exception:
+                cur_hash = None
+            if (
+                cur_hash is not None
+                and prev_hash is not None
+                and hamming_distance(cur_hash, prev_hash) <= _INDEX_DHASH_THRESHOLD
+            ):
+                continue
+            if cur_hash is not None:
+                prev_hash = cur_hash
+            try:
+                result = ocr.recognize(img_path)
+            except Exception:
+                continue
+            text = " ".join(b.text for b in result.text_blocks if b.text).strip()
+            if text:
+                frames.append(
+                    IndexFrame(timestamp_ms=int(round(ts * 1000)), text=text)
+                )
+
+        if not frames:
+            return
+        # Key on the recording DIRECTORY name (globally unique, and what the
+        # daemon query side resolves a recording filter to) — not the display
+        # name — so the scrub_worker purge and daemon reads agree on the key.
+        with ContentIndex(default_index_path()) as store:
+            if store.available:
+                store.write_frames(self._capture_dir.name, frames)
+        logger.info(
+            f"Chunk {idx}: content-indexed {len(frames)} frames in "
+            f"{time.perf_counter() - started:.2f}s"
+        )
 
     def _collect_chunk_files(self, idx: int, transcript_path: Path | None) -> list[dict]:
         """Collect files belonging to this chunk for upload.
