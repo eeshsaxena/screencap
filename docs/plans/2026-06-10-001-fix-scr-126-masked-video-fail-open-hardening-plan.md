@@ -1,7 +1,7 @@
 ---
 title: "fix: SCR-126 masked-video-upload fail-open hardening"
 type: fix
-status: active
+status: completed
 date: 2026-06-10
 deepened: 2026-06-10
 ---
