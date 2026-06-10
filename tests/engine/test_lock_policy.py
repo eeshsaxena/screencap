@@ -183,3 +183,35 @@ def test_write_identity_destination_local_when_no_cloud_intent(tmp_path):
 
     intent = json.loads((tmp_path / ".recording_intent").read_text())
     assert intent["destination"] == "local"
+
+
+def test_write_identity_freezes_masked_video_upload(tmp_path):
+    """SCR-125 R-SCR125-A: the masked-video-upload decision is frozen per
+    recording into ``.recording_intent`` at start. The threaded value wins over
+    the global, so a mid-recording global flip can never change this recording's
+    capture-vs-upload masking agreement."""
+    from screencap.engine.lock_policy import InheritLock
+
+    request = _make_request(name="frozen-on", cloud_intent=True, keep_local=False)
+    # Thread the resolved value explicitly (the engine resolves it once at start).
+    InheritLock().write_identity(
+        tmp_path, request=request, privacy_mode="public", masked_video_upload=True,
+    )
+    intent = json.loads((tmp_path / ".recording_intent").read_text())
+    assert intent["masked_video_upload"] is True
+
+
+def test_write_identity_masked_video_upload_defaults_to_global(tmp_path):
+    """No threaded value → freeze the global (a start-time read), so the field is
+    always present and authoritative for downstream readers."""
+    from unittest import mock
+
+    from screencap.engine.lock_policy import InheritLock
+
+    request = _make_request(name="frozen-default", cloud_intent=True, keep_local=False)
+    with mock.patch(
+        "screencap.config.get_masked_video_upload_enabled", return_value=False,
+    ):
+        InheritLock().write_identity(tmp_path, request=request, privacy_mode="public")
+    intent = json.loads((tmp_path / ".recording_intent").read_text())
+    assert intent["masked_video_upload"] is False

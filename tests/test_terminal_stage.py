@@ -114,7 +114,7 @@ class TestAE12DecisionTimeRace:
         signed_url_calls: list[float] = []
         calls_lock = threading.Lock()
 
-        def _fake_route_cloud(recording_dir, *, ledger, console, force, result, remote_exists, policy=None):
+        def _fake_route_cloud(recording_dir, *, ledger, console, force, result, remote_exists, policy=None, retention_override=None):
             # This stands in for the reconcile→scrub→upload critical section.
             # The "request signed URLs" decision happens HERE, inside the lock.
             with calls_lock:
@@ -418,7 +418,11 @@ class TestFailClosed:
             lambda *a, **kw: sentinel_called.append(True) or True,
         )
 
-        result = ts.run_terminal_stage(rec_dir, _remote_exists=lambda i: True)
+        # The failing chunk 1 is NOT already in GCS (a realistic fail-closed
+        # scenario — only an un-uploaded chunk reaches produce/masking). So the
+        # gate is unsatisfied and the converged fast path does not fire; produce
+        # runs and reports the FAILED chunk.
+        result = ts.run_terminal_stage(rec_dir, _remote_exists=lambda i: i != 1)
 
         assert result.sentinel_uploaded is False
         assert not sentinel_called, "sentinel must NOT be written when a chunk FAILED"
@@ -505,3 +509,316 @@ class TestStaleSentinel:
         # The regenerated sentinel uses the FROZEN ledger count (2), NOT the
         # stale 0 (Bug 3 fixed).
         assert captured["chunks_expected"] == 2
+
+
+# ---------------------------------------------------------------------------
+# SCR-125 U1 — the terminal stage routes its per-chunk video mask through the
+# SAME shared seam the live chunk_processor uses, gated on the FROZEN value.
+# ---------------------------------------------------------------------------
+
+
+class TestSharedMaskSeamU1:
+    def _write_intent(self, rec_dir: Path, *, masked: bool) -> None:
+        (rec_dir / ".recording_intent").write_text(json.dumps({
+            "version": 2, "destination": "cloud",
+            "retention_policy": "keep_forever", "retention_params": {},
+            "masked_video_upload": masked, "show_on_website": True,
+        }))
+
+    def test_mask_videos_routes_through_shared_seam_frozen_on(self, tmp_path, monkeypatch):
+        """Flag frozen ON → the terminal stage's _mask_videos drives the SHARED
+        pipeline_chunk_ops.mask_chunk_for_cloud (same body the live path uses)
+        and marks the ledger SCRUBBED. The GLOBAL is mocked OFF to prove the
+        frozen .recording_intent value is the gate, not the global."""
+        import screencap.pipeline_chunk_ops as pco
+        from screencap import terminal_stage as ts
+        from screencap.pipeline_state import Lifecycle, PipelineLedger
+        from screencap.terminal_stage import CloudCopyOutcome, CloudCopyProducer
+
+        rec_dir = _make_recording(tmp_path, destination="cloud", n_chunks=2)
+        self._write_intent(rec_dir, masked=True)
+        scrubbed = rec_dir.parent / f"{rec_dir.name}-scrubbed"
+
+        seen: list[int] = []
+        real = pco.mask_chunk_for_cloud
+
+        def _spy(recording_dir, scrubbed_dir, idx, **kw):
+            seen.append(idx)
+            return real(recording_dir, scrubbed_dir, idx, **kw)
+
+        monkeypatch.setattr(pco, "mask_chunk_for_cloud", _spy)
+        monkeypatch.setattr(
+            "screencap.scrubber.mask_video_chunk_for_cloud",
+            lambda *a, **kw: _MASKED_OK(),
+        )
+        # Global OFF — the frozen ON value must still drive masking.
+        monkeypatch.setattr(
+            "screencap.config.get_masked_video_upload_enabled", lambda: False,
+        )
+
+        ledger = PipelineLedger(rec_dir / "recording.db")
+        outcome = CloudCopyOutcome(scrubbed_dir=scrubbed)
+        CloudCopyProducer(rec_dir)._mask_videos(scrubbed, ledger, outcome)
+
+        assert sorted(seen) == [0, 1], "both chunks routed through the shared seam"
+        assert sorted(outcome.masked_chunks) == [0, 1]
+        for i in (0, 1):
+            assert ledger.get_chunk(i).lifecycle is Lifecycle.SCRUBBED
+
+    def test_mask_videos_noop_when_frozen_off(self, tmp_path, monkeypatch):
+        """Flag frozen OFF → no masker invoked even if the GLOBAL is ON
+        (frozen value is authoritative — R-SCR125-A)."""
+        from screencap import terminal_stage as ts
+        from screencap.terminal_stage import CloudCopyOutcome, CloudCopyProducer
+
+        rec_dir = _make_recording(tmp_path, destination="cloud", n_chunks=2)
+        self._write_intent(rec_dir, masked=False)
+        scrubbed = rec_dir.parent / f"{rec_dir.name}-scrubbed"
+
+        called = []
+        monkeypatch.setattr(
+            "screencap.scrubber.mask_video_chunk_for_cloud",
+            lambda *a, **kw: called.append(True),
+        )
+        monkeypatch.setattr(
+            "screencap.config.get_masked_video_upload_enabled", lambda: True,
+        )
+        outcome = CloudCopyOutcome(scrubbed_dir=scrubbed)
+        CloudCopyProducer(rec_dir)._mask_videos(scrubbed, None, outcome)
+        assert not called, "frozen OFF must not invoke the masker even if global ON"
+        assert not outcome.masked_chunks and not outcome.failed_chunks
+
+
+def _MASKED_OK():
+    from screencap.video_mask import MaskOutcome, MaskOutcomeStatus
+
+    return MaskOutcome(status=MaskOutcomeStatus.MASKED, reason="test", regions_masked=1)
+
+
+# ---------------------------------------------------------------------------
+# SCR-125 U3 — internal AE8 refusal + explicit promotion + retention override.
+# ---------------------------------------------------------------------------
+
+
+def _stub_cloud_seam(monkeypatch, scrubbed):
+    """Stub the producer + upload so the cloud route runs without real work."""
+    from screencap import terminal_stage as ts
+    from screencap.terminal_stage import CloudCopyOutcome
+
+    scrubbed.mkdir(exist_ok=True)
+    monkeypatch.setattr(
+        ts.CloudCopyProducer, "produce",
+        lambda self, **kw: CloudCopyOutcome(scrubbed_dir=scrubbed),
+    )
+    from screencap.upload import UploadResult
+    import screencap.upload as up
+    monkeypatch.setattr(up, "upload_recording", lambda d, **kw: UploadResult(recording=d.name))
+    monkeypatch.setattr("screencap.chunk_processor.upload_sentinel", lambda *a, **kw: True)
+
+
+class TestDryRunReadOnly:
+    """SCR-125 U5: dry-run is a read-only preview — no flock, no disk mutation."""
+
+    def test_dry_run_does_not_block_on_held_lock(self, tmp_path):
+        """A dry-run never takes the flock, so it completes even while another
+        surface holds it (a read-only preview must not block on a live run)."""
+        import threading
+
+        from screencap import terminal_stage as ts
+
+        rec_dir = _make_recording(tmp_path, destination="cloud", n_chunks=2)
+        held = threading.Event()
+        release = threading.Event()
+
+        def _hold():
+            with ts.terminal_lock(rec_dir.name):
+                held.set()
+                release.wait(timeout=5)
+
+        holder = threading.Thread(target=_hold)
+        holder.start()
+        assert held.wait(timeout=5)
+        try:
+            # Would block (up to lock_timeout) if dry-run took the flock.
+            result = ts.run_terminal_stage(rec_dir, dry_run=True, lock_timeout=2.0)
+            assert result.routed is True
+            assert result.n_expected == 2  # reported from the read-only ledger
+            assert result.sentinel_uploaded is False
+        finally:
+            release.set()
+            holder.join(timeout=5)
+
+    def test_dry_run_does_not_migrate_or_mutate(self, tmp_path, monkeypatch):
+        """Dry-run never produces a scrubbed copy, marks LOCAL_DONE, or writes a
+        sentinel — and uses the read-only ledger opener (no schema migration)."""
+        from screencap import terminal_stage as ts
+        from screencap.pipeline_state import Lifecycle, PipelineLedger
+
+        rec_dir = _make_recording(tmp_path, destination="local", n_chunks=2)
+        monkeypatch.setattr(
+            ts.CloudCopyProducer, "produce",
+            lambda *a, **kw: (_ for _ in ()).throw(AssertionError("dry-run must not produce")),
+        )
+        ts.run_terminal_stage(rec_dir, dry_run=True)
+        # No LOCAL_DONE marks written (chunks stay STAGED).
+        ledger = PipelineLedger(rec_dir / "recording.db")
+        assert all(r.lifecycle == Lifecycle.STAGED for r in ledger.all_chunks())
+        assert not (rec_dir / "recording_complete.json").exists()
+
+
+class TestAlreadyConvergedFastPath:
+    """SCR-125 U4: when reconcile shows the closed set is already all UPLOADED,
+    the terminal stage skips the expensive produce/re-scrub + no-op upload and
+    goes straight to the sentinel — so engine finalize stays within the stop
+    budget and a daemon resume / CLI re-upload of a converged recording is cheap."""
+
+    def test_already_converged_skips_produce(self, tmp_path, monkeypatch):
+        from screencap import terminal_stage as ts
+        from screencap.pipeline_state import PipelineLedger
+
+        rec_dir = _make_recording(tmp_path, destination="cloud", n_chunks=2)
+        # Everything already uploaded + confirmed remote (the happy live path).
+        ledger = PipelineLedger(rec_dir / "recording.db")
+        for i in range(2):
+            ledger.mark_uploaded(i)
+
+        # produce() MUST NOT run on the converged fast path.
+        monkeypatch.setattr(
+            ts.CloudCopyProducer, "produce",
+            lambda *a, **kw: (_ for _ in ()).throw(
+                AssertionError("produce must be skipped when already converged")
+            ),
+        )
+        sentinels = []
+        monkeypatch.setattr(
+            "screencap.chunk_processor.upload_sentinel",
+            lambda *a, **kw: sentinels.append(True) or True,
+        )
+
+        result = ts.run_terminal_stage(rec_dir, _remote_exists=lambda i: True)
+        assert result.finalize_gate_satisfied is True
+        assert result.sentinel_uploaded is True
+        assert sentinels == [True]
+
+    def test_force_still_rebuilds_even_when_converged(self, tmp_path, monkeypatch):
+        """--force re-scrubs + re-uploads even on a converged recording."""
+        from screencap import terminal_stage as ts
+        from screencap.pipeline_state import PipelineLedger
+        from screencap.terminal_stage import CloudCopyOutcome
+
+        rec_dir = _make_recording(tmp_path, destination="cloud", n_chunks=1)
+        ledger = PipelineLedger(rec_dir / "recording.db")
+        ledger.mark_uploaded(0)
+
+        produced = []
+        scrubbed = rec_dir.parent / f"{rec_dir.name}-scrubbed"
+        scrubbed.mkdir()
+        monkeypatch.setattr(
+            ts.CloudCopyProducer, "produce",
+            lambda self, **kw: produced.append(True) or CloudCopyOutcome(scrubbed_dir=scrubbed),
+        )
+        from screencap.upload import UploadResult
+        import screencap.upload as up
+        monkeypatch.setattr(up, "upload_recording", lambda d, **kw: UploadResult(recording=d.name))
+        monkeypatch.setattr("screencap.chunk_processor.upload_sentinel", lambda *a, **kw: True)
+
+        ts.run_terminal_stage(rec_dir, force=True, _remote_exists=lambda i: True)
+        assert produced == [True], "force must rebuild even when already converged"
+
+
+class TestU3PromotionAndRetention:
+    def test_ae8_hole_refuses_internally_nothing_uploaded(self, tmp_path, monkeypatch):
+        """AE8 moved inside run_terminal_stage: an evicted-and-unconfirmable chunk
+        raises PromotionRefused on the cloud route — the producer is never
+        reached, so nothing is uploaded."""
+        from screencap import terminal_stage as ts
+
+        rec_dir = _make_recording(tmp_path, destination="cloud", n_chunks=3)
+        # Chunk 1's local media is gone and it is NOT uploaded (still STAGED).
+        (rec_dir / "chunk_0001.mp4").unlink()
+
+        # Producer must NEVER run when there is a hole.
+        monkeypatch.setattr(
+            ts.CloudCopyProducer, "produce",
+            lambda *a, **kw: (_ for _ in ()).throw(AssertionError("must not produce on a hole")),
+        )
+        with pytest.raises(ts.PromotionRefused):
+            # remote_exists False for the missing chunk → unconfirmable hole.
+            ts.run_terminal_stage(rec_dir, _remote_exists=lambda i: False)
+
+    def test_force_destination_cloud_promotes_local_recording(self, tmp_path, monkeypatch):
+        """force_destination=cloud routes a local-intent recording through the
+        cloud path (uploads) instead of the LOCAL no-op."""
+        from screencap import terminal_stage as ts
+
+        rec_dir = _make_recording(tmp_path, destination="local", n_chunks=2)
+        scrubbed = rec_dir.parent / f"{rec_dir.name}-scrubbed"
+        _stub_cloud_seam(monkeypatch, scrubbed)
+
+        result = ts.run_terminal_stage(
+            rec_dir, force_destination="cloud", _remote_exists=lambda i: True,
+        )
+        assert result.destination == "cloud"
+        assert result.routed is True
+        assert result.sentinel_uploaded is True
+
+    def test_retention_override_keep_forever_suppresses_eviction(self, tmp_path, monkeypatch):
+        """retention_override=keep_forever prevents eviction even when the frozen
+        policy is delete_after_upload (the --no-delete semantics)."""
+        from screencap import terminal_stage as ts
+
+        rec_dir = _make_recording(tmp_path, destination="cloud", n_chunks=2)
+        # Freeze delete_after_upload.
+        (rec_dir / ".recording_intent").write_text(json.dumps({
+            "version": 2, "destination": "cloud",
+            "retention_policy": "delete_after_upload", "retention_params": {},
+            "show_on_website": True,
+        }))
+        scrubbed = rec_dir.parent / f"{rec_dir.name}-scrubbed"
+        _stub_cloud_seam(monkeypatch, scrubbed)
+
+        ts.run_terminal_stage(
+            rec_dir, retention_override="keep_forever", _remote_exists=lambda i: True,
+        )
+        # With keep_forever override, the local media survives the upload.
+        assert (rec_dir / "chunk_0000.mp4").exists()
+        assert (rec_dir / "chunk_0001.mp4").exists()
+
+    def test_delete_after_upload_without_override_evicts(self, tmp_path, monkeypatch):
+        """Control: the SAME recording WITHOUT the override evicts (proves the
+        override is what suppresses, not a mock)."""
+        from screencap import terminal_stage as ts
+
+        rec_dir = _make_recording(tmp_path, destination="cloud", n_chunks=2)
+        (rec_dir / ".recording_intent").write_text(json.dumps({
+            "version": 2, "destination": "cloud",
+            "retention_policy": "delete_after_upload", "retention_params": {},
+            "show_on_website": True,
+        }))
+        scrubbed = rec_dir.parent / f"{rec_dir.name}-scrubbed"
+        _stub_cloud_seam(monkeypatch, scrubbed)
+
+        ts.run_terminal_stage(rec_dir, _remote_exists=lambda i: True)
+        # keep_recent defaults to 0 at the terminal pass → all uploaded evicted.
+        assert not (rec_dir / "chunk_0000.mp4").exists()
+        assert not (rec_dir / "chunk_0001.mp4").exists()
+
+    def test_legacy_no_ledger_force_cloud_no_spurious_hole(self, tmp_path, monkeypatch):
+        """A legacy / no-ledger recording with force_destination=cloud falls
+        through the whole-dir path (R14) — no spurious AE8 hole refusal."""
+        from screencap import terminal_stage as ts
+
+        rec_dir = tmp_path / "legacy"
+        rec_dir.mkdir()
+        # A single-file legacy recording: no recording.db, no ledger table.
+        (rec_dir / "video.mp4").write_bytes(b"\x00" * 64)
+        (rec_dir / ".recording_id").write_text("legacy")
+        scrubbed = rec_dir.parent / f"{rec_dir.name}-scrubbed"
+        _stub_cloud_seam(monkeypatch, scrubbed)
+
+        # Must NOT raise PromotionRefused (no closed chunk set to gate on).
+        result = ts.run_terminal_stage(
+            rec_dir, force_destination="cloud", _remote_exists=lambda i: True,
+        )
+        assert result.destination == "cloud"
+        assert result.routed is True

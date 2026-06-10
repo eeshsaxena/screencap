@@ -35,6 +35,20 @@ class _StageAbort(Exception):
     """
 
 
+class _UploadOutcome(str, Enum):
+    """Outcome of the live per-chunk cloud upload op (SCR-125 U1).
+
+    ``DEFERRED`` is the lock-contention skip: another terminal-stage entry point
+    (manual ``screencap upload`` / daemon resume) holds the per-recording flock,
+    so this chunk is left ``PENDING`` for the convergence pass — never lost, never
+    force-uploaded under contention. ``UPLOADED`` / ``FAILED`` settle the chunk.
+    """
+
+    UPLOADED = "uploaded"
+    FAILED = "failed"
+    DEFERRED = "deferred"
+
+
 class ChunkStatus(str, Enum):
     """Per-chunk terminal status (V1.75).
 
@@ -103,9 +117,23 @@ class ChunkProcessor:
         segmentation_mode: str = "llm",
         scrub_enabled: bool = False,
         show_on_website: bool = True,
+        masked_video_upload: bool | None = None,
     ) -> None:
         self._capture_dir = Path(capture_dir)
         self._db_path = self._capture_dir / "recording.db"
+        # SCR-125 U1: the sibling <name>-scrubbed dir holds the masked cloud
+        # video copies (masked_video/) when masked_video_upload is ON.
+        self._scrubbed_dir = self._capture_dir.parent / f"{self._capture_dir.name}-scrubbed"
+        # The FROZEN per-recording masked-video-upload decision (R-SCR125-A):
+        # resolved ONCE here from .recording_intent (falling back to the global
+        # only for a legacy intent), so a mid-recording global flip can never
+        # change which video path this live upload ships. Default (flag OFF) =
+        # byte-for-byte today: the capture-blocked source .mp4 is uploaded.
+        if masked_video_upload is None:
+            from screencap.pipeline_chunk_ops import get_frozen_masked_video_upload
+
+            masked_video_upload = get_frozen_masked_video_upload(self._capture_dir)
+        self._masked_video_upload = bool(masked_video_upload)
         self._q = chunk_process_q
         self._audio_ack_q = audio_ack_q
         self._recording_name = recording_name or self._capture_dir.name
@@ -716,20 +744,29 @@ class ChunkProcessor:
                 if self._stop_event.is_set():
                     return
 
-            # 6. Upload
-            reached_upload = True
+            # 6. Cloud per-chunk op (mask → upload) behind the per-recording
+            # terminal flock (SCR-125 U1). The flock is acquired per chunk and
+            # released between chunks (non_blocking) so a concurrent manual
+            # `screencap upload` / daemon resume interleaves: a lock-contended
+            # chunk is DEFERRED (left PENDING) for the convergence pass, never
+            # lost and never force-uploaded under contention.
             if self._upload_enabled:
                 self._set_status("Uploading...")
-                files = self._collect_chunk_files(idx, transcript_path)
-                if files:
-                    success = self._upload_chunk(idx, files)
-                else:
-                    logger.warning(f"No files found for chunk {idx}")
+                outcome = self._cloud_upload_chunk(
+                    idx, start_ts, end_ts, transcript_path,
+                )
+                # DEFERRED (lock contended) leaves reached_upload False → the
+                # chunk stays PENDING (the eagerly-set value) for the convergence
+                # pass. Only a settled UPLOADED/FAILED outcome settles the status.
+                if outcome is not _UploadOutcome.DEFERRED:
+                    reached_upload = True
+                    success = outcome is _UploadOutcome.UPLOADED
             else:
                 # "Disabled" must not be conflated with "succeeded": when
                 # privacy init failed _upload_disabled_reason is set, so
                 # success stays False → FAILED → gate blocks → no stub.
                 # Per chunk-upload-sentinel-gating-and-data-loss.md fix #4.
+                reached_upload = True
                 success = self._upload_disabled_reason is None
         finally:
             # Settle the final status on every exit path. Staging from
@@ -762,15 +799,18 @@ class ChunkProcessor:
                 if settled is not None and settled != ChunkStatus.PENDING:
                     self._mirror_status_to_ledger(idx, settled)
 
-        # 7. Delete old chunks (keep 2 most recent). Only EMITTED chunks
-        # are safe to delete locally — NETWORK_SKIPPED and
-        # NETWORK_INCOMPLETE chunks must survive on disk for any future
-        # re-export path that surfaces.
+        # 7. Reclaim older confirmed chunks through the UNIFIED retention floor
+        # (SCR-125 U2). Gated on this chunk being EMITTED and the frozen policy
+        # being delete_after_upload (``self._auto_delete``). The floor enforces
+        # the never-delete-without-a-fresh-remote-confirm rule per chunk
+        # (prevention rule #3) — replacing the old delete-on-EMITTED-alone
+        # bookkeeping — and keeps the 2 most-recent confirmed chunks on disk
+        # (the same during-recording window as before).
         if (
             self._chunk_results.get(idx) == ChunkStatus.EMITTED
             and self._auto_delete
         ):
-            freed = self._delete_old_chunks(idx, keep_recent=2)
+            freed = self._evict_old_chunks_through_floor(idx)
             self._total_freed += freed
 
         if self._total_freed > 0:
@@ -1044,19 +1084,36 @@ class ChunkProcessor:
         Cloud-intent recordings include video (with placeholder frames for
         blocked intervals) and audio alongside text files.
         Skips 0-byte files and files renamed to .scrub_failed.
+
+        SCR-125 masked-path-switch (R-SCR125-A): when the FROZEN
+        ``masked_video_upload`` flag is ON for a cloud recording, the ``.mp4``
+        slot resolves to the MASKED copy under ``<name>-scrubbed/masked_video/``
+        and the rich SOURCE ``.mp4`` is NEVER added to the upload set — so the
+        live path can never ship unmasked rich video. The GCS object NAME stays
+        ``chunk_{idx:04d}.mp4`` (only the local source path changes), so the
+        cloud key is unchanged. Flag OFF (this milestone): the source ``.mp4`` is
+        uploaded exactly as today.
         """
         files = []
-        patterns = [
-            f"chunk_{idx:04d}.mp4",
-            f"audio_{idx:04d}.flac",
-            f"events_{idx:04d}.jsonl",
-            f"chunk_{idx:04d}_manifest.json",
+        video_name = f"chunk_{idx:04d}.mp4"
+        if self._cloud_intent and self._masked_video_upload:
+            from screencap.scrubber import masked_video_dir
+
+            video_path = masked_video_dir(self._scrubbed_dir) / video_name
+        else:
+            video_path = self._capture_dir / video_name
+        # (name -> local path) pairs. The video slot may point outside
+        # capture_dir (the masked copy); every other slot is a source file.
+        specs: list[tuple[str, Path]] = [
+            (video_name, video_path),
+            (f"audio_{idx:04d}.flac", self._capture_dir / f"audio_{idx:04d}.flac"),
+            (f"events_{idx:04d}.jsonl", self._capture_dir / f"events_{idx:04d}.jsonl"),
+            (f"chunk_{idx:04d}_manifest.json", self._capture_dir / f"chunk_{idx:04d}_manifest.json"),
         ]
         if transcript_path and transcript_path.exists():
-            patterns.append(transcript_path.name)
+            specs.append((transcript_path.name, transcript_path))
 
-        for name in patterns:
-            path = self._capture_dir / name
+        for name, path in specs:
             if path.exists() and path.stat().st_size > 0:
                 files.append({"name": name, "path": path})
             elif path.exists() and path.stat().st_size == 0:
@@ -1069,6 +1126,53 @@ class ChunkProcessor:
             files.append({"name": "_unlisted", "path": marker_path})
 
         return files
+
+    def _cloud_upload_chunk(
+        self, idx: int, start_ts: float, end_ts: float,
+        transcript_path: Path | None,
+    ) -> "_UploadOutcome":
+        """Mask (frozen-flag gated) → collect → upload one chunk, behind the flock.
+
+        SCR-125 U1: the live per-chunk cloud op acquires the per-recording
+        ``terminal_lock`` ``non_blocking`` and releases it between chunks, so it
+        cannot stall the capture-adjacent thread and a concurrent manual
+        ``screencap upload`` / daemon resume can interleave. On contention the
+        chunk is ``DEFERRED`` (left PENDING for the convergence pass — the
+        intended outcome, NOT a lost upload). When the FROZEN
+        ``masked_video_upload`` flag is ON the chunk's video is masked through the
+        SHARED seam first and the upload slot is switched to the masked copy
+        (R-SCR125-A); a mask FAILED is fail-closed (no upload).
+        """
+        from screencap.terminal_stage import TerminalStageBusy, terminal_lock
+
+        try:
+            with terminal_lock(self._recording_name, non_blocking=True):
+                if self._cloud_intent and self._masked_video_upload:
+                    from screencap.pipeline_chunk_ops import mask_chunk_for_cloud
+
+                    cls = mask_chunk_for_cloud(
+                        self._capture_dir, self._scrubbed_dir, idx,
+                        start_ts=start_ts, end_ts=end_ts, enabled=True,
+                        ledger=self._get_ledger(), db_path=self._db_path,
+                    )
+                    if cls.failed:
+                        # Fail-closed: never upload an un-maskable chunk.
+                        return _UploadOutcome.FAILED
+                files = self._collect_chunk_files(idx, transcript_path)
+                if not files:
+                    logger.warning(f"No files found for chunk {idx}")
+                    return _UploadOutcome.FAILED
+                return (
+                    _UploadOutcome.UPLOADED
+                    if self._upload_chunk(idx, files)
+                    else _UploadOutcome.FAILED
+                )
+        except TerminalStageBusy:
+            logger.info(
+                "chunk %d: terminal lock contended (manual upload / daemon "
+                "resume in progress); deferring to the convergence pass", idx,
+            )
+            return _UploadOutcome.DEFERRED
 
     def _upload_chunk(self, idx: int, files: list[dict]) -> bool:
         """Upload chunk files silently. Returns True if core files succeeded.
@@ -1090,35 +1194,55 @@ class ChunkProcessor:
                     logger.error(f"Chunk {idx} upload failed after retry: {e}")
         return False
 
-    def _delete_old_chunks(self, current_idx: int, keep_recent: int = 2) -> int:
-        """Delete media files for old EMITTED chunks. Returns bytes freed.
+    def _evict_old_chunks_through_floor(self, idx: int) -> int:
+        """Reclaim older confirmed chunks via the unified retention floor (U2).
 
-        EMITTED-only — ``NETWORK_SKIPPED`` and ``NETWORK_INCOMPLETE``
-        chunks are intentionally local-only (bodies were either not
-        decryptable or the proxy crashed mid-window). A future
-        re-export path may need their .mp4 / .flac / .jsonl files;
-        deleting them would be silent permanent data loss for the
-        non-network legs of an otherwise-recoverable chunk.
+        Routes the during-recording reclaim through
+        :func:`screencap.retention.evict_recording` so a chunk's rich local copy
+        is deleted ONLY when it is ledger-``UPLOADED`` AND a FRESH remote
+        re-confirm succeeds NOW (prevention rule #3) — replacing the old
+        delete-on-``EMITTED``-alone bookkeeping. ``keep_recent=2`` preserves the
+        same during-recording window the live path always kept; the floor's
+        candidate predicate already excludes ``SKIPPED`` / ``FAILED`` / in-flight
+        chunks (only ``UPLOADED`` is evictable), so the network-skipped /
+        incomplete survival invariant holds via the ledger.
+
+        Acquired under the per-recording terminal flock (``non_blocking``,
+        released between chunks — the same contract as the U1 upload op) so it
+        cannot race a concurrent terminal run (AE12). A lock-contended pass
+        simply defers — eviction is idempotent + resumable, so the next pass /
+        the finalize convergence reclaims. Never raises into recording: any
+        failure leaves more local files than retention wanted, never less.
         """
-        freed = 0
-        for old_idx in range(0, current_idx - keep_recent + 1):
-            # EMITTED-only deletion — see docstring.
-            if self._chunk_results.get(old_idx) != ChunkStatus.EMITTED:
-                continue
-            for ext_pattern in [
-                f"chunk_{old_idx:04d}.mp4",
-                f"audio_{old_idx:04d}.flac",
-                f"events_{old_idx:04d}.jsonl",
-            ]:
-                path = self._capture_dir / ext_pattern
-                if path.exists():
-                    try:
-                        freed += path.stat().st_size
-                        path.unlink()
-                        logger.info(f"Deleted {path.name}")
-                    except OSError as e:
-                        logger.warning(f"Failed to delete {path.name}: {e}")
-        return freed
+        from screencap.terminal_stage import TerminalStageBusy, terminal_lock
+
+        ledger = self._get_ledger()
+        if ledger is None:
+            return 0
+        try:
+            with terminal_lock(self._recording_name, non_blocking=True):
+                from screencap.retention import evict_recording
+
+                report = evict_recording(
+                    self._capture_dir,
+                    ledger=ledger,
+                    keep_recent=2,
+                    during_recording=True,
+                )
+                for ev in report.evicted_indices:
+                    logger.info("Evicted chunk %d local media (retention floor)", ev)
+                return report.bytes_freed
+        except TerminalStageBusy:
+            logger.debug(
+                "chunk %d: terminal lock contended; deferring eviction to the "
+                "next pass / finalize convergence", idx,
+            )
+            return 0
+        except Exception as exc:  # noqa: BLE001 — eviction never breaks recording
+            logger.warning(
+                "chunk %d: retention eviction failed (non-fatal): %s", idx, exc,
+            )
+            return 0
 
 
 def _save_transcript_quiet(

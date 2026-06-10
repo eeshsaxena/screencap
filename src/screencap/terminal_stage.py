@@ -75,7 +75,7 @@ from typing import TYPE_CHECKING, Any, Callable
 if TYPE_CHECKING:
     from rich.console import Console
 
-    from screencap.pipeline_policy import ResolvedPolicy
+    from screencap.pipeline_policy import Destination, ResolvedPolicy, RetentionPolicy
     from screencap.pipeline_state import PipelineLedger
 
 logger = logging.getLogger(__name__)
@@ -388,7 +388,10 @@ class CloudCopyProducer:
 
         # 2. Scrub → <name>-scrubbed (or reuse a current review-prepared copy).
         if not force and is_scrubbed_copy_reusable(self._recording_dir, scrubbed_dir):
-            logger.debug("Reusing reviewed scrubbed copy at %s", scrubbed_dir.name)
+            console.print(
+                f"  Reusing reviewed scrubbed copy at "
+                f"[dim]{scrubbed_dir.name}/[/dim] (reviewed == uploaded)."
+            )
         else:
             # cloud_bound_recovery=True records the recovery provenance so a
             # later reuse is valid. We do NOT pass _already_locked — the
@@ -408,24 +411,25 @@ class CloudCopyProducer:
         ledger: "PipelineLedger | None",
         outcome: CloudCopyOutcome,
     ) -> None:
-        """Apply U6 video masking per chunk and map results onto the ledger.
+        """Apply U6 video masking per chunk via the SHARED seam (SCR-125 U1).
 
-        Flag OFF (today's default): ``mask_video_chunk_for_cloud`` returns
-        ``None`` for every chunk → no masked copy, the capture-blocked source
-        chunk IS the cloud copy. Flag ON: a ``MaskOutcome.ok`` chunk →
-        ``mark_scrubbed``; a ``FAILED`` chunk → ``mark_failed`` (blocking the
-        sentinel + eviction) and recorded in ``outcome.failed_chunks``.
+        Gated on the FROZEN per-recording masked-video-upload decision (not the
+        mutable global), so the terminal stage and the live ``chunk_processor``
+        mask identically for a given recording. Flag OFF (today's default): no
+        masked copy — the capture-blocked source chunk IS the cloud copy, no
+        ledger scrub-state change (the agnostic STAGED state + the upload
+        confirmation drives the gate). Flag ON: each chunk goes through the same
+        :func:`pipeline_chunk_ops.mask_chunk_for_cloud` body the live path uses
+        — ok -> ``mark_scrubbed`` (recorded in ``masked_chunks``), FAILED ->
+        ``mark_failed`` (recorded in ``failed_chunks``, blocking the sentinel).
         """
-        from screencap.config import get_masked_video_upload_enabled
+        from screencap.pipeline_chunk_ops import (
+            get_frozen_masked_video_upload,
+            mask_chunk_for_cloud,
+        )
 
-        if not get_masked_video_upload_enabled():
-            # Conservative posture: masker not invoked. The source chunk media
-            # (capture-blocked for cloud today) is the cloud copy. No ledger
-            # scrub-state change here — the agnostic STAGED state plus the
-            # upload confirmation drives the gate.
+        if not get_frozen_masked_video_upload(self._recording_dir):
             return
-
-        from screencap.scrubber import mask_video_chunk_for_cloud
 
         db_path = self._recording_dir / "recording.db"
         chunk_videos = sorted(self._recording_dir.glob("chunk_*.mp4"))
@@ -437,49 +441,16 @@ class CloudCopyProducer:
                 continue
             start_ts = chunk_start_abs + idx * chunk_dur
             end_ts = start_ts + chunk_dur
-            try:
-                mask_outcome = mask_video_chunk_for_cloud(
-                    vf, db_path, scrubbed_dir,
-                    chunk_index=idx, start_ts=start_ts, end_ts=end_ts,
-                    # The chunk's OWN first-frame absolute time is start_ts, not
-                    # the recording base: each chunk mp4's PTS restarts near 0,
-                    # so video_mask maps frames as start_ts + frame_pts. Passing
-                    # the recording base would shift every chunk idx>=1's frames
-                    # outside the coverage span (mis-aligned masking).
-                    chunk_start_abs=start_ts,
-                )
-            except Exception as exc:  # noqa: BLE001 — fail closed on any error
-                logger.error("video mask raised for chunk %d: %s", idx, exc)
-                outcome.failed_chunks.append(idx)
-                if ledger is not None:
-                    with contextlib.suppress(Exception):
-                        ledger.mark_failed(idx, detail=f"video_mask error: {exc}")
-                continue
-            if mask_outcome is None:
-                # Flag flipped off mid-loop, or this chunk produced no copy by
-                # design — treat as no-op (handled by the flag short-circuit).
-                continue
-            if mask_outcome.ok:
+            cls = mask_chunk_for_cloud(
+                self._recording_dir, scrubbed_dir, idx,
+                start_ts=start_ts, end_ts=end_ts,
+                enabled=True,  # already gated on the frozen value above
+                ledger=ledger, db_path=db_path,
+            )
+            if cls.masked:
                 outcome.masked_chunks.append(idx)
-                if ledger is not None:
-                    with contextlib.suppress(Exception):
-                        # Do NOT downgrade a chunk a prior reconcile already
-                        # advanced to UPLOADED/EVICTED — mark_scrubbed sets
-                        # lifecycle=SCRUBBED, and the later _mark_uploaded_chunks
-                        # pass skips an already-UPLOADED upload_state, so the
-                        # row would be stuck SCRUBBED and never satisfy the
-                        # finalize gate.
-                        from screencap.pipeline_state import Lifecycle as _LC
-                        _row = ledger.get_chunk(idx)
-                        if _row is None or _row.lifecycle not in (
-                            _LC.UPLOADED, _LC.EVICTED,
-                        ):
-                            ledger.mark_scrubbed(idx)
-            else:
+            elif cls.failed:
                 outcome.failed_chunks.append(idx)
-                if ledger is not None:
-                    with contextlib.suppress(Exception):
-                        ledger.mark_failed(idx, detail=mask_outcome.reason or "video_mask FAILED")
 
 
 def _chunk_timing(db_path: Path, n_chunks: int) -> tuple[float, float]:
@@ -531,6 +502,8 @@ def run_terminal_stage(
     dry_run: bool = False,
     non_blocking: bool = False,
     lock_timeout: float = _DEFAULT_LOCK_TIMEOUT,
+    force_destination: "Destination | str | None" = None,
+    retention_override: "RetentionPolicy | str | None" = None,
     _remote_exists: Callable[[int], bool] | None = None,
     _on_locked: Callable[[], None] | None = None,
 ) -> TerminalResult:
@@ -550,6 +523,13 @@ def run_terminal_stage(
         non_blocking: if True, raise ``TerminalStageBusy`` immediately when the
             lock is contended instead of waiting (the "loser skips" mode).
         lock_timeout: blocking-with-timeout bound (ignored if ``non_blocking``).
+        force_destination: SCR-125 U3 explicit promotion — override the frozen
+            routed destination (e.g. ``cloud`` to promote a ``local``-intent /
+            legacy recording that would otherwise route LOCAL → no-op). ``None``
+            routes by the frozen ``.recording_intent`` (unchanged).
+        retention_override: SCR-125 U3 per-run retention override (e.g.
+            ``keep_forever`` for ``screencap upload --no-delete``). ``None`` uses
+            the frozen policy's retention.
         _remote_exists: test/eviction seam — a callback ``(idx) -> bool`` used
             in place of a real GCS stat.
         _on_locked: test hook invoked immediately after the lock is acquired,
@@ -557,9 +537,31 @@ def run_terminal_stage(
 
     Returns:
         :class:`TerminalResult`.
+
+    Raises:
+        PromotionRefused: when the cloud route detects a HOLE (a chunk required
+            for a complete upload whose local media is gone AND is unconfirmable
+            in GCS — AE8). Callers (CLI upload, finalize, daemon resume) handle
+            it; never a partial cloud copy.
+        TerminalStageBusy: when the lock is contended (per ``non_blocking`` /
+            ``lock_timeout``).
     """
     recording_dir = Path(recording_dir)
     name = recording_dir.name
+
+    # Dry-run is a READ-ONLY preview (route + report; no scrub / upload / sentinel
+    # / eviction), so it does NOT take the flock — it must never block on, or be
+    # blocked by, a concurrent real run.
+    if dry_run:
+        return _run_locked(
+            recording_dir,
+            console=console,
+            force=force,
+            dry_run=True,
+            force_destination=force_destination,
+            retention_override=retention_override,
+            remote_exists=_remote_exists,
+        )
 
     # === STEP 0: flock FIRST. Nothing below runs until we hold it. ===
     with terminal_lock(name, non_blocking=non_blocking, timeout=lock_timeout):
@@ -570,6 +572,8 @@ def run_terminal_stage(
             console=console,
             force=force,
             dry_run=dry_run,
+            force_destination=force_destination,
+            retention_override=retention_override,
             remote_exists=_remote_exists,
         )
 
@@ -580,16 +584,40 @@ def _run_locked(
     console: "Console | None",
     force: bool,
     dry_run: bool,
-    remote_exists: Callable[[int], bool] | None,
+    force_destination: "Destination | str | None" = None,
+    retention_override: "RetentionPolicy | str | None" = None,
+    remote_exists: Callable[[int], bool] | None = None,
 ) -> TerminalResult:
     """The critical section — runs only while the terminal flock is held."""
     from screencap.catalog import read_intent_policy
     from screencap.pipeline_policy import Destination
 
-    # --- Resolve the FROZEN routing policy (U3). ---
+    # --- Resolve the routing policy. ---
     policy = read_intent_policy(recording_dir)
-    destination = _resolve_destination(recording_dir, policy)
+    if force_destination is not None:
+        # SCR-125 U3 explicit promotion: the caller overrides the frozen routed
+        # destination (e.g. promote a local/legacy recording to cloud). The
+        # frozen retention/params are still honored unless retention_override.
+        destination = (
+            Destination(force_destination)
+            if isinstance(force_destination, str)
+            else force_destination
+        )
+    else:
+        destination = _resolve_destination(recording_dir, policy)
     result = TerminalResult(destination=destination.value)
+
+    # Dry-run preview: report the routing decision, write NOTHING (no schema
+    # migration, no LOCAL_DONE mark, no scrub/upload/sentinel, no eviction). Use
+    # the READ-ONLY ledger opener — ``_open_ledger`` migrates the schema (ALTER
+    # recording.db), which would mutate the source dir's content hash and defeat
+    # the scrubbed-copy reuse check. Universal so a dry-run never touches disk.
+    if dry_run:
+        ro_ledger = _open_ledger_readonly(recording_dir)
+        if ro_ledger is not None:
+            result.n_expected = ro_ledger.chunks_expected()
+        result.routed = True
+        return result
 
     ledger = _open_ledger(recording_dir)
     if ledger is not None:
@@ -605,14 +633,13 @@ def _run_locked(
         # Retention is UNIVERSAL (R11): a local recording with a size/time cap
         # also evicts its LOCAL_DONE chunks. keep_forever (the default) is a
         # no-op. No remote precondition for local eviction.
-        _apply_retention(recording_dir, policy, ledger, result, remote_exists=remote_exists)
+        _apply_retention(
+            recording_dir, policy, ledger, result,
+            remote_exists=remote_exists, retention_override=retention_override,
+        )
         return result
 
     # --- cloud / both routing ---
-    if dry_run:
-        result.routed = True
-        return result
-
     return _route_cloud(
         recording_dir,
         ledger=ledger,
@@ -621,6 +648,7 @@ def _run_locked(
         result=result,
         remote_exists=remote_exists,
         policy=policy,
+        retention_override=retention_override,
     )
 
 
@@ -734,12 +762,18 @@ def _route_cloud(
     result: TerminalResult,
     remote_exists: Callable[[int], bool] | None,
     policy: "ResolvedPolicy | None" = None,
+    retention_override: "RetentionPolicy | str | None" = None,
 ) -> TerminalResult:
     """Produce the cloud copy, reconcile, upload, gate the sentinel.
 
     Order (all inside the held flock):
 
-    1. **Reconcile from disk FIRST** — re-stat not-yet-UPLOADED chunks so a
+    0. **AE8 hole-refusal FIRST** — refuse (``PromotionRefused``) if any chunk
+       required for a complete upload has its local media gone AND is
+       unconfirmable in GCS, BEFORE producing any cloud copy. This moves the
+       standalone ``assert_promotable_to_cloud`` guard INTO the terminal stage
+       (SCR-125 U3) so retiring the CLI's standalone call does not lose AE8.
+    1. **Reconcile from disk** — re-stat not-yet-UPLOADED chunks so a
        half-finished prior run's confirmed chunks are recognized before we do
        any work (no re-upload).
     2. Produce the scrubbed/masked ``<name>-scrubbed`` cloud copy (scrub seam
@@ -752,12 +786,38 @@ def _route_cloud(
 
     name = recording_dir.name
 
+    # 0. AE8 — refuse a promotion with HOLES before producing any cloud copy
+    # (fail-closed, never a partial cloud copy). A legacy / no-ledger recording
+    # has no closed chunk set, so this is a no-op (R14 whole-dir path).
+    assert_promotable_to_cloud(recording_dir, remote_exists=remote_exists)
+
     # 1. Reconcile from disk before doing work (R9). Confirmed-in-GCS chunks
     # flip to UPLOADED so we never re-upload them.
     if ledger is not None:
         result.reconciled = _reconcile_ledger_against_gcs(
             recording_dir, ledger, remote_exists=remote_exists,
         )
+
+    # 1b. ALREADY-CONVERGED FAST PATH (SCR-125 U4 "finalize is cheap"). If the
+    # reconcile shows the FROZEN closed set is all UPLOADED in GCS, the recording
+    # is already complete — its scrubbed events/manifest were uploaded by the
+    # live path (a chunk is only UPLOADED once its core files are confirmed
+    # remote). Skip the expensive ``produce`` re-scrub + the no-op upload and go
+    # straight to the sentinel + retention. This keeps the engine finalize within
+    # the stop budget (the live path already did the work) and makes the daemon
+    # resume / CLI re-upload of a converged recording a near-no-op. ``force``
+    # always rebuilds (re-scrub + re-upload).
+    if not force and ledger is not None and ledger.finalize_gate_satisfied():
+        result.routed = True
+        _refresh_counts(ledger, result)
+        result.all_uploaded = True
+        result.finalize_gate_satisfied = True
+        result.sentinel_uploaded = _write_sentinel(recording_dir, ledger, result)
+        _apply_retention(
+            recording_dir, policy, ledger, result,
+            remote_exists=remote_exists, retention_override=retention_override,
+        )
+        return result
 
     # 2. Produce the cloud copy via the scrub seam adapter.
     producer = CloudCopyProducer(recording_dir, console=console)
@@ -827,9 +887,46 @@ def _route_cloud(
     # long cloud session (R12) and the finalize pass are the SAME call. Eviction
     # of a local copy before finalize is safe: the sentinel/finalize gate keys
     # off the frozen ledger count, not on-disk presence.
-    _apply_retention(recording_dir, policy, ledger, result, remote_exists=remote_exists)
+    _apply_retention(
+        recording_dir, policy, ledger, result,
+        remote_exists=remote_exists, retention_override=retention_override,
+    )
 
     return result
+
+
+def _apply_retention_override(
+    recording_dir: Path,
+    policy: "ResolvedPolicy | None",
+    retention_override: "RetentionPolicy | str | None",
+) -> "ResolvedPolicy | None":
+    """Return ``policy`` with its retention axis replaced by ``retention_override``.
+
+    ``None`` override → ``policy`` unchanged. When ``policy`` is ``None`` (legacy
+    recording with no frozen policy) the override still takes effect via a
+    freshly-built policy whose destination is the recording's routed destination,
+    so ``--no-delete`` (``keep_forever``) is honored even on a legacy recording.
+    """
+    if retention_override is None:
+        return policy
+    from dataclasses import replace
+
+    from screencap.pipeline_policy import RetentionPolicy
+
+    ro = (
+        RetentionPolicy(retention_override)
+        if isinstance(retention_override, str)
+        else retention_override
+    )
+    if policy is not None:
+        return replace(policy, retention_policy=ro)
+    from screencap.pipeline_policy import ResolvedPolicy
+
+    return ResolvedPolicy(
+        destination=_resolve_destination(recording_dir, None),
+        retention_policy=ro,
+        params={},
+    )
 
 
 def _apply_retention(
@@ -839,6 +936,7 @@ def _apply_retention(
     result: TerminalResult,
     *,
     remote_exists: Callable[[int], bool] | None,
+    retention_override: "RetentionPolicy | str | None" = None,
 ) -> None:
     """Invoke the U8 eviction executor for this recording, behind our flock.
 
@@ -849,9 +947,15 @@ def _apply_retention(
     fresh-remote-confirm floor; we only surface its report onto ``result``. Any
     error is non-fatal — a failed eviction never compromises an already-uploaded
     recording (it just leaves more local files than retention wanted).
+
+    ``retention_override`` (SCR-125 U3) replaces the frozen policy's retention
+    for this run — e.g. ``screencap upload --no-delete`` passes ``keep_forever``
+    so local media survives the upload. It overrides only the retention axis;
+    the destination and params are unchanged.
     """
     if ledger is None:
         return
+    policy = _apply_retention_override(recording_dir, policy, retention_override)
     try:
         from screencap.retention import evict_recording
 

@@ -329,6 +329,55 @@ class TestAE5CloudDeleteAfterUpload:
             assert row.upload_state == UploadState.UPLOADED
         assert ledger.finalize_gate_satisfied() is False  # chunk 2 not uploaded yet
 
+    def test_keep_recent_window_preserves_most_recent_uploaded(self, tmp_path):
+        """SCR-125 U2: ``keep_recent=2`` (the live-path window) keeps the 2
+        most-recent UPLOADED chunks on disk and evicts the older confirmed ones
+        — matching the during-recording reclaim the live path always did, but now
+        through the fresh-remote-confirm floor."""
+        from screencap.pipeline_policy import Destination, ResolvedPolicy, RetentionPolicy
+        from screencap.retention import evict_recording
+
+        # 5 chunks all uploaded + remote-confirmed.
+        rec_dir, ledger = _make_recording(tmp_path, n_chunks=5)
+        _cloud_uploaded(ledger, 0, 1, 2, 3, 4)
+        policy = ResolvedPolicy(
+            destination=Destination.CLOUD,
+            retention_policy=RetentionPolicy.DELETE_AFTER_UPLOAD,
+            params={},
+        )
+
+        report = evict_recording(
+            rec_dir, policy=policy, ledger=ledger,
+            remote_exists=_always_true, during_recording=True, keep_recent=2,
+        )
+
+        # The 3 oldest are evicted; the 2 most-recent stay on disk.
+        assert set(report.evicted_indices) == {0, 1, 2}
+        for i in (0, 1, 2):
+            assert not _present(rec_dir, i)
+        assert _present(rec_dir, 3)
+        assert _present(rec_dir, 4)
+
+    def test_keep_recent_zero_at_finalize_evicts_all(self, tmp_path):
+        """keep_recent=0 (the finalize/terminal default) evicts EVERY uploaded
+        chunk — no during-recording window at the end."""
+        from screencap.pipeline_policy import Destination, ResolvedPolicy, RetentionPolicy
+        from screencap.retention import evict_recording
+
+        rec_dir, ledger = _make_recording(tmp_path, n_chunks=3)
+        _cloud_uploaded(ledger, 0, 1, 2)
+        policy = ResolvedPolicy(
+            destination=Destination.CLOUD,
+            retention_policy=RetentionPolicy.DELETE_AFTER_UPLOAD,
+            params={},
+        )
+
+        report = evict_recording(
+            rec_dir, policy=policy, ledger=ledger,
+            remote_exists=_always_true, keep_recent=0,
+        )
+        assert set(report.evicted_indices) == {0, 1, 2}
+
 
 # ===========================================================================
 # Resume — an interrupted eviction (EVICT_PENDING) resumes on re-run.

@@ -13,6 +13,19 @@ from unittest.mock import MagicMock, patch
 import pytest
 
 
+@pytest.fixture(autouse=True)
+def _isolate_terminal_run_dir(tmp_path, monkeypatch):
+    """Point the per-chunk terminal-stage flock dir at a per-test tmp dir.
+
+    SCR-125 U1 wraps the live per-chunk upload in ``terminal_lock``; without
+    isolation those tests would acquire the real ``~/.screencap/run`` flock and
+    could contend with a running daemon / other tests.
+    """
+    import screencap.terminal_stage as ts
+
+    monkeypatch.setattr(ts, "_RUN_DIR", tmp_path / "ts-run")
+
+
 @pytest.fixture
 def capture_dir(recording_db):
     """Capture directory with a real engine DB schema."""
@@ -179,6 +192,130 @@ class TestCloudIntentGating:
         local_names = [f["name"] for f in cp_local._collect_chunk_files(0, None)]
         assert "chunk_0000.mp4" in local_names
         assert "audio_0000.flac" in local_names
+
+    def test_masked_path_switch_off_uploads_source_video(self, cloud_capture_dir):
+        """SCR-125 R-SCR125-A (flag OFF, this milestone's default): the live
+        per-chunk upload set's .mp4 slot resolves to the SOURCE video — the
+        byte-for-byte-today guarantee."""
+        from screencap.chunk_processor import ChunkProcessor
+
+        (cloud_capture_dir / "chunk_0000.mp4").write_bytes(b"rich video")
+        cp = ChunkProcessor(
+            cloud_capture_dir, multiprocessing.Queue(), multiprocessing.Queue(),
+            recording_name="test", upload_enabled=False, auto_delete=False,
+            cloud_intent=True, masked_video_upload=False,
+        )
+        files = cp._collect_chunk_files(0, None)
+        video = next(f for f in files if f["name"] == "chunk_0000.mp4")
+        assert video["path"] == cloud_capture_dir / "chunk_0000.mp4"
+
+    def test_masked_path_switch_on_uploads_masked_copy_not_source(self, cloud_capture_dir):
+        """SCR-125 R-SCR125-A (flag ON, security P0): the .mp4 slot resolves to
+        the masked copy under <name>-scrubbed/masked_video/, and the rich SOURCE
+        .mp4 path is NEVER in the upload set. The GCS object name is unchanged."""
+        from screencap.chunk_processor import ChunkProcessor
+
+        # Both the rich source AND a masked copy exist on disk.
+        (cloud_capture_dir / "chunk_0000.mp4").write_bytes(b"rich video")
+        masked_dir = cloud_capture_dir.parent / f"{cloud_capture_dir.name}-scrubbed" / "masked_video"
+        masked_dir.mkdir(parents=True)
+        masked_video = masked_dir / "chunk_0000.mp4"
+        masked_video.write_bytes(b"masked video")
+
+        cp = ChunkProcessor(
+            cloud_capture_dir, multiprocessing.Queue(), multiprocessing.Queue(),
+            recording_name="test", upload_enabled=False, auto_delete=False,
+            cloud_intent=True, masked_video_upload=True,
+        )
+        files = cp._collect_chunk_files(0, None)
+        video = next(f for f in files if f["name"] == "chunk_0000.mp4")
+        # The GCS object name is unchanged ...
+        assert video["name"] == "chunk_0000.mp4"
+        # ... but the local source is the MASKED copy, never the rich source.
+        assert video["path"] == masked_video
+        source = cloud_capture_dir / "chunk_0000.mp4"
+        assert all(f["path"] != source for f in files), (
+            "the rich SOURCE .mp4 must NEVER be in the upload set when the "
+            "masked_video_upload flag is ON (R-SCR125-A)"
+        )
+
+    def test_recording_db_never_in_upload_set(self, cloud_capture_dir):
+        """AE4: recording.db is never among the per-chunk uploaded files under
+        either flag state (it is local-only by rule, R8)."""
+        from screencap.chunk_processor import ChunkProcessor
+
+        (cloud_capture_dir / "chunk_0000.mp4").write_bytes(b"v")
+        for flag in (False, True):
+            cp = ChunkProcessor(
+                cloud_capture_dir, multiprocessing.Queue(), multiprocessing.Queue(),
+                recording_name="test", upload_enabled=False, auto_delete=False,
+                cloud_intent=True, masked_video_upload=flag,
+            )
+            names = [f["name"] for f in cp._collect_chunk_files(0, None)]
+            assert "recording.db" not in names
+
+    def test_frozen_masked_flag_read_from_intent_not_global(self, cloud_capture_dir):
+        """SCR-125 R-SCR125-A: the masked_video_upload value is read from the
+        FROZEN .recording_intent, so flipping the global mid-recording does not
+        change which video path the live upload ships."""
+        import json as _json
+
+        from screencap.chunk_processor import ChunkProcessor
+
+        # Freeze ON in the intent; the global is mocked OFF.
+        (cloud_capture_dir / ".recording_intent").write_text(_json.dumps({
+            "version": 2, "destination": "cloud",
+            "masked_video_upload": True,
+        }))
+        with mock.patch(
+            "screencap.config.get_masked_video_upload_enabled", return_value=False,
+        ):
+            cp = ChunkProcessor(
+                cloud_capture_dir, multiprocessing.Queue(), multiprocessing.Queue(),
+                recording_name="test", upload_enabled=False, auto_delete=False,
+                cloud_intent=True,  # masked_video_upload=None → resolve from intent
+            )
+        assert cp._masked_video_upload is True, (
+            "the frozen .recording_intent value must win over the mutable global"
+        )
+
+    def test_cloud_upload_chunk_defers_on_lock_contention(self, cloud_capture_dir):
+        """SCR-125 U1 lock contract: a concurrent holder of the per-recording
+        terminal flock makes the live per-chunk op DEFER (leave PENDING), never
+        deadlock or lose the chunk."""
+        import threading
+
+        from screencap import terminal_stage as ts
+        from screencap.chunk_processor import ChunkProcessor, _UploadOutcome
+
+        (cloud_capture_dir / "chunk_0000.mp4").write_bytes(b"v")
+        (cloud_capture_dir / "audio_0000.flac").write_bytes(b"a")
+        (cloud_capture_dir / "events_0000.jsonl").write_text("{}\n")
+        (cloud_capture_dir / "chunk_0000_manifest.json").write_text("{}")
+
+        cp = ChunkProcessor(
+            cloud_capture_dir, multiprocessing.Queue(), multiprocessing.Queue(),
+            recording_name="rec-deferral", upload_enabled=True, auto_delete=False,
+            cloud_intent=True, masked_video_upload=False,
+        )
+        held = threading.Event()
+        release = threading.Event()
+
+        def _hold():
+            with ts.terminal_lock("rec-deferral"):
+                held.set()
+                release.wait(timeout=5)
+
+        holder = threading.Thread(target=_hold)
+        holder.start()
+        assert held.wait(timeout=5)
+        try:
+            # The live op cannot acquire the contended flock → DEFERRED.
+            outcome = cp._cloud_upload_chunk(0, 0.0, 5.0, None)
+            assert outcome is _UploadOutcome.DEFERRED
+        finally:
+            release.set()
+            holder.join(timeout=5)
 
     def test_checkpoint_and_upload_db_never_uploads_raw_db(self, cloud_capture_dir):
         """U2: checkpoint_and_upload_db NEVER uploads the raw recording.db — for
@@ -961,6 +1098,18 @@ def _build_chunk_processor(
     """
     from screencap.chunk_processor import ChunkProcessor
 
+    # SCR-125 U2: the live reclaim routes through the unified retention floor,
+    # which reads the FROZEN policy from .recording_intent. A real cloud
+    # delete_after_upload recording freezes this at start; mirror it here so the
+    # floor evicts (the floor is the single source of truth, not the
+    # auto_delete bool — under a plan-tier override they can diverge).
+    (capture_dir / ".recording_intent").write_text(json.dumps({
+        "version": 2, "destination": "cloud",
+        "retention_policy": "delete_after_upload", "retention_params": {},
+        "masked_video_upload": False, "show_on_website": True,
+    }))
+    (capture_dir / ".recording_id").write_text("test-upload-gating")
+
     chunk_q = multiprocessing.Queue()
     audio_q = multiprocessing.Queue()
     cp = ChunkProcessor(
@@ -995,10 +1144,15 @@ def _enqueue_chunks(q, t0: float, n: int) -> None:
 class TestUploadGatingAllSucceed:
     """Scenario 1: All 7 chunks upload successfully."""
 
+    @mock.patch("screencap.terminal_stage._chunk_confirmed_remote", return_value=True)
     @mock.patch("screencap.chunk_processor.time.sleep")
     @mock.patch("screencap.chunk_processor.upload_chunk_files", return_value=True)
-    def test_seven_chunks_all_succeed(self, mock_upload, mock_sleep, tmp_path):
-        """Happy path: all chunks upload, cleanup runs, state is correct."""
+    def test_seven_chunks_all_succeed(self, mock_upload, mock_sleep, mock_confirm, tmp_path):
+        """Happy path: all chunks upload, cleanup runs, state is correct.
+
+        SCR-125 U2: cleanup now goes through the fresh-remote-confirm floor, so
+        the remote re-confirm is mocked True (in production it is a real GCS
+        re-stat — the floor never deletes without it, prevention rule #3)."""
         t0 = time.time()
         _create_seven_chunk_db(tmp_path / "recording.db", t0)
         _create_chunk_media_files(tmp_path, 7)
@@ -1036,9 +1190,10 @@ class TestUploadGatingAllSucceed:
 class TestUploadGatingPartialFailure:
     """Scenario 2: Chunk 3 fails permanently, rest succeed."""
 
+    @mock.patch("screencap.terminal_stage._chunk_confirmed_remote", return_value=True)
     @mock.patch("screencap.chunk_processor.time.sleep")
     @mock.patch("screencap.chunk_processor.upload_chunk_files")
-    def test_seven_chunks_one_fails_permanently(self, mock_upload, mock_sleep, tmp_path):
+    def test_seven_chunks_one_fails_permanently(self, mock_upload, mock_sleep, mock_confirm, tmp_path):
         """Chunk 3 fails both attempts. Retry called, files preserved for recovery."""
 
         def upload_side_effect(recording_name, files, capture_dir):
@@ -1082,9 +1237,10 @@ class TestUploadGatingPartialFailure:
 class TestUploadGatingRetryRecovery:
     """Scenario 3: Chunk 3 fails first attempt, succeeds on retry."""
 
+    @mock.patch("screencap.terminal_stage._chunk_confirmed_remote", return_value=True)
     @mock.patch("screencap.chunk_processor.time.sleep")
     @mock.patch("screencap.chunk_processor.upload_chunk_files")
-    def test_seven_chunks_one_recovers_on_retry(self, mock_upload, mock_sleep, tmp_path):
+    def test_seven_chunks_one_recovers_on_retry(self, mock_upload, mock_sleep, mock_confirm, tmp_path):
         """Chunk 3 fails first attempt, succeeds on retry. End state = happy path."""
 
         call_counts: dict[int, int] = defaultdict(int)
@@ -1857,102 +2013,73 @@ class TestUploadSummaryCountsEmittedOnly:
         assert n_total == 2
 
 
-class TestDeleteOldChunksRespectsTerminalStates:
-    """V1.75: ``_delete_old_chunks`` must only delete EMITTED chunks.
+class TestEvictThroughFloorU2:
+    """SCR-125 U2: the live reclaim routes through the unified retention floor.
 
-    ``NETWORK_SKIPPED`` and ``NETWORK_INCOMPLETE`` chunks are
-    intentionally local-only — a future re-export path may need their
-    .mp4 / .flac / .jsonl files. Deleting them would be silent
-    permanent data loss for the non-network legs of an otherwise
-    recoverable chunk.
+    The EMITTED-only / network-skipped survival invariant the old
+    ``_delete_old_chunks`` enforced via the in-memory map now lives in the
+    floor's candidate predicate (only ``UPLOADED`` is evictable) — exercised in
+    ``tests/test_retention.py``. These tests pin the live-path wiring: the
+    reclaim delegates to ``evict_recording`` with ``keep_recent=2`` /
+    ``during_recording=True`` under the per-recording flock, and defers on
+    contention rather than racing a concurrent terminal run (AE12).
     """
-
-    def _populate(self, capture_dir: Path, idx: int) -> None:
-        for ext in ("mp4", "flac", "jsonl"):
-            target = capture_dir / (
-                f"events_{idx:04d}.jsonl"
-                if ext == "jsonl"
-                else f"{'chunk' if ext == 'mp4' else 'audio'}_{idx:04d}.{ext}"
-            )
-            target.write_bytes(b"x" * 16)
 
     def _make_cp(self, capture_dir):
         from screencap.chunk_processor import ChunkProcessor
 
-        q = multiprocessing.Queue()
-        ack_q = multiprocessing.Queue()
         return ChunkProcessor(
-            capture_dir, q, ack_q,
-            recording_name="rec",
-            upload_enabled=True,
-            auto_delete=False,
+            capture_dir, multiprocessing.Queue(), multiprocessing.Queue(),
+            recording_name="rec-u2", upload_enabled=True, auto_delete=True,
+            cloud_intent=True,
         )
 
-    def test_skips_network_skipped(self, capture_dir):
-        """``NETWORK_SKIPPED`` chunk files must survive _delete_old_chunks."""
-        from screencap.chunk_processor import ChunkStatus
+    def test_live_reclaim_routes_through_floor_keep_recent_2(self, cloud_capture_dir):
+        from screencap.retention import EvictionReport
 
-        cp = self._make_cp(capture_dir)
-        cp._chunk_results[0] = ChunkStatus.NETWORK_SKIPPED
-        cp._chunk_results[1] = ChunkStatus.EMITTED
-        cp._chunk_results[2] = ChunkStatus.EMITTED
-        for i in (0, 1, 2):
-            self._populate(capture_dir, i)
+        cp = self._make_cp(cloud_capture_dir)
+        captured = {}
 
-        freed = cp._delete_old_chunks(current_idx=2, keep_recent=2)
+        def _fake_evict(recording_dir, **kw):
+            captured.update(kw)
+            captured["recording_dir"] = recording_dir
+            return EvictionReport(evicted_indices=[0], bytes_freed=4096)
 
-        # Chunk 0 files MUST still exist (NETWORK_SKIPPED).
-        assert (capture_dir / "chunk_0000.mp4").exists()
-        assert (capture_dir / "audio_0000.flac").exists()
-        assert (capture_dir / "events_0000.jsonl").exists()
-        # No files freed because only chunk 0 was in the keep_recent
-        # window and chunk 0 is NETWORK_SKIPPED.
-        assert freed == 0
+        with mock.patch("screencap.retention.evict_recording", _fake_evict):
+            freed = cp._evict_old_chunks_through_floor(2)
 
-    def test_skips_network_incomplete(self, capture_dir):
-        """``NETWORK_INCOMPLETE`` chunk files must survive _delete_old_chunks."""
-        from screencap.chunk_processor import ChunkStatus
+        assert freed == 4096
+        assert captured["keep_recent"] == 2, "the 2-most-recent window is preserved"
+        assert captured["during_recording"] is True
+        assert captured["recording_dir"] == cloud_capture_dir
 
-        cp = self._make_cp(capture_dir)
-        cp._chunk_results[0] = ChunkStatus.NETWORK_INCOMPLETE
-        cp._chunk_results[1] = ChunkStatus.EMITTED
-        cp._chunk_results[2] = ChunkStatus.EMITTED
-        for i in (0, 1, 2):
-            self._populate(capture_dir, i)
+    def test_live_reclaim_defers_on_lock_contention(self, cloud_capture_dir):
+        """A concurrent terminal-stage holder makes the reclaim defer (return 0,
+        evict_recording never called) — never racing the terminal run (AE12)."""
+        import threading
 
-        cp._delete_old_chunks(current_idx=2, keep_recent=2)
-        assert (capture_dir / "chunk_0000.mp4").exists()
-        assert (capture_dir / "audio_0000.flac").exists()
-        assert (capture_dir / "events_0000.jsonl").exists()
+        from screencap import terminal_stage as ts
 
-    def test_skips_failed(self, capture_dir):
-        """``FAILED`` chunks survive deletion so reconcile_against_gcs
-        can re-attempt the upload."""
-        from screencap.chunk_processor import ChunkStatus
+        cp = self._make_cp(cloud_capture_dir)
+        held = threading.Event()
+        release = threading.Event()
 
-        cp = self._make_cp(capture_dir)
-        cp._chunk_results[0] = ChunkStatus.FAILED
-        cp._chunk_results[1] = ChunkStatus.EMITTED
-        cp._chunk_results[2] = ChunkStatus.EMITTED
-        for i in (0, 1, 2):
-            self._populate(capture_dir, i)
+        def _hold():
+            with ts.terminal_lock("rec-u2"):
+                held.set()
+                release.wait(timeout=5)
 
-        cp._delete_old_chunks(current_idx=2, keep_recent=2)
-        assert (capture_dir / "chunk_0000.mp4").exists()
-
-    def test_skips_pending(self, capture_dir):
-        """``PENDING`` chunks survive deletion. Force-stop survivorship."""
-        from screencap.chunk_processor import ChunkStatus
-
-        cp = self._make_cp(capture_dir)
-        cp._chunk_results[0] = ChunkStatus.PENDING
-        cp._chunk_results[1] = ChunkStatus.EMITTED
-        cp._chunk_results[2] = ChunkStatus.EMITTED
-        for i in (0, 1, 2):
-            self._populate(capture_dir, i)
-
-        cp._delete_old_chunks(current_idx=2, keep_recent=2)
-        assert (capture_dir / "chunk_0000.mp4").exists()
+        holder = threading.Thread(target=_hold)
+        holder.start()
+        assert held.wait(timeout=5)
+        try:
+            with mock.patch("screencap.retention.evict_recording") as ev:
+                freed = cp._evict_old_chunks_through_floor(2)
+            assert freed == 0
+            ev.assert_not_called()
+        finally:
+            release.set()
+            holder.join(timeout=5)
 
 
 class TestProcessChunkFinalAssignment:

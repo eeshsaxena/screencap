@@ -25,6 +25,23 @@ def pytest_configure(config: pytest.Config) -> None:
 
 
 @pytest.fixture(autouse=True)
+def _isolate_recordings_and_run_dir(tmp_path, monkeypatch):
+    """Hermetically isolate the recordings dir + terminal-stage flock dir.
+
+    SCR-125 U6 adds a daemon-startup sweep (scans ``get_recordings_dir()``) and a
+    per-exit terminal-stage resume (takes the ``~/.screencap/run`` flock). Without
+    isolation those would touch the developer's REAL recordings / run dir during
+    the test suite. Pointing both at a per-test tmp dir keeps the daemon tests
+    hermetic (the sweep finds an empty dir → no-op; the flock lives in tmp)."""
+    import screencap.terminal_stage as ts
+
+    isolated = tmp_path / "recordings-isolated"
+    isolated.mkdir(parents=True, exist_ok=True)
+    monkeypatch.setenv("SCREENCAP_RECORDINGS_DIR", str(isolated))
+    monkeypatch.setattr(ts, "_RUN_DIR", tmp_path / "ts-run")
+
+
+@pytest.fixture(autouse=True)
 def _granted_permissions_by_default(
     request: pytest.FixtureRequest, monkeypatch: pytest.MonkeyPatch
 ):

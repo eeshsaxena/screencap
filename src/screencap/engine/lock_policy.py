@@ -26,6 +26,7 @@ def _write_identity_files(
     *,
     request: RecordingRequest,
     privacy_mode: str,
+    masked_video_upload: bool | None = None,
 ) -> None:
     """Identity-file writer used by ``InheritLock``.
 
@@ -34,6 +35,15 @@ def _write_identity_files(
     payload writer. Schema matches the wrapper-era payload at
     ``recorder.py`` so downstream consumers (catalog, upload,
     scrubber, recovery) need no changes.
+
+    ``masked_video_upload`` is the FROZEN masked-video-upload decision for this
+    recording (SCR-125 R-SCR125-A). The caller resolves it ONCE at start (the
+    same value capture-time ``block_video`` uses) and threads it here so it is
+    durable on disk; the live ``chunk_processor`` upload and ``terminal_stage``
+    masking read THIS frozen value, so a mid-recording flip of the mutable
+    global cannot make capture-blocking and upload-masking disagree. ``None``
+    (no value threaded) falls back to the global at write time — still a
+    start-time read, kept for call-site / test back-compat.
     """
     (capture_dir / ".recording_id").write_text(request.name)
 
@@ -53,6 +63,11 @@ def _write_identity_files(
 
     resolved = resolve_policy(destination=destination)
 
+    if masked_video_upload is None:
+        from screencap.config import get_masked_video_upload_enabled
+
+        masked_video_upload = get_masked_video_upload_enabled()
+
     intent = {
         # Bumped 1 -> 2: adds the frozen resolved-policy fields
         # (retention_policy, retention_params). Readers tolerate v1 (absent
@@ -61,6 +76,10 @@ def _write_identity_files(
         "destination": destination,
         "retention_policy": resolved.retention_policy.value,
         "retention_params": dict(resolved.params),
+        # SCR-125: freeze the masked-video-upload decision per recording so a
+        # mid-recording global flip cannot ship unmasked rich video (the live
+        # upload + terminal stage read this, never the mutable global).
+        "masked_video_upload": bool(masked_video_upload),
         "privacy_mode": privacy_mode,
         "show_on_website": request.show_on_website,
         "created_at": datetime.now(timezone.utc).isoformat(),
@@ -80,6 +99,7 @@ class LockPolicy(Protocol):
         *,
         request: RecordingRequest,
         privacy_mode: str,
+        masked_video_upload: bool | None = None,
     ) -> None: ...
 
     def register_children(
@@ -108,9 +128,11 @@ class InheritLock:
         *,
         request: RecordingRequest,
         privacy_mode: str,
+        masked_video_upload: bool | None = None,
     ) -> None:
         _write_identity_files(
             capture_dir, request=request, privacy_mode=privacy_mode,
+            masked_video_upload=masked_video_upload,
         )
 
     def register_children(

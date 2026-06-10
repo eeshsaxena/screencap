@@ -2306,10 +2306,17 @@ def mask_video_chunk_for_cloud(
     pixel_ratio: float = 2.0,
     classifier: object | None = None,
     evaluator: object | None = None,
+    enabled: bool | None = None,
 ):
     """Produce the cloud-bound video copy for one chunk, gated on the flag.
 
-    THE SINGLE GATE is ``config.get_masked_video_upload_enabled()``:
+    THE SINGLE GATE is the masked-video-upload decision. ``enabled`` lets the
+    caller pass the FROZEN per-recording value (SCR-125 — the live and terminal
+    paths gate on ``.recording_intent``'s ``masked_video_upload``, NOT the
+    mutable global, so a mid-recording flip can never make capture-blocking and
+    upload-masking disagree). ``enabled=None`` falls back to
+    ``config.get_masked_video_upload_enabled()`` (the global) for callers that
+    have no frozen value.
 
     * **OFF (this milestone's default)** — the masker is NOT invoked. Returns
       ``None`` to signal "no scrubber-side video masking happened; the cloud
@@ -2329,9 +2336,12 @@ def mask_video_chunk_for_cloud(
     output (``chunk_{index:04d}.mp4`` inside the masked-video dir, so the cloud
     set keeps the same chunk filenames).
     """
-    from screencap.config import get_masked_video_upload_enabled
+    if enabled is None:
+        from screencap.config import get_masked_video_upload_enabled
 
-    if not get_masked_video_upload_enabled():
+        enabled = get_masked_video_upload_enabled()
+
+    if not enabled:
         # Flag OFF: the conservative posture. The masker MUST NOT be in the
         # cloud-upload path; the capture-blocked chunk is the cloud copy.
         return None

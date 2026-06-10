@@ -28,6 +28,32 @@ def read_intent(directory: Path) -> str | None:
         return None
 
 
+def read_masked_video_upload(directory: Path) -> bool | None:
+    """Read the FROZEN ``masked_video_upload`` decision from ``.recording_intent``.
+
+    The masked-video-upload flag is resolved ONCE at recording start and frozen
+    into ``.recording_intent`` (``engine/lock_policy._write_identity_files``), so
+    a mid-recording flip of the mutable global cannot make capture-time blocking
+    and the live/terminal upload-time masking disagree (the rich-video leak
+    window — SCR-125 R-SCR125-A). Both the live ``chunk_processor`` upload and the
+    ``terminal_stage`` masking read THIS frozen value, never the global.
+
+    Returns the frozen bool, or ``None`` when the file is missing/corrupt or the
+    field is absent (a legacy intent written before SCR-125). The caller falls
+    back to the mutable global only for those legacy recordings — see
+    ``pipeline_chunk_ops.get_frozen_masked_video_upload``.
+    """
+    intent_path = directory / INTENT_FILE
+    if not intent_path.exists():
+        return None
+    try:
+        data = json.loads(intent_path.read_text())
+    except Exception:
+        return None
+    val = data.get("masked_video_upload")
+    return bool(val) if isinstance(val, bool) else None
+
+
 def read_intent_policy(directory: Path):
     """Read the frozen :class:`~screencap.pipeline_policy.ResolvedPolicy`.
 

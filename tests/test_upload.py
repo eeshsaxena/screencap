@@ -615,18 +615,32 @@ def test_upload_command_not_found(tmp_path):
     assert "not found" in result.output
 
 
+def _terminal_result_stub(**kw):
+    from screencap.terminal_stage import TerminalResult
+
+    defaults = dict(destination="cloud", routed=True, n_uploaded=1, sentinel_uploaded=True)
+    defaults.update(kw)
+    return TerminalResult(**defaults)
+
+
 def test_upload_command_dry_run(tmp_path):
+    """SCR-125 U5: --dry-run threads dry_run into the terminal stage (a read-only
+    preview); the CLI reports the routing decision."""
     rec = tmp_path / "my-rec"
     rec.mkdir()
     (rec / "video.mp4").write_bytes(b"x" * 1000)
     (rec / "audio.flac").write_bytes(b"x" * 500)
 
     runner = CliRunner()
-    with mock.patch("screencap.upload.get_recordings_dir", return_value=tmp_path):
+    fake = mock.MagicMock(return_value=_terminal_result_stub(routed=True))
+    with (
+        mock.patch("screencap.upload.get_recordings_dir", return_value=tmp_path),
+        mock.patch("screencap.terminal_stage.run_terminal_stage", fake),
+    ):
         result = runner.invoke(cli, ["upload", "my-rec", "--dry-run"])
     assert result.exit_code == 0
-    assert "Dry run" in result.output
-    assert "video.mp4" in result.output
+    assert fake.call_args.kwargs["dry_run"] is True
+    assert "Would upload my-rec" in result.output
 
 
 def _stub_scrub_recording(rec_dir):
@@ -642,30 +656,18 @@ def _stub_scrub_recording(rec_dir):
 
 
 def test_upload_command_success(tmp_path):
+    """SCR-125 U5: a converged upload prints 'Uploaded' and no public viewer URL.
+    The CLI drives the terminal stage; the HTTP upload engine is tested directly
+    elsewhere (test_upload_recording_*)."""
     rec = tmp_path / "my-rec"
     rec.mkdir()
     (rec / "video.mp4").write_bytes(b"x" * 100)
 
-    mock_urls_resp = mock.MagicMock()
-    mock_urls_resp.status_code = 200
-    mock_urls_resp.json.return_value = {
-        "urls": {"video.mp4": "https://url/video"},
-        "gcs_prefix": "gs://bucket/recordings/my-rec/",
-    }
-
-    mock_put_resp = mock.MagicMock()
-    mock_put_resp.status_code = 200
-    mock_put_resp.raise_for_status = mock.MagicMock()
-
     runner = CliRunner()
+    fake = mock.MagicMock(return_value=_terminal_result_stub(n_uploaded=1, sentinel_uploaded=True))
     with (
         mock.patch("screencap.upload.get_recordings_dir", return_value=tmp_path),
-        mock.patch(
-            "screencap.scrubber.scrub_recording",
-            return_value=_stub_scrub_recording(rec),
-        ),
-        mock.patch("screencap.upload.requests.post", return_value=mock_urls_resp),
-        mock.patch("screencap.upload.requests.put", return_value=mock_put_resp),
+        mock.patch("screencap.terminal_stage.run_terminal_stage", fake),
     ):
         result = runner.invoke(cli, ["upload", "my-rec"])
     assert result.exit_code == 0
@@ -740,31 +742,34 @@ def test_upload_command_dry_run_does_not_require_auth(tmp_path, monkeypatch):
     monkeypatch.setattr("screencap.auth.get_id_token", not_signed_in)
 
     runner = CliRunner()
-    with mock.patch("screencap.upload.get_recordings_dir", return_value=tmp_path):
+    fake = mock.MagicMock(return_value=_terminal_result_stub(routed=True))
+    with (
+        mock.patch("screencap.upload.get_recordings_dir", return_value=tmp_path),
+        mock.patch("screencap.terminal_stage.run_terminal_stage", fake),
+    ):
         result = runner.invoke(cli, ["upload", "my-rec", "--dry-run"])
 
     assert result.exit_code == 0  # dry-run is local-only; no sign-in needed
-    assert "Dry run" in result.output
+    assert "Would upload" in result.output
 
 
 def test_upload_command_service_unavailable(tmp_path):
-    import requests as req
-
+    """SCR-125 U5: the terminal stage catches an upload failure and surfaces it as
+    a warning (it never crashes the CLI mid-batch); local media is preserved."""
     rec = tmp_path / "my-rec"
     rec.mkdir()
     (rec / "video.mp4").write_bytes(b"x" * 100)
 
     runner = CliRunner()
+    fake = mock.MagicMock(return_value=_terminal_result_stub(
+        routed=False, sentinel_uploaded=False,
+        upload_warning="upload failed: service unavailable",
+    ))
     with (
         mock.patch("screencap.upload.get_recordings_dir", return_value=tmp_path),
-        mock.patch(
-            "screencap.scrubber.scrub_recording",
-            return_value=_stub_scrub_recording(rec),
-        ),
-        mock.patch("screencap.upload.requests.post", side_effect=req.ConnectionError),
+        mock.patch("screencap.terminal_stage.run_terminal_stage", fake),
     ):
         result = runner.invoke(cli, ["upload", "my-rec"])
-    assert result.exit_code == 1
     assert "unavailable" in result.output
 
 
@@ -1084,56 +1089,43 @@ def test_dry_run_does_not_write_status(tmp_path):
 
 
 def test_upload_cli_force_flag(tmp_path):
-    """CLI --force flag should bypass local upload check."""
+    """CLI --force threads force into the terminal stage (re-upload / rebuild)."""
     rec = tmp_path / "my-rec"
     rec.mkdir()
     (rec / "video.mp4").write_bytes(b"x" * 100)
     (rec / UPLOAD_STATUS_FILE).write_text('{"uploaded_at": "2026-01-01"}')
 
-    mock_urls_resp = mock.MagicMock()
-    mock_urls_resp.status_code = 200
-    mock_urls_resp.json.return_value = {
-        "urls": {"video.mp4": "https://url/video"},
-        "gcs_prefix": "gs://bucket/recordings/my-rec/",
-    }
-
-    mock_put_resp = mock.MagicMock()
-    mock_put_resp.status_code = 200
-    mock_put_resp.raise_for_status = mock.MagicMock()
-
     runner = CliRunner()
+    fake = mock.MagicMock(return_value=_terminal_result_stub(n_uploaded=1, sentinel_uploaded=True))
     with (
         mock.patch("screencap.upload.get_recordings_dir", return_value=tmp_path),
-        mock.patch(
-            "screencap.scrubber.scrub_recording",
-            return_value=_stub_scrub_recording(rec),
-        ),
-        mock.patch("screencap.upload.requests.post", return_value=mock_urls_resp),
-        mock.patch("screencap.upload.requests.put", return_value=mock_put_resp),
+        mock.patch("screencap.terminal_stage.run_terminal_stage", fake),
     ):
         result = runner.invoke(cli, ["upload", "my-rec", "--force"])
     assert result.exit_code == 0
+    assert fake.call_args.kwargs["force"] is True
     assert "Uploaded" in result.output
 
 
 def test_upload_cli_skips_already_uploaded(tmp_path):
-    """CLI upload should print skip message when already uploaded."""
+    """The terminal stage reconciles already-uploaded chunks (no re-upload) and
+    reports them as skipped."""
     rec = tmp_path / "my-rec"
     rec.mkdir()
     (rec / "video.mp4").write_bytes(b"x" * 100)
     (rec / UPLOAD_STATUS_FILE).write_text('{"uploaded_at": "2026-01-01"}')
 
     runner = CliRunner()
+    fake = mock.MagicMock(return_value=_terminal_result_stub(
+        n_uploaded=0, n_skipped=1, sentinel_uploaded=True,
+    ))
     with (
         mock.patch("screencap.upload.get_recordings_dir", return_value=tmp_path),
-        mock.patch(
-            "screencap.scrubber.scrub_recording",
-            return_value=_stub_scrub_recording(rec),
-        ),
+        mock.patch("screencap.terminal_stage.run_terminal_stage", fake),
     ):
         result = runner.invoke(cli, ["upload", "my-rec"])
     assert result.exit_code == 0
-    assert "Already uploaded" in result.output
+    assert "skipped" in result.output
 
 
 # ---------------------------------------------------------------------------
@@ -1317,7 +1309,13 @@ def test_upload_cli_short_flag(tmp_path):
 
 def _make_uploadable_recording(tmp_path):
     """A non-chunked recording the upload loop won't mutate before the guard
-    (events.jsonl present → no export; no chunks → no recovery)."""
+    (events.jsonl present → no export; no chunks → no recovery).
+
+    SCR-125: every real recording is seeded with the pipeline-ledger schema
+    during recording, so ``run_terminal_stage``'s ``_open_ledger`` migration is a
+    no-op and the scrubbed-copy source hash is stable across review → upload.
+    Bake the schema in here so the fixture matches production (otherwise the
+    upload-time migration would mutate recording.db and defeat reuse)."""
     rec = tmp_path / "my-rec"
     rec.mkdir()
     (rec / "video.mp4").write_bytes(b"x" * 100)
@@ -1327,6 +1325,9 @@ def _make_uploadable_recording(tmp_path):
     conn.execute("INSERT INTO recording VALUES (1716800000.0)")
     conn.commit()
     conn.close()
+    from screencap.pipeline_state import ensure_pipeline_state_schema
+
+    ensure_pipeline_state_schema(rec / "recording.db")
     return rec
 
 
@@ -1570,10 +1571,10 @@ def test_upload_scrubs_when_no_scrubbed_copy(tmp_path):
     # records cloud_bound_recovery=False and is_scrubbed_copy_reusable refuses to
     # reuse it, defeating reviewed == uploaded.
     assert scrub_spy.call_args.kwargs.get("cloud_bound_recovery") is True
-    # _already_locked=True: the upload holds the per-recording scrub lock across
-    # reuse-check → scrub → upload, so scrub_recording must not re-acquire it
-    # (a same-process flock would deadlock).
-    assert scrub_spy.call_args.kwargs.get("_already_locked") is True
+    # SCR-125 U5: the terminal stage's CloudCopyProducer holds the terminal
+    # flock (a DIFFERENT lock file than recording_scrub_lock), so it does NOT
+    # pass _already_locked — scrub_recording self-serializes its own rebuild.
+    assert scrub_spy.call_args.kwargs.get("_already_locked") is not True
 
 
 def test_recording_scrub_lock_acquires_and_releases(tmp_path, monkeypatch):
@@ -1630,5 +1631,7 @@ def test_upload_scrub_failure_blocks_upload(tmp_path):
     ):
         result = runner.invoke(cli, ["upload", "my-rec"])
 
-    up_spy.assert_not_called()  # never uploaded without a scrub
-    assert "cannot upload without scrubbing" in result.output
+    up_spy.assert_not_called()  # never uploaded without a scrub (fail-closed)
+    # The terminal stage surfaces the scrub failure as a warning; the recording
+    # is not uploaded and local media is preserved.
+    assert "scrub/mask failed" in result.output
