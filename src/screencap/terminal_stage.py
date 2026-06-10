@@ -854,6 +854,31 @@ def _route_cloud(
     result.routed = True
     uploaded_ok = not upload_result.failed
 
+    # 3b. SCR-129: upload the per-chunk SOURCE media (video + audio). The
+    # `<name>-scrubbed` copy uploaded above STRIPS all media
+    # (scrubber._SKIP_EXTENSIONS), so on the terminal-stage-only paths
+    # (`--no-live-upload`, daemon resume of an all-session-failed live upload,
+    # local->cloud promotion) — where the live chunk_processor never uploaded —
+    # the video/audio would otherwise NEVER reach the cloud, leaving a
+    # permanently media-less copy (the chunks would then stay PENDING and the
+    # sentinel withheld). Runs BEFORE the confirm pass so `_chunk_confirmed_remote`
+    # can see the freshly-uploaded media. Idempotent (a chunk the live path
+    # already shipped returns url=None and is not re-PUT).
+    media_warning = _upload_source_media(
+        recording_dir, ledger,
+        scrubbed_dir=copy.scrubbed_dir,
+        failed_chunks=set(copy.failed_chunks),
+    )
+    if media_warning:
+        # Surface alongside (not instead of) any mask/scrub warning already set
+        # — a media-upload failure for a non-mask-failed chunk must stay visible
+        # (this bug is precisely "the cloud copy is incomplete and nobody is told").
+        result.upload_warning = (
+            f"{result.upload_warning}; {media_warning}"
+            if result.upload_warning
+            else media_warning
+        )
+
     # 4. Map upload onto the ledger per chunk (closed-set). A chunk is UPLOADED
     # only when its core files confirmed in GCS; otherwise it stays
     # PENDING/FAILED and blocks the gate.
@@ -893,6 +918,126 @@ def _route_cloud(
     )
 
     return result
+
+
+def _media_upload_indices(
+    ledger: "PipelineLedger | None",
+    failed_chunks: set[int],
+) -> list[int]:
+    """Chunk indices whose source media the terminal stage should (re)upload.
+
+    The closed set minus the chunks that must NOT be media-uploaded: already
+    ``UPLOADED`` (the live path shipped them — confirmed in GCS), ``LOCAL_DONE``
+    / ``SKIPPED`` (no cloud copy by design), ``EVICTED`` (media already gone,
+    re-confirmed in GCS before eviction), and fail-closed mask failures (no
+    safe copy to ship).
+
+    A legacy / no-ledger dir (R14) has no closed chunk set to gate on — it is
+    the whole-dir scrub path, not a per-chunk media upload (a true single-file
+    recording has a single ``video.mp4``, not ``chunk_*.mp4``), so this is a
+    no-op there, mirroring how reconcile / promotion treat the no-ledger case.
+    """
+    if ledger is None:
+        return []
+
+    from screencap.pipeline_state import Lifecycle, UploadState
+
+    out: list[int] = []
+    for row in ledger.all_chunks():
+        if row.chunk_index in failed_chunks:
+            continue
+        if row.upload_state == UploadState.UPLOADED:
+            continue
+        if row.lifecycle in (Lifecycle.LOCAL_DONE, Lifecycle.SKIPPED, Lifecycle.EVICTED):
+            continue
+        out.append(row.chunk_index)
+    return out
+
+
+def _upload_source_media(
+    recording_dir: Path,
+    ledger: "PipelineLedger | None",
+    *,
+    scrubbed_dir: Path,
+    failed_chunks: set[int],
+) -> str | None:
+    """Upload each not-yet-uploaded chunk's MEDIA (video + audio) — SCR-129.
+
+    The ``<name>-scrubbed`` copy the terminal stage uploads strips all media, so
+    the chunk video/audio must be shipped from the source directly here.
+    Mirrors the live path's ``_collect_chunk_files`` masked-path-switch
+    (R-SCR125-A):
+
+    * video ``chunk_NNNN.mp4`` — from ``<name>-scrubbed/masked_video/`` when the
+      FROZEN ``masked_video_upload`` flag is ON (NEVER the rich source), else
+      from the source dir;
+    * audio ``audio_NNNN.flac`` — always from the source dir (audio is not
+      masked, exactly as the live path uploads it).
+
+    Only the MEDIA is shipped — NOT events/manifest/transcript. Those are the
+    fully-scrubbed copies in ``<name>-scrubbed`` that the step-3 upload already
+    sent; the SOURCE events are window-filtered but NOT PII-scrubbed, so
+    uploading them would be an R8 leak. The GCS object NAME stays the plain
+    ``chunk_NNNN.mp4`` / ``audio_NNNN.flac`` so the per-chunk
+    ``_chunk_confirmed_remote`` probe recognizes them.
+
+    Reuses ``chunk_processor.upload_chunk_files`` (same ``assert_uploadable`` R8
+    gate + ``request_signed_urls`` resumability the live path uses). Returns a
+    one-line warning naming the chunk(s) whose media upload failed, else
+    ``None``.
+    """
+    from screencap.chunk_processor import upload_chunk_files
+    from screencap.pipeline_chunk_ops import get_frozen_masked_video_upload
+    from screencap.scrubber import masked_video_dir
+
+    indices = _media_upload_indices(ledger, failed_chunks)
+    if not indices:
+        return None
+
+    masked_on = get_frozen_masked_video_upload(recording_dir)
+    masked_dir = masked_video_dir(scrubbed_dir)
+    recording_name = _read_recording_name(recording_dir)
+
+    failures: list[int] = []
+    for idx in indices:
+        video_name = f"chunk_{idx:04d}.mp4"
+        # Flag ON → ship the masked copy; flag OFF → the capture-blocked rich
+        # source IS the cloud copy (byte-for-byte the live path's choice).
+        # KNOWN (flag ON, default OFF — folded into SCR-126 when the flag flips):
+        # the step-3 ``upload_recording(scrubbed_dir)`` rglobs subdirs and ALSO
+        # ships ``masked_video/chunk_NNNN.mp4`` under that nested key. The plain
+        # key uploaded here is the one ``_chunk_confirmed_remote`` probes; the
+        # nested copy is an orphaned duplicate (wasted bytes, not a correctness
+        # bug). Suppressing it belongs with enabling masked upload, not here.
+        video_path = (masked_dir if masked_on else recording_dir) / video_name
+        specs = [
+            (video_name, video_path),
+            (f"audio_{idx:04d}.flac", recording_dir / f"audio_{idx:04d}.flac"),
+        ]
+        files = [
+            {"name": nm, "path": p}
+            for nm, p in specs
+            if p.exists() and p.stat().st_size > 0
+        ]
+        if not files:
+            continue
+        try:
+            ok = upload_chunk_files(recording_name, files, recording_dir)
+        except Exception as exc:  # noqa: BLE001 — never crash the terminal stage
+            logger.error(
+                "terminal_stage: source-media upload raised for chunk %d: %s",
+                idx, exc,
+            )
+            ok = False
+        if not ok:
+            failures.append(idx)
+
+    if failures:
+        return (
+            f"source media upload failed for chunk(s) "
+            f"{', '.join(str(i) for i in failures)} — sentinel may be withheld"
+        )
+    return None
 
 
 def _apply_retention_override(
