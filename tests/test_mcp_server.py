@@ -1,0 +1,220 @@
+"""Tests for the SCR-118 U5 ``screencap mcp`` thin stdio server.
+
+The tool functions are exercised directly (they are module-level), against both
+a stub client (mapping / clamp / error / no-match) and a real in-process daemon
+over ASGITransport (round-trip + held liveness subscription). The stdout
+discipline test runs the REAL ``mcp`` import so dependency-side stdout noise is
+caught.
+"""
+
+from __future__ import annotations
+
+import asyncio
+import contextlib
+import io
+
+import httpx
+import pytest
+
+from screencap.mcp import server
+from screencap.mcp._client import AsyncDaemonClient, DaemonError, LivenessSubscription
+
+# --------------------------------------------------------------------------
+# Stub client (mapping / clamp / error / no-match)
+# --------------------------------------------------------------------------
+
+
+class _StubClient:
+    def __init__(self, responses: dict | None = None, *, raises: Exception | None = None):
+        self.responses = responses or {}
+        self.raises = raises
+        self.calls: list[tuple] = []
+
+    async def _reply(self, kind, *args):
+        self.calls.append((kind, *args))
+        if self.raises is not None:
+            raise self.raises
+        return self.responses[kind]
+
+    async def content_search(self, query, *, recording=None, limit=None):
+        return await self._reply("content", query, recording, limit)
+
+    async def transcript_search(self, query, *, recording=None, limit=None):
+        return await self._reply("transcript", query, recording, limit)
+
+    async def timeline_query(self, *, start_ms=None, end_ms=None, app=None, recording=None, limit=None):
+        return await self._reply("timeline", start_ms, end_ms, app, recording, limit)
+
+    async def list_recordings(self):
+        return await self._reply("recordings")
+
+
+def _use_client(monkeypatch, client) -> None:
+    async def _fake_client():
+        return client
+
+    monkeypatch.setattr(server, "_client", _fake_client)
+
+
+@pytest.mark.asyncio
+async def test_content_tool_maps_pointer_only_hits(monkeypatch):
+    stub = _StubClient({
+        "content": {
+            "ok": True,
+            "hits": [{"recording": "demo", "timestamp_ms": 125000, "snippet": "invoice", "score": -1.2}],
+            "index_state": "ok",
+        }
+    })
+    _use_client(monkeypatch, stub)
+
+    result = await server.search_screen_content("invoice")
+
+    assert isinstance(result, server.ContentSearchResult)
+    assert result.index_state == "ok"
+    assert result.hits[0].recording == "demo"
+    assert result.hits[0].timestamp_ms == 125000
+    # Pointer-only: the model has no path/bytes field by construction.
+    assert set(server.ContentHit.model_fields) == {"recording", "timestamp_ms", "snippet", "score"}
+
+
+@pytest.mark.asyncio
+async def test_transcript_and_timeline_tools_map(monkeypatch):
+    stub = _StubClient({
+        "transcript": {"ok": True, "hits": [{"recording": "d", "chunk_index": 3, "snippet": "budget"}], "coverage": "best_effort"},
+        "timeline": {"ok": True, "rows": [{"recording": "d", "timestamp_ms": 1, "app": "Safari", "title": "T"}], "coverage": "authoritative"},
+    })
+    _use_client(monkeypatch, stub)
+
+    tr = await server.search_transcript("budget")
+    assert tr.coverage == "best_effort"
+    assert tr.hits[0].chunk_index == 3
+
+    tl = await server.query_timeline(app="safari")
+    assert tl.coverage == "authoritative"
+    assert tl.rows[0].app == "Safari"
+
+
+@pytest.mark.asyncio
+async def test_tool_limit_is_clamped(monkeypatch):
+    stub = _StubClient({"content": {"ok": True, "hits": [], "index_state": "no_match"}})
+    _use_client(monkeypatch, stub)
+
+    await server.search_screen_content("x", limit=10_000)
+
+    # The forwarded limit was clamped to the tool-layer max.
+    _, _query, _rec, forwarded_limit = stub.calls[0]
+    assert forwarded_limit == server._MAX_TOOL_LIMIT
+
+
+@pytest.mark.asyncio
+async def test_no_matches_returns_empty_not_error(monkeypatch):
+    stub = _StubClient({"content": {"ok": True, "hits": [], "index_state": "no_match"}})
+    _use_client(monkeypatch, stub)
+
+    result = await server.search_screen_content("nothing")
+    assert result.hits == []
+    assert result.index_state == "no_match"
+
+
+@pytest.mark.asyncio
+async def test_daemon_unreachable_raises_clean_error(monkeypatch):
+    stub = _StubClient(raises=DaemonError("daemon unreachable"))
+    _use_client(monkeypatch, stub)
+
+    with pytest.raises(DaemonError):
+        await server.search_screen_content("x")
+
+
+# --------------------------------------------------------------------------
+# Real in-process daemon round-trip (ASGITransport)
+# --------------------------------------------------------------------------
+
+
+def _test_daemon_client() -> AsyncDaemonClient:
+    from screencap.daemon.app import build_app
+
+    return AsyncDaemonClient(transport=httpx.ASGITransport(app=build_app()))
+
+
+@pytest.mark.asyncio
+async def test_content_tool_round_trips_through_daemon(monkeypatch, tmp_path):
+    import screencap.content_index as content_index
+
+    store_path = tmp_path / "content_index.db"
+    monkeypatch.setattr(content_index, "default_index_path", lambda: store_path)
+    with content_index.ContentIndex(store_path) as store:
+        store.write_frames(
+            "demo", [content_index.IndexFrame(timestamp_ms=1000, text="the invoice total")]
+        )
+
+    client = _test_daemon_client()
+    _use_client(monkeypatch, client)
+    try:
+        result = await server.search_screen_content("invoice")
+    finally:
+        await client.aclose()
+
+    assert result.index_state == "ok"
+    assert result.hits[0].recording == "demo"
+    assert "invoice" in result.hits[0].snippet.lower()
+
+
+async def _events_app(scope, receive, send):
+    """Minimal ASGI app that emits one `subscribed` NDJSON frame then ends.
+
+    A finite stream avoids the in-process ASGITransport deadlock that closing an
+    *infinite* stream causes (production uses a real UDS transport where aclose
+    closes the socket promptly). This exercises that open() consumes the
+    subscribed frame and aclose() cleans up without hanging.
+    """
+    assert scope["type"] == "http"
+    await send({
+        "type": "http.response.start",
+        "status": 200,
+        "headers": [(b"content-type", b"application/x-ndjson")],
+    })
+    await send({
+        "type": "http.response.body",
+        "body": b'{"type": "subscribed", "cursor": 0}\n',
+        "more_body": True,
+    })
+    await send({"type": "http.response.body", "body": b"", "more_body": False})
+
+
+@pytest.mark.asyncio
+async def test_liveness_subscription_opens_and_closes():
+    client = AsyncDaemonClient(transport=httpx.ASGITransport(app=_events_app))
+    sub = LivenessSubscription(client.raw)
+    try:
+        # open() must consume the `subscribed` frame without raising; the whole
+        # cycle is timeout-guarded so a regression hangs the test loudly.
+        await asyncio.wait_for(sub.open(), timeout=5.0)
+    finally:
+        await asyncio.wait_for(sub.aclose(), timeout=5.0)
+        await client.aclose()
+
+
+# --------------------------------------------------------------------------
+# stdout discipline (real mcp import)
+# --------------------------------------------------------------------------
+
+
+@pytest.mark.asyncio
+async def test_server_writes_nothing_to_stdout(monkeypatch):
+    stub = _StubClient({"content": {"ok": True, "hits": [], "index_state": "no_match"}})
+    _use_client(monkeypatch, stub)
+
+    buf = io.StringIO()
+    with contextlib.redirect_stdout(buf):
+        # Building the FastMCP app (real SDK) + a tool call must not touch stdout
+        # — the stdio transport owns it for the JSON-RPC stream.
+        server.build_server()
+        await server.search_screen_content("x")
+
+    assert buf.getvalue() == ""
+
+
+def test_mcp_command_registered():
+    from screencap.cli import cli
+
+    assert "mcp" in cli.commands

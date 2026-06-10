@@ -228,6 +228,23 @@ def serve(
     )
 
 
+@cli.command("mcp")
+def mcp() -> None:
+    """Run the MCP stdio server (for Claude Desktop / Codex / other agents).
+
+    Exposes ScreenCap's retrieval surface as MCP tools that forward to the
+    daemon over its UNIX socket. Communicates over stdin/stdout via JSON-RPC,
+    so it is launched as a subprocess by the MCP client, not run interactively.
+    See ``docs/mcp-client-setup.md``.
+    """
+    # Defer the mcp/httpx imports so ``screencap --help`` stays fast and only
+    # the ``mcp`` invocation pays for the SDK. stdout belongs to the JSON-RPC
+    # stream — the server logs to stderr only.
+    from screencap.mcp.server import run_stdio
+
+    run_stdio()
+
+
 @cli.command("_engine-worker", hidden=True)
 @click.argument("encoded_args")
 def _engine_worker_cmd(encoded_args: str) -> None:
