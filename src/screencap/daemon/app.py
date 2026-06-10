@@ -654,6 +654,84 @@ async def events_stream(request: Request) -> JSONResponse | StreamingResponse:
     return StreamingResponse(stream(), media_type="application/x-ndjson")
 
 
+def _run_content_search(
+    query: str, recording: str | None, limit: int | None,
+) -> dict[str, Any]:
+    """Blocking content-index search, run off the event loop via to_thread.
+
+    Never opens/creates the store when it does not exist yet (a read must not
+    spawn an empty PII store) — surfaces ``not_indexed`` instead. The store's
+    own ``search`` is fail-soft (corrupt → ``store_unavailable``), so this never
+    raises for an unreadable store.
+    """
+    from screencap.content_index import ContentIndex, IndexState, default_index_path
+
+    path = default_index_path()
+    if not path.exists():
+        return {"hits": [], "index_state": IndexState.NOT_INDEXED.value}
+
+    kwargs: dict[str, Any] = {}
+    if limit is not None:
+        kwargs["limit"] = limit
+    with ContentIndex(path) as store:
+        result = store.search(query, recording=recording, **kwargs)
+    return {
+        "hits": [
+            {
+                "recording": h.recording,
+                "timestamp_ms": h.timestamp_ms,
+                "snippet": h.snippet,
+                "score": h.score,
+            }
+            for h in result.hits
+        ],
+        "index_state": result.index_state.value,
+    }
+
+
+async def content_search(request: Request) -> JSONResponse:
+    """``POST /v0/content.search`` — ranked on-screen-text snippets + pointers.
+
+    Read-only over the global content index (SCR-118). Pointer-only response
+    (the model is structurally incapable of carrying a media path or image
+    bytes — R8). The caller-supplied ``recording`` filter is routed through the
+    canonical name validator (traversal-safe) before use; the FTS ``MATCH`` is
+    bound + phrase-escaped inside ``content_index``. A missing/corrupt store
+    fails soft via ``index_state`` rather than 500-ing. Deliberately NOT in
+    ``_ACTIVITY_PATHS`` — idle-shutdown is kept alive by the MCP-held
+    subscription (U5), preserving the cron-polling protection.
+    """
+    from screencap.daemon._name_validation import validate_recording_name
+
+    try:
+        body = await request.json()
+        if not isinstance(body, dict):
+            body = {}
+        parsed = schema.ContentSearchRequest.model_validate(body)
+        recording = parsed.recording
+        if recording is not None:
+            validate_recording_name(recording)
+
+        result = await asyncio.to_thread(
+            _run_content_search, parsed.query, recording, parsed.limit,
+        )
+        return JSONResponse(
+            schema.envelope(
+                schema_version=schema._CONTENT_SEARCH_API_VERSION,
+                hits=result["hits"],
+                index_state=result["index_state"],
+            )
+        )
+    except errors.DaemonAPIError as exc:
+        return _api_error_response(exc)
+    except Exception as exc:
+        return _internal_error_response(
+            exc,
+            schema_version=schema._CONTENT_SEARCH_API_VERSION,
+            request=request,
+        )
+
+
 def build_app() -> Starlette:
     app = Starlette(
         routes=[
@@ -664,6 +742,7 @@ def build_app() -> Starlette:
             Route("/v0/recording.start", recording_start, methods=["POST"]),
             Route("/v0/recording.stop", recording_stop, methods=["POST"]),
             Route("/v0/permission.request", permission_request, methods=["POST"]),
+            Route("/v0/content.search", content_search, methods=["POST"]),
         ],
         lifespan=lifespan,
     )

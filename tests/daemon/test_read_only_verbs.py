@@ -459,3 +459,119 @@ async def test_recording_list_ignores_active_cli_lock(
     payload = response.json()
     assert payload["ok"] is True
     assert [row["name"] for row in payload["recordings"]] == ["while-cli-records"]
+
+
+# ---------------------------------------------------------------------------
+# SCR-118 content.search (U3)
+# ---------------------------------------------------------------------------
+
+
+async def _asgi_post(path: str, body: dict) -> httpx.Response:
+    from screencap.daemon.app import build_app
+
+    transport = httpx.ASGITransport(app=build_app())
+    async with httpx.AsyncClient(transport=transport, base_url="http://test") as client:
+        return await client.post(path, json=body)
+
+
+def _seed_content_index(tmp_path: Path, monkeypatch: pytest.MonkeyPatch):
+    """Seed a content-index store and point the daemon handler at it."""
+    import screencap.content_index as content_index
+
+    store_path = tmp_path / "content_index.db"
+    monkeypatch.setattr(content_index, "default_index_path", lambda: store_path)
+    return content_index, store_path
+
+
+@pytest.mark.asyncio
+async def test_content_search_returns_pointer_only_hits(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    content_index, store_path = _seed_content_index(tmp_path, monkeypatch)
+    with content_index.ContentIndex(store_path) as store:
+        store.write_frames(
+            "demo",
+            [content_index.IndexFrame(timestamp_ms=125_000, text="the invoice total was wrong")],
+        )
+
+    response = await _asgi_post("/v0/content.search", {"query": "invoice"})
+
+    assert response.status_code == 200
+    payload = response.json()
+    _assert_envelope(payload, expected_schema_version=schema._CONTENT_SEARCH_API_VERSION)
+    assert payload["index_state"] == "ok"
+    assert len(payload["hits"]) == 1
+    hit = payload["hits"][0]
+    # Pointer-only: exactly these fields, no path / image bytes.
+    assert set(hit) == {"recording", "timestamp_ms", "snippet", "score"}
+    assert hit["recording"] == "demo"
+    assert hit["timestamp_ms"] == 125_000
+    assert "invoice" in hit["snippet"].lower()
+    # No media-path-shaped value anywhere in the serialized body.
+    assert ".mp4" not in response.text
+    assert ".jpg" not in response.text
+
+
+@pytest.mark.asyncio
+async def test_content_search_not_indexed_when_store_absent(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    _seed_content_index(tmp_path, monkeypatch)  # store path set but file absent
+
+    response = await _asgi_post("/v0/content.search", {"query": "anything"})
+
+    assert response.status_code == 200
+    payload = response.json()
+    assert payload["ok"] is True
+    assert payload["hits"] == []
+    assert payload["index_state"] == "not_indexed"
+    # A read must not have created an empty PII store.
+    assert not (tmp_path / "content_index.db").exists()
+
+
+@pytest.mark.asyncio
+async def test_content_search_rejects_traversal_recording(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    _seed_content_index(tmp_path, monkeypatch)
+
+    response = await _asgi_post(
+        "/v0/content.search", {"query": "x", "recording": "../../etc"}
+    )
+
+    assert response.status_code >= 400
+    payload = response.json()
+    assert payload["ok"] is False
+    assert payload["error"] == "invalid_name"
+
+
+@pytest.mark.asyncio
+async def test_content_search_fts_injection_is_literal(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    content_index, store_path = _seed_content_index(tmp_path, monkeypatch)
+    with content_index.ContentIndex(store_path) as store:
+        store.write_frames(
+            "demo", [content_index.IndexFrame(timestamp_ms=1000, text="ordinary words")]
+        )
+
+    for query in ('"', "*", "NEAR", "recording:demo", "a AND b"):
+        response = await _asgi_post("/v0/content.search", {"query": query})
+        assert response.status_code == 200, query
+        assert response.json()["ok"] is True
+
+
+@pytest.mark.asyncio
+async def test_content_search_limit_is_clamped(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    content_index, store_path = _seed_content_index(tmp_path, monkeypatch)
+    with content_index.ContentIndex(store_path) as store:
+        store.write_frames(
+            "demo",
+            [content_index.IndexFrame(timestamp_ms=i, text=f"match {i}") for i in range(30)],
+        )
+
+    response = await _asgi_post("/v0/content.search", {"query": "match", "limit": 5})
+    assert response.status_code == 200
+    assert len(response.json()["hits"]) == 5

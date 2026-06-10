@@ -257,6 +257,23 @@ class DaemonHTTPClient:
             self._request("POST", "/v0/recording.stop", json_body=body, timeout=timeout)
         )
 
+    def content_search(
+        self,
+        query: str,
+        *,
+        recording: str | None = None,
+        limit: int | None = None,
+    ) -> dict[str, Any]:
+        """``POST /v0/content.search`` — on-screen-text snippets + pointers."""
+        body: dict[str, Any] = {"query": query}
+        if recording is not None:
+            body["recording"] = recording
+        if limit is not None:
+            body["limit"] = limit
+        return self._parse_ok_envelope(
+            self._request("POST", "/v0/content.search", json_body=body)
+        )
+
     @contextmanager
     def events(
         self,

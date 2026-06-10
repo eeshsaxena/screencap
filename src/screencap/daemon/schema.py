@@ -14,6 +14,8 @@ _RECORDING_START_API_VERSION = 1
 RECORDING_START_API_VERSION = _RECORDING_START_API_VERSION  # public alias
 _RECORDING_STOP_API_VERSION = 1
 _PERMISSION_REQUEST_API_VERSION = 1
+# SCR-118 read-only query verbs.
+_CONTENT_SEARCH_API_VERSION = 1
 
 
 @cache
@@ -48,6 +50,9 @@ _MODEL_NAMES = {
     "RecordingStopResponse",
     "PermissionRequestRequest",
     "PermissionRequestResponse",
+    "ContentSearchRequest",
+    "ContentHit",
+    "ContentSearchResponse",
 }
 _MODELS: dict[str, Any] | None = None
 
@@ -209,6 +214,33 @@ def _load_models() -> dict[str, Any]:
         # than gating on this value.
         already_granted: bool
 
+    class ContentSearchRequest(_DaemonModel):
+        """SCR-118 on-screen content search input."""
+
+        query: str
+        recording: str | None = None
+        limit: int | None = None
+
+    class ContentHit(_DaemonModel):
+        """A single content match — POINTER ONLY.
+
+        Structurally incapable of carrying a media path or image bytes: text
+        snippet + ``(recording, timestamp_ms)`` pointer + bm25 score. R8 is a
+        property of this shape, enforced at the daemon boundary.
+        """
+
+        recording: str
+        timestamp_ms: int
+        snippet: str
+        score: float
+
+    class ContentSearchResponse(EnvelopeResponse):
+        hits: list[ContentHit]
+        # IndexState enum value: ok / no_match / not_indexed / ocr_unavailable
+        # / index_degraded / store_unavailable. Typed as str (not Literal) so a
+        # future state decodes tolerantly.
+        index_state: str
+
     _MODELS = {
         "EnvelopeResponse": EnvelopeResponse,
         "DaemonInfoResponse": DaemonInfoResponse,
@@ -222,6 +254,9 @@ def _load_models() -> dict[str, Any]:
         "RecordingStopResponse": RecordingStopResponse,
         "PermissionRequestRequest": PermissionRequestRequest,
         "PermissionRequestResponse": PermissionRequestResponse,
+        "ContentSearchRequest": ContentSearchRequest,
+        "ContentHit": ContentHit,
+        "ContentSearchResponse": ContentSearchResponse,
     }
     # `__getattr__` below dispatches every documented model name through
     # `_MODELS`, so injecting them into `globals()` would just shadow that
@@ -249,6 +284,7 @@ __all__ = [
     "_RECORDING_START_API_VERSION",
     "_RECORDING_STOP_API_VERSION",
     "_PERMISSION_REQUEST_API_VERSION",
+    "_CONTENT_SEARCH_API_VERSION",
     "daemon_version",
     "envelope",
 ] + sorted(_MODEL_NAMES)
