@@ -5,6 +5,7 @@ from __future__ import annotations
 import json
 import mimetypes
 import os
+import re
 import signal
 from concurrent.futures import ThreadPoolExecutor, as_completed
 from dataclasses import dataclass, field
@@ -209,6 +210,59 @@ def assert_uploadable(file_info: FileInfo) -> FileInfo:
     return file_info
 
 
+# ---------------------------------------------------------------------------
+# SCR-126 / Fix 1: the masked-video upload-seam gate.
+#
+# Sibling of `assert_uploadable`. When the FROZEN `masked_video_upload` decision
+# is ON for a recording, the post-hoc masker is the ONLY source of cloud chunk
+# video — every cloud `chunk_NNNN.mp4` must be the masked copy materialized under
+# `<name>-scrubbed/masked_video/` (`scrubber.masked_video_dir`), NEVER the rich
+# capture-time source. Unlike the existing masked-path *switch* (which each upload
+# caller applies), this gate sits at the enqueue boundary so a switch regression
+# in ANY path (live `_collect_chunk_files`, terminal `_upload_source_chunk_media`,
+# or the scrubbed-dir rglob `upload_recording`) fails loud instead of shipping a
+# clear chunk. It is path-structural, not content-inspecting, by design: a clear
+# copy can only legitimately live under `masked_video/` as a coverage-proven
+# `UNMASKED_PROVABLY_SAFE` output, and a stale/foreign copy there is the
+# scrubbed-copy reuse guard's concern (SCR-126 Fix 3), not this gate's.
+#
+# `masked_upload_on` is the FROZEN per-recording decision the CALLER resolves once
+# (via `pipeline_chunk_ops.get_frozen_masked_video_upload`) and passes in — this
+# keeps `upload.py` free of a `catalog`/`.recording_intent` dependency and uses the
+# SAME resolution the masked-path switch uses, so the gate is a true backstop of
+# the switch. The resolver's fallback-to-global (on a missing/legacy intent) only
+# activates the gate when the global is ON — the fail-closed direction (it demands
+# a masked path); with the flag OFF (today's default) the gate is inert and OFF /
+# legacy recordings ship their capture-blocked source exactly as before.
+_CHUNK_VIDEO_RE = re.compile(r"chunk_\d+\.mp4")
+_MASKED_VIDEO_DIRNAME = "masked_video"
+
+
+def assert_video_masked(file_info: FileInfo, *, masked_upload_on: bool) -> FileInfo:
+    """Hard safety gate: refuse to enqueue an unmasked cloud chunk video.
+
+    No-op when ``masked_upload_on`` is False (the OFF default — the capture-blocked
+    source IS the cloud copy). When True, a ``chunk_NNNN.mp4`` whose local path is
+    not under a ``masked_video/`` directory raises — the rich source must never
+    leave the machine while masked upload is enabled (SCR-126 Fix 1, fail closed).
+    Non-video artifacts pass through unchanged. Returns *file_info* when uploadable
+    so call sites can wrap an enqueue inline.
+    """
+    if not masked_upload_on:
+        return file_info
+    base = file_info.name.rsplit("/", 1)[-1]
+    if not _CHUNK_VIDEO_RE.fullmatch(base):
+        return file_info
+    if _MASKED_VIDEO_DIRNAME in file_info.path.parts:
+        return file_info
+    raise ValueError(
+        f"refusing to upload unmasked cloud chunk video {file_info.name!r} "
+        f"(path {file_info.path}): masked_video_upload is ON for this recording, "
+        f"so every cloud chunk_*.mp4 must be the post-hoc-masked copy under "
+        f"{_MASKED_VIDEO_DIRNAME}/ — never the rich capture-time source (SCR-126)."
+    )
+
+
 def list_recording_files(recording_dir: Path) -> list[FileInfo]:
     """Return files in a recording dir, sorted largest-first.
 
@@ -341,6 +395,7 @@ def upload_recording(
     max_retries: int = 1,
     force: bool = False,
     jobs: int = 4,
+    masked_video_upload: bool = False,
 ) -> UploadResult:
     """Upload all files in a recording directory.
 
@@ -379,6 +434,12 @@ def upload_recording(
     # gate, and it fails loud rather than silently shipping raw PII.
     for f in files:
         assert_uploadable(f)
+        # SCR-126 Fix 1: when masked-video upload is ON, the scrubbed-dir rglob
+        # (the path that ships masked_video/chunk_NNNN.mp4) must never enumerate a
+        # rich-source chunk video. The caller resolves the frozen decision from the
+        # SOURCE recording dir and passes it in (the scrubbed dir is what's
+        # enumerated here, so its own intent is not authoritative).
+        assert_video_masked(f, masked_upload_on=masked_video_upload)
 
     total_size = sum(f.size for f in files)
     console.print(

@@ -1031,3 +1031,56 @@ class TestTerminalStageCloudCopyProducerOrdering:
         producer = CloudCopyProducer(capture_dir)
         producer.produce(ledger=None, force=False)
         assert not scrub_called, "reusable scrubbed copy must not be rebuilt"
+
+
+# ---------------------------------------------------------------------------
+# SCR-126 Fix 2 / R3: the shared chunk-range helper. Locks the boundary
+# arithmetic that recovery (events/manifests) and the terminal masker (per-chunk
+# absolute origin) BOTH consume, so they cannot drift.
+# ---------------------------------------------------------------------------
+
+
+def _make_ranges_db(path: Path, *, rec_start: float, event_ts: list[float]) -> None:
+    import sqlite3
+
+    with sqlite3.connect(str(path)) as db:
+        db.execute("CREATE TABLE recording (id INTEGER PRIMARY KEY, timestamp REAL)")
+        db.execute("INSERT INTO recording (id, timestamp) VALUES (1, ?)", (rec_start,))
+        db.execute("CREATE TABLE action_event (id INTEGER PRIMARY KEY, timestamp REAL)")
+        for ts in event_ts:
+            db.execute("INSERT INTO action_event (timestamp) VALUES (?)", (ts,))
+        db.commit()
+
+
+def test_derive_chunk_ranges_grid_and_last_chunk_extension(tmp_path):
+    from screencap.recovery import derive_chunk_ranges
+
+    db = tmp_path / "recording.db"
+    _make_ranges_db(db, rec_start=100.0, event_ts=[100.5, 130.0])
+
+    with patch("screencap.config.get_chunk_duration", return_value=10.0):
+        ranges = derive_chunk_ranges(db, n_chunks=3)
+
+    # base_ts = min(rec_start=100.0, first_event=100.5) = 100.0; uniform 10s grid;
+    # last chunk extends to max(grid_end=130.0, last_event+1.0=131.0) = 131.0.
+    assert ranges == [
+        (0, 100.0, 110.0),
+        (1, 110.0, 120.0),
+        (2, 120.0, 131.0),
+    ]
+
+
+def test_derive_chunk_ranges_empty_when_no_events_or_no_recording(tmp_path):
+    from screencap.recovery import derive_chunk_ranges
+
+    # No action events → [] (caller falls back to best-effort).
+    db1 = tmp_path / "no_events.db"
+    _make_ranges_db(db1, rec_start=100.0, event_ts=[])
+    with patch("screencap.config.get_chunk_duration", return_value=10.0):
+        assert derive_chunk_ranges(db1, n_chunks=2) == []
+
+    # n_chunks <= 0 → [] without touching the DB.
+    assert derive_chunk_ranges(db1, n_chunks=0) == []
+
+    # Unreadable / missing DB → [] (read error swallowed, fail to best-effort).
+    assert derive_chunk_ranges(tmp_path / "does_not_exist.db", n_chunks=2) == []

@@ -23,6 +23,79 @@ if TYPE_CHECKING:
     from rich.console import Console
 
 
+def derive_chunk_grid(
+    db_path: Path, n_chunks: int
+) -> tuple[float, float, float] | None:
+    """The single source of chunk-grid arithmetic: ``(base_ts, chunk_dur, last_ts)``.
+
+    Shared by recovery (manifest / event windowing via :func:`derive_chunk_ranges`)
+    and the terminal video masker (each chunk's absolute ORIGIN = ``base_ts +
+    idx*chunk_dur``), so the two cannot drift (SCR-126 Fix 2 / R3). ``base_ts =
+    min(recording.timestamp, MIN(action_event.timestamp))``; a config ``chunk_dur``
+    (resolved to ``(last_ts - first_ts) / n_chunks`` when ``<= 0``); ``last_ts =
+    MAX(action_event.timestamp)`` for the last-chunk extension.
+
+    Returns ``None`` when the DB lacks a recording row or any action event, or on
+    any read error — callers fall back to their own best-effort posture.
+    """
+    if n_chunks <= 0:
+        return None
+    from screencap.config import get_chunk_duration
+    from screencap.recording_db import Row, open_recording_db
+
+    try:
+        with open_recording_db(db_path, row_factory=Row) as conn:
+            rec = conn.execute(
+                "SELECT timestamp FROM recording LIMIT 1"
+            ).fetchone()
+            if not rec:
+                return None
+            rec_start = rec["timestamp"]
+            first_evt = conn.execute(
+                "SELECT MIN(timestamp) as ts FROM action_event"
+            ).fetchone()
+            last_evt = conn.execute(
+                "SELECT MAX(timestamp) as ts FROM action_event"
+            ).fetchone()
+        if not first_evt or first_evt["ts"] is None:
+            return None
+        first_ts = first_evt["ts"]
+        last_ts = last_evt["ts"] if last_evt and last_evt["ts"] is not None else first_ts
+        chunk_dur = get_chunk_duration()
+        if chunk_dur <= 0:
+            chunk_dur = (last_ts - first_ts) / max(n_chunks, 1)
+        base_ts = min(rec_start, first_ts) if rec_start is not None else first_ts
+        return (base_ts, chunk_dur, last_ts)
+    except Exception:  # noqa: BLE001 — caller falls back to best-effort
+        return None
+
+
+def derive_chunk_ranges(
+    db_path: Path, n_chunks: int
+) -> list[tuple[int, float, float]]:
+    """Per-chunk ``(idx, c_start, c_end)`` absolute event-windowing spans.
+
+    Built from :func:`derive_chunk_grid` (the shared base/dur source) — a uniform
+    ``chunk_dur`` grid whose LAST chunk's end extends to ``max(grid_end, last_ts +
+    1.0)`` to cover all trailing events. The masker shares only the *origin*
+    (``c_start``) via ``derive_chunk_grid``; it derives each chunk's END from the
+    chunk's own decoded PTS extent (frames, not events), which legitimately differs
+    from ``c_end``. Returns ``[]`` when the grid is unavailable.
+    """
+    grid = derive_chunk_grid(db_path, n_chunks)
+    if grid is None:
+        return []
+    base_ts, chunk_dur, last_ts = grid
+    ranges: list[tuple[int, float, float]] = []
+    for idx in range(n_chunks):
+        c_start = base_ts + idx * chunk_dur
+        c_end = base_ts + (idx + 1) * chunk_dur
+        if idx == n_chunks - 1:
+            c_end = max(c_end, last_ts + 1.0)  # last chunk covers all events
+        ranges.append((idx, c_start, c_end))
+    return ranges
+
+
 def _recover_chunk_metadata(
     recording_dir: Path, console: "Console", *, force: bool = False,
     cloud_bound: bool,
@@ -59,8 +132,6 @@ def _recover_chunk_metadata(
     underlying data is fixed. Recovery's previous "raw dump tolerates
     everything" behaviour is intentionally retired by this refactor.
     """
-    from screencap.recording_db import Row, open_recording_db
-
     chunk_videos = sorted(recording_dir.glob("chunk_*.mp4"))
     if not chunk_videos:
         return  # not a chunked recording
@@ -97,43 +168,15 @@ def _recover_chunk_metadata(
     for idx in missing_manifests:
         (recording_dir / f"chunk_{idx:04d}_manifest.json.tmp").unlink(missing_ok=True)
 
-    # Derive chunk time ranges from recording.db. Click thresholds and the
-    # disabled-row / schema-drift handling now live inside
-    # ``screencap.export.export_chunk_events`` — recovery only needs the
-    # range arithmetic here.
-    try:
-        with open_recording_db(db_path, row_factory=Row) as conn:
-            rec = conn.execute(
-                "SELECT timestamp FROM recording LIMIT 1"
-            ).fetchone()
-            if not rec:
-                return
-            rec_start = rec["timestamp"]
-
-            first_evt = conn.execute("SELECT MIN(timestamp) as ts FROM action_event").fetchone()
-            last_evt = conn.execute("SELECT MAX(timestamp) as ts FROM action_event").fetchone()
-            if not first_evt or first_evt["ts"] is None:
-                return
-
-            first_ts = first_evt["ts"]
-            last_ts = last_evt["ts"]
-            n_chunks = len(chunk_videos)
-
-            from screencap.config import get_chunk_duration
-            chunk_dur = get_chunk_duration()
-            if chunk_dur <= 0:
-                chunk_dur = (last_ts - first_ts) / max(n_chunks, 1)
-
-            base_ts = min(rec_start, first_ts)
-            chunk_ranges = []
-            for idx in range(n_chunks):
-                c_start = base_ts + idx * chunk_dur
-                c_end = base_ts + (idx + 1) * chunk_dur
-                if idx == n_chunks - 1:
-                    c_end = max(c_end, last_ts + 1.0)  # last chunk extends to cover all events
-                chunk_ranges.append((idx, c_start, c_end))
-    except Exception as e:
-        console.print(f"  [yellow]Warning:[/yellow] Could not derive chunk ranges: {e}")
+    # Derive chunk time ranges from recording.db via the shared helper (the same
+    # arithmetic the terminal masker uses for each chunk's absolute origin, so the
+    # two cannot drift — SCR-126 Fix 2 / R3). Click thresholds and the
+    # disabled-row / schema-drift handling live inside
+    # ``screencap.export.export_chunk_events`` — recovery only needs the ranges.
+    chunk_ranges = derive_chunk_ranges(db_path, len(chunk_videos))
+    if not chunk_ranges:
+        # No recording row / no action events / read error — nothing to window
+        # against. Skip generation (best-effort recovery), as before.
         return
 
     # Generate missing manifests

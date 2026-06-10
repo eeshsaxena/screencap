@@ -427,19 +427,64 @@ class CloudCopyProducer:
             get_frozen_masked_video_upload,
             mask_chunk_for_cloud,
         )
+        from screencap.recovery import derive_chunk_grid
+        from screencap.scrubber import (
+            is_masked_video_reusable,
+            purge_orphan_masked_videos,
+            write_masked_provenance,
+        )
 
         if not get_frozen_masked_video_upload(self._recording_dir):
             return
 
         db_path = self._recording_dir / "recording.db"
         chunk_videos = sorted(self._recording_dir.glob("chunk_*.mp4"))
-        chunk_start_abs, chunk_dur = _chunk_timing(db_path, len(chunk_videos))
+        expected: set[int] = set()
+        for vf in chunk_videos:
+            try:
+                expected.add(int(vf.stem.split("_")[1]))
+            except (IndexError, ValueError):
+                continue
+
+        # SCR-126 Fix 3 — AUTHORITATIVE closed-set reconcile FIRST: purge any
+        # masked_video/chunk_*.mp4 whose source chunk no longer exists (an orphan
+        # the per-chunk pass never visits — e.g. a source evicted since the last
+        # pass). This MUST run before the reuse-skip below: the reuse check only
+        # validates the EXPECTED set, so an orphan would otherwise survive a skipped
+        # produce and reach the rglob upload.
+        purge_orphan_masked_videos(scrubbed_dir, expected_indices=expected)
+
+        # SCR-126 Fix 3 / R4 — reuse skip: when every expected chunk already has a
+        # masked copy provably current for ALL masking inputs (source bytes,
+        # geometry, policy, pixel_ratio, mask-logic version), the re-encode is
+        # skipped (reviewed == uploaded). Provenance + ledger scrub-state persist
+        # from the pass that wrote them.
+        if is_masked_video_reusable(
+            self._recording_dir, scrubbed_dir, expected_indices=expected
+        ):
+            outcome.masked_chunks.extend(sorted(expected))
+            return
+
+        # SCR-126 Fix 2 / R3: each chunk's absolute ORIGIN is base_ts + idx*chunk_dur
+        # keyed on the FILENAME index (correct for non-contiguous indices, e.g. after
+        # per-index eviction), from the SHARED grid helper recovery also uses — so
+        # the masked video and recovery's manifests/events cannot drift. The masker
+        # derives each chunk's END from its own decoded PTS extent (advisory here).
+        grid = derive_chunk_grid(db_path, len(chunk_videos))
+        if grid is not None:
+            base_ts, chunk_dur, _last_ts = grid
+        else:
+            # No events / read error: origin 0.0 makes the masker fail closed on the
+            # epoch span (no geometry there) — never an over-wide clear span.
+            from screencap.config import get_chunk_duration
+
+            base_ts, chunk_dur = 0.0, get_chunk_duration()
         for vf in chunk_videos:
             try:
                 idx = int(vf.stem.split("_")[1])
             except (IndexError, ValueError):
                 continue
-            start_ts = chunk_start_abs + idx * chunk_dur
+            start_ts = base_ts + idx * chunk_dur
             end_ts = start_ts + chunk_dur
             cls = mask_chunk_for_cloud(
                 self._recording_dir, scrubbed_dir, idx,
@@ -452,41 +497,36 @@ class CloudCopyProducer:
             elif cls.failed:
                 outcome.failed_chunks.append(idx)
 
-
-def _chunk_timing(db_path: Path, n_chunks: int) -> tuple[float, float]:
-    """Derive (chunk_start_abs, chunk_dur) from recording.db, mirroring recovery.
-
-    Best-effort: on any failure return ``(0.0, configured-duration)`` so the
-    caller still produces frame spans (the U6 coverage gate fails closed on
-    bad spans anyway).
-    """
-    from screencap.config import get_chunk_duration
-
-    chunk_dur = get_chunk_duration()
-    try:
-        from screencap.recording_db import Row, open_recording_db
-
-        with open_recording_db(db_path, row_factory=Row) as conn:
-            rec = conn.execute("SELECT timestamp FROM recording LIMIT 1").fetchone()
-            first = conn.execute("SELECT MIN(timestamp) ts FROM action_event").fetchone()
-            last = conn.execute("SELECT MAX(timestamp) ts FROM action_event").fetchone()
-        rec_start = rec["timestamp"] if rec else None
-        first_ts = first["ts"] if first else None
-        last_ts = last["ts"] if last else None
-        if first_ts is None:
-            return (rec_start or 0.0, chunk_dur if chunk_dur > 0 else 900.0)
-        if chunk_dur <= 0:
-            chunk_dur = (last_ts - first_ts) / max(n_chunks, 1) if last_ts else 900.0
-        base_ts = min(rec_start, first_ts) if rec_start is not None else first_ts
-        return (base_ts, chunk_dur)
-    except Exception:  # noqa: BLE001
-        return (0.0, chunk_dur if chunk_dur > 0 else 900.0)
+        # Record provenance over the successfully-masked set so the reuse +
+        # convergence-fast-path gates can trust the copies on the next entry.
+        write_masked_provenance(
+            self._recording_dir, scrubbed_dir, masked_indices=outcome.masked_chunks,
+        )
 
 
 def _null_console() -> Any:
     from rich.console import Console
 
     return Console(quiet=True)
+
+
+def _masked_convergence_ok(recording_dir: Path) -> bool:
+    """SCR-126 R8 gate for the convergence fast path.
+
+    Returns True when the fast path may declare 'done' WITHOUT running ``produce``:
+    either the frozen ``masked_video_upload`` flag is OFF (no masked cloud video is
+    involved — today's default), or it is ON and a masked-video provenance record
+    exists at the CURRENT ``MASK_PROVENANCE_VERSION``. A recording converged under
+    older mask logic returns False → the caller falls through to ``produce`` and
+    re-masks rather than shipping the stale cloud copy."""
+    from screencap.pipeline_chunk_ops import get_frozen_masked_video_upload
+
+    if not get_frozen_masked_video_upload(recording_dir):
+        return True
+    from screencap.scrubber import masked_provenance_version_current
+
+    scrubbed_dir = recording_dir.parent / f"{recording_dir.name}-scrubbed"
+    return masked_provenance_version_current(scrubbed_dir)
 
 
 # ---------------------------------------------------------------------------
@@ -807,7 +847,18 @@ def _route_cloud(
     # the stop budget (the live path already did the work) and makes the daemon
     # resume / CLI re-upload of a converged recording a near-no-op. ``force``
     # always rebuilds (re-scrub + re-upload).
-    if not force and ledger is not None and ledger.finalize_gate_satisfied():
+    #
+    # SCR-126 R8: the fast path skips ``produce`` (hence masking + provenance), so
+    # it must NOT declare convergence for a recording whose masked cloud video was
+    # produced under OLDER mask logic — ``_masked_convergence_ok`` falls it through
+    # to ``produce`` (re-mask) on a MASK_PROVENANCE_VERSION miss. No-op when the
+    # frozen masked flag is OFF (today's default — no masked copy is involved).
+    if (
+        not force
+        and ledger is not None
+        and ledger.finalize_gate_satisfied()
+        and _masked_convergence_ok(recording_dir)
+    ):
         result.routed = True
         _refresh_counts(ledger, result)
         result.all_uploaded = True
@@ -844,8 +895,16 @@ def _route_cloud(
     # 3. Upload the scrubbed copy's artifacts. ``upload_recording`` enumerates
     # via ``list_recording_files`` which already excludes recording.db + WAL
     # sidecars + *.scrub_failed (U2) — the raw DB never enters the set (AE4).
+    # SCR-126 Fix 1: resolve the FROZEN masked-video decision from the SOURCE
+    # recording dir (NOT the scrubbed dir being enumerated) and pass it so the
+    # rglob path gates any chunk_*.mp4 not under masked_video/ (fail closed).
+    from screencap.pipeline_chunk_ops import get_frozen_masked_video_upload
+
     try:
-        upload_result = upload_recording(copy.scrubbed_dir, force=force)
+        upload_result = upload_recording(
+            copy.scrubbed_dir, force=force,
+            masked_video_upload=get_frozen_masked_video_upload(recording_dir),
+        )
     except Exception as exc:  # noqa: BLE001
         logger.error("terminal_stage: upload failed for %s: %s", name, exc)
         result.upload_warning = f"upload failed: {exc}"

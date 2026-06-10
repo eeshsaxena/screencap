@@ -195,6 +195,104 @@ def test_enqueue_recording_db_is_rejected_not_silently_dropped(tmp_path):
     assert assert_uploadable(ok) is ok
 
 
+# ---------------------------------------------------------------------------
+# SCR-126 Fix 1: the masked-video upload-seam gate (assert_video_masked).
+# ---------------------------------------------------------------------------
+
+
+def test_assert_video_masked_gate(tmp_path):
+    """With masked_video_upload ON, a cloud chunk_*.mp4 must be the masker's copy
+    under masked_video/ — a rich-source chunk raises (fail closed); with the flag
+    OFF the gate is inert and the source chunk passes (today's behavior)."""
+    from screencap.upload import FileInfo, _content_type, assert_video_masked
+
+    src_dir = tmp_path / "rec"
+    masked_dir = tmp_path / "rec-scrubbed" / "masked_video"
+    src_dir.mkdir()
+    masked_dir.mkdir(parents=True)
+    src_chunk = src_dir / "chunk_0000.mp4"
+    src_chunk.write_bytes(b"x" * 10)
+    masked_chunk = masked_dir / "chunk_0000.mp4"
+    masked_chunk.write_bytes(b"x" * 10)
+
+    src_fi = FileInfo("chunk_0000.mp4", src_chunk, "video/mp4", 10)
+    masked_fi = FileInfo("chunk_0000.mp4", masked_chunk, "video/mp4", 10)
+    nested_masked_fi = FileInfo(
+        "masked_video/chunk_0000.mp4", masked_chunk, "video/mp4", 10
+    )
+
+    # Flag OFF: the source chunk passes unchanged (capture-blocked source is the
+    # cloud copy) — byte-for-byte today's behavior.
+    assert assert_video_masked(src_fi, masked_upload_on=False) is src_fi
+
+    # Flag ON + masked path (plain key and nested key): both pass.
+    assert assert_video_masked(masked_fi, masked_upload_on=True) is masked_fi
+    assert assert_video_masked(nested_masked_fi, masked_upload_on=True) is nested_masked_fi
+
+    # Flag ON + rich source path: REJECTED (fail closed) — the core fix.
+    with pytest.raises(ValueError, match="masked_video"):
+        assert_video_masked(src_fi, masked_upload_on=True)
+
+    # Non-video slots pass regardless of flag state.
+    for name in ("audio_0000.flac", "events_0000.jsonl", "chunk_0000_manifest.json"):
+        p = src_dir / name
+        p.write_bytes(b"x")
+        fi = FileInfo(name, p, _content_type(p), 1)
+        assert assert_video_masked(fi, masked_upload_on=True) is fi
+
+
+def test_upload_recording_rglob_rejects_unmasked_chunk_when_flag_on(tmp_path):
+    """The scrubbed-dir rglob path (upload_recording → list_recording_files) gates
+    chunk videos too: with masked_video_upload ON, a chunk_*.mp4 planted at the
+    scrubbed-dir root (outside masked_video/) is rejected before any network call
+    (SCR-126 Fix 1, H3 — the path that today bypasses the masked switch)."""
+    from screencap.upload import upload_recording
+
+    scrubbed = tmp_path / "rec-scrubbed"
+    (scrubbed / "masked_video").mkdir(parents=True)
+    # A legitimately-masked chunk under masked_video/ (would pass on its own)…
+    (scrubbed / "masked_video" / "chunk_0001.mp4").write_bytes(b"x" * 5)
+    # …and a stray rich-source chunk at the scrubbed-dir root (must be rejected).
+    (scrubbed / "chunk_0000.mp4").write_bytes(b"x" * 5)
+
+    with pytest.raises(ValueError, match="masked_video"):
+        upload_recording(scrubbed, masked_video_upload=True)
+
+    # Flag OFF: the same enumeration does not raise at the gate (it proceeds to
+    # the network layer, which we don't exercise here — assert it gets past the
+    # masked-video gate by reaching request_signed_urls).
+    with mock.patch(
+        "screencap.upload.request_signed_urls",
+        side_effect=RuntimeError("reached network"),
+    ):
+        with pytest.raises(RuntimeError, match="reached network"):
+            upload_recording(scrubbed, masked_video_upload=False)
+
+
+def test_upload_chunk_files_rejects_source_chunk_when_masked_on(tmp_path):
+    """The live/terminal chunk-media enqueue (upload_chunk_files) fails closed at
+    the shared seam when the frozen flag is ON and the video slot is the rich
+    source — the raise happens before any signed-URL request."""
+    from screencap import chunk_processor
+
+    capture_dir = tmp_path / "rec"
+    capture_dir.mkdir()
+    src_chunk = capture_dir / "chunk_0000.mp4"
+    src_chunk.write_bytes(b"x" * 10)
+    files = [{"name": "chunk_0000.mp4", "path": src_chunk}]
+
+    with mock.patch(
+        "screencap.pipeline_chunk_ops.get_frozen_masked_video_upload",
+        return_value=True,
+    ):
+        with mock.patch(
+            "screencap.upload.request_signed_urls",
+            side_effect=AssertionError("network reached before gate"),
+        ):
+            with pytest.raises(ValueError, match="masked_video"):
+                chunk_processor.upload_chunk_files("rec", files, capture_dir)
+
+
 def test_list_recording_files_legacy_no_db_does_not_crash(tmp_path):
     """Legacy/migrated recordings have no recording.db; the WAL-checkpoint side
     effect must not crash the upload, and legitimate files still upload."""
