@@ -844,8 +844,16 @@ def _route_cloud(
     # 3. Upload the scrubbed copy's artifacts. ``upload_recording`` enumerates
     # via ``list_recording_files`` which already excludes recording.db + WAL
     # sidecars + *.scrub_failed (U2) — the raw DB never enters the set (AE4).
+    # SCR-126 Fix 1: resolve the FROZEN masked-video decision from the SOURCE
+    # recording dir (NOT the scrubbed dir being enumerated) and pass it so the
+    # rglob path gates any chunk_*.mp4 not under masked_video/ (fail closed).
+    from screencap.pipeline_chunk_ops import get_frozen_masked_video_upload
+
     try:
-        upload_result = upload_recording(copy.scrubbed_dir, force=force)
+        upload_result = upload_recording(
+            copy.scrubbed_dir, force=force,
+            masked_video_upload=get_frozen_masked_video_upload(recording_dir),
+        )
     except Exception as exc:  # noqa: BLE001
         logger.error("terminal_stage: upload failed for %s: %s", name, exc)
         result.upload_warning = f"upload failed: {exc}"

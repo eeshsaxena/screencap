@@ -360,6 +360,7 @@ class ChunkProcessor:
             FileInfo,
             _content_type,
             assert_uploadable,
+            assert_video_masked,
             request_signed_urls,
         )
 
@@ -379,10 +380,16 @@ class ChunkProcessor:
                     size = path.stat().st_size
                 except FileNotFoundError:
                     continue
-                all_file_infos.append(assert_uploadable(FileInfo(
+                fi = assert_uploadable(FileInfo(
                     name=f["name"], path=path,
                     content_type=_content_type(path), size=size,
-                )))
+                ))
+                # SCR-126 Fix 1: gate the reconcile re-enumeration too (it applies
+                # the masked-path switch via _collect_chunk_files); the frozen
+                # decision is resolved once in __init__ as self._masked_video_upload.
+                all_file_infos.append(
+                    assert_video_masked(fi, masked_upload_on=self._masked_video_upload)
+                )
                 names.append(f["name"])
             if names:
                 per_chunk_names[idx] = names
@@ -1273,12 +1280,19 @@ def upload_chunk_files(
     Returns True if all core files uploaded. Transcript failures are
     logged but treated as non-fatal.
     """
+    from screencap.pipeline_chunk_ops import get_frozen_masked_video_upload
     from screencap.upload import (
         FileInfo,
         _content_type,
         assert_uploadable,
+        assert_video_masked,
         request_signed_urls,
     )
+
+    # SCR-126 Fix 1: resolve the FROZEN masked-video decision once from the source
+    # recording dir (capture_dir) and gate every chunk video at the enqueue
+    # boundary, so a masked-path-switch regression in any caller fails loud here.
+    masked_on = get_frozen_masked_video_upload(capture_dir)
 
     file_infos = []
     for f in files:
@@ -1287,12 +1301,15 @@ def upload_chunk_files(
         # gate the single upload seam uses, so a raw local-only artifact
         # (recording.db &c.) reaching this enqueue fails loud instead of
         # shipping silently. No-op for the chunk files this path actually sends.
-        file_infos.append(assert_uploadable(FileInfo(
+        fi = assert_uploadable(FileInfo(
             name=f["name"],
             path=p,
             content_type=_content_type(p),
             size=p.stat().st_size,
-        )))
+        ))
+        # SCR-126 Fix 1: with masked upload ON, a cloud chunk_*.mp4 must be the
+        # masked copy under masked_video/ — never the rich source.
+        file_infos.append(assert_video_masked(fi, masked_upload_on=masked_on))
 
     if not file_infos:
         return True
