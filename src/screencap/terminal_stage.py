@@ -427,39 +427,65 @@ class CloudCopyProducer:
             get_frozen_masked_video_upload,
             mask_chunk_for_cloud,
         )
-        from screencap.recovery import derive_chunk_ranges
+        from screencap.recovery import derive_chunk_grid
+        from screencap.scrubber import (
+            is_masked_video_reusable,
+            purge_orphan_masked_videos,
+            write_masked_provenance,
+        )
 
         if not get_frozen_masked_video_upload(self._recording_dir):
             return
 
         db_path = self._recording_dir / "recording.db"
         chunk_videos = sorted(self._recording_dir.glob("chunk_*.mp4"))
-        # SCR-126 Fix 2 / R3: each chunk's absolute ORIGIN comes from the SHARED
-        # range helper (same arithmetic recovery uses for manifests/events, so the
-        # two cannot drift). The masker derives each chunk's END from its own
-        # decoded PTS extent, so the grid c_end here is only an advisory span.
-        ranges = {
-            idx: (c_start, c_end)
-            for idx, c_start, c_end in derive_chunk_ranges(db_path, len(chunk_videos))
-        }
-        # Best-effort fallback origin only when the DB-derived grid is unavailable
-        # (no events / read error): mirror the prior base+grid arithmetic so the
-        # masker still runs and its coverage gate fails closed on a bad span.
-        fb_base, fb_dur = (
-            _chunk_timing(db_path, len(chunk_videos)) if not ranges else (0.0, 0.0)
-        )
         expected: set[int] = set()
+        for vf in chunk_videos:
+            try:
+                expected.add(int(vf.stem.split("_")[1]))
+            except (IndexError, ValueError):
+                continue
+
+        # SCR-126 Fix 3 — AUTHORITATIVE closed-set reconcile FIRST: purge any
+        # masked_video/chunk_*.mp4 whose source chunk no longer exists (an orphan
+        # the per-chunk pass never visits — e.g. a source evicted since the last
+        # pass). This MUST run before the reuse-skip below: the reuse check only
+        # validates the EXPECTED set, so an orphan would otherwise survive a skipped
+        # produce and reach the rglob upload.
+        purge_orphan_masked_videos(scrubbed_dir, expected_indices=expected)
+
+        # SCR-126 Fix 3 / R4 — reuse skip: when every expected chunk already has a
+        # masked copy provably current for ALL masking inputs (source bytes,
+        # geometry, policy, pixel_ratio, mask-logic version), the re-encode is
+        # skipped (reviewed == uploaded). Provenance + ledger scrub-state persist
+        # from the pass that wrote them.
+        if is_masked_video_reusable(
+            self._recording_dir, scrubbed_dir, expected_indices=expected
+        ):
+            outcome.masked_chunks.extend(sorted(expected))
+            return
+
+        # SCR-126 Fix 2 / R3: each chunk's absolute ORIGIN is base_ts + idx*chunk_dur
+        # keyed on the FILENAME index (correct for non-contiguous indices, e.g. after
+        # per-index eviction), from the SHARED grid helper recovery also uses — so
+        # the masked video and recovery's manifests/events cannot drift. The masker
+        # derives each chunk's END from its own decoded PTS extent (advisory here).
+        grid = derive_chunk_grid(db_path, len(chunk_videos))
+        if grid is not None:
+            base_ts, chunk_dur, _last_ts = grid
+        else:
+            # No events / read error: origin 0.0 makes the masker fail closed on the
+            # epoch span (no geometry there) — never an over-wide clear span.
+            from screencap.config import get_chunk_duration
+
+            base_ts, chunk_dur = 0.0, get_chunk_duration()
         for vf in chunk_videos:
             try:
                 idx = int(vf.stem.split("_")[1])
             except (IndexError, ValueError):
                 continue
-            expected.add(idx)
-            if idx in ranges:
-                start_ts, end_ts = ranges[idx]
-            else:
-                start_ts = fb_base + idx * fb_dur
-                end_ts = start_ts + fb_dur
+            start_ts = base_ts + idx * chunk_dur
+            end_ts = start_ts + chunk_dur
             cls = mask_chunk_for_cloud(
                 self._recording_dir, scrubbed_dir, idx,
                 start_ts=start_ts, end_ts=end_ts,
@@ -471,52 +497,11 @@ class CloudCopyProducer:
             elif cls.failed:
                 outcome.failed_chunks.append(idx)
 
-        # SCR-126 Fix 3 — AUTHORITATIVE closed-set reconcile + provenance. Purge any
-        # masked_video/chunk_*.mp4 whose source chunk no longer exists (orphans the
-        # per-chunk pass never visits), then record provenance over the
-        # successfully-masked set so the reuse and convergence-fast-path gates can
-        # trust the copies. Runs on every produce, including the reuse path that
-        # skips the wholesale scrub rebuild — so a prior run's stale copy can never
-        # reach the rglob upload set.
-        from screencap.scrubber import (
-            purge_orphan_masked_videos,
-            write_masked_provenance,
-        )
-
-        purge_orphan_masked_videos(scrubbed_dir, expected_indices=expected)
+        # Record provenance over the successfully-masked set so the reuse +
+        # convergence-fast-path gates can trust the copies on the next entry.
         write_masked_provenance(
             self._recording_dir, scrubbed_dir, masked_indices=outcome.masked_chunks,
         )
-
-
-def _chunk_timing(db_path: Path, n_chunks: int) -> tuple[float, float]:
-    """Derive (chunk_start_abs, chunk_dur) from recording.db, mirroring recovery.
-
-    Best-effort: on any failure return ``(0.0, configured-duration)`` so the
-    caller still produces frame spans (the U6 coverage gate fails closed on
-    bad spans anyway).
-    """
-    from screencap.config import get_chunk_duration
-
-    chunk_dur = get_chunk_duration()
-    try:
-        from screencap.recording_db import Row, open_recording_db
-
-        with open_recording_db(db_path, row_factory=Row) as conn:
-            rec = conn.execute("SELECT timestamp FROM recording LIMIT 1").fetchone()
-            first = conn.execute("SELECT MIN(timestamp) ts FROM action_event").fetchone()
-            last = conn.execute("SELECT MAX(timestamp) ts FROM action_event").fetchone()
-        rec_start = rec["timestamp"] if rec else None
-        first_ts = first["ts"] if first else None
-        last_ts = last["ts"] if last else None
-        if first_ts is None:
-            return (rec_start or 0.0, chunk_dur if chunk_dur > 0 else 900.0)
-        if chunk_dur <= 0:
-            chunk_dur = (last_ts - first_ts) / max(n_chunks, 1) if last_ts else 900.0
-        base_ts = min(rec_start, first_ts) if rec_start is not None else first_ts
-        return (base_ts, chunk_dur)
-    except Exception:  # noqa: BLE001
-        return (0.0, chunk_dur if chunk_dur > 0 else 900.0)
 
 
 def _null_console() -> Any:

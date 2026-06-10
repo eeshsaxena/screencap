@@ -255,3 +255,95 @@ def test_provenance_excluded_from_upload_enumeration(tmp_path):
 
     names = {fi.name for fi in list_recording_files(scrubbed)}
     assert not any(MASKED_PROVENANCE_NAME in n for n in names)
+
+
+def test_masked_video_dirname_coupled_to_upload_gate():
+    """The upload gate's masked-dir literal must stay coupled to masked_video_dir's
+    actual dirname. A rename of one without the other would flip the fail-closed
+    gate (best case breaks upload; worst case fails open) — this fails loudly."""
+    from screencap.upload import _MASKED_VIDEO_DIRNAME
+
+    assert masked_video_dir(Path("/x")).name == _MASKED_VIDEO_DIRNAME
+
+
+def test_mask_videos_origin_uses_filename_index_for_noncontiguous_chunks(tmp_path):
+    """Regression: _mask_videos must compute each chunk's absolute origin as
+    base+idx*dur keyed on the FILENAME index, so a non-contiguous source set (e.g.
+    chunk 1 evicted, leaving 0 and 2) masks chunk 2 at its TRUE origin — not at
+    epoch 0 (which fails closed and leaves the recording stuck)."""
+    from screencap.terminal_stage import CloudCopyOutcome, CloudCopyProducer
+
+    src = _make_src(tmp_path, n_chunks=0)  # db only; we add specific chunk files
+    # Non-contiguous source chunks: 0 and 2 present, 1 missing (evicted).
+    (src / "chunk_0000.mp4").write_bytes(b"c0")
+    (src / "chunk_0002.mp4").write_bytes(b"c2")
+    # Real action events so derive_chunk_grid yields a base; rec_start=100.
+    with contextlib.closing(sqlite3.connect(str(src / "recording.db"))) as conn:
+        conn.execute("DROP TABLE IF EXISTS recording")
+        conn.execute("CREATE TABLE recording (id INTEGER PRIMARY KEY, timestamp REAL, pixel_ratio REAL)")
+        conn.execute("INSERT INTO recording (id, timestamp, pixel_ratio) VALUES (1, 100.0, 1.0)")
+        conn.execute("CREATE TABLE action_event (id INTEGER PRIMARY KEY, timestamp REAL)")
+        conn.execute("INSERT INTO action_event (timestamp) VALUES (100.5), (130.0)")
+        conn.commit()
+
+    scrubbed = tmp_path / "rec-scrubbed"
+    (masked_video_dir(scrubbed)).mkdir(parents=True)
+    captured: dict[int, float] = {}
+
+    class _Cls:
+        masked, failed = True, False
+
+    def _fake_mask(recording_dir, scrubbed_dir, idx, *, start_ts, end_ts, **kw):
+        captured[idx] = start_ts
+        return _Cls()
+
+    with mock.patch(
+        "screencap.pipeline_chunk_ops.get_frozen_masked_video_upload", return_value=True
+    ), mock.patch(
+        "screencap.pipeline_chunk_ops.mask_chunk_for_cloud", side_effect=_fake_mask
+    ), mock.patch("screencap.config.get_chunk_duration", return_value=10.0), mock.patch(
+        "screencap.scrubber.is_masked_video_reusable", return_value=False
+    ):
+        producer = CloudCopyProducer(src)
+        outcome = CloudCopyOutcome(scrubbed_dir=scrubbed)
+        producer._mask_videos(scrubbed, None, outcome)
+
+    # base_ts = min(rec_start=100.0, first_event=100.5) = 100.0; chunk_dur = 10.0.
+    assert captured[0] == pytest.approx(100.0)
+    assert captured[2] == pytest.approx(120.0), (
+        "non-contiguous chunk 2 was masked at the wrong origin (the position-vs-"
+        "filename aliasing regression)"
+    )
+
+
+def test_mask_videos_reuse_skip_avoids_remask(tmp_path):
+    """When the masked set is provably current, _mask_videos skips the re-encode
+    (mask_chunk_for_cloud is never called) — and still purges orphans first."""
+    from screencap.terminal_stage import CloudCopyOutcome, CloudCopyProducer
+
+    src = _make_src(tmp_path, n_chunks=2)
+    scrubbed = tmp_path / "rec-scrubbed"
+    _make_masked_copies(scrubbed, [0, 1])
+
+    called = {"n": 0}
+
+    def _fake_mask(*a, **k):
+        called["n"] += 1
+        class _C:
+            masked, failed = True, False
+        return _C()
+
+    with mock.patch(
+        "screencap.pipeline_chunk_ops.get_frozen_masked_video_upload", return_value=True
+    ), mock.patch(
+        "screencap.pipeline_chunk_ops.mask_chunk_for_cloud", side_effect=_fake_mask
+    ):
+        # Provenance must be written under the SAME flag-ON view the reuse check
+        # reads it (in production both happen with the flag ON).
+        write_masked_provenance(src, scrubbed, masked_indices=[0, 1])
+        producer = CloudCopyProducer(src)
+        outcome = CloudCopyOutcome(scrubbed_dir=scrubbed)
+        producer._mask_videos(scrubbed, None, outcome)
+
+    assert called["n"] == 0, "re-masked despite a provably-current masked set"
+    assert sorted(outcome.masked_chunks) == [0, 1]

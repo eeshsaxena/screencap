@@ -407,9 +407,15 @@ def mask_video_chunk(
     Args:
         chunk_path: The rich local chunk mp4 (the source of truth; untouched).
         db_path: The local-only ``recording.db`` holding the geometry timeline.
-        start_ts: Inclusive absolute (Unix) start of the chunk's frame span.
-        end_ts: Inclusive absolute end of the chunk's frame span.
+        start_ts: ADVISORY — re-derived internally from the chunk's own decoded
+            PTS extent (``chunk_start_abs + min_pts``). The caller-supplied value
+            is NOT used for coverage; only ``chunk_start_abs`` is load-bearing
+            (SCR-126 Fix 2).
+        end_ts: ADVISORY — re-derived internally from the chunk's PTS extent
+            (``chunk_start_abs + max_pts``); the caller value is ignored.
         chunk_start_abs: Absolute Unix time of the chunk's first frame (PTS 0).
+            The sole external timing input — must be the TRUE first-frame
+            wall-clock (an early value mis-aligns geometry lookup; see R7).
             Per-frame absolute ts = ``chunk_start_abs + frame_pts_seconds``.
         output_path: Where to materialize the masked / faithful copy.
         pixel_ratio: Retina scaling factor for geometry → pixel conversion.

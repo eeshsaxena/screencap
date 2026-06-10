@@ -23,28 +23,23 @@ if TYPE_CHECKING:
     from rich.console import Console
 
 
-def derive_chunk_ranges(
+def derive_chunk_grid(
     db_path: Path, n_chunks: int
-) -> list[tuple[int, float, float]]:
-    """Per-chunk ``(idx, c_start, c_end)`` absolute spans derived from recording.db.
+) -> tuple[float, float, float] | None:
+    """The single source of chunk-grid arithmetic: ``(base_ts, chunk_dur, last_ts)``.
 
-    The single source of chunk-boundary arithmetic, shared by recovery (manifest /
-    event windowing) and the terminal video masker's per-chunk absolute ORIGIN, so
-    the two cannot drift (SCR-126 Fix 2 / R3). ``base_ts = min(recording.timestamp,
-    MIN(action_event.timestamp))``; a uniform ``chunk_dur`` grid; the LAST chunk's
-    end extends to ``max(grid_end, last_ts + 1.0)`` to cover all trailing events.
+    Shared by recovery (manifest / event windowing via :func:`derive_chunk_ranges`)
+    and the terminal video masker (each chunk's absolute ORIGIN = ``base_ts +
+    idx*chunk_dur``), so the two cannot drift (SCR-126 Fix 2 / R3). ``base_ts =
+    min(recording.timestamp, MIN(action_event.timestamp))``; a config ``chunk_dur``
+    (resolved to ``(last_ts - first_ts) / n_chunks`` when ``<= 0``); ``last_ts =
+    MAX(action_event.timestamp)`` for the last-chunk extension.
 
-    NOTE the boundaries here are the EVENT-windowing grid. The video masker uses
-    these only for each chunk's absolute origin (``c_start``); it derives the chunk
-    END from the chunk's own decoded PTS extent (frames, not events), which
-    legitimately differs from ``c_end``.
-
-    Returns ``[]`` when the DB lacks a recording row or any action event, or on any
-    read error — callers fall back to their own best-effort posture. A config
-    ``chunk_duration <= 0`` is resolved to ``(last_ts - first_ts) / n_chunks``.
+    Returns ``None`` when the DB lacks a recording row or any action event, or on
+    any read error — callers fall back to their own best-effort posture.
     """
     if n_chunks <= 0:
-        return []
+        return None
     from screencap.config import get_chunk_duration
     from screencap.recording_db import Row, open_recording_db
 
@@ -54,7 +49,7 @@ def derive_chunk_ranges(
                 "SELECT timestamp FROM recording LIMIT 1"
             ).fetchone()
             if not rec:
-                return []
+                return None
             rec_start = rec["timestamp"]
             first_evt = conn.execute(
                 "SELECT MIN(timestamp) as ts FROM action_event"
@@ -63,23 +58,42 @@ def derive_chunk_ranges(
                 "SELECT MAX(timestamp) as ts FROM action_event"
             ).fetchone()
         if not first_evt or first_evt["ts"] is None:
-            return []
+            return None
         first_ts = first_evt["ts"]
         last_ts = last_evt["ts"] if last_evt and last_evt["ts"] is not None else first_ts
         chunk_dur = get_chunk_duration()
         if chunk_dur <= 0:
             chunk_dur = (last_ts - first_ts) / max(n_chunks, 1)
         base_ts = min(rec_start, first_ts) if rec_start is not None else first_ts
-        ranges: list[tuple[int, float, float]] = []
-        for idx in range(n_chunks):
-            c_start = base_ts + idx * chunk_dur
-            c_end = base_ts + (idx + 1) * chunk_dur
-            if idx == n_chunks - 1:
-                c_end = max(c_end, last_ts + 1.0)  # last chunk covers all events
-            ranges.append((idx, c_start, c_end))
-        return ranges
+        return (base_ts, chunk_dur, last_ts)
     except Exception:  # noqa: BLE001 — caller falls back to best-effort
+        return None
+
+
+def derive_chunk_ranges(
+    db_path: Path, n_chunks: int
+) -> list[tuple[int, float, float]]:
+    """Per-chunk ``(idx, c_start, c_end)`` absolute event-windowing spans.
+
+    Built from :func:`derive_chunk_grid` (the shared base/dur source) — a uniform
+    ``chunk_dur`` grid whose LAST chunk's end extends to ``max(grid_end, last_ts +
+    1.0)`` to cover all trailing events. The masker shares only the *origin*
+    (``c_start``) via ``derive_chunk_grid``; it derives each chunk's END from the
+    chunk's own decoded PTS extent (frames, not events), which legitimately differs
+    from ``c_end``. Returns ``[]`` when the grid is unavailable.
+    """
+    grid = derive_chunk_grid(db_path, n_chunks)
+    if grid is None:
         return []
+    base_ts, chunk_dur, last_ts = grid
+    ranges: list[tuple[int, float, float]] = []
+    for idx in range(n_chunks):
+        c_start = base_ts + idx * chunk_dur
+        c_end = base_ts + (idx + 1) * chunk_dur
+        if idx == n_chunks - 1:
+            c_end = max(c_end, last_ts + 1.0)  # last chunk covers all events
+        ranges.append((idx, c_start, c_end))
+    return ranges
 
 
 def _recover_chunk_metadata(

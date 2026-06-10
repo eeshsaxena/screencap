@@ -3152,22 +3152,26 @@ def _compute_geometry_hash(src_dir: Path) -> str:
     upload-confirm) and refuse reuse forever. Returns a stable digest when the
     table/DB is absent or unreadable."""
     import hashlib
-    import sqlite3
 
     db_path = src_dir / "recording.db"
     if not db_path.exists():
         return hashlib.sha256(b"no-recording-db").hexdigest()
+    # Use the module-standard opener (busy_timeout set) so the geometry read does
+    # not spuriously fail "database is locked" under concurrent pipeline_chunk_state
+    # ledger churn between masking and upload — the exact window this hash spans.
+    from screencap.recording_db import Row, open_recording_db
+
     h = hashlib.sha256()
     try:
-        with contextlib.closing(sqlite3.connect(str(db_path))) as db:
-            cur = db.execute(
+        with open_recording_db(db_path, row_factory=Row) as conn:
+            cur = conn.execute(
                 "SELECT screenshot_timestamp, window_list_json "
                 "FROM window_geometry ORDER BY id"
             )
-            for ts, payload in cur:
-                h.update(repr(ts).encode("utf-8"))
+            for row in cur:
+                h.update(repr(row["screenshot_timestamp"]).encode("utf-8"))
                 h.update(b"\0")
-                h.update((payload or "").encode("utf-8"))
+                h.update((row["window_list_json"] or "").encode("utf-8"))
                 h.update(b"\0")
     except Exception:  # noqa: BLE001 — missing table / read error → stable digest
         return hashlib.sha256(b"no-geometry-table").hexdigest()
@@ -3178,16 +3182,16 @@ def _read_db_pixel_ratio(src_dir: Path) -> float:
     """The retina factor recorded for the recording (scales every mask rect).
 
     Read from ``recording.pixel_ratio``; default 2.0 when absent/unreadable."""
-    import sqlite3
-
     db_path = src_dir / "recording.db"
     if not db_path.exists():
         return 2.0
+    from screencap.recording_db import Row, open_recording_db
+
     try:
-        with contextlib.closing(sqlite3.connect(str(db_path))) as db:
-            row = db.execute("SELECT pixel_ratio FROM recording LIMIT 1").fetchone()
-        if row and row[0] is not None:
-            return float(row[0])
+        with open_recording_db(db_path, row_factory=Row) as conn:
+            row = conn.execute("SELECT pixel_ratio FROM recording LIMIT 1").fetchone()
+        if row and row["pixel_ratio"] is not None:
+            return float(row["pixel_ratio"])
     except Exception:  # noqa: BLE001
         pass
     return 2.0
