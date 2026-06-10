@@ -1971,11 +1971,15 @@ def mask_screenshots(
                         _prev_ocr_regions = ocr_regions
 
             # Background masking for screenshots that keep foreground content.
-            # Skip when OCR already handled foreground PII — bg masking with
-            # incomplete geometry can over-mask the foreground content.
+            # Runs independently of the foreground OCR pass: the two operate on
+            # disjoint regions (OCR scans only the active-window ROI; bg masking
+            # masks only sensitive *background* windows). respect_z_order=True
+            # already excludes the foreground window from the bg mask, so this
+            # cannot over-mask kept foreground content. Gating it on ocr_ran /
+            # cache_hit let sensitive background windows leak whenever Vision
+            # ran the foreground OCR pass (SCR-110).
             bg_masked = False
-            _skip_bg = ocr_ran or cache_hit
-            if not _skip_bg and actual_action in (
+            if actual_action in (
                 PrivacyAction.ALLOW,
                 PrivacyAction.TEXT_REDACT,
                 PrivacyAction.OCR_FALLBACK,

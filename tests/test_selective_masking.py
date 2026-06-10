@@ -512,11 +512,6 @@ class TestBackgroundWindowMasking:
         mask_screenshots(screenshots_dir, ctx, db_path=db_path, result=result)
         return screenshots_dir / "100.0.jpg", result
 
-    @pytest.mark.xfail(
-        strict=True,
-        reason="SCR-110: background-window masking is skipped when the foreground "
-        "OCR pass runs, so a sensitive background window can leak.",
-    )
     def test_allow_foreground_masks_sensitive_background(self, tmp_path):
         """ALLOW foreground (VS Code, internal mode) + MASK_WINDOW background
         (banking app): banking region masked, VS Code region preserved."""
@@ -551,11 +546,6 @@ class TestBackgroundWindowMasking:
         assert len(bg_entries) == 1
         assert "geometry" in bg_entries[0].evidence_type
 
-    @pytest.mark.xfail(
-        strict=True,
-        reason="SCR-110: background-window masking is skipped when the foreground "
-        "OCR pass runs, so a sensitive background window can leak.",
-    )
     def test_allow_foreground_exclude_background_masks_not_deletes(self, tmp_path):
         """ALLOW foreground + EXCLUDE background (1Password):
         background region masked (not file deleted) — foreground content preserved."""
@@ -630,11 +620,6 @@ class TestBackgroundWindowMasking:
         assert img_path.exists()
         assert _avg_brightness(img_path) > 200, "No geometry = no masking"
 
-    @pytest.mark.xfail(
-        strict=True,
-        reason="SCR-110: background-window masking is skipped when the foreground "
-        "OCR pass runs, so a sensitive background window can leak.",
-    )
     def test_text_redact_background_masked_on_scrub(self, tmp_path):
         """ALLOW foreground + TEXT_REDACT background (Slack in internal mode):
         Slack region masked because we can't text-redact a partial region."""
