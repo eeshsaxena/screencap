@@ -822,3 +822,153 @@ class TestU3PromotionAndRetention:
         )
         assert result.destination == "cloud"
         assert result.routed is True
+
+
+# ---------------------------------------------------------------------------
+# SCR-129 — the terminal stage is the SOLE uploader on non-live paths
+# (`--no-live-upload`, daemon resume of an all-session-failed live upload,
+# local->cloud promotion). The `<name>-scrubbed` copy STRIPS media, so the
+# source chunk video/audio must be uploaded by the terminal stage directly —
+# else the cloud copy is permanently media-less. Every prior cloud-route test
+# mocks the upload seam or hand-fills the scrubbed dir with media, so the gap
+# was invisible; these exercise the real media-less scrubbed dir + the real
+# per-chunk upload seam.
+# ---------------------------------------------------------------------------
+
+
+class TestSCR129SourceMediaUpload:
+    def _metadata_only_scrubbed(self, rec_dir: Path, n_chunks: int) -> Path:
+        """A `<name>-scrubbed` dir as the REAL scrubber leaves it: events +
+        manifest, NO media (.mp4/.flac are stripped by _SKIP_EXTENSIONS)."""
+        scrubbed = rec_dir.parent / f"{rec_dir.name}-scrubbed"
+        scrubbed.mkdir(exist_ok=True)
+        for i in range(n_chunks):
+            (scrubbed / f"events_{i:04d}.jsonl").write_text("{}\n")
+            (scrubbed / f"chunk_{i:04d}_manifest.json").write_text("{}")
+        return scrubbed
+
+    def _capture_uploads(self, monkeypatch, n_chunks: int):
+        """Wire a stateful (mock) cloud that distinguishes a PROBE from an
+        actual upload (PUT).
+
+        ``request_signed_urls`` returns ``None`` ("already there") only for a
+        name that has actually been PUT — so a chunk's reconcile/confirm probe
+        cannot spuriously confirm a video that was never uploaded. The scrubbed
+        metadata (events/manifest) is pre-seeded as already-uploaded (the
+        ``upload_recording`` scrubbed-dir path is stubbed out — not under test
+        here), so a chunk converges iff its MEDIA is genuinely PUT.
+
+        Returns the ``put`` list of ``(name, path)`` pairs actually uploaded.
+        """
+        from screencap.upload import UploadResult
+
+        uploaded: set[str] = set()
+        for i in range(n_chunks):
+            uploaded.add(f"events_{i:04d}.jsonl")
+            uploaded.add(f"chunk_{i:04d}_manifest.json")
+        put: list[tuple[str, str]] = []
+
+        def _fake_request_signed_urls(recording_name, files):
+            return (
+                {f.name: (None if f.name in uploaded else f"https://x/{f.name}")
+                 for f in files},
+                "prefix/",
+            )
+
+        def _fake_upload_single(fi, signed_url):
+            put.append((fi.name, str(fi.path)))
+            uploaded.add(fi.name)
+
+        monkeypatch.setattr(
+            "screencap.upload.request_signed_urls", _fake_request_signed_urls,
+        )
+        monkeypatch.setattr(
+            "screencap.chunk_processor._upload_single", _fake_upload_single,
+        )
+        # The scrubbed-metadata upload is not under test — stub it to a no-op so
+        # only the per-chunk MEDIA upload exercises the (mock) cloud.
+        monkeypatch.setattr(
+            "screencap.upload.upload_recording",
+            lambda d, **kw: UploadResult(recording=d.name),
+        )
+        monkeypatch.setattr(
+            "screencap.chunk_processor.upload_sentinel", lambda *a, **kw: True,
+        )
+        return put
+
+    def test_source_video_audio_uploaded_when_live_did_not(self, tmp_path, monkeypatch):
+        """Flag OFF (default): the source chunk video AND audio reach the cloud
+        through the terminal-stage-only path, and the recording converges."""
+        from screencap import terminal_stage as ts
+        from screencap.pipeline_state import PipelineLedger, UploadState
+        from screencap.terminal_stage import CloudCopyOutcome
+
+        rec_dir = _make_recording(tmp_path, destination="cloud", n_chunks=2)
+        scrubbed = self._metadata_only_scrubbed(rec_dir, 2)
+        monkeypatch.setattr(
+            ts.CloudCopyProducer, "produce",
+            lambda self, **kw: CloudCopyOutcome(scrubbed_dir=scrubbed),
+        )
+        put = self._capture_uploads(monkeypatch, 2)
+
+        result = ts.run_terminal_stage(rec_dir)
+
+        names = {n for n, _ in put}
+        assert {"chunk_0000.mp4", "chunk_0001.mp4"} <= names, (
+            f"source video never uploaded by the terminal stage: {sorted(names)}"
+        )
+        assert {"audio_0000.flac", "audio_0001.flac"} <= names, (
+            f"source audio never uploaded by the terminal stage: {sorted(names)}"
+        )
+        # The uploaded video is the RICH SOURCE copy (flag OFF), not a masked one.
+        video_paths = {n: p for n, p in put}
+        assert video_paths["chunk_0000.mp4"] == str(rec_dir / "chunk_0000.mp4")
+
+        # With the media genuinely in GCS, the recording converges.
+        assert result.finalize_gate_satisfied is True
+        assert result.sentinel_uploaded is True
+        ledger = PipelineLedger(rec_dir / "recording.db")
+        assert all(
+            r.upload_state == UploadState.UPLOADED for r in ledger.all_chunks()
+        )
+
+    def test_masked_copy_uploaded_never_rich_source_when_flag_on(self, tmp_path, monkeypatch):
+        """Flag frozen ON: the terminal stage ships the MASKED copy from
+        `<name>-scrubbed/masked_video/` under the plain `chunk_NNNN.mp4` key and
+        NEVER the rich source .mp4 (R-SCR125-A masked-path-switch)."""
+        from screencap import terminal_stage as ts
+        from screencap.scrubber import masked_video_dir
+        from screencap.terminal_stage import CloudCopyOutcome
+
+        rec_dir = _make_recording(tmp_path, destination="cloud", n_chunks=2)
+        (rec_dir / ".recording_intent").write_text(json.dumps({
+            "version": 2, "destination": "cloud",
+            "retention_policy": "keep_forever", "retention_params": {},
+            "masked_video_upload": True, "show_on_website": True,
+        }))
+        scrubbed = self._metadata_only_scrubbed(rec_dir, 2)
+        masked_dir = masked_video_dir(scrubbed)
+        masked_dir.mkdir(parents=True, exist_ok=True)
+        for i in range(2):
+            (masked_dir / f"chunk_{i:04d}.mp4").write_bytes(b"MASKED")
+
+        # produce() already ran the mask (we mock it): masked copies on disk.
+        monkeypatch.setattr(
+            ts.CloudCopyProducer, "produce",
+            lambda self, **kw: CloudCopyOutcome(
+                scrubbed_dir=scrubbed, masked_chunks=[0, 1]),
+        )
+        put = self._capture_uploads(monkeypatch, 2)
+
+        ts.run_terminal_stage(rec_dir)
+
+        video_paths = {n: p for n, p in put if n.startswith("chunk_") and n.endswith(".mp4")}
+        assert "chunk_0000.mp4" in video_paths, "masked video must reach the cloud"
+        assert video_paths["chunk_0000.mp4"] == str(masked_dir / "chunk_0000.mp4"), (
+            "must ship the masked copy, not the rich source"
+        )
+        # The rich SOURCE .mp4 path is never among the uploaded paths.
+        rich_sources = {str(rec_dir / f"chunk_{i:04d}.mp4") for i in range(2)}
+        assert not (rich_sources & {p for _, p in put}), (
+            "rich source video must never be uploaded when masking is ON"
+        )
