@@ -575,3 +575,210 @@ async def test_content_search_limit_is_clamped(
     response = await _asgi_post("/v0/content.search", {"query": "match", "limit": 5})
     assert response.status_code == 200
     assert len(response.json()["hits"]) == 5
+
+
+# ---------------------------------------------------------------------------
+# SCR-118 transcript.search + timeline.query (U4)
+# ---------------------------------------------------------------------------
+
+_REC_STARTED = 1778198400.0
+
+
+def _make_recording_with_windows(base: Path, name: str, windows: list[dict]) -> Path:
+    """Create a recording.db with window_event rows for timeline tests."""
+    from screencap.engine.db import create_db, crud
+
+    recording_dir = base / name
+    recording_dir.mkdir(parents=True)
+    engine, Session = create_db(str(recording_dir / "recording.db"))
+    session = Session()
+    recording = crud.insert_recording(
+        session,
+        {
+            "timestamp": _REC_STARTED,
+            "platform": "darwin",
+            "monitor_width": 1920,
+            "monitor_height": 1080,
+            "pixel_ratio": 2.0,
+            "double_click_interval_seconds": 0.5,
+            "double_click_distance_pixels": 5.0,
+        },
+    )
+    for w in windows:
+        crud.insert_window_event(
+            session, recording, _REC_STARTED + w["offset"],
+            {
+                "title": w.get("title"),
+                "app_name": w.get("app_name"),
+                "app_bundle_id": w.get("bundle"),
+                "browser_url": w.get("url"),
+            },
+        )
+    session.close()
+    engine.dispose()
+    return recording_dir
+
+
+def _guard_content_store(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> Path:
+    """Point the content store at a tmp path so we can assert it is never opened."""
+    import screencap.content_index as content_index
+
+    store_path = tmp_path / "content_index.db"
+    monkeypatch.setattr(content_index, "default_index_path", lambda: store_path)
+    return store_path
+
+
+@pytest.mark.asyncio
+async def test_timeline_query_returns_rows_without_ocr(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    recordings_dir = tmp_path / "recordings"
+    _make_recording_with_windows(
+        recordings_dir, "demo",
+        [
+            {"offset": 10, "app_name": "Safari", "bundle": "com.apple.Safari", "title": "Docs"},
+            {"offset": 20, "app_name": "Code", "bundle": "com.microsoft.VSCode", "title": "main.py"},
+        ],
+    )
+    monkeypatch.setenv("SCREENCAP_RECORDINGS_DIR", str(recordings_dir))
+    content_store = _guard_content_store(tmp_path, monkeypatch)
+
+    response = await _asgi_post("/v0/timeline.query", {})
+
+    assert response.status_code == 200
+    payload = response.json()
+    _assert_envelope(payload, expected_schema_version=schema._TIMELINE_QUERY_API_VERSION)
+    assert payload["coverage"] == "authoritative"
+    apps = [r["app"] for r in payload["rows"]]
+    assert apps == ["Safari", "Code"]  # wall-clock order
+    assert all(set(r) == {"recording", "timestamp_ms", "app", "title"} for r in payload["rows"])
+    # AE5: answered purely from event tables — the content index is never opened.
+    assert not content_store.exists()
+
+
+@pytest.mark.asyncio
+async def test_timeline_query_app_filter_and_omits_url(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    recordings_dir = tmp_path / "recordings"
+    _make_recording_with_windows(
+        recordings_dir, "demo",
+        [
+            {"offset": 10, "app_name": "Safari", "bundle": "com.apple.Safari",
+             "title": "Login", "url": "https://x.test/callback?code=SECRET_TOKEN"},
+            {"offset": 20, "app_name": "Code", "bundle": "com.microsoft.VSCode", "title": "main.py"},
+        ],
+    )
+    monkeypatch.setenv("SCREENCAP_RECORDINGS_DIR", str(recordings_dir))
+
+    response = await _asgi_post("/v0/timeline.query", {"app": "safari"})
+
+    assert response.status_code == 200
+    payload = response.json()
+    assert [r["app"] for r in payload["rows"]] == ["Safari"]
+    # v1 omits browser_url — the OAuth code must not appear anywhere.
+    assert "SECRET_TOKEN" not in response.text
+    assert "url" not in payload["rows"][0]
+
+
+@pytest.mark.asyncio
+async def test_timeline_query_spans_recordings_in_order(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    recordings_dir = tmp_path / "recordings"
+    _make_recording_with_windows(
+        recordings_dir, "rec-a", [{"offset": 30, "app_name": "Mail", "bundle": "com.apple.mail"}]
+    )
+    _make_recording_with_windows(
+        recordings_dir, "rec-b", [{"offset": 10, "app_name": "Slack", "bundle": "com.slack"}]
+    )
+    monkeypatch.setenv("SCREENCAP_RECORDINGS_DIR", str(recordings_dir))
+
+    response = await _asgi_post("/v0/timeline.query", {})
+
+    payload = response.json()
+    # rec-b's event (offset 10) is earlier in wall-clock than rec-a's (offset 30).
+    assert [(r["recording"], r["app"]) for r in payload["rows"]] == [
+        ("rec-b", "Slack"),
+        ("rec-a", "Mail"),
+    ]
+
+
+@pytest.mark.asyncio
+async def test_timeline_query_inverted_range_rejected(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    monkeypatch.setenv("SCREENCAP_RECORDINGS_DIR", str(tmp_path / "recordings"))
+    response = await _asgi_post("/v0/timeline.query", {"start_ms": 5000, "end_ms": 1000})
+    assert response.status_code == 400
+    assert response.json()["error"] == "invalid_range"
+
+
+@pytest.mark.asyncio
+async def test_transcript_search_returns_chunk_pointer(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    recordings_dir = tmp_path / "recordings"
+    rec = recordings_dir / "demo"
+    rec.mkdir(parents=True)
+    (rec / "transcript_0003.txt").write_text("we discussed the quarterly budget review")
+    monkeypatch.setenv("SCREENCAP_RECORDINGS_DIR", str(recordings_dir))
+
+    response = await _asgi_post("/v0/transcript.search", {"query": "budget"})
+
+    assert response.status_code == 200
+    payload = response.json()
+    _assert_envelope(payload, expected_schema_version=schema._TRANSCRIPT_SEARCH_API_VERSION)
+    assert payload["coverage"] == "best_effort"
+    assert len(payload["hits"]) == 1
+    hit = payload["hits"][0]
+    assert set(hit) == {"recording", "chunk_index", "snippet"}
+    assert hit["recording"] == "demo"
+    assert hit["chunk_index"] == 3
+    assert "budget" in hit["snippet"].lower()
+
+
+@pytest.mark.asyncio
+async def test_transcript_search_never_reads_raw_json(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    recordings_dir = tmp_path / "recordings"
+    rec = recordings_dir / "demo"
+    rec.mkdir(parents=True)
+    # Only the rich raw JSON exists (per-word fields = R7 leak) — never read.
+    (rec / "transcript_0001.json").write_text('{"words": [{"word": "budget"}]}')
+    monkeypatch.setenv("SCREENCAP_RECORDINGS_DIR", str(recordings_dir))
+
+    response = await _asgi_post("/v0/transcript.search", {"query": "budget"})
+
+    assert response.status_code == 200
+    assert response.json()["hits"] == []
+
+
+@pytest.mark.asyncio
+async def test_transcript_search_never_reads_scrub_failed(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    recordings_dir = tmp_path / "recordings"
+    rec = recordings_dir / "demo"
+    rec.mkdir(parents=True)
+    # The appended .scrub_failed suffix means scrubbing failed — never read.
+    (rec / "transcript_0001.txt.scrub_failed").write_text("unscrubbed budget secret")
+    monkeypatch.setenv("SCREENCAP_RECORDINGS_DIR", str(recordings_dir))
+
+    response = await _asgi_post("/v0/transcript.search", {"query": "budget"})
+
+    assert response.status_code == 200
+    assert response.json()["hits"] == []
+
+
+@pytest.mark.asyncio
+async def test_transcript_search_rejects_traversal(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    monkeypatch.setenv("SCREENCAP_RECORDINGS_DIR", str(tmp_path / "recordings"))
+    response = await _asgi_post(
+        "/v0/transcript.search", {"query": "x", "recording": "../../etc"}
+    )
+    assert response.status_code >= 400
+    assert response.json()["error"] == "invalid_name"

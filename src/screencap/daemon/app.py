@@ -8,6 +8,7 @@ import logging
 import os
 import time
 from contextlib import asynccontextmanager
+from pathlib import Path
 from typing import TYPE_CHECKING, Any, AsyncIterator
 
 from starlette.applications import Starlette
@@ -732,6 +733,248 @@ async def content_search(request: Request) -> JSONResponse:
         )
 
 
+# SCR-118 query bounds (DoS guards enforced at the daemon, not only in the MCP
+# tool layer, so a direct UDS caller cannot drive an unbounded scan).
+_QUERY_MAX_RECORDINGS = 200
+_QUERY_DEFAULT_LIMIT = 50
+_QUERY_MAX_LIMIT = 200
+
+
+def _clamp_limit(limit: int | None) -> int:
+    if limit is None:
+        return _QUERY_DEFAULT_LIMIT
+    return max(1, min(int(limit), _QUERY_MAX_LIMIT))
+
+
+def _escape_like(term: str) -> str:
+    return term.replace("\\", "\\\\").replace("%", "\\%").replace("_", "\\_")
+
+
+def _text_snippet(text: str, query: str, *, width: int = 120) -> str:
+    lowered = text.lower()
+    idx = lowered.find(query.lower())
+    if idx < 0:
+        return text[:width].strip()
+    start = max(0, idx - width // 2)
+    end = min(len(text), idx + len(query) + width // 2)
+    excerpt = text[start:end].strip().replace("\n", " ")
+    return f"{'…' if start > 0 else ''}{excerpt}{'…' if end < len(text) else ''}"
+
+
+def _iter_recording_dirs(recording: str | None) -> list[Path]:
+    """Candidate recording dirs to scan (validated single, or all, capped)."""
+    from screencap.config import get_recordings_dir, resolve_recording_dir
+
+    if recording is not None:
+        d = resolve_recording_dir(recording)
+        return [d] if d.is_dir() else []
+    base = get_recordings_dir()
+    dirs = [
+        d for d in sorted(base.iterdir())
+        if d.is_dir() and not d.name.startswith(".")
+    ]
+    return dirs[:_QUERY_MAX_RECORDINGS]
+
+
+def _parse_chunk_index(name: str) -> int:
+    """``transcript_0007.txt`` → 7; a bare ``transcript.txt`` → 0."""
+    stem = name[: -len(".txt")] if name.endswith(".txt") else name
+    _, _, tail = stem.partition("_")
+    try:
+        return int(tail)
+    except ValueError:
+        return 0
+
+
+def _run_transcript_search(
+    query: str, recording: str | None, limit: int,
+) -> list[dict[str, Any]]:
+    """Keyword scan over the STRICT scrubbed ``transcript_*.txt`` only.
+
+    Never reads the rich per-word ``transcript_*.json`` (an R7 leak) nor a
+    ``*.txt.scrub_failed`` file (the suffix is appended, so a ``*.txt`` glob
+    already excludes it; the explicit suffix check is belt-and-suspenders).
+    """
+    needle = query.lower()
+    hits: list[dict[str, Any]] = []
+    for rec_dir in _iter_recording_dirs(recording):
+        candidates = sorted(rec_dir.glob("transcript_*.txt"))
+        bare = rec_dir / "transcript.txt"
+        if bare.exists():
+            candidates.append(bare)
+        for path in candidates:
+            if path.suffix != ".txt" or path.name.endswith(".scrub_failed"):
+                continue
+            try:
+                text = path.read_text(encoding="utf-8", errors="replace")
+            except OSError:
+                continue
+            if needle in text.lower():
+                hits.append({
+                    "recording": rec_dir.name,
+                    "chunk_index": _parse_chunk_index(path.name),
+                    "snippet": _text_snippet(text, query),
+                })
+                if len(hits) >= limit:
+                    return hits
+    return hits
+
+
+def _run_timeline_query(
+    start_ms: int | None,
+    end_ms: int | None,
+    app: str | None,
+    recording: str | None,
+    limit: int,
+) -> list[dict[str, Any]]:
+    """Structured app/window/time rows from window_event across recordings.
+
+    Authoritative (event tables, no OCR/redaction loss). Schema-tolerant via
+    has_table/has_column; never touches OCR or the content index. ``browser_url``
+    is intentionally not selected (v1 omits it — see TimelineRow).
+    """
+    from screencap.recording_db import has_column, has_table, open_recording_db
+
+    start_s = start_ms / 1000.0 if start_ms is not None else None
+    end_s = end_ms / 1000.0 if end_ms is not None else None
+    app_like = f"%{_escape_like(app.lower())}%" if app else None
+
+    rows: list[dict[str, Any]] = []
+    for rec_dir in _iter_recording_dirs(recording):
+        db_path = rec_dir / "recording.db"
+        if not db_path.is_file():
+            continue
+        try:
+            with open_recording_db(db_path, read_only=True) as conn:
+                if not has_table(conn, "window_event") or not has_column(
+                    conn, "window_event", "timestamp"
+                ):
+                    continue
+                has_name = has_column(conn, "window_event", "app_name")
+                has_bundle = has_column(conn, "window_event", "app_bundle_id")
+                has_title = has_column(conn, "window_event", "title")
+                if app_like and not (has_name or has_bundle):
+                    continue
+
+                name_expr = "app_name" if has_name else "NULL"
+                bundle_expr = "app_bundle_id" if has_bundle else "NULL"
+                title_expr = "title" if has_title else "NULL"
+                sql = (
+                    f"SELECT timestamp, {name_expr}, {bundle_expr}, {title_expr} "
+                    "FROM window_event WHERE timestamp IS NOT NULL"
+                )
+                params: list[Any] = []
+                if start_s is not None:
+                    sql += " AND timestamp >= ?"
+                    params.append(start_s)
+                if end_s is not None:
+                    sql += " AND timestamp < ?"
+                    params.append(end_s)
+                if app_like:
+                    clauses = []
+                    if has_name:
+                        clauses.append("lower(app_name) LIKE ? ESCAPE '\\'")
+                        params.append(app_like)
+                    if has_bundle:
+                        clauses.append("lower(app_bundle_id) LIKE ? ESCAPE '\\'")
+                        params.append(app_like)
+                    sql += " AND (" + " OR ".join(clauses) + ")"
+                sql += " ORDER BY timestamp LIMIT ?"
+                params.append(limit)
+                for ts, app_name, bundle, title in conn.execute(sql, params):
+                    rows.append({
+                        "recording": rec_dir.name,
+                        "timestamp_ms": int(float(ts) * 1000),
+                        "app": app_name or bundle,
+                        "title": title,
+                    })
+        except Exception:
+            # A single unreadable/older recording must not fail the whole query.
+            logger.debug("timeline.query skipped %s", rec_dir.name, exc_info=True)
+            continue
+
+    # Cross-recording wall-clock order, then clamp.
+    rows.sort(key=lambda r: r["timestamp_ms"])
+    return rows[:limit]
+
+
+async def transcript_search(request: Request) -> JSONResponse:
+    """``POST /v0/transcript.search`` — keyword scan over scrubbed transcripts."""
+    from screencap.daemon._name_validation import validate_recording_name
+
+    try:
+        body = await request.json()
+        if not isinstance(body, dict):
+            body = {}
+        parsed = schema.TranscriptSearchRequest.model_validate(body)
+        if parsed.recording is not None:
+            validate_recording_name(parsed.recording)
+        limit = _clamp_limit(parsed.limit)
+        hits = await asyncio.to_thread(
+            _run_transcript_search, parsed.query, parsed.recording, limit,
+        )
+        return JSONResponse(
+            schema.envelope(
+                schema_version=schema._TRANSCRIPT_SEARCH_API_VERSION,
+                hits=hits,
+                coverage="best_effort",
+            )
+        )
+    except errors.DaemonAPIError as exc:
+        return _api_error_response(exc)
+    except Exception as exc:
+        return _internal_error_response(
+            exc,
+            schema_version=schema._TRANSCRIPT_SEARCH_API_VERSION,
+            request=request,
+        )
+
+
+async def timeline_query(request: Request) -> JSONResponse:
+    """``POST /v0/timeline.query`` — structured app/window/time rows (authoritative)."""
+    from screencap.daemon._name_validation import validate_recording_name
+
+    try:
+        body = await request.json()
+        if not isinstance(body, dict):
+            body = {}
+        parsed = schema.TimelineQueryRequest.model_validate(body)
+        if parsed.recording is not None:
+            validate_recording_name(parsed.recording)
+        if (
+            parsed.start_ms is not None
+            and parsed.end_ms is not None
+            and parsed.start_ms > parsed.end_ms
+        ):
+            return JSONResponse(
+                errors.error_envelope(
+                    schema_version=schema._TIMELINE_QUERY_API_VERSION,
+                    error="invalid_range",
+                ),
+                status_code=400,
+            )
+        limit = _clamp_limit(parsed.limit)
+        rows = await asyncio.to_thread(
+            _run_timeline_query,
+            parsed.start_ms, parsed.end_ms, parsed.app, parsed.recording, limit,
+        )
+        return JSONResponse(
+            schema.envelope(
+                schema_version=schema._TIMELINE_QUERY_API_VERSION,
+                rows=rows,
+                coverage="authoritative",
+            )
+        )
+    except errors.DaemonAPIError as exc:
+        return _api_error_response(exc)
+    except Exception as exc:
+        return _internal_error_response(
+            exc,
+            schema_version=schema._TIMELINE_QUERY_API_VERSION,
+            request=request,
+        )
+
+
 def build_app() -> Starlette:
     app = Starlette(
         routes=[
@@ -743,6 +986,8 @@ def build_app() -> Starlette:
             Route("/v0/recording.stop", recording_stop, methods=["POST"]),
             Route("/v0/permission.request", permission_request, methods=["POST"]),
             Route("/v0/content.search", content_search, methods=["POST"]),
+            Route("/v0/transcript.search", transcript_search, methods=["POST"]),
+            Route("/v0/timeline.query", timeline_query, methods=["POST"]),
         ],
         lifespan=lifespan,
     )

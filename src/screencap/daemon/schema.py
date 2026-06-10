@@ -16,6 +16,8 @@ _RECORDING_STOP_API_VERSION = 1
 _PERMISSION_REQUEST_API_VERSION = 1
 # SCR-118 read-only query verbs.
 _CONTENT_SEARCH_API_VERSION = 1
+_TRANSCRIPT_SEARCH_API_VERSION = 1
+_TIMELINE_QUERY_API_VERSION = 1
 
 
 @cache
@@ -53,6 +55,12 @@ _MODEL_NAMES = {
     "ContentSearchRequest",
     "ContentHit",
     "ContentSearchResponse",
+    "TranscriptSearchRequest",
+    "TranscriptHit",
+    "TranscriptSearchResponse",
+    "TimelineQueryRequest",
+    "TimelineRow",
+    "TimelineQueryResponse",
 }
 _MODELS: dict[str, Any] | None = None
 
@@ -241,6 +249,55 @@ def _load_models() -> dict[str, Any]:
         # future state decodes tolerantly.
         index_state: str
 
+    class TranscriptSearchRequest(_DaemonModel):
+        """SCR-118 transcript keyword-search input."""
+
+        query: str
+        recording: str | None = None
+        limit: int | None = None
+
+    class TranscriptHit(_DaemonModel):
+        """A transcript match. Pointer is chunk-granular (the scrubbed .txt has
+        no fine timestamps — the rich per-word .json is an R7 leak we never
+        read); an agent correlates precise time via timeline.query."""
+
+        recording: str
+        chunk_index: int
+        snippet: str
+
+    class TranscriptSearchResponse(EnvelopeResponse):
+        hits: list[TranscriptHit]
+        # 'best_effort' — transcript recall lags transcription. (Coherent
+        # interface != coherent recall.)
+        coverage: str
+
+    class TimelineQueryRequest(_DaemonModel):
+        """SCR-118 timeline query input (absolute unix ms time range)."""
+
+        start_ms: int | None = None
+        end_ms: int | None = None
+        app: str | None = None
+        recording: str | None = None
+        limit: int | None = None
+
+    class TimelineRow(_DaemonModel):
+        """A structured app/window/time row from the event tables.
+
+        ``browser_url`` is deliberately omitted in v1: it is captured
+        pre-scrubber and can carry OAuth codes / session tokens, so the
+        lowest-risk timeline shape is app + window title + time.
+        """
+
+        recording: str
+        timestamp_ms: int
+        app: str | None
+        title: str | None
+
+    class TimelineQueryResponse(EnvelopeResponse):
+        rows: list[TimelineRow]
+        # 'authoritative' — event tables, no OCR/redaction recall loss.
+        coverage: str
+
     _MODELS = {
         "EnvelopeResponse": EnvelopeResponse,
         "DaemonInfoResponse": DaemonInfoResponse,
@@ -257,6 +314,12 @@ def _load_models() -> dict[str, Any]:
         "ContentSearchRequest": ContentSearchRequest,
         "ContentHit": ContentHit,
         "ContentSearchResponse": ContentSearchResponse,
+        "TranscriptSearchRequest": TranscriptSearchRequest,
+        "TranscriptHit": TranscriptHit,
+        "TranscriptSearchResponse": TranscriptSearchResponse,
+        "TimelineQueryRequest": TimelineQueryRequest,
+        "TimelineRow": TimelineRow,
+        "TimelineQueryResponse": TimelineQueryResponse,
     }
     # `__getattr__` below dispatches every documented model name through
     # `_MODELS`, so injecting them into `globals()` would just shadow that
@@ -285,6 +348,8 @@ __all__ = [
     "_RECORDING_STOP_API_VERSION",
     "_PERMISSION_REQUEST_API_VERSION",
     "_CONTENT_SEARCH_API_VERSION",
+    "_TRANSCRIPT_SEARCH_API_VERSION",
+    "_TIMELINE_QUERY_API_VERSION",
     "daemon_version",
     "envelope",
 ] + sorted(_MODEL_NAMES)

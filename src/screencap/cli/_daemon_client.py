@@ -274,6 +274,47 @@ class DaemonHTTPClient:
             self._request("POST", "/v0/content.search", json_body=body)
         )
 
+    def transcript_search(
+        self,
+        query: str,
+        *,
+        recording: str | None = None,
+        limit: int | None = None,
+    ) -> dict[str, Any]:
+        """``POST /v0/transcript.search`` — keyword hits over scrubbed transcripts."""
+        body: dict[str, Any] = {"query": query}
+        if recording is not None:
+            body["recording"] = recording
+        if limit is not None:
+            body["limit"] = limit
+        return self._parse_ok_envelope(
+            self._request("POST", "/v0/transcript.search", json_body=body)
+        )
+
+    def timeline_query(
+        self,
+        *,
+        start_ms: int | None = None,
+        end_ms: int | None = None,
+        app: str | None = None,
+        recording: str | None = None,
+        limit: int | None = None,
+    ) -> dict[str, Any]:
+        """``POST /v0/timeline.query`` — structured app/window/time rows."""
+        body: dict[str, Any] = {}
+        for key, value in (
+            ("start_ms", start_ms),
+            ("end_ms", end_ms),
+            ("app", app),
+            ("recording", recording),
+            ("limit", limit),
+        ):
+            if value is not None:
+                body[key] = value
+        return self._parse_ok_envelope(
+            self._request("POST", "/v0/timeline.query", json_body=body)
+        )
+
     @contextmanager
     def events(
         self,
