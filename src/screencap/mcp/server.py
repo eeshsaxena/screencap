@@ -49,9 +49,8 @@ class ContentHit(BaseModel):
 
 class ContentSearchResult(BaseModel):
     hits: list[ContentHit]
-    # ok / no_match / not_indexed / ocr_unavailable / index_degraded /
-    # store_unavailable — so the agent never mistakes an empty/degraded index
-    # for ground truth.
+    # ok / no_match / not_indexed / index_degraded / store_unavailable — so the
+    # agent never mistakes an empty/degraded index for ground truth.
     index_state: str
 
 

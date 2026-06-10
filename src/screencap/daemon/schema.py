@@ -244,8 +244,8 @@ def _load_models() -> dict[str, Any]:
 
     class ContentSearchResponse(EnvelopeResponse):
         hits: list[ContentHit]
-        # IndexState enum value: ok / no_match / not_indexed / ocr_unavailable
-        # / index_degraded / store_unavailable. Typed as str (not Literal) so a
+        # content_index.IndexState value: ok / no_match / not_indexed /
+        # index_degraded / store_unavailable. Typed as str (not Literal) so a
         # future state decodes tolerantly.
         index_state: str
 

@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import asyncio
+import heapq
 import json
 import logging
 import os
@@ -746,21 +747,6 @@ def _clamp_limit(limit: int | None) -> int:
     return max(1, min(int(limit), _QUERY_MAX_LIMIT))
 
 
-def _escape_like(term: str) -> str:
-    return term.replace("\\", "\\\\").replace("%", "\\%").replace("_", "\\_")
-
-
-def _text_snippet(text: str, query: str, *, width: int = 120) -> str:
-    lowered = text.lower()
-    idx = lowered.find(query.lower())
-    if idx < 0:
-        return text[:width].strip()
-    start = max(0, idx - width // 2)
-    end = min(len(text), idx + len(query) + width // 2)
-    excerpt = text[start:end].strip().replace("\n", " ")
-    return f"{'…' if start > 0 else ''}{excerpt}{'…' if end < len(text) else ''}"
-
-
 def _iter_recording_dirs(recording: str | None) -> list[Path]:
     """Candidate recording dirs to scan (validated single, or all, capped)."""
     from screencap.config import get_recordings_dir, resolve_recording_dir
@@ -795,6 +781,8 @@ def _run_transcript_search(
     ``*.txt.scrub_failed`` file (the suffix is appended, so a ``*.txt`` glob
     already excludes it; the explicit suffix check is belt-and-suspenders).
     """
+    from screencap.content_index import _like_snippet
+
     needle = query.lower()
     hits: list[dict[str, Any]] = []
     for rec_dir in _iter_recording_dirs(recording):
@@ -813,7 +801,7 @@ def _run_transcript_search(
                 hits.append({
                     "recording": rec_dir.name,
                     "chunk_index": _parse_chunk_index(path.name),
-                    "snippet": _text_snippet(text, query),
+                    "snippet": _like_snippet(text, query, width=120, collapse_newlines=True),
                 })
                 if len(hits) >= limit:
                     return hits
@@ -833,6 +821,7 @@ def _run_timeline_query(
     has_table/has_column; never touches OCR or the content index. ``browser_url``
     is intentionally not selected (v1 omits it — see TimelineRow).
     """
+    from screencap.content_index import _escape_like
     from screencap.recording_db import has_column, has_table, open_recording_db
 
     start_s = start_ms / 1000.0 if start_ms is not None else None
@@ -893,9 +882,10 @@ def _run_timeline_query(
             logger.debug("timeline.query skipped %s", rec_dir.name, exc_info=True)
             continue
 
-    # Cross-recording wall-clock order, then clamp.
-    rows.sort(key=lambda r: r["timestamp_ms"])
-    return rows[:limit]
+    # Cross-recording wall-clock order, bounded to `limit` (each recording
+    # already returned ≤limit rows; take the globally-earliest `limit` without
+    # a full sort of the gathered set).
+    return heapq.nsmallest(limit, rows, key=lambda r: r["timestamp_ms"])
 
 
 async def transcript_search(request: Request) -> JSONResponse:

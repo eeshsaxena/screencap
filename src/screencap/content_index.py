@@ -78,17 +78,15 @@ class IndexState(str, Enum):
     """Why a search returned what it did — keeps "empty" from being ambiguous.
 
     A corrupt global store must never be silently indistinguishable from "no
-    match", so the read path always reports one of these. ``not_indexed`` and
-    ``ocr_unavailable`` are set by callers with more context (the daemon / the
-    feeder); the store itself only ever emits ``ok``, ``no_match``,
-    ``index_degraded`` (FTS5 absent → LIKE fallback), or ``store_unavailable``
-    (missing/corrupt/symlinked).
+    match", so the read path always reports one of these. ``not_indexed`` is set
+    by the daemon caller (no store file yet); the store itself only ever emits
+    ``ok``, ``no_match``, ``index_degraded`` (FTS5 absent → LIKE fallback), or
+    ``store_unavailable`` (missing/corrupt/symlinked).
     """
 
     OK = "ok"
     NO_MATCH = "no_match"
     NOT_INDEXED = "not_indexed"
-    OCR_UNAVAILABLE = "ocr_unavailable"
     INDEX_DEGRADED = "index_degraded"
     STORE_UNAVAILABLE = "store_unavailable"
 
@@ -488,19 +486,26 @@ class ContentIndex:
         return deleted if deleted is not None and deleted >= 0 else 0
 
 
-def _like_snippet(text: str, query: str, *, width: int = 80) -> str:
+def _like_snippet(
+    text: str, query: str, *, width: int = 80, collapse_newlines: bool = False,
+) -> str:
     """Build a bounded excerpt around the first case-insensitive match.
 
-    The FTS5 path uses SQLite's ``snippet()``; the degraded LIKE path has no
-    equivalent, so produce a comparable window here.
+    The FTS5 path uses SQLite's ``snippet()``; the degraded LIKE path and the
+    daemon's transcript scan have no equivalent, so produce a comparable window
+    here. Shared by both (``collapse_newlines`` flattens multi-line transcript
+    text into a single snippet line).
     """
     lowered = text.lower()
     idx = lowered.find(query.lower())
     if idx < 0:
-        return text[:width].strip()
+        excerpt = text[:width].strip()
+        return excerpt.replace("\n", " ") if collapse_newlines else excerpt
     start = max(0, idx - width // 2)
     end = min(len(text), idx + len(query) + width // 2)
     excerpt = text[start:end].strip()
+    if collapse_newlines:
+        excerpt = excerpt.replace("\n", " ")
     prefix = "…" if start > 0 else ""
     suffix = "…" if end < len(text) else ""
     return f"{prefix}{excerpt}{suffix}"
