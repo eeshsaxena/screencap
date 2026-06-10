@@ -2205,6 +2205,13 @@ class Scrubber:
             pixel_ratio=self.pixel_ratio,
         )
 
+        # Surface the per-chunk blocked intervals as review/consumer evidence,
+        # mirroring run(). This is a WRITE-ONLY signal for downstream consumers
+        # (the SCR-118 content-index pass reads result.blocked_intervals to skip
+        # EXCLUDE / secure-field frames); the redaction path itself never
+        # branches on it, so R5's one-directional invariant holds.
+        result.blocked_intervals = list(ctx.blocked_intervals)
+
         events_path = self.capture_dir / f"events_{idx:04d}.jsonl"
         if events_path.exists():
             try:

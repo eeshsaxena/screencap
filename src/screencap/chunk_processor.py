@@ -23,6 +23,7 @@ from screencap.recording_db import open_recording_db
 
 if TYPE_CHECKING:
     from screencap.network.export_pipeline import NetworkScrubPipeline
+    from screencap.scrubber import ScrubResult
 
 logger = logging.getLogger(__name__)
 
@@ -1056,12 +1057,16 @@ class ChunkProcessor:
     def _scrub_chunk_files(
         self, idx: int, start_ts: float, end_ts: float,
         transcript_path: Path | None,
-    ) -> None:
+    ) -> "ScrubResult":
         """Scrub text surfaces + mask screenshots for a single chunk.
 
         Delegates to ``Scrubber.run_chunk()`` so the load-bearing step order
         lives in one place; the chunk processor only owns lifecycle concerns
         (which chunks to scrub, when, with what masking config).
+
+        Returns the ``ScrubResult`` so the caller can drive the SCR-118
+        content-index pass off its write-only ``blocked_intervals`` signal
+        (the redaction path must never branch on the return value).
         """
         from screencap.scrubber import Scrubber
 
@@ -1084,6 +1089,7 @@ class ChunkProcessor:
             logger.info(
                 f"Chunk {idx}: scrubbed with {len(scrub_result.audit_entries)} audit entries"
             )
+        return scrub_result
 
     def _collect_chunk_files(self, idx: int, transcript_path: Path | None) -> list[dict]:
         """Collect files belonging to this chunk for upload.

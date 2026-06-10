@@ -411,6 +411,46 @@ def test_run_chunk_deletes_excluded_app_screenshots(tmp_path, pipeline_and_anony
     assert outside.exists(), "screenshot outside excluded interval should remain"
 
 
+def test_run_chunk_surfaces_blocked_intervals_on_result(tmp_path, pipeline_and_anonymizer):
+    """run_chunk() threads blocked intervals onto result.blocked_intervals.
+
+    SCR-118 contract change: this is a WRITE-ONLY signal the content-index pass
+    reads to skip EXCLUDE / secure-field frames. The redaction path must never
+    branch on it (R5). Mirrors run()'s existing behavior.
+    """
+    from screencap.privacy.context import DefaultContextClassifier
+    from screencap.privacy.policy import (
+        DefaultPolicyEvaluator,
+        PrivacyAction,
+        parse_privacy_config,
+    )
+
+    pipeline, anonymizer = pipeline_and_anonymizer
+    rec = tmp_path / "rec"
+    _make_recording_with_blocked_interval(
+        rec,
+        blocked_bundle_id="com.1password.1password",
+        blocked_start=100.0,
+        blocked_end=200.0,
+    )
+
+    cfg = parse_privacy_config({"privacy": {"mode": "internal"}})
+    from screencap.scrubber import Scrubber
+
+    result = Scrubber(
+        rec,
+        pipeline=pipeline,
+        anonymizer=anonymizer,
+        evaluator=DefaultPolicyEvaluator(cfg),
+        classifier=DefaultContextClassifier(),
+    ).run_chunk(idx=4, start_ts=0.0, end_ts=300.0, transcript_path=None)
+
+    assert result.blocked_intervals, "run_chunk must surface blocked intervals"
+    # A 1Password (password-manager) window → EXCLUDE — the action the content
+    # index filters on to skip secure/excluded frames.
+    assert any(iv.action is PrivacyAction.EXCLUDE for iv in result.blocked_intervals)
+
+
 # ---------------------------------------------------------------------------
 # scrub_recording() CLI entry-point: copy + delegate + summarize
 # ---------------------------------------------------------------------------
