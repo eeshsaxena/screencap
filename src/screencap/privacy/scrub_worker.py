@@ -35,6 +35,7 @@ A ``None`` value on the queue is a poison pill for graceful shutdown.
 from __future__ import annotations
 
 import logging
+import math
 import queue as _queue_mod
 import sqlite3
 import threading
@@ -617,8 +618,13 @@ class ScrubWorker:
                 if not store.available:
                     return
                 for start, end in intervals:
-                    start_ms = int(start * 1000)
-                    end_ms = None if end == float("inf") else int(end * 1000)
+                    # Widen the purge window (floor start, ceil end) so a frame
+                    # whose ms timestamp was ROUNDED at write time can't survive
+                    # at a sub-ms interval boundary. Writes use round(ts*1000);
+                    # truncating the end here would miss a rounded-up boundary
+                    # frame and leave disabled-app text queryable.
+                    start_ms = math.floor(start * 1000)
+                    end_ms = None if end == float("inf") else math.ceil(end * 1000)
                     store.delete_recording_interval(recording, start_ms, end_ms)
         except Exception:
             logger.warning(

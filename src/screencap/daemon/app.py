@@ -783,7 +783,11 @@ def _run_transcript_search(
     """
     from screencap.content_index import _like_snippet
 
-    needle = query.lower()
+    needle = query.strip().lower()
+    if not needle:
+        # An empty/whitespace needle matches every file ("" in text is always
+        # True) — that would dump the whole transcript corpus, not search it.
+        return []
     hits: list[dict[str, Any]] = []
     for rec_dir in _iter_recording_dirs(recording):
         candidates = sorted(rec_dir.glob("transcript_*.txt"))

@@ -31,8 +31,10 @@ privacy weight that "only index redacted frames" was meant to provide:
    an app is retroactively disabled, so content the user destroyed stops being
    queryable.
 
-The U2 feeder additionally skips frames inside secure-field / EXCLUDE intervals,
-so focused password fields are not indexed. See ``SECURITY.md``.
+The U2 feeder only indexes frames the privacy policy classified ``ALLOW`` — it
+skips every frame inside a flagged interval (secure-field, EXCLUDE, MASK_WINDOW,
+etc.), so focused password fields and masked windows are not indexed. See
+``SECURITY.md``.
 
 Hardened at-rest perms
 ----------------------
@@ -337,6 +339,51 @@ class ContentIndex:
                 f"INSERT INTO {table} (recording, timestamp_ms, text) VALUES (?, ?, ?)",
                 rows,
             )
+            conn.commit()
+        except Exception:
+            conn.rollback()
+            raise
+        self._checkpoint()
+        return len(rows)
+
+    def write_chunk(
+        self,
+        recording: str,
+        start_ms: int,
+        end_ms: int,
+        frames: Iterable[IndexFrame],
+    ) -> int:
+        """Replace all of ``recording``'s rows in ``[start_ms, end_ms)`` with ``frames``.
+
+        Unlike :meth:`write_frames` (per-frame upsert), this clears the WHOLE
+        chunk time-range first, so a re-process (``--force`` / reconcile) where a
+        frame is now policy- or dedup-skipped drops its stale, less-redacted row
+        instead of leaving it behind. One committed transaction → a reader never
+        sees a half-written chunk. Returns the number of rows written.
+        """
+        if self._conn is None:
+            raise sqlite3.OperationalError("content index not open")
+        rows = [
+            (recording, int(f.timestamp_ms), f.text)
+            for f in frames
+            if f.text and f.text.strip()
+        ]
+        conn = self._conn
+        table = self._table
+        cur = conn.cursor()
+        cur.execute("BEGIN IMMEDIATE")
+        try:
+            cur.execute(
+                f"DELETE FROM {table} "
+                "WHERE recording = ? AND timestamp_ms >= ? AND timestamp_ms < ?",
+                (recording, int(start_ms), int(end_ms)),
+            )
+            if rows:
+                cur.executemany(
+                    f"INSERT INTO {table} (recording, timestamp_ms, text) "
+                    "VALUES (?, ?, ?)",
+                    rows,
+                )
             conn.commit()
         except Exception:
             conn.rollback()

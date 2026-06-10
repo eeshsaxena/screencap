@@ -108,6 +108,30 @@ def test_empty_text_frames_are_dropped(tmp_path: Path) -> None:
     assert written == 1
 
 
+def test_write_chunk_replaces_whole_range(tmp_path: Path) -> None:
+    with _idx(tmp_path) as idx:
+        # First pass indexes two frames in [1000, 3000).
+        idx.write_chunk("rec", 1000, 3000, _frames((1000, "alpha"), (2000, "beta secret")))
+        assert {h.timestamp_ms for h in idx.search("alpha").hits} == {1000}
+
+        # Re-process the SAME range with only one surviving frame (the 2000 frame
+        # is now skipped). Range-replace must drop its stale row.
+        idx.write_chunk("rec", 1000, 3000, _frames((1000, "alpha redacted")))
+
+        assert idx.search("secret").hits == []
+        assert {h.timestamp_ms for h in idx.search("alpha").hits} == {1000}
+
+
+def test_write_chunk_leaves_other_ranges_intact(tmp_path: Path) -> None:
+    with _idx(tmp_path) as idx:
+        idx.write_chunk("rec", 1000, 2000, _frames((1500, "first chunk")))
+        idx.write_chunk("rec", 2000, 3000, _frames((2500, "second chunk")))
+        # Re-processing chunk 1 must not touch chunk 2's rows.
+        idx.write_chunk("rec", 1000, 2000, _frames((1500, "first chunk again")))
+
+        assert {h.timestamp_ms for h in idx.search("chunk").hits} == {1500, 2500}
+
+
 # --------------------------------------------------------------------------
 # Empty / no-match
 # --------------------------------------------------------------------------

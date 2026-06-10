@@ -150,6 +150,66 @@ def test_index_pass_skips_excluded_intervals(index_env, tmp_path):
     assert ts == {110_000, 190_000}
 
 
+def test_index_pass_skips_all_masked_actions_not_just_exclude(index_env, tmp_path):
+    """Frames in ANY policy-flagged interval are skipped — not only EXCLUDE.
+
+    blocked_intervals is built with the full SCRUB_BLOCK_ACTIONS set; a
+    MASK_WINDOW frame (banking/email/chat) must not be indexed even though it is
+    not EXCLUDE, or its unmasked on-screen text leaks into the local index.
+    """
+    from screencap.privacy.policy import PrivacyAction
+
+    cap = tmp_path / "rec"
+    cap.mkdir()
+    _make_screenshots(cap, [110.0, 150.0, 190.0])
+    _FakeOcr.texts = {
+        110_000: "ordinary alpha",
+        150_000: "BANK balance statement",  # inside a MASK_WINDOW interval
+        190_000: "ordinary beta",
+    }
+
+    scrub = ScrubResult()
+    scrub.blocked_intervals = [
+        BlockedInterval(start=140.0, end=160.0, action=PrivacyAction.MASK_WINDOW, reason="bank"),
+    ]
+
+    cp = _make_cp(cap)
+    cp._index_chunk_content(0, 100.0, 200.0, scrub)
+
+    assert _search(index_env.store_path, "balance") == []
+    assert _search(index_env.store_path, "BANK") == []
+    assert {h.timestamp_ms for h in _search(index_env.store_path, "ordinary")} == {110_000, 190_000}
+
+
+def test_reprocess_drops_now_skipped_frame(index_env, tmp_path):
+    """A re-process where a frame becomes policy-skipped must clear its stale row.
+
+    Range-replace (write_chunk) clears the whole chunk range, so a frame indexed
+    in pass 1 that is EXCLUDE/MASK-skipped in pass 2 (e.g. a tightened policy)
+    does not survive as a stale, less-redacted row.
+    """
+    from screencap.privacy.policy import PrivacyAction
+
+    cap = tmp_path / "rec"
+    cap.mkdir()
+    _make_screenshots(cap, [120.0, 150.0])
+    _FakeOcr.texts = {120_000: "keep me", 150_000: "now sensitive secret"}
+
+    cp = _make_cp(cap)
+    cp._index_chunk_content(0, 100.0, 200.0, ScrubResult())  # pass 1: both indexed
+    assert _search(index_env.store_path, "secret")  # present after pass 1
+
+    # Pass 2 with the 150.0 frame now inside a blocked interval.
+    scrub = ScrubResult()
+    scrub.blocked_intervals = [
+        BlockedInterval(start=145.0, end=155.0, action=PrivacyAction.EXCLUDE, reason="x"),
+    ]
+    cp._index_chunk_content(0, 100.0, 200.0, scrub)
+
+    assert _search(index_env.store_path, "secret") == []  # stale row cleared
+    assert {h.timestamp_ms for h in _search(index_env.store_path, "keep")} == {120_000}
+
+
 def test_index_pass_dedups_near_identical_frames(index_env, tmp_path, monkeypatch):
     cap = tmp_path / "rec"
     cap.mkdir()

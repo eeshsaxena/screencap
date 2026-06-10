@@ -782,3 +782,29 @@ async def test_transcript_search_rejects_traversal(
     )
     assert response.status_code >= 400
     assert response.json()["error"] == "invalid_name"
+
+
+@pytest.mark.asyncio
+async def test_transcript_search_empty_query_returns_nothing(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    recordings_dir = tmp_path / "recordings"
+    rec = recordings_dir / "demo"
+    rec.mkdir(parents=True)
+    (rec / "transcript_0001.txt").write_text("some private transcript content")
+    monkeypatch.setenv("SCREENCAP_RECORDINGS_DIR", str(recordings_dir))
+
+    # An empty/whitespace query must NOT dump the whole transcript corpus.
+    response = await _asgi_post("/v0/transcript.search", {"query": "   "})
+    assert response.status_code == 200
+    assert response.json()["hits"] == []
+
+
+@pytest.mark.asyncio
+async def test_timeline_query_rejects_traversal(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    monkeypatch.setenv("SCREENCAP_RECORDINGS_DIR", str(tmp_path / "recordings"))
+    response = await _asgi_post("/v0/timeline.query", {"recording": "../../etc"})
+    assert response.status_code >= 400
+    assert response.json()["error"] == "invalid_name"

@@ -9,6 +9,7 @@ from __future__ import annotations
 
 import json
 import logging
+import math
 import os
 import sqlite3
 import threading
@@ -35,6 +36,10 @@ _INDEX_DHASH_THRESHOLD = 5
 # stall the capture-adjacent thread / upload. Excess frames are dropped with a
 # log line (no silent truncation).
 _INDEX_MAX_OCR_FRAMES = 240
+# Wall-clock budget for the per-chunk OCR pass — a second backstop (alongside
+# the frame cap and the _stop_event check) so a slow/wedged OCR engine can never
+# sit in front of this chunk's upload indefinitely.
+_INDEX_OCR_BUDGET_S = 30.0
 
 
 class _StageAbort(Exception):
@@ -1132,10 +1137,12 @@ class ChunkProcessor:
 
         Privacy (narrowed R7): the live recorder never masks screenshots in
         place, so these pixels are unmasked — but the index is local-only (never
-        uploaded, like ``recording.db``) and purged on retroactive disable. Both
-        EXCLUDE-app and secure-field intervals carry ``action=EXCLUDE`` on
-        ``scrub_result.blocked_intervals``; frames inside them are skipped so
-        focused password fields and excluded apps are never indexed.
+        uploaded, like ``recording.db``) and purged on retroactive disable. The
+        pass skips every frame inside any ``scrub_result.blocked_intervals``
+        entry (the full SCRUB_BLOCK_ACTIONS set — EXCLUDE / MASK_WINDOW /
+        MASK_REGION / TEXT_REDACT / OCR_FALLBACK), so only ``ALLOW``-classified
+        frames are indexed and the index never holds more than the scrubbed
+        cloud copy's screenshots would.
         """
         if not self._content_index_enabled:
             return
@@ -1172,25 +1179,26 @@ class ChunkProcessor:
         )
         from screencap.engine.dedup import dhash, hamming_distance
         from screencap.privacy.context import parse_screenshot_timestamp
-        from screencap.privacy.policy import PrivacyAction
 
-        # EXCLUDE / secure-field intervals to skip (both carry action=EXCLUDE).
-        exclude_intervals = [
-            (iv.start, iv.end)
-            for iv in scrub_result.blocked_intervals
-            if iv.action is PrivacyAction.EXCLUDE
-        ]
+        # Skip EVERY frame the policy flagged for any masking/redaction action.
+        # ``blocked_intervals`` is built with the full SCRUB_BLOCK_ACTIONS set
+        # (EXCLUDE / MASK_WINDOW / MASK_REGION / TEXT_REDACT / OCR_FALLBACK), so
+        # indexing only excludes EXCLUDE would leave MASK_WINDOW content (banking
+        # / email / chat) — which the masker blanks in the cloud copy —
+        # searchable in the local index. Skipping all of them makes the index
+        # hold only ALLOW-classified on-screen text (the R7 narrowing).
+        skip_intervals = [(iv.start, iv.end) for iv in scrub_result.blocked_intervals]
 
-        def _excluded(ts: float) -> bool:
-            return any(s <= ts < e for s, e in exclude_intervals)
+        def _skipped(ts: float) -> bool:
+            return any(s <= ts < e for s, e in skip_intervals)
 
-        # Time-scope to [start_ts, end_ts); drop excluded frames.
+        # Time-scope to [start_ts, end_ts); drop policy-flagged frames.
         candidates: list[tuple[float, Path]] = []
         for img_path in sorted(screenshots_dir.glob("*.jpg")):
             ts = parse_screenshot_timestamp(img_path.name)
             if ts is None or not (start_ts <= ts < end_ts):
                 continue
-            if _excluded(ts):
+            if _skipped(ts):
                 continue
             candidates.append((ts, img_path))
 
@@ -1207,6 +1215,14 @@ class ChunkProcessor:
         prev_hash: int | None = None
         frames: list[IndexFrame] = []
         for ts, img_path in candidates:
+            # This pass runs synchronously before this chunk's upload, so a
+            # force-stop or a slow/wedged OCR engine must not pin the capture-
+            # adjacent thread: bail on stop, and on a wall-clock budget.
+            if self._stop_event.is_set():
+                break
+            if time.perf_counter() - started > _INDEX_OCR_BUDGET_S:
+                logger.info(f"Chunk {idx}: content-index OCR budget hit; stopping early")
+                break
             # Dedup near-identical consecutive frames (same primitive + tight
             # threshold mask_screenshots uses); keep prev_hash on a dup so we
             # compare against the last distinct frame.
@@ -1234,14 +1250,23 @@ class ChunkProcessor:
                     IndexFrame(timestamp_ms=int(round(ts * 1000)), text=text)
                 )
 
-        if not frames:
+        # Replace the WHOLE chunk time-range (not just the surviving frames) so a
+        # re-process where a frame is now skipped (policy/dedup) drops its stale,
+        # less-redacted row instead of leaving it behind. Range is [start, end)
+        # in ms, widened (floor/ceil) to cover any rounded frame timestamp.
+        start_ms = math.floor(start_ts * 1000)
+        end_ms = math.ceil(end_ts * 1000)
+        store_path = default_index_path()
+        # Nothing to index AND no store yet → don't create an empty PII store.
+        # (When the store exists we still run, so a re-process clears stale rows.)
+        if not frames and not store_path.exists():
             return
         # Key on the recording DIRECTORY name (globally unique, and what the
         # daemon query side resolves a recording filter to) — not the display
         # name — so the scrub_worker purge and daemon reads agree on the key.
-        with ContentIndex(default_index_path()) as store:
+        with ContentIndex(store_path) as store:
             if store.available:
-                store.write_frames(self._capture_dir.name, frames)
+                store.write_chunk(self._capture_dir.name, start_ms, end_ms, frames)
         logger.info(
             f"Chunk {idx}: content-indexed {len(frames)} frames in "
             f"{time.perf_counter() - started:.2f}s"
