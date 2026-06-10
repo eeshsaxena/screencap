@@ -28,6 +28,15 @@ Recordings flow through one **disk-first pipeline** rather than a fork at record
 - **`recording.db` is local-only by rule** — never uploaded (`upload.list_recording_files` excludes it + sidecars + `*.scrub_failed`; `upload.assert_uploadable` hard-rejects it). Cloud structured data derives only from scrubbed exports.
 - **Cloud video privacy** is governed by the `masked_video_upload` flag (default OFF). See `SECURITY.md` for the capture-time-blocking-vs-post-hoc-masking trust boundary and the prerequisites for enabling it.
 
+### Agent-memory retrieval: content index + MCP query surface (SCR-118)
+
+A queryable retrieval surface lets a local agent search recordings. It spans three streams through one interface and is **local-only** — nothing here is uploaded.
+
+- **Content index** — `src/screencap/content_index.py` (`ContentIndex`) owns a global FTS5 sidecar at `~/.screencap/content_index.db`, keyed by recording **directory name** + frame `timestamp_ms`. FTS5 probe + escaped-`LIKE` fallback, idempotent per-`(recording, timestamp_ms)` delete-then-insert writes, ranked pointer-only search with an `index_state` enum, `delete_recording` / `delete_recording_interval`, hardened `0o600`/`0o700` perms (symlink guard + post-WAL chmod), WAL + `busy_timeout=10000` + per-chunk transaction + PASSIVE checkpoint.
+- **Index OCR pass** — `chunk_processor._index_chunk_content` runs after `_scrub_chunk_files` (config flag `content_index_enabled` / `SCREENCAP_CONTENT_INDEX`, **default off**; requires scrub enabled). It OCRs the **local, unmasked** flat `screenshots/*.jpg`, time-scoped per chunk, **skipping secure-field / EXCLUDE frames** (filtered from the write-only `ScrubResult.blocked_intervals` by `action == EXCLUDE`), deduped via `engine.dedup`. **Strictly fail-open.** `scrub_worker._purge_content_index_intervals` propagates retroactive "disable this app" deletes to the index. See `SECURITY.md` for the narrowed-R7 rationale (index = same sensitivity class as the local screenshots; never uploaded + purged on destroy).
+- **Daemon query verbs** — `src/screencap/daemon/app.py`: `/v0/content.search`, `/v0/transcript.search`, `/v0/timeline.query` (read-only, validated inputs, pointer-only, class-name-only diagnostics, **not** in `_ACTIVITY_PATHS`). Per-stream coverage: timeline is `authoritative`; content/transcript are best-effort. `timeline.query` omits `browser_url` in v1.
+- **MCP server** — `src/screencap/mcp/` (`screencap mcp`): a thin FastMCP stdio server forwarding to the daemon over its own async UDS client, holding a `/v0/events` subscription for idle-shutdown liveness, stderr-only logging. Operator setup: `docs/mcp-client-setup.md`.
+
 ## Common Commands
 
 ```bash
