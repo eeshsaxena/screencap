@@ -204,17 +204,22 @@ def test_failclosed_no_geometry_samples(chunk_mp4, scrubbed_out, tmp_path):
     assert not scrubbed_out.exists()
 
 
-def test_failclosed_sparse_gap_exceeds_bound(chunk_mp4, scrubbed_out, tmp_path):
-    """Case (b): an inter-sample gap > MAX_GEOMETRY_GAP_SECONDS → FAILED."""
+def test_failclosed_sparse_gap_exceeds_bound(scrubbed_out, tmp_path):
+    """Case (b): an inter-sample gap > MAX_GEOMETRY_GAP_SECONDS → FAILED.
+
+    The chunk's real frames span the gap (the masker derives the span from the
+    chunk's PTS extent, so the gap must be within the frames that exist)."""
     db = tmp_path / "recording.db"
-    # Two samples straddling a gap larger than the bound (within a longer span).
     end = MAX_GEOMETRY_GAP_SECONDS + 1.0
+    # A chunk whose decoded frames actually span [0, end] (frame i at i/FPS).
+    long_chunk = tmp_path / "chunk_long.mp4"
+    _make_mp4(long_chunk, n_frames=int(round(end * FPS)) + 1)
     _make_db(
         db,
         geometry=[(0.0, []), (end, [])],  # gap == end > bound
     )
     outcome = mask_video_chunk(
-        chunk_mp4, db, start_ts=0.0, end_ts=end, chunk_start_abs=0.0,
+        long_chunk, db, start_ts=0.0, end_ts=end, chunk_start_abs=0.0,
         output_path=scrubbed_out, pixel_ratio=1.0,
     )
     assert outcome.status is MaskOutcomeStatus.FAILED
@@ -222,7 +227,7 @@ def test_failclosed_sparse_gap_exceeds_bound(chunk_mp4, scrubbed_out, tmp_path):
     assert "gap" in outcome.reason
 
 
-def test_failclosed_leading_edge_gap(chunk_mp4, scrubbed_out, tmp_path):
+def test_failclosed_leading_edge_gap(scrubbed_out, tmp_path):
     """Case (b): span start → first sample gap > bound → FAILED.
 
     A sample exists, but it is too far from the span start: the leading frames
@@ -230,10 +235,12 @@ def test_failclosed_leading_edge_gap(chunk_mp4, scrubbed_out, tmp_path):
     """
     db = tmp_path / "recording.db"
     end = MAX_GEOMETRY_GAP_SECONDS + 1.0
+    long_chunk = tmp_path / "chunk_long.mp4"
+    _make_mp4(long_chunk, n_frames=int(round(end * FPS)) + 1)
     # Single sample near the END; the leading edge is uncovered.
     _make_db(db, geometry=[(end, [])])
     outcome = mask_video_chunk(
-        chunk_mp4, db, start_ts=0.0, end_ts=end, chunk_start_abs=0.0,
+        long_chunk, db, start_ts=0.0, end_ts=end, chunk_start_abs=0.0,
         output_path=scrubbed_out, pixel_ratio=1.0,
     )
     assert outcome.status is MaskOutcomeStatus.FAILED
@@ -254,7 +261,9 @@ def test_failclosed_pyav_decode_error(scrubbed_out, tmp_path):
     assert outcome.status is MaskOutcomeStatus.FAILED
     assert outcome.output_path is None
     assert not scrubbed_out.exists()
-    assert "transcode_error" in outcome.reason
+    # A corrupt chunk now fails closed at the PTS-extent probe (the first read,
+    # before coverage/transcode) — the unreadable extent is itself unprovable.
+    assert "pts_extent_unprovable" in outcome.reason
 
 
 def test_failclosed_classifier_unavailable(chunk_mp4, scrubbed_out, tmp_path, monkeypatch):
@@ -480,3 +489,106 @@ def test_provably_safe_distinct_from_failed(chunk_mp4, scrubbed_out, tmp_path):
     assert bad.status is MaskOutcomeStatus.FAILED
     assert safe.status is not bad.status
     assert safe.ok and not bad.ok
+
+
+# ---------------------------------------------------------------------------
+# SCR-126 Fix 2: span derived from the chunk's real decoded PTS extent, plus
+# the fail-closed in-loop guard and the origin-bracketing backstop.
+# ---------------------------------------------------------------------------
+
+
+def test_scr126_trailing_frames_masked_when_caller_span_too_short(
+    chunk_mp4, scrubbed_out, tmp_path
+):
+    """The trailing-frame leak: a caller span shorter than the chunk's real
+    frames must NOT leave trailing frames clear while reporting MASKED.
+
+    Pre-fix, intervals were built only to the caller's (short) end_ts, so frames
+    beyond it got no interval and were drawn CLEAR while regions>0 still reported
+    MASKED. Post-fix the masker derives the span from the chunk's PTS extent, so
+    EVERY frame (incl. the trailing ones) is masked. Decoding a trailing frame
+    proves the sensitive region is actually filled."""
+    db = tmp_path / "recording.db"
+    # Sensitive window present across the whole real extent.
+    _make_db(db, geometry=_dense_samples(0.0, 1.0, [_SENSITIVE_WIN]))
+    # Caller passes a span that ends at 0.4s — far short of the real ~0.9s of
+    # frames (mimics terminal_stage's uniform chunk_dur underestimate).
+    outcome = mask_video_chunk(
+        chunk_mp4, db, start_ts=0.0, end_ts=0.4, chunk_start_abs=0.0,
+        output_path=scrubbed_out, pixel_ratio=1.0,
+    )
+    assert outcome.status is MaskOutcomeStatus.MASKED
+    assert scrubbed_out.exists()
+
+    c = av.open(str(scrubbed_out))
+    frames = list(c.decode(c.streams.video[0]))
+    c.close()
+    assert len(frames) == N_FRAMES
+    # Frame 8 is at t≈0.8s — WELL beyond the caller's 0.4 span. It must be masked
+    # (pre-fix it shipped clear). Sample a pixel inside the sensitive window.
+    trailing = frames[8].to_image().convert("RGB")
+    assert _is_masked_fill(trailing.getpixel((20, 20))), (
+        "trailing frame beyond the caller span shipped CLEAR — the SCR-126 "
+        "trailing-frame leak is open"
+    )
+
+
+def test_scr126_out_of_span_frame_fails_closed(
+    chunk_mp4, scrubbed_out, tmp_path, monkeypatch
+):
+    """A decoded frame outside the proven span fails closed (no clear ship).
+
+    Force the PTS-extent probe to under-report (end at 0.2s) so frames past 0.2
+    fall outside the coverage-proven span. The in-loop guard must raise → FAILED
+    → no copy, rather than drawing the unproven frames clear."""
+    import screencap.video_mask as vm
+
+    db = tmp_path / "recording.db"
+    _make_db(db, geometry=_dense_samples(0.0, 1.0, [_SENSITIVE_WIN]))
+    # Probe lies: claims the chunk ends at 0.2s though it really runs to ~0.9s.
+    monkeypatch.setattr(vm, "_probe_pts_extent", lambda _p: (0.0, 0.2))
+    outcome = mask_video_chunk(
+        chunk_mp4, db, start_ts=0.0, end_ts=1.0, chunk_start_abs=0.0,
+        output_path=scrubbed_out, pixel_ratio=1.0,
+    )
+    assert outcome.status is MaskOutcomeStatus.FAILED
+    assert not scrubbed_out.exists()
+    assert "outside coverage-proven span" in outcome.reason
+
+
+def test_scr126_misaligned_origin_fails_closed_not_wrong_window(
+    chunk_mp4, scrubbed_out, tmp_path
+):
+    """A grossly mis-aligned absolute origin fails closed, not masks the wrong
+    window. Geometry exists only around the TRUE window [10, 11]; an origin of
+    0.0 lands the derived span [0, ~0.9] where there is NO geometry → coverage
+    unprovable → FAILED. The masker does not silently reuse geometry from an
+    unrelated time (R7 backstop via coverage over the real extent)."""
+    db = tmp_path / "recording.db"
+    _make_db(db, geometry=_dense_samples(10.0, 11.0, [_SENSITIVE_WIN]))
+    outcome = mask_video_chunk(
+        chunk_mp4, db, start_ts=0.0, end_ts=1.0, chunk_start_abs=0.0,
+        output_path=scrubbed_out, pixel_ratio=1.0,
+    )
+    assert outcome.status is MaskOutcomeStatus.FAILED
+    assert not scrubbed_out.exists()
+
+
+def test_scr126_live_overshoot_end_ts_does_not_failclose(
+    chunk_mp4, scrubbed_out, tmp_path
+):
+    """Live-path parity (R9): rotation_time overshoots the last decoded frame, so
+    a too-large caller end_ts must NOT spuriously fail closed on the idle gap
+    before rotation. The masker derives the real extent (~0.9s), so dense
+    geometry over the frames yields MASKED — not a FAILED from a 4s edge gap."""
+    db = tmp_path / "recording.db"
+    _make_db(db, geometry=_dense_samples(0.0, 1.0, [_SENSITIVE_WIN]))
+    # end_ts=5.0 simulates rotation firing 4s after the last action-gated frame.
+    outcome = mask_video_chunk(
+        chunk_mp4, db, start_ts=0.0, end_ts=5.0, chunk_start_abs=0.0,
+        output_path=scrubbed_out, pixel_ratio=1.0,
+    )
+    assert outcome.status is MaskOutcomeStatus.MASKED, (
+        "honest live chunk spuriously failed closed on the rotation overshoot"
+    )
+    assert scrubbed_out.exists()

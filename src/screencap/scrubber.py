@@ -64,6 +64,14 @@ SCRUB_SENTINEL_NAME = ".scrub_complete"
 # own logic version, independent of the package release version.
 SCRUB_PROVENANCE_VERSION = 1
 
+# Bump when the post-hoc VIDEO-MASKING behavior changes (SCR-126 Fix 2/3) so a
+# masked_video/ copy produced by older mask logic is re-masked rather than reused
+# or re-uploaded. This is the mask-logic analogue of SCRUB_PROVENANCE_VERSION and
+# is recorded in the masked-video provenance (U3) and checked by the reuse +
+# convergence-fast-path gates. Version 1 is the initial SCR-126 mask logic
+# (real-extent coverage + the fail-closed in-loop span guard).
+MASK_PROVENANCE_VERSION = 1
+
 # Source files whose content determines the scrubbed output — hashed into the
 # provenance so an upload-path mutation of the original (events re-export, WAL
 # checkpoint, chunk recovery) or any other change invalidates reuse. Media and

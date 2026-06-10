@@ -86,6 +86,14 @@ _MASK_PIX_FMT = "yuv420p"
 # (near-black) so the visual treatment is consistent with screenshot masking.
 _MASK_FILL = (30, 30, 30)
 
+# Tolerance (seconds) for the in-loop "frame within the proven span" guard. The
+# masker derives the span from the chunk's own decoded PTS extent, so every honest
+# frame lands inside [start_ts, end_ts] by construction; the guard only fires on a
+# probe/decode disagreement. The epsilon absorbs float round-trip noise between the
+# demux-probe PTS and the decode-loop PTS (well under one frame interval), so a
+# genuine out-of-span frame (≥ one frame interval beyond the extent) still trips it.
+_SPAN_EPS_S: float = 1e-3
+
 
 class MaskOutcomeStatus(str, Enum):
     """Result of masking one cloud chunk.
@@ -338,6 +346,43 @@ def _interval_for(
     return None
 
 
+def _probe_pts_extent(chunk_path: Path) -> tuple[float, float]:
+    """Return ``(min_pts_seconds, max_pts_seconds)`` for the chunk's real frames.
+
+    Cheap demux pass — reads packet PTS only, does NOT decode. Recordings are
+    action-gated VFR, so packet/decode order is NOT guaranteed PTS-monotonic;
+    we therefore take ``max()`` over ALL packets' PTS, never the last packet's,
+    or a trailing low-PTS packet would under-report the extent and re-open the
+    trailing-clear-frame leak this probe exists to close (SCR-126 Fix 2).
+
+    Raises on any read error or absent PTS — the caller maps that to FAILED
+    (fail closed: a chunk whose true frame extent cannot be read must not ship).
+    """
+    container = av.open(str(chunk_path))
+    try:
+        if not container.streams.video:
+            raise RuntimeError(f"chunk {chunk_path.name} has no video stream")
+        vstream = container.streams.video[0]
+        time_base = vstream.time_base
+        min_pts: int | None = None
+        max_pts: int | None = None
+        for packet in container.demux(vstream):
+            if packet.pts is None:
+                continue
+            if min_pts is None or packet.pts < min_pts:
+                min_pts = packet.pts
+            if max_pts is None or packet.pts > max_pts:
+                max_pts = packet.pts
+    finally:
+        try:
+            container.close()
+        except Exception:  # noqa: BLE001
+            pass
+    if max_pts is None or time_base is None:
+        raise RuntimeError(f"chunk {chunk_path.name}: no readable packet PTS")
+    return (float((min_pts or 0) * time_base), float(max_pts * time_base))
+
+
 def mask_video_chunk(
     chunk_path: Path,
     db_path: Path,
@@ -375,7 +420,37 @@ def mask_video_chunk(
     Returns:
         A :class:`MaskOutcome`. FAILED leaves no copy on disk.
     """
+    # ---- SCR-126 Fix 2: derive the span from the chunk's OWN PTS extent. ----
+    # The caller-supplied [start_ts, end_ts] is advisory: on the terminal path it
+    # is a uniform chunk_dur grid that can fall SHORT of the real last frame
+    # (trailing frames then ship clear); on the live path end_ts == rotation_time
+    # OVERSHOOTS the last frame (would force a spurious fail-close on the idle gap
+    # before rotation). Re-derive both edges from the decoded PTS extent so the
+    # coverage gate proves geometry density over the frames that actually exist,
+    # and `chunk_start_abs` is the sole external (absolute-origin) input. A probe
+    # failure is unprovable → fail closed.
+    try:
+        min_secs, max_secs = _probe_pts_extent(chunk_path)
+    except Exception as exc:  # noqa: BLE001 — unreadable extent is unprovable
+        logger.warning(
+            "video_mask: chunk {} FAILED (PTS-extent unprovable): {}",
+            chunk_path.name, exc,
+        )
+        return MaskOutcome(
+            status=MaskOutcomeStatus.FAILED, reason=f"pts_extent_unprovable: {exc}"
+        )
+    start_ts = chunk_start_abs + min_secs
+    end_ts = chunk_start_abs + max_secs
+
     # ---- (b) FAIL CLOSED FIRST: prove coverage before any masking work. ----
+    # Coverage is proven over the REAL frame extent [start_ts, end_ts]; the
+    # gate's edge-gap check (start_ts → first sample, last sample → end_ts) is
+    # also what fails a chunk closed when geometry does not bracket the decoded
+    # frames within MAX_GEOMETRY_GAP_SECONDS — the available R7 origin-alignment
+    # backstop (a grossly mis-aligned absolute origin lands the span where
+    # geometry is sparse and fails closed). NOTE: a wrong-but-dense origin is not
+    # caught here; closing that fully needs a persisted per-chunk first-frame
+    # wall-clock, which does not exist today (see SCR-126 plan, R7 deferral).
     try:
         samples = _build_coverage(db_path, start_ts, end_ts)
     except _CoverageError as exc:
@@ -439,6 +514,7 @@ def mask_video_chunk(
     try:
         regions, frames = _transcode_with_masks(
             chunk_path, output_path, intervals, chunk_start_abs, pixel_ratio,
+            start_ts=start_ts, end_ts=end_ts,
         )
     except Exception as exc:
         logger.warning(
@@ -504,6 +580,9 @@ def _transcode_with_masks(
     intervals: list[_SensitiveInterval],
     chunk_start_abs: float,
     pixel_ratio: float,
+    *,
+    start_ts: float,
+    end_ts: float,
 ) -> tuple[int, int]:
     """Decode → draw opaque masks per frame → re-encode atomically.
 
@@ -562,6 +641,21 @@ def _transcode_with_masks(
             frame_pts = frame.pts if frame.pts is not None else 0
             frame_secs = float(frame_pts * time_base) if time_base else 0.0
             abs_ts = chunk_start_abs + frame_secs
+
+            # SCR-126 Fix 2 — fail-closed in-loop guard. Every frame MUST fall in
+            # the coverage-proven span [start_ts, end_ts] (derived from this
+            # chunk's own PTS extent). A frame outside it was never coverage-
+            # proven, so masking it would draw it clear (no interval) and ship a
+            # never-validated frame. Raise → the caller maps to FAILED and drops
+            # the copy. With span derived from the same packets this never fires
+            # for honest input; it makes a probe/decode disagreement loud, not a
+            # silent clear frame.
+            if abs_ts < start_ts - _SPAN_EPS_S or abs_ts > end_ts + _SPAN_EPS_S:
+                raise RuntimeError(
+                    f"frame at abs_ts {abs_ts:.6f} outside coverage-proven span "
+                    f"[{start_ts:.6f}, {end_ts:.6f}] — refusing to ship an "
+                    f"unproven frame"
+                )
 
             iv = _interval_for(intervals, abs_ts)
             img = frame.to_image().convert("RGB")

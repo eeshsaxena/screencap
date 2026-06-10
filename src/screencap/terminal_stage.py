@@ -427,20 +427,37 @@ class CloudCopyProducer:
             get_frozen_masked_video_upload,
             mask_chunk_for_cloud,
         )
+        from screencap.recovery import derive_chunk_ranges
 
         if not get_frozen_masked_video_upload(self._recording_dir):
             return
 
         db_path = self._recording_dir / "recording.db"
         chunk_videos = sorted(self._recording_dir.glob("chunk_*.mp4"))
-        chunk_start_abs, chunk_dur = _chunk_timing(db_path, len(chunk_videos))
+        # SCR-126 Fix 2 / R3: each chunk's absolute ORIGIN comes from the SHARED
+        # range helper (same arithmetic recovery uses for manifests/events, so the
+        # two cannot drift). The masker derives each chunk's END from its own
+        # decoded PTS extent, so the grid c_end here is only an advisory span.
+        ranges = {
+            idx: (c_start, c_end)
+            for idx, c_start, c_end in derive_chunk_ranges(db_path, len(chunk_videos))
+        }
+        # Best-effort fallback origin only when the DB-derived grid is unavailable
+        # (no events / read error): mirror the prior base+grid arithmetic so the
+        # masker still runs and its coverage gate fails closed on a bad span.
+        fb_base, fb_dur = (
+            _chunk_timing(db_path, len(chunk_videos)) if not ranges else (0.0, 0.0)
+        )
         for vf in chunk_videos:
             try:
                 idx = int(vf.stem.split("_")[1])
             except (IndexError, ValueError):
                 continue
-            start_ts = chunk_start_abs + idx * chunk_dur
-            end_ts = start_ts + chunk_dur
+            if idx in ranges:
+                start_ts, end_ts = ranges[idx]
+            else:
+                start_ts = fb_base + idx * fb_dur
+                end_ts = start_ts + fb_dur
             cls = mask_chunk_for_cloud(
                 self._recording_dir, scrubbed_dir, idx,
                 start_ts=start_ts, end_ts=end_ts,
