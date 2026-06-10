@@ -448,11 +448,13 @@ class CloudCopyProducer:
         fb_base, fb_dur = (
             _chunk_timing(db_path, len(chunk_videos)) if not ranges else (0.0, 0.0)
         )
+        expected: set[int] = set()
         for vf in chunk_videos:
             try:
                 idx = int(vf.stem.split("_")[1])
             except (IndexError, ValueError):
                 continue
+            expected.add(idx)
             if idx in ranges:
                 start_ts, end_ts = ranges[idx]
             else:
@@ -468,6 +470,23 @@ class CloudCopyProducer:
                 outcome.masked_chunks.append(idx)
             elif cls.failed:
                 outcome.failed_chunks.append(idx)
+
+        # SCR-126 Fix 3 — AUTHORITATIVE closed-set reconcile + provenance. Purge any
+        # masked_video/chunk_*.mp4 whose source chunk no longer exists (orphans the
+        # per-chunk pass never visits), then record provenance over the
+        # successfully-masked set so the reuse and convergence-fast-path gates can
+        # trust the copies. Runs on every produce, including the reuse path that
+        # skips the wholesale scrub rebuild — so a prior run's stale copy can never
+        # reach the rglob upload set.
+        from screencap.scrubber import (
+            purge_orphan_masked_videos,
+            write_masked_provenance,
+        )
+
+        purge_orphan_masked_videos(scrubbed_dir, expected_indices=expected)
+        write_masked_provenance(
+            self._recording_dir, scrubbed_dir, masked_indices=outcome.masked_chunks,
+        )
 
 
 def _chunk_timing(db_path: Path, n_chunks: int) -> tuple[float, float]:
@@ -504,6 +523,25 @@ def _null_console() -> Any:
     from rich.console import Console
 
     return Console(quiet=True)
+
+
+def _masked_convergence_ok(recording_dir: Path) -> bool:
+    """SCR-126 R8 gate for the convergence fast path.
+
+    Returns True when the fast path may declare 'done' WITHOUT running ``produce``:
+    either the frozen ``masked_video_upload`` flag is OFF (no masked cloud video is
+    involved — today's default), or it is ON and a masked-video provenance record
+    exists at the CURRENT ``MASK_PROVENANCE_VERSION``. A recording converged under
+    older mask logic returns False → the caller falls through to ``produce`` and
+    re-masks rather than shipping the stale cloud copy."""
+    from screencap.pipeline_chunk_ops import get_frozen_masked_video_upload
+
+    if not get_frozen_masked_video_upload(recording_dir):
+        return True
+    from screencap.scrubber import masked_provenance_version_current
+
+    scrubbed_dir = recording_dir.parent / f"{recording_dir.name}-scrubbed"
+    return masked_provenance_version_current(scrubbed_dir)
 
 
 # ---------------------------------------------------------------------------
@@ -824,7 +862,18 @@ def _route_cloud(
     # the stop budget (the live path already did the work) and makes the daemon
     # resume / CLI re-upload of a converged recording a near-no-op. ``force``
     # always rebuilds (re-scrub + re-upload).
-    if not force and ledger is not None and ledger.finalize_gate_satisfied():
+    #
+    # SCR-126 R8: the fast path skips ``produce`` (hence masking + provenance), so
+    # it must NOT declare convergence for a recording whose masked cloud video was
+    # produced under OLDER mask logic — ``_masked_convergence_ok`` falls it through
+    # to ``produce`` (re-mask) on a MASK_PROVENANCE_VERSION miss. No-op when the
+    # frozen masked flag is OFF (today's default — no masked copy is involved).
+    if (
+        not force
+        and ledger is not None
+        and ledger.finalize_gate_satisfied()
+        and _masked_convergence_ok(recording_dir)
+    ):
         result.routed = True
         _refresh_counts(ledger, result)
         result.all_uploaded = True

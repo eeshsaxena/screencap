@@ -19,7 +19,7 @@ import re
 import shutil
 import stat
 from collections import Counter
-from collections.abc import Iterator
+from collections.abc import Iterable, Iterator
 from contextlib import ExitStack
 from dataclasses import dataclass, field
 from pathlib import Path
@@ -2371,6 +2371,15 @@ def mask_video_chunk_for_cloud(
         classifier=classifier,
         evaluator=evaluator,
     )
+    # SCR-126 Fix 3 (in-masker secondary purge): on FAILED, a pre-existing masked
+    # copy from a PRIOR run (different policy / older mask logic) is NOT touched by
+    # mask_video_chunk's case-(b) early return — it would survive and could ship
+    # via the rglob upload. Remove it so a failed chunk leaves NO masked copy. (The
+    # produce-level closed-set reconcile is the authoritative purge; this is the
+    # per-chunk belt.)
+    if outcome is not None and not outcome.ok:
+        with contextlib.suppress(OSError):
+            output_path.unlink(missing_ok=True)
     return outcome
 
 
@@ -3107,6 +3116,222 @@ def is_scrubbed_copy_reusable(
     if require_cloud_bound and not prov.get("cloud_bound_recovery"):
         return False
     return prov.get("source_hash") == _compute_source_hash(src_dir)
+
+
+# ---------------------------------------------------------------------------
+# SCR-126 Fix 3: masked-video provenance — the reuse / convergence guard for the
+# masked_video/ copies. Distinct from .scrub_complete because masking runs AFTER
+# the scrub sentinel (step 3) and depends on inputs the scrub source-hash OMITS:
+# the source chunk *media* bytes (not in _SOURCE_HASH_GLOBS) and the global
+# privacy policy. Dot-prefixed so the upload dotfile filter excludes it.
+# ---------------------------------------------------------------------------
+
+MASKED_PROVENANCE_NAME = ".masked_provenance.json"
+
+
+def _hash_source_chunk(path: Path) -> str:
+    """sha256 over (size + bytes) of one source chunk mp4 — the masking input the
+    scrub source-hash does not cover."""
+    import hashlib
+
+    h = hashlib.sha256()
+    h.update(str(path.stat().st_size).encode("utf-8"))
+    h.update(b"\0")
+    with open(path, "rb") as fh:
+        for blk in iter(lambda: fh.read(1 << 16), b""):
+            h.update(blk)
+    return h.hexdigest()
+
+
+def _compute_geometry_hash(src_dir: Path) -> str:
+    """Content hash of the window_geometry timeline ONLY — never the whole DB.
+
+    Scoped to the geometry table so the masked-video reuse check is stable across
+    ``pipeline_chunk_state`` ledger churn between masking and upload: a full-DB
+    hash would change on every ledger transition (``mark_scrubbed`` /
+    upload-confirm) and refuse reuse forever. Returns a stable digest when the
+    table/DB is absent or unreadable."""
+    import hashlib
+    import sqlite3
+
+    db_path = src_dir / "recording.db"
+    if not db_path.exists():
+        return hashlib.sha256(b"no-recording-db").hexdigest()
+    h = hashlib.sha256()
+    try:
+        with contextlib.closing(sqlite3.connect(str(db_path))) as db:
+            cur = db.execute(
+                "SELECT screenshot_timestamp, window_list_json "
+                "FROM window_geometry ORDER BY id"
+            )
+            for ts, payload in cur:
+                h.update(repr(ts).encode("utf-8"))
+                h.update(b"\0")
+                h.update((payload or "").encode("utf-8"))
+                h.update(b"\0")
+    except Exception:  # noqa: BLE001 — missing table / read error → stable digest
+        return hashlib.sha256(b"no-geometry-table").hexdigest()
+    return h.hexdigest()
+
+
+def _read_db_pixel_ratio(src_dir: Path) -> float:
+    """The retina factor recorded for the recording (scales every mask rect).
+
+    Read from ``recording.pixel_ratio``; default 2.0 when absent/unreadable."""
+    import sqlite3
+
+    db_path = src_dir / "recording.db"
+    if not db_path.exists():
+        return 2.0
+    try:
+        with contextlib.closing(sqlite3.connect(str(db_path))) as db:
+            row = db.execute("SELECT pixel_ratio FROM recording LIMIT 1").fetchone()
+        if row and row[0] is not None:
+            return float(row[0])
+    except Exception:  # noqa: BLE001
+        pass
+    return 2.0
+
+
+def _read_privacy_mode() -> str:
+    """The active privacy mode — the primary masking-relevant policy axis."""
+    try:
+        from screencap.config import get_privacy_config
+
+        return str(get_privacy_config().mode.value)
+    except Exception:  # noqa: BLE001
+        return "internal"
+
+
+def _masked_inputs_fingerprint(
+    src_dir: Path, indices: "Iterable[int]"
+) -> dict:
+    """The fingerprint of every input that determines the masked-video output:
+    per-source-chunk bytes, the geometry timeline, pixel_ratio, the privacy
+    policy, the frozen flag, and the mask-logic version. Any change invalidates a
+    masked copy (SCR-126 Fix 3 / R4)."""
+    from screencap.pipeline_chunk_ops import get_frozen_masked_video_upload
+
+    src_chunks: dict[str, str] = {}
+    for idx in indices:
+        p = src_dir / f"chunk_{idx:04d}.mp4"
+        if p.exists():
+            src_chunks[str(idx)] = _hash_source_chunk(p)
+    return {
+        "mask_provenance_version": MASK_PROVENANCE_VERSION,
+        "masked_video_upload": bool(get_frozen_masked_video_upload(src_dir)),
+        "pixel_ratio": _read_db_pixel_ratio(src_dir),
+        "privacy_mode": _read_privacy_mode(),
+        "geometry_hash": _compute_geometry_hash(src_dir),
+        "source_chunks": src_chunks,
+    }
+
+
+def write_masked_provenance(
+    src_dir: Path, scrubbed_dir: Path, *, masked_indices: "Iterable[int]"
+) -> None:
+    """Record the masked-video provenance after a complete masking pass.
+
+    Atomic (temp + replace), mode 0600, mirroring :func:`_write_scrub_sentinel`.
+    Best-effort: a write failure is logged, not raised — without provenance the
+    reuse/fast-path checks simply refuse to trust the copies (rebuild, safe)."""
+    indices = sorted(set(masked_indices))
+    payload = _masked_inputs_fingerprint(src_dir, indices)
+    payload["masked_indices"] = indices
+    body = json.dumps(payload, indent=2).encode("utf-8")
+    out_dir = masked_video_dir(scrubbed_dir)
+    out_dir.mkdir(parents=True, exist_ok=True)
+    final = out_dir / MASKED_PROVENANCE_NAME
+    tmp = out_dir / (MASKED_PROVENANCE_NAME + ".tmp")
+    old_umask = os.umask(0o077)
+    try:
+        fd = os.open(
+            str(tmp), os.O_WRONLY | os.O_CREAT | os.O_TRUNC | os.O_NOFOLLOW, 0o600
+        )
+        try:
+            os.write(fd, body)
+        finally:
+            os.close(fd)
+        os.replace(tmp, final)
+    except OSError:
+        logger.warning("could not write masked provenance %s", final, exc_info=True)
+        with contextlib.suppress(OSError):
+            tmp.unlink(missing_ok=True)
+    finally:
+        os.umask(old_umask)
+
+
+def _read_masked_provenance(scrubbed_dir: Path) -> dict | None:
+    prov_path = masked_video_dir(scrubbed_dir) / MASKED_PROVENANCE_NAME
+    if not prov_path.exists():
+        return None
+    try:
+        return json.loads(prov_path.read_text(encoding="utf-8"))
+    except (OSError, json.JSONDecodeError):
+        return None
+
+
+def is_masked_video_reusable(
+    src_dir: Path, scrubbed_dir: Path, *, expected_indices: "Iterable[int]"
+) -> bool:
+    """True only when the existing ``masked_video/`` set is provably current for
+    EVERY expected chunk — present, current mask-logic version, and matching every
+    masking input (source bytes, geometry, pixel_ratio, policy, frozen flag). Any
+    miss → not reusable (caller purges + re-masks). Closes the stale-copy reuse
+    hole (SCR-126 Fix 3 / R4)."""
+    expected = sorted(set(expected_indices))
+    prov = _read_masked_provenance(scrubbed_dir)
+    if prov is None:
+        return False
+    if prov.get("mask_provenance_version") != MASK_PROVENANCE_VERSION:
+        return False
+    md = masked_video_dir(scrubbed_dir)
+    for idx in expected:
+        if not (md / f"chunk_{idx:04d}.mp4").exists():
+            return False
+    current = _masked_inputs_fingerprint(src_dir, expected)
+    for key in (
+        "masked_video_upload", "pixel_ratio", "privacy_mode",
+        "geometry_hash", "source_chunks",
+    ):
+        if prov.get(key) != current.get(key):
+            return False
+    return True
+
+
+def masked_provenance_version_current(scrubbed_dir: Path) -> bool:
+    """True when a masked-video provenance record exists at the CURRENT mask-logic
+    version. Used by the terminal-stage convergence fast path (SCR-126 R8): a
+    recording converged under OLD mask logic must NOT be declared done — it falls
+    through to re-mask. Absent provenance is treated as not-current (fail closed)."""
+    prov = _read_masked_provenance(scrubbed_dir)
+    return bool(prov) and prov.get("mask_provenance_version") == MASK_PROVENANCE_VERSION
+
+
+def purge_orphan_masked_videos(
+    scrubbed_dir: Path, *, expected_indices: "Iterable[int]"
+) -> list[int]:
+    """Closed-set reconcile: delete any ``masked_video/chunk_*.mp4`` whose index is
+    NOT in the current expected set (the source chunk is gone / was never produced
+    this pass). The AUTHORITATIVE stale-copy purge (SCR-126 Fix 3 / H2) — it runs
+    on every produce, including the reuse path that skips the wholesale scrub
+    rebuild, so a prior run's orphan can never reach the rglob upload set. Returns
+    the purged indices."""
+    expected = set(expected_indices)
+    md = masked_video_dir(scrubbed_dir)
+    if not md.is_dir():
+        return []
+    purged: list[int] = []
+    for vf in sorted(md.glob("chunk_*.mp4")):
+        try:
+            idx = int(vf.stem.split("_")[1])
+        except (IndexError, ValueError):
+            continue
+        if idx not in expected:
+            with contextlib.suppress(OSError):
+                vf.unlink()
+                purged.append(idx)
+    return purged
 
 
 def scrub_recording(
