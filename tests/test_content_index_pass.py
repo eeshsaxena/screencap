@@ -83,7 +83,7 @@ def index_env(tmp_path, monkeypatch):
     return SimpleNamespace(tmp_path=tmp_path, store_path=store_path)
 
 
-def _make_cp(capture_dir: Path, *, enabled: bool = True):
+def _make_cp(capture_dir: Path, *, enabled: bool = True, masking: bool = True):
     from screencap.chunk_processor import ChunkProcessor
 
     cp = ChunkProcessor(
@@ -95,6 +95,14 @@ def _make_cp(capture_dir: Path, *, enabled: bool = True):
         auto_delete=False,
     )
     cp._content_index_enabled = enabled
+    # The index pass FAILS CLOSED when masking classification is unavailable
+    # (no evaluator/classifier → blocked_intervals can't represent masked-app
+    # skips). With a real scrub pipeline these are set; the test CP is built
+    # without one, so stand in non-None sentinels to exercise the index path.
+    # ``masking=False`` leaves them None to assert the fail-closed gate.
+    if masking:
+        cp._masking_classifier = object()
+        cp._masking_evaluator = object()
     return cp
 
 
@@ -179,6 +187,71 @@ def test_index_pass_skips_all_masked_actions_not_just_exclude(index_env, tmp_pat
     assert _search(index_env.store_path, "balance") == []
     assert _search(index_env.store_path, "BANK") == []
     assert {h.timestamp_ms for h in _search(index_env.store_path, "ordinary")} == {110_000, 190_000}
+
+
+@pytest.mark.parametrize(
+    "action_name",
+    ["EXCLUDE", "MASK_WINDOW", "MASK_REGION", "TEXT_REDACT", "OCR_FALLBACK"],
+)
+def test_index_pass_skips_every_block_action(index_env, tmp_path, action_name):
+    """A frame inside a BlockedInterval of ANY SCRUB_BLOCK_ACTIONS member is
+    skipped — not just EXCLUDE/MASK_WINDOW. ``blocked_intervals`` is built with
+    the full set, so each must keep its (unmasked, local) on-screen text out of
+    the index, or it leaks content the cloud copy would have masked/redacted.
+    """
+    from screencap.privacy.policy import PrivacyAction
+
+    cap = tmp_path / "rec"
+    cap.mkdir()
+    _make_screenshots(cap, [110.0, 150.0, 190.0])
+    _FakeOcr.texts = {
+        110_000: "ordinary alpha",
+        150_000: "SENSITIVE redacted payload",  # inside the blocked interval
+        190_000: "ordinary beta",
+    }
+
+    scrub = ScrubResult()
+    scrub.blocked_intervals = [
+        BlockedInterval(
+            start=140.0, end=160.0,
+            action=getattr(PrivacyAction, action_name), reason=action_name.lower(),
+        ),
+    ]
+
+    cp = _make_cp(cap)
+    cp._index_chunk_content(0, 100.0, 200.0, scrub)
+
+    assert _search(index_env.store_path, "redacted") == []
+    assert _search(index_env.store_path, "SENSITIVE") == []
+    assert {h.timestamp_ms for h in _search(index_env.store_path, "ordinary")} == {110_000, 190_000}
+
+
+def test_index_pass_fails_closed_without_masking_classifier(index_env, tmp_path):
+    """When masking classification is unavailable (evaluator/classifier None),
+    blocked_intervals cannot represent the masked-app skips, so the pass must
+    index NOTHING — never ingest potentially masked-app on-screen text.
+
+    Mirrors the #2 fail-closed gate: even an empty blocked_intervals (the shape
+    a no-context scrub produces) must not let unfiltered frames through.
+    """
+    cap = tmp_path / "rec"
+    cap.mkdir()
+    _make_screenshots(cap, [110.0, 150.0, 190.0])
+    _FakeOcr.texts = {
+        110_000: "would be indexed alpha",
+        150_000: "would be indexed beta",
+        190_000: "would be indexed gamma",
+    }
+
+    # masking=False → classifier/evaluator stay None (the unavailable case). The
+    # empty blocked_intervals here would otherwise let every frame through.
+    cp = _make_cp(cap, masking=False)
+    cp._index_chunk_content(0, 100.0, 200.0, ScrubResult())
+
+    # Fail-closed: the pass returned before touching the store, so no PII store
+    # was created (assert BEFORE _search, which would create one on open).
+    assert not index_env.store_path.exists()
+    assert _search(index_env.store_path, "indexed") == []
 
 
 def test_reprocess_drops_now_skipped_frame(index_env, tmp_path):

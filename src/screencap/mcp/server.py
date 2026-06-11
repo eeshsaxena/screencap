@@ -18,6 +18,7 @@ from __future__ import annotations
 import asyncio
 import logging
 import sys
+from collections.abc import AsyncIterator
 
 from mcp.server.fastmcp import FastMCP
 from pydantic import BaseModel
@@ -31,7 +32,10 @@ logger = logging.getLogger("screencap.mcp")
 _MAX_TOOL_LIMIT = 100
 
 
-def _clamp(limit: int | None) -> int | None:
+def _clamp_or_none(limit: int | None) -> int | None:
+    # Passes ``None`` through (the caller omitted a limit → let the daemon apply
+    # its default), unlike the daemon's ``_clamp_limit`` which substitutes a
+    # default for ``None``. Both clamp a provided value into ``[1, max]``.
     if limit is None:
         return None
     return max(1, min(int(limit), _MAX_TOOL_LIMIT))
@@ -145,7 +149,12 @@ async def _client() -> AsyncDaemonClient:
 
 
 def _stderr(message: str) -> None:
-    print(message, file=sys.stderr, flush=True)
+    # MUST stay on stderr: the MCP stdio transport owns stdout for the JSON-RPC
+    # stream, so a default (stdout) Console would corrupt it. ``stderr=True``
+    # pins it there; ``highlight=False`` keeps the diagnostic text verbatim.
+    from rich.console import Console
+
+    Console(stderr=True, highlight=False).print(message)
 
 
 # -- tools (module-level so they are directly unit-testable) -----------------
@@ -160,7 +169,7 @@ async def search_screen_content(
     ``store_unavailable`` mean "no data", not "no match").
     """
     env = await (await _client()).content_search(
-        query, recording=recording, limit=_clamp(limit),
+        query, recording=recording, limit=_clamp_or_none(limit),
     )
     return ContentSearchResult(
         hits=[ContentHit(**h) for h in env.get("hits", [])],
@@ -173,7 +182,7 @@ async def search_transcript(
 ) -> TranscriptSearchResult:
     """Search audio-transcript text by keyword. Pointer is chunk-granular."""
     env = await (await _client()).transcript_search(
-        query, recording=recording, limit=_clamp(limit),
+        query, recording=recording, limit=_clamp_or_none(limit),
     )
     return TranscriptSearchResult(
         hits=[TranscriptHit(**h) for h in env.get("hits", [])],
@@ -191,7 +200,7 @@ async def query_timeline(
     """Query the authoritative app/window/time timeline from event tables."""
     env = await (await _client()).timeline_query(
         start_ms=start_ms, end_ms=end_ms, app=app,
-        recording=recording, limit=_clamp(limit),
+        recording=recording, limit=_clamp_or_none(limit),
     )
     return TimelineResult(
         rows=[TimelineRow(**r) for r in env.get("rows", [])],
@@ -218,7 +227,7 @@ def build_server() -> FastMCP:
     import contextlib
 
     @contextlib.asynccontextmanager
-    async def _lifespan(_server: FastMCP):
+    async def _lifespan(_server: FastMCP) -> AsyncIterator[None]:
         try:
             yield {}
         finally:

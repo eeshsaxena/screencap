@@ -714,8 +714,9 @@ async def content_search(request: Request) -> JSONResponse:
         if recording is not None:
             validate_recording_name(recording)
 
+        limit = _clamp_limit(parsed.limit)
         result = await asyncio.to_thread(
-            _run_content_search, parsed.query, recording, parsed.limit,
+            _run_content_search, parsed.query, recording, limit,
         )
         return JSONResponse(
             schema.envelope(
@@ -755,6 +756,10 @@ def _iter_recording_dirs(recording: str | None) -> list[Path]:
         d = resolve_recording_dir(recording)
         return [d] if d.is_dir() else []
     base = get_recordings_dir()
+    # A missing recordings dir (fresh install, no recordings yet) must return an
+    # empty list, not 500 via iterdir raising FileNotFoundError.
+    if not base.is_dir():
+        return []
     dirs = [
         d for d in sorted(base.iterdir())
         if d.is_dir() and not d.name.startswith(".")
@@ -781,7 +786,7 @@ def _run_transcript_search(
     ``*.txt.scrub_failed`` file (the suffix is appended, so a ``*.txt`` glob
     already excludes it; the explicit suffix check is belt-and-suspenders).
     """
-    from screencap.content_index import _like_snippet
+    from screencap.content_index import like_snippet
 
     needle = query.strip().lower()
     if not needle:
@@ -805,7 +810,7 @@ def _run_transcript_search(
                 hits.append({
                     "recording": rec_dir.name,
                     "chunk_index": _parse_chunk_index(path.name),
-                    "snippet": _like_snippet(text, query, width=120, collapse_newlines=True),
+                    "snippet": like_snippet(text, query, width=120, collapse_newlines=True),
                 })
                 if len(hits) >= limit:
                     return hits
@@ -825,12 +830,12 @@ def _run_timeline_query(
     has_table/has_column; never touches OCR or the content index. ``browser_url``
     is intentionally not selected (v1 omits it — see TimelineRow).
     """
-    from screencap.content_index import _escape_like
+    from screencap.content_index import escape_like
     from screencap.recording_db import has_column, has_table, open_recording_db
 
     start_s = start_ms / 1000.0 if start_ms is not None else None
     end_s = end_ms / 1000.0 if end_ms is not None else None
-    app_like = f"%{_escape_like(app.lower())}%" if app else None
+    app_like = f"%{escape_like(app.lower())}%" if app else None
 
     rows: list[dict[str, Any]] = []
     for rec_dir in _iter_recording_dirs(recording):
@@ -943,7 +948,7 @@ async def timeline_query(request: Request) -> JSONResponse:
             return JSONResponse(
                 errors.error_envelope(
                     schema_version=schema._TIMELINE_QUERY_API_VERSION,
-                    error="invalid_range",
+                    error=errors.INVALID_RANGE,
                 ),
                 status_code=400,
             )

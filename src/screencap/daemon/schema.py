@@ -71,7 +71,11 @@ def _load_models() -> dict[str, Any]:
     if _MODELS is not None:
         return _MODELS
 
-    from pydantic import BaseModel, ConfigDict
+    from pydantic import BaseModel, ConfigDict, Field
+
+    # Bound query/filter strings so a single request can't drive an unbounded
+    # scan (DoS guard at the daemon boundary, before any to_thread work).
+    _MAX_QUERY_LEN = 1024
 
     class _DaemonModel(BaseModel):
         """Shared Pydantic model settings for documented daemon responses."""
@@ -225,7 +229,7 @@ def _load_models() -> dict[str, Any]:
     class ContentSearchRequest(_DaemonModel):
         """SCR-118 on-screen content search input."""
 
-        query: str
+        query: str = Field(max_length=_MAX_QUERY_LEN)
         recording: str | None = None
         limit: int | None = None
 
@@ -252,7 +256,7 @@ def _load_models() -> dict[str, Any]:
     class TranscriptSearchRequest(_DaemonModel):
         """SCR-118 transcript keyword-search input."""
 
-        query: str
+        query: str = Field(max_length=_MAX_QUERY_LEN)
         recording: str | None = None
         limit: int | None = None
 
@@ -276,7 +280,7 @@ def _load_models() -> dict[str, Any]:
 
         start_ms: int | None = None
         end_ms: int | None = None
-        app: str | None = None
+        app: str | None = Field(default=None, max_length=_MAX_QUERY_LEN)
         recording: str | None = None
         limit: int | None = None
 

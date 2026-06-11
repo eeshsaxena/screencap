@@ -16,6 +16,7 @@ existing ``subscriber_count() > 0`` busy path — which self-clears on disconnec
 from __future__ import annotations
 
 import asyncio
+from collections.abc import AsyncIterator
 from pathlib import Path
 from typing import Any
 
@@ -150,7 +151,7 @@ class LivenessSubscription:
     def __init__(self, client: httpx.AsyncClient) -> None:
         self._client = client
         self._resp: httpx.Response | None = None
-        self._task: asyncio.Task | None = None
+        self._task: asyncio.Task[None] | None = None
 
     async def open(self) -> None:
         req = self._client.build_request(
@@ -168,11 +169,20 @@ class LivenessSubscription:
         self._task = asyncio.create_task(self._drain(lines))
 
     @staticmethod
-    async def _drain(lines: Any) -> None:
+    async def _drain(lines: AsyncIterator[str]) -> None:
         try:
             async for _line in lines:
                 pass  # discard — we only hold the subscription, not its data
-        except (httpx.HTTPError, asyncio.CancelledError):
+        except asyncio.CancelledError:
+            # Cooperative cancellation (aclose) — re-raise so the task ends
+            # cancelled rather than completing normally.
+            raise
+        except Exception:
+            # Any other error (HTTP, transport, decode) must stay swallowed: an
+            # unhandled exception escaping this background task would surface as a
+            # task-exception warning AND silently drop the /v0/events liveness
+            # subscription. Holding the subscription is best-effort; on failure
+            # the daemon just idle-shuts-down sooner.
             pass
 
     async def aclose(self) -> None:

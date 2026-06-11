@@ -808,3 +808,39 @@ async def test_timeline_query_rejects_traversal(
     response = await _asgi_post("/v0/timeline.query", {"recording": "../../etc"})
     assert response.status_code >= 400
     assert response.json()["error"] == "invalid_name"
+
+
+# ---------------------------------------------------------------------------
+# SCR-118 query verbs are excluded from idle-shutdown activity (U5)
+# ---------------------------------------------------------------------------
+
+
+@pytest.mark.asyncio
+async def test_query_verbs_do_not_bump_idle_activity(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """The three read verbs are NOT in ``_ACTIVITY_PATHS`` — a query must not
+    reset the idle-shutdown clock (the MCP-held subscription keeps the daemon
+    alive instead, so cron-style polling can't pin an auto-spawned daemon)."""
+    from screencap.daemon import _idle_shutdown
+    from screencap.daemon.app import build_app
+
+    monkeypatch.setenv("SCREENCAP_RECORDINGS_DIR", str(tmp_path / "recordings"))
+    _guard_content_store(tmp_path, monkeypatch)
+
+    app = build_app()
+    _idle_shutdown.attach(app, idle_seconds=600.0)
+    sentinel = 12345.0
+    app.state.idle_last_activity = sentinel
+
+    transport = httpx.ASGITransport(app=app)
+    async with httpx.AsyncClient(transport=transport, base_url="http://test") as client:
+        for path, body in (
+            ("/v0/content.search", {"query": "anything"}),
+            ("/v0/transcript.search", {"query": "anything"}),
+            ("/v0/timeline.query", {}),
+        ):
+            resp = await client.post(path, json=body)
+            assert resp.status_code == 200, path
+            # The activity middleware must have left the clock untouched.
+            assert app.state.idle_last_activity == sentinel, path

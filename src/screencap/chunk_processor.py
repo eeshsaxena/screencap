@@ -7,6 +7,7 @@ upload → delete old chunks).
 
 from __future__ import annotations
 
+import bisect
 import json
 import logging
 import math
@@ -1157,6 +1158,21 @@ class ChunkProcessor:
         self, idx: int, start_ts: float, end_ts: float,
         scrub_result: "ScrubResult",
     ) -> None:
+        # FAIL CLOSED on missing masking context. ``blocked_intervals`` is only
+        # populated with the app-class block actions (MASK_WINDOW / EXCLUDE /
+        # TEXT_REDACT / OCR_FALLBACK) when BOTH the evaluator and classifier are
+        # non-None (see ``scrubber.build_scrub_context``). Without them the skip
+        # set cannot represent the masked-app intervals, so indexing would ingest
+        # masked-app on-screen text (banking / email / chat). Index nothing in
+        # that case so only ALLOW-classified frames can ever reach the store.
+        if self._masking_classifier is None or self._masking_evaluator is None:
+            logger.warning(
+                f"Chunk {idx}: skipping content index — masking classification "
+                "unavailable (no evaluator/classifier), so blocked_intervals "
+                "cannot represent masked-app skips; only ALLOW frames may be "
+                "indexed."
+            )
+            return
         # Apple Vision unavailable → clean no-op (chunk proceeds unindexed).
         try:
             from screencap.privacy.ocr import VisionOcr
@@ -1179,6 +1195,7 @@ class ChunkProcessor:
         )
         from screencap.engine.dedup import dhash, hamming_distance
         from screencap.privacy.context import parse_screenshot_timestamp
+        from screencap.scrubber import find_blocked_interval
 
         # Skip EVERY frame the policy flagged for any masking/redaction action.
         # ``blocked_intervals`` is built with the full SCRUB_BLOCK_ACTIONS set
@@ -1187,17 +1204,37 @@ class ChunkProcessor:
         # / email / chat) — which the masker blanks in the cloud copy —
         # searchable in the local index. Skipping all of them makes the index
         # hold only ALLOW-classified on-screen text (the R7 narrowing).
-        skip_intervals = [(iv.start, iv.end) for iv in scrub_result.blocked_intervals]
+        #
+        # ``blocked_intervals`` is sorted by start (built via build_blocked_intervals
+        # / merge_intervals), so reuse the scrubber's bisect-backed lookup with a
+        # pre-built starts list instead of an O(n) per-frame linear scan. It also
+        # handles overlapping intervals (short secure-field nested in a long
+        # MASK_WINDOW) correctly.
+        skip_intervals = scrub_result.blocked_intervals
+        skip_starts = [iv.start for iv in skip_intervals]
 
         def _skipped(ts: float) -> bool:
-            return any(s <= ts < e for s, e in skip_intervals)
+            return find_blocked_interval(ts, skip_intervals, skip_starts) is not None
 
         # Time-scope to [start_ts, end_ts); drop policy-flagged frames.
-        candidates: list[tuple[float, Path]] = []
-        for img_path in sorted(screenshots_dir.glob("*.jpg")):
+        # Parse each filename's timestamp and sort by it (not by lexical name,
+        # which is only monotonic when the integer part has a fixed width), then
+        # bisect to the window: take only [start_ts, end_ts) and stop at the
+        # upper bound rather than scanning every later screenshot in the
+        # recording.
+        parsed: list[tuple[float, Path]] = []
+        for img_path in screenshots_dir.glob("*.jpg"):
             ts = parse_screenshot_timestamp(img_path.name)
-            if ts is None or not (start_ts <= ts < end_ts):
-                continue
+            if ts is not None:
+                parsed.append((ts, img_path))
+        parsed.sort(key=lambda p: p[0])
+
+        ts_keys = [ts for ts, _ in parsed]
+        lo = bisect.bisect_left(ts_keys, start_ts)
+        candidates: list[tuple[float, Path]] = []
+        for ts, img_path in parsed[lo:]:
+            if ts >= end_ts:
+                break
             if _skipped(ts):
                 continue
             candidates.append((ts, img_path))

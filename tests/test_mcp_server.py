@@ -125,6 +125,51 @@ async def test_daemon_unreachable_raises_clean_error(monkeypatch):
         await server.search_screen_content("x")
 
 
+@pytest.mark.asyncio
+async def test_list_recordings_projects_known_fields_only(monkeypatch):
+    """The tool projects each recording dict onto RecordingSummary's known
+    fields — extra daemon fields are stripped, and the known ones map through."""
+    stub = _StubClient({
+        "recordings": {
+            "ok": True,
+            "recordings": [
+                {
+                    "name": "demo",
+                    "date": "2026-06-11",
+                    "duration": "00:05",
+                    "has_audio": True,
+                    "transcribed": False,
+                    "uploaded": True,
+                    # Extra fields the daemon may add — must be dropped, not raise.
+                    "size_bytes": 12345,
+                    "path": "/Users/x/.screencap/recordings/demo",
+                    "internal_flag": True,
+                },
+            ],
+        }
+    })
+    _use_client(monkeypatch, stub)
+
+    result = await server.list_recordings()
+
+    assert isinstance(result, server.RecordingsResult)
+    assert len(result.recordings) == 1
+    rec = result.recordings[0]
+    # Known fields mapped correctly.
+    assert rec.name == "demo"
+    assert rec.date == "2026-06-11"
+    assert rec.duration == "00:05"
+    assert rec.has_audio is True
+    assert rec.transcribed is False
+    assert rec.uploaded is True
+    # Extra fields stripped — the model carries only its declared fields, so a
+    # leaked path can't ride through.
+    dumped = rec.model_dump()
+    assert set(dumped) == set(server.RecordingSummary.model_fields)
+    assert "path" not in dumped
+    assert "size_bytes" not in dumped
+
+
 # --------------------------------------------------------------------------
 # Real in-process daemon round-trip (ASGITransport)
 # --------------------------------------------------------------------------

@@ -69,10 +69,13 @@ from pathlib import Path
 
 logger = logging.getLogger(__name__)
 
-# Snippet/limit budgets. Directional in U1, tuned against real data later.
+# Snippet/limit budgets. The default/max mirror the daemon's shared query limit
+# contract (``daemon.app._QUERY_DEFAULT_LIMIT`` / ``_QUERY_MAX_LIMIT``) so all
+# three read verbs honor one limit ceiling — the daemon clamps before calling in,
+# and this is the floor for any direct in-process caller.
 _SNIPPET_TOKEN_BUDGET = 32
-_DEFAULT_LIMIT = 20
-_MAX_LIMIT = 100
+_DEFAULT_LIMIT = 50
+_MAX_LIMIT = 200
 _BUSY_TIMEOUT_MS = 10000
 
 
@@ -134,7 +137,7 @@ class _StoreUnavailable(Exception):
     """Internal: the store could not be opened (symlink/corruption)."""
 
 
-def _escape_like(term: str) -> str:
+def escape_like(term: str) -> str:
     r"""Escape ``%``/``_``/``\`` so a LIKE pattern matches them literally."""
     return (
         term.replace("\\", "\\\\").replace("%", "\\%").replace("_", "\\_")
@@ -470,7 +473,7 @@ class ContentIndex:
         self, query: str, recording: str | None, limit: int
     ) -> list[SearchHit]:
         assert self._conn is not None
-        pattern = f"%{_escape_like(query)}%"
+        pattern = f"%{escape_like(query)}%"
         sql = (
             "SELECT recording, timestamp_ms, text "
             "FROM content_plain WHERE text LIKE ? ESCAPE '\\'"
@@ -483,16 +486,22 @@ class ContentIndex:
         params.append(limit)
         cur = self._conn.execute(sql, params)
         return [
-            SearchHit(rec, int(ts), _like_snippet(text, query), 0.0)
+            SearchHit(rec, int(ts), like_snippet(text, query), 0.0)
             for rec, ts, text in cur.fetchall()
         ]
 
     # -- delete (privacy-correctness) ------------------------------------
 
     def delete_recording(self, recording: str) -> int:
-        """Purge every row for ``recording`` (full delete / stub-then-delete)."""
+        """Purge every row for ``recording`` (full delete / stub-then-delete).
+
+        Deletes from BOTH ``content_fts`` and ``content_plain`` when present, so
+        a store that was written under one schema and later opened under the
+        other (FTS5 availability differs across builds) can never leave the
+        purged recording's sensitive rows behind in the now-inactive table.
+        """
         return self._delete(
-            f"DELETE FROM {self._table} WHERE recording = ?",
+            "DELETE FROM {table} WHERE recording = ?",
             (recording,),
         )
 
@@ -502,38 +511,58 @@ class ContentIndex:
         """Purge ``recording`` rows in ``[start_ms, end_ms)`` (retroactive disable).
 
         ``end_ms=None`` means open-ended (the ``scrub_worker`` trailing interval
-        whose unix-seconds upper bound was ``float('inf')``).
+        whose unix-seconds upper bound was ``float('inf')``). Deletes from BOTH
+        tables when present (see :meth:`delete_recording`).
         """
         if end_ms is None:
             return self._delete(
-                f"DELETE FROM {self._table} "
+                "DELETE FROM {table} "
                 "WHERE recording = ? AND timestamp_ms >= ?",
                 (recording, int(start_ms)),
             )
         return self._delete(
-            f"DELETE FROM {self._table} "
+            "DELETE FROM {table} "
             "WHERE recording = ? AND timestamp_ms >= ? AND timestamp_ms < ?",
             (recording, int(start_ms), int(end_ms)),
         )
 
-    def _delete(self, sql: str, params: Sequence[object]) -> int:
+    def _present_tables(self, conn: sqlite3.Connection) -> list[str]:
+        """Which of the two content tables actually exist in this store."""
+        rows = conn.execute(
+            "SELECT name FROM sqlite_master "
+            "WHERE type IN ('table', 'view') "
+            "AND name IN ('content_fts', 'content_plain')"
+        ).fetchall()
+        return [r[0] for r in rows]
+
+    def _delete(self, sql_template: str, params: Sequence[object]) -> int:
+        """Run ``sql_template`` (a ``{table}`` placeholder) against every present
+        content table in one transaction. Returns total rows deleted.
+
+        ``{table}`` is interpolated only from a fixed allowlist of literal table
+        names discovered via ``sqlite_master`` — never from caller input — so no
+        SQL injection surface is introduced.
+        """
         if self._conn is None:
             raise sqlite3.OperationalError("content index not open")
         conn = self._conn
         cur = conn.cursor()
         cur.execute("BEGIN IMMEDIATE")
+        deleted = 0
         try:
-            cur.execute(sql, params)
-            deleted = cur.rowcount
+            for table in self._present_tables(conn):
+                cur.execute(sql_template.format(table=table), params)
+                if cur.rowcount and cur.rowcount > 0:
+                    deleted += cur.rowcount
             conn.commit()
         except Exception:
             conn.rollback()
             raise
         self._checkpoint()
-        return deleted if deleted is not None and deleted >= 0 else 0
+        return deleted
 
 
-def _like_snippet(
+def like_snippet(
     text: str, query: str, *, width: int = 80, collapse_newlines: bool = False,
 ) -> str:
     """Build a bounded excerpt around the first case-insensitive match.
