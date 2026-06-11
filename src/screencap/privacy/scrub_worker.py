@@ -611,10 +611,19 @@ class ScrubWorker:
             if not path.exists():
                 return  # never indexed → nothing to purge, don't create the store
 
-            from screencap.content_index import ContentIndex
+            from screencap.content_index import (
+                ContentIndex,
+                content_index_write_lock,
+            )
 
             recording = self._capture_dir.name
-            with ContentIndex(path) as store:
+            # SCR-134: take the shared content-index write lock around the purge
+            # so it can't interleave with a concurrent inline index write that
+            # already OCR'd these (now-disabled) frames — which would otherwise
+            # resurrect just-purged text. The screenshot files were already
+            # unlinked above (before this lock), so any inline write that runs
+            # AFTER this purge re-reads an empty disk and indexes nothing.
+            with content_index_write_lock(), ContentIndex(path) as store:
                 if not store.available:
                     return
                 for start, end in intervals:

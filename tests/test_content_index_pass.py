@@ -428,3 +428,64 @@ def test_scrub_worker_purge_skips_when_no_store(index_env, tmp_path):
     # No store on disk → purge must be a no-op and must NOT create one.
     ScrubWorker._purge_content_index_intervals(stub, [(0.0, 100.0)])
     assert not index_env.store_path.exists()
+
+
+# --------------------------------------------------------------------------
+# SCR-134: inline-write vs retroactive-disable-purge mutual exclusion
+# --------------------------------------------------------------------------
+
+
+def test_index_write_and_purge_serialize_on_shared_lock(index_env, tmp_path):
+    """SCR-134: the inline index write and the retroactive-disable purge must take
+    one shared lock, so an in-flight write can never re-insert just-purged text.
+
+    The earlier design closed the race only via a documented "re-disable
+    self-heals" recovery — which never ran for the content index (a re-disable
+    computes empty intervals from the already-deleted window_event rows). The fix
+    removes the race outright: holding ``content_index_write_lock`` must block BOTH
+    a concurrent purge AND a concurrent index pass until released, proving each
+    path acquires it. Both racers are threads of the one recorder process, so the
+    in-process lock is what excludes them here.
+    """
+    import threading
+
+    from screencap.content_index import content_index_write_lock
+    from screencap.privacy.scrub_worker import ScrubWorker
+
+    # Seed the store so the purge has both a store to open and a row to delete.
+    with ContentIndex(index_env.store_path) as store:
+        store.write_frames(
+            "rec",
+            [content_index.IndexFrame(timestamp_ms=150_000, text="resurrected secret")],
+        )
+
+    cap = tmp_path / "rec"
+    cap.mkdir()
+    _make_screenshots(cap, [120.0])
+    cp = _make_cp(cap)
+    purge_stub = SimpleNamespace(_capture_dir=cap)
+
+    contended_ops = {
+        "purge": lambda: ScrubWorker._purge_content_index_intervals(
+            purge_stub, [(0.0, float("inf"))]
+        ),
+        "index": lambda: cp._index_chunk_content(0, 100.0, 200.0, ScrubResult()),
+    }
+
+    for label, op in contended_ops.items():
+        started = threading.Event()
+        done = threading.Event()
+
+        def _run(op=op, started=started, done=done):
+            started.set()
+            op()
+            done.set()
+
+        with content_index_write_lock():
+            worker = threading.Thread(target=_run)
+            worker.start()
+            assert started.wait(2.0), f"{label} thread never started"
+            # While we hold the write lock the contended op must not complete.
+            assert not done.wait(0.4), f"{label} ran while the write lock was held"
+        worker.join(5.0)
+        assert done.is_set(), f"{label} never finished after the lock was released"
