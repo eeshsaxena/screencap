@@ -33,7 +33,10 @@ protocol DaemonRegistrationService {
 
 @MainActor
 protocol DaemonProbe {
-    func probe(timeout: TimeInterval) async -> Bool
+    /// The reachable daemon's reported version, or nil if no daemon answered.
+    /// Callers compare this against the bundled (expected) version to detect a
+    /// stale/foreign daemon squatting api.sock (SCR-121).
+    func probe(timeout: TimeInterval) async -> String?
 }
 
 @MainActor
@@ -54,6 +57,9 @@ final class DaemonInstallController: ObservableObject {
         case daemonDidNotStart = "daemon_did_not_start"
         case daemonSigningInvalid = "daemon_signing_invalid"
         case diskFull = "disk_full"
+        /// A reachable daemon reports a version other than the one this app
+        /// bundles, and a reinstall did not dislodge it (SCR-121).
+        case daemonVersionMismatch = "daemon_version_mismatch"
         case unknown
     }
 
@@ -64,17 +70,23 @@ final class DaemonInstallController: ObservableObject {
 
     private let registrationService: DaemonRegistrationService
     private let probe: DaemonProbe
+    /// The daemon version this app bundles, used to reject a reachable-but-stale
+    /// daemon (SCR-121). nil means "could not determine" — the version gate then
+    /// fails safe to the historical reachable-implies-running behavior.
+    private let expectedDaemonVersion: String?
     private let sleep: (UInt64) async -> Void
 
     init(
         registrationService: DaemonRegistrationService = SMAppServiceRegistration(),
         probe: DaemonProbe = LiveDaemonProbe(),
+        expectedDaemonVersion: String? = BundledDaemonVersion.expected(),
         sleep: @escaping (UInt64) async -> Void = { nanoseconds in
             try? await Task.sleep(nanoseconds: nanoseconds)
         }
     ) {
         self.registrationService = registrationService
         self.probe = probe
+        self.expectedDaemonVersion = expectedDaemonVersion
         self.sleep = sleep
     }
 
@@ -157,14 +169,36 @@ final class DaemonInstallController: ObservableObject {
     ) async {
         switch status {
         case .enabled:
-            let didStart = await pollDaemon(timeoutSeconds: timeoutSeconds, probeIntervalSeconds: probeIntervalSeconds)
-            if !didStart && allowRegistrationRefresh {
-                await refreshRegistrationAfterFailedPoll(
-                    timeoutSeconds: timeoutSeconds,
-                    probeIntervalSeconds: probeIntervalSeconds,
-                    approvalTimeoutSeconds: approvalTimeoutSeconds,
-                    approvalPollIntervalSeconds: approvalPollIntervalSeconds
-                )
+            let outcome = await pollDaemon(timeoutSeconds: timeoutSeconds, probeIntervalSeconds: probeIntervalSeconds)
+            switch outcome {
+            case .running:
+                break  // pollDaemon set .installedAndRunning and posted the notice
+            case .timedOut:
+                if allowRegistrationRefresh {
+                    await refreshRegistrationAfterFailedPoll(
+                        timeoutSeconds: timeoutSeconds,
+                        probeIntervalSeconds: probeIntervalSeconds,
+                        approvalTimeoutSeconds: approvalTimeoutSeconds,
+                        approvalPollIntervalSeconds: approvalPollIntervalSeconds
+                    )
+                }
+            case .versionMismatch(let running):
+                // A stale/foreign daemon is squatting api.sock. Try the reinstall
+                // path once (refresh re-registers this bundle's agent); if it
+                // still answers with the wrong version, surface it rather than
+                // silently driving the old daemon (SCR-121).
+                if allowRegistrationRefresh {
+                    daemonInstallLogger.error("Reachable daemon version \(running, privacy: .public) != expected \(self.expectedDaemonVersion ?? "unknown", privacy: .public); attempting reinstall")
+                    await refreshRegistrationAfterFailedPoll(
+                        timeoutSeconds: timeoutSeconds,
+                        probeIntervalSeconds: probeIntervalSeconds,
+                        approvalTimeoutSeconds: approvalTimeoutSeconds,
+                        approvalPollIntervalSeconds: approvalPollIntervalSeconds
+                    )
+                } else {
+                    daemonInstallLogger.error("Daemon still reports version \(running, privacy: .public) after reinstall; expected \(self.expectedDaemonVersion ?? "unknown", privacy: .public)")
+                    state = .installFailed(.daemonVersionMismatch)
+                }
             }
         case .requiresApproval:
             state = .requiresApproval
@@ -230,19 +264,34 @@ final class DaemonInstallController: ObservableObject {
         }
     }
 
-    private func pollDaemon(timeoutSeconds: TimeInterval, probeIntervalSeconds: TimeInterval) async -> Bool {
+    private enum DaemonPollOutcome: Equatable {
+        case running                          // reachable and version-matched
+        case versionMismatch(running: String) // reachable but the wrong version
+        case timedOut                         // never became reachable
+    }
+
+    private func pollDaemon(timeoutSeconds: TimeInterval, probeIntervalSeconds: TimeInterval) async -> DaemonPollOutcome {
         state = .polling
         let deadline = Date().addingTimeInterval(timeoutSeconds)
         while true {
-            if await probe.probe(timeout: min(1, max(0.1, probeIntervalSeconds))) {
+            if let version = await probe.probe(timeout: min(1, max(0.1, probeIntervalSeconds))) {
+                // "Socket reachable" is necessary but NOT sufficient (SCR-121): a
+                // stale/foreign daemon squatting api.sock answers daemon.info too.
+                // Only adopt it when its version matches the bundle we would
+                // install. When the expected version is unknown (nil) we fail safe
+                // to the historical reachable-implies-running behavior rather than
+                // risk a false "out of date" on a healthy daemon.
+                if let expected = expectedDaemonVersion, version != expected {
+                    return .versionMismatch(running: version)
+                }
                 state = .installedAndRunning
                 NotificationCenter.default.post(name: .screenCapDaemonInstalledAndRunning, object: nil)
-                return true
+                return .running
             }
             if Date() >= deadline {
                 let seconds = Int(timeoutSeconds)
                 state = .pollingFailed(reason: "Daemon did not respond within \(seconds)s")
-                return false
+                return .timedOut
             }
             await sleep(Self.nanoseconds(for: probeIntervalSeconds))
         }
@@ -325,17 +374,43 @@ final class SMAppServiceRegistration: DaemonRegistrationService {
 
 @MainActor
 final class LiveDaemonProbe: DaemonProbe {
-    func probe(timeout: TimeInterval) async -> Bool {
+    func probe(timeout: TimeInterval) async -> String? {
         do {
-            let _: DaemonInfoResponse = try await DaemonClient.request(
+            let response: DaemonInfoResponse = try await DaemonClient.request(
                 method: "GET",
                 path: "/v0/daemon.info",
                 timeout: timeout
             )
-            return true
+            return response.daemonVersion
         } catch {
             daemonInstallLogger.debug("daemon.info probe failed: \(String(describing: error), privacy: .public)")
-            return false
+            return nil
         }
+    }
+}
+
+/// Resolves the daemon version this app bundles, stamped into the app bundle at
+/// build time by `Scripts/embed-cli.sh` (`Contents/Resources/screencap-cli-version`).
+/// Returns nil — disabling the version gate — when it cannot be determined with
+/// confidence, so the gate never produces a false "out of date" (SCR-121).
+enum BundledDaemonVersion {
+    static let resourceName = "screencap-cli-version"
+
+    static func expected() -> String? {
+        // Under XCTest, Bundle.main is the host app bundle; tests inject the
+        // expected version explicitly, so don't compare against the real stamp.
+        guard ProcessInfo.processInfo.environment["XCTestConfigurationFilePath"] == nil else { return nil }
+        // Dev-source mode runs the daemon from in-repo source, whose version can
+        // legitimately differ from the (possibly stale) bundled CLI. build_and_run.sh
+        // owns staleness there; skip the gate to avoid false mismatches.
+        guard ProcessInfo.processInfo.environment["SCREENCAP_DAEMON_USE_DEV_SOURCE"] != "1" else { return nil }
+        guard
+            let url = Bundle.main.url(forResource: resourceName, withExtension: nil),
+            let raw = try? String(contentsOf: url, encoding: .utf8)
+        else {
+            return nil
+        }
+        let version = raw.trimmingCharacters(in: .whitespacesAndNewlines)
+        return version.isEmpty ? nil : version
     }
 }
