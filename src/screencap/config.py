@@ -173,6 +173,18 @@ def get_auto_name_local_only() -> bool:
     )
 
 
+def get_content_index_enabled() -> bool:
+    """Return whether the SCR-118 on-screen content index is enabled.
+
+    Opt-in (default off): when on, chunk processing OCRs the recording's local
+    screenshots (skipping secure-field / EXCLUDE frames) into the global
+    ``content_index.db`` so an MCP agent can search on-screen text. The index is
+    local-only (never uploaded) and purged on retroactive disable. Requires
+    scrubbing to be enabled — the secure-field skip depends on the scrub context.
+    """
+    return _parse_bool_env("SCREENCAP_CONTENT_INDEX", "content_index_enabled", False)
+
+
 def get_downloads_dir() -> Path:
     """Return downloads directory, creating it if needed."""
     env = os.environ.get("SCREENCAP_DOWNLOADS_DIR")

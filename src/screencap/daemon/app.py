@@ -3,11 +3,13 @@
 from __future__ import annotations
 
 import asyncio
+import heapq
 import json
 import logging
 import os
 import time
 from contextlib import asynccontextmanager
+from pathlib import Path
 from typing import TYPE_CHECKING, Any, AsyncIterator
 
 from starlette.applications import Starlette
@@ -654,6 +656,324 @@ async def events_stream(request: Request) -> JSONResponse | StreamingResponse:
     return StreamingResponse(stream(), media_type="application/x-ndjson")
 
 
+def _run_content_search(
+    query: str, recording: str | None, limit: int | None,
+) -> dict[str, Any]:
+    """Blocking content-index search, run off the event loop via to_thread.
+
+    Never opens/creates the store when it does not exist yet (a read must not
+    spawn an empty PII store) — surfaces ``not_indexed`` instead. The store's
+    own ``search`` is fail-soft (corrupt → ``store_unavailable``), so this never
+    raises for an unreadable store.
+    """
+    from screencap.content_index import ContentIndex, IndexState, default_index_path
+
+    path = default_index_path()
+    if not path.exists():
+        return {"hits": [], "index_state": IndexState.NOT_INDEXED.value}
+
+    kwargs: dict[str, Any] = {}
+    if limit is not None:
+        kwargs["limit"] = limit
+    with ContentIndex(path) as store:
+        result = store.search(query, recording=recording, **kwargs)
+    return {
+        "hits": [
+            {
+                "recording": h.recording,
+                "timestamp_ms": h.timestamp_ms,
+                "snippet": h.snippet,
+                "score": h.score,
+            }
+            for h in result.hits
+        ],
+        "index_state": result.index_state.value,
+    }
+
+
+async def content_search(request: Request) -> JSONResponse:
+    """``POST /v0/content.search`` — ranked on-screen-text snippets + pointers.
+
+    Read-only over the global content index (SCR-118). Pointer-only response
+    (the model is structurally incapable of carrying a media path or image
+    bytes — R8). The caller-supplied ``recording`` filter is routed through the
+    canonical name validator (traversal-safe) before use; the FTS ``MATCH`` is
+    bound + phrase-escaped inside ``content_index``. A missing/corrupt store
+    fails soft via ``index_state`` rather than 500-ing. Deliberately NOT in
+    ``_ACTIVITY_PATHS`` — idle-shutdown is kept alive by the MCP-held
+    subscription (U5), preserving the cron-polling protection.
+    """
+    from screencap.daemon._name_validation import validate_recording_name
+
+    try:
+        body = await request.json()
+        if not isinstance(body, dict):
+            body = {}
+        parsed = schema.ContentSearchRequest.model_validate(body)
+        recording = parsed.recording
+        if recording is not None:
+            validate_recording_name(recording)
+
+        limit = _clamp_limit(parsed.limit)
+        result = await asyncio.to_thread(
+            _run_content_search, parsed.query, recording, limit,
+        )
+        return JSONResponse(
+            schema.envelope(
+                schema_version=schema._CONTENT_SEARCH_API_VERSION,
+                hits=result["hits"],
+                index_state=result["index_state"],
+            )
+        )
+    except errors.DaemonAPIError as exc:
+        return _api_error_response(exc)
+    except Exception as exc:
+        return _internal_error_response(
+            exc,
+            schema_version=schema._CONTENT_SEARCH_API_VERSION,
+            request=request,
+        )
+
+
+# SCR-118 query bounds (DoS guards enforced at the daemon, not only in the MCP
+# tool layer, so a direct UDS caller cannot drive an unbounded scan).
+_QUERY_MAX_RECORDINGS = 200
+_QUERY_DEFAULT_LIMIT = 50
+_QUERY_MAX_LIMIT = 200
+
+
+def _clamp_limit(limit: int | None) -> int:
+    if limit is None:
+        return _QUERY_DEFAULT_LIMIT
+    return max(1, min(int(limit), _QUERY_MAX_LIMIT))
+
+
+def _iter_recording_dirs(recording: str | None) -> list[Path]:
+    """Candidate recording dirs to scan (validated single, or all, capped)."""
+    from screencap.config import get_recordings_dir, resolve_recording_dir
+
+    if recording is not None:
+        d = resolve_recording_dir(recording)
+        return [d] if d.is_dir() else []
+    base = get_recordings_dir()
+    # A missing recordings dir (fresh install, no recordings yet) must return an
+    # empty list, not 500 via iterdir raising FileNotFoundError.
+    if not base.is_dir():
+        return []
+    dirs = [
+        d for d in sorted(base.iterdir())
+        if d.is_dir() and not d.name.startswith(".")
+    ]
+    return dirs[:_QUERY_MAX_RECORDINGS]
+
+
+def _parse_chunk_index(name: str) -> int:
+    """``transcript_0007.txt`` → 7; a bare ``transcript.txt`` → 0."""
+    stem = name[: -len(".txt")] if name.endswith(".txt") else name
+    _, _, tail = stem.partition("_")
+    try:
+        return int(tail)
+    except ValueError:
+        return 0
+
+
+def _run_transcript_search(
+    query: str, recording: str | None, limit: int,
+) -> list[dict[str, Any]]:
+    """Keyword scan over the STRICT scrubbed ``transcript_*.txt`` only.
+
+    Never reads the rich per-word ``transcript_*.json`` (an R7 leak) nor a
+    ``*.txt.scrub_failed`` file (the suffix is appended, so a ``*.txt`` glob
+    already excludes it; the explicit suffix check is belt-and-suspenders).
+    """
+    from screencap.content_index import like_snippet
+
+    needle = query.strip().lower()
+    if not needle:
+        # An empty/whitespace needle matches every file ("" in text is always
+        # True) — that would dump the whole transcript corpus, not search it.
+        return []
+    hits: list[dict[str, Any]] = []
+    for rec_dir in _iter_recording_dirs(recording):
+        candidates = sorted(rec_dir.glob("transcript_*.txt"))
+        bare = rec_dir / "transcript.txt"
+        if bare.exists():
+            candidates.append(bare)
+        for path in candidates:
+            if path.suffix != ".txt" or path.name.endswith(".scrub_failed"):
+                continue
+            try:
+                text = path.read_text(encoding="utf-8", errors="replace")
+            except OSError:
+                continue
+            if needle in text.lower():
+                hits.append({
+                    "recording": rec_dir.name,
+                    "chunk_index": _parse_chunk_index(path.name),
+                    "snippet": like_snippet(text, query, width=120, collapse_newlines=True),
+                })
+                if len(hits) >= limit:
+                    return hits
+    return hits
+
+
+def _run_timeline_query(
+    start_ms: int | None,
+    end_ms: int | None,
+    app: str | None,
+    recording: str | None,
+    limit: int,
+) -> list[dict[str, Any]]:
+    """Structured app/window/time rows from window_event across recordings.
+
+    Authoritative (event tables, no OCR/redaction loss). Schema-tolerant via
+    has_table/has_column; never touches OCR or the content index. ``browser_url``
+    is intentionally not selected (v1 omits it — see TimelineRow).
+    """
+    from screencap.content_index import escape_like
+    from screencap.recording_db import has_column, has_table, open_recording_db
+
+    start_s = start_ms / 1000.0 if start_ms is not None else None
+    end_s = end_ms / 1000.0 if end_ms is not None else None
+    app_like = f"%{escape_like(app.lower())}%" if app else None
+
+    rows: list[dict[str, Any]] = []
+    for rec_dir in _iter_recording_dirs(recording):
+        db_path = rec_dir / "recording.db"
+        if not db_path.is_file():
+            continue
+        try:
+            with open_recording_db(db_path, read_only=True) as conn:
+                if not has_table(conn, "window_event") or not has_column(
+                    conn, "window_event", "timestamp"
+                ):
+                    continue
+                has_name = has_column(conn, "window_event", "app_name")
+                has_bundle = has_column(conn, "window_event", "app_bundle_id")
+                has_title = has_column(conn, "window_event", "title")
+                if app_like and not (has_name or has_bundle):
+                    continue
+
+                name_expr = "app_name" if has_name else "NULL"
+                bundle_expr = "app_bundle_id" if has_bundle else "NULL"
+                title_expr = "title" if has_title else "NULL"
+                sql = (
+                    f"SELECT timestamp, {name_expr}, {bundle_expr}, {title_expr} "
+                    "FROM window_event WHERE timestamp IS NOT NULL"
+                )
+                params: list[Any] = []
+                if start_s is not None:
+                    sql += " AND timestamp >= ?"
+                    params.append(start_s)
+                if end_s is not None:
+                    sql += " AND timestamp < ?"
+                    params.append(end_s)
+                if app_like:
+                    clauses = []
+                    if has_name:
+                        clauses.append("lower(app_name) LIKE ? ESCAPE '\\'")
+                        params.append(app_like)
+                    if has_bundle:
+                        clauses.append("lower(app_bundle_id) LIKE ? ESCAPE '\\'")
+                        params.append(app_like)
+                    sql += " AND (" + " OR ".join(clauses) + ")"
+                sql += " ORDER BY timestamp LIMIT ?"
+                params.append(limit)
+                for ts, app_name, bundle, title in conn.execute(sql, params):
+                    rows.append({
+                        "recording": rec_dir.name,
+                        "timestamp_ms": int(float(ts) * 1000),
+                        "app": app_name or bundle,
+                        "title": title,
+                    })
+        except Exception:
+            # A single unreadable/older recording must not fail the whole query.
+            logger.debug("timeline.query skipped %s", rec_dir.name, exc_info=True)
+            continue
+
+    # Cross-recording wall-clock order, bounded to `limit` (each recording
+    # already returned ≤limit rows; take the globally-earliest `limit` without
+    # a full sort of the gathered set).
+    return heapq.nsmallest(limit, rows, key=lambda r: r["timestamp_ms"])
+
+
+async def transcript_search(request: Request) -> JSONResponse:
+    """``POST /v0/transcript.search`` — keyword scan over scrubbed transcripts."""
+    from screencap.daemon._name_validation import validate_recording_name
+
+    try:
+        body = await request.json()
+        if not isinstance(body, dict):
+            body = {}
+        parsed = schema.TranscriptSearchRequest.model_validate(body)
+        if parsed.recording is not None:
+            validate_recording_name(parsed.recording)
+        limit = _clamp_limit(parsed.limit)
+        hits = await asyncio.to_thread(
+            _run_transcript_search, parsed.query, parsed.recording, limit,
+        )
+        return JSONResponse(
+            schema.envelope(
+                schema_version=schema._TRANSCRIPT_SEARCH_API_VERSION,
+                hits=hits,
+                coverage="best_effort",
+            )
+        )
+    except errors.DaemonAPIError as exc:
+        return _api_error_response(exc)
+    except Exception as exc:
+        return _internal_error_response(
+            exc,
+            schema_version=schema._TRANSCRIPT_SEARCH_API_VERSION,
+            request=request,
+        )
+
+
+async def timeline_query(request: Request) -> JSONResponse:
+    """``POST /v0/timeline.query`` — structured app/window/time rows (authoritative)."""
+    from screencap.daemon._name_validation import validate_recording_name
+
+    try:
+        body = await request.json()
+        if not isinstance(body, dict):
+            body = {}
+        parsed = schema.TimelineQueryRequest.model_validate(body)
+        if parsed.recording is not None:
+            validate_recording_name(parsed.recording)
+        if (
+            parsed.start_ms is not None
+            and parsed.end_ms is not None
+            and parsed.start_ms > parsed.end_ms
+        ):
+            return JSONResponse(
+                errors.error_envelope(
+                    schema_version=schema._TIMELINE_QUERY_API_VERSION,
+                    error=errors.INVALID_RANGE,
+                ),
+                status_code=400,
+            )
+        limit = _clamp_limit(parsed.limit)
+        rows = await asyncio.to_thread(
+            _run_timeline_query,
+            parsed.start_ms, parsed.end_ms, parsed.app, parsed.recording, limit,
+        )
+        return JSONResponse(
+            schema.envelope(
+                schema_version=schema._TIMELINE_QUERY_API_VERSION,
+                rows=rows,
+                coverage="authoritative",
+            )
+        )
+    except errors.DaemonAPIError as exc:
+        return _api_error_response(exc)
+    except Exception as exc:
+        return _internal_error_response(
+            exc,
+            schema_version=schema._TIMELINE_QUERY_API_VERSION,
+            request=request,
+        )
+
+
 def build_app() -> Starlette:
     app = Starlette(
         routes=[
@@ -664,6 +984,9 @@ def build_app() -> Starlette:
             Route("/v0/recording.start", recording_start, methods=["POST"]),
             Route("/v0/recording.stop", recording_stop, methods=["POST"]),
             Route("/v0/permission.request", permission_request, methods=["POST"]),
+            Route("/v0/content.search", content_search, methods=["POST"]),
+            Route("/v0/transcript.search", transcript_search, methods=["POST"]),
+            Route("/v0/timeline.query", timeline_query, methods=["POST"]),
         ],
         lifespan=lifespan,
     )

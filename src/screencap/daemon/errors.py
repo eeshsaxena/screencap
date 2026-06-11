@@ -20,6 +20,7 @@ INVALID_NAME = "invalid_name"
 INVALID_OUTPUT_DIR = "invalid_output_dir"
 PERMISSION_REQUIRED = "permission_required"
 INVALID_PERMISSION = "invalid_permission"
+INVALID_RANGE = "invalid_range"
 
 # Codes returned by the daemon outside the typed-exception paths (route
 # handler `except Exception`, query-string parse failures). Keeping them
@@ -506,6 +507,7 @@ __all__ = [
     "INVALID_OUTPUT_DIR",
     "PERMISSION_REQUIRED",
     "INVALID_PERMISSION",
+    "INVALID_RANGE",
     "ERROR_CODE_INTERNAL",
     "ERROR_CODE_INVALID_CURSOR",
     "EXCEPTION_TO_ERROR_CODE",

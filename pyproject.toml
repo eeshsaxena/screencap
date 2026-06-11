@@ -39,6 +39,10 @@ dependencies = [
     # extras because runtime CLI flows now depend on it; not a transitive
     # dep of starlette/uvicorn on the install path we ship.
     "httpx>=0.27",
+    # SCR-118 ``screencap mcp`` stdio server. The high-level API lives in the
+    # official SDK as ``mcp.server.fastmcp.FastMCP`` (NOT the third-party
+    # ``fastmcp`` package). Pinned <2 against a future breaking major.
+    "mcp>=1.27,<2",
 ]
 
 [project.optional-dependencies]

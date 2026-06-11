@@ -37,6 +37,38 @@ async def _read_until(lines: AsyncIterator[str], event_type: str, timeout: float
             return event
 
 
+_MEDIA_MARKERS = (".jpg", ".jpeg", ".png", ".mp4", ".flac", "screenshots/")
+
+
+async def _check_query_verbs(client: httpx.AsyncClient) -> int:
+    """Drive the SCR-118 read-only query verbs and assert the pointer-only contract.
+
+    Runs without needing a recording (empty results are valid) — the point is to
+    prove each verb answers ``ok`` with the right shape and that no media path or
+    image byte ever appears in a response (R8).
+    """
+    checks = (
+        ("/v0/content.search", {"query": "screencap-smoke-probe"}, "hits", "index_state"),
+        ("/v0/transcript.search", {"query": "screencap-smoke-probe"}, "hits", "coverage"),
+        ("/v0/timeline.query", {}, "rows", "coverage"),
+    )
+    for path, body, rows_key, signal_key in checks:
+        resp = await client.post(path, json=body, timeout=5.0)
+        if resp.status_code != 200 or not resp.json().get("ok"):
+            _print("FAIL", f"{path} unexpected response: {resp.status_code} {resp.text}")
+            return 1
+        payload = resp.json()
+        if not isinstance(payload.get(rows_key), list) or signal_key not in payload:
+            _print("FAIL", f"{path} missing {rows_key!r}/{signal_key!r}: {payload}")
+            return 1
+        lowered = resp.text.lower()
+        leaked = [m for m in _MEDIA_MARKERS if m in lowered]
+        if leaked:
+            _print("FAIL", f"{path} leaked media markers {leaked} into the response")
+            return 1
+    return 0
+
+
 async def _run() -> int:
     socket_path = _default_socket_path()
     if not socket_path.exists():
@@ -59,6 +91,11 @@ async def _run() -> int:
             _print("FAIL", f"session.snapshot unexpected response: {snapshot.status_code} {snapshot.text}")
             return 1
         cursor = snapshot.json()["cursor"]
+
+        # SCR-118 read-only query verbs (pointer-only, zero image bytes).
+        query_rc = await _check_query_verbs(client)
+        if query_rc != 0:
+            return query_rc
 
         async with client.stream("GET", f"/v0/events?since={cursor}", timeout=None) as stream:
             lines = stream.aiter_lines()
@@ -96,7 +133,8 @@ async def _run() -> int:
 
     _print(
         "PASS",
-        "daemon verbs support agent flow: "
+        "daemon verbs support agent flow (incl. content/transcript/timeline "
+        "query verbs, pointer-only): "
         f"cursor={cursor}, started_cursor={started.get('cursor')}, "
         f"finalized_cursor={finalized.get('cursor')}",
     )

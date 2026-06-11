@@ -1,7 +1,7 @@
 ---
 title: "feat: MCP agent-memory retrieval + content index"
 type: feat
-status: active
+status: completed
 date: 2026-06-05
 deepened: 2026-06-05
 origin: docs/brainstorms/2026-06-05-mcp-agent-memory-retrieval-requirements.md

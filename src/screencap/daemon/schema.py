@@ -14,6 +14,10 @@ _RECORDING_START_API_VERSION = 1
 RECORDING_START_API_VERSION = _RECORDING_START_API_VERSION  # public alias
 _RECORDING_STOP_API_VERSION = 1
 _PERMISSION_REQUEST_API_VERSION = 1
+# SCR-118 read-only query verbs.
+_CONTENT_SEARCH_API_VERSION = 1
+_TRANSCRIPT_SEARCH_API_VERSION = 1
+_TIMELINE_QUERY_API_VERSION = 1
 
 
 @cache
@@ -48,6 +52,15 @@ _MODEL_NAMES = {
     "RecordingStopResponse",
     "PermissionRequestRequest",
     "PermissionRequestResponse",
+    "ContentSearchRequest",
+    "ContentHit",
+    "ContentSearchResponse",
+    "TranscriptSearchRequest",
+    "TranscriptHit",
+    "TranscriptSearchResponse",
+    "TimelineQueryRequest",
+    "TimelineRow",
+    "TimelineQueryResponse",
 }
 _MODELS: dict[str, Any] | None = None
 
@@ -58,7 +71,11 @@ def _load_models() -> dict[str, Any]:
     if _MODELS is not None:
         return _MODELS
 
-    from pydantic import BaseModel, ConfigDict
+    from pydantic import BaseModel, ConfigDict, Field
+
+    # Bound query/filter strings so a single request can't drive an unbounded
+    # scan (DoS guard at the daemon boundary, before any to_thread work).
+    _MAX_QUERY_LEN = 1024
 
     class _DaemonModel(BaseModel):
         """Shared Pydantic model settings for documented daemon responses."""
@@ -209,6 +226,82 @@ def _load_models() -> dict[str, Any]:
         # than gating on this value.
         already_granted: bool
 
+    class ContentSearchRequest(_DaemonModel):
+        """SCR-118 on-screen content search input."""
+
+        query: str = Field(max_length=_MAX_QUERY_LEN)
+        recording: str | None = None
+        limit: int | None = None
+
+    class ContentHit(_DaemonModel):
+        """A single content match — POINTER ONLY.
+
+        Structurally incapable of carrying a media path or image bytes: text
+        snippet + ``(recording, timestamp_ms)`` pointer + bm25 score. R8 is a
+        property of this shape, enforced at the daemon boundary.
+        """
+
+        recording: str
+        timestamp_ms: int
+        snippet: str
+        score: float
+
+    class ContentSearchResponse(EnvelopeResponse):
+        hits: list[ContentHit]
+        # content_index.IndexState value: ok / no_match / not_indexed /
+        # index_degraded / store_unavailable. Typed as str (not Literal) so a
+        # future state decodes tolerantly.
+        index_state: str
+
+    class TranscriptSearchRequest(_DaemonModel):
+        """SCR-118 transcript keyword-search input."""
+
+        query: str = Field(max_length=_MAX_QUERY_LEN)
+        recording: str | None = None
+        limit: int | None = None
+
+    class TranscriptHit(_DaemonModel):
+        """A transcript match. Pointer is chunk-granular (the scrubbed .txt has
+        no fine timestamps — the rich per-word .json is an R7 leak we never
+        read); an agent correlates precise time via timeline.query."""
+
+        recording: str
+        chunk_index: int
+        snippet: str
+
+    class TranscriptSearchResponse(EnvelopeResponse):
+        hits: list[TranscriptHit]
+        # 'best_effort' — transcript recall lags transcription. (Coherent
+        # interface != coherent recall.)
+        coverage: str
+
+    class TimelineQueryRequest(_DaemonModel):
+        """SCR-118 timeline query input (absolute unix ms time range)."""
+
+        start_ms: int | None = None
+        end_ms: int | None = None
+        app: str | None = Field(default=None, max_length=_MAX_QUERY_LEN)
+        recording: str | None = None
+        limit: int | None = None
+
+    class TimelineRow(_DaemonModel):
+        """A structured app/window/time row from the event tables.
+
+        ``browser_url`` is deliberately omitted in v1: it is captured
+        pre-scrubber and can carry OAuth codes / session tokens, so the
+        lowest-risk timeline shape is app + window title + time.
+        """
+
+        recording: str
+        timestamp_ms: int
+        app: str | None
+        title: str | None
+
+    class TimelineQueryResponse(EnvelopeResponse):
+        rows: list[TimelineRow]
+        # 'authoritative' — event tables, no OCR/redaction recall loss.
+        coverage: str
+
     _MODELS = {
         "EnvelopeResponse": EnvelopeResponse,
         "DaemonInfoResponse": DaemonInfoResponse,
@@ -222,6 +315,15 @@ def _load_models() -> dict[str, Any]:
         "RecordingStopResponse": RecordingStopResponse,
         "PermissionRequestRequest": PermissionRequestRequest,
         "PermissionRequestResponse": PermissionRequestResponse,
+        "ContentSearchRequest": ContentSearchRequest,
+        "ContentHit": ContentHit,
+        "ContentSearchResponse": ContentSearchResponse,
+        "TranscriptSearchRequest": TranscriptSearchRequest,
+        "TranscriptHit": TranscriptHit,
+        "TranscriptSearchResponse": TranscriptSearchResponse,
+        "TimelineQueryRequest": TimelineQueryRequest,
+        "TimelineRow": TimelineRow,
+        "TimelineQueryResponse": TimelineQueryResponse,
     }
     # `__getattr__` below dispatches every documented model name through
     # `_MODELS`, so injecting them into `globals()` would just shadow that
@@ -249,6 +351,9 @@ __all__ = [
     "_RECORDING_START_API_VERSION",
     "_RECORDING_STOP_API_VERSION",
     "_PERMISSION_REQUEST_API_VERSION",
+    "_CONTENT_SEARCH_API_VERSION",
+    "_TRANSCRIPT_SEARCH_API_VERSION",
+    "_TIMELINE_QUERY_API_VERSION",
     "daemon_version",
     "envelope",
 ] + sorted(_MODEL_NAMES)
