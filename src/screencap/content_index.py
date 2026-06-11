@@ -59,10 +59,13 @@ growth.
 
 from __future__ import annotations
 
+import contextlib
+import fcntl
 import logging
 import os
 import sqlite3
-from collections.abc import Iterable, Sequence
+import threading
+from collections.abc import Iterable, Iterator, Sequence
 from dataclasses import dataclass, field
 from enum import Enum
 from pathlib import Path
@@ -131,6 +134,72 @@ def default_index_path() -> Path:
     from screencap.config import get_base_dir
 
     return get_base_dir() / "content_index.db"
+
+
+# SCR-134: serialize content-index writers against the retroactive-disable purge.
+# The inline index write (``chunk_processor._do_index_chunk_content``) and the
+# purge (``scrub_worker._purge_content_index_intervals``) run on two threads of
+# the SAME recorder process. Without serialization an inline write that already
+# OCR'd a now-disabled app's frames can commit just AFTER a concurrent purge,
+# resurrecting just-purged on-screen text in the global store — and the only
+# documented recovery (the user re-disabling the app) never re-purges the index,
+# because a re-disable derives an EMPTY interval set from the already-deleted
+# window_event rows. Holding this lock across the inline OCR+write and across the
+# purge makes the two orderings both converge to "purged": either the write lands
+# first and the purge then deletes it, or the purge runs first (after the scrub
+# unlinked the screenshots) and the write re-reads an empty disk and indexes
+# nothing.
+#
+# Mirrors ``terminal_stage.terminal_lock``: an in-process ``threading.Lock``
+# FIRST (the real mechanism here — both racers are same-process threads — and it
+# holds even on flock-unsupported filesystems), then a best-effort cross-process
+# ``fcntl.flock`` for any future cross-process writer (e.g. a full-delete CLI).
+# The store is global (one DB for all recordings), so this is a single global
+# lock, not per-recording. Fail-open: any lock-setup error degrades to the
+# in-process lock only — both callers are themselves fail-open and must never
+# break on lock setup. The kernel releases the flock on process death, so a crash
+# never wedges it.
+_WRITE_LOCK = threading.Lock()
+
+
+def _write_lock_path() -> Path:
+    return default_index_path().parent / "run" / "content-index.lock"
+
+
+@contextlib.contextmanager
+def content_index_write_lock() -> Iterator[None]:
+    """Hold the global content-index write lock (SCR-134).
+
+    Acquired by both the inline index write and the retroactive-disable purge so
+    the two never interleave. Blocking (it must WAIT for the other writer, not
+    fail) and fail-open (lock-setup errors degrade to the in-process lock only).
+    """
+    _WRITE_LOCK.acquire()
+    fd: int | None = None
+    try:
+        try:
+            lock_path = _write_lock_path()
+            lock_path.parent.mkdir(parents=True, exist_ok=True)
+            with contextlib.suppress(OSError):
+                os.chmod(lock_path.parent, 0o700)
+            fd = os.open(str(lock_path), os.O_RDWR | os.O_CREAT, 0o600)
+            fcntl.flock(fd, fcntl.LOCK_EX)
+        except OSError:
+            # Sandboxed/read-only run dir or a filesystem without flock support:
+            # the in-process lock still serializes the same-process racers, which
+            # is the race that actually exists today.
+            if fd is not None:
+                with contextlib.suppress(OSError):
+                    os.close(fd)
+                fd = None
+        yield
+    finally:
+        if fd is not None:
+            with contextlib.suppress(OSError):
+                fcntl.flock(fd, fcntl.LOCK_UN)
+            with contextlib.suppress(OSError):
+                os.close(fd)
+        _WRITE_LOCK.release()
 
 
 class _StoreUnavailable(Exception):

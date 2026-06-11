@@ -1191,6 +1191,7 @@ class ChunkProcessor:
         from screencap.content_index import (
             ContentIndex,
             IndexFrame,
+            content_index_write_lock,
             default_index_path,
         )
         from screencap.engine.dedup import dhash, hamming_distance
@@ -1248,66 +1249,77 @@ class ChunkProcessor:
             )
             candidates = candidates[:_INDEX_MAX_OCR_FRAMES]
 
-        started = time.perf_counter()
-        prev_hash: int | None = None
-        frames: list[IndexFrame] = []
-        for ts, img_path in candidates:
-            # This pass runs synchronously before this chunk's upload, so a
-            # force-stop or a slow/wedged OCR engine must not pin the capture-
-            # adjacent thread: bail on stop, and on a wall-clock budget.
-            if self._stop_event.is_set():
-                break
-            if time.perf_counter() - started > _INDEX_OCR_BUDGET_S:
-                logger.info(f"Chunk {idx}: content-index OCR budget hit; stopping early")
-                break
-            # Dedup near-identical consecutive frames (same primitive + tight
-            # threshold mask_screenshots uses); keep prev_hash on a dup so we
-            # compare against the last distinct frame.
-            cur_hash: int | None = None
-            try:
-                with Image.open(img_path) as im:
-                    cur_hash = dhash(im)
-            except Exception:
-                cur_hash = None
-            if (
-                cur_hash is not None
-                and prev_hash is not None
-                and hamming_distance(cur_hash, prev_hash) <= _INDEX_DHASH_THRESHOLD
-            ):
-                continue
-            if cur_hash is not None:
-                prev_hash = cur_hash
-            try:
-                result = ocr.recognize(img_path)
-            except Exception:
-                continue
-            text = " ".join(b.text for b in result.text_blocks if b.text).strip()
-            if text:
-                frames.append(
-                    IndexFrame(timestamp_ms=int(round(ts * 1000)), text=text)
-                )
+        # SCR-134: hold the shared content-index write lock across the OCR READS
+        # and the write. The lock pairs with scrub_worker's retroactive-disable
+        # purge so the two can't interleave: if a disable lands mid-pass, either
+        # this write completes first and the purge then deletes it, or the purge
+        # (which unlinks the screenshots before taking the lock) runs first and
+        # the OCR reads below then find the files already gone — so just-disabled
+        # text can never be re-indexed after a purge. The OCR loop's own stop /
+        # budget bails bound how long this is held (it never blocks the disable's
+        # own row/file deletes — only the index-purge tail waits).
+        with content_index_write_lock():
+            started = time.perf_counter()
+            prev_hash: int | None = None
+            frames: list[IndexFrame] = []
+            for ts, img_path in candidates:
+                # This pass runs synchronously before this chunk's upload, so a
+                # force-stop or a slow/wedged OCR engine must not pin the capture-
+                # adjacent thread: bail on stop, and on a wall-clock budget.
+                if self._stop_event.is_set():
+                    break
+                if time.perf_counter() - started > _INDEX_OCR_BUDGET_S:
+                    logger.info(f"Chunk {idx}: content-index OCR budget hit; stopping early")
+                    break
+                # Dedup near-identical consecutive frames (same primitive + tight
+                # threshold mask_screenshots uses); keep prev_hash on a dup so we
+                # compare against the last distinct frame.
+                cur_hash: int | None = None
+                try:
+                    with Image.open(img_path) as im:
+                        cur_hash = dhash(im)
+                except Exception:
+                    cur_hash = None
+                if (
+                    cur_hash is not None
+                    and prev_hash is not None
+                    and hamming_distance(cur_hash, prev_hash) <= _INDEX_DHASH_THRESHOLD
+                ):
+                    continue
+                if cur_hash is not None:
+                    prev_hash = cur_hash
+                try:
+                    result = ocr.recognize(img_path)
+                except Exception:
+                    continue
+                text = " ".join(b.text for b in result.text_blocks if b.text).strip()
+                if text:
+                    frames.append(
+                        IndexFrame(timestamp_ms=int(round(ts * 1000)), text=text)
+                    )
 
-        # Replace the WHOLE chunk time-range (not just the surviving frames) so a
-        # re-process where a frame is now skipped (policy/dedup) drops its stale,
-        # less-redacted row instead of leaving it behind. Range is [start, end)
-        # in ms, widened (floor/ceil) to cover any rounded frame timestamp.
-        start_ms = math.floor(start_ts * 1000)
-        end_ms = math.ceil(end_ts * 1000)
-        store_path = default_index_path()
-        # Nothing to index AND no store yet → don't create an empty PII store.
-        # (When the store exists we still run, so a re-process clears stale rows.)
-        if not frames and not store_path.exists():
-            return
-        # Key on the recording DIRECTORY name (globally unique, and what the
-        # daemon query side resolves a recording filter to) — not the display
-        # name — so the scrub_worker purge and daemon reads agree on the key.
-        with ContentIndex(store_path) as store:
-            if store.available:
-                store.write_chunk(self._capture_dir.name, start_ms, end_ms, frames)
-        logger.info(
-            f"Chunk {idx}: content-indexed {len(frames)} frames in "
-            f"{time.perf_counter() - started:.2f}s"
-        )
+            # Replace the WHOLE chunk time-range (not just the surviving frames)
+            # so a re-process where a frame is now skipped (policy/dedup) drops its
+            # stale, less-redacted row instead of leaving it behind. Range is
+            # [start, end) in ms, widened (floor/ceil) to cover any rounded frame
+            # timestamp.
+            start_ms = math.floor(start_ts * 1000)
+            end_ms = math.ceil(end_ts * 1000)
+            store_path = default_index_path()
+            # Nothing to index AND no store yet → don't create an empty PII store.
+            # (When the store exists we still run, so a re-process clears stale rows.)
+            if not frames and not store_path.exists():
+                return
+            # Key on the recording DIRECTORY name (globally unique, and what the
+            # daemon query side resolves a recording filter to) — not the display
+            # name — so the scrub_worker purge and daemon reads agree on the key.
+            with ContentIndex(store_path) as store:
+                if store.available:
+                    store.write_chunk(self._capture_dir.name, start_ms, end_ms, frames)
+            logger.info(
+                f"Chunk {idx}: content-indexed {len(frames)} frames in "
+                f"{time.perf_counter() - started:.2f}s"
+            )
 
     def _collect_chunk_files(self, idx: int, transcript_path: Path | None) -> list[dict]:
         """Collect files belonging to this chunk for upload.
