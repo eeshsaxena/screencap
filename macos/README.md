@@ -156,13 +156,31 @@ The .app is ad-hoc signed by Xcode (`TeamIdentifier=not set`). macOS TCC tracks 
 
 Recovering after a rebuild:
 
+ScreenCap has **two distinct TCC subjects**, and a rebuild can orphan grants for either:
+
+- the **app bundle** `com.screencap.macos` — the identity used on the CLI-fallback path (daemon unreachable), and
+- the embedded **`screencap` helper binary** — the daemon's identity, which is what `daemon.info` and the walkthrough's "for ScreenCap helper" rows reflect. It is a *separate* identity (a bare signed tool with no bundle id), so resetting the app does **not** reset it.
+
+Reset both:
+
 ```bash
+# App bundle (CLI-fallback path):
 tccutil reset All com.screencap.macos
+
+# Daemon/helper (the "ScreenCap helper" rows + daemon.info) — target the bare
+# `screencap` tool per service. If tccutil reports no match, remove every
+# `screencap` / `screencapspike` row in each pane with the "−" button instead.
+tccutil reset ScreenCapture screencap
+tccutil reset Accessibility screencap
+tccutil reset ListenEvent  screencap
+
+# Restart the daemon so it re-registers under the current signature:
+launchctl kickstart -k "gui/$(id -u)/com.screencap.daemon"
 ```
 
-Then re-grant via the walkthrough sheet at next launch.
+Then re-grant via the walkthrough sheet at next launch — its **Grant** buttons make the daemon register the right identity before opening each pane.
 
-To avoid the loop entirely, sign with a stable Developer ID. The release pipeline in `Unit 1` / `Unit 22` of the v1 plan handles this.
+To avoid the loop entirely, build with `DEVELOPMENT_TEAM` set (see [signing identity for dev builds](#one-time-setup-signing-identity-for-dev-builds)) or sign with a stable Developer ID. A stable signature gives both subjects a fixed designated requirement, so grants persist across rebuilds and the panes stop accumulating duplicate `screencap` rows. The release pipeline in `Unit 1` / `Unit 22` of the v1 plan handles Developer ID signing.
 
 If a rebuild leaves the walkthrough's app-process indicators stale, click **Skip for now** or **Done** after the helper is installed to dismiss the sheet and keep testing the rest of the UI. Daemon-backed recording is enforced by the helper/engine at start time; CLI fallback still uses the app/CLI permission path.
 
