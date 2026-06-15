@@ -63,6 +63,10 @@ struct PrivacyPaneView: View {
                 Image(systemName: "exclamationmark.shield")
                     .font(.system(size: 18))
                     .foregroundStyle(.orange)
+                    // Decorative — the adjacent title + body convey the full
+                    // meaning, so keep VoiceOver from announcing the symbol as a
+                    // separate, content-free focus stop.
+                    .accessibilityHidden(true)
                 VStack(alignment: .leading, spacing: 2) {
                     Text("Permission setup was skipped")
                         .font(.subheadline.weight(.semibold))
