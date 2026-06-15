@@ -198,6 +198,63 @@ final class PermissionControllerTests: XCTestCase {
     }
 
     @MainActor
+    func testRequestReopenSetupLatchesAndConsumesWithoutClearingDismissal() {
+        let (permissions, defaults) = makeController()
+        permissions.markSetupDismissed()
+        XCTAssertFalse(permissions.reopenSetupRequested)
+
+        // The recovery entry point latches a request for MainWindow to observe.
+        permissions.requestReopenSetup()
+        XCTAssertTrue(permissions.reopenSetupRequested)
+        // It must NOT clear the persisted dismissal — only completing setup
+        // (daemon grants landing) re-arms the launch gate, so a user who taps
+        // "Finish setup" then closes the sheet again still isn't re-nagged on
+        // the next launch.
+        XCTAssertTrue(permissions.setupDismissed)
+        XCTAssertTrue(defaults.bool(forKey: "com.screencap.macos.permissionSetupDismissed"))
+
+        // MainWindow consumes the latch after presenting so it doesn't
+        // re-present on a later view update.
+        permissions.consumeReopenSetupRequest()
+        XCTAssertFalse(permissions.reopenSetupRequested)
+        XCTAssertTrue(permissions.setupDismissed)
+    }
+
+    @MainActor
+    func testAdHocDevBuildWarningGatesOnAdHocSigningAndAnActiveDenial() {
+        let suite = "test-\(UUID().uuidString)"
+        let defaults = UserDefaults(suiteName: suite)!
+        defaults.removePersistentDomain(forName: suite)
+
+        func controller(adHoc: Bool) -> PermissionController {
+            PermissionController(defaults: defaults, isAdHocBuild: adHoc)
+        }
+        let denied = DaemonPermissionGrants(
+            screenRecording: .denied, accessibility: .granted, inputMonitoring: .granted
+        )
+        let allGranted = DaemonPermissionGrants(
+            screenRecording: .granted, accessibility: .granted, inputMonitoring: .granted
+        )
+
+        // Signed build never shows the dev hint, even with a denial — the OS
+        // really did orphan/deny it, but it's not the ad-hoc treadmill.
+        let signed = controller(adHoc: false)
+        signed.updateDaemonGrants(denied)
+        XCTAssertFalse(signed.showAdHocDevBuildWarning)
+
+        // Ad-hoc build with everything granted: nothing confusing to explain.
+        let adhocOK = controller(adHoc: true)
+        adhocOK.updateDaemonGrants(allGranted)
+        XCTAssertFalse(adhocOK.showAdHocDevBuildWarning)
+
+        // Ad-hoc build reporting a denial: the exact "granted in Settings but
+        // denied here" case → surface the hint.
+        let adhocDenied = controller(adHoc: true)
+        adhocDenied.updateDaemonGrants(denied)
+        XCTAssertTrue(adhocDenied.showAdHocDevBuildWarning)
+    }
+
+    @MainActor
     func testDaemonGrantPerPaneMappingExcludesMicrophone() {
         let (permissions, _) = makeController()
         permissions.updateDaemonGrants(

@@ -6,6 +6,7 @@ import CoreGraphics
 import Foundation
 import IOKit
 import IOKit.hid
+import Security
 import os
 
 private let permissionLogger = Logger(subsystem: "com.screencap.macos", category: "permission")
@@ -154,6 +155,16 @@ final class PermissionController: ObservableObject {
     /// so the walkthrough view reacts without owning the guard itself.
     @Published private(set) var daemonRegistrationInFlight: Set<PrivacyPane> = []
 
+    /// True when the running app is ad-hoc signed (no Team Identifier). On such
+    /// builds macOS re-keys TCC on every rebuild's changing signature, so prior
+    /// Screen Recording / Accessibility / Input Monitoring grants are orphaned
+    /// and the app reads "denied" even while System Settings still shows an old
+    /// build as granted. Used purely to surface a dev-only hint — it never
+    /// affects gating or the real OS-enforced permission state. Signed builds
+    /// (Apple Development / Developer ID / App Store) always have a team id, so
+    /// this is false for every release artifact. Injected for tests.
+    let isAdHocBuild: Bool
+
     private let defaults: UserDefaults
     private static let setupDismissedDefaultsKey = "com.screencap.macos.permissionSetupDismissed"
 
@@ -204,6 +215,25 @@ final class PermissionController: ObservableObject {
             || inputMonitoring == .denied
     }
 
+    /// Dev-only hint shown to explain the "System Settings says granted but the
+    /// app says denied" confusion that ad-hoc builds cause. Gated on an *actual*
+    /// denial (daemon- or app-process-reported) so a fully-granted ad-hoc build
+    /// stays quiet. Never shown on signed builds. See `adHocDevBuildWarning`.
+    var showAdHocDevBuildWarning: Bool {
+        isAdHocBuild && (daemonGrants.anyRequiredDenied || anyDenied)
+    }
+
+    /// Copy for the ad-hoc dev-build hint. Names the cause (signature changes on
+    /// every rebuild orphan the grant) and both fixes (stable `DEVELOPMENT_TEAM`
+    /// signing, or reset + re-grant). Intentionally developer-facing — it only
+    /// ever renders on an unsigned local build.
+    static let adHocDevBuildWarning =
+        "Ad-hoc dev build: macOS ties permission grants to the app's code "
+        + "signature, which changes on every rebuild — so System Settings may "
+        + "show an earlier build as granted while this one reads denied. Build "
+        + "with DEVELOPMENT_TEAM set for stable signing, or run "
+        + "`tccutil reset All com.screencap.macos` and grant again."
+
     /// All three required *daemon* grants are confirmed granted (microphone
     /// excluded). Drives the walkthrough's "all done" / auto-close path (U5).
     var allRequiredDaemonGrantsGranted: Bool {
@@ -222,6 +252,30 @@ final class PermissionController: ObservableObject {
         if grants.allRequiredGranted {
             clearSetupDismissed()
         }
+    }
+
+    /// Set when the user explicitly asks to re-open the first-run walkthrough
+    /// from a recovery affordance (the Privacy tab's "Finish setup" entry point),
+    /// as opposed to the launch gate, which `setupDismissed` suppresses. Without
+    /// this, a mistaken "Skip for now" is unrecoverable: the launch gate never
+    /// re-pops, and the daemon-grant auto-clear (`updateDaemonGrants`) can never
+    /// fire while the daemon stays uninstalled (the CLI-fallback path you land on
+    /// when you skip the install step). MainWindow observes this, presents the
+    /// sheet, then calls `consumeReopenSetupRequest()`.
+    @Published private(set) var reopenSetupRequested: Bool = false
+
+    /// User asked to re-open the walkthrough (recovery entry point). Deliberately
+    /// does NOT clear `setupDismissed`: only *completing* setup re-arms the gate
+    /// (daemon grants landing → `updateDaemonGrants`), so the launch behavior is
+    /// unchanged for users who never touch this affordance.
+    func requestReopenSetup() {
+        reopenSetupRequested = true
+    }
+
+    /// MainWindow calls this once it has presented the sheet, so the latched flag
+    /// doesn't re-present on a later view update.
+    func consumeReopenSetupRequest() {
+        reopenSetupRequested = false
     }
 
     /// Persist that the user dismissed the permission walkthrough ("Skip for
@@ -257,12 +311,14 @@ final class PermissionController: ObservableObject {
     init(
         defaults: UserDefaults = .standard,
         daemonRegistrar: DaemonPermissionRegistrar? = nil,
-        daemonSettingsOpener: (@MainActor (PrivacyPane) -> Void)? = nil
+        daemonSettingsOpener: (@MainActor (PrivacyPane) -> Void)? = nil,
+        isAdHocBuild: Bool = PermissionController.detectAdHocSigned()
     ) {
         self.defaults = defaults
         self.setupDismissed = defaults.bool(forKey: Self.setupDismissedDefaultsKey)
         self.injectedDaemonRegistrar = daemonRegistrar
         self.injectedDaemonSettingsOpener = daemonSettingsOpener
+        self.isAdHocBuild = isAdHocBuild
     }
 
     nonisolated deinit {
@@ -597,6 +653,35 @@ final class PermissionController: ObservableObject {
         case .notDetermined:     return .notDetermined
         @unknown default:        return .notDetermined
         }
+    }
+
+    /// True when the running bundle has no Team Identifier — i.e. it is ad-hoc
+    /// signed or unsigned. Apple Development, Developer ID, and App Store builds
+    /// all carry a team id, so this is false for every release artifact and any
+    /// dev build signed with `DEVELOPMENT_TEAM` set.
+    ///
+    /// Fails closed to `false` (assume properly signed) on any Security API
+    /// error so a probe hiccup never shows the dev hint on a real user's
+    /// machine. Crucially, the fail-closed path is distinct from the genuine
+    /// "ad-hoc" verdict: we return `true` ONLY when the signing information was
+    /// read successfully AND `kSecCodeInfoTeamIdentifier` is genuinely absent.
+    /// Any SecCode* guard failure (a transient Security-API error, an
+    /// unreadable record) returns `false` rather than mislabelling a properly
+    /// signed build as ad-hoc.
+    nonisolated static func detectAdHocSigned() -> Bool {
+        var codeRef: SecCode?
+        guard SecCodeCopySelf(SecCSFlags(), &codeRef) == errSecSuccess,
+              let codeRef else { return false }
+        var staticRef: SecStaticCode?
+        guard SecCodeCopyStaticCode(codeRef, SecCSFlags(), &staticRef) == errSecSuccess,
+              let staticRef else { return false }
+        var infoRef: CFDictionary?
+        let flags = SecCSFlags(rawValue: UInt32(kSecCSSigningInformation))
+        guard SecCodeCopySigningInformation(staticRef, flags, &infoRef) == errSecSuccess,
+              let info = infoRef as? [String: Any] else { return false }
+        // Signing info read successfully: a missing team id is a genuine ad-hoc
+        // verdict (true); a present one is a properly signed build (false).
+        return (info[kSecCodeInfoTeamIdentifier as String] as? String) == nil
     }
 
     nonisolated static func relaunchHelperShellScript(

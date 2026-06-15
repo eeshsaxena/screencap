@@ -8,11 +8,13 @@ import SwiftUI
 /// feedback decides whether to add one.
 struct PrivacyPaneView: View {
     @EnvironmentObject private var privacy: PrivacyController
+    @EnvironmentObject private var permissions: PermissionController
 
     var body: some View {
         VStack(alignment: .leading, spacing: 0) {
             header
             Divider()
+            finishSetupBanner
             content
         }
         .task { await initialLoad() }
@@ -46,6 +48,46 @@ struct PrivacyPaneView: View {
         }
         .padding(.horizontal, 20)
         .padding(.vertical, 12)
+    }
+
+    /// Recovery entry point for a skipped/incomplete first-run setup. Shown only
+    /// while `setupDismissed` is latched — i.e. the user tapped "Skip for now"
+    /// and setup hasn't since completed (completing it clears the flag via the
+    /// daemon-grant auto-clear). This is the always-available way back into the
+    /// walkthrough; without it a mistaken Skip is a dead end on the CLI-fallback
+    /// path, where the launch gate never re-pops.
+    @ViewBuilder
+    private var finishSetupBanner: some View {
+        if permissions.setupDismissed {
+            HStack(spacing: 12) {
+                Image(systemName: "exclamationmark.shield")
+                    .font(.system(size: 18))
+                    .foregroundStyle(.orange)
+                    // Decorative — the adjacent title + body convey the full
+                    // meaning, so keep VoiceOver from announcing the symbol as a
+                    // separate, content-free focus stop.
+                    .accessibilityHidden(true)
+                VStack(alignment: .leading, spacing: 2) {
+                    Text("Permission setup was skipped")
+                        .font(.subheadline.weight(.semibold))
+                    Text("ScreenCap can't record until the helper and its permissions are set up.")
+                        .font(.caption)
+                        .foregroundStyle(.secondary)
+                }
+                Spacer()
+                Button("Finish setup") {
+                    permissions.requestReopenSetup()
+                }
+                .buttonStyle(.borderedProminent)
+            }
+            .padding(12)
+            .background(
+                RoundedRectangle(cornerRadius: 10)
+                    .fill(Color(nsColor: .controlBackgroundColor))
+            )
+            .padding(.horizontal, 20)
+            .padding(.top, 12)
+        }
     }
 
     @ViewBuilder

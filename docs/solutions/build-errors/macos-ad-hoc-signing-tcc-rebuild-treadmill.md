@@ -2,7 +2,7 @@
 title: "Ad-hoc-signed dev builds appear as a new app to TCC on every rebuild — orphaning prior grants"
 slug: macos-ad-hoc-signing-tcc-rebuild-treadmill
 date: 2026-05-01
-updated: 2026-06-08
+updated: 2026-06-15
 category: build-errors
 severity: medium
 problem_type: dev-environment-friction
@@ -27,6 +27,8 @@ symptoms:
   - "`tccutil reset` is the only way to recover a clean grant flow"
   - "App is team-signed but TCC grants STILL churn on rebuild — because the nested daemon binary is ad-hoc"
   - "Two separate `screencap` rows appear in a Privacy pane (one per rebuild's cdhash)"
+  - "Daemon reports denied via `/v0/daemon.info` (and the walkthrough \"ScreenCap helper\" rows) while System Settings shows the same permission granted — the app and daemon are different TCC subjects"
+  - "`tccutil reset <Service> screencap` fails with OSStatus -10814; the Screen Recording entry reads \"ScreenCap\" but Accessibility / Input Monitoring read lowercase `screencap`"
 root_cause: >
   Xcode signs Debug builds with an ad-hoc signature (`Signature=adhoc,
   TeamIdentifier=not set`). TCC uses the code-signing identity to track
@@ -112,13 +114,69 @@ request to the *responsible process* (so the daemon must issue its own
 registration request, not the app):
 `docs/research/2026-06-05-daemon-tcc-registration-spike.md`.
 
+## Diagnosing it at runtime (2026-06-15): daemon says "denied" while System Settings shows "granted"
+
+The most confusing presentation of this problem: the first-run walkthrough's
+"ScreenCap helper" rows (and `/v0/daemon.info`) report Screen Recording /
+Accessibility / Input Monitoring as **denied**, yet System Settings shows them
+**granted** for ScreenCap, and recording is blocked. It looks like a probe bug.
+It isn't — it's the identity split above, plus three macOS-UI quirks. **Don't
+debug `permission_probe.py` / `daemon.info` — diagnose the TCC identity.**
+
+**1. Read ground truth from the daemon, not System Settings:**
+```bash
+curl -s --unix-socket ~/.screencap/run/api.sock http://localhost/v0/daemon.info
+# → "permissions":{"screen_recording":"denied","accessibility":"denied","input_monitoring":"denied"}
+```
+The probe spawns a fresh `screencap _permission-probe` subprocess, so this is the
+*live* state for the daemon's identity (not a stale in-process cache).
+
+**2. Inspect signing of BOTH the app AND the embedded CLI** (the daemon's real subject):
+```bash
+ps aux | grep "screencap serve"        # PPID 1 ⇒ launchd-parented background daemon
+codesign -dv --verbose=2 <App>.app
+codesign -dv --verbose=2 <App>.app/Contents/Resources/screencap/screencap
+```
+`Signature=adhoc` / `TeamIdentifier=not set` on the embedded CLI ⇒ the treadmill
+(grants orphaned every rebuild). A team identifier ⇒ stable; the denial is just an
+ungranted-or-wrong-entry, fixed below.
+
+**3. Account for three quirks that make a correct grant *look* broken:**
+- **Per-pane name divergence.** Screen Recording attributes to the containing
+  bundle, so its entry shows as **"ScreenCap"** (capitalized). Accessibility and
+  Input Monitoring attribute to the bare tool, so their entries show as lowercase
+  **`screencap`**. You enable differently-named rows in different panes — "it
+  never shows anything" is usually looking for the wrong name in the wrong pane.
+- **Default OFF + stale pane.** A freshly-registered entry is **default OFF**, and
+  the Screen Recording pane does **not** live-refresh. Quit System Settings
+  (`Cmd+Q`) and reopen to see and toggle the new entry.
+- **Input Monitoring doesn't self-register under launchd.** `IOHIDRequestAccess`
+  alone registers no row for the launchd daemon (`docs/research/2026-06-05-daemon-tcc-registration-spike.md`);
+  add it via the **`+`** button. Input Monitoring is advisory — it does **not**
+  block recording, so don't chase it first.
+
+After granting, the walkthrough rows flip green within ~5s (fresh probe). If a
+just-toggled grant doesn't take, restart the daemon so it re-reads live TCC:
+```bash
+launchctl kickstart -k gui/$(id -u)/com.screencap.daemon
+```
+
 ## Recovery
 
 ```bash
+# Resets the APP bundle's grants only — NOT the daemon's:
 tccutil reset All com.screencap.macos
 ```
 
-Wipes every TCC grant for the bundle id. Next launch shows fresh prompts; granting in Settings creates new entries that match the current build's signature.
+**`tccutil` cannot reset the daemon's grants.** The daemon's subject is the bare
+`screencap` tool, which has **no bundle id**, so `tccutil reset <Service> screencap`
+fails with `OSStatus -10814 "No such bundle identifier"`. Clean up the daemon's
+orphaned/duplicate `screencap` (and any `screencapspike`) rows **manually** with
+the **"−"** button in each pane (Screen Recording, Accessibility, Input Monitoring).
+Then re-grant via the walkthrough (its **Grant** buttons make the daemon register
+its own identity per pane) and toggle the new rows on per the runtime steps above.
+Do **not** use `tccutil reset <Service>` with no client — that wipes the service
+for *every* app on the machine.
 
 If you're going to do a smoke-test cycle, **don't rebuild between attempts**. Grant once, click Quit & Relaunch (which handles the in-process cache), test what you need to test, only then rebuild.
 
@@ -141,5 +199,8 @@ The pragmatic answer until a real Developer ID lands: accept the `tccutil reset`
 
 ## Related
 
-- `macos/README.md` — "TCC permissions on dev builds" (the user-facing version of this lesson).
-- `docs/solutions/runtime-errors/macos-tcc-per-process-cache-quit-and-relaunch.md` — the in-process cache problem (separate concern, same domain).
+- `macos/README.md` — "TCC permissions on dev builds" (the user-facing version of this lesson; now documents both TCC subjects + the per-service reset).
+- `docs/solutions/runtime-errors/macos-tcc-per-process-cache-quit-and-relaunch.md` — the in-process cache problem (separate concern, same domain: that one is "granted but a *running* process can't see it"; this one is "denied because the *wrong subject* was granted").
+- `docs/solutions/build-errors/env-export-prefix-silently-disables-team-signing.md` — a `.env` `export ` prefix silently dropping `DEVELOPMENT_TEAM`, which lands you back on the ad-hoc treadmill.
+- `docs/research/2026-06-05-daemon-tcc-registration-spike.md` — the source-of-truth spike (daemon identity, per-pane registration, Input-Monitoring-under-launchd, responsible-process attribution).
+- `docs/solutions/design-patterns/fallback-path-recovery-and-exit-code-signaling-2026-06-15.md` — related permission-onboarding UX from the same work (PR #232, SCR-142).
