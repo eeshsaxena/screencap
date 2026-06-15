@@ -329,6 +329,107 @@ build_cli_if_needed() {
   fi
 }
 
+daemon_api_socket() {
+  echo "${SCREENCAP_RUN_DIR:-$HOME/.screencap/run}/api.sock"
+}
+
+running_daemon_version() {
+  # Print the version of whatever daemon is currently answering api.sock, or
+  # nothing if unreachable / unparseable. curl --unix-socket ships with macOS;
+  # the daemon serves daemon.info as plain HTTP/1.1 over the UNIX socket.
+  local socket="$1"
+  [[ -S "$socket" ]] || return 0
+  local body
+  body="$(/usr/bin/curl -fsS --max-time 2 --unix-socket "$socket" \
+            "http://localhost/v0/daemon.info" 2>/dev/null)" || return 0
+  # Pull "daemon_version":"X.Y.Z" out of the JSON without a JSON parser.
+  sed -n 's/.*"daemon_version"[[:space:]]*:[[:space:]]*"\([^"]*\)".*/\1/p' <<<"$body"
+}
+
+cli_version_from_binary() {
+  # parse must match daemon.info.daemon_version; keep in sync with the sibling
+  # script's copy (macos/ScreenCap/Scripts/embed-cli.sh `cli_version_from_binary`).
+  "$1" --version 2>/dev/null | awk 'NF {print $NF}'
+}
+
+fresh_daemon_version() {
+  # The version the freshly built bundle would run (bundled mode only — callers
+  # skip reconciliation in dev-source mode). Empty if it can't be determined.
+  # `screencap --version` prints "screencap, version X.Y.Z"; keep the last field.
+  [[ -x "$CLI_BINARY" ]] || return 0
+  cli_version_from_binary "$CLI_BINARY"
+}
+
+reconcile_daemon_version() {
+  # SCR-121: a stale/foreign daemon (e.g. an older ScreenCap.app build) can be
+  # registered under com.screencap.daemon and squatting api.sock. `kickstart`
+  # only respawns whatever bundle the label is pinned to (the old one), and the
+  # app treats "socket reachable" as "installed", so the freshly built app would
+  # silently drive the OLD daemon. Detect that here and `bootout` the stale label
+  # so the new app reinstalls its bundled daemon on launch.
+  #
+  # Dev-source mode execs in-repo source and self-heals on kickstart, so there's
+  # no bundled-version staleness to reconcile — skip it.
+  if [[ "${SCREENCAP_DAEMON_USE_DEV_SOURCE:-0}" == "1" ]]; then
+    return
+  fi
+
+  local socket running fresh uid
+  socket="$(daemon_api_socket)"
+  running="$(running_daemon_version "$socket" || true)"
+  if [[ -z "$running" ]]; then
+    return  # no reachable daemon to reconcile
+  fi
+  fresh="$(fresh_daemon_version || true)"
+  if [[ -z "$fresh" || "$running" == "$fresh" ]]; then
+    return  # can't determine the fresh version, or already up to date
+  fi
+
+  uid="$(id -u)"
+  echo "warning: a stale ScreenCap daemon (version $running) is running, but this" >&2
+  echo "warning: build bundles version $fresh. Dislodging the stale helper so the" >&2
+  echo "warning: freshly built app reinstalls its own daemon on launch." >&2
+  # `launchctl bootout` returns non-zero when the label simply isn't loaded —
+  # that is the desired end state, not a failure. Distinguish a real bootout
+  # failure (label still registered) from "already gone" via `launchctl print`,
+  # and only surface the manual-recovery hint when the stale daemon persists.
+  if /bin/launchctl bootout "gui/$uid/com.screencap.daemon" >/dev/null 2>&1; then
+    : # dislodged
+  elif /bin/launchctl print "gui/$uid/com.screencap.daemon" >/dev/null 2>&1; then
+    echo "warning: launchctl bootout failed; the stale daemon may still be registered." >&2
+    echo "warning: manual recovery: launchctl bootout gui/$uid/com.screencap.daemon && ./script/build_and_run.sh" >&2
+  fi
+}
+
+confirm_fresh_daemon() {
+  # Acceptance gate for `--verify` (SCR-121): after the app is up, confirm the
+  # daemon answering api.sock is the freshly built version. The install can take
+  # a few seconds (and may need a one-time Login Items approval on a clean
+  # machine), so poll briefly and downgrade to a warning rather than failing —
+  # the daemon may legitimately still be awaiting user approval.
+  if [[ "${SCREENCAP_DAEMON_USE_DEV_SOURCE:-0}" == "1" ]]; then
+    return
+  fi
+  local socket fresh running uid
+  socket="$(daemon_api_socket)"
+  fresh="$(fresh_daemon_version || true)"
+  [[ -n "$fresh" ]] || return
+
+  for _ in $(seq 1 30); do
+    running="$(running_daemon_version "$socket" || true)"
+    if [[ "$running" == "$fresh" ]]; then
+      echo "Daemon version $running matches the freshly built bundle."
+      return
+    fi
+    sleep 1
+  done
+
+  uid="$(id -u)"
+  echo "warning: the running daemon did not converge to the freshly built version ($fresh)." >&2
+  echo "warning: last seen: ${running:-unreachable}. If recording misbehaves, run:" >&2
+  echo "warning:   launchctl bootout gui/$uid/com.screencap.daemon && ./script/build_and_run.sh" >&2
+}
+
 restart_daemon_if_loaded() {
   # launchd's KeepAlive keeps the daemon process alive across app and CLI
   # rebuilds. Without an explicit kickstart, a freshly-built CLI bundle or
@@ -377,6 +478,11 @@ build_app() {
 launch_app() {
   prepare_launch_env
   publish_launch_env
+  # SCR-121: dislodge a stale/version-mismatched daemon BEFORE kickstart/launch.
+  # Otherwise kickstart just respawns the old bundle and the freshly built app
+  # adopts it (treats "socket reachable" as "installed").
+  echo "==> Reconciling daemon version"
+  reconcile_daemon_version
   # Kickstart the daemon AFTER publish_launch_env so the respawned helper
   # inherits the freshly-set launchctl env (PATH, SCREENCAP_DEV_PYTHON,
   # SCREENCAP_DAEMON_USE_DEV_SOURCE). Without this, env changes published
@@ -413,6 +519,7 @@ verify_launch() {
         exit 1
       fi
       echo "$APP_NAME is running."
+      confirm_fresh_daemon
       return
     fi
     sleep 0.25

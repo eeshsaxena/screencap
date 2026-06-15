@@ -228,6 +228,8 @@ struct FirstRunPermissionsView: View {
             return "macOS rejected the helper signature."
         case .diskFull:
             return "The disk is full, so the helper could not be installed."
+        case .daemonVersionMismatch:
+            return "A different version of the ScreenCap helper is already running. Click Approve helper to reinstall the bundled version."
         case .unknown:
             return "The helper could not be installed."
         }

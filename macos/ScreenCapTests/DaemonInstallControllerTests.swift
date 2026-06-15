@@ -147,6 +147,94 @@ final class DaemonInstallControllerTests: XCTestCase {
 
         await fulfillment(of: [expectation], timeout: 1)
     }
+
+    // SCR-121: a reachable daemon whose version != the bundle we would install
+    // is a stale/foreign daemon squatting api.sock. It must not silently read as
+    // "installed and running". We try the reinstall (refresh) path once; if it
+    // still answers with the wrong version, surface a distinct failure.
+    func testReachableDaemonWithWrongVersionSurfacesMismatchAfterReinstall() async {
+        let registration = FakeDaemonRegistrationService(
+            registerStatuses: [.enabled],
+            refreshStatuses: [.enabled]
+        )
+        let probe = FakeDaemonProbe(versions: ["0.12.7", "0.12.7"])
+        let controller = DaemonInstallController(
+            registrationService: registration,
+            probe: probe,
+            expectedDaemonVersion: "0.20.0",
+            sleep: { _ in }
+        )
+
+        await controller.install(timeoutSeconds: 1, probeIntervalSeconds: 0.01)
+
+        XCTAssertEqual(registration.refreshedPlistNames, [DaemonInstallController.plistName])
+        XCTAssertEqual(probe.callCount, 2)
+        XCTAssertEqual(controller.state, .installFailed(.daemonVersionMismatch))
+    }
+
+    func testReinstallRecoversWhenFreshDaemonReportsExpectedVersion() async {
+        let expectation = expectation(description: "daemon installed notification")
+        let observer = NotificationCenter.default.addObserver(
+            forName: .screenCapDaemonInstalledAndRunning,
+            object: nil,
+            queue: .main
+        ) { _ in expectation.fulfill() }
+        defer { NotificationCenter.default.removeObserver(observer) }
+
+        let registration = FakeDaemonRegistrationService(
+            registerStatuses: [.enabled],
+            refreshStatuses: [.enabled]
+        )
+        // Stale daemon answers first; after the refresh dislodges it the fresh
+        // daemon reports the expected version.
+        let probe = FakeDaemonProbe(versions: ["0.12.7", "0.20.0"])
+        let controller = DaemonInstallController(
+            registrationService: registration,
+            probe: probe,
+            expectedDaemonVersion: "0.20.0",
+            sleep: { _ in }
+        )
+
+        await controller.install(timeoutSeconds: 1, probeIntervalSeconds: 0.01)
+
+        XCTAssertEqual(registration.refreshedPlistNames, [DaemonInstallController.plistName])
+        XCTAssertEqual(controller.state, .installedAndRunning)
+        await fulfillment(of: [expectation], timeout: 1)
+    }
+
+    func testReachableDaemonWithMatchingVersionInstallsWithoutRefresh() async {
+        let registration = FakeDaemonRegistrationService(registerStatuses: [.enabled])
+        let probe = FakeDaemonProbe(versions: ["0.20.0"])
+        let controller = DaemonInstallController(
+            registrationService: registration,
+            probe: probe,
+            expectedDaemonVersion: "0.20.0",
+            sleep: { _ in }
+        )
+
+        await controller.install(timeoutSeconds: 1, probeIntervalSeconds: 0.01)
+
+        XCTAssertEqual(registration.refreshedPlistNames, [])
+        XCTAssertEqual(probe.callCount, 1)
+        XCTAssertEqual(controller.state, .installedAndRunning)
+    }
+
+    // Fail-safe: when the expected version can't be determined (no bundled CLI,
+    // dev-source mode, unreadable stamp) we preserve the historical
+    // reachable-implies-running behavior rather than risk a false "out of date".
+    func testUnknownExpectedVersionAdoptsReachableDaemon() async {
+        let probe = FakeDaemonProbe(versions: ["0.12.7"])
+        let controller = DaemonInstallController(
+            registrationService: FakeDaemonRegistrationService(registerStatuses: [.enabled]),
+            probe: probe,
+            expectedDaemonVersion: nil,
+            sleep: { _ in }
+        )
+
+        await controller.install(timeoutSeconds: 1, probeIntervalSeconds: 0.01)
+
+        XCTAssertEqual(controller.state, .installedAndRunning)
+    }
 }
 
 @MainActor
@@ -186,15 +274,23 @@ private final class FakeDaemonRegistrationService: DaemonRegistrationService {
 
 @MainActor
 private final class FakeDaemonProbe: DaemonProbe {
-    private var results: [Bool]
+    /// Each element is the version a reachable daemon reports, or nil for an
+    /// unreachable probe. The `results: [Bool]` initializer keeps the older
+    /// reachability-only tests terse: `true` -> reachable with a placeholder
+    /// version, `false` -> unreachable.
+    private var results: [String?]
     private(set) var callCount = 0
 
-    init(results: [Bool]) {
-        self.results = results
+    init(results: [Bool], version: String = "0.0.0-test") {
+        self.results = results.map { $0 ? version : nil }
     }
 
-    func probe(timeout: TimeInterval) async -> Bool {
+    init(versions: [String?]) {
+        self.results = versions
+    }
+
+    func probe(timeout: TimeInterval) async -> String? {
         callCount += 1
-        return results.isEmpty ? false : results.removeFirst()
+        return results.isEmpty ? nil : results.removeFirst()
     }
 }

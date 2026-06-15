@@ -116,6 +116,38 @@ ditto "${SOURCE_DIR}" "${DEST_DIR}"
 
 echo "Embedded screencap CLI from ${SOURCE_DIR} -> ${DEST_DIR}"
 
+cli_version_from_binary() {
+    # parse must match daemon.info.daemon_version; keep in sync with the sibling
+    # script's copy (script/build_and_run.sh `cli_version_from_binary`).
+    "$1" --version 2>/dev/null | awk 'NF {print $NF}'
+}
+
+stamp_bundled_cli_version() {
+    # Record the bundled CLI's version next to it so DaemonInstallController can
+    # tell, at install time, whether the daemon answering api.sock is actually
+    # the version this app bundles — vs a stale/foreign daemon squatting the
+    # socket (SCR-121). `screencap --version` prints "screencap, version X.Y.Z";
+    # we keep the last whitespace-delimited field. The daemon reports the same
+    # value as daemon.info.daemon_version, so the two compare directly.
+    local version_file version
+    version_file="$(dirname "${DEST_DIR}")/screencap-cli-version"
+    # `|| true`: under `set -euo pipefail` a non-zero `screencap --version`
+    # (broken bundle) would otherwise abort the build at this assignment instead
+    # of reaching the safe-fallback `else` below.
+    version="$(cli_version_from_binary "${DEST_DIR}/screencap" || true)"
+    if [ -n "${version}" ]; then
+        printf '%s' "${version}" >"${version_file}"
+        echo "Stamped bundled CLI version ${version} -> ${version_file}"
+    else
+        # No readable version — remove any stale stamp so the app's gate fails
+        # safe (treats the version as unknown) rather than trusting an old value.
+        rm -f "${version_file}"
+        echo "warning: could not read bundled CLI version; daemon version gate disabled."
+    fi
+}
+
+stamp_bundled_cli_version
+
 sign_embedded_cli() {
     # PyInstaller emits an ad-hoc signature, so the embedded daemon binary has no
     # stable code identity. macOS TCC then keys the daemon's Screen Recording /
