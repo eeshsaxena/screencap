@@ -198,6 +198,29 @@ final class PermissionControllerTests: XCTestCase {
     }
 
     @MainActor
+    func testRequestReopenSetupLatchesAndConsumesWithoutClearingDismissal() {
+        let (permissions, defaults) = makeController()
+        permissions.markSetupDismissed()
+        XCTAssertFalse(permissions.reopenSetupRequested)
+
+        // The recovery entry point latches a request for MainWindow to observe.
+        permissions.requestReopenSetup()
+        XCTAssertTrue(permissions.reopenSetupRequested)
+        // It must NOT clear the persisted dismissal — only completing setup
+        // (daemon grants landing) re-arms the launch gate, so a user who taps
+        // "Finish setup" then closes the sheet again still isn't re-nagged on
+        // the next launch.
+        XCTAssertTrue(permissions.setupDismissed)
+        XCTAssertTrue(defaults.bool(forKey: "com.screencap.macos.permissionSetupDismissed"))
+
+        // MainWindow consumes the latch after presenting so it doesn't
+        // re-present on a later view update.
+        permissions.consumeReopenSetupRequest()
+        XCTAssertFalse(permissions.reopenSetupRequested)
+        XCTAssertTrue(permissions.setupDismissed)
+    }
+
+    @MainActor
     func testDaemonGrantPerPaneMappingExcludesMicrophone() {
         let (permissions, _) = makeController()
         permissions.updateDaemonGrants(

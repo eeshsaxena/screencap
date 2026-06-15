@@ -224,6 +224,30 @@ final class PermissionController: ObservableObject {
         }
     }
 
+    /// Set when the user explicitly asks to re-open the first-run walkthrough
+    /// from a recovery affordance (the Privacy tab's "Finish setup" entry point),
+    /// as opposed to the launch gate, which `setupDismissed` suppresses. Without
+    /// this, a mistaken "Skip for now" is unrecoverable: the launch gate never
+    /// re-pops, and the daemon-grant auto-clear (`updateDaemonGrants`) can never
+    /// fire while the daemon stays uninstalled (the CLI-fallback path you land on
+    /// when you skip the install step). MainWindow observes this, presents the
+    /// sheet, then calls `consumeReopenSetupRequest()`.
+    @Published private(set) var reopenSetupRequested: Bool = false
+
+    /// User asked to re-open the walkthrough (recovery entry point). Deliberately
+    /// does NOT clear `setupDismissed`: only *completing* setup re-arms the gate
+    /// (daemon grants landing → `updateDaemonGrants`), so the launch behavior is
+    /// unchanged for users who never touch this affordance.
+    func requestReopenSetup() {
+        reopenSetupRequested = true
+    }
+
+    /// MainWindow calls this once it has presented the sheet, so the latched flag
+    /// doesn't re-present on a later view update.
+    func consumeReopenSetupRequest() {
+        reopenSetupRequested = false
+    }
+
     /// Persist that the user dismissed the permission walkthrough ("Skip for
     /// now"). Suppresses the launch gate; does NOT affect the start-block.
     func markSetupDismissed() {

@@ -275,6 +275,23 @@ struct RecordingStateMachine {
             // Keep any prior user-facing warning.
         } else {
             switch exitCode {
+            case 1:
+                // Exit 1 is the engine's "generic failure" code, but on the
+                // CLI-fallback path it is overwhelmingly the start-time
+                // permission preflight bailing — `recorder.py`'s
+                // `_check_macos_permissions` raises `SystemExit(1)` when Screen
+                // Recording / Accessibility / Input Monitoring isn't granted to
+                // the spawned recorder. The engine's actionable guidance is
+                // printed to a console the app never sees, so the bare
+                // "Recorder exited with code 1" was a dead end. Surface a
+                // self-actionable message that points at the recovery entry
+                // point instead. (A genuine non-permission startup crash also
+                // exits 1; the wording stays hedged so it isn't a false claim.)
+                effects.append(.surfaceError(
+                    "Recording couldn't start. This usually means Screen Recording, "
+                    + "Accessibility, or Input Monitoring isn't granted to the recorder — "
+                    + "open the Privacy tab and choose \"Finish setup\" to grant them."
+                ))
             case 2:
                 effects.append(.surfaceError("ScreenCap is already recording."))
             case 3:

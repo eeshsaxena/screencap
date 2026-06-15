@@ -122,6 +122,15 @@ struct MainWindow: View {
             // daemon path is satisfied.
             updateFirstRunSheetPresentation()
         }
+        .onChange(of: permissions.reopenSetupRequested) { requested in
+            // Explicit user recovery action ("Finish setup" in the Privacy tab):
+            // present the walkthrough even though `setupDismissed` would suppress
+            // the launch gate. This is the way back from a mistaken "Skip for
+            // now". Consume the latch so it doesn't re-present on later updates.
+            guard requested else { return }
+            showingPermissionsSheet = true
+            permissions.consumeReopenSetupRequest()
+        }
         .onChange(of: section) { new in
             // Intentionally one-directional. We only clear the date filter
             // when leaving the recordings section, not when re-entering it

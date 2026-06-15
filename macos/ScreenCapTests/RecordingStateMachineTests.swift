@@ -358,6 +358,25 @@ final class RecordingStateMachineTests: XCTestCase {
         }
     }
 
+    func testProcessTerminatedExitCode1SurfacesActionablePermissionHint() {
+        var machine = RecordingStateMachine()
+
+        let effects = machine.processTerminated(exitCode: 1)
+
+        // Exit 1 (CLI-fallback) is overwhelmingly the start-time permission
+        // preflight bailing; the surfaced message must be self-actionable —
+        // naming the permissions and pointing at the "Finish setup" recovery —
+        // rather than the old dead-end "Recorder exited with code 1".
+        let surfaced = effects.compactMap { effect -> String? in
+            if case let .surfaceError(message) = effect { return message }
+            return nil
+        }
+        XCTAssertEqual(surfaced.count, 1)
+        XCTAssertTrue(surfaced[0].contains("Screen Recording"))
+        XCTAssertTrue(surfaced[0].contains("Finish setup"))
+        XCTAssertFalse(surfaced[0].contains("exited with code"))
+    }
+
     func testProcessTerminatedExitCode2SurfacesAlreadyRecording() {
         var machine = RecordingStateMachine()
 
