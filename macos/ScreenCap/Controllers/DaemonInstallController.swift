@@ -40,6 +40,15 @@ protocol DaemonProbe {
 }
 
 @MainActor
+protocol DaemonTerminator {
+    /// Force-terminate the launchd-managed daemon (`launchctl bootout`) so a
+    /// stale/squatting process releases api.sock before the reinstall
+    /// re-registers (SCR-135). Idempotent: a not-loaded label is a successful
+    /// no-op. Must never throw — bootout is best-effort cleanup.
+    func bootout() async
+}
+
+@MainActor
 final class DaemonInstallController: ObservableObject {
     enum State: Equatable {
         case idle
@@ -70,24 +79,36 @@ final class DaemonInstallController: ObservableObject {
 
     private let registrationService: DaemonRegistrationService
     private let probe: DaemonProbe
+    /// Force-terminates a stale/squatting daemon (`launchctl bootout`) so it
+    /// releases api.sock before the reinstall re-registers (SCR-135). A fresh
+    /// daemon cannot bind while the old one answers (`socket.py`
+    /// `DaemonAlreadyRunning`), so re-registration alone does not dislodge it.
+    private let terminator: DaemonTerminator
     /// The daemon version this app bundles, used to reject a reachable-but-stale
     /// daemon (SCR-121). nil means "could not determine" — the version gate then
     /// fails safe to the historical reachable-implies-running behavior.
     private let expectedDaemonVersion: String?
     private let sleep: (UInt64) async -> Void
+    /// Injectable clock so the poll deadline is deterministic under test: the
+    /// convergence budget (SCR-135) advances it through the stubbed `sleep`.
+    private let now: () -> Date
 
     init(
         registrationService: DaemonRegistrationService = SMAppServiceRegistration(),
         probe: DaemonProbe = LiveDaemonProbe(),
+        terminator: DaemonTerminator = LaunchctlDaemonTerminator(),
         expectedDaemonVersion: String? = BundledDaemonVersion.expected(),
         sleep: @escaping (UInt64) async -> Void = { nanoseconds in
             try? await Task.sleep(nanoseconds: nanoseconds)
-        }
+        },
+        now: @escaping () -> Date = Date.init
     ) {
         self.registrationService = registrationService
         self.probe = probe
+        self.terminator = terminator
         self.expectedDaemonVersion = expectedDaemonVersion
         self.sleep = sleep
+        self.now = now
     }
 
     func install(
@@ -169,7 +190,15 @@ final class DaemonInstallController: ObservableObject {
     ) async {
         switch status {
         case .enabled:
-            let outcome = await pollDaemon(timeoutSeconds: timeoutSeconds, probeIntervalSeconds: probeIntervalSeconds)
+            // The post-refresh poll (allowRegistrationRefresh == false) runs while
+            // a daemon swap is in flight, so it gets a convergence budget for a
+            // lingering version mismatch (SCR-135). The first poll fails the
+            // mismatch fast so the reinstall starts promptly.
+            let outcome = await pollDaemon(
+                timeoutSeconds: timeoutSeconds,
+                probeIntervalSeconds: probeIntervalSeconds,
+                convergeOnMismatch: !allowRegistrationRefresh
+            )
             switch outcome {
             case .running:
                 break  // pollDaemon set .installedAndRunning and posted the notice
@@ -188,7 +217,13 @@ final class DaemonInstallController: ObservableObject {
                 // still answers with the wrong version, surface it rather than
                 // silently driving the old daemon (SCR-121).
                 if allowRegistrationRefresh {
-                    daemonInstallLogger.error("Reachable daemon version \(running, privacy: .public) != expected \(self.expectedDaemonVersion ?? "unknown", privacy: .public); attempting reinstall")
+                    daemonInstallLogger.error("Reachable daemon version \(running, privacy: .public) != expected \(self.expectedDaemonVersion ?? "unknown", privacy: .public); dislodging stale daemon and reinstalling")
+                    // unregister()/register() alone does not reliably evict the
+                    // squatter (it is async and the daemon's ExitTimeOut is 30s),
+                    // and a fresh daemon cannot bind while the old one answers
+                    // (SCR-135). Bootout first so the socket is free, mirroring
+                    // reconcile_daemon_version in build_and_run.sh.
+                    await terminator.bootout()
                     await refreshRegistrationAfterFailedPoll(
                         timeoutSeconds: timeoutSeconds,
                         probeIntervalSeconds: probeIntervalSeconds,
@@ -270,9 +305,17 @@ final class DaemonInstallController: ObservableObject {
         case timedOut                         // never became reachable
     }
 
-    private func pollDaemon(timeoutSeconds: TimeInterval, probeIntervalSeconds: TimeInterval) async -> DaemonPollOutcome {
+    private func pollDaemon(
+        timeoutSeconds: TimeInterval,
+        probeIntervalSeconds: TimeInterval,
+        convergeOnMismatch: Bool
+    ) async -> DaemonPollOutcome {
         state = .polling
-        let deadline = Date().addingTimeInterval(timeoutSeconds)
+        let deadline = now().addingTimeInterval(timeoutSeconds)
+        // Last wrong version seen, so a mismatch that is momentarily unreachable
+        // at the exact deadline tick still resolves to .versionMismatch rather
+        // than a misleading .timedOut (SCR-135).
+        var lastMismatch: String?
         while true {
             if let version = await probe.probe(timeout: min(1, max(0.1, probeIntervalSeconds))) {
                 // "Socket reachable" is necessary but NOT sufficient (SCR-121): a
@@ -282,13 +325,28 @@ final class DaemonInstallController: ObservableObject {
                 // to the historical reachable-implies-running behavior rather than
                 // risk a false "out of date" on a healthy daemon.
                 if let expected = expectedDaemonVersion, version != expected {
+                    // A daemon swap is not instantaneous: after a reinstall the
+                    // stale daemon can keep answering until it exits and the fresh
+                    // one binds api.sock. Give that swap a convergence budget
+                    // instead of failing on the first probe (SCR-135), mirroring
+                    // the existing reachability budget below. The first poll
+                    // (convergeOnMismatch == false) still fails fast to trigger
+                    // the reinstall promptly.
+                    if convergeOnMismatch, now() < deadline {
+                        lastMismatch = version
+                        await sleep(Self.nanoseconds(for: probeIntervalSeconds))
+                        continue
+                    }
                     return .versionMismatch(running: version)
                 }
                 state = .installedAndRunning
                 NotificationCenter.default.post(name: .screenCapDaemonInstalledAndRunning, object: nil)
                 return .running
             }
-            if Date() >= deadline {
+            if now() >= deadline {
+                if let lastMismatch {
+                    return .versionMismatch(running: lastMismatch)
+                }
                 let seconds = Int(timeoutSeconds)
                 state = .pollingFailed(reason: "Daemon did not respond within \(seconds)s")
                 return .timedOut
@@ -385,6 +443,48 @@ final class LiveDaemonProbe: DaemonProbe {
         } catch {
             daemonInstallLogger.debug("daemon.info probe failed: \(String(describing: error), privacy: .public)")
             return nil
+        }
+    }
+}
+
+/// Evicts a stale/squatting daemon via `launchctl bootout` so it releases
+/// api.sock before the reinstall re-registers (SCR-135). Mirrors the
+/// `reconcile_daemon_version` dislodge in `build_and_run.sh`.
+@MainActor
+final class LaunchctlDaemonTerminator: DaemonTerminator {
+    func bootout() async {
+        // Never bootout from the test host process — the unit tests inject a
+        // fake terminator; this guard is defense-in-depth against a missed
+        // injection accidentally tearing down a developer's real daemon.
+        guard ProcessInfo.processInfo.environment["XCTestConfigurationFilePath"] == nil else { return }
+
+        let process = Process()
+        process.executableURL = URL(fileURLWithPath: "/bin/launchctl")
+        process.arguments = ["bootout", "gui/\(getuid())/com.screencap.daemon"]
+        process.standardInput = FileHandle.nullDevice
+        process.standardOutput = Pipe()
+        let stderrPipe = Pipe()
+        process.standardError = stderrPipe
+        do {
+            try process.run()
+            await withCheckedContinuation { (continuation: CheckedContinuation<Void, Never>) in
+                DispatchQueue.global(qos: .userInitiated).async {
+                    process.waitUntilExit()
+                    continuation.resume()
+                }
+            }
+            // `bootout` exits non-zero when the label simply isn't loaded — the
+            // desired end state, not a failure. Only log real failures (the
+            // label persists), since a still-registered squatter blocks the
+            // fresh daemon from binding.
+            if process.terminationStatus != 0 {
+                let stderr = (try? stderrPipe.fileHandleForReading.readToEnd())
+                    .flatMap { String(data: $0, encoding: .utf8) }?
+                    .trimmingCharacters(in: .whitespacesAndNewlines)
+                daemonInstallLogger.debug("launchctl bootout exit \(process.terminationStatus, privacy: .public): \(stderr ?? "", privacy: .public)")
+            }
+        } catch {
+            daemonInstallLogger.debug("launchctl bootout spawn failed: \(String(describing: error), privacy: .public)")
         }
     }
 }
