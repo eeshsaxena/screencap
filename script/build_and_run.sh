@@ -346,12 +346,18 @@ running_daemon_version() {
   sed -n 's/.*"daemon_version"[[:space:]]*:[[:space:]]*"\([^"]*\)".*/\1/p' <<<"$body"
 }
 
+cli_version_from_binary() {
+  # parse must match daemon.info.daemon_version; keep in sync with the sibling
+  # script's copy (macos/ScreenCap/Scripts/embed-cli.sh `cli_version_from_binary`).
+  "$1" --version 2>/dev/null | awk 'NF {print $NF}'
+}
+
 fresh_daemon_version() {
   # The version the freshly built bundle would run (bundled mode only — callers
   # skip reconciliation in dev-source mode). Empty if it can't be determined.
   # `screencap --version` prints "screencap, version X.Y.Z"; keep the last field.
   [[ -x "$CLI_BINARY" ]] || return 0
-  "$CLI_BINARY" --version 2>/dev/null | awk 'NF {print $NF}'
+  cli_version_from_binary "$CLI_BINARY"
 }
 
 reconcile_daemon_version() {
@@ -383,8 +389,16 @@ reconcile_daemon_version() {
   echo "warning: a stale ScreenCap daemon (version $running) is running, but this" >&2
   echo "warning: build bundles version $fresh. Dislodging the stale helper so the" >&2
   echo "warning: freshly built app reinstalls its own daemon on launch." >&2
-  echo "warning: (manual recovery: launchctl bootout gui/$uid/com.screencap.daemon)" >&2
-  /bin/launchctl bootout "gui/$uid/com.screencap.daemon" >/dev/null 2>&1 || true
+  # `launchctl bootout` returns non-zero when the label simply isn't loaded —
+  # that is the desired end state, not a failure. Distinguish a real bootout
+  # failure (label still registered) from "already gone" via `launchctl print`,
+  # and only surface the manual-recovery hint when the stale daemon persists.
+  if /bin/launchctl bootout "gui/$uid/com.screencap.daemon" >/dev/null 2>&1; then
+    : # dislodged
+  elif /bin/launchctl print "gui/$uid/com.screencap.daemon" >/dev/null 2>&1; then
+    echo "warning: launchctl bootout failed; the stale daemon may still be registered." >&2
+    echo "warning: manual recovery: launchctl bootout gui/$uid/com.screencap.daemon && ./script/build_and_run.sh" >&2
+  fi
 }
 
 confirm_fresh_daemon() {

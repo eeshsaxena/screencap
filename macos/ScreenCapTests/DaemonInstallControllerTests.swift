@@ -173,6 +173,14 @@ final class DaemonInstallControllerTests: XCTestCase {
     }
 
     func testReinstallRecoversWhenFreshDaemonReportsExpectedVersion() async {
+        let expectation = expectation(description: "daemon installed notification")
+        let observer = NotificationCenter.default.addObserver(
+            forName: .screenCapDaemonInstalledAndRunning,
+            object: nil,
+            queue: .main
+        ) { _ in expectation.fulfill() }
+        defer { NotificationCenter.default.removeObserver(observer) }
+
         let registration = FakeDaemonRegistrationService(
             registerStatuses: [.enabled],
             refreshStatuses: [.enabled]
@@ -191,6 +199,7 @@ final class DaemonInstallControllerTests: XCTestCase {
 
         XCTAssertEqual(registration.refreshedPlistNames, [DaemonInstallController.plistName])
         XCTAssertEqual(controller.state, .installedAndRunning)
+        await fulfillment(of: [expectation], timeout: 1)
     }
 
     func testReachableDaemonWithMatchingVersionInstallsWithoutRefresh() async {

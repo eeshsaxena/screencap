@@ -116,6 +116,12 @@ ditto "${SOURCE_DIR}" "${DEST_DIR}"
 
 echo "Embedded screencap CLI from ${SOURCE_DIR} -> ${DEST_DIR}"
 
+cli_version_from_binary() {
+    # parse must match daemon.info.daemon_version; keep in sync with the sibling
+    # script's copy (script/build_and_run.sh `cli_version_from_binary`).
+    "$1" --version 2>/dev/null | awk 'NF {print $NF}'
+}
+
 stamp_bundled_cli_version() {
     # Record the bundled CLI's version next to it so DaemonInstallController can
     # tell, at install time, whether the daemon answering api.sock is actually
@@ -128,7 +134,7 @@ stamp_bundled_cli_version() {
     # `|| true`: under `set -euo pipefail` a non-zero `screencap --version`
     # (broken bundle) would otherwise abort the build at this assignment instead
     # of reaching the safe-fallback `else` below.
-    version="$("${DEST_DIR}/screencap" --version 2>/dev/null | awk 'NF {print $NF}' || true)"
+    version="$(cli_version_from_binary "${DEST_DIR}/screencap" || true)"
     if [ -n "${version}" ]; then
         printf '%s' "${version}" >"${version_file}"
         echo "Stamped bundled CLI version ${version} -> ${version_file}"
