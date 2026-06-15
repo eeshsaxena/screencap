@@ -658,27 +658,30 @@ final class PermissionController: ObservableObject {
     /// True when the running bundle has no Team Identifier — i.e. it is ad-hoc
     /// signed or unsigned. Apple Development, Developer ID, and App Store builds
     /// all carry a team id, so this is false for every release artifact and any
-    /// dev build signed with `DEVELOPMENT_TEAM` set. Fails closed to `false`
-    /// (assume properly signed) on any Security API error so a probe hiccup
-    /// never shows the dev hint on a real user's machine.
+    /// dev build signed with `DEVELOPMENT_TEAM` set.
+    ///
+    /// Fails closed to `false` (assume properly signed) on any Security API
+    /// error so a probe hiccup never shows the dev hint on a real user's
+    /// machine. Crucially, the fail-closed path is distinct from the genuine
+    /// "ad-hoc" verdict: we return `true` ONLY when the signing information was
+    /// read successfully AND `kSecCodeInfoTeamIdentifier` is genuinely absent.
+    /// Any SecCode* guard failure (a transient Security-API error, an
+    /// unreadable record) returns `false` rather than mislabelling a properly
+    /// signed build as ad-hoc.
     nonisolated static func detectAdHocSigned() -> Bool {
-        currentTeamIdentifier() == nil
-    }
-
-    /// The running bundle's Team Identifier via the code-signing record, or nil
-    /// when ad-hoc/unsigned (or unreadable).
-    nonisolated static func currentTeamIdentifier() -> String? {
         var codeRef: SecCode?
         guard SecCodeCopySelf(SecCSFlags(), &codeRef) == errSecSuccess,
-              let codeRef else { return nil }
+              let codeRef else { return false }
         var staticRef: SecStaticCode?
         guard SecCodeCopyStaticCode(codeRef, SecCSFlags(), &staticRef) == errSecSuccess,
-              let staticRef else { return nil }
+              let staticRef else { return false }
         var infoRef: CFDictionary?
         let flags = SecCSFlags(rawValue: UInt32(kSecCSSigningInformation))
         guard SecCodeCopySigningInformation(staticRef, flags, &infoRef) == errSecSuccess,
-              let info = infoRef as? [String: Any] else { return nil }
-        return info[kSecCodeInfoTeamIdentifier as String] as? String
+              let info = infoRef as? [String: Any] else { return false }
+        // Signing info read successfully: a missing team id is a genuine ad-hoc
+        // verdict (true); a present one is a properly signed build (false).
+        return (info[kSecCodeInfoTeamIdentifier as String] as? String) == nil
     }
 
     nonisolated static func relaunchHelperShellScript(

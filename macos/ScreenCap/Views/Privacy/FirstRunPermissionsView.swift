@@ -134,6 +134,10 @@ struct FirstRunPermissionsView: View {
                 .font(.system(size: 16))
                 .foregroundStyle(.orange)
                 .padding(.top, 2)
+                // Decorative — the adjacent warning text conveys the full
+                // meaning, so keep VoiceOver from announcing the symbol as a
+                // separate, content-free focus stop (mirrors finishSetupBanner).
+                .accessibilityHidden(true)
             Text(PermissionController.adHocDevBuildWarning)
                 .font(.caption)
                 .foregroundStyle(.secondary)

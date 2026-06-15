@@ -253,6 +253,19 @@ struct RecordingStateMachine {
     /// awaiting one-shot continuations and maps exit codes to user-facing
     /// messages.
     mutating func processTerminated(exitCode: Int32) -> [Effect] {
+        // Capture whether the engine was already mid-recording BEFORE we idle
+        // below. `.recording` / `.stopping` mean a `started` event was already
+        // observed, so a non-zero exit now is a force-quit / mid-recording
+        // crash — NOT a start-time failure. `.starting` (and `.idle`, the spawn
+        // window before `started`) is the genuine start-time window where the
+        // permission preflight is the dominant cause. Used by the exit-1 branch
+        // below to avoid a false start-time permission message.
+        let wasActivelyRecording: Bool
+        switch state {
+        case .recording, .stopping: wasActivelyRecording = true
+        case .idle, .starting: wasActivelyRecording = false
+        }
+
         recordingStartedAt = nil
 
         var effects: [Effect] = [
@@ -276,8 +289,8 @@ struct RecordingStateMachine {
         } else {
             switch exitCode {
             case 1:
-                // Exit 1 is the engine's "generic failure" code, but on the
-                // CLI-fallback path it is overwhelmingly the start-time
+                // Exit 1 is the engine's "generic failure" code. On the
+                // CLI-fallback path at START TIME it is overwhelmingly the
                 // permission preflight bailing — `recorder.py`'s
                 // `_check_macos_permissions` raises `SystemExit(1)` when Screen
                 // Recording / Accessibility / Input Monitoring isn't granted to
@@ -287,11 +300,35 @@ struct RecordingStateMachine {
                 // self-actionable message that points at the recovery entry
                 // point instead. (A genuine non-permission startup crash also
                 // exits 1; the wording stays hedged so it isn't a false claim.)
-                effects.append(.surfaceError(
-                    "Recording couldn't start. This usually means Screen Recording, "
-                    + "Accessibility, or Input Monitoring isn't granted to the recorder — "
-                    + "open the Privacy tab and choose \"Finish setup\" to grant them."
-                ))
+                //
+                // But exit 1 ALSO fires when a process that was already
+                // recording dies (force-quit, mid-recording crash). In that
+                // case the start-time permission story is simply wrong — the
+                // recorder had already cleared preflight and produced a
+                // `started` event — and last-writer-wins on `lastError` would
+                // clobber the real reason a prior event (e.g. `permission_lost`,
+                // `disk_full`) may have already surfaced this session. So gate
+                // the permission hint on the start-time window and fall back to
+                // a neutral message otherwise. Distinguishing the non-permission
+                // start-time causes (disk-low, import failure, …) needs a
+                // precise per-cause signal that is deliberately deferred to
+                // SCR-142; until then the hedged start-time wording stands.
+                //
+                // The copy points at "the Privacy tab" generically rather than
+                // naming the conditional "Finish setup" button, which renders
+                // only when first-run setup was explicitly skipped — so a user
+                // who never skipped (ad-hoc-orphaned grant, or any indeterminate
+                // CLI-fallback exit-1) isn't pointed at a control that isn't on
+                // screen. The Privacy tab is always reachable from the sidebar.
+                if wasActivelyRecording {
+                    effects.append(.surfaceError("Recorder exited with code 1."))
+                } else {
+                    effects.append(.surfaceError(
+                        "Recording couldn't start. This usually means Screen Recording, "
+                        + "Accessibility, or Input Monitoring isn't granted to the recorder — "
+                        + "open the Privacy tab to review and grant them."
+                    ))
+                }
             case 2:
                 effects.append(.surfaceError("ScreenCap is already recording."))
             case 3:

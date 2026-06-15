@@ -360,21 +360,45 @@ final class RecordingStateMachineTests: XCTestCase {
 
     func testProcessTerminatedExitCode1SurfacesActionablePermissionHint() {
         var machine = RecordingStateMachine()
+        // Start-time window: a `started` event was never observed, so the
+        // machine is in `.starting` (or `.idle`). Exit 1 here is overwhelmingly
+        // the start-time permission preflight bailing; the surfaced message must
+        // be self-actionable — naming the permissions and pointing at the always
+        // -reachable Privacy tab — rather than the old dead-end "Recorder exited
+        // with code 1".
+        _ = machine.enterStarting()
 
         let effects = machine.processTerminated(exitCode: 1)
 
-        // Exit 1 (CLI-fallback) is overwhelmingly the start-time permission
-        // preflight bailing; the surfaced message must be self-actionable —
-        // naming the permissions and pointing at the "Finish setup" recovery —
-        // rather than the old dead-end "Recorder exited with code 1".
         let surfaced = effects.compactMap { effect -> String? in
             if case let .surfaceError(message) = effect { return message }
             return nil
         }
         XCTAssertEqual(surfaced.count, 1)
         XCTAssertTrue(surfaced[0].contains("Screen Recording"))
-        XCTAssertTrue(surfaced[0].contains("Finish setup"))
+        XCTAssertTrue(surfaced[0].contains("Privacy tab"))
         XCTAssertFalse(surfaced[0].contains("exited with code"))
+    }
+
+    func testProcessTerminatedExitCode1WhileRecordingDoesNotSurfacePermissionHint() {
+        // A process that exits 1 while ALREADY recording (force-quit /
+        // mid-recording crash) is NOT a start-time failure — it already cleared
+        // the permission preflight and produced a `started` event. The
+        // start-time permission hint would be a false claim, so we surface a
+        // neutral message instead.
+        var machine = RecordingStateMachine()
+        machine.forceState(.recording(elapsed: 12))
+
+        let effects = machine.processTerminated(exitCode: 1)
+
+        XCTAssertEqual(machine.state, .idle)
+        let surfaced = effects.compactMap { effect -> String? in
+            if case let .surfaceError(message) = effect { return message }
+            return nil
+        }
+        XCTAssertEqual(surfaced, ["Recorder exited with code 1."])
+        XCTAssertFalse(surfaced[0].contains("Screen Recording"))
+        XCTAssertFalse(surfaced[0].contains("Privacy tab"))
     }
 
     func testProcessTerminatedExitCode2SurfacesAlreadyRecording() {
