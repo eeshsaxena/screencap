@@ -42,6 +42,10 @@ struct FirstRunPermissionsView: View {
                     .foregroundStyle(.secondary)
             }
 
+            if permissions.showAdHocDevBuildWarning {
+                adHocDevBuildCallout
+            }
+
             if !isDaemonInstallComplete {
                 daemonInstallStep
             } else {
@@ -116,6 +120,31 @@ struct FirstRunPermissionsView: View {
         .onDisappear {
             permissions.stopDaemonGrantWatching()
         }
+    }
+
+    /// Developer-only hint: on an ad-hoc build, TCC grants are orphaned on every
+    /// rebuild, so the rows can read "needs action" even though System Settings
+    /// shows an earlier build as granted. Explains the cause and the fix so a
+    /// developer doesn't chase a phantom permission bug. Never renders on a
+    /// signed build (see `PermissionController.showAdHocDevBuildWarning`).
+    @ViewBuilder
+    private var adHocDevBuildCallout: some View {
+        HStack(alignment: .top, spacing: 10) {
+            Image(systemName: "hammer.fill")
+                .font(.system(size: 16))
+                .foregroundStyle(.orange)
+                .padding(.top, 2)
+            Text(PermissionController.adHocDevBuildWarning)
+                .font(.caption)
+                .foregroundStyle(.secondary)
+                .fixedSize(horizontal: false, vertical: true)
+            Spacer(minLength: 0)
+        }
+        .padding(12)
+        .background(
+            RoundedRectangle(cornerRadius: 10)
+                .fill(Color.orange.opacity(0.12))
+        )
     }
 
     @ViewBuilder

@@ -6,6 +6,7 @@ import CoreGraphics
 import Foundation
 import IOKit
 import IOKit.hid
+import Security
 import os
 
 private let permissionLogger = Logger(subsystem: "com.screencap.macos", category: "permission")
@@ -154,6 +155,16 @@ final class PermissionController: ObservableObject {
     /// so the walkthrough view reacts without owning the guard itself.
     @Published private(set) var daemonRegistrationInFlight: Set<PrivacyPane> = []
 
+    /// True when the running app is ad-hoc signed (no Team Identifier). On such
+    /// builds macOS re-keys TCC on every rebuild's changing signature, so prior
+    /// Screen Recording / Accessibility / Input Monitoring grants are orphaned
+    /// and the app reads "denied" even while System Settings still shows an old
+    /// build as granted. Used purely to surface a dev-only hint — it never
+    /// affects gating or the real OS-enforced permission state. Signed builds
+    /// (Apple Development / Developer ID / App Store) always have a team id, so
+    /// this is false for every release artifact. Injected for tests.
+    let isAdHocBuild: Bool
+
     private let defaults: UserDefaults
     private static let setupDismissedDefaultsKey = "com.screencap.macos.permissionSetupDismissed"
 
@@ -203,6 +214,25 @@ final class PermissionController: ObservableObject {
             || accessibility == .denied
             || inputMonitoring == .denied
     }
+
+    /// Dev-only hint shown to explain the "System Settings says granted but the
+    /// app says denied" confusion that ad-hoc builds cause. Gated on an *actual*
+    /// denial (daemon- or app-process-reported) so a fully-granted ad-hoc build
+    /// stays quiet. Never shown on signed builds. See `adHocDevBuildWarning`.
+    var showAdHocDevBuildWarning: Bool {
+        isAdHocBuild && (daemonGrants.anyRequiredDenied || anyDenied)
+    }
+
+    /// Copy for the ad-hoc dev-build hint. Names the cause (signature changes on
+    /// every rebuild orphan the grant) and both fixes (stable `DEVELOPMENT_TEAM`
+    /// signing, or reset + re-grant). Intentionally developer-facing — it only
+    /// ever renders on an unsigned local build.
+    static let adHocDevBuildWarning =
+        "Ad-hoc dev build: macOS ties permission grants to the app's code "
+        + "signature, which changes on every rebuild — so System Settings may "
+        + "show an earlier build as granted while this one reads denied. Build "
+        + "with DEVELOPMENT_TEAM set for stable signing, or run "
+        + "`tccutil reset All com.screencap.macos` and grant again."
 
     /// All three required *daemon* grants are confirmed granted (microphone
     /// excluded). Drives the walkthrough's "all done" / auto-close path (U5).
@@ -281,12 +311,14 @@ final class PermissionController: ObservableObject {
     init(
         defaults: UserDefaults = .standard,
         daemonRegistrar: DaemonPermissionRegistrar? = nil,
-        daemonSettingsOpener: (@MainActor (PrivacyPane) -> Void)? = nil
+        daemonSettingsOpener: (@MainActor (PrivacyPane) -> Void)? = nil,
+        isAdHocBuild: Bool = PermissionController.detectAdHocSigned()
     ) {
         self.defaults = defaults
         self.setupDismissed = defaults.bool(forKey: Self.setupDismissedDefaultsKey)
         self.injectedDaemonRegistrar = daemonRegistrar
         self.injectedDaemonSettingsOpener = daemonSettingsOpener
+        self.isAdHocBuild = isAdHocBuild
     }
 
     nonisolated deinit {
@@ -621,6 +653,32 @@ final class PermissionController: ObservableObject {
         case .notDetermined:     return .notDetermined
         @unknown default:        return .notDetermined
         }
+    }
+
+    /// True when the running bundle has no Team Identifier — i.e. it is ad-hoc
+    /// signed or unsigned. Apple Development, Developer ID, and App Store builds
+    /// all carry a team id, so this is false for every release artifact and any
+    /// dev build signed with `DEVELOPMENT_TEAM` set. Fails closed to `false`
+    /// (assume properly signed) on any Security API error so a probe hiccup
+    /// never shows the dev hint on a real user's machine.
+    nonisolated static func detectAdHocSigned() -> Bool {
+        currentTeamIdentifier() == nil
+    }
+
+    /// The running bundle's Team Identifier via the code-signing record, or nil
+    /// when ad-hoc/unsigned (or unreadable).
+    nonisolated static func currentTeamIdentifier() -> String? {
+        var codeRef: SecCode?
+        guard SecCodeCopySelf(SecCSFlags(), &codeRef) == errSecSuccess,
+              let codeRef else { return nil }
+        var staticRef: SecStaticCode?
+        guard SecCodeCopyStaticCode(codeRef, SecCSFlags(), &staticRef) == errSecSuccess,
+              let staticRef else { return nil }
+        var infoRef: CFDictionary?
+        let flags = SecCSFlags(rawValue: UInt32(kSecCSSigningInformation))
+        guard SecCodeCopySigningInformation(staticRef, flags, &infoRef) == errSecSuccess,
+              let info = infoRef as? [String: Any] else { return nil }
+        return info[kSecCodeInfoTeamIdentifier as String] as? String
     }
 
     nonisolated static func relaunchHelperShellScript(
