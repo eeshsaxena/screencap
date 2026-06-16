@@ -1384,6 +1384,65 @@ def test_smoke_test_exits_zero_on_all_pass():
     assert "dev install" in result.output
 
 
+# --- _auth-config-check command tests (U2 fail-closed release guard) ---
+
+
+def test_auth_config_check_hidden_from_help():
+    """_auth-config-check should not appear in --help output."""
+    runner = CliRunner()
+    result = runner.invoke(cli, ["--help"])
+    assert result.exit_code == 0
+    assert "_auth-config-check" not in result.output
+
+
+def test_auth_config_check_passes_when_provisioned():
+    """Exit 0 when creds resolve to non-placeholder values (env-injected here)."""
+    runner = CliRunner()
+    result = runner.invoke(
+        cli,
+        ["_auth-config-check"],
+        env={
+            "SCREENCAP_RELEASE_BUILD": "1",
+            "SCREENCAP_FIREBASE_API_KEY": "AIzaSyRealLookingWebKey",
+            "SCREENCAP_OAUTH_CLIENT_ID": "123456789.apps.googleusercontent.com",
+        },
+    )
+    assert result.exit_code == 0
+    assert "provisioned" in result.output
+
+
+def test_auth_config_check_fails_release_build_with_placeholders():
+    """Exit non-zero when a release build resolves the REPLACE_WITH_PROVISIONED_* sentinels."""
+    runner = CliRunner()
+    result = runner.invoke(
+        cli,
+        ["_auth-config-check"],
+        env={
+            "SCREENCAP_RELEASE_BUILD": "1",
+            "SCREENCAP_FIREBASE_API_KEY": None,
+            "SCREENCAP_OAUTH_CLIENT_ID": None,
+        },
+    )
+    assert result.exit_code == 1
+    assert "FAILED" in result.output
+
+
+def test_auth_config_check_passes_dev_build_with_placeholders():
+    """PR/dev builds (SCREENCAP_RELEASE_BUILD unset) stay green with placeholders."""
+    runner = CliRunner()
+    result = runner.invoke(
+        cli,
+        ["_auth-config-check"],
+        env={
+            "SCREENCAP_RELEASE_BUILD": None,
+            "SCREENCAP_FIREBASE_API_KEY": None,
+            "SCREENCAP_OAUTH_CLIENT_ID": None,
+        },
+    )
+    assert result.exit_code == 0
+    assert "dev/PR build" in result.output
+
+
 def _collect_followup_output(recording_name, capture_dir):
     """Run print_upload_followup and return the joined console.print args."""
     from screencap.recorder import print_upload_followup

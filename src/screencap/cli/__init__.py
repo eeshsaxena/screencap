@@ -4200,6 +4200,67 @@ def smoke_test(verbose):
 
 
 # ---------------------------------------------------------------------------
+# _auth-config-check (hidden) — fail-closed release guard for credential injection
+# ---------------------------------------------------------------------------
+
+
+def _is_placeholder_credential(value: str) -> bool:
+    """A credential is unprovisioned if it still carries the source sentinel."""
+    return value.startswith("REPLACE_WITH_PROVISIONED")
+
+
+@cli.command("_auth-config-check", hidden=True)
+def auth_config_check() -> None:
+    """Fail a RELEASE build whose resolved cloud-auth creds are still placeholders.
+
+    The single fail-closed guard for build-time credential injection (U2). Run by
+    the release job against the BUILT binary, after scripts/generate_provisioned.py:
+    if the injected screencap._provisioned module is missing/empty, auth's resolvers
+    fall back to the REPLACE_WITH_PROVISIONED_* sentinels and every sign-in would
+    fail — so such a binary must never ship.
+
+    Enforcement is gated on the SCREENCAP_RELEASE_BUILD marker so PR/dev builds (no
+    secrets) stay green with placeholders. The tag-triggered release workflow sets
+    the marker unconditionally on every (release-only) run, making this assertion
+    unskippable on a real release.
+    """
+    from screencap import auth
+
+    checked = (
+        ("Firebase Web API key", auth._api_key()),
+        ("OAuth client id", auth._oauth_client_id()),
+    )
+    placeholders = [label for label, value in checked if _is_placeholder_credential(value)]
+    release_build = os.environ.get("SCREENCAP_RELEASE_BUILD", "").strip().lower() not in (
+        "",
+        "0",
+        "false",
+        "no",
+    )
+
+    if not placeholders:
+        console.print(
+            "[green]auth-config-check:[/green] resolved cloud-auth credentials are provisioned."
+        )
+        return
+
+    joined = ", ".join(placeholders)
+    if release_build:
+        console.print(
+            f"[red]auth-config-check FAILED:[/red] release build resolved placeholder "
+            f"credential(s): {joined}. Run scripts/generate_provisioned.py with "
+            "SCREENCAP_OAUTH_CLIENT_ID + SCREENCAP_FIREBASE_API_KEY set before the build "
+            "(see docs/runbooks/cloud-auth-setup.md)."
+        )
+        raise SystemExit(1)
+
+    console.print(
+        f"[yellow]auth-config-check:[/yellow] placeholder credential(s) present ({joined}) — "
+        "OK for a dev/PR build (SCREENCAP_RELEASE_BUILD unset). A release build fails this check."
+    )
+
+
+# ---------------------------------------------------------------------------
 # _network-dump (hidden) - inspect captured network_event rows
 # ---------------------------------------------------------------------------
 
