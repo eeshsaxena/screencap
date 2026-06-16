@@ -1,9 +1,7 @@
 """Tests for screencap CLI argument parsing."""
 
 import json
-import sys
 import time
-import types
 from contextlib import contextmanager
 from unittest import mock
 
@@ -11,6 +9,7 @@ import pytest
 from click.testing import CliRunner
 
 from screencap.cli import cli
+from tests.conftest import _fake_provisioned, _install_provisioned
 
 
 @pytest.fixture(autouse=True)
@@ -1391,27 +1390,6 @@ def test_smoke_test_exits_zero_on_all_pass():
 # The guard checks the BUNDLED creds (auth._provisioned > placeholder), ignoring the
 # env layer, so these tests inject via a fake screencap._provisioned module rather
 # than env vars — mirroring how the shipped binary resolves creds for an end user.
-
-
-def _install_provisioned(monkeypatch, mod):
-    """Install (or force-absent, when ``mod is None``) ``screencap._provisioned`` so
-    ``auth.bundled_credentials()`` resolves it. A ``None`` sys.modules entry forces
-    ImportError even if a gitignored _provisioned.py exists on disk."""
-    import screencap
-
-    if mod is None:
-        monkeypatch.delattr(screencap, "_provisioned", raising=False)
-        monkeypatch.setitem(sys.modules, "screencap._provisioned", None)
-    else:
-        monkeypatch.setattr(screencap, "_provisioned", mod, raising=False)
-        monkeypatch.setitem(sys.modules, "screencap._provisioned", mod)
-
-
-def _fake_provisioned(**attrs):
-    mod = types.ModuleType("screencap._provisioned")
-    for key, value in attrs.items():
-        setattr(mod, key, value)
-    return mod
 
 
 def test_auth_config_check_hidden_from_help():

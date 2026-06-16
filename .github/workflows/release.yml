@@ -80,13 +80,6 @@ jobs:
       - name: Build frozen binary
         run: pyinstaller pyinstaller/screencap.spec
 
-      - name: Smoke test (help)
-        run: ./dist/screencap/screencap --help
-
-      - name: Smoke test (subsystems)
-        run: ./dist/screencap/screencap _smoke-test
-        timeout-minutes: 2
-
       - name: Verify provisioned credentials (release guard)
         # Fail-closed net on the BUILT binary: assert it resolves the bundled
         # _provisioned values, not the REPLACE_WITH_PROVISIONED_* placeholders.
@@ -94,9 +87,18 @@ jobs:
         # runs on tag pushes, so the assertion is unskippable on a release. (The
         # Generate step above already fails first if a Secret is missing — this
         # also catches a bundling failure where _provisioned didn't make it in.)
+        # Runs immediately after the build and BEFORE the smoke tests so the
+        # credential-bundling check always runs and logs even if a smoke test fails.
         env:
           SCREENCAP_RELEASE_BUILD: "1"
         run: ./dist/screencap/screencap _auth-config-check
+
+      - name: Smoke test (help)
+        run: ./dist/screencap/screencap --help
+
+      - name: Smoke test (subsystems)
+        run: ./dist/screencap/screencap _smoke-test
+        timeout-minutes: 2
 
       - name: Verify deployment target (minos)
         run: |

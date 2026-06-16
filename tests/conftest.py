@@ -7,9 +7,52 @@ schema always matches production.
 
 from __future__ import annotations
 
+import sys
+import types
 from pathlib import Path
 
 import pytest
+
+# ---------------------------------------------------------------------------
+# Shared cloud-auth provisioned-module test helpers
+#
+# ``_fake_provisioned`` / ``_install_provisioned`` let a test make
+# ``from screencap import _provisioned`` resolve to a fabricated module (or
+# force-absent), without writing a gitignored ``_provisioned.py`` to disk — so
+# the suite passes whether or not an operator has generated one locally. Shared
+# between tests/test_auth.py (credential-resolution precedence) and
+# tests/test_cli.py (the ``_auth-config-check`` release guard); imported via
+# ``from tests.conftest import _fake_provisioned, _install_provisioned``.
+# ---------------------------------------------------------------------------
+
+
+def _fake_provisioned(**attrs) -> types.ModuleType:
+    mod = types.ModuleType("screencap._provisioned")
+    for key, value in attrs.items():
+        setattr(mod, key, value)
+    return mod
+
+
+def _install_provisioned(monkeypatch, mod: types.ModuleType | None) -> None:
+    """Make ``from screencap import _provisioned`` resolve to ``mod``, or raise
+    ImportError when ``mod is None`` — even if a gitignored ``_provisioned.py``
+    exists on disk (an operator may have generated one to test cloud auth locally).
+
+    Present case: setting the attribute on the package is what ``IMPORT_FROM`` checks
+    first; sys.modules is kept in sync. Absent case: a ``None`` entry in
+    ``sys.modules`` makes ``import screencap._provisioned`` raise ``ImportError``
+    regardless of any on-disk module, and the package attribute is removed so the
+    import machinery reaches that entry. monkeypatch reverts everything on teardown."""
+    import screencap
+
+    if mod is None:
+        monkeypatch.delattr(screencap, "_provisioned", raising=False)
+        # `None` in sys.modules → `import screencap._provisioned` raises ImportError
+        # even when the file exists on disk: the robust "absent" state.
+        monkeypatch.setitem(sys.modules, "screencap._provisioned", None)
+    else:
+        monkeypatch.setattr(screencap, "_provisioned", mod, raising=False)
+        monkeypatch.setitem(sys.modules, "screencap._provisioned", mod)
 
 
 # ---------------------------------------------------------------------------

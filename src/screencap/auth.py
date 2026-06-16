@@ -102,21 +102,31 @@ def _provisioned_value(attr: str) -> str | None:
 
     The ``ImportError`` catch is deliberately narrow. An absent module
     (``ModuleNotFoundError``, an ``ImportError`` subclass) is the normal
-    not-injected case → ``None`` → placeholder. But a module that is PRESENT yet
-    malformed — a syntax error (``SyntaxError``, not caught here) or one missing the
-    expected constant (``getattr`` with no default → ``AttributeError``) — raises
-    loudly rather than silently degrading to the placeholder, which the U2 build
-    guard might then ship as a broken-sign-in binary.
+    not-injected case → ``None`` → placeholder. The fail-loud / fail-closed cases:
+
+    * a module that is PRESENT but syntactically invalid (``SyntaxError``, not an
+      ``ImportError`` subclass, not caught here) → propagates loudly;
+    * a module that is PRESENT but missing the expected constant (``getattr`` with no
+      default → ``AttributeError``) → propagates loudly;
+    * a module that is PRESENT with the constant set to a non-``str`` value → ``None``
+      → placeholder, which the U2 release guard then catches (fail-closed at release).
     """
     try:
         from screencap import _provisioned
     except ImportError:
         return None
-    return getattr(_provisioned, attr)
+    # getattr WITHOUT a default: a missing constant must still raise AttributeError
+    # (loud), never degrade to the placeholder. The isinstance check applies only to
+    # a PRESENT value — a non-str constant degrades to None → placeholder → caught by
+    # the release guard, rather than flowing a bad type into a network call.
+    value = getattr(_provisioned, attr)
+    return value if isinstance(value, str) else None
 
 
 def _api_key() -> str:
     # Precedence: explicit env var > injected _provisioned value > placeholder.
+    # An empty-string env override (SCREENCAP_FIREBASE_API_KEY="") is treated as
+    # unset by design — the `or`-chain falls through to the lower layers.
     return (
         os.environ.get("SCREENCAP_FIREBASE_API_KEY")
         or _provisioned_value("FIREBASE_API_KEY")
@@ -126,6 +136,8 @@ def _api_key() -> str:
 
 def _oauth_client_id() -> str:
     # Precedence: explicit env var > injected _provisioned value > placeholder.
+    # An empty-string env override (SCREENCAP_OAUTH_CLIENT_ID="") is treated as
+    # unset by design — the `or`-chain falls through to the lower layers.
     return (
         os.environ.get("SCREENCAP_OAUTH_CLIENT_ID")
         or _provisioned_value("OAUTH_CLIENT_ID")

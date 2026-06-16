@@ -16,7 +16,7 @@ from pathlib import Path
 import pytest
 
 import screencap.auth as a
-
+from tests.conftest import _fake_provisioned, _install_provisioned
 
 # --------------------------------------------------------------------------
 # Fixtures + helpers
@@ -569,35 +569,6 @@ def test_authed_post_propagates_not_signed_in_before_any_post(monkeypatch):
 # --------------------------------------------------------------------------
 
 
-def _fake_provisioned(**attrs) -> types.ModuleType:
-    mod = types.ModuleType("screencap._provisioned")
-    for key, value in attrs.items():
-        setattr(mod, key, value)
-    return mod
-
-
-def _install_provisioned(monkeypatch, mod: types.ModuleType | None) -> None:
-    """Make ``from screencap import _provisioned`` resolve to ``mod``, or raise
-    ImportError when ``mod is None`` — even if a gitignored ``_provisioned.py``
-    exists on disk (an operator may have generated one to test cloud auth locally).
-
-    Present case: setting the attribute on the package is what ``IMPORT_FROM`` checks
-    first; sys.modules is kept in sync. Absent case: a ``None`` entry in
-    ``sys.modules`` makes ``import screencap._provisioned`` raise ``ImportError``
-    regardless of any on-disk module, and the package attribute is removed so the
-    import machinery reaches that entry. monkeypatch reverts everything on teardown."""
-    import screencap
-
-    if mod is None:
-        monkeypatch.delattr(screencap, "_provisioned", raising=False)
-        # `None` in sys.modules → `import screencap._provisioned` raises ImportError
-        # even when the file exists on disk: the robust "absent" state.
-        monkeypatch.setitem(sys.modules, "screencap._provisioned", None)
-    else:
-        monkeypatch.setattr(screencap, "_provisioned", mod, raising=False)
-        monkeypatch.setitem(sys.modules, "screencap._provisioned", mod)
-
-
 @pytest.fixture
 def _no_cred_env(monkeypatch):
     """Clear the explicit credential env overrides so the lower layers show."""
@@ -637,6 +608,82 @@ def test_malformed_provisioned_raises_rather_than_silent_placeholder(
     _install_provisioned(monkeypatch, _fake_provisioned(**{present_attr: "prov-val"}))
     with pytest.raises(AttributeError):
         resolver()
+
+
+def test_syntax_error_in_provisioned_propagates_not_silent_placeholder(
+    monkeypatch, _no_cred_env
+):
+    # A PRESENT but syntactically-invalid _provisioned module must NOT be swallowed:
+    # the catch in _provisioned_value is `except ImportError` only, and SyntaxError is
+    # not an ImportError subclass — so it propagates loudly rather than degrading to a
+    # placeholder the build guard might then ship as a broken-sign-in binary.
+    import importlib.abc
+    import importlib.machinery
+
+    import screencap
+
+    class _SyntaxErrorLoader(importlib.abc.Loader):
+        def create_module(self, spec):
+            return None  # default module creation
+
+        def exec_module(self, module):
+            raise SyntaxError("invalid syntax in _provisioned.py")
+
+    class _SyntaxErrorFinder(importlib.abc.MetaPathFinder):
+        def find_spec(self, fullname, path, target=None):
+            if fullname == "screencap._provisioned":
+                return importlib.machinery.ModuleSpec(fullname, _SyntaxErrorLoader())
+            return None
+
+    # Clear any cached module + package attribute so the import reaches our finder
+    # (monkeypatch reverts all of this on teardown — offline, self-contained).
+    monkeypatch.delitem(sys.modules, "screencap._provisioned", raising=False)
+    monkeypatch.delattr(screencap, "_provisioned", raising=False)
+    monkeypatch.setattr(sys, "meta_path", [_SyntaxErrorFinder(), *sys.meta_path])
+
+    with pytest.raises(SyntaxError):
+        a._provisioned_value("FIREBASE_API_KEY")
+    with pytest.raises(SyntaxError):
+        a._api_key()
+
+
+def test_non_str_provisioned_value_degrades_to_placeholder(monkeypatch, _no_cred_env):
+    # A PRESENT module whose constant is a non-str value must NOT flow that bad type
+    # into a network call: _provisioned_value returns None for it → the resolver falls
+    # through to the placeholder, which the U2 release guard then catches (fail-closed).
+    _install_provisioned(
+        monkeypatch,
+        _fake_provisioned(FIREBASE_API_KEY=12345, OAUTH_CLIENT_ID=["not", "a", "str"]),
+    )
+    assert a._provisioned_value("FIREBASE_API_KEY") is None
+    assert a._api_key() == a.DEFAULT_FIREBASE_API_KEY
+    assert a._oauth_client_id() == a.DEFAULT_OAUTH_CLIENT_ID
+
+
+def test_empty_string_env_override_falls_through_to_lower_layers(monkeypatch, _no_cred_env):
+    # INTENTIONAL contract: an explicitly empty credential env var means "unset" — the
+    # `or`-chain falls THROUGH to the _provisioned layer (when present) or the
+    # placeholder (when absent), never resolving to "".
+    monkeypatch.setenv("SCREENCAP_FIREBASE_API_KEY", "")
+    monkeypatch.setenv("SCREENCAP_OAUTH_CLIENT_ID", "")
+    _install_provisioned(
+        monkeypatch,
+        _fake_provisioned(FIREBASE_API_KEY="prov-key", OAUTH_CLIENT_ID="prov-id"),
+    )
+    # Empty env is treated as unset → falls through to the provisioned value, not "".
+    assert a._api_key() == "prov-key"
+    assert a._oauth_client_id() == "prov-id"
+
+
+def test_empty_string_env_override_falls_through_to_placeholder_when_absent(
+    monkeypatch, _no_cred_env
+):
+    # Symmetric to the above with no _provisioned module: empty env → placeholder.
+    monkeypatch.setenv("SCREENCAP_FIREBASE_API_KEY", "")
+    monkeypatch.setenv("SCREENCAP_OAUTH_CLIENT_ID", "")
+    _install_provisioned(monkeypatch, None)
+    assert a._api_key() == a.DEFAULT_FIREBASE_API_KEY
+    assert a._oauth_client_id() == a.DEFAULT_OAUTH_CLIENT_ID
 
 
 def test_is_placeholder_credential_keyed_off_constants(monkeypatch, _no_cred_env):

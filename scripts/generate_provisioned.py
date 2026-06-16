@@ -75,9 +75,18 @@ def main() -> int:
     if missing:
         # Fail closed, writing nothing: a release build that did not receive the
         # injected credentials must not produce a placeholder binary (R6).
+        names = ", ".join(missing)
+        # GitHub Actions annotation on STDOUT so the Actions UI surfaces the cause
+        # inline instead of a bare "Process completed with exit code 1".
+        print(
+            f"::error::generate_provisioned.py: missing required environment "
+            f"variable(s): {names}. Set them before a release build "
+            "(see docs/runbooks/cloud-auth-setup.md)."
+        )
+        # Human-readable detail on stderr for local/non-Actions runs.
         print(
             "ERROR: refusing to generate _provisioned.py — missing required "
-            f"environment variable(s): {', '.join(missing)}.\n"
+            f"environment variable(s): {names}.\n"
             "Set both before building a release (see docs/runbooks/cloud-auth-setup.md).",
             file=sys.stderr,
         )

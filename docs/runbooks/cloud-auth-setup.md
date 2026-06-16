@@ -108,14 +108,19 @@ Redeploy the previous (pre-isolation) function revision if `demo-*` or signing m
 (`gcloud run revisions list --region southamerica-east1`, then redeploy the prior source).
 **No recording data is mutated by the function**, so rollback is safe and stateless.
 
-### Client-upload track operator setup (independent of the website fix)
+### Client-upload track operator setup (required before the NEXT release of any kind)
 
-To release a token-carrying client (so `screencap login` works in a shipped binary), add
-two **repository Secrets** (GitHub → Settings → Secrets and variables → Actions):
+Add two **repository Secrets** (GitHub → Settings → Secrets and variables → Actions):
 `SCREENCAP_OAUTH_CLIENT_ID` and `SCREENCAP_FIREBASE_API_KEY` (values in the gitignored
-`.env`; non-secret by design). The release workflow injects them at build time and the
-fail-closed guard (`_auth-config-check`) blocks a placeholder binary. For local-release,
-export the same two values before building (see `.claude/skills/local-release/SKILL.md`).
+`.env`; non-secret by design). These let a shipped binary sign in (`screencap login`).
+
+**This is not optional for token-carrying releases only.** The release workflow's "Generate
+provisioned credentials" step runs **unconditionally** on every tag, and it **fails the
+entire release build** (writing nothing) if either Secret is absent. So both Secrets must be
+present in the repo before the **next release tag of any kind** — not just a token-carrying
+one — or the build breaks. After injection, the fail-closed guard (`_auth-config-check`)
+blocks a placeholder binary. For local-release, export the same two values before building
+(see `.claude/skills/local-release/SKILL.md`).
 
 ---
 

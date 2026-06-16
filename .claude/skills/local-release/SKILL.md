@@ -164,13 +164,29 @@ For `--arch arm64`, skip this step (target is 14.0 and pip resolution naturally 
 ```bash
 ./dist/screencap/screencap --help
 ./dist/screencap/screencap _smoke-test
+```
+
+Both must exit 0. If `_smoke-test` fails, stop and report the error.
+
+### Step 5b: Fail-closed credential guard (ALWAYS run, even on `--release-only`)
+
+This guard validates the bits about to be published, so it must run on EVERY path —
+including `--release-only`, where Step 3 (build) and Step 5 (smoke test) are skipped and
+`dist/` holds a previously-built binary. Running it here ensures a placeholder
+(broken-sign-in) binary can never reach the package/upload steps.
+
+```bash
 # Fail-closed credential guard: assert the bundled binary resolves real creds,
 # not the REPLACE_WITH_PROVISIONED_* placeholders. SCREENCAP_RELEASE_BUILD=1
 # makes it enforce (it is a no-op exit-0 without that marker).
 SCREENCAP_RELEASE_BUILD=1 ./dist/screencap/screencap _auth-config-check
 ```
 
-All three must exit 0. If `_smoke-test` fails, stop and report the error. If `_auth-config-check` fails, the injection step (Step 3) did not run or the env vars were unset — re-run it before publishing; do NOT ship a placeholder binary.
+Must exit 0. If `_auth-config-check` fails, the injection step (Step 3) did not run or the
+env vars were unset — re-run the injection + build before publishing; do NOT ship a
+placeholder binary. On a `--release-only` re-run, a failure here means the existing `dist/`
+artifact was built without injected credentials — rebuild it (drop `--release-only`) rather
+than uploading it.
 
 ### Step 6: Package
 
