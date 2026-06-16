@@ -267,7 +267,7 @@ with the two `.env` values set; in a shipped binary it works once U1/U2 inject t
 | Target | Date | Outcome |
 |--------|------|---------|
 | dev (`get-upload-urls-dev`, bucket `screencap-recordings-dev-staging`) | 2026-06-16 | ✅ deployed merged code. Automated checks: `demo-list`→**200** `{"recordings":[]}` (was 400 on old code); tokenless `upload`/`list`/`sign-download`→**401**; invalid bearer→**401** (proves `verify_bearer`/`firebase_admin` live + project-pinned — an init failure would 503/500); unknown action→**400**. `demo/` empty (SCR-139). Same-project-token→uid signed round-trip = interactive operator step (below); not yet run. |
-| prod (`get-upload-urls`, bucket `screencap-recordings-staging`) | _pending — operator_ | Current serving revision `get-upload-urls-00001-xip` (2026-06-02, OLD code — rollback target). Command + verification below. `demo/` is empty, so expect the empty-gallery placeholder until SCR-139, NOT a deploy failure. |
+| prod (`get-upload-urls`, bucket `screencap-recordings-staging`) | 2026-06-16 | ✅ deployed merged code (new revision `get-upload-urls-00002-faq`; rollback target `get-upload-urls-00001-xip`). Verified: `demo-list`→**200** `{"recordings":[]}` (was 400 on old code); tokenless `upload`/`list`/`sign-download`→**401**; invalid bearer→**401**; unknown action→**400**. Website `demo-*` calls now succeed; `demo/` empty → gallery renders the empty-gallery placeholder until SCR-139. |
 
 Deploy command used (dev):
 
