@@ -267,7 +267,7 @@ with the two `.env` values set; in a shipped binary it works once U1/U2 inject t
 | Target | Date | Outcome |
 |--------|------|---------|
 | dev (`get-upload-urls-dev`, bucket `screencap-recordings-dev-staging`) | 2026-06-16 | ✅ deployed merged code. Automated checks: `demo-list`→**200** `{"recordings":[]}` (was 400 on old code); tokenless `upload`/`list`/`sign-download`→**401**; invalid bearer→**401** (proves `verify_bearer`/`firebase_admin` live + project-pinned — an init failure would 503/500); unknown action→**400**. `demo/` empty (SCR-139). Same-project-token→uid signed round-trip = interactive operator step (below); not yet run. |
-| _(prod cutover — U5)_ | _pending_ | operator step — see "Deploy to prod" |
+| prod (`get-upload-urls`, bucket `screencap-recordings-staging`) | _pending — operator_ | Current serving revision `get-upload-urls-00001-xip` (2026-06-02, OLD code — rollback target). Command + verification below. `demo/` is empty, so expect the empty-gallery placeholder until SCR-139, NOT a deploy failure. |
 
 Deploy command used (dev):
 
@@ -307,6 +307,45 @@ screencap download <name>  # authed list (own recordings only) + signed GET; che
 Expect: login succeeds; upload lands under `users/{uid}/…`; the list returns only your own
 recordings; download round-trips with matching checksums (google-cloud-storage 3.x crc32c).
 Foreign-project / cross-user denial (AE2) is already proven by the invalid-bearer→401 above.
+
+#### Deploy to prod (operator step — the website fix)
+
+Once dev validates, deploy the SAME source over the live prod function. This restores the
+website's `demo-*` actions. Run from the repo root:
+
+```bash
+# 1. PRE-CHECK demo/ content (videos vs empty-gallery placeholder):
+gcloud storage ls "gs://screencap-recordings-staging/demo/"   # empty today → SCR-139 pending
+
+# 2. DEPLOY (mirrors the dev command; prod bucket; explicit project pin):
+SIGNER=screencap-signer@proteus-photos.iam.gserviceaccount.com
+gcloud functions deploy get-upload-urls \
+  --project proteus-photos --gen2 --runtime python312 \
+  --trigger-http --allow-unauthenticated --region southamerica-east1 \
+  --source scripts/cloud-function/ --entry-point get_upload_urls \
+  --service-account "$SIGNER" \
+  --update-env-vars SCREENCAP_BUCKET=screencap-recordings-staging,SCREENCAP_PROJECT_ID=proteus-photos
+
+# 3. VERIFY (same checks as dev, against the prod URL):
+PROD=https://get-upload-urls-ld7izzjvga-rj.a.run.app
+curl -s -w '\n%{http_code}\n' -X POST "$PROD" -H 'Content-Type: application/json' -d '{"action":"demo-list"}'        # expect 200
+curl -s -o /dev/null -w '%{http_code}\n' -X POST "$PROD" -H 'Content-Type: application/json' -d '{"action":"list"}'  # expect 401
+# Then load the website: the gallery should stop erroring (empty-gallery placeholder
+# until SCR-139 populates demo/).
+```
+
+**Rollback (prod):** the pre-deploy serving revision is `get-upload-urls-00001-xip`
+(2026-06-02, the old code). Restore it with:
+
+```bash
+gcloud run services update-traffic get-upload-urls \
+  --project proteus-photos --region southamerica-east1 \
+  --to-revisions get-upload-urls-00001-xip=100
+```
+
+No recording data is mutated by the function, so rollback is safe and stateless. After a
+successful prod deploy, update the prod row above (date + outcome) and coordinate **SCR-139**
+so the gallery shows videos, not just the empty-gallery placeholder.
 
 ---
 
