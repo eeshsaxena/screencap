@@ -133,6 +133,30 @@ def _oauth_client_id() -> str:
     )
 
 
+def is_placeholder_credential(value: str) -> bool:
+    """True if a resolved credential is still an un-provisioned source placeholder.
+
+    Keyed off the actual ``DEFAULT_*`` sentinels (single source of truth) so the
+    U2 release guard can't silently drift if the placeholder strings ever change.
+    """
+    return value in (DEFAULT_FIREBASE_API_KEY, DEFAULT_OAUTH_CLIENT_ID)
+
+
+def bundled_credentials() -> tuple[str, str]:
+    """Resolve creds as the SHIPPED binary will for an end user — ``_provisioned``
+    (injected at build time) then the placeholder, **ignoring env vars**.
+
+    The U2 release guard uses this rather than :func:`_api_key`/:func:`_oauth_client_id`
+    so a build-shell env var or a stray ``.env`` (which ``load_dotenv`` reads at
+    startup) cannot mask a ``_provisioned`` bundling failure: an end user has neither,
+    so the guard must prove what is actually bundled. Returns ``(api_key, client_id)``.
+    """
+    return (
+        _provisioned_value("FIREBASE_API_KEY") or DEFAULT_FIREBASE_API_KEY,
+        _provisioned_value("OAUTH_CLIENT_ID") or DEFAULT_OAUTH_CLIENT_ID,
+    )
+
+
 def _oauth_client_secret() -> str:
     # Empty by default — public native client, no embedded secret.
     return os.environ.get("SCREENCAP_OAUTH_CLIENT_SECRET", "")

@@ -577,15 +577,22 @@ def _fake_provisioned(**attrs) -> types.ModuleType:
 
 
 def _install_provisioned(monkeypatch, mod: types.ModuleType | None) -> None:
-    """Make ``from screencap import _provisioned`` resolve to ``mod`` (or be
-    absent when ``mod is None``). Setting the attribute on the package is what
-    ``IMPORT_FROM`` checks first; sys.modules is kept in sync for completeness.
-    monkeypatch reverts both on teardown."""
+    """Make ``from screencap import _provisioned`` resolve to ``mod``, or raise
+    ImportError when ``mod is None`` — even if a gitignored ``_provisioned.py``
+    exists on disk (an operator may have generated one to test cloud auth locally).
+
+    Present case: setting the attribute on the package is what ``IMPORT_FROM`` checks
+    first; sys.modules is kept in sync. Absent case: a ``None`` entry in
+    ``sys.modules`` makes ``import screencap._provisioned`` raise ``ImportError``
+    regardless of any on-disk module, and the package attribute is removed so the
+    import machinery reaches that entry. monkeypatch reverts everything on teardown."""
     import screencap
 
     if mod is None:
         monkeypatch.delattr(screencap, "_provisioned", raising=False)
-        monkeypatch.delitem(sys.modules, "screencap._provisioned", raising=False)
+        # `None` in sys.modules → `import screencap._provisioned` raises ImportError
+        # even when the file exists on disk: the robust "absent" state.
+        monkeypatch.setitem(sys.modules, "screencap._provisioned", None)
     else:
         monkeypatch.setattr(screencap, "_provisioned", mod, raising=False)
         monkeypatch.setitem(sys.modules, "screencap._provisioned", mod)
@@ -614,12 +621,41 @@ def test_resolvers_fall_back_to_placeholder_when_provisioned_absent(monkeypatch,
     assert a._oauth_client_id() == a.DEFAULT_OAUTH_CLIENT_ID
 
 
-def test_malformed_provisioned_raises_rather_than_silent_placeholder(monkeypatch, _no_cred_env):
+@pytest.mark.parametrize(
+    "present_attr, resolver",
+    [
+        ("OAUTH_CLIENT_ID", lambda: a._api_key()),          # FIREBASE_API_KEY missing
+        ("FIREBASE_API_KEY", lambda: a._oauth_client_id()),  # OAUTH_CLIENT_ID missing
+    ],
+)
+def test_malformed_provisioned_raises_rather_than_silent_placeholder(
+    monkeypatch, _no_cred_env, present_attr, resolver
+):
     # Present module missing the expected constant → AttributeError (getattr has no
     # default), NOT a silent degrade to the placeholder the build guard might ship.
-    _install_provisioned(monkeypatch, _fake_provisioned(OAUTH_CLIENT_ID="prov-id"))
+    # Covered in both directions so neither resolver can regress to a quiet fallback.
+    _install_provisioned(monkeypatch, _fake_provisioned(**{present_attr: "prov-val"}))
     with pytest.raises(AttributeError):
-        a._api_key()
+        resolver()
+
+
+def test_is_placeholder_credential_keyed_off_constants(monkeypatch, _no_cred_env):
+    # The guard's placeholder detector must track the actual DEFAULT_* sentinels.
+    assert a.is_placeholder_credential(a.DEFAULT_FIREBASE_API_KEY)
+    assert a.is_placeholder_credential(a.DEFAULT_OAUTH_CLIENT_ID)
+    assert not a.is_placeholder_credential("AIzaSyRealLookingWebKey")
+    assert not a.is_placeholder_credential("123.apps.googleusercontent.com")
+
+
+def test_bundled_credentials_ignores_env(monkeypatch):
+    # bundled_credentials() must reflect ONLY what ships (_provisioned > placeholder),
+    # never the build-shell env — otherwise the release guard could be masked.
+    monkeypatch.setenv("SCREENCAP_FIREBASE_API_KEY", "env-key")
+    monkeypatch.setenv("SCREENCAP_OAUTH_CLIENT_ID", "env-id")
+    _install_provisioned(monkeypatch, None)
+    api_key, client_id = a.bundled_credentials()
+    assert api_key == a.DEFAULT_FIREBASE_API_KEY  # env ignored → placeholder
+    assert client_id == a.DEFAULT_OAUTH_CLIENT_ID
 
 
 def test_env_var_overrides_provisioned_and_placeholder(monkeypatch):
@@ -643,6 +679,7 @@ def _load_generator() -> types.ModuleType:
     root = Path(a.__file__).resolve().parents[2]
     gen_path = root / "scripts" / "generate_provisioned.py"
     spec = importlib.util.spec_from_file_location("generate_provisioned", gen_path)
+    assert spec is not None and spec.loader is not None, f"cannot load {gen_path}"
     mod = importlib.util.module_from_spec(spec)
     spec.loader.exec_module(mod)
     return mod
@@ -685,3 +722,28 @@ def test_generator_exits_nonzero_and_writes_nothing_when_var_missing(
 
     assert gen.main() == 1
     assert not out.exists()  # fail-closed: nothing written
+
+
+def test_generator_treats_whitespace_only_values_as_missing(monkeypatch, tmp_path):
+    # `.strip()` makes whitespace-only env vars count as missing → fail-closed.
+    gen = _load_generator()
+    out = tmp_path / "_provisioned.py"
+    monkeypatch.setattr(gen, "_OUTPUT_PATH", out)
+    monkeypatch.setenv("SCREENCAP_OAUTH_CLIENT_ID", "   ")
+    monkeypatch.setenv("SCREENCAP_FIREBASE_API_KEY", "\t\n")
+
+    assert gen.main() == 1
+    assert not out.exists()
+
+
+def test_generator_unlinks_stale_module_on_failure(monkeypatch, tmp_path):
+    # A fail-closed run must not leave a prior build's module behind to be re-bundled.
+    gen = _load_generator()
+    out = tmp_path / "_provisioned.py"
+    out.write_text("FIREBASE_API_KEY = 'stale'\nOAUTH_CLIENT_ID = 'stale'\n")
+    monkeypatch.setattr(gen, "_OUTPUT_PATH", out)
+    monkeypatch.delenv("SCREENCAP_OAUTH_CLIENT_ID", raising=False)
+    monkeypatch.delenv("SCREENCAP_FIREBASE_API_KEY", raising=False)
+
+    assert gen.main() == 1
+    assert not out.exists()  # stale module removed, not left for the next build

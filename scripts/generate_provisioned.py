@@ -59,6 +59,11 @@ def main() -> int:
     client_id = os.environ.get(_OAUTH_CLIENT_ID_ENV, "").strip()
     api_key = os.environ.get(_FIREBASE_API_KEY_ENV, "").strip()
 
+    # Remove any stale module FIRST so a fail-closed exit never leaves a prior
+    # build's _provisioned.py in the (gitignored, build-persistent) source tree to
+    # be silently re-bundled with outdated/rotated creds.
+    _OUTPUT_PATH.unlink(missing_ok=True)
+
     missing = [
         name
         for name, value in (

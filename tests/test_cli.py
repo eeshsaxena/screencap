@@ -1,7 +1,9 @@
 """Tests for screencap CLI argument parsing."""
 
 import json
+import sys
 import time
+import types
 from contextlib import contextmanager
 from unittest import mock
 
@@ -1385,6 +1387,31 @@ def test_smoke_test_exits_zero_on_all_pass():
 
 
 # --- _auth-config-check command tests (U2 fail-closed release guard) ---
+#
+# The guard checks the BUNDLED creds (auth._provisioned > placeholder), ignoring the
+# env layer, so these tests inject via a fake screencap._provisioned module rather
+# than env vars — mirroring how the shipped binary resolves creds for an end user.
+
+
+def _install_provisioned(monkeypatch, mod):
+    """Install (or force-absent, when ``mod is None``) ``screencap._provisioned`` so
+    ``auth.bundled_credentials()`` resolves it. A ``None`` sys.modules entry forces
+    ImportError even if a gitignored _provisioned.py exists on disk."""
+    import screencap
+
+    if mod is None:
+        monkeypatch.delattr(screencap, "_provisioned", raising=False)
+        monkeypatch.setitem(sys.modules, "screencap._provisioned", None)
+    else:
+        monkeypatch.setattr(screencap, "_provisioned", mod, raising=False)
+        monkeypatch.setitem(sys.modules, "screencap._provisioned", mod)
+
+
+def _fake_provisioned(**attrs):
+    mod = types.ModuleType("screencap._provisioned")
+    for key, value in attrs.items():
+        setattr(mod, key, value)
+    return mod
 
 
 def test_auth_config_check_hidden_from_help():
@@ -1395,8 +1422,36 @@ def test_auth_config_check_hidden_from_help():
     assert "_auth-config-check" not in result.output
 
 
-def test_auth_config_check_passes_when_provisioned():
-    """Exit 0 when creds resolve to non-placeholder values (env-injected here)."""
+def test_auth_config_check_passes_when_provisioned(monkeypatch):
+    """Exit 0 when the BUNDLED _provisioned module carries non-placeholder creds."""
+    _install_provisioned(
+        monkeypatch,
+        _fake_provisioned(
+            FIREBASE_API_KEY="AIzaSyRealLookingWebKey",
+            OAUTH_CLIENT_ID="123456789.apps.googleusercontent.com",
+        ),
+    )
+    runner = CliRunner()
+    result = runner.invoke(cli, ["_auth-config-check"], env={"SCREENCAP_RELEASE_BUILD": "1"})
+    assert result.exit_code == 0
+    assert "provisioned" in result.output
+
+
+def test_auth_config_check_fails_release_build_with_placeholders(monkeypatch):
+    """Exit non-zero when a release build's bundled creds are the REPLACE_WITH_PROVISIONED_* sentinels."""
+    _install_provisioned(monkeypatch, None)  # nothing bundled → placeholders
+    runner = CliRunner()
+    result = runner.invoke(cli, ["_auth-config-check"], env={"SCREENCAP_RELEASE_BUILD": "1"})
+    assert result.exit_code == 1
+    assert "FAILED" in result.output
+
+
+def test_auth_config_check_ignores_env_creds(monkeypatch):
+    """Anti-masking: env-var creds must NOT satisfy the guard when nothing is bundled.
+
+    An end user has no env override, so a build-shell env var (or a stray .env read by
+    load_dotenv) cannot be allowed to hide a _provisioned bundling failure."""
+    _install_provisioned(monkeypatch, None)
     runner = CliRunner()
     result = runner.invoke(
         cli,
@@ -1407,38 +1462,15 @@ def test_auth_config_check_passes_when_provisioned():
             "SCREENCAP_OAUTH_CLIENT_ID": "123456789.apps.googleusercontent.com",
         },
     )
-    assert result.exit_code == 0
-    assert "provisioned" in result.output
-
-
-def test_auth_config_check_fails_release_build_with_placeholders():
-    """Exit non-zero when a release build resolves the REPLACE_WITH_PROVISIONED_* sentinels."""
-    runner = CliRunner()
-    result = runner.invoke(
-        cli,
-        ["_auth-config-check"],
-        env={
-            "SCREENCAP_RELEASE_BUILD": "1",
-            "SCREENCAP_FIREBASE_API_KEY": None,
-            "SCREENCAP_OAUTH_CLIENT_ID": None,
-        },
-    )
     assert result.exit_code == 1
     assert "FAILED" in result.output
 
 
-def test_auth_config_check_passes_dev_build_with_placeholders():
+def test_auth_config_check_passes_dev_build_with_placeholders(monkeypatch):
     """PR/dev builds (SCREENCAP_RELEASE_BUILD unset) stay green with placeholders."""
+    _install_provisioned(monkeypatch, None)
     runner = CliRunner()
-    result = runner.invoke(
-        cli,
-        ["_auth-config-check"],
-        env={
-            "SCREENCAP_RELEASE_BUILD": None,
-            "SCREENCAP_FIREBASE_API_KEY": None,
-            "SCREENCAP_OAUTH_CLIENT_ID": None,
-        },
-    )
+    result = runner.invoke(cli, ["_auth-config-check"], env={"SCREENCAP_RELEASE_BUILD": None})
     assert result.exit_code == 0
     assert "dev/PR build" in result.output
 
