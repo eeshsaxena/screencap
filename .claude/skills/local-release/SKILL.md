@@ -28,6 +28,7 @@ Always:
 2. `gh` CLI authenticated with repo write access
 3. Working tree clean (`git status --short` shows nothing)
 4. On macOS (arm64 Apple Silicon OR Intel)
+5. The cloud-auth values `SCREENCAP_OAUTH_CLIENT_ID` + `SCREENCAP_FIREBASE_API_KEY` available to export (they live in the gitignored `.env`; see `docs/runbooks/cloud-auth-setup.md`). They are injected into the binary in Step 3; a release build without them is blocked by the Step 5 guard.
 
 For `--arch arm64`:
 - Running on an arm64 Mac (Apple Silicon) with Python 3.12+
@@ -80,6 +81,20 @@ The tag push will trigger GH Actions `release.yml` in parallel. If CI succeeds, 
 Run once per requested arch. For `--arch both`, run arm64 first, then x86_64.
 
 Use a dedicated venv per arch so they don't poison each other. Default venv path: `.venv` (arm64 on Apple Silicon, x86_64 on Intel Mac). For a second-arch build on Apple Silicon, create `.venv-x86_64` under Rosetta.
+
+#### Inject provisioned credentials (once, before any arch build)
+
+Release binaries must carry the OAuth client id + Firebase Web API key, or every `screencap login` fails. The values stay out of git: source keeps placeholders, and `scripts/generate_provisioned.py` writes the gitignored `src/screencap/_provisioned.py` that PyInstaller bundles. Run this ONCE before building — it writes into the source tree (`pathex=src`), so it applies to both the arm64 and x86_64 builds; it depends on no venv.
+
+```bash
+# Export the two non-secret values (they live in the gitignored .env — both
+# `SCREENCAP_OAUTH_CLIENT_ID` and `SCREENCAP_FIREBASE_API_KEY`; see
+# docs/runbooks/cloud-auth-setup.md). Easiest: source the .env, then generate.
+set -a; . ./.env; set +a
+python scripts/generate_provisioned.py   # exits non-zero (writes nothing) if either var is missing
+```
+
+If you skip this, the fail-closed guard in Step 5 stops the release rather than letting a placeholder (broken-sign-in) binary ship.
 
 #### arm64 path (native on Apple Silicon)
 
@@ -152,6 +167,26 @@ For `--arch arm64`, skip this step (target is 14.0 and pip resolution naturally 
 ```
 
 Both must exit 0. If `_smoke-test` fails, stop and report the error.
+
+### Step 5b: Fail-closed credential guard (ALWAYS run, even on `--release-only`)
+
+This guard validates the bits about to be published, so it must run on EVERY path —
+including `--release-only`, where Step 3 (build) and Step 5 (smoke test) are skipped and
+`dist/` holds a previously-built binary. Running it here ensures a placeholder
+(broken-sign-in) binary can never reach the package/upload steps.
+
+```bash
+# Fail-closed credential guard: assert the bundled binary resolves real creds,
+# not the REPLACE_WITH_PROVISIONED_* placeholders. SCREENCAP_RELEASE_BUILD=1
+# makes it enforce (it is a no-op exit-0 without that marker).
+SCREENCAP_RELEASE_BUILD=1 ./dist/screencap/screencap _auth-config-check
+```
+
+Must exit 0. If `_auth-config-check` fails, the injection step (Step 3) did not run or the
+env vars were unset — re-run the injection + build before publishing; do NOT ship a
+placeholder binary. On a `--release-only` re-run, a failure here means the existing `dist/`
+artifact was built without injected credentials — rebuild it (drop `--release-only`) rather
+than uploading it.
 
 ### Step 6: Package
 

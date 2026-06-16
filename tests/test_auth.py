@@ -6,13 +6,17 @@ Keychain are both mocked, so these run fully offline. The most subtle surface is
 """
 
 import base64
+import importlib.util
 import json
+import sys
 import time
+import types
+from pathlib import Path
 
 import pytest
 
 import screencap.auth as a
-
+from tests.conftest import _fake_provisioned, _install_provisioned
 
 # --------------------------------------------------------------------------
 # Fixtures + helpers
@@ -552,3 +556,241 @@ def test_authed_post_propagates_not_signed_in_before_any_post(monkeypatch):
     with pytest.raises(a.NotSignedIn):
         a.authed_post(lambda *x, **k: called.append(1), "https://fn")
     assert called == []  # never posts without a token
+
+
+# --------------------------------------------------------------------------
+# Credential resolution: env var > injected _provisioned > placeholder (U1)
+#
+# The release binary carries provisioned values via a gitignored
+# screencap._provisioned module (written by scripts/generate_provisioned.py).
+# These tests pin the three-layer precedence and the fail-loud-on-malformed
+# contract without writing _provisioned.py to disk (the suite must pass with no
+# such file present).
+# --------------------------------------------------------------------------
+
+
+@pytest.fixture
+def _no_cred_env(monkeypatch):
+    """Clear the explicit credential env overrides so the lower layers show."""
+    monkeypatch.delenv("SCREENCAP_FIREBASE_API_KEY", raising=False)
+    monkeypatch.delenv("SCREENCAP_OAUTH_CLIENT_ID", raising=False)
+
+
+def test_resolvers_return_provisioned_when_present_and_no_env(monkeypatch, _no_cred_env):
+    _install_provisioned(
+        monkeypatch,
+        _fake_provisioned(FIREBASE_API_KEY="prov-key", OAUTH_CLIENT_ID="prov-id"),
+    )
+    assert a._api_key() == "prov-key"
+    assert a._oauth_client_id() == "prov-id"
+
+
+def test_resolvers_fall_back_to_placeholder_when_provisioned_absent(monkeypatch, _no_cred_env):
+    _install_provisioned(monkeypatch, None)
+    # No ImportError surfaces — an absent module is the normal source-checkout state.
+    assert a._api_key() == a.DEFAULT_FIREBASE_API_KEY
+    assert a._oauth_client_id() == a.DEFAULT_OAUTH_CLIENT_ID
+
+
+@pytest.mark.parametrize(
+    "present_attr, resolver",
+    [
+        ("OAUTH_CLIENT_ID", lambda: a._api_key()),          # FIREBASE_API_KEY missing
+        ("FIREBASE_API_KEY", lambda: a._oauth_client_id()),  # OAUTH_CLIENT_ID missing
+    ],
+)
+def test_malformed_provisioned_raises_rather_than_silent_placeholder(
+    monkeypatch, _no_cred_env, present_attr, resolver
+):
+    # Present module missing the expected constant → AttributeError (getattr has no
+    # default), NOT a silent degrade to the placeholder the build guard might ship.
+    # Covered in both directions so neither resolver can regress to a quiet fallback.
+    _install_provisioned(monkeypatch, _fake_provisioned(**{present_attr: "prov-val"}))
+    with pytest.raises(AttributeError):
+        resolver()
+
+
+def test_syntax_error_in_provisioned_propagates_not_silent_placeholder(
+    monkeypatch, _no_cred_env
+):
+    # A PRESENT but syntactically-invalid _provisioned module must NOT be swallowed:
+    # the catch in _provisioned_value is `except ImportError` only, and SyntaxError is
+    # not an ImportError subclass — so it propagates loudly rather than degrading to a
+    # placeholder the build guard might then ship as a broken-sign-in binary.
+    import importlib.abc
+    import importlib.machinery
+
+    import screencap
+
+    class _SyntaxErrorLoader(importlib.abc.Loader):
+        def create_module(self, spec):
+            return None  # default module creation
+
+        def exec_module(self, module):
+            raise SyntaxError("invalid syntax in _provisioned.py")
+
+    class _SyntaxErrorFinder(importlib.abc.MetaPathFinder):
+        def find_spec(self, fullname, path, target=None):
+            if fullname == "screencap._provisioned":
+                return importlib.machinery.ModuleSpec(fullname, _SyntaxErrorLoader())
+            return None
+
+    # Clear any cached module + package attribute so the import reaches our finder
+    # (monkeypatch reverts all of this on teardown — offline, self-contained).
+    monkeypatch.delitem(sys.modules, "screencap._provisioned", raising=False)
+    monkeypatch.delattr(screencap, "_provisioned", raising=False)
+    monkeypatch.setattr(sys, "meta_path", [_SyntaxErrorFinder(), *sys.meta_path])
+
+    with pytest.raises(SyntaxError):
+        a._provisioned_value("FIREBASE_API_KEY")
+    with pytest.raises(SyntaxError):
+        a._api_key()
+
+
+def test_non_str_provisioned_value_degrades_to_placeholder(monkeypatch, _no_cred_env):
+    # A PRESENT module whose constant is a non-str value must NOT flow that bad type
+    # into a network call: _provisioned_value returns None for it → the resolver falls
+    # through to the placeholder, which the U2 release guard then catches (fail-closed).
+    _install_provisioned(
+        monkeypatch,
+        _fake_provisioned(FIREBASE_API_KEY=12345, OAUTH_CLIENT_ID=["not", "a", "str"]),
+    )
+    assert a._provisioned_value("FIREBASE_API_KEY") is None
+    assert a._api_key() == a.DEFAULT_FIREBASE_API_KEY
+    assert a._oauth_client_id() == a.DEFAULT_OAUTH_CLIENT_ID
+
+
+def test_empty_string_env_override_falls_through_to_lower_layers(monkeypatch, _no_cred_env):
+    # INTENTIONAL contract: an explicitly empty credential env var means "unset" — the
+    # `or`-chain falls THROUGH to the _provisioned layer (when present) or the
+    # placeholder (when absent), never resolving to "".
+    monkeypatch.setenv("SCREENCAP_FIREBASE_API_KEY", "")
+    monkeypatch.setenv("SCREENCAP_OAUTH_CLIENT_ID", "")
+    _install_provisioned(
+        monkeypatch,
+        _fake_provisioned(FIREBASE_API_KEY="prov-key", OAUTH_CLIENT_ID="prov-id"),
+    )
+    # Empty env is treated as unset → falls through to the provisioned value, not "".
+    assert a._api_key() == "prov-key"
+    assert a._oauth_client_id() == "prov-id"
+
+
+def test_empty_string_env_override_falls_through_to_placeholder_when_absent(
+    monkeypatch, _no_cred_env
+):
+    # Symmetric to the above with no _provisioned module: empty env → placeholder.
+    monkeypatch.setenv("SCREENCAP_FIREBASE_API_KEY", "")
+    monkeypatch.setenv("SCREENCAP_OAUTH_CLIENT_ID", "")
+    _install_provisioned(monkeypatch, None)
+    assert a._api_key() == a.DEFAULT_FIREBASE_API_KEY
+    assert a._oauth_client_id() == a.DEFAULT_OAUTH_CLIENT_ID
+
+
+def test_is_placeholder_credential_keyed_off_constants(monkeypatch, _no_cred_env):
+    # The guard's placeholder detector must track the actual DEFAULT_* sentinels.
+    assert a.is_placeholder_credential(a.DEFAULT_FIREBASE_API_KEY)
+    assert a.is_placeholder_credential(a.DEFAULT_OAUTH_CLIENT_ID)
+    assert not a.is_placeholder_credential("AIzaSyRealLookingWebKey")
+    assert not a.is_placeholder_credential("123.apps.googleusercontent.com")
+
+
+def test_bundled_credentials_ignores_env(monkeypatch):
+    # bundled_credentials() must reflect ONLY what ships (_provisioned > placeholder),
+    # never the build-shell env — otherwise the release guard could be masked.
+    monkeypatch.setenv("SCREENCAP_FIREBASE_API_KEY", "env-key")
+    monkeypatch.setenv("SCREENCAP_OAUTH_CLIENT_ID", "env-id")
+    _install_provisioned(monkeypatch, None)
+    api_key, client_id = a.bundled_credentials()
+    assert api_key == a.DEFAULT_FIREBASE_API_KEY  # env ignored → placeholder
+    assert client_id == a.DEFAULT_OAUTH_CLIENT_ID
+
+
+def test_env_var_overrides_provisioned_and_placeholder(monkeypatch):
+    monkeypatch.setenv("SCREENCAP_FIREBASE_API_KEY", "env-key")
+    monkeypatch.setenv("SCREENCAP_OAUTH_CLIENT_ID", "env-id")
+    _install_provisioned(
+        monkeypatch,
+        _fake_provisioned(FIREBASE_API_KEY="prov-key", OAUTH_CLIENT_ID="prov-id"),
+    )
+    assert a._api_key() == "env-key"
+    assert a._oauth_client_id() == "env-id"
+
+
+# --- the generator (scripts/generate_provisioned.py) ----------------------
+
+
+def _load_generator() -> types.ModuleType:
+    # auth.py lives at <root>/src/screencap/auth.py; the generator at
+    # <root>/scripts/generate_provisioned.py. Resolve from auth.py so the test
+    # finds the same tree pytest imported (PYTHONPATH=src in a worktree).
+    root = Path(a.__file__).resolve().parents[2]
+    gen_path = root / "scripts" / "generate_provisioned.py"
+    spec = importlib.util.spec_from_file_location("generate_provisioned", gen_path)
+    assert spec is not None and spec.loader is not None, f"cannot load {gen_path}"
+    mod = importlib.util.module_from_spec(spec)
+    spec.loader.exec_module(mod)
+    return mod
+
+
+def test_generator_writes_module_with_env_values(monkeypatch, tmp_path):
+    gen = _load_generator()
+    out = tmp_path / "_provisioned.py"
+    monkeypatch.setattr(gen, "_OUTPUT_PATH", out)
+    monkeypatch.setenv("SCREENCAP_OAUTH_CLIENT_ID", "gen-id")
+    monkeypatch.setenv("SCREENCAP_FIREBASE_API_KEY", "gen-key")
+
+    assert gen.main() == 0
+    assert out.exists()
+
+    ns: dict = {}
+    exec(compile(out.read_text(), str(out), "exec"), ns)
+    assert ns["OAUTH_CLIENT_ID"] == "gen-id"
+    assert ns["FIREBASE_API_KEY"] == "gen-key"
+
+
+@pytest.mark.parametrize(
+    "to_set",
+    [
+        (),  # both missing
+        ("SCREENCAP_OAUTH_CLIENT_ID",),  # api key missing
+        ("SCREENCAP_FIREBASE_API_KEY",),  # client id missing
+    ],
+)
+def test_generator_exits_nonzero_and_writes_nothing_when_var_missing(
+    monkeypatch, tmp_path, to_set
+):
+    gen = _load_generator()
+    out = tmp_path / "_provisioned.py"
+    monkeypatch.setattr(gen, "_OUTPUT_PATH", out)
+    monkeypatch.delenv("SCREENCAP_OAUTH_CLIENT_ID", raising=False)
+    monkeypatch.delenv("SCREENCAP_FIREBASE_API_KEY", raising=False)
+    for name in to_set:
+        monkeypatch.setenv(name, "x")
+
+    assert gen.main() == 1
+    assert not out.exists()  # fail-closed: nothing written
+
+
+def test_generator_treats_whitespace_only_values_as_missing(monkeypatch, tmp_path):
+    # `.strip()` makes whitespace-only env vars count as missing → fail-closed.
+    gen = _load_generator()
+    out = tmp_path / "_provisioned.py"
+    monkeypatch.setattr(gen, "_OUTPUT_PATH", out)
+    monkeypatch.setenv("SCREENCAP_OAUTH_CLIENT_ID", "   ")
+    monkeypatch.setenv("SCREENCAP_FIREBASE_API_KEY", "\t\n")
+
+    assert gen.main() == 1
+    assert not out.exists()
+
+
+def test_generator_unlinks_stale_module_on_failure(monkeypatch, tmp_path):
+    # A fail-closed run must not leave a prior build's module behind to be re-bundled.
+    gen = _load_generator()
+    out = tmp_path / "_provisioned.py"
+    out.write_text("FIREBASE_API_KEY = 'stale'\nOAUTH_CLIENT_ID = 'stale'\n")
+    monkeypatch.setattr(gen, "_OUTPUT_PATH", out)
+    monkeypatch.delenv("SCREENCAP_OAUTH_CLIENT_ID", raising=False)
+    monkeypatch.delenv("SCREENCAP_FIREBASE_API_KEY", raising=False)
+
+    assert gen.main() == 1
+    assert not out.exists()  # stale module removed, not left for the next build

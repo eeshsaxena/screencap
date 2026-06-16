@@ -60,8 +60,38 @@ jobs:
       - name: Audit dependencies
         run: pip install pip-audit && pip-audit
 
+      - name: Generate provisioned credentials
+        # Inject the non-secret OAuth client id + Firebase Web API key into a
+        # gitignored screencap._provisioned module BEFORE PyInstaller bundles it,
+        # so release binaries can sign in (placeholders stay in source). The
+        # generator fails the build — writing nothing — if a Secret is missing,
+        # so a release never silently ships a placeholder (broken-sign-in) binary.
+        #
+        # One-time operator setup: add these two repository Secrets (Settings →
+        # Secrets and variables → Actions → New repository secret). Their values
+        # live in the gitignored .env / docs/runbooks/cloud-auth-setup.md and are
+        # non-secret by design (public RFC 8252 client id + a Web API key
+        # restricted to Identity Toolkit + Token Service).
+        env:
+          SCREENCAP_OAUTH_CLIENT_ID: ${{ secrets.SCREENCAP_OAUTH_CLIENT_ID }}
+          SCREENCAP_FIREBASE_API_KEY: ${{ secrets.SCREENCAP_FIREBASE_API_KEY }}
+        run: python scripts/generate_provisioned.py
+
       - name: Build frozen binary
         run: pyinstaller pyinstaller/screencap.spec
+
+      - name: Verify provisioned credentials (release guard)
+        # Fail-closed net on the BUILT binary: assert it resolves the bundled
+        # _provisioned values, not the REPLACE_WITH_PROVISIONED_* placeholders.
+        # SCREENCAP_RELEASE_BUILD=1 makes the check enforce; this workflow only
+        # runs on tag pushes, so the assertion is unskippable on a release. (The
+        # Generate step above already fails first if a Secret is missing — this
+        # also catches a bundling failure where _provisioned didn't make it in.)
+        # Runs immediately after the build and BEFORE the smoke tests so the
+        # credential-bundling check always runs and logs even if a smoke test fails.
+        env:
+          SCREENCAP_RELEASE_BUILD: "1"
+        run: ./dist/screencap/screencap _auth-config-check
 
       - name: Smoke test (help)
         run: ./dist/screencap/screencap --help
