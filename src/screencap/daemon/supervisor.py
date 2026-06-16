@@ -253,6 +253,10 @@ class Supervisor:
         # the short-lived token; the refresh task re-mints it for recordings that
         # outlast the ~1h token. Both are torn down in _reset_state.
         self._engine_token_file: Path | None = None
+        # SCR-116: the uid the staged token belonged to. The re-mint loop refuses
+        # to restage a token whose uid differs (a mid-recording account switch),
+        # so every chunk of this recording stays in the original namespace.
+        self._engine_token_uid: str | None = None
         self._token_refresh_task: asyncio.Task[None] | None = None
         # SCR-125 U6: in-flight crash/restart terminal-stage resume tasks (the
         # engine-exit safety net + the startup sweep). Tracked as a set so the
@@ -624,17 +628,33 @@ class Supervisor:
             return
 
         swept: list[str] = []
+        refused: list[str] = []
         for d in candidates:
             try:
                 if await asyncio.to_thread(self._recording_needs_resume, d):
-                    swept.append(d.name)
-                    await self.resume_terminal_stage(d)
+                    result = await self.resume_terminal_stage(d)
+                    # SCR-116 observability: a result carrying an upload_warning
+                    # (e.g. account-ownership mismatch) did NOT converge — surface
+                    # it at WARNING and track it apart from the truly-swept count.
+                    if result is not None and result.upload_warning:
+                        refused.append(d.name)
+                        logger.warning(
+                            "daemon startup sweep: %s not converged (%s)",
+                            d.name, result.upload_warning,
+                        )
+                    else:
+                        swept.append(d.name)
             except Exception:  # noqa: BLE001 — one bad recording never aborts the sweep
                 logger.exception("daemon startup sweep: resume failed for %s", d)
         if swept:
             logger.info(
                 "daemon startup sweep resumed %d incomplete recording(s): %s",
                 len(swept), swept,
+            )
+        if refused:
+            logger.warning(
+                "daemon startup sweep: %d recording(s) refused convergence: %s",
+                len(refused), refused,
             )
 
     @staticmethod
@@ -1209,6 +1229,31 @@ class Supervisor:
             logger.warning("daemon: could not stage engine token file: %s", exc)
             return None
         self._engine_token_file = path
+        # SCR-116: pin the recording to this token's account. The uid is kept in
+        # memory for the re-mint guard and persisted into the recording dir so the
+        # terminal stage (which may run in a daemon/CLI process that reads the
+        # Keychain, not the engine token) can refuse to converge under a different
+        # account. A missing uid (malformed token) or write error just leaves the
+        # recording unpinned — degrades to prior behavior, never fails the start.
+        uid = auth.id_token_uid(token)
+        self._engine_token_uid = uid
+        if uid:
+            try:
+                from screencap.catalog import write_owner_uid
+
+                # The engine creates capture_dir at startup (mkdir exist_ok), but
+                # it does not exist yet at stage time — create it so the pin lands.
+                capture_dir.mkdir(parents=True, exist_ok=True)
+                write_owner_uid(capture_dir, uid)
+            except (OSError, ImportError) as exc:
+                logger.warning("daemon: could not pin recording owner uid: %s", exc)
+                # Degrade the in-memory re-mint guard and the on-disk pin
+                # consistently: if the disk pin didn't land, the terminal stage
+                # sees NO pin (read_owner_uid -> None) and won't gate, so the
+                # guard must not stay armed alone — otherwise the two halves
+                # disagree and the terminal stage could converge under a
+                # different account. Both unpinned = prior (unpinned) behavior.
+                self._engine_token_uid = None
         return {auth.ENGINE_TOKEN_FILE_ENV: str(path)}
 
     @staticmethod
@@ -1288,6 +1333,29 @@ class Supervisor:
                 continue
             if token == last:
                 continue  # unchanged — not yet within the refresh buffer
+            # SCR-116: refuse to restage a token for a DIFFERENT account. The user
+            # ran `logout && login` as another user mid-recording, so the Keychain
+            # (which _ensure_fresh prefers on refresh) now rotates to their uid.
+            # Writing it would make the engine upload subsequent chunks into the
+            # new user's namespace, fragmenting the recording. Skip the write (do
+            # NOT update `last`) so the engine keeps account A's token and fails
+            # closed on expiry; if the user switches back to A we resume re-minting.
+            # Mirror the terminal-stage gate's tolerance: only refuse on a
+            # DETERMINED, DIFFERENT uid. A None extraction (malformed token, uid
+            # not present) is undeterminable, not a switch — fall through to the
+            # normal restage rather than wrongly refusing a same-account re-mint.
+            minted_uid = auth.id_token_uid(token)
+            if (
+                self._engine_token_uid is not None
+                and minted_uid is not None
+                and minted_uid != self._engine_token_uid
+            ):
+                logger.warning(
+                    "daemon: re-minted token uid changed (account switch "
+                    "mid-recording) — refusing to restage; engine keeps the "
+                    "original account's token and fails closed on expiry"
+                )
+                continue
             try:
                 self._write_engine_token_file(path, token)
                 last = token
@@ -1304,6 +1372,7 @@ class Supervisor:
             self._token_refresh_task.cancel()
         self._token_refresh_task = None
         self._cleanup_engine_token_file()
+        self._engine_token_uid = None
         self._finalized_seen = False
         self._stopping = False
         self._exit_handled = False

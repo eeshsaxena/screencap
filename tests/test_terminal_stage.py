@@ -15,6 +15,7 @@ from pathlib import Path
 
 import pytest
 
+from tests._jwt import _jwt
 
 # ---------------------------------------------------------------------------
 # Fixtures — a recording dir with the U1 ledger schema + chunks on disk.
@@ -972,3 +973,158 @@ class TestSCR129SourceMediaUpload:
         assert not (rich_sources & {p for _, p in put}), (
             "rich source video must never be uploaded when masking is ON"
         )
+
+
+# ---------------------------------------------------------------------------
+# SCR-116 — account-ownership gate. A cloud recording is pinned at start to the
+# uid that owned it. If a different account is signed in at convergence time
+# (the user switched mid-/post-recording), the terminal stage must REFUSE all
+# cloud ops — no upload, no sentinel, no eviction — so the recording is never
+# fragmented into a second user's namespace.
+# ---------------------------------------------------------------------------
+
+
+class TestSCR116AccountOwnershipGate:
+    def test_account_mismatch_refuses_cloud_convergence(self, tmp_path, monkeypatch):
+        from screencap import auth
+        from screencap import terminal_stage as ts
+        from screencap.catalog import write_owner_uid
+
+        rec_dir = _make_recording(tmp_path, destination="cloud", n_chunks=2)
+        write_owner_uid(rec_dir, "uid-A")
+        # The process is now signed in as a DIFFERENT account.
+        monkeypatch.setattr(
+            auth, "get_id_token", lambda force_refresh=False: _jwt({"user_id": "uid-B"})
+        )
+
+        produced = []
+        monkeypatch.setattr(
+            ts.CloudCopyProducer, "produce",
+            lambda self, **kw: produced.append(1),
+        )
+        uploaded = []
+        import screencap.upload as up
+        monkeypatch.setattr(
+            up, "upload_recording", lambda *a, **k: uploaded.append(1)
+        )
+
+        result = ts.run_terminal_stage(rec_dir)
+
+        assert produced == [], "must not scrub/produce a cloud copy under the wrong account"
+        assert uploaded == [], "must not upload under the wrong account"
+        assert result.sentinel_uploaded is False
+        assert result.upload_warning and "account mismatch" in result.upload_warning.lower()
+
+    def test_matching_account_proceeds_to_upload(self, tmp_path, monkeypatch):
+        from screencap import auth
+        from screencap import terminal_stage as ts
+        from screencap.catalog import write_owner_uid
+        from screencap.terminal_stage import CloudCopyOutcome
+
+        rec_dir = _make_recording(tmp_path, destination="cloud", n_chunks=2)
+        write_owner_uid(rec_dir, "uid-A")
+        # Same account that owns the recording — the gate must NOT fire.
+        monkeypatch.setattr(
+            auth, "get_id_token", lambda force_refresh=False: _jwt({"user_id": "uid-A"})
+        )
+
+        scrubbed = rec_dir.parent / f"{rec_dir.name}-scrubbed"
+        scrubbed.mkdir()
+        for i in range(2):
+            (scrubbed / f"chunk_{i:04d}.mp4").write_bytes(b"\x00" * 32)
+            (scrubbed / f"events_{i:04d}.jsonl").write_text("{}\n")
+        monkeypatch.setattr(
+            ts.CloudCopyProducer, "produce",
+            lambda self, **kw: CloudCopyOutcome(scrubbed_dir=scrubbed),
+        )
+        uploaded = []
+        import screencap.upload as up
+
+        def _fake_upload(directory, **kw):
+            from screencap.upload import UploadResult
+            uploaded.append(directory)
+            return UploadResult(recording=directory.name)
+
+        monkeypatch.setattr(up, "upload_recording", _fake_upload)
+        monkeypatch.setattr(ts, "_open_ledger", lambda d: None)  # legacy gate path
+
+        result = ts.run_terminal_stage(rec_dir)
+
+        assert uploaded, "matching account must proceed to upload"
+        assert not (result.upload_warning and "account mismatch" in result.upload_warning.lower())
+
+    def test_no_owner_pin_legacy_recording_not_refused(self, tmp_path, monkeypatch):
+        """A recording with no pinned owner (legacy / local-promoted) is not gated
+        — preserves current behavior for recordings predating the pin."""
+        from screencap import auth
+        from screencap import terminal_stage as ts
+        from screencap.terminal_stage import CloudCopyOutcome
+
+        rec_dir = _make_recording(tmp_path, destination="cloud", n_chunks=1)
+        # No write_owner_uid(...) — no pin on disk.
+        monkeypatch.setattr(
+            auth, "get_id_token", lambda force_refresh=False: _jwt({"user_id": "uid-B"})
+        )
+        scrubbed = rec_dir.parent / f"{rec_dir.name}-scrubbed"
+        scrubbed.mkdir()
+        (scrubbed / "chunk_0000.mp4").write_bytes(b"\x00" * 32)
+        monkeypatch.setattr(
+            ts.CloudCopyProducer, "produce",
+            lambda self, **kw: CloudCopyOutcome(scrubbed_dir=scrubbed),
+        )
+        uploaded = []
+        import screencap.upload as up
+
+        def _fake_upload(directory, **kw):
+            from screencap.upload import UploadResult
+            uploaded.append(directory)
+            return UploadResult(recording=directory.name)
+
+        monkeypatch.setattr(up, "upload_recording", _fake_upload)
+        monkeypatch.setattr(ts, "_open_ledger", lambda d: None)
+
+        result = ts.run_terminal_stage(rec_dir)
+        assert not (result.upload_warning and "account mismatch" in result.upload_warning.lower())
+
+    def test_undeterminable_current_uid_does_not_refuse(self, tmp_path, monkeypatch):
+        """A pinned recording whose CURRENT uid is undeterminable (not signed in /
+        transient auth) must NOT fire the gate — an indeterminate uid is not a
+        mismatch. It falls through to the normal fail-closed upload path rather
+        than raising a false 'account mismatch'."""
+        from screencap import auth
+        from screencap import terminal_stage as ts
+        from screencap.catalog import write_owner_uid
+        from screencap.terminal_stage import CloudCopyOutcome
+
+        rec_dir = _make_recording(tmp_path, destination="cloud", n_chunks=2)
+        write_owner_uid(rec_dir, "uid-A")
+
+        def _not_signed_in(force_refresh=False):
+            raise auth.NotSignedIn("no usable stored credential")
+
+        monkeypatch.setattr(auth, "get_id_token", _not_signed_in)
+
+        scrubbed = rec_dir.parent / f"{rec_dir.name}-scrubbed"
+        scrubbed.mkdir()
+        for i in range(2):
+            (scrubbed / f"chunk_{i:04d}.mp4").write_bytes(b"\x00" * 32)
+            (scrubbed / f"events_{i:04d}.jsonl").write_text("{}\n")
+        monkeypatch.setattr(
+            ts.CloudCopyProducer, "produce",
+            lambda self, **kw: CloudCopyOutcome(scrubbed_dir=scrubbed),
+        )
+        uploaded = []
+        import screencap.upload as up
+
+        def _fake_upload(directory, **kw):
+            from screencap.upload import UploadResult
+            uploaded.append(directory)
+            return UploadResult(recording=directory.name)
+
+        monkeypatch.setattr(up, "upload_recording", _fake_upload)
+        monkeypatch.setattr(ts, "_open_ledger", lambda d: None)  # legacy gate path
+
+        result = ts.run_terminal_stage(rec_dir)
+
+        assert uploaded, "undeterminable current uid must not block the upload"
+        assert not (result.upload_warning and "account mismatch" in result.upload_warning.lower())

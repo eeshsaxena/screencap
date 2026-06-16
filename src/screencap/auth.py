@@ -332,6 +332,22 @@ def _decode_id_token_claims(id_token: str) -> dict:
         return {}
 
 
+def id_token_uid(id_token: str) -> str | None:
+    """Best-effort Firebase uid from an (UNVERIFIED) ID token, for client gating.
+
+    Mirrors the uid extraction in :func:`_refresh` (``user_id`` then ``sub``).
+    The token is NOT verified here — the server remains the verifier of record —
+    so this is only ever used to *refuse* a cross-account action (fail closed,
+    SCR-116), never to authorize one. Returns ``None`` for an empty/malformed
+    token or one carrying no uid claim, which callers treat as "cannot confirm
+    ownership" and fall back to their existing behavior.
+    """
+    if not id_token:
+        return None
+    claims = _decode_id_token_claims(id_token)
+    return claims.get("user_id") or claims.get("sub") or None
+
+
 # --------------------------------------------------------------------------
 # Loopback OAuth (RFC 8252)
 # --------------------------------------------------------------------------

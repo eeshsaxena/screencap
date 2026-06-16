@@ -19,6 +19,7 @@ import pytest
 from screencap import _stderr_events
 from screencap.daemon import schema
 from screencap.daemon.event_bus import EventBus
+from tests._jwt import _jwt
 
 
 @pytest.fixture
@@ -1104,6 +1105,167 @@ async def test_token_refresh_loop_write_oserror_does_not_crash_loop(
         await asyncio.sleep(0.1)
         assert not task.done(), "loop must keep running after a write OSError"
         assert path.read_text() == "prior-token"  # untouched
+    finally:
+        await _stop_loop(proc, task)
+
+
+# ---------------------------------------------------------------------------
+# SCR-116: pin the recording to the uid that owned it at start, so a
+# mid-recording account switch cannot fragment the cloud recording across two
+# users' namespaces. The daemon re-mint refuses to restage a different-uid
+# token (engine keeps the original account's token, fails closed on expiry).
+# ---------------------------------------------------------------------------
+
+
+@pytest.mark.asyncio
+async def test_stage_engine_token_pins_owner_uid(
+    tmp_path: Path, isolated_base_dir: Path, monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """``_stage_engine_token`` records the staged token's uid both in memory (for
+    the re-mint guard) and on disk in the recording dir (for the terminal stage's
+    account-ownership gate)."""
+    from screencap.catalog import read_owner_uid
+    from screencap.daemon.supervisor import Supervisor
+
+    monkeypatch.setattr(
+        "screencap.auth.get_id_token",
+        lambda force_refresh=False: _jwt({"user_id": "uid-A"}),
+    )
+
+    # capture_dir does NOT pre-exist (the production ordering — the engine, not
+    # the daemon, normally mkdir's it at startup). The pin must still land.
+    capture_dir = tmp_path / "rec"
+    supervisor = Supervisor(EventBus(), reconcile_on_init=False)
+    req = schema.RecordingStartRequest(
+        name="rec", output_dir=str(tmp_path), cloud_intent=True,
+    )
+
+    env = await supervisor._stage_engine_token(req, capture_dir)
+
+    from screencap import auth
+    assert env is not None and auth.ENGINE_TOKEN_FILE_ENV in env
+    assert supervisor._engine_token_uid == "uid-A"
+    assert read_owner_uid(capture_dir) == "uid-A"
+
+
+@pytest.mark.asyncio
+async def test_stage_engine_token_pin_write_failure_degrades_consistently(
+    tmp_path: Path, isolated_base_dir: Path, monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """A failed on-disk pin write must NOT leave the in-memory re-mint guard armed.
+
+    If ``write_owner_uid`` fails, the terminal stage will read no pin and won't
+    gate — so the daemon's in-memory ``_engine_token_uid`` must also be cleared,
+    or the two halves disagree (guard armed, disk unpinned). Both unpinned =
+    prior (unpinned) behavior. The start still succeeds (token staged, env set)."""
+    from screencap.catalog import read_owner_uid
+    from screencap.daemon.supervisor import Supervisor
+
+    monkeypatch.setattr(
+        "screencap.auth.get_id_token",
+        lambda force_refresh=False: _jwt({"user_id": "uid-A"}),
+    )
+
+    def _pin_boom(directory, uid):
+        raise OSError("disk full")
+
+    monkeypatch.setattr("screencap.catalog.write_owner_uid", _pin_boom)
+
+    capture_dir = tmp_path / "rec"
+    supervisor = Supervisor(EventBus(), reconcile_on_init=False)
+    req = schema.RecordingStartRequest(
+        name="rec", output_dir=str(tmp_path), cloud_intent=True,
+    )
+
+    env = await supervisor._stage_engine_token(req, capture_dir)
+
+    from screencap import auth
+    # Start still succeeds: token staged, env overlay returned.
+    assert env is not None and auth.ENGINE_TOKEN_FILE_ENV in env
+    # No disk pin landed, and the in-memory guard degraded to match it.
+    assert read_owner_uid(capture_dir) is None
+    assert supervisor._engine_token_uid is None
+
+
+@pytest.mark.asyncio
+async def test_token_refresh_loop_refuses_restage_on_uid_change(
+    isolated_base_dir: Path, monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """A re-mint whose uid differs from the pinned owner (the user switched
+    accounts mid-recording) must NOT be written to the engine token file — the
+    engine keeps account A's token and fails closed on expiry, so every chunk of
+    this recording stays in A's namespace."""
+    from screencap.daemon.supervisor import Supervisor
+
+    monkeypatch.setenv("SCREENCAP_DAEMON_TOKEN_REFRESH_INTERVAL", "0.01")
+    token_a = _jwt({"user_id": "uid-A"})
+    token_b = _jwt({"user_id": "uid-B"})
+    monkeypatch.setattr(
+        "screencap.auth.get_id_token", lambda force_refresh=False: token_b
+    )
+
+    path = isolated_base_dir / "run" / "engine-token-live.jwt"
+    path.parent.mkdir(parents=True, exist_ok=True)
+    Supervisor._write_engine_token_file(path, token_a)
+
+    supervisor = Supervisor(EventBus(), reconcile_on_init=False)
+    proc = _FakeAliveProc()
+    supervisor._proc = proc
+    supervisor._engine_token_file = path
+    supervisor._engine_token_uid = "uid-A"  # pinned at stage time
+
+    task = await _run_loop_briefly(supervisor, proc)
+    try:
+        # Spin several intervals; the foreign-uid token must never be restaged.
+        await asyncio.sleep(0.1)
+        assert not task.done(), "loop must keep running after refusing a restage"
+        assert path.read_text() == token_a, (
+            "engine token file must keep account A's token, not B's"
+        )
+    finally:
+        await _stop_loop(proc, task)
+
+
+@pytest.mark.asyncio
+async def test_token_refresh_loop_resumes_restage_after_switch_back_to_owner(
+    isolated_base_dir: Path, monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """After refusing foreign-uid re-mints, the loop must RESUME restaging once the
+    user switches back to the pinned account — a FRESH owner-uid token is written
+    to the engine token file (the recording keeps converging in A's namespace)."""
+    from screencap.daemon.supervisor import Supervisor
+
+    monkeypatch.setenv("SCREENCAP_DAEMON_TOKEN_REFRESH_INTERVAL", "0.01")
+    token_a = _jwt({"user_id": "uid-A"})
+    token_b = _jwt({"user_id": "uid-B"})
+    # A FRESH account-A token, distinct from the initial token_a, so the loop's
+    # ``token == last`` short-circuit doesn't mask the resumed write.
+    token_a2 = _jwt({"user_id": "uid-A", "iat": 1})
+    assert token_a2 != token_a
+    monkeypatch.setattr(
+        "screencap.auth.get_id_token", lambda force_refresh=False: token_b
+    )
+
+    path = isolated_base_dir / "run" / "engine-token-live.jwt"
+    path.parent.mkdir(parents=True, exist_ok=True)
+    Supervisor._write_engine_token_file(path, token_a)
+
+    supervisor = Supervisor(EventBus(), reconcile_on_init=False)
+    proc = _FakeAliveProc()
+    supervisor._proc = proc
+    supervisor._engine_token_file = path
+    supervisor._engine_token_uid = "uid-A"  # pinned at stage time
+
+    task = await _run_loop_briefly(supervisor, proc)
+    try:
+        # Phase 1: foreign uid-B is refused — the file keeps account A's token.
+        await asyncio.sleep(0.1)
+        assert path.read_text() == token_a, "must refuse the foreign-uid restage"
+        # Phase 2: the user switches back to A — the loop resumes restaging.
+        monkeypatch.setattr(
+            "screencap.auth.get_id_token", lambda force_refresh=False: token_a2
+        )
+        await _wait_until(lambda: path.read_text() == token_a2, timeout=2.0)
     finally:
         await _stop_loop(proc, task)
 
