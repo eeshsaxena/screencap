@@ -27,35 +27,95 @@ cross-project sequencing.
 
 ---
 
-## Pre-deploy gate (CRITICAL — read before deploying the function)
+## Deploy procedure (SCR-137) — restore the website
 
-The U2 function code **requires a Firebase bearer token** on `upload` / `list` /
-`sign-download`, **removes** the `get-index` action, and reshapes `gcs_prefix` to
-`users/{uid}/…`. The matching token-carrying clients (U5 remainder) and the website
-demo-repoint (U7) are deferred to follow-ups. So deploying this code **over the live
-`get-upload-urls`** would break every currently-shipped client:
+> **Status (2026-06-16): the earlier "do not deploy" gate is LIFTED.** SCR-138 (the
+> website repoint) shipped, so `screencap-website` now calls the tokenless `demo-*`
+> actions — but the live prod `get-upload-urls` still runs the OLD pre-isolation code
+> (verified: `POST {"action":"demo-list"}` → **HTTP 400**), so the public gallery is
+> broken. Deploying the merged `scripts/cloud-function/` code to prod is now the **fix**,
+> not a hazard to defer. The old options (hold / `get-upload-urls-v2` / a
+> `SCREENCAP_AUTH_ENABLED` flag) are **void** — see "Why deploying is now safe".
 
-- The current CLI (`upload.py` / `download.py`) and website send **no** bearer token →
-  every real-user action returns **401**.
-- `download.py`'s `fetch_session_index()` / `list_remote_sessions()` still POST
-  `{"action": "get-index"}`; the dispatcher now 400s it. (`fetch_session_index`
-  degrades to an empty index, so `list --remote` shows "no sessions" rather than
-  erroring — but `download --sessions` and all token-gated actions hard-fail.)
+### Why deploying is now safe (the old "401s all clients" risk is moot)
 
-The code is correct; this is a **deploy-sequencing hazard**, not a code defect. Pick
-ONE and do not deploy to the live function until it holds:
+The token-gated `upload` / `list` / `sign-download` actions require a Firebase bearer
+token, but **no shipped client can produce one**: `src/screencap/auth.py` still carries
+the `REPLACE_WITH_PROVISIONED_*` placeholders, and no released tag carries `authed_post`
+(verified absent through v0.20.0). So there is **no working user-upload flow to break**.
+Deploying the new code:
 
-1. **Sequence (default):** do not deploy over the live `get-upload-urls` until U5 (token
-   threading in `upload.py` / `download.py`) and U7 (website → `demo-*`) have shipped
-   and a token-carrying client is released.
-2. **New function name:** deploy as a *separate* function (e.g. `get-upload-urls-v2`)
-   and cut clients over only once they send tokens; retire the old function afterward.
-3. **Feature flag:** add a `SCREENCAP_AUTH_ENABLED` env so the deployed code falls
-   through to the legacy unauthenticated path until clients are ready.
+- turns the tokenless `demo-*` actions live (the website fix), and
+- lights up the token-gated `users/{uid}/…` path for *future* token-carrying releases
+  (enabled by the SCR-137 client-upload track — build-time cred injection, U1/U2).
 
-Also: when U5 removes the `--remote` / `--sessions` surface, remove
-`fetch_session_index` / `list_remote_sessions` from `download.py` so no shipped client
-calls the retired `get-index` action.
+The website uses only the tokenless `demo-*` path, so the website fix does **not** depend
+on the client-upload track.
+
+> Note on the retired `get-index`: the new dispatcher 400s `{"action":"get-index"}`. The
+> repointed website no longer calls it (SCR-138 dropped the `sessions/` routes), and no
+> token-carrying client ships, so nothing live depends on it. `download.py` still defines
+> `fetch_session_index` / `list_remote_sessions` (which degrade to an empty index) — their
+> removal rides with the deferred token-carrying client release, not this deploy.
+
+### Live targets (verified 2026-06-16 via `gcloud functions describe`)
+
+| | Function | URL | Bucket | SA |
+|---|---|---|---|---|
+| **prod** | `get-upload-urls` | `get-upload-urls-ld7izzjvga-rj.a.run.app` | `screencap-recordings-staging` | `screencap-signer@proteus-photos` |
+| **dev** | `get-upload-urls-dev` | `get-upload-urls-dev-ld7izzjvga-rj.a.run.app` | `screencap-recordings-dev-staging` | `screencap-signer@proteus-photos` |
+
+Both are gen2 / python312 / region `southamerica-east1`. Neither currently sets
+`SCREENCAP_PROJECT_ID` (old code) — **set it explicitly on every deploy**
+(`_resolve_project_id()` defaults to the literal `proteus-photos`, correct here, but
+pinning it is the documented guard against an off-project deploy).
+
+### ⚠️ `demo/` content pre-check (blocking for *videos*, not for *stops-erroring*)
+
+`gs://screencap-recordings-staging/demo/` is **empty** (verified 2026-06-16; the bucket
+holds only `recordings/` + `sessions/`). So after the prod deploy the website will stop
+erroring but render the **empty-gallery placeholder**, not videos. Showing videos needs
+the `demo/` promotion — **SCR-139** (no migration scripts in-repo yet). When reporting the
+result, state it explicitly: "deploy OK, `demo/` content pending (SCR-139)" so an empty
+gallery is not mistaken for a failed deploy.
+
+### Sequence
+
+1. **Dev-validate first** (U4) — deploy to `get-upload-urls-dev` (non-prod bucket), then
+   confirm `demo-*` dispatch + the tokenless-401 invariant + the token round-trip. Do not
+   let prod be the first live test of the new code. Recorded in the Live execution log.
+2. **Deploy to prod** (U5) — deploy over `get-upload-urls`, then verify the website + the
+   tokenless-401 invariant. Recorded in the Live execution log.
+
+The deploy command is the one in the `scripts/cloud-function/main.py` header; both the dev
+and prod invocations + their verification/rollback are captured in the **Live execution
+log** at the bottom of this runbook.
+
+### Verification (both dev and prod)
+
+- `firebase_admin initialized for project proteus-photos` in the function logs.
+- `POST {"action":"demo-list"}` returns **200** with a (possibly empty) list — not 400.
+- Tokenless `upload` / `list` / `sign-download` return **401** (the in-code gate; a CI
+  contract test asserts no tokenless request reaches a `users/` path).
+- A same-project Firebase token mints + verifies → uid; a foreign-project token → 401
+  (origin AE2 — a cross-user/foreign read is indistinguishable from "not found").
+- (prod) the website gallery loads via `demo-list` and a `demo-sign-download` plays —
+  *iff* `demo/` is populated (else the empty-gallery placeholder, per the pre-check).
+
+### Rollback
+
+Redeploy the previous (pre-isolation) function revision if `demo-*` or signing misbehaves
+(`gcloud run revisions list --region southamerica-east1`, then redeploy the prior source).
+**No recording data is mutated by the function**, so rollback is safe and stateless.
+
+### Client-upload track operator setup (independent of the website fix)
+
+To release a token-carrying client (so `screencap login` works in a shipped binary), add
+two **repository Secrets** (GitHub → Settings → Secrets and variables → Actions):
+`SCREENCAP_OAUTH_CLIENT_ID` and `SCREENCAP_FIREBASE_API_KEY` (values in the gitignored
+`.env`; non-secret by design). The release workflow injects them at build time and the
+fail-closed guard (`_auth-config-check`) blocks a placeholder binary. For local-release,
+export the same two values before building (see `.claude/skills/local-release/SKILL.md`).
 
 ---
 
@@ -179,8 +239,11 @@ gcloud functions logs read get-upload-urls --project proteus-photos \
 > **not committed** here — they live in the project-local `.env` (gitignored,
 > auto-loaded by `load_dotenv()` in `screencap/cli/__init__.py`) as
 > `SCREENCAP_OAUTH_CLIENT_ID` / `SCREENCAP_FIREBASE_API_KEY`. They are not secrets
-> (they ship in release binaries); for a shipped client they move into `auth.py`'s
-> defaults. Function deploy remains **gated** — see the Pre-deploy gate above.
+> (they ship in release binaries). For a shipped client they are **injected at build
+> time** into a gitignored `screencap._provisioned` module (SCR-137 U1/U2) — source
+> keeps the placeholders, nothing credential-looking is committed. The function deploy
+> is **no longer gated** — see "Deploy procedure (SCR-137)" above; dev + prod deploy
+> entries are logged below.
 
 | Item | Value | Notes |
 |------|-------|-------|
@@ -192,12 +255,19 @@ gcloud functions logs read get-upload-urls --project proteus-photos \
 | Disabled methods | ✅ email/pw, phone, anonymous left disabled | only Google was enabled |
 | `serviceAccountTokenCreator` confirmed | ✅ done (2026-06-04) | self-binding on the signer SA present (step 7 `gcloud` check) |
 
-**Provisioning (steps 1–7) is complete.** The only remaining item is the
-deliberately-**gated function deploy** (step 8 / Pre-deploy gate above) — deploying
-the token-verifying code over the live `get-upload-urls` would 401 current clients,
-so it waits on a token-carrying client release / a new function name / an auth flag.
-Client sign-in (`screencap login` / `whoami`) works today without the deploy once the
-two `.env` values are set.
+**Provisioning (steps 1–7) is complete.** The function deploy is no longer gated:
+SCR-138 shipped and the live website is broken on old code, so deploying the merged
+function is the fix (safe because no shipped client carries a token — see "Deploy
+procedure (SCR-137)" above). Dev-validate first, then prod; both are logged in the
+**Deploy log** below. Client sign-in (`screencap login` / `whoami`) works in dev today
+with the two `.env` values set; in a shipped binary it works once U1/U2 inject them.
+
+### Deploy log (SCR-137)
+
+| Target | Date | Outcome |
+|--------|------|---------|
+| _(dev validate — U4)_ | _pending_ | |
+| _(prod cutover — U5)_ | _pending_ | |
 
 ---
 
