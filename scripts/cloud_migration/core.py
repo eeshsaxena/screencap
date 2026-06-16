@@ -33,7 +33,7 @@ import re
 from dataclasses import dataclass
 from enum import Enum
 from pathlib import Path
-from typing import Callable, Iterable, Iterator
+from typing import Any, Callable, Iterable, Iterator, Literal, Protocol
 
 # --------------------------------------------------------------------------
 # Namespaces (all within the one shared recordings bucket) and constants
@@ -67,6 +67,50 @@ _DEMO_NAME_RE = re.compile(r"^[a-zA-Z0-9][a-zA-Z0-9._-]{0,255}$")
 _LIST_TIMEOUT = 60
 
 Log = Callable[[str], None]
+
+
+# --------------------------------------------------------------------------
+# Typed SDK-injection seam
+# --------------------------------------------------------------------------
+#
+# Structural ``Protocol``s capturing ONLY the GCS attributes/methods this module
+# actually touches. They keep ``core`` ``google.cloud``-free at import scope while
+# giving the entry points a real type for the injected client/bucket/blob, and the
+# in-memory test fake satisfies them structurally with no test changes.
+
+
+class GCSBlobProtocol(Protocol):
+    name: str
+    crc32c: str | None
+    content_type: str | None
+    size: int | None
+    generation: int | None
+
+    def rewrite(self, source: Any, token: str | None = ...) -> tuple[str | None, int, int]: ...
+
+    def reload(self) -> None: ...
+
+    def delete(self, **kwargs: Any) -> None: ...
+
+    def exists(self) -> bool: ...
+
+
+class GCSBucketProtocol(Protocol):
+    def blob(self, name: str) -> GCSBlobProtocol: ...
+
+    def get_blob(self, name: str) -> GCSBlobProtocol | None: ...
+
+    def list_blobs(self, *args: Any, **kwargs: Any) -> Iterable[GCSBlobProtocol]: ...
+
+    def get_iam_policy(self, *args: Any, **kwargs: Any) -> Any: ...
+
+    def set_iam_policy(self, policy: Any) -> Any: ...
+
+
+class GCSClientProtocol(Protocol):
+    def bucket(self, name: str) -> GCSBucketProtocol: ...
+
+    def list_blobs(self, *args: Any, **kwargs: Any) -> Iterable[GCSBlobProtocol]: ...
 
 
 class MigrationError(RuntimeError):
@@ -114,7 +158,9 @@ def map_key(key: str, src_prefix: str, dst_prefix: str) -> str | None:
 # --------------------------------------------------------------------------
 
 
-def iter_blobs(client, bucket_name: str, prefix: str) -> Iterator:
+def iter_blobs(
+    client: GCSClientProtocol, bucket_name: str, prefix: str
+) -> Iterator[GCSBlobProtocol]:
     """Yield blobs under ``prefix``, skipping any folder-placeholder (key==prefix)."""
     for blob in client.list_blobs(bucket_name, prefix=prefix, timeout=_LIST_TIMEOUT):
         if _remainder(blob.name, prefix) is None:
@@ -158,7 +204,7 @@ def verify_match(src, dst) -> str | None:
     return None
 
 
-def copy_blob(bucket, src_blob, dst_name: str):
+def copy_blob(bucket: GCSBucketProtocol, src_blob: GCSBlobProtocol, dst_name: str) -> Any:
     """``rewrite()`` ``src_blob`` into ``dst_name``, following ``rewriteToken`` to
     completion, and return the reloaded destination blob.
 
@@ -186,7 +232,7 @@ def _policy_bindings(policy) -> list:
     return list(getattr(policy, "bindings", policy))
 
 
-def find_public_iam_bindings(bucket) -> list[tuple[str, str]]:
+def find_public_iam_bindings(bucket: GCSBucketProtocol) -> list[tuple[str, str]]:
     """``(role, member)`` pairs granting ``allUsers``/``allAuthenticatedUsers`` anything.
 
     Any such binding can make ``import-review/`` objects world-readable by direct
@@ -202,7 +248,9 @@ def find_public_iam_bindings(bucket) -> list[tuple[str, str]]:
     return found
 
 
-def remove_public_iam_bindings(bucket, *, log: Log = print) -> list[tuple[str, str]]:
+def remove_public_iam_bindings(
+    bucket: GCSBucketProtocol, *, log: Log = print
+) -> list[tuple[str, str]]:
     """Strip every ``allUsers``/``allAuthenticatedUsers`` member, write the policy
     back, and re-read to assert they are gone. Returns the removed ``(role, member)``
     pairs. Mutates bucket-wide access — opt-in only.
@@ -319,7 +367,7 @@ class CopyOutcome:
     src: str
     dst: str
     # planned (dry-run) | copied | recopied | skipped-verified | failed
-    action: str
+    action: Literal["planned", "copied", "recopied", "skipped-verified", "failed"]
     reason: str = ""
 
     @property
@@ -328,10 +376,9 @@ class CopyOutcome:
 
 
 @dataclass
-class _CopyResult:
-    """Base for results carrying a list of copy outcomes (stage + promote)."""
-
+class StageResult:
     outcomes: list[CopyOutcome]
+    manifest: dict
 
     @property
     def failures(self) -> list[CopyOutcome]:
@@ -343,40 +390,64 @@ class _CopyResult:
 
 
 @dataclass
-class StageResult(_CopyResult):
-    manifest: dict
-
-
-@dataclass
-class PromoteResult(_CopyResult):
+class PromoteResult:
+    outcomes: list[CopyOutcome]
     promoted: list[str]
     stripped_markers: list[str]
     missing_from_staging: list[str]
     invalid_names: list[str]
+    # Allow-listed names present in staging only as marker blobs (no promotable
+    # content) — neither promoted nor "missing"; surfaced distinctly (fix #8).
+    marker_only: list[str]
+
+    @property
+    def failures(self) -> list[CopyOutcome]:
+        return [o for o in self.outcomes if o.action == "failed"]
+
+    @property
+    def ok(self) -> bool:
+        return not self.failures
 
 
-def _copy_one(bucket, src_blob, dst_name: str, *, dry_run: bool, log: Log) -> CopyOutcome:
+def _copy_one(
+    bucket: GCSBucketProtocol,
+    src_blob: GCSBlobProtocol,
+    dst_name: str,
+    *,
+    dry_run: bool,
+    log: Log,
+) -> CopyOutcome:
     """Idempotent, checksum-gated copy of one blob (shared by stage + promote).
 
     Trusts a checksum match to skip, re-copies on mismatch (never on existence
-    alone), verifies the fresh copy, and never deletes anything.
+    alone), verifies the fresh copy, and never deletes anything. A GCS error on
+    any single object is captured as a ``failed`` outcome (not propagated) so the
+    caller's loop continues and still writes a manifest with an accurate failure
+    count.
     """
-    # One GET fetches existence + metadata (None when absent) — no separate
-    # exists()+reload() round-trip.
-    dst = bucket.get_blob(dst_name)
-    already = dst is not None
-    mismatch = verify_match(src_blob, dst) if already else None
-    if already and mismatch is None:
-        log(f"  = {src_blob.name} -> {dst_name} (already present, verified) skip")
-        return CopyOutcome(src_blob.name, dst_name, "skipped-verified")
+    # google.api_core is imported lazily so core stays SDK-free at import scope.
+    from google.api_core.exceptions import GoogleAPICallError
 
-    if dry_run:
-        why = f"re-copy ({mismatch})" if already else "copy"
-        log(f"  + [dry-run] {src_blob.name} -> {dst_name} ({why})")
-        return CopyOutcome(src_blob.name, dst_name, "planned")
+    try:
+        # One GET fetches existence + metadata (None when absent) — no separate
+        # exists()+reload() round-trip.
+        dst = bucket.get_blob(dst_name)
+        already = dst is not None
+        mismatch = verify_match(src_blob, dst) if already else None
+        if already and mismatch is None:
+            log(f"  = {src_blob.name} -> {dst_name} (already present, verified) skip")
+            return CopyOutcome(src_blob.name, dst_name, "skipped-verified")
 
-    fresh = copy_blob(bucket, src_blob, dst_name)
-    mismatch = verify_match(src_blob, fresh)
+        if dry_run:
+            why = f"re-copy ({mismatch})" if already else "copy"
+            log(f"  + [dry-run] {src_blob.name} -> {dst_name} ({why})")
+            return CopyOutcome(src_blob.name, dst_name, "planned")
+
+        fresh = copy_blob(bucket, src_blob, dst_name)
+        mismatch = verify_match(src_blob, fresh)
+    except GoogleAPICallError as exc:
+        log(f"  ! {src_blob.name} -> {dst_name} FAILED (GCS error): {exc}")
+        return CopyOutcome(src_blob.name, dst_name, "failed", f"error: {exc}")
     if mismatch is not None:
         log(f"  ! {src_blob.name} -> {dst_name} FAILED verify: {mismatch}")
         return CopyOutcome(src_blob.name, dst_name, "failed", mismatch)
@@ -387,12 +458,13 @@ def _copy_one(bucket, src_blob, dst_name: str, *, dry_run: bool, log: Log) -> Co
 
 def run_stage(
     *,
-    client,
+    client: GCSClientProtocol,
     bucket_name: str,
     dry_run: bool,
     remove_public_iam: bool = False,
     confirm_quiesced: bool = False,
     probe: Callable[[], RecordingState] | None = None,
+    on_outcome: Callable[[CopyOutcome], None] | None = None,
     log: Log = print,
 ) -> StageResult:
     """U8 stage: copy flat ``recordings/`` into private ``import-review/``.
@@ -400,6 +472,11 @@ def run_stage(
     Runs the bucket-IAM pre-check FIRST, then the quiesce guard, then a per-object
     verified rewrite. ``sessions/`` is EXCLUDED by design (demo is a recordings
     gallery; its index references retired flat paths). No source is ever deleted.
+
+    ``on_outcome`` (optional) is invoked with each :class:`CopyOutcome` AS the
+    copy loop runs, so a long interrupted run can leave incremental provenance
+    (the shim appends a ``.partial.jsonl`` sidecar). The final ``.json`` manifest
+    is unchanged.
     """
     bucket = client.bucket(bucket_name)
 
@@ -436,6 +513,8 @@ def run_stage(
         dst_name = map_key(src_blob.name, FLAT_RECORDINGS_PREFIX, STAGING_PREFIX)
         outcome = _copy_one(bucket, src_blob, dst_name, dry_run=dry_run, log=log)
         outcomes.append(outcome)
+        if on_outcome is not None:
+            on_outcome(outcome)
         objects[src_blob.name] = {
             "dst": dst_name,
             "action": outcome.action,
@@ -452,7 +531,7 @@ def run_stage(
         "object_count": len(objects),
         "objects": objects,
     }
-    result = StageResult(outcomes, manifest)
+    result = StageResult(outcomes=outcomes, manifest=manifest)
     log(
         f"stage summary: {len(outcomes)} objects, {len(result.failures)} "
         f"failed verify, dry_run={dry_run}"
@@ -462,7 +541,7 @@ def run_stage(
 
 def run_promote(
     *,
-    client,
+    client: GCSClientProtocol,
     bucket_name: str,
     allow_list: Iterable[str],
     dry_run: bool,
@@ -488,7 +567,12 @@ def run_promote(
     promoted: set[str] = set()
     stripped: list[str] = []
     invalid: set[str] = set()
+    # Names seen at all in staging (any blob, marker or not) vs names seen with at
+    # least one PROMOTABLE (non-marker) content blob. A recording present only as
+    # marker blobs is "seen" (so not "missing") but produces no demo object, so it
+    # must be surfaced distinctly rather than silently dropped (fix #8).
     seen_names: set[str] = set()
+    content_seen: set[str] = set()
 
     for src_blob in iter_blobs(client, bucket_name, STAGING_PREFIX):
         rem = _remainder(src_blob.name, STAGING_PREFIX)  # {name}/{suffix}; never None
@@ -496,7 +580,13 @@ def run_promote(
         if len(parts) < 2 or not parts[1]:
             continue  # bare-name placeholder, no file suffix
         name, suffix = parts
-        seen_names.add(name)  # only count names with real content as "seen"
+        # Hard guard: never promote the retired ``sessions`` namespace into public
+        # ``demo/``, even if an allow-list typo names it. ``sessions`` has no demo
+        # representation; promoting it would publish retired session data (fix #11).
+        if name == "sessions":
+            log(f"  ! refusing to promote reserved name 'sessions' ({src_blob.name})")
+            continue
+        seen_names.add(name)  # name present in staging (marker or content)
         if name not in allow:
             continue
         if not is_valid_demo_name(name):
@@ -510,6 +600,7 @@ def run_promote(
             stripped.append(src_blob.name)
             log(f"  - {src_blob.name} (stripping superseded marker '{suffix}')")
             continue
+        content_seen.add(name)  # a real, promotable (non-marker) blob for this name
         dst_name = map_key(src_blob.name, STAGING_PREFIX, DEMO_PREFIX)
         outcome = _copy_one(bucket, src_blob, dst_name, dry_run=dry_run, log=log)
         outcomes.append(outcome)
@@ -519,10 +610,26 @@ def run_promote(
     missing = sorted(allow - seen_names - invalid)
     for name in missing:
         log(f"  ! allow-listed recording not found in staging: {name!r}")
-    result = PromoteResult(outcomes, sorted(promoted), stripped, missing, sorted(invalid))
+    # Allow-listed, name-valid, present in staging, but ONLY as marker blobs — no
+    # demo object was produced. Neither "promoted" nor "missing"; surfaced so the
+    # shim can exit non-zero (same treatment as missing).
+    marker_only = sorted(
+        n for n in (allow & seen_names) - invalid if n not in content_seen
+    )
+    for name in marker_only:
+        log(f"  ! allow-listed recording has only marker blobs in staging (nothing to promote): {name!r}")
+    result = PromoteResult(
+        outcomes=outcomes,
+        promoted=sorted(promoted),
+        stripped_markers=stripped,
+        missing_from_staging=missing,
+        invalid_names=sorted(invalid),
+        marker_only=marker_only,
+    )
     log(
         f"promote summary: {len(promoted)} recordings, {len(stripped)} markers "
-        f"stripped, {len(missing)} missing, {len(invalid)} invalid-name skipped, "
+        f"stripped, {len(missing)} missing, {len(marker_only)} marker-only, "
+        f"{len(invalid)} invalid-name skipped, "
         f"{len(result.failures)} failed verify, dry_run={dry_run}"
     )
     return result
@@ -537,7 +644,7 @@ def run_promote(
 class DeleteOutcome:
     src: str
     # planned (dry-run) | deleted | kept
-    action: str
+    action: Literal["planned", "deleted", "kept"]
     reason: str = ""
 
 
@@ -564,13 +671,20 @@ class DecommissionResult:
     def kept(self) -> list[DeleteOutcome]:
         return [o for o in self.outcomes if o.action == "kept"]
 
+    @property
+    def kept_on_error(self) -> list[DeleteOutcome]:
+        """Sources KEPT because a GCS error (not a clean gate refusal) interrupted
+        their delete — the run is partial/incomplete and the shim exits non-zero."""
+        return [o for o in self.kept if o.reason.startswith("error: ")]
+
 
 def run_decommission(
     *,
-    client,
+    client: GCSClientProtocol,
     bucket_name: str,
     include_sessions: bool,
     dry_run: bool,
+    sessions_backup_confirmed: bool = False,
     confirm_quiesced: bool = False,
     probe: Callable[[], RecordingState] | None = None,
     log: Log = print,
@@ -580,13 +694,34 @@ def run_decommission(
     Each ``recordings/`` delete is gated on a FRESH live re-verify of its
     ``import-review/`` staging copy (crc32c + content_type) — the manifest is a
     hint, the live re-confirm is proof; a source whose staging copy is missing or
-    mismatched is KEPT, never deleted. ``sessions/`` is retired data with no
-    staging copy, so it is deleted only behind an explicit ``include_sessions``
-    opt-in. A post-run re-scan asserts the prefixes are empty and surfaces any new
-    flat blob (a missed-write race) rather than deleting it.
+    mismatched is KEPT, never deleted. The verified delete is additionally
+    generation-pinned (``if_generation_match``) to the generation captured at
+    enumeration, so a racing overwrite between verify and delete is refused (the
+    source is KEPT) rather than silently destroying newer bytes. A GCS error on a
+    single delete also KEEPS that source (recorded as ``kept`` with reason
+    ``error: …``) so the run still produces a complete deleted/kept accounting.
+
+    ``sessions/`` is retired data with no staging copy, so it is deleted only
+    behind an explicit ``include_sessions`` opt-in, AND only once the operator has
+    attested (``sessions_backup_confirmed``) that the zkairdrop session archive is
+    accessible — there is no staging copy to fall back on. A post-run re-scan
+    asserts the prefixes are empty and surfaces any new flat blob (a missed-write
+    race) rather than deleting it.
     """
+    # Lazy SDK imports — keep core ``google.cloud``-free at import scope.
+    from google.api_core.exceptions import GoogleAPICallError, PreconditionFailed
+
     bucket = client.bucket(bucket_name)
     assert_quiesced(confirm_quiesced=confirm_quiesced, probe=probe, log=log)
+
+    # Sessions are irreplaceable (no staging copy). Refuse the sessions delete loop
+    # unless the operator has explicitly attested the zkairdrop archive is
+    # accessible — fail-closed, BEFORE any delete touches the bucket.
+    if include_sessions and not sessions_backup_confirmed:
+        raise MigrationError(
+            "pass --sessions-backup-confirmed after verifying the zkairdrop archive "
+            "is accessible — sessions/ has no staging copy to fall back on"
+        )
 
     outcomes: list[DeleteOutcome] = []
     handled: set[str] = set()
@@ -594,6 +729,9 @@ def run_decommission(
     # recordings/ — gated per-object on a verified staging copy.
     for src_blob in iter_blobs(client, bucket_name, FLAT_RECORDINGS_PREFIX):
         handled.add(src_blob.name)
+        # Pin the source generation observed at enumeration; the delete below
+        # refuses (PreconditionFailed) if the source was overwritten since.
+        gen = getattr(src_blob, "generation", None)
         staging_name = map_key(src_blob.name, FLAT_RECORDINGS_PREFIX, STAGING_PREFIX)
         # One GET fetches the staging copy + its metadata (None when absent).
         staging = bucket.get_blob(staging_name)
@@ -612,11 +750,27 @@ def run_decommission(
             outcomes.append(DeleteOutcome(src_blob.name, "planned", "verified-in-staging"))
             log(f"  - [dry-run] DELETE {src_blob.name} (verified-in-staging)")
             continue
-        src_blob.delete()
+        try:
+            src_blob.delete(if_generation_match=gen)
+        except PreconditionFailed:
+            # The source changed between verify and delete (generation mismatch).
+            # The staging copy we verified no longer matches the live source —
+            # KEEP it; deleting would destroy un-staged newer bytes.
+            outcomes.append(
+                DeleteOutcome(
+                    src_blob.name, "kept", "source changed since enumeration (generation mismatch)"
+                )
+            )
+            log(f"  ✗ KEEP {src_blob.name} (source changed since enumeration — generation mismatch)")
+            continue
+        except GoogleAPICallError as exc:
+            outcomes.append(DeleteOutcome(src_blob.name, "kept", f"error: {exc}"))
+            log(f"  ✗ KEEP {src_blob.name} (GCS error during delete: {exc})")
+            continue
         outcomes.append(DeleteOutcome(src_blob.name, "deleted", "verified-in-staging"))
         log(f"  - DELETE {src_blob.name} (verified-in-staging)")
 
-    # sessions/ — retired, not staged anywhere; opt-in only.
+    # sessions/ — retired, not staged anywhere; opt-in + backup-attestation only.
     if include_sessions:
         for src_blob in iter_blobs(client, bucket_name, FLAT_SESSIONS_PREFIX):
             handled.add(src_blob.name)
@@ -624,7 +778,12 @@ def run_decommission(
                 outcomes.append(DeleteOutcome(src_blob.name, "planned", "retired session"))
                 log(f"  - [dry-run] DELETE {src_blob.name} (retired session)")
                 continue
-            src_blob.delete()
+            try:
+                src_blob.delete()
+            except GoogleAPICallError as exc:
+                outcomes.append(DeleteOutcome(src_blob.name, "kept", f"error: {exc}"))
+                log(f"  ✗ KEEP {src_blob.name} (GCS error during delete: {exc})")
+                continue
             outcomes.append(DeleteOutcome(src_blob.name, "deleted", "retired session"))
             log(f"  - DELETE {src_blob.name} (retired session)")
 
@@ -635,7 +794,12 @@ def run_decommission(
 
 
 def _rescan(
-    client, bucket_name: str, include_sessions: bool, *, handled: set[str], log: Log
+    client: GCSClientProtocol,
+    bucket_name: str,
+    include_sessions: bool,
+    *,
+    handled: set[str],
+    log: Log,
 ) -> RescanResult:
     """Post-decommission re-scan: report leftovers and flag any blob not seen at
     delete time (a write that raced past U8's quiesce)."""

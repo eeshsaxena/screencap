@@ -26,6 +26,8 @@ Usage::
 from __future__ import annotations
 
 import argparse
+import dataclasses
+import json
 import sys
 
 from cloud_migration import core
@@ -55,6 +57,21 @@ def _parse_args(argv):
 def main(argv=None) -> int:
     args = _parse_args(argv if argv is not None else sys.argv[1:])
     client = core.build_client(args.project)
+
+    # Compute paths up-front so the incremental sidecar lands next to the final
+    # manifest (and uses the same dry-run suffixing).
+    manifest_path = args.manifest + (".dryrun.json" if args.dry_run else "")
+    partial_path = manifest_path + ".partial.jsonl"
+
+    # Append one JSON line per CopyOutcome AS the stage loop runs, flushing per
+    # line, so an interrupted long run still leaves per-object provenance. The
+    # final ``.json`` manifest below is unchanged in format.
+    partial_fp = open(partial_path, "w", encoding="utf-8")  # noqa: SIM115
+
+    def _record(outcome: core.CopyOutcome) -> None:
+        partial_fp.write(json.dumps(dataclasses.asdict(outcome), sort_keys=True) + "\n")
+        partial_fp.flush()
+
     try:
         result = core.run_stage(
             client=client,
@@ -62,14 +79,16 @@ def main(argv=None) -> int:
             dry_run=args.dry_run,
             remove_public_iam=args.remove_public_iam,
             confirm_quiesced=args.confirm_quiesced,
+            on_outcome=_record,
         )
     except core.MigrationError as exc:
         print(f"ERROR: {exc}", file=sys.stderr)
         return 2
+    finally:
+        partial_fp.close()
 
     # Write the manifest; on a dry-run, to a sidecar path so it can't clobber a
     # real one. U9 re-verifies live regardless — the manifest is provenance.
-    manifest_path = args.manifest + (".dryrun.json" if args.dry_run else "")
     core.write_manifest(manifest_path, result.manifest)
 
     if not result.ok:

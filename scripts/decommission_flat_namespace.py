@@ -47,6 +47,15 @@ def _parse_args(argv):
         help="Also delete retired sessions/ blobs (no staging copy exists to gate on)",
     )
     p.add_argument(
+        "--sessions-backup-confirmed",
+        action="store_true",
+        help=(
+            "Required alongside --include-sessions: attest the zkairdrop session "
+            "archive is accessible. sessions/ has no staging copy, so this is the "
+            "only backup gate before the irreversible session delete."
+        ),
+    )
+    p.add_argument(
         "--confirm-quiesced",
         action="store_true",
         help="Attest the flat write path is closed when status is unavailable",
@@ -74,6 +83,7 @@ def main(argv=None) -> int:
             bucket_name=args.bucket,
             include_sessions=args.include_sessions,
             dry_run=args.dry_run,
+            sessions_backup_confirmed=args.sessions_backup_confirmed,
             confirm_quiesced=args.confirm_quiesced,
         )
     except core.MigrationError as exc:
@@ -87,6 +97,18 @@ def main(argv=None) -> int:
             "gate held; re-stage them before they can be decommissioned.",
             file=sys.stderr,
         )
+
+    # A source KEPT because a GCS error interrupted its delete means the run is
+    # partial — exit non-zero so a pipeline / `set -e` run does not treat an
+    # incomplete decommission as clean.
+    kept_on_error = result.kept_on_error
+    if kept_on_error:
+        print(
+            f"ERROR: {len(kept_on_error)} object(s) KEPT due to a GCS error during "
+            "delete — the decommission is incomplete; re-run after investigating.",
+            file=sys.stderr,
+        )
+        return 1
 
     rescan = result.rescan
     if rescan is not None:

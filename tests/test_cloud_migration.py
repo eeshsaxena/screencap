@@ -51,12 +51,13 @@ class FakeStore:
         self.deleted: list[str] = []
 
     def add(self, name, *, crc32c=None, content_type="application/octet-stream",
-            size=10, md5_hash=None):
+            size=10, md5_hash=None, generation=1):
         self.objects[name] = {
             "crc32c": crc32c if crc32c is not None else f"crc-{name}",
             "content_type": content_type,
             "size": size,
             "md5_hash": md5_hash,
+            "generation": generation,
         }
 
 
@@ -73,8 +74,10 @@ class FakeBlob:
             self.content_type = rec["content_type"]
             self.size = rec["size"]
             self.md5_hash = rec.get("md5_hash")
+            self.generation = rec.get("generation", 1)
         else:
             self.crc32c = self.content_type = self.size = self.md5_hash = None
+            self.generation = None
 
     def exists(self):
         return self.name in self._store.objects
@@ -82,7 +85,19 @@ class FakeBlob:
     def reload(self):
         self._load()
 
-    def delete(self):
+    def delete(self, if_generation_match=None):
+        """Honor an ``if_generation_match`` precondition like google's Blob.delete:
+        raise PreconditionFailed (HTTP 412) when it does not match the CURRENT live
+        generation — modeling a racing overwrite between enumeration and delete."""
+        rec = self._store.objects.get(self.name)
+        if if_generation_match is not None and rec is not None:
+            live_gen = rec.get("generation", 1)
+            if live_gen != if_generation_match:
+                from google.api_core.exceptions import PreconditionFailed
+
+                raise PreconditionFailed(
+                    f"generation mismatch (expected {if_generation_match}, live {live_gen})"
+                )
         self._store.objects.pop(self.name, None)
         self._store.deleted.append(self.name)
 
@@ -595,11 +610,11 @@ def test_decommission_sessions_only_with_opt_in(store, client):
     )
     assert store.deleted == []
 
-    # With the opt-in, retired sessions are deleted (no staging gate — they were
-    # never migrated).
+    # With the opt-in AND the backup attestation, retired sessions are deleted (no
+    # staging gate — they were never migrated; the zkairdrop archive is the backup).
     result = core.run_decommission(
         client=client, bucket_name=BUCKET, include_sessions=True, dry_run=False,
-        probe=IDLE, log=lambda _m: None,
+        sessions_backup_confirmed=True, probe=IDLE, log=lambda _m: None,
     )
     assert set(store.deleted) == {"sessions/_index.json", "sessions/foo/data.json"}
     assert result.rescan.empty
@@ -755,3 +770,221 @@ def test_decommission_cli_new_blob_returns_rc1(store, client, patch_build_client
     client.list_blobs = racing_list
     rc = decom_cli.main(["--bucket", BUCKET, "--confirm"])
     assert rc == 1  # new flat blob since enumeration — R11 not satisfied
+
+
+# --------------------------------------------------------------------------
+# U9 — generation-pinned delete (verify→delete atomicity)
+# --------------------------------------------------------------------------
+
+
+def test_decommission_keeps_source_changed_since_enumeration(store, client):
+    # The source verifies against staging at enumeration, but is OVERWRITTEN (its
+    # live generation bumps) before the delete fires. The generation-pinned delete
+    # must refuse (PreconditionFailed) and KEEP the source rather than destroy the
+    # newer, un-staged bytes.
+    _seed_flat_with_staging(store)
+
+    orig_get_blob = FakeBucket.get_blob
+    bumped = {"done": False}
+
+    # Wrap get_blob so the verify GET for the video's staging copy advances the
+    # LIVE source generation — modeling a racing overwrite that lands between the
+    # verify and the (now-stale-generation) delete.
+    def get_blob_then_bump(self, name):
+        res = orig_get_blob(self, name)
+        if name == "import-review/alpha/video.mp4" and not bumped["done"]:
+            bumped["done"] = True
+            store.objects["recordings/alpha/video.mp4"]["generation"] = 99
+        return res
+
+    FakeBucket.get_blob = get_blob_then_bump
+    try:
+        result = core.run_decommission(
+            client=client, bucket_name=BUCKET, include_sessions=False, dry_run=False,
+            probe=IDLE, log=lambda _m: None,
+        )
+    finally:
+        FakeBucket.get_blob = orig_get_blob
+
+    # The video source CHANGED since enumeration → KEPT, not deleted.
+    assert "recordings/alpha/video.mp4" not in store.deleted
+    assert "recordings/alpha/video.mp4" in store.objects
+    kept_video = [o for o in result.kept if o.src == "recordings/alpha/video.mp4"]
+    assert kept_video and "generation mismatch" in kept_video[0].reason
+    # The unchanged manifest source still deletes normally.
+    assert "recordings/alpha/manifest.json" in store.deleted
+
+
+# --------------------------------------------------------------------------
+# U9 — partial accounting on a GCS error during delete
+# --------------------------------------------------------------------------
+
+
+def test_decommission_keeps_source_on_gcs_error_and_continues(store, client):
+    from google.api_core.exceptions import GoogleAPICallError
+
+    _seed_flat_with_staging(store)
+
+    orig_delete = FakeBlob.delete
+
+    def flaky_delete(self, if_generation_match=None):
+        if self.name == "recordings/alpha/video.mp4":
+            raise GoogleAPICallError("simulated transient GCS error")
+        return orig_delete(self, if_generation_match=if_generation_match)
+
+    FakeBlob.delete = flaky_delete
+    try:
+        result = core.run_decommission(
+            client=client, bucket_name=BUCKET, include_sessions=False, dry_run=False,
+            probe=IDLE, log=lambda _m: None,
+        )
+    finally:
+        FakeBlob.delete = orig_delete
+
+    # The errored object is KEPT (never marked deleted) but the loop CONTINUED and
+    # deleted the other verified source — a complete deleted/kept accounting.
+    assert "recordings/alpha/video.mp4" not in store.deleted
+    assert "recordings/alpha/manifest.json" in store.deleted
+    assert any(o.src == "recordings/alpha/video.mp4" and o.action == "kept" for o in result.outcomes)
+    assert result.kept_on_error and result.kept_on_error[0].reason.startswith("error: ")
+
+
+# --------------------------------------------------------------------------
+# U9 — sessions backup gate
+# --------------------------------------------------------------------------
+
+
+def test_decommission_sessions_withheld_without_backup_confirmation(store, client):
+    store.add("sessions/_index.json", crc32c="S", content_type="application/json")
+    # --include-sessions without the backup attestation must refuse (fail-closed)
+    # BEFORE any delete — sessions/ has no staging copy to fall back on.
+    with pytest.raises(MigrationError, match="sessions-backup-confirmed"):
+        core.run_decommission(
+            client=client, bucket_name=BUCKET, include_sessions=True, dry_run=False,
+            sessions_backup_confirmed=False, probe=IDLE, log=lambda _m: None,
+        )
+    assert store.deleted == []  # nothing touched
+
+    # With BOTH the opt-in and the attestation, retired sessions are deleted.
+    result = core.run_decommission(
+        client=client, bucket_name=BUCKET, include_sessions=True, dry_run=False,
+        sessions_backup_confirmed=True, probe=IDLE, log=lambda _m: None,
+    )
+    assert "sessions/_index.json" in store.deleted
+    assert result.rescan.empty
+
+
+def test_decommission_cli_include_sessions_requires_backup_flag(store, client, patch_build_client):
+    import decommission_flat_namespace as decom_cli
+
+    store.add("sessions/_index.json", crc32c="S", content_type="application/json")
+    rc = decom_cli.main(["--bucket", BUCKET, "--confirm", "--include-sessions"])
+    assert rc == 2  # MigrationError (backup not confirmed) -> exit 2
+    assert store.deleted == []
+
+    rc = decom_cli.main(
+        ["--bucket", BUCKET, "--confirm", "--include-sessions", "--sessions-backup-confirmed"]
+    )
+    assert rc == 0
+    assert "sessions/_index.json" in store.deleted
+
+
+# --------------------------------------------------------------------------
+# U9 — keep-path integration (fail-closed crc32c on staging)
+# --------------------------------------------------------------------------
+
+
+def test_decommission_keeps_source_when_staging_crc_unavailable(store, client):
+    # Source has a real crc32c; its staging copy exposes crc32c=None (a composite
+    # object). verify_match fails closed → the source must be KEPT, not deleted.
+    store.add("recordings/comp/video.mp4", crc32c="REAL", content_type="video/mp4")
+    store.objects["import-review/comp/video.mp4"] = {
+        "crc32c": None, "content_type": "video/mp4", "size": 10, "md5_hash": None,
+        "generation": 1,
+    }
+    result = core.run_decommission(
+        client=client, bucket_name=BUCKET, include_sessions=False, dry_run=False,
+        probe=IDLE, log=lambda _m: None,
+    )
+    assert store.deleted == []
+    assert "recordings/comp/video.mp4" in store.objects
+    [outcome] = [o for o in result.outcomes if o.src == "recordings/comp/video.mp4"]
+    assert outcome.action == "kept"
+
+
+# --------------------------------------------------------------------------
+# U8 — promote: marker-only recordings + sessions exclusion
+# --------------------------------------------------------------------------
+
+
+def test_promote_marker_only_recording_surfaced_not_silently_dropped(store, client):
+    # An allow-listed recording present in staging ONLY as marker blobs produces no
+    # demo object — it must be surfaced as marker_only, not silently dropped, and
+    # not reported as missing.
+    store.add("import-review/markeronly/_unlisted", content_type="application/octet-stream", size=0)
+    store.add("import-review/markeronly/show_on_website", content_type="application/octet-stream", size=0)
+    result = core.run_promote(
+        client=client, bucket_name=BUCKET, allow_list=["markeronly"], dry_run=False,
+        log=lambda _m: None,
+    )
+    assert result.marker_only == ["markeronly"]
+    assert result.missing_from_staging == []  # it WAS present (as markers)
+    assert result.promoted == []
+    assert not any(k.startswith("demo/markeronly/") for k in store.objects)
+
+
+def test_promote_cli_marker_only_returns_rc1(store, client, patch_build_client, tmp_path):
+    import promote_staging_to_demo as promote_cli
+
+    store.add("import-review/markeronly/_unlisted", content_type="application/octet-stream", size=0)
+    allow = tmp_path / "allow.txt"
+    allow.write_text("markeronly\n")
+    rc = promote_cli.main(["--bucket", BUCKET, "--allow-list", str(allow)])
+    assert rc == 1  # nothing actually promoted — not a complete promote
+
+
+def test_promote_refuses_sessions_name(store, client):
+    # An allow-list typo naming 'sessions' must never publish retired session data
+    # to public demo/.
+    store.add("import-review/sessions/_index.json", content_type="application/json")
+    result = core.run_promote(
+        client=client, bucket_name=BUCKET, allow_list=["sessions"], dry_run=False,
+        log=lambda _m: None,
+    )
+    assert not any(k.startswith("demo/sessions") for k in store.objects)
+    assert result.promoted == []
+
+
+# --------------------------------------------------------------------------
+# Validator agreement — core.is_valid_demo_name vs the function's is_valid_name
+# --------------------------------------------------------------------------
+
+
+def test_demo_name_validator_agrees_with_cloud_function_paths():
+    # The migration's "reaches demo/" guard MUST agree with the function's
+    # "listable + playable" guard, or a promoted name could be hidden-but-public
+    # (or a servable name wrongly skipped). Import the function's is_valid_name via
+    # the same scripts/ sys.path injection the module already set up, then assert
+    # the two validators agree over a shared corpus. Fall back to a regex-literal
+    # equality check if the function module cannot be imported.
+    import importlib.util
+
+    paths_file = _SCRIPTS / "cloud-function" / "paths.py"
+    spec = importlib.util.spec_from_file_location("_cf_paths", paths_file)
+    corpus = [
+        # valid
+        "alpha", "a", "demo-2024", "rec_01", "x.y.z", "A1", "0start", "ok-name",
+        # invalid / traversal
+        "..", "..evil", "a/b", "foo/", "/foo", "", ".", "a..b/c",
+        "a b", "naïve", "with space", "tab\tname", "-leadingdash",
+    ]
+    if spec is not None and spec.loader is not None:
+        cf_paths = importlib.util.module_from_spec(spec)
+        spec.loader.exec_module(cf_paths)
+        for name in corpus:
+            assert core.is_valid_demo_name(name) == cf_paths.is_valid_name(name), (
+                f"validator divergence on {name!r}: "
+                f"core={core.is_valid_demo_name(name)} cf={cf_paths.is_valid_name(name)}"
+            )
+    else:  # pragma: no cover — import seam present in this layout
+        assert core._DEMO_NAME_RE.pattern == r"^[a-zA-Z0-9][a-zA-Z0-9._-]{0,255}$"

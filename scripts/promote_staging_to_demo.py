@@ -39,7 +39,14 @@ def _parse_args(argv):
 
 def main(argv=None) -> int:
     args = _parse_args(argv if argv is not None else sys.argv[1:])
-    allow = core.load_allow_list(args.allow_list)
+    try:
+        allow = core.load_allow_list(args.allow_list)
+    except OSError as exc:
+        print(
+            f"ERROR: cannot read allow-list {args.allow_list!r}: {exc}",
+            file=sys.stderr,
+        )
+        return 2
     if not allow:
         print(
             f"ERROR: allow-list {args.allow_list!r} is empty — nothing to promote. "
@@ -50,12 +57,19 @@ def main(argv=None) -> int:
     print(f"allow-list: {len(allow)} recording(s) cleared for public demo/")
 
     client = core.build_client(args.project)
-    result = core.run_promote(
-        client=client,
-        bucket_name=args.bucket,
-        allow_list=allow,
-        dry_run=args.dry_run,
-    )
+    try:
+        result = core.run_promote(
+            client=client,
+            bucket_name=args.bucket,
+            allow_list=allow,
+            dry_run=args.dry_run,
+        )
+    except core.MigrationError as exc:
+        print(f"ERROR: {exc}", file=sys.stderr)
+        return 2
+    except _gcs_call_error() as exc:
+        print(f"ERROR: GCS error during promote: {exc}", file=sys.stderr)
+        return 1
 
     if result.invalid_names:
         print(
@@ -69,6 +83,12 @@ def main(argv=None) -> int:
             f"{', '.join(result.missing_from_staging)}",
             file=sys.stderr,
         )
+    if result.marker_only:
+        print(
+            "WARNING: allow-listed recordings present only as marker blobs (nothing "
+            f"to promote): {', '.join(result.marker_only)}",
+            file=sys.stderr,
+        )
     if not result.ok:
         print(
             f"ERROR: {len(result.failures)} object(s) failed verification — "
@@ -76,12 +96,21 @@ def main(argv=None) -> int:
             file=sys.stderr,
         )
         return 1
-    # A typo'd or unstaged allow-list entry, or a name the demo handlers reject,
-    # means the promotion is not what the operator intended — exit non-zero so a
-    # pipeline / `set -e` run does not treat a partial promote as complete.
-    if result.missing_from_staging or result.invalid_names:
+    # A typo'd or unstaged allow-list entry, a name the demo handlers reject, or a
+    # recording present only as marker blobs means the promotion is not what the
+    # operator intended — exit non-zero so a pipeline / `set -e` run does not treat
+    # a partial promote as complete.
+    if result.missing_from_staging or result.invalid_names or result.marker_only:
         return 1
     return 0
+
+
+def _gcs_call_error():
+    """The GCS API-error class, imported lazily so this shim stays SDK-free until
+    it actually runs against GCS (matches ``core``'s lazy-import posture)."""
+    from google.api_core.exceptions import GoogleAPICallError
+
+    return GoogleAPICallError
 
 
 if __name__ == "__main__":
