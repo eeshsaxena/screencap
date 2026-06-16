@@ -5,14 +5,13 @@ Keychain are both mocked, so these run fully offline. The most subtle surface is
 ``get_id_token`` refresh/rotation, so that is covered most heavily.
 """
 
-import base64
 import json
 import time
 
 import pytest
 
 import screencap.auth as a
-
+from tests._jwt import _jwt
 
 # --------------------------------------------------------------------------
 # Fixtures + helpers
@@ -55,13 +54,6 @@ def fake_keyring(monkeypatch):
 
 
 _KEY = (a.KEYCHAIN_SERVICE, a.KEYCHAIN_ACCOUNT)
-
-
-def _jwt(claims: dict) -> str:
-    def b64(d):
-        return base64.urlsafe_b64encode(json.dumps(d).encode()).rstrip(b"=").decode()
-
-    return f"{b64({'alg': 'RS256'})}.{b64(claims)}.sig"
 
 
 class _FakeResp:

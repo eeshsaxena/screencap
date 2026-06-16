@@ -628,17 +628,33 @@ class Supervisor:
             return
 
         swept: list[str] = []
+        refused: list[str] = []
         for d in candidates:
             try:
                 if await asyncio.to_thread(self._recording_needs_resume, d):
-                    swept.append(d.name)
-                    await self.resume_terminal_stage(d)
+                    result = await self.resume_terminal_stage(d)
+                    # SCR-116 observability: a result carrying an upload_warning
+                    # (e.g. account-ownership mismatch) did NOT converge — surface
+                    # it at WARNING and track it apart from the truly-swept count.
+                    if result is not None and result.upload_warning:
+                        refused.append(d.name)
+                        logger.warning(
+                            "daemon startup sweep: %s not converged (%s)",
+                            d.name, result.upload_warning,
+                        )
+                    else:
+                        swept.append(d.name)
             except Exception:  # noqa: BLE001 — one bad recording never aborts the sweep
                 logger.exception("daemon startup sweep: resume failed for %s", d)
         if swept:
             logger.info(
                 "daemon startup sweep resumed %d incomplete recording(s): %s",
                 len(swept), swept,
+            )
+        if refused:
+            logger.warning(
+                "daemon startup sweep: %d recording(s) refused convergence: %s",
+                len(refused), refused,
             )
 
     @staticmethod
@@ -1229,8 +1245,15 @@ class Supervisor:
                 # it does not exist yet at stage time — create it so the pin lands.
                 capture_dir.mkdir(parents=True, exist_ok=True)
                 write_owner_uid(capture_dir, uid)
-            except OSError as exc:
+            except (OSError, ImportError) as exc:
                 logger.warning("daemon: could not pin recording owner uid: %s", exc)
+                # Degrade the in-memory re-mint guard and the on-disk pin
+                # consistently: if the disk pin didn't land, the terminal stage
+                # sees NO pin (read_owner_uid -> None) and won't gate, so the
+                # guard must not stay armed alone — otherwise the two halves
+                # disagree and the terminal stage could converge under a
+                # different account. Both unpinned = prior (unpinned) behavior.
+                self._engine_token_uid = None
         return {auth.ENGINE_TOKEN_FILE_ENV: str(path)}
 
     @staticmethod
@@ -1317,9 +1340,15 @@ class Supervisor:
             # new user's namespace, fragmenting the recording. Skip the write (do
             # NOT update `last`) so the engine keeps account A's token and fails
             # closed on expiry; if the user switches back to A we resume re-minting.
+            # Mirror the terminal-stage gate's tolerance: only refuse on a
+            # DETERMINED, DIFFERENT uid. A None extraction (malformed token, uid
+            # not present) is undeterminable, not a switch — fall through to the
+            # normal restage rather than wrongly refusing a same-account re-mint.
+            minted_uid = auth.id_token_uid(token)
             if (
                 self._engine_token_uid is not None
-                and auth.id_token_uid(token) != self._engine_token_uid
+                and minted_uid is not None
+                and minted_uid != self._engine_token_uid
             ):
                 logger.warning(
                     "daemon: re-minted token uid changed (account switch "
