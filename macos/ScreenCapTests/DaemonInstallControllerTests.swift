@@ -71,7 +71,15 @@ final class DaemonInstallControllerTests: XCTestCase {
             sleep: { _ in }
         )
 
-        await controller.install(timeoutSeconds: 0, probeIntervalSeconds: 0.01)
+        // The first poll times out at the reachability budget and refreshes; the
+        // post-refresh poll uses the convergence budget (SCR-135). Pin it to 0 too
+        // so this all-unreachable case fails fast and deterministically instead of
+        // spinning the 30s default.
+        await controller.install(
+            timeoutSeconds: 0,
+            probeIntervalSeconds: 0.01,
+            convergenceTimeoutSeconds: 0
+        )
 
         XCTAssertEqual(controller.state, .pollingFailed(reason: "Daemon did not respond within 0s"))
     }
@@ -171,10 +179,22 @@ final class DaemonInstallControllerTests: XCTestCase {
             now: { clock.now }
         )
 
-        await controller.install(timeoutSeconds: 1, probeIntervalSeconds: 0.5)
+        // Pass an EXPLICIT convergence budget so FIX-1's 30s default cannot make
+        // the loop count nondeterministic (SCR-135). With timeoutSeconds=1 the
+        // first poll fast-fails the mismatch on its single probe (callCount 1);
+        // the post-refresh poll then runs the 2s convergence budget at 0.5s/iter:
+        //   probes at now = 0, 0.5, 1.0, 1.5 sleep+continue (now < 2.0), and the
+        //   probe at now = 2.0 surfaces the mismatch (now < deadline is false).
+        // That is 1 (first poll) + 5 (post-refresh) = 6 probes.
+        await controller.install(
+            timeoutSeconds: 1,
+            probeIntervalSeconds: 0.5,
+            convergenceTimeoutSeconds: 2
+        )
 
         XCTAssertEqual(registration.refreshedPlistNames, [DaemonInstallController.plistName])
         XCTAssertEqual(terminator.bootoutCount, 1)
+        XCTAssertEqual(probe.callCount, 6)
         XCTAssertEqual(controller.state, .installFailed(.daemonVersionMismatch))
     }
 
@@ -213,12 +233,64 @@ final class DaemonInstallControllerTests: XCTestCase {
             now: { clock.now }
         )
 
-        await controller.install(timeoutSeconds: 1, probeIntervalSeconds: 0.5)
+        // Explicit convergence budget keeps the count deterministic under FIX-1's
+        // 30s default. First poll fast-fails the mismatch (callCount 1); the
+        // post-refresh poll probes the stale version once (now 0 < 2, sleep), then
+        // sees the fresh version on the next probe and converges — well within the
+        // 2s budget. That is 1 + 2 = 3 probes.
+        await controller.install(
+            timeoutSeconds: 1,
+            probeIntervalSeconds: 0.5,
+            convergenceTimeoutSeconds: 2
+        )
 
         XCTAssertEqual(registration.refreshedPlistNames, [DaemonInstallController.plistName])
         XCTAssertEqual(terminator.bootoutCount, 1)
+        XCTAssertEqual(probe.callCount, 3)
         XCTAssertEqual(controller.state, .installedAndRunning)
         await fulfillment(of: [expectation], timeout: 1)
+    }
+
+    // SCR-135: the convergence-budget poll caches the LAST wrong version it saw
+    // (`lastMismatch`) so a stale daemon that goes momentarily unreachable right
+    // at the deadline still surfaces a real `.daemonVersionMismatch` rather than a
+    // misleading `.pollingFailed`/`.timedOut`. Here the stale daemon answers the
+    // wrong version on the first poll AND on the first post-refresh probe, then
+    // vanishes (nil, sustained through the rest of the budget). FakeDaemonProbe
+    // sustains its last scripted value, so the trailing nil is consumed once then
+    // sustained as nil — modelling "the squatter dropped off the socket without
+    // the fresh daemon ever binding." The deadline must still resolve to the
+    // cached mismatch.
+    func testConvergencePollSurfacesMismatchWhenStaleDaemonVanishesAtDeadline() async {
+        let registration = FakeDaemonRegistrationService(
+            registerStatuses: [.enabled],
+            refreshStatuses: [.enabled]
+        )
+        let terminator = FakeDaemonTerminator()
+        // First poll sees the mismatch (fast-fail); the post-refresh poll sees it
+        // once more, then the probe goes unreachable (nil) for the rest of the
+        // convergence budget.
+        let probe = FakeDaemonProbe(versions: ["0.12.7", "0.12.7", nil])
+        let clock = FakeClock()
+        let controller = DaemonInstallController(
+            registrationService: registration,
+            probe: probe,
+            terminator: terminator,
+            expectedDaemonVersion: "0.20.0",
+            sleep: { clock.advance(nanoseconds: $0) },
+            now: { clock.now }
+        )
+
+        await controller.install(
+            timeoutSeconds: 1,
+            probeIntervalSeconds: 0.5,
+            convergenceTimeoutSeconds: 2
+        )
+
+        XCTAssertEqual(registration.refreshedPlistNames, [DaemonInstallController.plistName])
+        XCTAssertEqual(terminator.bootoutCount, 1)
+        // The cached mismatch wins at the deadline — NOT .pollingFailed.
+        XCTAssertEqual(controller.state, .installFailed(.daemonVersionMismatch))
     }
 
     func testReachableDaemonWithMatchingVersionInstallsWithoutRefresh() async {
