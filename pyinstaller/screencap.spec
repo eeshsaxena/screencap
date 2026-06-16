@@ -143,6 +143,13 @@ hidden_imports = [
     # analysis cannot trace that. Pin it here so frozen builds find
     # the macOS Keychain backend at runtime.
     'keyring.backends.macOS',
+    # Build-time-injected cloud-auth credentials. Generated (gitignored) by
+    # scripts/generate_provisioned.py BEFORE this build runs, then imported only
+    # via `from screencap import _provisioned` inside auth.py — a guarded import
+    # PyInstaller's static analysis cannot trace. Pin it so the frozen binary
+    # carries the injected values; absent on an un-generated dev build (a benign
+    # "hidden import not found" warning), present on every release build.
+    'screencap._provisioned',
     # Daemon package + dynamic subprocess entry points.
     'screencap.__main__',
     'screencap.cli',

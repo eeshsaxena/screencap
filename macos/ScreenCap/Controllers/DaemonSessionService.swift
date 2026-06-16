@@ -186,37 +186,23 @@ final class LiveDaemonSessionService: DaemonSessionService {
     /// a non-zero status (carries stderr for actionable diagnostics — the
     /// headless / no-LaunchAgent case prints "Could not find service…" here).
     func reload() async -> Result<Void, DaemonSession.ReloadError> {
-        let process = Process()
-        process.executableURL = URL(fileURLWithPath: "/bin/launchctl")
-        process.arguments = ["kickstart", "-kp", "gui/\(getuid())/com.screencap.daemon"]
-        process.standardInput = FileHandle.nullDevice
-        process.standardOutput = Pipe()
-        let stderrPipe = Pipe()
-        process.standardError = stderrPipe
+        let result: LaunchctlResult
         do {
-            try process.run()
-            await withCheckedContinuation { (continuation: CheckedContinuation<Void, Never>) in
-                DispatchQueue.global(qos: .userInitiated).async {
-                    process.waitUntilExit()
-                    continuation.resume()
-                }
-            }
-            if process.terminationStatus == 0 {
-                return .success(())
-            }
-            let stderrData = try? stderrPipe.fileHandleForReading.readToEnd()
-            let stderrString = stderrData.flatMap { String(data: $0, encoding: .utf8) }?
-                .trimmingCharacters(in: .whitespacesAndNewlines)
-            if let stderrString, !stderrString.isEmpty {
-                daemonSessionLogger.info("launchctl kickstart failed (exit \(process.terminationStatus, privacy: .public)): \(stderrString, privacy: .public)")
-            }
-            return .failure(.nonZeroExit(
-                code: process.terminationStatus,
-                stderr: stderrString?.isEmpty == false ? stderrString : nil
-            ))
+            result = try await runLaunchctl(["kickstart", "-kp", "gui/\(getuid())/com.screencap.daemon"])
         } catch {
             return .failure(.spawnFailed(error))
         }
+        if result.terminationStatus == 0 {
+            return .success(())
+        }
+        let stderrString = result.stderr.isEmpty ? nil : result.stderr
+        if let stderrString {
+            daemonSessionLogger.info("launchctl kickstart failed (exit \(result.terminationStatus, privacy: .public)): \(stderrString, privacy: .public)")
+        }
+        return .failure(.nonZeroExit(
+            code: result.terminationStatus,
+            stderr: stderrString
+        ))
     }
 
     // MARK: - Event stream

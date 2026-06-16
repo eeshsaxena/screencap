@@ -45,11 +45,17 @@ Deploy (project: proteus-photos, region: southamerica-east1):
     # (the dev function still verifies proteus-photos tokens — set the project
     # explicitly even if the dev function is deployed in another GCP project).
 
-    # PRE-DEPLOY GATE: this code REQUIRES a Firebase bearer token on
-    # upload/list/sign-download and removes get-index. Do NOT deploy it over the
-    # live get-upload-urls until the token-carrying clients (U5) and the website
-    # demo-repoint (U7) have shipped, or deploy under a new function name and cut
-    # clients over once they send tokens. See docs/runbooks/cloud-auth-setup.md.
+    # DEPLOY (SCR-137 — gate LIFTED 2026-06-16): the old "hold until clients carry
+    # tokens" gate is void. SCR-138 (website repoint to demo-*) shipped, and the live
+    # prod get-upload-urls still runs OLD code (demo-list -> 400) so the public gallery
+    # is broken. Deploying THIS code is the fix. It is safe re: clients: the shipped
+    # client carries only REPLACE_WITH_PROVISIONED_* placeholders (no released tag has
+    # authed_post), so the now-token-gated upload/list/sign-download break no working
+    # flow; demo-* are tokenless. Dev-validate (get-upload-urls-dev) first, THEN deploy
+    # to prod. Separately: the website shows *videos* only once demo/ has content —
+    # that is SCR-139 (demo promotion), NOT this deploy; gs://<bucket>/demo/ is empty
+    # today, so a fresh deploy yields the empty-gallery placeholder until SCR-139 runs.
+    # Full procedure + verification + rollback: docs/runbooks/cloud-auth-setup.md.
 """
 
 from __future__ import annotations
