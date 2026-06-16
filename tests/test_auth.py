@@ -552,3 +552,21 @@ def test_authed_post_propagates_not_signed_in_before_any_post(monkeypatch):
     with pytest.raises(a.NotSignedIn):
         a.authed_post(lambda *x, **k: called.append(1), "https://fn")
     assert called == []  # never posts without a token
+
+
+# --------------------------------------------------------------------------
+# id_token_uid — client-side uid extraction for the SCR-116 ownership gate
+# --------------------------------------------------------------------------
+
+
+def test_id_token_uid_prefers_user_id_then_sub():
+    assert a.id_token_uid(_jwt({"user_id": "A", "sub": "B"})) == "A"
+    assert a.id_token_uid(_jwt({"sub": "B"})) == "B"
+
+
+def test_id_token_uid_returns_none_for_junk_or_empty():
+    # Malformed / non-JWT / empty all yield None (caller treats unknown uid as
+    # "cannot confirm ownership" and falls back to current behavior).
+    assert a.id_token_uid("not-a-jwt") is None
+    assert a.id_token_uid("") is None
+    assert a.id_token_uid(_jwt({"email": "e@x.com"})) is None  # no uid claim

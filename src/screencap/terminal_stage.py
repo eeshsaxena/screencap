@@ -826,6 +826,39 @@ def _route_cloud(
 
     name = recording_dir.name
 
+    # 0a. SCR-116 ACCOUNT-OWNERSHIP GATE. A cloud recording is pinned at start to
+    # the uid that owned it. If THIS process would act as a different account (the
+    # user switched accounts since), refuse every cloud op — no produce, no
+    # upload, no sentinel, no eviction — and leave the recording intact locally,
+    # rather than fragmenting it into a second user's namespace (or writing the
+    # sentinel under the wrong namespace). This guards the terminal-stage entry
+    # points the daemon re-mint guard cannot — the daemon resume and `screencap
+    # upload`, which read the Keychain (the current account), not the engine
+    # token. Unknown ownership (legacy/local recording) or an undeterminable
+    # current uid (not signed in / transient) does NOT refuse here: the former
+    # has no pin to honor, the latter is left to the normal fail-closed upload
+    # path so we never raise a false mismatch.
+    from screencap.catalog import read_owner_uid
+
+    owner_uid = read_owner_uid(recording_dir)
+    if owner_uid is not None:
+        from screencap import auth
+
+        try:
+            current_uid = auth.id_token_uid(auth.get_id_token())
+        except Exception:  # noqa: BLE001 — NotSignedIn/AuthError/etc: don't refuse
+            current_uid = None
+        if current_uid is not None and current_uid != owner_uid:
+            logger.warning(
+                "terminal_stage: account mismatch for %s (recording owner uid "
+                "!= signed-in uid) — refusing cloud convergence; kept local", name,
+            )
+            result.upload_warning = (
+                "account mismatch — this recording belongs to a different account "
+                "than the one now signed in; cloud convergence refused (kept local)"
+            )
+            return result
+
     # 0. AE8 — refuse a promotion with HOLES before producing any cloud copy
     # (fail-closed, never a partial cloud copy). A legacy / no-ledger recording
     # has no closed chunk set, so this is a no-op (R14 whole-dir path).

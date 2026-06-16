@@ -12,6 +12,37 @@ from screencap.recording_db import has_table, open_recording_db
 
 INTENT_FILE = ".recording_intent"
 
+# SCR-116: the cloud account uid that OWNS a recording, pinned at start. A
+# dotfile, so ``upload.list_recording_files`` (which skips ``.``-prefixed names)
+# never uploads it — this is local-only ownership metadata.
+OWNER_UID_FILE = ".cloud_owner_uid"
+
+
+def write_owner_uid(directory: Path, uid: str) -> None:
+    """Pin the cloud account uid that owns this recording (SCR-116).
+
+    Written once by the daemon at token-staging time — the daemon is the only
+    component that can read the Keychain / mint the token, so it is the only one
+    that knows the uid. The terminal stage reads it back to refuse converging a
+    recording into a *different* account's namespace after a mid-lifecycle
+    account switch (``screencap logout && login`` as another user).
+    """
+    (directory / OWNER_UID_FILE).write_text(uid)
+
+
+def read_owner_uid(directory: Path) -> str | None:
+    """Read the pinned owner uid, or ``None`` when absent.
+
+    ``None`` for a legacy recording (predating the pin) or a local recording
+    (never tied to an account) — callers treat that as "ownership unknown" and
+    fall back to their existing behavior rather than refusing.
+    """
+    try:
+        uid = (directory / OWNER_UID_FILE).read_text().strip()
+    except OSError:
+        return None
+    return uid or None
+
 
 def read_intent(directory: Path) -> str | None:
     """Read the recording intent from a .recording_intent file.
