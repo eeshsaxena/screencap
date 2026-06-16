@@ -16,6 +16,10 @@ src/screencap/__pycache__
 venv/
 .env
 
+# Build-time-injected cloud-auth credentials (written by
+# scripts/generate_provisioned.py; non-secret but kept out of git by policy)
+src/screencap/_provisioned.py
+
 # Testing
 .pytest_cache/
 .coverage

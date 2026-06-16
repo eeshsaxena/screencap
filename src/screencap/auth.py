@@ -49,9 +49,15 @@ logger = logging.getLogger(__name__)
 # --------------------------------------------------------------------------
 
 # These ship in the client and are NOT secrets (public native OAuth client + a
-# browser API key restricted to Identity Toolkit + Token Service). They are
-# placeholders until U1 provisioning fills them in; the env overrides let dev and
-# tests point at a real project without a rebuild.
+# browser API key restricted to Identity Toolkit + Token Service). The source tree
+# carries only these placeholders — the real provisioned values are injected at
+# build time into a gitignored ``screencap._provisioned`` module (written by
+# ``scripts/generate_provisioned.py``) which the resolvers below consult. Precedence:
+#   explicit env var (SCREENCAP_*)  >  screencap._provisioned  >  placeholder
+# so dev/.env and tests keep overriding without a rebuild, release binaries get the
+# injected values, and an unconfigured build resolves to the placeholder (the U2
+# build guard rejects that for release/tag builds). "Inject, don't commit" keeps the
+# values out of git; it is not a security boundary (they ship in the binary anyway).
 DEFAULT_FIREBASE_API_KEY = "REPLACE_WITH_PROVISIONED_WEB_API_KEY"
 DEFAULT_OAUTH_CLIENT_ID = "REPLACE_WITH_PROVISIONED_DESKTOP_CLIENT_ID.apps.googleusercontent.com"
 
@@ -86,12 +92,45 @@ _REFRESH_BUFFER_SECONDS = 300
 LOGIN_TIMEOUT_SECONDS = 180
 
 
+def _provisioned_value(attr: str) -> str | None:
+    """Return a build-time-injected credential, or ``None`` if not injected.
+
+    Reads ``attr`` from the gitignored ``screencap._provisioned`` module written by
+    ``scripts/generate_provisioned.py`` at build time. Returns ``None`` when the
+    module is ABSENT (source checkout / test suite / unconfigured build) so the
+    caller falls back to the placeholder.
+
+    The ``ImportError`` catch is deliberately narrow. An absent module
+    (``ModuleNotFoundError``, an ``ImportError`` subclass) is the normal
+    not-injected case → ``None`` → placeholder. But a module that is PRESENT yet
+    malformed — a syntax error (``SyntaxError``, not caught here) or one missing the
+    expected constant (``getattr`` with no default → ``AttributeError``) — raises
+    loudly rather than silently degrading to the placeholder, which the U2 build
+    guard might then ship as a broken-sign-in binary.
+    """
+    try:
+        from screencap import _provisioned
+    except ImportError:
+        return None
+    return getattr(_provisioned, attr)
+
+
 def _api_key() -> str:
-    return os.environ.get("SCREENCAP_FIREBASE_API_KEY", DEFAULT_FIREBASE_API_KEY)
+    # Precedence: explicit env var > injected _provisioned value > placeholder.
+    return (
+        os.environ.get("SCREENCAP_FIREBASE_API_KEY")
+        or _provisioned_value("FIREBASE_API_KEY")
+        or DEFAULT_FIREBASE_API_KEY
+    )
 
 
 def _oauth_client_id() -> str:
-    return os.environ.get("SCREENCAP_OAUTH_CLIENT_ID", DEFAULT_OAUTH_CLIENT_ID)
+    # Precedence: explicit env var > injected _provisioned value > placeholder.
+    return (
+        os.environ.get("SCREENCAP_OAUTH_CLIENT_ID")
+        or _provisioned_value("OAUTH_CLIENT_ID")
+        or DEFAULT_OAUTH_CLIENT_ID
+    )
 
 
 def _oauth_client_secret() -> str:
