@@ -266,8 +266,47 @@ with the two `.env` values set; in a shipped binary it works once U1/U2 inject t
 
 | Target | Date | Outcome |
 |--------|------|---------|
-| _(dev validate — U4)_ | _pending_ | |
-| _(prod cutover — U5)_ | _pending_ | |
+| dev (`get-upload-urls-dev`, bucket `screencap-recordings-dev-staging`) | 2026-06-16 | ✅ deployed merged code. Automated checks: `demo-list`→**200** `{"recordings":[]}` (was 400 on old code); tokenless `upload`/`list`/`sign-download`→**401**; invalid bearer→**401** (proves `verify_bearer`/`firebase_admin` live + project-pinned — an init failure would 503/500); unknown action→**400**. `demo/` empty (SCR-139). Same-project-token→uid signed round-trip = interactive operator step (below); not yet run. |
+| _(prod cutover — U5)_ | _pending_ | operator step — see "Deploy to prod" |
+
+Deploy command used (dev):
+
+```bash
+SIGNER=screencap-signer@proteus-photos.iam.gserviceaccount.com
+gcloud functions deploy get-upload-urls-dev \
+  --project proteus-photos --gen2 --runtime python312 \
+  --trigger-http --allow-unauthenticated --region southamerica-east1 \
+  --source scripts/cloud-function/ --entry-point get_upload_urls \
+  --service-account "$SIGNER" \
+  --update-env-vars SCREENCAP_BUCKET=screencap-recordings-dev-staging,SCREENCAP_PROJECT_ID=proteus-photos
+```
+
+(`--update-env-vars`, not `--set-env-vars`, so the platform-managed `LOG_EXECUTION_ID`
+is preserved. `SCREENCAP_PROJECT_ID` is added explicitly per the `main.py` header.)
+
+#### Interactive token round-trip (operator step — needs a browser)
+
+The automated checks above cover `demo-*` dispatch + tokenless/invalid-token denial. The
+remaining same-project-token → uid → signed round-trip needs a real Google sign-in, so run
+it manually against the dev function from a **token-carrying client** (HEAD source already
+threads bearer tokens via `auth.authed_post`; released binaries do so once U1/U2 inject the
+creds). From the repo root:
+
+```bash
+set -a; . ./.env; set +a   # real SCREENCAP_OAUTH_CLIENT_ID + SCREENCAP_FIREBASE_API_KEY
+# Point BOTH client knobs at dev — upload.py reads SCREENCAP_UPLOAD_URL, download.py reads
+# SCREENCAP_DOWNLOAD_URL; setting only one leaves the other leg on prod:
+export SCREENCAP_UPLOAD_URL=https://get-upload-urls-dev-ld7izzjvga-rj.a.run.app
+export SCREENCAP_DOWNLOAD_URL=https://get-upload-urls-dev-ld7izzjvga-rj.a.run.app
+screencap login            # browser → Google → Firebase; stores the refresh token
+screencap whoami           # expect: signed in as <you>
+screencap upload <name>    # authed PUT under users/{uid}/…
+screencap download <name>  # authed list (own recordings only) + signed GET; checksum holds
+```
+
+Expect: login succeeds; upload lands under `users/{uid}/…`; the list returns only your own
+recordings; download round-trips with matching checksums (google-cloud-storage 3.x crc32c).
+Foreign-project / cross-user denial (AE2) is already proven by the invalid-bearer→401 above.
 
 ---
 
