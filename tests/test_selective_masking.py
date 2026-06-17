@@ -480,12 +480,16 @@ class TestBackgroundWindowMasking:
     visible in the background.
     """
 
-    def _setup_scrub(self, tmp_path, *, foreground_bundle, foreground_title,
-                     geometry_windows, evaluator_kwargs=None,
-                     pixel_ratio=1.0, img_w=200, img_h=150):
-        """Common setup for background masking tests."""
+    def _build_scrub_ctx(self, tmp_path, *, foreground_bundle, foreground_title,
+                         geometry_windows, evaluator_kwargs=None,
+                         pixel_ratio=1.0, img_w=200, img_h=150):
+        """Build the scene + ScrubContext WITHOUT calling mask_screenshots.
+
+        Returns (screenshots_dir, ctx, db_path, result) so a caller can apply
+        monkeypatches (e.g. faking the OCR stack) before running the scrub.
+        """
         from screencap.privacy.context import WindowContext
-        from screencap.scrubber import ScrubContext, ScrubResult, mask_screenshots
+        from screencap.scrubber import ScrubContext, ScrubResult
 
         screenshots_dir = tmp_path / "screenshots"
         screenshots_dir.mkdir()
@@ -508,6 +512,24 @@ class TestBackgroundWindowMasking:
         result = ScrubResult()
         ctx = ScrubContext(window_events=window_events, evaluator=evaluator,
                            classifier=classifier, pixel_ratio=pixel_ratio)
+        return screenshots_dir, ctx, db_path, result
+
+    def _setup_scrub(self, tmp_path, *, foreground_bundle, foreground_title,
+                     geometry_windows, evaluator_kwargs=None,
+                     pixel_ratio=1.0, img_w=200, img_h=150):
+        """Common setup for background masking tests: build scene then scrub."""
+        from screencap.scrubber import mask_screenshots
+
+        screenshots_dir, ctx, db_path, result = self._build_scrub_ctx(
+            tmp_path,
+            foreground_bundle=foreground_bundle,
+            foreground_title=foreground_title,
+            geometry_windows=geometry_windows,
+            evaluator_kwargs=evaluator_kwargs,
+            pixel_ratio=pixel_ratio,
+            img_w=img_w,
+            img_h=img_h,
+        )
 
         mask_screenshots(screenshots_dir, ctx, db_path=db_path, result=result)
         return screenshots_dir / "100.0.jpg", result
@@ -669,8 +691,23 @@ class TestBackgroundWindowMasking:
         """
         from PIL import Image
 
-        from screencap.privacy.context import WindowContext
-        from screencap.scrubber import ScrubContext, ScrubResult, mask_screenshots
+        from screencap.scrubber import mask_screenshots
+
+        # Same scene as test_allow_foreground_masks_sensitive_background:
+        # foreground VS Code (ALLOW) + background Robinhood (banking → MASK_WINDOW).
+        # Build the scene first so we can fake the OCR stack BEFORE mask runs.
+        screenshots_dir, ctx, db_path, result = self._build_scrub_ctx(
+            tmp_path,
+            foreground_bundle="com.microsoft.VSCode",
+            foreground_title="main.py",
+            evaluator_kwargs={"mode": "internal"},
+            geometry_windows=[
+                {"bundle_id": "com.microsoft.VSCode", "app_name": "VS Code",
+                 "x": 0, "y": 0, "width": 100, "height": 150},
+                {"bundle_id": "com.robinhood.Robinhood", "app_name": "Robinhood",
+                 "x": 100, "y": 0, "width": 100, "height": 150},
+            ],
+        )
 
         # Fake the Vision/OCR stack: VisionOcr() and create_default_pipeline()
         # only need to return non-None so the OCR pass is enabled; the real OCR
@@ -693,34 +730,6 @@ class TestBackgroundWindowMasking:
         monkeypatch.setattr(
             "screencap.scrubber.ocr_mask_screenshot", _fake_ocr_mask_screenshot
         )
-
-        # Same scene as test_allow_foreground_masks_sensitive_background:
-        # foreground VS Code (ALLOW) + background Robinhood (banking → MASK_WINDOW).
-        screenshots_dir = tmp_path / "screenshots"
-        screenshots_dir.mkdir()
-        _make_test_jpeg(screenshots_dir / "100.0.jpg", width=200, height=150)
-
-        db_path = tmp_path / "recording.db"
-        geom_data = json.dumps({
-            "windows": [
-                {"bundle_id": "com.microsoft.VSCode", "app_name": "VS Code",
-                 "x": 0, "y": 0, "width": 100, "height": 150},
-                {"bundle_id": "com.robinhood.Robinhood", "app_name": "Robinhood",
-                 "x": 100, "y": 0, "width": 100, "height": 150},
-            ],
-            "display_bounds": [0.0, 0.0, 200.0, 150.0],
-        })
-        _create_geometry_db(db_path, [(100.0, geom_data)])
-
-        evaluator = _make_evaluator(mode="internal")
-        classifier = DefaultContextClassifier()
-        window_events = [
-            WindowContext(timestamp=99.0, app_bundle_id="com.microsoft.VSCode",
-                          title="main.py")
-        ]
-        result = ScrubResult()
-        ctx = ScrubContext(window_events=window_events, evaluator=evaluator,
-                           classifier=classifier, pixel_ratio=1.0)
 
         mask_screenshots(screenshots_dir, ctx, db_path=db_path, result=result)
 

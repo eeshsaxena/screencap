@@ -12,10 +12,12 @@ on:
 permissions:
   contents: read
 
-# Cancel superseded runs on the same ref to save (10x-billed) macOS minutes.
+# Cancel superseded PR runs on the same ref to save (10x-billed) macOS minutes.
+# Pushes to main are NOT cancelled so each main commit runs the guards to
+# completion (preserving per-commit CI signal on the protected branch).
 concurrency:
   group: ci-${{ github.workflow }}-${{ github.ref }}
-  cancel-in-progress: true
+  cancel-in-progress: ${{ github.event_name == 'pull_request' }}
 
 jobs:
   privacy-guards-macos:
@@ -60,11 +62,12 @@ jobs:
         run: pytest -m privacy --timeout=300
 
   privacy-guards-visionfree:
-    # Defense-in-depth: prove the SCR-110 background-masking invariant on every run
-    # WITHOUT pyobjc-Vision. tests/test_selective_masking.py (incl.
-    # TestBackgroundWindowMasking) imports no pyobjc at module load, so it runs on
-    # Linux. This is the "runs everywhere" guard the learning doc calls for; if
-    # macOS runners are unavailable, this lane still catches the regression.
+    # Defense-in-depth: run the Linux-capable @pytest.mark.privacy guards on every
+    # run WITHOUT pyobjc-Vision, so if the macOS lane is unavailable this lane still
+    # catches privacy regressions (e.g. the SCR-110 background-masking invariant).
+    # Every privacy-marked module EXCEPT tests/privacy/test_ocr.py imports no
+    # pyobjc at module load, so they collect + run on Linux; test_ocr.py is the
+    # only macOS-gated module (real Apple Vision OCR) and is --ignore'd here.
     name: Privacy guards (Vision-free, Linux)
     runs-on: ubuntu-latest
     timeout-minutes: 20
@@ -88,5 +91,10 @@ jobs:
         # `sys_platform == 'darwin'` markers in pyproject.toml.
         run: pip install -e ".[dev]"
 
-      - name: Run Vision-free background-masking guards
-        run: pytest tests/test_selective_masking.py -v
+      - name: Run Vision-free privacy guards
+        # Run the Linux-capable privacy marker as a backstop for the macOS lane.
+        # --ignore=tests/privacy/test_ocr.py drops the only macOS-gated module
+        # (real Apple Vision OCR); the rest collect + run cleanly on Linux.
+        # Per-test timeout (pytest-timeout, from .[dev]) matches the macOS lane so a
+        # hung test fails fast instead of stalling up to the 20-minute job cap.
+        run: pytest -m privacy --ignore=tests/privacy/test_ocr.py -v --timeout=300
