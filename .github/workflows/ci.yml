@@ -1,0 +1,82 @@
+name: CI
+
+# Run the @pytest.mark.privacy regression guards automatically so a privacy
+# regression (e.g. sensitive background-window masking leaking, SCR-110) fails
+# a check instead of shipping undetected. The repo had no pytest lane in CI;
+# this workflow adds one scoped to the privacy guards (SCR-133).
+on:
+  push:
+    branches: [main]
+  pull_request:
+
+permissions:
+  contents: read
+
+# Cancel superseded runs on the same ref to save (10x-billed) macOS minutes.
+concurrency:
+  group: ci-${{ github.workflow }}-${{ github.ref }}
+  cancel-in-progress: true
+
+jobs:
+  privacy-guards-macos:
+    # Highest-fidelity lane: a macOS runner with pyobjc-Vision installed runs the
+    # full @pytest.mark.privacy suite, exercising the real OCR/masking + NER path.
+    # Mirrors the runner + Python + install setup used by release.yml.
+    name: Privacy guards (macOS, Vision)
+    runs-on: macos-14
+    timeout-minutes: 30
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/setup-python@v5
+        with:
+          python-version: '3.12'
+
+      - uses: actions/cache@v4
+        with:
+          path: ~/.cache/pip
+          key: ${{ runner.os }}-macos-14-pip-${{ hashFiles('pyproject.toml') }}
+
+      - name: Install dependencies
+        # .[dev] pulls .[record] (incl. pyobjc-framework-Vision on darwin) plus the
+        # pytest tooling, so both the Vision-backed and Vision-free guards run here.
+        run: pip install -e ".[dev]"
+
+      - name: Download spaCy model (presidio NER backbone)
+        # The privacy suite exercises the real DetectionPipeline (presidio); its
+        # spaCy backbone needs this model. Same step as release.yml.
+        run: python -m spacy download en_core_web_sm
+
+      - name: Run privacy guard suite
+        # Per-test timeout (pytest-timeout, from .[dev]) keeps a hung test from
+        # stalling the whole lane.
+        run: pytest -m privacy --timeout=300
+
+  privacy-guards-visionfree:
+    # Defense-in-depth: prove the SCR-110 background-masking invariant on every run
+    # WITHOUT pyobjc-Vision. tests/test_selective_masking.py (incl.
+    # TestBackgroundWindowMasking) imports no pyobjc at module load, so it runs on
+    # Linux. This is the "runs everywhere" guard the learning doc calls for; if
+    # macOS runners are unavailable, this lane still catches the regression.
+    name: Privacy guards (Vision-free, Linux)
+    runs-on: ubuntu-latest
+    timeout-minutes: 20
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/setup-python@v5
+        with:
+          python-version: '3.12'
+
+      - uses: actions/cache@v4
+        with:
+          path: ~/.cache/pip
+          key: ${{ runner.os }}-ubuntu-pip-${{ hashFiles('pyproject.toml') }}
+
+      - name: Install dependencies
+        # pyobjc / darwin-only deps are auto-skipped on Linux via their
+        # `sys_platform == 'darwin'` markers in pyproject.toml.
+        run: pip install -e ".[dev]"
+
+      - name: Run Vision-free background-masking guards
+        run: pytest tests/test_selective_masking.py -v
