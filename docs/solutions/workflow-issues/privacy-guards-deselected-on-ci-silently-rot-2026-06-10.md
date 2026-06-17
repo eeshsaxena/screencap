@@ -25,6 +25,7 @@ tags:
   - silent-regression
 related_issues:
   - "SCR-110"
+  - "SCR-133"
   - "https://github.com/proteus-computer-use/screencap/pull/228"
 ---
 
@@ -125,9 +126,23 @@ def test_allow_foreground_masks_sensitive_background(self, tmp_path):
 ```
 
 Removing the `xfail` markers (so they pass for the right reason) plus dropping the
-gate restored the protection. Note these still only run where Vision is installed —
-the deeper fix to the blind spot (a CI lane that installs Vision, or a Vision-free
-unit test of the gating predicate) remains open.
+gate restored the protection.
+
+**Update (SCR-133, 2026-06-17): the CI blind spot is now closed.**
+`.github/workflows/ci.yml` runs the `@pytest.mark.privacy` guards on every push to
+`main` and every PR, via two lanes:
+
+1. **`privacy-guards-macos`** — a macOS runner installs `.[dev]` (incl.
+   pyobjc-Vision) and runs the full `pytest -m privacy` suite, exercising the real
+   OCR/masking path where SCR-110 actually manifests (`ocr_ran=True`).
+2. **`privacy-guards-visionfree`** — an Ubuntu runner runs
+   `tests/test_selective_masking.py` without Vision. The other
+   `TestBackgroundWindowMasking` tests run with `ocr_ran=False`, so they pass with or
+   without the gate and cannot catch SCR-110 off a Mac;
+   `test_background_masked_even_when_foreground_ocr_pass_runs` closes that gap by
+   faking the OCR stack to force `ocr_ran=True` and asserting the background window is
+   still masked. This is the "fake/in-memory OCR stub" rule #1 calls for — the
+   invariant is now checked on every CI run, with or without Vision installed.
 
 ## Related
 
