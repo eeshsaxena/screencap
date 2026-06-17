@@ -35,7 +35,14 @@ jobs:
       - uses: actions/cache@v4
         with:
           path: ~/.cache/pip
-          key: ${{ runner.os }}-macos-14-pip-${{ hashFiles('pyproject.toml') }}
+          # Keyed on os+arch (not a hardcoded runner label) so a runner bump
+          # invalidates the cache instead of silently reusing stale wheels.
+          key: ${{ runner.os }}-${{ runner.arch }}-pip-${{ hashFiles('pyproject.toml') }}
+
+      - name: Upgrade pip past CVE-2026-3219
+        # Match release.yml: the runner-shipped pip is flagged by pip-audit; 26.1
+        # is the fix release (pypa/pip#13870, GHSA-58qw-9mgm-455v).
+        run: pip install --upgrade "pip>=26.1"
 
       - name: Install dependencies
         # .[dev] pulls .[record] (incl. pyobjc-framework-Vision on darwin) plus the
@@ -71,7 +78,10 @@ jobs:
       - uses: actions/cache@v4
         with:
           path: ~/.cache/pip
-          key: ${{ runner.os }}-ubuntu-pip-${{ hashFiles('pyproject.toml') }}
+          key: ${{ runner.os }}-${{ runner.arch }}-pip-${{ hashFiles('pyproject.toml') }}
+
+      - name: Upgrade pip past CVE-2026-3219
+        run: pip install --upgrade "pip>=26.1"
 
       - name: Install dependencies
         # pyobjc / darwin-only deps are auto-skipped on Linux via their
