@@ -363,6 +363,46 @@ final class ReviewWindowViewModelTests: XCTestCase {
         XCTAssertNil(effects.pendingAutoClose, "auto-close handle should have been cancelled")
     }
 
+    /// SCR-90 — defensive disarm. Once `.succeeded` arms the auto-close timer,
+    /// any transition away from `.succeeded` must cancel the pending dismiss so
+    /// it can't auto-close the new window out from under the user. Today's
+    /// first-write-wins controller blocks a second *terminal* event after
+    /// success, but `UploadController.start` still permits a fresh `.uploading`
+    /// from `.succeeded` (the Retry-after-success path) — and a future
+    /// state-machine change could reopen the late-failure path. Without the
+    /// disarm, the stale success timer fires and dismisses the new window.
+    func testTransitionAwayFromSucceededCancelsPendingAutoClose() async {
+        let service = FakeUploadService()
+        let controller = makeController(service: service)
+        let effects = FakeReviewWindowEffects()
+        let model = makeModel(controller: controller, effects: effects)
+        var dismissCalls = 0
+        model.dismissHandler = { dismissCalls += 1 }
+
+        await model.loadReviewData()
+        model.startUpload()
+        service.emit(#"{"type": "upload_started", "schema_version": 1, "file_count": 1}"#)
+        service.emit(#"{"type": "upload_finished", "schema_version": 1, "uploaded": 1, "skipped": 0, "failed": 0}"#)
+        await Task.yield()
+
+        // Sanity: success armed the auto-close timer.
+        XCTAssertNotNil(effects.pendingAutoClose, "success should arm the auto-close timer")
+
+        // A fresh upload starts after success — the controller publishes
+        // `.uploading` from `.succeeded`, so the viewmodel observes a
+        // transition away from `.succeeded` and must disarm the dismiss.
+        controller.start(name: "rec-001")
+        await Task.yield()
+
+        XCTAssertNil(
+            effects.pendingAutoClose,
+            "transition away from .succeeded must cancel the auto-close timer")
+
+        // Even if the stale timer somehow fired, no dismiss should occur.
+        effects.fireAutoClose()
+        XCTAssertEqual(dismissCalls, 0, "no dismiss fires after the state flips out of .succeeded")
+    }
+
     /// Covers AE5 (U6): Cancel on the ready review screen uploads nothing and
     /// is inert — no upload is started, no process is terminated, and the state
     /// stays ready (the original on-disk recording is never touched because no

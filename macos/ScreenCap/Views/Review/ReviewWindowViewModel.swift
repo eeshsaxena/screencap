@@ -281,6 +281,10 @@ final class ReviewWindowViewModel: ObservableObject {
     /// Upload-button action. No-op if the viewmodel isn't in a ready /
     /// failed (with retry data) state.
     func startUpload() {
+        // A new upload supersedes any pending success auto-close (SCR-90): if
+        // the user re-uploads from a success confirmation, the old dismiss must
+        // not fire against the new in-flight window.
+        disarmAutoClose()
         let data = currentReviewData()
         guard let data else { return }
         state = .uploading(progress: .init(filesDone: 0, filesTotal: 0, fraction: 0), data: data)
@@ -292,8 +296,7 @@ final class ReviewWindowViewModel: ObservableObject {
     /// state observer. Safe-on-idle (the controller's cancel guard checks
     /// isRunning).
     func cancel() {
-        autoCloseHandle?.cancel()
-        autoCloseHandle = nil
+        disarmAutoClose()
         uploadController.cancel()
     }
 
@@ -304,6 +307,14 @@ final class ReviewWindowViewModel: ObservableObject {
     }
 
     // MARK: - Internal
+
+    /// Cancels and clears any pending success auto-close timer (SCR-90).
+    /// Idempotent — `AutoCloseHandle.cancel()` is a no-op once fired/cancelled
+    /// and the handle is nilled, so repeated calls are safe.
+    private func disarmAutoClose() {
+        autoCloseHandle?.cancel()
+        autoCloseHandle = nil
+    }
 
     private func currentReviewData() -> ReviewData? {
         switch state {
@@ -322,6 +333,10 @@ final class ReviewWindowViewModel: ObservableObject {
         case .idle:
             return
         case .uploading(let progress):
+            // Any transition away from `.succeeded` disarms the pending
+            // auto-close (SCR-90) so a stale success timer can't dismiss a
+            // window that's now showing a fresh in-flight upload.
+            disarmAutoClose()
             if let data = currentReviewData() {
                 state = .uploading(progress: progress, data: data)
             }
@@ -338,6 +353,10 @@ final class ReviewWindowViewModel: ObservableObject {
                 self?.dismissHandler?()
             }
         case .failed(let message):
+            // Disarm any pending success auto-close (SCR-90): a late failure
+            // after `.succeeded` must not auto-dismiss the failure window out
+            // from under the user.
+            disarmAutoClose()
             // Carry the last-known ReviewData forward so the Retry button
             // has the panes to render against without re-running U2.
             let retry = currentReviewData()
