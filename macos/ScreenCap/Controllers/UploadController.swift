@@ -76,16 +76,58 @@ enum UploadState: Equatable {
     }
 }
 
+/// Process-wide in-flight upload registry keyed by recording name (SCR-89).
+///
+/// R3 allows multiple concurrent review windows, and the review scene is a
+/// multi-window `WindowGroup` (ScreenCapApp) — on the macOS 13 deployment
+/// floor, opening the window twice for the same recording yields two windows,
+/// each owning its own `UploadController`. The per-instance `.uploading`
+/// guard in `start(name:)` therefore can't see an upload started by another
+/// window's controller for the *same* recording, so two `screencap upload
+/// <name>` children would race — wasting bandwidth and reporting all-skipped
+/// / 0 uploaded. This registry is the cross-controller guard: a recording
+/// name may be claimed by at most one controller at a time.
+///
+/// `@MainActor`-isolated, so every access is serialized on the main actor —
+/// no locking required. Injected into `UploadController` (rather than read as
+/// a bare static) so tests can supply a fresh instance per case or share one
+/// across controllers to exercise the cross-window refusal; production uses
+/// the `.shared` singleton. Mirrors the `ReviewWindowOpener.shared` pattern.
+@MainActor
+final class UploadRegistry {
+    static let shared = UploadRegistry()
+
+    private var activeNames: Set<String> = []
+
+    /// Attempts to claim `name`. Returns true if the caller now owns it,
+    /// false if another controller already holds it.
+    func claim(_ name: String) -> Bool {
+        activeNames.insert(name).inserted
+    }
+
+    /// Releases a previously claimed name. A no-op if the name isn't held,
+    /// so release paths can fire idempotently.
+    func release(_ name: String) {
+        activeNames.remove(name)
+    }
+}
+
 @MainActor
 final class UploadController: ObservableObject {
     @Published private(set) var state: UploadState = .idle
 
     private let service: UploadService
+    private let registry: UploadRegistry
     private let inactivityTimeoutSeconds: Double
     private var process: SpawnedProcessHandle?
     private var sawTerminalEvent: Bool = false
     private var filesTotal: Int = 0
     private var filesDone: Int = 0
+    /// The recording name this controller currently holds in the cross-window
+    /// `registry` (SCR-89), or nil when it holds none. Set on a successful
+    /// claim in `start(name:)`, cleared by `releaseClaim()` on any terminal
+    /// state or cancel so the registry entry is released exactly once.
+    private var claimedName: String?
     /// Inactivity watchdog (todo #001). Reset on every parsed upload event
     /// and on terminal exit. If no event arrives within the bound, the
     /// controller surfaces a `.failed("upload timed out")` and SIGTERMs the
@@ -103,17 +145,32 @@ final class UploadController: ObservableObject {
     /// instead of hours.
     init(
         service: UploadService = LiveUploadService(),
+        registry: UploadRegistry = .shared,
         inactivityTimeoutSeconds: Double = 120
     ) {
         self.service = service
+        self.registry = registry
         self.inactivityTimeoutSeconds = inactivityTimeoutSeconds
     }
 
     /// Spawns `screencap upload <name>` and starts streaming events. The
-    /// guard rejects only `uploading` — start is valid from idle, succeeded,
-    /// or failed so the Retry button (U8) can reuse this entry point.
+    /// per-instance guard rejects only `uploading` — start is valid from idle,
+    /// succeeded, or failed so the Retry button (U8) can reuse this entry
+    /// point. The cross-window registry guard (SCR-89) additionally refuses
+    /// when another controller is already uploading the same recording.
     func start(name: String) {
         if case .uploading = state { return }
+        // Cross-window guard (SCR-89): refuse if another window's controller
+        // is already uploading this recording. Surface a terminal `.failed`
+        // rather than a silent no-op — the review viewmodel optimistically
+        // sets `.uploading` before calling `start`, so a no-op would strand
+        // the window on "Starting upload…"; `.failed` gives a clear message
+        // and the Retry button (valid again once the other upload releases).
+        guard registry.claim(name) else {
+            state = .failed("An upload for this recording is already in progress.")
+            return
+        }
+        claimedName = name
         sawTerminalEvent = false
         filesTotal = 0
         filesDone = 0
@@ -128,8 +185,9 @@ final class UploadController: ObservableObject {
         } catch {
             // Spawn failure (binary not found, launch failed) maps to a
             // terminal failure state with the launch error surfaced. No
-            // process to clean up.
+            // process to clean up, but the registry claim must be released.
             sawTerminalEvent = true
+            releaseClaim()
             state = .failed(error.localizedDescription)
         }
     }
@@ -140,8 +198,23 @@ final class UploadController: ObservableObject {
     func cancel() {
         watchdogTask?.cancel()
         watchdogTask = nil
+        // Release the cross-window claim (SCR-89) so another window may take
+        // over the recording the moment the user cancels. The Python side's
+        // per-recording terminal-stage flock is the real overlap safety net;
+        // this guard only prevents obviously-wasteful concurrent spawns.
+        releaseClaim()
         guard let process, process.isRunning else { return }
         process.terminate()
+    }
+
+    /// Releases this controller's cross-window registry claim (SCR-89), if it
+    /// holds one. Idempotent — safe to call from every terminal/cancel path;
+    /// `claimedName` is nilled so a second call is a no-op.
+    private func releaseClaim() {
+        if let name = claimedName {
+            registry.release(name)
+            claimedName = nil
+        }
     }
 
     /// (Re-)arm the inactivity watchdog. Called at start and on every
@@ -163,6 +236,7 @@ final class UploadController: ObservableObject {
         // a race shouldn't clobber a fresh .succeeded / .failed.
         guard !sawTerminalEvent, case .uploading = state else { return }
         sawTerminalEvent = true
+        releaseClaim()
         // SIGTERM the child so the OS reaps it and the user isn't left
         // with a zombie upload process after the UI gives up.
         process?.terminate()
@@ -215,6 +289,7 @@ final class UploadController: ObservableObject {
             sawTerminalEvent = true
             watchdogTask?.cancel()
             watchdogTask = nil
+            releaseClaim()
             state = .succeeded(.init(
                 uploaded: event.uploaded ?? 0,
                 skipped: event.skipped ?? 0,
@@ -225,6 +300,7 @@ final class UploadController: ObservableObject {
             sawTerminalEvent = true
             watchdogTask?.cancel()
             watchdogTask = nil
+            releaseClaim()
             state = .failed(event.error ?? "upload failed")
         default:
             // Unknown event type — silently ignore. A future addition
@@ -237,6 +313,9 @@ final class UploadController: ObservableObject {
         process = nil
         watchdogTask?.cancel()
         watchdogTask = nil
+        // The child has exited, so the cross-window claim (SCR-89) is always
+        // released here — idempotent if a terminal event already released it.
+        releaseClaim()
         // If we already received a terminal event, defer to it — the
         // terminationHandler may run after `upload_finished` / `upload_failed`.
         guard !sawTerminalEvent else { return }
