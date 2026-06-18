@@ -324,6 +324,10 @@ final class ReviewWindowViewModel: ObservableObject {
         case .failed(_, let retryData):
             return retryData
         case .preparing, .succeeded:
+            // `.succeeded` intentionally returns nil: an upload already
+            // completed, so there is no ready/retry payload to re-enter
+            // `.uploading` with. See the SCR-90 note in
+            // `handleUploadStateChange`'s `.uploading` branch.
             return nil
         }
     }
@@ -333,10 +337,20 @@ final class ReviewWindowViewModel: ObservableObject {
         case .idle:
             return
         case .uploading(let progress):
-            // Any transition away from `.succeeded` disarms the pending
-            // auto-close (SCR-90) so a stale success timer can't dismiss a
-            // window that's now showing a fresh in-flight upload.
+            // Disarm any pending success auto-close (SCR-90). This fires on
+            // every `.uploading` event (progress ticks included), but
+            // `disarmAutoClose()` is idempotent, so repeated calls during a
+            // live upload are no-ops; the case that matters is the first
+            // `.uploading` after `.succeeded`, which cancels the stale dismiss
+            // timer before a restarted upload would render.
             disarmAutoClose()
+            // Arriving here straight from `.succeeded` disarms but does NOT
+            // advance the state: `currentReviewData()` returns nil for
+            // `.succeeded`, so the guard below is skipped and the viewmodel
+            // stays `.succeeded`. That restart-from-success path is not
+            // user-reachable today (the success screen exposes no re-upload
+            // affordance; the controller is first-write-wins), so this is
+            // defensive-only — the disarm above is the part that matters.
             if let data = currentReviewData() {
                 state = .uploading(progress: progress, data: data)
             }

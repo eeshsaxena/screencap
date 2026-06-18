@@ -364,13 +364,15 @@ final class ReviewWindowViewModelTests: XCTestCase {
     }
 
     /// SCR-90 — defensive disarm. Once `.succeeded` arms the auto-close timer,
-    /// any transition away from `.succeeded` must cancel the pending dismiss so
-    /// it can't auto-close the new window out from under the user. Today's
-    /// first-write-wins controller blocks a second *terminal* event after
-    /// success, but `UploadController.start` still permits a fresh `.uploading`
-    /// from `.succeeded` (the Retry-after-success path) — and a future
-    /// state-machine change could reopen the late-failure path. Without the
-    /// disarm, the stale success timer fires and dismisses the new window.
+    /// a fresh upload-state `.uploading` (the controller's Retry-after-success
+    /// publish) must cancel the pending dismiss so a stale success timer can't
+    /// auto-close a window the user is now interacting with. This asserts the
+    /// *upload state* moving off `.succeeded`; the viewmodel's own `ReviewState`
+    /// intentionally stays `.succeeded` here (`currentReviewData()` returns nil
+    /// for `.succeeded`, so the `.uploading` branch disarms but does not
+    /// advance). That restart-from-success path is not user-reachable today —
+    /// this is defensive hardening, and a future change that makes it reachable
+    /// will trip the `.succeeded` state assertion below.
     func testTransitionAwayFromSucceededCancelsPendingAutoClose() async {
         let service = FakeUploadService()
         let controller = makeController(service: service)
@@ -388,19 +390,28 @@ final class ReviewWindowViewModelTests: XCTestCase {
         // Sanity: success armed the auto-close timer.
         XCTAssertNotNil(effects.pendingAutoClose, "success should arm the auto-close timer")
 
-        // A fresh upload starts after success — the controller publishes
-        // `.uploading` from `.succeeded`, so the viewmodel observes a
-        // transition away from `.succeeded` and must disarm the dismiss.
+        // A fresh upload starts after success — the controller publishes a new
+        // `.uploading` upload-state, so the viewmodel's observer runs its
+        // `.uploading` branch and must disarm the pending dismiss.
         controller.start(name: "rec-001")
         await Task.yield()
 
         XCTAssertNil(
             effects.pendingAutoClose,
-            "transition away from .succeeded must cancel the auto-close timer")
+            "a fresh upload after success must cancel the auto-close timer")
+
+        // The viewmodel's ReviewState intentionally stays `.succeeded`:
+        // `currentReviewData()` returns nil for `.succeeded`, so the
+        // `.uploading` observer branch disarms but does not advance the state.
+        // Pinning this documents the current (unreachable) behavior, so a
+        // future change that makes restart-after-success reachable trips here.
+        if case .succeeded = model.state {} else {
+            XCTFail("state should stay .succeeded after restart-from-success, got \(model.state)")
+        }
 
         // Even if the stale timer somehow fired, no dismiss should occur.
         effects.fireAutoClose()
-        XCTAssertEqual(dismissCalls, 0, "no dismiss fires after the state flips out of .succeeded")
+        XCTAssertEqual(dismissCalls, 0, "no dismiss fires after the disarm")
     }
 
     /// Covers AE5 (U6): Cancel on the ready review screen uploads nothing and
