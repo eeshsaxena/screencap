@@ -27,9 +27,10 @@ process exit code): 0=clean, 2=lock-held, 3=permission_lost, 4=disk_full,
 ``capture_unhealthy`` (SCR-76) is ADVISORY: it has NO exit code and never
 terminates a recording. The engine's mid-recording supervisor emits it once
 per detection edge when a reader is demonstrably attempting but producing no
-useful output AND the cause is not a ``screen_recording`` denial. ``capture_
-recovered`` (SCR-100) is its paired clear: the supervisor emits it once when a
-reader that previously crossed the unhealthy edge returns healthy mid-recording,
+useful output AND the cause is not a ``screen_recording`` denial.
+``capture_recovered`` (SCR-100) is its paired clear: the supervisor emits it
+once when a reader that previously crossed the unhealthy edge returns healthy
+mid-recording,
 so the shell can drop the stale advisory instead of letting it linger until the
 recording ends. It carries ``reader`` + ``elapsed`` only (no ``reason``); like
 ``capture_unhealthy`` it is advisory with no exit code. A recover-then-rebreak

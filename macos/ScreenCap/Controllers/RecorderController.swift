@@ -47,8 +47,9 @@ struct RecorderEventLine: Decodable {
     let optOutCommandExamples: [String]?
     let cursor: Int?
     let reason: String?
-    /// Which capture is affected on a `capture_unhealthy` event (SCR-76):
-    /// "screen" / "window" / "action". Absent on every other event type.
+    /// Which capture is affected on a `capture_unhealthy` (SCR-76) or
+    /// `capture_recovered` (SCR-100) event: "screen" / "window" / "action".
+    /// Absent on every other event type.
     let reader: String?
     let ts: Double?
 

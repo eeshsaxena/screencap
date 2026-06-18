@@ -182,6 +182,21 @@ final class RecorderControllerTests: XCTestCase {
         XCTAssertNil(recorder.captureAdvisory)
     }
 
+    func testCaptureRecoveredWhileStoppingIsNoOp() {
+        let recorder = RecorderController()
+        recorder._testSetPresentation(state: .stopping(quitting: false))
+
+        // A late recovery arriving during teardown must be a no-op, mirroring
+        // the capture_unhealthy .stopping suppression — handleCaptureRecovered's
+        // `if case .recording` guard drops it (and the .idle chokepoint clears
+        // everything anyway).
+        recorder._testHandleStderrLine(
+            #"{"type":"capture_recovered","reader":"screen","elapsed":15.0,"schema_version":1}"#
+        )
+
+        XCTAssertNil(recorder.captureAdvisory)
+    }
+
     func testMissingPermissionsMessageNamesEveryRequiredPermission() {
         XCTAssertEqual(
             RecorderController.requiredPermissionsErrorMessage,

@@ -2350,9 +2350,10 @@ def _capture_health_tick(
     broken-in-frozen" gap (R12) without a subprocess. ``emit`` (stderr) and the
     in-process ``probe`` are both frozen-safe by construction.
     """
+    from screencap._stderr_events import EVENT_CAPTURE_RECOVERED
+
     if prev_counts is None or elapsed < window_secs:
         return []  # start-barrier / warmup — establish baseline, no verdict yet
-    from screencap._stderr_events import EVENT_CAPTURE_RECOVERED
 
     events: list[tuple[str, str]] = []
     unhealthy, recovered = _capture_health_step(
