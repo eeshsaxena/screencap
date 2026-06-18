@@ -480,12 +480,16 @@ class TestBackgroundWindowMasking:
     visible in the background.
     """
 
-    def _setup_scrub(self, tmp_path, *, foreground_bundle, foreground_title,
-                     geometry_windows, evaluator_kwargs=None,
-                     pixel_ratio=1.0, img_w=200, img_h=150):
-        """Common setup for background masking tests."""
+    def _build_scrub_ctx(self, tmp_path, *, foreground_bundle, foreground_title,
+                         geometry_windows, evaluator_kwargs=None,
+                         pixel_ratio=1.0, img_w=200, img_h=150):
+        """Build the scene + ScrubContext WITHOUT calling mask_screenshots.
+
+        Returns (screenshots_dir, ctx, db_path, result) so a caller can apply
+        monkeypatches (e.g. faking the OCR stack) before running the scrub.
+        """
         from screencap.privacy.context import WindowContext
-        from screencap.scrubber import ScrubContext, ScrubResult, mask_screenshots
+        from screencap.scrubber import ScrubContext, ScrubResult
 
         screenshots_dir = tmp_path / "screenshots"
         screenshots_dir.mkdir()
@@ -508,6 +512,24 @@ class TestBackgroundWindowMasking:
         result = ScrubResult()
         ctx = ScrubContext(window_events=window_events, evaluator=evaluator,
                            classifier=classifier, pixel_ratio=pixel_ratio)
+        return screenshots_dir, ctx, db_path, result
+
+    def _setup_scrub(self, tmp_path, *, foreground_bundle, foreground_title,
+                     geometry_windows, evaluator_kwargs=None,
+                     pixel_ratio=1.0, img_w=200, img_h=150):
+        """Common setup for background masking tests: build scene then scrub."""
+        from screencap.scrubber import mask_screenshots
+
+        screenshots_dir, ctx, db_path, result = self._build_scrub_ctx(
+            tmp_path,
+            foreground_bundle=foreground_bundle,
+            foreground_title=foreground_title,
+            geometry_windows=geometry_windows,
+            evaluator_kwargs=evaluator_kwargs,
+            pixel_ratio=pixel_ratio,
+            img_w=img_w,
+            img_h=img_h,
+        )
 
         mask_screenshots(screenshots_dir, ctx, db_path=db_path, result=result)
         return screenshots_dir / "100.0.jpg", result
@@ -647,6 +669,95 @@ class TestBackgroundWindowMasking:
 
         assert all(c > 200 for c in left_pixel), f"VS Code should be unmasked: {left_pixel}"
         assert all(c < 50 for c in right_pixel), f"Slack (TEXT_REDACT) should be masked: {right_pixel}"
+
+    def test_background_masked_even_when_foreground_ocr_pass_runs(
+        self, tmp_path, monkeypatch
+    ):
+        """SCR-110 regression guard that runs WITHOUT pyobjc-Vision.
+
+        Background-window masking and the foreground OCR pass operate on
+        disjoint regions, so a sensitive background window must be masked
+        *regardless* of whether the foreground OCR pass ran. The original bug
+        gated background masking on ``ocr_ran or cache_hit``, so a sensitive
+        background window leaked whenever Vision ran the foreground OCR pass.
+
+        The other tests in this class run with ``ocr_ran=False`` (no Vision),
+        so they pass with or without that gate and cannot catch the regression
+        off a Mac. Real Vision only runs on macOS, so here we fake the OCR
+        stack: a stub ``ocr_mask_screenshot`` forces the foreground OCR pass to
+        run (``ocr_ran=True``) while returning no foreground regions, and we
+        assert the background window is still masked. This makes the SCR-110
+        invariant checkable on every CI run without Vision installed.
+        """
+        from PIL import Image
+
+        from screencap.scrubber import mask_screenshots
+
+        # Same scene as test_allow_foreground_masks_sensitive_background:
+        # foreground VS Code (ALLOW) + background Robinhood (banking → MASK_WINDOW).
+        # Build the scene first so we can fake the OCR stack BEFORE mask runs.
+        screenshots_dir, ctx, db_path, result = self._build_scrub_ctx(
+            tmp_path,
+            foreground_bundle="com.microsoft.VSCode",
+            foreground_title="main.py",
+            evaluator_kwargs={"mode": "internal"},
+            geometry_windows=[
+                {"bundle_id": "com.microsoft.VSCode", "app_name": "VS Code",
+                 "x": 0, "y": 0, "width": 100, "height": 150},
+                {"bundle_id": "com.robinhood.Robinhood", "app_name": "Robinhood",
+                 "x": 100, "y": 0, "width": 100, "height": 150},
+            ],
+        )
+
+        # Fake the Vision/OCR stack: VisionOcr() and create_default_pipeline()
+        # only need to return non-None so the OCR pass is enabled; the real OCR
+        # work is replaced by a stub that records the call and returns no
+        # foreground regions (so ocr_ran=True and foreground content is kept).
+        ocr_called = {"count": 0}
+
+        class _FakeVisionOcr:
+            def __init__(self, *args, **kwargs):
+                pass
+
+        def _fake_ocr_mask_screenshot(*args, **kwargs):
+            ocr_called["count"] += 1
+            return []
+
+        monkeypatch.setattr("screencap.privacy.ocr.VisionOcr", _FakeVisionOcr)
+        monkeypatch.setattr(
+            "screencap.privacy.create_default_pipeline", lambda: object()
+        )
+        monkeypatch.setattr(
+            "screencap.scrubber.ocr_mask_screenshot", _fake_ocr_mask_screenshot
+        )
+
+        mask_screenshots(screenshots_dir, ctx, db_path=db_path, result=result)
+
+        img_path = screenshots_dir / "100.0.jpg"
+
+        # Precondition: the foreground OCR pass actually ran. Without this the
+        # test is vacuous (ocr_ran=False) and would not guard SCR-110.
+        assert ocr_called["count"] >= 1, (
+            "foreground OCR pass did not run; the SCR-110 guard would be vacuous"
+        )
+
+        # Invariant: the sensitive background window is masked even though the
+        # foreground OCR pass ran on this screenshot.
+        assert img_path.exists()
+        img = Image.open(img_path).convert("RGB")
+        left_pixel = img.getpixel((25, 130))    # VS Code (foreground, ALLOW)
+        right_pixel = img.getpixel((150, 130))   # Robinhood (background, MASK_WINDOW)
+        img.close()
+
+        assert all(c > 200 for c in left_pixel), f"VS Code should be unmasked: {left_pixel}"
+        assert all(c < 50 for c in right_pixel), (
+            "Banking app must be masked even when the foreground OCR pass ran "
+            f"(SCR-110): {right_pixel}"
+        )
+
+        bg_entries = [e for e in result.audit_entries
+                      if "background_windows_masked" in e.reason]
+        assert len(bg_entries) == 1
 
 
 # ---------------------------------------------------------------------------

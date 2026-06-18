@@ -1,0 +1,102 @@
+name: CI
+
+# Run the @pytest.mark.privacy regression guards automatically so a privacy
+# regression (e.g. sensitive background-window masking leaking, SCR-110) fails
+# a check instead of shipping undetected. The repo had no pytest lane in CI;
+# this workflow adds one scoped to the privacy guards (SCR-133).
+on:
+  push:
+    branches: [main]
+  pull_request:
+
+permissions:
+  contents: read
+
+# Cancel superseded PR runs on the same ref to save (10x-billed) macOS minutes.
+# Pushes to main are NOT cancelled so each main commit runs the guards to
+# completion (preserving per-commit CI signal on the protected branch).
+concurrency:
+  group: ci-${{ github.workflow }}-${{ github.ref }}
+  cancel-in-progress: ${{ github.event_name == 'pull_request' }}
+
+jobs:
+  privacy-guards-macos:
+    # Highest-fidelity lane: a macOS runner with pyobjc-Vision installed runs the
+    # full @pytest.mark.privacy suite, exercising the real OCR/masking + NER path.
+    # Mirrors the runner + Python + install setup used by release.yml.
+    name: Privacy guards (macOS, Vision)
+    runs-on: macos-14
+    timeout-minutes: 30
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/setup-python@v5
+        with:
+          python-version: '3.12'
+
+      - uses: actions/cache@v4
+        with:
+          path: ~/.cache/pip
+          # Keyed on os+arch (not a hardcoded runner label) so a runner bump
+          # invalidates the cache instead of silently reusing stale wheels.
+          key: ${{ runner.os }}-${{ runner.arch }}-pip-${{ hashFiles('pyproject.toml') }}
+
+      - name: Upgrade pip past CVE-2026-3219
+        # Match release.yml: the runner-shipped pip is flagged by pip-audit; 26.1
+        # is the fix release (pypa/pip#13870, GHSA-58qw-9mgm-455v).
+        run: pip install --upgrade "pip>=26.1"
+
+      - name: Install dependencies
+        # .[dev] pulls .[record] (incl. pyobjc-framework-Vision on darwin) plus the
+        # pytest tooling, so both the Vision-backed and Vision-free guards run here.
+        run: pip install -e ".[dev]"
+
+      - name: Download spaCy model (presidio NER backbone)
+        # The privacy suite exercises the real DetectionPipeline (presidio); its
+        # spaCy backbone needs this model. Same step as release.yml.
+        run: python -m spacy download en_core_web_sm
+
+      - name: Run privacy guard suite
+        # Per-test timeout (pytest-timeout, from .[dev]) keeps a hung test from
+        # stalling the whole lane.
+        run: pytest -m privacy --timeout=300
+
+  privacy-guards-visionfree:
+    # Defense-in-depth: prove the SCR-110 background-masking invariant on every run
+    # WITHOUT pyobjc-Vision. tests/test_selective_masking.py (incl.
+    # TestBackgroundWindowMasking) imports no pyobjc at module load, so it runs on
+    # Linux. This is the "runs everywhere" guard; if macOS runners are unavailable,
+    # this lane still catches the regression.
+    #
+    # Scoped to this one file ON PURPOSE: `pytest -m privacy` imports the WHOLE test
+    # tree to discover markers before deselecting, and several non-privacy modules
+    # (tests/engine/*, tests/network/*, test_capture_health*) import pynput at module
+    # load, which fails on a headless Linux runner (no X server). A broader Linux
+    # backstop needs xvfb or import-mocking infra — tracked separately.
+    name: Privacy guards (Vision-free, Linux)
+    runs-on: ubuntu-latest
+    timeout-minutes: 20
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/setup-python@v5
+        with:
+          python-version: '3.12'
+
+      - uses: actions/cache@v4
+        with:
+          path: ~/.cache/pip
+          key: ${{ runner.os }}-${{ runner.arch }}-pip-${{ hashFiles('pyproject.toml') }}
+
+      - name: Upgrade pip past CVE-2026-3219
+        run: pip install --upgrade "pip>=26.1"
+
+      - name: Install dependencies
+        # pyobjc / darwin-only deps are auto-skipped on Linux via their
+        # `sys_platform == 'darwin'` markers in pyproject.toml.
+        run: pip install -e ".[dev]"
+
+      - name: Run Vision-free background-masking guards
+        # Per-test timeout (pytest-timeout, from .[dev]) matches the macOS lane so a
+        # hung test fails fast instead of stalling up to the 20-minute job cap.
+        run: pytest tests/test_selective_masking.py -v --timeout=300
