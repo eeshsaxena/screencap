@@ -153,6 +153,18 @@ final class UploadController: ObservableObject {
         self.inactivityTimeoutSeconds = inactivityTimeoutSeconds
     }
 
+    deinit {
+        // SCR-89: defensively release a still-held claim if this controller is
+        // deallocated without cancel()/a terminal event ever firing (e.g. a
+        // window torn down without onDisappear). deinit is non-isolated and
+        // releaseClaim() is @MainActor, so capture the name + registry and hop
+        // to the main actor. Idempotent with the other release paths.
+        if let name = claimedName {
+            let registry = self.registry
+            Task { @MainActor in registry.release(name) }
+        }
+    }
+
     /// Spawns `screencap upload <name>` and starts streaming events. The
     /// per-instance guard rejects only `uploading` — start is valid from idle,
     /// succeeded, or failed so the Retry button (U8) can reuse this entry
@@ -215,6 +227,16 @@ final class UploadController: ObservableObject {
             registry.release(name)
             claimedName = nil
         }
+    }
+
+    /// Shared cleanup for a `handleLine` terminal event (`upload_finished` /
+    /// `upload_failed`): cancel the inactivity watchdog and release the
+    /// cross-window claim (SCR-89). The callers keep `sawTerminalEvent = true`
+    /// and the `state = ...` assignment so each case still owns its outcome.
+    private func cancelWatchdogAndReleaseClaim() {
+        watchdogTask?.cancel()
+        watchdogTask = nil
+        releaseClaim()
     }
 
     /// (Re-)arm the inactivity watchdog. Called at start and on every
@@ -287,9 +309,7 @@ final class UploadController: ObservableObject {
             // terminal event lands first owns the final state.
             guard !sawTerminalEvent else { return }
             sawTerminalEvent = true
-            watchdogTask?.cancel()
-            watchdogTask = nil
-            releaseClaim()
+            cancelWatchdogAndReleaseClaim()
             state = .succeeded(.init(
                 uploaded: event.uploaded ?? 0,
                 skipped: event.skipped ?? 0,
@@ -298,9 +318,7 @@ final class UploadController: ObservableObject {
         case "upload_failed":
             guard !sawTerminalEvent else { return }
             sawTerminalEvent = true
-            watchdogTask?.cancel()
-            watchdogTask = nil
-            releaseClaim()
+            cancelWatchdogAndReleaseClaim()
             state = .failed(event.error ?? "upload failed")
         default:
             // Unknown event type — silently ignore. A future addition

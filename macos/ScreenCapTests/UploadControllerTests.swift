@@ -473,6 +473,101 @@ final class UploadControllerTests: XCTestCase {
         }
     }
 
+    /// SCR-89 — the inactivity-timeout release path frees the name for another
+    /// window. Pins `fireInactivityTimeout()`'s `releaseClaim()`: after A's
+    /// watchdog fires, B can claim the same recording.
+    func testNameReleasedAfterInactivityTimeoutAllowsSecondController() async {
+        let serviceA = FakeUploadService()
+        let serviceB = FakeUploadService()
+        let controllerA = makeController(service: serviceA, inactivityTimeoutSeconds: 0.05)
+        let controllerB = makeController(service: serviceB)
+
+        controllerA.start(name: "rec-001")
+        // Let A's watchdog fire (bound 50ms; wait well past it).
+        try? await Task.sleep(nanoseconds: 200_000_000)
+
+        controllerB.start(name: "rec-001")
+
+        XCTAssertEqual(serviceB.startedNames, ["rec-001"], "name should be free after A's inactivity timeout")
+        if case .uploading = controllerB.state {
+            // pass
+        } else {
+            XCTFail("B should upload after A's watchdog released, got \(controllerB.state)")
+        }
+    }
+
+    /// SCR-89 — the exit-without-terminal-event release path frees the name.
+    /// Pins `handleTerminated()`'s unconditional `releaseClaim()`: A's child
+    /// exits non-zero with no prior terminal event, so B can claim the name.
+    func testNameReleasedAfterExitWithoutEventAllowsSecondController() {
+        let serviceA = FakeUploadService()
+        let serviceB = FakeUploadService()
+        let controllerA = makeController(service: serviceA)
+        let controllerB = makeController(service: serviceB)
+
+        controllerA.start(name: "rec-001")
+        // No terminal event — the child just exits, driving handleTerminated.
+        serviceA.terminate(exitCode: 1)
+
+        controllerB.start(name: "rec-001")
+
+        XCTAssertEqual(serviceB.startedNames, ["rec-001"], "name should be free after A's bare exit")
+        if case .uploading = controllerB.state {
+            // pass
+        } else {
+            XCTFail("B should upload after A's exit released, got \(controllerB.state)")
+        }
+    }
+
+    /// SCR-89 — the spawn-failure release path frees the name. Pins the catch
+    /// block's `releaseClaim()` in `start(name:)`: A's service throws on spawn,
+    /// so A lands on `.failed` having released the claim, and B can take it.
+    func testNameReleasedAfterSpawnFailureAllowsSecondController() {
+        let serviceA = FakeUploadService()
+        serviceA.pendingError = FakeUploadServiceError.launchFailed
+        let serviceB = FakeUploadService()
+        let controllerA = makeController(service: serviceA)
+        let controllerB = makeController(service: serviceB)
+
+        controllerA.start(name: "rec-001")
+        if case .failed = controllerA.state {
+            // pass
+        } else {
+            XCTFail("A should be failed after spawn failure, got \(controllerA.state)")
+        }
+
+        controllerB.start(name: "rec-001")
+
+        XCTAssertEqual(serviceB.startedNames, ["rec-001"], "name should be free after A's spawn failure")
+        if case .uploading = controllerB.state {
+            // pass
+        } else {
+            XCTFail("B should upload after A's spawn-failure released, got \(controllerB.state)")
+        }
+    }
+
+    /// SCR-89 — the `upload_failed` event release path frees the name. Pins the
+    /// `upload_failed` case's `releaseClaim()` in `handleLine`: A fails via an
+    /// explicit event, so B can claim the same recording.
+    func testNameReleasedAfterUploadFailedEventAllowsSecondController() {
+        let serviceA = FakeUploadService()
+        let serviceB = FakeUploadService()
+        let controllerA = makeController(service: serviceA)
+        let controllerB = makeController(service: serviceB)
+
+        controllerA.start(name: "rec-001")
+        serviceA.emit(#"{"type": "upload_failed", "schema_version": 1, "error": "network reset"}"#)
+
+        controllerB.start(name: "rec-001")
+
+        XCTAssertEqual(serviceB.startedNames, ["rec-001"], "name should be free after A's upload_failed event")
+        if case .uploading = controllerB.state {
+            // pass
+        } else {
+            XCTFail("B should upload after A's upload_failed released, got \(controllerB.state)")
+        }
+    }
+
     /// SCR-89 — the same controller's retry path still works under the
     /// registry: a failure releases the name, so re-`start` re-claims it.
     func testSameControllerRetryReclaimsName() {
