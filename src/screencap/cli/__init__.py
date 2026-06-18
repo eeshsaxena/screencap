@@ -2667,6 +2667,9 @@ def upload(names, all_recordings, dry_run, force, jobs, no_delete):
     # the sentinel, and retention, behind the per-recording flock. ``screencap
     # upload`` is an EXPLICIT promotion: force_destination=cloud uploads a
     # local/legacy/no-intent recording that would otherwise route LOCAL → no-op.
+    import signal as _signal
+
+    from screencap._stderr_events import EVENT_UPLOAD_FAILED, emit_event
     from screencap.pipeline_policy import Destination, RetentionPolicy
     from screencap.terminal_stage import (
         PromotionRefused,
@@ -2674,75 +2677,130 @@ def upload(names, all_recordings, dry_run, force, jobs, no_delete):
         run_terminal_stage,
     )
 
+    # SCR-94: install a top-level SIGTERM handler BEFORE the terminal stage runs
+    # so a cancel during the multi-second pre-upload prep phase (GCS reconcile,
+    # recovery, scrub/export — all inside run_terminal_stage, which runs BEFORE
+    # upload_recording installs its own finer handler) still emits a terminal
+    # ``upload_failed(error="interrupted")`` event. Without it the child dies on
+    # the default SIGTERM disposition with no event, and the SwiftUI
+    # UploadController surfaces a raw "exited with code N" instead of a clean
+    # cancel (the review window's close-as-cancel terminate()s this subprocess).
+    #
+    # upload_recording swaps in — and restores — its own SIGTERM handler for the
+    # transfer phase, so exactly one of the two is installed at any instant: a
+    # cancel emits exactly one terminal event, by construction. signal.signal
+    # requires the main thread (the CLI path always is); an off-main-thread
+    # caller skips both install and restore.
+    _current_name: list[str | None] = [None]
+    _interrupt_emitted = [False]
+
+    def _emit_interrupted_and_raise(_signum, _frame):
+        if not _interrupt_emitted[0]:
+            _interrupt_emitted[0] = True
+            fields: dict[str, str] = {"error": "interrupted"}
+            if _current_name[0] is not None:
+                fields["recording"] = _current_name[0]
+            emit_event(EVENT_UPLOAD_FAILED, **fields)
+        raise KeyboardInterrupt
+
+    _UNSET: object = object()
+    _previous_sigterm: object = _UNSET
+    try:
+        _previous_sigterm = _signal.signal(
+            _signal.SIGTERM, _emit_interrupted_and_raise
+        )
+    except ValueError:
+        pass  # off-main-thread — the restore guard below no-ops.
+
     total_count = len(dirs)
     n_ok = 0
     n_failed = 0
-    for i, d in enumerate(dirs, 1):
-        if total_count > 1:
-            console.print(f"\n[bold][{i}/{total_count}][/bold] {d.name}")
-        try:
-            result = run_terminal_stage(
-                d,
-                console=console,
-                force=force,
-                dry_run=dry_run,
-                force_destination=Destination.CLOUD,
-                # --no-delete keeps local media after upload (a per-run override).
-                retention_override=(
-                    RetentionPolicy.KEEP_FOREVER if no_delete else None
-                ),
-            )
-        except PromotionRefused as e:
-            console.print(
-                f"[red]Error:[/red] {e}\n"
-                "[dim]Upload skipped — nothing was changed.[/dim]"
-            )
-            n_failed += 1
-            continue
-        except TerminalStageBusy:
-            console.print(
-                f"  [yellow]{d.name}: upload already in progress[/yellow] — a "
-                "recording is finalizing, or another upload / daemon resume holds "
-                "the lock. Try again shortly."
-            )
-            n_failed += 1
-            continue
-        except FileNotFoundError as e:
-            console.print(f"[red]Error:[/red] {e}")
-            n_failed += 1
-            continue
-        except RuntimeError as e:
-            console.print(f"[red]Error:[/red] {e}")
-            sys.exit(1)
-
-        if dry_run:
-            console.print(
-                f"  [dim]Would upload {d.name} → cloud (dry run; nothing changed).[/dim]"
-            )
-            continue
-
-        # A FAILED chunk (scrub/mask fail-closed) or an upload warning means the
-        # recording did not fully converge — local media is preserved.
-        if result.failed_indices or result.upload_warning:
-            if result.upload_warning:
-                console.print(f"  [yellow]Warning:[/yellow] {result.upload_warning}")
-            if result.failed_indices:
-                console.print(
-                    f"  [yellow]{d.name}: {len(result.failed_indices)} chunk(s) could "
-                    "not be prepared — local media preserved, sentinel withheld.[/yellow]"
+    try:
+        for i, d in enumerate(dirs, 1):
+            _current_name[0] = d.name
+            if total_count > 1:
+                console.print(f"\n[bold][{i}/{total_count}][/bold] {d.name}")
+            try:
+                result = run_terminal_stage(
+                    d,
+                    console=console,
+                    force=force,
+                    dry_run=dry_run,
+                    force_destination=Destination.CLOUD,
+                    # --no-delete keeps local media after upload (a per-run override).
+                    retention_override=(
+                        RetentionPolicy.KEEP_FOREVER if no_delete else None
+                    ),
                 )
-            n_failed += 1
-            continue
+            except PromotionRefused as e:
+                console.print(
+                    f"[red]Error:[/red] {e}\n"
+                    "[dim]Upload skipped — nothing was changed.[/dim]"
+                )
+                n_failed += 1
+                continue
+            except TerminalStageBusy:
+                console.print(
+                    f"  [yellow]{d.name}: upload already in progress[/yellow] — a "
+                    "recording is finalizing, or another upload / daemon resume holds "
+                    "the lock. Try again shortly."
+                )
+                n_failed += 1
+                continue
+            except FileNotFoundError as e:
+                console.print(f"[red]Error:[/red] {e}")
+                n_failed += 1
+                continue
+            except RuntimeError as e:
+                console.print(f"[red]Error:[/red] {e}")
+                sys.exit(1)
 
-        n_ok += 1
-        note = " (stitching triggered)" if result.sentinel_uploaded else ""
-        console.print(
-            f"\n[green]Uploaded {d.name}[/green] "
-            f"({result.n_uploaded} chunk(s) uploaded, {result.n_skipped} skipped){note}"
-        )
+            if dry_run:
+                console.print(
+                    f"  [dim]Would upload {d.name} → cloud (dry run; nothing changed).[/dim]"
+                )
+                continue
 
-    if total_count > 1 and not dry_run:
-        console.print(f"\n[bold]Done.[/bold] {n_ok} uploaded, {n_failed} failed")
+            # A FAILED chunk (scrub/mask fail-closed) or an upload warning means the
+            # recording did not fully converge — local media is preserved.
+            if result.failed_indices or result.upload_warning:
+                if result.upload_warning:
+                    console.print(f"  [yellow]Warning:[/yellow] {result.upload_warning}")
+                if result.failed_indices:
+                    console.print(
+                        f"  [yellow]{d.name}: {len(result.failed_indices)} chunk(s) could "
+                        "not be prepared — local media preserved, sentinel withheld.[/yellow]"
+                    )
+                n_failed += 1
+                continue
+
+            n_ok += 1
+            note = " (stitching triggered)" if result.sentinel_uploaded else ""
+            console.print(
+                f"\n[green]Uploaded {d.name}[/green] "
+                f"({result.n_uploaded} chunk(s) uploaded, {result.n_skipped} skipped){note}"
+            )
+
+        if total_count > 1 and not dry_run:
+            console.print(f"\n[bold]Done.[/bold] {n_ok} uploaded, {n_failed} failed")
+    except KeyboardInterrupt:
+        # SIGTERM (window-close cancel) or Ctrl+C during the prep phase. The
+        # handler already emitted the terminal upload_failed(interrupted) event;
+        # exit non-zero without a traceback so the batch stops cleanly.
+        sys.exit(130)
+    finally:
+        # Restore only if install actually succeeded (_UNSET ⇒ off-main-thread).
+        # A genuine None previous handler (C-set) restores to SIG_DFL.
+        if _previous_sigterm is not _UNSET:
+            try:
+                _signal.signal(
+                    _signal.SIGTERM,
+                    _previous_sigterm
+                    if _previous_sigterm is not None
+                    else _signal.SIG_DFL,
+                )
+            except ValueError:
+                pass
 
 
 @cli.command()

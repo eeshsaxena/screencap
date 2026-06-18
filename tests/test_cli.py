@@ -1140,6 +1140,80 @@ def test_upload_busy_shows_friendly_message(tmp_path):
     assert "Traceback" not in result.output
 
 
+def test_upload_sigterm_during_prep_emits_interrupted(tmp_path):
+    """SCR-94: a SIGTERM during the pre-upload prep phase — run_terminal_stage's
+    reconcile / recovery / scrub, which runs BEFORE upload_recording installs its
+    own SIGTERM handler — must still emit a terminal ``upload_failed`` event.
+
+    Without the top-level handler the child dies on the default SIGTERM
+    disposition with no event, and the SwiftUI UploadController surfaces a raw
+    "exited with code N" instead of a clean cancel.
+    """
+    import os
+    import signal
+
+    rec_dir = _make_upload_recording(tmp_path, "rec-cancel")
+    runner = CliRunner()
+
+    def _sigterm_mid_prep(d, **kw):
+        # Stand in for the review-window-close SIGTERM landing while the terminal
+        # stage is still scrubbing/exporting. The command's handler fires during
+        # the sleep, emits the terminal event, and raises KeyboardInterrupt — so
+        # the sleep never completes and the AssertionError is never reached.
+        os.kill(os.getpid(), signal.SIGTERM)
+        time.sleep(5)
+        raise AssertionError("SIGTERM handler did not interrupt the prep phase")
+
+    with (
+        mock.patch("screencap.upload.resolve_recording_dirs", return_value=[rec_dir]),
+        mock.patch("screencap.terminal_stage.run_terminal_stage", _sigterm_mid_prep),
+    ):
+        result = runner.invoke(cli, ["upload", "rec-cancel"])
+
+    # Cancelled → non-zero exit, but a clean one (no traceback). The Swift side
+    # keys off the terminal event, not the exit code.
+    assert result.exit_code != 0
+    assert "Traceback" not in result.output
+
+    events = [
+        json.loads(line)
+        for line in result.stderr.splitlines()
+        if line.strip().startswith("{")
+    ]
+    failed = [e for e in events if e.get("type") == "upload_failed"]
+    # Exactly one terminal event — the command's handler and upload_recording's
+    # own handler are never both installed at once (SCR-94), so cancel can't
+    # double-emit.
+    assert len(failed) == 1, f"expected one upload_failed, got {events}"
+    assert failed[0]["error"] == "interrupted"
+    assert failed[0]["recording"] == "rec-cancel"
+    # We cancelled before the transfer phase, so upload_started never fired.
+    assert not any(e.get("type") == "upload_started" for e in events)
+
+
+def test_upload_restores_sigterm_handler_after_run(tmp_path):
+    """SCR-94: the command must restore the previous SIGTERM disposition on exit
+    so a long-lived host process (or a back-to-back invocation) is never left
+    with the upload command's handler permanently installed."""
+    import signal
+
+    rec_dir = _make_upload_recording(tmp_path, "rec-restore")
+    runner = CliRunner()
+    fake = mock.MagicMock(return_value=_terminal_result())
+
+    previous = signal.signal(signal.SIGTERM, signal.SIG_DFL)
+    try:
+        with (
+            mock.patch("screencap.upload.resolve_recording_dirs", return_value=[rec_dir]),
+            mock.patch("screencap.terminal_stage.run_terminal_stage", fake),
+        ):
+            result = runner.invoke(cli, ["upload", "rec-restore"])
+        assert result.exit_code == 0
+        assert signal.getsignal(signal.SIGTERM) == signal.SIG_DFL
+    finally:
+        signal.signal(signal.SIGTERM, previous)
+
+
 # --- start command — cloud NLP model gate ---
 
 
