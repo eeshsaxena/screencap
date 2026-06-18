@@ -52,6 +52,28 @@ final class LiveVideoPlaybackEngine: VideoPlaybackEngine {
         self.player = AVPlayer(url: url)
     }
 
+    /// SCR-91 defensive backstop. The periodic time observer is normally
+    /// detached via `VideoPlayerPane.onDisappear → tearDown → stopObservingTime`.
+    /// If that callback is ever skipped (the window closes while still
+    /// `.loading` so the pane never rendered, or another SwiftUI lifecycle
+    /// corner case), the `AVPlayer` would otherwise be torn down with the
+    /// observer still registered — AVFoundation's contract requires an explicit
+    /// `removeTimeObserver`. `deinit` is the language-guaranteed cleanup hook,
+    /// so detach here as a last resort.
+    ///
+    /// `deinit` is nonisolated even though the class is `@MainActor`: it may
+    /// read `self`'s stored properties (it holds the only reference at this
+    /// point) but cannot call the `@MainActor` `stopObservingTime()`, so the
+    /// detach is inlined. `AVPlayer.removeTimeObserver` is thread-safe per
+    /// Apple's docs, so it is safe on whichever thread drops the last
+    /// reference. The KVO `statusObserver` self-invalidates as it deallocates
+    /// with the engine, so only the time observer needs manual cleanup here.
+    deinit {
+        if let timeObserverToken {
+            player.removeTimeObserver(timeObserverToken)
+        }
+    }
+
     var currentSeconds: Double {
         let t = player.currentTime()
         guard t.isValid, !t.isIndefinite else { return 0 }
