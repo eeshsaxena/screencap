@@ -210,10 +210,20 @@ final class UploadController: ObservableObject {
     func cancel() {
         watchdogTask?.cancel()
         watchdogTask = nil
-        // Release the cross-window claim (SCR-89) so another window may take
-        // over the recording the moment the user cancels. The Python side's
-        // per-recording terminal-stage flock is the real overlap safety net;
-        // this guard only prevents obviously-wasteful concurrent spawns.
+        // Release the cross-window claim (SCR-89) *before* the SIGTERM below.
+        // This ordering is deliberate (SCR-154): SIGTERM does not kill the
+        // child synchronously — on a wedged HTTP PUT the Python side only
+        // reacts once the socket read returns or the syscall is interrupted —
+        // so releasing here opens a brief window where the name is free while
+        // the old child is still alive, during which a second window could
+        // spawn a concurrent `screencap upload <name>`. We accept that on
+        // purpose: releasing eagerly lets another window take over the moment
+        // the user cancels rather than stranding the recording until a wedged
+        // child finally dies, and the Python terminal-stage `fcntl.flock`
+        // serializes the actual destructive work — worst case is wasted
+        // bandwidth + one child blocking on the flock, not corruption. This
+        // registry guard only prevents obviously-wasteful concurrent spawns;
+        // the flock is the real overlap safety net.
         releaseClaim()
         guard let process, process.isRunning else { return }
         process.terminate()
@@ -258,6 +268,15 @@ final class UploadController: ObservableObject {
         // a race shouldn't clobber a fresh .succeeded / .failed.
         guard !sawTerminalEvent, case .uploading = state else { return }
         sawTerminalEvent = true
+        // Release the cross-window claim (SCR-89) before the SIGTERM below —
+        // the same deliberate release-before-kill ordering as `cancel()`, and
+        // for the same reason (SCR-154). The watchdog fires precisely because
+        // the child is wedged, so SIGTERM won't reap it synchronously; rather
+        // than hold the name hostage to a stuck child, release it now so the
+        // recording is claimable again — including by this window's own Retry
+        // button, which re-claims via `start`. The flock backstops the brief
+        // concurrent-spawn window this opens (see `cancel()` for the full
+        // rationale).
         releaseClaim()
         // SIGTERM the child so the OS reaps it and the user isn't left
         // with a zombie upload process after the UI gives up.
