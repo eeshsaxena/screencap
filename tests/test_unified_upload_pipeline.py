@@ -183,10 +183,8 @@ def test_ae2_interrupt_rerun_no_duplicate_and_converges(tmp_path, monkeypatch):
 
     # First pass: only 0,1 are confirmed in GCS.
     confirmed = {0, 1}
-    probes: list[int] = []
 
     def _remote_exists(idx):
-        probes.append(idx)
         return idx in confirmed
 
     r1 = ts.run_terminal_stage(rec_dir, _remote_exists=_remote_exists)
@@ -201,11 +199,17 @@ def test_ae2_interrupt_rerun_no_duplicate_and_converges(tmp_path, monkeypatch):
 
     # Second pass (a different surface re-running): chunk 2 now lands.
     confirmed.add(2)
-    probes.clear()
     r2 = ts.run_terminal_stage(rec_dir, _remote_exists=_remote_exists)
 
-    # The already-UPLOADED chunks 0,1 are NEVER re-probed (no re-upload).
-    assert 0 not in probes and 1 not in probes
+    # SCR-127: the re-validation pass now DOES re-probe the already-UPLOADED
+    # chunks 0,1 (a stat, not a re-upload) to catch a stale UPLOADED. They
+    # confirm present, so they are neither downgraded nor re-uploaded — the
+    # exactly-once UPLOAD guarantee is unchanged: all three converge to UPLOADED,
+    # the fast path emits exactly one sentinel without re-running produce/upload.
+    assert r2.downgraded == 0
+    st2 = {r.chunk_index: r.upload_state
+           for r in PipelineLedger(rec_dir / "recording.db").all_chunks()}
+    assert all(st2[i] is UploadState.UPLOADED for i in (0, 1, 2))
     assert r2.finalize_gate_satisfied is True
     assert r2.sentinel_uploaded is True
     assert sentinels == [True]  # exactly one sentinel across both passes

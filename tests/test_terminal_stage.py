@@ -1128,3 +1128,110 @@ class TestSCR116AccountOwnershipGate:
 
         assert uploaded, "undeterminable current uid must not block the upload"
         assert not (result.upload_warning and "account mismatch" in result.upload_warning.lower())
+
+
+# ---------------------------------------------------------------------------
+# SCR-127 — terminal reconcile must DOWNGRADE a stale/false UPLOADED row.
+#
+# The promote pass (`_reconcile_ledger_against_gcs`) only ever flips
+# PENDING/FAILED -> UPLOADED. An already-UPLOADED row written by the live mirror
+# (from in-memory EMITTED, no independent re-confirm) was never re-stat'd, so a
+# stale/false UPLOADED could never be downgraded — `finalize_gate_satisfied`
+# then trusted it forever. The re-validation pass closes that asymmetry, but
+# ONLY on a positive confirmed-absent and NEVER for an evicted chunk (whose
+# local media is legitimately gone; the eviction-time re-confirm is the gate).
+# ---------------------------------------------------------------------------
+
+
+class TestSCR127RevalidateUploaded:
+    """`_revalidate_uploaded_chunks` downgrades only confirmed-absent UPLOADED rows."""
+
+    def test_confirmed_absent_uploaded_row_is_downgraded(self, tmp_path):
+        from screencap import terminal_stage as ts
+        from screencap.pipeline_state import Lifecycle, PipelineLedger, UploadState
+
+        rec_dir = _make_recording(tmp_path, destination="cloud", n_chunks=3)
+        ledger = PipelineLedger(rec_dir / "recording.db")
+        for i in range(3):
+            ledger.mark_uploaded(i)
+        # The gate is satisfied while all three carry a bare UPLOADED.
+        assert ledger.finalize_gate_satisfied() is True
+
+        # chunk 0 GONE (confirmed absent), chunk 1 present, chunk 2 UNREACHABLE
+        # (raises). Only the confirmed-absent row may be downgraded — a transient
+        # unreachable must never force a re-upload.
+        def _remote(idx):
+            if idx == 0:
+                return False
+            if idx == 2:
+                raise RuntimeError("GCS unreachable")
+            return True
+
+        n = ts._revalidate_uploaded_chunks(rec_dir, ledger, remote_exists=_remote)
+
+        assert n == 1
+        states = {
+            r.chunk_index: (r.lifecycle, r.upload_state) for r in ledger.all_chunks()
+        }
+        assert states[0] == (Lifecycle.FAILED, UploadState.FAILED)
+        assert states[1] == (Lifecycle.UPLOADED, UploadState.UPLOADED)
+        assert states[2] == (Lifecycle.UPLOADED, UploadState.UPLOADED)
+        # The downgrade makes the gate distrust the now-missing chunk.
+        assert ledger.finalize_gate_satisfied() is False
+
+    def test_evicted_uploaded_row_is_never_downgraded(self, tmp_path):
+        from screencap import terminal_stage as ts
+        from screencap.pipeline_state import Lifecycle, PipelineLedger, UploadState
+
+        rec_dir = _make_recording(tmp_path, destination="cloud", n_chunks=1)
+        ledger = PipelineLedger(rec_dir / "recording.db")
+        ledger.mark_uploaded(0)
+        # Evict chunk 0: fresh re-confirm true, then unlink its local media —
+        # leaving lifecycle=EVICTED, upload_state=UPLOADED, nothing to re-probe.
+        ledger.begin_eviction(0, remote_exists=lambda: True)
+
+        def _unlink():
+            for nm in (
+                "chunk_0000.mp4", "audio_0000.flac",
+                "events_0000.jsonl", "chunk_0000_manifest.json",
+            ):
+                (rec_dir / nm).unlink(missing_ok=True)
+
+        ledger.commit_eviction(0, unlink=_unlink)
+
+        # Even though a fresh stat would say "absent" (False), an EVICTED row is
+        # the "evicted but in GCS is fine" case and must NOT be downgraded.
+        n = ts._revalidate_uploaded_chunks(
+            rec_dir, ledger, remote_exists=lambda idx: False,
+        )
+
+        assert n == 0
+        row = ledger.get_chunk(0)
+        assert row.lifecycle == Lifecycle.EVICTED
+        assert row.upload_state == UploadState.UPLOADED
+
+    def test_real_probe_downgrades_only_on_a_definitive_put_url(self, tmp_path, monkeypatch):
+        from screencap import terminal_stage as ts
+        from screencap.pipeline_state import PipelineLedger, UploadState
+
+        rec_dir = _make_recording(tmp_path, destination="cloud", n_chunks=2)
+        ledger = PipelineLedger(rec_dir / "recording.db")
+        ledger.mark_uploaded(0)
+        ledger.mark_uploaded(1)
+
+        import screencap.upload as up
+
+        # chunk 0: every core file gets a NON-None PUT url -> GCS does not have it
+        # (confirmed absent). chunk 1: all url=None -> already present.
+        def _signed(recording_name, infos):
+            if any("0000" in fi.name for fi in infos):
+                return ({fi.name: "https://put/here" for fi in infos}, "prefix")
+            return ({fi.name: None for fi in infos}, "prefix")
+
+        monkeypatch.setattr(up, "request_signed_urls", _signed)
+
+        n = ts._revalidate_uploaded_chunks(rec_dir, ledger, remote_exists=None)
+
+        assert n == 1
+        assert ledger.get_chunk(0).upload_state == UploadState.FAILED
+        assert ledger.get_chunk(1).upload_state == UploadState.UPLOADED

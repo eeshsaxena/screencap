@@ -77,6 +77,7 @@ if TYPE_CHECKING:
 
     from screencap.pipeline_policy import Destination, ResolvedPolicy, RetentionPolicy
     from screencap.pipeline_state import PipelineLedger
+    from screencap.upload import FileInfo
 
 logger = logging.getLogger(__name__)
 
@@ -148,6 +149,9 @@ class TerminalResult:
     n_skipped: int = 0
     n_local_done: int = 0
     reconciled: int = 0
+    # SCR-127 — count of already-UPLOADED rows the re-validation pass downgraded
+    # this run because GCS confirmed their core files absent (informational).
+    downgraded: int = 0
     stubbed: bool = False
     upload_warning: str | None = None
     failed_indices: list[int] = field(default_factory=list)
@@ -870,6 +874,14 @@ def _route_cloud(
         result.reconciled = _reconcile_ledger_against_gcs(
             recording_dir, ledger, remote_exists=remote_exists,
         )
+        # 1a. SCR-127 — the SYMMETRIC re-validation: a stale/false UPLOADED (the
+        # live mirror wrote it from in-memory EMITTED, no independent re-confirm)
+        # is downgraded on a confirmed-absent BEFORE the gate / fast path below,
+        # so neither can trust it. Bounded sample, downgrade-on-positive-absent
+        # only — a downgraded chunk re-converges through produce + upload.
+        result.downgraded = _revalidate_uploaded_chunks(
+            recording_dir, ledger, remote_exists=remote_exists,
+        )
 
     # 1b. ALREADY-CONVERGED FAST PATH (SCR-125 U4 "finalize is cheap"). If the
     # reconcile shows the FROZEN closed set is all UPLOADED in GCS, the recording
@@ -1229,8 +1241,10 @@ def _reconcile_ledger_against_gcs(
     in-memory ``_chunk_results``: for every chunk whose ``upload_state`` is
     PENDING or FAILED we ask the server (via ``request_signed_urls`` —
     ``url=None`` ⇒ already there). When the server confirms a chunk's core
-    files are all present, we ``mark_uploaded``. PENDING/FAILED only — an
-    already-``UPLOADED`` chunk is never re-probed. Returns the flip count.
+    files are all present, we ``mark_uploaded``. PENDING/FAILED only — this pass
+    never re-probes an already-``UPLOADED`` chunk; the inverse direction
+    (downgrading a stale/confirmed-absent ``UPLOADED``) is
+    :func:`_revalidate_uploaded_chunks` (SCR-127). Returns the flip count.
 
     This runs FIRST on (re)entry so an interrupted prior run's confirmed chunks
     are recognized before any scrub/upload work — the R9 "converge, don't
@@ -1256,6 +1270,60 @@ def _reconcile_ledger_against_gcs(
     return flipped
 
 
+def _chunk_probe_infos(recording_dir: Path, idx: int) -> "tuple[list[FileInfo], bool]":
+    """Build the GCS-probe ``FileInfo`` list for chunk ``idx`` from local files.
+
+    Probe the chunk's core files across ALL the dirs they can live in. The
+    scrubbed copy STRIPS media (scrubber._SKIP_EXTENSIONS skips .mp4/.flac), so
+    the chunk's VIDEO/AUDIO live in the SOURCE dir (the live path uploads them
+    from there) while the scrubbed events/manifest live in <name>-scrubbed (and
+    the masked cloud video, when the flag is on, lives in masked_video/). Probing
+    only the scrubbed dir would judge "confirmed" on events+manifest alone and
+    miss the video — a media-blind false positive (SCR-123). Search
+    source -> masked_video -> scrubbed for each name. Keeping this in ONE place
+    means both the confirm (:func:`_chunk_confirmed_remote`) and the re-validate
+    (:func:`_chunk_confirmed_absent`) probes stay media-aware together.
+
+    Returns ``(infos, video_present)``: the VIDEO must be present locally to prove
+    anything about GCS — events+manifest alone is the media-blind confirm.
+    """
+    from screencap.upload import FileInfo, _content_type
+
+    scrubbed_dir = recording_dir.parent / f"{recording_dir.name}-scrubbed"
+    masked_dir = scrubbed_dir / "masked_video"
+    search_dirs = [d for d in (recording_dir, masked_dir, scrubbed_dir) if d.exists()]
+    video_name = f"chunk_{idx:04d}.mp4"
+    core_names = [
+        video_name,
+        f"audio_{idx:04d}.flac",
+        f"events_{idx:04d}.jsonl",
+        f"chunk_{idx:04d}_manifest.json",
+    ]
+    infos: list[FileInfo] = []
+    video_present = False
+    for nm in core_names:
+        for d in search_dirs:
+            p = d / nm
+            if p.exists() and p.stat().st_size > 0:
+                infos.append(FileInfo(nm, p, _content_type(p), p.stat().st_size))
+                if nm == video_name:
+                    video_present = True
+                break
+    return infos, video_present
+
+
+def _probe_recording_key(recording_dir: Path) -> str:
+    """The GCS recording key for a probe — the original id, NOT a dir basename.
+
+    Derived EXACTLY as ``upload_recording`` does, from the SOURCE
+    ``recording.db`` sibling ``.recording_id`` (the original id, also copied into
+    <name>-scrubbed), NOT a dir basename (which would be "<name>-scrubbed" and
+    probe the wrong prefix).
+    """
+    id_file = recording_dir / ".recording_id"
+    return id_file.read_text().strip() if id_file.exists() else recording_dir.name
+
+
 def _chunk_confirmed_remote(
     recording_dir: Path,
     idx: int,
@@ -1276,53 +1344,132 @@ def _chunk_confirmed_remote(
         except Exception:  # noqa: BLE001
             return False
 
-    from screencap.upload import FileInfo, _content_type, request_signed_urls
+    from screencap.upload import request_signed_urls
 
-    # Probe the chunk's core files across ALL the dirs they can live in. The
-    # scrubbed copy STRIPS media (scrubber._SKIP_EXTENSIONS skips .mp4/.flac),
-    # so the chunk's VIDEO/AUDIO live in the SOURCE dir (the live path uploads
-    # them from there) while the scrubbed events/manifest live in <name>-scrubbed
-    # (and the masked cloud video, when the flag is on, lives in masked_video/).
-    # Probing only the scrubbed dir would judge "confirmed" on events+manifest
-    # alone and miss the video — a media-blind false positive (SCR-123). Search
-    # source -> masked_video -> scrubbed for each name, and REQUIRE the video.
-    scrubbed_dir = recording_dir.parent / f"{recording_dir.name}-scrubbed"
-    masked_dir = scrubbed_dir / "masked_video"
-    search_dirs = [d for d in (recording_dir, masked_dir, scrubbed_dir) if d.exists()]
-    video_name = f"chunk_{idx:04d}.mp4"
-    core_names = [
-        video_name,
-        f"audio_{idx:04d}.flac",
-        f"events_{idx:04d}.jsonl",
-        f"chunk_{idx:04d}_manifest.json",
-    ]
-    infos: list[FileInfo] = []
-    seen: set[str] = set()
-    for nm in core_names:
-        for d in search_dirs:
-            p = d / nm
-            if p.exists() and p.stat().st_size > 0:
-                infos.append(FileInfo(nm, p, _content_type(p), p.stat().st_size))
-                seen.add(nm)
-                break
+    infos, video_present = _chunk_probe_infos(recording_dir, idx)
     # The VIDEO must be present locally to probe — events+manifest alone is the
     # media-blind confirm. If the video is gone everywhere locally we cannot
     # prove it is in GCS, so fail closed (conservative False): a reconcile leaves
     # the chunk PENDING, a promotion refuses the hole, an eviction is refused.
-    if video_name not in seen or not infos:
+    if not video_present or not infos:
         return False
-    # Derive the GCS recording key EXACTLY as ``upload_recording`` does — from
-    # the SOURCE ``recording.db`` sibling ``.recording_id`` (the original id,
-    # also copied into <name>-scrubbed), NOT a dir basename (which would be
-    # "<name>-scrubbed" and probe the wrong prefix). Tests inject
-    # ``remote_exists`` so this is only reachable on the real-GCS path.
-    id_file = recording_dir / ".recording_id"
-    recording_name = id_file.read_text().strip() if id_file.exists() else recording_dir.name
     try:
-        urls, _ = request_signed_urls(recording_name, infos)
+        urls, _ = request_signed_urls(_probe_recording_key(recording_dir), infos)
     except Exception:  # noqa: BLE001
         return False
     return all(fi.name in urls and urls[fi.name] is None for fi in infos)
+
+
+def _chunk_confirmed_absent(
+    recording_dir: Path,
+    idx: int,
+    *,
+    remote_exists: Callable[[int], bool] | None,
+) -> bool:
+    """True ONLY when GCS DEFINITIVELY reports chunk ``idx`` is not fully present.
+
+    The fail-SAFE inverse of :func:`_chunk_confirmed_remote`, used by the SCR-127
+    re-validation downgrade pass. Returns True only on POSITIVE confirmed-absent
+    evidence; a fully-present chunk, an unreachable server, or an un-probeable
+    chunk (local video gone) all return False. The asymmetry is deliberate — a
+    downgrade forces a re-upload, so it must fire only on proof the object is
+    gone, never on a transient blip (which would churn re-uploads).
+
+    Injected ``remote_exists`` (tests / eviction seam): a plain ``False`` is the
+    confirmed-absent signal; an exception (unreachable) is NOT. On the real path,
+    a core file reported with a NON-None signed URL means GCS does not have it
+    (here is where to PUT it) → absent; an all-``url=None`` response is present;
+    any exception is not-absent.
+    """
+    if remote_exists is not None:
+        try:
+            return not bool(remote_exists(idx))
+        except Exception:  # noqa: BLE001 — unreachable is NOT confirmed-absent
+            return False
+
+    from screencap.upload import request_signed_urls
+
+    infos, video_present = _chunk_probe_infos(recording_dir, idx)
+    # No local video → cannot build the probe → cannot prove absence (e.g. an
+    # evicted chunk; those are skipped by the caller regardless). Fail safe.
+    if not video_present or not infos:
+        return False
+    try:
+        urls, _ = request_signed_urls(_probe_recording_key(recording_dir), infos)
+    except Exception:  # noqa: BLE001 — unreachable is NOT confirmed-absent
+        return False
+    # A definitive response. Any core file with a NON-None signed URL means GCS
+    # does not have it → the chunk is not fully uploaded → confirmed absent.
+    return any(fi.name in urls and urls[fi.name] is not None for fi in infos)
+
+
+# The re-validation downgrade pass re-stats at most this many of the OLDEST
+# still-resident UPLOADED chunks per terminal-stage entry. Bounded so a resume of
+# an already-converged recording stays a near-no-op (it does NOT re-probe every
+# chunk on every entry) — this is the "sample" the SCR-127 issue calls for, NOT
+# exhaustive coverage. It targets the eviction FRONTIER: under delete_after_upload
+# retention evicts oldest-first, so the lowest-index resident chunks are the ones
+# whose stale UPLOADED would matter first, and as they evict the window slides to
+# cover more over repeated entries. Under the DEFAULT keep_forever policy nothing
+# evicts, so the oldest N stay a fixed sample (chunks past N are not re-validated)
+# — acceptable because keep_forever never deletes either, so the residual risk is
+# only an optimistic gate/sentinel on a chunk whose cloud copy silently regressed,
+# never local data loss. The eviction-time begin_eviction re-confirm stays the
+# load-bearing data-loss gate regardless.
+_REVALIDATE_SAMPLE_SIZE = 8
+
+
+def _revalidate_uploaded_chunks(
+    recording_dir: Path,
+    ledger: "PipelineLedger",
+    *,
+    remote_exists: Callable[[int], bool] | None,
+) -> int:
+    """Re-stat a sample of UPLOADED rows; downgrade confirmed-absent ones (SCR-127).
+
+    The symmetric counterpart to :func:`_reconcile_ledger_against_gcs`'s promote
+    pass: that flips PENDING/FAILED → UPLOADED on a fresh remote confirm; this
+    flips a stale UPLOADED → FAILED when GCS DEFINITIVELY reports the chunk's core
+    files are gone. The live mirror writes UPLOADED from in-memory EMITTED without
+    an independent re-confirm, so without this a false/stale UPLOADED was trusted
+    forever (``finalize_gate_satisfied`` → already-converged fast path → eviction
+    candidate). A downgraded chunk re-enters the normal produce + upload path and
+    is re-confirmed by ``_mark_uploaded_chunks`` (its local media is still here —
+    we only downgrade probeable, non-evicted rows).
+
+    Fail-SAFE: downgrades ONLY on positive confirmed-absent evidence
+    (:func:`_chunk_confirmed_absent`). An unreachable server or an un-probeable
+    chunk leaves the row UPLOADED. EVICTED rows are skipped — they keep
+    ``upload_state == UPLOADED`` by design and have no local media to re-probe
+    (the "evicted but in GCS is fine" case, mirroring
+    :func:`detect_promotion_holes`); re-probing one would wrongly downgrade every
+    legitimately-evicted chunk and permanently block the finalize gate.
+
+    The eviction-time fresh re-confirm (``begin_eviction``) remains the
+    load-bearing data-loss gate regardless; this only keeps the ledger honest
+    upstream of it. Returns the number of rows downgraded.
+    """
+    from screencap.pipeline_state import Lifecycle, UploadState
+
+    resident = [
+        r.chunk_index
+        for r in ledger.all_chunks()  # ordered by chunk_index ascending (oldest first)
+        if r.upload_state == UploadState.UPLOADED and r.lifecycle != Lifecycle.EVICTED
+    ]
+    downgraded = 0
+    for idx in resident[:_REVALIDATE_SAMPLE_SIZE]:
+        if _chunk_confirmed_absent(recording_dir, idx, remote_exists=remote_exists):
+            with contextlib.suppress(Exception):
+                ledger.mark_failed(
+                    idx, detail="reconcile: UPLOADED row confirmed absent in GCS",
+                )
+                downgraded += 1
+                logger.warning(
+                    "terminal_stage: chunk %d was UPLOADED but is now absent in "
+                    "GCS — downgraded to FAILED for re-upload",
+                    idx,
+                )
+    return downgraded
 
 
 def _mark_uploaded_chunks(
