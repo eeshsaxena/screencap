@@ -311,4 +311,14 @@ struct AVPlayerNSView: NSViewRepresentable {
             view.player = player
         }
     }
+
+    // AVPlayerView's internal AVPlayerLayer holds a strong reference to the
+    // AVPlayer. Without this hook SwiftUI's default no-op leaves that
+    // reference in place, so between the pane's teardown (.onDisappear →
+    // tearDown()) and AppKit eventually deallocating the view the player stays
+    // retained and live. Niling it here releases the layer's reference in
+    // lockstep with tearDown() removing the time observer (SCR-93).
+    static func dismantleNSView(_ nsView: AVPlayerView, coordinator: ()) {
+        nsView.player = nil
+    }
 }
