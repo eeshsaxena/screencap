@@ -61,6 +61,21 @@ enum FakeReviewLoadError: Error, LocalizedError {
 
 @MainActor
 final class ReviewWindowViewModelTests: XCTestCase {
+    /// Fresh per-test cross-window upload registry (SCR-89). These tests all
+    /// review the same `"rec-001"` name, so without isolation a controller
+    /// left mid-upload in one case would keep its claim on the production
+    /// `.shared` registry and make the next case's upload refuse.
+    private var registry: UploadRegistry!
+
+    override func setUp() {
+        super.setUp()
+        registry = UploadRegistry()
+    }
+
+    /// Builds an upload controller bound to this test's isolated registry.
+    private func makeController(service: UploadService = FakeUploadService()) -> UploadController {
+        UploadController(service: service, registry: registry)
+    }
 
     func testInitialStateIsPreparing() {
         let model = makeModel()
@@ -120,7 +135,7 @@ final class ReviewWindowViewModelTests: XCTestCase {
     }
 
     func testStartUploadFromReadyTransitionsToUploading() async {
-        let controller = UploadController(service: FakeUploadService())
+        let controller = makeController()
         let model = makeModel(controller: controller)
 
         await model.loadReviewData()
@@ -135,7 +150,7 @@ final class ReviewWindowViewModelTests: XCTestCase {
 
     func testUploadSuccessRefreshesIndexAndSchedulesAutoClose() async {
         let service = FakeUploadService()
-        let controller = UploadController(service: service)
+        let controller = makeController(service: service)
         let effects = FakeReviewWindowEffects()
         let model = makeModel(controller: controller, effects: effects)
 
@@ -163,7 +178,7 @@ final class ReviewWindowViewModelTests: XCTestCase {
 
     func testAutoCloseTimerFiringDismissesWindow() async {
         let service = FakeUploadService()
-        let controller = UploadController(service: service)
+        let controller = makeController(service: service)
         let effects = FakeReviewWindowEffects()
         let model = makeModel(controller: controller, effects: effects)
         var dismissCalls = 0
@@ -185,7 +200,7 @@ final class ReviewWindowViewModelTests: XCTestCase {
     /// so Retry doesn't re-spawn `review-data`.
     func testUploadFailedTransitionsToFailedWithRetryDataAndRetryStartsAgain() async {
         let service = FakeUploadService()
-        let controller = UploadController(service: service)
+        let controller = makeController(service: service)
         let model = makeModel(controller: controller)
 
         await model.loadReviewData()
@@ -215,7 +230,7 @@ final class ReviewWindowViewModelTests: XCTestCase {
     /// upload_failed(error: "interrupted") and state lands on failed.
     func testWindowCloseDuringUploadInvokesCancel() async {
         let service = FakeUploadService()
-        let controller = UploadController(service: service)
+        let controller = makeController(service: service)
         let model = makeModel(controller: controller)
 
         await model.loadReviewData()
@@ -229,7 +244,7 @@ final class ReviewWindowViewModelTests: XCTestCase {
 
     func testWindowCloseDuringPreparingDoesNotCrashAndDoesNotTerminate() async {
         let service = FakeUploadService()
-        let controller = UploadController(service: service)
+        let controller = makeController(service: service)
         let model = makeModel(controller: controller)
 
         // No loadReviewData → state remains .preparing.
@@ -331,7 +346,7 @@ final class ReviewWindowViewModelTests: XCTestCase {
     /// firing after the user manually closed the window.
     func testWindowCloseBeforeAutoCloseFiresCancelsTheTimer() async {
         let service = FakeUploadService()
-        let controller = UploadController(service: service)
+        let controller = makeController(service: service)
         let effects = FakeReviewWindowEffects()
         let model = makeModel(controller: controller, effects: effects)
 
@@ -354,7 +369,7 @@ final class ReviewWindowViewModelTests: XCTestCase {
     /// upload subprocess ran).
     func testCancelFromReadyUploadsNothing() async {
         let service = FakeUploadService()
-        let controller = UploadController(service: service)
+        let controller = makeController(service: service)
         let model = makeModel(controller: controller)
 
         await model.loadReviewData()
@@ -374,7 +389,7 @@ final class ReviewWindowViewModelTests: XCTestCase {
     /// gate Upload. A ready envelope carrying a secure-field interval, redaction
     /// counts, and a fail-closed marker still uploads on intent.
     func testUploadStaysEnabledRegardlessOfRedactionFlags() async {
-        let controller = UploadController(service: FakeUploadService())
+        let controller = makeController()
         let loader = FakeReviewDataLoader()
         loader.nextEnvelope = .init(
             ok: true, schemaVersion: 2,
@@ -504,13 +519,15 @@ final class ReviewWindowViewModelTests: XCTestCase {
 
     private func makeModel(
         loader: ReviewDataLoader = FakeReviewDataLoader(),
-        controller: UploadController = UploadController(service: FakeUploadService()),
+        controller: UploadController? = nil,
         effects: ReviewWindowEffects = FakeReviewWindowEffects(),
         autoCloseSeconds: Double = 2.0
     ) -> ReviewWindowViewModel {
+        // Default arguments can't call instance methods, so resolve the
+        // registry-bound controller here when the caller didn't supply one.
         ReviewWindowViewModel(
             recordingName: "rec-001",
-            uploadController: controller,
+            uploadController: controller ?? makeController(),
             loader: loader,
             effects: effects,
             autoCloseSeconds: autoCloseSeconds

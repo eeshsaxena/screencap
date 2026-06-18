@@ -35,7 +35,9 @@ final class RecordingsIndexRefreshOnUploadTests: XCTestCase {
     /// notification, so the index does not see a refresh trigger.
     func testNoNotificationFiredFromFailedStateMeansNoRefreshTriggered() async {
         let service = FakeUploadService()
-        let controller = UploadController(service: service)
+        // Bind to a local registry (SCR-89) rather than the production
+        // `.shared` singleton so this case never leaks an in-flight claim.
+        let controller = UploadController(service: service, registry: UploadRegistry())
         let effects = FakeReviewWindowEffects()
         let model = ReviewWindowViewModel(
             recordingName: "rec-001",

@@ -38,9 +38,34 @@ enum FakeUploadServiceError: Error, LocalizedError {
 
 @MainActor
 final class UploadControllerTests: XCTestCase {
+    /// Fresh per-test cross-window registry (SCR-89) so a controller left
+    /// mid-upload in one case can't keep its claim and make the next case's
+    /// `start("rec-001")` refuse. The cross-controller tests build both
+    /// controllers from this same instance to exercise the guard.
+    private var registry: UploadRegistry!
+
+    override func setUp() {
+        super.setUp()
+        registry = UploadRegistry()
+    }
+
+    /// Builds a controller bound to this test's isolated `registry`. All
+    /// single-controller cases go through here so they don't touch the
+    /// production `.shared` registry.
+    private func makeController(
+        service: UploadService,
+        inactivityTimeoutSeconds: Double = 120
+    ) -> UploadController {
+        UploadController(
+            service: service,
+            registry: registry,
+            inactivityTimeoutSeconds: inactivityTimeoutSeconds
+        )
+    }
+
     func testStartTransitionsIdleToUploading() {
         let service = FakeUploadService()
-        let controller = UploadController(service: service)
+        let controller = makeController(service: service)
 
         controller.start(name: "rec-001")
 
@@ -57,7 +82,7 @@ final class UploadControllerTests: XCTestCase {
     /// progress → succeeded(summary).
     func testHappyPathDrivesIdleToSucceeded() {
         let service = FakeUploadService()
-        let controller = UploadController(service: service)
+        let controller = makeController(service: service)
 
         controller.start(name: "rec-001")
         service.emit(#"{"type": "upload_started", "schema_version": 1, "file_count": 3}"#)
@@ -78,7 +103,7 @@ final class UploadControllerTests: XCTestCase {
 
     func testProgressFractionTracksFilesDoneOverFilesTotal() {
         let service = FakeUploadService()
-        let controller = UploadController(service: service)
+        let controller = makeController(service: service)
 
         controller.start(name: "rec-001")
         service.emit(#"{"type": "upload_started", "schema_version": 1, "file_count": 4}"#)
@@ -96,7 +121,7 @@ final class UploadControllerTests: XCTestCase {
     /// Covers AE5 — explicit upload_failed event transitions to failed(error).
     func testUploadFailedEventTransitionsToFailedWithMessage() {
         let service = FakeUploadService()
-        let controller = UploadController(service: service)
+        let controller = makeController(service: service)
 
         controller.start(name: "rec-001")
         service.emit(#"{"type": "upload_started", "schema_version": 1, "file_count": 1}"#)
@@ -114,7 +139,7 @@ final class UploadControllerTests: XCTestCase {
     /// silently staying in `uploading`.
     func testProcessExitsNonZeroWithoutTerminalEventTransitionsToFailed() {
         let service = FakeUploadService()
-        let controller = UploadController(service: service)
+        let controller = makeController(service: service)
 
         controller.start(name: "rec-001")
         service.emit(#"{"type": "upload_started", "schema_version": 1, "file_count": 1}"#)
@@ -131,7 +156,7 @@ final class UploadControllerTests: XCTestCase {
     /// emits upload_failed(error: "interrupted"), state lands on failed.
     func testCancelMidUploadTerminatesProcessAndStateLandsOnFailedInterrupted() {
         let service = FakeUploadService()
-        let controller = UploadController(service: service)
+        let controller = makeController(service: service)
 
         controller.start(name: "rec-001")
         service.emit(#"{"type": "upload_started", "schema_version": 1, "file_count": 3}"#)
@@ -153,7 +178,7 @@ final class UploadControllerTests: XCTestCase {
     /// not crash and must not dispatch terminate.
     func testCancelOnIdleIsSafeNoOp() {
         let service = FakeUploadService()
-        let controller = UploadController(service: service)
+        let controller = makeController(service: service)
 
         controller.cancel()
 
@@ -167,7 +192,7 @@ final class UploadControllerTests: XCTestCase {
 
     func testCancelAfterSucceededIsSafeNoOp() {
         let service = FakeUploadService()
-        let controller = UploadController(service: service)
+        let controller = makeController(service: service)
 
         controller.start(name: "rec-001")
         service.emit(#"{"type": "upload_started", "schema_version": 1, "file_count": 1}"#)
@@ -188,7 +213,7 @@ final class UploadControllerTests: XCTestCase {
 
     func testNonJSONLineDoesNotChangeState() {
         let service = FakeUploadService()
-        let controller = UploadController(service: service)
+        let controller = makeController(service: service)
 
         controller.start(name: "rec-001")
         service.emit(#"{"type": "upload_started", "schema_version": 1, "file_count": 2}"#)
@@ -199,7 +224,7 @@ final class UploadControllerTests: XCTestCase {
 
     func testUnknownEventTypeDoesNotChangeState() {
         let service = FakeUploadService()
-        let controller = UploadController(service: service)
+        let controller = makeController(service: service)
 
         controller.start(name: "rec-001")
         service.emit(#"{"type": "upload_started", "schema_version": 1, "file_count": 2}"#)
@@ -214,7 +239,7 @@ final class UploadControllerTests: XCTestCase {
     func testStartFailsWhenServiceThrowsAndStateLandsOnFailed() {
         let service = FakeUploadService()
         service.pendingError = FakeUploadServiceError.launchFailed
-        let controller = UploadController(service: service)
+        let controller = makeController(service: service)
 
         controller.start(name: "rec-001")
 
@@ -229,7 +254,7 @@ final class UploadControllerTests: XCTestCase {
     /// no-op (review window owns one upload at a time per window).
     func testSecondStartWhileUploadingIsNoOp() {
         let service = FakeUploadService()
-        let controller = UploadController(service: service)
+        let controller = makeController(service: service)
 
         controller.start(name: "rec-001")
         controller.start(name: "rec-002")
@@ -241,7 +266,7 @@ final class UploadControllerTests: XCTestCase {
     /// (this is what the Retry button in U8 wires up to).
     func testRetryAfterFailureStartsAgain() {
         let service = FakeUploadService()
-        let controller = UploadController(service: service)
+        let controller = makeController(service: service)
 
         controller.start(name: "rec-001")
         service.emit(#"{"type": "upload_failed", "schema_version": 1, "error": "first try"}"#)
@@ -265,7 +290,7 @@ final class UploadControllerTests: XCTestCase {
     /// regression there ships visible.
     func testUploadFileDoneWithoutFilesDoneIncrementsCounter() {
         let service = FakeUploadService()
-        let controller = UploadController(service: service)
+        let controller = makeController(service: service)
 
         controller.start(name: "rec-001")
         service.emit(#"{"type": "upload_started", "schema_version": 1, "file_count": 3}"#)
@@ -284,7 +309,7 @@ final class UploadControllerTests: XCTestCase {
     /// `.failed("upload failed")` (the default-message fallback).
     func testUploadFailedWithoutErrorUsesDefaultMessage() {
         let service = FakeUploadService()
-        let controller = UploadController(service: service)
+        let controller = makeController(service: service)
 
         controller.start(name: "rec-001")
         service.emit(#"{"type": "upload_started", "schema_version": 1, "file_count": 1}"#)
@@ -305,7 +330,7 @@ final class UploadControllerTests: XCTestCase {
     /// successful terminal.
     func testSecondTerminalEventIsIgnored() {
         let service = FakeUploadService()
-        let controller = UploadController(service: service)
+        let controller = makeController(service: service)
 
         controller.start(name: "rec-001")
         service.emit(#"{"type": "upload_started", "schema_version": 1, "file_count": 1}"#)
@@ -325,7 +350,7 @@ final class UploadControllerTests: XCTestCase {
     /// and SIGTERMs the child.
     func testInactivityTimeoutTransitionsToFailed() async {
         let service = FakeUploadService()
-        let controller = UploadController(service: service, inactivityTimeoutSeconds: 0.05)
+        let controller = makeController(service: service, inactivityTimeoutSeconds: 0.05)
 
         controller.start(name: "rec-001")
         // No events for longer than the bound.
@@ -345,7 +370,7 @@ final class UploadControllerTests: XCTestCase {
         let service = FakeUploadService()
         // Bound = 100ms. Events arrive every 30ms for ~200ms. The watchdog
         // should reset on each and never fire.
-        let controller = UploadController(service: service, inactivityTimeoutSeconds: 0.1)
+        let controller = makeController(service: service, inactivityTimeoutSeconds: 0.1)
 
         controller.start(name: "rec-001")
         for _ in 0..<6 {
@@ -358,6 +383,209 @@ final class UploadControllerTests: XCTestCase {
             // pass
         } else {
             XCTFail("watchdog must reset; got \(controller.state)")
+        }
+    }
+
+    /// SCR-89 — two controllers (two review windows) for the SAME recording
+    /// must not both spawn `screencap upload`. The first claims the name; the
+    /// second is refused by the cross-window registry, never starts a
+    /// process, and lands on `.failed` (so the optimistic-`.uploading`
+    /// viewmodel isn't stranded). This is the core regression guard: without
+    /// the registry, `serviceB.startedNames` would be `["rec-001"]`.
+    func testConcurrentUploadOfSameNameIsRefusedAcrossControllers() {
+        let serviceA = FakeUploadService()
+        let serviceB = FakeUploadService()
+        let controllerA = makeController(service: serviceA)
+        let controllerB = makeController(service: serviceB)
+
+        controllerA.start(name: "rec-001")
+        controllerB.start(name: "rec-001")
+
+        XCTAssertEqual(serviceA.startedNames, ["rec-001"], "first controller should spawn")
+        XCTAssertEqual(serviceB.startedNames, [], "second controller must NOT spawn a concurrent upload")
+        guard case .uploading = controllerA.state else {
+            return XCTFail("A should be uploading, got \(controllerA.state)")
+        }
+        if case .failed(let msg) = controllerB.state {
+            XCTAssertTrue(msg.contains("already in progress"), "got: \(msg)")
+        } else {
+            XCTFail("B should be refused→failed, got \(controllerB.state)")
+        }
+    }
+
+    /// SCR-89 — a different recording name is unaffected by an in-flight
+    /// upload: the registry is keyed per name, not a global single-flight.
+    func testConcurrentUploadOfDifferentNamesBothStart() {
+        let serviceA = FakeUploadService()
+        let serviceB = FakeUploadService()
+        let controllerA = makeController(service: serviceA)
+        let controllerB = makeController(service: serviceB)
+
+        controllerA.start(name: "rec-001")
+        controllerB.start(name: "rec-002")
+
+        XCTAssertEqual(serviceA.startedNames, ["rec-001"])
+        XCTAssertEqual(serviceB.startedNames, ["rec-002"])
+    }
+
+    /// SCR-89 — once the first controller reaches a terminal state, the name
+    /// is released so a second controller (e.g. a retry from another window)
+    /// can upload it.
+    func testNameReleasedAfterTerminalAllowsSecondController() {
+        let serviceA = FakeUploadService()
+        let serviceB = FakeUploadService()
+        let controllerA = makeController(service: serviceA)
+        let controllerB = makeController(service: serviceB)
+
+        controllerA.start(name: "rec-001")
+        serviceA.emit(#"{"type": "upload_finished", "schema_version": 1, "uploaded": 1, "skipped": 0, "failed": 0}"#)
+        serviceA.terminate(exitCode: 0)
+
+        controllerB.start(name: "rec-001")
+
+        XCTAssertEqual(serviceB.startedNames, ["rec-001"], "name should be free after A's terminal event")
+        if case .uploading = controllerB.state {
+            // pass
+        } else {
+            XCTFail("B should upload after A released, got \(controllerB.state)")
+        }
+    }
+
+    /// SCR-89 — `cancel()` releases the name so another window can take over
+    /// immediately (matching the ticket's "release on any terminal state or
+    /// cancel").
+    func testCancelReleasesNameForAnotherController() {
+        let serviceA = FakeUploadService()
+        let serviceB = FakeUploadService()
+        let controllerA = makeController(service: serviceA)
+        let controllerB = makeController(service: serviceB)
+
+        controllerA.start(name: "rec-001")
+        controllerA.cancel()
+
+        controllerB.start(name: "rec-001")
+
+        XCTAssertEqual(serviceB.startedNames, ["rec-001"], "cancel should free the name")
+        if case .uploading = controllerB.state {
+            // pass
+        } else {
+            XCTFail("B should upload after A cancelled, got \(controllerB.state)")
+        }
+    }
+
+    /// SCR-89 — the inactivity-timeout release path frees the name for another
+    /// window. Pins `fireInactivityTimeout()`'s `releaseClaim()`: after A's
+    /// watchdog fires, B can claim the same recording.
+    func testNameReleasedAfterInactivityTimeoutAllowsSecondController() async {
+        let serviceA = FakeUploadService()
+        let serviceB = FakeUploadService()
+        let controllerA = makeController(service: serviceA, inactivityTimeoutSeconds: 0.05)
+        let controllerB = makeController(service: serviceB)
+
+        controllerA.start(name: "rec-001")
+        // Let A's watchdog fire (bound 50ms; wait well past it).
+        try? await Task.sleep(nanoseconds: 200_000_000)
+
+        controllerB.start(name: "rec-001")
+
+        XCTAssertEqual(serviceB.startedNames, ["rec-001"], "name should be free after A's inactivity timeout")
+        if case .uploading = controllerB.state {
+            // pass
+        } else {
+            XCTFail("B should upload after A's watchdog released, got \(controllerB.state)")
+        }
+    }
+
+    /// SCR-89 — the exit-without-terminal-event release path frees the name.
+    /// Pins `handleTerminated()`'s unconditional `releaseClaim()`: A's child
+    /// exits non-zero with no prior terminal event, so B can claim the name.
+    func testNameReleasedAfterExitWithoutEventAllowsSecondController() {
+        let serviceA = FakeUploadService()
+        let serviceB = FakeUploadService()
+        let controllerA = makeController(service: serviceA)
+        let controllerB = makeController(service: serviceB)
+
+        controllerA.start(name: "rec-001")
+        // No terminal event — the child just exits, driving handleTerminated.
+        serviceA.terminate(exitCode: 1)
+
+        controllerB.start(name: "rec-001")
+
+        XCTAssertEqual(serviceB.startedNames, ["rec-001"], "name should be free after A's bare exit")
+        if case .uploading = controllerB.state {
+            // pass
+        } else {
+            XCTFail("B should upload after A's exit released, got \(controllerB.state)")
+        }
+    }
+
+    /// SCR-89 — the spawn-failure release path frees the name. Pins the catch
+    /// block's `releaseClaim()` in `start(name:)`: A's service throws on spawn,
+    /// so A lands on `.failed` having released the claim, and B can take it.
+    func testNameReleasedAfterSpawnFailureAllowsSecondController() {
+        let serviceA = FakeUploadService()
+        serviceA.pendingError = FakeUploadServiceError.launchFailed
+        let serviceB = FakeUploadService()
+        let controllerA = makeController(service: serviceA)
+        let controllerB = makeController(service: serviceB)
+
+        controllerA.start(name: "rec-001")
+        if case .failed = controllerA.state {
+            // pass
+        } else {
+            XCTFail("A should be failed after spawn failure, got \(controllerA.state)")
+        }
+
+        controllerB.start(name: "rec-001")
+
+        XCTAssertEqual(serviceB.startedNames, ["rec-001"], "name should be free after A's spawn failure")
+        if case .uploading = controllerB.state {
+            // pass
+        } else {
+            XCTFail("B should upload after A's spawn-failure released, got \(controllerB.state)")
+        }
+    }
+
+    /// SCR-89 — the `upload_failed` event release path frees the name. Pins the
+    /// `upload_failed` case's `releaseClaim()` in `handleLine`: A fails via an
+    /// explicit event, so B can claim the same recording.
+    func testNameReleasedAfterUploadFailedEventAllowsSecondController() {
+        let serviceA = FakeUploadService()
+        let serviceB = FakeUploadService()
+        let controllerA = makeController(service: serviceA)
+        let controllerB = makeController(service: serviceB)
+
+        controllerA.start(name: "rec-001")
+        serviceA.emit(#"{"type": "upload_failed", "schema_version": 1, "error": "network reset"}"#)
+
+        controllerB.start(name: "rec-001")
+
+        XCTAssertEqual(serviceB.startedNames, ["rec-001"], "name should be free after A's upload_failed event")
+        if case .uploading = controllerB.state {
+            // pass
+        } else {
+            XCTFail("B should upload after A's upload_failed released, got \(controllerB.state)")
+        }
+    }
+
+    /// SCR-89 — the same controller's retry path still works under the
+    /// registry: a failure releases the name, so re-`start` re-claims it.
+    func testSameControllerRetryReclaimsName() {
+        let service = FakeUploadService()
+        let controller = makeController(service: service)
+
+        controller.start(name: "rec-001")
+        service.emit(#"{"type": "upload_failed", "schema_version": 1, "error": "first try"}"#)
+        service.terminate(exitCode: 1)
+        service.fakeProcess = FakeSpawnedProcessHandle(isRunning: true, pid: 99999, forceKillReturnValue: true)
+
+        controller.start(name: "rec-001")
+
+        XCTAssertEqual(service.startedNames, ["rec-001", "rec-001"])
+        if case .uploading = controller.state {
+            // pass
+        } else {
+            XCTFail("expected uploading state on retry, got \(controller.state)")
         }
     }
 }
