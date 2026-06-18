@@ -2691,33 +2691,41 @@ def upload(names, all_recordings, dry_run, force, jobs, no_delete):
     # cancel emits exactly one terminal event, by construction. signal.signal
     # requires the main thread (the CLI path always is); an off-main-thread
     # caller skips both install and restore.
-    _current_name: list[str | None] = [None]
-    _interrupt_emitted = [False]
+    _current_name: str | None = None
+    _interrupt_emitted = False
 
     def _emit_interrupted_and_raise(_signum, _frame):
-        if not _interrupt_emitted[0]:
-            _interrupt_emitted[0] = True
+        nonlocal _interrupt_emitted
+        if not _interrupt_emitted:
+            _interrupt_emitted = True
             fields: dict[str, str] = {"error": "interrupted"}
-            if _current_name[0] is not None:
-                fields["recording"] = _current_name[0]
+            if _current_name is not None:
+                fields["recording"] = _current_name
             emit_event(EVENT_UPLOAD_FAILED, **fields)
         raise KeyboardInterrupt
 
+    # Install INSIDE the outer try so a SIGTERM arriving in the gap between
+    # install and try-entry still routes through the restoring finally
+    # (mirrors upload.upload_recording's proven handler). _UNSET / the
+    # previous-handler sentinel are set BEFORE the try so the finally can
+    # tell "install succeeded with a None (C-set) previous handler" from
+    # "install never ran" (off-main-thread ValueError).
     _UNSET: object = object()
     _previous_sigterm: object = _UNSET
-    try:
-        _previous_sigterm = _signal.signal(
-            _signal.SIGTERM, _emit_interrupted_and_raise
-        )
-    except ValueError:
-        pass  # off-main-thread — the restore guard below no-ops.
 
     total_count = len(dirs)
     n_ok = 0
     n_failed = 0
     try:
+        try:
+            _previous_sigterm = _signal.signal(
+                _signal.SIGTERM, _emit_interrupted_and_raise
+            )
+        except ValueError:
+            pass  # off-main-thread — the restore guard below no-ops.
+
         for i, d in enumerate(dirs, 1):
-            _current_name[0] = d.name
+            _current_name = d.name
             if total_count > 1:
                 console.print(f"\n[bold][{i}/{total_count}][/bold] {d.name}")
             try:
@@ -2784,9 +2792,14 @@ def upload(names, all_recordings, dry_run, force, jobs, no_delete):
         if total_count > 1 and not dry_run:
             console.print(f"\n[bold]Done.[/bold] {n_ok} uploaded, {n_failed} failed")
     except KeyboardInterrupt:
-        # SIGTERM (window-close cancel) or Ctrl+C during the prep phase. The
-        # handler already emitted the terminal upload_failed(interrupted) event;
-        # exit non-zero without a traceback so the batch stops cleanly.
+        # Reached two ways during the prep phase. On a SIGTERM (window-close
+        # cancel) our handler ran first, so it already emitted the terminal
+        # upload_failed(interrupted) event before raising. A native Ctrl+C /
+        # SIGINT, by contrast, raises KeyboardInterrupt directly WITHOUT
+        # invoking our SIGTERM handler, so it reaches here with no event
+        # emitted (out of scope for SCR-94 — the SwiftUI cancel path is
+        # SIGTERM). Either way, exit non-zero without a traceback so the batch
+        # stops cleanly.
         sys.exit(130)
     finally:
         # Restore only if install actually succeeded (_UNSET ⇒ off-main-thread).
