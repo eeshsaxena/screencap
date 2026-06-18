@@ -1,3 +1,5 @@
+import AVFoundation
+import AVKit
 import XCTest
 @testable import ScreenCap
 
@@ -226,6 +228,23 @@ final class VideoPlayerPaneTests: XCTestCase {
         model.tearDown()
 
         XCTAssertEqual(engine.stopObserveCalls, 1)
+    }
+
+    /// SCR-93 — `AVPlayerView`'s internal `AVPlayerLayer` strongly retains its
+    /// `player`. Without a `dismantleNSView`, that reference outlives the
+    /// representable's teardown (`.onDisappear` → `tearDown()`), keeping the
+    /// `AVPlayer` retained and live until AppKit eventually deallocates the
+    /// view. `dismantleNSView` must release it in lockstep with teardown so
+    /// the player can deallocate promptly.
+    func testDismantleNSViewReleasesPlayerReference() {
+        let player = AVPlayer()
+        let view = AVPlayerView()
+        view.player = player
+        XCTAssertNotNil(view.player)
+
+        AVPlayerNSView.dismantleNSView(view, coordinator: ())
+
+        XCTAssertNil(view.player, "dismantleNSView must drop the layer's strong AVPlayer reference")
     }
 
     func testLoadStatusTransitionsPublishToModel() {
