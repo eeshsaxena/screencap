@@ -10,9 +10,9 @@ The schema is the cross-language contract — see
 
 Active events (emitted in v1):
   started, lock_contended, recording_finalized, disk_full,
-  permission_lost, capture_unhealthy, stopped, menubar_neutralized_by_env,
-  matrix_disclosure_required, lock_metadata_write_failed,
-  terminated_reason_persist_failed,
+  permission_lost, capture_unhealthy, capture_recovered, stopped,
+  menubar_neutralized_by_env, matrix_disclosure_required,
+  lock_metadata_write_failed, terminated_reason_persist_failed,
   upload_started, upload_file_done, upload_finished, upload_failed
 
 Reserved events (schema documented, NOT emitted in v1 — todo 004):
@@ -27,7 +27,15 @@ process exit code): 0=clean, 2=lock-held, 3=permission_lost, 4=disk_full,
 ``capture_unhealthy`` (SCR-76) is ADVISORY: it has NO exit code and never
 terminates a recording. The engine's mid-recording supervisor emits it once
 per detection edge when a reader is demonstrably attempting but producing no
-useful output AND the cause is not a ``screen_recording`` denial. Only a
+useful output AND the cause is not a ``screen_recording`` denial.
+``capture_recovered`` (SCR-100) is its paired clear: the supervisor emits it
+once when a reader that previously crossed the unhealthy edge returns healthy
+mid-recording,
+so the shell can drop the stale advisory instead of letting it linger until the
+recording ends. It carries ``reader`` + ``elapsed`` only (no ``reason``); like
+``capture_unhealthy`` it is advisory with no exit code. A recover-then-rebreak
+re-emits ``capture_unhealthy`` (the engine clears its per-reader emitted flag on
+recovery), so the advisory re-shows. Only a
 ``screen_recording`` denial reuses the terminal-capable ``permission_lost``
 (the core screen capture is genuinely dead); an ``accessibility`` /
 ``input_monitoring`` attribution is a best-guess for a window / action stall
@@ -68,6 +76,12 @@ EVENT_PERMISSION_LOST = "permission_lost"
 # (only that reuses permission_lost; accessibility / input_monitoring stay
 # advisory per SCR-101). ADVISORY: no exit code, never terminal.
 EVENT_CAPTURE_UNHEALTHY = "capture_unhealthy"
+# Paired recovery/clear for capture_unhealthy (SCR-100). Emitted once when a
+# reader that previously crossed the unhealthy edge returns healthy
+# mid-recording, so the shell drops the stale advisory instead of holding it
+# until the recording ends. ADVISORY: carries reader + elapsed, no reason, no
+# exit code, never terminal.
+EVENT_CAPTURE_RECOVERED = "capture_recovered"
 EVENT_STOPPED = "stopped"
 EVENT_MENUBAR_NEUTRALIZED_BY_ENV = "menubar_neutralized_by_env"
 # Disclosure / failure-surface events (todo 005, todo 013).
@@ -148,6 +162,7 @@ __all__ = [
     "EVENT_DISK_FULL",
     "EVENT_PERMISSION_LOST",
     "EVENT_CAPTURE_UNHEALTHY",
+    "EVENT_CAPTURE_RECOVERED",
     "CAPTURE_UNHEALTHY_REASON_READER_STALLED",
     "CAPTURE_UNHEALTHY_REASON_LISTENER_DEAD",
     "CAPTURE_UNHEALTHY_REASONS",

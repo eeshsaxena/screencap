@@ -228,9 +228,13 @@ class TestActionListenerAlive:
 # ---------------------------------------------------------------------------
 
 
-def _drive(ticks, *, action_alive=True, debounce=3, alive=None):
+def _drive(ticks, *, action_alive=True, debounce=3, alive=None, recovered=False):
     """Feed a sequence of (attempt_delta, output_delta) for the SCREEN reader
-    through _capture_health_step and return the per-tick edge lists."""
+    through _capture_health_step and return the per-tick edge lists.
+
+    By default returns the per-tick UNHEALTHY edge lists (the original contract).
+    Pass ``recovered=True`` to return the per-tick RECOVERY edge lists instead
+    (SCR-100), so a single helper covers both halves of the paired signal."""
     alive = alive or _ALIVE
     runs, emitted = {}, {}
     prev = {"screen.attempt": 0, "screen.output": 0,
@@ -243,9 +247,10 @@ def _drive(ticks, *, action_alive=True, debounce=3, alive=None):
         # keep window healthy so only the screen dimension drives the verdict
         cur["window.attempt"] += 2
         cur["window.output"] += 2
-        out.append(recorder._capture_health_step(
+        unhealthy, recovery = recorder._capture_health_step(
             prev, cur, alive, action_alive, debounce, runs, emitted,
-        ))
+        )
+        out.append(recovery if recovered else unhealthy)
         prev = dict(cur)
     return out
 
@@ -277,6 +282,67 @@ def test_recover_then_rebreak_re_emits():
     assert edges[6] == ["screen"]
 
 
+def test_recovery_after_emitted_unhealthy_yields_recovered_edge_once():
+    # SCR-100: a reader that crossed the unhealthy edge (emitted at tick 2) and
+    # then returns healthy reports a RECOVERY edge exactly once on the healthy
+    # tick — the engine signal the shell uses to clear the stale advisory — and
+    # not again while it stays healthy.
+    ticks = [(20, 0), (20, 0), (20, 0), (20, 20), (20, 20)]
+    unhealthy = _drive(ticks, debounce=3)
+    recovered = _drive(ticks, debounce=3, recovered=True)
+    assert unhealthy[2] == ["screen"]            # surfaced unhealthy at the edge
+    assert recovered[3] == ["screen"]            # paired recovery, once
+    assert all(r == [] for i, r in enumerate(recovered) if i != 3)
+
+
+def test_transient_blip_below_debounce_recovers_silently():
+    # SCR-100: a single stalled tick (below debounce=3) never surfaces an
+    # unhealthy edge, so its recovery must be SILENT — no advisory was shown,
+    # nothing to clear. A spurious recovery edge here would clear an advisory
+    # the shell never set.
+    ticks = [(20, 0), (20, 20), (20, 20)]
+    unhealthy = _drive(ticks, debounce=3)
+    recovered = _drive(ticks, debounce=3, recovered=True)
+    assert all(e == [] for e in unhealthy)
+    assert all(r == [] for r in recovered)
+
+
+def test_recover_then_rebreak_emits_recovery_then_unhealthy_again():
+    # SCR-100 + re-show: recovery fires once on the healthy tick (index 3), then
+    # a fresh unhealthy edge fires again on the rebreak (index 6) so the advisory
+    # re-shows. The two halves interleave correctly across the cycle.
+    ticks = [(20, 0), (20, 0), (20, 0), (20, 20), (20, 0), (20, 0), (20, 0)]
+    unhealthy = _drive(ticks, debounce=3)
+    recovered = _drive(ticks, debounce=3, recovered=True)
+    assert unhealthy[2] == ["screen"]
+    assert recovered[3] == ["screen"]
+    assert unhealthy[6] == ["screen"]
+    assert all(r == [] for i, r in enumerate(recovered) if i != 3)
+
+
+def test_dead_reader_after_emitted_unhealthy_is_not_reported_recovered():
+    # SCR-100 guard: a reader that crossed the unhealthy edge and then goes
+    # DEAD (alive=False) must not be reported as recovered — it did not recover,
+    # it died, and the existing record.child_died path owns that case.
+    runs, emitted = {}, {}
+    prev = {"screen.attempt": 0, "screen.output": 0,
+            "window.attempt": 0, "window.output": 0}
+    cur = dict(prev)
+    recovered_per_tick = []
+    for tick in range(4):
+        cur["screen.attempt"] += 20            # screen stalled (attempt, no output)
+        cur["window.attempt"] += 2             # window healthy throughout
+        cur["window.output"] += 2
+        alive = {"screen": tick < 3, "window": True, "action": True}
+        _u, recovery = recorder._capture_health_step(
+            prev, cur, alive, True, 3, runs, emitted,
+        )
+        recovered_per_tick.append(recovery)
+        prev = dict(cur)
+    # Edge emitted at tick 2; screen goes dead at tick 3 → no recovery reported.
+    assert all(r == [] for r in recovered_per_tick)
+
+
 def test_dead_reader_is_left_to_child_died_path():
     # not alive → never evaluated by the health check (no double-emit).
     edges = _drive([(20, 0)] * 5, alive={"screen": False, "window": True, "action": True})
@@ -290,7 +356,7 @@ def test_action_heartbeat_alive_with_no_output_is_idle_not_unhealthy():
     for _ in range(5):
         edges += recorder._capture_health_step(
             {}, {}, _ALIVE, True, 3, runs, emitted,
-        )
+        )[0]
     assert edges == []
 
 
@@ -299,7 +365,7 @@ def test_action_listener_dead_fires_as_action_after_debounce():
     runs, emitted = {}, {}
     fired = []
     for _ in range(4):
-        fired.append(recorder._capture_health_step({}, {}, _ALIVE, False, 3, runs, emitted))
+        fired.append(recorder._capture_health_step({}, {}, _ALIVE, False, 3, runs, emitted)[0])
     assert fired[2] == ["action"]
 
 
@@ -313,7 +379,7 @@ def test_window_broken_poll_fires():
         cur["window.attempt"] += 2          # polling
         cur["screen.attempt"] += 20         # screen healthy
         cur["screen.output"] += 20
-        edges.append(recorder._capture_health_step(prev, cur, _ALIVE, True, 3, runs, emitted))
+        edges.append(recorder._capture_health_step(prev, cur, _ALIVE, True, 3, runs, emitted)[0])
         prev = dict(cur)
     # debounce=3: the first two stalled ticks must NOT fire; only the third
     # (the edge) does. Pinning each tick guards the window-reader debounce

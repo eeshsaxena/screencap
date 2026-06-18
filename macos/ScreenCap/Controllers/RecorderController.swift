@@ -47,8 +47,9 @@ struct RecorderEventLine: Decodable {
     let optOutCommandExamples: [String]?
     let cursor: Int?
     let reason: String?
-    /// Which capture is affected on a `capture_unhealthy` event (SCR-76):
-    /// "screen" / "window" / "action". Absent on every other event type.
+    /// Which capture is affected on a `capture_unhealthy` (SCR-76) or
+    /// `capture_recovered` (SCR-100) event: "screen" / "window" / "action".
+    /// Absent on every other event type.
     let reader: String?
     let ts: Double?
 
@@ -90,7 +91,12 @@ final class RecorderController: ObservableObject {
             // handleCaptureUnhealthy's `.recording` guard prevents it from
             // being re-set outside a recording, so this single chokepoint
             // covers every idle-transition path (stop, Cmd+Q, termination).
-            if case .idle = state { captureAdvisory = nil }
+            // Also reset the per-reader tracking so the next recording starts
+            // clean (SCR-100).
+            if case .idle = state {
+                captureAdvisory = nil
+                unhealthyReaders.removeAll()
+            }
         }
     }
     @Published private(set) var lastError: String?
@@ -99,6 +105,13 @@ final class RecorderController: ObservableObject {
     /// it as a non-blocking hint that does not imply the recording has stopped.
     /// Cleared automatically on the return to `.idle` (see `state.didSet`).
     @Published private(set) var captureAdvisory: String?
+    /// Readers currently flagged unhealthy by the engine, in recency order
+    /// (last == most recent). Readers are independent (screen / window /
+    /// action can stall simultaneously), so the advisory only clears when this
+    /// empties — one reader recovering must not drop a hint another still
+    /// warrants. The displayed message names the most-recent reader so it
+    /// stays specific (SCR-100). Reset on the return to `.idle`.
+    private var unhealthyReaders: [String] = []
     @Published private(set) var matrixDisclosure: PrivacyMatrixDisclosure?
     @Published private(set) var transport: RecorderTransport = .cliFallback
     @Published private(set) var daemonProbeCompleted = false
@@ -507,6 +520,8 @@ final class RecorderController: ObservableObject {
                 handlePermissionLost(permission: permission)
             case .handleCaptureUnhealthy(let reason, let reader):
                 handleCaptureUnhealthy(reason: reason, reader: reader)
+            case .handleCaptureRecovered(let reader):
+                handleCaptureRecovered(reader: reader)
             }
         }
         state = machine.state
@@ -668,8 +683,42 @@ final class RecorderController: ObservableObject {
     /// `handlePermissionLost`'s `if case .recording = state` guard.
     private func handleCaptureUnhealthy(reason: String?, reader: String?) {
         guard case .recording = state else { return }
+        // Track this reader as currently-unhealthy (recency order, dedup) and
+        // recompute the hint. Multiple readers can be unhealthy at once, so the
+        // tracked readers decide when the advisory clears; the message names the
+        // latest one.
+        let key = reader ?? "capture"
+        unhealthyReaders.removeAll { $0 == key }
+        unhealthyReaders.append(key)
+        refreshCaptureAdvisory()
+    }
+
+    /// Clear the advisory for a reader that recovered mid-recording (SCR-100).
+    ///
+    /// Paired with `handleCaptureUnhealthy`: the engine emits `capture_recovered`
+    /// once when a previously-unhealthy reader returns healthy. Removing it from
+    /// the tracked set clears the advisory only when no reader remains unhealthy,
+    /// so a transient blip on one reader no longer leaves the hint up for the
+    /// rest of the recording. Guarded to `.recording` for symmetry with
+    /// `handleCaptureUnhealthy` — during teardown the `.idle` chokepoint clears
+    /// everything anyway.
+    private func handleCaptureRecovered(reader: String?) {
+        guard case .recording = state else { return }
+        let key = reader ?? "capture"
+        unhealthyReaders.removeAll { $0 == key }
+        refreshCaptureAdvisory()
+    }
+
+    /// Recompute `captureAdvisory` from the tracked unhealthy readers: `nil`
+    /// when none remain, otherwise a hint naming the most-recent reader. Updated
+    /// in place (no re-pop) to match the engine's once-per-edge emission.
+    private func refreshCaptureAdvisory() {
+        guard let latest = unhealthyReaders.last else {
+            captureAdvisory = nil
+            return
+        }
         let what: String
-        switch reader {
+        switch latest {
         case "screen": what = "Screen capture"
         case "window": what = "Window capture"
         case "action": what = "Input capture"

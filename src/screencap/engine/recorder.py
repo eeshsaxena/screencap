@@ -2226,7 +2226,7 @@ def _capture_health_step(
     debounce: int,
     runs: dict,
     emitted: dict,
-) -> list[str]:
+) -> tuple[list[str], list[str]]:
     """Advance per-reader capture-health debounce state by one supervisor tick.
 
     Pure decision step (no I/O), unit-testable in isolation from the engine.
@@ -2241,12 +2241,22 @@ def _capture_health_step(
     the existing ``record.child_died`` path and its debounce state is reset, so
     there is no double-emit. Mutates ``runs`` / ``emitted`` in place.
 
-    Returns the readers that crossed the unhealthy edge THIS tick (run length
-    reached ``debounce`` and not already emitted); the caller labels + emits
-    once per edge. ``emitted`` is cleared when a reader returns healthy, so a
-    recover-then-rebreak re-emits.
+    Returns ``(unhealthy_edges, recovered_edges)``:
+      - **unhealthy_edges** — readers that crossed the unhealthy edge THIS tick
+        (run length reached ``debounce`` and not already emitted); the caller
+        labels + emits ``capture_unhealthy`` (or ``permission_lost``) once.
+      - **recovered_edges** — readers that returned healthy THIS tick AFTER a
+        surfaced unhealthy edge (``emitted`` was set); the caller emits the
+        paired ``capture_recovered`` once (SCR-100) so the shell drops the stale
+        advisory instead of holding it until the recording ends. A reader that
+        merely blipped below ``debounce`` (never ``emitted``) recovers silently —
+        nothing was surfaced, so nothing needs clearing. ``emitted`` is cleared
+        on recovery, so a recover-then-rebreak re-emits ``capture_unhealthy``.
+        A dead reader is left to ``record.child_died`` and never reported as
+        recovered (it did not recover — it died).
     """
     edges: list[str] = []
+    recovered: list[str] = []
     for reader in ("screen", "window", "action"):
         if not alive.get(reader):
             runs[reader] = 0
@@ -2264,9 +2274,11 @@ def _capture_health_step(
                 emitted[reader] = True
                 edges.append(reader)
         else:
+            if emitted.get(reader):
+                recovered.append(reader)
             runs[reader] = 0
             emitted[reader] = False
-    return edges
+    return edges, recovered
 
 
 def _emit_capture_health_event(
@@ -2326,8 +2338,10 @@ def _capture_health_tick(
 
     Warmup-gates (no verdict until ``prev_counts`` exists and ``elapsed`` has
     reached one full ``window_secs``), evaluates per-reader deltas via
-    ``_capture_health_step``, attributes each fresh edge with ``probe`` and
-    emits once per edge via ``_emit_capture_health_event``. Returns the list of
+    ``_capture_health_step``, attributes each fresh unhealthy edge with ``probe``
+    and emits once via ``_emit_capture_health_event``, and emits the paired
+    ``capture_recovered`` (SCR-100) once per recovery edge so the shell can drop
+    the stale advisory mid-recording. Returns the list of
     ``(reader, event_type)`` emitted this tick.
 
     The detection → attribution → emission WIRING lives here (not inline in
@@ -2336,14 +2350,24 @@ def _capture_health_tick(
     broken-in-frozen" gap (R12) without a subprocess. ``emit`` (stderr) and the
     in-process ``probe`` are both frozen-safe by construction.
     """
+    from screencap._stderr_events import EVENT_CAPTURE_RECOVERED
+
     if prev_counts is None or elapsed < window_secs:
         return []  # start-barrier / warmup — establish baseline, no verdict yet
+
     events: list[tuple[str, str]] = []
-    for reader in _capture_health_step(
+    unhealthy, recovered = _capture_health_step(
         prev_counts, cur_counts, alive, action_alive, debounce, runs, emitted,
-    ):
+    )
+    for reader in unhealthy:
         label = probe(reader)
         events.append((reader, _emit_capture_health_event(reader, label, elapsed, emit)))
+    for reader in recovered:
+        # Paired advisory clear (SCR-100): no probe — recovery is unconditional,
+        # carries reader + elapsed only (no reason). The shell uses it to drop
+        # the stale capture_unhealthy advisory for this reader mid-recording.
+        emit(EVENT_CAPTURE_RECOVERED, reader=reader, elapsed=elapsed)
+        events.append((reader, EVENT_CAPTURE_RECOVERED))
     return events
 
 # Shared pressure state: written by gesture tap, read by pynput callbacks.
@@ -3943,7 +3967,7 @@ def record(
                         emit=_emit_health_event,
                     ):
                         logger.warning(
-                            f"capture-health: '{_reader}' reader unhealthy → {_etype}"
+                            f"capture-health: '{_reader}' reader edge → {_etype}"
                         )
                     _health_prev_counts = _hc_cur
                 except Exception:

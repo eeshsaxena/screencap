@@ -108,6 +108,95 @@ final class RecorderControllerTests: XCTestCase {
         XCTAssertTrue(recorder.state.isRecording)
     }
 
+    // MARK: - capture_recovered paired clear (SCR-100)
+
+    func testCaptureRecoveredClearsAdvisoryMidRecording() {
+        let recorder = RecorderController()
+        recorder._testSetPresentation(state: .recording(elapsed: 5))
+        recorder._testHandleStderrLine(
+            #"{"type":"capture_unhealthy","reason":"reader_stalled","reader":"screen","schema_version":1}"#
+        )
+        XCTAssertNotNil(recorder.captureAdvisory)
+
+        // The reader recovers WITHIN the same recording — the advisory must clear
+        // immediately, not linger until .idle (the SCR-100 bug).
+        recorder._testHandleStderrLine(
+            #"{"type":"capture_recovered","reader":"screen","elapsed":15.0,"schema_version":1}"#
+        )
+        XCTAssertNil(recorder.captureAdvisory)
+        XCTAssertTrue(recorder.state.isRecording)
+    }
+
+    func testCaptureRecoveredForOneReaderKeepsAdvisoryWhileAnotherUnhealthy() {
+        let recorder = RecorderController()
+        recorder._testSetPresentation(state: .recording(elapsed: 5))
+        recorder._testHandleStderrLine(
+            #"{"type":"capture_unhealthy","reason":"reader_stalled","reader":"screen","schema_version":1}"#
+        )
+        recorder._testHandleStderrLine(
+            #"{"type":"capture_unhealthy","reason":"listener_dead","reader":"action","schema_version":1}"#
+        )
+        XCTAssertTrue(recorder.captureAdvisory?.contains("Input capture") ?? false)
+
+        // action recovers but screen is still unhealthy → the advisory must
+        // persist and fall back to naming the still-unhealthy screen reader.
+        recorder._testHandleStderrLine(
+            #"{"type":"capture_recovered","reader":"action","schema_version":1}"#
+        )
+        XCTAssertNotNil(recorder.captureAdvisory)
+        XCTAssertTrue(recorder.captureAdvisory?.contains("Screen capture") ?? false)
+
+        // screen recovers too → nothing left unhealthy → advisory clears.
+        recorder._testHandleStderrLine(
+            #"{"type":"capture_recovered","reader":"screen","schema_version":1}"#
+        )
+        XCTAssertNil(recorder.captureAdvisory)
+    }
+
+    func testCaptureUnhealthyReShowsAfterRecovery() {
+        let recorder = RecorderController()
+        recorder._testSetPresentation(state: .recording(elapsed: 5))
+        recorder._testHandleStderrLine(
+            #"{"type":"capture_unhealthy","reason":"reader_stalled","reader":"screen","schema_version":1}"#
+        )
+        recorder._testHandleStderrLine(
+            #"{"type":"capture_recovered","reader":"screen","schema_version":1}"#
+        )
+        XCTAssertNil(recorder.captureAdvisory)
+
+        // The engine re-emits capture_unhealthy on a rebreak (it clears its
+        // per-reader emitted flag on recovery), so the advisory re-shows.
+        recorder._testHandleStderrLine(
+            #"{"type":"capture_unhealthy","reason":"reader_stalled","reader":"screen","schema_version":1}"#
+        )
+        XCTAssertNotNil(recorder.captureAdvisory)
+    }
+
+    func testCaptureRecoveredWhileIdleIsNoOp() {
+        let recorder = RecorderController()  // default .idle
+        // A late recovery arriving with no active recording must not crash or
+        // set any state — mirrors the capture_unhealthy .recording guard.
+        recorder._testHandleStderrLine(
+            #"{"type":"capture_recovered","reader":"screen","schema_version":1}"#
+        )
+        XCTAssertNil(recorder.captureAdvisory)
+    }
+
+    func testCaptureRecoveredWhileStoppingIsNoOp() {
+        let recorder = RecorderController()
+        recorder._testSetPresentation(state: .stopping(quitting: false))
+
+        // A late recovery arriving during teardown must be a no-op, mirroring
+        // the capture_unhealthy .stopping suppression — handleCaptureRecovered's
+        // `if case .recording` guard drops it (and the .idle chokepoint clears
+        // everything anyway).
+        recorder._testHandleStderrLine(
+            #"{"type":"capture_recovered","reader":"screen","elapsed":15.0,"schema_version":1}"#
+        )
+
+        XCTAssertNil(recorder.captureAdvisory)
+    }
+
     func testMissingPermissionsMessageNamesEveryRequiredPermission() {
         XCTAssertEqual(
             RecorderController.requiredPermissionsErrorMessage,

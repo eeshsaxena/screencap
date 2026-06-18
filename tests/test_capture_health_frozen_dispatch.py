@@ -118,6 +118,41 @@ def test_nonscreen_attribution_stays_advisory_not_terminal():
     assert captured[0]["reason"] == "reader_stalled"
 
 
+def test_recovery_emits_paired_capture_recovered_after_unhealthy():
+    # SCR-100: once a reader crosses the unhealthy edge (capture_unhealthy) and
+    # then produces useful output again, the SAME wiring emits a paired
+    # capture_recovered for that reader — carrying reader + elapsed, NO reason —
+    # so the shell drops the stale advisory mid-recording rather than at .idle.
+    ticks = []
+    attempt, output = 0, 0
+    for i in range(1, 5):           # ticks 1..4: stalled (baseline + 3 → edge)
+        attempt += 20
+        ticks.append(({"screen.attempt": attempt, "screen.output": output}, 100.0 + i, True))
+    for i in range(5, 7):           # ticks 5..6: healthy → recovery edge
+        attempt += 20
+        output += 20
+        ticks.append(({"screen.attempt": attempt, "screen.output": output}, 100.0 + i, True))
+    captured = _run_ticks(ticks, window_secs=0.0, debounce=3)
+    assert [c["type"] for c in captured] == ["capture_unhealthy", "capture_recovered"]
+    assert captured[1]["reader"] == "screen"
+    assert isinstance(captured[1]["elapsed"], float)
+    assert "reason" not in captured[1]  # recovery carries reader + elapsed only
+
+
+def test_transient_stall_below_debounce_emits_neither_edge():
+    # SCR-100: a stall that never reaches debounce surfaces no capture_unhealthy,
+    # so its recovery must be silent too — the wiring emits nothing across the
+    # whole cycle (no advisory shown, none to clear).
+    ticks = [
+        ({"screen.attempt": 20, "screen.output": 0}, 101.0, True),   # baseline
+        ({"screen.attempt": 40, "screen.output": 0}, 102.0, True),   # 1 stalled tick
+        ({"screen.attempt": 60, "screen.output": 20}, 103.0, True),  # healthy again
+        ({"screen.attempt": 80, "screen.output": 40}, 104.0, True),  # stays healthy
+    ]
+    captured = _run_ticks(ticks, window_secs=0.0, debounce=3)
+    assert captured == []
+
+
 def test_action_listener_dead_routes_to_capture_unhealthy_listener_dead():
     # AE2: action listener dead (heartbeat False), no TCC attribution → advisory.
     ticks = [({}, 100.0 + i, False) for i in range(1, 5)]
