@@ -111,27 +111,63 @@ Email-first, 3 steps over ~10 days. You're not at a volume that needs heavy mult
 
 ---
 
-## 7. Messaging — principles + sample
+## 7. Messaging — how to relate Proteus + ScreenCap
 
-**Principles:** lead with their outcome, not your product category; one short specific ask; privacy in the body, not buried; name the *cross-tool* pain specifically (that's your differentiator); no "revolutionary AI platform" language.
+**The product relationship (your internal source of truth):**
+- **Proteus** — the company; builds computer-use AI agents (the model). *Your sender / sending domain.*
+- **ScreenCap** — Proteus's on-device macOS tool that captures and maps real workflows. *What the recipient runs.*
+- **Pilot deliverables** — a workflow/time map + draft agents. *What the recipient gets.*
+- **The corpus** — consented traces that train Proteus's agents. *What you get.*
 
-**Sample Email 1**
+**The one-sentence spine** (use a version of this in every email so the relationship is always clear without a lecture):
 
-> **Subject:** the cross-tool work your ops team can't see
+> "Proteus builds AI agents that take over repetitive, cross-tool software work — and ScreenCap is our on-device macOS tool that maps how your team actually works, so we can show you where the time goes and train agents on it."
+
+**Principles:** lead with the recipient's outcome, not your product names; introduce Proteus and ScreenCap only once, in that single spine sentence; one short specific ask; privacy in the body, not buried; name the *cross-tool* pain specifically (your differentiator); no "revolutionary AI platform" language.
+
+### Email 1 — the hook (day 1)
+
+> **Subject:** where your ops team's hours actually go
 >
-> Hi {first} — quick one.
+> Hi {first} —
 >
-> Your ops/CS team spends the day stitching together {Salesforce, the warehouse, Looker, admin panels} — and that cross-tool work is invisible: no one can see which recurring sequences eat the most time, and it's the exact stuff that's hardest to automate.
+> I'm {name}, from Proteus — we build AI agents that take over repetitive, cross-tool software work.
 >
-> We built a local-first tool that maps it — and turns the most repetitive sequences into draft automations — without sending screens anywhere. It runs on-device with capture-time redaction, so company data never leaves the machine and your team stays in control.
+> To train them, we first map how a team really moves across its tools — Salesforce, the warehouse, Looker, admin panels — using **ScreenCap**, our macOS tool that runs entirely on-device with capture-time redaction, so nothing leaves your team's machines.
 >
-> Worth 15 minutes to see if your team's a fit for an early pilot?
+> The pilot trade: your ops team runs it for a few weeks, and you get (1) a map of where their time actually goes and (2) draft agents for your most repetitive workflows. We get consented data to improve our models.
+>
+> Worth 15 minutes to see if {Company}'s a fit?
 >
 > — {name}
 
-**Subject-line variants to A/B:** "where your ops team's hours actually go" · "automating your recurring cross-tool workflows" · "{Company}'s ops workflows → draft agents."
+### Email 2 — credibility + privacy (day 4)
 
-**Follow-up (Email 3) one-liner:** "Even if a pilot's not right now, I'm happy to share the workflow-map approach so your team can run it themselves — want me to send it over?"
+> **Subject:** re: where your ops team's hours actually go
+>
+> Hi {first} — quick follow-up.
+>
+> The usual hesitation is "you want my team to run a screen recorder over company data." Fair — so to be precise: with ScreenCap, capture and redaction happen on-device, PII is filtered *before* anything is written to disk, and nothing reaches Proteus unless someone explicitly opts in a specific recording. Your team stays in control the whole way.
+>
+> (Context: since Rewind shut down, there's no trustworthy local-first option left for this — exactly the gap we're built for.)
+>
+> Still worth a quick look for {Company}?
+>
+> — {name}
+
+### Email 3 — give-to-get / breakup (day 9)
+
+> **Subject:** re: where your ops team's hours actually go
+>
+> Hi {first} — last note from me on this.
+>
+> Even if a pilot isn't right for {Company} now, I'm happy to share how we map ops workflows so your team can spot its own time-sinks without us. Want me to send it over?
+>
+> And if the timing's just off, tell me when to circle back.
+>
+> — {name}
+
+**Subject-line variants to A/B:** "automating your recurring cross-tool workflows" · "{Company}'s ops workflows → draft agents" · "a time map of your ops stack."
 
 ---
 
