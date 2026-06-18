@@ -272,9 +272,10 @@ final class VideoPlayerPaneTests: XCTestCase {
     /// and asserts the engine deallocates cleanly through its `deinit` backstop.
     ///
     /// AVPlayer exposes no public way to assert the observer was removed, and
-    /// the observer block captures `self` weakly so there is no retain cycle —
-    /// this is a clean-dealloc / no-crash guard for the `deinit` path, in the
-    /// same spirit as `testLiveEngineSurvivesMissingFileURL`.
+    /// the observer block does not capture `self` at all (only the `onTick`
+    /// closure passed in), so there is no retain cycle — this is a clean-dealloc
+    /// / no-crash guard for the `deinit` path, in the same spirit as
+    /// `testLiveEngineSurvivesMissingFileURL`.
     func testLiveEngineDeinitDetachesTimeObserverWithoutTearDown() {
         let url = URL(fileURLWithPath: "/tmp/screencap-deinit-backstop-missing.mp4")
         weak var weakEngine: LiveVideoPlaybackEngine?
