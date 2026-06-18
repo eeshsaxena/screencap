@@ -229,6 +229,18 @@ final class RecordingStateMachineTests: XCTestCase {
         XCTAssertEqual(machine.state, .recording(elapsed: 7))
     }
 
+    func testCaptureRecoveredEmitsHandleCaptureRecoveredEffect() {
+        // SCR-100: the paired recovery event maps to the clear effect, carrying
+        // the reader, and — like its unhealthy counterpart — does not change state.
+        var machine = RecordingStateMachine()
+        machine.forceState(.recording(elapsed: 7))
+
+        let effects = machine.handle(event: event(type: "capture_recovered", reader: "screen"))
+
+        XCTAssertEqual(effects, [.handleCaptureRecovered(reader: "screen")])
+        XCTAssertEqual(machine.state, .recording(elapsed: 7))
+    }
+
     func testPermissionLostStillRoutesToHandlePermissionLost() {
         // Regression guard: capture_unhealthy must not perturb the existing
         // permission_lost routing (TCC denials still take the terminal path).

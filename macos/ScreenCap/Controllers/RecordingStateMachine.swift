@@ -62,6 +62,7 @@ struct RecordingStateMachine {
         case refreshIndex
         case handlePermissionLost(permission: String?)
         case handleCaptureUnhealthy(reason: String?, reader: String?)
+        case handleCaptureRecovered(reader: String?)
     }
 
     private(set) var state: RecordingState = .idle
@@ -215,6 +216,13 @@ struct RecordingStateMachine {
             // the cause is non-TCC or could not be attributed. (A TCC denial
             // the engine could attribute arrives as `permission_lost` instead.)
             return [.handleCaptureUnhealthy(reason: event.reason, reader: event.reader)]
+
+        case "capture_recovered":
+            // Paired clear for capture_unhealthy (SCR-100). The engine emits
+            // this once when a reader that previously went unhealthy returns
+            // healthy mid-recording, so the controller can drop the stale
+            // advisory for that reader instead of holding it until `.idle`.
+            return [.handleCaptureRecovered(reader: event.reader)]
 
         case "disk_full":
             return [.surfaceError("Disk is full — recording stopped.")]

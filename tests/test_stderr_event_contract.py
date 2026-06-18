@@ -26,6 +26,7 @@ import pytest
         ),
         ("EVENT_SUBSCRIBED", "subscribed"),
         ("EVENT_CAPTURE_UNHEALTHY", "capture_unhealthy"),
+        ("EVENT_CAPTURE_RECOVERED", "capture_recovered"),
     ],
 )
 def test_daemon_bus_event_type_constants_are_exported(name: str, expected: str) -> None:
@@ -247,6 +248,26 @@ class TestEventSchemas:
         assert evt["reason"] in CAPTURE_UNHEALTHY_REASONS
         assert evt["reader"] in ("screen", "window", "action")
         assert isinstance(evt["elapsed"], float)
+        assert "exit_code" not in evt  # advisory — never terminal
+
+    def test_capture_recovered_schema(self):
+        """SCR-100 paired-recovery event. Carries reader + elapsed only — NO
+        reason (unlike capture_unhealthy) and NO exit_code (it never terminates).
+        The shell uses it to clear the stale advisory for that reader."""
+        from screencap._stderr_events import EVENT_SCHEMA_VERSION
+        from screencap.cli import _emit_event
+
+        out = _capture_stderr(lambda: _emit_event(
+            "capture_recovered",
+            reader="screen",
+            elapsed=15.0,
+        ))
+        evt = _parse_lines(out)[0]
+        assert evt["type"] == "capture_recovered"
+        assert evt["schema_version"] == EVENT_SCHEMA_VERSION
+        assert evt["reader"] in ("screen", "window", "action")
+        assert isinstance(evt["elapsed"], float)
+        assert "reason" not in evt  # recovery carries no reason code
         assert "exit_code" not in evt  # advisory — never terminal
 
     def test_stopped_schema(self):
