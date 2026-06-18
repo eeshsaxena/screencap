@@ -233,9 +233,18 @@ final class VideoPlayerPaneTests: XCTestCase {
     /// SCR-93 — `AVPlayerView`'s internal `AVPlayerLayer` strongly retains its
     /// `player`. Without a `dismantleNSView`, that reference outlives the
     /// representable's teardown (`.onDisappear` → `tearDown()`), keeping the
-    /// `AVPlayer` retained and live until AppKit eventually deallocates the
-    /// view. `dismantleNSView` must release it in lockstep with teardown so
-    /// the player can deallocate promptly.
+    /// `AVPlayer` retained by the view's layer until AppKit eventually
+    /// deallocates the view. `dismantleNSView` must drop that reference at
+    /// SwiftUI teardown time.
+    ///
+    /// We assert the layer's reference is dropped — the contract this hook
+    /// controls — rather than that the `AVPlayer` itself deallocates.
+    /// AVFoundation does not release an `AVPlayer` synchronously when its last
+    /// visible strong reference goes away (a weak-ref dealloc assertion here
+    /// fails: the player survives the autoreleasepool drain), so a
+    /// deallocation check would be flaky. Whether the player ultimately frees
+    /// also depends on the engine/model lifecycle that owns it via
+    /// `LiveVideoPlaybackEngine.player`, not on this hook.
     func testDismantleNSViewReleasesPlayerReference() {
         let player = AVPlayer()
         let view = AVPlayerView()
