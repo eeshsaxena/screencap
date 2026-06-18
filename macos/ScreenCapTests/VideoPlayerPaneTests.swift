@@ -261,4 +261,32 @@ final class VideoPlayerPaneTests: XCTestCase {
         XCTAssertNotNil(engine.player)
         XCTAssertEqual(engine.currentSeconds, 0)
     }
+
+    /// SCR-91 — `deinit` safety-net. The periodic time observer is normally
+    /// detached via `VideoPlayerPane.onDisappear → tearDown → stopObservingTime`.
+    /// If that callback is ever skipped (window closed while still `.loading`
+    /// so the pane never rendered, or another SwiftUI lifecycle corner case),
+    /// the engine's `deinit` must still remove the observer before the AVPlayer
+    /// deallocates, per AVFoundation's contract. This arms the observer, then
+    /// drops the only strong reference WITHOUT calling tearDown/stopObservingTime,
+    /// and asserts the engine deallocates cleanly through its `deinit` backstop.
+    ///
+    /// AVPlayer exposes no public way to assert the observer was removed, and
+    /// the observer block captures `self` weakly so there is no retain cycle —
+    /// this is a clean-dealloc / no-crash guard for the `deinit` path, in the
+    /// same spirit as `testLiveEngineSurvivesMissingFileURL`.
+    func testLiveEngineDeinitDetachesTimeObserverWithoutTearDown() {
+        let url = URL(fileURLWithPath: "/tmp/screencap-deinit-backstop-missing.mp4")
+        weak var weakEngine: LiveVideoPlaybackEngine?
+        autoreleasepool {
+            let engine = LiveVideoPlaybackEngine(url: url)
+            engine.startObservingTime(interval: 0.1) { _ in }
+            weakEngine = engine
+            // Deliberately skip stopObservingTime()/tearDown — simulate the
+            // dropped-onDisappear path. Dropping the last strong reference at
+            // the end of this scope runs `deinit`, which must detach the
+            // still-registered time observer.
+        }
+        XCTAssertNil(weakEngine, "engine must deallocate cleanly via its deinit backstop")
+    }
 }
