@@ -147,6 +147,24 @@ final class VideoPlayerPaneTests: XCTestCase {
         XCTAssertEqual(model.currentTime, 12.5)
     }
 
+    /// SCR-92 — a continuous scrub drag fires `onChanged` on every pixel of
+    /// mouse jitter; re-seeking to a target within a sub-threshold distance of
+    /// the frame already on screen is wasted work. The model drops those
+    /// redundant re-seeks before they reach the engine, while still honoring
+    /// any move large enough to matter.
+    func testSubThresholdReseeksAreDropped() {
+        let engine = FakeVideoPlaybackEngine()
+        let model = VideoPlayerPaneModel(engine: engine)
+
+        model.seek(toSeconds: 10.0)   // first seek — always dispatched
+        model.seek(toSeconds: 10.02)  // < 0.05s away — dropped, no engine call
+        model.seek(toSeconds: 11.0)   // far enough — dispatched
+
+        XCTAssertEqual(engine.seekRequests, [10.0, 11.0])
+        // The dropped seek must not move the published cursor either.
+        XCTAssertEqual(model.currentTime, 11.0)
+    }
+
     /// Risk-table guard: a periodic-observer tick that arrives mid-scrub must
     /// not snap the cursor backward to a stale frame timestamp. The model
     /// flags itself as "seeking from scrub" until the seek completion fires.

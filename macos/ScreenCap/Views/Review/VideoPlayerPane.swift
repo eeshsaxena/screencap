@@ -69,13 +69,24 @@ final class LiveVideoPlaybackEngine: VideoPlaybackEngine {
         }
     }
 
+    /// Seek tolerance for review scrubbing (SCR-92). A `.zero` tolerance forces
+    /// an exact-frame seek — AVPlayer decodes forward from the nearest keyframe
+    /// to the precise frame — which is the most expensive seek variant. During a
+    /// continuous timeline drag every `onChanged` delta queues one, compounding
+    /// scrub jank. A small non-zero tolerance lets AVPlayer settle on a nearby
+    /// keyframe/already-decoded frame instead (Apple's documented recommendation
+    /// for smooth scrubbing). Review navigation never needs frame-exactness, and
+    /// this engine's `seek` is only ever driven by the timeline scrub and the
+    /// event-row click, so applying it uniformly is correct.
+    private static let scrubTolerance = CMTime(seconds: 0.1, preferredTimescale: 600)
+
     func seek(toSeconds seconds: Double, completion: @escaping @MainActor (Bool) -> Void) {
         let time = CMTime(seconds: max(0, seconds), preferredTimescale: 600)
         // AVPlayer invokes the completion handler on an internal queue,
         // and passes `finished: false` if a newer seek superseded this
         // one. Hop to the main actor before calling the user's completion
         // so its closure body can touch MainActor state directly.
-        player.seek(to: time, toleranceBefore: .zero, toleranceAfter: .zero) { finished in
+        player.seek(to: time, toleranceBefore: Self.scrubTolerance, toleranceAfter: Self.scrubTolerance) { finished in
             DispatchQueue.main.async {
                 MainActor.assumeIsolated { completion(finished) }
             }
@@ -170,7 +181,19 @@ final class VideoPlayerPaneModel: ObservableObject {
         }
     }
 
+    /// Minimum move (seconds) that earns a fresh engine seek (SCR-92). A scrub
+    /// drag fires `onChanged` on every pixel of mouse jitter; re-seeking to a
+    /// target this close to the frame already on screen is wasted work. Kept
+    /// below `LiveVideoPlaybackEngine.scrubTolerance` (0.1s) so a dropped seek
+    /// is always within the tolerance the engine would have used anyway — the
+    /// displayed frame is never more than the accepted tolerance off-target.
+    private static let scrubMinDelta = 0.05
+
     func seek(toSeconds seconds: Double) {
+        // Drop redundant sub-threshold re-seeks. The cursor is already within
+        // `scrubMinDelta` of the requested target, so neither the engine seek
+        // nor the cursor update would produce a visible change.
+        guard abs(seconds - currentTime) >= Self.scrubMinDelta else { return }
         isSeekingFromScrub = true
         currentTime = seconds
         seekGeneration &+= 1
