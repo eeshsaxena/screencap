@@ -4,7 +4,7 @@ from __future__ import annotations
 
 import re
 
-from screencap.privacy import Detection, EntityType
+from screencap.redaction.engine import Detection, EntityType
 
 # Luhn checksum for credit card validation
 def _luhn_check(number: str) -> bool:

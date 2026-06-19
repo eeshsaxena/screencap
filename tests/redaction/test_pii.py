@@ -4,8 +4,8 @@ from __future__ import annotations
 
 import pytest
 
-from screencap.privacy import EntityType
-from screencap.privacy.pii import PiiDetector
+from screencap.redaction import EntityType
+from screencap.redaction.pii import PiiDetector
 
 pytestmark = pytest.mark.privacy
 
@@ -206,28 +206,28 @@ class TestGlinerOffsets:
 
 class TestFactorySwitching:
     def test_create_with_presidio(self):
-        from screencap.privacy import create_default_pipeline
+        from screencap.redaction import create_default_pipeline
 
         pipeline = create_default_pipeline(pii_engine="presidio")
         detector_names = [type(d).__name__ for d in pipeline._detectors]
         assert "PiiDetector" in detector_names
 
     def test_create_with_presidio_gliner(self):
-        from screencap.privacy import create_default_pipeline
+        from screencap.redaction import create_default_pipeline
 
         pipeline = create_default_pipeline(pii_engine="presidio-gliner")
         detector_names = [type(d).__name__ for d in pipeline._detectors]
         assert "PiiDetector" in detector_names
 
     def test_create_auto_uses_gliner(self):
-        from screencap.privacy import create_default_pipeline
+        from screencap.redaction import create_default_pipeline
 
         pipeline = create_default_pipeline()  # auto
         detector_names = [type(d).__name__ for d in pipeline._detectors]
         assert "PiiDetector" in detector_names
 
     def test_create_invalid_engine_raises(self):
-        from screencap.privacy import create_default_pipeline
+        from screencap.redaction import create_default_pipeline
 
         with pytest.raises(ValueError, match="Invalid pii_engine"):
             create_default_pipeline(pii_engine="invalid")
@@ -247,10 +247,10 @@ class TestGlinerModelLoadFailureFallback:
         """ONNX tensor shape mismatch at model load → spaCy fallback activates."""
         from unittest.mock import patch
 
-        from screencap.privacy import create_default_pipeline
+        from screencap.redaction import create_default_pipeline
 
         with patch(
-            "screencap.privacy.pii.PiiDetector._init_gliner",
+            "screencap.redaction.pii.PiiDetector._init_gliner",
             side_effect=RuntimeError("unexpected logits shape"),
         ):
             pipeline = create_default_pipeline()
@@ -266,10 +266,10 @@ class TestGlinerModelLoadFailureFallback:
         """Model architecture not recognized (e.g. 'modernbert') → spaCy fallback."""
         from unittest.mock import patch
 
-        from screencap.privacy import create_default_pipeline
+        from screencap.redaction import create_default_pipeline
 
         with patch(
-            "screencap.privacy.pii.PiiDetector._init_gliner",
+            "screencap.redaction.pii.PiiDetector._init_gliner",
             side_effect=KeyError("modernbert"),
         ):
             pipeline = create_default_pipeline()
@@ -284,10 +284,10 @@ class TestGlinerModelLoadFailureFallback:
         """Model file not found on disk → spaCy fallback activates."""
         from unittest.mock import patch
 
-        from screencap.privacy import create_default_pipeline
+        from screencap.redaction import create_default_pipeline
 
         with patch(
-            "screencap.privacy.pii.PiiDetector._init_gliner",
+            "screencap.redaction.pii.PiiDetector._init_gliner",
             side_effect=OSError("model file not found"),
         ):
             pipeline = create_default_pipeline()
@@ -303,10 +303,10 @@ class TestGlinerModelLoadFailureFallback:
         import pytest
         from unittest.mock import patch
 
-        from screencap.privacy import create_default_pipeline
+        from screencap.redaction import create_default_pipeline
 
         with patch(
-            "screencap.privacy.pii.PiiDetector._init_gliner",
+            "screencap.redaction.pii.PiiDetector._init_gliner",
             side_effect=RuntimeError("ONNX tensor mismatch"),
         ):
             with pytest.raises(RuntimeError, match="fast-gliner model failed to load"):

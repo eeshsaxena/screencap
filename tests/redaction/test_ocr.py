@@ -39,14 +39,14 @@ def _render_text_jpeg(tmp_path: Path, text: str, filename: str = "test.jpg") -> 
 
 @pytest.fixture()
 def ocr():
-    from screencap.privacy.ocr import VisionOcr
+    from screencap.redaction.ocr import VisionOcr
 
     return VisionOcr()
 
 
 @pytest.fixture()
 def pipeline():
-    from screencap.privacy import create_default_pipeline
+    from screencap.redaction import create_default_pipeline
 
     return create_default_pipeline()
 
@@ -122,14 +122,14 @@ class TestOcrMaskScreenshot:
 
 class TestBuildOffsetMap:
     def test_identity_when_equal(self):
-        from screencap.privacy.ocr import build_offset_map
+        from screencap.redaction.ocr import build_offset_map
 
         result = build_offset_map("hello", "hello")
         assert result == [0, 1, 2, 3, 4, 5]
 
     def test_zero_width_char_stripped(self):
-        from screencap.privacy.ocr import build_offset_map
-        from screencap.privacy import normalize_text
+        from screencap.redaction.ocr import build_offset_map
+        from screencap.redaction import normalize_text
 
         original = "he\u200bllo"  # zero-width space between e and l
         normalized = normalize_text(original)
@@ -162,7 +162,7 @@ class TestVisionBboxToPixels:
         return type("B", (), {"origin": origin, "size": size})()
 
     def test_no_roi_identity(self):
-        from screencap.privacy.ocr import _vision_bbox_to_pixels
+        from screencap.redaction.ocr import _vision_bbox_to_pixels
 
         bbox = self._mock_bbox(0.25, 0.75, 0.5, 0.125)
         x, y, w, h = _vision_bbox_to_pixels(bbox, 2000, 1000)
@@ -173,7 +173,7 @@ class TestVisionBboxToPixels:
         assert y == 125
 
     def test_roi_remaps_to_full_image(self):
-        from screencap.privacy.ocr import _vision_bbox_to_pixels
+        from screencap.redaction.ocr import _vision_bbox_to_pixels
 
         # ROI covers the right half of the image
         roi = (0.5, 0.0, 0.5, 1.0)
@@ -190,7 +190,7 @@ class TestVisionBboxToPixels:
         assert y == 125
 
     def test_roi_none_same_as_no_roi(self):
-        from screencap.privacy.ocr import _vision_bbox_to_pixels
+        from screencap.redaction.ocr import _vision_bbox_to_pixels
 
         bbox = self._mock_bbox(0.25, 0.5, 0.4, 0.1)
         result_none = _vision_bbox_to_pixels(bbox, 1920, 1080, None)

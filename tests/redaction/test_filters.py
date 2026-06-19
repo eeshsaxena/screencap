@@ -4,8 +4,8 @@ from __future__ import annotations
 
 import pytest
 
-from screencap.privacy import Detection, EntityType
-from screencap.privacy.filters import HeuristicFilter
+from screencap.redaction import Detection, EntityType
+from screencap.redaction.filters import HeuristicFilter
 
 pytestmark = pytest.mark.privacy
 

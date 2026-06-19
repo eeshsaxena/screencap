@@ -6,7 +6,7 @@ New backends only need to add their mapping dict here.
 
 from __future__ import annotations
 
-from screencap.privacy import EntityType
+from screencap.redaction.engine import EntityType
 
 # Presidio (spaCy NER backend) -> EntityType
 PRESIDIO_MAP: dict[str, str] = {

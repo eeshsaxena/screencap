@@ -4,8 +4,8 @@ from __future__ import annotations
 
 import pytest
 
-from screencap.privacy import EntityType
-from screencap.privacy.secrets import DetectSecretsDetector
+from screencap.redaction import EntityType
+from screencap.redaction.secrets import DetectSecretsDetector
 
 pytestmark = pytest.mark.privacy
 
@@ -129,7 +129,7 @@ class TestMultipleOccurrences:
 class TestEntityTypeMapping:
     def test_unmapped_falls_to_secret(self, detector: DetectSecretsDetector):
         """All mapped types should be valid EntityType constants."""
-        from screencap.privacy.secrets import _TYPE_MAP
+        from screencap.redaction.secrets import _TYPE_MAP
 
         valid_types = {
             v

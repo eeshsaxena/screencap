@@ -7,7 +7,7 @@ from unittest.mock import patch
 
 import pytest
 
-from screencap.privacy import (
+from screencap.redaction.engine import (
     AllDetectorsFailedError,
     Anonymizer,
     Detection,
@@ -20,8 +20,8 @@ from screencap.privacy import (
     create_default_pipeline,
     normalize_text,
 )
-from screencap.privacy.filters import HeuristicFilter
-from screencap.privacy.resolver import DetectionResolver
+from screencap.redaction.filters import HeuristicFilter
+from screencap.redaction.resolver import DetectionResolver
 
 pytestmark = pytest.mark.privacy
 
@@ -355,7 +355,7 @@ class TestNlpModelAvailabilityGating:
         # --- require_pii on create_default_pipeline ---
 
         # 6. PiiDetector unavailable: require_pii=False succeeds, True raises
-        with patch("screencap.privacy.pii.PiiDetector", side_effect=ImportError("no model")):
+        with patch("screencap.redaction.pii.PiiDetector", side_effect=ImportError("no model")):
             # Default (False) — backward-compatible, returns pipeline with regex+secrets
             pipeline = create_default_pipeline()
             assert pipeline is not None

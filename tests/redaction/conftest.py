@@ -4,7 +4,7 @@ from __future__ import annotations
 
 import pytest
 
-from screencap.privacy import Anonymizer
+from screencap.redaction import Anonymizer
 
 
 @pytest.fixture()

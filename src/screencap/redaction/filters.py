@@ -9,7 +9,7 @@ from __future__ import annotations
 import re
 import unicodedata
 
-from screencap.privacy import Detection, EntityType
+from screencap.redaction.engine import Detection, EntityType
 
 
 # Month patterns that NER models misclassify as PERSON

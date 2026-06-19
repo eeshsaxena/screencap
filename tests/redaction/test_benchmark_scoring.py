@@ -10,14 +10,14 @@ from __future__ import annotations
 
 import pytest
 
-from screencap.privacy import Detection, DetectionResult, normalize_text
-from tests.privacy.fixtures.test_corpus import (
+from screencap.redaction import Detection, DetectionResult, normalize_text
+from tests.redaction.fixtures.test_corpus import (
     FALSE_POSITIVE_CASES,
     TRUE_POSITIVE_CASES,
     CorpusCase,
     ExpectedEntity,
 )
-from tests.privacy.test_benchmark import AggregateResult, run_benchmark, score_predictions
+from tests.redaction.test_benchmark import AggregateResult, run_benchmark, score_predictions
 
 pytestmark = pytest.mark.privacy
 

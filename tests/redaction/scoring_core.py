@@ -19,8 +19,8 @@ import json
 from dataclasses import dataclass, field
 from pathlib import Path
 
-from screencap.privacy import Anonymizer, Detection, DetectionResult
-from tests.privacy.fixtures.test_corpus import (
+from screencap.redaction import Anonymizer, Detection, DetectionResult
+from tests.redaction.fixtures.test_corpus import (
     FALSE_POSITIVE_CASES,
     TRUE_POSITIVE_CASES,
     CorpusCase,

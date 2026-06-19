@@ -4,8 +4,8 @@ from __future__ import annotations
 
 import pytest
 
-from screencap.privacy import Detection
-from screencap.privacy.resolver import DetectionResolver
+from screencap.redaction import Detection
+from screencap.redaction.resolver import DetectionResolver
 
 pytestmark = pytest.mark.privacy
 

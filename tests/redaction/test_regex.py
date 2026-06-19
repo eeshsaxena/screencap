@@ -4,8 +4,8 @@ from __future__ import annotations
 
 import pytest
 
-from screencap.privacy import EntityType
-from screencap.privacy.regex import RegexDetector
+from screencap.redaction import EntityType
+from screencap.redaction.regex import RegexDetector
 
 pytestmark = pytest.mark.privacy
 

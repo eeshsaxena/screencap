@@ -11,7 +11,7 @@ Resolution rules:
 
 from __future__ import annotations
 
-from screencap.privacy import Detection
+from screencap.redaction.engine import Detection
 
 # Source priority — higher number = higher priority
 SOURCE_PRIORITY: dict[str, int] = {

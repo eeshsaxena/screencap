@@ -16,12 +16,12 @@ from pathlib import Path
 
 import pytest
 
-from screencap.privacy import DetectionPipeline
-from tests.privacy.fixtures.test_corpus import (
+from screencap.redaction import DetectionPipeline
+from tests.redaction.fixtures.test_corpus import (
     FALSE_POSITIVE_CASES,
     TRUE_POSITIVE_CASES,
 )
-from tests.privacy.scoring_core import (
+from tests.redaction.scoring_core import (
     _FREQ_WEIGHT,
     AggregateResult,
     BenchmarkResult,
@@ -69,7 +69,7 @@ def run_benchmark(pipeline: DetectionPipeline) -> AggregateResult:
 
 
 def _build_pipeline() -> DetectionPipeline:
-    from screencap.privacy import create_default_pipeline
+    from screencap.redaction import create_default_pipeline
 
     return create_default_pipeline()
 

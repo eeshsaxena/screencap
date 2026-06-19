@@ -11,7 +11,7 @@ from __future__ import annotations
 
 import pytest
 
-from screencap.privacy import Anonymizer, EntityType, create_default_pipeline
+from screencap.redaction import Anonymizer, EntityType, create_default_pipeline
 
 pytestmark = pytest.mark.privacy
 
