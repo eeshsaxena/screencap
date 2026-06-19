@@ -9,7 +9,7 @@ import pytest
 
 from screencap.privacy.actions import PrivacyAction
 from screencap.privacy.policy import PrivacyConfig, PrivacyMode
-from screencap.privacy.recorder_enforcement import (
+from screencap.enforcement.recorder_enforcement import (
     KEYSTROKE_CONTENT_FIELDS,
     RecorderPrivacyFilter,
 )
@@ -78,7 +78,7 @@ class TestRecorderPrivacyFilter:
 
         # Switch to allowed app — hold should activate
         now = time.monotonic()
-        with patch("screencap.privacy.recorder_enforcement.time") as mock_time:
+        with patch("screencap.enforcement.recorder_enforcement.time") as mock_time:
             mock_time.monotonic.return_value = now
             f.on_window_event({
                 "app_bundle_id": "com.microsoft.VSCode",
@@ -113,7 +113,7 @@ class TestRecorderPrivacyFilter:
         mono_now = 500.0  # monotonic ~500s since boot
         unix_now = 1.7e9  # Unix timestamp
 
-        with patch("screencap.privacy.recorder_enforcement.time") as mock_time:
+        with patch("screencap.enforcement.recorder_enforcement.time") as mock_time:
             mock_time.monotonic.return_value = mono_now
             f.on_window_event({
                 "app_bundle_id": "com.microsoft.VSCode",
@@ -209,7 +209,7 @@ class TestFailClosed:
         f = RecorderPrivacyFilter(config, transition_hold_seconds=1.0, secure_input_fn=None)
 
         now = time.monotonic()
-        with patch("screencap.privacy.recorder_enforcement.time") as mock_time:
+        with patch("screencap.enforcement.recorder_enforcement.time") as mock_time:
             mock_time.monotonic.return_value = now
             f.fail_closed()
             assert f.is_screen_allowed() is False
@@ -266,7 +266,7 @@ class TestSecureInputDetection:
         f.on_window_event(_ALLOWED_EVENT)
 
         now = time.monotonic()
-        with patch("screencap.privacy.recorder_enforcement.time") as mock_time:
+        with patch("screencap.enforcement.recorder_enforcement.time") as mock_time:
             # Secure input active — keystrokes blocked, screenshots allowed
             mock_time.monotonic.return_value = now
             disp = f.get_capture_disposition()
@@ -319,7 +319,7 @@ class TestAXSecureTextField:
         )
 
         now = time.monotonic()
-        with patch("screencap.privacy.recorder_enforcement.time") as mock_time:
+        with patch("screencap.enforcement.recorder_enforcement.time") as mock_time:
             mock_time.monotonic.return_value = now
             f.on_action_event({
                 "element_state": {ax_key: "AXSecureTextField"},
@@ -351,7 +351,7 @@ class TestAXSecureTextField:
         f.on_window_event(_ALLOWED_EVENT)
 
         now = time.monotonic()
-        with patch("screencap.privacy.recorder_enforcement.time") as mock_time:
+        with patch("screencap.enforcement.recorder_enforcement.time") as mock_time:
             mock_time.monotonic.return_value = now
             f.on_action_event({
                 "element_state": {"AXRole": "AXSecureTextField"},

@@ -7,7 +7,7 @@ import sys
 import pytest
 
 from screencap import config as config_module
-from screencap.privacy.persistence import persist_disable
+from screencap.enforcement.persistence import persist_disable
 
 if sys.version_info >= (3, 11):
     import tomllib

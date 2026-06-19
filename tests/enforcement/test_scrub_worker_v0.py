@@ -21,7 +21,7 @@ from pathlib import Path
 import pytest
 
 from screencap.engine.db import create_db
-from screencap.privacy.scrub_worker import ScrubWorker
+from screencap.enforcement.scrub_worker import ScrubWorker
 
 pytestmark = pytest.mark.privacy
 
@@ -573,7 +573,7 @@ def test_scrub_triggers_engine_flush_before_select(tmp_path: Path) -> None:
     """
     import multiprocessing
     import threading as _threading_mod
-    from screencap.privacy.scrub_worker import ScrubWorker
+    from screencap.enforcement.scrub_worker import ScrubWorker
 
     db_path = _make_recording_db(tmp_path)
     rec_id_holder = {}

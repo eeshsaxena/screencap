@@ -1,4 +1,4 @@
-"""Tests for the privacy filter factory in ``screencap.privacy.filter``.
+"""Tests for the privacy filter factory in ``screencap.enforcement.window_filter``.
 
 Covers Unit 1 of the unified-export-callable refactor:
 
@@ -11,9 +11,10 @@ Covers Unit 1 of the unified-export-callable refactor:
 - ``.menubar_overrides.json``: missing file is fine; malformed JSON falls
   back to policy evaluation without raising.
 - Import paths: ``build_privacy_filter`` and ``build_cloud_window_filter``
-  are importable only from the canonical ``screencap.privacy.filter``
-  location. The historical ``screencap.exporter`` re-export was removed
-  in todo 019.
+  are importable from the canonical ``screencap.enforcement.window_filter``
+  location (the SCR-33 U3 home; ``screencap.privacy.filter`` is a temporary
+  re-export shim removed in U5). The historical ``screencap.exporter``
+  re-export was removed in todo 019.
 """
 
 from __future__ import annotations
@@ -23,7 +24,7 @@ import re
 from unittest.mock import patch
 
 from screencap.engine.events import WindowSwitchEvent
-from screencap.privacy.filter import (
+from screencap.enforcement.window_filter import (
     build_cloud_window_filter,
     build_privacy_filter,
 )
@@ -326,21 +327,22 @@ class TestMenubarOverridesLoading:
 
 class TestImportPaths:
     """``build_privacy_filter`` and ``build_cloud_window_filter`` are
-    importable only from the canonical ``screencap.privacy.filter``
-    location. The legacy ``screencap.exporter`` re-export was removed
-    in todo 019; ``screencap.privacy.filter`` is now the single source
-    of truth.
+    importable from the canonical ``screencap.enforcement.window_filter``
+    location (the SCR-33 U3 home). The legacy ``screencap.exporter``
+    re-export was removed in todo 019; ``screencap.enforcement.window_filter``
+    is now the single source of truth (``screencap.privacy.filter`` is a
+    temporary re-export shim removed in U5).
     """
 
     def test_import_from_privacy_filter_module(self):
-        from screencap.privacy.filter import (  # noqa: F401
+        from screencap.enforcement.window_filter import (  # noqa: F401
             build_cloud_window_filter,
             build_privacy_filter,
         )
 
     def test_chunk_processor_import_path_works(self):
         """Chunk processor imports from the canonical location."""
-        from screencap.privacy.filter import build_privacy_filter
+        from screencap.enforcement.window_filter import build_privacy_filter
 
         with _public_config():
             pf = build_privacy_filter(
