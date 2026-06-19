@@ -514,6 +514,11 @@ def _null_console() -> Any:
     return Console(quiet=True)
 
 
+def _append_warning(existing: str | None, fragment: str) -> str:
+    """Join a new warning fragment onto an existing one (`; `-separated), or return it alone."""
+    return f"{existing}; {fragment}" if existing else fragment
+
+
 def _masked_convergence_ok(recording_dir: Path) -> bool:
     """SCR-126 R8 gate for the convergence fast path.
 
@@ -952,11 +957,24 @@ def _route_cloud(
         )
     except Exception as exc:  # noqa: BLE001
         logger.error("terminal_stage: upload failed for %s: %s", name, exc)
-        result.upload_warning = f"upload failed: {exc}"
+        result.upload_warning = _append_warning(result.upload_warning, f"upload failed: {exc}")
         return result
 
     result.routed = True
     uploaded_ok = not upload_result.failed
+    if not uploaded_ok:
+        # SCR-79: a per-file upload failure (a file's PUT failed after retries —
+        # ``upload_recording`` emits the terminal ``upload_failed`` event and
+        # returns ``result.failed`` non-empty WITHOUT raising) must be surfaced
+        # like every OTHER failure mode in this function. Without it the CLI sees
+        # a clean result, prints "Uploaded", and exits 0 despite the event. The
+        # sentinel is still withheld below (the finalize gate stays unsatisfied)
+        # and local media is preserved for a resumable retry.
+        upload_failure_warning = (
+            f"{len(upload_result.failed)} file(s) failed to upload — "
+            "sentinel withheld, local media preserved"
+        )
+        result.upload_warning = _append_warning(result.upload_warning, upload_failure_warning)
 
     # 3b. SCR-129: upload the per-chunk SOURCE media (video + audio). The
     # `<name>-scrubbed` copy uploaded above STRIPS all media
@@ -977,11 +995,7 @@ def _route_cloud(
         # Surface alongside (not instead of) any mask/scrub warning already set
         # — a media-upload failure for a non-mask-failed chunk must stay visible
         # (this bug is precisely "the cloud copy is incomplete and nobody is told").
-        result.upload_warning = (
-            f"{result.upload_warning}; {media_warning}"
-            if result.upload_warning
-            else media_warning
-        )
+        result.upload_warning = _append_warning(result.upload_warning, media_warning)
 
     # 4. Map upload onto the ledger per chunk (closed-set). A chunk is UPLOADED
     # only when its core files confirmed in GCS; otherwise it stays

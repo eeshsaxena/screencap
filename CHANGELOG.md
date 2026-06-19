@@ -7,6 +7,11 @@ and this project adheres to [Semantic Versioning](https://semver.org/).
 
 ## [Unreleased]
 
+### Fixed
+
+- `screencap upload` now exits non-zero when a recording fails to upload; a
+  retryable "already in progress" busy-lock skip still exits 0 (SCR-79).
+
 ### Removed
 
 - **Remote *session* browsing CLI surface** (per-user cloud storage isolation, U5).

@@ -311,6 +311,56 @@ def test_failed_chunk_no_sentinel_preserves_media(tmp_path, monkeypatch):
     assert (rec_dir / "chunk_0001.mp4").exists()
 
 
+def test_per_file_upload_failure_surfaces_warning(tmp_path, monkeypatch):
+    """SCR-79: a per-file upload failure must surface as an ``upload_warning``.
+
+    ``upload_recording`` reports a failed file by returning ``result.failed``
+    non-empty WITHOUT raising (a file's PUT failed after retries — it has already
+    emitted the terminal ``upload_failed`` stderr event). The terminal stage sets
+    no warning for any OTHER failure mode's sibling — it must do so here too, or
+    the CLI sees a clean result, prints "Uploaded", and exits 0 despite the event.
+    The sentinel is withheld (gate unsatisfied) and local media is preserved.
+    """
+    from screencap import terminal_stage as ts
+    from screencap.terminal_stage import CloudCopyOutcome
+    from screencap.upload import UploadResult
+    import screencap.upload as up
+
+    rec_dir = _make_recording(tmp_path, destination="cloud", n_chunks=1, name="pfail")
+    scrubbed = rec_dir.parent / f"{rec_dir.name}-scrubbed"
+    scrubbed.mkdir(exist_ok=True)
+
+    # produce succeeds (no mask failures) so we reach the artifact upload step.
+    monkeypatch.setattr(
+        ts.CloudCopyProducer, "produce",
+        lambda self, **kw: CloudCopyOutcome(scrubbed_dir=scrubbed, failed_chunks=[]),
+    )
+    # The scrubbed-artifact upload reports a per-file failure but does NOT raise.
+    monkeypatch.setattr(
+        up, "upload_recording",
+        lambda d, **kw: UploadResult(
+            recording=d.name, failed=["chunk_0000_events.jsonl"],
+        ),
+    )
+    # Isolate the artifact-upload path: the (orthogonal) source-media upload
+    # succeeds, so the only failure under test is ``upload_recording.failed``.
+    monkeypatch.setattr(ts, "_upload_source_media", lambda *a, **kw: None)
+    sentinels: list[bool] = []
+    monkeypatch.setattr(
+        "screencap.chunk_processor.upload_sentinel",
+        lambda *a, **kw: sentinels.append(True) or True,
+    )
+
+    result = ts.run_terminal_stage(rec_dir, _remote_exists=lambda i: False)
+
+    assert result.upload_warning is not None
+    assert "failed to upload" in result.upload_warning
+    assert result.sentinel_uploaded is False
+    assert sentinels == []
+    # Local media preserved for a resumable retry.
+    assert (rec_dir / "chunk_0000.mp4").exists()
+
+
 # ---------------------------------------------------------------------------
 # AE5 / R12 — delete_after_upload evicts confirmed chunks; disk stays bounded.
 # ---------------------------------------------------------------------------
