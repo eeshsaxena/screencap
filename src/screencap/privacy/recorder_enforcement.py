@@ -591,7 +591,7 @@ class RecorderPrivacyFilter:
             return
 
         try:
-            from screencap.privacy.masking import (
+            from screencap.privacy.mask_primitives import (
                 _apply_bitmap_mask_to_image,
                 _apply_mask_to_image,
                 window_regions_from_geometry,

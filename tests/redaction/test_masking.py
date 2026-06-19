@@ -19,11 +19,13 @@ from tests._image_helpers import _avg_brightness
 
 from screencap.privacy.actions import PrivacyAction
 from screencap.privacy.context import DefaultContextClassifier, WindowContext
-from screencap.privacy.masking import (
+from screencap.privacy.mask_primitives import (
     MaskRegion,
-    MaskStrategy,
     _apply_mask_to_image,
     full_window_geometry,
+)
+from screencap.redaction.masking import (
+    MaskStrategy,
     mask_screenshot,
 )
 from screencap.privacy.policy import (

@@ -20,10 +20,12 @@ from screencap.privacy.context import (
     DefaultContextClassifier,
     load_window_geometry,
 )
-from screencap.privacy.masking import (
+from screencap.privacy.mask_primitives import (
     MaskRegion,
-    mask_screenshot,
     window_regions_from_geometry,
+)
+from screencap.redaction.masking import (
+    mask_screenshot,
 )
 from screencap.privacy.policy import (
     ContextClass,
