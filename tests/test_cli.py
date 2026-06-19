@@ -1089,6 +1089,31 @@ def test_upload_exits_nonzero_when_recording_fails(tmp_path):
     assert "Uploaded rec-fail" not in result.output
 
 
+def test_upload_warning_only_exits_nonzero(tmp_path):
+    """SCR-79: the ``upload_warning``-only arm of the CLI guard
+    ``if result.failed_indices or result.upload_warning:``. A per-file
+    ``upload_failed`` surfaces as an ``upload_warning`` from _route_cloud WITHOUT
+    ``failed_indices`` (those come from the ledger, not ``upload_result.failed``),
+    so the warning alone must still exit non-zero and never print 'Uploaded'."""
+    rec_dir = _make_upload_recording(tmp_path, "rec-warn")
+    runner = CliRunner()
+    fake = mock.MagicMock(return_value=_terminal_result(
+        sentinel_uploaded=False,
+        upload_warning=(
+            "1 file(s) failed to upload — sentinel withheld, local media preserved"
+        ),
+    ))
+
+    with (
+        mock.patch("screencap.upload.resolve_recording_dirs", return_value=[rec_dir]),
+        mock.patch("screencap.terminal_stage.run_terminal_stage", fake),
+    ):
+        result = runner.invoke(cli, ["upload", "rec-warn"])
+
+    assert result.exit_code == 1
+    assert "Uploaded" not in result.output
+
+
 def test_upload_promotion_refused_exits_nonzero(tmp_path):
     """AE8 + SCR-79: a recording with holes → PromotionRefused is non-fatal to the
     BATCH (it continues to the next recording, no traceback), but a refused upload
@@ -1168,6 +1193,34 @@ def test_upload_busy_shows_friendly_message(tmp_path):
     assert result.exit_code == 0
     assert "in progress" in result.output
     assert "Traceback" not in result.output
+
+
+def test_upload_busy_plus_success_exits_zero(tmp_path):
+    """SCR-79: in a multi-recording batch, a ``TerminalStageBusy`` skip is
+    retryable (n_busy), not a failure — so a batch where one recording is busy and
+    the other uploads cleanly still exits 0, and the Done summary reports the busy
+    one as 'in progress'."""
+    rec_busy = _make_upload_recording(tmp_path, "rec-busy")
+    rec_ok = _make_upload_recording(tmp_path, "rec-ok")
+    runner = CliRunner()
+    from screencap.terminal_stage import TerminalStageBusy
+
+    def _busy_then_ok(d, **kw):
+        if d.name == "rec-busy":
+            raise TerminalStageBusy("held")
+        return _terminal_result(routed=True, sentinel_uploaded=True)
+
+    with (
+        mock.patch(
+            "screencap.upload.resolve_recording_dirs",
+            return_value=[rec_busy, rec_ok],
+        ),
+        mock.patch("screencap.terminal_stage.run_terminal_stage", _busy_then_ok),
+    ):
+        result = runner.invoke(cli, ["upload", "rec-busy", "rec-ok"])
+
+    assert result.exit_code == 0
+    assert "in progress" in result.output
 
 
 def test_upload_sigterm_during_prep_emits_interrupted(tmp_path):

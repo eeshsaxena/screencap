@@ -2365,7 +2365,11 @@ def update():
 @click.option("--no-delete", is_flag=True, default=False,
               help="Keep local recording files after upload instead of auto-deleting.")
 def upload(names, all_recordings, dry_run, force, jobs, no_delete):
-    """Upload recordings to cloud storage."""
+    """Upload recordings to cloud storage.
+
+    Exit codes: 0 = all recordings uploaded (or a retryable "already in progress"
+    busy-lock skip); 1 = one or more recordings failed to upload (SCR-79).
+    """
     from screencap.upload import resolve_recording_dirs
 
     try:
@@ -2569,8 +2573,10 @@ def upload(names, all_recordings, dry_run, force, jobs, no_delete):
         # command exit non-zero, so a consumer that trusts the exit code (the U7
         # Swift UploadController reads ``terminationStatus`` alongside the stderr
         # event) agrees with the terminal event. A ``TerminalStageBusy`` skip is
-        # retryable, not a failure (n_busy), and keeps exit 0.
-        if n_failed:
+        # retryable, not a failure (n_busy), and keeps exit 0. A --dry-run is a
+        # read-only preview that touches nothing, so it never fails-exits (mirrors
+        # the ``total_count > 1 and not dry_run`` guard on the Done summary above).
+        if n_failed and not dry_run:
             sys.exit(1)
     except KeyboardInterrupt:
         # Reached two ways during the prep phase. On a SIGTERM (window-close

@@ -514,6 +514,11 @@ def _null_console() -> Any:
     return Console(quiet=True)
 
 
+def _append_warning(existing: str | None, fragment: str) -> str:
+    """Join a new warning fragment onto an existing one (`; `-separated), or return it alone."""
+    return f"{existing}; {fragment}" if existing else fragment
+
+
 def _masked_convergence_ok(recording_dir: Path) -> bool:
     """SCR-126 R8 gate for the convergence fast path.
 
@@ -952,7 +957,7 @@ def _route_cloud(
         )
     except Exception as exc:  # noqa: BLE001
         logger.error("terminal_stage: upload failed for %s: %s", name, exc)
-        result.upload_warning = f"upload failed: {exc}"
+        result.upload_warning = _append_warning(result.upload_warning, f"upload failed: {exc}")
         return result
 
     result.routed = True
@@ -969,11 +974,7 @@ def _route_cloud(
             f"{len(upload_result.failed)} file(s) failed to upload — "
             "sentinel withheld, local media preserved"
         )
-        result.upload_warning = (
-            f"{result.upload_warning}; {upload_failure_warning}"
-            if result.upload_warning
-            else upload_failure_warning
-        )
+        result.upload_warning = _append_warning(result.upload_warning, upload_failure_warning)
 
     # 3b. SCR-129: upload the per-chunk SOURCE media (video + audio). The
     # `<name>-scrubbed` copy uploaded above STRIPS all media
@@ -994,11 +995,7 @@ def _route_cloud(
         # Surface alongside (not instead of) any mask/scrub warning already set
         # — a media-upload failure for a non-mask-failed chunk must stay visible
         # (this bug is precisely "the cloud copy is incomplete and nobody is told").
-        result.upload_warning = (
-            f"{result.upload_warning}; {media_warning}"
-            if result.upload_warning
-            else media_warning
-        )
+        result.upload_warning = _append_warning(result.upload_warning, media_warning)
 
     # 4. Map upload onto the ledger per chunk (closed-set). A chunk is UPLOADED
     # only when its core files confirmed in GCS; otherwise it stays
