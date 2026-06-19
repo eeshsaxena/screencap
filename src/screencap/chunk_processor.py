@@ -1034,9 +1034,9 @@ class ChunkProcessor:
         merging, typing aggregation). A mouse.down at chunk end may stay
         unmerged — accepted limitation (orphan events at boundaries).
         """
+        from screencap.enforcement.window_filter import build_cloud_window_filter
         from screencap.export import export_chunk_events
         from screencap.exporter import build_export_metadata, write_events_jsonl
-        from screencap.enforcement.window_filter import build_cloud_window_filter
 
         jsonl_path = self._capture_dir / f"events_{idx:04d}.jsonl"
         if jsonl_path.exists():

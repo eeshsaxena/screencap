@@ -21,11 +21,10 @@ Classification priority (first match wins):
 from __future__ import annotations
 
 import logging
-import os
 import plistlib
 import re
 import subprocess
-from dataclasses import dataclass, field
+from dataclasses import dataclass
 from pathlib import Path
 
 from screencap.privacy.policy import ContextClass

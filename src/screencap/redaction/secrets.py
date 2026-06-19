@@ -2,8 +2,6 @@
 
 from __future__ import annotations
 
-import re
-
 from detect_secrets.plugins.aws import AWSKeyDetector
 from detect_secrets.plugins.basic_auth import BasicAuthDetector
 from detect_secrets.plugins.github_token import GitHubTokenDetector

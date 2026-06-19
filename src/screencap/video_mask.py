@@ -232,8 +232,8 @@ def _sensitive_windows_at(
     them to pixel rects against that frame's actual dimensions.
     """
     from screencap.privacy.actions import VIDEO_BLOCK_ACTIONS
-    from screencap.redaction.geometry import load_window_geometry
     from screencap.privacy.policy import FrameMetadata
+    from screencap.redaction.geometry import load_window_geometry
 
     snap = load_window_geometry(db_path, sample_ts)
     if snap is None or not snap.windows:

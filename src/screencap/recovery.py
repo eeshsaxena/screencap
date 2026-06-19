@@ -200,9 +200,9 @@ def _recover_chunk_metadata(
     # Generate missing per-chunk events via the shared export seam.
     if missing_events:
         with console.status("[dim]Exporting per-chunk events...[/dim]"):
+            from screencap.enforcement.window_filter import build_cloud_window_filter
             from screencap.export import export_chunk_events
             from screencap.exporter import build_export_metadata, write_events_jsonl
-            from screencap.enforcement.window_filter import build_cloud_window_filter
 
             # Resolve privacy_mode: prefer the locked-at-record-time value
             # in .recording_intent (matches what the live chunk processor

@@ -11,7 +11,6 @@ import unicodedata
 
 from screencap.redaction.engine import Detection, EntityType
 
-
 # Month patterns that NER models misclassify as PERSON
 _MONTH_PATTERNS = frozenset({
     "jan", "feb", "mar", "apr", "may", "jun",

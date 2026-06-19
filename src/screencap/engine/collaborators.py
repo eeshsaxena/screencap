@@ -119,8 +119,8 @@ class RecordingCollaborators:
           where the filter persists per-target action overrides.
         """
         from screencap.config import get_privacy_config
-        from screencap.privacy.policy import _MODE_STRICTNESS
         from screencap.enforcement.recorder_enforcement import RecorderPrivacyFilter
+        from screencap.privacy.policy import _MODE_STRICTNESS
 
         override_file = capture_dir / ".menubar_overrides.json"
         privacy_config = get_privacy_config()

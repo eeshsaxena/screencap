@@ -6,6 +6,7 @@ import re
 
 from screencap.redaction.engine import Detection, EntityType
 
+
 # Luhn checksum for credit card validation
 def _luhn_check(number: str) -> bool:
     """Validate a credit card number using the Luhn algorithm."""

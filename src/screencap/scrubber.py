@@ -3390,8 +3390,8 @@ def scrub_recording(
     # Privacy imports deferred here — not at module level — so that
     # screencap --help works without privacy deps installed.
     from screencap.privacy.classify import DefaultContextClassifier
-    from screencap.redaction import Anonymizer, create_default_pipeline
     from screencap.privacy.policy import DefaultPolicyEvaluator
+    from screencap.redaction import Anonymizer, create_default_pipeline
 
     src = resolve_recording_dir(name)
     if not src.exists():
