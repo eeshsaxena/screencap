@@ -8,6 +8,16 @@ ScreenCap is a macOS CLI for screen recording. The recording engine lives at `sr
 
 A native SwiftUI app shell lives at `macos/` and wraps the bundled CLI; see "macOS SwiftUI app shell" below for details.
 
+### Privacy subsystem packages (SCR-33)
+
+The privacy code is split into three sibling packages forming a one-way dependency DAG (`privacy` is the leaf; both halves depend on it; neither depends on the other):
+
+- **`src/screencap/privacy/`** — the **shared privacy-model core** (leaf): the action vocabulary (`actions.py` — `PrivacyAction`, action-sets), the context×mode policy matrix (`policy.py`), the context classifier + bundle/domain maps (`classify.py`), audit records (`reasons.py` — `AuditEntry`/`ReasonCode`), the domain index loader + its bundled `data/ut1` blocklists (`domain_loader.py` + `data/`), and the pixel/region masking primitives shared by both halves (`mask_primitives.py`). Its `__init__` deliberately re-exports nothing, so importing a small shared symbol never pulls in heavier modules.
+- **`src/screencap/enforcement/`** — **capture-time enforcement** (runs on every window event during recording): `recorder_enforcement.py` (`RecorderPrivacyFilter`), `window_filter.py` (the cloud/local window-title filters; the call-graph guard `tests/test_privacy_filter_call_graph.py` pins `build_privacy_filter`'s home here), `persistence.py`, `disable_log.py`, and `scrub_worker.py` (a capture-time row-deletion sidecar — *not* a text scrubber). Carries no NLP/ML import surface.
+- **`src/screencap/redaction/`** — **post-hoc detection + redaction** (runs during scrubbing): the standalone string-detection/anonymization engine (`engine.py` + `pii`/`regex`/`secrets`/`resolver`/`filters`/`entity_mapping` backends), Apple Vision OCR (`ocr.py`), policy-driven image-mask orchestration (`masking.py`), and the scrub-time DB-geometry readers (`geometry.py`). Invoked through the narrow `create_default_pipeline` / `Anonymizer` / `normalize_text` seam.
+
+`tests/test_package_boundary_call_graph.py` and `tests/redaction/test_import_lightness.py` are the durable guards for this DAG and for the shared core staying light.
+
 ### Daemon architecture (Phase 2)
 
 The recording engine is supervised by a background daemon. CLI live-state commands (`screencap start` / `stop` / `status`) are thin HTTP clients of the daemon's `/v0/*` API over a UNIX socket at `~/.screencap/run/api.sock`. The daemon itself runs via `screencap serve` and is normally managed by a LaunchAgent installed by `screencap setup`.

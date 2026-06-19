@@ -54,6 +54,31 @@ def test_importing_privacy_actions_does_not_import_engine() -> None:
     assert "ok" in result.stdout
 
 
+def test_importing_privacy_pulls_no_ml_dependencies() -> None:
+    """Frozen import budget: the shared core stays free of the NLP/ML stack.
+
+    The cross-package edge guard (``tests/test_package_boundary_call_graph.py``)
+    catches a *new edge* (privacy importing redaction), but not a heavy symbol
+    re-fattening the core *in place* (e.g. someone adding a ``torch`` import
+    straight into ``screencap.privacy``). This budget assertion is the durable
+    defense against that regression — the original wart was exactly the core
+    being heavy to import.
+    """
+    result = _run(
+        "import sys\n"
+        "import screencap.privacy\n"
+        "import screencap.privacy.classify\n"
+        "import screencap.privacy.mask_primitives\n"
+        "heavy = [m for m in sys.modules if m.split('.')[0] in "
+        "{'torch', 'transformers', 'presidio_analyzer', 'gliner', 'detect_secrets'}]\n"
+        "assert not heavy, heavy\n"
+        "assert 'screencap.redaction.engine' not in sys.modules\n"
+        "print('ok')\n"
+    )
+    assert result.returncode == 0, result.stderr
+    assert "ok" in result.stdout
+
+
 def test_redaction_engine_class_identity() -> None:
     """``AllDetectorsFailedError`` is one object across its real homes.
 
