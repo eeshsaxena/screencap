@@ -1062,9 +1062,37 @@ def test_upload_routes_through_terminal_stage(tmp_path):
     assert "Uploaded rec-a" in result.output
 
 
-def test_upload_promotion_refused_is_nonfatal(tmp_path):
-    """AE8: a recording with holes → PromotionRefused surfaced as an error, the
-    batch is non-fatal (exit 0 for a single rec is acceptable), nothing uploaded."""
+def test_upload_exits_nonzero_when_recording_fails(tmp_path):
+    """SCR-79: a recording the terminal stage reports as failed (``upload_warning``
+    / ``failed_indices`` — the per-file ``upload_failed`` path) makes ``screencap
+    upload`` exit non-zero, so a consumer that trusts the exit code (the U7 Swift
+    UploadController reads ``terminationStatus`` alongside the stderr event) agrees
+    with the terminal event instead of reading a per-file failure as success."""
+    rec_dir = _make_upload_recording(tmp_path, "rec-fail")
+    runner = CliRunner()
+    fake = mock.MagicMock(return_value=_terminal_result(
+        sentinel_uploaded=False,
+        failed_indices=[0],
+        upload_warning=(
+            "1 file(s) failed to upload — sentinel withheld, local media preserved"
+        ),
+    ))
+
+    with (
+        mock.patch("screencap.upload.resolve_recording_dirs", return_value=[rec_dir]),
+        mock.patch("screencap.terminal_stage.run_terminal_stage", fake),
+    ):
+        result = runner.invoke(cli, ["upload", "rec-fail"])
+
+    assert result.exit_code == 1
+    # The failure is reported, never a misleading success line.
+    assert "Uploaded rec-fail" not in result.output
+
+
+def test_upload_promotion_refused_exits_nonzero(tmp_path):
+    """AE8 + SCR-79: a recording with holes → PromotionRefused is non-fatal to the
+    BATCH (it continues to the next recording, no traceback), but a refused upload
+    is still a failure, so the command exits non-zero."""
     rec_dir = _make_upload_recording(tmp_path, "rec-holes")
     runner = CliRunner()
     from screencap.terminal_stage import PromotionRefused
@@ -1078,8 +1106,10 @@ def test_upload_promotion_refused_is_nonfatal(tmp_path):
     ):
         result = runner.invoke(cli, ["upload", "rec-holes"])
 
+    assert result.exit_code == 1
     assert "missing locally" in result.output
     assert "skipped" in result.output.lower()
+    assert "Traceback" not in result.output
 
 
 def test_upload_dry_run_passes_dry_run(tmp_path):

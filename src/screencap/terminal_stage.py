@@ -957,6 +957,23 @@ def _route_cloud(
 
     result.routed = True
     uploaded_ok = not upload_result.failed
+    if not uploaded_ok:
+        # SCR-79: a per-file upload failure (a file's PUT failed after retries —
+        # ``upload_recording`` emits the terminal ``upload_failed`` event and
+        # returns ``result.failed`` non-empty WITHOUT raising) must be surfaced
+        # like every OTHER failure mode in this function. Without it the CLI sees
+        # a clean result, prints "Uploaded", and exits 0 despite the event. The
+        # sentinel is still withheld below (the finalize gate stays unsatisfied)
+        # and local media is preserved for a resumable retry.
+        upload_failure_warning = (
+            f"{len(upload_result.failed)} file(s) failed to upload — "
+            "sentinel withheld, local media preserved"
+        )
+        result.upload_warning = (
+            f"{result.upload_warning}; {upload_failure_warning}"
+            if result.upload_warning
+            else upload_failure_warning
+        )
 
     # 3b. SCR-129: upload the per-chunk SOURCE media (video + audio). The
     # `<name>-scrubbed` copy uploaded above STRIPS all media

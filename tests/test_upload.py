@@ -896,8 +896,12 @@ def test_upload_command_multiple_recordings(tmp_path):
         mock.patch("screencap.upload.requests.put", return_value=mock_put_resp),
     ):
         result = runner.invoke(cli, ["upload", "rec1", "rec2"])
-    assert result.exit_code == 0
+    # Both minimal fixtures (no recording.db) fail cloud-copy production, so the
+    # batch iterates both, prints the "Done." summary, and exits non-zero — the
+    # SCR-79 contract (a failed upload must not exit 0).
+    assert result.exit_code == 1
     assert "Done." in result.output
+    assert "2 failed" in result.output
 
 
 # ---------------------------------------------------------------------------
@@ -1362,7 +1366,10 @@ def test_upload_cli_jobs_flag_accepted(tmp_path):
         mock.patch("screencap.upload.requests.put", return_value=mock_put_resp),
     ):
         result = runner.invoke(cli, ["upload", "my-rec", "--jobs", "2"])
-    assert result.exit_code == 0
+    # --jobs is accepted (no Click usage error); the minimal fixture then fails
+    # production, which SCR-79 surfaces as exit 1 (not the usage-error exit 2).
+    assert "No such option" not in result.output
+    assert result.exit_code == 1
 
 
 @pytest.mark.parametrize("bad_value", ["0", "-1", "abc"])
@@ -1397,7 +1404,10 @@ def test_upload_cli_short_flag(tmp_path):
         mock.patch("screencap.upload.requests.put", return_value=mock_put_resp),
     ):
         result = runner.invoke(cli, ["upload", "my-rec", "-j", "1"])
-    assert result.exit_code == 0
+    # -j is accepted (no Click usage error); the minimal fixture then fails
+    # production, which SCR-79 surfaces as exit 1 (not the usage-error exit 2).
+    assert "No such option" not in result.output
+    assert result.exit_code == 1
 
 
 # ---------------------------------------------------------------------------

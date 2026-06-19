@@ -2480,6 +2480,10 @@ def upload(names, all_recordings, dry_run, force, jobs, no_delete):
     total_count = len(dirs)
     n_ok = 0
     n_failed = 0
+    # A recording whose finalize lock is held by another process is NOT a failure
+    # (it's being uploaded elsewhere / is retryable) — tracked apart from n_failed
+    # so it never flips the exit code (SCR-79).
+    n_busy = 0
     try:
         try:
             _previous_sigterm = _signal.signal(
@@ -2517,7 +2521,7 @@ def upload(names, all_recordings, dry_run, force, jobs, no_delete):
                     "recording is finalizing, or another upload / daemon resume holds "
                     "the lock. Try again shortly."
                 )
-                n_failed += 1
+                n_busy += 1
                 continue
             except FileNotFoundError as e:
                 console.print(f"[red]Error:[/red] {e}")
@@ -2554,7 +2558,20 @@ def upload(names, all_recordings, dry_run, force, jobs, no_delete):
             )
 
         if total_count > 1 and not dry_run:
-            console.print(f"\n[bold]Done.[/bold] {n_ok} uploaded, {n_failed} failed")
+            busy_note = f", {n_busy} in progress" if n_busy else ""
+            console.print(
+                f"\n[bold]Done.[/bold] {n_ok} uploaded, {n_failed} failed{busy_note}"
+            )
+
+        # SCR-79: pin the exit-code contract. Any recording that failed to upload —
+        # a per-file upload failure (which emits the terminal ``upload_failed``
+        # event), a refused promotion (holes), or a missing recording — makes the
+        # command exit non-zero, so a consumer that trusts the exit code (the U7
+        # Swift UploadController reads ``terminationStatus`` alongside the stderr
+        # event) agrees with the terminal event. A ``TerminalStageBusy`` skip is
+        # retryable, not a failure (n_busy), and keeps exit 0.
+        if n_failed:
+            sys.exit(1)
     except KeyboardInterrupt:
         # Reached two ways during the prep phase. On a SIGTERM (window-close
         # cancel) our handler ran first, so it already emitted the terminal
