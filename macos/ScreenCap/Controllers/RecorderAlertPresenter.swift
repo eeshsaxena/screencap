@@ -12,8 +12,11 @@ protocol RecorderAlertPresenter {
     /// orchestrator maps this into the stop policy + countdown.
     func confirmStopAndQuit() -> NSApplication.TerminateReply
 
-    /// Shows the "Permission revoked" alert. Invokes `openSettings` when the
-    /// user clicks **Open System Settings**.
+    /// Shows the "Recording stopped" permission-lost alert. The copy is
+    /// intentionally neutral on cause (SCR-87): the same modal fires for a true
+    /// mid-recording TCC revocation and for a fresh dev-build whose code-signing
+    /// identity TCC has never granted. Invokes `openSettings` when the user
+    /// clicks **Open System Settings**.
     func presentPermissionLost(permission: String, openSettings: @MainActor () -> Void)
 
     /// Shows the "permission required *before* recording" alert (U4/U6). Distinct

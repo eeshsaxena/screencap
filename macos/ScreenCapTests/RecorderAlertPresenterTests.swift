@@ -42,17 +42,29 @@ final class RecorderAlertPresenterTests: XCTestCase {
     /// edit; the `disabled` check encodes the specific SCR-87 invariant so even
     /// a future reword can't reintroduce the misleading framing.
     func testPermissionLostCopyIsNeutralOnCause() {
-        let body = LiveRecorderAlertPresenter.permissionLostBody(permission: "screen_recording")
+        // Pass the user-facing display name — the form `handlePermissionLost`
+        // now resolves the raw daemon token to before presenting (SCR-87).
+        let body = LiveRecorderAlertPresenter.permissionLostBody(permission: "Screen Recording")
 
         XCTAssertEqual(LiveRecorderAlertPresenter.permissionLostTitle, "Recording stopped")
         XCTAssertEqual(
             body,
-            "ScreenCap doesn't have permission to screen_recording. "
+            "ScreenCap doesn't have permission to Screen Recording. "
                 + "Enable it in System Settings, then start a new recording."
         )
+        // The "disabled"/"revoked" invariants apply to BOTH title and body so a
+        // future edit can't reintroduce the misleading framing in either string.
         XCTAssertFalse(
             body.lowercased().contains("disabled"),
             "Permission-lost copy must not assert the user disabled anything (SCR-87)."
+        )
+        XCTAssertFalse(
+            LiveRecorderAlertPresenter.permissionLostTitle.lowercased().contains("disabled"),
+            "Permission-lost title must not assert the user disabled anything (SCR-87)."
+        )
+        XCTAssertFalse(
+            body.lowercased().contains("revoked"),
+            "Permission-lost copy must not assert a revocation that did not happen (SCR-87)."
         )
         XCTAssertFalse(
             LiveRecorderAlertPresenter.permissionLostTitle.lowercased().contains("revoked"),

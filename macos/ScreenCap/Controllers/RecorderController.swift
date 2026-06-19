@@ -655,7 +655,12 @@ final class RecorderController: ObservableObject {
     }
 
     private func handlePermissionLost(permission: String?) {
-        let perm = permission ?? "a required permission"
+        // Resolve the raw daemon token (e.g. "screen_recording") to its
+        // user-facing display name ("Screen Recording") before it reaches the
+        // modal/status copy. Keep the nil fallback so the unknown-permission
+        // case doesn't falsely name a specific permission (SCR-87).
+        let pane = permission.map { PrivacyPane.from(permissionString: $0) }
+        let perm = pane?.displayName ?? "a required permission"
         lastError = "Recording stopped: \(perm) was revoked."
 
         // Initiate the stop BEFORE blocking on the modal, so the engine
@@ -668,7 +673,7 @@ final class RecorderController: ObservableObject {
         }
 
         alertPresenter.presentPermissionLost(permission: perm) { [weak self] in
-            self?.permissions?.openSystemSettings(for: PrivacyPane.from(permissionString: perm))
+            self?.permissions?.openSystemSettings(for: pane ?? .screenRecording)
         }
     }
 
