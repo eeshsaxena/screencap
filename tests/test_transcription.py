@@ -31,9 +31,10 @@ def test_detect_cached_models_ranks_best_first_and_filters_unknown(tmp_path, mon
     _make_faster_whisper_model(hf_cache, "base")  # faster-whisper backend
     _make_faster_whisper_model(hf_cache, "gigantic")  # not a known model → ignored
     _make_whisper_pt(xdg_cache, "small")  # openai-whisper backend
+    _make_whisper_pt(xdg_cache, "tiny.en")  # locale-suffixed filename → stem parsed to "tiny"
 
     # Rank order is large > medium > small > base > tiny.
-    assert transcription._detect_cached_models() == ["small", "base"]
+    assert transcription._detect_cached_models() == ["small", "base", "tiny"]
 
 
 def test_detect_cached_models_empty_when_no_cache(tmp_path, monkeypatch):

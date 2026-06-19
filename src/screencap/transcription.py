@@ -11,9 +11,13 @@ from __future__ import annotations
 
 import json
 import sys
+from typing import TYPE_CHECKING
 
 import click
 from rich.console import Console
+
+if TYPE_CHECKING:
+    from pathlib import Path
 
 console = Console()
 
@@ -165,7 +169,12 @@ def _select_local_model(model: str | None = None) -> tuple[str, str]:
     return "local", model_name
 
 
-def _transcribe_api_inline(api_key, audio_path, transcript_path, transcript_json_path):
+def _transcribe_api_inline(
+    api_key: str,
+    audio_path: Path,
+    transcript_path: Path,
+    transcript_json_path: Path,
+) -> None:
     """Transcribe using OpenAI Whisper API with an explicit api_key.
 
     Avoids delegating to screencap.engine (whose pydantic-settings singleton
@@ -201,7 +210,12 @@ def _transcribe_api_inline(api_key, audio_path, transcript_path, transcript_json
     )
 
 
-def _run_api_transcription(api_key, audio_path, transcript_path, transcript_json_path):
+def _run_api_transcription(
+    api_key: str,
+    audio_path: Path,
+    transcript_path: Path,
+    transcript_json_path: Path,
+) -> None:
     """Try API transcription, retry with new key on auth failure, or fall back to local."""
     while True:
         try:
