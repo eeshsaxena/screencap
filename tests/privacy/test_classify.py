@@ -1,7 +1,7 @@
 """Tests for the shared context classifier (SCR-33 U4).
 
-The pure, DB-free classifier slice split out of the old
-``screencap.privacy.context`` module now lives in
+The pure, DB-free classifier slice split out of the original privacy
+``context`` module now lives in
 ``screencap.privacy.classify``. These assertions are the classifier half of
 the former ``tests/privacy/test_context.py`` characterization baseline.
 """

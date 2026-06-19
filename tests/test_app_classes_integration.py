@@ -8,7 +8,7 @@ from __future__ import annotations
 
 import pytest
 
-from screencap.privacy.context import DefaultContextClassifier
+from screencap.privacy.classify import DefaultContextClassifier
 from screencap.privacy.policy import (
     ContextClass,
     InvalidPrivacyConfigError,

@@ -2,7 +2,7 @@
 
 Bridges screenshots to app/window context via timestamp correlation, reading
 the local-only ``recording.db``. This is the DB-dependent, scrub-only slice
-split out of the old ``screencap.privacy.context`` module; it carries the
+split out of the original privacy ``context`` module; it carries the
 ``screencap.recording_db`` dependency and therefore lives in
 ``screencap.redaction`` (never imported by the capture path).
 

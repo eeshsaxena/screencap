@@ -92,7 +92,7 @@ def _report_unclassified_apps(capture_dir) -> None:
     """Report apps seen during recording that are not in privacy config."""
     from screencap.catalog import get_seen_bundle_ids
     from screencap.config import get_privacy_config
-    from screencap.privacy.context import BUNDLE_ID_MAP
+    from screencap.privacy.classify import BUNDLE_ID_MAP
 
     seen_bids = get_seen_bundle_ids([capture_dir])
     if not seen_bids:
@@ -354,7 +354,7 @@ from screencap._stderr_events import (  # noqa: E402
 
 def _maybe_download_nlp_models() -> None:
     """Prompt to download GLiNER + spaCy models if not already cached."""
-    from screencap.privacy import are_nlp_models_cached
+    from screencap.redaction import are_nlp_models_cached
 
     if are_nlp_models_cached():
         return  # fully cached
@@ -791,7 +791,7 @@ def start(
 
     # --- Cloud NLP model gate ---
     if is_cloud:
-        from screencap.privacy import are_nlp_models_cached
+        from screencap.redaction import are_nlp_models_cached
         if not are_nlp_models_cached():
             if not _stdin_is_tty():
                 console.print(
@@ -1597,7 +1597,7 @@ def _build_export_privacy_filter(recording_dir):
     """
     from pathlib import Path as _Path
 
-    from screencap.privacy.filter import build_local_window_filter
+    from screencap.enforcement.window_filter import build_local_window_filter
 
     err_console = Console(stderr=True)
     mode = None
@@ -2135,7 +2135,7 @@ def status(as_json, no_nlp_check):
 
     if not no_nlp_check:
         try:
-            from screencap.privacy import are_nlp_models_cached
+            from screencap.redaction import are_nlp_models_cached
             payload["nlp_models_cached"] = bool(are_nlp_models_cached())
         except Exception:
             pass
@@ -3238,7 +3238,7 @@ def _settings_privacy_apply(
     # sensitive class (e.g., `app_classes set com.example.foo=password_manager`)
     # cannot be allow-listed in a follow-up call.
     if is_list and field == "allow_apps" and op == "add":
-        from screencap.privacy.context import BROWSER_BUNDLE_IDS, BUNDLE_ID_MAP
+        from screencap.privacy.classify import BROWSER_BUNDLE_IDS, BUNDLE_ID_MAP
         from screencap.privacy.policy import ContextClass
         configured_mode = str(privacy_tbl.get("mode") or "internal")
 
@@ -3339,7 +3339,7 @@ def _settings_privacy_apply(
             # PASSWORD_MANAGER → BUNDLE_ID_MAP fallback or UNKNOWN).
             if existing_override:
                 from screencap.privacy.actions import _ACTION_SEVERITY
-                from screencap.privacy.context import BUNDLE_ID_MAP as _BUNDLE_MAP
+                from screencap.privacy.classify import BUNDLE_ID_MAP as _BUNDLE_MAP
                 from screencap.privacy.policy import (
                     ContextClass,
                     PrivacyMode,
@@ -3389,7 +3389,7 @@ def _settings_privacy_apply(
             # Validate CLASS against ContextClass enum so we don't silently
             # corrupt config with a typo that crashes the next start
             # (todo 010). Accept upper/lower case input; normalize to value.
-            from screencap.privacy.context import BUNDLE_ID_MAP
+            from screencap.privacy.classify import BUNDLE_ID_MAP
             from screencap.privacy.policy import ContextClass
             valid_classes = {c.value for c in ContextClass}
             normalized = ctx_str.lower()
@@ -3541,7 +3541,7 @@ def _check_detect_secrets_plugins() -> tuple[str, bool, str]:
     import traceback as _tb
     name = "detect_secrets_plugins"
     try:
-        from screencap.privacy.secrets import DetectSecretsDetector
+        from screencap.redaction.secrets import DetectSecretsDetector
         DetectSecretsDetector()
         return name, True, ""
     except Exception:
@@ -3664,7 +3664,7 @@ def _check_domain_index() -> tuple[str, bool, str]:
     import traceback as _tb
     name = "domain_index"
     try:
-        from screencap.privacy.context import DefaultContextClassifier
+        from screencap.privacy.classify import DefaultContextClassifier
         DefaultContextClassifier()
         return name, True, ""
     except Exception:

@@ -26,7 +26,7 @@ pytestmark = pytest.mark.privacy
 @pytest.fixture(scope="module")
 def pipeline_and_anonymizer():
     """Real detection pipeline + anonymizer (shared across module for speed)."""
-    from screencap.privacy import Anonymizer, create_default_pipeline
+    from screencap.redaction import Anonymizer, create_default_pipeline
 
     return create_default_pipeline(), Anonymizer()
 
@@ -220,7 +220,7 @@ def _make_recording_with_blocked_interval(
 
 def test_run_nulls_action_rows_inside_blocked_interval(tmp_path, pipeline_and_anonymizer):
     """Scrubber.run() nulls action_event content inside an excluded-app interval."""
-    from screencap.privacy.context import DefaultContextClassifier
+    from screencap.privacy.classify import DefaultContextClassifier
     from screencap.privacy.policy import DefaultPolicyEvaluator, parse_privacy_config
 
     pipeline, anonymizer = pipeline_and_anonymizer
@@ -263,7 +263,7 @@ def test_run_writes_audit_log_when_blocked_intervals_present(
     tmp_path, pipeline_and_anonymizer,
 ):
     """privacy_audit.json is written when blocked-interval audit entries exist."""
-    from screencap.privacy.context import DefaultContextClassifier
+    from screencap.privacy.classify import DefaultContextClassifier
     from screencap.privacy.policy import DefaultPolicyEvaluator, parse_privacy_config
 
     pipeline, anonymizer = pipeline_and_anonymizer
@@ -369,7 +369,7 @@ def test_run_chunk_scrubs_transcripts_and_v1_manifest(tmp_path, pipeline_and_ano
 
 def test_run_chunk_deletes_excluded_app_screenshots(tmp_path, pipeline_and_anonymizer):
     """run_chunk() removes screenshots taken while an excluded app is frontmost."""
-    from screencap.privacy.context import DefaultContextClassifier
+    from screencap.privacy.classify import DefaultContextClassifier
     from screencap.privacy.policy import DefaultPolicyEvaluator, parse_privacy_config
 
     pipeline, anonymizer = pipeline_and_anonymizer
@@ -418,7 +418,7 @@ def test_run_chunk_surfaces_blocked_intervals_on_result(tmp_path, pipeline_and_a
     reads to skip EXCLUDE / secure-field frames. The redaction path must never
     branch on it (R5). Mirrors run()'s existing behavior.
     """
-    from screencap.privacy.context import DefaultContextClassifier
+    from screencap.privacy.classify import DefaultContextClassifier
     from screencap.privacy.policy import (
         DefaultPolicyEvaluator,
         PrivacyAction,
@@ -543,7 +543,7 @@ def test_run_drops_mouse_move_inside_excluded_app_interval(
     password-manager (or code editor / admin console / unverified
     browser) leaks to GCS even when content is otherwise scrubbed.
     """
-    from screencap.privacy.context import DefaultContextClassifier
+    from screencap.privacy.classify import DefaultContextClassifier
     from screencap.privacy.policy import DefaultPolicyEvaluator, parse_privacy_config
 
     pipeline, anonymizer = pipeline_and_anonymizer
@@ -661,7 +661,7 @@ def test_run_threads_blocked_intervals_onto_result_and_audit(
 ):
     """A blocked-app interval surfaces on ``result.blocked_intervals`` and in
     ``privacy_audit.json`` with start/end/reason (R13 evidence)."""
-    from screencap.privacy.context import DefaultContextClassifier
+    from screencap.privacy.classify import DefaultContextClassifier
     from screencap.privacy.policy import DefaultPolicyEvaluator, parse_privacy_config
 
     pipeline, anonymizer = pipeline_and_anonymizer
@@ -782,7 +782,7 @@ def test_run_records_fail_closed_when_detectors_fail(tmp_path):
 
     The raw value never appears in the result or the audit JSON.
     """
-    from screencap.privacy import AllDetectorsFailedError
+    from screencap.redaction import AllDetectorsFailedError
     from screencap.scrubber import SCRUB_FAILED_SENTINEL, Scrubber
 
     rec = tmp_path / "rec"

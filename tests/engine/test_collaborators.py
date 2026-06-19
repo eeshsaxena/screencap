@@ -591,7 +591,7 @@ def test_scrub_worker_failure_hard_errors_for_cloud_intent(tmp_path):
 
     with (
         mock.patch(
-            "screencap.privacy.scrub_worker.ScrubWorker",
+            "screencap.enforcement.scrub_worker.ScrubWorker",
             side_effect=RuntimeError("scrub init failed"),
         ),
         pytest.raises(SystemExit) as exc_info,
@@ -641,7 +641,7 @@ def test_scrub_worker_failure_tears_down_chunk_processor(tmp_path):
 
     with (
         mock.patch(
-            "screencap.privacy.scrub_worker.ScrubWorker",
+            "screencap.enforcement.scrub_worker.ScrubWorker",
             side_effect=RuntimeError("scrub init failed"),
         ),
         pytest.raises(SystemExit),
@@ -682,7 +682,7 @@ def test_scrub_worker_failure_warns_for_local_recording(tmp_path):
     fake_console = mock.MagicMock()
 
     with mock.patch(
-        "screencap.privacy.scrub_worker.ScrubWorker",
+        "screencap.enforcement.scrub_worker.ScrubWorker",
         side_effect=RuntimeError("scrub init failed"),
     ):
         helper.start(

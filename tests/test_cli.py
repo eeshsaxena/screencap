@@ -1255,7 +1255,7 @@ def test_cloud_start_nlp_model_gate(tmp_path):
     with (
         no_setup, tty,
         mock.patch("screencap.recorder.start_recording", return_value=(fake_dir, 42.0, None, None)) as mock_rec,
-        mock.patch("screencap.privacy.are_nlp_models_cached", return_value=True),
+        mock.patch("screencap.redaction.engine.are_nlp_models_cached", return_value=True),
     ):
         result = _invoke(["--cloud"])
         assert result.exit_code == 0, result.output
@@ -1275,7 +1275,7 @@ def test_cloud_start_nlp_model_gate(tmp_path):
         mock.patch("screencap.cli._maybe_prompt_privacy_setup"),
         mock.patch("screencap.cli._stdin_is_tty", return_value=True),
         mock.patch("screencap.recorder.start_recording", return_value=(fake_dir, 42.0, None, None)) as mock_rec,
-        mock.patch("screencap.privacy.are_nlp_models_cached", side_effect=cached_after_download),
+        mock.patch("screencap.redaction.engine.are_nlp_models_cached", side_effect=cached_after_download),
         mock.patch("screencap.cli._download_nlp_models"),
     ):
         call_count = 0
@@ -1289,7 +1289,7 @@ def test_cloud_start_nlp_model_gate(tmp_path):
         mock.patch("screencap.cli._maybe_prompt_privacy_setup"),
         mock.patch("screencap.cli._stdin_is_tty", return_value=True),
         mock.patch("screencap.recorder.start_recording", return_value=(fake_dir, 42.0, None, None)) as mock_rec,
-        mock.patch("screencap.privacy.are_nlp_models_cached", return_value=False),
+        mock.patch("screencap.redaction.engine.are_nlp_models_cached", return_value=False),
         mock.patch("screencap.cli._download_nlp_models", side_effect=RuntimeError("network")),
     ):
         result = _invoke(["--cloud"], input="y\ny\n")
@@ -1303,7 +1303,7 @@ def test_cloud_start_nlp_model_gate(tmp_path):
         mock.patch("screencap.cli._maybe_prompt_privacy_setup"),
         mock.patch("screencap.cli._stdin_is_tty", return_value=True),
         mock.patch("screencap.recorder.start_recording", return_value=(fake_dir, 42.0, None, None)) as mock_rec,
-        mock.patch("screencap.privacy.are_nlp_models_cached", return_value=False),
+        mock.patch("screencap.redaction.engine.are_nlp_models_cached", return_value=False),
     ):
         result = _invoke(["--cloud"], input="n\nn\n")
         assert result.exit_code != 0
@@ -1314,7 +1314,7 @@ def test_cloud_start_nlp_model_gate(tmp_path):
         mock.patch("screencap.cli._maybe_prompt_privacy_setup"),
         mock.patch("screencap.cli._stdin_is_tty", return_value=False),
         mock.patch("screencap.recorder.start_recording", return_value=(fake_dir, 42.0, None, None)) as mock_rec,
-        mock.patch("screencap.privacy.are_nlp_models_cached", return_value=False),
+        mock.patch("screencap.redaction.engine.are_nlp_models_cached", return_value=False),
     ):
         result = _invoke(["--cloud"])
         assert result.exit_code != 0
@@ -1326,7 +1326,7 @@ def test_cloud_start_nlp_model_gate(tmp_path):
         mock.patch("screencap.cli._maybe_prompt_privacy_setup"),
         mock.patch("screencap.cli._stdin_is_tty", return_value=True),
         mock.patch("screencap.recorder.start_recording", return_value=(fake_dir, 42.0, None, None)) as mock_rec,
-        mock.patch("screencap.privacy.are_nlp_models_cached") as mock_cached,
+        mock.patch("screencap.redaction.engine.are_nlp_models_cached") as mock_cached,
     ):
         result = _invoke(["--local"])
         assert result.exit_code == 0, result.output
@@ -1652,7 +1652,7 @@ def test_start_intent_flag_resolves_to_recorder_kwargs(
     fake_dir.mkdir()
     with (
         _safe_start_prompts(),
-        mock.patch("screencap.privacy.are_nlp_models_cached", return_value=True),
+        mock.patch("screencap.redaction.engine.are_nlp_models_cached", return_value=True),
         mock.patch(
             "screencap.recorder.start_recording",
             return_value=(fake_dir, 42.0, None, None),

@@ -197,7 +197,7 @@ def test_no_nlp_check_skips_probe(monkeypatch):
 
     _patch_client(monkeypatch, handler)
     runner = CliRunner()
-    with mock.patch("screencap.privacy.are_nlp_models_cached") as m:
+    with mock.patch("screencap.redaction.engine.are_nlp_models_cached") as m:
         result = runner.invoke(
             cli, ["status", "--json", "--no-nlp-check"], catch_exceptions=False
         )

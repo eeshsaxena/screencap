@@ -11,7 +11,7 @@ from __future__ import annotations
 import pytest
 
 from screencap.privacy.actions import PrivacyAction
-from screencap.privacy.context import (
+from screencap.privacy.classify import (
     BUNDLE_ID_MAP,
     DefaultContextClassifier,
 )

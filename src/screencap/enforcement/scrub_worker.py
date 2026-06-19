@@ -50,7 +50,7 @@ from typing import Any
 
 from screencap._flush import wait_for_writer_flush
 from screencap.enforcement.disable_log import DisableLogWriter
-from screencap.privacy.context import domain_from_url
+from screencap.privacy.classify import domain_from_url
 from screencap.privacy.domain_loader import extract_root_domain
 
 logger = logging.getLogger(__name__)

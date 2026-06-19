@@ -16,10 +16,8 @@ from pathlib import Path
 import pytest
 
 from screencap.privacy.actions import PrivacyAction
-from screencap.privacy.context import (
-    DefaultContextClassifier,
-    load_window_geometry,
-)
+from screencap.privacy.classify import DefaultContextClassifier
+from screencap.redaction.geometry import load_window_geometry
 from screencap.privacy.mask_primitives import (
     MaskRegion,
     window_regions_from_geometry,
@@ -34,7 +32,7 @@ from screencap.privacy.policy import (
     PrivacyMode,
     parse_privacy_config,
 )
-from screencap.privacy.recorder_enforcement import (
+from screencap.enforcement.recorder_enforcement import (
     RecorderPrivacyFilter,
 )
 
@@ -396,7 +394,7 @@ class TestScrubberSelectiveMasking:
         """
         from PIL import Image
 
-        from screencap.privacy.context import WindowContext
+        from screencap.redaction.geometry import WindowContext
         from screencap.scrubber import ScrubContext, ScrubResult, mask_screenshots
 
         screenshots_dir = tmp_path / "screenshots"
@@ -445,7 +443,7 @@ class TestScrubberSelectiveMasking:
 
     def test_fallback_to_full_frame_without_geometry(self, tmp_path):
         """No geometry DB → MASK_WINDOW falls back to full-frame masking (not deletion)."""
-        from screencap.privacy.context import WindowContext
+        from screencap.redaction.geometry import WindowContext
         from screencap.scrubber import ScrubContext, ScrubResult, mask_screenshots
 
         screenshots_dir = tmp_path / "screenshots"
@@ -490,7 +488,7 @@ class TestBackgroundWindowMasking:
         Returns (screenshots_dir, ctx, db_path, result) so a caller can apply
         monkeypatches (e.g. faking the OCR stack) before running the scrub.
         """
-        from screencap.privacy.context import WindowContext
+        from screencap.redaction.geometry import WindowContext
         from screencap.scrubber import ScrubContext, ScrubResult
 
         screenshots_dir = tmp_path / "screenshots"
@@ -620,7 +618,7 @@ class TestBackgroundWindowMasking:
 
     def test_allow_foreground_no_geometry_unchanged(self, tmp_path):
         """ALLOW foreground + no geometry data: screenshot kept as-is (fail-open)."""
-        from screencap.privacy.context import WindowContext
+        from screencap.redaction.geometry import WindowContext
         from screencap.scrubber import ScrubContext, ScrubResult, mask_screenshots
 
         screenshots_dir = tmp_path / "screenshots"
@@ -725,9 +723,9 @@ class TestBackgroundWindowMasking:
             ocr_called["count"] += 1
             return []
 
-        monkeypatch.setattr("screencap.privacy.ocr.VisionOcr", _FakeVisionOcr)
+        monkeypatch.setattr("screencap.redaction.ocr.VisionOcr", _FakeVisionOcr)
         monkeypatch.setattr(
-            "screencap.privacy.create_default_pipeline", lambda: object()
+            "screencap.redaction.engine.create_default_pipeline", lambda: object()
         )
         monkeypatch.setattr(
             "screencap.scrubber.ocr_mask_screenshot", _fake_ocr_mask_screenshot

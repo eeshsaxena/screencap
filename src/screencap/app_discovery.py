@@ -234,7 +234,7 @@ def auto_classify_detailed(metadata: AppMetadata) -> ClassificationResult:
     7. LSApplicationCategoryType
     8. UNKNOWN
     """
-    from screencap.privacy.context import BROWSER_BUNDLE_IDS, BUNDLE_ID_MAP
+    from screencap.privacy.classify import BROWSER_BUNDLE_IDS, BUNDLE_ID_MAP
 
     bid = metadata.bundle_id
 

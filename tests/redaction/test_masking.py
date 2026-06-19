@@ -18,7 +18,8 @@ import pytest
 from tests._image_helpers import _avg_brightness
 
 from screencap.privacy.actions import PrivacyAction
-from screencap.privacy.context import DefaultContextClassifier, WindowContext
+from screencap.privacy.classify import DefaultContextClassifier
+from screencap.redaction.geometry import WindowContext
 from screencap.privacy.mask_primitives import (
     MaskRegion,
     _apply_mask_to_image,

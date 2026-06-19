@@ -47,7 +47,7 @@ def build_privacy_filter(
         (possibly with masked title), or None to suppress it.
     """
     from screencap.privacy.actions import PrivacyAction
-    from screencap.privacy.context import DefaultContextClassifier
+    from screencap.privacy.classify import DefaultContextClassifier
     from screencap.privacy.policy import (
         DefaultPolicyEvaluator,
         PrivacyMode,
@@ -203,7 +203,7 @@ def build_local_window_filter(
     Local callers MUST go through this factory rather than calling
     ``build_privacy_filter`` directly with ``cloud_intent=False``. The AST
     CI guard at ``tests/test_privacy_filter_call_graph.py`` enforces this
-    boundary so ad-hoc filter construction outside ``screencap.privacy.filter``
+    boundary so ad-hoc filter construction outside ``screencap.enforcement.window_filter``
     cannot drift away from the documented contract.
 
     Symmetric with :func:`build_cloud_window_filter` — but always returns

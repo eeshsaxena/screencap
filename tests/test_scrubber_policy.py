@@ -18,10 +18,8 @@ from pathlib import Path
 import pytest
 
 from screencap.privacy.actions import PrivacyAction
-from screencap.privacy.context import (
-    DefaultContextClassifier,
-    WindowContext,
-)
+from screencap.privacy.classify import DefaultContextClassifier
+from screencap.redaction.geometry import WindowContext
 from screencap.privacy.policy import (
     DefaultPolicyEvaluator,
     PrivacyConfig,
@@ -175,7 +173,7 @@ class TestScreenshotRouting:
 
         # Patch VisionOcr to simulate missing Vision framework
         with patch(
-            "screencap.privacy.ocr.VisionOcr",
+            "screencap.redaction.ocr.VisionOcr",
             side_effect=ImportError("No module named 'Vision'"),
         ):
             self._mask(dst, _OcrFallbackEvaluator(), classifier, window_events, result)
@@ -352,7 +350,7 @@ class TestOcrFallbackIntegration:
         )
         # Patch VisionOcr constructor to raise ImportError — _ocr will be None
         with patch(
-            "screencap.privacy.ocr.VisionOcr",
+            "screencap.redaction.ocr.VisionOcr",
             side_effect=ImportError("No module named 'Vision'"),
         ):
             mask_screenshots(dst / "screenshots", ctx, result=result)
@@ -882,7 +880,7 @@ class TestSecureFieldIntervals:
 @pytest.fixture
 def pipeline_and_anonymizer():
     """Create a real detection pipeline and anonymizer."""
-    from screencap.privacy import Anonymizer, create_default_pipeline
+    from screencap.redaction import Anonymizer, create_default_pipeline
 
     pipeline = create_default_pipeline()
     anonymizer = Anonymizer()

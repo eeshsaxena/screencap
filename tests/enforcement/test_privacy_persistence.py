@@ -1,4 +1,4 @@
-"""Tests for screencap.privacy.persistence — cross-session disable persistence."""
+"""Tests for screencap.enforcement.persistence — cross-session disable persistence."""
 
 from __future__ import annotations
 

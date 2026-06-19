@@ -870,7 +870,7 @@ def test_stub_recording_not_called_when_uploads_disabled(recording_env):
         mock.patch("screencap.metrics.save_metrics"),
         # Privacy pipeline fails → uploads disabled
         mock.patch(
-            "screencap.privacy.create_default_pipeline",
+            "screencap.redaction.engine.create_default_pipeline",
             side_effect=ImportError("test: no privacy deps"),
         ),
         # Mock side effects inside ChunkProcessor
@@ -960,7 +960,7 @@ def test_upload_warning_surfaced_at_stop(recording_env):
         mock.patch("shutil.disk_usage", return_value=_PLENTY_OF_DISK),
         mock.patch("screencap.metrics.save_metrics"),
         mock.patch(
-            "screencap.privacy.create_default_pipeline",
+            "screencap.redaction.engine.create_default_pipeline",
             side_effect=ImportError("test: missing GLiNER models"),
         ),
         mock.patch("screencap.chunk_processor.ChunkProcessor._wait_for_audio", return_value=True),
@@ -1086,8 +1086,8 @@ def test_sentinel_not_uploaded_without_sentinel_for_cloud(recording_env, monkeyp
         # All chunks upload successfully
         mock.patch("screencap.chunk_processor.upload_chunk_files", return_value=True),
         # Pipeline init succeeds inside ChunkProcessor (mock the import path)
-        mock.patch("screencap.privacy.create_default_pipeline") as mock_pipeline,
-        mock.patch("screencap.privacy.Anonymizer"),
+        mock.patch("screencap.redaction.engine.create_default_pipeline") as mock_pipeline,
+        mock.patch("screencap.redaction.engine.Anonymizer"),
         # Provide real PrivacyConfig for capture-time enforcement
         mock.patch("screencap.config.get_privacy_config", return_value=_test_privacy_config),
         mock.patch("screencap.chunk_processor.ChunkProcessor._wait_for_audio", return_value=True),

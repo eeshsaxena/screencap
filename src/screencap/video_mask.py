@@ -179,7 +179,7 @@ def _build_coverage(
     Raises :class:`_CoverageError` on any of the above (the caller turns this
     into a FAILED outcome).
     """
-    from screencap.privacy.context import (
+    from screencap.redaction.geometry import (
         geometry_capture_failures_in_span,
         list_geometry_sample_timestamps,
     )
@@ -232,7 +232,7 @@ def _sensitive_windows_at(
     them to pixel rects against that frame's actual dimensions.
     """
     from screencap.privacy.actions import VIDEO_BLOCK_ACTIONS
-    from screencap.privacy.context import load_window_geometry
+    from screencap.redaction.geometry import load_window_geometry
     from screencap.privacy.policy import FrameMetadata
 
     snap = load_window_geometry(db_path, sample_ts)
@@ -303,7 +303,7 @@ def _windows_to_rects(
     display_origin: tuple[float, float],
 ) -> list[tuple[int, int, int, int]]:
     """Convert held window dicts to dilated, clamped pixel rects for one frame."""
-    from screencap.privacy.masking import _window_to_pixel_rect
+    from screencap.privacy.mask_primitives import _window_to_pixel_rect
 
     disp_x, disp_y = display_origin
     rects: list[tuple[int, int, int, int]] = []
@@ -479,7 +479,7 @@ def mask_video_chunk(
     if classifier is None or evaluator is None:
         try:
             from screencap.config import get_privacy_config
-            from screencap.privacy.context import DefaultContextClassifier
+            from screencap.privacy.classify import DefaultContextClassifier
             from screencap.privacy.policy import DefaultPolicyEvaluator
 
             privacy_config = get_privacy_config()

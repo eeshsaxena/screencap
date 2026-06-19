@@ -1,4 +1,4 @@
-"""Import-lightness guards for the privacy/redaction split (SCR-33 U1).
+"""Import-lightness guards for the privacy/redaction split (SCR-33).
 
 The whole point of moving the 488-line detection engine out of
 ``screencap.privacy.__init__`` is that importing a small shared symbol must
@@ -6,11 +6,7 @@ no longer drag in the heavy engine. These tests pin that property:
 
 - Importing ``screencap.privacy`` (or a leaf submodule like
   ``screencap.privacy.actions``) must NOT import
-  ``screencap.redaction.engine`` — the shim's ``__getattr__`` is lazy.
-- The legacy ``from screencap.privacy import <engine symbol>`` path must still
-  resolve via the shim and return the *identical* object the engine defines
-  (object identity, not a copy — critical for ``except
-  AllDetectorsFailedError``).
+  ``screencap.redaction.engine``.
 
 The lightness assertions use a fresh subprocess so ``sys.modules`` is clean:
 another test in the same session may have already imported the engine, which
@@ -58,29 +54,17 @@ def test_importing_privacy_actions_does_not_import_engine() -> None:
     assert "ok" in result.stdout
 
 
-def test_shim_resolves_and_is_engine_object() -> None:
-    """Legacy shim access returns the identical engine object."""
-    result = _run(
-        "from screencap.privacy import are_nlp_models_cached\n"
-        "import screencap.redaction.engine as engine\n"
-        "assert are_nlp_models_cached is engine.are_nlp_models_cached\n"
-        "print('ok')\n"
-    )
-    assert result.returncode == 0, result.stderr
-    assert "ok" in result.stdout
+def test_redaction_engine_class_identity() -> None:
+    """``AllDetectorsFailedError`` is one object across its real homes.
 
-
-def test_all_detectors_failed_error_class_identity() -> None:
-    """The shim must return the IDENTICAL exception class (``is``), not a copy.
-
-    If the shim returned a copy, ``except AllDetectorsFailedError`` in code
-    that imported it via ``screencap.privacy`` would silently stop matching a
-    detector failure raised by the engine.
+    Consumers import it from ``screencap.redaction`` (package ``__getattr__``
+    forwards to ``engine``); the ``except AllDetectorsFailedError`` in
+    ``scrubber.py`` only matches if both resolve to the identical class.
     """
     result = _run(
-        "import screencap.privacy\n"
+        "import screencap.redaction as redaction\n"
         "import screencap.redaction.engine as engine\n"
-        "assert screencap.privacy.AllDetectorsFailedError "
+        "assert redaction.AllDetectorsFailedError "
         "is engine.AllDetectorsFailedError\n"
         "print('ok')\n"
     )

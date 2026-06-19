@@ -12,8 +12,7 @@ Covers Unit 1 of the unified-export-callable refactor:
   back to policy evaluation without raising.
 - Import paths: ``build_privacy_filter`` and ``build_cloud_window_filter``
   are importable from the canonical ``screencap.enforcement.window_filter``
-  location (the SCR-33 U3 home; ``screencap.privacy.filter`` is a temporary
-  re-export shim removed in U5). The historical ``screencap.exporter``
+  location (the SCR-33 U3 home). The historical ``screencap.exporter``
   re-export was removed in todo 019.
 """
 
@@ -330,8 +329,7 @@ class TestImportPaths:
     importable from the canonical ``screencap.enforcement.window_filter``
     location (the SCR-33 U3 home). The legacy ``screencap.exporter``
     re-export was removed in todo 019; ``screencap.enforcement.window_filter``
-    is now the single source of truth (``screencap.privacy.filter`` is a
-    temporary re-export shim removed in U5).
+    is now the single source of truth.
     """
 
     def test_import_from_privacy_filter_module(self):

@@ -26,7 +26,7 @@ from screencap.app_discovery import (
     is_background_app,
 )
 from screencap.config import save_config_atomic
-from screencap.privacy.context import BUNDLE_ID_MAP
+from screencap.privacy.classify import BUNDLE_ID_MAP
 from screencap.privacy.policy import ContextClass, PrivacyMode
 
 console = Console()
@@ -757,13 +757,13 @@ def run_setup_wizard(
 def _download_nlp_models() -> None:
     """Download GLiNER + spaCy models if not already cached."""
     try:
-        from screencap.privacy.pii import PiiDetector
+        from screencap.redaction.pii import PiiDetector
 
         console.print("  Downloading privacy models (this may take a few minutes)...")
         PiiDetector()  # triggers HuggingFace download + spaCy model load
         console.print("  [bold #22d3ee]\u2705 Privacy models downloaded[/bold #22d3ee]")
 
-        from screencap.privacy import _cleanup_stale_onnx_blobs
+        from screencap.redaction.engine import _cleanup_stale_onnx_blobs
         try:
             _cleanup_stale_onnx_blobs()
         except Exception:

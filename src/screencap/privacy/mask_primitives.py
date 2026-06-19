@@ -23,7 +23,7 @@ from __future__ import annotations
 from dataclasses import dataclass
 
 from screencap.privacy.actions import KEYSTROKE_NULL_ACTIONS, PrivacyAction
-from screencap.privacy.context import DefaultContextClassifier
+from screencap.privacy.classify import DefaultContextClassifier
 from screencap.privacy.policy import (
     ContextClass,
     DefaultPolicyEvaluator,

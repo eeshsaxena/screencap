@@ -66,7 +66,7 @@ from screencap.privacy.actions import (
     PrivacyAction,
     resolve_override,
 )
-from screencap.privacy.context import DefaultContextClassifier, domain_from_url
+from screencap.privacy.classify import DefaultContextClassifier, domain_from_url
 from screencap.privacy.domain_loader import extract_root_domain
 from screencap.privacy.policy import (
     DEFAULT_TRANSITION_HOLD_SECONDS,
