@@ -196,7 +196,7 @@ def scrub_text(
     if not text or not text.strip():
         return text, None
 
-    from screencap.privacy import AllDetectorsFailedError
+    from screencap.redaction import AllDetectorsFailedError
 
     try:
         detection_result = pipeline.detect(text)
@@ -763,13 +763,14 @@ def build_scrub_context(
                     pass  # keep default 2.0
 
             # Load window events
-            from screencap.privacy.context import load_window_events
+            from screencap.redaction.geometry import load_window_events
 
             if time_range is not None:
                 # Scoped load for chunk processor
                 try:
                     if has_table(conn, "window_event"):
-                        from screencap.privacy.context import WindowContext, domain_from_url
+                        from screencap.privacy.classify import domain_from_url
+                        from screencap.redaction.geometry import WindowContext
 
                         has_browser_url = has_column(conn, "window_event", "browser_url")
 
@@ -1549,9 +1550,9 @@ def ocr_mask_screenshot(
     raises (e.g. ``AllDetectorsFailedError``), the entire text block is masked
     as a precaution rather than escalating to MASK_WINDOW for the whole image.
     """
-    from screencap.privacy import normalize_text
-    from screencap.privacy.masking import MaskRegion
-    from screencap.privacy.ocr import build_offset_map
+    from screencap.privacy.mask_primitives import MaskRegion
+    from screencap.redaction import normalize_text
+    from screencap.redaction.ocr import build_offset_map
 
     result = ocr.recognize(image_path, roi=roi)
     if not result.text_blocks:
@@ -1613,7 +1614,7 @@ def _active_window_bounds(
     if geom is None or not geom.windows:
         return None
 
-    from screencap.privacy.masking import _window_to_pixel_rect
+    from screencap.privacy.mask_primitives import _window_to_pixel_rect
 
     target = None
     for win in geom.windows:
@@ -1690,24 +1691,24 @@ def mask_screenshots(
     evaluator = ctx.evaluator
     classifier = ctx.classifier
 
-    from screencap.privacy.context import (
+    from screencap.privacy.mask_primitives import window_regions_from_geometry
+    from screencap.redaction.geometry import (
         _load_geometry_row,
         associate_screenshot,
         parse_screenshot_timestamp,
     )
-    from screencap.privacy.masking import (
+    from screencap.redaction.masking import (
         MaskStrategy,
         mask_screenshot,
-        window_regions_from_geometry,
     )
 
     # Try to create OCR + detection pipeline for OCR_FALLBACK.
     _ocr = None
     _pipeline = None
     try:
-        from screencap.privacy.ocr import VisionOcr
+        from screencap.redaction.ocr import VisionOcr
         _ocr = VisionOcr()
-        from screencap.privacy import create_default_pipeline
+        from screencap.redaction import create_default_pipeline
         _pipeline = create_default_pipeline()
     except ImportError:
         logger.warning(
@@ -2406,7 +2407,7 @@ def _build_app_allowlist(metrics_path: Path) -> frozenset[str]:
         data = json.loads(metrics_path.read_text(encoding="utf-8"))
         apps = data.get("static", {}).get("running_applications") or []
         # Deferred import — only needed here.
-        from screencap.privacy import normalize_text
+        from screencap.redaction import normalize_text
 
         names = {normalize_text(app["name"]).lower() for app in apps if app.get("name")}
         return frozenset(names)
@@ -3388,9 +3389,9 @@ def scrub_recording(
     """
     # Privacy imports deferred here — not at module level — so that
     # screencap --help works without privacy deps installed.
-    from screencap.privacy import Anonymizer, create_default_pipeline
-    from screencap.privacy.context import DefaultContextClassifier
+    from screencap.privacy.classify import DefaultContextClassifier
     from screencap.privacy.policy import DefaultPolicyEvaluator
+    from screencap.redaction import Anonymizer, create_default_pipeline
 
     src = resolve_recording_dir(name)
     if not src.exists():

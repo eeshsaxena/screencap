@@ -19,14 +19,12 @@ from rich.table import Table
 
 from screencap.app_discovery import (
     AppMetadata,
-    ClassificationResult,
-    auto_classify,
     auto_classify_detailed,
     discover_installed_apps,
     is_background_app,
 )
 from screencap.config import save_config_atomic
-from screencap.privacy.context import BUNDLE_ID_MAP
+from screencap.privacy.classify import BUNDLE_ID_MAP
 from screencap.privacy.policy import ContextClass, PrivacyMode
 
 console = Console()
@@ -585,7 +583,7 @@ def run_setup_wizard(
             mode = PrivacyMode.INTERNAL
         upload_default = existing_upload_default
     else:
-        console.print(f"\n[bold #60a5fa]\u25c9 ScreenCap[/bold #60a5fa] [dim #a78bfa]Privacy Setup[/dim #a78bfa]\n")
+        console.print("\n[bold #60a5fa]\u25c9 ScreenCap[/bold #60a5fa] [dim #a78bfa]Privacy Setup[/dim #a78bfa]\n")
         console.print("[bold]Where will your recordings go?[/bold]\n")
         console.print("  [#818cf8]1.[/#818cf8] Cloud          \u2192 upload to cloud (public privacy mode)")
         console.print("  [#818cf8]2.[/#818cf8] Local          \u2192 stay on this machine (internal privacy mode)")
@@ -757,13 +755,13 @@ def run_setup_wizard(
 def _download_nlp_models() -> None:
     """Download GLiNER + spaCy models if not already cached."""
     try:
-        from screencap.privacy.pii import PiiDetector
+        from screencap.redaction.pii import PiiDetector
 
         console.print("  Downloading privacy models (this may take a few minutes)...")
         PiiDetector()  # triggers HuggingFace download + spaCy model load
         console.print("  [bold #22d3ee]\u2705 Privacy models downloaded[/bold #22d3ee]")
 
-        from screencap.privacy import _cleanup_stale_onnx_blobs
+        from screencap.redaction.engine import _cleanup_stale_onnx_blobs
         try:
             _cleanup_stale_onnx_blobs()
         except Exception:

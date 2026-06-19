@@ -63,7 +63,7 @@ jobs:
 
   privacy-guards-visionfree:
     # Defense-in-depth: prove the SCR-110 background-masking invariant on every run
-    # WITHOUT pyobjc-Vision. tests/test_selective_masking.py (incl.
+    # WITHOUT pyobjc-Vision. tests/redaction/test_selective_masking.py (incl.
     # TestBackgroundWindowMasking) imports no pyobjc at module load, so it runs on
     # Linux. This is the "runs everywhere" guard; if macOS runners are unavailable,
     # this lane still catches the regression.
@@ -99,4 +99,4 @@ jobs:
       - name: Run Vision-free background-masking guards
         # Per-test timeout (pytest-timeout, from .[dev]) matches the macOS lane so a
         # hung test fails fast instead of stalling up to the 20-minute job cap.
-        run: pytest tests/test_selective_masking.py -v --timeout=300
+        run: pytest tests/redaction/test_selective_masking.py -v --timeout=300

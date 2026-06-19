@@ -766,7 +766,7 @@ def _cleanup_chunk_cache(
 # App category classification (inline — Cloud Run doesn't have screencap pkg)
 # ---------------------------------------------------------------------------
 
-# Synced from screencap.privacy.context BUNDLE_ID_MAP + BROWSER_BUNDLE_IDS.
+# Synced from screencap.privacy.classify BUNDLE_ID_MAP + BROWSER_BUNDLE_IDS.
 # ContextClass mapping: CODE_EDITOR_TERMINAL→CODE, EMAIL→EMAIL, CHAT→CHAT,
 # CALENDAR→CHAT, VIDEO_CALL→CHAT, ADMIN_CONSOLE→CODE, BANKING→OTHER,
 # PASSWORD_MANAGER→OTHER, browsers→BROWSER.

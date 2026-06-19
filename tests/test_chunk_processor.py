@@ -115,7 +115,7 @@ def cloud_capture_dir(recording_db):
 
 def _make_mock_pipeline():
     """Create a mock pipeline/anonymizer that detects 'John Smith' as PERSON."""
-    from screencap.privacy import Anonymizer, Detection, DetectionResult
+    from screencap.redaction import Anonymizer, Detection, DetectionResult
 
     pipeline = MagicMock()
 
@@ -355,7 +355,7 @@ class TestCloudIntentGating:
         ack_q = multiprocessing.Queue()
 
         with patch(
-            "screencap.privacy.create_default_pipeline",
+            "screencap.redaction.engine.create_default_pipeline",
             side_effect=ImportError("test: no privacy deps"),
         ):
             cp = ChunkProcessor(
@@ -399,10 +399,10 @@ class TestCloudProcessorRequiresPiiDetection:
 
         # 1. Cloud-intent: require_pii=True is passed
         with patch(
-            "screencap.privacy.create_default_pipeline",
+            "screencap.redaction.engine.create_default_pipeline",
         ) as mock_pipeline:
             mock_pipeline.return_value = MagicMock()
-            with patch("screencap.privacy.Anonymizer"):
+            with patch("screencap.redaction.engine.Anonymizer"):
                 cp = ChunkProcessor(
                     cloud_capture_dir, q, ack_q, recording_name="test",
                     upload_enabled=True, auto_delete=False,
@@ -414,7 +414,7 @@ class TestCloudProcessorRequiresPiiDetection:
 
         # 2. Pipeline failure: upload_warning exposed
         with patch(
-            "screencap.privacy.create_default_pipeline",
+            "screencap.redaction.engine.create_default_pipeline",
             side_effect=ImportError("no PII models"),
         ):
             cp = ChunkProcessor(
@@ -520,7 +520,7 @@ class TestInlineScrubbing:
         self, cloud_capture_dir, cloud_processor,
     ):
         """scrub_text must return '<SCRUB_FAILED>' when all detectors fail."""
-        from screencap.privacy import AllDetectorsFailedError
+        from screencap.redaction import AllDetectorsFailedError
         from screencap.scrubber import scrub_text
 
         cloud_processor._pipeline.detect = MagicMock(
@@ -1313,7 +1313,7 @@ class TestPrivacyFailureDataLoss:
         audio_q = multiprocessing.Queue()
 
         with patch(
-            "screencap.privacy.create_default_pipeline",
+            "screencap.redaction.engine.create_default_pipeline",
             side_effect=ImportError("test: no privacy deps"),
         ):
             cp = ChunkProcessor(
@@ -1458,8 +1458,8 @@ class TestPrivacyFailureDataLoss:
         chunk_q = multiprocessing.Queue()
         audio_q = multiprocessing.Queue()
 
-        with patch("screencap.privacy.create_default_pipeline") as mock_pipeline, \
-             patch("screencap.privacy.Anonymizer"), \
+        with patch("screencap.redaction.engine.create_default_pipeline") as mock_pipeline, \
+             patch("screencap.redaction.engine.Anonymizer"), \
              patch("screencap.config.get_privacy_config", side_effect=RuntimeError("masking init failed")):
             mock_pipeline.return_value = MagicMock()
             cp = ChunkProcessor(

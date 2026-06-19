@@ -32,7 +32,7 @@ We deliberately avoid the ``mode=ro`` URI form because it fails when the
 
 Documented exception
 --------------------
-``src/screencap/privacy/scrub_worker.py`` keeps its own ``sqlite3.connect``
+``src/screencap/enforcement/scrub_worker.py`` keeps its own ``sqlite3.connect``
 call. It has different concurrency requirements (live-writer coexistence and
 ``busy_timeout=10000``) that the standard helper does not serve. See the
 inline comment in that file for the list of evolving columns it reads.

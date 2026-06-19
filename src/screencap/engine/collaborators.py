@@ -119,8 +119,8 @@ class RecordingCollaborators:
           where the filter persists per-target action overrides.
         """
         from screencap.config import get_privacy_config
+        from screencap.enforcement.recorder_enforcement import RecorderPrivacyFilter
         from screencap.privacy.policy import _MODE_STRICTNESS
-        from screencap.privacy.recorder_enforcement import RecorderPrivacyFilter
 
         override_file = capture_dir / ".menubar_overrides.json"
         privacy_config = get_privacy_config()
@@ -692,7 +692,7 @@ class RecordingCollaborators:
         console: Any,
     ) -> None:
         try:
-            from screencap.privacy.scrub_worker import ScrubWorker
+            from screencap.enforcement.scrub_worker import ScrubWorker
 
             sw = ScrubWorker(
                 disable_q=self._channels.disable,

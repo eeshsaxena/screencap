@@ -20,7 +20,7 @@ either trivially true or moot. Three structural guards remain:
    (``engine/capture.py``, the CLI ``screencap export`` command).
 
 3. ``build_privacy_filter`` is called only from its declaration site
-   (``src/screencap/privacy/filter.py``). Production code routes
+   (``src/screencap/enforcement/window_filter.py``). Production code routes
    through ``build_cloud_window_filter`` — the factory that returns
    ``None`` for non-cloud paths and the cloud-mode filter otherwise.
    This catches the original Slack-title leak shape (a literal
@@ -68,7 +68,7 @@ def _find_calls(tree: ast.AST, name: str) -> list[int]:
 
 
 _UNIFIED_EXPORT_HOME = "export.py"
-_BUILD_PRIVACY_FILTER_HOME = "privacy/filter.py"
+_BUILD_PRIVACY_FILTER_HOME = "enforcement/window_filter.py"
 
 # Local-only callers of ``export_chunk_events`` may omit
 # ``window_filter`` (the default ``None`` is correct for
@@ -192,8 +192,8 @@ class TestExportChunkEventsCloudCallSites:
 
 class TestBuildPrivacyFilterCallSiteExclusivity:
     """``build_privacy_filter`` is module-private to the factory home
-    (``src/screencap/privacy/filter.py``). Production code must always
-    go through ``build_cloud_window_filter``.
+    (``src/screencap/enforcement/window_filter.py``). Production code must
+    always go through ``build_cloud_window_filter``.
     """
 
     def test_no_build_privacy_filter_calls_outside_factory_home(self):
@@ -208,7 +208,8 @@ class TestBuildPrivacyFilterCallSiteExclusivity:
                 violations.append(
                     f"{_rel(py_path)}:{lineno} calls build_privacy_filter "
                     "directly — only build_cloud_window_filter (in "
-                    "screencap.privacy.filter) is the sanctioned constructor."
+                    "screencap.enforcement.window_filter) is the sanctioned "
+                    "constructor."
                 )
         assert not violations, (
             "build_privacy_filter call(s) outside the factory home:\n  - "

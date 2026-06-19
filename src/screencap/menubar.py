@@ -29,7 +29,7 @@ from pathlib import Path
 
 from screencap.pidfile import _is_screencap_process
 from screencap.privacy.actions import EXCLUDED_ACTION_VALUES, make_override_key
-from screencap.privacy.context import PASSWORD_MANAGER_BUNDLES
+from screencap.privacy.classify import PASSWORD_MANAGER_BUNDLES
 
 # Debug log — written by the menubar subprocess so we can post-mortem
 # what the prompt path saw. Disabled by default; set
@@ -229,7 +229,8 @@ def _run_menubar(
     # the no-op behavior. Do not use it for security decisions.
     if os.environ.get("SCREENCAP_PARENT") == "swiftui":
         try:
-            from screencap._stderr_events import emit_event as _emit_event, EVENT_MENUBAR_NEUTRALIZED_BY_ENV
+            from screencap._stderr_events import EVENT_MENUBAR_NEUTRALIZED_BY_ENV
+            from screencap._stderr_events import emit_event as _emit_event
             _emit_event(EVENT_MENUBAR_NEUTRALIZED_BY_ENV, env="SCREENCAP_PARENT=swiftui")
         except Exception:
             pass
@@ -1334,7 +1335,7 @@ def _run_menubar(
             self._send_disable_override()
             if d is not None:
                 try:
-                    from screencap.privacy.persistence import persist_disable
+                    from screencap.enforcement.persistence import persist_disable
                     persist_disable(d.bundle_id, d.domain)
                 except Exception:
                     pass  # Best-effort; per-recording override still applied

@@ -21,11 +21,10 @@ Classification priority (first match wins):
 from __future__ import annotations
 
 import logging
-import os
 import plistlib
 import re
 import subprocess
-from dataclasses import dataclass, field
+from dataclasses import dataclass
 from pathlib import Path
 
 from screencap.privacy.policy import ContextClass
@@ -234,7 +233,7 @@ def auto_classify_detailed(metadata: AppMetadata) -> ClassificationResult:
     7. LSApplicationCategoryType
     8. UNKNOWN
     """
-    from screencap.privacy.context import BROWSER_BUNDLE_IDS, BUNDLE_ID_MAP
+    from screencap.privacy.classify import BROWSER_BUNDLE_IDS, BUNDLE_ID_MAP
 
     bid = metadata.bundle_id
 

@@ -14,7 +14,7 @@ Per-export-session lifecycle:
    ``db_path`` and ``recording_id``.
 2. ``__init__`` loads the meta row from ``network_event_meta`` for this
    recording, fetches the KEK from Keychain, unwraps the DEK once, and
-   builds a :class:`screencap.privacy.DetectionPipeline`. KEK plaintext
+   builds a :class:`screencap.redaction.DetectionPipeline`. KEK plaintext
    is dropped after the unwrap; DEK plaintext is held for the lifetime
    of this pipeline instance.
 3. ``decrypt_and_scrub(capture_event)`` is called per network event row
@@ -133,7 +133,7 @@ class NetworkScrubPipeline:
         from screencap.engine.db import get_session_for_path  # noqa: PLC0415
         from screencap.engine.db.models import NetworkEventMeta  # noqa: PLC0415
         from screencap.network import crypto  # noqa: PLC0415
-        from screencap.privacy import (  # noqa: PLC0415
+        from screencap.redaction import (  # noqa: PLC0415
             Anonymizer,
             create_default_pipeline,
         )

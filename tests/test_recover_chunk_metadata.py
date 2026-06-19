@@ -831,7 +831,7 @@ class TestRecoveryScrubberChain:
         # upload command's chain). Use the same masking classifier the
         # scrubber would derive in production.
         from screencap.config import get_privacy_config
-        from screencap.privacy.context import DefaultContextClassifier
+        from screencap.privacy.classify import DefaultContextClassifier
         from screencap.privacy.policy import DefaultPolicyEvaluator, PrivacyMode
         from dataclasses import replace as dc_replace
 
@@ -850,13 +850,13 @@ class TestRecoveryScrubberChain:
 
         # Use a no-op pipeline/anonymizer — we only care about the
         # interval-driven mouse.move drop here, not PII detection.
-        from screencap.privacy import Anonymizer
+        from screencap.redaction import Anonymizer
         from unittest.mock import MagicMock
 
         pipeline = MagicMock()
 
         def _detect(text):
-            from screencap.privacy import DetectionResult
+            from screencap.redaction import DetectionResult
             return DetectionResult(text, [])
 
         pipeline.detect = _detect

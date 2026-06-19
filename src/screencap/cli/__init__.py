@@ -92,7 +92,7 @@ def _report_unclassified_apps(capture_dir) -> None:
     """Report apps seen during recording that are not in privacy config."""
     from screencap.catalog import get_seen_bundle_ids
     from screencap.config import get_privacy_config
-    from screencap.privacy.context import BUNDLE_ID_MAP
+    from screencap.privacy.classify import BUNDLE_ID_MAP
 
     seen_bids = get_seen_bundle_ids([capture_dir])
     if not seen_bids:
@@ -348,13 +348,15 @@ def _permission_probe_cmd() -> None:
 # Click + rich Console into the child process.
 from screencap._stderr_events import (  # noqa: E402
     EVENT_STOPPED,
+)
+from screencap._stderr_events import (
     emit_event as _emit_event,
 )
 
 
 def _maybe_download_nlp_models() -> None:
     """Prompt to download GLiNER + spaCy models if not already cached."""
-    from screencap.privacy import are_nlp_models_cached
+    from screencap.redaction import are_nlp_models_cached
 
     if are_nlp_models_cached():
         return  # fully cached
@@ -583,6 +585,8 @@ def _maybe_prompt_matrix_acknowledgement() -> None:
         try:
             from screencap._stderr_events import (
                 EVENT_MATRIX_DISCLOSURE_REQUIRED,
+            )
+            from screencap._stderr_events import (
                 emit_event as _emit_event,
             )
             _emit_event(
@@ -791,7 +795,7 @@ def start(
 
     # --- Cloud NLP model gate ---
     if is_cloud:
-        from screencap.privacy import are_nlp_models_cached
+        from screencap.redaction import are_nlp_models_cached
         if not are_nlp_models_cached():
             if not _stdin_is_tty():
                 console.print(
@@ -1171,6 +1175,7 @@ def _auto_transcribe(capture_dir, audio_path):
     # Try faster-whisper first
     try:
         import faster_whisper  # noqa: F401
+
         from screencap.engine.cli import _transcribe_faster_whisper
 
         with console.status("[bold]Transcribing audio...[/bold]"):
@@ -1317,7 +1322,7 @@ def view(name, regenerate, max_events):
               help="Output as JSON. Auto-detected when stdout is not a TTY (todo 030).")
 def info(name, as_json):
     """Show details and system metrics for a recording."""
-    from screencap.catalog import find_db, read_drops, _read_recording_meta
+    from screencap.catalog import _read_recording_meta, find_db, read_drops
     from screencap.config import get_recordings_dir
 
     try:
@@ -1388,7 +1393,7 @@ def info(name, as_json):
         console.print("  [dim]No recording metadata available.[/dim]")
 
     if isinstance(drops, dict) and any(v > 0 for v in drops.values()):
-        console.print(f"\n  [yellow]Events dropped during recording:[/yellow]")
+        console.print("\n  [yellow]Events dropped during recording:[/yellow]")
         for event_type, count in drops.items():
             if count > 0:
                 console.print(f"    [yellow]{event_type}:[/yellow] {count}")
@@ -1405,7 +1410,7 @@ def info(name, as_json):
                 for i, d in enumerate(val):
                     console.print(f"  [#60a5fa]display {i}:[/#60a5fa] {d.get('width')}x{d.get('height')}")
             elif key == "locale" and isinstance(val, dict):
-                console.print(f"  [#60a5fa]locale:[/#60a5fa]")
+                console.print("  [#60a5fa]locale:[/#60a5fa]")
                 for lk, lv in val.items():
                     if isinstance(lv, list):
                         console.print(f"    [#60a5fa]{lk}:[/#60a5fa] {', '.join(str(x) for x in lv)}")
@@ -1414,12 +1419,12 @@ def info(name, as_json):
                     else:
                         console.print(f"    [#60a5fa]{lk}:[/#60a5fa] {lv}")
             elif key == "running_applications" and isinstance(val, list):
-                console.print(f"  [#60a5fa]running apps:[/#60a5fa]")
+                console.print("  [#60a5fa]running apps:[/#60a5fa]")
                 for app in val:
                     v = f" v{app['version']}" if app.get("version") else ""
                     console.print(f"    {app['name']} ({app['bundle_id']}){v}")
             elif key == "wifi" and isinstance(val, dict):
-                console.print(f"  [#60a5fa]wifi:[/#60a5fa]")
+                console.print("  [#60a5fa]wifi:[/#60a5fa]")
                 for wk, wv in val.items():
                     console.print(f"    [#60a5fa]{wk}:[/#60a5fa] {wv}")
             else:
@@ -1431,13 +1436,13 @@ def info(name, as_json):
             console.print(Panel(f"[bold]{phase.title()} Snapshot[/bold]"))
             for key, val in snapshot.items():
                 if key == "wifi" and isinstance(val, dict):
-                    console.print(f"  [#60a5fa]wifi:[/#60a5fa]")
+                    console.print("  [#60a5fa]wifi:[/#60a5fa]")
                     for wk, wv in val.items():
                         console.print(f"    [#60a5fa]{wk}:[/#60a5fa] {wv}")
                 else:
                     console.print(f"  [#60a5fa]{key}:[/#60a5fa] {val}")
         elif phase == "end":
-            console.print(f"\n  [dim]No end snapshot (recording may have been interrupted).[/dim]")
+            console.print("\n  [dim]No end snapshot (recording may have been interrupted).[/dim]")
 
 
 def _export_one(
@@ -1597,7 +1602,7 @@ def _build_export_privacy_filter(recording_dir):
     """
     from pathlib import Path as _Path
 
-    from screencap.privacy.filter import build_local_window_filter
+    from screencap.enforcement.window_filter import build_local_window_filter
 
     err_console = Console(stderr=True)
     mode = None
@@ -2135,7 +2140,7 @@ def status(as_json, no_nlp_check):
 
     if not no_nlp_check:
         try:
-            from screencap.privacy import are_nlp_models_cached
+            from screencap.redaction import are_nlp_models_cached
             payload["nlp_models_cached"] = bool(are_nlp_models_cached())
         except Exception:
             pass
@@ -2746,6 +2751,7 @@ def transcribe(name, model):
             # Fix #3: resolve import FIRST, then call
             try:
                 import faster_whisper  # noqa: F401
+
                 from screencap.engine.cli import _transcribe_faster_whisper
                 local_fn = _transcribe_faster_whisper
             except ImportError:
@@ -3261,7 +3267,7 @@ def _settings_privacy_apply(
     # sensitive class (e.g., `app_classes set com.example.foo=password_manager`)
     # cannot be allow-listed in a follow-up call.
     if is_list and field == "allow_apps" and op == "add":
-        from screencap.privacy.context import BROWSER_BUNDLE_IDS, BUNDLE_ID_MAP
+        from screencap.privacy.classify import BROWSER_BUNDLE_IDS, BUNDLE_ID_MAP
         from screencap.privacy.policy import ContextClass
         configured_mode = str(privacy_tbl.get("mode") or "internal")
 
@@ -3362,7 +3368,7 @@ def _settings_privacy_apply(
             # PASSWORD_MANAGER → BUNDLE_ID_MAP fallback or UNKNOWN).
             if existing_override:
                 from screencap.privacy.actions import _ACTION_SEVERITY
-                from screencap.privacy.context import BUNDLE_ID_MAP as _BUNDLE_MAP
+                from screencap.privacy.classify import BUNDLE_ID_MAP as _BUNDLE_MAP
                 from screencap.privacy.policy import (
                     ContextClass,
                     PrivacyMode,
@@ -3412,7 +3418,7 @@ def _settings_privacy_apply(
             # Validate CLASS against ContextClass enum so we don't silently
             # corrupt config with a typo that crashes the next start
             # (todo 010). Accept upper/lower case input; normalize to value.
-            from screencap.privacy.context import BUNDLE_ID_MAP
+            from screencap.privacy.classify import BUNDLE_ID_MAP
             from screencap.privacy.policy import ContextClass
             valid_classes = {c.value for c in ContextClass}
             normalized = ctx_str.lower()
@@ -3518,7 +3524,7 @@ def _check_presidio_analyzer() -> tuple[str, bool, str]:
     name = "presidio_analyzer"
     try:
         from presidio_analyzer import AnalyzerEngine
-        from presidio_analyzer.nlp_engine import NlpEngine, NlpArtifacts
+        from presidio_analyzer.nlp_engine import NlpArtifacts, NlpEngine
 
         class _NoOpNlpEngine(NlpEngine):
             def load(self): pass
@@ -3564,7 +3570,7 @@ def _check_detect_secrets_plugins() -> tuple[str, bool, str]:
     import traceback as _tb
     name = "detect_secrets_plugins"
     try:
-        from screencap.privacy.secrets import DetectSecretsDetector
+        from screencap.redaction.secrets import DetectSecretsDetector
         DetectSecretsDetector()
         return name, True, ""
     except Exception:
@@ -3687,7 +3693,7 @@ def _check_domain_index() -> tuple[str, bool, str]:
     import traceback as _tb
     name = "domain_index"
     try:
-        from screencap.privacy.context import DefaultContextClassifier
+        from screencap.privacy.classify import DefaultContextClassifier
         DefaultContextClassifier()
         return name, True, ""
     except Exception:
@@ -3721,6 +3727,7 @@ def _check_keyring_macos_backend() -> tuple[str, bool, str]:
     name = "keyring_macos_backend"
     try:
         import traceback as _tb
+
         import keyring  # noqa: PLC0415
         import keyring.backends.macOS  # noqa: PLC0415, F401
         backend = keyring.get_keyring()

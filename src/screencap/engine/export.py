@@ -14,7 +14,7 @@ suppression at the scrub layer, not here). Callers handle:
 - ``initial_window_row`` timestamp rewrite to ``start_ts - 0.001`` (R3).
 - ``mouse.move`` dropping (e.g., the CLI's ``--exclude-moves`` flag, R7).
 - Privacy-aware ``window_filter`` construction via
-  ``screencap.privacy.filter.build_cloud_window_filter`` (R5).
+  ``screencap.enforcement.window_filter.build_cloud_window_filter`` (R5).
 - ``_meta`` header generation and atomic file writes (R13, R14).
 """
 
@@ -124,7 +124,7 @@ def unified_export_events(
             ``WindowSwitchEvent`` and returns either a possibly-modified
             event or ``None`` to suppress. Cloud-bound callers MUST
             construct this via
-            ``screencap.privacy.filter.build_cloud_window_filter`` (R5).
+            ``screencap.enforcement.window_filter.build_cloud_window_filter`` (R5).
             ``None`` (the default) passes all dedup'd window events
             through unchanged.
         network_rows: Optional dict rows from ``network_event`` table

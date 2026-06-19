@@ -540,7 +540,7 @@ class TestPrivacyFilterInitFailure:
             mock.patch("screencap.config.get_disk_stop_mb", return_value=0),
             mock.patch("screencap.config.get_privacy_config", return_value=public_config),
             mock.patch(
-                "screencap.privacy.recorder_enforcement.RecorderPrivacyFilter",
+                "screencap.enforcement.recorder_enforcement.RecorderPrivacyFilter",
                 side_effect=RuntimeError("missing dep"),
             ),
             mock.patch("screencap.engine.recorder.Recorder"),
@@ -563,7 +563,7 @@ class TestPrivacyFilterInitFailure:
             mock.patch("screencap.config.get_disk_stop_mb", return_value=0),
             mock.patch("screencap.config.get_privacy_config", return_value=internal_config),
             mock.patch(
-                "screencap.privacy.recorder_enforcement.RecorderPrivacyFilter",
+                "screencap.enforcement.recorder_enforcement.RecorderPrivacyFilter",
                 side_effect=RuntimeError("missing dep"),
             ),
             mock.patch("screencap.engine.recorder.Recorder") as MockRecorder,
@@ -632,7 +632,7 @@ class TestCloudIntentRecording:
             mock.patch("shutil.disk_usage", return_value=_PLENTY_OF_DISK),
             mock.patch("screencap.config.get_privacy_config", return_value=internal_config),
             mock.patch(
-                "screencap.privacy.recorder_enforcement.RecorderPrivacyFilter",
+                "screencap.enforcement.recorder_enforcement.RecorderPrivacyFilter",
                 side_effect=lambda config, **kw: FakeFilter(config, **kw),
             ),
             mock.patch("screencap.engine.recorder.Recorder") as MockRecorder,
@@ -666,7 +666,7 @@ class TestCloudIntentRecording:
             mock.patch("screencap.recorder.get_recordings_dir", return_value=tmp_path),
             mock.patch("shutil.disk_usage", return_value=_PLENTY_OF_DISK),
             mock.patch("screencap.config.get_privacy_config", return_value=config),
-            mock.patch("screencap.privacy.recorder_enforcement.RecorderPrivacyFilter") as MockFilter,
+            mock.patch("screencap.enforcement.recorder_enforcement.RecorderPrivacyFilter") as MockFilter,
             mock.patch("screencap.engine.recorder.Recorder") as MockRecorder,
             mock.patch("screencap.engine.config.config") as mock_engine_config,
             mock.patch("screencap.recorder.console") as mock_console,

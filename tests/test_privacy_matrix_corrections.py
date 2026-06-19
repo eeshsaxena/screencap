@@ -97,7 +97,7 @@ def _evaluator(*, mode="internal", allow_apps=(), exclude_apps=()):
 
 def _eval_for(evaluator, bundle_id, title="Whatever", domain=None):
     """Classify the bundle and evaluate; returns the ActionDecision."""
-    from screencap.privacy.context import DefaultContextClassifier
+    from screencap.privacy.classify import DefaultContextClassifier
     from screencap.privacy.policy import FrameMetadata
 
     metadata = FrameMetadata(bundle_id=bundle_id, window_title=title, domain=domain)

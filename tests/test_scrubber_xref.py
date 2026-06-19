@@ -263,7 +263,7 @@ class TestCrossReferenceKeyType:
 class TestScrubEventsJsonlWithXref:
     @pytest.fixture
     def pipeline_and_anonymizer(self):
-        from screencap.privacy import Anonymizer, create_default_pipeline
+        from screencap.redaction import Anonymizer, create_default_pipeline
         pipeline = create_default_pipeline()
         anonymizer = Anonymizer()
         return pipeline, anonymizer

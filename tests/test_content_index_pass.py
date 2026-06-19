@@ -21,7 +21,7 @@ from PIL import Image
 
 import screencap.content_index as content_index
 import screencap.engine.dedup as dedup
-import screencap.privacy.ocr as ocr_mod
+import screencap.redaction.ocr as ocr_mod
 from screencap.content_index import ContentIndex
 from screencap.scrubber import BlockedInterval, ScrubResult
 
@@ -353,7 +353,7 @@ def test_index_pass_fail_open_on_ocr_error(index_env, tmp_path):
         def recognize(self, *_a, **_k):
             raise RuntimeError("OCR exploded")
 
-    import screencap.privacy.ocr as ocr_module
+    import screencap.redaction.ocr as ocr_module
 
     _orig = ocr_module.VisionOcr
     ocr_module.VisionOcr = _BoomOcr
@@ -398,7 +398,7 @@ def test_index_pass_noop_without_screenshots_dir(index_env, tmp_path):
 
 
 def test_scrub_worker_purges_disabled_intervals(index_env, tmp_path):
-    from screencap.privacy.scrub_worker import ScrubWorker
+    from screencap.enforcement.scrub_worker import ScrubWorker
 
     # Seed the store as if a recording had been indexed.
     with ContentIndex(index_env.store_path) as store:
@@ -422,7 +422,7 @@ def test_scrub_worker_purges_disabled_intervals(index_env, tmp_path):
 
 
 def test_scrub_worker_purge_skips_when_no_store(index_env, tmp_path):
-    from screencap.privacy.scrub_worker import ScrubWorker
+    from screencap.enforcement.scrub_worker import ScrubWorker
 
     stub = SimpleNamespace(_capture_dir=Path("/whatever/rec"))
     # No store on disk → purge must be a no-op and must NOT create one.
@@ -450,7 +450,7 @@ def test_index_write_and_purge_serialize_on_shared_lock(index_env, tmp_path):
     import threading
 
     from screencap.content_index import content_index_write_lock
-    from screencap.privacy.scrub_worker import ScrubWorker
+    from screencap.enforcement.scrub_worker import ScrubWorker
 
     # Seed the store so the purge has both a store to open and a row to delete.
     with ContentIndex(index_env.store_path) as store:

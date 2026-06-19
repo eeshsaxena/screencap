@@ -13,16 +13,16 @@ from pathlib import Path
 from unittest.mock import patch
 
 from screencap.privacy.actions import PrivacyAction
-from screencap.privacy.context import (
-    WindowContext,
-    associate_screenshot,
-    load_window_events,
-)
+from screencap.enforcement.recorder_enforcement import RecorderPrivacyFilter
 from screencap.privacy.policy import (
     PrivacyConfig,
     PrivacyMode,
 )
-from screencap.privacy.recorder_enforcement import RecorderPrivacyFilter
+from screencap.redaction.geometry import (
+    WindowContext,
+    associate_screenshot,
+    load_window_events,
+)
 
 
 def _make_config(**kwargs) -> PrivacyConfig:
@@ -128,7 +128,7 @@ class TestExportDomainPropagation:
 
     def test_filter_uses_domain_for_classification(self):
         """Export privacy filter reads domain from WindowSwitchEvent."""
-        from screencap.privacy.filter import build_privacy_filter
+        from screencap.enforcement.window_filter import build_privacy_filter
         from screencap.engine.events import WindowSwitchEvent
 
         with _mock_privacy_config():
@@ -152,7 +152,7 @@ class TestExportDomainPropagation:
 
     def test_filter_excludes_banking_domain(self):
         """Export privacy filter suppresses events for EXCLUDE domains."""
-        from screencap.privacy.filter import build_privacy_filter
+        from screencap.enforcement.window_filter import build_privacy_filter
         from screencap.engine.events import WindowSwitchEvent
 
         with _mock_privacy_config():
@@ -172,7 +172,7 @@ class TestExportDomainPropagation:
 
     def test_filter_masks_email_domain(self):
         """MASK_WINDOW domains get title masked and domain set to None."""
-        from screencap.privacy.filter import build_privacy_filter
+        from screencap.enforcement.window_filter import build_privacy_filter
         from screencap.engine.events import WindowSwitchEvent
 
         with _mock_privacy_config():
@@ -194,7 +194,7 @@ class TestExportDomainPropagation:
 
     def test_filter_no_domain_falls_to_unverified(self):
         """Browser without domain → BROWSER_UNVERIFIED → MASK_WINDOW."""
-        from screencap.privacy.filter import build_privacy_filter
+        from screencap.enforcement.window_filter import build_privacy_filter
         from screencap.engine.events import WindowSwitchEvent
 
         with _mock_privacy_config():
@@ -368,7 +368,7 @@ class TestBuildBlockedIntervalsDomain:
     """_build_blocked_intervals uses domain from WindowContext."""
 
     def test_banking_domain_produces_blocked_interval(self):
-        from screencap.privacy.context import DefaultContextClassifier
+        from screencap.privacy.classify import DefaultContextClassifier
         from screencap.privacy.policy import DefaultPolicyEvaluator
         from screencap.scrubber import build_blocked_intervals as _build_blocked_intervals
 
@@ -397,7 +397,7 @@ class TestBuildBlockedIntervalsDomain:
         assert intervals[0].action == PrivacyAction.EXCLUDE
 
     def test_safe_domain_no_blocked_interval(self):
-        from screencap.privacy.context import DefaultContextClassifier
+        from screencap.privacy.classify import DefaultContextClassifier
         from screencap.privacy.policy import DefaultPolicyEvaluator
         from screencap.scrubber import build_blocked_intervals as _build_blocked_intervals
 

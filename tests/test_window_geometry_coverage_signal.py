@@ -24,7 +24,7 @@ from screencap.engine.db import create_db, crud, get_session_for_path
 # recorder.Event namedtuple: (timestamp, type, data, extra). ``extra`` carries
 # the window-geometry payload for a "screen" event.
 from screencap.engine.recorder import Event, write_screen_event
-from screencap.privacy.context import (
+from screencap.redaction.geometry import (
     geometry_capture_failures_in_span,
     list_geometry_sample_timestamps,
 )

@@ -167,7 +167,7 @@ class TestMatrixExcludeGuard:
         # If Robinhood isn't in the bundle map this test is vacuous; pick a
         # known-mapped bundle. Use a representative banking bundle ID that's
         # in BUNDLE_ID_MAP.
-        from screencap.privacy.context import BUNDLE_ID_MAP
+        from screencap.privacy.classify import BUNDLE_ID_MAP
         from screencap.privacy.policy import ContextClass
         banking_bundle = next(
             (bid for bid, cls in BUNDLE_ID_MAP.items() if cls == ContextClass.BANKING),

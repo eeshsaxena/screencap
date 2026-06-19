@@ -186,7 +186,7 @@ class ChunkProcessor:
         self._upload_disabled_reason: str | None = None
         if _should_init_scrub:
             try:
-                from screencap.privacy import Anonymizer, create_default_pipeline
+                from screencap.redaction import Anonymizer, create_default_pipeline
                 self._pipeline = create_default_pipeline(require_pii=True)
                 self._anonymizer = Anonymizer()
                 logger.info("Scrubbing pipeline initialized")
@@ -209,7 +209,7 @@ class ChunkProcessor:
             # Initialize classifier/evaluator for screenshot masking
             try:
                 from screencap.config import get_privacy_config
-                from screencap.privacy.context import DefaultContextClassifier
+                from screencap.privacy.classify import DefaultContextClassifier
                 from screencap.privacy.policy import DefaultPolicyEvaluator, PrivacyMode
 
                 _pc = get_privacy_config()
@@ -1034,9 +1034,9 @@ class ChunkProcessor:
         merging, typing aggregation). A mouse.down at chunk end may stay
         unmerged — accepted limitation (orphan events at boundaries).
         """
+        from screencap.enforcement.window_filter import build_cloud_window_filter
         from screencap.export import export_chunk_events
         from screencap.exporter import build_export_metadata, write_events_jsonl
-        from screencap.privacy.filter import build_cloud_window_filter
 
         jsonl_path = self._capture_dir / f"events_{idx:04d}.jsonl"
         if jsonl_path.exists():
@@ -1175,7 +1175,7 @@ class ChunkProcessor:
             return
         # Apple Vision unavailable → clean no-op (chunk proceeds unindexed).
         try:
-            from screencap.privacy.ocr import VisionOcr
+            from screencap.redaction.ocr import VisionOcr
 
             ocr = VisionOcr()
         except Exception:
@@ -1195,7 +1195,7 @@ class ChunkProcessor:
             default_index_path,
         )
         from screencap.engine.dedup import dhash, hamming_distance
-        from screencap.privacy.context import parse_screenshot_timestamp
+        from screencap.redaction.geometry import parse_screenshot_timestamp
         from screencap.scrubber import find_blocked_interval
 
         # Skip EVERY frame the policy flagged for any masking/redaction action.

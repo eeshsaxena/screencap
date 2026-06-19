@@ -162,10 +162,10 @@ def _run_chunk_path(
         # dependencies so this stays a unit test.
         with (
             mock.patch(
-                "screencap.privacy.create_default_pipeline",
+                "screencap.redaction.engine.create_default_pipeline",
                 return_value=MagicMock(),
             ),
-            mock.patch("screencap.privacy.Anonymizer"),
+            mock.patch("screencap.redaction.engine.Anonymizer"),
         ):
             cp = ChunkProcessor(
                 rec_dir,
