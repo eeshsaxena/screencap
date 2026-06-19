@@ -82,7 +82,7 @@ MASK_DILATE_PX: int = 8
 _MASK_CODEC = "libx264"
 _MASK_PIX_FMT = "yuv420p"
 
-# Opaque fill for masked rectangles. Matches privacy.mask_primitives._MASK_COLOR
+# Opaque fill for masked rectangles. Matches privacy.mask_primitives.MASK_COLOR
 # (near-black) so the visual treatment is consistent with screenshot masking.
 _MASK_FILL = (30, 30, 30)
 

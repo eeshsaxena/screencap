@@ -287,7 +287,7 @@ def _build_z_order_regions(
 # ---------------------------------------------------------------------------
 
 # Visual treatment constants
-_MASK_COLOR = (30, 30, 30)  # near-black
+MASK_COLOR = (30, 30, 30)  # near-black
 _LABEL_COLOR = (180, 180, 180)  # light gray text
 
 
@@ -295,12 +295,12 @@ def _apply_bitmap_mask_to_image(img, mask_bitmap) -> None:
     """Apply a bitmap mask to an image, in-place.
 
     Pixels where ``mask_bitmap`` is white (255) are filled with
-    ``_MASK_COLOR``. Pixels where it is black (0) are preserved.
+    ``MASK_COLOR``. Pixels where it is black (0) are preserved.
     Used by the z-order-aware masking path.
     """
     from PIL import Image
 
-    mask_fill = Image.new("RGB", img.size, _MASK_COLOR)
+    mask_fill = Image.new("RGB", img.size, MASK_COLOR)
     composited = Image.composite(mask_fill, img, mask_bitmap)
     img.paste(composited)
     mask_fill.close()
@@ -326,7 +326,7 @@ def _apply_mask_to_image(img, regions: list[MaskRegion]) -> None:
         x2 = min(region.x + region.width, img.width)
         y2 = min(region.y + region.height, img.height)
 
-        draw.rectangle([x1, y1, x2, y2], fill=_MASK_COLOR)
+        draw.rectangle([x1, y1, x2, y2], fill=MASK_COLOR)
 
         # Draw label centered in the region
         if region.label:

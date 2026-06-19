@@ -11,5 +11,3 @@ post-hoc ``screencap.redaction`` detection/NLP pipeline — keeping the heavy
 ``transformers``/``torch`` surface off the capture path. Imports are kept
 light (no eager heavy imports at package import time).
 """
-
-from __future__ import annotations

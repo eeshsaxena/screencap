@@ -20,11 +20,11 @@ _project_root = Path(__file__).resolve().parent.parent
 sys.path.insert(0, str(_project_root / "src"))
 sys.path.insert(0, str(_project_root))
 
-from screencap.privacy import DetectionPipeline
-from screencap.privacy.regex import RegexDetector
-from screencap.privacy.secrets import DetectSecretsDetector
-from tests.privacy.fixtures.test_corpus import FALSE_POSITIVE_CASES, TRUE_POSITIVE_CASES
-from tests.privacy.test_benchmark import (
+from screencap.redaction import DetectionPipeline
+from screencap.redaction.regex import RegexDetector
+from screencap.redaction.secrets import DetectSecretsDetector
+from tests.redaction.fixtures.test_corpus import FALSE_POSITIVE_CASES, TRUE_POSITIVE_CASES
+from tests.redaction.test_benchmark import (
     AggregateResult,
     print_benchmark_table,
     run_benchmark,
@@ -36,14 +36,14 @@ def _build_pipeline(engine: str) -> DetectionPipeline:
     """Build a pipeline for the given engine."""
     if engine == "full":
         # Full pipeline with resolver + heuristic filter (Step 3)
-        from screencap.privacy import create_default_pipeline
+        from screencap.redaction import create_default_pipeline
 
         return create_default_pipeline()
 
     detectors = [RegexDetector(), DetectSecretsDetector()]
 
     if engine in ("presidio", "presidio-gliner"):
-        from screencap.privacy.pii import PiiDetector
+        from screencap.redaction.pii import PiiDetector
 
         ner_backend = "spacy" if engine == "presidio" else "gliner"
         detectors.append(PiiDetector(ner_backend=ner_backend))

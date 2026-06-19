@@ -21,7 +21,7 @@ from typing import Any
 
 from loguru import logger
 
-# Browser bundle-ID sets (mirrors BROWSER_BUNDLE_IDS in privacy/context.py).
+# Browser bundle-ID sets (mirrors BROWSER_BUNDLE_IDS in privacy/classify.py).
 _SAFARI_BUNDLES: frozenset[str] = frozenset({
     "com.apple.Safari",
     "com.apple.SafariTechnologyPreview",

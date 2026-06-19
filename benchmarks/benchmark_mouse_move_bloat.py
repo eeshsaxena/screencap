@@ -300,7 +300,7 @@ def _make_scrubber():
     we mirror that. The first call is slow because it spins up Presidio
     + GLiNER; subsequent runs reuse the same instances.
     """
-    from screencap.privacy import Anonymizer, create_default_pipeline
+    from screencap.redaction import Anonymizer, create_default_pipeline
 
     pipeline = create_default_pipeline(require_pii=True)
     anonymizer = Anonymizer()
@@ -319,7 +319,7 @@ def run_pipeline(
     """Run a single (export → scrub) pass and capture timings + sizes."""
     from screencap.engine.export import unified_export_events
     from screencap.exporter import build_export_metadata, write_events_jsonl
-    from screencap.privacy.filter import build_cloud_window_filter
+    from screencap.enforcement.window_filter import build_cloud_window_filter
     from screencap.scrubber import scrub_events_jsonl
 
     jsonl_path = out_dir / f"events_{label}.jsonl"

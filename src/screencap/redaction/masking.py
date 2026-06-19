@@ -20,7 +20,7 @@ from enum import Enum
 from pathlib import Path
 
 from screencap.privacy.mask_primitives import (
-    _MASK_COLOR,
+    MASK_COLOR,
     MaskRegion,
     _apply_bitmap_mask_to_image,
     _apply_mask_to_image,
@@ -30,7 +30,6 @@ from screencap.privacy.mask_primitives import (
 from screencap.privacy.policy import ContextClass
 
 __all__ = [
-    "MaskRegion",
     "MaskStrategy",
     "get_mask_strategy",
     "mask_screenshot",
@@ -133,7 +132,7 @@ def mask_screenshot(
         # Read dimensions without decoding pixel data, then create blank image
         with Image.open(image_path) as probe:
             w, h = probe.size
-        img = Image.new("RGB", (w, h), _MASK_COLOR)
+        img = Image.new("RGB", (w, h), MASK_COLOR)
         full_regions = full_window_geometry(w, h, context_class)
         # Draw labels on the blank image
         _apply_mask_to_image(img, full_regions)
