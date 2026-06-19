@@ -34,6 +34,31 @@ final class RecorderAlertPresenterTests: XCTestCase {
         XCTAssertFalse(opened)
         XCTAssertEqual(presenter.lastPermissionPresented, "Screen Recording")
     }
+
+    /// Pins the permission-lost copy (SCR-87). The same modal fires for a true
+    /// revocation and for a fresh dev-build identity TCC has never granted, so
+    /// the wording must read sensibly for both and must NOT assert the user
+    /// disabled anything. Exact-string equality guards against a silent copy
+    /// edit; the `disabled` check encodes the specific SCR-87 invariant so even
+    /// a future reword can't reintroduce the misleading framing.
+    func testPermissionLostCopyIsNeutralOnCause() {
+        let body = LiveRecorderAlertPresenter.permissionLostBody(permission: "screen_recording")
+
+        XCTAssertEqual(LiveRecorderAlertPresenter.permissionLostTitle, "Recording stopped")
+        XCTAssertEqual(
+            body,
+            "ScreenCap doesn't have permission to screen_recording. "
+                + "Enable it in System Settings, then start a new recording."
+        )
+        XCTAssertFalse(
+            body.lowercased().contains("disabled"),
+            "Permission-lost copy must not assert the user disabled anything (SCR-87)."
+        )
+        XCTAssertFalse(
+            LiveRecorderAlertPresenter.permissionLostTitle.lowercased().contains("revoked"),
+            "Permission-lost title must not assert a revocation that did not happen (SCR-87)."
+        )
+    }
 }
 
 /// Test-only stand-in. Returns a fixed reply for Cmd+Q and either invokes
