@@ -1,7 +1,7 @@
 ---
 title: "refactor: Split privacy/ into shared core, capture-time enforcement, and post-hoc redaction (SCR-33)"
 type: refactor
-status: active
+status: completed
 date: 2026-06-19
 ---
 
