@@ -745,11 +745,13 @@ def test_promote_cli_promotes_from_allow_list_file(store, client, patch_build_cl
     assert not any(k.startswith("demo/beta/") for k in store.objects)
 
 
-def test_decommission_cli_requires_confirm_for_live(store, client, patch_build_client):
+def test_decommission_cli_requires_confirm_for_live(store, client, patch_build_client, tmp_path):
     import decommission_flat_namespace as decom_cli
 
     _seed_flat_with_staging(store)
-    rc = decom_cli.main(["--bucket", BUCKET])  # no --dry-run, no --confirm
+    # --audit-log to tmp for consistency/hygiene; the --confirm guard returns before
+    # the audit log is opened, so nothing is written here today.
+    rc = decom_cli.main(["--bucket", BUCKET, "--audit-log", str(tmp_path / "a.jsonl")])
     assert rc == 2
     assert store.deleted == []
 
@@ -923,6 +925,25 @@ def test_decommission_keeps_source_on_retry_error_during_delete(store, client):
     assert "recordings/alpha/manifest.json" in store.deleted
 
 
+def test_decommission_keeps_session_on_retry_error_during_delete(store, client):
+    # The sessions/ delete loop's widened catch (GoogleAPIError) must absorb a
+    # RetryError per-object too — structurally identical to the recordings/ branch
+    # but its own except block, so it gets its own regression test.
+    from google.api_core.exceptions import RetryError
+
+    store.add("sessions/_index.json", crc32c="S", content_type="application/json")
+    store.raise_on_delete["sessions/_index.json"] = RetryError("simulated retry exhaustion", None)
+    result = core.run_decommission(
+        client=client, bucket_name=BUCKET, include_sessions=True, dry_run=False,
+        sessions_backup_confirmed=True, probe=IDLE, log=lambda _m: None,
+    )
+    assert "sessions/_index.json" not in store.deleted
+    assert result.kept_on_error and any(
+        o.src == "sessions/_index.json" and o.reason.startswith("error: ")
+        for o in result.kept_on_error
+    )
+
+
 def test_decommission_keeps_source_on_error_fetching_staging(store, client):
     # A transient error fetching the staging copy (the currently-unwrapped get_blob)
     # must KEEP that source and continue — not abort the whole loop. RetryError also
@@ -1088,6 +1109,27 @@ def test_decommission_cli_writes_audit_log_0o600(store, client, patch_build_clie
     assert {r["src"] for r in rows if r["action"] == "deleted"} == set(store.deleted)
     # The irreversible-step audit artifact is owner-only.
     assert (audit.stat().st_mode & 0o777) == 0o600
+
+
+def test_decommission_cli_audit_log_appends_across_runs(store, client, patch_build_client, tmp_path):
+    import decommission_flat_namespace as decom_cli
+
+    audit = tmp_path / "audit.jsonl"
+    _seed_flat_with_staging(store)  # alpha manifest + video, both verified
+    decom_cli.main(["--bucket", BUCKET, "--confirm", "--audit-log", str(audit)])
+    first = audit.read_text(encoding="utf-8").splitlines()
+    assert first  # first run recorded its deletions
+
+    # A second live run on a fresh source must APPEND, never truncate the prior record
+    # (the irreversible step's audit history must survive a re-run).
+    store.add("recordings/gamma/manifest.json", crc32c="G", content_type="application/json")
+    store.objects["import-review/gamma/manifest.json"] = {
+        "crc32c": "G", "content_type": "application/json", "size": 10, "md5_hash": None,
+    }
+    decom_cli.main(["--bucket", BUCKET, "--confirm", "--audit-log", str(audit)])
+    second = audit.read_text(encoding="utf-8").splitlines()
+    assert len(second) > len(first)
+    assert second[: len(first)] == first  # prior run's lines intact at the head
 
 
 def test_decommission_cli_dry_run_writes_dryrun_sidecar(store, client, patch_build_client, tmp_path):

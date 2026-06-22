@@ -107,7 +107,7 @@ class GCSBlobProtocol(Protocol):
 
     def reload(self, timeout: float = ...) -> None: ...
 
-    def delete(self, **kwargs: Any) -> None: ...
+    def delete(self, *, if_generation_match: int | None = ..., timeout: float = ...) -> None: ...
 
     def exists(self) -> bool: ...
 
@@ -230,7 +230,7 @@ def verify_match(src, dst) -> str | None:
     return None
 
 
-def copy_blob(bucket: GCSBucketProtocol, src_blob: GCSBlobProtocol, dst_name: str) -> Any:
+def copy_blob(bucket: GCSBucketProtocol, src_blob: GCSBlobProtocol, dst_name: str) -> GCSBlobProtocol:
     """``rewrite()`` ``src_blob`` into ``dst_name``, following ``rewriteToken`` to
     completion, and return the reloaded destination blob.
 

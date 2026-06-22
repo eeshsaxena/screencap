@@ -111,7 +111,11 @@ def main(argv=None) -> int:
     # AS the loop runs (flushed per line), so a crash mid-run still leaves an
     # auditable record of exactly what was deleted — this is the irreversible step.
     audit_path = args.audit_log + (".dryrun.jsonl" if args.dry_run else "")
-    audit_fp = _open_audit_log(audit_path, dry_run=args.dry_run)
+    try:
+        audit_fp = _open_audit_log(audit_path, dry_run=args.dry_run)
+    except OSError as exc:
+        print(f"ERROR: cannot open audit log {audit_path!r}: {exc}", file=sys.stderr)
+        return 2
 
     def _record(outcome: core.DeleteOutcome) -> None:
         audit_fp.write(json.dumps(dataclasses.asdict(outcome), sort_keys=True) + "\n")
