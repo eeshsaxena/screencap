@@ -288,6 +288,68 @@ final class ReviewWindowViewModelTests: XCTestCase {
         withExtendedLifetime(owner) {}
     }
 
+    /// SCR-158 — an `upload_busy` event (another *process* held the terminal
+    /// lock) must surface as the distinct `.busy` state, NOT `.failed`: the
+    /// child exited cleanly (exit 0), so it isn't a failure. Unlike `.refused`,
+    /// `.busy` carries `retryData` AND is retry-friendly — the busy-lock clears
+    /// on its own. The panes data is carried forward so the window keeps
+    /// rendering the review content.
+    func testUploadBusySurfacesBusyStateWithRetryData() async {
+        let service = FakeUploadService()
+        let controller = makeController(service: service)
+        let model = makeModel(controller: controller)
+
+        await model.loadReviewData()
+        model.startUpload()
+        if case .uploading = model.state {} else {
+            return XCTFail("expected uploading after startUpload, got \(model.state)")
+        }
+        service.emit(#"{"type": "upload_busy", "schema_version": 1, "recording": "rec-001", "retryable": true}"#)
+        await Task.yield()
+
+        if case .busy(let message, let retryData) = model.state {
+            XCTAssertFalse(message.isEmpty)
+            XCTAssertNotNil(retryData, "busy must keep panes data so the window still renders + Retry can re-run")
+        } else {
+            XCTFail("expected busy with retry data, got \(model.state)")
+        }
+    }
+
+    /// SCR-158 — the inverse of `testReuploadFromRefusedReRefusesAndNeverSpawns`:
+    /// because a busy-lock is transient, re-invoking the upload entry point from
+    /// `.busy` (the Retry button's path) DOES re-spawn. The `.busy` terminal
+    /// path released the cross-window claim, so the second `startUpload()`
+    /// re-claims it, returns to `.uploading`, and the service records a SECOND
+    /// start — proving Retry is a real re-attempt, not a silent no-op.
+    func testRetryFromBusyReSpawnsAndReturnsToUploading() async {
+        let service = FakeUploadService()
+        let controller = makeController(service: service)
+        let model = makeModel(controller: controller)
+
+        await model.loadReviewData()
+        model.startUpload()
+        service.emit(#"{"type": "upload_busy", "schema_version": 1, "recording": "rec-001", "retryable": true}"#)
+        await Task.yield()
+        guard case .busy = model.state else {
+            return XCTFail("expected busy after first attempt, got \(model.state)")
+        }
+
+        // Retry: the busy terminal released the claim and reset the child, so a
+        // fresh start re-spawns. Reset the fake's process handle for the second
+        // spawn cycle (mirrors the `.failed`-retry test).
+        service.terminate(exitCode: 0)
+        service.fakeProcess = FakeSpawnedProcessHandle(isRunning: true, pid: 99, forceKillReturnValue: true)
+        model.startUpload()
+        await Task.yield()
+
+        if case .uploading = model.state {} else {
+            XCTFail("re-attempt from busy must return to uploading, got \(model.state)")
+        }
+        XCTAssertEqual(
+            service.startedNames, ["rec-001", "rec-001"],
+            "Retry from busy must re-spawn — the inverse of the refused never-spawn invariant")
+    }
+
     /// Covers AE4: window dismissed while uploading → controller.cancel()
     /// is called; the Python side's SIGTERM handler then emits
     /// upload_failed(error: "interrupted") and state lands on failed.
@@ -400,8 +462,41 @@ final class ReviewWindowViewModelTests: XCTestCase {
             XCTAssertEqual(data.videoURL.path, "/tmp/video.mp4")
             XCTAssertEqual(data.startedAt, 0, "null started_at falls back to origin 0")
             XCTAssertEqual(data.durationSeconds, 0, "null duration_seconds falls back to unknown (0)")
+            XCTAssertFalse(data.timingError, "benign event-free null is not a read failure")
         } else {
             XCTFail("expected ready for playable recording with null timing, got \(model.state)")
+        }
+    }
+
+    /// SCR-107 — `ok: true` with null timing AND `timing_error: true` is a
+    /// playable recording whose `recording.db` couldn't be read (corrupt /
+    /// unreadable). It must still land on `.ready` (the video plays) but carry
+    /// `timingError` so the panes surface a non-blocking advisory — NOT
+    /// `.failed`, and NOT silently indistinguishable from a clean event-free
+    /// recording. This is the discriminator the SCR-102 fix erased.
+    func testTimingErrorEnvelopeLandsOnReadyWithAdvisoryFlag() async {
+        let loader = FakeReviewDataLoader()
+        loader.nextEnvelope = .init(
+            ok: true,
+            schemaVersion: 2,
+            videoPath: "/tmp/video.mp4",
+            eventsPath: "/tmp/events.jsonl",
+            startedAt: nil,
+            durationSeconds: nil,
+            videoPixfmtRemediated: false,
+            error: nil,
+            timingError: true
+        )
+        let model = makeModel(loader: loader)
+
+        await model.loadReviewData()
+
+        if case .ready(let data) = model.state {
+            XCTAssertTrue(data.timingError, "DB-read failure must set the advisory flag")
+            XCTAssertEqual(data.startedAt, 0, "null timing still falls back to origin 0")
+            XCTAssertEqual(data.durationSeconds, 0)
+        } else {
+            XCTFail("expected ready with advisory for unreadable-DB recording, got \(model.state)")
         }
     }
 
@@ -618,7 +713,8 @@ final class ReviewWindowViewModelTests: XCTestCase {
          "coverage": {"video_local_only": true, "audio_local_only": true,
                        "transcript_uploaded_scrubbed": false, "screenshots_uploaded": true,
                        "allowed_app_screenshot_pii_manual_review": true},
-         "started_at": null, "duration_seconds": null, "video_pixfmt_remediated": false}
+         "started_at": null, "duration_seconds": null, "video_pixfmt_remediated": false,
+         "timing_error": true}
         """
         let env = try JSONDecoder().decode(ReviewDataEnvelope.self, from: Data(json.utf8))
         XCTAssertEqual(env.schemaVersion, 2)
@@ -627,6 +723,7 @@ final class ReviewWindowViewModelTests: XCTestCase {
         XCTAssertEqual(env.redaction?.markers?.first?.category, "policy_excluded_app")
         XCTAssertNil(env.redaction?.blockedIntervals?.first?.end, "null end → nil")
         XCTAssertEqual(env.coverage?.transcriptUploadedScrubbed, false)
+        XCTAssertEqual(env.timingError, true)
     }
 
     // MARK: - Helpers

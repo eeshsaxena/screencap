@@ -40,9 +40,14 @@ binding** — Step 0 enforces that.
 > (`tests/test_cloud_migration.py`); the shared logic lives in
 > `scripts/cloud_migration/core.py`. Run them from an admin machine with
 > Application Default Credentials for a principal holding
-> `roles/storage.objectAdmin` (object copy/delete) **and**
-> `roles/storage.admin` *or* `storage.buckets.{get,setIamPolicy}` (the Step 0 IAM
-> pre-check). Install the SDK: `pip install google-cloud-storage>=3.1.1`.
+> `roles/storage.objectAdmin` (object copy/delete) **and** `roles/storage.admin`
+> for the Step 0 pre-checks. Step 0 reads the bucket IAM policy, its
+> `iam_configuration` (UBLA + Public Access Prevention), and — when UBLA is off —
+> its **default object ACL**; `roles/storage.admin` is the simplest grant that
+> covers all three. The narrower `storage.buckets.{get,setIamPolicy}` is **not**
+> sufficient on its own — it omits default-object-ACL read, so the SCR-146 ACL
+> check would fail with a permission error on a UBLA-off bucket. Install the SDK:
+> `pip install google-cloud-storage>=3.1.1`.
 
 ---
 
@@ -85,13 +90,16 @@ gcloud storage buckets get-iam-policy "gs://$BUCKET" --format=json \
   | jq '.bindings[] | select(.members[]|test("allUsers|allAuthenticatedUsers"))'
 ```
 
-> **IAM bindings are not the only public door.** The stage script's automated
-> check inspects bucket **IAM** only. GCS also serves objects publicly through
-> legacy **object / default-object ACLs**, which are active whenever **Uniform
-> Bucket-Level Access (UBLA)** is disabled (the default on older buckets). Before
-> trusting "private staging", confirm UBLA is on and Public Access Prevention is
-> enforced — otherwise a public *default object ACL* would make every staged
-> object world-readable even with zero public IAM bindings:
+> **IAM bindings are not the only public door.** GCS also serves objects publicly
+> through legacy **object / default-object ACLs**, which are active whenever
+> **Uniform Bucket-Level Access (UBLA)** is disabled (the default on older buckets).
+> A public *default object ACL* would make every staged object world-readable even
+> with zero public IAM bindings. **As of SCR-146 the stage script asserts this
+> automatically** — it reads `iam_configuration` and, when UBLA is off, enumerates
+> the default object ACL for `allUsers`/`allAuthenticatedUsers` and **refuses to
+> stage (fail-closed)** if a public grant exists. Unlike the IAM check there is no
+> `--remove-public-*` auto-fix: enable UBLA out-of-band first. Confirm the posture
+> yourself before the run and record it in the log below:
 >
 > ```bash
 > gcloud storage buckets describe "gs://$BUCKET" \
@@ -103,7 +111,7 @@ gcloud storage buckets get-iam-policy "gs://$BUCKET" --format=json \
 >
 > If UBLA is off, enable it (`gcloud storage buckets update "gs://$BUCKET"
 > --uniform-bucket-level-access`) and set Public Access Prevention to `enforced`
-> before the first stage run. Record the result in the log below.
+> before the first stage run.
 
 `migrate_flat_to_staging.py` runs the IAM-binding check itself and **refuses to
 stage** while a public binding exists. Remove it in one of two ways:

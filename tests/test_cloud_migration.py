@@ -5,9 +5,11 @@ The migration core (``scripts/cloud_migration/core.py``) is intentionally
 fake — the same posture ``scripts/cloud-function/conftest.py`` gives the function
 suite. The fake mirrors enough of the real surface (``list_blobs`` filtered by
 prefix, per-blob ``crc32c``/``content_type``/``md5_hash``, a multi-call
-``rewrite()`` with rewriteToken, ``get_iam_policy``/``set_iam_policy``, ``delete``)
-that a handler copying the wrong prefix, skipping verification, or truncating a
-large object is provably caught — a prefix-only mock would miss it.
+``rewrite()`` with rewriteToken, ``get_iam_policy``/``set_iam_policy``, ``delete``,
+and the reload-gated ``iam_configuration``/``default_object_acl`` the UBLA pre-check
+reads) that a handler copying the wrong prefix, skipping verification, truncating a
+large object, or staging into a publicly-ACL'd bucket is provably caught — a
+prefix-only mock would miss it.
 
 ``scripts/`` is put on ``sys.path`` (mirroring ``tests/test_auth.py`` loading
 ``scripts/generate_provisioned.py``) so the package + thin CLI shims import.
@@ -43,6 +45,18 @@ class FakeStore:
     def __init__(self):
         self.objects: dict[str, dict] = {}
         self.iam_bindings: list[dict] = []
+        # Bucket public-access posture (SCR-146 UBLA / default-object-ACL gate).
+        # Default to the correctly-configured posture (UBLA on + PAP enforced) so
+        # the gate is a no-op for tests that don't exercise it — the production
+        # rule is "don't false-refuse a correctly-configured bucket".
+        self.ubla_enabled: bool = True
+        self.public_access_prevention: str | None = "enforced"
+        # Default object ACL entries: [{"entity": "allUsers", "role": "READER"}, ...].
+        self.default_object_acl: list[dict] = []
+        # When set, FakeBucket.reload() / get_iam_policy() raise these — model a live
+        # bucket read failing (bucket gone / permission denied) so the gate aborts.
+        self.reload_error: Exception | None = None
+        self.iam_policy_error: Exception | None = None
         # src name -> number of rewrite() calls needed (default 1).
         self.rewrite_plan: dict[str, int] = {}
         # src names whose copy lands with a corrupted crc32c (verify should fail).
@@ -147,10 +161,37 @@ class FakePolicy:
         self.bindings = bindings
 
 
+class FakeIAMConfiguration:
+    """Mirrors google's ``bucket.iam_configuration`` surface the gate reads."""
+
+    def __init__(self, *, uniform_bucket_level_access_enabled, public_access_prevention):
+        self.uniform_bucket_level_access_enabled = uniform_bucket_level_access_enabled
+        self.public_access_prevention = public_access_prevention
+
+
+class FakeACL:
+    """Mirrors google's ACL: ``reload()`` fetches live entries, then iterate
+    ``{"entity": ..., "role": ...}`` dicts (one per entity/role)."""
+
+    def __init__(self, store: FakeStore):
+        self._store = store
+        self._entries: list[dict] = []
+
+    def reload(self, *args, **kwargs):
+        self._entries = [dict(e) for e in self._store.default_object_acl]
+
+    def __iter__(self):
+        return iter(self._entries)
+
+
 class FakeBucket:
     def __init__(self, store: FakeStore, name: str):
         self._store = store
         self.name = name
+        self._default_object_acl = FakeACL(store)
+        # Populated by reload() from the live store, mirroring google's Bucket
+        # whose iam_configuration reads cached _properties (empty until reloaded).
+        self._reloaded = False
 
     def blob(self, name):
         return FakeBlob(self._store, name)
@@ -163,7 +204,32 @@ class FakeBucket:
             raise exc
         return FakeBlob(self._store, name) if name in self._store.objects else None
 
+    def reload(self, *args, **kwargs):
+        if self._store.reload_error is not None:
+            raise self._store.reload_error
+        self._reloaded = True
+
+    @property
+    def iam_configuration(self):
+        # google's iam_configuration reads the bucket's cached _properties, which a
+        # bare client.bucket(name) ref does NOT have until reload(); model that so
+        # the production code's reload-before-read is load-bearing in tests.
+        if not self._reloaded:
+            return FakeIAMConfiguration(
+                uniform_bucket_level_access_enabled=False, public_access_prevention=None
+            )
+        return FakeIAMConfiguration(
+            uniform_bucket_level_access_enabled=self._store.ubla_enabled,
+            public_access_prevention=self._store.public_access_prevention,
+        )
+
+    @property
+    def default_object_acl(self):
+        return self._default_object_acl
+
     def get_iam_policy(self, requested_policy_version=None):
+        if self._store.iam_policy_error is not None:
+            raise self._store.iam_policy_error
         # Preserve every binding field (role, members, condition, ...) so the
         # production code's condition-preservation is observable in tests.
         return FakePolicy([dict(b, members=set(b["members"])) for b in self._store.iam_bindings])
@@ -417,6 +483,139 @@ def test_stage_dry_run_with_public_iam_refuses_with_hint(store, client):
             client=client, bucket_name=BUCKET, dry_run=True, remove_public_iam=True,
             probe=IDLE, log=lambda _m: None,
         )
+
+
+# --------------------------------------------------------------------------
+# U8 — UBLA / default-object-ACL pre-check (the second public door, SCR-146)
+# --------------------------------------------------------------------------
+
+
+def test_read_iam_configuration_reads_live_posture(store, client):
+    # Must reload() before reading: the default fake posture (correctly-configured)
+    # is only visible after reload — an un-reloaded bucket reads UBLA off / PAP unset.
+    assert core.read_iam_configuration(client.bucket(BUCKET)) == (True, "enforced")
+    store.ubla_enabled = False
+    store.public_access_prevention = "inherited"
+    assert core.read_iam_configuration(client.bucket(BUCKET)) == (False, "inherited")
+
+
+def test_find_public_default_object_acl_detects_both_public_entities(store, client):
+    store.default_object_acl = [
+        {"entity": "allUsers", "role": "READER"},
+        {"entity": "user-someone@x.com", "role": "OWNER"},  # private grant, ignored
+        {"entity": "allAuthenticatedUsers", "role": "READER"},
+    ]
+    found = core.find_public_default_object_acl(client.bucket(BUCKET))
+    assert sorted(found) == [("READER", "allAuthenticatedUsers"), ("READER", "allUsers")]
+
+
+def test_stage_refuses_with_public_default_object_acl_when_ubla_off(store, client):
+    # The exact SCR-146 hole: zero public IAM bindings, but UBLA off + a public
+    # default object ACL would make every staged import-review/ object public.
+    _seed_two_recordings(store)
+    store.ubla_enabled = False
+    store.public_access_prevention = "inherited"
+    store.default_object_acl = [{"entity": "allUsers", "role": "READER"}]
+    with pytest.raises(MigrationError, match="default object ACL"):
+        core.run_stage(client=client, bucket_name=BUCKET, dry_run=False, probe=IDLE, log=lambda _m: None)
+    assert store.rewrite_log == []  # never started copying
+
+
+def test_stage_dry_run_refuses_with_public_default_object_acl(store, client):
+    # The ACL gate is read-only and fail-closed, so it refuses even on a dry-run
+    # (unlike --remove-public-iam, it never mutates anything to defer).
+    _seed_two_recordings(store)
+    store.ubla_enabled = False
+    store.public_access_prevention = "inherited"  # PAP not enforced -> ACL is live
+    store.default_object_acl = [{"entity": "allAuthenticatedUsers", "role": "READER"}]
+    with pytest.raises(MigrationError, match="default object ACL"):
+        core.run_stage(client=client, bucket_name=BUCKET, dry_run=True, probe=IDLE, log=lambda _m: None)
+    assert store.rewrite_log == []  # never started copying
+
+
+def test_stage_proceeds_when_ubla_enabled_even_with_public_default_acl(store, client):
+    # UBLA on makes object ACLs inert — a stale public default ACL must NOT refuse
+    # (no false-refuse). PAP is left un-enforced so this exercises the UBLA branch
+    # (not the PAP short-circuit). Also guards the reload(): without it the gate
+    # would read UBLA off, enumerate the ACL, find allUsers, and wrongly refuse.
+    _seed_two_recordings(store)
+    store.ubla_enabled = True
+    store.public_access_prevention = "inherited"
+    store.default_object_acl = [{"entity": "allUsers", "role": "READER"}]
+    result = core.run_stage(
+        client=client, bucket_name=BUCKET, dry_run=False, probe=IDLE, log=lambda _m: None
+    )
+    assert result.ok
+    assert store.rewrite_log  # staging proceeded
+
+
+def test_stage_proceeds_when_ubla_off_with_private_default_acl(store, client):
+    # UBLA off but the default object ACL grants no public access — staged objects
+    # inherit a private ACL, so staging must proceed (no false-refuse).
+    _seed_two_recordings(store)
+    store.ubla_enabled = False
+    store.public_access_prevention = "inherited"
+    store.default_object_acl = [{"entity": "user-someone@x.com", "role": "OWNER"}]
+    result = core.run_stage(
+        client=client, bucket_name=BUCKET, dry_run=False, probe=IDLE, log=lambda _m: None
+    )
+    assert result.ok
+
+
+def test_stage_proceeds_when_pap_enforced_even_with_ubla_off_and_public_acl(store, client):
+    # public_access_prevention=enforced blocks all public access bucket-wide (IAM +
+    # ACLs), so a hardened-but-not-yet-UBLA bucket with a stale public default ACL is
+    # genuinely private and must NOT be refused (the ticket's "don't false-refuse a
+    # correctly-configured bucket" — GCS would never serve that ACL publicly).
+    _seed_two_recordings(store)
+    store.ubla_enabled = False
+    store.public_access_prevention = "enforced"
+    store.default_object_acl = [{"entity": "allUsers", "role": "READER"}]
+    result = core.run_stage(
+        client=client, bucket_name=BUCKET, dry_run=False, probe=IDLE, log=lambda _m: None
+    )
+    assert result.ok
+    assert store.rewrite_log  # staging proceeded
+
+
+def test_stage_fails_closed_when_bucket_reload_errors(store, client):
+    # The UBLA pre-check reads LIVE bucket state; if that read fails (bucket gone,
+    # permission denied), staging must abort before any copy — never fail-open by
+    # treating an un-read bucket as private. The raw GCS error is surfaced as a
+    # fail-closed MigrationError (clean message + exit 2), not an uncaught traceback.
+    from google.api_core.exceptions import Forbidden
+
+    _seed_two_recordings(store)
+    store.reload_error = Forbidden("missing storage.buckets.get / defaultObjectAcl read")
+    with pytest.raises(MigrationError, match="could not read bucket metadata"):
+        core.run_stage(client=client, bucket_name=BUCKET, dry_run=False, probe=IDLE, log=lambda _m: None)
+    assert store.rewrite_log == []  # never started copying
+
+
+def test_stage_fails_closed_when_bucket_reload_raises_retry_error(store, client):
+    # RetryError (retry-deadline exhaustion) is NOT a GoogleAPICallError — it sits
+    # under the broader GoogleAPIError base. The pre-check catch must still fail
+    # closed with a MigrationError rather than letting the raw error escape as an
+    # uncaught traceback (exit 1).
+    from google.api_core.exceptions import RetryError
+
+    _seed_two_recordings(store)
+    store.reload_error = RetryError("retry deadline exceeded", TimeoutError("transient"))
+    with pytest.raises(MigrationError, match="could not read bucket metadata"):
+        core.run_stage(client=client, bucket_name=BUCKET, dry_run=False, probe=IDLE, log=lambda _m: None)
+    assert store.rewrite_log == []  # never started copying
+
+
+def test_stage_fails_closed_when_iam_policy_read_errors(store, client):
+    # Same fail-closed contract for the IAM-binding pre-check: a get_iam_policy
+    # failure refuses to stage with a MigrationError rather than crashing.
+    from google.api_core.exceptions import Forbidden
+
+    _seed_two_recordings(store)
+    store.iam_policy_error = Forbidden("missing storage.buckets.getIamPolicy")
+    with pytest.raises(MigrationError, match="could not read bucket IAM policy"):
+        core.run_stage(client=client, bucket_name=BUCKET, dry_run=False, probe=IDLE, log=lambda _m: None)
+    assert store.rewrite_log == []  # never started copying
 
 
 def test_stage_refuses_while_recording_active(store, client):
@@ -720,6 +919,17 @@ def test_stage_cli_public_iam_returns_error_code(store, client, patch_build_clie
 
     _seed_two_recordings(store)
     store.iam_bindings = [{"role": "roles/storage.objectViewer", "members": {"allUsers"}}]
+    rc = stage_cli.main(["--bucket", BUCKET, "--manifest", str(tmp_path / "m.json")])
+    assert rc == 2  # MigrationError -> exit 2
+
+
+def test_stage_cli_public_default_object_acl_returns_error_code(store, client, patch_build_client, tmp_path):
+    import migrate_flat_to_staging as stage_cli
+
+    _seed_two_recordings(store)
+    store.ubla_enabled = False
+    store.public_access_prevention = "inherited"
+    store.default_object_acl = [{"entity": "allUsers", "role": "READER"}]
     rc = stage_cli.main(["--bucket", BUCKET, "--manifest", str(tmp_path / "m.json")])
     assert rc == 2  # MigrationError -> exit 2
 

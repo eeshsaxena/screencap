@@ -84,6 +84,13 @@ struct ReviewDataEnvelope: Decodable, Equatable {
     var screenshots: [String]? = nil
     var redaction: ReviewRedaction? = nil
     var coverage: ReviewCoverage? = nil
+    /// SCR-107 — `true` only when null `startedAt`/`durationSeconds` is due to a
+    /// failed `recording.db` read (corrupt/unreadable), as opposed to a benign
+    /// recording with no action events. Lets the consumer surface a
+    /// non-blocking advisory instead of silently treating a corrupted DB as a
+    /// clean, event-free review. Absent (older envelope) → nil → treated as no
+    /// error.
+    var timingError: Bool? = nil
 
     enum CodingKeys: String, CodingKey {
         case ok
@@ -98,6 +105,7 @@ struct ReviewDataEnvelope: Decodable, Equatable {
         case screenshots
         case redaction
         case coverage
+        case timingError = "timing_error"
     }
 }
 
@@ -119,6 +127,10 @@ struct ReviewData: Equatable {
     let durationSeconds: Double
     let redaction: ReviewRedaction?
     let coverage: ReviewCoverage?
+    /// SCR-107 — the timing metadata couldn't be read (corrupt/unreadable
+    /// `recording.db`). The review is still playable; the panes surface a
+    /// non-blocking advisory and the timeline stays at its 0-origin fallback.
+    let timingError: Bool
 }
 
 /// Test seam over `CLIClient.runJSONRaw` so the review-data fetch can be
@@ -186,9 +198,37 @@ enum ReviewState: Equatable {
     /// Cross-window refusal (SCR-155): another window already owns this
     /// recording's upload. Distinct from `.failed` so the action row offers
     /// honest "another window is handling it" copy and a Close — never a Retry
-    /// that would silently re-refuse. `data` is carried so the review panes
-    /// still render; only the bottom action row differs.
-    case refused(message: String, data: ReviewData?)
+    /// that would silently re-refuse. `retryData` is carried so the review
+    /// panes still render; only the bottom action row differs (no Retry).
+    case refused(message: String, retryData: ReviewData?)
+    /// Busy-lock skip (SCR-158): the `screencap upload` child exited cleanly
+    /// after another *process* held the per-recording terminal-stage lock.
+    /// Framed as info, not an error (the recording isn't broken) — but unlike
+    /// `.refused`, it IS retryable, so the action row offers a Retry. `retryData`
+    /// is carried so the panes still render and Retry can re-run without a
+    /// re-prep.
+    case busy(message: String, retryData: ReviewData?)
+
+    /// The review data carried by the current state, if any — the single
+    /// source of truth both the viewmodel (`currentReviewData()`) and the view
+    /// (`currentData()`) delegate to. Exhaustive over every case with NO
+    /// `default:` arm, so adding a future case is a compile error here rather
+    /// than a silent nil. `.preparing`/`.succeeded` carry no payload (a
+    /// completed upload has no ready/retry data to re-enter `.uploading` with —
+    /// see the SCR-90 note in `handleUploadStateChange`'s `.uploading` branch).
+    var reviewData: ReviewData? {
+        switch self {
+        case .ready(let data),
+             .uploading(_, let data):
+            return data
+        case .failed(_, let retryData),
+             .refused(_, let retryData),
+             .busy(_, let retryData):
+            return retryData
+        case .preparing, .succeeded:
+            return nil
+        }
+    }
 }
 
 @MainActor
@@ -279,7 +319,11 @@ final class ReviewWindowViewModel: ObservableObject {
                 startedAt: envelope.startedAt ?? 0,
                 durationSeconds: envelope.durationSeconds ?? 0,
                 redaction: envelope.redaction,
-                coverage: envelope.coverage
+                coverage: envelope.coverage,
+                // SCR-107: a null-timing envelope flagged as a DB-read failure
+                // stays playable but carries the advisory; a missing flag
+                // (older envelope) is treated as no error.
+                timingError: envelope.timingError ?? false
             )
             state = .ready(data)
         } catch {
@@ -288,8 +332,9 @@ final class ReviewWindowViewModel: ObservableObject {
         }
     }
 
-    /// Upload-button action. No-op if the viewmodel isn't in a ready /
-    /// failed (with retry data) state.
+    /// Upload-button action. No-op if the viewmodel isn't in a state that
+    /// carries review data to upload against — ready, or failed / busy with
+    /// retry data (SCR-158).
     func startUpload() {
         // A new upload supersedes any pending success auto-close (SCR-90): if
         // the user re-uploads from a success confirmation, the old dismiss must
@@ -327,21 +372,7 @@ final class ReviewWindowViewModel: ObservableObject {
     }
 
     private func currentReviewData() -> ReviewData? {
-        switch state {
-        case .ready(let data),
-             .uploading(_, let data):
-            return data
-        case .failed(_, let retryData):
-            return retryData
-        case .refused(_, let data):
-            return data
-        case .preparing, .succeeded:
-            // `.succeeded` intentionally returns nil: an upload already
-            // completed, so there is no ready/retry payload to re-enter
-            // `.uploading` with. See the SCR-90 note in
-            // `handleUploadStateChange`'s `.uploading` branch.
-            return nil
-        }
+        state.reviewData
     }
 
     private func handleUploadStateChange(_ uploadState: UploadState) {
@@ -396,7 +427,16 @@ final class ReviewWindowViewModel: ObservableObject {
             // forward (the viewmodel is `.uploading` here, from the optimistic
             // `startUpload`) so the window still renders the review content.
             disarmAutoClose()
-            state = .refused(message: message, data: currentReviewData())
+            state = .refused(message: message, retryData: currentReviewData())
+        case .busy(let message):
+            // SCR-158: a busy-lock skip is NOT a failure — the child exited 0
+            // because another process held the terminal-stage lock transiently.
+            // Surface honest "in progress, try again shortly" copy with a Retry
+            // (unlike `.refused`, a busy-lock clears on its own, so retrying is
+            // the right affordance). Carry the panes data forward so the window
+            // keeps rendering the review content.
+            disarmAutoClose()
+            state = .busy(message: message, retryData: currentReviewData())
         }
     }
 }

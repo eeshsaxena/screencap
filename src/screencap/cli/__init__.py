@@ -1348,7 +1348,7 @@ def info(name, as_json):
     if db_path:
         from datetime import datetime
 
-        started, duration = _read_recording_meta(db_path)
+        started, duration, _ = _read_recording_meta(db_path)
         if started:
             rec_meta["date"] = datetime.fromtimestamp(started).strftime("%Y-%m-%d %H:%M:%S")
         if duration:
@@ -2438,7 +2438,11 @@ def upload(names, all_recordings, dry_run, force, jobs, no_delete):
     # local/legacy/no-intent recording that would otherwise route LOCAL → no-op.
     import signal as _signal
 
-    from screencap._stderr_events import EVENT_UPLOAD_FAILED, emit_event
+    from screencap._stderr_events import (
+        EVENT_UPLOAD_BUSY,
+        EVENT_UPLOAD_FAILED,
+        emit_event,
+    )
     from screencap.pipeline_policy import Destination, RetentionPolicy
     from screencap.terminal_stage import (
         PromotionRefused,
@@ -2521,6 +2525,15 @@ def upload(names, all_recordings, dry_run, force, jobs, no_delete):
                 n_failed += 1
                 continue
             except TerminalStageBusy:
+                # SCR-158: a contended terminal lock is a RETRYABLE skip, not a
+                # failure (exit stays 0). Emit a structured terminal stderr event
+                # BEFORE the human-readable line so the event-first Swift
+                # UploadController maps it to a retry-friendly state instead of
+                # rendering exit-0-without-an-event as a hard failure, and so an
+                # autonomous agent can tell busy-skip apart from a successful
+                # no-op without scraping rich console text. NOT upload_failed —
+                # SCR-79 ties that event to a non-zero exit.
+                emit_event(EVENT_UPLOAD_BUSY, recording=d.name, retryable=True)
                 console.print(
                     f"  [yellow]{d.name}: upload already in progress[/yellow] — a "
                     "recording is finalizing, or another upload / daemon resume holds "

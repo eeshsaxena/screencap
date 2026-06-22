@@ -13,7 +13,8 @@ Active events (emitted in v1):
   permission_lost, capture_unhealthy, capture_recovered, stopped,
   menubar_neutralized_by_env, matrix_disclosure_required,
   lock_metadata_write_failed, terminated_reason_persist_failed,
-  upload_started, upload_file_done, upload_finished, upload_failed
+  upload_started, upload_file_done, upload_finished, upload_failed,
+  upload_busy
 
 Reserved events (schema documented, NOT emitted in v1 — todo 004):
   chunk_finalized — wiring deferred to a follow-up that touches
@@ -103,6 +104,14 @@ EVENT_UPLOAD_STARTED = "upload_started"
 EVENT_UPLOAD_FILE_DONE = "upload_file_done"
 EVENT_UPLOAD_FINISHED = "upload_finished"
 EVENT_UPLOAD_FAILED = "upload_failed"
+# Terminal, NON-failure outcome (SCR-158): ``screencap upload`` skipped a
+# recording because another process held the per-recording terminal-stage lock
+# (a finalize, a daemon resume, or a concurrent upload). It is RETRYABLE and
+# keeps exit 0, so it is deliberately distinct from ``upload_failed`` (which
+# SCR-79 pins to a non-zero exit). The event-first Swift UploadController maps
+# it to a retry-friendly state rather than rendering exit-0-without-an-event as
+# a hard failure; agents read ``retryable`` to tell it apart from a no-op.
+EVENT_UPLOAD_BUSY = "upload_busy"
 
 # Closed set of ``capture_unhealthy`` ``reason`` codes (SCR-76). The reason
 # field rides the daemon EventBus to any same-EUID subscriber, so it MUST be
@@ -184,4 +193,5 @@ __all__ = [
     "EVENT_UPLOAD_FILE_DONE",
     "EVENT_UPLOAD_FINISHED",
     "EVENT_UPLOAD_FAILED",
+    "EVENT_UPLOAD_BUSY",
 ]

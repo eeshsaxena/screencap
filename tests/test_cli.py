@@ -1195,6 +1195,42 @@ def test_upload_busy_shows_friendly_message(tmp_path):
     assert "Traceback" not in result.output
 
 
+def test_upload_busy_emits_structured_stderr_event(tmp_path):
+    """SCR-158: a ``TerminalStageBusy`` skip must emit a structured ``upload_busy``
+    stderr event (``retryable=True``) so the event-first Swift UploadController and
+    autonomous agents can tell a retryable busy-lock apart from a silent no-op —
+    instead of exit-0-without-a-terminal-event being rendered as a hard failure.
+    Stays exit 0, and is deliberately NOT an ``upload_failed`` event (SCR-79 ties
+    that event to a non-zero exit)."""
+    rec_dir = _make_upload_recording(tmp_path, "rec-busy")
+    # Click 8.2 always captures stderr separately; result.stderr holds the
+    # structured lifecycle events (emit_event writes to sys.stderr).
+    runner = CliRunner()
+    from screencap.terminal_stage import TerminalStageBusy
+
+    def _busy(d, **kw):
+        raise TerminalStageBusy("held")
+
+    with (
+        mock.patch("screencap.upload.resolve_recording_dirs", return_value=[rec_dir]),
+        mock.patch("screencap.terminal_stage.run_terminal_stage", _busy),
+    ):
+        result = runner.invoke(cli, ["upload", "rec-busy"])
+
+    assert result.exit_code == 0
+    events = [
+        json.loads(line)
+        for line in result.stderr.splitlines()
+        if line.strip().startswith("{")
+    ]
+    busy = [e for e in events if e.get("type") == "upload_busy"]
+    assert busy, f"expected an upload_busy event on stderr, got: {result.stderr!r}"
+    assert busy[0]["retryable"] is True
+    assert busy[0]["recording"] == "rec-busy"
+    # SCR-79: a busy skip is exit 0, so it must not masquerade as upload_failed.
+    assert not any(e.get("type") == "upload_failed" for e in events)
+
+
 def test_upload_busy_plus_success_exits_zero(tmp_path):
     """SCR-79: in a multi-recording batch, a ``TerminalStageBusy`` skip is
     retryable (n_busy), not a failure — so a batch where one recording is busy and

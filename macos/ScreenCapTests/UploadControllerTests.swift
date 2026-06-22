@@ -152,6 +152,31 @@ final class UploadControllerTests: XCTestCase {
         }
     }
 
+    /// SCR-158: an `upload_busy` event (a contended terminal-stage lock held by
+    /// another process) is a retryable, terminal, NON-failure outcome. The
+    /// controller must land on `.busy` — distinct from `.failed` — and the
+    /// child's subsequent exit 0 must NOT overwrite it (first-write-wins).
+    /// Without the explicit handler, exit-0-without-a-terminal-event would
+    /// render as `.failed("upload exited with code 0")`, the SCR-158 bug.
+    func testUploadBusyEventTransitionsToBusyNotFailed() {
+        let service = FakeUploadService()
+        let controller = makeController(service: service)
+
+        controller.start(name: "rec-001")
+        service.emit(#"{"type": "upload_busy", "schema_version": 1, "recording": "rec-001", "retryable": true}"#)
+        // Busy-skip keeps exit 0 (SCR-79); the terminationHandler fires after
+        // the event and must defer to it, not clobber `.busy` with `.failed`.
+        service.terminate(exitCode: 0)
+
+        guard case .busy(let msg) = controller.state else {
+            return XCTFail("expected busy state, got \(controller.state)")
+        }
+        // Pin a stable keyword of the synthesized copy, not just non-emptiness,
+        // so a silent copy regression is caught — mirrors the `.refused` /
+        // CLI "in progress" assertions.
+        XCTAssertTrue(msg.contains("in progress"), "got: \(msg)")
+    }
+
     /// Covers AE4 — cancel mid-upload sends SIGTERM via terminate(), Python
     /// emits upload_failed(error: "interrupted"), state lands on failed.
     func testCancelMidUploadTerminatesProcessAndStateLandsOnFailedInterrupted() {
@@ -567,6 +592,33 @@ final class UploadControllerTests: XCTestCase {
             // pass
         } else {
             XCTFail("B should upload after A's upload_failed released, got \(controllerB.state)")
+        }
+    }
+
+    /// SCR-158 — the `upload_busy` event release path frees the name. A
+    /// busy-skip is a terminal, NON-failure outcome (exit 0), but it must still
+    /// release the cross-window claim like every other terminal path, so a
+    /// second controller (e.g. a Retry from another window) can take over: A
+    /// emits `upload_busy` then exits 0, and B `start`-ing the same recording
+    /// reaches `.uploading`, not `.refused`. Pins that `.busy` doesn't strand
+    /// the claim (the inverse would leave B refused forever).
+    func testNameReleasedAfterUploadBusyEventAllowsSecondController() {
+        let serviceA = FakeUploadService()
+        let serviceB = FakeUploadService()
+        let controllerA = makeController(service: serviceA)
+        let controllerB = makeController(service: serviceB)
+
+        controllerA.start(name: "rec-001")
+        serviceA.emit(#"{"type": "upload_busy", "schema_version": 1, "recording": "rec-001", "retryable": true}"#)
+        serviceA.terminate(exitCode: 0)
+
+        controllerB.start(name: "rec-001")
+
+        XCTAssertEqual(serviceB.startedNames, ["rec-001"], "name should be free after A's upload_busy event")
+        if case .uploading = controllerB.state {
+            // pass
+        } else {
+            XCTFail("B should upload after A's upload_busy released, got \(controllerB.state)")
         }
     }
 
