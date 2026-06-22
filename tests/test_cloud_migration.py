@@ -501,6 +501,7 @@ def test_stage_dry_run_refuses_with_public_default_object_acl(store, client):
     store.default_object_acl = [{"entity": "allAuthenticatedUsers", "role": "READER"}]
     with pytest.raises(MigrationError, match="default object ACL"):
         core.run_stage(client=client, bucket_name=BUCKET, dry_run=True, probe=IDLE, log=lambda _m: None)
+    assert store.rewrite_log == []  # never started copying
 
 
 def test_stage_proceeds_when_ubla_enabled_even_with_public_default_acl(store, client):
@@ -557,6 +558,20 @@ def test_stage_fails_closed_when_bucket_reload_errors(store, client):
 
     _seed_two_recordings(store)
     store.reload_error = Forbidden("missing storage.buckets.get / defaultObjectAcl read")
+    with pytest.raises(MigrationError, match="could not read bucket metadata"):
+        core.run_stage(client=client, bucket_name=BUCKET, dry_run=False, probe=IDLE, log=lambda _m: None)
+    assert store.rewrite_log == []  # never started copying
+
+
+def test_stage_fails_closed_when_bucket_reload_raises_retry_error(store, client):
+    # RetryError (retry-deadline exhaustion) is NOT a GoogleAPICallError — it sits
+    # under the broader GoogleAPIError base. The pre-check catch must still fail
+    # closed with a MigrationError rather than letting the raw error escape as an
+    # uncaught traceback (exit 1).
+    from google.api_core.exceptions import RetryError
+
+    _seed_two_recordings(store)
+    store.reload_error = RetryError("retry deadline exceeded", TimeoutError("transient"))
     with pytest.raises(MigrationError, match="could not read bucket metadata"):
         core.run_stage(client=client, bucket_name=BUCKET, dry_run=False, probe=IDLE, log=lambda _m: None)
     assert store.rewrite_log == []  # never started copying
@@ -875,6 +890,17 @@ def test_stage_cli_public_iam_returns_error_code(store, client, patch_build_clie
 
     _seed_two_recordings(store)
     store.iam_bindings = [{"role": "roles/storage.objectViewer", "members": {"allUsers"}}]
+    rc = stage_cli.main(["--bucket", BUCKET, "--manifest", str(tmp_path / "m.json")])
+    assert rc == 2  # MigrationError -> exit 2
+
+
+def test_stage_cli_public_default_object_acl_returns_error_code(store, client, patch_build_client, tmp_path):
+    import migrate_flat_to_staging as stage_cli
+
+    _seed_two_recordings(store)
+    store.ubla_enabled = False
+    store.public_access_prevention = "inherited"
+    store.default_object_acl = [{"entity": "allUsers", "role": "READER"}]
     rc = stage_cli.main(["--bucket", BUCKET, "--manifest", str(tmp_path / "m.json")])
     assert rc == 2  # MigrationError -> exit 2
 

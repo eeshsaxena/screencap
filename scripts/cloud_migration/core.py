@@ -138,18 +138,19 @@ class MigrationError(RuntimeError):
 
 
 @contextmanager
-def _refuse_on_gcs_error(what: str):
+def _refuse_on_gcs_error(what: str) -> Iterator[None]:
     """Convert a GCS API failure during a pre-check READ into a fail-closed
     ``MigrationError``, so a transient/permission/not-found error refuses to stage
     with an actionable message + clean exit code rather than an uncaught traceback.
     A pre-check that cannot confirm the bucket is private must NOT proceed.
     """
-    # google.api_core is imported lazily so core stays SDK-free at import scope.
-    from google.api_core.exceptions import GoogleAPICallError
+    # google.api_core + google.auth are imported lazily so core stays SDK-free at import scope.
+    from google.api_core.exceptions import GoogleAPIError
+    from google.auth.exceptions import GoogleAuthError
 
     try:
         yield
-    except GoogleAPICallError as exc:
+    except (GoogleAPIError, GoogleAuthError) as exc:
         raise MigrationError(
             f"refusing to stage: could not read {what} to verify the bucket is "
             f"private ({exc}). The Step 0 pre-checks need bucket IAM + metadata + "
