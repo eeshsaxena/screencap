@@ -176,7 +176,7 @@ def serve(
                 console.print(f"[green]{result.state}[/green]: {result.plist_path}")
                 return
             if result.state == launchagent.STATE_INSTALL_FAILED_ALREADY_RUNNING:
-                console.print(f"[red]{result.state}[/red]: {result.detail}")
+                console.print(f"[red]{result.state}[/red]: {escape(str(result.detail))}")
                 # Surface the actionable remediation: if `result.detail`
                 # carried a `pid={N}` clause from launchagent.install(),
                 # the operator can `kill {pid}` directly. Otherwise
@@ -195,7 +195,7 @@ def serve(
                         "installed agent, then re-run [bold]screencap serve --install[/bold]."
                     )
                 raise SystemExit(1)
-            console.print(f"[red]{result.state}[/red]: {result.detail}")
+            console.print(f"[red]{result.state}[/red]: {escape(str(result.detail))}")
             raise SystemExit(1)
 
         if uninstall:
@@ -203,18 +203,18 @@ def serve(
             if result.state == launchagent.STATE_UNINSTALLED:
                 console.print(f"[green]{result.state}[/green]: {result.plist_path}")
                 return
-            console.print(f"[red]{result.state}[/red]: {result.detail}")
+            console.print(f"[red]{result.state}[/red]: {escape(str(result.detail))}")
             raise SystemExit(1)
 
         result = launchagent.status()
         if result.state == launchagent.STATE_LOADED:
             state_detail = result.launchd_state or "unknown"
-            console.print(f"[green]{launchagent.STATE_LOADED}[/green]: {state_detail}")
+            console.print(f"[green]{launchagent.STATE_LOADED}[/green]: {escape(str(state_detail))}")
             return
         if result.state == launchagent.STATE_NOT_LOADED:
             console.print(f"[yellow]{launchagent.STATE_NOT_LOADED}[/yellow]")
             return
-        console.print(f"[red]{result.state}[/red]: {result.detail}")
+        console.print(f"[red]{result.state}[/red]: {escape(str(result.detail))}")
         raise SystemExit(1)
 
     from screencap.daemon.server import serve as _serve
@@ -810,7 +810,7 @@ def start(
                 try:
                     _download_nlp_models()
                 except (OSError, RuntimeError, ImportError) as exc:
-                    console.print(f"[yellow]Warning:[/] Download failed: {exc}")
+                    console.print(f"[yellow]Warning:[/] Download failed: {escape(str(exc))}")
             if not are_nlp_models_cached():
                 if click.confirm(
                     "Record locally instead? You can 'screencap upload' later "
@@ -1152,7 +1152,7 @@ def _auto_export(capture_dir: Path) -> None:
             console.print("[yellow]Warning:[/yellow] Recording contains no events.")
     except Exception as e:
         console.print(
-            f"[yellow]Warning:[/yellow] Could not auto-export events.jsonl ({e}). "
+            f"[yellow]Warning:[/yellow] Could not auto-export events.jsonl ({escape(str(e))}). "
             f"Run 'screencap export {capture_dir.name}' manually."
         )
 
@@ -1307,7 +1307,7 @@ def view(name, regenerate, max_events):
         console.print(_RECORD_EXTRAS_MSG)
         sys.exit(1)
     except (FileNotFoundError, RuntimeError, ValueError) as e:
-        console.print(f"[red]Error:[/red] {e}")
+        console.print(f"[red]Error:[/red] {escape(str(e))}")
         sys.exit(1)
 
 
@@ -1329,7 +1329,7 @@ def info(name, as_json):
 
     recording_dir = get_recordings_dir() / name
     if not recording_dir.exists():
-        console.print(f"[red]Error:[/red] Recording not found: {name}")
+        console.print(f"[red]Error:[/red] Recording not found: {escape(str(name))}")
         sys.exit(1)
 
     # Read recording intent
@@ -1539,7 +1539,7 @@ def _export_one(
                     )
                 except KekUnavailableError as e:
                     err_console.print(
-                        f"[red]Error:[/red] Cannot decrypt network bodies: {e}. "
+                        f"[red]Error:[/red] Cannot decrypt network bodies: {escape(str(e))}. "
                         "Run `screencap network uninstall && screencap start "
                         "--network` to regenerate (existing encrypted bodies "
                         "will be lost).",
@@ -1578,7 +1578,7 @@ def _export_one(
             network_scrub_pipeline=network_scrub_pipeline,
         )
     except ExportError as e:
-        err_console.print(f"[red]Error:[/red] {e}")
+        err_console.print(f"[red]Error:[/red] {escape(str(e))}")
         return -1
 
 
@@ -1700,7 +1700,7 @@ def review_data_cmd(name, as_json):
         if as_json:
             click.echo(json.dumps(err_payload))
         else:
-            console.print(f"[red]Error:[/red] {e}")
+            console.print(f"[red]Error:[/red] {escape(str(e))}")
         sys.exit(1)
 
     if as_json:
@@ -1778,7 +1778,7 @@ def whoami_cmd(as_json):
                 {"ok": False, "schema_version": _AUTH_SCHEMA_VERSION, "error": str(e)}
             ))
             sys.exit(1)
-        console.print(f"[red]Error checking sign-in state:[/red] {e}")
+        console.print(f"[red]Error checking sign-in state:[/red] {escape(str(e))}")
         sys.exit(1)
     if as_json:
         envelope = {"ok": True, "schema_version": _AUTH_SCHEMA_VERSION, **info}
@@ -1872,7 +1872,7 @@ def export(name, all_recordings, downloads, output, use_stdout, exclude_moves, p
             if count >= 0:
                 err_console.print(f"Exported {count} events to [bold]{out}[/bold]")
                 if count == 0:
-                    err_console.print(f"[yellow]Warning:[/yellow] Recording '{rec_dir.name}' contains no events.")
+                    err_console.print(f"[yellow]Warning:[/yellow] Recording '{escape(str(rec_dir.name))}' contains no events.")
                 exported += 1
             else:
                 failed += 1
@@ -1894,7 +1894,7 @@ def export(name, all_recordings, downloads, output, use_stdout, exclude_moves, p
         recording_dir = get_downloads_dir() / name
 
     if not recording_dir.exists():
-        err_console.print(f"[red]Error:[/red] Recording not found: {name}")
+        err_console.print(f"[red]Error:[/red] Recording not found: {escape(str(name))}")
         sys.exit(1)
 
     # Resolve output destination. Network rows are emitted ONLY when
@@ -1997,7 +1997,7 @@ def apps(as_json, include_spotlight):
             }) + "\n")
             sys.stdout.flush()
         else:
-            err_console.print(f"[red]Error:[/red] {exc}")
+            err_console.print(f"[red]Error:[/red] {escape(str(exc))}")
         raise SystemExit(1)
 
     # ``has_per_frame_overrides`` (todo 008, schema v2): per-app
@@ -2286,7 +2286,7 @@ def stop(force, as_json):
     except SchemaMismatchError as exc:
         _stop_outcome["error"] = "schema_mismatch"
         if not as_json:
-            console.print(f"[red]Error:[/red] {exc}")
+            console.print(f"[red]Error:[/red] {escape(str(exc))}")
             console.print(
                 "Update the daemon: [bold]launchctl kickstart -kp "
                 "gui/$UID/com.screencap.daemon[/bold]"
@@ -2306,7 +2306,7 @@ def stop(force, as_json):
             return
         _stop_outcome["error"] = code
         if not as_json:
-            console.print(f"[red]Daemon error:[/red] {code}")
+            console.print(f"[red]Daemon error:[/red] {escape(str(code))}")
         _emit_stop_result(ok=False, exit_code=1)
         return
 
@@ -2321,7 +2321,7 @@ def stop(force, as_json):
             console.print(f"[#22d3ee]Recording {label}.[/#22d3ee]")
         else:
             console.print(
-                f"[yellow]Daemon reported final_state={_stop_outcome['final_state']!r}.[/yellow]"
+                f"[yellow]Daemon reported final_state={escape(repr(_stop_outcome['final_state']))}.[/yellow]"
             )
     _emit_stop_result(ok=True)
 
@@ -2376,7 +2376,7 @@ def upload(names, all_recordings, dry_run, force, jobs, no_delete):
     try:
         dirs = resolve_recording_dirs(names, all_recordings=all_recordings)
     except (FileNotFoundError, ValueError) as e:
-        console.print(f"[red]Error:[/red] {e}")
+        console.print(f"[red]Error:[/red] {escape(str(e))}")
         sys.exit(1)
 
     # Cloud upload requires a signed-in account (R2). Check once up-front so we
@@ -2515,7 +2515,7 @@ def upload(names, all_recordings, dry_run, force, jobs, no_delete):
                 )
             except PromotionRefused as e:
                 console.print(
-                    f"[red]Error:[/red] {e}\n"
+                    f"[red]Error:[/red] {escape(str(e))}\n"
                     "[dim]Upload skipped — nothing was changed.[/dim]"
                 )
                 n_failed += 1
@@ -2529,7 +2529,7 @@ def upload(names, all_recordings, dry_run, force, jobs, no_delete):
                 n_busy += 1
                 continue
             except FileNotFoundError as e:
-                console.print(f"[red]Error:[/red] {e}")
+                console.print(f"[red]Error:[/red] {escape(str(e))}")
                 n_failed += 1
                 continue
             except RuntimeError as e:
@@ -2544,7 +2544,7 @@ def upload(names, all_recordings, dry_run, force, jobs, no_delete):
                 # logic — still per-recording. Treat it like the PromotionRefused /
                 # FileNotFoundError handlers above; the `if n_failed: sys.exit(1)`
                 # gate below still yields the non-zero exit code (SCR-79).
-                console.print(f"[red]Error:[/red] {e}")
+                console.print(f"[red]Error:[/red] {escape(str(e))}")
                 n_failed += 1
                 continue
 
@@ -2558,7 +2558,7 @@ def upload(names, all_recordings, dry_run, force, jobs, no_delete):
             # recording did not fully converge — local media is preserved.
             if result.failed_indices or result.upload_warning:
                 if result.upload_warning:
-                    console.print(f"  [yellow]Warning:[/yellow] {result.upload_warning}")
+                    console.print(f"  [yellow]Warning:[/yellow] {escape(str(result.upload_warning))}")
                 if result.failed_indices:
                     console.print(
                         f"  [yellow]{d.name}: {len(result.failed_indices)} chunk(s) could "
@@ -2639,7 +2639,7 @@ def download(names, dest, dry_run, force, jobs):
     try:
         dest_dir = _resolve_dest_dir(dest)
     except RuntimeError as e:
-        console.print(f"[red]Error:[/red] {e}")
+        console.print(f"[red]Error:[/red] {escape(str(e))}")
         sys.exit(1)
 
     if names:
@@ -2649,7 +2649,7 @@ def download(names, dest, dry_run, force, jobs):
         try:
             remote = list_remote_recordings()
         except RuntimeError as e:
-            console.print(f"[red]Error:[/red] {e}")
+            console.print(f"[red]Error:[/red] {escape(str(e))}")
             sys.exit(1)
 
         if not remote:
@@ -2686,10 +2686,10 @@ def download(names, dest, dry_run, force, jobs):
                     f"({len(result.downloaded)} files, {_fmt_size(result.total_bytes)})"
                 )
         except FileNotFoundError as e:
-            console.print(f"  [red]Error:[/red] {e}")
+            console.print(f"  [red]Error:[/red] {escape(str(e))}")
             all_failed += 1
         except RuntimeError as e:
-            console.print(f"  [red]Error:[/red] {e}")
+            console.print(f"  [red]Error:[/red] {escape(str(e))}")
             all_failed += 1
 
     if not dry_run:
@@ -2717,7 +2717,7 @@ def transcribe(name, model):
 
     if not audio_path.exists():
         console.print(
-            f"[red]Error:[/red] No audio found for recording '{name}'. "
+            f"[red]Error:[/red] No audio found for recording '{escape(str(name))}'. "
             "Was it recorded with audio enabled?"
         )
         sys.exit(1)
@@ -2770,7 +2770,7 @@ def transcribe(name, model):
             console.print(f"[dim]Using Whisper ({backend_param} model)...[/dim]")
             local_fn(audio_path, transcript_path, transcript_json_path, backend_param)
         except Exception as e:
-            console.print(f"[red]Transcription failed:[/red] {e}")
+            console.print(f"[red]Transcription failed:[/red] {escape(str(e))}")
             sys.exit(1)
 
     # Fix #2: hard-check that output was actually created
@@ -2828,17 +2828,17 @@ def scrub(name: str, pii_engine: str | None) -> None:
     try:
         scrub_recording(name, pii_engine=pii_engine)
     except FileNotFoundError as e:
-        console.print(f"[red]Error:[/red] {e}")
+        console.print(f"[red]Error:[/red] {escape(str(e))}")
         raise SystemExit(1)
     except ImportError as e:
         console.print(
             "[red]Error: Privacy dependencies are missing.[/red]\n"
             "Reinstall or update screencap."
         )
-        console.print(f"[dim]{e}[/dim]")
+        console.print(f"[dim]{escape(str(e))}[/dim]")
         raise SystemExit(1)
     except ValueError as e:
-        console.print(f"[red]Error:[/red] {e}")
+        console.print(f"[red]Error:[/red] {escape(str(e))}")
         raise SystemExit(1)
 
 
@@ -2913,17 +2913,17 @@ def settings(ctx, set_pair, as_json):
             elif raw_value.lower() in ("false", "0", "no"):
                 value = False
             else:
-                console.print(f"[red]Error:[/red] {key} must be true or false, got: {raw_value}")
+                console.print(f"[red]Error:[/red] {escape(str(key))} must be true or false, got: {escape(str(raw_value))}")
                 raise SystemExit(1)
         elif key in _CHOICE_KEYS:
             valid = _CHOICE_KEYS[key]
             if raw_value.lower() not in valid:
-                console.print(f"[red]Error:[/red] {key} must be one of {valid}, got: {raw_value}")
+                console.print(f"[red]Error:[/red] {escape(str(key))} must be one of {valid}, got: {escape(str(raw_value))}")
                 raise SystemExit(1)
             value = raw_value.lower()
         else:
             all_keys = sorted(_BOOL_KEYS | set(_CHOICE_KEYS.keys()))
-            console.print(f"[red]Error:[/red] Unknown setting: {key}")
+            console.print(f"[red]Error:[/red] Unknown setting: {escape(str(key))}")
             console.print(f"[dim]Available: {', '.join(all_keys)}[/dim]")
             raise SystemExit(1)
 
@@ -3174,15 +3174,15 @@ def settings_privacy(field, op, value, as_json):
 
     if not (is_list or is_scalar or is_map):
         all_fields = sorted(_PRIVACY_LIST_FIELDS + _PRIVACY_SCALAR_FIELDS + _PRIVACY_MAP_FIELDS)
-        err_console.print(f"[red]Error:[/red] Unknown privacy field: {field}")
+        err_console.print(f"[red]Error:[/red] Unknown privacy field: {escape(str(field))}")
         err_console.print(f"[dim]Available: {', '.join(all_fields)}[/dim]")
         _result(False, exit_code=1, error=f"unknown_field:{field}")
 
     if is_list and op == "set":
-        err_console.print(f"[red]Error:[/red] {field} is a list — use add/remove, not set.")
+        err_console.print(f"[red]Error:[/red] {escape(str(field))} is a list — use add/remove, not set.")
         _result(False, exit_code=1, error=f"list_field_set_op:{field}")
     if is_scalar and op != "set":
-        err_console.print(f"[red]Error:[/red] {field} is a scalar — use set, not {op}.")
+        err_console.print(f"[red]Error:[/red] {escape(str(field))} is a scalar — use set, not {escape(str(op))}.")
         _result(False, exit_code=1, error=f"scalar_field_bad_op:{field}={op}")
 
     value = _privacy_list_field_value(value)
@@ -3194,7 +3194,7 @@ def settings_privacy(field, op, value, as_json):
             if value.lower() not in _PRIVACY_MODE_VALUES:
                 err_console.print(
                     f"[red]Error:[/red] mode must be one of "
-                    f"{_PRIVACY_MODE_VALUES}, got: {value}"
+                    f"{_PRIVACY_MODE_VALUES}, got: {escape(str(value))}"
                 )
                 _result(False, exit_code=1, error=f"invalid_mode:{value}")
             parsed_value = value.lower()
@@ -3205,7 +3205,7 @@ def settings_privacy(field, op, value, as_json):
                 parsed_value = False
             else:
                 err_console.print(
-                    f"[red]Error:[/red] {field} must be true/false, got: {value}"
+                    f"[red]Error:[/red] {escape(str(field))} must be true/false, got: {escape(str(value))}"
                 )
                 _result(False, exit_code=1, error=f"invalid_bool:{field}={value}")
 
@@ -3233,7 +3233,7 @@ def settings_privacy(field, op, value, as_json):
         )
 
     if changed:
-        err_console.print(f"  [bold]privacy.{field}[/bold] {op} {value}")
+        err_console.print(f"  [bold]privacy.{escape(str(field))}[/bold] {escape(str(op))} {escape(str(value))}")
         _result(True, changed=True)
 
 
@@ -3302,7 +3302,7 @@ def _settings_privacy_apply(
             )
             if blocking_action is not None:
                 err_console.print(
-                    f"[red]Error:[/red] '{value}' is in {effective_class.value} which the "
+                    f"[red]Error:[/red] '{escape(str(value))}' is in {effective_class.value} which the "
                     f"privacy matrix at mode={configured_mode!r} produces "
                     f"{blocking_action.value} — allow_apps cannot loosen this. "
                     f"Set mode=public to capture broadly, or override at the "
@@ -3324,10 +3324,10 @@ def _settings_privacy_apply(
             # reason about it. Keeps the privacy-first posture symmetric
             # with how PASSWORD_MANAGER and friends are handled.
             err_console.print(
-                f"[red]Error:[/red] '{value}' is not in BUNDLE_ID_MAP and has no "
+                f"[red]Error:[/red] '{escape(str(value))}' is not in BUNDLE_ID_MAP and has no "
                 f"app_classes override — refusing to allow-list an unclassified "
                 f"bundle. Run [bold]screencap settings privacy app_classes set "
-                f"{value}=<class>[/bold] first (e.g., browser_unverified for an "
+                f"{escape(str(value))}=<class>[/bold] first (e.g., browser_unverified for an "
                 f"AI tool), then add to allow_apps if needed."
             )
             _result(
@@ -3348,13 +3348,13 @@ def _settings_privacy_apply(
         if op == "add":
             if value in arr:
                 # Idempotent no-op
-                err_console.print(f"[dim]{field} already contains {value} — no change.[/dim]")
+                err_console.print(f"[dim]{escape(str(field))} already contains {escape(str(value))} — no change.[/dim]")
                 _result(True, changed=False)
                 return False
             arr.append(value)
         else:  # remove
             if value not in arr:
-                err_console.print(f"[dim]{field} does not contain {value} — no change.[/dim]")
+                err_console.print(f"[dim]{escape(str(field))} does not contain {escape(str(value))} — no change.[/dim]")
                 _result(True, changed=False)
                 return False
             arr.remove(value)
@@ -3397,7 +3397,7 @@ def _settings_privacy_apply(
                     new_action = get_matrix_action(fallback_class, _mode_enum)
                     if _ACTION_SEVERITY[new_action] > _ACTION_SEVERITY[old_action]:
                         err_console.print(
-                            f"[red]Error:[/red] removing the '{bundle}' classification "
+                            f"[red]Error:[/red] removing the '{escape(str(bundle))}' classification "
                             f"would revert it from {old_class.value} ({old_action.value}) "
                             f"to {fallback_class.value} ({new_action.value}) at "
                             f"mode={configured_mode!r} — that loosens the matrix and is "
@@ -3418,7 +3418,7 @@ def _settings_privacy_apply(
         else:  # add or set
             if "=" not in value:
                 err_console.print(
-                    f"[red]Error:[/red] map field {field} requires BUNDLE_ID=CLASS for {op}, got: {value}"
+                    f"[red]Error:[/red] map field {escape(str(field))} requires BUNDLE_ID=CLASS for {escape(str(op))}, got: {escape(str(value))}"
                 )
                 _result(False, exit_code=1, error=f"map_value_missing_eq:{field}={value}")
             bundle, ctx_str = value.split("=", 1)
@@ -3432,7 +3432,7 @@ def _settings_privacy_apply(
             normalized = ctx_str.lower()
             if normalized not in valid_classes:
                 err_console.print(
-                    f"[red]Error:[/red] Unknown context class: {ctx_str}"
+                    f"[red]Error:[/red] Unknown context class: {escape(str(ctx_str))}"
                 )
                 err_console.print(
                     f"[dim]Available: {', '.join(sorted(valid_classes))}[/dim]"
@@ -3492,7 +3492,7 @@ def _settings_privacy_apply(
                 # were "blocking".
                 if _ACTION_SEVERITY[new_action] > _ACTION_SEVERITY[old_action]:
                     err_console.print(
-                        f"[red]Error:[/red] reclassifying '{bundle}' from "
+                        f"[red]Error:[/red] reclassifying '{escape(str(bundle))}' from "
                         f"{old_class.value} to {new_class.value} would loosen "
                         f"the matrix at mode={configured_mode!r} from "
                         f"{old_action.value} to {new_action.value} — rejected. "
@@ -3839,7 +3839,7 @@ def network_preload_pin_cmd(host: str) -> None:
         if host_lc in existing:
             console.print(f"[dim]{host_lc} already in known-pinned-hosts list.[/dim]")
         else:
-            console.print(f"[red]Failed to persist[/red] {host_lc}")
+            console.print(f"[red]Failed to persist[/red] {escape(str(host_lc))}")
             sys.exit(1)
 
 
@@ -3942,7 +3942,7 @@ def network_remove_kek_cmd(force: bool) -> None:
                 f"encrypted network bodies that depend on this KEK:"
             )
             for name in encrypted_recordings:
-                console.print(f"  • {name}")
+                console.print(f"  • {escape(str(name))}")
         if unreadable_recordings:
             console.print(
                 f"[red]Refusing to delete KEK:[/red] "
@@ -3950,7 +3950,7 @@ def network_remove_kek_cmd(force: bool) -> None:
                 f"scanned for encrypted bodies and may still need this KEK:"
             )
             for entry in unreadable_recordings:
-                console.print(f"  • {entry}")
+                console.print(f"  • {escape(str(entry))}")
             console.print(
                 "[dim]Unreadable recordings fail closed — re-run after "
                 "removing the bad recordings, or pass [bold]--force[/bold] "
@@ -3981,7 +3981,7 @@ def network_remove_kek_cmd(force: bool) -> None:
                 f"scanned and will lose access to this KEK:"
             )
             for entry in unreadable_recordings:
-                console.print(f"  • {entry}")
+                console.print(f"  • {escape(str(entry))}")
 
     try:
         import keyring  # noqa: PLC0415
@@ -3994,7 +3994,7 @@ def network_remove_kek_cmd(force: bool) -> None:
         if "no such password" in msg or "not found" in msg or "passworddeleteerror" in type(exc).__name__.lower():
             console.print("[dim]No KEK present in Keychain (already removed).[/dim]")
         else:
-            console.print(f"[red]Failed to delete KEK:[/red] {exc}")
+            console.print(f"[red]Failed to delete KEK:[/red] {escape(str(exc))}")
             sys.exit(1)
 
 
@@ -4062,9 +4062,9 @@ def smoke_test(verbose):
             # err contains the full traceback; show last line for summary,
             # full traceback when --verbose
             err_summary = err.strip().rsplit("\n", 1)[-1]
-            console.print(f"  [red]\\[FAIL][/red] {name} — {err_summary}")
+            console.print(f"  [red]\\[FAIL][/red] {name} — {escape(str(err_summary))}")
             if verbose:
-                console.print(err)
+                console.print(escape(str(err)))
 
     passed_count = sum(1 for _, p, _ in results if p)
     total = len(results)
@@ -4173,12 +4173,12 @@ def network_dump(name, limit, kind, host_substr, verbose):
 
     recording_dir = get_recordings_dir() / name
     if not recording_dir.exists():
-        console.print(f"[red]Error:[/red] Recording not found: {name}")
+        console.print(f"[red]Error:[/red] Recording not found: {escape(str(name))}")
         sys.exit(1)
     db_path = recording_dir / "recording.db"
     if not db_path.is_file():
         console.print(
-            f"[red]Error:[/red] recording.db not found in {recording_dir}",
+            f"[red]Error:[/red] recording.db not found in {escape(str(recording_dir))}",
         )
         sys.exit(1)
 
@@ -4189,7 +4189,7 @@ def network_dump(name, limit, kind, host_substr, verbose):
     try:
         conn = sqlite3.connect(uri, uri=True)
     except sqlite3.OperationalError as exc:
-        console.print(f"[red]Error:[/red] failed to open {db_path}: {exc}")
+        console.print(f"[red]Error:[/red] failed to open {escape(str(db_path))}: {escape(str(exc))}")
         sys.exit(1)
     try:
         conn.row_factory = sqlite3.Row
@@ -4267,16 +4267,16 @@ def network_dump(name, limit, kind, host_substr, verbose):
                         console.print("    [dim]headers:[/dim]")
                         for entry in headers:
                             if isinstance(entry, (list, tuple)) and len(entry) == 2:
-                                console.print(f"      {entry[0]}: {entry[1]}")
+                                console.print(f"      {escape(str(entry[0]))}: {escape(str(entry[1]))}")
                             else:
-                                console.print(f"      {entry!r}")
+                                console.print(f"      {escape(repr(entry))}")
                 details_json = row["details_json"]
                 if details_json:
                     try:
                         details = json.loads(details_json)
                     except (TypeError, ValueError):
                         details = details_json
-                    console.print(f"    [dim]details:[/dim] {details!r}")
+                    console.print(f"    [dim]details:[/dim] {escape(repr(details))}")
     finally:
         conn.close()
 

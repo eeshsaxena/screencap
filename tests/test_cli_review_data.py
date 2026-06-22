@@ -348,6 +348,34 @@ def test_cli_invalid_name_emits_error_envelope(recordings_root):
     assert "can't process this video" not in payload["error"]
 
 
+def test_cli_human_error_escapes_rich_markup():
+    """SCR-117: the human-readable error sink interpolates exception text into a
+    Rich-markup string. When that text carries markup metacharacters — most
+    dangerously an unbalanced ``[/]`` — Rich raises ``MarkupError``, which the
+    surrounding ``except ReviewPrepareError`` does not catch, so it propagates
+    and crashes the command with a traceback instead of the intended exit-1.
+
+    Patch ``_should_default_to_json`` to force the human path (CliRunner's
+    stdout is non-TTY, which would otherwise auto-select the unaffected --json
+    path). The dynamic segment must be escaped, so the brackets survive verbatim
+    rather than being parsed as markup (and stripped, or crashing)."""
+    from rich.errors import MarkupError
+
+    with mock.patch("screencap.cli._should_default_to_json", return_value=False), \
+         mock.patch(
+             "screencap.review.prepare_review_data",
+             side_effect=ReviewPrepareError("token=[/] in [secret] failed"),
+         ):
+        result = CliRunner().invoke(cli, ["review-data", "some-rec"])
+
+    # Core regression: markup metacharacters in error text must not crash.
+    assert not isinstance(result.exception, MarkupError), result.exception
+    assert result.exit_code == 1
+    # Escaped, so the literal brackets are preserved instead of stripped.
+    assert "[/]" in result.output
+    assert "[secret]" in result.output
+
+
 def test_cli_chunked_recording_stdout_is_clean_json(recordings_root):
     """A multi-chunk recording triggers _ensure_single_video's concat-progress
     prints. Those must go to stderr, leaving stdout as a single parseable JSON
