@@ -245,6 +245,10 @@ final class ReviewWindowViewModel: ObservableObject {
         // Re-entrancy guard: if the user retried after a prep failure, we
         // come through here again; clear the failure surface back to
         // preparing so the spinner is visible while the second call runs.
+        // Only `.failed` is reset: `.refused` (SCR-155) arises post-`ready`
+        // from the upload flow, never during this `.task`-driven prep, so it
+        // is never the live state when `loadReviewData` runs. A future caller
+        // that re-enters from `.refused` must decide whether re-prep is wanted.
         if case .failed = state { state = .preparing }
         do {
             let envelope = try await loader.load(name: recordingName)
