@@ -18,11 +18,18 @@ A second quiesce guard runs first (``--confirm-quiesced`` to attest on an admin
 box without ``screencap``). Always ``--dry-run`` and confirm the empty-prefix
 re-scan before the live run. See ``docs/runbooks/cloud-migration-runbook.md``.
 
+Every run writes a durable per-delete audit log (``--audit-log``, default
+``cloud-migration-decommission-audit.jsonl``): one JSON object per delete/keep,
+flushed per line, mode ``0o600``. It is the crash-safe record of this irreversible
+step — live runs APPEND to it; ``--dry-run`` writes a ``.dryrun.jsonl`` preview.
+
 Usage::
 
     python scripts/decommission_flat_namespace.py --bucket screencap-recordings --dry-run
     python scripts/decommission_flat_namespace.py --bucket screencap-recordings \\
         --include-sessions --confirm
+    python scripts/decommission_flat_namespace.py --bucket screencap-recordings \\
+        --confirm --audit-log /var/log/screencap/decommission.jsonl
 """
 
 from __future__ import annotations
