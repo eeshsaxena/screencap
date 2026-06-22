@@ -18,6 +18,7 @@ from __future__ import annotations
 import json
 import time
 from typing import Any
+from unittest import mock
 
 import httpx
 import pytest
@@ -242,3 +243,53 @@ def test_start_daemon_error_returns_exit_1(stub_daemon):
     }
     result = stub_daemon.invoke(["start", "--name", "demo", "--local"])
     assert result.exit_code == 1, result.output
+
+
+# ---------------------------------------------------------------------------
+# Cloud NLP-model gate (SCR-52)
+#
+# ``screencap start --cloud`` refuses to start when the NLP models needed to
+# scrub cloud-bound PII are not cached. The gate is owned by the CLI
+# (src/screencap/cli/__init__.py) and fires *before* the daemon handoff — there
+# is no daemon-side ``models_not_cached`` envelope, so the regression surface is
+# the client boundary, not the request handler. These replace the skipped
+# ``test_cloud_start_nlp_model_gate`` in tests/test_cli.py, ported to the
+# Phase 2 daemon-client architecture. ``stub_daemon`` runs non-interactively
+# (``_stdin_is_tty`` → False), so the gate takes its hard-fail branch.
+# ---------------------------------------------------------------------------
+
+
+def test_cloud_start_blocked_when_models_missing(stub_daemon):
+    """Non-interactive cloud start with no cached models: exit 1, an actionable
+    ``screencap setup`` message, and the daemon is never contacted — the gate
+    fires before ``POST /v0/recording.start``."""
+    with mock.patch(
+        "screencap.redaction.are_nlp_models_cached", return_value=False
+    ):
+        result = stub_daemon.invoke(["start", "--name", "demo", "--cloud"])
+    assert result.exit_code == 1, result.output
+    assert "setup" in result.output  # points at ``screencap setup --scan``
+    # No payload reached the daemon: the gate short-circuits the handoff.
+    assert stub_daemon.captured_start == {}
+
+
+def test_cloud_start_proceeds_when_models_cached(stub_daemon):
+    """Cached models let the cloud start through: the daemon is POSTed with
+    ``cloud_intent=True`` and the clean finalize maps to exit 0. Guards against
+    a gate that over-blocks every cloud recording."""
+    with mock.patch(
+        "screencap.redaction.are_nlp_models_cached", return_value=True
+    ):
+        result = stub_daemon.invoke(["start", "--name", "demo", "--cloud"])
+    assert result.exit_code == 0, result.output
+    assert stub_daemon.captured_start["cloud_intent"] is True
+
+
+def test_local_start_skips_model_probe(stub_daemon):
+    """The gate is cloud-scoped: a ``--local`` start never consults the model
+    cache and proceeds straight to the daemon with ``cloud_intent=False``."""
+    with mock.patch("screencap.redaction.are_nlp_models_cached") as probe:
+        result = stub_daemon.invoke(["start", "--name", "demo", "--local"])
+    assert result.exit_code == 0, result.output
+    probe.assert_not_called()
+    assert stub_daemon.captured_start["cloud_intent"] is False
