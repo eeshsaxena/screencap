@@ -138,6 +138,30 @@ struct FailClosedCallout: View {
     }
 }
 
+/// Non-blocking timing advisory (SCR-107): the recording's timing metadata
+/// couldn't be read — a corrupt, truncated, or otherwise unreadable
+/// `recording.db`. The review stays playable (the video renders), so this is a
+/// degraded-not-failed signal: an amber callout explaining why the timeline is
+/// absent, distinct from the `ok: false` failure path. Renders nothing when
+/// timing read cleanly (including a benign event-free recording).
+struct TimingUnavailableCallout: View {
+    let timingError: Bool
+
+    var body: some View {
+        if timingError {
+            HStack(spacing: 8) {
+                Image(systemName: "exclamationmark.triangle.fill")
+                    .foregroundStyle(.orange)
+                Text("Timeline unavailable — this recording's metadata couldn't be read.")
+                    .font(.caption)
+                Spacer()
+            }
+            .padding(.horizontal, 12).padding(.vertical, 6)
+            .background(.orange.opacity(0.12))
+        }
+    }
+}
+
 /// Persistent (not collapsed) coverage disclosure (R9), rendered from the
 /// envelope's structured `coverage` facts. The allowed-app on-screen-PII blind
 /// spot is emphasized over the benign facts because it is the only one

@@ -84,6 +84,13 @@ struct ReviewDataEnvelope: Decodable, Equatable {
     var screenshots: [String]? = nil
     var redaction: ReviewRedaction? = nil
     var coverage: ReviewCoverage? = nil
+    /// SCR-107 — `true` only when null `startedAt`/`durationSeconds` is due to a
+    /// failed `recording.db` read (corrupt/unreadable), as opposed to a benign
+    /// recording with no action events. Lets the consumer surface a
+    /// non-blocking advisory instead of silently treating a corrupted DB as a
+    /// clean, event-free review. Absent (older envelope) → nil → treated as no
+    /// error.
+    var timingError: Bool? = nil
 
     enum CodingKeys: String, CodingKey {
         case ok
@@ -98,6 +105,7 @@ struct ReviewDataEnvelope: Decodable, Equatable {
         case screenshots
         case redaction
         case coverage
+        case timingError = "timing_error"
     }
 }
 
@@ -119,6 +127,10 @@ struct ReviewData: Equatable {
     let durationSeconds: Double
     let redaction: ReviewRedaction?
     let coverage: ReviewCoverage?
+    /// SCR-107 — the timing metadata couldn't be read (corrupt/unreadable
+    /// `recording.db`). The review is still playable; the panes surface a
+    /// non-blocking advisory and the timeline stays at its 0-origin fallback.
+    let timingError: Bool
 }
 
 /// Test seam over `CLIClient.runJSONRaw` so the review-data fetch can be
@@ -279,7 +291,11 @@ final class ReviewWindowViewModel: ObservableObject {
                 startedAt: envelope.startedAt ?? 0,
                 durationSeconds: envelope.durationSeconds ?? 0,
                 redaction: envelope.redaction,
-                coverage: envelope.coverage
+                coverage: envelope.coverage,
+                // SCR-107: a null-timing envelope flagged as a DB-read failure
+                // stays playable but carries the advisory; a missing flag
+                // (older envelope) is treated as no error.
+                timingError: envelope.timingError ?? false
             )
             state = .ready(data)
         } catch {

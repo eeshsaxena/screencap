@@ -281,24 +281,54 @@ def test_auto_exports_missing_events_with_upload_config(recordings_root):
 
 def test_nullable_metadata_serialized_as_json_null(recordings_root):
     """A playable recording with no action events (``_read_recording_meta``
-    returns None) still yields ok=True with started_at/duration_seconds as
-    JSON null — the Swift side decodes them as Double?."""
+    returns None timing, timing_error=False) still yields ok=True with
+    started_at/duration_seconds as JSON null — the Swift side decodes them as
+    Double?. timing_error is False because the DB read itself succeeded."""
     rec_dir = _make_recording(recordings_root, "rec-nometa")
     _write_video(rec_dir / "video.mp4", (0, 0, 200), pix_fmt="yuv420p")
     (rec_dir / "events.jsonl").write_text(json.dumps({"_meta": True}) + "\n")
 
     with mock.patch(
-        "screencap.catalog._read_recording_meta", return_value=(None, None)
+        "screencap.catalog._read_recording_meta",
+        return_value=(None, None, False),
     ):
         envelope = prepare_review_data("rec-nometa")
 
     assert envelope["ok"] is True
     assert envelope["started_at"] is None
     assert envelope["duration_seconds"] is None
+    # Benign event-free null is NOT a read failure.
+    assert envelope["timing_error"] is False
     # Serialized as JSON null, not omitted and not 0.
     serialized = json.loads(json.dumps(envelope))
     assert serialized["started_at"] is None
     assert serialized["duration_seconds"] is None
+    assert serialized["timing_error"] is False
+
+
+def test_timing_error_flagged_when_db_read_fails(recordings_root):
+    """SCR-107: a swallowed DB-read failure (corrupt/unreadable recording.db)
+    yields ok=True + null timing BUT timing_error=True, so the Swift consumer
+    can surface a non-blocking advisory instead of presenting a corrupted DB
+    as a clean, event-free review."""
+    rec_dir = _make_recording(recordings_root, "rec-badmeta")
+    _write_video(rec_dir / "video.mp4", (0, 0, 200), pix_fmt="yuv420p")
+    (rec_dir / "events.jsonl").write_text(json.dumps({"_meta": True}) + "\n")
+
+    with mock.patch(
+        "screencap.catalog._read_recording_meta",
+        return_value=(None, None, True),
+    ):
+        envelope = prepare_review_data("rec-badmeta")
+
+    # Still playable — the video renders; only the timeline is unavailable.
+    assert envelope["ok"] is True
+    assert envelope["started_at"] is None
+    assert envelope["duration_seconds"] is None
+    # The discriminator that separates corruption from a benign event-free DB.
+    assert envelope["timing_error"] is True
+    serialized = json.loads(json.dumps(envelope))
+    assert serialized["timing_error"] is True
 
 
 # ---------------------------------------------------------------------------

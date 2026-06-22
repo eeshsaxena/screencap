@@ -1348,7 +1348,7 @@ def info(name, as_json):
     if db_path:
         from datetime import datetime
 
-        started, duration = _read_recording_meta(db_path)
+        started, duration, _ = _read_recording_meta(db_path)
         if started:
             rec_meta["date"] = datetime.fromtimestamp(started).strftime("%Y-%m-%d %H:%M:%S")
         if duration:

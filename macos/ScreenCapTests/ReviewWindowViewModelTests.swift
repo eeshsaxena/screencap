@@ -400,8 +400,41 @@ final class ReviewWindowViewModelTests: XCTestCase {
             XCTAssertEqual(data.videoURL.path, "/tmp/video.mp4")
             XCTAssertEqual(data.startedAt, 0, "null started_at falls back to origin 0")
             XCTAssertEqual(data.durationSeconds, 0, "null duration_seconds falls back to unknown (0)")
+            XCTAssertFalse(data.timingError, "benign event-free null is not a read failure")
         } else {
             XCTFail("expected ready for playable recording with null timing, got \(model.state)")
+        }
+    }
+
+    /// SCR-107 — `ok: true` with null timing AND `timing_error: true` is a
+    /// playable recording whose `recording.db` couldn't be read (corrupt /
+    /// unreadable). It must still land on `.ready` (the video plays) but carry
+    /// `timingError` so the panes surface a non-blocking advisory — NOT
+    /// `.failed`, and NOT silently indistinguishable from a clean event-free
+    /// recording. This is the discriminator the SCR-102 fix erased.
+    func testTimingErrorEnvelopeLandsOnReadyWithAdvisoryFlag() async {
+        let loader = FakeReviewDataLoader()
+        loader.nextEnvelope = .init(
+            ok: true,
+            schemaVersion: 2,
+            videoPath: "/tmp/video.mp4",
+            eventsPath: "/tmp/events.jsonl",
+            startedAt: nil,
+            durationSeconds: nil,
+            videoPixfmtRemediated: false,
+            error: nil,
+            timingError: true
+        )
+        let model = makeModel(loader: loader)
+
+        await model.loadReviewData()
+
+        if case .ready(let data) = model.state {
+            XCTAssertTrue(data.timingError, "DB-read failure must set the advisory flag")
+            XCTAssertEqual(data.startedAt, 0, "null timing still falls back to origin 0")
+            XCTAssertEqual(data.durationSeconds, 0)
+        } else {
+            XCTFail("expected ready with advisory for unreadable-DB recording, got \(model.state)")
         }
     }
 

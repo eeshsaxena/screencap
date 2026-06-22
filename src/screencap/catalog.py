@@ -218,8 +218,24 @@ def _ledger_has_uploaded_chunk(db_path: Path) -> bool | None:
         conn.close()
 
 
-def _read_recording_meta(db_path: Path) -> tuple[float | None, float | None]:
-    """Read (started_timestamp, duration_seconds) from a recording.db."""
+def _read_recording_meta(
+    db_path: Path,
+) -> tuple[float | None, float | None, bool]:
+    """Read (started_timestamp, duration_seconds, timing_error) from a recording.db.
+
+    ``timing_error`` is True ONLY when the read itself failed — a caught
+    sqlite3/OS exception from a corrupt, truncated, locked, or otherwise
+    unreadable DB. A DB that opens cleanly but carries no usable timing (no
+    ``recording`` table, a zero/NULL timestamp, or no ``action_event`` rows)
+    returns ``timing_error=False`` so a legitimately event-free recording is
+    never flagged as corrupt.
+
+    Display-only callers (``list_recordings``, ``cli info``) ignore the third
+    value; the review-data emitter uses it to tell "couldn't read the DB" apart
+    from "DB read fine, just no timing" — without it, ``except Exception``
+    collapses both into the same ``(None, None)`` and a corrupted DB presents as
+    a clean, playable review (SCR-107).
+    """
     try:
         with open_recording_db(db_path) as conn:
             started: float | None = None
@@ -233,9 +249,9 @@ def _read_recording_meta(db_path: Path) -> tuple[float | None, float | None]:
                     if ev and ev[0] is not None:
                         duration = float(ev[0]) - started
 
-            return started, duration
+            return started, duration, False
     except Exception:
-        return None, None
+        return None, None, True
 
 
 def get_seen_bundle_ids(directories: list[Path] | None = None) -> set[str]:
@@ -288,7 +304,7 @@ def list_recordings(recordings_dir: Path | None = None) -> list[RecordingInfo]:
         if db is None:
             continue
 
-        started, duration = _read_recording_meta(db)
+        started, duration, _ = _read_recording_meta(db)
         date_str = "—"
         if started:
             date_str = datetime.fromtimestamp(started).strftime("%Y-%m-%d")
