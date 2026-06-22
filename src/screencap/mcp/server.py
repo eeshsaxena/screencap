@@ -232,6 +232,13 @@ async def list_recordings() -> RecordingsResult:
     ``null`` for a local/legacy recording) and a best-effort ``upload_warning``.
     To tell a permanently-blocked recording (wrong account signed in) apart from
     a transient upload failure, compare ``owner_uid`` against ``whoami().uid``.
+
+    Ownership comparison rules:
+    - Only treat a recording as account-blocked when ``whoami().signed_in`` is
+      True, ``whoami().stale`` is False, ``whoami().uid`` is non-null, the
+      recording's ``owner_uid`` is non-null, and ``owner_uid != uid``.
+    - When ``owner_uid`` is None (legacy or local recording): ownership is
+      UNKNOWN — do NOT block on a mismatch.
     """
     env = await (await _client()).list_recordings()
     keep = set(RecordingSummary.model_fields)
@@ -250,6 +257,15 @@ async def whoami() -> WhoAmIResult:
     ``list_recordings``: an un-uploaded recording whose ``owner_uid`` differs
     from this ``uid`` is blocked because a different account is signed in (advise
     re-login as the owner), not merely waiting on a retry.
+
+    Guards for safe comparison:
+    - Only conclude a wrong-account block when ``signed_in`` is True, ``stale``
+      is False, ``uid`` is non-null, the recording's ``owner_uid`` is non-null,
+      and ``owner_uid != uid``.
+    - When ``stale`` is True (offline; ``uid`` is None though signed in): the
+      account is temporarily UNVERIFIABLE — do NOT conclude a mismatch.
+    - When ``owner_uid`` is None (legacy or local recording): ownership is
+      UNKNOWN, not a block.
     """
     env = await (await _client()).whoami()
     keep = set(WhoAmIResult.model_fields)

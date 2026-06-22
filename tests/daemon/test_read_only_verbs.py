@@ -507,6 +507,31 @@ async def test_auth_whoami_fails_open(monkeypatch: pytest.MonkeyPatch) -> None:
 
 
 @pytest.mark.asyncio
+async def test_auth_whoami_stale(monkeypatch: pytest.MonkeyPatch) -> None:
+    """Stale/offline shape: signed_in=True, uid=None, email=None, stale=True.
+
+    This shape is produced when the token cache is populated but the Keychain
+    probe cannot verify freshness (e.g. offline). The daemon must surface it
+    intact so callers know to treat the account as temporarily UNVERIFIABLE
+    rather than signed-out or mismatched.
+    """
+    from screencap import auth
+
+    monkeypatch.setattr(
+        auth, "whoami",
+        lambda: {"signed_in": True, "uid": None, "email": None, "stale": True},
+    )
+    response = await _asgi_get("/v0/auth.whoami")
+    assert response.status_code == 200
+    payload = response.json()
+    _assert_envelope(payload, expected_schema_version=schema._AUTH_WHOAMI_API_VERSION)
+    assert payload["signed_in"] is True
+    assert payload["uid"] is None
+    assert payload["email"] is None
+    assert payload["stale"] is True
+
+
+@pytest.mark.asyncio
 async def test_read_only_verbs_round_trip_over_unix_socket(
     serve_process,
     uds_client_factory,
@@ -515,11 +540,19 @@ async def test_read_only_verbs_round_trip_over_unix_socket(
         info = (await client.get("/v0/daemon.info")).json()
         recordings = (await client.get("/v0/recording.list")).json()
         snapshot = (await client.get("/v0/session.snapshot")).json()
+        whoami = (await client.get("/v0/auth.whoami")).json()
 
     assert serve_process.poll() is None
     assert schema.DaemonInfoResponse(**info).model_dump()["ok"] is True
     assert schema.ListResponse(**recordings).model_dump()["ok"] is True
     assert schema.SessionSnapshotResponse(**snapshot).model_dump()["ok"] is True
+    # auth.whoami exercises the real fail-open path — signed_in may be False in
+    # CI (no Keychain), but the envelope must always be well-formed.
+    assert whoami["ok"] is True
+    assert "signed_in" in whoami
+    assert "uid" in whoami
+    assert "email" in whoami
+    assert "stale" in whoami
 
 
 @pytest.mark.asyncio

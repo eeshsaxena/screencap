@@ -299,6 +299,20 @@ def test_list_recordings_upload_warning_none_when_field_null(recordings_dir):
     assert info.upload_warning is None
 
 
+def test_list_recordings_owner_uid_none_when_pin_not_utf8(recordings_dir):
+    """owner_uid is None (not a UnicodeDecodeError 500) when the pin file is non-UTF-8.
+
+    Path.read_text() raises UnicodeDecodeError (a ValueError) on non-UTF-8 bytes.
+    The guard must catch (OSError, ValueError) — a bare OSError would let the
+    decode error escape and crash the whole recording.list call (regression for
+    the fix in catalog.read_owner_uid).
+    """
+    d = _make_recording(recordings_dir, "bad-pin-rec", duration=10.0)
+    (d / ".cloud_owner_uid").write_bytes(b"\xff\xfe")  # invalid UTF-8
+    info = list_recordings(recordings_dir)[0]
+    assert info.owner_uid is None
+
+
 # --- U3 catalog guard: hidden review artifact must not mask stub detection ---
 
 

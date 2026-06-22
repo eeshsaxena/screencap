@@ -208,7 +208,7 @@ async def auth_whoami(request: Request) -> JSONResponse:
     try:
         info = await asyncio.to_thread(auth.whoami)
     except Exception:  # noqa: BLE001 — a read verb must never 500
-        logger.debug("auth.whoami probe failed", exc_info=True)
+        logger.warning("auth.whoami probe failed", exc_info=True)
         info = {"signed_in": False}
     return JSONResponse(
         schema.envelope(
@@ -216,7 +216,7 @@ async def auth_whoami(request: Request) -> JSONResponse:
             signed_in=bool(info.get("signed_in")),
             uid=info.get("uid"),
             email=info.get("email"),
-            stale=bool(info.get("stale")),
+            stale=info.get("stale", False),
         )
     )
 

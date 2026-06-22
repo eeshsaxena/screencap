@@ -249,6 +249,29 @@ async def test_whoami_tool_reports_signed_out(monkeypatch):
     assert result.email is None
 
 
+@pytest.mark.asyncio
+async def test_whoami_tool_reports_stale_offline(monkeypatch):
+    """Stale/offline shape: signed_in=True, uid=None, email=None, stale=True.
+
+    This shape is produced when auth is cached but cannot be verified (offline).
+    The MCP tool must surface it intact so the agent knows the account is
+    temporarily UNVERIFIABLE, not signed-out.
+    """
+    stub = _StubClient({
+        "whoami": {
+            "ok": True, "signed_in": True, "uid": None, "email": None, "stale": True,
+        }
+    })
+    _use_client(monkeypatch, stub)
+
+    result = await server.whoami()
+    assert isinstance(result, server.WhoAmIResult)
+    assert result.signed_in is True
+    assert result.uid is None
+    assert result.email is None
+    assert result.stale is True
+
+
 # --------------------------------------------------------------------------
 # Real in-process daemon round-trip (ASGITransport)
 # --------------------------------------------------------------------------

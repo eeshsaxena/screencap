@@ -39,7 +39,7 @@ def read_owner_uid(directory: Path) -> str | None:
     """
     try:
         uid = (directory / OWNER_UID_FILE).read_text().strip()
-    except OSError:
+    except (OSError, ValueError):
         return None
     return uid or None
 
