@@ -169,7 +169,6 @@ def _load_models() -> dict[str, Any]:
         output_dir: str | None = None
         wifi_metrics: bool | None = None
         app_versions: bool | None = None
-        force_clean: bool = False
         capture_video: bool | None = None
         capture_images: bool | None = None
         capture_window_data: bool | None = None

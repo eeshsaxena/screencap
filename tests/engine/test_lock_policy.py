@@ -49,7 +49,7 @@ def test_inherit_lock_claim_and_release_are_noops(tmp_path):
         mock.patch("screencap.pidfile.write_pidfile") as write,
         mock.patch("screencap.pidfile.delete_pidfile") as delete,
     ):
-        policy.claim(tmp_path, force_clean=False)
+        policy.claim(tmp_path)
         policy.register_children(tmp_path, [{"pid": 1, "name": "x"}])
         policy.release()
 
@@ -76,7 +76,7 @@ def test_inherit_lock_methods_touch_no_files_outside_identity(tmp_path):
     # Pre-state: empty capture_dir.
     assert list(tmp_path.iterdir()) == []
 
-    policy.claim(tmp_path, force_clean=False)
+    policy.claim(tmp_path)
     assert list(tmp_path.iterdir()) == [], (
         "InheritLock.claim must not create any files"
     )

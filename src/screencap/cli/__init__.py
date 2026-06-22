@@ -658,7 +658,6 @@ def _maybe_prompt_matrix_acknowledgement() -> None:
 @click.option("--no-app-versions", is_flag=True, default=False, help="Disable running app version capture.")
 @click.option("--no-auto-name", is_flag=True, default=False, help="Skip LLM auto-naming after recording.")
 @click.option("--local-only", is_flag=True, default=False, help="Restrict LLM naming to local providers (Ollama).")
-@click.option("--force", is_flag=True, default=False, help="Auto-clean orphaned processes before starting.")
 @click.option("--verbose", "-v", is_flag=True, default=False, help="Show all info/debug output during recording.")
 @click.option("--chunk-duration", type=float, default=None,
               help="Auto-cut recording at this interval (seconds). Default: 900 (15 min). Set 0 to disable chunking.")
@@ -691,7 +690,7 @@ def _maybe_prompt_matrix_acknowledgement() -> None:
 def start(
     name, description, no_audio, no_video, no_images, no_window_data,
     output, no_wifi_metrics, no_app_versions,
-    no_auto_name, local_only, force, verbose, chunk_duration, no_live_upload,
+    no_auto_name, local_only, verbose, chunk_duration, no_live_upload,
     destination, segmentation_mode, no_scrub, network, unlisted,
 ):
     """Record a screen capture session. Ctrl+C to stop.
@@ -886,7 +885,6 @@ def start(
         output=output,
         wifi_metrics=wifi_metrics,
         app_versions=app_versions,
-        force_clean=force,
         capture_video=capture_video,
         capture_images=capture_images,
         capture_window_data=capture_window_data,
@@ -915,7 +913,6 @@ def _run_start_via_daemon(
     output: str | None,
     wifi_metrics: bool | None,
     app_versions: bool | None,
-    force_clean: bool,
     capture_video: bool | None,
     capture_images: bool | None,
     capture_window_data: bool | None,
@@ -981,7 +978,6 @@ def _run_start_via_daemon(
         "output_dir": output,
         "wifi_metrics": wifi_metrics,
         "app_versions": app_versions,
-        "force_clean": force_clean,
         "capture_video": capture_video,
         "capture_images": capture_images,
         "capture_window_data": capture_window_data,

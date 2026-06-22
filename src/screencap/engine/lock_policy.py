@@ -91,7 +91,7 @@ def _write_identity_files(
 class LockPolicy(Protocol):
     """Process-exclusive lock + per-recording identity ownership."""
 
-    def claim(self, capture_dir: Path, *, force_clean: bool) -> None: ...
+    def claim(self, capture_dir: Path) -> None: ...
 
     def write_identity(
         self,
@@ -119,7 +119,7 @@ class InheritLock:
     consumers (catalog, upload, scrubber, recovery) find them.
     """
 
-    def claim(self, capture_dir: Path, *, force_clean: bool) -> None:
+    def claim(self, capture_dir: Path) -> None:
         pass
 
     def write_identity(

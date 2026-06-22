@@ -58,6 +58,9 @@ _PHASE1_SWIFTUI_PAYLOAD: dict[str, Any] = {
     "output_dir": None,
     "wifi_metrics": False,
     "app_versions": True,
+    # SCR-65 removed ``force_clean`` from RecordingStartRequest; an old SwiftUI
+    # client still sends it, so keep it here to prove ``extra="ignore"`` tolerates
+    # the now-unknown field (the daemon must still return 200, no version bump).
     "force_clean": False,
     "capture_video": True,
     "capture_images": True,
