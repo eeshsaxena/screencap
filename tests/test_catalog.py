@@ -496,3 +496,101 @@ def test_get_seen_bundle_ids_no_window_event_table(tmp_path):
 def test_get_seen_bundle_ids_empty_dirs(tmp_path):
     result = get_seen_bundle_ids([])
     assert result == set()
+
+
+# ---------------------------------------------------------------------------
+# _read_recording_meta — timing_error discriminator (SCR-107)
+#
+# A swallowed DB-read exception must be distinguishable from a structurally
+# event-free recording. ``timing_error`` (the third tuple element) is True ONLY
+# on the caught-exception path (corrupt / unreadable DB); every readable-but-
+# empty case stays False so a legitimately event-free recording is never
+# flagged. Display-only callers discard the third element.
+# ---------------------------------------------------------------------------
+
+
+def test_read_recording_meta_healthy_recording(tmp_path):
+    """A healthy recording reads timing with timing_error=False."""
+    from screencap.catalog import _read_recording_meta
+
+    d = _make_recording(tmp_path, "healthy", duration=60.0)
+    started, duration, timing_error = _read_recording_meta(d / "recording.db")
+    assert started is not None
+    assert duration is not None and duration > 0
+    assert timing_error is False
+
+
+def test_read_recording_meta_corrupt_db_flags_error(tmp_path):
+    """A corrupt / unreadable DB raises inside the read -> timing_error=True.
+
+    This is the SCR-107 case: the swallowed exception previously collapsed
+    into the same (None, None) a benign recording produces.
+    """
+    from screencap.catalog import _read_recording_meta
+
+    corrupt = tmp_path / "corrupt.db"
+    corrupt.write_bytes(b"this is not a sqlite database at all")
+    started, duration, timing_error = _read_recording_meta(corrupt)
+    assert started is None
+    assert duration is None
+    assert timing_error is True
+
+
+def test_read_recording_meta_valid_db_no_recording_table(tmp_path):
+    """A valid sqlite file missing the recording table is NOT an error.
+
+    The DB opened cleanly; it simply carries no timing. timing_error stays
+    False so it is not mistaken for corruption.
+    """
+    from screencap.catalog import _read_recording_meta
+
+    db_path = tmp_path / "noschema.db"
+    sqlite3.connect(str(db_path)).close()
+    started, duration, timing_error = _read_recording_meta(db_path)
+    assert (started, duration) == (None, None)
+    assert timing_error is False
+
+
+def test_read_recording_meta_zero_timestamp_not_error(tmp_path):
+    """A recording row with a zero/NULL timestamp is empty, not corrupt."""
+    from screencap.catalog import _read_recording_meta
+
+    db_path = tmp_path / "zerots.db"
+    conn = sqlite3.connect(str(db_path))
+    conn.execute("CREATE TABLE recording (timestamp REAL)")
+    conn.execute("INSERT INTO recording VALUES (0)")
+    conn.commit()
+    conn.close()
+    started, duration, timing_error = _read_recording_meta(db_path)
+    assert (started, duration) == (None, None)
+    assert timing_error is False
+
+
+def test_read_recording_meta_valid_timestamp_no_action_event_table(tmp_path):
+    """A DB with a valid non-zero timestamp but no action_event table is NOT
+    an error: started is populated, duration is unknown, timing_error is False."""
+    from screencap.catalog import _read_recording_meta
+
+    db_path = tmp_path / "notimeline.db"
+    conn = sqlite3.connect(str(db_path))
+    conn.execute("CREATE TABLE recording (timestamp REAL)")
+    conn.execute("INSERT INTO recording VALUES (1716800000.0)")
+    conn.commit()
+    conn.close()
+    started, duration, timing_error = _read_recording_meta(db_path)
+    assert started is not None
+    assert duration is None
+    assert timing_error is False
+
+
+def test_list_recordings_tolerates_corrupt_db(tmp_path):
+    """The display caller (list_recordings) still lists a recording whose DB is
+    corrupt — it discards timing_error and shows the '—' date fallback rather
+    than crashing on the 3-tuple read."""
+    rec_dir = tmp_path / "rec-corrupt"
+    rec_dir.mkdir()
+    (rec_dir / "recording.db").write_bytes(b"not a sqlite database")
+    result = list_recordings(tmp_path)
+    assert len(result) == 1
+    assert result[0].name == "rec-corrupt"
+    assert result[0].date == "—"

@@ -191,7 +191,10 @@ def prepare_review_data(name: str) -> dict:
     failure, a missing timestamp, or a recording with no action events.
     They are serialized as JSON ``null`` in that case — a perfectly
     playable recording can still carry null metadata, so the Swift side
-    decodes them as ``Double?`` (upstream plan U6/U8).
+    decodes them as ``Double?`` (upstream plan U6/U8). The companion
+    ``timing_error`` flag (SCR-107) is ``True`` only when that null is due to a
+    failed DB read, letting the consumer distinguish a corrupted/unreadable
+    ``recording.db`` from a legitimately event-free recording.
     """
     from screencap.catalog import _read_recording_meta, find_db
     from screencap.config import get_recordings_dir, resolve_recording_dir
@@ -294,11 +297,19 @@ def prepare_review_data(name: str) -> dict:
     # Timing metadata for the timeline pane's coordinate space, read from the
     # original DB (scrubbing nulls content, not timestamps). Nullable — see the
     # docstring; a playable recording may have no action events.
+    #
+    # `timing_error` (SCR-107) disambiguates the null: True ONLY when the DB
+    # read itself failed (corrupt / unreadable recording.db, a swallowed
+    # exception), so the Swift consumer can surface a non-blocking advisory
+    # instead of presenting a corrupted DB as a clean, event-free review. A
+    # benign event-free recording (or an absent DB) keeps it False — null
+    # timing alone is not an error.
     db_path = find_db(rec_dir)
     started_at: float | None = None
     duration_seconds: float | None = None
+    timing_error: bool = False
     if db_path is not None:
-        started_at, duration_seconds = _read_recording_meta(db_path)
+        started_at, duration_seconds, timing_error = _read_recording_meta(db_path)
 
     return {
         "ok": True,
@@ -316,6 +327,9 @@ def prepare_review_data(name: str) -> dict:
         "coverage": coverage,
         "started_at": started_at,
         "duration_seconds": duration_seconds,
+        # SCR-107: True only when null timing is due to a failed DB read, so the
+        # consumer can tell a corrupted DB from a benign event-free recording.
+        "timing_error": timing_error,
         "video_pixfmt_remediated": remediated,
     }
 

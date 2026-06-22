@@ -281,24 +281,74 @@ def test_auto_exports_missing_events_with_upload_config(recordings_root):
 
 def test_nullable_metadata_serialized_as_json_null(recordings_root):
     """A playable recording with no action events (``_read_recording_meta``
-    returns None) still yields ok=True with started_at/duration_seconds as
-    JSON null — the Swift side decodes them as Double?."""
+    returns None timing, timing_error=False) still yields ok=True with
+    started_at/duration_seconds as JSON null — the Swift side decodes them as
+    Double?. timing_error is False because the DB read itself succeeded."""
     rec_dir = _make_recording(recordings_root, "rec-nometa")
     _write_video(rec_dir / "video.mp4", (0, 0, 200), pix_fmt="yuv420p")
     (rec_dir / "events.jsonl").write_text(json.dumps({"_meta": True}) + "\n")
 
     with mock.patch(
-        "screencap.catalog._read_recording_meta", return_value=(None, None)
+        "screencap.catalog._read_recording_meta",
+        return_value=(None, None, False),
     ):
         envelope = prepare_review_data("rec-nometa")
 
     assert envelope["ok"] is True
     assert envelope["started_at"] is None
     assert envelope["duration_seconds"] is None
+    # Benign event-free null is NOT a read failure.
+    assert envelope["timing_error"] is False
     # Serialized as JSON null, not omitted and not 0.
     serialized = json.loads(json.dumps(envelope))
     assert serialized["started_at"] is None
     assert serialized["duration_seconds"] is None
+    assert serialized["timing_error"] is False
+
+
+def test_timing_error_flagged_when_db_read_fails(recordings_root):
+    """SCR-107: a swallowed DB-read failure (corrupt/unreadable recording.db)
+    yields ok=True + null timing BUT timing_error=True, so the Swift consumer
+    can surface a non-blocking advisory instead of presenting a corrupted DB
+    as a clean, event-free review."""
+    rec_dir = _make_recording(recordings_root, "rec-badmeta")
+    _write_video(rec_dir / "video.mp4", (0, 0, 200), pix_fmt="yuv420p")
+    (rec_dir / "events.jsonl").write_text(json.dumps({"_meta": True}) + "\n")
+
+    with mock.patch(
+        "screencap.catalog._read_recording_meta",
+        return_value=(None, None, True),
+    ):
+        envelope = prepare_review_data("rec-badmeta")
+
+    # Still playable — the video renders; only the timeline is unavailable.
+    assert envelope["ok"] is True
+    assert envelope["started_at"] is None
+    assert envelope["duration_seconds"] is None
+    # The discriminator that separates corruption from a benign event-free DB.
+    assert envelope["timing_error"] is True
+    serialized = json.loads(json.dumps(envelope))
+    assert serialized["timing_error"] is True
+
+
+def test_timing_error_real_corrupt_db(recordings_root):
+    """SCR-107 end-to-end: a real corrupt recording.db (non-sqlite bytes) causes
+    timing_error=True in the envelope without mocking _read_recording_meta.
+
+    The review stays playable (ok=True), started_at/duration_seconds are null,
+    and timing_error is True — distinguishing a corrupt DB from a benign
+    event-free recording.
+    """
+    rec_dir = _make_recording(recordings_root, "rec-realcorrupt", with_db=False)
+    _write_video(rec_dir / "video.mp4", (0, 0, 200), pix_fmt="yuv420p")
+    (rec_dir / "events.jsonl").write_text(json.dumps({"_meta": True}) + "\n")
+    (rec_dir / "recording.db").write_bytes(b"not a sqlite database")
+
+    envelope = prepare_review_data("rec-realcorrupt")
+
+    assert envelope["ok"] is True
+    assert envelope["started_at"] is None
+    assert envelope["timing_error"] is True
 
 
 # ---------------------------------------------------------------------------
@@ -320,6 +370,8 @@ def test_cli_emits_json_envelope(recordings_root):
     assert payload["video_path"].endswith("/video.mp4")
     assert payload["events_path"].endswith("/events.jsonl")
     assert payload["video_pixfmt_remediated"] is False
+    assert "timing_error" in payload
+    assert payload["timing_error"] is False
 
 
 def test_cli_cant_process_emits_error_envelope(recordings_root):

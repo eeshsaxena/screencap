@@ -254,6 +254,12 @@ struct ReviewWindow: View {
     private var panesIfAvailable: some View {
         if let videoModel, let data = currentData() {
             VStack(spacing: 0) {
+                // Non-blocking advisory (SCR-107): the recording's timing
+                // metadata couldn't be read (corrupt/unreadable recording.db),
+                // so the timeline can't be placed. Surfaced ABOVE the redaction
+                // evidence because it's a more fundamental data-integrity signal
+                // — the video below still plays.
+                TimingUnavailableCallout(timingError: data.timingError)
                 // Per-recording redaction summary, framed as protection (R8),
                 // with the distinct fail-closed callout (R14) separate beneath.
                 RedactionEvidenceView(redaction: data.redaction)
