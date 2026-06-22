@@ -38,6 +38,16 @@ final class UploadEventParsingTests: XCTestCase {
         XCTAssertEqual(event?.error, "interrupted")
     }
 
+    /// SCR-158: a contended terminal-stage lock is surfaced as an
+    /// `upload_busy` event (retryable, exit 0) the controller maps to `.busy`.
+    func testParsesUploadBusyPayload() {
+        let line = #"{"type": "upload_busy", "schema_version": 1, "recording": "rec-001", "retryable": true}"#
+        let event = UploadEventLine.parse(stderrLine: line)
+        XCTAssertEqual(event?.type, "upload_busy")
+        XCTAssertEqual(event?.recording, "rec-001")
+        XCTAssertEqual(event?.retryable, true)
+    }
+
     func testBlankLineReturnsNil() {
         XCTAssertNil(UploadEventLine.parse(stderrLine: ""))
         XCTAssertNil(UploadEventLine.parse(stderrLine: "   "))

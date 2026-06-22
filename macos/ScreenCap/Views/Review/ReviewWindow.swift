@@ -335,17 +335,7 @@ struct ReviewWindow: View {
     /// panes, the redaction summary, the coverage strip, and the timeline
     /// markers. Available in ready / uploading / failed-with-retry.
     private func currentData() -> ReviewData? {
-        switch model.state {
-        case .ready(let data),
-             .uploading(_, let data):
-            return data
-        case .failed(_, .some(let data)),
-             .refused(_, .some(let data)),
-             .busy(_, .some(let data)):
-            return data
-        default:
-            return nil
-        }
+        model.state.reviewData
     }
 
     @ViewBuilder
@@ -456,6 +446,11 @@ struct ReviewWindow: View {
                     .lineLimit(2)
                 Spacer()
                 Button("Close") { dismiss() }
+                    // Mirror the `.refused`/`.failed` rows: when a Retry is
+                    // present it owns ⏎ (`.defaultAction`) and Close takes Esc
+                    // (`.cancelAction`); with no Retry, Close is the default
+                    // action so ⏎ still dismisses (SCR-158).
+                    .keyboardShortcut(retryData != nil ? .cancelAction : .defaultAction)
                 if retryData != nil {
                     Button("Retry") { attemptUpload() }
                         .keyboardShortcut(.defaultAction)

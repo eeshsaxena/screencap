@@ -34,6 +34,10 @@ struct UploadEventLine: Decodable, Equatable {
     // upload_failed fields
     let error: String?
 
+    // upload_busy fields (SCR-158) — parse-only today so a future
+    // `retryable: false` payload isn't silently treated as retryable.
+    let retryable: Bool?
+
     enum CodingKeys: String, CodingKey {
         case type
         case schemaVersion = "schema_version"
@@ -50,6 +54,7 @@ struct UploadEventLine: Decodable, Equatable {
         case failed
         case gcsPrefix = "gcs_prefix"
         case error
+        case retryable
     }
 
     /// Drift-resilient parser. Returns nil on blank lines, lines that aren't
