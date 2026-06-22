@@ -2717,7 +2717,7 @@ def transcribe(name, model):
 
     if not audio_path.exists():
         console.print(
-            f"[red]Error:[/red] No audio found for recording '{name}'. "
+            f"[red]Error:[/red] No audio found for recording '{escape(str(name))}'. "
             "Was it recorded with audio enabled?"
         )
         sys.exit(1)
@@ -3194,7 +3194,7 @@ def settings_privacy(field, op, value, as_json):
             if value.lower() not in _PRIVACY_MODE_VALUES:
                 err_console.print(
                     f"[red]Error:[/red] mode must be one of "
-                    f"{_PRIVACY_MODE_VALUES}, got: {value}"
+                    f"{_PRIVACY_MODE_VALUES}, got: {escape(str(value))}"
                 )
                 _result(False, exit_code=1, error=f"invalid_mode:{value}")
             parsed_value = value.lower()
@@ -3205,7 +3205,7 @@ def settings_privacy(field, op, value, as_json):
                 parsed_value = False
             else:
                 err_console.print(
-                    f"[red]Error:[/red] {field} must be true/false, got: {value}"
+                    f"[red]Error:[/red] {escape(str(field))} must be true/false, got: {escape(str(value))}"
                 )
                 _result(False, exit_code=1, error=f"invalid_bool:{field}={value}")
 
@@ -3302,7 +3302,7 @@ def _settings_privacy_apply(
             )
             if blocking_action is not None:
                 err_console.print(
-                    f"[red]Error:[/red] '{value}' is in {effective_class.value} which the "
+                    f"[red]Error:[/red] '{escape(str(value))}' is in {effective_class.value} which the "
                     f"privacy matrix at mode={configured_mode!r} produces "
                     f"{blocking_action.value} — allow_apps cannot loosen this. "
                     f"Set mode=public to capture broadly, or override at the "
@@ -3324,10 +3324,10 @@ def _settings_privacy_apply(
             # reason about it. Keeps the privacy-first posture symmetric
             # with how PASSWORD_MANAGER and friends are handled.
             err_console.print(
-                f"[red]Error:[/red] '{value}' is not in BUNDLE_ID_MAP and has no "
+                f"[red]Error:[/red] '{escape(str(value))}' is not in BUNDLE_ID_MAP and has no "
                 f"app_classes override — refusing to allow-list an unclassified "
                 f"bundle. Run [bold]screencap settings privacy app_classes set "
-                f"{value}=<class>[/bold] first (e.g., browser_unverified for an "
+                f"{escape(str(value))}=<class>[/bold] first (e.g., browser_unverified for an "
                 f"AI tool), then add to allow_apps if needed."
             )
             _result(
@@ -3397,7 +3397,7 @@ def _settings_privacy_apply(
                     new_action = get_matrix_action(fallback_class, _mode_enum)
                     if _ACTION_SEVERITY[new_action] > _ACTION_SEVERITY[old_action]:
                         err_console.print(
-                            f"[red]Error:[/red] removing the '{bundle}' classification "
+                            f"[red]Error:[/red] removing the '{escape(str(bundle))}' classification "
                             f"would revert it from {old_class.value} ({old_action.value}) "
                             f"to {fallback_class.value} ({new_action.value}) at "
                             f"mode={configured_mode!r} — that loosens the matrix and is "
@@ -3418,7 +3418,7 @@ def _settings_privacy_apply(
         else:  # add or set
             if "=" not in value:
                 err_console.print(
-                    f"[red]Error:[/red] map field {field} requires BUNDLE_ID=CLASS for {op}, got: {value}"
+                    f"[red]Error:[/red] map field {escape(str(field))} requires BUNDLE_ID=CLASS for {escape(str(op))}, got: {escape(str(value))}"
                 )
                 _result(False, exit_code=1, error=f"map_value_missing_eq:{field}={value}")
             bundle, ctx_str = value.split("=", 1)
@@ -3432,7 +3432,7 @@ def _settings_privacy_apply(
             normalized = ctx_str.lower()
             if normalized not in valid_classes:
                 err_console.print(
-                    f"[red]Error:[/red] Unknown context class: {ctx_str}"
+                    f"[red]Error:[/red] Unknown context class: {escape(str(ctx_str))}"
                 )
                 err_console.print(
                     f"[dim]Available: {', '.join(sorted(valid_classes))}[/dim]"
@@ -3492,7 +3492,7 @@ def _settings_privacy_apply(
                 # were "blocking".
                 if _ACTION_SEVERITY[new_action] > _ACTION_SEVERITY[old_action]:
                     err_console.print(
-                        f"[red]Error:[/red] reclassifying '{bundle}' from "
+                        f"[red]Error:[/red] reclassifying '{escape(str(bundle))}' from "
                         f"{old_class.value} to {new_class.value} would loosen "
                         f"the matrix at mode={configured_mode!r} from "
                         f"{old_action.value} to {new_action.value} — rejected. "
@@ -4064,7 +4064,7 @@ def smoke_test(verbose):
             err_summary = err.strip().rsplit("\n", 1)[-1]
             console.print(f"  [red]\\[FAIL][/red] {name} — {escape(str(err_summary))}")
             if verbose:
-                console.print(err)
+                console.print(escape(str(err)))
 
     passed_count = sum(1 for _, p, _ in results if p)
     total = len(results)
@@ -4178,7 +4178,7 @@ def network_dump(name, limit, kind, host_substr, verbose):
     db_path = recording_dir / "recording.db"
     if not db_path.is_file():
         console.print(
-            f"[red]Error:[/red] recording.db not found in {recording_dir}",
+            f"[red]Error:[/red] recording.db not found in {escape(str(recording_dir))}",
         )
         sys.exit(1)
 
