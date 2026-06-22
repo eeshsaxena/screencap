@@ -190,6 +190,9 @@ final class UploadController: ObservableObject {
         // "released" promise was optimistic (eager release-before-SIGTERM,
         // SCR-154).
         guard registry.claim(name) else {
+            uploadLogger.info(
+                "Cross-window refusal for \(name, privacy: .public): another window already holds the upload claim."
+            )
             state = .refused("This recording is already being uploaded in another window.")
             return
         }
