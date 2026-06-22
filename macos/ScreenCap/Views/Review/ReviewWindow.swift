@@ -341,16 +341,7 @@ struct ReviewWindow: View {
     /// panes, the redaction summary, the coverage strip, and the timeline
     /// markers. Available in ready / uploading / failed-with-retry.
     private func currentData() -> ReviewData? {
-        switch model.state {
-        case .ready(let data),
-             .uploading(_, let data):
-            return data
-        case .failed(_, .some(let data)),
-             .refused(_, .some(let data)):
-            return data
-        default:
-            return nil
-        }
+        model.state.reviewData
     }
 
     @ViewBuilder
@@ -445,6 +436,32 @@ struct ReviewWindow: View {
                 Spacer()
                 Button("Close") { dismiss() }
                     .keyboardShortcut(.defaultAction)
+            }
+            .padding(12)
+        case .busy(let message, let retryData):
+            // SCR-158: busy-lock skip — framed as info, not an error (the child
+            // exited 0; the recording isn't broken). Unlike `.refused`, a
+            // busy-lock is transient, so a Retry IS offered when there is panes
+            // data to re-run against; the default action so ⏎ retries.
+            HStack(spacing: 8) {
+                Image(systemName: "clock.fill")
+                    .foregroundStyle(.secondary)
+                Text(message)
+                    .font(.caption)
+                    .foregroundStyle(.secondary)
+                    .lineLimit(2)
+                Spacer()
+                Button("Close") { dismiss() }
+                    // Mirror the `.refused`/`.failed` rows: when a Retry is
+                    // present it owns ⏎ (`.defaultAction`) and Close takes Esc
+                    // (`.cancelAction`); with no Retry, Close is the default
+                    // action so ⏎ still dismisses (SCR-158).
+                    .keyboardShortcut(retryData != nil ? .cancelAction : .defaultAction)
+                if retryData != nil {
+                    Button("Retry") { attemptUpload() }
+                        .keyboardShortcut(.defaultAction)
+                        .buttonStyle(.borderedProminent)
+                }
             }
             .padding(12)
         }
