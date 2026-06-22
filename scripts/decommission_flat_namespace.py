@@ -28,6 +28,9 @@ Usage::
 from __future__ import annotations
 
 import argparse
+import dataclasses
+import json
+import os
 import sys
 
 from cloud_migration import core
@@ -60,7 +63,28 @@ def _parse_args(argv):
         action="store_true",
         help="Attest the flat write path is closed when status is unavailable",
     )
+    p.add_argument(
+        "--audit-log",
+        default="cloud-migration-decommission-audit.jsonl",
+        help=(
+            "Path for the durable per-delete audit log: one JSON object per line "
+            "(src/action/reason), flushed per line, mode 0o600. This is the irreversible "
+            "step's crash-safe record. Live runs APPEND (a re-run never destroys the "
+            "prior record); --dry-run writes a '.dryrun.jsonl' preview instead."
+        ),
+    )
     return p.parse_args(argv)
+
+
+def _open_audit_log(path: str, *, dry_run: bool):
+    """Open the decommission audit log at mode 0o600 (recording object names are the
+    same sensitivity class as the recordings — they can leak that something was
+    recorded). Live runs append so a re-run after a partial failure extends rather
+    than truncates the prior deletion record; the dry-run sidecar is truncated."""
+    flags = os.O_WRONLY | os.O_CREAT | (os.O_TRUNC if dry_run else os.O_APPEND)
+    fd = os.open(path, flags, 0o600)
+    os.fchmod(fd, 0o600)  # enforce 0o600 even if the file pre-existed with looser perms
+    return os.fdopen(fd, "w" if dry_run else "a", encoding="utf-8")
 
 
 def main(argv=None) -> int:
@@ -76,8 +100,18 @@ def main(argv=None) -> int:
         )
         return 2
 
-    client = core.build_client(args.project)
+    # Open the durable audit log BEFORE the run and append one JSON line per outcome
+    # AS the loop runs (flushed per line), so a crash mid-run still leaves an
+    # auditable record of exactly what was deleted — this is the irreversible step.
+    audit_path = args.audit_log + (".dryrun.jsonl" if args.dry_run else "")
+    audit_fp = _open_audit_log(audit_path, dry_run=args.dry_run)
+
+    def _record(outcome: core.DeleteOutcome) -> None:
+        audit_fp.write(json.dumps(dataclasses.asdict(outcome), sort_keys=True) + "\n")
+        audit_fp.flush()
+
     try:
+        client = core.build_client(args.project)
         result = core.run_decommission(
             client=client,
             bucket_name=args.bucket,
@@ -85,10 +119,15 @@ def main(argv=None) -> int:
             dry_run=args.dry_run,
             sessions_backup_confirmed=args.sessions_backup_confirmed,
             confirm_quiesced=args.confirm_quiesced,
+            on_outcome=_record,
         )
     except core.MigrationError as exc:
         print(f"ERROR: {exc}", file=sys.stderr)
         return 2
+    finally:
+        audit_fp.close()
+
+    print(f"decommission audit log (mode 0o600): {audit_path}", file=sys.stderr)
 
     kept = result.kept
     if kept:

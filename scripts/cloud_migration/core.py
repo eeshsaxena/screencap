@@ -733,6 +733,7 @@ def run_decommission(
     sessions_backup_confirmed: bool = False,
     confirm_quiesced: bool = False,
     probe: Callable[[], RecordingState] | None = None,
+    on_outcome: Callable[[DeleteOutcome], None] | None = None,
     log: Log = print,
 ) -> DecommissionResult:
     """U9: delete the flat source blobs after the website cutover is verified live.
@@ -753,6 +754,12 @@ def run_decommission(
     accessible — there is no staging copy to fall back on. A post-run re-scan
     asserts the prefixes are empty and surfaces any new flat blob (a missed-write
     race) rather than deleting it.
+
+    ``on_outcome`` (optional) is invoked with each :class:`DeleteOutcome` AS the loop
+    runs — a ``deleted`` row only AFTER its delete returns — so the decommission shim
+    can append a crash-safe ``.jsonl`` audit log of this irreversible step (SCR-145),
+    mirroring ``run_stage``'s incremental-provenance hook. The accounting in the
+    returned :class:`DecommissionResult` is unchanged.
     """
     # Lazy SDK imports — keep core ``google.cloud``-free at import scope. GoogleAPIError
     # is the broad base (it catches RetryError, which GoogleAPICallError does not);
@@ -776,6 +783,14 @@ def run_decommission(
     outcomes: list[DeleteOutcome] = []
     handled: set[str] = set()
 
+    def _emit(outcome: DeleteOutcome) -> None:
+        # Append AND notify in one place so every outcome — including a ``deleted``
+        # row emitted only AFTER the delete returns — reaches ``on_outcome`` in loop
+        # order, giving the shim a crash-safe per-line audit log (SCR-145).
+        outcomes.append(outcome)
+        if on_outcome is not None:
+            on_outcome(outcome)
+
     # recordings/ — gated per-object on a verified staging copy.
     for src_blob in iter_blobs(client, bucket_name, FLAT_RECORDINGS_PREFIX):
         handled.add(src_blob.name)
@@ -790,22 +805,22 @@ def run_decommission(
         try:
             staging = bucket.get_blob(staging_name, timeout=_OP_TIMEOUT)
         except GoogleAPIError as exc:
-            outcomes.append(DeleteOutcome(src_blob.name, "kept", f"error: {exc}"))
+            _emit(DeleteOutcome(src_blob.name, "kept", f"error: {exc}"))
             log(f"  ✗ KEEP {src_blob.name} (GCS error fetching staging copy: {exc})")
             continue
         if staging is None:
-            outcomes.append(DeleteOutcome(src_blob.name, "kept", "no staging copy"))
+            _emit(DeleteOutcome(src_blob.name, "kept", "no staging copy"))
             log(f"  ✗ KEEP {src_blob.name} (no staging copy at {staging_name})")
             continue
         mismatch = verify_match(src_blob, staging)
         if mismatch is not None:
-            outcomes.append(
+            _emit(
                 DeleteOutcome(src_blob.name, "kept", f"staging unverified: {mismatch}")
             )
             log(f"  ✗ KEEP {src_blob.name} (staging unverified: {mismatch})")
             continue
         if dry_run:
-            outcomes.append(DeleteOutcome(src_blob.name, "planned", "verified-in-staging"))
+            _emit(DeleteOutcome(src_blob.name, "planned", "verified-in-staging"))
             log(f"  - [dry-run] DELETE {src_blob.name} (verified-in-staging)")
             continue
         try:
@@ -814,7 +829,7 @@ def run_decommission(
             # The source changed between verify and delete (generation mismatch).
             # The staging copy we verified no longer matches the live source —
             # KEEP it; deleting would destroy un-staged newer bytes.
-            outcomes.append(
+            _emit(
                 DeleteOutcome(
                     src_blob.name, "kept", "source changed since enumeration (generation mismatch)"
                 )
@@ -822,10 +837,10 @@ def run_decommission(
             log(f"  ✗ KEEP {src_blob.name} (source changed since enumeration — generation mismatch)")
             continue
         except GoogleAPIError as exc:
-            outcomes.append(DeleteOutcome(src_blob.name, "kept", f"error: {exc}"))
+            _emit(DeleteOutcome(src_blob.name, "kept", f"error: {exc}"))
             log(f"  ✗ KEEP {src_blob.name} (GCS error during delete: {exc})")
             continue
-        outcomes.append(DeleteOutcome(src_blob.name, "deleted", "verified-in-staging"))
+        _emit(DeleteOutcome(src_blob.name, "deleted", "verified-in-staging"))
         log(f"  - DELETE {src_blob.name} (verified-in-staging)")
 
     # sessions/ — retired, not staged anywhere; opt-in + backup-attestation only.
@@ -833,16 +848,16 @@ def run_decommission(
         for src_blob in iter_blobs(client, bucket_name, FLAT_SESSIONS_PREFIX):
             handled.add(src_blob.name)
             if dry_run:
-                outcomes.append(DeleteOutcome(src_blob.name, "planned", "retired session"))
+                _emit(DeleteOutcome(src_blob.name, "planned", "retired session"))
                 log(f"  - [dry-run] DELETE {src_blob.name} (retired session)")
                 continue
             try:
                 src_blob.delete(timeout=_OP_TIMEOUT)
             except GoogleAPIError as exc:
-                outcomes.append(DeleteOutcome(src_blob.name, "kept", f"error: {exc}"))
+                _emit(DeleteOutcome(src_blob.name, "kept", f"error: {exc}"))
                 log(f"  ✗ KEEP {src_blob.name} (GCS error during delete: {exc})")
                 continue
-            outcomes.append(DeleteOutcome(src_blob.name, "deleted", "retired session"))
+            _emit(DeleteOutcome(src_blob.name, "deleted", "retired session"))
             log(f"  - DELETE {src_blob.name} (retired session)")
 
     rescan = None

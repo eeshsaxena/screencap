@@ -19,6 +19,7 @@ Run with::
 
 from __future__ import annotations
 
+import json
 import sys
 from pathlib import Path
 
@@ -753,11 +754,12 @@ def test_decommission_cli_requires_confirm_for_live(store, client, patch_build_c
     assert store.deleted == []
 
 
-def test_decommission_cli_confirm_deletes(store, client, patch_build_client):
+def test_decommission_cli_confirm_deletes(store, client, patch_build_client, tmp_path):
     import decommission_flat_namespace as decom_cli
 
     _seed_flat_with_staging(store)
-    rc = decom_cli.main(["--bucket", BUCKET, "--confirm"])
+    audit = str(tmp_path / "audit.jsonl")
+    rc = decom_cli.main(["--bucket", BUCKET, "--confirm", "--audit-log", audit])
     assert rc == 0
     assert set(store.deleted) == {"recordings/alpha/manifest.json", "recordings/alpha/video.mp4"}
 
@@ -781,7 +783,7 @@ def test_promote_cli_missing_entry_returns_rc1(store, client, patch_build_client
     assert rc == 1  # a typo'd / unstaged entry must not read as a complete promote
 
 
-def test_decommission_cli_new_blob_returns_rc1(store, client, patch_build_client):
+def test_decommission_cli_new_blob_returns_rc1(store, client, patch_build_client, tmp_path):
     import decommission_flat_namespace as decom_cli
 
     _seed_flat_with_staging(store)
@@ -796,7 +798,7 @@ def test_decommission_cli_new_blob_returns_rc1(store, client, patch_build_client
         return blobs
 
     client.list_blobs = racing_list
-    rc = decom_cli.main(["--bucket", BUCKET, "--confirm"])
+    rc = decom_cli.main(["--bucket", BUCKET, "--confirm", "--audit-log", str(tmp_path / "a.jsonl")])
     assert rc == 1  # new flat blob since enumeration — R11 not satisfied
 
 
@@ -1040,6 +1042,69 @@ def test_stage_large_object_under_cap_still_completes(store, client):
 
 
 # --------------------------------------------------------------------------
+# SCR-145 U4 — durable decommission audit log (on_outcome + .jsonl, 0o600)
+# --------------------------------------------------------------------------
+
+
+def test_decommission_on_outcome_fires_per_outcome(store, client):
+    _seed_flat_with_staging(store)
+    seen: list = []
+    result = core.run_decommission(
+        client=client, bucket_name=BUCKET, include_sessions=False, dry_run=False,
+        probe=IDLE, on_outcome=seen.append, log=lambda _m: None,
+    )
+    # Exactly one callback per outcome, in loop order, matching the returned result.
+    assert [(o.src, o.action) for o in seen] == [(o.src, o.action) for o in result.outcomes]
+    # 'deleted' rows correspond to what was actually removed.
+    assert {o.src for o in seen if o.action == "deleted"} == set(store.deleted)
+
+
+def test_decommission_audit_callback_records_before_a_mid_run_crash(store, client):
+    # A non-GCS error (uncaught → models a process crash) on the 2nd delete must leave
+    # the 1st object's outcome ALREADY emitted to the sink — proving the audit log is
+    # written incrementally per outcome, not batched at the end.
+    _seed_flat_with_staging(store)
+    store.raise_on_delete["recordings/alpha/video.mp4"] = RuntimeError("simulated crash")
+    seen: list = []
+    with pytest.raises(RuntimeError, match="simulated crash"):
+        core.run_decommission(
+            client=client, bucket_name=BUCKET, include_sessions=False, dry_run=False,
+            probe=IDLE, on_outcome=seen.append, log=lambda _m: None,
+        )
+    # manifest.json sorts before video.mp4 → it was deleted and emitted pre-crash.
+    assert any(o.src == "recordings/alpha/manifest.json" and o.action == "deleted" for o in seen)
+    assert "recordings/alpha/manifest.json" in store.deleted
+
+
+def test_decommission_cli_writes_audit_log_0o600(store, client, patch_build_client, tmp_path):
+    import decommission_flat_namespace as decom_cli
+
+    _seed_flat_with_staging(store)
+    audit = tmp_path / "audit.jsonl"
+    rc = decom_cli.main(["--bucket", BUCKET, "--confirm", "--audit-log", str(audit)])
+    assert rc == 0
+    rows = [json.loads(ln) for ln in audit.read_text(encoding="utf-8").splitlines()]
+    assert rows and all({"src", "action", "reason"} <= r.keys() for r in rows)
+    assert {r["src"] for r in rows if r["action"] == "deleted"} == set(store.deleted)
+    # The irreversible-step audit artifact is owner-only.
+    assert (audit.stat().st_mode & 0o777) == 0o600
+
+
+def test_decommission_cli_dry_run_writes_dryrun_sidecar(store, client, patch_build_client, tmp_path):
+    import decommission_flat_namespace as decom_cli
+
+    _seed_flat_with_staging(store)
+    audit = tmp_path / "audit.jsonl"
+    rc = decom_cli.main(["--bucket", BUCKET, "--dry-run", "--audit-log", str(audit)])
+    assert rc == 0
+    assert store.deleted == []
+    assert not audit.exists()  # live path is never written on a dry-run
+    preview = tmp_path / "audit.jsonl.dryrun.jsonl"
+    rows = [json.loads(ln) for ln in preview.read_text(encoding="utf-8").splitlines()]
+    assert rows and all(r["action"] == "planned" for r in rows)
+
+
+# --------------------------------------------------------------------------
 # U9 — sessions backup gate
 # --------------------------------------------------------------------------
 
@@ -1064,16 +1129,18 @@ def test_decommission_sessions_withheld_without_backup_confirmation(store, clien
     assert result.rescan.empty
 
 
-def test_decommission_cli_include_sessions_requires_backup_flag(store, client, patch_build_client):
+def test_decommission_cli_include_sessions_requires_backup_flag(store, client, patch_build_client, tmp_path):
     import decommission_flat_namespace as decom_cli
 
+    audit = str(tmp_path / "audit.jsonl")
     store.add("sessions/_index.json", crc32c="S", content_type="application/json")
-    rc = decom_cli.main(["--bucket", BUCKET, "--confirm", "--include-sessions"])
+    rc = decom_cli.main(["--bucket", BUCKET, "--confirm", "--include-sessions", "--audit-log", audit])
     assert rc == 2  # MigrationError (backup not confirmed) -> exit 2
     assert store.deleted == []
 
     rc = decom_cli.main(
-        ["--bucket", BUCKET, "--confirm", "--include-sessions", "--sessions-backup-confirmed"]
+        ["--bucket", BUCKET, "--confirm", "--include-sessions", "--sessions-backup-confirmed",
+         "--audit-log", audit]
     )
     assert rc == 0
     assert "sessions/_index.json" in store.deleted
