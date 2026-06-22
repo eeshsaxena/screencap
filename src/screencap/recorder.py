@@ -582,8 +582,10 @@ def start_recording(
     show_on_website: bool = True,
     network: bool = False,
     *,
-    # Session-controller worker-mode injection points. Set only by
-    # screencap.session.run_recording_worker.
+    # Session-controller worker-mode injection points. The optional seams
+    # here are normally set only by screencap.session.run_recording_worker;
+    # ``_lock_policy`` is the exception — it is REQUIRED, so every direct
+    # caller must pass it explicitly (SCR-66).
     _channels: "IpcChannels | None" = None,
     _menubar_policy: "MenubarPolicy | None" = None,
     _signal_policy: "SignalPolicy | None" = None,
