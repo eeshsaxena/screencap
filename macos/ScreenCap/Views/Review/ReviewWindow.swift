@@ -339,7 +339,8 @@ struct ReviewWindow: View {
         case .ready(let data),
              .uploading(_, let data):
             return data
-        case .failed(_, .some(let data)):
+        case .failed(_, .some(let data)),
+             .refused(_, .some(let data)):
             return data
         default:
             return nil
@@ -419,6 +420,25 @@ struct ReviewWindow: View {
                         .keyboardShortcut(.defaultAction)
                         .buttonStyle(.borderedProminent)
                 }
+            }
+            .padding(12)
+        case .refused(let message, _):
+            // SCR-155: cross-window refusal — framed as info, not an error
+            // (the recording isn't broken, another window is uploading it).
+            // Deliberately no Retry: while the owner holds the claim a Retry
+            // would silently re-refuse, and "released" is optimistic (SCR-154
+            // releases eagerly, before the owning child exits). Close is the
+            // honest affordance; the owning window carries the upload to done.
+            HStack(spacing: 8) {
+                Image(systemName: "info.circle.fill")
+                    .foregroundStyle(.secondary)
+                Text(message)
+                    .font(.caption)
+                    .foregroundStyle(.secondary)
+                    .lineLimit(2)
+                Spacer()
+                Button("Close") { dismiss() }
+                    .keyboardShortcut(.defaultAction)
             }
             .padding(12)
         }

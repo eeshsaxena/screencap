@@ -389,9 +389,11 @@ final class UploadControllerTests: XCTestCase {
     /// SCR-89 — two controllers (two review windows) for the SAME recording
     /// must not both spawn `screencap upload`. The first claims the name; the
     /// second is refused by the cross-window registry, never starts a
-    /// process, and lands on `.failed` (so the optimistic-`.uploading`
-    /// viewmodel isn't stranded). This is the core regression guard: without
-    /// the registry, `serviceB.startedNames` would be `["rec-001"]`.
+    /// process, and lands on `.refused` (a distinct state from `.failed`, so
+    /// the optimistic-`.uploading` viewmodel isn't stranded *and* the window
+    /// can render the refusal honestly without a re-refusing Retry — SCR-155).
+    /// This is the core regression guard: without the registry,
+    /// `serviceB.startedNames` would be `["rec-001"]`.
     func testConcurrentUploadOfSameNameIsRefusedAcrossControllers() {
         let serviceA = FakeUploadService()
         let serviceB = FakeUploadService()
@@ -406,10 +408,10 @@ final class UploadControllerTests: XCTestCase {
         guard case .uploading = controllerA.state else {
             return XCTFail("A should be uploading, got \(controllerA.state)")
         }
-        if case .failed(let msg) = controllerB.state {
-            XCTAssertTrue(msg.contains("already in progress"), "got: \(msg)")
+        if case .refused(let msg) = controllerB.state {
+            XCTAssertTrue(msg.contains("another window"), "got: \(msg)")
         } else {
-            XCTFail("B should be refused→failed, got \(controllerB.state)")
+            XCTFail("B should be refused, got \(controllerB.state)")
         }
     }
 

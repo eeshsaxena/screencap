@@ -225,6 +225,69 @@ final class ReviewWindowViewModelTests: XCTestCase {
         }
     }
 
+    /// SCR-155 — when another window already owns this recording's upload, the
+    /// cross-window guard (SCR-89) refuses this window's upload. That refusal
+    /// must surface as the distinct `.refused` state, NOT `.failed`: a
+    /// `.failed` would render an enabled Retry that silently re-refuses for as
+    /// long as the owner holds the claim. The refusal still carries the panes
+    /// `data` so the window keeps rendering the review content.
+    func testCrossWindowRefusalSurfacesRefusedStateWithPanesData() async {
+        // Another window (owner) claims "rec-001" on the shared registry first.
+        let owner = makeController(service: FakeUploadService())
+        owner.start(name: "rec-001")
+
+        let model = makeModel()
+        await model.loadReviewData()
+        model.startUpload()
+        await Task.yield()
+
+        if case .refused(let message, let data) = model.state {
+            XCTAssertTrue(message.contains("another window"), "got: \(message)")
+            XCTAssertNotNil(data, "refusal must keep panes data so the window still renders")
+        } else {
+            XCTFail("expected refused, got \(model.state)")
+        }
+        // Keep `owner` alive across the awaits above: if ARC released it
+        // early, its deinit would free the claim and this window would upload
+        // instead of being refused.
+        withExtendedLifetime(owner) {}
+    }
+
+    /// SCR-155 — the reason it is safe to drop the Retry button: a `.refused`
+    /// window must never silently re-upload. The guarantee is enforced at the
+    /// state machine, not the view — re-invoking the upload entry point from
+    /// `.refused` re-claims the registry, is refused again, stays `.refused`,
+    /// and never spawns a process. This is the regression guard against the
+    /// old `.failed` behavior whose enabled Retry re-refused for as long as
+    /// the owner held the claim.
+    func testReuploadFromRefusedReRefusesAndNeverSpawns() async {
+        // Owner window claims "rec-001" first and holds it across the awaits.
+        let owner = makeController(service: FakeUploadService())
+        owner.start(name: "rec-001")
+
+        let service = FakeUploadService()
+        let model = makeModel(controller: makeController(service: service))
+        await model.loadReviewData()
+
+        // First attempt is refused.
+        model.startUpload()
+        await Task.yield()
+        guard case .refused = model.state else {
+            return XCTFail("expected refused after first attempt, got \(model.state)")
+        }
+
+        // Re-invoking upload from `.refused` (the path the old Retry took) must
+        // re-refuse — not strand on `.uploading` and not spawn a process.
+        model.startUpload()
+        await Task.yield()
+        if case .refused = model.state {} else {
+            XCTFail("re-attempt from refused must stay refused, got \(model.state)")
+        }
+        XCTAssertEqual(service.startedNames, [], "a refused window must never spawn an upload")
+
+        withExtendedLifetime(owner) {}
+    }
+
     /// Covers AE4: window dismissed while uploading → controller.cancel()
     /// is called; the Python side's SIGTERM handler then emits
     /// upload_failed(error: "interrupted") and state lands on failed.
