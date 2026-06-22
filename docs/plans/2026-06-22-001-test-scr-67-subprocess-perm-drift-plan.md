@@ -1,7 +1,7 @@
 ---
 title: "test: Subprocess-level perm-drift integration test for daemon socket bind (SCR-67)"
 type: test
-status: active
+status: completed
 date: 2026-06-22
 linear: https://linear.app/zk-email/issue/SCR-67/add-subprocess-level-perm-drift-integration-test-for-daemon-socket
 ---
