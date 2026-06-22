@@ -46,6 +46,9 @@ class FakeStore:
         self.rewrite_plan: dict[str, int] = {}
         # src names whose copy lands with a corrupted crc32c (verify should fail).
         self.corrupt_on_rewrite: set[str] = set()
+        # src names whose rewrite() never clears its token — exercises copy_blob's
+        # iteration / wall-clock loop bound (SCR-145).
+        self.rewrite_never_completes: set[str] = set()
         # error injection (SCR-145): name -> exception instance to raise. Additive
         # seam so a transient GCS error / RetryError on a single object is provable
         # without the SDK. Keyed by the SOURCE blob name for rewrite, by the fetched
@@ -123,6 +126,8 @@ class FakeBlob:
         exc = self._store.raise_on_rewrite.get(source.name)
         if exc is not None:
             raise exc
+        if source.name in self._store.rewrite_never_completes:
+            return ("stuck", 10, 100)  # token never clears → copy_blob must bound the loop
         self._store.rewrite_log.append((source.name, self.name))
         need = self._store.rewrite_plan.get(source.name, 1)
         done = (0 if token is None else int(token)) + 1
@@ -978,6 +983,60 @@ def test_decommission_passes_explicit_timeout_on_delete_and_get(store, client):
     ops = {op for op, _t in store.seen_timeouts}
     assert {"get_blob", "delete"} <= ops
     assert store.seen_timeouts and all(t == core._OP_TIMEOUT for _op, t in store.seen_timeouts)
+
+
+# --------------------------------------------------------------------------
+# SCR-145 U3 — copy_blob rewriteToken loop is bounded (iterations + wall-clock)
+# --------------------------------------------------------------------------
+
+
+def test_stage_fails_object_on_stuck_rewrite_token_iteration_cap(store, client, monkeypatch):
+    monkeypatch.setattr(core, "_REWRITE_MAX_ITERS", 5)  # small cap so the test is fast
+    _seed_two_recordings(store)
+    store.rewrite_never_completes.add("recordings/alpha/video.mp4")
+    result = core.run_stage(
+        client=client, bucket_name=BUCKET, dry_run=False, probe=IDLE, log=lambda _m: None,
+    )
+    # The stuck object failed; the loop CONTINUED and staged the rest; run still ok'd.
+    assert not result.ok
+    assert any(
+        o.src == "recordings/alpha/video.mp4" and o.action == "failed" for o in result.failures
+    )
+    assert any(o.src == "recordings/beta/manifest.json" and o.verified for o in result.outcomes)
+
+
+def test_copy_blob_fails_on_wall_clock_deadline(store, client, monkeypatch):
+    # Iteration cap left high; a clock jumped past the deadline trips the wall-clock
+    # bound, proving it fires independently of iteration count. Single object so the
+    # only time.monotonic() callers are copy_blob's entry + first cap check.
+    store.add("recordings/solo/video.mp4", crc32c="V", content_type="video/mp4")
+    store.rewrite_never_completes.add("recordings/solo/video.mp4")
+    calls = {"n": 0}
+
+    def clock():
+        calls["n"] += 1
+        return 0.0 if calls["n"] == 1 else core._REWRITE_MAX_WALL + 1.0
+
+    monkeypatch.setattr(core.time, "monotonic", clock)
+    result = core.run_stage(
+        client=client, bucket_name=BUCKET, dry_run=False, probe=IDLE, log=lambda _m: None,
+    )
+    assert not result.ok
+    assert any(
+        o.src == "recordings/solo/video.mp4" and o.action == "failed" for o in result.failures
+    )
+
+
+def test_stage_large_object_under_cap_still_completes(store, client):
+    # A legitimately large object needing many (but under-cap) rewrite calls must NOT
+    # false-trigger the cap.
+    store.add("recordings/big/video.mp4", crc32c="B", content_type="video/mp4", size=9999)
+    store.rewrite_plan["recordings/big/video.mp4"] = 500
+    result = core.run_stage(
+        client=client, bucket_name=BUCKET, dry_run=False, probe=IDLE, log=lambda _m: None,
+    )
+    assert result.ok
+    assert any(o.src == "recordings/big/video.mp4" and o.action == "copied" for o in result.outcomes)
 
 
 # --------------------------------------------------------------------------

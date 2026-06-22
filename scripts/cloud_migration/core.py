@@ -30,6 +30,7 @@ from __future__ import annotations
 
 import json
 import re
+import time
 from dataclasses import dataclass
 from enum import Enum
 from pathlib import Path
@@ -70,6 +71,15 @@ _LIST_TIMEOUT = 60
 # place; equals the SDK's current default, so behavior is unchanged, but no single
 # call can hang indefinitely on an unresponsive endpoint (SCR-145).
 _OP_TIMEOUT = 60
+
+# copy_blob rewriteToken loop bounds (SCR-145): a stuck or pathologically-slow token
+# must not hang the process. The iteration cap is generous — each iteration copies one
+# server-side chunk, so even a multi-GB cross-region rewrite stays far below it (a
+# hang-guard, NOT a size limit). Because each iteration can itself take up to
+# _OP_TIMEOUT, the iteration cap alone does not bound elapsed time, so a wall-clock
+# deadline backs it up. Either bound tripping fails just that one object.
+_REWRITE_MAX_ITERS = 10_000
+_REWRITE_MAX_WALL = 30 * 60  # seconds
 
 Log = Callable[[str], None]
 
@@ -122,6 +132,15 @@ class GCSClientProtocol(Protocol):
 
 class MigrationError(RuntimeError):
     """A pre-condition gate failed and the operation refused to run (fail-closed)."""
+
+
+class RewriteLimitExceeded(RuntimeError):
+    """``copy_blob``'s rewriteToken loop exceeded its iteration or wall-clock bound.
+
+    Distinct from :class:`MigrationError` (a fail-closed gate refusal that SHOULD
+    abort the whole run): a stuck/slow token is a per-OBJECT failure, caught by
+    ``_copy_one`` and recorded as a ``failed`` outcome so the run still completes and
+    a re-run can retry that object (SCR-145)."""
 
 
 # --------------------------------------------------------------------------
@@ -218,13 +237,29 @@ def copy_blob(bucket: GCSBucketProtocol, src_blob: GCSBlobProtocol, dst_name: st
     A large video object needs multiple ``rewrite()`` calls — one rewriteToken
     round-trip per server-side chunk. Stopping at the first call truncates it
     silently, so loop until the token clears.
+
+    The loop is bounded by BOTH a generous iteration cap and a wall-clock deadline
+    (SCR-145): a stuck token (returned forever) or a slow-but-responsive endpoint
+    (a token returned just under each call's ``timeout``) would otherwise hang the
+    process indefinitely. Tripping either bound raises :class:`RewriteLimitExceeded`,
+    which ``_copy_one`` records as a per-object ``failed`` outcome; the iteration cap
+    is generous enough never to false-trigger on a legitimate large cross-region /
+    cross-storage-class rewrite.
     """
     dst_blob = bucket.blob(dst_name)
     token = None
+    iters = 0
+    deadline = time.monotonic() + _REWRITE_MAX_WALL
     while True:
         token, _rewritten, _total = dst_blob.rewrite(src_blob, token=token, timeout=_OP_TIMEOUT)
+        iters += 1
         if token is None:
             break
+        if iters >= _REWRITE_MAX_ITERS or time.monotonic() > deadline:
+            raise RewriteLimitExceeded(
+                f"{dst_name}: rewriteToken did not clear after {iters} iterations / "
+                f"{_REWRITE_MAX_WALL}s — aborting this object's copy"
+            )
     dst_blob.reload(timeout=_OP_TIMEOUT)
     return dst_blob
 
@@ -456,7 +491,7 @@ def _copy_one(
 
         fresh = copy_blob(bucket, src_blob, dst_name)
         mismatch = verify_match(src_blob, fresh)
-    except GoogleAPIError as exc:
+    except (GoogleAPIError, RewriteLimitExceeded) as exc:
         log(f"  ! {src_blob.name} -> {dst_name} FAILED (GCS error): {exc}")
         return CopyOutcome(src_blob.name, dst_name, "failed", f"error: {exc}")
     if mismatch is not None:
