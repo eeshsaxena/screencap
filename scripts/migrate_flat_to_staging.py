@@ -5,9 +5,12 @@ rollback source of truth until ``decommission_flat_namespace.py`` (U9).
 
 Runs three gates before copying, in order:
 
-1. **Bucket-IAM pre-check** — refuses if the bucket has any
+1. **Public-exposure pre-check** — refuses if the bucket has any
    ``allUsers``/``allAuthenticatedUsers`` read binding (``--remove-public-iam`` to
-   strip them). "Private staging" is a fiction otherwise.
+   strip them), AND (SCR-146) if Uniform Bucket-Level Access is off with a public
+   *default object ACL* — the second public door, which serves staged objects by
+   direct URL even with zero public IAM bindings (no auto-fix; enable UBLA
+   out-of-band). "Private staging" is a fiction otherwise.
 2. **Quiesce guard** — refuses while a screencap recording is in flight on this
    machine (``--confirm-quiesced`` to attest when ``screencap status`` is
    unavailable on an admin box).
