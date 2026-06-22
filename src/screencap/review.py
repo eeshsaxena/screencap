@@ -307,7 +307,7 @@ def prepare_review_data(name: str) -> dict:
     db_path = find_db(rec_dir)
     started_at: float | None = None
     duration_seconds: float | None = None
-    timing_error = False
+    timing_error: bool = False
     if db_path is not None:
         started_at, duration_seconds, timing_error = _read_recording_meta(db_path)
 

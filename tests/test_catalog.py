@@ -566,6 +566,23 @@ def test_read_recording_meta_zero_timestamp_not_error(tmp_path):
     assert timing_error is False
 
 
+def test_read_recording_meta_valid_timestamp_no_action_event_table(tmp_path):
+    """A DB with a valid non-zero timestamp but no action_event table is NOT
+    an error: started is populated, duration is unknown, timing_error is False."""
+    from screencap.catalog import _read_recording_meta
+
+    db_path = tmp_path / "notimeline.db"
+    conn = sqlite3.connect(str(db_path))
+    conn.execute("CREATE TABLE recording (timestamp REAL)")
+    conn.execute("INSERT INTO recording VALUES (1716800000.0)")
+    conn.commit()
+    conn.close()
+    started, duration, timing_error = _read_recording_meta(db_path)
+    assert started is not None
+    assert duration is None
+    assert timing_error is False
+
+
 def test_list_recordings_tolerates_corrupt_db(tmp_path):
     """The display caller (list_recordings) still lists a recording whose DB is
     corrupt — it discards timing_error and shows the '—' date fallback rather

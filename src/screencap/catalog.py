@@ -3,12 +3,15 @@
 from __future__ import annotations
 
 import json
+import logging
 from datetime import datetime
 from pathlib import Path
 from typing import NamedTuple
 
 from screencap.config import get_recordings_dir
 from screencap.recording_db import has_table, open_recording_db
+
+logger = logging.getLogger(__name__)
 
 INTENT_FILE = ".recording_intent"
 
@@ -236,6 +239,8 @@ def _read_recording_meta(
     collapses both into the same ``(None, None)`` and a corrupted DB presents as
     a clean, playable review (SCR-107).
     """
+    import sqlite3
+
     try:
         with open_recording_db(db_path) as conn:
             started: float | None = None
@@ -250,7 +255,8 @@ def _read_recording_meta(
                         duration = float(ev[0]) - started
 
             return started, duration, False
-    except Exception:
+    except (sqlite3.Error, OSError, ValueError) as exc:
+        logger.warning("recording.db read failed for %s: %r", db_path, exc)
         return None, None, True
 
 

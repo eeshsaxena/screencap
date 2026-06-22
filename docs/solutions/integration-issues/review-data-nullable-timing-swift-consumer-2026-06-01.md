@@ -48,7 +48,7 @@ Python emitter (`src/screencap/review.py`) legitimately returns `null` timing on
 started_at: float | None = None
 duration_seconds: float | None = None
 if db_path is not None:
-    started_at, duration_seconds = _read_recording_meta(db_path)
+    started_at, duration_seconds, timing_error = _read_recording_meta(db_path)
 return {"ok": True, ..., "started_at": started_at, "duration_seconds": duration_seconds}
 ```
 

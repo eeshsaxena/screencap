@@ -331,6 +331,26 @@ def test_timing_error_flagged_when_db_read_fails(recordings_root):
     assert serialized["timing_error"] is True
 
 
+def test_timing_error_real_corrupt_db(recordings_root):
+    """SCR-107 end-to-end: a real corrupt recording.db (non-sqlite bytes) causes
+    timing_error=True in the envelope without mocking _read_recording_meta.
+
+    The review stays playable (ok=True), started_at/duration_seconds are null,
+    and timing_error is True — distinguishing a corrupt DB from a benign
+    event-free recording.
+    """
+    rec_dir = _make_recording(recordings_root, "rec-realcorrupt", with_db=False)
+    _write_video(rec_dir / "video.mp4", (0, 0, 200), pix_fmt="yuv420p")
+    (rec_dir / "events.jsonl").write_text(json.dumps({"_meta": True}) + "\n")
+    (rec_dir / "recording.db").write_bytes(b"not a sqlite database")
+
+    envelope = prepare_review_data("rec-realcorrupt")
+
+    assert envelope["ok"] is True
+    assert envelope["started_at"] is None
+    assert envelope["timing_error"] is True
+
+
 # ---------------------------------------------------------------------------
 # CLI command (`screencap review-data`)
 # ---------------------------------------------------------------------------
@@ -350,6 +370,8 @@ def test_cli_emits_json_envelope(recordings_root):
     assert payload["video_path"].endswith("/video.mp4")
     assert payload["events_path"].endswith("/events.jsonl")
     assert payload["video_pixfmt_remediated"] is False
+    assert "timing_error" in payload
+    assert payload["timing_error"] is False
 
 
 def test_cli_cant_process_emits_error_envelope(recordings_root):

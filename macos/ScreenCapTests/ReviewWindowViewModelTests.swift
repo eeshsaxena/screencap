@@ -651,7 +651,8 @@ final class ReviewWindowViewModelTests: XCTestCase {
          "coverage": {"video_local_only": true, "audio_local_only": true,
                        "transcript_uploaded_scrubbed": false, "screenshots_uploaded": true,
                        "allowed_app_screenshot_pii_manual_review": true},
-         "started_at": null, "duration_seconds": null, "video_pixfmt_remediated": false}
+         "started_at": null, "duration_seconds": null, "video_pixfmt_remediated": false,
+         "timing_error": true}
         """
         let env = try JSONDecoder().decode(ReviewDataEnvelope.self, from: Data(json.utf8))
         XCTAssertEqual(env.schemaVersion, 2)
@@ -660,6 +661,7 @@ final class ReviewWindowViewModelTests: XCTestCase {
         XCTAssertEqual(env.redaction?.markers?.first?.category, "policy_excluded_app")
         XCTAssertNil(env.redaction?.blockedIntervals?.first?.end, "null end → nil")
         XCTAssertEqual(env.coverage?.transcriptUploadedScrubbed, false)
+        XCTAssertEqual(env.timingError, true)
     }
 
     // MARK: - Helpers

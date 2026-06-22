@@ -152,6 +152,7 @@ struct TimingUnavailableCallout: View {
             HStack(spacing: 8) {
                 Image(systemName: "exclamationmark.triangle.fill")
                     .foregroundStyle(.orange)
+                    .accessibilityHidden(true)
                 Text("Timeline unavailable — this recording's metadata couldn't be read.")
                     .font(.caption)
                 Spacer()
