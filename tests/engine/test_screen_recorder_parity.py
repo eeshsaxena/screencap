@@ -109,6 +109,7 @@ def test_seam_direct_path_matches_wrapper(tmp_path):
             "parity", output_dir=wrapper_dir,
             _menubar_policy=MenubarNoop(),
             _signal_policy=NoopSignalPolicy(),
+            _lock_policy=InheritLock(),
         )
     finally:
         for m in mocks:
@@ -213,6 +214,7 @@ def test_seam_mitm_proxy_v15_path_matches_wrapper(tmp_path):
             "parity-net", output_dir=wrapper_dir, network=True,
             _menubar_policy=MenubarNoop(),
             _signal_policy=NoopSignalPolicy(),
+            _lock_policy=InheritLock(),
         )
     finally:
         for m in all_mocks:

@@ -89,6 +89,7 @@ def main() -> int:
 
     SlowFakeRecorder = _build_slow_recorder(args.ready_marker, args.setup_hold)
 
+    from screencap.engine.lock_policy import InheritLock
     from screencap.recorder import start_recording
 
     with (
@@ -101,7 +102,7 @@ def main() -> int:
         mock.patch("shutil.disk_usage", return_value=_PLENTY_OF_DISK),
         mock.patch("screencap.engine.recorder.Recorder", SlowFakeRecorder),
     ):
-        start_recording("sigint-setup-test", output_dir=args.output_dir)
+        start_recording("sigint-setup-test", output_dir=args.output_dir, _lock_policy=InheritLock())
 
     return 0
 

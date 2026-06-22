@@ -38,6 +38,7 @@ def test_noop_permission_policy_does_not_call_check_permissions_now(tmp_path):
     from screencap.engine.menubar_policy import Noop as MenubarNoop
     from screencap.engine.permission_policy import Noop as PermNoop
     from screencap.engine.screen_recorder import NoopSignalPolicy
+    from screencap.engine.lock_policy import InheritLock
     from screencap.recorder import start_recording
 
     mocks = _base_mocks()
@@ -51,6 +52,7 @@ def test_noop_permission_policy_does_not_call_check_permissions_now(tmp_path):
                 _permission_policy=PermNoop(),
                 _signal_policy=NoopSignalPolicy(),
                 _menubar_policy=MenubarNoop(),
+                _lock_policy=InheritLock(),
             )
     finally:
         for m in mocks:
@@ -74,6 +76,7 @@ def test_noop_disk_policy_does_not_call_shutil_disk_usage(tmp_path):
     from screencap.engine.menubar_policy import Noop as MenubarNoop
     from screencap.engine.permission_policy import Noop as PermNoop
     from screencap.engine.screen_recorder import NoopSignalPolicy
+    from screencap.engine.lock_policy import InheritLock
     from screencap.recorder import start_recording
 
     mocks = _base_mocks()
@@ -88,6 +91,7 @@ def test_noop_disk_policy_does_not_call_shutil_disk_usage(tmp_path):
                 _disk_policy=DiskNoop(),
                 _signal_policy=NoopSignalPolicy(),
                 _menubar_policy=MenubarNoop(),
+                _lock_policy=InheritLock(),
             )
     finally:
         for m in mocks:

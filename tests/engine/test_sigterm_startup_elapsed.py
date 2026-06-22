@@ -73,6 +73,7 @@ def test_elapsed_recovered_when_live_loop_skipped(tmp_path):
     """
     from screencap.engine.menubar_policy import Noop as MenubarNoop
     from screencap.engine.screen_recorder import NoopSignalPolicy
+    from screencap.engine.lock_policy import InheritLock
     from screencap.recorder import start_recording
 
     out_dir = tmp_path / "rec"
@@ -85,6 +86,7 @@ def test_elapsed_recovered_when_live_loop_skipped(tmp_path):
             "scr71", output_dir=out_dir,
             _menubar_policy=MenubarNoop(),
             _signal_policy=NoopSignalPolicy(),
+            _lock_policy=InheritLock(),
         )
     finally:
         for m in mocks:
@@ -105,6 +107,7 @@ def test_elapsed_stays_zero_without_engine_duration(tmp_path):
     """
     from screencap.engine.menubar_policy import Noop as MenubarNoop
     from screencap.engine.screen_recorder import NoopSignalPolicy
+    from screencap.engine.lock_policy import InheritLock
     from screencap.recorder import start_recording
 
     out_dir = tmp_path / "rec"
@@ -117,6 +120,7 @@ def test_elapsed_stays_zero_without_engine_duration(tmp_path):
             "scr71-none", output_dir=out_dir,
             _menubar_policy=MenubarNoop(),
             _signal_policy=NoopSignalPolicy(),
+            _lock_policy=InheritLock(),
         )
     finally:
         for m in mocks:
