@@ -60,7 +60,8 @@ works the same way.
 | `search_screen_content` | On-screen text snippets + `(recording, timestamp_ms)` | **Best-effort** |
 | `search_transcript` | Audio-transcript snippets + `(recording, chunk_index)` | **Best-effort** |
 | `query_timeline` | Structured app / window / time rows | **Authoritative** |
-| `list_recordings` | Recording names + metadata | — |
+| `list_recordings` | Recording names + metadata, incl. cloud `owner_uid` + `upload_warning` | — |
+| `whoami` | The cloud account signed in on this machine (`uid` / `email`) | **Authoritative** |
 
 - **Text and pointers only — never pixels.** No tool returns or references a
   screenshot, a video frame, or a file path. The pointer is a recording name

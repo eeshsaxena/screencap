@@ -44,6 +44,32 @@ def read_owner_uid(directory: Path) -> str | None:
     return uid or None
 
 
+def read_upload_warning(directory: Path) -> str | None:
+    """Best-effort deferred-upload follow-up text from ``.upload_followup.json``.
+
+    Returns the human-readable warning for a cloud recording whose upload did not
+    fully complete at finalize and was handed to the daemon resume / manual
+    ``screencap upload`` (the ``upload_disabled`` follow-up kind carries text;
+    the others typically leave it ``None``). ``None`` when the file is absent,
+    unreadable, or carries no warning text.
+
+    CAVEAT (SCR-148): this is best-effort context, NOT a durable upload-state
+    oracle. The file is EPHEMERAL — ``recorder.print_upload_followup`` deletes it
+    after the session controller prints it — and it never carries the SCR-116
+    *account-mismatch* refusal, which is set only on the in-memory
+    ``terminal_stage.TerminalStageResult``. For the durable account-mismatch
+    signal, read :func:`read_owner_uid` and compare it against the currently
+    signed-in uid (``auth.whoami`` / the daemon's ``/v0/auth.whoami`` verb).
+    """
+    path = directory / ".upload_followup.json"
+    try:
+        data = json.loads(path.read_text())
+    except (OSError, ValueError):
+        return None
+    warning = data.get("upload_warning") if isinstance(data, dict) else None
+    return warning if isinstance(warning, str) and warning else None
+
+
 def read_intent(directory: Path) -> str | None:
     """Read the recording intent from a .recording_intent file.
 
@@ -134,6 +160,16 @@ class RecordingInfo(NamedTuple):
     # for HH:MM rendering, sorting, and date-bucket grouping.
     started_at: float | None = None  # Unix timestamp from the recording row
     duration_seconds: float | None = None  # raw seconds, source of `duration`
+    # SCR-148: cloud account-mismatch observability (a SCR-116 follow-up). Both
+    # are mirrored EXACTLY onto daemon.schema.RecordingSummary — recording.list
+    # asserts the two field sets match, so any field added here must be added
+    # there too. `owner_uid` is the Firebase uid pinned at start (.cloud_owner_uid,
+    # local-only); None for legacy/local recordings. An agent compares it against
+    # /v0/auth.whoami to tell a permanent account-mismatch block apart from a
+    # transient upload failure. `upload_warning` is best-effort follow-up text —
+    # see read_upload_warning for why it is NOT the account-mismatch signal.
+    owner_uid: str | None = None
+    upload_warning: str | None = None
 
 
 def _fmt_duration(seconds: float | None) -> str:
@@ -363,6 +399,10 @@ def list_recordings(recordings_dir: Path | None = None) -> list[RecordingInfo]:
 
         drops = read_drops(d)
         intent = read_intent(d)
+        # SCR-148: both are pure local reads (no auth / Keychain access), so
+        # list_recordings stays a cheap local scan usable without sign-in.
+        owner_uid = read_owner_uid(d)
+        upload_warning = read_upload_warning(d)
 
         results.append(
             RecordingInfo(
@@ -381,6 +421,8 @@ def list_recordings(recordings_dir: Path | None = None) -> list[RecordingInfo]:
                 is_chunked=is_chunked,
                 started_at=started,
                 duration_seconds=duration,
+                owner_uid=owner_uid,
+                upload_warning=upload_warning,
             )
         )
 

@@ -191,6 +191,36 @@ async def recording_list(request: Request) -> JSONResponse:
     )
 
 
+async def auth_whoami(request: Request) -> JSONResponse:
+    """SCR-148: report the cloud account currently signed in on this daemon.
+
+    Read-only and same-EUID gated like every other ``/v0`` verb. Pairs with
+    ``recording.list``'s ``owner_uid`` so an agent can compare a recording's
+    pinned owner against the live signed-in uid and tell a permanent
+    account-mismatch block apart from a transient upload failure.
+
+    Fails OPEN to ``signed_in=false`` (never a 500): ``auth.whoami`` is built
+    not to raise, but an unexpected Keychain error must degrade like every other
+    read verb rather than drop a polling client to its error path.
+    """
+    from screencap import auth
+
+    try:
+        info = await asyncio.to_thread(auth.whoami)
+    except Exception:  # noqa: BLE001 — a read verb must never 500
+        logger.debug("auth.whoami probe failed", exc_info=True)
+        info = {"signed_in": False}
+    return JSONResponse(
+        schema.envelope(
+            schema_version=schema._AUTH_WHOAMI_API_VERSION,
+            signed_in=bool(info.get("signed_in")),
+            uid=info.get("uid"),
+            email=info.get("email"),
+            stale=bool(info.get("stale")),
+        )
+    )
+
+
 def _empty_snapshot(
     *,
     is_recording: bool | None,
@@ -979,6 +1009,7 @@ def build_app() -> Starlette:
         routes=[
             Route("/v0/daemon.info", daemon_info, methods=["GET"]),
             Route("/v0/recording.list", recording_list, methods=["GET"]),
+            Route("/v0/auth.whoami", auth_whoami, methods=["GET"]),
             Route("/v0/session.snapshot", session_snapshot, methods=["GET"]),
             Route("/v0/events", events_stream, methods=["GET"]),
             Route("/v0/recording.start", recording_start, methods=["POST"]),

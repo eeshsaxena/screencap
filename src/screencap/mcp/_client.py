@@ -96,6 +96,9 @@ class AsyncDaemonClient:
     async def list_recordings(self) -> dict[str, Any]:
         return await self._get("/v0/recording.list")
 
+    async def whoami(self) -> dict[str, Any]:
+        return await self._get("/v0/auth.whoami")
+
     async def content_search(
         self, query: str, *, recording: str | None = None, limit: int | None = None,
     ) -> dict[str, Any]:
