@@ -340,7 +340,8 @@ struct ReviewWindow: View {
              .uploading(_, let data):
             return data
         case .failed(_, .some(let data)),
-             .refused(_, .some(let data)):
+             .refused(_, .some(let data)),
+             .busy(_, .some(let data)):
             return data
         default:
             return nil
@@ -439,6 +440,27 @@ struct ReviewWindow: View {
                 Spacer()
                 Button("Close") { dismiss() }
                     .keyboardShortcut(.defaultAction)
+            }
+            .padding(12)
+        case .busy(let message, let retryData):
+            // SCR-158: busy-lock skip — framed as info, not an error (the child
+            // exited 0; the recording isn't broken). Unlike `.refused`, a
+            // busy-lock is transient, so a Retry IS offered when there is panes
+            // data to re-run against; the default action so ⏎ retries.
+            HStack(spacing: 8) {
+                Image(systemName: "clock.fill")
+                    .foregroundStyle(.secondary)
+                Text(message)
+                    .font(.caption)
+                    .foregroundStyle(.secondary)
+                    .lineLimit(2)
+                Spacer()
+                Button("Close") { dismiss() }
+                if retryData != nil {
+                    Button("Retry") { attemptUpload() }
+                        .keyboardShortcut(.defaultAction)
+                        .buttonStyle(.borderedProminent)
+                }
             }
             .padding(12)
         }

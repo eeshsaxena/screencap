@@ -189,6 +189,13 @@ enum ReviewState: Equatable {
     /// that would silently re-refuse. `data` is carried so the review panes
     /// still render; only the bottom action row differs.
     case refused(message: String, data: ReviewData?)
+    /// Busy-lock skip (SCR-158): the `screencap upload` child exited cleanly
+    /// after another *process* held the per-recording terminal-stage lock.
+    /// Framed as info, not an error (the recording isn't broken) — but unlike
+    /// `.refused`, it IS retryable, so the action row offers a Retry. `retryData`
+    /// is carried so the panes still render and Retry can re-run without a
+    /// re-prep.
+    case busy(message: String, retryData: ReviewData?)
 }
 
 @MainActor
@@ -288,8 +295,9 @@ final class ReviewWindowViewModel: ObservableObject {
         }
     }
 
-    /// Upload-button action. No-op if the viewmodel isn't in a ready /
-    /// failed (with retry data) state.
+    /// Upload-button action. No-op if the viewmodel isn't in a state that
+    /// carries review data to upload against — ready, or failed / busy with
+    /// retry data (SCR-158).
     func startUpload() {
         // A new upload supersedes any pending success auto-close (SCR-90): if
         // the user re-uploads from a success confirmation, the old dismiss must
@@ -335,6 +343,8 @@ final class ReviewWindowViewModel: ObservableObject {
             return retryData
         case .refused(_, let data):
             return data
+        case .busy(_, let retryData):
+            return retryData
         case .preparing, .succeeded:
             // `.succeeded` intentionally returns nil: an upload already
             // completed, so there is no ready/retry payload to re-enter
@@ -397,6 +407,15 @@ final class ReviewWindowViewModel: ObservableObject {
             // `startUpload`) so the window still renders the review content.
             disarmAutoClose()
             state = .refused(message: message, data: currentReviewData())
+        case .busy(let message):
+            // SCR-158: a busy-lock skip is NOT a failure — the child exited 0
+            // because another process held the terminal-stage lock transiently.
+            // Surface honest "in progress, try again shortly" copy with a Retry
+            // (unlike `.refused`, a busy-lock clears on its own, so retrying is
+            // the right affordance). Carry the panes data forward so the window
+            // keeps rendering the review content.
+            disarmAutoClose()
+            state = .busy(message: message, retryData: currentReviewData())
         }
     }
 }

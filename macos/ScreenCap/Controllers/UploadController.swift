@@ -64,6 +64,15 @@ enum UploadState: Equatable {
     /// window can render it honestly (no dangling Retry that silently
     /// re-refuses) — it is *not* a genuine upload failure.
     case refused(String)
+    /// Terminal busy-skip (SCR-158): the spawned `screencap upload` child exited
+    /// 0 after emitting an `upload_busy` event because another *process* held
+    /// the per-recording terminal-stage lock (a finalize, a daemon resume, or a
+    /// concurrent upload). Distinct from `.failed` (it is not a failure — the
+    /// child exited cleanly) and from `.refused` (which re-refuses on retry while
+    /// the same-app claim is held): a busy-lock is transient, so this state is
+    /// retry-friendly. Without it, exit-0-without-a-terminal-event would render
+    /// as `.failed("upload exited with code 0")`.
+    case busy(String)
 
     struct Progress: Equatable {
         let filesDone: Int
@@ -353,6 +362,19 @@ final class UploadController: ObservableObject {
             sawTerminalEvent = true
             cancelWatchdogAndReleaseClaim()
             state = .failed(event.error ?? "upload failed")
+        case "upload_busy":
+            // SCR-158: a contended terminal lock is a retryable, terminal,
+            // NON-failure outcome (the child exits 0). First-write-wins like the
+            // other terminal events. The user-facing copy is owned here (the
+            // Python event carries only `recording` + `retryable`, no message),
+            // mirroring the synthesized copy for `.refused`.
+            guard !sawTerminalEvent else { return }
+            sawTerminalEvent = true
+            cancelWatchdogAndReleaseClaim()
+            state = .busy(
+                "Upload already in progress — a recording is finalizing or being "
+                    + "uploaded elsewhere. Try again shortly."
+            )
         default:
             // Unknown event type — silently ignore. A future addition
             // (e.g. `upload_progress`) does not need a Swift bump.

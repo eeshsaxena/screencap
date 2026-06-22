@@ -152,6 +152,28 @@ final class UploadControllerTests: XCTestCase {
         }
     }
 
+    /// SCR-158: an `upload_busy` event (a contended terminal-stage lock held by
+    /// another process) is a retryable, terminal, NON-failure outcome. The
+    /// controller must land on `.busy` — distinct from `.failed` — and the
+    /// child's subsequent exit 0 must NOT overwrite it (first-write-wins).
+    /// Without the explicit handler, exit-0-without-a-terminal-event would
+    /// render as `.failed("upload exited with code 0")`, the SCR-158 bug.
+    func testUploadBusyEventTransitionsToBusyNotFailed() {
+        let service = FakeUploadService()
+        let controller = makeController(service: service)
+
+        controller.start(name: "rec-001")
+        service.emit(#"{"type": "upload_busy", "schema_version": 1, "recording": "rec-001", "retryable": true}"#)
+        // Busy-skip keeps exit 0 (SCR-79); the terminationHandler fires after
+        // the event and must defer to it, not clobber `.busy` with `.failed`.
+        service.terminate(exitCode: 0)
+
+        guard case .busy(let msg) = controller.state else {
+            return XCTFail("expected busy state, got \(controller.state)")
+        }
+        XCTAssertFalse(msg.isEmpty)
+    }
+
     /// Covers AE4 — cancel mid-upload sends SIGTERM via terminate(), Python
     /// emits upload_failed(error: "interrupted"), state lands on failed.
     func testCancelMidUploadTerminatesProcessAndStateLandsOnFailedInterrupted() {
