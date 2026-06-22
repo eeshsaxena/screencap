@@ -38,6 +38,11 @@ def _parse_args(argv):
 
 
 def main(argv=None) -> int:
+    # Lazy import so this shim stays SDK-free at import scope (matches core's
+    # lazy-import posture). GoogleAPIError (not GoogleAPICallError) is the broad
+    # base so a top-level RetryError escaping run_promote is caught too (SCR-145).
+    from google.api_core.exceptions import GoogleAPIError
+
     args = _parse_args(argv if argv is not None else sys.argv[1:])
     try:
         allow = core.load_allow_list(args.allow_list)
@@ -67,7 +72,7 @@ def main(argv=None) -> int:
     except core.MigrationError as exc:
         print(f"ERROR: {exc}", file=sys.stderr)
         return 2
-    except _gcs_error() as exc:
+    except GoogleAPIError as exc:
         print(f"ERROR: GCS error during promote: {exc}", file=sys.stderr)
         return 1
 
@@ -103,16 +108,6 @@ def main(argv=None) -> int:
     if result.missing_from_staging or result.invalid_names or result.marker_only:
         return 1
     return 0
-
-
-def _gcs_error():
-    """The broad GCS error base class, imported lazily so this shim stays SDK-free
-    until it actually runs against GCS (matches ``core``'s lazy-import posture).
-    GoogleAPIError (not GoogleAPICallError) so a top-level RetryError is caught too
-    (SCR-145)."""
-    from google.api_core.exceptions import GoogleAPIError
-
-    return GoogleAPIError
 
 
 if __name__ == "__main__":

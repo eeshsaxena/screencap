@@ -88,10 +88,15 @@ def _open_audit_log(path: str, *, dry_run: bool):
     same sensitivity class as the recordings — they can leak that something was
     recorded). Live runs append so a re-run after a partial failure extends rather
     than truncates the prior deletion record; the dry-run sidecar is truncated."""
-    flags = os.O_WRONLY | os.O_CREAT | (os.O_TRUNC if dry_run else os.O_APPEND)
+    # Co-locate the truncate/append flag with the matching fdopen mode so the two
+    # never drift out of sync. O_NOFOLLOW refuses a symlinked target (mirrors the
+    # other hardened sinks: daemon/audit_log.py, cli/_autospawn.py, content_index.py)
+    # — the resulting ELOOP surfaces cleanly through main()'s `except OSError`.
+    extra_flag, mode = (os.O_TRUNC, "w") if dry_run else (os.O_APPEND, "a")
+    flags = os.O_WRONLY | os.O_CREAT | os.O_NOFOLLOW | extra_flag
     fd = os.open(path, flags, 0o600)
     os.fchmod(fd, 0o600)  # enforce 0o600 even if the file pre-existed with looser perms
-    return os.fdopen(fd, "w" if dry_run else "a", encoding="utf-8")
+    return os.fdopen(fd, mode, encoding="utf-8")
 
 
 def main(argv=None) -> int:
@@ -135,6 +140,19 @@ def main(argv=None) -> int:
     except core.MigrationError as exc:
         print(f"ERROR: {exc}", file=sys.stderr)
         return 2
+    except OSError as exc:
+        # An OSError here means the audit sink itself failed mid-run (e.g. a full
+        # disk during `_record`'s write/flush). This is the irreversible step: a
+        # delete may have already committed, so its audit line could be lost. STOP
+        # rather than keep doing unrecorded irreversible deletes — never crash with a
+        # raw traceback, never overstate what was deleted. Exit 1 (the
+        # incomplete/investigate bucket, consistent with kept-on-error).
+        print(
+            f"ERROR: audit log write failed ({exc}); aborting — the last deleted "
+            f"object may be unlogged. Inspect {audit_path} before re-running.",
+            file=sys.stderr,
+        )
+        return 1
     finally:
         audit_fp.close()
 

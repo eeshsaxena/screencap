@@ -745,6 +745,28 @@ def test_promote_cli_promotes_from_allow_list_file(store, client, patch_build_cl
     assert not any(k.startswith("demo/beta/") for k in store.objects)
 
 
+def test_promote_cli_returns_rc1_on_gcs_error_escaping_run_promote(
+    store, client, patch_build_client, tmp_path, monkeypatch
+):
+    # A GCS error that escapes run_promote ITSELF (e.g. enumeration via iter_blobs,
+    # not the per-object _copy_one seam) must hit the shim's top-level catch — the
+    # `raise_on_rewrite` seam only reaches _copy_one, so it cannot exercise this path.
+    # RetryError proves the catch uses the broad GoogleAPIError, not GoogleAPICallError.
+    import promote_staging_to_demo as promote_cli
+    from google.api_core.exceptions import RetryError
+
+    _seed_staging(store)
+    allow = tmp_path / "allow.txt"
+    allow.write_text("alpha\n")
+
+    def boom(*_a, **_k):
+        raise RetryError("simulated retry exhaustion enumerating staging", None)
+
+    monkeypatch.setattr(core, "iter_blobs", boom)
+    rc = promote_cli.main(["--bucket", BUCKET, "--allow-list", str(allow)])
+    assert rc == 1  # GCS error during promote -> exit 1, no raw traceback
+
+
 def test_decommission_cli_requires_confirm_for_live(store, client, patch_build_client, tmp_path):
     import decommission_flat_namespace as decom_cli
 
@@ -843,6 +865,13 @@ def test_decommission_keeps_source_changed_since_enumeration(store, client):
     assert "recordings/alpha/video.mp4" in store.objects
     kept_video = [o for o in result.kept if o.src == "recordings/alpha/video.mp4"]
     assert kept_video and "generation mismatch" in kept_video[0].reason
+    # Pin the EXACT reason so the except-ordering invariant is actually exercised:
+    # PreconditionFailed (a GoogleAPICallError subclass) MUST be caught before the
+    # broad `except GoogleAPIError`. If the order were reversed, this would land in
+    # the generic `error: …` bucket — whose string also happens to contain
+    # "generation mismatch", so the substring check above alone would not catch it.
+    assert not kept_video[0].reason.startswith("error:")
+    assert kept_video[0].reason == "source changed since enumeration (generation mismatch)"
     # The unchanged manifest source still deletes normally.
     assert "recordings/alpha/manifest.json" in store.deleted
 
@@ -1146,6 +1175,40 @@ def test_decommission_cli_dry_run_writes_dryrun_sidecar(store, client, patch_bui
     assert rows and all(r["action"] == "planned" for r in rows)
 
 
+def test_decommission_cli_aborts_cleanly_on_audit_write_failure(
+    store, client, patch_build_client, tmp_path, monkeypatch
+):
+    # The audit sink itself fails (full disk) mid-run: `_record`'s write raises an
+    # OSError AFTER the first delete has already committed. The CLI must NOT crash
+    # with a raw traceback — it must abort cleanly with rc 1 (incomplete/investigate),
+    # and the already-deleted object stays in store.deleted (the delete committed,
+    # the run understates rather than crashes).
+    import decommission_flat_namespace as decom_cli
+
+    _seed_flat_with_staging(store)  # alpha manifest + video, both verified
+
+    real_open = decom_cli._open_audit_log
+
+    def open_then_break_write(path, *, dry_run):
+        fp = real_open(path, dry_run=dry_run)
+        # A `deleted` outcome is emitted only AFTER its delete returns, so failing
+        # the first write means at least one delete has already committed.
+        def _boom(*_a, **_k):
+            raise OSError("No space left on device")
+
+        monkeypatch.setattr(fp, "write", _boom)
+        return fp
+
+    monkeypatch.setattr(decom_cli, "_open_audit_log", open_then_break_write)
+
+    audit = tmp_path / "audit.jsonl"
+    rc = decom_cli.main(["--bucket", BUCKET, "--confirm", "--audit-log", str(audit)])
+    assert rc == 1  # clean abort, not a raw traceback
+    # The delete that committed before the audit write failed is reflected — the run
+    # understates (a lost audit line) rather than overstates or crashes.
+    assert store.deleted  # at least one delete committed before the abort
+
+
 # --------------------------------------------------------------------------
 # U9 — sessions backup gate
 # --------------------------------------------------------------------------
@@ -1174,11 +1237,17 @@ def test_decommission_sessions_withheld_without_backup_confirmation(store, clien
 def test_decommission_cli_include_sessions_requires_backup_flag(store, client, patch_build_client, tmp_path):
     import decommission_flat_namespace as decom_cli
 
-    audit = str(tmp_path / "audit.jsonl")
+    audit_path = tmp_path / "audit.jsonl"
+    audit = str(audit_path)
     store.add("sessions/_index.json", crc32c="S", content_type="application/json")
     rc = decom_cli.main(["--bucket", BUCKET, "--confirm", "--include-sessions", "--audit-log", audit])
     assert rc == 2  # MigrationError (backup not confirmed) -> exit 2
     assert store.deleted == []
+    # The audit log is opened BEFORE run_decommission, so even on the early
+    # MigrationError refusal the `finally` must have closed it cleanly, leaving a
+    # well-formed (empty) file — exercising the finally-close path.
+    assert audit_path.exists()
+    assert audit_path.read_text(encoding="utf-8") == ""
 
     rc = decom_cli.main(
         ["--bucket", BUCKET, "--confirm", "--include-sessions", "--sessions-backup-confirmed",

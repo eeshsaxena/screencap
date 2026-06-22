@@ -255,10 +255,18 @@ def copy_blob(bucket: GCSBucketProtocol, src_blob: GCSBlobProtocol, dst_name: st
         iters += 1
         if token is None:
             break
-        if iters >= _REWRITE_MAX_ITERS or time.monotonic() > deadline:
+        # Two independent bounds — name the one that actually fired so the failure
+        # reason is not misleading (a tripped iteration cap must not blame the
+        # wall-clock constant, and vice versa).
+        if iters >= _REWRITE_MAX_ITERS:
             raise RewriteLimitExceeded(
-                f"{dst_name}: rewriteToken did not clear after {iters} iterations / "
-                f"{_REWRITE_MAX_WALL}s — aborting this object's copy"
+                f"{dst_name}: rewriteToken did not clear after {iters} iterations "
+                f"(cap {_REWRITE_MAX_ITERS}) — aborting this object's copy"
+            )
+        if time.monotonic() > deadline:
+            raise RewriteLimitExceeded(
+                f"{dst_name}: rewriteToken did not clear within {_REWRITE_MAX_WALL}s "
+                "wall-clock — aborting this object's copy"
             )
     dst_blob.reload(timeout=_OP_TIMEOUT)
     return dst_blob
