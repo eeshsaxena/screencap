@@ -268,7 +268,10 @@ def test_cloud_start_blocked_when_models_missing(stub_daemon):
     ):
         result = stub_daemon.invoke(["start", "--name", "demo", "--cloud"])
     assert result.exit_code == 1, result.output
-    assert "setup" in result.output  # points at ``screencap setup --scan``
+    # Pin the exact remediation command. Normalize whitespace first: rich wraps
+    # the message at the 80-col default, splitting ``screencap`` from ``setup``
+    # across a newline, so a raw-substring match on the full command would fail.
+    assert "screencap setup --scan" in " ".join(result.output.split())
     # No payload reached the daemon: the gate short-circuits the handoff.
     assert stub_daemon.captured_start == {}
 
