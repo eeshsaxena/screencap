@@ -2533,8 +2533,20 @@ def upload(names, all_recordings, dry_run, force, jobs, no_delete):
                 n_failed += 1
                 continue
             except RuntimeError as e:
+                # SCR-159: a generic RuntimeError reaching THIS handler is
+                # per-recording, not a batch-global failure — count it and continue
+                # rather than abandon the rest of the batch. Note the transient
+                # upload errors (auth blip, timeout, service error) and scrub/mask
+                # failures do NOT arrive here: run_terminal_stage absorbs them in its
+                # own catchers and surfaces them as result.upload_warning (handled
+                # below). What escapes to here is a RuntimeError from
+                # run_terminal_stage's reconcile / ledger / retention / sentinel
+                # logic — still per-recording. Treat it like the PromotionRefused /
+                # FileNotFoundError handlers above; the `if n_failed: sys.exit(1)`
+                # gate below still yields the non-zero exit code (SCR-79).
                 console.print(f"[red]Error:[/red] {e}")
-                sys.exit(1)
+                n_failed += 1
+                continue
 
             if dry_run:
                 console.print(
