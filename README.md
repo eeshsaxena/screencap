@@ -101,7 +101,6 @@ Record screen, mouse, keyboard, and optionally audio. Starts immediately with no
 | `-o, --output PATH` | Custom output directory (skips directory rename) |
 | `--no-wifi-metrics` | Disable WiFi metrics collection |
 | `--no-app-versions` | Disable running app version capture |
-| `--force` | Auto-clean orphaned processes before starting |
 
 Output files: `video.mp4`, `audio.flac`, `recording.db`, `viewer.html`
 
