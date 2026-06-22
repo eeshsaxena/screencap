@@ -977,3 +977,44 @@ class TestNetworkV15Plumbing:
         assert "dek_wrapped" not in kwargs
         assert "dek_nonce" not in kwargs
         assert kwargs.get("network", False) is False or "network" not in kwargs
+
+
+class TestLockPolicyContract:
+    """SCR-66: ``_lock_policy`` is a required keyword-only argument.
+
+    The daemon-only invariant — ``InheritLock`` is correct only inside a
+    daemon-spawned worker, where the supervisor owns the pidfile — is now
+    enforced at the call boundary rather than documented only in prose. A
+    direct caller that omits ``_lock_policy`` must fail loudly instead of
+    silently inheriting a no-op lock.
+    """
+
+    def test_start_recording_requires_lock_policy(self, tmp_path):
+        """Omitting ``_lock_policy`` raises ``TypeError`` at call binding,
+        before any recording side effects run (so no mocks are needed)."""
+        from screencap.recorder import start_recording
+
+        with pytest.raises(TypeError) as exc_info:
+            start_recording("inv", output_dir=tmp_path / "inv-rec")
+
+        assert "_lock_policy" in str(exc_info.value)
+
+    def test_signature_has_no_default_for_lock_policy(self):
+        """Pin the contract at the signature level too: a future refactor that
+        re-adds a default (or swallows ``_lock_policy`` into ``**kwargs``) would
+        regress to the silent daemon-only no-op. Mirrors the required-keyword
+        contract in tests/test_recover_chunk_metadata.py."""
+        import inspect
+
+        from screencap.recorder import start_recording
+
+        params = inspect.signature(start_recording).parameters
+        assert "_lock_policy" in params, (
+            "_lock_policy kwarg removed from start_recording — direct callers "
+            "must always choose their process-exclusion policy explicitly."
+        )
+        assert params["_lock_policy"].default is inspect.Parameter.empty, (
+            "_lock_policy now has a default — start_recording must require "
+            "callers to choose their lock policy explicitly (SCR-66). "
+            "InheritLock is a no-op correct only inside a daemon worker."
+        )
