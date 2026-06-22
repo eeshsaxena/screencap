@@ -21,7 +21,10 @@ fresh-remote-confirm rule):
   ground truth until U9, which deletes a source ONLY after a fresh live re-verify
   of its staging copy.
 * **Private staging is a pre-condition, not a hope.** Staging refuses to run
-  while the bucket carries any ``allUsers``/``allAuthenticatedUsers`` binding.
+  while the bucket carries any ``allUsers``/``allAuthenticatedUsers`` IAM binding,
+  AND (SCR-146) while Uniform Bucket-Level Access is off with a public *default
+  object ACL* — the second public door, which serves objects by direct URL even
+  with zero public IAM bindings.
 * **Quiesce.** A migration refuses while a recording is in flight on this
   machine (a late completion sentinel can land a flat blob after enumeration).
 """
@@ -30,6 +33,7 @@ from __future__ import annotations
 
 import json
 import re
+from contextlib import contextmanager
 from dataclasses import dataclass
 from enum import Enum
 from pathlib import Path
@@ -54,7 +58,13 @@ STRIPPED_MARKERS = frozenset({"_unlisted", "show_on_website"})
 # IAM members that make bucket objects world-readable. "Private staging" is a
 # fiction while either is bound to ANY role, so staging refuses to run until both
 # are gone (plan U8 bucket-IAM pre-check; the SCR-139 ticket's first pre-check).
+# The same two tokens name the public principals in a legacy object/default-object
+# ACL (the ACL ``entity`` field), so the UBLA/ACL pre-check (SCR-146) reuses the set.
 PUBLIC_IAM_MEMBERS = frozenset({"allUsers", "allAuthenticatedUsers"})
+
+# ``public_access_prevention`` reads ``"enforced"`` when GCS blocks all public
+# access; any other value (``"inherited"`` / legacy ``"unspecified"``) does not.
+PUBLIC_ACCESS_PREVENTION_ENFORCED = "enforced"
 
 # Mirrors the cloud function's recording-name guard (paths.py ``_NAME_RE`` +
 # ``is_valid_name``): a public demo name may not contain a slash or climb via
@@ -96,6 +106,14 @@ class GCSBlobProtocol(Protocol):
 
 
 class GCSBucketProtocol(Protocol):
+    # Bucket-level metadata for the public-exposure pre-checks. ``iam_configuration``
+    # and ``default_object_acl`` read from the bucket's cached ``_properties``, so a
+    # bare ``client.bucket(name)`` reference exposes only DEFAULTS (UBLA reads False)
+    # until ``reload()`` populates them from the live bucket — see
+    # :func:`read_iam_configuration`.
+    iam_configuration: Any
+    default_object_acl: Any
+
     def blob(self, name: str) -> GCSBlobProtocol: ...
 
     def get_blob(self, name: str) -> GCSBlobProtocol | None: ...
@@ -106,6 +124,8 @@ class GCSBucketProtocol(Protocol):
 
     def set_iam_policy(self, policy: Any) -> Any: ...
 
+    def reload(self, *args: Any, **kwargs: Any) -> None: ...
+
 
 class GCSClientProtocol(Protocol):
     def bucket(self, name: str) -> GCSBucketProtocol: ...
@@ -115,6 +135,27 @@ class GCSClientProtocol(Protocol):
 
 class MigrationError(RuntimeError):
     """A pre-condition gate failed and the operation refused to run (fail-closed)."""
+
+
+@contextmanager
+def _refuse_on_gcs_error(what: str) -> Iterator[None]:
+    """Convert a GCS API failure during a pre-check READ into a fail-closed
+    ``MigrationError``, so a transient/permission/not-found error refuses to stage
+    with an actionable message + clean exit code rather than an uncaught traceback.
+    A pre-check that cannot confirm the bucket is private must NOT proceed.
+    """
+    # google.api_core + google.auth are imported lazily so core stays SDK-free at import scope.
+    from google.api_core.exceptions import GoogleAPIError
+    from google.auth.exceptions import GoogleAuthError
+
+    try:
+        yield
+    except (GoogleAPIError, GoogleAuthError) as exc:
+        raise MigrationError(
+            f"refusing to stage: could not read {what} to verify the bucket is "
+            f"private ({exc}). The Step 0 pre-checks need bucket IAM + metadata + "
+            "default-object-ACL read (roles/storage.admin) — see the runbook."
+        ) from exc
 
 
 # --------------------------------------------------------------------------
@@ -238,7 +279,8 @@ def find_public_iam_bindings(bucket: GCSBucketProtocol) -> list[tuple[str, str]]
     Any such binding can make ``import-review/`` objects world-readable by direct
     URL, so private staging cannot be guaranteed while one exists.
     """
-    policy = bucket.get_iam_policy(requested_policy_version=3)
+    with _refuse_on_gcs_error("bucket IAM policy"):
+        policy = bucket.get_iam_policy(requested_policy_version=3)
     found: list[tuple[str, str]] = []
     for binding in _policy_bindings(policy):
         role = binding.get("role")
@@ -279,6 +321,103 @@ def remove_public_iam_bindings(
     for role, member in removed:
         log(f"  removed public IAM binding: {member} : {role}")
     return removed
+
+
+# --------------------------------------------------------------------------
+# UBLA / object-ACL pre-check (the second public door — SCR-146)
+# --------------------------------------------------------------------------
+#
+# Bucket IAM is not the only way GCS serves objects publicly. While Uniform
+# Bucket-Level Access (UBLA) is DISABLED (the default on older buckets), legacy
+# per-object and DEFAULT-object ACLs are live, and a public default object ACL
+# makes every newly written object world-readable by direct URL — even with zero
+# public IAM bindings. So a bucket that clears ``find_public_iam_bindings`` can
+# still expose ``import-review/``. This pre-check closes that door, fail-closed.
+
+
+def read_iam_configuration(bucket: GCSBucketProtocol) -> tuple[bool, str | None]:
+    """``(uniform_bucket_level_access_enabled, public_access_prevention)``.
+
+    Reloads the bucket FIRST: ``iam_configuration`` reads the bucket's cached
+    ``_properties``, and a bare ``client.bucket(name)`` reference carries none — so
+    without the reload UBLA would read ``False`` on a bucket we never inspected and
+    fail-OPEN into the ACL path. The reload makes the read reflect live state.
+    """
+    with _refuse_on_gcs_error("bucket metadata (iam_configuration)"):
+        bucket.reload()
+    cfg = bucket.iam_configuration
+    ubla = bool(getattr(cfg, "uniform_bucket_level_access_enabled", False))
+    pap = getattr(cfg, "public_access_prevention", None)
+    return ubla, pap
+
+
+def find_public_default_object_acl(bucket: GCSBucketProtocol) -> list[tuple[str, str]]:
+    """``(role, entity)`` grants of ``allUsers``/``allAuthenticatedUsers`` in the
+    bucket's DEFAULT OBJECT ACL — the ACL every newly written object inherits.
+
+    Only meaningful while UBLA is disabled (UBLA makes object ACLs inert); callers
+    gate on :func:`read_iam_configuration` before consulting this.
+    """
+    acl = bucket.default_object_acl
+    with _refuse_on_gcs_error("bucket default object ACL"):
+        acl.reload()
+    found: list[tuple[str, str]] = []
+    for entry in acl:
+        entity = entry.get("entity")
+        if entity in PUBLIC_IAM_MEMBERS:
+            found.append((entry.get("role"), entity))
+    return found
+
+
+def assert_no_public_object_acl(
+    bucket: GCSBucketProtocol, bucket_name: str, *, log: Log = print
+) -> None:
+    """Refuse to stage if a default object ACL could make ``import-review/`` objects
+    world-readable (SCR-146). Fail-closed; read-only (no auto-remediation).
+
+    Public Access Prevention enforced -> public access is impossible bucket-wide;
+    OK. UBLA enabled -> object ACLs are inert; OK. Otherwise (UBLA off AND PAP not
+    enforced) a public DEFAULT object ACL would be inherited by every staged object,
+    so refuse when one is present. A correctly-configured bucket (PAP enforced, UBLA
+    on, or UBLA off with a private default ACL) is NOT refused.
+    """
+    ubla, pap = read_iam_configuration(bucket)
+    # Public Access Prevention, when enforced, blocks ALL public access bucket-wide
+    # (IAM *and* ACLs) and cannot be overridden — so no object can be served publicly
+    # regardless of UBLA or any legacy ACL. It is the strongest lock and a
+    # definitively-safe posture: honor it so a hardened bucket is never falsely
+    # refused over a stale ACL GCS would refuse to serve anyway.
+    if pap == PUBLIC_ACCESS_PREVENTION_ENFORCED:
+        log(
+            "UBLA pre-check: public_access_prevention=enforced — public access is "
+            "blocked bucket-wide (IAM + ACLs), so object ACLs cannot expose staged "
+            "objects regardless of UBLA. OK."
+        )
+        return
+    if ubla:
+        log(
+            "UBLA pre-check: uniform_bucket_level_access enabled "
+            f"(public_access_prevention={pap or 'unset'}) — object ACLs inert. OK."
+        )
+        return
+    public_acl = find_public_default_object_acl(bucket)
+    if public_acl:
+        detail = ", ".join(f"{entity}:{role}" for role, entity in public_acl)
+        raise MigrationError(
+            f"refusing to stage: bucket {bucket_name!r} has Uniform Bucket-Level "
+            "Access DISABLED, public_access_prevention not enforced, and a public "
+            f"default object ACL ({detail}). Newly staged import-review/ objects "
+            "would inherit it and be world-readable by direct URL despite no public "
+            "IAM binding. Enable UBLA (gcloud storage buckets update "
+            "--uniform-bucket-level-access) and set public_access_prevention="
+            "enforced, then re-run (runbook Step 0)."
+        )
+    log(
+        "UBLA pre-check: UBLA disabled and public_access_prevention not enforced, "
+        f"but the default object ACL grants no public access (pap={pap or 'unset'}). "
+        "OK — staged objects inherit a private default ACL; enabling UBLA and "
+        "enforcing PAP is still recommended."
+    )
 
 
 # --------------------------------------------------------------------------
@@ -469,9 +608,11 @@ def run_stage(
 ) -> StageResult:
     """U8 stage: copy flat ``recordings/`` into private ``import-review/``.
 
-    Runs the bucket-IAM pre-check FIRST, then the quiesce guard, then a per-object
-    verified rewrite. ``sessions/`` is EXCLUDED by design (demo is a recordings
-    gallery; its index references retired flat paths). No source is ever deleted.
+    Runs the bucket-IAM pre-check FIRST, then the UBLA / default-object-ACL
+    pre-check (the second public door — SCR-146), then the quiesce guard, then a
+    per-object verified rewrite. ``sessions/`` is EXCLUDED by design (demo is a
+    recordings gallery; its index references retired flat paths). No source is ever
+    deleted.
 
     ``on_outcome`` (optional) is invoked with each :class:`CopyOutcome` AS the
     copy loop runs, so a long interrupted run can leave incremental provenance
@@ -502,6 +643,11 @@ def run_stage(
             )
     else:
         log("bucket-IAM pre-check: no allUsers/allAuthenticatedUsers bindings. OK.")
+
+    # 1b) UBLA / object-ACL pre-check — the SECOND public door (SCR-146). Read-only;
+    # refuses fail-closed if a public default object ACL would expose staged objects
+    # while UBLA is off. Runs on dry-run too (it never mutates anything).
+    assert_no_public_object_acl(bucket, bucket_name, log=log)
 
     # 2) Quiesce guard.
     assert_quiesced(confirm_quiesced=confirm_quiesced, probe=probe, log=log)
