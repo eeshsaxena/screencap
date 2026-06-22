@@ -1,7 +1,7 @@
 ---
 title: "fix: Harden cloud-migration scripts (GCS error breadth, timeouts, rewrite cap, decommission audit log)"
 type: fix
-status: active
+status: completed
 date: 2026-06-22
 deepened: 2026-06-22
 ---
