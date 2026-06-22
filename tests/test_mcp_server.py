@@ -48,6 +48,9 @@ class _StubClient:
     async def list_recordings(self):
         return await self._reply("recordings")
 
+    async def whoami(self):
+        return await self._reply("whoami")
+
 
 def _use_client(monkeypatch, client) -> None:
     async def _fake_client():
@@ -168,6 +171,105 @@ async def test_list_recordings_projects_known_fields_only(monkeypatch):
     assert set(dumped) == set(server.RecordingSummary.model_fields)
     assert "path" not in dumped
     assert "size_bytes" not in dumped
+
+
+@pytest.mark.asyncio
+async def test_list_recordings_surfaces_account_mismatch_fields(monkeypatch):
+    """SCR-148: owner_uid + upload_warning ride through to RecordingSummary."""
+    stub = _StubClient({
+        "recordings": {
+            "ok": True,
+            "recordings": [
+                {
+                    "name": "demo", "date": "2026-06-11", "duration": "00:05",
+                    "has_audio": False, "transcribed": False, "uploaded": False,
+                    "owner_uid": "uid-abc",
+                    "upload_warning": "uploads disabled: offline",
+                },
+            ],
+        }
+    })
+    _use_client(monkeypatch, stub)
+
+    result = await server.list_recordings()
+    rec = result.recordings[0]
+    assert rec.owner_uid == "uid-abc"
+    assert rec.upload_warning == "uploads disabled: offline"
+
+
+@pytest.mark.asyncio
+async def test_list_recordings_account_fields_default_none(monkeypatch):
+    """A daemon that omits the SCR-148 fields decodes them as None, not an error."""
+    stub = _StubClient({
+        "recordings": {
+            "ok": True,
+            "recordings": [
+                {
+                    "name": "legacy", "date": "2026-06-11", "duration": "00:05",
+                    "has_audio": False, "transcribed": False, "uploaded": True,
+                },
+            ],
+        }
+    })
+    _use_client(monkeypatch, stub)
+
+    rec = (await server.list_recordings()).recordings[0]
+    assert rec.owner_uid is None
+    assert rec.upload_warning is None
+
+
+@pytest.mark.asyncio
+async def test_whoami_tool_reports_signed_in_identity(monkeypatch):
+    """SCR-148: the whoami tool forwards the daemon's signed-in uid/email."""
+    stub = _StubClient({
+        "whoami": {
+            "ok": True, "signed_in": True, "uid": "uid-xyz",
+            "email": "a@b.com", "stale": False,
+        }
+    })
+    _use_client(monkeypatch, stub)
+
+    result = await server.whoami()
+    assert isinstance(result, server.WhoAmIResult)
+    assert result.signed_in is True
+    assert result.uid == "uid-xyz"
+    assert result.email == "a@b.com"
+    assert result.stale is False
+
+
+@pytest.mark.asyncio
+async def test_whoami_tool_reports_signed_out(monkeypatch):
+    """Signed-out forwards signed_in=false with null identity."""
+    stub = _StubClient({"whoami": {"ok": True, "signed_in": False}})
+    _use_client(monkeypatch, stub)
+
+    result = await server.whoami()
+    assert result.signed_in is False
+    assert result.uid is None
+    assert result.email is None
+
+
+@pytest.mark.asyncio
+async def test_whoami_tool_reports_stale_offline(monkeypatch):
+    """Stale/offline shape: signed_in=True, uid=None, email=None, stale=True.
+
+    This shape is produced when auth is cached but cannot be verified (offline).
+    The MCP tool must surface it intact so the agent knows the account is
+    temporarily UNVERIFIABLE, not signed-out.
+    """
+    stub = _StubClient({
+        "whoami": {
+            "ok": True, "signed_in": True, "uid": None, "email": None, "stale": True,
+        }
+    })
+    _use_client(monkeypatch, stub)
+
+    result = await server.whoami()
+    assert isinstance(result, server.WhoAmIResult)
+    assert result.signed_in is True
+    assert result.uid is None
+    assert result.email is None
+    assert result.stale is True
 
 
 # --------------------------------------------------------------------------

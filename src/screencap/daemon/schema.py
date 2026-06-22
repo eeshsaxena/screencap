@@ -18,6 +18,8 @@ _PERMISSION_REQUEST_API_VERSION = 1
 _CONTENT_SEARCH_API_VERSION = 1
 _TRANSCRIPT_SEARCH_API_VERSION = 1
 _TIMELINE_QUERY_API_VERSION = 1
+# SCR-148 cloud account-mismatch observability.
+_AUTH_WHOAMI_API_VERSION = 1
 
 
 @cache
@@ -61,6 +63,7 @@ _MODEL_NAMES = {
     "TimelineQueryRequest",
     "TimelineRow",
     "TimelineQueryResponse",
+    "WhoAmIResponse",
 }
 _MODELS: dict[str, Any] | None = None
 
@@ -131,6 +134,12 @@ def _load_models() -> dict[str, Any]:
         intent: str | None = None
         started_at: float | None = None
         duration_seconds: float | None = None
+        # SCR-148: kept in EXACT sync with catalog.RecordingInfo — recording.list
+        # (app.py) asserts the two field sets match, so this block must track any
+        # change to RecordingInfo's SCR-148 fields. Additive on the wire: older
+        # clients ignore unknown keys, so no _LIST_API_VERSION bump is required.
+        owner_uid: str | None = None
+        upload_warning: str | None = None
 
     class ListResponse(EnvelopeResponse):
         recordings: list[RecordingSummary]
@@ -305,6 +314,22 @@ def _load_models() -> dict[str, Any]:
         # 'authoritative' — event tables, no OCR/redaction recall loss.
         coverage: str
 
+    class WhoAmIResponse(EnvelopeResponse):
+        """SCR-148: the currently signed-in cloud account on this daemon.
+
+        Mirrors the ``auth.whoami`` shape (and the CLI ``whoami --json``
+        envelope). An agent compares ``uid`` against a recording's
+        ``owner_uid`` to tell a permanent account-mismatch block (re-login as
+        the right account) apart from a transient upload failure. ``stale`` is
+        True when a refresh-token exists but could not be refreshed (offline),
+        so ``uid``/``email`` are unknown though the user is nominally signed in.
+        """
+
+        signed_in: bool
+        uid: str | None = None
+        email: str | None = None
+        stale: bool = False
+
     _MODELS = {
         "EnvelopeResponse": EnvelopeResponse,
         "DaemonInfoResponse": DaemonInfoResponse,
@@ -327,6 +352,7 @@ def _load_models() -> dict[str, Any]:
         "TimelineQueryRequest": TimelineQueryRequest,
         "TimelineRow": TimelineRow,
         "TimelineQueryResponse": TimelineQueryResponse,
+        "WhoAmIResponse": WhoAmIResponse,
     }
     # `__getattr__` below dispatches every documented model name through
     # `_MODELS`, so injecting them into `globals()` would just shadow that
@@ -357,6 +383,7 @@ __all__ = [
     "_CONTENT_SEARCH_API_VERSION",
     "_TRANSCRIPT_SEARCH_API_VERSION",
     "_TIMELINE_QUERY_API_VERSION",
+    "_AUTH_WHOAMI_API_VERSION",
     "daemon_version",
     "envelope",
 ] + sorted(_MODEL_NAMES)

@@ -1,10 +1,10 @@
 """FastMCP stdio server exposing ScreenCap's retrieval surface to an agent.
 
-Four tools — ``search_screen_content``, ``search_transcript``,
-``query_timeline``, ``list_recordings`` — each forward to a daemon ``/v0/*`` read
-verb and re-wrap the response as a typed, POINTER-ONLY result (text snippets +
-``(recording, timestamp)`` pointers; never frame pixels). The server holds no
-query logic of its own (R1).
+Five tools — ``search_screen_content``, ``search_transcript``,
+``query_timeline``, ``list_recordings``, ``whoami`` — each forward to a daemon
+``/v0/*`` read verb and re-wrap the response as a typed, POINTER-ONLY result
+(text snippets + ``(recording, timestamp)`` pointers; never frame pixels). The
+server holds no query logic of its own (R1).
 
 stdio discipline: with the stdio transport the server owns stdout (the JSON-RPC
 stream), so NOTHING may be written to stdout — all logging goes to stderr. Heavy
@@ -88,10 +88,27 @@ class RecordingSummary(BaseModel):
     has_audio: bool
     transcribed: bool
     uploaded: bool
+    # SCR-148: cloud account-mismatch observability. owner_uid is the Firebase
+    # uid that owns the recording (None for legacy/local); compare it against
+    # whoami().uid to tell a permanent wrong-account block from a transient
+    # upload failure. upload_warning is best-effort deferred-upload text.
+    owner_uid: str | None = None
+    upload_warning: str | None = None
 
 
 class RecordingsResult(BaseModel):
     recordings: list[RecordingSummary]
+
+
+class WhoAmIResult(BaseModel):
+    """The cloud account currently signed in on the daemon (SCR-148)."""
+
+    signed_in: bool
+    uid: str | None = None
+    email: str | None = None
+    # True when signed in but the token could not be refreshed (offline), so
+    # uid/email are unknown.
+    stale: bool = False
 
 
 # -- lazy daemon runtime (connect + held subscription on first tool call) ---
@@ -209,7 +226,20 @@ async def query_timeline(
 
 
 async def list_recordings() -> RecordingsResult:
-    """List available recordings (name, date, duration, flags)."""
+    """List available recordings (name, date, duration, flags).
+
+    Each recording carries ``owner_uid`` (the cloud account that owns it, or
+    ``null`` for a local/legacy recording) and a best-effort ``upload_warning``.
+    To tell a permanently-blocked recording (wrong account signed in) apart from
+    a transient upload failure, compare ``owner_uid`` against ``whoami().uid``.
+
+    Ownership comparison rules:
+    - Only treat a recording as account-blocked when ``whoami().signed_in`` is
+      True, ``whoami().stale`` is False, ``whoami().uid`` is non-null, the
+      recording's ``owner_uid`` is non-null, and ``owner_uid != uid``.
+    - When ``owner_uid`` is None (legacy or local recording): ownership is
+      UNKNOWN — do NOT block on a mismatch.
+    """
     env = await (await _client()).list_recordings()
     keep = set(RecordingSummary.model_fields)
     return RecordingsResult(
@@ -218,6 +248,28 @@ async def list_recordings() -> RecordingsResult:
             for rec in env.get("recordings", [])
         ],
     )
+
+
+async def whoami() -> WhoAmIResult:
+    """Report the cloud account currently signed in on this machine.
+
+    Use the returned ``uid`` to interpret each recording's ``owner_uid`` from
+    ``list_recordings``: an un-uploaded recording whose ``owner_uid`` differs
+    from this ``uid`` is blocked because a different account is signed in (advise
+    re-login as the owner), not merely waiting on a retry.
+
+    Guards for safe comparison:
+    - Only conclude a wrong-account block when ``signed_in`` is True, ``stale``
+      is False, ``uid`` is non-null, the recording's ``owner_uid`` is non-null,
+      and ``owner_uid != uid``.
+    - When ``stale`` is True (offline; ``uid`` is None though signed in): the
+      account is temporarily UNVERIFIABLE — do NOT conclude a mismatch.
+    - When ``owner_uid`` is None (legacy or local recording): ownership is
+      UNKNOWN, not a block.
+    """
+    env = await (await _client()).whoami()
+    keep = set(WhoAmIResult.model_fields)
+    return WhoAmIResult(**{k: v for k, v in env.items() if k in keep})
 
 
 # -- server ------------------------------------------------------------------
@@ -243,7 +295,10 @@ def build_server() -> FastMCP:
         ),
         lifespan=_lifespan,
     )
-    for fn in (search_screen_content, search_transcript, query_timeline, list_recordings):
+    for fn in (
+        search_screen_content, search_transcript, query_timeline,
+        list_recordings, whoami,
+    ):
         mcp.tool()(fn)
     return mcp
 

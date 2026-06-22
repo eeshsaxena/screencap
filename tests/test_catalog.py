@@ -233,6 +233,84 @@ def test_recording_info_namedtuple_asdict_includes_new_fields(recordings_dir):
     assert "duration_seconds" in d
     assert d["started_at"] is not None
     assert d["duration_seconds"] is not None
+    # SCR-148: account-mismatch observability fields are serialized too, so the
+    # daemon recording.list field-set parity assertion and the JSON output both
+    # pick them up.
+    assert "owner_uid" in d
+    assert "upload_warning" in d
+
+
+# --- SCR-148: cloud account-mismatch observability fields ---
+
+
+def test_list_recordings_owner_uid_from_pin(recordings_dir):
+    """owner_uid is read from the pinned .cloud_owner_uid dotfile (SCR-116)."""
+    from screencap.catalog import write_owner_uid
+
+    d = _make_recording(recordings_dir, "owned-rec", duration=10.0)
+    write_owner_uid(d, "firebase-uid-123")
+
+    info = list_recordings(recordings_dir)[0]
+    assert info.owner_uid == "firebase-uid-123"
+
+
+def test_list_recordings_owner_uid_none_when_unpinned(recordings_dir):
+    """owner_uid is None for a legacy/local recording with no pin."""
+    _make_recording(recordings_dir, "unpinned-rec", duration=10.0)
+    info = list_recordings(recordings_dir)[0]
+    assert info.owner_uid is None
+
+
+def test_list_recordings_upload_warning_from_followup(recordings_dir):
+    """upload_warning surfaces the .upload_followup.json warning text."""
+    d = _make_recording(recordings_dir, "warned-rec", duration=10.0)
+    (d / ".upload_followup.json").write_text(json.dumps({
+        "kind": "upload_disabled",
+        "n_uploaded": 0,
+        "n_total": 3,
+        "upload_warning": "uploads disabled: network unreachable",
+    }))
+    info = list_recordings(recordings_dir)[0]
+    assert info.upload_warning == "uploads disabled: network unreachable"
+
+
+def test_list_recordings_upload_warning_none_when_absent(recordings_dir):
+    """upload_warning is None when no follow-up file is present (the common case)."""
+    _make_recording(recordings_dir, "clean-rec", duration=10.0)
+    info = list_recordings(recordings_dir)[0]
+    assert info.upload_warning is None
+
+
+def test_list_recordings_upload_warning_none_when_followup_corrupt(recordings_dir):
+    """A corrupt/empty follow-up file degrades to None, never raises."""
+    d = _make_recording(recordings_dir, "corrupt-rec", duration=10.0)
+    (d / ".upload_followup.json").write_text("{not valid json")
+    info = list_recordings(recordings_dir)[0]
+    assert info.upload_warning is None
+
+
+def test_list_recordings_upload_warning_none_when_field_null(recordings_dir):
+    """A follow-up with no warning text (e.g. partial upload) yields None."""
+    d = _make_recording(recordings_dir, "partial-rec", duration=10.0)
+    (d / ".upload_followup.json").write_text(json.dumps({
+        "kind": "partial", "n_uploaded": 1, "n_total": 3, "upload_warning": None,
+    }))
+    info = list_recordings(recordings_dir)[0]
+    assert info.upload_warning is None
+
+
+def test_list_recordings_owner_uid_none_when_pin_not_utf8(recordings_dir):
+    """owner_uid is None (not a UnicodeDecodeError 500) when the pin file is non-UTF-8.
+
+    Path.read_text() raises UnicodeDecodeError (a ValueError) on non-UTF-8 bytes.
+    The guard must catch (OSError, ValueError) — a bare OSError would let the
+    decode error escape and crash the whole recording.list call (regression for
+    the fix in catalog.read_owner_uid).
+    """
+    d = _make_recording(recordings_dir, "bad-pin-rec", duration=10.0)
+    (d / ".cloud_owner_uid").write_bytes(b"\xff\xfe")  # invalid UTF-8
+    info = list_recordings(recordings_dir)[0]
+    assert info.owner_uid is None
 
 
 # --- U3 catalog guard: hidden review artifact must not mask stub detection ---

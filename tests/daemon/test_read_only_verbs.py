@@ -426,6 +426,111 @@ async def test_recording_list_catalog_unreadable_returns_error_envelope(
     assert payload["reason"]
 
 
+# --- SCR-148: cloud account-mismatch observability surface ---
+
+
+@pytest.mark.asyncio
+async def test_recording_list_surfaces_owner_uid_and_upload_warning(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """recording.list exposes the pinned owner uid + deferred-upload warning."""
+    from screencap.catalog import write_owner_uid
+
+    recordings_dir = tmp_path / "recordings"
+    rec = _make_recording(recordings_dir, "owned")
+    write_owner_uid(rec, "uid-abc")
+    (rec / ".upload_followup.json").write_text(json.dumps({
+        "kind": "upload_disabled",
+        "n_uploaded": 0,
+        "n_total": 1,
+        "upload_warning": "uploads disabled: offline",
+    }))
+    monkeypatch.setenv("SCREENCAP_RECORDINGS_DIR", str(recordings_dir))
+
+    response = await _asgi_get("/v0/recording.list")
+    assert response.status_code == 200
+    payload = response.json()
+    summary = payload["recordings"][0]
+    assert summary["owner_uid"] == "uid-abc"
+    assert summary["upload_warning"] == "uploads disabled: offline"
+
+
+@pytest.mark.asyncio
+async def test_auth_whoami_signed_in(monkeypatch: pytest.MonkeyPatch) -> None:
+    """/v0/auth.whoami reports the signed-in uid/email in the daemon envelope."""
+    from screencap import auth
+
+    monkeypatch.setattr(
+        auth, "whoami",
+        lambda: {"signed_in": True, "uid": "uid-xyz", "email": "a@b.com"},
+    )
+    response = await _asgi_get("/v0/auth.whoami")
+    assert response.status_code == 200
+    payload = response.json()
+    _assert_envelope(payload, expected_schema_version=schema._AUTH_WHOAMI_API_VERSION)
+    assert payload["signed_in"] is True
+    assert payload["uid"] == "uid-xyz"
+    assert payload["email"] == "a@b.com"
+    assert payload["stale"] is False
+
+
+@pytest.mark.asyncio
+async def test_auth_whoami_signed_out(monkeypatch: pytest.MonkeyPatch) -> None:
+    """Signed-out reports signed_in=false and null uid/email (never raises)."""
+    from screencap import auth
+
+    monkeypatch.setattr(auth, "whoami", lambda: {"signed_in": False})
+    response = await _asgi_get("/v0/auth.whoami")
+    assert response.status_code == 200
+    payload = response.json()
+    _assert_envelope(payload, expected_schema_version=schema._AUTH_WHOAMI_API_VERSION)
+    assert payload["signed_in"] is False
+    assert payload["uid"] is None
+    assert payload["email"] is None
+
+
+@pytest.mark.asyncio
+async def test_auth_whoami_fails_open(monkeypatch: pytest.MonkeyPatch) -> None:
+    """A whoami() raise degrades to signed_in=false — a read verb never 500s."""
+    from screencap import auth
+
+    def _boom() -> dict[str, Any]:
+        raise RuntimeError("keychain locked")
+
+    monkeypatch.setattr(auth, "whoami", _boom)
+    response = await _asgi_get("/v0/auth.whoami")
+    assert response.status_code == 200
+    payload = response.json()
+    assert payload["ok"] is True
+    assert payload["signed_in"] is False
+
+
+@pytest.mark.asyncio
+async def test_auth_whoami_stale(monkeypatch: pytest.MonkeyPatch) -> None:
+    """Stale/offline shape: signed_in=True, uid=None, email=None, stale=True.
+
+    This shape is produced when the token cache is populated but the Keychain
+    probe cannot verify freshness (e.g. offline). The daemon must surface it
+    intact so callers know to treat the account as temporarily UNVERIFIABLE
+    rather than signed-out or mismatched.
+    """
+    from screencap import auth
+
+    monkeypatch.setattr(
+        auth, "whoami",
+        lambda: {"signed_in": True, "uid": None, "email": None, "stale": True},
+    )
+    response = await _asgi_get("/v0/auth.whoami")
+    assert response.status_code == 200
+    payload = response.json()
+    _assert_envelope(payload, expected_schema_version=schema._AUTH_WHOAMI_API_VERSION)
+    assert payload["signed_in"] is True
+    assert payload["uid"] is None
+    assert payload["email"] is None
+    assert payload["stale"] is True
+
+
 @pytest.mark.asyncio
 async def test_read_only_verbs_round_trip_over_unix_socket(
     serve_process,
@@ -435,11 +540,19 @@ async def test_read_only_verbs_round_trip_over_unix_socket(
         info = (await client.get("/v0/daemon.info")).json()
         recordings = (await client.get("/v0/recording.list")).json()
         snapshot = (await client.get("/v0/session.snapshot")).json()
+        whoami = (await client.get("/v0/auth.whoami")).json()
 
     assert serve_process.poll() is None
     assert schema.DaemonInfoResponse(**info).model_dump()["ok"] is True
     assert schema.ListResponse(**recordings).model_dump()["ok"] is True
     assert schema.SessionSnapshotResponse(**snapshot).model_dump()["ok"] is True
+    # auth.whoami exercises the real fail-open path — signed_in may be False in
+    # CI (no Keychain), but the envelope must always be well-formed.
+    assert whoami["ok"] is True
+    assert "signed_in" in whoami
+    assert "uid" in whoami
+    assert "email" in whoami
+    assert "stale" in whoami
 
 
 @pytest.mark.asyncio
