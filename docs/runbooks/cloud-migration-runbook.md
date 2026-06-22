@@ -268,6 +268,7 @@ rollback source of truth — **do not delete it**.
 python scripts/decommission_flat_namespace.py --bucket "$BUCKET" --dry-run
 
 # Live: requires --confirm. Add --include-sessions to also retire sessions/.
+# A durable .jsonl audit log is written automatically (--audit-log to relocate it).
 python scripts/decommission_flat_namespace.py --bucket "$BUCKET" --confirm --include-sessions
 ```
 
@@ -284,6 +285,19 @@ Guarantees:
 - A **post-run re-scan** asserts `recordings/` (and `sessions/`, if included) are
   empty (R11) and **surfaces any new flat blob** that raced past the quiesce —
   exit is non-zero and the blob is reported, not deleted.
+- A **durable audit log** (`--audit-log`, default
+  `cloud-migration-decommission-audit.jsonl`) records every delete/keep as one JSON
+  line, flushed per line, mode `0o600` — the crash-safe record of this irreversible
+  step. Live runs **append** (a re-run after a partial failure never destroys the
+  prior record); `--dry-run` writes a `.dryrun.jsonl` preview. Its object names are
+  sensitive — treat the file like the recordings themselves.
+- **Reliability (SCR-145):** a transient GCS error (including `RetryError` from
+  exhausted SDK retries) on any single object KEEPS that object and the run
+  continues, exiting **non-zero** so an incomplete run is never read as clean; every
+  per-object GCS call is timeout-bounded and the per-object copy loop is iteration-
+  and wall-clock-bounded. An **all-objects-failed** `error:` pattern signals a
+  *systemic* outage (a sustained 503/throttle exhausting retries), not transient
+  single-object noise — investigate the endpoint/quota before re-running.
 
 > **Deliberate window note.** Between Step 5 (promotion) and Step 7
 > (decommission), the flat namespace is still publicly listable via any surviving
@@ -295,6 +309,9 @@ Post-run confirmation:
 ```bash
 gsutil ls "gs://$BUCKET/recordings/**" 2>&1 | head   # expect: no matches
 gsutil ls "gs://$BUCKET/sessions/**"   2>&1 | head   # expect: no matches (if --include-sessions)
+
+# Review the durable audit log of exactly what was deleted/kept (mode 0o600):
+jq -c '{src, action, reason}' cloud-migration-decommission-audit.jsonl | head
 ```
 
 ---
@@ -322,4 +339,4 @@ gsutil ls "gs://$BUCKET/sessions/**"   2>&1 | head   # expect: no matches (if --
 - **Step 4 review:** _allow-list = … (or empty → synthetic gallery)_
 - **Step 5 promote:** _N recordings in demo/; markers stripped …_
 - **Step 6 cutover:** _website verified live on demo/ at … by …_
-- **Step 7 decommission:** _N deleted; sessions included? …; re-scan empty? …_
+- **Step 7 decommission:** _N deleted; sessions included? …; re-scan empty? …; audit-log path …_

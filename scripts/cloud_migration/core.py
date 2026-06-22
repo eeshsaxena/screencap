@@ -33,6 +33,7 @@ from __future__ import annotations
 
 import json
 import re
+import time
 from contextlib import contextmanager
 from dataclasses import dataclass
 from enum import Enum
@@ -76,6 +77,20 @@ _DEMO_NAME_RE = re.compile(r"^[a-zA-Z0-9][a-zA-Z0-9._-]{0,255}$")
 # list_blobs page timeout — matches the function's 60s.
 _LIST_TIMEOUT = 60
 
+# Per-object op timeout (rewrite/reload/get_blob/delete). Explicit + tunable in one
+# place; equals the SDK's current default, so behavior is unchanged, but no single
+# call can hang indefinitely on an unresponsive endpoint (SCR-145).
+_OP_TIMEOUT = 60
+
+# copy_blob rewriteToken loop bounds (SCR-145): a stuck or pathologically-slow token
+# must not hang the process. The iteration cap is generous — each iteration copies one
+# server-side chunk, so even a multi-GB cross-region rewrite stays far below it (a
+# hang-guard, NOT a size limit). Because each iteration can itself take up to
+# _OP_TIMEOUT, the iteration cap alone does not bound elapsed time, so a wall-clock
+# deadline backs it up. Either bound tripping fails just that one object.
+_REWRITE_MAX_ITERS = 10_000
+_REWRITE_MAX_WALL = 30 * 60  # seconds
+
 Log = Callable[[str], None]
 
 
@@ -96,11 +111,13 @@ class GCSBlobProtocol(Protocol):
     size: int | None
     generation: int | None
 
-    def rewrite(self, source: Any, token: str | None = ...) -> tuple[str | None, int, int]: ...
+    def rewrite(
+        self, source: Any, token: str | None = ..., timeout: float = ...
+    ) -> tuple[str | None, int, int]: ...
 
-    def reload(self) -> None: ...
+    def reload(self, timeout: float = ...) -> None: ...
 
-    def delete(self, **kwargs: Any) -> None: ...
+    def delete(self, *, if_generation_match: int | None = ..., timeout: float = ...) -> None: ...
 
     def exists(self) -> bool: ...
 
@@ -116,7 +133,7 @@ class GCSBucketProtocol(Protocol):
 
     def blob(self, name: str) -> GCSBlobProtocol: ...
 
-    def get_blob(self, name: str) -> GCSBlobProtocol | None: ...
+    def get_blob(self, name: str, timeout: float = ...) -> GCSBlobProtocol | None: ...
 
     def list_blobs(self, *args: Any, **kwargs: Any) -> Iterable[GCSBlobProtocol]: ...
 
@@ -135,6 +152,15 @@ class GCSClientProtocol(Protocol):
 
 class MigrationError(RuntimeError):
     """A pre-condition gate failed and the operation refused to run (fail-closed)."""
+
+
+class RewriteLimitExceeded(RuntimeError):
+    """``copy_blob``'s rewriteToken loop exceeded its iteration or wall-clock bound.
+
+    Distinct from :class:`MigrationError` (a fail-closed gate refusal that SHOULD
+    abort the whole run): a stuck/slow token is a per-OBJECT failure, caught by
+    ``_copy_one`` and recorded as a ``failed`` outcome so the run still completes and
+    a re-run can retry that object (SCR-145)."""
 
 
 @contextmanager
@@ -245,21 +271,45 @@ def verify_match(src, dst) -> str | None:
     return None
 
 
-def copy_blob(bucket: GCSBucketProtocol, src_blob: GCSBlobProtocol, dst_name: str) -> Any:
+def copy_blob(bucket: GCSBucketProtocol, src_blob: GCSBlobProtocol, dst_name: str) -> GCSBlobProtocol:
     """``rewrite()`` ``src_blob`` into ``dst_name``, following ``rewriteToken`` to
     completion, and return the reloaded destination blob.
 
     A large video object needs multiple ``rewrite()`` calls — one rewriteToken
     round-trip per server-side chunk. Stopping at the first call truncates it
     silently, so loop until the token clears.
+
+    The loop is bounded by BOTH a generous iteration cap and a wall-clock deadline
+    (SCR-145): a stuck token (returned forever) or a slow-but-responsive endpoint
+    (a token returned just under each call's ``timeout``) would otherwise hang the
+    process indefinitely. Tripping either bound raises :class:`RewriteLimitExceeded`,
+    which ``_copy_one`` records as a per-object ``failed`` outcome; the iteration cap
+    is generous enough never to false-trigger on a legitimate large cross-region /
+    cross-storage-class rewrite.
     """
     dst_blob = bucket.blob(dst_name)
     token = None
+    iters = 0
+    deadline = time.monotonic() + _REWRITE_MAX_WALL
     while True:
-        token, _rewritten, _total = dst_blob.rewrite(src_blob, token=token)
+        token, _rewritten, _total = dst_blob.rewrite(src_blob, token=token, timeout=_OP_TIMEOUT)
+        iters += 1
         if token is None:
             break
-    dst_blob.reload()
+        # Two independent bounds — name the one that actually fired so the failure
+        # reason is not misleading (a tripped iteration cap must not blame the
+        # wall-clock constant, and vice versa).
+        if iters >= _REWRITE_MAX_ITERS:
+            raise RewriteLimitExceeded(
+                f"{dst_name}: rewriteToken did not clear after {iters} iterations "
+                f"(cap {_REWRITE_MAX_ITERS}) — aborting this object's copy"
+            )
+        if time.monotonic() > deadline:
+            raise RewriteLimitExceeded(
+                f"{dst_name}: rewriteToken did not clear within {_REWRITE_MAX_WALL}s "
+                "wall-clock — aborting this object's copy"
+            )
+    dst_blob.reload(timeout=_OP_TIMEOUT)
     return dst_blob
 
 
@@ -565,12 +615,16 @@ def _copy_one(
     count.
     """
     # google.api_core is imported lazily so core stays SDK-free at import scope.
-    from google.api_core.exceptions import GoogleAPICallError
+    # GoogleAPIError is the broad base, NOT GoogleAPICallError: a RetryError (raised
+    # when the SDK exhausts its own retries on a persistent 429/503) is a
+    # GoogleAPIError but not a GoogleAPICallError, and must be absorbed per-object
+    # too rather than aborting the whole copy loop (SCR-145).
+    from google.api_core.exceptions import GoogleAPIError
 
     try:
         # One GET fetches existence + metadata (None when absent) — no separate
         # exists()+reload() round-trip.
-        dst = bucket.get_blob(dst_name)
+        dst = bucket.get_blob(dst_name, timeout=_OP_TIMEOUT)
         already = dst is not None
         mismatch = verify_match(src_blob, dst) if already else None
         if already and mismatch is None:
@@ -584,7 +638,7 @@ def _copy_one(
 
         fresh = copy_blob(bucket, src_blob, dst_name)
         mismatch = verify_match(src_blob, fresh)
-    except GoogleAPICallError as exc:
+    except (GoogleAPIError, RewriteLimitExceeded) as exc:
         log(f"  ! {src_blob.name} -> {dst_name} FAILED (GCS error): {exc}")
         return CopyOutcome(src_blob.name, dst_name, "failed", f"error: {exc}")
     if mismatch is not None:
@@ -833,6 +887,7 @@ def run_decommission(
     sessions_backup_confirmed: bool = False,
     confirm_quiesced: bool = False,
     probe: Callable[[], RecordingState] | None = None,
+    on_outcome: Callable[[DeleteOutcome], None] | None = None,
     log: Log = print,
 ) -> DecommissionResult:
     """U9: delete the flat source blobs after the website cutover is verified live.
@@ -853,9 +908,19 @@ def run_decommission(
     accessible — there is no staging copy to fall back on. A post-run re-scan
     asserts the prefixes are empty and surfaces any new flat blob (a missed-write
     race) rather than deleting it.
+
+    ``on_outcome`` (optional) is invoked with each :class:`DeleteOutcome` AS the loop
+    runs — a ``deleted`` row only AFTER its delete returns — so the decommission shim
+    can append a crash-safe ``.jsonl`` audit log of this irreversible step (SCR-145),
+    mirroring ``run_stage``'s incremental-provenance hook. The accounting in the
+    returned :class:`DecommissionResult` is unchanged.
     """
-    # Lazy SDK imports — keep core ``google.cloud``-free at import scope.
-    from google.api_core.exceptions import GoogleAPICallError, PreconditionFailed
+    # Lazy SDK imports — keep core ``google.cloud``-free at import scope. GoogleAPIError
+    # is the broad base (it catches RetryError, which GoogleAPICallError does not);
+    # PreconditionFailed is caught separately and FIRST below (it is a
+    # GoogleAPICallError subclass) so a generation mismatch keeps its distinct reason
+    # rather than being mislabeled a transient error (SCR-145).
+    from google.api_core.exceptions import GoogleAPIError, PreconditionFailed
 
     bucket = client.bucket(bucket_name)
     assert_quiesced(confirm_quiesced=confirm_quiesced, probe=probe, log=log)
@@ -872,6 +937,14 @@ def run_decommission(
     outcomes: list[DeleteOutcome] = []
     handled: set[str] = set()
 
+    def _emit(outcome: DeleteOutcome) -> None:
+        # Append AND notify in one place so every outcome — including a ``deleted``
+        # row emitted only AFTER the delete returns — reaches ``on_outcome`` in loop
+        # order, giving the shim a crash-safe per-line audit log (SCR-145).
+        outcomes.append(outcome)
+        if on_outcome is not None:
+            on_outcome(outcome)
+
     # recordings/ — gated per-object on a verified staging copy.
     for src_blob in iter_blobs(client, bucket_name, FLAT_RECORDINGS_PREFIX):
         handled.add(src_blob.name)
@@ -879,41 +952,49 @@ def run_decommission(
         # refuses (PreconditionFailed) if the source was overwritten since.
         gen = getattr(src_blob, "generation", None)
         staging_name = map_key(src_blob.name, FLAT_RECORDINGS_PREFIX, STAGING_PREFIX)
-        # One GET fetches the staging copy + its metadata (None when absent).
-        staging = bucket.get_blob(staging_name)
+        # One GET fetches the staging copy + its metadata (None when absent). A
+        # transient GCS error on this GET KEEPS the source (recorded as an error) and
+        # lets the loop continue — it must never abort the whole decommission mid-run
+        # (SCR-145; same per-object posture as the delete below).
+        try:
+            staging = bucket.get_blob(staging_name, timeout=_OP_TIMEOUT)
+        except GoogleAPIError as exc:
+            _emit(DeleteOutcome(src_blob.name, "kept", f"error: {exc}"))
+            log(f"  ✗ KEEP {src_blob.name} (GCS error fetching staging copy: {exc})")
+            continue
         if staging is None:
-            outcomes.append(DeleteOutcome(src_blob.name, "kept", "no staging copy"))
+            _emit(DeleteOutcome(src_blob.name, "kept", "no staging copy"))
             log(f"  ✗ KEEP {src_blob.name} (no staging copy at {staging_name})")
             continue
         mismatch = verify_match(src_blob, staging)
         if mismatch is not None:
-            outcomes.append(
+            _emit(
                 DeleteOutcome(src_blob.name, "kept", f"staging unverified: {mismatch}")
             )
             log(f"  ✗ KEEP {src_blob.name} (staging unverified: {mismatch})")
             continue
         if dry_run:
-            outcomes.append(DeleteOutcome(src_blob.name, "planned", "verified-in-staging"))
+            _emit(DeleteOutcome(src_blob.name, "planned", "verified-in-staging"))
             log(f"  - [dry-run] DELETE {src_blob.name} (verified-in-staging)")
             continue
         try:
-            src_blob.delete(if_generation_match=gen)
+            src_blob.delete(if_generation_match=gen, timeout=_OP_TIMEOUT)
         except PreconditionFailed:
             # The source changed between verify and delete (generation mismatch).
             # The staging copy we verified no longer matches the live source —
             # KEEP it; deleting would destroy un-staged newer bytes.
-            outcomes.append(
+            _emit(
                 DeleteOutcome(
                     src_blob.name, "kept", "source changed since enumeration (generation mismatch)"
                 )
             )
             log(f"  ✗ KEEP {src_blob.name} (source changed since enumeration — generation mismatch)")
             continue
-        except GoogleAPICallError as exc:
-            outcomes.append(DeleteOutcome(src_blob.name, "kept", f"error: {exc}"))
+        except GoogleAPIError as exc:
+            _emit(DeleteOutcome(src_blob.name, "kept", f"error: {exc}"))
             log(f"  ✗ KEEP {src_blob.name} (GCS error during delete: {exc})")
             continue
-        outcomes.append(DeleteOutcome(src_blob.name, "deleted", "verified-in-staging"))
+        _emit(DeleteOutcome(src_blob.name, "deleted", "verified-in-staging"))
         log(f"  - DELETE {src_blob.name} (verified-in-staging)")
 
     # sessions/ — retired, not staged anywhere; opt-in + backup-attestation only.
@@ -921,16 +1002,16 @@ def run_decommission(
         for src_blob in iter_blobs(client, bucket_name, FLAT_SESSIONS_PREFIX):
             handled.add(src_blob.name)
             if dry_run:
-                outcomes.append(DeleteOutcome(src_blob.name, "planned", "retired session"))
+                _emit(DeleteOutcome(src_blob.name, "planned", "retired session"))
                 log(f"  - [dry-run] DELETE {src_blob.name} (retired session)")
                 continue
             try:
-                src_blob.delete()
-            except GoogleAPICallError as exc:
-                outcomes.append(DeleteOutcome(src_blob.name, "kept", f"error: {exc}"))
+                src_blob.delete(timeout=_OP_TIMEOUT)
+            except GoogleAPIError as exc:
+                _emit(DeleteOutcome(src_blob.name, "kept", f"error: {exc}"))
                 log(f"  ✗ KEEP {src_blob.name} (GCS error during delete: {exc})")
                 continue
-            outcomes.append(DeleteOutcome(src_blob.name, "deleted", "retired session"))
+            _emit(DeleteOutcome(src_blob.name, "deleted", "retired session"))
             log(f"  - DELETE {src_blob.name} (retired session)")
 
     rescan = None

@@ -21,6 +21,7 @@ Run with::
 
 from __future__ import annotations
 
+import json
 import sys
 from pathlib import Path
 
@@ -60,9 +61,22 @@ class FakeStore:
         self.rewrite_plan: dict[str, int] = {}
         # src names whose copy lands with a corrupted crc32c (verify should fail).
         self.corrupt_on_rewrite: set[str] = set()
+        # src names whose rewrite() never clears its token — exercises copy_blob's
+        # iteration / wall-clock loop bound (SCR-145).
+        self.rewrite_never_completes: set[str] = set()
+        # error injection (SCR-145): name -> exception instance to raise. Additive
+        # seam so a transient GCS error / RetryError on a single object is provable
+        # without the SDK. Keyed by the SOURCE blob name for rewrite, by the fetched
+        # name for get_blob, and by the blob name for delete.
+        self.raise_on_rewrite: dict[str, BaseException] = {}
+        self.raise_on_get_blob: dict[str, BaseException] = {}
+        self.raise_on_delete: dict[str, BaseException] = {}
         # observability
         self.rewrite_log: list[tuple[str, str]] = []
         self.deleted: list[str] = []
+        # (op_name, timeout) recorded per per-object call so a test can assert every
+        # GCS call carries an explicit timeout (SCR-145).
+        self.seen_timeouts: list[tuple[str, object]] = []
 
     def add(self, name, *, crc32c=None, content_type="application/octet-stream",
             size=10, md5_hash=None, generation=1):
@@ -96,13 +110,18 @@ class FakeBlob:
     def exists(self):
         return self.name in self._store.objects
 
-    def reload(self):
+    def reload(self, timeout=None):
+        self._store.seen_timeouts.append(("reload", timeout))
         self._load()
 
-    def delete(self, if_generation_match=None):
+    def delete(self, if_generation_match=None, timeout=None):
         """Honor an ``if_generation_match`` precondition like google's Blob.delete:
         raise PreconditionFailed (HTTP 412) when it does not match the CURRENT live
         generation — modeling a racing overwrite between enumeration and delete."""
+        self._store.seen_timeouts.append(("delete", timeout))
+        exc = self._store.raise_on_delete.get(self.name)
+        if exc is not None:
+            raise exc
         rec = self._store.objects.get(self.name)
         if if_generation_match is not None and rec is not None:
             live_gen = rec.get("generation", 1)
@@ -115,9 +134,15 @@ class FakeBlob:
         self._store.objects.pop(self.name, None)
         self._store.deleted.append(self.name)
 
-    def rewrite(self, source, token=None):
+    def rewrite(self, source, token=None, timeout=None):
         """Multi-call rewrite: returns a non-None token until the final call, which
         copies the source record (optionally corrupting crc32c)."""
+        self._store.seen_timeouts.append(("rewrite", timeout))
+        exc = self._store.raise_on_rewrite.get(source.name)
+        if exc is not None:
+            raise exc
+        if source.name in self._store.rewrite_never_completes:
+            return ("stuck", 10, 100)  # token never clears → copy_blob must bound the loop
         self._store.rewrite_log.append((source.name, self.name))
         need = self._store.rewrite_plan.get(source.name, 1)
         done = (0 if token is None else int(token)) + 1
@@ -171,8 +196,12 @@ class FakeBucket:
     def blob(self, name):
         return FakeBlob(self._store, name)
 
-    def get_blob(self, name):
+    def get_blob(self, name, timeout=None):
         """Like google's Bucket.get_blob: one GET → populated blob, or None."""
+        self._store.seen_timeouts.append(("get_blob", timeout))
+        exc = self._store.raise_on_get_blob.get(name)
+        if exc is not None:
+            raise exc
         return FakeBlob(self._store, name) if name in self._store.objects else None
 
     def reload(self, *args, **kwargs):
@@ -926,20 +955,45 @@ def test_promote_cli_promotes_from_allow_list_file(store, client, patch_build_cl
     assert not any(k.startswith("demo/beta/") for k in store.objects)
 
 
-def test_decommission_cli_requires_confirm_for_live(store, client, patch_build_client):
+def test_promote_cli_returns_rc1_on_gcs_error_escaping_run_promote(
+    store, client, patch_build_client, tmp_path, monkeypatch
+):
+    # A GCS error that escapes run_promote ITSELF (e.g. enumeration via iter_blobs,
+    # not the per-object _copy_one seam) must hit the shim's top-level catch — the
+    # `raise_on_rewrite` seam only reaches _copy_one, so it cannot exercise this path.
+    # RetryError proves the catch uses the broad GoogleAPIError, not GoogleAPICallError.
+    import promote_staging_to_demo as promote_cli
+    from google.api_core.exceptions import RetryError
+
+    _seed_staging(store)
+    allow = tmp_path / "allow.txt"
+    allow.write_text("alpha\n")
+
+    def boom(*_a, **_k):
+        raise RetryError("simulated retry exhaustion enumerating staging", None)
+
+    monkeypatch.setattr(core, "iter_blobs", boom)
+    rc = promote_cli.main(["--bucket", BUCKET, "--allow-list", str(allow)])
+    assert rc == 1  # GCS error during promote -> exit 1, no raw traceback
+
+
+def test_decommission_cli_requires_confirm_for_live(store, client, patch_build_client, tmp_path):
     import decommission_flat_namespace as decom_cli
 
     _seed_flat_with_staging(store)
-    rc = decom_cli.main(["--bucket", BUCKET])  # no --dry-run, no --confirm
+    # --audit-log to tmp for consistency/hygiene; the --confirm guard returns before
+    # the audit log is opened, so nothing is written here today.
+    rc = decom_cli.main(["--bucket", BUCKET, "--audit-log", str(tmp_path / "a.jsonl")])
     assert rc == 2
     assert store.deleted == []
 
 
-def test_decommission_cli_confirm_deletes(store, client, patch_build_client):
+def test_decommission_cli_confirm_deletes(store, client, patch_build_client, tmp_path):
     import decommission_flat_namespace as decom_cli
 
     _seed_flat_with_staging(store)
-    rc = decom_cli.main(["--bucket", BUCKET, "--confirm"])
+    audit = str(tmp_path / "audit.jsonl")
+    rc = decom_cli.main(["--bucket", BUCKET, "--confirm", "--audit-log", audit])
     assert rc == 0
     assert set(store.deleted) == {"recordings/alpha/manifest.json", "recordings/alpha/video.mp4"}
 
@@ -963,7 +1017,7 @@ def test_promote_cli_missing_entry_returns_rc1(store, client, patch_build_client
     assert rc == 1  # a typo'd / unstaged entry must not read as a complete promote
 
 
-def test_decommission_cli_new_blob_returns_rc1(store, client, patch_build_client):
+def test_decommission_cli_new_blob_returns_rc1(store, client, patch_build_client, tmp_path):
     import decommission_flat_namespace as decom_cli
 
     _seed_flat_with_staging(store)
@@ -978,7 +1032,7 @@ def test_decommission_cli_new_blob_returns_rc1(store, client, patch_build_client
         return blobs
 
     client.list_blobs = racing_list
-    rc = decom_cli.main(["--bucket", BUCKET, "--confirm"])
+    rc = decom_cli.main(["--bucket", BUCKET, "--confirm", "--audit-log", str(tmp_path / "a.jsonl")])
     assert rc == 1  # new flat blob since enumeration — R11 not satisfied
 
 
@@ -1000,8 +1054,8 @@ def test_decommission_keeps_source_changed_since_enumeration(store, client):
     # Wrap get_blob so the verify GET for the video's staging copy advances the
     # LIVE source generation — modeling a racing overwrite that lands between the
     # verify and the (now-stale-generation) delete.
-    def get_blob_then_bump(self, name):
-        res = orig_get_blob(self, name)
+    def get_blob_then_bump(self, name, timeout=None):
+        res = orig_get_blob(self, name, timeout=timeout)
         if name == "import-review/alpha/video.mp4" and not bumped["done"]:
             bumped["done"] = True
             store.objects["recordings/alpha/video.mp4"]["generation"] = 99
@@ -1021,6 +1075,13 @@ def test_decommission_keeps_source_changed_since_enumeration(store, client):
     assert "recordings/alpha/video.mp4" in store.objects
     kept_video = [o for o in result.kept if o.src == "recordings/alpha/video.mp4"]
     assert kept_video and "generation mismatch" in kept_video[0].reason
+    # Pin the EXACT reason so the except-ordering invariant is actually exercised:
+    # PreconditionFailed (a GoogleAPICallError subclass) MUST be caught before the
+    # broad `except GoogleAPIError`. If the order were reversed, this would land in
+    # the generic `error: …` bucket — whose string also happens to contain
+    # "generation mismatch", so the substring check above alone would not catch it.
+    assert not kept_video[0].reason.startswith("error:")
+    assert kept_video[0].reason == "source changed since enumeration (generation mismatch)"
     # The unchanged manifest source still deletes normally.
     assert "recordings/alpha/manifest.json" in store.deleted
 
@@ -1037,10 +1098,10 @@ def test_decommission_keeps_source_on_gcs_error_and_continues(store, client):
 
     orig_delete = FakeBlob.delete
 
-    def flaky_delete(self, if_generation_match=None):
+    def flaky_delete(self, if_generation_match=None, timeout=None):
         if self.name == "recordings/alpha/video.mp4":
             raise GoogleAPICallError("simulated transient GCS error")
-        return orig_delete(self, if_generation_match=if_generation_match)
+        return orig_delete(self, if_generation_match=if_generation_match, timeout=timeout)
 
     FakeBlob.delete = flaky_delete
     try:
@@ -1057,6 +1118,305 @@ def test_decommission_keeps_source_on_gcs_error_and_continues(store, client):
     assert "recordings/alpha/manifest.json" in store.deleted
     assert any(o.src == "recordings/alpha/video.mp4" and o.action == "kept" for o in result.outcomes)
     assert result.kept_on_error and result.kept_on_error[0].reason.startswith("error: ")
+
+
+# --------------------------------------------------------------------------
+# SCR-145 U1 — RetryError breadth (GoogleAPIError, NOT just GoogleAPICallError)
+# RetryError is the exception the SDK raises once it exhausts its OWN retries on a
+# persistent 429/503; it is a GoogleAPIError but NOT a GoogleAPICallError, so a
+# narrow `except GoogleAPICallError` would let it abort the whole loop.
+# --------------------------------------------------------------------------
+
+
+def test_stage_keeps_running_on_retry_error_during_copy(store, client):
+    from google.api_core.exceptions import RetryError
+
+    _seed_two_recordings(store)
+    store.raise_on_rewrite["recordings/alpha/video.mp4"] = RetryError(
+        "simulated retry exhaustion", None
+    )
+    result = core.run_stage(
+        client=client, bucket_name=BUCKET, dry_run=False, probe=IDLE, log=lambda _m: None,
+    )
+    # The errored object is recorded failed; the loop CONTINUED and staged the rest,
+    # and run_stage still produced a result (manifest), surfacing the failure.
+    assert not result.ok
+    assert any(o.src == "recordings/alpha/video.mp4" and o.action == "failed" for o in result.failures)
+    assert any(o.src == "recordings/alpha/manifest.json" and o.verified for o in result.outcomes)
+    assert any(o.src == "recordings/beta/manifest.json" and o.verified for o in result.outcomes)
+
+
+def test_decommission_keeps_source_on_retry_error_during_delete(store, client):
+    from google.api_core.exceptions import RetryError
+
+    _seed_flat_with_staging(store)
+    store.raise_on_delete["recordings/alpha/video.mp4"] = RetryError(
+        "simulated retry exhaustion", None
+    )
+    result = core.run_decommission(
+        client=client, bucket_name=BUCKET, include_sessions=False, dry_run=False,
+        probe=IDLE, log=lambda _m: None,
+    )
+    assert "recordings/alpha/video.mp4" not in store.deleted
+    assert any(o.src == "recordings/alpha/video.mp4" and o.action == "kept" for o in result.outcomes)
+    assert result.kept_on_error and result.kept_on_error[0].reason.startswith("error: ")
+    # Loop continued and deleted the verified sibling.
+    assert "recordings/alpha/manifest.json" in store.deleted
+
+
+def test_decommission_keeps_session_on_retry_error_during_delete(store, client):
+    # The sessions/ delete loop's widened catch (GoogleAPIError) must absorb a
+    # RetryError per-object too — structurally identical to the recordings/ branch
+    # but its own except block, so it gets its own regression test.
+    from google.api_core.exceptions import RetryError
+
+    store.add("sessions/_index.json", crc32c="S", content_type="application/json")
+    store.raise_on_delete["sessions/_index.json"] = RetryError("simulated retry exhaustion", None)
+    result = core.run_decommission(
+        client=client, bucket_name=BUCKET, include_sessions=True, dry_run=False,
+        sessions_backup_confirmed=True, probe=IDLE, log=lambda _m: None,
+    )
+    assert "sessions/_index.json" not in store.deleted
+    assert result.kept_on_error and any(
+        o.src == "sessions/_index.json" and o.reason.startswith("error: ")
+        for o in result.kept_on_error
+    )
+
+
+def test_decommission_keeps_source_on_error_fetching_staging(store, client):
+    # A transient error fetching the staging copy (the currently-unwrapped get_blob)
+    # must KEEP that source and continue — not abort the whole loop. RetryError also
+    # proves the wrap uses the broad GoogleAPIError, not GoogleAPICallError.
+    from google.api_core.exceptions import RetryError
+
+    _seed_flat_with_staging(store)
+    store.raise_on_get_blob["import-review/alpha/video.mp4"] = RetryError(
+        "simulated retry exhaustion", None
+    )
+    result = core.run_decommission(
+        client=client, bucket_name=BUCKET, include_sessions=False, dry_run=False,
+        probe=IDLE, log=lambda _m: None,
+    )
+    assert "recordings/alpha/video.mp4" not in store.deleted
+    assert any(
+        o.src == "recordings/alpha/video.mp4" and o.action == "kept"
+        and o.reason.startswith("error: ")
+        for o in result.outcomes
+    )
+    assert "recordings/alpha/manifest.json" in store.deleted
+
+
+def test_promote_marks_failed_on_retry_error(store, client):
+    from google.api_core.exceptions import RetryError
+
+    store.add("import-review/alpha/video.mp4", crc32c="V", content_type="video/mp4")
+    store.raise_on_rewrite["import-review/alpha/video.mp4"] = RetryError(
+        "simulated retry exhaustion", None
+    )
+    result = core.run_promote(
+        client=client, bucket_name=BUCKET, allow_list=["alpha"], dry_run=False,
+        log=lambda _m: None,
+    )
+    assert not result.ok
+    assert any(o.action == "failed" for o in result.outcomes)
+
+
+# --------------------------------------------------------------------------
+# SCR-145 U2 — every per-object GCS call passes an explicit timeout
+# --------------------------------------------------------------------------
+
+
+def test_stage_passes_explicit_timeout_on_every_call(store, client):
+    _seed_two_recordings(store)  # fresh recordings/, nothing staged → real copies
+    core.run_stage(
+        client=client, bucket_name=BUCKET, dry_run=False, probe=IDLE, log=lambda _m: None,
+    )
+    ops = {op for op, _t in store.seen_timeouts}
+    assert {"rewrite", "reload", "get_blob"} <= ops
+    assert store.seen_timeouts and all(t == core._OP_TIMEOUT for _op, t in store.seen_timeouts)
+
+
+def test_decommission_passes_explicit_timeout_on_delete_and_get(store, client):
+    _seed_flat_with_staging(store)
+    core.run_decommission(
+        client=client, bucket_name=BUCKET, include_sessions=False, dry_run=False,
+        probe=IDLE, log=lambda _m: None,
+    )
+    ops = {op for op, _t in store.seen_timeouts}
+    assert {"get_blob", "delete"} <= ops
+    assert store.seen_timeouts and all(t == core._OP_TIMEOUT for _op, t in store.seen_timeouts)
+
+
+# --------------------------------------------------------------------------
+# SCR-145 U3 — copy_blob rewriteToken loop is bounded (iterations + wall-clock)
+# --------------------------------------------------------------------------
+
+
+def test_stage_fails_object_on_stuck_rewrite_token_iteration_cap(store, client, monkeypatch):
+    monkeypatch.setattr(core, "_REWRITE_MAX_ITERS", 5)  # small cap so the test is fast
+    _seed_two_recordings(store)
+    store.rewrite_never_completes.add("recordings/alpha/video.mp4")
+    result = core.run_stage(
+        client=client, bucket_name=BUCKET, dry_run=False, probe=IDLE, log=lambda _m: None,
+    )
+    # The stuck object failed; the loop CONTINUED and staged the rest; run still ok'd.
+    assert not result.ok
+    assert any(
+        o.src == "recordings/alpha/video.mp4" and o.action == "failed" for o in result.failures
+    )
+    assert any(o.src == "recordings/beta/manifest.json" and o.verified for o in result.outcomes)
+
+
+def test_copy_blob_fails_on_wall_clock_deadline(store, client, monkeypatch):
+    # Iteration cap left high; a clock jumped past the deadline trips the wall-clock
+    # bound, proving it fires independently of iteration count. Single object so the
+    # only time.monotonic() callers are copy_blob's entry + first cap check.
+    store.add("recordings/solo/video.mp4", crc32c="V", content_type="video/mp4")
+    store.rewrite_never_completes.add("recordings/solo/video.mp4")
+    calls = {"n": 0}
+
+    def clock():
+        calls["n"] += 1
+        return 0.0 if calls["n"] == 1 else core._REWRITE_MAX_WALL + 1.0
+
+    monkeypatch.setattr(core.time, "monotonic", clock)
+    result = core.run_stage(
+        client=client, bucket_name=BUCKET, dry_run=False, probe=IDLE, log=lambda _m: None,
+    )
+    assert not result.ok
+    assert any(
+        o.src == "recordings/solo/video.mp4" and o.action == "failed" for o in result.failures
+    )
+
+
+def test_stage_large_object_under_cap_still_completes(store, client):
+    # A legitimately large object needing many (but under-cap) rewrite calls must NOT
+    # false-trigger the cap.
+    store.add("recordings/big/video.mp4", crc32c="B", content_type="video/mp4", size=9999)
+    store.rewrite_plan["recordings/big/video.mp4"] = 500
+    result = core.run_stage(
+        client=client, bucket_name=BUCKET, dry_run=False, probe=IDLE, log=lambda _m: None,
+    )
+    assert result.ok
+    assert any(o.src == "recordings/big/video.mp4" and o.action == "copied" for o in result.outcomes)
+
+
+# --------------------------------------------------------------------------
+# SCR-145 U4 — durable decommission audit log (on_outcome + .jsonl, 0o600)
+# --------------------------------------------------------------------------
+
+
+def test_decommission_on_outcome_fires_per_outcome(store, client):
+    _seed_flat_with_staging(store)
+    seen: list = []
+    result = core.run_decommission(
+        client=client, bucket_name=BUCKET, include_sessions=False, dry_run=False,
+        probe=IDLE, on_outcome=seen.append, log=lambda _m: None,
+    )
+    # Exactly one callback per outcome, in loop order, matching the returned result.
+    assert [(o.src, o.action) for o in seen] == [(o.src, o.action) for o in result.outcomes]
+    # 'deleted' rows correspond to what was actually removed.
+    assert {o.src for o in seen if o.action == "deleted"} == set(store.deleted)
+
+
+def test_decommission_audit_callback_records_before_a_mid_run_crash(store, client):
+    # A non-GCS error (uncaught → models a process crash) on the 2nd delete must leave
+    # the 1st object's outcome ALREADY emitted to the sink — proving the audit log is
+    # written incrementally per outcome, not batched at the end.
+    _seed_flat_with_staging(store)
+    store.raise_on_delete["recordings/alpha/video.mp4"] = RuntimeError("simulated crash")
+    seen: list = []
+    with pytest.raises(RuntimeError, match="simulated crash"):
+        core.run_decommission(
+            client=client, bucket_name=BUCKET, include_sessions=False, dry_run=False,
+            probe=IDLE, on_outcome=seen.append, log=lambda _m: None,
+        )
+    # manifest.json sorts before video.mp4 → it was deleted and emitted pre-crash.
+    assert any(o.src == "recordings/alpha/manifest.json" and o.action == "deleted" for o in seen)
+    assert "recordings/alpha/manifest.json" in store.deleted
+
+
+def test_decommission_cli_writes_audit_log_0o600(store, client, patch_build_client, tmp_path):
+    import decommission_flat_namespace as decom_cli
+
+    _seed_flat_with_staging(store)
+    audit = tmp_path / "audit.jsonl"
+    rc = decom_cli.main(["--bucket", BUCKET, "--confirm", "--audit-log", str(audit)])
+    assert rc == 0
+    rows = [json.loads(ln) for ln in audit.read_text(encoding="utf-8").splitlines()]
+    assert rows and all({"src", "action", "reason"} <= r.keys() for r in rows)
+    assert {r["src"] for r in rows if r["action"] == "deleted"} == set(store.deleted)
+    # The irreversible-step audit artifact is owner-only.
+    assert (audit.stat().st_mode & 0o777) == 0o600
+
+
+def test_decommission_cli_audit_log_appends_across_runs(store, client, patch_build_client, tmp_path):
+    import decommission_flat_namespace as decom_cli
+
+    audit = tmp_path / "audit.jsonl"
+    _seed_flat_with_staging(store)  # alpha manifest + video, both verified
+    decom_cli.main(["--bucket", BUCKET, "--confirm", "--audit-log", str(audit)])
+    first = audit.read_text(encoding="utf-8").splitlines()
+    assert first  # first run recorded its deletions
+
+    # A second live run on a fresh source must APPEND, never truncate the prior record
+    # (the irreversible step's audit history must survive a re-run).
+    store.add("recordings/gamma/manifest.json", crc32c="G", content_type="application/json")
+    store.objects["import-review/gamma/manifest.json"] = {
+        "crc32c": "G", "content_type": "application/json", "size": 10, "md5_hash": None,
+    }
+    decom_cli.main(["--bucket", BUCKET, "--confirm", "--audit-log", str(audit)])
+    second = audit.read_text(encoding="utf-8").splitlines()
+    assert len(second) > len(first)
+    assert second[: len(first)] == first  # prior run's lines intact at the head
+
+
+def test_decommission_cli_dry_run_writes_dryrun_sidecar(store, client, patch_build_client, tmp_path):
+    import decommission_flat_namespace as decom_cli
+
+    _seed_flat_with_staging(store)
+    audit = tmp_path / "audit.jsonl"
+    rc = decom_cli.main(["--bucket", BUCKET, "--dry-run", "--audit-log", str(audit)])
+    assert rc == 0
+    assert store.deleted == []
+    assert not audit.exists()  # live path is never written on a dry-run
+    preview = tmp_path / "audit.jsonl.dryrun.jsonl"
+    rows = [json.loads(ln) for ln in preview.read_text(encoding="utf-8").splitlines()]
+    assert rows and all(r["action"] == "planned" for r in rows)
+
+
+def test_decommission_cli_aborts_cleanly_on_audit_write_failure(
+    store, client, patch_build_client, tmp_path, monkeypatch
+):
+    # The audit sink itself fails (full disk) mid-run: `_record`'s write raises an
+    # OSError AFTER the first delete has already committed. The CLI must NOT crash
+    # with a raw traceback — it must abort cleanly with rc 1 (incomplete/investigate),
+    # and the already-deleted object stays in store.deleted (the delete committed,
+    # the run understates rather than crashes).
+    import decommission_flat_namespace as decom_cli
+
+    _seed_flat_with_staging(store)  # alpha manifest + video, both verified
+
+    real_open = decom_cli._open_audit_log
+
+    def open_then_break_write(path, *, dry_run):
+        fp = real_open(path, dry_run=dry_run)
+        # A `deleted` outcome is emitted only AFTER its delete returns, so failing
+        # the first write means at least one delete has already committed.
+        def _boom(*_a, **_k):
+            raise OSError("No space left on device")
+
+        monkeypatch.setattr(fp, "write", _boom)
+        return fp
+
+    monkeypatch.setattr(decom_cli, "_open_audit_log", open_then_break_write)
+
+    audit = tmp_path / "audit.jsonl"
+    rc = decom_cli.main(["--bucket", BUCKET, "--confirm", "--audit-log", str(audit)])
+    assert rc == 1  # clean abort, not a raw traceback
+    # The delete that committed before the audit write failed is reflected — the run
+    # understates (a lost audit line) rather than overstates or crashes.
+    assert store.deleted  # at least one delete committed before the abort
 
 
 # --------------------------------------------------------------------------
@@ -1084,16 +1444,24 @@ def test_decommission_sessions_withheld_without_backup_confirmation(store, clien
     assert result.rescan.empty
 
 
-def test_decommission_cli_include_sessions_requires_backup_flag(store, client, patch_build_client):
+def test_decommission_cli_include_sessions_requires_backup_flag(store, client, patch_build_client, tmp_path):
     import decommission_flat_namespace as decom_cli
 
+    audit_path = tmp_path / "audit.jsonl"
+    audit = str(audit_path)
     store.add("sessions/_index.json", crc32c="S", content_type="application/json")
-    rc = decom_cli.main(["--bucket", BUCKET, "--confirm", "--include-sessions"])
+    rc = decom_cli.main(["--bucket", BUCKET, "--confirm", "--include-sessions", "--audit-log", audit])
     assert rc == 2  # MigrationError (backup not confirmed) -> exit 2
     assert store.deleted == []
+    # The audit log is opened BEFORE run_decommission, so even on the early
+    # MigrationError refusal the `finally` must have closed it cleanly, leaving a
+    # well-formed (empty) file — exercising the finally-close path.
+    assert audit_path.exists()
+    assert audit_path.read_text(encoding="utf-8") == ""
 
     rc = decom_cli.main(
-        ["--bucket", BUCKET, "--confirm", "--include-sessions", "--sessions-backup-confirmed"]
+        ["--bucket", BUCKET, "--confirm", "--include-sessions", "--sessions-backup-confirmed",
+         "--audit-log", audit]
     )
     assert rc == 0
     assert "sessions/_index.json" in store.deleted
