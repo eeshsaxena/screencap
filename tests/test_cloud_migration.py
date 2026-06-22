@@ -56,6 +56,9 @@ class FakeStore:
         # observability
         self.rewrite_log: list[tuple[str, str]] = []
         self.deleted: list[str] = []
+        # (op_name, timeout) recorded per per-object call so a test can assert every
+        # GCS call carries an explicit timeout (SCR-145).
+        self.seen_timeouts: list[tuple[str, object]] = []
 
     def add(self, name, *, crc32c=None, content_type="application/octet-stream",
             size=10, md5_hash=None, generation=1):
@@ -89,13 +92,15 @@ class FakeBlob:
     def exists(self):
         return self.name in self._store.objects
 
-    def reload(self):
+    def reload(self, timeout=None):
+        self._store.seen_timeouts.append(("reload", timeout))
         self._load()
 
-    def delete(self, if_generation_match=None):
+    def delete(self, if_generation_match=None, timeout=None):
         """Honor an ``if_generation_match`` precondition like google's Blob.delete:
         raise PreconditionFailed (HTTP 412) when it does not match the CURRENT live
         generation — modeling a racing overwrite between enumeration and delete."""
+        self._store.seen_timeouts.append(("delete", timeout))
         exc = self._store.raise_on_delete.get(self.name)
         if exc is not None:
             raise exc
@@ -111,9 +116,10 @@ class FakeBlob:
         self._store.objects.pop(self.name, None)
         self._store.deleted.append(self.name)
 
-    def rewrite(self, source, token=None):
+    def rewrite(self, source, token=None, timeout=None):
         """Multi-call rewrite: returns a non-None token until the final call, which
         copies the source record (optionally corrupting crc32c)."""
+        self._store.seen_timeouts.append(("rewrite", timeout))
         exc = self._store.raise_on_rewrite.get(source.name)
         if exc is not None:
             raise exc
@@ -143,8 +149,9 @@ class FakeBucket:
     def blob(self, name):
         return FakeBlob(self._store, name)
 
-    def get_blob(self, name):
+    def get_blob(self, name, timeout=None):
         """Like google's Bucket.get_blob: one GET → populated blob, or None."""
+        self._store.seen_timeouts.append(("get_blob", timeout))
         exc = self._store.raise_on_get_blob.get(name)
         if exc is not None:
             raise exc
@@ -806,8 +813,8 @@ def test_decommission_keeps_source_changed_since_enumeration(store, client):
     # Wrap get_blob so the verify GET for the video's staging copy advances the
     # LIVE source generation — modeling a racing overwrite that lands between the
     # verify and the (now-stale-generation) delete.
-    def get_blob_then_bump(self, name):
-        res = orig_get_blob(self, name)
+    def get_blob_then_bump(self, name, timeout=None):
+        res = orig_get_blob(self, name, timeout=timeout)
         if name == "import-review/alpha/video.mp4" and not bumped["done"]:
             bumped["done"] = True
             store.objects["recordings/alpha/video.mp4"]["generation"] = 99
@@ -843,10 +850,10 @@ def test_decommission_keeps_source_on_gcs_error_and_continues(store, client):
 
     orig_delete = FakeBlob.delete
 
-    def flaky_delete(self, if_generation_match=None):
+    def flaky_delete(self, if_generation_match=None, timeout=None):
         if self.name == "recordings/alpha/video.mp4":
             raise GoogleAPICallError("simulated transient GCS error")
-        return orig_delete(self, if_generation_match=if_generation_match)
+        return orig_delete(self, if_generation_match=if_generation_match, timeout=timeout)
 
     FakeBlob.delete = flaky_delete
     try:
@@ -945,6 +952,32 @@ def test_promote_marks_failed_on_retry_error(store, client):
     )
     assert not result.ok
     assert any(o.action == "failed" for o in result.outcomes)
+
+
+# --------------------------------------------------------------------------
+# SCR-145 U2 — every per-object GCS call passes an explicit timeout
+# --------------------------------------------------------------------------
+
+
+def test_stage_passes_explicit_timeout_on_every_call(store, client):
+    _seed_two_recordings(store)  # fresh recordings/, nothing staged → real copies
+    core.run_stage(
+        client=client, bucket_name=BUCKET, dry_run=False, probe=IDLE, log=lambda _m: None,
+    )
+    ops = {op for op, _t in store.seen_timeouts}
+    assert {"rewrite", "reload", "get_blob"} <= ops
+    assert store.seen_timeouts and all(t == core._OP_TIMEOUT for _op, t in store.seen_timeouts)
+
+
+def test_decommission_passes_explicit_timeout_on_delete_and_get(store, client):
+    _seed_flat_with_staging(store)
+    core.run_decommission(
+        client=client, bucket_name=BUCKET, include_sessions=False, dry_run=False,
+        probe=IDLE, log=lambda _m: None,
+    )
+    ops = {op for op, _t in store.seen_timeouts}
+    assert {"get_blob", "delete"} <= ops
+    assert store.seen_timeouts and all(t == core._OP_TIMEOUT for _op, t in store.seen_timeouts)
 
 
 # --------------------------------------------------------------------------

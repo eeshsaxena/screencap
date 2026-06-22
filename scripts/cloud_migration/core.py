@@ -66,6 +66,11 @@ _DEMO_NAME_RE = re.compile(r"^[a-zA-Z0-9][a-zA-Z0-9._-]{0,255}$")
 # list_blobs page timeout — matches the function's 60s.
 _LIST_TIMEOUT = 60
 
+# Per-object op timeout (rewrite/reload/get_blob/delete). Explicit + tunable in one
+# place; equals the SDK's current default, so behavior is unchanged, but no single
+# call can hang indefinitely on an unresponsive endpoint (SCR-145).
+_OP_TIMEOUT = 60
+
 Log = Callable[[str], None]
 
 
@@ -86,9 +91,11 @@ class GCSBlobProtocol(Protocol):
     size: int | None
     generation: int | None
 
-    def rewrite(self, source: Any, token: str | None = ...) -> tuple[str | None, int, int]: ...
+    def rewrite(
+        self, source: Any, token: str | None = ..., timeout: float = ...
+    ) -> tuple[str | None, int, int]: ...
 
-    def reload(self) -> None: ...
+    def reload(self, timeout: float = ...) -> None: ...
 
     def delete(self, **kwargs: Any) -> None: ...
 
@@ -98,7 +105,7 @@ class GCSBlobProtocol(Protocol):
 class GCSBucketProtocol(Protocol):
     def blob(self, name: str) -> GCSBlobProtocol: ...
 
-    def get_blob(self, name: str) -> GCSBlobProtocol | None: ...
+    def get_blob(self, name: str, timeout: float = ...) -> GCSBlobProtocol | None: ...
 
     def list_blobs(self, *args: Any, **kwargs: Any) -> Iterable[GCSBlobProtocol]: ...
 
@@ -215,10 +222,10 @@ def copy_blob(bucket: GCSBucketProtocol, src_blob: GCSBlobProtocol, dst_name: st
     dst_blob = bucket.blob(dst_name)
     token = None
     while True:
-        token, _rewritten, _total = dst_blob.rewrite(src_blob, token=token)
+        token, _rewritten, _total = dst_blob.rewrite(src_blob, token=token, timeout=_OP_TIMEOUT)
         if token is None:
             break
-    dst_blob.reload()
+    dst_blob.reload(timeout=_OP_TIMEOUT)
     return dst_blob
 
 
@@ -435,7 +442,7 @@ def _copy_one(
     try:
         # One GET fetches existence + metadata (None when absent) — no separate
         # exists()+reload() round-trip.
-        dst = bucket.get_blob(dst_name)
+        dst = bucket.get_blob(dst_name, timeout=_OP_TIMEOUT)
         already = dst is not None
         mismatch = verify_match(src_blob, dst) if already else None
         if already and mismatch is None:
@@ -746,7 +753,7 @@ def run_decommission(
         # lets the loop continue — it must never abort the whole decommission mid-run
         # (SCR-145; same per-object posture as the delete below).
         try:
-            staging = bucket.get_blob(staging_name)
+            staging = bucket.get_blob(staging_name, timeout=_OP_TIMEOUT)
         except GoogleAPIError as exc:
             outcomes.append(DeleteOutcome(src_blob.name, "kept", f"error: {exc}"))
             log(f"  ✗ KEEP {src_blob.name} (GCS error fetching staging copy: {exc})")
@@ -767,7 +774,7 @@ def run_decommission(
             log(f"  - [dry-run] DELETE {src_blob.name} (verified-in-staging)")
             continue
         try:
-            src_blob.delete(if_generation_match=gen)
+            src_blob.delete(if_generation_match=gen, timeout=_OP_TIMEOUT)
         except PreconditionFailed:
             # The source changed between verify and delete (generation mismatch).
             # The staging copy we verified no longer matches the live source —
@@ -795,7 +802,7 @@ def run_decommission(
                 log(f"  - [dry-run] DELETE {src_blob.name} (retired session)")
                 continue
             try:
-                src_blob.delete()
+                src_blob.delete(timeout=_OP_TIMEOUT)
             except GoogleAPIError as exc:
                 outcomes.append(DeleteOutcome(src_blob.name, "kept", f"error: {exc}"))
                 log(f"  ✗ KEEP {src_blob.name} (GCS error during delete: {exc})")
