@@ -243,6 +243,10 @@ struct RecordingStartResponse: Decodable {
     let apiSchemaVersion: Int
     let sessionID: String
     let startedAt: Double
+    /// Required in API schema v1: the daemon always returns the spawned
+    /// engine's PID on a successful start (`supervisor.spawn`). Non-optional
+    /// by contract — contrast `SessionSnapshotResponse.enginePID`, which is
+    /// optional because it is nil when no recording is in flight.
     let enginePID: Int
     /// Bus cursor captured BEFORE the engine spawn — feed into
     /// `/v0/events?since=<cursor>` to receive the `started` event without

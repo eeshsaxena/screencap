@@ -187,6 +187,10 @@ def _load_models() -> dict[str, Any]:
     class RecordingStartResponse(EnvelopeResponse):
         session_id: str
         started_at: float
+        # Required in v1: ``supervisor.spawn`` always populates the spawned
+        # engine's PID on a successful start, so this is non-optional (contrast
+        # ``SessionSnapshotResponse.engine_pid``, which is ``int | None`` because
+        # it is absent when no recording is in flight).
         engine_pid: int
         # `cursor` is the bus cursor captured BEFORE the engine spawn — clients
         # subscribe to /v0/events?since=<cursor> after start to receive the
