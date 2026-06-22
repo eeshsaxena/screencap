@@ -46,6 +46,13 @@ class FakeStore:
         self.rewrite_plan: dict[str, int] = {}
         # src names whose copy lands with a corrupted crc32c (verify should fail).
         self.corrupt_on_rewrite: set[str] = set()
+        # error injection (SCR-145): name -> exception instance to raise. Additive
+        # seam so a transient GCS error / RetryError on a single object is provable
+        # without the SDK. Keyed by the SOURCE blob name for rewrite, by the fetched
+        # name for get_blob, and by the blob name for delete.
+        self.raise_on_rewrite: dict[str, BaseException] = {}
+        self.raise_on_get_blob: dict[str, BaseException] = {}
+        self.raise_on_delete: dict[str, BaseException] = {}
         # observability
         self.rewrite_log: list[tuple[str, str]] = []
         self.deleted: list[str] = []
@@ -89,6 +96,9 @@ class FakeBlob:
         """Honor an ``if_generation_match`` precondition like google's Blob.delete:
         raise PreconditionFailed (HTTP 412) when it does not match the CURRENT live
         generation — modeling a racing overwrite between enumeration and delete."""
+        exc = self._store.raise_on_delete.get(self.name)
+        if exc is not None:
+            raise exc
         rec = self._store.objects.get(self.name)
         if if_generation_match is not None and rec is not None:
             live_gen = rec.get("generation", 1)
@@ -104,6 +114,9 @@ class FakeBlob:
     def rewrite(self, source, token=None):
         """Multi-call rewrite: returns a non-None token until the final call, which
         copies the source record (optionally corrupting crc32c)."""
+        exc = self._store.raise_on_rewrite.get(source.name)
+        if exc is not None:
+            raise exc
         self._store.rewrite_log.append((source.name, self.name))
         need = self._store.rewrite_plan.get(source.name, 1)
         done = (0 if token is None else int(token)) + 1
@@ -132,6 +145,9 @@ class FakeBucket:
 
     def get_blob(self, name):
         """Like google's Bucket.get_blob: one GET → populated blob, or None."""
+        exc = self._store.raise_on_get_blob.get(name)
+        if exc is not None:
+            raise exc
         return FakeBlob(self._store, name) if name in self._store.objects else None
 
     def get_iam_policy(self, requested_policy_version=None):
@@ -847,6 +863,88 @@ def test_decommission_keeps_source_on_gcs_error_and_continues(store, client):
     assert "recordings/alpha/manifest.json" in store.deleted
     assert any(o.src == "recordings/alpha/video.mp4" and o.action == "kept" for o in result.outcomes)
     assert result.kept_on_error and result.kept_on_error[0].reason.startswith("error: ")
+
+
+# --------------------------------------------------------------------------
+# SCR-145 U1 — RetryError breadth (GoogleAPIError, NOT just GoogleAPICallError)
+# RetryError is the exception the SDK raises once it exhausts its OWN retries on a
+# persistent 429/503; it is a GoogleAPIError but NOT a GoogleAPICallError, so a
+# narrow `except GoogleAPICallError` would let it abort the whole loop.
+# --------------------------------------------------------------------------
+
+
+def test_stage_keeps_running_on_retry_error_during_copy(store, client):
+    from google.api_core.exceptions import RetryError
+
+    _seed_two_recordings(store)
+    store.raise_on_rewrite["recordings/alpha/video.mp4"] = RetryError(
+        "simulated retry exhaustion", None
+    )
+    result = core.run_stage(
+        client=client, bucket_name=BUCKET, dry_run=False, probe=IDLE, log=lambda _m: None,
+    )
+    # The errored object is recorded failed; the loop CONTINUED and staged the rest,
+    # and run_stage still produced a result (manifest), surfacing the failure.
+    assert not result.ok
+    assert any(o.src == "recordings/alpha/video.mp4" and o.action == "failed" for o in result.failures)
+    assert any(o.src == "recordings/alpha/manifest.json" and o.verified for o in result.outcomes)
+    assert any(o.src == "recordings/beta/manifest.json" and o.verified for o in result.outcomes)
+
+
+def test_decommission_keeps_source_on_retry_error_during_delete(store, client):
+    from google.api_core.exceptions import RetryError
+
+    _seed_flat_with_staging(store)
+    store.raise_on_delete["recordings/alpha/video.mp4"] = RetryError(
+        "simulated retry exhaustion", None
+    )
+    result = core.run_decommission(
+        client=client, bucket_name=BUCKET, include_sessions=False, dry_run=False,
+        probe=IDLE, log=lambda _m: None,
+    )
+    assert "recordings/alpha/video.mp4" not in store.deleted
+    assert any(o.src == "recordings/alpha/video.mp4" and o.action == "kept" for o in result.outcomes)
+    assert result.kept_on_error and result.kept_on_error[0].reason.startswith("error: ")
+    # Loop continued and deleted the verified sibling.
+    assert "recordings/alpha/manifest.json" in store.deleted
+
+
+def test_decommission_keeps_source_on_error_fetching_staging(store, client):
+    # A transient error fetching the staging copy (the currently-unwrapped get_blob)
+    # must KEEP that source and continue — not abort the whole loop. RetryError also
+    # proves the wrap uses the broad GoogleAPIError, not GoogleAPICallError.
+    from google.api_core.exceptions import RetryError
+
+    _seed_flat_with_staging(store)
+    store.raise_on_get_blob["import-review/alpha/video.mp4"] = RetryError(
+        "simulated retry exhaustion", None
+    )
+    result = core.run_decommission(
+        client=client, bucket_name=BUCKET, include_sessions=False, dry_run=False,
+        probe=IDLE, log=lambda _m: None,
+    )
+    assert "recordings/alpha/video.mp4" not in store.deleted
+    assert any(
+        o.src == "recordings/alpha/video.mp4" and o.action == "kept"
+        and o.reason.startswith("error: ")
+        for o in result.outcomes
+    )
+    assert "recordings/alpha/manifest.json" in store.deleted
+
+
+def test_promote_marks_failed_on_retry_error(store, client):
+    from google.api_core.exceptions import RetryError
+
+    store.add("import-review/alpha/video.mp4", crc32c="V", content_type="video/mp4")
+    store.raise_on_rewrite["import-review/alpha/video.mp4"] = RetryError(
+        "simulated retry exhaustion", None
+    )
+    result = core.run_promote(
+        client=client, bucket_name=BUCKET, allow_list=["alpha"], dry_run=False,
+        log=lambda _m: None,
+    )
+    assert not result.ok
+    assert any(o.action == "failed" for o in result.outcomes)
 
 
 # --------------------------------------------------------------------------

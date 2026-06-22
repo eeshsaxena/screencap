@@ -67,7 +67,7 @@ def main(argv=None) -> int:
     except core.MigrationError as exc:
         print(f"ERROR: {exc}", file=sys.stderr)
         return 2
-    except _gcs_call_error() as exc:
+    except _gcs_error() as exc:
         print(f"ERROR: GCS error during promote: {exc}", file=sys.stderr)
         return 1
 
@@ -105,12 +105,14 @@ def main(argv=None) -> int:
     return 0
 
 
-def _gcs_call_error():
-    """The GCS API-error class, imported lazily so this shim stays SDK-free until
-    it actually runs against GCS (matches ``core``'s lazy-import posture)."""
-    from google.api_core.exceptions import GoogleAPICallError
+def _gcs_error():
+    """The broad GCS error base class, imported lazily so this shim stays SDK-free
+    until it actually runs against GCS (matches ``core``'s lazy-import posture).
+    GoogleAPIError (not GoogleAPICallError) so a top-level RetryError is caught too
+    (SCR-145)."""
+    from google.api_core.exceptions import GoogleAPIError
 
-    return GoogleAPICallError
+    return GoogleAPIError
 
 
 if __name__ == "__main__":

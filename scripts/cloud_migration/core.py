@@ -426,7 +426,11 @@ def _copy_one(
     count.
     """
     # google.api_core is imported lazily so core stays SDK-free at import scope.
-    from google.api_core.exceptions import GoogleAPICallError
+    # GoogleAPIError is the broad base, NOT GoogleAPICallError: a RetryError (raised
+    # when the SDK exhausts its own retries on a persistent 429/503) is a
+    # GoogleAPIError but not a GoogleAPICallError, and must be absorbed per-object
+    # too rather than aborting the whole copy loop (SCR-145).
+    from google.api_core.exceptions import GoogleAPIError
 
     try:
         # One GET fetches existence + metadata (None when absent) — no separate
@@ -445,7 +449,7 @@ def _copy_one(
 
         fresh = copy_blob(bucket, src_blob, dst_name)
         mismatch = verify_match(src_blob, fresh)
-    except GoogleAPICallError as exc:
+    except GoogleAPIError as exc:
         log(f"  ! {src_blob.name} -> {dst_name} FAILED (GCS error): {exc}")
         return CopyOutcome(src_blob.name, dst_name, "failed", f"error: {exc}")
     if mismatch is not None:
@@ -708,8 +712,12 @@ def run_decommission(
     asserts the prefixes are empty and surfaces any new flat blob (a missed-write
     race) rather than deleting it.
     """
-    # Lazy SDK imports — keep core ``google.cloud``-free at import scope.
-    from google.api_core.exceptions import GoogleAPICallError, PreconditionFailed
+    # Lazy SDK imports — keep core ``google.cloud``-free at import scope. GoogleAPIError
+    # is the broad base (it catches RetryError, which GoogleAPICallError does not);
+    # PreconditionFailed is caught separately and FIRST below (it is a
+    # GoogleAPICallError subclass) so a generation mismatch keeps its distinct reason
+    # rather than being mislabeled a transient error (SCR-145).
+    from google.api_core.exceptions import GoogleAPIError, PreconditionFailed
 
     bucket = client.bucket(bucket_name)
     assert_quiesced(confirm_quiesced=confirm_quiesced, probe=probe, log=log)
@@ -733,8 +741,16 @@ def run_decommission(
         # refuses (PreconditionFailed) if the source was overwritten since.
         gen = getattr(src_blob, "generation", None)
         staging_name = map_key(src_blob.name, FLAT_RECORDINGS_PREFIX, STAGING_PREFIX)
-        # One GET fetches the staging copy + its metadata (None when absent).
-        staging = bucket.get_blob(staging_name)
+        # One GET fetches the staging copy + its metadata (None when absent). A
+        # transient GCS error on this GET KEEPS the source (recorded as an error) and
+        # lets the loop continue — it must never abort the whole decommission mid-run
+        # (SCR-145; same per-object posture as the delete below).
+        try:
+            staging = bucket.get_blob(staging_name)
+        except GoogleAPIError as exc:
+            outcomes.append(DeleteOutcome(src_blob.name, "kept", f"error: {exc}"))
+            log(f"  ✗ KEEP {src_blob.name} (GCS error fetching staging copy: {exc})")
+            continue
         if staging is None:
             outcomes.append(DeleteOutcome(src_blob.name, "kept", "no staging copy"))
             log(f"  ✗ KEEP {src_blob.name} (no staging copy at {staging_name})")
@@ -763,7 +779,7 @@ def run_decommission(
             )
             log(f"  ✗ KEEP {src_blob.name} (source changed since enumeration — generation mismatch)")
             continue
-        except GoogleAPICallError as exc:
+        except GoogleAPIError as exc:
             outcomes.append(DeleteOutcome(src_blob.name, "kept", f"error: {exc}"))
             log(f"  ✗ KEEP {src_blob.name} (GCS error during delete: {exc})")
             continue
@@ -780,7 +796,7 @@ def run_decommission(
                 continue
             try:
                 src_blob.delete()
-            except GoogleAPICallError as exc:
+            except GoogleAPIError as exc:
                 outcomes.append(DeleteOutcome(src_blob.name, "kept", f"error: {exc}"))
                 log(f"  ✗ KEEP {src_blob.name} (GCS error during delete: {exc})")
                 continue
