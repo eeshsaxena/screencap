@@ -161,6 +161,51 @@ def test_serve_against_perm_drifted_parent_dir_exits_75_with_drift_message(
     assert rc == EX_TEMPFAIL, f"expected EX_TEMPFAIL={EX_TEMPFAIL}, got {rc}"
 
 
+def test_serve_subprocess_perm_drift_exits_75_with_named_offender(
+    cli_env: dict[str, str],
+    tmp_path: Path,
+) -> None:
+    """SCR-67: a real ``screencap serve`` subprocess driven into bind-time
+    parent-dir perm drift via the ``SCREENCAP_DAEMON_TEST_DRIFT_PARENT_MODE``
+    hook exits EX_TEMPFAIL=75 at the OS level and names the offender on stderr.
+
+    The in-process sibling above proves the same SocketPermsDrift -> EX_TEMPFAIL
+    contract under a monkeypatch; this proves it through a genuinely spawned
+    process — the drift-class branch reaches the OS-level exit + stderr, and the
+    env-var hook propagates and fires across the real launch boundary."""
+    from screencap.daemon.server import EX_TEMPFAIL
+
+    socket_path = short_socket_path(tmp_path)
+    # No pre-creation: _ensure_socket_directory mkdirs the parent, then the hook
+    # drifts it to 0o755 before _verify_socket_perms runs.
+    try:
+        result = subprocess.run(
+            _cli_command("serve", "--socket", str(socket_path)),
+            env={**cli_env, "SCREENCAP_DAEMON_TEST_DRIFT_PARENT_MODE": "0755"},
+            stdout=subprocess.PIPE,
+            stderr=subprocess.PIPE,
+            text=True,
+            timeout=10,
+        )
+        # Capture cleanup state BEFORE the finally unlink — otherwise the
+        # "socket must not survive" assertion below is vacuous (the finally
+        # would have removed it regardless of what the daemon did).
+        socket_survived = socket_path.exists()
+    finally:
+        socket_path.unlink(missing_ok=True)
+
+    assert result.returncode == EX_TEMPFAIL, (
+        f"expected EX_TEMPFAIL={EX_TEMPFAIL}; got {result.returncode}\nstderr:\n{result.stderr}"
+    )
+    # Match wrap-safe tokens, not the full path: rich Console wraps a long
+    # /private/var/folders path at ~80 cols on a pipe, but these whitespace-
+    # delimited tokens stay intact across the wrap.
+    assert "drifted" in result.stderr, f"stderr missing 'drifted':\n{result.stderr}"
+    assert "0o755" in result.stderr, f"stderr missing '0o755':\n{result.stderr}"
+    # The half-bound socket must not survive the failed verify.
+    assert not socket_survived
+
+
 def test_serve_against_rogue_file_at_socket_path_exits_1_not_75(
     cli_env: dict[str, str],
     tmp_path: Path,

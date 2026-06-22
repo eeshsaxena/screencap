@@ -80,6 +80,43 @@ def _ensure_socket_directory(path: Path) -> None:
     os.chmod(path.parent, 0o700)
 
 
+_TEST_DRIFT_PARENT_MODE_ENV = "SCREENCAP_DAEMON_TEST_DRIFT_PARENT_MODE"
+
+
+def _maybe_inject_test_parent_drift(socket_path: Path) -> None:
+    """Test-only: drift the socket parent dir's mode so the subprocess-level
+    perm-drift integration test (SCR-67) can exercise :func:`_verify_socket_perms`
+    end-to-end through a real ``screencap serve`` process.
+
+    No-op unless ``SCREENCAP_DAEMON_TEST_DRIFT_PARENT_MODE`` is set (octal, e.g.
+    ``"0755"``). When set, it ``chmod``s the parent AFTER
+    :func:`_ensure_socket_directory` re-established ``0o700`` and BEFORE
+    :func:`_verify_socket_perms`, reproducing the exact ensure->drift->verify
+    race the verifier defends against — the cross-process analogue of the
+    in-process ``ensure_then_drift`` monkeypatch in the daemon socket tests.
+
+    Fail-closed by construction: because the drift lands before the verify, any
+    value other than ``0o700`` makes :func:`_verify_socket_perms` raise and the
+    daemon abort. This hook can only ever refuse startup, never serve over a
+    relaxed socket. The ``SCREENCAP_DAEMON_`` prefix means CLI auto-spawn strips
+    it (``cli/_autospawn.py``) and launchd does not inherit the operator's shell
+    env, so it cannot reach a production daemon.
+    """
+    raw = os.environ.get(_TEST_DRIFT_PARENT_MODE_ENV)
+    if not raw:
+        return
+    try:
+        mode = int(raw, 8)
+    except ValueError as exc:
+        # A mistyped octal value must keep the typed-exit contract: surface it
+        # as SocketPermsDrift so serve() maps it to EX_TEMPFAIL rather than
+        # letting a bare ValueError escape as an unclassified exit-1 traceback.
+        raise SocketPermsDrift(
+            f"{_TEST_DRIFT_PARENT_MODE_ENV}={raw!r} is not a valid octal mode"
+        ) from exc
+    os.chmod(socket_path.parent, mode)
+
+
 _EXPECTED_PARENT_MODE = 0o700
 _EXPECTED_SOCKET_MODE = 0o600
 
@@ -218,6 +255,7 @@ class PeerCheckingUnixSocket(socket.socket):
 def bind_unix_socket(path: str | Path | None = None) -> PeerCheckingUnixSocket:
     socket_path = Path(path).expanduser() if path is not None else default_socket_path()
     _ensure_socket_directory(socket_path)
+    _maybe_inject_test_parent_drift(socket_path)
     _probe_existing_socket(socket_path)
 
     listener = PeerCheckingUnixSocket(socket.AF_UNIX, socket.SOCK_STREAM)

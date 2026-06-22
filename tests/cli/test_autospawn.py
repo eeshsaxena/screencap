@@ -81,6 +81,43 @@ def test_no_launchagent_spawns_and_polls_ready(monkeypatch, isolated_log):
     assert emitted == ["Starting ScreenCap daemon...", "Daemon ready."]
 
 
+def test_spawn_strips_screencap_daemon_env_vars(monkeypatch, isolated_log):
+    """Auto-spawn drops every ``SCREENCAP_DAEMON_*`` var before ``posix_spawn``
+    so a hostile (``SCREENCAP_DAEMON_ENGINE_COMMAND``) or test-only
+    (``SCREENCAP_DAEMON_TEST_DRIFT_PARENT_MODE``, SCR-67) var in the operator's
+    environment can never reach the spawned daemon. Pins the R3 containment the
+    drift hook relies on; non-``SCREENCAP_DAEMON_`` vars must survive."""
+    spawned: dict = {}
+    reachable_state = {"after_spawn": False}
+
+    def fake_reachable(_p: Path) -> bool:
+        return reachable_state["after_spawn"]
+
+    def fake_spawn(path: str, argv, env, **kwargs):
+        spawned["env"] = env
+        reachable_state["after_spawn"] = True
+        return 9999
+
+    monkeypatch.setattr(_autospawn, "_socket_reachable", fake_reachable)
+    monkeypatch.setattr(_autospawn, "_launchagent_installed", lambda: False)
+    monkeypatch.setattr(os, "posix_spawn", fake_spawn)
+    monkeypatch.setenv("SCREENCAP_DAEMON_TEST_DRIFT_PARENT_MODE", "0755")
+    monkeypatch.setenv("SCREENCAP_DAEMON_ENGINE_COMMAND", '["evil"]')
+    monkeypatch.setenv("SCREENCAP_PERMISSION_PROBE_FAKE", "granted")  # non-DAEMON control
+
+    _autospawn.ensure_daemon_or_spawn(
+        socket_path=Path("/tmp/never-used.sock"),
+        readiness_timeout_s=1.0,
+        stderr_emitter=lambda _m: None,
+    )
+
+    env = spawned["env"]
+    assert not any(k.startswith("SCREENCAP_DAEMON_") for k in env)
+    assert "SCREENCAP_DAEMON_TEST_DRIFT_PARENT_MODE" not in env
+    # A non-DAEMON-namespaced var must pass through untouched.
+    assert env.get("SCREENCAP_PERMISSION_PROBE_FAKE") == "granted"
+
+
 def test_readiness_timeout_kills_pid_and_surfaces_log_tail(monkeypatch, isolated_log):
     killed: dict = {}
 
