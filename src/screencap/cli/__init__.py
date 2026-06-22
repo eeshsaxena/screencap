@@ -1152,7 +1152,7 @@ def _auto_export(capture_dir: Path) -> None:
             console.print("[yellow]Warning:[/yellow] Recording contains no events.")
     except Exception as e:
         console.print(
-            f"[yellow]Warning:[/yellow] Could not auto-export events.jsonl ({e}). "
+            f"[yellow]Warning:[/yellow] Could not auto-export events.jsonl ({escape(str(e))}). "
             f"Run 'screencap export {capture_dir.name}' manually."
         )
 
@@ -1539,7 +1539,7 @@ def _export_one(
                     )
                 except KekUnavailableError as e:
                     err_console.print(
-                        f"[red]Error:[/red] Cannot decrypt network bodies: {e}. "
+                        f"[red]Error:[/red] Cannot decrypt network bodies: {escape(str(e))}. "
                         "Run `screencap network uninstall && screencap start "
                         "--network` to regenerate (existing encrypted bodies "
                         "will be lost).",
@@ -2321,7 +2321,7 @@ def stop(force, as_json):
             console.print(f"[#22d3ee]Recording {label}.[/#22d3ee]")
         else:
             console.print(
-                f"[yellow]Daemon reported final_state={_stop_outcome['final_state']!r}.[/yellow]"
+                f"[yellow]Daemon reported final_state={escape(repr(_stop_outcome['final_state']))}.[/yellow]"
             )
     _emit_stop_result(ok=True)
 
@@ -2515,7 +2515,7 @@ def upload(names, all_recordings, dry_run, force, jobs, no_delete):
                 )
             except PromotionRefused as e:
                 console.print(
-                    f"[red]Error:[/red] {e}\n"
+                    f"[red]Error:[/red] {escape(str(e))}\n"
                     "[dim]Upload skipped — nothing was changed.[/dim]"
                 )
                 n_failed += 1
@@ -2533,8 +2533,20 @@ def upload(names, all_recordings, dry_run, force, jobs, no_delete):
                 n_failed += 1
                 continue
             except RuntimeError as e:
+                # SCR-159: a generic RuntimeError reaching THIS handler is
+                # per-recording, not a batch-global failure — count it and continue
+                # rather than abandon the rest of the batch. Note the transient
+                # upload errors (auth blip, timeout, service error) and scrub/mask
+                # failures do NOT arrive here: run_terminal_stage absorbs them in its
+                # own catchers and surfaces them as result.upload_warning (handled
+                # below). What escapes to here is a RuntimeError from
+                # run_terminal_stage's reconcile / ledger / retention / sentinel
+                # logic — still per-recording. Treat it like the PromotionRefused /
+                # FileNotFoundError handlers above; the `if n_failed: sys.exit(1)`
+                # gate below still yields the non-zero exit code (SCR-79).
                 console.print(f"[red]Error:[/red] {escape(str(e))}")
-                sys.exit(1)
+                n_failed += 1
+                continue
 
             if dry_run:
                 console.print(

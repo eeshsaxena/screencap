@@ -1223,6 +1223,41 @@ def test_upload_busy_plus_success_exits_zero(tmp_path):
     assert "in progress" in result.output
 
 
+def test_upload_generic_runtimeerror_does_not_abandon_batch(tmp_path):
+    """SCR-159: a generic ``RuntimeError`` on one recording (e.g. a transient
+    "Upload service timed out" surfaced by request_signed_urls) must NOT abort the
+    batch. The truly-global failure ("not signed in") is gated up-front before the
+    loop, so an in-loop RuntimeError is per-attempt — it counts as a failure and the
+    batch continues, matching the PromotionRefused / FileNotFoundError handlers. The
+    remaining recording is still attempted, the Done summary still prints, and the
+    final n_failed gate (not a mid-loop sys.exit) yields the non-zero exit code."""
+    rec_fail = _make_upload_recording(tmp_path, "rec-fail")
+    rec_ok = _make_upload_recording(tmp_path, "rec-ok")
+    runner = CliRunner()
+
+    def _timeout_then_ok(d, **kw):
+        if d.name == "rec-fail":
+            raise RuntimeError("Upload service timed out. Try again later.")
+        return _terminal_result(routed=True, sentinel_uploaded=True)
+
+    with (
+        mock.patch(
+            "screencap.upload.resolve_recording_dirs",
+            return_value=[rec_fail, rec_ok],
+        ),
+        mock.patch("screencap.terminal_stage.run_terminal_stage", _timeout_then_ok),
+    ):
+        result = runner.invoke(cli, ["upload", "rec-fail", "rec-ok"])
+
+    # rec-ok is still attempted (not abandoned), and the batch reports both outcomes.
+    assert "Uploaded rec-ok" in result.output
+    assert "Done." in result.output
+    assert "1 uploaded, 1 failed" in result.output
+    # A failed recording still flips the exit code (SCR-79) — via the n_failed gate.
+    assert result.exit_code == 1
+    assert "Traceback" not in result.output
+
+
 def test_upload_sigterm_during_prep_emits_interrupted(tmp_path):
     """SCR-94: a SIGTERM during the pre-upload prep phase — run_terminal_stage's
     reconcile / recovery / scrub, which runs BEFORE upload_recording installs its
