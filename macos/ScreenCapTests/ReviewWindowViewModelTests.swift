@@ -225,6 +225,34 @@ final class ReviewWindowViewModelTests: XCTestCase {
         }
     }
 
+    /// SCR-155 — when another window already owns this recording's upload, the
+    /// cross-window guard (SCR-89) refuses this window's upload. That refusal
+    /// must surface as the distinct `.refused` state, NOT `.failed`: a
+    /// `.failed` would render an enabled Retry that silently re-refuses for as
+    /// long as the owner holds the claim. The refusal still carries the panes
+    /// `data` so the window keeps rendering the review content.
+    func testCrossWindowRefusalSurfacesRefusedStateWithPanesData() async {
+        // Another window (owner) claims "rec-001" on the shared registry first.
+        let owner = makeController(service: FakeUploadService())
+        owner.start(name: "rec-001")
+
+        let model = makeModel()
+        await model.loadReviewData()
+        model.startUpload()
+        await Task.yield()
+
+        if case .refused(let message, let data) = model.state {
+            XCTAssertTrue(message.contains("another window"), "got: \(message)")
+            XCTAssertNotNil(data, "refusal must keep panes data so the window still renders")
+        } else {
+            XCTFail("expected refused, got \(model.state)")
+        }
+        // Keep `owner` alive across the awaits above: if ARC released it
+        // early, its deinit would free the claim and this window would upload
+        // instead of being refused.
+        withExtendedLifetime(owner) {}
+    }
+
     /// Covers AE4: window dismissed while uploading → controller.cancel()
     /// is called; the Python side's SIGTERM handler then emits
     /// upload_failed(error: "interrupted") and state lands on failed.

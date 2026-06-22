@@ -58,6 +58,12 @@ enum UploadState: Equatable {
     case uploading(progress: Progress)
     case succeeded(Summary)
     case failed(String)
+    /// Cross-window claim refusal (SCR-89/SCR-155): another controller already
+    /// holds this recording's upload, so this one never spawned a child and
+    /// never claimed the name. Distinct from `.failed` precisely so the review
+    /// window can render it honestly (no dangling Retry that silently
+    /// re-refuses) — it is *not* a genuine upload failure.
+    case refused(String)
 
     struct Progress: Equatable {
         let filesDone: Int
@@ -173,13 +179,18 @@ final class UploadController: ObservableObject {
     func start(name: String) {
         if case .uploading = state { return }
         // Cross-window guard (SCR-89): refuse if another window's controller
-        // is already uploading this recording. Surface a terminal `.failed`
+        // is already uploading this recording. Surface a terminal `.refused`
         // rather than a silent no-op — the review viewmodel optimistically
         // sets `.uploading` before calling `start`, so a no-op would strand
-        // the window on "Starting upload…"; `.failed` gives a clear message
-        // and the Retry button (valid again once the other upload releases).
+        // the window on "Starting upload…". `.refused` (SCR-155) is deliberately
+        // a *distinct* state from `.failed`: the recording isn't broken, it's
+        // being handled by another window, so the UI shows honest copy and no
+        // Retry — rather than the old `.failed` whose enabled Retry silently
+        // re-refused for as long as the owner held the claim, and whose
+        // "released" promise was optimistic (eager release-before-SIGTERM,
+        // SCR-154).
         guard registry.claim(name) else {
-            state = .failed("An upload for this recording is already in progress.")
+            state = .refused("This recording is already being uploaded in another window.")
             return
         }
         claimedName = name

@@ -183,6 +183,12 @@ enum ReviewState: Equatable {
     case uploading(progress: UploadState.Progress, data: ReviewData)
     case succeeded(summary: UploadState.Summary)
     case failed(message: String, retryData: ReviewData?)
+    /// Cross-window refusal (SCR-155): another window already owns this
+    /// recording's upload. Distinct from `.failed` so the action row offers
+    /// honest "another window is handling it" copy and a Close — never a Retry
+    /// that would silently re-refuse. `data` is carried so the review panes
+    /// still render; only the bottom action row differs.
+    case refused(message: String, data: ReviewData?)
 }
 
 @MainActor
@@ -323,6 +329,8 @@ final class ReviewWindowViewModel: ObservableObject {
             return data
         case .failed(_, let retryData):
             return retryData
+        case .refused(_, let data):
+            return data
         case .preparing, .succeeded:
             // `.succeeded` intentionally returns nil: an upload already
             // completed, so there is no ready/retry payload to re-enter
@@ -375,6 +383,16 @@ final class ReviewWindowViewModel: ObservableObject {
             // has the panes to render against without re-running U2.
             let retry = currentReviewData()
             state = .failed(message: message, retryData: retry)
+        case .refused(let message):
+            // SCR-155: a cross-window claim refusal is NOT a genuine upload
+            // failure — another window already owns this recording's upload.
+            // Surface it as a distinct, non-retryable state with honest copy
+            // rather than a `.failed` whose enabled Retry would silently
+            // re-refuse while the owner holds the claim. Carry the panes data
+            // forward (the viewmodel is `.uploading` here, from the optimistic
+            // `startUpload`) so the window still renders the review content.
+            disarmAutoClose()
+            state = .refused(message: message, data: currentReviewData())
         }
     }
 }
