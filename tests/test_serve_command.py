@@ -187,6 +187,10 @@ def test_serve_subprocess_perm_drift_exits_75_with_named_offender(
             text=True,
             timeout=10,
         )
+        # Capture cleanup state BEFORE the finally unlink — otherwise the
+        # "socket must not survive" assertion below is vacuous (the finally
+        # would have removed it regardless of what the daemon did).
+        socket_survived = socket_path.exists()
     finally:
         socket_path.unlink(missing_ok=True)
 
@@ -199,7 +203,7 @@ def test_serve_subprocess_perm_drift_exits_75_with_named_offender(
     assert "drifted" in result.stderr, f"stderr missing 'drifted':\n{result.stderr}"
     assert "0o755" in result.stderr, f"stderr missing '0o755':\n{result.stderr}"
     # The half-bound socket must not survive the failed verify.
-    assert not socket_path.exists()
+    assert not socket_survived
 
 
 def test_serve_against_rogue_file_at_socket_path_exits_1_not_75(

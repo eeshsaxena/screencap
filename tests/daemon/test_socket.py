@@ -223,6 +223,24 @@ def test_drift_hook_with_expected_mode_is_noop(
         daemon_socket_path.unlink(missing_ok=True)
 
 
+def test_drift_hook_with_malformed_value_raises_socket_perms_drift(
+    daemon_socket_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """A non-octal hook value surfaces as SocketPermsDrift (which serve() maps to
+    EX_TEMPFAIL) rather than a bare ValueError that would escape as an
+    unclassified exit-1 traceback — keeping the typed-exit contract even on
+    test misuse. No socket is created (the hook runs before bind)."""
+    from screencap.daemon import socket as daemon_socket
+
+    monkeypatch.setenv("SCREENCAP_DAEMON_TEST_DRIFT_PARENT_MODE", "notoctal")
+
+    with pytest.raises(daemon_socket.SocketPermsDrift, match=r"not a valid octal"):
+        daemon_socket.bind_unix_socket(daemon_socket_path)
+
+    assert not daemon_socket_path.exists()
+
+
 def test_verify_socket_perms_translates_missing_paths_to_drift_error(
     tmp_path: Path,
 ) -> None:

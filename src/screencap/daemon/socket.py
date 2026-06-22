@@ -105,7 +105,16 @@ def _maybe_inject_test_parent_drift(socket_path: Path) -> None:
     raw = os.environ.get(_TEST_DRIFT_PARENT_MODE_ENV)
     if not raw:
         return
-    os.chmod(socket_path.parent, int(raw, 8))
+    try:
+        mode = int(raw, 8)
+    except ValueError as exc:
+        # A mistyped octal value must keep the typed-exit contract: surface it
+        # as SocketPermsDrift so serve() maps it to EX_TEMPFAIL rather than
+        # letting a bare ValueError escape as an unclassified exit-1 traceback.
+        raise SocketPermsDrift(
+            f"{_TEST_DRIFT_PARENT_MODE_ENV}={raw!r} is not a valid octal mode"
+        ) from exc
+    os.chmod(socket_path.parent, mode)
 
 
 _EXPECTED_PARENT_MODE = 0o700
