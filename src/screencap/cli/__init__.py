@@ -2533,8 +2533,17 @@ def upload(names, all_recordings, dry_run, force, jobs, no_delete):
                 n_failed += 1
                 continue
             except RuntimeError as e:
+                # SCR-159: a generic RuntimeError here is per-recording, not global
+                # — the one global gate (NotSignedIn) already fail-exited up-front,
+                # so what reaches this point is a transient/per-attempt upload error
+                # (auth blip, timeout, service error). Treat it like the
+                # PromotionRefused / FileNotFoundError handlers above: count it and
+                # continue so the rest of the batch is still attempted and the Done
+                # summary prints. The `if n_failed: sys.exit(1)` gate below keeps the
+                # non-zero exit code (SCR-79).
                 console.print(f"[red]Error:[/red] {e}")
-                sys.exit(1)
+                n_failed += 1
+                continue
 
             if dry_run:
                 console.print(
