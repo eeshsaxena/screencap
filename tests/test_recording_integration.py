@@ -144,6 +144,7 @@ def test_normal_recording_lifecycle(recording_env):
 
     Covers: A1, A2, A3, A6, A8, B5, D1.
     """
+    from screencap.engine.lock_policy import InheritLock
     from screencap.recorder import start_recording
 
     rec_dir = recording_env["recordings_dir"] / "test-rec"
@@ -162,6 +163,7 @@ def test_normal_recording_lifecycle(recording_env):
             app_versions=False,
             chunk_duration=0,
             verbose=True,
+            _lock_policy=InheritLock(),
         )
 
     # A1 + B5: PID file lifecycle is the daemon supervisor's responsibility
@@ -615,6 +617,7 @@ def test_start_recording_multi_chunk_produces_all_chunk_files(recording_env):
     permissions, disk_usage, orphan scan, metrics.
     Real: config (env vars), pidfile (tmp_path), ChunkProcessor, exporter.
     """
+    from screencap.engine.lock_policy import InheritLock
     from screencap.recorder import start_recording
 
     rec_dir = recording_env["recordings_dir"] / "test-chunked"
@@ -687,6 +690,7 @@ def test_start_recording_multi_chunk_produces_all_chunk_files(recording_env):
             chunk_duration=30,
             verbose=True,
             live_upload=False,
+            _lock_policy=InheritLock(),
         )
 
     # Both chunk event files should exist
@@ -767,6 +771,7 @@ def test_non_chunked_recording_no_chunk_processor(recording_env):
     scan, metrics.
     Real: config (env vars), pidfile (tmp_path), file I/O.
     """
+    from screencap.engine.lock_policy import InheritLock
     from screencap.recorder import start_recording
 
     rec_dir = recording_env["recordings_dir"] / "test-no-chunks"
@@ -786,6 +791,7 @@ def test_non_chunked_recording_no_chunk_processor(recording_env):
             app_versions=False,
             chunk_duration=0,
             verbose=True,
+            _lock_policy=InheritLock(),
         )
 
     # ChunkProcessor should NOT have been instantiated
@@ -814,6 +820,7 @@ def test_stub_recording_not_called_when_uploads_disabled(recording_env):
     all_chunks_uploaded() returns False. The recorder shutdown path must NOT
     call stub_recording(), preserving all local media files.
     """
+    from screencap.engine.lock_policy import InheritLock
     from screencap.recorder import start_recording
 
     rec_dir = recording_env["recordings_dir"] / "test-guard-gate"
@@ -892,6 +899,7 @@ def test_stub_recording_not_called_when_uploads_disabled(recording_env):
             verbose=True,
             live_upload=True,
             cloud_intent=True,
+            _lock_policy=InheritLock(),
         )
 
     # stub_recording must NOT have been called — data loss prevention
@@ -916,6 +924,7 @@ def test_upload_warning_surfaced_at_stop(recording_env):
     suggested ``screencap upload <name>`` command matches the final on-disk
     directory.
     """
+    from screencap.engine.lock_policy import InheritLock
     from screencap.recorder import print_upload_followup, start_recording
 
     rec_dir = recording_env["recordings_dir"] / "test-warning"
@@ -977,6 +986,7 @@ def test_upload_warning_surfaced_at_stop(recording_env):
             verbose=True,
             live_upload=True,
             cloud_intent=True,
+            _lock_policy=InheritLock(),
         )
 
     # The recorder must have written the follow-up state with the
@@ -1013,6 +1023,7 @@ def test_sentinel_not_uploaded_without_sentinel_for_cloud(recording_env, monkeyp
     Here the terminal stage reports a NON-converged result (no sentinel, nothing
     evicted), and finalize must leave every local chunk intact (no data loss).
     """
+    from screencap.engine.lock_policy import InheritLock
     from screencap.recorder import start_recording
     from screencap.terminal_stage import TerminalResult
 
@@ -1108,6 +1119,7 @@ def test_sentinel_not_uploaded_without_sentinel_for_cloud(recording_env, monkeyp
             verbose=True,
             live_upload=True,
             cloud_intent=True,
+            _lock_policy=InheritLock(),
         )
 
     # The old stub_recording path is retired — finalize never deletes media.

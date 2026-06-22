@@ -369,6 +369,7 @@ class TestPreRecordingDiskCheck:
         """Recording starts normally when there is enough disk space."""
         from tests.conftest import FakeRecorder
 
+        from screencap.engine.lock_policy import InheritLock
         from screencap.recorder import start_recording
 
         # 10 GB free — well above default 2000 MB warn threshold
@@ -383,11 +384,12 @@ class TestPreRecordingDiskCheck:
             mock.patch("shutil.disk_usage", return_value=fake_usage),
             mock.patch("screencap.engine.recorder.Recorder", FakeRecorder),
         ):
-            capture_dir, elapsed, _, _ = start_recording("test", output_dir=tmp_path / "test-rec")
+            capture_dir, elapsed, _, _ = start_recording("test", output_dir=tmp_path / "test-rec", _lock_policy=InheritLock())
             assert capture_dir.exists()
 
     def test_insufficient_space_aborts(self, tmp_path):
         """Recording refuses to start when free space is below warn threshold."""
+        from screencap.engine.lock_policy import InheritLock
         from screencap.recorder import start_recording
 
         # 500 MB free — below default 2000 MB warn threshold
@@ -402,10 +404,11 @@ class TestPreRecordingDiskCheck:
             mock.patch("shutil.disk_usage", return_value=fake_usage),
         ):
             with pytest.raises(SystemExit):
-                start_recording("test", output_dir=tmp_path / "test-rec")
+                start_recording("test", output_dir=tmp_path / "test-rec", _lock_policy=InheritLock())
 
     def test_file_not_found_hard_error(self, tmp_path):
         """FileNotFoundError from disk_usage produces hard error."""
+        from screencap.engine.lock_policy import InheritLock
         from screencap.recorder import start_recording
 
         with (
@@ -417,10 +420,11 @@ class TestPreRecordingDiskCheck:
             mock.patch("shutil.disk_usage", side_effect=FileNotFoundError("not found")),
         ):
             with pytest.raises(SystemExit):
-                start_recording("test", output_dir=tmp_path / "test-rec")
+                start_recording("test", output_dir=tmp_path / "test-rec", _lock_policy=InheritLock())
 
     def test_oserror_fails_closed(self, tmp_path):
         """OSError from disk_usage now fails closed: an unreadable disk is the same threat as a full one."""
+        from screencap.engine.lock_policy import InheritLock
         from screencap.recorder import start_recording
 
         with (
@@ -433,12 +437,13 @@ class TestPreRecordingDiskCheck:
             mock.patch("screencap.engine.recorder.Recorder"),
             pytest.raises(SystemExit) as exc_info,
         ):
-            start_recording("test", output_dir=tmp_path / "test-rec", verbose=True)
+            start_recording("test", output_dir=tmp_path / "test-rec", verbose=True, _lock_policy=InheritLock())
 
         assert exc_info.value.code == 1
 
     def test_warn_mb_zero_disables_check(self, tmp_path):
         """Setting warn_mb=0 disables the pre-recording disk check."""
+        from screencap.engine.lock_policy import InheritLock
         from screencap.recorder import start_recording
 
         mock_recorder = mock.MagicMock()
@@ -460,11 +465,12 @@ class TestPreRecordingDiskCheck:
             MockRecorder.return_value.__enter__ = mock.MagicMock(return_value=mock_recorder)
             MockRecorder.return_value.__exit__ = mock.MagicMock(return_value=False)
 
-            capture_dir, _, _, _ = start_recording("test", output_dir=tmp_path / "test-rec")
+            capture_dir, _, _, _ = start_recording("test", output_dir=tmp_path / "test-rec", _lock_policy=InheritLock())
             assert capture_dir.exists()
 
     def test_check_runs_before_mkdir(self, tmp_path):
         """Disk check should run before capture_dir.mkdir() — no leftover dirs on failure."""
+        from screencap.engine.lock_policy import InheritLock
         from screencap.recorder import start_recording
 
         fake_usage = DiskUsage(total=100e9, used=99.5e9, free=500e6)
@@ -479,7 +485,7 @@ class TestPreRecordingDiskCheck:
             mock.patch("shutil.disk_usage", return_value=fake_usage),
         ):
             with pytest.raises(SystemExit):
-                start_recording("test", output_dir=capture_dir)
+                start_recording("test", output_dir=capture_dir, _lock_policy=InheritLock())
 
         # Directory should NOT have been created
         assert not capture_dir.exists()
@@ -490,6 +496,7 @@ class TestThresholdValidation:
 
     def test_stop_gte_warn_rejected(self, tmp_path):
         """stop_mb >= warn_mb (when both non-zero) should be rejected."""
+        from screencap.engine.lock_policy import InheritLock
         from screencap.recorder import start_recording
 
         with (
@@ -500,10 +507,11 @@ class TestThresholdValidation:
             mock.patch("screencap.config.get_disk_stop_mb", return_value=500),
         ):
             with pytest.raises(SystemExit):
-                start_recording("test", output_dir=tmp_path / "test-rec")
+                start_recording("test", output_dir=tmp_path / "test-rec", _lock_policy=InheritLock())
 
     def test_stop_greater_than_warn_rejected(self, tmp_path):
         """stop_mb > warn_mb should be rejected."""
+        from screencap.engine.lock_policy import InheritLock
         from screencap.recorder import start_recording
 
         with (
@@ -514,7 +522,7 @@ class TestThresholdValidation:
             mock.patch("screencap.config.get_disk_stop_mb", return_value=1000),
         ):
             with pytest.raises(SystemExit):
-                start_recording("test", output_dir=tmp_path / "test-rec")
+                start_recording("test", output_dir=tmp_path / "test-rec", _lock_policy=InheritLock())
 
 
 class TestPrivacyFilterInitFailure:
@@ -528,6 +536,7 @@ class TestPrivacyFilterInitFailure:
     def test_public_mode_hard_errors_on_filter_failure(self, tmp_path):
         """Public mode raises SystemExit(1) when privacy filter fails."""
         from screencap.privacy.policy import PrivacyConfig, PrivacyMode
+        from screencap.engine.lock_policy import InheritLock
         from screencap.recorder import start_recording
 
         public_config = PrivacyConfig(mode=PrivacyMode.PUBLIC)
@@ -546,11 +555,12 @@ class TestPrivacyFilterInitFailure:
             mock.patch("screencap.engine.recorder.Recorder"),
         ):
             with pytest.raises(SystemExit):
-                start_recording("test", output_dir=tmp_path / "test-rec")
+                start_recording("test", output_dir=tmp_path / "test-rec", _lock_policy=InheritLock())
 
     def test_internal_mode_exits_on_filter_failure(self, tmp_path):
         """Internal mode hard-fails when privacy config exists but filter init fails."""
         from screencap.privacy.policy import PrivacyConfig, PrivacyMode
+        from screencap.engine.lock_policy import InheritLock
         from screencap.recorder import start_recording
 
         internal_config = PrivacyConfig(mode=PrivacyMode.INTERNAL)
@@ -572,7 +582,7 @@ class TestPrivacyFilterInitFailure:
             MockRecorder.return_value.__enter__ = mock.MagicMock()
             MockRecorder.return_value.__exit__ = mock.MagicMock(return_value=False)
 
-            start_recording("test", output_dir=tmp_path / "test-rec")
+            start_recording("test", output_dir=tmp_path / "test-rec", _lock_policy=InheritLock())
 
         assert exc_info.value.code == 1
 
@@ -584,6 +594,7 @@ class TestPrivacyFilterInitFailure:
         of ``if privacy_config is not None`` would fall through to the
         warn-and-proceed branch, leaking un-protected captures to GCS.
         """
+        from screencap.engine.lock_policy import InheritLock
         from screencap.recorder import start_recording
 
         with (
@@ -603,6 +614,7 @@ class TestPrivacyFilterInitFailure:
                 "cloud-test",
                 output_dir=tmp_path / "cloud-rec",
                 cloud_intent=True,
+                _lock_policy=InheritLock(),
             )
 
         assert exc_info.value.code == 1
@@ -613,6 +625,7 @@ class TestCloudIntentRecording:
 
     def test_cloud_intent_forces_public_mode(self, tmp_path):
         """Cloud-intent recording forces public privacy mode."""
+        from screencap.engine.lock_policy import InheritLock
         from screencap.recorder import start_recording
         from screencap.privacy.policy import PrivacyConfig, PrivacyMode
 
@@ -646,7 +659,7 @@ class TestCloudIntentRecording:
             mock_recorder.wait_for_ready = mock.MagicMock()
 
             try:
-                start_recording("cloud-test", output_dir=tmp_path / "cloud-rec", cloud_intent=True)
+                start_recording("cloud-test", output_dir=tmp_path / "cloud-rec", cloud_intent=True, _lock_policy=InheritLock())
             except (SystemExit, Exception):
                 pass
 
@@ -656,6 +669,7 @@ class TestCloudIntentRecording:
 
     def test_cloud_intent_warning_printed(self, tmp_path, capsys):
         """Cloud-intent recording prints privacy warning."""
+        from screencap.engine.lock_policy import InheritLock
         from screencap.recorder import start_recording
         from screencap.privacy.policy import PrivacyConfig, PrivacyMode
 
@@ -680,7 +694,7 @@ class TestCloudIntentRecording:
             mock_recorder.wait_for_ready = mock.MagicMock()
 
             try:
-                start_recording("cloud-test", output_dir=tmp_path / "cloud-rec", cloud_intent=True)
+                start_recording("cloud-test", output_dir=tmp_path / "cloud-rec", cloud_intent=True, _lock_policy=InheritLock())
             except (SystemExit, Exception):
                 pass
 
@@ -700,6 +714,7 @@ class TestHeadlessRecorderUnavailable:
         sets Recorder = None and triggers the user-facing 'Recorder not available' message.
         Poisoning sys.modules forces the ImportError branch.
         """
+        from screencap.engine.lock_policy import InheritLock
         from screencap.recorder import start_recording
 
         with (
@@ -713,7 +728,7 @@ class TestHeadlessRecorderUnavailable:
             mock.patch("screencap.recorder.console") as mock_console,
         ):
             with pytest.raises(SystemExit) as exc_info:
-                start_recording("test", output_dir=tmp_path / "test-rec")
+                start_recording("test", output_dir=tmp_path / "test-rec", _lock_policy=InheritLock())
 
         assert exc_info.value.code == 1
         print_calls = [str(c) for c in mock_console.print.call_args_list]
@@ -760,6 +775,7 @@ class TestNetworkV15Plumbing:
         from multiprocessing import Event as _Event
 
         from screencap.network.config import NetworkConfig
+        from screencap.engine.lock_policy import InheritLock
         from screencap.recorder import start_recording
         from tests.conftest import FakeRecorder
 
@@ -821,6 +837,7 @@ class TestNetworkV15Plumbing:
                 output_dir=tmp_path / "v15-rec",
                 network=True,
                 network_handoff_ready=handoff_ev,
+                _lock_policy=InheritLock(),
             )
 
         # Crypto helpers were each called exactly once.
@@ -851,6 +868,7 @@ class TestNetworkV15Plumbing:
         from multiprocessing import Event as _Event
 
         from screencap.network.config import NetworkConfig
+        from screencap.engine.lock_policy import InheritLock
         from screencap.recorder import start_recording
         from tests.conftest import FakeRecorder
 
@@ -897,6 +915,7 @@ class TestNetworkV15Plumbing:
                 output_dir=tmp_path / "v15-empty-rec",
                 network=True,
                 network_handoff_ready=handoff_ev,
+                _lock_policy=InheritLock(),
             )
 
         # The warning text appears in at least one console.print call.
@@ -913,6 +932,7 @@ class TestNetworkV15Plumbing:
         does not receive any DEK kwargs."""
         import contextlib
 
+        from screencap.engine.lock_policy import InheritLock
         from screencap.recorder import start_recording
         from tests.conftest import FakeRecorder
 
@@ -941,6 +961,7 @@ class TestNetworkV15Plumbing:
                 output_dir=tmp_path / "no-net-rec",
                 # network defaults to False; pass explicitly for clarity.
                 network=False,
+                _lock_policy=InheritLock(),
             )
 
         # No crypto calls.
@@ -956,3 +977,44 @@ class TestNetworkV15Plumbing:
         assert "dek_wrapped" not in kwargs
         assert "dek_nonce" not in kwargs
         assert kwargs.get("network", False) is False or "network" not in kwargs
+
+
+class TestLockPolicyContract:
+    """SCR-66: ``_lock_policy`` is a required keyword-only argument.
+
+    The daemon-only invariant — ``InheritLock`` is correct only inside a
+    daemon-spawned worker, where the supervisor owns the pidfile — is now
+    enforced at the call boundary rather than documented only in prose. A
+    direct caller that omits ``_lock_policy`` must fail loudly instead of
+    silently inheriting a no-op lock.
+    """
+
+    def test_start_recording_requires_lock_policy(self, tmp_path):
+        """Omitting ``_lock_policy`` raises ``TypeError`` at call binding,
+        before any recording side effects run (so no mocks are needed)."""
+        from screencap.recorder import start_recording
+
+        with pytest.raises(TypeError) as exc_info:
+            start_recording("inv", output_dir=tmp_path / "inv-rec")
+
+        assert "_lock_policy" in str(exc_info.value)
+
+    def test_signature_has_no_default_for_lock_policy(self):
+        """Pin the contract at the signature level too: a future refactor that
+        re-adds a default (or swallows ``_lock_policy`` into ``**kwargs``) would
+        regress to the silent daemon-only no-op. Mirrors the required-keyword
+        contract in tests/test_recover_chunk_metadata.py."""
+        import inspect
+
+        from screencap.recorder import start_recording
+
+        params = inspect.signature(start_recording).parameters
+        assert "_lock_policy" in params, (
+            "_lock_policy kwarg removed from start_recording — direct callers "
+            "must always choose their process-exclusion policy explicitly."
+        )
+        assert params["_lock_policy"].default is inspect.Parameter.empty, (
+            "_lock_policy now has a default — start_recording must require "
+            "callers to choose their lock policy explicitly (SCR-66). "
+            "InheritLock is a no-op correct only inside a daemon worker."
+        )

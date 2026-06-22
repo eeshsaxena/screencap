@@ -581,12 +581,14 @@ def start_recording(
     show_on_website: bool = True,
     network: bool = False,
     *,
-    # Session-controller worker-mode injection points. Set only by
-    # screencap.session.run_recording_worker.
+    # Session-controller worker-mode injection points. The optional seams
+    # here are normally set only by screencap.session.run_recording_worker;
+    # ``_lock_policy`` is the exception — it is REQUIRED, so every direct
+    # caller must pass it explicitly (SCR-66).
     _channels: "IpcChannels | None" = None,
     _menubar_policy: "MenubarPolicy | None" = None,
     _signal_policy: "SignalPolicy | None" = None,
-    _lock_policy: "LockPolicy | None" = None,
+    _lock_policy: "LockPolicy",
     _permission_policy: "PermissionPolicy | None" = None,
     _disk_policy: "DiskPolicy | None" = None,
     _network_policy: "NetworkPolicy | None" = None,
@@ -604,7 +606,6 @@ def start_recording(
     """
     from screencap.engine.config import RecordingConfig
     from screencap.engine.disk_policy import MonitorAndStop
-    from screencap.engine.lock_policy import InheritLock
     from screencap.engine.menubar_policy import SpawnNewMenubar
     from screencap.engine.network_policy import MitmProxyV15 as _MitmProxyV15
     from screencap.engine.network_policy import Null as _NetworkNull
@@ -632,14 +633,17 @@ def start_recording(
     channels = _channels if _channels is not None else IpcChannels.create()
     menubar = _menubar_policy if _menubar_policy is not None else SpawnNewMenubar()
     signal = _signal_policy if _signal_policy is not None else ThreeTapSigint()
-    # NOTE: ``InheritLock`` is only correct when this function is invoked
-    # inside a daemon-spawned worker process — the supervisor owns the
-    # pidfile lifecycle there, so the policy intentionally no-ops. Direct
-    # callers (tests, ad-hoc scripts, future engine-topology callers) get
-    # no process-exclusion guarantee; two concurrent ``start_recording``
-    # calls for the same name will race on ``recording.db`` and friends.
-    # If you add a non-daemon caller, pass an explicit ``_lock_policy``.
-    lock = _lock_policy if _lock_policy is not None else InheritLock()
+    # ``_lock_policy`` is REQUIRED: callers must consciously choose their
+    # process-exclusion policy. ``InheritLock`` (a no-op claim/register/
+    # release that only writes identity files) is correct ONLY inside a
+    # daemon-spawned worker, where the supervisor already owns the
+    # process-exclusive pidfile (``daemon/supervisor.py`` →
+    # ``pidfile.claim_lock``). A direct caller that passes ``InheritLock``
+    # gets no exclusion; two concurrent ``start_recording`` calls for the
+    # same name still race ``recording.db`` and friends. Requiring the
+    # argument lifts that daemon-only invariant from prose to a
+    # ``TypeError`` at the call boundary (SCR-66).
+    lock = _lock_policy
     permission = _permission_policy if _permission_policy is not None else MacOSTCC()
     disk = _disk_policy if _disk_policy is not None else MonitorAndStop()
     net = _network_policy if _network_policy is not None else (_MitmProxyV15() if network else _NetworkNull())
