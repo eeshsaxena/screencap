@@ -217,6 +217,18 @@ def test_start_payload_carries_flags(stub_daemon):
     assert payload["capture_window_data"] is False
     assert payload["wifi_metrics"] is False
     assert payload["app_versions"] is False
+    # SCR-65: the dropped ``--force``/``force_clean`` plumbing leaves no
+    # residue in the start payload.
+    assert "force_clean" not in payload
+
+
+def test_start_force_flag_removed(stub_daemon):
+    """SCR-65: ``start --force`` was a silent no-op (dead since SCR-53), so the
+    flag is removed. Click now rejects it instead of accepting a parameter that
+    nothing consumes."""
+    result = stub_daemon.invoke(["start", "--name", "demo", "--force", "--local"])
+    assert result.exit_code == 2, result.output
+    assert "no such option" in result.output.lower()
 
 
 def test_start_daemon_error_returns_exit_1(stub_daemon):

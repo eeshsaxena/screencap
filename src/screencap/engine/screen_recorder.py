@@ -286,7 +286,6 @@ class LegacyOptions:
     output_dir: str | Path | None = None
     wifi_metrics: bool | None = None
     app_versions: bool | None = None
-    force_clean: bool = False
     capture_video: bool | None = None
     capture_images: bool | None = None
     capture_window_data: bool | None = None
@@ -371,7 +370,6 @@ def _run_screen_recorder(rec: "ScreenRecorder") -> "RecordingResult":
     output_dir = legacy.output_dir
     wifi_metrics = legacy.wifi_metrics
     app_versions = legacy.app_versions
-    force_clean = legacy.force_clean
     capture_video = legacy.capture_video
     capture_images = legacy.capture_images
     capture_window_data = legacy.capture_window_data
@@ -407,7 +405,7 @@ def _run_screen_recorder(rec: "ScreenRecorder") -> "RecordingResult":
     # (see ``daemon/supervisor.py``), so ``InheritLock.claim`` is a no-op.
     # The call is preserved for the seam — a future ``LockPolicy`` variant
     # from the engine-topology spike may need to do real work here.
-    lock_policy.claim(capture_dir, force_clean=force_clean)
+    lock_policy.claim(capture_dir)
 
     if capture_dir.exists() and any(capture_dir.iterdir()):
         console.print(

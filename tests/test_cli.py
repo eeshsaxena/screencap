@@ -1771,46 +1771,6 @@ def test_start_cloud_then_local_resolves_to_local(tmp_path):
 
 
 @pytestmark_legacy_start
-def test_start_force_flag_passes_force_clean_to_recorder(tmp_path):
-    """`start --force` triggers orphan cleanup and forwards force_clean=True."""
-    runner = CliRunner()
-    fake_dir = tmp_path / "test"
-    fake_dir.mkdir()
-    orphans = [{"pid": 444, "name": "old_writer"}]
-    with (
-        _safe_start_prompts(),
-        mock.patch("screencap.pidfile.find_orphaned_processes", return_value=orphans),
-        mock.patch("screencap.pidfile.terminate_processes"),
-        mock.patch("screencap.pidfile.delete_pidfile"),
-        mock.patch("screencap.pidfile.write_pidfile"),
-        mock.patch(
-            "screencap.recorder.start_recording",
-            return_value=(fake_dir, 42.0, None, None),
-        ) as mock_rec,
-    ):
-        result = runner.invoke(cli, ["start", "--name", "test", "--force"])
-    assert result.exit_code == 0, result.output
-    _, kwargs = mock_rec.call_args
-    assert kwargs["force_clean"] is True
-
-
-@pytestmark_legacy_start
-def test_start_without_force_exits_when_orphans_present():
-    """Without --force, start exits non-zero rather than racing the orphans."""
-    runner = CliRunner()
-    orphans = [{"pid": 555, "name": "old_writer"}]
-    with (
-        _safe_start_prompts(),
-        mock.patch("screencap.pidfile.find_orphaned_processes", return_value=orphans),
-        mock.patch("screencap.pidfile.terminate_processes"),
-        mock.patch("screencap.pidfile.delete_pidfile"),
-        mock.patch("screencap.recorder.start_recording", side_effect=SystemExit(1)),
-    ):
-        result = runner.invoke(cli, ["start", "--name", "test"])
-    assert result.exit_code == 1
-
-
-@pytestmark_legacy_start
 def test_start_disk_full_skips_auto_naming_but_prints_summary(tmp_path):
     """DiskFullError from start_recording is caught: the post-recording pipeline
     skips auto-naming/transcription, but the summary still prints so the user
