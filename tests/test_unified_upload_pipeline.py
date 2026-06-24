@@ -386,3 +386,139 @@ def test_ae5_delete_after_upload_evicts_confirmed_through_terminal(tmp_path, mon
     assert not (rec_dir / "chunk_0000.mp4").exists()
     assert not (rec_dir / "chunk_0001.mp4").exists()
     assert set(result.evicted) == {0, 1}
+
+
+# ---------------------------------------------------------------------------
+# SCR-131 — end-to-end integration of the REAL upload HTTP chain through the
+# unified pipeline.
+#
+# Every other test in this file stubs the cloud seam (``CloudCopyProducer.produce``
+# + ``upload_recording`` via ``_stub_cloud_seam``), so the real chain — cloud
+# route → real ``scrub_recording`` (media stripped) → ``list_recording_files``
+# exclusions → ``request_signed_urls`` (POST) → per-file PUT → SCR-129
+# ``_upload_source_media`` (the chunk video/audio the scrubbed copy lacks) → the
+# confirm probes → sentinel — is never exercised AS A WHOLE. That blind spot is
+# what hid SCR-129 (a media-less scrubbed-dir upload). This test mocks ONLY the
+# HTTP boundary (``screencap.upload.requests.post`` / ``.put``) and lets the rest
+# run for real, then asserts the ACTUAL file set that reached the cloud: each
+# chunk's source video DID (SCR-129) and ``recording.db`` (+ WAL/SHM) NEVER did
+# (AE4).
+# ---------------------------------------------------------------------------
+
+
+class _Resp:
+    """Minimal ``requests.Response`` double for the fake-GCS endpoints."""
+
+    def __init__(self, status_code: int, payload: dict):
+        self.status_code = status_code
+        self._payload = payload
+        self.text = ""
+
+    def json(self) -> dict:
+        return self._payload
+
+    def raise_for_status(self) -> None:
+        if self.status_code >= 400:
+            import requests
+
+            raise requests.HTTPError(f"status {self.status_code}")
+
+
+class _FakeGCS:
+    """In-memory GCS double driving the real upload HTTP chain (SCR-131).
+
+    Stands in for the ``get-upload-urls`` Cloud Function (POST) plus the
+    signed-URL object store (PUT); ``bucket`` is the set of object names
+    currently "in GCS". A POST grants a fresh signed URL for any requested name
+    NOT yet in the bucket, and returns ``url=None`` for one already there (the
+    server's "already uploaded — skip" resumability signal that the real confirm
+    / reconcile probes key off). A PUT to a granted URL marks that object present.
+    Because the probes converge over this state, the test needs no injected
+    ``remote_exists`` seam — it is the genuine HTTP chain end to end.
+    """
+
+    def __init__(self):
+        self.bucket: set[str] = set()  # object names "present in GCS"
+        self._url_name: dict[str, str] = {}  # signed URL -> object name
+        self.posted_names: set[str] = set()  # every name any POST asked about
+        self.put_names: list[str] = []  # every name a PUT stored (in order)
+        self._counter = 0
+
+    def post(self, url, *, json=None, headers=None, timeout=None):
+        # request_signed_urls payload: {"recording": ..., "files": [{"name": ...}]}
+        urls: dict[str, str | None] = {}
+        for spec in json["files"]:
+            nm = spec["name"]
+            self.posted_names.add(nm)
+            if nm in self.bucket:
+                urls[nm] = None  # already there -> skip (resumable)
+            else:
+                self._counter += 1
+                signed = f"https://fake-gcs.invalid/put/{self._counter}"
+                self._url_name[signed] = nm
+                urls[nm] = signed
+        return _Resp(200, {"urls": urls, "gcs_prefix": f"gs://bucket/{json['recording']}"})
+
+    def put(self, url, *, data=None, headers=None, timeout=None):
+        nm = self._url_name.get(url)
+        if nm is not None:
+            self.bucket.add(nm)
+            self.put_names.append(nm)
+        return _Resp(200, {})
+
+
+def test_scr131_real_http_chain_ships_video_never_recording_db(tmp_path, monkeypatch):
+    """Drive ``run_terminal_stage`` over the REAL chain with only HTTP mocked.
+
+    Nothing is stubbed but the HTTP boundary (``requests.post`` / ``.put``) and
+    the auth token: the real ``scrub_recording`` (which strips media), the real
+    ``list_recording_files`` exclusions, ``_upload_source_media`` (SCR-129), the
+    ``_chunk_confirmed_remote`` probes, and the sentinel all run. The assertions
+    are therefore about the ACTUAL file set requested for and pushed to the cloud.
+    """
+    from screencap import auth
+    from screencap import terminal_stage as ts
+
+    rec_dir = _make_recording(tmp_path, destination="cloud", n_chunks=2, name="scr131")
+
+    gcs = _FakeGCS()
+    # The ONLY mock is the HTTP boundary. ``screencap.upload.requests`` IS the
+    # ``requests`` module singleton, so patching ``.post`` / ``.put`` here also
+    # covers ``chunk_processor._upload_single`` (the SCR-129 source-media PUT)
+    # and ``upload_sentinel`` — every signed-URL POST flows through
+    # ``screencap.upload.request_signed_urls`` regardless of caller.
+    monkeypatch.setattr("screencap.upload.requests.post", gcs.post)
+    monkeypatch.setattr("screencap.upload.requests.put", gcs.put)
+    # No real Keychain/daemon credential in tests; the uid stays unpinned
+    # (``read_owner_uid`` is None) so the account-ownership gate is a no-op.
+    monkeypatch.setattr(auth, "get_id_token", lambda force_refresh=False: "test-token")
+    # ``scrub_recording`` resolves the recording + its ``-scrubbed`` sibling via
+    # ``get_recordings_dir`` (the dir name -> path lookup), so point it at tmp.
+    monkeypatch.setattr("screencap.config.get_recordings_dir", lambda: tmp_path)
+    monkeypatch.setattr("screencap.scrubber.get_recordings_dir", lambda: tmp_path)
+
+    result = ts.run_terminal_stage(rec_dir)
+
+    # The whole frozen closed set converged through the real chain.
+    assert result.finalize_gate_satisfied is True
+    assert result.sentinel_uploaded is True
+
+    # SCR-129: each chunk's SOURCE video + audio reached the cloud. The scrubbed
+    # copy strips all media, so this only holds if ``_upload_source_media`` shipped
+    # them from the source dir — the exact regression that was previously mock-blind.
+    assert {"chunk_0000.mp4", "chunk_0001.mp4"} <= gcs.bucket
+    assert {"audio_0000.flac", "audio_0001.flac"} <= gcs.bucket
+    # The scrubbed per-chunk artifacts reached the cloud (via list_recording_files).
+    assert {"events_0000.jsonl", "events_0001.jsonl"} <= gcs.bucket
+    assert {"chunk_0000_manifest.json", "chunk_0001_manifest.json"} <= gcs.bucket
+    # The completeness sentinel landed (the LAST write, gated on the closed set).
+    assert "recording_complete.json" in gcs.bucket
+
+    # AE4 — the raw local-only ``recording.db`` (+ its WAL/SHM sidecars) must NEVER
+    # be offered for upload NOR pushed, across BOTH the scrubbed-dir enumeration and
+    # the source-media path. This is the integration-level assertion the leaf-level
+    # ``list_recording_files`` / ``assert_uploadable`` unit tests cannot make,
+    # because they never see the full terminal-stage file set.
+    raw = {"recording.db", "recording.db-wal", "recording.db-shm"}
+    assert raw.isdisjoint(gcs.posted_names), "recording.db must never be offered for upload (AE4)"
+    assert raw.isdisjoint(set(gcs.put_names)), "recording.db must never be PUT to the cloud (AE4)"
