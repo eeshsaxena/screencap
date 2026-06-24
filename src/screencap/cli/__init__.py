@@ -903,7 +903,7 @@ def _auto_export(capture_dir: Path) -> None:
     except Exception as e:
         console.print(
             f"[yellow]Warning:[/yellow] Could not auto-export events.jsonl ({escape(str(e))}). "
-            f"Run 'screencap export {capture_dir.name}' manually."
+            f"Run 'screencap export {escape(str(capture_dir.name))}' manually."
         )
 
 
@@ -1142,7 +1142,7 @@ def info(name, as_json):
         console.print("\n  [yellow]Events dropped during recording:[/yellow]")
         for event_type, count in drops.items():
             if count > 0:
-                console.print(f"    [yellow]{event_type}:[/yellow] {count}")
+                console.print(f"    [yellow]{escape(str(event_type))}:[/yellow] {count}")
 
     if metrics is None:
         console.print("\n[dim]No system metrics available (recorded before metrics feature).[/dim]")
@@ -1381,8 +1381,8 @@ def _build_export_privacy_filter(recording_dir):
         )
         err_console.print(
             f"[yellow]Warning:[/yellow] No .recording_intent in "
-            f"{rec_name} — "
-            f"applying current config mode={mode!r}. Re-record under the desired "
+            f"{escape(str(rec_name))} — "
+            f"applying current config mode={escape(repr(mode))}. Re-record under the desired "
             f"mode for accurate filtering."
         )
         # Machine-parseable mirror of the warning (todo 010): when stdout is
@@ -2168,7 +2168,7 @@ def upload(names, all_recordings, dry_run, force, jobs, no_delete):
         intent = read_intent(d)
         if intent == "local" and not dry_run:
             console.print(
-                f"  [yellow]Note:[/yellow] {d.name} is local-intent — post-hoc "
+                f"  [yellow]Note:[/yellow] {escape(str(d.name))} is local-intent — post-hoc "
                 "scrubbing provides weaker guarantees than capture-time enforcement."
             )
 
@@ -2285,7 +2285,7 @@ def upload(names, all_recordings, dry_run, force, jobs, no_delete):
                 # SCR-79 ties that event to a non-zero exit.
                 emit_event(EVENT_UPLOAD_BUSY, recording=d.name, retryable=True)
                 console.print(
-                    f"  [yellow]{d.name}: upload already in progress[/yellow] — a "
+                    f"  [yellow]{escape(str(d.name))}: upload already in progress[/yellow] — a "
                     "recording is finalizing, or another upload / daemon resume holds "
                     "the lock. Try again shortly."
                 )
@@ -2324,7 +2324,7 @@ def upload(names, all_recordings, dry_run, force, jobs, no_delete):
                     console.print(f"  [yellow]Warning:[/yellow] {escape(str(result.upload_warning))}")
                 if result.failed_indices:
                     console.print(
-                        f"  [yellow]{d.name}: {len(result.failed_indices)} chunk(s) could "
+                        f"  [yellow]{escape(str(d.name))}: {len(result.failed_indices)} chunk(s) could "
                         "not be prepared — local media preserved, sentinel withheld.[/yellow]"
                     )
                 n_failed += 1
@@ -3450,14 +3450,14 @@ def smoke_test(verbose):
             result = (check_fn.__name__.replace("_check_", ""), False, traceback.format_exc())
         results.append(result)
 
-        name, passed, err = result
+        check_name, passed, err = result
         if passed:
-            console.print(f"  [green]\\[PASS][/green] {name}")
+            console.print(f"  [green]\\[PASS][/green] {check_name}")
         else:
             # err contains the full traceback; show last line for summary,
             # full traceback when --verbose
             err_summary = err.strip().rsplit("\n", 1)[-1]
-            console.print(f"  [red]\\[FAIL][/red] {name} — {escape(str(err_summary))}")
+            console.print(f"  [red]\\[FAIL][/red] {escape(str(check_name))} — {escape(str(err_summary))}")
             if verbose:
                 console.print(escape(str(err)))
 
