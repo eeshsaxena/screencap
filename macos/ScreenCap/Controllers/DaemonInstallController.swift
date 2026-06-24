@@ -235,7 +235,14 @@ final class DaemonInstallController: ObservableObject {
         approvalTimeoutSeconds: TimeInterval,
         approvalPollIntervalSeconds: TimeInterval,
         convergenceTimeoutSeconds: TimeInterval,
-        allowRegistrationRefresh: Bool
+        allowRegistrationRefresh: Bool,
+        // The wrong version that drove us into the post-refresh pass, or nil if we
+        // got here for any other reason (first pass, or a plain reachability
+        // timeout). Lets the second-pass `.timedOut` branch tell "the reinstall of
+        // a mismatched daemon never converged" apart from "a daemon simply never
+        // came up", and surface the actionable mismatch state for the former
+        // (SCR-136).
+        priorMismatchVersion: String? = nil
     ) async {
         switch status {
         case .enabled:
@@ -261,6 +268,20 @@ final class DaemonInstallController: ObservableObject {
                         approvalPollIntervalSeconds: approvalPollIntervalSeconds,
                         convergenceTimeoutSeconds: convergenceTimeoutSeconds
                     )
+                } else if let priorMismatchVersion {
+                    // We entered this post-refresh pass because a version-mismatched
+                    // daemon was squatting the socket. The reinstall booted it out,
+                    // but the replacement never answered before the convergence
+                    // budget expired — so the swap did not complete. The user's real
+                    // problem is still the stale helper, so surface the actionable
+                    // `.daemonVersionMismatch` ("reinstall the bundled helper")
+                    // rather than the generic `.pollingFailed` ("did not respond")
+                    // that pollDaemon left in `state` (SCR-136). This mirrors the
+                    // cached-`lastMismatch` deadline resolution in pollDaemon for the
+                    // case where the stale daemon vanishes before the second pass
+                    // ever probes it.
+                    daemonInstallLogger.error("Daemon never reappeared after reinstalling over version \(priorMismatchVersion, privacy: .public); expected \(self.expectedDaemonVersion ?? "unknown", privacy: .public)")
+                    state = .installFailed(.daemonVersionMismatch)
                 }
             case .versionMismatch(let running):
                 // A stale/foreign daemon is squatting api.sock. Try the reinstall
@@ -280,7 +301,8 @@ final class DaemonInstallController: ObservableObject {
                         probeIntervalSeconds: probeIntervalSeconds,
                         approvalTimeoutSeconds: approvalTimeoutSeconds,
                         approvalPollIntervalSeconds: approvalPollIntervalSeconds,
-                        convergenceTimeoutSeconds: convergenceTimeoutSeconds
+                        convergenceTimeoutSeconds: convergenceTimeoutSeconds,
+                        priorMismatchVersion: running
                     )
                 } else {
                     daemonInstallLogger.error("Daemon still reports version \(running, privacy: .public) after reinstall; expected \(self.expectedDaemonVersion ?? "unknown", privacy: .public)")
@@ -301,7 +323,8 @@ final class DaemonInstallController: ObservableObject {
                     approvalTimeoutSeconds: approvalTimeoutSeconds,
                     approvalPollIntervalSeconds: approvalPollIntervalSeconds,
                     convergenceTimeoutSeconds: convergenceTimeoutSeconds,
-                    allowRegistrationRefresh: allowRegistrationRefresh
+                    allowRegistrationRefresh: allowRegistrationRefresh,
+                    priorMismatchVersion: priorMismatchVersion
                 )
             } else {
                 state = .installFailed(.unknown)
@@ -320,7 +343,12 @@ final class DaemonInstallController: ObservableObject {
         probeIntervalSeconds: TimeInterval,
         approvalTimeoutSeconds: TimeInterval,
         approvalPollIntervalSeconds: TimeInterval,
-        convergenceTimeoutSeconds: TimeInterval
+        convergenceTimeoutSeconds: TimeInterval,
+        // Carries the wrong version forward only when the refresh was triggered by
+        // a version mismatch (not a plain reachability timeout), so the post-refresh
+        // pass can resolve a non-converging swap to `.daemonVersionMismatch`
+        // (SCR-136).
+        priorMismatchVersion: String? = nil
     ) async {
         state = .registering
         let refreshedStatus: SMAppService.Status
@@ -339,7 +367,8 @@ final class DaemonInstallController: ObservableObject {
             approvalTimeoutSeconds: approvalTimeoutSeconds,
             approvalPollIntervalSeconds: approvalPollIntervalSeconds,
             convergenceTimeoutSeconds: convergenceTimeoutSeconds,
-            allowRegistrationRefresh: false
+            allowRegistrationRefresh: false,
+            priorMismatchVersion: priorMismatchVersion
         )
     }
 

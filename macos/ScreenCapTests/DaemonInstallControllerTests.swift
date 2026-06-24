@@ -293,6 +293,45 @@ final class DaemonInstallControllerTests: XCTestCase {
         XCTAssertEqual(controller.state, .installFailed(.daemonVersionMismatch))
     }
 
+    // SCR-136: sibling of the `lastMismatch` case above. Here the version-
+    // mismatched daemon answers on the FIRST poll (fast-fail) but is already gone
+    // by the time the post-refresh poll probes — every second-pass probe is
+    // unreachable, so `lastMismatch` is never set and the poll returns `.timedOut`
+    // rather than `.versionMismatch`. The user arrived via a version mismatch, so
+    // the actionable `.daemonVersionMismatch` ("reinstall the bundled helper")
+    // must still win over the generic `.pollingFailed` ("did not respond"). Before
+    // the fix the second-pass `.timedOut` branch was a no-op and the state leaked
+    // through as `.pollingFailed`.
+    func testMismatchThenSecondPollTimeoutSurfacesMismatch() async {
+        let registration = FakeDaemonRegistrationService(
+            registerStatuses: [.enabled],
+            refreshStatuses: [.enabled]
+        )
+        let terminator = FakeDaemonTerminator()
+        // Wrong version on the first poll, then unreachable forever: the booted-out
+        // stale daemon is gone and the replacement never binds api.sock.
+        let probe = FakeDaemonProbe(versions: ["0.12.7", nil])
+        let clock = FakeClock()
+        let controller = DaemonInstallController(
+            registrationService: registration,
+            probe: probe,
+            terminator: terminator,
+            expectedDaemonVersion: "0.20.0",
+            sleep: { clock.advance(nanoseconds: $0) },
+            now: { clock.now }
+        )
+
+        await controller.install(
+            timeoutSeconds: 1,
+            probeIntervalSeconds: 0.5,
+            convergenceTimeoutSeconds: 2
+        )
+
+        XCTAssertEqual(registration.refreshedPlistNames, [DaemonInstallController.plistName])
+        XCTAssertEqual(terminator.bootoutCount, 1)
+        XCTAssertEqual(controller.state, .installFailed(.daemonVersionMismatch))
+    }
+
     func testReachableDaemonWithMatchingVersionInstallsWithoutRefresh() async {
         let registration = FakeDaemonRegistrationService(registerStatuses: [.enabled])
         let terminator = FakeDaemonTerminator()

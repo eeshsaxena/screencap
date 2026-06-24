@@ -1,6 +1,6 @@
 ---
 title: Daemon poll timeout after a version mismatch surfaces a generic "did not respond" (untested)
-status: open
+status: done
 priority: medium
 created: 2026-06-15
 source: code-review PR #231
@@ -38,6 +38,10 @@ Intertwined with finding #1 (the convergence-budget change) and changes install 
 ## Evidence
 
 - `macos/ScreenCap/Controllers/DaemonInstallController.swift:176` — second-pass `.timedOut` case is a no-op when `allowRegistrationRefresh` is false
+
+## Resolution (SCR-136)
+
+Terminal state chosen: **`.daemonVersionMismatch`** (coherent with the existing cached-`lastMismatch` path, which already surfaces it for the same failure differing only by one probe's timing; gives the actionable "reinstall the bundled helper" guidance). Threaded `priorMismatchVersion` through `refreshRegistrationAfterFailedPoll` → `handleRegisteredStatus`; the second-pass `.timedOut` branch now surfaces `.daemonVersionMismatch` when we arrived via a mismatch. First-pass pure-timeout path stays `.pollingFailed` unchanged. Test added: `testMismatchThenSecondPollTimeoutSurfacesMismatch` (`["0.12.7", nil]` + `expectedDaemonVersion: "0.20.0"`), confirmed failing on the pre-fix controller for the right reason, passing after. Full macOS test target green (only the known parallel-load flakes, verified passing in isolation).
 
 ## Linear filing details (for handoff session)
 
