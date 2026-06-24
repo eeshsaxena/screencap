@@ -346,6 +346,67 @@ final class RecorderControllerTests: XCTestCase {
         )
     }
 
+    // MARK: - SCR-142 CLI-fallback permission_required routing
+
+    /// The CLI-fallback transport must route a start-time `permission_required`
+    /// event into the SAME precise grant flow the daemon transport uses, naming
+    /// every missing permission — not the hedged exit-1 fallback. The capturing
+    /// CLI fake lets us replay the engine's stderr→termination sequence in the
+    /// FIFO order `LiveCLIRecorderService` guarantees (event before terminate).
+    func testCLIFallbackPermissionRequiredRoutesToGrantFlowNamingEachPermission() throws {
+        let alert = FakeRecorderAlertPresenter(stopAndQuitReply: .terminateLater)
+        let cliService = CapturingCLIRecorderService()
+        let recorder = RecorderController(alertPresenter: alert, cliService: cliService)
+        // No permissions bound: the start guard is skipped, so we reach the
+        // spawn and capture the callbacks (the stale-client scenario where the
+        // daemon's fresh pre-spawn probe is the first to see the denial).
+        recorder._testSetTransport(.cliFallback)
+
+        recorder.start(name: "demo")
+
+        let event = try XCTUnwrap(RecorderEventLine.parse(
+            stderrLine: #"{"type":"permission_required","missing":["screen_recording","accessibility"],"schema_version":1}"#
+        ))
+        let onEvent = try XCTUnwrap(cliService.capturedEvent)
+        let onTerminated = try XCTUnwrap(cliService.capturedTerminated)
+
+        // Engine emits the structured event, THEN exits 3 (FIFO-ordered).
+        onEvent(event)
+        onTerminated(3)
+
+        XCTAssertEqual(alert.lastPermissionRequiredPresented, ["Screen Recording", "Accessibility"])
+        // The generic exit-3 "revoked" copy is suppressed; the grant-flow
+        // message stands, and we land back idle (nothing was recording).
+        XCTAssertEqual(recorder.lastError, "Grant Screen Recording, Accessibility to ScreenCap before recording.")
+        XCTAssertFalse(recorder.state.isRecording)
+    }
+
+    /// SCR-142 empty-`missing` fallback: a `permission_required` event with an
+    /// empty `missing` list (the CLI collapses a non-list / absent `missing` to
+    /// `[]`) must still route into the grant flow, naming Screen Recording — the
+    /// permission fatal to capture — via `privacyPanes(fromMissing:)`.
+    func testCLIFallbackPermissionRequiredWithEmptyMissingFallsBackToScreenRecording() throws {
+        let alert = FakeRecorderAlertPresenter(stopAndQuitReply: .terminateLater)
+        let cliService = CapturingCLIRecorderService()
+        let recorder = RecorderController(alertPresenter: alert, cliService: cliService)
+        recorder._testSetTransport(.cliFallback)
+
+        recorder.start(name: "demo")
+
+        let event = try XCTUnwrap(RecorderEventLine.parse(
+            stderrLine: #"{"type":"permission_required","missing":[],"schema_version":1}"#
+        ))
+        let onEvent = try XCTUnwrap(cliService.capturedEvent)
+        let onTerminated = try XCTUnwrap(cliService.capturedTerminated)
+
+        onEvent(event)
+        onTerminated(3)
+
+        XCTAssertEqual(alert.lastPermissionRequiredPresented, ["Screen Recording"])
+        XCTAssertEqual(recorder.lastError, "Grant Screen Recording to ScreenCap before recording.")
+        XCTAssertFalse(recorder.state.isRecording)
+    }
+
     // MARK: - Helpers
 
     private func waitUntil(
@@ -409,6 +470,25 @@ final class StubbedCLIRecorderService: CLIRecorderService {
     ) throws {
         // No-op: these tests drive state via `_testSetPresentation`, not via
         // a real subprocess lifecycle.
+    }
+}
+
+/// Fake `CLIRecorderService` that captures the orchestrator's `onEvent` /
+/// `onTerminated` callbacks so a test can drive the CLI-fallback stderr →
+/// termination sequence deterministically (no real subprocess).
+@MainActor
+final class CapturingCLIRecorderService: CLIRecorderService {
+    var currentProcess: SpawnedProcessHandle?
+    private(set) var capturedEvent: (@MainActor @Sendable (RecorderEventLine) -> Void)?
+    private(set) var capturedTerminated: (@MainActor @Sendable (Int32) -> Void)?
+
+    func start(
+        args: [String],
+        onEvent: @escaping @MainActor @Sendable (RecorderEventLine) -> Void,
+        onTerminated: @escaping @MainActor @Sendable (Int32) -> Void
+    ) throws {
+        capturedEvent = onEvent
+        capturedTerminated = onTerminated
     }
 }
 

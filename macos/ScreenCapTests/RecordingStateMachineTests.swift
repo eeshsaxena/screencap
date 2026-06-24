@@ -280,6 +280,15 @@ final class RecordingStateMachineTests: XCTestCase {
         XCTAssertNil(line.reader)
     }
 
+    func testPermissionRequiredLineDecodesMissingList() throws {
+        // SCR-142: the CLI re-emits the daemon's `missing` list as a JSON array.
+        let json = #"{"type":"permission_required","missing":["screen_recording","accessibility"],"schema_version":1}"#
+        let line = try JSONDecoder().decode(RecorderEventLine.self, from: Data(json.utf8))
+
+        XCTAssertEqual(line.type, "permission_required")
+        XCTAssertEqual(line.missing, ["screen_recording", "accessibility"])
+    }
+
     // MARK: - Event: matrix_disclosure_required
 
     func testMatrixDisclosureEventEmitsSetMatrixDisclosureWithChanges() {
@@ -429,6 +438,92 @@ final class RecordingStateMachineTests: XCTestCase {
         XCTAssertTrue(effects.contains(.surfaceError("Recording stopped because a required permission was revoked.")))
     }
 
+    func testPermissionRequiredEmitsHandlePermissionRequiredWithMissingList() {
+        // SCR-142: the CLI-fallback start-time block names every denied
+        // permission, so the event routes the full `missing` list (not the
+        // single-permission `permission_lost` path) into the grant flow.
+        var machine = RecordingStateMachine()
+
+        let effects = machine.handle(event: event(
+            type: "permission_required",
+            missing: ["screen_recording", "accessibility"]
+        ))
+
+        XCTAssertEqual(
+            effects,
+            [.handlePermissionRequired(missing: ["screen_recording", "accessibility"])]
+        )
+    }
+
+    func testPermissionRequiredWithEmptyMissingEmitsEffectWithEmptyList() {
+        // SCR-142 fallback: a `permission_required` carrying an empty `missing`
+        // list (a non-list / absent `missing` collapsed by the CLI) still routes
+        // into the grant flow — the effect carries `[]` and the controller's
+        // `privacyPanes(fromMissing:)` supplies the `.screenRecording` fallback.
+        var machine = RecordingStateMachine()
+
+        let effects = machine.handle(event: event(
+            type: "permission_required",
+            missing: []
+        ))
+
+        XCTAssertEqual(effects, [.handlePermissionRequired(missing: [])])
+    }
+
+    func testPermissionRequiredThenExit3SuppressesGenericRevokedMessage() {
+        // SCR-142 de-dup: once `permission_required` routed the precise grant
+        // flow, the process exits 3 — but the generic "permission was revoked"
+        // copy must NOT also fire (it's redundant and wrong: nothing was
+        // recording to revoke). The FIFO stderr→termination ordering guarantees
+        // the event is processed before `processTerminated`.
+        var machine = RecordingStateMachine()
+        _ = machine.enterStarting()
+        _ = machine.handle(event: event(
+            type: "permission_required",
+            missing: ["screen_recording"]
+        ))
+
+        let effects = machine.processTerminated(exitCode: 3)
+
+        XCTAssertFalse(
+            effects.contains(.surfaceError("Recording stopped because a required permission was revoked.")),
+            "exit-3 message must be suppressed after a permission_required block"
+        )
+    }
+
+    func testPermissionRequiredThenNonExit3StillSurfacesItsRealMessage() {
+        // SCR-142 de-dup scope: the suppression only covers exit 3. If a
+        // `permission_required` event is followed by a NON-3 exit (e.g. a
+        // disk_full crash exiting 4), that exit's real message must still
+        // surface — the routed flag must not swallow an unrelated failure.
+        var machine = RecordingStateMachine()
+        _ = machine.enterStarting()
+        _ = machine.handle(event: event(
+            type: "permission_required",
+            missing: ["screen_recording"]
+        ))
+
+        let effects = machine.processTerminated(exitCode: 4)
+
+        XCTAssertTrue(
+            effects.contains(.surfaceError("Disk is full — recording stopped.")),
+            "a non-3 exit after permission_required must still surface its real message"
+        )
+    }
+
+    func testExit3WithoutPriorPermissionRequiredStillSurfacesRevoked() {
+        // Guard the de-dup is scoped: a bare exit 3 (mid-recording revocation,
+        // no preceding `permission_required`) still surfaces its message.
+        var machine = RecordingStateMachine()
+        _ = machine.enterStarting()
+
+        let effects = machine.processTerminated(exitCode: 3)
+
+        XCTAssertTrue(
+            effects.contains(.surfaceError("Recording stopped because a required permission was revoked."))
+        )
+    }
+
     func testProcessTerminatedExitCode4SurfacesDiskFull() {
         var machine = RecordingStateMachine()
 
@@ -454,6 +549,7 @@ final class RecordingStateMachineTests: XCTestCase {
         schemaVersion: Int? = 1,
         forceStopped: Bool? = nil,
         permission: String? = nil,
+        missing: [String]? = nil,
         changes: [String]? = nil,
         optOutCommandExamples: [String]? = nil,
         cursor: Int? = nil,
@@ -466,6 +562,7 @@ final class RecordingStateMachineTests: XCTestCase {
             schemaVersion: schemaVersion,
             forceStopped: forceStopped,
             permission: permission,
+            missing: missing,
             changes: changes,
             optOutCommandExamples: optOutCommandExamples,
             cursor: cursor,

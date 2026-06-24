@@ -10,11 +10,11 @@ The schema is the cross-language contract — see
 
 Active events (emitted in v1):
   started, lock_contended, recording_finalized, disk_full,
-  permission_lost, capture_unhealthy, capture_recovered, stopped,
-  menubar_neutralized_by_env, matrix_disclosure_required,
-  lock_metadata_write_failed, terminated_reason_persist_failed,
-  upload_started, upload_file_done, upload_finished, upload_failed,
-  upload_busy
+  permission_lost, permission_required, capture_unhealthy,
+  capture_recovered, stopped, menubar_neutralized_by_env,
+  matrix_disclosure_required, lock_metadata_write_failed,
+  terminated_reason_persist_failed, upload_started, upload_file_done,
+  upload_finished, upload_failed, upload_busy
 
 Reserved events (schema documented, NOT emitted in v1 — todo 004):
   chunk_finalized — wiring deferred to a follow-up that touches
@@ -22,8 +22,10 @@ Reserved events (schema documented, NOT emitted in v1 — todo 004):
   informational, not authoritative; do not block on it.
 
 Exit codes (terminal exit_code on the ``stopped`` event matches the
-process exit code): 0=clean, 2=lock-held, 3=permission_lost, 4=disk_full,
-5=user-initiated force-quit, 1=generic failure.
+process exit code): 0=clean, 2=lock-held, 3=permission denied/lost
+(start-time ``permission_required`` block OR mid-recording
+``permission_lost``), 4=disk_full, 5=user-initiated force-quit,
+1=generic failure.
 
 ``capture_unhealthy`` (SCR-76) is ADVISORY: it has NO exit code and never
 terminates a recording. The engine's mid-recording supervisor emits it once
@@ -71,6 +73,15 @@ EVENT_CHUNK_FINALIZED = "chunk_finalized"
 EVENT_RECORDING_FINALIZED = "recording_finalized"
 EVENT_DISK_FULL = "disk_full"
 EVENT_PERMISSION_LOST = "permission_lost"
+# Start-time permission block (SCR-142). Re-emitted by the ``screencap start``
+# daemon client when the daemon's pre-spawn permission gate rejects the start
+# with a ``permission_required`` envelope. Unlike the single-permission
+# ``permission_lost`` (a mid-recording revocation), this carries the full
+# ``missing`` list of denied permissions (a subset of ``PERMISSION_LABELS``) so
+# the CLI-fallback SwiftUI shell can name every missing permission and route
+# into the same precise grant flow the daemon transport already uses. Pairs
+# with process exit code 3.
+EVENT_PERMISSION_REQUIRED = "permission_required"
 # Advisory mid-recording capture-health signal (SCR-76). Emitted by the
 # engine's supervisor loop when a reader is demonstrably attempting but
 # producing no useful output AND the cause is NOT a screen_recording denial
@@ -136,6 +147,16 @@ PERMISSION_LABELS = frozenset({
     PERMISSION_INPUT_MONITORING,
     PERMISSION_ACCESSIBILITY,
 })
+# Canonical human-readable names for each TCC label. Single source of truth for
+# the display strings, so the ``permission_required`` human echo (cli) names
+# permissions identically to the SwiftUI shell's ``PrivacyPane.displayName``
+# rather than relying on a ``.replace("_", " ").title()`` that would render
+# "Input_monitoring" → "Input Monitoring" only by coincidence.
+PERMISSION_DISPLAY: dict[str, str] = {
+    PERMISSION_SCREEN_RECORDING: "Screen Recording",
+    PERMISSION_ACCESSIBILITY: "Accessibility",
+    PERMISSION_INPUT_MONITORING: "Input Monitoring",
+}
 # Type alias mirroring PERMISSION_LABELS for use in type hints.
 PermissionLabel = Literal["screen_recording", "input_monitoring", "accessibility"]
 
@@ -170,6 +191,7 @@ __all__ = [
     "EVENT_RECORDING_FINALIZED",
     "EVENT_DISK_FULL",
     "EVENT_PERMISSION_LOST",
+    "EVENT_PERMISSION_REQUIRED",
     "EVENT_CAPTURE_UNHEALTHY",
     "EVENT_CAPTURE_RECOVERED",
     "CAPTURE_UNHEALTHY_REASON_READER_STALLED",
@@ -179,6 +201,7 @@ __all__ = [
     "PERMISSION_INPUT_MONITORING",
     "PERMISSION_ACCESSIBILITY",
     "PERMISSION_LABELS",
+    "PERMISSION_DISPLAY",
     "PermissionLabel",
     "EVENT_STOPPED",
     "EVENT_MENUBAR_NEUTRALIZED_BY_ENV",
