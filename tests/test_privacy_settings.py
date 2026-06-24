@@ -74,3 +74,83 @@ class TestPrivacyConfigWriter:
                 raise _Boom()
 
         assert _CONFIG_PATH.read_text(encoding="utf-8") == original
+
+
+class TestMatrixBlocksAllowForClass:
+    """The matrix-invariant guard as a pure function — the extraction's key
+    payoff: directly testable without a CliRunner round trip. Behavioral
+    coverage through `settings privacy` lives in test_settings_privacy.py."""
+
+    def test_password_manager_blocked_in_every_mode(self):
+        from screencap.privacy.policy import ContextClass
+        from screencap.privacy_settings import _matrix_blocks_allow_for_class
+
+        for mode in ("internal", "public"):
+            assert (
+                _matrix_blocks_allow_for_class(ContextClass.PASSWORD_MANAGER, mode)
+                is not None
+            )
+
+    def test_browser_unverified_is_mode_dependent(self):
+        """BROWSER_UNVERIFIED is ALLOW under internal (allowable) but MASK_WINDOW
+        under public (blocked) — exercises the mode-dependent guard branch."""
+        from screencap.privacy.policy import ContextClass
+        from screencap.privacy_settings import _matrix_blocks_allow_for_class
+
+        assert (
+            _matrix_blocks_allow_for_class(ContextClass.BROWSER_UNVERIFIED, "internal")
+            is None
+        )
+        assert (
+            _matrix_blocks_allow_for_class(ContextClass.BROWSER_UNVERIFIED, "public")
+            is not None
+        )
+
+    def test_chat_blocked_under_internal(self):
+        from screencap.privacy.policy import ContextClass
+        from screencap.privacy_settings import _matrix_blocks_allow_for_class
+
+        # CHAT is MASK_WINDOW under internal → allow_apps cannot loosen it.
+        assert _matrix_blocks_allow_for_class(ContextClass.CHAT, "internal") is not None
+
+    def test_invalid_mode_falls_back_to_internal(self):
+        from screencap.privacy.policy import ContextClass
+        from screencap.privacy_settings import _matrix_blocks_allow_for_class
+
+        # An unparseable mode is treated as internal, under which CHAT is blocked.
+        assert _matrix_blocks_allow_for_class(ContextClass.CHAT, "garbage") is not None
+
+
+class TestBuildPrivacySettingsBlock:
+    """The `settings --json` privacy block reader (SCR-17), now directly tested."""
+
+    def test_no_section_reports_internal_default_and_flag_false(self):
+        from screencap.privacy_settings import _build_privacy_settings_block
+
+        # No config file written by this test.
+        assert _build_privacy_settings_block() == {
+            "mode": "internal",
+            "setup_skipped": False,
+            "has_privacy_section": False,
+        }
+
+    def test_reads_mode_and_flags_from_section(self):
+        from screencap.config import _CONFIG_PATH
+        from screencap.privacy_settings import _build_privacy_settings_block
+
+        _CONFIG_PATH.write_text(
+            '[privacy]\nmode = "public"\nsetup_skipped = true\n', encoding="utf-8"
+        )
+        block = _build_privacy_settings_block()
+        assert block["mode"] == "public"
+        assert block["setup_skipped"] is True
+        assert block["has_privacy_section"] is True
+
+    def test_invalid_mode_falls_back_to_internal_but_keeps_section_flag(self):
+        from screencap.config import _CONFIG_PATH
+        from screencap.privacy_settings import _build_privacy_settings_block
+
+        _CONFIG_PATH.write_text('[privacy]\nmode = "bogus"\n', encoding="utf-8")
+        block = _build_privacy_settings_block()
+        assert block["mode"] == "internal"
+        assert block["has_privacy_section"] is True
