@@ -1388,54 +1388,82 @@ class ChunkProcessor:
         """
         from screencap.terminal_stage import TerminalStageBusy, terminal_lock
 
-        try:
-            with terminal_lock(self._recording_name, non_blocking=True):
-                if self._cloud_intent and self._masked_video_upload:
-                    from screencap.pipeline_chunk_ops import mask_chunk_for_cloud
-
-                    cls = mask_chunk_for_cloud(
-                        self._capture_dir, self._scrubbed_dir, idx,
-                        start_ts=start_ts, end_ts=end_ts, enabled=True,
-                        ledger=self._get_ledger(), db_path=self._db_path,
-                    )
-                    if cls.failed:
-                        # Fail-closed: never upload an un-maskable chunk.
-                        return _UploadOutcome.FAILED
-                files = self._collect_chunk_files(idx, transcript_path)
-                if not files:
-                    logger.warning(f"No files found for chunk {idx}")
-                    return _UploadOutcome.FAILED
-                return (
-                    _UploadOutcome.UPLOADED
-                    if self._upload_chunk(idx, files)
-                    else _UploadOutcome.FAILED
-                )
-        except TerminalStageBusy:
-            logger.info(
-                "chunk %d: terminal lock contended (manual upload / daemon "
-                "resume in progress); deferring to the convergence pass", idx,
-            )
-            return _UploadOutcome.DEFERRED
-
-    def _upload_chunk(self, idx: int, files: list[dict]) -> bool:
-        """Upload chunk files silently. Returns True if core files succeeded.
-
-        Transcript upload failure is non-fatal — the chunk is still
-        considered uploaded if video/audio/events succeed.
-        Retries once after a 5-second backoff on failure.
-        """
+        # SCR-130: own the upload retry/backoff HERE so the 5s sleep happens
+        # OUTSIDE the held flock. Each attempt acquires → masks → uploads →
+        # releases; on a transient upload error we release the lock, back off,
+        # then re-acquire for the retry — so the backoff no longer extends the
+        # critical section a concurrent manual upload / daemon resume waits on.
+        # terminal_lock, mask_chunk_for_cloud and _collect_chunk_files are
+        # idempotent, so re-entering the critical section for the retry is safe.
         for attempt in range(2):
             try:
-                return upload_chunk_files(
-                    self._recording_name, files, self._capture_dir,
+                with terminal_lock(self._recording_name, non_blocking=True):
+                    if self._cloud_intent and self._masked_video_upload:
+                        from screencap.pipeline_chunk_ops import mask_chunk_for_cloud
+
+                        cls = mask_chunk_for_cloud(
+                            self._capture_dir, self._scrubbed_dir, idx,
+                            start_ts=start_ts, end_ts=end_ts, enabled=True,
+                            ledger=self._get_ledger(), db_path=self._db_path,
+                        )
+                        if cls.failed:
+                            # Fail-closed: never upload an un-maskable chunk.
+                            return _UploadOutcome.FAILED
+                    files = self._collect_chunk_files(idx, transcript_path)
+                    if not files:
+                        logger.warning(f"No files found for chunk {idx}")
+                        return _UploadOutcome.FAILED
+                    # Single attempt under the lock. A transient error propagates
+                    # out of _upload_chunk so we can back off AFTER releasing the
+                    # flock (below); mask/collect errors still propagate as before.
+                    try:
+                        uploaded = self._upload_chunk(idx, files)
+                    except Exception as exc:  # noqa: BLE001 — transient upload error
+                        if attempt == 0:
+                            logger.warning(
+                                f"Chunk {idx} upload attempt 1 failed: {exc}, "
+                                "retrying in 5s..."
+                            )
+                            # Fall through to back off OUTSIDE the released flock.
+                        else:
+                            logger.error(
+                                f"Chunk {idx} upload failed after retry: {exc}"
+                            )
+                            return _UploadOutcome.FAILED
+                    else:
+                        return (
+                            _UploadOutcome.UPLOADED if uploaded
+                            else _UploadOutcome.FAILED
+                        )
+            except TerminalStageBusy:
+                logger.info(
+                    "chunk %d: terminal lock contended (manual upload / daemon "
+                    "resume in progress); deferring to the convergence pass", idx,
                 )
-            except Exception as e:
-                if attempt == 0:
-                    logger.warning(f"Chunk {idx} upload attempt 1 failed: {e}, retrying in 5s...")
-                    time.sleep(5)
-                else:
-                    logger.error(f"Chunk {idx} upload failed after retry: {e}")
-        return False
+                return _UploadOutcome.DEFERRED
+            # Reached only after a first-attempt transient failure: the flock is
+            # released here, so the backoff stays outside the critical section.
+            time.sleep(5)
+        # Defensive: on attempt==1 every branch returns inside the loop body, so
+        # this is an unreachable exhaustiveness guard for the _UploadOutcome type.
+        return _UploadOutcome.FAILED
+
+    def _upload_chunk(self, idx: int, files: list[dict]) -> bool:
+        """Upload chunk files silently in a SINGLE attempt. Returns True if core
+        files succeeded.
+
+        Transcript upload failure is non-fatal — the chunk is still considered
+        uploaded if video/audio/events succeed (handled in ``upload_chunk_files``).
+
+        SCR-130: the retry + 5s backoff lives in ``_cloud_upload_chunk`` OUTSIDE
+        the held terminal flock, so a transient error is allowed to propagate
+        here instead of sleeping under the lock. A core-file PUT failure that
+        ``upload_chunk_files`` catches still returns ``False`` (terminal for this
+        attempt, no retry) exactly as before.
+        """
+        return upload_chunk_files(
+            self._recording_name, files, self._capture_dir,
+        )
 
     def _evict_old_chunks_through_floor(self, idx: int) -> int:
         """Reclaim older confirmed chunks via the unified retention floor (U2).
