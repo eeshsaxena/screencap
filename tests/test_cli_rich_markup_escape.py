@@ -22,14 +22,15 @@ developer-written (static) markup carries a ``[red]`` or ``[yellow]`` tag. Pure
 info/success sinks interpolating dynamic text are a separate, still-open gap
 (SCR-169); covering "all dynamic interpolations" here would flag ~140 in-scope-
 for-SCR-169 sinks and never go green. The rule for an error/warning sink: every
-interpolated value must be escaped, a structurally-safe shape (int count, enum
-``.value``, ALL-CAPS module constant), or an allow-listed internal constant.
+interpolated value must be escaped, a structurally-safe shape (int count, or a
+module-prefixed ALL-CAPS constant), or an allow-listed internal constant.
 """
 
 from __future__ import annotations
 
 import ast
 import re
+from collections.abc import Iterator
 from pathlib import Path
 
 _CLI_PATH = (
@@ -62,15 +63,25 @@ _CONST_NAME = re.compile(r"^_*[A-Z][A-Z0-9_]*$")
 #
 # Before adding an entry, confirm the expression is NOT user/exception/external
 # text. When in doubt, wrap the sink in ``escape()`` instead of allow-listing it.
+#
+# Known limitation (accepted): matching is by the *bare unparsed expression
+# string* (``_unparse(expr) in _RAW_INTERNAL_CONSTANTS``), so the exemption is
+# keyed on the name's spelling, not its provenance. A future external variable
+# that happened to share one of these spellings at a red/yellow sink would be
+# silently exempted. That risk was deliberately minimised: the formerly generic
+# ``name``/``mode``/``event_type`` entries were removed (``mode``/``event_type``
+# are now ``escape()``-wrapped at their sinks; the smoke-test local was renamed to
+# ``check_name``). The four entries that remain are genuinely internal *and*
+# already specific enough (``result.state``/``valid``/``joined`` are unlikely
+# external-data spellings; ``count`` is an int tally). Re-keying on (lineno, expr)
+# was considered and rejected: it would couple the allow-list to line numbers that
+# shift on every unrelated edit, making the guard brittle for no real safety gain.
 _RAW_INTERNAL_CONSTANTS = frozenset(
     {
         "result.state",  # daemon DaemonState label (fixed internal vocabulary)
         "count",  # int tally from a ``drops.items()`` loop
-        "event_type",  # internal event-type identifier (dict key)
         "valid",  # ``_CHOICE_KEYS[key]``: the frozenset of valid choice strings
-        "mode",  # internal privacy-mode label ("internal"/"cloud"/...)
         "joined",  # ``", ".join(...)`` of internal placeholder field names
-        "name",  # smoke-test check function ``__name__`` (internal)
     }
 )
 
@@ -97,8 +108,17 @@ def _is_structurally_safe(node: ast.expr) -> bool:
     """True if ``node`` provably cannot carry attacker-controlled markup.
 
     Covers the documented exemption categories the AST can verify at the sink:
-    int counts (``len()``/``int()`` and numeric literals), enum ``.value``
-    labels, and ALL-CAPS module constants.
+    int counts (``len()``/``int()`` and numeric literals) and ALL-CAPS module
+    constants.
+
+    The blanket ``.value`` exemption was removed: it accepted *any* attribute
+    named ``value`` regardless of receiver (so ``external_obj.value`` slipped
+    through on shape alone), and no current red/yellow sink relies on it. The
+    ALL-CAPS-attribute exemption is narrowed to a module-prefixed receiver — a
+    bare ``Name`` (e.g. ``launchagent.STATE_NOT_LOADED``) — rather than any
+    ``.ATTR`` chain, so ``external_obj.method().SOME_ATTR`` is no longer waved
+    through. Anything outside these shapes must be ``escape()``-wrapped or
+    allow-listed by spelling.
     """
     # ``len(...)`` / ``int(...)`` → an int count.
     if (
@@ -110,13 +130,17 @@ def _is_structurally_safe(node: ast.expr) -> bool:
     # Numeric literal.
     if isinstance(node, ast.Constant) and isinstance(node.value, (int, float)):
         return True
-    # Enum value label, e.g. ``state.value``.
-    if isinstance(node, ast.Attribute) and node.attr == "value":
-        return True
-    # Module constant: ``_PRIVACY_MODE_VALUES`` or ``launchagent.STATE_NOT_LOADED``.
+    # Bare module constant: ``_PRIVACY_MODE_VALUES``.
     if isinstance(node, ast.Name) and _CONST_NAME.match(node.id):
         return True
-    if isinstance(node, ast.Attribute) and _CONST_NAME.match(node.attr):
+    # Module-prefixed constant: ``launchagent.STATE_NOT_LOADED`` — an ALL-CAPS
+    # attribute whose receiver is a plain module/name reference. Constraining the
+    # receiver to a ``Name`` keeps arbitrary ``external_obj.SOME_ATTR`` chains out.
+    if (
+        isinstance(node, ast.Attribute)
+        and isinstance(node.value, ast.Name)
+        and _CONST_NAME.match(node.attr)
+    ):
         return True
     return False
 
@@ -128,11 +152,15 @@ def _unparse(node: ast.expr) -> str:
         return "<unparseable>"
 
 
-def _iter_error_sink_interpolations():
+def _iter_error_sink_interpolations_in(tree: ast.AST) -> Iterator[tuple[int, ast.expr]]:
     """Yield ``(lineno, expr_node)`` for every interpolation inside an
-    error/warning ``console.print`` / ``err_console.print`` f-string sink.
+    error/warning ``console.print`` / ``err_console.print`` f-string sink found
+    in ``tree``.
+
+    The walk is parameterised on an already-parsed tree so the negative self-test
+    (:func:`test_guard_flags_a_known_bad_sink`) can drive the *identical*
+    detection path over a synthetic snippet without re-reading the real CLI file.
     """
-    tree = ast.parse(_CLI_PATH.read_text(encoding="utf-8"), filename=str(_CLI_PATH))
     for node in ast.walk(tree):
         if not isinstance(node, ast.Call):
             continue
@@ -154,6 +182,28 @@ def _iter_error_sink_interpolations():
                     yield node.lineno, part.value
 
 
+def _iter_error_sink_interpolations() -> Iterator[tuple[int, ast.expr]]:
+    """Yield error/warning-sink interpolations from the live CLI module."""
+    tree = ast.parse(_CLI_PATH.read_text(encoding="utf-8"), filename=str(_CLI_PATH))
+    yield from _iter_error_sink_interpolations_in(tree)
+
+
+def _is_unescaped_violation(expr: ast.expr) -> bool:
+    """True if ``expr`` at a red/yellow sink is NOT proven safe by any of the
+    three exemptions (``escape()`` wrap, structural shape, allow-listed name).
+
+    Shared by the live-file guard and the negative self-test so both exercise the
+    exact same predicates — the self-test cannot drift from what CI enforces.
+    """
+    if _is_escape_call(expr):
+        return False
+    if _is_structurally_safe(expr):
+        return False
+    if _unparse(expr) in _RAW_INTERNAL_CONSTANTS:
+        return False
+    return True
+
+
 def test_cli_error_sinks_escape_dynamic_markup() -> None:
     """Every dynamic interpolation in a red/yellow CLI sink is escaped, a
     structurally-safe shape, or an allow-listed internal constant.
@@ -166,11 +216,7 @@ def test_cli_error_sinks_escape_dynamic_markup() -> None:
     """
     violations: list[str] = []
     for lineno, expr in _iter_error_sink_interpolations():
-        if _is_escape_call(expr):
-            continue
-        if _is_structurally_safe(expr):
-            continue
-        if _unparse(expr) in _RAW_INTERNAL_CONSTANTS:
+        if not _is_unescaped_violation(expr):
             continue
         violations.append(
             f"src/screencap/cli/__init__.py:{lineno} interpolates "
@@ -182,3 +228,22 @@ def test_cli_error_sinks_escape_dynamic_markup() -> None:
         "Unescaped dynamic text in CLI error/warning Rich-markup sink(s):\n  - "
         + "\n  - ".join(violations)
     )
+
+
+def test_guard_flags_a_known_bad_sink() -> None:
+    """The detector actually fires on a deliberately-unescaped red sink.
+
+    Without this, a silent regression in the walk or the exemption predicates
+    (e.g. ``_ERROR_MARKUP`` stops matching, ``_iter_*`` yields nothing) would let
+    the live-file guard pass *vacuously* forever — green while enforcing nothing.
+    This drives the SAME walk + predicates over a synthetic snippet and asserts at
+    least one violation, pinning the guard against rotting into a no-op.
+    """
+    snippet = 'console.print(f"[red]Error:[/red] {e}")'
+    tree = ast.parse(snippet)
+    violations = [
+        expr
+        for _lineno, expr in _iter_error_sink_interpolations_in(tree)
+        if _is_unescaped_violation(expr)
+    ]
+    assert violations, "guard failed to flag a known-bad unescaped [red] sink"
