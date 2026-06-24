@@ -428,6 +428,35 @@ def test_cli_human_error_escapes_rich_markup():
     assert "[secret]" in result.output
 
 
+def test_cli_human_success_escapes_rich_markup():
+    """SCR-169: the human-readable *success* path interpolates the user-chosen
+    recording name and the envelope's file paths (which embed that name) into
+    Rich-markup strings. SCR-117 only covered the error path. A name carrying an
+    unbalanced ``[/]`` makes Rich raise ``MarkupError`` and crash the command;
+    a balanced ``[x]`` run is silently stripped. The dynamic segments must be
+    escaped so the brackets survive verbatim."""
+    from rich.errors import MarkupError
+
+    envelope = {
+        "ok": True,
+        "schema_version": REVIEW_SCHEMA_VERSION,
+        "video_path": "/recs/we[/]ird/video.mp4",
+        "events_path": "/recs/we[/]ird/events.jsonl",
+    }
+    with mock.patch("screencap.cli._should_default_to_json", return_value=False), \
+         mock.patch(
+             "screencap.review.prepare_review_data",
+             return_value=envelope,
+         ):
+        result = CliRunner().invoke(cli, ["review-data", "we[/]ird"])
+
+    assert not isinstance(result.exception, MarkupError), result.exception
+    assert result.exit_code == 0
+    # Escaped, so the literal brackets survive instead of crashing/stripping.
+    assert "we[/]ird" in result.output
+    assert "/recs/we[/]ird/video.mp4" in result.output
+
+
 def test_cli_chunked_recording_stdout_is_clean_json(recordings_root):
     """A multi-chunk recording triggers _ensure_single_video's concat-progress
     prints. Those must go to stderr, leaving stdout as a single parseable JSON

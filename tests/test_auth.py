@@ -444,6 +444,52 @@ def test_cli_whoami_json_error_envelope(monkeypatch):
     assert p["ok"] is False and "error" in p
 
 
+def test_cli_login_success_escapes_provider_email_markup(monkeypatch):
+    """SCR-169: the ``login`` success line interpolates the provider-controlled
+    account email into ``[bold]...[/bold]``. SCR-117 escaped the *error* path but
+    left this *success* path. An email carrying an unbalanced ``[/]`` makes Rich
+    raise ``MarkupError`` (closing a tag the developer never opened), crashing the
+    command after sign-in already succeeded; a balanced ``[x]`` run is silently
+    stripped. Same untrusted-source class as PR #216, on the success path.
+
+    Force the human path (CliRunner stdout is non-TTY, which auto-selects the
+    unaffected --json path)."""
+    from click.testing import CliRunner
+    from rich.errors import MarkupError
+
+    import screencap.cli as cli_mod
+
+    monkeypatch.setattr(cli_mod, "_should_default_to_json", lambda: False)
+    monkeypatch.setattr(
+        a, "login",
+        lambda: a.AuthState("id", "rt", time.time() + 3600, "uid1", "ev[/]il@x.com"),
+    )
+    res = CliRunner().invoke(cli_mod.login_cmd, [])
+    assert not isinstance(res.exception, MarkupError), res.exception
+    assert res.exit_code == 0
+    assert "ev[/]il@x.com" in res.output
+
+
+def test_cli_whoami_success_escapes_provider_email_markup(monkeypatch):
+    """SCR-169: ``whoami`` success interpolates the provider-controlled email/uid
+    into ``[bold]{who}[/bold]``. SCR-117 escaped the whoami *error* path but left
+    the success path. Markup metacharacters must not crash or be stripped."""
+    from click.testing import CliRunner
+    from rich.errors import MarkupError
+
+    import screencap.cli as cli_mod
+
+    monkeypatch.setattr(cli_mod, "_should_default_to_json", lambda: False)
+    monkeypatch.setattr(
+        a, "whoami",
+        lambda: {"signed_in": True, "uid": "uid1", "email": "ev[/]il@x.com"},
+    )
+    res = CliRunner().invoke(cli_mod.whoami_cmd, [])
+    assert not isinstance(res.exception, MarkupError), res.exception
+    assert res.exit_code == 0
+    assert "ev[/]il@x.com" in res.output
+
+
 # --------------------------------------------------------------------------
 # U5: out-of-band engine token + force_refresh
 # --------------------------------------------------------------------------
