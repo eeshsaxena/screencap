@@ -292,6 +292,13 @@ struct RecordingStateMachine {
         }
 
         recordingStartedAt = nil
+        // This path terminates the recording, so clear the start-time identity
+        // fields too — mirrors enterIdle()/forceState(.idle) so the
+        // "cleared only on terminal/idle transitions" invariant on
+        // `startedSessionID` holds here as well (SCR-68). `pendingStartCursor`
+        // is cleared for parity; this function doesn't otherwise reset it.
+        pendingStartCursor = nil
+        startedSessionID = nil
 
         var effects: [Effect] = [
             .stopElapsedTimer,

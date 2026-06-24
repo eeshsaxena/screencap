@@ -628,19 +628,16 @@ final class RecorderControllerDaemonTests: XCTestCase {
         await recorder.probeDaemon()
         recorder.start(name: "mine")
 
-        // Let the recovery loop fire several cursor_unknown cycles (baseBackoff
-        // 0.1, 0.2, 0.4 …). The 10-failure `.lostContact` ceiling is tens of
-        // seconds of cumulative backoff away, so within this window the state
-        // can only be `.starting` (rejected) or — pre-fix — `.recording`
-        // (wrongly promoted onto the intruder).
-        try await Task.sleep(nanoseconds: 700_000_000)
-
-        // Prove the recovery path actually engaged so the assertion below isn't
-        // passing because the loop never reached the catch.
-        XCTAssertGreaterThanOrEqual(
-            cursorUnknownCount.value, 2,
-            "Recovery loop never engaged; expected at least two cursor_unknown 410s against the foreign snapshot."
-        )
+        // Deterministically wait for the recovery loop to fire at least two
+        // cursor_unknown cycles (baseBackoff 0.1, 0.2, 0.4 …) rather than
+        // sleeping a fixed interval. Reaching `>= 2` is positive proof the
+        // catch engaged at least twice against the foreign snapshot; the
+        // generous 5s cap is well below the 10-failure `.lostContact` ceiling
+        // (tens of seconds of cumulative backoff away), so when this returns the
+        // state can only be `.starting` (rejected) or — pre-fix — `.recording`
+        // (wrongly promoted onto the intruder). `waitUntil` XCTFails on timeout,
+        // which doubles as the "recovery loop never engaged" assertion.
+        await waitUntil(timeout: 5) { cursorUnknownCount.value >= 2 }
 
         // Core SCR-68 invariant: the foreign session must not be promoted.
         // Pre-fix this is `.recording` (the catch trusted isRecording &&
