@@ -1052,7 +1052,7 @@ def view(name, regenerate, max_events):
 
     try:
         open_viewer(name, regenerate=regenerate, max_events=max_events)
-        console.print(f"[dim]Opening {name}/viewer.html ...[/dim]")
+        console.print(f"[dim]Opening {escape(str(name))}/viewer.html ...[/dim]")
     except ImportError:
         console.print(_RECORD_EXTRAS_MSG)
         sys.exit(1)
@@ -1125,16 +1125,16 @@ def info(name, as_json):
     # Human-readable output
     from rich.panel import Panel
 
-    console.print(Panel(f"[bold]{name}[/bold]", title="Recording"))
+    console.print(Panel(f"[bold]{escape(str(name))}[/bold]", title="Recording"))
 
     if intent_data:
-        console.print(f"  [#60a5fa]destination:[/#60a5fa] {intent_data.get('destination', '?')}")
-        console.print(f"  [#60a5fa]privacy mode:[/#60a5fa] {intent_data.get('privacy_mode', '?')}")
-        console.print(f"  [#60a5fa]intent source:[/#60a5fa] {intent_data.get('source', '?')}")
+        console.print(f"  [#60a5fa]destination:[/#60a5fa] {escape(str(intent_data.get('destination', '?')))}")
+        console.print(f"  [#60a5fa]privacy mode:[/#60a5fa] {escape(str(intent_data.get('privacy_mode', '?')))}")
+        console.print(f"  [#60a5fa]intent source:[/#60a5fa] {escape(str(intent_data.get('source', '?')))}")
 
     if rec_meta:
         for key, val in rec_meta.items():
-            console.print(f"  [#60a5fa]{key}:[/#60a5fa] {val}")
+            console.print(f"  [#60a5fa]{key}:[/#60a5fa] {escape(str(val))}")
     else:
         console.print("  [dim]No recording metadata available.[/dim]")
 
@@ -1159,22 +1159,22 @@ def info(name, as_json):
                 console.print("  [#60a5fa]locale:[/#60a5fa]")
                 for lk, lv in val.items():
                     if isinstance(lv, list):
-                        console.print(f"    [#60a5fa]{lk}:[/#60a5fa] {', '.join(str(x) for x in lv)}")
+                        console.print(f"    [#60a5fa]{lk}:[/#60a5fa] {escape(', '.join(str(x) for x in lv))}")
                     elif isinstance(lv, dict):
-                        console.print(f"    [#60a5fa]{lk}:[/#60a5fa] {lv}")
+                        console.print(f"    [#60a5fa]{lk}:[/#60a5fa] {escape(str(lv))}")
                     else:
-                        console.print(f"    [#60a5fa]{lk}:[/#60a5fa] {lv}")
+                        console.print(f"    [#60a5fa]{lk}:[/#60a5fa] {escape(str(lv))}")
             elif key == "running_applications" and isinstance(val, list):
                 console.print("  [#60a5fa]running apps:[/#60a5fa]")
                 for app in val:
-                    v = f" v{app['version']}" if app.get("version") else ""
-                    console.print(f"    {app['name']} ({app['bundle_id']}){v}")
+                    v = f" v{escape(str(app['version']))}" if app.get("version") else ""
+                    console.print(f"    {escape(str(app['name']))} ({escape(str(app['bundle_id']))}){v}")
             elif key == "wifi" and isinstance(val, dict):
                 console.print("  [#60a5fa]wifi:[/#60a5fa]")
                 for wk, wv in val.items():
-                    console.print(f"    [#60a5fa]{wk}:[/#60a5fa] {wv}")
+                    console.print(f"    [#60a5fa]{wk}:[/#60a5fa] {escape(str(wv))}")
             else:
-                console.print(f"  [#60a5fa]{key}:[/#60a5fa] {val}")
+                console.print(f"  [#60a5fa]{key}:[/#60a5fa] {escape(str(val))}")
 
     for phase in ("start", "end"):
         snapshot = metrics.get(phase)
@@ -1184,9 +1184,9 @@ def info(name, as_json):
                 if key == "wifi" and isinstance(val, dict):
                     console.print("  [#60a5fa]wifi:[/#60a5fa]")
                     for wk, wv in val.items():
-                        console.print(f"    [#60a5fa]{wk}:[/#60a5fa] {wv}")
+                        console.print(f"    [#60a5fa]{wk}:[/#60a5fa] {escape(str(wv))}")
                 else:
-                    console.print(f"  [#60a5fa]{key}:[/#60a5fa] {val}")
+                    console.print(f"  [#60a5fa]{key}:[/#60a5fa] {escape(str(val))}")
         elif phase == "end":
             console.print("\n  [dim]No end snapshot (recording may have been interrupted).[/dim]")
 
@@ -1460,9 +1460,9 @@ def review_data_cmd(name, as_json):
     # Human-readable fallback for the rare CLI-direct user. The
     # SwiftUI shell always passes --json (auto-detected via non-TTY
     # stdout when spawned as a subprocess).
-    console.print(f"[bold]{name}[/bold]")
-    console.print(f"  video:  [dim]{envelope['video_path']}[/dim]")
-    console.print(f"  events: [dim]{envelope['events_path']}[/dim]")
+    console.print(f"[bold]{escape(str(name))}[/bold]")
+    console.print(f"  video:  [dim]{escape(str(envelope['video_path']))}[/dim]")
+    console.print(f"  events: [dim]{escape(str(envelope['events_path']))}[/dim]")
     if envelope.get("video_pixfmt_remediated"):
         console.print("  [dim](video remediated for AVKit compatibility)[/dim]")
 
@@ -1496,7 +1496,7 @@ def login_cmd(as_json):
             "signed_in": True, "uid": state.uid, "email": state.email,
         }))
         return
-    console.print(f"[green]Signed in[/green] as [bold]{state.email or state.uid}[/bold].")
+    console.print(f"[green]Signed in[/green] as [bold]{escape(str(state.email or state.uid))}[/bold].")
 
 
 @cli.command("logout")
@@ -1537,7 +1537,7 @@ def whoami_cmd(as_json):
     if info.get("signed_in"):
         who = info.get("email") or info.get("uid") or "(unknown account)"
         suffix = " [dim](offline — could not refresh)[/dim]" if info.get("stale") else ""
-        console.print(f"Signed in as [bold]{who}[/bold]{suffix}")
+        console.print(f"Signed in as [bold]{escape(str(who))}[/bold]{suffix}")
     else:
         console.print("Not signed in. Run [bold]screencap login[/bold] to upload to the cloud.")
 
@@ -1808,7 +1808,7 @@ def apps(as_json, include_spotlight):
         badge = "[red]EXCLUDE[/red]" if row["resolved_action"] == "exclude" else (
             "[yellow]MASK[/yellow]" if "mask" in row["resolved_action"] else "[green]ALLOW[/green]"
         )
-        console.print(f"  {badge} {row['display_name']} ({row['bundle_id']})")
+        console.print(f"  {badge} {escape(str(row['display_name']))} ({escape(str(row['bundle_id']))})")
     console.print()
 
 
@@ -1950,9 +1950,9 @@ def status(as_json, no_nlp_check):
         else:
             console.print("[#22d3ee]Recording[/#22d3ee] — (start time unknown)")
         if payload.get("recording_name"):
-            console.print(f"  Recording: {payload['recording_name']}")
+            console.print(f"  Recording: {escape(str(payload['recording_name']))}")
         if payload.get("claimant"):
-            console.print(f"  Claimant: {payload['claimant']}")
+            console.print(f"  Claimant: {escape(str(payload['claimant']))}")
     elif not payload["daemon_reachable"]:
         console.print("[dim]Not recording. (Daemon not running.)[/dim]")
     else:
@@ -2545,12 +2545,12 @@ def transcribe(name, model):
         sys.exit(1)
 
     # Show results
-    console.print(f"\n[green]Transcript saved:[/green] {transcript_path}")
-    console.print(f"[green]Timestamps saved:[/green] {transcript_json_path}")
+    console.print(f"\n[green]Transcript saved:[/green] {escape(str(transcript_path))}")
+    console.print(f"[green]Timestamps saved:[/green] {escape(str(transcript_json_path))}")
     text = transcript_path.read_text().strip()
     if text:
         preview = text[:500] + ("..." if len(text) > 500 else "")
-        console.print(f"\n[bold]Preview:[/bold]\n{preview}")
+        console.print(f"\n[bold]Preview:[/bold]\n{escape(preview)}")
 
 
 @cli.command()
@@ -2703,7 +2703,7 @@ def settings(ctx, set_pair, as_json):
             doc[key] = value
         _save_config_atomic(_CONFIG_PATH, doc)
         invalidate_config_cache()
-        console.print(f"  [bold]{key}[/bold] = {value}")
+        console.print(f"  [bold]{escape(str(key))}[/bold] = {escape(str(value))}")
         return
 
     # --- Display all settings ---

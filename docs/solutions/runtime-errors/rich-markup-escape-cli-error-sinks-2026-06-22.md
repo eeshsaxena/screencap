@@ -71,9 +71,19 @@ The crash and the garble are the same bug: dynamic text reaching Rich's markup p
 - Structural guard ([tests/test_cli_rich_markup_escape.py](../../../tests/test_cli_rich_markup_escape.py) `test_cli_error_sinks_escape_dynamic_markup`, SCR-168): AST-walks `cli/__init__.py` and fails if any interpolation in a `[red]`/`[yellow]` sink is neither `escape()`-wrapped, a structurally-safe shape (int count / enum `.value` / ALL-CAPS module constant), nor an allow-listed internal constant. This pins the invariant for *every* error/warning sink at once so the next unescaped `console.print(f"[red]…{e}")` fails CI instead of relying on a per-sink test that would never be written. Scoped to error/warning sinks — info/success sinks are SCR-169. Landing it surfaced 5 residual name-family gaps (`d.name`/`rec_name`/`capture_dir.name`) the original sweep missed, now escaped.
 - Regression test ([tests/test_cli_review_data.py](../../../tests/test_cli_review_data.py) `test_cli_human_error_escapes_rich_markup`): drives the human error path with `[/]`-laden exception text and asserts no `MarkupError`, a clean exit-1, and verbatim bracket preservation. To force the human (non-JSON) path under `CliRunner` (whose stdout is non-TTY), patch `screencap.cli._should_default_to_json` to return `False`.
 - `MarkupError` is a `rich.errors` type, not a subclass of the domain exceptions handlers catch — a `try/except DomainError` around a `console.print` does NOT contain it. Escaping at the sink is the fix, not broadening the `except`.
-- Still out of scope and a known gap: pure info-display sinks that print dynamic-but-non-error text, notably `screencap apps`, which prints OS-derived app names that could in theory contain brackets.
+- The deferred info/success-path gap (SCR-169) — sinks that print dynamic-but-non-error text — covered the same bug class on the *success* path that SCR-117 left on the *error* path. Closed by escaping the dynamic segment in each of these families:
+  - `login` / `whoami` success — the provider-controlled account email/uid (the same untrusted source class as PR #216, just on the success path).
+  - `view` success — the user-chosen recording name in the "Opening …/viewer.html" line.
+  - `info` — recording name, `.recording_intent` values, and `metrics.json` / OS-derived values: running-app names + bundle IDs + versions, wifi SSID, and locale strings (the structural metric *keys* stay unescaped — internal constants).
+  - `apps` human listing — OS-derived `display_name` / `bundle_id`.
+  - `status` — daemon-reported `recording_name` (user-chosen) + `claimant`.
+  - `transcribe` — the transcript `preview` text plus the name-derived saved paths.
+  - `settings --set` echo — the (validated) key/value, for symmetry with the already-escaped error paths in the same command.
+  - `review_data` human success — recording name + envelope `video_path` / `events_path`.
+- Remaining same-class siblings outside SCR-169's enumerated scope (e.g. the `export` "Exported N events to <path>" success lines) are left for the SCR-168 AST guard, which is meant to enforce escaping across *all* dynamic interpolations rather than only the error/warning sinks.
 
 ## Related
 
 - PR https://github.com/proteus-computer-use/screencap/pull/261 (this sweep), Linear SCR-117
 - PR https://github.com/proteus-computer-use/screencap/pull/216 (established the `escape(str(e))` precedent on the `login` sink)
+- Linear SCR-169 (the deferred info/success-path sweep documented in Prevention above), SCR-168 (the AST guard that will enforce the invariant across all dynamic sinks)

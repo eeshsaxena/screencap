@@ -190,6 +190,39 @@ class TestErrorPath:
         assert payload["schema_version"] >= 1
 
 
+class TestHumanOutputMarkupSafety:
+    def test_human_output_escapes_os_app_name_markup(self, monkeypatch):
+        """SCR-169: the human-path ``apps`` listing interpolates the OS-derived
+        ``display_name`` / ``bundle_id`` into a Rich-markup string. A name carrying
+        an unbalanced ``[/]`` makes Rich raise ``MarkupError`` and crash the
+        command; a balanced ``[x]`` run is silently stripped. The dynamic segments
+        must be escaped so brackets render verbatim and never reach the parser.
+
+        Force the human path — CliRunner stdout is non-TTY, which would otherwise
+        auto-select the unaffected --json path."""
+        from rich.errors import MarkupError
+
+        import screencap.cli as cli_mod
+
+        evil = [
+            AppMetadata(path="/Applications/Evil.app",
+                        bundle_id="com.evil[/]app",
+                        display_name="Evil[/] App"),
+        ]
+        monkeypatch.setattr(cli_mod, "_should_default_to_json", lambda: False)
+        with mock.patch(
+            "screencap.app_discovery.discover_installed_apps",
+            return_value=evil,
+        ):
+            result = CliRunner().invoke(cli, ["apps"], catch_exceptions=False)
+
+        assert not isinstance(result.exception, MarkupError), result.exception
+        assert result.exit_code == 0
+        # Escaped, so the literal brackets survive instead of crashing/stripping.
+        assert "Evil[/] App" in result.output
+        assert "com.evil[/]app" in result.output
+
+
 class TestSpotlightFlag:
     def test_default_skips_spotlight(self):
         runner = CliRunner()
