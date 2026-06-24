@@ -1,7 +1,7 @@
 ---
 title: "refactor: Extract privacy/settings mutators into privacy_settings.py (SCR-156)"
 type: refactor
-status: active
+status: completed
 date: 2026-06-24
 ---
 
