@@ -150,10 +150,10 @@ def _maybe_download_nlp_models() -> None:
         "These are needed for scrubbing and cloud upload."
     )
     if click.confirm("Download now?", default=True):
-        # The download wrapper is a CLI-layer testability shim with a second
-        # caller in the cloud-gate flow, so it stays in cli/__init__.py; reach
-        # it lazily to keep this module free of a module-level cli dependency.
-        from screencap.cli import _download_nlp_models
+        # Reach the real downloader in setup_wizard directly (the CLI-layer
+        # _download_nlp_models is just a thin shim around this same function),
+        # so this module carries no dependency back into screencap.cli.
+        from screencap.setup_wizard import _download_nlp_models
         _download_nlp_models()
     else:
         console.print(

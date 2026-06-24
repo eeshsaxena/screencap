@@ -172,6 +172,9 @@ class TestPrivacyDiagnostics:
 
         name, ok, err = _check_onnxruntime_excluded()
         assert name == "onnxruntime_excluded"
+        # Env-robust on purpose: onnxruntime is typically importable in a dev
+        # environment (ok=False) but excluded from the frozen binary (ok=True).
+        # Assert only the contract shape so this is not flaky across both.
         assert isinstance(ok, bool)
 
     def test_both_checks_registered_in_cli_smoke_list(self):
