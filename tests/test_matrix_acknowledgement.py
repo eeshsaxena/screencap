@@ -52,7 +52,7 @@ def _write_config(path: Path, body: str) -> None:
 
 class TestWritePrivacyFlag:
     def test_creates_privacy_section_when_missing(self, tmp_path):
-        from screencap.cli import _write_privacy_flag
+        from screencap.privacy_settings import _write_privacy_flag
         from screencap.config import _CONFIG_PATH
 
         # No file exists yet
@@ -60,7 +60,7 @@ class TestWritePrivacyFlag:
         assert _read_flag(_CONFIG_PATH) is True
 
     def test_preserves_other_privacy_keys(self, tmp_path):
-        from screencap.cli import _write_privacy_flag
+        from screencap.privacy_settings import _write_privacy_flag
         from screencap.config import _CONFIG_PATH
 
         _write_config(_CONFIG_PATH, """
@@ -80,7 +80,7 @@ allow_apps = ["com.example.bar"]
         assert cfg["privacy"]["allow_apps"] == ["com.example.bar"]
 
     def test_overwrites_existing_value(self, tmp_path):
-        from screencap.cli import _write_privacy_flag
+        from screencap.privacy_settings import _write_privacy_flag
         from screencap.config import _CONFIG_PATH
 
         _write_config(_CONFIG_PATH, """
