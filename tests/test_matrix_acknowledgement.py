@@ -65,7 +65,7 @@ class TestWritePrivacyFlag:
 
         _write_config(_CONFIG_PATH, """
 [privacy]
-mode = "internal"
+mode = "internal"  # keep-this-comment
 exclude_apps = ["com.example.foo"]
 allow_apps = ["com.example.bar"]
 """.lstrip())
@@ -78,6 +78,13 @@ allow_apps = ["com.example.bar"]
         assert cfg["privacy"]["mode"] == "internal"
         assert cfg["privacy"]["exclude_apps"] == ["com.example.foo"]
         assert cfg["privacy"]["allow_apps"] == ["com.example.bar"]
+
+        # R9/R16: tomlkit write must preserve inline comments on pre-existing
+        # keys. tomllib strips comments, so assert against the raw file text.
+        raw = _CONFIG_PATH.read_text()
+        assert "# keep-this-comment" in raw, (
+            f"inline comment on a pre-existing key was destroyed. Content:\n{raw}"
+        )
 
     def test_overwrites_existing_value(self, tmp_path):
         from screencap.privacy_settings import _write_privacy_flag
