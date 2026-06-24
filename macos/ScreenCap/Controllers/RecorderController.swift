@@ -326,8 +326,12 @@ final class RecorderController: ObservableObject {
 
     private func startViaDaemon(name: String? = nil) async {
         do {
-            let cursor = try await daemonService.startRecording(name: name)
-            machine.setPendingStartCursor(cursor)
+            let started = try await daemonService.startRecording(name: name)
+            machine.setPendingStartCursor(started.cursor)
+            // Bind the started session's identity so a `cursor_unknown`
+            // snapshot promotion can't attribute the UI to a foreign session
+            // that took over mid-start (SCR-68).
+            machine.setStartedSessionID(started.sessionID)
             attachDaemonEventStream()
             // Same rationale as syncDaemonSnapshot: on the daemon transport
             // the watchdog's check is a guarded no-op, so don't arm it.
@@ -537,6 +541,7 @@ final class RecorderController: ObservableObject {
                     onTransientWarning: { [weak self] message in self?.lastError = message },
                     getPendingStartCursor: { [weak self] in self?.machine.pendingStartCursor },
                     clearPendingStartCursor: { [weak self] in self?.machine.clearPendingStartCursor() },
+                    getStartedSessionID: { [weak self] in self?.machine.startedSessionID },
                     isRecording: { [weak self] in self?.state.isRecording ?? false },
                     onSnapshotConfirmedActiveRecording: { [weak self] startedAt in
                         // `.starting`-only — mirrors syncDaemonSnapshot's

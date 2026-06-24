@@ -71,6 +71,13 @@ struct RecordingStateMachine {
     /// instead of the later `session.snapshot` cursor. Kept until we observe a
     /// start outcome, so a dropped initial stream cannot skip the boundary.
     private(set) var pendingStartCursor: Int?
+    /// `session_id` of the recording started via `/v0/recording.start`, used as
+    /// the cross-session identity witness during `cursor_unknown` recovery
+    /// (SCR-68). Deliberately *not* cleared by `clearPendingStartCursor()`: a
+    /// 410 evicting the start cursor must not also erase the identity check,
+    /// otherwise a foreign session reported by the refetched snapshot could be
+    /// promoted onto the UI. Cleared only on terminal/idle transitions.
+    private(set) var startedSessionID: String?
     private(set) var recordingStartedAt: Date?
 
     /// Set the start-response cursor from the orchestrator after a successful
@@ -78,6 +85,13 @@ struct RecordingStateMachine {
     /// stays `private(set)` and writes are localised.
     mutating func setPendingStartCursor(_ cursor: Int?) {
         pendingStartCursor = cursor
+    }
+
+    /// Record the started session's `session_id` after a successful
+    /// `/v0/recording.start`, so a later snapshot-driven promotion can verify
+    /// it is the same session (SCR-68).
+    mutating func setStartedSessionID(_ sessionID: String?) {
+        startedSessionID = sessionID
     }
 
     /// Clear the start-response cursor when the daemon has evicted it from
@@ -137,6 +151,7 @@ struct RecordingStateMachine {
 
     /// Final transition to `.idle` after a stop completes. Idempotent.
     mutating func enterIdle() {
+        startedSessionID = nil
         state = .idle
     }
 
@@ -154,6 +169,7 @@ struct RecordingStateMachine {
         if case .idle = newState {
             recordingStartedAt = nil
             pendingStartCursor = nil
+            startedSessionID = nil
         }
         state = newState
     }
@@ -200,6 +216,7 @@ struct RecordingStateMachine {
             // happening. Release any in-flight stop callers, surface the
             // reason, and drop back to `.idle`.
             pendingStartCursor = nil
+            startedSessionID = nil
             state = .idle
             return [
                 .surfaceError(event.reason ?? "Recording failed."),
