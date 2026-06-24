@@ -1444,6 +1444,8 @@ class ChunkProcessor:
             # Reached only after a first-attempt transient failure: the flock is
             # released here, so the backoff stays outside the critical section.
             time.sleep(5)
+        # Defensive: on attempt==1 every branch returns inside the loop body, so
+        # this is an unreachable exhaustiveness guard for the _UploadOutcome type.
         return _UploadOutcome.FAILED
 
     def _upload_chunk(self, idx: int, files: list[dict]) -> bool:

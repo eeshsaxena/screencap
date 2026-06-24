@@ -385,6 +385,109 @@ class TestCloudIntentGating:
             "the retry backoff must run OUTSIDE the held terminal flock (SCR-130)"
         )
 
+    def test_retry_then_lock_contention_defers(self, cloud_capture_dir):
+        """SCR-130: the retry re-acquires the flock, so a manual upload / daemon
+        resume that grabs the lock DURING the backoff makes the retry attempt
+        DEFER (TerminalStageBusy on re-acquire) — the chunk is left PENDING for
+        the convergence pass, never marked FAILED. This release-then-contend path
+        does not exist in the pre-SCR-130 single-acquisition design."""
+        from screencap import terminal_stage as ts
+        from screencap.chunk_processor import ChunkProcessor, _UploadOutcome
+
+        (cloud_capture_dir / "chunk_0000.mp4").write_bytes(b"v")
+        (cloud_capture_dir / "audio_0000.flac").write_bytes(b"a")
+        (cloud_capture_dir / "events_0000.jsonl").write_text("{}\n")
+        (cloud_capture_dir / "chunk_0000_manifest.json").write_text("{}")
+
+        cp = ChunkProcessor(
+            cloud_capture_dir, multiprocessing.Queue(), multiprocessing.Queue(),
+            recording_name="rec-retry-defer", upload_enabled=True,
+            auto_delete=False, cloud_intent=True, masked_video_upload=False,
+        )
+
+        # Attempt 0 acquires the lock normally and the upload raises (→ backoff);
+        # attempt 1's re-acquire finds the lock contended and must DEFER.
+        real_terminal_lock = ts.terminal_lock
+        lock_calls = {"n": 0}
+
+        def _lock_side_effect(name, non_blocking=False):
+            lock_calls["n"] += 1
+            if lock_calls["n"] >= 2:
+                raise ts.TerminalStageBusy("contended on retry")
+            return real_terminal_lock(name, non_blocking=non_blocking)
+
+        with (
+            mock.patch(
+                "screencap.chunk_processor.upload_chunk_files",
+                side_effect=ConnectionError("transient failure"),
+            ),
+            mock.patch(
+                "screencap.terminal_stage.terminal_lock",
+                side_effect=_lock_side_effect,
+            ),
+            mock.patch("screencap.chunk_processor.time.sleep"),  # skip 5s backoff
+        ):
+            outcome = cp._cloud_upload_chunk(0, 0.0, 5.0, None)
+
+        assert outcome is _UploadOutcome.DEFERRED
+        assert lock_calls["n"] == 2, (
+            "the retry must re-acquire the flock; contention on that second "
+            "acquisition is what produces DEFERRED (SCR-130)"
+        )
+
+    def test_retry_remasks_idempotently(self, cloud_capture_dir):
+        """SCR-130 idempotency invariant: with masked_video_upload ON, the retry
+        re-enters the critical section and re-runs mask_chunk_for_cloud. The PR's
+        safety argument rests on that re-mask being idempotent; this pins that a
+        transient first attempt recovers (UPLOADED) and the masker is invoked on
+        BOTH attempts."""
+        from screencap.chunk_processor import ChunkProcessor, _UploadOutcome
+
+        (cloud_capture_dir / "chunk_0000.mp4").write_bytes(b"rich video")
+        (cloud_capture_dir / "audio_0000.flac").write_bytes(b"a")
+        (cloud_capture_dir / "events_0000.jsonl").write_text("{}\n")
+        (cloud_capture_dir / "chunk_0000_manifest.json").write_text("{}")
+        masked_dir = (
+            cloud_capture_dir.parent
+            / f"{cloud_capture_dir.name}-scrubbed" / "masked_video"
+        )
+        masked_dir.mkdir(parents=True)
+        (masked_dir / "chunk_0000.mp4").write_bytes(b"masked video")
+
+        cp = ChunkProcessor(
+            cloud_capture_dir, multiprocessing.Queue(), multiprocessing.Queue(),
+            recording_name="rec-remask", upload_enabled=True, auto_delete=False,
+            cloud_intent=True, masked_video_upload=True,
+        )
+
+        attempts = {"n": 0}
+
+        def _upload_side_effect(recording_name, files, capture_dir):
+            attempts["n"] += 1
+            if attempts["n"] == 1:
+                raise ConnectionError("transient failure")
+            return True
+
+        mask = mock.MagicMock(return_value=mock.MagicMock(failed=False))
+
+        with (
+            mock.patch(
+                "screencap.pipeline_chunk_ops.mask_chunk_for_cloud", mask,
+            ),
+            mock.patch(
+                "screencap.chunk_processor.upload_chunk_files",
+                side_effect=_upload_side_effect,
+            ),
+            mock.patch("screencap.chunk_processor.time.sleep"),  # skip 5s backoff
+        ):
+            outcome = cp._cloud_upload_chunk(0, 0.0, 5.0, None)
+
+        assert outcome is _UploadOutcome.UPLOADED
+        assert attempts["n"] == 2
+        # The masker ran on BOTH attempts — re-entering the critical section on
+        # retry re-masks, and that must be idempotent (SCR-130).
+        assert mask.call_count == 2
+
     def test_checkpoint_and_upload_db_never_uploads_raw_db(self, cloud_capture_dir):
         """U2: checkpoint_and_upload_db NEVER uploads the raw recording.db — for
         any destination — because the DB is local-only by rule (R8). It only
