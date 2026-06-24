@@ -43,6 +43,12 @@ struct RecorderEventLine: Decodable {
     let schemaVersion: Int?
     let forceStopped: Bool?
     let permission: String?
+    /// Full list of denied permissions on a `permission_required` (SCR-142)
+    /// start-time block. Unlike the single `permission` field (a mid-recording
+    /// `permission_lost` revocation), this names every missing permission at
+    /// once so the CLI-fallback shell can route into the precise grant flow.
+    /// Absent on every other event type.
+    let missing: [String]?
     let changes: [String]?
     let optOutCommandExamples: [String]?
     let cursor: Int?
@@ -58,6 +64,7 @@ struct RecorderEventLine: Decodable {
         case schemaVersion = "schema_version"
         case forceStopped = "force_stopped"
         case permission
+        case missing
         case changes
         case optOutCommandExamples = "opt_out_command_examples"
         case cursor
@@ -528,6 +535,8 @@ final class RecorderController: ObservableObject {
                 Task { await self.index?.refresh() }
             case .handlePermissionLost(let permission):
                 handlePermissionLost(permission: permission)
+            case .handlePermissionRequired(let missing):
+                handlePermissionRequired(missing: missing)
             case .handleCaptureUnhealthy(let reason, let reader):
                 handleCaptureUnhealthy(reason: reason, reader: reader)
             case .handleCaptureRecovered(let reader):
@@ -629,10 +638,7 @@ final class RecorderController: ObservableObject {
             // client-side start-block (U4). No engine spawned, so no duplicate
             // permission_lost for this attempt.
             transitionToIdle()
-            let panes = missing.isEmpty
-                ? [PrivacyPane.screenRecording]
-                : missing.map { PrivacyPane.from(permissionString: $0) }
-            routeToPermissionGrant(missing: panes)
+            routeToPermissionGrant(missing: privacyPanes(fromMissing: missing))
         case .other(let description):
             lastError = description
             if state.isRecording { transitionToIdle() }
@@ -668,6 +674,30 @@ final class RecorderController: ObservableObject {
         ) { [weak self] in
             self?.permissions?.openSystemSettings(for: primary)
         }
+    }
+
+    /// Route a CLI-fallback start-time `permission_required` block (SCR-142)
+    /// into the SAME precise grant flow the daemon transport's typed
+    /// `permission_required` failure already uses (U6). The engine's daemon
+    /// pre-spawn gate named every denied permission in `missing`; mapping each
+    /// to its `PrivacyPane` lets the alert name them exactly instead of the
+    /// hedged "Screen Recording, Accessibility, or Input Monitoring" fallback.
+    /// No recording is in flight (the start was blocked before spawn), so this
+    /// only surfaces + routes — `processTerminated` drops the state to `.idle`.
+    private func handlePermissionRequired(missing: [String]) {
+        routeToPermissionGrant(missing: privacyPanes(fromMissing: missing))
+    }
+
+    /// Map the raw daemon `missing` permission strings to their `PrivacyPane`s,
+    /// falling back to `[.screenRecording]` when the list is empty so the
+    /// grant flow always names at least the permission fatal to capture. Single
+    /// owner of that empty-fallback, shared by the daemon-transport typed
+    /// `permission_required` failure (U6) and the CLI-fallback stderr event
+    /// (SCR-142).
+    private func privacyPanes(fromMissing missing: [String]) -> [PrivacyPane] {
+        missing.isEmpty
+            ? [PrivacyPane.screenRecording]
+            : missing.map { PrivacyPane.from(permissionString: $0) }
     }
 
     private func handlePermissionLost(permission: String?) {

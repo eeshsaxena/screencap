@@ -70,6 +70,19 @@ class Settings(BaseSettings):
     CAPTURE_HEALTH_WINDOW_SECS: float = 10.0
     CAPTURE_HEALTH_DEBOUNCE_TICKS: int = 3
 
+    # Mid-recording Screen-Recording revocation watch on the shell/daemon path
+    # (SCR-106). The daemon worker runs the engine with no standalone TCC poll
+    # (it used PermNoop), so a genuine mid-recording Screen-Recording revocation
+    # had no robust teardown: the capture-health labeller reads the stale
+    # per-process TCC cache, and its frame-output detector can be defeated by a
+    # denial that still yields a readable wallpaper frame. ``FreshScreenWatch``
+    # closes that gap with a periodic FRESH-process preflight (cache-immune,
+    # content-independent). INTERVAL bounds the spawn cost (~0.2 s per probe);
+    # DEBOUNCE requires N consecutive *explicit* denials before teardown — an
+    # inconclusive probe (spawn/timeout error) is fail-open and never counts.
+    SCREEN_PERM_WATCH_INTERVAL_SECS: float = 20.0
+    SCREEN_PERM_WATCH_DEBOUNCE: int = 2
+
     # Auto-cut video into chunks at this interval (seconds). 0 = legacy single-file.
     VIDEO_CHUNK_DURATION: float = 900.0
 

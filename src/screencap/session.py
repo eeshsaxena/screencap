@@ -162,15 +162,16 @@ def run_recording_worker(args: dict) -> None:
     from screencap.engine.lock_policy import InheritLock
     from screencap.engine.menubar_policy import Noop as MenubarNoop
     from screencap.engine.network_policy import Null as NetworkNull
-    from screencap.engine.permission_policy import Noop as PermNoop
+    from screencap.engine.permission_policy import FreshScreenWatch
     from screencap.engine.screen_recorder import IpcChannels, SigtermOnly
     from screencap.recorder import DiskFullError, start_recording
 
     # Fail-fast Screen Recording preflight (daemon-spawn path only).
-    # The engine policy is PermNoop, so without this check the recording
-    # loop would enter `screen_event_reader` (20 fps) and trigger a fresh
-    # TCC prompt on every `screencapture` / Quartz call when the daemon
-    # binary's code identity is not authorized.
+    # The engine policy is `FreshScreenWatch`, whose `preflight` is a no-op
+    # (it governs only the mid-recording window, SCR-106), so without THIS
+    # startup check the recording loop would enter `screen_event_reader`
+    # (20 fps) and trigger a fresh TCC prompt on every `screencapture` /
+    # Quartz call when the daemon binary's code identity is not authorized.
     #
     # In-process `Quartz.CGPreflightScreenCaptureAccess` is correct here
     # despite the per-process TCC cache: this worker is freshly spawned
@@ -233,7 +234,7 @@ def run_recording_worker(args: dict) -> None:
             _menubar_policy=MenubarNoop(),
             _signal_policy=SigtermOnly(),
             _lock_policy=InheritLock(),
-            _permission_policy=PermNoop(),
+            _permission_policy=FreshScreenWatch(),
             _disk_policy=DiskNoop(),
             _network_policy=NetworkNull(),
             network_handoff_ready=args.get("_network_handoff_ready"),

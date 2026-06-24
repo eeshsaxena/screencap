@@ -61,6 +61,7 @@ struct RecordingStateMachine {
         case setMatrixDisclosure(PrivacyMatrixDisclosure)
         case refreshIndex
         case handlePermissionLost(permission: String?)
+        case handlePermissionRequired(missing: [String])
         case handleCaptureUnhealthy(reason: String?, reader: String?)
         case handleCaptureRecovered(reader: String?)
     }
@@ -79,6 +80,12 @@ struct RecordingStateMachine {
     /// promoted onto the UI. Cleared only on terminal/idle transitions.
     private(set) var startedSessionID: String?
     private(set) var recordingStartedAt: Date?
+    /// Set when a `permission_required` (SCR-142) start-time block was already
+    /// routed into the grant flow this attempt, so the subsequent non-zero
+    /// process exit (3) does not ALSO surface a generic "permission was revoked"
+    /// message that would clobber the precise grant-flow alert. Reset at the
+    /// start of each attempt (`enterStarting`) and consumed in `processTerminated`.
+    private(set) var permissionRequiredRouted = false
 
     /// Set the start-response cursor from the orchestrator after a successful
     /// `/v0/recording.start`. Kept as a named mutating method so the field
@@ -104,6 +111,7 @@ struct RecordingStateMachine {
     mutating func enterStarting() -> [Effect] {
         guard !state.isRecording else { return [] }
         state = .starting
+        permissionRequiredRouted = false
         return [.clearError]
     }
 
@@ -170,6 +178,7 @@ struct RecordingStateMachine {
             recordingStartedAt = nil
             pendingStartCursor = nil
             startedSessionID = nil
+            permissionRequiredRouted = false
         }
         state = newState
     }
@@ -226,6 +235,17 @@ struct RecordingStateMachine {
 
         case "permission_lost":
             return [.handlePermissionLost(permission: event.permission)]
+
+        case "permission_required":
+            // SCR-142: the daemon's pre-spawn permission gate blocked the start
+            // and `screencap start` re-emitted the full `missing` list. Route
+            // into the SAME precise grant flow the daemon transport uses, naming
+            // every denied permission. Mark it routed so the imminent exit-3
+            // process termination doesn't clobber the alert with a generic
+            // "permission was revoked" message (which is also wrong here — the
+            // recording never started).
+            permissionRequiredRouted = true
+            return [.handlePermissionRequired(missing: event.missing ?? [])]
 
         case "capture_unhealthy":
             // Advisory, NON-terminal (SCR-76). The controller surfaces a
@@ -318,33 +338,37 @@ struct RecordingStateMachine {
         // a new recording begins.
         if exitCode == 0 || exitCode == 130 || exitCode == 143 {
             // Keep any prior user-facing warning.
+        } else if permissionRequiredRouted && exitCode == 3 {
+            // SCR-142: a start-time `permission_required` block already routed
+            // the user into the precise grant flow this attempt (and named every
+            // missing permission). The process now exits 3, but the generic
+            // case-3 "permission was revoked" copy would be both redundant and
+            // wrong (nothing was recording to revoke), so suppress it and let the
+            // grant-flow alert stand. The suppression is scoped to exit 3: a
+            // non-3 exit after a `permission_required` event is a different
+            // failure (e.g. disk_full → 4) whose real message must still surface.
         } else {
             switch exitCode {
             case 1:
-                // Exit 1 is the engine's "generic failure" code. On the
-                // CLI-fallback path at START TIME it is overwhelmingly the
-                // permission preflight bailing — `recorder.py`'s
-                // `_check_macos_permissions` raises `SystemExit(1)` when Screen
-                // Recording / Accessibility / Input Monitoring isn't granted to
-                // the spawned recorder. The engine's actionable guidance is
-                // printed to a console the app never sees, so the bare
-                // "Recorder exited with code 1" was a dead end. Surface a
-                // self-actionable message that points at the recovery entry
-                // point instead. (A genuine non-permission startup crash also
-                // exits 1; the wording stays hedged so it isn't a false claim.)
+                // Exit 1 is the engine's "generic failure" code. At START TIME on
+                // the CLI-fallback path it means the start failed before any
+                // `started` event for a reason we could NOT attribute precisely:
+                // a genuine non-permission startup crash (import failure, encoder
+                // fault), or a permission denial the daemon's grant probe left
+                // indeterminate so the pre-spawn gate never fired. A *precise*
+                // permission block now arrives instead as `permission_required`
+                // (handled above, exit 3) — so this branch is the residual
+                // catch-all, and the hedged "usually means … isn't granted"
+                // wording stays a safe non-false fallback.
                 //
-                // But exit 1 ALSO fires when a process that was already
-                // recording dies (force-quit, mid-recording crash). In that
-                // case the start-time permission story is simply wrong — the
-                // recorder had already cleared preflight and produced a
+                // Exit 1 ALSO fires when a process that was already recording
+                // dies (force-quit, mid-recording crash). There the start-time
+                // permission story is wrong — the recorder already produced a
                 // `started` event — and last-writer-wins on `lastError` would
                 // clobber the real reason a prior event (e.g. `permission_lost`,
-                // `disk_full`) may have already surfaced this session. So gate
-                // the permission hint on the start-time window and fall back to
-                // a neutral message otherwise. Distinguishing the non-permission
-                // start-time causes (disk-low, import failure, …) needs a
-                // precise per-cause signal that is deliberately deferred to
-                // SCR-142; until then the hedged start-time wording stands.
+                // `disk_full`) may have surfaced this session. So gate the
+                // permission hint on the start-time window and fall back to a
+                // neutral message otherwise.
                 //
                 // The copy points at "the Privacy tab" generically rather than
                 // naming the conditional "Finish setup" button, which renders
@@ -371,6 +395,10 @@ struct RecordingStateMachine {
                 effects.append(.surfaceError("Recorder exited with code \(exitCode)."))
             }
         }
+
+        // Consume the SCR-142 routed flag so it cannot leak into a later
+        // termination; the next attempt re-arms it via `enterStarting`.
+        permissionRequiredRouted = false
 
         if state.isRecording {
             state = .idle

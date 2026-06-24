@@ -58,7 +58,7 @@ The terminal `exit_code` on the `stopped` event matches the process exit code:
 | 0    | clean                  |
 | 1    | generic failure        |
 | 2    | lock-held              |
-| 3    | permission_lost        |
+| 3    | permission denied/lost — `permission_required` (start-time block) OR `permission_lost` (mid-recording) |
 | 4    | disk_full              |
 | 5    | user-initiated force-quit |
 
@@ -84,6 +84,15 @@ exists, and otherwise read from the emit site.
   `permission` (one of `screen_recording` / `accessibility` / `input_monitoring`),
   `elapsed: float`. Only a `screen_recording` denial is terminal (exit 3);
   `accessibility` / `input_monitoring` are best-guess attributions (SCR-101).
+- **`permission_required`** (SCR-142) — a **start-time** permission block: the
+  daemon's pre-spawn permission gate rejected the start and `screencap start`
+  re-emits the rejection as a structured event so the CLI-fallback shell can
+  name the exact missing permission(s). Unlike single-permission
+  `permission_lost`, it carries `missing: list[str]` — the full set of denied
+  permissions (each a subset of `screen_recording` / `accessibility` /
+  `input_monitoring`). Terminal; maps to exit 3. Additive/non-breaking (a new
+  event type with a field absent on all others), so `EVENT_SCHEMA_VERSION` is
+  unchanged.
 - **`capture_unhealthy`** (SCR-76) — **advisory**, no exit code, never terminal.
   Emitted once per detection edge when a reader is demonstrably attempting but
   producing no useful output and the cause is not a `screen_recording` denial.
