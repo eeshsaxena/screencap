@@ -62,20 +62,26 @@ jobs:
         run: pytest -m privacy --timeout=300
 
   privacy-guards-visionfree:
-    # Defense-in-depth: prove the SCR-110 background-masking invariant on every run
-    # WITHOUT pyobjc-Vision. tests/redaction/test_selective_masking.py (incl.
-    # TestBackgroundWindowMasking) imports no pyobjc at module load, so it runs on
-    # Linux. This is the "runs everywhere" guard; if macOS runners are unavailable,
-    # this lane still catches the regression.
+    # Vision-free backstop: run the @pytest.mark.privacy guards WITHOUT pyobjc-Vision
+    # on Linux, so if the macOS lane is unavailable or billing-blocked (binary-test.yml
+    # is disabled with `if: false  # billing`, so macOS-minutes pressure is real here)
+    # the privacy regressions are still caught. The runtime macOS-only tests — Apple
+    # Vision OCR (test_ocr.py) and the Vision branches of test_scrubber_policy.py —
+    # self-skip via `skipif(sys.platform != 'darwin')`, so this lane mirrors the macOS
+    # lane minus Vision fidelity (SCR-151).
     #
-    # Scoped to this one file ON PURPOSE: `pytest -m privacy` imports the WHOLE test
-    # tree to discover markers before deselecting, and several non-privacy modules
-    # (tests/engine/*, tests/network/*, test_capture_health*) import pynput at module
-    # load, which fails on a headless Linux runner (no X server). A broader Linux
-    # backstop needs xvfb or import-mocking infra — tracked separately.
+    # Why xvfb-run (do NOT re-narrow this to a single file — SCR-151): `pytest -m
+    # privacy` imports the WHOLE test tree to discover markers before deselecting, and
+    # several non-privacy modules (tests/engine/*, tests/network/*, test_capture_health*)
+    # import screencap.engine.recorder -> pynput at module load. pynput's Xlib backend
+    # fails to import on a headless Linux runner (no X server), which broke an earlier
+    # broadening attempt with 7 collection errors before xvfb-run was added (pynput's
+    # Xlib backend raises at import time when no X server is present). xvfb-run provides
+    # a virtual X server so pynput imports and the whole tree collects. Xvfb is
+    # pre-installed on the ubuntu-24.04 runner image, so no apt-get step is needed.
     name: Privacy guards (Vision-free, Linux)
-    runs-on: ubuntu-latest
-    timeout-minutes: 20
+    runs-on: ubuntu-24.04
+    timeout-minutes: 30
     steps:
       - uses: actions/checkout@v4
 
@@ -96,10 +102,26 @@ jobs:
         # `sys_platform == 'darwin'` markers in pyproject.toml.
         run: pip install -e ".[dev]"
 
-      - name: Run Vision-free background-masking guards
-        # Per-test timeout (pytest-timeout, from .[dev]) matches the macOS lane so a
-        # hung test fails fast instead of stalling up to the 20-minute job cap.
-        run: pytest tests/redaction/test_selective_masking.py -v --timeout=300
+      - name: Download spaCy model (presidio NER backbone)
+        # The broadened privacy suite exercises the real DetectionPipeline (presidio);
+        # its spaCy backbone needs this model. Retried because this lane is the privacy
+        # backstop and the model installs into site-packages (outside ~/.cache/pip), so
+        # it has no cache fallback — a transient PyPI/CDN blip would otherwise red the lane.
+        run: |
+          for i in 1 2 3; do
+            if python -m spacy download en_core_web_sm; then exit 0; fi
+            echo "spaCy model download attempt $i failed; retrying in 15s..." >&2
+            sleep 15
+          done
+          echo "spaCy model download failed after 3 attempts" >&2
+          exit 1
+
+      - name: Run privacy guard suite (xvfb so pynput imports headless)
+        # xvfb-run -a auto-picks a free display number so `pytest -m privacy` can import
+        # the whole tree (incl. the pynput-importing non-privacy modules deselected by
+        # the marker) without a real X server. Per-test timeout (pytest-timeout, from
+        # .[dev]) matches the macOS lane so a hung test fails fast.
+        run: xvfb-run -a pytest -m privacy --timeout=300
 
   lock-policy-contract-linux:
     # SCR-66: pin the start_recording ``_lock_policy``-required contract on every
