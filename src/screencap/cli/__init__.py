@@ -2115,7 +2115,12 @@ def update():
               help="Parallel file transfers per recording (default: 4).")
 @click.option("--no-delete", is_flag=True, default=False,
               help="Keep local recording files after upload instead of auto-deleting.")
-def upload(names, all_recordings, dry_run, force, jobs, no_delete):
+@click.option("--lock-timeout", type=click.FloatRange(min=0), default=600.0,
+              help="Seconds to wait for a contended per-recording terminal lock "
+                   "before reporting it busy (default: 600). The interactive app "
+                   "passes a short value (well under its 120s watchdog) so a "
+                   "contended lock surfaces as retryable rather than timing out.")
+def upload(names, all_recordings, dry_run, force, jobs, no_delete, lock_timeout):
     """Upload recordings to cloud storage.
 
     Exit codes: 0 = all recordings uploaded (or a retryable "already in progress"
@@ -2261,6 +2266,13 @@ def upload(names, all_recordings, dry_run, force, jobs, no_delete):
                     console=console,
                     force=force,
                     dry_run=dry_run,
+                    # SCR-165: blocking-with-timeout bound for the per-recording
+                    # terminal lock. Default 600s preserves the CLI/agent
+                    # converge-over-winner behavior; the interactive Swift path
+                    # passes a short value so a contended lock raises
+                    # TerminalStageBusy (→ upload_busy) well under its 120s
+                    # inactivity watchdog instead of being SIGTERMed mid-wait.
+                    lock_timeout=lock_timeout,
                     force_destination=Destination.CLOUD,
                     # --no-delete keeps local media after upload (a per-run override).
                     retention_override=(

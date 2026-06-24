@@ -24,16 +24,32 @@ protocol UploadService {
 
 @MainActor
 final class LiveUploadService: UploadService {
+    /// Interactive per-recording terminal-lock timeout (seconds), handed to
+    /// `screencap upload --lock-timeout` (SCR-165). Deliberately well under the
+    /// `UploadController` 120s `inactivityTimeoutSeconds` watchdog so a
+    /// contended lock raises `TerminalStageBusy` fast → emits `upload_busy` →
+    /// renders as a retryable `.busy`, instead of the watchdog SIGTERMing the
+    /// child mid-wait and rendering a hard `.failed("upload timed out")`. The
+    /// CLI/agent default stays 600s (converge-over-winner); only this
+    /// interactive path shortens it. Invariant pinned by `UploadControllerTests`.
+    static let interactiveLockTimeoutSeconds = 30
+
+    /// The `screencap upload` argv for the interactive path. Extracted so the
+    /// `--lock-timeout` injection is unit-testable (the `UploadService` seam
+    /// otherwise hides argv from `FakeUploadService`). The trailing `--`
+    /// matches the RecordingsListView "view" callsite: forces Click to treat
+    /// the recording name as a positional argument even if it begins with `--`.
+    static func uploadArgs(name: String) -> [String] {
+        ["upload", "--lock-timeout", String(interactiveLockTimeoutSeconds), "--", name]
+    }
+
     func start(
         name: String,
         onLine: @escaping @MainActor (String) -> Void,
         onTerminated: @escaping @MainActor (Int32) -> Void
     ) throws -> SpawnedProcessHandle {
-        // `--` matches the RecordingsListView "view" callsite: forces Click
-        // to treat the recording name as a positional argument even if it
-        // begins with `--`.
         try CLIClient.spawn(
-            args: ["upload", "--", name],
+            args: Self.uploadArgs(name: name),
             onStderrLine: { line in
                 DispatchQueue.main.async {
                     MainActor.assumeIsolated { onLine(line) }

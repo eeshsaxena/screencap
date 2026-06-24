@@ -177,6 +177,26 @@ final class UploadControllerTests: XCTestCase {
         XCTAssertTrue(msg.contains("in progress"), "got: \(msg)")
     }
 
+    /// SCR-165: the interactive upload must spawn with a short `--lock-timeout`
+    /// (well under the 120s inactivity watchdog) so a contended terminal lock
+    /// raises `TerminalStageBusy` → emits `upload_busy` (the `.busy` path above)
+    /// *before* the watchdog SIGTERMs the child and renders the hard
+    /// `.failed("upload timed out")`. Pins both the argv injection and the
+    /// under-watchdog invariant the comment depends on.
+    func testInteractiveUploadPassesShortLockTimeoutUnderWatchdog() {
+        XCTAssertEqual(
+            LiveUploadService.uploadArgs(name: "rec-001"),
+            ["upload", "--lock-timeout", "30", "--", "rec-001"]
+        )
+        // The whole point of SCR-165: the lock timeout must be strictly under
+        // the default watchdog, or the busy event can't surface first.
+        XCTAssertLessThan(
+            Double(LiveUploadService.interactiveLockTimeoutSeconds),
+            120,
+            "interactive lock timeout must stay under the 120s inactivity watchdog"
+        )
+    }
+
     /// Covers AE4 — cancel mid-upload sends SIGTERM via terminate(), Python
     /// emits upload_failed(error: "interrupted"), state lands on failed.
     func testCancelMidUploadTerminatesProcessAndStateLandsOnFailedInterrupted() {
