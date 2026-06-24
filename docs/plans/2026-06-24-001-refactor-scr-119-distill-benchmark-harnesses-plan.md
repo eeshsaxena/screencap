@@ -1,7 +1,7 @@
 ---
 title: "refactor: Distill remaining one-off benchmark harnesses to docs/solutions (SCR-119)"
 type: refactor
-status: active
+status: completed
 date: 2026-06-24
 ---
 
