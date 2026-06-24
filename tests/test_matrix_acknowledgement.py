@@ -101,7 +101,7 @@ matrix_acknowledged_v2026_04 = false
 class TestMatrixAcknowledgementPrompt:
     def test_no_config_file_skips(self, tmp_path):
         """Brand-new user with no config.toml at all → no prompt, no flag write."""
-        from screencap.cli import _maybe_prompt_matrix_acknowledgement
+        from screencap.privacy_settings import _maybe_prompt_matrix_acknowledgement
         from screencap.config import _CONFIG_PATH
 
         assert not _CONFIG_PATH.exists()
@@ -110,7 +110,7 @@ class TestMatrixAcknowledgementPrompt:
 
     def test_already_acknowledged_skips(self, tmp_path):
         """Flag already true → no-op."""
-        from screencap.cli import _maybe_prompt_matrix_acknowledgement
+        from screencap.privacy_settings import _maybe_prompt_matrix_acknowledgement
         from screencap.config import _CONFIG_PATH
 
         _write_config(_CONFIG_PATH, """
@@ -126,7 +126,7 @@ exclude_apps = ["com.example.x"]
 
     def test_non_internal_mode_skips(self, tmp_path):
         """Mode != internal → matrix change doesn't apply, no flag write."""
-        from screencap.cli import _maybe_prompt_matrix_acknowledgement
+        from screencap.privacy_settings import _maybe_prompt_matrix_acknowledgement
         from screencap.config import _CONFIG_PATH
 
         _write_config(_CONFIG_PATH, """
@@ -137,13 +137,53 @@ mode = "public"
         _maybe_prompt_matrix_acknowledgement()
         assert _read_flag(_CONFIG_PATH) is None  # never set
 
+    def test_swiftui_parent_emits_disclosure_event_and_writes_flag(
+        self, tmp_path, monkeypatch
+    ):
+        """Under SCREENCAP_PARENT=swiftui the matrix tightening is disclosed via
+        the `matrix_disclosure_required` stderr event (todo 013) and the ack
+        flag is auto-written so the prompt never re-fires. Guards the SwiftUI
+        cross-language contract survived the SCR-156 extraction.
+        """
+        import screencap._stderr_events as _ev
+        from screencap._stderr_events import EVENT_MATRIX_DISCLOSURE_REQUIRED
+        from screencap.config import _CONFIG_PATH
+        from screencap.privacy_settings import _maybe_prompt_matrix_acknowledgement
+
+        _write_config(_CONFIG_PATH, """
+[privacy]
+mode = "internal"
+""".lstrip())
+
+        monkeypatch.setenv("SCREENCAP_PARENT", "swiftui")
+        monkeypatch.delenv("SCREENCAP_MATRIX_ACK", raising=False)
+
+        calls = []
+        monkeypatch.setattr(
+            _ev,
+            "emit_event",
+            lambda event_type, **fields: calls.append((event_type, fields)),
+        )
+
+        _maybe_prompt_matrix_acknowledgement()
+
+        # The disclosure event fired once, naming both behavior changes.
+        assert len(calls) == 1
+        event_type, fields = calls[0]
+        assert event_type == EVENT_MATRIX_DISCLOSURE_REQUIRED
+        assert "chat_email_calendar_video_call_mask_window" in fields["changes"]
+        assert "ai_assistant_browser_unverified" in fields["changes"]
+
+        # And the ack flag is written so future starts short-circuit.
+        assert _read_flag(_CONFIG_PATH) is True
+
     def test_env_var_writes_flag_without_prompting(self, tmp_path, monkeypatch):
         """SCREENCAP_MATRIX_ACK=true → flag written, no interactive prompt.
 
         SwiftUI's spawn path sets this env var; the flag is written so future
         invocations short-circuit without re-checking.
         """
-        from screencap.cli import _maybe_prompt_matrix_acknowledgement
+        from screencap.privacy_settings import _maybe_prompt_matrix_acknowledgement
         from screencap.config import _CONFIG_PATH
 
         _write_config(_CONFIG_PATH, """
@@ -165,7 +205,7 @@ mode = "internal"
         Background invocations (cron, scripts) should not get a 5s wait;
         the flag should still be set so they don't re-check on every run.
         """
-        from screencap.cli import _maybe_prompt_matrix_acknowledgement
+        from screencap.privacy_settings import _maybe_prompt_matrix_acknowledgement
         from screencap.config import _CONFIG_PATH
 
         _write_config(_CONFIG_PATH, """
@@ -181,7 +221,7 @@ mode = "internal"
 
     def test_invalid_mode_value_skips(self, tmp_path):
         """Garbage mode value → no crash, no flag write."""
-        from screencap.cli import _maybe_prompt_matrix_acknowledgement
+        from screencap.privacy_settings import _maybe_prompt_matrix_acknowledgement
         from screencap.config import _CONFIG_PATH
 
         _write_config(_CONFIG_PATH, """
@@ -194,7 +234,7 @@ mode = "wat"
 
     def test_acknowledged_after_first_run_persists(self, tmp_path, monkeypatch):
         """Flag persists across two invocations — second run is a no-op."""
-        from screencap.cli import _maybe_prompt_matrix_acknowledgement
+        from screencap.privacy_settings import _maybe_prompt_matrix_acknowledgement
         from screencap.config import _CONFIG_PATH
 
         _write_config(_CONFIG_PATH, """
@@ -231,7 +271,7 @@ class TestNewUserPreSet:
         """Simulate a brand-new user who declines the privacy wizard. The
         matrix-ack flag must be set so the next start doesn't fire the prompt.
         """
-        from screencap.cli import _maybe_prompt_privacy_setup
+        from screencap.privacy_settings import _maybe_prompt_privacy_setup
         from screencap.config import _CONFIG_PATH, invalidate_config_cache
 
         # Fresh config — no [privacy] section yet.
