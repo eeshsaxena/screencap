@@ -3068,31 +3068,6 @@ def _check_sounddevice() -> tuple[str, bool, str]:
         return name, False, _tb.format_exc()
 
 
-def _check_domain_index() -> tuple[str, bool, str]:
-    """Instantiate DefaultContextClassifier (exercises build_domain_index → load_ut1_domains)."""
-    import traceback as _tb
-    name = "domain_index"
-    try:
-        from screencap.privacy.classify import DefaultContextClassifier
-        DefaultContextClassifier()
-        return name, True, ""
-    except Exception:
-        return name, False, _tb.format_exc()
-
-
-def _check_onnxruntime_excluded() -> tuple[str, bool, str]:
-    """Verify onnxruntime is NOT importable (confirms exclusion in spec)."""
-    name = "onnxruntime_excluded"
-    try:
-        import onnxruntime  # noqa: F401
-        return name, False, "onnxruntime should not be importable but was"
-    except ImportError:
-        return name, True, ""
-    except Exception:
-        import traceback as _tb
-        return name, False, _tb.format_exc()
-
-
 def _check_keyring_macos_backend() -> tuple[str, bool, str]:
     """Verify the macOS Keychain backend is importable + selected.
 
@@ -3392,6 +3367,15 @@ def network_restore_cmd() -> None:
     else:
         console.print("No orphaned proxy state found.")
 
+
+# Two privacy-related checks live in privacy_settings.py (SCR-156); the registry
+# stays here so the `screencap.cli._SMOKE_CHECKS` patch path used by the
+# smoke-test cases keeps working. privacy_settings defers all heavy imports, so
+# this module-level reference does not regress `screencap --help`.
+from screencap.privacy_settings import (  # noqa: E402
+    _check_domain_index,
+    _check_onnxruntime_excluded,
+)
 
 _SMOKE_CHECKS = [
     _check_presidio_analyzer,

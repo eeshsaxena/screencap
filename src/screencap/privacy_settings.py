@@ -683,3 +683,28 @@ def _settings_privacy_apply(
             privacy_tbl[field] = cur
 
     return True
+
+
+def _check_domain_index() -> tuple[str, bool, str]:
+    """Instantiate DefaultContextClassifier (exercises build_domain_index → load_ut1_domains)."""
+    import traceback as _tb
+    name = "domain_index"
+    try:
+        from screencap.privacy.classify import DefaultContextClassifier
+        DefaultContextClassifier()
+        return name, True, ""
+    except Exception:
+        return name, False, _tb.format_exc()
+
+
+def _check_onnxruntime_excluded() -> tuple[str, bool, str]:
+    """Verify onnxruntime is NOT importable (confirms exclusion in spec)."""
+    name = "onnxruntime_excluded"
+    try:
+        import onnxruntime  # noqa: F401
+        return name, False, "onnxruntime should not be importable but was"
+    except ImportError:
+        return name, True, ""
+    except Exception:
+        import traceback as _tb
+        return name, False, _tb.format_exc()

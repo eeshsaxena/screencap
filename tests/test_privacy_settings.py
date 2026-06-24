@@ -154,3 +154,32 @@ class TestBuildPrivacySettingsBlock:
         block = _build_privacy_settings_block()
         assert block["mode"] == "internal"
         assert block["has_privacy_section"] is True
+
+
+class TestPrivacyDiagnostics:
+    """The two privacy smoke checks moved in SCR-156; the _SMOKE_CHECKS registry
+    stays in cli so its existing patch path keeps working."""
+
+    def test_domain_index_check_passes(self):
+        from screencap.privacy_settings import _check_domain_index
+
+        name, ok, err = _check_domain_index()
+        assert name == "domain_index"
+        assert ok is True, err
+
+    def test_onnxruntime_excluded_check_returns_contract(self):
+        from screencap.privacy_settings import _check_onnxruntime_excluded
+
+        name, ok, err = _check_onnxruntime_excluded()
+        assert name == "onnxruntime_excluded"
+        assert isinstance(ok, bool)
+
+    def test_both_checks_registered_in_cli_smoke_list(self):
+        from screencap import cli as _cli
+        from screencap.privacy_settings import (
+            _check_domain_index,
+            _check_onnxruntime_excluded,
+        )
+
+        assert _check_domain_index in _cli._SMOKE_CHECKS
+        assert _check_onnxruntime_excluded in _cli._SMOKE_CHECKS
